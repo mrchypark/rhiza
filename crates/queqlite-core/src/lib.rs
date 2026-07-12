@@ -145,11 +145,8 @@ impl ConfigurationState {
         }
         let change = if entry.entry_type == EntryType::ConfigChange {
             Some(
-                ConfigChange::recognize(&StoredCommand::new(
-                    entry.entry_type,
-                    entry.payload.clone(),
-                ))
-                .map_err(|_| ConfigurationTransitionError::InvalidConfigChange)?,
+                ConfigChange::recognize_parts(entry.entry_type, &entry.payload)
+                    .map_err(|_| ConfigurationTransitionError::InvalidConfigChange)?,
             )
         } else {
             None
@@ -861,10 +858,17 @@ impl ConfigChange {
     }
 
     pub fn recognize(command: &StoredCommand) -> Result<Self, ConfigChangeDecodeError> {
-        if command.entry_type != EntryType::ConfigChange {
+        Self::recognize_parts(command.entry_type, &command.payload)
+    }
+
+    pub fn recognize_parts(
+        entry_type: EntryType,
+        payload: &[u8],
+    ) -> Result<Self, ConfigChangeDecodeError> {
+        if entry_type != EntryType::ConfigChange {
             return Err(ConfigChangeDecodeError);
         }
-        let bytes = &command.payload;
+        let bytes = payload;
         if bytes.get(..4) != Some(CONFIG_CHANGE_MAGIC) {
             return Err(ConfigChangeDecodeError);
         }
@@ -977,23 +981,21 @@ fn decode_successor(
 }
 
 fn read_config_string(bytes: &[u8], cursor: &mut usize) -> Result<String, ConfigChangeDecodeError> {
-    let length_bytes: [u8; 2] = bytes
-        .get(*cursor..*cursor + 2)
-        .ok_or(ConfigChangeDecodeError)?
-        .try_into()
-        .expect("checked string length");
-    *cursor += 2;
-    let length = u16::from_be_bytes(length_bytes) as usize;
-    let value = bytes
-        .get(*cursor..*cursor + length)
+    let length = read_config_u16(bytes, *cursor)? as usize;
+    let value_start = cursor.checked_add(2).ok_or(ConfigChangeDecodeError)?;
+    let value_end = value_start
+        .checked_add(length)
         .ok_or(ConfigChangeDecodeError)?;
-    *cursor += length;
+    let value = bytes
+        .get(value_start..value_end)
+        .ok_or(ConfigChangeDecodeError)?;
+    *cursor = value_end;
     String::from_utf8(value.to_vec()).map_err(|_| ConfigChangeDecodeError)
 }
 
 fn read_config_u64_at(bytes: &[u8], cursor: &mut usize) -> Result<u64, ConfigChangeDecodeError> {
     let value = read_config_u64(bytes, *cursor)?;
-    *cursor += 8;
+    *cursor = cursor.checked_add(8).ok_or(ConfigChangeDecodeError)?;
     Ok(value)
 }
 
@@ -1002,7 +1004,7 @@ fn read_config_hash_at(
     cursor: &mut usize,
 ) -> Result<LogHash, ConfigChangeDecodeError> {
     let value = read_config_hash(bytes, *cursor)?;
-    *cursor += 32;
+    *cursor = cursor.checked_add(32).ok_or(ConfigChangeDecodeError)?;
     Ok(value)
 }
 
@@ -1018,26 +1020,25 @@ impl std::fmt::Display for ConfigChangeDecodeError {
 impl std::error::Error for ConfigChangeDecodeError {}
 
 fn read_config_u16(bytes: &[u8], offset: usize) -> Result<u16, ConfigChangeDecodeError> {
-    let bytes = bytes
-        .get(offset..offset + 2)
-        .ok_or(ConfigChangeDecodeError)?;
+    let end = offset.checked_add(2).ok_or(ConfigChangeDecodeError)?;
+    let bytes = bytes.get(offset..end).ok_or(ConfigChangeDecodeError)?;
     Ok(u16::from_be_bytes(
         bytes.try_into().expect("u16 slice length"),
     ))
 }
 
 fn read_config_u64(bytes: &[u8], offset: usize) -> Result<u64, ConfigChangeDecodeError> {
-    let bytes = bytes
-        .get(offset..offset + 8)
-        .ok_or(ConfigChangeDecodeError)?;
+    let end = offset.checked_add(8).ok_or(ConfigChangeDecodeError)?;
+    let bytes = bytes.get(offset..end).ok_or(ConfigChangeDecodeError)?;
     Ok(u64::from_be_bytes(
         bytes.try_into().expect("u64 slice length"),
     ))
 }
 
 fn read_config_hash(bytes: &[u8], offset: usize) -> Result<LogHash, ConfigChangeDecodeError> {
+    let end = offset.checked_add(32).ok_or(ConfigChangeDecodeError)?;
     let bytes: [u8; 32] = bytes
-        .get(offset..offset + 32)
+        .get(offset..end)
         .ok_or(ConfigChangeDecodeError)?
         .try_into()
         .expect("hash slice length");
@@ -1278,5 +1279,44 @@ impl Snapshot {
 
     pub fn db_bytes(&self) -> &[u8] {
         &self.db_bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        read_config_hash, read_config_hash_at, read_config_string, read_config_u16,
+        read_config_u64, read_config_u64_at, ConfigChangeDecodeError,
+    };
+
+    #[test]
+    fn config_decoder_rejects_overflowing_offsets_without_panicking() {
+        let bytes = [];
+        assert_eq!(
+            read_config_u16(&bytes, usize::MAX),
+            Err(ConfigChangeDecodeError)
+        );
+        assert_eq!(
+            read_config_u64(&bytes, usize::MAX),
+            Err(ConfigChangeDecodeError)
+        );
+        assert_eq!(
+            read_config_hash(&bytes, usize::MAX),
+            Err(ConfigChangeDecodeError)
+        );
+
+        let mut cursor = usize::MAX;
+        assert_eq!(
+            read_config_string(&bytes, &mut cursor),
+            Err(ConfigChangeDecodeError)
+        );
+        assert_eq!(
+            read_config_u64_at(&bytes, &mut cursor),
+            Err(ConfigChangeDecodeError)
+        );
+        assert_eq!(
+            read_config_hash_at(&bytes, &mut cursor),
+            Err(ConfigChangeDecodeError)
+        );
     }
 }
