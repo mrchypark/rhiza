@@ -526,8 +526,26 @@ fn bound_activation_requires_the_successor_and_stop_command_authorized_by_bound_
         serialized["binding"]["stop_command_hash"],
         serde_json::to_value(stop_command_hash).unwrap()
     );
-    let round_tripped: ConfigurationState = serde_json::from_value(serialized).unwrap();
+    let round_tripped: ConfigurationState = serde_json::from_value(serialized.clone()).unwrap();
     assert_eq!(round_tripped, stopped);
+
+    let forged_stop_command_hash = LogHash::from_bytes([9; 32]);
+    let mut forged_state = serialized;
+    forged_state["binding"]["stop_command_hash"] =
+        serde_json::to_value(forged_stop_command_hash).unwrap();
+    let forged_state: ConfigurationState = serde_json::from_value(forged_state).unwrap();
+    let forged_activation = config_entry(
+        11,
+        5,
+        stop.hash,
+        ConfigChange::bound_activation_barrier(
+            authorized_successor.clone(),
+            10,
+            stop.hash,
+            forged_stop_command_hash,
+        ),
+    );
+    assert!(forged_state.validate_entry(&forged_activation).is_err());
 
     let other_successor = ConfigChange::bound_stop(
         "cluster-a",

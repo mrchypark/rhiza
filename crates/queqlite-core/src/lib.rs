@@ -242,6 +242,8 @@ impl ConfigurationState {
                 && entry.prev_hash == stop.hash()
                 && stop_slot == stop.index()
                 && prefix_hash == stop.hash()
+                // Reject a deserialized state whose cached authorization hash
+                // does not match its bound successor descriptor.
                 && *authorized_stop_command_hash
                     == (ConfigChange::BoundStop {
                         successor: authorized_successor.clone(),
