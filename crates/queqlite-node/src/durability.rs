@@ -258,6 +258,21 @@ impl CheckpointCoordinator {
         mode: DurabilityMode,
         holder: impl AsRef<str>,
     ) -> Result<Self, DurabilityError> {
+        Self::open_with_holder_and_options(
+            store,
+            mode,
+            holder,
+            CheckpointPublisherOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn open_with_holder_and_options(
+        store: ObjectArchiveStore,
+        mode: DurabilityMode,
+        holder: impl AsRef<str>,
+        publisher_options: CheckpointPublisherOptions,
+    ) -> Result<Self, DurabilityError> {
         mode.validate()?;
         store
             .load_checkpoint()
@@ -273,7 +288,7 @@ impl CheckpointCoordinator {
             holder.as_ref()
         );
         let publisher = store
-            .open_checkpoint_publisher(holder, CheckpointPublisherOptions::default())
+            .open_checkpoint_publisher(holder, publisher_options)
             .await?;
         let loaded = publisher.cached_checkpoint().await;
         let durable_tip = *loaded.manifest().tip();

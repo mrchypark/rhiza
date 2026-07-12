@@ -2159,6 +2159,7 @@ pub struct ProposerProgress {
     phase_zero_priorities: BTreeMap<(Round, NodeId), ProposalPriority>,
     command: Option<StoredCommand>,
     command_holders: BTreeSet<NodeId>,
+    transition_involved: bool,
 }
 
 impl ProposerProgress {
@@ -2170,10 +2171,12 @@ impl ProposerProgress {
             phase_zero_priorities: BTreeMap::new(),
             command: None,
             command_holders: BTreeSet::new(),
+            transition_involved: false,
         }
     }
 
     fn with_command(mut self, command: StoredCommand) -> Self {
+        self.transition_involved = command.entry_type == EntryType::ConfigChange;
         self.command = Some(command);
         self
     }
@@ -2725,7 +2728,11 @@ impl ThreeNodeConsensus {
                         &self.membership,
                     )
                     .map_err(Error::Rejected)?;
-                return self.finish_decision(proof.clone(), progress.command.as_ref());
+                return self.finish_decision(
+                    proof.clone(),
+                    progress.command.as_ref(),
+                    progress.transition_involved,
+                );
             }
         }
         if let Some(highest) = replies.iter().map(|reply| reply.step).max() {
@@ -2786,7 +2793,11 @@ impl ThreeNodeConsensus {
                         proposal,
                         summaries,
                     };
-                    return self.finish_decision(proof, progress.command.as_ref());
+                    return self.finish_decision(
+                        proof,
+                        progress.command.as_ref(),
+                        progress.transition_involved,
+                    );
                 }
                 progress.proposal = replies
                     .iter()
@@ -2811,7 +2822,11 @@ impl ThreeNodeConsensus {
                         proposal: progress.proposal.clone(),
                         summaries,
                     };
-                    return self.finish_decision(proof, progress.command.as_ref());
+                    return self.finish_decision(
+                        proof,
+                        progress.command.as_ref(),
+                        progress.transition_involved,
+                    );
                 }
             }
             3 => {
@@ -2832,6 +2847,7 @@ impl ThreeNodeConsensus {
         &self,
         proof: DecisionProof,
         known_command: Option<&StoredCommand>,
+        transition_involved: bool,
     ) -> Result<DriveOutcome> {
         proof
             .validate_for_cluster(
@@ -2857,7 +2873,7 @@ impl ThreeNodeConsensus {
                 .fetch_verified_value(proof_context(&proof).0, value)?
                 .ok_or(Error::CommandUnavailable)?,
         };
-        if command.entry_type != EntryType::ConfigChange {
+        if command.entry_type != EntryType::ConfigChange && !transition_involved {
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;

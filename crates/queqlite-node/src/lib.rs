@@ -3604,41 +3604,65 @@ impl NodeRuntime {
     ) -> Result<StopInformation, NodeError> {
         self.ensure_ready()?;
         self.ensure_writes_active()?;
-        let (last_index, last_hash) = self.ensure_materialized_tip()?;
-        let slot = last_index
-            .checked_add(1)
-            .ok_or_else(|| NodeError::Invariant("qlog index is exhausted".into()))?;
-        let entry = successor
-            .map_or_else(
-                || self.consensus.propose_stop_at(slot, last_hash),
-                |successor| {
-                    self.consensus
-                        .propose_stop_for_successor_at(slot, last_hash, successor)
-                },
+        let state = self.configuration_state()?;
+        let stop_command = match successor {
+            Some(successor) => ConfigChange::bound_stop(
+                self.config.cluster_id.clone(),
+                state.config_id(),
+                state.digest(),
+                state.config_id().checked_add(1).ok_or_else(|| {
+                    NodeError::Invariant("successor config id is exhausted".into())
+                })?,
+                successor.members().to_vec(),
             )
-            .map_err(|error| self.map_consensus_error(error))?;
-        self.persist_entry(&entry, slot, last_hash)?;
-        let proof = self
-            .consensus
-            .inspect_decision_proof_at(slot)
-            .map_err(|error| self.map_consensus_error(error))?
-            .ok_or_else(|| NodeError::Unavailable("durable Stop proof is unavailable".into()))?;
-        if proof
-            .proposal()
-            .value
-            .as_ref()
-            .map(|value| value.entry_hash)
-            != Some(entry.hash)
-        {
-            return Err(self.latch(NodeError::Reconciliation(
-                "Stop proof differs from committed stop entry".into(),
-            )));
+            .map_err(|error| NodeError::Invariant(error.to_string()))?
+            .to_stored_command(),
+            None => ConfigChange::stop(state.config_id(), state.digest()).to_stored_command(),
+        };
+        loop {
+            let (last_index, last_hash) = self.ensure_materialized_tip()?;
+            let slot = last_index
+                .checked_add(1)
+                .ok_or_else(|| NodeError::Invariant("qlog index is exhausted".into()))?;
+            let entry = self
+                .consensus
+                .propose_stored_at(slot, last_hash, stop_command.clone())
+                .map_err(|error| self.map_consensus_error(error))?;
+            self.persist_entry(&entry, slot, last_hash)?;
+            let decided = StoredCommand::new(entry.entry_type, entry.payload.clone());
+            if decided != stop_command {
+                let current = self.configuration_state()?;
+                if current.is_active() {
+                    continue;
+                }
+                return Err(NodeError::ConfigurationTransition {
+                    state: Box::new(current),
+                });
+            }
+            let proof = self
+                .consensus
+                .inspect_decision_proof_at(slot)
+                .map_err(|error| self.map_consensus_error(error))?
+                .ok_or_else(|| {
+                    NodeError::Unavailable("durable Stop proof is unavailable".into())
+                })?;
+            if proof
+                .proposal()
+                .value
+                .as_ref()
+                .map(|value| value.entry_hash)
+                != Some(entry.hash)
+            {
+                return Err(self.latch(NodeError::Reconciliation(
+                    "Stop proof differs from committed stop entry".into(),
+                )));
+            }
+            return Ok(StopInformation {
+                version: 2,
+                entry,
+                proof,
+            });
         }
-        Ok(StopInformation {
-            version: 2,
-            entry,
-            proof,
-        })
     }
 
     pub fn activate_successor(&self) -> Result<LogEntry, NodeError> {

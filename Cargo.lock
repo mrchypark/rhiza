@@ -1304,6 +1304,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "queqlite-cli"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "queqlite-archive",
+ "queqlite-core",
+ "queqlite-node",
+ "queqlite-obj-store",
+ "queqlite-quepaxa",
+ "queqlite-sqlite",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "queqlite-core"
 version = "0.1.0"
 dependencies = [
