@@ -6,7 +6,7 @@ use std::{
         Arc, Condvar, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use queqlite_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
@@ -942,7 +942,7 @@ impl RecorderRpc for DeadRecorder {
 
 #[derive(Clone)]
 struct RejectingRecordRecorder {
-    rejected: Option<Arc<AtomicBool>>,
+    rejected: Option<Arc<(Mutex<bool>, Condvar)>>,
     reason: RejectReason,
 }
 
@@ -953,7 +953,9 @@ impl RecorderRpc for RejectingRecordRecorder {
 
     fn record(&self, _request: RecordRequest) -> Result<RecordSummary, Error> {
         if let Some(rejected) = &self.rejected {
-            rejected.store(true, Ordering::Release);
+            let (state, condition) = &**rejected;
+            *state.lock().unwrap() = true;
+            condition.notify_all();
         }
         Err(Error::Rejected(self.reason.clone()))
     }
@@ -974,7 +976,7 @@ impl RecorderRpc for RejectingRecordRecorder {
 #[derive(Clone)]
 struct WaitForRejectionRecorder {
     store: RecorderFileStore,
-    rejected: Arc<AtomicBool>,
+    rejected: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl RecorderRpc for WaitForRejectionRecorder {
@@ -983,9 +985,11 @@ impl RecorderRpc for WaitForRejectionRecorder {
     }
 
     fn record(&self, request: RecordRequest) -> Result<RecordSummary, Error> {
-        while !self.rejected.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
+        let (state, condition) = &*self.rejected;
+        let rejected = condition
+            .wait_while(state.lock().unwrap(), |rejected| !*rejected)
+            .unwrap();
+        drop(rejected);
         self.store.record(request)
     }
 
@@ -1114,9 +1118,11 @@ impl RecorderRpc for BlockingRecordRecorder {
     }
 }
 
-struct SlowProofRecorder;
+struct CountingProofRecorder {
+    proof_installs: Arc<AtomicUsize>,
+}
 
-impl RecorderRpc for SlowProofRecorder {
+impl RecorderRpc for CountingProofRecorder {
     fn call(&self, _request: RecorderRequest) -> Result<RecorderReply, Error> {
         Err(Error::Io("recorder unavailable".into()))
     }
@@ -1130,8 +1136,8 @@ impl RecorderRpc for SlowProofRecorder {
         _proof: DecisionProof,
         _membership: &Membership,
     ) -> Result<(), Error> {
-        thread::sleep(Duration::from_secs(1));
-        Err(Error::Io("recorder timed out".into()))
+        self.proof_installs.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Io("recorder unavailable".into()))
     }
 }
 
@@ -1323,7 +1329,7 @@ fn adopted_command_is_redistributed_after_a_holder_crashes_in_a_later_phase() {
 fn record_broadcast_ignores_a_minority_typed_rejection() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
-    let rejected = Arc::new(AtomicBool::new(false));
+    let rejected = Arc::new((Mutex::new(false), Condvar::new()));
     let mut recorders = Vec::new();
     for id in ["n1", "n2"] {
         let store = RecorderFileStore::new_with_membership(
@@ -1555,6 +1561,7 @@ fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
     let root = tempfile::tempdir().unwrap();
     let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
     let counts = Arc::new(ProtocolCounts::default());
+    let minority_proof_installs = Arc::new(AtomicUsize::new(0));
     let recorders = ["n1", "n2"]
         .into_iter()
         .map(|id| {
@@ -1577,13 +1584,14 @@ fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
         })
         .chain(std::iter::once((
             "n3".into(),
-            Box::new(SlowProofRecorder) as Box<dyn RecorderRpc>,
+            Box::new(CountingProofRecorder {
+                proof_installs: Arc::clone(&minority_proof_installs),
+            }) as Box<dyn RecorderRpc>,
         )))
         .collect();
     let consensus =
         ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
 
-    let started = Instant::now();
     consensus
         .propose_at(
             1,
@@ -1592,8 +1600,8 @@ fn ordinary_fast_path_does_not_install_proof_cache_on_recorders() {
         )
         .unwrap();
 
-    assert!(started.elapsed() < Duration::from_millis(500));
     assert_eq!(counts.proof_installs.load(Ordering::SeqCst), 0);
+    assert_eq!(minority_proof_installs.load(Ordering::SeqCst), 0);
 }
 
 proptest! {
