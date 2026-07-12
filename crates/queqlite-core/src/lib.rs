@@ -963,6 +963,9 @@ fn decode_successor(
     let config_id = read_config_u64_at(bytes, cursor)?;
     let encoded_digest = read_config_hash_at(bytes, cursor)?;
     let count = *bytes.get(*cursor).ok_or(ConfigChangeDecodeError)? as usize;
+    if !(3..=7).contains(&count) {
+        return Err(ConfigChangeDecodeError);
+    }
     *cursor += 1;
     let members = (0..count)
         .map(|_| read_config_string(bytes, cursor))
@@ -990,7 +993,9 @@ fn read_config_string(bytes: &[u8], cursor: &mut usize) -> Result<String, Config
         .get(value_start..value_end)
         .ok_or(ConfigChangeDecodeError)?;
     *cursor = value_end;
-    String::from_utf8(value.to_vec()).map_err(|_| ConfigChangeDecodeError)
+    std::str::from_utf8(value)
+        .map(str::to_owned)
+        .map_err(|_| ConfigChangeDecodeError)
 }
 
 fn read_config_u64_at(bytes: &[u8], cursor: &mut usize) -> Result<u64, ConfigChangeDecodeError> {
