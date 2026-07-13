@@ -120,6 +120,7 @@ export QUEQLITE_IMAGE="$image" QUEQLITE_KUBE_CONTEXT="$context" QUEQLITE_K8S_NAM
 export QUEQLITE_CLUSTER_ID=queqlite-vind QUEQLITE_RECOVERY_GENERATION=1
 export QUEQLITE_CHECKPOINT_LEASE_MS=5000
 export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials
+export QUEQLITE_S3_ALLOW_HTTP=true
 
 echo "== initialize object checkpoint and bootstrap config 1 =="
 scripts/k8s-object-job.sh 1 "$target/config-c1.json" init-checkpoint >/dev/null
