@@ -124,7 +124,8 @@ skip-build run additionally requires the image's
 The same provenance records the benchmark client SHA-256, Rust toolchain
 versions, and normalized Kubernetes runtime image digests. Queqlite and RustFS
 are always required; disabled object metering marks its nginx and AWS inventory
-images `not_applicable` instead of requiring them.
+images `not_applicable` instead of requiring them. All three Queqlite pods must
+run the same digest as the locally inspected image.
 
 It applies fixed default resources to make comparisons controlled on the
 8-core/24-GiB host: each Queqlite and RustFS container requests `250m` CPU and

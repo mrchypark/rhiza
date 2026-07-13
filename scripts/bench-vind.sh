@@ -270,11 +270,13 @@ render_provenance_json() {
     def runtime_component($value; $required):
       (if ($value | type) == "array" then $value else [] end) as $ids |
       [$ids[] | immutable_digest] as $normalized |
-      if ($required | not) then {status:"not_applicable",image_digests:[]}
+      if ($required | not) then {status:"not_applicable",observed_instances:0,image_digests:[]}
       else {status:(if ($ids | length) > 0 and all($normalized[]; . != null)
           then "verified" else "missing_or_invalid" end),
+        observed_instances:($ids | length),
         image_digests:([$normalized[] | select(. != null)] | unique)} end;
-    ($inspect[0].Id // "") as $content_id |
+    ($inspect[0].Id // "") as $content_id_raw |
+    ($content_id_raw | immutable_digest) as $content_id |
     (($inspect[0].RepoDigests // []) | map(select(type == "string"))) as $repo_digests |
     (($inspect[0].Config.Labels["org.opencontainers.image.revision"] // "") |
       if type == "string" then . else "" end) as $source_revision |
@@ -284,7 +286,7 @@ render_provenance_json() {
     runtime_component($runtime_image_ids.aws_cli_inventory; $object_enabled) as $inventory_runtime |
     ([if ($commit | test("^[0-9a-f]{40,64}$") | not) then "missing_git_commit" else empty end,
       if $dirty then "dirty_source" else empty end,
-      if ($content_id | test("^sha256:[0-9a-f]{64}$") | not)
+      if $content_id == null
         then "missing_immutable_image_identity" else empty end,
       if $build_mode == "skip-build" and $source_revision != $commit
         then "unverified_image_source" else empty end,
@@ -296,6 +298,15 @@ render_provenance_json() {
         then "missing_or_invalid_cargo_version" else empty end,
       if $queqlite_runtime.status != "verified"
         then "missing_or_invalid_queqlite_runtime_image" else empty end,
+      if $queqlite_runtime.status == "verified" and $queqlite_runtime.observed_instances != 3
+        then "unexpected_queqlite_runtime_image_count" else empty end,
+      if $queqlite_runtime.status == "verified" and
+        ($queqlite_runtime.image_digests | length) != 1
+        then "heterogeneous_queqlite_runtime_images" else empty end,
+      if $queqlite_runtime.status == "verified" and
+        ($queqlite_runtime.image_digests | length) == 1 and $content_id != null and
+        $queqlite_runtime.image_digests[0] != $content_id
+        then "queqlite_runtime_image_mismatch" else empty end,
       if $rustfs_runtime.status != "verified"
         then "missing_or_invalid_rustfs_runtime_image" else empty end,
       if $meter_runtime.status == "missing_or_invalid"
@@ -305,7 +316,7 @@ render_provenance_json() {
     {publishable:($reasons | length == 0),reasons:$reasons,
      source:{git_commit:(if $commit == "" then null else $commit end),dirty:$dirty,clean:($dirty | not)},
      image:{reference:$image_reference,build_mode:$build_mode,
-       content_id:(if $content_id == "" then null else $content_id end),repo_digests:$repo_digests,
+       content_id:$content_id,repo_digests:$repo_digests,
        source_revision:(if $source_revision == "" then null else $source_revision end)},
      execution:{benchmark_client:{sha256:(if $benchmark_sha256 == "" then null else $benchmark_sha256 end)},
        toolchain:{rustc_vv:(if $rustc_vv == "" then null else $rustc_vv end),

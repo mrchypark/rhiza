@@ -119,7 +119,8 @@ printf '%s\n' '{"measurement":{"measurement_window":{"started_at_epoch_seconds":
 jq -e '.started_at_epoch_seconds == 120.25 and .finished_at_epoch_seconds == 200.75' \
   <<< "$(measurement_window_from_report "$tmp/benchmark-report.json")" >/dev/null
 
-image_id="sha256:$(printf 'a%.0s' {1..64})"
+image_digest="sha256:$(printf 'a%.0s' {1..64})"
+image_id="docker-pullable://queqlite@${image_digest}"
 repo_digest="example/queqlite@sha256:$(printf 'b%.0s' {1..64})"
 source_commit="$(printf 'c%.0s' {1..40})"
 client_sha256="$(printf 'd%.0s' {1..64})"
@@ -129,14 +130,19 @@ inspect="$(jq -cn --arg id "$image_id" --arg digest "$repo_digest" '[{Id:$id,Rep
 matching_inspect="$(jq -cn --arg id "$image_id" --arg digest "$repo_digest" --arg revision "$source_commit" \
   '[{Id:$id,RepoDigests:[$digest],Config:{Labels:{"org.opencontainers.image.revision":$revision}}}]')"
 runtime_images="$(jq -cn \
-  --arg queqlite "containerd://sha256:$(printf '1%.0s' {1..64})" \
+  --arg queqlite "containerd://${image_digest}" \
   --arg rustfs "docker-pullable://rustfs@sha256:$(printf '2%.0s' {1..64})" \
   --arg meter "containerd://sha256:$(printf '3%.0s' {1..64})" \
   --arg inventory "docker-pullable://aws@sha256:$(printf '4%.0s' {1..64})" \
-  '{queqlite:[$queqlite],rustfs:[$rustfs],object_meter:[$meter],aws_cli_inventory:[$inventory]}')"
+  '{queqlite:[$queqlite,$queqlite,$queqlite],rustfs:[$rustfs],
+    object_meter:[$meter],aws_cli_inventory:[$inventory]}')"
 pod_status_fixture="$(jq -cn --argjson identities "$runtime_images" '{items:[
   {metadata:{labels:{"app.kubernetes.io/name":"queqlite"}},status:{containerStatuses:[
     {name:"queqlite",imageID:$identities.queqlite[0]}]}},
+  {metadata:{labels:{"app.kubernetes.io/name":"queqlite"}},status:{containerStatuses:[
+    {name:"queqlite",imageID:$identities.queqlite[1]}]}},
+  {metadata:{labels:{"app.kubernetes.io/name":"queqlite"}},status:{containerStatuses:[
+    {name:"queqlite",imageID:$identities.queqlite[2]}]}},
   {metadata:{labels:{"app.kubernetes.io/name":"rustfs"}},status:{containerStatuses:[
     {name:"rustfs",imageID:$identities.rustfs[0]},
     {name:"object-meter",imageID:$identities.object_meter[0]}]}}
@@ -148,13 +154,34 @@ printf '%s\n' "$observed_runtime" | jq -e --argjson expected "$runtime_images" '
 ' >/dev/null
 built_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
   "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true)"
-printf '%s\n' "$built_provenance" | jq -e --arg id "$image_id" --arg digest "$repo_digest" '
+printf '%s\n' "$built_provenance" | jq -e --arg id "$image_digest" --arg digest "$repo_digest" '
   .publishable == true and .source.dirty == false and .image.build_mode == "built" and
   .image.content_id == $id and .image.repo_digests == [$digest] and .reasons == [] and
   (.execution.benchmark_client.sha256 | test("^[0-9a-f]{64}$")) and
   (.execution.toolchain.rustc_vv | startswith("rustc ")) and
   (.execution.toolchain.cargo_version | startswith("cargo ")) and
   all(.execution.runtime_images[]; .status == "verified" and (.image_digests | length) == 1)
+' >/dev/null
+heterogeneous_runtime="$(printf '%s\n' "$runtime_images" | jq -c \
+  --arg image "containerd://sha256:$(printf '5%.0s' {1..64})" '.queqlite[2] = $image')"
+heterogeneous_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+  "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$heterogeneous_runtime" true)"
+printf '%s\n' "$heterogeneous_provenance" | jq -e '
+  .publishable == false and (.reasons | index("heterogeneous_queqlite_runtime_images") != null)
+' >/dev/null
+short_runtime="$(printf '%s\n' "$runtime_images" | jq -c '.queqlite = .queqlite[:2]')"
+short_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+  "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$short_runtime" true)"
+printf '%s\n' "$short_provenance" | jq -e '
+  .publishable == false and (.reasons | index("unexpected_queqlite_runtime_image_count") != null)
+' >/dev/null
+mismatched_image="containerd://sha256:$(printf '6%.0s' {1..64})"
+mismatched_runtime="$(printf '%s\n' "$runtime_images" | jq -c --arg image "$mismatched_image" \
+  '.queqlite = [$image,$image,$image]')"
+mismatched_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
+  "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$mismatched_runtime" true)"
+printf '%s\n' "$mismatched_provenance" | jq -e '
+  .publishable == false and (.reasons | index("queqlite_runtime_image_mismatch") != null)
 ' >/dev/null
 matching_provenance="$(render_provenance_json "$source_commit" false skip-build queqlite:dev \
   "$matching_inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$runtime_images" true)"
@@ -187,8 +214,8 @@ done
 for component in queqlite rustfs object_meter aws_cli_inventory; do
   for invalid in missing mutable; do
     if [ "$invalid" = missing ]; then value='[]'; else value='["latest"]'; fi
-    invalid_runtime="$(jq -c --arg component "$component" --argjson value "$value" \
-      '.[$component] = $value' <<< "$runtime_images")"
+    invalid_runtime="$(printf '%s\n' "$runtime_images" | jq -c --arg component "$component" \
+      --argjson value "$value" '.[$component] = $value')"
     invalid_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev \
       "$inspect" "$client_sha256" "$rustc_vv" "$cargo_version" "$invalid_runtime" true)"
     reason="missing_or_invalid_${component}_runtime_image"
@@ -196,8 +223,8 @@ for component in queqlite rustfs object_meter aws_cli_inventory; do
       '.publishable == false and (.reasons | index($reason) != null)' >/dev/null
   done
 done
-disabled_runtime="$(jq -c '.object_meter = ["latest"] | .aws_cli_inventory = []' \
-  <<< "$runtime_images")"
+disabled_runtime="$(printf '%s\n' "$runtime_images" | jq -c \
+  '.object_meter = ["latest"] | .aws_cli_inventory = []')"
 disabled_provenance="$(render_provenance_json "$source_commit" false built queqlite:dev "$inspect" \
   "$client_sha256" "$rustc_vv" "$cargo_version" "$disabled_runtime" false)"
 printf '%s\n' "$disabled_provenance" | jq -e '
