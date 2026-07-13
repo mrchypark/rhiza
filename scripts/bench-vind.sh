@@ -58,6 +58,10 @@ source_git_commit=""
 source_dirty=true
 image_build_mode="unknown"
 image_inspect_json='[]'
+benchmark_binary_sha256=""
+rustc_vv=""
+cargo_version=""
+runtime_image_ids_json='{"queqlite":[],"rustfs":[],"object_meter":[],"aws_cli_inventory":[]}'
 [ "$resource_sampling" = 0 ] || resource_evidence_status=pending
 [ "$object_metering" = 0 ] || {
   object_evidence_status=pending
@@ -168,6 +172,20 @@ summarize_resource_samples() {
   ' "$1"
 }
 
+runtime_image_ids_from_pods() {
+  jq -c '
+    def image_id($container):
+      (([.status.containerStatuses[]? | select(.name == $container) | (.imageID // "")][0]) // "");
+    {queqlite:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "queqlite") |
+        image_id("queqlite")],
+     rustfs:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "rustfs") |
+        image_id("rustfs")],
+     object_meter:[.items[]? | select(.metadata.labels["app.kubernetes.io/name"] == "rustfs") |
+        image_id("object-meter")],
+     aws_cli_inventory:[]}
+  '
+}
+
 validate_object_evidence() {
   local request_count
   [ -r "$1" ] || return 1
@@ -241,22 +259,59 @@ measurement_window_from_report() {
 
 render_provenance_json() {
   jq -n --arg commit "$1" --argjson dirty "$2" --arg build_mode "$3" \
-    --arg image_reference "$4" --argjson inspect "$5" '
+    --arg image_reference "$4" --argjson inspect "$5" --arg benchmark_sha256 "$6" \
+    --arg rustc_vv "$7" --arg cargo_version "$8" --argjson runtime_image_ids "$9" \
+    --argjson object_enabled "${10}" '
+    def immutable_digest:
+      if type == "string" then
+        if test("sha256:[0-9a-f]{64}$")
+        then capture("(?<digest>sha256:[0-9a-f]{64})$").digest else null end
+      else null end;
+    def runtime_component($value; $required):
+      (if ($value | type) == "array" then $value else [] end) as $ids |
+      [$ids[] | immutable_digest] as $normalized |
+      if ($required | not) then {status:"not_applicable",image_digests:[]}
+      else {status:(if ($ids | length) > 0 and all($normalized[]; . != null)
+          then "verified" else "missing_or_invalid" end),
+        image_digests:([$normalized[] | select(. != null)] | unique)} end;
     ($inspect[0].Id // "") as $content_id |
     (($inspect[0].RepoDigests // []) | map(select(type == "string"))) as $repo_digests |
     (($inspect[0].Config.Labels["org.opencontainers.image.revision"] // "") |
       if type == "string" then . else "" end) as $source_revision |
+    runtime_component($runtime_image_ids.queqlite; true) as $queqlite_runtime |
+    runtime_component($runtime_image_ids.rustfs; true) as $rustfs_runtime |
+    runtime_component($runtime_image_ids.object_meter; $object_enabled) as $meter_runtime |
+    runtime_component($runtime_image_ids.aws_cli_inventory; $object_enabled) as $inventory_runtime |
     ([if ($commit | test("^[0-9a-f]{40,64}$") | not) then "missing_git_commit" else empty end,
       if $dirty then "dirty_source" else empty end,
       if ($content_id | test("^sha256:[0-9a-f]{64}$") | not)
         then "missing_immutable_image_identity" else empty end,
       if $build_mode == "skip-build" and $source_revision != $commit
-        then "unverified_image_source" else empty end]) as $reasons |
+        then "unverified_image_source" else empty end,
+      if ($benchmark_sha256 | test("^[0-9a-f]{64}$") | not)
+        then "missing_or_invalid_benchmark_client_sha256" else empty end,
+      if ($rustc_vv | startswith("rustc ") | not)
+        then "missing_or_invalid_rustc_version" else empty end,
+      if ($cargo_version | startswith("cargo ") | not)
+        then "missing_or_invalid_cargo_version" else empty end,
+      if $queqlite_runtime.status != "verified"
+        then "missing_or_invalid_queqlite_runtime_image" else empty end,
+      if $rustfs_runtime.status != "verified"
+        then "missing_or_invalid_rustfs_runtime_image" else empty end,
+      if $meter_runtime.status == "missing_or_invalid"
+        then "missing_or_invalid_object_meter_runtime_image" else empty end,
+      if $inventory_runtime.status == "missing_or_invalid"
+        then "missing_or_invalid_aws_cli_inventory_runtime_image" else empty end]) as $reasons |
     {publishable:($reasons | length == 0),reasons:$reasons,
      source:{git_commit:(if $commit == "" then null else $commit end),dirty:$dirty,clean:($dirty | not)},
      image:{reference:$image_reference,build_mode:$build_mode,
        content_id:(if $content_id == "" then null else $content_id end),repo_digests:$repo_digests,
-       source_revision:(if $source_revision == "" then null else $source_revision end)}}
+       source_revision:(if $source_revision == "" then null else $source_revision end)},
+     execution:{benchmark_client:{sha256:(if $benchmark_sha256 == "" then null else $benchmark_sha256 end)},
+       toolchain:{rustc_vv:(if $rustc_vv == "" then null else $rustc_vv end),
+         cargo_version:(if $cargo_version == "" then null else $cargo_version end)},
+       runtime_images:{queqlite:$queqlite_runtime,rustfs:$rustfs_runtime,
+         object_meter:$meter_runtime,aws_cli_inventory:$inventory_runtime}}}
   '
 }
 
@@ -323,7 +378,7 @@ case "$resource_sampling" in 0|1) ;; *) die "QUEQLITE_BENCH_RESOURCE_SAMPLING mu
 case "$multi_endpoint" in 0|1) ;; *) die "QUEQLITE_BENCH_MULTI_ENDPOINT must be 0 or 1";; esac
 case "$sample_interval" in ''|*[!0-9]*) die "--sample-interval must be a positive integer";; esac
 [ "$sample_interval" -gt 0 ] || die "--sample-interval must be a positive integer"
-for tool in cargo curl docker jq kubectl openssl sed timeout vcluster yq; do require "$tool"; done
+for tool in cargo curl docker jq kubectl openssl rustc sed timeout vcluster yq; do require "$tool"; done
 
 target="$repo_root/$target_base/$run_id"
 benchmark_json="$target/benchmark.json"
@@ -386,6 +441,7 @@ wait_for_resource_coverage() {
 
 collect_object_usage() {
   local pod phase usage_pod meter_enabled meter_status inventory_status retained retained_output usage_tmp
+  local inventory_image_id
   meter_enabled=false
   [ "$object_metering" = 1 ] && meter_enabled=true
   if [ -z "$context" ] || ! k get service rustfs >/dev/null 2>&1; then
@@ -436,6 +492,10 @@ collect_object_usage() {
       sleep 1
     done
   fi
+  inventory_image_id="$(k get pod "$usage_pod" -o json 2>/dev/null | jq -r \
+    '(([.status.containerStatuses[]? | select(.name == "aws-cli") | (.imageID // "")][0]) // "")' || true)"
+  runtime_image_ids_json="$(printf '%s\n' "$runtime_image_ids_json" | jq -c \
+    --arg image_id "$inventory_image_id" '.aws_cli_inventory = [$image_id]')"
   retained='{"object_count":null,"retained_bytes":null}'
   if [ "$phase" = Succeeded ]; then
     if retained_output="$(k logs "$usage_pod" 2>/dev/null)" &&
@@ -514,7 +574,8 @@ emit_artifacts() {
   measurement_window="$(render_measurement_window_json \
     "$measurement_started_at_epoch_seconds" "$measurement_finished_at_epoch_seconds")"
   provenance="$(render_provenance_json "$source_git_commit" "$source_dirty" \
-    "$image_build_mode" "$image" "$image_inspect_json")"
+    "$image_build_mode" "$image" "$image_inspect_json" "$benchmark_binary_sha256" \
+    "$rustc_vv" "$cargo_version" "$runtime_image_ids_json" "$object_enabled")"
   jq -n \
     --arg run_id "$run_id" \
     --arg cluster "$cluster" \
@@ -551,6 +612,7 @@ emit_artifacts() {
 
 cleanup_run() {
   cleanup_status="$1"
+  local runtime_pods_json observed_runtime_image_ids
   mkdir -p "$target"
   if [ "$resource_sampling" = 1 ] &&
     { [ -z "$sampler_pid" ] || ! kill -0 "$sampler_pid" 2>/dev/null; }; then
@@ -561,6 +623,11 @@ cleanup_run() {
   [ -z "$sampler_pid" ] || wait "$sampler_pid" 2>/dev/null || true
   for pid in "${port_forward_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   for pid in "${port_forward_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+  if [ "$namespace_created" = true ] &&
+    runtime_pods_json="$(k get pods -o json 2>/dev/null)" &&
+    observed_runtime_image_ids="$(printf '%s\n' "$runtime_pods_json" | runtime_image_ids_from_pods)"; then
+    runtime_image_ids_json="$observed_runtime_image_ids"
+  fi
   if [ "$object_metering" = 0 ]; then
     : > "$object_access_log"
     jq -n '{metering:{enabled:false,status:"disabled",source:null,requests:0,
@@ -802,6 +869,10 @@ bench_target_dir="$(cargo metadata --locked --manifest-path bench/Cargo.toml --f
 cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench
 bench_binary="$bench_target_dir/release/queqlite-bench"
 [ -x "$bench_binary" ] || die "benchmark binary was not built: $bench_binary"
+benchmark_binary_sha256="$(openssl dgst -sha256 -r "$bench_binary")"
+benchmark_binary_sha256="${benchmark_binary_sha256%% *}"
+rustc_vv="$(rustc -Vv)"
+cargo_version="$(cargo --version)"
 
 : > "$resources_jsonl"
 if [ "$resource_sampling" = 1 ]; then

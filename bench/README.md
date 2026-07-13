@@ -121,6 +121,10 @@ tree or missing immutable image ID leaves an ordinary local run usable but sets
 `publishable: true` support release or published performance evidence. A
 skip-build run additionally requires the image's
 `org.opencontainers.image.revision` label to match the exact Git commit.
+The same provenance records the benchmark client SHA-256, Rust toolchain
+versions, and normalized Kubernetes runtime image digests. Queqlite and RustFS
+are always required; disabled object metering marks its nginx and AWS inventory
+images `not_applicable` instead of requiring them.
 
 It applies fixed default resources to make comparisons controlled on the
 8-core/24-GiB host: each Queqlite and RustFS container requests `250m` CPU and
