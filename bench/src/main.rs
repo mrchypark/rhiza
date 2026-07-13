@@ -338,7 +338,12 @@ fn wait_for_rate(
             RateDecision::Ready
         };
     };
-    let sequence = ticket.fetch_add(1, Ordering::Relaxed);
+    let sequence = match ticket.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1)
+    }) {
+        Ok(sequence) => sequence,
+        Err(_) => return RateDecision::Stop,
+    };
     let duration = deadline.saturating_duration_since(start);
     let scheduled_seconds = sequence as f64 / rate;
     if scheduled_seconds >= duration.as_secs_f64() {
@@ -974,7 +979,7 @@ mod tests {
         net::{TcpListener, TcpStream},
         process,
         sync::{
-            atomic::{AtomicU64, AtomicU8},
+            atomic::{AtomicU64, AtomicU8, Ordering},
             Arc,
         },
         thread,
@@ -1106,6 +1111,23 @@ mod tests {
             RateDecision::Stop
         );
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn saturated_open_loop_ticket_stays_stopped_without_wrapping() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let ticket = AtomicU64::new(u64::MAX);
+
+        assert_eq!(
+            wait_for_rate(Some(1.0), &ticket, start, deadline),
+            RateDecision::Stop
+        );
+        assert_eq!(
+            wait_for_rate(Some(1.0), &ticket, start, deadline),
+            RateDecision::Stop
+        );
+        assert_eq!(ticket.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
