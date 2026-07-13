@@ -365,7 +365,7 @@ echo "scaling stopped configuration $old_id to zero"
 [ "$("${k[@]}" get statefulset "$old_name" -o jsonpath='{.spec.replicas}')" = 0 ]
 [ -z "$("${k[@]}" get pod -l "queqlite.dev/config-id=${old_id}" -o name)" ]
 
-QUEQLITE_STARTUP_MODE=disaster scripts/render-k8s-config.sh \
+QUEQLITE_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
   "$new_id" "$new_replicas" "$successor_bundle" "$successor_yaml" successor
 "${k[@]}" apply --dry-run=client --validate=false -f "$successor_yaml" >/dev/null
 "${k[@]}" apply -f "$successor_yaml" >/dev/null

@@ -48,6 +48,10 @@ for replicas in 3 7; do
     .spec.template.spec.containers[0].env[] |
     select(.name == "QUEQLITE_S3_ALLOW_HTTP") | .value' \
     "$tmp/config-${id}.yaml")" = false ]
+  [ "$(yq eval -r 'select(.kind == "StatefulSet") |
+    .spec.template.spec.containers[0].env[] |
+    select(.name == "QUEQLITE_STARTUP_MODE") | .value' \
+    "$tmp/config-${id}.yaml")" = rejoin ]
   if yq eval -r 'select(.kind == "StatefulSet") |
     .spec.template.spec.containers[0].env[].name' "$tmp/config-${id}.yaml" |
     grep -Eq '^QUEQLITE_S3_(ENDPOINT|ACCESS_KEY|SECRET_KEY)$'; then
@@ -661,7 +665,7 @@ durable_secret_line="$(grep -n -- '--from-file=stop.json=' scripts/replace-k8s-c
 # shellcheck disable=SC2016
 scale_down_line="$(grep -n 'scale statefulset "$old_name" --replicas=0' \
   scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
-start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=disaster' scripts/replace-k8s-config.sh | cut -d: -f1)"
+start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=rejoin' scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$compact_line" -lt "$fork_line" ]
 [ "$fork_line" -lt "$start_line" ]
 [ "$durable_secret_line" -lt "$scale_down_line" ]
@@ -670,6 +674,11 @@ grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
 grep -Fq 'export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials' \
   scripts/e2e-vind-rustfs.sh
 grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/e2e-vind-rustfs.sh
+grep -Fq 'QUEQLITE_STARTUP_MODE=rejoin scripts/render-k8s-config.sh' \
+  scripts/e2e-vind-rustfs.sh
+grep -Fq "kill -TERM 1" scripts/e2e-vind-rustfs.sh
+grep -Fq "containerStatuses[0].restartCount" scripts/e2e-vind-rustfs.sh
+grep -Fq "current_uid\" = \"\$restart_uid" scripts/e2e-vind-rustfs.sh
 # shellcheck disable=SC2016
 grep -Fq 'token:$tokens[$n]' \
   scripts/e2e-vind-rustfs.sh

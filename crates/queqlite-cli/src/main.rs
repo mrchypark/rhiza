@@ -1879,9 +1879,7 @@ where
     .map_err(|error| error.to_string())?;
     let node_config = config.node_config()?;
     let preparation = if config.bundle.predecessor.is_some() {
-        if remote.startup != StartupMode::Disaster {
-            return Err("successor startup requires disaster mode and a fresh restore".into());
-        }
+        require_successor_startup_mode(remote.startup)?;
         let restored =
             restore_successor_checkpoint_to_fresh_data_dir(archive.clone(), &node_config)
                 .await
@@ -2028,6 +2026,14 @@ where
         finish_remote_serve(result.and(drained), runtime, coordinator).await
     })
     .await?
+}
+
+fn require_successor_startup_mode(mode: StartupMode) -> Result<(), String> {
+    if mode == StartupMode::Rejoin {
+        Ok(())
+    } else {
+        Err("successor startup requires rejoin mode".into())
+    }
 }
 
 async fn finish_remote_serve(
@@ -2912,9 +2918,13 @@ async fn prepare_remote_startup(
                 restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), data_dir, node_id)
                     .await
                     .map_err(|error| error.to_string())?;
-            Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_index: tip.index(),
-            })
+            if tip.index() == 0 {
+                Ok(StartupPreparation::RecorderFirst)
+            } else {
+                Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
+                    checkpoint_index: tip.index(),
+                })
+            }
         }
         StartupMode::Rejoin => Ok(StartupPreparation::RecorderFirst),
         StartupMode::Disaster => {
@@ -4817,6 +4827,13 @@ mod tests {
                 .unwrap(),
             StartupPreparation::RecorderFirst
         );
+        let empty_rejoin_dir = root.path().join("empty-rejoin");
+        assert_eq!(
+            prepare_remote_startup(StartupMode::Rejoin, &archive, &empty_rejoin_dir, "node-1",)
+                .await
+                .unwrap(),
+            StartupPreparation::RecorderFirst
+        );
         archive.publish_committed(&entries(2)).await.unwrap();
         assert!(
             prepare_remote_startup(StartupMode::Bootstrap, &archive, &data_dir, "node-1")
@@ -4858,6 +4875,13 @@ mod tests {
             StartupPreparation::RecorderFirst
         );
         assert!(fresh_disaster_dir.join("consensus/log").exists());
+    }
+
+    #[test]
+    fn successor_startup_uses_rejoin_as_its_steady_mode() {
+        assert!(require_successor_startup_mode(StartupMode::Rejoin).is_ok());
+        assert!(require_successor_startup_mode(StartupMode::Bootstrap).is_err());
+        assert!(require_successor_startup_mode(StartupMode::Disaster).is_err());
     }
 
     fn unused_local_address() -> String {

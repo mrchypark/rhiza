@@ -133,7 +133,7 @@ export QUEQLITE_S3_ALLOW_HTTP=true
 
 echo "== initialize object checkpoint and bootstrap config 1 =="
 scripts/k8s-object-job.sh 1 "$target/config-c1.json" init-checkpoint >/dev/null
-QUEQLITE_STARTUP_MODE=bootstrap scripts/render-k8s-config.sh \
+QUEQLITE_STARTUP_MODE=rejoin scripts/render-k8s-config.sh \
   1 3 "$target/config-c1.json" "$target/config-c1.yaml"
 k create -f "$target/config-c1.yaml" >/dev/null
 scripts/wait-k8s-statefulset-ready.sh queqlite-c1 3 1
@@ -231,6 +231,28 @@ for ((attempt=1; attempt<=20; attempt++)); do
 done
 jq -e '.anchor.format_version == 2 and .anchor.configuration_state.phase == "active"' \
   "$generation_compact" >/dev/null
+
+echo "== restart successor container in place and rejoin preserved emptyDir state =="
+restart_pod=queqlite-c2-1
+restart_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
+restart_count="$(k get pod "$restart_pod" \
+  -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+k exec "$restart_pod" -- /bin/sh -ec 'kill -TERM 1' >/dev/null 2>&1 || true
+for ((attempt=1; attempt<=120; attempt++)); do
+  current_uid="$(k get pod "$restart_pod" -o jsonpath='{.metadata.uid}')"
+  [ "$current_uid" = "$restart_uid" ] || die "successor Pod was recreated during container restart"
+  current_count="$(k get pod "$restart_pod" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+  ready="$(k get pod "$restart_pod" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
+  if [ "$current_count" -gt "$restart_count" ] && [ "$ready" = True ]; then
+    break
+  fi
+  [ "$attempt" -lt 120 ] || die "successor container did not rejoin with preserved state"
+  sleep 1
+done
+retry_client "$restart_pod" read --key suffix --consistency barrier --expect replayed
+
 scripts/k8s-object-job.sh 2 "$successor" roll-checkpoint \
   --from-generation 1 --to-generation 2 >/dev/null
 echo "== replace generation-1 pods with generation-2 S3 restores =="
