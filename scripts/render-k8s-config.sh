@@ -26,7 +26,8 @@ jq -e --argjson id "$config_id" --argjson replicas "$replicas" '
   .version == 1 and .config_id == $id and
   (.members | length) == $replicas and
   ([.members[].node_id] | unique | length) == $replicas and
-  ([.members[].token] | all(type == "string" and length > 0))
+  ([.members[].token] | all(type == "string" and length > 0)) and
+  ([.members[].token] | unique | length) == $replicas
 ' "$bundle" >/dev/null || { echo "invalid v1 bundle/config/replica identity" >&2; exit 65; }
 
 name="queqlite-c${config_id}"

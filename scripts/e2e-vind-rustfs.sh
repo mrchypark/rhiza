@@ -84,7 +84,12 @@ vcluster node load-image "$node" --image "$image"
 
 client_token="$(openssl rand -hex 24)"
 admin_token="$(openssl rand -hex 24)"
-peer_token="$(openssl rand -hex 24)"
+peer_tokens="$(jq -cn \
+  --arg first "$(openssl rand -hex 24)" \
+  --arg second "$(openssl rand -hex 24)" \
+  --arg third "$(openssl rand -hex 24)" \
+  '[$first, $second, $third]')"
+[ "$(jq 'unique | length' <<< "$peer_tokens")" = 3 ] || die "peer tokens must be unique"
 k create secret generic queqlite-auth \
   --from-literal=client-token="$client_token" \
   --from-literal=admin-token="$admin_token" >/dev/null
@@ -101,18 +106,22 @@ rustfs_uid="$(k get pod -l app.kubernetes.io/name=rustfs -o jsonpath='{.items[0]
 
 make_bundle() {
   id="$1" output="$2"
-  jq -n --argjson id "$id" --arg token "$peer_token" '
+  jq -n --argjson id "$id" --argjson tokens "$peer_tokens" '
     {version:1, config_id:$id, members:[range(3) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8081"),
       log_url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8080"),
-      token:$token
+      token:$tokens[$n]
     }]}
   ' > "$output"
   chmod 600 "$output"
 }
 make_bundle 1 "$target/config-c1.json"
 make_bundle 2 "$target/config-c2-draft.json"
+jq -e '[.members[].token] | unique | length == 3' \
+  "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
+jq -se '(.[0].members | map(.token)) == (.[1].members | map(.token))' \
+  "$target/config-c1.json" "$target/config-c2-draft.json" >/dev/null
 k create secret generic queqlite-c1-bundle --from-file=config.json="$target/config-c1.json" \
   --dry-run=client -o yaml | yq eval '.immutable = true' - | k create -f - >/dev/null
 

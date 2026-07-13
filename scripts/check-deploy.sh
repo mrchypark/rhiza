@@ -33,9 +33,10 @@ for replicas in 3 7; do
       node_id:("node-" + ($n + 1 | tostring)),
       url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8081"),
       log_url:("http://queqlite-c" + ($id|tostring) + "-" + ($n|tostring) + ".queqlite-c" + ($id|tostring) + ":8080"),
-      token:"not-a-real-secret"
+      token:("not-a-real-secret-" + ($n + 1 | tostring))
     }]}
   ' > "$tmp/config-${id}.json"
+  [ "$(jq '[.members[].token] | unique | length' "$tmp/config-${id}.json")" = "$replicas" ]
   scripts/render-k8s-config.sh "$id" "$replicas" \
     "$tmp/config-${id}.json" "$tmp/config-${id}.yaml" successor
   yq eval '.' "$tmp/config-${id}.yaml" >/dev/null
@@ -54,6 +55,13 @@ for replicas in 3 7; do
     exit 1
   fi
 done
+
+jq '(.members[].token) = "duplicate"' "$tmp/config-3.json" > "$tmp/config-3-duplicate.json"
+if scripts/render-k8s-config.sh 3 3 \
+  "$tmp/config-3-duplicate.json" "$tmp/invalid-duplicate-token.yaml"; then
+  echo "render accepted duplicate peer tokens" >&2
+  exit 1
+fi
 
 QUEQLITE_S3_ENDPOINT=http://rustfs:9000 \
 QUEQLITE_OBJECT_SECRET=rustfs-credentials \
@@ -99,6 +107,9 @@ grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
 grep -Fq 'export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials' \
   scripts/e2e-vind-rustfs.sh
 grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/e2e-vind-rustfs.sh
+# shellcheck disable=SC2016
+grep -Fq 'token:$tokens[$n]' \
+  scripts/e2e-vind-rustfs.sh
 # Assert literal runtime variables in the helper call.
 # shellcheck disable=SC2016
 grep -Fq 'scripts/wait-k8s-statefulset-ready.sh "$new_name" "$new_replicas" "$new_id"' \
