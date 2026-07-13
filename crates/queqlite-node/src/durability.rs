@@ -258,6 +258,21 @@ impl CheckpointCoordinator {
         mode: DurabilityMode,
         holder: impl AsRef<str>,
     ) -> Result<Self, DurabilityError> {
+        Self::open_with_holder_and_options(
+            store,
+            mode,
+            holder,
+            CheckpointPublisherOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn open_with_holder_and_options(
+        store: ObjectArchiveStore,
+        mode: DurabilityMode,
+        holder: impl AsRef<str>,
+        publisher_options: CheckpointPublisherOptions,
+    ) -> Result<Self, DurabilityError> {
         mode.validate()?;
         store
             .load_checkpoint()
@@ -273,7 +288,7 @@ impl CheckpointCoordinator {
             holder.as_ref()
         );
         let publisher = store
-            .open_checkpoint_publisher(holder, CheckpointPublisherOptions::default())
+            .open_checkpoint_publisher(holder, publisher_options)
             .await?;
         let loaded = publisher.cached_checkpoint().await;
         let durable_tip = *loaded.manifest().tip();
@@ -889,7 +904,7 @@ fn prepare_successor_restore_root(
             SuccessorRestoreRootState::Intent
         }
         (Err(error), Ok(actual)) if error.kind() == std::io::ErrorKind::NotFound => {
-            if actual != expected_identity {
+            if !completed_successor_identity_matches(&actual, expected_identity) {
                 return Err(DurabilityError::DataDirNotFresh(data_dir.to_path_buf()));
             }
             SuccessorRestoreRootState::Complete
@@ -963,6 +978,43 @@ fn prepare_successor_restore_root(
         sync_directory(data_dir)?;
     }
     Ok((lock, state))
+}
+
+fn completed_successor_identity_matches(actual: &[u8], expected: &[u8]) -> bool {
+    let (Ok(mut actual), Ok(mut expected)) = (
+        serde_json::from_slice::<serde_json::Value>(actual),
+        serde_json::from_slice::<serde_json::Value>(expected),
+    ) else {
+        return false;
+    };
+    let Some(actual_index) = actual["checkpoint_index"].as_u64() else {
+        return false;
+    };
+    let Some(expected_index) = expected["checkpoint_index"].as_u64() else {
+        return false;
+    };
+    let (Some(actual_hash), Some(expected_hash)) = (
+        actual["checkpoint_hash"].as_str(),
+        expected["checkpoint_hash"].as_str(),
+    ) else {
+        return false;
+    };
+    if LogHash::from_hex(actual_hash).is_none() || LogHash::from_hex(expected_hash).is_none() {
+        return false;
+    }
+    if actual_index > expected_index
+        || (actual_index == expected_index && actual_hash != expected_hash)
+    {
+        return false;
+    }
+    for receipt in [&mut actual, &mut expected] {
+        let Some(receipt) = receipt.as_object_mut() else {
+            return false;
+        };
+        receipt.remove("checkpoint_index");
+        receipt.remove("checkpoint_hash");
+    }
+    actual == expected
 }
 
 fn sync_directory(path: &Path) -> Result<(), DurabilityError> {
@@ -1086,8 +1138,56 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        mark_durable_state, CheckpointTip, CoordinatorState, DurabilityHealth, LogHash, PendingLag,
+        completed_successor_identity_matches, mark_durable_state, CheckpointTip, CoordinatorState,
+        DurabilityHealth, LogHash, PendingLag,
     };
+
+    fn successor_receipt(index: u64, hash_byte: char, generation: u64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "cluster_id": "cluster-a",
+            "epoch": 1,
+            "target_config_id": 2,
+            "recovery_generation": generation,
+            "node_id": "node-1",
+            "membership_digest": "digest",
+            "predecessor_config_id": 1,
+            "stop_index": 4,
+            "stop_hash": "stop",
+            "checkpoint_index": index,
+            "checkpoint_hash": hash_byte.to_string().repeat(64),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn completed_successor_receipt_allows_only_forward_checkpoint_progress() {
+        let expected = successor_receipt(8, '8', 1);
+
+        assert!(completed_successor_identity_matches(
+            &successor_receipt(4, '4', 1),
+            &expected
+        ));
+        assert!(!completed_successor_identity_matches(
+            &successor_receipt(8, '9', 1),
+            &expected
+        ));
+        assert!(!completed_successor_identity_matches(
+            &successor_receipt(9, '9', 1),
+            &expected
+        ));
+        assert!(!completed_successor_identity_matches(
+            &successor_receipt(4, '4', 2),
+            &expected
+        ));
+        let mut malformed =
+            serde_json::from_slice::<serde_json::Value>(&successor_receipt(4, '4', 1)).unwrap();
+        malformed["checkpoint_hash"] = serde_json::json!(7);
+        assert!(!completed_successor_identity_matches(
+            &serde_json::to_vec(&malformed).unwrap(),
+            &expected
+        ));
+    }
 
     #[test]
     fn concurrent_flush_completion_cannot_regress_the_durable_tip() {

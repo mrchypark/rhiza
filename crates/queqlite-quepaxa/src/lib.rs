@@ -2159,6 +2159,7 @@ pub struct ProposerProgress {
     phase_zero_priorities: BTreeMap<(Round, NodeId), ProposalPriority>,
     command: Option<StoredCommand>,
     command_holders: BTreeSet<NodeId>,
+    transition_involved: bool,
 }
 
 impl ProposerProgress {
@@ -2170,10 +2171,12 @@ impl ProposerProgress {
             phase_zero_priorities: BTreeMap::new(),
             command: None,
             command_holders: BTreeSet::new(),
+            transition_involved: false,
         }
     }
 
     fn with_command(mut self, command: StoredCommand) -> Self {
+        self.transition_involved = command.entry_type == EntryType::ConfigChange;
         self.command = Some(command);
         self
     }
@@ -2725,7 +2728,11 @@ impl ThreeNodeConsensus {
                         &self.membership,
                     )
                     .map_err(Error::Rejected)?;
-                return self.finish_decision(proof.clone(), progress.command.as_ref());
+                return self.finish_decision(
+                    proof.clone(),
+                    progress.command.as_ref(),
+                    progress.transition_involved,
+                );
             }
         }
         if let Some(highest) = replies.iter().map(|reply| reply.step).max() {
@@ -2786,7 +2793,11 @@ impl ThreeNodeConsensus {
                         proposal,
                         summaries,
                     };
-                    return self.finish_decision(proof, progress.command.as_ref());
+                    return self.finish_decision(
+                        proof,
+                        progress.command.as_ref(),
+                        progress.transition_involved,
+                    );
                 }
                 progress.proposal = replies
                     .iter()
@@ -2811,7 +2822,11 @@ impl ThreeNodeConsensus {
                         proposal: progress.proposal.clone(),
                         summaries,
                     };
-                    return self.finish_decision(proof, progress.command.as_ref());
+                    return self.finish_decision(
+                        proof,
+                        progress.command.as_ref(),
+                        progress.transition_involved,
+                    );
                 }
             }
             3 => {
@@ -2832,6 +2847,7 @@ impl ThreeNodeConsensus {
         &self,
         proof: DecisionProof,
         known_command: Option<&StoredCommand>,
+        transition_involved: bool,
     ) -> Result<DriveOutcome> {
         proof
             .validate_for_cluster(
@@ -2857,7 +2873,7 @@ impl ThreeNodeConsensus {
                 .fetch_verified_value(proof_context(&proof).0, value)?
                 .ok_or(Error::CommandUnavailable)?,
         };
-        if command.entry_type != EntryType::ConfigChange {
+        if command.entry_type != EntryType::ConfigChange && !transition_involved {
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;
@@ -3447,7 +3463,8 @@ impl ThreeNodeConsensus {
         }
         progress.command_holders.clear();
         progress.command = self.fetch_verified_value(progress.slot, value)?;
-        if progress.command.is_some() {
+        if let Some(command) = &progress.command {
+            progress.transition_involved |= command.entry_type == EntryType::ConfigChange;
             Ok(())
         } else {
             Err(Error::CommandUnavailable)
@@ -4508,8 +4525,11 @@ impl Consensus for SingleNodeConsensus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Consensus, SingleNodeConsensus};
-    use queqlite_core::{Command, CommandKind, LogHash};
+    use super::{
+        AcceptedValue, ConfigChange, Consensus, Membership, Proposal, ProposalPriority,
+        ProposerProgress, RecorderFileStore, RecorderRpc, SingleNodeConsensus, ThreeNodeConsensus,
+    };
+    use queqlite_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
 
     #[test]
     fn single_node_consensus_commits_contiguous_hash_chain() {
@@ -4527,5 +4547,61 @@ mod tests {
         assert_eq!(second.index, 2);
         assert_eq!(second.prev_hash, first.hash);
         assert_eq!(second.hash, second.recompute_hash());
+    }
+
+    #[test]
+    fn progress_remembers_config_change_after_later_normal_adoption() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let stores: Vec<_> = membership
+            .members()
+            .iter()
+            .map(|id| {
+                RecorderFileStore::new_with_membership(
+                    root.path().join(id),
+                    id.clone(),
+                    "cluster",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let offered = StoredCommand::new(EntryType::Command, b"offered".to_vec());
+        let transition = ConfigChange::stop(1, membership.digest()).to_stored_command();
+        let adopted = StoredCommand::new(EntryType::Command, b"adopted".to_vec());
+        for store in &stores {
+            for command in [&transition, &adopted] {
+                store
+                    .store_command(command.hash(), command.clone())
+                    .unwrap();
+            }
+        }
+        let recorders = membership
+            .members()
+            .iter()
+            .zip(&stores)
+            .map(|(id, store)| (id.clone(), Box::new(store.clone()) as Box<dyn RecorderRpc>))
+            .collect();
+        let consensus =
+            ThreeNodeConsensus::from_recorders_with_ids("cluster", "n1", 1, 1, recorders).unwrap();
+        let proposal = |command: &StoredCommand| {
+            Proposal::new(
+                ProposalPriority::from_u64(1),
+                "other",
+                1,
+                AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, command),
+            )
+        };
+        let mut progress = ProposerProgress::new(1, proposal(&offered)).with_command(offered);
+
+        progress.proposal = proposal(&transition);
+        consensus.ensure_progress_command(&mut progress).unwrap();
+        progress.proposal = proposal(&adopted);
+        consensus.ensure_progress_command(&mut progress).unwrap();
+
+        assert_eq!(progress.command, Some(adopted));
+        assert!(progress.transition_involved);
     }
 }

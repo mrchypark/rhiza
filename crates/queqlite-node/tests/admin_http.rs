@@ -222,6 +222,9 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
 
     let status = admin_status(addr).await;
+    assert_eq!(status.cluster_id, "cluster-a");
+    assert_eq!(status.epoch, 1);
+    assert_eq!(status.recovery_generation, 1);
     assert_eq!(
         status.node.configuration_status,
         RuntimeConfigurationStatus::Stopped

@@ -2,6 +2,7 @@
 members = [
     "crates/queqlite",
     "crates/queqlite-archive",
+    "crates/queqlite-cli",
     "crates/queqlite-core",
     "crates/queqlite-log",
     "crates/queqlite-node",

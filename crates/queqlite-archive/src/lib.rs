@@ -1761,7 +1761,47 @@ impl ObjectArchiveStore {
             stop_entry: stop_entry.clone(),
             successor,
         };
-        self.copy_checkpoint_to(target, Some(transition)).await
+        if let Some(advanced) = target
+            .load_valid_advanced_successor(&transition, stop_entry.index)
+            .await?
+        {
+            return Ok(advanced);
+        }
+        match self
+            .copy_checkpoint_to(target, Some(transition.clone()))
+            .await
+        {
+            Err(Error::CheckpointTargetConflict) => target
+                .load_valid_advanced_successor(&transition, stop_entry.index)
+                .await?
+                .ok_or(Error::CheckpointTargetConflict),
+            result => result,
+        }
+    }
+
+    async fn load_valid_advanced_successor(
+        &self,
+        transition: &CheckpointSuccessorTransition,
+        stop_index: u64,
+    ) -> Result<Option<LoadedCheckpointManifest>> {
+        let Some(loaded) = self.load_checkpoint().await? else {
+            return Ok(None);
+        };
+        if loaded.manifest.successor_transition.as_ref() != Some(transition)
+            || loaded.manifest.tip.index() <= stop_index
+        {
+            return Ok(None);
+        }
+        self.restore_checkpoint_v2().await?;
+        let reloaded = self.load_checkpoint().await?.ok_or_else(|| {
+            Error::InvalidCheckpoint("advanced successor checkpoint disappeared".into())
+        })?;
+        if reloaded.manifest.successor_transition.as_ref() != Some(transition)
+            || reloaded.manifest.tip.index() <= stop_index
+        {
+            return Err(Error::CheckpointTargetConflict);
+        }
+        Ok(Some(reloaded))
     }
 
     async fn copy_checkpoint_to(

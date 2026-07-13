@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use queqlite_core::{Command, CommandKind, ConfigurationState};
+use queqlite_core::{Command, CommandKind, ConfigurationState, LogHash};
 use queqlite_node::{
     install_successor_recorder, log_peer_router, AdminConfig, ConfigError, FetchLogRequest,
     InMemoryLogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, RuntimeConfigurationStatus,
@@ -274,6 +274,47 @@ fn stopped_runtime_rejects_writes_with_typed_transition_error() {
         runtime.write("request-1", "key", "value"),
         Err(NodeError::ConfigurationTransition { state }) if state.as_ref() == &stopped
     ));
+}
+
+#[test]
+fn stop_advances_past_an_already_decided_normal_command() {
+    let root = TempDir::new().unwrap();
+    let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+    let config = NodeConfig::new(
+        "cluster-a",
+        "n1",
+        root.path().join("node"),
+        1,
+        1,
+        peers(3),
+        "client-token",
+    )
+    .unwrap();
+    let consensus = Arc::new(membership_consensus(root.path(), membership.clone()));
+    consensus
+        .propose_at(
+            1,
+            LogHash::ZERO,
+            Command::new(CommandKind::ReadBarrier, Vec::new()),
+        )
+        .unwrap();
+    let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+
+    let stop = runtime
+        .stop_current_configuration_for_successor(&membership)
+        .unwrap();
+
+    assert_eq!(stop.entry.index, 2);
+    assert_eq!(runtime.applied_index().unwrap(), 2);
+    assert_eq!(
+        runtime
+            .configuration_state()
+            .unwrap()
+            .stop()
+            .unwrap()
+            .index(),
+        2
+    );
 }
 
 #[test]
