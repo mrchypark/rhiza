@@ -6,27 +6,40 @@ printf '%s\n' "$*" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
 case " $* " in
   *" get statefulset queqlite-c3 "*) exit 0 ;;
   *" get secret queqlite-c4-bundle -o json "*) exit 1 ;;
+  *" get secret queqlite-auth -o json "*) cat "$QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE" ;;
   *" get secret missing-object-credentials "*) exit 1 ;;
   *" create -f "*)
     manifest="${*: -1}"
-    args="$(yq eval -r '.spec.template.spec.containers[0].args | join(" ")' "$manifest")"
-    [ "$args" = "checkpoint inspect" ]
-    printf '%s\n' "$args" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
-    case "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" in
-      provider)
-        [ "$(yq eval '[.spec.template.spec.containers[0].env[] |
-          select(.name == "QUEQLITE_S3_ENDPOINT" or
-            .name == "QUEQLITE_S3_ACCESS_KEY" or
-            .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$manifest")" = 0 ]
-        ;;
-      endpoint)
-        [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
-          select(.name == "QUEQLITE_S3_ENDPOINT") | .value' "$manifest")" = \
-          http://127.0.0.1:1 ]
-        ;;
-      *) exit 99 ;;
-    esac
+    if [ "$(yq eval -r '.spec.template.spec.containers[0].name' "$manifest")" = curl ]; then
+      method="$(yq eval -r '.spec.template.spec.containers[0].env[] |
+        select(.name == "QUEQLITE_ADMIN_METHOD") | .value' "$manifest")"
+      path="$(yq eval -r '.spec.template.spec.containers[0].env[] |
+        select(.name == "QUEQLITE_ADMIN_PATH") | .value' "$manifest")"
+      [ "$method $path" = "GET /v1/admin/membership/status" ]
+      printf 'admin %s %s\n' "$method" "$path" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
+    else
+      args="$(yq eval -r '.spec.template.spec.containers[0].args | join(" ")' "$manifest")"
+      [ "$args" = "checkpoint inspect" ]
+      printf '%s\n' "$args" >> "$QUEQLITE_KUBECTL_FIXTURE_LOG"
+      case "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" in
+        provider)
+          [ "$(yq eval '[.spec.template.spec.containers[0].env[] |
+            select(.name == "QUEQLITE_S3_ENDPOINT" or
+              .name == "QUEQLITE_S3_ACCESS_KEY" or
+              .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$manifest")" = 0 ]
+          ;;
+        endpoint)
+          [ "$(yq eval -r '.spec.template.spec.containers[0].env[] |
+            select(.name == "QUEQLITE_S3_ENDPOINT") | .value' "$manifest")" = \
+            http://127.0.0.1:1 ]
+          ;;
+        *) exit 99 ;;
+      esac
+    fi
     ;;
+  *" get job/ql-admin-"*"Complete"*) printf 'True' ;;
+  *" get job/ql-admin-"*"Failed"*) exit 0 ;;
+  *" logs job/ql-admin-"*) cat "$QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE" ;;
   *" get job/ql-object-"*"Complete"*) exit 0 ;;
   *" get job/ql-object-"*"Failed"*) printf 'True' ;;
   *" logs job/ql-object-"*) echo "fixture object-store preflight failed" >&2 ;;

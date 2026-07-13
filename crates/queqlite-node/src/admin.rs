@@ -59,6 +59,8 @@ impl fmt::Debug for AdminConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct AdminStatusResponse {
+    pub cluster_id: String,
+    pub epoch: u64,
     pub node: NodeStatus,
     pub members: Vec<String>,
     pub recovery_generation: u64,
@@ -652,6 +654,8 @@ fn status_response(state: &AdminRouteState) -> Result<AdminStatusResponse, NodeE
     });
     let stopped_transition = stopped_transition(&state.runtime)?;
     Ok(AdminStatusResponse {
+        cluster_id: state.runtime.config.cluster_id().to_owned(),
+        epoch: state.runtime.config.epoch(),
         node,
         members: state.runtime.config.membership().members().to_vec(),
         recovery_generation: state.runtime.config.recovery_generation(),

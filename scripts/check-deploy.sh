@@ -170,16 +170,10 @@ for invalid_env in \
   [ ! -e "$invalid_env_dir/stop-c3.state.json" ]
 done
 
-# Permit read-only discovery, but record any kubectl mutation attempted afterward.
-# shellcheck disable=SC2016
-printf '%s\n' '#!/usr/bin/env bash' \
-  'case " $* " in' \
-  '  *" get statefulset "*) exit 0 ;;' \
-  '  *" get secret "*) exit 1 ;;' \
-  '  *) : > "$KUBECTL_MARKER"; exit 99 ;;' \
-  'esac' > "$stub_bin/kubectl"
 wrong_live_status="$tmp/wrong-live-members.json"
 jq -n '{
+  cluster_id:"queqlite-vind",
+  epoch:1,
   node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
   members:["node-1","node-2","other-node"],
   recovery_generation:1,
@@ -188,21 +182,39 @@ jq -n '{
   stopped_transition:null
 }' > "$wrong_live_status"
 wrong_members_dir="$tmp/wrong-members-transition"
-wrong_members_marker="$tmp/wrong-members.kubectl-mutation"
+wrong_members_log="$tmp/wrong-members.kubectl-log"
+preflight_bin="$tmp/preflight-bin"
+mkdir "$preflight_bin"
+cp scripts/test-fixtures/kubectl-preflight-failure.sh "$preflight_bin/kubectl"
+chmod +x "$preflight_bin/kubectl"
+valid_auth_secret="$tmp/valid-auth-secret.json"
+jq -n \
+  --arg client "$(printf '%s' successor-client | openssl base64 -A)" \
+  --arg admin "$(printf '%s' successor-admin | openssl base64 -A)" \
+  '{data:{"client-token":$client,"admin-token":$admin}}' > "$valid_auth_secret"
 set +e
-PATH="$stub_bin:$PATH" KUBECTL_MARKER="$wrong_members_marker" \
+PATH="$preflight_bin:$PATH" \
+  QUEQLITE_KUBECTL_FIXTURE_PROFILE=wrong-members \
+  QUEQLITE_KUBECTL_FIXTURE_LOG="$wrong_members_log" \
+  QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$wrong_live_status" \
+  QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
   QUEQLITE_RECONFIG_WORK_DIR="$wrong_members_dir" \
-  QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$wrong_live_status" \
   scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
   >/dev/null 2>&1
 wrong_members_rc=$?
 set -e
 [ "$wrong_members_rc" = 65 ]
 [ ! -e "$wrong_members_dir/stop-c3.state.json" ]
-[ ! -e "$wrong_members_marker" ]
+grep -Fq 'admin GET /v1/admin/membership/status' "$wrong_members_log"
+if grep -Fq 'checkpoint inspect' "$wrong_members_log"; then
+  echo "wrong live membership reached the object-store preflight" >&2
+  exit 1
+fi
 
 valid_live_status="$tmp/valid-live-members.json"
 jq -n '{
+  cluster_id:"queqlite-vind",
+  epoch:1,
   node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
   members:["node-1","node-2","node-3"],
   recovery_generation:1,
@@ -210,11 +222,6 @@ jq -n '{
   checkpoint_root:null,
   stopped_transition:null
 }' > "$valid_live_status"
-preflight_bin="$tmp/preflight-bin"
-mkdir "$preflight_bin"
-cp scripts/test-fixtures/kubectl-preflight-failure.sh "$preflight_bin/kubectl"
-chmod +x "$preflight_bin/kubectl"
-
 assert_object_preflight_blocks_stop() {
   local profile="$1"
   local transition_dir="$tmp/${profile}-preflight-transition"
@@ -224,8 +231,9 @@ assert_object_preflight_blocks_stop() {
   env "$@" PATH="$preflight_bin:$PATH" \
     QUEQLITE_KUBECTL_FIXTURE_PROFILE="$profile" \
     QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
+    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
     QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
-    QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$valid_live_status" \
     scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
     >/dev/null 2>&1
   rc=$?
@@ -243,14 +251,83 @@ assert_object_preflight_blocks_stop provider
 assert_object_preflight_blocks_stop endpoint \
   QUEQLITE_S3_ENDPOINT=http://127.0.0.1:1 QUEQLITE_S3_ALLOW_HTTP=true
 
+assert_live_identity_rejected() {
+  local filter="$1" label="$2"
+  local status="$tmp/${label}-status.json"
+  local transition_dir="$tmp/${label}-transition"
+  local command_log="$tmp/${label}.kubectl-log" rc
+  jq "$filter" "$valid_live_status" > "$status"
+  set +e
+  PATH="$preflight_bin:$PATH" \
+    QUEQLITE_KUBECTL_FIXTURE_PROFILE=identity \
+    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
+    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$status" \
+    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" = 65 ]
+  [ ! -e "$transition_dir/stop-c3.state.json" ]
+  grep -Fq 'admin GET /v1/admin/membership/status' "$command_log"
+  if grep -Eq 'checkpoint inspect|admin POST|scale statefulset|apply |create secret' \
+    "$command_log"; then
+    echo "live identity mismatch allowed a transition action: $label" >&2
+    exit 1
+  fi
+}
+
+assert_live_identity_rejected '.cluster_id = "other-cluster"' wrong-cluster
+assert_live_identity_rejected '.epoch = 2' wrong-epoch
+assert_live_identity_rejected '.recovery_generation = 2' wrong-generation
+
+assert_auth_secret_rejected() {
+  local secret="$1" label="$2"
+  local transition_dir="$tmp/${label}-auth-transition"
+  local command_log="$tmp/${label}-auth.kubectl-log" rc
+  set +e
+  PATH="$preflight_bin:$PATH" \
+    QUEQLITE_KUBECTL_FIXTURE_PROFILE=auth \
+    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
+    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$secret" \
+    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" = 65 ]
+  [ ! -e "$transition_dir/stop-c3.state.json" ]
+  grep -Fq 'get secret queqlite-auth -o json' "$command_log"
+  if grep -Eq 'admin |checkpoint inspect|scale statefulset|apply |create secret' \
+    "$command_log"; then
+    echo "invalid auth Secret allowed a transition action: $label" >&2
+    exit 1
+  fi
+}
+
+jq 'del(.data["admin-token"])' "$valid_auth_secret" > "$tmp/missing-admin-auth.json"
+assert_auth_secret_rejected "$tmp/missing-admin-auth.json" missing-admin
+jq --arg blank "$(printf ' ' | openssl base64 -A)" \
+  '.data["client-token"] = $blank' "$valid_auth_secret" > "$tmp/blank-client-auth.json"
+assert_auth_secret_rejected "$tmp/blank-client-auth.json" blank-client
+jq '.data["admin-token"] = .data["client-token"]' "$valid_auth_secret" \
+  > "$tmp/shared-auth.json"
+assert_auth_secret_rejected "$tmp/shared-auth.json" shared-client-admin
+jq --arg peer "$(printf '%s' not-a-real-secret-1 | openssl base64 -A)" \
+  '.data["admin-token"] = $peer' "$valid_auth_secret" > "$tmp/peer-auth.json"
+assert_auth_secret_rejected "$tmp/peer-auth.json" peer-collision
+
 missing_secret_dir="$tmp/missing-secret-transition"
 missing_secret_log="$tmp/missing-secret.kubectl-log"
 set +e
 PATH="$preflight_bin:$PATH" \
   QUEQLITE_KUBECTL_FIXTURE_PROFILE=missing-secret \
   QUEQLITE_KUBECTL_FIXTURE_LOG="$missing_secret_log" \
+  QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+  QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
   QUEQLITE_RECONFIG_WORK_DIR="$missing_secret_dir" \
-  QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$valid_live_status" \
   QUEQLITE_OBJECT_SECRET=missing-object-credentials \
   scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
   >/dev/null 2>&1
@@ -263,6 +340,31 @@ if grep -Fq 'checkpoint inspect' "$missing_secret_log"; then
   echo "missing explicit credentials reached the object-store Job" >&2
   exit 1
 fi
+
+fake_checkpoint="$tmp/fake-checkpoint.json"
+jq -n '{identity:{config_id:3}}' > "$fake_checkpoint"
+for bypass_env in \
+  "QUEQLITE_OBJECT_JOB_RESPONSE_FILE=$fake_checkpoint" \
+  "QUEQLITE_OBJECT_JOB_RENDER_ONLY=$tmp/render-only.yaml" \
+  "QUEQLITE_ADMIN_JOB_RESPONSE_FILE=$valid_live_status" \
+  "QUEQLITE_ADMIN_JOB_RENDER_ONLY=$tmp/admin-render-only.yaml" \
+  "QUEQLITE_STATEFULSET_FIXTURE_DIR=$tmp/statefulset-fixture"; do
+  bypass_dir="$tmp/${bypass_env%%=*}-transition"
+  bypass_log="$tmp/${bypass_env%%=*}.kubectl-log"
+  set +e
+  env "$bypass_env" PATH="$preflight_bin:$PATH" \
+    QUEQLITE_KUBECTL_FIXTURE_PROFILE=provider \
+    QUEQLITE_KUBECTL_FIXTURE_LOG="$bypass_log" \
+    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    QUEQLITE_RECONFIG_WORK_DIR="$bypass_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  bypass_rc=$?
+  set -e
+  [ "$bypass_rc" = 65 ]
+  [ ! -e "$bypass_dir/stop-c3.state.json" ]
+  [ ! -e "$bypass_log" ]
+done
 
 stop_successor="$(jq -cn '{config_id:4,members:["node-1","node-2","node-3"],
   digest:[range(32) | 0]}')"
@@ -309,13 +411,55 @@ jq -e '
   .version == 1 and .config_id == 4 and .predecessor.version == 2 and
   .predecessor.stop_entry.config_id == 3 and .predecessor.stop_proof != null
 ' "$partial_successor_bundle" >/dev/null
-jq '.predecessor.unknown = true' "$partial_successor_bundle" \
-  > "$tmp/unknown-predecessor-field.json"
-if scripts/render-k8s-config.sh 4 3 \
-  "$tmp/unknown-predecessor-field.json" "$tmp/invalid-predecessor-field.yaml" successor; then
-  echo "render accepted an unknown predecessor field" >&2
-  exit 1
-fi
+valid_predecessor_bundle="$tmp/valid-predecessor-bundle.json"
+jq '
+  def bytes($value): [range(32) | $value];
+  {priority:bytes(255), proposer_id:"node-1", proposal_id:1,
+   value:{command_hash:bytes(2), prev_hash:bytes(0), entry_hash:bytes(1)}} as $proposal |
+  .predecessor = {
+    version:2,
+    members:["node-1","node-2","node-3"],
+    stop_entry:{
+      cluster_id:"queqlite-vind", epoch:1, config_id:3, index:9,
+      entry_type:"ConfigChange", payload:[1], prev_hash:bytes(0), hash:bytes(1)
+    },
+    stop_proof:{FastPath:{
+      cluster_id:"queqlite-vind", slot:9, epoch:1, config_id:3,
+      config_digest:bytes(3), proposal:$proposal,
+      summaries:["node-1","node-2"] | map({
+        recorder_id:., slot:9, step:4,
+        first_current:$proposal, aggregate_prior:null
+      })
+    }}
+  }
+' "$successor_draft" > "$valid_predecessor_bundle"
+scripts/render-k8s-config.sh 4 3 \
+  "$valid_predecessor_bundle" "$tmp/valid-predecessor.yaml" successor
+valid_phase2_bundle="$tmp/valid-phase2-predecessor-bundle.json"
+jq '
+  .predecessor.stop_proof.FastPath as $proof |
+  .predecessor.stop_proof = {Phase2:($proof + {step:6} |
+    .summaries |= map(.step = 6 | .first_current = null |
+      .aggregate_prior = $proof.proposal))}
+' "$valid_predecessor_bundle" > "$valid_phase2_bundle"
+scripts/render-k8s-config.sh 4 3 \
+  "$valid_phase2_bundle" "$tmp/valid-phase2-predecessor.yaml" successor
+
+assert_predecessor_rejected() {
+  local filter="$1" label="$2"
+  local invalid_bundle="$tmp/invalid-predecessor-${label}.json"
+  jq "$filter" "$valid_predecessor_bundle" > "$invalid_bundle"
+  if scripts/render-k8s-config.sh 4 3 \
+    "$invalid_bundle" "$tmp/invalid-predecessor-${label}.yaml" successor; then
+    echo "render accepted malformed predecessor $label" >&2
+    exit 1
+  fi
+}
+assert_predecessor_rejected '.predecessor.version = 1' version
+assert_predecessor_rejected '.predecessor.members = ["node-1","node-1","node-3"]' members
+assert_predecessor_rejected 'del(.predecessor.stop_entry.hash)' stop-entry
+assert_predecessor_rejected '.predecessor.stop_proof = {}' stop-proof
+assert_predecessor_rejected '.predecessor.unknown = true' unknown-field
 for bundle_attempt in "$partial_successor_bundle".attempt.*; do
   [ ! -e "$bundle_attempt" ]
 done

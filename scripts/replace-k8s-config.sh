@@ -5,6 +5,14 @@ set -euo pipefail
   echo "usage: $0 OLD_BUNDLE_JSON SUCCESSOR_DRAFT_JSON" >&2
   exit 64
 }
+if [ -n "${QUEQLITE_OBJECT_JOB_RESPONSE_FILE+x}" ] ||
+  [ -n "${QUEQLITE_OBJECT_JOB_RENDER_ONLY+x}" ] ||
+  [ -n "${QUEQLITE_ADMIN_JOB_RESPONSE_FILE+x}" ] ||
+  [ -n "${QUEQLITE_ADMIN_JOB_RENDER_ONLY+x}" ] ||
+  [ -n "${QUEQLITE_STATEFULSET_FIXTURE_DIR+x}" ]; then
+  echo "test-only Job response/render hooks are forbidden during configuration replacement" >&2
+  exit 65
+fi
 old_bundle="$1"
 successor_draft="$2"
 namespace="${QUEQLITE_K8S_NAMESPACE:-queqlite-e2e}"
@@ -14,7 +22,10 @@ status_path="${QUEQLITE_ADMIN_STATUS_PATH:-/v1/admin/membership/status}"
 stop_path="${QUEQLITE_ADMIN_STOP_PATH:-/v1/admin/membership/stop}"
 compact_path="${QUEQLITE_ADMIN_COMPACT_PATH:-/v1/admin/checkpoint/compact}"
 activate_path="${QUEQLITE_ADMIN_ACTIVATE_PATH:-/v1/admin/membership/activate}"
+cluster_id="${QUEQLITE_CLUSTER_ID:-queqlite-vind}"
+epoch="${QUEQLITE_EPOCH:-1}"
 generation="${QUEQLITE_RECOVERY_GENERATION:-1}"
+auth_secret="${QUEQLITE_AUTH_SECRET:-queqlite-auth}"
 object_secret="${QUEQLITE_OBJECT_SECRET-}"
 object_secret_set="${QUEQLITE_OBJECT_SECRET+x}"
 
@@ -67,6 +78,24 @@ if durable_secret_json="$("${k[@]}" get secret "${new_name}-bundle" -o json 2>/d
   durable_resume=true
   echo "recovered transition state from durable Secret ${new_name}-bundle" >&2
 fi
+if ! auth_secret_json="$("${k[@]}" get secret "$auth_secret" -o json 2>/dev/null)"; then
+  echo "runtime authentication Secret is unavailable: $auth_secret" >&2
+  exit 65
+fi
+jq -e --slurpfile successor "$successor_draft" '
+  def auth_token:
+    type == "string" and (explode | length > 0 and all(. >= 33 and . <= 126));
+  (.data["client-token"] |
+    if type == "string" and length > 0 then (try @base64d catch null) else null end) as $client |
+  (.data["admin-token"] |
+    if type == "string" and length > 0 then (try @base64d catch null) else null end) as $admin |
+  ($client | auth_token) and ($admin | auth_token) and
+  $client != $admin and
+  all($successor[0].members[].token; . != $client and . != $admin)
+' <<< "$auth_secret_json" >/dev/null || {
+  echo "runtime authentication Secret has invalid or conflicting tokens" >&2
+  exit 65
+}
 if [ -n "$object_secret_set" ] &&
   ! "${k[@]}" get secret "$object_secret" >/dev/null; then
   echo "object credential Secret is unavailable: $object_secret" >&2
@@ -104,7 +133,11 @@ if ! "$durable_resume"; then
       echo "cannot verify live membership for ${old_name}-${ordinal}" >&2
       exit 65
     fi
-    jq -e --argjson id "$old_id" --argjson members "$expected_old_members" '
+    jq -e --arg cluster "$cluster_id" --argjson epoch "$epoch" \
+      --argjson generation "$generation" --argjson id "$old_id" \
+      --argjson members "$expected_old_members" '
+      .cluster_id == $cluster and .epoch == $epoch and
+      .recovery_generation == $generation and
       .node.active_config_id == $id and
       .node.configuration_state.config_id == $id and
       .members == $members and (.members | length) == ($members | length)
