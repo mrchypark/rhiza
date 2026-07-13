@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    client_authenticated, install_successor_recorder, ConfigError, NodeError, NodeRuntime,
-    NodeStatus, StopInformation,
+    client_authenticated, install_successor_recorder, valid_auth_token, ConfigError, NodeError,
+    NodeRuntime, NodeStatus, StopInformation,
 };
 use crate::{CheckpointCoordinator, DurabilityError};
 
@@ -40,7 +40,7 @@ pub struct AdminConfig {
 impl AdminConfig {
     pub fn new(token: impl Into<String>) -> Result<Self, ConfigError> {
         let token = token.into();
-        if token.trim().is_empty() {
+        if !valid_auth_token(&token) {
             return Err(ConfigError::EmptyAdminToken);
         }
         Ok(Self { token })
@@ -169,7 +169,7 @@ struct AdminRouteState {
     runtime: Arc<NodeRuntime>,
     recorder: RecorderFileStore,
     coordinator: Option<Arc<CheckpointCoordinator>>,
-    operations: Arc<tokio::sync::Mutex<HashMap<String, OperationRecord>>>,
+    operations: Arc<tokio::sync::Mutex<Option<HashMap<String, OperationRecord>>>>,
     ledger_path: PathBuf,
 }
 
@@ -190,9 +190,10 @@ pub fn node_router_with_admin(
     runtime: Arc<NodeRuntime>,
     recorder: RecorderFileStore,
     admin: AdminConfig,
-) -> Router {
-    crate::node_router(runtime.clone(), recorder.clone())
-        .merge(admin_router(runtime, recorder, None, admin))
+) -> Result<Router, ConfigError> {
+    validate_admin_token(&runtime, &admin)?;
+    Ok(crate::node_router(runtime.clone(), recorder.clone())
+        .merge(admin_router(runtime, recorder, None, admin)))
 }
 
 pub fn node_router_with_checkpoint_and_admin(
@@ -200,9 +201,25 @@ pub fn node_router_with_checkpoint_and_admin(
     recorder: RecorderFileStore,
     coordinator: Arc<CheckpointCoordinator>,
     admin: AdminConfig,
-) -> Router {
-    crate::node_router_with_checkpoint(runtime.clone(), recorder.clone(), coordinator.clone())
-        .merge(admin_router(runtime, recorder, Some(coordinator), admin))
+) -> Result<Router, ConfigError> {
+    validate_admin_token(&runtime, &admin)?;
+    Ok(
+        crate::node_router_with_checkpoint(runtime.clone(), recorder.clone(), coordinator.clone())
+            .merge(admin_router(runtime, recorder, Some(coordinator), admin)),
+    )
+}
+
+fn validate_admin_token(runtime: &NodeRuntime, admin: &AdminConfig) -> Result<(), ConfigError> {
+    if runtime.config().client_token() == admin.token
+        || runtime
+            .config()
+            .peers()
+            .iter()
+            .any(|peer| peer.token() == admin.token)
+    {
+        return Err(ConfigError::AdminTokenConflictsWithRuntime);
+    }
+    Ok(())
 }
 
 fn admin_router(
@@ -212,7 +229,12 @@ fn admin_router(
     admin: AdminConfig,
 ) -> Router {
     let ledger_path = runtime.config().data_dir().join("admin-operations-v1.json");
-    let operations = load_operations(&ledger_path).unwrap_or_default();
+    let operations = load_operations(&ledger_path)
+        .map(Some)
+        .unwrap_or_else(|error| {
+            eprintln!("admin operation ledger is unavailable: {error}");
+            None
+        });
     let state = AdminRouteState {
         runtime,
         recorder,
@@ -403,7 +425,10 @@ where
     };
     {
         let operations = state.operations.lock().await;
-        if let Some(response) = replay(&operations, &operation_id, &fingerprint) {
+        let Some(operations) = operations.as_ref() else {
+            return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
+        };
+        if let Some(response) = replay(operations, &operation_id, &fingerprint) {
             return response;
         }
     }
@@ -418,13 +443,15 @@ where
         let _permit = permit;
         let result = operation.await;
         let mut operations = detached_state.operations.lock().await;
-        let _ = store_result(
-            &mut operations,
-            detached_operation_id,
-            detached_fingerprint,
-            result,
-        );
-        let _ = persist_operations(&detached_state.ledger_path, &operations);
+        let Some(records) = operations.as_mut() else {
+            completed.send_replace(true);
+            return;
+        };
+        let _ = store_result(records, detached_operation_id, detached_fingerprint, result);
+        if let Err(error) = persist_operations(&detached_state.ledger_path, records) {
+            eprintln!("admin operation ledger persistence failed: {error}");
+            *operations = None;
+        }
         completed.send_replace(true);
     });
     let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -439,7 +466,10 @@ where
         return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
     }
     let operations = state.operations.lock().await;
-    replay(&operations, &operation_id, &fingerprint)
+    let Some(operations) = operations.as_ref() else {
+        return admin_error(StatusCode::SERVICE_UNAVAILABLE, AdminErrorCode::Unavailable);
+    };
+    replay(operations, &operation_id, &fingerprint)
         .unwrap_or_else(|| admin_error(StatusCode::INTERNAL_SERVER_ERROR, AdminErrorCode::Internal))
 }
 
