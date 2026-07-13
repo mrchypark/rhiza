@@ -107,6 +107,7 @@ jq '.members[0].token = "peer-sécret"' "$tmp/config-4.json" \
   > "$tmp/config-4-nonascii-token.json"
 jq '.members[0].unknown = true' "$tmp/config-4.json" \
   > "$tmp/config-4-unknown-member-field.json"
+jq '.version = 2' "$tmp/config-3.json" > "$tmp/config-3-version-2.json"
 stub_bin="$tmp/stub-bin"
 mkdir "$stub_bin"
 # shellcheck disable=SC2016
@@ -135,6 +136,39 @@ assert_replace_rejects_before_kubectl "$tmp/config-4-spaced-token.json" spaced-t
 assert_replace_rejects_before_kubectl "$tmp/config-4-nonascii-token.json" nonascii-token
 assert_replace_rejects_before_kubectl \
   "$tmp/config-4-unknown-member-field.json" unknown-member-field
+
+invalid_old_marker="$tmp/invalid-old-version.kubectl-called"
+invalid_old_dir="$tmp/invalid-old-version-transition"
+set +e
+PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_old_marker" \
+  QUEQLITE_RECONFIG_WORK_DIR="$invalid_old_dir" \
+  scripts/replace-k8s-config.sh \
+    "$tmp/config-3-version-2.json" "$tmp/config-4.json" >/dev/null 2>&1
+invalid_old_rc=$?
+set -e
+[ "$invalid_old_rc" = 65 ]
+[ ! -e "$invalid_old_marker" ]
+[ ! -e "$invalid_old_dir/stop-c3.state.json" ]
+
+for invalid_env in \
+  'QUEQLITE_EPOCH=abc' \
+  'QUEQLITE_EPOCH=0' \
+  'QUEQLITE_RECOVERY_GENERATION=abc' \
+  'QUEQLITE_RECOVERY_GENERATION=0' \
+  'QUEQLITE_S3_ALLOW_HTTP=maybe'; do
+  invalid_env_marker="$tmp/${invalid_env//=/_}.kubectl-called"
+  invalid_env_dir="$tmp/${invalid_env//=/_}-transition"
+  set +e
+  env "$invalid_env" PATH="$stub_bin:$PATH" KUBECTL_MARKER="$invalid_env_marker" \
+    QUEQLITE_RECONFIG_WORK_DIR="$invalid_env_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  invalid_env_rc=$?
+  set -e
+  [ "$invalid_env_rc" = 65 ]
+  [ ! -e "$invalid_env_marker" ]
+  [ ! -e "$invalid_env_dir/stop-c3.state.json" ]
+done
 
 # Permit read-only discovery, but record any kubectl mutation attempted afterward.
 # shellcheck disable=SC2016
@@ -166,6 +200,69 @@ set -e
 [ "$wrong_members_rc" = 65 ]
 [ ! -e "$wrong_members_dir/stop-c3.state.json" ]
 [ ! -e "$wrong_members_marker" ]
+
+valid_live_status="$tmp/valid-live-members.json"
+jq -n '{
+  node:{active_config_id:3,configuration_state:{phase:"active",config_id:3}},
+  members:["node-1","node-2","node-3"],
+  recovery_generation:1,
+  qlog_root:{index:0,hash:[range(32) | 0]},
+  checkpoint_root:null,
+  stopped_transition:null
+}' > "$valid_live_status"
+preflight_bin="$tmp/preflight-bin"
+mkdir "$preflight_bin"
+cp scripts/test-fixtures/kubectl-preflight-failure.sh "$preflight_bin/kubectl"
+chmod +x "$preflight_bin/kubectl"
+
+assert_object_preflight_blocks_stop() {
+  local profile="$1"
+  local transition_dir="$tmp/${profile}-preflight-transition"
+  local command_log="$tmp/${profile}-preflight.kubectl-log" rc
+  shift
+  set +e
+  env "$@" PATH="$preflight_bin:$PATH" \
+    QUEQLITE_KUBECTL_FIXTURE_PROFILE="$profile" \
+    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
+    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$valid_live_status" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" = 1 ]
+  [ ! -e "$transition_dir/stop-c3.state.json" ]
+  grep -Fq 'checkpoint inspect' "$command_log"
+  if grep -Eq 'scale statefulset|apply |create secret|membership/stop' "$command_log"; then
+    echo "object-store preflight allowed an irreversible transition action" >&2
+    exit 1
+  fi
+}
+
+assert_object_preflight_blocks_stop provider
+assert_object_preflight_blocks_stop endpoint \
+  QUEQLITE_S3_ENDPOINT=http://127.0.0.1:1 QUEQLITE_S3_ALLOW_HTTP=true
+
+missing_secret_dir="$tmp/missing-secret-transition"
+missing_secret_log="$tmp/missing-secret.kubectl-log"
+set +e
+PATH="$preflight_bin:$PATH" \
+  QUEQLITE_KUBECTL_FIXTURE_PROFILE=missing-secret \
+  QUEQLITE_KUBECTL_FIXTURE_LOG="$missing_secret_log" \
+  QUEQLITE_RECONFIG_WORK_DIR="$missing_secret_dir" \
+  QUEQLITE_ADMIN_JOB_RESPONSE_FILE="$valid_live_status" \
+  QUEQLITE_OBJECT_SECRET=missing-object-credentials \
+  scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+  >/dev/null 2>&1
+missing_secret_rc=$?
+set -e
+[ "$missing_secret_rc" = 65 ]
+[ ! -e "$missing_secret_dir/stop-c3.state.json" ]
+grep -Fq 'get secret missing-object-credentials' "$missing_secret_log"
+if grep -Fq 'checkpoint inspect' "$missing_secret_log"; then
+  echo "missing explicit credentials reached the object-store Job" >&2
+  exit 1
+fi
 
 stop_successor="$(jq -cn '{config_id:4,members:["node-1","node-2","node-3"],
   digest:[range(32) | 0]}')"
@@ -311,6 +408,8 @@ grep -Fq '{config_id:$id,members:$members,digest:$digest}' \
 # shellcheck disable=SC2016
 grep -Fq 'scripts/k8s-stop-state.sh prepare "$stop_state"' scripts/replace-k8s-config.sh
 stop_state_line="$(grep -n 'k8s-stop-state.sh prepare' scripts/replace-k8s-config.sh | cut -d: -f1)"
+object_preflight_line="$(grep -n 'k8s-object-job.sh.*checkpoint inspect' \
+  scripts/replace-k8s-config.sh | head -n 1 | cut -d: -f1)"
 # shellcheck disable=SC2016
 successor_preflight_line="$(grep -n '"$successor_draft" "$successor_preflight_yaml" successor' \
   scripts/replace-k8s-config.sh | cut -d: -f1)"
@@ -330,6 +429,7 @@ stop_post_line="$(grep -n 'POST "$stop_path"' scripts/replace-k8s-config.sh | cu
 [ "$stop_validate_line" -lt "$stop_post_line" ]
 [ "$successor_preflight_line" -lt "$first_kubectl_line" ]
 [ "$successor_preflight_line" -lt "$stop_state_line" ]
+[ "$object_preflight_line" -lt "$stop_state_line" ]
 grep -Fq 'k8s-stop-state.sh recover' scripts/replace-k8s-config.sh
 grep -Fq 'incomplete successor bundle artifact will be rebuilt' \
   scripts/replace-k8s-config.sh
@@ -410,6 +510,18 @@ if QUEQLITE_OBJECT_SECRET='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-objec
   echo "object Job accepted an explicitly empty object credential secret" >&2
   exit 1
 fi
+for invalid_env in \
+  'QUEQLITE_EPOCH=abc' \
+  'QUEQLITE_EPOCH=0' \
+  'QUEQLITE_RECOVERY_GENERATION=abc' \
+  'QUEQLITE_RECOVERY_GENERATION=0' \
+  'QUEQLITE_S3_ALLOW_HTTP=maybe'; do
+  if env "$invalid_env" QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-object-job.yaml" \
+    scripts/k8s-object-job.sh 3 "$tmp/config-3.json" checkpoint inspect; then
+    echo "object Job accepted invalid environment: $invalid_env" >&2
+    exit 1
+  fi
+done
 
 mkdir "$tmp/ready-fixture"
 jq -n '{metadata:{generation:4}, spec:{replicas:3},

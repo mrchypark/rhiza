@@ -35,6 +35,17 @@ export OBJECT_SECRET="${QUEQLITE_OBJECT_SECRET-}"
 export OBJECT_SECRET_SET="${QUEQLITE_OBJECT_SECRET+x}"
 export RECOVERY_GENERATION="${QUEQLITE_RECOVERY_GENERATION:-1}"
 export BUNDLE_SECRET="${name}-bundle"
+die() { echo "$*" >&2; exit 65; }
+case "$EPOCH" in
+  ''|*[!0-9]*|0) die "QUEQLITE_EPOCH must be a positive integer" ;;
+esac
+case "$RECOVERY_GENERATION" in
+  ''|*[!0-9]*|0) die "QUEQLITE_RECOVERY_GENERATION must be a positive integer" ;;
+esac
+case "$S3_ALLOW_HTTP" in
+  true|false|1|0) ;;
+  *) die "QUEQLITE_S3_ALLOW_HTTP must be true|false|1|0" ;;
+esac
 [ -z "$S3_ENDPOINT_SET" ] || [ -n "$S3_ENDPOINT" ] || {
   echo "QUEQLITE_S3_ENDPOINT must not be empty when set" >&2
   exit 65

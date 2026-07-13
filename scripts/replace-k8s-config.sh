@@ -15,6 +15,8 @@ stop_path="${QUEQLITE_ADMIN_STOP_PATH:-/v1/admin/membership/stop}"
 compact_path="${QUEQLITE_ADMIN_COMPACT_PATH:-/v1/admin/checkpoint/compact}"
 activate_path="${QUEQLITE_ADMIN_ACTIVATE_PATH:-/v1/admin/membership/activate}"
 generation="${QUEQLITE_RECOVERY_GENERATION:-1}"
+object_secret="${QUEQLITE_OBJECT_SECRET-}"
+object_secret_set="${QUEQLITE_OBJECT_SECRET+x}"
 
 for tool in kubectl jq yq openssl; do command -v "$tool" >/dev/null || { echo "missing required command: $tool" >&2; exit 127; }; done
 old_id="$(jq -er '.config_id' "$old_bundle")"
@@ -25,11 +27,21 @@ new_replicas="$(jq -er '.members | length' "$successor_draft")"
 case "$old_replicas:$new_replicas" in [3-7]:[3-7]) ;; *) exit 65;; esac
 jq -e '.version == 1 and (.predecessor | not)' "$successor_draft" >/dev/null
 
+umask 077
+old_preflight_yaml="$(mktemp)"
+successor_preflight_yaml="$(mktemp)"
+trap 'rm -f "$old_preflight_yaml" "$successor_preflight_yaml"' EXIT
+scripts/render-k8s-config.sh \
+  "$old_id" "$old_replicas" "$old_bundle" "$old_preflight_yaml"
+scripts/render-k8s-config.sh \
+  "$new_id" "$new_replicas" "$successor_draft" "$successor_preflight_yaml" successor
+rm -f "$old_preflight_yaml" "$successor_preflight_yaml"
+trap - EXIT
+
 old_name="queqlite-c${old_id}"
 new_name="queqlite-c${new_id}"
 mkdir -p "$work_dir"
 chmod 700 "$work_dir"
-umask 077
 stop_json="$work_dir/stop-c${old_id}.json"
 stop_state="$work_dir/stop-c${old_id}.state.json"
 successor_bundle="$work_dir/config-c${new_id}.json"
@@ -39,13 +51,7 @@ compact_json="$work_dir/compact-c${old_id}.json"
 forked_json="$work_dir/fork-c${old_id}-to-c${new_id}.json"
 target_inspect_json="$work_dir/checkpoint-c${new_id}.json"
 status_json="$work_dir/status.json"
-
-successor_preflight_yaml="$(mktemp "$work_dir/config-c${new_id}.preflight.XXXXXX.yaml")"
-trap 'rm -f "$successor_preflight_yaml"' EXIT
-scripts/render-k8s-config.sh \
-  "$new_id" "$new_replicas" "$successor_draft" "$successor_preflight_yaml" successor
-rm -f "$successor_preflight_yaml"
-trap - EXIT
+object_preflight_json="$work_dir/checkpoint-c${old_id}.preflight.json"
 
 k=(kubectl)
 [ -z "$context" ] || k+=(--context "$context")
@@ -60,6 +66,11 @@ if durable_secret_json="$("${k[@]}" get secret "${new_name}-bundle" -o json 2>/d
   rm -f "$durable_secret_file"
   durable_resume=true
   echo "recovered transition state from durable Secret ${new_name}-bundle" >&2
+fi
+if [ -n "$object_secret_set" ] &&
+  ! "${k[@]}" get secret "$object_secret" >/dev/null; then
+  echo "object credential Secret is unavailable: $object_secret" >&2
+  exit 65
 fi
 resume=false
 if [ -s "$stop_json" ] && [ -s "$successor_bundle" ]; then
@@ -102,6 +113,15 @@ if ! "$durable_resume"; then
       exit 65
     }
   done
+  echo "preflighting checkpoint and object-store access"
+  QUEQLITE_RECOVERY_GENERATION="$generation" \
+    scripts/k8s-object-job.sh "$old_id" "$old_bundle" checkpoint inspect \
+    > "$object_preflight_json"
+  jq -e --argjson id "$old_id" '.identity.config_id == $id' \
+    "$object_preflight_json" >/dev/null || {
+    echo "object-store preflight returned a checkpoint for another configuration" >&2
+    exit 65
+  }
 fi
 
 be64() {

@@ -67,6 +67,16 @@ checkpoint_lease_ms="${QUEQLITE_CHECKPOINT_LEASE_MS:-300000}"
 bundle_secret="${name}-bundle"
 
 die() { echo "$*" >&2; exit 65; }
+case "$epoch" in
+  ''|*[!0-9]*|0) die "QUEQLITE_EPOCH must be a positive integer" ;;
+esac
+case "$generation" in
+  ''|*[!0-9]*|0) die "QUEQLITE_RECOVERY_GENERATION must be a positive integer" ;;
+esac
+case "$s3_http" in
+  true|false|1|0) ;;
+  *) die "QUEQLITE_S3_ALLOW_HTTP must be true|false|1|0" ;;
+esac
 case "$checkpoint_lease_ms" in
   ''|*[!0-9]*|0) die "QUEQLITE_CHECKPOINT_LEASE_MS must be a positive integer" ;;
 esac
