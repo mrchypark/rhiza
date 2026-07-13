@@ -17,17 +17,48 @@ grep -Fq 'export QUEQLITE_S3_ALLOW_HTTP=true' scripts/bench-vind.sh
 source scripts/bench-vind.sh
 
 : > "$tmp/empty-resources.jsonl"
-if validate_resource_samples "$tmp/empty-resources.jsonl"; then
+if validate_resource_sample_schema "$tmp/empty-resources.jsonl"; then
   echo "empty resource evidence was accepted" >&2
   exit 1
 fi
-printf '%s\n' '{"timestamp":"2026-07-13T00:00:00Z","source":"containerd_cri_stats","app":"queqlite","pod":"q-0","pod_uid":"u","container":"queqlite","container_id":"c","restart_count":0,"cpu_usage_usec":1,"memory_bytes":2}' > "$tmp/resources.jsonl"
-if validate_resource_samples "$tmp/resources.jsonl"; then
+resource_sample() {
+  jq -cn --arg app "$1" --argjson epoch "$2" \
+    '{timestamp:"2026-07-13T00:00:00Z",timestamp_epoch_seconds:$epoch,
+      source:"containerd_cri_stats",app:$app,pod:($app + "-0"),pod_uid:($app + "-uid"),
+      container:$app,container_id:($app + "-container"),restart_count:0,
+      cpu_usage_usec:$epoch,memory_bytes:2}'
+}
+resource_sample queqlite 100 > "$tmp/resources.jsonl"
+if validate_resource_sample_schema "$tmp/resources.jsonl"; then
   echo "resource evidence without simulator samples was accepted" >&2
   exit 1
 fi
-printf '%s\n' '{"timestamp":"2026-07-13T00:00:00Z","source":"containerd_cri_stats","app":"simulator","pod":"rustfs-0","pod_uid":"u2","container":"rustfs","container_id":"c2","restart_count":0,"cpu_usage_usec":1,"memory_bytes":2}' >> "$tmp/resources.jsonl"
-validate_resource_samples "$tmp/resources.jsonl"
+resource_sample simulator 100 >> "$tmp/resources.jsonl"
+validate_resource_sample_schema "$tmp/resources.jsonl"
+if validate_resource_samples "$tmp/resources.jsonl" 120 200 2; then
+  echo "single resource sample per app was accepted" >&2
+  exit 1
+fi
+cp "$tmp/resources.jsonl" "$tmp/stale-resources.jsonl"
+resource_sample queqlite 150 >> "$tmp/stale-resources.jsonl"
+resource_sample simulator 150 >> "$tmp/stale-resources.jsonl"
+if validate_resource_samples "$tmp/stale-resources.jsonl" 120 200 2; then
+  echo "resource evidence that ends before measurement coverage was accepted" >&2
+  exit 1
+fi
+{
+  resource_sample queqlite 150
+  resource_sample simulator 150
+  resource_sample queqlite 199
+  resource_sample simulator 199
+} > "$tmp/late-resources.jsonl"
+if validate_resource_samples "$tmp/late-resources.jsonl" 120 200 2; then
+  echo "resource evidence that starts after measurement was accepted" >&2
+  exit 1
+fi
+resource_sample queqlite 199 >> "$tmp/resources.jsonl"
+resource_sample simulator 199 >> "$tmp/resources.jsonl"
+validate_resource_samples "$tmp/resources.jsonl" 120 200 2
 
 : > "$tmp/empty-access.jsonl"
 printf '%s\n' '{"metering":{"enabled":true,"status":"failed","requests":0},"retained":{"status":"ok","object_count":0,"retained_bytes":0}}' > "$tmp/invalid-meter.json"
@@ -47,12 +78,24 @@ printf '%s\n' '{"metering":{"enabled":true,"status":"ok","requests":1},"retained
 validate_object_evidence "$tmp/access.jsonl" "$tmp/usage.json"
 [ "$(evidence_exit_status 0 failed ok)" = 1 ]
 [ "$(evidence_exit_status 7 ok ok)" = 7 ]
+[ "$(evidence_exit_status 0 ok ok failed)" = 1 ]
 failed_evidence="$(render_evidence_json failed ok true true)"
 jq -e '.status == "failed" and .resource_sampling.status == "failed" and
   .object_metering.status == "ok"' <<< "$failed_evidence" >/dev/null
 jq -e '.status == "disabled" and
   (.resource_sampling.enabled | not) and (.object_metering.enabled | not)' \
   <<< "$(render_evidence_json disabled disabled false false)" >/dev/null
+[ "$(cleanup_outcome 0 1)" = ok ]
+[ "$(cleanup_outcome 1 1)" = failed ]
+[ "$(cleanup_outcome 0 0)" = failed ]
+jq -e '.status == "failed" and (.cleaned_up | not)' \
+  <<< "$(render_cleanup_json failed failed ok)" >/dev/null
+jq -e '(.requested | not) and (.cleaned_up | not) and .namespace == "retained"' \
+  <<< "$(render_cleanup_json skipped retained retained)" >/dev/null
+jq -e '.started_at_epoch_seconds == 120 and .finished_at_epoch_seconds == 200' \
+  <<< "$(render_measurement_window_json 120 200)" >/dev/null
+printf '%s\n' '{"configured":{"warmup_seconds":0.5}}' > "$tmp/benchmark-report.json"
+[ "$(measurement_start_from_report 100 "$tmp/benchmark-report.json")" = 101 ]
 
 build_line="$(grep -n 'cargo build --release --locked --manifest-path bench/Cargo.toml --bin queqlite-bench' scripts/bench-vind.sh | cut -d: -f1)"
 # shellcheck disable=SC2016 # Literal source-order check.
@@ -61,6 +104,8 @@ meter_line="$(grep -n "k exec .*': > /var/log/nginx/s3-access.log'" scripts/benc
 [ -n "$build_line" ] && [ "$build_line" -lt "$sample_line" ] && [ "$build_line" -lt "$meter_line" ]
 # shellcheck disable=SC2016 # Literal direct-execution check.
 grep -Fq 'QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}"' scripts/bench-vind.sh
+grep -Fq 'scripts/check-bench-vind-static.sh' .github/workflows/ci.yml
+grep -Fq 'YQ_VERSION: v4.47.2' .github/workflows/ci.yml
 
 printf '%s\n' 'fixture port-forward failure' > "$tmp/port-forward-0.log"
 if failure="$(

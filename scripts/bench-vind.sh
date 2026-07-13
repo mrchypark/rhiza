@@ -40,13 +40,20 @@ keep=false
 context=""
 previous_context=""
 created_cluster=false
+namespace_created=false
 port_forward_pids=()
 sampler_pid=""
 benchmark_status=255
 cleanup_status=0
+cleaned_up=false
+cleanup_verification_status=skipped
+namespace_cleanup_status=not_created
+vcluster_cleanup_status=not_created
 resource_evidence_status=disabled
 object_evidence_status=disabled
 object_meter_reset_status=disabled
+measurement_started_at_epoch_seconds=""
+measurement_finished_at_epoch_seconds=""
 [ "$resource_sampling" = 0 ] || resource_evidence_status=pending
 [ "$object_metering" = 0 ] || {
   object_evidence_status=pending
@@ -87,14 +94,31 @@ assert_port_forward_alive() {
   exit 1
 }
 
-validate_resource_samples() {
+validate_resource_sample_schema() {
   jq -s -e '
     any(.[]; .app == "queqlite") and any(.[]; .app == "simulator") and all(.[];
       (.timestamp | type == "string" and length > 0) and
+      (.timestamp_epoch_seconds | type == "number" and . >= 0) and
       .source == "containerd_cri_stats" and
       (.app == "queqlite" or .app == "simulator") and
       ([.pod,.pod_uid,.container,.container_id] | all(type == "string")) and
       ([.restart_count,.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0)))
+  ' "$1" >/dev/null 2>&1
+}
+
+validate_resource_samples() {
+  validate_resource_sample_schema "$1" && jq -s -e \
+    --argjson start "$2" --argjson end "$3" --argjson interval "$4" '
+    . as $samples |
+    $start >= 0 and $end >= $start and $interval > 0 and
+    all(["queqlite","simulator"][];
+      . as $app |
+      [$samples[] | select(.app == $app)] as $app_samples |
+      ($app_samples | length) >= 2 and
+      ([$app_samples[].timestamp_epoch_seconds] | min) <= $start and
+      ([$app_samples[].timestamp_epoch_seconds] | max) >= ($end - $interval - 1) and
+      ([$app_samples[].timestamp_epoch_seconds] | max) >
+        ([$app_samples[].timestamp_epoch_seconds] | min))
   ' "$1" >/dev/null 2>&1
 }
 
@@ -129,7 +153,7 @@ evidence_overall_status() {
 
 evidence_exit_status() {
   if [ "$1" -ne 0 ]; then echo "$1"
-  elif [ "$(evidence_overall_status "$2" "$3")" = failed ]; then echo 1
+  elif [ "$(evidence_overall_status "$2" "$3")" = failed ] || [ "${4:-ok}" = failed ]; then echo 1
   else echo 0
   fi
 }
@@ -141,6 +165,26 @@ render_evidence_json() {
     '{status:$overall,
       resource_sampling:{enabled:$resource_enabled,status:$resource},
       object_metering:{enabled:$object_enabled,status:$object}}'
+}
+
+cleanup_outcome() {
+  if [ "$1" -eq 0 ] && [ "$2" -ne 0 ]; then echo ok; else echo failed; fi
+}
+
+render_cleanup_json() {
+  jq -n --arg status "$1" --arg namespace_status "$2" --arg vcluster_status "$3" \
+    '{requested:($status != "skipped"),status:$status,cleaned_up:($status == "ok"),
+      namespace:$namespace_status,vcluster:$vcluster_status}'
+}
+
+render_measurement_window_json() {
+  jq -n --arg started "$1" --arg finished "$2" \
+    '{started_at_epoch_seconds:(if $started == "" then null else ($started | tonumber) end),
+      finished_at_epoch_seconds:(if $finished == "" then null else ($finished | tonumber) end)}'
+}
+
+measurement_start_from_report() {
+  jq -er --argjson started "$1" '$started + (.configured.warmup_seconds | ceil)' "$2"
 }
 
 # Allow the static check to exercise process-failure handling without starting a cluster.
@@ -227,6 +271,7 @@ shell_quote() { printf '%q' "$1"; }
 sample_resources() {
   printf 'resource sampler started: context=%s namespace=%s\n' "$context" "$namespace"
   while [ ! -e "$stop_sampler" ]; do
+    timestamp_epoch_seconds="$(date -u +%s)"
     timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     summary="$(timeout 3 docker exec "vcluster.cp.$cluster" crictl stats -o json 2>/dev/null || true)"
     if ! jq -e --arg namespace "$namespace" '
@@ -236,14 +281,15 @@ sample_resources() {
       sleep "$sample_interval"
       continue
     fi
-    jq -c --arg timestamp "$timestamp" --arg namespace "$namespace" '
+    jq -c --arg timestamp "$timestamp" --argjson timestamp_epoch_seconds "$timestamp_epoch_seconds" \
+      --arg namespace "$namespace" '
       .stats[] |
       select(.attributes.labels["io.kubernetes.pod.namespace"] == $namespace) |
       .attributes.metadata.name as $container |
       .attributes.labels["io.kubernetes.pod.name"] as $pod |
       select($container == "queqlite" or $container == "rustfs" or $container == "object-meter") |
       select($container != "queqlite" or ($pod | startswith("queqlite-c1-"))) |
-      {timestamp:$timestamp,source:"containerd_cri_stats",
+      {timestamp:$timestamp,timestamp_epoch_seconds:$timestamp_epoch_seconds,source:"containerd_cri_stats",
        app:(if $container == "queqlite" then "queqlite" else "simulator" end),
        pod:$pod,
        pod_uid:(.attributes.labels["io.kubernetes.pod.uid"] // ""),container:$container,
@@ -376,12 +422,15 @@ wait_for_checkpoint_drain() {
 }
 
 emit_artifacts() {
-  local cleaned_up=true resource_enabled=false object_enabled=false evidence
-  [ "$keep" = true ] && cleaned_up=false
+  local resource_enabled=false object_enabled=false evidence cleanup measurement_window
   [ "$resource_sampling" = 0 ] || resource_enabled=true
   [ "$object_metering" = 0 ] || object_enabled=true
   evidence="$(render_evidence_json "$resource_evidence_status" "$object_evidence_status" \
     "$resource_enabled" "$object_enabled")"
+  cleanup="$(render_cleanup_json "$cleanup_verification_status" \
+    "$namespace_cleanup_status" "$vcluster_cleanup_status")"
+  measurement_window="$(render_measurement_window_json \
+    "$measurement_started_at_epoch_seconds" "$measurement_finished_at_epoch_seconds")"
   jq -n \
     --arg run_id "$run_id" \
     --arg cluster "$cluster" \
@@ -400,9 +449,12 @@ emit_artifacts() {
     --argjson benchmark_exit "$benchmark_status" \
     --argjson run_exit "$cleanup_status" \
     --argjson evidence "$evidence" \
+    --argjson cleanup "$cleanup" \
+    --argjson measurement_window "$measurement_window" \
     --argjson cleaned_up "$cleaned_up" \
     '{run_id:$run_id,cluster:$cluster,namespace:$namespace,benchmark_exit_status:$benchmark_exit,
-      exit_status:$run_exit,evidence:$evidence,
+      exit_status:$run_exit,evidence:$evidence,cleanup:$cleanup,
+      measurement_window:$measurement_window,
       configuration:{durability:{mode:$durability_mode,
         max_lag:(if $durability_max_lag == "" then null else $durability_max_lag end),
         interval:(if $durability_interval == "" then null else $durability_interval end)}},
@@ -438,7 +490,8 @@ cleanup_run() {
     jq -n '{status:"disabled",samples:0,container_cpu_usage_usec_deltas:[],apps:[]}' \
       > "$resource_summary"
   elif [ "$resource_evidence_status" != failed ] &&
-    validate_resource_samples "$resources_jsonl" && jq -s '
+    validate_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
+      "$measurement_finished_at_epoch_seconds" "$sample_interval" && jq -s '
       def cpu_deltas: group_by([.app,.pod_uid,.container,.container_id]) | map(sort_by(.timestamp) as $g |
         {app:$g[0].app,pod:$g[0].pod,pod_uid:$g[0].pod_uid,container:$g[0].container,
          container_id:$g[0].container_id,first:$g[0].cpu_usage_usec,last:$g[-1].cpu_usage_usec,
@@ -460,19 +513,46 @@ cleanup_run() {
     jq -n '{status:"failed",error:"resource samples unavailable or invalid",samples:0,
       container_cpu_usage_usec_deltas:[],apps:[]}' > "$resource_summary"
   fi
+  if [ "$keep" = false ]; then
+    if [ "$namespace_created" = true ]; then
+      namespace_delete_status=0
+      kubectl --context "$context" delete namespace "$namespace" --wait=true >/dev/null 2>&1 ||
+        namespace_delete_status=$?
+      namespace_present_status=0
+      if namespace_output="$(kubectl --context "$context" get namespace "$namespace" \
+        --ignore-not-found -o name 2>/dev/null)" && [ -z "$namespace_output" ]; then
+        namespace_present_status=1
+      fi
+      namespace_cleanup_status="$(cleanup_outcome "$namespace_delete_status" \
+        "$namespace_present_status")"
+    fi
+    if [ "$created_cluster" = true ]; then
+      vcluster_delete_status=0
+      vcluster delete "$cluster" --driver docker >/dev/null 2>&1 || vcluster_delete_status=$?
+      vcluster_present_status=0
+      if vcluster_output="$(vcluster list --driver docker --output json 2>/dev/null)" &&
+        ! grep -Fq "\"${cluster}\"" <<< "$vcluster_output"; then
+        vcluster_present_status=1
+      fi
+      vcluster_cleanup_status="$(cleanup_outcome "$vcluster_delete_status" \
+        "$vcluster_present_status")"
+    fi
+    if { [ "$namespace_cleanup_status" = ok ] || [ "$namespace_cleanup_status" = not_created ]; } &&
+      { [ "$vcluster_cleanup_status" = ok ] || [ "$vcluster_cleanup_status" = not_created ] ||
+        [ "$vcluster_cleanup_status" = not_owned ]; }; then
+      cleanup_verification_status=ok
+      cleaned_up=true
+    else
+      cleanup_verification_status=failed
+    fi
+  fi
+  [ -z "$previous_context" ] || kubectl config use-context "$previous_context" >/dev/null 2>&1 || true
   cleanup_status="$(evidence_exit_status "$cleanup_status" \
-    "$resource_evidence_status" "$object_evidence_status")"
+    "$resource_evidence_status" "$object_evidence_status" "$cleanup_verification_status")"
   if ! emit_artifacts; then
     echo "failed to write benchmark artifacts" >&2
     [ "$cleanup_status" -ne 0 ] || cleanup_status=1
   fi
-  if [ "$keep" = false ] && [ -n "$context" ]; then
-    k delete namespace "$namespace" --wait=true >/dev/null 2>&1 || true
-  fi
-  if [ "$keep" = false ] && [ "$created_cluster" = true ]; then
-    vcluster delete "$cluster" --driver docker >/dev/null 2>&1 || true
-  fi
-  [ -z "$previous_context" ] || kubectl config use-context "$previous_context" >/dev/null 2>&1 || true
   if [ "$cleanup_status" -eq 0 ]; then
     cat "$artifacts_json"
   else
@@ -502,9 +582,11 @@ vcluster use driver docker >/dev/null
 if vcluster list --driver docker --output json | grep -Fq "\"${cluster}\""; then
   [ "${QUEQLITE_VIND_REUSE_EXISTING:-0}" = 1 ] || die "vind cluster already exists: $cluster"
   vcluster connect "$cluster" --driver docker >/dev/null
+  vcluster_cleanup_status=not_owned
 else
   vcluster create "$cluster" --driver docker --kube-config-context-name "$cluster" >/dev/null
   created_cluster=true
+  vcluster_cleanup_status=retained
 fi
 context="$(kubectl config current-context 2>/dev/null || true)"
 [ -n "$context" ] || die "vcluster did not select a Kubernetes context"
@@ -515,6 +597,8 @@ if kubectl --context "$context" get namespace "$namespace" >/dev/null 2>&1; then
   kubectl --context "$context" delete namespace "$namespace" --wait=true >/dev/null
 fi
 kubectl --context "$context" create namespace "$namespace" >/dev/null
+namespace_created=true
+namespace_cleanup_status=retained
 kubectl --context "$context" label namespace "$namespace" queqlite.dev/bench-managed=true \
   "queqlite.dev/bench-run-id=$run_id" >/dev/null
 
@@ -643,11 +727,11 @@ if [ "$resource_sampling" = 1 ]; then
   sample_resources >"$resource_sampler_log" 2>&1 &
   sampler_pid=$!
   for _ in $(seq 1 10); do
-    validate_resource_samples "$resources_jsonl" && break
+    validate_resource_sample_schema "$resources_jsonl" && break
     kill -0 "$sampler_pid" 2>/dev/null || break
     sleep 1
   done
-  validate_resource_samples "$resources_jsonl" ||
+  validate_resource_sample_schema "$resources_jsonl" ||
     die "resource sampler did not produce a valid initial sample"
 else
   printf 'resource sampling disabled\n' > "$resource_sampler_log"
@@ -672,10 +756,15 @@ case "$fault" in
     bench_args+=(--fault "$fault_offset" pod-delete "$fault_command") ;;
 esac
 
+benchmark_started_at_epoch_seconds="$(date -u +%s)"
 if QUEQLITE_CLIENT_TOKEN="$client_token" "$bench_binary" "${bench_args[@]}" > "$benchmark_json"; then
   benchmark_status=0
 else
   benchmark_status=$?
-  exit "$benchmark_status"
 fi
+measurement_finished_at_epoch_seconds="$(date -u +%s)"
+[ "$benchmark_status" -eq 0 ] || exit "$benchmark_status"
+measurement_started_at_epoch_seconds="$(measurement_start_from_report \
+  "$benchmark_started_at_epoch_seconds" "$benchmark_json")" ||
+  die "benchmark report has no valid warmup duration"
 wait_for_checkpoint_drain || die "checkpoint did not drain to the committed qlog tip"
