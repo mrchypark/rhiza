@@ -12,14 +12,15 @@ use queqlite_archive::{
 };
 use queqlite_core::{ConfigChange, ConfigurationState, LogAnchor, LogEntry, StoredCommand};
 use queqlite_node::{
-    install_successor_recorder, node_router, node_router_with_admin, node_router_with_checkpoint,
-    node_router_with_checkpoint_and_admin, recorder_router_for_generation,
-    recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
-    restore_checkpoint_to_fresh_data_dir_for_node, restore_successor_checkpoint_to_fresh_data_dir,
-    run_e2e, AdminActivateRequest, AdminActivateResponse, AdminCompactRequest,
-    AdminCompactResponse, AdminConfig, AdminErrorResponse, AdminInstallSuccessorRequest,
-    AdminInstallSuccessorResponse, AdminStatusResponse, AdminStopRequest, AdminStopResponse,
-    AdminSuccessorBundle, CheckpointCoordinator, DurabilityMode, E2eConfig, HttpLogPeer,
+    install_successor_recorder, node_router, node_router_with_admin_and_tasks,
+    node_router_with_checkpoint, node_router_with_checkpoint_and_admin_tasks,
+    recorder_router_for_generation, recover_successor_recorder_after_checkpoint,
+    rehydrate_recorder_after_checkpoint, restore_checkpoint_to_fresh_data_dir_for_node,
+    restore_successor_checkpoint_to_fresh_data_dir, run_e2e, AdminActivateRequest,
+    AdminActivateResponse, AdminCompactRequest, AdminCompactResponse, AdminConfig,
+    AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
+    AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
+    AdminTaskTracker, CheckpointCoordinator, DurabilityMode, E2eConfig, HttpLogPeer,
     HttpRecorderClient, LogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
     ReadRequest, ReadResponse, SqlExecuteRequest, SqlExecuteResponse, SqlQueryRequest,
     SqlQueryResponse, StopInformation, WriteRequest, WriteResponse, ADMIN_ACTIVATE_PATH,
@@ -280,6 +281,7 @@ const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
 impl fmt::Debug for AdminClientConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1691,13 +1693,59 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ServeExit {
+    Shutdown,
+    Client,
+    Recorder,
+    CheckpointWorker,
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn stop_admin_admission(tasks: Option<&AdminTaskTracker>) {
+    if let Some(tasks) = tasks {
+        tasks.stop_admission();
+    }
+}
+
+async fn wait_for_admin_tasks(tasks: Option<&AdminTaskTracker>) {
+    if let Some(tasks) = tasks {
+        tasks.wait_for_idle().await;
+    }
+}
+
+fn shutdown_deadline_error(timeout: Duration) -> String {
+    format!(
+        "shutdown did not complete within {} seconds; final checkpoint durability is unconfirmed",
+        timeout.as_secs_f64()
+    )
+}
+
+async fn before_shutdown_deadline<T>(
+    timeout: Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| shutdown_deadline_error(timeout))
+}
+
 async fn serve_legacy_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let node_config = config.node_config()?;
     let recorder = open_recorder(&config)?;
-    let mut recorder_server = spawn_recorder_server(&config, recorder.clone()).await?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut recorder_server =
+        spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?;
     tokio::task::yield_now().await;
 
     let consensus = build_consensus(&config)?;
@@ -1712,36 +1760,65 @@ where
         "queqlite serving client={} recorder={}",
         config.client_listen, config.recorder_listen
     );
-    let _materializer = materializer_worker(runtime.clone());
+    let mut materializer = materializer_worker(runtime.clone(), shutdown_rx.clone());
 
-    let app = match config.admin_config()? {
-        Some(admin) => node_router_with_admin(runtime.clone(), recorder, admin)
-            .map_err(|error| error.to_string())?,
-        None => node_router(runtime.clone(), recorder),
+    let (app, admin_tasks) = match config.admin_config()? {
+        Some(admin) => {
+            let (router, tasks) =
+                node_router_with_admin_and_tasks(runtime.clone(), recorder, admin)
+                    .map_err(|error| error.to_string())?;
+            (router, Some(tasks))
+        }
+        None => (node_router(runtime.clone(), recorder), None),
     };
-    let shutdown_runtime = runtime.clone();
-    let client_server = async move {
+    let mut client_server = AbortOnDrop(tokio::spawn(async move {
         axum::serve(client_listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                shutdown_runtime.cancel_operations();
-            })
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
             .await
+            .map_err(|error| format!("client server stopped: {error}"))
+    }));
+    tokio::pin!(shutdown);
+    let (exit, result) = tokio::select! {
+        biased;
+        () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
+        result = &mut client_server.0 =>
+            (ServeExit::Client, server_task_result(result, "client server")),
+        result = &mut recorder_server.0 =>
+            (ServeExit::Recorder, Err(recorder_task_error(result))),
     };
-    tokio::pin!(client_server);
-    let result = tokio::select! {
-        result = &mut client_server =>
-            result.map_err(|error| format!("client server stopped: {error}")),
-        result = &mut recorder_server.0 => Err(recorder_task_error(result)),
-    };
+    stop_admin_admission(admin_tasks.as_ref());
+    shutdown_tx.send_replace(true);
     runtime.cancel_operations();
-    result
+    let drained = before_shutdown_deadline(SERVE_SHUTDOWN_TIMEOUT, async {
+        let mut drained = Ok(());
+        if exit != ServeExit::Client {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut client_server.0).await, "client server"),
+            );
+        }
+        if exit != ServeExit::Recorder {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut recorder_server.0).await, "recorder server"),
+            );
+        }
+        retain_first_error(
+            &mut drained,
+            task_result((&mut materializer.0).await, "materializer worker"),
+        );
+        wait_for_admin_tasks(admin_tasks.as_ref()).await;
+        drained
+    })
+    .await?;
+    result.and(drained)
 }
 
 async fn serve_remote_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let remote = config
         .remote
         .clone()
@@ -1780,7 +1857,8 @@ where
     let recorder = open_recorder(&config)?;
     let mut recorder_server = match preparation {
         StartupPreparation::RecorderFirst => {
-            let server = spawn_recorder_server(&config, recorder.clone()).await?;
+            let server =
+                spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?;
             tokio::task::yield_now().await;
             Some(server)
         }
@@ -1806,7 +1884,8 @@ where
         rehydrate_recorder_with_retry(runtime.clone(), recorder.clone(), checkpoint_index).await?;
     }
     if recorder_server.is_none() {
-        recorder_server = Some(spawn_recorder_server(&config, recorder.clone()).await?);
+        recorder_server =
+            Some(spawn_recorder_server(&config, recorder.clone(), shutdown_rx.clone()).await?);
         tokio::task::yield_now().await;
     }
 
@@ -1827,47 +1906,88 @@ where
         "queqlite serving client={} recorder={} recovery_generation={}",
         config.client_listen, config.recorder_listen, config.recovery_generation
     );
-    let _materializer = materializer_worker(runtime.clone());
+    let mut materializer = materializer_worker(runtime.clone(), shutdown_rx.clone());
 
-    let app = match config.admin_config()? {
-        Some(admin) => node_router_with_checkpoint_and_admin(
-            runtime.clone(),
-            recorder,
-            coordinator.clone(),
-            admin,
-        )
-        .map_err(|error| error.to_string())?,
-        None => node_router_with_checkpoint(runtime.clone(), recorder, coordinator.clone()),
+    let (app, admin_tasks) = match config.admin_config()? {
+        Some(admin) => {
+            let (router, tasks) = node_router_with_checkpoint_and_admin_tasks(
+                runtime.clone(),
+                recorder,
+                coordinator.clone(),
+                admin,
+            )
+            .map_err(|error| error.to_string())?;
+            (router, Some(tasks))
+        }
+        None => (
+            node_router_with_checkpoint(runtime.clone(), recorder, coordinator.clone()),
+            None,
+        ),
     };
-    let shutdown_runtime = runtime.clone();
-    let client_server = async move {
+    let client_shutdown = shutdown_rx.clone();
+    let mut client_server = AbortOnDrop(tokio::spawn(async move {
         axum::serve(client_listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.await;
-                shutdown_runtime.cancel_operations();
-            })
+            .with_graceful_shutdown(wait_for_shutdown(client_shutdown))
             .await
-    };
-    tokio::pin!(client_server);
+            .map_err(|error| format!("client server stopped: {error}"))
+    }));
     let mut recorder_server = recorder_server.expect("remote recorder server started");
     let mut worker = checkpoint_worker(
         remote.durability,
         Arc::clone(&runtime),
         Arc::clone(&coordinator),
+        shutdown_rx.clone(),
     );
-    let result = if let Some(worker) = worker.as_mut() {
+    tokio::pin!(shutdown);
+    let (exit, result) = if let Some(worker) = worker.as_mut() {
         tokio::select! {
-            result = &mut client_server => result.map_err(|error| format!("client server stopped: {error}")),
-            result = &mut recorder_server.0 => Err(recorder_task_error(result)),
-            result = &mut worker.0 => Err(checkpoint_worker_error(result)),
+            biased;
+            () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
+            result = &mut client_server.0 => (ServeExit::Client, server_task_result(result, "client server")),
+            result = &mut recorder_server.0 => (ServeExit::Recorder, Err(recorder_task_error(result))),
+            result = &mut worker.0 => (ServeExit::CheckpointWorker, Err(checkpoint_worker_error(result))),
         }
     } else {
         tokio::select! {
-            result = &mut client_server => result.map_err(|error| format!("client server stopped: {error}")),
-            result = &mut recorder_server.0 => Err(recorder_task_error(result)),
+            biased;
+            () = &mut shutdown => (ServeExit::Shutdown, Ok(())),
+            result = &mut client_server.0 => (ServeExit::Client, server_task_result(result, "client server")),
+            result = &mut recorder_server.0 => (ServeExit::Recorder, Err(recorder_task_error(result))),
         }
     };
-    finish_remote_serve(result, runtime, coordinator).await
+    stop_admin_admission(admin_tasks.as_ref());
+    shutdown_tx.send_replace(true);
+    runtime.cancel_operations();
+    before_shutdown_deadline(SERVE_SHUTDOWN_TIMEOUT, async {
+        let mut drained = Ok(());
+        if exit != ServeExit::Client {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut client_server.0).await, "client server"),
+            );
+        }
+        if exit != ServeExit::Recorder {
+            retain_first_error(
+                &mut drained,
+                server_task_result((&mut recorder_server.0).await, "recorder server"),
+            );
+        }
+        if exit != ServeExit::CheckpointWorker {
+            if let Some(worker) = worker.as_mut() {
+                retain_first_error(
+                    &mut drained,
+                    task_result((&mut worker.0).await, "checkpoint worker"),
+                );
+            }
+        }
+        retain_first_error(
+            &mut drained,
+            task_result((&mut materializer.0).await, "materializer worker"),
+        );
+        wait_for_admin_tasks(admin_tasks.as_ref()).await;
+        finish_remote_serve(result.and(drained), runtime, coordinator).await
+    })
+    .await?
 }
 
 async fn finish_remote_serve(
@@ -1881,13 +2001,20 @@ async fn finish_remote_serve(
             .flush_runtime(&runtime, applied_index)
             .await
             .map(|_| ())
-            .map_err(|error| format!("final checkpoint flush failed: {error}")),
-        Err(error) => Err(error.to_string()),
+            .map_err(|error| {
+                format!(
+                    "final checkpoint durability is unconfirmed because the flush failed: {error}"
+                )
+            }),
+        Err(error) => Err(format!(
+            "final checkpoint durability is unconfirmed because the applied index is unavailable: {error}"
+        )),
     };
     match (result, final_flush) {
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) => Err(error),
-        (Err(error), Ok(()) | Err(_)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(durability_error)) => Err(format!("{error}; {durability_error}")),
     }
 }
 
@@ -1959,6 +2086,7 @@ fn open_recorder(config: &ServeConfig) -> Result<RecorderFileStore, String> {
 async fn spawn_recorder_server(
     config: &ServeConfig,
     recorder: RecorderFileStore,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<AbortOnDrop<Result<(), String>>, String> {
     let listener = tokio::net::TcpListener::bind(&config.recorder_listen)
         .await
@@ -1970,6 +2098,7 @@ async fn spawn_recorder_server(
     );
     Ok(AbortOnDrop(tokio::spawn(async move {
         axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown))
             .await
             .map_err(|error| format!("recorder server stopped: {error}"))
     })))
@@ -1993,6 +2122,7 @@ fn checkpoint_worker(
     mode: DurabilityMode,
     runtime: Arc<NodeRuntime>,
     coordinator: Arc<CheckpointCoordinator>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Option<AbortOnDrop<()>> {
     let cadence = match mode {
         DurabilityMode::Sync => return None,
@@ -2001,23 +2131,51 @@ fn checkpoint_worker(
     };
     Some(AbortOnDrop(tokio::spawn(async move {
         loop {
-            tokio::time::sleep(cadence).await;
-            if let Err(error) = coordinator.flush_runtime(&runtime, u64::MAX).await {
-                eprintln!("checkpoint flush failed; retrying after {cadence:?}: {error}");
+            tokio::select! {
+                () = wait_for_shutdown(shutdown.clone()) => return,
+                () = tokio::time::sleep(cadence) => {}
+            }
+            tokio::select! {
+                () = wait_for_shutdown(shutdown.clone()) => return,
+                result = coordinator.flush_runtime(&runtime, u64::MAX) => {
+                    if let Err(error) = result {
+                        eprintln!("checkpoint flush failed; retrying after {cadence:?}: {error}");
+                    }
+                }
             }
         }
     })))
 }
 
-fn materializer_worker(runtime: Arc<NodeRuntime>) -> AbortOnDrop<()> {
+fn materializer_worker(
+    runtime: Arc<NodeRuntime>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> AbortOnDrop<()> {
     AbortOnDrop(tokio::spawn(async move {
         if let Err(error) = runtime
-            .run_background_materializer(Duration::from_millis(100), std::future::pending())
+            .run_background_materializer(Duration::from_millis(100), wait_for_shutdown(shutdown))
             .await
         {
             eprintln!("background materializer stopped: {error}");
         }
     }))
+}
+
+fn task_result<T>(result: Result<T, tokio::task::JoinError>, name: &str) -> Result<T, String> {
+    result.map_err(|error| format!("{name} task failed: {error}"))
+}
+
+fn retain_first_error(current: &mut Result<(), String>, next: Result<(), String>) {
+    if current.is_ok() && next.is_err() {
+        *current = next;
+    }
+}
+
+fn server_task_result(
+    result: Result<Result<(), String>, tokio::task::JoinError>,
+    name: &str,
+) -> Result<(), String> {
+    task_result(result, name)?
 }
 
 fn checkpoint_worker_error(result: Result<(), tokio::task::JoinError>) -> String {
@@ -3200,10 +3358,10 @@ fn parse_optional_bool(
     }
 }
 
+const USAGE: &str = "usage:\n  queqlite status --url <url>\n  queqlite e2e|verify-restore [options]\n  queqlite serve\n  queqlite init-checkpoint\n  queqlite roll-checkpoint [--from-generation N --to-generation N+1]\n  queqlite checkpoint inspect\n  queqlite checkpoint compact\n  queqlite gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  queqlite gc inspect|evidence --plan-hash <sha256>\n  queqlite gc apply --plan-hash <sha256> --confirm\n  queqlite membership status|stop|install-successor|activate [--offline]\n  queqlite write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  queqlite read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  queqlite sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  queqlite sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  queqlite health --url <url> [--ready]\n\nRepeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. serve and membership commands read QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE; legacy QUEQLITE_CONFIG_ID plus QUEQLITE_PEER_1..3 remains deprecated fallback. `barrier` remains a compatibility alias for `read_barrier`. Membership and checkpoint compact commands use the live admin API by default; pass --offline only as an explicit local fallback while the data root is not serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it.";
+
 fn usage() {
-    eprintln!(
-        "usage:\n  queqlite status --url <url>\n  queqlite e2e|verify-restore [options]\n  queqlite serve\n  queqlite init-checkpoint\n  queqlite roll-checkpoint [--from-generation N --to-generation N+1]\n  queqlite checkpoint inspect\n  queqlite checkpoint compact\n  queqlite gc plan --operation-id <id> [--retain-generations N --grace-ms N --min-age-ms N]\n  queqlite gc inspect|evidence --plan-hash <sha256>\n  queqlite gc apply --plan-hash <sha256> --confirm\n  queqlite membership status|stop|install-successor|activate\n  queqlite write --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --key <key> --value <value>\n  queqlite read --url <preferred> [--url <fallback> ...] [--token <token>] --key <key> [--consistency local|read_barrier] [--expect <value>]\n  queqlite sql execute --url <preferred> [--url <fallback> ...] [--token <token>] --request-id <id> --sql <sql> [--params-json <json>]\n  queqlite sql query --url <preferred> [--url <fallback> ...] [--token <token>] --sql <sql> [--params-json <json>] [--consistency local|read_barrier] [--max-rows N]\n  queqlite health --url <url> [--ready]\n\nRepeat --url in preferred order. Idempotent operations hedge later endpoints after 100 ms; read_barrier operations retry sequentially. Every attempt reuses the exact request body, including write request IDs and read consistency. Client requests use a 2 s connect deadline, 5 s per-attempt deadline, and 15 s total operation deadline. serve and membership commands read QUEQLITE_CONFIG_BUNDLE or QUEQLITE_CONFIG_BUNDLE_FILE; legacy QUEQLITE_CONFIG_ID plus QUEQLITE_PEER_1..3 remains deprecated fallback. `barrier` remains a compatibility alias for `read_barrier`. membership and checkpoint compact are offline commands and fail while the local data root is serving. gc plan is dry-run only; deletion requires gc apply with the exact plan hash and --confirm. roll-checkpoint performs explicit full-cluster disaster-recovery fencing; stop all old-generation pods before running it."
-    );
+    eprintln!("{USAGE}");
 }
 
 #[cfg(test)]
@@ -4344,6 +4502,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_deadline_bounds_a_stalled_drain_or_final_flush() {
+        let result = before_shutdown_deadline(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await;
+
+        assert!(result
+            .unwrap_err()
+            .contains("final checkpoint durability is unconfirmed"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_worker_stops_before_the_final_flush_phase() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = runtime_for_final_flush(root.path());
+        let (shutdown, wait) = tokio::sync::watch::channel(false);
+        let mut worker = checkpoint_worker(
+            DurabilityMode::Periodic {
+                interval: Duration::from_secs(3600),
+            },
+            runtime,
+            coordinator,
+            wait,
+        )
+        .unwrap();
+
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), &mut worker.0)
+            .await
+            .expect("checkpoint worker must stop before final flush")
+            .unwrap();
+    }
+
+    #[test]
+    fn usage_describes_live_admin_as_the_default_and_offline_as_explicit() {
+        assert!(USAGE.contains("live admin API by default"));
+        assert!(USAGE.contains("pass --offline only as an explicit local fallback"));
+    }
+
+    #[tokio::test]
     async fn init_checkpoint_is_idempotent_only_for_an_empty_matching_identity() {
         let root = tempfile::tempdir().unwrap();
         let archive = local_checkpoint(root.path(), 1);
@@ -4646,6 +4858,9 @@ mod tests {
         assert!(joined.0.unwrap().is_ok());
         assert!(joined.1.unwrap().is_ok());
         assert!(joined.2.unwrap().is_ok());
+        for address in &recorder_addresses {
+            assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        }
     }
 
     #[derive(Clone, Default)]
