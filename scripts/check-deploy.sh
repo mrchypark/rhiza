@@ -63,6 +63,42 @@ if scripts/render-k8s-config.sh 3 3 \
   exit 1
 fi
 
+jq '.config_id = 4 |
+  .members |= to_entries | .members |= map(
+    .value.url = "http://queqlite-c4-\(.key).queqlite-c4:8081" |
+    .value.log_url = "http://queqlite-c4-\(.key).queqlite-c4:8080" | .value
+  )' "$tmp/config-3.json" > "$tmp/config-4.json"
+jq '.members[0].node_id = "other-1"' "$tmp/config-4.json" \
+  > "$tmp/config-4-invalid-node.json"
+jq '.members[0].token = " "' "$tmp/config-4.json" \
+  > "$tmp/config-4-invalid-token.json"
+jq '.members[0].url = "not-a-url"' "$tmp/config-4.json" \
+  > "$tmp/config-4-invalid-url.json"
+stub_bin="$tmp/stub-bin"
+mkdir "$stub_bin"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' ': > "$KUBECTL_MARKER"' 'exit 99' \
+  > "$stub_bin/kubectl"
+chmod +x "$stub_bin/kubectl"
+assert_replace_rejects_before_kubectl() {
+  local draft="$1" label="$2"
+  local marker="$tmp/${label}.kubectl-called"
+  local transition_dir="$tmp/${label}-transition" rc
+  set +e
+  PATH="$stub_bin:$PATH" KUBECTL_MARKER="$marker" \
+    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$draft" \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" = 65 ]
+  [ ! -e "$marker" ]
+  [ ! -e "$transition_dir/stop-c3.state.json" ]
+}
+assert_replace_rejects_before_kubectl "$tmp/config-4-invalid-node.json" invalid-node
+assert_replace_rejects_before_kubectl "$tmp/config-4-invalid-token.json" invalid-token
+assert_replace_rejects_before_kubectl "$tmp/config-4-invalid-url.json" invalid-url
+
 stop_successor="$(jq -cn '{config_id:4,members:["node-1","node-2","node-3"],
   digest:[range(32) | 0]}')"
 stop_state="$tmp/stop-c3.state.json"
@@ -84,6 +120,66 @@ scripts/k8s-stop-state.sh recover \
 jq -e --arg operation "$first_stop_operation" --argjson successor "$stop_successor" '
   .operation_id == $operation and .stop.version == 2 and .successor == $successor
 ' "$tmp/recovered-stop.json" >/dev/null
+scripts/k8s-stop-state.sh validate "$stop_state" "$tmp/recovered-stop.json"
+legacy_stop_state="$tmp/legacy-stop-c3.state.json"
+legacy_stop_operation="$(jq -er '.operation_id' "$tmp/recovered-stop.json")"
+[ "$(scripts/k8s-stop-state.sh prepare "$legacy_stop_state" 3 4 \
+  "$stop_successor" "$legacy_stop_operation")" = "$legacy_stop_operation" ]
+scripts/k8s-stop-state.sh validate "$legacy_stop_state" "$tmp/recovered-stop.json"
+successor_draft="$tmp/successor-draft.json"
+jq '.config_id = 4 | del(.predecessor)' "$tmp/config-3.json" > "$successor_draft"
+partial_successor_bundle="$tmp/partial-successor-bundle.json"
+printf '{"version":' > "$partial_successor_bundle"
+scripts/k8s-stop-state.sh write-bundle \
+  "$tmp/recovered-stop.json" "$tmp/config-3.json" "$successor_draft" \
+  "$partial_successor_bundle"
+jq -e '
+  .version == 1 and .config_id == 4 and .predecessor.version == 2 and
+  .predecessor.stop_entry.config_id == 3 and .predecessor.stop_proof != null
+' "$partial_successor_bundle" >/dev/null
+for bundle_attempt in "$partial_successor_bundle".attempt.*; do
+  [ ! -e "$bundle_attempt" ]
+done
+durable_transition_secret="$tmp/post-scale-transition-secret.json"
+jq -n \
+  --arg stop "$(openssl base64 -A -in "$tmp/recovered-stop.json")" \
+  --arg bundle "$(openssl base64 -A -in "$partial_successor_bundle")" \
+  '{data:{"stop.json":$stop,"config.json":$bundle}}' \
+  > "$durable_transition_secret"
+post_scale_stop="$tmp/post-scale-workdir/stop-c3.json"
+post_scale_bundle="$tmp/post-scale-workdir/config-c4.json"
+mkdir "$tmp/post-scale-workdir"
+scripts/k8s-stop-state.sh hydrate "$durable_transition_secret" \
+  "$tmp/config-3.json" "$successor_draft" "$post_scale_stop" "$post_scale_bundle"
+jq -e '.stop.entry.config_id == 3 and .successor.config_id == 4' \
+  "$post_scale_stop" >/dev/null
+jq -e '.config_id == 4 and .predecessor.stop_entry.config_id == 3' \
+  "$post_scale_bundle" >/dev/null
+jq -e 'del(.data["stop.json"])' "$durable_transition_secret" \
+  > "$tmp/incomplete-transition-secret.json"
+set +e
+scripts/k8s-stop-state.sh hydrate "$tmp/incomplete-transition-secret.json" \
+  "$tmp/config-3.json" "$successor_draft" \
+  "$tmp/incomplete-stop.json" "$tmp/incomplete-bundle.json"
+incomplete_transition_rc=$?
+set -e
+[ "$incomplete_transition_rc" = 65 ]
+[ ! -e "$tmp/incomplete-stop.json" ]
+[ ! -e "$tmp/incomplete-bundle.json" ]
+jq '.operation_id = "stop-other"' "$tmp/recovered-stop.json" \
+  > "$tmp/mismatched-stop-operation.json"
+set +e
+scripts/k8s-stop-state.sh validate \
+  "$stop_state" "$tmp/mismatched-stop-operation.json"
+mismatched_operation_rc=$?
+set -e
+[ "$mismatched_operation_rc" = 65 ]
+jq 'del(.stop.proof)' "$tmp/recovered-stop.json" > "$tmp/missing-stop-proof.json"
+set +e
+scripts/k8s-stop-state.sh validate "$stop_state" "$tmp/missing-stop-proof.json"
+missing_proof_rc=$?
+set -e
+[ "$missing_proof_rc" = 65 ]
 jq '.stopped_transition.successor.members = ["other-1","other-2","other-3"]' \
   "$tmp/stopped-status.json" > "$tmp/mismatched-stopped-status.json"
 set +e
@@ -134,15 +230,40 @@ grep -Fq '{config_id:$id,members:$members,digest:$digest}' \
 grep -Fq 'scripts/k8s-stop-state.sh prepare "$stop_state"' scripts/replace-k8s-config.sh
 stop_state_line="$(grep -n 'k8s-stop-state.sh prepare' scripts/replace-k8s-config.sh | cut -d: -f1)"
 # shellcheck disable=SC2016
+successor_preflight_line="$(grep -n '"$successor_draft" "$successor_preflight_yaml" successor' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+first_kubectl_line="$(grep -n '"${k\[@\]}" get statefulset "$old_name"' \
+  scripts/replace-k8s-config.sh | head -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016
+grep -Fq 'k8s-stop-state.sh validate "$stop_state" "$stop_json"' \
+  scripts/replace-k8s-config.sh
+# shellcheck disable=SC2016
+stop_validate_line="$(grep -n 'k8s-stop-state.sh validate "$stop_state" "$stop_json"' \
+  scripts/replace-k8s-config.sh | head -n 1 | cut -d: -f1)"
+# shellcheck disable=SC2016
 stop_post_line="$(grep -n 'POST "$stop_path"' scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$stop_state_line" -lt "$stop_post_line" ]
+[ "$stop_state_line" -lt "$stop_validate_line" ]
+[ "$stop_validate_line" -lt "$stop_post_line" ]
+[ "$successor_preflight_line" -lt "$first_kubectl_line" ]
+[ "$successor_preflight_line" -lt "$stop_state_line" ]
 grep -Fq 'k8s-stop-state.sh recover' scripts/replace-k8s-config.sh
-grep -Fq "stop_proof: \$stopped[0].stop.proof" scripts/replace-k8s-config.sh
+grep -Fq 'incomplete successor bundle artifact will be rebuilt' \
+  scripts/replace-k8s-config.sh
+grep -Fq 'k8s-stop-state.sh write-bundle' scripts/replace-k8s-config.sh
+grep -Fq 'k8s-stop-state.sh hydrate' scripts/replace-k8s-config.sh
+grep -Fq "stop_proof: \$stopped[0].stop.proof" scripts/k8s-stop-state.sh
 compact_line="$(grep -n 'publishing final checkpoint V2' scripts/replace-k8s-config.sh | cut -d: -f1)"
 fork_line="$(grep -n 'forking stopped checkpoint' scripts/replace-k8s-config.sh | cut -d: -f1)"
+durable_secret_line="$(grep -n -- '--from-file=stop.json=' scripts/replace-k8s-config.sh | cut -d: -f1)"
+# shellcheck disable=SC2016
+scale_down_line="$(grep -n 'scale statefulset "$old_name" --replicas=0' \
+  scripts/replace-k8s-config.sh | cut -d: -f1)"
 start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=disaster' scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$compact_line" -lt "$fork_line" ]
 [ "$fork_line" -lt "$start_line" ]
+[ "$durable_secret_line" -lt "$scale_down_line" ]
 grep -Fq "context=\"\$(kubectl config current-context" scripts/e2e-vind-rustfs.sh
 grep -Fq 'get --raw=/readyz' scripts/e2e-vind-rustfs.sh
 grep -Fq 'export QUEQLITE_S3_ENDPOINT=http://rustfs:9000 QUEQLITE_OBJECT_SECRET=rustfs-credentials' \
@@ -209,16 +330,29 @@ if QUEQLITE_OBJECT_SECRET='' QUEQLITE_OBJECT_JOB_RENDER_ONLY="$tmp/invalid-objec
 fi
 
 mkdir "$tmp/ready-fixture"
-jq -n '{metadata:{generation:4}, spec:{replicas:3}, status:{observedGeneration:4,readyReplicas:3}}' \
+jq -n '{metadata:{generation:4}, spec:{replicas:3},
+  status:{observedGeneration:4,readyReplicas:3,updateRevision:"revision-4"}}' \
   > "$tmp/ready-fixture/statefulset.json"
 for ordinal in 0 1 2; do
   jq -n --arg id 3 '{
-    metadata:{labels:{"queqlite.dev/config-id":$id}},
+    metadata:{labels:{"queqlite.dev/config-id":$id,
+      "controller-revision-hash":"revision-4"}},
     status:{conditions:[{type:"Ready",status:"True"}]}
   }' > "$tmp/ready-fixture/queqlite-c3-${ordinal}.json"
 done
 QUEQLITE_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
   scripts/wait-k8s-statefulset-ready.sh queqlite-c3 3 3
+jq '.metadata.labels["controller-revision-hash"] = "revision-3"' \
+  "$tmp/ready-fixture/queqlite-c3-1.json" > "$tmp/ready-fixture/stale-pod.json"
+mv "$tmp/ready-fixture/stale-pod.json" "$tmp/ready-fixture/queqlite-c3-1.json"
+if QUEQLITE_STATEFULSET_FIXTURE_DIR="$tmp/ready-fixture" \
+  scripts/wait-k8s-statefulset-ready.sh queqlite-c3 3 3; then
+  echo "StatefulSet readiness check accepted a stale controller revision" >&2
+  exit 1
+fi
+jq '.metadata.labels["controller-revision-hash"] = "revision-4"' \
+  "$tmp/ready-fixture/queqlite-c3-1.json" > "$tmp/ready-fixture/current-pod.json"
+mv "$tmp/ready-fixture/current-pod.json" "$tmp/ready-fixture/queqlite-c3-1.json"
 jq '.status.readyReplicas = 2' "$tmp/ready-fixture/statefulset.json" \
   > "$tmp/ready-fixture/not-ready.json"
 mv "$tmp/ready-fixture/not-ready.json" "$tmp/ready-fixture/statefulset.json"

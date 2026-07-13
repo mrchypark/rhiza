@@ -40,20 +40,44 @@ forked_json="$work_dir/fork-c${old_id}-to-c${new_id}.json"
 target_inspect_json="$work_dir/checkpoint-c${new_id}.json"
 status_json="$work_dir/status.json"
 
+successor_preflight_yaml="$(mktemp "$work_dir/config-c${new_id}.preflight.XXXXXX.yaml")"
+trap 'rm -f "$successor_preflight_yaml"' EXIT
+scripts/render-k8s-config.sh \
+  "$new_id" "$new_replicas" "$successor_draft" "$successor_preflight_yaml" successor
+rm -f "$successor_preflight_yaml"
+trap - EXIT
+
 k=(kubectl)
 [ -z "$context" ] || k+=(--context "$context")
 k+=(-n "$namespace")
 "${k[@]}" get statefulset "$old_name" >/dev/null
+durable_resume=false
+if durable_secret_json="$("${k[@]}" get secret "${new_name}-bundle" -o json 2>/dev/null)"; then
+  durable_secret_file="$work_dir/${new_name}-bundle.secret.json"
+  printf '%s' "$durable_secret_json" > "$durable_secret_file"
+  scripts/k8s-stop-state.sh hydrate "$durable_secret_file" \
+    "$old_bundle" "$successor_draft" "$stop_json" "$successor_bundle"
+  rm -f "$durable_secret_file"
+  durable_resume=true
+  echo "recovered transition state from durable Secret ${new_name}-bundle" >&2
+fi
 resume=false
 if [ -s "$stop_json" ] && [ -s "$successor_bundle" ]; then
   jq -e --argjson old "$old_id" --argjson new "$new_id" '
     .stop.version == 2 and .stop.entry.config_id == $old and
     .successor.config_id == $new
   ' "$stop_json" >/dev/null
-  jq -e --argjson new "$new_id" '
+  if ! jq empty "$successor_bundle" >/dev/null 2>&1; then
+    echo "incomplete successor bundle artifact will be rebuilt: $successor_bundle" >&2
+    rm -f "$successor_bundle"
+  elif jq -e --argjson new "$new_id" '
     .version == 1 and .config_id == $new and .predecessor.version == 2
-  ' "$successor_bundle" >/dev/null
-  resume=true
+  ' "$successor_bundle" >/dev/null; then
+    resume="$durable_resume"
+  else
+    echo "existing successor bundle is valid JSON but does not match configuration $new_id: $successor_bundle" >&2
+    exit 65
+  fi
 fi
 
 admin() {
@@ -94,18 +118,12 @@ else
 fi
 stop_operation="$(scripts/k8s-stop-state.sh prepare "$stop_state" \
   "$old_id" "$new_id" "$stop_successor" "$stop_candidate")"
+if [ -s "$stop_json" ]; then
+  scripts/k8s-stop-state.sh validate "$stop_state" "$stop_json"
+fi
 stop_request="$(jq -cn --arg op "$stop_operation" --argjson id "$old_id" \
   --argjson successor "$stop_successor" \
   '{operation_id:$op, expected_config_id:$id, successor:$successor}')"
-
-validate_stop_response() {
-  jq -e --arg operation "$stop_operation" --argjson id "$old_id" \
-    --argjson successor "$stop_successor" '
-    .operation_id == $operation and .stop.version == 2 and
-    .stop.entry.config_id == $id and .stop.proof != null and
-    .successor == $successor
-  ' "$1" >/dev/null
-}
 
 recover_stop_from_status() {
   local rc
@@ -131,11 +149,10 @@ if ! "$stop_ready"; then
   for ((attempt=1; attempt<=60; attempt++)); do
     if admin "$old_name" "${old_name}-0" POST "$stop_path" "$stop_request" \
       > "$stop_attempt_json"; then
-      validate_stop_response "$stop_attempt_json" || {
+      if ! scripts/k8s-stop-state.sh validate "$stop_state" "$stop_attempt_json"; then
         rm -f "$stop_attempt_json"
-        echo "Stop response does not match persisted Stop state" >&2
         exit 65
-      }
+      fi
       mv "$stop_attempt_json" "$stop_json"
       break
     fi
@@ -150,10 +167,7 @@ if ! "$stop_ready"; then
     sleep 1
   done
 fi
-validate_stop_response "$stop_json" || {
-  echo "Stop response does not match persisted Stop state" >&2
-  exit 65
-}
+scripts/k8s-stop-state.sh validate "$stop_state" "$stop_json"
 
 for ((attempt=1; attempt<=60; attempt++)); do
   all_stopped=true
@@ -168,15 +182,9 @@ for ((attempt=1; attempt<=60; attempt++)); do
   [ "$attempt" -lt 60 ] || { echo "not every old node reached Stopped(S)" >&2; exit 1; }
 done
 
-jq --slurpfile stopped "$stop_json" --slurpfile old "$old_bundle" '
-  . + {predecessor: {
-    version: 2,
-    members: [$old[0].members[].node_id],
-    stop_entry: $stopped[0].stop.entry,
-    stop_proof: $stopped[0].stop.proof
-  }}
-' "$successor_draft" > "$successor_bundle"
-chmod 600 "$stop_json" "$successor_bundle"
+scripts/k8s-stop-state.sh write-bundle \
+  "$stop_json" "$old_bundle" "$successor_draft" "$successor_bundle"
+chmod 600 "$stop_json"
 
 echo "publishing final checkpoint V2"
 admin "$old_name" "${old_name}-0" GET "$status_path" > "$status_json"
@@ -200,15 +208,19 @@ jq -e --argjson id "$old_id" \
 fi
 
 expected_bundle_b64="$(openssl base64 -A -in "$successor_bundle")"
+expected_stop_b64="$(openssl base64 -A -in "$stop_json")"
 if "${k[@]}" get secret "${new_name}-bundle" >/dev/null 2>&1; then
   actual_bundle_b64="$("${k[@]}" get secret "${new_name}-bundle" -o jsonpath='{.data.config\.json}')"
-  [ "$actual_bundle_b64" = "$expected_bundle_b64" ] || {
-    echo "existing successor bundle Secret differs from the resume bundle" >&2
+  actual_stop_b64="$("${k[@]}" get secret "${new_name}-bundle" -o jsonpath='{.data.stop\.json}')"
+  [ "$actual_bundle_b64" = "$expected_bundle_b64" ] &&
+    [ "$actual_stop_b64" = "$expected_stop_b64" ] || {
+    echo "existing successor transition Secret differs from the resume artifacts" >&2
     exit 65
   }
 else
   "${k[@]}" create secret generic "${new_name}-bundle" \
-    --from-file=config.json="$successor_bundle" --dry-run=client -o yaml \
+    --from-file=config.json="$successor_bundle" --from-file=stop.json="$stop_json" \
+    --dry-run=client -o yaml \
     | yq eval '.immutable = true' - \
     | "${k[@]}" create -f - >/dev/null
 fi

@@ -48,6 +48,98 @@ case "${1-}" in
     fi
     jq -er '.operation_id' "$state_file"
     ;;
+  validate)
+    [ "$#" -eq 3 ] || die "usage: $0 validate STATE STOP_RESPONSE_JSON"
+    state_file="$2"
+    response_file="$3"
+    [ -s "$state_file" ] || die "Stop state is unavailable"
+    [ -s "$response_file" ] || die "Stop response is unavailable"
+    old_id="$(jq -er '.old_config_id' "$state_file")"
+    operation="$(jq -er '.operation_id' "$state_file")"
+    successor="$(jq -ec '.successor' "$state_file")"
+    jq -e --argjson old "$old_id" --arg operation "$operation" \
+      --argjson successor "$successor" '
+      .operation_id == $operation and .stop.version == 2 and
+      .stop.entry.config_id == $old and .stop.proof != null and
+      .successor == $successor
+    ' "$response_file" >/dev/null || die "Stop response does not match persisted Stop state"
+    ;;
+  write-bundle)
+    [ "$#" -eq 5 ] || die "usage: $0 write-bundle STOP_RESPONSE OLD_BUNDLE SUCCESSOR_DRAFT OUTPUT"
+    response_file="$2"
+    old_bundle="$3"
+    successor_draft="$4"
+    output_file="$5"
+    [ -s "$response_file" ] || die "Stop response is unavailable"
+    [ -s "$old_bundle" ] || die "old configuration bundle is unavailable"
+    [ -s "$successor_draft" ] || die "successor draft is unavailable"
+    old_id="$(jq -er '.config_id' "$old_bundle")"
+    new_id="$(jq -er '.config_id' "$successor_draft")"
+    jq -e --argjson old "$old_id" --argjson new "$new_id" '
+      .operation_id != null and .stop.version == 2 and
+      .stop.entry.config_id == $old and .stop.proof != null and
+      .successor.config_id == $new
+    ' "$response_file" >/dev/null || die "Stop response cannot produce the successor bundle"
+    bundle_attempt="${output_file}.attempt.$$"
+    trap 'rm -f "$bundle_attempt"' EXIT
+    umask 077
+    jq --slurpfile stopped "$response_file" --slurpfile old "$old_bundle" '
+      . + {predecessor: {
+        version: 2,
+        members: [$old[0].members[].node_id],
+        stop_entry: $stopped[0].stop.entry,
+        stop_proof: $stopped[0].stop.proof
+      }}
+    ' "$successor_draft" > "$bundle_attempt"
+    jq -e --argjson new "$new_id" --slurpfile stopped "$response_file" \
+      --slurpfile old "$old_bundle" '
+      .version == 1 and .config_id == $new and .predecessor.version == 2 and
+      .predecessor.members == [$old[0].members[].node_id] and
+      .predecessor.stop_entry == $stopped[0].stop.entry and
+      .predecessor.stop_proof == $stopped[0].stop.proof
+    ' "$bundle_attempt" >/dev/null || die "generated successor bundle is invalid"
+    chmod 600 "$bundle_attempt"
+    mv "$bundle_attempt" "$output_file"
+    trap - EXIT
+    ;;
+  hydrate)
+    [ "$#" -eq 6 ] || die "usage: $0 hydrate SECRET_JSON OLD_BUNDLE SUCCESSOR_DRAFT STOP_OUTPUT BUNDLE_OUTPUT"
+    secret_file="$2"
+    old_bundle="$3"
+    successor_draft="$4"
+    stop_output="$5"
+    bundle_output="$6"
+    [ -s "$secret_file" ] || die "durable transition Secret is unavailable"
+    stop_attempt="${stop_output}.attempt.$$"
+    bundle_attempt="${bundle_output}.attempt.$$"
+    trap 'rm -f "$stop_attempt" "$bundle_attempt"' EXIT
+    umask 077
+    jq -er '.data["stop.json"] | select(type == "string" and length > 0) |
+      @base64d | fromjson' "$secret_file" \
+      > "$stop_attempt" || die "durable transition Secret has no valid Stop response"
+    jq -er '.data["config.json"] | select(type == "string" and length > 0) |
+      @base64d | fromjson' "$secret_file" \
+      > "$bundle_attempt" || die "durable transition Secret has no valid successor bundle"
+    old_id="$(jq -er '.config_id' "$old_bundle")"
+    new_id="$(jq -er '.config_id' "$successor_draft")"
+    jq -e --argjson old "$old_id" --argjson new "$new_id" \
+      --slurpfile stop "$stop_attempt" --slurpfile old_bundle "$old_bundle" \
+      --slurpfile draft "$successor_draft" '
+      .version == 1 and .config_id == $new and
+      (del(.predecessor) == $draft[0]) and .predecessor.version == 2 and
+      .predecessor.members == [$old_bundle[0].members[].node_id] and
+      .predecessor.stop_entry == $stop[0].stop.entry and
+      .predecessor.stop_proof == $stop[0].stop.proof and
+      ($stop[0].operation_id | type == "string" and length > 0) and
+      $stop[0].stop.version == 2 and
+      $stop[0].stop.entry.config_id == $old and $stop[0].stop.proof != null and
+      $stop[0].successor.config_id == $new
+    ' "$bundle_attempt" >/dev/null || die "durable transition Secret is inconsistent"
+    chmod 600 "$stop_attempt" "$bundle_attempt"
+    mv "$stop_attempt" "$stop_output"
+    mv "$bundle_attempt" "$bundle_output"
+    trap - EXIT
+    ;;
   recover)
     [ "$#" -eq 4 ] || die "usage: $0 recover STATE STATUS_JSON STOP_RESPONSE_JSON"
     state_file="$2"
@@ -84,6 +176,6 @@ case "${1-}" in
     trap - EXIT
     ;;
   *)
-    die "usage: $0 prepare|recover ..."
+    die "usage: $0 prepare|validate|write-bundle|hydrate|recover ..."
     ;;
 esac

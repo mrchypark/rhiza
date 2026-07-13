@@ -25,9 +25,18 @@ require yq
 jq -e --argjson id "$config_id" --argjson replicas "$replicas" '
   .version == 1 and .config_id == $id and
   (.members | length) == $replicas and
-  ([.members[].node_id] | unique | length) == $replicas and
-  ([.members[].token] | all(type == "string" and length > 0)) and
-  ([.members[].token] | unique | length) == $replicas
+  ([.members[].node_id] | sort) ==
+    [range(1; $replicas + 1) | "node-\(.)"] and
+  ([.members[].token] | all(
+    type == "string" and test("[^[:space:]]") and
+    (test("[[:cntrl:]]") | not))) and
+  ([.members[].token] | unique | length) == $replicas and
+  ([.members | sort_by(.node_id)[] | {node_id, url, log_url}] ==
+    [range(0; $replicas) as $n | {
+      node_id: "node-\($n + 1)",
+      url: "http://queqlite-c\($id)-\($n).queqlite-c\($id):8081",
+      log_url: "http://queqlite-c\($id)-\($n).queqlite-c\($id):8080"
+    }])
 ' "$bundle" >/dev/null || { echo "invalid v1 bundle/config/replica identity" >&2; exit 65; }
 
 name="queqlite-c${config_id}"
