@@ -606,6 +606,24 @@ async fn stopped_v2_checkpoint_forks_only_to_its_bound_successor() {
     );
     assert!(restored.suffix().is_empty());
 
+    let successor_entries =
+        entries_for("cluster-a", 7, 4, stop.index + 1, stop.index + 2, stop.hash);
+    target.publish_committed(&successor_entries).await.unwrap();
+    let advanced_version = target
+        .load_checkpoint()
+        .await
+        .unwrap()
+        .unwrap()
+        .version()
+        .clone();
+    let advanced = source.fork_stopped_successor(&target, &stop).await.unwrap();
+    assert_eq!(advanced.version(), &advanced_version);
+    assert_eq!(advanced.manifest().tip().index(), stop.index + 2);
+    assert_eq!(
+        advanced.manifest().successor_transition(),
+        first.manifest().successor_transition()
+    );
+
     let rolled_identity = CheckpointIdentity::new("cluster-a", 7, 4, 10);
     let rolled = ObjectArchiveStore::new_checkpoint_for_single_process(
         store.clone(),

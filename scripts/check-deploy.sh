@@ -314,6 +314,47 @@ assert_object_preflight_blocks_stop provider
 assert_object_preflight_blocks_stop endpoint \
   QUEQLITE_S3_ENDPOINT=http://127.0.0.1:1 QUEQLITE_S3_ALLOW_HTTP=true
 
+assert_mutation_preflight_blocks_stop() {
+  local profile="$1"
+  local transition_dir="$tmp/${profile}-transition"
+  local command_log="$tmp/${profile}.kubectl-log" rc
+  set +e
+  PATH="$preflight_bin:$PATH" \
+    QUEQLITE_KUBECTL_FIXTURE_PROFILE="$profile" \
+    QUEQLITE_KUBECTL_FIXTURE_LOG="$command_log" \
+    QUEQLITE_KUBECTL_FIXTURE_ADMIN_RESPONSE="$valid_live_status" \
+    QUEQLITE_KUBECTL_FIXTURE_AUTH_RESPONSE="$valid_auth_secret" \
+    QUEQLITE_RECONFIG_WORK_DIR="$transition_dir" \
+    scripts/replace-k8s-config.sh "$tmp/config-3.json" "$tmp/config-4.json" \
+    >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" != 0 ]
+  [ ! -e "$transition_dir/stop-c3.state.json" ]
+  grep -Fq 'checkpoint inspect' "$command_log"
+  grep -Fq 'create secret generic queqlite-c4-bundle' "$command_log"
+  case "$profile" in
+    dry-run-scale-denied) grep -Fq 'scale statefulset queqlite-c3' "$command_log" ;;
+    dry-run-apply-denied)
+      grep -Fq 'scale statefulset queqlite-c3' "$command_log"
+      grep -Fq 'apply --server-side --dry-run=server' "$command_log"
+      ;;
+  esac
+  if grep -Fq 'admin POST' "$command_log"; then
+    echo "Kubernetes mutation denial reached Stop: $profile" >&2
+    exit 1
+  fi
+  if grep -E 'create secret generic|scale statefulset| apply ' "$command_log" \
+    | grep -v 'dry-run' >/dev/null; then
+    echo "Kubernetes mutation denial performed a non-dry-run mutation: $profile" >&2
+    exit 1
+  fi
+}
+
+assert_mutation_preflight_blocks_stop dry-run-secret-denied
+assert_mutation_preflight_blocks_stop dry-run-scale-denied
+assert_mutation_preflight_blocks_stop dry-run-apply-denied
+
 assert_live_identity_rejected() {
   local filter="$1" label="$2"
   local status="$tmp/${label}-status.json"
@@ -615,10 +656,11 @@ grep -Fq 'k8s-stop-state.sh hydrate' scripts/replace-k8s-config.sh
 grep -Fq "stop_proof: \$stopped[0].stop.proof" scripts/k8s-stop-state.sh
 compact_line="$(grep -n 'publishing final checkpoint V2' scripts/replace-k8s-config.sh | cut -d: -f1)"
 fork_line="$(grep -n 'forking stopped checkpoint' scripts/replace-k8s-config.sh | cut -d: -f1)"
-durable_secret_line="$(grep -n -- '--from-file=stop.json=' scripts/replace-k8s-config.sh | cut -d: -f1)"
+durable_secret_line="$(grep -n -- '--from-file=stop.json=' scripts/replace-k8s-config.sh \
+  | tail -n 1 | cut -d: -f1)"
 # shellcheck disable=SC2016
 scale_down_line="$(grep -n 'scale statefulset "$old_name" --replicas=0' \
-  scripts/replace-k8s-config.sh | cut -d: -f1)"
+  scripts/replace-k8s-config.sh | tail -n 1 | cut -d: -f1)"
 start_line="$(grep -n 'QUEQLITE_STARTUP_MODE=disaster' scripts/replace-k8s-config.sh | cut -d: -f1)"
 [ "$compact_line" -lt "$fork_line" ]
 [ "$fork_line" -lt "$start_line" ]

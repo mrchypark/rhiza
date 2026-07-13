@@ -46,8 +46,6 @@ scripts/render-k8s-config.sh \
   "$old_id" "$old_replicas" "$old_bundle" "$old_preflight_yaml"
 scripts/render-k8s-config.sh \
   "$new_id" "$new_replicas" "$successor_draft" "$successor_preflight_yaml" successor
-rm -f "$old_preflight_yaml" "$successor_preflight_yaml"
-trap - EXIT
 
 old_name="queqlite-c${old_id}"
 new_name="queqlite-c${new_id}"
@@ -182,6 +180,15 @@ if ! "$durable_resume"; then
     echo "object-store preflight returned a checkpoint for another configuration" >&2
     exit 65
   }
+  echo "preflighting Kubernetes transition mutations"
+  "${k[@]}" create secret generic "${new_name}-bundle" \
+    --from-file=config.json="$successor_draft" --from-file=stop.json="$old_bundle" \
+    --dry-run=client -o yaml \
+    | yq eval '.immutable = true' - \
+    | "${k[@]}" create --dry-run=server -f - >/dev/null
+  "${k[@]}" scale statefulset "$old_name" --replicas=0 --dry-run=server >/dev/null
+  "${k[@]}" apply --server-side --dry-run=server --validate=false \
+    -f "$successor_preflight_yaml" >/dev/null
 fi
 
 be64() {

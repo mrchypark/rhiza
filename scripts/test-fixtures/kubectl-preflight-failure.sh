@@ -28,6 +28,27 @@ case " $* " in
   *" exec -i queqlite-c"*" -- queqlite validate-config-bundle --stdin "*)
     "$QUEQLITE_KUBECTL_FIXTURE_QUEQLITE" validate-config-bundle --stdin
     ;;
+  *" create secret generic "*" --dry-run=client -o yaml "*)
+    arguments=("$@")
+    for ((index=0; index + 2 < ${#arguments[@]}; index++)); do
+      if [ "${arguments[index]}" = secret ] && [ "${arguments[index + 1]}" = generic ]; then
+        secret_name="${arguments[index + 2]}"
+        break
+      fi
+    done
+    printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\ndata:\n  config.json: e30=\n  stop.json: e30=\n' \
+      "$secret_name"
+    ;;
+  *" create --dry-run=server -f - "*)
+    yq eval -e '.kind == "Secret" and .immutable == true' - >/dev/null
+    [ "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" != dry-run-secret-denied ]
+    ;;
+  *" scale statefulset "*" --replicas=0 --dry-run=server "*)
+    [ "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" != dry-run-scale-denied ]
+    ;;
+  *" apply --server-side --dry-run=server --validate=false -f "*)
+    [ "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" != dry-run-apply-denied ]
+    ;;
   *" create -f "*)
     manifest="${*: -1}"
     if [ "$(yq eval -r '.spec.template.spec.containers[0].name' "$manifest")" = curl ]; then
@@ -64,8 +85,18 @@ case " $* " in
                   .name == "QUEQLITE_S3_SECRET_KEY")] | length' "$manifest")" = 0 ]
               ;;
           esac
-          printf failed > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE"
-          : > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE"
+          case "$QUEQLITE_KUBECTL_FIXTURE_PROFILE" in
+            dry-run-*)
+              source_id="$(jq -r '.config_id' "$QUEQLITE_KUBECTL_FIXTURE_BUNDLE_FILE")"
+              jq -n --argjson id "$source_id" '{identity:{config_id:$id}}' \
+                > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE"
+              printf success > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE"
+              ;;
+            *)
+              printf failed > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_STATE"
+              : > "$QUEQLITE_KUBECTL_FIXTURE_OBJECT_RESPONSE"
+              ;;
+          esac
           ;;
         *) exit 99 ;;
       esac
