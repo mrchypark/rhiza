@@ -156,6 +156,9 @@ from memory averages and peaks instead of being counted as a partial snapshot.
 `resource-summary.json`
 reports container-lifecycle CPU deltas plus average/peak memory using samples
 inside, or immediately bracketing, the Rust-reported measurement window. A
+complete app collection's earliest and latest CRI timestamps classify that
+memory batch; missing complete predecessor or successor batches invalidate the
+summary. CPU windowing continues to use each container's runtime timestamp. A
 pre-existing container uses its last pre-window counter as the baseline; a
 container born in the window uses zero, and a same-identity counter regression
 invalidates the evidence. Pod UID, container ID, and restart count must remain

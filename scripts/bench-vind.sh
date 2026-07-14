@@ -356,17 +356,38 @@ summarize_resource_samples() {
          container_id:$g[0].container_id,first:$first,last:$g[-1].cpu_usage_usec,
          baseline:(if $baseline == null then "born_in_window" else "preexisting" end),
          delta_usec:($g[-1].cpu_usage_usec - $first)});
-    def memory_by_app: group_by([.collection_batch,.app]) |
+    def complete_memory_batches: group_by([.collection_batch,.app]) |
       map(. as $batch |
-        select(([$batch[] | component] | unique | sort) ==
-          $expected_by_app[$batch[0].app]) |
+        ([$batch[] | component] | unique | sort) as $components |
+        select($components == $expected_by_app[$batch[0].app] and
+          ($components | length) == ($batch | length)) |
         {collection_batch:$batch[0].collection_batch,app:$batch[0].app,
+         started_at_epoch_seconds:($batch | map(.timestamp_epoch_seconds) | min),
+         finished_at_epoch_seconds:($batch | map(.timestamp_epoch_seconds) | max),
          memory_bytes:($batch | map(.memory_bytes) | add)});
+    def memory_window: group_by(.app) |
+      map(sort_by([.started_at_epoch_seconds,.finished_at_epoch_seconds,
+          .collection_batch]) as $batches |
+        ([$batches[] | select(.finished_at_epoch_seconds < $start)] | last) as $before |
+        ([$batches[] | select(.finished_at_epoch_seconds >= $start and
+          .started_at_epoch_seconds <= $end)]) as $inside |
+        ([$batches[] | select(.started_at_epoch_seconds > $end)] | first) as $after |
+        ([$before] + $inside + [$after] | map(select(. != null)) |
+          unique_by(.collection_batch))) | map(.[]);
     if any($samples[]; ((.collection_batch | type != "number") or
         .collection_batch < 0 or (.collection_batch | floor) != .collection_batch)) then
       error("resource sample collection batch is missing or invalid")
     elif any($groups[]; regressed) then error("container CPU counter regressed") else
-    (cpu_deltas) as $cpu | ($window | memory_by_app) as $memory |
+    (cpu_deltas) as $cpu |
+    ($samples | complete_memory_batches) as $complete_memory |
+    ($complete_memory | memory_window) as $memory |
+    if any(($expected_by_app | keys)[]; . as $app |
+        (any($complete_memory[]; .app == $app and
+          .finished_at_epoch_seconds <= $start) | not) or
+        (any($complete_memory[]; .app == $app and
+          .started_at_epoch_seconds >= $end) | not)) then
+      error("complete memory batches do not bracket the measurement window")
+    else
     {status:"ok",measurement_window:{started_at_epoch_seconds:$start,
       finished_at_epoch_seconds:$end},samples:($window | length),
      container_cpu_usage_usec_deltas:$cpu,
@@ -377,6 +398,7 @@ summarize_resource_samples() {
         average_memory_bytes:(if ($app_memory | length) == 0 then null else
           (($app_memory | map(.memory_bytes) | add) / ($app_memory | length) | floor) end),
         peak_memory_bytes:($app_memory | map(.memory_bytes) | max // null)}))} end
+    end
   ' "$1"
 }
 

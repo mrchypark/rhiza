@@ -91,6 +91,14 @@ jq -cn '{stats:[{attributes:{id:"container-id",metadata:{name:"queqlite"},
   cpu:{timestamp:"130000000000",usageCoreNanoSeconds:{value:"3000"}},
   memory:{timestamp:"130000000000",workingSetBytes:{value:"2"}}}]}' |
   resource_samples_from_cri_stats bench 2 >> "$tmp/delayed-collector.jsonl"
+jq -cn '{stats:[{attributes:{id:"pre-container-id",metadata:{name:"queqlite"},
+    labels:{"io.kubernetes.pod.namespace":"bench",
+      "io.kubernetes.pod.name":"queqlite-c1-0",
+      "io.kubernetes.pod.uid":"pre-pod-uid"},
+    annotations:{"io.kubernetes.container.restartCount":"0"}},
+  cpu:{timestamp:"119000000000",usageCoreNanoSeconds:{value:"0"}},
+  memory:{timestamp:"119000000000",workingSetBytes:{value:"2"}}}]}' |
+  resource_samples_from_cri_stats bench 0 >> "$tmp/delayed-collector.jsonl"
 jq -e '.timestamp_epoch_seconds == 121.25' \
   <(head -1 "$tmp/delayed-collector.jsonl") >/dev/null
 summarize_resource_samples "$tmp/delayed-collector.jsonl" 120 129 \
@@ -110,18 +118,61 @@ fi
 # CRI timestamps may be staggered within one stats response. Memory remains one
 # collection snapshot and must be summed by collection batch, not timestamp.
 {
+  for pod in queqlite-c1-0 queqlite-c1-1 queqlite-c1-2; do
+    component_sample "$pod" queqlite 140 140 original 0 9 |
+      jq -c 'if .pod == "queqlite-c1-0" then .memory_bytes = 10
+        elif .pod == "queqlite-c1-1" then .memory_bytes = 20
+        else .memory_bytes = 30 end'
+  done
   component_sample queqlite-c1-0 queqlite 150 150 original 0 10 |
     jq -c '.memory_bytes = 10'
   component_sample queqlite-c1-1 queqlite 151 151 original 0 10 |
     jq -c '.memory_bytes = 20'
   component_sample queqlite-c1-2 queqlite 152 152 original 0 10 |
     jq -c '.memory_bytes = 30'
+  for pod in queqlite-c1-0 queqlite-c1-1 queqlite-c1-2; do
+    component_sample "$pod" queqlite 160 160 original 0 11 |
+      jq -c 'if .pod == "queqlite-c1-0" then .memory_bytes = 10
+        elif .pod == "queqlite-c1-1" then .memory_bytes = 20
+        else .memory_bytes = 30 end'
+  done
 } > "$tmp/staggered-memory-resources.jsonl"
 summarize_resource_samples "$tmp/staggered-memory-resources.jsonl" 149 153 \
   > "$tmp/staggered-memory-summary.json"
 jq -e '.apps[] | select(.app == "queqlite") |
-  .memory_samples == 1 and .average_memory_bytes == 60 and .peak_memory_bytes == 60' \
+  .memory_samples == 3 and .average_memory_bytes == 60 and .peak_memory_bytes == 60' \
   "$tmp/staggered-memory-summary.json" >/dev/null
+
+# Selecting the measurement window per container can split every complete CRI
+# response when valid timestamp skew crosses both boundaries. Memory evidence
+# must instead retain complete collection batches.
+{
+  for batch in 1 2 3 4; do
+    case "$batch" in
+      1) first=100; later=100 ;;
+      2) first=118; later=122 ;;
+      3) first=119; later=123 ;;
+      4) first=140; later=140 ;;
+    esac
+    component_sample queqlite-c1-0 queqlite "$first" "$first" original 0 "$batch"
+    component_sample queqlite-c1-1 queqlite "$later" "$later" original 0 "$batch"
+    component_sample queqlite-c1-2 queqlite "$later" "$later" original 0 "$batch"
+    component_sample rustfs-abc rustfs "$first" "$first" original 0 "$batch"
+  done
+} > "$tmp/batch-window-skew-resources.jsonl"
+validate_resource_samples "$tmp/batch-window-skew-resources.jsonl" 120 121 50 0
+summarize_resource_samples "$tmp/batch-window-skew-resources.jsonl" 120 121 \
+  > "$tmp/batch-window-skew-summary.json"
+jq -e '.apps[] | select(.app == "queqlite") |
+  .memory_samples == 4 and .average_memory_bytes == 6 and .peak_memory_bytes == 6' \
+  "$tmp/batch-window-skew-summary.json" >/dev/null
+jq -c 'select(.collection_batch != 4)' "$tmp/batch-window-skew-resources.jsonl" \
+  > "$tmp/unbracketed-memory-resources.jsonl"
+if summarize_resource_samples "$tmp/unbracketed-memory-resources.jsonl" 120 121 \
+  >/dev/null 2>&1; then
+  echo "memory evidence without a complete successor batch was accepted" >&2
+  exit 1
+fi
 
 {
   for epoch in 118 124 130 136 142; do
