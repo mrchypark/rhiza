@@ -107,23 +107,33 @@ assert_port_forward_alive() {
   local index="$1" pid="${port_forward_pids[$1]}" status=0
   kill -0 "$pid" 2>/dev/null && return
   if wait "$pid"; then status=0; else status=$?; fi
-  echo "port-forward exited with status $status: ${endpoint_urls[$index]}" >&2
+  echo "port-forward exited with status $status: ${admin_endpoint_urls[$index]}" >&2
   sed 's/^/  /' "$target/port-forward-$index.log" >&2
   exit 1
 }
 
 assert_all_port_forwards_alive() {
   local index
-  for index in "${!endpoint_urls[@]}"; do assert_port_forward_alive "$index"; done
+  for index in "${!admin_endpoint_urls[@]}"; do assert_port_forward_alive "$index"; done
 }
 
 assert_all_port_forwards_ready() {
   local endpoint_url
   assert_all_port_forwards_alive
-  for endpoint_url in "${endpoint_urls[@]}"; do
+  for endpoint_url in "${admin_endpoint_urls[@]}"; do
     endpoint_ready "$endpoint_url" ||
       die "port-forward did not remain ready: $endpoint_url"
   done
+}
+
+configure_endpoint_topology() {
+  [ "${#admin_endpoint_urls[@]}" -eq 3 ] || return 1
+  workload_endpoint_urls=("${admin_endpoint_urls[0]}")
+  [ "$multi_endpoint" = 0 ] || workload_endpoint_urls=("${admin_endpoint_urls[@]}")
+}
+
+selected_resource_fault_pod() {
+  if [ "$fault" = pod-delete ]; then printf '%s' "$fault_pod"; fi
 }
 
 supervise_rebinding_port_forward() {
@@ -210,7 +220,8 @@ validate_resource_sample_schema() {
         (.app == "simulator" and
           (.container == "rustfs" or .container == "object-meter") and
           (.pod | startswith("rustfs-")))) and
-      ([.restart_count,.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0))) and
+      (.restart_count | type == "number" and . >= 0 and floor == .) and
+      ([.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0))) and
     all($expected[]; . as $required | any($samples[]; component == $required)) and
     ([$samples[] | select(.container == "rustfs") | .pod] | unique | length) == 1 and
     (if $meter_enabled == 1 then
@@ -252,6 +263,7 @@ validate_resource_samples() {
     --arg fault_start "$fault_start" --arg fault_end "$fault_end" \
     --argjson expected "$expected" '
     def component: if .app == "queqlite" then .pod else .container end;
+    def identity: [.pod_uid,.container_id,.restart_count];
     def fault_gap($component; $left; $right):
       $component == $fault_pod and
       ($left.pod_uid != $right.pod_uid or $left.container_id != $right.container_id) and
@@ -264,23 +276,39 @@ validate_resource_samples() {
       ($right.timestamp_epoch_seconds - ($fault_end | tonumber)) <= $max_gap;
     . as $samples |
     $start >= 0 and $end >= $start and $interval > 0 and
+    ($fault_pod == "" or ($fault_pod | test("^queqlite-c1-[0-2]$"))) and
     all($expected[];
       . as $component |
       ([$samples[] | select(component == $component)] |
         unique_by([.timestamp_epoch_seconds,.container_id]) |
         sort_by(.timestamp_epoch_seconds)) as $observed |
+      (if $component == $fault_pod and
+          ($fault_end | test("^[0-9]+([.][0-9]+)?$")) and
+          ($fault_end | tonumber) > $end
+       then ($fault_end | tonumber) else $end end) as $coverage_end |
       ([$observed[] | select(.timestamp_epoch_seconds <= $start)] | last) as $before |
-      ([$observed[] | select(.timestamp_epoch_seconds >= $end)] | first) as $after |
+      ([$observed[] | select(.timestamp_epoch_seconds >= $coverage_end)] | first) as $after |
       ($observed | length) >= 2 and $before != null and $after != null and
       ($start - $before.timestamp_epoch_seconds) <= $max_gap and
-      ($after.timestamp_epoch_seconds - $end) <= $max_gap and
+      ($after.timestamp_epoch_seconds - $coverage_end) <= $max_gap and
       (([$observed[] | select(.timestamp_epoch_seconds >= $before.timestamp_epoch_seconds and
           .timestamp_epoch_seconds <= $after.timestamp_epoch_seconds)]) as $covered |
         ($covered | length) >= 2 and
         all(range(1; $covered | length);
           . as $i | ($covered[$i].timestamp_epoch_seconds -
             $covered[$i - 1].timestamp_epoch_seconds) <= $max_gap or
-            fault_gap($component; $covered[$i - 1]; $covered[$i]))))
+            fault_gap($component; $covered[$i - 1]; $covered[$i])) and
+        (if $component == $fault_pod then
+           ([$covered[] | identity] | unique | length) == 2 and
+           ([range(1; $covered | length) as $i |
+             select(($covered[$i - 1] | identity) != ($covered[$i] | identity))] | length) == 1 and
+           all(range(1; $covered | length);
+             . as $i |
+             (($covered[$i - 1] | identity) == ($covered[$i] | identity)) or
+             fault_gap($component; $covered[$i - 1]; $covered[$i]))
+         else
+           ([$covered[] | identity] | unique | length) == 1
+         end)))
   ' "$1" >/dev/null 2>&1
 }
 
@@ -507,7 +535,7 @@ wait_for_checkpoint_drain() {
   local statuses_file="$target/.checkpoint-statuses.jsonl"
   for _ in $(seq 1 120); do
     : > "$statuses_file"
-    for endpoint_url in "${endpoint_urls[@]}"; do
+    for endpoint_url in "${admin_endpoint_urls[@]}"; do
       status="$(curl --max-time 3 -fsS -H 'x-queqlite-version: 1' -H "Authorization: Bearer $admin_token" \
         "$endpoint_url/v1/admin/membership/status" 2>/dev/null || true)"
       [ -n "$status" ] || continue
@@ -520,17 +548,22 @@ wait_for_checkpoint_drain() {
     done
     elapsed=$((SECONDS - start_epoch))
     jq -s '.' "$statuses_file" > "$status_file"
-    if jq -e --argjson expected "${#endpoint_urls[@]}" '
+    if jq -e --argjson expected "${#admin_endpoint_urls[@]}" '
+      def hash:
+        type == "array" and length == 32 and
+        all(.[]; type == "number" and . >= 0 and . <= 255 and floor == .);
       . as $statuses |
       ($statuses[0].status.qlog_root // null) as $root |
       length == $expected and
       ($root | type) == "object" and
-      ($root.index | type) == "number" and
-      ($root.hash | type) == "string" and
+      ($root.index | type) == "number" and $root.index >= 0 and ($root.index | floor) == $root.index and
+      ($root.hash | hash) and
       all($statuses[];
         (.status | type) == "object" and
         (.status.qlog_root | type) == "object" and
         (.status.checkpoint_root | type) == "object" and
+        (.status.qlog_root.hash | hash) and
+        (.status.checkpoint_root.hash | hash) and
         .status.qlog_root == $root and .status.checkpoint_root == $root)
     ' "$status_file" >/dev/null 2>&1; then
       jq --argjson wait_seconds "$elapsed" \
@@ -673,7 +706,7 @@ wait_for_resource_coverage() {
   local deadline=$((SECONDS + $(resource_coverage_wait_budget_seconds)))
   while ! validate_resource_samples "$resources_jsonl" \
     "$measurement_started_at_epoch_seconds" "$measurement_finished_at_epoch_seconds" \
-    "$sample_interval" "$object_metering" "${fault_pod:-}" \
+    "$sample_interval" "$object_metering" "$(selected_resource_fault_pod)" \
     "$resource_fault_started_at_epoch_seconds" "$resource_fault_finished_at_epoch_seconds"; do
     kill -0 "$sampler_pid" 2>/dev/null || return 1
     [ "$SECONDS" -lt "$deadline" ] || return 1
@@ -856,7 +889,7 @@ cleanup_run() {
   elif [ "$resource_evidence_status" != failed ] &&
     validate_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
       "$measurement_finished_at_epoch_seconds" "$sample_interval" "$object_metering" \
-      "${fault_pod:-}" "$resource_fault_started_at_epoch_seconds" \
+      "$(selected_resource_fault_pod)" "$resource_fault_started_at_epoch_seconds" \
       "$resource_fault_finished_at_epoch_seconds" &&
     summarize_resource_samples "$resources_jsonl" "$measurement_started_at_epoch_seconds" \
       "$measurement_finished_at_epoch_seconds" > "$resource_summary"; then
@@ -1043,11 +1076,10 @@ scripts/wait-k8s-statefulset-ready.sh queqlite-c1 3 1
 k set env statefulset/queqlite-c1 QUEQLITE_STARTUP_MODE=rejoin >/dev/null
 
 local_port="${QUEQLITE_BENCH_PORT:-18080}"
-endpoint_urls=()
-endpoint_count=1
+admin_endpoint_urls=()
+workload_endpoint_urls=()
 fault_endpoint_index=""
-[ "$multi_endpoint" = 0 ] || endpoint_count=3
-for ordinal in $(seq 0 $((endpoint_count - 1))); do
+for ordinal in 0 1 2; do
   port=$((local_port + ordinal))
   if [ "$fault" = pod-delete ] && [ "$fault_pod" = "queqlite-c1-$ordinal" ]; then
     fault_endpoint_index="$ordinal"
@@ -1057,11 +1089,12 @@ for ordinal in $(seq 0 $((endpoint_count - 1))); do
       > "$target/port-forward-$ordinal.log" 2>&1 &
   fi
   port_forward_pids+=("$!")
-  endpoint_urls+=("http://127.0.0.1:${port}")
+  admin_endpoint_urls+=("http://127.0.0.1:${port}")
 done
+configure_endpoint_topology || die "benchmark requires exactly three admin endpoints"
 
-for index in "${!endpoint_urls[@]}"; do
-  endpoint_url="${endpoint_urls[$index]}"
+for index in "${!admin_endpoint_urls[@]}"; do
+  endpoint_url="${admin_endpoint_urls[$index]}"
   for _ in $(seq 1 60); do
     endpoint_ready "$endpoint_url" && break
     assert_port_forward_alive "$index"
@@ -1121,7 +1154,7 @@ if [ "$object_metering" = 1 ]; then
 fi
 bench_args=(--duration "$duration" --warmup "$warmup" --concurrency "$concurrency"
   --workload "$workload" --write-percent "$write_percent" --skip-setup)
-for endpoint_url in "${endpoint_urls[@]}"; do bench_args+=(--endpoint "$endpoint_url"); done
+for endpoint_url in "${workload_endpoint_urls[@]}"; do bench_args+=(--endpoint "$endpoint_url"); done
 [ -z "$target_rate" ] || bench_args+=(--target-rate "$target_rate")
 case "$fault" in
   pod-delete)

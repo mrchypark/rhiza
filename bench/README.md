@@ -114,6 +114,14 @@ suffixes. `artifacts.json` records the selected mode and the applicable
 `max_lag` or `interval` under `configuration.durability`; the rendered cluster
 manifest records the same environment configuration.
 
+The runner always establishes and monitors all three local node forwards for
+readiness and final checkpoint consensus. The default workload still targets
+only the preferred first endpoint; `QUEQLITE_BENCH_MULTI_ENDPOINT=1` passes all
+three forwards to the load generator for preferred-first failover. A dead or
+invalid admin endpoint makes the evidence fail instead of reducing the quorum
+being checked. Final checkpoint roots must agree on both index and the serialized
+32-byte hash across all three nodes.
+
 `artifacts.json.provenance` binds the run to the Git commit and dirty state plus
 the Docker image content ID and available repository digests. A dirty source
 tree or missing immutable image ID leaves an ordinary local run usable but sets
@@ -141,7 +149,11 @@ reports container-lifecycle CPU deltas plus average/peak memory using samples
 inside, or immediately bracketing, the Rust-reported measurement window. A
 pre-existing container uses its last pre-window counter as the baseline; a
 container born in the window uses zero, and a same-identity counter regression
-invalidates the evidence. Warmup and later cleanup samples are excluded.
+invalidates the evidence. Pod UID, container ID, and restart count must remain
+stable for every component. A pod-delete run requires exactly one identity
+transition for the named fault pod inside the verified fault window; any other
+restart or identity transition invalidates the evidence. Warmup and later
+cleanup samples are excluded.
 Publishable evidence permits one missed collection plus one second of scheduling
 jitter. The three-second collection timeout sends TERM and forces a kill one
 second later, so the default continuity and final-coverage budget is twice the

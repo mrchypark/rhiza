@@ -46,14 +46,16 @@ if validate_resource_sample_schema "$tmp/empty-resources.jsonl"; then
 fi
 component_sample() {
   local pod="$1" container="$2" epoch="$3" cpu="${4:-$3}" identity="${5:-original}"
+  local restart_count="${6:-0}"
   local app=simulator
   [ "$container" != queqlite ] || app=queqlite
   jq -cn --arg app "$app" --arg pod "$pod" --arg container "$container" \
     --arg identity "$identity" --argjson epoch "$epoch" --argjson cpu "$cpu" \
+    --argjson restart_count "$restart_count" \
     '{timestamp:"2026-07-13T00:00:00Z",timestamp_epoch_seconds:$epoch,
       source:"containerd_cri_stats",app:$app,pod:$pod,
       pod_uid:($pod + "-uid-" + $identity),container:$container,
-      container_id:($container + "-id-" + $identity),restart_count:0,
+      container_id:($container + "-id-" + $identity),restart_count:$restart_count,
       cpu_usage_usec:$cpu,memory_bytes:2}'
 }
 resource_cycle() {
@@ -124,6 +126,39 @@ component_sample rustfs-abc rustfs 201 >> "$tmp/resources.jsonl"
 validate_resource_sample_schema "$tmp/jittered-resources.jsonl" 0
 validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 0
 
+cp "$tmp/jittered-resources.jsonl" "$tmp/unexpected-restart-resources.jsonl"
+jq -c 'if .pod == "queqlite-c1-2" and .timestamp_epoch_seconds >= 150
+  then .restart_count = 1 else . end' "$tmp/unexpected-restart-resources.jsonl" \
+  > "$tmp/unexpected-restart-resources.tmp"
+mv "$tmp/unexpected-restart-resources.tmp" "$tmp/unexpected-restart-resources.jsonl"
+if validate_resource_samples "$tmp/unexpected-restart-resources.jsonl" 120 200 2 0; then
+  echo "unexpected restart in a no-fault run was accepted" >&2
+  exit 1
+fi
+
+cp "$tmp/jittered-resources.jsonl" "$tmp/non-fault-identity-resources.jsonl"
+jq -c 'if .pod == "queqlite-c1-2" and .timestamp_epoch_seconds >= 150
+  then .pod_uid = "unexpected-uid" | .container_id = "unexpected-container"
+  else . end' "$tmp/non-fault-identity-resources.jsonl" \
+  > "$tmp/non-fault-identity-resources.tmp"
+mv "$tmp/non-fault-identity-resources.tmp" "$tmp/non-fault-identity-resources.jsonl"
+if validate_resource_samples "$tmp/non-fault-identity-resources.jsonl" 120 200 2 0 \
+  queqlite-c1-1 135 185; then
+  echo "non-fault component identity transition was accepted" >&2
+  exit 1
+fi
+
+if validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 0 \
+  queqlite-c1-1 135 185; then
+  echo "fault evidence without the required identity transition was accepted" >&2
+  exit 1
+fi
+if validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 0 \
+  rustfs-abc 135 185; then
+  echo "non-Queqlite fault component was accepted" >&2
+  exit 1
+fi
+
 {
   resource_cycle 100
   for epoch in $(seq 122 6 200); do
@@ -156,6 +191,26 @@ jq -e '.samples == 12 and
 
 gap_fixture "$tmp/fault-gap-resources.jsonl" queqlite-c1-1
 validate_resource_samples "$tmp/fault-gap-resources.jsonl" 120 200 2 0 \
+  queqlite-c1-1 135 185
+cp "$tmp/fault-gap-resources.jsonl" "$tmp/fault-with-other-restart-resources.jsonl"
+jq -c 'if .pod == "queqlite-c1-2" and .timestamp_epoch_seconds >= 150
+  then .restart_count = 1 else . end' "$tmp/fault-with-other-restart-resources.jsonl" \
+  > "$tmp/fault-with-other-restart-resources.tmp"
+mv "$tmp/fault-with-other-restart-resources.tmp" "$tmp/fault-with-other-restart-resources.jsonl"
+if validate_resource_samples "$tmp/fault-with-other-restart-resources.jsonl" 120 200 2 0 \
+  queqlite-c1-1 135 185; then
+  echo "restart of a non-fault component was accepted" >&2
+  exit 1
+fi
+{
+  for epoch in $(seq 118 6 160); do resource_cycle "$epoch"; done
+  for epoch in $(seq 166 6 184); do resource_cycle "$epoch" queqlite-c1-1; done
+  for epoch in 190 196 202; do
+    resource_cycle "$epoch" queqlite-c1-1
+    component_sample queqlite-c1-1 queqlite "$epoch" "$epoch" replacement
+  done
+} > "$tmp/fault-outlives-measurement-resources.jsonl"
+validate_resource_samples "$tmp/fault-outlives-measurement-resources.jsonl" 120 160 2 0 \
   queqlite-c1-1 135 185
 sed 's/-replacement"/-original"/g' "$tmp/fault-gap-resources.jsonl" \
   > "$tmp/fault-omission-resources.jsonl"
@@ -410,7 +465,7 @@ if failure="$(
   # shellcheck disable=SC2034 # Read by assert_port_forward_alive from the sourced script.
   target="$tmp"
   # shellcheck disable=SC2034 # Read by assert_port_forward_alive from the sourced script.
-  endpoint_urls=(http://127.0.0.1:18080)
+  admin_endpoint_urls=(http://127.0.0.1:18080)
   false &
   port_forward_pids=("$!")
   while kill -0 "${port_forward_pids[0]}" 2>/dev/null; do :; done
@@ -426,7 +481,7 @@ grep -Fq 'fixture port-forward failure' <<< "$failure"
 printf '%s\n' 'fixture non-target failure' > "$tmp/port-forward-1.log"
 if failure="$(
   target="$tmp"
-  endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081)
+  admin_endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081)
   sleep 30 & live_pid=$!
   trap 'kill "$live_pid" 2>/dev/null || true' EXIT
   false & dead_pid=$!
@@ -473,33 +528,82 @@ mkdir "$checkpoint_fixture"
 (
   target="$checkpoint_fixture"
   checkpoint_drain_json="$checkpoint_fixture/result.json"
-  endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081)
+  admin_endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081 http://127.0.0.1:18082)
   admin_token=fixture
   checkpoint_fixture_mode=stale
   seq() { printf '1\n'; }
   sleep() { :; }
   curl() {
-    local url="${!#}" index=6 hash=six
+    local url="${!#}" index=6
     if [ "$checkpoint_fixture_mode" = stale ] && [[ "$url" == *:18080/* ]]; then
       index=5
-      hash=five
     fi
-    jq -cn --argjson index "$index" --arg hash "$hash" \
-      '{qlog_root:{index:$index,hash:$hash},checkpoint_root:{index:$index,hash:$hash}}'
+    jq -cn --argjson index "$index" \
+      '{qlog_root:{index:$index,hash:[range(32)]},
+        checkpoint_root:{index:$index,hash:[range(32)]}}'
   }
   if wait_for_checkpoint_drain; then
     echo "a stale endpoint with a locally matching checkpoint was accepted" >&2
     exit 1
   fi
   jq -e '.qlog_root == null and .checkpoint_root == null and
-    (.endpoints | length) == 2' "$checkpoint_drain_json" >/dev/null
+    (.endpoints | length) == 3' "$checkpoint_drain_json" >/dev/null
 
   checkpoint_fixture_mode=converged
   wait_for_checkpoint_drain
-  jq -e '.qlog_root == {index:6,hash:"six"} and
-    .checkpoint_root == .qlog_root and (.endpoints | length) == 2 and
-    all(.endpoints[]; .qlog_root == {index:6,hash:"six"} and
+  jq -e '.qlog_root == {index:6,hash:[range(32)]} and
+    .checkpoint_root == .qlog_root and (.endpoints | length) == 3 and
+    all(.endpoints[]; .qlog_root == {index:6,hash:[range(32)]} and
       .checkpoint_root == .qlog_root)' "$checkpoint_drain_json" >/dev/null
+
+  checkpoint_fixture_mode="invalid-hash"
+  curl() {
+    jq -cn '{qlog_root:{index:6,hash:"not-serde-log-hash"},
+      checkpoint_root:{index:6,hash:"not-serde-log-hash"}}'
+  }
+  if wait_for_checkpoint_drain; then
+    echo "checkpoint drain accepted a string hash" >&2
+    exit 1
+  fi
+
+  curl() {
+    jq -cn '{qlog_root:{index:6,hash:([range(31)] + [256])},
+      checkpoint_root:{index:6,hash:([range(31)] + [256])}}'
+  }
+  if wait_for_checkpoint_drain; then
+    echo "checkpoint drain accepted an invalid byte-array hash" >&2
+    exit 1
+  fi
+
+  curl() {
+    jq -cn '{qlog_root:{index:6,hash:[range(31)]},
+      checkpoint_root:{index:6,hash:[range(31)]}}'
+  }
+  if wait_for_checkpoint_drain; then
+    echo "checkpoint drain accepted a short byte-array hash" >&2
+    exit 1
+  fi
+)
+
+(
+  admin_endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081 http://127.0.0.1:18082)
+  multi_endpoint=0
+  configure_endpoint_topology
+  [ "${#workload_endpoint_urls[@]}" -eq 1 ]
+  [ "${workload_endpoint_urls[0]}" = "${admin_endpoint_urls[0]}" ]
+  multi_endpoint=1
+  configure_endpoint_topology
+  [ "${workload_endpoint_urls[*]}" = "${admin_endpoint_urls[*]}" ]
+  admin_endpoint_urls=(http://127.0.0.1:18080 http://127.0.0.1:18081)
+  if configure_endpoint_topology; then
+    echo "incomplete admin evidence topology was accepted" >&2
+    exit 1
+  fi
+  fault=none
+  fault_pod=queqlite-c1-1
+  [ -z "$(selected_resource_fault_pod)" ]
+  fault="pod-delete"
+  [ "$(selected_resource_fault_pod)" = queqlite-c1-1 ]
 )
 
 : > "$KUBECTL_LOG"
@@ -524,7 +628,7 @@ rebind_fixture="$tmp/rebind"
 mkdir "$rebind_fixture"
 (
   target="$rebind_fixture"
-  endpoint_urls=(http://127.0.0.1:18081)
+  admin_endpoint_urls=(http://127.0.0.1:18081)
   printf '0\n' > "$rebind_fixture/starts"
   k() {
     local invocation
