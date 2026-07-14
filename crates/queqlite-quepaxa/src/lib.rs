@@ -1,22 +1,25 @@
+#![doc = include_str!("../README.md")]
+
 use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
-use queqlite_core::{
-    canonical_membership_digest, ClusterId, Command, CommandKind, ConfigId, EntryType, Epoch,
-    LogEntry, LogHash, LogIndex, NodeId, StoredCommand,
-};
+use queqlite_core::canonical_membership_digest;
 
-pub use queqlite_core::ConfigChange;
+pub use queqlite_core::{
+    ClusterId, Command, CommandKind, ConfigChange, ConfigId, EntryType, Epoch, LogEntry, LogHash,
+    LogIndex, NodeId, StoredCommand,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Slot = u64;
@@ -39,11 +42,6 @@ pub enum Error {
     CommandUnavailable,
     Cancelled,
     ConflictingCertificates,
-    /// Legacy source-compatibility error; the active engine returns Pending.
-    ContentionExhausted {
-        attempts: usize,
-        highest_promised: Option<Ballot>,
-    },
     Decode(String),
     DuplicateRecorderIdentity,
     EmptyRecorderIdentity,
@@ -75,12 +73,6 @@ impl fmt::Display for Error {
             Self::Cancelled => write!(f, "QuePaxa proposal cancelled"),
             Self::ConflictingCertificates => {
                 write!(f, "QuePaxa recovered conflicting decision certificates")
-            }
-            Self::ContentionExhausted { attempts, .. } => {
-                write!(
-                    f,
-                    "QuePaxa contention retries exhausted after {attempts} attempts"
-                )
             }
             Self::Decode(message) => write!(f, "QuePaxa decode failed: {message}"),
             Self::DuplicateRecorderIdentity => write!(f, "recorder identities must be unique"),
@@ -1086,15 +1078,20 @@ pub struct RecorderFileStore {
 }
 
 pub trait RecorderRpc: Send + Sync {
-    /// Performs one recorder operation with a finite deadline.
-    ///
-    /// Implementations must return an error when that deadline expires. Quorum
-    /// operations call recorders concurrently, but wait for every call to
-    /// finish before evaluating replies; an unbounded implementation can stall
-    /// the entire quorum operation.
-    fn call(&self, request: RecorderRequest) -> Result<RecorderReply>;
+    /// Compatibility hook for the pre-typed recorder protocol.
+    #[doc(hidden)]
+    fn call(&self, _request: RecorderRequest) -> Result<RecorderReply> {
+        Err(Error::MigrationRequired {
+            format: "recorder transport",
+            version: 1,
+        })
+    }
 
-    /// Genuine QuePaxa Record operation. Implementations must opt in.
+    /// Performs one genuine QuePaxa Record operation.
+    ///
+    /// Network implementations must enforce a finite deadline and return an
+    /// error when it expires. The same bounded-call requirement applies to all
+    /// process-bound methods on this trait.
     fn record(&self, _request: RecordRequest) -> Result<RecordSummary> {
         Err(Error::TypedRecordRequired)
     }
@@ -2115,9 +2112,6 @@ pub struct ThreeNodeConsensus {
     background_threads: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
-pub type QuePaxaConsensus = ThreeNodeConsensus;
-pub type StoppableQuePaxa = ThreeNodeConsensus;
-
 pub trait PrioritySource: Send + Sync {
     fn sample(
         &self,
@@ -2141,8 +2135,7 @@ impl PrioritySource for OsPrioritySource {
     ) -> Result<ProposalPriority> {
         let mut bytes = [0; 32];
         let _ = (slot, round, proposer_id, recorder_id);
-        fs::File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut bytes))
+        getrandom::fill(&mut bytes)
             .map_err(|error| Error::RandomnessUnavailable(error.to_string()))?;
         if bytes == ProposalPriority::ZERO.0 || bytes == ProposalPriority::MAX.0 {
             bytes[31] = 1;
@@ -2208,12 +2201,47 @@ impl Drop for ThreeNodeConsensus {
             Err(poisoned) => std::mem::take(poisoned.into_inner()),
         };
         for handle in handles {
-            let _ = handle.join();
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
 
 impl ThreeNodeConsensus {
+    /// Waits up to `timeout` for quorum RPC workers that outlived an early
+    /// quorum return. Returns `true` when every tracked worker has finished.
+    /// Callers must first quiesce proposal admission and ensure no proposal
+    /// can still spawn or register workers; this only drains already tracked
+    /// workers.
+    pub fn finish_pending_rpcs(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            let empty = {
+                let mut handles = match self.background_threads.lock() {
+                    Ok(handles) => handles,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let mut index = 0;
+                while index < handles.len() {
+                    if handles[index].is_finished() {
+                        let _ = handles.swap_remove(index).join();
+                    } else {
+                        index += 1;
+                    }
+                }
+                handles.is_empty()
+            };
+            if empty {
+                return true;
+            }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub const fn config_id(&self) -> ConfigId {
         self.config_id
     }
@@ -2398,17 +2426,16 @@ impl ThreeNodeConsensus {
         }
     }
 
-    pub fn propose_with_priority(&self, command: Command, priority: Priority) -> Result<LogEntry> {
+    fn propose_next(&self, command: Command) -> Result<LogEntry> {
         let mut tip = self.legacy_tip.lock().map_err(|_| Error::ProposeFailed)?;
-        let entry =
-            self.propose_at_with_priority(tip.next_index, tip.last_hash, command, priority)?;
+        let entry = self.propose_at(tip.next_index, tip.last_hash, command)?;
         tip.next_index = entry.index + 1;
         tip.last_hash = entry.hash;
         Ok(entry)
     }
 
     pub fn propose_at(&self, slot: Slot, prev_hash: LogHash, command: Command) -> Result<LogEntry> {
-        self.propose_at_with_priority(slot, prev_hash, command, Priority::MAX)
+        self.propose_stored_at(slot, prev_hash, stored_command(command)?)
     }
 
     pub fn propose_at_cancellable(
@@ -2418,31 +2445,16 @@ impl ThreeNodeConsensus {
         command: Command,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<LogEntry> {
-        self.propose_stored_at_with_priority_until(
-            slot,
-            prev_hash,
-            stored_command(command)?,
-            Priority::MAX,
-            || cancelled.load(Ordering::Acquire),
-        )
-    }
-
-    pub fn propose_at_with_priority(
-        &self,
-        slot: Slot,
-        prev_hash: LogHash,
-        command: Command,
-        priority: Priority,
-    ) -> Result<LogEntry> {
-        self.propose_stored_at_with_priority(slot, prev_hash, stored_command(command)?, priority)
+        self.propose_stored_at_until(slot, prev_hash, stored_command(command)?, || {
+            cancelled.load(Ordering::Acquire)
+        })
     }
 
     pub fn propose_stop_at(&self, slot: Slot, prev_hash: LogHash) -> Result<LogEntry> {
-        self.propose_stored_at_with_priority(
+        self.propose_stored_at(
             slot,
             prev_hash,
             ConfigChange::stop(self.config_id, self.config_digest).to_stored_command(),
-            Priority::MAX,
         )
     }
 
@@ -2464,12 +2476,7 @@ impl ThreeNodeConsensus {
             successor.members().to_vec(),
         )
         .map_err(|_| Error::Rejected(RejectReason::InvalidTransition))?;
-        self.propose_stored_at_with_priority(
-            slot,
-            prev_hash,
-            stop.to_stored_command(),
-            Priority::MAX,
-        )
+        self.propose_stored_at(slot, prev_hash, stop.to_stored_command())
     }
 
     pub fn propose_activation_barrier_at(
@@ -2477,7 +2484,7 @@ impl ThreeNodeConsensus {
         stop_slot: Slot,
         prefix_hash: LogHash,
     ) -> Result<LogEntry> {
-        self.propose_stored_at_with_priority(
+        self.propose_stored_at(
             stop_slot.checked_add(1).ok_or(Error::InvalidRecoveredTip)?,
             prefix_hash,
             ConfigChange::activation_barrier(
@@ -2487,7 +2494,6 @@ impl ThreeNodeConsensus {
                 prefix_hash,
             )
             .to_stored_command(),
-            Priority::MAX,
         )
     }
 
@@ -2505,7 +2511,7 @@ impl ThreeNodeConsensus {
             })
             .ok_or(Error::Rejected(RejectReason::InvalidTransition))?
             .clone();
-        self.propose_stored_at_with_priority(
+        self.propose_stored_at(
             stop.index
                 .checked_add(1)
                 .ok_or(Error::InvalidRecoveredTip)?,
@@ -2517,7 +2523,6 @@ impl ThreeNodeConsensus {
                 command.hash(),
             )
             .to_stored_command(),
-            Priority::MAX,
         )
     }
 
@@ -2558,7 +2563,7 @@ impl ThreeNodeConsensus {
             .successor()
             .expect("bound stop has successor")
             .clone();
-        self.propose_stored_at_with_priority(
+        self.propose_stored_at(
             stop_slot.checked_add(1).ok_or(Error::InvalidRecoveredTip)?,
             value.entry_hash,
             ConfigChange::bound_activation_barrier(
@@ -2568,7 +2573,6 @@ impl ThreeNodeConsensus {
                 value.command_hash,
             )
             .to_stored_command(),
-            Priority::MAX,
         )
     }
 
@@ -2578,31 +2582,14 @@ impl ThreeNodeConsensus {
         prev_hash: LogHash,
         command: StoredCommand,
     ) -> Result<LogEntry> {
-        self.propose_stored_at_with_priority(slot, prev_hash, command, Priority::MAX)
+        self.propose_stored_at_until(slot, prev_hash, command, || false)
     }
 
-    fn propose_stored_at_with_priority(
+    fn propose_stored_at_until<F>(
         &self,
         slot: Slot,
         prev_hash: LogHash,
         offered_command: StoredCommand,
-        _priority: Priority,
-    ) -> Result<LogEntry> {
-        self.propose_stored_at_with_priority_until(
-            slot,
-            prev_hash,
-            offered_command,
-            _priority,
-            || false,
-        )
-    }
-
-    fn propose_stored_at_with_priority_until<F>(
-        &self,
-        slot: Slot,
-        prev_hash: LogHash,
-        offered_command: StoredCommand,
-        _priority: Priority,
         cancelled: F,
     ) -> Result<LogEntry>
     where
@@ -3103,6 +3090,7 @@ impl ThreeNodeConsensus {
         let config_id = self.config_id;
         let config_digest = self.config_digest;
         let (sender, receiver) = std::sync::mpsc::channel();
+        let mut handles = Vec::with_capacity(self.recorders.len());
         for (expected_id, recorder) in self
             .membership
             .members()
@@ -3112,7 +3100,7 @@ impl ThreeNodeConsensus {
         {
             let sender = sender.clone();
             let request = request.clone();
-            thread::spawn(move || {
+            handles.push(thread::spawn(move || {
                 let reply = recorder.call(request).ok().filter(|reply| {
                     reply.recorder_id == expected_id
                         && reply.slot == slot
@@ -3120,7 +3108,7 @@ impl ThreeNodeConsensus {
                         && reply.config_digest == config_digest
                 });
                 let _ = sender.send(reply);
-            });
+            }));
         }
         drop(sender);
         let mut replies = Vec::with_capacity(quorum);
@@ -3130,6 +3118,7 @@ impl ThreeNodeConsensus {
                 break;
             }
         }
+        self.track_background_threads(handles);
         if replies.len() < quorum {
             return Ok(CertifiedDecisionInspection::Unavailable);
         }
@@ -3343,6 +3332,7 @@ impl ThreeNodeConsensus {
     ) -> Result<()> {
         let quorum = quorum_size(self.recorders.len());
         let (sender, receiver) = std::sync::mpsc::channel();
+        let mut handles = Vec::with_capacity(self.recorders.len());
         for recorder in &self.recorders {
             let recorder = Arc::clone(recorder);
             let command = command.clone();
@@ -3351,7 +3341,7 @@ impl ThreeNodeConsensus {
             let config_id = self.config_id;
             let config_digest = self.config_digest;
             let sender = sender.clone();
-            thread::spawn(move || {
+            handles.push(thread::spawn(move || {
                 let stored = recorder
                     .store_command_for(
                         cluster_id,
@@ -3363,7 +3353,7 @@ impl ThreeNodeConsensus {
                     )
                     .is_ok();
                 let _ = sender.send(stored);
-            });
+            }));
         }
         drop(sender);
         let mut stored = 0;
@@ -3373,6 +3363,7 @@ impl ThreeNodeConsensus {
                 break;
             }
         }
+        self.track_background_threads(handles);
         if stored < quorum {
             return Err(Error::NoQuorum);
         }
@@ -3434,8 +3425,9 @@ impl ThreeNodeConsensus {
     }
 
     fn track_background_threads(&self, handles: Vec<thread::JoinHandle<()>>) {
-        let Ok(mut background) = self.background_threads.lock() else {
-            return;
+        let mut background = match self.background_threads.lock() {
+            Ok(background) => background,
+            Err(poisoned) => poisoned.into_inner(),
         };
         let mut index = 0;
         while index < background.len() {
@@ -3687,7 +3679,7 @@ fn decode_certificate_proposer(encoded: &str) -> Option<(&str, &str)> {
 
 impl Consensus for ThreeNodeConsensus {
     fn propose(&self, command: Command) -> Result<LogEntry> {
-        self.propose_with_priority(command, Priority::MAX)
+        self.propose_next(command)
     }
 }
 
@@ -4530,6 +4522,7 @@ mod tests {
         ProposerProgress, RecorderFileStore, RecorderRpc, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use queqlite_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
+    use std::{sync::mpsc, thread, time::Duration};
 
     #[test]
     fn single_node_consensus_commits_contiguous_hash_chain() {
@@ -4603,5 +4596,44 @@ mod tests {
 
         assert_eq!(progress.command, Some(adopted));
         assert!(progress.transition_involved);
+    }
+
+    #[test]
+    fn pending_rpc_workers_are_tracked_and_drained_after_lock_poisoning() {
+        let root = tempfile::tempdir().unwrap();
+        let consensus = ThreeNodeConsensus::new(
+            "cluster",
+            "n1",
+            1,
+            1,
+            [
+                root.path().join("n1"),
+                root.path().join("n2"),
+                root.path().join("n3"),
+            ],
+        )
+        .unwrap();
+        thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = consensus.background_threads.lock().unwrap();
+                    panic!("poison background worker lock");
+                })
+                .join()
+                .is_err());
+        });
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+        consensus.track_background_threads(vec![worker]);
+
+        assert!(!consensus.finish_pending_rpcs(Duration::ZERO));
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 }

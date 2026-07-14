@@ -31,3 +31,11 @@ jobs:
           echo "${YQ_SHA256}  ${RUNNER_TEMP}/yq" | sha256sum -c -
           sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
       - run: scripts/check-bench-vind-static.sh
+      - run: scripts/check-quepaxa-package.sh
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check -p queqlite-core -p queqlite-quepaxa --lib --locked

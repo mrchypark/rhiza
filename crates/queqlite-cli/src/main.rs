@@ -1769,12 +1769,41 @@ fn shutdown_deadline_error(timeout: Duration) -> String {
 }
 
 async fn before_shutdown_deadline<T>(
+    deadline: tokio::time::Instant,
     timeout: Duration,
     future: impl std::future::Future<Output = T>,
 ) -> Result<T, String> {
-    tokio::time::timeout(timeout, future)
+    tokio::time::timeout_at(deadline, future)
         .await
         .map_err(|_| shutdown_deadline_error(timeout))
+}
+
+fn remaining_shutdown_budget(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+fn pending_consensus_rpc_result(finished: bool) -> Result<(), String> {
+    if finished {
+        Ok(())
+    } else {
+        Err("consensus RPCs did not finish before the shutdown deadline".into())
+    }
+}
+
+fn finish_pending_consensus_rpcs(
+    runtime: &Arc<NodeRuntime>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let consensus = runtime.consensus();
+    let finished = if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(|| consensus.finish_pending_rpcs(timeout))
+    } else {
+        consensus.finish_pending_rpcs(timeout)
+    };
+    pending_consensus_rpc_result(finished)
 }
 
 async fn serve_legacy_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
@@ -1829,7 +1858,8 @@ where
     stop_admin_admission(admin_tasks.as_ref());
     shutdown_tx.send_replace(true);
     runtime.cancel_operations();
-    let drained = before_shutdown_deadline(SERVE_SHUTDOWN_TIMEOUT, async {
+    let deadline = tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT;
+    let drained = before_shutdown_deadline(deadline, SERVE_SHUTDOWN_TIMEOUT, async {
         let mut drained = Ok(());
         if exit != ServeExit::Client {
             retain_first_error(
@@ -1850,8 +1880,15 @@ where
         wait_for_admin_tasks(admin_tasks.as_ref()).await;
         drained
     })
-    .await?;
-    result.and(drained)
+    .await
+    .unwrap_or_else(Err);
+    let mut shutdown_result = result;
+    retain_first_error(&mut shutdown_result, drained);
+    retain_first_error(
+        &mut shutdown_result,
+        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)),
+    );
+    shutdown_result
 }
 
 async fn serve_remote_until<F>(config: ServeConfig, shutdown: F) -> Result<(), String>
@@ -1996,7 +2033,8 @@ where
     stop_admin_admission(admin_tasks.as_ref());
     shutdown_tx.send_replace(true);
     runtime.cancel_operations();
-    before_shutdown_deadline(SERVE_SHUTDOWN_TIMEOUT, async {
+    let deadline = tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT;
+    let drained = before_shutdown_deadline(deadline, SERVE_SHUTDOWN_TIMEOUT, async {
         let mut drained = Ok(());
         if exit != ServeExit::Client {
             retain_first_error(
@@ -2023,9 +2061,13 @@ where
             task_result((&mut materializer.0).await, "materializer worker"),
         );
         wait_for_admin_tasks(admin_tasks.as_ref()).await;
-        finish_remote_serve(result.and(drained), runtime, coordinator).await
+        drained
     })
-    .await?
+    .await
+    .unwrap_or_else(Err);
+    let mut shutdown_result = result;
+    retain_first_error(&mut shutdown_result, drained);
+    finish_remote_shutdown(shutdown_result, runtime, coordinator, deadline).await
 }
 
 fn require_successor_startup_mode(mode: StartupMode) -> Result<(), String> {
@@ -2036,32 +2078,37 @@ fn require_successor_startup_mode(mode: StartupMode) -> Result<(), String> {
     }
 }
 
-async fn finish_remote_serve(
-    result: Result<(), String>,
+async fn finish_remote_shutdown(
+    mut result: Result<(), String>,
     runtime: Arc<NodeRuntime>,
     coordinator: Arc<CheckpointCoordinator>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     runtime.cancel_operations();
-    let final_flush = match runtime.applied_index() {
-        Ok(applied_index) => coordinator
-            .flush_runtime(&runtime, applied_index)
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "final checkpoint durability is unconfirmed because the flush failed: {error}"
-                )
-            }),
-        Err(error) => Err(format!(
-            "final checkpoint durability is unconfirmed because the applied index is unavailable: {error}"
-        )),
-    };
-    match (result, final_flush) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(durability_error)) => Err(format!("{error}; {durability_error}")),
-    }
+    let final_flush = before_shutdown_deadline(deadline, SERVE_SHUTDOWN_TIMEOUT, async {
+        match runtime.applied_index() {
+            Ok(applied_index) => coordinator
+                .flush_runtime(&runtime, applied_index)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    format!(
+                        "final checkpoint durability is unconfirmed because the flush failed: {error}"
+                    )
+                }),
+            Err(error) => Err(format!(
+                "final checkpoint durability is unconfirmed because the applied index is unavailable: {error}"
+            )),
+        }
+    })
+    .await
+    .unwrap_or_else(Err);
+    append_shutdown_error(&mut result, final_flush);
+    append_shutdown_error(
+        &mut result,
+        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)),
+    );
+    result
 }
 
 fn install_successor_recorder_for_startup(config: &ServeConfig) -> Result<(), String> {
@@ -2214,6 +2261,19 @@ fn task_result<T>(result: Result<T, tokio::task::JoinError>, name: &str) -> Resu
 fn retain_first_error(current: &mut Result<(), String>, next: Result<(), String>) {
     if current.is_ok() && next.is_err() {
         *current = next;
+    }
+}
+
+fn append_shutdown_error(current: &mut Result<(), String>, next: Result<(), String>) {
+    let Err(next) = next else {
+        return;
+    };
+    match current {
+        Ok(()) => *current = Err(next),
+        Err(current) => {
+            current.push_str("; ");
+            current.push_str(&next);
+        }
     }
 }
 
@@ -3420,7 +3480,7 @@ mod tests {
         collections::HashMap,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Mutex,
+            mpsc, Arc, Condvar, Mutex,
         },
     };
 
@@ -3436,7 +3496,7 @@ mod tests {
     };
     use queqlite_node::{ReadRequest, WriteRequest, PROTOCOL_VERSION, VERSION_HEADER};
     use queqlite_obj_store::{ObjStore, ObjStoreConfig};
-    use queqlite_quepaxa::AcceptedValue;
+    use queqlite_quepaxa::{AcceptedValue, RecordRequest, RecordSummary, RecorderReply};
 
     use super::*;
 
@@ -4611,6 +4671,132 @@ mod tests {
         )
     }
 
+    fn runtime_with_blocked_minority(
+        root: &Path,
+    ) -> (Arc<NodeRuntime>, mpsc::Receiver<()>, BlockingRelease) {
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let release = BlockingRelease::default();
+        let recorders = membership
+            .members()
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let recorder = RecorderFileStore::new_with_membership(
+                    root.join("recorders").join(id),
+                    id.clone(),
+                    "cluster-a",
+                    1,
+                    1,
+                    membership.clone(),
+                )
+                .unwrap();
+                let recorder: Box<dyn RecorderRpc> = if index == 2 {
+                    Box::new(BlockingRecorder {
+                        inner: recorder,
+                        started: started_tx.clone(),
+                        release: release.clone(),
+                    })
+                } else {
+                    Box::new(recorder)
+                };
+                (id.clone(), recorder)
+            })
+            .collect();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recorders_with_ids("cluster-a", "node-1", 1, 1, recorders)
+                .unwrap(),
+        );
+        let runtime = Arc::new(
+            NodeRuntime::open(
+                NodeConfig::new(
+                    "cluster-a",
+                    "node-1",
+                    root.join("node"),
+                    1,
+                    1,
+                    [
+                        PeerConfig::new("node-1", "http://node-1", "peer-token-1").unwrap(),
+                        PeerConfig::new("node-2", "http://node-2", "peer-token-2").unwrap(),
+                        PeerConfig::new("node-3", "http://node-3", "peer-token-3").unwrap(),
+                    ],
+                    "client-token",
+                )
+                .unwrap(),
+                consensus,
+                &[],
+            )
+            .unwrap(),
+        );
+        (runtime, started_rx, release)
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingRelease(Arc<(Mutex<bool>, Condvar)>);
+
+    impl BlockingRelease {
+        fn wait(&self) {
+            let (released, condition) = &*self.0;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            let (released, condition) = &*self.0;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+        }
+    }
+
+    struct BlockingRecorder {
+        inner: RecorderFileStore,
+        started: mpsc::Sender<()>,
+        release: BlockingRelease,
+    }
+
+    impl RecorderRpc for BlockingRecorder {
+        fn call(
+            &self,
+            request: queqlite_quepaxa::RecorderRequest,
+        ) -> queqlite_quepaxa::Result<RecorderReply> {
+            self.inner.call(request)
+        }
+
+        fn record(&self, request: RecordRequest) -> queqlite_quepaxa::Result<RecordSummary> {
+            let _ = self.started.send(());
+            self.release.wait();
+            self.inner.record(request)
+        }
+
+        fn install_decision_proof(
+            &self,
+            proof: DecisionProof,
+            membership: &Membership,
+        ) -> queqlite_quepaxa::Result<()> {
+            self.inner.install_decision_proof(proof, membership)
+        }
+
+        fn inspect_decision_proof(
+            &self,
+            slot: u64,
+        ) -> queqlite_quepaxa::Result<Option<DecisionProof>> {
+            self.inner.inspect_decision_proof(slot)
+        }
+
+        fn inspect_record_summary(
+            &self,
+            slot: u64,
+        ) -> queqlite_quepaxa::Result<Option<RecordSummary>> {
+            self.inner.inspect_record_summary(slot)
+        }
+
+        fn uses_typed_protocol(&self) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn remote_shutdown_flushes_the_applied_tip_before_returning() {
         let root = tempfile::tempdir().unwrap();
@@ -4630,9 +4816,14 @@ mod tests {
         let runtime = runtime_for_final_flush(root.path());
         let committed = runtime.write("request-1", "alpha", "one").unwrap();
 
-        finish_remote_serve(Ok(()), Arc::clone(&runtime), Arc::clone(&coordinator))
-            .await
-            .unwrap();
+        finish_remote_shutdown(
+            Ok(()),
+            Arc::clone(&runtime),
+            Arc::clone(&coordinator),
+            tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
         assert_eq!(
@@ -4649,8 +4840,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_shutdown_preserves_the_primary_error_after_the_final_flush() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = runtime_for_final_flush(root.path());
+        let committed = runtime.write("request-1", "alpha", "one").unwrap();
+
+        let error = finish_remote_shutdown(
+            Err("client server failed".into()),
+            Arc::clone(&runtime),
+            Arc::clone(&coordinator),
+            tokio::time::Instant::now() + SERVE_SHUTDOWN_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "client server failed");
+        assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_shutdown_reports_primary_durability_and_consensus_errors_together() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let (runtime, started, release) = runtime_with_blocked_minority(root.path());
+        runtime.write("request-1", "alpha", "one").unwrap();
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+
+        let error = finish_remote_shutdown(
+            Err("client server failed".into()),
+            Arc::clone(&runtime),
+            coordinator,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        release.release();
+        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).unwrap();
+
+        assert_eq!(
+            error,
+            format!(
+                "client server failed; {}; consensus RPCs did not finish before the shutdown deadline",
+                shutdown_deadline_error(SERVE_SHUTDOWN_TIMEOUT)
+            )
+        );
+    }
+
+    #[test]
+    fn unfinished_consensus_rpcs_fail_an_otherwise_successful_shutdown() {
+        assert!(pending_consensus_rpc_result(true).is_ok());
+        assert!(pending_consensus_rpc_result(false)
+            .unwrap_err()
+            .contains("consensus RPCs did not finish"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consensus_drain_uses_only_the_remaining_shutdown_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let (runtime, started, release) = runtime_with_blocked_minority(root.path());
+        runtime.write("request-1", "alpha", "one").unwrap();
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        let exhausted_deadline = tokio::time::Instant::now();
+        let prior_drain = before_shutdown_deadline(
+            exhausted_deadline,
+            Duration::ZERO,
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(prior_drain.is_err());
+
+        let error =
+            finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(exhausted_deadline))
+                .unwrap_err();
+
+        assert!(error.contains("consensus RPCs did not finish"));
+        release.release();
+        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
+        const HANG_GUARD: Duration = Duration::from_secs(10);
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
+        let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
+        let (drain_finished_tx, drain_finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let executor = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async move {
+                let runtime = runtime_for_final_flush(&root_path);
+                let blocker = tokio::task::spawn_blocking(move || {
+                    blocker_started_tx.send(()).unwrap();
+                    release_blocker_rx.recv().unwrap();
+                });
+                let result = finish_pending_consensus_rpcs(&runtime, Duration::ZERO);
+                drain_finished_tx.send(result).unwrap();
+                blocker.await.unwrap();
+            });
+        });
+        blocker_started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("blocking-pool saturation must be established");
+
+        let result = drain_finished_rx.recv_timeout(HANG_GUARD);
+        release_blocker_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        result
+            .expect("consensus drain must start immediately despite blocking-pool saturation")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_deadline_bounds_a_stalled_drain_or_final_flush() {
         let result = before_shutdown_deadline(
+            tokio::time::Instant::now() + Duration::from_millis(10),
             Duration::from_millis(10),
             std::future::pending::<Result<(), String>>(),
         )
