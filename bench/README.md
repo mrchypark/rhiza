@@ -145,8 +145,12 @@ simulator and its resources are reported separately from Queqlite. Override them
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_MEMORY_{REQUEST,LIMIT}`. Resource JSONL
 samples use containerd CRI stats and their runtime-provided metric timestamp,
 rather than the time the potentially slow collection started. CPU and memory
-values must share that timestamp. Samples require all three Queqlite ordinals plus
-RustFS and, when enabled, its object-meter sidecar. `resource-summary.json`
+values must share that timestamp. Every stats response also receives a unique
+collection batch ID, so app memory is summed across containers from the same
+response even when their CRI timestamps are staggered. Missing, invalid, or
+reused batch IDs invalidate the resource evidence. Samples require all three
+Queqlite ordinals plus RustFS and, when enabled, its object-meter sidecar.
+`resource-summary.json`
 reports container-lifecycle CPU deltas plus average/peak memory using samples
 inside, or immediately bracketing, the Rust-reported measurement window. A
 pre-existing container uses its last pre-window counter as the baseline; a

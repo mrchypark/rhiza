@@ -47,25 +47,29 @@ fi
 component_sample() {
   local pod="$1" container="$2" epoch="$3" cpu="${4:-$3}" identity="${5:-original}"
   local restart_count="${6:-0}"
+  local collection_batch="${7:-$epoch}"
   local app=simulator
   [ "$container" != queqlite ] || app=queqlite
   jq -cn --arg app "$app" --arg pod "$pod" --arg container "$container" \
     --arg identity "$identity" --argjson epoch "$epoch" --argjson cpu "$cpu" \
-    --argjson restart_count "$restart_count" \
+    --argjson restart_count "$restart_count" --argjson collection_batch "$collection_batch" \
     '{timestamp:"2026-07-13T00:00:00Z",timestamp_epoch_seconds:$epoch,
-      source:"containerd_cri_stats",app:$app,pod:$pod,
+      collection_batch:$collection_batch,source:"containerd_cri_stats",app:$app,pod:$pod,
       pod_uid:($pod + "-uid-" + $identity),container:$container,
       container_id:($container + "-id-" + $identity),restart_count:$restart_count,
       cpu_usage_usec:$cpu,memory_bytes:2}'
 }
 resource_cycle() {
   local epoch="$1" omit="${2:-}" meter="${3:-false}" cpu="${4:-$1}" pod
+  local collection_batch="${5:-$epoch}"
   for pod in queqlite-c1-0 queqlite-c1-1 queqlite-c1-2; do
-    [ "$pod" = "$omit" ] || component_sample "$pod" queqlite "$epoch" "$cpu"
+    [ "$pod" = "$omit" ] || component_sample "$pod" queqlite "$epoch" "$cpu" original 0 \
+      "$collection_batch"
   done
-  [ "$omit" = rustfs ] || component_sample rustfs-abc rustfs "$epoch" "$cpu"
+  [ "$omit" = rustfs ] || component_sample rustfs-abc rustfs "$epoch" "$cpu" original 0 \
+    "$collection_batch"
   if [ "$meter" = true ] && [ "$omit" != object-meter ]; then
-    component_sample rustfs-abc object-meter "$epoch" "$cpu"
+    component_sample rustfs-abc object-meter "$epoch" "$cpu" original 0 "$collection_batch"
   fi
 }
 
@@ -78,7 +82,7 @@ jq -cn '{stats:[{attributes:{id:"container-id",metadata:{name:"queqlite"},
     annotations:{"io.kubernetes.container.restartCount":"0"}},
   cpu:{timestamp:"121250000000",usageCoreNanoSeconds:{value:"1000"}},
   memory:{timestamp:"121250000000",workingSetBytes:{value:"2"}}}]}' |
-  resource_samples_from_cri_stats bench > "$tmp/delayed-collector.jsonl"
+  resource_samples_from_cri_stats bench 1 > "$tmp/delayed-collector.jsonl"
 jq -cn '{stats:[{attributes:{id:"container-id",metadata:{name:"queqlite"},
     labels:{"io.kubernetes.pod.namespace":"bench",
       "io.kubernetes.pod.name":"queqlite-c1-0",
@@ -86,7 +90,7 @@ jq -cn '{stats:[{attributes:{id:"container-id",metadata:{name:"queqlite"},
     annotations:{"io.kubernetes.container.restartCount":"0"}},
   cpu:{timestamp:"130000000000",usageCoreNanoSeconds:{value:"3000"}},
   memory:{timestamp:"130000000000",workingSetBytes:{value:"2"}}}]}' |
-  resource_samples_from_cri_stats bench >> "$tmp/delayed-collector.jsonl"
+  resource_samples_from_cri_stats bench 2 >> "$tmp/delayed-collector.jsonl"
 jq -e '.timestamp_epoch_seconds == 121.25' \
   <(head -1 "$tmp/delayed-collector.jsonl") >/dev/null
 summarize_resource_samples "$tmp/delayed-collector.jsonl" 120 129 \
@@ -98,8 +102,46 @@ if jq -cn '{stats:[{attributes:{metadata:{name:"queqlite"},
     labels:{"io.kubernetes.pod.namespace":"bench",
       "io.kubernetes.pod.name":"queqlite-c1-0"}},
   cpu:{timestamp:0},memory:{timestamp:1}}]}' |
-  resource_samples_from_cri_stats bench >/dev/null 2>&1; then
+  resource_samples_from_cri_stats bench 1 >/dev/null 2>&1; then
   echo "resource sample without positive CRI timestamps was accepted" >&2
+  exit 1
+fi
+
+# CRI timestamps may be staggered within one stats response. Memory remains one
+# collection snapshot and must be summed by collection batch, not timestamp.
+{
+  component_sample queqlite-c1-0 queqlite 150 150 original 0 10 |
+    jq -c '.memory_bytes = 10'
+  component_sample queqlite-c1-1 queqlite 151 151 original 0 10 |
+    jq -c '.memory_bytes = 20'
+  component_sample queqlite-c1-2 queqlite 152 152 original 0 10 |
+    jq -c '.memory_bytes = 30'
+} > "$tmp/staggered-memory-resources.jsonl"
+summarize_resource_samples "$tmp/staggered-memory-resources.jsonl" 149 153 \
+  > "$tmp/staggered-memory-summary.json"
+jq -e '.apps[] | select(.app == "queqlite") |
+  .memory_samples == 1 and .average_memory_bytes == 60 and .peak_memory_bytes == 60' \
+  "$tmp/staggered-memory-summary.json" >/dev/null
+
+resource_cycle 150 > "$tmp/valid-collection-batch.jsonl"
+jq -c 'del(.collection_batch)' "$tmp/valid-collection-batch.jsonl" \
+  > "$tmp/missing-collection-batch.jsonl"
+if validate_resource_sample_schema "$tmp/missing-collection-batch.jsonl" 0; then
+  echo "resource evidence without a collection batch was accepted" >&2
+  exit 1
+fi
+jq -c '.collection_batch = 1.5' "$tmp/valid-collection-batch.jsonl" \
+  > "$tmp/invalid-collection-batch.jsonl"
+if validate_resource_sample_schema "$tmp/invalid-collection-batch.jsonl" 0; then
+  echo "resource evidence with an invalid collection batch was accepted" >&2
+  exit 1
+fi
+{
+  resource_cycle 150 "" false 150 10
+  resource_cycle 151 "" false 151 10
+} > "$tmp/reused-collection-batch.jsonl"
+if validate_resource_sample_schema "$tmp/reused-collection-batch.jsonl" 0; then
+  echo "separate collections sharing a batch identity were accepted" >&2
   exit 1
 fi
 gap_fixture() {

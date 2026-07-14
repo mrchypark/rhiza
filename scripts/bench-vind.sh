@@ -212,6 +212,7 @@ validate_resource_sample_schema() {
     length > 0 and all(.[];
       (.timestamp | type == "string" and length > 0) and
       (.timestamp_epoch_seconds | type == "number" and . >= 0) and
+      (.collection_batch | type == "number" and . >= 0 and floor == .) and
       .source == "containerd_cri_stats" and
       ([.pod,.pod_uid,.container,.container_id] |
         all(type == "string" and length > 0)) and
@@ -223,6 +224,8 @@ validate_resource_sample_schema() {
       (.restart_count | type == "number" and . >= 0 and floor == .) and
       ([.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0))) and
     all($expected[]; . as $required | any($samples[]; component == $required)) and
+    ($samples | group_by(.collection_batch) | all(.[]; . as $batch |
+      ([$batch[] | component] | unique | length) == ($batch | length))) and
     ([$samples[] | select(.container == "rustfs") | .pod] | unique | length) == 1 and
     (if $meter_enabled == 1 then
        ([$samples[] | select(.container == "object-meter") | .pod] | unique) ==
@@ -324,7 +327,7 @@ summarize_resource_samples() {
         ([$g[] | select(.timestamp_epoch_seconds >= $end)] | first) as $after |
         select(($inside | length) > 0 or ($before != null and $after != null)) |
         ([$before] + $inside + [$after] | map(select(. != null)) |
-          unique_by(.timestamp_epoch_seconds)))) as $groups |
+          unique_by([.timestamp_epoch_seconds,.collection_batch])))) as $groups |
     ($groups | map(.[])) as $window |
     def regressed:
       . as $g | any(range(1; length); . as $i |
@@ -337,10 +340,13 @@ summarize_resource_samples() {
          container_id:$g[0].container_id,first:$first,last:$g[-1].cpu_usage_usec,
          baseline:(if $baseline == null then "born_in_window" else "preexisting" end),
          delta_usec:($g[-1].cpu_usage_usec - $first)});
-    def memory_by_app: group_by([.timestamp_epoch_seconds,.app]) |
-      map({timestamp:.[0].timestamp,timestamp_epoch_seconds:.[0].timestamp_epoch_seconds,
-        app:.[0].app,memory_bytes:(map(.memory_bytes) | add)});
-    if any($groups[]; regressed) then error("container CPU counter regressed") else
+    def memory_by_app: group_by([.collection_batch,.app]) |
+      map({collection_batch:.[0].collection_batch,app:.[0].app,
+        memory_bytes:(map(.memory_bytes) | add)});
+    if any($samples[]; ((.collection_batch | type != "number") or
+        .collection_batch < 0 or (.collection_batch | floor) != .collection_batch)) then
+      error("resource sample collection batch is missing or invalid")
+    elif any($groups[]; regressed) then error("container CPU counter regressed") else
     (cpu_deltas) as $cpu | ($window | memory_by_app) as $memory |
     {status:"ok",measurement_window:{started_at_epoch_seconds:$start,
       finished_at_epoch_seconds:$end},samples:($window | length),
@@ -587,8 +593,9 @@ wait_for_checkpoint_drain() {
 }
 
 resource_samples_from_cri_stats() {
-  local sample_namespace="$1"
-  jq -c --arg namespace "$sample_namespace" '
+  local sample_namespace="$1" collection_batch="${2:-}"
+  case "$collection_batch" in ''|*[!0-9]*) return 1 ;; esac
+  jq -c --arg namespace "$sample_namespace" --argjson collection_batch "$collection_batch" '
     def required_integer:
       if type == "number" and floor == . then .
       elif type == "string" and test("^[0-9]+$") then tonumber
@@ -608,6 +615,7 @@ resource_samples_from_cri_stats() {
       ($cpu_timestamp_ns / 1000000000) as $cpu_timestamp |
       {timestamp:($cpu_timestamp | floor | todateiso8601),
        timestamp_epoch_seconds:$cpu_timestamp,
+       collection_batch:$collection_batch,
        source:"containerd_cri_stats",
        app:(if $container == "queqlite" then "queqlite" else "simulator" end),
        pod:$pod,
@@ -701,6 +709,7 @@ stop_sampler="$target/.stop-sampler"
 k() { kubectl --context "$context" -n "$namespace" "$@"; }
 
 sample_resources() {
+  local collection_batch=0
   printf 'resource sampler started: context=%s namespace=%s\n' "$context" "$namespace"
   while [ ! -e "$stop_sampler" ]; do
     summary="$(timeout --kill-after="${resource_sample_kill_after}s" \
@@ -713,7 +722,9 @@ sample_resources() {
       sleep "$sample_interval"
       continue
     fi
-    resource_samples_from_cri_stats "$namespace" <<< "$summary" >> "$resources_jsonl"
+    collection_batch=$((collection_batch + 1))
+    resource_samples_from_cri_stats "$namespace" "$collection_batch" \
+      <<< "$summary" >> "$resources_jsonl"
     sleep "$sample_interval"
   done
 }
