@@ -213,7 +213,7 @@ validate_resource_sample_schema() {
       ([.restart_count,.cpu_usage_usec,.memory_bytes] | all(type == "number" and . >= 0))) and
     all($expected[]; . as $required | any($samples[]; component == $required)) and
     ([$samples[] | select(.container == "rustfs") | .pod] | unique | length) == 1 and
-    (if $meter_enabled then
+    (if $meter_enabled == 1 then
        ([$samples[] | select(.container == "object-meter") | .pod] | unique) ==
        ([$samples[] | select(.container == "rustfs") | .pod] | unique)
      else true end)
@@ -221,7 +221,7 @@ validate_resource_sample_schema() {
 }
 
 expected_resource_components() {
-  if [ "$1" = true ] || [ "$1" = 1 ]; then
+  if [ "$1" = 1 ]; then
     echo '["queqlite-c1-0","queqlite-c1-1","queqlite-c1-2","rustfs","object-meter"]'
   else
     echo '["queqlite-c1-0","queqlite-c1-1","queqlite-c1-2","rustfs"]'

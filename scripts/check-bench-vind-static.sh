@@ -121,6 +121,7 @@ component_sample rustfs-abc rustfs 201 >> "$tmp/resources.jsonl"
     resource_cycle "$epoch"
   done
 } > "$tmp/jittered-resources.jsonl"
+validate_resource_sample_schema "$tmp/jittered-resources.jsonl" 0
 validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 false
 
 {
@@ -183,7 +184,7 @@ if validate_resource_sample_schema "$tmp/missing-component-resources.jsonl" fals
   echo "resource evidence without every Queqlite ordinal was accepted" >&2
   exit 1
 fi
-if validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 true "" "" ""; then
+if validate_resource_samples "$tmp/jittered-resources.jsonl" 120 200 2 1 "" "" ""; then
   echo "resource evidence without the enabled object meter was accepted" >&2
   exit 1
 fi
@@ -191,7 +192,7 @@ cp "$tmp/window-resources.jsonl" "$tmp/meter-resources.jsonl"
 for epoch in 100 150 200; do
   component_sample rustfs-abc object-meter "$epoch" "$epoch" >> "$tmp/meter-resources.jsonl"
 done
-validate_resource_samples "$tmp/meter-resources.jsonl" 120 190 50 true "" "" ""
+validate_resource_samples "$tmp/meter-resources.jsonl" 120 190 50 1 "" "" ""
 {
   component_sample queqlite-c1-0 queqlite 100 100 original
   component_sample queqlite-c1-0 queqlite 150 130 original
