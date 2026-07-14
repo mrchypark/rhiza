@@ -586,6 +586,40 @@ wait_for_checkpoint_drain() {
   return 1
 }
 
+resource_samples_from_cri_stats() {
+  local sample_namespace="$1"
+  jq -c --arg namespace "$sample_namespace" '
+    def required_integer:
+      if type == "number" and floor == . then .
+      elif type == "string" and test("^[0-9]+$") then tonumber
+      else error("CRI stats timestamp is not an integer") end;
+    .stats[] |
+    select(.attributes.labels["io.kubernetes.pod.namespace"] == $namespace) |
+    .attributes.metadata.name as $container |
+    .attributes.labels["io.kubernetes.pod.name"] as $pod |
+    select($container == "queqlite" or $container == "rustfs" or $container == "object-meter") |
+    select($container != "queqlite" or ($pod | startswith("queqlite-c1-"))) |
+    (.cpu.timestamp | required_integer) as $cpu_timestamp_ns |
+    (.memory.timestamp | required_integer) as $memory_timestamp_ns |
+    if $cpu_timestamp_ns <= 0 or $memory_timestamp_ns <= 0 or
+        $cpu_timestamp_ns != $memory_timestamp_ns then
+      error("CRI CPU and memory stats must share a positive timestamp")
+    else
+      ($cpu_timestamp_ns / 1000000000) as $cpu_timestamp |
+      {timestamp:($cpu_timestamp | floor | todateiso8601),
+       timestamp_epoch_seconds:$cpu_timestamp,
+       source:"containerd_cri_stats",
+       app:(if $container == "queqlite" then "queqlite" else "simulator" end),
+       pod:$pod,
+       pod_uid:(.attributes.labels["io.kubernetes.pod.uid"] // ""),container:$container,
+       container_id:.attributes.id,
+       restart_count:(.attributes.annotations["io.kubernetes.container.restartCount"] // "0" | tonumber),
+       cpu_usage_usec:((.cpu.usageCoreNanoSeconds.value // "0" | tonumber) / 1000 | floor),
+       memory_bytes:(.memory.workingSetBytes.value // .memory.usageBytes.value // "0" | tonumber)}
+    end
+  '
+}
+
 # Allow the static check to exercise process-failure handling without starting a cluster.
 [ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
@@ -669,8 +703,6 @@ k() { kubectl --context "$context" -n "$namespace" "$@"; }
 sample_resources() {
   printf 'resource sampler started: context=%s namespace=%s\n' "$context" "$namespace"
   while [ ! -e "$stop_sampler" ]; do
-    timestamp_epoch_seconds="$(date -u +%s)"
-    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     summary="$(timeout --kill-after="${resource_sample_kill_after}s" \
       "${resource_sample_timeout}s" docker exec "vcluster.cp.$cluster" \
       crictl stats -o json 2>/dev/null || true)"
@@ -681,23 +713,7 @@ sample_resources() {
       sleep "$sample_interval"
       continue
     fi
-    jq -c --arg timestamp "$timestamp" --argjson timestamp_epoch_seconds "$timestamp_epoch_seconds" \
-      --arg namespace "$namespace" '
-      .stats[] |
-      select(.attributes.labels["io.kubernetes.pod.namespace"] == $namespace) |
-      .attributes.metadata.name as $container |
-      .attributes.labels["io.kubernetes.pod.name"] as $pod |
-      select($container == "queqlite" or $container == "rustfs" or $container == "object-meter") |
-      select($container != "queqlite" or ($pod | startswith("queqlite-c1-"))) |
-      {timestamp:$timestamp,timestamp_epoch_seconds:$timestamp_epoch_seconds,source:"containerd_cri_stats",
-       app:(if $container == "queqlite" then "queqlite" else "simulator" end),
-       pod:$pod,
-       pod_uid:(.attributes.labels["io.kubernetes.pod.uid"] // ""),container:$container,
-       container_id:.attributes.id,
-       restart_count:(.attributes.annotations["io.kubernetes.container.restartCount"] // "0" | tonumber),
-       cpu_usage_usec:((.cpu.usageCoreNanoSeconds.value // "0" | tonumber) / 1000 | floor),
-       memory_bytes:(.memory.workingSetBytes.value // .memory.usageBytes.value // "0" | tonumber)}
-    ' <<< "$summary" >> "$resources_jsonl"
+    resource_samples_from_cri_stats "$namespace" <<< "$summary" >> "$resources_jsonl"
     sleep "$sample_interval"
   done
 }

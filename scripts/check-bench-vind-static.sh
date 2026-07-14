@@ -68,6 +68,40 @@ resource_cycle() {
     component_sample rustfs-abc object-meter "$epoch" "$cpu"
   fi
 }
+
+# A collection started before the boundary may return counters gathered after it.
+# The runtime-provided CRI timestamps, not collector invocation time, classify them.
+jq -cn '{stats:[{attributes:{id:"container-id",metadata:{name:"queqlite"},
+    labels:{"io.kubernetes.pod.namespace":"bench",
+      "io.kubernetes.pod.name":"queqlite-c1-0",
+      "io.kubernetes.pod.uid":"pod-uid"},
+    annotations:{"io.kubernetes.container.restartCount":"0"}},
+  cpu:{timestamp:"121250000000",usageCoreNanoSeconds:{value:"1000"}},
+  memory:{timestamp:"121250000000",workingSetBytes:{value:"2"}}}]}' |
+  resource_samples_from_cri_stats bench > "$tmp/delayed-collector.jsonl"
+jq -cn '{stats:[{attributes:{id:"container-id",metadata:{name:"queqlite"},
+    labels:{"io.kubernetes.pod.namespace":"bench",
+      "io.kubernetes.pod.name":"queqlite-c1-0",
+      "io.kubernetes.pod.uid":"pod-uid"},
+    annotations:{"io.kubernetes.container.restartCount":"0"}},
+  cpu:{timestamp:"130000000000",usageCoreNanoSeconds:{value:"3000"}},
+  memory:{timestamp:"130000000000",workingSetBytes:{value:"2"}}}]}' |
+  resource_samples_from_cri_stats bench >> "$tmp/delayed-collector.jsonl"
+jq -e '.timestamp_epoch_seconds == 121.25' \
+  <(head -1 "$tmp/delayed-collector.jsonl") >/dev/null
+summarize_resource_samples "$tmp/delayed-collector.jsonl" 120 129 \
+  > "$tmp/delayed-collector-summary.json"
+jq -e '.container_cpu_usage_usec_deltas[0] |
+  .baseline == "born_in_window" and .delta_usec == 3' \
+  "$tmp/delayed-collector-summary.json" >/dev/null
+if jq -cn '{stats:[{attributes:{metadata:{name:"queqlite"},
+    labels:{"io.kubernetes.pod.namespace":"bench",
+      "io.kubernetes.pod.name":"queqlite-c1-0"}},
+  cpu:{timestamp:0},memory:{timestamp:1}}]}' |
+  resource_samples_from_cri_stats bench >/dev/null 2>&1; then
+  echo "resource sample without positive CRI timestamps was accepted" >&2
+  exit 1
+fi
 gap_fixture() {
   local file="$1" omitted="$2" epoch
   {

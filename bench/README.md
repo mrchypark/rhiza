@@ -143,7 +143,9 @@ It applies fixed default resources to make comparisons controlled on the
 simulator and its resources are reported separately from Queqlite. Override them through
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_CPU_{REQUEST,LIMIT}` and
 `QUEQLITE_BENCH_{QUEQLITE,RUSTFS}_MEMORY_{REQUEST,LIMIT}`. Resource JSONL
-samples use containerd CRI stats and require all three Queqlite ordinals plus
+samples use containerd CRI stats and their runtime-provided metric timestamp,
+rather than the time the potentially slow collection started. CPU and memory
+values must share that timestamp. Samples require all three Queqlite ordinals plus
 RustFS and, when enabled, its object-meter sidecar. `resource-summary.json`
 reports container-lifecycle CPU deltas plus average/peak memory using samples
 inside, or immediately bracketing, the Rust-reported measurement window. A
