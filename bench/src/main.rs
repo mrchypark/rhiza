@@ -169,8 +169,9 @@ fn measurement_window(
 }
 
 fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), String> {
+    let request_id = format!("{run_id}-setup-ddl");
     let body = json!({
-        "request_id": format!("{run_id}-setup-ddl"),
+        "request_id": request_id,
         "statements": [{
             "sql": format!(
                 "CREATE TABLE IF NOT EXISTS {} (request_id TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
@@ -179,16 +180,19 @@ fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), Str
             "parameters": []
         }]
     });
-    execute(
+    protocol_post_failover(
         client,
-        endpoint(&config.endpoints[0], "/v1/sql/execute"),
-        &config.token,
+        config,
+        &request_id,
+        "/v1/sql/execute",
         body,
+        "sql_execute",
     )
     .map_err(|error| format!("create benchmark table: {error}"))?;
     let seed_id = BENCH_SEED_ID;
+    let request_id = format!("{run_id}-setup-seed");
     let body = json!({
-        "request_id": format!("{run_id}-setup-seed"),
+        "request_id": request_id,
         "statements": [{
             "sql": format!(
                 "INSERT INTO {} (request_id, value) VALUES (?, ?) ON CONFLICT(request_id) DO UPDATE SET value = excluded.value RETURNING request_id, value",
@@ -200,11 +204,13 @@ fn setup_table(client: &Client, config: &Config, run_id: &str) -> Result<(), Str
             ]
         }]
     });
-    let response = execute(
+    let response = protocol_post_failover(
         client,
-        endpoint(&config.endpoints[0], "/v1/sql/execute"),
-        &config.token,
+        config,
+        &request_id,
+        "/v1/sql/execute",
         body,
+        "sql_execute",
     )
     .map_err(|error| format!("insert benchmark seed: {error}"))?;
     let returned_id = response
@@ -610,10 +616,6 @@ fn endpoint_candidates(endpoints: &[String], _key: &str, path: &str) -> Vec<Stri
 
 fn endpoint(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
-}
-
-fn execute(client: &Client, url: String, token: &str, body: Value) -> Result<Value, String> {
-    protocol_post(client, url, token, body, "sql_execute")
 }
 
 fn validate_read_response(response: &Value, request_id: &str) -> Result<(), String> {
@@ -1123,11 +1125,11 @@ impl FaultOutput {
         if self.status == "succeeded" {
             return None;
         }
-        if !self.command_completed && self.status == "unfinished" {
-            return Some(format!("fault hook {} did not finish", self.tag));
-        }
         if let Some(error) = &self.command_error {
             return Some(format!("fault hook {} failed: {error}", self.tag));
+        }
+        if !self.command_completed && self.status == "unfinished" {
+            return Some(format!("fault hook {} did not finish", self.tag));
         }
         Some(match self.command_status {
             Some(status) => format!("fault hook {} exited with status {status}", self.tag),
@@ -1286,6 +1288,67 @@ mod tests {
     }
 
     #[test]
+    fn setup_retries_each_stable_request_on_the_next_endpoint() {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_endpoint = format!("http://{}", first.local_addr().unwrap());
+        let second_endpoint = format!("http://{}", second.local_addr().unwrap());
+        let first_server = thread::spawn(move || {
+            first
+                .incoming()
+                .take(2)
+                .map(|stream| {
+                    let mut stream = stream.unwrap();
+                    let body = read_request_body(&mut stream);
+                    respond(&mut stream, "503 Service Unavailable", "{}");
+                    body
+                })
+                .collect::<Vec<_>>()
+        });
+        let second_server = thread::spawn(move || {
+            second
+                .incoming()
+                .take(2)
+                .map(|stream| {
+                    let mut stream = stream.unwrap();
+                    let body = read_request_body(&mut stream);
+                    let response = if body.contains("RETURNING request_id, value") {
+                        r#"{"applied_index":1,"results":[{"returning":{"rows":[[{"type":"text","value":"queqlite-bench-seed"}]]}}]}"#
+                    } else {
+                        r#"{"applied_index":1,"results":[{}]}"#
+                    };
+                    respond(&mut stream, "200 OK", response);
+                    body
+                })
+                .collect::<Vec<_>>()
+        });
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut config = config(first_endpoint);
+        config.endpoints.push(second_endpoint);
+
+        setup_table(&client, &config, "stable").unwrap();
+
+        let first_bodies = first_server.join().unwrap();
+        let second_bodies = second_server.join().unwrap();
+        assert_eq!(first_bodies, second_bodies);
+        assert_eq!(
+            first_bodies
+                .iter()
+                .map(
+                    |body| serde_json::from_str::<serde_json::Value>(body).unwrap()["request_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                )
+                .collect::<Vec<_>>(),
+            ["stable-setup-ddl", "stable-setup-seed"]
+        );
+    }
+
+    #[test]
     fn measurement_window_uses_phase_boundaries_not_warmup_or_fault_join() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1324,6 +1387,7 @@ mod tests {
         ));
         let _ = fs::remove_file(&marker);
         let call_started = Instant::now();
+        let worker_startup_delay = Duration::from_millis(100);
         let measurement = run_phase_with_startup_delay(
             &client,
             &config,
@@ -1335,7 +1399,7 @@ mod tests {
                 tag: "slow-join".into(),
                 command: format!("printf started > '{}'; sleep 0.2", marker.display()),
             }),
-            Duration::from_millis(100),
+            worker_startup_delay,
         )
         .unwrap();
         server.join().unwrap();
@@ -1344,12 +1408,21 @@ mod tests {
         let measurement_window = measurement.measurement_window.unwrap();
         let reported_span = measurement_window.finished_at_epoch_seconds
             - measurement_window.started_at_epoch_seconds;
+        let fault_elapsed = Duration::try_from_secs_f64(
+            measurement
+                .fault
+                .as_ref()
+                .unwrap()
+                .command_elapsed_seconds
+                .unwrap(),
+        )
+        .unwrap();
         assert!(
             measurement_window.started_at_epoch_seconds >= warmup_window.finished_at_epoch_seconds
         );
         assert!((reported_span - measurement.wall_elapsed.as_secs_f64()).abs() < 0.05);
-        assert!(reported_span < 0.05);
-        assert!(call_started.elapsed().as_secs_f64() > reported_span + 0.25);
+        assert!(Duration::try_from_secs_f64(reported_span).unwrap() < fault_elapsed);
+        assert!(call_started.elapsed() >= worker_startup_delay + fault_elapsed);
         assert!(marker.exists());
         let _ = fs::remove_file(marker);
     }
@@ -1496,7 +1569,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(500));
         assert!(!output.command_completed);
         assert_eq!(output.status, "unfinished");
-        assert!(output.failure().unwrap().contains("did not finish"));
+        assert!(output.failure().unwrap().contains("40ms"));
         assert_eq!(
             output.command_error.as_deref(),
             Some("fault command exceeded configured timeout of 40ms")
