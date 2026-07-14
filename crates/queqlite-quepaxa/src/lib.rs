@@ -2211,12 +2211,16 @@ impl Drop for ThreeNodeConsensus {
 impl ThreeNodeConsensus {
     /// Waits up to `timeout` for quorum RPC workers that outlived an early
     /// quorum return. Returns `true` when every tracked worker has finished.
+    /// Callers must first quiesce proposal admission and ensure no proposal
+    /// can still spawn or register workers; this only drains already tracked
+    /// workers.
     pub fn finish_pending_rpcs(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         loop {
             let empty = {
-                let Ok(mut handles) = self.background_threads.lock() else {
-                    return false;
+                let mut handles = match self.background_threads.lock() {
+                    Ok(handles) => handles,
+                    Err(poisoned) => poisoned.into_inner(),
                 };
                 let mut index = 0;
                 while index < handles.len() {
@@ -3421,8 +3425,9 @@ impl ThreeNodeConsensus {
     }
 
     fn track_background_threads(&self, handles: Vec<thread::JoinHandle<()>>) {
-        let Ok(mut background) = self.background_threads.lock() else {
-            return;
+        let mut background = match self.background_threads.lock() {
+            Ok(background) => background,
+            Err(poisoned) => poisoned.into_inner(),
         };
         let mut index = 0;
         while index < background.len() {
@@ -4517,6 +4522,7 @@ mod tests {
         ProposerProgress, RecorderFileStore, RecorderRpc, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use queqlite_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
+    use std::{sync::mpsc, thread, time::Duration};
 
     #[test]
     fn single_node_consensus_commits_contiguous_hash_chain() {
@@ -4590,5 +4596,44 @@ mod tests {
 
         assert_eq!(progress.command, Some(adopted));
         assert!(progress.transition_involved);
+    }
+
+    #[test]
+    fn pending_rpc_workers_are_tracked_and_drained_after_lock_poisoning() {
+        let root = tempfile::tempdir().unwrap();
+        let consensus = ThreeNodeConsensus::new(
+            "cluster",
+            "n1",
+            1,
+            1,
+            [
+                root.path().join("n1"),
+                root.path().join("n2"),
+                root.path().join("n3"),
+            ],
+        )
+        .unwrap();
+        thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _guard = consensus.background_threads.lock().unwrap();
+                    panic!("poison background worker lock");
+                })
+                .join()
+                .is_err());
+        });
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+        consensus.track_background_threads(vec![worker]);
+
+        assert!(!consensus.finish_pending_rpcs(Duration::ZERO));
+        release_tx.send(()).unwrap();
+        assert!(consensus.finish_pending_rpcs(Duration::from_secs(1)));
     }
 }

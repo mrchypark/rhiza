@@ -1,4 +1,7 @@
-use std::{fs, time::SystemTime};
+use std::{
+    fs,
+    time::{Duration, SystemTime},
+};
 
 use queqlite_quepaxa::{Command, CommandKind, Consensus, ThreeNodeConsensus};
 
@@ -16,6 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     println!("decided slot {} with hash {:?}", entry.index, entry.hash);
+    if !consensus.finish_pending_rpcs(Duration::from_secs(1)) {
+        return Err("timed out waiting for pending QuePaxa RPCs".into());
+    }
     drop(consensus);
     fs::remove_dir_all(base)?;
     Ok(())
