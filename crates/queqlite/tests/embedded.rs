@@ -214,6 +214,50 @@ async fn shutdown_waits_for_a_minority_rpc_before_releasing_storage() {
     root.close().unwrap();
 }
 
+#[test]
+fn shutdown_consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
+    let (saturated_tx, saturated_rx) = mpsc::channel();
+    let (shutdown_finished_tx, shutdown_finished_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async move {
+            let queqlite = Queqlite::open(config(&root_path)).await.unwrap();
+            let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                release_blocker_rx.recv().unwrap();
+            });
+            blocker_started_rx.recv().unwrap();
+            saturated_tx.send(()).unwrap();
+            shutdown_finished_tx
+                .send(queqlite.shutdown().await)
+                .unwrap();
+            blocker.await.unwrap();
+        });
+    });
+    saturated_rx
+        .recv_timeout(HANG_GUARD)
+        .expect("blocking-pool saturation must be established");
+
+    let result = shutdown_finished_rx.recv_timeout(HANG_GUARD);
+    release_blocker_tx.send(()).unwrap();
+    worker.join().unwrap();
+
+    result
+        .expect("shutdown consensus drain must start despite blocking-pool saturation")
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn open_rejects_recorder_membership_before_creating_runtime_storage() {
     let root = tempfile::tempdir().unwrap();

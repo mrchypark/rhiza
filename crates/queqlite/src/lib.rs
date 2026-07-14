@@ -249,7 +249,7 @@ impl Queqlite {
             }
         }
         let mut result = flush_applied_tip(&inner).await;
-        let consensus_result = finish_pending_consensus_rpcs(&inner, SHUTDOWN_RPC_TIMEOUT).await;
+        let consensus_result = finish_pending_consensus_rpcs(&inner, SHUTDOWN_RPC_TIMEOUT);
         if result.is_ok() {
             result = consensus_result;
         }
@@ -379,11 +379,16 @@ async fn flush_applied_tip(inner: &Inner) -> Result<(), Error> {
     Ok(())
 }
 
-async fn finish_pending_consensus_rpcs(inner: &Inner, timeout: Duration) -> Result<(), Error> {
-    let consensus = Arc::clone(inner.runtime.consensus());
-    let finished = tokio::task::spawn_blocking(move || consensus.finish_pending_rpcs(timeout))
-        .await
-        .map_err(Error::Worker)?;
+fn finish_pending_consensus_rpcs(inner: &Inner, timeout: Duration) -> Result<(), Error> {
+    let consensus = inner.runtime.consensus();
+    let finished = if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(|| consensus.finish_pending_rpcs(timeout))
+    } else {
+        consensus.finish_pending_rpcs(timeout)
+    };
     if finished {
         Ok(())
     } else {

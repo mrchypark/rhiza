@@ -1790,14 +1790,19 @@ fn pending_consensus_rpc_result(finished: bool) -> Result<(), String> {
     }
 }
 
-async fn finish_pending_consensus_rpcs(
+fn finish_pending_consensus_rpcs(
     runtime: &Arc<NodeRuntime>,
     timeout: Duration,
 ) -> Result<(), String> {
-    let consensus = Arc::clone(runtime.consensus());
-    let finished = tokio::task::spawn_blocking(move || consensus.finish_pending_rpcs(timeout))
-        .await
-        .map_err(|error| format!("consensus RPC drain task failed: {error}"))?;
+    let consensus = runtime.consensus();
+    let finished = if matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    ) {
+        tokio::task::block_in_place(|| consensus.finish_pending_rpcs(timeout))
+    } else {
+        consensus.finish_pending_rpcs(timeout)
+    };
     pending_consensus_rpc_result(finished)
 }
 
@@ -1881,7 +1886,7 @@ where
     retain_first_error(&mut shutdown_result, drained);
     retain_first_error(
         &mut shutdown_result,
-        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)).await,
+        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)),
     );
     shutdown_result
 }
@@ -2098,10 +2103,10 @@ async fn finish_remote_shutdown(
     })
     .await
     .unwrap_or_else(Err);
-    retain_first_error(&mut result, final_flush);
-    retain_first_error(
+    append_shutdown_error(&mut result, final_flush);
+    append_shutdown_error(
         &mut result,
-        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)).await,
+        finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(deadline)),
     );
     result
 }
@@ -2256,6 +2261,19 @@ fn task_result<T>(result: Result<T, tokio::task::JoinError>, name: &str) -> Resu
 fn retain_first_error(current: &mut Result<(), String>, next: Result<(), String>) {
     if current.is_ok() && next.is_err() {
         *current = next;
+    }
+}
+
+fn append_shutdown_error(current: &mut Result<(), String>, next: Result<(), String>) {
+    let Err(next) = next else {
+        return;
+    };
+    match current {
+        Ok(()) => *current = Err(next),
+        Err(current) => {
+            current.push_str("; ");
+            current.push_str(&next);
+        }
     }
 }
 
@@ -4853,6 +4871,48 @@ mod tests {
         assert_eq!(coordinator.durable_tip().index(), committed.applied_index);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_shutdown_reports_primary_durability_and_consensus_errors_together() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = local_checkpoint(&root.path().join("archive"), 1);
+        archive.initialize_checkpoint().await.unwrap();
+        let coordinator = Arc::new(
+            CheckpointCoordinator::open_with_holder(
+                archive,
+                DurabilityMode::Periodic {
+                    interval: Duration::from_secs(3600),
+                },
+                "node-1",
+            )
+            .await
+            .unwrap(),
+        );
+        let (runtime, started, release) = runtime_with_blocked_minority(root.path());
+        runtime.write("request-1", "alpha", "one").unwrap();
+        tokio::task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+
+        let error = finish_remote_shutdown(
+            Err("client server failed".into()),
+            Arc::clone(&runtime),
+            coordinator,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        release.release();
+        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).unwrap();
+
+        assert_eq!(
+            error,
+            format!(
+                "client server failed; {}; consensus RPCs did not finish before the shutdown deadline",
+                shutdown_deadline_error(SERVE_SHUTDOWN_TIMEOUT)
+            )
+        );
+    }
+
     #[test]
     fn unfinished_consensus_rpcs_fail_an_otherwise_successful_shutdown() {
         assert!(pending_consensus_rpc_result(true).is_ok());
@@ -4880,13 +4940,50 @@ mod tests {
 
         let error =
             finish_pending_consensus_rpcs(&runtime, remaining_shutdown_budget(exhausted_deadline))
-                .await
                 .unwrap_err();
 
         assert!(error.contains("consensus RPCs did not finish"));
         release.release();
-        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT)
-            .await
+        finish_pending_consensus_rpcs(&runtime, SERVE_SHUTDOWN_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn consensus_drain_is_not_queued_behind_a_saturated_blocking_pool() {
+        const HANG_GUARD: Duration = Duration::from_secs(10);
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
+        let (release_blocker_tx, release_blocker_rx) = mpsc::channel();
+        let (drain_finished_tx, drain_finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let executor = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async move {
+                let runtime = runtime_for_final_flush(&root_path);
+                let blocker = tokio::task::spawn_blocking(move || {
+                    blocker_started_tx.send(()).unwrap();
+                    release_blocker_rx.recv().unwrap();
+                });
+                let result = finish_pending_consensus_rpcs(&runtime, Duration::ZERO);
+                drain_finished_tx.send(result).unwrap();
+                blocker.await.unwrap();
+            });
+        });
+        blocker_started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("blocking-pool saturation must be established");
+
+        let result = drain_finished_rx.recv_timeout(HANG_GUARD);
+        release_blocker_tx.send(()).unwrap();
+        worker.join().unwrap();
+
+        result
+            .expect("consensus drain must start immediately despite blocking-pool saturation")
             .unwrap();
     }
 
