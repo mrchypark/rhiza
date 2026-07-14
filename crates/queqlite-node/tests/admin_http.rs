@@ -1,6 +1,11 @@
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
-use axum::Router;
+use axum::{
+    body::{to_bytes, Body},
+    http::Request,
+    response::Response,
+    Router,
+};
 use queqlite_archive::{CheckpointIdentity, ObjectArchiveStore};
 use queqlite_core::{ConfigurationState, LogAnchor, LogHash};
 use queqlite_log::{IndexRange, LogStore};
@@ -16,6 +21,7 @@ use queqlite_node::{
 };
 use queqlite_obj_store::{ObjStore, ObjStoreConfig};
 use queqlite_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
+use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "admin-secret";
 
@@ -24,11 +30,14 @@ async fn admin_authentication_precedes_body_parsing_and_routes_are_optional() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime(root.path(), "node", 1, peers(), None);
     let admin_recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, server) = serve(node_router_with_admin(
-        runtime.clone(),
-        admin_recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            admin_recorder,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
 
     let malformed = reqwest::Client::new()
@@ -81,16 +90,117 @@ async fn admin_authentication_precedes_body_parsing_and_routes_are_optional() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn admin_router_rejects_tokens_shared_with_lower_privilege_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+
+    assert!(matches!(
+        node_router_with_admin(
+            runtime.clone(),
+            recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+            AdminConfig::new("client-token").unwrap(),
+        ),
+        Err(queqlite_node::ConfigError::AdminTokenConflictsWithRuntime)
+    ));
+
+    let archive = initialized_checkpoint(&root.path().join("archive")).await;
+    let coordinator = Arc::new(
+        CheckpointCoordinator::open(archive, DurabilityMode::Sync)
+            .await
+            .unwrap(),
+    );
+    assert!(matches!(
+        node_router_with_checkpoint_and_admin(
+            runtime,
+            recorder(
+                root.path(),
+                "checkpoint-admin-recorder",
+                "node-1",
+                1,
+                old_membership(),
+            ),
+            coordinator,
+            AdminConfig::new("peer-token-1").unwrap(),
+        ),
+        Err(queqlite_node::ConfigError::AdminTokenConflictsWithRuntime)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_operation_ledger_blocks_admin_operations() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+    std::fs::write(
+        runtime.config().data_dir().join("admin-operations-v1.json"),
+        b"not json",
+    )
+    .unwrap();
+    let router = node_router_with_admin(
+        runtime.clone(),
+        recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+        AdminConfig::new(ADMIN_TOKEN).unwrap(),
+    )
+    .unwrap();
+    let (addr, server) = serve(router).await;
+
+    let response = admin_post(
+        addr,
+        ADMIN_STOP_PATH,
+        &AdminStopRequest {
+            operation_id: "blocked-by-corrupt-ledger".into(),
+            expected_config_id: 1,
+            successor: successor_bundle(2, old_membership()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(runtime.applied_index().unwrap(), 0);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn operation_ledger_persist_failure_is_not_reported_as_success() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = runtime(root.path(), "node", 1, peers(), None);
+    let router = node_router_with_admin(
+        runtime.clone(),
+        recorder(root.path(), "admin-recorder", "node-1", 1, old_membership()),
+        AdminConfig::new(ADMIN_TOKEN).unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir(runtime.config().data_dir().join("admin-operations-v1.json")).unwrap();
+    let (addr, server) = serve(router).await;
+
+    let response = admin_post(
+        addr,
+        ADMIN_STOP_PATH,
+        &AdminStopRequest {
+            operation_id: "persist-must-succeed".into(),
+            expected_config_id: 1,
+            successor: successor_bundle(2, old_membership()),
+        },
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
     let root = tempfile::tempdir().unwrap();
     let runtime = runtime(root.path(), "node", 1, peers(), None);
     runtime.write("before-stop", "key", "value").unwrap();
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, server) = serve(node_router_with_admin(
-        runtime.clone(),
-        recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            recorder,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     let request = AdminStopRequest {
         operation_id: "stop-001".into(),
@@ -118,6 +228,9 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
 
     let status = admin_status(addr).await;
+    assert_eq!(status.cluster_id, "cluster-a");
+    assert_eq!(status.epoch, 1);
+    assert_eq!(status.recovery_generation, 1);
     assert_eq!(
         status.node.configuration_status,
         RuntimeConfigurationStatus::Stopped
@@ -152,58 +265,78 @@ async fn stop_is_idempotent_conflict_checked_and_closes_old_config_writes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stop_success_and_changed_body_conflict_survive_router_and_runtime_restart() {
     let root = tempfile::tempdir().unwrap();
-    let first_runtime = runtime(root.path(), "node", 1, peers(), None);
+    let consensus_recorders = consensus_recorders(root.path(), 1, &old_membership());
+    let first_runtime = runtime_with_consensus_recorders(
+        root.path(),
+        "node",
+        1,
+        peers(),
+        None,
+        consensus_recorders.clone(),
+    );
     let admin_recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
     let request = AdminStopRequest {
         operation_id: "stop-restart-001".into(),
         expected_config_id: 1,
         successor: successor_bundle(2, old_membership()),
     };
-    let (addr, shutdown, server) = serve_until_shutdown(node_router_with_admin(
+    let first_router = node_router_with_admin(
         first_runtime.clone(),
         admin_recorder.clone(),
         AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
-    .await;
-    let first = admin_post(addr, ADMIN_STOP_PATH, &request).await;
+    )
+    .unwrap();
+    let first = router_admin_post(first_router, ADMIN_STOP_PATH, &request).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
-    let first = first.json::<AdminStopResponse>().await.unwrap();
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let first = response_json::<AdminStopResponse>(first).await;
     drop(first_runtime);
 
-    let runtime = runtime(root.path(), "node", 1, peers(), None);
-    let (addr, server) = serve(node_router_with_admin(
+    let runtime = runtime_with_consensus_recorders(
+        root.path(),
+        "node",
+        1,
+        peers(),
+        None,
+        consensus_recorders,
+    );
+    let router = node_router_with_admin(
         runtime,
         admin_recorder,
         AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
-    .await;
-    let replay = admin_post(addr, ADMIN_STOP_PATH, &request).await;
+    )
+    .unwrap();
+    let replay = router_admin_post(router.clone(), ADMIN_STOP_PATH, &request).await;
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
-    assert_eq!(replay.json::<AdminStopResponse>().await.unwrap(), first);
+    assert_eq!(response_json::<AdminStopResponse>(replay).await, first);
     let mut changed = request;
     changed.successor.config_id = 3;
-    let conflict = admin_post(addr, ADMIN_STOP_PATH, &changed).await;
+    let conflict = router_admin_post(router, ADMIN_STOP_PATH, &changed).await;
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
-    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn install_successor_replays_exact_result_and_rejects_changed_bundle() {
     let root = tempfile::tempdir().unwrap();
-    let first_runtime = runtime(root.path(), "node", 1, peers(), None);
+    let consensus_recorders = consensus_recorders(root.path(), 1, &old_membership());
+    let first_runtime = runtime_with_consensus_recorders(
+        root.path(),
+        "node",
+        1,
+        peers(),
+        None,
+        consensus_recorders.clone(),
+    );
     let successor = Membership::new(["node-1", "node-2", "node-4"]).unwrap();
     let stop = first_runtime
         .stop_current_configuration_for_successor(&successor)
         .unwrap();
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, shutdown, server) = serve_until_shutdown(node_router_with_admin(
+    let first_router = node_router_with_admin(
         first_runtime.clone(),
         recorder.clone(),
         AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
-    .await;
+    )
+    .unwrap();
     let request = AdminInstallSuccessorRequest {
         operation_id: "install-001".into(),
         expected_config_id: 1,
@@ -219,35 +352,32 @@ async fn install_successor_replays_exact_result_and_rejects_changed_bundle() {
     let request: AdminInstallSuccessorRequest =
         serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
 
-    let first = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
+    let first = router_admin_post(first_router, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
     assert_eq!(first.status(), reqwest::StatusCode::OK);
-    let first = first.json::<AdminInstallSuccessorResponse>().await.unwrap();
-    let _ = shutdown.send(());
-    let _ = server.await;
+    let first = response_json::<AdminInstallSuccessorResponse>(first).await;
     drop(first_runtime);
 
-    let runtime = runtime(root.path(), "node", 1, peers(), None);
-    let (addr, server) = serve(node_router_with_admin(
-        runtime,
-        recorder,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
-    .await;
-    let replay = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
+    let runtime = runtime_with_consensus_recorders(
+        root.path(),
+        "node",
+        1,
+        peers(),
+        None,
+        consensus_recorders,
+    );
+    let router =
+        node_router_with_admin(runtime, recorder, AdminConfig::new(ADMIN_TOKEN).unwrap()).unwrap();
+    let replay = router_admin_post(router.clone(), ADMIN_INSTALL_SUCCESSOR_PATH, &request).await;
     assert_eq!(replay.status(), reqwest::StatusCode::OK);
     assert_eq!(
-        replay
-            .json::<AdminInstallSuccessorResponse>()
-            .await
-            .unwrap(),
+        response_json::<AdminInstallSuccessorResponse>(replay).await,
         first
     );
 
     let mut changed = request;
     changed.successor.digest = LogHash::ZERO;
-    let conflict = admin_post(addr, ADMIN_INSTALL_SUCCESSOR_PATH, &changed).await;
+    let conflict = router_admin_post(router, ADMIN_INSTALL_SUCCESSOR_PATH, &changed).await;
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
-    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -299,11 +429,14 @@ async fn stopped_successor_activates_through_live_admin_and_reopens_writes() {
             .unwrap(),
     );
     let runtime = Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap());
-    let (addr, server) = serve(node_router_with_admin(
-        runtime.clone(),
-        local.unwrap(),
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_admin(
+            runtime.clone(),
+            local.unwrap(),
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
 
     let before = admin_status(addr).await;
@@ -348,12 +481,15 @@ async fn compact_archive_failure_preserves_local_qlog() {
         runtime.applied_hash().unwrap(),
     );
     let recorder = recorder(root.path(), "admin-recorder", "node-1", 1, old_membership());
-    let (addr, server) = serve(node_router_with_checkpoint_and_admin(
-        runtime.clone(),
-        recorder,
-        coordinator,
-        AdminConfig::new(ADMIN_TOKEN).unwrap(),
-    ))
+    let (addr, server) = serve(
+        node_router_with_checkpoint_and_admin(
+            runtime.clone(),
+            recorder,
+            coordinator,
+            AdminConfig::new(ADMIN_TOKEN).unwrap(),
+        )
+        .unwrap(),
+    )
     .await;
     std::fs::remove_dir_all(&archive_root).unwrap();
     std::fs::write(&archive_root, b"unavailable").unwrap();
@@ -409,32 +545,34 @@ async fn admin_post<T: serde::Serialize>(
         .unwrap()
 }
 
+async fn router_admin_post<T: serde::Serialize>(
+    router: Router,
+    path: &str,
+    request: &T,
+) -> Response {
+    router
+        .oneshot(
+            Request::post(path)
+                .header(VERSION_HEADER, PROTOCOL_VERSION.to_string())
+                .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn response_json<T: serde::de::DeserializeOwned>(response: Response) -> T {
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
 async fn serve(router: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (addr, server)
-}
-
-async fn serve_until_shutdown(
-    router: Router,
-) -> (
-    SocketAddr,
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (shutdown, wait_for_shutdown) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = wait_for_shutdown.await;
-            })
-            .await
-            .unwrap()
-    });
-    (addr, shutdown, server)
 }
 
 async fn initialized_checkpoint(root: &Path) -> ObjectArchiveStore {
@@ -456,6 +594,20 @@ fn runtime(
     config_id: u64,
     peers: Vec<PeerConfig>,
     state: Option<ConfigurationState>,
+) -> Arc<NodeRuntime> {
+    let membership =
+        Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_owned())).unwrap();
+    let recorders = consensus_recorders(root, config_id, &membership);
+    runtime_with_consensus_recorders(root, data_dir, config_id, peers, state, recorders)
+}
+
+fn runtime_with_consensus_recorders(
+    root: &Path,
+    data_dir: &str,
+    config_id: u64,
+    peers: Vec<PeerConfig>,
+    state: Option<ConfigurationState>,
+    recorders: Vec<(String, RecorderFileStore)>,
 ) -> Arc<NodeRuntime> {
     let membership =
         Membership::from_voters(peers.iter().map(|peer| peer.node_id().to_owned())).unwrap();
@@ -481,18 +633,14 @@ fn runtime(
         ),
     }
     .unwrap();
+    assert_eq!(recorders.len(), membership.members().len());
     let recorders = membership
         .members()
         .iter()
-        .map(|id| {
-            let recorder = recorder(
-                root,
-                &format!("consensus-{id}"),
-                id,
-                config_id,
-                membership.clone(),
-            );
-            (id.clone(), Box::new(recorder) as Box<dyn RecorderRpc>)
+        .zip(recorders)
+        .map(|(expected_id, (recorder_id, recorder))| {
+            assert_eq!(expected_id, &recorder_id);
+            (recorder_id, Box::new(recorder) as Box<dyn RecorderRpc>)
         })
         .collect();
     let consensus = Arc::new(
@@ -500,6 +648,29 @@ fn runtime(
             .unwrap(),
     );
     Arc::new(NodeRuntime::open(config, consensus, &[]).unwrap())
+}
+
+fn consensus_recorders(
+    root: &Path,
+    config_id: u64,
+    membership: &Membership,
+) -> Vec<(String, RecorderFileStore)> {
+    membership
+        .members()
+        .iter()
+        .map(|id| {
+            (
+                id.clone(),
+                recorder(
+                    root,
+                    &format!("consensus-{id}"),
+                    id,
+                    config_id,
+                    membership.clone(),
+                ),
+            )
+        })
+        .collect()
 }
 
 fn recorder(

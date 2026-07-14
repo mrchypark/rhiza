@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 
@@ -48,6 +51,16 @@ impl Config {
         }
         if self.fault_timeout.is_zero() {
             return Err("--fault-timeout must be greater than zero".into());
+        }
+        for (flag, duration) in [
+            ("--duration", self.duration),
+            ("--warmup", self.warmup),
+            ("--request-timeout", self.request_timeout),
+            ("--fault-timeout", self.fault_timeout),
+        ] {
+            if Instant::now().checked_add(duration).is_none() {
+                return Err(format!("{flag} exceeds the platform clock range"));
+            }
         }
         if self.concurrency == 0 {
             return Err("--concurrency must be greater than zero".into());
@@ -233,6 +246,8 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
         (number, 1.0)
     } else if let Some(number) = value.strip_suffix('m') {
         (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600.0)
     } else {
         (value, 1.0)
     };
@@ -243,7 +258,7 @@ pub fn parse_duration(value: &str) -> Result<Duration, String> {
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(format!("invalid duration: {value}"));
     }
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|_| format!("invalid duration: {value}"))
 }
 
 fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
@@ -289,9 +304,9 @@ pub fn rate_decision(
     interval: Duration,
     duration: Duration,
 ) -> RateDecision {
-    if scheduled >= duration {
+    if scheduled >= duration || elapsed >= duration {
         RateDecision::Stop
-    } else if elapsed >= duration || elapsed > scheduled.saturating_add(interval) {
+    } else if elapsed > scheduled.saturating_add(interval) {
         RateDecision::Dropped
     } else {
         RateDecision::Ready
@@ -552,6 +567,50 @@ mod tests {
     }
 
     #[test]
+    fn durations_accept_hours_and_reject_unrepresentable_finite_values() {
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7_200));
+        assert!(parse_duration("1e300s").is_err());
+    }
+
+    #[test]
+    fn config_rejects_duration_outside_platform_clock_range() {
+        let result = parse_config(
+            [
+                "--endpoint",
+                "http://node",
+                "--token",
+                "secret",
+                "--duration",
+                "1.8e19s",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+            |_| None,
+        );
+
+        assert!(result.unwrap_err().contains("platform clock range"));
+    }
+
+    #[test]
+    fn config_rejects_request_timeout_outside_platform_clock_range() {
+        let result = parse_config(
+            [
+                "--endpoint",
+                "http://node",
+                "--token",
+                "secret",
+                "--request-timeout",
+                "1.8e19s",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+            |_| None,
+        );
+
+        assert!(result.unwrap_err().contains("--request-timeout"));
+    }
+
+    #[test]
     fn histogram_percentiles_and_transaction_rate_are_aggregated() {
         let mut stats = Stats::default();
         stats.record(Duration::from_micros(90), true, true, None);
@@ -619,6 +678,15 @@ mod tests {
                 Duration::from_secs(10),
             ),
             RateDecision::Ready
+        );
+        assert_eq!(
+            rate_decision(
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            ),
+            RateDecision::Stop
         );
     }
 }

@@ -70,10 +70,14 @@ pub fn calculate(
         .iter()
         .find(|provider| provider.id == provider_id)
         .ok_or_else(|| format!("unknown provider {provider_id:?}"))?;
+    validate_provider(provider)?;
     let storage_rate = match input.rustfs_storage_usd_per_gb_month {
         Some(rate) if provider.id == "rustfs-local" => rate,
         Some(_) => {
             return Err("--rustfs-storage-usd-per-gb-month only applies to rustfs-local".into())
+        }
+        None if provider.id == "rustfs-local" => {
+            return Err("--rustfs-storage-usd-per-gb-month is required for rustfs-local".into())
         }
         None => provider.storage_usd_per_unit_month,
     };
@@ -95,44 +99,45 @@ pub fn calculate(
             format!("{}-month", provider.storage_unit),
             storage_rate,
             format!("USD per {}-month", provider.storage_unit),
-        ),
+        )?,
         item(
             "put",
             input.put_count as f64,
             "requests".into(),
             provider.put_list_usd_per_1000,
             "USD per 1,000 requests".into(),
-        ),
+        )?,
         item(
             "list",
             input.list_count as f64,
             "requests".into(),
             provider.put_list_usd_per_1000,
             "USD per 1,000 requests".into(),
-        ),
+        )?,
         item(
             "get",
             input.get_count as f64,
             "requests".into(),
             provider.get_usd_per_1000,
             "USD per 1,000 requests".into(),
-        ),
+        )?,
         item(
             "delete",
             input.delete_count as f64,
             "requests".into(),
             provider.delete_usd_per_1000,
             "USD per 1,000 requests".into(),
-        ),
+        )?,
         item(
             "egress",
             input.egress_gb,
             "GB".into(),
             egress_rate,
             "USD per GB".into(),
-        ),
+        )?,
     ];
     let total_monthly_usd = items.iter().map(|item| item.monthly_usd).sum();
+    validate_derived("total monthly cost", total_monthly_usd)?;
     Ok(CostOutput {
         as_of: rates.as_of.clone(),
         currency: rates.currency.clone(),
@@ -156,25 +161,58 @@ fn validate_input(input: CostInput) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_provider(provider: &ProviderRate) -> Result<(), String> {
+    for (name, value) in [
+        (
+            "storage input multiplier",
+            provider.storage_input_gb_month_multiplier,
+        ),
+        ("storage rate", provider.storage_usd_per_unit_month),
+        ("PUT/LIST rate", provider.put_list_usd_per_1000),
+        ("GET rate", provider.get_usd_per_1000),
+        ("DELETE rate", provider.delete_usd_per_1000),
+        ("default egress rate", provider.default_egress_usd_per_gb),
+    ] {
+        if value < 0.0 || !value.is_finite() {
+            return Err(format!(
+                "provider {name} must be a finite non-negative number"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn item(
     name: &'static str,
     quantity: f64,
     unit: String,
     rate_usd: f64,
     rate_unit: String,
-) -> CostItem {
+) -> Result<CostItem, String> {
+    validate_derived(&format!("{name} quantity"), quantity)?;
+    validate_derived(&format!("{name} rate"), rate_usd)?;
     let divisor = if rate_unit == "USD per 1,000 requests" {
         1_000.0
     } else {
         1.0
     };
-    CostItem {
+    let monthly_usd = quantity / divisor * rate_usd;
+    validate_derived(&format!("{name} monthly cost"), monthly_usd)?;
+    Ok(CostItem {
         name,
         quantity,
         unit,
         rate_usd,
         rate_unit,
-        monthly_usd: quantity / divisor * rate_usd,
+        monthly_usd,
+    })
+}
+
+fn validate_derived(name: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(format!("{name} must be a finite non-negative number"))
     }
 }
 
@@ -261,5 +299,84 @@ mod tests {
         .unwrap();
 
         assert_eq!(output.total_monthly_usd, 1.0);
+    }
+
+    #[test]
+    fn rustfs_requires_an_explicit_local_storage_rate() {
+        let rates = parse_rates(RATES).unwrap();
+        let error = calculate(
+            &rates,
+            "rustfs-local",
+            CostInput {
+                retained_gb_month: 100.0,
+                ..CostInput::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("--rustfs-storage-usd-per-gb-month"));
+    }
+
+    #[test]
+    fn provider_rates_must_be_finite_and_non_negative() {
+        for field in 0..6 {
+            let mut rates = parse_rates(RATES).unwrap();
+            let provider = &mut rates.providers[0];
+            match field {
+                0 => provider.storage_input_gb_month_multiplier = -1.0,
+                1 => provider.storage_usd_per_unit_month = -1.0,
+                2 => provider.put_list_usd_per_1000 = -1.0,
+                3 => provider.get_usd_per_1000 = -1.0,
+                4 => provider.delete_usd_per_1000 = -1.0,
+                5 => provider.default_egress_usd_per_gb = f64::NAN,
+                _ => unreachable!(),
+            }
+            let provider_id = provider.id.clone();
+
+            assert!(calculate(&rates, &provider_id, CostInput::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn derived_quantities_item_costs_and_totals_must_remain_finite() {
+        let mut rates = parse_rates(RATES).unwrap();
+        rates.providers[0].storage_input_gb_month_multiplier = 2.0;
+        assert!(calculate(
+            &rates,
+            "aws-s3-standard-us-east-1",
+            CostInput {
+                retained_gb_month: f64::MAX,
+                ..CostInput::default()
+            },
+        )
+        .is_err());
+
+        let mut rates = parse_rates(RATES).unwrap();
+        let provider = &mut rates.providers[0];
+        provider.storage_input_gb_month_multiplier = 1.0;
+        provider.storage_usd_per_unit_month = 1.0;
+        provider.default_egress_usd_per_gb = 1.0;
+        assert!(calculate(
+            &rates,
+            "aws-s3-standard-us-east-1",
+            CostInput {
+                retained_gb_month: 1.0e308,
+                egress_gb: 1.0e308,
+                ..CostInput::default()
+            },
+        )
+        .is_err());
+
+        let rates = parse_rates(RATES).unwrap();
+        assert!(calculate(
+            &rates,
+            "rustfs-local",
+            CostInput {
+                retained_gb_month: f64::MAX,
+                rustfs_storage_usd_per_gb_month: Some(f64::MAX),
+                ..CostInput::default()
+            },
+        )
+        .is_err());
     }
 }
