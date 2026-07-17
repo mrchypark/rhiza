@@ -22,8 +22,15 @@ const MAX_PAYLOAD_BYTES: usize = 4 * 1024;
 const WAL_HARD_FRAME_LIMIT: usize = 1_024;
 const WAL_SOFT_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
 // The production WAL checkpoints after 1,024 frames. Keeping every invocation below that
-// boundary isolates the steady append + durability barrier that this benchmark is for.
+// boundary isolates the steady append + durability barrier that the default benchmark is for.
 const MAX_TOTAL_OPERATIONS: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CommandMode {
+    Inline,
+    PreStored,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Config {
@@ -33,6 +40,8 @@ struct Config {
     label: String,
     root: Option<PathBuf>,
     keep: bool,
+    command_mode: CommandMode,
+    checkpoint_diagnostic: bool,
 }
 
 impl Default for Config {
@@ -44,6 +53,8 @@ impl Default for Config {
             label: "native".into(),
             root: None,
             keep: false,
+            command_mode: CommandMode::Inline,
+            checkpoint_diagnostic: false,
         }
     }
 }
@@ -52,12 +63,18 @@ impl Config {
     fn parse_from(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut config = Self::default();
         let mut args = args.into_iter();
+        let mut operations_explicit = false;
+        let mut warmup_explicit = false;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--operations" => {
                     config.operations = parse_usize("--operations", args.next())?;
+                    operations_explicit = true;
                 }
-                "--warmup" => config.warmup = parse_usize("--warmup", args.next())?,
+                "--warmup" => {
+                    config.warmup = parse_usize("--warmup", args.next())?;
+                    warmup_explicit = true;
+                }
                 "--payload-bytes" => {
                     config.payload_bytes = parse_usize("--payload-bytes", args.next())?;
                 }
@@ -73,9 +90,35 @@ impl Config {
                     ));
                 }
                 "--keep" => config.keep = true,
+                "--command-mode" => {
+                    config.command_mode = match args.next().as_deref() {
+                        Some("inline") => CommandMode::Inline,
+                        Some("pre-stored") => CommandMode::PreStored,
+                        Some(value) => {
+                            return Err(format!(
+                                "invalid --command-mode {value:?}; expected inline or pre-stored"
+                            ));
+                        }
+                        None => return Err("--command-mode requires a value".into()),
+                    };
+                }
+                "--checkpoint-diagnostic" => config.checkpoint_diagnostic = true,
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unknown argument {other:?}\n{}", usage())),
             }
+        }
+        if config.checkpoint_diagnostic {
+            if warmup_explicit && config.warmup != 0 {
+                return Err("--checkpoint-diagnostic requires --warmup 0".into());
+            }
+            if operations_explicit && config.operations != WAL_HARD_FRAME_LIMIT + 1 {
+                return Err(format!(
+                    "--checkpoint-diagnostic requires --operations {}",
+                    WAL_HARD_FRAME_LIMIT + 1
+                ));
+            }
+            config.warmup = 0;
+            config.operations = WAL_HARD_FRAME_LIMIT + 1;
         }
         if config.operations == 0 {
             return Err("--operations must be greater than zero".into());
@@ -92,7 +135,7 @@ impl Config {
             .warmup
             .checked_add(config.operations)
             .ok_or_else(|| "warmup + operations overflowed".to_owned())?;
-        if total > MAX_TOTAL_OPERATIONS {
+        if !config.checkpoint_diagnostic && total > MAX_TOTAL_OPERATIONS {
             return Err(format!(
                 "warmup + operations must not exceed {MAX_TOTAL_OPERATIONS}; this keeps the run before the WAL checkpoint boundary"
             ));
@@ -109,7 +152,7 @@ fn parse_usize(flag: &str, value: Option<String>) -> Result<usize, String> {
 }
 
 fn usage() -> String {
-    "usage: recorder_sync_bench [--operations N] [--warmup N] [--payload-bytes N] [--label NAME] [--root PATH] [--keep]".into()
+    "usage: recorder_sync_bench [--operations N] [--warmup N] [--payload-bytes N] [--label NAME] [--root PATH] [--keep] [--command-mode inline|pre-stored] [--checkpoint-diagnostic]".into()
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +168,21 @@ struct LatencyNs {
     p50: Option<u64>,
     p95: Option<u64>,
     p99: Option<u64>,
+    max: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct OperationObservation {
+    operation: usize,
+    call_elapsed_ns: u64,
+    completed: bool,
+    checkpoint_observed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckpointEvent {
+    operation: usize,
+    generation: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +192,7 @@ struct WalObservation {
     generations: Vec<u64>,
     first_sequence: Option<u64>,
     last_sequence: Option<u64>,
+    checkpoints_observed: usize,
     checkpoint_avoided_observed: bool,
 }
 
@@ -141,6 +200,8 @@ struct WalObservation {
 struct Report {
     benchmark: &'static str,
     sync_variant: String,
+    command_mode: CommandMode,
+    checkpoint_diagnostic: bool,
     operations: usize,
     warmup: usize,
     payload_bytes: usize,
@@ -150,6 +211,8 @@ struct Report {
     ops_per_second: f64,
     latency_scope: &'static str,
     latency_ns: LatencyNs,
+    checkpoint_boundary_operations: Vec<OperationObservation>,
+    checkpoint_events: Vec<CheckpointEvent>,
     wal: WalObservation,
     platform: Platform,
 }
@@ -206,9 +269,15 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
     )
     .map_err(|error| error.to_string())?;
     let payload = vec![0x5a; config.payload_bytes];
+    let command = StoredCommand::new(EntryType::Command, payload);
+    if config.command_mode == CommandMode::PreStored {
+        store
+            .store_command(command.hash(), command.clone())
+            .map_err(|error| format!("pre-store setup failed: {error}"))?;
+    }
     let total = config.warmup + config.operations;
     let mut requests: Vec<_> = (1..=total)
-        .map(|slot| record_request(config_digest, slot as u64, &payload))
+        .map(|slot| record_request(config_digest, slot as u64, &command, config.command_mode))
         .collect();
     let measured_requests = requests.split_off(config.warmup);
 
@@ -220,12 +289,25 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
 
     let started = Instant::now();
     let mut latencies = Vec::with_capacity(config.operations);
+    let mut boundary_operations = Vec::with_capacity(3);
     let mut errors = 0usize;
-    for request in measured_requests {
+    for (index, request) in measured_requests.into_iter().enumerate() {
+        let operation = config.warmup + index + 1;
         let operation_started = Instant::now();
-        match store.record_proposal(request) {
-            Ok(_) => latencies.push(duration_ns(operation_started.elapsed().as_nanos())),
-            Err(_) => errors += 1,
+        let completed = store.record_proposal(request).is_ok();
+        let call_elapsed_ns = duration_ns(operation_started.elapsed().as_nanos());
+        if completed {
+            latencies.push(call_elapsed_ns);
+        } else {
+            errors += 1;
+        }
+        if (WAL_HARD_FRAME_LIMIT - 1..=WAL_HARD_FRAME_LIMIT + 1).contains(&operation) {
+            boundary_operations.push(OperationObservation {
+                operation,
+                call_elapsed_ns,
+                completed,
+                checkpoint_observed: false,
+            });
         }
     }
     let elapsed_ns = duration_ns(started.elapsed().as_nanos());
@@ -236,9 +318,30 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
     } else {
         completed as f64 * 1_000_000_000.0 / elapsed_ns as f64
     };
+    let wal = observe_wal(&root.join("recorder.wal"), total)?;
+    let checkpoint_events = if config.checkpoint_diagnostic && wal.checkpoints_observed == 1 {
+        wal.generations
+            .last()
+            .copied()
+            .map(|generation| CheckpointEvent {
+                operation: WAL_HARD_FRAME_LIMIT + 1,
+                generation,
+            })
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for observation in &mut boundary_operations {
+        observation.checkpoint_observed = checkpoint_events
+            .iter()
+            .any(|event| event.operation == observation.operation);
+    }
     let report = Report {
         benchmark: "recorder_wal_record",
         sync_variant: config.label.clone(),
+        command_mode: config.command_mode,
+        checkpoint_diagnostic: config.checkpoint_diagnostic,
         operations: config.operations,
         warmup: config.warmup,
         payload_bytes: config.payload_bytes,
@@ -251,8 +354,11 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
             p50: percentile(&latencies, 50),
             p95: percentile(&latencies, 95),
             p99: percentile(&latencies, 99),
+            max: latencies.last().copied(),
         },
-        wal: observe_wal(&root.join("recorder.wal"), total)?,
+        checkpoint_boundary_operations: boundary_operations,
+        checkpoint_events,
+        wal,
         platform: Platform {
             os: env::consts::OS,
             arch: env::consts::ARCH,
@@ -263,10 +369,14 @@ fn run_at_root(config: &Config, root: &Path) -> Result<(Report, bool), String> {
     Ok((report, errors != 0))
 }
 
-fn record_request(config_digest: LogHash, slot: u64, payload: &[u8]) -> RecordRequest {
-    let command = StoredCommand::new(EntryType::Command, payload.to_vec());
+fn record_request(
+    config_digest: LogHash,
+    slot: u64,
+    command: &StoredCommand,
+    command_mode: CommandMode,
+) -> RecordRequest {
     let value =
-        AcceptedValue::from_command(CLUSTER_ID, slot, EPOCH, CONFIG_ID, LogHash::ZERO, &command);
+        AcceptedValue::from_command(CLUSTER_ID, slot, EPOCH, CONFIG_ID, LogHash::ZERO, command);
     RecordRequest {
         cluster_id: CLUSTER_ID.into(),
         epoch: EPOCH,
@@ -275,7 +385,7 @@ fn record_request(config_digest: LogHash, slot: u64, payload: &[u8]) -> RecordRe
         slot,
         step: 4,
         proposal: Proposal::new(ProposalPriority::MAX, "benchmark-proposer", slot, value),
-        command: Some(command),
+        command: (command_mode == CommandMode::Inline).then(|| command.clone()),
     }
 }
 
@@ -339,12 +449,20 @@ fn observe_wal(path: &Path, attempted_frames: usize) -> Result<WalObservation, S
         && generations == [1]
         && first_sequence == Some(1)
         && last_sequence == Some(attempted_frames as u64);
+    let checkpoints_observed = generations
+        .last()
+        .copied()
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .try_into()
+        .unwrap_or(usize::MAX);
     Ok(WalObservation {
         bytes: byte_count,
         frames,
         generations,
         first_sequence,
         last_sequence,
+        checkpoints_observed,
         checkpoint_avoided_observed,
     })
 }
@@ -395,6 +513,44 @@ mod tests {
     }
 
     #[test]
+    fn parser_enables_exact_checkpoint_boundary_diagnostic_defaults() {
+        let config = Config::parse_from(
+            ["--checkpoint-diagnostic", "--command-mode", "pre-stored"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(config.operations, WAL_HARD_FRAME_LIMIT + 1);
+        assert_eq!(config.warmup, 0);
+        assert_eq!(config.command_mode, CommandMode::PreStored);
+        assert!(config.checkpoint_diagnostic);
+    }
+
+    #[test]
+    fn parser_rejects_checkpoint_diagnostic_with_hidden_warmup() {
+        let error = Config::parse_from(
+            ["--checkpoint-diagnostic", "--warmup", "1"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("requires --warmup 0"));
+    }
+
+    #[test]
+    fn command_mode_controls_whether_record_contains_inline_command() {
+        let command = StoredCommand::new(EntryType::Command, b"payload".to_vec());
+
+        let inline = record_request(LogHash::ZERO, 1, &command, CommandMode::Inline);
+        let pre_stored = record_request(LogHash::ZERO, 1, &command, CommandMode::PreStored);
+
+        assert_eq!(inline.command, Some(command));
+        assert_eq!(pre_stored.command, None);
+    }
+
+    #[test]
     fn parser_rejects_runs_that_cross_the_checkpoint_boundary() {
         let error = Config::parse_from(
             ["--operations", "901", "--warmup", "100"]
@@ -411,6 +567,8 @@ mod tests {
         let report = Report {
             benchmark: "recorder_wal_record",
             sync_variant: "native".into(),
+            command_mode: CommandMode::Inline,
+            checkpoint_diagnostic: false,
             operations: 2,
             warmup: 1,
             payload_bytes: 128,
@@ -423,13 +581,17 @@ mod tests {
                 p50: Some(40),
                 p95: Some(60),
                 p99: Some(60),
+                max: Some(60),
             },
+            checkpoint_boundary_operations: Vec::new(),
+            checkpoint_events: Vec::new(),
             wal: WalObservation {
                 bytes: 200,
                 frames: 3,
                 generations: vec![1],
                 first_sequence: Some(1),
                 last_sequence: Some(3),
+                checkpoints_observed: 0,
                 checkpoint_avoided_observed: true,
             },
             platform: Platform {
@@ -442,7 +604,9 @@ mod tests {
 
         let value = serde_json::to_value(report).unwrap();
         assert_eq!(value["operations"], 2);
+        assert_eq!(value["command_mode"], "inline");
         assert_eq!(value["latency_ns"]["p99"], 60);
+        assert_eq!(value["latency_ns"]["max"], 60);
         assert_eq!(value["latency_scope"], "successful_calls_only");
         assert_eq!(value["wal"]["checkpoint_avoided_observed"], true);
         assert_eq!(value["platform"]["os"], "linux");
@@ -451,5 +615,24 @@ mod tests {
     #[test]
     fn empty_success_set_has_no_latency_percentiles() {
         assert_eq!(percentile(&[], 99), None);
+    }
+
+    #[test]
+    fn wal_observation_reports_checkpoint_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("recorder.wal");
+        let mut frame = Vec::from(b"QWAL".as_slice());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&30u64.to_be_bytes());
+        frame.extend_from_slice(&2u64.to_be_bytes());
+        frame.extend_from_slice(&1025u64.to_be_bytes());
+        fs::write(&path, frame).unwrap();
+
+        let observation = observe_wal(&path, WAL_HARD_FRAME_LIMIT + 1).unwrap();
+
+        assert_eq!(observation.frames, 1);
+        assert_eq!(observation.generations, vec![2]);
+        assert_eq!(observation.checkpoints_observed, 1);
+        assert!(!observation.checkpoint_avoided_observed);
     }
 }
