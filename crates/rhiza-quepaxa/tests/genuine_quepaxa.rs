@@ -533,6 +533,7 @@ fn recorder_crash_reopen_reconstructs_decision_from_phase_state() {
         .unwrap();
     assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     assert!(engine.inspect_decision_proof_at(1).unwrap().is_some());
+    assert!(engine.finish_pending_rpcs(Duration::from_secs(1)));
     drop(engine);
 
     let reopened = consensus(root.path(), "n3").with_priority_source(Arc::new(FixedPriority));
