@@ -47,22 +47,38 @@ See `examples/local_three_node.rs` for a complete runnable example.
   workers, including proof workers. A transport that ignores its deadline can
   leak its own worker and resources, but cannot block consensus destruction.
 - Call `finish_pending_rpcs` with an application-selected bound before removing
-  local recorder storage or shutting down a transport used by accepted record
-  or proof jobs. The drain does not recover proof jobs already dropped because
-  a bounded worker queue was full.
+  local recorder storage or shutting down a transport used by accepted record,
+  proof, or control jobs. The drain does not recover jobs already dropped
+  because a bounded worker queue was full.
+- Each recorder has one record worker and one control worker, each with room for
+  one queued job. Record saturation returns retryable `Pending`; control
+  saturation may surface retryable `NoQuorum` or `Unavailable`.
+- `register_command` is fallible: it rejects mismatched command hashes and
+  succeeds only after a recorder quorum stores the command. `NoQuorum` is
+  retryable.
 - `PrioritySource` is injectable for deterministic simulation. The default uses
   the operating system random source through `getrandom` and supports all
   platforms supported by that crate.
 
 ## Recorder durability
 
-Normal records are acknowledged from a bounded, checksummed append-only
+Normal records are acknowledged from a threshold-checkpointed, checksummed append-only
 `recorder.wal`. Each frame carries its generation and sequence, the previous
 frame digest, the exact slot/configuration/head state, and an optional inline
-command. Recovery replays only the continuous digest chain, truncates an
-incomplete unacknowledged tail, and fails closed on a complete corrupt frame.
-The WAL is checkpointed before its 16 MiB soft limit or 1,024-frame hard limit
-is exceeded.
+command. Recovery replays only the continuous digest chain. Fully present
+frames with checksum, digest-chain, generation, or sequence corruption fail
+closed. An incomplete final frame is treated as an unacknowledged torn tail and
+truncated. QWAL v1 cannot distinguish a genuinely torn final frame from a
+corrupted declared frame length that extends beyond EOF; that ambiguity remains
+an explicit residual format risk until the framing format changes.
+Before each append, the recorder evaluates the WAL's 16 MiB byte threshold and
+1,024-frame threshold. Because the check precedes the append, an individual
+frame can carry the WAL past the 16 MiB soft threshold; the recorder checkpoints
+before the following append. Command payloads have no separate hard size bound.
+The existing checkpoint format and 1,024-frame boundary are intentionally
+retained. A broader crash-safe checkpoint redesign is deferred; the logical
+boundary diagnostic below does not replace the physical power-loss deployment
+gate.
 
 The steady path acknowledges only after the appended frame is durable. On
 Linux it uses `File::sync_data` (`fdatasync`); other platforms conservatively
@@ -82,14 +98,38 @@ XFS, and the intended Kubernetes CSI remains a separate deployment gate.
 
 `recorder_sync_bench` measures the actual `RecorderFileStore::record_proposal`
 steady WAL append and acknowledgement path without pulling in a rhiza backend
-or network transport. A run is deliberately capped below the WAL checkpoint
-boundary and emits one JSON object with throughput, successful-call latency
-percentiles, error count, exact WAL byte/frame observations, and platform
-metadata. Request construction is completed before timing.
+or network transport. A default steady-state run is deliberately capped below
+the WAL checkpoint boundary; `--checkpoint-diagnostic` is the explicit
+boundary-crossing exception. Each run emits one JSON object with throughput,
+successful-call latency percentiles, error count, exact WAL byte/frame
+observations, and platform metadata. Every operation uses an equal-sized but
+distinct command payload and hash; `--payload-bytes` is the exact payload size
+and must be at least 2. All commands and requests are constructed before timing.
+
+The default `--command-mode inline` includes the inline command and its WAL
+persistence in every timed `record_proposal` call. `--command-mode pre-stored`
+stores every distinct command before warmup and before the timer starts, then
+omits commands from measured requests. Command pre-storage is therefore
+excluded from its latency and throughput.
 
 ```console
 cargo run --release -p rhiza-quepaxa --example recorder_sync_bench -- \
   --warmup 100 --operations 500 --label native
+```
+
+`--checkpoint-diagnostic` is a boundary-crossing correctness run, not a
+steady-state comparison. It forces `--warmup 0 --operations 1025` (and rejects
+conflicting explicit values). Operations 1 through 1024 fill generation 1;
+operation 1025 measures the synchronous checkpoint before the new proposal is
+appended as the first generation-2 frame. The command exits nonzero unless it
+observes exactly that one checkpoint, a durable-head generation of 2 through
+sequence 1024, and one checksummed generation-2 WAL frame at sequence 1025. It
+also drops and reopens the recorder with the expected membership, so production
+decoders validate the complete durable head and WAL before success is reported.
+
+```console
+cargo run --release -p rhiza-quepaxa --example recorder_sync_bench -- \
+  --checkpoint-diagnostic
 ```
 
 On Linux, `File::sync_data` reaches the normal dynamically linked `fdatasync`
