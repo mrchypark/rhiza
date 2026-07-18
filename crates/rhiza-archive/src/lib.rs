@@ -2401,14 +2401,24 @@ impl ObjectArchiveStore {
                 until_ms: plan.not_before_ms,
             });
         }
-        self.acquire_gc_barrier(&plan, now_ms).await?;
-        self.enter_delete_phase(&plan, now_ms).await?;
-        self.fence_gc_root(&plan).await?;
-        self.retire_plan_generations(&plan, now_ms).await?;
+        if let Err(error) = self.acquire_gc_barrier(&plan, now_ms).await {
+            return self.gc_report_after_stale(plan_hash, error).await;
+        }
+        if let Err(error) = self.enter_delete_phase(&plan, now_ms).await {
+            return self.gc_report_after_stale(plan_hash, error).await;
+        }
+        if let Err(error) = self.fence_gc_root(&plan).await {
+            return self.gc_report_after_stale(plan_hash, error).await;
+        }
+        if let Err(error) = self.retire_plan_generations(&plan, now_ms).await {
+            return self.gc_report_after_stale(plan_hash, error).await;
+        }
 
         let mut results = Vec::with_capacity(plan.candidates.len());
         for candidate in &plan.candidates {
-            self.validate_gc_fence(&plan, now_ms).await?;
+            if let Err(error) = self.validate_gc_fence(&plan, now_ms).await {
+                return self.gc_report_after_stale(plan_hash, error).await;
+            }
             if !is_known_checkpoint_object(&candidate.generation, &candidate.key) {
                 return Err(Error::InvalidGc(format!(
                     "candidate is outside a known checkpoint layout: {}",
@@ -2473,6 +2483,19 @@ impl ObjectArchiveStore {
         };
         self.clear_gc_barrier(&plan).await?;
         Ok(report)
+    }
+
+    async fn gc_report_after_stale(
+        &self,
+        plan_hash: &str,
+        error: Error,
+    ) -> Result<GcExecutionReport> {
+        if matches!(error, Error::GcPlanStale { .. }) {
+            if let Some(report) = self.load_gc_report(plan_hash).await? {
+                return Ok(report);
+            }
+        }
+        Err(error)
     }
 
     pub fn gc_plan_key(&self, plan_hash: &str) -> String {
