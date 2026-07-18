@@ -7,10 +7,21 @@ use rhiza_core::LogAnchor;
 use rhiza_core::{ConfigChange, ConfigurationState, EntryType, LogEntry, LogHash};
 use rhiza_graph::{
     apply_lgfx_to_exact_base, decode_snapshot, encode_replicated_graph_command, encode_snapshot,
-    graph_materializer_fingerprint, restore_snapshot_file, ControlIdentity, ControlStore, Error,
-    GraphCommandResultV1, GraphCommandV1, GraphValueV1, LadybugFileEffectV1, LadybugStateMachine,
-    PendingApply,
+    graph_materializer_fingerprint, lgfx_chunks_digest, restore_snapshot_file, ControlIdentity,
+    ControlStore, Error, GraphCommandResultV1, GraphCommandV1, GraphValueV1, LadybugFileChunkV1,
+    LadybugFileEffectV1, LadybugStateMachine, PendingApply, LGFX_CHUNK_BYTES,
 };
+
+const DOCUMENT_SCHEMA: &str = r#"CREATE NODE TABLE RhizaDocument(
+    id STRING PRIMARY KEY,
+    kind UINT8,
+    bool_value BOOL,
+    i64_value INT64,
+    u64_value UINT64,
+    f64_value DOUBLE,
+    string_value STRING,
+    bytes_value BLOB
+)"#;
 
 fn command(request: &str, id: &str, value: u64) -> (GraphCommandV1, Vec<u8>) {
     let command = GraphCommandV1::put_document(request, id, GraphValueV1::U64(value)).unwrap();
@@ -44,6 +55,229 @@ fn control_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".control");
     value.into()
+}
+
+fn custom_genesis(path: &Path, node_id: &str, mutation: &str) -> LadybugStateMachine {
+    let database = lbug::Database::new(path, lbug::SystemConfig::default()).unwrap();
+    let connection = lbug::Connection::new(&database).unwrap();
+    connection.query(DOCUMENT_SCHEMA).unwrap();
+    connection.query(mutation).unwrap();
+    connection.query("CHECKPOINT").unwrap();
+    drop(connection);
+    drop(database);
+    let digest = LogHash::digest(&[&fs::read(path).unwrap()]);
+    ControlStore::create(
+        control_path(path),
+        &ControlIdentity::new(
+            "cluster-1",
+            node_id,
+            7,
+            ConfigurationState::active(3, LogHash::ZERO),
+            1,
+            graph_materializer_fingerprint(),
+            digest,
+        ),
+    )
+    .unwrap();
+    LadybugStateMachine::open(path, "cluster-1", node_id, 7, 3).unwrap()
+}
+
+fn full_chunks(path: &Path) -> Vec<LadybugFileChunkV1> {
+    fs::read(path)
+        .unwrap()
+        .chunks_exact(LGFX_CHUNK_BYTES)
+        .enumerate()
+        .map(|(chunk_index, after_image)| LadybugFileChunkV1 {
+            chunk_index: chunk_index as u64,
+            after_image: after_image.to_vec(),
+        })
+        .collect()
+}
+
+fn assert_pair_unchanged(
+    state: &LadybugStateMachine,
+    path: &Path,
+    entry: &LogEntry,
+    before_db: &[u8],
+    before_control: &[u8],
+) {
+    assert!(state.apply_entry(entry).is_err());
+    assert_eq!(fs::read(path).unwrap(), before_db);
+    assert_eq!(fs::read(control_path(path)).unwrap(), before_control);
+}
+
+#[test]
+fn first_effect_bootstraps_independent_fresh_ladybug_genesis_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let proposer_path = dir.path().join("proposer.lbug");
+    let follower_path = dir.path().join("follower.lbug");
+    let exact_path = dir.path().join("exact-follower.lbug");
+    let proposer = LadybugStateMachine::open(&proposer_path, "cluster-1", "node-1", 7, 3).unwrap();
+    let follower = LadybugStateMachine::open(&follower_path, "cluster-1", "node-2", 7, 3).unwrap();
+    fs::copy(&proposer_path, &exact_path).unwrap();
+    let exact_digest = proposer.canonical_db_digest().unwrap();
+    ControlStore::create(
+        control_path(&exact_path),
+        &ControlIdentity::new(
+            "cluster-1",
+            "node-3",
+            7,
+            ConfigurationState::active(3, LogHash::ZERO),
+            1,
+            graph_materializer_fingerprint(),
+            exact_digest,
+        ),
+    )
+    .unwrap();
+    let exact = LadybugStateMachine::open(&exact_path, "cluster-1", "node-3", 7, 3).unwrap();
+    assert_eq!(exact.canonical_db_digest().unwrap(), exact_digest);
+    assert_eq!(
+        proposer.reconciliation_base_state().unwrap(),
+        (
+            proposer.materialized_tip().unwrap(),
+            proposer.configuration_state_value().unwrap(),
+        )
+    );
+    assert_ne!(exact_digest, follower.canonical_db_digest().unwrap());
+
+    let (_, request) = command("request-1", "document-1", 42);
+    let encoded = proposer
+        .prepare_graph_effect(&request, 0, LogHash::ZERO)
+        .unwrap();
+    let effect = LadybugFileEffectV1::decode(&encoded).unwrap();
+    assert_eq!(
+        effect.chunks.len() as u64,
+        effect.target_file_bytes / rhiza_graph::LGFX_CHUNK_BYTES as u64
+    );
+
+    let entry = lgfx_entry(1, LogHash::ZERO, encoded);
+    proposer.apply_entry(&entry).unwrap();
+    follower.apply_entry(&entry).unwrap();
+    exact.apply_entry(&entry).unwrap();
+
+    assert_eq!(
+        fs::read(&proposer_path).unwrap(),
+        fs::read(&follower_path).unwrap()
+    );
+    assert_eq!(
+        fs::read(&proposer_path).unwrap(),
+        fs::read(&exact_path).unwrap()
+    );
+    assert_eq!(
+        follower.get_document_with_tip("document-1").unwrap(),
+        (Some(GraphValueV1::U64(42)), 1, entry.hash)
+    );
+
+    let (_, second_request) = command("request-2", "document-2", 7);
+    let second_encoded = proposer
+        .prepare_graph_effect(&second_request, 1, entry.hash)
+        .unwrap();
+    let second_effect = LadybugFileEffectV1::decode(&second_encoded).unwrap();
+    assert!(
+        (second_effect.chunks.len() as u64)
+            < second_effect.target_file_bytes / rhiza_graph::LGFX_CHUNK_BYTES as u64
+    );
+    let second_entry = lgfx_entry(2, entry.hash, second_encoded);
+    proposer.apply_entry(&second_entry).unwrap();
+    follower.apply_entry(&second_entry).unwrap();
+    assert_eq!(
+        fs::read(&proposer_path).unwrap(),
+        fs::read(&follower_path).unwrap()
+    );
+}
+
+#[test]
+fn divergent_bootstrap_rejections_leave_database_and_control_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let proposer_path = dir.path().join("proposer.lbug");
+    let proposer = LadybugStateMachine::open(&proposer_path, "cluster-1", "node-1", 7, 3).unwrap();
+    let (_, request) = command("request-1", "document-1", 42);
+    let encoded = proposer
+        .prepare_graph_effect(&request, 0, LogHash::ZERO)
+        .unwrap();
+    let effect = LadybugFileEffectV1::decode(&encoded).unwrap();
+    let entry = lgfx_entry(1, LogHash::ZERO, encoded);
+
+    for (name, mutation) in [
+        (
+            "extra-schema",
+            "CREATE NODE TABLE Unexpected(id STRING PRIMARY KEY)",
+        ),
+        (
+            "nonempty",
+            "CREATE (:RhizaDocument {id: 'existing', kind: 1})",
+        ),
+    ] {
+        let path = dir.path().join(format!("{name}.lbug"));
+        let state = custom_genesis(&path, name, mutation);
+        let before_db = fs::read(&path).unwrap();
+        let before_control = fs::read(control_path(&path)).unwrap();
+        let (_, polluted_request) = command("polluted-request", "new-document", 1);
+        assert!(state
+            .prepare_graph_effect(&polluted_request, 0, LogHash::ZERO)
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before_db);
+        assert_eq!(fs::read(control_path(&path)).unwrap(), before_control);
+        assert_pair_unchanged(&state, &path, &entry, &before_db, &before_control);
+    }
+
+    let missing_path = dir.path().join("missing-chunk.lbug");
+    let missing =
+        LadybugStateMachine::open(&missing_path, "cluster-1", "node-missing", 7, 3).unwrap();
+    let mut incomplete = effect.clone();
+    incomplete.chunks.remove(0);
+    incomplete.chunks_digest = lgfx_chunks_digest(&incomplete.chunks);
+    let incomplete_entry = lgfx_entry(1, LogHash::ZERO, incomplete.encode().unwrap());
+    let proposer_before_db = fs::read(&proposer_path).unwrap();
+    let proposer_before_control = fs::read(control_path(&proposer_path)).unwrap();
+    assert_pair_unchanged(
+        &proposer,
+        &proposer_path,
+        &incomplete_entry,
+        &proposer_before_db,
+        &proposer_before_control,
+    );
+    let before_db = fs::read(&missing_path).unwrap();
+    let before_control = fs::read(control_path(&missing_path)).unwrap();
+    assert_pair_unchanged(
+        &missing,
+        &missing_path,
+        &incomplete_entry,
+        &before_db,
+        &before_control,
+    );
+
+    let receipt_path = dir.path().join("receipt.lbug");
+    let receipt =
+        LadybugStateMachine::open(&receipt_path, "cluster-1", "node-receipt", 7, 3).unwrap();
+    proposer.apply_entry(&entry).unwrap();
+    receipt.apply_entry(&entry).unwrap();
+    let (_, second_request) = command("request-2", "document-2", 7);
+    let mut second = LadybugFileEffectV1::decode(
+        &proposer
+            .prepare_graph_effect(&second_request, 1, entry.hash)
+            .unwrap(),
+    )
+    .unwrap();
+    let second_target = dir.path().join("second-target.lbug");
+    apply_lgfx_to_exact_base(&proposer_path, &second_target, &second).unwrap();
+    let divergent_path = dir.path().join("divergent.lbug");
+    let divergent =
+        LadybugStateMachine::open(&divergent_path, "cluster-1", "node-divergent", 7, 3).unwrap();
+    second.base_db_digest = divergent.canonical_db_digest().unwrap();
+    second.base_file_bytes = fs::metadata(&divergent_path).unwrap().len();
+    second.chunks = full_chunks(&second_target);
+    second.chunks_digest = lgfx_chunks_digest(&second.chunks);
+    let second_entry = lgfx_entry(2, entry.hash, second.encode().unwrap());
+    let before_db = fs::read(&receipt_path).unwrap();
+    let before_control = fs::read(control_path(&receipt_path)).unwrap();
+    assert_pair_unchanged(
+        &receipt,
+        &receipt_path,
+        &second_entry,
+        &before_db,
+        &before_control,
+    );
 }
 
 #[test]
@@ -265,8 +499,71 @@ fn restart_reapplies_the_same_pending_effect_from_either_base_or_installed_targe
 
         let reopened = LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
         assert!(reopened.get_document("document-1").is_err());
+        assert!(reopened.materialized_tip().is_err());
+        assert_eq!(
+            reopened.reconciliation_base_state().unwrap(),
+            (
+                LogAnchor::new(0, LogHash::ZERO),
+                ConfigurationState::active(3, LogHash::ZERO),
+            )
+        );
         let outcome = reopened.apply_entry(&entry).unwrap();
         assert_eq!(outcome.applied_hash(), entry.hash);
+        assert_eq!(
+            reopened.get_document_with_tip("document-1").unwrap(),
+            (Some(GraphValueV1::U64(9)), 1, entry.hash)
+        );
+    }
+}
+
+#[test]
+fn restart_reapplies_bootstrap_pending_from_local_genesis_or_installed_target() {
+    for target_installed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let proposer_path = dir.path().join("proposer.lbug");
+        let follower_path = dir.path().join("follower.lbug");
+        let proposer =
+            LadybugStateMachine::open(&proposer_path, "cluster-1", "node-1", 7, 3).unwrap();
+        let follower =
+            LadybugStateMachine::open(&follower_path, "cluster-1", "node-2", 7, 3).unwrap();
+        let follower_digest = follower.canonical_db_digest().unwrap();
+        let (_, request) = command("request-1", "document-1", 9);
+        let encoded = proposer
+            .prepare_graph_effect(&request, 0, LogHash::ZERO)
+            .unwrap();
+        let effect = LadybugFileEffectV1::decode(&encoded).unwrap();
+        let entry = lgfx_entry(1, LogHash::ZERO, encoded);
+        drop(proposer);
+        drop(follower);
+
+        let pending = PendingApply::new(
+            LogAnchor::new(0, LogHash::ZERO),
+            LogAnchor::new(1, entry.hash),
+            follower_digest,
+            effect.target_db_digest,
+            effect.target_file_bytes,
+        );
+        let control = ControlStore::open_existing(control_path(&follower_path)).unwrap();
+        control.begin_pending(&pending).unwrap();
+        drop(control);
+
+        if target_installed {
+            let target = dir.path().join("installed.lbug");
+            apply_lgfx_to_exact_base(&proposer_path, &target, &effect).unwrap();
+            fs::rename(target, &follower_path).unwrap();
+        }
+
+        let reopened =
+            LadybugStateMachine::open(&follower_path, "cluster-1", "node-2", 7, 3).unwrap();
+        assert!(reopened.materialized_tip().is_err());
+        assert_eq!(
+            reopened.reconciliation_base_state().unwrap(),
+            (
+                LogAnchor::new(0, LogHash::ZERO),
+                ConfigurationState::active(3, LogHash::ZERO),
+            )
+        );
+        reopened.apply_entry(&entry).unwrap();
         assert_eq!(
             reopened.get_document_with_tip("document-1").unwrap(),
             (Some(GraphValueV1::U64(9)), 1, entry.hash)

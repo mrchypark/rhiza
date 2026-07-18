@@ -344,6 +344,26 @@ impl ControlStore {
         pending_from(&*self.lock()?)
     }
 
+    pub(crate) fn has_receipts(&self) -> Result<bool> {
+        let exists: i64 = self
+            .lock()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM request_receipts LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error)?;
+        Ok(exists != 0)
+    }
+
+    pub(crate) fn committed_state(&self) -> Result<(LogAnchor, ConfigurationState)> {
+        let connection = self.lock()?;
+        Ok((
+            meta_anchor(&connection, "applied_tip")?,
+            meta_configuration(&connection)?,
+        ))
+    }
+
     pub fn lookup_request(
         &self,
         request_id: &str,

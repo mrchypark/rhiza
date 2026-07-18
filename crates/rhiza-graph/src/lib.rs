@@ -1165,6 +1165,16 @@ impl LadybugStateMachine {
         self.control.applied_tip()
     }
 
+    /// Returns the committed control base for startup qlog reconciliation.
+    ///
+    /// Unlike normal read APIs, this deliberately remains available while an
+    /// LGFX apply is pending so startup can redeliver the next committed qlog
+    /// entry. It must not be used for serving reads or creating snapshots.
+    pub fn reconciliation_base_state(&self) -> Result<(LogAnchor, ConfigurationState)> {
+        let _writer = self.lock_writer()?;
+        self.control.committed_state()
+    }
+
     pub fn configuration_state_value(&self) -> Result<ConfigurationState> {
         let _writer = self.lock_writer()?;
         self.ensure_no_pending_apply()?;
@@ -1358,6 +1368,10 @@ impl LadybugStateMachine {
                 "graph request was already materialized; use its receipt".into(),
             ));
         }
+        let first_graph_command = !self.control.has_receipts()?;
+        if first_graph_command {
+            self.validate_ladybug_logical_genesis()?;
+        }
         let identity = self.control.identity()?;
         let base_artifact = NamedTempFile::new_in(parent_dir(&self.path)).map_err(io_error)?;
         let staging_artifact = NamedTempFile::new_in(parent_dir(&self.path)).map_err(io_error)?;
@@ -1384,7 +1398,11 @@ impl LadybugStateMachine {
                     "closed Ladybug base digest does not match graph control".into(),
                 ));
             }
-            let chunks = diff_closed_ladybug_files(base_path, staging_path)?;
+            let chunks = if first_graph_command {
+                lgfx::full_closed_ladybug_file(staging_path)?
+            } else {
+                diff_closed_ladybug_files(base_path, staging_path)?
+            };
             let effect = LadybugFileEffectV1 {
                 cluster_id: identity.cluster_id().to_owned(),
                 epoch: identity.epoch(),
@@ -1558,15 +1576,18 @@ impl LadybugStateMachine {
                     "LGFX request receipt already belongs to an earlier entry".into(),
                 ));
             }
+            let divergent_base = effect.base_db_digest != identity.user_db_digest();
+            let first_graph_command = !self.control.has_receipts()?;
             let pending = PendingApply::new(
                 base,
                 target,
-                effect.base_db_digest,
+                identity.user_db_digest(),
                 effect.target_db_digest,
                 effect.target_file_bytes,
             );
+            self.validate_lgfx_apply_mode(&effect, &pending, first_graph_command, divergent_base)?;
             self.control.begin_pending(&pending)?;
-            self.install_lgfx_effect(&effect)?;
+            self.install_lgfx_effect(&effect, divergent_base)?;
             let receipt = RequestReceipt::new(
                 &effect.request_id,
                 effect.request_digest,
@@ -1602,7 +1623,136 @@ impl LadybugStateMachine {
         })
     }
 
-    fn install_lgfx_effect(&self, effect: &LadybugFileEffectV1) -> Result<()> {
+    fn validate_lgfx_apply_mode(
+        &self,
+        effect: &LadybugFileEffectV1,
+        pending: &PendingApply,
+        first_graph_command: bool,
+        divergent_base: bool,
+    ) -> Result<()> {
+        let existing_pending = self.control.pending()?;
+        if existing_pending
+            .as_ref()
+            .is_some_and(|existing| existing != pending)
+        {
+            return Err(Error::InvalidEntry(
+                "a different LGFX apply is already pending".into(),
+            ));
+        }
+        if first_graph_command && !effect.fully_covers_target() {
+            return Err(Error::InvalidEntry(
+                "first LGFX command requires a full target image".into(),
+            ));
+        }
+        if !first_graph_command && divergent_base {
+            return Err(Error::InvalidEntry(
+                "LGFX after bootstrap requires the exact committed base".into(),
+            ));
+        }
+
+        self.close_database_cleanly()?;
+        let inspected = (|| {
+            Ok((
+                lgfx::file_digest(&self.path)?,
+                fs::metadata(&self.path).map_err(io_error)?.len(),
+            ))
+        })();
+        let reopen = self.reopen_database();
+        let (digest, bytes) = match (inspected, reopen) {
+            (Err(error), _) | (Ok(_), Err(error)) => return Err(error),
+            (Ok(identity), Ok(())) => identity,
+        };
+
+        if digest == effect.target_db_digest && bytes == effect.target_file_bytes {
+            if existing_pending.as_ref() == Some(pending) {
+                return Ok(());
+            }
+            return Err(Error::InvalidEntry(
+                "LGFX target bytes exist without the matching pending intent".into(),
+            ));
+        }
+        if !first_graph_command {
+            if digest == effect.base_db_digest && bytes == effect.base_file_bytes {
+                return Ok(());
+            }
+            return Err(Error::InvalidEntry(
+                "canonical Ladybug file does not match the exact LGFX base".into(),
+            ));
+        }
+        if digest != pending.base_db_digest() {
+            return Err(Error::InvalidEntry(
+                "first LGFX command does not match fresh local control".into(),
+            ));
+        }
+        self.validate_ladybug_logical_genesis()
+    }
+
+    fn validate_ladybug_logical_genesis(&self) -> Result<()> {
+        let guard = self.read_database()?;
+        let database = guard.as_ref().ok_or(Error::Closed)?;
+        let connection = Connection::new(database).map_err(ladybug_error)?;
+        let tables = connection
+            .query("CALL show_tables() RETURN name, type")
+            .map_err(ladybug_error)?
+            .collect::<Vec<_>>();
+        if tables
+            != vec![vec![
+                Value::String("RhizaDocument".into()),
+                Value::String("NODE".into()),
+            ]]
+        {
+            return Err(Error::InvalidEntry(
+                "divergent LGFX bootstrap requires exactly the RhizaDocument table".into(),
+            ));
+        }
+        let columns = connection
+            .query(
+                "CALL table_info('RhizaDocument') RETURN name, type, `default expression`, `primary key`",
+            )
+            .map_err(ladybug_error)?
+            .collect::<Vec<_>>();
+        let expected = [
+            ("id", "STRING", true),
+            ("kind", "UINT8", false),
+            ("bool_value", "BOOL", false),
+            ("i64_value", "INT64", false),
+            ("u64_value", "UINT64", false),
+            ("f64_value", "DOUBLE", false),
+            ("string_value", "STRING", false),
+            ("bytes_value", "BLOB", false),
+        ]
+        .into_iter()
+        .map(|(name, kind, primary)| {
+            vec![
+                Value::String(name.into()),
+                Value::String(kind.into()),
+                Value::String("NULL".into()),
+                Value::Bool(primary),
+            ]
+        })
+        .collect::<Vec<_>>();
+        if columns != expected {
+            return Err(Error::InvalidEntry(
+                "divergent LGFX bootstrap requires the exact RhizaDocument schema".into(),
+            ));
+        }
+        let rows = connection
+            .query("MATCH (d:RhizaDocument) RETURN count(d)")
+            .map_err(ladybug_error)?
+            .collect::<Vec<_>>();
+        if rows != vec![vec![Value::Int64(0)]] {
+            return Err(Error::InvalidEntry(
+                "divergent LGFX bootstrap requires zero RhizaDocument rows".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn install_lgfx_effect(
+        &self,
+        effect: &LadybugFileEffectV1,
+        divergent_base: bool,
+    ) -> Result<()> {
         self.close_database_cleanly()?;
         let install = (|| {
             let digest = lgfx::file_digest(&self.path)?;
@@ -1616,14 +1766,18 @@ impl LadybugStateMachine {
                 }
                 return Ok(());
             }
-            if digest != effect.base_db_digest {
+            if !divergent_base && digest != effect.base_db_digest {
                 return Err(Error::InvalidEntry(
                     "canonical Ladybug digest matches neither LGFX base nor target".into(),
                 ));
             }
             let temp_dir = tempfile::tempdir_in(parent_dir(&self.path)).map_err(io_error)?;
             let target = temp_dir.path().join("target.lbug");
-            apply_lgfx_to_exact_base(&self.path, &target, effect)?;
+            if divergent_base {
+                lgfx::apply_lgfx_full_image(&target, effect)?;
+            } else {
+                apply_lgfx_to_exact_base(&self.path, &target, effect)?;
+            }
             let verify = open_database(&target)?;
             let connection = Connection::new(&verify).map_err(ladybug_error)?;
             connection.query("RETURN 1").map_err(ladybug_error)?;
@@ -4962,7 +5116,7 @@ mod snapshot_tests {
         effect.target_file_bytes += LGFX_CHUNK_BYTES as u64;
 
         assert!(matches!(
-            state.install_lgfx_effect(&effect),
+            state.install_lgfx_effect(&effect, false),
             Err(Error::InvalidEntry(message)) if message.contains("target size")
         ));
     }

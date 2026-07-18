@@ -64,6 +64,15 @@ pub struct LadybugFileEffectV1 {
 }
 
 impl LadybugFileEffectV1 {
+    pub fn fully_covers_target(&self) -> bool {
+        self.chunks.len() as u64 == self.target_file_bytes / LGFX_CHUNK_BYTES as u64
+            && self
+                .chunks
+                .iter()
+                .enumerate()
+                .all(|(index, chunk)| chunk.chunk_index == index as u64)
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_nonempty_bounded("cluster_id", &self.cluster_id, MAX_ID_BYTES)?;
         validate_nonempty_bounded("request_id", &self.request_id, MAX_ID_BYTES)?;
@@ -224,6 +233,73 @@ pub fn diff_closed_ladybug_files(
         }
     }
     Ok(chunks)
+}
+
+pub(crate) fn full_closed_ladybug_file(path: impl AsRef<Path>) -> Result<Vec<LadybugFileChunkV1>> {
+    let path = path.as_ref();
+    require_clean(path)?;
+    let length = file_length(path)?;
+    validate_file_length("target", length)?;
+    let mut file = File::open(path).map_err(io_error)?;
+    let mut chunks = Vec::new();
+    for chunk_index in 0..length / LGFX_CHUNK_BYTES as u64 {
+        let mut after_image = vec![0; LGFX_CHUNK_BYTES];
+        file.read_exact(&mut after_image).map_err(io_error)?;
+        let captured_bytes = chunks
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(LGFX_CHUNK_BYTES))
+            .ok_or_else(|| Error::ResourceExhausted("LGFX full image bytes overflow".into()))?;
+        if captured_bytes > MAX_LGFX_V1_BYTES {
+            return exhausted("LGFX full image exceeds the envelope bound");
+        }
+        chunks.push(LadybugFileChunkV1 {
+            chunk_index,
+            after_image,
+        });
+    }
+    Ok(chunks)
+}
+
+pub(crate) fn apply_lgfx_full_image(
+    target_path: impl AsRef<Path>,
+    effect: &LadybugFileEffectV1,
+) -> Result<LogHash> {
+    effect.validate()?;
+    if !effect.fully_covers_target() {
+        return invalid("full-image install requires every target chunk");
+    }
+    let target_path = target_path.as_ref();
+    require_clean(target_path)?;
+    if path_present(target_path)? {
+        return invalid("target database already exists");
+    }
+    ensure_parent(target_path)?;
+    let parent = target_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent).map_err(io_error)?;
+    for chunk in &effect.chunks {
+        temporary.write_all(&chunk.after_image).map_err(io_error)?;
+    }
+    temporary
+        .as_file_mut()
+        .set_len(effect.target_file_bytes)
+        .map_err(io_error)?;
+    temporary.as_file().sync_all().map_err(io_error)?;
+    let target_digest = file_digest(temporary.path())?;
+    if target_digest != effect.target_db_digest {
+        return invalid("full-image digest does not match the target");
+    }
+    temporary.persist_noclobber(target_path).map_err(|error| {
+        if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::InvalidEntry("LGFX target already exists".into())
+        } else {
+            io_error(error.error)
+        }
+    })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(io_error)?;
+    Ok(target_digest)
 }
 
 /// Applies an LGFX effect only through a temporary clone of its exact base.
