@@ -7349,6 +7349,7 @@ mod tests {
 
     #[cfg(feature = "sql")]
     async fn sequential_cluster_start(recorder_transport: RecorderTransport) {
+        let _cluster_test_guard = sequential_cluster_test_lock().lock().await;
         let temp = tempfile::tempdir().unwrap();
         let recorder_addresses = [
             unused_local_address(),
@@ -7494,6 +7495,12 @@ mod tests {
         for address in &tcp_addresses {
             assert!(tokio::net::TcpStream::connect(address).await.is_err());
         }
+    }
+
+    #[cfg(feature = "sql")]
+    fn sequential_cluster_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[cfg(feature = "sql")]
