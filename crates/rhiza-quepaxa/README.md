@@ -146,9 +146,12 @@ and container provenance.
 python3 bench/run-recorder-sync-linux.py --pairs 12
 ```
 
-A 2026-07-17 Docker Desktop Linux/aarch64 diagnostic ran 12 balanced pairs,
-each with 100 warmups and 800 measured records. All 19,200 measured records
-succeeded. Median throughput was 2,983.9011487711614 ops/s for native
+The tracked 2026-07-17 Docker Desktop Linux/aarch64 results are a legacy
+diagnostic from an identical-command-per-slot harness. They predate the
+distinct-command workload and explicit command-mode methodology documented
+above, so they do not validate the current workload. That run used 12 balanced
+pairs, each with 100 warmups and 800 measured records. All 19,200 measured
+records succeeded. Median throughput was 2,983.9011487711614 ops/s for native
 `fdatasync` and 1,911.5215089204817 ops/s with the `fsync` preload. Dividing
 the aggregate medians gives 1.561008408666x. However, the median paired
 `fsync-preload/native` ratio was 0.9278500671968066, and each candidate won
@@ -159,7 +162,7 @@ paired result and win split remain mixed. All 12
 preload runs observed the expected 900 intercepts, and every run observed 900
 WAL frames in generation 1 without a checkpoint.
 
-The tracked artifacts are
+The legacy tracked artifacts are
 [`raw.jsonl`](../../docs/benchmarks/recorder-sync-linux-20260717/raw.jsonl)
 (24 rows, 49,782 bytes) and
 [`summary.json`](../../docs/benchmarks/recorder-sync-linux-20260717/summary.json)
@@ -168,18 +171,19 @@ container provenance. The QuePaxa source SHA-256 is
 `54ca511bd8be35e1b2deeb50a1f8f9ced66bb336194e4d7ba07c4473a9d60c1d`
 and the benchmark binary SHA-256 is
 `7bc075b29e7d49524ea51555b5cc95a0f6d1eea4b9eccff7d634caa27893459d`.
-Its recorded runner SHA-256
+The historical runner SHA-256 recorded by those artifacts is
 `bbe7d010c56fae73cc2d65d252093e2e547b4c191a8e14c9ccd7aa7454ed0b7d`
-matches the current runner. The fresh build provenance is retained under
-`target/recorder-sync-linux-build-final-v3-20260717`, and the runner's full-reuse
-gate verified it. The summary sets `production_valid=false`: measurements from
-a dirty tree remain diagnostic, and Docker Desktop's virtual filesystem cannot
-reproduce host power loss or the target CSI flush path. Linux `sync_data`
-remains a correctness-preserving candidate implementation of the smaller
-durability syscall. The aggregate Docker result is favorable, but paired
-performance is inconclusive and is not a production speedup claim. Production
-performance adoption requires clean physical crash/reopen and throughput/latency
-testing on the target ext4/XFS/CSI stack.
+and is retained only for historical provenance; it is not claimed to match the
+current runner. The artifacts record fresh build provenance under
+`target/recorder-sync-linux-build-final-v3-20260717` and record that the runner's
+full-reuse gate verified it. The summary sets `production_valid=false`:
+measurements from a dirty tree remain diagnostic, and Docker Desktop's virtual
+filesystem cannot reproduce host power loss or the target CSI flush path.
+Linux `sync_data` remains a correctness-preserving candidate implementation of
+the smaller durability syscall. The aggregate Docker result is favorable, but
+paired performance is inconclusive and is not a production speedup claim.
+Production performance adoption requires clean physical crash/reopen and
+throughput/latency testing on the target ext4/XFS/CSI stack.
 
 ## Compatibility policy
 

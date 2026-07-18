@@ -1908,9 +1908,6 @@ impl RecorderFileStore {
     }
 
     pub fn store_command(&self, command_hash: LogHash, command: StoredCommand) -> Result<()> {
-        if command.hash() != command_hash {
-            return Err(Error::CommandHashMismatch);
-        }
         let _guard = self
             .sync
             .lock()
@@ -1919,6 +1916,20 @@ impl RecorderFileStore {
     }
 
     fn store_command_unlocked(&self, command_hash: LogHash, command: &StoredCommand) -> Result<()> {
+        if command.hash() != command_hash {
+            return Err(Error::CommandHashMismatch);
+        }
+        {
+            let wal = self
+                .wal
+                .lock()
+                .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
+            match wal.commands.get(&command_hash) {
+                Some(existing) if existing == command => return Ok(()),
+                Some(_) => return Err(Error::CommandHashMismatch),
+                None => {}
+            }
+        }
         self.stage_command_unlocked(command_hash, command)?;
         self.sync_root()
     }
@@ -3954,6 +3965,13 @@ impl ThreeNodeConsensus {
         self.ensure_progress_command(&mut progress)?;
         let round = progress.step / 4;
         let phase = progress.step % 4;
+        if phase == 0 {
+            progress
+                .phase_zero_priorities
+                .retain(|(cached_round, _), _| *cached_round == round);
+        } else {
+            progress.phase_zero_priorities.clear();
+        }
         let command_targets: BTreeSet<_> = self
             .membership
             .members()
@@ -4043,6 +4061,7 @@ impl ThreeNodeConsensus {
                     progress.proposal = proposal.clone();
                 }
                 self.ensure_progress_command(&mut progress)?;
+                progress.phase_zero_priorities.clear();
                 return Ok(DriveOutcome::Progress(progress));
             }
         }
@@ -4136,6 +4155,7 @@ impl ThreeNodeConsensus {
         }
         self.ensure_progress_command(&mut progress)?;
         progress.step = progress.step.checked_add(1).ok_or(Error::ProposeFailed)?;
+        progress.phase_zero_priorities.clear();
         Ok(DriveOutcome::Progress(progress))
     }
 
@@ -6369,16 +6389,20 @@ mod tests {
         command_file_reads, decode_wal_frame, encode_stored_command, encode_wal_frame,
         last_file_sync_kind, reset_command_file_reads, reset_sync_counts, sync_counts,
         sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue, ConfigChange,
-        ConfigurationState, Consensus, ControlDispatch, ControlJob, Error, FileSyncKind,
-        Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress, RecordRequest,
-        RecordSummary, RecordedHeadProvenance, RecorderFileStore, RecorderRpc, RecorderSlotState,
-        RejectReason, SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
+        ConfigurationState, Consensus, ControlDispatch, ControlJob, DecisionProof, DriveOutcome,
+        Error, FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority,
+        ProposerProgress, RecordRequest, RecordSummary, RecordedHeadProvenance, RecorderFileStore,
+        RecorderRequest, RecorderRpc, RecorderSlotState, RecorderSummary, RejectReason,
+        SealFaultPoint, SingleNodeConsensus, ThreeNodeConsensus,
     };
     use proptest::prelude::*;
     use rhiza_core::{Command, CommandKind, EntryType, LogHash, StoredCommand};
     use std::{
         collections::{HashMap, HashSet},
-        sync::{mpsc, Arc, Condvar, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Condvar, Mutex,
+        },
         thread,
         time::Duration,
     };
@@ -6693,6 +6717,37 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CountingPrioritySource {
+        samples: AtomicUsize,
+    }
+
+    impl PrioritySource for CountingPrioritySource {
+        fn sample(
+            &self,
+            _slot: u64,
+            _round: u64,
+            _proposer_id: &str,
+            _recorder_id: &str,
+        ) -> super::Result<ProposalPriority> {
+            let sample = self.samples.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(ProposalPriority::from_u64(sample as u64))
+        }
+    }
+
+    struct CatchUpRecorder {
+        recorder_id: &'static str,
+        step: u64,
+    }
+
+    impl RecorderRpc for CatchUpRecorder {
+        fn record(&self, request: RecordRequest) -> super::Result<RecordSummary> {
+            let mut summary = record_summary(self.recorder_id, request);
+            summary.step = self.step;
+            Ok(summary)
+        }
+    }
+
     #[test]
     fn single_node_consensus_commits_contiguous_hash_chain() {
         let consensus = SingleNodeConsensus::new("cluster-a", 1, 1);
@@ -6746,7 +6801,108 @@ mod tests {
                 .insert((0, recorder_id.into()), ProposalPriority::from_u64(1));
         }
 
-        assert!(consensus.drive(progress).is_ok());
+        let DriveOutcome::Progress(progress) = consensus.drive(progress).unwrap() else {
+            panic!("phase zero quorum should advance progress");
+        };
+        assert!(progress.phase_zero_priorities.is_empty());
+    }
+
+    #[test]
+    fn phase_zero_priorities_are_stable_only_for_pending_retries_in_the_current_round() {
+        let source = Arc::new(CountingPrioritySource::default());
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "writer",
+            1,
+            1,
+            vec![
+                (
+                    "n1".into(),
+                    Box::new(SlotRecorder {
+                        recorder_id: "n1",
+                        reject_slot: None,
+                        observed: None,
+                    }) as Box<dyn RecorderRpc>,
+                ),
+                ("n2".into(), Box::new(AlwaysIoRecorder)),
+                ("n3".into(), Box::new(AlwaysIoRecorder)),
+            ],
+        )
+        .unwrap()
+        .with_priority_source(source.clone());
+        let command = StoredCommand::new(EntryType::Command, b"bounded-priorities".to_vec());
+        let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
+        let mut progress =
+            ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "writer", 1, value))
+                .with_command(command);
+        progress.step = 0;
+
+        let DriveOutcome::Pending(mut progress) = consensus.drive(progress).unwrap() else {
+            panic!("one recorder reply should leave progress pending");
+        };
+        assert_eq!(progress.phase_zero_priorities.len(), 3);
+        assert_eq!(source.samples.load(Ordering::Relaxed), 3);
+
+        let DriveOutcome::Pending(retry) = consensus.drive(progress.clone()).unwrap() else {
+            panic!("same-round retry should remain pending");
+        };
+        assert_eq!(retry.phase_zero_priorities, progress.phase_zero_priorities);
+        assert_eq!(source.samples.load(Ordering::Relaxed), 3);
+
+        for round in 1..=64 {
+            progress.step = round * 4;
+            let DriveOutcome::Pending(next) = consensus.drive(progress).unwrap() else {
+                panic!("one recorder reply should leave progress pending");
+            };
+            assert_eq!(next.phase_zero_priorities.len(), 3);
+            assert!(next
+                .phase_zero_priorities
+                .keys()
+                .all(|(cached_round, _)| *cached_round == round));
+            progress = next;
+        }
+        assert_eq!(source.samples.load(Ordering::Relaxed), 3 * 65);
+    }
+
+    #[test]
+    fn phase_zero_priorities_are_cleared_when_progress_catches_up() {
+        let consensus = ThreeNodeConsensus::from_recorders_with_ids(
+            "cluster",
+            "writer",
+            1,
+            1,
+            ["n1", "n2", "n3"]
+                .into_iter()
+                .map(|recorder_id| {
+                    (
+                        recorder_id.into(),
+                        Box::new(CatchUpRecorder {
+                            recorder_id,
+                            step: 8,
+                        }) as Box<dyn RecorderRpc>,
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+        .with_priority_source(Arc::new(FailingPrioritySource));
+        let command = StoredCommand::new(EntryType::Command, b"catch-up".to_vec());
+        let value = AcceptedValue::from_command("cluster", 1, 1, 1, LogHash::ZERO, &command);
+        let mut progress =
+            ProposerProgress::new(1, Proposal::new(ProposalPriority::MAX, "writer", 1, value))
+                .with_command(command);
+        progress.step = 0;
+        for recorder_id in ["n1", "n2", "n3"] {
+            progress
+                .phase_zero_priorities
+                .insert((0, recorder_id.into()), ProposalPriority::from_u64(1));
+        }
+
+        let DriveOutcome::Progress(progress) = consensus.drive(progress).unwrap() else {
+            panic!("higher recorder steps should catch progress up");
+        };
+        assert_eq!(progress.step, 8);
+        assert!(progress.phase_zero_priorities.is_empty());
     }
 
     #[test]
@@ -6818,6 +6974,174 @@ mod tests {
             .unwrap();
 
         assert_eq!(sync_counts(), (1, 0));
+    }
+
+    #[test]
+    fn wal_durable_command_store_adds_no_sync_and_survives_proof_checkpoint_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"proof-worker-command".to_vec());
+        let command_hash = command.hash();
+        let value = AcceptedValue::from_command("cluster", 8, 1, 1, LogHash::ZERO, &command);
+        let proposal = Proposal::new(ProposalPriority::MAX, "writer", 1, value);
+        let proof = DecisionProof::FastPath {
+            cluster_id: "cluster".into(),
+            slot: 8,
+            epoch: 1,
+            config_id: 1,
+            config_digest: membership.digest(),
+            proposal: proposal.clone(),
+            summaries: ["n1", "n2"]
+                .into_iter()
+                .map(|recorder_id| RecorderSummary {
+                    recorder_id: recorder_id.into(),
+                    slot: 8,
+                    step: 4,
+                    first_current: Some(proposal.clone()),
+                    aggregate_prior: None,
+                })
+                .collect(),
+        };
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        store
+            .record_proposal(RecordRequest {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 8,
+                step: 4,
+                proposal,
+                command: Some(command.clone()),
+            })
+            .unwrap();
+
+        reset_sync_counts();
+        RecorderRpc::store_command_for(
+            &store,
+            "cluster".into(),
+            1,
+            1,
+            membership.digest(),
+            command_hash,
+            command.clone(),
+        )
+        .unwrap();
+        assert_eq!(sync_counts(), (0, 0));
+        assert!(!store.command_path(command_hash).exists());
+
+        store
+            .install_decision_proof_record(proof.clone(), &membership)
+            .unwrap();
+        drop(store);
+
+        let reopened = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.fetch_command(command_hash).unwrap(),
+            Some(command.clone())
+        );
+        assert_eq!(reopened.load(8).unwrap().decision_proof(), Some(&proof));
+        reopened.checkpoint_wal_unlocked().unwrap();
+        assert!(reopened.command_path(command_hash).exists());
+        drop(reopened);
+
+        let checkpointed =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        assert_eq!(
+            checkpointed.fetch_command(command_hash).unwrap(),
+            Some(command)
+        );
+        assert_eq!(checkpointed.load(8).unwrap().decision_proof(), Some(&proof));
+    }
+
+    #[test]
+    fn duplicate_command_file_store_keeps_the_root_directory_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"durable-command".to_vec());
+        store
+            .store_command(command.hash(), command.clone())
+            .unwrap();
+        reset_sync_counts();
+
+        store.store_command(command.hash(), command).unwrap();
+
+        assert_eq!(sync_counts(), (0, 1));
+    }
+
+    #[test]
+    fn direct_store_command_rejects_a_claimed_hash_without_creating_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "cluster",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"mismatched-hash".to_vec());
+        let claimed_hash = LogHash::digest(&[b"claimed-hash"]);
+
+        assert_eq!(
+            store.apply(RecorderRequest::StoreCommand {
+                cluster_id: "cluster".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                command_hash: claimed_hash,
+                command,
+            }),
+            Err(Error::CommandHashMismatch)
+        );
+        assert!(!store.command_path(claimed_hash).exists());
+    }
+
+    #[test]
+    fn wal_command_store_rejects_conflicting_bytes_without_syncing() {
+        let root = tempfile::tempdir().unwrap();
+        let membership = Membership::new(["n1", "n2", "n3"]).unwrap();
+        let store =
+            RecorderFileStore::new_with_membership(root.path(), "n1", "cluster", 1, 1, membership)
+                .unwrap();
+        let command = StoredCommand::new(EntryType::Command, b"expected".to_vec());
+        let conflicting = StoredCommand::new(EntryType::Command, b"conflicting".to_vec());
+        store
+            .wal
+            .lock()
+            .unwrap()
+            .commands
+            .insert(command.hash(), conflicting);
+        reset_sync_counts();
+
+        assert_eq!(
+            store.store_command(command.hash(), command.clone()),
+            Err(Error::CommandHashMismatch)
+        );
+        assert_eq!(sync_counts(), (0, 0));
+        assert!(!store.command_path(command.hash()).exists());
     }
 
     #[test]
