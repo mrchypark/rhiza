@@ -479,6 +479,55 @@ impl RecorderRpc for BlockingStoreOnce {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn postcard_rpc_control_lane_progresses_while_command_store_is_blocked() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let store_count = Arc::new(AtomicUsize::new(0));
+    let (address, server) = server(BlockingStoreOnce {
+        started: started_tx,
+        release: Arc::clone(&release),
+        stores: Arc::clone(&store_count),
+    })
+    .await;
+    let client = Arc::new(client(address));
+    let stores = (0..8)
+        .map(|index| {
+            let client = Arc::clone(&client);
+            thread::spawn(move || {
+                let command = StoredCommand::new(
+                    EntryType::Command,
+                    format!("blocked-store-{index}").into_bytes(),
+                );
+                client.store_command_for(
+                    "rhiza:sql:cluster-a".into(),
+                    1,
+                    1,
+                    Membership::new(["node-1", "node-2", "node-3"])
+                        .unwrap()
+                        .digest(),
+                    command.hash(),
+                    command,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for _ in 0..stores.len() {
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    let identity = client.recorder_id();
+    let (released, ready) = &*release;
+    *released.lock().unwrap() = true;
+    ready.notify_all();
+    assert_eq!(identity.unwrap(), "node-1");
+    for store in stores {
+        assert!(store.join().unwrap().is_ok());
+    }
+    assert_eq!(store_count.load(Ordering::SeqCst), 8);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn postcard_rpc_does_not_replay_a_mutation_after_session_failure_and_later_reconnects() {
     let (started_tx, started_rx) = mpsc::channel();
     let release = Arc::new((Mutex::new(false), Condvar::new()));
