@@ -3964,12 +3964,19 @@ impl ThreeNodeConsensus {
                 .ok_or(Error::CommandUnavailable)?,
         };
         if command.entry_type != EntryType::ConfigChange && !transition_involved {
-            for worker in &self.proof_workers {
+            let Some((last_worker, other_workers)) = self.proof_workers.split_last() else {
+                return Err(Error::NoQuorum);
+            };
+            for worker in other_workers {
                 worker.dispatch(ProofJob {
                     proof: proof.clone(),
                     command: command.clone(),
                 });
             }
+            last_worker.dispatch(ProofJob {
+                proof: proof.clone(),
+                command,
+            });
             return Ok(DriveOutcome::Decision(proof));
         }
         self.install_decision_proof_quorum(proof.clone())?;

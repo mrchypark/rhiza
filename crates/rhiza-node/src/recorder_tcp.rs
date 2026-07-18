@@ -290,6 +290,7 @@ where
     R: RecorderRpc + Clone + Send + Sync + 'static,
     F: Future<Output = ()> + Send,
 {
+    let peers: Arc<[PeerConfig]> = peers.into();
     let slots = Arc::new(tokio::sync::Semaphore::new(DEFAULT_PEER_CONCURRENCY));
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_SERVER_CONNECTIONS));
     let reported_connection_error = Arc::new(AtomicBool::new(false));
@@ -351,7 +352,7 @@ where
 async fn serve_connection<R, S>(
     mut stream: S,
     recorder: R,
-    peers: Vec<PeerConfig>,
+    peers: Arc<[PeerConfig]>,
     recovery_generation: u64,
     slots: Arc<tokio::sync::Semaphore>,
 ) -> Result<(), String>
@@ -423,7 +424,7 @@ where
             permit,
             dispatch_deadline,
             hello.node_id.clone(),
-            peers.clone(),
+            Arc::clone(&peers),
         )
         .await;
         write_value_async_with_timeout(
@@ -446,7 +447,7 @@ async fn dispatch_with_deadline<R>(
     permit: tokio::sync::OwnedSemaphorePermit,
     deadline: Instant,
     authenticated_peer_id: String,
-    peers: Vec<PeerConfig>,
+    peers: Arc<[PeerConfig]>,
 ) -> RecorderResponseBody
 where
     R: RecorderRpc + Send + Sync + 'static,
@@ -1636,7 +1637,7 @@ mod tests {
             permit,
             Instant::now() - Duration::from_millis(1),
             "node-1".into(),
-            peers(),
+            peers().into(),
         )
         .await;
 
@@ -1659,7 +1660,7 @@ mod tests {
             CountingMutation {
                 calls: Arc::clone(&calls),
             },
-            peers(),
+            peers().into(),
             7,
             slots,
         ));
