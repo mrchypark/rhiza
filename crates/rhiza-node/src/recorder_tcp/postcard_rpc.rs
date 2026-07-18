@@ -1052,7 +1052,7 @@ impl RecorderRpc for TcpPostcardRpcRecorderClient {
                 command_hash,
                 command,
             },
-            false,
+            true,
         )? {
             RecorderResponseBody::StoreCommand(result) => result.into_result(),
             _ => Err(Error::Decode("recorder response operation mismatch".into())),

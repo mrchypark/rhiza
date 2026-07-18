@@ -826,6 +826,10 @@ impl RecorderRpc for SlowRecorder {
         self.inner.inspect_decision_proof(slot)
     }
 
+    fn inspect_record_summary(&self, slot: u64) -> rhiza_quepaxa::Result<Option<RecordSummary>> {
+        self.inner.inspect_record_summary(slot)
+    }
+
     fn uses_typed_protocol(&self) -> bool {
         true
     }
