@@ -7468,7 +7468,10 @@ mod tests {
             wait_until_ready(address).await;
         }
         let committed = request_write(&WriteArgs {
-            urls: vec![format!("http://{}", client_addresses[0])],
+            urls: client_addresses
+                .iter()
+                .map(|address| format!("http://{address}"))
+                .collect(),
             token: "client-secret".into(),
             request_id: format!("integration-{recorder_transport:?}"),
             key: "transport".into(),
