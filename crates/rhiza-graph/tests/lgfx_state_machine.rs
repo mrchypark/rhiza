@@ -167,6 +167,72 @@ fn rhgs_v2_restores_clean_bytes_replicated_tip_and_receipt_to_another_node() {
 }
 
 #[test]
+fn nondefault_recovery_generation_survives_reopen_and_snapshot_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.lbug");
+    let target_path = dir.path().join("target.lbug");
+    let configuration = ConfigurationState::active(3, LogHash::ZERO);
+
+    let source = LadybugStateMachine::open_with_configuration(
+        &source_path,
+        "cluster-1",
+        "node-1",
+        7,
+        configuration.clone(),
+        42,
+    )
+    .unwrap();
+    assert_eq!(
+        ControlStore::open_existing(control_path(&source_path))
+            .unwrap()
+            .recovery_generation()
+            .unwrap(),
+        42
+    );
+    let snapshot = source.create_snapshot(0).unwrap();
+    drop(source);
+
+    assert!(matches!(
+        LadybugStateMachine::open_with_configuration(
+            &source_path,
+            "cluster-1",
+            "node-1",
+            7,
+            configuration.clone(),
+            41,
+        ),
+        Err(Error::IdentityMismatch(reason)) if reason == "recovery_generation"
+    ));
+    LadybugStateMachine::open_with_configuration(
+        &source_path,
+        "cluster-1",
+        "node-1",
+        7,
+        configuration.clone(),
+        42,
+    )
+    .unwrap();
+
+    restore_snapshot_file(&target_path, &snapshot, "node-2").unwrap();
+    LadybugStateMachine::open_with_configuration(
+        &target_path,
+        "cluster-1",
+        "node-2",
+        7,
+        configuration,
+        42,
+    )
+    .unwrap();
+    assert_eq!(
+        ControlStore::open_existing(control_path(&target_path))
+            .unwrap()
+            .recovery_generation()
+            .unwrap(),
+        42
+    );
+}
+
+#[test]
 fn restart_reapplies_the_same_pending_effect_from_either_base_or_installed_target() {
     for target_installed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -220,6 +286,7 @@ fn noop_and_configuration_entries_change_only_replicated_control_and_survive_sna
         "node-1",
         7,
         ConfigurationState::active(3, config_digest),
+        1,
     )
     .unwrap();
     let original_bytes = fs::read(&source_path).unwrap();

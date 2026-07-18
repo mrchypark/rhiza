@@ -984,6 +984,7 @@ impl LadybugStateMachine {
             node_id,
             epoch,
             ConfigurationState::active(config_id, LogHash::ZERO),
+            1,
         )
     }
 
@@ -993,6 +994,7 @@ impl LadybugStateMachine {
         node_id: &str,
         epoch: u64,
         configuration_state: ConfigurationState,
+        recovery_generation: u64,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         ensure_parent(&path)?;
@@ -1005,8 +1007,15 @@ impl LadybugStateMachine {
                 node_id,
                 epoch,
                 configuration_state,
+                recovery_generation,
             ),
-            (true, true) => Self::open_existing_pair(&path, cluster_id, node_id, epoch),
+            (true, true) => Self::open_existing_pair(
+                &path,
+                cluster_id,
+                node_id,
+                epoch,
+                recovery_generation,
+            ),
             (true, false) => Err(Error::IdentityMismatch(
                 "graph control sidecar is missing; restore an RHGS v2 snapshot instead of auto-migrating"
                     .into(),
@@ -1023,6 +1032,7 @@ impl LadybugStateMachine {
         node_id: &str,
         epoch: u64,
         configuration_state: ConfigurationState,
+        recovery_generation: u64,
     ) -> Result<Self> {
         let control_path = control_sidecar_path(path);
         OpenOptions::new()
@@ -1054,7 +1064,7 @@ impl LadybugStateMachine {
                     node_id,
                     epoch,
                     configuration_state,
-                    1,
+                    recovery_generation,
                     graph_materializer_fingerprint(),
                     digest,
                 ),
@@ -1083,6 +1093,7 @@ impl LadybugStateMachine {
         cluster_id: &str,
         node_id: &str,
         epoch: u64,
+        recovery_generation: u64,
     ) -> Result<Self> {
         require_regular_file(path, "canonical Ladybug database")?;
         require_regular_file(
@@ -1101,6 +1112,9 @@ impl LadybugStateMachine {
         }
         if persisted.epoch() != epoch {
             return Err(Error::IdentityMismatch("epoch".into()));
+        }
+        if persisted.recovery_generation() != recovery_generation {
+            return Err(Error::IdentityMismatch("recovery_generation".into()));
         }
         if persisted.materializer_fingerprint() != graph_materializer_fingerprint() {
             return Err(Error::IdentityMismatch(
@@ -4859,6 +4873,7 @@ mod snapshot_tests {
                     "node-1",
                     7,
                     ConfigurationState::active(3, LogHash::ZERO),
+                    1,
                 )
                 .is_ok()
             }));
@@ -4898,6 +4913,7 @@ mod snapshot_tests {
             "node-1",
             7,
             ConfigurationState::active(3, LogHash::ZERO),
+            1,
         )
         .is_err());
         assert_eq!(fs::read(&control_path).unwrap(), before);
