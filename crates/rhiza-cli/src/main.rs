@@ -2377,6 +2377,9 @@ async fn before_shutdown_deadline<T>(
     timeout: Duration,
     future: impl std::future::Future<Output = T>,
 ) -> Result<T, String> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(shutdown_deadline_error(timeout));
+    }
     tokio::time::timeout_at(deadline, future)
         .await
         .map_err(|_| shutdown_deadline_error(timeout))
@@ -7402,6 +7405,20 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("final checkpoint durability is unconfirmed"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sql")]
+    async fn shutdown_deadline_rejects_ready_work_when_budget_is_already_exhausted() {
+        let timeout = Duration::from_millis(10);
+        let result = before_shutdown_deadline(
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            timeout,
+            std::future::ready(()),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), shutdown_deadline_error(timeout));
     }
 
     #[tokio::test]

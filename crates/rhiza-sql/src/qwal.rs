@@ -337,29 +337,28 @@ pub(crate) fn diff_closed_databases_from_candidates(
     for page_no in 1..=target_pages {
         target.read_exact(&mut target_page).map_err(io_error)?;
         target_hasher.update(&target_page);
-        if candidate_pages.binary_search(&page_no).is_err() {
-            continue;
-        }
         let base_has_page = page_no <= base_pages;
         if base_has_page {
-            base.seek(SeekFrom::Start((page_no - 1) * u64::from(base_page_size)))
-                .map_err(io_error)?;
             base.read_exact(&mut base_page).map_err(io_error)?;
         }
-        if !base_has_page || base_page != target_page {
-            changed_bytes = changed_bytes
-                .checked_add(page_size)
-                .ok_or_else(|| Error::ResourceExhausted("QWAL diff size overflows".into()))?;
-            if changed_bytes > MAX_QWAL_V2_BYTES {
-                return Err(Error::ResourceExhausted(format!(
-                    "QWAL changed pages exceed {MAX_QWAL_V2_BYTES} bytes"
-                )));
-            }
-            pages.push(QwalPageV2 {
-                page_no,
-                after_image: target_page.clone(),
-            });
+        if base_has_page && base_page == target_page {
+            continue;
         }
+        if candidate_pages.binary_search(&page_no).is_err() {
+            return invalid("QWAL candidate recording omitted a changed target page");
+        }
+        changed_bytes = changed_bytes
+            .checked_add(page_size)
+            .ok_or_else(|| Error::ResourceExhausted("QWAL diff size overflows".into()))?;
+        if changed_bytes > MAX_QWAL_V2_BYTES {
+            return Err(Error::ResourceExhausted(format!(
+                "QWAL changed pages exceed {MAX_QWAL_V2_BYTES} bytes"
+            )));
+        }
+        pages.push(QwalPageV2 {
+            page_no,
+            after_image: target_page.clone(),
+        });
     }
     Ok((pages, LogHash::from_bytes(target_hasher.finalize().into())))
 }
@@ -649,6 +648,17 @@ mod tests {
         write_pages(&target, 512, &[1, 2]);
 
         assert!(diff_closed_databases_from_candidates(&base, &target, &[]).is_err());
+    }
+
+    #[test]
+    fn candidate_diff_fails_closed_when_changed_existing_page_was_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        let target = dir.path().join("target.db");
+        write_pages(&base, 512, &[1, 2, 3]);
+        write_pages(&target, 512, &[1, 9, 3]);
+
+        assert!(diff_closed_databases_from_candidates(&base, &target, &[1, 3]).is_err());
     }
 
     #[test]
