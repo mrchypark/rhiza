@@ -417,38 +417,51 @@ async fn sql_http_executes_atomic_ddl_dml_and_queries_typed_rows_with_barrier() 
     )
     .await;
 
-    for (request_id, sql, parameters) in [
-        ("sql-select-as-write", "SELECT name FROM users", Vec::new()),
-        (
-            "sql-constraint-failure",
-            "INSERT INTO users(id, name) VALUES (?1, ?2)",
-            vec![SqlValue::Integer(1), SqlValue::Text("Grace".into())],
-        ),
-    ] {
-        let rejected = client
-            .post(format!("http://{addr}{SQL_EXECUTE_PATH}"))
-            .header(VERSION_HEADER, PROTOCOL_VERSION)
-            .bearer_auth("client-token")
-            .json(&SqlExecuteRequest {
-                request_id: request_id.into(),
-                statements: vec![SqlStatement {
-                    sql: sql.into(),
-                    parameters,
-                }],
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_client_error(
-            rejected,
-            reqwest::StatusCode::BAD_REQUEST,
-            "invalid_request",
-            false,
-            Some(0),
-        )
-        .await;
-        assert!(runtime.is_ready());
-    }
+    let readonly = SqlExecuteRequest {
+        request_id: "sql-readonly-execute".into(),
+        statements: vec![SqlStatement {
+            sql: "SELECT name FROM users".into(),
+            parameters: vec![],
+        }],
+    };
+    let readonly_first = post_sql_execute(&client, addr, &readonly).await;
+    assert!(readonly_first.status().is_success());
+    let readonly_first = readonly_first.json::<SqlExecuteResponse>().await.unwrap();
+    assert_eq!(readonly_first.results[0].rows_affected, 0);
+    let returning = readonly_first.results[0].returning.as_ref().unwrap();
+    assert_eq!(returning.columns, ["name"]);
+    assert_eq!(returning.rows, [[SqlValue::Text("Ada".into())]]);
+    runtime
+        .write("between-readonly-retries", "receipt", "preserved")
+        .unwrap();
+    let readonly_replay = post_sql_execute(&client, addr, &readonly)
+        .await
+        .json::<SqlExecuteResponse>()
+        .await
+        .unwrap();
+    assert_eq!(readonly_replay, readonly_first);
+
+    let constraint_failure = post_sql_execute(
+        &client,
+        addr,
+        &SqlExecuteRequest {
+            request_id: "sql-constraint-failure".into(),
+            statements: vec![SqlStatement {
+                sql: "INSERT INTO users(id, name) VALUES (?1, ?2)".into(),
+                parameters: vec![SqlValue::Integer(1), SqlValue::Text("Grace".into())],
+            }],
+        },
+    )
+    .await;
+    assert_client_error(
+        constraint_failure,
+        reqwest::StatusCode::BAD_REQUEST,
+        "invalid_request",
+        false,
+        Some(0),
+    )
+    .await;
+    assert!(runtime.is_ready());
 
     let second_statement_failure = client
         .post(format!("http://{addr}{SQL_EXECUTE_PATH}"))

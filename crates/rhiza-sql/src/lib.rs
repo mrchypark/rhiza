@@ -49,8 +49,8 @@ CREATE TABLE IF NOT EXISTS __rhiza_kv (
 const SQL_COMMAND_V2_MAGIC: &[u8] = b"QSQL\0\x02";
 const SQL_RESULT_V1_MAGIC: &[u8] = b"QRES\0\x01";
 const QWAL_SNAPSHOT_V3_MAGIC: &[u8] = b"QSNP\0\x04";
-const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v3-policy-v7-page-state";
-const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v3;wal_autocheckpoint=0;canonical_synchronous=OFF;control_synchronous=OFF;page_state_cache=rebuildable;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=denied;attach=denied;vtable=denied";
+const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v3-policy-v8-compat";
+const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v3;wal_autocheckpoint=0;canonical_synchronous=OFF;control_synchronous=OFF;page_state_cache=rebuildable;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=command_scoped;attach=denied;vtable=bundled";
 pub const MAX_SQL_STATEMENTS: usize = 64;
 pub const MAX_SQL_PARAMETERS: usize = 999;
 pub const MAX_SQL_TEXT_BYTES: usize = 64 * 1024;
@@ -2984,11 +2984,6 @@ fn execute_sql_statements(
         let mut returning_bytes = 0usize;
         for operation in statements {
             let mut statement = conn.prepare(&operation.sql).map_err(sqlite_error)?;
-            if statement.readonly() {
-                return Err(Error::InvalidCommand(
-                    "replicated SQL statements must mutate the database".into(),
-                ));
-            }
             let column_count = statement.column_count();
             let total_changes_before = conn.total_changes();
             let returning = if column_count == 0 {
@@ -3047,6 +3042,7 @@ fn execute_sql_statements(
                 returning,
             });
         }
+        validate_temp_schema_empty(conn)?;
         Ok(SqlCommandResult { statement_results })
     })?;
     validate_reserved_schema(conn)?;
@@ -3155,12 +3151,18 @@ fn with_sql_authorizer<T>(
 }
 
 fn authorize_sql(context: AuthContext<'_>, mode: SqlAuthorizationMode) -> Authorization {
-    if context.database_name.is_some_and(|name| name != "main") {
+    if context.database_name.is_some_and(|name| {
+        name != "main" && !(mode == SqlAuthorizationMode::PhysicalWrite && name == "temp")
+    }) {
         return Authorization::Deny;
     }
     match context.action {
         AuthAction::Unknown { .. }
-        | AuthAction::CreateTempIndex { .. }
+        | AuthAction::Transaction { .. }
+        | AuthAction::Attach { .. }
+        | AuthAction::Detach { .. }
+        | AuthAction::Savepoint { .. } => Authorization::Deny,
+        AuthAction::CreateTempIndex { .. }
         | AuthAction::CreateTempTable { .. }
         | AuthAction::CreateTempTrigger { .. }
         | AuthAction::CreateTempView { .. }
@@ -3168,21 +3170,22 @@ fn authorize_sql(context: AuthContext<'_>, mode: SqlAuthorizationMode) -> Author
         | AuthAction::DropTempTable { .. }
         | AuthAction::DropTempTrigger { .. }
         | AuthAction::DropTempView { .. }
-        | AuthAction::Transaction { .. }
-        | AuthAction::Attach { .. }
-        | AuthAction::Detach { .. }
-        | AuthAction::CreateVtable { .. }
-        | AuthAction::DropVtable { .. }
-        | AuthAction::Savepoint { .. } => Authorization::Deny,
-        AuthAction::Pragma {
-            pragma_name,
-            pragma_value,
-        } if mode == SqlAuthorizationMode::ReadOnly
-            && observational_pragma(pragma_name, pragma_value) =>
+            if mode == SqlAuthorizationMode::PhysicalWrite =>
         {
             Authorization::Allow
         }
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } if authorized_pragma(mode, pragma_name, pragma_value) => Authorization::Allow,
         AuthAction::Pragma { .. } => Authorization::Deny,
+        AuthAction::CreateVtable { module_name, .. }
+        | AuthAction::DropVtable { module_name, .. }
+            if mode == SqlAuthorizationMode::PhysicalWrite && bundled_vtable(module_name) =>
+        {
+            Authorization::Allow
+        }
+        AuthAction::CreateVtable { .. } | AuthAction::DropVtable { .. } => Authorization::Deny,
         AuthAction::Function { function_name } if unsafe_sql_function(function_name) => {
             Authorization::Deny
         }
@@ -3224,6 +3227,23 @@ fn authorize_sql(context: AuthContext<'_>, mode: SqlAuthorizationMode) -> Author
     }
 }
 
+fn authorized_pragma(mode: SqlAuthorizationMode, name: &str, value: Option<&str>) -> bool {
+    if observational_pragma(name, value) {
+        return true;
+    }
+    mode == SqlAuthorizationMode::PhysicalWrite
+        && ((matches_ignore_ascii_case(name, &["application_id", "user_version"])
+            && value.is_some())
+            || (name.eq_ignore_ascii_case("optimize")
+                && value.is_none_or(|value| {
+                    value.parse::<u32>().is_ok()
+                        || value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                            .is_some_and(|hex| u32::from_str_radix(hex, 16).is_ok())
+                })))
+}
+
 fn observational_pragma(name: &str, value: Option<&str>) -> bool {
     const ARGUMENT_SAFE: &[&str] = &[
         "foreign_key_check",
@@ -3238,17 +3258,52 @@ fn observational_pragma(name: &str, value: Option<&str>) -> bool {
         "table_xinfo",
     ];
     const NO_ARGUMENT_ONLY: &[&str] = &[
+        "analysis_limit",
         "application_id",
+        "auto_vacuum",
+        "automatic_index",
+        "busy_timeout",
+        "cache_size",
+        "cache_spill",
+        "case_sensitive_like",
+        "cell_size_check",
+        "checkpoint_fullfsync",
         "collation_list",
         "compile_options",
+        "count_changes",
         "data_version",
+        "default_cache_size",
+        "defer_foreign_keys",
+        "empty_result_callbacks",
         "encoding",
         "freelist_count",
+        "foreign_keys",
+        "full_column_names",
+        "fullfsync",
         "function_list",
+        "hard_heap_limit",
+        "ignore_check_constraints",
+        "journal_size_limit",
+        "legacy_alter_table",
+        "locking_mode",
+        "max_page_count",
+        "mmap_size",
         "module_list",
         "page_count",
+        "page_size",
         "pragma_list",
+        "query_only",
+        "read_uncommitted",
+        "recursive_triggers",
+        "reverse_unordered_selects",
         "schema_version",
+        "secure_delete",
+        "short_column_names",
+        "soft_heap_limit",
+        "synchronous",
+        "temp_store",
+        "threads",
+        "trusted_schema",
         "user_version",
     ];
 
@@ -3265,7 +3320,20 @@ fn observational_pragma(name: &str, value: Option<&str>) -> bool {
 }
 
 fn reserved_name(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("__rhiza_")
+    const TABLES: &[&str] = &["__rhiza_kv", "__rhiza_meta", "__rhiza_requests"];
+    reserved_table_name(name)
+        || strip_ascii_prefix_ignore_case(name, "sqlite_autoindex_").is_some_and(|suffix| {
+            TABLES.iter().any(|table| {
+                suffix
+                    .get(..table.len())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(table))
+                    && suffix.as_bytes().get(table.len()) == Some(&b'_')
+            })
+        })
+}
+
+fn reserved_table_name(name: &str) -> bool {
+    matches_ignore_ascii_case(name, &["__rhiza_kv", "__rhiza_meta", "__rhiza_requests"])
 }
 
 fn validate_reserved_schema(conn: &Connection) -> Result<()> {
@@ -3273,14 +3341,18 @@ fn validate_reserved_schema(conn: &Connection) -> Result<()> {
         .query_row(
             "SELECT name
              FROM sqlite_schema
-             WHERE (lower(name) GLOB '__rhiza_*' OR lower(tbl_name) GLOB '__rhiza_*')
-               AND NOT (
-                   (type = 'table' AND name = '__rhiza_kv' AND tbl_name = '__rhiza_kv')
-                   OR
-                   (type = 'index'
-                    AND name GLOB 'sqlite_autoindex___rhiza_kv_*'
-                    AND tbl_name = '__rhiza_kv')
-               )
+             WHERE
+               ((lower(name) IN ('__rhiza_meta', '__rhiza_requests')
+                 OR lower(tbl_name) IN ('__rhiza_meta', '__rhiza_requests')))
+               OR
+               ((lower(name) = '__rhiza_kv' OR lower(tbl_name) = '__rhiza_kv')
+                AND NOT (
+                    (type = 'table' AND name = '__rhiza_kv' AND tbl_name = '__rhiza_kv')
+                    OR
+                    (type = 'index'
+                     AND name GLOB 'sqlite_autoindex___rhiza_kv_*'
+                     AND tbl_name = '__rhiza_kv')
+                ))
              LIMIT 1",
             [],
             |row| row.get(0),
@@ -3292,7 +3364,266 @@ fn validate_reserved_schema(conn: &Connection) -> Result<()> {
             "SQL object uses reserved rhiza namespace: {name}"
         )));
     }
+    let mut statement = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE type = 'table' AND lower(sql) LIKE 'create virtual table%'",
+        )
+        .map_err(sqlite_error)?;
+    let definitions = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    if let Some((name, _)) = definitions
+        .into_iter()
+        .find(|(_, sql)| virtual_table_uses_reserved_content(sql))
+    {
+        return Err(Error::InvalidCommand(format!(
+            "SQL virtual table uses reserved rhiza content: {name}"
+        )));
+    }
     Ok(())
+}
+
+fn virtual_table_uses_reserved_content(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let Some(mut index) = unquoted_open_paren(bytes) else {
+        return false;
+    };
+    index += 1;
+    let mut depth = 1usize;
+    let mut argument = Vec::new();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                    index += 1;
+                }
+                argument.push(b' ');
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && (bytes[index] != b'*' || bytes[index + 1] != b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+                argument.push(b' ');
+            }
+            quote @ (b'\'' | b'"' | b'`' | b'[') => {
+                let close = if quote == b'[' { b']' } else { quote };
+                argument.push(quote);
+                index += 1;
+                while let Some(byte) = bytes.get(index).copied() {
+                    argument.push(byte);
+                    index += 1;
+                    if byte == close {
+                        if bytes.get(index) == Some(&close) {
+                            argument.push(close);
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                argument.push(b'(');
+                index += 1;
+            }
+            b')' if depth == 1 => {
+                return content_argument_uses_reserved_table(&argument);
+            }
+            b')' => {
+                depth -= 1;
+                argument.push(b')');
+                index += 1;
+            }
+            b',' if depth == 1 => {
+                if content_argument_uses_reserved_table(&argument) {
+                    return true;
+                }
+                argument.clear();
+                index += 1;
+            }
+            byte => {
+                argument.push(byte);
+                index += 1;
+            }
+        }
+    }
+    content_argument_uses_reserved_table(&argument)
+}
+
+fn unquoted_open_paren(bytes: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && (bytes[index] != b'*' || bytes[index + 1] != b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            quote @ (b'\'' | b'"' | b'`' | b'[') => {
+                let close = if quote == b'[' { b']' } else { quote };
+                index += 1;
+                while let Some(byte) = bytes.get(index).copied() {
+                    index += 1;
+                    if byte == close {
+                        if bytes.get(index) == Some(&close) {
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            b'(' => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn content_argument_uses_reserved_table(argument: &[u8]) -> bool {
+    let argument = trim_ascii(argument);
+    let Some(equal) = unquoted_equal(argument) else {
+        return false;
+    };
+    let key = dequote_whole_sql_token(trim_ascii(&argument[..equal]));
+    if !key.eq_ignore_ascii_case(b"content") {
+        return false;
+    }
+    let value = dequote_whole_sql_token(trim_ascii(&argument[equal + 1..]));
+    std::str::from_utf8(&value).is_ok_and(reserved_table_name)
+}
+
+fn unquoted_equal(token: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    let mut depth = 0usize;
+    while index < token.len() {
+        match token[index] {
+            quote @ (b'\'' | b'"' | b'`' | b'[') => {
+                let close = if quote == b'[' { b']' } else { quote };
+                index += 1;
+                while let Some(byte) = token.get(index).copied() {
+                    index += 1;
+                    if byte == close {
+                        if token.get(index) == Some(&close) {
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'=' if depth == 0 => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn dequote_whole_sql_token(token: &[u8]) -> Vec<u8> {
+    let Some(open) = token.first().copied() else {
+        return Vec::new();
+    };
+    let close = match open {
+        b'\'' | b'"' | b'`' => open,
+        b'[' => b']',
+        _ => return token.to_vec(),
+    };
+    if token.last() != Some(&close) || token.len() < 2 {
+        return token.to_vec();
+    }
+    let mut dequoted = Vec::with_capacity(token.len() - 2);
+    let mut index = 1;
+    while index + 1 < token.len() {
+        let byte = token[index];
+        dequoted.push(byte);
+        index += 1;
+        if byte == close && token.get(index) == Some(&close) {
+            index += 1;
+        }
+    }
+    dequoted
+}
+
+fn trim_ascii(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn validate_temp_schema_empty(conn: &Connection) -> Result<()> {
+    let name = conn
+        .query_row("SELECT name FROM sqlite_temp_schema LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(sqlite_error)?;
+    if let Some(name) = name {
+        return Err(Error::InvalidCommand(format!(
+            "replicated SQL member left TEMP object {name} behind"
+        )));
+    }
+    Ok(())
+}
+
+fn bundled_vtable(module_name: &str) -> bool {
+    matches_ignore_ascii_case(
+        module_name,
+        &[
+            "fts3",
+            "fts3tokenize",
+            "fts4",
+            "fts4aux",
+            "fts5",
+            "fts5vocab",
+            "dbstat",
+            "rtree",
+            "rtree_i32",
+        ],
+    )
+}
+
+fn matches_ignore_ascii_case(value: &str, choices: &[&str]) -> bool {
+    choices
+        .iter()
+        .any(|choice| value.eq_ignore_ascii_case(choice))
 }
 
 fn unsafe_sql_function(name: &str) -> bool {
@@ -3451,6 +3782,49 @@ fn io_error(error: std::io::Error) -> Error {
 #[cfg(test)]
 mod query_policy_tests {
     use super::*;
+
+    #[test]
+    fn reserved_name_and_vtable_content_checks_match_only_structural_sentinels() {
+        for name in [
+            "__rhiza_kv",
+            "__RHIZA_META",
+            "__rhiza_requests",
+            "sqlite_autoindex___rhiza_kv_1",
+        ] {
+            assert!(reserved_name(name));
+        }
+        for name in [
+            "__rhiza_user_table",
+            "x__rhiza_kv",
+            "sqlite_autoindex_user_1",
+        ] {
+            assert!(!reserved_name(name));
+        }
+        for sql in [
+            "CREATE VIRTUAL TABLE x USING fts5(body, content='__rhiza_kv')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, CONTENT = [__RHIZA_META])",
+            "CREATE VIRTUAL TABLE x USING fts5(body, content=__rhiza_requests)",
+            "CREATE VIRTUAL TABLE x USING fts5(body, content=\"__rhiza_meta\")",
+            "CREATE VIRTUAL TABLE x USING fts5(body, content=`__rhiza_requests`)",
+            "CREATE VIRTUAL TABLE x USING fts5(prefix=(a,b), CoNtEnT /* option */ = '__rhiza_kv')",
+        ] {
+            assert!(virtual_table_uses_reserved_content(sql));
+        }
+        for sql in [
+            "CREATE VIRTUAL TABLE x USING fts5(__rhiza_kv)",
+            "CREATE VIRTUAL TABLE x USING fts5(body, tokenize='__rhiza_kv')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, content='__rhiza_kv_user')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, 'content=__rhiza_kv')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, \"content=__rhiza_meta\")",
+            "CREATE VIRTUAL TABLE x USING fts5(body, `content=__rhiza_requests`)",
+            "CREATE VIRTUAL TABLE x USING fts5(body, [content=__rhiza_kv])",
+            "CREATE VIRTUAL TABLE x USING fts5(body, 'content=''__rhiza_kv''')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, /* content='__rhiza_kv' */ tokenize='porter')",
+            "CREATE VIRTUAL TABLE x USING fts5(body, -- content='__rhiza_kv'\n tokenize='porter')",
+        ] {
+            assert!(!virtual_table_uses_reserved_content(sql));
+        }
+    }
 
     fn prepare_single_sql_effect(
         database: &SqliteStateMachine,

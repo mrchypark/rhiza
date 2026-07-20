@@ -2,7 +2,8 @@ use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Sn
 use rhiza_sql::{
     decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
     restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, SqlBatchMember,
-    SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES, QWAL_V3_MAGIC,
+    SqlCommand, SqlCommandResult, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES,
+    QWAL_V3_MAGIC,
 };
 use rusqlite::Connection;
 
@@ -76,6 +77,69 @@ fn query(db: &SqliteStateMachine, sql: &str) -> Vec<Vec<SqlValue>> {
     .rows
 }
 
+fn command(request_id: &str, statements: &[&str]) -> SqlCommand {
+    SqlCommand {
+        request_id: request_id.into(),
+        statements: statements
+            .iter()
+            .map(|sql| SqlStatement {
+                sql: (*sql).into(),
+                parameters: vec![],
+            })
+            .collect(),
+    }
+}
+
+fn open_pair(dir: &tempfile::TempDir) -> (SqliteStateMachine, SqliteStateMachine) {
+    (
+        SqliteStateMachine::open(
+            dir.path().join("proposer.sqlite"),
+            "cluster-a",
+            "node-1",
+            1,
+            1,
+        )
+        .unwrap(),
+        SqliteStateMachine::open(
+            dir.path().join("follower.sqlite"),
+            "cluster-a",
+            "node-2",
+            1,
+            1,
+        )
+        .unwrap(),
+    )
+}
+
+fn apply_replicated(
+    proposer: &SqliteStateMachine,
+    follower: &SqliteStateMachine,
+    command: &SqlCommand,
+    base_index: u64,
+    base_hash: LogHash,
+) -> (Vec<u8>, LogEntry, SqlCommandResult) {
+    let (request, effect) = prepared_qwal(proposer, command, base_index, base_hash);
+    let decided = entry(base_index + 1, base_hash, &effect);
+    let proposer_result = proposer
+        .apply_entry_with_result(&decided)
+        .unwrap()
+        .sql_result()
+        .cloned()
+        .unwrap();
+    let follower_result = follower
+        .apply_entry_with_result(&decided)
+        .unwrap()
+        .sql_result()
+        .cloned()
+        .unwrap();
+    assert_eq!(follower_result, proposer_result);
+    assert_eq!(
+        follower.canonical_db_digest().unwrap(),
+        proposer.canonical_db_digest().unwrap()
+    );
+    (request, decided, proposer_result)
+}
+
 #[test]
 fn batch_preparation_commits_successes_once_and_isolates_failed_members() {
     let dir = tempfile::tempdir().unwrap();
@@ -91,17 +155,31 @@ fn batch_preparation_commits_successes_once_and_isolates_failed_members() {
         },
         SqlCommand {
             request_id: "batch-fail".into(),
-            statements: vec![SqlStatement {
-                sql: "INSERT INTO absent_table VALUES ('must-rollback')".into(),
-                parameters: vec![],
-            }],
+            statements: vec![
+                SqlStatement {
+                    sql: "CREATE TEMP TABLE reusable(value TEXT)".into(),
+                    parameters: vec![],
+                },
+                SqlStatement {
+                    sql: "INSERT INTO batch_items VALUES ('must-rollback')".into(),
+                    parameters: vec![],
+                },
+            ],
         },
         SqlCommand {
             request_id: "batch-insert".into(),
-            statements: vec![SqlStatement {
-                sql: "INSERT INTO batch_items VALUES ('kept') RETURNING value".into(),
+            statements: [
+                "CREATE TEMP TABLE reusable(value TEXT)",
+                "INSERT INTO reusable VALUES ('kept')",
+                "INSERT INTO batch_items SELECT value FROM reusable RETURNING value",
+                "DROP TABLE temp.reusable",
+            ]
+            .into_iter()
+            .map(|sql| SqlStatement {
+                sql: sql.into(),
                 parameters: vec![],
-            }],
+            })
+            .collect(),
         },
     ];
     let payloads = commands
@@ -488,6 +566,403 @@ fn qwal_effect_reproduces_complete_sqlite_behavior_from_an_exact_base() {
             "SELECT parent_id, nonce_hex, created_at FROM audit"
         ),
         vec![inserted.clone()]
+    );
+}
+
+#[test]
+fn replicated_read_statements_bind_exact_rows_into_the_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proposer, follower) = open_pair(&dir);
+    let mixed = command(
+        "mixed-read-write",
+        &[
+            "CREATE TABLE mixed(value INTEGER NOT NULL)",
+            "CREATE TEMP TABLE scratch(value INTEGER NOT NULL)",
+            "INSERT INTO scratch VALUES (2), (3)",
+            "INSERT INTO mixed SELECT value FROM scratch",
+            "DROP TABLE temp.scratch",
+            "SELECT count(*) AS count, sum(value) AS total FROM mixed",
+            "VALUES ('receipt-row'), (hex(randomblob(8)))",
+            "UPDATE mixed SET value = value * 10 RETURNING value",
+        ],
+    );
+    let (request, decided, result) =
+        apply_replicated(&proposer, &follower, &mixed, 0, LogHash::ZERO);
+    assert_eq!(
+        result.statement_results[5].returning.as_ref().unwrap().rows,
+        [[SqlValue::Integer(2), SqlValue::Integer(5)]]
+    );
+    let values = &result.statement_results[6].returning.as_ref().unwrap().rows;
+    assert_eq!(values[0], [SqlValue::Text("receipt-row".into())]);
+    assert!(matches!(&values[1][0], SqlValue::Text(value) if value.len() == 16));
+    assert_eq!(
+        query(&follower, "SELECT value FROM mixed ORDER BY value"),
+        [[SqlValue::Integer(20)], [SqlValue::Integer(30)]]
+    );
+    assert_eq!(
+        follower
+            .check_sql_request("mixed-read-write", &request)
+            .unwrap()
+            .unwrap()
+            .1,
+        Some(result)
+    );
+
+    let lingering = command(
+        "temp-must-not-escape",
+        &[
+            "CREATE TEMP TABLE lingering(value INTEGER)",
+            "INSERT INTO mixed VALUES (999)",
+        ],
+    );
+    let payload = encode_sql_command(&lingering).unwrap();
+    let rejected = proposer
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command: &lingering,
+                request_payload: &payload,
+            }],
+            1,
+            decided.hash,
+        )
+        .unwrap();
+    assert!(rejected.effect.is_none());
+    assert!(
+        matches!(&rejected.results[0], Err(Error::InvalidCommand(message)) if message.contains("TEMP"))
+    );
+    assert_eq!(
+        query(&proposer, "SELECT max(value) FROM mixed"),
+        [[SqlValue::Integer(30)]]
+    );
+}
+
+#[test]
+fn bundled_fts5_and_rtree_vtables_replay_mutation_delete_and_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let proposer_path = dir.path().join("proposer.sqlite");
+    let follower_path = dir.path().join("follower.sqlite");
+    let (proposer, follower) = open_pair(&dir);
+    let modules = query(
+        &proposer,
+        "SELECT name FROM pragma_module_list ORDER BY name",
+    );
+    for expected in [
+        "fts3",
+        "fts3tokenize",
+        "fts4",
+        "fts4aux",
+        "fts5",
+        "fts5vocab",
+        "rtree",
+        "rtree_i32",
+        "dbstat",
+    ] {
+        assert!(modules.contains(&vec![SqlValue::Text(expected.into())]));
+    }
+    let create = command(
+        "vtable-create",
+        &[
+            "CREATE VIRTUAL TABLE legacy3 USING fts3(body)",
+            "CREATE VIRTUAL TABLE legacy4 USING fts4(body)",
+            "CREATE VIRTUAL TABLE documents USING fts5(body)",
+            "CREATE VIRTUAL TABLE safe_reserved_token USING fts5(__rhiza_kv)",
+            "CREATE VIRTUAL TABLE whole_single USING fts5('content=__rhiza_kv')",
+            "CREATE VIRTUAL TABLE whole_double USING fts5(\"content=__rhiza_meta\")",
+            "CREATE VIRTUAL TABLE whole_backtick USING fts5(`content=__rhiza_requests`)",
+            "CREATE VIRTUAL TABLE whole_bracket USING fts5([content=__rhiza_kv])",
+            "CREATE VIRTUAL TABLE whole_escaped USING fts5('content=''__rhiza_kv''')",
+            "CREATE VIRTUAL TABLE block_comment_safe USING fts5(body, /* content='__rhiza_kv' */ tokenize='porter')",
+            "CREATE VIRTUAL TABLE line_comment_safe USING fts5(body, -- content='__rhiza_kv'\n tokenize='porter')",
+            "CREATE VIRTUAL TABLE terms4 USING fts4aux(legacy4)",
+            "CREATE VIRTUAL TABLE vocabulary USING fts5vocab(documents, row)",
+            "CREATE VIRTUAL TABLE tokens USING fts3tokenize(simple)",
+            "INSERT INTO legacy4(body) VALUES ('legacy term')",
+            "INSERT INTO legacy3(body) VALUES ('old three')",
+            "INSERT INTO documents(rowid, body) VALUES (1, 'alpha one'), (2, 'beta two')",
+            "CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)",
+            "CREATE VIRTUAL TABLE int_boxes USING rtree_i32(id, min_x, max_x, min_y, max_y)",
+            "CREATE VIRTUAL TABLE page_stats USING dbstat",
+            "INSERT INTO boxes VALUES (1, 0, 10, 0, 10), (2, 20, 30, 20, 30)",
+            "INSERT INTO int_boxes VALUES (1, 1, 9, 2, 8), (2, 20, 30, 20, 30)",
+        ],
+    );
+    let (_, first, _) = apply_replicated(&proposer, &follower, &create, 0, LogHash::ZERO);
+    let mutate = command(
+        "vtable-mutate",
+        &[
+            "UPDATE documents SET body = 'gamma three' WHERE rowid = 1",
+            "DELETE FROM documents WHERE rowid = 2",
+            "UPDATE legacy3 SET body = 'updated three' WHERE rowid = 1",
+            "UPDATE boxes SET min_x = 5, max_x = 15 WHERE id = 1",
+            "DELETE FROM boxes WHERE id = 2",
+            "UPDATE int_boxes SET min_x = 3 WHERE id = 1",
+            "DELETE FROM int_boxes WHERE id = 2",
+            "DROP TABLE boxes",
+        ],
+    );
+    let (_, second, _) = apply_replicated(&proposer, &follower, &mutate, 1, first.hash);
+    assert_eq!(
+        query(
+            &follower,
+            "SELECT rowid, body FROM documents WHERE documents MATCH 'gamma'"
+        ),
+        [[SqlValue::Integer(1), SqlValue::Text("gamma three".into())]]
+    );
+    assert_eq!(
+        query(
+            &follower,
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'boxes'"
+        ),
+        [[SqlValue::Integer(0)]]
+    );
+    assert_eq!(
+        query(
+            &follower,
+            "SELECT token FROM tokens WHERE input = 'Hello World'"
+        ),
+        [
+            [SqlValue::Text("hello".into())],
+            [SqlValue::Text("world".into())]
+        ]
+    );
+    assert_eq!(
+        query(
+            &follower,
+            "SELECT DISTINCT term FROM terms4 WHERE term = 'legacy'",
+        ),
+        [[SqlValue::Text("legacy".into())]]
+    );
+    assert_eq!(
+        query(
+            &follower,
+            "SELECT body FROM legacy3 WHERE legacy3 MATCH 'updated'",
+        ),
+        [[SqlValue::Text("updated three".into())]]
+    );
+    assert_eq!(
+        query(
+            &follower,
+            "SELECT term FROM vocabulary WHERE term = 'gamma'",
+        ),
+        [[SqlValue::Text("gamma".into())]]
+    );
+    assert_eq!(
+        query(&follower, "SELECT min_x, max_x FROM int_boxes WHERE id = 1"),
+        [[SqlValue::Integer(3), SqlValue::Integer(9)]]
+    );
+    assert_ne!(
+        query(&follower, "SELECT count(*) FROM page_stats"),
+        [[SqlValue::Integer(0)]]
+    );
+    for (table, column) in [
+        ("whole_single", "content=__rhiza_kv"),
+        ("whole_double", "content=__rhiza_meta"),
+        ("whole_backtick", "content=__rhiza_requests"),
+        ("whole_bracket", "content=__rhiza_kv"),
+        ("whole_escaped", "content='__rhiza_kv'"),
+    ] {
+        assert_eq!(
+            query(
+                &follower,
+                &format!("SELECT name FROM pragma_table_info('{table}')"),
+            ),
+            [[SqlValue::Text(column.into())]]
+        );
+    }
+    for denied in [
+        command(
+            "unknown-vtable",
+            &["CREATE VIRTUAL TABLE forbidden USING custom_module(value)"],
+        ),
+        command(
+            "internal-content-vtable",
+            &["CREATE VIRTUAL TABLE forbidden_content USING fts5(key, value, content='__rhiza_kv')"],
+        ),
+    ] {
+        let payload = encode_sql_command(&denied).unwrap();
+        let rejected = proposer
+            .prepare_sql_batch_effect(
+                &[SqlBatchMember {
+                    command: &denied,
+                    request_payload: &payload,
+                }],
+                2,
+                second.hash,
+            )
+            .unwrap();
+        assert!(rejected.effect.is_none());
+        assert!(rejected.results[0].is_err());
+    }
+    drop(proposer);
+    drop(follower);
+    let proposer = SqliteStateMachine::open_existing(&proposer_path).unwrap();
+    let follower = SqliteStateMachine::open_existing(&follower_path).unwrap();
+    assert_eq!(
+        query(&proposer, "SELECT rowid, body FROM documents"),
+        query(&follower, "SELECT rowid, body FROM documents")
+    );
+    for sql in [
+        "SELECT body FROM legacy3",
+        "SELECT term FROM vocabulary WHERE term = 'gamma'",
+        "SELECT min_x, max_x FROM int_boxes",
+        "SELECT count(*) FROM page_stats",
+    ] {
+        assert_eq!(query(&proposer, sql), query(&follower, sql));
+    }
+}
+
+#[test]
+fn modern_sqlite_schema_and_dml_features_keep_exact_page_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let proposer_path = dir.path().join("proposer.sqlite");
+    let follower_path = dir.path().join("follower.sqlite");
+    let (proposer, follower) = open_pair(&dir);
+    let modern = command(
+        "modern-sqlite",
+        &[
+            "CREATE TABLE modern(id INTEGER PRIMARY KEY, base INTEGER NOT NULL, doubled INTEGER GENERATED ALWAYS AS (base * 2) STORED) STRICT",
+            "CREATE INDEX modern_positive ON modern(base) WHERE base > 0",
+            "INSERT INTO modern(id, base) VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET base = excluded.base",
+            "INSERT INTO modern(id, base) VALUES (1, 7) ON CONFLICT(id) DO UPDATE SET base = excluded.base",
+            "ALTER TABLE modern ADD COLUMN note TEXT",
+            "CREATE VIEW modern_view AS SELECT id, doubled, note FROM modern",
+            "CREATE TABLE labels(name TEXT PRIMARY KEY, weight INTEGER NOT NULL) WITHOUT ROWID",
+            "WITH input(name, weight) AS (VALUES ('exact', 9)) INSERT INTO labels SELECT * FROM input",
+            "SELECT id, doubled, note FROM modern_view",
+            "CREATE TABLE __rhiza_user_table(value TEXT)",
+            "INSERT INTO __rhiza_user_table VALUES ('allowed')",
+            "PRAGMA user_version = 23",
+            "PRAGMA application_id = 1380473162",
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+            "PRAGMA optimize=65538",
+            "PRAGMA optimize",
+            "PRAGMA optimize(65538)",
+        ],
+    );
+    let (_, decided, result) = apply_replicated(&proposer, &follower, &modern, 0, LogHash::ZERO);
+    assert_eq!(
+        result.statement_results[8].returning.as_ref().unwrap().rows,
+        [[SqlValue::Integer(1), SqlValue::Integer(14), SqlValue::Null]]
+    );
+    assert_eq!(
+        result.statement_results[13]
+            .returning
+            .as_ref()
+            .unwrap()
+            .rows,
+        [[SqlValue::Integer(0)]]
+    );
+    assert_eq!(
+        query(&follower, "SELECT name, weight FROM labels"),
+        [[SqlValue::Text("exact".into()), SqlValue::Integer(9)]]
+    );
+    assert_eq!(
+        query(&follower, "SELECT value FROM __rhiza_user_table"),
+        [[SqlValue::Text("allowed".into())]]
+    );
+    for denied in [
+        command(
+            "legacy-meta-create",
+            &["CREATE TABLE __rhiza_meta(value TEXT)"],
+        ),
+        command(
+            "legacy-requests-create",
+            &["CREATE TABLE __rhiza_requests(value TEXT)"],
+        ),
+        command(
+            "legacy-meta-rename",
+            &["ALTER TABLE __rhiza_user_table RENAME TO __rhiza_meta"],
+        ),
+        command(
+            "legacy-requests-rename",
+            &["ALTER TABLE __rhiza_user_table RENAME TO __rhiza_requests"],
+        ),
+        command("schema-version-write", &["PRAGMA schema_version = 99"]),
+        command("optimize-invalid", &["PRAGMA optimize = 'garbage'"]),
+        command("incremental-vacuum-write", &["PRAGMA incremental_vacuum"]),
+    ] {
+        let payload = encode_sql_command(&denied).unwrap();
+        let rejected = proposer
+            .prepare_sql_batch_effect(
+                &[SqlBatchMember {
+                    command: &denied,
+                    request_payload: &payload,
+                }],
+                1,
+                decided.hash,
+            )
+            .unwrap();
+        assert!(rejected.effect.is_none());
+        assert!(rejected.results[0].is_err());
+    }
+    drop(proposer);
+    drop(follower);
+    let proposer = SqliteStateMachine::open_existing(&proposer_path).unwrap();
+    let follower = SqliteStateMachine::open_existing(&follower_path).unwrap();
+    for (pragma, expected) in [
+        ("PRAGMA user_version", 23),
+        ("PRAGMA application_id", 1_380_473_162),
+    ] {
+        assert_eq!(query(&proposer, pragma), [[SqlValue::Integer(expected)]]);
+        assert_eq!(query(&proposer, pragma), query(&follower, pragma));
+    }
+    assert_eq!(
+        query(&proposer, "SELECT count(*) FROM sqlite_stat1"),
+        query(&follower, "SELECT count(*) FROM sqlite_stat1")
+    );
+    assert_ne!(
+        query(&proposer, "SELECT count(*) FROM sqlite_stat1"),
+        [[SqlValue::Integer(0)]]
+    );
+    assert_eq!(
+        query(&proposer, "SELECT value FROM __rhiza_user_table"),
+        [[SqlValue::Text("allowed".into())]]
+    );
+    assert_eq!(
+        query(&proposer, "SELECT value FROM __rhiza_user_table"),
+        query(&follower, "SELECT value FROM __rhiza_user_table")
+    );
+}
+
+#[test]
+fn pure_replicated_read_receipt_survives_duplicate_retry_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let follower_path = dir.path().join("follower.sqlite");
+    let (proposer, follower) = open_pair(&dir);
+    let command = command(
+        "pure-read",
+        &[
+            "SELECT 40 + 2 AS answer",
+            "VALUES ('stable'), (hex(randomblob(8)))",
+        ],
+    );
+    let (request, decided, result) =
+        apply_replicated(&proposer, &follower, &command, 0, LogHash::ZERO);
+    assert!(decode_qwal_v3(&decided.payload).unwrap().pages.is_empty());
+    assert_eq!(
+        follower
+            .check_sql_request("pure-read", &request)
+            .unwrap()
+            .unwrap()
+            .1,
+        Some(result.clone())
+    );
+    drop(follower);
+    let follower = SqliteStateMachine::open_existing(&follower_path).unwrap();
+    assert_eq!(
+        follower
+            .apply_entry_with_result(&decided)
+            .unwrap()
+            .sql_result(),
+        Some(&result)
+    );
+    assert_eq!(
+        follower
+            .check_sql_request("pure-read", &request)
+            .unwrap()
+            .unwrap()
+            .1,
+        Some(result)
     );
 }
 

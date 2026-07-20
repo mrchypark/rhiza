@@ -17,10 +17,12 @@ use rhiza_node::{
     node_rpc_router_for_generation, node_rpc_router_with_limits, recorder_router, AckMode,
     ClientErrorResponse, ConfigError, FetchLogError, FetchLogRequest, FetchLogResponse,
     HttpLogPeer, HttpRecorderClient, InMemoryLogPeer, LogPeer, NodeConfig, NodeError, NodeRuntime,
-    PeerConfig, ReadConsistency, ReadRequest, WriteRequest, DEFAULT_WRITER_BATCH_MAX,
+    PeerConfig, ReadConsistency, ReadRequest, SqlExecuteRequest, SqlExecuteResponse,
+    SqlQueryRequest, SqlQueryResponse, WriteRequest, DEFAULT_WRITER_BATCH_MAX,
     DEFAULT_WRITER_BATCH_WINDOW, LIVEZ_PATH, MAX_COMMAND_BYTES, MAX_FETCH_ENTRIES,
     MAX_HTTP_BODY_BYTES, NODE_ID_HEADER, PROTOCOL_VERSION, READYZ_PATH, RECORDER_IDENTITY_PATH,
-    RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, VERSION_HEADER,
+    RECORDER_PROTOCOL_VERSION, RECOVERY_GENERATION_HEADER, SQL_EXECUTE_PATH, SQL_QUERY_PATH,
+    VERSION_HEADER,
 };
 use rhiza_quepaxa::{
     CertifiedDecisionInspection, DecisionProof, FixedMembership, IsrState, Membership,
@@ -2185,6 +2187,87 @@ async fn authenticated_http_write_and_read_use_runtime() {
 
     assert!(read.status().is_success());
     assert!(read.text().await.unwrap().contains("http"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_http_replays_fts5_write_and_read_barrier_exposes_match_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime =
+        Arc::new(NodeRuntime::open(node_config(dir.path()), consensus(dir.path()), &[]).unwrap());
+    let recorder = RecorderFileStore::new_with_id(
+        dir.path().join("sql-http-recorder"),
+        "node-1",
+        "rhiza:sql:cluster-a",
+        1,
+        1,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, node_router(runtime, recorder))
+            .await
+            .unwrap();
+    });
+    let client = reqwest::Client::new();
+    let command = SqlExecuteRequest {
+        request_id: "fts-http-write".into(),
+        statements: vec![
+            SqlStatement {
+                sql: "CREATE VIRTUAL TABLE documents USING fts5(body)".into(),
+                parameters: vec![],
+            },
+            SqlStatement {
+                sql: "INSERT INTO documents(body) VALUES (?1)".into(),
+                parameters: vec![SqlValue::Text("leaderless sqlite search".into())],
+            },
+        ],
+    };
+
+    let execute = || {
+        client
+            .post(format!("http://{addr}{SQL_EXECUTE_PATH}"))
+            .header(VERSION_HEADER, PROTOCOL_VERSION)
+            .bearer_auth("client-token")
+            .json(&command)
+            .send()
+    };
+    let first = execute().await.unwrap();
+    assert!(first.status().is_success());
+    let first = first.json::<SqlExecuteResponse>().await.unwrap();
+
+    let replay = execute().await.unwrap();
+    assert!(replay.status().is_success());
+    assert_eq!(replay.json::<SqlExecuteResponse>().await.unwrap(), first);
+
+    let query = client
+        .post(format!("http://{addr}{SQL_QUERY_PATH}"))
+        .header(VERSION_HEADER, PROTOCOL_VERSION)
+        .bearer_auth("client-token")
+        .json(&SqlQueryRequest {
+            statement: SqlStatement {
+                sql: "SELECT rowid, body FROM documents WHERE documents MATCH ?1".into(),
+                parameters: vec![SqlValue::Text("sqlite".into())],
+            },
+            consistency: Some(ReadConsistency::ReadBarrier),
+            max_rows: Some(10),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert!(query.status().is_success());
+    let query = query.json::<SqlQueryResponse>().await.unwrap();
+
+    assert_eq!(query.columns, ["rowid", "body"]);
+    assert_eq!(
+        query.rows,
+        [vec![
+            SqlValue::Integer(1),
+            SqlValue::Text("leaderless sqlite search".into())
+        ]]
+    );
+    assert!(query.applied_index >= first.applied_index);
     server.abort();
 }
 

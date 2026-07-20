@@ -1,7 +1,8 @@
-# Hiqlite SQL Message Review
+# Hiqlite/Haqlite SQL Compatibility Review
 
-> Status: architecture reference. Reviewed against Hiqlite commit
-> `c8316c53799c509990475ea8e2aa2ef8679e070e` (Hiqlite 0.14-era source).
+> Status: architecture reference. Reviewed against Hiqlite 0.14 commit
+> `c8316c53799c509990475ea8e2aa2ef8679e070e` and Haqlite commit
+> `db6db54b555a56c7352a5c9d57f1b998da05d199`.
 
 ## What Hiqlite Sends
 
@@ -44,13 +45,13 @@ Adopt or retain these patterns:
 - Separate local and consistency-barrier read paths.
 - A response envelope correlated to the client request ID.
 
-rhiza sql now has this shape in QSQL v2: it carries a stable request ID, typed
-statements, an executor fingerprint, and a statement-level result with
-`rows_affected` plus bounded typed `RETURNING` rows. QSQL v2 persists that
-typed result with the request record, making exact retries return the original
-result. QuePaxa still orders opaque bytes and SQLite still provides the atomic
-transaction boundary; this is an application-envelope change, not a SQL-aware
-consensus protocol.
+QSQL v2 carries a stable request ID and ordered typed `statements[]`. Execution
+produces a statement-level result with `rows_affected` plus bounded typed rows.
+The rows may come from DML `RETURNING`, `SELECT`, `VALUES`, or an observational
+PRAGMA executed through the replicated execute API. QWAL v3 binds the executor
+fingerprint, physical page effect and exact result receipt, so retries and
+follower apply never regenerate it. QuePaxa still orders opaque bytes and
+SQLite provides the command transaction boundary.
 
 Do not adopt these Hiqlite-specific choices:
 
@@ -64,77 +65,74 @@ Do not adopt these Hiqlite-specific choices:
 - Coupling SQL messages to Kubernetes or object storage. Those stay outside the
   consensus and state-machine contracts.
 
-## Correctness Limit of Statement Replication
+## Physical Replay Instead of Statement Determinism
 
-Both systems execute the same SQL text independently on each SQLite replica.
-Blocking `random()`, time functions, connection-local counters, `PRAGMA`, TEMP,
-`ATTACH`, and virtual tables removes common hazards but does not make every
-SQLite write deterministic.
+Hiqlite executes the same write SQL independently on every SQLite state
+machine. Its writer overwrites time/date/random functions with failures and its
+documentation forbids non-deterministic functions in modifying statements.
+That still leaves SQLite version, compile options, collation, connection state,
+implicit ROWID edge cases, TEMP and attached-file state as compatibility
+boundaries.
 
-One counterexample is implicit ROWID allocation. If a table has already used
-ROWID `9223372036854775807`, SQLite may choose positive candidate ROWIDs
-pseudo-randomly. No SQL function appears for an authorizer or function denylist
-to reject. SQLite versions, compile options, extensions, collations, and
-connection settings are additional executor-compatibility boundaries.
+Rhiza does not use statement replay. The winning proposer executes once against
+the exact base, captures committed native-WAL page after-images, and puts those
+pages and the typed receipt in QWAL v3. Followers verify the base/target Merkle
+state and apply the pages without re-executing SQL. This supports trigger and
+foreign-key indirect changes, `AUTOINCREMENT`, time/random functions, general
+DDL/DML and exact returned rows within the bounded QWAL contract.
 
-Therefore rhiza sql's statement-replay fallback calls its write surface
-**admitted deterministic SQL**. It supports DDL and DML within an explicit
-policy, but it must not promise unrestricted SQLite write semantics. Direct
-statement-replay `RETURNING` is rejected because its typed rows must be
-persisted and replayed exactly. Read-only SQL can be broader because its result
-is not replayed as replicated state.
+Haqlite also works below SQL by shipping WAL state. Its leader exposes a normal
+`rusqlite::Connection`; without a caller-supplied authorizer, an unfenced
+connection has no SQL filter. Hrana adds connection-scoped transaction sessions.
+That broad parser surface is not itself a strict durability guarantee: Haqlite's
+default Continuous mode sends WAL to storage in the background, whereas Rhiza
+ACKs only after Recorder quorum durability.
 
-## Bounded Effect Replication
+## Practical Compatibility Matrix
 
-The implemented bounded path for eligible QSQL v2 writes is QEFX v1 effect
-replication:
+| Surface | Hiqlite 0.14 | Haqlite | Rhiza QWAL v3 |
+| --- | --- | --- | --- |
+| General `main` DDL/DML | execute and migrations | raw connection/Hrana | supported and exact page replay |
+| `RETURNING` | dedicated execute API | raw query/Hrana `want_rows` | typed exact receipt |
+| Atomic multi-statement work | prepared `txn()` list | native/Hrana transaction | atomic `statements[]` command |
+| Read in replicated execute | transaction output is limited | Hrana `want_rows` | `SELECT`/`VALUES` exact receipt |
+| Raw multi-statement string | unprepared `batch()`, partial statement errors | native/Hrana sequence | one statement per array item |
+| Raw transaction session | not the documented model | supported by Hrana baton | denied; command is the transaction |
+| PRAGMA | no product allowlist; connection semantics vary | unfenced raw leader; fenced default denies PRAGMA | curated observation; two header setters and bounded optimize masks |
+| TEMP | writer-connection local, not read-pool HA state | connection/session local | create/use/drop within one command only |
+| Virtual tables | engine-dependent, no cluster module registry | engine/registration-dependent | bundled FTS/RTree/DBSTAT nine-module allowlist |
+| Non-deterministic write | explicitly forbidden | physical WAL mode can capture it | exact pages and receipt supported |
+| ATTACH/extension/external state | not a verified HA contract | raw SQL may run but files are outside registered DB replication | denied |
 
-```text
-request coordinator
-  -> execute once in an isolated SQLite transaction at the exact qlog base
-  -> capture a deterministic, bounded SQLite session changeset
-  -> QuePaxa decides effect bytes + request identity + base position
-  -> every node applies the same effect
-  -> qlog and snapshot recovery replay the effect and persisted result
-```
+The compatibility target is the safe application surface in this table, not
+every statement that another product happens not to filter. Rhiza therefore
+keeps raw transaction/savepoint control, `ATTACH`/`DETACH`, persistent TEMP,
+`VACUUM`/`VACUUM INTO`, arbitrary UDF/collation/extension/vtable modules, and
+storage-changing PRAGMA setters outside the contract.
 
-QEFX is intentionally bounded and is not unrestricted arbitrary effect
-replication. Its envelope binds the exact base qlog index and hash, the SQLite
-executor fingerprint, the canonical request digest, the persisted typed
-result, and a session changeset capped at 256 KiB. QEFX v1 is the effect format
-and the surrounding qlog entry supplies the decided position; cluster,
-configuration, and recovery-generation identity are validated by the qlog and
-QANC recovery metadata.
+## Current Decision
 
-The effect path explicitly validates complete table schema and primary keys.
-DDL, tables without a complete supported primary key/schema, triggers, foreign
-keys, and indirect trigger/foreign-key changes are outside QEFX. They fall back
-to deterministic statement replay only when the admitted request has no
-`RETURNING`; a `RETURNING` request fails closed. QEFX application uses
-`SQLITE_CHANGESET_ABORT` for conflicts. If a competing command occupies the
-proposed slot, the coordinator regenerates the effect against that command's
-new exact qlog base instead of reusing stale effect bytes.
-
-Snapshots and QANC v3 recovery anchors carry the executor fingerprint and
-recovery metadata. A mismatch is rejected during recovery rather than
-attempting best-effort execution.
-
-## Staged Decision
-
-1. Keep QSQL v2 as the typed command envelope and retain deterministic
-   statement replay only as the bounded non-RETURNING fallback.
+1. Keep QSQL v2 as the typed command envelope and QWAL v3 as the only replicated
+   SQLite effect; no statement-replay or QEFX fallback remains.
 2. Keep QuePaxa unaware of SQL. It orders a versioned opaque state-machine
-   command in every stage.
-3. Keep QEFX v1 limited to validated, bounded session changesets and test
-   duplicate delivery, conflicts, crash points, exact-base regeneration,
-   snapshot restore, and fingerprint mismatch rejection.
-4. Keep MAB preferred-proposer and hedge-delay tuning documentation-only.
+   command.
+3. Match Hiqlite/Haqlite on ordinary `main` DDL/DML, exact returned rows,
+   ordered atomic statements, observational metadata, and bundled
+   FTS/RTree/DBSTAT.
+4. Admit connection-local or external state only after it has a bounded,
+   recoverable QWAL/snapshot contract; parser acceptance alone is insufficient.
 
 ## Sources
 
-- [Hiqlite repository](https://github.com/sebadob/hiqlite)
+- [Hiqlite execute API](https://github.com/sebadob/hiqlite/blob/c8316c53799c509990475ea8e2aa2ef8679e070e/hiqlite/src/client/execute.rs#L9-L227)
+- [Hiqlite transaction API](https://github.com/sebadob/hiqlite/blob/c8316c53799c509990475ea8e2aa2ef8679e070e/hiqlite/src/client/transaction.rs#L8-L99)
+- [Hiqlite batch API](https://github.com/sebadob/hiqlite/blob/c8316c53799c509990475ea8e2aa2ef8679e070e/hiqlite/src/client/batch.rs#L8-L92)
+- [Hiqlite non-deterministic write limitation](https://github.com/sebadob/hiqlite/blob/c8316c53799c509990475ea8e2aa2ef8679e070e/README.md#L631-L643)
 - [Hiqlite crate documentation](https://docs.rs/crate/hiqlite/latest)
+- [Haqlite raw connection and authorizer contract](https://github.com/russellromney/haqlite/blob/db6db54b555a56c7352a5c9d57f1b998da05d199/src/database.rs#L339-L357)
+- [Haqlite leader/follower authorizer behavior](https://github.com/russellromney/haqlite/blob/db6db54b555a56c7352a5c9d57f1b998da05d199/src/database.rs#L916-L1024)
+- [Haqlite raw rusqlite connection API](https://github.com/russellromney/haqlite/blob/db6db54b555a56c7352a5c9d57f1b998da05d199/src/database.rs#L1475-L1497)
+- [Haqlite Hrana baton transaction test](https://github.com/russellromney/haqlite/blob/db6db54b555a56c7352a5c9d57f1b998da05d199/tests/test_hrana.rs#L254-L291)
+- [Haqlite durability modes](https://github.com/russellromney/haqlite/blob/db6db54b555a56c7352a5c9d57f1b998da05d199/README.md#L75-L85)
 - [SQLite ROWID allocation](https://www.sqlite.org/autoinc.html)
-- [SQLite deterministic functions](https://www.sqlite.org/deterministic.html)
-- [SQLite session extension](https://www.sqlite.org/sessionintro.html)
 - [SQLite WAL format](https://www.sqlite.org/walformat.html)
