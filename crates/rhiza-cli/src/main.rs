@@ -21,16 +21,16 @@ use rhiza_node::{
     node_router_with_admin_and_tasks, node_router_with_checkpoint,
     node_router_with_checkpoint_and_admin_tasks, recorder_router_for_generation,
     recover_successor_recorder_after_checkpoint, rehydrate_recorder_after_checkpoint,
-    restore_checkpoint_to_fresh_data_dir_for_node, restore_successor_checkpoint_to_fresh_data_dir,
-    serve_recorder_tcp, serve_recorder_tcp_tls, validate_recorder_tcp_endpoint,
-    AdminActivateRequest, AdminActivateResponse, AdminCompactRequest, AdminCompactResponse,
-    AdminConfig, AdminErrorResponse, AdminInstallSuccessorRequest, AdminInstallSuccessorResponse,
-    AdminStatusResponse, AdminStopRequest, AdminStopResponse, AdminSuccessorBundle,
-    AdminTaskTracker, CheckpointCoordinator, DurabilityMode, HttpLogPeer, HttpRecorderClient,
-    LogPeer, NodeConfig, NodeError, NodeRuntime, PeerConfig, ReadConsistency,
-    RecorderTlsClientConfig, RecorderTlsServerConfig, StopInformation, TcpPostcardRecorderClient,
-    ADMIN_ACTIVATE_PATH, ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH,
-    ADMIN_STOP_PATH, LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
+    restore_successor_checkpoint_to_fresh_data_dir, serve_recorder_tcp, serve_recorder_tcp_tls,
+    validate_recorder_tcp_endpoint, AdminActivateRequest, AdminActivateResponse,
+    AdminCompactRequest, AdminCompactResponse, AdminConfig, AdminErrorResponse,
+    AdminInstallSuccessorRequest, AdminInstallSuccessorResponse, AdminStatusResponse,
+    AdminStopRequest, AdminStopResponse, AdminSuccessorBundle, AdminTaskTracker,
+    CheckpointCoordinator, DurabilityMode, HttpLogPeer, HttpRecorderClient, LogPeer, NodeConfig,
+    NodeError, NodeRuntime, PeerConfig, ReadConsistency, RecorderTlsClientConfig,
+    RecorderTlsServerConfig, StopInformation, TcpPostcardRecorderClient, ADMIN_ACTIVATE_PATH,
+    ADMIN_COMPACT_PATH, ADMIN_INSTALL_SUCCESSOR_PATH, ADMIN_STATUS_PATH, ADMIN_STOP_PATH,
+    LIVEZ_PATH, PROTOCOL_VERSION, READYZ_PATH, VERSION_HEADER,
 };
 #[cfg(feature = "sql")]
 use rhiza_node::{
@@ -57,7 +57,7 @@ use rhiza_quepaxa::{
     RecordSummary, RecorderFileStore, RecorderRpc, ThreeNodeConsensus,
 };
 #[cfg(feature = "sql")]
-use rhiza_sql::{SqlStatement, SqlValue, SqliteStateMachine};
+use rhiza_sql::{SqlStatement, SqlValue};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[tokio::main]
@@ -4189,16 +4189,24 @@ async fn prepare_remote_startup(
             Ok(StartupPreparation::RecorderFirst)
         }
         StartupMode::Rejoin if local_data_is_fresh(data_dir)? => {
+            let identity = archive
+                .checkpoint_identity()
+                .map_err(|error| error.to_string())?;
+            let marker = encode_local_checkpoint_identity_marker(execution_profile, identity)?;
             let tip =
-                restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), data_dir, node_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            write_local_checkpoint_identity_marker(
+                rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
+                    archive.clone(),
+                    data_dir,
+                    node_id,
+                    LOCAL_CHECKPOINT_IDENTITY_FILE,
+                    &marker,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            read_and_validate_local_checkpoint_identity_marker(
                 data_dir,
                 execution_profile,
-                archive
-                    .checkpoint_identity()
-                    .map_err(|error| error.to_string())?,
+                identity,
             )?;
             Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
                 checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
@@ -4210,6 +4218,43 @@ async fn prepare_remote_startup(
                 .await
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "rejoin requires an initialized checkpoint".to_string())?;
+            if rhiza_node::durability::checkpoint_restore_in_progress(data_dir)
+                .map_err(|error| error.to_string())?
+            {
+                let marker = encode_local_checkpoint_identity_marker(
+                    execution_profile,
+                    loaded.manifest().identity(),
+                )?;
+                let tip = if execution_profile == ExecutionProfile::Graph {
+                    rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
+                        archive.clone(),
+                        data_dir,
+                        node_id,
+                        LOCAL_CHECKPOINT_IDENTITY_FILE,
+                        &marker,
+                    )
+                    .await
+                } else {
+                    rhiza_node::durability::restore_checkpoint_for_rejoin_preserving_recorder(
+                        archive.clone(),
+                        data_dir,
+                        node_id,
+                        execution_profile,
+                        LOCAL_CHECKPOINT_IDENTITY_FILE,
+                        &marker,
+                    )
+                    .await
+                }
+                .map_err(|error| error.to_string())?;
+                read_and_validate_local_checkpoint_identity_marker(
+                    data_dir,
+                    execution_profile,
+                    loaded.manifest().identity(),
+                )?;
+                return Ok(StartupPreparation::RuntimeFirstWithPeerCatchup {
+                    checkpoint_root: LogAnchor::new(tip.index(), tip.hash()),
+                });
+            }
             read_and_validate_local_checkpoint_identity_marker(
                 data_dir,
                 execution_profile,
@@ -4219,27 +4264,35 @@ async fn prepare_remote_startup(
                 loaded.manifest().tip().index(),
                 loaded.manifest().tip().hash(),
             );
-            if let Err(error) =
-                validate_local_materializer(data_dir, execution_profile, checkpoint_root)
-            {
-                let quarantine = quarantine_local_data_dir(data_dir)?;
+            if let Err(error) = rhiza_node::durability::validate_local_recovery_view(
+                data_dir,
+                loaded.manifest().identity(),
+                node_id,
+                execution_profile,
+                checkpoint_root,
+            ) {
                 eprintln!(
-                    "local materializer is not trustworthy ({error}); quarantined {} and restoring the verified checkpoint",
-                    quarantine.display()
+                    "local recovery view is not trustworthy ({error}); quarantining rebuildable state and restoring the verified checkpoint"
                 );
-                let tip = restore_checkpoint_to_fresh_data_dir_for_node(
+                let marker = encode_local_checkpoint_identity_marker(
+                    execution_profile,
+                    loaded.manifest().identity(),
+                )?;
+                let tip = rhiza_node::durability::restore_checkpoint_for_rejoin_preserving_recorder(
                     archive.clone(),
                     data_dir,
                     node_id,
+                    execution_profile,
+                    LOCAL_CHECKPOINT_IDENTITY_FILE,
+                    &marker,
                 )
                 .await
                 .map_err(|restore_error| {
                     format!(
-                        "local materializer was quarantined at {} but verified checkpoint restore failed: {restore_error}",
-                        quarantine.display()
+                        "rebuildable local recovery view was quarantined but verified checkpoint restore failed: {restore_error}"
                     )
                 })?;
-                write_local_checkpoint_identity_marker(
+                read_and_validate_local_checkpoint_identity_marker(
                     data_dir,
                     execution_profile,
                     loaded.manifest().identity(),
@@ -4257,92 +4310,33 @@ async fn prepare_remote_startup(
             })
         }
         StartupMode::Disaster => {
-            if !local_data_is_fresh(data_dir)? {
+            let restore_in_progress =
+                rhiza_node::durability::checkpoint_restore_in_progress(data_dir)
+                    .map_err(|error| error.to_string())?;
+            if !restore_in_progress && !local_data_is_fresh(data_dir)? {
                 return Err("disaster startup requires a fresh local data directory".into());
             }
-            restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), data_dir, node_id)
-                .await
+            let identity = archive
+                .checkpoint_identity()
                 .map_err(|error| error.to_string())?;
-            write_local_checkpoint_identity_marker(
+            let marker = encode_local_checkpoint_identity_marker(execution_profile, identity)?;
+            rhiza_node::durability::restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
+                archive.clone(),
+                data_dir,
+                node_id,
+                LOCAL_CHECKPOINT_IDENTITY_FILE,
+                &marker,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            read_and_validate_local_checkpoint_identity_marker(
                 data_dir,
                 execution_profile,
-                archive
-                    .checkpoint_identity()
-                    .map_err(|error| error.to_string())?,
+                identity,
             )?;
             Ok(StartupPreparation::RecorderFirst)
         }
     }
-}
-
-#[cfg_attr(not(feature = "sql"), allow(unused_variables))]
-fn validate_local_materializer(
-    data_dir: &Path,
-    execution_profile: ExecutionProfile,
-    checkpoint_root: LogAnchor,
-) -> Result<(), String> {
-    match execution_profile {
-        ExecutionProfile::Sqlite => {
-            #[cfg(feature = "sql")]
-            {
-                let materializer =
-                    SqliteStateMachine::open_existing(data_dir.join("sqlite/db.sqlite"))
-                        .map_err(|error| error.to_string())?;
-                let applied_index = materializer
-                    .applied_index_value()
-                    .map_err(|error| error.to_string())?;
-                let applied_hash = materializer
-                    .applied_hash_value()
-                    .map_err(|error| error.to_string())?;
-                if applied_index < checkpoint_root.index()
-                    || (applied_index == checkpoint_root.index()
-                        && applied_hash != checkpoint_root.hash())
-                {
-                    return Err(format!(
-                        "SQL materializer tip {applied_index}/{} does not cover checkpoint root {}/{}",
-                        applied_hash.to_hex(),
-                        checkpoint_root.index(),
-                        checkpoint_root.hash().to_hex()
-                    ));
-                }
-                Ok(())
-            }
-            #[cfg(not(feature = "sql"))]
-            Err("sql execution profile is not compiled in".into())
-        }
-        ExecutionProfile::Graph | ExecutionProfile::Kv => Ok(()),
-    }
-}
-
-fn quarantine_local_data_dir(data_dir: &Path) -> Result<PathBuf, String> {
-    static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    let parent = data_dir
-        .parent()
-        .ok_or_else(|| "local data directory has no parent for quarantine".to_string())?;
-    let name = data_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| "local data directory has no safe quarantine name".to_string())?;
-    for _ in 0..128 {
-        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let target = parent.join(format!(
-            ".{name}.quarantine-{}-{sequence}",
-            std::process::id()
-        ));
-        match fs::rename(data_dir, &target) {
-            Ok(()) => return Ok(target),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "failed to quarantine local data directory {}: {error}",
-                    data_dir.display()
-                ))
-            }
-        }
-    }
-    Err("could not allocate a local data quarantine path".into())
 }
 
 fn marker_from_identity(
@@ -4357,6 +4351,14 @@ fn marker_from_identity(
         config_id: identity.config_id(),
         recovery_generation: identity.recovery_generation(),
     }
+}
+
+fn encode_local_checkpoint_identity_marker(
+    execution_profile: ExecutionProfile,
+    identity: &CheckpointIdentity,
+) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&marker_from_identity(execution_profile, identity))
+        .map_err(|error| format!("cannot encode local checkpoint identity marker: {error}"))
 }
 
 fn validate_local_checkpoint_identity_marker(
@@ -4440,9 +4442,7 @@ fn write_local_checkpoint_identity_marker(
             identity,
         );
     }
-    let marker = marker_from_identity(execution_profile, identity);
-    let bytes = serde_json::to_vec(&marker)
-        .map_err(|error| format!("cannot encode local checkpoint identity marker: {error}"))?;
+    let bytes = encode_local_checkpoint_identity_marker(execution_profile, identity)?;
     let nonce = LOCAL_MARKER_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temporary = data_dir.join(format!(
         ".rhiza-checkpoint-identity.tmp-{}-{nonce}",
@@ -5099,6 +5099,8 @@ fn usage() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "sql")]
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     #[cfg(feature = "sql")]
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5118,19 +5120,42 @@ mod tests {
     use rhiza_core::{
         ConfigChange, EntryType, LogAnchor, LogEntry, LogHash, RecoveryAnchor, SnapshotIdentity,
     };
+    #[cfg(feature = "sql")]
+    use rhiza_log::FileLogStore;
     #[cfg(feature = "graph")]
     use rhiza_node::GraphQueryParameterDto;
     use rhiza_node::{NodeStatus, RuntimeConfigurationStatus};
     #[cfg(feature = "sql")]
     use rhiza_node::{ReadRequest, WriteRequest, PROTOCOL_VERSION, VERSION_HEADER};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-    use rhiza_quepaxa::AcceptedValue;
+    use rhiza_quepaxa::{AcceptedValue, Proposal, ProposalPriority};
     #[cfg(feature = "sql")]
     use rhiza_quepaxa::{RecordRequest, RecordSummary};
     #[cfg(feature = "sql")]
     use rhiza_sql::{encode_sql_command, SqlBatchMember, SqlCommand, SqliteStateMachine};
 
     use super::*;
+
+    #[cfg(feature = "sql")]
+    fn directory_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files);
+        files
+    }
 
     #[test]
     #[cfg(feature = "sql")]
@@ -6977,11 +7002,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "sql")]
-    fn checkpoint_fixture_entries_use_one_receipt_qwal_v2_effects() {
+    fn checkpoint_fixture_entries_use_one_receipt_qwal_v3_effects_and_reject_v2() {
         let entries = entries(3);
 
         for (offset, entry) in entries.iter().enumerate() {
-            let effect = rhiza_sql::decode_qwal_v2(&entry.payload).unwrap();
+            let effect = rhiza_sql::decode_qwal_v3(&entry.payload).unwrap();
             assert_eq!(effect.base_index, offset as u64);
             assert_eq!(effect.base_hash, entry.prev_hash);
             assert_eq!(effect.receipts.len(), 1);
@@ -6989,6 +7014,10 @@ mod tests {
                 effect.receipts[0].request_id,
                 format!("checkpoint-entry-{}", offset + 1)
             );
+
+            let mut v2 = b"QWAL\0\x03".to_vec();
+            v2.extend_from_slice(&entry.payload[rhiza_sql::QWAL_V3_MAGIC.len()..]);
+            assert!(rhiza_sql::decode_qwal_v3(&v2).is_err());
         }
     }
 
@@ -7632,7 +7661,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(matches!(
+        assert_eq!(
             prepare_remote_startup(
                 StartupMode::Rejoin,
                 &archive,
@@ -7642,10 +7671,53 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::VerifyLocalCheckpoint { root, .. }
-                if root == LogAnchor::new(0, LogHash::ZERO)
+            StartupPreparation::RuntimeFirstWithPeerCatchup {
+                checkpoint_root: LogAnchor::new(0, LogHash::ZERO)
+            }
+        );
+        let committed = entries(3);
+        archive.publish_committed(&committed[..2]).await.unwrap();
+        let snapshot_dir = root.path().join("snapshot-source");
+        let snapshot_state = SqliteStateMachine::open(
+            snapshot_dir.join("db.sqlite"),
+            "rhiza:sql:cluster-a",
+            "node-1",
+            1,
+            1,
+        )
+        .unwrap();
+        for entry in &committed[..2] {
+            snapshot_state.apply_entry(entry).unwrap();
+        }
+        let recovery = snapshot_state.create_recovery_snapshot(1).unwrap();
+        archive
+            .publish_checkpoint_snapshot(recovery.anchor().clone(), recovery.db_bytes())
+            .await
+            .unwrap();
+        let interrupted_rejoin_dir = root.path().join("interrupted-rejoin");
+        std::fs::create_dir_all(interrupted_rejoin_dir.join("sqlite")).unwrap();
+        std::fs::write(
+            interrupted_rejoin_dir.join(".rhiza-restore-v1"),
+            b"rhiza restore in progress\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &interrupted_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root }
+                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
         ));
-        archive.publish_committed(&entries(2)).await.unwrap();
+        assert!(interrupted_rejoin_dir
+            .join(LOCAL_CHECKPOINT_IDENTITY_FILE)
+            .is_file());
+        assert!(!interrupted_rejoin_dir.join(".rhiza-restore-v1").exists());
         let fresh_bootstrap_dir = root.path().join("fresh-bootstrap-nonempty");
         assert!(prepare_remote_startup(
             StartupMode::Bootstrap,
@@ -7670,23 +7742,14 @@ mod tests {
             .await
             .unwrap(),
             StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(2, entries(2)[1].hash)
+                checkpoint_root: LogAnchor::new(2, committed[1].hash)
             }
         );
         assert!(fresh_rejoin_dir.join("consensus/log").exists());
         assert!(fresh_rejoin_dir
             .join(LOCAL_CHECKPOINT_IDENTITY_FILE)
             .is_file());
-        let state = SqliteStateMachine::open(
-            fresh_rejoin_dir.join("sqlite/db.sqlite"),
-            "rhiza:sql:cluster-a",
-            "node-1",
-            1,
-            1,
-        )
-        .unwrap();
-        drop(state);
-        assert_eq!(
+        assert!(matches!(
             prepare_remote_startup(
                 StartupMode::Rejoin,
                 &archive,
@@ -7696,9 +7759,117 @@ mod tests {
             )
             .await
             .unwrap(),
-            StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(2, entries(2)[1].hash)
-            }
+            StartupPreparation::VerifyLocalCheckpoint { root, .. }
+                if root == LogAnchor::new(2, committed[1].hash)
+        ));
+
+        let membership = Membership::new(["node-1", "node-2", "node-3"]).unwrap();
+        let recorder = RecorderFileStore::new_with_membership(
+            fresh_rejoin_dir.join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership.clone(),
+        )
+        .unwrap();
+        let recorder_command = StoredCommand::new(EntryType::Command, b"preserved-qcmd".to_vec());
+        recorder
+            .store_command_for(
+                "rhiza:sql:cluster-a".into(),
+                1,
+                1,
+                membership.digest(),
+                recorder_command.hash(),
+                recorder_command.clone(),
+            )
+            .unwrap();
+        recorder
+            .record(RecordRequest {
+                cluster_id: "rhiza:sql:cluster-a".into(),
+                epoch: 1,
+                config_id: 1,
+                config_digest: membership.digest(),
+                slot: 3,
+                step: 4,
+                proposal: Proposal::new(
+                    ProposalPriority::MAX,
+                    "node-1",
+                    1,
+                    AcceptedValue::from_command(
+                        "rhiza:sql:cluster-a",
+                        3,
+                        1,
+                        1,
+                        committed[1].hash,
+                        &recorder_command,
+                    ),
+                ),
+                command: None,
+            })
+            .unwrap();
+        drop(recorder);
+        let recorder_before = directory_file_bytes(&fresh_rejoin_dir.join("recorder"));
+        assert!(recorder_before
+            .values()
+            .any(|bytes| bytes.starts_with(b"QCMD")));
+        assert!(recorder_before
+            .get(Path::new("recorder.wal"))
+            .is_some_and(|bytes| bytes.starts_with(b"QWAL")));
+        std::fs::remove_dir_all(fresh_rejoin_dir.join("consensus")).unwrap();
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &fresh_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root }
+                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
+        ));
+        assert_eq!(
+            directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
+            recorder_before
+        );
+
+        let materializer =
+            SqliteStateMachine::open_existing(fresh_rejoin_dir.join("sqlite/db.sqlite")).unwrap();
+        materializer.apply_entry(&committed[2]).unwrap();
+        let qlog = FileLogStore::open(
+            fresh_rejoin_dir.join("consensus/log"),
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+        )
+        .unwrap();
+        qlog.append(&committed[2]).unwrap();
+        assert!(matches!(
+            prepare_remote_startup(
+                StartupMode::Rejoin,
+                &archive,
+                &fresh_rejoin_dir,
+                "node-1",
+                ExecutionProfile::Sqlite,
+            )
+            .await
+            .unwrap(),
+            StartupPreparation::RuntimeFirstWithPeerCatchup { checkpoint_root }
+                if checkpoint_root == LogAnchor::new(2, committed[1].hash)
+        ));
+        rhiza_node::durability::validate_local_recovery_view(
+            &fresh_rejoin_dir,
+            archive.checkpoint_identity().unwrap(),
+            "node-1",
+            ExecutionProfile::Sqlite,
+            LogAnchor::new(2, committed[1].hash),
+        )
+        .unwrap();
+        assert_eq!(
+            directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
+            recorder_before
         );
 
         std::fs::create_dir_all(fresh_rejoin_dir.join("sqlite")).unwrap();
@@ -7714,17 +7885,34 @@ mod tests {
             .await
             .unwrap(),
             StartupPreparation::RuntimeFirstWithPeerCatchup {
-                checkpoint_root: LogAnchor::new(2, entries(2)[1].hash)
+                checkpoint_root: LogAnchor::new(2, committed[1].hash)
             }
         );
         assert!(fresh_rejoin_dir.join("consensus/log").exists());
-        assert!(std::fs::read_dir(root.path())
+        assert_eq!(
+            directory_file_bytes(&fresh_rejoin_dir.join("recorder")),
+            recorder_before
+        );
+        let recorder = RecorderFileStore::new_with_membership(
+            fresh_rejoin_dir.join("recorder"),
+            "node-1",
+            "rhiza:sql:cluster-a",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        assert_eq!(
+            recorder.fetch_command(recorder_command.hash()).unwrap(),
+            Some(recorder_command)
+        );
+        assert!(std::fs::read_dir(&fresh_rejoin_dir)
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".fresh-rejoin.quarantine-")));
+                .starts_with(".rebuildable-quarantine-")));
 
         let disaster_dir = root.path().join("disaster");
         std::fs::create_dir_all(disaster_dir.join("sqlite")).unwrap();
@@ -8068,8 +8256,9 @@ mod tests {
             recorder.clone(),
             LogAnchor::new(checkpoint_root.index, checkpoint_root.hash),
         );
+        std::fs::remove_dir_all(root.path().join("recorders/node-3")).unwrap();
 
-        rehydrate_recorder_with_retry(runtime, recorder.clone(), checkpoint_root.index)
+        rehydrate_recorder_with_retry(runtime.clone(), recorder.clone(), checkpoint_root.index)
             .await
             .unwrap();
         assert!(gate.inspect_decision_proof(1).is_err());
@@ -8081,6 +8270,26 @@ mod tests {
         assert_eq!(
             recorder.fetch_command(command.hash()).unwrap(),
             Some(command)
+        );
+        let replay = runtime.write("request-2", "key", "two").unwrap();
+        assert_eq!(replay.applied_index, 2);
+        assert_eq!(
+            runtime
+                .read("key", ReadConsistency::Local)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("two")
+        );
+        let next = runtime.write("request-3", "key", "three").unwrap();
+        assert_eq!(next.applied_index, 3);
+        assert_eq!(
+            runtime
+                .read("key", ReadConsistency::Local)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("three")
         );
     }
 

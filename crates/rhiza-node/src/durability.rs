@@ -29,7 +29,7 @@ use rhiza_graph::{
 #[cfg(feature = "kv")]
 use rhiza_kv::{
     decode_snapshot as decode_kv_snapshot, encode_snapshot as encode_kv_snapshot,
-    restore_snapshot_file as restore_kv_snapshot_file,
+    restore_snapshot_file as restore_kv_snapshot_file, RedbStateMachine,
 };
 use rhiza_log::{FileLogStore, IndexRange, LogStore};
 #[cfg(feature = "sql")]
@@ -831,7 +831,7 @@ pub async fn restore_checkpoint_to_fresh_data_dir(
     store: ObjectArchiveStore,
     data_dir: impl AsRef<Path>,
 ) -> Result<CheckpointTip, DurabilityError> {
-    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None).await
+    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), None, None).await
 }
 
 pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
@@ -844,24 +844,197 @@ pub async fn restore_checkpoint_to_fresh_data_dir_for_node(
             "target node_id is empty".into(),
         ));
     }
-    restore_checkpoint_to_fresh_data_dir_with_target(store, data_dir.as_ref(), Some(target_node_id))
-        .await
+    restore_checkpoint_to_fresh_data_dir_with_target(
+        store,
+        data_dir.as_ref(),
+        Some(target_node_id),
+        None,
+    )
+    .await
+}
+
+pub async fn restore_checkpoint_to_fresh_data_dir_for_node_with_marker(
+    store: ObjectArchiveStore,
+    data_dir: impl AsRef<Path>,
+    target_node_id: &str,
+    marker_name: &str,
+    marker_contents: &[u8],
+) -> Result<CheckpointTip, DurabilityError> {
+    if target_node_id.is_empty() {
+        return Err(DurabilityError::SnapshotVerification(
+            "target node_id is empty".into(),
+        ));
+    }
+    validate_restore_marker_name(marker_name)?;
+    restore_checkpoint_to_fresh_data_dir_with_target(
+        store,
+        data_dir.as_ref(),
+        Some(target_node_id),
+        Some((marker_name, marker_contents)),
+    )
+    .await
+}
+
+pub fn checkpoint_restore_in_progress(data_dir: impl AsRef<Path>) -> Result<bool, DurabilityError> {
+    let intent = data_dir.as_ref().join(RESTORE_INTENT_FILE);
+    let metadata = match fs::symlink_metadata(&intent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || fs::read(intent)? != RESTORE_INTENT_CONTENTS
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "local checkpoint restore intent is invalid".into(),
+        ));
+    }
+    Ok(true)
+}
+
+pub fn validate_local_recovery_view(
+    data_dir: impl AsRef<Path>,
+    identity: &CheckpointIdentity,
+    target_node_id: &str,
+    execution_profile: ExecutionProfile,
+    checkpoint_root: LogAnchor,
+) -> Result<(), DurabilityError> {
+    let data_dir = data_dir.as_ref();
+    if checkpoint_restore_in_progress(data_dir)? {
+        return Err(DurabilityError::SnapshotVerification(
+            "local recovery view has an incomplete checkpoint restore intent".into(),
+        ));
+    }
+    #[cfg(not(feature = "kv"))]
+    let _ = target_node_id;
+    if snapshot_profile(identity.cluster_id())? != execution_profile {
+        return Err(DurabilityError::SnapshotVerification(
+            "local recovery view profile does not match checkpoint identity".into(),
+        ));
+    }
+    match execution_profile {
+        ExecutionProfile::Sqlite => {
+            #[cfg(feature = "sql")]
+            {
+                let state =
+                    rhiza_sql::SqliteStateMachine::open_existing(data_dir.join("sqlite/db.sqlite"))
+                        .map_err(|error| {
+                            DurabilityError::SnapshotVerification(error.to_string())
+                        })?;
+                validate_materializer_tip(
+                    "SQL",
+                    LogAnchor::new(
+                        state.applied_index_value().map_err(|error| {
+                            DurabilityError::SnapshotVerification(error.to_string())
+                        })?,
+                        state.applied_hash_value().map_err(|error| {
+                            DurabilityError::SnapshotVerification(error.to_string())
+                        })?,
+                    ),
+                    checkpoint_root,
+                )?;
+            }
+            #[cfg(not(feature = "sql"))]
+            return Err(DurabilityError::SnapshotVerification(
+                "sql execution profile is not compiled in".into(),
+            ));
+        }
+        ExecutionProfile::Kv => {
+            #[cfg(feature = "kv")]
+            {
+                let path = data_dir.join("kv/data.redb");
+                if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                    return Err(DurabilityError::SnapshotVerification(
+                        "KV materializer is missing or is not a regular file".into(),
+                    ));
+                }
+                let state = RedbStateMachine::open(
+                    &path,
+                    identity.cluster_id(),
+                    target_node_id,
+                    identity.epoch(),
+                    identity.config_id(),
+                )
+                .map_err(|error| DurabilityError::SnapshotVerification(error.to_string()))?;
+                validate_materializer_tip(
+                    "KV",
+                    state.applied_tip().map_err(|error| {
+                        DurabilityError::SnapshotVerification(error.to_string())
+                    })?,
+                    checkpoint_root,
+                )?;
+            }
+            #[cfg(not(feature = "kv"))]
+            return Err(DurabilityError::SnapshotVerification(
+                "kv execution profile is not compiled in".into(),
+            ));
+        }
+        ExecutionProfile::Graph => return Ok(()),
+    }
+
+    validate_local_qlog(data_dir, identity, checkpoint_root)
+}
+
+pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
+    store: ObjectArchiveStore,
+    data_dir: impl AsRef<Path>,
+    target_node_id: &str,
+    execution_profile: ExecutionProfile,
+    marker_name: &str,
+    marker_contents: &[u8],
+) -> Result<CheckpointTip, DurabilityError> {
+    if target_node_id.is_empty() {
+        return Err(DurabilityError::SnapshotVerification(
+            "target node_id is empty".into(),
+        ));
+    }
+    validate_restore_marker_name(marker_name)?;
+    let data_dir = data_dir.as_ref();
+    let identity = store.checkpoint_identity()?.clone();
+    if snapshot_profile(identity.cluster_id())? != execution_profile
+        || execution_profile == ExecutionProfile::Graph
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "rejoin recovery only replaces matching SQL or KV recovery views".into(),
+        ));
+    }
+    let restored = store.restore_checkpoint_v2().await?;
+    publish_restore_marker(data_dir, RESTORE_INTENT_FILE, RESTORE_INTENT_CONTENTS)?;
+    install_restored_checkpoint(
+        &identity,
+        &restored,
+        data_dir,
+        Some(target_node_id),
+        true,
+        true,
+        Some((marker_name, marker_contents)),
+    )
 }
 
 async fn restore_checkpoint_to_fresh_data_dir_with_target(
     store: ObjectArchiveStore,
     data_dir: &Path,
     target_node_id: Option<&str>,
+    completion_marker: Option<(&str, &[u8])>,
 ) -> Result<CheckpointTip, DurabilityError> {
     let identity = store.checkpoint_identity()?.clone();
     store
         .load_checkpoint()
         .await?
         .ok_or(DurabilityError::MissingCheckpoint)?;
-    prepare_fresh_restore_data_dir(data_dir)?;
+    prepare_fresh_restore_data_dir(data_dir, completion_marker.map(|(name, _)| name))?;
     let restored = store.restore_checkpoint_v2().await?;
     publish_restore_marker(data_dir, RESTORE_INTENT_FILE, RESTORE_INTENT_CONTENTS)?;
-    install_restored_checkpoint(&identity, &restored, data_dir, target_node_id, true)
+    install_restored_checkpoint(
+        &identity,
+        &restored,
+        data_dir,
+        target_node_id,
+        true,
+        false,
+        completion_marker,
+    )
 }
 
 fn install_restored_checkpoint(
@@ -870,6 +1043,8 @@ fn install_restored_checkpoint(
     data_dir: &Path,
     target_node_id: Option<&str>,
     remove_generic_intent: bool,
+    replace_rebuildable: bool,
+    completion_marker: Option<(&str, &[u8])>,
 ) -> Result<CheckpointTip, DurabilityError> {
     let tip = *restored.tip();
     let profile = snapshot_profile(identity.cluster_id())?;
@@ -910,7 +1085,10 @@ fn install_restored_checkpoint(
                 ));
             }
         }
-        publish_restore_staging(&staging, data_dir, remove_generic_intent)
+        if replace_rebuildable {
+            quarantine_rebuildable_view(data_dir, profile)?;
+        }
+        publish_restore_staging(&staging, data_dir, remove_generic_intent, completion_marker)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -926,6 +1104,81 @@ fn validate_restored_suffix(
     for entry in suffix {
         crate::validate_profile_entry_shape(profile, entry)
             .map_err(DurabilityError::SnapshotVerification)?;
+    }
+    Ok(())
+}
+
+fn validate_materializer_tip(
+    label: &str,
+    actual: LogAnchor,
+    checkpoint_root: LogAnchor,
+) -> Result<(), DurabilityError> {
+    if actual != checkpoint_root {
+        return Err(DurabilityError::SnapshotVerification(format!(
+            "{label} materializer tip {}/{} does not exactly match checkpoint root {}/{}",
+            actual.index(),
+            actual.hash().to_hex(),
+            checkpoint_root.index(),
+            checkpoint_root.hash().to_hex(),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_local_qlog(
+    data_dir: &Path,
+    identity: &CheckpointIdentity,
+    checkpoint_root: LogAnchor,
+) -> Result<(), DurabilityError> {
+    let path = data_dir.join("consensus/log");
+    if !path_has_state(&path)? {
+        return Err(DurabilityError::SnapshotVerification(
+            "local qlog is missing or empty".into(),
+        ));
+    }
+    let log = FileLogStore::open(
+        path,
+        identity.cluster_id(),
+        identity.epoch(),
+        identity.config_id(),
+    )?;
+    let state = log.logical_state()?;
+    let tip = state
+        .tip
+        .ok_or_else(|| DurabilityError::SnapshotVerification("local qlog has no tip".into()))?;
+    if tip != checkpoint_root {
+        return Err(DurabilityError::SnapshotVerification(format!(
+            "local qlog tip {}/{} does not exactly match checkpoint root {}/{}",
+            tip.index(),
+            tip.hash().to_hex(),
+            checkpoint_root.index(),
+            checkpoint_root.hash().to_hex(),
+        )));
+    }
+    if checkpoint_root.index() == 0 {
+        if checkpoint_root.hash() != LogHash::ZERO {
+            return Err(DurabilityError::SnapshotVerification(
+                "checkpoint genesis hash is not zero".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let included_hash = match state.anchor.as_ref() {
+        Some(anchor) if anchor.compacted().index() == checkpoint_root.index() => {
+            Some(anchor.compacted().hash())
+        }
+        Some(anchor) if anchor.compacted().index() > checkpoint_root.index() => {
+            return Err(DurabilityError::SnapshotVerification(
+                "local qlog compacted past checkpoint root without exact inclusion evidence".into(),
+            ));
+        }
+        _ => log.read(checkpoint_root.index())?.map(|entry| entry.hash),
+    };
+    if included_hash != Some(checkpoint_root.hash()) {
+        return Err(DurabilityError::SnapshotVerification(format!(
+            "local qlog does not include checkpoint root {} with its exact hash",
+            checkpoint_root.index(),
+        )));
     }
     Ok(())
 }
@@ -1143,6 +1396,8 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
         config.data_dir(),
         Some(config.node_id()),
         false,
+        false,
+        None,
     )?;
     Ok(SuccessorRestorePreparation {
         tip: *restored.tip(),
@@ -1178,6 +1433,7 @@ fn publish_restore_staging(
     staging: &Path,
     data_dir: &Path,
     remove_generic_intent: bool,
+    completion_marker: Option<(&str, &[u8])>,
 ) -> Result<(), DurabilityError> {
     sync_directory(staging)?;
     for name in ["sqlite", "ladybug", "kv", "consensus"] {
@@ -1188,10 +1444,62 @@ fn publish_restore_staging(
     }
     fs::remove_dir(staging)?;
     sync_directory(data_dir)?;
+    if let Some((marker_name, marker_contents)) = completion_marker {
+        publish_restore_marker(data_dir, marker_name, marker_contents)?;
+    }
     if remove_generic_intent {
         fs::remove_file(data_dir.join(RESTORE_INTENT_FILE))?;
     }
     sync_directory(data_dir)
+}
+
+fn quarantine_rebuildable_view(
+    data_dir: &Path,
+    profile: ExecutionProfile,
+) -> Result<Option<PathBuf>, DurabilityError> {
+    let materializer = match profile {
+        ExecutionProfile::Sqlite => "sqlite",
+        ExecutionProfile::Kv => "kv",
+        ExecutionProfile::Graph => {
+            return Err(DurabilityError::SnapshotVerification(
+                "graph recovery view replacement is outside this recovery path".into(),
+            ))
+        }
+    };
+    let names = [materializer, "consensus"];
+    if !names
+        .iter()
+        .any(|name| fs::symlink_metadata(data_dir.join(name)).is_ok())
+    {
+        return Ok(None);
+    }
+    for _ in 0..128 {
+        let sequence = RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let quarantine = data_dir.join(format!(
+            ".rebuildable-quarantine-{}-{sequence}",
+            process::id()
+        ));
+        match fs::create_dir(&quarantine) {
+            Ok(()) => {
+                for name in names {
+                    let source = data_dir.join(name);
+                    if fs::symlink_metadata(&source).is_ok() {
+                        fs::rename(source, quarantine.join(name))?;
+                    }
+                }
+                sync_directory(&quarantine)?;
+                sync_directory(data_dir)?;
+                return Ok(Some(quarantine));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate rebuildable recovery quarantine",
+    )
+    .into())
 }
 
 fn publish_restore_marker(
@@ -1199,6 +1507,7 @@ fn publish_restore_marker(
     marker_name: &str,
     contents: &[u8],
 ) -> Result<(), DurabilityError> {
+    validate_restore_marker_name(marker_name)?;
     fs::create_dir_all(data_dir)?;
     let sequence = RESTORE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = data_dir.join(format!(
@@ -1213,6 +1522,18 @@ fn publish_restore_marker(
     file.sync_all()?;
     fs::rename(temporary, data_dir.join(marker_name))?;
     sync_directory(data_dir)
+}
+
+fn validate_restore_marker_name(marker_name: &str) -> Result<(), DurabilityError> {
+    if marker_name.is_empty()
+        || matches!(marker_name, "." | "..")
+        || marker_name.contains(std::path::MAIN_SEPARATOR)
+    {
+        return Err(DurabilityError::SnapshotVerification(
+            "restore marker name must be one local file name".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1405,7 +1726,10 @@ fn validate_local_batch(
     Ok(())
 }
 
-fn prepare_fresh_restore_data_dir(data_dir: &Path) -> Result<(), DurabilityError> {
+fn prepare_fresh_restore_data_dir(
+    data_dir: &Path,
+    completion_marker_name: Option<&str>,
+) -> Result<(), DurabilityError> {
     if !path_has_state(data_dir)? {
         return Ok(());
     }
@@ -1435,6 +1759,7 @@ fn prepare_fresh_restore_data_dir(data_dir: &Path) -> Result<(), DurabilityError
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let owned = name == RESTORE_INTENT_FILE
+            || completion_marker_name.is_some_and(|marker| name == marker)
             || name == "sqlite"
             || name == "ladybug"
             || name == "kv"
@@ -1486,10 +1811,24 @@ fn path_has_state(path: &Path) -> Result<bool, std::io::Error> {
 mod tests {
     use super::{
         completed_successor_identity_matches, mark_durable_state, observe_durable_tip,
-        snapshot_profile, validate_restored_suffix, CheckpointTip, CoordinatorState,
-        DurabilityError, DurabilityHealth, ExecutionProfile, LogHash, PendingLag,
+        restore_checkpoint_for_rejoin_preserving_recorder,
+        restore_checkpoint_to_fresh_data_dir_for_node, snapshot_profile, validate_local_qlog,
+        validate_local_recovery_view, validate_materializer_tip, validate_restored_suffix,
+        CheckpointCoordinator, CheckpointTip, CoordinatorState, DurabilityError, DurabilityHealth,
+        DurabilityMode, ExecutionProfile, LogHash, PendingLag, RESTORE_INTENT_CONTENTS,
+        RESTORE_INTENT_FILE,
     };
+    #[cfg(feature = "kv")]
+    use crate::{KvCommandV1, NodeConfig, NodeRuntime};
+    use rhiza_archive::CheckpointIdentity;
+    #[cfg(feature = "kv")]
+    use rhiza_archive::ObjectArchiveStore;
     use rhiza_core::{EntryType, LogEntry};
+    use rhiza_log::{FileLogStore, LogStore};
+    #[cfg(feature = "kv")]
+    use rhiza_obj_store::{ObjStore, ObjStoreConfig};
+    #[cfg(feature = "kv")]
+    use rhiza_quepaxa::ThreeNodeConsensus;
     use std::sync::{Arc, Barrier, Mutex};
 
     #[test]
@@ -1539,6 +1878,229 @@ mod tests {
             validate_restored_suffix(ExecutionProfile::Sqlite, &[entry]),
             Err(DurabilityError::SnapshotVerification(message)) if message.contains("QWAL")
         ));
+    }
+
+    #[test]
+    fn materializer_tip_requires_exact_checkpoint_root() {
+        let checkpoint = rhiza_core::LogAnchor::new(4, LogHash::digest(&[b"checkpoint"]));
+        let ahead = rhiza_core::LogAnchor::new(5, LogHash::digest(&[b"ahead"]));
+        let behind = rhiza_core::LogAnchor::new(3, LogHash::digest(&[b"behind"]));
+        let conflicting = rhiza_core::LogAnchor::new(4, LogHash::digest(&[b"conflicting"]));
+
+        assert!(validate_materializer_tip("test", ahead, checkpoint).is_err());
+        assert!(validate_materializer_tip("test", behind, checkpoint).is_err());
+        assert!(validate_materializer_tip("test", conflicting, checkpoint).is_err());
+        assert!(validate_materializer_tip("test", checkpoint, checkpoint).is_ok());
+    }
+
+    #[test]
+    fn local_qlog_rejects_ahead_tip_even_when_checkpoint_entry_is_retained() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = CheckpointIdentity::new("rhiza:sql:cluster-a", 1, 1, 1);
+        let log = FileLogStore::open(
+            root.path().join("consensus/log"),
+            identity.cluster_id(),
+            1,
+            1,
+        )
+        .unwrap();
+        let entry = |index, previous| {
+            let hash = LogEntry::calculate_hash(
+                identity.cluster_id(),
+                index,
+                1,
+                1,
+                EntryType::Noop,
+                previous,
+                &[],
+            );
+            LogEntry {
+                cluster_id: identity.cluster_id().into(),
+                epoch: 1,
+                config_id: 1,
+                index,
+                entry_type: EntryType::Noop,
+                payload: Vec::new(),
+                prev_hash: previous,
+                hash,
+            }
+        };
+        let first = entry(1, LogHash::ZERO);
+        let second = entry(2, first.hash);
+        log.append_batch(&[first.clone(), second]).unwrap();
+
+        assert!(validate_local_qlog(
+            root.path(),
+            &identity,
+            rhiza_core::LogAnchor::new(first.index, first.hash),
+        )
+        .is_err());
+        assert!(validate_local_qlog(
+            root.path(),
+            &identity,
+            rhiza_core::LogAnchor::new(2, LogHash::digest(&[b"conflicting"])),
+        )
+        .is_err());
+        assert!(validate_local_qlog(
+            root.path(),
+            &identity,
+            rhiza_core::LogAnchor::new(3, LogHash::digest(&[b"ahead checkpoint"])),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn restore_intent_remains_until_completion_marker_is_durable_and_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join(RESTORE_INTENT_FILE), RESTORE_INTENT_CONTENTS).unwrap();
+        std::fs::create_dir(data_dir.join("identity.json")).unwrap();
+        let staging = super::create_restore_staging_dir(&data_dir).unwrap();
+
+        assert!(super::publish_restore_staging(
+            &staging,
+            &data_dir,
+            true,
+            Some(("identity.json", b"identity-v1")),
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(data_dir.join(RESTORE_INTENT_FILE)).unwrap(),
+            RESTORE_INTENT_CONTENTS
+        );
+
+        std::fs::remove_dir(data_dir.join("identity.json")).unwrap();
+        let retry_staging = super::create_restore_staging_dir(&data_dir).unwrap();
+        super::publish_restore_staging(
+            &retry_staging,
+            &data_dir,
+            true,
+            Some(("identity.json", b"identity-v1")),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(data_dir.join("identity.json")).unwrap(),
+            b"identity-v1"
+        );
+        assert!(!data_dir.join(RESTORE_INTENT_FILE).exists());
+    }
+
+    #[cfg(feature = "kv")]
+    #[tokio::test]
+    async fn kv_compacted_rejoin_restores_missing_or_corrupt_views_without_touching_recorder() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = CheckpointIdentity::new("rhiza:kv:cluster-a", 1, 1, 1);
+        let archive = ObjectArchiveStore::new_checkpoint_for_single_process(
+            ObjStore::new(ObjStoreConfig::Local {
+                root: root.path().join("archive"),
+            })
+            .unwrap(),
+            identity.clone(),
+        );
+        archive.initialize_checkpoint().await.unwrap();
+        let source_dir = root.path().join("source");
+        let config = NodeConfig::new_embedded(
+            "cluster-a",
+            "node-1",
+            source_dir,
+            1,
+            1,
+            ["node-1", "node-2", "node-3"],
+        )
+        .unwrap()
+        .with_execution_profile(ExecutionProfile::Kv)
+        .unwrap()
+        .with_recovery_generation(1)
+        .unwrap();
+        let consensus = Arc::new(
+            ThreeNodeConsensus::from_recovered_tip(
+                "rhiza:kv:cluster-a",
+                "node-1",
+                1,
+                1,
+                [
+                    root.path().join("recorders/node-1"),
+                    root.path().join("recorders/node-2"),
+                    root.path().join("recorders/node-3"),
+                ],
+                1,
+                LogHash::ZERO,
+            )
+            .unwrap(),
+        );
+        let runtime = NodeRuntime::open(config, consensus, &[]).unwrap();
+        let coordinator = CheckpointCoordinator::open(archive.clone(), DurabilityMode::Sync)
+            .await
+            .unwrap();
+        let committed = runtime
+            .mutate_kv(KvCommandV1::put("request-1", b"key".to_vec(), b"value".to_vec()).unwrap())
+            .unwrap();
+        coordinator.note_committed(committed.applied_index());
+        coordinator
+            .flush_runtime(&runtime, committed.applied_index())
+            .await
+            .unwrap();
+        let checkpoint_root = runtime.checkpoint_compact(&coordinator).await.unwrap();
+
+        let target = root.path().join("target");
+        restore_checkpoint_to_fresh_data_dir_for_node(archive.clone(), &target, "node-1")
+            .await
+            .unwrap();
+        validate_local_recovery_view(
+            &target,
+            &identity,
+            "node-1",
+            ExecutionProfile::Kv,
+            *checkpoint_root.compacted(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(target.join("recorder")).unwrap();
+        std::fs::write(target.join("recorder/sentinel"), b"keep-me").unwrap();
+
+        std::fs::remove_dir_all(target.join("consensus")).unwrap();
+        assert!(validate_local_recovery_view(
+            &target,
+            &identity,
+            "node-1",
+            ExecutionProfile::Kv,
+            *checkpoint_root.compacted(),
+        )
+        .is_err());
+        restore_checkpoint_for_rejoin_preserving_recorder(
+            archive.clone(),
+            &target,
+            "node-1",
+            ExecutionProfile::Kv,
+            "identity.json",
+            b"identity-v1",
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(target.join("kv/data.redb"), b"corrupt").unwrap();
+        assert!(validate_local_recovery_view(
+            &target,
+            &identity,
+            "node-1",
+            ExecutionProfile::Kv,
+            *checkpoint_root.compacted(),
+        )
+        .is_err());
+        restore_checkpoint_for_rejoin_preserving_recorder(
+            archive,
+            &target,
+            "node-1",
+            ExecutionProfile::Kv,
+            "identity.json",
+            b"identity-v1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(target.join("recorder/sentinel")).unwrap(),
+            b"keep-me"
+        );
     }
 
     fn successor_receipt(index: u64, hash_byte: char, generation: u64) -> Vec<u8> {
