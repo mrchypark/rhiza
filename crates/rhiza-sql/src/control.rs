@@ -18,10 +18,11 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 
 use super::{ApplyProgress, Error, RequestConflict, RequestOutcome, Result};
+use crate::page_state::StateIdentityV3;
 
-const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x05";
-const CONTROL_SCHEMA_VERSION: u64 = 5;
-const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x05";
+const CONTROL_MAGIC: &[u8] = b"RHIZA-SQL-CONTROL\0\x06";
+const CONTROL_SCHEMA_VERSION: u64 = 6;
+const SNAPSHOT_MAGIC: &[u8] = b"QCTL\0\x06";
 const MAX_RESULT_BLOB_BYTES: usize = super::MAX_SQL_EFFECT_BYTES;
 const SQLITE_VARIABLE_LIMIT: usize = 999;
 const RECEIPT_LOOKUP_CHUNK_SIZE: usize = SQLITE_VARIABLE_LIMIT;
@@ -44,16 +45,19 @@ const CREATE_PENDING_APPLY_SQL: &str = r#"CREATE TABLE pending_apply (
     base_hash BLOB NOT NULL CHECK(length(base_hash) = 32),
     entry_index INTEGER NOT NULL CHECK(entry_index > 0),
     entry_hash BLOB NOT NULL CHECK(length(entry_hash) = 32),
-    base_db_digest BLOB NOT NULL CHECK(length(base_db_digest) = 32),
-    target_db_digest BLOB NOT NULL CHECK(length(target_db_digest) = 32),
-    target_file_bytes INTEGER NOT NULL CHECK(target_file_bytes >= 0)
+    base_page_size INTEGER NOT NULL CHECK(base_page_size >= 512 AND base_page_size <= 65536),
+    base_page_count INTEGER NOT NULL CHECK(base_page_count > 0),
+    base_state_root BLOB NOT NULL CHECK(length(base_state_root) = 32),
+    target_page_size INTEGER NOT NULL CHECK(target_page_size >= 512 AND target_page_size <= 65536),
+    target_page_count INTEGER NOT NULL CHECK(target_page_count > 0),
+    target_state_root BLOB NOT NULL CHECK(length(target_state_root) = 32)
 );"#;
 const CREATE_EMBEDDED_LOG_SQL: &str = r#"CREATE TABLE embedded_qlog (
     log_index INTEGER PRIMARY KEY CHECK(log_index > 0),
     entry_bytes BLOB NOT NULL
 ) WITHOUT ROWID;"#;
 
-const REQUIRED_META_KEYS: [&str; 10] = [
+const REQUIRED_META_KEYS: [&str; 12] = [
     "magic",
     "schema_version",
     "cluster_id",
@@ -62,7 +66,9 @@ const REQUIRED_META_KEYS: [&str; 10] = [
     "configuration_state",
     "recovery_generation",
     "materializer_fingerprint",
-    "user_db_digest",
+    "page_size",
+    "page_count",
+    "state_root",
     "applied_tip",
 ];
 
@@ -83,9 +89,12 @@ const PENDING_APPLY_COLUMNS: &[ExpectedColumn] = &[
     ("base_hash", "BLOB", true, 0),
     ("entry_index", "INTEGER", true, 0),
     ("entry_hash", "BLOB", true, 0),
-    ("base_db_digest", "BLOB", true, 0),
-    ("target_db_digest", "BLOB", true, 0),
-    ("target_file_bytes", "INTEGER", true, 0),
+    ("base_page_size", "INTEGER", true, 0),
+    ("base_page_count", "INTEGER", true, 0),
+    ("base_state_root", "BLOB", true, 0),
+    ("target_page_size", "INTEGER", true, 0),
+    ("target_page_count", "INTEGER", true, 0),
+    ("target_state_root", "BLOB", true, 0),
 ];
 const EMBEDDED_LOG_COLUMNS: &[ExpectedColumn] = &[
     ("log_index", "INTEGER", true, 1),
@@ -100,7 +109,7 @@ pub struct ControlIdentity {
     configuration_state: ConfigurationState,
     recovery_generation: u64,
     materializer_fingerprint: LogHash,
-    user_db_digest: LogHash,
+    user_state: StateIdentityV3,
 }
 
 impl ControlIdentity {
@@ -111,7 +120,7 @@ impl ControlIdentity {
         configuration_state: ConfigurationState,
         recovery_generation: u64,
         materializer_fingerprint: LogHash,
-        user_db_digest: LogHash,
+        user_state: StateIdentityV3,
     ) -> Self {
         Self {
             cluster_id: cluster_id.into(),
@@ -120,7 +129,7 @@ impl ControlIdentity {
             configuration_state,
             recovery_generation,
             materializer_fingerprint,
-            user_db_digest,
+            user_state,
         }
     }
 
@@ -142,8 +151,8 @@ impl ControlIdentity {
     pub const fn materializer_fingerprint(&self) -> LogHash {
         self.materializer_fingerprint
     }
-    pub const fn user_db_digest(&self) -> LogHash {
-        self.user_db_digest
+    pub const fn user_state(&self) -> StateIdentityV3 {
+        self.user_state
     }
 }
 
@@ -190,25 +199,22 @@ impl RequestReceipt {
 pub struct PendingApply {
     base: LogAnchor,
     entry: LogAnchor,
-    base_db_digest: LogHash,
-    target_db_digest: LogHash,
-    target_file_bytes: u64,
+    base_state: StateIdentityV3,
+    target_state: StateIdentityV3,
 }
 
 impl PendingApply {
     pub const fn new(
         base: LogAnchor,
         entry: LogAnchor,
-        base_db_digest: LogHash,
-        target_db_digest: LogHash,
-        target_file_bytes: u64,
+        base_state: StateIdentityV3,
+        target_state: StateIdentityV3,
     ) -> Self {
         Self {
             base,
             entry,
-            base_db_digest,
-            target_db_digest,
-            target_file_bytes,
+            base_state,
+            target_state,
         }
     }
 
@@ -218,14 +224,11 @@ impl PendingApply {
     pub const fn entry(&self) -> LogAnchor {
         self.entry
     }
-    pub const fn base_db_digest(&self) -> LogHash {
-        self.base_db_digest
+    pub const fn base_state(&self) -> StateIdentityV3 {
+        self.base_state
     }
-    pub const fn target_db_digest(&self) -> LogHash {
-        self.target_db_digest
-    }
-    pub const fn target_file_bytes(&self) -> u64 {
-        self.target_file_bytes
+    pub const fn target_state(&self) -> StateIdentityV3 {
+        self.target_state
     }
 }
 
@@ -237,7 +240,7 @@ struct ReplicatedSnapshot {
     configuration_state: ConfigurationState,
     recovery_generation: u64,
     materializer_fingerprint: LogHash,
-    user_db_digest: LogHash,
+    user_state: StateIdentityV3,
     applied_tip: LogAnchor,
     receipts: Vec<RequestReceipt>,
 }
@@ -358,7 +361,7 @@ impl ControlStore {
             "materializer_fingerprint",
             identity.materializer_fingerprint,
         )?;
-        put_hash(&tx, "user_db_digest", identity.user_db_digest)?;
+        put_state(&tx, identity.user_state)?;
         put_anchor(&tx, "applied_tip", LogAnchor::new(0, LogHash::ZERO))?;
         tx.commit().map_err(sqlite_error)
     }
@@ -375,7 +378,7 @@ impl ControlStore {
             meta_configuration(&self.conn)?,
             meta_u64(&self.conn, "recovery_generation")?,
             meta_hash(&self.conn, "materializer_fingerprint")?,
-            meta_hash(&self.conn, "user_db_digest")?,
+            meta_state(&self.conn)?,
         ))
     }
 
@@ -396,8 +399,8 @@ impl ControlStore {
         meta_hash(&self.conn, "materializer_fingerprint")
     }
 
-    pub fn user_db_digest(&self) -> Result<LogHash> {
-        meta_hash(&self.conn, "user_db_digest")
+    pub fn user_state(&self) -> Result<StateIdentityV3> {
+        meta_state(&self.conn)
     }
 
     pub fn lookup_request(
@@ -436,8 +439,8 @@ impl ControlStore {
             };
         }
         let tip = meta_anchor(&tx, "applied_tip")?;
-        let db_digest = meta_hash(&tx, "user_db_digest")?;
-        if pending.base != tip || pending.base_db_digest != db_digest {
+        let user_state = meta_state(&tx)?;
+        if pending.base != tip || pending.base_state != user_state {
             return Err(Error::InvalidEntry(
                 "pending apply does not match the committed base".into(),
             ));
@@ -478,8 +481,8 @@ impl ControlStore {
             };
         }
         let tip = meta_anchor(&tx, "applied_tip")?;
-        let db_digest = meta_hash(&tx, "user_db_digest")?;
-        if pending.base != tip || pending.base_db_digest != db_digest {
+        let user_state = meta_state(&tx)?;
+        if pending.base != tip || pending.base_state != user_state {
             return Err(Error::InvalidEntry(
                 "pending apply does not match the committed base".into(),
             ));
@@ -596,7 +599,7 @@ impl ControlStore {
         expected_base: LogAnchor,
         entry: LogAnchor,
         expected_configuration: &ConfigurationState,
-        expected_user_db_digest: LogHash,
+        expected_user_state: StateIdentityV3,
     ) -> Result<()> {
         let expected_entry_index = expected_base
             .index()
@@ -625,9 +628,9 @@ impl ControlStore {
                 "metadata-only commit configuration changed".into(),
             ));
         }
-        if meta_hash(&tx, "user_db_digest")? != expected_user_db_digest {
+        if meta_state(&tx)? != expected_user_state {
             return Err(Error::InvalidEntry(
-                "metadata-only commit user database digest changed".into(),
+                "metadata-only commit user state changed".into(),
             ));
         }
 
@@ -653,7 +656,7 @@ impl ControlStore {
         expected_base: LogAnchor,
         entry: &LogEntry,
         expected_configuration: &ConfigurationState,
-        expected_user_db_digest: LogHash,
+        expected_user_state: StateIdentityV3,
     ) -> Result<()> {
         let entry_anchor = LogAnchor::new(entry.index, entry.hash);
         let expected_entry_index = expected_base
@@ -670,7 +673,7 @@ impl ControlStore {
         if pending_from(&tx)?.is_some()
             || meta_anchor(&tx, "applied_tip")? != expected_base
             || meta_configuration(&tx)? != *expected_configuration
-            || meta_hash(&tx, "user_db_digest")? != expected_user_db_digest
+            || meta_state(&tx)? != expected_user_state
         {
             return Err(Error::InvalidEntry(
                 "metadata-only embedded commit does not match the committed base".into(),
@@ -687,10 +690,10 @@ impl ControlStore {
         configuration_state: &ConfigurationState,
         receipts: &[RequestReceipt],
     ) -> Result<()> {
-        if receipts.len() > super::MAX_QWAL_V2_RECEIPTS {
+        if receipts.len() > super::MAX_QWAL_V3_RECEIPTS {
             return Err(Error::ResourceExhausted(format!(
                 "applied receipt batch exceeds {} members",
-                super::MAX_QWAL_V2_RECEIPTS
+                super::MAX_QWAL_V3_RECEIPTS
             )));
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
@@ -718,7 +721,7 @@ impl ControlStore {
             .as_ref()
             .is_some_and(|existing| existing != pending)
             || meta_anchor(&tx, "applied_tip")? != pending.base
-            || meta_hash(&tx, "user_db_digest")? != pending.base_db_digest
+            || meta_state(&tx)? != pending.base_state
             || LogAnchor::new(entry.index, entry.hash) != pending.entry
             || entry.recompute_hash() != entry.hash
         {
@@ -759,7 +762,7 @@ impl ControlStore {
             configuration_state: meta_configuration(&self.conn)?,
             recovery_generation: meta_u64(&self.conn, "recovery_generation")?,
             materializer_fingerprint: meta_hash(&self.conn, "materializer_fingerprint")?,
-            user_db_digest: meta_hash(&self.conn, "user_db_digest")?,
+            user_state: meta_state(&self.conn)?,
             applied_tip: tip,
             receipts,
         };
@@ -807,7 +810,8 @@ impl ControlStore {
         }
         put_configuration(&tx, &snapshot.configuration_state)?;
         put_u64(&tx, "recovery_generation", recovery_generation)?;
-        put_hash(&tx, "user_db_digest", snapshot.user_db_digest)?;
+        validate_state(snapshot.user_state)?;
+        put_state(&tx, snapshot.user_state)?;
         put_anchor(&tx, "applied_tip", snapshot.applied_tip)?;
         tx.execute("DELETE FROM pending_apply", [])
             .map_err(sqlite_error)?;
@@ -914,8 +918,8 @@ impl ControlStore {
         if actual.materializer_fingerprint != expected.materializer_fingerprint {
             return Err(Error::IdentityMismatch("materializer_fingerprint".into()));
         }
-        if actual.user_db_digest != expected.user_db_digest {
-            return Err(Error::IdentityMismatch("user_db_digest".into()));
+        if actual.user_state != expected.user_state {
+            return Err(Error::IdentityMismatch("user_state".into()));
         }
         Ok(())
     }
@@ -930,6 +934,18 @@ fn validate_new_identity(identity: &ControlIdentity) -> Result<()> {
     }
     if identity.epoch == 0 {
         return Err(Error::IdentityMismatch("epoch".into()));
+    }
+    validate_state(identity.user_state)?;
+    Ok(())
+}
+
+fn validate_state(state: StateIdentityV3) -> Result<()> {
+    if !(512..=65_536).contains(&state.page_size)
+        || !state.page_size.is_power_of_two()
+        || state.page_count == 0
+        || state.state_root == LogHash::ZERO
+    {
+        return Err(Error::IdentityMismatch("user_state".into()));
     }
     Ok(())
 }
@@ -1000,10 +1016,10 @@ fn commit_applied_transaction(
     configuration_state: &ConfigurationState,
     receipts: &[RequestReceipt],
 ) -> Result<()> {
-    if receipts.len() > super::MAX_QWAL_V2_RECEIPTS {
+    if receipts.len() > super::MAX_QWAL_V3_RECEIPTS {
         return Err(Error::ResourceExhausted(format!(
             "applied receipt batch exceeds {} members",
-            super::MAX_QWAL_V2_RECEIPTS
+            super::MAX_QWAL_V3_RECEIPTS
         )));
     }
     if configuration_state.config_id() < meta_configuration(&tx)?.config_id() {
@@ -1018,10 +1034,10 @@ fn commit_applied_transaction(
         result_bytes = result_bytes
             .checked_add(receipt.result_blob.len())
             .ok_or_else(|| Error::ResourceExhausted("receipt result bytes overflow".into()))?;
-        if result_bytes > super::MAX_QWAL_V2_BYTES {
+        if result_bytes > super::MAX_QWAL_V3_BYTES {
             return Err(Error::ResourceExhausted(format!(
                 "receipt results exceed {} bytes",
-                super::MAX_QWAL_V2_BYTES
+                super::MAX_QWAL_V3_BYTES
             )));
         }
         if receipt.original_anchor != pending.entry {
@@ -1059,7 +1075,7 @@ fn commit_applied_transaction(
     insert_receipts_bulk(&tx, pending.entry, &absent)?;
     put_anchor(&tx, "applied_tip", pending.entry)?;
     put_configuration(&tx, configuration_state)?;
-    put_hash(&tx, "user_db_digest", pending.target_db_digest)?;
+    put_state(&tx, pending.target_state)?;
     tx.execute("DELETE FROM pending_apply WHERE singleton = 1", [])
         .map_err(sqlite_error)?;
     tx.commit().map_err(sqlite_error)
@@ -1108,10 +1124,10 @@ fn lookup_requests_from(
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-    if requests.len() > super::MAX_QWAL_V2_RECEIPTS {
+    if requests.len() > super::MAX_QWAL_V3_RECEIPTS {
         return Err(Error::ResourceExhausted(format!(
             "request lookup exceeds {} members",
-            super::MAX_QWAL_V2_RECEIPTS
+            super::MAX_QWAL_V3_RECEIPTS
         )));
     }
     let mut request_ids = HashSet::with_capacity(requests.len());
@@ -1202,7 +1218,7 @@ fn insert_receipts_bulk(
     if receipts.is_empty() {
         return Ok(());
     }
-    if receipts.len() > super::MAX_QWAL_V2_RECEIPTS {
+    if receipts.len() > super::MAX_QWAL_V3_RECEIPTS {
         return Err(Error::ResourceExhausted(
             "bulk receipt insert exceeds the QWAL receipt limit".into(),
         ));
@@ -1281,9 +1297,11 @@ fn insert_or_validate_receipt(conn: &Connection, receipt: &RequestReceipt) -> Re
 }
 
 fn insert_pending(conn: &Connection, value: &PendingApply) -> Result<()> {
+    validate_state(value.base_state)?;
+    validate_state(value.target_state)?;
     conn.execute(
-        "INSERT INTO pending_apply(singleton,base_index,base_hash,entry_index,entry_hash,base_db_digest,target_db_digest,target_file_bytes) VALUES(1,?1,?2,?3,?4,?5,?6,?7)",
-        params![u64_to_sql(value.base.index())?, value.base.hash().as_bytes().as_slice(), u64_to_sql(value.entry.index())?, value.entry.hash().as_bytes().as_slice(), value.base_db_digest.as_bytes().as_slice(), value.target_db_digest.as_bytes().as_slice(), u64_to_sql(value.target_file_bytes)?],
+        "INSERT INTO pending_apply(singleton,base_index,base_hash,entry_index,entry_hash,base_page_size,base_page_count,base_state_root,target_page_size,target_page_count,target_state_root) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![u64_to_sql(value.base.index())?, value.base.hash().as_bytes().as_slice(), u64_to_sql(value.entry.index())?, value.entry.hash().as_bytes().as_slice(), i64::from(value.base_state.page_size), i64::from(value.base_state.page_count), value.base_state.state_root.as_bytes().as_slice(), i64::from(value.target_state.page_size), i64::from(value.target_state.page_count), value.target_state.state_root.as_bytes().as_slice()],
     ).map_err(sqlite_error)?;
     Ok(())
 }
@@ -1339,16 +1357,27 @@ fn decode_embedded_log_entry(encoded: &[u8], cluster_id: &str) -> Result<LogEntr
 
 fn pending_from(conn: &Connection) -> Result<Option<PendingApply>> {
     conn.query_row(
-        "SELECT base_index,base_hash,entry_index,entry_hash,base_db_digest,target_db_digest,target_file_bytes FROM pending_apply WHERE singleton=1",
+        "SELECT base_index,base_hash,entry_index,entry_hash,base_page_size,base_page_count,base_state_root,target_page_size,target_page_count,target_state_root FROM pending_apply WHERE singleton=1",
         [],
         |row| Ok(PendingApply::new(
             LogAnchor::new(u64_from_sql(row.get(0)?)?, hash_from_blob(row.get(1)?)?),
             LogAnchor::new(u64_from_sql(row.get(2)?)?, hash_from_blob(row.get(3)?)?),
-            hash_from_blob(row.get(4)?)?,
-            hash_from_blob(row.get(5)?)?,
-            u64_from_sql(row.get(6)?)?,
+            StateIdentityV3 {
+                page_size: u32_from_sql(row.get(4)?)?,
+                page_count: u32_from_sql(row.get(5)?)?,
+                state_root: hash_from_blob(row.get(6)?)?,
+            },
+            StateIdentityV3 {
+                page_size: u32_from_sql(row.get(7)?)?,
+                page_count: u32_from_sql(row.get(8)?)?,
+                state_root: hash_from_blob(row.get(9)?)?,
+            },
         )),
-    ).optional().map_err(sqlite_error)
+    ).optional().map_err(sqlite_error)?.map(|pending| {
+        validate_state(pending.base_state)?;
+        validate_state(pending.target_state)?;
+        Ok(pending)
+    }).transpose()
 }
 
 fn encode_snapshot(snapshot: &ReplicatedSnapshot) -> Result<Vec<u8>> {
@@ -1437,6 +1466,23 @@ fn meta_hash(conn: &Connection, key: &str) -> Result<LogHash> {
         Error::Sqlite(format!("invalid control hash {key}"))
     })?))
 }
+fn put_state(conn: &Connection, state: StateIdentityV3) -> Result<()> {
+    validate_state(state)?;
+    put_u64(conn, "page_size", u64::from(state.page_size))?;
+    put_u64(conn, "page_count", u64::from(state.page_count))?;
+    put_hash(conn, "state_root", state.state_root)
+}
+fn meta_state(conn: &Connection) -> Result<StateIdentityV3> {
+    let state = StateIdentityV3 {
+        page_size: u32::try_from(meta_u64(conn, "page_size")?)
+            .map_err(|_| Error::Sqlite("invalid control page_size".into()))?,
+        page_count: u32::try_from(meta_u64(conn, "page_count")?)
+            .map_err(|_| Error::Sqlite("invalid control page_count".into()))?,
+        state_root: meta_hash(conn, "state_root")?,
+    };
+    validate_state(state)?;
+    Ok(state)
+}
 fn meta_text(conn: &Connection, key: &str) -> Result<String> {
     String::from_utf8(get_meta(conn, key)?)
         .map_err(|_| Error::Sqlite(format!("invalid control text {key}")))
@@ -1476,6 +1522,9 @@ fn u64_to_sql(value: u64) -> Result<i64> {
 fn u64_from_sql(value: i64) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
 }
+fn u32_from_sql(value: i64) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, value))
+}
 fn hash_from_blob(bytes: Vec<u8>) -> rusqlite::Result<LogHash> {
     let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1510,6 +1559,13 @@ mod tests {
     fn hash(label: &[u8]) -> LogHash {
         LogHash::digest(&[label])
     }
+    fn state(label: &[u8]) -> StateIdentityV3 {
+        StateIdentityV3 {
+            page_size: 512,
+            page_count: 8,
+            state_root: hash(label),
+        }
+    }
     fn identity(node: &str) -> ControlIdentity {
         ControlIdentity::new(
             "cluster",
@@ -1518,16 +1574,15 @@ mod tests {
             ConfigurationState::active(3, hash(b"config")),
             11,
             hash(b"fingerprint"),
-            hash(b"base-db"),
+            state(b"base-db"),
         )
     }
     fn pending() -> PendingApply {
         PendingApply::new(
             LogAnchor::new(0, LogHash::ZERO),
             LogAnchor::new(1, hash(b"entry")),
-            hash(b"base-db"),
-            hash(b"target-db"),
-            4096,
+            state(b"base-db"),
+            state(b"target-db"),
         )
     }
     fn receipt(digest: LogHash) -> RequestReceipt {
@@ -1558,6 +1613,61 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_state_root_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sqlite.control");
+        ControlStore::create(&path, &identity("node-a")).unwrap();
+        let mut expected = identity("node-a");
+        expected.user_state.state_root = hash(b"different-root");
+
+        assert!(matches!(
+            ControlStore::open_existing(&path, &expected),
+            Err(Error::IdentityMismatch(field)) if field == "user_state"
+        ));
+    }
+
+    #[test]
+    fn control_identity_and_snapshot_reject_zero_state_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut invalid = identity("node-a");
+        invalid.user_state.state_root = LogHash::ZERO;
+        assert!(matches!(
+            ControlStore::create(dir.path().join("invalid.control"), &invalid),
+            Err(Error::IdentityMismatch(field)) if field == "user_state"
+        ));
+
+        let destination =
+            ControlStore::create(dir.path().join("destination.control"), &identity("node-b"))
+                .unwrap();
+        let snapshot = ReplicatedSnapshot {
+            cluster_id: "cluster".into(),
+            epoch: 7,
+            configuration_state: ConfigurationState::active(3, hash(b"config")),
+            recovery_generation: 11,
+            materializer_fingerprint: hash(b"fingerprint"),
+            user_state: invalid.user_state(),
+            applied_tip: LogAnchor::new(0, LogHash::ZERO),
+            receipts: Vec::new(),
+        };
+
+        assert!(matches!(
+            destination.import_replicated_snapshot(&encode_snapshot(&snapshot).unwrap()),
+            Err(Error::IdentityMismatch(field)) if field == "user_state"
+        ));
+        assert_eq!(destination.user_state().unwrap(), state(b"base-db"));
+    }
+
+    #[test]
+    fn control_identity_round_trips_page_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = identity("node-a");
+        let store = ControlStore::create(dir.path().join("sqlite.control"), &expected).unwrap();
+
+        assert_eq!(store.identity().unwrap(), expected);
+        assert_eq!(store.user_state().unwrap(), state(b"base-db"));
+    }
+
+    #[test]
     fn quorum_authoritative_control_cache_disables_local_sync() {
         let dir = tempfile::tempdir().unwrap();
         let store =
@@ -1572,12 +1682,75 @@ mod tests {
     }
 
     #[test]
-    fn v5_control_and_snapshot_reject_v4_without_migration() {
+    fn rebuildable_apply_publishes_entry_tip_receipt_and_state_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = identity("node-a");
+        let store = ControlStore::create(dir.path().join("sqlite.control"), &original).unwrap();
+        let configuration = original.configuration_state().clone();
+        let entry_hash = LogEntry::calculate_hash(
+            "cluster",
+            1,
+            7,
+            configuration.config_id(),
+            rhiza_core::EntryType::Noop,
+            LogHash::ZERO,
+            &[],
+        );
+        let entry = LogEntry {
+            cluster_id: "cluster".into(),
+            epoch: 7,
+            config_id: configuration.config_id(),
+            index: 1,
+            entry_type: rhiza_core::EntryType::Noop,
+            payload: Vec::new(),
+            prev_hash: LogHash::ZERO,
+            hash: entry_hash,
+        };
+        let pending = PendingApply::new(
+            LogAnchor::new(0, LogHash::ZERO),
+            LogAnchor::new(1, entry_hash),
+            original.user_state(),
+            state(b"target-db"),
+        );
+        let receipt = RequestReceipt::new(
+            "request-1",
+            hash(b"request"),
+            pending.entry(),
+            crate::encode_sql_result(&crate::SqlCommandResult {
+                statement_results: Vec::new(),
+            })
+            .unwrap(),
+        );
+
+        store
+            .commit_rebuildable_apply(
+                &pending,
+                &entry,
+                &configuration,
+                std::slice::from_ref(&receipt),
+            )
+            .unwrap();
+
+        assert_eq!(store.pending().unwrap(), None);
+        assert_eq!(store.embedded_log_entries(1, 1).unwrap(), [entry]);
+        assert_eq!(store.user_state().unwrap(), pending.target_state());
+        assert_eq!(
+            store.applied_tip().unwrap(),
+            ApplyProgress::new(pending.entry().index(), pending.entry().hash())
+        );
+        assert_eq!(
+            store.lookup_request("request-1", hash(b"request")).unwrap(),
+            Some(receipt)
+        );
+    }
+
+    #[test]
+    fn v6_control_and_snapshot_reject_v5_without_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sqlite.control");
         let store = ControlStore::create(&path, &identity("node-a")).unwrap();
         let mut old_snapshot = store.export_replicated_snapshot().unwrap();
-        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 4;
+        old_snapshot[SNAPSHOT_MAGIC.len() - 1] = 5;
         assert!(matches!(
             store.import_replicated_snapshot(&old_snapshot),
             Err(Error::InvalidSnapshot(_))
@@ -1587,7 +1760,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute(
             "UPDATE control_meta SET value=?1 WHERE key='schema_version'",
-            [4_u64.to_be_bytes().as_slice()],
+            [5_u64.to_be_bytes().as_slice()],
         )
         .unwrap();
         drop(conn);
@@ -1631,7 +1804,7 @@ mod tests {
                 LogAnchor::new(0, LogHash::ZERO),
                 &first,
                 &configuration,
-                hash(b"base-db"),
+                state(b"base-db"),
             )
             .unwrap();
         store
@@ -1639,7 +1812,7 @@ mod tests {
                 LogAnchor::new(1, first.hash),
                 &second,
                 &configuration,
-                hash(b"base-db"),
+                state(b"base-db"),
             )
             .unwrap();
 
@@ -1689,9 +1862,12 @@ mod tests {
                  base_hash BLOB NOT NULL,
                  entry_index INTEGER NOT NULL,
                  entry_hash BLOB NOT NULL,
-                 base_db_digest BLOB NOT NULL,
-                 target_db_digest BLOB NOT NULL,
-                 target_file_bytes INTEGER NOT NULL
+                 base_page_size INTEGER NOT NULL,
+                 base_page_count INTEGER NOT NULL,
+                 base_state_root BLOB NOT NULL,
+                 target_page_size INTEGER NOT NULL,
+                 target_page_count INTEGER NOT NULL,
+                 target_state_root BLOB NOT NULL
              );",
         )
         .unwrap();
@@ -1776,7 +1952,7 @@ mod tests {
         let store =
             ControlStore::create(dir.path().join("sqlite.control"), &identity("node-a")).unwrap();
         let pending = pending();
-        let mut receipts = (0usize..super::super::MAX_QWAL_V2_RECEIPTS)
+        let mut receipts = (0usize..super::super::MAX_QWAL_V3_RECEIPTS)
             .map(|index| receipt_for(&format!("request-{index:04}"), hash(&index.to_le_bytes())))
             .collect::<Vec<_>>();
         receipts.last_mut().unwrap().request_id = receipts[0].request_id.clone();
@@ -1834,9 +2010,8 @@ mod tests {
         let pending = PendingApply::new(
             pending.entry(),
             LogAnchor::new(2, hash(b"entry-2")),
-            pending.target_db_digest(),
-            hash(b"target-2"),
-            4096,
+            pending.target_state(),
+            state(b"target-2"),
         );
         let conflicting = [
             RequestReceipt::new(
@@ -1938,7 +2113,7 @@ mod tests {
             identity("node-a").configuration_state().clone(),
             11,
             hash(b"fingerprint"),
-            pending.target_db_digest(),
+            pending.target_state(),
         );
         let store = ControlStore::open_existing(&path, &reopened_identity).unwrap();
         let lookups = receipts
@@ -1974,9 +2149,8 @@ mod tests {
         let pending = PendingApply::new(
             first.entry(),
             LogAnchor::new(2, hash(b"entry-2")),
-            first.target_db_digest(),
-            hash(b"target-2"),
-            4096,
+            first.target_state(),
+            state(b"target-2"),
         );
         let receipts = (0usize..1024)
             .map(|index| {
@@ -2122,9 +2296,8 @@ mod tests {
         let different = PendingApply::new(
             pending.base(),
             LogAnchor::new(1, hash(b"different")),
-            pending.base_db_digest(),
-            pending.target_db_digest(),
-            4096,
+            pending.base_state(),
+            pending.target_state(),
         );
         assert!(store.clear_pending(&different).is_err());
         store.clear_pending(&pending).unwrap();
@@ -2146,7 +2319,7 @@ mod tests {
                     base,
                     entry,
                     original.configuration_state(),
-                    original.user_db_digest(),
+                    original.user_state(),
                 )
                 .unwrap();
             assert_eq!(store.pending().unwrap(), None);
@@ -2161,7 +2334,7 @@ mod tests {
             store.configuration_state().unwrap(),
             *original.configuration_state()
         );
-        assert_eq!(store.user_db_digest().unwrap(), original.user_db_digest());
+        assert_eq!(store.user_state().unwrap(), original.user_state());
         assert_eq!(store.pending().unwrap(), None);
     }
 
@@ -2176,7 +2349,7 @@ mod tests {
                 LogAnchor::new(0, hash(b"wrong-base")),
                 LogAnchor::new(1, hash(b"noop")),
                 original.configuration_state(),
-                original.user_db_digest(),
+                original.user_state(),
             ),
             Err(Error::InvalidEntry(_))
         ));
@@ -2200,7 +2373,7 @@ mod tests {
                 pending.base(),
                 pending.entry(),
                 original.configuration_state(),
-                original.user_db_digest(),
+                original.user_state(),
             ),
             Err(Error::InvalidEntry(_))
         ));
@@ -2233,7 +2406,7 @@ mod tests {
             next_config.clone(),
             11,
             hash(b"fingerprint"),
-            hash(b"target-db"),
+            state(b"target-db"),
         );
         let store = ControlStore::open_existing(&path, &reopened_identity).unwrap();
         assert_eq!(
@@ -2273,6 +2446,10 @@ mod tests {
         assert_eq!(destination.identity().unwrap().node_id(), "node-b");
         assert_eq!(destination.recovery_generation().unwrap(), 42);
         assert_eq!(
+            destination.user_state().unwrap(),
+            source_pending.target_state()
+        );
+        assert_eq!(
             destination.applied_tip().unwrap(),
             ApplyProgress::new(1, hash(b"entry"))
         );
@@ -2291,7 +2468,7 @@ mod tests {
             configuration_state: ConfigurationState::active(3, hash(b"config")),
             recovery_generation: 11,
             materializer_fingerprint: hash(b"fingerprint"),
-            user_db_digest: hash(b"base-db"),
+            user_state: state(b"base-db"),
             applied_tip: LogAnchor::new(1, hash(b"entry")),
             receipts: vec![RequestReceipt::new(
                 "oversized",

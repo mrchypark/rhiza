@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
+use crate::page_state::{PageStateCacheV3, PageStatePatchV3};
 use crate::wal_capture::{capture_wal, WalCapture, WalCommit};
 
 mod control;
@@ -30,10 +31,10 @@ mod qwal;
 mod wal_capture;
 
 pub use control::{ControlIdentity, ControlStore, PendingApply, RequestReceipt};
+pub use page_state::StateIdentityV3;
 pub use qwal::{
-    apply_qwal_to_file, decode_qwal_v2, diff_closed_databases, encode_qwal_v2, file_digest,
-    sqlite_page_size, QwalEnvelopeV2, QwalPageV2, QwalReceiptV2, MAX_QWAL_V2_BYTES,
-    MAX_QWAL_V2_RECEIPTS, QWAL_V2_MAGIC,
+    decode_qwal_v3, encode_qwal_v3, sqlite_page_size, QwalEnvelopeV3, QwalPageV3, QwalReceiptV3,
+    MAX_QWAL_V3_BYTES, MAX_QWAL_V3_RECEIPTS, QWAL_V3_MAGIC,
 };
 const CREATE_KV_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS __rhiza_kv (
@@ -44,9 +45,9 @@ CREATE TABLE IF NOT EXISTS __rhiza_kv (
 
 const SQL_COMMAND_V2_MAGIC: &[u8] = b"QSQL\0\x02";
 const SQL_RESULT_V1_MAGIC: &[u8] = b"QRES\0\x01";
-const QWAL_SNAPSHOT_V2_MAGIC: &[u8] = b"QSNP\0\x03";
-const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v2-policy-v6-quorum-authoritative";
-const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v2;wal_autocheckpoint=0;canonical_synchronous=OFF;control_synchronous=OFF;local_cache=rebuildable;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=denied;attach=denied;vtable=denied";
+const QWAL_SNAPSHOT_V3_MAGIC: &[u8] = b"QSNP\0\x04";
+const SQL_EXECUTOR_POLICY_VERSION: &str = "rhiza-sql-qwal-batch-v3-policy-v7-page-state";
+const SQL_CONNECTION_PROFILE: &str = "qwal_batch_v3;wal_autocheckpoint=0;canonical_synchronous=OFF;control_synchronous=OFF;page_state_cache=rebuildable;staging_synchronous=OFF;foreign_keys=ON;trusted_schema=OFF;temp=denied;attach=denied;vtable=denied";
 pub const MAX_SQL_STATEMENTS: usize = 64;
 pub const MAX_SQL_PARAMETERS: usize = 999;
 pub const MAX_SQL_TEXT_BYTES: usize = 64 * 1024;
@@ -58,9 +59,10 @@ const SQL_PROGRESS_HANDLER_OPS: i32 = 1_000;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct QwalSnapshotV2 {
+struct QwalSnapshotV3 {
     user_db: Vec<u8>,
     replicated_control: Vec<u8>,
+    user_state: StateIdentityV3,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -140,7 +142,7 @@ pub struct SqlBatchPreparation {
 }
 
 struct PreparedQwalMutation {
-    receipts: Vec<QwalReceiptV2>,
+    receipts: Vec<QwalReceiptV3>,
     results: Vec<Result<SqlCommandResult>>,
 }
 
@@ -327,7 +329,15 @@ pub struct SqliteStateMachine {
     conn: Mutex<Option<Connection>>,
     lifecycle: Mutex<()>,
     control: ControlStore,
+    page_state: Mutex<CanonicalPageStateV3>,
+    uncommitted_effect: Mutex<Option<LogHash>>,
     prepared_target: Mutex<Option<PreparedTarget>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalPageStateV3 {
+    cache: PageStateCacheV3,
+    seal: Option<PreparedBaseSeal>,
 }
 
 struct PreparedTarget {
@@ -343,10 +353,8 @@ struct PreparedTarget {
     materializer_fingerprint: String,
     base_index: LogIndex,
     base_hash: LogHash,
-    base_db_digest: LogHash,
-    base_file_bytes: u64,
-    target_db_digest: LogHash,
-    target_file_bytes: u64,
+    base_state: StateIdentityV3,
+    target_state: StateIdentityV3,
     effect_digest: LogHash,
 }
 
@@ -364,7 +372,7 @@ struct PreparedBaseSeal {
 impl PreparedTarget {
     fn matches(
         &self,
-        effect: &QwalEnvelopeV2,
+        effect: &QwalEnvelopeV3,
         effect_payload: &[u8],
         identity: &ControlIdentity,
     ) -> bool {
@@ -378,10 +386,8 @@ impl PreparedTarget {
             && self.materializer_fingerprint == effect.materializer_fingerprint
             && self.base_index == effect.base_index
             && self.base_hash == effect.base_hash
-            && self.base_db_digest == effect.base_db_digest
-            && self.base_file_bytes == effect.base_file_bytes
-            && self.target_db_digest == effect.target_db_digest
-            && self.target_file_bytes == effect.target_file_bytes
+            && self.base_state == effect.base_state
+            && self.target_state == effect.target_state
             && self.effect_digest == LogHash::digest(&[effect_payload])
     }
 }
@@ -479,7 +485,7 @@ impl SqliteStateMachine {
                 .map_err(sqlite_error)?;
             conn.close()
                 .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
-            let digest = file_digest(path)?;
+            let page_state = rebuild_sealed_page_state(path)?;
             let identity = ControlIdentity::new(
                 cluster_id,
                 node_id,
@@ -487,7 +493,7 @@ impl SqliteStateMachine {
                 configuration_state,
                 1,
                 sql_executor_fingerprint()?,
-                digest,
+                page_state.cache.identity(),
             );
             let control = ControlStore::create(&control_path, &identity)?;
             let conn = open_connection(path)?;
@@ -496,6 +502,8 @@ impl SqliteStateMachine {
                 conn: Mutex::new(Some(conn)),
                 lifecycle: Mutex::new(()),
                 control,
+                page_state: Mutex::new(page_state),
+                uncommitted_effect: Mutex::new(None),
                 prepared_target: Mutex::new(None),
             })
         })();
@@ -513,15 +521,17 @@ impl SqliteStateMachine {
                 "QWAL database and control sidecar must both exist".into(),
             ));
         }
-        reject_legacy_user_database(path)?;
         let control = ControlStore::open_existing_unchecked(&control_path)?;
-        validate_control_database_pair(path, &control)?;
+        let page_state = validate_control_database_pair(path, &control)?;
+        reject_legacy_user_database(path)?;
         let conn = open_connection(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             conn: Mutex::new(Some(conn)),
             lifecycle: Mutex::new(()),
             control,
+            page_state: Mutex::new(page_state),
+            uncommitted_effect: Mutex::new(None),
             prepared_target: Mutex::new(None),
         })
     }
@@ -605,10 +615,24 @@ impl SqliteStateMachine {
 
     pub fn apply_entry_with_result(&self, entry: &LogEntry) -> Result<ApplyOutcome> {
         let _lifecycle = self.lock_lifecycle()?;
+        self.ensure_page_state_sealed()?;
         if entry.recompute_hash() != entry.hash {
             return Err(Error::InvalidEntry(
                 "hash does not match entry contents".into(),
             ));
+        }
+        if let Some(installed) = *self
+            .uncommitted_effect
+            .lock()
+            .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?
+        {
+            if entry.entry_type != EntryType::Command
+                || installed != LogHash::digest(&[&entry.payload])
+            {
+                return Err(Error::InvalidEntry(
+                    "only the exact installed QWAL effect may retry after control failure".into(),
+                ));
+            }
         }
         self.apply_qwal_entry(entry)
     }
@@ -679,17 +703,16 @@ impl SqliteStateMachine {
                     )))
                 }
             }
-            let digest = self.control.user_db_digest()?;
+            let user_state = self.control.user_state()?;
             if entry.entry_type == EntryType::Noop && next_configuration == current_configuration {
                 self.control.commit_metadata_only_entry_with_log(
                     base_anchor,
                     entry,
                     &current_configuration,
-                    digest,
+                    user_state,
                 )?;
             } else {
-                let bytes = fs::metadata(&self.path).map_err(io_error)?.len();
-                let pending = PendingApply::new(base_anchor, entry_anchor, digest, digest, bytes);
+                let pending = PendingApply::new(base_anchor, entry_anchor, user_state, user_state);
                 self.control.begin_pending_with_entry(&pending, entry)?;
                 self.control
                     .commit_applied(&pending, &next_configuration, &[])?;
@@ -751,13 +774,27 @@ impl SqliteStateMachine {
         let pending = PendingApply::new(
             base_anchor,
             entry_anchor,
-            effect.base_db_digest,
-            effect.target_db_digest,
-            effect.target_file_bytes,
+            effect.base_state,
+            effect.target_state,
         );
-        self.install_qwal_effect(&effect, &entry.payload)?;
-        self.control
-            .commit_rebuildable_apply(&pending, entry, &next_configuration, &receipts)?;
+        self.install_qwal_effect(&effect, &entry.payload, entry_anchor)?;
+        #[cfg(test)]
+        let control_commit = inject_qwal_control_fault(&self.path).and_then(|()| {
+            self.control
+                .commit_rebuildable_apply(&pending, entry, &next_configuration, &receipts)
+        });
+        #[cfg(not(test))]
+        let control_commit =
+            self.control
+                .commit_rebuildable_apply(&pending, entry, &next_configuration, &receipts);
+        if let Err(error) = control_commit {
+            let _ = self.close_connection();
+            return Err(error);
+        }
+        self.uncommitted_effect
+            .lock()
+            .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?
+            .take();
         Ok(ApplyOutcome {
             progress: ApplyProgress::new(entry.index, entry.hash),
             sql_result: if results.len() == 1 {
@@ -768,13 +805,37 @@ impl SqliteStateMachine {
         })
     }
 
-    fn install_qwal_effect(&self, effect: &QwalEnvelopeV2, effect_payload: &[u8]) -> Result<()> {
+    fn install_qwal_effect(
+        &self,
+        effect: &QwalEnvelopeV3,
+        effect_payload: &[u8],
+        entry_anchor: LogAnchor,
+    ) -> Result<()> {
+        if !self.preverify_page_state_transition(effect, effect_payload, entry_anchor)? {
+            if self
+                .conn
+                .lock()
+                .map_err(|_| Error::Sqlite("SQLite connection lock is poisoned".into()))?
+                .is_none()
+            {
+                self.reopen_connection()?;
+            }
+            return Ok(());
+        };
         #[cfg(test)]
         begin_prepared_base_reuse_audit(&self.path);
         if let Some(prepared) = self.take_matching_prepared_target(effect, effect_payload)? {
             self.close_connection()?;
             match self.promote_prepared_target(&prepared, effect) {
                 Ok(true) => {
+                    let mut installed = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&self.path)
+                        .map_err(io_error)?;
+                    qwal::verify_installed_pages(&mut installed, effect)?;
+                    self.publish_page_state_after_install(effect, &installed)?;
+                    self.remember_uncommitted_effect(effect_payload)?;
                     #[cfg(test)]
                     note_prepared_install(&self.path, PreparedInstallPath::Promoted);
                     return self.reopen_connection();
@@ -790,51 +851,127 @@ impl SqliteStateMachine {
         note_second_checkpoint(&self.path);
         self.with_connection(checkpoint_truncate)?;
         self.close_connection()?;
-        let install = (|| {
+        let mut canonical = self.open_bound_canonical()?;
+        qwal::apply_preverified_qwal_in_place(&mut canonical, effect, |page_no| {
             #[cfg(test)]
-            note_second_base_full_hash(&self.path);
-            let current_digest = file_digest(&self.path)?;
-            if current_digest == effect.target_db_digest {
-                self.discard_prepared_target()?;
-                return Ok(());
-            }
-            if current_digest != effect.base_db_digest {
-                self.discard_prepared_target()?;
+            inject_qwal_apply_fault(&self.path, page_no)?;
+            #[cfg(not(test))]
+            let _ = page_no;
+            Ok(())
+        })?;
+        self.publish_page_state_after_install(effect, &canonical)?;
+        self.remember_uncommitted_effect(effect_payload)?;
+        #[cfg(test)]
+        note_prepared_install(&self.path, PreparedInstallPath::Patched);
+        self.reopen_connection()
+    }
+
+    fn preverify_page_state_transition(
+        &self,
+        effect: &QwalEnvelopeV3,
+        effect_payload: &[u8],
+        entry_anchor: LogAnchor,
+    ) -> Result<bool> {
+        let page_state = self
+            .page_state
+            .lock()
+            .map_err(|_| Error::Sqlite("SQLite page-state cache lock is poisoned".into()))?;
+        verify_bound_canonical(&self.path, &page_state)?;
+        let current = page_state.cache.identity();
+        if current == effect.target_state && current != effect.base_state {
+            let digest = LogHash::digest(&[effect_payload]);
+            let installed = self
+                .uncommitted_effect
+                .lock()
+                .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?;
+            let durable_replay = self.control.pending()?.is_some_and(|pending| {
+                pending.base_state() == effect.base_state
+                    && pending.target_state() == effect.target_state
+                    && pending.entry() == entry_anchor
+            });
+            if *installed != Some(digest) && !durable_replay {
                 return Err(Error::InvalidEntry(
-                    "canonical SQLite digest matches neither QWAL base nor target".into(),
+                    "QWAL target is installed without an exact in-process replay seal".into(),
                 ));
             }
-            if fs::metadata(&self.path).map_err(io_error)?.len() != effect.base_file_bytes {
-                self.discard_prepared_target()?;
-                return Err(Error::InvalidEntry(
-                    "canonical SQLite size does not match the QWAL base".into(),
-                ));
-            }
-            let temp_dir = tempfile::tempdir_in(parent_dir(&self.path)).map_err(io_error)?;
-            let temp_path = temp_dir.path().join("target.sqlite");
-            (|| {
-                apply_qwal_to_file(&self.path, &temp_path, effect)?;
-                let verify = Connection::open_with_flags(
-                    &temp_path,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                )
-                .map_err(sqlite_error)?;
-                integrity_check(&verify)?;
-                verify
-                    .close()
-                    .map_err(|(_, error)| Error::Sqlite(error.to_string()))?;
-                fs::rename(&temp_path, &self.path).map_err(io_error)?;
-                #[cfg(test)]
-                note_prepared_install(&self.path, PreparedInstallPath::Rebuilt);
-                Ok(())
-            })()
-        })();
-        let reopen = self.reopen_connection();
-        match (install, reopen) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
+            return Ok(false);
         }
+        if current != effect.base_state {
+            return Err(Error::InvalidEntry(
+                "QWAL base page state does not match the canonical cache".into(),
+            ));
+        }
+        let patches = effect
+            .pages
+            .iter()
+            .map(|page| PageStatePatchV3::new(page.page_no, &page.after_image))
+            .collect::<Vec<_>>();
+        let target = page_state
+            .cache
+            .overlay(effect.target_state.page_count, &patches)?;
+        if target != effect.target_state {
+            return Err(Error::InvalidEntry(
+                "QWAL target page state mismatch".into(),
+            ));
+        }
+        Ok(current != effect.target_state)
+    }
+
+    fn ensure_page_state_sealed(&self) -> Result<()> {
+        let page_state = self
+            .page_state
+            .lock()
+            .map_err(|_| Error::Sqlite("SQLite page-state cache lock is poisoned".into()))?;
+        verify_bound_canonical(&self.path, &page_state)
+    }
+
+    fn open_bound_canonical(&self) -> Result<File> {
+        if !sqlite_sidecars_absent(&self.path)? {
+            return Err(Error::InvalidEntry(
+                "closed canonical SQLite database still has WAL sidecars".into(),
+            ));
+        }
+        let page_state = self
+            .page_state
+            .lock()
+            .map_err(|_| Error::Sqlite("SQLite page-state cache lock is poisoned".into()))?;
+        open_bound_canonical(&self.path, &page_state)
+    }
+
+    fn publish_page_state_after_install(
+        &self,
+        effect: &QwalEnvelopeV3,
+        canonical: &File,
+    ) -> Result<()> {
+        let seal = seal_held_canonical(&self.path, canonical)?;
+        let mut page_state = self
+            .page_state
+            .lock()
+            .map_err(|_| Error::Sqlite("SQLite page-state cache lock is poisoned".into()))?;
+        let patches = effect
+            .pages
+            .iter()
+            .map(|page| PageStatePatchV3::new(page.page_no, &page.after_image))
+            .collect::<Vec<_>>();
+        let target = page_state
+            .cache
+            .apply_patch(effect.target_state.page_count, &patches)?;
+        if target != effect.target_state {
+            return Err(Error::InvalidEntry(
+                "installed QWAL target page state invariant failed".into(),
+            ));
+        }
+        page_state.seal = seal;
+        Ok(())
+    }
+
+    fn remember_uncommitted_effect(&self, effect_payload: &[u8]) -> Result<()> {
+        *self
+            .uncommitted_effect
+            .lock()
+            .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))? =
+            Some(LogHash::digest(&[effect_payload]));
+        Ok(())
     }
 
     fn discard_prepared_target(&self) -> Result<()> {
@@ -847,7 +984,7 @@ impl SqliteStateMachine {
 
     fn discard_prepared_target_unless(
         &self,
-        effect: &QwalEnvelopeV2,
+        effect: &QwalEnvelopeV3,
         effect_payload: &[u8],
         identity: &ControlIdentity,
     ) -> Result<()> {
@@ -866,7 +1003,7 @@ impl SqliteStateMachine {
 
     fn take_matching_prepared_target(
         &self,
-        effect: &QwalEnvelopeV2,
+        effect: &QwalEnvelopeV3,
         effect_payload: &[u8],
     ) -> Result<Option<PreparedTarget>> {
         let identity = self.control.identity()?;
@@ -882,7 +1019,7 @@ impl SqliteStateMachine {
     fn promote_prepared_target(
         &self,
         prepared: &PreparedTarget,
-        effect: &QwalEnvelopeV2,
+        effect: &QwalEnvelopeV3,
     ) -> Result<bool> {
         if !prepared_base_still_sealed(&self.path, prepared)?
             || !sqlite_sidecars_absent(prepared.artifact.path())?
@@ -900,7 +1037,9 @@ impl SqliteStateMachine {
         ) {
             return Ok(false);
         }
-        if owned_metadata.len() != effect.target_file_bytes {
+        if owned_metadata.len()
+            != u64::from(effect.target_state.page_size) * u64::from(effect.target_state.page_count)
+        {
             return Ok(false);
         }
         let Some(rename_metadata) = symlink_metadata_if_exists(prepared.artifact.path())? else {
@@ -1061,9 +1200,9 @@ impl SqliteStateMachine {
         base_index: LogIndex,
         base_hash: LogHash,
     ) -> Result<SqlBatchPreparation> {
-        if members.is_empty() || members.len() > MAX_QWAL_V2_RECEIPTS {
+        if members.is_empty() || members.len() > MAX_QWAL_V3_RECEIPTS {
             return Err(Error::InvalidCommand(format!(
-                "SQL batch must contain 1..={MAX_QWAL_V2_RECEIPTS} members"
+                "SQL batch must contain 1..={MAX_QWAL_V3_RECEIPTS} members"
             )));
         }
         self.prepare_qwal_effect(base_index, base_hash, |staging| {
@@ -1129,7 +1268,7 @@ impl SqliteStateMachine {
                 {
                     Ok((result, result_blob)) => {
                         savepoint.commit().map_err(sqlite_error)?;
-                        receipts.push(QwalReceiptV2 {
+                        receipts.push(QwalReceiptV3 {
                             request_id: member.command.request_id.clone(),
                             request_digest,
                             result_blob,
@@ -1189,7 +1328,7 @@ impl SqliteStateMachine {
                 statement_results: Vec::new(),
             };
             Ok(PreparedQwalMutation {
-                receipts: vec![QwalReceiptV2 {
+                receipts: vec![QwalReceiptV3 {
                     request_id: request_id.to_owned(),
                     request_digest,
                     result_blob: encode_sql_result(&result)?,
@@ -1209,6 +1348,7 @@ impl SqliteStateMachine {
         mutation: impl FnOnce(&mut Connection) -> Result<PreparedQwalMutation>,
     ) -> Result<SqlBatchPreparation> {
         let _lifecycle = self.lock_lifecycle()?;
+        self.ensure_page_state_sealed()?;
         self.ensure_no_pending_apply()?;
         let tip = self.control.applied_tip()?;
         if tip != ApplyProgress::new(base_index, base_hash) {
@@ -1217,15 +1357,35 @@ impl SqliteStateMachine {
             ));
         }
         let identity = self.control.identity()?;
+        let base_state = self
+            .page_state
+            .lock()
+            .map_err(|_| Error::Sqlite("SQLite page-state cache lock is poisoned".into()))?
+            .cache
+            .identity();
+        if base_state != identity.user_state() {
+            return Err(Error::InvalidEntry(
+                "cached SQLite base state does not match the control sidecar".into(),
+            ));
+        }
 
         let prepare_result = (|| {
             self.close_connection()?;
 
-            let (base_file, actual_base_digest, base_seal) = open_hashed_prepared_base(&self.path)?;
-            if actual_base_digest != identity.user_db_digest() {
-                return Err(Error::InvalidEntry(
-                    "closed SQLite base digest does not match the control sidecar".into(),
-                ));
+            let (base_file, base_seal) = open_sealed_prepared_base(&self.path)?;
+            {
+                let page_state = self.page_state.lock().map_err(|_| {
+                    Error::Sqlite("SQLite page-state cache lock is poisoned".into())
+                })?;
+                if !prepared_base_metadata_matches(
+                    page_state.seal.as_ref(),
+                    &base_file.metadata().map_err(io_error)?,
+                    &fs::symlink_metadata(&self.path).map_err(io_error)?,
+                ) {
+                    return Err(Error::InvalidEntry(
+                        "closed SQLite base no longer matches the cached page-state seal".into(),
+                    ));
+                }
             }
             let base_file_bytes = fs::metadata(&self.path).map_err(io_error)?.len();
             let staging_artifact = clone_or_copy_to_temp(&self.path)?;
@@ -1238,7 +1398,7 @@ impl SqliteStateMachine {
             }
             #[cfg(test)]
             note_speculative_copy(&self.path);
-            let page_size = sqlite_page_size(&self.path)?;
+            let page_size = base_state.page_size;
             let base_db_pages = u32::try_from(base_file_bytes / u64::from(page_size))
                 .map_err(|_| Error::ResourceExhausted("SQLite base page count overflows".into()))?;
             if !sqlite_sidecars_absent(staging_path)? {
@@ -1283,7 +1443,7 @@ impl SqliteStateMachine {
             let capture = match held_wal {
                 Some((mut wal, seal)) => {
                     verify_staging_wal_seal(&wal, seal)?;
-                    let capture = capture_wal(&mut wal, base_db_pages, MAX_QWAL_V2_BYTES)?;
+                    let capture = capture_wal(&mut wal, base_db_pages, MAX_QWAL_V3_BYTES)?;
                     verify_staging_wal_seal(&wal, seal)?;
                     capture
                 }
@@ -1298,33 +1458,35 @@ impl SqliteStateMachine {
             )?;
             sidecar_cleanup.cleanup()?;
             let target_file_bytes = fs::metadata(staging_path).map_err(io_error)?.len();
-            let target_db_digest = file_digest(staging_path)?;
-            if pages.is_empty()
-                && target_file_bytes == base_file_bytes
-                && target_db_digest != actual_base_digest
-            {
-                return Err(Error::InvalidEntry(
-                    "no-change SQLite WAL target differs from its closed base".into(),
-                ));
-            }
+            let target_page_count = u32::try_from(target_file_bytes / u64::from(page_size))
+                .map_err(|_| {
+                    Error::ResourceExhausted("SQLite target page count overflows".into())
+                })?;
+            let patches = pages
+                .iter()
+                .map(|page| PageStatePatchV3::new(page.page_no, &page.after_image))
+                .collect::<Vec<_>>();
+            let target_state = self
+                .page_state
+                .lock()
+                .map_err(|_| Error::Sqlite("SQLite page-state cache lock is poisoned".into()))?
+                .cache
+                .overlay(target_page_count, &patches)?;
 
-            let effect = QwalEnvelopeV2 {
+            let effect = QwalEnvelopeV3 {
                 cluster_id: identity.cluster_id().to_owned(),
                 epoch: identity.epoch(),
                 configuration_id: identity.configuration_state().config_id(),
                 recovery_generation: identity.recovery_generation(),
                 base_index,
                 base_hash,
-                base_db_digest: actual_base_digest,
-                base_file_bytes,
-                target_db_digest,
-                target_file_bytes,
+                base_state,
+                target_state,
                 materializer_fingerprint: identity.materializer_fingerprint().to_hex(),
-                page_size,
                 receipts: mutation.receipts,
                 pages,
             };
-            let encoded = encode_qwal_v2(&effect)?;
+            let encoded = encode_qwal_v3(&effect)?;
             Ok((
                 Some(encoded),
                 mutation.results,
@@ -1354,7 +1516,7 @@ impl SqliteStateMachine {
             });
         };
         let (base_file, base_seal) =
-            prepared_base.expect("a prepared QWAL effect retains its hashed canonical base");
+            prepared_base.expect("a prepared QWAL effect retains its sealed canonical base");
         let staging_artifact =
             staging_artifact.expect("a prepared QWAL effect retains its speculative target");
         let target_owned = staging_artifact.as_file().metadata().map_err(io_error)?;
@@ -1373,10 +1535,8 @@ impl SqliteStateMachine {
             materializer_fingerprint: effect.materializer_fingerprint.clone(),
             base_index: effect.base_index,
             base_hash: effect.base_hash,
-            base_db_digest: effect.base_db_digest,
-            base_file_bytes: effect.base_file_bytes,
-            target_db_digest: effect.target_db_digest,
-            target_file_bytes: effect.target_file_bytes,
+            base_state: effect.base_state,
+            target_state: effect.target_state,
             effect_digest: LogHash::digest(&[&encoded]),
         };
         *self
@@ -1395,6 +1555,8 @@ impl SqliteStateMachine {
         request_id: &str,
         command_payload: &[u8],
     ) -> Result<Option<RequestOutcome>> {
+        let _lifecycle = self.lock_lifecycle()?;
+        self.with_connection(|_| Ok(()))?;
         self.ensure_no_pending_apply()?;
         let Some(receipt) = self
             .control
@@ -1440,6 +1602,8 @@ impl SqliteStateMachine {
     /// Duplicate request ids are rejected before querying; callers that accept
     /// aliases must deduplicate by id and fan the aligned result back out.
     pub fn check_sql_requests(&self, requests: &[(&str, &[u8])]) -> Result<Vec<SqlRequestLookup>> {
+        let _lifecycle = self.lock_lifecycle()?;
+        self.with_connection(|_| Ok(()))?;
         self.ensure_no_pending_apply()?;
         let mut validations = Vec::with_capacity(requests.len());
         let mut lookup_keys = Vec::with_capacity(requests.len());
@@ -1529,6 +1693,7 @@ impl SqliteStateMachine {
 
     pub fn create_snapshot(&self, target: LogIndex) -> Result<Snapshot> {
         let _lifecycle = self.lock_lifecycle()?;
+        self.ensure_page_state_sealed()?;
         self.ensure_no_pending_apply()?;
         let tip = self.control.applied_tip()?;
         if tip.applied_index() != target {
@@ -1551,15 +1716,21 @@ impl SqliteStateMachine {
         self.with_connection(checkpoint_truncate)?;
         self.close_connection()?;
         let snapshot = (|| {
-            let user_db = fs::read(&self.path).map_err(io_error)?;
-            if LogHash::digest(&[&user_db]) != identity.user_db_digest() {
+            let mut canonical = self.open_bound_canonical()?;
+            canonical.seek(SeekFrom::Start(0)).map_err(io_error)?;
+            let mut user_db = Vec::new();
+            canonical.read_to_end(&mut user_db).map_err(io_error)?;
+            seal_held_canonical(&self.path, &canonical)?;
+            let page_state = page_state_from_database_bytes(&user_db)?;
+            if page_state.identity() != identity.user_state() {
                 return Err(Error::InvalidSnapshot(
-                    "canonical database digest does not match control sidecar".into(),
+                    "canonical database page state does not match control sidecar".into(),
                 ));
             }
-            let container = QwalSnapshotV2 {
+            let container = QwalSnapshotV3 {
                 user_db,
                 replicated_control: self.control.export_replicated_snapshot()?,
+                user_state: page_state.identity(),
             };
             encode_qwal_snapshot(&container).map(|bytes| Snapshot::new(manifest, bytes))
         })();
@@ -1694,7 +1865,12 @@ fn restore_snapshot_file_with_recovery_generation(
         integrity_check(&restore_conn)?;
     }
 
-    let digest = LogHash::digest(&[&container.user_db]);
+    let page_state = page_state_from_database_bytes(&container.user_db)?;
+    if page_state.identity() != container.user_state {
+        return Err(Error::InvalidSnapshot(
+            "QWAL snapshot database does not match its page state".into(),
+        ));
+    }
     let control_temp_dir = tempfile::tempdir_in(parent).map_err(io_error)?;
     let control_temp_path = control_temp_dir.path().join("control.sqlite");
     let control_identity = ControlIdentity::new(
@@ -1704,7 +1880,7 @@ fn restore_snapshot_file_with_recovery_generation(
         snapshot.manifest().configuration_state().clone(),
         1,
         sql_executor_fingerprint()?,
-        digest,
+        container.user_state,
     );
     let control = ControlStore::create(&control_temp_path, &control_identity)?;
     control.import_replicated_snapshot_with_recovery_generation(
@@ -1715,7 +1891,7 @@ fn restore_snapshot_file_with_recovery_generation(
     if imported_tip.applied_index() != snapshot.manifest().index()
         || imported_tip.applied_hash() != snapshot.manifest().applied_hash()
         || control.configuration_state()? != *snapshot.manifest().configuration_state()
-        || control.user_db_digest()? != digest
+        || control.user_state()? != container.user_state
         || recovery_generation
             .is_some_and(|expected| control.recovery_generation().ok() != Some(expected))
     {
@@ -1904,7 +2080,7 @@ fn speculative_prepare_audit(path: &Path) -> Option<SpeculativePrepareAudit> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedInstallPath {
     Promoted,
-    Rebuilt,
+    Patched,
 }
 
 #[cfg(test)]
@@ -1934,7 +2110,6 @@ fn prepared_install_path(path: &Path) -> Option<PreparedInstallPath> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PreparedBaseReuseAudit {
     second_checkpoint_count: usize,
-    second_base_full_hash_count: usize,
 }
 
 #[cfg(test)]
@@ -1955,15 +2130,6 @@ fn note_second_checkpoint(path: &Path) {
     if let Ok(mut audits) = prepared_base_reuse_audits().lock() {
         if let Some((_, audit)) = audits.iter_mut().rev().find(|(audited, _)| audited == path) {
             audit.second_checkpoint_count += 1;
-        }
-    }
-}
-
-#[cfg(test)]
-fn note_second_base_full_hash(path: &Path) {
-    if let Ok(mut audits) = prepared_base_reuse_audits().lock() {
-        if let Some((_, audit)) = audits.iter_mut().rev().find(|(audited, _)| audited == path) {
-            audit.second_base_full_hash_count += 1;
         }
     }
 }
@@ -2104,6 +2270,62 @@ enum WalCaptureFault {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QwalApplyFault {
+    AfterPage(u32),
+    BeforeControlCommit,
+}
+
+#[cfg(test)]
+fn qwal_apply_faults() -> &'static Mutex<Vec<(PathBuf, QwalApplyFault)>> {
+    static FAULTS: OnceLock<Mutex<Vec<(PathBuf, QwalApplyFault)>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn arm_qwal_apply_fault(path: &Path, fault: QwalApplyFault) {
+    qwal_apply_faults()
+        .lock()
+        .unwrap()
+        .push((path.to_path_buf(), fault));
+}
+
+#[cfg(test)]
+fn take_qwal_apply_fault(path: &Path, matches: impl Fn(QwalApplyFault) -> bool) -> Result<bool> {
+    let mut faults = qwal_apply_faults()
+        .lock()
+        .map_err(|_| Error::Sqlite("QWAL apply fault lock is poisoned".into()))?;
+    Ok(faults
+        .iter()
+        .position(|(armed, fault)| armed == path && matches(*fault))
+        .map(|position| faults.swap_remove(position))
+        .is_some())
+}
+
+#[cfg(test)]
+fn inject_qwal_apply_fault(path: &Path, page_no: u32) -> Result<()> {
+    if take_qwal_apply_fault(
+        path,
+        |fault| matches!(fault, QwalApplyFault::AfterPage(expected) if expected == page_no),
+    )? {
+        return Err(Error::Io(
+            "injected failure during canonical QWAL page writes".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_qwal_control_fault(path: &Path) -> Result<()> {
+    if take_qwal_apply_fault(path, |fault| fault == QwalApplyFault::BeforeControlCommit)? {
+        return Err(Error::Sqlite(
+            "injected post-install control commit failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn wal_capture_faults() -> &'static Mutex<Vec<(PathBuf, WalCaptureFault)>> {
     static FAULTS: OnceLock<Mutex<Vec<(PathBuf, WalCaptureFault)>>> = OnceLock::new();
     FAULTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -2149,7 +2371,7 @@ fn materialize_wal_capture(
     expected_page_size: u32,
     base_file_bytes: u64,
     capture: WalCapture,
-) -> Result<Vec<QwalPageV2>> {
+) -> Result<Vec<QwalPageV3>> {
     let WalCapture::Committed(WalCommit {
         page_size,
         target_db_pages,
@@ -2207,8 +2429,9 @@ fn materialize_wal_capture(
         target.seek(SeekFrom::Start(offset)).map_err(io_error)?;
         target.write_all(&page.after_image).map_err(io_error)?;
         if differs_from_base {
-            changed.push(QwalPageV2 {
-                page_no,
+            changed.push(QwalPageV3 {
+                page_no: u32::try_from(page_no)
+                    .map_err(|_| Error::ResourceExhausted("QWAL page count exceeds u32".into()))?,
                 after_image: page.after_image,
             });
         }
@@ -2240,6 +2463,123 @@ fn open_file_digest(file: &File) -> Result<LogHash> {
         hasher.update(&buffer[..read]);
     }
     Ok(LogHash::from_bytes(hasher.finalize().into()))
+}
+
+fn file_digest(path: impl AsRef<Path>) -> Result<LogHash> {
+    open_file_digest(&File::open(path.as_ref()).map_err(io_error)?)
+}
+
+fn page_state_from_database_bytes(bytes: &[u8]) -> Result<PageStateCacheV3> {
+    let header = bytes
+        .get(..100)
+        .ok_or_else(|| Error::InvalidEntry("SQLite database header is truncated".into()))?;
+    let file_bytes = u64::try_from(bytes.len())
+        .map_err(|_| Error::ResourceExhausted("SQLite database size exceeds u64".into()))?;
+    let page_size = qwal::sqlite_page_size_from_header(header, file_bytes)?;
+    PageStateCacheV3::from_pages(page_size, bytes.chunks_exact(page_size as usize))
+}
+
+#[cfg(test)]
+fn rebuild_page_state(path: &Path) -> Result<PageStateCacheV3> {
+    page_state_from_database_bytes(&fs::read(path).map_err(io_error)?)
+}
+
+fn rebuild_sealed_page_state(path: &Path) -> Result<CanonicalPageStateV3> {
+    if !sqlite_sidecars_absent(path)? {
+        return Err(Error::InvalidEntry(
+            "closed canonical SQLite database has WAL sidecars during page-state rebuild".into(),
+        ));
+    }
+    let named_before = fs::symlink_metadata(path).map_err(io_error)?;
+    let mut file = File::open(path).map_err(io_error)?;
+    let owned_before = file.metadata().map_err(io_error)?;
+    let seal = prepared_base_seal(&owned_before, &named_before)?;
+    let expected_bytes = owned_before.len();
+    let cache = rebuild_page_state_from_file(&mut file, expected_bytes)?;
+    let owned_after = file.metadata().map_err(io_error)?;
+    let named_after = fs::symlink_metadata(path).map_err(io_error)?;
+    if !prepared_base_metadata_matches(seal.as_ref(), &owned_after, &named_after)
+        || owned_after.len() != expected_bytes
+        || !sqlite_sidecars_absent(path)?
+    {
+        return Err(Error::InvalidEntry(
+            "SQLite database changed while rebuilding page state".into(),
+        ));
+    }
+    Ok(CanonicalPageStateV3 { cache, seal })
+}
+
+fn rebuild_page_state_from_file(file: &mut File, expected_bytes: u64) -> Result<PageStateCacheV3> {
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header).map_err(io_error)?;
+    let page_size = qwal::sqlite_page_size_from_header(&header, expected_bytes)?;
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let mut remaining = expected_bytes / u64::from(page_size);
+    let mut stream_error = None;
+    let cache = PageStateCacheV3::from_pages(
+        page_size,
+        std::iter::from_fn(|| {
+            if remaining == 0 || stream_error.is_some() {
+                return None;
+            }
+            let mut page = vec![0; page_size as usize];
+            match file.read_exact(&mut page) {
+                Ok(()) => {
+                    remaining -= 1;
+                    Some(page)
+                }
+                Err(error) => {
+                    stream_error = Some(io_error(error));
+                    None
+                }
+            }
+        }),
+    )?;
+    if let Some(error) = stream_error {
+        return Err(error);
+    }
+    Ok(cache)
+}
+
+fn open_bound_canonical(path: &Path, page_state: &CanonicalPageStateV3) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(io_error)?;
+    let owned = file.metadata().map_err(io_error)?;
+    let named = fs::symlink_metadata(path).map_err(io_error)?;
+    if !prepared_base_metadata_matches(page_state.seal.as_ref(), &owned, &named) {
+        return Err(Error::InvalidEntry(
+            "canonical SQLite file no longer matches the cached page-state seal".into(),
+        ));
+    }
+    Ok(file)
+}
+
+fn verify_bound_canonical(path: &Path, page_state: &CanonicalPageStateV3) -> Result<()> {
+    open_bound_canonical(path, page_state).map(drop)
+}
+
+fn seal_held_canonical(path: &Path, file: &File) -> Result<Option<PreparedBaseSeal>> {
+    if !sqlite_sidecars_absent(path)? {
+        return Err(Error::InvalidEntry(
+            "closed canonical SQLite database has WAL sidecars while refreshing its seal".into(),
+        ));
+    }
+    let owned_before = file.metadata().map_err(io_error)?;
+    let named_before = fs::symlink_metadata(path).map_err(io_error)?;
+    let seal = prepared_base_seal(&owned_before, &named_before)?;
+    let owned_after = file.metadata().map_err(io_error)?;
+    let named_after = fs::symlink_metadata(path).map_err(io_error)?;
+    if !prepared_base_metadata_matches(seal.as_ref(), &owned_after, &named_after)
+        || !sqlite_sidecars_absent(path)?
+    {
+        return Err(Error::InvalidEntry(
+            "canonical SQLite file changed while refreshing its page-state seal".into(),
+        ));
+    }
+    Ok(seal)
 }
 
 fn clone_or_copy_to_temp(base: &Path) -> Result<NamedTempFile> {
@@ -2330,7 +2670,7 @@ fn try_platform_clone(_base: &Path, _target: &Path) -> io::Result<File> {
     ))
 }
 
-fn open_hashed_prepared_base(path: &Path) -> Result<(File, LogHash, Option<PreparedBaseSeal>)> {
+fn open_sealed_prepared_base(path: &Path) -> Result<(File, Option<PreparedBaseSeal>)> {
     let named_before = fs::symlink_metadata(path).map_err(io_error)?;
     if !named_before.file_type().is_file() {
         return Err(Error::InvalidEntry(
@@ -2350,17 +2690,16 @@ fn open_hashed_prepared_base(path: &Path) -> Result<(File, LogHash, Option<Prepa
             "closed SQLite base still has WAL sidecars".into(),
         ));
     }
-    let digest = open_file_digest(&file)?;
     let owned_after = file.metadata().map_err(io_error)?;
     let named_after = fs::symlink_metadata(path).map_err(io_error)?;
     if !prepared_base_metadata_matches(seal.as_ref(), &owned_after, &named_after)
         || !sqlite_sidecars_absent(path)?
     {
         return Err(Error::InvalidEntry(
-            "closed SQLite base changed while its digest was computed".into(),
+            "closed SQLite base changed while it was sealed".into(),
         ));
     }
-    Ok((file, digest, seal))
+    Ok((file, seal))
 }
 
 #[cfg(unix)]
@@ -2492,8 +2831,12 @@ fn reject_legacy_user_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_control_database_pair(path: &Path, control: &ControlStore) -> Result<()> {
-    let digest = file_digest(path)?;
+fn validate_control_database_pair(
+    path: &Path,
+    control: &ControlStore,
+) -> Result<CanonicalPageStateV3> {
+    let page_state = rebuild_sealed_page_state(path)?;
+    let actual = page_state.cache.identity();
     if let Some(pending) = control.pending()? {
         let tip = control.applied_tip()?;
         let expected_entry_index = tip
@@ -2501,48 +2844,48 @@ fn validate_control_database_pair(path: &Path, control: &ControlStore) -> Result
             .checked_add(1)
             .ok_or_else(|| Error::InvalidEntry("pending QWAL entry index is exhausted".into()))?;
         if pending.base() != LogAnchor::new(tip.applied_index(), tip.applied_hash())
-            || pending.base_db_digest() != control.user_db_digest()?
+            || pending.base_state() != control.user_state()?
             || pending.entry().index() != expected_entry_index
         {
             return Err(Error::InvalidEntry(
                 "pending QWAL intent does not extend the committed control state".into(),
             ));
         }
-        if digest == pending.base_db_digest() {
-            return Ok(());
+        if actual == pending.base_state() {
+            return Ok(page_state);
         }
-        if digest == pending.target_db_digest() {
-            let bytes = fs::metadata(path).map_err(io_error)?.len();
-            if bytes != pending.target_file_bytes() {
-                return Err(Error::InvalidEntry(
-                    "pending QWAL target size does not match the canonical database".into(),
-                ));
-            }
-            return Ok(());
+        if actual == pending.target_state() {
+            let verify = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(sqlite_error)?;
+            integrity_check(&verify)?;
+            return Ok(page_state);
         }
         return Err(Error::InvalidEntry(
-            "pending QWAL database digest matches neither base nor target".into(),
+            "pending QWAL database state matches neither base nor target".into(),
         ));
     }
-    if digest != control.user_db_digest()? {
+    if actual != control.user_state()? {
         return Err(Error::InvalidEntry(
-            "canonical SQLite digest does not match the control sidecar".into(),
+            "canonical SQLite page state does not match the control sidecar".into(),
         ));
     }
-    Ok(())
+    Ok(page_state)
 }
 
-fn decode_qwal_command(payload: &[u8]) -> Result<QwalEnvelopeV2> {
-    if !payload.starts_with(QWAL_V2_MAGIC) {
+fn decode_qwal_command(payload: &[u8]) -> Result<QwalEnvelopeV3> {
+    if !payload.starts_with(QWAL_V3_MAGIC) {
         return Err(Error::InvalidCommand(
-            "QWAL-only SQLite apply requires a QWAL v2 payload".into(),
+            "QWAL-only SQLite apply requires a QWAL v3 payload".into(),
         ));
     }
-    decode_qwal_v2(payload)
+    decode_qwal_v3(payload)
 }
 
 fn validate_qwal_identity(
-    effect: &QwalEnvelopeV2,
+    effect: &QwalEnvelopeV3,
     identity: &ControlIdentity,
     configuration: &ConfigurationState,
 ) -> Result<()> {
@@ -2551,6 +2894,7 @@ fn validate_qwal_identity(
         || effect.configuration_id != configuration.config_id()
         || effect.recovery_generation != identity.recovery_generation()
         || effect.materializer_fingerprint != identity.materializer_fingerprint().to_hex()
+        || effect.base_state != identity.user_state()
     {
         return Err(Error::InvalidEntry(
             "QWAL effect identity or materializer fingerprint mismatch".into(),
@@ -2559,20 +2903,20 @@ fn validate_qwal_identity(
     Ok(())
 }
 
-fn encode_qwal_snapshot(snapshot: &QwalSnapshotV2) -> Result<Vec<u8>> {
+fn encode_qwal_snapshot(snapshot: &QwalSnapshotV3) -> Result<Vec<u8>> {
     let body = postcard::to_allocvec(snapshot)
         .map_err(|error| Error::InvalidSnapshot(format!("QSNP encode failed: {error}")))?;
-    let mut encoded = Vec::with_capacity(QWAL_SNAPSHOT_V2_MAGIC.len() + body.len());
-    encoded.extend_from_slice(QWAL_SNAPSHOT_V2_MAGIC);
+    let mut encoded = Vec::with_capacity(QWAL_SNAPSHOT_V3_MAGIC.len() + body.len());
+    encoded.extend_from_slice(QWAL_SNAPSHOT_V3_MAGIC);
     encoded.extend_from_slice(&body);
     Ok(encoded)
 }
 
-fn decode_qwal_snapshot(encoded: &[u8]) -> Result<QwalSnapshotV2> {
+fn decode_qwal_snapshot(encoded: &[u8]) -> Result<QwalSnapshotV3> {
     let body = encoded
-        .strip_prefix(QWAL_SNAPSHOT_V2_MAGIC)
+        .strip_prefix(QWAL_SNAPSHOT_V3_MAGIC)
         .ok_or_else(|| Error::InvalidSnapshot("QWAL snapshot magic is missing".into()))?;
-    let snapshot: QwalSnapshotV2 = postcard::from_bytes(body)
+    let snapshot: QwalSnapshotV3 = postcard::from_bytes(body)
         .map_err(|error| Error::InvalidSnapshot(format!("QSNP decode failed: {error}")))?;
     if postcard::to_allocvec(&snapshot)
         .map_err(|error| Error::InvalidSnapshot(format!("QSNP re-encode failed: {error}")))?
@@ -3162,9 +3506,9 @@ mod query_policy_tests {
         let database =
             SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
                 .unwrap();
-        let commands = (0usize..MAX_QWAL_V2_RECEIPTS)
+        let commands = (0usize..MAX_QWAL_V3_RECEIPTS)
             .map(|index| SqlCommand {
-                request_id: if index + 1 == MAX_QWAL_V2_RECEIPTS {
+                request_id: if index + 1 == MAX_QWAL_V3_RECEIPTS {
                     "request-0000".into()
                 } else {
                     format!("request-{index:04}")
@@ -3193,7 +3537,7 @@ mod query_policy_tests {
             .unwrap();
 
         assert!(preparation.effect.is_none());
-        assert_eq!(preparation.results.len(), MAX_QWAL_V2_RECEIPTS);
+        assert_eq!(preparation.results.len(), MAX_QWAL_V3_RECEIPTS);
         assert!(matches!(
             preparation.results.last().unwrap(),
             Err(Error::InvalidCommand(message)) if message.contains("repeats a request_id")
@@ -3377,7 +3721,7 @@ mod query_policy_tests {
         let payload = encode_sql_command(&command).unwrap();
         let effect =
             prepare_single_sql_effect(&database, &command, &payload, 0, LogHash::ZERO).unwrap();
-        assert!(effect.starts_with(QWAL_V2_MAGIC));
+        assert!(effect.starts_with(QWAL_V3_MAGIC));
         assert_eq!(database.applied_index_value().unwrap(), 0);
     }
 
@@ -3410,7 +3754,7 @@ mod query_policy_tests {
             let prepared = database.prepared_target.lock().unwrap();
             assert!(sqlite_sidecars_absent(prepared.as_ref().unwrap().artifact.path()).unwrap());
         }
-        let effect = decode_qwal_v2(&payload).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
         let hash = LogEntry::calculate_hash(
             "cluster-a",
             1,
@@ -3433,8 +3777,8 @@ mod query_policy_tests {
             })
             .unwrap();
         assert_eq!(
-            database.canonical_db_digest().unwrap(),
-            effect.target_db_digest
+            rebuild_page_state(&path).unwrap().identity(),
+            effect.target_state
         );
     }
 
@@ -3510,10 +3854,9 @@ mod query_policy_tests {
         let base_digest = database.canonical_db_digest().unwrap();
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 1, setup_entry.hash).unwrap();
-        let effect = decode_qwal_v2(&payload).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
         assert!(effect.pages.is_empty());
-        assert_eq!(effect.base_db_digest, base_digest);
-        assert_eq!(effect.target_db_digest, base_digest);
+        assert_eq!(effect.base_state, effect.target_state);
 
         let entry = command_entry(2, setup_entry.hash, payload);
         database.apply_entry(&entry).unwrap();
@@ -3566,7 +3909,6 @@ mod query_policy_tests {
             prepared_base_reuse_audit(&path),
             Some(PreparedBaseReuseAudit {
                 second_checkpoint_count: 0,
-                second_base_full_hash_count: 0,
             })
         );
         assert_eq!(outcome.progress(), ApplyProgress::new(1, entry.hash));
@@ -3581,7 +3923,7 @@ mod query_policy_tests {
     }
 
     #[test]
-    fn foreign_consensus_winner_discards_the_prepared_target_and_rebuilds() {
+    fn foreign_consensus_winner_discards_the_prepared_target_and_patches_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let local_path = dir.path().join("local.sqlite");
         let foreign_path = dir.path().join("foreign.sqlite");
@@ -3620,13 +3962,12 @@ mod query_policy_tests {
 
         assert_eq!(
             prepared_install_path(&local_path),
-            Some(PreparedInstallPath::Rebuilt)
+            Some(PreparedInstallPath::Patched)
         );
         assert_eq!(
             prepared_base_reuse_audit(&local_path),
             Some(PreparedBaseReuseAudit {
                 second_checkpoint_count: 1,
-                second_base_full_hash_count: 1,
             })
         );
         assert_eq!(
@@ -3642,6 +3983,179 @@ mod query_policy_tests {
                 .unwrap()
                 .rows,
             vec![vec![SqlValue::Text("foreign_only".into())]]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_size_canonical_mutation_is_rejected_before_qwal_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let command = SqlCommand {
+            request_id: "sealed-base-mutation".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE must_not_be_installed(value INTEGER NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let payload =
+            prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
+        let entry = command_entry(1, LogHash::ZERO, payload);
+        {
+            let _lifecycle = database.lock_lifecycle().unwrap();
+            database.close_connection().unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let offset = file.metadata().unwrap().len() - 1;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            let mut byte = [0_u8; 1];
+            file.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0xff;
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&byte).unwrap();
+        }
+        let mutated = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            database.apply_entry(&entry),
+            Err(Error::InvalidEntry(message)) if message.contains("page-state seal")
+        ));
+        assert_eq!(fs::read(&path).unwrap(), mutated);
+        assert_eq!(database.applied_tip_value().unwrap(), (0, LogHash::ZERO));
+    }
+
+    #[test]
+    fn interrupted_in_place_apply_is_rejected_on_reopen_for_recorder_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let proposer_path = dir.path().join("proposer.sqlite");
+        let follower_path = dir.path().join("follower.sqlite");
+        let proposer =
+            SqliteStateMachine::open(&proposer_path, "cluster-a", "node-1", 1, 1).unwrap();
+        let follower =
+            SqliteStateMachine::open(&follower_path, "cluster-a", "node-2", 1, 1).unwrap();
+        let command = SqlCommand {
+            request_id: "interrupt-in-place".into(),
+            statements: vec![
+                SqlStatement {
+                    sql: "CREATE TABLE interrupted(value BLOB NOT NULL)".into(),
+                    parameters: vec![],
+                },
+                SqlStatement {
+                    sql: "INSERT INTO interrupted VALUES (zeroblob(20000))".into(),
+                    parameters: vec![],
+                },
+            ],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let payload =
+            prepare_single_sql_effect(&proposer, &command, &request, 0, LogHash::ZERO).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
+        assert!(effect.pages.len() > 1);
+        arm_qwal_apply_fault(
+            &follower_path,
+            QwalApplyFault::AfterPage(effect.pages[0].page_no),
+        );
+
+        assert!(follower
+            .apply_entry(&command_entry(1, LogHash::ZERO, payload))
+            .is_err());
+        assert!(matches!(
+            follower.query_sql(&SqlStatement { sql: "SELECT 1".into(), parameters: vec![] }, 1, 64),
+            Err(Error::Sqlite(message)) if message.contains("closed")
+        ));
+        drop(follower);
+        assert!(matches!(
+            SqliteStateMachine::open_existing(&follower_path),
+            Err(Error::InvalidEntry(message)) if message.contains("page state")
+        ));
+    }
+
+    #[test]
+    fn startup_rejects_untracked_committed_wal_before_exposing_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        drop(database);
+
+        let external = Connection::open(&path).unwrap();
+        external
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        external
+            .execute_batch(
+                "CREATE TABLE untracked_wal(value TEXT NOT NULL);
+                 INSERT INTO untracked_wal VALUES ('must-not-be-visible');",
+            )
+            .unwrap();
+        assert!(
+            fs::metadata(sqlite_sidecar_path(&path, "-wal"))
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        assert!(matches!(
+            SqliteStateMachine::open_existing(&path),
+            Err(Error::InvalidEntry(message)) if message.contains("sidecars")
+        ));
+        drop(external);
+    }
+
+    #[test]
+    fn post_install_control_failure_closes_reads_until_exact_replay_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let command = SqlCommand {
+            request_id: "control-failure".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE installed_before_control(value INTEGER NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let payload =
+            prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
+        let entry = command_entry(1, LogHash::ZERO, payload);
+        arm_qwal_apply_fault(&path, QwalApplyFault::BeforeControlCommit);
+
+        assert!(database.apply_entry(&entry).is_err());
+        assert_eq!(database.applied_tip_value().unwrap(), (0, LogHash::ZERO));
+        assert!(matches!(
+            database.query_sql(&SqlStatement { sql: "SELECT 1".into(), parameters: vec![] }, 1, 64),
+            Err(Error::Sqlite(message)) if message.contains("closed")
+        ));
+        assert!(matches!(
+            database.check_request("control-failure", &request),
+            Err(Error::Sqlite(message)) if message.contains("closed")
+        ));
+        assert!(matches!(
+            database.check_sql_requests(&[("control-failure", request.as_slice())]),
+            Err(Error::Sqlite(message)) if message.contains("closed")
+        ));
+
+        database.apply_entry(&entry).unwrap();
+        assert_eq!(database.applied_tip_value().unwrap(), (1, entry.hash));
+        assert_eq!(
+            database
+                .query_sql(
+                    &SqlStatement {
+                        sql:
+                            "SELECT name FROM sqlite_schema WHERE name = 'installed_before_control'"
+                                .into(),
+                        parameters: vec![],
+                    },
+                    1,
+                    256,
+                )
+                .unwrap()
+                .rows,
+            vec![vec![SqlValue::Text("installed_before_control".into())]]
         );
     }
 
@@ -3682,13 +4196,12 @@ mod query_policy_tests {
 
         assert_eq!(
             prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
+            Some(PreparedInstallPath::Patched)
         );
         assert_eq!(
             prepared_base_reuse_audit(&path),
             Some(PreparedBaseReuseAudit {
                 second_checkpoint_count: 1,
-                second_base_full_hash_count: 1,
             })
         );
         assert!(!fs::symlink_metadata(&path)
@@ -3713,7 +4226,7 @@ mod query_policy_tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepared_base_new_inode_falls_back_to_a_full_rebuild() {
+    fn prepared_base_new_inode_is_rejected_by_the_page_state_seal() {
         use std::os::unix::fs::MetadataExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3739,21 +4252,10 @@ mod query_policy_tests {
         }
         assert_ne!(fs::metadata(&path).unwrap().ino(), original_inode);
 
-        database
+        assert!(database
             .apply_entry(&command_entry(1, LogHash::ZERO, payload))
-            .unwrap();
-
-        assert_eq!(
-            prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
-        );
-        assert_eq!(
-            prepared_base_reuse_audit(&path),
-            Some(PreparedBaseReuseAudit {
-                second_checkpoint_count: 1,
-                second_base_full_hash_count: 1,
-            })
-        );
+            .is_err());
+        assert_eq!(prepared_install_path(&path), None);
     }
 
     #[cfg(unix)]
@@ -3782,15 +4284,11 @@ mod query_policy_tests {
             symlink(&backing, &path).unwrap();
         }
 
-        database
+        assert!(database
             .apply_entry(&command_entry(1, LogHash::ZERO, payload))
-            .unwrap();
-
-        assert_eq!(
-            prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
-        );
-        assert!(!fs::symlink_metadata(&path)
+            .is_err());
+        assert_eq!(prepared_install_path(&path), None);
+        assert!(fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
             .is_symlink());
@@ -3840,7 +4338,7 @@ mod query_policy_tests {
 
     #[cfg(unix)]
     #[test]
-    fn missing_prepared_target_falls_back_to_a_full_rebuild() {
+    fn missing_prepared_target_falls_back_to_an_in_place_patch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
@@ -3871,13 +4369,13 @@ mod query_policy_tests {
 
         assert_eq!(
             prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
+            Some(PreparedInstallPath::Patched)
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn mutated_prepared_target_falls_back_to_a_full_rebuild() {
+    fn mutated_prepared_target_falls_back_to_an_in_place_patch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
@@ -3891,7 +4389,7 @@ mod query_policy_tests {
         let request = encode_sql_command(&command).unwrap();
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
-        let effect = decode_qwal_v2(&payload).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
         let staging_path = database
             .prepared_target
             .lock()
@@ -3908,7 +4406,10 @@ mod query_policy_tests {
             )
             .unwrap();
         mutation.close().unwrap();
-        assert_ne!(file_digest(&staging_path).unwrap(), effect.target_db_digest);
+        assert_ne!(
+            rebuild_page_state(&staging_path).unwrap().identity(),
+            effect.target_state
+        );
 
         database
             .apply_entry(&command_entry(1, LogHash::ZERO, payload))
@@ -3916,7 +4417,7 @@ mod query_policy_tests {
 
         assert_eq!(
             prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
+            Some(PreparedInstallPath::Patched)
         );
         assert!(database
             .query_sql(
@@ -3993,13 +4494,12 @@ mod query_policy_tests {
 
         assert_eq!(
             prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
+            Some(PreparedInstallPath::Patched)
         );
         assert_eq!(
             prepared_base_reuse_audit(&path),
             Some(PreparedBaseReuseAudit {
                 second_checkpoint_count: 1,
-                second_base_full_hash_count: 1,
             })
         );
         assert_eq!(
@@ -4015,7 +4515,7 @@ mod query_policy_tests {
     }
 
     #[test]
-    fn replay_after_durable_pending_with_canonical_base_rebuilds_target_and_receipt() {
+    fn replay_after_legacy_pending_with_canonical_base_patches_target_and_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         let command = SqlCommand {
@@ -4035,7 +4535,7 @@ mod query_policy_tests {
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
-        let effect = decode_qwal_v2(&payload).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
         let expected_result = decode_sql_result(&effect.receipts[0].result_blob).unwrap();
         let entry = command_entry(1, LogHash::ZERO, payload);
         let pending = pending_for(&entry, &effect);
@@ -4047,18 +4547,17 @@ mod query_policy_tests {
 
         assert_eq!(outcome.sql_result(), Some(&expected_result));
         assert_eq!(
-            database.canonical_db_digest().unwrap(),
-            effect.target_db_digest
+            rebuild_page_state(&path).unwrap().identity(),
+            effect.target_state
         );
         assert_eq!(
             prepared_install_path(&path),
-            Some(PreparedInstallPath::Rebuilt)
+            Some(PreparedInstallPath::Patched)
         );
         assert_eq!(
             prepared_base_reuse_audit(&path),
             Some(PreparedBaseReuseAudit {
                 second_checkpoint_count: 1,
-                second_base_full_hash_count: 1,
             })
         );
         assert_eq!(
@@ -4092,7 +4591,7 @@ mod query_policy_tests {
         let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
         let payload =
             prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
-        let effect = decode_qwal_v2(&payload).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
         let expected_result = decode_sql_result(&effect.receipts[0].result_blob).unwrap();
         let entry = command_entry(1, LogHash::ZERO, payload);
         let pending = pending_for(&entry, &effect);
@@ -4116,8 +4615,8 @@ mod query_policy_tests {
 
         assert_eq!(outcome.sql_result(), Some(&expected_result));
         assert_eq!(
-            database.canonical_db_digest().unwrap(),
-            effect.target_db_digest
+            rebuild_page_state(&path).unwrap().identity(),
+            effect.target_state
         );
         assert_eq!(prepared_install_path(&path), None);
         assert_eq!(
@@ -4129,13 +4628,12 @@ mod query_policy_tests {
         );
     }
 
-    fn pending_for(entry: &LogEntry, effect: &QwalEnvelopeV2) -> PendingApply {
+    fn pending_for(entry: &LogEntry, effect: &QwalEnvelopeV3) -> PendingApply {
         PendingApply::new(
             LogAnchor::new(effect.base_index, effect.base_hash),
             LogAnchor::new(entry.index, entry.hash),
-            effect.base_db_digest,
-            effect.target_db_digest,
-            effect.target_file_bytes,
+            effect.base_state,
+            effect.target_state,
         )
     }
 

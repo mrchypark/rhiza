@@ -1,8 +1,9 @@
-use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash};
+use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot};
 use rhiza_sql::{
-    decode_qwal_v2, encode_put_request, encode_sql_command, restore_recovery_snapshot_file,
-    restore_snapshot_file, ControlStore, Error, PendingApply, SqlBatchMember, SqlCommand,
-    SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES, QWAL_V2_MAGIC,
+    decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
+    restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, PendingApply,
+    SqlBatchMember, SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES,
+    QWAL_V3_MAGIC,
 };
 use rusqlite::Connection;
 
@@ -59,7 +60,7 @@ fn prepared_qwal(
         .unwrap();
     preparation.results.into_iter().next().unwrap().unwrap();
     let effect = preparation.effect.unwrap();
-    assert!(effect.starts_with(QWAL_V2_MAGIC));
+    assert!(effect.starts_with(QWAL_V3_MAGIC));
     (request, effect)
 }
 
@@ -125,7 +126,7 @@ fn batch_preparation_commits_successes_once_and_isolates_failed_members() {
     assert!(preparation.results[1].is_err());
     assert!(preparation.results[2].is_ok());
     let payload = preparation.effect.unwrap();
-    let effect = decode_qwal_v2(&payload).unwrap();
+    let effect = decode_qwal_v3(&payload).unwrap();
     assert_eq!(
         effect
             .receipts
@@ -200,7 +201,7 @@ fn one_thousand_twenty_four_successes_share_one_entry_and_survive_reopen() {
     assert!(preparation.results.iter().all(Result::is_ok));
     let payload = preparation.effect.unwrap();
     assert!(payload.len() <= MAX_SQL_EFFECT_BYTES);
-    assert_eq!(decode_qwal_v2(&payload).unwrap().receipts.len(), 1024);
+    assert_eq!(decode_qwal_v3(&payload).unwrap().receipts.len(), 1024);
     let decided = entry(2, setup_entry.hash, &payload);
     db.apply_entry(&decided).unwrap();
     drop(db);
@@ -539,6 +540,78 @@ fn qwal_apply_rejects_an_effect_prepared_from_a_stale_base() {
 }
 
 #[test]
+fn qwal_apply_rejects_a_forged_target_root_before_writing_canonical_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let db = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let command = SqlCommand {
+        request_id: "forged-target-root".into(),
+        statements: vec![SqlStatement {
+            sql: "CREATE TABLE must_not_be_installed(value TEXT NOT NULL)".into(),
+            parameters: vec![],
+        }],
+    };
+    let (_, encoded) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
+    let mut forged = decode_qwal_v3(&encoded).unwrap();
+    forged.target_state.state_root = LogHash::digest(&[b"forged-target-root"]);
+    let forged = encode_qwal_v3(&forged).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    assert!(matches!(
+        db.apply_entry(&entry(1, LogHash::ZERO, &forged)),
+        Err(Error::InvalidEntry(message)) if message.contains("target page state")
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(db.applied_tip_value().unwrap(), (0, LogHash::ZERO));
+}
+
+#[test]
+fn qwal_apply_rejects_forged_no_change_target_with_inconsistent_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let db = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+    let setup = SqlCommand {
+        request_id: "forged-no-change-setup".into(),
+        statements: vec![
+            SqlStatement {
+                sql: "CREATE TABLE forged_no_change(value TEXT NOT NULL)".into(),
+                parameters: vec![],
+            },
+            SqlStatement {
+                sql: "INSERT INTO forged_no_change VALUES ('before')".into(),
+                parameters: vec![],
+            },
+        ],
+    };
+    let (_, setup_effect) = prepared_qwal(&db, &setup, 0, LogHash::ZERO);
+    let setup_entry = entry(1, LogHash::ZERO, &setup_effect);
+    db.apply_entry(&setup_entry).unwrap();
+    let update = SqlCommand {
+        request_id: "forged-no-change".into(),
+        statements: vec![SqlStatement {
+            sql: "UPDATE forged_no_change SET value = 'after!'".into(),
+            parameters: vec![],
+        }],
+    };
+    let (_, encoded) = prepared_qwal(&db, &update, 1, setup_entry.hash);
+    let mut forged = decode_qwal_v3(&encoded).unwrap();
+    assert!(!forged.pages.is_empty());
+    assert_eq!(forged.base_state.page_count, forged.target_state.page_count);
+    forged.target_state = forged.base_state;
+    let forged = encode_qwal_v3(&forged).unwrap();
+
+    assert!(matches!(
+        db.apply_entry(&entry(2, setup_entry.hash, &forged)),
+        Err(Error::InvalidEntry(message)) if message.contains("target page state")
+    ));
+    assert_eq!(db.applied_tip_value().unwrap(), (1, setup_entry.hash));
+    assert_eq!(
+        query(&db, "SELECT value FROM forged_no_change"),
+        [[SqlValue::Text("before".into())]]
+    );
+}
+
+#[test]
 fn pure_noop_commit_survives_reopen_and_replay_but_rejects_a_different_hash() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite");
@@ -698,6 +771,43 @@ fn qwal_snapshot_restore_rebinds_node_identity_without_changing_user_bytes_or_re
 }
 
 #[test]
+fn qwal_snapshot_restore_rejects_user_bytes_that_do_not_match_the_bound_page_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.sqlite");
+    let source = SqliteStateMachine::open(&source_path, "cluster-a", "node-1", 1, 1).unwrap();
+    let command = SqlCommand {
+        request_id: "snapshot-root-mismatch".into(),
+        statements: vec![
+            SqlStatement {
+                sql: "CREATE TABLE snapshot_values(value TEXT NOT NULL)".into(),
+                parameters: vec![],
+            },
+            SqlStatement {
+                sql: "INSERT INTO snapshot_values VALUES ('preserved')".into(),
+                parameters: vec![],
+            },
+        ],
+    };
+    let (_, effect) = prepared_qwal(&source, &command, 0, LogHash::ZERO);
+    source
+        .apply_entry(&entry(1, LogHash::ZERO, &effect))
+        .unwrap();
+    let snapshot = source.create_snapshot(1).unwrap();
+    let mut tampered = snapshot.db_bytes().to_vec();
+    let offset = tampered
+        .windows(b"preserved".len())
+        .position(|window| window == b"preserved")
+        .expect("snapshot contains the inserted SQLite value");
+    tampered[offset..offset + b"tampered!".len()].copy_from_slice(b"tampered!");
+    let tampered = Snapshot::new(snapshot.manifest().clone(), tampered);
+
+    assert!(matches!(
+        restore_snapshot_file(dir.path().join("rejected.sqlite"), &tampered, "node-2"),
+        Err(Error::InvalidSnapshot(message)) if message.contains("page state")
+    ));
+}
+
+#[test]
 fn qwal_only_apply_rejects_legacy_qsql_and_qefx_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
@@ -713,7 +823,11 @@ fn qwal_only_apply_rejects_legacy_qsql_and_qefx_payloads() {
     assert!(qsql.starts_with(b"QSQL\0\x02"));
     let before = db.canonical_db_digest().unwrap();
 
-    let legacy_payloads = [qsql, b"QEFX\0\x01{}".to_vec()];
+    let legacy_payloads = [
+        qsql,
+        b"QEFX\0\x01{}".to_vec(),
+        b"QWAL\0\x03legacy-v2".to_vec(),
+    ];
     for payload in legacy_payloads {
         assert!(matches!(
             db.apply_entry(&entry(1, LogHash::ZERO, &payload)),
@@ -755,14 +869,13 @@ fn unresolved_pending_apply_blocks_reads_and_preparation_but_exact_replay_recove
         }],
     };
     let (request, effect_bytes) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
-    let effect = decode_qwal_v2(&effect_bytes).unwrap();
+    let effect = decode_qwal_v3(&effect_bytes).unwrap();
     let decided = entry(1, LogHash::ZERO, &effect_bytes);
     let pending = PendingApply::new(
         LogAnchor::new(0, LogHash::ZERO),
         LogAnchor::new(1, decided.hash),
-        effect.base_db_digest,
-        effect.target_db_digest,
-        effect.target_file_bytes,
+        effect.base_state,
+        effect.target_state,
     );
     let control =
         ControlStore::open_existing_unchecked(path.with_extension("sqlite.control")).unwrap();
@@ -822,7 +935,7 @@ fn open_rejects_a_pending_intent_that_no_longer_extends_the_committed_tip() {
         }],
     };
     let (_, effect_bytes) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
-    let effect = decode_qwal_v2(&effect_bytes).unwrap();
+    let effect = decode_qwal_v3(&effect_bytes).unwrap();
     let decided = entry(1, LogHash::ZERO, &effect_bytes);
     drop(db);
 
@@ -832,9 +945,8 @@ fn open_rejects_a_pending_intent_that_no_longer_extends_the_committed_tip() {
         .begin_pending(&PendingApply::new(
             LogAnchor::new(0, LogHash::ZERO),
             LogAnchor::new(1, decided.hash),
-            effect.base_db_digest,
-            effect.target_db_digest,
-            effect.target_file_bytes,
+            effect.base_state,
+            effect.target_state,
         ))
         .unwrap();
     drop(control);
@@ -886,5 +998,5 @@ fn recovery_restore_overrides_the_embedded_generation_for_the_next_effect() {
         }],
     };
     let (_, next_effect) = prepared_qwal(&target, &next, 1, setup_entry.hash);
-    assert_eq!(decode_qwal_v2(&next_effect).unwrap().recovery_generation, 7);
+    assert_eq!(decode_qwal_v3(&next_effect).unwrap().recovery_generation, 7);
 }
