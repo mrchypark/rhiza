@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -20,15 +20,20 @@ use rhiza_graph::{encode_replicated_graph_command, GraphResultValue, LadybugStat
 use rhiza_kv::{encode_replicated_kv_command, KvCommandV1, RedbStateMachine};
 use rhiza_node::{NodeConfig, NodeRuntime, SqlWriteProfileSnapshot, SqlWriteProfiler};
 use rhiza_quepaxa::{Membership, RecorderFileStore, RecorderRpc, ThreeNodeConsensus};
+#[cfg(test)]
+use rhiza_sql::decode_qwal_v3;
 use rhiza_sql::{
-    encode_sql_command, SqlBatchMember, SqlBatchPreparation, SqliteStateMachine, QWAL_V2_MAGIC,
+    encode_sql_command, restore_snapshot_file, SqlBatchMember, SqlBatchPreparation,
+    SqliteStateMachine, QWAL_V3_MAGIC,
 };
 use serde::Serialize;
 
 const KEYSPACE: u64 = 256;
+const MAX_SQL_PADDING_MIB: usize = 1_024;
+const SQL_PADDING_CHUNK_BYTES: usize = 128 * 1024;
 const RAW_RESULT_BYTES: usize = 1024 * 1024;
 const RAW_GRAPH_TIMEOUT_MS: u64 = 5_000;
-const REPORT_SCHEMA_VERSION: u32 = 4;
+const REPORT_SCHEMA_VERSION: u32 = 5;
 type RecorderSet = Vec<(String, Box<dyn RecorderRpc>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -105,6 +110,7 @@ enum Layer {
     Runtime,
     Raw,
     Qwal,
+    FollowerApply,
     Consensus,
 }
 
@@ -115,8 +121,11 @@ impl Layer {
             "runtime" => Ok(Self::Runtime),
             "raw" => Ok(Self::Raw),
             "qwal" => Ok(Self::Qwal),
+            "follower-apply" => Ok(Self::FollowerApply),
             "consensus" => Ok(Self::Consensus),
-            _ => Err("--layer must be handle, runtime, raw, qwal, or consensus".into()),
+            _ => Err(
+                "--layer must be handle, runtime, raw, qwal, follower-apply, or consensus".into(),
+            ),
         }
     }
 
@@ -130,7 +139,10 @@ impl Layer {
                 "direct materializer reads; writes encode a command, construct LogEntry, and apply it"
             }
             Self::Qwal => {
-                "SQLite QWAL v2 batch encode, effect preparation, LogEntry construction, and materializer apply"
+                "SQLite QWAL v3 batch encode, effect preparation, LogEntry construction, and materializer apply"
+            }
+            Self::FollowerApply => {
+                "QWAL v3 preparation on an identically restored SQL leader plus timed SqliteStateMachine::apply_entry of a prebuilt LogEntry on a separate follower"
             }
             Self::Consensus => {
                 "generic ThreeNodeConsensus::propose_at with deterministic payload; selected profile is not exercised; excludes qlog and materializer"
@@ -143,7 +155,7 @@ impl Layer {
             Self::Handle | Self::Runtime => {
                 "in-process QuePaxa with three file-backed RecorderRpc voters"
             }
-            Self::Raw | Self::Qwal => {
+            Self::Raw | Self::Qwal | Self::FollowerApply => {
                 "excluded; writes include command encode, LogEntry construction, and materializer apply"
             }
             Self::Consensus => "in-process QuePaxa with three file-backed RecorderRpc voters",
@@ -161,6 +173,9 @@ impl Layer {
             Self::Raw => "materializer-native local commit only",
             Self::Qwal => {
                 "non-durable local QWAL batch preparation and SQLite materializer apply; excludes consensus and qlog"
+            }
+            Self::FollowerApply => {
+                "non-durable follower SQLite materializer apply from a leader-prepared QWAL; excludes consensus and qlog"
             }
             Self::Consensus => {
                 "three RecorderFileStore voter commits; excludes local qlog and materializer"
@@ -193,6 +208,7 @@ struct Config {
     value_bytes: usize,
     read_consistency: BenchmarkReadConsistency,
     sql_write_profile: bool,
+    sql_padding_mib: usize,
 }
 
 impl Config {
@@ -209,6 +225,8 @@ impl Config {
         let mut read_consistency = BenchmarkReadConsistency::Local;
         let mut consistency_was_explicit = false;
         let mut sql_write_profile = false;
+        let mut sql_padding_mib = 0;
+        let mut sql_padding_was_explicit = false;
         let mut index = 0;
         while index < values.len() {
             let flag = &values[index];
@@ -231,6 +249,10 @@ impl Config {
                 "--warmup" => warmup = parse_u64_allow_zero(next()?, flag)?,
                 "--concurrency" => concurrency = parse_usize(next()?, flag)?,
                 "--value-bytes" => value_bytes = parse_usize(next()?, flag)?,
+                "--sql-padding-mib" => {
+                    sql_padding_mib = parse_usize_allow_zero(next()?, flag)?;
+                    sql_padding_was_explicit = true;
+                }
                 "--consistency" => {
                     read_consistency = BenchmarkReadConsistency::parse(next()?)?;
                     consistency_was_explicit = true;
@@ -243,7 +265,16 @@ impl Config {
         if !(16..=4_096).contains(&value_bytes) {
             return Err("--value-bytes must be between 16 and 4096".into());
         }
-        if matches!(layer, Layer::Raw | Layer::Qwal | Layer::Consensus) && concurrency != 1 {
+        if sql_padding_mib > MAX_SQL_PADDING_MIB {
+            return Err(format!(
+                "--sql-padding-mib must be between 0 and {MAX_SQL_PADDING_MIB}"
+            ));
+        }
+        if matches!(
+            layer,
+            Layer::Raw | Layer::Qwal | Layer::FollowerApply | Layer::Consensus
+        ) && concurrency != 1
+        {
             return Err(format!("--layer {layer:?} requires --concurrency 1").to_lowercase());
         }
         let profile = profile.ok_or_else(|| "--profile is required".to_string())?;
@@ -256,12 +287,24 @@ impl Config {
         }
         if layer == Layer::Raw && profile == Profile::Sql && workload == Workload::Write {
             return Err(
-                "--layer raw cannot measure SQL writes: SQLite apply accepts only prepared QWAL v2 effects; use --layer qwal"
+                "--layer raw cannot measure SQL writes: SQLite apply accepts only prepared QWAL v3 effects; use --layer qwal"
                     .into(),
             );
         }
-        if layer == Layer::Qwal && (profile != Profile::Sql || workload != Workload::Write) {
-            return Err("--layer qwal supports only --profile sql --workload write".into());
+        if matches!(layer, Layer::Qwal | Layer::FollowerApply)
+            && (profile != Profile::Sql || workload != Workload::Write)
+        {
+            return Err(format!(
+                "--layer {} supports only --profile sql --workload write",
+                match layer {
+                    Layer::Qwal => "qwal",
+                    Layer::FollowerApply => "follower-apply",
+                    _ => unreachable!(),
+                }
+            ));
+        }
+        if sql_padding_was_explicit && layer != Layer::FollowerApply {
+            return Err("--sql-padding-mib requires --layer follower-apply".into());
         }
         if consistency_was_explicit
             && (workload == Workload::Write || !matches!(layer, Layer::Handle | Layer::Runtime))
@@ -286,15 +329,21 @@ impl Config {
                 "--batch-size must be 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, or 1024".into(),
             );
         }
-        if batch_size > 256 && layer != Layer::Qwal {
-            return Err("--batch-size 512 or 1024 requires --layer qwal".into());
+        if batch_size > 256 && !matches!(layer, Layer::Qwal | Layer::FollowerApply) {
+            return Err("--batch-size 512 or 1024 requires --layer qwal or follower-apply".into());
         }
         if batch_size != 1 && workload != Workload::Write {
             return Err("--batch-size greater than 1 requires --workload write".into());
         }
-        if batch_size != 1 && !matches!(layer, Layer::Handle | Layer::Runtime | Layer::Qwal) {
+        if batch_size != 1
+            && !matches!(
+                layer,
+                Layer::Handle | Layer::Runtime | Layer::Qwal | Layer::FollowerApply
+            )
+        {
             return Err(
-                "--batch-size greater than 1 requires --layer handle, runtime, or qwal".into(),
+                "--batch-size greater than 1 requires --layer handle, runtime, qwal, or follower-apply"
+                    .into(),
             );
         }
         if batch_size > 64
@@ -304,7 +353,7 @@ impl Config {
             let layer = match layer {
                 Layer::Handle => "handle",
                 Layer::Runtime => "runtime",
-                Layer::Raw | Layer::Qwal | Layer::Consensus => {
+                Layer::Raw | Layer::Qwal | Layer::FollowerApply | Layer::Consensus => {
                     unreachable!("only embedded typed batch layers reach this check")
                 }
             };
@@ -323,6 +372,7 @@ impl Config {
             value_bytes,
             read_consistency,
             sql_write_profile,
+            sql_padding_mib,
         })
     }
 }
@@ -355,11 +405,17 @@ fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_usize_allow_zero(value: &str, flag: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} must be a non-negative integer"))
+}
+
 fn usage() -> String {
     "usage: rhiza-profile --profile sql|graph|kv --workload write|get|document-get|native-read \
-     [--layer handle|runtime|raw|qwal|consensus] [--operations N] [--warmup N] [--concurrency N] \
+     [--layer handle|runtime|raw|qwal|follower-apply|consensus] [--operations N] [--warmup N] [--concurrency N] \
      [--batch-size 1|2|4|8|16|32|64|128|256|512|1024] [--value-bytes N] [--consistency local|read_barrier] \
-     [--sql-write-profile]"
+     [--sql-write-profile] [--sql-padding-mib 0..1024]"
         .into()
 }
 
@@ -377,6 +433,8 @@ struct Samples {
     qwal_prepare_latency_us: BTreeMap<u64, u64>,
     qwal_apply_calls: u64,
     qwal_apply_latency_us: BTreeMap<u64, u64>,
+    follower_apply_calls: u64,
+    follower_apply_latency_us: BTreeMap<u64, u64>,
     qwal_envelope_bytes: ByteSamples,
     sql_write_profile: SqlWritePhaseSamples,
 }
@@ -432,6 +490,11 @@ impl Samples {
         }
     }
 
+    fn record_follower_apply(&mut self, apply: Duration) {
+        self.follower_apply_calls += 1;
+        record_latency(&mut self.follower_apply_latency_us, apply);
+    }
+
     fn merge(&mut self, other: Self) {
         self.successes += other.successes;
         self.errors += other.errors;
@@ -454,6 +517,10 @@ impl Samples {
         self.qwal_apply_calls += other.qwal_apply_calls;
         for (latency, count) in other.qwal_apply_latency_us {
             *self.qwal_apply_latency_us.entry(latency).or_default() += count;
+        }
+        self.follower_apply_calls += other.follower_apply_calls;
+        for (latency, count) in other.follower_apply_latency_us {
+            *self.follower_apply_latency_us.entry(latency).or_default() += count;
         }
         self.qwal_envelope_bytes.merge(other.qwal_envelope_bytes);
         self.sql_write_profile.merge(other.sql_write_profile);
@@ -508,6 +575,10 @@ impl Samples {
                 self.qwal_prepare_calls,
             ),
             qwal_apply_latency_us: latencies(&self.qwal_apply_latency_us, self.qwal_apply_calls),
+            follower_apply_latency_us: latencies(
+                &self.follower_apply_latency_us,
+                self.follower_apply_calls,
+            ),
             qwal_envelope_bytes: self.qwal_envelope_bytes.metrics(),
             sql_write_profile: self.sql_write_profile.metrics(),
             logical_item_latency_us: Latencies {
@@ -773,10 +844,26 @@ struct ReportConfig {
     concurrency: usize,
     keyspace: u64,
     value_bytes: usize,
+    sql_padding_mib: usize,
     read_consistency: &'static str,
     consensus: &'static str,
     durability: &'static str,
     sql_write_profile: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follower_apply_latency_scope: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follower_seed_state: Option<FollowerSeedState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct FollowerSeedState {
+    receipt_count: u64,
+    leader_database_bytes: u64,
+    follower_database_bytes: u64,
+    leader_control_bytes: u64,
+    follower_control_bytes: u64,
+    leader_embedded_qlog_entries: u64,
+    follower_embedded_qlog_entries: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -804,6 +891,8 @@ struct Metrics {
     qwal_prepare_latency_us: Option<Latencies>,
     #[serde(skip_serializing_if = "Option::is_none")]
     qwal_apply_latency_us: Option<Latencies>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follower_apply_latency_us: Option<Latencies>,
     #[serde(skip_serializing_if = "Option::is_none")]
     qwal_envelope_bytes: Option<QwalEnvelopeBytes>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -888,7 +977,7 @@ async fn run(config: Config) -> Result<Report, String> {
     // change the source provenance reported for this run.
     let provenance = provenance();
     let root = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let (samples, elapsed, qlog_entries) = match config.layer {
+    let (samples, elapsed, qlog_entries, follower_seed_state) = match config.layer {
         Layer::Handle => {
             let rhiza = Rhiza::open(embedded_config(root.path(), config.profile)?)
                 .await
@@ -897,21 +986,29 @@ async fn run(config: Config) -> Result<Report, String> {
             let shutdown = rhiza.shutdown().await.map_err(|error| error.to_string());
             let measured = measured?;
             shutdown?;
-            measured
+            let (samples, elapsed, qlog_entries) = measured;
+            (samples, elapsed, qlog_entries, None)
         }
         Layer::Runtime => {
             let (runtime, profiler) = runtime(root.path(), &config)?;
-            measure_target(Target::Runtime(runtime), &config, profiler).await?
+            let (samples, elapsed, qlog_entries) =
+                measure_target(Target::Runtime(runtime), &config, profiler).await?;
+            (samples, elapsed, qlog_entries, None)
         }
         Layer::Raw | Layer::Qwal => {
             let (samples, elapsed) =
                 measure_raw(RawTarget::open(root.path(), config.profile)?, &config)?;
-            (samples, elapsed, None)
+            (samples, elapsed, None, None)
+        }
+        Layer::FollowerApply => {
+            let (samples, elapsed, seed_state) =
+                measure_follower(SqlFollowerTarget::open(root.path())?, &config)?;
+            (samples, elapsed, None, Some(seed_state))
         }
         Layer::Consensus => {
             let (samples, elapsed) =
                 measure_consensus(ConsensusTarget::open(root.path())?, &config)?;
-            (samples, elapsed, None)
+            (samples, elapsed, None, None)
         }
     };
 
@@ -929,6 +1026,14 @@ async fn run(config: Config) -> Result<Report, String> {
     if config.layer == Layer::Qwal {
         limitations.push(
             "QWAL latency combines effect preparation and apply; internal phase timings are not exposed by this report",
+        );
+    }
+    if config.layer == Layer::FollowerApply {
+        limitations.push(
+            "follower_apply_latency_us measures only SqliteStateMachine::apply_entry for a prebuilt follower LogEntry; payload clone/hash/entry construction, anchor bookkeeping, leader QWAL preparation, and leader catch-up are excluded",
+        );
+        limitations.push(
+            "SQL padding is seeded before a recovery-snapshot restore into fresh leader/follower views; seed receipts remain in control and are reported, while embedded qlog is cleared",
         );
     }
     if config.workload == Workload::Write {
@@ -963,10 +1068,15 @@ async fn run(config: Config) -> Result<Report, String> {
             concurrency: config.concurrency,
             keyspace: KEYSPACE,
             value_bytes: config.value_bytes,
+            sql_padding_mib: config.sql_padding_mib,
             read_consistency: config.read_consistency.report(),
             consensus: config.layer.consensus(),
             durability: config.layer.durability(config.profile),
             sql_write_profile: config.sql_write_profile,
+            follower_apply_latency_scope: (config.layer == Layer::FollowerApply).then_some(
+                "SqliteStateMachine::apply_entry on a prebuilt leader LogEntry only; payload clone/hash/entry construction and anchor bookkeeping are excluded",
+            ),
+            follower_seed_state,
         },
         measurement: samples.metrics(elapsed, qlog_entries),
         limitations,
@@ -1978,6 +2088,14 @@ struct QwalBatchOutcome {
     envelope_bytes: Option<usize>,
     prepare_latency: Duration,
     apply_latency: Option<Duration>,
+    follower_apply_latency: Option<Duration>,
+}
+
+struct PreparedQwalBatch {
+    results: Vec<Result<(), String>>,
+    payload: Option<Vec<u8>>,
+    envelope_bytes: Option<usize>,
+    prepare_latency: Duration,
 }
 
 impl RawTarget {
@@ -1985,12 +2103,7 @@ impl RawTarget {
         let cluster_id = effective_cluster_id(profile.execution_profile(), "profile-bench")
             .map_err(|error| error.to_string())?;
         let state = match profile {
-            Profile::Sql => {
-                SqliteStateMachine::open(root.join("raw/sql.db"), &cluster_id, "node-1", 1, 1)
-                    .map(Box::new)
-                    .map(RawState::Sql)
-                    .map_err(|error| error.to_string())?
-            }
+            Profile::Sql => return Self::open_sql(root, "sql.db", "node-1"),
             Profile::Graph => {
                 LadybugStateMachine::open(root.join("raw/graph.lbug"), &cluster_id, "node-1", 1, 1)
                     .map(RawState::Graph)
@@ -2010,7 +2123,34 @@ impl RawTarget {
         })
     }
 
-    fn apply(&mut self, payload: Vec<u8>) -> Result<(), String> {
+    fn open_sql(root: &Path, database: &str, node_id: &str) -> Result<Self, String> {
+        let cluster_id = effective_cluster_id(ExecutionProfile::Sqlite, "profile-bench")
+            .map_err(|error| error.to_string())?;
+        let state =
+            SqliteStateMachine::open(root.join("raw").join(database), &cluster_id, node_id, 1, 1)
+                .map(Box::new)
+                .map_err(|error| error.to_string())?;
+        let (applied_index, applied_hash) = state
+            .applied_tip_value()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            cluster_id,
+            next_index: applied_index
+                .checked_add(1)
+                .ok_or_else(|| "QWAL benchmark index exhausted".to_string())?,
+            previous_hash: applied_hash,
+            state: RawState::Sql(state),
+        })
+    }
+
+    fn sql_state(&self) -> Result<&SqliteStateMachine, String> {
+        match &self.state {
+            RawState::Sql(state) => Ok(state),
+            _ => Err("QWAL benchmark requires SQL state".into()),
+        }
+    }
+
+    fn build_entry(&self, payload: Vec<u8>) -> LogEntry {
         let hash = LogEntry::calculate_hash(
             &self.cluster_id,
             self.next_index,
@@ -2020,7 +2160,7 @@ impl RawTarget {
             self.previous_hash,
             &payload,
         );
-        let entry = LogEntry {
+        LogEntry {
             cluster_id: self.cluster_id.clone(),
             epoch: 1,
             config_id: 1,
@@ -2029,30 +2169,49 @@ impl RawTarget {
             payload,
             prev_hash: self.previous_hash,
             hash,
-        };
+        }
+    }
+
+    fn apply_prebuilt_entry(&mut self, entry: &LogEntry) -> Result<(), String> {
+        if entry.cluster_id != self.cluster_id
+            || entry.index != self.next_index
+            || entry.prev_hash != self.previous_hash
+        {
+            return Err("prebuilt benchmark entry does not extend the target anchor".into());
+        }
         match &self.state {
             RawState::Sql(state) => state
-                .apply_entry(&entry)
+                .apply_entry(entry)
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
             RawState::Graph(state) => state
-                .apply_entry(&entry)
+                .apply_entry(entry)
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
             RawState::Kv(state) => state
-                .apply_entry(&entry)
+                .apply_entry(entry)
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
         }?;
-        self.next_index += 1;
-        self.previous_hash = hash;
+        self.advance_anchor(entry)?;
         Ok(())
     }
 
-    fn prepare_and_apply_sql_batch(
-        &mut self,
-        commands: &[SqlCommand],
-    ) -> Result<QwalBatchOutcome, String> {
+    fn advance_anchor(&mut self, entry: &LogEntry) -> Result<(), String> {
+        self.next_index = entry
+            .index
+            .checked_add(1)
+            .ok_or_else(|| "QWAL benchmark index exhausted".to_string())?;
+        self.previous_hash = entry.hash;
+        Ok(())
+    }
+
+    fn apply(&mut self, payload: Vec<u8>) -> Result<(), String> {
+        let entry = self.build_entry(payload);
+        self.apply_prebuilt_entry(&entry)
+    }
+
+    fn prepare_sql_batch(&mut self, commands: &[SqlCommand]) -> Result<PreparedQwalBatch, String> {
         let requests = commands
             .iter()
             .map(encode_sql_command)
@@ -2081,10 +2240,28 @@ impl RawTarget {
         };
         let prepare_latency = prepare_began.elapsed();
         let envelope_bytes = effect.as_ref().map(Vec::len);
-        let apply_latency = if let Some(payload) = effect {
-            if !payload.starts_with(QWAL_V2_MAGIC) {
-                return Err("SQLite prepared a non-QWAL v2 benchmark effect".into());
+        if let Some(payload) = &effect {
+            if !payload.starts_with(QWAL_V3_MAGIC) {
+                return Err("SQLite prepared a non-QWAL v3 benchmark effect".into());
             }
+        }
+        Ok(PreparedQwalBatch {
+            results: results
+                .into_iter()
+                .map(|result| result.map(|_| ()).map_err(|error| error.to_string()))
+                .collect(),
+            payload: effect,
+            envelope_bytes,
+            prepare_latency,
+        })
+    }
+
+    fn prepare_and_apply_sql_batch(
+        &mut self,
+        commands: &[SqlCommand],
+    ) -> Result<QwalBatchOutcome, String> {
+        let prepared = self.prepare_sql_batch(commands)?;
+        let apply_latency = if let Some(payload) = prepared.payload {
             let apply_began = Instant::now();
             self.apply(payload)?;
             Some(apply_began.elapsed())
@@ -2092,13 +2269,11 @@ impl RawTarget {
             None
         };
         Ok(QwalBatchOutcome {
-            results: results
-                .into_iter()
-                .map(|result| result.map(|_| ()).map_err(|error| error.to_string()))
-                .collect(),
-            envelope_bytes,
-            prepare_latency,
+            results: prepared.results,
+            envelope_bytes: prepared.envelope_bytes,
+            prepare_latency: prepared.prepare_latency,
             apply_latency,
+            follower_apply_latency: None,
         })
     }
 
@@ -2155,7 +2330,7 @@ impl RawTarget {
         let value = value(key_index, request_id, value_bytes);
         let payload = match profile {
             Profile::Sql => {
-                return Err("raw SQL writes require prepared QWAL v2 effects".into());
+                return Err("raw SQL writes require prepared QWAL v3 effects".into());
             }
             Profile::Graph => encode_replicated_graph_command(
                 &GraphCommandV1::put_document(request_id, key, GraphValueV1::String(value))
@@ -2288,6 +2463,271 @@ impl RawTarget {
     }
 }
 
+struct SqlFollowerTarget {
+    root: PathBuf,
+    leader: RawTarget,
+    follower: RawTarget,
+    leader_path: PathBuf,
+    follower_path: PathBuf,
+}
+
+impl SqlFollowerTarget {
+    fn open(root: &Path) -> Result<Self, String> {
+        let leader_path = root.join("raw/leader-seed.db");
+        let follower_path = root.join("raw/follower-seed.db");
+        Ok(Self {
+            root: root.to_path_buf(),
+            leader: RawTarget::open_sql(root, "leader-seed.db", "node-1")?,
+            follower: RawTarget::open_sql(root, "follower-seed.db", "node-2")?,
+            leader_path,
+            follower_path,
+        })
+    }
+
+    fn seed(
+        &mut self,
+        value_bytes: usize,
+        padding_mib: usize,
+    ) -> Result<FollowerSeedState, String> {
+        let mut receipt_count = 0u64;
+        self.apply_seed_command(SqlCommand {
+            request_id: "profile-bench-schema".into(),
+            statements: vec![
+                SqlStatement {
+                    sql: "CREATE TABLE bench_items(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                        .into(),
+                    parameters: vec![],
+                },
+                SqlStatement {
+                    sql:
+                        "CREATE TABLE bench_padding(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)"
+                            .into(),
+                    parameters: vec![],
+                },
+            ],
+        })?;
+        receipt_count += 1;
+
+        let padding_bytes = padding_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| "SQL padding byte count overflows".to_string())?;
+        let mut inserted = 0usize;
+        let mut chunk_id = 0u64;
+        while inserted < padding_bytes {
+            let bytes = SQL_PADDING_CHUNK_BYTES.min(padding_bytes - inserted);
+            self.apply_seed_command(SqlCommand {
+                request_id: format!("profile-bench-padding-{chunk_id:016x}"),
+                statements: vec![SqlStatement {
+                    sql: "INSERT INTO bench_padding(id, payload) VALUES (?1, ?2)".into(),
+                    parameters: vec![
+                        SqlValue::Integer(i64::try_from(chunk_id).map_err(|_| {
+                            "SQL padding chunk id exceeds SQLite INTEGER".to_string()
+                        })?),
+                        SqlValue::Blob(vec![0; bytes]),
+                    ],
+                }],
+            })?;
+            receipt_count += 1;
+            inserted += bytes;
+            chunk_id += 1;
+        }
+
+        for index in 0..KEYSPACE {
+            self.apply_seed_command(sql_write_command(index, "setup", value_bytes))?;
+            receipt_count += 1;
+        }
+        self.restore_compacted_seed(receipt_count)
+    }
+
+    fn restore_compacted_seed(&mut self, receipt_count: u64) -> Result<FollowerSeedState, String> {
+        let snapshot = self
+            .leader
+            .sql_state()?
+            .create_recovery_snapshot(1)
+            .map_err(|error| error.to_string())?;
+        let leader_path = self.root.join("raw/leader-measured.db");
+        let follower_path = self.root.join("raw/follower-measured.db");
+        restore_snapshot_file(&leader_path, snapshot.snapshot(), "node-1")
+            .map_err(|error| error.to_string())?;
+        restore_snapshot_file(&follower_path, snapshot.snapshot(), "node-2")
+            .map_err(|error| error.to_string())?;
+
+        self.leader = RawTarget::open_sql(&self.root, "leader-measured.db", "node-1")?;
+        self.follower = RawTarget::open_sql(&self.root, "follower-measured.db", "node-2")?;
+        self.leader_path = leader_path;
+        self.follower_path = follower_path;
+        self.verify_aligned_anchor()?;
+
+        verify_snapshot_cleared_embedded_qlog(self.leader.sql_state()?)?;
+        verify_snapshot_cleared_embedded_qlog(self.follower.sql_state()?)?;
+
+        Ok(FollowerSeedState {
+            receipt_count,
+            leader_database_bytes: file_bytes(&self.leader_path)?,
+            follower_database_bytes: file_bytes(&self.follower_path)?,
+            leader_control_bytes: file_bytes(&control_sidecar_path(&self.leader_path))?,
+            follower_control_bytes: file_bytes(&control_sidecar_path(&self.follower_path))?,
+            leader_embedded_qlog_entries: 0,
+            follower_embedded_qlog_entries: 0,
+        })
+    }
+
+    fn apply_seed_command(&mut self, command: SqlCommand) -> Result<(), String> {
+        let prepared = self.leader.prepare_sql_batch(&[command])?;
+        if prepared.results.iter().any(Result::is_err) {
+            return Err("SQL follower benchmark seed command failed".into());
+        }
+        let payload = prepared
+            .payload
+            .ok_or_else(|| "SQL follower benchmark seed produced no QWAL effect".to_string())?;
+        self.follower.apply(payload.clone())?;
+        self.leader.apply(payload)?;
+        self.verify_aligned_anchor()
+    }
+
+    fn verify_aligned_anchor(&self) -> Result<(), String> {
+        if self.leader.next_index != self.follower.next_index
+            || self.leader.previous_hash != self.follower.previous_hash
+        {
+            return Err("SQL follower benchmark leader and follower anchors diverged".into());
+        }
+        Ok(())
+    }
+
+    fn verify_identical_state(&self) -> Result<(), String> {
+        let leader = self.leader.sql_state()?;
+        let follower = self.follower.sql_state()?;
+        if leader
+            .canonical_db_digest()
+            .map_err(|error| error.to_string())?
+            != follower
+                .canonical_db_digest()
+                .map_err(|error| error.to_string())?
+            || leader
+                .applied_tip_value()
+                .map_err(|error| error.to_string())?
+                != follower
+                    .applied_tip_value()
+                    .map_err(|error| error.to_string())?
+        {
+            return Err("SQL follower benchmark leader and follower states diverged".into());
+        }
+        Ok(())
+    }
+
+    fn write_sql_qwal_batch(
+        &mut self,
+        first_sequence: u64,
+        count: usize,
+        phase: &str,
+        value_bytes: usize,
+    ) -> Result<QwalBatchOutcome, String> {
+        let commands = (0..count)
+            .map(|offset| sql_write_command(first_sequence + offset as u64, phase, value_bytes))
+            .collect::<Vec<_>>();
+        let prepared = self.leader.prepare_sql_batch(&commands)?;
+        let follower_apply_latency = if let Some(payload) = prepared.payload {
+            let follower_entry = self.follower.build_entry(payload);
+            let leader_entry = follower_entry.clone();
+            let follower_state = self.follower.sql_state()?;
+            let follower_apply_began = Instant::now();
+            let follower_apply = follower_state.apply_entry(&follower_entry);
+            let follower_apply_latency = follower_apply_began.elapsed();
+            follower_apply.map_err(|error| error.to_string())?;
+            self.follower.advance_anchor(&follower_entry)?;
+            self.leader.apply_prebuilt_entry(&leader_entry)?;
+            self.verify_aligned_anchor()?;
+            Some(follower_apply_latency)
+        } else {
+            None
+        };
+        Ok(QwalBatchOutcome {
+            results: prepared.results,
+            envelope_bytes: prepared.envelope_bytes,
+            prepare_latency: prepared.prepare_latency,
+            apply_latency: None,
+            follower_apply_latency,
+        })
+    }
+}
+
+fn control_sidecar_path(database: &Path) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(".control");
+    PathBuf::from(path)
+}
+
+fn file_bytes(path: &Path) -> Result<u64, String> {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
+}
+
+fn verify_snapshot_cleared_embedded_qlog(state: &SqliteStateMachine) -> Result<(), String> {
+    match state.embedded_log_entries(1, 1) {
+        Err(error)
+            if error
+                .to_string()
+                .contains("embedded qlog is missing index 1") =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err("restored follower benchmark seed retained embedded qlog index 1".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn measure_follower(
+    mut target: SqlFollowerTarget,
+    config: &Config,
+) -> Result<(Samples, Duration, FollowerSeedState), String> {
+    let seed_state = target.seed(config.value_bytes, config.sql_padding_mib)?;
+    if config.warmup > 0 {
+        let (warmup, _) = run_phase_follower(&mut target, config, config.warmup, "warmup");
+        if warmup.errors > 0 {
+            return Err(format!("warmup failed with {} errors", warmup.errors));
+        }
+        target.verify_aligned_anchor()?;
+    }
+    let measured = run_phase_follower(&mut target, config, config.operations, "measure");
+    target.verify_identical_state()?;
+    Ok((measured.0, measured.1, seed_state))
+}
+
+fn run_phase_follower(
+    target: &mut SqlFollowerTarget,
+    config: &Config,
+    operations: u64,
+    phase: &'static str,
+) -> (Samples, Duration) {
+    let start = Instant::now();
+    let mut samples = Samples::default();
+    let mut sequence = 0;
+    while sequence < operations {
+        let count = config.batch_size.min((operations - sequence) as usize);
+        let began = Instant::now();
+        let outcome = target.write_sql_qwal_batch(sequence, count, phase, config.value_bytes);
+        let batch_elapsed = began.elapsed();
+        match outcome {
+            Ok(outcome) => {
+                samples.record_qwal_phases(outcome.prepare_latency, outcome.apply_latency);
+                if let Some(apply) = outcome.follower_apply_latency {
+                    samples.record_follower_apply(apply);
+                }
+                if let Some(bytes) = outcome.envelope_bytes {
+                    samples.record_qwal_envelope(bytes);
+                }
+                samples.record_batch(batch_elapsed, outcome.results);
+            }
+            Err(error) => {
+                samples.record_batch(batch_elapsed, repeated_batch_error(count, error));
+            }
+        }
+        sequence += count as u64;
+    }
+    (samples, start.elapsed())
+}
+
 fn measure_raw(mut target: RawTarget, config: &Config) -> Result<(Samples, Duration), String> {
     if config.profile == Profile::Sql {
         target.prepare_and_apply_sql(&SqlCommand {
@@ -2333,16 +2773,18 @@ fn run_phase_raw(
         while sequence < operations {
             let count = config.batch_size.min((operations - sequence) as usize);
             let began = Instant::now();
-            match target.write_sql_qwal_batch(sequence, count, phase, config.value_bytes) {
+            let outcome = target.write_sql_qwal_batch(sequence, count, phase, config.value_bytes);
+            let batch_elapsed = began.elapsed();
+            match outcome {
                 Ok(outcome) => {
                     samples.record_qwal_phases(outcome.prepare_latency, outcome.apply_latency);
                     if let Some(bytes) = outcome.envelope_bytes {
                         samples.record_qwal_envelope(bytes);
                     }
-                    samples.record_batch(began.elapsed(), outcome.results);
+                    samples.record_batch(batch_elapsed, outcome.results);
                 }
                 Err(error) => {
-                    samples.record_batch(began.elapsed(), repeated_batch_error(count, error));
+                    samples.record_batch(batch_elapsed, repeated_batch_error(count, error));
                 }
             }
             sequence += count as u64;
@@ -2559,6 +3001,7 @@ mod tests {
                 value_bytes: 64,
                 read_consistency: BenchmarkReadConsistency::Local,
                 sql_write_profile: false,
+                sql_padding_mib: 0,
             }
         );
     }
@@ -2814,7 +3257,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "--layer raw cannot measure SQL writes: SQLite apply accepts only prepared QWAL v2 effects; use --layer qwal"
+            "--layer raw cannot measure SQL writes: SQLite apply accepts only prepared QWAL v3 effects; use --layer qwal"
         );
     }
 
@@ -2860,6 +3303,220 @@ mod tests {
     }
 
     #[test]
+    fn follower_apply_accepts_only_single_worker_sql_writes_and_bounded_padding() {
+        for padding in ["0", "1024"] {
+            let config = Config::parse(
+                [
+                    "--profile",
+                    "sql",
+                    "--workload",
+                    "write",
+                    "--layer",
+                    "follower-apply",
+                    "--sql-padding-mib",
+                    padding,
+                ]
+                .map(str::to_owned),
+            )
+            .unwrap();
+            assert_eq!(config.layer, Layer::FollowerApply);
+            assert_eq!(config.sql_padding_mib.to_string(), padding);
+        }
+
+        for invalid in [
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "follower-apply",
+                "--sql-padding-mib",
+                "1025",
+            ],
+            vec![
+                "--profile",
+                "kv",
+                "--workload",
+                "write",
+                "--layer",
+                "follower-apply",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "get",
+                "--layer",
+                "follower-apply",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "follower-apply",
+                "--concurrency",
+                "2",
+            ],
+            vec![
+                "--profile",
+                "sql",
+                "--workload",
+                "write",
+                "--layer",
+                "qwal",
+                "--sql-padding-mib",
+                "1",
+            ],
+        ] {
+            assert!(Config::parse(invalid.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn follower_apply_seed_restores_identical_compacted_states_with_exact_padding() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = SqlFollowerTarget::open(root.path()).unwrap();
+
+        let seed = target.seed(64, 1).unwrap();
+
+        assert_eq!(seed.receipt_count, KEYSPACE + 9);
+        assert_eq!(seed.leader_embedded_qlog_entries, 0);
+        assert_eq!(seed.follower_embedded_qlog_entries, 0);
+        assert!(seed.leader_database_bytes >= 1024 * 1024);
+        assert_eq!(seed.leader_database_bytes, seed.follower_database_bytes);
+        assert!(seed.leader_control_bytes > 0);
+        assert_eq!(seed.leader_control_bytes, seed.follower_control_bytes);
+
+        assert_eq!(
+            target
+                .leader
+                .sql_state()
+                .unwrap()
+                .canonical_db_digest()
+                .unwrap(),
+            target
+                .follower
+                .sql_state()
+                .unwrap()
+                .canonical_db_digest()
+                .unwrap()
+        );
+        assert_eq!(
+            target
+                .leader
+                .sql_state()
+                .unwrap()
+                .applied_tip_value()
+                .unwrap(),
+            target
+                .follower
+                .sql_state()
+                .unwrap()
+                .applied_tip_value()
+                .unwrap()
+        );
+        assert_eq!(
+            sql_scalar_integer(
+                target.follower.sql_state().unwrap(),
+                "SELECT COALESCE(sum(length(payload)), 0) FROM bench_padding",
+            ),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn follower_apply_replays_the_prebuilt_leader_entry_and_reports_apply_latency() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = SqlFollowerTarget::open(root.path()).unwrap();
+        target.seed(64, 0).unwrap();
+
+        let outcome = target
+            .write_sql_qwal_batch(7, 1, "follower-test", 64)
+            .unwrap();
+
+        assert!(outcome.results.iter().all(Result::is_ok));
+        assert!(outcome.follower_apply_latency.is_some());
+        assert!(outcome.apply_latency.is_none());
+        assert_eq!(
+            sql_scalar_text(
+                target.follower.sql_state().unwrap(),
+                "SELECT value FROM bench_items WHERE key = 'bench-key-00000007'",
+            ),
+            value(7, "follower-test-0000000000000007", 64)
+        );
+        assert_eq!(
+            target
+                .leader
+                .sql_state()
+                .unwrap()
+                .canonical_db_digest()
+                .unwrap(),
+            target
+                .follower
+                .sql_state()
+                .unwrap()
+                .canonical_db_digest()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn follower_hot_row_effect_excludes_untouched_padding_root_page() {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = SqlFollowerTarget::open(root.path()).unwrap();
+        target.seed(64, 1).unwrap();
+        let padding_root = sql_scalar_integer(
+            target.leader.sql_state().unwrap(),
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'bench_padding'",
+        ) as u32;
+
+        let prepared = target
+            .leader
+            .prepare_sql_batch(&[sql_write_command(9, "padding-audit", 64)])
+            .unwrap();
+        let effect = decode_qwal_v3(prepared.payload.as_ref().unwrap()).unwrap();
+
+        assert!(effect.pages.iter().all(|page| page.page_no != padding_root));
+    }
+
+    fn sql_scalar_integer(state: &SqliteStateMachine, sql: &str) -> i64 {
+        let result = state
+            .query_sql(
+                &SqlStatement {
+                    sql: sql.into(),
+                    parameters: vec![],
+                },
+                1,
+                RAW_RESULT_BYTES,
+            )
+            .unwrap();
+        let SqlValue::Integer(value) = result.rows[0][0] else {
+            panic!("expected one integer SQL value")
+        };
+        value
+    }
+
+    fn sql_scalar_text(state: &SqliteStateMachine, sql: &str) -> String {
+        let result = state
+            .query_sql(
+                &SqlStatement {
+                    sql: sql.into(),
+                    parameters: vec![],
+                },
+                1,
+                RAW_RESULT_BYTES,
+            )
+            .unwrap();
+        let SqlValue::Text(value) = &result.rows[0][0] else {
+            panic!("expected one text SQL value")
+        };
+        value.clone()
+    }
+
+    #[test]
     fn qwal_sql_write_is_queryable_after_preparation_and_apply() {
         let root = tempfile::tempdir().unwrap();
         let mut target = RawTarget::open(root.path(), Profile::Sql).unwrap();
@@ -2881,7 +3538,7 @@ mod tests {
         assert!(outcome.results.iter().all(Result::is_ok));
         assert!(outcome
             .envelope_bytes
-            .is_some_and(|bytes| bytes > QWAL_V2_MAGIC.len()));
+            .is_some_and(|bytes| bytes > QWAL_V3_MAGIC.len()));
         assert_eq!(target.next_index, index_before_batch + 1);
     }
 
@@ -3057,7 +3714,20 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_sql_profile_reports_validated_phase_histograms() {
+    fn follower_apply_metrics_are_separate_from_leader_prepare_and_apply() {
+        let mut samples = Samples::default();
+        samples.record_qwal_phases(Duration::from_micros(80), None);
+        samples.record_follower_apply(Duration::from_micros(25));
+
+        let metrics = samples.metrics(Duration::from_secs(1), None);
+
+        assert_eq!(metrics.qwal_prepare_latency_us.unwrap().p50, Some(80));
+        assert!(metrics.qwal_apply_latency_us.is_none());
+        assert_eq!(metrics.follower_apply_latency_us.unwrap().p50, Some(25));
+    }
+
+    #[test]
+    fn schema_v5_sql_profile_reports_validated_phase_histograms() {
         let mut samples = SqlWritePhaseSamples::default();
         samples
             .record_snapshot(
@@ -3071,7 +3741,7 @@ mod tests {
             .unwrap();
 
         let metrics = samples.metrics().unwrap();
-        assert_eq!(REPORT_SCHEMA_VERSION, 4);
+        assert_eq!(REPORT_SCHEMA_VERSION, 5);
         assert_eq!(metrics.sample_count, 1);
         assert_eq!(metrics.member_count, 4);
         assert_eq!(metrics.dropped_samples, 0);

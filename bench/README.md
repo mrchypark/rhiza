@@ -235,7 +235,7 @@ transaction durably stores the full qlog entry with the KV state, receipts, and
 applied tip. The file qlog is a buffered serving mirror and can be rehydrated
 from redb, removing its separate hot-path sync without weakening strict ACK.
 SQL uses a Recorder-authoritative model: the 2/3 Recorder WAL sync is the only
-durability boundary on the common path. SQLite, the generation-5 control
+durability boundary on the common path. SQLite, the generation-6 control
 sidecar, and the file qlog are non-durable local views rebuilt from a verified
 checkpoint plus Recorder tail. ACK waits for local SQLite visibility, while
 readiness remains closed until tip validation and catch-up finish. Recorder
@@ -248,12 +248,32 @@ time. Graph is not part of this KV group-commit path.
 For runtime writes, `qlog_entries` and `logical_operations_per_qlog` expose
 coalescing efficiency. SQL QWAL reports `qwal_prepare_latency_us`,
 `qwal_apply_latency_us`, and actual encoded `qwal_envelope_bytes`, in addition
-to whole-call latency. A QWAL v2 SQL batch is ordered and non-atomic: successful
-members share one qlog entry and one anchor, while member savepoints isolate
-failures. An all-failed batch creates no qlog entry. Retry an indeterminate
-batch as the whole unchanged vector with the same request IDs.
-Profile report schema v4 names the buffered SQL mirror cost
-`phase_latency_us.local_qlog_mirror_append`; it is not a durability sync.
+to whole-call latency. A clean-install QWAL v3 SQL batch is ordered and
+non-atomic: successful members share one qlog entry and one anchor, while member
+savepoints isolate failures. An all-failed batch creates no qlog entry. Retry an
+indeterminate batch as the whole unchanged vector with the same request IDs.
+Profile report schema v5 records `configuration.sql_padding_mib`, the optional
+`configuration.follower_apply_latency_scope`, and
+`configuration.follower_seed_state`, plus
+`measurement.follower_apply_latency_us`. `follower_seed_state` records the
+pre-warmup leader/follower DB and control sizes, retained seed receipt count,
+and the zero embedded-qlog counts after restore. The report continues to name
+the buffered SQL mirror cost `phase_latency_us.local_qlog_mirror_append`; that
+phase is not a durability sync.
+
+`--layer follower-apply` first seeds separate SQL leader and follower databases
+with the same leader-generated QWAL entries. It then creates one recovery
+snapshot and restores it into fresh node-1/node-2 views. This clears the seed
+embedded qlog; request receipts intentionally remain and their count and control
+file cost are reported. Each measured QWAL is prepared on the leader. Payload
+clone, hash and `LogEntry` construction finish before the timer; only the
+follower `SqliteStateMachine::apply_entry` call is timed. Anchor bookkeeping and
+the subsequent leader catch-up also remain outside `follower_apply_latency_us`.
+Whole-run throughput includes the complete loop, so the two metrics must not be
+interchanged. `--sql-padding-mib 0..1024` adds exactly that many MiB of zero
+blobs to an untouched deterministic `bench_padding` table before snapshot
+restore and warmup. Measured writes keep the same `--value-bytes` hot-row payload
+in `bench_items`; seed and restore are excluded from reported latency samples.
 
 The current release evidence is under
 `target/rhiza-bench/write-v3-group-window-idle/20260719T032700/` (an ignored
@@ -318,6 +338,12 @@ for batch_size in 1 2 4 8 16 32 64; do
     --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
     > "target/rhiza-bench/profile/kv-write-batch-${batch_size}.json"
 done
+
+bench/target/release/rhiza-profile \
+  --profile sql --workload write --layer follower-apply --batch-size 1 \
+  --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
+  --sql-padding-mib 1024 \
+  > target/rhiza-bench/profile/sql-follower-apply-padding-1024mib.json
 ```
 
 Run on an otherwise idle machine. Each invocation uses a fresh temporary data
