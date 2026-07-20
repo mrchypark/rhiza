@@ -537,6 +537,7 @@ matrix_emit_cell() {
     --argjson failed_peers "$cell_failed" --argjson survivors "$cell_survivors" \
     --argjson hold_requested_seconds "$cell_hold" \
     --argjson failure_probe_interval_seconds "$recovery_f1_probe_interval" \
+    --argjson auto_recovery_timeout_seconds "$recovery_auto_timeout" \
     --argjson hold_actual_seconds "$cell_hold_actual" \
     --argjson release_epoch_seconds "$cell_release_epoch" \
     --argjson service_rto_seconds "$cell_service_rto" \
@@ -568,6 +569,7 @@ matrix_emit_cell() {
       same_pod_restart_covered:false,arbitrary_leader_failure_covered:false,
       survivors:$survivors,hold_requested_seconds:$hold_requested_seconds,
       failure_probe_interval_seconds:$failure_probe_interval_seconds,
+      auto_recovery_timeout_seconds:$auto_recovery_timeout_seconds,
       hold_actual_seconds:$hold_actual_seconds,release_epoch_seconds:$release_epoch_seconds,
       service_rto_seconds:$service_rto_seconds,full_rto_seconds:$full_rto_seconds,
       failure_injected_at:$failure_injected_at,
@@ -594,9 +596,11 @@ matrix_emit_cell() {
 matrix_emit_summary() {
   local status="$1" error="${2-}"
   jq -cn --arg run_id "$run_id" --arg profile "$profile" --arg status "$status" \
-    --arg error "$error" '
+    --arg error "$error" \
+    --argjson auto_recovery_timeout_seconds "$recovery_auto_timeout" '
     {record_type:"summary",run_id:$run_id,profile:$profile,status:$status,
       error:(if $error == "" then null else $error end),
+      auto_recovery_timeout_seconds:$auto_recovery_timeout_seconds,
       fault_target_policy:"statefulset_highest_ordinals",
       same_pod_restart_covered:false,arbitrary_leader_failure_covered:false}' \
     >> "$recovery_matrix_jsonl"

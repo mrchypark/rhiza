@@ -12,12 +12,24 @@ require_literal() {
   }
 }
 
+require_literal_count() {
+  literal="$1"
+  expected="$2"
+  actual="$(grep -Fc -- "$literal" "$script")"
+  [ "$actual" -eq "$expected" ] || {
+    echo "recovery-matrix contract count for '$literal': expected $expected, got $actual" >&2
+    exit 1
+  }
+}
+
 bash -n "$script"
 
 require_literal 'RHIZA_E2E_RECOVERY_MATRIX:-0'
 require_literal 'RHIZA_E2E_RECOVERY_MATRIX_ONLY:-0'
 require_literal 'RHIZA_RECOVERY_HOLD_SECONDS:-60,180,300'
 require_literal 'RHIZA_RECOVERY_FAIL_PEERS:-1,2,3'
+require_literal 'RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS:-30'
+require_literal 'RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS must be positive'
 require_literal 'RHIZA_RECOVERY_F1_PROBE_INTERVAL_SECONDS:-10'
 require_literal 'RHIZA_VIND_DIRECT_CLUSTER:-0'
 require_literal 'RHIZA_VIND_SKIP_IMAGE_LOAD:-0'
@@ -68,6 +80,15 @@ require_literal 'matrix_run_f1_availability_probe'
 require_literal 'failure_probe_interval_seconds="$recovery_f1_probe_interval"'
 # shellcheck disable=SC2016
 require_literal 'failure_probe_interval_seconds:$failure_probe_interval_seconds'
+# shellcheck disable=SC2016
+require_literal '--argjson auto_recovery_timeout_seconds "$recovery_auto_timeout"'
+# shellcheck disable=SC2016
+require_literal 'auto_recovery_timeout_seconds:$auto_recovery_timeout_seconds'
+# Both cell and summary records must describe the configured recovery deadline.
+# shellcheck disable=SC2016
+require_literal_count '--argjson auto_recovery_timeout_seconds "$recovery_auto_timeout"' 2
+# shellcheck disable=SC2016
+require_literal_count 'auto_recovery_timeout_seconds:$auto_recovery_timeout_seconds' 2
 require_literal 'matrix_emit_summary'
 require_literal 'same_pod_restart_covered:false'
 require_literal 'arbitrary_leader_failure_covered:false'

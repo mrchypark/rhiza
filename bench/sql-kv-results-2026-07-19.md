@@ -3,7 +3,13 @@
 This report intentionally excludes Graph. It records the SQL and KV benchmark
 matrix requested after the Graph benchmark work was stopped.
 
-## Scope and provenance
+> Historical status: every section before
+> [QWAL v3 final paired regression](#qwal-v3-final-paired-regression--2026-07-20)
+> records an earlier schema-v3, generation-4, or generation-5/QWAL-v2 stage.
+> Those raw numbers are preserved for provenance but are superseded for current
+> performance conclusions by the final paired QWAL v3 section.
+
+## Historical schema-v3 scope and provenance (superseded)
 
 - Benchmark: `rhiza-profile`, schema v3, direct `NodeRuntime` API
 - Topology: one in-process QuePaxa node with three file-backed Recorder voters
@@ -126,7 +132,7 @@ SQLite durability work. The high b512/b1024 variance tracks the unrelated host
 load rather than a correctness failure: every QWAL run completed all operations,
 all 100 batch calls, and reported zero errors.
 
-## Conclusion
+## Historical schema-v3 conclusion (superseded)
 
 The correctness contracts passed: no errors, no stale-read qlog writes, durable
 three-voter writes, exact batch accounting, and complete SQL phase profiling.
@@ -259,8 +265,10 @@ Every run completed all logical writes with zero errors. The unchanged qlog
 density isolates the removed sync. The batch-256 pair had a common low third
 run on the loaded host, so the median is diagnostic rather than release-grade.
 
-## Recorder-authoritative SQL follow-up — 2026-07-20
+## Recorder-authoritative SQL follow-up — 2026-07-20 (historical QWAL v2; superseded)
 
+This generation-5/QWAL-v2 result is retained as historical evidence; the
+authoritative current conclusion is the final paired QWAL v3 section below.
 Generation-5 SQL makes the 2/3 Recorder WAL the authoritative durable redo
 source. SQLite, control, and file qlog are non-durable local views; ACK waits
 for local apply visibility but not a second storage flush. Startup quarantines

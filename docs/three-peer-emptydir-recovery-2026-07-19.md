@@ -4,7 +4,10 @@
 대상: Rhiza SQL 전체 매트릭스 (`rhiza-sql:recovery-20260719b`), no-quorum 회귀 (`rhiza-sql:recovery-20260719h`), Hiqlite `0.14.0` (`c8316c53799c`)
 토폴로지: voter 3개, 데이터 볼륨 `emptyDir`, PVC 0개
 
-## 결론
+> 아래 2026-07-19 결과는 당시 구현의 역사적 증거로 보존한다. 현재 QWAL v3
+> 재검증 결과는 문서 끝의 2026-07-20 섹션이 우선한다.
+
+## 2026-07-19 결론 (역사적 결과)
 
 - 1 peer 손실에서는 두 시스템 모두 quorum을 유지하고 RPO 0으로 복구했다.
 - 2 peer 손실에서는 강한 읽기와 쓰기가 닫혔다. Rhiza는 남은 peer의 로컬 읽기가 가능했다. 최초 전체 매트릭스에서는 1분 셀이 자동 재가입하고 3·5분 셀이 checkpoint DR로 전환했지만, 후속 반복에서는 hold와 무관하게 자동/DR 결과가 바뀌어 제어면 tail 변동임을 확인했다. Hiqlite는 세 셀 모두 backup DR이 필요했다.
@@ -54,7 +57,10 @@
 
 1. 남은 1 peer는 로컬 상태를 보유하지만 quorum은 없다.
 2. 강한 읽기와 쓰기를 fail-closed 한다. Rhiza local SQL read는 stale 허용 경로로 성공한다.
-3. Rhiza는 새 peer 2개의 자동 재가입을 30초 기다린다. 성공하면 RPO 0이다. 실패하면 0→3으로 전환해 last sync checkpoint에서 재부트스트랩한다.
+3. Rhiza의 자동 재가입 대기시간은 `RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS`가
+   결정하며 기본값은 30초다. 제한 안에 성공하면 RPO 0이다. 실패하면
+   StatefulSet을 0→3으로 전환하는 operator DR로 last sync checkpoint에서
+   재부트스트랩한다.
 4. Hiqlite는 이 매트릭스에서 자동 복구하지 않고, completed backup을 지정해 0→3 restore한다.
 5. ACK/RPO 경계와 3 voter 수렴을 검증한다.
 
@@ -96,3 +102,69 @@ Hiqlite:
 - Rhiza: `artifacts/rhiza-recovery-full-f1-direct`, `artifacts/rhiza-recovery-full-f2-h*-direct*`, `artifacts/rhiza-recovery-full-f3-h*-direct*`
 - Rhiza no-quorum 최종 회귀: `target/rhiza-e2e/sql/20260719-142701-2968/recovery-matrix.jsonl` (F2/60s, service/full RTO 17/39s, RPO 0)
 - Hiqlite: `artifacts/hiqlite-recovery-full-f1c`, `artifacts/hiqlite-recovery-full-f2`, `artifacts/hiqlite-recovery-full-f2-h300b`, `artifacts/hiqlite-recovery-full-f3-h*`
+
+## 2026-07-20 QWAL v3 GKE 재검증
+
+실행 호출/배포 provenance상 SQL/KV 이미지는 모두 runtime commit `e11b5e9`,
+recovery harness commit `c4c9bca`를 사용했다. SQL은
+`asia-northeast3-docker.pkg.dev/patch2-the-new-era/conalog-dev/rhiza-sql:recovery-e11b5e93f75a`
+(index digest `sha256:50ac4c7cd61d66a5648c9c84dc08a7d3120d268e1a2aa956704e8edd248e52b4`),
+KV는
+`asia-northeast3-docker.pkg.dev/patch2-the-new-era/conalog-dev/rhiza-kv:recovery-e11b5e93f75a`
+(index digest `sha256:61fdafbe0496f7c1a596916a04b78f3cb754d64a527115df926160e01d8d900d`)다.
+JSONL은 측정된 status, 서비스/완전 RTO, RPO, checkpoint, 최종 tip,
+marker 소실, PVC 수와 `failure_probe_interval_seconds=20`을 직접 기록한다.
+세 voter 모두 `emptyDir`이며 모든 셀은 hold 60초를 실제로 유지했다.
+
+### SQL
+
+정상 매트릭스 원시 증거는
+`target/rhiza-recovery-c4c9bca-20260720-075912/sql-normal/sql/20260720-075912-32442/recovery-matrix.jsonl`이다.
+실행 호출 provenance상 이 매트릭스의 자동 재가입 timeout은 90초였다. 이
+timeout 값 자체는 역사적 JSONL 필드가 아니며, JSONL은 자동 복구를 시도했지만
+실패하고 operator DR로 전환한 결과를 직접 기록한다.
+
+| 손실 | 서비스 RTO | 완전 RTO | 자동 재가입 | 최종 복구 | RPO | checkpoint index |
+|---:|---:|---:|---|---|---|---:|
+| 1 | 9s | 32s | 해당 없음 | fresh peer 재생성 | 0 | — |
+| 2 | 116s | 147s | 실행 timeout 90초; 실패 | operator DR 0→3 | last sync checkpoint | 12 |
+| 3 | 19s | 48s | 해당 없음 | operator DR 0→3 | last sync checkpoint | 16 |
+
+세 셀 모두 상태는 `passed`였고 ACK sentinel 보존, request idempotency 경계,
+세 voter의 최종 tip 일치를 확인했다. 새 Pod의 `emptyDir` marker는 소실됐고
+PVC 수는 0이었다. 특히 F2의 `passed`는 자동 복구 성공을 뜻하지 않는다.
+90초 자동 재가입이 실패한 뒤 checkpoint 기반 operator DR fallback이 끝까지
+성공했다는 뜻이다.
+
+자동 대기시간 자체가 원인인지 분리하기 위해 실행 호출 provenance상 F2만
+`RHIZA_RECOVERY_AUTO_TIMEOUT_SECONDS=180`으로 다시 실행했다. 이 timeout 값
+자체는 역사적 JSONL 필드가 아니다. 원시 증거는
+`target/rhiza-recovery-c4c9bca-20260720-081514/sql-f2-auto180/sql/20260720-081522-51453/recovery-matrix.jsonl`이다.
+서비스/완전 RTO는 199/227초였고, 180초 안에도 자동 재가입은 실패했다.
+이 셀 역시 checkpoint index 6에서 operator DR로 복구했으며 ACK sentinel,
+idempotency 경계, 최종 tip 일치가 모두 참이었다. 따라서 현재 QWAL v3 GKE
+증거에서 F2의 검증된 복구 경로는 자동 재가입이 아니라 fail-closed 뒤
+checkpoint DR fallback이다.
+
+### KV
+
+원시 증거는
+`target/rhiza-recovery-c4c9bca-20260720-082218/kv-matrix/kv/20260720-082245-58905/recovery-matrix.jsonl`이다.
+실행 호출 provenance상 자동 재가입 timeout은 180초였다. 이 값 자체는 역사적
+JSONL 필드가 아니며, JSONL은 F2 자동 복구 시도 실패와 operator DR 전환을
+직접 기록한다.
+
+| 손실 | 서비스 RTO | 완전 RTO | 자동 재가입 | 최종 복구 | RPO | checkpoint root | 최종 tip |
+|---:|---:|---:|---|---|---|---|---|
+| 1 | 9s | 103s | 해당 없음 | fresh peer 재생성 | 0 | — | `8:48ecb73b114748380068de7550977045bd0cc5110386d48b5240980113b086b6` |
+| 2 | 206s | 275s | 실행 timeout 180초; 실패 | operator DR 0→3 | last sync checkpoint | `9:1de25e4cbd07bd92ec44321e19a3ecd894f4a204c824f2871c7bb579d0db1f62` | `12:db66540853bde9e2bdf2d78bdd02a055876a5624e0e7a114f4a475bf5a6b2de0` |
+| 3 | 20s | 94s | 해당 없음 | operator DR 0→3 | last sync checkpoint | `13:d9c8e1869c7a1506a975cd7f925c986ccbde625c9086a1137cae4a498200132c` | `16:12ac1df859555184fb525992ac4887e4e00090b814dc08aad9cfdd54a38926f4` |
+
+세 셀 모두 ACK sentinel 보존, request idempotency 경계, 최종 tip 일치,
+`emptyDir` marker 소실을 확인했고 PVC는 0개였다. F2의 `passed`는 자동
+재가입 성공이 아니라 180초 자동 재가입 실패 뒤 checkpoint 기반 operator DR
+fallback이 성공했다는 뜻이다.
+
+Hiqlite 구현과 harness는 QWAL v3 변경의 영향을 받지 않았으므로 2026-07-20에
+다시 실행하지 않았다. 2026-07-19의 Hiqlite 60/180/300초 원시 증거와 결과를
+비교 기준으로 그대로 유지한다.
