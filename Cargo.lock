@@ -2126,6 +2126,7 @@ version = "0.1.0"
 dependencies = [
  "fallible-streaming-iterator",
  "postcard",
+ "proptest",
  "rhiza-core",
  "rhiza-log",
  "rusqlite",

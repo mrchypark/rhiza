@@ -25,6 +25,7 @@ use tempfile::NamedTempFile;
 use crate::wal_capture::{capture_wal, WalCapture, WalCommit};
 
 mod control;
+mod page_state;
 mod qwal;
 mod wal_capture;
 
