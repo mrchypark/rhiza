@@ -3,7 +3,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -329,6 +332,7 @@ pub struct SqliteStateMachine {
     conn: Mutex<Option<Connection>>,
     lifecycle: Mutex<()>,
     control: ControlStore,
+    pending_fence: AtomicBool,
     page_state: Mutex<CanonicalPageStateV3>,
     uncommitted_effect: Mutex<Option<LogHash>>,
     prepared_target: Mutex<Option<PreparedTarget>>,
@@ -502,6 +506,7 @@ impl SqliteStateMachine {
                 conn: Mutex::new(Some(conn)),
                 lifecycle: Mutex::new(()),
                 control,
+                pending_fence: AtomicBool::new(false),
                 page_state: Mutex::new(page_state),
                 uncommitted_effect: Mutex::new(None),
                 prepared_target: Mutex::new(None),
@@ -522,7 +527,7 @@ impl SqliteStateMachine {
             ));
         }
         let control = ControlStore::open_existing_unchecked(&control_path)?;
-        let page_state = validate_control_database_pair(path, &control)?;
+        let (page_state, pending) = validate_control_database_pair(path, &control)?;
         reject_legacy_user_database(path)?;
         let conn = open_connection(path)?;
         Ok(Self {
@@ -530,6 +535,7 @@ impl SqliteStateMachine {
             conn: Mutex::new(Some(conn)),
             lifecycle: Mutex::new(()),
             control,
+            pending_fence: AtomicBool::new(pending),
             page_state: Mutex::new(page_state),
             uncommitted_effect: Mutex::new(None),
             prepared_target: Mutex::new(None),
@@ -573,7 +579,7 @@ impl SqliteStateMachine {
     }
 
     fn ensure_no_pending_apply(&self) -> Result<()> {
-        if self.control.pending()?.is_some() {
+        if self.pending_fence.load(Ordering::Acquire) {
             return Err(Error::InvalidEntry(
                 "canonical SQLite state is unavailable while a QWAL apply is pending".into(),
             ));
@@ -621,16 +627,23 @@ impl SqliteStateMachine {
                 "hash does not match entry contents".into(),
             ));
         }
-        if let Some(installed) = *self
+        let installed = *self
             .uncommitted_effect
             .lock()
-            .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?
-        {
+            .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?;
+        if let Some(installed) = installed {
             if entry.entry_type != EntryType::Command
                 || installed != LogHash::digest(&[&entry.payload])
             {
                 return Err(Error::InvalidEntry(
                     "only the exact installed QWAL effect may retry after control failure".into(),
+                ));
+            }
+        } else if self.pending_fence.load(Ordering::Acquire) {
+            let incoming = LogAnchor::new(entry.index, entry.hash);
+            if self.control.pending()?.map(|pending| pending.entry()) != Some(incoming) {
+                return Err(Error::InvalidEntry(
+                    "only the exact durable pending entry may retry physical apply".into(),
                 ));
             }
         }
@@ -713,9 +726,13 @@ impl SqliteStateMachine {
                 )?;
             } else {
                 let pending = PendingApply::new(base_anchor, entry_anchor, user_state, user_state);
+                self.pending_fence.store(true, Ordering::Release);
                 self.control.begin_pending_with_entry(&pending, entry)?;
+                #[cfg(test)]
+                inject_pending_commit_fault(&self.path)?;
                 self.control
                     .commit_applied(&pending, &next_configuration, &[])?;
+                self.pending_fence.store(false, Ordering::Release);
             }
             return Ok(ApplyOutcome {
                 progress: ApplyProgress::new(entry.index, entry.hash),
@@ -777,6 +794,7 @@ impl SqliteStateMachine {
             effect.base_state,
             effect.target_state,
         );
+        self.pending_fence.store(true, Ordering::Release);
         self.install_qwal_effect(&effect, &entry.payload, entry_anchor)?;
         #[cfg(test)]
         let control_commit = inject_qwal_control_fault(&self.path).and_then(|()| {
@@ -791,6 +809,7 @@ impl SqliteStateMachine {
             let _ = self.close_connection();
             return Err(error);
         }
+        self.pending_fence.store(false, Ordering::Release);
         self.uncommitted_effect
             .lock()
             .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?
@@ -812,6 +831,7 @@ impl SqliteStateMachine {
         entry_anchor: LogAnchor,
     ) -> Result<()> {
         if !self.preverify_page_state_transition(effect, effect_payload, entry_anchor)? {
+            self.remember_uncommitted_effect(effect_payload)?;
             if self
                 .conn
                 .lock()
@@ -884,12 +904,19 @@ impl SqliteStateMachine {
                 .uncommitted_effect
                 .lock()
                 .map_err(|_| Error::Sqlite("uncommitted QWAL effect lock is poisoned".into()))?;
-            let durable_replay = self.control.pending()?.is_some_and(|pending| {
-                pending.base_state() == effect.base_state
-                    && pending.target_state() == effect.target_state
-                    && pending.entry() == entry_anchor
-            });
-            if *installed != Some(digest) && !durable_replay {
+            let exact_in_process_replay = *installed == Some(digest);
+            drop(installed);
+            let durable_replay =
+                if exact_in_process_replay || !self.pending_fence.load(Ordering::Acquire) {
+                    false
+                } else {
+                    self.control.pending()?.is_some_and(|pending| {
+                        pending.base_state() == effect.base_state
+                            && pending.target_state() == effect.target_state
+                            && pending.entry() == entry_anchor
+                    })
+                };
+            if !exact_in_process_replay && !durable_replay {
                 return Err(Error::InvalidEntry(
                     "QWAL target is installed without an exact in-process replay seal".into(),
                 ));
@@ -2274,6 +2301,7 @@ enum WalCaptureFault {
 enum QwalApplyFault {
     AfterPage(u32),
     BeforeControlCommit,
+    BeforePendingCommit,
 }
 
 #[cfg(test)]
@@ -2320,6 +2348,16 @@ fn inject_qwal_control_fault(path: &Path) -> Result<()> {
     if take_qwal_apply_fault(path, |fault| fault == QwalApplyFault::BeforeControlCommit)? {
         return Err(Error::Sqlite(
             "injected post-install control commit failure".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_pending_commit_fault(path: &Path) -> Result<()> {
+    if take_qwal_apply_fault(path, |fault| fault == QwalApplyFault::BeforePendingCommit)? {
+        return Err(Error::Sqlite(
+            "injected pending control commit failure".into(),
         ));
     }
     Ok(())
@@ -2834,10 +2872,11 @@ fn reject_legacy_user_database(path: &Path) -> Result<()> {
 fn validate_control_database_pair(
     path: &Path,
     control: &ControlStore,
-) -> Result<CanonicalPageStateV3> {
+) -> Result<(CanonicalPageStateV3, bool)> {
     let page_state = rebuild_sealed_page_state(path)?;
     let actual = page_state.cache.identity();
-    if let Some(pending) = control.pending()? {
+    let pending = control.pending()?;
+    if let Some(pending) = pending.as_ref() {
         let tip = control.applied_tip()?;
         let expected_entry_index = tip
             .applied_index()
@@ -2852,7 +2891,7 @@ fn validate_control_database_pair(
             ));
         }
         if actual == pending.base_state() {
-            return Ok(page_state);
+            return Ok((page_state, true));
         }
         if actual == pending.target_state() {
             let verify = Connection::open_with_flags(
@@ -2861,7 +2900,7 @@ fn validate_control_database_pair(
             )
             .map_err(sqlite_error)?;
             integrity_check(&verify)?;
-            return Ok(page_state);
+            return Ok((page_state, true));
         }
         return Err(Error::InvalidEntry(
             "pending QWAL database state matches neither base nor target".into(),
@@ -2872,7 +2911,7 @@ fn validate_control_database_pair(
             "canonical SQLite page state does not match the control sidecar".into(),
         ));
     }
-    Ok(page_state)
+    Ok((page_state, false))
 }
 
 fn decode_qwal_command(payload: &[u8]) -> Result<QwalEnvelopeV3> {
@@ -3699,6 +3738,48 @@ mod query_policy_tests {
     }
 
     #[test]
+    fn normal_reads_do_not_query_the_control_pending_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let control_path = control_sidecar_path(&path);
+        control::begin_pending_query_audit(&control_path);
+        let command = SqlCommand {
+            request_id: "pending-audit".into(),
+            statements: vec![SqlStatement {
+                sql: "SELECT 1".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+
+        assert_eq!(database.get_value("absent").unwrap(), None);
+        database
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT 1".into(),
+                    parameters: vec![],
+                },
+                1,
+                64,
+            )
+            .unwrap();
+        assert_eq!(
+            database.check_request("pending-audit", &request).unwrap(),
+            None
+        );
+        assert!(matches!(
+            database
+                .check_sql_requests(&[("pending-audit", request.as_slice())])
+                .unwrap()
+                .as_slice(),
+            [Ok(None)]
+        ));
+
+        assert_eq!(control::pending_query_count(&control_path), Some(0));
+    }
+
+    #[test]
     fn physical_effect_preparation_accepts_nondeterministic_functions() {
         let dir = tempfile::tempdir().unwrap();
         let database =
@@ -3864,6 +3945,94 @@ mod query_policy_tests {
         assert_eq!(database.canonical_db_digest().unwrap(), base_digest);
         assert!(database
             .check_sql_request("no-physical-change", &request)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn no_change_control_failure_blocks_everything_except_exact_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let setup = SqlCommand {
+            request_id: "no-change-fault-setup".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE no_change_fault(value TEXT NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let setup_request = encode_sql_command(&setup).unwrap();
+        let setup_payload =
+            prepare_single_sql_effect(&database, &setup, &setup_request, 0, LogHash::ZERO).unwrap();
+        let setup_entry = command_entry(1, LogHash::ZERO, setup_payload);
+        database.apply_entry(&setup_entry).unwrap();
+
+        let command = SqlCommand {
+            request_id: "no-change-fault".into(),
+            statements: vec![SqlStatement {
+                sql: "UPDATE no_change_fault SET value = 'unused' WHERE rowid = -1".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let payload =
+            prepare_single_sql_effect(&database, &command, &request, 1, setup_entry.hash).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
+        assert!(effect.pages.is_empty());
+        assert_eq!(effect.base_state, effect.target_state);
+        let entry = command_entry(2, setup_entry.hash, payload);
+        arm_qwal_apply_fault(&path, QwalApplyFault::BeforeControlCommit);
+
+        assert!(database.apply_entry(&entry).is_err());
+        assert!(database.pending_fence.load(Ordering::Acquire));
+        assert!(database.get_value("blocked").is_err());
+        assert!(database
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT 1".into(),
+                    parameters: vec![],
+                },
+                1,
+                64,
+            )
+            .is_err());
+        assert!(database.check_request("no-change-fault", &request).is_err());
+        assert!(database
+            .prepare_sql_batch_effect(
+                &[SqlBatchMember {
+                    command: &command,
+                    request_payload: &request,
+                }],
+                1,
+                setup_entry.hash,
+            )
+            .is_err());
+        let different = LogEntry {
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            index: 2,
+            entry_type: EntryType::Noop,
+            payload: Vec::new(),
+            prev_hash: setup_entry.hash,
+            hash: LogEntry::calculate_hash(
+                "cluster-a",
+                2,
+                1,
+                1,
+                EntryType::Noop,
+                setup_entry.hash,
+                &[],
+            ),
+        };
+        assert!(database.apply_entry(&different).is_err());
+
+        database.apply_entry(&entry).unwrap();
+        assert!(!database.pending_fence.load(Ordering::Acquire));
+        assert_eq!(database.applied_tip_value().unwrap(), (2, entry.hash));
+        assert_eq!(database.get_value("unblocked").unwrap(), None);
+        assert!(database
+            .check_sql_request("no-change-fault", &request)
             .unwrap()
             .is_some());
     }
@@ -4066,7 +4235,7 @@ mod query_policy_tests {
             .is_err());
         assert!(matches!(
             follower.query_sql(&SqlStatement { sql: "SELECT 1".into(), parameters: vec![] }, 1, 64),
-            Err(Error::Sqlite(message)) if message.contains("closed")
+            Err(Error::InvalidEntry(message)) if message.contains("pending")
         ));
         drop(follower);
         assert!(matches!(
@@ -4128,7 +4297,7 @@ mod query_policy_tests {
         assert_eq!(database.applied_tip_value().unwrap(), (0, LogHash::ZERO));
         assert!(matches!(
             database.query_sql(&SqlStatement { sql: "SELECT 1".into(), parameters: vec![] }, 1, 64),
-            Err(Error::Sqlite(message)) if message.contains("closed")
+            Err(Error::InvalidEntry(message)) if message.contains("pending")
         ));
         assert!(matches!(
             database.check_request("control-failure", &request),
@@ -4139,7 +4308,10 @@ mod query_policy_tests {
             Err(Error::Sqlite(message)) if message.contains("closed")
         ));
 
+        let control_path = control_sidecar_path(&path);
+        control::begin_pending_query_audit(&control_path);
         database.apply_entry(&entry).unwrap();
+        assert_eq!(control::pending_query_count(&control_path), Some(0));
         assert_eq!(database.applied_tip_value().unwrap(), (1, entry.hash));
         assert_eq!(
             database
@@ -4157,6 +4329,47 @@ mod query_policy_tests {
                 .rows,
             vec![vec![SqlValue::Text("installed_before_control".into())]]
         );
+    }
+
+    #[test]
+    fn pending_commit_failure_keeps_reads_fenced_until_exact_replay_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let change = rhiza_core::ConfigChange::stop(1, LogHash::ZERO).to_stored_command();
+        let hash = LogEntry::calculate_hash(
+            "cluster-a",
+            1,
+            1,
+            1,
+            change.entry_type,
+            LogHash::ZERO,
+            &change.payload,
+        );
+        let entry = LogEntry {
+            cluster_id: "cluster-a".into(),
+            epoch: 1,
+            config_id: 1,
+            index: 1,
+            entry_type: change.entry_type,
+            payload: change.payload,
+            prev_hash: LogHash::ZERO,
+            hash,
+        };
+        arm_qwal_apply_fault(&path, QwalApplyFault::BeforePendingCommit);
+
+        assert!(database.apply_entry(&entry).is_err());
+        assert!(database.pending_fence.load(Ordering::Acquire));
+        assert!(database.control.pending().unwrap().is_some());
+        assert!(matches!(
+            database.get_value("blocked"),
+            Err(Error::InvalidEntry(message)) if message.contains("pending")
+        ));
+
+        database.apply_entry(&entry).unwrap();
+        assert!(!database.pending_fence.load(Ordering::Acquire));
+        assert_eq!(database.control.pending().unwrap(), None);
+        assert_eq!(database.get_value("unblocked").unwrap(), None);
     }
 
     #[cfg(unix)]
@@ -4538,13 +4751,73 @@ mod query_policy_tests {
         let effect = decode_qwal_v3(&payload).unwrap();
         let expected_result = decode_sql_result(&effect.receipts[0].result_blob).unwrap();
         let entry = command_entry(1, LogHash::ZERO, payload);
+        let different_command = SqlCommand {
+            request_id: "different-pending-base".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE wrong_pending_winner(value INTEGER NOT NULL)".into(),
+                parameters: vec![],
+            }],
+        };
+        let different_request = encode_sql_command(&different_command).unwrap();
+        let different_payload = prepare_single_sql_effect(
+            &database,
+            &different_command,
+            &different_request,
+            0,
+            LogHash::ZERO,
+        )
+        .unwrap();
+        let different_entry = command_entry(1, LogHash::ZERO, different_payload);
         let pending = pending_for(&entry, &effect);
         database.control.begin_pending(&pending).unwrap();
+        let canonical_before_replay = fs::read(&path).unwrap();
         drop(database);
 
         let database = SqliteStateMachine::open_existing(&path).unwrap();
+        assert!(database.pending_fence.load(Ordering::Acquire));
+        assert!(matches!(
+            database.get_value("blocked"),
+            Err(Error::InvalidEntry(message)) if message.contains("pending")
+        ));
+        assert!(database
+            .query_sql(
+                &SqlStatement {
+                    sql: "SELECT 1".into(),
+                    parameters: vec![],
+                },
+                1,
+                64,
+            )
+            .is_err());
+        assert!(database
+            .check_request("pending-base-replay", &request)
+            .is_err());
+        assert!(database.canonical_db_digest().is_err());
+        assert!(database.create_snapshot(0).is_err());
+        assert!(database
+            .prepare_sql_batch_effect(
+                &[SqlBatchMember {
+                    command: &command,
+                    request_payload: &request,
+                }],
+                0,
+                LogHash::ZERO,
+            )
+            .is_err());
+        assert!(matches!(
+            database.apply_entry_with_result(&different_entry),
+            Err(Error::InvalidEntry(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), canonical_before_replay);
+        assert_eq!(
+            rebuild_page_state(&path).unwrap().identity(),
+            effect.base_state
+        );
+        assert!(database.pending_fence.load(Ordering::Acquire));
+        assert!(database.get_value("still-blocked").is_err());
         let outcome = database.apply_entry_with_result(&entry).unwrap();
 
+        assert!(!database.pending_fence.load(Ordering::Acquire));
         assert_eq!(outcome.sql_result(), Some(&expected_result));
         assert_eq!(
             rebuild_page_state(&path).unwrap().identity(),
@@ -4567,6 +4840,43 @@ mod query_policy_tests {
                 .unwrap(),
             (RequestOutcome::new(1, entry.hash), Some(expected_result))
         );
+    }
+
+    #[test]
+    fn open_rejects_pending_that_no_longer_extends_the_committed_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let command = SqlCommand {
+            request_id: "corrupt-pending".into(),
+            statements: vec![SqlStatement {
+                sql: "CREATE TABLE corrupt_pending(id INTEGER PRIMARY KEY)".into(),
+                parameters: vec![],
+            }],
+        };
+        let request = encode_sql_command(&command).unwrap();
+        let database = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
+        let payload =
+            prepare_single_sql_effect(&database, &command, &request, 0, LogHash::ZERO).unwrap();
+        let effect = decode_qwal_v3(&payload).unwrap();
+        let entry = command_entry(1, LogHash::ZERO, payload);
+        database
+            .control
+            .begin_pending(&pending_for(&entry, &effect))
+            .unwrap();
+        drop(database);
+
+        Connection::open(control_sidecar_path(&path))
+            .unwrap()
+            .execute(
+                "UPDATE pending_apply SET base_index = 1 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            SqliteStateMachine::open_existing(&path),
+            Err(Error::InvalidEntry(_))
+        ));
     }
 
     #[test]

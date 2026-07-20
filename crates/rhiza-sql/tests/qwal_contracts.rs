@@ -1,9 +1,8 @@
 use rhiza_core::{ConfigurationState, EntryType, LogAnchor, LogEntry, LogHash, Snapshot};
 use rhiza_sql::{
     decode_qwal_v3, encode_put_request, encode_qwal_v3, encode_sql_command,
-    restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, PendingApply,
-    SqlBatchMember, SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES,
-    QWAL_V3_MAGIC,
+    restore_recovery_snapshot_file, restore_snapshot_file, ControlStore, Error, SqlBatchMember,
+    SqlCommand, SqlStatement, SqlValue, SqliteStateMachine, MAX_SQL_EFFECT_BYTES, QWAL_V3_MAGIC,
 };
 use rusqlite::Connection;
 
@@ -605,8 +604,21 @@ fn qwal_apply_rejects_forged_no_change_target_with_inconsistent_pages() {
         Err(Error::InvalidEntry(message)) if message.contains("target page state")
     ));
     assert_eq!(db.applied_tip_value().unwrap(), (1, setup_entry.hash));
+    assert!(matches!(
+        db.query_sql(
+            &SqlStatement {
+                sql: "SELECT value FROM forged_no_change".into(),
+                parameters: vec![],
+            },
+            1,
+            64,
+        ),
+        Err(Error::InvalidEntry(message)) if message.contains("pending")
+    ));
+    drop(db);
+    let reopened = SqliteStateMachine::open_existing(&path).unwrap();
     assert_eq!(
-        query(&db, "SELECT value FROM forged_no_change"),
+        query(&reopened, "SELECT value FROM forged_no_change"),
         [[SqlValue::Text("before".into())]]
     );
 }
@@ -854,114 +866,6 @@ fn existing_legacy_database_requires_snapshot_bootstrap_instead_of_auto_upgrade(
     drop(connection);
 
     assert!(SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).is_err());
-}
-
-#[test]
-fn unresolved_pending_apply_blocks_reads_and_preparation_but_exact_replay_recovers() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state.sqlite");
-    let db = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
-    let command = SqlCommand {
-        request_id: "pending".into(),
-        statements: vec![SqlStatement {
-            sql: "CREATE TABLE pending_items(id INTEGER PRIMARY KEY)".into(),
-            parameters: vec![],
-        }],
-    };
-    let (request, effect_bytes) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
-    let effect = decode_qwal_v3(&effect_bytes).unwrap();
-    let decided = entry(1, LogHash::ZERO, &effect_bytes);
-    let pending = PendingApply::new(
-        LogAnchor::new(0, LogHash::ZERO),
-        LogAnchor::new(1, decided.hash),
-        effect.base_state,
-        effect.target_state,
-    );
-    let control =
-        ControlStore::open_existing_unchecked(path.with_extension("sqlite.control")).unwrap();
-    control.begin_pending(&pending).unwrap();
-
-    assert!(matches!(
-        db.query_sql(
-            &SqlStatement {
-                sql: "SELECT 1".into(),
-                parameters: vec![],
-            },
-            1,
-            16,
-        ),
-        Err(Error::InvalidEntry(_))
-    ));
-    assert!(matches!(
-        db.canonical_db_digest(),
-        Err(Error::InvalidEntry(_))
-    ));
-    assert!(matches!(db.create_snapshot(0), Err(Error::InvalidEntry(_))));
-    assert!(matches!(
-        db.prepare_sql_batch_effect(
-            &[SqlBatchMember {
-                command: &command,
-                request_payload: &request,
-            }],
-            0,
-            LogHash::ZERO,
-        ),
-        Err(Error::InvalidEntry(_))
-    ));
-
-    db.apply_entry(&decided).unwrap();
-    assert!(db
-        .query_sql(
-            &SqlStatement {
-                sql: "SELECT name FROM sqlite_schema WHERE name = 'pending_items'".into(),
-                parameters: vec![],
-            },
-            1,
-            1024,
-        )
-        .is_ok());
-}
-
-#[test]
-fn open_rejects_a_pending_intent_that_no_longer_extends_the_committed_tip() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state.sqlite");
-    let db = SqliteStateMachine::open(&path, "cluster-a", "node-1", 1, 1).unwrap();
-    let command = SqlCommand {
-        request_id: "corrupt-pending".into(),
-        statements: vec![SqlStatement {
-            sql: "CREATE TABLE corrupt_pending(id INTEGER PRIMARY KEY)".into(),
-            parameters: vec![],
-        }],
-    };
-    let (_, effect_bytes) = prepared_qwal(&db, &command, 0, LogHash::ZERO);
-    let effect = decode_qwal_v3(&effect_bytes).unwrap();
-    let decided = entry(1, LogHash::ZERO, &effect_bytes);
-    drop(db);
-
-    let control_path = path.with_extension("sqlite.control");
-    let control = ControlStore::open_existing_unchecked(&control_path).unwrap();
-    control
-        .begin_pending(&PendingApply::new(
-            LogAnchor::new(0, LogHash::ZERO),
-            LogAnchor::new(1, decided.hash),
-            effect.base_state,
-            effect.target_state,
-        ))
-        .unwrap();
-    drop(control);
-    Connection::open(&control_path)
-        .unwrap()
-        .execute(
-            "UPDATE pending_apply SET base_index = 1 WHERE singleton = 1",
-            [],
-        )
-        .unwrap();
-
-    assert!(matches!(
-        SqliteStateMachine::open_existing(&path),
-        Err(Error::InvalidEntry(_))
-    ));
 }
 
 #[test]

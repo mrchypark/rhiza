@@ -3,6 +3,8 @@
 //! This database is deliberately separate from the canonical user database so
 //! node-local identity and qlog progress cannot change replicated user pages.
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::{
     collections::HashSet,
     fmt::Write as _,
@@ -250,6 +252,40 @@ pub struct ControlStore {
     conn: Connection,
 }
 
+#[cfg(test)]
+fn pending_query_audits() -> &'static Mutex<Vec<(PathBuf, usize)>> {
+    static AUDITS: OnceLock<Mutex<Vec<(PathBuf, usize)>>> = OnceLock::new();
+    AUDITS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn begin_pending_query_audit(path: &Path) {
+    pending_query_audits()
+        .lock()
+        .unwrap()
+        .push((path.to_path_buf(), 0));
+}
+
+#[cfg(test)]
+pub(crate) fn pending_query_count(path: &Path) -> Option<usize> {
+    pending_query_audits().lock().ok().and_then(|audits| {
+        audits
+            .iter()
+            .rev()
+            .find(|(audited, _)| audited == path)
+            .map(|(_, count)| *count)
+    })
+}
+
+#[cfg(test)]
+fn note_pending_query(path: &Path) {
+    if let Ok(mut audits) = pending_query_audits().lock() {
+        if let Some((_, count)) = audits.iter_mut().rev().find(|(audited, _)| audited == path) {
+            *count += 1;
+        }
+    }
+}
+
 impl ControlStore {
     /// Opens and validates an existing sidecar, or creates it if absent.
     pub fn open(path: impl AsRef<Path>, identity: &ControlIdentity) -> Result<Self> {
@@ -426,7 +462,8 @@ impl ControlStore {
         lookup_requests_from(&self.conn, requests)
     }
 
-    pub fn begin_pending(&self, pending: &PendingApply) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn begin_pending(&self, pending: &PendingApply) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
         if let Some(existing) = pending_from(&tx)? {
@@ -460,7 +497,11 @@ impl ControlStore {
     }
 
     /// Atomically makes the physical-apply intent and its complete local qlog entry durable.
-    pub fn begin_pending_with_entry(&self, pending: &PendingApply, entry: &LogEntry) -> Result<()> {
+    pub(crate) fn begin_pending_with_entry(
+        &self,
+        pending: &PendingApply,
+        entry: &LogEntry,
+    ) -> Result<()> {
         if LogAnchor::new(entry.index, entry.hash) != pending.entry
             || entry.recompute_hash() != entry.hash
         {
@@ -553,7 +594,7 @@ impl ControlStore {
     }
 
     /// Removes embedded qlog entries before a verified checkpoint anchor.
-    pub fn compact_embedded_log_before(&self, anchor_index: u64) -> Result<()> {
+    pub(crate) fn compact_embedded_log_before(&self, anchor_index: u64) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
         let applied_index = meta_anchor(&tx, "applied_tip")?.index();
@@ -571,10 +612,13 @@ impl ControlStore {
     }
 
     pub fn pending(&self) -> Result<Option<PendingApply>> {
+        #[cfg(test)]
+        note_pending_query(&self.path);
         pending_from(&self.conn)
     }
 
-    pub fn clear_pending(&self, expected: &PendingApply) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn clear_pending(&self, expected: &PendingApply) -> Result<()> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
         match pending_from(&tx)? {
@@ -594,7 +638,8 @@ impl ControlStore {
     /// does not transition the configuration. The exact committed base is
     /// checked again inside the same FULL-synchronous transaction as the tip
     /// update, so this path cannot bypass an older physical apply intent.
-    pub fn commit_metadata_only_entry(
+    #[cfg(test)]
+    pub(crate) fn commit_metadata_only_entry(
         &self,
         expected_base: LogAnchor,
         entry: LogAnchor,
@@ -651,7 +696,7 @@ impl ControlStore {
         tx.commit().map_err(sqlite_error)
     }
 
-    pub fn commit_metadata_only_entry_with_log(
+    pub(crate) fn commit_metadata_only_entry_with_log(
         &self,
         expected_base: LogAnchor,
         entry: &LogEntry,
@@ -684,7 +729,7 @@ impl ControlStore {
         tx.commit().map_err(sqlite_error)
     }
 
-    pub fn commit_applied(
+    pub(crate) fn commit_applied(
         &self,
         pending: &PendingApply,
         configuration_state: &ConfigurationState,
@@ -708,7 +753,7 @@ impl ControlStore {
 
     /// Atomically publishes a locally installed QWAL target, its receipts, and
     /// its rebuildable qlog mirror without a pre-install durability intent.
-    pub fn commit_rebuildable_apply(
+    pub(crate) fn commit_rebuildable_apply(
         &self,
         pending: &PendingApply,
         entry: &LogEntry,
@@ -769,13 +814,14 @@ impl ControlStore {
         encode_snapshot(&snapshot)
     }
 
-    pub fn import_replicated_snapshot(&self, encoded: &[u8]) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn import_replicated_snapshot(&self, encoded: &[u8]) -> Result<()> {
         self.import_replicated_snapshot_with_recovery_generation(encoded, None)
     }
 
     /// Atomically imports replicated state while optionally rebinding it to a
     /// recovery anchor generation. The destination node identity is retained.
-    pub fn import_replicated_snapshot_with_recovery_generation(
+    pub(crate) fn import_replicated_snapshot_with_recovery_generation(
         &self,
         encoded: &[u8],
         recovery_generation: Option<u64>,
