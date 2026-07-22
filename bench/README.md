@@ -198,9 +198,10 @@ cargo test --manifest-path bench/Cargo.toml
 `NodeRuntime` calls (`--layer runtime`), and the materializer (`--layer raw`)
 without HTTP. Every run preloads the same 256 bounded keys and measures a fixed
 number of operations. Handle and runtime writes use a local QuePaxa instance
-backed by three file-based Recorder voters; raw excludes consensus. Reads use
-local consistency, so they deliberately exclude a consensus read barrier. The
-stable JSON report records these boundaries, the exact Git state,
+backed by three file-based Recorder voters; raw excludes consensus. Reads default
+to local consistency; pass `--consistency read_barrier` on handle/runtime read
+workloads to measure the read-only 2/3 quorum fence. The stable JSON report
+records the selected consistency, these boundaries, the exact Git state,
 host/toolchain provenance, errors, throughput, and p50/p95/p99/p99.9/max latency
 in microseconds.
 
@@ -210,14 +211,147 @@ graph, and a bounded prefix scan for KV; compare `get` for point-read parity.
 For graph, `get` measures generic Cypher while `document-get` measures the fixed
 document projection without parsing a caller-supplied query.
 
-For `write`, `--batch-size 1|2|4|8|16|32|64` exercises the typed embedded batch
-API on the handle or runtime layer. `operations`, attempts, successes, errors,
-and throughput remain logical-command counts rather than batch-call counts.
-Successful commands in one non-atomic batch may share a QuePaxa log entry;
-runtime-layer JSON also reports `qlog_entries` for the measured phase so the
-coalescing ratio is visible. Per-command latency is the enclosing batch response
-latency. Retry an indeterminate batch as the whole unchanged vector with the
-same request IDs.
+For `write`, `--batch-size 1|2|4|8|16|32|64` exercises every typed batch API on
+the handle or runtime. SQL and KV additionally accept 128 and 256: a
+public typed SQL call is capped at 256 members and 512 KiB of aggregate
+canonical encoded input. Its FIFO group queue has a fixed 32 MiB pending
+encoded-byte budget, while one physical group is capped at 2 MiB and 1,024
+members. Direct SQL QWAL additionally accepts 512 and 1,024 members.
+`operations`, attempts, successes, errors, and
+`operations_per_second` are logical-command counts. `batch_calls`,
+`successful_batch_calls`, `failed_batch_calls`,
+`batch_calls_per_second`, and `batch_call_latency_us` describe physical API
+calls separately. `logical_item_latency_us` is the batch service time amortized
+over its submitted members; it is not an independent end-to-end latency sample
+for every member.
+
+KV public calls are capped at 256 members. Direct runtime and embedded
+`mutate_kv`/`mutate_kv_batch` calls enter a 64-call, 32 MiB FIFO queue with a
+500µs quiet period that restarts on arrival and a 2ms hard deadline at the
+default setting; one active group contains at most 1,024 members. The
+wire batch is command version 3 and the redb materializer fingerprint uses
+domain v3, so this is a clean-install breaking boundary. One `Immediate` redb
+transaction durably stores the full qlog entry with the KV state, receipts, and
+applied tip. The file qlog is a buffered serving mirror and can be rehydrated
+from redb, removing its separate hot-path sync without weakening strict ACK.
+SQL uses a Recorder-authoritative model: the 2/3 Recorder WAL sync is the only
+durability boundary on the common path. SQLite, the generation-6 control
+sidecar, and the file qlog are non-durable local views rebuilt from a verified
+checkpoint plus Recorder tail. ACK waits for local SQLite visibility, while
+readiness remains closed until tip validation and catch-up finish. Recorder
+QCMD files currently are retained without a GC path.
+The 512 KiB replicated command ceiling still applies: an oversized flattened
+group is emitted as the largest fitting ordered prefixes. HTTP writes use their
+existing async writer batch directly and do not enter the KV queue a second
+time. Graph is not part of this KV group-commit path.
+
+For runtime writes, `qlog_entries` and `logical_operations_per_qlog` expose
+coalescing efficiency. SQL QWAL reports `qwal_prepare_latency_us`,
+`qwal_apply_latency_us`, and actual encoded `qwal_envelope_bytes`, in addition
+to whole-call latency. A clean-install QWAL v3 SQL batch is ordered and
+non-atomic: successful members share one qlog entry and one anchor, while member
+savepoints isolate failures. An all-failed batch creates no qlog entry. Retry an
+indeterminate batch as the whole unchanged vector with the same request IDs.
+Profile report schema v6 records `configuration.sql_padding_mib`, the optional
+`configuration.follower_apply_latency_scope`, and
+`configuration.follower_seed_state`, plus
+`measurement.follower_apply_latency_us`. `follower_seed_state` records the
+pre-warmup leader/follower DB and control sizes, the number of expected seed
+receipts verified by request ID, command digest, and original log-index ordinal,
+and the zero embedded-qlog counts after restore. When an explicit seed cache is
+used, its `seed_cache` object also records `created` or `hit`, the absolute file
+path, whole-cache digest and byte count, and the embedded snapshot digest. The
+report continues to name
+the buffered SQL mirror cost `phase_latency_us.local_qlog_mirror_append`; that
+phase is not a durability sync.
+
+`--layer follower-apply` seeds one temporary SQL leader with leader-generated
+QWAL entries. It then creates one recovery snapshot and restores it into fresh
+node-1/node-2 views; no temporary seed follower is created. This clears the seed
+embedded qlog; expected request receipts intentionally remain, and the verified
+expected population plus control-file cost are reported. Each measured QWAL is
+prepared on the leader. Payload
+clone, hash and `LogEntry` construction finish before the timer; only the
+follower `SqliteStateMachine::apply_entry` call is timed. Anchor bookkeeping and
+the subsequent leader catch-up also remain outside `follower_apply_latency_us`.
+Whole-run throughput includes the complete loop, so the two metrics must not be
+interchanged. `--sql-padding-mib 0..1024` adds exactly that many MiB of zero
+blobs to an untouched deterministic `bench_padding` table before snapshot
+restore and warmup. Measured writes keep the same `--value-bytes` hot-row payload
+in `bench_items`; seed and restore are excluded from reported latency samples.
+
+Large follower-apply comparisons can reuse their deterministic setup with
+`--sql-seed-cache FILE`. If the file is absent, the harness performs the normal
+QWAL seed and creates the normalized recovery snapshot. It first restores and
+fully validates fresh node-1/node-2 materializers, then publishes the validated
+cache atomically without replacing an existing file. If the file exists, the
+harness validates a configuration-derived hard size bound before allocating the
+snapshot, reads the header and exact snapshot once through one revalidated file
+handle, then skips QWAL seeding and restores fresh materializers from it. The
+cache binds the exact seed-recipe ID and digest, active configuration state,
+padding, value size, keyspace, expected receipt count, snapshot manifest, and
+canonical framing/digests. Both paths fail closed unless the restored tips
+align, every expected receipt remains at its exact original ordinal, the
+embedded qlog is empty, and every deterministic seed and padding row has the
+requested ID, length, and content. This proves the expected recipe; it does not
+claim a separately enumerated total receipt count because that count is not
+exposed by the materializer API. A malformed, modified, sparse oversized,
+symlinked, non-regular, or configuration-mismatched cache is never regenerated
+over the existing path. Reported paths are canonical.
+
+Use different cache files for baseline and current binaries. Sharing one cache
+would bind both runs to one harness/report format and could hide a setup-format
+difference. For example:
+
+```sh
+baseline/bench/target/release/rhiza-profile \
+  --profile sql --workload write --layer follower-apply --batch-size 1 \
+  --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
+  --sql-padding-mib 1024 \
+  --sql-seed-cache target/rhiza-bench/profile/baseline-padding-1024mib.seed \
+  > target/rhiza-bench/profile/baseline-follower-apply-padding-1024mib.json
+
+bench/target/release/rhiza-profile \
+  --profile sql --workload write --layer follower-apply --batch-size 1 \
+  --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
+  --sql-padding-mib 1024 \
+  --sql-seed-cache target/rhiza-bench/profile/current-padding-1024mib.seed \
+  > target/rhiza-bench/profile/current-follower-apply-padding-1024mib.json
+```
+
+The current release evidence is under
+`target/rhiza-bench/write-v3-group-window-idle/20260719T032700/` (an ignored
+benchmark directory). Runtime c4 submitted four concurrent public 256-member
+calls; the bounded 500µs drain window produced a median **15,824 logical
+ops/s**, 101 QLog entries per 102,400 writes, and a seven-run IQR below 1%. Direct QWAL
+medians from `target/rhiza-bench/write-v3-group-commit/20260719T025727/` were
+16,313 / 22,109 / 25,730 logical ops/s for 256 / 512 / 1,024 members. Read each
+artifact's `README.md` for exact commands, durability boundaries, topology, raw
+JSON, and limitations.
+
+The first post-`HashSet` c4 diagnostic under
+`target/rhiza-bench/write-v4-hashset/20260719T042000/` had a seven-run median of
+**17,974 logical ops/s**, **13.6%** above 15,824. It does not replace the stable
+official result: an orphan Virtualization VM was present and the post-run
+snapshot showed heavy `syspolicyd` and `trustd` activity. Treat it only as a
+signal for a controlled rerun.
+
+The checked-in [strong-read diagnostic](strong-read-results-2026-07-19.md)
+records three-run c1/c4/c16 local and read-barrier controls for SQL, KV, and
+Graph after disk space was cleared. The host was not idle and later showed an
+orphan VM/background load, so the result is diagnostic rather than publishable
+release evidence.
+
+The post-change KV artifact is
+`target/rhiza-bench/kv-group-commit/20260719T122120/`, built as binary SHA-256
+`a1f34866955b638371db4e0852f04d382425d22a0c5247aced5b828009c4db76`.
+For 102,400 logical writes in 1,600 public batch calls, c1 median was **2,008.81
+ops/s** with 1,600 qlog entries and c4 median was **10,738.69 ops/s** with
+401–402 qlog entries. This is a structural/qlog gate pass, not publishable
+throughput evidence: c1/c4 IQR was 11.09%/7.24%, and Dory VM,
+`syspolicyd`, and Storage extension activity invalidated the stability gate.
+The checked-in [SQL/KV diagnostic](sql-kv-results-2026-07-19.md) preserves the
+full comparison and raw-artifact boundary. Graph is excluded from that report.
 
 ```sh
 cargo build --release --locked --manifest-path bench/Cargo.toml \
@@ -248,6 +382,12 @@ for batch_size in 1 2 4 8 16 32 64; do
     --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
     > "target/rhiza-bench/profile/kv-write-batch-${batch_size}.json"
 done
+
+bench/target/release/rhiza-profile \
+  --profile sql --workload write --layer follower-apply --batch-size 1 \
+  --operations 10000 --warmup 1000 --concurrency 1 --value-bytes 128 \
+  --sql-padding-mib 1024 \
+  > target/rhiza-bench/profile/sql-follower-apply-padding-1024mib.json
 ```
 
 Run on an otherwise idle machine. Each invocation uses a fresh temporary data

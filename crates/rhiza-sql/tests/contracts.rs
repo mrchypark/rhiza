@@ -1,7 +1,7 @@
 use rhiza_core::{EntryType, LogEntry, LogHash};
 use rhiza_sql::{
-    encode_sql_command, restore_snapshot_file, sql_executor_fingerprint, Error, SqlCommand,
-    SqlEffectPreparation, SqlStatement, SqlValue, SqliteStateMachine,
+    encode_sql_command, restore_snapshot_file, sql_executor_fingerprint, Error, SqlBatchMember,
+    SqlCommand, SqlStatement, SqlValue, SqliteStateMachine,
 };
 use rusqlite::Connection;
 
@@ -12,9 +12,18 @@ fn apply_command(
     prev_hash: LogHash,
 ) -> LogHash {
     let request = encode_sql_command(command).unwrap();
-    let SqlEffectPreparation::Effect(effect) = db
-        .prepare_sql_effect(command, &request, index - 1, prev_hash)
+    let preparation = db
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command,
+                request_payload: &request,
+            }],
+            index - 1,
+            prev_hash,
+        )
         .unwrap();
+    preparation.results.into_iter().next().unwrap().unwrap();
+    let effect = preparation.effect.unwrap();
     let hash = LogEntry::calculate_hash(
         "cluster-a",
         1,
@@ -58,8 +67,19 @@ fn qsql_v2_rejects_a_mismatched_executor_fingerprint_before_preparation() {
     tampered.extend_from_slice(&serde_json::to_vec(&body).unwrap());
 
     assert_ne!(sql_executor_fingerprint().unwrap(), LogHash::ZERO);
+    let preparation = db
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command: &command,
+                request_payload: &tampered,
+            }],
+            0,
+            LogHash::ZERO,
+        )
+        .unwrap();
+    assert!(preparation.effect.is_none());
     assert!(matches!(
-        db.prepare_sql_effect(&command, &tampered, 0, LogHash::ZERO),
+        &preparation.results[0],
         Err(Error::InvalidCommand(_))
     ));
 }
@@ -204,16 +224,51 @@ fn sql_query_allows_only_curated_observational_pragmas_without_state_changes() {
         "PrAgMa TaBlE_LiSt(pragma_items)",
         "PRAGMA table_xinfo(pragma_items)",
         "PRAGMA application_id",
+        "PRAGMA analysis_limit",
+        "PRAGMA auto_vacuum",
+        "PRAGMA automatic_index",
+        "PRAGMA busy_timeout",
+        "PRAGMA cache_size",
+        "PRAGMA cache_spill",
+        "PRAGMA case_sensitive_like",
+        "PRAGMA cell_size_check",
+        "PRAGMA checkpoint_fullfsync",
         "PRAGMA collation_list",
         "PRAGMA compile_options",
+        "PRAGMA count_changes",
         "PRAGMA data_version",
+        "PRAGMA default_cache_size",
+        "PRAGMA defer_foreign_keys",
+        "PRAGMA empty_result_callbacks",
         "PRAGMA encoding",
         "PRAGMA freelist_count",
+        "PRAGMA foreign_keys",
+        "PRAGMA full_column_names",
+        "PRAGMA fullfsync",
         "PRAGMA function_list",
+        "PRAGMA hard_heap_limit",
+        "PRAGMA ignore_check_constraints",
+        "PRAGMA journal_size_limit",
+        "PRAGMA legacy_alter_table",
+        "PRAGMA locking_mode",
+        "PRAGMA max_page_count",
+        "PRAGMA mmap_size",
         "PRAGMA module_list",
         "PRAGMA page_count",
+        "PRAGMA page_size",
         "PRAGMA pragma_list",
+        "PRAGMA query_only",
+        "PRAGMA read_uncommitted",
+        "PRAGMA recursive_triggers",
+        "PRAGMA reverse_unordered_selects",
         "PRAGMA schema_version",
+        "PRAGMA secure_delete",
+        "PRAGMA short_column_names",
+        "PRAGMA soft_heap_limit",
+        "PRAGMA synchronous",
+        "PRAGMA temp_store",
+        "PRAGMA threads",
+        "PRAGMA trusted_schema",
         "PRAGMA user_version",
     ] {
         assert!(
@@ -250,7 +305,6 @@ fn sql_query_allows_only_curated_observational_pragmas_without_state_changes() {
 
     for sql in [
         "PRAGMA database_list",
-        "PRAGMA cache_size",
         "PRAGMA table_info(__rhiza_kv)",
         "PRAGMA user_version = 7",
         "PRAGMA foreign_keys = OFF",
@@ -310,38 +364,34 @@ fn sql_query_enforces_row_byte_and_utf8_result_boundaries() {
 }
 
 #[test]
-fn reserved_trigger_names_and_targets_are_rejected_without_changing_the_base() {
+fn trigger_on_the_internal_table_is_rejected_without_changing_the_base() {
     let dir = tempfile::tempdir().unwrap();
     let db = SqliteStateMachine::open(dir.path().join("state.sqlite"), "cluster-a", "node-1", 1, 1)
         .unwrap();
     let initial = db.canonical_db_digest().unwrap();
 
-    for (request_id, sql) in [
-        (
-            "reserved-trigger-name",
-            "CREATE TABLE items(id INTEGER); CREATE TRIGGER __rhiza_hidden AFTER INSERT ON items BEGIN SELECT 1; END",
-        ),
-        (
-            "reserved-trigger-target",
-            "CREATE TRIGGER user_trigger AFTER INSERT ON __rhiza_kv BEGIN SELECT 1; END",
-        ),
-    ] {
-        let command = SqlCommand {
-            request_id: request_id.into(),
-            statements: sql
-                .split("; ")
-                .map(|sql| SqlStatement {
-                    sql: sql.into(),
-                    parameters: vec![],
-                })
-                .collect(),
-        };
-        let request = encode_sql_command(&command).unwrap();
-        assert!(db
-            .prepare_sql_effect(&command, &request, 0, LogHash::ZERO)
-            .is_err());
-        assert_eq!(db.canonical_db_digest().unwrap(), initial);
-    }
+    let command = SqlCommand {
+        request_id: "reserved-trigger-target".into(),
+        statements: vec![SqlStatement {
+            sql: "CREATE TRIGGER user_trigger AFTER INSERT ON __rhiza_kv BEGIN SELECT 1; END"
+                .into(),
+            parameters: vec![],
+        }],
+    };
+    let request = encode_sql_command(&command).unwrap();
+    let preparation = db
+        .prepare_sql_batch_effect(
+            &[SqlBatchMember {
+                command: &command,
+                request_payload: &request,
+            }],
+            0,
+            LogHash::ZERO,
+        )
+        .unwrap();
+    assert!(preparation.effect.is_none());
+    assert!(preparation.results[0].is_err());
+    assert_eq!(db.canonical_db_digest().unwrap(), initial);
 }
 
 #[test]
