@@ -5128,7 +5128,9 @@ mod tests {
     #[cfg(feature = "sql")]
     use rhiza_node::{ReadRequest, WriteRequest, PROTOCOL_VERSION, VERSION_HEADER};
     use rhiza_obj_store::{ObjStore, ObjStoreConfig};
-    use rhiza_quepaxa::{AcceptedValue, Proposal, ProposalPriority};
+    use rhiza_quepaxa::AcceptedValue;
+    #[cfg(feature = "sql")]
+    use rhiza_quepaxa::{Proposal, ProposalPriority};
     #[cfg(feature = "sql")]
     use rhiza_quepaxa::{RecordRequest, RecordSummary};
     #[cfg(feature = "sql")]

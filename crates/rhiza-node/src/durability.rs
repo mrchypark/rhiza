@@ -913,7 +913,7 @@ pub fn validate_local_recovery_view(
             "local recovery view profile does not match checkpoint identity".into(),
         ));
     }
-    match execution_profile {
+    let validate_qlog = match execution_profile {
         ExecutionProfile::Sqlite => {
             #[cfg(feature = "sql")]
             {
@@ -934,6 +934,7 @@ pub fn validate_local_recovery_view(
                     ),
                     checkpoint_root,
                 )?;
+                true
             }
             #[cfg(not(feature = "sql"))]
             return Err(DurabilityError::SnapshotVerification(
@@ -964,16 +965,21 @@ pub fn validate_local_recovery_view(
                     })?,
                     checkpoint_root,
                 )?;
+                true
             }
             #[cfg(not(feature = "kv"))]
             return Err(DurabilityError::SnapshotVerification(
                 "kv execution profile is not compiled in".into(),
             ));
         }
-        ExecutionProfile::Graph => return Ok(()),
-    }
+        ExecutionProfile::Graph => false,
+    };
 
-    validate_local_qlog(data_dir, identity, checkpoint_root)
+    if validate_qlog {
+        validate_local_qlog(data_dir, identity, checkpoint_root)
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
@@ -1108,6 +1114,7 @@ fn validate_restored_suffix(
     Ok(())
 }
 
+#[cfg(any(feature = "sql", feature = "kv", test))]
 fn validate_materializer_tip(
     label: &str,
     actual: LogAnchor,

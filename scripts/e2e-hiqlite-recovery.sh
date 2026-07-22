@@ -78,8 +78,9 @@ if [ "$build_image" = 0 ] && [ -z "${HIQLITE_RECOVERY_PROXY_IMAGE:-}" ]; then
   die "HIQLITE_BUILD_IMAGE=0 requires an explicit HIQLITE_RECOVERY_PROXY_IMAGE"
 fi
 IFS=, read -r -a hold_values <<< "$hold_csv"
-[ "${#hold_values[@]}" -ge 1 ] && [ "${#hold_values[@]}" -le 3 ] \
-  || die "HIQLITE_RECOVERY_HOLD_SECONDS must contain one to three durations"
+if [ "${#hold_values[@]}" -lt 1 ] || [ "${#hold_values[@]}" -gt 3 ]; then
+  die "HIQLITE_RECOVERY_HOLD_SECONDS must contain one to three durations"
+fi
 seen_holds=,
 for value in "${hold_values[@]}"; do
   [[ "$value" =~ ^[0-9]+$ ]] \
@@ -90,8 +91,9 @@ for value in "${hold_values[@]}"; do
   seen_holds="${seen_holds}${value},"
 done
 IFS=, read -r -a failure_values <<< "$failure_csv"
-[ "${#failure_values[@]}" -ge 1 ] && [ "${#failure_values[@]}" -le 3 ] \
-  || die "HIQLITE_RECOVERY_FAIL_PEERS must contain one to three failure counts"
+if [ "${#failure_values[@]}" -lt 1 ] || [ "${#failure_values[@]}" -gt 3 ]; then
+  die "HIQLITE_RECOVERY_FAIL_PEERS must contain one to three failure counts"
+fi
 seen_failures=,
 for value in "${failure_values[@]}"; do
   case "$value" in 1|2|3) ;; *) die "HIQLITE_RECOVERY_FAIL_PEERS values must be 1, 2, or 3" ;; esac
@@ -219,8 +221,9 @@ build_artifacts() {
       expected_image_id="${HIQLITE_RECOVERY_EXPECTED_LOCAL_IMAGE_ID:-}"
       expected_proxy_id="${HIQLITE_RECOVERY_EXPECTED_LOCAL_PROXY_IMAGE_ID:-}"
       expected_lock_sha="${HIQLITE_RECOVERY_EXPECTED_LOCKFILE_SHA256:-}"
-      [ -n "$expected_image_id" ] && [ -n "$expected_proxy_id" ] \
-        || die "exact local image reuse requires both expected image IDs"
+      if [ -z "$expected_image_id" ] || [ -z "$expected_proxy_id" ]; then
+        die "exact local image reuse requires both expected image IDs"
+      fi
       [ "${#expected_lock_sha}" -eq 64 ] \
         || die "exact local image reuse requires a 64-character expected lockfile SHA-256"
       resolved_image="$(docker image inspect --format '{{.Id}}' "$image")"
