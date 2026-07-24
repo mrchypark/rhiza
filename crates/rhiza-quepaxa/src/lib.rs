@@ -20,7 +20,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -3625,8 +3625,51 @@ fn control_rpc<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
         .unwrap_or(Err(Error::ProposeFailed))
 }
 
+struct QueuedControlJob {
+    job: ControlJob,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl QueuedControlJob {
+    fn run(self, recorder: &dyn RecorderRpc) {
+        if !self
+            .cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+        {
+            self.job.run(recorder);
+        }
+    }
+
+    fn fail(self, error: Error) {
+        self.job.fail(error);
+    }
+}
+
+struct ControlJobCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ControlJobCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+}
+
+impl Drop for ControlJobCancellation {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 struct ControlWorker {
-    sender: Option<std::sync::mpsc::SyncSender<ControlJob>>,
+    sender: Option<std::sync::mpsc::SyncSender<QueuedControlJob>>,
     handle: Option<thread::JoinHandle<()>>,
     pending: Arc<AtomicUsize>,
 }
@@ -3641,7 +3684,7 @@ enum ControlDispatch {
 impl ControlWorker {
     fn spawn(recorder: Arc<dyn RecorderRpc>) -> Result<Self> {
         let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<ControlJob>(CONTROL_WORKER_QUEUE_CAPACITY);
+            std::sync::mpsc::sync_channel::<QueuedControlJob>(CONTROL_WORKER_QUEUE_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let worker_pending = Arc::clone(&pending);
         let handle = thread::Builder::new()
@@ -3660,7 +3703,24 @@ impl ControlWorker {
     }
 
     fn dispatch(&self, job: ControlJob) -> ControlDispatch {
+        self.dispatch_with_cancellation(job, None)
+    }
+
+    fn dispatch_cancellable(
+        &self,
+        job: ControlJob,
+        cancellation: Arc<AtomicBool>,
+    ) -> ControlDispatch {
+        self.dispatch_with_cancellation(job, Some(cancellation))
+    }
+
+    fn dispatch_with_cancellation(
+        &self,
+        job: ControlJob,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> ControlDispatch {
         self.pending.fetch_add(1, Ordering::Relaxed);
+        let job = QueuedControlJob { job, cancelled };
         let (failed, outcome) = match &self.sender {
             Some(sender) => match sender.try_send(job) {
                 Ok(()) => (None, ControlDispatch::Accepted),
@@ -4815,13 +4875,17 @@ impl ThreeNodeConsensus {
         let config_digest = self.config_digest;
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let cancellation = ControlJobCancellation::new();
         let mut saturated = 0;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::InspectSummary {
-                index,
-                slot,
-                result: sender.clone(),
-            }) == ControlDispatch::Saturated
+            if worker.dispatch_cancellable(
+                ControlJob::InspectSummary {
+                    index,
+                    slot,
+                    result: sender.clone(),
+                },
+                cancellation.token(),
+            ) == ControlDispatch::Saturated
             {
                 saturated += 1;
             }
@@ -5074,17 +5138,21 @@ impl ThreeNodeConsensus {
         let quorum = quorum_size(self.control_workers.len());
         let total = self.control_workers.len();
         let (sender, receiver) = std::sync::mpsc::sync_channel(total.max(1));
+        let cancellation = ControlJobCancellation::new();
         let mut saturated = 0;
         for (index, worker) in self.control_workers.iter().enumerate() {
-            if worker.dispatch(ControlJob::FetchCommand {
-                index,
-                cluster_id: self.cluster_id.clone(),
-                epoch: self.epoch,
-                config_id: self.config_id,
-                config_digest: self.config_digest,
-                command_hash: value.command_hash,
-                result: sender.clone(),
-            }) == ControlDispatch::Saturated
+            if worker.dispatch_cancellable(
+                ControlJob::FetchCommand {
+                    index,
+                    cluster_id: self.cluster_id.clone(),
+                    epoch: self.epoch,
+                    config_id: self.config_id,
+                    config_digest: self.config_digest,
+                    command_hash: value.command_hash,
+                    result: sender.clone(),
+                },
+                cancellation.token(),
+            ) == ControlDispatch::Saturated
             {
                 saturated += 1;
             }
