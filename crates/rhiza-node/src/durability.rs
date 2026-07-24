@@ -1236,11 +1236,13 @@ pub async fn restore_checkpoint_for_rejoin_preserving_recorder(
         &identity,
         &restored,
         data_dir,
-        Some(target_node_id),
-        true,
-        true,
-        Some(&recovery_identity),
-        Some((marker_name, marker_contents)),
+        RestoreInstallOptions {
+            target_node_id: Some(target_node_id),
+            remove_generic_intent: true,
+            replace_rebuildable: true,
+            recovery_identity: Some(&recovery_identity),
+            completion_marker: Some((marker_name, marker_contents)),
+        },
     )
 }
 
@@ -1278,31 +1280,37 @@ async fn restore_checkpoint_to_fresh_data_dir_with_target(
         &identity,
         &restored,
         data_dir,
-        Some(target_node_id),
-        true,
-        false,
-        Some(&recovery_identity),
-        completion_marker,
+        RestoreInstallOptions {
+            target_node_id: Some(target_node_id),
+            remove_generic_intent: true,
+            replace_rebuildable: false,
+            recovery_identity: Some(&recovery_identity),
+            completion_marker,
+        },
     )
+}
+
+struct RestoreInstallOptions<'a> {
+    target_node_id: Option<&'a str>,
+    remove_generic_intent: bool,
+    replace_rebuildable: bool,
+    recovery_identity: Option<&'a RecoveryArtifactIdentity>,
+    completion_marker: Option<(&'a str, &'a [u8])>,
 }
 
 fn install_restored_checkpoint(
     identity: &CheckpointIdentity,
     restored: &RestoredCheckpoint,
     data_dir: &Path,
-    target_node_id: Option<&str>,
-    remove_generic_intent: bool,
-    replace_rebuildable: bool,
-    recovery_identity: Option<&RecoveryArtifactIdentity>,
-    completion_marker: Option<(&str, &[u8])>,
+    options: RestoreInstallOptions<'_>,
 ) -> Result<CheckpointTip, DurabilityError> {
     let tip = *restored.tip();
     let profile = snapshot_profile(identity.cluster_id())?;
     validate_restored_suffix(profile, restored.suffix())?;
-    let staging = create_restore_staging_dir(data_dir, recovery_identity)?;
+    let staging = create_restore_staging_dir(data_dir, options.recovery_identity)?;
     let result = (|| -> Result<(), DurabilityError> {
         if let Some(snapshot) = restored.snapshot() {
-            install_profile_snapshot(identity, snapshot, &staging, target_node_id)?;
+            install_profile_snapshot(identity, snapshot, &staging, options.target_node_id)?;
         }
 
         if restored.snapshot().is_some() || !restored.suffix().is_empty() {
@@ -1335,10 +1343,15 @@ fn install_restored_checkpoint(
                 ));
             }
         }
-        if replace_rebuildable {
-            quarantine_rebuildable_view(data_dir, profile, recovery_identity)?;
+        if options.replace_rebuildable {
+            quarantine_rebuildable_view(data_dir, profile, options.recovery_identity)?;
         }
-        publish_restore_staging(&staging, data_dir, remove_generic_intent, completion_marker)
+        publish_restore_staging(
+            &staging,
+            data_dir,
+            options.remove_generic_intent,
+            options.completion_marker,
+        )
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
@@ -1637,16 +1650,18 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
                 identity,
                 &restored,
                 config.data_dir(),
-                Some(config.node_id()),
-                false,
-                true,
-                Some(&RecoveryArtifactIdentity::Successor(
-                    complete_marker
-                        .as_ref()
-                        .expect("Complete state has a validated identity")
-                        .clone(),
-                )),
-                None,
+                RestoreInstallOptions {
+                    target_node_id: Some(config.node_id()),
+                    remove_generic_intent: false,
+                    replace_rebuildable: true,
+                    recovery_identity: Some(&RecoveryArtifactIdentity::Successor(
+                        complete_marker
+                            .as_ref()
+                            .expect("Complete state has a validated identity")
+                            .clone(),
+                    )),
+                    completion_marker: None,
+                },
             )?;
         }
         return Ok(SuccessorRestorePreparation {
@@ -1671,11 +1686,13 @@ pub async fn restore_successor_checkpoint_to_fresh_data_dir(
         identity,
         &restored,
         config.data_dir(),
-        Some(config.node_id()),
-        false,
-        false,
-        Some(&intent_identity),
-        None,
+        RestoreInstallOptions {
+            target_node_id: Some(config.node_id()),
+            remove_generic_intent: false,
+            replace_rebuildable: false,
+            recovery_identity: Some(&intent_identity),
+            completion_marker: None,
+        },
     )?;
     Ok(SuccessorRestorePreparation {
         tip: *restored.tip(),
@@ -2712,6 +2729,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(root.path().join(SUCCESSOR_RESTORE_LOCK_FILE))
             .unwrap();
         let preparation = SuccessorRestorePreparation {

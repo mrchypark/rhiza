@@ -1440,15 +1440,14 @@ impl RecorderFileStore {
             }
             (None, None) => {}
         }
-        for name in [".recorder.lock"] {
-            let path = root.join(name);
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|_| Error::Decode(format!("recorder is missing {name}")))?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(Error::Decode(format!(
-                    "recorder {name} must be a regular file"
-                )));
-            }
+        let name = ".recorder.lock";
+        let path = root.join(name);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| Error::Decode(format!("recorder is missing {name}")))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::Decode(format!(
+                "recorder {name} must be a regular file"
+            )));
         }
         let configuration = decode_configuration_state(&read_regular_file_bounded(
             &root.join("configuration.rec"),
