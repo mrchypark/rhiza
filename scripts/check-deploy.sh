@@ -1124,7 +1124,7 @@ for required_recovery_proof in \
   'if ! scripts/k8s-admin-job.sh' \
   'sample_complete=false' \
   '([.[].qlog_root] | unique | length == 1)'; do
-  grep -Fq "$required_recovery_proof" <<< "$self_heal_e2e"
+  grep -Fq -- "$required_recovery_proof" <<< "$self_heal_e2e"
 done
 if grep -Fq '.cluster_id == "rhiza-vind"' <<< "$self_heal_e2e"; then
   echo "same-membership Pod recreation E2E compares a logical rather than canonical cluster ID" >&2
