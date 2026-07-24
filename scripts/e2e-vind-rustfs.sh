@@ -552,8 +552,9 @@ verify_same_membership_pod_recreation() {
   # END same-membership automatic Pod recreation.
 
   new_target_uid="$(k get pod "$target_pod" -o jsonpath='{.metadata.uid}')"
-  [ -n "$new_target_uid" ] && [ "$new_target_uid" != "$old_target_uid" ] \
-    || die "StatefulSet did not recreate the deleted ordinal with a new Pod UID"
+  if [ -z "$new_target_uid" ] || [ "$new_target_uid" = "$old_target_uid" ]; then
+    die "StatefulSet did not recreate the deleted ordinal with a new Pod UID"
+  fi
   [ "$(k get pod "$survivor_a" -o jsonpath='{.metadata.uid}')" = "$old_survivor_a_uid" ] \
     || die "first survivor Pod was replaced during one-Pod recovery"
   [ "$(k get pod "$survivor_b" -o jsonpath='{.metadata.uid}')" = "$old_survivor_b_uid" ] \

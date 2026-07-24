@@ -1111,7 +1111,7 @@ self_heal_e2e="$(sed -n \
 # shellcheck disable=SC2016
 for required_recovery_proof in \
   'k delete pod "$target_pod" --wait=true' \
-  'new_target_uid" != "$old_target_uid' \
+  'new_target_uid" = "$old_target_uid' \
   'old_survivor_a_uid' \
   'old_survivor_b_uid' \
   'replacement Pod retained deleted emptyDir data' \
