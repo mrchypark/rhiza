@@ -5527,10 +5527,9 @@ async fn handle_kv_batch(
                 return node_error_response(error);
             }
             Ok(WriteOperationResult::Runtime(_)) => {
-                return node_error_response(NodeError::ExecutionProfileMismatch {
-                    expected: ExecutionProfile::Kv,
-                    actual: ExecutionProfile::Kv,
-                });
+                return node_error_response(NodeError::Invariant(
+                    "KV batch handler received non-KV response from writer".into(),
+                ));
             }
             Ok(WriteOperationResult::DurabilityUnavailable) => {
                 return node_error_response(NodeError::Unavailable(
