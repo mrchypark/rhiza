@@ -678,6 +678,8 @@ pub const KV_DELETE_PATH: &str = "/v1/kv/delete";
 pub const KV_GET_PATH: &str = "/v1/kv/get";
 #[cfg(feature = "kv")]
 pub const KV_SCAN_PATH: &str = "/v1/kv/scan";
+#[cfg(feature = "kv")]
+pub const KV_BATCH_PATH: &str = "/v1/kv/batch";
 pub const LIVEZ_PATH: &str = "/livez";
 pub const READYZ_PATH: &str = "/readyz";
 const MAX_STARTUP_RECOVERY_ENTRIES: usize = 100_000;
@@ -4080,6 +4082,7 @@ where
                     .route(KV_DELETE_PATH, post(handle_kv_delete))
                     .route(KV_GET_PATH, post(handle_kv_get))
                     .route(KV_SCAN_PATH, post(handle_kv_scan))
+                    .route(KV_BATCH_PATH, post(handle_kv_batch))
             }
             #[cfg(not(feature = "kv"))]
             unreachable!("KV runtime cannot open without the kv feature")
@@ -5375,6 +5378,83 @@ async fn handle_kv_scan(
         Ok(Err(error)) => node_error_response(error),
         Err(error) => client_task_error(error),
     }
+}
+
+#[cfg(feature = "kv")]
+async fn handle_kv_batch(
+    State(state): State<NodeRouteState>,
+    Extension(permit): Extension<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    request: Result<Json<KvBatchRequest>, JsonRejection>,
+) -> Response {
+    let request = match client_json(request) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    if request.members.is_empty() || request.members.len() > MAX_KV_BATCH_MEMBERS {
+        return node_error_response(NodeError::InvalidRequest(format!(
+            "batch must contain 1..={MAX_KV_BATCH_MEMBERS} members"
+        )));
+    }
+    let mut commands = Vec::with_capacity(request.members.len());
+    for member in request.members {
+        match member {
+            KvBatchMemberRequest::Put(put) => {
+                let key = match decode_base64("key", &put.key) {
+                    Ok(key) => key,
+                    Err(error) => return node_error_response(error),
+                };
+                let value = match decode_base64("value", &put.value) {
+                    Ok(value) => value,
+                    Err(error) => return node_error_response(error),
+                };
+                match KvCommandV1::put(put.request_id, key, value) {
+                    Ok(command) => commands.push(command),
+                    Err(error) => {
+                        return node_error_response(NodeError::InvalidRequest(error.to_string()))
+                    }
+                }
+            }
+            KvBatchMemberRequest::Delete(delete) => {
+                let key = match decode_base64("key", &delete.key) {
+                    Ok(key) => key,
+                    Err(error) => return node_error_response(error),
+                };
+                match KvCommandV1::delete(delete.request_id, key) {
+                    Ok(command) => commands.push(command),
+                    Err(error) => {
+                        return node_error_response(NodeError::InvalidRequest(error.to_string()))
+                    }
+                }
+            }
+        }
+    }
+    let payload = match encode_replicated_kv_batch(&commands) {
+        Ok(payload) if payload.len() <= MAX_COMMAND_BYTES => payload,
+        Ok(_) => {
+            return node_error_response(NodeError::InvalidRequest(format!(
+                "batch command exceeds {MAX_COMMAND_BYTES} bytes"
+            )));
+        }
+        Err(error) => return node_error_response(NodeError::InvalidRequest(error.to_string())),
+    };
+    let request_id = format!(
+        "__rhiza_kv_batch_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    coordinate_write(
+        state,
+        permit,
+        request_id,
+        payload,
+        QueuedOperation::KeyValue {
+            key: String::new(),
+            value: String::new(),
+        },
+    )
+    .await
 }
 
 #[cfg(feature = "sql")]
@@ -7473,6 +7553,35 @@ pub struct KvScanResponse {
     pub next_cursor: Option<String>,
     pub applied_index: LogIndex,
     pub hash: LogHash,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum KvBatchMemberRequest {
+    Put(KvPutRequest),
+    Delete(KvDeleteRequest),
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KvBatchRequest {
+    pub members: Vec<KvBatchMemberRequest>,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct KvBatchMemberResponse {
+    pub applied_index: LogIndex,
+    pub hash: LogHash,
+    pub result: KvMutationResultDto,
+}
+
+#[cfg(feature = "kv")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct KvBatchResponse {
+    pub members: Vec<KvBatchMemberResponse>,
 }
 
 #[cfg(feature = "graph")]

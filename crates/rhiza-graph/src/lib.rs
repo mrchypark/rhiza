@@ -38,8 +38,8 @@ pub const MAX_GRAPH_PARAMETER_DEPTH: usize = 16;
 const MAX_GRAPH_PARAMETER_VALUES: usize = 4096;
 const MAX_GRAPH_PARAMETER_CONTAINER_VALUES: usize = 1024;
 const MAX_GRAPH_PARAMETER_NAME_BYTES: usize = 256;
-const LADYBUG_BUFFER_POOL_BYTES: u64 = 512 * 1024 * 1024;
-const LADYBUG_MAX_NUM_THREADS: u64 = 2;
+const DEFAULT_LADYBUG_BUFFER_POOL_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_LADYBUG_MAX_NUM_THREADS: u64 = 2;
 const LADYBUG_BUFFER_POOL_EXHAUSTED: &str =
     "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!";
 const LADYBUG_CONVERSION_ERROR_PREFIX: &str = "Conversion exception:";
@@ -862,6 +862,7 @@ pub struct LadybugStateMachine {
 }
 
 impl LadybugStateMachine {
+    #[tracing::instrument(level = "info", skip_all, fields(cluster_id, node_id, epoch, config_id))]
     pub fn open(
         path: impl AsRef<Path>,
         cluster_id: &str,
@@ -879,6 +880,7 @@ impl LadybugStateMachine {
         };
         let database = open_database(&path)?;
         initialize_or_validate(&database, &identity)?;
+        tracing::info!(cluster_id, node_id, epoch, config_id, "graph state machine opened");
         Ok(Self {
             path,
             identity,
@@ -887,6 +889,7 @@ impl LadybugStateMachine {
         })
     }
 
+    #[tracing::instrument(skip(self, entry), fields(index = entry.index))]
     pub fn apply_entry(&self, entry: &LogEntry) -> Result<ApplyOutcome> {
         if entry.recompute_hash() != entry.hash {
             return Err(Error::InvalidEntry(
@@ -1496,7 +1499,15 @@ fn open_database(path: &Path) -> Result<Database> {
 }
 
 fn ladybug_system_config() -> SystemConfig {
-    ladybug_system_config_with_limits(LADYBUG_BUFFER_POOL_BYTES, LADYBUG_MAX_NUM_THREADS)
+    let buffer_pool_size = std::env::var("RHIZA_GRAPH_BUFFER_POOL_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LADYBUG_BUFFER_POOL_BYTES);
+    let max_num_threads = std::env::var("RHIZA_GRAPH_MAX_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LADYBUG_MAX_NUM_THREADS);
+    ladybug_system_config_with_limits(buffer_pool_size, max_num_threads)
 }
 
 fn ladybug_system_config_with_limits(buffer_pool_size: u64, max_num_threads: u64) -> SystemConfig {
