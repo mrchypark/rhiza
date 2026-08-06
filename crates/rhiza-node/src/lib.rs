@@ -5428,33 +5428,126 @@ async fn handle_kv_batch(
             }
         }
     }
-    let payload = match encode_replicated_kv_batch(&commands) {
-        Ok(payload) if payload.len() <= MAX_COMMAND_BYTES => payload,
-        Ok(_) => {
-            return node_error_response(NodeError::InvalidRequest(format!(
-                "batch command exceeds {MAX_COMMAND_BYTES} bytes"
-            )));
+    let batch_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut member_responses = Vec::with_capacity(commands.len());
+    for (idx, command) in commands.into_iter().enumerate() {
+        let payload = match encode_replicated_kv_command(&command) {
+            Ok(payload) if payload.len() <= MAX_COMMAND_BYTES => payload,
+            Ok(_) => {
+                return node_error_response(NodeError::InvalidRequest(format!(
+                    "command exceeds {MAX_COMMAND_BYTES} bytes"
+                )));
+            }
+            Err(error) => {
+                return node_error_response(NodeError::InvalidRequest(error.to_string()))
+            }
+        };
+        let request_id = format!("__rhiza_kv_batch_{batch_id}_{idx}");
+        let deadline = tokio::time::Instant::now() + CLIENT_WRITE_WAIT_TIMEOUT;
+        let (mut receiver, queued) = {
+            let mut operations = state.write_operations.lock().await;
+            if let Some(operation) = operations.get(&request_id) {
+                if operation.payload != payload {
+                    return client_error_response(
+                        StatusCode::CONFLICT,
+                        "request_conflict",
+                        false,
+                        "request id is already in flight with a different payload",
+                        None,
+                    );
+                }
+                (operation.result.clone(), None)
+            } else {
+                let (sender, receiver) = tokio::sync::watch::channel(None);
+                operations.insert(
+                    request_id.clone(),
+                    WriteOperation {
+                        payload: payload.clone(),
+                        result: receiver.clone(),
+                    },
+                );
+                (
+                    receiver,
+                    Some(QueuedWrite {
+                        request_id: request_id.clone(),
+                        payload,
+                        operation: QueuedOperation::Kv(command),
+                        permit: permit.clone(),
+                        sender,
+                    }),
+                )
+            }
+        };
+        if let Some(queued) = queued {
+            match tokio::time::timeout_at(deadline, state.writer.send(queued)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    state.write_operations.lock().await.remove(&request_id);
+                    return node_error_response(NodeError::Unavailable(
+                        "writer queue is unavailable".into(),
+                    ));
+                }
+                Err(_) => {
+                    state.write_operations.lock().await.remove(&request_id);
+                    return node_error_response(NodeError::Unavailable(
+                        "write did not enter the queue before the response deadline".into(),
+                    ));
+                }
+            }
         }
-        Err(error) => return node_error_response(NodeError::InvalidRequest(error.to_string())),
-    };
-    let request_id = format!(
-        "__rhiza_kv_batch_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    coordinate_write(
-        state,
-        permit,
-        request_id,
-        payload,
-        QueuedOperation::KeyValue {
-            key: String::new(),
-            value: String::new(),
-        },
-    )
-    .await
+        let wait = async {
+            loop {
+                if let Some(result) = receiver.borrow().clone() {
+                    return result;
+                }
+                if receiver.changed().await.is_err() {
+                    return WriteOperationResult::DurabilityUnavailable;
+                }
+            }
+        };
+        match tokio::time::timeout_at(deadline, wait).await {
+            Ok(WriteOperationResult::Runtime(Ok(ClientWriteResponse::Kv(outcome)))) => {
+                member_responses.push(KvBatchMemberResponse {
+                    applied_index: outcome.applied_index(),
+                    hash: outcome.hash(),
+                    result: match outcome.result() {
+                        KvCommandResultV1::Put { replaced } => KvMutationResultDto::Put {
+                            replaced: *replaced,
+                        },
+                        KvCommandResultV1::Delete { existed } => {
+                            KvMutationResultDto::Delete { existed: *existed }
+                        }
+                    },
+                });
+            }
+            Ok(WriteOperationResult::Runtime(Err(error))) => {
+                return node_error_response(error);
+            }
+            Ok(WriteOperationResult::Runtime(_)) => {
+                return node_error_response(NodeError::ExecutionProfileMismatch {
+                    expected: ExecutionProfile::Kv,
+                    actual: ExecutionProfile::Kv,
+                });
+            }
+            Ok(WriteOperationResult::DurabilityUnavailable) => {
+                return node_error_response(NodeError::Unavailable(
+                    "durability confirmation is unavailable".into(),
+                ));
+            }
+            Err(_) => {
+                return node_error_response(NodeError::Unavailable(
+                    "write timed out".into(),
+                ));
+            }
+        }
+    }
+    Json(KvBatchResponse {
+        members: member_responses,
+    })
+    .into_response()
 }
 
 #[cfg(feature = "sql")]

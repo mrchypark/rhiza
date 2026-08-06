@@ -1499,14 +1499,42 @@ fn open_database(path: &Path) -> Result<Database> {
 }
 
 fn ladybug_system_config() -> SystemConfig {
-    let buffer_pool_size = std::env::var("RHIZA_GRAPH_BUFFER_POOL_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LADYBUG_BUFFER_POOL_BYTES);
-    let max_num_threads = std::env::var("RHIZA_GRAPH_MAX_NUM_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_LADYBUG_MAX_NUM_THREADS);
+    let buffer_pool_size = match std::env::var("RHIZA_GRAPH_BUFFER_POOL_BYTES") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_BUFFER_POOL_BYTES=0 is invalid, using default {DEFAULT_LADYBUG_BUFFER_POOL_BYTES}"
+                );
+                DEFAULT_LADYBUG_BUFFER_POOL_BYTES
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_BUFFER_POOL_BYTES={val} is not a valid u64, using default {DEFAULT_LADYBUG_BUFFER_POOL_BYTES}"
+                );
+                DEFAULT_LADYBUG_BUFFER_POOL_BYTES
+            }
+        },
+        Err(_) => DEFAULT_LADYBUG_BUFFER_POOL_BYTES,
+    };
+    let max_num_threads = match std::env::var("RHIZA_GRAPH_MAX_NUM_THREADS") {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_MAX_NUM_THREADS=0 is invalid, using default {DEFAULT_LADYBUG_MAX_NUM_THREADS}"
+                );
+                DEFAULT_LADYBUG_MAX_NUM_THREADS
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "RHIZA_GRAPH_MAX_NUM_THREADS={val} is not a valid u64, using default {DEFAULT_LADYBUG_MAX_NUM_THREADS}"
+                );
+                DEFAULT_LADYBUG_MAX_NUM_THREADS
+            }
+        },
+        Err(_) => DEFAULT_LADYBUG_MAX_NUM_THREADS,
+    };
     ladybug_system_config_with_limits(buffer_pool_size, max_num_threads)
 }
 

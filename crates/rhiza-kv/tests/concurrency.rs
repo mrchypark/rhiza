@@ -133,11 +133,9 @@ fn concurrent_scan_during_writes() {
         handles.push(thread::spawn(move || {
             for _ in 0..10 {
                 let result = sm_clone.scan_range(b"key-0000", Some(b"key-0100"), 100, None);
-                if let Ok(scan_result) = result {
-                    for row in scan_result.rows() {
-                        assert!(row.key().starts_with(b"key-"));
-                    }
-                }
+                let scan_result = result.unwrap();
+                let count = scan_result.rows().len();
+                assert!(count <= 100, "scan should not exceed total key count, got {count}");
             }
         }));
     }
