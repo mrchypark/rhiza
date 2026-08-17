@@ -3724,21 +3724,19 @@ impl RecorderFileStore {
                     u64::try_from(chunk.len()).unwrap_or(0),
                     std::sync::atomic::Ordering::Release,
                 );
-                self.cached_chunk_count.fetch_add(
-                    1,
-                    std::sync::atomic::Ordering::Release,
-                );
+                self.cached_chunk_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
         anchor.sync()?;
         {
-            let manifest_count = self.cached_manifest_count.load(
-                std::sync::atomic::Ordering::Acquire,
-            );
+            let manifest_count = self
+                .cached_manifest_count
+                .load(std::sync::atomic::Ordering::Acquire);
             if manifest_count >= MAX_MANIFEST_OBJECTS {
-                return Err(Error::EffectBundleInvalid(
-                    format!("manifest object count limit {MAX_MANIFEST_OBJECTS} exceeded"),
-                ));
+                return Err(Error::EffectBundleInvalid(format!(
+                    "manifest object count limit {MAX_MANIFEST_OBJECTS} exceeded"
+                )));
             }
         }
         anchor.atomic_write(
@@ -3746,10 +3744,8 @@ impl RecorderFileStore {
             &encode_effect_bundle(&request.manifest_command)?,
         )?;
         anchor.sync()?;
-        self.cached_manifest_count.fetch_add(
-            1,
-            std::sync::atomic::Ordering::Release,
-        );
+        self.cached_manifest_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.clear_staged_effect_pin(&bundle.binding)?;
         Ok(())
     }
@@ -3832,7 +3828,9 @@ impl RecorderFileStore {
                     let now = std::time::Instant::now();
                     let expired: Vec<LogHash> = staged
                         .iter()
-                        .filter(|(_, v)| now.duration_since(v.last_touched) > STAGED_EFFECT_LEASE_TTL)
+                        .filter(|(_, v)| {
+                            now.duration_since(v.last_touched) > STAGED_EFFECT_LEASE_TTL
+                        })
                         .map(|(k, _)| *k)
                         .collect();
                     for key in &expired {
@@ -3875,10 +3873,8 @@ impl RecorderFileStore {
                 u64::try_from(chunk.len()).unwrap_or(0),
                 std::sync::atomic::Ordering::Release,
             );
-            self.cached_chunk_count.fetch_add(
-                1,
-                std::sync::atomic::Ordering::Release,
-            );
+            self.cached_chunk_count
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let mut staged = self
             .staged_effect_pins
@@ -4285,10 +4281,8 @@ impl RecorderFileStore {
                     continue;
                 }
                 self.effect_root_anchor.remove(&name)?;
-                self.cached_manifest_count.fetch_sub(
-                    1,
-                    std::sync::atomic::Ordering::Release,
-                );
+                self.cached_manifest_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 removed += 1;
             }
         }
@@ -4389,9 +4383,9 @@ impl RecorderFileStore {
                     MAX_EFFECT_BUNDLE_CHUNK_BYTES,
                     "effect chunk",
                 )?;
-                total_bytes = total_bytes
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
+                total_bytes = total_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    Error::EffectBundleInvalid("quota accounting overflow".into())
+                })?;
                 count += 1;
             } else if name.starts_with(EFFECT_BUNDLE_PREFIX) {
                 manifest_count += 1;
@@ -4458,14 +4452,10 @@ impl RecorderFileStore {
                 ) {
                     let len = bytes.len() as u64;
                     self.effect_root_anchor.remove(&name)?;
-                    self.cached_chunk_usage.fetch_sub(
-                        len,
-                        std::sync::atomic::Ordering::Release,
-                    );
-                    self.cached_chunk_count.fetch_sub(
-                        1,
-                        std::sync::atomic::Ordering::Release,
-                    );
+                    self.cached_chunk_usage
+                        .fetch_sub(len, std::sync::atomic::Ordering::Release);
+                    self.cached_chunk_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 } else {
                     self.effect_root_anchor.remove(&name)?;
                 }
