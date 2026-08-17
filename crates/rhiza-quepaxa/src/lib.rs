@@ -1978,6 +1978,7 @@ const EFFECT_BUNDLE_GC_ANCHOR_FILE: &str = ".effect-bundle-gc-anchor.rec";
 const EFFECT_BUNDLE_GC_ANCHOR_MAGIC: &[u8; 4] = b"QEGC";
 const EFFECT_BUNDLE_GC_ANCHOR_VERSION: u16 = 1;
 const MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES: usize = 4 * 1024;
+const MAX_STAGED_EFFECT_BUNDLES: usize = 32;
 const STAGED_EFFECT_RESTAGE_REQUIRED: &str =
     "every effect chunk must be staged in the current process before finalization";
 const STORAGE_GENERATION_FILE: &str = ".rhiza-storage-generation";
@@ -2272,6 +2273,12 @@ fn validate_effect_chunks(chunks: &[Vec<u8>]) -> Result<()> {
 
 fn effect_chunk_digest(chunk: &[u8]) -> LogHash {
     ExternalEffectCommand::chunk_digest(chunk)
+}
+
+fn effect_chunk_quota_actual(current: u64, added: u64) -> Result<u64> {
+    current
+        .checked_add(added)
+        .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))
 }
 
 fn effect_digest(chunk_hashes: &[LogHash], chunk_lengths: &[u32], total_len: usize) -> LogHash {
@@ -3722,6 +3729,23 @@ impl RecorderFileStore {
         ordinal: u16,
         chunk: &[u8],
     ) -> Result<()> {
+        self.stage_effect_bundle_chunk_with_quota(
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+            DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES,
+        )
+    }
+
+    fn stage_effect_bundle_chunk_with_quota(
+        &self,
+        binding: &EffectBundleBinding,
+        manifest_command: &StoredCommand,
+        ordinal: u16,
+        chunk: &[u8],
+        quota_bytes: u64,
+    ) -> Result<()> {
         let qefx = verified_effect_bundle_command(binding, manifest_command)?;
         let expected = qefx.chunks().get(usize::from(ordinal)).ok_or_else(|| {
             Error::EffectBundleInvalid("effect chunk ordinal is out of range".into())
@@ -3760,14 +3784,21 @@ impl RecorderFileStore {
             binding: binding.clone(),
             manifest_command: manifest_command.clone(),
         };
-        if self
-            .staged_effect_pins
-            .lock()
-            .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
-            .get(&binding_digest)
-            .is_some_and(|staged| staged.pin != pin)
         {
-            return Err(Error::EffectBundleConflict);
+            let staged = self
+                .staged_effect_pins
+                .lock()
+                .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
+            match staged.get(&binding_digest) {
+                Some(staged) if staged.pin != pin => return Err(Error::EffectBundleConflict),
+                Some(_) => {}
+                None if staged.len() >= MAX_STAGED_EFFECT_BUNDLES => {
+                    return Err(Error::EffectBundleInvalid(
+                        "too many staged effect bundles; limit is 32".into(),
+                    ));
+                }
+                None => {}
+            }
         }
         let name = self.effect_chunk_name(expected.digest());
         if let Some(existing) = self.effect_root_anchor.read_optional(
@@ -3779,6 +3810,18 @@ impl RecorderFileStore {
                 return Err(Error::EffectBundleConflict);
             }
         } else {
+            let actual = effect_chunk_quota_actual(
+                self.effect_chunk_usage_unlocked()?,
+                u64::try_from(chunk.len()).map_err(|_| {
+                    Error::EffectBundleInvalid("chunk length cannot fit u64".into())
+                })?,
+            )?;
+            if actual > quota_bytes {
+                return Err(Error::EffectBundleQuotaExceeded {
+                    actual,
+                    limit: quota_bytes,
+                });
+            }
             self.effect_root_anchor.atomic_write(&name, chunk)?;
             self.effect_root_anchor.sync()?;
         }
@@ -13017,23 +13060,23 @@ mod tests {
     use super::{
         anchored_fs, capture_next_fetch_group_token, command_file_reads,
         count_control_budget_constructors_for, current_recorder_layout, decode_configuration_state,
-        decode_recorder_state, decode_wal_frame, encode_stored_command, encode_wal_frame,
-        ensure_storage_generation, force_next_control_group_drain_timeout, last_file_sync_kind,
-        lock_unpoison, pause_after_next_fetch_dispatch, pause_after_next_summary_dispatch,
-        pause_after_next_summary_provisional_none, prepare_fresh_recorder_root,
-        record_budget_identity_for, reset_command_file_reads, reset_sync_counts, sync_counts,
-        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
-        CertifiedDecisionInspection, ClusterId, ConfigChange, ConfigId, ConfigurationState,
-        Consensus, ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob,
-        ControlJobCancellation, ControlWorker, DecisionInspection, DecisionProof, DriveOutcome,
-        EffectBundleBinding, EffectBundleFinalizeRequest, Epoch, Error, ExternalEffectCommand,
-        FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
-        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
-        RecordedHeadProvenance, RecorderEffectBundle, RecorderFileStore, RecorderPostPreflightHook,
-        RecorderPreflight, RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState,
-        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, Slot,
-        ThreeNodeConsensus, RECORDER_POST_PREFLIGHT_HOOK, STORAGE_GENERATION_FILE,
-        STORAGE_GENERATION_FINGERPRINT,
+        decode_recorder_state, decode_wal_frame, effect_chunk_quota_actual, encode_stored_command,
+        encode_wal_frame, ensure_storage_generation, force_next_control_group_drain_timeout,
+        last_file_sync_kind, lock_unpoison, pause_after_next_fetch_dispatch,
+        pause_after_next_summary_dispatch, pause_after_next_summary_provisional_none,
+        prepare_fresh_recorder_root, record_budget_identity_for, reset_command_file_reads,
+        reset_sync_counts, sync_counts, sync_wal_append, sync_wal_metadata, upsert_wal_command,
+        AcceptedValue, BudgetIdentityEvent, CertifiedDecisionInspection, ClusterId, ConfigChange,
+        ConfigId, ConfigurationState, Consensus, ControlCallBudget, ControlCallGroup,
+        ControlDispatch, ControlJob, ControlJobCancellation, ControlWorker, DecisionInspection,
+        DecisionProof, DriveOutcome, EffectBundleBinding, EffectBundleFinalizeRequest, Epoch,
+        Error, ExternalEffectCommand, FileSyncKind, Membership, PrioritySource, Proposal,
+        ProposalPriority, ProposerProgress, ReadFenceObservation, ReadFenceRequest,
+        ReadFenceSlotState, RecordRequest, RecordSummary, RecordedHeadProvenance,
+        RecorderEffectBundle, RecorderFileStore, RecorderPostPreflightHook, RecorderPreflight,
+        RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState, RecorderSummary,
+        RejectReason, SealFaultPoint, SingleNodeConsensus, Slot, ThreeNodeConsensus,
+        RECORDER_POST_PREFLIGHT_HOOK, STORAGE_GENERATION_FILE, STORAGE_GENERATION_FINGERPRINT,
     };
     #[cfg(feature = "test-hooks")]
     use super::{
@@ -15562,6 +15605,71 @@ mod tests {
         let bundle = RecorderEffectBundle::new(binding, chunks).unwrap();
         EffectBundleFinalizeRequest::new(bundle.clone(), manifest.clone()).unwrap();
         (membership, bundle, manifest)
+    }
+
+    #[test]
+    fn staged_effect_chunk_quota_counts_only_missing_cas_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = b"quota-shared".to_vec();
+        let (membership, bundle, manifest) = effect_fetch_fixture_with_chunks(vec![shared.clone()]);
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "effect-fetch-cluster",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let quota = shared.len() as u64;
+        store
+            .stage_effect_bundle_chunk_with_quota(bundle.binding(), &manifest, 0, &shared, quota)
+            .unwrap();
+        store
+            .stage_effect_bundle_chunk_with_quota(bundle.binding(), &manifest, 0, &shared, quota)
+            .unwrap();
+
+        let extra = b"x".to_vec();
+        let (_, extra_bundle, extra_manifest) =
+            effect_fetch_fixture_with_chunks(vec![extra.clone()]);
+        store
+            .stage_effect_bundle_chunk_with_quota(
+                extra_bundle.binding(),
+                &extra_manifest,
+                0,
+                &extra,
+                quota + 1,
+            )
+            .unwrap();
+
+        let rejected = b"yy".to_vec();
+        let (_, rejected_bundle, rejected_manifest) =
+            effect_fetch_fixture_with_chunks(vec![rejected.clone()]);
+        let rejected_path = root.path().join(format!(
+            "effect-chunk-{}.qefc",
+            ExternalEffectCommand::chunk_digest(&rejected).to_hex()
+        ));
+        assert_eq!(
+            store.stage_effect_bundle_chunk_with_quota(
+                rejected_bundle.binding(),
+                &rejected_manifest,
+                0,
+                &rejected,
+                quota + 2,
+            ),
+            Err(Error::EffectBundleQuotaExceeded {
+                actual: quota + 3,
+                limit: quota + 2,
+            })
+        );
+        assert!(!rejected_path.exists());
+        assert_eq!(store.effect_chunk_usage_unlocked().unwrap(), quota + 1);
+        assert_eq!(
+            effect_chunk_quota_actual(u64::MAX, 1),
+            Err(Error::EffectBundleInvalid(
+                "quota accounting overflow".into()
+            ))
+        );
     }
 
     fn effect_fetch_consensus(recorders: [ScriptedEffectFetchRecorder; 3]) -> ThreeNodeConsensus {

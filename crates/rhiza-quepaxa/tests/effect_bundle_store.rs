@@ -600,6 +600,83 @@ fn staged_finalize_requires_every_chunk_to_be_restaged_after_restart() {
 }
 
 #[test]
+fn staged_effect_admission_bounds_distinct_bindings_without_blocking_retries() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let shared = b"shared-staged-chunk".to_vec();
+    let later = b"later-staged-chunk".to_vec();
+    let (first_bundle, first_request) =
+        sql_qefx(&membership, vec![shared.clone(), later.clone()], 100);
+    store
+        .stage_effect_bundle_chunk(
+            first_bundle.binding(),
+            &first_request.manifest_command,
+            0,
+            &shared,
+        )
+        .unwrap();
+
+    for slot in 101..132 {
+        let (bundle, request) = sql_qefx(&membership, vec![shared.clone()], slot);
+        store
+            .stage_effect_bundle_chunk(bundle.binding(), &request.manifest_command, 0, &shared)
+            .unwrap();
+    }
+
+    store
+        .stage_effect_bundle_chunk(
+            first_bundle.binding(),
+            &first_request.manifest_command,
+            0,
+            &shared,
+        )
+        .unwrap();
+    store
+        .stage_effect_bundle_chunk(
+            first_bundle.binding(),
+            &first_request.manifest_command,
+            1,
+            &later,
+        )
+        .unwrap();
+
+    let candidate_chunk = b"capacity-released-chunk".to_vec();
+    let (candidate_bundle, candidate_request) =
+        sql_qefx(&membership, vec![candidate_chunk.clone()], 132);
+    assert!(matches!(
+        store.stage_effect_bundle_chunk(
+            candidate_bundle.binding(),
+            &candidate_request.manifest_command,
+            0,
+            &candidate_chunk,
+        ),
+        Err(Error::EffectBundleInvalid(message))
+            if message == "too many staged effect bundles; limit is 32"
+    ));
+    let candidate_path = root.path().join(format!(
+        "effect-chunk-{}.qefc",
+        ExternalEffectCommand::chunk_digest(&candidate_chunk).to_hex()
+    ));
+    assert!(!candidate_path.exists());
+
+    store
+        .finalize_staged_effect_bundle(
+            first_bundle.binding(),
+            first_request.manifest_command.clone(),
+        )
+        .unwrap();
+    store
+        .stage_effect_bundle_chunk(
+            candidate_bundle.binding(),
+            &candidate_request.manifest_command,
+            0,
+            &candidate_chunk,
+        )
+        .unwrap();
+    assert!(candidate_path.is_file());
+}
+
+#[test]
 fn failed_chunk_stage_does_not_leave_a_gc_pin() {
     let root = tempfile::tempdir().unwrap();
     let (store, membership) = open_store(root.path());
