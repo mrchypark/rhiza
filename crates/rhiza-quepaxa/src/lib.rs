@@ -1926,6 +1926,7 @@ pub struct RecorderFileStore {
     staged_effect_pins: Arc<Mutex<HashMap<LogHash, StagedEffectBundle>>>,
     cached_chunk_usage: Arc<std::sync::atomic::AtomicU64>,
     cached_chunk_count: Arc<std::sync::atomic::AtomicUsize>,
+    cached_manifest_count: Arc<std::sync::atomic::AtomicUsize>,
     sync: Arc<Mutex<()>>,
 }
 
@@ -1982,6 +1983,7 @@ const EFFECT_BUNDLE_GC_ANCHOR_VERSION: u16 = 1;
 const MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES: usize = 4 * 1024;
 const MAX_STAGED_EFFECT_BUNDLES: usize = 32;
 const STAGED_EFFECT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_MANIFEST_OBJECTS: usize = 4096;
 const STAGED_EFFECT_RESTAGE_REQUIRED: &str =
     "every effect chunk must be staged in the current process before finalization";
 const STORAGE_GENERATION_FILE: &str = ".rhiza-storage-generation";
@@ -2907,6 +2909,7 @@ impl RecorderFileStore {
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
                 cached_chunk_usage: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 cached_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cached_manifest_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 sync: Arc::new(Mutex::new(())),
             },
             false,
@@ -2968,6 +2971,7 @@ impl RecorderFileStore {
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
                 cached_chunk_usage: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 cached_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cached_manifest_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 sync: Arc::new(Mutex::new(())),
             },
             true,
@@ -3716,14 +3720,36 @@ impl RecorderFileStore {
                 .is_none()
             {
                 anchor.atomic_write(&name, chunk)?;
+                self.cached_chunk_usage.fetch_add(
+                    u64::try_from(chunk.len()).unwrap_or(0),
+                    std::sync::atomic::Ordering::Release,
+                );
+                self.cached_chunk_count.fetch_add(
+                    1,
+                    std::sync::atomic::Ordering::Release,
+                );
             }
         }
         anchor.sync()?;
+        {
+            let manifest_count = self.cached_manifest_count.load(
+                std::sync::atomic::Ordering::Acquire,
+            );
+            if manifest_count >= MAX_MANIFEST_OBJECTS {
+                return Err(Error::EffectBundleInvalid(
+                    format!("manifest object count limit {MAX_MANIFEST_OBJECTS} exceeded"),
+                ));
+            }
+        }
         anchor.atomic_write(
             &manifest_name,
             &encode_effect_bundle(&request.manifest_command)?,
         )?;
         anchor.sync()?;
+        self.cached_manifest_count.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Release,
+        );
         self.clear_staged_effect_pin(&bundle.binding)?;
         Ok(())
     }
@@ -4259,6 +4285,10 @@ impl RecorderFileStore {
                     continue;
                 }
                 self.effect_root_anchor.remove(&name)?;
+                self.cached_manifest_count.fetch_sub(
+                    1,
+                    std::sync::atomic::Ordering::Release,
+                );
                 removed += 1;
             }
         }
@@ -4346,29 +4376,33 @@ impl RecorderFileStore {
     fn init_chunk_counters_from_disk(&self) -> Result<()> {
         let mut total_bytes = 0u64;
         let mut count = 0usize;
+        let mut manifest_count = 0usize;
         for name in self.effect_root_anchor.list()? {
-            if !name.starts_with(EFFECT_CHUNK_PREFIX) {
-                continue;
+            if name.starts_with(EFFECT_CHUNK_PREFIX) {
+                if !self.is_effect_chunk_name(&name) {
+                    return Err(Error::EffectBundleInvalid(
+                        "invalid effect chunk name".into(),
+                    ));
+                }
+                let chunk = self.effect_root_anchor.read(
+                    &name,
+                    MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                    "effect chunk",
+                )?;
+                total_bytes = total_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
+                count += 1;
+            } else if name.starts_with(EFFECT_BUNDLE_PREFIX) {
+                manifest_count += 1;
             }
-            if !self.is_effect_chunk_name(&name) {
-                return Err(Error::EffectBundleInvalid(
-                    "invalid effect chunk name".into(),
-                ));
-            }
-            let chunk = self.effect_root_anchor.read(
-                &name,
-                MAX_EFFECT_BUNDLE_CHUNK_BYTES,
-                "effect chunk",
-            )?;
-            total_bytes = total_bytes
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
-            count += 1;
         }
         self.cached_chunk_usage
             .store(total_bytes, std::sync::atomic::Ordering::Release);
         self.cached_chunk_count
             .store(count, std::sync::atomic::Ordering::Release);
+        self.cached_manifest_count
+            .store(manifest_count, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -4417,7 +4451,24 @@ impl RecorderFileStore {
                     complete = false;
                     continue;
                 }
-                self.effect_root_anchor.remove(&name)?;
+                if let Ok(bytes) = self.effect_root_anchor.read(
+                    &name,
+                    MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                    "effect chunk",
+                ) {
+                    let len = bytes.len() as u64;
+                    self.effect_root_anchor.remove(&name)?;
+                    self.cached_chunk_usage.fetch_sub(
+                        len,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                    self.cached_chunk_count.fetch_sub(
+                        1,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                } else {
+                    self.effect_root_anchor.remove(&name)?;
+                }
                 removed += 1;
             }
         }
