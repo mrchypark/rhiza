@@ -798,3 +798,116 @@ fn certified_gc_preserves_active_and_reconfiguration_pins_under_anchor() {
     );
     assert_eq!(store.load_effect_bundle(swept.binding()).unwrap(), None);
 }
+
+#[test]
+fn parallel_cap_admission_succeeds_for_exactly_32_and_rejects_the_rest() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let chunk = b"parallel-cap-chunk".to_vec();
+
+    // Pre-generate 64 distinct bundles (1 chunk each).
+    let bundles: Vec<(RecorderEffectBundle, EffectBundleFinalizeRequest)> = (200..264u64)
+        .map(|slot| sql_qefx(&membership, vec![chunk.clone()], slot))
+        .collect();
+
+    // Use a barrier to release all 64 threads simultaneously, then count
+    // successes. Track which indices succeeded so later steps use a binding
+    // that was definitely admitted.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(64));
+    let success_indices: std::sync::Arc<std::sync::Mutex<Vec<usize>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let handles: Vec<_> = bundles
+        .iter()
+        .enumerate()
+        .map(|(idx, (bundle, request))| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let success_indices = std::sync::Arc::clone(&success_indices);
+            let store = store.clone();
+            let binding = bundle.binding().clone();
+            let manifest_command = request.manifest_command.clone();
+            let chunk_data = bundle.chunks()[0].clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result =
+                    store.stage_effect_bundle_chunk(&binding, &manifest_command, 0, &chunk_data);
+                if result.is_ok() {
+                    success_indices.lock().unwrap().push(idx);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let succeeded = success_indices.lock().unwrap();
+    assert_eq!(
+        succeeded.len(),
+        32,
+        "exactly 32 distinct bindings should be staged"
+    );
+
+    let &first_ok = &succeeded[0];
+    let (ref ok_bundle, ref ok_request) = bundles[first_ok];
+
+    // Retrying an already-admitted binding should succeed (idempotent).
+    store
+        .stage_effect_bundle_chunk(ok_bundle.binding(), &ok_request.manifest_command, 0, &chunk)
+        .unwrap();
+
+    // A new distinct binding should be rejected (cap still at 32).
+    let new = sql_qefx(&membership, vec![chunk.clone()], 300);
+    assert!(matches!(
+        store.stage_effect_bundle_chunk(new.0.binding(), &new.1.manifest_command, 0, &chunk,),
+        Err(Error::EffectBundleInvalid(_))
+    ));
+
+    // After finalizing one binding, a new one should be admitted.
+    drop(succeeded);
+    store
+        .finalize_staged_effect_bundle(ok_bundle.binding(), ok_request.manifest_command.clone())
+        .unwrap();
+    store
+        .stage_effect_bundle_chunk(new.0.binding(), &new.1.manifest_command, 0, &chunk)
+        .unwrap();
+}
+
+#[test]
+fn orphan_cas_file_after_crash_is_counted_in_quota() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, membership) = open_store(root.path());
+    let chunk = b"orphan-test-chunk".to_vec();
+
+    let (bundle, request) = sql_qefx(&membership, vec![chunk.clone()], 400);
+    store
+        .stage_effect_bundle_chunk(bundle.binding(), &request.manifest_command, 0, &chunk)
+        .unwrap();
+    let initial_usage = store.effect_chunk_usage_for_testing();
+    assert!(initial_usage > 0);
+
+    // Simulate a crash: clear the staged pin (memory lost) but CAS file
+    // persists on disk. The counter should still reflect the orphan.
+    store.clear_staged_effect_pin_for_testing(bundle.binding());
+
+    // Re-open the store to re-scan from disk.
+    drop(store);
+    let (store, _membership) = open_store(root.path());
+    let reopened_usage = store.effect_chunk_usage_for_testing();
+    assert_eq!(
+        initial_usage, reopened_usage,
+        "orphan should be counted in quota"
+    );
+
+    // Staging a new chunk should still respect the quota.
+    let new_chunk = b"new-chunk-after-crash".to_vec();
+    let (bundle2, request2) = sql_qefx(&membership, vec![new_chunk.clone()], 401);
+    store
+        .stage_effect_bundle_chunk(bundle2.binding(), &request2.manifest_command, 0, &new_chunk)
+        .unwrap();
+    assert!(
+        store.effect_chunk_usage_for_testing() > reopened_usage,
+        "new chunk should increase usage"
+    );
+}

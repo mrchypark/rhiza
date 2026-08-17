@@ -781,6 +781,14 @@ pub enum Error {
         limit: u64,
     },
     EffectBundleUnavailable,
+    /// The proposal was cancelled before any recorder recorded the slot.
+    ///
+    /// **Certainty guarantee:** `Cancelled` is a definite pre-mutation failure.
+    /// No recorder has durably accepted the operation, so a retry with the
+    /// same request id is always safe. This variant is only returned for
+    /// cancellations that occur *before* admission; once a recorder has
+    /// durably recorded a slot, any subsequent cancellation is normalised to
+    /// [`Error::UnknownOutcome`] by the consensus layer.
     Cancelled,
     /// The caller cancelled an RPC before a recorder acknowledged it.
     RpcCancelled,
@@ -4244,6 +4252,21 @@ impl RecorderFileStore {
         Ok(())
     }
 
+    /// Clear a staged pin without finalizing, to simulate a crash
+    /// where the CAS file persists but the pin is lost.
+    pub fn clear_staged_effect_pin_for_testing(&self, binding: &EffectBundleBinding) {
+        self.staged_effect_pins
+            .lock()
+            .unwrap()
+            .remove(&effect_bundle_binding_digest(binding));
+    }
+
+    /// Expose the current chunk byte usage for quota assertions.
+    pub fn effect_chunk_usage_for_testing(&self) -> u64 {
+        self.cached_chunk_usage
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn sweep_effect_bundle_manifests_unlocked(
         &self,
         through_slot: Slot,
@@ -4361,7 +4384,7 @@ impl RecorderFileStore {
         )
     }
 
-    fn effect_chunk_usage_unlocked(&self) -> Result<u64> {
+    pub(crate) fn effect_chunk_usage_unlocked(&self) -> Result<u64> {
         Ok(self
             .cached_chunk_usage
             .load(std::sync::atomic::Ordering::Acquire))
