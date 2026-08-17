@@ -1924,6 +1924,8 @@ pub struct RecorderFileStore {
     _root_lock: Arc<fs::File>,
     effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
     staged_effect_pins: Arc<Mutex<HashMap<LogHash, StagedEffectBundle>>>,
+    cached_chunk_usage: Arc<std::sync::atomic::AtomicU64>,
+    cached_chunk_count: Arc<std::sync::atomic::AtomicUsize>,
     sync: Arc<Mutex<()>>,
 }
 
@@ -1979,6 +1981,7 @@ const EFFECT_BUNDLE_GC_ANCHOR_MAGIC: &[u8; 4] = b"QEGC";
 const EFFECT_BUNDLE_GC_ANCHOR_VERSION: u16 = 1;
 const MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES: usize = 4 * 1024;
 const MAX_STAGED_EFFECT_BUNDLES: usize = 32;
+const STAGED_EFFECT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const STAGED_EFFECT_RESTAGE_REQUIRED: &str =
     "every effect chunk must be staged in the current process before finalization";
 const STORAGE_GENERATION_FILE: &str = ".rhiza-storage-generation";
@@ -2072,6 +2075,7 @@ pub struct EffectBundleGcPin {
 struct StagedEffectBundle {
     pin: EffectBundleGcPin,
     ordinals: BTreeSet<u16>,
+    last_touched: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -2901,6 +2905,8 @@ impl RecorderFileStore {
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
+                cached_chunk_usage: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                cached_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 sync: Arc::new(Mutex::new(())),
             },
             false,
@@ -2960,6 +2966,8 @@ impl RecorderFileStore {
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
+                cached_chunk_usage: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                cached_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 sync: Arc::new(Mutex::new(())),
             },
             true,
@@ -3087,6 +3095,7 @@ impl RecorderFileStore {
         store.recover_intent()?;
         store.open_or_initialize_recorded_head(existing_format)?;
         store.open_or_replay_wal()?;
+        store.init_chunk_counters_from_disk()?;
         Ok(store)
     }
 
@@ -3666,6 +3675,7 @@ impl RecorderFileStore {
         }
 
         let mut missing_bytes = 0u64;
+        let mut seen_digests = std::collections::HashSet::new();
         for (chunk, hash) in bundle.chunks.iter().zip(&bundle.chunk_hashes) {
             let name = self.effect_chunk_name(*hash);
             if let Some(existing) =
@@ -3674,7 +3684,7 @@ impl RecorderFileStore {
                 if existing != *chunk || effect_chunk_digest(&existing) != *hash {
                     return Err(Error::EffectBundleConflict);
                 }
-            } else {
+            } else if seen_digests.insert(*hash) {
                 missing_bytes = missing_bytes
                     .checked_add(u64::try_from(chunk.len()).map_err(|_| {
                         Error::EffectBundleInvalid("chunk length cannot fit u64".into())
@@ -3785,7 +3795,7 @@ impl RecorderFileStore {
             manifest_command: manifest_command.clone(),
         };
         {
-            let staged = self
+            let mut staged = self
                 .staged_effect_pins
                 .lock()
                 .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
@@ -3793,9 +3803,20 @@ impl RecorderFileStore {
                 Some(staged) if staged.pin != pin => return Err(Error::EffectBundleConflict),
                 Some(_) => {}
                 None if staged.len() >= MAX_STAGED_EFFECT_BUNDLES => {
-                    return Err(Error::EffectBundleInvalid(
-                        "too many staged effect bundles; limit is 32".into(),
-                    ));
+                    let now = std::time::Instant::now();
+                    let expired: Vec<LogHash> = staged
+                        .iter()
+                        .filter(|(_, v)| now.duration_since(v.last_touched) > STAGED_EFFECT_LEASE_TTL)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    for key in &expired {
+                        staged.remove(key);
+                    }
+                    if staged.len() >= MAX_STAGED_EFFECT_BUNDLES {
+                        return Err(Error::EffectBundleInvalid(
+                            "too many staged effect bundles; limit is 32".into(),
+                        ));
+                    }
                 }
                 None => {}
             }
@@ -3824,17 +3845,28 @@ impl RecorderFileStore {
             }
             self.effect_root_anchor.atomic_write(&name, chunk)?;
             self.effect_root_anchor.sync()?;
+            self.cached_chunk_usage.fetch_add(
+                u64::try_from(chunk.len()).unwrap_or(0),
+                std::sync::atomic::Ordering::Release,
+            );
+            self.cached_chunk_count.fetch_add(
+                1,
+                std::sync::atomic::Ordering::Release,
+            );
         }
         let mut staged = self
             .staged_effect_pins
             .lock()
             .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
+        let now = std::time::Instant::now();
         let entry = staged
             .entry(binding_digest)
             .or_insert_with(|| StagedEffectBundle {
                 pin: pin.clone(),
                 ordinals: BTreeSet::new(),
+                last_touched: now,
             });
+        entry.last_touched = now;
         if entry.pin != pin {
             return Err(Error::EffectBundleConflict);
         }
@@ -4306,7 +4338,14 @@ impl RecorderFileStore {
     }
 
     fn effect_chunk_usage_unlocked(&self) -> Result<u64> {
-        let mut total = 0u64;
+        Ok(self
+            .cached_chunk_usage
+            .load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn init_chunk_counters_from_disk(&self) -> Result<()> {
+        let mut total_bytes = 0u64;
+        let mut count = 0usize;
         for name in self.effect_root_anchor.list()? {
             if !name.starts_with(EFFECT_CHUNK_PREFIX) {
                 continue;
@@ -4321,11 +4360,16 @@ impl RecorderFileStore {
                 MAX_EFFECT_BUNDLE_CHUNK_BYTES,
                 "effect chunk",
             )?;
-            total = total
+            total_bytes = total_bytes
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
+            count += 1;
         }
-        Ok(total)
+        self.cached_chunk_usage
+            .store(total_bytes, std::sync::atomic::Ordering::Release);
+        self.cached_chunk_count
+            .store(count, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     fn reap_unreachable_effect_chunks_unlocked(
@@ -5195,9 +5239,20 @@ impl RecorderFileStore {
         Ok(())
     }
 
+    /// Checkpoint the current WAL contents to the effect root anchor.
+    ///
+    /// This function must preserve the in-memory WAL state until the on-disk
+    /// checkpoint is complete and the WAL file is truncated. If we clear the
+    /// in-memory state (via `std::mem::take`) before the disk writes finish,
+    /// concurrent readers will observe an empty WAL during the checkpoint I/O
+    /// window — a correctness violation that can lead to data loss.
+    ///
+    /// The fix clones the slot/command maps for disk writes and only clears the
+    /// WAL state after the truncate succeeds. On error the WAL state is
+    /// unchanged — no rollback logic is needed.
     fn checkpoint_wal_unlocked(&self) -> Result<()> {
         let (checkpoint, next_sequence, slots, commands) = {
-            let mut wal = self
+            let wal = self
                 .wal
                 .lock()
                 .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
@@ -5212,8 +5267,8 @@ impl RecorderFileStore {
             (
                 wal.checkpoint,
                 wal.next_sequence,
-                std::mem::take(&mut wal.slots),
-                std::mem::take(&mut wal.commands),
+                wal.slots.clone(),
+                wal.commands.clone(),
             )
         };
         let materialized = (|| -> Result<WalCheckpoint> {
@@ -5257,46 +5312,37 @@ impl RecorderFileStore {
             )?;
             Ok(next_checkpoint)
         })();
-        let next_checkpoint = match materialized {
-            Ok(next_checkpoint) => next_checkpoint,
-            Err(error) => {
+        match materialized {
+            Ok(next_checkpoint) => {
+                if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
+                    if let Ok(mut wal) = self.wal.lock() {
+                        wal.failed = true;
+                    }
+                    return Err(error);
+                }
                 let mut wal = self
                     .wal
                     .lock()
                     .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
-                if slots.iter().any(|(slot, bytes)| {
-                    matches!(wal.slots.get(slot), Some(existing) if existing != bytes)
-                }) || commands.iter().any(|(hash, command)| {
-                    matches!(wal.commands.get(hash), Some(existing) if existing != command)
-                }) {
-                    wal.failed = true;
-                    return Err(Error::Io("recorder WAL checkpoint rollback conflict".into()));
-                }
-                wal.slots.extend(slots);
-                wal.commands.extend(commands);
-                return Err(error);
+                wal.checkpoint = next_checkpoint;
+                wal.last_digest = LogHash::ZERO;
+                wal.frame_count = 0;
+                wal.byte_count = 0;
+                wal.slots.clear();
+                wal.commands.clear();
+                self.recent_slots
+                    .lock()
+                    .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+                    .clear();
+                Ok(())
             }
-        };
-        if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.failed = true;
+            Err(error) => {
+                // WAL state is unchanged — slots and commands were cloned,
+                // not taken. On error the in-memory WAL is consistent and
+                // concurrent readers see the original state.
+                Err(error)
             }
-            return Err(error);
         }
-        let mut wal = self
-            .wal
-            .lock()
-            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
-        wal.checkpoint = next_checkpoint;
-        wal.last_digest = LogHash::ZERO;
-        wal.frame_count = 0;
-        wal.byte_count = 0;
-        // slots and commands were already taken by std::mem::take() above.
-        self.recent_slots
-            .lock()
-            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
-            .clear();
-        Ok(())
     }
 
     fn sync_root(&self) -> Result<()> {
