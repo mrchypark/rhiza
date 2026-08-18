@@ -4047,6 +4047,12 @@ impl ObjectArchiveStore {
         }
 
         let mut results = Vec::with_capacity(plan.candidates.len());
+        // Each candidate deletion is fenced: validate_gc_fence re-reads the
+        // GC control object and verifies the barrier, fence, root, and lease
+        // state have not changed since the last check.  The caller-provided
+        // now_ms is used for the initial not-before gate; inside the loop the
+        // same timestamp is acceptable because the caller must not advance the
+        // clock backward and the barrier expiry is checked against it.
         for candidate in &plan.candidates {
             if let Err(error) = self.validate_gc_fence(&plan, now_ms).await {
                 return self.gc_report_after_stale(&plan, error).await;
