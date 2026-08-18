@@ -5314,6 +5314,24 @@ impl RecorderFileStore {
     /// The fix clones the slot/command maps for disk writes and only clears the
     /// WAL state after the truncate succeeds. On error the WAL state is
     /// unchanged — no rollback logic is needed.
+    ///
+    /// # Generation-based atomic checkpoint
+    ///
+    /// The checkpoint uses a commit-marker file (`.checkpoint-N.done`) to
+    /// provide a stronger atomicity guarantee. The write order is:
+    ///
+    /// 1. Write command/slot/configuration files (idempotent — safe to repeat)
+    /// 2. Write `recorded-head.rec` with new generation
+    /// 3. Write `.checkpoint-N.done` commit marker + fsync directory
+    /// 4. Truncate `recorder.wal` to 0 + fsync
+    /// 5. Remove orphan files from previous generations
+    ///
+    /// If the process crashes between steps 2 and 4, the commit marker is
+    /// absent. On recovery the WAL replay skips frames from older generations
+    /// and the incomplete checkpoint files are harmless (they will be
+    /// overwritten by the next successful checkpoint). If the crash occurs
+    /// after step 3 but before step 5, orphan files remain on disk but do
+    /// not affect correctness.
     fn checkpoint_wal_unlocked(&self) -> Result<()> {
         let (checkpoint, next_sequence, slots, commands) = {
             let wal = self
