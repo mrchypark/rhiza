@@ -3914,6 +3914,16 @@ impl ObjectArchiveStore {
         if let CheckpointBase::Snapshot(snapshot) = &root_manifest.base {
             root_references.insert(snapshot.object_key.clone());
         }
+        // Include QEFX effect objects (manifest + chunks) referenced by the
+        // root manifest so they are not classified as unreferenced during GC.
+        for segment in &root_manifest.segments {
+            for effect in &segment.effects {
+                root_references.insert(effect.manifest_object_key.clone());
+                for key in &effect.chunk_object_keys {
+                    root_references.insert(key.clone());
+                }
+            }
+        }
 
         let mut generations = control
             .generations
@@ -6447,8 +6457,51 @@ fn is_known_checkpoint_snapshot(identity: &CheckpointIdentity, key: &str) -> boo
             .all(|part| part.len() == 64 && part.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+/// Recognize QEFX effect objects stored under `effects/`:
+/// - `effects/{index:020}-{digest_hex}/binding.qefx` (manifest)
+/// - `effects/{index:020}-{digest_hex}/chunks/{ordinal:03}-{chunk_hex}.qefc` (chunks)
+fn is_known_checkpoint_effect(identity: &CheckpointIdentity, key: &str) -> bool {
+    let prefix = checkpoint_namespace(identity) + "/effects/";
+    let Some(relative) = key.strip_prefix(&prefix) else {
+        return false;
+    };
+    // All effect paths start with {index:020}-{64hex}/
+    let Some((index_digest, remainder)) = relative.split_once('/') else {
+        return false;
+    };
+    let Some((index_part, digest_part)) = index_digest.split_once('-') else {
+        return false;
+    };
+    let index_ok = index_part.len() == 20 && index_part.bytes().all(|b| b.is_ascii_digit());
+    let digest_ok = digest_part.len() == 64 && digest_part.bytes().all(|b| b.is_ascii_hexdigit());
+    if !index_ok || !digest_ok {
+        return false;
+    }
+    match remainder {
+        "binding.qefx" => true,
+        r if r.starts_with("chunks/") => {
+            let Some(file_name) = r.strip_prefix("chunks/") else {
+                return false;
+            };
+            let Some(file_name) = file_name.strip_suffix(".qefc") else {
+                return false;
+            };
+            let Some((ordinal, chunk_hex)) = file_name.split_once('-') else {
+                return false;
+            };
+            ordinal.len() == 3
+                && ordinal.bytes().all(|b| b.is_ascii_digit())
+                && chunk_hex.len() == 64
+                && chunk_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        _ => false,
+    }
+}
+
 fn is_known_checkpoint_object(identity: &CheckpointIdentity, key: &str) -> bool {
-    is_known_checkpoint_segment(identity, key) || is_known_checkpoint_snapshot(identity, key)
+    is_known_checkpoint_segment(identity, key)
+        || is_known_checkpoint_snapshot(identity, key)
+        || is_known_checkpoint_effect(identity, key)
 }
 
 fn is_known_retired_checkpoint_object(identity: &CheckpointIdentity, key: &str) -> bool {
@@ -10144,5 +10197,70 @@ mod tests {
             },
             chunks,
         )
+    }
+
+    fn test_effect_identity() -> CheckpointIdentity {
+        CheckpointIdentity::new("cluster-a", 7, 3, LogHash::digest(&[b"effect-test"]), 1)
+    }
+
+    #[test]
+    fn is_known_checkpoint_effect_recognizes_manifest_and_chunks() {
+        let identity = test_effect_identity();
+        let ns = checkpoint_namespace(&identity);
+
+        // Manifest
+        let manifest_key = format!(
+            "{ns}/effects/00000000000000000042-{}/binding.qefx",
+            "a".repeat(64)
+        );
+        assert!(is_known_checkpoint_effect(&identity, &manifest_key));
+
+        // Chunk
+        let chunk_key = format!(
+            "{ns}/effects/00000000000000000042-{}/chunks/000-{}.qefc",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        assert!(is_known_checkpoint_effect(&identity, &chunk_key));
+
+        // Wrong namespace
+        assert!(!is_known_checkpoint_effect(
+            &identity,
+            "other/effects/00000000000000000042-aaa/binding.qefx"
+        ));
+
+        // Invalid index length
+        let bad_index = format!(
+            "{ns}/effects/00000000000000000-{}/binding.qefx",
+            "a".repeat(64)
+        );
+        assert!(!is_known_checkpoint_effect(&identity, &bad_index));
+
+        // Invalid digest length
+        let bad_digest = format!("{ns}/effects/00000000000000000042-aaa/binding.qefx");
+        assert!(!is_known_checkpoint_effect(&identity, &bad_digest));
+
+        // Not an effect path
+        assert!(!is_known_checkpoint_effect(
+            &identity,
+            &format!("{ns}/segments/00000000000000000000-00000000000000000010.qlog")
+        ));
+    }
+
+    #[test]
+    fn is_known_checkpoint_object_includes_effects() {
+        let identity = test_effect_identity();
+        let ns = checkpoint_namespace(&identity);
+
+        // Segment
+        let seg = format!("{ns}/segments/00000000000000000000-00000000000000000010.qlog");
+        assert!(is_known_checkpoint_object(&identity, &seg));
+
+        // Effect manifest
+        let eff = format!(
+            "{ns}/effects/00000000000000000042-{}/binding.qefx",
+            "a".repeat(64)
+        );
+        assert!(is_known_checkpoint_object(&identity, &eff));
     }
 }
