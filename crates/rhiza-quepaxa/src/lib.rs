@@ -781,6 +781,14 @@ pub enum Error {
         limit: u64,
     },
     EffectBundleUnavailable,
+    /// The proposal was cancelled before any recorder recorded the slot.
+    ///
+    /// **Certainty guarantee:** `Cancelled` is a definite pre-mutation failure.
+    /// No recorder has durably accepted the operation, so a retry with the
+    /// same request id is always safe. This variant is only returned for
+    /// cancellations that occur *before* admission; once a recorder has
+    /// durably recorded a slot, any subsequent cancellation is normalised to
+    /// [`Error::UnknownOutcome`] by the consensus layer.
     Cancelled,
     /// The caller cancelled an RPC before a recorder acknowledged it.
     RpcCancelled,
@@ -1924,6 +1932,9 @@ pub struct RecorderFileStore {
     _root_lock: Arc<fs::File>,
     effect_root_anchor: Arc<anchored_fs::AnchoredDir>,
     staged_effect_pins: Arc<Mutex<HashMap<LogHash, StagedEffectBundle>>>,
+    cached_chunk_usage: Arc<std::sync::atomic::AtomicU64>,
+    cached_chunk_count: Arc<std::sync::atomic::AtomicUsize>,
+    cached_manifest_count: Arc<std::sync::atomic::AtomicUsize>,
     sync: Arc<Mutex<()>>,
 }
 
@@ -1978,6 +1989,9 @@ const EFFECT_BUNDLE_GC_ANCHOR_FILE: &str = ".effect-bundle-gc-anchor.rec";
 const EFFECT_BUNDLE_GC_ANCHOR_MAGIC: &[u8; 4] = b"QEGC";
 const EFFECT_BUNDLE_GC_ANCHOR_VERSION: u16 = 1;
 const MAX_EFFECT_BUNDLE_GC_ANCHOR_BYTES: usize = 4 * 1024;
+const MAX_STAGED_EFFECT_BUNDLES: usize = 32;
+const STAGED_EFFECT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const MAX_MANIFEST_OBJECTS: usize = 4096;
 const STAGED_EFFECT_RESTAGE_REQUIRED: &str =
     "every effect chunk must be staged in the current process before finalization";
 const STORAGE_GENERATION_FILE: &str = ".rhiza-storage-generation";
@@ -2071,6 +2085,7 @@ pub struct EffectBundleGcPin {
 struct StagedEffectBundle {
     pin: EffectBundleGcPin,
     ordinals: BTreeSet<u16>,
+    last_touched: std::time::Instant,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -2272,6 +2287,12 @@ fn validate_effect_chunks(chunks: &[Vec<u8>]) -> Result<()> {
 
 fn effect_chunk_digest(chunk: &[u8]) -> LogHash {
     ExternalEffectCommand::chunk_digest(chunk)
+}
+
+fn effect_chunk_quota_actual(current: u64, added: u64) -> Result<u64> {
+    current
+        .checked_add(added)
+        .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))
 }
 
 fn effect_digest(chunk_hashes: &[LogHash], chunk_lengths: &[u32], total_len: usize) -> LogHash {
@@ -2894,6 +2915,9 @@ impl RecorderFileStore {
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
+                cached_chunk_usage: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                cached_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cached_manifest_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 sync: Arc::new(Mutex::new(())),
             },
             false,
@@ -2953,6 +2977,9 @@ impl RecorderFileStore {
                 _root_lock: Arc::new(root_lock),
                 effect_root_anchor,
                 staged_effect_pins: Arc::new(Mutex::new(HashMap::new())),
+                cached_chunk_usage: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                cached_chunk_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                cached_manifest_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 sync: Arc::new(Mutex::new(())),
             },
             true,
@@ -3080,6 +3107,7 @@ impl RecorderFileStore {
         store.recover_intent()?;
         store.open_or_initialize_recorded_head(existing_format)?;
         store.open_or_replay_wal()?;
+        store.init_chunk_counters_from_disk()?;
         Ok(store)
     }
 
@@ -3659,6 +3687,7 @@ impl RecorderFileStore {
         }
 
         let mut missing_bytes = 0u64;
+        let mut seen_digests = std::collections::HashSet::new();
         for (chunk, hash) in bundle.chunks.iter().zip(&bundle.chunk_hashes) {
             let name = self.effect_chunk_name(*hash);
             if let Some(existing) =
@@ -3667,7 +3696,7 @@ impl RecorderFileStore {
                 if existing != *chunk || effect_chunk_digest(&existing) != *hash {
                     return Err(Error::EffectBundleConflict);
                 }
-            } else {
+            } else if seen_digests.insert(*hash) {
                 missing_bytes = missing_bytes
                     .checked_add(u64::try_from(chunk.len()).map_err(|_| {
                         Error::EffectBundleInvalid("chunk length cannot fit u64".into())
@@ -3699,14 +3728,32 @@ impl RecorderFileStore {
                 .is_none()
             {
                 anchor.atomic_write(&name, chunk)?;
+                self.cached_chunk_usage.fetch_add(
+                    u64::try_from(chunk.len()).unwrap_or(0),
+                    std::sync::atomic::Ordering::Release,
+                );
+                self.cached_chunk_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
             }
         }
         anchor.sync()?;
+        {
+            let manifest_count = self
+                .cached_manifest_count
+                .load(std::sync::atomic::Ordering::Acquire);
+            if manifest_count >= MAX_MANIFEST_OBJECTS {
+                return Err(Error::EffectBundleInvalid(format!(
+                    "manifest object count limit {MAX_MANIFEST_OBJECTS} exceeded"
+                )));
+            }
+        }
         anchor.atomic_write(
             &manifest_name,
             &encode_effect_bundle(&request.manifest_command)?,
         )?;
         anchor.sync()?;
+        self.cached_manifest_count
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         self.clear_staged_effect_pin(&bundle.binding)?;
         Ok(())
     }
@@ -3721,6 +3768,23 @@ impl RecorderFileStore {
         manifest_command: &StoredCommand,
         ordinal: u16,
         chunk: &[u8],
+    ) -> Result<()> {
+        self.stage_effect_bundle_chunk_with_quota(
+            binding,
+            manifest_command,
+            ordinal,
+            chunk,
+            DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES,
+        )
+    }
+
+    fn stage_effect_bundle_chunk_with_quota(
+        &self,
+        binding: &EffectBundleBinding,
+        manifest_command: &StoredCommand,
+        ordinal: u16,
+        chunk: &[u8],
+        quota_bytes: u64,
     ) -> Result<()> {
         let qefx = verified_effect_bundle_command(binding, manifest_command)?;
         let expected = qefx.chunks().get(usize::from(ordinal)).ok_or_else(|| {
@@ -3760,14 +3824,34 @@ impl RecorderFileStore {
             binding: binding.clone(),
             manifest_command: manifest_command.clone(),
         };
-        if self
-            .staged_effect_pins
-            .lock()
-            .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?
-            .get(&binding_digest)
-            .is_some_and(|staged| staged.pin != pin)
         {
-            return Err(Error::EffectBundleConflict);
+            let mut staged = self
+                .staged_effect_pins
+                .lock()
+                .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
+            match staged.get(&binding_digest) {
+                Some(staged) if staged.pin != pin => return Err(Error::EffectBundleConflict),
+                Some(_) => {}
+                None if staged.len() >= MAX_STAGED_EFFECT_BUNDLES => {
+                    let now = std::time::Instant::now();
+                    let expired: Vec<LogHash> = staged
+                        .iter()
+                        .filter(|(_, v)| {
+                            now.duration_since(v.last_touched) > STAGED_EFFECT_LEASE_TTL
+                        })
+                        .map(|(k, _)| *k)
+                        .collect();
+                    for key in &expired {
+                        staged.remove(key);
+                    }
+                    if staged.len() >= MAX_STAGED_EFFECT_BUNDLES {
+                        return Err(Error::EffectBundleInvalid(
+                            "too many staged effect bundles; limit is 32".into(),
+                        ));
+                    }
+                }
+                None => {}
+            }
         }
         let name = self.effect_chunk_name(expected.digest());
         if let Some(existing) = self.effect_root_anchor.read_optional(
@@ -3779,19 +3863,40 @@ impl RecorderFileStore {
                 return Err(Error::EffectBundleConflict);
             }
         } else {
+            let actual = effect_chunk_quota_actual(
+                self.effect_chunk_usage_unlocked()?,
+                u64::try_from(chunk.len()).map_err(|_| {
+                    Error::EffectBundleInvalid("chunk length cannot fit u64".into())
+                })?,
+            )?;
+            if actual > quota_bytes {
+                return Err(Error::EffectBundleQuotaExceeded {
+                    actual,
+                    limit: quota_bytes,
+                });
+            }
             self.effect_root_anchor.atomic_write(&name, chunk)?;
             self.effect_root_anchor.sync()?;
+            self.cached_chunk_usage.fetch_add(
+                u64::try_from(chunk.len()).unwrap_or(0),
+                std::sync::atomic::Ordering::Release,
+            );
+            self.cached_chunk_count
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         let mut staged = self
             .staged_effect_pins
             .lock()
             .map_err(|_| Error::Io("staged effect pin lock poisoned".into()))?;
+        let now = std::time::Instant::now();
         let entry = staged
             .entry(binding_digest)
             .or_insert_with(|| StagedEffectBundle {
                 pin: pin.clone(),
                 ordinals: BTreeSet::new(),
+                last_touched: now,
             });
+        entry.last_touched = now;
         if entry.pin != pin {
             return Err(Error::EffectBundleConflict);
         }
@@ -4147,6 +4252,21 @@ impl RecorderFileStore {
         Ok(())
     }
 
+    /// Clear a staged pin without finalizing, to simulate a crash
+    /// where the CAS file persists but the pin is lost.
+    pub fn clear_staged_effect_pin_for_testing(&self, binding: &EffectBundleBinding) {
+        self.staged_effect_pins
+            .lock()
+            .unwrap()
+            .remove(&effect_bundle_binding_digest(binding));
+    }
+
+    /// Expose the current chunk byte usage for quota assertions.
+    pub fn effect_chunk_usage_for_testing(&self) -> u64 {
+        self.cached_chunk_usage
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn sweep_effect_bundle_manifests_unlocked(
         &self,
         through_slot: Slot,
@@ -4184,6 +4304,8 @@ impl RecorderFileStore {
                     continue;
                 }
                 self.effect_root_anchor.remove(&name)?;
+                self.cached_manifest_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 removed += 1;
             }
         }
@@ -4262,27 +4384,43 @@ impl RecorderFileStore {
         )
     }
 
-    fn effect_chunk_usage_unlocked(&self) -> Result<u64> {
-        let mut total = 0u64;
+    pub(crate) fn effect_chunk_usage_unlocked(&self) -> Result<u64> {
+        Ok(self
+            .cached_chunk_usage
+            .load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn init_chunk_counters_from_disk(&self) -> Result<()> {
+        let mut total_bytes = 0u64;
+        let mut count = 0usize;
+        let mut manifest_count = 0usize;
         for name in self.effect_root_anchor.list()? {
-            if !name.starts_with(EFFECT_CHUNK_PREFIX) {
-                continue;
+            if name.starts_with(EFFECT_CHUNK_PREFIX) {
+                if !self.is_effect_chunk_name(&name) {
+                    return Err(Error::EffectBundleInvalid(
+                        "invalid effect chunk name".into(),
+                    ));
+                }
+                let chunk = self.effect_root_anchor.read(
+                    &name,
+                    MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                    "effect chunk",
+                )?;
+                total_bytes = total_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    Error::EffectBundleInvalid("quota accounting overflow".into())
+                })?;
+                count += 1;
+            } else if name.starts_with(EFFECT_BUNDLE_PREFIX) {
+                manifest_count += 1;
             }
-            if !self.is_effect_chunk_name(&name) {
-                return Err(Error::EffectBundleInvalid(
-                    "invalid effect chunk name".into(),
-                ));
-            }
-            let chunk = self.effect_root_anchor.read(
-                &name,
-                MAX_EFFECT_BUNDLE_CHUNK_BYTES,
-                "effect chunk",
-            )?;
-            total = total
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| Error::EffectBundleInvalid("quota accounting overflow".into()))?;
         }
-        Ok(total)
+        self.cached_chunk_usage
+            .store(total_bytes, std::sync::atomic::Ordering::Release);
+        self.cached_chunk_count
+            .store(count, std::sync::atomic::Ordering::Release);
+        self.cached_manifest_count
+            .store(manifest_count, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     fn reap_unreachable_effect_chunks_unlocked(
@@ -4330,7 +4468,20 @@ impl RecorderFileStore {
                     complete = false;
                     continue;
                 }
-                self.effect_root_anchor.remove(&name)?;
+                if let Ok(bytes) = self.effect_root_anchor.read(
+                    &name,
+                    MAX_EFFECT_BUNDLE_CHUNK_BYTES,
+                    "effect chunk",
+                ) {
+                    let len = bytes.len() as u64;
+                    self.effect_root_anchor.remove(&name)?;
+                    self.cached_chunk_usage
+                        .fetch_sub(len, std::sync::atomic::Ordering::Release);
+                    self.cached_chunk_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+                } else {
+                    self.effect_root_anchor.remove(&name)?;
+                }
                 removed += 1;
             }
         }
@@ -5152,9 +5303,20 @@ impl RecorderFileStore {
         Ok(())
     }
 
+    /// Checkpoint the current WAL contents to the effect root anchor.
+    ///
+    /// This function must preserve the in-memory WAL state until the on-disk
+    /// checkpoint is complete and the WAL file is truncated. If we clear the
+    /// in-memory state (via `std::mem::take`) before the disk writes finish,
+    /// concurrent readers will observe an empty WAL during the checkpoint I/O
+    /// window — a correctness violation that can lead to data loss.
+    ///
+    /// The fix clones the slot/command maps for disk writes and only clears the
+    /// WAL state after the truncate succeeds. On error the WAL state is
+    /// unchanged — no rollback logic is needed.
     fn checkpoint_wal_unlocked(&self) -> Result<()> {
         let (checkpoint, next_sequence, slots, commands) = {
-            let mut wal = self
+            let wal = self
                 .wal
                 .lock()
                 .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
@@ -5169,8 +5331,8 @@ impl RecorderFileStore {
             (
                 wal.checkpoint,
                 wal.next_sequence,
-                std::mem::take(&mut wal.slots),
-                std::mem::take(&mut wal.commands),
+                wal.slots.clone(),
+                wal.commands.clone(),
             )
         };
         let materialized = (|| -> Result<WalCheckpoint> {
@@ -5214,46 +5376,37 @@ impl RecorderFileStore {
             )?;
             Ok(next_checkpoint)
         })();
-        let next_checkpoint = match materialized {
-            Ok(next_checkpoint) => next_checkpoint,
-            Err(error) => {
+        match materialized {
+            Ok(next_checkpoint) => {
+                if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
+                    if let Ok(mut wal) = self.wal.lock() {
+                        wal.failed = true;
+                    }
+                    return Err(error);
+                }
                 let mut wal = self
                     .wal
                     .lock()
                     .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
-                if slots.iter().any(|(slot, bytes)| {
-                    matches!(wal.slots.get(slot), Some(existing) if existing != bytes)
-                }) || commands.iter().any(|(hash, command)| {
-                    matches!(wal.commands.get(hash), Some(existing) if existing != command)
-                }) {
-                    wal.failed = true;
-                    return Err(Error::Io("recorder WAL checkpoint rollback conflict".into()));
-                }
-                wal.slots.extend(slots);
-                wal.commands.extend(commands);
-                return Err(error);
+                wal.checkpoint = next_checkpoint;
+                wal.last_digest = LogHash::ZERO;
+                wal.frame_count = 0;
+                wal.byte_count = 0;
+                wal.slots.clear();
+                wal.commands.clear();
+                self.recent_slots
+                    .lock()
+                    .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
+                    .clear();
+                Ok(())
             }
-        };
-        if let Err(error) = self.effect_root_anchor.truncate(Self::WAL_FILE, 0) {
-            if let Ok(mut wal) = self.wal.lock() {
-                wal.failed = true;
+            Err(error) => {
+                // WAL state is unchanged — slots and commands were cloned,
+                // not taken. On error the in-memory WAL is consistent and
+                // concurrent readers see the original state.
+                Err(error)
             }
-            return Err(error);
         }
-        let mut wal = self
-            .wal
-            .lock()
-            .map_err(|_| Error::Io("recorder WAL lock poisoned".into()))?;
-        wal.checkpoint = next_checkpoint;
-        wal.last_digest = LogHash::ZERO;
-        wal.frame_count = 0;
-        wal.byte_count = 0;
-        // slots and commands were already taken by std::mem::take() above.
-        self.recent_slots
-            .lock()
-            .map_err(|_| Error::Io("recorder recent-slot lock poisoned".into()))?
-            .clear();
-        Ok(())
     }
 
     fn sync_root(&self) -> Result<()> {
@@ -13017,23 +13170,23 @@ mod tests {
     use super::{
         anchored_fs, capture_next_fetch_group_token, command_file_reads,
         count_control_budget_constructors_for, current_recorder_layout, decode_configuration_state,
-        decode_recorder_state, decode_wal_frame, encode_stored_command, encode_wal_frame,
-        ensure_storage_generation, force_next_control_group_drain_timeout, last_file_sync_kind,
-        lock_unpoison, pause_after_next_fetch_dispatch, pause_after_next_summary_dispatch,
-        pause_after_next_summary_provisional_none, prepare_fresh_recorder_root,
-        record_budget_identity_for, reset_command_file_reads, reset_sync_counts, sync_counts,
-        sync_wal_append, sync_wal_metadata, upsert_wal_command, AcceptedValue, BudgetIdentityEvent,
-        CertifiedDecisionInspection, ClusterId, ConfigChange, ConfigId, ConfigurationState,
-        Consensus, ControlCallBudget, ControlCallGroup, ControlDispatch, ControlJob,
-        ControlJobCancellation, ControlWorker, DecisionInspection, DecisionProof, DriveOutcome,
-        EffectBundleBinding, EffectBundleFinalizeRequest, Epoch, Error, ExternalEffectCommand,
-        FileSyncKind, Membership, PrioritySource, Proposal, ProposalPriority, ProposerProgress,
-        ReadFenceObservation, ReadFenceRequest, ReadFenceSlotState, RecordRequest, RecordSummary,
-        RecordedHeadProvenance, RecorderEffectBundle, RecorderFileStore, RecorderPostPreflightHook,
-        RecorderPreflight, RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState,
-        RecorderSummary, RejectReason, SealFaultPoint, SingleNodeConsensus, Slot,
-        ThreeNodeConsensus, RECORDER_POST_PREFLIGHT_HOOK, STORAGE_GENERATION_FILE,
-        STORAGE_GENERATION_FINGERPRINT,
+        decode_recorder_state, decode_wal_frame, effect_chunk_quota_actual, encode_stored_command,
+        encode_wal_frame, ensure_storage_generation, force_next_control_group_drain_timeout,
+        last_file_sync_kind, lock_unpoison, pause_after_next_fetch_dispatch,
+        pause_after_next_summary_dispatch, pause_after_next_summary_provisional_none,
+        prepare_fresh_recorder_root, record_budget_identity_for, reset_command_file_reads,
+        reset_sync_counts, sync_counts, sync_wal_append, sync_wal_metadata, upsert_wal_command,
+        AcceptedValue, BudgetIdentityEvent, CertifiedDecisionInspection, ClusterId, ConfigChange,
+        ConfigId, ConfigurationState, Consensus, ControlCallBudget, ControlCallGroup,
+        ControlDispatch, ControlJob, ControlJobCancellation, ControlWorker, DecisionInspection,
+        DecisionProof, DriveOutcome, EffectBundleBinding, EffectBundleFinalizeRequest, Epoch,
+        Error, ExternalEffectCommand, FileSyncKind, Membership, PrioritySource, Proposal,
+        ProposalPriority, ProposerProgress, ReadFenceObservation, ReadFenceRequest,
+        ReadFenceSlotState, RecordRequest, RecordSummary, RecordedHeadProvenance,
+        RecorderEffectBundle, RecorderFileStore, RecorderPostPreflightHook, RecorderPreflight,
+        RecorderRequest, RecorderRpc, RecorderRpcContext, RecorderSlotState, RecorderSummary,
+        RejectReason, SealFaultPoint, SingleNodeConsensus, Slot, ThreeNodeConsensus,
+        RECORDER_POST_PREFLIGHT_HOOK, STORAGE_GENERATION_FILE, STORAGE_GENERATION_FINGERPRINT,
     };
     #[cfg(feature = "test-hooks")]
     use super::{
@@ -15562,6 +15715,71 @@ mod tests {
         let bundle = RecorderEffectBundle::new(binding, chunks).unwrap();
         EffectBundleFinalizeRequest::new(bundle.clone(), manifest.clone()).unwrap();
         (membership, bundle, manifest)
+    }
+
+    #[test]
+    fn staged_effect_chunk_quota_counts_only_missing_cas_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let shared = b"quota-shared".to_vec();
+        let (membership, bundle, manifest) = effect_fetch_fixture_with_chunks(vec![shared.clone()]);
+        let store = RecorderFileStore::new_with_membership(
+            root.path(),
+            "n1",
+            "effect-fetch-cluster",
+            1,
+            1,
+            membership,
+        )
+        .unwrap();
+        let quota = shared.len() as u64;
+        store
+            .stage_effect_bundle_chunk_with_quota(bundle.binding(), &manifest, 0, &shared, quota)
+            .unwrap();
+        store
+            .stage_effect_bundle_chunk_with_quota(bundle.binding(), &manifest, 0, &shared, quota)
+            .unwrap();
+
+        let extra = b"x".to_vec();
+        let (_, extra_bundle, extra_manifest) =
+            effect_fetch_fixture_with_chunks(vec![extra.clone()]);
+        store
+            .stage_effect_bundle_chunk_with_quota(
+                extra_bundle.binding(),
+                &extra_manifest,
+                0,
+                &extra,
+                quota + 1,
+            )
+            .unwrap();
+
+        let rejected = b"yy".to_vec();
+        let (_, rejected_bundle, rejected_manifest) =
+            effect_fetch_fixture_with_chunks(vec![rejected.clone()]);
+        let rejected_path = root.path().join(format!(
+            "effect-chunk-{}.qefc",
+            ExternalEffectCommand::chunk_digest(&rejected).to_hex()
+        ));
+        assert_eq!(
+            store.stage_effect_bundle_chunk_with_quota(
+                rejected_bundle.binding(),
+                &rejected_manifest,
+                0,
+                &rejected,
+                quota + 2,
+            ),
+            Err(Error::EffectBundleQuotaExceeded {
+                actual: quota + 3,
+                limit: quota + 2,
+            })
+        );
+        assert!(!rejected_path.exists());
+        assert_eq!(store.effect_chunk_usage_unlocked().unwrap(), quota + 1);
+        assert_eq!(
+            effect_chunk_quota_actual(u64::MAX, 1),
+            Err(Error::EffectBundleInvalid(
+                "quota accounting overflow".into()
+            ))
+        );
     }
 
     fn effect_fetch_consensus(recorders: [ScriptedEffectFetchRecorder; 3]) -> ThreeNodeConsensus {

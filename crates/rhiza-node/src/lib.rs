@@ -6042,7 +6042,7 @@ fn client_write_path(path: &str) -> bool {
         return true;
     }
     #[cfg(feature = "kv")]
-    if matches!(path, KV_PUT_PATH | KV_DELETE_PATH) {
+    if matches!(path, KV_PUT_PATH | KV_DELETE_PATH | KV_BATCH_PATH) {
         return true;
     }
     false
@@ -13256,6 +13256,35 @@ mod tests {
         sql_query_http_response, NodeService, SqlCommand, SqlQueryResponse, SqlStatement, SqlValue,
         SqlWriteProfiler, MAX_SQL_RESPONSE_BYTES,
     };
+
+    #[test]
+    #[cfg(all(feature = "kv", feature = "sql"))]
+    fn client_write_path_covers_all_mutation_routes() {
+        use super::{
+            client_write_path, KV_BATCH_PATH, KV_DELETE_PATH, KV_PUT_PATH, SQL_EXECUTE_PATH,
+            WRITE_PATH,
+        };
+        let mut mutation_paths = vec![
+            WRITE_PATH,
+            SQL_EXECUTE_PATH,
+            KV_PUT_PATH,
+            KV_DELETE_PATH,
+            KV_BATCH_PATH,
+        ];
+        #[cfg(feature = "graph")]
+        {
+            mutation_paths.push(super::GRAPH_PUT_DOCUMENT_PATH);
+            mutation_paths.push(super::GRAPH_DELETE_DOCUMENT_PATH);
+        }
+        for path in mutation_paths {
+            assert!(
+                client_write_path(path),
+                "{path} must be classified as a write path"
+            );
+        }
+        assert!(!client_write_path("/v1/kv/get"));
+        assert!(!client_write_path("/v1/kv/scan"));
+    }
 
     struct PendingThenDataBody {
         state: u8,

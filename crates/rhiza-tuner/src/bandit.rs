@@ -250,6 +250,14 @@ fn sample_beta(rng: &mut impl Rng, alpha: f64, beta: f64) -> f64 {
     x / (x + y)
 }
 
+/// Sample from a standard normal distribution N(0,1) using the Box-Muller
+/// transform. Only one of the two independent normal samples is returned.
+fn sample_standard_normal(rng: &mut impl Rng) -> f64 {
+    let u1: f64 = rng.random();
+    let u2: f64 = rng.random();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
 /// Sample from a Gamma(shape, 1) distribution using Marsaglia and Tsang's method.
 fn sample_gamma(rng: &mut impl Rng, shape: f64) -> f64 {
     if shape < 1.0 {
@@ -263,7 +271,7 @@ fn sample_gamma(rng: &mut impl Rng, shape: f64) -> f64 {
             let mut x;
             let mut v;
             loop {
-                x = rng.random::<f64>();
+                x = sample_standard_normal(rng);
                 v = 1.0 + c * x;
                 if v > 0.0 {
                     break;
@@ -415,6 +423,34 @@ mod tests {
         for _ in 0..1000 {
             let v = sample_beta(&mut rng, 2.0, 5.0);
             assert!((0.0..=1.0).contains(&v), "sample_beta returned {v}");
+        }
+    }
+
+    #[test]
+    fn sample_gamma_has_correct_mean_and_variance() {
+        let mut rng = rand::rng();
+        let n = 10_000;
+        for &shape in &[0.5, 1.0, 2.0, 5.0, 10.0] {
+            let mut sum = 0.0;
+            let mut sum_sq = 0.0;
+            for _ in 0..n {
+                let s = sample_gamma(&mut rng, shape);
+                assert!(s > 0.0, "gamma sample must be positive, got {s}");
+                sum += s;
+                sum_sq += s * s;
+            }
+            let mean = sum / n as f64;
+            let variance = sum_sq / n as f64 - mean * mean;
+            let rel_err_mean = (mean - shape).abs() / shape;
+            let rel_err_var = (variance - shape).abs() / shape;
+            assert!(
+                rel_err_mean < 0.1,
+                "Gamma({shape}) mean {mean} too far from {shape}"
+            );
+            assert!(
+                rel_err_var < 0.15,
+                "Gamma({shape}) variance {variance} too far from {shape}"
+            );
         }
     }
 }

@@ -130,7 +130,7 @@ validate() {
     require_row "$file" 'Recorder generation and lock' 'rhiza-quepaxa' "$(code '.rhiza-storage-generation')" 'clean-v1' 'reject open/install'
     require_row "$file" 'Recorder decision state' 'rhiza-quepaxa' "$(code 'recorder.wal')" "\`QWAL\` v$recorder_wal_version" 'conflict fails closed'
     require_row "$file" 'Recorder configuration/commands' 'rhiza-quepaxa' "$(code 'configuration.rec')" "\`QCON\` v$configuration_version" 'content-hash checks'
-    require_row "$file" 'Recorder effects and GC fence' 'rhiza-quepaxa' "$(code '.effect-bundle-gc-anchor.rec')" "$qegc_token" 'staged chunk ACKs are process-local' 'restage every chunk after restart' 'unsafe deletion fails closed'
+    require_row "$file" 'Recorder effects and GC fence' 'rhiza-quepaxa' "$(code '.effect-bundle-gc-anchor.rec')" "$qegc_token" 'staged chunk ACKs are process-local' "at most $max_staged_effect_bundles process-local staged bindings" "stage and finalize share the $effect_bundle_store_quota_mib MiB effect-chunk quota" 'restage every chunk after restart' 'unsafe deletion fails closed'
     require_row "$file" 'SQL materialization and control' 'rhiza-sql' "$(code '.rhiza-control.sqlite')" "\`QCTL\` schema v$sql_control_version" 'install snapshot rather than auto-migrate'
     require_row "$file" 'KV materialization' 'rhiza-kv' "$(code '<data>/kv/data.redb')" "$kv_snapshot_token" 'replay continuity'
     require_row "$file" 'Graph materialization' 'rhiza-graph' "$(code '<data>/ladybug/graph.lbug')" "$graph_snapshot_token" 'checked before use'
@@ -147,6 +147,7 @@ validate() {
     source_contains crates/rhiza-log/src/lib.rs 'pub const QLOG_FORMAT_VERSION'
     source_contains crates/rhiza-quepaxa/src/lib.rs 'const RECORDER_WAL_MAGIC: &[u8; 4] = b"QWAL";'
     source_contains crates/rhiza-quepaxa/src/lib.rs 'const STAGED_EFFECT_RESTAGE_REQUIRED: &str ='
+    source_contains crates/rhiza-quepaxa/src/lib.rs 'const MAX_STAGED_EFFECT_BUNDLES: usize ='
     source_contains crates/rhiza-archive/src/lib.rs 'pub const CHECKPOINT_FORMAT_VERSION'
     source_contains crates/rhiza-node/src/durability.rs 'const RESTORE_RECEIPT_FILE: &str = ".rhiza-checkpoint-install.json";'
     source_contains crates/rhiza-node/src/admin.rs 'const ADMIN_OPERATION_LEDGER_FILE: &str = "admin-operations-v2.json";'
@@ -196,6 +197,11 @@ admin_ledger_max_bytes=$(const_product crates/rhiza-node/src/admin.rs ADMIN_OPER
 admin_ledger_max_records=$(const_version crates/rhiza-node/src/admin.rs ADMIN_OPERATION_LEDGER_MAX_RECORDS)
 admin_result_max_bytes=$(const_product crates/rhiza-node/src/admin.rs ADMIN_OPERATION_RESULT_MAX_BYTES)
 admin_retention_secs=$(const_product crates/rhiza-node/src/admin.rs ADMIN_OPERATION_RETENTION_SECS)
+max_staged_effect_bundles=$(const_version crates/rhiza-quepaxa/src/lib.rs MAX_STAGED_EFFECT_BUNDLES)
+effect_bundle_store_quota_bytes=$(const_product crates/rhiza-quepaxa/src/lib.rs DEFAULT_EFFECT_BUNDLE_STORE_QUOTA_BYTES)
+effect_bundle_store_quota_mib=$((effect_bundle_store_quota_bytes / 1024 / 1024))
+[ "$max_staged_effect_bundles" = 32 ] || fail 'staged effect bundle limit must remain 32'
+[ "$effect_bundle_store_quota_bytes" = $((256 * 1024 * 1024)) ] || fail 'effect chunk store quota must remain exactly 256 MiB'
 
 validate "$contract_file"
 
@@ -235,6 +241,8 @@ negative_token control-intent-bound "$(code 'CONTROL_INTENT_MAX_BYTES') = $contr
 negative_token qefx "$qefx_token"
 negative_token qegc "$qegc_token"
 negative_token staged-effect-process-local 'staged chunk ACKs are process-local'
+negative_token staged-effect-bundle-limit "at most $max_staged_effect_bundles process-local staged bindings"
+negative_token staged-effect-byte-quota "stage and finalize share the $effect_bundle_store_quota_mib MiB effect-chunk quota"
 negative_token staged-effect-restage 'restage every chunk after restart'
 negative_token kv-snapshot "$kv_snapshot_token"
 negative_token graph-snapshot "$graph_snapshot_token"
