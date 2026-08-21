@@ -12,7 +12,7 @@ use std::path::Path;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 use rhiza_core::{
-    ConfigChange, EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash,
+    ConfigurationState, EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash,
     ReplicatedCommandEnvelope,
 };
 use tempfile::NamedTempFile;
@@ -37,6 +37,7 @@ const META_CLUSTER_ID: &str = "cluster_id";
 const META_NODE_ID: &str = "node_id";
 const META_EPOCH: &str = "epoch";
 const META_CONFIG_ID: &str = "config_id";
+const META_CONFIG_DIGEST: &str = "config_digest";
 const META_APPLIED_INDEX: &str = "applied_index";
 const META_APPLIED_HASH: &str = "applied_hash";
 const META_MATERIALIZER_FINGERPRINT: &str = "materializer_fingerprint";
@@ -838,7 +839,10 @@ pub struct RedbStateMachine {
     cluster_id: String,
     node_id: String,
     epoch: u64,
-    config_id: u64,
+    config_id: std::sync::atomic::AtomicU64,
+    /// The configuration digest is updated atomically with config_id
+    /// when a ConfigChange entry transitions to a successor config.
+    config_digest: std::sync::Mutex<rhiza_core::LogHash>,
 }
 
 impl RedbStateMachine {
@@ -849,6 +853,23 @@ impl RedbStateMachine {
         node_id: impl Into<String>,
         epoch: u64,
         config_id: u64,
+    ) -> Result<Self, Error> {
+        Self::open_with_digest(path, cluster_id, node_id, epoch, config_id, LogHash::ZERO)
+    }
+
+    /// Open or create a KV state machine with an explicit config digest.
+    /// The digest is persisted and used for configuration transition
+    /// validation. Use [`Self::open`] when the digest is not yet known
+    /// (e.g. during initial bootstrap the digest defaults to `LogHash::ZERO`
+    /// and is updated on the first ConfigChange).
+    #[tracing::instrument(level = "info", skip_all, fields(epoch, config_id))]
+    pub fn open_with_digest(
+        path: impl AsRef<Path>,
+        cluster_id: impl Into<String>,
+        node_id: impl Into<String>,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
     ) -> Result<Self, Error> {
         let cluster_id = cluster_id.into();
         let node_id = node_id.into();
@@ -862,6 +883,23 @@ impl RedbStateMachine {
         }
         let database = Database::create(path).map_err(database_error)?;
         initialize_or_validate(&database, &cluster_id, &node_id, epoch, config_id)?;
+        let stored_digest = load_config_digest(&database)?;
+        // If the stored digest is ZERO (new database), persist the provided
+        // digest so future transitions can validate against it.
+        if stored_digest == LogHash::ZERO && config_digest != LogHash::ZERO {
+            let write = database.begin_write().map_err(database_error)?;
+            let mut progress = write.open_table(PROGRESS_TABLE).map_err(database_error)?;
+            progress
+                .insert(META_CONFIG_DIGEST, config_digest.as_bytes().as_slice())
+                .map_err(database_error)?;
+            drop(progress);
+            write.commit().map_err(database_error)?;
+        }
+        let effective_digest = if stored_digest == LogHash::ZERO {
+            config_digest
+        } else {
+            stored_digest
+        };
         tracing::info!(
             cluster_id,
             node_id,
@@ -874,7 +912,8 @@ impl RedbStateMachine {
             cluster_id,
             node_id,
             epoch,
-            config_id,
+            config_id: std::sync::atomic::AtomicU64::new(config_id),
+            config_digest: std::sync::Mutex::new(effective_digest),
         })
     }
 
@@ -1034,7 +1073,7 @@ impl RedbStateMachine {
             &self.cluster_id,
             &self.node_id,
             self.epoch,
-            self.config_id,
+            self.config_id.load(std::sync::atomic::Ordering::Acquire),
         )?;
         let applied_index = snapshot_u64_meta(&progress, META_APPLIED_INDEX)?;
         if applied_index != target_index {
@@ -1090,7 +1129,7 @@ impl RedbStateMachine {
             cluster_id: self.cluster_id.clone(),
             created_by: self.node_id.clone(),
             epoch: self.epoch,
-            config_id: self.config_id,
+            config_id: self.config_id.load(std::sync::atomic::Ordering::Acquire),
             applied_index,
             applied_hash,
             materializer_fingerprint: kv_materializer_fingerprint(),
@@ -1287,6 +1326,7 @@ impl RedbStateMachine {
             ));
         }
 
+        let mut pending_config_transition: Option<(u64, LogHash)> = None;
         let result = match entry.entry_type {
             EntryType::Command => {
                 let commands = decoded_commands
@@ -1355,8 +1395,28 @@ impl RedbStateMachine {
                 None
             }
             EntryType::ConfigChange => {
-                ConfigChange::recognize_parts(entry.entry_type, &entry.payload)
-                    .map_err(|_| Error::InvalidEntry("invalid configuration change".into()))?;
+                let digest = *self
+                    .config_digest
+                    .lock()
+                    .map_err(|_| Error::InvalidEntry("config digest lock poisoned".into()))?;
+                let current_config = ConfigurationState::active(
+                    self.config_id.load(std::sync::atomic::Ordering::Acquire),
+                    digest,
+                );
+                let next_config = current_config
+                    .validate_entry(entry)
+                    .map_err(|error| Error::InvalidEntry(format!("config transition: {error}")))?;
+                let next_id = next_config.config_id();
+                let next_digest = next_config.digest();
+                // Persist the new configuration state to the progress table.
+                progress
+                    .insert(META_CONFIG_ID, next_id.to_be_bytes().as_slice())
+                    .map_err(database_error)?;
+                progress
+                    .insert(META_CONFIG_DIGEST, next_digest.as_bytes().as_slice())
+                    .map_err(database_error)?;
+                // Defer in-memory update until after commit succeeds.
+                pending_config_transition = Some((next_id, next_digest));
                 None
             }
             EntryType::SnapshotBarrier | EntryType::SnapshotPublished => None,
@@ -1389,6 +1449,22 @@ impl RedbStateMachine {
         drop(progress);
         write.commit().map_err(database_error)?;
 
+        // Apply in-memory config transition after successful commit.
+        if let Some((next_id, next_digest)) = pending_config_transition {
+            self.config_id
+                .store(next_id, std::sync::atomic::Ordering::Release);
+            *self
+                .config_digest
+                .lock()
+                .map_err(|_| Error::InvalidEntry("config digest lock poisoned".into()))? =
+                next_digest;
+            tracing::info!(
+                old_config_id = entry.config_id,
+                new_config_id = next_id,
+                "kv config transition applied"
+            );
+        }
+
         Ok(ApplyOutcome {
             applied_index: entry.index,
             applied_hash: entry.hash,
@@ -1405,7 +1481,7 @@ impl RedbStateMachine {
         if entry.epoch != self.epoch {
             return Err(Error::InvalidEntry("entry epoch does not match".into()));
         }
-        if entry.config_id != self.config_id {
+        if entry.config_id != self.config_id.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::InvalidEntry(
                 "entry configuration id does not match".into(),
             ));
@@ -1685,6 +1761,9 @@ fn initialize_or_validate(
             require_meta(&progress, META_NODE_ID, node_id.as_bytes())?;
             require_meta(&progress, META_EPOCH, &epoch.to_be_bytes())?;
             require_meta(&progress, META_CONFIG_ID, &config_id.to_be_bytes())?;
+            // META_CONFIG_DIGEST may not exist in databases created before
+            // config digest tracking. Its absence is tolerated (defaults to
+            // LogHash::ZERO via load_config_digest).
             require_meta(
                 &progress,
                 META_MATERIALIZER_FINGERPRINT,
@@ -1716,6 +1795,9 @@ fn initialize_or_validate(
         .map_err(database_error)?;
     progress
         .insert(META_CONFIG_ID, config_id.to_be_bytes().as_slice())
+        .map_err(database_error)?;
+    progress
+        .insert(META_CONFIG_DIGEST, LogHash::ZERO.as_bytes().as_slice())
         .map_err(database_error)?;
     progress
         .insert(META_APPLIED_INDEX, 0_u64.to_be_bytes().as_slice())
@@ -1778,6 +1860,24 @@ fn read_hash_meta(
         .try_into()
         .map_err(|_| Error::Database(format!("invalid hash progress metadata {key}")))?;
     Ok(LogHash::from_bytes(bytes))
+}
+
+/// Load the persisted config digest from the progress table.
+/// Returns `LogHash::ZERO` for databases created before config_digest
+/// tracking was added.
+fn load_config_digest(database: &Database) -> Result<LogHash, Error> {
+    let read = database.begin_read().map_err(database_error)?;
+    let progress = read.open_table(PROGRESS_TABLE).map_err(database_error)?;
+    match progress.get(META_CONFIG_DIGEST).map_err(database_error)? {
+        Some(value) => {
+            let bytes: [u8; 32] = value
+                .value()
+                .try_into()
+                .map_err(|_| Error::Database("invalid config_digest progress metadata".into()))?;
+            Ok(LogHash::from_bytes(bytes))
+        }
+        None => Ok(LogHash::ZERO),
+    }
 }
 
 fn read_tip(table: &impl ReadableTable<&'static str, &'static [u8]>) -> Result<KvReadTip, Error> {

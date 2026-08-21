@@ -822,6 +822,43 @@ impl CheckpointEffectRecord {
     pub const fn entry_index(&self) -> LogIndex {
         self.entry_index
     }
+
+    /// Returns true when the three legacy chunk arrays are all empty,
+    /// meaning chunk keys are deterministically derived from the manifest
+    /// binding (the "compact" format).
+    pub fn is_compact_format(&self) -> bool {
+        self.chunk_object_keys.is_empty()
+            && self.chunk_sha256.is_empty()
+            && self.chunk_size_bytes.is_empty()
+    }
+
+    /// Returns all object keys referenced by this effect record.
+    ///
+    /// - **Always includes** the manifest object key.
+    /// - **Legacy format** (`chunk_object_keys` populated): includes the
+    ///   stored chunk keys directly.
+    /// - **Compact format** (empty chunk arrays): requires the decoded
+    ///   QEFX command to derive deterministic chunk keys from the manifest
+    ///   binding. The caller MUST pass the command decoded from the
+    ///   manifest; passing `None` for a compact record is a logic error.
+    pub fn all_object_keys(
+        &self,
+        effect_prefix: &str,
+        command: Option<&ExternalEffectCommand>,
+    ) -> Vec<String> {
+        let mut keys = vec![format!("{effect_prefix}/binding.qefx")];
+        if !self.is_compact_format() {
+            keys.extend(self.chunk_object_keys.iter().cloned());
+        } else if let Some(cmd) = command {
+            for (ordinal, expected) in cmd.chunks().iter().enumerate() {
+                keys.push(format!(
+                    "{effect_prefix}/chunks/{ordinal:03}-{}.qefc",
+                    expected.digest().to_hex()
+                ));
+            }
+        }
+        keys
+    }
 }
 
 /// Verified bytes for one checkpoint-owned QEFX reference.
@@ -3916,11 +3953,38 @@ impl ObjectArchiveStore {
         }
         // Include QEFX effect objects (manifest + chunks) referenced by the
         // root manifest so they are not classified as unreferenced during GC.
+        // For compact-format records the chunk arrays are empty; we must
+        // download the manifest to derive deterministic chunk keys.
         for segment in &root_manifest.segments {
             for effect in &segment.effects {
-                root_references.insert(effect.manifest_object_key.clone());
-                for key in &effect.chunk_object_keys {
-                    root_references.insert(key.clone());
+                if effect.is_compact_format() {
+                    // Download manifest to derive chunk keys.
+                    let manifest_bytes = self
+                        .download_verified(
+                            &effect.manifest_object_key,
+                            effect.manifest_size_bytes,
+                            &effect.manifest_sha256,
+                        )
+                        .await?;
+                    let cmd = ExternalEffectCommand::decode(&manifest_bytes).map_err(|error| {
+                        Error::InvalidCheckpoint(format!(
+                            "cannot decode compact QEFX for GC root: {error}"
+                        ))
+                    })?;
+                    let prefix = checkpoint_effect_prefix(
+                        root_manifest.identity(),
+                        effect.entry_index(),
+                        cmd.effect_digest_value(),
+                    );
+                    for key in effect.all_object_keys(&prefix, Some(&cmd)) {
+                        root_references.insert(key);
+                    }
+                } else {
+                    // Legacy format: chunk_object_keys is populated.
+                    for key in &effect.chunk_object_keys {
+                        root_references.insert(key.clone());
+                    }
+                    root_references.insert(effect.manifest_object_key.clone());
                 }
             }
         }
@@ -10268,5 +10332,47 @@ mod tests {
             "a".repeat(64)
         );
         assert!(is_known_checkpoint_object(&identity, &eff));
+    }
+
+    #[test]
+    fn effect_record_all_object_keys_legacy_and_compact() {
+        let identity = test_effect_identity();
+        let ns = checkpoint_namespace(&identity);
+        let prefix = format!("{ns}/effects/00000000000000000042-{}", "a".repeat(64));
+
+        // Legacy format: chunk_object_keys populated.
+        let legacy = CheckpointEffectRecord {
+            entry_index: 42,
+            manifest_object_key: format!("{prefix}/binding.qefx"),
+            manifest_sha256: "b".repeat(64),
+            manifest_size_bytes: 100,
+            chunk_object_keys: vec![
+                format!("{prefix}/chunks/000-{}.qefc", "c".repeat(64)),
+                format!("{prefix}/chunks/001-{}.qefc", "d".repeat(64)),
+            ],
+            chunk_sha256: vec!["e".repeat(64), "f".repeat(64)],
+            chunk_size_bytes: vec![200, 300],
+        };
+        assert!(!legacy.is_compact_format());
+        let keys = legacy.all_object_keys(&prefix, None);
+        assert_eq!(keys.len(), 3); // manifest + 2 chunks
+        assert!(keys.contains(&format!("{prefix}/binding.qefx")));
+
+        // Compact format: chunk arrays empty, command provided.
+        let compact = CheckpointEffectRecord {
+            entry_index: 42,
+            manifest_object_key: format!("{prefix}/binding.qefx"),
+            manifest_sha256: "b".repeat(64),
+            manifest_size_bytes: 100,
+            chunk_object_keys: vec![],
+            chunk_sha256: vec![],
+            chunk_size_bytes: vec![],
+        };
+        assert!(compact.is_compact_format());
+
+        // With command=None for compact, only manifest is returned.
+        let keys_no_cmd = compact.all_object_keys(&prefix, None);
+        assert_eq!(keys_no_cmd.len(), 1);
+        assert_eq!(keys_no_cmd[0], format!("{prefix}/binding.qefx"));
     }
 }

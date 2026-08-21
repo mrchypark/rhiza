@@ -16,7 +16,8 @@ use std::{
 
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use rhiza_core::{
-    EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex, ReplicatedCommandEnvelope,
+    ConfigurationState, EntryType, ExecutionProfile, LogAnchor, LogEntry, LogHash, LogIndex,
+    ReplicatedCommandEnvelope,
 };
 use tempfile::NamedTempFile;
 
@@ -851,12 +852,13 @@ struct Identity {
     node_id: String,
     epoch: u64,
     config_id: u64,
+    config_digest: LogHash,
 }
 
 /// Authoritative LadybugDB materialized state guarded by a single local writer.
 pub struct LadybugStateMachine {
     path: PathBuf,
-    identity: Identity,
+    identity: Mutex<Identity>,
     database: RwLock<Option<Database>>,
     writer: Mutex<()>,
 }
@@ -874,6 +876,23 @@ impl LadybugStateMachine {
         epoch: u64,
         config_id: u64,
     ) -> Result<Self> {
+        Self::open_with_digest(path, cluster_id, node_id, epoch, config_id, LogHash::ZERO)
+    }
+
+    /// Open or create a Graph state machine with an explicit config digest.
+    #[tracing::instrument(
+        level = "info",
+        skip_all,
+        fields(cluster_id, node_id, epoch, config_id)
+    )]
+    pub fn open_with_digest(
+        path: impl AsRef<Path>,
+        cluster_id: &str,
+        node_id: &str,
+        epoch: u64,
+        config_id: u64,
+        config_digest: LogHash,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         ensure_parent(&path)?;
         let identity = Identity {
@@ -881,6 +900,7 @@ impl LadybugStateMachine {
             node_id: node_id.into(),
             epoch,
             config_id,
+            config_digest,
         };
         let database = open_database(&path)?;
         initialize_or_validate(&database, &identity)?;
@@ -893,7 +913,7 @@ impl LadybugStateMachine {
         );
         Ok(Self {
             path,
-            identity,
+            identity: Mutex::new(identity),
             database: RwLock::new(Some(database)),
             writer: Mutex::new(()),
         })
@@ -1132,11 +1152,15 @@ impl LadybugStateMachine {
         *guard = Some(open_database(&self.path)?);
         let db_bytes = read_result?;
         let storage_version = lbug::get_storage_version();
+        let id = self
+            .identity
+            .lock()
+            .map_err(|_| Error::Ladybug("identity lock poisoned".into()))?;
         let mut snapshot = LadybugSnapshot {
-            cluster_id: self.identity.cluster_id.clone(),
-            created_by: self.identity.node_id.clone(),
-            epoch: self.identity.epoch,
-            config_id: self.identity.config_id,
+            cluster_id: id.cluster_id.clone(),
+            created_by: id.node_id.clone(),
+            epoch: id.epoch,
+            config_id: id.config_id,
             applied_index,
             applied_hash,
             storage_version,
@@ -1144,6 +1168,7 @@ impl LadybugStateMachine {
             digest: LogHash::ZERO,
             db_bytes,
         };
+        drop(id);
         snapshot.digest = snapshot.recompute_digest();
         Ok(snapshot)
     }
@@ -1154,16 +1179,21 @@ impl LadybugStateMachine {
         entry: &LogEntry,
         commands: &[DecodedGraphCommand],
     ) -> Result<ApplyOutcome> {
-        validate_identity(connection, &self.identity)?;
-        if entry.cluster_id != self.identity.cluster_id {
+        let id = self
+            .identity
+            .lock()
+            .map_err(|_| Error::Ladybug("identity lock poisoned".into()))?;
+        validate_identity(connection, &id)?;
+        if entry.cluster_id != id.cluster_id {
             return Err(Error::IdentityMismatch("cluster_id".into()));
         }
-        if entry.epoch != self.identity.epoch {
+        if entry.epoch != id.epoch {
             return Err(Error::IdentityMismatch("epoch".into()));
         }
-        if entry.config_id != self.identity.config_id {
+        if entry.config_id != id.config_id {
             return Err(Error::IdentityMismatch("config_id".into()));
         }
+        drop(id);
 
         let (current_index, current_hash) = materialized_tip(connection)?;
         if entry.index == current_index {
@@ -1230,10 +1260,36 @@ impl LadybugStateMachine {
                 }
                 (results.len() == 1).then(|| results.remove(0))
             }
-            EntryType::ConfigChange
-            | EntryType::SnapshotBarrier
-            | EntryType::SnapshotPublished
-            | EntryType::Noop => None,
+            EntryType::ConfigChange => {
+                let id = self
+                    .identity
+                    .lock()
+                    .map_err(|_| Error::Ladybug("identity lock poisoned".into()))?;
+                let current_config = ConfigurationState::active(id.config_id, id.config_digest);
+                let next_config = current_config
+                    .validate_entry(entry)
+                    .map_err(|error| Error::InvalidEntry(format!("config transition: {error}")))?;
+                let next_id = next_config.config_id();
+                let next_digest = next_config.digest();
+                // Persist the new configuration to the metadata table.
+                set_meta(connection, "config_id", &next_id.to_string())?;
+                set_meta(connection, "config_digest", &next_digest.to_hex())?;
+                drop(id);
+                // Update in-memory identity.
+                let mut id = self
+                    .identity
+                    .lock()
+                    .map_err(|_| Error::Ladybug("identity lock poisoned".into()))?;
+                id.config_id = next_id;
+                id.config_digest = next_digest;
+                tracing::info!(
+                    old_config_id = entry.config_id,
+                    new_config_id = next_id,
+                    "graph config transition applied"
+                );
+                None
+            }
+            EntryType::SnapshotBarrier | EntryType::SnapshotPublished | EntryType::Noop => None,
         };
 
         set_materialized_tip(connection, entry.index, entry.hash)?;
@@ -1587,6 +1643,11 @@ fn initialize_or_validate(database: &Database, identity: &Identity) -> Result<()
             create_meta(&connection, "node_id", &identity.node_id)?;
             create_meta(&connection, "epoch", &identity.epoch.to_string())?;
             create_meta(&connection, "config_id", &identity.config_id.to_string())?;
+            create_meta(
+                &connection,
+                "config_digest",
+                &identity.config_digest.to_hex(),
+            )?;
             create_meta(&connection, "applied_index", "0")?;
             create_meta(&connection, "applied_hash", &LogHash::ZERO.to_hex())?;
             create_meta(&connection, "schema_version", SCHEMA_VERSION)?;
@@ -5175,11 +5236,12 @@ mod query_tests {
             node_id: "node-1".into(),
             epoch: 7,
             config_id: 3,
+            config_digest: LogHash::ZERO,
         };
         initialize_or_validate(&database, &identity).unwrap();
         let state = LadybugStateMachine {
             path: PathBuf::from(":memory:"),
-            identity,
+            identity: Mutex::new(identity),
             database: RwLock::new(Some(database)),
             writer: Mutex::new(()),
         };

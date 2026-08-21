@@ -358,8 +358,16 @@ fn restore_preserves_an_existing_target() {
 #[test]
 fn lifecycle_entries_advance_progress_without_mutating_kv_data() {
     let dir = tempfile::tempdir().unwrap();
-    let state =
-        RedbStateMachine::open(dir.path().join("state.redb"), "cluster-1", "node-1", 7, 3).unwrap();
+    let initial_digest = LogHash::from_bytes([7; 32]);
+    let state = RedbStateMachine::open_with_digest(
+        dir.path().join("state.redb"),
+        "cluster-1",
+        "node-1",
+        7,
+        3,
+        initial_digest,
+    )
+    .unwrap();
     let put = KvCommandV1::put("put-1", b"key".to_vec(), b"value".to_vec()).unwrap();
     let first = entry(1, LogHash::ZERO, replicated(&put));
     state.apply_entry(&first).unwrap();
