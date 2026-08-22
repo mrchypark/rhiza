@@ -202,7 +202,7 @@ enum ChecksumOrder {
 
 fn checksum(order: ChecksumOrder, bytes: &[u8], mut state: [u32; 2]) -> [u32; 2] {
     debug_assert_eq!(bytes.len() % 8, 0);
-    for chunk in bytes.chunks_exact(8) {
+    for chunk in bytes.as_chunks::<8>().0 {
         let word = |bytes: [u8; 4]| match order {
             ChecksumOrder::Big => u32::from_be_bytes(bytes),
             ChecksumOrder::Little => u32::from_le_bytes(bytes),
@@ -262,7 +262,7 @@ mod tests {
 
     fn checksum(order: ChecksumOrder, bytes: &[u8], mut state: [u32; 2]) -> [u32; 2] {
         assert_eq!(bytes.len() % 8, 0);
-        for chunk in bytes.chunks_exact(8) {
+        for chunk in bytes.as_chunks::<8>().0 {
             let word = |bytes: [u8; 4]| match order {
                 ChecksumOrder::Big => u32::from_be_bytes(bytes),
                 ChecksumOrder::Little => u32::from_le_bytes(bytes),

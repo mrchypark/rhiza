@@ -8284,7 +8284,7 @@ fn decode_base64(field: &str, encoded: &str) -> Result<Vec<u8>, NodeError> {
         )));
     }
     let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (chunk_index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (chunk_index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = chunk_index + 1 == bytes.len() / 4;
         let first = sextet(chunk[0]);
         let second = sextet(chunk[1]);
