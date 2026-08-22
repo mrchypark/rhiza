@@ -8759,13 +8759,18 @@ impl ThreeNodeConsensus {
             ),
         )
         .with_command(offered_command.clone());
+        let mut backoff_us: u64 = 100;
         loop {
             check_proposal_operation_context(context, &mutation_started, &cancelled)?;
             match self.drive_inner(progress, context, &mutation_started)? {
-                DriveOutcome::Progress(next) => progress = next,
+                DriveOutcome::Progress(next) => {
+                    progress = next;
+                    backoff_us = 100;
+                }
                 DriveOutcome::Pending(next) => {
                     progress = next;
-                    thread::sleep(std::time::Duration::from_millis(10));
+                    thread::sleep(std::time::Duration::from_micros(backoff_us));
+                    backoff_us = (backoff_us * 2).min(5000);
                 }
                 DriveOutcome::Decision(proof) => {
                     let value = proof

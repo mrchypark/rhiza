@@ -19,6 +19,7 @@ test-hooks = []
 tuner = ["dep:rhiza-tuner"]
 
 [dependencies]
+bytes.workspace = true
 rhiza-archive = { version = "0.3.0", path = "../rhiza-archive" }
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 rhiza-graph = { version = "0.2.0", path = "../rhiza-graph", optional = true }

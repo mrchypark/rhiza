@@ -9799,15 +9799,6 @@ impl NodeRuntime {
 
     #[cfg(feature = "sql")]
     fn run_sql_group_commit_leader<P: SqlWritePhaseProfile>(&self, profile: &mut P) {
-        let _commit = match self.lock_commit() {
-            Ok(commit) => commit,
-            Err(error) => {
-                self.sql_group_commit.fail_pending(error);
-                return;
-            }
-        };
-        profile.commit_lock_acquired();
-
         loop {
             if !self
                 .sql_group_commit
@@ -9815,8 +9806,16 @@ impl NodeRuntime {
             {
                 break;
             }
+            let _commit = match self.lock_commit() {
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.sql_group_commit.fail_pending(error);
+                    return;
+                }
+            };
+            profile.commit_lock_acquired();
             let Some(jobs) = self.sql_group_commit.drain_next_group() else {
-                break;
+                continue;
             };
             if let Err(error) = self
                 .ensure_ready()
@@ -10439,14 +10438,6 @@ impl NodeRuntime {
 
     #[cfg(feature = "kv")]
     fn run_kv_group_commit_leader(&self) {
-        let _commit = match self.lock_commit() {
-            Ok(commit) => commit,
-            Err(error) => {
-                self.kv_group_commit.fail_pending(error);
-                return;
-            }
-        };
-
         loop {
             if !self
                 .kv_group_commit
@@ -10454,8 +10445,15 @@ impl NodeRuntime {
             {
                 break;
             }
+            let _commit = match self.lock_commit() {
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.kv_group_commit.fail_pending(error);
+                    return;
+                }
+            };
             let Some(jobs) = self.kv_group_commit.drain_next_group() else {
-                break;
+                continue;
             };
             if let Err(error) = self
                 .ensure_ready()

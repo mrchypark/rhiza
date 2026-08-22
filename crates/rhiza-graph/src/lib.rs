@@ -39,7 +39,7 @@ pub const MAX_GRAPH_PARAMETER_DEPTH: usize = 16;
 const MAX_GRAPH_PARAMETER_VALUES: usize = 4096;
 const MAX_GRAPH_PARAMETER_CONTAINER_VALUES: usize = 1024;
 const MAX_GRAPH_PARAMETER_NAME_BYTES: usize = 256;
-const DEFAULT_LADYBUG_BUFFER_POOL_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_LADYBUG_BUFFER_POOL_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_LADYBUG_MAX_NUM_THREADS: u64 = 2;
 const LADYBUG_BUFFER_POOL_EXHAUSTED: &str =
     "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!";
@@ -47,6 +47,11 @@ const LADYBUG_CONVERSION_ERROR_PREFIX: &str = "Conversion exception:";
 const BATCH_COMMAND_VERSION: u16 = 2;
 const BATCH_REQUEST_ID: &str = "__rhiza_graph_batch_v1";
 pub const MAX_GRAPH_BATCH_MEMBERS: usize = 64;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAULT_INJECT_COMMIT_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 const CREATE_META_TABLE: &str = r#"
 CREATE NODE TABLE IF NOT EXISTS __RhizaMeta(
@@ -855,6 +860,24 @@ struct Identity {
     config_digest: LogHash,
 }
 
+struct PendingIdentityUpdate {
+    config_id: u64,
+    config_digest: LogHash,
+}
+
+impl PendingIdentityUpdate {
+    fn apply(self, identity: &mut Identity) {
+        identity.config_id = self.config_id;
+        identity.config_digest = self.config_digest;
+    }
+}
+
+#[must_use]
+struct TransactionApplyResult {
+    outcome: ApplyOutcome,
+    identity_update: Option<PendingIdentityUpdate>,
+}
+
 /// Authoritative LadybugDB materialized state guarded by a single local writer.
 pub struct LadybugStateMachine {
     path: PathBuf,
@@ -940,9 +963,17 @@ impl LadybugStateMachine {
         let guard = self.read_database()?;
         let database = guard.as_ref().ok_or(Error::Closed)?;
         let connection = Connection::new(database).map_err(ladybug_error)?;
-        transaction(&connection, || {
+        let tx_result = transaction(&connection, || {
             self.apply_in_transaction(&connection, entry, &commands)
-        })
+        })?;
+        if let Some(update) = tx_result.identity_update {
+            let mut id = self
+                .identity
+                .lock()
+                .map_err(|_| Error::Ladybug("identity lock poisoned".into()))?;
+            update.apply(&mut id);
+        }
+        Ok(tx_result.outcome)
     }
 
     pub fn applied_index(&self) -> Result<LogIndex> {
@@ -1178,7 +1209,7 @@ impl LadybugStateMachine {
         connection: &Connection<'_>,
         entry: &LogEntry,
         commands: &[DecodedGraphCommand],
-    ) -> Result<ApplyOutcome> {
+    ) -> Result<TransactionApplyResult> {
         let id = self
             .identity
             .lock()
@@ -1217,10 +1248,13 @@ impl LadybugStateMachine {
                 );
             }
             let result = (results.len() == 1).then(|| results.remove(0));
-            return Ok(ApplyOutcome {
-                applied_index: current_index,
-                applied_hash: current_hash,
-                result,
+            return Ok(TransactionApplyResult {
+                outcome: ApplyOutcome {
+                    applied_index: current_index,
+                    applied_hash: current_hash,
+                    result,
+                },
+                identity_update: None,
             });
         }
         let expected = current_index
@@ -1238,7 +1272,7 @@ impl LadybugStateMachine {
             ));
         }
 
-        let result = match entry.entry_type {
+        let (result, identity_update) = match entry.entry_type {
             EntryType::Command => {
                 let mut requests = matching_requests(connection, commands)?;
                 let mut documents = existing_documents(connection, commands)?;
@@ -1258,7 +1292,8 @@ impl LadybugStateMachine {
                         results.push(result);
                     }
                 }
-                (results.len() == 1).then(|| results.remove(0))
+                let result = (results.len() == 1).then(|| results.remove(0));
+                (result, None)
             }
             EntryType::ConfigChange => {
                 let id = self
@@ -1275,28 +1310,32 @@ impl LadybugStateMachine {
                 set_meta(connection, "config_id", &next_id.to_string())?;
                 set_meta(connection, "config_digest", &next_digest.to_hex())?;
                 drop(id);
-                // Update in-memory identity.
-                let mut id = self
-                    .identity
-                    .lock()
-                    .map_err(|_| Error::Ladybug("identity lock poisoned".into()))?;
-                id.config_id = next_id;
-                id.config_digest = next_digest;
                 tracing::info!(
                     old_config_id = entry.config_id,
                     new_config_id = next_id,
                     "graph config transition applied"
                 );
-                None
+                (
+                    None,
+                    Some(PendingIdentityUpdate {
+                        config_id: next_id,
+                        config_digest: next_digest,
+                    }),
+                )
             }
-            EntryType::SnapshotBarrier | EntryType::SnapshotPublished | EntryType::Noop => None,
+            EntryType::SnapshotBarrier | EntryType::SnapshotPublished | EntryType::Noop => {
+                (None, None)
+            }
         };
 
         set_materialized_tip(connection, entry.index, entry.hash)?;
-        Ok(ApplyOutcome {
-            applied_index: entry.index,
-            applied_hash: entry.hash,
-            result,
+        Ok(TransactionApplyResult {
+            outcome: ApplyOutcome {
+                applied_index: entry.index,
+                applied_hash: entry.hash,
+                result,
+            },
+            identity_update,
         })
     }
 
@@ -1709,13 +1748,24 @@ fn transaction<T>(connection: &Connection<'_>, operation: impl FnOnce() -> Resul
         .query("BEGIN TRANSACTION")
         .map_err(ladybug_error)?;
     match operation() {
-        Ok(value) => match connection.query("COMMIT") {
-            Ok(_) => Ok(value),
-            Err(error) => {
-                let _ = connection.query("ROLLBACK");
-                Err(ladybug_error(error))
+        Ok(value) => {
+            #[cfg(test)]
+            {
+                if FAULT_INJECT_COMMIT_FAILURE.with(|flag| flag.get()) {
+                    let _ = connection.query("ROLLBACK");
+                    return Err(Error::Ladybug(
+                        "injected commit failure for testing".into(),
+                    ));
+                }
             }
-        },
+            match connection.query("COMMIT") {
+                Ok(_) => Ok(value),
+                Err(error) => {
+                    let _ = connection.query("ROLLBACK");
+                    Err(ladybug_error(error))
+                }
+            }
+        }
         Err(error) => {
             let _ = connection.query("ROLLBACK");
             Err(error)
@@ -5276,5 +5326,118 @@ mod query_tests {
                 GraphParameterValue::String("document".into()),
             )]), 10, 4096).is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod config_change_commit_failure {
+    use super::*;
+
+    fn stop_config_change_entry(
+        index: u64,
+        config_id: u64,
+        new_digest: LogHash,
+        prev_hash: LogHash,
+    ) -> LogEntry {
+        let change = rhiza_core::ConfigChange::stop(config_id, new_digest);
+        let command = change.to_stored_command();
+        let hash = LogEntry::calculate_hash(
+            "cluster-1",
+            index,
+            7,
+            config_id,
+            command.entry_type,
+            prev_hash,
+            &command.payload,
+        );
+        LogEntry {
+            cluster_id: "cluster-1".into(),
+            epoch: 7,
+            config_id,
+            index,
+            entry_type: command.entry_type,
+            payload: command.payload,
+            prev_hash,
+            hash,
+        }
+    }
+
+    #[test]
+    fn config_change_commit_failure_preserves_in_memory_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.lbug");
+        let state =
+            LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+
+        let put = GraphCommandV1::put_document(
+            "req-1",
+            "doc-1",
+            GraphValueV1::String("hello".into()),
+        )
+        .unwrap();
+        let payload = encode_replicated_graph_command(&put).unwrap();
+        let cmd_hash = LogEntry::calculate_hash(
+            "cluster-1",
+            1,
+            7,
+            3,
+            EntryType::Command,
+            LogHash::ZERO,
+            &payload,
+        );
+        let cmd_entry = LogEntry {
+            cluster_id: "cluster-1".into(),
+            epoch: 7,
+            config_id: 3,
+            index: 1,
+            entry_type: EntryType::Command,
+            payload,
+            prev_hash: LogHash::ZERO,
+            hash: cmd_hash,
+        };
+        state.apply_entry(&cmd_entry).unwrap();
+
+        let original_digest = state.identity.lock().unwrap().config_digest;
+
+        let new_digest = LogHash::from_bytes([0xAB; 32]);
+        let cc_entry = stop_config_change_entry(2, 3, new_digest, cmd_entry.hash);
+
+        FAULT_INJECT_COMMIT_FAILURE.with(|flag| flag.set(true));
+
+        let result = state.apply_entry(&cc_entry);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("injected commit failure"),
+            "expected injected commit failure, got: {err_msg}"
+        );
+
+        FAULT_INJECT_COMMIT_FAILURE.with(|flag| flag.set(false));
+
+        let identity = state.identity.lock().unwrap();
+        assert_eq!(
+            identity.config_digest, original_digest,
+            "in-memory config_digest should remain unchanged after commit failure"
+        );
+        assert_eq!(
+            identity.config_id, 3,
+            "in-memory config_id should remain 3 after commit failure"
+        );
+        drop(identity);
+
+        let reopened =
+            LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+
+        let retry_result = reopened.apply_entry(&cc_entry);
+        assert!(
+            retry_result.is_ok(),
+            "retry after commit failure should succeed"
+        );
+
+        let identity = reopened.identity.lock().unwrap();
+        assert_eq!(
+            identity.config_digest, new_digest,
+            "in-memory config_digest should be updated after successful retry"
+        );
     }
 }

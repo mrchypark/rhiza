@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Archive import and export support for rhiza"
 
 [dependencies]
+bytes.workspace = true
 rhiza-core = { version = "0.3.0", path = "../rhiza-core" }
 rhiza-log = { version = "0.3.0", path = "../rhiza-log" }
 rhiza-obj-store = { version = "0.3.0", path = "../rhiza-obj-store" }
