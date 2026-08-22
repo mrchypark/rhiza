@@ -50,6 +50,7 @@ use rhiza_sql::{
 };
 use serde::{Deserialize, Serialize};
 
+use bytes::Bytes;
 use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
@@ -193,7 +194,7 @@ impl QefxGcTask {
             self.handle.abort();
         }
         match self.handle.await {
-            Ok(_) => Ok(()),
+            Ok(inner) => inner,
             Err(error) if cancelled_before_local && error.is_cancelled() => Ok(()),
             Err(error) => Err(DurabilityError::SnapshotVerification(format!(
                 "QEFX GC task lifecycle became uncertain during shutdown: {error}"
@@ -585,7 +586,7 @@ struct PreparedCheckpointEffect {
     entry_index: LogIndex,
     effect: VerifiedQwalEffectBundleV4,
     manifest: Vec<u8>,
-    chunks: Vec<Vec<u8>>,
+    chunks: Vec<Bytes>,
 }
 
 /// The two local installation contracts. Fresh installation owns every
@@ -2025,7 +2026,10 @@ impl CheckpointCoordinator {
                 })?;
             effects.push(
                 self.store
-                    .publish_verified_qefx_bundle(entry, bundle.chunks())
+                    .publish_verified_qefx_bundle(
+                        entry,
+                        &bundle.chunks().iter().cloned().map(Bytes::from).collect::<Vec<_>>(),
+                    )
                     .await?,
             );
         }
@@ -3671,13 +3675,68 @@ fn write_prepared_external_sql_handoff(
     for effect in effects {
         let entry_dir = root.join(effect.entry_index.to_string());
         fs::create_dir(&entry_dir)?;
-        fs::write(entry_dir.join("binding.qefx"), &effect.manifest)?;
+        // Phase 1: write and sync all chunks, then rename them.
         for (ordinal, chunk) in effect.chunks.iter().enumerate() {
-            fs::write(entry_dir.join(format!("{ordinal:03}.qefc")), chunk)?;
+            write_sync_rename(
+                &entry_dir.join(format!("{ordinal:03}.qefc")),
+                chunk,
+            )?;
         }
+        sync_directory(&entry_dir)?;
+        // Phase 2: write and sync binding, then rename it.
+        // Binding is the commit marker; it must be published last.
+        write_sync_rename(&entry_dir.join("binding.qefx"), &effect.manifest)?;
         sync_directory(&entry_dir)?;
     }
     sync_directory(&root)
+}
+
+/// Writes `data` to a unique temp file in the same directory as `final_path`,
+/// syncs the file data, then atomically renames it to `final_path`.
+///
+/// Postcondition: file data and metadata are durable. The caller must
+/// `sync_directory()` on the parent directory to make the directory entry durable.
+fn write_sync_rename(final_path: &Path, data: &[u8]) -> Result<(), DurabilityError> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| {
+            DurabilityError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "handoff path has no parent directory",
+            ))
+        })?;
+    let mut tmp_path;
+    loop {
+        let nonce: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let tmp_name = format!(
+            ".{}.tmp.{:016x}",
+            final_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("handoff"),
+            nonce ^ (data.len() as u64)
+        );
+        tmp_path = parent.join(tmp_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => {
+                let mut file = file;
+                file.write_all(data)?;
+                file.sync_all()?;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(DurabilityError::Io(e)),
+        }
+    }
+    fs::rename(&tmp_path, final_path)?;
+    Ok(())
 }
 
 #[cfg(feature = "sql")]
@@ -5527,6 +5586,7 @@ mod tests {
     use crate::KvCommandV1;
     #[cfg(any(feature = "sql", feature = "kv"))]
     use crate::{NodeConfig, NodeRuntime};
+    use bytes::Bytes;
     use rhiza_archive::{CheckpointIdentity, CheckpointPublisherOptions, ObjectArchiveStore};
     use rhiza_core::{ConfigurationState, EntryType, LogEntry};
     #[cfg(feature = "sql")]
@@ -5672,7 +5732,10 @@ mod tests {
             };
             effects.push(
                 archive
-                    .publish_verified_qefx_bundle(&entry, &chunks)
+                    .publish_verified_qefx_bundle(
+                        &entry,
+                        &chunks.iter().cloned().map(Bytes::from).collect::<Vec<_>>(),
+                    )
                     .await
                     .unwrap(),
             );

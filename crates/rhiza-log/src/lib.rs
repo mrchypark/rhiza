@@ -864,15 +864,7 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0x82f6_3b78 & mask);
-        }
-    }
-    !crc
+    crc32c::crc32c(bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

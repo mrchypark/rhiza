@@ -416,6 +416,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1987,6 +1996,7 @@ dependencies = [
 name = "rhiza-archive"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "rhiza-core",
  "rhiza-log",
  "rhiza-obj-store",
@@ -2086,6 +2096,7 @@ dependencies = [
 name = "rhiza-log"
 version = "0.3.0"
 dependencies = [
+ "crc32c",
  "libc",
  "proptest",
  "rhiza-core",
@@ -2097,6 +2108,7 @@ name = "rhiza-node"
 version = "0.4.0"
 dependencies = [
  "axum",
+ "bytes",
  "http-body",
  "libc",
  "postcard",

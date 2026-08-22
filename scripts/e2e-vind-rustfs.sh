@@ -555,7 +555,7 @@ fresh_assert_prebootstrap_absence
 make_bundle() {
   id="$1" output="$2" name="rhiza-${profile}-c${id}"
   jq -n --argjson id "$id" --argjson tokens "$peer_tokens" --arg name "$name" \
-    --arg recorder_transport "${RHIZA_RECORDER_TRANSPORT:-http}" \
+    --arg recorder_transport "${RHIZA_RECORDER_TRANSPORT:-tcp-postcard}" \
     --arg recorder_tls "${RHIZA_RECORDER_TLS:-off}" '
     {config_id:$id, members:[range(3) as $n | {
       node_id:("node-" + ($n + 1 | tostring)),

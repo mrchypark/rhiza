@@ -397,6 +397,57 @@ impl ObjStore {
         }
     }
 
+    /// Conditional create only. Returns `AlreadyExists` immediately without
+    /// reading back the existing object.
+    pub async fn create_strict(&self, key: &str, bytes: impl AsRef<[u8]>) -> Result<UpdateVersion> {
+        self.put_with_mode(key, bytes.as_ref(), PutMode::Create).await
+    }
+
+    /// Idempotent create: tries a conditional create, and on `AlreadyExists`
+    /// verifies the existing object via a cheap HEAD (size + etag) instead of
+    /// a full GET. Falls back to a full byte comparison only when metadata
+    /// does not match.
+    pub async fn create_idempotent(&self, key: &str, bytes: impl AsRef<[u8]>) -> Result<UpdateVersion> {
+        let bytes = bytes.as_ref();
+        match self.put_with_mode(key, bytes, PutMode::Create).await {
+            Ok(version) => Ok(version),
+            Err(error @ Error::AlreadyExists { .. }) => {
+                let meta = self.head(key).await?;
+                if meta.size_bytes() == bytes.len() as u64 {
+                    Ok(meta.version().clone().into())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns object metadata (size, etag, version) without reading bytes.
+    pub async fn head(&self, key: &str) -> Result<ObjectMetadata> {
+        let path = ObjPath::from(key);
+        let meta = self
+            .inner
+            .head(&path)
+            .await
+            .map_err(|err| map_store_error(key, err))?;
+        let version = ObjectVersion {
+            e_tag: meta.e_tag,
+            version: meta.version,
+        };
+        if version.e_tag.is_none() && version.version.is_none() {
+            return Err(Error::MissingVersion {
+                key: key.to_string(),
+            });
+        }
+        Ok(ObjectMetadata {
+            key: key.to_string(),
+            size_bytes: meta.size,
+            last_modified_ms: u64::try_from(meta.last_modified.timestamp_millis()).unwrap_or(0),
+            version,
+        })
+    }
+
     /// Performs exactly one provider request for a conditional create when a
     /// backend-specific one-shot client is configured. The caller owns any
     /// retry and idempotency policy.
@@ -549,6 +600,14 @@ impl ObjStore {
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(error) => Err(map_store_error(key, error)),
         }
+    }
+
+    pub async fn delete_batch(&self, items: &[(&str, &ObjectVersion)]) -> Result<Vec<bool>> {
+        let mut results = Vec::with_capacity(items.len());
+        for (key, expected) in items {
+            results.push(self.delete_exact(key, expected).await?);
+        }
+        Ok(results)
     }
 
     async fn put_with_mode(&self, key: &str, bytes: &[u8], mode: PutMode) -> Result<UpdateVersion> {

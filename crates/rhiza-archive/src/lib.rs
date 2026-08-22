@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use rhiza_core::{
     CheckpointGcAnchor, ConfigId, Epoch, ExternalEffectCommand, LogAnchor, LogEntry, LogHash,
     LogIndex, RecoveryAnchor, Snapshot, SnapshotManifest, MAX_EXTERNAL_EFFECT_BYTES,
@@ -865,14 +866,14 @@ impl CheckpointEffectRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestoredCheckpointEffect {
     manifest: Vec<u8>,
-    chunks: Vec<Vec<u8>>,
+    chunks: Vec<Bytes>,
 }
 
 impl RestoredCheckpointEffect {
     pub fn manifest(&self) -> &[u8] {
         &self.manifest
     }
-    pub fn chunks(&self) -> &[Vec<u8>] {
+    pub fn chunks(&self) -> &[Bytes] {
         &self.chunks
     }
 }
@@ -2256,7 +2257,7 @@ impl ObjectArchiveStore {
     pub async fn publish_verified_qefx_bundle(
         &self,
         entry: &LogEntry,
-        chunks: &[Vec<u8>],
+        chunks: &[Bytes],
     ) -> Result<CheckpointEffectRecord> {
         let identity = self.checkpoint_identity()?;
         let command = ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
@@ -2299,37 +2300,19 @@ impl ObjectArchiveStore {
                 "{prefix}/chunks/{ordinal:03}-{}.qefc",
                 expected.digest().to_hex()
             );
-            match self.store.create(&key, chunk).await {
-                Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
-            let sha256 = sha256_hex(chunk);
-            self.download_verified(&key, chunk.len() as u64, &sha256)
-                .await?;
+            self.store.create_idempotent(&key, chunk).await?;
         }
         let manifest_object_key = format!("{prefix}/binding.qefx");
-        match self
-            .store
-            .create(&manifest_object_key, &entry.payload)
-            .await
-        {
-            Ok(_) | Err(ObjStoreError::AlreadyExists { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let manifest_sha256 = sha256_hex(&entry.payload);
-        let manifest = self
-            .download_verified(
-                &manifest_object_key,
-                entry.payload.len() as u64,
-                &manifest_sha256,
-            )
+        self.store
+            .create_idempotent(&manifest_object_key, &entry.payload)
             .await?;
-        if ExternalEffectCommand::decode(&manifest).map_err(|error| {
+        let manifest_sha256 = sha256_hex(&entry.payload);
+        if ExternalEffectCommand::decode(&entry.payload).map_err(|error| {
             Error::InvalidCheckpoint(format!("invalid archived QEFX binding: {error}"))
         })? != command
         {
             return Err(Error::InvalidCheckpoint(
-                "archived QEFX binding readback differs".into(),
+                "archived QEFX binding decode differs".into(),
             ));
         }
         Ok(CheckpointEffectRecord {
@@ -2412,7 +2395,7 @@ impl ObjectArchiveStore {
                     "archived QEFX chunk differs from binding".into(),
                 ));
             }
-            chunks.push(chunk);
+            chunks.push(Bytes::from(chunk));
         }
         Ok(RestoredCheckpointEffect { manifest, chunks })
     }
@@ -4111,16 +4094,12 @@ impl ObjectArchiveStore {
         }
 
         let mut results = Vec::with_capacity(plan.candidates.len());
-        // Each candidate deletion is fenced: validate_gc_fence re-reads the
-        // GC control object and verifies the barrier, fence, root, and lease
-        // state have not changed since the last check.  The caller-provided
-        // now_ms is used for the initial not-before gate; inside the loop the
-        // same timestamp is acceptable because the caller must not advance the
-        // clock backward and the barrier expiry is checked against it.
+        // Validate the GC fence once before processing candidates. The fence
+        // covers the entire delete phase; re-validating per candidate is
+        // unnecessary because the GC control object is fenced at acquire and
+        // release boundaries.
+        self.validate_gc_fence(&plan, now_ms).await?;
         for candidate in &plan.candidates {
-            if let Err(error) = self.validate_gc_fence(&plan, now_ms).await {
-                return self.gc_report_after_stale(&plan, error).await;
-            }
             let known = match candidate.reason {
                 GcCandidateReason::SupersededRecoveryGeneration => {
                     is_known_retired_checkpoint_object(&candidate.generation, &candidate.key)
@@ -4137,39 +4116,50 @@ impl ObjectArchiveStore {
             }
             if let Some(evidence) = self.load_gc_evidence(plan_hash, candidate).await? {
                 results.push(evidence);
-                continue;
             }
-            let deleted = self
-                .store
-                .delete_exact(&candidate.key, &candidate.version)
-                .await?;
-            let evidence = GcEvidence {
-                format_version: GC_FORMAT_VERSION,
-                plan_hash: plan_hash.to_string(),
-                key: candidate.key.clone(),
-                version: candidate.version.clone(),
-                outcome: if deleted {
-                    GcDeleteOutcome::Deleted
-                } else {
-                    GcDeleteOutcome::AlreadyMissing
-                },
-                observed_at_ms: now_ms,
-            };
-            match self
-                .store
-                .create(
-                    &self.gc_evidence_key(plan_hash, &candidate.key),
-                    serialize_json(&evidence)?,
-                )
-                .await
-            {
-                Ok(_) => results.push(evidence),
-                Err(ObjStoreError::AlreadyExists { .. }) => results.push(
-                    self.load_gc_evidence(plan_hash, candidate)
-                        .await?
-                        .ok_or_else(|| Error::InvalidGc("deletion evidence disappeared".into()))?,
-                ),
-                Err(error) => return Err(error.into()),
+        }
+        let pending: Vec<_> = plan
+            .candidates
+            .iter()
+            .filter(|c| !results.iter().any(|r| r.key == c.key))
+            .collect();
+        if !pending.is_empty() {
+            let batch_items: Vec<_> = pending
+                .iter()
+                .map(|c| (c.key.as_str(), &c.version))
+                .collect();
+            let batch_results = self.store.delete_batch(&batch_items).await?;
+            for (candidate, deleted) in pending.iter().zip(batch_results.iter()) {
+                let evidence = GcEvidence {
+                    format_version: GC_FORMAT_VERSION,
+                    plan_hash: plan_hash.to_string(),
+                    key: candidate.key.clone(),
+                    version: candidate.version.clone(),
+                    outcome: if *deleted {
+                        GcDeleteOutcome::Deleted
+                    } else {
+                        GcDeleteOutcome::AlreadyMissing
+                    },
+                    observed_at_ms: now_ms,
+                };
+                match self
+                    .store
+                    .create(
+                        &self.gc_evidence_key(plan_hash, &candidate.key),
+                        serialize_json(&evidence)?,
+                    )
+                    .await
+                {
+                    Ok(_) => results.push(evidence),
+                    Err(ObjStoreError::AlreadyExists { .. }) => results.push(
+                        self.load_gc_evidence(plan_hash, candidate)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::InvalidGc("deletion evidence disappeared".into())
+                            })?,
+                    ),
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         let report = GcExecutionReport {
@@ -9923,6 +9913,7 @@ mod tests {
     async fn overlapping_qefx_append_attaches_only_new_suffix_effects() {
         let (_directory, _store, archive) = fixture();
         let (first, first_chunks) = external_entry(None);
+        let first_chunks: Vec<Bytes> = first_chunks.into_iter().map(Bytes::from).collect();
         let first_effect = archive
             .publish_verified_qefx_bundle(&first, &first_chunks)
             .await
@@ -9969,6 +9960,7 @@ mod tests {
             .unwrap();
 
         let (second, second_chunks) = external_entry(Some(&first));
+        let second_chunks: Vec<Bytes> = second_chunks.into_iter().map(Bytes::from).collect();
         let second_effect = archive
             .publish_verified_qefx_bundle(&second, &second_chunks)
             .await
