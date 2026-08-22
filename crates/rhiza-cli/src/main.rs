@@ -937,8 +937,8 @@ impl ServeConfig {
         let recorder_listen =
             lookup("RHIZA_RECORDER_LISTEN").unwrap_or_else(|| "0.0.0.0:8081".into());
         let requested_recorder_transport = match lookup("RHIZA_RECORDER_TRANSPORT").as_deref() {
-            None | Some("tcp-postcard") => RecorderTransport::TcpPostcard,
-            Some("http") => RecorderTransport::Http,
+            None | Some("http") => RecorderTransport::Http,
+            Some("tcp-postcard") => RecorderTransport::TcpPostcard,
             Some("tcp-postcard-rpc") => {
                 #[cfg(feature = "recorder-postcard-rpc")]
                 {
@@ -5413,7 +5413,7 @@ mod tests {
         assert_eq!(config.bundle.peers[1].log_base_url(), "http://node-2:8081");
         assert_eq!(config.recovery_generation, 1);
         assert!(config.remote.is_none());
-        assert_eq!(config.recorder_transport, RecorderTransport::TcpPostcard);
+        assert_eq!(config.recorder_transport, RecorderTransport::Http);
         assert!(config.recorder_tcp.is_none());
     }
 

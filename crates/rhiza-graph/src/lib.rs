@@ -1753,9 +1753,7 @@ fn transaction<T>(connection: &Connection<'_>, operation: impl FnOnce() -> Resul
             {
                 if FAULT_INJECT_COMMIT_FAILURE.with(|flag| flag.get()) {
                     let _ = connection.query("ROLLBACK");
-                    return Err(Error::Ladybug(
-                        "injected commit failure for testing".into(),
-                    ));
+                    return Err(Error::Ladybug("injected commit failure for testing".into()));
                 }
             }
             match connection.query("COMMIT") {
@@ -5366,15 +5364,11 @@ mod config_change_commit_failure {
     fn config_change_commit_failure_preserves_in_memory_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("graph.lbug");
-        let state =
-            LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+        let state = LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
 
-        let put = GraphCommandV1::put_document(
-            "req-1",
-            "doc-1",
-            GraphValueV1::String("hello".into()),
-        )
-        .unwrap();
+        let put =
+            GraphCommandV1::put_document("req-1", "doc-1", GraphValueV1::String("hello".into()))
+                .unwrap();
         let payload = encode_replicated_graph_command(&put).unwrap();
         let cmd_hash = LogEntry::calculate_hash(
             "cluster-1",
@@ -5425,8 +5419,7 @@ mod config_change_commit_failure {
         );
         drop(identity);
 
-        let reopened =
-            LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
+        let reopened = LadybugStateMachine::open(&path, "cluster-1", "node-1", 7, 3).unwrap();
 
         let retry_result = reopened.apply_entry(&cc_entry);
         assert!(

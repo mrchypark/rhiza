@@ -50,8 +50,8 @@ use rhiza_sql::{
 };
 use serde::{Deserialize, Serialize};
 
-use bytes::Bytes;
 use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
+use bytes::Bytes;
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
 const SYNC_COMPACTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -2028,7 +2028,12 @@ impl CheckpointCoordinator {
                 self.store
                     .publish_verified_qefx_bundle(
                         entry,
-                        &bundle.chunks().iter().cloned().map(Bytes::from).collect::<Vec<_>>(),
+                        &bundle
+                            .chunks()
+                            .iter()
+                            .cloned()
+                            .map(Bytes::from)
+                            .collect::<Vec<_>>(),
                     )
                     .await?,
             );
@@ -3677,10 +3682,7 @@ fn write_prepared_external_sql_handoff(
         fs::create_dir(&entry_dir)?;
         // Phase 1: write and sync all chunks, then rename them.
         for (ordinal, chunk) in effect.chunks.iter().enumerate() {
-            write_sync_rename(
-                &entry_dir.join(format!("{ordinal:03}.qefc")),
-                chunk,
-            )?;
+            write_sync_rename(&entry_dir.join(format!("{ordinal:03}.qefc")), chunk)?;
         }
         sync_directory(&entry_dir)?;
         // Phase 2: write and sync binding, then rename it.
@@ -3697,14 +3699,12 @@ fn write_prepared_external_sql_handoff(
 /// Postcondition: file data and metadata are durable. The caller must
 /// `sync_directory()` on the parent directory to make the directory entry durable.
 fn write_sync_rename(final_path: &Path, data: &[u8]) -> Result<(), DurabilityError> {
-    let parent = final_path
-        .parent()
-        .ok_or_else(|| {
-            DurabilityError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "handoff path has no parent directory",
-            ))
-        })?;
+    let parent = final_path.parent().ok_or_else(|| {
+        DurabilityError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "handoff path has no parent directory",
+        ))
+    })?;
     let mut tmp_path;
     loop {
         let nonce: u64 = std::time::SystemTime::now()

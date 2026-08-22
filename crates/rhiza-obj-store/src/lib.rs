@@ -400,14 +400,19 @@ impl ObjStore {
     /// Conditional create only. Returns `AlreadyExists` immediately without
     /// reading back the existing object.
     pub async fn create_strict(&self, key: &str, bytes: impl AsRef<[u8]>) -> Result<UpdateVersion> {
-        self.put_with_mode(key, bytes.as_ref(), PutMode::Create).await
+        self.put_with_mode(key, bytes.as_ref(), PutMode::Create)
+            .await
     }
 
     /// Idempotent create: tries a conditional create, and on `AlreadyExists`
     /// verifies the existing object via a cheap HEAD (size + etag) instead of
     /// a full GET. Falls back to a full byte comparison only when metadata
     /// does not match.
-    pub async fn create_idempotent(&self, key: &str, bytes: impl AsRef<[u8]>) -> Result<UpdateVersion> {
+    pub async fn create_idempotent(
+        &self,
+        key: &str,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<UpdateVersion> {
         let bytes = bytes.as_ref();
         match self.put_with_mode(key, bytes, PutMode::Create).await {
             Ok(version) => Ok(version),
