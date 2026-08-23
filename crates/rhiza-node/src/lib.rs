@@ -4408,6 +4408,7 @@ where
         })
 }
 
+#[allow(clippy::result_large_err)]
 async fn decode_recorder_json<T, R>(
     state: &RecorderRouteState<R>,
     headers: &HeaderMap,
