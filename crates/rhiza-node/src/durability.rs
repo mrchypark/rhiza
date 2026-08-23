@@ -51,6 +51,7 @@ use rhiza_sql::{
 use serde::{Deserialize, Serialize};
 
 use crate::{Materializer, NodeConfig, NodeRuntime, StopInformation};
+#[cfg(feature = "sql")]
 use bytes::Bytes;
 
 const FLUSH_BATCH_ENTRIES: LogIndex = 32;
@@ -3698,6 +3699,7 @@ fn write_prepared_external_sql_handoff(
 ///
 /// Postcondition: file data and metadata are durable. The caller must
 /// `sync_directory()` on the parent directory to make the directory entry durable.
+#[cfg(feature = "sql")]
 fn write_sync_rename(final_path: &Path, data: &[u8]) -> Result<(), DurabilityError> {
     let parent = final_path.parent().ok_or_else(|| {
         DurabilityError::Io(std::io::Error::new(
