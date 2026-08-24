@@ -142,6 +142,9 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
 	case peerfb.OperationPropose:
+		if !s.server.ready() {
+			return nil, ErrNotReady
+		}
 		if !conn.ConnectionState().TLS.HandshakeComplete {
 			return nil, fmt.Errorf("propose is not accepted as replayable early data")
 		}
@@ -154,11 +157,14 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		}
 		return &peerfb.ResponseT{Decided: decidedToWire(decision)}, nil
 	case peerfb.OperationLearned:
+		if !s.server.ready() {
+			return nil, ErrNotReady
+		}
 		decision, err := decisionFromWire(request.Decision)
 		if err != nil {
 			return nil, err
 		}
-		if err := s.server.core.AcceptDecision(decision); err != nil {
+		if err := s.server.core.AcceptDecisionHint(decision); err != nil {
 			return nil, err
 		}
 		if err := s.server.applyDecisions(ctx, decision.Slot); err != nil {

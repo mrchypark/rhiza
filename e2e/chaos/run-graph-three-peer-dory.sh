@@ -80,6 +80,12 @@ until curl -fsS "$node1/healthz" >/dev/null 2>&1; do
 done
 dory k8s apply -f "$script_dir/graph-two-peer-failure.yaml"
 dory k8s wait podchaos/"$two_failures" -n rhiza-graph-3peer-e2e --for=condition=AllInjected=True --timeout=60s
+deadline=$((SECONDS + 10))
+while curl -fsS --max-time 1 "$node0/ready" >/dev/null 2>&1 || \
+  curl -fsS --max-time 1 "$node2/ready" >/dev/null 2>&1; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.25
+done
 status=000
 deadline=$((SECONDS + 15))
 while [[ "$status" == 000 ]]; do
@@ -102,6 +108,10 @@ until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done
-post "$node1/v1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'after', value: 'fault'})\"}"
+deadline=$((SECONDS + 30))
+until post "$node1/v1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'after', value: 'fault'})\"}" 2>/dev/null; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.25
+done
 
 printf 'PASS: graph peers=3 failed=1 quorum-write=%ss converged=true; failed=2 write-status=%s recovered-write=true\n' "$write_seconds" "$status"

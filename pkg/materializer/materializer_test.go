@@ -416,6 +416,25 @@ func TestMaterializerPersistsAppliedSlot(t *testing.T) {
 	}
 }
 
+func TestValidateTipRejectsRecoveredDecisionConflict(t *testing.T) {
+	m, err := Open(t.TempDir()+"/validate-tip.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	value := []byte("CREATE TABLE validate_tip (id INTEGER)")
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ValidateTip(1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ValidateTip(1, []byte("different")); err == nil {
+		t.Fatal("accepted conflicting recovered decision")
+	}
+}
+
 func TestMaterializerRejectsLegacyDatabaseWithoutAppliedSlot(t *testing.T) {
 	dbPath := t.TempDir() + "/legacy.db"
 	db, err := sql.Open("sqlite3", "file:"+dbPath)

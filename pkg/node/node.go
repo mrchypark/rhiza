@@ -150,6 +150,30 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	// Record RPCs must be available while every replica is recovering. Public
+	// proposals and learned decisions remain gated by ready=false.
+	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
+	n.server = server
+	peer, err := network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
+	if err != nil {
+		return fmt.Errorf("listen peer QUIC: %w", err)
+	}
+	n.peer = peer
+
+	recoveryTarget := quepaxa.Slot(material.Tip())
+	if recorderTip := core.RecorderTip(); recorderTip > recoveryTarget {
+		recoveryTarget = recorderTip
+	}
+	if n.checkpoints != nil {
+		if latest := n.checkpoints.Latest(); latest != nil && quepaxa.Slot(latest.Index) > recoveryTarget {
+			recoveryTarget = quepaxa.Slot(latest.Index)
+		}
+	}
+	if recoveryTarget > core.Tip() {
+		if err := core.RecoverThrough(ctx, recoveryTarget); err != nil {
+			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, err)
+		}
+	}
 	if n.checkpoints != nil {
 		if latest := n.checkpoints.Latest(); latest != nil && latest.Index > material.Tip() {
 			if quepaxa.Slot(latest.Index) > core.Tip() {
@@ -165,21 +189,23 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		}
 	}
 
-	// 6. Replay the materializer after New has recovered consensus state.
+	// 6. Verify a materializer that survived beyond the local decision marker,
+	// then replay the remaining recovered decisions.
 	if quepaxa.Slot(material.Tip()) > core.Tip() {
 		return fmt.Errorf("materialized slot %d is ahead of certified log tip %d", material.Tip(), core.Tip())
+	}
+	if material.Tip() > 0 {
+		decision, ok := core.CertifiedValue(quepaxa.Slot(material.Tip()))
+		if !ok {
+			return fmt.Errorf("materialized slot %d has no recovered decision", material.Tip())
+		}
+		if err := material.ValidateTip(material.Tip(), decision.Value); err != nil {
+			return err
+		}
 	}
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return fmt.Errorf("replay local decisions: %w", err)
 	}
-	// 7. Create HTTP server
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
-	n.server = server
-	peer, err := network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
-	if err != nil {
-		return fmt.Errorf("listen peer QUIC: %w", err)
-	}
-	n.peer = peer
 	if len(cluster.Members) == 1 {
 		n.ready.Store(true)
 	} else {

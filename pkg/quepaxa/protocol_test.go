@@ -219,7 +219,7 @@ func (transport *clusterTransport) SendDecision(_ context.Context, decision Deci
 	defer transport.mu.RUnlock()
 	for id, core := range transport.cores {
 		if !transport.down[id] && !transport.dropDecision[id] {
-			if err := core.AcceptDecision(decision); err != nil {
+			if err := core.AcceptDecisionHint(decision); err != nil {
 				return err
 			}
 		}
@@ -515,5 +515,66 @@ func TestDecisionsRecoverDurablyAfterCrash(t *testing.T) {
 	}
 	if len(recovered.recorders) != 0 {
 		t.Fatal("duplicate record recreated decided ISR state")
+	}
+}
+
+func TestClusterRecoversFastDecisionFromDurableRecorderQuorum(t *testing.T) {
+	cores, transport := newTestCluster(t)
+	for id := range cores {
+		transport.dropDecision[id] = true
+	}
+	if slot, _, err := cores["n1"].Propose(context.Background(), []byte("quorum-only")); err != nil || slot != 1 {
+		t.Fatalf("propose slot=%d err=%v", slot, err)
+	}
+
+	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	config := &Cluster{ConfigID: 1, Members: members}
+	recoveredTransport := &clusterTransport{cores: make(map[NodeID]*Core), down: make(map[NodeID]bool), dropDecision: make(map[NodeID]bool), delay: make(map[Slot]time.Duration)}
+	for _, member := range members {
+		wal, err := qlog.Open(filepath.Join(t.TempDir(), string(member.ID)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wal.Close() })
+		entries, err := cores[member.ID].wal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if entry.Type == qlog.EntryReceipt {
+				if err := wal.Append(entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if err := wal.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		core := newCore(member.ID, config, wal, recoveredTransport)
+		if err := core.recover(); err != nil {
+			t.Fatal(err)
+		}
+		recoveredTransport.cores[member.ID] = core
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	recovered := recoveredTransport.cores["n1"]
+	if recovered.RecorderTip() != 1 {
+		t.Fatalf("recorder tip=%d, want 1", recovered.RecorderTip())
+	}
+	if err := recovered.RecoverThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := recovered.CertifiedValue(1)
+	if !ok || string(decision.Value) != "quorum-only" {
+		t.Fatalf("recovered decision=%q ok=%v", decision.Value, ok)
+	}
+	entries, err := recovered.wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(entries, func(entry qlog.Entry) bool { return entry.Type == qlog.EntryDecide }) {
+		t.Fatal("recovered decision was not persisted")
 	}
 }

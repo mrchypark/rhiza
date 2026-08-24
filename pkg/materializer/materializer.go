@@ -70,7 +70,9 @@ func Open(dbPath string, readerCount int) (*Materializer, error) {
 		return nil, fmt.Errorf("stat database: %w", err)
 	}
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
-	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(full)&_pragma=busy_timeout(5000)"
+	// QLog is the durable source of truth; SQLite is replayable materialized
+	// state, so NORMAL avoids a redundant per-command durability barrier.
+	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)"
 	readerDSN := fileURL + "?mode=ro&_pragma=busy_timeout(5000)"
 
 	// Open main database for metadata
@@ -196,6 +198,19 @@ func (m *Materializer) loadTip(existing bool) error {
 		return fmt.Errorf("invalid applied hash")
 	}
 	copy(m.tipHash[:], decoded)
+	return nil
+}
+
+// ValidateTip checks that materialized state agrees with the recovered log.
+func (m *Materializer) ValidateTip(slot uint64, value []byte) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.tip != slot {
+		return fmt.Errorf("materialized tip %d does not match recovered tip %d", m.tip, slot)
+	}
+	if sha256.Sum256(value) != m.tipHash {
+		return fmt.Errorf("materialized slot %d hash conflicts with recovered decision", slot)
+	}
 	return nil
 }
 

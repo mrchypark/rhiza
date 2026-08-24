@@ -141,6 +141,30 @@ func TestCoreRecord(t *testing.T) {
 	}
 }
 
+func TestRecorderDurablyPromotesLearnedHintBeforeReply(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	config := &Cluster{Members: []Member{{ID: "n1"}}}
+	core := newCore("n1", config, wal, nil)
+	proposal := newProposal(highestPriority, "n1", []byte("hint"))
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)}}}
+	if err := core.AcceptDecisionHint(decision); err != nil {
+		t.Fatal(err)
+	}
+	if core.durable[1] {
+		t.Fatal("learned hint unexpectedly marked durable")
+	}
+	if _, err := core.Record(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if !core.durable[1] {
+		t.Fatal("recorder replied before durable promotion")
+	}
+}
+
 func TestCoreAcceptLearned(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)

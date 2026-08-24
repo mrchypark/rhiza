@@ -55,6 +55,7 @@ type Core struct {
 	tip        Slot
 	tipChanged chan struct{}
 	decided    map[Slot]DecidedValue
+	durable    map[Slot]bool
 	byHash     map[ValueHash]Slot
 	recorders  map[Slot]ISR
 	listeners  []chan SlotValue
@@ -68,7 +69,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), tipChanged: make(chan struct{}),
-		decided: make(map[Slot]DecidedValue), byHash: make(map[ValueHash]Slot), recorders: make(map[Slot]ISR),
+		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming),
 	}
 }
@@ -107,12 +108,15 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			return 0, nil, err
 		}
 		c.markEpochStarted(slot)
-		decision, err := c.runSlot(ctx, slot, proposed)
+		decision, err := c.runSlot(ctx, slot, proposed, true)
 		if err != nil {
 			c.releaseSlot(slot)
 			return 0, nil, err
 		}
-		if err := c.AcceptDecision(decision); err != nil {
+		// A durable recorder quorum already makes the decision recoverable. Like
+		// Raft's commit index, the local decision marker need not add a second
+		// synchronous disk barrier to the clustered fast path.
+		if err := c.acceptDecision(decision, len(c.config.Members) == 1); err != nil {
 			c.releaseSlot(slot)
 			return 0, nil, err
 		}
@@ -300,7 +304,7 @@ func (c *Core) releaseSlot(slot Slot) {
 	c.vacant[index] = slot
 }
 
-func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte) (Decision, error) {
+func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeaderFastPath bool) (Decision, error) {
 	leaderOrder, err := c.LeaderOrder(slot)
 	if err != nil {
 		return Decision{}, err
@@ -316,7 +320,7 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte) (Decision, 
 		requests := make(map[NodeID]RecordRequest, len(c.config.Members))
 		for _, member := range c.config.Members {
 			candidate := proposal
-			if step%4 == 0 && (step > 4 || c.nodeID != leader) {
+			if step%4 == 0 && (step > 4 || c.nodeID != leader || !allowLeaderFastPath) {
 				priority, err := c.priority()
 				if err != nil {
 					return Decision{}, err
@@ -470,6 +474,12 @@ func (c *Core) Record(_ context.Context, request RecordRequest) (Summary, error)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if decided, ok := c.decided[request.Slot]; ok {
+		if !c.durable[request.Slot] {
+			if err := c.wal.Sync(); err != nil {
+				return Summary{}, err
+			}
+			c.durable[request.Slot] = true
+		}
 		decision, err := decodeDecision(decided.Certificate)
 		if err != nil {
 			return Summary{}, err
@@ -505,6 +515,17 @@ func (c *Core) Record(_ context.Context, request RecordRequest) (Summary, error)
 
 // AcceptDecision validates Algorithm 4 quorum evidence and records the decision durably.
 func (c *Core) AcceptDecision(decision Decision) error {
+	return c.acceptDecision(decision, true)
+}
+
+// AcceptDecisionHint installs a certified decision without a second disk
+// barrier. The durable recorder quorum remains the recovery source; catch-up
+// callers that require a local durable copy use AcceptDecision instead.
+func (c *Core) AcceptDecisionHint(decision Decision) error {
+	return c.acceptDecision(decision, false)
+}
+
+func (c *Core) acceptDecision(decision Decision, durable bool) error {
 	if err := c.validateDecision(decision); err != nil {
 		return err
 	}
@@ -516,22 +537,33 @@ func (c *Core) AcceptDecision(decision Decision) error {
 
 	c.mu.Lock()
 	if existing, ok := c.decided[decision.Slot]; ok {
-		c.mu.Unlock()
 		if existing.Hash != decision.Proposal.Hash || !bytes.Equal(existing.Value, decision.Proposal.Value) {
+			c.mu.Unlock()
 			return fmt.Errorf("slot %d already decided with another value", decision.Slot)
 		}
+		if durable && !c.durable[decision.Slot] {
+			if err := c.wal.Sync(); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			c.durable[decision.Slot] = true
+		}
+		c.mu.Unlock()
 		return nil
 	}
 	if err := c.wal.Append(qlog.Entry{Slot: uint64(decision.Slot), Hash: decision.Proposal.Hash, Type: qlog.EntryDecide, Payload: payload}); err != nil {
 		c.mu.Unlock()
 		return err
 	}
-	if err := c.wal.Sync(); err != nil {
-		c.mu.Unlock()
-		return err
+	if durable {
+		if err := c.wal.Sync(); err != nil {
+			c.mu.Unlock()
+			return err
+		}
 	}
 	value := DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: append([]byte(nil), decision.Proposal.Value...), Certificate: certificate}
 	c.decided[decision.Slot] = value
+	c.durable[decision.Slot] = durable
 	c.byHash[decision.Proposal.Hash] = decision.Slot
 	delete(c.recorders, decision.Slot)
 	c.advanceTipLocked()
@@ -545,6 +577,57 @@ func (c *Core) AcceptDecision(decision Decision) error {
 		}
 	}
 	return nil
+}
+
+// RecorderTip returns the highest slot represented by recovered durable ISR
+// state, including a decision whose certificate marker may have been lost.
+func (c *Core) RecorderTip() Slot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var tip Slot
+	for slot := range c.recorders {
+		if slot > tip {
+			tip = slot
+		}
+	}
+	return tip
+}
+
+// RecoverThrough re-drives undecided slots from durable recorder state. It
+// deliberately disables the leader fast path so a restarted leader cannot
+// introduce a different highest-priority value for an old slot.
+func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
+	select {
+	case c.pipeline <- struct{}{}:
+		defer func() { <-c.pipeline }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	for c.Tip() < through {
+		slot := c.Tip() + 1
+		value := c.recoveryValue(slot)
+		decision, err := c.runSlot(ctx, slot, value, false)
+		if err != nil {
+			return fmt.Errorf("recover slot %d: %w", slot, err)
+		}
+		if err := c.acceptDecision(decision, true); err != nil {
+			return fmt.Errorf("persist recovered slot %d: %w", slot, err)
+		}
+	}
+	return nil
+}
+
+func (c *Core) recoveryValue(slot Slot) []byte {
+	c.mu.RLock()
+	state := c.recorders[slot]
+	c.mu.RUnlock()
+	if proposal := maxProposal(maxProposal(state.FirstCurrent, state.AggregateCurrent), state.AggregatePrior); proposal != nil {
+		return append([]byte(nil), proposal.Value...)
+	}
+	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-recovery:%s:%d", c.nodeID, slot)))
+	var nonce [ReadBarrierNonceSize]byte
+	copy(nonce[:], seed[:])
+	return EncodeReadBarrier(nonce)
 }
 
 func (c *Core) validateDecision(decision Decision) error {
@@ -792,6 +875,7 @@ func (c *Core) recover() error {
 				return fmt.Errorf("conflicting decisions at slot %d", decision.Slot)
 			}
 			c.decided[decision.Slot] = DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: decision.Proposal.Value, Certificate: certificate}
+			c.durable[decision.Slot] = true
 			c.byHash[decision.Proposal.Hash] = decision.Slot
 			delete(c.recorders, decision.Slot)
 			c.mu.Unlock()

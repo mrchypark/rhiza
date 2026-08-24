@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"runtime"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
@@ -10,7 +11,6 @@ import (
 
 const (
 	maxSQLBatch = 16
-	batchWait   = time.Millisecond
 )
 
 type batchResult struct {
@@ -55,20 +55,16 @@ func (b *sqlBatcher) submit(ctx context.Context, command types.SQLCommand) (quep
 func (b *sqlBatcher) run() {
 	for first := range b.input {
 		items := []batchItem{first}
-		timer := time.NewTimer(batchWait)
+		// Let concurrently submitted commands reach the queue without imposing
+		// a fixed latency floor on an isolated request.
+		runtime.Gosched()
 	collect:
 		for len(items) < maxSQLBatch {
 			select {
 			case item := <-b.input:
 				items = append(items, item)
-			case <-timer.C:
-				break collect
-			}
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
 			default:
+				break collect
 			}
 		}
 
