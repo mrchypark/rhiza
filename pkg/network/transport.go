@@ -2,6 +2,8 @@ package network
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -31,6 +33,7 @@ type Transport struct {
 	configID  uint
 	localID   quepaxa.NodeID
 	token     string
+	fallback  string
 	tls       *tls.Config
 	quic      *quic.Config
 	peers     map[quepaxa.NodeID]*peerConnection
@@ -41,12 +44,15 @@ func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *que
 	for _, member := range config.Members {
 		peers[member.ID] = &peerConnection{}
 	}
+	localToken := token
+	if member, ok := config.MemberSet()[localID]; ok && member.Token != "" {
+		localToken = member.Token
+	}
 	return &Transport{
 		members: config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
-		localID: localID, token: token, peers: peers,
+		localID: localID, token: localToken, fallback: token, peers: peers,
 		tls: &tls.Config{
 			MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN},
-			InsecureSkipVerify: true, // Peer identity is fenced by membership and the configured token.
 			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
 		},
 		quic: &quic.Config{HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256},
@@ -84,6 +90,25 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 		}
 		tlsConfig := t.tls.Clone()
 		tlsConfig.ServerName = string(to)
+		identityToken := member.Token
+		if identityToken == "" {
+			identityToken = t.fallback
+		}
+		if identityToken == "" && len(t.members) > 1 {
+			return nil, fmt.Errorf("peer identity token is required for %s", to)
+		}
+		expectedKey := peerPublicKey(t.clusterID, to, identityToken)
+		tlsConfig.InsecureSkipVerify = true // Exact token-bound Ed25519 key pin is verified below.
+		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) != 1 {
+				return fmt.Errorf("peer %s presented %d certificates", to, len(state.PeerCertificates))
+			}
+			key, ok := state.PeerCertificates[0].PublicKey.(ed25519.PublicKey)
+			if !ok || subtle.ConstantTimeCompare(key, expectedKey) != 1 {
+				return fmt.Errorf("peer %s certificate identity mismatch", to)
+			}
+			return nil
+		}
 		peer.conn, err = quic.DialAddrEarly(ctx, addr, tlsConfig, t.quic)
 		if err != nil {
 			peer.conn = nil

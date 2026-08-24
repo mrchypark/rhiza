@@ -3,26 +3,27 @@ package qlog
 import (
 	"encoding/json"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
 
 // SegmentMeta describes a segment file.
 type SegmentMeta struct {
-	Index    uint32    `json:"index"`
+	Index     uint32   `json:"index"`
 	StartSlot uint64   `json:"start_slot"`
-	EndSlot  uint64    `json:"end_slot"`
-	Size     int64     `json:"size"`
-	Hash     [32]byte  `json:"hash"`
-	Synced   bool      `json:"synced"` // object storage에 동기화되었는지
+	EndSlot   uint64   `json:"end_slot"`
+	Size      int64    `json:"size"`
+	Hash      [32]byte `json:"hash"`
+	Synced    bool     `json:"synced"` // object storage에 동기화되었는지
 }
 
 // Manifest tracks QLog segment metadata.
 type Manifest struct {
-	Segments   []SegmentMeta `json:"segments"`
-	TipSlot    uint64        `json:"tip_slot"`
-	LastSync   time.Time     `json:"last_sync"`
-	mu         sync.RWMutex
+	Segments []SegmentMeta `json:"segments"`
+	TipSlot  uint64        `json:"tip_slot"`
+	LastSync time.Time     `json:"last_sync"`
+	mu       sync.RWMutex
 }
 
 // NewManifest creates a new manifest.
@@ -95,6 +96,44 @@ func (m *Manifest) MarkSynced(index uint32) {
 			m.Segments[i].Synced = true
 			m.LastSync = time.Now()
 			break
+		}
+	}
+}
+
+func (m *Manifest) IsSynced(seg SegmentMeta) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, current := range m.Segments {
+		if current.Index == seg.Index {
+			return current.Synced && current.Size == seg.Size && current.Hash == seg.Hash
+		}
+	}
+	return false
+}
+
+func (m *Manifest) UpsertSynced(seg SegmentMeta) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seg.Synced = true
+	for i := range m.Segments {
+		if m.Segments[i].Index == seg.Index {
+			m.Segments[i] = seg
+			m.recalculateTip()
+			m.LastSync = time.Now()
+			return
+		}
+	}
+	m.Segments = append(m.Segments, seg)
+	sort.Slice(m.Segments, func(i, j int) bool { return m.Segments[i].Index < m.Segments[j].Index })
+	m.recalculateTip()
+	m.LastSync = time.Now()
+}
+
+func (m *Manifest) recalculateTip() {
+	m.TipSlot = 0
+	for _, seg := range m.Segments {
+		if seg.EndSlot > m.TipSlot {
+			m.TipSlot = seg.EndSlot
 		}
 	}
 }

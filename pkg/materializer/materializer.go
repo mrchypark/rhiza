@@ -52,6 +52,12 @@ type notificationSubscription struct {
 	ch    chan []byte
 }
 
+type snapshotParts struct {
+	sqlite   []byte
+	graphDir string
+	cleanup  func()
+}
+
 // Open opens or creates a materializer.
 func Open(dbPath string, readerCount int) (*Materializer, error) {
 	if readerCount < 1 {
@@ -329,9 +335,21 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 				return fmt.Errorf("check SQL request %q: %w", command.RequestID, err)
 			}
 		}
-		result, err := executeSQLCommand(ctx, tx, command)
-		if err != nil {
-			return fmt.Errorf("execute SQL request %q: %w", command.RequestID, err)
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT rhiza_command"); err != nil {
+			return err
+		}
+		result, executeErr := executeSQLCommand(ctx, tx, command)
+		if executeErr != nil {
+			if command.RequestID == "" {
+				return executeErr
+			}
+			if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
+				return err
+			}
+			result = types.SQLCommandResult{Error: executeErr.Error()}
+		}
+		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
+			return err
 		}
 		if command.RequestID != "" {
 			resultJSON, err := json.Marshal(result)
@@ -727,7 +745,7 @@ func (m *Materializer) Snapshot(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read snapshot: %w", err)
 	}
-	return data, nil
+	return m.encodeSnapshot(data)
 }
 
 // Restore restores from a snapshot.
@@ -738,6 +756,13 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	dir := filepath.Dir(m.dbPath)
+	parts, err := prepareSnapshot(data, dir)
+	if err != nil {
+		return err
+	}
+	if parts.cleanup != nil {
+		defer parts.cleanup()
+	}
 	file, err := os.CreateTemp(dir, ".rhiza-restore-*.db")
 	if err != nil {
 		return err
@@ -745,7 +770,7 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 	tempPath := file.Name()
 	defer os.Remove(tempPath)
 	if err := file.Chmod(0o600); err == nil {
-		_, err = file.Write(data)
+		_, err = file.Write(parts.sqlite)
 	}
 	if err == nil {
 		err = file.Sync()
@@ -768,7 +793,10 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
+	graphPath := filepath.Join(dir, "ladybug")
+	graphBackupPath := graphPath + ".restore-backup"
 	os.Remove(backupPath)
+	os.RemoveAll(graphBackupPath)
 	if err := m.closeConnections(); err != nil {
 		return err
 	}
@@ -777,7 +805,31 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 	if err := os.Rename(m.dbPath, backupPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("backup database: %w", err)
 	}
+	graphBackedUp := false
+	graphInstalled := false
+	if parts.graphDir != "" {
+		if err := os.Rename(graphPath, graphBackupPath); err == nil {
+			graphBackedUp = true
+		} else if !os.IsNotExist(err) {
+			_ = os.Rename(backupPath, m.dbPath)
+			return fmt.Errorf("backup graph database: %w", err)
+		}
+		if err := os.Rename(parts.graphDir, graphPath); err != nil {
+			if graphBackedUp {
+				_ = os.Rename(graphBackupPath, graphPath)
+			}
+			_ = os.Rename(backupPath, m.dbPath)
+			return fmt.Errorf("install graph snapshot: %w", err)
+		}
+		graphInstalled = true
+	}
 	if err := os.Rename(tempPath, m.dbPath); err != nil {
+		if graphInstalled {
+			_ = os.RemoveAll(graphPath)
+		}
+		if graphBackedUp {
+			_ = os.Rename(graphBackupPath, graphPath)
+		}
 		_ = os.Rename(backupPath, m.dbPath)
 		if reopenErr := m.reopen(); reopenErr != nil {
 			return fmt.Errorf("install snapshot: %w; reopen original: %v", err, reopenErr)
@@ -785,8 +837,20 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 		return fmt.Errorf("install snapshot: %w", err)
 	}
 	restored, err := Open(m.dbPath, m.readersN)
+	if err == nil {
+		err = restored.validateRestoredSnapshot()
+	}
 	if err != nil {
+		if restored != nil {
+			_ = restored.Close()
+		}
 		os.Remove(m.dbPath)
+		if graphInstalled {
+			_ = os.RemoveAll(graphPath)
+		}
+		if graphBackedUp {
+			_ = os.Rename(graphBackupPath, graphPath)
+		}
 		_ = os.Rename(backupPath, m.dbPath)
 		if reopenErr := m.reopen(); reopenErr != nil {
 			return fmt.Errorf("open restored snapshot: %w; reopen original: %v", err, reopenErr)
@@ -794,6 +858,7 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 		return fmt.Errorf("open restored snapshot: %w", err)
 	}
 	os.Remove(backupPath)
+	os.RemoveAll(graphBackupPath)
 	m.db, m.writer, m.readers, m.graph = restored.db, restored.writer, restored.readers, restored.graph
 	m.tip, m.tipHash = restored.tip, restored.tipHash
 	restored.db, restored.writer, restored.readers, restored.graph = nil, nil, nil, nil

@@ -43,8 +43,17 @@ type ExecutionConfig struct {
 	Members     []NodeConfig `json:"members"`
 
 	// Object store configuration
-	ObjStoreEndpoint string `json:"objstore_endpoint"`
-	ObjStoreBucket   string `json:"objstore_bucket"`
+	ObjStoreEndpoint     string `json:"objstore_endpoint"`
+	ObjStoreBucket       string `json:"objstore_bucket"`
+	ObjStoreProvider     string `json:"objstore_provider"`
+	ObjStoreDir          string `json:"objstore_dir"`
+	ObjStorePrefix       string `json:"objstore_prefix"`
+	ObjStoreRegion       string `json:"objstore_region"`
+	ObjStoreInsecure     bool   `json:"objstore_insecure"`
+	ObjStoreRetries      int    `json:"objstore_retries"`
+	ObjStoreAccessKey    string `json:"objstore_access_key"`
+	ObjStoreSecretKey    string `json:"objstore_secret_key"`
+	ObjStoreSessionToken string `json:"objstore_session_token"`
 
 	// Timing
 	CheckpointInterval time.Duration `json:"checkpoint_interval"`

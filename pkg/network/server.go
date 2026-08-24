@@ -128,7 +128,7 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 				results <- result{slot: slot, member: member.ID, rank: rank}
 				return
 			}
-			proposeCtx, cancelPropose := context.WithTimeout(context.Background(), 30*time.Second)
+			proposeCtx, cancelPropose := context.WithTimeout(hedgeCtx, 30*time.Second)
 			defer cancelPropose()
 			if member.ID == s.core.NodeID() {
 				slot, _, err := s.core.Propose(proposeCtx, value)
@@ -280,7 +280,7 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
-	return ExecuteResponse{Slot: uint64(slot), Success: true, Result: result}, nil
+	return ExecuteResponse{Slot: uint64(slot), Success: result.Error == "", Error: result.Error, Result: result}, nil
 }
 
 // QueryRequest is the request body for query.

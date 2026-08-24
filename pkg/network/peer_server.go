@@ -3,7 +3,10 @@ package network
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -12,6 +15,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/quic-go/quic-go"
@@ -26,7 +30,17 @@ type PeerServer struct {
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
-	certificate, err := ephemeralCertificate()
+	identityToken := token
+	for _, member := range members {
+		if member.ID == server.core.NodeID() && member.Token != "" {
+			identityToken = member.Token
+			break
+		}
+	}
+	if identityToken == "" && len(members) > 1 {
+		return nil, fmt.Errorf("peer identity token is required")
+	}
+	certificate, err := peerCertificate(server.cluster, server.core.NodeID(), identityToken)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +124,7 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	if expectedToken == "" {
 		expectedToken = s.token
 	}
-	if request.Token != expectedToken {
+	if subtle.ConstantTimeCompare([]byte(request.Token), []byte(expectedToken)) != 1 {
 		return nil, fmt.Errorf("peer authentication failed")
 	}
 	switch request.Operation {
@@ -169,15 +183,29 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	}
 }
 
-func ephemeralCertificate() (tls.Certificate, error) {
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
+func peerPublicKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) ed25519.PublicKey {
+	return peerPrivateKey(clusterID, nodeID, token).Public().(ed25519.PublicKey)
+}
+
+func peerPrivateKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) ed25519.PrivateKey {
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte("rhiza-peer-certificate-v1\x00"))
+	mac.Write([]byte(clusterID))
+	mac.Write([]byte{0})
+	mac.Write([]byte(nodeID))
+	return ed25519.NewKeyFromSeed(mac.Sum(nil))
+}
+
+func peerCertificate(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) (tls.Certificate, error) {
+	privateKey := peerPrivateKey(clusterID, nodeID, token)
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	serialHash := sha256.Sum256(publicKey)
+	serial := new(big.Int).SetBytes(serialHash[:20])
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "rhiza-peer"},
-		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(24 * time.Hour),
-		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber: serial, Subject: pkix.Name{CommonName: string(nodeID)}, DNSNames: []string{string(nodeID)},
+		NotBefore: time.Unix(0, 0), NotAfter: time.Date(2125, 1, 1, 0, 0, 0, 0, time.UTC),
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
 	if err != nil {

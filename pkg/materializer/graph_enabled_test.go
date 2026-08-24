@@ -47,6 +47,22 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	if err != nil || !found || string(got) != "graph" {
 		t.Fatalf("KV got=%q found=%v err=%v", got, found, err)
 	}
+	snapshot, err := m.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyGraph(5, types.GraphCommand{RequestID: "person-2", Cypher: `CREATE (p:Person {id: '2', name: 'Grace'})`})
+	if err := m.Restore(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	result, err = m.GraphQuery(ctx, `MATCH (p:Person) RETURN p.name ORDER BY p.name`, nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "Ada" || m.Tip() != 4 {
+		t.Fatalf("restored graph result=%+v tip=%d err=%v", result, m.Tip(), err)
+	}
+	got, found, err = m.KVGet(ctx, "mode", time.Now())
+	if err != nil || !found || string(got) != "graph" {
+		t.Fatalf("restored KV got=%q found=%v err=%v", got, found, err)
+	}
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -57,5 +73,37 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	defer m.Close()
 	if m.Tip() != 4 {
 		t.Fatalf("tip=%d, want 4", m.Tip())
+	}
+}
+
+func TestFailedGraphCommandRecordsResultAndAdvancesTip(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	commands := []types.GraphCommand{
+		{RequestID: "schema", Cypher: `CREATE NODE TABLE Item(id STRING, PRIMARY KEY(id))`},
+		{RequestID: "first", Cypher: `CREATE (:Item {id: '1'})`},
+		{RequestID: "duplicate", Cypher: `CREATE (:Item {id: '1'})`},
+		{RequestID: "after", Cypher: `CREATE (:Item {id: '2'})`},
+	}
+	for i, command := range commands {
+		value, err := types.EncodeGraphCommand(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Apply(ctx, uint64(i+1), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := m.GraphRequestResult(ctx, "duplicate")
+	if err != nil || result.Error == "" || m.Tip() != 4 {
+		t.Fatalf("result=%+v tip=%d err=%v", result, m.Tip(), err)
+	}
+	rows, err := m.GraphQuery(ctx, `MATCH (n:Item) RETURN n.id ORDER BY n.id`, nil)
+	if err != nil || len(rows.Rows) != 2 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
 	}
 }

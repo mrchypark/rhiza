@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math/rand"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -61,6 +62,41 @@ func TestISRMatchesAlgorithm3(t *testing.T) {
 	_, reply = state.Record(8, low)
 	if reply.AggregatePrior != nil {
 		t.Fatalf("skipped step retained prior aggregate: %+v", reply)
+	}
+}
+
+func TestISRMonotonicProperties(t *testing.T) {
+	random := rand.New(rand.NewSource(1))
+	state := ISR{}
+	for range 10_000 {
+		step := Step(random.Intn(64) + 4)
+		var priority Priority
+		priority[31] = byte(random.Intn(255))
+		proposal := newProposal(priority, NodeID("n"+string(rune('1'+random.Intn(3)))), []byte{byte(random.Intn(255))})
+		before := state
+		next, summary := state.Record(step, proposal)
+		if next.Step < before.Step || summary.Step != next.Step {
+			t.Fatalf("step regressed: before=%d input=%d after=%d", before.Step, step, next.Step)
+		}
+		switch {
+		case step < before.Step:
+			if !sameProposal(next.FirstCurrent, before.FirstCurrent) || !sameProposal(next.AggregateCurrent, before.AggregateCurrent) || !sameProposal(next.AggregatePrior, before.AggregatePrior) {
+				t.Fatal("stale input mutated ISR")
+			}
+		case step == before.Step:
+			if !sameProposal(next.FirstCurrent, before.FirstCurrent) || compareProposal(next.AggregateCurrent, before.AggregateCurrent) < 0 {
+				t.Fatal("same-step aggregate regressed")
+			}
+		case step == before.Step+1:
+			if !sameProposal(next.AggregatePrior, before.AggregateCurrent) {
+				t.Fatal("adjacent step lost prior aggregate")
+			}
+		case step > before.Step+1:
+			if next.AggregatePrior != nil {
+				t.Fatal("step gap retained prior aggregate")
+			}
+		}
+		state = next
 	}
 }
 
@@ -431,5 +467,53 @@ func TestRecorderStateRecoversDurably(t *testing.T) {
 	}
 	if !sameProposal(summary.AggregatePrior, &high) {
 		t.Fatalf("recovered ISR lost prior aggregate: %+v", summary)
+	}
+}
+
+func TestDecisionsRecoverDurablyAfterCrash(t *testing.T) {
+	dir := t.TempDir()
+	config := &Cluster{Members: []Member{{ID: "n1"}}}
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core := newCore("n1", config, wal, nil)
+	for slot := Slot(1); slot <= 20; slot++ {
+		got, _, err := core.Propose(context.Background(), []byte{byte(slot)})
+		if err != nil || got != slot {
+			t.Fatalf("slot=%d got=%d err=%v", slot, got, err)
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	decisions, tip, err := recovered.DecisionsFrom(1, 20)
+	if err != nil || tip != 20 || len(decisions) != 20 {
+		t.Fatalf("tip=%d decisions=%d err=%v", tip, len(decisions), err)
+	}
+	for i, decision := range decisions {
+		if decision.Slot != Slot(i+1) || len(decision.Value) != 1 || decision.Value[0] != byte(i+1) {
+			t.Fatalf("decision[%d]=%+v", i, decision)
+		}
+	}
+	if len(recovered.recorders) != 0 {
+		t.Fatalf("decided recorder states retained after recovery: %d", len(recovered.recorders))
+	}
+	proposal := newProposal(highestPriority, "n1", []byte{1})
+	if _, err := recovered.Record(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered.recorders) != 0 {
+		t.Fatal("duplicate record recreated decided ISR state")
 	}
 }

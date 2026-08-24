@@ -6,7 +6,7 @@ metadata:
 spec:
   action: pod-failure
   mode: one
-  duration: 2m
+  duration: 20s
   selector:
     pods:
       rhiza-graph-3peer-e2e:

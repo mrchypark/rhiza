@@ -23,7 +23,7 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,6 +62,13 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	}
 	if !transport.peers[member.ID].conn.ConnectionState().Used0RTT {
 		t.Fatal("replay-safe Record did not use QUIC 0-RTT")
+	}
+	wrongMember := member
+	wrongMember.Token = "wrong"
+	wrong := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: []quepaxa.Member{wrongMember}}, "wrong")
+	defer wrong.Close()
+	if _, err := wrong.SendRecord(callCtx, member.ID, request); err == nil {
+		t.Fatal("peer with the wrong token-bound certificate identity was accepted")
 	}
 }
 

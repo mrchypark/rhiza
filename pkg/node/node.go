@@ -9,12 +9,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
@@ -23,16 +26,20 @@ import (
 
 // Node is the main runtime container.
 type Node struct {
-	config    *types.ExecutionConfig
-	core      *quepaxa.Core
-	material  *materializer.Materializer
-	server    *network.Server
-	peer      *network.PeerServer
-	transport *network.Transport
-	wal       *qlog.WAL
-	lock      *qlog.LockFile
-	ready     atomic.Bool
-	opened    atomic.Bool
+	config       *types.ExecutionConfig
+	core         *quepaxa.Core
+	material     *materializer.Materializer
+	server       *network.Server
+	peer         *network.PeerServer
+	transport    *network.Transport
+	wal          *qlog.WAL
+	lock         *qlog.LockFile
+	bucket       *objectstore.MeteredBucket
+	qlogSync     *qlog.ObjStoreSyncer
+	checkpoints  *checkpoint.Manager
+	checkpointer *checkpoint.AutoCheckpointer
+	ready        atomic.Bool
+	opened       atomic.Bool
 }
 
 // New creates a new Node.
@@ -72,6 +79,32 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("open WAL: %w", err)
 	}
 	n.wal = wal
+	if n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" {
+		provider := objectstore.Provider(n.config.ObjStoreProvider)
+		if provider == "" {
+			provider = objectstore.ProviderS3
+		}
+		bucket, bucketErr := objectstore.NewBucket(objectstore.Config{
+			Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
+			Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
+			Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,
+			AccessKey: n.config.ObjStoreAccessKey, SecretKey: n.config.ObjStoreSecretKey, SessionToken: n.config.ObjStoreSessionToken,
+		})
+		if bucketErr != nil {
+			return fmt.Errorf("open object store: %w", bucketErr)
+		}
+		n.bucket = bucket
+		prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), string(n.config.NodeID))
+		manifest := qlog.NewManifest()
+		n.qlogSync = qlog.NewObjStoreSyncer(wal, manifest, bucket, prefix, 0)
+		if _, recoveryErr := qlog.NewRecovery(wal, manifest, bucket, prefix).Recover(ctx); recoveryErr != nil {
+			return recoveryErr
+		}
+		n.checkpoints = checkpoint.NewManager(bucket, prefix, n.config.DataDir)
+		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
+			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
+		}
+	}
 
 	// 3. Recovery is completed below by Core.Recover plus deterministic replay.
 	if !cleanStart {
@@ -101,6 +134,13 @@ func (n *Node) Open(ctx context.Context) (err error) {
 
 	// 5. Create consensus core through the same public API available to external users.
 	cluster := n.loadClusterConfig()
+	if len(cluster.Members) > 1 {
+		for _, member := range cluster.Members {
+			if member.Token == "" && n.config.AdminToken == "" {
+				return fmt.Errorf("peer token is required for multi-node cluster member %s", member.ID)
+			}
+		}
+	}
 	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
 	n.transport = transport
 	core, err := quepaxa.New(quepaxa.Config{
@@ -110,6 +150,20 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	if n.checkpoints != nil {
+		if latest := n.checkpoints.Latest(); latest != nil && latest.Index > material.Tip() {
+			if quepaxa.Slot(latest.Index) > core.Tip() {
+				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", latest.Index, core.Tip())
+			}
+			data, readErr := n.checkpoints.Read(ctx, latest.Index)
+			if readErr != nil {
+				return readErr
+			}
+			if restoreErr := material.Restore(ctx, data); restoreErr != nil {
+				return fmt.Errorf("restore checkpoint %d: %w", latest.Index, restoreErr)
+			}
+		}
+	}
 
 	// 6. Replay the materializer after New has recovered consensus state.
 	if quepaxa.Slot(material.Tip()) > core.Tip() {
@@ -118,12 +172,6 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if err := n.replayLocalDecisions(ctx); err != nil {
 		return fmt.Errorf("replay local decisions: %w", err)
 	}
-	if len(cluster.Members) == 1 {
-		n.ready.Store(true)
-	} else {
-		go n.startCatchUp(ctx, transport, cluster)
-	}
-
 	// 7. Create HTTP server
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
 	n.server = server
@@ -132,9 +180,22 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("listen peer QUIC: %w", err)
 	}
 	n.peer = peer
+	if len(cluster.Members) == 1 {
+		n.ready.Store(true)
+	} else {
+		go n.startCatchUp(ctx, transport, cluster)
+	}
 
 	// 8. Start periodic WAL sync
 	core.StartPeriodicSync(ctx, 1*time.Second)
+	if n.checkpoints != nil {
+		interval := n.config.CheckpointInterval
+		if interval <= 0 {
+			interval = time.Minute
+		}
+		n.checkpointer = checkpoint.NewAutoCheckpointer(n.checkpoints, material, 1, interval)
+		n.checkpointer.Start(ctx, func() uint64 { return uint64(core.Tip()) }, n.qlogSync.Sync)
+	}
 	return nil
 }
 
@@ -308,6 +369,9 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 // Shutdown gracefully shuts down the node.
 func (n *Node) Shutdown() error {
 	n.opened.Store(false)
+	if n.checkpointer != nil {
+		n.checkpointer.Stop()
+	}
 	if n.peer != nil {
 		n.peer.Close()
 		n.peer = nil
@@ -316,26 +380,48 @@ func (n *Node) Shutdown() error {
 		n.transport.Close()
 		n.transport = nil
 	}
+	var shutdownErr error
+	if n.qlogSync != nil && n.material != nil && n.core != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := n.qlogSync.Sync(shutdownCtx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
+		} else if n.checkpointer != nil {
+			shutdownErr = errors.Join(shutdownErr, n.checkpointer.CheckpointOnShutdown(shutdownCtx, uint64(n.core.Tip())))
+		}
+		cancel()
+		n.qlogSync.Stop()
+		n.qlogSync = nil
+	}
 	// Close WAL
 	if n.wal != nil {
-		n.wal.Sync()
-		n.wal.Close()
+		shutdownErr = errors.Join(shutdownErr, n.wal.Sync(), n.wal.Close())
 		n.wal = nil
 	}
 
 	// Close materializer
 	if n.material != nil {
-		n.material.Close()
+		shutdownErr = errors.Join(shutdownErr, n.material.Close())
 		n.material = nil
 	}
 
 	// Release lock
 	if n.lock != nil {
-		n.lock.Release()
+		shutdownErr = errors.Join(shutdownErr, n.lock.Release())
 		n.lock = nil
 	}
 
-	return nil
+	if n.bucket != nil {
+		shutdownErr = errors.Join(shutdownErr, n.bucket.Close())
+		n.bucket = nil
+	}
+	return shutdownErr
+}
+
+func (n *Node) ObjectStoreStats() (objectstore.Stats, bool) {
+	if n.bucket == nil {
+		return objectstore.Stats{}, false
+	}
+	return n.bucket.Stats(), true
 }
 
 // loadClusterConfig loads cluster configuration.

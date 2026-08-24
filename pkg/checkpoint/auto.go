@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -17,6 +18,8 @@ type AutoCheckpointer struct {
 	interval int64 // checkpoint every N slots
 	duration time.Duration
 	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // NewAutoCheckpointer creates a new auto checkpointer.
@@ -31,8 +34,13 @@ func NewAutoCheckpointer(manager *Manager, material *materializer.Materializer, 
 }
 
 // Start starts the automatic checkpoint loop.
-func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64) {
+func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, before func(context.Context) error) {
+	if a.duration <= 0 || a.interval <= 0 {
+		return
+	}
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
 		ticker := time.NewTicker(a.duration)
 		defer ticker.Stop()
 
@@ -53,6 +61,12 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64) {
 				// Check if we've processed enough new slots
 				if tip-lastCheckpoint < uint64(a.interval) {
 					continue
+				}
+				if before != nil {
+					if err := before(ctx); err != nil {
+						log.Printf("failed to sync WAL before checkpoint: %v", err)
+						continue
+					}
 				}
 
 				log.Printf("creating automatic checkpoint at slot %d", tip)
@@ -78,7 +92,8 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64) {
 
 // Stop stops the automatic checkpoint loop.
 func (a *AutoCheckpointer) Stop() {
-	close(a.stopCh)
+	a.stopOnce.Do(func() { close(a.stopCh) })
+	a.wg.Wait()
 }
 
 // CheckpointOnShutdown creates a checkpoint during shutdown.

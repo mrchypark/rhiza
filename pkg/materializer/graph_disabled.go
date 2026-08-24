@@ -36,4 +36,12 @@ func (*Materializer) GraphRequestMatches(context.Context, types.GraphCommand) (b
 	return false, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
+func (*Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) { return sqlite, nil }
+
+func prepareSnapshot(data []byte, _ string) (snapshotParts, error) {
+	return snapshotParts{sqlite: data}, nil
+}
+
+func (*Materializer) validateRestoredSnapshot() error { return nil }
+
 func (*Materializer) graphHealth() error { return nil }

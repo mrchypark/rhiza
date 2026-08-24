@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/thanos-io/objstore"
@@ -32,6 +33,7 @@ type Manager struct {
 	bucket   objstore.Bucket
 	prefix   string
 	manifest *Manifest
+	mu       sync.Mutex
 }
 
 // NewManager creates a new checkpoint manager.
@@ -45,6 +47,8 @@ func NewManager(bucket objstore.Bucket, prefix, localDir string) *Manager {
 
 // Load loads the manifest from object storage.
 func (m *Manager) Load(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	key := m.key("checkpoint/manifest.json")
 	r, err := m.bucket.Get(ctx, key)
 	if err != nil {
@@ -65,6 +69,12 @@ func (m *Manager) Load(ctx context.Context) error {
 
 // Save saves the manifest to object storage.
 func (m *Manager) Save(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.save(ctx)
+}
+
+func (m *Manager) save(ctx context.Context) error {
 	data, err := json.MarshalIndent(m.manifest, "", "  ")
 	if err != nil {
 		return err
@@ -76,11 +86,19 @@ func (m *Manager) Save(ctx context.Context) error {
 
 // Create uploads a transactionally consistent materializer snapshot.
 func (m *Manager) Create(ctx context.Context, data []byte, index uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(data) == 0 {
 		return fmt.Errorf("empty checkpoint")
 	}
 	// Calculate hash
 	hash := sha256.Sum256(data)
+	if count := len(m.manifest.Checkpoints); count > 0 {
+		latest := m.manifest.Checkpoints[count-1]
+		if latest.Index == index && latest.Hash == hash {
+			return nil
+		}
+	}
 
 	// Upload to object storage
 	key := m.key(fmt.Sprintf("checkpoint/%d-%x", index, hash[:8]))
@@ -98,11 +116,13 @@ func (m *Manager) Create(ctx context.Context, data []byte, index uint64) error {
 	m.manifest.Checkpoints = append(m.manifest.Checkpoints, cp)
 
 	log.Printf("checkpoint created: index=%d size=%d", index, len(data))
-	return m.Save(ctx)
+	return m.save(ctx)
 }
 
 // Latest returns the most recent checkpoint.
 func (m *Manager) Latest() *Checkpoint {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(m.manifest.Checkpoints) == 0 {
 		return nil
 	}
@@ -112,6 +132,17 @@ func (m *Manager) Latest() *Checkpoint {
 
 // Download downloads a checkpoint to local directory.
 func (m *Manager) Download(ctx context.Context, index uint64, dstPath string) error {
+	data, err := m.Read(ctx, index)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dstPath, data, 0600)
+}
+
+// Read downloads and verifies a checkpoint before it can be restored.
+func (m *Manager) Read(ctx context.Context, index uint64) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// Find checkpoint in manifest
 	var target *Checkpoint
 	for _, cp := range m.manifest.Checkpoints {
@@ -121,33 +152,34 @@ func (m *Manager) Download(ctx context.Context, index uint64, dstPath string) er
 		}
 	}
 	if target == nil {
-		return fmt.Errorf("checkpoint %d not found", index)
+		return nil, fmt.Errorf("checkpoint %d not found", index)
 	}
 
 	// Download from object storage
 	key := m.key(fmt.Sprintf("checkpoint/%d-%x", target.Index, target.Hash[:8]))
 	r, err := m.bucket.Get(ctx, key)
 	if err != nil {
-		return fmt.Errorf("download checkpoint: %w", err)
+		return nil, fmt.Errorf("download checkpoint: %w", err)
 	}
 	defer r.Close()
 
-	// Write to local file
-	f, err := os.Create(dstPath)
+	data, err := io.ReadAll(r)
 	if err != nil {
-		return fmt.Errorf("create file: %w", err)
+		return nil, fmt.Errorf("read checkpoint: %w", err)
 	}
-	defer f.Close()
-
-	if _, err := io.Copy(f, r); err != nil {
-		return fmt.Errorf("write file: %w", err)
+	if int64(len(data)) != target.Size {
+		return nil, fmt.Errorf("checkpoint %d size mismatch: got %d want %d", index, len(data), target.Size)
 	}
-
-	return nil
+	if sha256.Sum256(data) != target.Hash {
+		return nil, fmt.Errorf("checkpoint %d hash mismatch", index)
+	}
+	return data, nil
 }
 
 // Cleanup removes old checkpoints, keeping the latest N.
 func (m *Manager) Cleanup(ctx context.Context, keep int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(m.manifest.Checkpoints) <= keep {
 		return nil
 	}
@@ -162,7 +194,7 @@ func (m *Manager) Cleanup(ctx context.Context, keep int) error {
 	}
 
 	m.manifest.Checkpoints = m.manifest.Checkpoints[len(toRemove):]
-	return m.Save(ctx)
+	return m.save(ctx)
 }
 
 // key prepends the prefix to the path.

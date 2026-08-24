@@ -2,8 +2,16 @@ package qlog
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/thanos-io/objstore"
 )
 
 func TestEntryEncodeDecode(t *testing.T) {
@@ -129,6 +137,145 @@ func TestWALRolloverRoundTrip(t *testing.T) {
 	entries, err := reopened.Read()
 	if err != nil || len(entries) != 3 {
 		t.Fatalf("entries=%d err=%v", len(entries), err)
+	}
+}
+
+func TestWALRepairsTornTailBeforeAppend(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := uint64(1); slot <= 2; slot++ {
+		if err := wal.Append(Entry{Slot: slot, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "seg_001.log")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, info.Size()-5); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Append(Entry{Slot: 3, Type: EntryProposal, Payload: []byte("after-repair")}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Slot != 1 || entries[1].Slot != 3 {
+		t.Fatalf("repaired entries = %#v", entries)
+	}
+}
+
+func TestWALSortsSegmentIndexesNumerically(t *testing.T) {
+	dir := t.TempDir()
+	for _, entry := range []Entry{{Slot: 999, Type: EntryProposal}, {Slot: 1000, Type: EntryProposal}} {
+		path := filepath.Join(dir, fmt.Sprintf("seg_%03d.log", entry.Slot))
+		if err := os.WriteFile(path, entry.Encode(), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Slot != 999 || entries[1].Slot != 1000 || wal.current.index != 1000 {
+		t.Fatalf("segments were not sorted numerically: %#v current=%d", entries, wal.current.index)
+	}
+}
+
+func TestRecoveryInstallsExactObjectStoreSegment(t *testing.T) {
+	segment := append(
+		Entry{Slot: 1, Type: EntryProposal, Payload: []byte("one")}.Encode(),
+		Entry{Slot: 2, Type: EntryDecide, Payload: []byte("two")}.Encode()...,
+	)
+	hash := sha256.Sum256(segment)
+	manifest := Manifest{Segments: []SegmentMeta{{Index: 1, StartSlot: 1, EndSlot: 2, Size: int64(len(segment)), Hash: hash, Synced: true}}, TipSlot: 2}
+	manifestData, err := json.Marshal(&manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := objstore.NewInMemBucket()
+	ctx := context.Background()
+	if err := bucket.Upload(ctx, "qlog/segments/seg_001.log", bytes.NewReader(segment)); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, "qlog/manifest.json", bytes.NewReader(manifestData)); err != nil {
+		t.Fatal(err)
+	}
+
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	tip, err := NewRecovery(wal, NewManifest(), bucket, "").Recover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tip != 2 || len(entries) != 2 || entries[0].Slot != 1 || entries[1].Slot != 2 {
+		t.Fatalf("tip=%d entries=%#v", tip, entries)
+	}
+}
+
+func TestRecoveryExtendsMatchingLocalSegment(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	remote, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := uint64(1); slot <= 2; slot++ {
+		if err := remote.Append(Entry{Slot: slot, Type: EntryDecide, Payload: []byte{byte(slot)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syncer := NewObjStoreSyncer(remote, NewManifest(), bucket, "", time.Second)
+	if err := syncer.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_ = remote.Close()
+
+	local, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	if err := local.Append(Entry{Slot: 1, Type: EntryDecide, Payload: []byte{1}}); err != nil {
+		t.Fatal(err)
+	}
+	tip, err := NewRecovery(local, NewManifest(), bucket, "").Recover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := local.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tip != 2 || len(entries) != 2 {
+		t.Fatalf("tip=%d entries=%#v", tip, entries)
 	}
 }
 

@@ -43,6 +43,7 @@ type SQLStatementResult struct {
 // SQLCommandResult is persisted with the request ID for idempotent retries.
 type SQLCommandResult struct {
 	Statements []SQLStatementResult `json:"statements"`
+	Error      string               `json:"error,omitempty"`
 }
 
 // KVCommand is a replicated mutation of the typed key/value store.
@@ -77,6 +78,7 @@ type GraphCommand struct {
 type GraphCommandResult struct {
 	Columns []string `json:"columns,omitempty"`
 	Rows    [][]any  `json:"rows,omitempty"`
+	Error   string   `json:"error,omitempty"`
 }
 
 func EncodeGraphCommand(command GraphCommand) ([]byte, error) {

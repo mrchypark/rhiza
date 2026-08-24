@@ -469,6 +469,20 @@ func (c *Core) Record(_ context.Context, request RecordRequest) (Summary, error)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if decided, ok := c.decided[request.Slot]; ok {
+		decision, err := decodeDecision(decided.Certificate)
+		if err != nil {
+			return Summary{}, err
+		}
+		step := decision.Step
+		if request.Step > step {
+			step = request.Step
+		}
+		return Summary{
+			RecorderID: c.nodeID, Step: step, FirstCurrent: cloneProposal(&decision.Proposal),
+			AggregatePrior: cloneProposal(&decision.Proposal),
+		}, nil
+	}
 	epoch := leaderEpoch(request.Slot)
 	if _, ok := c.epochStart[epoch]; !ok {
 		c.epochStart[epoch] = c.now()
@@ -519,6 +533,7 @@ func (c *Core) AcceptDecision(decision Decision) error {
 	value := DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: append([]byte(nil), decision.Proposal.Value...), Certificate: certificate}
 	c.decided[decision.Slot] = value
 	c.byHash[decision.Proposal.Hash] = decision.Slot
+	delete(c.recorders, decision.Slot)
 	c.advanceTipLocked()
 	listeners := append([]chan SlotValue(nil), c.listeners...)
 	c.mu.Unlock()
@@ -744,11 +759,6 @@ func (c *Core) recover() error {
 	if err != nil {
 		return err
 	}
-	type recoveredDecision struct {
-		decision    Decision
-		certificate []byte
-	}
-	recovered := make([]recoveredDecision, 0)
 	for _, entry := range entries {
 		switch entry.Type {
 		case qlog.EntryReceipt:
@@ -760,33 +770,32 @@ func (c *Core) recover() error {
 				return fmt.Errorf("recover QuePaxa ISR: %w", err)
 			}
 			c.mu.Lock()
-			c.recorders[persisted.Slot] = persisted.State
+			if _, decided := c.decided[persisted.Slot]; !decided {
+				c.recorders[persisted.Slot] = persisted.State
+			}
 			c.mu.Unlock()
 		case qlog.EntryDecide:
 			if !bytes.HasPrefix(entry.Payload, decisionEntryMagic) {
 				continue
 			}
-			certificate := append([]byte(nil), entry.Payload[len(decisionEntryMagic):]...)
+			certificate := entry.Payload[len(decisionEntryMagic):]
 			decision, err := decodeDecision(certificate)
 			if err != nil {
 				return err
 			}
-			recovered = append(recovered, recoveredDecision{decision: decision, certificate: certificate})
-		}
-	}
-	sort.Slice(recovered, func(i, j int) bool { return recovered[i].decision.Slot < recovered[j].decision.Slot })
-	for _, item := range recovered {
-		if err := c.validateDecision(item.decision); err != nil {
-			return fmt.Errorf("recover QuePaxa decision: %w", err)
-		}
-		c.mu.Lock()
-		if existing, ok := c.decided[item.decision.Slot]; ok && existing.Hash != item.decision.Proposal.Hash {
+			if err := c.validateDecision(decision); err != nil {
+				return fmt.Errorf("recover QuePaxa decision: %w", err)
+			}
+			c.mu.Lock()
+			if existing, ok := c.decided[decision.Slot]; ok && existing.Hash != decision.Proposal.Hash {
+				c.mu.Unlock()
+				return fmt.Errorf("conflicting decisions at slot %d", decision.Slot)
+			}
+			c.decided[decision.Slot] = DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: decision.Proposal.Value, Certificate: certificate}
+			c.byHash[decision.Proposal.Hash] = decision.Slot
+			delete(c.recorders, decision.Slot)
 			c.mu.Unlock()
-			return fmt.Errorf("conflicting decisions at slot %d", item.decision.Slot)
 		}
-		c.decided[item.decision.Slot] = DecidedValue{Slot: item.decision.Slot, Hash: item.decision.Proposal.Hash, Value: append([]byte(nil), item.decision.Proposal.Value...), Certificate: item.certificate}
-		c.byHash[item.decision.Proposal.Hash] = item.decision.Slot
-		c.mu.Unlock()
 	}
 	c.mu.Lock()
 	c.advanceTipLocked()

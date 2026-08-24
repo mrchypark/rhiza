@@ -134,6 +134,38 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 	}
 }
 
+func TestFailedSQLCommandRecordsResultAndAdvancesTip(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/failure.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	commands := [][]types.SQLCommand{
+		{{RequestID: "schema", SQL: "CREATE TABLE failures (id INTEGER PRIMARY KEY)"}},
+		{{RequestID: "first", SQL: "INSERT INTO failures VALUES (1)"}},
+		{{RequestID: "duplicate", SQL: "INSERT INTO failures VALUES (1)"}},
+		{{RequestID: "after", SQL: "INSERT INTO failures VALUES (2)"}},
+	}
+	for i, batch := range commands {
+		value, err := types.EncodeSQLBatch(batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Apply(ctx, uint64(i+1), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := m.RequestResult(ctx, "duplicate")
+	if err != nil || result.Error == "" || m.Tip() != 4 {
+		t.Fatalf("result=%+v tip=%d err=%v", result, m.Tip(), err)
+	}
+	var count int
+	if err := m.QueryRow(ctx, "SELECT COUNT(*) FROM failures").Scan(&count); err != nil || count != 2 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
 func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(t.TempDir()+"/features.db", 1)

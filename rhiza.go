@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -32,23 +33,33 @@ type KVMutationRequest = network.KVMutationRequest
 type KVMutationResponse = network.KVMutationResponse
 type GraphQueryRequest = network.GraphQueryRequest
 type GraphExecuteResponse = network.GraphExecuteResponse
+type ObjectStoreStats = objstore.Stats
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
-	ClusterID          string
-	NodeID             string
-	Profile            Profile
-	DataDir            string
-	BindAddr           string
-	PeerAddr           string
-	AdminToken         string
-	ClientToken        string
-	Members            []Member
-	ObjStoreEndpoint   string
-	ObjStoreBucket     string
-	CheckpointInterval time.Duration
-	ReadTimeout        time.Duration
-	HedgeDelay         time.Duration
+	ClusterID            string
+	NodeID               string
+	Profile              Profile
+	DataDir              string
+	BindAddr             string
+	PeerAddr             string
+	AdminToken           string
+	ClientToken          string
+	Members              []Member
+	ObjStoreEndpoint     string
+	ObjStoreBucket       string
+	ObjStoreProvider     string
+	ObjStoreDir          string
+	ObjStorePrefix       string
+	ObjStoreRegion       string
+	ObjStoreInsecure     bool
+	ObjStoreRetries      int
+	ObjStoreAccessKey    string
+	ObjStoreSecretKey    string
+	ObjStoreSessionToken string
+	CheckpointInterval   time.Duration
+	ReadTimeout          time.Duration
+	HedgeDelay           time.Duration
 }
 
 const (
@@ -98,6 +109,9 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, ClientToken: config.ClientToken, Members: config.Members,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
+		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
+		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,
+		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
 		CheckpointInterval: config.CheckpointInterval, ReadTimeout: config.ReadTimeout, HedgeDelay: config.HedgeDelay,
 	}
 	n := node.New(internalConfig)
@@ -152,4 +166,8 @@ func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (uint64, err
 }
 func (db *DB) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
 	return db.api.NotifySubscribe(topic)
+}
+
+func (db *DB) ObjectStoreStats() (ObjectStoreStats, bool) {
+	return db.node.ObjectStoreStats()
 }

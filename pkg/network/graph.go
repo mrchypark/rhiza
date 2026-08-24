@@ -11,8 +11,10 @@ import (
 )
 
 type GraphExecuteResponse struct {
-	Slot   uint64                   `json:"slot"`
-	Result types.GraphCommandResult `json:"result"`
+	Slot    uint64                   `json:"slot"`
+	Success bool                     `json:"success"`
+	Error   string                   `json:"error,omitempty"`
+	Result  types.GraphCommandResult `json:"result"`
 }
 
 type GraphQueryRequest struct {
@@ -64,7 +66,7 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 		return GraphExecuteResponse{}, err
 	}
 	result, err := s.material.GraphRequestResult(ctx, command.RequestID)
-	return GraphExecuteResponse{Slot: uint64(slot), Result: result}, err
+	return GraphExecuteResponse{Slot: uint64(slot), Success: result.Error == "", Error: result.Error, Result: result}, err
 }
 
 func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {

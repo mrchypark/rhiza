@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/thanos-io/objstore"
@@ -20,6 +21,7 @@ type ObjStoreSyncer struct {
 	prefix   string
 	interval time.Duration
 	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewObjStoreSyncer creates a new object storage syncer.
@@ -36,6 +38,9 @@ func NewObjStoreSyncer(wal *WAL, manifest *Manifest, bucket objstore.Bucket, pre
 
 // Start starts the background sync loop.
 func (s *ObjStoreSyncer) Start(ctx context.Context) {
+	if s.interval <= 0 {
+		return
+	}
 	go func() {
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
@@ -47,7 +52,7 @@ func (s *ObjStoreSyncer) Start(ctx context.Context) {
 			case <-s.stopCh:
 				return
 			case <-ticker.C:
-				if err := s.sync(ctx); err != nil {
+				if err := s.Sync(ctx); err != nil {
 					log.Printf("object storage sync error: %v", err)
 				}
 			}
@@ -57,59 +62,36 @@ func (s *ObjStoreSyncer) Start(ctx context.Context) {
 
 // Stop stops the sync loop.
 func (s *ObjStoreSyncer) Stop() {
-	close(s.stopCh)
+	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
-// sync syncs unsynced segments to object storage.
-func (s *ObjStoreSyncer) sync(ctx context.Context) error {
-	unsynced := s.manifest.Unsynced()
-	if len(unsynced) == 0 {
+// Sync uploads only new or changed segments, then publishes their manifest.
+func (s *ObjStoreSyncer) Sync(ctx context.Context) error {
+	snapshots, err := s.wal.SegmentSnapshots()
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, snapshot := range snapshots {
+		if s.manifest.IsSynced(snapshot.Meta) {
+			continue
+		}
+		if err := s.syncSegment(ctx, snapshot.Meta, snapshot.Data); err != nil {
+			return fmt.Errorf("sync segment %d: %w", snapshot.Meta.Index, err)
+		}
+		s.manifest.UpsertSynced(snapshot.Meta)
+		changed = true
+	}
+	if !changed {
 		return nil
 	}
-
-	for _, seg := range unsynced {
-		if err := s.syncSegment(ctx, seg); err != nil {
-			return fmt.Errorf("sync segment %d: %w", seg.Index, err)
-		}
-		s.manifest.MarkSynced(seg.Index)
-	}
-
-	// Save manifest
 	return s.saveManifest(ctx)
 }
 
 // syncSegment syncs a single segment to object storage.
-func (s *ObjStoreSyncer) syncSegment(ctx context.Context, seg SegmentMeta) error {
-	// Read segment from local WAL
-	data, err := s.readSegment(seg.Index)
-	if err != nil {
-		return err
-	}
-
-	// Upload to object storage
+func (s *ObjStoreSyncer) syncSegment(ctx context.Context, seg SegmentMeta, data []byte) error {
 	key := s.key(fmt.Sprintf("qlog/segments/seg_%03d.log", seg.Index))
 	return s.bucket.Upload(ctx, key, bytes.NewReader(data))
-}
-
-// readSegment reads a segment file into memory.
-func (s *ObjStoreSyncer) readSegment(index uint32) ([]byte, error) {
-	s.wal.mu.RLock()
-	defer s.wal.mu.RUnlock()
-
-	for _, seg := range s.wal.segments {
-		if seg.index == index {
-			seg.mu.Lock()
-			defer seg.mu.Unlock()
-
-			data := make([]byte, seg.offset)
-			if _, err := seg.file.ReadAt(data, 0); err != nil {
-				return nil, err
-			}
-			return data, nil
-		}
-	}
-
-	return nil, fmt.Errorf("segment %d not found", index)
 }
 
 // saveManifest saves the manifest to object storage.

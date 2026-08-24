@@ -6,7 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOEXPERIMENT=arenas go build -o rhiza ./cmd/rhiza
+RUN CGO_ENABLED=0 GOOS=linux GOEXPERIMENT=arenas,greenteagc go build -o rhiza ./cmd/rhiza
 
 FROM alpine:3.19
 

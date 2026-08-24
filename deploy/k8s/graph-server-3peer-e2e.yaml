@@ -4,6 +4,15 @@ metadata:
   name: rhiza-graph-3peer-e2e
 ---
 apiVersion: v1
+kind: Secret
+metadata:
+  name: rhiza-peer-auth
+  namespace: rhiza-graph-3peer-e2e
+type: Opaque
+stringData:
+  token: rhiza-local-e2e-peer-token
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: rhiza-graph-headless
@@ -66,11 +75,18 @@ spec:
               value: 0.0.0.0:9090
             - name: RHIZA_DATA_DIR
               value: /data
+            - name: RHIZA_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-peer-auth
+                  key: token
             - name: RHIZA_HEDGE_DELAY
               value: 20ms
+            - name: GOMEMLIMIT
+              value: 768MiB
             - name: RHIZA_CLUSTER_MEMBERS
               value: >-
-                [{"node_id":"rhiza-graph-0","url":"http://rhiza-graph-0.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc:8080","peer_url":"quic://rhiza-graph-0.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc:9090"},{"node_id":"rhiza-graph-1","url":"http://rhiza-graph-1.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc:8080","peer_url":"quic://rhiza-graph-1.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc:9090"},{"node_id":"rhiza-graph-2","url":"http://rhiza-graph-2.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc:8080","peer_url":"quic://rhiza-graph-2.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc:9090"}]
+                [{"node_id":"rhiza-graph-0","url":"http://rhiza-graph-0.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-graph-0.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc.cluster.local:9090"},{"node_id":"rhiza-graph-1","url":"http://rhiza-graph-1.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-graph-1.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc.cluster.local:9090"},{"node_id":"rhiza-graph-2","url":"http://rhiza-graph-2.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-graph-2.rhiza-graph-headless.rhiza-graph-3peer-e2e.svc.cluster.local:9090"}]
           ports:
             - name: http
               containerPort: 8080

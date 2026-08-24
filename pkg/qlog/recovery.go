@@ -2,6 +2,7 @@ package qlog
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 
@@ -29,7 +30,7 @@ func NewRecovery(wal *WAL, manifest *Manifest, bucket objstore.Bucket, prefix st
 func (r *Recovery) Recover(ctx context.Context) (uint64, error) {
 	// 1. Try to load manifest from object storage
 	if err := r.syncer.LoadManifest(ctx); err != nil {
-		log.Printf("failed to load manifest from object storage: %v", err)
+		return 0, fmt.Errorf("load object-store manifest: %w", err)
 	}
 
 	// 2. Read local WAL
@@ -79,24 +80,36 @@ func (r *Recovery) shouldRestore(ctx context.Context, localTip uint64) bool {
 
 // restoreFromObjectStorage restores state from object storage.
 func (r *Recovery) restoreFromObjectStorage(ctx context.Context) (uint64, error) {
-	// Download and replay segments from object storage
 	for _, seg := range r.manifest.Segments {
 		data, err := r.syncer.DownloadSegment(ctx, seg.Index)
 		if err != nil {
 			return 0, fmt.Errorf("download segment %d: %w", seg.Index, err)
 		}
-
-		// Write to local WAL
-		if err := r.wal.Append(Entry{
-			Slot:    seg.StartSlot,
-			Type:    EntryProposal,
-			Payload: data,
-		}); err != nil {
-			return 0, fmt.Errorf("write segment %d: %w", seg.Index, err)
+		if seg.Size > 0 && int64(len(data)) != seg.Size {
+			return 0, fmt.Errorf("segment %d size mismatch: got %d want %d", seg.Index, len(data), seg.Size)
+		}
+		hash := sha256.Sum256(data)
+		if seg.Hash != ([32]byte{}) && hash != seg.Hash {
+			return 0, fmt.Errorf("segment %d hash mismatch", seg.Index)
+		}
+		if err := r.wal.RestoreSegment(seg.Index, data); err != nil {
+			return 0, fmt.Errorf("restore segment %d: %w", seg.Index, err)
 		}
 	}
-
-	return r.manifest.TipSlot, nil
+	entries, err := r.wal.Read()
+	if err != nil {
+		return 0, fmt.Errorf("read restored WAL: %w", err)
+	}
+	var tip uint64
+	for _, entry := range entries {
+		if entry.Slot > tip {
+			tip = entry.Slot
+		}
+	}
+	if tip < r.manifest.TipSlot {
+		return 0, fmt.Errorf("restored WAL tip %d is behind manifest tip %d", tip, r.manifest.TipSlot)
+	}
+	return tip, nil
 }
 
 // RecoverFromCheckpoint restores from a checkpoint and replays WAL.

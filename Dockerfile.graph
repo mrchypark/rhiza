@@ -14,8 +14,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ENV CGO_ENABLED=1 CGO_CFLAGS=-I/opt/ladybug CGO_LDFLAGS=-L/opt/ladybug LD_LIBRARY_PATH=/opt/ladybug
-RUN GOEXPERIMENT=arenas go test -tags="graph system_ladybug" ./... && \
-    GOEXPERIMENT=arenas go build -tags="graph system_ladybug" -o rhiza ./cmd/rhiza
+RUN GOEXPERIMENT=arenas,greenteagc go test -tags="graph system_ladybug" ./... && \
+    GOEXPERIMENT=arenas,greenteagc go build -tags="graph system_ladybug" -o rhiza ./cmd/rhiza
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 && rm -rf /var/lib/apt/lists/*

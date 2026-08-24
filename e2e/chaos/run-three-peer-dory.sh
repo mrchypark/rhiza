@@ -37,6 +37,15 @@ suffix="$(date +%s)"
 table="chaos_3peer_${suffix}"
 node0="http://127.0.0.1:${base_port}"
 node1="http://127.0.0.1:$((base_port + 1))"
+wait_value() {
+  local peer="$1" value="$2" deadline=$((SECONDS + 15)) result
+  until result="$(curl -fsS -H 'Content-Type: application/json' -d \
+    "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
+    "http://127.0.0.1:$((base_port + peer))/v1/sql/query" 2>/dev/null)" && [[ "$result" == *"$value"* ]]; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.1
+  done
+}
 curl -fsS -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"schema-${suffix}\",\"sql\":\"CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT NOT NULL)\"}" \
   "$node0/v1/sql/execute" >/dev/null
@@ -45,10 +54,7 @@ curl -fsS -H 'Content-Type: application/json' -d \
   "$node1/v1/sql/execute" >/dev/null
 
 for peer in 0 1 2; do
-  result="$(curl -fsS -H 'Content-Type: application/json' -d \
-    "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
-    "http://127.0.0.1:$((base_port + peer))/v1/sql/query")"
-  [[ "$result" == *'before-fault'* ]]
+  wait_value "$peer" before-fault
 done
 
 restart_before="$(dory k8s get pod rhiza-sql-0 -n rhiza-3peer-e2e -o jsonpath='{.status.containerStatuses[0].restartCount}')"
@@ -66,10 +72,7 @@ write_seconds="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_total}' -H 'Con
   "$node1/v1/sql/execute")"
 
 for peer in 1 2; do
-  result="$(curl -fsS -H 'Content-Type: application/json' -d \
-    "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
-    "http://127.0.0.1:$((base_port + peer))/v1/sql/query")"
-  [[ "$result" == *'during-fault'* ]]
+  wait_value "$peer" during-fault
 done
 
 dory k8s wait podchaos/"$one_failure" -n rhiza-3peer-e2e --for=condition=AllRecovered=True --timeout=180s
@@ -148,8 +151,12 @@ until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   sleep 0.5
 done
 curl -fsS --max-time 20 -o /dev/null -H 'Content-Type: application/json' -d \
-  "{\"request_id\":\"after-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (3, 'after-quorum')\"}" \
+  "{\"request_id\":\"after-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (4, 'after-quorum')\"}" \
   "$node1/v1/sql/execute"
 dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
+result="$(curl -fsS -H 'Content-Type: application/json' -d \
+  "{\"sql\":\"SELECT value FROM ${table} WHERE id = 4\",\"consistency\":\"linearizable\"}" \
+  "$node1/v1/sql/query")"
+[[ "$result" == *'after-quorum'* ]]
 
 printf 'PASS: peers=3 failed=1 quorum-write=%ss converged=true rebuilt=true; failed=2 write-status=%s recovered-write=true\n' "$write_seconds" "$status"
