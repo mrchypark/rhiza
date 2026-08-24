@@ -22,8 +22,9 @@ const peerALPN = "rhiza-peer/1"
 const peerRPCTimeout = 5 * time.Second
 
 type peerConnection struct {
-	mu   sync.Mutex
-	conn *quic.Conn
+	mu     sync.Mutex
+	conn   *quic.Conn
+	active map[*quic.Conn]int
 }
 
 // Transport sends private peer RPCs over persistent raw QUIC connections.
@@ -42,7 +43,7 @@ type Transport struct {
 func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string) *Transport {
 	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
 	for _, member := range config.Members {
-		peers[member.ID] = &peerConnection{}
+		peers[member.ID] = &peerConnection{active: make(map[*quic.Conn]int)}
 	}
 	localToken := token
 	if member, ok := config.MemberSet()[localID]; ok && member.Token != "" {
@@ -122,7 +123,9 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 		case <-peer.conn.HandshakeComplete():
 		}
 	}
-	return peer.conn, nil
+	conn := peer.conn
+	peer.active[conn]++
+	return conn, nil
 }
 
 func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
@@ -132,9 +135,10 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 	if err != nil {
 		return nil, err
 	}
+	defer t.release(to, conn)
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		t.dropIfClosed(to, conn)
+		t.invalidate(to, conn)
 		return nil, err
 	}
 	defer stream.CancelRead(0)
@@ -142,17 +146,17 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 		_ = stream.SetDeadline(deadline)
 	}
 	if err := writePeerFrame(stream, encodePeerRequest(request)); err != nil {
-		t.dropIfClosed(to, conn)
+		t.invalidate(to, conn)
 		stream.CancelWrite(1)
 		return nil, err
 	}
 	if err := stream.Close(); err != nil {
-		t.dropIfClosed(to, conn)
+		t.invalidate(to, conn)
 		return nil, err
 	}
 	data, err := readPeerFrame(stream)
 	if err != nil {
-		t.dropIfClosed(to, conn)
+		t.invalidate(to, conn)
 		return nil, err
 	}
 	response, err := decodePeerResponse(data)
@@ -162,9 +166,27 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 	return response, err
 }
 
-func (t *Transport) dropIfClosed(to quepaxa.NodeID, conn *quic.Conn) {
-	if conn.Context().Err() != nil {
-		t.drop(to, conn)
+func (t *Transport) invalidate(to quepaxa.NodeID, conn *quic.Conn) {
+	peer := t.peers[to]
+	peer.mu.Lock()
+	if peer.conn == conn {
+		peer.conn = nil
+	}
+	peer.mu.Unlock()
+}
+
+func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {
+	peer := t.peers[to]
+	peer.mu.Lock()
+	peer.active[conn]--
+	remaining := peer.active[conn]
+	if remaining == 0 {
+		delete(peer.active, conn)
+	}
+	stale := peer.conn != conn
+	peer.mu.Unlock()
+	if remaining == 0 && stale {
+		_ = conn.CloseWithError(0, "reconnect")
 	}
 }
 
@@ -244,6 +266,10 @@ func (t *Transport) Close() error {
 			_ = peer.conn.CloseWithError(0, "shutdown")
 			peer.conn = nil
 		}
+		for conn := range peer.active {
+			_ = conn.CloseWithError(0, "shutdown")
+		}
+		clear(peer.active)
 		peer.mu.Unlock()
 	}
 	return nil
