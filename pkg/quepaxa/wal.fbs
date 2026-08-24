@@ -1,0 +1,19 @@
+namespace walfb;
+
+table Proposal {
+  priority:[ubyte] (id: 0);
+  proposer_id:string (id: 1);
+  hash:[ubyte] (id: 2);
+  value:[ubyte] (id: 3);
+}
+
+table RecorderState {
+  slot:ulong (id: 0);
+  step:ulong (id: 1);
+  first_current:Proposal (id: 2);
+  aggregate_current:Proposal (id: 3);
+  aggregate_prior:Proposal (id: 4);
+}
+
+root_type RecorderState;
+file_identifier "QISR";

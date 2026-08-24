@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
@@ -17,6 +19,27 @@ func (m *mockTransport) SendRecord(_ context.Context, to NodeID, request RecordR
 }
 
 func (m *mockTransport) SendDecision(context.Context, Decision) error {
+	return nil
+}
+
+type blockingDecisionTransport struct {
+	once    sync.Once
+	mu      sync.Mutex
+	slots   []Slot
+	started chan struct{}
+	release chan struct{}
+}
+
+func (t *blockingDecisionTransport) SendRecord(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
+	return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
+}
+
+func (t *blockingDecisionTransport) SendDecision(_ context.Context, decision Decision) error {
+	t.mu.Lock()
+	t.slots = append(t.slots, decision.Slot)
+	t.mu.Unlock()
+	t.once.Do(func() { close(t.started) })
+	<-t.release
 	return nil
 }
 
@@ -77,6 +100,33 @@ func TestCoreMayDecideSameValueInDifferentSlots(t *testing.T) {
 		if err != nil || slot != want {
 			t.Fatalf("proposal %d: slot=%d err=%v", want, slot, err)
 		}
+	}
+}
+
+func TestCoreDoesNotReuseFastPathPriorityAfterCanceledSlot(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}}}, wal, nil)
+	core.priority = func() (Priority, error) { return Priority{1}, nil }
+	core.releaseSlot(1) // A canceled attempt may already exist on a recorder.
+
+	slot, _, err := core.Propose(context.Background(), []byte("retry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	certified, ok := core.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("retried slot was not certified")
+	}
+	decision, err := decodeDecision(certified.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Proposal.Priority == highestPriority {
+		t.Fatal("reused slot incorrectly took the unique fast path")
 	}
 }
 
@@ -162,6 +212,44 @@ func TestRecorderDurablyPromotesLearnedHintBeforeReply(t *testing.T) {
 	}
 	if !core.durable[1] {
 		t.Fatal("recorder replied before durable promotion")
+	}
+}
+
+func TestDecisionDisseminationQueueIsBounded(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &blockingDecisionTransport{started: make(chan struct{}), release: make(chan struct{})}
+	config := &Cluster{Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}
+	core := newCore("n1", config, wal, transport)
+	for i := 0; i < decisionQueueSize+10; i++ {
+		core.enqueueDecision(Decision{Slot: Slot(i + 1)})
+	}
+	<-transport.started
+	if queued := len(core.decisionQ); queued > decisionQueueSize {
+		t.Fatalf("queued decisions=%d, want at most %d", queued, decisionQueueSize)
+	}
+	close(transport.release)
+	deadline := time.Now().Add(time.Second)
+	for {
+		core.decisionMu.Lock()
+		sending := core.sending
+		core.decisionMu.Unlock()
+		if !sending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("decision worker did not drain")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	transport.mu.Lock()
+	last := transport.slots[len(transport.slots)-1]
+	transport.mu.Unlock()
+	if want := Slot(decisionQueueSize + 10); last != want {
+		t.Fatalf("last disseminated slot=%d, want newest %d", last, want)
 	}
 }
 

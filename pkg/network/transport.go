@@ -134,7 +134,7 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 	}
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		t.drop(to, conn)
+		t.dropIfClosed(to, conn)
 		return nil, err
 	}
 	defer stream.CancelRead(0)
@@ -142,17 +142,17 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 		_ = stream.SetDeadline(deadline)
 	}
 	if err := writePeerFrame(stream, encodePeerRequest(request)); err != nil {
-		t.drop(to, conn)
+		t.dropIfClosed(to, conn)
 		stream.CancelWrite(1)
 		return nil, err
 	}
 	if err := stream.Close(); err != nil {
-		t.drop(to, conn)
+		t.dropIfClosed(to, conn)
 		return nil, err
 	}
 	data, err := readPeerFrame(stream)
 	if err != nil {
-		t.drop(to, conn)
+		t.dropIfClosed(to, conn)
 		return nil, err
 	}
 	response, err := decodePeerResponse(data)
@@ -160,6 +160,12 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 		return nil, quepaxa.ErrQuorumUnavailable
 	}
 	return response, err
+}
+
+func (t *Transport) dropIfClosed(to quepaxa.NodeID, conn *quic.Conn) {
+	if conn.Context().Err() != nil {
+		t.drop(to, conn)
+	}
 }
 
 func (t *Transport) drop(to quepaxa.NodeID, conn *quic.Conn) {

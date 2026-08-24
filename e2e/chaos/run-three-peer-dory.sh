@@ -145,15 +145,19 @@ if [[ "$status" != "503" ]]; then
   exit 1
 fi
 dory k8s wait podchaos/"$two_failures" -n rhiza-3peer-e2e --for=condition=AllRecovered=True --timeout=90s
+dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
 deadline=$((SECONDS + 60))
 until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done
-curl -fsS --max-time 20 -o /dev/null -H 'Content-Type: application/json' -d \
+deadline=$((SECONDS + 30))
+until curl -fsS --max-time 20 -o /dev/null -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"after-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (4, 'after-quorum')\"}" \
-  "$node1/v1/sql/execute"
-dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
+  "$node1/v1/sql/execute" 2>/dev/null; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.25
+done
 result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "{\"sql\":\"SELECT value FROM ${table} WHERE id = 4\",\"consistency\":\"linearizable\"}" \
   "$node1/v1/sql/query")"

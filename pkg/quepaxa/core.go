@@ -17,11 +17,13 @@ import (
 var ErrQuorumUnavailable = errors.New("QuePaxa quorum unavailable")
 
 var (
-	isrEntryMagic      = []byte("QISR1\x00")
+	isrEntryMagicV1    = []byte("QISR1\x00")
+	isrEntryMagicV2    = []byte("QISR2\x00")
 	decisionEntryMagic = []byte("QDEC1\x00")
 )
 
 const leaderEpochSize Slot = 16
+const decisionQueueSize = 1
 
 type leaderTiming struct {
 	average time.Duration
@@ -56,12 +58,16 @@ type Core struct {
 	tipChanged chan struct{}
 	decided    map[Slot]DecidedValue
 	durable    map[Slot]bool
+	logged     map[Slot]bool
 	byHash     map[ValueHash]Slot
 	recorders  map[Slot]ISR
 	listeners  []chan SlotValue
 	now        func() time.Time
 	epochStart map[uint64]time.Time
 	timings    map[NodeID]leaderTiming
+	decisionMu sync.Mutex
+	decisionQ  chan Decision
+	sending    bool
 }
 
 func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport) *Core {
@@ -69,8 +75,8 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), tipChanged: make(chan struct{}),
-		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), recorders: make(map[Slot]ISR),
-		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming),
+		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), recorders: make(map[Slot]ISR),
+		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), decisionQ: make(chan Decision, decisionQueueSize),
 	}
 }
 
@@ -89,7 +95,7 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 		if err := ctx.Err(); err != nil {
 			return 0, nil, err
 		}
-		slot := c.reserveSlot()
+		slot, reused := c.reserveSlot()
 		proposed := value
 		if c.isLeaderScheduleSlot(slot) {
 			if err := c.WaitTip(ctx, slot-1); err != nil {
@@ -108,7 +114,7 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			return 0, nil, err
 		}
 		c.markEpochStarted(slot)
-		decision, err := c.runSlot(ctx, slot, proposed, true)
+		decision, err := c.runSlot(ctx, slot, proposed, !reused)
 		if err != nil {
 			c.releaseSlot(slot)
 			return 0, nil, err
@@ -121,10 +127,52 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			return 0, nil, err
 		}
 		if c.transport != nil && len(c.config.Members) > 1 {
-			go func(decision Decision) { _ = c.transport.SendDecision(context.Background(), decision) }(decision)
+			c.enqueueDecision(decision)
 		}
 		if decision.Proposal.Hash == offeredHash && bytes.Equal(decision.Proposal.Value, value) {
 			return proposalResult(decision)
+		}
+	}
+}
+
+func (c *Core) enqueueDecision(decision Decision) {
+	c.decisionMu.Lock()
+	select {
+	case c.decisionQ <- decision:
+	default:
+		// Keep only the newest hint; paged catch-up supplies skipped decisions.
+		select {
+		case <-c.decisionQ:
+		default:
+		}
+		select {
+		case c.decisionQ <- decision:
+		default:
+		}
+	}
+	if !c.sending {
+		c.sending = true
+		go c.sendDecisions()
+	}
+	c.decisionMu.Unlock()
+}
+
+func (c *Core) sendDecisions() {
+	for {
+		select {
+		case decision := <-c.decisionQ:
+			_ = c.transport.SendDecision(context.Background(), decision)
+		default:
+			c.decisionMu.Lock()
+			select {
+			case decision := <-c.decisionQ:
+				c.decisionMu.Unlock()
+				_ = c.transport.SendDecision(context.Background(), decision)
+			default:
+				c.sending = false
+				c.decisionMu.Unlock()
+				return
+			}
 		}
 	}
 }
@@ -149,14 +197,14 @@ func (c *Core) decisionByValue(hash ValueHash, value []byte) (Decision, bool) {
 	return decision, err == nil
 }
 
-func (c *Core) reserveSlot() Slot {
+func (c *Core) reserveSlot() (Slot, bool) {
 	c.slotMu.Lock()
 	defer c.slotMu.Unlock()
 	for len(c.vacant) > 0 {
 		slot := c.vacant[0]
 		c.vacant = c.vacant[1:]
 		if !c.IsDecided(slot) {
-			return slot
+			return slot, true
 		}
 	}
 	if next := c.Tip() + 1; c.nextSlot < next {
@@ -164,7 +212,7 @@ func (c *Core) reserveSlot() Slot {
 	}
 	slot := c.nextSlot
 	c.nextSlot++
-	return slot
+	return slot, false
 }
 
 func leaderEpoch(slot Slot) uint64 {
@@ -475,6 +523,16 @@ func (c *Core) Record(_ context.Context, request RecordRequest) (Summary, error)
 	defer c.mu.Unlock()
 	if decided, ok := c.decided[request.Slot]; ok {
 		if !c.durable[request.Slot] {
+			if !c.logged[request.Slot] {
+				decision, err := decodeDecision(decided.Certificate)
+				if err != nil {
+					return Summary{}, err
+				}
+				if err := c.appendDecision(decision, decided.Certificate); err != nil {
+					return Summary{}, err
+				}
+				c.logged[request.Slot] = true
+			}
 			if err := c.wal.Sync(); err != nil {
 				return Summary{}, err
 			}
@@ -499,11 +557,8 @@ func (c *Core) Record(_ context.Context, request RecordRequest) (Summary, error)
 	}
 	next, summary := c.recorders[request.Slot].Record(request.Step, request.Proposal)
 	summary.RecorderID = c.nodeID
-	payload, err := json.Marshal(recorderEntry{Slot: request.Slot, State: next})
-	if err != nil {
-		return Summary{}, err
-	}
-	if err := c.wal.Append(qlog.Entry{Slot: uint64(request.Slot), Hash: request.Proposal.Hash, Type: qlog.EntryReceipt, Payload: append(isrEntryMagic, payload...)}); err != nil {
+	payload := encodeRecorderEntry(request.Slot, next)
+	if err := c.wal.Append(qlog.Entry{Slot: uint64(request.Slot), Hash: request.Proposal.Hash, Type: qlog.EntryReceipt, Payload: payload}); err != nil {
 		return Summary{}, err
 	}
 	if err := c.wal.Sync(); err != nil {
@@ -533,13 +588,18 @@ func (c *Core) acceptDecision(decision Decision, durable bool) error {
 	if err != nil {
 		return err
 	}
-	payload := append(append([]byte(nil), decisionEntryMagic...), certificate...)
-
 	c.mu.Lock()
 	if existing, ok := c.decided[decision.Slot]; ok {
 		if existing.Hash != decision.Proposal.Hash || !bytes.Equal(existing.Value, decision.Proposal.Value) {
 			c.mu.Unlock()
 			return fmt.Errorf("slot %d already decided with another value", decision.Slot)
+		}
+		if durable && !c.logged[decision.Slot] {
+			if err := c.appendDecision(decision, certificate); err != nil {
+				c.mu.Unlock()
+				return err
+			}
+			c.logged[decision.Slot] = true
 		}
 		if durable && !c.durable[decision.Slot] {
 			if err := c.wal.Sync(); err != nil {
@@ -551,11 +611,11 @@ func (c *Core) acceptDecision(decision Decision, durable bool) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if err := c.wal.Append(qlog.Entry{Slot: uint64(decision.Slot), Hash: decision.Proposal.Hash, Type: qlog.EntryDecide, Payload: payload}); err != nil {
-		c.mu.Unlock()
-		return err
-	}
 	if durable {
+		if err := c.appendDecision(decision, certificate); err != nil {
+			c.mu.Unlock()
+			return err
+		}
 		if err := c.wal.Sync(); err != nil {
 			c.mu.Unlock()
 			return err
@@ -564,6 +624,7 @@ func (c *Core) acceptDecision(decision Decision, durable bool) error {
 	value := DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: append([]byte(nil), decision.Proposal.Value...), Certificate: certificate}
 	c.decided[decision.Slot] = value
 	c.durable[decision.Slot] = durable
+	c.logged[decision.Slot] = durable
 	c.byHash[decision.Proposal.Hash] = decision.Slot
 	delete(c.recorders, decision.Slot)
 	c.advanceTipLocked()
@@ -577,6 +638,11 @@ func (c *Core) acceptDecision(decision Decision, durable bool) error {
 		}
 	}
 	return nil
+}
+
+func (c *Core) appendDecision(decision Decision, certificate []byte) error {
+	payload := append(append([]byte(nil), decisionEntryMagic...), certificate...)
+	return c.wal.Append(qlog.Entry{Slot: uint64(decision.Slot), Hash: decision.Proposal.Hash, Type: qlog.EntryDecide, Payload: payload})
 }
 
 // RecorderTip returns the highest slot represented by recovered durable ISR
@@ -631,6 +697,10 @@ func (c *Core) recoveryValue(slot Slot) []byte {
 }
 
 func (c *Core) validateDecision(decision Decision) error {
+	return c.validateDecisionForRecovery(decision, false)
+}
+
+func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader bool) error {
 	if decision.Slot == 0 || sha256.Sum256(decision.Proposal.Value) != decision.Proposal.Hash {
 		return fmt.Errorf("invalid QuePaxa decision value")
 	}
@@ -664,9 +734,13 @@ func (c *Core) validateDecision(decision Decision) error {
 	case 0:
 		order, err := c.LeaderOrder(decision.Slot)
 		if err != nil {
-			return err
+			epoch := leaderEpoch(decision.Slot)
+			missingControl := epoch >= c.explorationEpochs() && !c.IsDecided(leaderEpochFirst(epoch-1))
+			if !allowMissingLeader || !missingControl {
+				return err
+			}
 		}
-		if decision.Step != 4 || decision.Proposal.ProposerID != order[0] || decision.Proposal.Priority != highestPriority {
+		if decision.Step != 4 || (len(order) > 0 && decision.Proposal.ProposerID != order[0]) || decision.Proposal.Priority != highestPriority {
 			return fmt.Errorf("invalid QuePaxa fast-path decision")
 		}
 		for _, summary := range decision.Summaries {
@@ -704,14 +778,66 @@ func decodeDecision(certificate []byte) (Decision, error) {
 
 // AcceptCertifiedValue binds catch-up metadata to its certificate before mutation.
 func (c *Core) AcceptCertifiedValue(value DecidedValue) error {
-	decision, err := decodeDecision(value.Certificate)
-	if err != nil {
+	return c.AcceptCertifiedValues([]DecidedValue{value})
+}
+
+// AcceptCertifiedValues validates and persists a catch-up page with one sync.
+func (c *Core) AcceptCertifiedValues(values []DecidedValue) error {
+	return c.acceptCertifiedValues(values, true)
+}
+
+// AcceptCertifiedHints installs an on-demand page without adding a frontend
+// disk barrier; the source recorder quorum remains durable.
+func (c *Core) AcceptCertifiedHints(values []DecidedValue) error {
+	return c.acceptCertifiedValues(values, false)
+}
+
+func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error {
+	slots := make([]Slot, 0, len(values))
+	for _, value := range values {
+		decision, err := certifiedDecision(value)
+		if err != nil {
+			return err
+		}
+		if err := c.acceptDecision(decision, false); err != nil {
+			return err
+		}
+		if durable {
+			c.mu.Lock()
+			if !c.logged[decision.Slot] {
+				if err := c.appendDecision(decision, value.Certificate); err != nil {
+					c.mu.Unlock()
+					return err
+				}
+				c.logged[decision.Slot] = true
+			}
+			c.mu.Unlock()
+		}
+		slots = append(slots, decision.Slot)
+	}
+	if !durable || len(slots) == 0 {
+		return nil
+	}
+	if err := c.wal.Sync(); err != nil {
 		return err
 	}
-	if decision.Slot != value.Slot || decision.Proposal.Hash != value.Hash || !bytes.Equal(decision.Proposal.Value, value.Value) {
-		return fmt.Errorf("catch-up value does not match QuePaxa certificate")
+	c.mu.Lock()
+	for _, slot := range slots {
+		c.durable[slot] = true
 	}
-	return c.AcceptDecision(decision)
+	c.mu.Unlock()
+	return nil
+}
+
+func certifiedDecision(value DecidedValue) (Decision, error) {
+	decision, err := decodeDecision(value.Certificate)
+	if err != nil {
+		return Decision{}, err
+	}
+	if decision.Slot != value.Slot || decision.Proposal.Hash != value.Hash || !bytes.Equal(decision.Proposal.Value, value.Value) {
+		return Decision{}, fmt.Errorf("catch-up value does not match QuePaxa certificate")
+	}
+	return decision, nil
 }
 
 // CertifiedValue returns a decided value even if an earlier slot is still missing.
@@ -845,11 +971,11 @@ func (c *Core) recover() error {
 	for _, entry := range entries {
 		switch entry.Type {
 		case qlog.EntryReceipt:
-			if !bytes.HasPrefix(entry.Payload, isrEntryMagic) {
+			if !bytes.HasPrefix(entry.Payload, isrEntryMagicV1) && !bytes.HasPrefix(entry.Payload, isrEntryMagicV2) {
 				continue
 			}
-			var persisted recorderEntry
-			if err := json.Unmarshal(entry.Payload[len(isrEntryMagic):], &persisted); err != nil {
+			persisted, err := decodeRecorderEntry(entry.Payload)
+			if err != nil {
 				return fmt.Errorf("recover QuePaxa ISR: %w", err)
 			}
 			c.mu.Lock()
@@ -866,7 +992,7 @@ func (c *Core) recover() error {
 			if err != nil {
 				return err
 			}
-			if err := c.validateDecision(decision); err != nil {
+			if err := c.validateDecisionForRecovery(decision, true); err != nil {
 				return fmt.Errorf("recover QuePaxa decision: %w", err)
 			}
 			c.mu.Lock()
@@ -876,9 +1002,27 @@ func (c *Core) recover() error {
 			}
 			c.decided[decision.Slot] = DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: decision.Proposal.Value, Certificate: certificate}
 			c.durable[decision.Slot] = true
+			c.logged[decision.Slot] = true
 			c.byHash[decision.Proposal.Hash] = decision.Slot
 			delete(c.recorders, decision.Slot)
 			c.mu.Unlock()
+		}
+	}
+	c.mu.RLock()
+	recovered := make([]Decision, 0, len(c.decided))
+	for _, value := range c.decided {
+		decision, err := decodeDecision(value.Certificate)
+		if err != nil {
+			c.mu.RUnlock()
+			return err
+		}
+		recovered = append(recovered, decision)
+	}
+	c.mu.RUnlock()
+	sort.Slice(recovered, func(i, j int) bool { return recovered[i].Slot < recovered[j].Slot })
+	for _, decision := range recovered {
+		if err := c.validateDecisionForRecovery(decision, true); err != nil {
+			return fmt.Errorf("recover QuePaxa decision: %w", err)
 		}
 	}
 	c.mu.Lock()

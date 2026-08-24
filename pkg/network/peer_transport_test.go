@@ -55,6 +55,18 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	first := transport.peers[member.ID].conn
+	canceledCtx, cancelNow := context.WithCancel(ctx)
+	cancelNow()
+	if _, err := transport.SendRecord(canceledCtx, member.ID, request); err == nil {
+		t.Fatal("canceled stream succeeded")
+	}
+	if transport.peers[member.ID].conn != first {
+		t.Fatal("stream cancellation discarded healthy QUIC connection")
+	}
+	request.Step++
+	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
+		t.Fatalf("request after stream cancellation: %v", err)
+	}
 	transport.drop(member.ID, first)
 	request.Step++
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {

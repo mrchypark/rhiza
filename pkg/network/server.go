@@ -112,6 +112,7 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 	plan := s.proposerPlan()
 	members := plan.members
 	results := make(chan result, len(members))
+	var firstErr error
 	for rank, member := range members {
 		go func(rank int, member quepaxa.Member) {
 			delay := time.Duration(rank) * s.hedgeDelay
@@ -137,7 +138,7 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 			}
 			decision, err := s.transport.Propose(proposeCtx, member.ID, value)
 			if err == nil {
-				err = s.core.AcceptCertifiedValue(decision)
+				err = s.acceptFrom(proposeCtx, member.ID, decision)
 			}
 			results <- result{slot: decision.Slot, err: err, member: member.ID, rank: rank, worked: true}
 		}(rank, member)
@@ -153,9 +154,35 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 				}
 				return result.slot, nil
 			}
+			if firstErr == nil {
+				firstErr = result.err
+			}
 		}
 	}
+	if firstErr != nil {
+		return 0, fmt.Errorf("%w: %v", quepaxa.ErrQuorumUnavailable, firstErr)
+	}
 	return 0, quepaxa.ErrQuorumUnavailable
+}
+
+func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision quepaxa.DecidedValue) error {
+	for s.core.Tip() < decision.Slot {
+		from := s.core.Tip() + 1
+		response, err := s.transport.FetchDecisions(ctx, source, from, 256)
+		if err != nil {
+			return err
+		}
+		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
+			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
+		}
+		if err := s.core.AcceptCertifiedHints(response.Decisions); err != nil {
+			return err
+		}
+	}
+	if certified, ok := s.core.CertifiedValue(decision.Slot); !ok || certified.Hash != decision.Hash {
+		return fmt.Errorf("peer %s returned inconsistent decision slot %d", source, decision.Slot)
+	}
+	return nil
 }
 
 type proposerPlan struct {

@@ -3,6 +3,7 @@ package quepaxa
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math/rand"
 	"path/filepath"
@@ -518,6 +519,51 @@ func TestDecisionsRecoverDurablyAfterCrash(t *testing.T) {
 	}
 }
 
+func TestRecoveryDefersMissingLeaderScheduleToPeerCatchUp(t *testing.T) {
+	dir := t.TempDir()
+	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	config := &Cluster{Members: members}
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal := newProposal(highestPriority, "n1", []byte("durable-with-schedule-gap"))
+	decision := Decision{Slot: 130, Step: 4, Proposal: proposal, Summaries: []Summary{
+		{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+		{RecorderID: "n2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+	}}
+	certificate, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := append(append([]byte(nil), decisionEntryMagic...), certificate...)
+	if err := wal.Append(qlog.Entry{Slot: uint64(decision.Slot), Hash: proposal.Hash, Type: qlog.EntryDecide, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := recovered.CertifiedValue(decision.Slot); !ok {
+		t.Fatal("durable decision was not recovered")
+	}
+	if err := recovered.validateDecision(decision); err == nil {
+		t.Fatal("peer input bypassed missing leader schedule validation")
+	}
+}
+
 func TestClusterRecoversFastDecisionFromDurableRecorderQuorum(t *testing.T) {
 	cores, transport := newTestCluster(t)
 	for id := range cores {
@@ -525,6 +571,13 @@ func TestClusterRecoversFastDecisionFromDurableRecorderQuorum(t *testing.T) {
 	}
 	if slot, _, err := cores["n1"].Propose(context.Background(), []byte("quorum-only")); err != nil || slot != 1 {
 		t.Fatalf("propose slot=%d err=%v", slot, err)
+	}
+	proposerEntries, err := cores["n1"].wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(proposerEntries, func(entry qlog.Entry) bool { return entry.Type == qlog.EntryDecide }) {
+		t.Fatal("clustered fast path synchronously logged a redundant decision marker")
 	}
 
 	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}

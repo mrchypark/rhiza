@@ -313,7 +313,11 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
 	for {
 		if err := n.catchUp(ctx, transport, cluster); err != nil {
-			n.ready.Store(false)
+			// A transient peer timeout must not make an already caught-up node
+			// reject traffic; quorum operations enforce their own availability.
+			if !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+				n.ready.Store(false)
+			}
 			log.Printf("quorum catch-up failed: %v", err)
 		} else {
 			n.ready.Store(true)
@@ -378,13 +382,15 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 			if decision.Slot != expected {
 				return fmt.Errorf("catch-up gap: expected=%d got=%d", expected, decision.Slot)
 			}
-			if err := n.core.AcceptCertifiedValue(decision); err != nil {
-				return err
-			}
+			expected++
+		}
+		if err := n.core.AcceptCertifiedValues(best.Decisions); err != nil {
+			return err
+		}
+		for _, decision := range best.Decisions {
 			if err := n.material.Apply(ctx, uint64(decision.Slot), decision.Value); err != nil {
 				return err
 			}
-			expected++
 		}
 		if len(best.Decisions) == 0 {
 			return fmt.Errorf("catch-up source reported tip %d without slot %d", best.Tip, expected)

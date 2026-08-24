@@ -41,6 +41,13 @@ node2="http://127.0.0.1:$((base_port + 2))"
 post() {
   curl -fsS --max-time 25 -H 'Content-Type: application/json' -d "$2" "$1" >/dev/null
 }
+wait_for_pod() {
+  local pod="$1" deadline=$((SECONDS + 60))
+  until dory k8s get pod "$pod" -n rhiza-graph-3peer-e2e >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.5
+  done
+}
 post "$node0/v1/graph/execute" "{\"request_id\":\"schema-${suffix}\",\"cypher\":\"CREATE NODE TABLE ${table}(id STRING, value STRING, PRIMARY KEY(id))\"}"
 post "$node1/v1/graph/execute" "{\"request_id\":\"seed-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'before', value: 'fault'})\"}"
 
@@ -51,7 +58,7 @@ write_seconds="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_total}' -H 'Con
   "$node1/v1/graph/execute")"
 dory k8s wait podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=180s
 dory k8s delete pod rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
-dory k8s wait pod/rhiza-graph-2 -n rhiza-graph-3peer-e2e --for=create --timeout=60s
+wait_for_pod rhiza-graph-2
 dory k8s wait pod/rhiza-graph-2 -n rhiza-graph-3peer-e2e --for=condition=Ready --timeout=180s
 kill "${pf_pids[2]}" 2>/dev/null || true
 wait "${pf_pids[2]}" 2>/dev/null || true
@@ -101,7 +108,8 @@ if [[ "$status" != 503 ]]; then
 fi
 dory k8s wait podchaos/"$two_failures" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=90s
 dory k8s delete pod rhiza-graph-0 rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
-dory k8s wait pod/rhiza-graph-0 pod/rhiza-graph-2 -n rhiza-graph-3peer-e2e --for=create --timeout=60s
+wait_for_pod rhiza-graph-0
+wait_for_pod rhiza-graph-2
 dory k8s wait pod/rhiza-graph-0 pod/rhiza-graph-1 pod/rhiza-graph-2 -n rhiza-graph-3peer-e2e --for=condition=Ready --timeout=180s
 deadline=$((SECONDS + 90))
 until curl -fsS "$node1/ready" >/dev/null 2>&1; do
