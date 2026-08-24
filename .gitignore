@@ -1,4 +1,38 @@
-/target/
-/artifacts/
-/bench/hiqlite-recovery-client/target/
-**/*.rs.bk
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+rhiza
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

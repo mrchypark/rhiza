@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza
+  namespace: rhiza
+  labels:
+    app.kubernetes.io/name: rhiza
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: peer-quic
+      port: 9090
+      targetPort: peer-quic
+      protocol: UDP
+  selector:
+    app.kubernetes.io/name: rhiza
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-headless
+  namespace: rhiza
+  labels:
+    app.kubernetes.io/name: rhiza
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: peer-quic
+      port: 9090
+      targetPort: peer-quic
+      protocol: UDP
+  selector:
+    app.kubernetes.io/name: rhiza

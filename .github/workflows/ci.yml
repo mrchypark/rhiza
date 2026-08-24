@@ -9,168 +9,42 @@ permissions:
   contents: read
 
 jobs:
-  chaos-qualification-image:
-    name: Chaos qualification image (SQL, linux-amd64)
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[chaos-image]')
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
+  go:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arenas: [false, true]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        env:
+          GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
+        run: go test ./...
+      - name: Vet
+        if: matrix.arenas == false
+        run: go vet ./...
+      - name: Build
+        env:
+          GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
+        run: go build ./cmd/rhiza
+
+  containers:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Build and push SQL qualification image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          provenance: false
-          platforms: linux/amd64
-          build-args: RHIZA_PROFILE=sql
-          tags: ghcr.io/${{ github.repository }}-sql:chaos-${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            io.rhiza.qualification=chaos
-          cache-from: type=gha,scope=chaos-rhiza-sql-amd64
-          cache-to: type=gha,mode=max,scope=chaos-rhiza-sql-amd64,ignore-error=true
-      - name: Verify published image
-        env:
-          IMAGE: ghcr.io/${{ github.repository }}-sql:chaos-${{ github.sha }}
-        run: docker buildx imagetools inspect "$IMAGE"
-
-  profile-checks:
-    name: Cargo profile (${{ matrix.profile }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [sql, graph, kv]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Check, lint, and test profile
-        env:
-          RHIZA_PROFILE: ${{ matrix.profile }}
-        run: |
-          cargo_features=(--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc")
-          tuner_features=(--no-default-features --features "$RHIZA_PROFILE,recorder-postcard-rpc,tuner")
-          cargo check --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
-          cargo check --locked -p rhiza-cli --all-targets "${tuner_features[@]}"
-          dependency_tree="$RUNNER_TEMP/rhiza-${RHIZA_PROFILE}-dependencies.txt"
-          tuner_dependency_tree="$RUNNER_TEMP/rhiza-${RHIZA_PROFILE}-tuner-dependencies.txt"
-          cargo tree --locked -p rhiza-cli -e normal "${cargo_features[@]}" \
-            --prefix none --format '{p}' > "$dependency_tree"
-          cargo tree --locked -p rhiza-cli -e normal "${tuner_features[@]}" \
-            --prefix none --format '{p}' > "$tuner_dependency_tree"
-          case "$RHIZA_PROFILE" in
-            sql) forbidden=(rhiza-graph lbug rhiza-kv redb) ;;
-            graph) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-kv redb) ;;
-            kv) forbidden=(rhiza-sql rusqlite libsqlite3-sys rhiza-graph lbug) ;;
-            *) exit 64 ;;
-          esac
-          for dependency in "${forbidden[@]}"; do
-            for tree in "$dependency_tree" "$tuner_dependency_tree"; do
-              if awk -v package="$dependency" '$1 == package { found=1 } END { exit !found }' "$tree"; then
-                echo "$RHIZA_PROFILE profile unexpectedly includes $dependency" >&2
-                exit 1
-              fi
-            done
-          done
-          cargo clippy --locked -p rhiza-cli --all-targets "${cargo_features[@]}" -- -D warnings
-          cargo clippy --locked -p rhiza-cli --all-targets "${tuner_features[@]}" -- -D warnings
-          cargo test --locked -p rhiza-cli --all-targets "${cargo_features[@]}"
-          cargo test --locked -p rhiza-cli --all-targets "${tuner_features[@]}"
-          cargo test --locked -p rhiza-client --no-default-features \
-            --features "$RHIZA_PROFILE,tuner"
-          if [ "$RHIZA_PROFILE" = graph ]; then
-            cargo test --locked -p rhiza-graph
-            cargo test --locked -p rhiza-node --features graph --lib \
-              graph_write_retries_the_same_request_after_unknown_recorder_outcome
-            cargo test --locked -p rhiza-node --no-default-features --features graph --test graph_runtime
-            cargo test --locked -p rhiza-node --features graph --test durability \
-              graph_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node
-            cargo test --locked -p rhizadb --no-default-features --features graph \
-              --test graph_embedded --test feature_matrix
-          fi
-          if [ "$RHIZA_PROFILE" = kv ]; then
-            cargo test --locked -p rhiza-kv
-            cargo test --locked -p rhiza-node --no-default-features --features kv \
-              --test kv_runtime --test execution_profile_features
-            cargo test --locked -p rhiza-node --features kv \
-              --test durability kv_checkpoint_restores_snapshot_and_exact_suffix_to_a_fresh_other_node
-            cargo test --locked -p rhiza-client --no-default-features --features kv
-          fi
-
-  container-images:
-    name: Container image (rhiza-${{ matrix.profile }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [sql, graph, kv]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Build rhiza-${{ matrix.profile }}
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          load: true
-          tags: rhiza-${{ matrix.profile }}:ci
-          build-args: RHIZA_PROFILE=${{ matrix.profile }}
-          cache-from: |
-            type=gha,scope=rhiza-${{ matrix.profile }}
-          cache-to: type=gha,mode=max,scope=rhiza-${{ matrix.profile }}
-      - name: Verify distroless runtime contract
-        env:
-          RHIZA_IMAGE: rhiza-${{ matrix.profile }}:ci
-          RHIZA_PROFILE: ${{ matrix.profile }}
-        run: |
-          test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ index .Config.Labels "io.rhiza.build-profile" }}')" = "$RHIZA_PROFILE"
-          test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ json .Config.Entrypoint }}')" = '["/usr/local/bin/rhiza"]'
-          test "$(docker image inspect "$RHIZA_IMAGE" --format '{{ .Config.User }}')" = '65532:65532'
-      - name: Smoke-test runtime loader
-        env:
-          RHIZA_IMAGE: rhiza-${{ matrix.profile }}:ci
-        run: |
-          set +e
-          runtime_output="$(docker run --rm "$RHIZA_IMAGE" 2>&1)"
-          runtime_status=$?
-          set -e
-          test "$runtime_status" -eq 2
-          printf '%s\n' "$runtime_output" | grep -Fx 'missing command'
-          printf '%s\n' "$runtime_output" | grep -Fx 'usage:'
-
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          tags: rhiza-sql-kv:ci
+      - uses: docker/build-push-action@v6
         with:
-          components: clippy, rustfmt
-      - name: Install pinned yq
-        env:
-          YQ_VERSION: v4.47.2
-          YQ_SHA256: 1bb99e1019e23de33c7e6afc23e93dad72aad6cf2cb03c797f068ea79814ddb0
-        run: |
-          curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o "${RUNNER_TEMP}/yq"
-          echo "${YQ_SHA256}  ${RUNNER_TEMP}/yq" | sha256sum -c -
-          sudo install -m 0755 "${RUNNER_TEMP}/yq" /usr/local/bin/yq
-      - name: Run the same check suite used locally
-        run: scripts/check-ci.sh
-
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89
-      - run: cargo check -p rhiza-core -p rhiza-quepaxa --lib --locked
+          context: .
+          file: Dockerfile.graph
+          push: false
+          tags: rhiza-graph-kv:ci

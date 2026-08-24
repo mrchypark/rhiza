@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rhiza
+  namespace: rhiza
+  labels:
+    app.kubernetes.io/name: rhiza
+spec:
+  serviceName: rhiza
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rhiza
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rhiza
+    spec:
+      containers:
+        - name: rhiza
+          image: rhiza:latest
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: peer-quic
+              containerPort: 9090
+              protocol: UDP
+          envFrom:
+            - configMapRef:
+                name: rhiza-config
+          env:
+            - name: RHIZA_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: objstore
+              mountPath: /objstore
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: objstore
+          emptyDir: {}

@@ -1,0 +1,16 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: rhiza-graph-two-peer-failure
+  namespace: rhiza-graph-3peer-e2e
+spec:
+  action: pod-failure
+  mode: all
+  duration: 20s
+  selector:
+    pods:
+      rhiza-graph-3peer-e2e:
+        - rhiza-graph-0
+        - rhiza-graph-2
+  containerNames:
+    - rhiza-graph

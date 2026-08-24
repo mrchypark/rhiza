@@ -1,0 +1,15 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: rhiza-preferred-peer-failure
+  namespace: rhiza-3peer-e2e
+spec:
+  action: pod-failure
+  mode: one
+  duration: 2m
+  selector:
+    pods:
+      rhiza-3peer-e2e:
+        - rhiza-sql-0
+  containerNames:
+    - rhiza-sql

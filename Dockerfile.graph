@@ -1,0 +1,27 @@
+FROM golang:1.27-bookworm AS builder
+
+ARG TARGETARCH
+ARG LBUG_VERSION=0.17.0
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl g++ && rm -rf /var/lib/apt/lists/*
+RUN case "$TARGETARCH" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) exit 1 ;; esac && \
+    mkdir -p /opt/ladybug && \
+    curl -fSL "https://github.com/LadybugDB/ladybug/releases/download/v${LBUG_VERSION}/liblbug-linux-${arch}.tar.gz" | tar xz -C /opt/ladybug && \
+    ln -sf "liblbug.so.${LBUG_VERSION}" /opt/ladybug/liblbug.so && \
+    ln -sf "liblbug.so.${LBUG_VERSION}" /opt/ladybug/liblbug.so.0
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ENV CGO_ENABLED=1 CGO_CFLAGS=-I/opt/ladybug CGO_LDFLAGS=-L/opt/ladybug LD_LIBRARY_PATH=/opt/ladybug
+RUN GOEXPERIMENT=arenas go test -tags="graph system_ladybug" ./... && \
+    GOEXPERIMENT=arenas go build -tags="graph system_ladybug" -o rhiza ./cmd/rhiza
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/ladybug/liblbug.so.0.17.0 /usr/local/lib/
+RUN ln -s liblbug.so.0.17.0 /usr/local/lib/liblbug.so && ln -s liblbug.so.0.17.0 /usr/local/lib/liblbug.so.0
+COPY --from=builder /app/rhiza /usr/local/bin/rhiza
+ENV LD_LIBRARY_PATH=/usr/local/lib
+EXPOSE 8080
+ENTRYPOINT ["rhiza"]

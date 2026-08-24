@@ -1,0 +1,73 @@
+namespace peerfb;
+
+enum Operation:ubyte {
+  None = 0,
+  Record = 1,
+  Propose = 2,
+  Learned = 3,
+  Decisions = 4
+}
+
+table Proposal {
+  priority:[ubyte] (id: 0);
+  proposer_id:string (id: 1);
+  hash:[ubyte] (id: 2);
+  value:[ubyte] (id: 3);
+}
+
+table Summary {
+  recorder_id:string (id: 0);
+  step:ulong (id: 1);
+  first_current:Proposal (id: 2);
+  aggregate_prior:Proposal (id: 3);
+}
+
+table RecordRequest {
+  slot:ulong (id: 0);
+  step:ulong (id: 1);
+  proposal:Proposal (id: 2);
+}
+
+table Decision {
+  slot:ulong (id: 0);
+  step:ulong (id: 1);
+  proposal:Proposal (id: 2);
+  summaries:[Summary] (id: 3);
+}
+
+table DecidedValue {
+  slot:ulong (id: 0);
+  hash:[ubyte] (id: 1);
+  value:[ubyte] (id: 2);
+  certificate:[ubyte] (id: 3);
+}
+
+table Request {
+  version:ushort = 1 (id: 0);
+  operation:Operation (id: 1);
+  cluster_id:string (id: 2);
+  sender_id:string (id: 3);
+  config_id:ulong (id: 4);
+  token:string (id: 5);
+  record:RecordRequest (id: 6);
+  value:[ubyte] (id: 7);
+  decision:Decision (id: 8);
+  from:ulong (id: 9);
+  limit:uint (id: 10);
+}
+
+table Response {
+  version:ushort = 1 (id: 0);
+  error:string (id: 1);
+  summary:Summary (id: 2);
+  decided:DecidedValue (id: 3);
+  cluster_id:string (id: 4);
+  proposer_id:string (id: 5);
+  config_id:ulong (id: 6);
+  tip:ulong (id: 7);
+  decisions:[DecidedValue] (id: 8);
+  error_code:ushort (id: 9);
+}
+
+root_type Request;
+file_identifier "RHZA";

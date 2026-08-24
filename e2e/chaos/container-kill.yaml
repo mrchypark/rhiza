@@ -1,0 +1,15 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: rhiza-sql-container-kill
+  namespace: rhiza-e2e
+spec:
+  action: container-kill
+  mode: one
+  selector:
+    namespaces:
+      - rhiza-e2e
+    labelSelectors:
+      app: rhiza-sql
+  containerNames:
+    - rhiza-sql

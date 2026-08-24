@@ -1,0 +1,255 @@
+package network
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net/url"
+	"sync"
+	"time"
+
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network/peerfb"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
+)
+
+const peerALPN = "rhiza-peer/1"
+const peerRPCTimeout = 5 * time.Second
+
+type peerConnection struct {
+	mu   sync.Mutex
+	conn *quic.Conn
+}
+
+// Transport sends private peer RPCs over persistent raw QUIC connections.
+type Transport struct {
+	members   map[quepaxa.NodeID]quepaxa.Member
+	clusterID types.ClusterID
+	configID  uint
+	localID   quepaxa.NodeID
+	token     string
+	tls       *tls.Config
+	quic      *quic.Config
+	peers     map[quepaxa.NodeID]*peerConnection
+}
+
+func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string) *Transport {
+	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
+	for _, member := range config.Members {
+		peers[member.ID] = &peerConnection{}
+	}
+	return &Transport{
+		members: config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
+		localID: localID, token: token, peers: peers,
+		tls: &tls.Config{
+			MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN},
+			InsecureSkipVerify: true, // Peer identity is fenced by membership and the configured token.
+			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
+		},
+		quic: &quic.Config{HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second, MaxIncomingStreams: 256},
+	}
+}
+
+func (t *Transport) request(operation peerfb.Operation) *peerfb.RequestT {
+	return &peerfb.RequestT{Operation: operation, ClusterId: string(t.clusterID), SenderId: string(t.localID), ConfigId: uint64(t.configID), Token: t.token}
+}
+
+func memberQUICAddr(member quepaxa.Member) (string, error) {
+	raw := member.PeerURL
+	if raw == "" {
+		raw = member.URL
+	}
+	endpoint, err := url.Parse(raw)
+	if err != nil || endpoint.Host == "" {
+		return "", fmt.Errorf("invalid peer URL %q", raw)
+	}
+	return endpoint.Host, nil
+}
+
+func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHandshake bool) (*quic.Conn, error) {
+	member, ok := t.members[to]
+	if !ok {
+		return nil, fmt.Errorf("unknown node: %s", to)
+	}
+	peer := t.peers[to]
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.conn == nil || peer.conn.Context().Err() != nil {
+		addr, err := memberQUICAddr(member)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig := t.tls.Clone()
+		tlsConfig.ServerName = string(to)
+		peer.conn, err = quic.DialAddrEarly(ctx, addr, tlsConfig, t.quic)
+		if err != nil {
+			peer.conn = nil
+			return nil, err
+		}
+	}
+	if waitHandshake {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-peer.conn.HandshakeComplete():
+		}
+	}
+	return peer.conn, nil
+}
+
+func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
+	ctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	defer cancel()
+	conn, err := t.connection(ctx, to, waitHandshake)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.drop(to, conn)
+		return nil, err
+	}
+	defer stream.CancelRead(0)
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	if err := writePeerFrame(stream, encodePeerRequest(request)); err != nil {
+		t.drop(to, conn)
+		stream.CancelWrite(1)
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		t.drop(to, conn)
+		return nil, err
+	}
+	data, err := readPeerFrame(stream)
+	if err != nil {
+		t.drop(to, conn)
+		return nil, err
+	}
+	response, err := decodePeerResponse(data)
+	if response != nil && response.ErrorCode == 1 {
+		return nil, quepaxa.ErrQuorumUnavailable
+	}
+	return response, err
+}
+
+func (t *Transport) drop(to quepaxa.NodeID, conn *quic.Conn) {
+	peer := t.peers[to]
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+	if peer.conn == conn {
+		peer.conn = nil
+		_ = conn.CloseWithError(0, "reconnect")
+	}
+}
+
+func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, from quepaxa.Slot, limit int) (DecisionsResponse, error) {
+	req := t.request(peerfb.OperationDecisions)
+	req.From, req.Limit = uint64(from), uint32(limit)
+	response, err := t.call(ctx, source, req, false)
+	if err != nil {
+		return DecisionsResponse{}, err
+	}
+	result := DecisionsResponse{ClusterID: types.ClusterID(response.ClusterId), ProposerID: quepaxa.NodeID(response.ProposerId), ConfigID: uint(response.ConfigId), Tip: quepaxa.Slot(response.Tip), Decisions: make([]quepaxa.DecidedValue, len(response.Decisions))}
+	for i := range response.Decisions {
+		result.Decisions[i], err = decidedFromWire(response.Decisions[i])
+		if err != nil {
+			return DecisionsResponse{}, err
+		}
+	}
+	if result.ClusterID != t.clusterID || result.ProposerID != source || result.ConfigID != t.configID {
+		return DecisionsResponse{}, fmt.Errorf("catch-up source identity mismatch")
+	}
+	return result, nil
+}
+
+func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	req := t.request(peerfb.OperationRecord)
+	req.Record = &peerfb.RecordRequestT{Slot: uint64(request.Slot), Step: uint64(request.Step), Proposal: proposalToWire(request.Proposal)}
+	response, err := t.call(ctx, to, req, false)
+	if err != nil {
+		return quepaxa.Summary{}, err
+	}
+	summary, err := summaryFromWire(response.Summary)
+	if err == nil && summary.RecorderID != to {
+		err = fmt.Errorf("recorder identity mismatch: want %s got %s", to, summary.RecorderID)
+	}
+	return summary, err
+}
+
+func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
+	req := t.request(peerfb.OperationPropose)
+	req.Value = value
+	response, err := t.call(ctx, to, req, true)
+	if err != nil {
+		return quepaxa.DecidedValue{}, err
+	}
+	return decidedFromWire(response.Decided)
+}
+
+func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {
+	var firstErr error
+	for _, member := range t.members {
+		if member.ID == t.localID {
+			continue
+		}
+		req := t.request(peerfb.OperationLearned)
+		req.Decision = decisionToWire(decision)
+		if _, err := t.call(ctx, member.ID, req, false); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (t *Transport) Close() error {
+	for _, peer := range t.peers {
+		peer.mu.Lock()
+		if peer.conn != nil {
+			_ = peer.conn.CloseWithError(0, "shutdown")
+			peer.conn = nil
+		}
+		peer.mu.Unlock()
+	}
+	return nil
+}
+
+func writePeerFrame(w io.Writer, data []byte) error {
+	if len(data) == 0 || len(data) > maxPeerFrame {
+		return fmt.Errorf("peer frame too large: %d", len(data))
+	}
+	frame := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(frame, uint32(len(data)))
+	copy(frame[4:], data)
+	for len(frame) > 0 {
+		n, err := w.Write(frame)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		frame = frame[n:]
+	}
+	return nil
+}
+
+func readPeerFrame(r io.Reader) ([]byte, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	size := binary.BigEndian.Uint32(header[:])
+	if size == 0 || size > maxPeerFrame {
+		return nil, fmt.Errorf("invalid peer frame size %d", size)
+	}
+	data := make([]byte, size)
+	_, err := io.ReadFull(r, data)
+	return data, err
+}
+
+var _ quepaxa.Transport = (*Transport)(nil)

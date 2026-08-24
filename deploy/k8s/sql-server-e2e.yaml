@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rhiza-e2e
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rhiza-sql
+  namespace: rhiza-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rhiza-sql
+  template:
+    metadata:
+      labels:
+        app: rhiza-sql
+    spec:
+      containers:
+        - name: rhiza-sql
+          image: rhiza-sql-e2e:dev
+          imagePullPolicy: Never
+          env:
+            - name: RHIZA_NODE_ID
+              value: node-1
+            - name: RHIZA_BIND_ADDR
+              value: 0.0.0.0:8080
+            - name: RHIZA_PEER_ADDR
+              value: 0.0.0.0:9090
+            - name: RHIZA_DATA_DIR
+              value: /data
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: peer-quic
+              containerPort: 9090
+              protocol: UDP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-sql
+  namespace: rhiza-e2e
+spec:
+  selector:
+    app: rhiza-sql
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+    - name: peer-quic
+      port: 9090
+      targetPort: peer-quic
+      protocol: UDP

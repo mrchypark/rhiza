@@ -1,5 +1,3 @@
-/target/
-**/target/
-/.git/
-/.rhiza-e2e/
-/.rhiza-objects/
+.git
+/rhiza
+*.db
