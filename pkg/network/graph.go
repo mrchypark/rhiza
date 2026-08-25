@@ -66,7 +66,13 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 		return GraphExecuteResponse{}, err
 	}
 	result, err := s.material.GraphRequestResult(ctx, command.RequestID)
-	return GraphExecuteResponse{Slot: uint64(slot), Success: result.Error == "", Error: result.Error, Result: result}, err
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil || !matches {
+		return GraphExecuteResponse{}, ErrRequestConflict
+	}
+	return GraphExecuteResponse{Slot: uint64(slot), Success: result.Error == "", Error: result.Error, Result: result}, nil
 }
 
 func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {

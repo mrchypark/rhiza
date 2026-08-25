@@ -364,6 +364,12 @@ func (m *Materializer) graphHealth() error {
 
 const graphSnapshotMagic = "RHIZA-GORAPHDB-SNAPSHOT-1\n"
 
+const (
+	maxGraphSnapshotFiles     = 65536
+	maxGraphSnapshotExpansion = 128
+	minGraphSnapshotExtracted = 64 << 20
+)
+
 func (m *Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) {
 	g := m.graph
 	if g == nil {
@@ -457,6 +463,23 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 	if err != nil {
 		return snapshotParts{}, fmt.Errorf("open graph checkpoint: %w", err)
 	}
+	maxExtracted := int64(len(archive)) * maxGraphSnapshotExpansion
+	if maxExtracted < minGraphSnapshotExtracted {
+		maxExtracted = minGraphSnapshotExtracted
+	}
+	if len(zr.File) > maxGraphSnapshotFiles {
+		return snapshotParts{}, fmt.Errorf("graph checkpoint exceeds entry limit")
+	}
+	var extracted uint64
+	for _, file := range zr.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		if file.UncompressedSize64 > uint64(maxExtracted)-extracted {
+			return snapshotParts{}, fmt.Errorf("graph checkpoint exceeds extraction limits")
+		}
+		extracted += file.UncompressedSize64
+	}
 	root, err := os.MkdirTemp(dir, ".rhiza-graph-restore-*")
 	if err != nil {
 		return snapshotParts{}, err
@@ -471,7 +494,7 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 				parts.cleanup()
 				return snapshotParts{}, err
 			}
-			parts.sqlite, err = io.ReadAll(reader)
+			parts.sqlite, err = io.ReadAll(io.LimitReader(reader, int64(file.UncompressedSize64)+1))
 			closeErr := reader.Close()
 			if err == nil {
 				err = closeErr
@@ -479,6 +502,10 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 			if err != nil {
 				parts.cleanup()
 				return snapshotParts{}, err
+			}
+			if uint64(len(parts.sqlite)) != file.UncompressedSize64 {
+				parts.cleanup()
+				return snapshotParts{}, fmt.Errorf("invalid sqlite checkpoint size")
 			}
 			continue
 		}
@@ -507,7 +534,11 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 		}
 		output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err == nil {
-			_, err = io.Copy(output, reader)
+			var copied int64
+			copied, err = io.Copy(output, io.LimitReader(reader, int64(file.UncompressedSize64)+1))
+			if err == nil && uint64(copied) != file.UncompressedSize64 {
+				err = fmt.Errorf("invalid graph checkpoint size for %q", file.Name)
+			}
 		}
 		_ = reader.Close()
 		if output != nil {

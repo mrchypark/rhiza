@@ -21,12 +21,19 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+const (
+	maxPeerConnections = 64
+	maxPeerStreams     = 1024
+)
+
 // PeerServer owns the private QUIC listener. Public HTTP remains a separate adapter.
 type PeerServer struct {
-	listener *quic.EarlyListener
-	server   *Server
-	members  map[quepaxa.NodeID]quepaxa.Member
-	token    string
+	listener    *quic.EarlyListener
+	server      *Server
+	members     map[quepaxa.NodeID]quepaxa.Member
+	token       string
+	connections chan struct{}
+	streams     chan struct{}
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
@@ -51,7 +58,10 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 	if err != nil {
 		return nil, err
 	}
-	peer := &PeerServer{listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), token: token}
+	peer := &PeerServer{
+		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), token: token,
+		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams),
+	}
 	for _, member := range members {
 		peer.members[member.ID] = member
 	}
@@ -73,7 +83,15 @@ func (s *PeerServer) serve(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		go s.serveConnection(ctx, conn)
+		select {
+		case s.connections <- struct{}{}:
+			go func() {
+				defer func() { <-s.connections }()
+				s.serveConnection(ctx, conn)
+			}()
+		default:
+			_ = conn.CloseWithError(1, "peer connection limit reached")
+		}
 	}
 }
 
@@ -83,7 +101,16 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 		if err != nil {
 			return
 		}
-		go s.serveStream(conn, stream)
+		select {
+		case s.streams <- struct{}{}:
+			go func() {
+				defer func() { <-s.streams }()
+				s.serveStream(conn, stream)
+			}()
+		default:
+			stream.CancelRead(1)
+			stream.CancelWrite(1)
+		}
 	}
 }
 
@@ -179,11 +206,18 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if err != nil {
 			return nil, err
 		}
-		wireDecisions := make([]*peerfb.DecidedValueT, len(decisions))
+		response := &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(tip)}
 		for i := range decisions {
-			wireDecisions[i] = decidedToWire(decisions[i])
+			response.Decisions = append(response.Decisions, decidedToWire(decisions[i]))
+			if len(encodePeerResponse(response)) > maxPeerFrame {
+				response.Decisions = response.Decisions[:len(response.Decisions)-1]
+				if len(response.Decisions) == 0 {
+					return nil, fmt.Errorf("decision %d exceeds peer frame limit", decisions[i].Slot)
+				}
+				break
+			}
 		}
-		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(tip), Decisions: wireDecisions}, nil
+		return response, nil
 	default:
 		return nil, fmt.Errorf("unknown peer operation %d", request.Operation)
 	}

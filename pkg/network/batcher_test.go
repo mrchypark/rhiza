@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -14,9 +15,12 @@ func TestSQLBatcherCombinesQueuedCommands(t *testing.T) {
 	var mu sync.Mutex
 	proposals := 0
 	commands := 0
+	ctx, cancel := context.WithCancel(context.Background())
 	b := &sqlBatcher{
 		input:    make(chan batchItem, 16),
 		inflight: make(chan struct{}, 16),
+		ctx:      ctx,
+		cancel:   cancel,
 		propose: func(_ context.Context, value []byte) (quepaxa.Slot, error) {
 			batch, ok, err := types.DecodeSQLBatch(value)
 			if err != nil || !ok {
@@ -30,6 +34,7 @@ func TestSQLBatcherCombinesQueuedCommands(t *testing.T) {
 		},
 		apply: func(context.Context, quepaxa.Slot) error { return nil },
 	}
+	b.wg.Add(1)
 
 	results := make(chan error, 4)
 	for i := 0; i < 4; i++ {
@@ -43,6 +48,7 @@ func TestSQLBatcherCombinesQueuedCommands(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	go b.run()
+	defer b.Close()
 	for range 4 {
 		if err := <-results; err != nil {
 			t.Fatal(err)
@@ -52,5 +58,27 @@ func TestSQLBatcherCombinesQueuedCommands(t *testing.T) {
 	defer mu.Unlock()
 	if proposals != 1 || commands != 4 {
 		t.Fatalf("proposals=%d commands=%d", proposals, commands)
+	}
+}
+
+func TestSQLBatcherCloseStopsPendingWork(t *testing.T) {
+	started := make(chan struct{})
+	b := newSQLBatcher(func(ctx context.Context, _ []byte) (quepaxa.Slot, error) {
+		close(started)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}, func(context.Context, quepaxa.Slot) error { return nil })
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.submit(context.Background(), types.SQLCommand{RequestID: "pending", SQL: "SELECT 1"})
+		done <- err
+	}()
+	<-started
+	b.Close()
+	if err := <-done; !errors.Is(err, ErrNotReady) {
+		t.Fatalf("pending submit error=%v, want ErrNotReady", err)
+	}
+	if _, err := b.submit(context.Background(), types.SQLCommand{RequestID: "closed", SQL: "SELECT 1"}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("closed submit error=%v, want ErrNotReady", err)
 	}
 }

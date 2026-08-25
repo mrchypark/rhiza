@@ -3,13 +3,23 @@
 package materializer
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
 
 func TestGraphAndKVMaterializer(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sqlite.db")
@@ -72,6 +82,25 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	defer m.Close()
 	if m.Tip() != 3 {
 		t.Fatalf("tip=%d, want 3", m.Tip())
+	}
+}
+
+func TestGraphSnapshotRejectsExcessiveExpansion(t *testing.T) {
+	var archive bytes.Buffer
+	archive.WriteString(graphSnapshotMagic)
+	zw := zip.NewWriter(&archive)
+	entry, err := zw.Create("sqlite.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(entry, zeroReader{}, minGraphSnapshotExtracted+1); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareSnapshot(archive.Bytes(), t.TempDir()); err == nil {
+		t.Fatal("excessively expanded graph checkpoint was accepted")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -92,4 +93,37 @@ func TestPeerCodecRejectsMalformedFrame(t *testing.T) {
 	if _, err := decodePeerRequest([]byte("not-flatbuffers")); err == nil {
 		t.Fatal("malformed frame accepted")
 	}
+}
+
+func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer server.Close()
+	for slot := quepaxa.Slot(1); slot <= 256; slot++ {
+		value := make([]byte, 8<<10)
+		value[0] = byte(slot)
+		if _, _, err := core.Propose(context.Background(), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response, err := serverPeerHandleDecisions(server, member, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Decisions) == 0 || len(response.Decisions) >= 256 || len(encodePeerResponse(response)) > maxPeerFrame {
+		t.Fatalf("decisions=%d encoded=%d", len(response.Decisions), len(encodePeerResponse(response)))
+	}
+	next, err := serverPeerHandleDecisions(server, member, uint64(len(response.Decisions)+1))
+	if err != nil || len(next.Decisions) == 0 {
+		t.Fatalf("next page decisions=%d err=%v", len(next.Decisions), err)
+	}
+}
+
+func serverPeerHandleDecisions(server *Server, member quepaxa.Member, from uint64) (*peerfb.ResponseT, error) {
+	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
+	return peer.handle(context.Background(), nil, &peerfb.RequestT{
+		Operation: peerfb.OperationDecisions, ClusterId: string(server.cluster), SenderId: string(member.ID),
+		ConfigId: uint64(server.core.ConfigID()), Token: member.Token, From: from, Limit: 256,
+	})
 }

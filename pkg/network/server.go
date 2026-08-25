@@ -64,6 +64,9 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	return s
 }
 
+// Close stops background request batching.
+func (s *Server) Close() { s.batcher.Close() }
+
 // routes registers HTTP routes.
 func (s *Server) routes() {
 	// Client API

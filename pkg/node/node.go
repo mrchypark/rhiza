@@ -401,6 +401,10 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 // Shutdown gracefully shuts down the node.
 func (n *Node) Shutdown() error {
 	n.opened.Store(false)
+	if n.server != nil {
+		n.server.Close()
+		n.server = nil
+	}
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
 	}
