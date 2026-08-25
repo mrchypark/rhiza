@@ -19,25 +19,10 @@ func TestGraphServer(t *testing.T) {
 		t.Skip("set RHIZA_GRAPH_E2E_URL to run the graph server E2E test")
 	}
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
-	postGraph(t, graphURL, "/v1/graph/execute", map[string]any{
-		"request_id": "person-schema-" + suffix,
-		"cypher":     `CREATE NODE TABLE IF NOT EXISTS Person(id STRING, name STRING, PRIMARY KEY(id))`,
-	}, nil)
-	postGraph(t, graphURL, "/v1/graph/execute", map[string]any{
-		"request_id": "knows-schema-" + suffix,
-		"cypher":     `CREATE REL TABLE IF NOT EXISTS Knows(FROM Person TO Person, since INT64)`,
-	}, nil)
 	adaID, graceID := "ada-"+suffix, "grace-"+suffix
-	for id, name := range map[string]string{adaID: "Ada", graceID: "Grace"} {
-		postGraph(t, graphURL, "/v1/graph/execute", map[string]any{
-			"request_id": "person-" + id + "-" + suffix,
-			"cypher":     `CREATE (p:Person {id: $id, name: $name}) RETURN p.name`,
-			"args":       map[string]any{"id": id, "name": name},
-		}, nil)
-	}
 	postGraph(t, graphURL, "/v1/graph/execute", map[string]any{
 		"request_id": "knows-" + suffix,
-		"cypher":     `MATCH (a:Person), (b:Person) WHERE a.id = $from AND b.id = $to CREATE (a)-[:Knows {since: $since}]->(b) RETURN b.name`,
+		"cypher":     `CREATE (:Person {id: $from, name: "Ada"})-[:Knows {since: $since}]->(:Person {id: $to, name: "Grace"})`,
 		"args":       map[string]any{"from": adaID, "to": graceID, "since": 2026},
 	}, nil)
 	var result queryResponse
@@ -53,11 +38,11 @@ func TestGraphServer(t *testing.T) {
 }
 
 func BenchmarkGraphQueryLocal(b *testing.B) {
-	benchmarkGraphRequests(b, []byte(`{"cypher":"RETURN 1","consistency":"local"}`), "/v1/graph/query")
+	benchmarkGraphRequests(b, []byte(`{"cypher":"MATCH (n) RETURN n LIMIT 1","consistency":"local"}`), "/v1/graph/query")
 }
 
 func BenchmarkGraphQueryLinearizable(b *testing.B) {
-	benchmarkGraphRequests(b, []byte(`{"cypher":"RETURN 1","consistency":"linearizable"}`), "/v1/graph/query")
+	benchmarkGraphRequests(b, []byte(`{"cypher":"MATCH (n) RETURN n LIMIT 1","consistency":"linearizable"}`), "/v1/graph/query")
 }
 
 func BenchmarkGraphCreate(b *testing.B) {
@@ -65,10 +50,6 @@ func BenchmarkGraphCreate(b *testing.B) {
 	if target == "" {
 		b.Skip("set RHIZA_GRAPH_E2E_URL to run graph benchmarks")
 	}
-	postGraph(b, target, "/v1/graph/execute", map[string]any{
-		"request_id": fmt.Sprintf("benchmark-schema-%d", time.Now().UnixNano()),
-		"cypher":     `CREATE NODE TABLE IF NOT EXISTS BenchmarkNode(id STRING, PRIMARY KEY(id))`,
-	}, nil)
 	prefix := time.Now().UnixNano()
 	var requestID atomic.Uint64
 	benchmarkDynamicRequestsAt(b, target, "/v1/graph/execute", func() []byte {

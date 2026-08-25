@@ -34,7 +34,7 @@ for peer in 0 1 2; do
 done
 
 suffix="$(date +%s)"
-table="ChaosNode_${suffix}"
+label="ChaosNode_${suffix}"
 node0="http://127.0.0.1:${base_port}"
 node1="http://127.0.0.1:$((base_port + 1))"
 node2="http://127.0.0.1:$((base_port + 2))"
@@ -48,13 +48,12 @@ wait_for_pod() {
     sleep 0.5
   done
 }
-post "$node0/v1/graph/execute" "{\"request_id\":\"schema-${suffix}\",\"cypher\":\"CREATE NODE TABLE ${table}(id STRING, value STRING, PRIMARY KEY(id))\"}"
-post "$node1/v1/graph/execute" "{\"request_id\":\"seed-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'before', value: 'fault'})\"}"
+post "$node1/v1/graph/execute" "{\"request_id\":\"seed-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'before', value: 'fault'})\"}"
 
 dory k8s apply -f "$script_dir/graph-one-peer-failure.yaml"
 dory k8s wait podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --for=condition=AllInjected=True --timeout=60s
 write_seconds="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_total}' -H 'Content-Type: application/json' -d \
-  "{\"request_id\":\"during-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'during', value: 'fault'})\"}" \
+  "{\"request_id\":\"during-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'during', value: 'fault'})\"}" \
   "$node1/v1/graph/execute")"
 dory k8s wait podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=180s
 dory k8s delete pod rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
@@ -69,7 +68,7 @@ while true; do
 	pf_pids[2]="$!"
   sleep 0.5
   if result="$(curl -fsS --max-time 5 -H 'Content-Type: application/json' -d \
-    "{\"cypher\":\"MATCH (n:${table}) RETURN n.id\",\"consistency\":\"local\"}" \
+    "{\"cypher\":\"MATCH (n:${label}) RETURN n.id\",\"consistency\":\"local\"}" \
     "$node2/v1/graph/query" 2>/dev/null)" && [[ "$result" == *during* ]]; then
     break
   fi
@@ -97,7 +96,7 @@ status=000
 deadline=$((SECONDS + 15))
 while [[ "$status" == 000 ]]; do
   status="$(curl -sS --max-time 6 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d \
-    "{\"request_id\":\"no-quorum-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'rejected', value: 'fault'})\"}" \
+    "{\"request_id\":\"no-quorum-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'rejected', value: 'fault'})\"}" \
     "$node1/v1/graph/execute" 2>/dev/null || true)"
   (( SECONDS < deadline )) || break
   [[ "$status" != 000 ]] || sleep 0.25
@@ -117,7 +116,7 @@ until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   sleep 0.5
 done
 deadline=$((SECONDS + 30))
-until post "$node1/v1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${table} {id: 'after', value: 'fault'})\"}" 2>/dev/null; do
+until post "$node1/v1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'after', value: 'fault'})\"}" 2>/dev/null; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.25
 done

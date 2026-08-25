@@ -122,7 +122,7 @@ func Open(dbPath string, readerCount int) (*Materializer, error) {
 		m.Close()
 		return nil, fmt.Errorf("load applied slot: %w", err)
 	}
-	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "ladybug"), m.tip)
+	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "goraphdb"), m.tip)
 	if err != nil {
 		m.Close()
 		return nil, fmt.Errorf("open graph materializer: %w", err)
@@ -272,7 +272,7 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 	if err != nil {
 		return fmt.Errorf("decode graph command: %w", err)
 	}
-	if err := m.applyGraph(slot, value, graphCommand, graph); err != nil {
+	if err := m.applyGraph(ctx, slot, value, graphCommand, graph); err != nil {
 		return err
 	}
 
@@ -808,7 +808,7 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
-	graphPath := filepath.Join(dir, "ladybug")
+	graphPath := filepath.Join(dir, "goraphdb")
 	graphBackupPath := graphPath + ".restore-backup"
 	os.Remove(backupPath)
 	os.RemoveAll(graphBackupPath)

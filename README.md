@@ -11,15 +11,14 @@ over the same Go API.
 - Green Tea GC is the Go 1.27 default.
 - The container enables `GOEXPERIMENT=arenas` for QLog read scratch buffers.
 - The default `sql-kv` image uses cgo-free `ncruces/go-sqlite3`.
-- The separate `graph-kv` image uses CGO and LadybugDB/liblbug 0.17.0.
+- The separate `graph-kv` image uses the pure-Go GoraphDB fork.
 
 ```bash
 go test ./...
 go vet ./...
 GOEXPERIMENT=arenas go test ./...
 go build ./cmd/rhiza
-CGO_ENABLED=1 CGO_CFLAGS=-I/path/to/liblbug CGO_LDFLAGS=-L/path/to/liblbug \
-  go build -tags="graph system_ladybug" ./cmd/rhiza
+CGO_ENABLED=0 GOEXPERIMENT=arenas,greenteagc go build -tags=graph ./cmd/rhiza
 docker build -t rhiza-sql-kv:dev .
 docker build -f Dockerfile.graph -t rhiza-graph-kv:dev .
 ```
@@ -97,7 +96,7 @@ a quorum is unavailable; they never fall back to a stale read. With three
 peers, one failed peer preserves reads and writes. Two failed peers preserve
 only local reads and reject writes and linearizable reads with HTTP 503.
 
-SQLite and Ladybug are derived from the certified QLog. Startup replays missing decisions;
+SQLite and GoraphDB are derived from the certified QLog. Startup replays missing decisions;
 an unreadable SQLite database is quarantined and rebuilt from the log. SQLite
 snapshots use `VACUUM INTO`, are integrity-checked before atomic restore, and
 checkpoint uploads consume those consistent bytes rather than the live file.
@@ -124,15 +123,17 @@ local port-forward overhead and showed substantial tail variance.
 For Graph/KV qualification, build and import `rhiza-graph-kv-e2e:dev`, then
 apply `deploy/k8s/graph-server-3peer-e2e.yaml`. Set `RHIZA_GRAPH_E2E_URL` to a
 forwarded peer and run `go test ./e2e -run TestGraphServer`. The same Dory
-qualification passed with a 27.0 ms one-peer-failure write, HTTP 503 with two
-failed peers, convergence, and a successful write after quorum recovery.
+qualification passed with a 15.2 ms one-peer-failure write, HTTP 503 with two
+failed peers, convergence, and a successful write after quorum recovery. Three-peer
+samples were 0.29–0.35 ms local read, 4.7–21.6 ms linearizable read, and
+8.1–11.6 ms graph write, including port-forward overhead.
 
 The build profile is fixed into each binary and mismatched
 `RHIZA_EXECUTION_PROFILE` values are rejected at startup. Graph mutations and
-their request IDs commit atomically in Ladybug before the SQLite sidecar tip,
-so a crash replays without applying the graph mutation twice. Ladybug is
-rebuilt from the full QLog when local state is missing; graph checkpoint bundles
-and remote bootstrap are not enabled yet.
+their request IDs commit atomically in GoraphDB before the SQLite sidecar tip,
+so a crash replays without applying the graph mutation twice. GoraphDB is
+rebuilt from the full QLog when local state is missing; graph checkpoints bundle
+the SQLite and GoraphDB materializations.
 
 ## License
 

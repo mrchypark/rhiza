@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,79 +17,88 @@ import (
 	"strings"
 	"sync"
 
-	lbug "github.com/LadybugDB/go-ladybug"
 	"github.com/mrchypark/rhiza/internal/types"
+	graphdb "github.com/mstrYoda/goraphdb"
 )
 
+var graphTipKey = []byte("rhiza/applied_slot")
+
 type graphState struct {
-	db   *lbug.Database
-	conn *lbug.Connection
-	mu   sync.Mutex
-	tip  uint64
+	db  *graphdb.DB
+	mu  sync.Mutex
+	tip uint64
+}
+
+type graphRequest struct {
+	Hash   string                   `json:"hash"`
+	Result types.GraphCommandResult `json:"result"`
 }
 
 func BuildProfile() types.Profile { return types.ProfileGraph }
 func GraphEnabled() bool          { return true }
 
 func openGraph(path string, sqliteTip uint64) (*graphState, error) {
-	_, statErr := os.Stat(path)
-	existing := statErr == nil
-	if statErr != nil && !os.IsNotExist(statErr) {
-		return nil, statErr
+	existing := false
+	if entries, err := os.ReadDir(path); err == nil {
+		existing = len(entries) > 0
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
-	db, err := lbug.OpenDatabase(path, lbug.DefaultSystemConfig())
+	opts := graphdb.DefaultOptions()
+	opts.ShardCount = 1
+	opts.NoSync = false
+	opts.EnableWAL = false
+	opts.Role = "standalone"
+	opts.MaxResultRows = MaxReturningRows
+	db, err := graphdb.Open(path, opts)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := lbug.OpenConnection(db)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	g := &graphState{db: db, conn: conn}
-	for _, schema := range []string{
-		`CREATE NODE TABLE IF NOT EXISTS _RhizaMeta(key STRING, value INT64, PRIMARY KEY(key))`,
-		`CREATE NODE TABLE IF NOT EXISTS _RhizaRequest(id STRING, command_hash STRING, result STRING, PRIMARY KEY(id))`,
-	} {
-		if err := g.queryClose(schema); err != nil {
-			g.close()
-			return nil, fmt.Errorf("initialize Ladybug schema: %w", err)
-		}
-	}
-	result, err := conn.Query(`MATCH (m:_RhizaMeta {key: 'applied_slot'}) RETURN m.value`)
+	g := &graphState{db: db}
+	encodedTip, err := db.GetMetadata(graphTipKey)
 	if err != nil {
 		g.close()
 		return nil, err
 	}
-	rows, err := collectGraphRows(result)
-	result.Close()
-	if err != nil {
-		g.close()
-		return nil, err
-	}
-	if len(rows.Rows) == 0 {
+	if encodedTip == nil {
 		if existing || sqliteTip != 0 {
 			g.close()
-			return nil, fmt.Errorf("existing state has no Ladybug applied slot; rebuild from the decision log")
+			return nil, fmt.Errorf("existing graph state has no applied slot; rebuild from the decision log")
 		}
-		if err := g.queryClose(`CREATE (m:_RhizaMeta {key: 'applied_slot', value: 0})`); err != nil {
+		if err := db.UpdateAtomic(context.Background(), func(tx *graphdb.AtomicTx) error {
+			return tx.PutMetadata(graphTipKey, encodeGraphTip(0))
+		}); err != nil {
 			g.close()
 			return nil, err
 		}
 	} else {
-		tip, ok := rows.Rows[0][0].(int64)
-		if !ok || tip < 0 {
+		g.tip, err = decodeGraphTip(encodedTip)
+		if err != nil {
 			g.close()
-			return nil, fmt.Errorf("invalid Ladybug applied slot")
+			return nil, err
 		}
-		g.tip = uint64(tip)
 	}
 	if g.tip < sqliteTip {
 		g.close()
-		return nil, fmt.Errorf("Ladybug applied slot %d is behind SQLite slot %d; rebuild from the decision log", g.tip, sqliteTip)
+		return nil, fmt.Errorf("graph applied slot %d is behind SQLite slot %d; rebuild from the decision log", g.tip, sqliteTip)
 	}
 	return g, nil
 }
+
+func encodeGraphTip(tip uint64) []byte {
+	data := make([]byte, 8)
+	binary.BigEndian.PutUint64(data, tip)
+	return data
+}
+
+func decodeGraphTip(data []byte) (uint64, error) {
+	if len(data) != 8 {
+		return 0, fmt.Errorf("invalid graph applied slot")
+	}
+	return binary.BigEndian.Uint64(data), nil
+}
+
+func graphRequestKey(id string) []byte { return []byte("rhiza/request/" + id) }
 
 func (g *graphState) close() {
 	if g == nil {
@@ -96,28 +106,16 @@ func (g *graphState) close() {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.conn != nil {
-		g.conn.Close()
-		g.conn = nil
-	}
 	if g.db != nil {
-		g.db.Close()
+		_ = g.db.Close()
 		g.db = nil
 	}
 }
 
-func (g *graphState) queryClose(query string) error {
-	result, err := g.conn.Query(query)
-	if result != nil {
-		result.Close()
-	}
-	return err
-}
-
-func (m *Materializer) applyGraph(slot uint64, value []byte, command types.GraphCommand, graph bool) error {
+func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, command types.GraphCommand, graph bool) error {
 	g := m.graph
-	if g == nil {
-		return fmt.Errorf("Ladybug is not open")
+	if g == nil || g.db == nil {
+		return fmt.Errorf("GoraphDB is not open")
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -125,7 +123,7 @@ func (m *Materializer) applyGraph(slot uint64, value []byte, command types.Graph
 		return nil
 	}
 	if slot != g.tip+1 {
-		return fmt.Errorf("Ladybug apply slot gap: have %d, got %d", g.tip, slot)
+		return fmt.Errorf("graph apply slot gap: have %d, got %d", g.tip, slot)
 	}
 	if commands, sqlBatch, err := types.DecodeSQLBatch(value); err != nil {
 		return err
@@ -140,54 +138,126 @@ func (m *Materializer) applyGraph(slot uint64, value []byte, command types.Graph
 		if !known {
 			return fmt.Errorf("unrecognized command is not supported by the graph-kv build")
 		}
-	}
-	if err := g.queryClose("BEGIN TRANSACTION"); err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = g.queryClose("ROLLBACK")
+		if err := g.advanceTip(ctx, slot); err != nil {
+			return err
 		}
-	}()
-	if graph {
-		if err := g.applyCommand(command); err != nil {
-			_ = g.queryClose("ROLLBACK")
-			if beginErr := g.queryClose("BEGIN TRANSACTION"); beginErr != nil {
-				return beginErr
-			}
-			if recordErr := g.recordFailure(command, err); recordErr != nil {
-				return recordErr
-			}
+		g.tip = slot
+		return nil
+	}
+
+	result, hash, err := prepareGraphCommand(command)
+	if err == nil {
+		err = g.applyCommand(ctx, slot, command, hash, &result)
+	}
+	if err != nil {
+		result = types.GraphCommandResult{Error: err.Error()}
+		if recordErr := g.recordFailure(ctx, slot, command, hash, result); recordErr != nil {
+			return recordErr
 		}
 	}
-	if err := g.executeClose(`MATCH (m:_RhizaMeta {key: 'applied_slot'}) SET m.value = $slot`, map[string]any{"slot": int64(slot)}); err != nil {
-		return err
-	}
-	if err := g.queryClose("COMMIT"); err != nil {
-		return err
-	}
-	committed = true
 	g.tip = slot
 	return nil
 }
 
-func (g *graphState) recordFailure(command types.GraphCommand, cause error) error {
+func prepareGraphCommand(command types.GraphCommand) (types.GraphCommandResult, string, error) {
+	if err := ValidateGraphCommand(command); err != nil {
+		return types.GraphCommandResult{}, "", err
+	}
 	encoded, err := json.Marshal(command)
 	if err != nil {
-		return err
+		return types.GraphCommandResult{}, "", err
 	}
 	hash := sha256.Sum256(encoded)
-	if _, found, err := g.request(command.RequestID); err != nil || found {
-		return err
-	}
-	result, err := json.Marshal(types.GraphCommandResult{Error: cause.Error()})
+	return types.GraphCommandResult{}, hex.EncodeToString(hash[:]), nil
+}
+
+func (g *graphState) advanceTip(ctx context.Context, slot uint64) error {
+	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+		return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+	})
+}
+
+func (g *graphState) applyCommand(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result *types.GraphCommandResult) error {
+	args, err := graphArgs(command.Args)
 	if err != nil {
 		return err
 	}
-	return g.executeClose(`CREATE (r:_RhizaRequest {id: $id, command_hash: $hash, result: $result})`, map[string]any{
-		"id": command.RequestID, "hash": hex.EncodeToString(hash[:]), "result": string(result),
+	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+		existing, found, err := requestInTx(tx, command.RequestID)
+		if err != nil {
+			return err
+		}
+		if found {
+			if existing.Hash != hash {
+				return fmt.Errorf("request_id was already used for a different graph command")
+			}
+			*result = existing.Result
+			return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+		}
+		queryResult, err := tx.CypherWithParams(ctx, command.Cypher, args)
+		if err != nil {
+			return err
+		}
+		*result = collectGoraphRows(queryResult)
+		if err := putRequest(tx, command.RequestID, graphRequest{Hash: hash, Result: *result}); err != nil {
+			return err
+		}
+		return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
 	})
+}
+
+func (g *graphState) recordFailure(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result types.GraphCommandResult) error {
+	if hash == "" {
+		encoded, err := json.Marshal(command)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(encoded)
+		hash = hex.EncodeToString(sum[:])
+	}
+	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+		_, found, err := requestInTx(tx, command.RequestID)
+		if err != nil {
+			return err
+		}
+		if !found && command.RequestID != "" {
+			if err := putRequest(tx, command.RequestID, graphRequest{Hash: hash, Result: result}); err != nil {
+				return err
+			}
+		}
+		return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+	})
+}
+
+func putRequest(tx *graphdb.AtomicTx, id string, request graphRequest) error {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	return tx.PutMetadata(graphRequestKey(id), encoded)
+}
+
+func requestInTx(tx *graphdb.AtomicTx, id string) (graphRequest, bool, error) {
+	return decodeGraphRequest(tx.GetMetadata(graphRequestKey(id)))
+}
+
+func (g *graphState) request(id string) (graphRequest, bool, error) {
+	data, err := g.db.GetMetadata(graphRequestKey(id))
+	if err != nil {
+		return graphRequest{}, false, err
+	}
+	return decodeGraphRequest(data)
+}
+
+func decodeGraphRequest(data []byte) (graphRequest, bool, error) {
+	if data == nil {
+		return graphRequest{}, false, nil
+	}
+	var request graphRequest
+	if err := json.Unmarshal(data, &request); err != nil {
+		return graphRequest{}, false, fmt.Errorf("invalid graph request record: %w", err)
+	}
+	return request, true, nil
 }
 
 func knownNonGraphValue(value []byte) (bool, error) {
@@ -204,98 +274,9 @@ func knownNonGraphValue(value []byte) (bool, error) {
 	return ok, err
 }
 
-func (g *graphState) applyCommand(command types.GraphCommand) error {
-	if err := ValidateGraphCommand(command); err != nil {
-		return err
-	}
-	encoded, err := json.Marshal(command)
-	if err != nil {
-		return err
-	}
-	hash := sha256.Sum256(encoded)
-	hashString := hex.EncodeToString(hash[:])
-	existing, found, err := g.request(command.RequestID)
-	if err != nil {
-		return err
-	}
-	if found {
-		if existing.hash != hashString {
-			return fmt.Errorf("request_id was already used for a different graph command")
-		}
-		return nil
-	}
-	args, err := graphArgs(command.Args)
-	if err != nil {
-		return err
-	}
-	statement, err := g.conn.Prepare(command.Cypher)
-	if err != nil {
-		return err
-	}
-	defer statement.Close()
-	if statement.IsReadOnly() {
-		return fmt.Errorf("graph execute requires a mutation")
-	}
-	result, err := g.conn.Execute(statement, args)
-	if err != nil {
-		return err
-	}
-	commandResult, err := collectGraphRows(result)
-	result.Close()
-	if err != nil {
-		return err
-	}
-	resultJSON, err := json.Marshal(commandResult)
-	if err != nil {
-		return err
-	}
-	return g.executeClose(`CREATE (r:_RhizaRequest {id: $id, command_hash: $hash, result: $result})`, map[string]any{
-		"id": command.RequestID, "hash": hashString, "result": string(resultJSON),
-	})
-}
-
-type graphRequest struct {
-	hash   string
-	result string
-}
-
-func (g *graphState) request(id string) (graphRequest, bool, error) {
-	statement, err := g.conn.Prepare(`MATCH (r:_RhizaRequest {id: $id}) RETURN r.command_hash, r.result`)
-	if err != nil {
-		return graphRequest{}, false, err
-	}
-	defer statement.Close()
-	result, err := g.conn.Execute(statement, map[string]any{"id": id})
-	if err != nil {
-		return graphRequest{}, false, err
-	}
-	defer result.Close()
-	rows, err := collectGraphRows(result)
-	if err != nil || len(rows.Rows) == 0 {
-		return graphRequest{}, false, err
-	}
-	hash, hashOK := rows.Rows[0][0].(string)
-	encoded, resultOK := rows.Rows[0][1].(string)
-	if !hashOK || !resultOK {
-		return graphRequest{}, false, fmt.Errorf("invalid graph request record")
-	}
-	return graphRequest{hash: hash, result: encoded}, true, nil
-}
-
-func (g *graphState) executeClose(query string, args map[string]any) error {
-	statement, err := g.conn.Prepare(query)
-	if err != nil {
-		return err
-	}
-	defer statement.Close()
-	result, err := g.conn.Execute(statement, args)
-	if result != nil {
-		result.Close()
-	}
-	return err
-}
-
 func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[string]any) (types.GraphCommandResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return types.GraphCommandResult{}, err
 	}
@@ -309,43 +290,35 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	g := m.graph
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	statement, err := g.conn.Prepare(cypher)
+	if g.tip != m.tip {
+		return types.GraphCommandResult{}, fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
+	}
+	result, err := g.db.CypherReadWithParams(ctx, cypher, converted)
 	if err != nil {
 		return types.GraphCommandResult{}, err
 	}
-	defer statement.Close()
-	if !statement.IsReadOnly() {
-		return types.GraphCommandResult{}, fmt.Errorf("graph query must be read-only")
-	}
-	result, err := g.conn.Execute(statement, converted)
-	if err != nil {
-		return types.GraphCommandResult{}, err
-	}
-	defer result.Close()
-	return collectGraphRows(result)
-}
-
-func collectGraphRows(result *lbug.QueryResult) (types.GraphCommandResult, error) {
-	response := types.GraphCommandResult{Columns: append([]string(nil), result.GetColumnNames()...)}
-	for result.HasNext() {
-		if len(response.Rows) >= MaxReturningRows {
-			return response, fmt.Errorf("graph result exceeds %d rows", MaxReturningRows)
-		}
-		tuple, err := result.Next()
-		if err != nil {
-			return response, err
-		}
-		row, err := tuple.GetAsSlice()
-		tuple.Close()
-		if err != nil {
-			return response, err
-		}
-		response.Rows = append(response.Rows, row)
+	response := collectGoraphRows(result)
+	if len(response.Rows) > MaxReturningRows {
+		return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d rows", MaxReturningRows)
 	}
 	return response, nil
 }
 
+func collectGoraphRows(result *graphdb.CypherResult) types.GraphCommandResult {
+	response := types.GraphCommandResult{Columns: append([]string(nil), result.Columns...)}
+	for _, source := range result.Rows {
+		row := make([]any, len(result.Columns))
+		for i, column := range result.Columns {
+			row[i] = source[column]
+		}
+		response.Rows = append(response.Rows, row)
+	}
+	return response
+}
+
 func (m *Materializer) GraphRequestResult(_ context.Context, requestID string) (types.GraphCommandResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	g := m.graph
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -356,12 +329,12 @@ func (m *Materializer) GraphRequestResult(_ context.Context, requestID string) (
 	if !found {
 		return types.GraphCommandResult{}, fmt.Errorf("graph request not found")
 	}
-	var result types.GraphCommandResult
-	err = json.Unmarshal([]byte(request.result), &result)
-	return result, err
+	return request.Result, nil
 }
 
 func (m *Materializer) GraphRequestMatches(_ context.Context, command types.GraphCommand) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	encoded, err := json.Marshal(command)
 	if err != nil {
 		return false, err
@@ -374,42 +347,38 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 	if err != nil || !found {
 		return !found, err
 	}
-	return bytes.Equal([]byte(request.hash), []byte(hex.EncodeToString(hash[:]))), nil
+	return request.Hash == hex.EncodeToString(hash[:]), nil
 }
 
 func (m *Materializer) graphHealth() error {
-	if m.graph == nil {
-		return fmt.Errorf("Ladybug is not open")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.graph == nil || m.graph.db == nil {
+		return fmt.Errorf("GoraphDB is not open")
 	}
-	m.graph.mu.Lock()
-	defer m.graph.mu.Unlock()
-	if m.graph.conn == nil {
-		return fmt.Errorf("Ladybug is not open")
+	if m.graph.tip != m.tip {
+		return fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", m.graph.tip, m.tip)
 	}
 	return nil
 }
 
-const graphSnapshotMagic = "RHIZA-GRAPH-SNAPSHOT-1\n"
+const graphSnapshotMagic = "RHIZA-GORAPHDB-SNAPSHOT-1\n"
 
 func (m *Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) {
 	g := m.graph
 	if g == nil {
-		return nil, fmt.Errorf("Ladybug is not open")
+		return nil, fmt.Errorf("GoraphDB is not open")
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.tip != m.tip {
-		return nil, fmt.Errorf("cannot checkpoint mismatched materializers: SQLite=%d Ladybug=%d", m.tip, g.tip)
+		return nil, fmt.Errorf("cannot checkpoint mismatched materializers: SQLite=%d GoraphDB=%d", m.tip, g.tip)
 	}
-	if g.conn != nil {
-		g.conn.Close()
-		g.conn = nil
+	if err := g.db.Close(); err != nil {
+		return nil, err
 	}
-	if g.db != nil {
-		g.db.Close()
-		g.db = nil
-	}
-	graphPath := filepath.Join(filepath.Dir(m.dbPath), "ladybug")
+	g.db = nil
+	graphPath := filepath.Join(filepath.Dir(m.dbPath), "goraphdb")
 	data, snapshotErr := encodeGraphSnapshot(sqlite, graphPath)
 	reopened, reopenErr := openGraph(graphPath, m.tip)
 	if reopenErr != nil {
@@ -418,8 +387,8 @@ func (m *Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("reopen graph after snapshot: %w", reopenErr)
 	}
-	g.db, g.conn, g.tip = reopened.db, reopened.conn, reopened.tip
-	reopened.db, reopened.conn = nil, nil
+	g.db, g.tip = reopened.db, reopened.tip
+	reopened.db = nil
 	if snapshotErr != nil {
 		return nil, snapshotErr
 	}
@@ -447,17 +416,13 @@ func encodeGraphSnapshot(sqlite []byte, graphPath string) ([]byte, error) {
 				return err
 			}
 			if !info.Mode().IsRegular() {
-				return fmt.Errorf("unsupported Ladybug snapshot file %s", path)
+				return fmt.Errorf("unsupported GoraphDB snapshot file %s", path)
 			}
 			rel, err := filepath.Rel(graphPath, path)
 			if err != nil {
 				return err
 			}
-			name := "ladybug"
-			if rel != "." {
-				name += "/" + filepath.ToSlash(rel)
-			}
-			writer, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate})
+			writer, err := zw.CreateHeader(&zip.FileHeader{Name: "goraphdb/" + filepath.ToSlash(rel), Method: zip.Deflate})
 			if err != nil {
 				return err
 			}
@@ -485,7 +450,7 @@ func encodeGraphSnapshot(sqlite []byte, graphPath string) ([]byte, error) {
 
 func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 	if !bytes.HasPrefix(data, []byte(graphSnapshotMagic)) {
-		return snapshotParts{}, fmt.Errorf("graph build requires a Graph/KV checkpoint")
+		return snapshotParts{}, fmt.Errorf("graph build requires a GoraphDB Graph/KV checkpoint")
 	}
 	archive := data[len(graphSnapshotMagic):]
 	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
@@ -496,7 +461,7 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 	if err != nil {
 		return snapshotParts{}, err
 	}
-	parts := snapshotParts{graphDir: filepath.Join(root, "ladybug"), cleanup: func() { _ = os.RemoveAll(root) }}
+	parts := snapshotParts{graphDir: filepath.Join(root, "goraphdb"), cleanup: func() { _ = os.RemoveAll(root) }}
 	graphFiles := 0
 	for _, file := range zr.File {
 		name := filepath.ToSlash(filepath.Clean(file.Name))
@@ -520,15 +485,12 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 		if file.FileInfo().IsDir() {
 			continue
 		}
-		if !file.Mode().IsRegular() || name != "ladybug" && !strings.HasPrefix(name, "ladybug/") {
+		if !file.Mode().IsRegular() || !strings.HasPrefix(name, "goraphdb/") {
 			parts.cleanup()
 			return snapshotParts{}, fmt.Errorf("invalid graph checkpoint path %q", file.Name)
 		}
-		rel := strings.TrimPrefix(name, "ladybug/")
-		target := parts.graphDir
-		if name != "ladybug" {
-			target = filepath.Join(parts.graphDir, filepath.FromSlash(rel))
-		}
+		rel := strings.TrimPrefix(name, "goraphdb/")
+		target := filepath.Join(parts.graphDir, filepath.FromSlash(rel))
 		cleanRel, err := filepath.Rel(parts.graphDir, target)
 		if err != nil || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
 			parts.cleanup()
@@ -547,7 +509,7 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 		if err == nil {
 			_, err = io.Copy(output, reader)
 		}
-		reader.Close()
+		_ = reader.Close()
 		if output != nil {
 			if closeErr := output.Close(); err == nil {
 				err = closeErr
@@ -568,10 +530,10 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 
 func (m *Materializer) validateRestoredSnapshot() error {
 	if m.graph == nil {
-		return fmt.Errorf("Ladybug checkpoint is missing")
+		return fmt.Errorf("GoraphDB checkpoint is missing")
 	}
 	if m.graph.tip != m.tip {
-		return fmt.Errorf("checkpoint materializer tips differ: SQLite=%d Ladybug=%d", m.tip, m.graph.tip)
+		return fmt.Errorf("checkpoint materializer tips differ: SQLite=%d GoraphDB=%d", m.tip, m.graph.tip)
 	}
 	return nil
 }

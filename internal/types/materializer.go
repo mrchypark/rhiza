@@ -3,7 +3,7 @@ package types
 import "context"
 
 // Materializer applies decided values to local state.
-// Implementations exist for SQL (SQLite), Graph (LadybugDB), and KV.
+// Implementations exist for SQL (SQLite), Graph (GoraphDB), and KV.
 type Materializer interface {
 	// Apply applies a decided value to the local materialization.
 	// The slot is provided for ordering guarantees.

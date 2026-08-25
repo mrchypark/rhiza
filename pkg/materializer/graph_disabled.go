@@ -17,7 +17,7 @@ func GraphEnabled() bool          { return false }
 func openGraph(string, uint64) (*graphState, error) { return nil, nil }
 func (*graphState) close()                          {}
 
-func (m *Materializer) applyGraph(_ uint64, _ []byte, _ types.GraphCommand, graph bool) error {
+func (m *Materializer) applyGraph(_ context.Context, _ uint64, _ []byte, _ types.GraphCommand, graph bool) error {
 	if graph {
 		return fmt.Errorf("graph command is not supported by the sql-kv build")
 	}
