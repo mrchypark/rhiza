@@ -207,16 +207,25 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			return nil, err
 		}
 		response := &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(tip)}
+		wireDecisions := make([]*peerfb.DecidedValueT, len(decisions))
 		for i := range decisions {
-			response.Decisions = append(response.Decisions, decidedToWire(decisions[i]))
-			if len(encodePeerResponse(response)) > maxPeerFrame {
-				response.Decisions = response.Decisions[:len(response.Decisions)-1]
-				if len(response.Decisions) == 0 {
-					return nil, fmt.Errorf("decision %d exceeds peer frame limit", decisions[i].Slot)
-				}
-				break
+			wireDecisions[i] = decidedToWire(decisions[i])
+		}
+		low, high, fit := 1, len(wireDecisions), 0
+		for low <= high {
+			mid := low + (high-low)/2
+			response.Decisions = wireDecisions[:mid]
+			if len(encodePeerResponse(response)) <= maxPeerFrame {
+				fit = mid
+				low = mid + 1
+			} else {
+				high = mid - 1
 			}
 		}
+		if len(wireDecisions) > 0 && fit == 0 {
+			return nil, fmt.Errorf("decision %d exceeds peer frame limit", decisions[0].Slot)
+		}
+		response.Decisions = wireDecisions[:fit]
 		return response, nil
 	default:
 		return nil, fmt.Errorf("unknown peer operation %d", request.Operation)
