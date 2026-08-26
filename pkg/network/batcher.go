@@ -91,9 +91,11 @@ func (b *sqlBatcher) run() {
 			}
 		}
 
+		active := make([]batchItem, 0, len(items))
 		commands := make([]types.SQLCommand, 0, len(items))
 		for _, item := range items {
 			if item.ctx.Err() == nil {
+				active = append(active, item)
 				commands = append(commands, item.command)
 			}
 		}
@@ -104,13 +106,22 @@ func (b *sqlBatcher) run() {
 		b.wg.Add(1)
 		go func() {
 			defer func() { <-b.inflight; b.wg.Done() }()
-			b.execute(items, commands)
+			b.execute(active, commands)
 		}()
 	}
 }
 
 func (b *sqlBatcher) execute(items []batchItem, commands []types.SQLCommand) {
 	value, err := types.EncodeSQLBatch(commands)
+	if err == nil && len(value) > quepaxa.MaxReplicatedValueBytes && len(items) > 1 {
+		mid := len(items) / 2
+		b.execute(items[:mid], commands[:mid])
+		b.execute(items[mid:], commands[mid:])
+		return
+	}
+	if err == nil && len(value) > quepaxa.MaxReplicatedValueBytes {
+		err = ErrInvalidRequest
+	}
 	var slot quepaxa.Slot
 	if err == nil {
 		ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)

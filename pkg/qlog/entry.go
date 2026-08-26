@@ -7,13 +7,22 @@ import (
 	"io"
 )
 
+var entryCRCTable = crc32.MakeTable(crc32.Castagnoli)
+
+const entryV2LengthFlag uint32 = 1 << 31
+
+func entryPayloadLength(encoded uint32) (uint32, bool) {
+	return encoded &^ entryV2LengthFlag, encoded&entryV2LengthFlag != 0
+}
+
 // EntryType is the type of QLog entry.
 type EntryType uint8
 
 const (
-	EntryProposal EntryType = iota // 제안된 값
-	EntryReceipt                   // receipt 기록
-	EntryDecide                    // quorum 도달 (결정)
+	EntryProposal   EntryType = iota // 제안된 값
+	EntryReceipt                     // receipt 기록
+	EntryDecide                      // quorum 도달 (결정)
+	EntryCheckpoint                  // certified compacted prefix floor
 )
 
 // Entry is a single QLog entry.
@@ -40,14 +49,16 @@ func (e Entry) Encode() []byte {
 	buf = append(buf, byte(e.Type))
 
 	// Payload length
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(payloadLen))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(payloadLen)|entryV2LengthFlag)
 
-	// CRC32 (over everything so far)
-	crc := crc32.ChecksumIEEE(buf)
-	buf = binary.LittleEndian.AppendUint32(buf, crc)
+	// V2 entries cover both metadata and payload. The explicit length flag lets
+	// recovery distinguish them from legacy header-only IEEE records.
+	buf = binary.LittleEndian.AppendUint32(buf, 0)
 
 	// Payload
 	buf = append(buf, e.Payload...)
+	crc := crc32.Update(crc32.Checksum(buf[:45], entryCRCTable), entryCRCTable, buf[49:])
+	binary.LittleEndian.PutUint32(buf[45:49], crc)
 
 	return buf
 }
@@ -64,18 +75,20 @@ func DecodeEntry(data []byte) (Entry, int, error) {
 	}
 	copy(entry.Hash[:], data[8:40])
 
-	payloadLen := binary.LittleEndian.Uint32(data[41:45])
+	payloadLen, v2 := entryPayloadLength(binary.LittleEndian.Uint32(data[41:45]))
 	storedCRC := binary.LittleEndian.Uint32(data[45:49])
-
-	// Verify CRC (over bytes 0-45, before CRC field)
-	actualCRC := crc32.ChecksumIEEE(data[0:45])
-	if storedCRC != actualCRC {
-		return Entry{}, 0, fmt.Errorf("CRC mismatch: stored=%08x actual=%08x", storedCRC, actualCRC)
-	}
 
 	totalLen := 49 + int(payloadLen)
 	if len(data) < totalLen {
 		return Entry{}, 0, io.ErrUnexpectedEOF
+	}
+
+	actualCRC := crc32.ChecksumIEEE(data[:45])
+	if v2 {
+		actualCRC = crc32.Update(crc32.Checksum(data[:45], entryCRCTable), entryCRCTable, data[49:totalLen])
+	}
+	if storedCRC != actualCRC {
+		return Entry{}, 0, fmt.Errorf("CRC mismatch: stored=%08x actual=%08x", storedCRC, actualCRC)
 	}
 
 	entry.Payload = make([]byte, payloadLen)

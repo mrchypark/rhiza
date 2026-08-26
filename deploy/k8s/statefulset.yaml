@@ -6,7 +6,11 @@ metadata:
   labels:
     app.kubernetes.io/name: rhiza
 spec:
-  serviceName: rhiza
+  serviceName: rhiza-headless
+  # Wire/certificate migrations require an explicit coordinated restart.
+  updateStrategy:
+    type: OnDelete
+    rollingUpdate: null
   replicas: 3
   selector:
     matchLabels:
@@ -16,6 +20,9 @@ spec:
       labels:
         app.kubernetes.io/name: rhiza
     spec:
+      securityContext:
+        fsGroup: 65532
+        runAsNonRoot: true
       containers:
         - name: rhiza
           image: rhiza:latest
@@ -28,6 +35,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: rhiza-config
+            # Required private peer identity only; public client auth remains disabled.
+            - secretRef:
+                name: rhiza-peer-credentials
           env:
             - name: RHIZA_NODE_ID
               valueFrom:
@@ -57,8 +67,18 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
-      volumes:
-        - name: data
-          emptyDir: {}
-        - name: objstore
-          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+    - metadata:
+        name: objstore
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

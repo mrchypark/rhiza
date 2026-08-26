@@ -9,7 +9,6 @@ import (
 // LockFile prevents multiple processes from using the same WAL directory.
 type LockFile struct {
 	file *os.File
-	path string
 }
 
 // Acquire acquires an exclusive lock on the WAL directory.
@@ -55,15 +54,24 @@ func Acquire(dir string) (bool, *LockFile, error) {
 	}
 	fmt.Fprintf(f, "%d", os.Getpid())
 
-	return cleanStart, &LockFile{file: f, path: path}, nil
+	return cleanStart, &LockFile{file: f}, nil
 }
 
-// Release releases the lock and removes the lock file.
+// Release marks a clean shutdown and releases the stable lock inode.
 func (lf *LockFile) Release() error {
-	if lf.file != nil {
-		lf.file.Truncate(0)
-		lf.file.Close()
+	if lf.file == nil {
+		return nil
 	}
-	os.Remove(lf.path)
-	return nil
+	if err := lf.file.Truncate(0); err != nil {
+		return err
+	}
+	if err := lf.file.Sync(); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lf.file.Fd()), syscall.LOCK_UN); err != nil {
+		return err
+	}
+	err := lf.file.Close()
+	lf.file = nil
+	return err
 }

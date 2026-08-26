@@ -82,3 +82,32 @@ func TestSQLBatcherCloseStopsPendingWork(t *testing.T) {
 		t.Fatalf("closed submit error=%v, want ErrNotReady", err)
 	}
 }
+
+func TestSQLBatcherSplitsOversizedCombinedValue(t *testing.T) {
+	var sizes []int
+	b := &sqlBatcher{
+		ctx: context.Background(),
+		propose: func(_ context.Context, value []byte) (quepaxa.Slot, error) {
+			sizes = append(sizes, len(value))
+			return quepaxa.Slot(len(sizes)), nil
+		},
+		apply: func(context.Context, quepaxa.Slot) error { return nil },
+	}
+	items := []batchItem{
+		{result: make(chan batchResult, 1)},
+		{result: make(chan batchResult, 1)},
+	}
+	commands := []types.SQLCommand{
+		{RequestID: "a", SQL: "INSERT INTO t VALUES (?)", Args: []any{make([]byte, 70<<10)}},
+		{RequestID: "b", SQL: "INSERT INTO t VALUES (?)", Args: []any{make([]byte, 70<<10)}},
+	}
+	b.execute(items, commands)
+	if len(sizes) != 2 {
+		t.Fatalf("proposals=%d, want split into 2", len(sizes))
+	}
+	for _, size := range sizes {
+		if size > quepaxa.MaxReplicatedValueBytes {
+			t.Fatalf("oversized proposal: %d", size)
+		}
+	}
+}

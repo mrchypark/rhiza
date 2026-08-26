@@ -32,6 +32,18 @@ jobs:
           GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
         run: go build ./cmd/rhiza
 
+      - name: Graph profile
+        if: matrix.arenas == false
+        run: go test -tags graph ./...
+
+      - name: Race detector
+        if: matrix.arenas == false
+        run: go test -race ./...
+
+      - name: Vulnerability scan
+        if: matrix.arenas == false
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
   containers:
     runs-on: ubuntu-latest
     steps:

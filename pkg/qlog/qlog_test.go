@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -65,6 +67,21 @@ func TestEntryEncodeDecode(t *testing.T) {
 	}
 	if string(decoded.Payload) != string(entry.Payload) {
 		t.Errorf("payload mismatch: got %s, want %s", decoded.Payload, entry.Payload)
+	}
+}
+
+func TestEntryChecksumCoversPayloadAndReadsLegacyHeaderChecksum(t *testing.T) {
+	data := (Entry{Slot: 1, Payload: []byte("payload")}).Encode()
+	data[len(data)-1] ^= 1
+	if _, _, err := DecodeEntry(data); err == nil {
+		t.Fatal("payload corruption passed checksum validation")
+	}
+
+	legacy := (Entry{Slot: 2, Payload: []byte("legacy")}).Encode()
+	binary.LittleEndian.PutUint32(legacy[41:45], binary.LittleEndian.Uint32(legacy[41:45])&^entryV2LengthFlag)
+	binary.LittleEndian.PutUint32(legacy[45:49], crc32.ChecksumIEEE(legacy[:45]))
+	if _, _, err := DecodeEntry(legacy); err != nil {
+		t.Fatalf("legacy header checksum: %v", err)
 	}
 }
 
@@ -688,7 +705,12 @@ func TestLockFile(t *testing.T) {
 	}
 
 	// Release lock
-	lock.Release()
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lock.qlog")); err != nil {
+		t.Fatalf("stable lock inode missing after release: %v", err)
+	}
 
 	// Acquire again
 	cleanStart, lock2, err := Acquire(dir)

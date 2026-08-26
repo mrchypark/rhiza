@@ -49,4 +49,11 @@ func (testTransport) SendRecord(_ context.Context, _ quepaxa.NodeID, _ quepaxa.R
 	return quepaxa.Summary{}, nil
 }
 
-func (testTransport) SendDecision(context.Context, quepaxa.Decision) error { return nil }
+func (testTransport) SendDecision(context.Context, quepaxa.Decision) error          { return nil }
+func (testTransport) ReadTip(context.Context, quepaxa.NodeID) (quepaxa.Slot, error) { return 0, nil }
+func (testTransport) StageValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash, []byte) error {
+	return nil
+}
+func (testTransport) FetchValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash) ([]byte, error) {
+	return nil, errors.New("missing")
+}

@@ -137,6 +137,10 @@ func (r *countingReader) Read(buffer []byte) (int, error) {
 	return n, err
 }
 
+func (r *countingReader) ObjectSize() (int64, error) {
+	return thanosobjstore.TryToGetSize(r.reader)
+}
+
 type countingReadCloser struct {
 	io.ReadCloser
 	count *atomic.Uint64

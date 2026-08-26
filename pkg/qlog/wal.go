@@ -307,8 +307,8 @@ func (s *Segment) scan(repairTail bool) ([]Entry, error) {
 		if _, err := s.file.ReadAt(header, offset); err != nil {
 			return nil, err
 		}
-		payloadLen := int64(binary.LittleEndian.Uint32(header[41:45]))
-		totalLen := int64(len(header)) + payloadLen
+		payloadLen, _ := entryPayloadLength(binary.LittleEndian.Uint32(header[41:45]))
+		totalLen := int64(len(header)) + int64(payloadLen)
 		if totalLen > remaining {
 			if repairTail {
 				if err := s.file.Truncate(offset); err != nil {
@@ -437,6 +437,102 @@ func validateSegmentBytes(data []byte) error {
 		offset += used
 	}
 	return nil
+}
+
+// Compact atomically installs a certified base plus the suffix that remains
+// necessary for consensus recovery. The new higher-numbered segment is made
+// durable before any old segment is removed.
+func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
+	if base.Type != EntryCheckpoint || base.Slot == 0 {
+		return fmt.Errorf("invalid WAL compaction base")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var kept []Entry
+	for _, seg := range w.segments {
+		entries, err := seg.readAll()
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			switch {
+			case entry.Type == EntryProposal:
+				if _, ok := keepValueHashes[entry.Hash]; ok {
+					kept = append(kept, entry)
+				}
+			case entry.Slot > base.Slot:
+				kept = append(kept, entry)
+			}
+		}
+	}
+	index := uint32(1)
+	if w.current != nil {
+		index = w.current.index + 1
+	}
+	temp, err := os.CreateTemp(w.dir, ".rhiza-compact-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	offset := int64(0)
+	for _, entry := range append([]Entry{base}, kept...) {
+		data := entry.Encode()
+		n, writeErr := temp.Write(data)
+		if writeErr != nil {
+			temp.Close()
+			return writeErr
+		}
+		if n != len(data) {
+			temp.Close()
+			return io.ErrShortWrite
+		}
+		offset += int64(n)
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	target := filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", index))
+	if err := os.Rename(tempPath, target); err != nil {
+		return err
+	}
+	if err := syncDir(w.dir); err != nil {
+		return err
+	}
+	old := append([]*Segment(nil), w.segments...)
+	for _, seg := range old {
+		seg.mu.Lock()
+		closeErr := seg.file.Close()
+		seg.mu.Unlock()
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	file, err := os.OpenFile(target, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	w.segments = []*Segment{{file: file, index: index, offset: offset}}
+	w.current = w.segments[0]
+	for _, seg := range old {
+		if err := os.Remove(filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", seg.index))); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return syncDir(w.dir)
+}
+
+func syncDir(dir string) error {
+	file, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return file.Sync()
 }
 
 // Close closes all segment files.

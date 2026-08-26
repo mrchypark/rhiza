@@ -1,9 +1,10 @@
 package quepaxa
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"math/rand"
 	"path/filepath"
@@ -21,6 +22,35 @@ func BenchmarkCoreProposeThreePeers(b *testing.B) {
 
 func BenchmarkCoreProposeOnePeerDown(b *testing.B) {
 	benchmarkCorePropose(b, true)
+}
+
+func BenchmarkCoreReadIndexThreePeers(b *testing.B)  { benchmarkCoreReadIndex(b, false) }
+func BenchmarkCoreReadIndexOnePeerDown(b *testing.B) { benchmarkCoreReadIndex(b, true) }
+
+func BenchmarkCoreLocalReadIndex(b *testing.B) {
+	cores, _ := newTestCluster(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = cores["n2"].Tip()
+	}
+}
+
+func benchmarkCoreReadIndex(b *testing.B, oneDown bool) {
+	cores, transport := newTestCluster(b)
+	if _, _, err := cores["n2"].Propose(context.Background(), []byte("seed")); err != nil {
+		b.Fatal(err)
+	}
+	if oneDown {
+		transport.fail("n1")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, _, err := cores["n2"].ReadIndex(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func benchmarkCorePropose(b *testing.B, oneDown bool) {
@@ -101,14 +131,37 @@ func TestISRMonotonicProperties(t *testing.T) {
 	}
 }
 
-func TestProposalOrderIsPriorityProposerValue(t *testing.T) {
+func TestProposalOrderIsPriorityProposerHash(t *testing.T) {
 	priority := Priority{31: 1}
-	low := newProposal(priority, "n1", []byte("a"))
-	highValue := newProposal(priority, "n1", []byte("b"))
+	left := newProposal(priority, "n1", []byte("a"))
+	right := newProposal(priority, "n1", []byte("b"))
 	highProposer := newProposal(priority, "n2", []byte("a"))
 	highPriority := newProposal(Priority{31: 2}, "n1", []byte("a"))
-	if compareProposal(&low, &highValue) >= 0 || compareProposal(&highValue, &highProposer) >= 0 || compareProposal(&highProposer, &highPriority) >= 0 {
-		t.Fatal("proposal order does not match <priority, proposer, value>")
+	if got, want := compareProposal(&left, &right), bytes.Compare(left.Hash[:], right.Hash[:]); got != want {
+		t.Fatalf("hash order=%d, want %d", got, want)
+	}
+	if compareProposal(&left, &highProposer) >= 0 || compareProposal(&highProposer, &highPriority) >= 0 {
+		t.Fatal("proposal order does not match <priority, proposer, hash>")
+	}
+}
+
+func TestCertificateContainsOnlyValueHash(t *testing.T) {
+	value := bytes.Repeat([]byte("certificate-must-not-repeat-this-value"), 32)
+	proposal := newProposal(highestPriority, "n1", value)
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{
+		{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+		{RecorderID: "n2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+	}}
+	certificate, err := encodeCertificate(7, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(certificate, value) {
+		t.Fatal("certificate contains the decided value")
+	}
+	configID, decoded, err := decodeCertificate(certificate)
+	if err != nil || configID != 7 || decoded.Proposal.Hash != proposal.Hash || len(decoded.Proposal.Value) != 0 {
+		t.Fatalf("decoded certificate=%+v config=%d err=%v", decoded, configID, err)
 	}
 }
 
@@ -217,15 +270,64 @@ func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, re
 
 func (transport *clusterTransport) SendDecision(_ context.Context, decision Decision) error {
 	transport.mu.RLock()
-	defer transport.mu.RUnlock()
+	targets := make([]*Core, 0, len(transport.cores))
 	for id, core := range transport.cores {
 		if !transport.down[id] && !transport.dropDecision[id] {
-			if err := core.AcceptDecisionHint(decision); err != nil {
-				return err
+			targets = append(targets, core)
+		}
+	}
+	transport.mu.RUnlock()
+	results := make(chan error, len(targets))
+	for _, core := range targets {
+		go func() { results <- core.AcceptDecision(decision) }()
+	}
+	successes := 0
+	for range targets {
+		if err := <-results; err == nil {
+			successes++
+			if successes >= len(transport.cores)/2+1 {
+				return nil
 			}
 		}
 	}
-	return nil
+	return ErrQuorumUnavailable
+}
+
+func (transport *clusterTransport) ReadTip(_ context.Context, to NodeID) (Slot, error) {
+	transport.mu.Lock()
+	down := transport.down[to]
+	core := transport.cores[to]
+	transport.mu.Unlock()
+	if down || core == nil {
+		return 0, errors.New("down")
+	}
+	return core.Tip(), nil
+}
+
+func (transport *clusterTransport) StageValue(_ context.Context, to NodeID, hash ValueHash, value []byte) error {
+	transport.mu.Lock()
+	down := transport.down[to]
+	core := transport.cores[to]
+	transport.mu.Unlock()
+	if down || core == nil {
+		return errors.New("down")
+	}
+	return core.StageValue(hash, value)
+}
+
+func (transport *clusterTransport) FetchValue(_ context.Context, from NodeID, hash ValueHash) ([]byte, error) {
+	transport.mu.Lock()
+	down := transport.down[from]
+	core := transport.cores[from]
+	transport.mu.Unlock()
+	if down || core == nil {
+		return nil, errors.New("down")
+	}
+	value, ok := core.Value(hash)
+	if !ok {
+		return nil, errors.New("missing")
+	}
+	return value, nil
 }
 
 func (transport *clusterTransport) fail(ids ...NodeID) {
@@ -436,6 +538,61 @@ func TestUniqueReadBarrierOnStaleReplicaFollowsCompletedWrite(t *testing.T) {
 	}
 }
 
+func TestReadIndexSurvivesOneFailureAndFailsWithoutQuorum(t *testing.T) {
+	cores, transport := newTestCluster(t)
+	if _, _, err := cores["n1"].Propose(context.Background(), []byte("write")); err != nil {
+		t.Fatal(err)
+	}
+	transport.fail("n1")
+	index, _, err := cores["n2"].ReadIndex(context.Background())
+	if err != nil || index != 1 || cores["n2"].Tip() != 1 {
+		t.Fatalf("read-index=%d tip=%d err=%v", index, cores["n2"].Tip(), err)
+	}
+	transport.fail("n3")
+	if _, _, err := cores["n2"].ReadIndex(context.Background()); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("minority read-index error=%v", err)
+	}
+}
+
+func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
+	cores, _ := newTestCluster(t)
+	if _, _, err := cores["n1"].Propose(context.Background(), []byte("state")); err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := cores["n1"].PrefixHash(1)
+	if !ok {
+		t.Fatal("missing decision prefix")
+	}
+	root := sha256.Sum256([]byte("root"))
+	state := sha256.Sum256([]byte("snapshot"))
+	var mu sync.Mutex
+	verified := 0
+	for _, core := range cores {
+		core.SetCheckpointValidator(func(_ context.Context, seal CheckpointSeal) error {
+			if seal.RootHash != root || seal.StateHash != state {
+				return errors.New("wrong root")
+			}
+			mu.Lock()
+			verified++
+			mu.Unlock()
+			return nil
+		})
+	}
+	value, err := EncodeCheckpointSeal(CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot, _, err := cores["n1"].Propose(context.Background(), value); err != nil || slot != 2 {
+		t.Fatalf("seal slot=%d err=%v", slot, err)
+	}
+	mu.Lock()
+	count := verified
+	mu.Unlock()
+	if count < 2 {
+		t.Fatalf("checkpoint verified by %d recorders, want quorum", count)
+	}
+}
+
 func TestRecorderStateRecoversDurably(t *testing.T) {
 	dir := t.TempDir()
 	config := &Cluster{Members: []Member{{ID: "n1"}}}
@@ -532,11 +689,15 @@ func TestRecoveryDefersMissingLeaderScheduleToPeerCatchUp(t *testing.T) {
 		{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
 		{RecorderID: "n2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
 	}}
-	certificate, err := json.Marshal(decision)
+	certificate, err := encodeCertificate(config.ConfigID, decision)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := append(append([]byte(nil), decisionEntryMagic...), certificate...)
+	record, err := encodeDecisionRecord(proposal.Value, certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := append(append([]byte(nil), decisionEntryMagic...), record...)
 	if err := wal.Append(qlog.Entry{Slot: uint64(decision.Slot), Hash: proposal.Hash, Type: qlog.EntryDecide, Payload: payload}); err != nil {
 		t.Fatal(err)
 	}
@@ -564,20 +725,20 @@ func TestRecoveryDefersMissingLeaderScheduleToPeerCatchUp(t *testing.T) {
 	}
 }
 
-func TestClusterRecoversFastDecisionFromDurableRecorderQuorum(t *testing.T) {
+func TestClusterDoesNotAckWithoutCommitQuorumAndRecoversRecorderState(t *testing.T) {
 	cores, transport := newTestCluster(t)
 	for id := range cores {
 		transport.dropDecision[id] = true
 	}
-	if slot, _, err := cores["n1"].Propose(context.Background(), []byte("quorum-only")); err != nil || slot != 1 {
+	if slot, _, err := cores["n1"].Propose(context.Background(), []byte("quorum-only")); !errors.Is(err, ErrQuorumUnavailable) || slot != 0 {
 		t.Fatalf("propose slot=%d err=%v", slot, err)
 	}
 	proposerEntries, err := cores["n1"].wal.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if slices.ContainsFunc(proposerEntries, func(entry qlog.Entry) bool { return entry.Type == qlog.EntryDecide }) {
-		t.Fatal("clustered fast path synchronously logged a redundant decision marker")
+	if !slices.ContainsFunc(proposerEntries, func(entry qlog.Entry) bool { return entry.Type == qlog.EntryDecide }) {
+		t.Fatal("clustered fast path returned without a durable commit marker")
 	}
 
 	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
@@ -594,7 +755,7 @@ func TestClusterRecoversFastDecisionFromDurableRecorderQuorum(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, entry := range entries {
-			if entry.Type == qlog.EntryReceipt {
+			if entry.Type == qlog.EntryReceipt || entry.Type == qlog.EntryProposal {
 				if err := wal.Append(entry); err != nil {
 					t.Fatal(err)
 				}

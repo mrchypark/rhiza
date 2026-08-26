@@ -15,6 +15,7 @@ var notifyCommandMagic = []byte("QNTF1\x00")
 var graphCommandMagic = []byte("QGRF1\x00")
 
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
+const MaxRequestIDBytes = 256
 
 // SQLCommand is one submitter command inside a proposer batch.
 type SQLCommand struct {
@@ -54,8 +55,21 @@ type KVCommand struct {
 	Value            []byte `json:"value,omitempty"`
 	Expected         []byte `json:"expected,omitempty"`
 	ExpectedExists   bool   `json:"expected_exists,omitempty"`
+	TTLMS            int64  `json:"ttl_ms,omitempty"`
 	ExpiresAtUnixMS  int64  `json:"expires_at_unix_ms,omitempty"`
 	ObservedAtUnixMS int64  `json:"observed_at_unix_ms,omitempty"`
+}
+
+// KVRequestMatches compares client intent, excluding first-admission time.
+func KVRequestMatches(stored, request KVCommand) bool {
+	ttl := stored.TTLMS
+	if ttl == 0 && stored.ExpiresAtUnixMS > stored.ObservedAtUnixMS {
+		ttl = stored.ExpiresAtUnixMS - stored.ObservedAtUnixMS
+	}
+	return stored.RequestID == request.RequestID && stored.Operation == request.Operation &&
+		stored.Key == request.Key && bytes.Equal(stored.Value, request.Value) &&
+		bytes.Equal(stored.Expected, request.Expected) && stored.ExpectedExists == request.ExpectedExists &&
+		ttl == request.TTLMS
 }
 
 type KVCommandResult struct {
@@ -178,6 +192,10 @@ func EncodeReadBarrier(nonce [ReadBarrierNonceSize]byte) []byte {
 
 func DecodeReadBarrier(value []byte) (bool, error) {
 	return quepaxa.DecodeReadBarrier(value)
+}
+
+func DecodeCheckpointSeal(value []byte) (quepaxa.CheckpointSeal, bool, error) {
+	return quepaxa.DecodeCheckpointSeal(value)
 }
 
 // Proposal is a value proposed for a slot.

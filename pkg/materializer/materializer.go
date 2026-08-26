@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"os"
@@ -28,6 +29,8 @@ const (
 	MaxSQLStatements = 64
 	MaxSQLArgs       = 999
 	MaxReturningRows = 10_000
+	MaxResultBytes   = 16 << 20
+	MaxCellBytes     = 1 << 20
 )
 
 // Materializer applies decided values to SQLite.
@@ -89,20 +92,17 @@ func Open(dbPath string, readerCount int) (*Materializer, error) {
 	}
 	writer.SetMaxOpenConns(1)
 
-	// Open reader connections (pool)
-	readers := make([]*sql.DB, readerCount)
-	for i := 0; i < readerCount; i++ {
-		r, err := openSQLite(readerDSN, false)
-		if err != nil {
-			db.Close()
-			writer.Close()
-			for j := 0; j < i; j++ {
-				readers[j].Close()
-			}
-			return nil, fmt.Errorf("open reader %d: %w", i, err)
-		}
-		readers[i] = r
+	// database/sql already provides the reader pool; one handle avoids opening
+	// N independent pools while only ever selecting readers[0].
+	reader, err := openSQLite(readerDSN, false)
+	if err != nil {
+		db.Close()
+		writer.Close()
+		return nil, fmt.Errorf("open reader: %w", err)
 	}
+	reader.SetMaxOpenConns(readerCount)
+	reader.SetMaxIdleConns(readerCount)
+	readers := []*sql.DB{reader}
 
 	m := &Materializer{
 		db:       db,
@@ -237,7 +237,8 @@ func (m *Materializer) initSchema() error {
 			result_json BLOB NOT NULL
 		);
 		CREATE TABLE IF NOT EXISTS _rhiza_notify_requests (
-			request_id TEXT PRIMARY KEY
+			request_id TEXT PRIMARY KEY,
+			command_json BLOB
 		);
 		`)
 	if err != nil {
@@ -249,6 +250,16 @@ func (m *Materializer) initSchema() error {
 	}
 	if resultColumn == 0 {
 		_, err = m.db.Exec(`ALTER TABLE _rhiza_requests ADD COLUMN result_json BLOB`)
+		if err != nil {
+			return err
+		}
+	}
+	var notifyCommandColumn int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_rhiza_notify_requests') WHERE name = 'command_json'`).Scan(&notifyCommandColumn); err != nil {
+		return err
+	}
+	if notifyCommandColumn == 0 {
+		_, err = m.db.Exec(`ALTER TABLE _rhiza_notify_requests ADD COLUMN command_json BLOB`)
 	}
 	return err
 }
@@ -303,21 +314,38 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 	} else if schedule {
 		commands = nil
 		batched = true
+	} else if _, checkpoint, err := types.DecodeCheckpointSeal(value); err != nil {
+		return fmt.Errorf("decode checkpoint seal: %w", err)
+	} else if checkpoint {
+		commands = nil
+		batched = true
 	} else if graph {
 		commands = nil
 		batched = true
 	}
 	publish := false
 	if notify {
-		if notifyCommand.RequestID == "" || notifyCommand.Topic == "" || len(notifyCommand.Topic) > 256 || len(notifyCommand.Payload) > 1<<20 {
+		if notifyCommand.RequestID == "" || len(notifyCommand.RequestID) > types.MaxRequestIDBytes || notifyCommand.Topic == "" || len(notifyCommand.Topic) > 256 || len(notifyCommand.Payload) > 1<<20 {
 			return fmt.Errorf("invalid notification")
 		}
-		result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO _rhiza_notify_requests(request_id) VALUES (?)`, notifyCommand.RequestID)
+		commandJSON, err := json.Marshal(notifyCommand)
 		if err != nil {
 			return err
 		}
-		rows, _ := result.RowsAffected()
-		publish = rows > 0
+		var existing []byte
+		err = tx.QueryRowContext(ctx, `SELECT command_json FROM _rhiza_notify_requests WHERE request_id = ?`, notifyCommand.RequestID).Scan(&existing)
+		switch {
+		case err == sql.ErrNoRows:
+			_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_notify_requests(request_id, command_json) VALUES (?, ?)`, notifyCommand.RequestID, commandJSON)
+			publish = err == nil
+		case err == nil:
+			publish = false
+		case err != nil:
+			return err
+		}
+		if err != nil {
+			return err
+		}
 		commands = nil
 		batched = true
 	} else if kv {
@@ -423,7 +451,7 @@ func (m *Materializer) Subscribe(topic string) (<-chan []byte, func()) {
 }
 
 func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, command types.KVCommand) error {
-	if command.RequestID == "" || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
+	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
 		return fmt.Errorf("invalid KV command")
 	}
 	switch command.Operation {
@@ -438,7 +466,8 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, command types.KV
 	var existingCommand, existingResult []byte
 	err = tx.QueryRowContext(ctx, `SELECT command_json, result_json FROM _rhiza_kv_requests WHERE request_id = ?`, command.RequestID).Scan(&existingCommand, &existingResult)
 	if err == nil {
-		if !bytes.Equal(existingCommand, commandJSON) {
+		var existing types.KVCommand
+		if json.Unmarshal(existingCommand, &existing) != nil || !types.KVRequestMatches(existing, command) {
 			return nil
 		}
 		return nil
@@ -501,13 +530,51 @@ func (m *Materializer) KVRequestResult(ctx context.Context, requestID string) (t
 	return result, err
 }
 
+// KVRequest returns the exact first-admitted command and result for a request ID.
+func (m *Materializer) KVRequest(ctx context.Context, requestID string) (types.KVCommand, types.KVCommandResult, bool, error) {
+	var commandJSON, resultJSON []byte
+	err := m.reader().QueryRowContext(ctx, `SELECT command_json, result_json FROM _rhiza_kv_requests WHERE request_id = ?`, requestID).Scan(&commandJSON, &resultJSON)
+	if err == sql.ErrNoRows {
+		return types.KVCommand{}, types.KVCommandResult{}, false, nil
+	}
+	if err != nil {
+		return types.KVCommand{}, types.KVCommandResult{}, false, err
+	}
+	var command types.KVCommand
+	var result types.KVCommandResult
+	if err := json.Unmarshal(commandJSON, &command); err != nil {
+		return types.KVCommand{}, types.KVCommandResult{}, false, err
+	}
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		return types.KVCommand{}, types.KVCommandResult{}, false, err
+	}
+	return command, result, true, nil
+}
+
 func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCommand) (bool, error) {
+	var existing []byte
+	err := m.reader().QueryRowContext(ctx, `SELECT command_json FROM _rhiza_kv_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var stored types.KVCommand
+	if err := json.Unmarshal(existing, &stored); err != nil {
+		return false, err
+	}
+	return types.KVRequestMatches(stored, command), nil
+}
+
+// NotifyRequestMatches checks whether a request ID is unused or has identical content.
+func (m *Materializer) NotifyRequestMatches(ctx context.Context, command types.NotifyCommand) (bool, error) {
 	encoded, err := json.Marshal(command)
 	if err != nil {
 		return false, err
 	}
 	var existing []byte
-	err = m.reader().QueryRowContext(ctx, `SELECT command_json FROM _rhiza_kv_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
+	err = m.reader().QueryRowContext(ctx, `SELECT command_json FROM _rhiza_notify_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
 	if err == sql.ErrNoRows {
 		return true, nil
 	}
@@ -516,6 +583,9 @@ func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCom
 
 // ValidateSQLCommand validates the replicated SQL trust boundary.
 func ValidateSQLCommand(command types.SQLCommand) error {
+	if len(command.RequestID) > types.MaxRequestIDBytes {
+		return fmt.Errorf("request_id must not exceed %d bytes", types.MaxRequestIDBytes)
+	}
 	statements := command.Statements
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
@@ -648,6 +718,10 @@ func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
 		return types.SQLStatementResult{}, err
 	}
 	result := types.SQLStatementResult{Columns: columns}
+	resultBytes := 0
+	for _, column := range columns {
+		resultBytes += len(column)
+	}
 	for rows.Next() {
 		if len(result.Rows) >= limit {
 			return result, fmt.Errorf("result exceeds %d rows", limit)
@@ -659,6 +733,24 @@ func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
 		}
 		if err := rows.Scan(pointers...); err != nil {
 			return result, err
+		}
+		for _, value := range values {
+			size := 16
+			switch value := value.(type) {
+			case string:
+				size = len(value)
+			case []byte:
+				size = len(value)
+			case nil:
+				size = 1
+			}
+			if size > MaxCellBytes {
+				return result, fmt.Errorf("result cell exceeds %d bytes", MaxCellBytes)
+			}
+			resultBytes += size
+			if resultBytes > MaxResultBytes {
+				return result, fmt.Errorf("result exceeds %d bytes", MaxResultBytes)
+			}
 		}
 		result.Rows = append(result.Rows, values)
 	}
@@ -743,24 +835,59 @@ func (m *Materializer) Exec(ctx context.Context, query string, args ...interface
 
 // Snapshot creates a backup of the database.
 func (m *Materializer) Snapshot(ctx context.Context) ([]byte, error) {
+	data, _, err := m.SnapshotAt(ctx)
+	return data, err
+}
+
+// SnapshotAt returns a snapshot and the applied slot captured under the same lock.
+func (m *Materializer) SnapshotAt(ctx context.Context) ([]byte, uint64, error) {
+	var data bytes.Buffer
+	index, err := m.SnapshotTo(ctx, &data)
+	return data.Bytes(), index, err
+}
+
+// SnapshotTo streams a transactionally consistent snapshot while holding the
+// apply barrier, so memory use is bounded by the storage writers.
+func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-snapshot-*.db")
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	path := file.Name()
 	file.Close()
 	os.Remove(path)
 	defer os.Remove(path)
 	if _, err := m.db.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
-		return nil, fmt.Errorf("snapshot: %w", err)
+		return 0, fmt.Errorf("snapshot: %w", err)
 	}
-	data, err := os.ReadFile(path)
+	if err := m.writeSnapshot(path, writer); err != nil {
+		return 0, fmt.Errorf("stream snapshot: %w", err)
+	}
+	return m.tip, nil
+}
+
+// SnapshotFileAt creates a bounded-memory snapshot file for chunked upload.
+func (m *Materializer) SnapshotFileAt(ctx context.Context) (string, uint64, func(), error) {
+	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-checkpoint-*")
 	if err != nil {
-		return nil, fmt.Errorf("read snapshot: %w", err)
+		return "", 0, nil, err
 	}
-	return m.encodeSnapshot(data)
+	path := file.Name()
+	cleanup := func() { _ = os.Remove(path) }
+	index, err := m.SnapshotTo(ctx, file)
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		cleanup()
+		return "", 0, nil, err
+	}
+	return path, index, cleanup, nil
 }
 
 // Restore restores from a snapshot.

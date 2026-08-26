@@ -7,16 +7,17 @@ import (
 )
 
 type ResponseT struct {
-	Version uint16 `json:"version"`
-	Error string `json:"error"`
-	Summary *SummaryT `json:"summary"`
-	Decided *DecidedValueT `json:"decided"`
-	ClusterId string `json:"cluster_id"`
-	ProposerId string `json:"proposer_id"`
-	ConfigId uint64 `json:"config_id"`
-	Tip uint64 `json:"tip"`
-	Decisions []*DecidedValueT `json:"decisions"`
-	ErrorCode uint16 `json:"error_code"`
+	Version    uint16           `json:"version"`
+	Error      string           `json:"error"`
+	Summary    *SummaryT        `json:"summary"`
+	Decided    *DecidedValueT   `json:"decided"`
+	ClusterId  string           `json:"cluster_id"`
+	ProposerId string           `json:"proposer_id"`
+	ConfigId   uint64           `json:"config_id"`
+	Tip        uint64           `json:"tip"`
+	Decisions  []*DecidedValueT `json:"decisions"`
+	ErrorCode  uint16           `json:"error_code"`
+	Value      []byte           `json:"value"`
 }
 
 func (t *ResponseT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -50,6 +51,10 @@ func (t *ResponseT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 		}
 		decisionsOffset = builder.EndVector(decisionsLength)
 	}
+	valueOffset := flatbuffers.UOffsetT(0)
+	if t.Value != nil {
+		valueOffset = builder.CreateByteString(t.Value)
+	}
 	ResponseStart(builder)
 	ResponseAddVersion(builder, t.Version)
 	ResponseAddError(builder, errorOffset)
@@ -61,6 +66,7 @@ func (t *ResponseT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	ResponseAddTip(builder, t.Tip)
 	ResponseAddDecisions(builder, decisionsOffset)
 	ResponseAddErrorCode(builder, t.ErrorCode)
+	ResponseAddValue(builder, valueOffset)
 	return ResponseEnd(builder)
 }
 
@@ -81,6 +87,7 @@ func (rcv *Response) UnPackTo(t *ResponseT) {
 		t.Decisions[j] = x.UnPack()
 	}
 	t.ErrorCode = rcv.ErrorCode()
+	t.Value = rcv.ValueBytes()
 }
 
 func (rcv *Response) UnPack() *ResponseT {
@@ -132,7 +139,7 @@ func (rcv *Response) Version() uint16 {
 	if o != 0 {
 		return rcv._tab.GetUint16(o + rcv._tab.Pos)
 	}
-	return 1
+	return 2
 }
 
 func (rcv *Response) MutateVersion(n uint16) bool {
@@ -245,11 +252,45 @@ func (rcv *Response) MutateErrorCode(n uint16) bool {
 	return rcv._tab.MutateUint16Slot(22, n)
 }
 
+func (rcv *Response) Value(j int) byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(24))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.GetByte(a + flatbuffers.UOffsetT(j*1))
+	}
+	return 0
+}
+
+func (rcv *Response) ValueLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(24))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *Response) ValueBytes() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(24))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
+func (rcv *Response) MutateValue(j int, n byte) bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(24))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.MutateByte(a+flatbuffers.UOffsetT(j*1), n)
+	}
+	return false
+}
+
 func ResponseStart(builder *flatbuffers.Builder) {
-	builder.StartObject(10)
+	builder.StartObject(11)
 }
 func ResponseAddVersion(builder *flatbuffers.Builder, version uint16) {
-	builder.PrependUint16Slot(0, version, 1)
+	builder.PrependUint16Slot(0, version, 2)
 }
 func ResponseAddError(builder *flatbuffers.Builder, error flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(1, flatbuffers.UOffsetT(error), 0)
@@ -280,6 +321,12 @@ func ResponseStartDecisionsVector(builder *flatbuffers.Builder, numElems int) fl
 }
 func ResponseAddErrorCode(builder *flatbuffers.Builder, errorCode uint16) {
 	builder.PrependUint16Slot(9, errorCode, 0)
+}
+func ResponseAddValue(builder *flatbuffers.Builder, value flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(10, flatbuffers.UOffsetT(value), 0)
+}
+func ResponseStartValueVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(1, numElems, 1)
 }
 func ResponseEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

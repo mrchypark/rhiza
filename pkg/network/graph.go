@@ -8,6 +8,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 type GraphExecuteResponse struct {
@@ -46,6 +47,9 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if !s.writable || !s.ready() {
 		return GraphExecuteResponse{}, ErrNotReady
 	}
+	if !materializer.GraphEnabled() {
+		return GraphExecuteResponse{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
+	}
 	if err := materializer.ValidateGraphCommand(command); err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
@@ -57,6 +61,9 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	value, err := types.EncodeGraphCommand(command)
 	if err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if len(value) > quepaxa.MaxReplicatedValueBytes {
+		return GraphExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	slot, err := s.proposeHedged(ctx, value)
 	if err == nil {
@@ -98,6 +105,9 @@ func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (types.GraphCommandResult, error) {
+	if !materializer.GraphEnabled() {
+		return types.GraphCommandResult{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
+	}
 	if request.Cypher == "" {
 		return types.GraphCommandResult{}, ErrInvalidRequest
 	}

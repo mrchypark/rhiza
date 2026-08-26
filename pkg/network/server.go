@@ -2,7 +2,6 @@ package network
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,6 +120,9 @@ type DecisionsResponse struct {
 }
 
 func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	if slot, ok := s.core.DecidedSlot(value); ok {
+		return slot, nil
+	}
 	if len(s.members) <= 1 || s.transport == nil {
 		slot, _, err := s.core.Propose(ctx, value)
 		return slot, err
@@ -191,7 +193,17 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 }
 
 func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision quepaxa.DecidedValue) error {
-	for s.core.Tip() < decision.Slot {
+	if err := s.catchUpFrom(ctx, source, decision.Slot); err != nil {
+		return err
+	}
+	if certified, ok := s.core.CertifiedValue(decision.Slot); !ok || certified.Hash != decision.Hash {
+		return fmt.Errorf("peer %s returned inconsistent decision slot %d", source, decision.Slot)
+	}
+	return nil
+}
+
+func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot) error {
+	for s.core.Tip() < through {
 		from := s.core.Tip() + 1
 		response, err := s.transport.FetchDecisions(ctx, source, from, 256)
 		if err != nil {
@@ -203,9 +215,6 @@ func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision
 		if err := s.core.AcceptCertifiedHints(response.Decisions); err != nil {
 			return err
 		}
-	}
-	if certified, ok := s.core.CertifiedValue(decision.Slot); !ok || certified.Hash != decision.Hash {
-		return fmt.Errorf("peer %s returned inconsistent decision slot %d", source, decision.Slot)
 	}
 	return nil
 }
@@ -309,12 +318,18 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if !s.writable || !s.ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
-	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
+	if materializer.GraphEnabled() {
+		return ExecuteResponse{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
+	}
 	if req.RequestID == "" {
 		return ExecuteResponse{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
 	}
+	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
 	if err := materializer.ValidateSQLCommand(command); err != nil {
 		return ExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if encoded, err := types.EncodeSQLBatch([]types.SQLCommand{command}); err != nil || len(encoded) > quepaxa.MaxReplicatedValueBytes {
+		return ExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil {
 		return ExecuteResponse{}, err
@@ -370,6 +385,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 // Query reads SQL locally or after a linearizable consensus barrier.
 func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
+	if materializer.GraphEnabled() {
+		return QueryResponse{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
+	}
 	if req.SQL == "" {
 		return QueryResponse{}, fmt.Errorf("%w: sql is required", ErrInvalidRequest)
 	}
@@ -479,7 +497,7 @@ func (s *Server) handleKVMutation(w http.ResponseWriter, r *http.Request, operat
 		return
 	}
 	var req KVMutationRequest
-	if err := decodeJSON(w, r, &req); err != nil || req.RequestID == "" || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
+	if err := decodeJSON(w, r, &req); err != nil || req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -506,22 +524,31 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if !s.writable || !s.ready() {
 		return KVMutationResponse{}, ErrNotReady
 	}
-	if req.RequestID == "" || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
+	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
 		return KVMutationResponse{}, ErrInvalidRequest
 	}
-	now := time.Now().UnixMilli()
-	command := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, ObservedAtUnixMS: now}
-	if req.TTLMS > 0 {
-		command.ExpiresAtUnixMS = now + req.TTLMS
-	}
-	if matches, err := s.material.KVRequestMatches(ctx, command); err != nil {
+	intent := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
+	command, result, found, err := s.material.KVRequest(ctx, req.RequestID)
+	if err != nil {
 		return KVMutationResponse{}, err
-	} else if !matches {
+	}
+	if found && !types.KVRequestMatches(command, intent) {
 		return KVMutationResponse{}, ErrRequestConflict
+	}
+	if !found {
+		now := time.Now().UnixMilli()
+		command = intent
+		command.ObservedAtUnixMS = now
+		if req.TTLMS > 0 {
+			command.ExpiresAtUnixMS = now + req.TTLMS
+		}
 	}
 	value, err := types.EncodeKVCommand(command)
 	if err != nil {
 		return KVMutationResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if len(value) > quepaxa.MaxReplicatedValueBytes {
+		return KVMutationResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	slot, err := s.proposeHedged(ctx, value)
 	if err == nil {
@@ -533,11 +560,13 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if err != nil {
 		return KVMutationResponse{}, err
 	}
-	result, err := s.material.KVRequestResult(ctx, req.RequestID)
-	if err != nil {
-		return KVMutationResponse{}, err
+	if !found {
+		result, err = s.material.KVRequestResult(ctx, req.RequestID)
+		if err != nil {
+			return KVMutationResponse{}, err
+		}
 	}
-	if matches, err := s.material.KVRequestMatches(ctx, command); err != nil || !matches {
+	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil || !matches {
 		return KVMutationResponse{}, ErrRequestConflict
 	}
 	return KVMutationResponse{Slot: uint64(slot), Applied: result.Applied}, nil
@@ -550,15 +579,19 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 	case "", "local":
 		return nil
 	case "linearizable":
-		var nonce [types.ReadBarrierNonceSize]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return err
-		}
-		slot, err := s.proposeHedged(ctx, types.EncodeReadBarrier(nonce))
+		index, source, err := s.core.ReadIndex(ctx)
 		if err != nil {
 			return err
 		}
-		return s.applyDecisions(ctx, slot)
+		if index > s.core.Tip() {
+			if s.transport == nil || source == s.core.NodeID() {
+				return fmt.Errorf("read-index source cannot supply slot %d", index)
+			}
+			if err := s.catchUpFrom(ctx, source, index); err != nil {
+				return err
+			}
+		}
+		return s.applyDecisions(ctx, index)
 	default:
 		return errConsistency
 	}
@@ -570,7 +603,7 @@ func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req types.NotifyCommand
-	if err := decodeJSON(w, r, &req); err != nil || req.RequestID == "" || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
+	if err := decodeJSON(w, r, &req); err != nil || req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -587,12 +620,20 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ui
 	if !s.writable || !s.ready() {
 		return 0, ErrNotReady
 	}
-	if req.RequestID == "" || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
+	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
 		return 0, ErrInvalidRequest
+	}
+	if matches, err := s.material.NotifyRequestMatches(ctx, req); err != nil {
+		return 0, err
+	} else if !matches {
+		return 0, ErrRequestConflict
 	}
 	value, err := types.EncodeNotifyCommand(req)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if len(value) > quepaxa.MaxReplicatedValueBytes {
+		return 0, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	slot, err := s.proposeHedged(ctx, value)
 	if err == nil {
@@ -600,6 +641,13 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ui
 	}
 	if err == nil {
 		err = s.waitDurable(ctx, slot)
+	}
+	if err == nil {
+		if matches, matchErr := s.material.NotifyRequestMatches(ctx, req); matchErr != nil {
+			err = matchErr
+		} else if !matches {
+			err = ErrRequestConflict
+		}
 	}
 	return uint64(slot), err
 }
@@ -662,6 +710,19 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 		}
 		decision, _ := s.core.CertifiedValue(slot)
 		return decision, nil
+	}
+	if len(value) > quepaxa.MaxReplicatedValueBytes {
+		return quepaxa.DecidedValue{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
+	}
+	if _, sqlValue, err := types.DecodeSQLBatch(value); err != nil {
+		return quepaxa.DecidedValue{}, err
+	} else if sqlValue && materializer.GraphEnabled() {
+		return quepaxa.DecidedValue{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
+	}
+	if _, graphValue, err := types.DecodeGraphCommand(value); err != nil {
+		return quepaxa.DecidedValue{}, err
+	} else if graphValue && !materializer.GraphEnabled() {
+		return quepaxa.DecidedValue{}, fmt.Errorf("%w: graph commands require the graph build", ErrInvalidRequest)
 	}
 	slot, _, err := s.core.Propose(ctx, value)
 	if err != nil {

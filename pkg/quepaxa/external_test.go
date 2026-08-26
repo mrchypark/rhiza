@@ -32,6 +32,9 @@ func (transport) SendRecord(_ context.Context, to quepaxa.NodeID, request quepax
 }
 
 func (transport) SendDecision(context.Context, quepaxa.Decision) error { return nil }
+func (transport) ReadTip(context.Context, quepaxa.NodeID) (quepaxa.Slot, error) { return 0, nil }
+func (transport) StageValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash, []byte) error { return nil }
+func (transport) FetchValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash) ([]byte, error) { return nil, nil }
 
 var _ quepaxa.Transport = transport{}
 

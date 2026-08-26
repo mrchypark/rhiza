@@ -38,6 +38,9 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	request := quepaxa.RecordRequest{Slot: 1, Step: 4, Proposal: quepaxa.Proposal{ProposerID: "n1", Value: []byte("value")}}
 	request.Proposal.Priority[31] = 1
 	request.Proposal.Hash = sha256.Sum256(request.Proposal.Value)
+	if err := transport.StageValue(callCtx, member.ID, request.Proposal.Hash, request.Proposal.Value); err != nil {
+		t.Fatal(err)
+	}
 	summary, err := transport.SendRecord(callCtx, member.ID, request)
 	if err != nil {
 		t.Fatal(err)

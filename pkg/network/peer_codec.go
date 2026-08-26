@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	peerWireVersion = 1
+	peerWireVersion = 2
 	maxPeerFrame    = 1 << 20
 )
 
@@ -96,6 +96,17 @@ func summaryToWire(value quepaxa.Summary) *peerfb.SummaryT {
 	return result
 }
 
+func certificateSummaryToWire(value quepaxa.Summary) *peerfb.SummaryT {
+	result := summaryToWire(value)
+	if result.FirstCurrent != nil {
+		result.FirstCurrent.Value = nil
+	}
+	if result.AggregatePrior != nil {
+		result.AggregatePrior.Value = nil
+	}
+	return result
+}
+
 func summaryFromWire(value *peerfb.SummaryT) (quepaxa.Summary, error) {
 	if value == nil || value.RecorderId == "" {
 		return quepaxa.Summary{}, fmt.Errorf("invalid summary")
@@ -121,7 +132,7 @@ func summaryFromWire(value *peerfb.SummaryT) (quepaxa.Summary, error) {
 func decisionToWire(value quepaxa.Decision) *peerfb.DecisionT {
 	summaries := make([]*peerfb.SummaryT, len(value.Summaries))
 	for i := range value.Summaries {
-		summaries[i] = summaryToWire(value.Summaries[i])
+		summaries[i] = certificateSummaryToWire(value.Summaries[i])
 	}
 	return &peerfb.DecisionT{Slot: uint64(value.Slot), Step: uint64(value.Step), Proposal: proposalToWire(value.Proposal), Summaries: summaries}
 }

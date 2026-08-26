@@ -226,6 +226,17 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestQueryResultRejectsOversizedCell(t *testing.T) {
+	m, err := Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if _, err := m.QueryResult(context.Background(), "SELECT zeroblob(?)", []any{MaxCellBytes + 1}); err == nil {
+		t.Fatal("oversized result cell was accepted")
+	}
+}
+
 func TestMaterializerRejectsNondeterministicWrite(t *testing.T) {
 	m, err := Open(t.TempDir()+"/deterministic.db", 1)
 	if err != nil {

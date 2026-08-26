@@ -18,7 +18,8 @@ var highestPriority = Priority{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 
-// Proposal is the paper's lexicographically ordered <priority, proposer, value> tuple.
+// Proposal is the paper's lexicographically ordered tuple, with the value
+// represented by its collision-resistant hash in this storage epoch.
 type Proposal struct {
 	Priority   Priority  `json:"priority"`
 	ProposerID NodeID    `json:"proposer_id"`
@@ -57,7 +58,7 @@ func compareProposal(left, right *Proposal) int {
 	if result := bytes.Compare([]byte(left.ProposerID), []byte(right.ProposerID)); result != 0 {
 		return result
 	}
-	return bytes.Compare(left.Value, right.Value)
+	return bytes.Compare(left.Hash[:], right.Hash[:])
 }
 
 func maxProposal(values ...*Proposal) *Proposal {

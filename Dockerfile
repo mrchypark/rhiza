@@ -10,11 +10,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOEXPERIMENT=arenas,greenteagc go build -o rhiza ./
 
 FROM alpine:3.19
 
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates && adduser -D -u 65532 rhiza
 
 WORKDIR /app
 
 COPY --from=builder /app/rhiza .
+
+USER 65532:65532
 
 EXPOSE 8080
 

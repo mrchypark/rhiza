@@ -4,9 +4,10 @@ package rhiza_test
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,26 +132,30 @@ func objectStoreTip(t *testing.T, dir, cluster, node string) uint64 {
 	return tip
 }
 
-func readObjectStoreTip(dir, cluster, node string) (uint64, error) {
-	manifestDir := filepath.Join(dir, cluster, node, "qlog", "manifests")
-	entries, err := os.ReadDir(manifestDir)
+func readObjectStoreTip(dir, cluster, _ string) (uint64, error) {
+	extentDir := filepath.Join(dir, cluster, "archive", "extents")
+	entries, err := os.ReadDir(extentDir)
 	if err != nil {
 		return 0, err
 	}
 	if len(entries) == 0 {
 		return 0, os.ErrNotExist
 	}
-	data, err := os.ReadFile(filepath.Join(manifestDir, entries[len(entries)-1].Name()))
-	if err != nil {
-		return 0, err
+	var tip uint64
+	for _, entry := range entries {
+		parts := strings.Split(strings.TrimSuffix(entry.Name(), ".json"), "_")
+		if len(parts) != 3 {
+			continue
+		}
+		end, err := strconv.ParseUint(parts[1], 10, 64)
+		if err == nil && end > tip {
+			tip = end
+		}
 	}
-	var manifest struct {
-		Tip uint64 `json:"tip_slot"`
+	if tip == 0 {
+		return 0, os.ErrNotExist
 	}
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return 0, err
-	}
-	return manifest.Tip, nil
+	return tip, nil
 }
 
 func TestEmbeddedObjectStoreRecovery(t *testing.T) {

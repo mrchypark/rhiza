@@ -163,4 +163,28 @@ result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "$node1/v1/sql/query")"
 [[ "$result" == *'after-quorum'* ]]
 
-printf 'PASS: peers=3 failed=1 quorum-write=%ss converged=true rebuilt=true; failed=2 write-status=%s recovered-write=true\n' "$write_seconds" "$status"
+for peer in 0 1 2; do
+  kill "${pf_pids[$peer]}" 2>/dev/null || true
+  wait "${pf_pids[$peer]}" 2>/dev/null || true
+done
+dory k8s delete pod rhiza-sql-0 rhiza-sql-1 rhiza-sql-2 -n rhiza-3peer-e2e --wait=true >/dev/null
+deadline=$((SECONDS + 90))
+until dory k8s get pod rhiza-sql-0 rhiza-sql-1 rhiza-sql-2 -n rhiza-3peer-e2e >/dev/null 2>&1; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.5
+done
+dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
+for peer in 0 1 2; do
+  dory k8s port-forward "pod/rhiza-sql-${peer}" -n rhiza-3peer-e2e "$((base_port + peer)):8080" >"$tmp_dir/port-forward-${peer}.log" 2>&1 &
+  pf_pids[$peer]="$!"
+done
+deadline=$((SECONDS + 90))
+until result="$(curl -fsS -H 'Content-Type: application/json' -d \
+  "{\"sql\":\"SELECT id, value FROM ${table} ORDER BY id\",\"consistency\":\"linearizable\"}" \
+  "$node0/v1/sql/query" 2>/dev/null)"; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.5
+done
+[[ "$result" == *'before-fault'* && "$result" == *'during-fault'* && "$result" == *'after-quorum'* && "$result" != *'must-not-commit'* ]]
+
+printf 'PASS: peers=3 failed=1 quorum-write=%ss converged=true rebuilt=true; failed=2 write-status=%s recovered-write=true; shared-object-recovery=true\n' "$write_seconds" "$status"

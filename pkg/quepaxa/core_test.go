@@ -1,13 +1,13 @@
 package quepaxa
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
@@ -22,25 +22,10 @@ func (m *mockTransport) SendDecision(context.Context, Decision) error {
 	return nil
 }
 
-type blockingDecisionTransport struct {
-	once    sync.Once
-	mu      sync.Mutex
-	slots   []Slot
-	started chan struct{}
-	release chan struct{}
-}
-
-func (t *blockingDecisionTransport) SendRecord(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
-	return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
-}
-
-func (t *blockingDecisionTransport) SendDecision(_ context.Context, decision Decision) error {
-	t.mu.Lock()
-	t.slots = append(t.slots, decision.Slot)
-	t.mu.Unlock()
-	t.once.Do(func() { close(t.started) })
-	<-t.release
-	return nil
+func (m *mockTransport) ReadTip(context.Context, NodeID) (Slot, error)               { return 0, nil }
+func (m *mockTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error { return nil }
+func (m *mockTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
+	return nil, errors.New("value unavailable")
 }
 
 func TestCorePropose(t *testing.T) {
@@ -85,6 +70,145 @@ func TestCorePropose(t *testing.T) {
 	if !core.IsQuorum(receipts) {
 		t.Error("expected quorum to be reached")
 	}
+}
+
+func TestCoreRejectsOversizedValue(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}}}, wal, nil)
+	if _, _, err := core.Propose(context.Background(), make([]byte, MaxReplicatedValueBytes+1)); err == nil {
+		t.Fatal("oversized value was accepted")
+	}
+}
+
+func TestValueIsNotAvailableUntilRetrySyncSucceeds(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{Members: []Member{{ID: "n1"}}}, wal, nil)
+	value := []byte("durable-only")
+	hash := sha256.Sum256(value)
+	core.commits = newGroupCommit(func() error { return errors.New("sync failed") })
+	if err := core.StoreValue(hash, value); err == nil {
+		t.Fatal("failed sync was acknowledged")
+	}
+	if _, ok := core.Value(hash); ok {
+		t.Fatal("unsynced value became available")
+	}
+	core.commits = newGroupCommit(wal.Sync)
+	if err := core.StoreValue(hash, value); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := core.Value(hash); !ok || !bytes.Equal(got, value) {
+		t.Fatal("synced retry did not publish value")
+	}
+}
+
+func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Cluster{ConfigID: 3, Members: []Member{{ID: "n1"}}}
+	core := newCore("n1", config, wal, nil)
+	for i := byte(1); i <= 5; i++ {
+		if _, _, err := core.Propose(context.Background(), []byte{i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantPrefix, _ := core.PrefixHash(5)
+	root := sha256.Sum256([]byte("certified-root"))
+	state := sha256.Sum256([]byte("snapshot"))
+	prefix3, _ := core.PrefixHash(3)
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	seal, err := EncodeCheckpointSeal(CheckpointSeal{ConfigID: 3, Index: 3, RootHash: root, StateHash: state, PrefixHash: prefix3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CompactThrough(3, root); err != nil {
+		t.Fatal(err)
+	}
+	if core.Tip() != 6 {
+		t.Fatalf("live compacted tip=%d, want 6", core.Tip())
+	}
+	if _, _, err := core.DecisionsFrom(1, 10); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("compacted read error=%v", err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Tip() != 6 {
+		t.Fatalf("recovered tip=%d, want 6", recovered.Tip())
+	}
+	if got, ok := recovered.PrefixHash(5); !ok || got != wantPrefix {
+		t.Fatal("recovered suffix prefix hash mismatch")
+	}
+	if slot, _, err := recovered.Propose(context.Background(), []byte("next")); err != nil || slot != 7 {
+		t.Fatalf("next slot=%d err=%v", slot, err)
+	}
+}
+
+func TestRecorderCapPreservesLegacyRecovery(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}}}, wal, nil)
+	proposal := newProposal(Priority{1}, "node-1", make([]byte, MaxReplicatedValueBytes+1))
+	request := RecordRequest{Slot: 1, Step: 4, Proposal: proposal}
+	if _, err := core.Record(context.Background(), request); err == nil {
+		t.Fatal("new oversized recorder value was accepted")
+	}
+	core.recorders[1] = ISR{Step: 4, FirstCurrent: cloneProposal(&proposal), AggregateCurrent: cloneProposal(&proposal)}
+	if _, err := core.Record(context.Background(), request); err != nil {
+		t.Fatalf("legacy recorder recovery was blocked: %v", err)
+	}
+}
+
+func TestEnsureDurableWritesDecisionMarker(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	config := &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}
+	core := newCore("node-1", config, wal, &mockTransport{})
+	slot, _, err := core.Propose(context.Background(), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.EnsureDurable(slot); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Slot == uint64(slot) && entry.Type == qlog.EntryDecide {
+			return
+		}
+	}
+	t.Fatal("durability barrier did not persist the certified decision")
 }
 
 func TestCoreMayDecideSameValueInDifferentSlots(t *testing.T) {
@@ -212,44 +336,6 @@ func TestRecorderDurablyPromotesLearnedHintBeforeReply(t *testing.T) {
 	}
 	if !core.durable[1] {
 		t.Fatal("recorder replied before durable promotion")
-	}
-}
-
-func TestDecisionDisseminationQueueIsBounded(t *testing.T) {
-	wal, err := qlog.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer wal.Close()
-	transport := &blockingDecisionTransport{started: make(chan struct{}), release: make(chan struct{})}
-	config := &Cluster{Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}
-	core := newCore("n1", config, wal, transport)
-	for i := 0; i < decisionQueueSize+10; i++ {
-		core.enqueueDecision(Decision{Slot: Slot(i + 1)})
-	}
-	<-transport.started
-	if queued := len(core.decisionQ); queued > decisionQueueSize {
-		t.Fatalf("queued decisions=%d, want at most %d", queued, decisionQueueSize)
-	}
-	close(transport.release)
-	deadline := time.Now().Add(time.Second)
-	for {
-		core.decisionMu.Lock()
-		sending := core.sending
-		core.decisionMu.Unlock()
-		if !sending {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("decision worker did not drain")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	transport.mu.Lock()
-	last := transport.slots[len(transport.slots)-1]
-	transport.mu.Unlock()
-	if want := Slot(decisionQueueSize + 10); last != want {
-		t.Fatalf("last disseminated slot=%d, want newest %d", last, want)
 	}
 }
 

@@ -2,14 +2,20 @@ package quepaxa
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 )
 
 var leaderScheduleMagic = []byte("QLDR1\x00")
 var readBarrierMagic = []byte("QRDB1\x00")
+var checkpointSealMagic = []byte("QCKP2\x00")
 
-const ReadBarrierNonceSize = 16
+const (
+	ReadBarrierNonceSize    = 16
+	MaxReplicatedValueBytes = 128 << 10
+)
 
 // Slot is a monotonically increasing consensus position.
 type Slot uint64
@@ -21,6 +27,19 @@ type NodeID string
 
 // ValueHash is the SHA-256 hash of a proposed value.
 type ValueHash [32]byte
+
+func AdvancePrefixHash(previous [32]byte, slot Slot, value ValueHash) [32]byte {
+	hash := sha256.New()
+	hash.Write([]byte("rhiza/decision-prefix/v1\x00"))
+	hash.Write(previous[:])
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(slot))
+	hash.Write(encoded[:])
+	hash.Write(value[:])
+	var next [32]byte
+	copy(next[:], hash.Sum(nil))
+	return next
+}
 
 // Member describes one fixed cluster member.
 type Member struct {
@@ -63,6 +82,41 @@ type DecidedValue struct {
 	Hash        ValueHash       `json:"hash"`
 	Value       []byte          `json:"value"`
 	Certificate json.RawMessage `json:"certificate,omitempty"`
+}
+
+type CheckpointSeal struct {
+	ConfigID   uint     `json:"config_id"`
+	Index      Slot     `json:"index"`
+	RootHash   [32]byte `json:"root_hash"`
+	StateHash  [32]byte `json:"state_hash"`
+	PrefixHash [32]byte `json:"prefix_hash"`
+}
+
+type SealedCheckpoint struct {
+	CheckpointSeal
+	DecisionSlot Slot
+}
+
+func EncodeCheckpointSeal(seal CheckpointSeal) ([]byte, error) {
+	payload, err := json.Marshal(seal)
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]byte(nil), checkpointSealMagic...), payload...), nil
+}
+
+func DecodeCheckpointSeal(value []byte) (CheckpointSeal, bool, error) {
+	if !bytes.HasPrefix(value, checkpointSealMagic) {
+		return CheckpointSeal{}, false, nil
+	}
+	var seal CheckpointSeal
+	if err := json.Unmarshal(value[len(checkpointSealMagic):], &seal); err != nil {
+		return CheckpointSeal{}, true, err
+	}
+	if seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.StateHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) {
+		return CheckpointSeal{}, true, fmt.Errorf("invalid checkpoint seal")
+	}
+	return seal, true, nil
 }
 
 // Receipt is a recorder's confirmation of a proposal.

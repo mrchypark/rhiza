@@ -67,3 +67,33 @@ func TestConcurrentGraphRequestIDConflict(t *testing.T) {
 		t.Fatalf("succeeded=%d conflicted=%d", succeeded, conflicted)
 	}
 }
+
+func TestGraphBuildRejectsNewSQLBeforeConsensus(t *testing.T) {
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	member := quepaxa.Member{ID: "n1"}
+	core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: quepaxa.Cluster{Members: []quepaxa.Member{member}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer server.Close()
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "sql", SQL: "CREATE TABLE forbidden (id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.proposeLocal(context.Background(), value); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("error=%v, want invalid request", err)
+	}
+	if core.Tip() != 0 {
+		t.Fatalf("rejected SQL advanced consensus tip to %d", core.Tip())
+	}
+}

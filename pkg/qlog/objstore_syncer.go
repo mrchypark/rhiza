@@ -43,7 +43,9 @@ type ObjStoreSyncer struct {
 	interval           time.Duration
 	stopCh             chan struct{}
 	stopOnce           sync.Once
+	wg                 sync.WaitGroup
 	syncMu             sync.Mutex
+	gcMu               sync.Mutex
 	publishedTip       uint64
 	manifestDirty      bool
 	stateInitialized   bool
@@ -73,7 +75,9 @@ func (s *ObjStoreSyncer) Start(ctx context.Context) {
 	if s.interval <= 0 {
 		return
 	}
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		ticker := time.NewTicker(s.interval)
 		defer ticker.Stop()
 		for {
@@ -92,16 +96,20 @@ func (s *ObjStoreSyncer) Start(ctx context.Context) {
 }
 
 // Stop stops the sync loop.
-func (s *ObjStoreSyncer) Stop() { s.stopOnce.Do(func() { close(s.stopCh) }) }
+func (s *ObjStoreSyncer) Stop() {
+	s.stopOnce.Do(func() { close(s.stopCh) })
+	s.wg.Wait()
+}
 
 // Sync publishes new bytes and compacts long extent chains off the ACK path.
 func (s *ObjStoreSyncer) Sync(ctx context.Context) error {
 	s.syncMu.Lock()
-	defer s.syncMu.Unlock()
-	if err := s.syncThroughLocked(ctx, 0, true); err != nil {
+	err := s.syncThroughLocked(ctx, 0, true)
+	s.syncMu.Unlock()
+	if err != nil {
 		return err
 	}
-	s.maybeGCLocked(ctx)
+	s.maybeGC(ctx)
 	return nil
 }
 
@@ -480,22 +488,22 @@ func (s *ObjStoreSyncer) verifyExtentPrefix(ctx context.Context, segment Segment
 
 // GarbageCollect performs persistent two-phase mark-and-sweep.
 func (s *ObjStoreSyncer) GarbageCollect(ctx context.Context, grace time.Duration) error {
-	s.syncMu.Lock()
-	defer s.syncMu.Unlock()
-	return s.garbageCollectLocked(ctx, time.Now().Add(-grace))
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	return s.garbageCollect(ctx, time.Now().Add(-grace))
 }
 
-func (s *ObjStoreSyncer) maybeGCLocked(ctx context.Context) {
+func (s *ObjStoreSyncer) maybeGC(ctx context.Context) {
 	if s.gcInterval <= 0 || time.Now().Before(s.nextGC) {
 		return
 	}
 	s.nextGC = time.Now().Add(s.gcInterval)
-	if err := s.garbageCollectLocked(ctx, time.Now().Add(-s.gcGrace)); err != nil {
+	if err := s.GarbageCollect(ctx, s.gcGrace); err != nil {
 		log.Printf("object storage GC error: %v", err)
 	}
 }
 
-func (s *ObjStoreSyncer) garbageCollectLocked(ctx context.Context, cutoff time.Time) error {
+func (s *ObjStoreSyncer) garbageCollect(ctx context.Context, cutoff time.Time) error {
 	current, currentKey, err := s.loadLatestManifest(ctx)
 	if err != nil || current == nil {
 		return err
@@ -544,6 +552,8 @@ func (s *ObjStoreSyncer) garbageCollectLocked(ctx context.Context, cutoff time.T
 			return err
 		}
 	}
+	type deletion struct{ object, mark string }
+	var mature []deletion
 	for _, name := range candidates {
 		mark := s.gcMarkKey(name)
 		if _, exists := marks[mark]; !exists {
@@ -559,14 +569,24 @@ func (s *ObjStoreSyncer) garbageCollectLocked(ctx context.Context, cutoff time.T
 		if attributes.LastModified.IsZero() || attributes.LastModified.After(cutoff) {
 			continue
 		}
-		_, latestKey, err := s.loadLatestManifest(ctx)
-		if err != nil || latestKey != currentKey {
+		mature = append(mature, deletion{name, mark})
+	}
+	if len(mature) == 0 {
+		return nil
+	}
+	// Publication is blocked only for the final revalidation and sweep, not
+	// while listing and traversing every live extent.
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	_, latestKey, err := s.loadLatestManifest(ctx)
+	if err != nil || latestKey != currentKey {
+		return err
+	}
+	for _, item := range mature {
+		if err := s.bucket.Delete(ctx, item.object); err != nil {
 			return err
 		}
-		if err := s.bucket.Delete(ctx, name); err != nil {
-			return err
-		}
-		if err := s.bucket.Delete(ctx, mark); err != nil {
+		if err := s.bucket.Delete(ctx, item.mark); err != nil {
 			return err
 		}
 	}

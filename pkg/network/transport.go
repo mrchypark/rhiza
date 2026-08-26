@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
@@ -245,18 +246,72 @@ func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte
 }
 
 func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {
-	var firstErr error
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(t.members)-1)
+	pending := 0
 	for _, member := range t.members {
 		if member.ID == t.localID {
 			continue
 		}
-		req := t.request(peerfb.OperationLearned)
-		req.Decision = decisionToWire(decision)
-		if _, err := t.call(ctx, member.ID, req, false); err != nil && firstErr == nil {
-			firstErr = err
+		pending++
+		go func(member quepaxa.Member) {
+			req := t.request(peerfb.OperationLearned)
+			req.Decision = decisionToWire(decision)
+			_, err := t.call(callCtx, member.ID, req, false)
+			results <- err
+		}(member)
+	}
+	successes := 1 // local learner
+	var firstErr error
+	for range pending {
+		if err := <-results; err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			successes++
+			if successes >= len(t.members)/2+1 {
+				return nil
+			}
 		}
 	}
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	return quepaxa.ErrQuorumUnavailable
+}
+
+func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
+	response, err := t.call(ctx, to, t.request(peerfb.OperationReadIndex), false)
+	if err != nil {
+		return 0, err
+	}
+	if response.ClusterId != string(t.clusterID) || response.ProposerId != string(to) || response.ConfigId != uint64(t.configID) {
+		return 0, fmt.Errorf("read-index source identity mismatch")
+	}
+	return quepaxa.Slot(response.Tip), nil
+}
+
+func (t *Transport) StageValue(ctx context.Context, to quepaxa.NodeID, hash quepaxa.ValueHash, value []byte) error {
+	request := t.request(peerfb.OperationStageValue)
+	request.Hash = append([]byte(nil), hash[:]...)
+	request.Value = append([]byte(nil), value...)
+	_, err := t.call(ctx, to, request, false)
+	return err
+}
+
+func (t *Transport) FetchValue(ctx context.Context, from quepaxa.NodeID, hash quepaxa.ValueHash) ([]byte, error) {
+	request := t.request(peerfb.OperationFetchValue)
+	request.Hash = append([]byte(nil), hash[:]...)
+	response, err := t.call(ctx, from, request, false)
+	if err != nil {
+		return nil, err
+	}
+	if sha256.Sum256(response.Value) != hash {
+		return nil, fmt.Errorf("fetched value hash mismatch")
+	}
+	return append([]byte(nil), response.Value...), nil
 }
 
 func (t *Transport) Close() error {

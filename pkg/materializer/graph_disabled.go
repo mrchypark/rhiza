@@ -5,6 +5,8 @@ package materializer
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
@@ -37,6 +39,16 @@ func (*Materializer) GraphRequestMatches(context.Context, types.GraphCommand) (b
 }
 
 func (*Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) { return sqlite, nil }
+
+func (*Materializer) writeSnapshot(path string, writer io.Writer) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = io.Copy(writer, file)
+	return err
+}
 
 func prepareSnapshot(data []byte, _ string) (snapshotParts, error) {
 	return snapshotParts{sqlite: data}, nil

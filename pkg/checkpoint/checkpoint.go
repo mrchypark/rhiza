@@ -4,203 +4,372 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
-	"time"
 
 	"github.com/thanos-io/objstore"
 )
 
-// Checkpoint represents a snapshot of materialized state.
+const (
+	formatVersion     = 2
+	chunkSize         = 4 << 20
+	maxCheckpointSize = 16 << 30
+	maxChunks         = maxCheckpointSize/chunkSize + 1
+	maxRootSize       = 1 << 20
+)
+
+type Chunk struct {
+	Hash [32]byte `json:"hash"`
+	Size int64    `json:"size"`
+}
+
+// Checkpoint is an immutable, content-addressed recovery root.
 type Checkpoint struct {
-	Index     uint64    `json:"index"`
-	Hash      [32]byte  `json:"hash"`
-	Size      int64     `json:"size"`
-	CreatedAt time.Time `json:"created_at"`
+	Version  int      `json:"version"`
+	ConfigID uint     `json:"config_id"`
+	Index    uint64   `json:"index"`
+	Hash     [32]byte `json:"hash"`
+	Size     int64    `json:"size"`
+	Chunks   []Chunk  `json:"chunks"`
+	RootHash [32]byte `json:"-"`
 }
 
-// Manifest tracks checkpoint metadata.
-type Manifest struct {
-	Checkpoints []Checkpoint `json:"checkpoints"`
-}
-
-// Manager manages checkpoints in object storage.
 type Manager struct {
-	bucket   objstore.Bucket
-	prefix   string
-	manifest *Manifest
-	mu       sync.Mutex
+	bucket      objstore.Bucket
+	prefix      string
+	configID    uint
+	checkpoints []Checkpoint
+	mu          sync.Mutex
 }
 
-// NewManager creates a new checkpoint manager.
-func NewManager(bucket objstore.Bucket, prefix, localDir string) *Manager {
-	return &Manager{
-		bucket:   bucket,
-		prefix:   prefix,
-		manifest: &Manifest{Checkpoints: make([]Checkpoint, 0)},
+func NewManager(bucket objstore.Bucket, prefix, _ string, configID ...uint) *Manager {
+	m := &Manager{bucket: bucket, prefix: prefix}
+	if len(configID) != 0 {
+		m.configID = configID[0]
 	}
+	return m
 }
 
-// Load loads the manifest from object storage.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := m.key("checkpoint/manifest.json")
-	r, err := m.bucket.Get(ctx, key)
-	if err != nil {
-		if m.bucket.IsObjNotFoundErr(err) {
-			return nil // no manifest yet
-		}
-		return err
-	}
-	defer r.Close()
-
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-
-	return json.Unmarshal(data, m.manifest)
-}
-
-// Save saves the manifest to object storage.
-func (m *Manager) Save(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.save(ctx)
-}
-
-func (m *Manager) save(ctx context.Context) error {
-	data, err := json.MarshalIndent(m.manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	key := m.key("checkpoint/manifest.json")
-	return m.bucket.Upload(ctx, key, bytes.NewReader(data))
-}
-
-// Create uploads a transactionally consistent materializer snapshot.
-func (m *Manager) Create(ctx context.Context, data []byte, index uint64) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(data) == 0 {
-		return fmt.Errorf("empty checkpoint")
-	}
-	// Calculate hash
-	hash := sha256.Sum256(data)
-	if count := len(m.manifest.Checkpoints); count > 0 {
-		latest := m.manifest.Checkpoints[count-1]
-		if latest.Index == index && latest.Hash == hash {
+	byRoot := make(map[[32]byte]Checkpoint)
+	err := m.bucket.Iter(ctx, m.key("checkpoint/roots"), func(name string) error {
+		index, rootHash, ok := parseRootKey(name)
+		if !ok {
 			return nil
 		}
-	}
-
-	// Upload to object storage
-	key := m.key(fmt.Sprintf("checkpoint/%d-%x", index, hash[:8]))
-	if err := m.bucket.Upload(ctx, key, bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("upload checkpoint: %w", err)
-	}
-
-	// Update manifest
-	cp := Checkpoint{
-		Index:     index,
-		Hash:      hash,
-		Size:      int64(len(data)),
-		CreatedAt: time.Now(),
-	}
-	m.manifest.Checkpoints = append(m.manifest.Checkpoints, cp)
-
-	log.Printf("checkpoint created: index=%d size=%d", index, len(data))
-	return m.save(ctx)
-}
-
-// Latest returns the most recent checkpoint.
-func (m *Manager) Latest() *Checkpoint {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.manifest.Checkpoints) == 0 {
+		root, err := m.readRoot(ctx, name, rootHash)
+		if err != nil {
+			return err
+		}
+		if root.Index != index {
+			return fmt.Errorf("checkpoint root index mismatch")
+		}
+		byRoot[root.RootHash] = root
 		return nil
-	}
-	cp := m.manifest.Checkpoints[len(m.manifest.Checkpoints)-1]
-	return &cp
-}
-
-// Download downloads a checkpoint to local directory.
-func (m *Manager) Download(ctx context.Context, index uint64, dstPath string) error {
-	data, err := m.Read(ctx, index)
+	})
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dstPath, data, 0600)
+	m.checkpoints = m.checkpoints[:0]
+	for _, root := range byRoot {
+		m.checkpoints = append(m.checkpoints, root)
+	}
+	m.sortRoots()
+	return nil
 }
 
-// Read downloads and verifies a checkpoint before it can be restored.
-func (m *Manager) Read(ctx context.Context, index uint64) ([]byte, error) {
+// Create is the bounded in-memory convenience API. CreateReader is the
+// streaming protocol used by the runtime.
+func (m *Manager) Create(ctx context.Context, data []byte, index uint64) error {
+	_, err := m.CreateReader(ctx, bytes.NewReader(data), index)
+	return err
+}
+
+func (m *Manager) CreateReader(ctx context.Context, reader io.Reader, index uint64) (*Checkpoint, error) {
+	if index == 0 {
+		return nil, fmt.Errorf("checkpoint index is required")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Find checkpoint in manifest
-	var target *Checkpoint
-	for _, cp := range m.manifest.Checkpoints {
-		if cp.Index == index {
-			target = &cp
+	root := Checkpoint{Version: formatVersion, ConfigID: m.configID, Index: index}
+	stateHash := sha256.New()
+	buffer := make([]byte, chunkSize)
+	for {
+		n, err := io.ReadFull(reader, buffer)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			return nil, err
+		}
+		if n != 0 {
+			if root.Size+int64(n) > maxCheckpointSize || len(root.Chunks) >= maxChunks {
+				return nil, fmt.Errorf("checkpoint exceeds %d bytes", maxCheckpointSize)
+			}
+			data := buffer[:n]
+			hash := sha256.Sum256(data)
+			if err := m.bucket.Upload(ctx, m.key(chunkKey(hash)), bytes.NewReader(data)); err != nil {
+				return nil, fmt.Errorf("upload checkpoint chunk: %w", err)
+			}
+			_, _ = stateHash.Write(data)
+			root.Size += int64(n)
+			root.Chunks = append(root.Chunks, Chunk{Hash: hash, Size: int64(n)})
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
 	}
-	if target == nil {
-		return nil, fmt.Errorf("checkpoint %d not found", index)
+	if root.Size == 0 {
+		return nil, fmt.Errorf("empty checkpoint")
 	}
-
-	// Download from object storage
-	key := m.key(fmt.Sprintf("checkpoint/%d-%x", target.Index, target.Hash[:8]))
-	r, err := m.bucket.Get(ctx, key)
+	copy(root.Hash[:], stateHash.Sum(nil))
+	data, err := json.Marshal(root)
 	if err != nil {
-		return nil, fmt.Errorf("download checkpoint: %w", err)
+		return nil, err
 	}
-	defer r.Close()
-
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("read checkpoint: %w", err)
-	}
-	if int64(len(data)) != target.Size {
-		return nil, fmt.Errorf("checkpoint %d size mismatch: got %d want %d", index, len(data), target.Size)
-	}
-	if sha256.Sum256(data) != target.Hash {
-		return nil, fmt.Errorf("checkpoint %d hash mismatch", index)
-	}
-	return data, nil
-}
-
-// Cleanup removes old checkpoints, keeping the latest N.
-func (m *Manager) Cleanup(ctx context.Context, keep int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.manifest.Checkpoints) <= keep {
-		return nil
-	}
-
-	// Remove old checkpoints
-	toRemove := m.manifest.Checkpoints[:len(m.manifest.Checkpoints)-keep]
-	for _, cp := range toRemove {
-		key := m.key(fmt.Sprintf("checkpoint/%d-%x", cp.Index, cp.Hash[:8]))
-		if err := m.bucket.Delete(ctx, key); err != nil {
-			log.Printf("failed to delete checkpoint %d: %v", cp.Index, err)
+	root.RootHash = sha256.Sum256(data)
+	for _, existing := range m.checkpoints {
+		if existing.RootHash == root.RootHash {
+			copy := existing
+			return &copy, nil
 		}
 	}
-
-	m.manifest.Checkpoints = m.manifest.Checkpoints[len(toRemove):]
-	return m.save(ctx)
+	if err := m.bucket.Upload(ctx, m.key(rootKey(root)), bytes.NewReader(data)); err != nil {
+		return nil, fmt.Errorf("publish checkpoint root: %w", err)
+	}
+	m.checkpoints = append(m.checkpoints, root)
+	m.sortRoots()
+	log.Printf("checkpoint root published: index=%d size=%d chunks=%d", index, root.Size, len(root.Chunks))
+	copy := root
+	return &copy, nil
 }
 
-// key prepends the prefix to the path.
-func (m *Manager) key(path string) string {
-	if m.prefix == "" {
-		return path
+func (m *Manager) Latest() *Checkpoint {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.checkpoints) == 0 {
+		return nil
 	}
-	return m.prefix + "/" + path
+	root := m.checkpoints[len(m.checkpoints)-1]
+	root.Chunks = append([]Chunk(nil), root.Chunks...)
+	return &root
+}
+
+func (m *Manager) OpenRoot(ctx context.Context, index uint64, rootHash [32]byte) (*Checkpoint, error) {
+	name := m.key(fmt.Sprintf("checkpoint/roots/%020d_%x.json", index, rootHash))
+	root, err := m.readRoot(ctx, name, rootHash)
+	if err != nil {
+		return nil, err
+	}
+	if root.Index != index {
+		return nil, fmt.Errorf("checkpoint root index mismatch")
+	}
+	return &root, nil
+}
+
+func (m *Manager) Download(ctx context.Context, index uint64, dstPath string) error {
+	file, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	err = m.ReadTo(ctx, index, file)
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (m *Manager) Read(ctx context.Context, index uint64) ([]byte, error) {
+	var data bytes.Buffer
+	if err := m.ReadTo(ctx, index, &data); err != nil {
+		return nil, err
+	}
+	return data.Bytes(), nil
+}
+
+func (m *Manager) ReadRoot(ctx context.Context, index uint64, rootHash [32]byte) ([]byte, error) {
+	root, err := m.OpenRoot(ctx, index, rootHash)
+	if err != nil {
+		return nil, err
+	}
+	var data bytes.Buffer
+	if err := m.verifyAndWrite(ctx, *root, &data); err != nil {
+		return nil, err
+	}
+	return data.Bytes(), nil
+}
+
+func (m *Manager) ReadTo(ctx context.Context, index uint64, writer io.Writer) error {
+	m.mu.Lock()
+	var target *Checkpoint
+	for i := range m.checkpoints {
+		if m.checkpoints[i].Index == index {
+			if target != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("checkpoint %d has multiple candidate roots; a sealed root hash is required", index)
+			}
+			copy := m.checkpoints[i]
+			target = &copy
+		}
+	}
+	m.mu.Unlock()
+	if target == nil {
+		return fmt.Errorf("checkpoint %d not found", index)
+	}
+	return m.verifyAndWrite(ctx, *target, writer)
+}
+
+// Verify independently strong-reads every object referenced by a proposed
+// checkpoint seal before the recorder may vote for it.
+func (m *Manager) Verify(ctx context.Context, index uint64, rootHash, stateHash [32]byte) error {
+	name := m.key(fmt.Sprintf("checkpoint/roots/%020d_%x.json", index, rootHash))
+	root, err := m.readRoot(ctx, name, rootHash)
+	if err != nil {
+		return err
+	}
+	if root.Index != index || root.Hash != stateHash {
+		return fmt.Errorf("checkpoint seal identity mismatch")
+	}
+	return m.verifyAndWrite(ctx, root, io.Discard)
+}
+
+func (m *Manager) verifyAndWrite(ctx context.Context, target Checkpoint, writer io.Writer) error {
+	stateHash := sha256.New()
+	var size int64
+	for _, chunk := range target.Chunks {
+		r, err := m.bucket.Get(ctx, m.key(chunkKey(chunk.Hash)))
+		if err != nil {
+			return fmt.Errorf("download checkpoint chunk: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(r, chunk.Size+1))
+		closeErr := r.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if int64(len(data)) != chunk.Size || sha256.Sum256(data) != chunk.Hash {
+			return fmt.Errorf("checkpoint %d chunk integrity mismatch", target.Index)
+		}
+		if _, err := writer.Write(data); err != nil {
+			return err
+		}
+		_, _ = stateHash.Write(data)
+		size += int64(len(data))
+	}
+	var hash [32]byte
+	copy(hash[:], stateHash.Sum(nil))
+	if size != target.Size || hash != target.Hash {
+		return fmt.Errorf("checkpoint %d root integrity mismatch", target.Index)
+	}
+	return nil
+}
+
+func (m *Manager) Cleanup(ctx context.Context, keep int) error {
+	if keep < 1 {
+		return fmt.Errorf("checkpoint retention must be positive")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.checkpoints) <= keep {
+		return nil
+	}
+	remove := m.checkpoints[:len(m.checkpoints)-keep]
+	for _, root := range remove {
+		if err := m.bucket.Delete(ctx, m.key(rootKey(root))); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			return err
+		}
+	}
+	m.checkpoints = append([]Checkpoint(nil), m.checkpoints[len(remove):]...)
+	return nil
+}
+
+func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) (Checkpoint, error) {
+	r, err := m.bucket.Get(ctx, name)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	defer r.Close()
+	data, err := io.ReadAll(io.LimitReader(r, maxRootSize+1))
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	if len(data) > maxRootSize || sha256.Sum256(data) != expected {
+		return Checkpoint{}, fmt.Errorf("checkpoint root integrity mismatch")
+	}
+	var root Checkpoint
+	if err := json.Unmarshal(data, &root); err != nil {
+		return Checkpoint{}, err
+	}
+	root.RootHash = expected
+	if err := m.validateRoot(root); err != nil {
+		return Checkpoint{}, err
+	}
+	return root, nil
+}
+
+func (m *Manager) validateRoot(root Checkpoint) error {
+	if root.Version != formatVersion || root.ConfigID != m.configID || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Chunks) == 0 || len(root.Chunks) > maxChunks {
+		return fmt.Errorf("invalid checkpoint root")
+	}
+	var size int64
+	for i, chunk := range root.Chunks {
+		if chunk.Size <= 0 || chunk.Size > chunkSize || (i+1 < len(root.Chunks) && chunk.Size != chunkSize) {
+			return fmt.Errorf("invalid checkpoint chunk layout")
+		}
+		size += chunk.Size
+	}
+	if size != root.Size {
+		return fmt.Errorf("checkpoint size mismatch")
+	}
+	return nil
+}
+
+func chunkKey(hash [32]byte) string { return fmt.Sprintf("checkpoint/chunks/%x.chunk", hash) }
+func rootKey(root Checkpoint) string {
+	return fmt.Sprintf("checkpoint/roots/%020d_%x.json", root.Index, root.RootHash)
+}
+
+func parseRootKey(name string) (uint64, [32]byte, bool) {
+	base := strings.TrimSuffix(path.Base(name), ".json")
+	parts := strings.SplitN(base, "_", 2)
+	if len(parts) != 2 || len(parts[1]) != 64 {
+		return 0, [32]byte{}, false
+	}
+	index, err := strconv.ParseUint(parts[0], 10, 64)
+	decoded, hashErr := hex.DecodeString(parts[1])
+	if err != nil || hashErr != nil || len(decoded) != 32 {
+		return 0, [32]byte{}, false
+	}
+	var hash [32]byte
+	copy(hash[:], decoded)
+	return index, hash, true
+}
+
+func (m *Manager) key(value string) string {
+	if m.prefix == "" {
+		return value
+	}
+	return m.prefix + "/" + value
+}
+
+func (m *Manager) sortRoots() {
+	sort.Slice(m.checkpoints, func(i, j int) bool {
+		if m.checkpoints[i].Index != m.checkpoints[j].Index {
+			return m.checkpoints[i].Index < m.checkpoints[j].Index
+		}
+		return bytes.Compare(m.checkpoints[i].RootHash[:], m.checkpoints[j].RootHash[:]) < 0
+	})
 }

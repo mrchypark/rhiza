@@ -8,11 +8,10 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
@@ -22,6 +21,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 // Node is the main runtime container.
@@ -35,11 +35,13 @@ type Node struct {
 	wal          *qlog.WAL
 	lock         *qlog.LockFile
 	bucket       *objectstore.MeteredBucket
-	qlogSync     *qlog.ObjStoreSyncer
 	checkpoints  *checkpoint.Manager
+	archive      *recovery.Manager
 	checkpointer *checkpoint.AutoCheckpointer
 	ready        atomic.Bool
 	opened       atomic.Bool
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 // New creates a new Node.
@@ -81,6 +83,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			_ = n.Shutdown()
 		}
 	}()
+	ctx, n.cancel = context.WithCancel(ctx)
 
 	// 1. Acquire lock file
 	cleanStart, lock, err := qlog.Acquire(n.config.DataDir + "/qlog")
@@ -110,28 +113,14 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			return fmt.Errorf("open object store: %w", bucketErr)
 		}
 		n.bucket = bucket
-		prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), string(n.config.NodeID))
-		manifest := qlog.NewManifest()
-		interval := n.config.ObjStoreSyncInterval
-		if interval == 0 {
-			interval = time.Minute
-		}
-		n.qlogSync = qlog.NewObjStoreSyncer(wal, manifest, bucket, prefix, interval)
-		gcInterval := n.config.ObjStoreGCInterval
-		if gcInterval == 0 {
-			gcInterval = time.Hour
-		}
-		gcGrace := n.config.ObjStoreGCGracePeriod
-		if gcGrace == 0 {
-			gcGrace = 24 * time.Hour
-		}
-		n.qlogSync.ConfigureGC(gcInterval, gcGrace)
-		if _, recoveryErr := qlog.NewRecovery(wal, manifest, bucket, prefix).Recover(ctx); recoveryErr != nil {
-			return recoveryErr
-		}
-		n.checkpoints = checkpoint.NewManager(bucket, prefix, n.config.DataDir)
+		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
+		n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
+		}
+		n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
+		if loadErr := n.archive.Load(ctx); loadErr != nil {
+			return fmt.Errorf("load shared decision archive: %w", loadErr)
 		}
 	}
 
@@ -146,8 +135,8 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		4, // reader count
 	)
 	if err != nil {
-		// ponytail: qlog is currently never compacted, so rebuilding SQLite from it
-		// is safer and smaller than database-specific corruption repair.
+		// Rebuilding from the retained consensus base and suffix is safer and
+		// smaller than database-specific corruption repair.
 		if rebuildErr := quarantineSQLite(n.config.DataDir + "/sqlite.db"); rebuildErr != nil {
 			return fmt.Errorf("open materializer: %w; quarantine: %v", err, rebuildErr)
 		}
@@ -179,12 +168,37 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	if n.checkpoints != nil {
+		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+		})
+	}
+	if n.archive != nil {
+		for core.Tip() < n.archive.Tip() {
+			values, _, archiveErr := n.archive.DecisionsFrom(core.Tip()+1, 256)
+			if archiveErr != nil || len(values) == 0 {
+				if archiveErr == nil {
+					archiveErr = fmt.Errorf("shared archive omitted slot %d", core.Tip()+1)
+				}
+				return archiveErr
+			}
+			if archiveErr := core.AcceptCertifiedValues(values); archiveErr != nil {
+				return fmt.Errorf("recover shared archive: %w", archiveErr)
+			}
+		}
+	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
 		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
-			return n.qlogSync.SyncThrough(ctx, uint64(slot))
+			if err := core.EnsureDurable(slot); err != nil {
+				return err
+			}
+			if err := n.archive.SyncThrough(ctx, core, slot); err != nil {
+				return err
+			}
+			return nil
 		})
 	}
 	n.server = server
@@ -194,31 +208,41 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	}
 	n.peer = peer
 
+	var certifiedCheckpoint *checkpoint.Checkpoint
+	if n.checkpoints != nil {
+		if seal, ok := core.LatestCheckpointSeal(); ok {
+			certifiedCheckpoint, err = n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
+			if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
+				if err == nil {
+					err = fmt.Errorf("certified checkpoint state hash mismatch")
+				}
+				return err
+			}
+		}
+	}
 	recoveryTarget := quepaxa.Slot(material.Tip())
 	if recorderTip := core.RecorderTip(); recorderTip > recoveryTarget {
 		recoveryTarget = recorderTip
 	}
-	if n.checkpoints != nil {
-		if latest := n.checkpoints.Latest(); latest != nil && quepaxa.Slot(latest.Index) > recoveryTarget {
-			recoveryTarget = quepaxa.Slot(latest.Index)
-		}
+	if certifiedCheckpoint != nil && quepaxa.Slot(certifiedCheckpoint.Index) > recoveryTarget {
+		recoveryTarget = quepaxa.Slot(certifiedCheckpoint.Index)
 	}
 	if recoveryTarget > core.Tip() {
 		if err := core.RecoverThrough(ctx, recoveryTarget); err != nil {
 			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, err)
 		}
 	}
-	if n.checkpoints != nil {
-		if latest := n.checkpoints.Latest(); latest != nil && latest.Index > material.Tip() {
-			if quepaxa.Slot(latest.Index) > core.Tip() {
-				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", latest.Index, core.Tip())
+	if certifiedCheckpoint != nil {
+		if certifiedCheckpoint.Index > material.Tip() {
+			if quepaxa.Slot(certifiedCheckpoint.Index) > core.Tip() {
+				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", certifiedCheckpoint.Index, core.Tip())
 			}
-			data, readErr := n.checkpoints.Read(ctx, latest.Index)
+			data, readErr := n.checkpoints.ReadRoot(ctx, certifiedCheckpoint.Index, certifiedCheckpoint.RootHash)
 			if readErr != nil {
 				return readErr
 			}
 			if restoreErr := material.Restore(ctx, data); restoreErr != nil {
-				return fmt.Errorf("restore checkpoint %d: %w", latest.Index, restoreErr)
+				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
 			}
 		}
 	}
@@ -228,7 +252,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if quepaxa.Slot(material.Tip()) > core.Tip() {
 		return fmt.Errorf("materialized slot %d is ahead of certified log tip %d", material.Tip(), core.Tip())
 	}
-	if material.Tip() > 0 {
+	if material.Tip() > uint64(core.CompactionFloor()) {
 		decision, ok := core.CertifiedValue(quepaxa.Slot(material.Tip()))
 		if !ok {
 			return fmt.Errorf("materialized slot %d has no recovered decision", material.Tip())
@@ -243,13 +267,40 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if len(cluster.Members) == 1 {
 		n.ready.Store(true)
 	} else {
-		go n.startCatchUp(ctx, transport, cluster)
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			n.startCatchUp(ctx, transport, cluster)
+		}()
 	}
 
 	// 8. Start periodic WAL sync
 	core.StartPeriodicSync(ctx, 1*time.Second)
-	if n.qlogSync != nil {
-		n.qlogSync.Start(ctx)
+	if n.archive != nil {
+		interval := n.config.ObjStoreSyncInterval
+		if interval == 0 {
+			interval = time.Minute
+		}
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := n.catchUpArchive(ctx); err != nil {
+						log.Printf("shared archive catch-up error: %v", err)
+					} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+						log.Printf("shared archive sync error: %v", err)
+					} else if err := n.compactCertifiedCheckpoint(ctx); err != nil {
+						log.Printf("certified checkpoint compaction skipped: %v", err)
+					}
+				}
+			}
+		}()
 	}
 	if n.checkpoints != nil {
 		interval := n.config.CheckpointInterval
@@ -257,9 +308,86 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			interval = time.Minute
 		}
 		n.checkpointer = checkpoint.NewAutoCheckpointer(n.checkpoints, material, 1, interval)
-		n.checkpointer.Start(ctx, func() uint64 { return uint64(core.Tip()) }, n.qlogSync.Sync)
+		n.checkpointer.ConfigurePublication(
+			func() bool {
+				order := core.ProposerOrder()
+				if len(order) == 0 || order[0] != core.NodeID() {
+					return false
+				}
+				seal, ok := core.LatestCheckpointSeal()
+				return !ok || material.Tip() > uint64(seal.DecisionSlot)
+			},
+			func(ctx context.Context, root *checkpoint.Checkpoint) error {
+				prefix, ok := core.PrefixHash(quepaxa.Slot(root.Index))
+				if !ok {
+					return fmt.Errorf("checkpoint prefix %d is unavailable", root.Index)
+				}
+				value, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{
+					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix,
+				})
+				if err != nil {
+					return err
+				}
+				_, _, err = core.Propose(ctx, value)
+				if err != nil {
+					return err
+				}
+				if err := n.replayLocalDecisions(ctx); err != nil {
+					return err
+				}
+				return n.compactCertifiedCheckpoint(ctx)
+			},
+		)
+		n.checkpointer.Start(ctx, func() uint64 { return uint64(core.Tip()) }, func(ctx context.Context) error {
+			if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+				return err
+			}
+			return nil
+		})
 	}
 	return nil
+}
+
+func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
+	if n.core == nil || n.archive == nil || n.checkpoints == nil {
+		return nil
+	}
+	seal, ok := n.core.LatestCheckpointSeal()
+	if !ok || seal.Index <= n.core.CompactionFloor() {
+		return nil
+	}
+	if quepaxa.Slot(n.material.Tip()) < seal.Index {
+		return fmt.Errorf("materializer tip %d is behind checkpoint %d", n.material.Tip(), seal.Index)
+	}
+	if err := n.core.VerifyCheckpoint(ctx, seal.CheckpointSeal); err != nil {
+		return err
+	}
+	if err := n.archive.SyncThrough(ctx, n.core, seal.DecisionSlot); err != nil {
+		return err
+	}
+	return n.core.CompactThrough(seal.Index, seal.RootHash)
+}
+
+func (n *Node) catchUpArchive(ctx context.Context) error {
+	if n.archive == nil || n.core == nil {
+		return nil
+	}
+	if err := n.archive.Load(ctx); err != nil {
+		return err
+	}
+	for n.core.Tip() < n.archive.Tip() {
+		values, _, err := n.archive.DecisionsFrom(n.core.Tip()+1, 256)
+		if err != nil || len(values) == 0 {
+			if err == nil {
+				err = fmt.Errorf("shared archive omitted slot %d", n.core.Tip()+1)
+			}
+			return err
+		}
+		if err := n.core.AcceptCertifiedValues(values); err != nil {
+			return err
+		}
+	}
+	return n.replayLocalDecisions(ctx)
 }
 
 // Start opens the embedded engine and serves the optional public HTTP adapter.
@@ -269,7 +397,7 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	listener, err := net.Listen("tcp", n.config.BindAddr)
 	if err != nil {
-		return fmt.Errorf("listen: %w", err)
+		return errors.Join(fmt.Errorf("listen: %w", err), n.Shutdown())
 	}
 
 	httpServer := &http.Server{
@@ -369,6 +497,9 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 
 func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
 	for {
+		if err := n.catchUpArchive(ctx); err != nil {
+			return err
+		}
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return err
 		}
@@ -438,6 +569,8 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 // Shutdown gracefully shuts down the node.
 func (n *Node) Shutdown() error {
 	n.opened.Store(false)
+	n.ready.Store(false)
+	var shutdownErr error
 	if n.server != nil {
 		n.server.Close()
 		n.server = nil
@@ -445,6 +578,21 @@ func (n *Node) Shutdown() error {
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
 	}
+	if n.archive != nil && n.material != nil && n.core != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()); err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
+		} else if n.checkpointer != nil {
+			shutdownErr = errors.Join(shutdownErr, n.checkpointer.CheckpointOnShutdown(shutdownCtx, uint64(n.core.Tip())))
+		}
+		cancel()
+	}
+	n.checkpointer = nil
+	if n.cancel != nil {
+		n.cancel()
+		n.cancel = nil
+	}
+	n.wg.Wait()
 	if n.peer != nil {
 		n.peer.Close()
 		n.peer = nil
@@ -453,17 +601,8 @@ func (n *Node) Shutdown() error {
 		n.transport.Close()
 		n.transport = nil
 	}
-	var shutdownErr error
-	if n.qlogSync != nil && n.material != nil && n.core != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := n.qlogSync.Sync(shutdownCtx); err != nil {
-			shutdownErr = errors.Join(shutdownErr, err)
-		} else if n.checkpointer != nil {
-			shutdownErr = errors.Join(shutdownErr, n.checkpointer.CheckpointOnShutdown(shutdownCtx, uint64(n.core.Tip())))
-		}
-		cancel()
-		n.qlogSync.Stop()
-		n.qlogSync = nil
+	if n.core != nil {
+		n.core.StopPeriodicSync()
 	}
 	// Close WAL
 	if n.wal != nil {
@@ -519,32 +658,4 @@ func (n *Node) peerAddr() string {
 		return n.config.BindAddr
 	}
 	return net.JoinHostPort(host, "9090")
-}
-
-func main() {
-	// Parse config from environment
-	config := &types.ExecutionConfig{
-		ClusterID: types.ClusterID(os.Getenv("RHIZA_CLUSTER_ID")),
-		Profile:   types.Profile(os.Getenv("RHIZA_EXECUTION_PROFILE")),
-		DataDir:   getEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"),
-		BindAddr:  getEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
-	}
-
-	node := New(config)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	if err := node.Start(ctx); err != nil {
-		log.Fatalf("node error: %v", err)
-	}
-
-	node.Shutdown()
-}
-
-func getEnvOrDefault(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultValue
 }

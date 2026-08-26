@@ -5,7 +5,10 @@ enum Operation:ubyte {
   Record = 1,
   Propose = 2,
   Learned = 3,
-  Decisions = 4
+  Decisions = 4,
+  ReadIndex = 5,
+  StageValue = 6,
+  FetchValue = 7
 }
 
 table Proposal {
@@ -43,7 +46,7 @@ table DecidedValue {
 }
 
 table Request {
-  version:ushort = 1 (id: 0);
+  version:ushort = 2 (id: 0);
   operation:Operation (id: 1);
   cluster_id:string (id: 2);
   sender_id:string (id: 3);
@@ -54,10 +57,11 @@ table Request {
   decision:Decision (id: 8);
   from:ulong (id: 9);
   limit:uint (id: 10);
+  hash:[ubyte] (id: 11);
 }
 
 table Response {
-  version:ushort = 1 (id: 0);
+  version:ushort = 2 (id: 0);
   error:string (id: 1);
   summary:Summary (id: 2);
   decided:DecidedValue (id: 3);
@@ -67,6 +71,7 @@ table Response {
   tip:ulong (id: 7);
   decisions:[DecidedValue] (id: 8);
   error_code:ushort (id: 9);
+  value:[ubyte] (id: 10);
 }
 
 root_type Request;

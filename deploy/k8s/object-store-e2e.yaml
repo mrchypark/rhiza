@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rhiza-objstore-e2e
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rhiza-minio
+  namespace: rhiza-objstore-e2e
+type: Opaque
+stringData:
+  access-key: rhiza-e2e
+  secret-key: rhiza-e2e-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-minio
+  namespace: rhiza-objstore-e2e
+spec:
+  selector:
+    app: rhiza-minio
+  ports:
+    - name: s3
+      port: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rhiza-minio
+  namespace: rhiza-objstore-e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rhiza-minio
+  template:
+    metadata:
+      labels:
+        app: rhiza-minio
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          args: ["server", "/data"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-minio
+                  key: access-key
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-minio
+                  key: secret-key
+          ports:
+            - name: s3
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: s3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rhiza-create-bucket
+  namespace: rhiza-objstore-e2e
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              until mc alias set local http://rhiza-minio:9000 "$ACCESS_KEY" "$SECRET_KEY"; do sleep 1; done;
+              mc mb --ignore-existing local/rhiza
+          env:
+            - name: ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-minio
+                  key: access-key
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-minio
+                  key: secret-key

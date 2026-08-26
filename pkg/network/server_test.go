@@ -29,6 +29,16 @@ func (unavailableTransport) SendDecision(context.Context, quepaxa.Decision) erro
 	return errors.New("unavailable")
 }
 
+func (unavailableTransport) ReadTip(context.Context, quepaxa.NodeID) (quepaxa.Slot, error) {
+	return 0, errors.New("unavailable")
+}
+func (unavailableTransport) StageValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash, []byte) error {
+	return errors.New("unavailable")
+}
+func (unavailableTransport) FetchValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash) ([]byte, error) {
+	return nil, errors.New("unavailable")
+}
+
 func mustCore(t *testing.T, nodeID quepaxa.NodeID, members []quepaxa.Member, wal *qlog.WAL, transport quepaxa.Transport) *quepaxa.Core {
 	t.Helper()
 	if wal == nil {
@@ -90,6 +100,23 @@ func TestHTTPAdapterDoesNotExposePeerRPC(t *testing.T) {
 	}
 }
 
+func TestSQLBuildRejectsNewGraphValueBeforeConsensus(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil, members, 0)
+	defer server.Close()
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "graph", Cypher: "CREATE (:N)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.proposeLocal(context.Background(), value); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("error=%v, want invalid request", err)
+	}
+	if core.Tip() != 0 {
+		t.Fatalf("rejected graph value advanced consensus tip to %d", core.Tip())
+	}
+}
+
 func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}}
 	core := mustCore(t, "n1", members, nil, nil)
@@ -118,7 +145,7 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 	}
 }
 
-func TestLinearizableQueryAppliesThroughUniqueConsensusBarrier(t *testing.T) {
+func TestLinearizableQueryUsesReadIndexWithoutConsumingSlots(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir() + "/qlog")
 	if err != nil {
 		t.Fatal(err)
@@ -141,13 +168,13 @@ func TestLinearizableQueryAppliesThroughUniqueConsensusBarrier(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
-	if material.Tip() != 2 {
-		t.Fatalf("material tip=%d, want write plus barrier at 2", material.Tip())
+	if material.Tip() != 1 {
+		t.Fatalf("material tip=%d, want write at 1", material.Tip())
 	}
 	res = httptest.NewRecorder()
 	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/sql/query", bytes.NewReader(body)))
-	if res.Code != http.StatusOK || material.Tip() != 3 {
-		t.Fatalf("second read reused old barrier: status=%d tip=%d", res.Code, material.Tip())
+	if res.Code != http.StatusOK || material.Tip() != 1 {
+		t.Fatalf("second read consumed a consensus slot: status=%d tip=%d", res.Code, material.Tip())
 	}
 
 	res = httptest.NewRecorder()
@@ -322,5 +349,74 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 	res = request("/v1/kv/get", `{"key":"short"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"found":false`)) {
 		t.Fatalf("TTL get status=%d body=%s", res.Code, res.Body.String())
+	}
+}
+
+func TestKVRetryPreservesFirstAdmissionAndRejectsChangedIntent(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+
+	req := KVMutationRequest{RequestID: "retry", Key: "key", Value: []byte("value"), TTLMS: 60_000}
+	first, err := server.KVPut(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	second, err := server.KVPut(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("retry changed result: first=%+v second=%+v", first, second)
+	}
+	req.Value = []byte("different")
+	if _, err := server.KVPut(context.Background(), req); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("changed request error=%v, want conflict", err)
+	}
+}
+
+func TestNotifyRetryIsIdempotentAndChangedPayloadConflicts(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	ch, cancel, err := server.NotifySubscribe("topic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	command := types.NotifyCommand{RequestID: "notify", Topic: "topic", Payload: []byte("one")}
+	first, err := server.NotifyPublish(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := server.NotifyPublish(context.Background(), command)
+	if err != nil || first != second {
+		t.Fatalf("retry slot=%d want=%d err=%v", second, first, err)
+	}
+	if got := <-ch; !bytes.Equal(got, command.Payload) {
+		t.Fatalf("payload=%q", got)
+	}
+	select {
+	case duplicate := <-ch:
+		t.Fatalf("duplicate publish=%q", duplicate)
+	default:
+	}
+	command.Payload = []byte("two")
+	if _, err := server.NotifyPublish(context.Background(), command); !errors.Is(err, ErrRequestConflict) {
+		t.Fatalf("changed notification error=%v, want conflict", err)
 	}
 }

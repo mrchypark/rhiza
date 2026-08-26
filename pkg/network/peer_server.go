@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
@@ -34,6 +35,8 @@ type PeerServer struct {
 	token       string
 	connections chan struct{}
 	streams     chan struct{}
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
@@ -58,26 +61,29 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 	if err != nil {
 		return nil, err
 	}
+	runCtx, cancel := context.WithCancel(ctx)
 	peer := &PeerServer{
 		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), token: token,
-		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams),
+		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams), cancel: cancel,
 	}
 	for _, member := range members {
 		peer.members[member.ID] = member
 	}
-	go peer.serve(ctx)
+	peer.wg.Add(1)
+	go func() { defer peer.wg.Done(); peer.serve(runCtx) }()
 	return peer, nil
 }
 
-func (s *PeerServer) Close() error { return s.listener.Close() }
+func (s *PeerServer) Close() error {
+	s.cancel()
+	err := s.listener.Close()
+	s.wg.Wait()
+	return err
+}
 
 func (s *PeerServer) Addr() string { return s.listener.Addr().String() }
 
 func (s *PeerServer) serve(ctx context.Context) {
-	go func() {
-		<-ctx.Done()
-		_ = s.Close()
-	}()
 	for {
 		conn, err := s.listener.Accept(ctx)
 		if err != nil {
@@ -85,8 +91,9 @@ func (s *PeerServer) serve(ctx context.Context) {
 		}
 		select {
 		case s.connections <- struct{}{}:
+			s.wg.Add(1)
 			go func() {
-				defer func() { <-s.connections }()
+				defer func() { <-s.connections; s.wg.Done() }()
 				s.serveConnection(ctx, conn)
 			}()
 		default:
@@ -96,6 +103,7 @@ func (s *PeerServer) serve(ctx context.Context) {
 }
 
 func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
+	defer conn.CloseWithError(0, "shutdown")
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -103,8 +111,9 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 		}
 		select {
 		case s.streams <- struct{}{}:
+			s.wg.Add(1)
 			go func() {
-				defer func() { <-s.streams }()
+				defer func() { <-s.streams; s.wg.Done() }()
 				s.serveStream(conn, stream)
 			}()
 		default:
@@ -191,7 +200,7 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if err != nil {
 			return nil, err
 		}
-		if err := s.server.core.AcceptDecisionHint(decision); err != nil {
+		if err := s.server.core.AcceptDecision(decision); err != nil {
 			return nil, err
 		}
 		if err := s.server.applyDecisions(ctx, decision.Slot); err != nil {
@@ -227,6 +236,32 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		}
 		response.Decisions = wireDecisions[:fit]
 		return response, nil
+	case peerfb.OperationReadIndex:
+		if !s.server.ready() {
+			return nil, ErrNotReady
+		}
+		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(s.server.core.Tip())}, nil
+	case peerfb.OperationStageValue:
+		if len(request.Hash) != sha256.Size {
+			return nil, fmt.Errorf("invalid value hash")
+		}
+		var hash quepaxa.ValueHash
+		copy(hash[:], request.Hash)
+		if err := s.server.core.StageValue(hash, request.Value); err != nil {
+			return nil, err
+		}
+		return &peerfb.ResponseT{}, nil
+	case peerfb.OperationFetchValue:
+		if len(request.Hash) != sha256.Size {
+			return nil, fmt.Errorf("invalid value hash")
+		}
+		var hash quepaxa.ValueHash
+		copy(hash[:], request.Hash)
+		value, ok := s.server.core.Value(hash)
+		if !ok {
+			return nil, fmt.Errorf("value is unavailable")
+		}
+		return &peerfb.ResponseT{Value: value}, nil
 	default:
 		return nil, fmt.Errorf("unknown peer operation %d", request.Operation)
 	}

@@ -20,6 +20,12 @@ type AutoCheckpointer struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+	eligible func() bool
+	publish  func(context.Context, *Checkpoint) error
+}
+
+func (a *AutoCheckpointer) ConfigurePublication(eligible func() bool, publish func(context.Context, *Checkpoint) error) {
+	a.eligible, a.publish = eligible, publish
 }
 
 // NewAutoCheckpointer creates a new auto checkpointer.
@@ -53,6 +59,9 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 			case <-a.stopCh:
 				return
 			case <-ticker.C:
+				if a.eligible != nil && !a.eligible() {
+					continue
+				}
 				tip := tipFunc()
 				if tip == 0 {
 					continue
@@ -69,22 +78,14 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 					}
 				}
 
-				log.Printf("creating automatic checkpoint at slot %d", tip)
-				snapshot, err := a.material.Snapshot(ctx)
-				if err == nil {
-					err = a.manager.Create(ctx, snapshot, tip)
-				}
+				appliedTip, err := a.create(ctx)
 				if err != nil {
 					log.Printf("failed to create checkpoint: %v", err)
 					continue
 				}
 
-				lastCheckpoint = tip
+				lastCheckpoint = appliedTip
 
-				// Cleanup old checkpoints
-				if err := a.manager.Cleanup(ctx, 3); err != nil {
-					log.Printf("failed to cleanup checkpoints: %v", err)
-				}
 			}
 		}
 	}()
@@ -102,12 +103,33 @@ func (a *AutoCheckpointer) CheckpointOnShutdown(ctx context.Context, tip uint64)
 		return nil
 	}
 
-	log.Printf("creating shutdown checkpoint at slot %d", tip)
-	snapshot, err := a.material.Snapshot(ctx)
+	appliedTip, err := a.create(ctx)
 	if err != nil {
 		return err
 	}
-	return a.manager.Create(ctx, snapshot, tip)
+	if appliedTip == 0 {
+		return nil
+	}
+	return nil
+}
+
+func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
+	path, appliedTip, cleanup, err := a.material.SnapshotFileAt(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer cleanup()
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	log.Printf("creating streaming checkpoint at slot %d", appliedTip)
+	root, err := a.manager.CreateReader(ctx, file, appliedTip)
+	if err == nil && a.publish != nil {
+		err = a.publish(ctx, root)
+	}
+	return appliedTip, err
 }
 
 // NewManagerFromEnv creates a checkpoint manager from environment.

@@ -96,7 +96,7 @@ func proposalFromFlatBuffer(proposal *walfb.ProposalT) (*Proposal, error) {
 	decoded := &Proposal{ProposerID: NodeID(proposal.ProposerId), Value: append([]byte(nil), proposal.Value...)}
 	copy(decoded.Priority[:], proposal.Priority)
 	copy(decoded.Hash[:], proposal.Hash)
-	if sha256.Sum256(decoded.Value) != decoded.Hash {
+	if len(decoded.Value) != 0 && sha256.Sum256(decoded.Value) != decoded.Hash {
 		return nil, fmt.Errorf("proposal hash mismatch")
 	}
 	return decoded, nil

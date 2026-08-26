@@ -7,17 +7,18 @@ import (
 )
 
 type RequestT struct {
-	Version uint16 `json:"version"`
-	Operation Operation `json:"operation"`
-	ClusterId string `json:"cluster_id"`
-	SenderId string `json:"sender_id"`
-	ConfigId uint64 `json:"config_id"`
-	Token string `json:"token"`
-	Record *RecordRequestT `json:"record"`
-	Value []byte `json:"value"`
-	Decision *DecisionT `json:"decision"`
-	From uint64 `json:"from"`
-	Limit uint32 `json:"limit"`
+	Version   uint16          `json:"version"`
+	Operation Operation       `json:"operation"`
+	ClusterId string          `json:"cluster_id"`
+	SenderId  string          `json:"sender_id"`
+	ConfigId  uint64          `json:"config_id"`
+	Token     string          `json:"token"`
+	Record    *RecordRequestT `json:"record"`
+	Value     []byte          `json:"value"`
+	Decision  *DecisionT      `json:"decision"`
+	From      uint64          `json:"from"`
+	Limit     uint32          `json:"limit"`
+	Hash      []byte          `json:"hash"`
 }
 
 func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -42,6 +43,10 @@ func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 		valueOffset = builder.CreateByteString(t.Value)
 	}
 	decisionOffset := t.Decision.Pack(builder)
+	hashOffset := flatbuffers.UOffsetT(0)
+	if t.Hash != nil {
+		hashOffset = builder.CreateByteString(t.Hash)
+	}
 	RequestStart(builder)
 	RequestAddVersion(builder, t.Version)
 	RequestAddOperation(builder, t.Operation)
@@ -54,6 +59,7 @@ func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	RequestAddDecision(builder, decisionOffset)
 	RequestAddFrom(builder, t.From)
 	RequestAddLimit(builder, t.Limit)
+	RequestAddHash(builder, hashOffset)
 	return RequestEnd(builder)
 }
 
@@ -69,6 +75,7 @@ func (rcv *Request) UnPackTo(t *RequestT) {
 	t.Decision = rcv.Decision(nil).UnPack()
 	t.From = rcv.From()
 	t.Limit = rcv.Limit()
+	t.Hash = rcv.HashBytes()
 }
 
 func (rcv *Request) UnPack() *RequestT {
@@ -132,7 +139,7 @@ func (rcv *Request) Version() uint16 {
 	if o != 0 {
 		return rcv._tab.GetUint16(o + rcv._tab.Pos)
 	}
-	return 1
+	return 2
 }
 
 func (rcv *Request) MutateVersion(n uint16) bool {
@@ -271,11 +278,45 @@ func (rcv *Request) MutateLimit(n uint32) bool {
 	return rcv._tab.MutateUint32Slot(24, n)
 }
 
+func (rcv *Request) Hash(j int) byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.GetByte(a + flatbuffers.UOffsetT(j*1))
+	}
+	return 0
+}
+
+func (rcv *Request) HashLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *Request) HashBytes() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
+func (rcv *Request) MutateHash(j int, n byte) bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(26))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.MutateByte(a+flatbuffers.UOffsetT(j*1), n)
+	}
+	return false
+}
+
 func RequestStart(builder *flatbuffers.Builder) {
-	builder.StartObject(11)
+	builder.StartObject(12)
 }
 func RequestAddVersion(builder *flatbuffers.Builder, version uint16) {
-	builder.PrependUint16Slot(0, version, 1)
+	builder.PrependUint16Slot(0, version, 2)
 }
 func RequestAddOperation(builder *flatbuffers.Builder, operation Operation) {
 	builder.PrependByteSlot(1, byte(operation), 0)
@@ -309,6 +350,12 @@ func RequestAddFrom(builder *flatbuffers.Builder, from uint64) {
 }
 func RequestAddLimit(builder *flatbuffers.Builder, limit uint32) {
 	builder.PrependUint32Slot(10, limit, 0)
+}
+func RequestAddHash(builder *flatbuffers.Builder, hash flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(11, flatbuffers.UOffsetT(hash), 0)
+}
+func RequestStartHashVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(1, numElems, 1)
 }
 func RequestEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

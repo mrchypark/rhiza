@@ -49,6 +49,9 @@ metadata:
 spec:
   serviceName: rhiza-graph-headless
   podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+    rollingUpdate: null
   replicas: 3
   selector:
     matchLabels:
@@ -75,6 +78,26 @@ spec:
               value: 0.0.0.0:9090
             - name: RHIZA_DATA_DIR
               value: /data
+            - name: RHIZA_CLUSTER_ID
+              value: graph-3peer-e2e
+            - name: RHIZA_OBJSTORE_PROVIDER
+              value: s3
+            - name: RHIZA_OBJSTORE_ENDPOINT
+              value: rhiza-minio.rhiza-objstore-e2e.svc.cluster.local:9000
+            - name: RHIZA_OBJSTORE_BUCKET
+              value: rhiza
+            - name: RHIZA_OBJSTORE_REGION
+              value: us-east-1
+            - name: RHIZA_OBJSTORE_INSECURE
+              value: "true"
+            - name: RHIZA_OBJSTORE_ACCESS_KEY
+              value: rhiza-e2e
+            - name: RHIZA_OBJSTORE_SECRET_KEY
+              value: rhiza-e2e-secret
+            - name: RHIZA_OBJSTORE_DURABILITY
+              value: before-ack
+            - name: RHIZA_CHECKPOINT_INTERVAL
+              value: 5s
             - name: RHIZA_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:

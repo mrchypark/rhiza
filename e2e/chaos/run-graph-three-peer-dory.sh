@@ -121,4 +121,28 @@ until post "$node1/v1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cyph
   sleep 0.25
 done
 
-printf 'PASS: graph peers=3 failed=1 quorum-write=%ss converged=true; failed=2 write-status=%s recovered-write=true\n' "$write_seconds" "$status"
+for peer in 0 1 2; do
+  (( pf_pids[$peer] > 0 )) || continue
+  kill "${pf_pids[$peer]}" 2>/dev/null || true
+  wait "${pf_pids[$peer]}" 2>/dev/null || true
+done
+dory k8s delete pod rhiza-graph-0 rhiza-graph-1 rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
+deadline=$((SECONDS + 90))
+until dory k8s get pod rhiza-graph-0 rhiza-graph-1 rhiza-graph-2 -n rhiza-graph-3peer-e2e >/dev/null 2>&1; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.5
+done
+dory k8s wait pod/rhiza-graph-0 pod/rhiza-graph-1 pod/rhiza-graph-2 -n rhiza-graph-3peer-e2e --for=condition=Ready --timeout=180s
+for peer in 0 1 2; do
+  dory k8s port-forward "pod/rhiza-graph-${peer}" -n rhiza-graph-3peer-e2e "$((base_port + peer)):8080" >"$tmp_dir/port-forward-${peer}.log" 2>&1 &
+  pf_pids[$peer]="$!"
+done
+deadline=$((SECONDS + 90))
+until result="$(curl -fsS --max-time 10 -H 'Content-Type: application/json' -d \
+  "{\"cypher\":\"MATCH (n:${label}) RETURN n.id\",\"consistency\":\"linearizable\"}" \
+  "$node0/v1/graph/query" 2>/dev/null)" && [[ "$result" == *before* && "$result" == *during* && "$result" == *after* && "$result" != *rejected* ]]; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.5
+done
+
+printf 'PASS: graph peers=3 failed=1 quorum-write=%ss converged=true; failed=2 write-status=%s recovered-write=true; shared-object-recovery=true\n' "$write_seconds" "$status"
