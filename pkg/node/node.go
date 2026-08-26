@@ -257,11 +257,20 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			if quepaxa.Slot(certifiedCheckpoint.Index) > core.Tip() {
 				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", certifiedCheckpoint.Index, core.Tip())
 			}
-			data, readErr := n.checkpoints.ReadRoot(ctx, certifiedCheckpoint.Index, certifiedCheckpoint.RootHash)
-			if readErr != nil {
+			file, fileErr := os.CreateTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
+			if fileErr != nil {
+				return fileErr
+			}
+			path := file.Name()
+			if closeErr := file.Close(); closeErr != nil {
+				_ = os.Remove(path)
+				return closeErr
+			}
+			defer os.Remove(path)
+			if readErr := n.checkpoints.DownloadRoot(ctx, certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, path); readErr != nil {
 				return readErr
 			}
-			if restoreErr := material.Restore(ctx, data); restoreErr != nil {
+			if restoreErr := material.RestoreFile(ctx, path); restoreErr != nil {
 				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
 			}
 		}
@@ -335,16 +344,28 @@ func (n *Node) Open(ctx context.Context) (err error) {
 					return false
 				}
 				seal, ok := core.LatestCheckpointSeal()
-				return !ok || material.Tip() > uint64(seal.DecisionSlot)
+				return !ok || material.Tip() > uint64(seal.Index)
 			},
 			func(ctx context.Context, root *checkpoint.Checkpoint) error {
 				prefix, ok := core.PrefixHash(quepaxa.Slot(root.Index))
 				if !ok {
 					return fmt.Errorf("checkpoint prefix %d is unavailable", root.Index)
 				}
-				value, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{
-					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix,
-				})
+				order, err := core.LeaderOrder(quepaxa.Slot(root.Index) + 1)
+				if err != nil {
+					return err
+				}
+				seal := quepaxa.CheckpointSeal{
+					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
+					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order,
+				}
+				if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+					return err
+				}
+				if err := transport.PrepareCheckpoint(ctx, seal); err != nil {
+					return err
+				}
+				value, err := quepaxa.EncodeCheckpointSeal(seal)
 				if err != nil {
 					return err
 				}
@@ -364,6 +385,37 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			}
 			return nil
 		})
+	}
+	if n.checkpoints != nil && n.config.ObjStoreGCInterval > 0 {
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			ticker := time.NewTicker(n.config.ObjStoreGCInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					order := core.ProposerOrder()
+					if len(order) == 0 || order[0] != core.NodeID() {
+						continue
+					}
+					retain := make(map[[32]byte]struct{}, 2)
+					if _, root, ok := core.RecoveryRoot(); ok {
+						retain[root] = struct{}{}
+					}
+					if seal, ok := core.LatestCheckpointSeal(); ok {
+						retain[seal.RootHash] = struct{}{}
+					}
+					if err := n.checkpoints.GarbageCollect(ctx, retain, 2, n.config.ObjStoreGCGracePeriod); err != nil {
+						log.Printf("checkpoint GC failed: %v", err)
+					} else if err := n.archive.Cleanup(ctx, n.config.ObjStoreGCGracePeriod); err != nil {
+						log.Printf("archive GC failed: %v", err)
+					}
+				}
+			}
+		}()
 	}
 	return nil
 }

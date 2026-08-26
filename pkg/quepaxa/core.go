@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -69,8 +70,9 @@ type Core struct {
 	values              map[ValueHash][]byte
 	valueDurable        map[ValueHash]bool
 	prefixes            map[Slot][32]byte
+	checkpointMu        sync.Mutex
 	checkpointValidator func(context.Context, CheckpointSeal) error
-	verifiedRoots       map[[32]byte]bool
+	preparedCheckpoints map[Slot][32]byte
 	sealedRoots         map[[32]byte]SealedCheckpoint
 	recorders           map[Slot]ISR
 	recordLocks         [64]sync.Mutex
@@ -89,7 +91,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
 		nextSlot: 1, pipeline: make(chan struct{}, 16), tipChanged: make(chan struct{}),
-		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), verifiedRoots: make(map[[32]byte]bool), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
+		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
 }
@@ -810,17 +812,47 @@ func (c *Core) validateCheckpointValue(ctx context.Context, hash ValueHash) erro
 	if err != nil || !checkpoint {
 		return err
 	}
-	return c.VerifyCheckpoint(ctx, seal)
+	return c.RequirePreparedCheckpoint(seal)
 }
 
-func (c *Core) VerifyCheckpoint(ctx context.Context, seal CheckpointSeal) error {
+func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Context, CheckpointSeal) error, error) {
 	c.mu.RLock()
 	prefix, prefixOK := c.prefixes[seal.Index]
-	verified := c.verifiedRoots[seal.RootHash]
+	preparedRoot, prepared := c.preparedCheckpoints[seal.Index]
 	validator := c.checkpointValidator
+	order, orderErr := c.leaderOrderLocked(seal.Index + 1)
+	tip := c.tip
 	c.mu.RUnlock()
-	if seal.ConfigID != c.config.ConfigID || !prefixOK || prefix != seal.PrefixHash || seal.Index >= c.Tip()+1 {
-		return fmt.Errorf("checkpoint seal does not match local certified prefix")
+	if seal.ConfigID != c.config.ConfigID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) {
+		return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix")
+	}
+	if prepared && preparedRoot != seal.RootHash {
+		return false, nil, fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	}
+	return prepared, validator, nil
+}
+
+// RequirePreparedCheckpoint is the bounded Record-path check. Full object
+// verification happens before consensus through PrepareCheckpoint.
+func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
+	verified, _, err := c.checkpointIdentity(seal)
+	if err != nil {
+		return err
+	}
+	if !verified {
+		return fmt.Errorf("checkpoint root is not prepared")
+	}
+	return nil
+}
+
+// PrepareCheckpoint verifies a candidate outside Record RPC and persists the
+// verified identity before this node may vote for its seal.
+func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error {
+	c.checkpointMu.Lock()
+	defer c.checkpointMu.Unlock()
+	verified, validator, err := c.checkpointIdentity(seal)
+	if err != nil {
+		return err
 	}
 	if verified {
 		return nil
@@ -831,10 +863,25 @@ func (c *Core) VerifyCheckpoint(ctx context.Context, seal CheckpointSeal) error 
 	if err := validator(ctx, seal); err != nil {
 		return err
 	}
+	payload, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		return err
+	}
+	if err := c.wal.Append(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}); err != nil {
+		return err
+	}
+	if err := c.commits.Sync(ctx); err != nil {
+		return err
+	}
 	c.mu.Lock()
-	c.verifiedRoots[seal.RootHash] = true
+	c.preparedCheckpoints[seal.Index] = seal.RootHash
 	c.mu.Unlock()
 	return nil
+}
+
+// VerifyCheckpoint preserves the public API while using the prepare protocol.
+func (c *Core) VerifyCheckpoint(ctx context.Context, seal CheckpointSeal) error {
+	return c.PrepareCheckpoint(ctx, seal)
 }
 
 // AcceptDecision validates Algorithm 4 quorum evidence and records the decision durably.
@@ -1421,6 +1468,7 @@ func (c *Core) recover() error {
 	if err != nil {
 		return err
 	}
+	var prepared []CheckpointSeal
 	for _, entry := range entries {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
@@ -1434,6 +1482,15 @@ func (c *Core) recover() error {
 			c.mu.Lock()
 			c.installBaseLocked(base)
 			c.mu.Unlock()
+		case qlog.EntryCheckpointVerified:
+			seal, checkpoint, decodeErr := DecodeCheckpointSeal(entry.Payload)
+			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.config.ConfigID || !c.validateLeaderSchedule(seal.NextLeaderOrder) {
+				if decodeErr == nil {
+					decodeErr = fmt.Errorf("checkpoint verification identity mismatch")
+				}
+				return fmt.Errorf("recover verified checkpoint: %w", decodeErr)
+			}
+			prepared = append(prepared, seal)
 		case qlog.EntryProposal:
 			if len(entry.Payload) == 0 || sha256.Sum256(entry.Payload) != entry.Hash {
 				return fmt.Errorf("recover QuePaxa value identity mismatch")
@@ -1511,6 +1568,18 @@ func (c *Core) recover() error {
 	c.mu.Lock()
 	c.advanceTipLocked()
 	c.mu.Unlock()
+	for _, seal := range prepared {
+		if _, _, err := c.checkpointIdentity(seal); err != nil {
+			return fmt.Errorf("recover verified checkpoint: %w", err)
+		}
+		c.mu.Lock()
+		if root, exists := c.preparedCheckpoints[seal.Index]; exists && root != seal.RootHash {
+			c.mu.Unlock()
+			return fmt.Errorf("recover verified checkpoint: conflicting roots at index %d", seal.Index)
+		}
+		c.preparedCheckpoints[seal.Index] = seal.RootHash
+		c.mu.Unlock()
+	}
 	return nil
 }
 

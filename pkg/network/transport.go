@@ -21,6 +21,7 @@ import (
 
 const peerALPN = "rhiza-peer/1"
 const peerRPCTimeout = 5 * time.Second
+const checkpointPrepareTimeout = 5 * time.Minute
 
 type peerConnection struct {
 	mu     sync.Mutex
@@ -130,7 +131,11 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 }
 
 func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
-	ctx, cancel := context.WithTimeout(ctx, peerRPCTimeout)
+	return t.callWithTimeout(ctx, to, request, waitHandshake, peerRPCTimeout)
+}
+
+func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool, timeout time.Duration) (*peerfb.ResponseT, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	conn, err := t.connection(ctx, to, waitHandshake)
 	if err != nil {
@@ -165,6 +170,52 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 		return nil, quepaxa.ErrQuorumUnavailable
 	}
 	return response, err
+}
+
+// PrepareCheckpoint waits for a durable verified quorum before the small seal
+// value enters normal consensus.
+func (t *Transport) PrepareCheckpoint(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+	value, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(t.members)-1)
+	pending := 0
+	for _, member := range t.members {
+		if member.ID == t.localID {
+			continue
+		}
+		pending++
+		go func(member quepaxa.Member) {
+			request := t.request(peerfb.OperationPrepareCheckpoint)
+			request.Value = value
+			_, err := t.callWithTimeout(callCtx, member.ID, request, false, checkpointPrepareTimeout)
+			results <- err
+		}(member)
+	}
+	successes := 1
+	if successes >= len(t.members)/2+1 {
+		return nil
+	}
+	var firstErr error
+	for range pending {
+		if err := <-results; err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			successes++
+			if successes >= len(t.members)/2+1 {
+				return nil
+			}
+		}
+	}
+	if firstErr != nil {
+		return fmt.Errorf("%w: prepare checkpoint: %v", quepaxa.ErrQuorumUnavailable, firstErr)
+	}
+	return quepaxa.ErrQuorumUnavailable
 }
 
 func (t *Transport) invalidate(to quepaxa.NodeID, conn *quic.Conn) {

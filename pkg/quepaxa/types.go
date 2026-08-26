@@ -85,11 +85,12 @@ type DecidedValue struct {
 }
 
 type CheckpointSeal struct {
-	ConfigID   uint     `json:"config_id"`
-	Index      Slot     `json:"index"`
-	RootHash   [32]byte `json:"root_hash"`
-	StateHash  [32]byte `json:"state_hash"`
-	PrefixHash [32]byte `json:"prefix_hash"`
+	ConfigID        uint     `json:"config_id"`
+	Index           Slot     `json:"index"`
+	RootHash        [32]byte `json:"root_hash"`
+	StateHash       [32]byte `json:"state_hash"`
+	PrefixHash      [32]byte `json:"prefix_hash"`
+	NextLeaderOrder []NodeID `json:"next_leader_order"`
 }
 
 type SealedCheckpoint struct {
@@ -113,7 +114,7 @@ func DecodeCheckpointSeal(value []byte) (CheckpointSeal, bool, error) {
 	if err := json.Unmarshal(value[len(checkpointSealMagic):], &seal); err != nil {
 		return CheckpointSeal{}, true, err
 	}
-	if seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.StateHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) {
+	if seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.StateHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || len(seal.NextLeaderOrder) == 0 {
 		return CheckpointSeal{}, true, fmt.Errorf("invalid checkpoint seal")
 	}
 	return seal, true, nil

@@ -48,8 +48,15 @@ func (*Materializer) writeSnapshot(path string, writer io.Writer) error {
 	return err
 }
 
-func prepareSnapshot(data []byte, _ string) (snapshotParts, error) {
-	return snapshotParts{sqlite: data}, nil
+func prepareSnapshotFile(path, _ string) (snapshotParts, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return snapshotParts{}, err
+	}
+	if info.Size() == 0 {
+		return snapshotParts{}, fmt.Errorf("empty snapshot")
+	}
+	return snapshotParts{sqlitePath: path}, nil
 }
 
 func (*Materializer) validateRestoredSnapshot() error { return nil }

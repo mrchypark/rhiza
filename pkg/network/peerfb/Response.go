@@ -7,17 +7,17 @@ import (
 )
 
 type ResponseT struct {
-	Version    uint16           `json:"version"`
-	Error      string           `json:"error"`
-	Summary    *SummaryT        `json:"summary"`
-	Decided    *DecidedValueT   `json:"decided"`
-	ClusterId  string           `json:"cluster_id"`
-	ProposerId string           `json:"proposer_id"`
-	ConfigId   uint64           `json:"config_id"`
-	Tip        uint64           `json:"tip"`
-	Decisions  []*DecidedValueT `json:"decisions"`
-	ErrorCode  uint16           `json:"error_code"`
-	Value      []byte           `json:"value"`
+	Version uint16 `json:"version"`
+	Error string `json:"error"`
+	Summary *SummaryT `json:"summary"`
+	Decided *DecidedValueT `json:"decided"`
+	ClusterId string `json:"cluster_id"`
+	ProposerId string `json:"proposer_id"`
+	ConfigId uint64 `json:"config_id"`
+	Tip uint64 `json:"tip"`
+	Decisions []*DecidedValueT `json:"decisions"`
+	ErrorCode uint16 `json:"error_code"`
+	Value []byte `json:"value"`
 }
 
 func (t *ResponseT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {

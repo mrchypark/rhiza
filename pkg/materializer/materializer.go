@@ -56,9 +56,9 @@ type notificationSubscription struct {
 }
 
 type snapshotParts struct {
-	sqlite   []byte
-	graphDir string
-	cleanup  func()
+	sqlitePath string
+	graphDir   string
+	cleanup    func()
 }
 
 // Open opens or creates a materializer.
@@ -895,10 +895,32 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("empty snapshot")
 	}
+	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-restore-input-*")
+	if err != nil {
+		return err
+	}
+	path := file.Name()
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	defer os.Remove(path)
+	return m.RestoreFile(ctx, path)
+}
+
+// RestoreFile validates and atomically installs a checkpoint without loading
+// the snapshot into the Go heap.
+func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	dir := filepath.Dir(m.dbPath)
-	parts, err := prepareSnapshot(data, dir)
+	parts, err := prepareSnapshotFile(snapshotPath, dir)
 	if err != nil {
 		return err
 	}
@@ -912,7 +934,14 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 	tempPath := file.Name()
 	defer os.Remove(tempPath)
 	if err = file.Chmod(0o600); err == nil {
-		_, err = file.Write(parts.sqlite)
+		var source *os.File
+		source, err = os.Open(parts.sqlitePath)
+		if err == nil {
+			_, err = io.Copy(file, source)
+			if closeErr := source.Close(); err == nil {
+				err = closeErr
+			}
+		}
 	}
 	if err == nil {
 		err = file.Sync()

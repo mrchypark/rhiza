@@ -578,7 +578,14 @@ func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
 			return nil
 		})
 	}
-	value, err := EncodeCheckpointSeal(CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix})
+	order, _ := cores["n1"].LeaderOrder(2)
+	checkpoint := CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix, NextLeaderOrder: order}
+	for _, core := range cores {
+		if err := core.PrepareCheckpoint(context.Background(), checkpoint); err != nil {
+			t.Fatal(err)
+		}
+	}
+	value, err := EncodeCheckpointSeal(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -588,8 +595,8 @@ func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
 	mu.Lock()
 	count := verified
 	mu.Unlock()
-	if count < 2 {
-		t.Fatalf("checkpoint verified by %d recorders, want quorum", count)
+	if count != len(cores) {
+		t.Fatalf("checkpoint validator calls=%d, want prepare-only %d", count, len(cores))
 	}
 }
 
@@ -612,15 +619,18 @@ func TestCompactedLearnerCountsAsCoveredQuorum(t *testing.T) {
 	for _, core := range cores {
 		core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
 	}
-	checkpointSeal := CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix}
+	order, _ := cores["n1"].LeaderOrder(2)
+	checkpointSeal := CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix, NextLeaderOrder: order}
+	for _, core := range cores {
+		if err := core.PrepareCheckpoint(context.Background(), checkpointSeal); err != nil {
+			t.Fatal(err)
+		}
+	}
 	seal, err := EncodeCheckpointSeal(checkpointSeal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := cores["n1"].Propose(context.Background(), seal); err != nil {
-		t.Fatal(err)
-	}
-	if err := cores["n2"].VerifyCheckpoint(context.Background(), checkpointSeal); err != nil {
 		t.Fatal(err)
 	}
 	if err := cores["n2"].CompactThrough(1, root); err != nil {

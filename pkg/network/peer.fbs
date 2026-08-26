@@ -8,7 +8,8 @@ enum Operation:ubyte {
   Decisions = 4,
   ReadIndex = 5,
   StageValue = 6,
-  FetchValue = 7
+  FetchValue = 7,
+  PrepareCheckpoint = 8
 }
 
 table Proposal {

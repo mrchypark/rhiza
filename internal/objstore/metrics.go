@@ -84,6 +84,13 @@ func (b *MeteredBucket) Iter(ctx context.Context, dir string, f func(string) err
 	return err
 }
 
+func (b *MeteredBucket) IterWithAttributes(ctx context.Context, dir string, f func(thanosobjstore.IterObjectAttributes) error, options ...thanosobjstore.IterOption) error {
+	b.metrics.lists.Add(1)
+	err := b.Bucket.IterWithAttributes(ctx, dir, f, options...)
+	b.record(err)
+	return err
+}
+
 func (b *MeteredBucket) Exists(ctx context.Context, name string) (bool, error) {
 	b.metrics.heads.Add(1)
 	exists, err := b.Bucket.Exists(ctx, name)

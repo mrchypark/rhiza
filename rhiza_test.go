@@ -133,8 +133,8 @@ func objectStoreTip(t *testing.T, dir, cluster, node string) uint64 {
 }
 
 func readObjectStoreTip(dir, cluster, _ string) (uint64, error) {
-	extentDir := filepath.Join(dir, cluster, "archive", "extents")
-	entries, err := os.ReadDir(extentDir)
+	manifestDir := filepath.Join(dir, cluster, "archive", "manifests")
+	entries, err := os.ReadDir(manifestDir)
 	if err != nil {
 		return 0, err
 	}
@@ -144,10 +144,10 @@ func readObjectStoreTip(dir, cluster, _ string) (uint64, error) {
 	var tip uint64
 	for _, entry := range entries {
 		parts := strings.Split(strings.TrimSuffix(entry.Name(), ".json"), "_")
-		if len(parts) != 3 {
+		if len(parts) != 2 {
 			continue
 		}
-		end, err := strconv.ParseUint(parts[1], 10, 64)
+		end, err := strconv.ParseUint(parts[0], 10, 64)
 		if err == nil && end > tip {
 			tip = end
 		}

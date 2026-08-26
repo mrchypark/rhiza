@@ -7,36 +7,39 @@ import "strconv"
 type Operation byte
 
 const (
-	OperationNone       Operation = 0
-	OperationRecord     Operation = 1
-	OperationPropose    Operation = 2
-	OperationLearned    Operation = 3
-	OperationDecisions  Operation = 4
-	OperationReadIndex  Operation = 5
-	OperationStageValue Operation = 6
-	OperationFetchValue Operation = 7
+	OperationNone              Operation = 0
+	OperationRecord            Operation = 1
+	OperationPropose           Operation = 2
+	OperationLearned           Operation = 3
+	OperationDecisions         Operation = 4
+	OperationReadIndex         Operation = 5
+	OperationStageValue        Operation = 6
+	OperationFetchValue        Operation = 7
+	OperationPrepareCheckpoint Operation = 8
 )
 
 var EnumNamesOperation = map[Operation]string{
-	OperationNone:       "None",
-	OperationRecord:     "Record",
-	OperationPropose:    "Propose",
-	OperationLearned:    "Learned",
-	OperationDecisions:  "Decisions",
-	OperationReadIndex:  "ReadIndex",
-	OperationStageValue: "StageValue",
-	OperationFetchValue: "FetchValue",
+	OperationNone:              "None",
+	OperationRecord:            "Record",
+	OperationPropose:           "Propose",
+	OperationLearned:           "Learned",
+	OperationDecisions:         "Decisions",
+	OperationReadIndex:         "ReadIndex",
+	OperationStageValue:        "StageValue",
+	OperationFetchValue:        "FetchValue",
+	OperationPrepareCheckpoint: "PrepareCheckpoint",
 }
 
 var EnumValuesOperation = map[string]Operation{
-	"None":       OperationNone,
-	"Record":     OperationRecord,
-	"Propose":    OperationPropose,
-	"Learned":    OperationLearned,
-	"Decisions":  OperationDecisions,
-	"ReadIndex":  OperationReadIndex,
-	"StageValue": OperationStageValue,
-	"FetchValue": OperationFetchValue,
+	"None":              OperationNone,
+	"Record":            OperationRecord,
+	"Propose":           OperationPropose,
+	"Learned":           OperationLearned,
+	"Decisions":         OperationDecisions,
+	"ReadIndex":         OperationReadIndex,
+	"StageValue":        OperationStageValue,
+	"FetchValue":        OperationFetchValue,
+	"PrepareCheckpoint": OperationPrepareCheckpoint,
 }
 
 func (v Operation) String() string {

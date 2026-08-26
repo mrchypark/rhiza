@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -99,7 +100,11 @@ func TestGraphSnapshotRejectsExcessiveExpansion(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepareSnapshot(archive.Bytes(), t.TempDir()); err == nil {
+	path := filepath.Join(t.TempDir(), "checkpoint.zip")
+	if err := os.WriteFile(path, archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareSnapshotFile(path, t.TempDir()); err == nil {
 		t.Fatal("excessively expanded graph checkpoint was accepted")
 	}
 }

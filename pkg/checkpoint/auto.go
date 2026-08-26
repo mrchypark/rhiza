@@ -51,6 +51,9 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 		defer ticker.Stop()
 
 		var lastCheckpoint uint64
+		if latest := a.manager.Latest(); latest != nil {
+			lastCheckpoint = latest.Index
+		}
 
 		for {
 			select {
@@ -102,6 +105,9 @@ func (a *AutoCheckpointer) CheckpointOnShutdown(ctx context.Context, tip uint64)
 	if tip == 0 {
 		return nil
 	}
+	if latest := a.manager.Latest(); latest != nil && latest.Index >= tip {
+		return nil
+	}
 
 	appliedTip, err := a.create(ctx)
 	if err != nil {
@@ -114,6 +120,9 @@ func (a *AutoCheckpointer) CheckpointOnShutdown(ctx context.Context, tip uint64)
 }
 
 func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
+	if latest := a.manager.Latest(); latest != nil && latest.Index >= a.material.Tip() {
+		return latest.Index, nil
+	}
 	path, appliedTip, cleanup, err := a.material.SnapshotFileAt(ctx)
 	if err != nil {
 		return 0, err

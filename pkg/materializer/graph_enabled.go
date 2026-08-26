@@ -4,7 +4,6 @@ package materializer
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -474,16 +473,26 @@ func writeGraphFiles(zw *zip.Writer, graphPath string) error {
 	})
 }
 
-func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
-	if !bytes.HasPrefix(data, []byte(graphSnapshotMagic)) {
+func prepareSnapshotFile(path, dir string) (snapshotParts, error) {
+	archive, err := os.Open(path)
+	if err != nil {
+		return snapshotParts{}, err
+	}
+	defer archive.Close()
+	info, err := archive.Stat()
+	if err != nil {
+		return snapshotParts{}, err
+	}
+	magic := make([]byte, len(graphSnapshotMagic))
+	if _, err := io.ReadFull(archive, magic); err != nil || string(magic) != graphSnapshotMagic {
 		return snapshotParts{}, fmt.Errorf("graph build requires a GoraphDB Graph/KV checkpoint")
 	}
-	archive := data[len(graphSnapshotMagic):]
-	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	archiveSize := info.Size() - int64(len(graphSnapshotMagic))
+	zr, err := zip.NewReader(io.NewSectionReader(archive, int64(len(graphSnapshotMagic)), archiveSize), archiveSize)
 	if err != nil {
 		return snapshotParts{}, fmt.Errorf("open graph checkpoint: %w", err)
 	}
-	maxExtracted := int64(len(archive)) * maxGraphSnapshotExpansion
+	maxExtracted := archiveSize * maxGraphSnapshotExpansion
 	if maxExtracted < minGraphSnapshotExtracted {
 		maxExtracted = minGraphSnapshotExtracted
 	}
@@ -504,7 +513,7 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 	if err != nil {
 		return snapshotParts{}, err
 	}
-	parts := snapshotParts{graphDir: filepath.Join(root, "goraphdb"), cleanup: func() { _ = os.RemoveAll(root) }}
+	parts := snapshotParts{sqlitePath: filepath.Join(root, "sqlite.db"), graphDir: filepath.Join(root, "goraphdb"), cleanup: func() { _ = os.RemoveAll(root) }}
 	graphFiles := 0
 	for _, file := range zr.File {
 		name := filepath.ToSlash(filepath.Clean(file.Name))
@@ -514,16 +523,26 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 				parts.cleanup()
 				return snapshotParts{}, err
 			}
-			parts.sqlite, err = io.ReadAll(io.LimitReader(reader, int64(file.UncompressedSize64)+1))
+			output, openErr := os.OpenFile(parts.sqlitePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if openErr != nil {
+				_ = reader.Close()
+				parts.cleanup()
+				return snapshotParts{}, openErr
+			}
+			var copied int64
+			copied, err = io.Copy(output, io.LimitReader(reader, int64(file.UncompressedSize64)+1))
 			closeErr := reader.Close()
 			if err == nil {
 				err = closeErr
+			}
+			if outputErr := output.Close(); err == nil {
+				err = outputErr
 			}
 			if err != nil {
 				parts.cleanup()
 				return snapshotParts{}, err
 			}
-			if uint64(len(parts.sqlite)) != file.UncompressedSize64 {
+			if uint64(copied) != file.UncompressedSize64 {
 				parts.cleanup()
 				return snapshotParts{}, fmt.Errorf("invalid sqlite checkpoint size")
 			}
@@ -572,7 +591,7 @@ func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {
 		}
 		graphFiles++
 	}
-	if len(parts.sqlite) == 0 || graphFiles == 0 {
+	if sqliteInfo, err := os.Stat(parts.sqlitePath); err != nil || sqliteInfo.Size() == 0 || graphFiles == 0 {
 		parts.cleanup()
 		return snapshotParts{}, fmt.Errorf("incomplete Graph/KV checkpoint")
 	}

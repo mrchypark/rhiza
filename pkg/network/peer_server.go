@@ -262,6 +262,18 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			return nil, fmt.Errorf("value is unavailable")
 		}
 		return &peerfb.ResponseT{Value: value}, nil
+	case peerfb.OperationPrepareCheckpoint:
+		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value)
+		if err != nil || !checkpoint {
+			if err == nil {
+				err = fmt.Errorf("checkpoint seal is required")
+			}
+			return nil, err
+		}
+		if err := s.server.core.PrepareCheckpoint(ctx, seal); err != nil {
+			return nil, err
+		}
+		return &peerfb.ResponseT{}, nil
 	default:
 		return nil, fmt.Errorf("unknown peer operation %d", request.Operation)
 	}

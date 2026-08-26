@@ -19,10 +19,11 @@ func entryPayloadLength(encoded uint32) (uint32, bool) {
 type EntryType uint8
 
 const (
-	EntryProposal   EntryType = iota // 제안된 값
-	EntryReceipt                     // receipt 기록
-	EntryDecide                      // quorum 도달 (결정)
-	EntryCheckpoint                  // certified compacted prefix floor
+	EntryProposal           EntryType = iota // 제안된 값
+	EntryReceipt                             // receipt 기록
+	EntryDecide                              // quorum 도달 (결정)
+	EntryCheckpoint                          // certified compacted prefix floor
+	EntryCheckpointVerified                  // locally verified checkpoint root
 )
 
 // Entry is a single QLog entry.

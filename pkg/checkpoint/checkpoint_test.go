@@ -16,7 +16,7 @@ func TestReadRejectsCorruptCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	cp := manager.Latest()
-	key := manager.key(chunkKey(cp.Chunks[0].Hash))
+	key := manager.key(chunkKey(cp.RootHash, cp.Chunks[0].Hash))
 	if err := bucket.Upload(ctx, key, bytes.NewReader([]byte("bad!!"))); err != nil {
 		t.Fatal(err)
 	}
@@ -75,5 +75,31 @@ func TestCandidateRootsRequireSealedHash(t *testing.T) {
 	}
 	if first.RootHash == second.RootHash {
 		t.Fatal("test roots unexpectedly match")
+	}
+}
+
+func TestGarbageCollectRetiresRootBeforeItsChunks(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	manager := NewManager(bucket, "cluster", t.TempDir(), 9)
+	old, err := manager.CreateReader(ctx, bytes.NewReader([]byte("old")), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CreateReader(ctx, bytes.NewReader([]byte("new")), 11); err != nil {
+		t.Fatal(err)
+	}
+	oldChunk := manager.key(chunkKey(old.RootHash, old.Chunks[0].Hash))
+	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ := bucket.Exists(ctx, oldChunk); !exists {
+		t.Fatal("retired root chunks were deleted in the same GC pass")
+	}
+	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ := bucket.Exists(ctx, oldChunk); exists {
+		t.Fatal("orphaned root chunks survived the following GC pass")
 	}
 }

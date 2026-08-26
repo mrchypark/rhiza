@@ -162,7 +162,12 @@ func TestCompleteDecisionAndCompactionLockBoundary(t *testing.T) {
 		state := sha256.Sum256([]byte("lock-state"))
 		prefix, _ := core.PrefixHash(1)
 		core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
-		seal, err := EncodeCheckpointSeal(CheckpointSeal{ConfigID: 11, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix})
+		order, _ := core.LeaderOrder(2)
+		checkpoint := CheckpointSeal{ConfigID: 11, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix, NextLeaderOrder: order}
+		if err := core.PrepareCheckpoint(context.Background(), checkpoint); err != nil {
+			t.Fatal(err)
+		}
+		seal, err := EncodeCheckpointSeal(checkpoint)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -294,7 +299,12 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	state := sha256.Sum256([]byte("snapshot"))
 	prefix3, _ := core.PrefixHash(3)
 	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
-	seal, err := EncodeCheckpointSeal(CheckpointSeal{ConfigID: 3, Index: 3, RootHash: root, StateHash: state, PrefixHash: prefix3})
+	order, _ := core.LeaderOrder(4)
+	checkpoint := CheckpointSeal{ConfigID: 3, Index: 3, RootHash: root, StateHash: state, PrefixHash: prefix3, NextLeaderOrder: order}
+	if err := core.PrepareCheckpoint(context.Background(), checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	seal, err := EncodeCheckpointSeal(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,6 +343,49 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	}
 }
 
+func TestPrepareCheckpointLocksOneRootPerIndexAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Cluster{ConfigID: 3, Members: []Member{{ID: "n1"}}}
+	core := newCore("n1", config, wal, nil)
+	if _, _, err := core.Propose(context.Background(), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	prefix, _ := core.PrefixHash(1)
+	order, _ := core.LeaderOrder(2)
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	first := CheckpointSeal{ConfigID: 3, Index: 1, RootHash: sha256.Sum256([]byte("first")), StateHash: sha256.Sum256([]byte("state")), PrefixHash: prefix, NextLeaderOrder: order}
+	if err := core.PrepareCheckpoint(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.RootHash = sha256.Sum256([]byte("second"))
+	if err := core.PrepareCheckpoint(context.Background(), second); err == nil {
+		t.Fatal("second root was prepared at the same index")
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RequirePreparedCheckpoint(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RequirePreparedCheckpoint(second); err == nil {
+		t.Fatal("restart lost the one-root prepare lock")
+	}
+}
+
 func TestCompactionPrunesAllocatorAndRejectsClosedSlots(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)
@@ -357,7 +410,12 @@ func TestCompactionPrunesAllocatorAndRejectsClosedSlots(t *testing.T) {
 	state := sha256.Sum256([]byte("state"))
 	prefix, _ := core.PrefixHash(1)
 	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
-	seal, err := EncodeCheckpointSeal(CheckpointSeal{ConfigID: 7, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix})
+	order, _ := core.LeaderOrder(2)
+	checkpoint := CheckpointSeal{ConfigID: 7, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix, NextLeaderOrder: order}
+	if err := core.PrepareCheckpoint(context.Background(), checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	seal, err := EncodeCheckpointSeal(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}

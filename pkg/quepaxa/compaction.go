@@ -50,7 +50,7 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		return fmt.Errorf("compaction floor %d is outside retained range (%d,%d]", through, c.floor, c.tip)
 	}
 	seal, sealed := c.sealedRoots[recoveryRoot]
-	if !sealed || seal.Index != through || !c.verifiedRoots[recoveryRoot] {
+	if preparedRoot, prepared := c.preparedCheckpoints[through]; !sealed || seal.Index != through || !prepared || preparedRoot != recoveryRoot {
 		return fmt.Errorf("recovery root is not locally verified and quorum sealed through %d", through)
 	}
 	prefix, ok := c.prefixes[through]
@@ -110,6 +110,12 @@ func (c *Core) CompactionFloor() Slot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.floor
+}
+
+func (c *Core) RecoveryRoot() (Slot, [32]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.floor, c.floorRoot, c.floor != 0 && c.floorRoot != ([32]byte{})
 }
 
 func (c *Core) installBaseLocked(base consensusBase) {
