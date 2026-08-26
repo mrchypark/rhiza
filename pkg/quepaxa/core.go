@@ -147,13 +147,8 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			c.releaseSlot(slot)
 			return 0, nil, err
 		}
-		if err := c.EnsureDurable(decision.Slot); err != nil {
+		if _, err := c.CompleteDecision(ctx, decision.Slot); err != nil {
 			return 0, nil, err
-		}
-		if c.transport != nil && len(c.config.Members) > 1 {
-			if err := c.transport.SendDecision(ctx, decision); err != nil {
-				return 0, nil, fmt.Errorf("%w: learn decision: %v", ErrQuorumUnavailable, err)
-			}
 		}
 		if decision.Proposal.Hash == offeredHash && bytes.Equal(decision.Proposal.Value, value) {
 			return proposalResult(decision)
@@ -348,14 +343,22 @@ func (c *Core) decisionByValue(hash ValueHash, value []byte) (Decision, bool) {
 func (c *Core) reserveSlot() (Slot, bool) {
 	c.slotMu.Lock()
 	defer c.slotMu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for len(c.vacant) > 0 {
 		slot := c.vacant[0]
 		c.vacant = c.vacant[1:]
-		if !c.IsDecided(slot) {
-			return slot, true
+		if slot > c.floor {
+			if _, decided := c.decided[slot]; !decided {
+				return slot, true
+			}
 		}
 	}
-	if next := c.Tip() + 1; c.nextSlot < next {
+	next := c.tip + 1
+	if floorNext := c.floor + 1; next < floorNext {
+		next = floorNext
+	}
+	if c.nextSlot < next {
 		c.nextSlot = next
 	}
 	slot := c.nextSlot
@@ -489,11 +492,18 @@ func (c *Core) calculateLeaderSchedule() []NodeID {
 }
 
 func (c *Core) releaseSlot(slot Slot) {
-	if slot == 0 || c.IsDecided(slot) {
+	if slot == 0 {
 		return
 	}
 	c.slotMu.Lock()
 	defer c.slotMu.Unlock()
+	c.mu.RLock()
+	compacted := slot <= c.floor
+	_, decided := c.decided[slot]
+	c.mu.RUnlock()
+	if compacted || decided {
+		return
+	}
 	index := sort.Search(len(c.vacant), func(i int) bool { return c.vacant[i] >= slot })
 	if index < len(c.vacant) && c.vacant[index] == slot {
 		return
@@ -690,6 +700,9 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 	if request.Slot == 0 || request.Step < 4 {
 		return Summary{}, fmt.Errorf("invalid QuePaxa slot or step")
 	}
+	if err := c.rejectCompacted(request.Slot); err != nil {
+		return Summary{}, err
+	}
 	if len(request.Proposal.Value) != 0 && len(request.Proposal.Value) <= MaxReplicatedValueBytes {
 		if err := c.StageValue(request.Proposal.Hash, request.Proposal.Value); err != nil {
 			return Summary{}, err
@@ -702,6 +715,10 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 	lock.Lock()
 	defer lock.Unlock()
 	c.mu.Lock()
+	if err := c.compactedErrorLocked(request.Slot); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
 	if decided, ok := c.decided[request.Slot]; ok {
 		needsSync := !c.durable[request.Slot]
 		if !c.durable[request.Slot] {
@@ -822,25 +839,44 @@ func (c *Core) VerifyCheckpoint(ctx context.Context, seal CheckpointSeal) error 
 
 // AcceptDecision validates Algorithm 4 quorum evidence and records the decision durably.
 func (c *Core) AcceptDecision(decision Decision) error {
+	lock := &c.recordLocks[uint64(decision.Slot)%uint64(len(c.recordLocks))]
+	lock.Lock()
+	defer lock.Unlock()
 	if err := c.acceptDecision(decision); err != nil {
 		return err
 	}
-	return c.EnsureDurable(decision.Slot)
+	return c.ensureDurableLocked(decision.Slot)
 }
 
 // AcceptDecisionHint installs a certified decision without a second disk
 // barrier. The durable recorder quorum remains the recovery source; catch-up
 // callers that require a local durable copy use AcceptDecision instead.
 func (c *Core) AcceptDecisionHint(decision Decision) error {
+	lock := &c.recordLocks[uint64(decision.Slot)%uint64(len(c.recordLocks))]
+	lock.Lock()
+	defer lock.Unlock()
 	return c.acceptDecision(decision)
 }
 
-// EnsureDurable persists the full certified decision before an external ACK.
+// EnsureDurable ensures the slot has a durable local decision marker or is
+// already covered by the certified recovery base.
 func (c *Core) EnsureDurable(slot Slot) error {
 	lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	defer lock.Unlock()
+	return c.ensureDurableLocked(slot)
+}
+
+func (c *Core) ensureDurableLocked(slot Slot) error {
 	c.mu.Lock()
+	if slot == 0 {
+		c.mu.Unlock()
+		return fmt.Errorf("invalid QuePaxa slot")
+	}
+	if slot <= c.floor {
+		c.mu.Unlock()
+		return nil
+	}
 	decided, ok := c.decided[slot]
 	if !ok {
 		c.mu.Unlock()
@@ -873,8 +909,46 @@ func (c *Core) EnsureDurable(slot Slot) error {
 	return nil
 }
 
+// CompleteDecision makes an existing decision safe to acknowledge by
+// re-establishing the learner quorum required by ReadIndex.
+func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, error) {
+	lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
+	lock.Lock()
+	if err := c.ensureDurableLocked(slot); err != nil {
+		lock.Unlock()
+		return DecidedValue{}, err
+	}
+	c.mu.RLock()
+	value, ok := c.decided[slot]
+	compacted := slot <= c.floor
+	value.Value = append([]byte(nil), value.Value...)
+	value.Certificate = append([]byte(nil), value.Certificate...)
+	c.mu.RUnlock()
+	lock.Unlock()
+	if compacted {
+		return DecidedValue{}, fmt.Errorf("%w: slot %d is covered by the recovery floor", ErrCompacted, slot)
+	}
+	if !ok {
+		return DecidedValue{}, fmt.Errorf("slot %d is not decided", slot)
+	}
+	decision, err := c.certifiedDecision(value)
+	if err != nil {
+		return DecidedValue{}, err
+	}
+	if len(c.config.Members) <= 1 {
+		return value, nil
+	}
+	if c.transport == nil {
+		return DecidedValue{}, ErrQuorumUnavailable
+	}
+	if err := c.transport.SendDecision(ctx, decision); err != nil {
+		return DecidedValue{}, fmt.Errorf("%w: learn decision: %v", ErrQuorumUnavailable, err)
+	}
+	return value, nil
+}
+
 func (c *Core) acceptDecision(decision Decision) error {
-	if err := c.validateDecision(decision); err != nil {
+	if err := c.validateDecisionAtFloor(decision); err != nil {
 		return err
 	}
 	certificate, err := encodeCertificate(c.config.ConfigID, decision)
@@ -882,6 +956,10 @@ func (c *Core) acceptDecision(decision Decision) error {
 		return err
 	}
 	c.mu.Lock()
+	if decision.Slot <= c.floor {
+		c.mu.Unlock()
+		return nil
+	}
 	if existing, ok := c.decided[decision.Slot]; ok {
 		if existing.Hash != decision.Proposal.Hash || !bytes.Equal(existing.Value, decision.Proposal.Value) {
 			c.mu.Unlock()
@@ -898,7 +976,7 @@ func (c *Core) acceptDecision(decision Decision) error {
 	c.decided[decision.Slot] = value
 	c.durable[decision.Slot] = false
 	c.logged[decision.Slot] = false
-	c.byHash[decision.Proposal.Hash] = decision.Slot
+	c.updateHashIndexLocked(decision.Proposal.Hash, decision.Slot)
 	delete(c.recorders, decision.Slot)
 	c.advanceTipLocked()
 	listeners := append([]chan SlotValue(nil), c.listeners...)
@@ -1084,17 +1162,39 @@ func (c *Core) AcceptCertifiedHints(values []DecidedValue) error {
 }
 
 func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error {
-	slots := make([]Slot, 0, len(values))
-	for _, value := range values {
+	decisions := make([]Decision, len(values))
+	for i, value := range values {
 		decision, err := c.certifiedDecision(value)
 		if err != nil {
 			return err
 		}
+		if err := c.validateDecisionAtFloor(decision); err != nil {
+			return err
+		}
+		decisions[i] = decision
+	}
+	unlock := c.lockDecisionSlots(values)
+	defer unlock()
+	c.mu.RLock()
+	for _, decision := range decisions {
+		if err := c.compactedErrorLocked(decision.Slot); err != nil {
+			c.mu.RUnlock()
+			return err
+		}
+	}
+	c.mu.RUnlock()
+	slots := make([]Slot, 0, len(values))
+	for i, value := range values {
+		decision := decisions[i]
 		if err := c.acceptDecision(decision); err != nil {
 			return err
 		}
 		if durable {
 			c.mu.Lock()
+			if err := c.compactedErrorLocked(decision.Slot); err != nil {
+				c.mu.Unlock()
+				return err
+			}
 			if !c.logged[decision.Slot] {
 				if err := c.appendDecision(decision, value.Value, value.Certificate); err != nil {
 					c.mu.Unlock()
@@ -1121,6 +1221,54 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Core) validateDecisionAtFloor(decision Decision) error {
+	c.mu.RLock()
+	covered := decision.Slot <= c.floor
+	c.mu.RUnlock()
+	return c.validateDecisionForRecovery(decision, covered)
+}
+
+func (c *Core) lockDecisionSlots(values []DecidedValue) func() {
+	indexes := make([]int, 0, len(values))
+	seen := make(map[int]struct{}, len(values))
+	for _, value := range values {
+		index := int(uint64(value.Slot) % uint64(len(c.recordLocks)))
+		if _, ok := seen[index]; ok {
+			continue
+		}
+		seen[index] = struct{}{}
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	for _, index := range indexes {
+		c.recordLocks[index].Lock()
+	}
+	return func() {
+		for i := len(indexes) - 1; i >= 0; i-- {
+			c.recordLocks[indexes[i]].Unlock()
+		}
+	}
+}
+
+func (c *Core) rejectCompacted(slot Slot) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.compactedErrorLocked(slot)
+}
+
+func (c *Core) compactedErrorLocked(slot Slot) error {
+	if slot <= c.floor {
+		return fmt.Errorf("%w: slot %d is at or below floor %d", ErrCompacted, slot, c.floor)
+	}
+	return nil
+}
+
+func (c *Core) updateHashIndexLocked(hash ValueHash, slot Slot) {
+	if current, ok := c.byHash[hash]; !ok || slot < current {
+		c.byHash[hash] = slot
+	}
 }
 
 func (c *Core) certifiedDecision(value DecidedValue) (Decision, error) {

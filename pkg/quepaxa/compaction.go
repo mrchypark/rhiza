@@ -33,6 +33,8 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 			<-c.pipeline
 		}
 	}()
+	c.slotMu.Lock()
+	defer c.slotMu.Unlock()
 	for i := range c.recordLocks {
 		c.recordLocks[i].Lock()
 	}
@@ -88,6 +90,7 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	}
 	c.installBaseLocked(base)
 	c.advanceTipLocked()
+	c.pruneSlotAllocatorLocked()
 	return nil
 }
 
@@ -117,13 +120,16 @@ func (c *Core) installBaseLocked(base consensusBase) {
 	c.tip = base.ClosedThrough
 	clear(c.prefixes)
 	c.prefixes[base.ClosedThrough] = base.PrefixHash
-	for slot, decision := range c.decided {
+	for slot := range c.decided {
 		if slot <= base.ClosedThrough {
 			delete(c.decided, slot)
 			delete(c.durable, slot)
 			delete(c.logged, slot)
-			delete(c.byHash, decision.Hash)
 		}
+	}
+	clear(c.byHash)
+	for slot, decision := range c.decided {
+		c.updateHashIndexLocked(decision.Hash, slot)
 	}
 	for slot := range c.recorders {
 		if slot <= base.ClosedThrough {
@@ -146,6 +152,24 @@ func (c *Core) installBaseLocked(base consensusBase) {
 			delete(c.values, hash)
 			delete(c.valueDurable, hash)
 		}
+	}
+}
+
+// pruneSlotAllocatorLocked requires slotMu and mu.
+func (c *Core) pruneSlotAllocatorLocked() {
+	kept := c.vacant[:0]
+	for _, slot := range c.vacant {
+		if slot > c.floor {
+			kept = append(kept, slot)
+		}
+	}
+	c.vacant = kept
+	next := c.tip + 1
+	if floorNext := c.floor + 1; next < floorNext {
+		next = floorNext
+	}
+	if c.nextSlot < next {
+		c.nextSlot = next
 	}
 }
 

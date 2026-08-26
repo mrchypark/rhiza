@@ -198,9 +198,9 @@ func (w *WAL) Sync() error {
 // Read reads all entries from all segments.
 func (w *WAL) Read() ([]Entry, error) {
 	w.mu.RLock()
+	defer w.mu.RUnlock()
 	segments := make([]*Segment, len(w.segments))
 	copy(segments, w.segments)
-	w.mu.RUnlock()
 
 	var entries []Entry
 	for _, seg := range segments {
@@ -413,7 +413,7 @@ func writeSegmentAtomically(path string, data []byte) error {
 	}
 	temp := f.Name()
 	defer os.Remove(temp)
-	if err := f.Chmod(0644); err == nil {
+	if err = f.Chmod(0644); err == nil {
 		_, err = f.Write(data)
 	}
 	if err == nil {

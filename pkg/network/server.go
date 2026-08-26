@@ -121,7 +121,11 @@ type DecisionsResponse struct {
 
 func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	if slot, ok := s.core.DecidedSlot(value); ok {
-		return slot, nil
+		if _, err := s.core.CompleteDecision(ctx, slot); err == nil {
+			return slot, nil
+		} else if !errors.Is(err, quepaxa.ErrCompacted) {
+			return slot, err
+		}
 	}
 	if len(s.members) <= 1 || s.transport == nil {
 		slot, _, err := s.core.Propose(ctx, value)
@@ -153,8 +157,10 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 				}
 			}
 			if slot, ok := s.core.DecidedSlot(value); ok {
-				results <- result{slot: slot, member: member.ID, rank: rank}
-				return
+				if _, err := s.core.CompleteDecision(hedgeCtx, slot); !errors.Is(err, quepaxa.ErrCompacted) {
+					results <- result{slot: slot, err: err, member: member.ID, rank: rank}
+					return
+				}
 			}
 			proposeCtx, cancelPropose := context.WithTimeout(hedgeCtx, 30*time.Second)
 			defer cancelPropose()
@@ -705,11 +711,14 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.DecidedValue, error) {
 	if slot, ok := s.core.DecidedSlot(value); ok {
-		if err := s.applyDecisions(ctx, slot); err != nil {
+		if decision, err := s.core.CompleteDecision(ctx, slot); err == nil {
+			if err := s.applyDecisions(ctx, slot); err != nil {
+				return quepaxa.DecidedValue{}, err
+			}
+			return decision, nil
+		} else if !errors.Is(err, quepaxa.ErrCompacted) {
 			return quepaxa.DecidedValue{}, err
 		}
-		decision, _ := s.core.CertifiedValue(slot)
-		return decision, nil
 	}
 	if len(value) > quepaxa.MaxReplicatedValueBytes {
 		return quepaxa.DecidedValue{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)

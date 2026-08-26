@@ -73,15 +73,3 @@ func graphArg(value any) (any, error) {
 		return nil, fmt.Errorf("unsupported graph argument type %T", value)
 	}
 }
-
-func graphArgs(args map[string]any) (map[string]any, error) {
-	result := make(map[string]any, len(args))
-	for key, value := range args {
-		converted, err := graphArg(value)
-		if err != nil {
-			return nil, err
-		}
-		result[key] = converted
-	}
-	return result, nil
-}

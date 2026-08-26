@@ -38,8 +38,6 @@ func (*Materializer) GraphRequestMatches(context.Context, types.GraphCommand) (b
 	return false, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
-func (*Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) { return sqlite, nil }
-
 func (*Materializer) writeSnapshot(path string, writer io.Writer) error {
 	file, err := os.Open(path)
 	if err != nil {

@@ -75,7 +75,8 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatalf("request after stream cancellation: %v", err)
 	}
-	transport.drop(member.ID, first)
+	transport.invalidate(member.ID, first)
+	_ = first.CloseWithError(0, "reconnect")
 	request.Step++
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatal(err)

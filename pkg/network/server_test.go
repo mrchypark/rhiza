@@ -39,6 +39,29 @@ func (unavailableTransport) FetchValue(context.Context, quepaxa.NodeID, quepaxa.
 	return nil, errors.New("unavailable")
 }
 
+type retryLearnerTransport struct {
+	sendCalls int
+	sendErr   error
+}
+
+func (t *retryLearnerTransport) SendRecord(_ context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	proposal := request.Proposal
+	return quepaxa.Summary{RecorderID: to, Step: request.Step, FirstCurrent: &proposal}, nil
+}
+func (t *retryLearnerTransport) SendDecision(context.Context, quepaxa.Decision) error {
+	t.sendCalls++
+	return t.sendErr
+}
+func (*retryLearnerTransport) ReadTip(context.Context, quepaxa.NodeID) (quepaxa.Slot, error) {
+	return 0, nil
+}
+func (*retryLearnerTransport) StageValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash, []byte) error {
+	return nil
+}
+func (*retryLearnerTransport) FetchValue(context.Context, quepaxa.NodeID, quepaxa.ValueHash) ([]byte, error) {
+	return nil, errors.New("value unavailable")
+}
+
 func mustCore(t *testing.T, nodeID quepaxa.NodeID, members []quepaxa.Member, wal *qlog.WAL, transport quepaxa.Transport) *quepaxa.Core {
 	t.Helper()
 	if wal == nil {
@@ -87,6 +110,33 @@ func TestLocalProposerAppliesAlreadyDecidedValue(t *testing.T) {
 	}
 	if material.Tip() != 1 {
 		t.Fatalf("material tip=%d, want 1", material.Tip())
+	}
+}
+
+func TestLocalRetryReestablishesLearnerQuorum(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	transport := &retryLearnerTransport{sendErr: errors.New("learners unavailable")}
+	core := mustCore(t, "n1", members, nil, transport)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "schema-retry", SQL: "CREATE TABLE retried (id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(context.Background(), value); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("first proposal error=%v, want quorum unavailable", err)
+	}
+	transport.sendErr = nil
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	if _, err := server.proposeLocal(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	if transport.sendCalls != 2 || material.Tip() != 1 {
+		t.Fatalf("SendDecision calls=%d material tip=%d, want 2 and 1", transport.sendCalls, material.Tip())
 	}
 }
 

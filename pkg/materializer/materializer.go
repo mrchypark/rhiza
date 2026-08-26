@@ -911,7 +911,7 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 	}
 	tempPath := file.Name()
 	defer os.Remove(tempPath)
-	if err := file.Chmod(0o600); err == nil {
+	if err = file.Chmod(0o600); err == nil {
 		_, err = file.Write(parts.sqlite)
 	}
 	if err == nil {

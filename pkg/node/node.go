@@ -51,6 +51,23 @@ func New(config *types.ExecutionConfig) *Node {
 	}
 }
 
+func validateObjectStoreConfig(config *types.ExecutionConfig) (bool, error) {
+	configured := config.ObjStoreProvider != "" || config.ObjStoreEndpoint != "" || config.ObjStoreBucket != "" || config.ObjStoreDir != ""
+	provider := objectstore.Provider(config.ObjStoreProvider)
+	if len(config.Members) > 1 && configured {
+		if provider == "" || provider == objectstore.ProviderFilesystem || config.ObjStoreDir != "" {
+			return false, fmt.Errorf("multi-node clusters require an explicit shared S3-compatible object store")
+		}
+		if provider != objectstore.ProviderS3 {
+			return false, fmt.Errorf("multi-node object-store provider %q is unsupported", provider)
+		}
+	}
+	if provider == objectstore.ProviderS3 && config.ObjStoreBucket == "" {
+		return false, fmt.Errorf("S3 bucket is required")
+	}
+	return configured, nil
+}
+
 // Open starts the embedded engine and its private peer transport without serving HTTP.
 func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
@@ -71,7 +88,10 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config.ObjStoreGCInterval < 0 || n.config.ObjStoreGCGracePeriod < 0 {
 		return fmt.Errorf("object-store GC durations must not be negative")
 	}
-	objectStoreConfigured := n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != ""
+	objectStoreConfigured, configErr := validateObjectStoreConfig(n.config)
+	if configErr != nil {
+		return configErr
+	}
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck && !objectStoreConfigured {
 		return fmt.Errorf("before-ack durability requires object storage")
 	}

@@ -191,16 +191,6 @@ func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {
 	}
 }
 
-func (t *Transport) drop(to quepaxa.NodeID, conn *quic.Conn) {
-	peer := t.peers[to]
-	peer.mu.Lock()
-	defer peer.mu.Unlock()
-	if peer.conn == conn {
-		peer.conn = nil
-		_ = conn.CloseWithError(0, "reconnect")
-	}
-}
-
 func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, from quepaxa.Slot, limit int) (DecisionsResponse, error) {
 	req := t.request(peerfb.OperationDecisions)
 	req.From, req.Limit = uint64(from), uint32(limit)

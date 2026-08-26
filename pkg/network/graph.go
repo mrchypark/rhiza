@@ -1,5 +1,7 @@
 package network
 
+//lint:file-ignore SA4023 Graph-enabled builds use a different materializer implementation that can return nil errors.
+
 import (
 	"context"
 	"encoding/json"

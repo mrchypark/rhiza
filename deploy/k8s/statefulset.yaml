@@ -38,6 +38,10 @@ spec:
             # Required private peer identity only; public client auth remains disabled.
             - secretRef:
                 name: rhiza-peer-credentials
+            - secretRef:
+                # Must contain RHIZA_OBJSTORE_BUCKET. Endpoint and credentials
+                # are optional when workload identity targets AWS S3 directly.
+                name: rhiza-object-store
           env:
             - name: RHIZA_NODE_ID
               valueFrom:
@@ -46,8 +50,6 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-            - name: objstore
-              mountPath: /objstore
           livenessProbe:
             httpGet:
               path: /healthz
@@ -70,13 +72,6 @@ spec:
   volumeClaimTemplates:
     - metadata:
         name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 10Gi
-    - metadata:
-        name: objstore
       spec:
         accessModes: ["ReadWriteOnce"]
         resources:

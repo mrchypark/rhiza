@@ -593,6 +593,56 @@ func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
 	}
 }
 
+func TestCompactedLearnerCountsAsCoveredQuorum(t *testing.T) {
+	cores, transport := newTestCluster(t)
+	if _, _, err := cores["n1"].Propose(context.Background(), []byte("covered write")); err != nil {
+		t.Fatal(err)
+	}
+	certified, ok := cores["n1"].CertifiedValue(1)
+	if !ok {
+		t.Fatal("slot 1 is not certified")
+	}
+	decision, err := cores["n1"].certifiedDecision(certified)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, _ := cores["n1"].PrefixHash(1)
+	root := sha256.Sum256([]byte("covered-root"))
+	state := sha256.Sum256([]byte("covered-state"))
+	for _, core := range cores {
+		core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	}
+	checkpointSeal := CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix}
+	seal, err := EncodeCheckpointSeal(checkpointSeal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := cores["n1"].Propose(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["n2"].VerifyCheckpoint(context.Background(), checkpointSeal); err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["n2"].CompactThrough(1, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["n2"].AcceptDecision(decision); err != nil {
+		t.Fatalf("covered learner rejected valid decision: %v", err)
+	}
+	if _, ok := cores["n2"].CertifiedValue(1); ok {
+		t.Fatal("covered learner reinserted compacted decision")
+	}
+	malformed := decision
+	malformed.Proposal.Value = []byte("tampered")
+	if err := cores["n2"].AcceptDecision(malformed); err == nil {
+		t.Fatal("covered learner accepted malformed decision")
+	}
+	transport.fail("n3")
+	if _, err := cores["n1"].CompleteDecision(context.Background(), 1); err != nil {
+		t.Fatalf("retained plus covered learner did not form quorum: %v", err)
+	}
+}
+
 func TestRecorderStateRecoversDurably(t *testing.T) {
 	dir := t.TempDir()
 	config := &Cluster{Members: []Member{{ID: "n1"}}}

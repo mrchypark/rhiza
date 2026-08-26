@@ -9,7 +9,9 @@ data:
   RHIZA_BIND_ADDR: "0.0.0.0:8080"
   RHIZA_PEER_ADDR: "0.0.0.0:9090"
   RHIZA_DATA_DIR: "/data"
-  RHIZA_OBJSTORE_PROVIDER: "filesystem"
-  RHIZA_FILESYSTEM_DIR: "/objstore"
+  # The required rhiza-object-store Secret supplies one shared bucket and,
+  # for S3-compatible stores, its endpoint and credentials.
+  RHIZA_OBJSTORE_PROVIDER: "s3"
+  RHIZA_OBJSTORE_PREFIX: "rhiza"
   RHIZA_CLUSTER_MEMBERS: >-
     [{"node_id":"rhiza-0","url":"http://rhiza-0.rhiza-headless.rhiza.svc.cluster.local:8080","peer_url":"quic://rhiza-0.rhiza-headless.rhiza.svc.cluster.local:9090"},{"node_id":"rhiza-1","url":"http://rhiza-1.rhiza-headless.rhiza.svc.cluster.local:8080","peer_url":"quic://rhiza-1.rhiza-headless.rhiza.svc.cluster.local:9090"},{"node_id":"rhiza-2","url":"http://rhiza-2.rhiza-headless.rhiza.svc.cluster.local:8080","peer_url":"quic://rhiza-2.rhiza-headless.rhiza.svc.cluster.local:9090"}]

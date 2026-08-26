@@ -21,6 +21,18 @@ import (
 	graphdb "github.com/mstrYoda/goraphdb"
 )
 
+func graphArgs(args map[string]any) (map[string]any, error) {
+	result := make(map[string]any, len(args))
+	for key, value := range args {
+		converted, err := graphArg(value)
+		if err != nil {
+			return nil, err
+		}
+		result[key] = converted
+	}
+	return result, nil
+}
+
 var graphTipKey = []byte("rhiza/applied_slot")
 
 type graphState struct {
@@ -373,37 +385,6 @@ const (
 	minGraphSnapshotExtracted = 64 << 20
 )
 
-func (m *Materializer) encodeSnapshot(sqlite []byte) ([]byte, error) {
-	g := m.graph
-	if g == nil {
-		return nil, fmt.Errorf("GoraphDB is not open")
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.tip != m.tip {
-		return nil, fmt.Errorf("cannot checkpoint mismatched materializers: SQLite=%d GoraphDB=%d", m.tip, g.tip)
-	}
-	if err := g.db.Close(); err != nil {
-		return nil, err
-	}
-	g.db = nil
-	graphPath := filepath.Join(filepath.Dir(m.dbPath), "goraphdb")
-	data, snapshotErr := encodeGraphSnapshot(sqlite, graphPath)
-	reopened, reopenErr := openGraph(graphPath, m.tip)
-	if reopenErr != nil {
-		if snapshotErr != nil {
-			return nil, fmt.Errorf("snapshot graph: %v; reopen graph: %w", snapshotErr, reopenErr)
-		}
-		return nil, fmt.Errorf("reopen graph after snapshot: %w", reopenErr)
-	}
-	g.db, g.tip = reopened.db, reopened.tip
-	reopened.db = nil
-	if snapshotErr != nil {
-		return nil, snapshotErr
-	}
-	return data, nil
-}
-
 func (m *Materializer) writeSnapshot(sqlitePath string, output io.Writer) error {
 	g := m.graph
 	if g == nil {
@@ -491,59 +472,6 @@ func writeGraphFiles(zw *zip.Writer, graphPath string) error {
 		}
 		return closeErr
 	})
-}
-
-func encodeGraphSnapshot(sqlite []byte, graphPath string) ([]byte, error) {
-	var data bytes.Buffer
-	data.WriteString(graphSnapshotMagic)
-	zw := zip.NewWriter(&data)
-	sqliteFile, err := zw.CreateHeader(&zip.FileHeader{Name: "sqlite.db", Method: zip.Deflate})
-	if err == nil {
-		_, err = sqliteFile.Write(sqlite)
-	}
-	if err == nil {
-		err = filepath.WalkDir(graphPath, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if entry.IsDir() {
-				return nil
-			}
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			if !info.Mode().IsRegular() {
-				return fmt.Errorf("unsupported GoraphDB snapshot file %s", path)
-			}
-			rel, err := filepath.Rel(graphPath, path)
-			if err != nil {
-				return err
-			}
-			writer, err := zw.CreateHeader(&zip.FileHeader{Name: "goraphdb/" + filepath.ToSlash(rel), Method: zip.Deflate})
-			if err != nil {
-				return err
-			}
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(writer, file)
-			closeErr := file.Close()
-			if copyErr != nil {
-				return copyErr
-			}
-			return closeErr
-		})
-	}
-	closeErr := zw.Close()
-	if err != nil {
-		return nil, err
-	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-	return data.Bytes(), nil
 }
 
 func prepareSnapshot(data []byte, dir string) (snapshotParts, error) {

@@ -70,12 +70,7 @@ func (r *Recovery) shouldRestore(ctx context.Context, localTip uint64) bool {
 	}
 
 	// If object storage has a newer manifest, restore
-	remoteTip := r.manifest.TipSlot
-	if remoteTip > localTip {
-		return true
-	}
-
-	return false
+	return r.manifest.TipSlot > localTip
 }
 
 // restoreFromObjectStorage restores state from object storage.
