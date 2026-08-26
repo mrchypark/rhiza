@@ -90,6 +90,34 @@ func TestHTTPAdapterDoesNotExposePeerRPC(t *testing.T) {
 	}
 }
 
+func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error {
+		return errors.New("bucket unavailable")
+	})
+	req := ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE durable (id INTEGER)"}
+	if _, err := server.Execute(context.Background(), req); !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("error=%v, want ErrDurabilityUnavailable", err)
+	}
+
+	server.SetDurabilityBarrier(nil)
+	response, err := server.Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Slot == 0 {
+		t.Fatal("retry returned no slot")
+	}
+}
+
 func TestLinearizableQueryAppliesThroughUniqueConsensusBarrier(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir() + "/qlog")
 	if err != nil {

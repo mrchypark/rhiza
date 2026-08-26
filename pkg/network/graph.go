@@ -62,6 +62,9 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if err == nil {
 		err = s.applyDecisions(ctx, slot)
 	}
+	if err == nil {
+		err = s.waitDurable(ctx, slot)
+	}
 	if err != nil {
 		return GraphExecuteResponse{}, err
 	}

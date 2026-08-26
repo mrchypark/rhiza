@@ -34,8 +34,9 @@ const defaultMaxSize = 64 * 1024 * 1024 // 64MB per segment
 
 // SegmentSnapshot is an exact, validated WAL segment and its object-store metadata.
 type SegmentSnapshot struct {
-	Meta SegmentMeta
-	Data []byte
+	Meta   SegmentMeta
+	Offset int64
+	Data   []byte
 }
 
 // Open opens or creates a WAL in the given directory.
@@ -214,13 +215,32 @@ func (w *WAL) Read() ([]Entry, error) {
 
 // SegmentSnapshots returns consistent copies suitable for object-store upload.
 func (w *WAL) SegmentSnapshots() ([]SegmentSnapshot, error) {
+	return w.SegmentSnapshotsSince(nil)
+}
+
+// SegmentSnapshotsSince avoids rereading segments whose validated metadata is unchanged.
+func (w *WAL) SegmentSnapshotsSince(validated map[uint32]SegmentMeta) ([]SegmentSnapshot, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	snapshots := make([]SegmentSnapshot, 0, len(w.segments))
 	for _, seg := range w.segments {
 		seg.mu.Lock()
-		data := make([]byte, seg.offset)
-		_, err := seg.file.ReadAt(data, 0)
+		known, ok := validated[seg.index]
+		if ok && known.Size > seg.offset {
+			seg.mu.Unlock()
+			return nil, fmt.Errorf("segment %d shrank from %d to %d", seg.index, known.Size, seg.offset)
+		}
+		if ok && known.Size == seg.offset {
+			seg.mu.Unlock()
+			snapshots = append(snapshots, SegmentSnapshot{Meta: known})
+			continue
+		}
+		offset := int64(0)
+		if ok {
+			offset = known.Size
+		}
+		data := make([]byte, seg.offset-offset)
+		_, err := seg.file.ReadAt(data, offset)
 		seg.mu.Unlock()
 		if err != nil && !(err == io.EOF && len(data) == 0) {
 			return nil, err
@@ -228,9 +248,9 @@ func (w *WAL) SegmentSnapshots() ([]SegmentSnapshot, error) {
 		if len(data) == 0 {
 			continue
 		}
-		var start, end uint64
-		for offset := 0; offset < len(data); {
-			entry, used, err := DecodeEntry(data[offset:])
+		start, end := known.StartSlot, known.EndSlot
+		for cursor := 0; cursor < len(data); {
+			entry, used, err := DecodeEntry(data[cursor:])
 			if err != nil {
 				return nil, fmt.Errorf("segment %d: %w", seg.index, err)
 			}
@@ -240,11 +260,13 @@ func (w *WAL) SegmentSnapshots() ([]SegmentSnapshot, error) {
 			if entry.Slot > end {
 				end = entry.Slot
 			}
-			offset += used
+			cursor += used
 		}
-		snapshots = append(snapshots, SegmentSnapshot{Meta: SegmentMeta{
-			Index: seg.index, StartSlot: start, EndSlot: end, Size: int64(len(data)), Hash: sha256.Sum256(data),
-		}, Data: data})
+		meta := SegmentMeta{Index: seg.index, StartSlot: start, EndSlot: end, Size: offset + int64(len(data))}
+		if offset == 0 {
+			meta.Hash = sha256.Sum256(data)
+		}
+		snapshots = append(snapshots, SegmentSnapshot{Meta: meta, Offset: offset, Data: data})
 	}
 	return snapshots, nil
 }

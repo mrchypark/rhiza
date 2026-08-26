@@ -5,14 +5,40 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/thanos-io/objstore"
 )
+
+type failManifestBucket struct {
+	objstore.Bucket
+	fail bool
+}
+
+type countingBucket struct {
+	objstore.Bucket
+	uploads map[string]int
+}
+
+func (b *countingBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	b.uploads[name]++
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func (b *failManifestBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if b.fail && (strings.Contains(name, "qlog/manifests/") || strings.HasSuffix(name, "manifest.json")) {
+		b.fail = false
+		return errors.New("manifest unavailable")
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
 
 func TestEntryEncodeDecode(t *testing.T) {
 	entry := Entry{
@@ -202,6 +228,34 @@ func TestWALSortsSegmentIndexesNumerically(t *testing.T) {
 	}
 }
 
+func TestSegmentSnapshotsSinceReadsOnlyDelta(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	first := Entry{Slot: 1, Type: EntryDecide, Payload: []byte("one")}
+	if err := wal.Append(first); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := wal.SegmentSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	known := map[uint32]SegmentMeta{snapshots[0].Meta.Index: snapshots[0].Meta}
+	second := Entry{Slot: 2, Type: EntryDecide, Payload: []byte("two")}
+	if err := wal.Append(second); err != nil {
+		t.Fatal(err)
+	}
+	delta, err := wal.SegmentSnapshotsSince(known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(delta) != 1 || delta[0].Offset != int64(len(first.Encode())) || !bytes.Equal(delta[0].Data, second.Encode()) {
+		t.Fatalf("unexpected delta: %+v", delta)
+	}
+}
+
 func TestRecoveryInstallsExactObjectStoreSegment(t *testing.T) {
 	segment := append(
 		Entry{Slot: 1, Type: EntryProposal, Payload: []byte("one")}.Encode(),
@@ -276,6 +330,343 @@ func TestRecoveryExtendsMatchingLocalSegment(t *testing.T) {
 	}
 	if tip != 2 || len(entries) != 2 {
 		t.Fatalf("tip=%d entries=%#v", tip, entries)
+	}
+}
+
+func TestSyncThroughRetriesFailedManifestPublication(t *testing.T) {
+	ctx := context.Background()
+	bucket := &failManifestBucket{Bucket: objstore.NewInMemBucket()}
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := wal.Append(Entry{Slot: 1, Type: EntryDecide, Payload: []byte("one")}); err != nil {
+		t.Fatal(err)
+	}
+	syncer := NewObjStoreSyncer(wal, NewManifest(), bucket, "", 0)
+	if err := syncer.SyncThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 2, Type: EntryDecide, Payload: []byte("two")}); err != nil {
+		t.Fatal(err)
+	}
+	bucket.fail = true
+	if err := syncer.SyncThrough(ctx, 2); err == nil {
+		t.Fatal("expected manifest publication failure")
+	}
+	old, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tip, err := NewRecovery(old, NewManifest(), bucket, "").Recover(ctx); err != nil || tip != 1 {
+		t.Fatalf("previous published prefix tip=%d err=%v", tip, err)
+	}
+	_ = old.Close()
+
+	if err := syncer.SyncThrough(ctx, 2); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+
+	restored, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if tip, err := NewRecovery(restored, NewManifest(), bucket, "").Recover(ctx); err != nil || tip != 2 {
+		t.Fatalf("recovery tip=%d err=%v", tip, err)
+	}
+}
+
+func TestExtentSyncUploadsOnlyAppendedBytesAndCollectsOldManifest(t *testing.T) {
+	ctx := context.Background()
+	memory := objstore.NewInMemBucket()
+	bucket := &countingBucket{Bucket: memory, uploads: make(map[string]int)}
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	manifest := NewManifest()
+	syncer := NewObjStoreSyncer(wal, manifest, bucket, "", 0)
+	syncer.chunkSize = 128
+	if err := wal.Append(Entry{Slot: 1, Type: EntryDecide, Payload: bytes.Repeat([]byte("a"), 200)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	firstSegments, _, _, _ := manifest.Snapshot()
+	if len(firstSegments) != 1 || firstSegments[0].ExtentCount != 2 {
+		t.Fatalf("first segments=%+v", firstSegments)
+	}
+	firstHead, err := syncer.downloadExtent(ctx, firstSegments[0].ExtentHead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stableKey := extentObjectKey(firstHead.Previous)
+	var firstManifest string
+	if err := memory.Iter(ctx, "qlog/manifests", func(name string) error { firstManifest = name; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := wal.Append(Entry{Slot: 2, Type: EntryDecide, Payload: bytes.Repeat([]byte("b"), 50)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncThrough(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if bucket.uploads[stableKey] != 1 {
+		t.Fatalf("stable extent uploads=%d, want 1", bucket.uploads[stableKey])
+	}
+	extentUploads := 0
+	for name, count := range bucket.uploads {
+		if strings.Contains(name, "qlog/extents/") {
+			extentUploads += count
+		}
+	}
+	if extentUploads != 3 {
+		t.Fatalf("extent uploads=%d, want two initial plus one append", extentUploads)
+	}
+	if err := syncer.GarbageCollect(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ := memory.Exists(ctx, firstManifest); !exists {
+		t.Fatal("GC removed an old manifest inside the grace period")
+	}
+	mark := syncer.gcMarkKey(firstManifest)
+	if err := memory.ChangeLastModified(mark, time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.GarbageCollect(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ := memory.Exists(ctx, firstManifest); exists {
+		t.Fatal("expired manifest was not deleted")
+	}
+	if exists, err := memory.Exists(ctx, stableKey); err != nil || !exists {
+		t.Fatalf("referenced extent was deleted: exists=%v err=%v", exists, err)
+	}
+
+	restored, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if tip, err := NewRecovery(restored, NewManifest(), bucket, "").Recover(ctx); err != nil || tip != 2 {
+		t.Fatalf("extent recovery tip=%d err=%v", tip, err)
+	}
+}
+
+func TestImmutableManifestGenerationCannotRollBack(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	syncer := NewObjStoreSyncer(wal, NewManifest(), bucket, "", 0)
+	if err := wal.Append(Entry{Slot: 1, Type: EntryDecide, Payload: []byte("one")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	var oldKey string
+	if err := bucket.Iter(ctx, "qlog/manifests", func(name string) error { oldKey = name; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	oldReader, err := bucket.Get(ctx, oldKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldData, err := io.ReadAll(oldReader)
+	oldReader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 2, Type: EntryDecide, Payload: []byte("two")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncThrough(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	// A delayed retry of an older publication can only overwrite its immutable key.
+	if err := bucket.Upload(ctx, oldKey, bytes.NewReader(oldData)); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if tip, err := NewRecovery(restored, NewManifest(), bucket, "").Recover(ctx); err != nil || tip != 2 {
+		t.Fatalf("recovery rolled back: tip=%d err=%v", tip, err)
+	}
+}
+
+func TestExtentRecoveryRejectsCorruptionAndUnknownMode(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncManifest := NewManifest()
+	syncer := NewObjStoreSyncer(wal, syncManifest, bucket, "", 0)
+	if err := wal.Append(Entry{Slot: 1, Type: EntryDecide, Payload: []byte("one")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	segments, _, _, _ := syncManifest.Snapshot()
+	key := extentObjectKey(segments[0].ExtentHead)
+	r, err := bucket.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(r)
+	r.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 0xff
+	if err := bucket.Upload(ctx, key, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	corruptWAL, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer corruptWAL.Close()
+	if _, err := NewRecovery(corruptWAL, NewManifest(), bucket, "").Recover(ctx); err == nil || !strings.Contains(err.Error(), "extent hash mismatch") {
+		t.Fatalf("expected extent integrity error, got %v", err)
+	}
+
+	unknown := &Manifest{Version: 2, Generation: 1, StorageMode: "future", TipSlot: 1}
+	unknownData, err := json.Marshal(unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownHash := sha256.Sum256(unknownData)
+	unknownKey := fmt.Sprintf("qlog/manifests/%020d_%x.json", unknown.Generation, unknownHash)
+	unknownBucket := objstore.NewInMemBucket()
+	if err := unknownBucket.Upload(ctx, unknownKey, bytes.NewReader(unknownData)); err != nil {
+		t.Fatal(err)
+	}
+	unknownWAL, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unknownWAL.Close()
+	if _, err := NewRecovery(unknownWAL, NewManifest(), unknownBucket, "").Recover(ctx); err == nil || !strings.Contains(err.Error(), "unsupported QLog storage mode") {
+		t.Fatalf("expected storage-mode error, got %v", err)
+	}
+}
+
+func TestManifestGenerationForkFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	for _, tip := range []uint64{1, 2} {
+		manifest := &Manifest{Version: 2, Generation: 7, StorageMode: StorageModeExtentChainV1, TipSlot: tip}
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(data)
+		key := fmt.Sprintf("qlog/manifests/%020d_%x.json", manifest.Generation, hash)
+		if err := bucket.Upload(ctx, key, bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	err = NewObjStoreSyncer(wal, NewManifest(), bucket, "", 0).LoadManifest(ctx)
+	if err == nil || !strings.Contains(err.Error(), "conflicting object-store manifests") {
+		t.Fatalf("expected manifest fork error, got %v", err)
+	}
+}
+
+func TestBackgroundSyncCompactsLongExtentChain(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	manifest := NewManifest()
+	syncer := NewObjStoreSyncer(wal, manifest, bucket, "", 0)
+	for slot := uint64(1); slot <= maxExtentChain+1; slot++ {
+		if err := wal.Append(Entry{Slot: slot, Type: EntryDecide, Payload: []byte{byte(slot)}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := syncer.SyncThrough(ctx, slot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _, _, _ := manifest.Snapshot()
+	if before[0].ExtentCount <= maxExtentChain {
+		t.Fatalf("extent chain did not grow: %d", before[0].ExtentCount)
+	}
+	if err := syncer.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, _, _, _ := manifest.Snapshot()
+	if after[0].ExtentCount >= before[0].ExtentCount {
+		t.Fatalf("extent chain was not compacted: before=%d after=%d", before[0].ExtentCount, after[0].ExtentCount)
+	}
+	restored, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if tip, err := NewRecovery(restored, NewManifest(), bucket, "").Recover(ctx); err != nil || tip != maxExtentChain+1 {
+		t.Fatalf("compacted recovery tip=%d err=%v", tip, err)
+	}
+}
+
+func TestSyncRetriesDirtyManifestWhenTipIsUnchanged(t *testing.T) {
+	ctx := context.Background()
+	bucket := &failManifestBucket{Bucket: objstore.NewInMemBucket()}
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	syncer := NewObjStoreSyncer(wal, NewManifest(), bucket, "", 0)
+	if err := wal.Append(Entry{Slot: 1, Type: EntryDecide, Payload: []byte("decision")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.SyncThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryReceipt, Payload: []byte("receipt")}); err != nil {
+		t.Fatal(err)
+	}
+	bucket.fail = true
+	if err := syncer.SyncThrough(ctx, 1); err == nil {
+		t.Fatal("expected manifest publication failure")
+	}
+	if err := syncer.SyncThrough(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if _, err := NewRecovery(restored, NewManifest(), bucket, "").Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := restored.Read()
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("restored entries=%d err=%v", len(entries), err)
 	}
 }
 

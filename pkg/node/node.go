@@ -57,6 +57,22 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config.Profile != materializer.BuildProfile() {
 		return fmt.Errorf("execution profile %q does not match %s build", n.config.Profile, materializer.BuildProfile())
 	}
+	if n.config.ObjStoreDurability == "" {
+		n.config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
+	}
+	if n.config.ObjStoreDurability != types.ObjectStoreDurabilityAsync && n.config.ObjStoreDurability != types.ObjectStoreDurabilityBeforeAck {
+		return fmt.Errorf("invalid object-store durability %q", n.config.ObjStoreDurability)
+	}
+	if n.config.ObjStoreSyncInterval < 0 {
+		return fmt.Errorf("object-store sync interval must not be negative")
+	}
+	if n.config.ObjStoreGCInterval < 0 || n.config.ObjStoreGCGracePeriod < 0 {
+		return fmt.Errorf("object-store GC durations must not be negative")
+	}
+	objectStoreConfigured := n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != ""
+	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck && !objectStoreConfigured {
+		return fmt.Errorf("before-ack durability requires object storage")
+	}
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")
 	}
@@ -79,7 +95,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("open WAL: %w", err)
 	}
 	n.wal = wal
-	if n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" {
+	if objectStoreConfigured {
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
 			provider = objectstore.ProviderS3
@@ -96,7 +112,20 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		n.bucket = bucket
 		prefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), string(n.config.NodeID))
 		manifest := qlog.NewManifest()
-		n.qlogSync = qlog.NewObjStoreSyncer(wal, manifest, bucket, prefix, 0)
+		interval := n.config.ObjStoreSyncInterval
+		if interval == 0 {
+			interval = time.Minute
+		}
+		n.qlogSync = qlog.NewObjStoreSyncer(wal, manifest, bucket, prefix, interval)
+		gcInterval := n.config.ObjStoreGCInterval
+		if gcInterval == 0 {
+			gcInterval = time.Hour
+		}
+		gcGrace := n.config.ObjStoreGCGracePeriod
+		if gcGrace == 0 {
+			gcGrace = 24 * time.Hour
+		}
+		n.qlogSync.ConfigureGC(gcInterval, gcGrace)
 		if _, recoveryErr := qlog.NewRecovery(wal, manifest, bucket, prefix).Recover(ctx); recoveryErr != nil {
 			return recoveryErr
 		}
@@ -153,6 +182,11 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
+	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
+		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+			return n.qlogSync.SyncThrough(ctx, uint64(slot))
+		})
+	}
 	n.server = server
 	peer, err := network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
 	if err != nil {
@@ -214,6 +248,9 @@ func (n *Node) Open(ctx context.Context) (err error) {
 
 	// 8. Start periodic WAL sync
 	core.StartPeriodicSync(ctx, 1*time.Second)
+	if n.qlogSync != nil {
+		n.qlogSync.Start(ctx)
+	}
 	if n.checkpoints != nil {
 		interval := n.config.CheckpointInterval
 		if interval <= 0 {

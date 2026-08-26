@@ -3,6 +3,7 @@ package qlog
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -10,27 +11,64 @@ import (
 
 // SegmentMeta describes a segment file.
 type SegmentMeta struct {
-	Index     uint32   `json:"index"`
-	StartSlot uint64   `json:"start_slot"`
-	EndSlot   uint64   `json:"end_slot"`
-	Size      int64    `json:"size"`
-	Hash      [32]byte `json:"hash"`
-	Synced    bool     `json:"synced"` // object storage에 동기화되었는지
+	Index       uint32   `json:"index"`
+	StartSlot   uint64   `json:"start_slot"`
+	EndSlot     uint64   `json:"end_slot"`
+	Size        int64    `json:"size"`
+	Hash        [32]byte `json:"hash"`
+	ExtentHead  [32]byte `json:"extent_head,omitempty"`
+	ExtentCount uint32   `json:"extent_count,omitempty"`
+	Synced      bool     `json:"synced"` // object storage에 동기화되었는지
 }
+
+const (
+	StorageModeLegacySegment = "legacy-segment"
+	StorageModeExtentChainV1 = "extent-chain-v1"
+)
 
 // Manifest tracks QLog segment metadata.
 type Manifest struct {
-	Segments []SegmentMeta `json:"segments"`
-	TipSlot  uint64        `json:"tip_slot"`
-	LastSync time.Time     `json:"last_sync"`
-	mu       sync.RWMutex
+	Version     int           `json:"version,omitempty"`
+	Generation  uint64        `json:"generation,omitempty"`
+	StorageMode string        `json:"storage_mode,omitempty"`
+	Segments    []SegmentMeta `json:"segments"`
+	TipSlot     uint64        `json:"tip_slot"`
+	LastSync    time.Time     `json:"last_sync"`
+	mu          sync.RWMutex
 }
 
 // NewManifest creates a new manifest.
 func NewManifest() *Manifest {
 	return &Manifest{
-		Segments: make([]SegmentMeta, 0),
+		Version:     2,
+		StorageMode: StorageModeExtentChainV1,
+		Segments:    make([]SegmentMeta, 0),
 	}
+}
+
+// ReplaceSynced installs the exact extent-chain snapshot to publish.
+func (m *Manifest) ReplaceSynced(segments []SegmentMeta) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range segments {
+		segments[i].Synced = true
+	}
+	if m.Version == 2 && m.StorageMode == StorageModeExtentChainV1 && slices.Equal(m.Segments, segments) {
+		return false
+	}
+	m.Version = 2
+	m.Generation++
+	m.StorageMode = StorageModeExtentChainV1
+	m.Segments = append(m.Segments[:0], segments...)
+	m.recalculateTip()
+	m.LastSync = time.Now()
+	return true
+}
+
+func (m *Manifest) Snapshot() (segments []SegmentMeta, mode string, generation, tip uint64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]SegmentMeta(nil), m.Segments...), m.StorageMode, m.Generation, m.TipSlot
 }
 
 // Load reads the manifest from file.
@@ -127,6 +165,12 @@ func (m *Manifest) UpsertSynced(seg SegmentMeta) {
 	sort.Slice(m.Segments, func(i, j int) bool { return m.Segments[i].Index < m.Segments[j].Index })
 	m.recalculateTip()
 	m.LastSync = time.Now()
+}
+
+func (m *Manifest) Tip() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.TipSlot
 }
 
 func (m *Manifest) recalculateTip() {

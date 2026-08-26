@@ -19,9 +19,10 @@ import (
 const maxRequestBody = 1 << 20
 
 var (
-	ErrNotReady        = errors.New("node is not ready")
-	ErrRequestConflict = errors.New("request ID conflict")
-	ErrInvalidRequest  = errors.New("invalid request")
+	ErrNotReady              = errors.New("node is not ready")
+	ErrRequestConflict       = errors.New("request ID conflict")
+	ErrInvalidRequest        = errors.New("invalid request")
+	ErrDurabilityUnavailable = errors.New("object-store durability unavailable")
 )
 
 // Server is the HTTP server for client API.
@@ -37,6 +38,7 @@ type Server struct {
 	members    []quepaxa.Member
 	hedgeDelay time.Duration
 	applyMu    sync.Mutex
+	durability func(context.Context, quepaxa.Slot) error
 	routeMu    sync.Mutex
 	routeBase  quepaxa.NodeID
 	routeFirst quepaxa.NodeID
@@ -59,13 +61,33 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
-	s.batcher = newSQLBatcher(s.proposeHedged, s.applyDecisions)
+	s.batcher = newSQLBatcher(s.proposeHedged, func(ctx context.Context, slot quepaxa.Slot) error {
+		if err := s.applyDecisions(ctx, slot); err != nil {
+			return err
+		}
+		return s.waitDurable(ctx, slot)
+	})
 	s.routes()
 	return s
 }
 
 // Close stops background request batching.
 func (s *Server) Close() { s.batcher.Close() }
+
+// SetDurabilityBarrier installs the mutation ACK barrier before the server is exposed.
+func (s *Server) SetDurabilityBarrier(barrier func(context.Context, quepaxa.Slot) error) {
+	s.durability = barrier
+}
+
+func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
+	if s.durability == nil {
+		return nil
+	}
+	if err := s.durability(ctx, slot); err != nil {
+		return fmt.Errorf("%w: %v", ErrDurabilityUnavailable, err)
+	}
+	return nil
+}
 
 // routes registers HTTP routes.
 func (s *Server) routes() {
@@ -368,7 +390,7 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrRequestConflict):
 		status = http.StatusConflict
-	case errors.Is(err, ErrNotReady), errors.Is(err, quepaxa.ErrQuorumUnavailable):
+	case errors.Is(err, ErrNotReady), errors.Is(err, ErrDurabilityUnavailable), errors.Is(err, quepaxa.ErrQuorumUnavailable):
 		status = http.StatusServiceUnavailable
 	}
 	http.Error(w, err.Error(), status)
@@ -505,6 +527,9 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if err == nil {
 		err = s.applyDecisions(ctx, slot)
 	}
+	if err == nil {
+		err = s.waitDurable(ctx, slot)
+	}
 	if err != nil {
 		return KVMutationResponse{}, err
 	}
@@ -572,6 +597,9 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ui
 	slot, err := s.proposeHedged(ctx, value)
 	if err == nil {
 		err = s.applyDecisions(ctx, slot)
+	}
+	if err == nil {
+		err = s.waitDurable(ctx, slot)
 	}
 	return uint64(slot), err
 }

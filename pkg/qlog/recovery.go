@@ -80,21 +80,20 @@ func (r *Recovery) shouldRestore(ctx context.Context, localTip uint64) bool {
 
 // restoreFromObjectStorage restores state from object storage.
 func (r *Recovery) restoreFromObjectStorage(ctx context.Context) (uint64, error) {
-	for _, seg := range r.manifest.Segments {
-		data, err := r.syncer.DownloadSegment(ctx, seg.Index)
-		if err != nil {
-			return 0, fmt.Errorf("download segment %d: %w", seg.Index, err)
+	switch r.manifest.StorageMode {
+	case StorageModeExtentChainV1:
+		if err := r.restoreExtents(ctx); err != nil {
+			return 0, err
 		}
-		if seg.Size > 0 && int64(len(data)) != seg.Size {
-			return 0, fmt.Errorf("segment %d size mismatch: got %d want %d", seg.Index, len(data), seg.Size)
+	case "", StorageModeLegacySegment:
+		if r.manifest.Version >= 2 {
+			return 0, fmt.Errorf("version %d manifest has no storage mode", r.manifest.Version)
 		}
-		hash := sha256.Sum256(data)
-		if seg.Hash != ([32]byte{}) && hash != seg.Hash {
-			return 0, fmt.Errorf("segment %d hash mismatch", seg.Index)
+		if err := r.restoreLegacySegments(ctx); err != nil {
+			return 0, err
 		}
-		if err := r.wal.RestoreSegment(seg.Index, data); err != nil {
-			return 0, fmt.Errorf("restore segment %d: %w", seg.Index, err)
-		}
+	default:
+		return 0, fmt.Errorf("unsupported QLog storage mode %q", r.manifest.StorageMode)
 	}
 	entries, err := r.wal.Read()
 	if err != nil {
@@ -110,6 +109,69 @@ func (r *Recovery) restoreFromObjectStorage(ctx context.Context) (uint64, error)
 		return 0, fmt.Errorf("restored WAL tip %d is behind manifest tip %d", tip, r.manifest.TipSlot)
 	}
 	return tip, nil
+}
+
+func (r *Recovery) restoreLegacySegments(ctx context.Context) error {
+	for _, seg := range r.manifest.Segments {
+		data, err := r.syncer.DownloadSegment(ctx, seg)
+		if err != nil {
+			return fmt.Errorf("download segment %d: %w", seg.Index, err)
+		}
+		if err := r.restoreSegment(seg, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Recovery) restoreExtents(ctx context.Context) error {
+	for _, segment := range r.manifest.Segments {
+		if segment.Size <= 0 || segment.Size > defaultMaxSize+(32<<20) {
+			return fmt.Errorf("segment %d has invalid size %d", segment.Index, segment.Size)
+		}
+		if segment.ExtentHead == ([32]byte{}) || segment.ExtentCount == 0 || segment.ExtentCount > maxExtentChainEntries {
+			return fmt.Errorf("segment %d has invalid extent chain", segment.Index)
+		}
+		data := make([]byte, segment.Size)
+		hash := segment.ExtentHead
+		expectedEnd := segment.Size
+		var count uint32
+		for hash != ([32]byte{}) {
+			if count >= segment.ExtentCount {
+				return fmt.Errorf("segment %d extent chain exceeds declared count", segment.Index)
+			}
+			part, err := r.syncer.downloadExtent(ctx, hash)
+			if err != nil {
+				return fmt.Errorf("download segment %d extent: %w", segment.Index, err)
+			}
+			if part.Segment != segment.Index || part.Offset+int64(len(part.Data)) != expectedEnd {
+				return fmt.Errorf("segment %d has a gap or overlapping extent at %d", segment.Index, part.Offset)
+			}
+			copy(data[part.Offset:expectedEnd], part.Data)
+			count++
+			expectedEnd, hash = part.Offset, part.Previous
+		}
+		if count != segment.ExtentCount || expectedEnd != 0 {
+			return fmt.Errorf("segment %d extent chain is incomplete", segment.Index)
+		}
+		if err := r.restoreSegment(segment, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Recovery) restoreSegment(seg SegmentMeta, data []byte) error {
+	if seg.Size > 0 && int64(len(data)) != seg.Size {
+		return fmt.Errorf("segment %d size mismatch: got %d want %d", seg.Index, len(data), seg.Size)
+	}
+	if seg.Hash != ([32]byte{}) && sha256.Sum256(data) != seg.Hash {
+		return fmt.Errorf("segment %d hash mismatch", seg.Index)
+	}
+	if err := r.wal.RestoreSegment(seg.Index, data); err != nil {
+		return fmt.Errorf("restore segment %d: %w", seg.Index, err)
+	}
+	return nil
 }
 
 // RecoverFromCheckpoint restores from a checkpoint and replays WAL.

@@ -34,47 +34,55 @@ type KVMutationResponse = network.KVMutationResponse
 type GraphQueryRequest = network.GraphQueryRequest
 type GraphExecuteResponse = network.GraphExecuteResponse
 type ObjectStoreStats = objstore.Stats
+type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
-	ClusterID            string
-	NodeID               string
-	Profile              Profile
-	DataDir              string
-	BindAddr             string
-	PeerAddr             string
-	AdminToken           string
-	ClientToken          string
-	Members              []Member
-	ObjStoreEndpoint     string
-	ObjStoreBucket       string
-	ObjStoreProvider     string
-	ObjStoreDir          string
-	ObjStorePrefix       string
-	ObjStoreRegion       string
-	ObjStoreInsecure     bool
-	ObjStoreRetries      int
-	ObjStoreAccessKey    string
-	ObjStoreSecretKey    string
-	ObjStoreSessionToken string
-	CheckpointInterval   time.Duration
-	ReadTimeout          time.Duration
-	HedgeDelay           time.Duration
+	ClusterID             string
+	NodeID                string
+	Profile               Profile
+	DataDir               string
+	BindAddr              string
+	PeerAddr              string
+	AdminToken            string
+	ClientToken           string
+	Members               []Member
+	ObjStoreEndpoint      string
+	ObjStoreBucket        string
+	ObjStoreProvider      string
+	ObjStoreDir           string
+	ObjStorePrefix        string
+	ObjStoreRegion        string
+	ObjStoreInsecure      bool
+	ObjStoreRetries       int
+	ObjStoreAccessKey     string
+	ObjStoreSecretKey     string
+	ObjStoreSessionToken  string
+	ObjStoreDurability    ObjectStoreDurability
+	ObjStoreSyncInterval  time.Duration
+	ObjStoreGCInterval    time.Duration
+	ObjStoreGCGracePeriod time.Duration
+	CheckpointInterval    time.Duration
+	ReadTimeout           time.Duration
+	HedgeDelay            time.Duration
 }
 
 const (
-	ProfileSQL              = types.ProfileSQL
-	ProfileGraph            = types.ProfileGraph
-	ProfileKV               = types.ProfileKV
-	ConsistencyLocal        = "local"
-	ConsistencyLinearizable = "linearizable"
+	ProfileSQL                     = types.ProfileSQL
+	ProfileGraph                   = types.ProfileGraph
+	ProfileKV                      = types.ProfileKV
+	ConsistencyLocal               = "local"
+	ConsistencyLinearizable        = "linearizable"
+	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
+	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
 )
 
 var (
-	ErrNotReady          = network.ErrNotReady
-	ErrRequestConflict   = network.ErrRequestConflict
-	ErrInvalidRequest    = network.ErrInvalidRequest
-	ErrQuorumUnavailable = quepaxa.ErrQuorumUnavailable
+	ErrNotReady              = network.ErrNotReady
+	ErrRequestConflict       = network.ErrRequestConflict
+	ErrInvalidRequest        = network.ErrInvalidRequest
+	ErrQuorumUnavailable     = quepaxa.ErrQuorumUnavailable
+	ErrDurabilityUnavailable = network.ErrDurabilityUnavailable
 )
 
 // DB owns one embedded Rhiza node and its private QUIC peer endpoint.
@@ -112,6 +120,8 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,
 		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
+		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
+		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
 		CheckpointInterval: config.CheckpointInterval, ReadTimeout: config.ReadTimeout, HedgeDelay: config.HedgeDelay,
 	}
 	n := node.New(internalConfig)
