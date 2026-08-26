@@ -1,7 +1,10 @@
 package qlog
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"slices"
 	"sort"
@@ -21,29 +24,18 @@ type SegmentMeta struct {
 	Synced      bool     `json:"synced"` // object storage에 동기화되었는지
 }
 
-const (
-	StorageModeLegacySegment = "legacy-segment"
-	StorageModeExtentChainV1 = "extent-chain-v1"
-)
-
 // Manifest tracks QLog segment metadata.
 type Manifest struct {
-	Version     int           `json:"version,omitempty"`
-	Generation  uint64        `json:"generation,omitempty"`
-	StorageMode string        `json:"storage_mode,omitempty"`
-	Segments    []SegmentMeta `json:"segments"`
-	TipSlot     uint64        `json:"tip_slot"`
-	LastSync    time.Time     `json:"last_sync"`
-	mu          sync.RWMutex
+	Generation uint64        `json:"generation,omitempty"`
+	Segments   []SegmentMeta `json:"segments"`
+	TipSlot    uint64        `json:"tip_slot"`
+	LastSync   time.Time     `json:"last_sync"`
+	mu         sync.RWMutex
 }
 
 // NewManifest creates a new manifest.
 func NewManifest() *Manifest {
-	return &Manifest{
-		Version:     2,
-		StorageMode: StorageModeExtentChainV1,
-		Segments:    make([]SegmentMeta, 0),
-	}
+	return &Manifest{Segments: make([]SegmentMeta, 0)}
 }
 
 // ReplaceSynced installs the exact extent-chain snapshot to publish.
@@ -53,22 +45,20 @@ func (m *Manifest) ReplaceSynced(segments []SegmentMeta) bool {
 	for i := range segments {
 		segments[i].Synced = true
 	}
-	if m.Version == 2 && m.StorageMode == StorageModeExtentChainV1 && slices.Equal(m.Segments, segments) {
+	if slices.Equal(m.Segments, segments) {
 		return false
 	}
-	m.Version = 2
 	m.Generation++
-	m.StorageMode = StorageModeExtentChainV1
 	m.Segments = append(m.Segments[:0], segments...)
 	m.recalculateTip()
 	m.LastSync = time.Now()
 	return true
 }
 
-func (m *Manifest) Snapshot() (segments []SegmentMeta, mode string, generation, tip uint64) {
+func (m *Manifest) Snapshot() (segments []SegmentMeta, generation, tip uint64) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]SegmentMeta(nil), m.Segments...), m.StorageMode, m.Generation, m.TipSlot
+	return append([]SegmentMeta(nil), m.Segments...), m.Generation, m.TipSlot
 }
 
 // Load reads the manifest from file.
@@ -84,7 +74,19 @@ func (m *Manifest) Load(path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return json.Unmarshal(data, m)
+	return decodeManifestJSON(data, m)
+}
+
+func decodeManifestJSON(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON data")
+	}
+	return nil
 }
 
 // Save writes the manifest to file.

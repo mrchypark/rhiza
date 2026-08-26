@@ -41,17 +41,17 @@ wait_value() {
   local peer="$1" value="$2" deadline=$((SECONDS + 15)) result
   until result="$(curl -fsS -H 'Content-Type: application/json' -d \
     "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
-    "http://127.0.0.1:$((base_port + peer))/v1/sql/query" 2>/dev/null)" && [[ "$result" == *"$value"* ]]; do
+    "http://127.0.0.1:$((base_port + peer))/sql/query" 2>/dev/null)" && [[ "$result" == *"$value"* ]]; do
     (( SECONDS < deadline )) || return 1
     sleep 0.1
   done
 }
 curl -fsS -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"schema-${suffix}\",\"sql\":\"CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT NOT NULL)\"}" \
-  "$node0/v1/sql/execute" >/dev/null
+  "$node0/sql/execute" >/dev/null
 curl -fsS -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"seed-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (1, 'before-fault')\"}" \
-  "$node1/v1/sql/execute" >/dev/null
+  "$node1/sql/execute" >/dev/null
 
 for peer in 0 1 2; do
   wait_value "$peer" before-fault
@@ -69,7 +69,7 @@ fi
 
 write_seconds="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_total}' -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"during-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (2, 'during-fault')\"}" \
-  "$node1/v1/sql/execute")"
+  "$node1/sql/execute")"
 
 for peer in 1 2; do
   wait_value "$peer" during-fault
@@ -100,7 +100,7 @@ until curl -fsS "$node0/ready" >/dev/null 2>&1; do
 done
 result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
-  "$node0/v1/sql/query")"
+  "$node0/sql/query")"
 if [[ "$result" != *'during-fault'* ]]; then
   echo "FAIL: peers=3 failed=1 quorum-write=${write_seconds}s recovered-node-converged=false" >&2
 	exit 1
@@ -123,7 +123,7 @@ pf_pids[0]="$!"
 deadline=$((SECONDS + 30))
 until result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
-  "$node0/v1/sql/query" 2>/dev/null)"; do
+  "$node0/sql/query" 2>/dev/null)"; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done
@@ -139,7 +139,7 @@ while curl -fsS --max-time 1 "$node0/ready" >/dev/null 2>&1 || \
 done
 status="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"no-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (3, 'must-not-commit')\"}" \
-  "$node1/v1/sql/execute")"
+  "$node1/sql/execute")"
 if [[ "$status" != "503" ]]; then
   echo "FAIL: peers=3 failed=2 expected-status=503 actual-status=$status" >&2
   exit 1
@@ -154,13 +154,13 @@ done
 deadline=$((SECONDS + 30))
 until curl -fsS --max-time 20 -o /dev/null -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"after-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (4, 'after-quorum')\"}" \
-  "$node1/v1/sql/execute" 2>/dev/null; do
+  "$node1/sql/execute" 2>/dev/null; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.25
 done
 result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "{\"sql\":\"SELECT value FROM ${table} WHERE id = 4\",\"consistency\":\"linearizable\"}" \
-  "$node1/v1/sql/query")"
+  "$node1/sql/query")"
 [[ "$result" == *'after-quorum'* ]]
 
 for peer in 0 1 2; do
@@ -181,7 +181,7 @@ done
 deadline=$((SECONDS + 90))
 until result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "{\"sql\":\"SELECT id, value FROM ${table} ORDER BY id\",\"consistency\":\"linearizable\"}" \
-  "$node0/v1/sql/query" 2>/dev/null)"; do
+  "$node0/sql/query" 2>/dev/null)"; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done

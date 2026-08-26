@@ -18,9 +18,8 @@ var ErrQuorumUnavailable = errors.New("QuePaxa quorum unavailable")
 var ErrCompacted = errors.New("QuePaxa history compacted")
 
 var (
-	isrEntryMagicV1    = []byte("QISR1\x00")
-	isrEntryMagicV2    = []byte("QISR2\x00")
-	decisionEntryMagic = []byte("QDEC1\x00")
+	isrEntryMagic      = []byte("QISR\x00")
+	decisionEntryMagic = []byte("QDEC\x00")
 )
 
 const leaderEpochSize Slot = 16
@@ -764,10 +763,10 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 		return summary, nil
 	}
 	state := c.recorders[request.Slot]
-	legacy := sameProposal(state.FirstCurrent, &request.Proposal) ||
+	known := sameProposal(state.FirstCurrent, &request.Proposal) ||
 		sameProposal(state.AggregateCurrent, &request.Proposal) ||
 		sameProposal(state.AggregatePrior, &request.Proposal)
-	if value, ok := c.values[request.Proposal.Hash]; !ok && !legacy {
+	if value, ok := c.values[request.Proposal.Hash]; !ok && !known {
 		c.mu.Unlock()
 		return Summary{}, fmt.Errorf("proposal value is unavailable")
 	} else if ok && len(request.Proposal.Value) != 0 && !bytes.Equal(request.Proposal.Value, value) {
@@ -1121,8 +1120,6 @@ func (c *Core) validateDecision(decision Decision) error {
 }
 
 func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader bool) error {
-	// Recovery must continue to accept already-certified legacy values that
-	// predate the current proposal admission ceiling.
 	if decision.Slot == 0 || sha256.Sum256(decision.Proposal.Value) != decision.Proposal.Hash {
 		return fmt.Errorf("invalid QuePaxa decision value")
 	}
@@ -1345,20 +1342,6 @@ func (c *Core) DecidedSlot(value []byte) (Slot, bool) {
 	return decision.Slot, ok
 }
 
-// AcceptLearned is retained only for single-node compatibility. Clustered
-// callers must use AcceptDecision so learned hints cannot bypass consensus.
-func (c *Core) AcceptLearned(slot Slot, value []byte, hash ValueHash) error {
-	if len(c.config.Members) != 1 {
-		return fmt.Errorf("uncertified learned decision rejected")
-	}
-	proposal := newProposal(highestPriority, c.nodeID, value)
-	if proposal.Hash != hash {
-		return fmt.Errorf("learned value hash mismatch")
-	}
-	summary := Summary{RecorderID: c.nodeID, Step: 4, FirstCurrent: cloneProposal(&proposal)}
-	return c.AcceptDecision(Decision{Slot: slot, Step: 4, Proposal: proposal, Summaries: []Summary{summary}})
-}
-
 func (c *Core) Learn(ctx context.Context, from Slot) (<-chan SlotValue, error) {
 	ch := make(chan SlotValue, 100)
 	c.mu.Lock()
@@ -1498,9 +1481,6 @@ func (c *Core) recover() error {
 			c.values[entry.Hash] = append([]byte(nil), entry.Payload...)
 			c.valueDurable[entry.Hash] = true
 		case qlog.EntryReceipt:
-			if !bytes.HasPrefix(entry.Payload, isrEntryMagicV1) && !bytes.HasPrefix(entry.Payload, isrEntryMagicV2) {
-				continue
-			}
 			persisted, err := decodeRecorderEntry(entry.Payload)
 			if err != nil {
 				return fmt.Errorf("recover QuePaxa ISR: %w", err)
@@ -1512,7 +1492,7 @@ func (c *Core) recover() error {
 			c.mu.Unlock()
 		case qlog.EntryDecide:
 			if !bytes.HasPrefix(entry.Payload, decisionEntryMagic) {
-				continue
+				return fmt.Errorf("recover QuePaxa decision: unknown WAL record format")
 			}
 			value, certificate, err := decodeDecisionRecord(entry.Payload[len(decisionEntryMagic):])
 			if err != nil {

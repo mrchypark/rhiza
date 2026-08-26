@@ -47,7 +47,7 @@ table DecidedValue {
 }
 
 table Request {
-  version:ushort = 2 (id: 0);
+  magic:uint (id: 0);
   operation:Operation (id: 1);
   cluster_id:string (id: 2);
   sender_id:string (id: 3);
@@ -62,7 +62,7 @@ table Request {
 }
 
 table Response {
-  version:ushort = 2 (id: 0);
+  magic:uint (id: 0);
   error:string (id: 1);
   summary:Summary (id: 2);
   decided:DecidedValue (id: 3);

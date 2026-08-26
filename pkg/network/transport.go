@@ -19,7 +19,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const peerALPN = "rhiza-peer/1"
+const peerALPN = "rhiza-peer"
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
 

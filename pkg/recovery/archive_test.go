@@ -42,6 +42,12 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	}
 }
 
+func TestArchiveRejectsNumberedObject(t *testing.T) {
+	if err := decodePersistedJSON([]byte(`{"version":2}`), &archiveHead{}); err == nil {
+		t.Fatal("accepted numbered archive object")
+	}
+}
+
 func TestArchiveCleanupCompactsCardinality(t *testing.T) {
 	ctx := context.Background()
 	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}

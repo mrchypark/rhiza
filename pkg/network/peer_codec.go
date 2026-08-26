@@ -11,13 +11,13 @@ import (
 )
 
 const (
-	peerWireVersion = 2
-	maxPeerFrame    = 1 << 20
+	peerWireMagic uint32 = 0x52485a41
+	maxPeerFrame         = 1 << 20
 )
 
 func encodePeerRequest(request *peerfb.RequestT) []byte {
 	builder := flatbuffers.NewBuilder(512)
-	request.Version = peerWireVersion
+	request.Magic = peerWireMagic
 	offset := request.Pack(builder)
 	peerfb.FinishRequestBuffer(builder, offset)
 	return append([]byte(nil), builder.FinishedBytes()...)
@@ -34,15 +34,15 @@ func decodePeerRequest(data []byte) (request *peerfb.RequestT, err error) {
 		}
 	}()
 	request = peerfb.GetRootAsRequest(data, 0).UnPack()
-	if request.Version != peerWireVersion {
-		return nil, fmt.Errorf("unsupported peer wire version %d", request.Version)
+	if request.Magic != peerWireMagic {
+		return nil, fmt.Errorf("invalid peer frame marker")
 	}
 	return request, nil
 }
 
 func encodePeerResponse(response *peerfb.ResponseT) []byte {
 	builder := flatbuffers.NewBuilder(512)
-	response.Version = peerWireVersion
+	response.Magic = peerWireMagic
 	offset := response.Pack(builder)
 	peerfb.FinishResponseBuffer(builder, offset)
 	return append([]byte(nil), builder.FinishedBytes()...)
@@ -59,8 +59,8 @@ func decodePeerResponse(data []byte) (response *peerfb.ResponseT, err error) {
 		}
 	}()
 	response = peerfb.GetRootAsResponse(data, 0).UnPack()
-	if response.Version != peerWireVersion {
-		return nil, fmt.Errorf("unsupported peer wire version %d", response.Version)
+	if response.Magic != peerWireMagic {
+		return nil, fmt.Errorf("invalid peer response marker")
 	}
 	if response.Error != "" {
 		return response, fmt.Errorf("peer rejected request: %s", response.Error)

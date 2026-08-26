@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	flatbuffers "github.com/google/flatbuffers/go"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -96,6 +97,16 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 func TestPeerCodecRejectsMalformedFrame(t *testing.T) {
 	if _, err := decodePeerRequest([]byte("not-flatbuffers")); err == nil {
 		t.Fatal("malformed frame accepted")
+	}
+}
+
+func TestPeerCodecRejectsWrongMarker(t *testing.T) {
+	request := &peerfb.RequestT{Magic: 2, Operation: peerfb.OperationRecord}
+	builder := flatbuffers.NewBuilder(64)
+	offset := request.Pack(builder)
+	peerfb.FinishRequestBuffer(builder, offset)
+	if _, err := decodePeerRequest(builder.FinishedBytes()); err == nil {
+		t.Fatal("accepted peer frame with wrong marker")
 	}
 }
 

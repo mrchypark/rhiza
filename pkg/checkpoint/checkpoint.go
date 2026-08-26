@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	formatVersion     = 3
 	chunkSize         = 4 << 20
 	maxCheckpointSize = 16 << 30
 	maxChunks         = maxCheckpointSize/chunkSize + 1
@@ -35,7 +34,6 @@ type Chunk struct {
 
 // Checkpoint is an immutable, content-addressed recovery root.
 type Checkpoint struct {
-	Version  int      `json:"version"`
 	ConfigID uint     `json:"config_id"`
 	Index    uint64   `json:"index"`
 	Hash     [32]byte `json:"hash"`
@@ -113,7 +111,7 @@ func (m *Manager) CreateReader(ctx context.Context, reader io.Reader, index uint
 		_ = spool.Close()
 		_ = os.Remove(spoolPath)
 	}()
-	root := Checkpoint{Version: formatVersion, ConfigID: m.configID, Index: index}
+	root := Checkpoint{ConfigID: m.configID, Index: index}
 	stateHash := sha256.New()
 	buffer := make([]byte, chunkSize)
 	for {
@@ -440,7 +438,7 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 		return Checkpoint{}, fmt.Errorf("checkpoint root integrity mismatch")
 	}
 	var root Checkpoint
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := decodePersistedJSON(data, &root); err != nil {
 		return Checkpoint{}, err
 	}
 	root.RootHash = expected
@@ -451,7 +449,7 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 }
 
 func (m *Manager) validateRoot(root Checkpoint) error {
-	if root.Version != formatVersion || root.ConfigID != m.configID || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Chunks) == 0 || len(root.Chunks) > maxChunks {
+	if root.ConfigID != m.configID || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Chunks) == 0 || len(root.Chunks) > maxChunks {
 		return fmt.Errorf("invalid checkpoint root")
 	}
 	var size int64
@@ -463,6 +461,18 @@ func (m *Manager) validateRoot(root Checkpoint) error {
 	}
 	if size != root.Size {
 		return fmt.Errorf("checkpoint size mismatch")
+	}
+	return nil
+}
+
+func decodePersistedJSON(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON data")
 	}
 	return nil
 }

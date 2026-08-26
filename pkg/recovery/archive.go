@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	archiveVersion     = 2
 	maxExtentSize      = 8 << 20
 	maxExtentItems     = 1024
 	maxManifestSize    = 4 << 20
@@ -27,7 +26,6 @@ const (
 )
 
 type Extent struct {
-	Version     int                    `json:"version"`
 	ConfigID    uint                   `json:"config_id"`
 	Start       quepaxa.Slot           `json:"start"`
 	End         quepaxa.Slot           `json:"end"`
@@ -45,14 +43,12 @@ type extentRef struct {
 }
 
 type archiveManifest struct {
-	Version  int          `json:"version"`
 	ConfigID uint         `json:"config_id"`
 	Tip      quepaxa.Slot `json:"tip"`
 	Extents  []extentRef  `json:"extents"`
 }
 
 type archiveHead struct {
-	Version      int          `json:"version"`
 	ConfigID     uint         `json:"config_id"`
 	Tip          quepaxa.Slot `json:"tip"`
 	ManifestHash [32]byte     `json:"manifest_hash"`
@@ -70,17 +66,17 @@ type syncBatch struct {
 }
 
 type Manager struct {
-	bucket      objstore.Bucket
-	prefix      string
-	configID    uint
-	mu          sync.Mutex
-	extents     []Extent
-	manifest    archiveManifest
-	tip         quepaxa.Slot
-	headVersion *objstore.ObjectVersion
-	cas         bool
-	batchMu     sync.Mutex
-	batch       *syncBatch
+	bucket   objstore.Bucket
+	prefix   string
+	configID uint
+	mu       sync.Mutex
+	extents  []Extent
+	manifest archiveManifest
+	tip      quepaxa.Slot
+	headCAS  *objstore.ObjectVersion
+	cas      bool
+	batchMu  sync.Mutex
+	batch    *syncBatch
 }
 
 func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
@@ -91,29 +87,27 @@ func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.loadLocked(ctx, true)
+	return m.loadLocked(ctx)
 }
 
-func (m *Manager) loadLocked(ctx context.Context, checkLegacy bool) error {
+func (m *Manager) loadLocked(ctx context.Context) error {
 	name := m.key("archive/latest.json")
 	attributes, err := m.bucket.Attributes(ctx, name)
 	if err != nil {
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
-		if checkLegacy {
-			legacy := false
-			if err := m.bucket.Iter(ctx, m.key("archive/extents"), func(string) error { legacy = true; return nil }); err != nil {
-				return err
-			}
-			if legacy {
-				return fmt.Errorf("legacy shared archive format is not supported; rebuild archive v2 from a certified local log")
-			}
+		unsupported := false
+		if err := m.bucket.Iter(ctx, m.key("archive/extents"), func(string) error { unsupported = true; return nil }); err != nil {
+			return err
+		}
+		if unsupported {
+			return fmt.Errorf("unsupported shared archive layout")
 		}
 		m.extents = nil
-		m.manifest = archiveManifest{Version: archiveVersion, ConfigID: m.configID}
+		m.manifest = archiveManifest{ConfigID: m.configID}
 		m.tip = 0
-		m.headVersion = nil
+		m.headCAS = nil
 		return nil
 	}
 	headData, err := m.readObject(ctx, name, maxHeadSize)
@@ -121,10 +115,10 @@ func (m *Manager) loadLocked(ctx context.Context, checkLegacy bool) error {
 		return err
 	}
 	var head archiveHead
-	if err := json.Unmarshal(headData, &head); err != nil {
+	if err := decodePersistedJSON(headData, &head); err != nil {
 		return err
 	}
-	if head.Version != archiveVersion || head.ConfigID != m.configID || head.Tip == 0 || head.ManifestHash == ([32]byte{}) {
+	if head.ConfigID != m.configID || head.Tip == 0 || head.ManifestHash == ([32]byte{}) {
 		return fmt.Errorf("invalid shared archive head")
 	}
 	manifestName := m.key(manifestKey(head.Tip, head.ManifestHash))
@@ -136,10 +130,10 @@ func (m *Manager) loadLocked(ctx context.Context, checkLegacy bool) error {
 		return fmt.Errorf("shared archive manifest integrity mismatch")
 	}
 	var manifest archiveManifest
-	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+	if err := decodePersistedJSON(manifestData, &manifest); err != nil {
 		return err
 	}
-	if manifest.Version != archiveVersion || manifest.ConfigID != m.configID || manifest.Tip != head.Tip || len(manifest.Extents) == 0 {
+	if manifest.ConfigID != m.configID || manifest.Tip != head.Tip || len(manifest.Extents) == 0 {
 		return fmt.Errorf("invalid shared archive manifest")
 	}
 	extents := make([]Extent, 0, len(manifest.Extents))
@@ -165,7 +159,7 @@ func (m *Manager) loadLocked(ctx context.Context, checkLegacy bool) error {
 	m.extents = extents
 	m.manifest = manifest
 	m.tip = manifest.Tip
-	m.headVersion = attributes.Version
+	m.headCAS = attributes.Version
 	return nil
 }
 
@@ -228,7 +222,7 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		}
 		extents := append([]Extent(nil), m.extents...)
 		manifest := m.manifest
-		manifest.Version, manifest.ConfigID = archiveVersion, m.configID
+		manifest.ConfigID = m.configID
 		manifest.Extents = append([]extentRef(nil), manifest.Extents...)
 		from := m.tip + 1
 		for from <= through {
@@ -262,13 +256,13 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		if err := m.publishHeadLocked(ctx, manifest, manifestHash); err == nil {
 			m.extents, m.manifest, m.tip = extents, manifest, manifest.Tip
 			if m.cas {
-				return m.loadLocked(ctx, false)
+				return m.loadLocked(ctx)
 			}
 			return nil
 		} else if !m.cas {
 			return err
 		}
-		if err := m.loadLocked(ctx, false); err != nil {
+		if err := m.loadLocked(ctx); err != nil {
 			return err
 		}
 	}
@@ -276,16 +270,16 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) publishHeadLocked(ctx context.Context, manifest archiveManifest, hash [32]byte) error {
-	data, err := json.Marshal(archiveHead{Version: archiveVersion, ConfigID: m.configID, Tip: manifest.Tip, ManifestHash: hash})
+	data, err := json.Marshal(archiveHead{ConfigID: m.configID, Tip: manifest.Tip, ManifestHash: hash})
 	if err != nil {
 		return err
 	}
 	var options []objstore.ObjectUploadOption
 	if m.cas {
-		if m.headVersion == nil {
+		if m.headCAS == nil {
 			options = append(options, objstore.WithIfNotExists())
 		} else {
-			options = append(options, objstore.WithIfMatch(m.headVersion))
+			options = append(options, objstore.WithIfMatch(m.headCAS))
 		}
 	}
 	return m.bucket.Upload(ctx, m.key("archive/latest.json"), bytes.NewReader(data), options...)
@@ -328,7 +322,7 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot) (Extent, 
 	if !ok {
 		return Extent{}, extentRef{}, tip, fmt.Errorf("archive end prefix %d is unavailable", end)
 	}
-	extent := Extent{Version: archiveVersion, ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, Decisions: selected}
+	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, Decisions: selected}
 	data, err := json.Marshal(extent)
 	if err != nil {
 		return Extent{}, extentRef{}, tip, err
@@ -377,12 +371,12 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 		return fmt.Errorf("archive GC grace period must not be negative")
 	}
 	m.mu.Lock()
-	if err := m.loadLocked(ctx, false); err != nil {
+	if err := m.loadLocked(ctx); err != nil {
 		m.mu.Unlock()
 		return err
 	}
 	if compacted := m.compactExtents(); len(compacted) < len(m.extents) {
-		manifest := archiveManifest{Version: archiveVersion, ConfigID: m.configID, Tip: m.tip, Extents: make([]extentRef, 0, len(compacted))}
+		manifest := archiveManifest{ConfigID: m.configID, Tip: m.tip, Extents: make([]extentRef, 0, len(compacted))}
 		for _, extent := range compacted {
 			data, err := json.Marshal(extent)
 			if err != nil || len(data) > maxExtentSize {
@@ -413,7 +407,7 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 		}
 		m.extents, m.manifest = compacted, manifest
 		if m.cas {
-			if err := m.loadLocked(ctx, false); err != nil {
+			if err := m.loadLocked(ctx); err != nil {
 				m.mu.Unlock()
 				return err
 			}
@@ -476,7 +470,7 @@ func (m *Manager) compactExtents() []Extent {
 				current, size = Extent{}, 256
 			}
 			if len(current.Decisions) == 0 {
-				current = Extent{Version: archiveVersion, ConfigID: m.configID, Start: decision.Slot, StartPrefix: prefix}
+				current = Extent{ConfigID: m.configID, Start: decision.Slot, StartPrefix: prefix}
 			}
 			current.Decisions = append(current.Decisions, decision)
 			current.End = decision.Slot
@@ -498,7 +492,7 @@ func (m *Manager) readExtent(ctx context.Context, name string, expected [32]byte
 		return Extent{}, fmt.Errorf("archive extent integrity mismatch")
 	}
 	var extent Extent
-	if err := json.Unmarshal(data, &extent); err != nil {
+	if err := decodePersistedJSON(data, &extent); err != nil {
 		return Extent{}, err
 	}
 	if err := m.validateExtent(extent); err != nil {
@@ -524,7 +518,7 @@ func (m *Manager) readObject(ctx context.Context, name string, limit int64) ([]b
 }
 
 func (m *Manager) validateExtent(extent Extent) error {
-	if extent.Version != archiveVersion || extent.ConfigID != m.configID || extent.Start == 0 || extent.End < extent.Start || len(extent.Decisions) == 0 || len(extent.Decisions) > maxExtentItems || int(extent.End-extent.Start+1) != len(extent.Decisions) {
+	if extent.ConfigID != m.configID || extent.Start == 0 || extent.End < extent.Start || len(extent.Decisions) == 0 || len(extent.Decisions) > maxExtentItems || int(extent.End-extent.Start+1) != len(extent.Decisions) {
 		return fmt.Errorf("invalid archive extent")
 	}
 	prefix := extent.StartPrefix
@@ -536,6 +530,18 @@ func (m *Manager) validateExtent(extent Extent) error {
 	}
 	if prefix != extent.EndPrefix {
 		return fmt.Errorf("archive extent prefix mismatch")
+	}
+	return nil
+}
+
+func decodePersistedJSON(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON data")
 	}
 	return nil
 }

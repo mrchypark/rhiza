@@ -75,20 +75,8 @@ func (r *Recovery) shouldRestore(ctx context.Context, localTip uint64) bool {
 
 // restoreFromObjectStorage restores state from object storage.
 func (r *Recovery) restoreFromObjectStorage(ctx context.Context) (uint64, error) {
-	switch r.manifest.StorageMode {
-	case StorageModeExtentChainV1:
-		if err := r.restoreExtents(ctx); err != nil {
-			return 0, err
-		}
-	case "", StorageModeLegacySegment:
-		if r.manifest.Version >= 2 {
-			return 0, fmt.Errorf("version %d manifest has no storage mode", r.manifest.Version)
-		}
-		if err := r.restoreLegacySegments(ctx); err != nil {
-			return 0, err
-		}
-	default:
-		return 0, fmt.Errorf("unsupported QLog storage mode %q", r.manifest.StorageMode)
+	if err := r.restoreExtents(ctx); err != nil {
+		return 0, err
 	}
 	entries, err := r.wal.Read()
 	if err != nil {
@@ -104,19 +92,6 @@ func (r *Recovery) restoreFromObjectStorage(ctx context.Context) (uint64, error)
 		return 0, fmt.Errorf("restored WAL tip %d is behind manifest tip %d", tip, r.manifest.TipSlot)
 	}
 	return tip, nil
-}
-
-func (r *Recovery) restoreLegacySegments(ctx context.Context) error {
-	for _, seg := range r.manifest.Segments {
-		data, err := r.syncer.DownloadSegment(ctx, seg)
-		if err != nil {
-			return fmt.Errorf("download segment %d: %w", seg.Index, err)
-		}
-		if err := r.restoreSegment(seg, data); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (r *Recovery) restoreExtents(ctx context.Context) error {

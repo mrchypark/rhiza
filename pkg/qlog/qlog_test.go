@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -70,18 +68,17 @@ func TestEntryEncodeDecode(t *testing.T) {
 	}
 }
 
-func TestEntryChecksumCoversPayloadAndReadsLegacyHeaderChecksum(t *testing.T) {
+func TestEntryChecksumCoversPayloadAndRejectsOldLayout(t *testing.T) {
 	data := (Entry{Slot: 1, Payload: []byte("payload")}).Encode()
 	data[len(data)-1] ^= 1
 	if _, _, err := DecodeEntry(data); err == nil {
 		t.Fatal("payload corruption passed checksum validation")
 	}
 
-	legacy := (Entry{Slot: 2, Payload: []byte("legacy")}).Encode()
-	binary.LittleEndian.PutUint32(legacy[41:45], binary.LittleEndian.Uint32(legacy[41:45])&^entryV2LengthFlag)
-	binary.LittleEndian.PutUint32(legacy[45:49], crc32.ChecksumIEEE(legacy[:45]))
-	if _, _, err := DecodeEntry(legacy); err != nil {
-		t.Fatalf("legacy header checksum: %v", err)
+	old := (Entry{Slot: 2, Payload: []byte("old")}).Encode()
+	old[44] = 0
+	if _, _, err := DecodeEntry(old); err == nil {
+		t.Fatal("accepted WAL entry without current marker")
 	}
 }
 
@@ -273,7 +270,7 @@ func TestSegmentSnapshotsSinceReadsOnlyDelta(t *testing.T) {
 	}
 }
 
-func TestRecoveryInstallsExactObjectStoreSegment(t *testing.T) {
+func TestRecoveryRejectsMutableObjectStoreManifest(t *testing.T) {
 	segment := append(
 		Entry{Slot: 1, Type: EntryProposal, Payload: []byte("one")}.Encode(),
 		Entry{Slot: 2, Type: EntryDecide, Payload: []byte("two")}.Encode()...,
@@ -298,16 +295,8 @@ func TestRecoveryInstallsExactObjectStoreSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wal.Close()
-	tip, err := NewRecovery(wal, NewManifest(), bucket, "").Recover(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entries, err := wal.Read()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tip != 2 || len(entries) != 2 || entries[0].Slot != 1 || entries[1].Slot != 2 {
-		t.Fatalf("tip=%d entries=%#v", tip, entries)
+	if _, err := NewRecovery(wal, NewManifest(), bucket, "").Recover(ctx); err == nil || !strings.Contains(err.Error(), "unsupported object-store QLog layout") {
+		t.Fatalf("expected mutable manifest rejection, got %v", err)
 	}
 }
 
@@ -413,7 +402,7 @@ func TestExtentSyncUploadsOnlyAppendedBytesAndCollectsOldManifest(t *testing.T) 
 	if err := syncer.SyncThrough(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	firstSegments, _, _, _ := manifest.Snapshot()
+	firstSegments, _, _ := manifest.Snapshot()
 	if len(firstSegments) != 1 || firstSegments[0].ExtentCount != 2 {
 		t.Fatalf("first segments=%+v", firstSegments)
 	}
@@ -523,7 +512,7 @@ func TestImmutableManifestGenerationCannotRollBack(t *testing.T) {
 	}
 }
 
-func TestExtentRecoveryRejectsCorruptionAndUnknownMode(t *testing.T) {
+func TestExtentRecoveryRejectsCorruptionAndNumberedManifest(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
 	wal, err := Open(t.TempDir())
@@ -538,7 +527,7 @@ func TestExtentRecoveryRejectsCorruptionAndUnknownMode(t *testing.T) {
 	if err := syncer.SyncThrough(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	segments, _, _, _ := syncManifest.Snapshot()
+	segments, _, _ := syncManifest.Snapshot()
 	key := extentObjectKey(segments[0].ExtentHead)
 	r, err := bucket.Get(ctx, key)
 	if err != nil {
@@ -562,13 +551,17 @@ func TestExtentRecoveryRejectsCorruptionAndUnknownMode(t *testing.T) {
 		t.Fatalf("expected extent integrity error, got %v", err)
 	}
 
-	unknown := &Manifest{Version: 2, Generation: 1, StorageMode: "future", TipSlot: 1}
-	unknownData, err := json.Marshal(unknown)
+	versioned := struct {
+		Version    int    `json:"version"`
+		Generation uint64 `json:"generation"`
+		TipSlot    uint64 `json:"tip_slot"`
+	}{Version: 2, Generation: 1, TipSlot: 1}
+	unknownData, err := json.Marshal(versioned)
 	if err != nil {
 		t.Fatal(err)
 	}
 	unknownHash := sha256.Sum256(unknownData)
-	unknownKey := fmt.Sprintf("qlog/manifests/%020d_%x.json", unknown.Generation, unknownHash)
+	unknownKey := fmt.Sprintf("qlog/manifests/%020d_%x.json", versioned.Generation, unknownHash)
 	unknownBucket := objstore.NewInMemBucket()
 	if err := unknownBucket.Upload(ctx, unknownKey, bytes.NewReader(unknownData)); err != nil {
 		t.Fatal(err)
@@ -578,8 +571,8 @@ func TestExtentRecoveryRejectsCorruptionAndUnknownMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unknownWAL.Close()
-	if _, err := NewRecovery(unknownWAL, NewManifest(), unknownBucket, "").Recover(ctx); err == nil || !strings.Contains(err.Error(), "unsupported QLog storage mode") {
-		t.Fatalf("expected storage-mode error, got %v", err)
+	if _, err := NewRecovery(unknownWAL, NewManifest(), unknownBucket, "").Recover(ctx); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("expected numbered manifest rejection, got %v", err)
 	}
 }
 
@@ -587,7 +580,7 @@ func TestManifestGenerationForkFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
 	for _, tip := range []uint64{1, 2} {
-		manifest := &Manifest{Version: 2, Generation: 7, StorageMode: StorageModeExtentChainV1, TipSlot: tip}
+		manifest := &Manifest{Generation: 7, TipSlot: tip}
 		data, err := json.Marshal(manifest)
 		if err != nil {
 			t.Fatal(err)
@@ -627,14 +620,14 @@ func TestBackgroundSyncCompactsLongExtentChain(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	before, _, _, _ := manifest.Snapshot()
+	before, _, _ := manifest.Snapshot()
 	if before[0].ExtentCount <= maxExtentChain {
 		t.Fatalf("extent chain did not grow: %d", before[0].ExtentCount)
 	}
 	if err := syncer.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	after, _, _, _ := manifest.Snapshot()
+	after, _, _ := manifest.Snapshot()
 	if after[0].ExtentCount >= before[0].ExtentCount {
 		t.Fatalf("extent chain was not compacted: before=%d after=%d", before[0].ExtentCount, after[0].ExtentCount)
 	}

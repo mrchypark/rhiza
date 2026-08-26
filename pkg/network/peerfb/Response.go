@@ -7,7 +7,7 @@ import (
 )
 
 type ResponseT struct {
-	Version uint16 `json:"version"`
+	Magic uint32 `json:"magic"`
 	Error string `json:"error"`
 	Summary *SummaryT `json:"summary"`
 	Decided *DecidedValueT `json:"decided"`
@@ -56,7 +56,7 @@ func (t *ResponseT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 		valueOffset = builder.CreateByteString(t.Value)
 	}
 	ResponseStart(builder)
-	ResponseAddVersion(builder, t.Version)
+	ResponseAddMagic(builder, t.Magic)
 	ResponseAddError(builder, errorOffset)
 	ResponseAddSummary(builder, summaryOffset)
 	ResponseAddDecided(builder, decidedOffset)
@@ -71,7 +71,7 @@ func (t *ResponseT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 }
 
 func (rcv *Response) UnPackTo(t *ResponseT) {
-	t.Version = rcv.Version()
+	t.Magic = rcv.Magic()
 	t.Error = string(rcv.Error())
 	t.Summary = rcv.Summary(nil).UnPack()
 	t.Decided = rcv.Decided(nil).UnPack()
@@ -134,16 +134,16 @@ func (rcv *Response) Table() flatbuffers.Table {
 	return rcv._tab
 }
 
-func (rcv *Response) Version() uint16 {
+func (rcv *Response) Magic() uint32 {
 	o := flatbuffers.UOffsetT(rcv._tab.Offset(4))
 	if o != 0 {
-		return rcv._tab.GetUint16(o + rcv._tab.Pos)
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
 	}
-	return 2
+	return 0
 }
 
-func (rcv *Response) MutateVersion(n uint16) bool {
-	return rcv._tab.MutateUint16Slot(4, n)
+func (rcv *Response) MutateMagic(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(4, n)
 }
 
 func (rcv *Response) Error() []byte {
@@ -289,8 +289,8 @@ func (rcv *Response) MutateValue(j int, n byte) bool {
 func ResponseStart(builder *flatbuffers.Builder) {
 	builder.StartObject(11)
 }
-func ResponseAddVersion(builder *flatbuffers.Builder, version uint16) {
-	builder.PrependUint16Slot(0, version, 2)
+func ResponseAddMagic(builder *flatbuffers.Builder, magic uint32) {
+	builder.PrependUint32Slot(0, magic, 0)
 }
 func ResponseAddError(builder *flatbuffers.Builder, error flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(1, flatbuffers.UOffsetT(error), 0)

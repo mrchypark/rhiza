@@ -285,7 +285,7 @@ func peerPublicKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token strin
 
 func peerPrivateKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) ed25519.PrivateKey {
 	mac := hmac.New(sha256.New, []byte(token))
-	mac.Write([]byte("rhiza-peer-certificate-v1\x00"))
+	mac.Write([]byte("rhiza-peer-certificate\x00"))
 	mac.Write([]byte(clusterID))
 	mac.Write([]byte{0})
 	mac.Write([]byte(nodeID))

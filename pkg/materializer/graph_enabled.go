@@ -376,7 +376,7 @@ func (m *Materializer) graphHealth() error {
 	return nil
 }
 
-const graphSnapshotMagic = "RHIZA-GORAPHDB-SNAPSHOT-1\n"
+const graphSnapshotMagic = "RHIZA-GORAPHDB-SNAPSHOT\n"
 
 const (
 	maxGraphSnapshotFiles     = 65536

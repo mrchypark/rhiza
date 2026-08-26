@@ -20,13 +20,13 @@ func TestGraphServer(t *testing.T) {
 	}
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	adaID, graceID := "ada-"+suffix, "grace-"+suffix
-	postGraph(t, graphURL, "/v1/graph/execute", map[string]any{
+	postGraph(t, graphURL, "/graph/execute", map[string]any{
 		"request_id": "knows-" + suffix,
 		"cypher":     `CREATE (:Person {id: $from, name: "Ada"})-[:Knows {since: $since}]->(:Person {id: $to, name: "Grace"})`,
 		"args":       map[string]any{"from": adaID, "to": graceID, "since": 2026},
 	}, nil)
 	var result queryResponse
-	postGraph(t, graphURL, "/v1/graph/query", map[string]any{
+	postGraph(t, graphURL, "/graph/query", map[string]any{
 		"cypher":      `MATCH (:Person {id: $id})-[:Knows]->(friend:Person) RETURN friend.name`,
 		"args":        map[string]any{"id": adaID},
 		"consistency": "linearizable",
@@ -34,15 +34,15 @@ func TestGraphServer(t *testing.T) {
 	if len(result.Rows) != 1 || result.Rows[0][0] != "Grace" {
 		t.Fatalf("unexpected traversal: %+v", result)
 	}
-	postGraph(t, graphURL, "/v1/kv/put", map[string]any{"request_id": "kv-" + suffix, "key": "graph-" + suffix, "value": []byte("ok")}, nil)
+	postGraph(t, graphURL, "/kv/put", map[string]any{"request_id": "kv-" + suffix, "key": "graph-" + suffix, "value": []byte("ok")}, nil)
 }
 
 func BenchmarkGraphQueryLocal(b *testing.B) {
-	benchmarkGraphRequests(b, []byte(`{"cypher":"MATCH (n) RETURN n LIMIT 1","consistency":"local"}`), "/v1/graph/query")
+	benchmarkGraphRequests(b, []byte(`{"cypher":"MATCH (n) RETURN n LIMIT 1","consistency":"local"}`), "/graph/query")
 }
 
 func BenchmarkGraphQueryLinearizable(b *testing.B) {
-	benchmarkGraphRequests(b, []byte(`{"cypher":"MATCH (n) RETURN n LIMIT 1","consistency":"linearizable"}`), "/v1/graph/query")
+	benchmarkGraphRequests(b, []byte(`{"cypher":"MATCH (n) RETURN n LIMIT 1","consistency":"linearizable"}`), "/graph/query")
 }
 
 func BenchmarkGraphCreate(b *testing.B) {
@@ -52,7 +52,7 @@ func BenchmarkGraphCreate(b *testing.B) {
 	}
 	prefix := time.Now().UnixNano()
 	var requestID atomic.Uint64
-	benchmarkDynamicRequestsAt(b, target, "/v1/graph/execute", func() []byte {
+	benchmarkDynamicRequestsAt(b, target, "/graph/execute", func() []byte {
 		id := requestID.Add(1)
 		return []byte(fmt.Sprintf(`{"request_id":"graph-%d-%d","cypher":"CREATE (:BenchmarkNode {id: $id})","args":{"id":"%d-%d"}}`, prefix, id, prefix, id))
 	})

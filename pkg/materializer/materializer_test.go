@@ -446,17 +446,17 @@ func TestValidateTipRejectsRecoveredDecisionConflict(t *testing.T) {
 	}
 }
 
-func TestMaterializerRejectsLegacyDatabaseWithoutAppliedSlot(t *testing.T) {
-	dbPath := t.TempDir() + "/legacy.db"
+func TestMaterializerRejectsUnmanagedDatabaseWithoutAppliedSlot(t *testing.T) {
+	dbPath := t.TempDir() + "/unmanaged.db"
 	db, err := sql.Open("sqlite3", "file:"+dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("CREATE TABLE legacy (id INTEGER)"); err != nil {
+	if _, err := db.Exec("CREATE TABLE unmanaged (id INTEGER)"); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
 	if _, err := Open(dbPath, 1); err == nil {
-		t.Fatal("expected legacy database rejection")
+		t.Fatal("expected unmanaged database rejection")
 	}
 }

@@ -494,7 +494,7 @@ func TestCompactionPrunesAllocatorAndRejectsClosedSlots(t *testing.T) {
 	}
 }
 
-func TestRecorderCapPreservesLegacyRecovery(t *testing.T) {
+func TestRecorderCapRejectsOversizedValue(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -505,10 +505,6 @@ func TestRecorderCapPreservesLegacyRecovery(t *testing.T) {
 	request := RecordRequest{Slot: 1, Step: 4, Proposal: proposal}
 	if _, err := core.Record(context.Background(), request); err == nil {
 		t.Fatal("new oversized recorder value was accepted")
-	}
-	core.recorders[1] = ISR{Step: 4, FirstCurrent: cloneProposal(&proposal), AggregateCurrent: cloneProposal(&proposal)}
-	if _, err := core.Record(context.Background(), request); err != nil {
-		t.Fatalf("legacy recorder recovery was blocked: %v", err)
 	}
 }
 
@@ -667,35 +663,6 @@ func TestRecorderDurablyPromotesLearnedHintBeforeReply(t *testing.T) {
 	}
 }
 
-func TestCoreAcceptLearned(t *testing.T) {
-	dir := t.TempDir()
-	wal, err := qlog.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer wal.Close()
-	core := newCore("node-2", &Cluster{Members: []Member{{ID: "node-2"}}}, wal, &mockTransport{})
-	value := []byte("CREATE TABLE learned (id INT)")
-	hash := sha256.Sum256(value)
-	if err := core.AcceptLearned(1, value, hash); err != nil {
-		t.Fatal(err)
-	}
-	if !core.IsDecided(1) || core.Tip() != 1 {
-		t.Fatalf("learned slot not recorded: tip=%d", core.Tip())
-	}
-	hash[0]++
-	if err := core.AcceptLearned(8, value, hash); err == nil {
-		t.Fatal("expected hash mismatch")
-	}
-	decisions, tip, err := core.DecisionsFrom(1, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if tip != 1 || len(decisions) != 1 || decisions[0].Slot != 1 || string(decisions[0].Value) != string(value) {
-		t.Fatalf("unexpected decisions: tip=%d values=%+v", tip, decisions)
-	}
-}
-
 func TestDecisionsFromStopsAtGap(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -704,8 +671,9 @@ func TestDecisionsFromStopsAtGap(t *testing.T) {
 	defer wal.Close()
 	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}}}, wal, &mockTransport{})
 	value := []byte("SELECT 2")
-	hash := sha256.Sum256(value)
-	if err := core.AcceptLearned(2, value, hash); err != nil {
+	proposal := newProposal(highestPriority, "node-1", value)
+	decision := Decision{Slot: 2, Step: 4, Proposal: proposal, Summaries: []Summary{{RecorderID: "node-1", Step: 4, FirstCurrent: cloneProposal(&proposal)}}}
+	if err := core.AcceptDecision(decision); err != nil {
 		t.Fatal(err)
 	}
 	decisions, tip, err := core.DecisionsFrom(1, 10)

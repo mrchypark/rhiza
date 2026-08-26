@@ -3,7 +3,6 @@ package quepaxa
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 
 	flatbuffers "github.com/google/flatbuffers/go"
@@ -32,22 +31,18 @@ func encodeRecorderEntry(slot Slot, state ISR) []byte {
 	walfb.RecorderStateAddAggregatePrior(builder, prior)
 	offset := walfb.RecorderStateEnd(builder)
 	walfb.FinishRecorderStateBuffer(builder, offset)
-	payload := make([]byte, len(isrEntryMagicV2)+len(builder.FinishedBytes()))
-	copy(payload, isrEntryMagicV2)
-	copy(payload[len(isrEntryMagicV2):], builder.FinishedBytes())
+	payload := make([]byte, len(isrEntryMagic)+len(builder.FinishedBytes()))
+	copy(payload, isrEntryMagic)
+	copy(payload[len(isrEntryMagic):], builder.FinishedBytes())
 	return payload
 }
 
 func decodeRecorderEntry(payload []byte) (persisted recorderEntry, err error) {
-	if bytes.HasPrefix(payload, isrEntryMagicV1) {
-		err = json.Unmarshal(payload[len(isrEntryMagicV1):], &persisted)
-		return persisted, err
-	}
-	if !bytes.HasPrefix(payload, isrEntryMagicV2) {
+	if !bytes.HasPrefix(payload, isrEntryMagic) {
 		return persisted, fmt.Errorf("unknown recorder WAL format")
 	}
 
-	data := payload[len(isrEntryMagicV2):]
+	data := payload[len(isrEntryMagic):]
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("invalid FlatBuffers recorder WAL: %v", recovered)

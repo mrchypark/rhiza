@@ -9,10 +9,13 @@ import (
 
 var entryCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
-const entryV2LengthFlag uint32 = 1 << 31
+const (
+	entryLengthMarker uint32 = 3 << 30
+	entryLengthMask   uint32 = ^entryLengthMarker
+)
 
 func entryPayloadLength(encoded uint32) (uint32, bool) {
-	return encoded &^ entryV2LengthFlag, encoded&entryV2LengthFlag != 0
+	return encoded & entryLengthMask, encoded&entryLengthMarker == entryLengthMarker
 }
 
 // EntryType is the type of QLog entry.
@@ -50,10 +53,9 @@ func (e Entry) Encode() []byte {
 	buf = append(buf, byte(e.Type))
 
 	// Payload length
-	buf = binary.LittleEndian.AppendUint32(buf, uint32(payloadLen)|entryV2LengthFlag)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(payloadLen)|entryLengthMarker)
 
-	// V2 entries cover both metadata and payload. The explicit length flag lets
-	// recovery distinguish them from legacy header-only IEEE records.
+	// The marker rejects bytes written by any other WAL layout.
 	buf = binary.LittleEndian.AppendUint32(buf, 0)
 
 	// Payload
@@ -76,7 +78,10 @@ func DecodeEntry(data []byte) (Entry, int, error) {
 	}
 	copy(entry.Hash[:], data[8:40])
 
-	payloadLen, v2 := entryPayloadLength(binary.LittleEndian.Uint32(data[41:45]))
+	payloadLen, current := entryPayloadLength(binary.LittleEndian.Uint32(data[41:45]))
+	if !current {
+		return Entry{}, 0, fmt.Errorf("unknown WAL entry format")
+	}
 	storedCRC := binary.LittleEndian.Uint32(data[45:49])
 
 	totalLen := 49 + int(payloadLen)
@@ -84,10 +89,7 @@ func DecodeEntry(data []byte) (Entry, int, error) {
 		return Entry{}, 0, io.ErrUnexpectedEOF
 	}
 
-	actualCRC := crc32.ChecksumIEEE(data[:45])
-	if v2 {
-		actualCRC = crc32.Update(crc32.Checksum(data[:45], entryCRCTable), entryCRCTable, data[49:totalLen])
-	}
+	actualCRC := crc32.Update(crc32.Checksum(data[:45], entryCRCTable), entryCRCTable, data[49:totalLen])
 	if storedCRC != actualCRC {
 		return Entry{}, 0, fmt.Errorf("CRC mismatch: stored=%08x actual=%08x", storedCRC, actualCRC)
 	}

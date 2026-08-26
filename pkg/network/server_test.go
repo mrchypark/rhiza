@@ -144,7 +144,7 @@ func TestHTTPAdapterDoesNotExposePeerRPC(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}}
 	server := NewServer(mustCore(t, "n1", members, nil, nil), nil, "cluster", true, nil, members, 0)
 	response := httptest.NewRecorder()
-	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/internal/decisions?from=1", nil))
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/internal/decisions?from=1", nil))
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404", response.Code)
 	}
@@ -214,7 +214,7 @@ func TestLinearizableQueryUsesReadIndexWithoutConsumingSlots(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil, members, 0)
 	body := []byte(`{"sql":"SELECT COUNT(*) FROM barrier_read","consistency":"linearizable"}`)
 	res := httptest.NewRecorder()
-	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/sql/query", bytes.NewReader(body)))
+	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/sql/query", bytes.NewReader(body)))
 	if res.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
 	}
@@ -222,13 +222,13 @@ func TestLinearizableQueryUsesReadIndexWithoutConsumingSlots(t *testing.T) {
 		t.Fatalf("material tip=%d, want write at 1", material.Tip())
 	}
 	res = httptest.NewRecorder()
-	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/sql/query", bytes.NewReader(body)))
+	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/sql/query", bytes.NewReader(body)))
 	if res.Code != http.StatusOK || material.Tip() != 1 {
 		t.Fatalf("second read consumed a consensus slot: status=%d tip=%d", res.Code, material.Tip())
 	}
 
 	res = httptest.NewRecorder()
-	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/sql/query", bytes.NewReader([]byte(`{"sql":"SELECT 1","consistency":"eventual"}`))))
+	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/sql/query", bytes.NewReader([]byte(`{"sql":"SELECT 1","consistency":"eventual"}`))))
 	if res.Code != http.StatusBadRequest {
 		t.Fatalf("invalid consistency status=%d, want 400", res.Code)
 	}
@@ -252,7 +252,7 @@ func TestLinearizableQueryFailsClosedWithoutQuorum(t *testing.T) {
 	for consistency, want := range map[string]int{"local": http.StatusOK, "linearizable": http.StatusServiceUnavailable} {
 		body := []byte(`{"sql":"SELECT 1","consistency":"` + consistency + `"}`)
 		res := httptest.NewRecorder()
-		server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/v1/sql/query", bytes.NewReader(body)))
+		server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/sql/query", bytes.NewReader(body)))
 		if res.Code != want {
 			t.Fatalf("%s read status=%d, want %d: %s", consistency, res.Code, want, res.Body.String())
 		}
@@ -370,33 +370,33 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 		return res
 	}
 
-	res := request("/v1/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["bound"],"want_rows":true}]}`)
+	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["bound"],"want_rows":true}]}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"bound"`)) {
 		t.Fatalf("SQL status=%d body=%s", res.Code, res.Body.String())
 	}
-	res = request("/v1/sql/query", `{"sql":"SELECT name FROM api WHERE id = ?","args":[1],"consistency":"local"}`)
+	res = request("/sql/query", `{"sql":"SELECT name FROM api WHERE id = ?","args":[1],"consistency":"local"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"bound"`)) {
 		t.Fatalf("query status=%d body=%s", res.Code, res.Body.String())
 	}
 
-	res = request("/v1/kv/put", `{"request_id":"kv-1","key":"key","value":"dmFsdWU="}`)
+	res = request("/kv/put", `{"request_id":"kv-1","key":"key","value":"dmFsdWU="}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("put status=%d body=%s", res.Code, res.Body.String())
 	}
-	res = request("/v1/kv/get", `{"key":"key","consistency":"linearizable"}`)
+	res = request("/kv/get", `{"key":"key","consistency":"linearizable"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"dmFsdWU="`)) {
 		t.Fatalf("get status=%d body=%s", res.Code, res.Body.String())
 	}
-	res = request("/v1/kv/cas", `{"request_id":"kv-2","key":"key","expected":"dmFsdWU=","expected_exists":true,"value":"bmV3"}`)
+	res = request("/kv/cas", `{"request_id":"kv-2","key":"key","expected":"dmFsdWU=","expected_exists":true,"value":"bmV3"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"applied":true`)) {
 		t.Fatalf("cas status=%d body=%s", res.Code, res.Body.String())
 	}
-	res = request("/v1/kv/put", `{"request_id":"kv-3","key":"short","value":"eA==","ttl_ms":1}`)
+	res = request("/kv/put", `{"request_id":"kv-3","key":"short","value":"eA==","ttl_ms":1}`)
 	if res.Code != http.StatusOK {
 		t.Fatalf("TTL put status=%d body=%s", res.Code, res.Body.String())
 	}
 	time.Sleep(2 * time.Millisecond)
-	res = request("/v1/kv/get", `{"key":"short"}`)
+	res = request("/kv/get", `{"key":"short"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"found":false`)) {
 		t.Fatalf("TTL get status=%d body=%s", res.Code, res.Body.String())
 	}

@@ -7,7 +7,7 @@ import (
 )
 
 type RequestT struct {
-	Version uint16 `json:"version"`
+	Magic uint32 `json:"magic"`
 	Operation Operation `json:"operation"`
 	ClusterId string `json:"cluster_id"`
 	SenderId string `json:"sender_id"`
@@ -48,7 +48,7 @@ func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 		hashOffset = builder.CreateByteString(t.Hash)
 	}
 	RequestStart(builder)
-	RequestAddVersion(builder, t.Version)
+	RequestAddMagic(builder, t.Magic)
 	RequestAddOperation(builder, t.Operation)
 	RequestAddClusterId(builder, clusterIdOffset)
 	RequestAddSenderId(builder, senderIdOffset)
@@ -64,7 +64,7 @@ func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 }
 
 func (rcv *Request) UnPackTo(t *RequestT) {
-	t.Version = rcv.Version()
+	t.Magic = rcv.Magic()
 	t.Operation = rcv.Operation()
 	t.ClusterId = string(rcv.ClusterId())
 	t.SenderId = string(rcv.SenderId())
@@ -134,16 +134,16 @@ func (rcv *Request) Table() flatbuffers.Table {
 	return rcv._tab
 }
 
-func (rcv *Request) Version() uint16 {
+func (rcv *Request) Magic() uint32 {
 	o := flatbuffers.UOffsetT(rcv._tab.Offset(4))
 	if o != 0 {
-		return rcv._tab.GetUint16(o + rcv._tab.Pos)
+		return rcv._tab.GetUint32(o + rcv._tab.Pos)
 	}
-	return 2
+	return 0
 }
 
-func (rcv *Request) MutateVersion(n uint16) bool {
-	return rcv._tab.MutateUint16Slot(4, n)
+func (rcv *Request) MutateMagic(n uint32) bool {
+	return rcv._tab.MutateUint32Slot(4, n)
 }
 
 func (rcv *Request) Operation() Operation {
@@ -315,8 +315,8 @@ func (rcv *Request) MutateHash(j int, n byte) bool {
 func RequestStart(builder *flatbuffers.Builder) {
 	builder.StartObject(12)
 }
-func RequestAddVersion(builder *flatbuffers.Builder, version uint16) {
-	builder.PrependUint16Slot(0, version, 2)
+func RequestAddMagic(builder *flatbuffers.Builder, magic uint32) {
+	builder.PrependUint32Slot(0, magic, 0)
 }
 func RequestAddOperation(builder *flatbuffers.Builder, operation Operation) {
 	builder.PrependByteSlot(1, byte(operation), 0)

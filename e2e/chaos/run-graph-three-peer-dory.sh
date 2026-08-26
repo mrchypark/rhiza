@@ -48,13 +48,13 @@ wait_for_pod() {
     sleep 0.5
   done
 }
-post "$node1/v1/graph/execute" "{\"request_id\":\"seed-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'before', value: 'fault'})\"}"
+post "$node1/graph/execute" "{\"request_id\":\"seed-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'before', value: 'fault'})\"}"
 
 dory k8s apply -f "$script_dir/graph-one-peer-failure.yaml"
 dory k8s wait podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --for=condition=AllInjected=True --timeout=60s
 write_seconds="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_total}' -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"during-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'during', value: 'fault'})\"}" \
-  "$node1/v1/graph/execute")"
+  "$node1/graph/execute")"
 dory k8s wait podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=180s
 dory k8s delete pod rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
 wait_for_pod rhiza-graph-2
@@ -69,7 +69,7 @@ while true; do
   sleep 0.5
   if result="$(curl -fsS --max-time 5 -H 'Content-Type: application/json' -d \
     "{\"cypher\":\"MATCH (n:${label}) RETURN n.id\",\"consistency\":\"local\"}" \
-    "$node2/v1/graph/query" 2>/dev/null)" && [[ "$result" == *during* ]]; then
+    "$node2/graph/query" 2>/dev/null)" && [[ "$result" == *during* ]]; then
     break
   fi
   kill "${pf_pids[2]}" 2>/dev/null || true
@@ -97,7 +97,7 @@ deadline=$((SECONDS + 15))
 while [[ "$status" == 000 ]]; do
   status="$(curl -sS --max-time 6 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d \
     "{\"request_id\":\"no-quorum-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'rejected', value: 'fault'})\"}" \
-    "$node1/v1/graph/execute" 2>/dev/null || true)"
+    "$node1/graph/execute" 2>/dev/null || true)"
   (( SECONDS < deadline )) || break
   [[ "$status" != 000 ]] || sleep 0.25
 done
@@ -116,7 +116,7 @@ until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   sleep 0.5
 done
 deadline=$((SECONDS + 30))
-until post "$node1/v1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'after', value: 'fault'})\"}" 2>/dev/null; do
+until post "$node1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'after', value: 'fault'})\"}" 2>/dev/null; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.25
 done
@@ -140,7 +140,7 @@ done
 deadline=$((SECONDS + 90))
 until result="$(curl -fsS --max-time 10 -H 'Content-Type: application/json' -d \
   "{\"cypher\":\"MATCH (n:${label}) RETURN n.id\",\"consistency\":\"linearizable\"}" \
-  "$node0/v1/graph/query" 2>/dev/null)" && [[ "$result" == *before* && "$result" == *during* && "$result" == *after* && "$result" != *rejected* ]]; do
+  "$node0/graph/query" 2>/dev/null)" && [[ "$result" == *before* && "$result" == *during* && "$result" == *after* && "$result" != *rejected* ]]; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done

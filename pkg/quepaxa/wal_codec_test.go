@@ -30,9 +30,9 @@ func TestRecorderEntryFlatBufferRoundTrip(t *testing.T) {
 func TestRecorderEntryRejectsCorruptFlatBuffer(t *testing.T) {
 	proposal := newProposal(Priority{1}, "n1", []byte("value"))
 	payload := encodeRecorderEntry(1, ISR{Step: 4, FirstCurrent: &proposal})
-	for _, corrupt := range [][]byte{payload[:len(isrEntryMagicV2)+4], append([]byte(nil), payload...)} {
+	for _, corrupt := range [][]byte{payload[:len(isrEntryMagic)+4], append([]byte(nil), payload...)} {
 		if len(corrupt) == len(payload) {
-			corrupt[len(isrEntryMagicV2)+4] ^= 0xff
+			corrupt[len(isrEntryMagic)+4] ^= 0xff
 		}
 		if _, err := decodeRecorderEntry(corrupt); err == nil {
 			t.Fatalf("accepted corrupt payload of length %d", len(corrupt))
@@ -40,20 +40,16 @@ func TestRecorderEntryRejectsCorruptFlatBuffer(t *testing.T) {
 	}
 }
 
-func TestRecorderEntryReadsLegacyJSON(t *testing.T) {
-	proposal := newProposal(Priority{1}, "n1", []byte("legacy"))
+func TestRecorderEntryRejectsNumberedJSONFormat(t *testing.T) {
+	proposal := newProposal(Priority{1}, "n1", []byte("old"))
 	want := recorderEntry{Slot: 7, State: ISR{Step: 5, AggregateCurrent: &proposal}}
 	jsonPayload, err := json.Marshal(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := append(append([]byte(nil), isrEntryMagicV1...), jsonPayload...)
-	got, err := decodeRecorderEntry(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("legacy round trip mismatch: got %#v want %#v", got, want)
+	payload := append([]byte("QISR1\x00"), jsonPayload...)
+	if _, err := decodeRecorderEntry(payload); err == nil {
+		t.Fatal("accepted numbered recorder WAL format")
 	}
 }
 

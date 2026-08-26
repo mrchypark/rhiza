@@ -54,14 +54,14 @@ All mutations require a unique `request_id` and are idempotent. JSON request
 bodies are limited to 1 MiB. SQL is limited to 256 KiB, 999 arguments, 64
 statements per transaction, and 10,000 returned rows.
 
-- `POST /v1/sql/execute`: one statement, arguments, and optional returned rows.
-- `POST /v1/sql/transaction`: an atomic `statements` array.
-- `POST /v1/sql/query`: arguments plus `local` or `linearizable` consistency.
-- `POST /v1/graph/execute`: one idempotent Cypher mutation with named arguments.
-- `POST /v1/graph/query`: read-only Cypher with `local` or `linearizable` consistency.
-- `POST /v1/kv/put`, `/get`, `/delete`, `/cas`: binary values, TTL, and CAS.
-- `POST /v1/notify/publish`: replicated notification publication.
-- `GET /v1/notify/subscribe?topic=...`: bounded, live, at-most-once SSE stream.
+- `POST /sql/execute`: one statement, arguments, and optional returned rows.
+- `POST /sql/transaction`: an atomic `statements` array.
+- `POST /sql/query`: arguments plus `local` or `linearizable` consistency.
+- `POST /graph/execute`: one idempotent Cypher mutation with named arguments.
+- `POST /graph/query`: read-only Cypher with `local` or `linearizable` consistency.
+- `POST /kv/put`, `/get`, `/delete`, `/cas`: binary values, TTL, and CAS.
+- `POST /notify/publish`: replicated notification publication.
+- `GET /notify/subscribe?topic=...`: bounded, live, at-most-once SSE stream.
 
 Replicated SQL rejects explicit transaction control, attachment, and known
 nondeterministic functions. Multi-statement client transactions use the
@@ -77,7 +77,7 @@ because the prepared `statements` array covers the same database features.
 ## Peer transport
 
 Peer consensus and catch-up traffic uses raw QUIC over UDP 9090 with a private
-`rhiza-peer/1` ALPN and FlatBuffers messages. Each RPC uses an independent
+`rhiza-peer` ALPN and FlatBuffers messages. Each RPC uses an independent
 bidirectional QUIC stream on a reused connection. Frames are capped at 1 MiB;
 connections use TLS 1.3, keepalive, bounded stream counts, five-second RPC
 deadlines, and reconnect after transport failure.

@@ -38,17 +38,17 @@ func TestSQLServer(t *testing.T) {
 
 	table := fmt.Sprintf("e2e_%d", time.Now().UnixNano())
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
-	post(t, "/v1/sql/execute", map[string]string{
+	post(t, "/sql/execute", map[string]string{
 		"request_id": "schema-" + suffix,
 		"sql":        "CREATE TABLE " + table + " (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
 	}, nil)
-	post(t, "/v1/sql/execute", map[string]string{
+	post(t, "/sql/execute", map[string]string{
 		"request_id": "insert-" + suffix,
 		"sql":        "INSERT INTO " + table + " (id, name) VALUES (1, 'Ada')",
 	}, nil)
 
 	var got queryResponse
-	post(t, "/v1/sql/query", map[string]string{
+	post(t, "/sql/query", map[string]string{
 		"sql": "SELECT id, name FROM " + table,
 	}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != float64(1) || got.Rows[0][1] != "Ada" {
@@ -58,20 +58,20 @@ func TestSQLServer(t *testing.T) {
 	var transaction struct {
 		Success bool `json:"success"`
 	}
-	post(t, "/v1/sql/transaction", map[string]any{
+	post(t, "/sql/transaction", map[string]any{
 		"request_id": "transaction-" + suffix,
 		"statements": []map[string]any{{"sql": "INSERT INTO " + table + " (id, name) VALUES (?, ?) RETURNING id", "args": []any{2, "Grace"}, "want_rows": true}},
 	}, &transaction)
 	if !transaction.Success {
 		t.Fatal("transaction was not committed")
 	}
-	post(t, "/v1/sql/query", map[string]any{"sql": "SELECT name FROM " + table + " WHERE id = ?", "args": []any{2}, "consistency": "linearizable"}, &got)
+	post(t, "/sql/query", map[string]any{"sql": "SELECT name FROM " + table + " WHERE id = ?", "args": []any{2}, "consistency": "linearizable"}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != "Grace" {
 		t.Fatalf("bound query result: %+v", got)
 	}
 
 	ftsTable := "fts_" + suffix
-	post(t, "/v1/sql/transaction", map[string]any{
+	post(t, "/sql/transaction", map[string]any{
 		"request_id": "surface-" + suffix,
 		"statements": []map[string]any{
 			{"sql": "CREATE VIRTUAL TABLE " + ftsTable + " USING fts5(name)"},
@@ -82,26 +82,26 @@ func TestSQLServer(t *testing.T) {
 	if !transaction.Success {
 		t.Fatal("SQLite feature transaction was not committed")
 	}
-	post(t, "/v1/sql/query", map[string]any{"sql": "SELECT name, row_number() OVER (ORDER BY name) FROM " + ftsTable + " WHERE " + ftsTable + " MATCH ?", "args": []any{"Grace"}}, &got)
+	post(t, "/sql/query", map[string]any{"sql": "SELECT name, row_number() OVER (ORDER BY name) FROM " + ftsTable + " WHERE " + ftsTable + " MATCH ?", "args": []any{"Grace"}}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != "Grace" || got.Rows[0][1] != float64(1) {
 		t.Fatalf("SQLite FTS/window result: %+v", got)
 	}
 
 	key := "e2e-" + suffix
-	post(t, "/v1/kv/put", map[string]any{"request_id": "kv-put-" + suffix, "key": key, "value": []byte("value")}, nil)
+	post(t, "/kv/put", map[string]any{"request_id": "kv-put-" + suffix, "key": key, "value": []byte("value")}, nil)
 	var kv struct {
 		Found bool   `json:"found"`
 		Value []byte `json:"value"`
 	}
-	post(t, "/v1/kv/get", map[string]any{"key": key, "consistency": "linearizable"}, &kv)
+	post(t, "/kv/get", map[string]any{"key": key, "consistency": "linearizable"}, &kv)
 	if !kv.Found || string(kv.Value) != "value" {
 		t.Fatalf("KV result: %+v", kv)
 	}
-	post(t, "/v1/kv/cas", map[string]any{"request_id": "kv-cas-" + suffix, "key": key, "expected": []byte("value"), "expected_exists": true, "value": []byte("changed")}, nil)
+	post(t, "/kv/cas", map[string]any{"request_id": "kv-cas-" + suffix, "key": key, "expected": []byte("value"), "expected_exists": true, "value": []byte("changed")}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/notify/subscribe?topic=e2e", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/notify/subscribe?topic=e2e", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,39 +115,39 @@ func TestSQLServer(t *testing.T) {
 		t.Fatalf("notify connection: %q", line)
 	}
 	_, _ = reader.ReadString('\n')
-	post(t, "/v1/notify/publish", map[string]any{"request_id": "notify-" + suffix, "topic": "e2e", "payload": []byte("ready")}, nil)
+	post(t, "/notify/publish", map[string]any{"request_id": "notify-" + suffix, "topic": "e2e", "payload": []byte("ready")}, nil)
 	if line, _ := reader.ReadString('\n'); !strings.Contains(line, "cmVhZHk=") {
 		t.Fatalf("notify event: %q", line)
 	}
 }
 
 func BenchmarkSQLServerQueryLocal(b *testing.B) {
-	benchmarkRequests(b, []byte(`{"sql":"SELECT 1","consistency":"local"}`), "/v1/sql/query")
+	benchmarkRequests(b, []byte(`{"sql":"SELECT 1","consistency":"local"}`), "/sql/query")
 }
 
 func BenchmarkSQLServerQueryLinearizable(b *testing.B) {
-	benchmarkRequests(b, []byte(`{"sql":"SELECT 1","consistency":"linearizable"}`), "/v1/sql/query")
+	benchmarkRequests(b, []byte(`{"sql":"SELECT 1","consistency":"linearizable"}`), "/sql/query")
 }
 
 func BenchmarkSQLServerInsert(b *testing.B) {
 	if baseURL == "" {
 		b.Skip("set RHIZA_E2E_URL to run SQL server benchmarks")
 	}
-	post(b, "/v1/sql/execute", map[string]string{
+	post(b, "/sql/execute", map[string]string{
 		"request_id": "benchmark-schema",
 		"sql":        "CREATE TABLE IF NOT EXISTS benchmark_writes (value INTEGER NOT NULL)",
 	}, nil)
 	var before queryResponse
-	post(b, "/v1/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM benchmark_writes"}, &before)
+	post(b, "/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM benchmark_writes"}, &before)
 	beforeCount := int(before.Rows[0][0].(float64))
 	prefix := time.Now().UnixNano()
 	var requestID atomic.Uint64
-	benchmarkDynamicRequests(b, "/v1/sql/execute", func() []byte {
+	benchmarkDynamicRequests(b, "/sql/execute", func() []byte {
 		return []byte(fmt.Sprintf(`{"request_id":"benchmark-%d-%d","sql":"INSERT INTO benchmark_writes(value) VALUES (1)"}`, prefix, requestID.Add(1)))
 	})
 	b.StopTimer()
 	var after queryResponse
-	post(b, "/v1/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM benchmark_writes"}, &after)
+	post(b, "/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM benchmark_writes"}, &after)
 	if delta := int(after.Rows[0][0].(float64)) - beforeCount; delta != b.N {
 		b.Fatalf("committed rows=%d, requests=%d", delta, b.N)
 	}
@@ -166,9 +166,9 @@ func benchmarkKVGet(b *testing.B, consistency string) {
 		b.Skip("set RHIZA_E2E_URL to run KV benchmarks")
 	}
 	key := fmt.Sprintf("benchmark-kv-%d", time.Now().UnixNano())
-	post(b, "/v1/kv/put", map[string]any{"request_id": "seed-" + key, "key": key, "value": []byte("value")}, nil)
+	post(b, "/kv/put", map[string]any{"request_id": "seed-" + key, "key": key, "value": []byte("value")}, nil)
 	body, _ := json.Marshal(map[string]any{"key": key, "consistency": consistency})
-	benchmarkRequests(b, body, "/v1/kv/get")
+	benchmarkRequests(b, body, "/kv/get")
 }
 
 func BenchmarkKVPut(b *testing.B) {
@@ -177,7 +177,7 @@ func BenchmarkKVPut(b *testing.B) {
 	}
 	prefix := time.Now().UnixNano()
 	var requestID atomic.Uint64
-	benchmarkDynamicRequests(b, "/v1/kv/put", func() []byte {
+	benchmarkDynamicRequests(b, "/kv/put", func() []byte {
 		id := requestID.Add(1)
 		return []byte(fmt.Sprintf(`{"request_id":"kv-%d-%d","key":"kv-%d-%d","value":"dg=="}`, prefix, id, prefix, id))
 	})

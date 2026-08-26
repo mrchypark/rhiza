@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math/rand"
 	"path/filepath"
@@ -162,6 +163,27 @@ func TestCertificateContainsOnlyValueHash(t *testing.T) {
 	configID, decoded, err := decodeCertificate(certificate)
 	if err != nil || configID != 7 || decoded.Proposal.Hash != proposal.Hash || len(decoded.Proposal.Value) != 0 {
 		t.Fatalf("decoded certificate=%+v config=%d err=%v", decoded, configID, err)
+	}
+}
+
+func TestCertificateRejectsNumberedObject(t *testing.T) {
+	proposal := newProposal(highestPriority, "n1", []byte("value"))
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)}}}
+	data, err := encodeCertificate(1, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(data, &object); err != nil {
+		t.Fatal(err)
+	}
+	object["version"] = 2
+	data, err = json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := decodeCertificate(data); err == nil {
+		t.Fatal("accepted numbered certificate")
 	}
 }
 

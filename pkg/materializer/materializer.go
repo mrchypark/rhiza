@@ -783,8 +783,7 @@ func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLC
 	if err == sql.ErrNoRows {
 		return true, nil
 	}
-	legacy := len(command.Args) == 0 && len(command.Statements) == 0 && !command.WantRows && existing == command.SQL
-	return existing == string(encoded) || legacy, err
+	return existing == string(encoded), err
 }
 
 // Query executes a read query.

@@ -92,19 +92,19 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 func (s *Server) routes() {
 	// Client API
 	if materializer.GraphEnabled() {
-		s.mux.HandleFunc("/v1/graph/execute", s.handleGraphExecute)
-		s.mux.HandleFunc("/v1/graph/query", s.handleGraphQuery)
+		s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
+		s.mux.HandleFunc("/graph/query", s.handleGraphQuery)
 	} else {
-		s.mux.HandleFunc("/v1/sql/execute", s.handleExecute)
-		s.mux.HandleFunc("/v1/sql/transaction", s.handleExecute)
-		s.mux.HandleFunc("/v1/sql/query", s.handleQuery)
+		s.mux.HandleFunc("/sql/execute", s.handleExecute)
+		s.mux.HandleFunc("/sql/transaction", s.handleExecute)
+		s.mux.HandleFunc("/sql/query", s.handleQuery)
 	}
-	s.mux.HandleFunc("/v1/kv/put", s.handleKVPut)
-	s.mux.HandleFunc("/v1/kv/get", s.handleKVGet)
-	s.mux.HandleFunc("/v1/kv/delete", s.handleKVDelete)
-	s.mux.HandleFunc("/v1/kv/cas", s.handleKVCAS)
-	s.mux.HandleFunc("/v1/notify/publish", s.handleNotifyPublish)
-	s.mux.HandleFunc("/v1/notify/subscribe", s.handleNotifySubscribe)
+	s.mux.HandleFunc("/kv/put", s.handleKVPut)
+	s.mux.HandleFunc("/kv/get", s.handleKVGet)
+	s.mux.HandleFunc("/kv/delete", s.handleKVDelete)
+	s.mux.HandleFunc("/kv/cas", s.handleKVCAS)
+	s.mux.HandleFunc("/notify/publish", s.handleNotifyPublish)
+	s.mux.HandleFunc("/notify/subscribe", s.handleNotifySubscribe)
 
 	// Health
 	s.mux.HandleFunc("/ready", s.handleReady)

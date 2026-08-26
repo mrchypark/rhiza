@@ -24,7 +24,7 @@ const (
 	maxExtentChain           = 256
 	maxExtentChainEntries    = 1 << 20
 	maxManifestSize          = 64 << 20
-	extentMagic              = "QEXT1"
+	extentMagic              = "QEXT\x00"
 )
 
 type extent struct {
@@ -135,7 +135,7 @@ func (s *ObjStoreSyncer) syncThroughLocked(ctx context.Context, through uint64, 
 	if err != nil {
 		return err
 	}
-	previous, mode, _, _ := s.manifest.Snapshot()
+	previous, _, _ := s.manifest.Snapshot()
 	old := make(map[uint32]SegmentMeta, len(previous))
 	for _, segment := range previous {
 		old[segment.Index] = segment
@@ -146,11 +146,6 @@ func (s *ObjStoreSyncer) syncThroughLocked(ctx context.Context, through uint64, 
 		old = make(map[uint32]SegmentMeta, len(s.validated))
 		for index, segment := range s.validated {
 			old[index] = segment
-		}
-		if len(old) == 0 {
-			mode = ""
-		} else {
-			mode = StorageModeExtentChainV1
 		}
 	}
 	desired := make([]SegmentMeta, 0, len(snapshots))
@@ -166,11 +161,11 @@ func (s *ObjStoreSyncer) syncThroughLocked(ctx context.Context, through uint64, 
 		start, head, count := int64(0), [32]byte{}, uint32(0)
 		if snapshot.Offset > 0 {
 			validated, ok := s.validated[snapshot.Meta.Index]
-			if !exists || !ok || prior != validated || snapshot.Offset != prior.Size || mode != StorageModeExtentChainV1 {
+			if !exists || !ok || prior != validated || snapshot.Offset != prior.Size {
 				return fmt.Errorf("segment %d delta does not extend published WAL", snapshot.Meta.Index)
 			}
 			start, head, count = snapshot.Offset, prior.ExtentHead, prior.ExtentCount
-		} else if exists && mode == StorageModeExtentChainV1 {
+		} else if exists {
 			if prior.Size > int64(len(snapshot.Data)) {
 				return fmt.Errorf("local segment %d does not extend published WAL", prior.Index)
 			}
@@ -293,7 +288,7 @@ func (s *ObjStoreSyncer) saveManifest(ctx context.Context) (string, error) {
 	return key, nil
 }
 
-// LoadManifest loads the highest immutable generation, then falls back to the legacy mutable key.
+// LoadManifest loads the highest immutable generation.
 func (s *ObjStoreSyncer) LoadManifest(ctx context.Context) error {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
@@ -302,9 +297,7 @@ func (s *ObjStoreSyncer) LoadManifest(ctx context.Context) error {
 		return err
 	}
 	s.manifest.mu.Lock()
-	s.manifest.Version = loaded.Version
 	s.manifest.Generation = loaded.Generation
-	s.manifest.StorageMode = loaded.StorageMode
 	s.manifest.Segments = append(s.manifest.Segments[:0], loaded.Segments...)
 	s.manifest.TipSlot = loaded.TipSlot
 	s.manifest.LastSync = loaded.LastSync
@@ -338,12 +331,12 @@ func (s *ObjStoreSyncer) loadLatestManifest(ctx context.Context) (*Manifest, str
 		manifest, err := s.readManifest(ctx, best, true)
 		return manifest, best, err
 	}
-	legacy := s.key("qlog/manifest.json")
-	manifest, err := s.readManifest(ctx, legacy, false)
-	if err != nil && s.bucket.IsObjNotFoundErr(err) {
-		return nil, "", nil
+	if exists, err := s.bucket.Exists(ctx, s.key("qlog/manifest.json")); err != nil {
+		return nil, "", err
+	} else if exists {
+		return nil, "", fmt.Errorf("unsupported object-store QLog layout")
 	}
-	return manifest, legacy, err
+	return nil, "", nil
 }
 
 func (s *ObjStoreSyncer) readManifest(ctx context.Context, key string, verifyKey bool) (*Manifest, error) {
@@ -360,7 +353,7 @@ func (s *ObjStoreSyncer) readManifest(ctx context.Context, key string, verifyKey
 		return nil, fmt.Errorf("object-store manifest exceeds %d bytes", maxManifestSize)
 	}
 	var manifest Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
+	if err := decodeManifestJSON(data, &manifest); err != nil {
 		return nil, err
 	}
 	if verifyKey {
@@ -392,7 +385,7 @@ func (s *ObjStoreSyncer) initializeStateLocked() {
 	if s.stateInitialized {
 		return
 	}
-	_, _, generation, tip := s.manifest.Snapshot()
+	_, generation, tip := s.manifest.Snapshot()
 	s.publishedTip = tip
 	if generation > 0 {
 		s.manifest.mu.RLock()
@@ -401,23 +394,6 @@ func (s *ObjStoreSyncer) initializeStateLocked() {
 		s.currentManifestKey = s.key(fmt.Sprintf("qlog/manifests/%020d_%x.json", generation, sha256.Sum256(data)))
 	}
 	s.stateInitialized = true
-}
-
-// DownloadSegment reads a legacy whole-segment object.
-func (s *ObjStoreSyncer) DownloadSegment(ctx context.Context, seg SegmentMeta) ([]byte, error) {
-	r, err := s.bucket.Get(ctx, s.key(segmentObjectKey(seg)))
-	if err != nil && s.bucket.IsObjNotFoundErr(err) {
-		r, err = s.bucket.Get(ctx, s.key(fmt.Sprintf("qlog/segments/seg_%03d.log", seg.Index)))
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-
-func segmentObjectKey(seg SegmentMeta) string {
-	return fmt.Sprintf("qlog/segments/seg_%03d_%x.log", seg.Index, seg.Hash)
 }
 
 func (s *ObjStoreSyncer) downloadExtent(ctx context.Context, hash [32]byte) (extent, error) {
@@ -509,20 +485,13 @@ func (s *ObjStoreSyncer) garbageCollect(ctx context.Context, cutoff time.Time) e
 		return err
 	}
 	referenced := map[string]struct{}{currentKey: {}}
-	if current.StorageMode == StorageModeExtentChainV1 {
-		for _, segment := range current.Segments {
-			keys, err := s.extentChainKeys(ctx, segment)
-			if err != nil {
-				return err
-			}
-			for _, key := range keys {
-				referenced[key] = struct{}{}
-			}
+	for _, segment := range current.Segments {
+		keys, err := s.extentChainKeys(ctx, segment)
+		if err != nil {
+			return err
 		}
-	} else {
-		for _, segment := range current.Segments {
-			referenced[s.key(segmentObjectKey(segment))] = struct{}{}
-			referenced[s.key(fmt.Sprintf("qlog/segments/seg_%03d.log", segment.Index))] = struct{}{}
+		for _, key := range keys {
+			referenced[key] = struct{}{}
 		}
 	}
 	marks := make(map[string]struct{})

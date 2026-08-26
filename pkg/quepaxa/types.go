@@ -8,9 +8,9 @@ import (
 	"fmt"
 )
 
-var leaderScheduleMagic = []byte("QLDR1\x00")
-var readBarrierMagic = []byte("QRDB1\x00")
-var checkpointSealMagic = []byte("QCKP2\x00")
+var leaderScheduleMagic = []byte("QLDR\x00")
+var readBarrierMagic = []byte("QRDB\x00")
+var checkpointSealMagic = []byte("QCKP\x00")
 
 const (
 	ReadBarrierNonceSize    = 16
@@ -30,7 +30,7 @@ type ValueHash [32]byte
 
 func AdvancePrefixHash(previous [32]byte, slot Slot, value ValueHash) [32]byte {
 	hash := sha256.New()
-	hash.Write([]byte("rhiza/decision-prefix/v1\x00"))
+	hash.Write([]byte("rhiza/decision-prefix\x00"))
 	hash.Write(previous[:])
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], uint64(slot))

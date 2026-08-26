@@ -9,10 +9,10 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-var sqlBatchMagic = []byte("QBAT1\x00")
-var kvCommandMagic = []byte("QKVC1\x00")
-var notifyCommandMagic = []byte("QNTF1\x00")
-var graphCommandMagic = []byte("QGRF1\x00")
+var sqlBatchMagic = []byte("QBAT\x00")
+var kvCommandMagic = []byte("QKVC\x00")
+var notifyCommandMagic = []byte("QNTF\x00")
+var graphCommandMagic = []byte("QGRF\x00")
 
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
 const MaxRequestIDBytes = 256

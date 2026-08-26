@@ -1,11 +1,11 @@
 package quepaxa
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 )
-
-const certificateVersion = 2
 
 type proposalRef struct {
 	Priority   Priority  `json:"priority"`
@@ -20,8 +20,7 @@ type summaryRef struct {
 	AggregatePrior *proposalRef `json:"aggregate_prior,omitempty"`
 }
 
-type certificateV2 struct {
-	Version   int          `json:"version"`
+type certificate struct {
 	ConfigID  uint         `json:"config_id"`
 	Slot      Slot         `json:"slot"`
 	Step      Step         `json:"step"`
@@ -29,7 +28,7 @@ type certificateV2 struct {
 	Summaries []summaryRef `json:"summaries"`
 }
 
-type decisionRecordV2 struct {
+type decisionRecord struct {
 	Value       []byte          `json:"value"`
 	Certificate json.RawMessage `json:"certificate"`
 }
@@ -49,8 +48,8 @@ func proposalFromRef(value *proposalRef) *Proposal {
 }
 
 func encodeCertificate(configID uint, decision Decision) ([]byte, error) {
-	certificate := certificateV2{
-		Version: certificateVersion, ConfigID: configID, Slot: decision.Slot, Step: decision.Step,
+	certificate := certificate{
+		ConfigID: configID, Slot: decision.Slot, Step: decision.Step,
 		Proposal: *ref(&decision.Proposal), Summaries: make([]summaryRef, len(decision.Summaries)),
 	}
 	for i, summary := range decision.Summaries {
@@ -66,12 +65,9 @@ func decodeCertificate(data []byte) (uint, Decision, error) {
 	if len(data) == 0 {
 		return 0, Decision{}, fmt.Errorf("decision has no QuePaxa certificate")
 	}
-	var certificate certificateV2
-	if err := json.Unmarshal(data, &certificate); err != nil {
+	var certificate certificate
+	if err := decodeStrictJSON(data, &certificate); err != nil {
 		return 0, Decision{}, fmt.Errorf("decode QuePaxa certificate: %w", err)
-	}
-	if certificate.Version != certificateVersion {
-		return 0, Decision{}, fmt.Errorf("unsupported QuePaxa certificate version %d", certificate.Version)
 	}
 	decision := Decision{
 		Slot: certificate.Slot, Step: certificate.Step, Proposal: *proposalFromRef(&certificate.Proposal),
@@ -87,16 +83,28 @@ func decodeCertificate(data []byte) (uint, Decision, error) {
 }
 
 func encodeDecisionRecord(value []byte, certificate []byte) ([]byte, error) {
-	return json.Marshal(decisionRecordV2{Value: value, Certificate: certificate})
+	return json.Marshal(decisionRecord{Value: value, Certificate: certificate})
 }
 
 func decodeDecisionRecord(data []byte) ([]byte, []byte, error) {
-	var record decisionRecordV2
-	if err := json.Unmarshal(data, &record); err != nil {
+	var record decisionRecord
+	if err := decodeStrictJSON(data, &record); err != nil {
 		return nil, nil, fmt.Errorf("decode decision WAL record: %w", err)
 	}
 	if len(record.Certificate) == 0 {
 		return nil, nil, fmt.Errorf("decision WAL record has no certificate")
 	}
 	return record.Value, record.Certificate, nil
+}
+
+func decodeStrictJSON(data []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("trailing JSON data")
+	}
+	return nil
 }

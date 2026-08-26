@@ -36,10 +36,10 @@ suffix="$(date +%s)"
 table="chaos_e2e_${suffix}"
 curl -fsS -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"chaos-schema-${suffix}\",\"sql\":\"CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value TEXT NOT NULL)\"}" \
-  "$base_url/v1/sql/execute" >/dev/null
+  "$base_url/sql/execute" >/dev/null
 curl -fsS -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"chaos-seed-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (1, 'survived')\"}" \
-  "$base_url/v1/sql/execute" >/dev/null
+  "$base_url/sql/execute" >/dev/null
 
 pod="$(dory k8s get pods -n rhiza-e2e -l app=rhiza-sql -o jsonpath='{.items[0].metadata.name}')"
 restart_before="$(dory k8s get pod "$pod" -n rhiza-e2e -o jsonpath='{.status.containerStatuses[?(@.name=="rhiza-sql")].restartCount}')"
@@ -65,10 +65,10 @@ done
 
 curl -fsS -H 'Content-Type: application/json' -d \
   "{\"request_id\":\"chaos-after-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (2, 'after-recovery')\"}" \
-  "$base_url/v1/sql/execute" >/dev/null
+  "$base_url/sql/execute" >/dev/null
 result="$(curl -fsS -H 'Content-Type: application/json' -d \
   "{\"sql\":\"SELECT value FROM ${table} ORDER BY id\"}" \
-  "$base_url/v1/sql/query")"
+  "$base_url/sql/query")"
 [[ "$result" == *'survived'* ]]
 [[ "$result" == *'after-recovery'* ]]
 

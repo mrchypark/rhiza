@@ -25,6 +25,12 @@ func TestReadRejectsCorruptCheckpoint(t *testing.T) {
 	}
 }
 
+func TestCheckpointRejectsNumberedRoot(t *testing.T) {
+	if err := decodePersistedJSON([]byte(`{"version":3}`), &Checkpoint{}); err == nil {
+		t.Fatal("accepted numbered checkpoint root")
+	}
+}
+
 func TestSharedRootStreamsAndVerifiesWithoutManifest(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()

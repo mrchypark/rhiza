@@ -7,10 +7,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
 
-const consensusBaseVersion = 1
-
 type consensusBase struct {
-	Version         int      `json:"version"`
 	ConfigID        uint     `json:"config_id"`
 	ClosedThrough   Slot     `json:"closed_through"`
 	PrefixHash      [32]byte `json:"prefix_hash"`
@@ -62,7 +59,7 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		return err
 	}
 	base := consensusBase{
-		Version: consensusBaseVersion, ConfigID: c.config.ConfigID, ClosedThrough: through,
+		ConfigID: c.config.ConfigID, ClosedThrough: through,
 		PrefixHash: prefix, RecoveryRoot: recoveryRoot, LeaderEpoch: leaderEpoch(through + 1), NextLeaderOrder: order,
 	}
 	payload, err := json.Marshal(base)
@@ -181,10 +178,10 @@ func (c *Core) pruneSlotAllocatorLocked() {
 
 func decodeConsensusBase(data []byte) (consensusBase, error) {
 	var base consensusBase
-	if err := json.Unmarshal(data, &base); err != nil {
+	if err := decodeStrictJSON(data, &base); err != nil {
 		return consensusBase{}, err
 	}
-	if base.Version != consensusBaseVersion || base.ClosedThrough == 0 || base.PrefixHash == ([32]byte{}) || base.RecoveryRoot == ([32]byte{}) || len(base.NextLeaderOrder) == 0 {
+	if base.ClosedThrough == 0 || base.PrefixHash == ([32]byte{}) || base.RecoveryRoot == ([32]byte{}) || len(base.NextLeaderOrder) == 0 {
 		return consensusBase{}, fmt.Errorf("invalid consensus base")
 	}
 	return base, nil
