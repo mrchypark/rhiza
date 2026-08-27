@@ -807,6 +807,60 @@ func TestRecoveryDefersMissingLeaderScheduleToPeerCatchUp(t *testing.T) {
 	}
 }
 
+func TestDecidedSlotStableAcrossRestartWithDuplicateValue(t *testing.T) {
+	dir := t.TempDir()
+	config := &Cluster{ConfigID: 1, Members: []Member{{ID: "n1"}}}
+	value := []byte("same value at two slots")
+	proposal := newProposal(highestPriority, "n1", value)
+
+	liveWAL, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := newCore("n1", config, liveWAL, nil)
+	live.updateHashIndexLocked(proposal.Hash, 1)
+	live.updateHashIndexLocked(proposal.Hash, 2)
+	if slot := live.byHash[proposal.Hash]; slot != 1 {
+		t.Fatalf("live hash index slot=%d, want 1", slot)
+	}
+	_ = liveWAL.Close()
+
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slot := range []Slot{1, 2} {
+		decision := Decision{Slot: slot, Step: 4, Proposal: proposal, Summaries: []Summary{{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)}}}
+		certificate, err := encodeCertificate(config.ConfigID, decision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := encodeDecisionRecord(value, certificate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := append(append([]byte(nil), decisionEntryMagic...), record...)
+		if err := wal.Append(qlog.Entry{Slot: uint64(slot), Hash: proposal.Hash, Type: qlog.EntryDecide, Payload: payload}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if slot, ok := recovered.DecidedSlot(value); !ok || slot != 1 {
+		t.Fatalf("recovered decided slot=%d ok=%v, want 1", slot, ok)
+	}
+}
+
 func TestClusterDoesNotAckWithoutCommitQuorumAndRecoversRecorderState(t *testing.T) {
 	cores, transport := newTestCluster(t)
 	for id := range cores {

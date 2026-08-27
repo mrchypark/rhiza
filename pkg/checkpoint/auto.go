@@ -13,15 +13,21 @@ import (
 
 // AutoCheckpointer automatically creates checkpoints.
 type AutoCheckpointer struct {
-	manager  *Manager
-	material *materializer.Materializer
-	interval int64 // checkpoint every N slots
-	duration time.Duration
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
-	eligible func() bool
-	publish  func(context.Context, *Checkpoint) error
+	manager    *Manager
+	material   *materializer.Materializer
+	interval   int64 // checkpoint every N slots
+	duration   time.Duration
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	wg         sync.WaitGroup
+	eligible   func() bool
+	publish    func(context.Context, *Checkpoint) error
+	tailBytes  func() int64
+	tailBudget int64
+}
+
+func (a *AutoCheckpointer) ConfigureTail(bytes func() int64, budget int64) {
+	a.tailBytes, a.tailBudget = bytes, budget
 }
 
 func (a *AutoCheckpointer) ConfigurePublication(eligible func() bool, publish func(context.Context, *Checkpoint) error) {
@@ -47,13 +53,18 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		ticker := time.NewTicker(a.duration)
+		period := a.duration
+		if period > time.Minute {
+			period = time.Minute
+		}
+		ticker := time.NewTicker(period)
 		defer ticker.Stop()
 
 		var lastCheckpoint uint64
 		if latest := a.manager.Latest(); latest != nil {
 			lastCheckpoint = latest.Index
 		}
+		lastCheckpointAt := time.Now()
 
 		for {
 			select {
@@ -62,6 +73,11 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 			case <-a.stopCh:
 				return
 			case <-ticker.C:
+				timeDue := time.Since(lastCheckpointAt) >= a.duration
+				tailDue := a.tailBytes != nil && a.tailBudget > 0 && a.tailBytes() >= a.tailBudget
+				if !timeDue && !tailDue {
+					continue
+				}
 				if a.eligible != nil && !a.eligible() {
 					continue
 				}
@@ -88,6 +104,7 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 				}
 
 				lastCheckpoint = appliedTip
+				lastCheckpointAt = time.Now()
 
 			}
 		}
@@ -123,18 +140,17 @@ func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
 	if latest := a.manager.Latest(); latest != nil && latest.Index >= a.material.Tip() {
 		return latest.Index, nil
 	}
-	path, appliedTip, cleanup, err := a.material.SnapshotFileAt(ctx)
+	files, appliedTip, cleanup, err := a.material.CheckpointFilesAt(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer cleanup()
-	file, err := os.Open(path)
-	if err != nil {
-		return 0, err
+	sources := make([]Source, 0, len(files))
+	for _, file := range files {
+		sources = append(sources, Source{Role: string(file.Role), Path: file.Path})
 	}
-	defer file.Close()
 	log.Printf("creating streaming checkpoint at slot %d", appliedTip)
-	root, err := a.manager.CreateReader(ctx, file, appliedTip)
+	root, err := a.manager.CreateFiles(ctx, sources, appliedTip)
 	if err == nil && a.publish != nil {
 		err = a.publish(ctx, root)
 	}

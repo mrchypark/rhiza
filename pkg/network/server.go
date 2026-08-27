@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -22,6 +23,7 @@ var (
 	ErrNotReady              = errors.New("node is not ready")
 	ErrRequestConflict       = errors.New("request ID conflict")
 	ErrInvalidRequest        = errors.New("invalid request")
+	ErrOverloaded            = errors.New("mutation queue overloaded")
 	ErrDurabilityUnavailable = errors.New("object-store durability unavailable")
 	ErrCommitUnknown         = errors.New("commit outcome unknown")
 )
@@ -29,9 +31,10 @@ var (
 // CommitUnknownError means consensus and local apply succeeded, but the
 // configured before-ACK object-store barrier did not.
 type CommitUnknownError struct {
-	Slot      quepaxa.Slot
-	RequestID string
-	Cause     error
+	Slot             quepaxa.Slot
+	RequestID        string
+	RetryThroughSlot uint64
+	Cause            error
 }
 
 func (e *CommitUnknownError) Error() string {
@@ -41,7 +44,7 @@ func (e *CommitUnknownError) Unwrap() []error { return []error{ErrCommitUnknown,
 
 func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 	if errors.Is(err, ErrDurabilityUnavailable) {
-		return &CommitUnknownError{Slot: slot, RequestID: requestID, Cause: err}
+		return &CommitUnknownError{Slot: slot, RequestID: requestID, RetryThroughSlot: uint64(slot) + types.DefaultIdempotencyWindowSlots - 1, Cause: err}
 	}
 	return err
 }
@@ -68,6 +71,7 @@ type Server struct {
 	proposeMu    sync.Mutex
 	inflight     map[[32]byte]*proposalCall
 	objectStats  func() (map[string]uint64, bool)
+	syncLimit    chan struct{}
 }
 
 type proposalCall struct {
@@ -89,6 +93,7 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		members:    append([]quepaxa.Member(nil), members...),
 		hedgeDelay: hedgeDelay,
 		inflight:   make(map[[32]byte]*proposalCall),
+		syncLimit:  make(chan struct{}, 2),
 	}
 	if len(ready) > 0 {
 		s.ready = ready[0]
@@ -187,24 +192,31 @@ type DecisionsResponse struct {
 func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	hash := sha256.Sum256(value)
 	s.proposeMu.Lock()
-	if call := s.inflight[hash]; call != nil {
-		s.proposeMu.Unlock()
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-call.done:
-			return call.slot, call.err
-		}
+	call := s.inflight[hash]
+	if call == nil {
+		call = &proposalCall{done: make(chan struct{})}
+		s.inflight[hash] = call
+		go s.runProposal(hash, call, bytes.Clone(value))
 	}
-	call := &proposalCall{done: make(chan struct{})}
-	s.inflight[hash] = call
 	s.proposeMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-call.done:
+		return call.slot, call.err
+	}
+}
+
+func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	call.slot, call.err = s.proposeHedgedOnce(ctx, value)
+	cancel()
 	s.proposeMu.Lock()
-	delete(s.inflight, hash)
+	if s.inflight[hash] == call {
+		delete(s.inflight, hash)
+	}
 	close(call.done)
 	s.proposeMu.Unlock()
-	return call.slot, call.err
 }
 
 func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
@@ -297,9 +309,32 @@ func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision
 }
 
 func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot) error {
+	select {
+	case s.syncLimit <- struct{}{}:
+		defer func() { <-s.syncLimit }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	backoff := [...]time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
 	for s.core.Tip() < through {
 		from := s.core.Tip() + 1
-		response, err := s.transport.FetchDecisions(ctx, source, from, 256)
+		var response DecisionsResponse
+		var err error
+		for attempt, delay := range backoff {
+			if delay != 0 {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+			response, err = s.transport.FetchDecisions(pageCtx, source, from, 128)
+			cancel()
+			if err == nil || attempt == len(backoff)-1 {
+				break
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -381,10 +416,7 @@ type ExecuteRequest struct {
 
 // ExecuteResponse is the response body for execute.
 type ExecuteResponse struct {
-	Slot    uint64                 `json:"slot"`
-	Success bool                   `json:"success"`
-	Error   string                 `json:"error,omitempty"`
-	Result  types.SQLCommandResult `json:"result"`
+	types.MutationReceipt
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -430,18 +462,26 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	} else if !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
-	slot, err := s.sqlBatcher.submit(ctx, command)
-	if err != nil {
+	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationSQL, req.RequestID); err != nil {
 		return ExecuteResponse{}, err
+	} else if found {
+		return ExecuteResponse{MutationReceipt: receipt}, nil
 	}
-	result, err := s.material.RequestResult(ctx, req.RequestID)
+	_, err := s.sqlBatcher.submit(ctx, command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
 	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
-	return ExecuteResponse{Slot: uint64(slot), Success: result.Error == "", Error: result.Error, Result: result}, nil
+	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationSQL, req.RequestID)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	if !found {
+		return ExecuteResponse{}, fmt.Errorf("SQL mutation receipt is unavailable")
+	}
+	return ExecuteResponse{MutationReceipt: receipt}, nil
 }
 
 // QueryRequest is the request body for query.
@@ -502,28 +542,28 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrRequestConflict):
 		status = http.StatusConflict
-	case errors.Is(err, ErrNotReady), errors.Is(err, ErrDurabilityUnavailable), errors.Is(err, ErrCommitUnknown), errors.Is(err, quepaxa.ErrQuorumUnavailable):
+	case errors.Is(err, ErrNotReady), errors.Is(err, ErrOverloaded), errors.Is(err, ErrDurabilityUnavailable), errors.Is(err, ErrCommitUnknown), errors.Is(err, quepaxa.ErrQuorumUnavailable):
 		status = http.StatusServiceUnavailable
 	}
 	var unknown *CommitUnknownError
 	if errors.As(err, &unknown) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]any{"code": "commit_unknown", "request_id": unknown.RequestID, "slot": unknown.Slot})
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "commit_unknown", "request_id": unknown.RequestID, "slot": unknown.Slot, "retry_through_slot": unknown.RetryThroughSlot})
 		return
 	}
 	http.Error(w, err.Error(), status)
 }
 
 type RequestStatusRequest struct {
+	Kind      string `json:"kind"`
 	RequestID string `json:"request_id"`
-	Slot      uint64 `json:"slot"`
 }
 
 type RequestStatusResponse struct {
-	State string `json:"state"`
-	Slot  uint64 `json:"slot"`
-	Tip   uint64 `json:"tip"`
+	State   string                 `json:"state"`
+	Tip     uint64                 `json:"tip"`
+	Receipt *types.MutationReceipt `json:"receipt,omitempty"`
 }
 
 func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
@@ -546,22 +586,44 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (RequestStatusResponse, error) {
-	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Slot == 0 {
+	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes {
+		return RequestStatusResponse{}, ErrInvalidRequest
+	}
+	kind, ok := mutationKind(req.Kind)
+	if !ok {
 		return RequestStatusResponse{}, ErrInvalidRequest
 	}
 	tip := s.material.Tip()
-	if tip < req.Slot {
-		return RequestStatusResponse{State: "pending", Slot: req.Slot, Tip: tip}, nil
+	var receipt types.MutationReceipt
+	var found bool
+	var err error
+	if kind == types.MutationGraph {
+		receipt, found, err = s.material.GraphMutationReceipt(ctx, req.RequestID)
+	} else {
+		receipt, found, err = s.material.MutationReceipt(ctx, kind, req.RequestID)
 	}
-	committed, err := s.material.RequestCommitted(ctx, req.RequestID)
 	if err != nil {
 		return RequestStatusResponse{}, err
 	}
-	state := "absent"
-	if committed {
-		state = "committed"
+	if !found {
+		return RequestStatusResponse{State: "unknown_or_expired", Tip: tip}, nil
 	}
-	return RequestStatusResponse{State: state, Slot: req.Slot, Tip: tip}, nil
+	return RequestStatusResponse{State: string(receipt.Status), Tip: tip, Receipt: &receipt}, nil
+}
+
+func mutationKind(kind string) (types.MutationKind, bool) {
+	switch kind {
+	case "sql":
+		return types.MutationSQL, true
+	case "kv":
+		return types.MutationKV, true
+	case "notify":
+		return types.MutationNotify, true
+	case "graph":
+		return types.MutationGraph, true
+	default:
+		return 0, false
+	}
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any) error {
@@ -596,8 +658,7 @@ type KVMutationRequest struct {
 	TTLMS          int64  `json:"ttl_ms,omitempty"`
 }
 type KVMutationResponse struct {
-	Slot    uint64 `json:"slot"`
-	Applied bool   `json:"applied"`
+	types.MutationReceipt
 }
 
 func (s *Server) handleKVGet(w http.ResponseWriter, r *http.Request) {
@@ -678,20 +739,21 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		return KVMutationResponse{}, ErrInvalidRequest
 	}
 	intent := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
-	command, result, found, err := s.material.KVRequest(ctx, req.RequestID)
-	if err != nil {
+	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
 		return KVMutationResponse{}, err
-	}
-	if found && !types.KVRequestMatches(command, intent) {
+	} else if !matches {
 		return KVMutationResponse{}, ErrRequestConflict
 	}
-	if !found {
-		now := time.Now().UnixMilli()
-		command = intent
-		command.ObservedAtUnixMS = now
-		if req.TTLMS > 0 {
-			command.ExpiresAtUnixMS = now + req.TTLMS
-		}
+	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID); err != nil {
+		return KVMutationResponse{}, err
+	} else if found {
+		return KVMutationResponse{MutationReceipt: receipt}, nil
+	}
+	command := intent
+	now := time.Now().UnixMilli()
+	command.ObservedAtUnixMS = now
+	if req.TTLMS > 0 {
+		command.ExpiresAtUnixMS = now + req.TTLMS
 	}
 	value, err := types.EncodeKVCommand(command)
 	if err != nil {
@@ -710,16 +772,17 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if err != nil {
 		return KVMutationResponse{}, commitUnknown(slot, req.RequestID, err)
 	}
-	if !found {
-		result, err = s.material.KVRequestResult(ctx, req.RequestID)
-		if err != nil {
-			return KVMutationResponse{}, err
-		}
-	}
 	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil || !matches {
 		return KVMutationResponse{}, ErrRequestConflict
 	}
-	return KVMutationResponse{Slot: uint64(slot), Applied: result.Applied}, nil
+	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID)
+	if err != nil {
+		return KVMutationResponse{}, err
+	}
+	if !found {
+		return KVMutationResponse{}, fmt.Errorf("KV mutation receipt is unavailable")
+	}
+	return KVMutationResponse{MutationReceipt: receipt}, nil
 }
 
 var errConsistency = errors.New("consistency must be local or linearizable")
@@ -757,33 +820,38 @@ func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	slot, err := s.NotifyPublish(r.Context(), req)
+	receipt, err := s.NotifyPublish(r.Context(), req)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]uint64{"slot": slot})
+	json.NewEncoder(w).Encode(receipt)
 }
 
-func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (uint64, error) {
+func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (types.MutationReceipt, error) {
 	if !s.writable || !s.ready() {
-		return 0, ErrNotReady
+		return types.MutationReceipt{}, ErrNotReady
 	}
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
-		return 0, ErrInvalidRequest
+		return types.MutationReceipt{}, ErrInvalidRequest
 	}
 	if matches, err := s.material.NotifyRequestMatches(ctx, req); err != nil {
-		return 0, err
+		return types.MutationReceipt{}, err
 	} else if !matches {
-		return 0, ErrRequestConflict
+		return types.MutationReceipt{}, ErrRequestConflict
+	}
+	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationNotify, req.RequestID); err != nil {
+		return types.MutationReceipt{}, err
+	} else if found {
+		return receipt, nil
 	}
 	value, err := types.EncodeNotifyCommand(req)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return types.MutationReceipt{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	if len(value) > quepaxa.MaxReplicatedValueBytes {
-		return 0, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
+		return types.MutationReceipt{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	slot, err := s.proposeHedged(ctx, value)
 	if err == nil {
@@ -799,7 +867,17 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ui
 			err = ErrRequestConflict
 		}
 	}
-	return uint64(slot), commitUnknown(slot, req.RequestID, err)
+	if err != nil {
+		return types.MutationReceipt{}, commitUnknown(slot, req.RequestID, err)
+	}
+	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationNotify, req.RequestID)
+	if err != nil {
+		return types.MutationReceipt{}, err
+	}
+	if !found {
+		return types.MutationReceipt{}, fmt.Errorf("notification receipt is unavailable")
+	}
+	return receipt, nil
 }
 
 func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {

@@ -2,14 +2,45 @@ package node
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestOperationSyncPeerPermutationIsDeterministicAndBalanced(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	first, ok := syncSource("n1", members, 0)
+	if !ok {
+		t.Fatal("no sync peer")
+	}
+	second, _ := syncSource("n1", members, 1)
+	again, _ := syncSource("n1", members, 0)
+	if first != again || first == second || first == "n1" || second == "n1" {
+		t.Fatalf("sources=%s,%s again=%s", first, second, again)
+	}
+	for round := uint64(0); round < 32; round++ {
+		delay := syncInterval("n1", round)
+		if delay < 900*time.Millisecond || delay > 1100*time.Millisecond {
+			t.Fatalf("round %d delay=%v", round, delay)
+		}
+	}
+}
+
+func TestTransientCatchUpFailureKeepsReadyNodeServing(t *testing.T) {
+	n := &Node{}
+	n.ready.Store(true)
+	n.observeCatchUp(errors.New("temporary peer timeout"))
+	if !n.ready.Load() {
+		t.Fatal("transient catch-up failure cleared readiness")
+	}
+}
 
 func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 	for name, configure := range map[string]func(*types.ExecutionConfig){

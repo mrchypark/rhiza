@@ -3,17 +3,13 @@
 package materializer
 
 import (
-	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/mrchypark/rhiza/internal/types"
@@ -33,22 +29,38 @@ func graphArgs(args map[string]any) (map[string]any, error) {
 }
 
 var graphTipKey = []byte("rhiza/applied_slot")
+var graphJournalKey = []byte("rhiza/recovery_journal")
 
 type graphState struct {
-	db  *graphdb.DB
-	mu  sync.Mutex
-	tip uint64
+	db                *graphdb.DB
+	mu                sync.Mutex
+	tip               uint64
+	idempotencyWindow uint64
 }
 
+type graphFileSnapshot = graphdb.FileSnapshot
+
+func (m *Materializer) beginGraphFileSnapshot() (*graphFileSnapshot, error) {
+	m.graph.mu.Lock()
+	defer m.graph.mu.Unlock()
+	return m.graph.db.BeginFileSnapshot()
+}
+func (m *Materializer) graphTip() uint64 { return m.graph.tip }
+
 type graphRequest struct {
-	Hash   string                   `json:"hash"`
-	Result types.GraphCommandResult `json:"result"`
+	Fingerprint [32]byte
+	Receipt     types.MutationReceipt
+}
+
+type graphJournalEntry struct {
+	Slot uint64
+	Hash [32]byte
 }
 
 func BuildProfile() types.Profile { return types.ProfileGraph }
 func GraphEnabled() bool          { return true }
 
-func openGraph(path string, sqliteTip uint64) (*graphState, error) {
+func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, error) {
 	existing := false
 	if entries, err := os.ReadDir(path); err == nil {
 		existing = len(entries) > 0
@@ -67,7 +79,7 @@ func openGraph(path string, sqliteTip uint64) (*graphState, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &graphState{db: db}
+	g := &graphState{db: db, idempotencyWindow: idempotencyWindow}
 	encodedTip, err := db.GetMetadata(graphTipKey)
 	if err != nil {
 		g.close()
@@ -79,7 +91,10 @@ func openGraph(path string, sqliteTip uint64) (*graphState, error) {
 			return nil, fmt.Errorf("existing graph state has no applied slot; rebuild from the decision log")
 		}
 		if err := db.UpdateAtomic(context.Background(), func(tx *graphdb.AtomicTx) error {
-			return tx.PutMetadata(graphTipKey, encodeGraphTip(0))
+			if err := tx.PutMetadata(graphTipKey, encodeGraphTip(0)); err != nil {
+				return err
+			}
+			return tx.PutMetadata(graphJournalKey, nil)
 		}); err != nil {
 			g.close()
 			return nil, err
@@ -91,11 +106,65 @@ func openGraph(path string, sqliteTip uint64) (*graphState, error) {
 			return nil, err
 		}
 	}
+	encodedJournal, err := db.GetMetadata(graphJournalKey)
+	if err != nil {
+		g.close()
+		return nil, err
+	}
+	journal, err := decodeGraphJournal(encodedJournal)
+	if err != nil {
+		g.close()
+		return nil, err
+	}
 	if g.tip < sqliteTip {
 		g.close()
 		return nil, fmt.Errorf("graph applied slot %d is behind SQLite slot %d; rebuild from the decision log", g.tip, sqliteTip)
 	}
+	journal = pendingGraphJournal(journal, sqliteTip)
+	if g.tip > sqliteTip && (len(journal) != int(g.tip-sqliteTip) || journal[0].Slot != sqliteTip+1 || journal[len(journal)-1].Slot != g.tip) {
+		g.close()
+		return nil, fmt.Errorf("graph recovery journal does not cover SQLite gap %d..%d", sqliteTip+1, g.tip)
+	}
+	if err := db.UpdateAtomic(context.Background(), func(tx *graphdb.AtomicTx) error {
+		return tx.PutMetadata(graphJournalKey, encodeGraphJournal(journal))
+	}); err != nil {
+		g.close()
+		return nil, err
+	}
 	return g, nil
+}
+
+func encodeGraphJournal(entries []graphJournalEntry) []byte {
+	data := make([]byte, len(entries)*40)
+	for i, entry := range entries {
+		offset := i * 40
+		binary.BigEndian.PutUint64(data[offset:offset+8], entry.Slot)
+		copy(data[offset+8:offset+40], entry.Hash[:])
+	}
+	return data
+}
+
+func decodeGraphJournal(data []byte) ([]graphJournalEntry, error) {
+	if len(data)%40 != 0 {
+		return nil, fmt.Errorf("invalid graph recovery journal")
+	}
+	entries := make([]graphJournalEntry, len(data)/40)
+	for i := range entries {
+		offset := i * 40
+		entries[i].Slot = binary.BigEndian.Uint64(data[offset : offset+8])
+		copy(entries[i].Hash[:], data[offset+8:offset+40])
+		if entries[i].Slot == 0 || i > 0 && entries[i-1].Slot+1 != entries[i].Slot {
+			return nil, fmt.Errorf("invalid graph recovery journal")
+		}
+	}
+	return entries, nil
+}
+
+func pendingGraphJournal(entries []graphJournalEntry, through uint64) []graphJournalEntry {
+	for len(entries) > 0 && entries[0].Slot <= through {
+		entries = entries[1:]
+	}
+	return entries
 }
 
 func encodeGraphTip(tip uint64) []byte {
@@ -111,7 +180,14 @@ func decodeGraphTip(data []byte) (uint64, error) {
 	return binary.BigEndian.Uint64(data), nil
 }
 
-func graphRequestKey(id string) []byte { return []byte("rhiza/request/" + id) }
+func graphRequestKey(id string) []byte { return []byte("rhiza/idem/by-id/" + id) }
+
+func graphSlotKey(slot uint64) []byte {
+	key := make([]byte, len("rhiza/idem/by-slot/")+8)
+	copy(key, "rhiza/idem/by-slot/")
+	binary.BigEndian.PutUint64(key[len("rhiza/idem/by-slot/"):], slot)
+	return key
+}
 
 func (g *graphState) close() {
 	if g == nil {
@@ -132,8 +208,25 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	valueHash := sha256.Sum256(value)
 	if slot <= g.tip {
-		return nil
+		encoded, err := g.db.GetMetadata(graphJournalKey)
+		if err != nil {
+			return err
+		}
+		journal, err := decodeGraphJournal(encoded)
+		if err != nil {
+			return err
+		}
+		for _, entry := range journal {
+			if entry.Slot == slot {
+				if entry.Hash != valueHash {
+					return fmt.Errorf("graph applied slot %d hash conflict", slot)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("graph applied slot %d is missing from recovery journal", slot)
 	}
 	if slot != g.tip+1 {
 		return fmt.Errorf("graph apply slot gap: have %d, got %d", g.tip, slot)
@@ -151,7 +244,7 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 		if !known {
 			return fmt.Errorf("unrecognized command is not supported by the graph-kv build")
 		}
-		if err := g.advanceTip(ctx, slot); err != nil {
+		if err := g.advanceTip(ctx, slot, valueHash); err != nil {
 			return err
 		}
 		g.tip = slot
@@ -160,13 +253,12 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 
 	for i, command := range commands {
 		advance := i == len(commands)-1
-		result, hash, err := prepareGraphCommand(command)
+		fingerprint, err := prepareGraphCommand(command)
 		if err == nil {
-			err = g.applyCommand(ctx, slot, command, hash, &result, advance)
+			err = g.applyCommand(ctx, slot, valueHash, command, fingerprint, advance)
 		}
 		if err != nil {
-			result = types.GraphCommandResult{Error: err.Error()}
-			if recordErr := g.recordFailure(ctx, slot, command, hash, result, advance); recordErr != nil {
+			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance); recordErr != nil {
 				return recordErr
 			}
 		}
@@ -175,25 +267,20 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	return nil
 }
 
-func prepareGraphCommand(command types.GraphCommand) (types.GraphCommandResult, string, error) {
+func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 	if err := ValidateGraphCommand(command); err != nil {
-		return types.GraphCommandResult{}, "", err
+		return [32]byte{}, err
 	}
-	encoded, err := json.Marshal(command)
-	if err != nil {
-		return types.GraphCommandResult{}, "", err
-	}
-	hash := sha256.Sum256(encoded)
-	return types.GraphCommandResult{}, hex.EncodeToString(hash[:]), nil
+	return types.GraphFingerprint(command)
 }
 
-func (g *graphState) advanceTip(ctx context.Context, slot uint64) error {
+func (g *graphState) advanceTip(ctx context.Context, slot uint64, valueHash [32]byte) error {
 	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
-		return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+		return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
 	})
 }
 
-func (g *graphState) applyCommand(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result *types.GraphCommandResult, advance bool) error {
+func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool) error {
 	args, err := graphArgs(command.Args)
 	if err != nil {
 		return err
@@ -204,38 +291,36 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, command type
 			return err
 		}
 		if found {
-			if existing.Hash != hash {
+			if existing.Fingerprint != fingerprint {
 				return fmt.Errorf("request_id was already used for a different graph command")
 			}
-			*result = existing.Result
 			if advance {
-				return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+				return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
 			}
 			return nil
 		}
-		queryResult, err := tx.CypherWithParams(ctx, command.Cypher, args)
+		_, err = tx.CypherWithParams(ctx, command.Cypher, args)
 		if err != nil {
 			return err
 		}
-		*result = collectGoraphRows(queryResult)
-		if err := putRequest(tx, command.RequestID, graphRequest{Hash: hash, Result: *result}); err != nil {
+		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true, RetryThroughSlot: slot + g.idempotencyWindow - 1}
+		if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
 			return err
 		}
 		if advance {
-			return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
 		}
 		return nil
 	})
 }
 
-func (g *graphState) recordFailure(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result types.GraphCommandResult, advance bool) error {
-	if hash == "" {
-		encoded, err := json.Marshal(command)
+func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool) error {
+	if fingerprint == ([32]byte{}) {
+		var err error
+		fingerprint, err = types.GraphFingerprint(command)
 		if err != nil {
 			return err
 		}
-		sum := sha256.Sum256(encoded)
-		hash = hex.EncodeToString(sum[:])
 	}
 	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
 		_, found, err := requestInTx(tx, command.RequestID)
@@ -243,23 +328,66 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, command typ
 			return err
 		}
 		if !found && command.RequestID != "" {
-			if err := putRequest(tx, command.RequestID, graphRequest{Hash: hash, Result: result}); err != nil {
+			receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: "execution_failed", RetryThroughSlot: slot + g.idempotencyWindow - 1}
+			if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
 				return err
 			}
 		}
 		if advance {
-			return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
 		}
 		return nil
 	})
 }
 
-func putRequest(tx *graphdb.AtomicTx, id string, request graphRequest) error {
-	encoded, err := json.Marshal(request)
+func advanceGraphMetadata(tx *graphdb.AtomicTx, slot uint64, hash [32]byte, window uint64) error {
+	journal, err := decodeGraphJournal(tx.GetMetadata(graphJournalKey))
 	if err != nil {
 		return err
 	}
-	return tx.PutMetadata(graphRequestKey(id), encoded)
+	if len(journal) != 0 && journal[len(journal)-1].Slot+1 != slot {
+		return fmt.Errorf("graph recovery journal slot gap")
+	}
+	journal = append(journal, graphJournalEntry{Slot: slot, Hash: hash})
+	if err := tx.PutMetadata(graphJournalKey, encodeGraphJournal(journal)); err != nil {
+		return err
+	}
+	if slot >= window {
+		if err := pruneGraphRequests(tx, slot-window); err != nil {
+			return err
+		}
+	}
+	return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+}
+
+func (m *Materializer) confirmGraphThrough(ctx context.Context, through uint64) error {
+	g := m.graph
+	if g == nil || g.db == nil {
+		return fmt.Errorf("GoraphDB is not open")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+		journal, err := decodeGraphJournal(tx.GetMetadata(graphJournalKey))
+		if err != nil {
+			return err
+		}
+		return tx.PutMetadata(graphJournalKey, encodeGraphJournal(pendingGraphJournal(journal, through)))
+	})
+}
+
+func putRequest(tx *graphdb.AtomicTx, id string, request graphRequest) error {
+	if err := tx.PutMetadata(graphRequestKey(id), encodeGraphRequest(request)); err != nil {
+		return err
+	}
+	key := graphSlotKey(request.Receipt.Slot)
+	ids := tx.GetMetadata(key)
+	if len(id) > 255 {
+		return fmt.Errorf("graph request ID exceeds slot index encoding")
+	}
+	ids = append(ids, byte(len(id)))
+	ids = append(ids, id...)
+	return tx.PutMetadata(key, ids)
 }
 
 func requestInTx(tx *graphdb.AtomicTx, id string) (graphRequest, bool, error) {
@@ -271,18 +399,66 @@ func (g *graphState) request(id string) (graphRequest, bool, error) {
 	if err != nil {
 		return graphRequest{}, false, err
 	}
-	return decodeGraphRequest(data)
+	request, found, err := decodeGraphRequest(data)
+	if found {
+		request.Receipt.RetryThroughSlot = request.Receipt.Slot + g.idempotencyWindow - 1
+	}
+	return request, found, err
 }
 
 func decodeGraphRequest(data []byte) (graphRequest, bool, error) {
 	if data == nil {
 		return graphRequest{}, false, nil
 	}
+	if len(data) < 42 {
+		return graphRequest{}, false, fmt.Errorf("invalid graph request record")
+	}
 	var request graphRequest
-	if err := json.Unmarshal(data, &request); err != nil {
-		return graphRequest{}, false, fmt.Errorf("invalid graph request record: %w", err)
+	copy(request.Fingerprint[:], data[:32])
+	request.Receipt.Slot = binary.BigEndian.Uint64(data[32:40])
+	request.Receipt.Applied = data[41]&1 != 0
+	switch data[40] {
+	case 1:
+		request.Receipt.Status = types.MutationCommitted
+	case 2:
+		request.Receipt.Status = types.MutationRejected
+		request.Receipt.ErrorCode = "execution_failed"
+	default:
+		return graphRequest{}, false, fmt.Errorf("invalid graph request status")
 	}
 	return request, true, nil
+}
+
+func encodeGraphRequest(request graphRequest) []byte {
+	data := make([]byte, 42)
+	copy(data, request.Fingerprint[:])
+	binary.BigEndian.PutUint64(data[32:40], request.Receipt.Slot)
+	if request.Receipt.Status == types.MutationRejected {
+		data[40] = 2
+	} else {
+		data[40] = 1
+	}
+	if request.Receipt.Applied {
+		data[41] = 1
+	}
+	return data
+}
+
+func pruneGraphRequests(tx *graphdb.AtomicTx, slot uint64) error {
+	key := graphSlotKey(slot)
+	ids := tx.GetMetadata(key)
+	for len(ids) > 0 {
+		length := int(ids[0])
+		ids = ids[1:]
+		if length == 0 || length > len(ids) {
+			return fmt.Errorf("invalid graph idempotency slot index")
+		}
+		if err := tx.DeleteMetadata(graphRequestKey(string(ids[:length]))); err != nil {
+			return err
+		}
+		ids = ids[length:]
+	}
+	return tx.DeleteMetadata(key)
 }
 
 func knownNonGraphValue(value []byte) (bool, error) {
@@ -325,49 +501,57 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	if err != nil {
 		return types.GraphCommandResult{}, err
 	}
-	response := collectGoraphRows(result)
-	if len(response.Rows) > MaxReturningRows {
-		return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d rows", MaxReturningRows)
+	return collectGoraphRows(result)
+}
+
+func collectGoraphRows(result *graphdb.CypherResult) (types.GraphCommandResult, error) {
+	response := types.GraphCommandResult{Columns: append([]string(nil), result.Columns...)}
+	remaining := MaxResultBytes
+	for _, column := range response.Columns {
+		remaining -= len(column)
+	}
+	for _, source := range result.Rows {
+		if len(response.Rows) == MaxReturningRows {
+			return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d rows", MaxReturningRows)
+		}
+		row := make([]any, len(result.Columns))
+		for i, column := range result.Columns {
+			value := source[column]
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return types.GraphCommandResult{}, err
+			}
+			if len(encoded) > MaxCellBytes {
+				return types.GraphCommandResult{}, fmt.Errorf("graph result cell exceeds %d bytes", MaxCellBytes)
+			}
+			remaining -= len(encoded)
+			if remaining < 0 {
+				return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d bytes", MaxResultBytes)
+			}
+			row[i] = value
+		}
+		response.Rows = append(response.Rows, row)
 	}
 	return response, nil
 }
 
-func collectGoraphRows(result *graphdb.CypherResult) types.GraphCommandResult {
-	response := types.GraphCommandResult{Columns: append([]string(nil), result.Columns...)}
-	for _, source := range result.Rows {
-		row := make([]any, len(result.Columns))
-		for i, column := range result.Columns {
-			row[i] = source[column]
-		}
-		response.Rows = append(response.Rows, row)
-	}
-	return response
-}
-
-func (m *Materializer) GraphRequestResult(_ context.Context, requestID string) (types.GraphCommandResult, error) {
+func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string) (types.MutationReceipt, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	g := m.graph
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	request, found, err := g.request(requestID)
-	if err != nil {
-		return types.GraphCommandResult{}, err
-	}
-	if !found {
-		return types.GraphCommandResult{}, fmt.Errorf("graph request not found")
-	}
-	return request.Result, nil
+	return request.Receipt, found, err
 }
 
 func (m *Materializer) GraphRequestMatches(_ context.Context, command types.GraphCommand) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	encoded, err := json.Marshal(command)
+	fingerprint, err := types.GraphFingerprint(command)
 	if err != nil {
 		return false, err
 	}
-	hash := sha256.Sum256(encoded)
 	g := m.graph
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -375,7 +559,7 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 	if err != nil || !found {
 		return !found, err
 	}
-	return request.Hash == hex.EncodeToString(hash[:]), nil
+	return request.Fingerprint == fingerprint, nil
 }
 
 func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
@@ -399,226 +583,12 @@ func (m *Materializer) graphHealth() error {
 	return nil
 }
 
-const graphSnapshotMagic = "RHIZA-GORAPHDB-SNAPSHOT\n"
-
-const (
-	maxGraphSnapshotFiles     = 65536
-	maxGraphSnapshotExpansion = 128
-	minGraphSnapshotExtracted = 64 << 20
-)
-
-func (m *Materializer) writeSnapshot(sqlitePath string, output io.Writer) error {
-	g := m.graph
-	if g == nil {
-		return fmt.Errorf("GoraphDB is not open")
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.tip != m.tip {
-		return fmt.Errorf("cannot checkpoint mismatched materializers: SQLite=%d GoraphDB=%d", m.tip, g.tip)
-	}
-	if err := g.db.Close(); err != nil {
-		return err
-	}
-	g.db = nil
-	graphPath := filepath.Join(filepath.Dir(m.dbPath), "goraphdb")
-	snapshotErr := encodeGraphSnapshotFile(sqlitePath, graphPath, output)
-	reopened, reopenErr := openGraph(graphPath, m.tip)
-	if reopenErr != nil {
-		if snapshotErr != nil {
-			return fmt.Errorf("snapshot graph: %v; reopen graph: %w", snapshotErr, reopenErr)
-		}
-		return fmt.Errorf("reopen graph after snapshot: %w", reopenErr)
-	}
-	g.db, g.tip = reopened.db, reopened.tip
-	reopened.db = nil
-	return snapshotErr
+func (*Materializer) writeSnapshot(string, io.Writer) error {
+	return fmt.Errorf("graph snapshots require CheckpointFilesAt")
 }
 
-func encodeGraphSnapshotFile(sqlitePath, graphPath string, output io.Writer) error {
-	if _, err := io.WriteString(output, graphSnapshotMagic); err != nil {
-		return err
-	}
-	zw := zip.NewWriter(output)
-	sqliteWriter, err := zw.CreateHeader(&zip.FileHeader{Name: "sqlite.db", Method: zip.Deflate})
-	if err == nil {
-		var file *os.File
-		file, err = os.Open(sqlitePath)
-		if err == nil {
-			_, err = io.Copy(sqliteWriter, file)
-			if closeErr := file.Close(); err == nil {
-				err = closeErr
-			}
-		}
-	}
-	if err == nil {
-		err = writeGraphFiles(zw, graphPath)
-	}
-	if closeErr := zw.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func writeGraphFiles(zw *zip.Writer, graphPath string) error {
-	return filepath.WalkDir(graphPath, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("unsupported GoraphDB snapshot file %s", path)
-		}
-		rel, err := filepath.Rel(graphPath, path)
-		if err != nil {
-			return err
-		}
-		writer, err := zw.CreateHeader(&zip.FileHeader{Name: "goraphdb/" + filepath.ToSlash(rel), Method: zip.Deflate})
-		if err != nil {
-			return err
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(writer, file)
-		closeErr := file.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		return closeErr
-	})
-}
-
-func prepareSnapshotFile(path, dir string) (snapshotParts, error) {
-	archive, err := os.Open(path)
-	if err != nil {
-		return snapshotParts{}, err
-	}
-	defer archive.Close()
-	info, err := archive.Stat()
-	if err != nil {
-		return snapshotParts{}, err
-	}
-	magic := make([]byte, len(graphSnapshotMagic))
-	if _, err := io.ReadFull(archive, magic); err != nil || string(magic) != graphSnapshotMagic {
-		return snapshotParts{}, fmt.Errorf("graph build requires a GoraphDB Graph/KV checkpoint")
-	}
-	archiveSize := info.Size() - int64(len(graphSnapshotMagic))
-	zr, err := zip.NewReader(io.NewSectionReader(archive, int64(len(graphSnapshotMagic)), archiveSize), archiveSize)
-	if err != nil {
-		return snapshotParts{}, fmt.Errorf("open graph checkpoint: %w", err)
-	}
-	maxExtracted := archiveSize * maxGraphSnapshotExpansion
-	if maxExtracted < minGraphSnapshotExtracted {
-		maxExtracted = minGraphSnapshotExtracted
-	}
-	if len(zr.File) > maxGraphSnapshotFiles {
-		return snapshotParts{}, fmt.Errorf("graph checkpoint exceeds entry limit")
-	}
-	var extracted uint64
-	for _, file := range zr.File {
-		if file.FileInfo().IsDir() {
-			continue
-		}
-		if file.UncompressedSize64 > uint64(maxExtracted)-extracted {
-			return snapshotParts{}, fmt.Errorf("graph checkpoint exceeds extraction limits")
-		}
-		extracted += file.UncompressedSize64
-	}
-	root, err := os.MkdirTemp(dir, ".rhiza-graph-restore-*")
-	if err != nil {
-		return snapshotParts{}, err
-	}
-	parts := snapshotParts{sqlitePath: filepath.Join(root, "sqlite.db"), graphDir: filepath.Join(root, "goraphdb"), cleanup: func() { _ = os.RemoveAll(root) }}
-	graphFiles := 0
-	for _, file := range zr.File {
-		name := filepath.ToSlash(filepath.Clean(file.Name))
-		if name == "sqlite.db" {
-			reader, err := file.Open()
-			if err != nil {
-				parts.cleanup()
-				return snapshotParts{}, err
-			}
-			output, openErr := os.OpenFile(parts.sqlitePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-			if openErr != nil {
-				_ = reader.Close()
-				parts.cleanup()
-				return snapshotParts{}, openErr
-			}
-			var copied int64
-			copied, err = io.Copy(output, io.LimitReader(reader, int64(file.UncompressedSize64)+1))
-			closeErr := reader.Close()
-			if err == nil {
-				err = closeErr
-			}
-			if outputErr := output.Close(); err == nil {
-				err = outputErr
-			}
-			if err != nil {
-				parts.cleanup()
-				return snapshotParts{}, err
-			}
-			if uint64(copied) != file.UncompressedSize64 {
-				parts.cleanup()
-				return snapshotParts{}, fmt.Errorf("invalid sqlite checkpoint size")
-			}
-			continue
-		}
-		if file.FileInfo().IsDir() {
-			continue
-		}
-		if !file.Mode().IsRegular() || !strings.HasPrefix(name, "goraphdb/") {
-			parts.cleanup()
-			return snapshotParts{}, fmt.Errorf("invalid graph checkpoint path %q", file.Name)
-		}
-		rel := strings.TrimPrefix(name, "goraphdb/")
-		target := filepath.Join(parts.graphDir, filepath.FromSlash(rel))
-		cleanRel, err := filepath.Rel(parts.graphDir, target)
-		if err != nil || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
-			parts.cleanup()
-			return snapshotParts{}, fmt.Errorf("invalid graph checkpoint path %q", file.Name)
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
-			parts.cleanup()
-			return snapshotParts{}, err
-		}
-		reader, err := file.Open()
-		if err != nil {
-			parts.cleanup()
-			return snapshotParts{}, err
-		}
-		output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err == nil {
-			var copied int64
-			copied, err = io.Copy(output, io.LimitReader(reader, int64(file.UncompressedSize64)+1))
-			if err == nil && uint64(copied) != file.UncompressedSize64 {
-				err = fmt.Errorf("invalid graph checkpoint size for %q", file.Name)
-			}
-		}
-		_ = reader.Close()
-		if output != nil {
-			if closeErr := output.Close(); err == nil {
-				err = closeErr
-			}
-		}
-		if err != nil {
-			parts.cleanup()
-			return snapshotParts{}, err
-		}
-		graphFiles++
-	}
-	if sqliteInfo, err := os.Stat(parts.sqlitePath); err != nil || sqliteInfo.Size() == 0 || graphFiles == 0 {
-		parts.cleanup()
-		return snapshotParts{}, fmt.Errorf("incomplete Graph/KV checkpoint")
-	}
-	return parts, nil
+func prepareSnapshotFile(string, string) (snapshotParts, error) {
+	return snapshotParts{}, fmt.Errorf("graph snapshots require fixed-role files")
 }
 
 func (m *Materializer) validateRestoredSnapshot() error {

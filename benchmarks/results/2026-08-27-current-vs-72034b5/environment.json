@@ -1,0 +1,54 @@
+{
+  "measured_at": "2026-08-27T19:04:44+09:00",
+  "baseline_commit": "72034b5cb8cc6d54194c259b7741a950bc1f7002",
+  "current": {
+    "head": "72034b5cb8cc6d54194c259b7741a950bc1f7002",
+    "implementation_diff_sha256": "970117901042ae62606dadf8018513fe74f156bde0a322e9e189ceeb9b16cd4d",
+    "goraphdb_head": "daa7ce485e6becd9e857a9c51ee70f2e659ee01e",
+    "goraphdb_diff_sha256": "clean"
+  },
+  "runtime": {
+    "go": "go version go1.27.0 darwin/arm64",
+    "goexperiment": "arenas,greenteagc",
+    "os_version": "26.3",
+    "cpu": "Apple M3",
+    "memory_bytes": 25769803776,
+    "kubernetes": "v1.36.2+k3s1"
+  },
+  "images": {
+    "baseline": {
+      "sql": "sha256:4443d0d509d207c216ab47d8c76c1311d44fb2187a738766d71e0598b7f3dfdd",
+      "graph": "sha256:ad46f5e5494cff5616fe7a9f883816a4339eeba6bb9652745dc628c21c010c64"
+    },
+    "current": {
+      "sql": "sha256:619417ab60ca4a75295a0ea2851187aa4f4c66daae3078b4000fa8fe5d327d91",
+      "graph": "sha256:77ffef1388699a731ac8a7c4b3ffa6b793c12ce9d08a9fcd46c97b4533acc543"
+    }
+  },
+  "matrix": {
+    "repetitions": 3,
+    "read_requests_per_run": 1000,
+    "write_requests_per_run": 100,
+    "concurrency": 16,
+    "profiles": [
+      "sql",
+      "graph"
+    ],
+    "durability": [
+      "async",
+      "before-ack"
+    ],
+    "health": [
+      "healthy",
+      "one-fault-current"
+    ],
+    "checkpoint_interval": "0",
+    "async_sync_interval": "1m",
+    "checkpoint_intervals": [
+      "0",
+      "1s-stress"
+    ],
+    "http_records": 288,
+    "summary_rows": 96
+  }
+}

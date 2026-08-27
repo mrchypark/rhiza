@@ -8,6 +8,73 @@ import (
 	"testing"
 )
 
+func TestWALCloseReportsSegmentErrors(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.current.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err == nil {
+		t.Fatal("WAL close discarded segment errors")
+	}
+}
+
+func TestWALUsesPrivatePermissions(t *testing.T) {
+	dir := t.TempDir() + "/qlog"
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	segment := filepath.Join(dir, "seg_001.log")
+	if err := os.WriteFile(segment, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(segment, 0644); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	for path, want := range map[string]os.FileMode{dir: 0700, segment: 0600} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Fatalf("%s permissions=%o, want %o", path, got, want)
+		}
+	}
+}
+
+func TestWALSyncTracksDirtyWrites(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if wal.dirty {
+		t.Fatal("new WAL is dirty")
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	if !wal.dirty {
+		t.Fatal("append did not mark WAL dirty")
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if wal.dirty {
+		t.Fatal("successful sync left WAL dirty")
+	}
+}
+
 func TestEntryEncodeDecode(t *testing.T) {
 	entry := Entry{
 		Slot:    42,

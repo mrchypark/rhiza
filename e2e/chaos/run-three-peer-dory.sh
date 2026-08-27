@@ -8,6 +8,14 @@ two_failures="rhiza-two-peer-failure"
 tmp_dir="$(mktemp -d -t rhiza-3peer.XXXXXX)"
 pf_pids=()
 
+for peer in 0 1 2; do
+  port="$((base_port + peer))"
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null; then
+    echo "local port ${port} is already in use; set RHIZA_E2E_PORT" >&2
+    exit 1
+  fi
+done
+
 cleanup() {
   dory k8s delete podchaos "$one_failure" "$two_failures" -n rhiza-3peer-e2e --ignore-not-found --wait=true >/dev/null
   for pid in "${pf_pids[@]}"; do
@@ -76,6 +84,7 @@ for peer in 1 2; do
 done
 
 dory k8s wait podchaos/"$one_failure" -n rhiza-3peer-e2e --for=condition=AllRecovered=True --timeout=180s
+dory k8s delete podchaos/"$one_failure" -n rhiza-3peer-e2e --wait=true >/dev/null
 deadline=$((SECONDS + 60))
 while true; do
   restart_after="$(dory k8s get pod rhiza-sql-0 -n rhiza-3peer-e2e -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || true)"
@@ -145,6 +154,7 @@ if [[ "$status" != "503" ]]; then
   exit 1
 fi
 dory k8s wait podchaos/"$two_failures" -n rhiza-3peer-e2e --for=condition=AllRecovered=True --timeout=90s
+dory k8s delete podchaos/"$two_failures" -n rhiza-3peer-e2e --wait=true >/dev/null
 dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
 deadline=$((SECONDS + 60))
 until curl -fsS "$node1/ready" >/dev/null 2>&1; do

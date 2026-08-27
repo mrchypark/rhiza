@@ -11,7 +11,7 @@ const (
 	OperationRecord            Operation = 1
 	OperationPropose           Operation = 2
 	OperationLearned           Operation = 3
-	OperationDecisions         Operation = 4
+	OperationSync              Operation = 4
 	OperationReadIndex         Operation = 5
 	OperationStageValue        Operation = 6
 	OperationFetchValue        Operation = 7
@@ -23,7 +23,7 @@ var EnumNamesOperation = map[Operation]string{
 	OperationRecord:            "Record",
 	OperationPropose:           "Propose",
 	OperationLearned:           "Learned",
-	OperationDecisions:         "Decisions",
+	OperationSync:              "Sync",
 	OperationReadIndex:         "ReadIndex",
 	OperationStageValue:        "StageValue",
 	OperationFetchValue:        "FetchValue",
@@ -35,7 +35,7 @@ var EnumValuesOperation = map[string]Operation{
 	"Record":            OperationRecord,
 	"Propose":           OperationPropose,
 	"Learned":           OperationLearned,
-	"Decisions":         OperationDecisions,
+	"Sync":              OperationSync,
 	"ReadIndex":         OperationReadIndex,
 	"StageValue":        OperationStageValue,
 	"FetchValue":        OperationFetchValue,

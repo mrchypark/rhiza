@@ -243,7 +243,7 @@ func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {
 }
 
 func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, from quepaxa.Slot, limit int) (DecisionsResponse, error) {
-	req := t.request(peerfb.OperationDecisions)
+	req := t.request(peerfb.OperationSync)
 	req.From, req.Limit = uint64(from), uint32(limit)
 	response, err := t.call(ctx, source, req, false)
 	if err != nil {

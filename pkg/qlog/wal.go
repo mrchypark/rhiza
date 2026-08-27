@@ -3,6 +3,7 @@ package qlog
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,14 +28,31 @@ type WAL struct {
 	current  *Segment
 	mu       sync.RWMutex
 	maxSize  int64
+	dirty    bool
+}
+
+// Bytes returns the current on-disk segment bytes.
+func (w *WAL) Bytes() int64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	var total int64
+	for _, segment := range w.segments {
+		segment.mu.Lock()
+		total += segment.offset
+		segment.mu.Unlock()
+	}
+	return total
 }
 
 const defaultMaxSize = 64 * 1024 * 1024 // 64MB per segment
 
 // Open opens or creates a WAL in the given directory.
 func Open(dir string) (*WAL, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create WAL dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return nil, fmt.Errorf("secure WAL dir: %w", err)
 	}
 
 	w := &WAL{
@@ -71,8 +89,13 @@ func (w *WAL) loadSegments() error {
 	sort.Slice(paths, func(i, j int) bool { return paths[i].index < paths[j].index })
 
 	for i, item := range paths {
-		f, err := os.OpenFile(item.path, os.O_RDWR, 0644)
+		f, err := os.OpenFile(item.path, os.O_RDWR, 0600)
 		if err != nil {
+			w.closeSegments()
+			return err
+		}
+		if err := f.Chmod(0600); err != nil {
+			f.Close()
 			w.closeSegments()
 			return err
 		}
@@ -122,9 +145,10 @@ func (w *WAL) createSegment(index uint32) error {
 		if err != nil {
 			return err
 		}
+		w.dirty = false
 	}
 	path := filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", index))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -169,6 +193,7 @@ func (w *WAL) Append(entry Entry) error {
 		return io.ErrShortWrite
 	}
 	w.current.offset += int64(n)
+	w.dirty = true
 
 	return nil
 }
@@ -176,15 +201,19 @@ func (w *WAL) Append(entry Entry) error {
 // Sync flushes the current segment. Older segments are immutable and synced
 // before rollover.
 func (w *WAL) Sync() error {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	if w.current == nil {
+	if w.current == nil || !w.dirty {
 		return nil
 	}
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
-	return w.current.file.Sync()
+	if err := w.current.file.Sync(); err != nil {
+		return err
+	}
+	w.dirty = false
+	return nil
 }
 
 // Read reads all entries from all segments.
@@ -310,7 +339,7 @@ func (w *WAL) RestoreSegment(index uint32, data []byte) error {
 	if err := writeSegmentAtomically(path, data); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -325,14 +354,15 @@ func (w *WAL) replaceEmptySegment(seg *Segment, data []byte) error {
 	seg.mu.Lock()
 	defer seg.mu.Unlock()
 	path := filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", seg.index))
-	if err := seg.file.Close(); err != nil {
-		return err
-	}
 	if err := writeSegmentAtomically(path, data); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0600)
 	if err != nil {
+		return err
+	}
+	if err := seg.file.Close(); err != nil {
+		f.Close()
 		return err
 	}
 	seg.file = f
@@ -347,7 +377,7 @@ func writeSegmentAtomically(path string, data []byte) error {
 	}
 	temp := f.Name()
 	defer os.Remove(temp)
-	if err = f.Chmod(0644); err == nil {
+	if err = f.Chmod(0600); err == nil {
 		_, err = f.Write(data)
 	}
 	if err == nil {
@@ -359,7 +389,10 @@ func writeSegmentAtomically(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(temp, path)
+	if err := os.Rename(temp, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
 
 func validateSegmentBytes(data []byte) error {
@@ -437,21 +470,23 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 	if err := syncDir(w.dir); err != nil {
 		return err
 	}
-	old := append([]*Segment(nil), w.segments...)
-	for _, seg := range old {
-		seg.mu.Lock()
-		closeErr := seg.file.Close()
-		seg.mu.Unlock()
-		if closeErr != nil {
-			return closeErr
-		}
-	}
-	file, err := os.OpenFile(target, os.O_RDWR, 0o644)
+	file, err := os.OpenFile(target, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
+	old := append([]*Segment(nil), w.segments...)
 	w.segments = []*Segment{{file: file, index: index, offset: offset}}
 	w.current = w.segments[0]
+	w.dirty = false
+	var closeErr error
+	for _, seg := range old {
+		seg.mu.Lock()
+		closeErr = errors.Join(closeErr, seg.file.Close())
+		seg.mu.Unlock()
+	}
+	if closeErr != nil {
+		return closeErr
+	}
 	for _, seg := range old {
 		if err := os.Remove(filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", seg.index))); err != nil && !os.IsNotExist(err) {
 			return err
@@ -474,11 +509,11 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	var err error
 	for _, seg := range w.segments {
 		seg.mu.Lock()
-		seg.file.Sync()
-		seg.file.Close()
+		err = errors.Join(err, seg.file.Sync(), seg.file.Close())
 		seg.mu.Unlock()
 	}
-	return nil
+	return err
 }

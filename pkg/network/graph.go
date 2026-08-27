@@ -14,10 +14,7 @@ import (
 )
 
 type GraphExecuteResponse struct {
-	Slot    uint64                   `json:"slot"`
-	Success bool                     `json:"success"`
-	Error   string                   `json:"error,omitempty"`
-	Result  types.GraphCommandResult `json:"result"`
+	types.MutationReceipt
 }
 
 type GraphQueryRequest struct {
@@ -60,6 +57,11 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	} else if !matches {
 		return GraphExecuteResponse{}, ErrRequestConflict
 	}
+	if receipt, found, err := s.material.GraphMutationReceipt(ctx, command.RequestID); err != nil {
+		return GraphExecuteResponse{}, err
+	} else if found {
+		return GraphExecuteResponse{MutationReceipt: receipt}, nil
+	}
 	value, err := types.EncodeGraphBatch([]types.GraphCommand{command})
 	if err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
@@ -67,18 +69,21 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if len(value) > quepaxa.MaxReplicatedValueBytes {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	slot, err := s.graphBatcher.submit(ctx, command)
+	_, err = s.graphBatcher.submit(ctx, command)
 	if err != nil {
 		return GraphExecuteResponse{}, err
 	}
-	result, err := s.material.GraphRequestResult(ctx, command.RequestID)
+	receipt, found, err := s.material.GraphMutationReceipt(ctx, command.RequestID)
 	if err != nil {
 		return GraphExecuteResponse{}, err
+	}
+	if !found {
+		return GraphExecuteResponse{}, fmt.Errorf("graph mutation receipt is unavailable")
 	}
 	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil || !matches {
 		return GraphExecuteResponse{}, ErrRequestConflict
 	}
-	return GraphExecuteResponse{Slot: uint64(slot), Success: result.Error == "", Error: result.Error, Result: result}, nil
+	return GraphExecuteResponse{MutationReceipt: receipt}, nil
 }
 
 func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {

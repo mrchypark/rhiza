@@ -7,18 +7,18 @@ import (
 )
 
 type RequestT struct {
-	Magic uint32 `json:"magic"`
-	Operation Operation `json:"operation"`
-	ClusterId string `json:"cluster_id"`
-	SenderId string `json:"sender_id"`
-	ConfigId uint64 `json:"config_id"`
-	Token string `json:"token"`
-	Record *RecordRequestT `json:"record"`
-	Value []byte `json:"value"`
-	Decision *DecisionT `json:"decision"`
-	From uint64 `json:"from"`
-	Limit uint32 `json:"limit"`
-	Hash []byte `json:"hash"`
+	Magic     uint32          `json:"magic"`
+	Operation Operation       `json:"operation"`
+	ClusterId string          `json:"cluster_id"`
+	SenderId  string          `json:"sender_id"`
+	ConfigId  uint64          `json:"config_id"`
+	Token     string          `json:"token"`
+	Record    *RecordRequestT `json:"record"`
+	Value     []byte          `json:"value"`
+	Decision  *DecisionT      `json:"decision"`
+	From      uint64          `json:"from"`
+	Limit     uint32          `json:"limit"`
+	Hash      []byte          `json:"hash"`
 }
 
 func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {

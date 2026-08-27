@@ -4,10 +4,9 @@ package rhiza_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -133,29 +132,17 @@ func objectStoreTip(t *testing.T, dir, cluster, node string) uint64 {
 }
 
 func readObjectStoreTip(dir, cluster, _ string) (uint64, error) {
-	manifestDir := filepath.Join(dir, cluster, "archive", "manifests")
-	entries, err := os.ReadDir(manifestDir)
+	data, err := os.ReadFile(filepath.Join(dir, cluster, "archive", "latest.json"))
 	if err != nil {
 		return 0, err
 	}
-	if len(entries) == 0 {
-		return 0, os.ErrNotExist
+	var head struct {
+		Tip uint64 `json:"tip"`
 	}
-	var tip uint64
-	for _, entry := range entries {
-		parts := strings.Split(strings.TrimSuffix(entry.Name(), ".json"), "_")
-		if len(parts) != 2 {
-			continue
-		}
-		end, err := strconv.ParseUint(parts[0], 10, 64)
-		if err == nil && end > tip {
-			tip = end
-		}
+	if err := json.Unmarshal(data, &head); err != nil {
+		return 0, err
 	}
-	if tip == 0 {
-		return 0, os.ErrNotExist
-	}
-	return tip, nil
+	return head.Tip, nil
 }
 
 func TestEmbeddedObjectStoreRecovery(t *testing.T) {

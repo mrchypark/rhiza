@@ -37,19 +37,20 @@ const (
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
 type Materializer struct {
-	db       *sql.DB
-	writer   *sql.DB
-	readers  []*sql.DB
-	mu       sync.RWMutex
-	tip      uint64
-	stateTip uint64
-	tipHash  [32]byte
-	dbPath   string
-	readersN int
-	graph    *graphState
-	notifyMu sync.Mutex
-	nextSub  uint64
-	subs     map[uint64]notificationSubscription
+	db                *sql.DB
+	writer            *sql.DB
+	readers           []*sql.DB
+	mu                sync.RWMutex
+	tip               uint64
+	stateTip          uint64
+	tipHash           [32]byte
+	dbPath            string
+	readersN          int
+	idempotencyWindow uint64
+	graph             *graphState
+	notifyMu          sync.Mutex
+	nextSub           uint64
+	subs              map[uint64]notificationSubscription
 }
 
 type notificationSubscription struct {
@@ -63,10 +64,29 @@ type snapshotParts struct {
 	cleanup    func()
 }
 
+type CheckpointRole string
+
+const (
+	CheckpointSQLite    CheckpointRole = "sqlite"
+	CheckpointGraphData CheckpointRole = "graph-data"
+)
+
+type CheckpointFile struct {
+	Role CheckpointRole
+	Path string
+}
+
 // Open opens or creates a materializer.
-func Open(dbPath string, readerCount int) (*Materializer, error) {
+func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
 	if readerCount < 1 {
 		return nil, fmt.Errorf("reader count must be positive")
+	}
+	window := uint64(types.DefaultIdempotencyWindowSlots)
+	if len(idempotencyWindow) != 0 {
+		window = idempotencyWindow[0]
+	}
+	if window < 1024 || window > 1_048_576 {
+		return nil, fmt.Errorf("idempotency window must be between 1024 and 1048576 slots")
 	}
 	existing := false
 	if info, err := os.Stat(dbPath); err == nil {
@@ -107,12 +127,13 @@ func Open(dbPath string, readerCount int) (*Materializer, error) {
 	readers := []*sql.DB{reader}
 
 	m := &Materializer{
-		db:       db,
-		writer:   writer,
-		readers:  readers,
-		dbPath:   dbPath,
-		readersN: readerCount,
-		subs:     make(map[uint64]notificationSubscription),
+		db:                db,
+		writer:            writer,
+		readers:           readers,
+		dbPath:            dbPath,
+		readersN:          readerCount,
+		idempotencyWindow: window,
+		subs:              make(map[uint64]notificationSubscription),
 	}
 
 	// Initialize schema
@@ -124,7 +145,7 @@ func Open(dbPath string, readerCount int) (*Materializer, error) {
 		m.Close()
 		return nil, fmt.Errorf("load applied slot: %w", err)
 	}
-	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "goraphdb"), m.tip)
+	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "goraphdb"), m.tip, window)
 	if err != nil {
 		m.Close()
 		return nil, fmt.Errorf("open graph materializer: %w", err)
@@ -231,40 +252,112 @@ func (m *Materializer) initSchema() error {
 			key TEXT PRIMARY KEY,
 			value TEXT
 		);
-		CREATE TABLE IF NOT EXISTS _rhiza_requests (
-				request_id TEXT PRIMARY KEY,
-				sql TEXT NOT NULL,
-				result_json BLOB
-			);
 		CREATE TABLE IF NOT EXISTS _rhiza_kv (
 			key TEXT PRIMARY KEY,
 			value BLOB NOT NULL,
 			expires_at_unix_ms INTEGER NOT NULL DEFAULT 0
 		);
-		CREATE TABLE IF NOT EXISTS _rhiza_kv_requests (
-			request_id TEXT PRIMARY KEY,
-			command_json BLOB NOT NULL,
-			result_json BLOB NOT NULL
-		);
-		CREATE TABLE IF NOT EXISTS _rhiza_notify_requests (
-			request_id TEXT PRIMARY KEY,
-			command_json BLOB
-		);
+		CREATE TABLE IF NOT EXISTS _rhiza_idempotency (
+			kind INTEGER NOT NULL,
+			request_id BLOB NOT NULL,
+			fingerprint BLOB NOT NULL CHECK(length(fingerprint) = 32),
+			commit_slot INTEGER NOT NULL,
+			status TEXT NOT NULL,
+			error_code TEXT NOT NULL,
+			rows_affected INTEGER NOT NULL,
+			last_insert_id INTEGER NOT NULL,
+			applied INTEGER NOT NULL,
+			PRIMARY KEY(kind, request_id)
+		) WITHOUT ROWID;
+		CREATE INDEX IF NOT EXISTS _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot);
 		`)
 	if err != nil {
 		return err
 	}
-	for _, query := range []string{
-		`SELECT result_json FROM _rhiza_requests LIMIT 0`,
-		`SELECT command_json FROM _rhiza_notify_requests LIMIT 0`,
-	} {
-		if rows, err := m.db.Query(query); err != nil {
-			return fmt.Errorf("incompatible materializer schema: %w", err)
-		} else {
-			rows.Close()
-		}
+	var incompatible int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('_rhiza_requests','_rhiza_kv_requests','_rhiza_notify_requests')`).Scan(&incompatible); err != nil {
+		return err
+	}
+	if incompatible != 0 {
+		return fmt.Errorf("incompatible idempotency schema; rebuild from the certified log")
 	}
 	return nil
+}
+
+type storedReceipt struct {
+	fingerprint [32]byte
+	receipt     types.MutationReceipt
+}
+
+func scanReceipt(scanner interface{ Scan(...any) error }, window uint64) (storedReceipt, error) {
+	var record storedReceipt
+	var fingerprint []byte
+	var applied int
+	err := scanner.Scan(&fingerprint, &record.receipt.Slot, &record.receipt.Status, &record.receipt.ErrorCode, &record.receipt.RowsAffected, &record.receipt.LastInsertID, &applied)
+	if err != nil {
+		return storedReceipt{}, err
+	}
+	if len(fingerprint) != sha256.Size {
+		return storedReceipt{}, fmt.Errorf("invalid idempotency fingerprint")
+	}
+	copy(record.fingerprint[:], fingerprint)
+	record.receipt.Applied = applied != 0
+	record.receipt.RetryThroughSlot = record.receipt.Slot + window - 1
+	return record, nil
+}
+
+func receiptQuery() string {
+	return `SELECT fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied FROM _rhiza_idempotency WHERE kind = ? AND request_id = ?`
+}
+
+func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationKind, requestID string) (types.MutationReceipt, bool, error) {
+	record, err := scanReceipt(m.reader().QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+	if err == sql.ErrNoRows {
+		return types.MutationReceipt{}, false, nil
+	}
+	if err != nil {
+		return types.MutationReceipt{}, false, err
+	}
+	if m.Tip() > record.receipt.RetryThroughSlot {
+		return types.MutationReceipt{}, false, nil
+	}
+	return record.receipt, true, nil
+}
+
+func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKind, requestID string, fingerprint [32]byte) (bool, bool, error) {
+	record, err := scanReceipt(m.reader().QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+	if err == sql.ErrNoRows {
+		return true, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if m.Tip() > record.receipt.RetryThroughSlot {
+		return true, false, nil
+	}
+	return record.fingerprint == fingerprint, true, nil
+}
+
+func (m *Materializer) receiptInTx(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string) (storedReceipt, bool, error) {
+	record, err := scanReceipt(tx.QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+	if err == sql.ErrNoRows {
+		return storedReceipt{}, false, nil
+	}
+	return record, err == nil, err
+}
+
+func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+	return err
+}
+
+func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64) error {
+	if tip <= m.idempotencyWindow {
+		return nil
+	}
+	floor := tip - m.idempotencyWindow + 1
+	_, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_idempotency WHERE commit_slot < ?`, floor)
+	return err
 }
 
 type pendingNotification struct {
@@ -315,6 +408,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return fmt.Errorf("commit apply batch: %w", err)
 	}
+	if err := m.confirmGraphThrough(ctx, m.tip); err != nil {
+		return fmt.Errorf("confirm graph apply: %w", err)
+	}
 	for _, notification := range pending {
 		m.publishNotification(notification.topic, notification.payload)
 	}
@@ -322,6 +418,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 }
 
 func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, pending *[]pendingNotification) error {
+	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
+		return fmt.Errorf("prune idempotency receipts: %w", err)
+	}
 	graphCommands, graph, err := types.DecodeGraphBatch(value)
 	if err != nil {
 		return fmt.Errorf("decode graph batch: %w", err)
@@ -367,28 +466,27 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		if notifyCommand.RequestID == "" || len(notifyCommand.RequestID) > types.MaxRequestIDBytes || notifyCommand.Topic == "" || len(notifyCommand.Topic) > 256 || len(notifyCommand.Payload) > 1<<20 {
 			return fmt.Errorf("invalid notification")
 		}
-		commandJSON, err := json.Marshal(notifyCommand)
+		fingerprint, err := types.NotifyFingerprint(notifyCommand)
 		if err != nil {
 			return err
 		}
-		var existing []byte
-		err = tx.QueryRowContext(ctx, `SELECT command_json FROM _rhiza_notify_requests WHERE request_id = ?`, notifyCommand.RequestID).Scan(&existing)
-		switch {
-		case err == sql.ErrNoRows:
-			_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_notify_requests(request_id, command_json) VALUES (?, ?)`, notifyCommand.RequestID, commandJSON)
-			publish = err == nil
-		case err == nil:
+		existing, found, err := m.receiptInTx(ctx, tx, types.MutationNotify, notifyCommand.RequestID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true}
+			if err := insertReceipt(ctx, tx, types.MutationNotify, notifyCommand.RequestID, fingerprint, receipt); err != nil {
+				return err
+			}
+			publish = true
+		} else if existing.fingerprint != fingerprint {
 			publish = false
-		case err != nil:
-			return err
-		}
-		if err != nil {
-			return err
 		}
 		commands = nil
 		batched = true
 	} else if kv {
-		if err := m.applyKV(ctx, tx, kvCommand); err != nil {
+		if err := m.applyKV(ctx, tx, slot, kvCommand); err != nil {
 			return err
 		}
 		commands = nil
@@ -400,27 +498,25 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		if err := ValidateSQLCommand(command); err != nil {
 			return fmt.Errorf("validate SQL request %q: %w", command.RequestID, err)
 		}
-		commandJSON, err := json.Marshal(command)
+		fingerprint, err := types.SQLFingerprint(command)
 		if err != nil {
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
 		}
 		if command.RequestID != "" {
-			var existing string
-			err := tx.QueryRowContext(ctx, `SELECT sql FROM _rhiza_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
-			switch {
-			case err == nil:
-				if existing != string(commandJSON) && !(len(command.Args) == 0 && len(command.Statements) == 0 && !command.WantRows && existing == command.SQL) {
-					continue
-				}
-				continue
-			case err != sql.ErrNoRows:
+			existing, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID)
+			if err != nil {
 				return fmt.Errorf("check SQL request %q: %w", command.RequestID, err)
+			}
+			if found {
+				_ = existing
+				continue
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
 		result, executeErr := executeSQLCommand(ctx, tx, command)
+		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted}
 		if executeErr != nil {
 			if command.RequestID == "" {
 				return executeErr
@@ -428,17 +524,19 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 			if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
 				return err
 			}
-			result = types.SQLCommandResult{Error: executeErr.Error()}
+			receipt.Status = types.MutationRejected
+			receipt.ErrorCode = "execution_failed"
+		} else {
+			for _, statement := range result.Statements {
+				receipt.RowsAffected += statement.RowsAffected
+				receipt.LastInsertID = statement.LastInsertID
+			}
 		}
 		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
 			return err
 		}
 		if command.RequestID != "" {
-			resultJSON, err := json.Marshal(result)
-			if err != nil {
-				return fmt.Errorf("encode SQL result %q: %w", command.RequestID, err)
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_requests(request_id, sql, result_json) VALUES (?, ?, ?)`, command.RequestID, commandJSON, resultJSON); err != nil {
+			if err := insertReceipt(ctx, tx, types.MutationSQL, command.RequestID, fingerprint, receipt); err != nil {
 				return fmt.Errorf("record SQL request %q: %w", command.RequestID, err)
 			}
 		}
@@ -493,7 +591,7 @@ func (m *Materializer) Subscribe(topic string) (<-chan []byte, func()) {
 	}
 }
 
-func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, command types.KVCommand) error {
+func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand) error {
 	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || len(command.Value) > 16<<20 {
 		return fmt.Errorf("invalid KV command")
 	}
@@ -502,23 +600,16 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, command types.KV
 	default:
 		return fmt.Errorf("invalid KV operation %q", command.Operation)
 	}
-	commandJSON, err := json.Marshal(command)
+	fingerprint, err := types.KVFingerprint(command)
 	if err != nil {
 		return err
 	}
-	var existingCommand, existingResult []byte
-	err = tx.QueryRowContext(ctx, `SELECT command_json, result_json FROM _rhiza_kv_requests WHERE request_id = ?`, command.RequestID).Scan(&existingCommand, &existingResult)
-	if err == nil {
-		var existing types.KVCommand
-		if json.Unmarshal(existingCommand, &existing) != nil || !types.KVRequestMatches(existing, command) {
-			return nil
-		}
+	if _, found, err := m.receiptInTx(ctx, tx, types.MutationKV, command.RequestID); err != nil {
+		return err
+	} else if found {
 		return nil
 	}
-	if err != sql.ErrNoRows {
-		return err
-	}
-	result := types.KVCommandResult{Applied: true}
+	receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true}
 	switch command.Operation {
 	case "put":
 		_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`, command.Key, command.Value, command.ExpiresAtUnixMS)
@@ -527,7 +618,7 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, command types.KV
 		affected, err = tx.ExecContext(ctx, `DELETE FROM _rhiza_kv WHERE key = ?`, command.Key)
 		if err == nil {
 			rows, _ := affected.RowsAffected()
-			result.Applied = rows > 0
+			receipt.Applied = rows > 0
 		}
 	case "cas":
 		var current []byte
@@ -537,20 +628,15 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, command types.KV
 		if lookupErr != nil && lookupErr != sql.ErrNoRows {
 			return lookupErr
 		}
-		result.Applied = exists == command.ExpectedExists && (!exists || bytes.Equal(current, command.Expected))
-		if result.Applied {
+		receipt.Applied = exists == command.ExpectedExists && (!exists || bytes.Equal(current, command.Expected))
+		if receipt.Applied {
 			_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv(key, value, expires_at_unix_ms) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at_unix_ms=excluded.expires_at_unix_ms`, command.Key, command.Value, command.ExpiresAtUnixMS)
 		}
 	}
 	if err != nil {
 		return err
 	}
-	resultJSON, err := json.Marshal(result)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO _rhiza_kv_requests(request_id, command_json, result_json) VALUES (?, ?, ?)`, command.RequestID, commandJSON, resultJSON)
-	return err
+	return insertReceipt(ctx, tx, types.MutationKV, command.RequestID, fingerprint, receipt)
 }
 
 // KVGet reads a non-expired value from the local materialized state.
@@ -563,80 +649,23 @@ func (m *Materializer) KVGet(ctx context.Context, key string, now time.Time) ([]
 	return value, err == nil, err
 }
 
-func (m *Materializer) KVRequestResult(ctx context.Context, requestID string) (types.KVCommandResult, error) {
-	var data []byte
-	if err := m.reader().QueryRowContext(ctx, `SELECT result_json FROM _rhiza_kv_requests WHERE request_id = ?`, requestID).Scan(&data); err != nil {
-		return types.KVCommandResult{}, err
-	}
-	var result types.KVCommandResult
-	err := json.Unmarshal(data, &result)
-	return result, err
-}
-
-// KVRequest returns the exact first-admitted command and result for a request ID.
-func (m *Materializer) KVRequest(ctx context.Context, requestID string) (types.KVCommand, types.KVCommandResult, bool, error) {
-	var commandJSON, resultJSON []byte
-	err := m.reader().QueryRowContext(ctx, `SELECT command_json, result_json FROM _rhiza_kv_requests WHERE request_id = ?`, requestID).Scan(&commandJSON, &resultJSON)
-	if err == sql.ErrNoRows {
-		return types.KVCommand{}, types.KVCommandResult{}, false, nil
-	}
-	if err != nil {
-		return types.KVCommand{}, types.KVCommandResult{}, false, err
-	}
-	var command types.KVCommand
-	var result types.KVCommandResult
-	if err := json.Unmarshal(commandJSON, &command); err != nil {
-		return types.KVCommand{}, types.KVCommandResult{}, false, err
-	}
-	if err := json.Unmarshal(resultJSON, &result); err != nil {
-		return types.KVCommand{}, types.KVCommandResult{}, false, err
-	}
-	return command, result, true, nil
-}
-
 func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCommand) (bool, error) {
-	var existing []byte
-	err := m.reader().QueryRowContext(ctx, `SELECT command_json FROM _rhiza_kv_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
-	if err == sql.ErrNoRows {
-		return true, nil
-	}
+	fingerprint, err := types.KVFingerprint(command)
 	if err != nil {
 		return false, err
 	}
-	var stored types.KVCommand
-	if err := json.Unmarshal(existing, &stored); err != nil {
-		return false, err
-	}
-	return types.KVRequestMatches(stored, command), nil
+	matches, _, err := m.requestMatches(ctx, types.MutationKV, command.RequestID, fingerprint)
+	return matches, err
 }
 
 // NotifyRequestMatches checks whether a request ID is unused or has identical content.
 func (m *Materializer) NotifyRequestMatches(ctx context.Context, command types.NotifyCommand) (bool, error) {
-	encoded, err := json.Marshal(command)
+	fingerprint, err := types.NotifyFingerprint(command)
 	if err != nil {
 		return false, err
 	}
-	var existing []byte
-	err = m.reader().QueryRowContext(ctx, `SELECT command_json FROM _rhiza_notify_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
-	if err == sql.ErrNoRows {
-		return true, nil
-	}
-	return bytes.Equal(existing, encoded), err
-}
-
-// RequestCommitted reports whether an idempotent mutation reached any local
-// materializer. Callers pair this with the reported consensus slot.
-func (m *Materializer) RequestCommitted(ctx context.Context, requestID string) (bool, error) {
-	var found int
-	err := m.reader().QueryRowContext(ctx, `
-		SELECT EXISTS(SELECT 1 FROM _rhiza_requests WHERE request_id = ?)
-		    OR EXISTS(SELECT 1 FROM _rhiza_kv_requests WHERE request_id = ?)
-		    OR EXISTS(SELECT 1 FROM _rhiza_notify_requests WHERE request_id = ?)
-	`, requestID, requestID, requestID).Scan(&found)
-	if err != nil || found != 0 {
-		return found != 0, err
-	}
-	return m.graphRequestExists(requestID)
+	matches, _, err := m.requestMatches(ctx, types.MutationNotify, command.RequestID, fingerprint)
+	return matches, err
 }
 
 // ValidateSQLCommand validates the replicated SQL trust boundary.
@@ -652,6 +681,9 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		return fmt.Errorf("statement count must be between 1 and %d", MaxSQLStatements)
 	}
 	for _, statement := range statements {
+		if statement.WantRows {
+			return fmt.Errorf("mutation row results are unsupported; issue a query after the returned slot")
+		}
 		if strings.TrimSpace(statement.SQL) == "" {
 			return fmt.Errorf("SQL is required")
 		}
@@ -691,6 +723,7 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
 	}
 	result := types.SQLCommandResult{Statements: make([]types.SQLStatementResult, 0, len(statements))}
+	budget := resultBudget{rows: MaxReturningRows, bytes: MaxResultBytes}
 	for _, statement := range statements {
 		args := make([]any, len(statement.Args))
 		for i, arg := range statement.Args {
@@ -705,7 +738,7 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 			if err != nil {
 				return result, err
 			}
-			statementResult, err := collectRows(rows, MaxReturningRows)
+			statementResult, err := collectRowsWithBudget(rows, &budget)
 			rows.Close()
 			if err != nil {
 				return result, err
@@ -721,6 +754,13 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 		statementResult.RowsAffected, _ = execResult.RowsAffected()
 		statementResult.LastInsertID, _ = execResult.LastInsertId()
 		result.Statements = append(result.Statements, statementResult)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return result, err
+	}
+	if len(encoded) > MaxResultBytes {
+		return result, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
 	}
 	return result, nil
 }
@@ -780,19 +820,30 @@ func NormalizeSQLArgs(args []any) ([]any, error) {
 	return result, nil
 }
 
+type resultBudget struct {
+	rows  int
+	bytes int
+}
+
 func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
+	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes})
+}
+
+func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget) (types.SQLStatementResult, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return types.SQLStatementResult{}, err
 	}
 	result := types.SQLStatementResult{Columns: columns}
-	resultBytes := 0
 	for _, column := range columns {
-		resultBytes += len(column)
+		budget.bytes -= len(column)
+	}
+	if budget.bytes < 0 {
+		return result, fmt.Errorf("result exceeds %d bytes", MaxResultBytes)
 	}
 	for rows.Next() {
-		if len(result.Rows) >= limit {
-			return result, fmt.Errorf("result exceeds %d rows", limit)
+		if budget.rows == 0 {
+			return result, fmt.Errorf("result exceeds %d rows", MaxReturningRows)
 		}
 		values := make([]any, len(columns))
 		pointers := make([]any, len(columns))
@@ -815,43 +866,24 @@ func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
 			if size > MaxCellBytes {
 				return result, fmt.Errorf("result cell exceeds %d bytes", MaxCellBytes)
 			}
-			resultBytes += size
-			if resultBytes > MaxResultBytes {
+			budget.bytes -= size
+			if budget.bytes < 0 {
 				return result, fmt.Errorf("result exceeds %d bytes", MaxResultBytes)
 			}
 		}
 		result.Rows = append(result.Rows, values)
+		budget.rows--
 	}
 	return result, rows.Err()
 }
 
-// RequestResult returns the persisted result for an idempotent request.
-func (m *Materializer) RequestResult(ctx context.Context, requestID string) (types.SQLCommandResult, error) {
-	var data []byte
-	if err := m.reader().QueryRowContext(ctx, `SELECT result_json FROM _rhiza_requests WHERE request_id = ?`, requestID).Scan(&data); err != nil {
-		return types.SQLCommandResult{}, err
-	}
-	if len(data) == 0 {
-		return types.SQLCommandResult{Statements: []types.SQLStatementResult{}}, nil
-	}
-	var result types.SQLCommandResult
-	if err := json.Unmarshal(data, &result); err != nil {
-		return types.SQLCommandResult{}, err
-	}
-	return result, nil
-}
-
 func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLCommand) (bool, error) {
-	encoded, err := json.Marshal(command)
+	fingerprint, err := types.SQLFingerprint(command)
 	if err != nil {
 		return false, err
 	}
-	var existing string
-	err = m.reader().QueryRowContext(ctx, `SELECT sql FROM _rhiza_requests WHERE request_id = ?`, command.RequestID).Scan(&existing)
-	if err == sql.ErrNoRows {
-		return true, nil
-	}
-	return existing == string(encoded), err
+	matches, _, err := m.requestMatches(ctx, types.MutationSQL, command.RequestID, fingerprint)
+	return matches, err
 }
 
 // Query executes a read query.
@@ -909,11 +941,8 @@ func (m *Materializer) SnapshotAt(ctx context.Context) ([]byte, uint64, error) {
 	return data.Bytes(), index, err
 }
 
-// SnapshotTo streams a transactionally consistent snapshot while holding the
-// apply barrier, so memory use is bounded by the storage writers.
+// SnapshotTo streams a transactionally consistent snapshot with bounded memory.
 func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-snapshot-*.db")
 	if err != nil {
 		return 0, err
@@ -922,6 +951,18 @@ func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64
 	file.Close()
 	os.Remove(path)
 	defer os.Remove(path)
+	if !GraphEnabled() {
+		index, err := m.backupSQLite(ctx, path)
+		if err != nil {
+			return 0, fmt.Errorf("snapshot: %w", err)
+		}
+		if err := m.writeSnapshot(path, writer); err != nil {
+			return 0, fmt.Errorf("stream snapshot: %w", err)
+		}
+		return index, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, err := m.db.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
 		return 0, fmt.Errorf("snapshot: %w", err)
 	}
@@ -931,26 +972,100 @@ func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64
 	return m.tip, nil
 }
 
-// SnapshotFileAt creates a bounded-memory snapshot file for chunked upload.
-func (m *Materializer) SnapshotFileAt(ctx context.Context) (string, uint64, func(), error) {
-	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-checkpoint-*")
+func (m *Materializer) backupSQLite(ctx context.Context, path string) (uint64, error) {
+	conn, err := m.db.Conn(ctx)
 	if err != nil {
-		return "", 0, nil, err
+		return 0, err
 	}
-	path := file.Name()
-	cleanup := func() { _ = os.Remove(path) }
-	index, err := m.SnapshotTo(ctx, file)
+	destination := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+	err = conn.Raw(func(driverConn any) error {
+		raw, ok := driverConn.(sqlite3driver.Conn)
+		if !ok {
+			return fmt.Errorf("unexpected SQLite driver connection %T", driverConn)
+		}
+		return raw.Raw().Backup("main", destination)
+	})
+	if closeErr := conn.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return 0, err
+	}
+	backup, err := openSQLite(destination+"?mode=ro", false)
+	if err != nil {
+		return 0, err
+	}
+	defer backup.Close()
+	var value string
+	if err := backup.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key = 'applied_slot'`).Scan(&value); err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(value, 10, 64)
+}
+
+// CheckpointFilesAt captures fixed-role database files without packaging them.
+func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile, uint64, func(), error) {
+	dir := filepath.Dir(m.dbPath)
+	sqlite, err := os.CreateTemp(dir, ".rhiza-checkpoint-sqlite-*")
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	sqlitePath := sqlite.Name()
+	_ = sqlite.Close()
+	_ = os.Remove(sqlitePath)
+	paths := []string{sqlitePath}
+	cleanup := func() {
+		for _, path := range paths {
+			_ = os.Remove(path)
+		}
+	}
+	if !GraphEnabled() {
+		index, err := m.backupSQLite(ctx, sqlitePath)
+		if err != nil {
+			cleanup()
+			return nil, 0, nil, err
+		}
+		return []CheckpointFile{{Role: CheckpointSQLite, Path: sqlitePath}}, index, cleanup, nil
+	}
+	graph, err := os.CreateTemp(dir, ".rhiza-checkpoint-graph-*")
+	if err != nil {
+		cleanup()
+		return nil, 0, nil, err
+	}
+	graphPath := graph.Name()
+	paths = append(paths, graphPath)
+	m.mu.Lock()
+	if m.graphTip() != m.tip {
+		m.mu.Unlock()
+		_ = graph.Close()
+		cleanup()
+		return nil, 0, nil, fmt.Errorf("cannot checkpoint mismatched materializers: SQLite=%d GoraphDB=%d", m.tip, m.graphTip())
+	}
+	snapshot, err := m.beginGraphFileSnapshot()
 	if err == nil {
-		err = file.Sync()
+		_, err = m.db.ExecContext(ctx, "VACUUM INTO ?", sqlitePath)
 	}
-	if closeErr := file.Close(); err == nil {
+	index := m.tip
+	m.mu.Unlock()
+	if err == nil {
+		_, err = snapshot.WriteTo(ctx, graph)
+	}
+	if snapshot != nil {
+		if closeErr := snapshot.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err == nil {
+		err = graph.Sync()
+	}
+	if closeErr := graph.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		cleanup()
-		return "", 0, nil, err
+		return nil, 0, nil, err
 	}
-	return path, index, cleanup, nil
+	return []CheckpointFile{{Role: CheckpointSQLite, Path: sqlitePath}, {Role: CheckpointGraphData, Path: graphPath}}, index, cleanup, nil
 }
 
 // Restore restores from a snapshot.
@@ -980,13 +1095,83 @@ func (m *Materializer) Restore(ctx context.Context, data []byte) error {
 // RestoreFile validates and atomically installs a checkpoint without loading
 // the snapshot into the Go heap.
 func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	dir := filepath.Dir(m.dbPath)
-	parts, err := prepareSnapshotFile(snapshotPath, dir)
+	if GraphEnabled() {
+		return fmt.Errorf("graph build requires fixed-role checkpoint files")
+	}
+	return m.restoreParts(ctx, snapshotParts{sqlitePath: snapshotPath})
+}
+
+// RestoreCheckpoint atomically installs the exact fixed-role checkpoint set.
+func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []CheckpointFile) error {
+	var parts snapshotParts
+	seen := make(map[CheckpointRole]bool, len(files))
+	for _, file := range files {
+		if seen[file.Role] || file.Path == "" {
+			return fmt.Errorf("invalid checkpoint file set")
+		}
+		seen[file.Role] = true
+		switch file.Role {
+		case CheckpointSQLite:
+			parts.sqlitePath = file.Path
+		case CheckpointGraphData:
+			parts.graphDir = filepath.Dir(file.Path)
+		default:
+			return fmt.Errorf("unknown checkpoint role %q", file.Role)
+		}
+	}
+	if parts.sqlitePath == "" || GraphEnabled() != seen[CheckpointGraphData] {
+		return fmt.Errorf("checkpoint file roles do not match build profile")
+	}
+	if GraphEnabled() {
+		root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
+		if err != nil {
+			return err
+		}
+		graphDir := filepath.Join(root, "goraphdb")
+		if err := os.MkdirAll(graphDir, 0o700); err != nil {
+			_ = os.RemoveAll(root)
+			return err
+		}
+		source := ""
+		for _, file := range files {
+			if file.Role == CheckpointGraphData {
+				source = file.Path
+			}
+		}
+		if err := copyFile(source, filepath.Join(graphDir, "shard_0000.db")); err != nil {
+			_ = os.RemoveAll(root)
+			return err
+		}
+		parts.graphDir = graphDir
+		parts.cleanup = func() { _ = os.RemoveAll(root) }
+	}
+	return m.restoreParts(ctx, parts)
+}
+
+func copyFile(sourcePath, targetPath string) error {
+	source, err := os.Open(sourcePath)
 	if err != nil {
 		return err
 	}
+	defer source.Close()
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(target, source)
+	if err == nil {
+		err = target.Sync()
+	}
+	if closeErr := target.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dir := filepath.Dir(m.dbPath)
 	if parts.cleanup != nil {
 		defer parts.cleanup()
 	}
@@ -1070,7 +1255,7 @@ func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) err
 		}
 		return fmt.Errorf("install snapshot: %w", err)
 	}
-	restored, err := Open(m.dbPath, m.readersN)
+	restored, err := Open(m.dbPath, m.readersN, m.idempotencyWindow)
 	if err == nil {
 		err = restored.validateRestoredSnapshot()
 	}
@@ -1100,7 +1285,7 @@ func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) err
 }
 
 func (m *Materializer) reopen() error {
-	reopened, err := Open(m.dbPath, m.readersN)
+	reopened, err := Open(m.dbPath, m.readersN, m.idempotencyWindow)
 	if err != nil {
 		return err
 	}

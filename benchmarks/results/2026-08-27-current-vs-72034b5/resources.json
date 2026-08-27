@@ -1,0 +1,130 @@
+[
+  {
+    "config": "baseline-72034b5-graph-async",
+    "duration_s": 8,
+    "cpu_seconds": 6.247395,
+    "average_cores": 0.780924375,
+    "memory_current_bytes": 57536512,
+    "memory_peak_bytes": 64921600
+  },
+  {
+    "config": "baseline-72034b5-graph-async-checkpoint-1s",
+    "duration_s": 15,
+    "cpu_seconds": 11.374783,
+    "average_cores": 0.7583188666666667,
+    "memory_current_bytes": 119377920,
+    "memory_peak_bytes": 132878336
+  },
+  {
+    "config": "baseline-72034b5-graph-before-ack",
+    "duration_s": 10,
+    "cpu_seconds": 7.230268,
+    "average_cores": 0.7230268,
+    "memory_current_bytes": 67649536,
+    "memory_peak_bytes": 74133504
+  },
+  {
+    "config": "baseline-72034b5-sql-async",
+    "duration_s": 9,
+    "cpu_seconds": 7.028955,
+    "average_cores": 0.780995,
+    "memory_current_bytes": 60198912,
+    "memory_peak_bytes": 66068480
+  },
+  {
+    "config": "baseline-72034b5-sql-async-checkpoint-1s",
+    "duration_s": 11,
+    "cpu_seconds": 7.080323,
+    "average_cores": 0.6436657272727273,
+    "memory_current_bytes": 71417856,
+    "memory_peak_bytes": 86208512
+  },
+  {
+    "config": "baseline-72034b5-sql-before-ack",
+    "duration_s": 9,
+    "cpu_seconds": 7.937201,
+    "average_cores": 0.8819112222222222,
+    "memory_current_bytes": 91992064,
+    "memory_peak_bytes": 98308096
+  },
+  {
+    "config": "current-working-tree-graph-async",
+    "duration_s": 9,
+    "cpu_seconds": 6.22159,
+    "average_cores": 0.6912877777777777,
+    "memory_current_bytes": 48533504,
+    "memory_peak_bytes": 54919168
+  },
+  {
+    "config": "current-working-tree-graph-async-checkpoint-1s",
+    "duration_s": 15,
+    "cpu_seconds": 8.624625,
+    "average_cores": 0.574975,
+    "memory_current_bytes": 76636160,
+    "memory_peak_bytes": 92569600
+  },
+  {
+    "config": "current-working-tree-graph-async-one-fault",
+    "duration_s": 11,
+    "cpu_seconds": 7.017538,
+    "average_cores": 0.637958,
+    "memory_current_bytes": 62472192,
+    "memory_peak_bytes": 68833280
+  },
+  {
+    "config": "current-working-tree-graph-before-ack",
+    "duration_s": 13,
+    "cpu_seconds": 7.497359,
+    "average_cores": 0.5767199230769231,
+    "memory_current_bytes": 69664768,
+    "memory_peak_bytes": 77049856
+  },
+  {
+    "config": "current-working-tree-graph-before-ack-one-fault",
+    "duration_s": 14,
+    "cpu_seconds": 8.646804,
+    "average_cores": 0.6176288571428571,
+    "memory_current_bytes": 81133568,
+    "memory_peak_bytes": 88002560
+  },
+  {
+    "config": "current-working-tree-sql-async",
+    "duration_s": 11,
+    "cpu_seconds": 7.152531,
+    "average_cores": 0.6502300909090909,
+    "memory_current_bytes": 75825152,
+    "memory_peak_bytes": 82640896
+  },
+  {
+    "config": "current-working-tree-sql-async-checkpoint-1s",
+    "duration_s": 13,
+    "cpu_seconds": 8.128995,
+    "average_cores": 0.6253073076923077,
+    "memory_current_bytes": 70004736,
+    "memory_peak_bytes": 98078720
+  },
+  {
+    "config": "current-working-tree-sql-async-one-fault",
+    "duration_s": 9,
+    "cpu_seconds": 6.673623,
+    "average_cores": 0.7415136666666666,
+    "memory_current_bytes": 72683520,
+    "memory_peak_bytes": 78983168
+  },
+  {
+    "config": "current-working-tree-sql-before-ack",
+    "duration_s": 9,
+    "cpu_seconds": 6.626371,
+    "average_cores": 0.7362634444444445,
+    "memory_current_bytes": 64294912,
+    "memory_peak_bytes": 70696960
+  },
+  {
+    "config": "current-working-tree-sql-before-ack-one-fault",
+    "duration_s": 11,
+    "cpu_seconds": 6.772292,
+    "average_cores": 0.6156629090909091,
+    "memory_current_bytes": 76664832,
+    "memory_peak_bytes": 83509248
+  }
+]

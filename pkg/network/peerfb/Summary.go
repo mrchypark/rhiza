@@ -7,9 +7,9 @@ import (
 )
 
 type SummaryT struct {
-	RecorderId string `json:"recorder_id"`
-	Step uint64 `json:"step"`
-	FirstCurrent *ProposalT `json:"first_current"`
+	RecorderId     string     `json:"recorder_id"`
+	Step           uint64     `json:"step"`
+	FirstCurrent   *ProposalT `json:"first_current"`
 	AggregatePrior *ProposalT `json:"aggregate_prior"`
 }
 

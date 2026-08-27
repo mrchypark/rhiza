@@ -18,44 +18,31 @@ import (
 const (
 	maxExtentSize      = 8 << 20
 	maxExtentItems     = 1024
-	maxManifestSize    = 4 << 20
-	maxHeadSize        = 4 << 10
+	maxHeadSize        = 64 << 10
 	archiveGroupDelay  = 2 * time.Millisecond
 	archiveSyncTimeout = 5 * time.Minute
 	maxPublishRetries  = 8
 )
 
 type Extent struct {
-	ConfigID    uint                   `json:"config_id"`
-	Start       quepaxa.Slot           `json:"start"`
-	End         quepaxa.Slot           `json:"end"`
-	StartPrefix [32]byte               `json:"start_prefix"`
-	EndPrefix   [32]byte               `json:"end_prefix"`
-	Decisions   []quepaxa.DecidedValue `json:"decisions"`
+	ConfigID     uint                   `json:"config_id"`
+	Start        quepaxa.Slot           `json:"start"`
+	End          quepaxa.Slot           `json:"end"`
+	StartPrefix  [32]byte               `json:"start_prefix"`
+	EndPrefix    [32]byte               `json:"end_prefix"`
+	PreviousHash [32]byte               `json:"previous_hash"`
+	Decisions    []quepaxa.DecidedValue `json:"decisions"`
+	hash         [32]byte
 }
 
-type extentRef struct {
-	Start       quepaxa.Slot `json:"start"`
-	End         quepaxa.Slot `json:"end"`
-	Hash        [32]byte     `json:"hash"`
-	StartPrefix [32]byte     `json:"start_prefix"`
-	EndPrefix   [32]byte     `json:"end_prefix"`
-}
-
-type archiveManifest struct {
+type archiveHead struct {
 	ConfigID     uint                    `json:"config_id"`
 	Base         quepaxa.Slot            `json:"base"`
 	BasePrefix   [32]byte                `json:"base_prefix"`
 	BaseSeal     *quepaxa.CheckpointSeal `json:"base_seal,omitempty"`
 	BaseDecision *quepaxa.DecidedValue   `json:"base_decision,omitempty"`
 	Tip          quepaxa.Slot            `json:"tip"`
-	Extents      []extentRef             `json:"extents"`
-}
-
-type archiveHead struct {
-	ConfigID     uint         `json:"config_id"`
-	Tip          quepaxa.Slot `json:"tip"`
-	ManifestHash [32]byte     `json:"manifest_hash"`
+	TailHash     [32]byte                `json:"tail_hash"`
 }
 
 type source interface {
@@ -75,7 +62,7 @@ type Manager struct {
 	configID uint
 	mu       sync.Mutex
 	extents  []Extent
-	manifest archiveManifest
+	head     archiveHead
 	tip      quepaxa.Slot
 	headCAS  *objstore.ObjectVersion
 	cas      bool
@@ -109,7 +96,7 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 			return fmt.Errorf("unsupported shared archive layout")
 		}
 		m.extents = nil
-		m.manifest = archiveManifest{ConfigID: m.configID}
+		m.head = archiveHead{ConfigID: m.configID}
 		m.tip = 0
 		m.headCAS = nil
 		return nil
@@ -125,53 +112,53 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 	if err := decodePersistedJSON(headData, &head); err != nil {
 		return err
 	}
-	if head.ConfigID != m.configID || head.Tip == 0 || head.ManifestHash == ([32]byte{}) {
+	if head.ConfigID != m.configID || head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) {
 		return fmt.Errorf("invalid shared archive head")
 	}
-	manifestName := m.key(manifestKey(head.Tip, head.ManifestHash))
-	manifestData, err := m.readObject(ctx, manifestName, maxManifestSize)
-	if err != nil {
-		return err
-	}
-	if sha256.Sum256(manifestData) != head.ManifestHash {
-		return fmt.Errorf("shared archive manifest integrity mismatch")
-	}
-	var manifest archiveManifest
-	if err := decodePersistedJSON(manifestData, &manifest); err != nil {
-		return err
-	}
-	if manifest.ConfigID != m.configID || manifest.Tip != head.Tip || manifest.Tip < manifest.Base || (manifest.Tip > manifest.Base && len(manifest.Extents) == 0) {
-		return fmt.Errorf("invalid shared archive manifest")
-	}
-	if manifest.Base > 0 && (manifest.BaseSeal == nil || manifest.BaseDecision == nil || manifest.BaseSeal.Index != manifest.Base || manifest.BaseSeal.PrefixHash != manifest.BasePrefix) {
+	if head.Base > 0 && (head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix) {
 		return fmt.Errorf("invalid shared archive recovery base")
 	}
-	extents := make([]Extent, 0, len(manifest.Extents))
-	next := manifest.Base + 1
-	prefix := manifest.BasePrefix
-	for _, ref := range manifest.Extents {
-		if ref.Start != next || ref.End < ref.Start || ref.StartPrefix != prefix || ref.Hash == ([32]byte{}) {
-			return fmt.Errorf("invalid shared archive extent chain")
+	extents := make([]Extent, 0)
+	hash, end := head.TailHash, head.Tip
+	for end > head.Base {
+		if hash == ([32]byte{}) {
+			return fmt.Errorf("invalid shared archive block chain")
 		}
-		extent, err := m.readExtent(ctx, m.key(extentKey(ref)), ref.Hash)
+		extent, err := m.readExtent(ctx, hash)
 		if err != nil {
 			return err
 		}
-		if extent.Start != ref.Start || extent.End != ref.End || extent.StartPrefix != ref.StartPrefix || extent.EndPrefix != ref.EndPrefix {
-			return fmt.Errorf("shared archive extent reference mismatch")
+		if extent.End != end {
+			return fmt.Errorf("invalid shared archive block chain")
 		}
 		extents = append(extents, extent)
-		next, prefix = ref.End+1, ref.EndPrefix
+		hash, end = extent.PreviousHash, extent.Start-1
 	}
-	if len(manifest.Extents) == 0 {
-		next = manifest.Base + 1
+	slices.Reverse(extents)
+	if len(extents) != 0 && extents[0].Start <= head.Base {
+		extent := extents[0]
+		offset := int(head.Base - extent.Start + 1)
+		extent.Decisions = append([]quepaxa.DecidedValue(nil), extent.Decisions[offset:]...)
+		extent.Start = head.Base + 1
+		extent.StartPrefix = head.BasePrefix
+		if err := m.validateExtent(extent); err != nil {
+			return fmt.Errorf("invalid shared archive checkpoint boundary: %w", err)
+		}
+		extents[0] = extent
 	}
-	if next-1 != manifest.Tip {
-		return fmt.Errorf("shared archive manifest tip mismatch")
+	next, prefix := head.Base+1, head.BasePrefix
+	for _, extent := range extents {
+		if extent.Start != next || extent.StartPrefix != prefix {
+			return fmt.Errorf("invalid shared archive block chain")
+		}
+		next, prefix = extent.End+1, extent.EndPrefix
+	}
+	if next-1 != head.Tip {
+		return fmt.Errorf("shared archive head tip mismatch")
 	}
 	m.extents = extents
-	m.manifest = manifest
-	m.tip = manifest.Tip
+	m.head = head
+	m.tip = head.Tip
 	m.headCAS = attributes.Version
 	return nil
 }
@@ -191,14 +178,15 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
-		if through <= m.manifest.Base {
+		if through <= m.head.Base {
 			return nil
 		}
 		if through > m.tip {
 			return fmt.Errorf("archive tip %d is behind trim slot %d", m.tip, through)
 		}
 		sealCopy, decisionCopy := sealed.CheckpointSeal, decision
-		manifest := archiveManifest{ConfigID: m.configID, Base: through, BasePrefix: prefix, BaseSeal: &sealCopy, BaseDecision: &decisionCopy, Tip: m.tip}
+		head := m.head
+		head.Base, head.BasePrefix, head.BaseSeal, head.BaseDecision = through, prefix, &sealCopy, &decisionCopy
 		extents := make([]Extent, 0, len(m.extents))
 		for _, extent := range m.extents {
 			if extent.End <= through {
@@ -210,33 +198,15 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 				extent.Start = through + 1
 				extent.StartPrefix = prefix
 			}
-			data, err := json.Marshal(extent)
-			if err != nil {
-				return err
-			}
-			hash := sha256.Sum256(data)
-			ref := extentRef{Start: extent.Start, End: extent.End, Hash: hash, StartPrefix: extent.StartPrefix, EndPrefix: extent.EndPrefix}
-			if err := m.bucket.Upload(ctx, m.key(extentKey(ref)), bytes.NewReader(data)); err != nil {
-				return err
-			}
 			extents = append(extents, extent)
-			manifest.Extents = append(manifest.Extents, ref)
 		}
-		data, err := json.Marshal(manifest)
-		if err != nil {
-			return err
+		if through == m.tip {
+			head.TailHash = [32]byte{}
 		}
-		if len(data) > maxManifestSize {
-			return fmt.Errorf("archive manifest exceeds %d bytes", maxManifestSize)
-		}
-		hash := sha256.Sum256(data)
-		if err := m.bucket.Upload(ctx, m.key(manifestKey(manifest.Tip, hash)), bytes.NewReader(data)); err != nil {
-			return err
-		}
-		if err := m.publishHeadLocked(ctx, manifest, hash); err == nil {
-			m.extents, m.manifest = extents, manifest
+		if err := m.publishHeadLocked(ctx, head); err == nil {
+			m.extents, m.head = extents, head
 			if m.cas {
-				return m.refreshPublishedHead(ctx, manifest, hash)
+				return m.refreshPublishedHead(ctx, head)
 			}
 			return nil
 		} else if !m.cas {
@@ -249,7 +219,7 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 	return fmt.Errorf("shared archive trim conflicted too many times")
 }
 
-func (m *Manager) refreshPublishedHead(ctx context.Context, manifest archiveManifest, hash [32]byte) error {
+func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead) error {
 	name := m.key("archive/latest.json")
 	attributes, err := m.bucket.Attributes(ctx, name)
 	if err != nil {
@@ -263,7 +233,11 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, manifest archiveMani
 	if err := decodePersistedJSON(data, &head); err != nil {
 		return err
 	}
-	if head.ConfigID != m.configID || head.Tip != manifest.Tip || head.ManifestHash != hash {
+	expectedData, err := json.Marshal(expected)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(data, expectedData) {
 		return m.loadLocked(ctx)
 	}
 	m.headCAS = attributes.Version
@@ -273,14 +247,14 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, manifest archiveMani
 func (m *Manager) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.DecidedValue, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.manifest.BaseSeal == nil || m.manifest.BaseDecision == nil {
+	if m.head.BaseSeal == nil || m.head.BaseDecision == nil {
 		return quepaxa.CheckpointSeal{}, quepaxa.DecidedValue{}, false
 	}
-	return *m.manifest.BaseSeal, *m.manifest.BaseDecision, true
+	return *m.head.BaseSeal, *m.head.BaseDecision, true
 }
 
 // SyncThrough publishes all decisions through the requested slot. Concurrent
-// callers share a bounded delay and one immutable block/manifest publication.
+// callers share a bounded delay and one immutable block/head publication.
 func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.Slot) error {
 	if through == 0 || m.Tip() >= through {
 		return nil
@@ -336,13 +310,13 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		if m.tip >= through {
 			return nil
 		}
-		extents := append([]Extent(nil), m.extents...)
-		manifest := m.manifest
-		manifest.ConfigID = m.configID
-		manifest.Extents = append([]extentRef(nil), manifest.Extents...)
+		added := make([]Extent, 0, 1)
+		head := m.head
+		head.ConfigID = m.configID
+		previous := head.TailHash
 		from := m.tip + 1
 		for from <= through {
-			extent, ref, sourceTip, err := m.buildExtent(core, from, through)
+			extent, sourceTip, err := m.buildExtent(core, from, through, previous)
 			if err != nil {
 				return err
 			}
@@ -353,32 +327,21 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 			if len(data) > maxExtentSize {
 				return fmt.Errorf("archive extent exceeds %d bytes", maxExtentSize)
 			}
-			if err := m.bucket.Upload(ctx, m.key(extentKey(ref)), bytes.NewReader(data)); err != nil {
+			if err := m.bucket.Upload(ctx, m.key(extentKey(extent.hash)), bytes.NewReader(data)); err != nil {
 				return err
 			}
-			extents = append(extents, extent)
-			manifest.Extents = append(manifest.Extents, ref)
-			manifest.Tip = ref.End
-			from = ref.End + 1
-			if sourceTip < through && ref.End == sourceTip {
+			added = append(added, extent)
+			head.Tip, head.TailHash, previous = extent.End, extent.hash, extent.hash
+			from = extent.End + 1
+			if sourceTip < through && extent.End == sourceTip {
 				return fmt.Errorf("archive source tip %d is behind required slot %d", sourceTip, through)
 			}
 		}
-		manifestData, err := json.Marshal(manifest)
-		if err != nil {
-			return fmt.Errorf("encode archive manifest: %w", err)
-		}
-		if len(manifestData) > maxManifestSize {
-			return fmt.Errorf("archive manifest exceeds %d bytes", maxManifestSize)
-		}
-		manifestHash := sha256.Sum256(manifestData)
-		if err := m.bucket.Upload(ctx, m.key(manifestKey(manifest.Tip, manifestHash)), bytes.NewReader(manifestData)); err != nil {
-			return err
-		}
-		if err := m.publishHeadLocked(ctx, manifest, manifestHash); err == nil {
-			m.extents, m.manifest, m.tip = extents, manifest, manifest.Tip
+		if err := m.publishHeadLocked(ctx, head); err == nil {
+			m.extents = append(m.extents, added...)
+			m.head, m.tip = head, head.Tip
 			if m.cas {
-				return m.refreshPublishedHead(ctx, manifest, manifestHash)
+				return m.refreshPublishedHead(ctx, head)
 			}
 			return nil
 		} else if !m.cas {
@@ -391,10 +354,13 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 	return fmt.Errorf("shared archive publication conflicted too many times")
 }
 
-func (m *Manager) publishHeadLocked(ctx context.Context, manifest archiveManifest, hash [32]byte) error {
-	data, err := json.Marshal(archiveHead{ConfigID: m.configID, Tip: manifest.Tip, ManifestHash: hash})
+func (m *Manager) publishHeadLocked(ctx context.Context, head archiveHead) error {
+	data, err := json.Marshal(head)
 	if err != nil {
 		return err
+	}
+	if len(data) > maxHeadSize {
+		return fmt.Errorf("archive head exceeds %d bytes", maxHeadSize)
 	}
 	var options []objstore.ObjectUploadOption
 	if m.cas {
@@ -407,57 +373,83 @@ func (m *Manager) publishHeadLocked(ctx context.Context, manifest archiveManifes
 	return m.bucket.Upload(ctx, m.key("archive/latest.json"), bytes.NewReader(data), options...)
 }
 
-func (m *Manager) buildExtent(core source, from, through quepaxa.Slot) (Extent, extentRef, quepaxa.Slot, error) {
+func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous [32]byte) (Extent, quepaxa.Slot, error) {
 	decisions, tip, err := core.DecisionsFrom(from, maxExtentItems)
 	if err != nil {
-		return Extent{}, extentRef{}, tip, err
+		return Extent{}, tip, err
 	}
 	if len(decisions) == 0 || decisions[0].Slot != from {
-		return Extent{}, extentRef{}, tip, fmt.Errorf("shared archive source omitted slot %d", from)
+		return Extent{}, tip, fmt.Errorf("shared archive source omitted slot %d", from)
 	}
-	selected := decisions[:0]
-	size := 256
-	for _, decision := range decisions {
-		next := size + len(decision.Value) + len(decision.Certificate) + 256
-		if len(selected) != 0 && next > maxExtentSize {
-			break
-		}
-		if next > maxExtentSize {
-			return Extent{}, extentRef{}, tip, fmt.Errorf("decision %d exceeds archive extent limit", decision.Slot)
-		}
-		selected = append(selected, decision)
-		size = next
-		if decision.Slot >= through {
-			break
-		}
-	}
-	end := selected[len(selected)-1].Slot
 	var startPrefix [32]byte
 	if from > 1 {
 		var ok bool
 		startPrefix, ok = core.PrefixHash(from - 1)
 		if !ok {
-			return Extent{}, extentRef{}, tip, fmt.Errorf("archive start prefix %d is unavailable", from-1)
+			return Extent{}, tip, fmt.Errorf("archive start prefix %d is unavailable", from-1)
 		}
 	}
-	endPrefix, ok := core.PrefixHash(end)
-	if !ok {
-		return Extent{}, extentRef{}, tip, fmt.Errorf("archive end prefix %d is unavailable", end)
+	selected := decisions[:0]
+	encodedDecisions := 0
+	var endPrefix [32]byte
+	for _, decision := range decisions {
+		encoded, err := json.Marshal(decision)
+		if err != nil {
+			return Extent{}, tip, err
+		}
+		candidatePrefix, ok := core.PrefixHash(decision.Slot)
+		if !ok {
+			return Extent{}, tip, fmt.Errorf("archive end prefix %d is unavailable", decision.Slot)
+		}
+		candidate := Extent{ConfigID: m.configID, Start: from, End: decision.Slot, StartPrefix: startPrefix, EndPrefix: candidatePrefix, PreviousHash: previous, Decisions: []quepaxa.DecidedValue{}}
+		size, err := extentEncodedSize(candidate, encodedDecisions+len(encoded), len(selected)+1)
+		if err != nil {
+			return Extent{}, tip, err
+		}
+		if len(selected) != 0 && size > maxExtentSize {
+			break
+		}
+		if size > maxExtentSize {
+			return Extent{}, tip, fmt.Errorf("decision %d exceeds archive extent limit", decision.Slot)
+		}
+		selected = append(selected, decision)
+		encodedDecisions += len(encoded)
+		endPrefix = candidatePrefix
+		if decision.Slot >= through {
+			break
+		}
 	}
-	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, Decisions: selected}
+	end := selected[len(selected)-1].Slot
+	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, PreviousHash: previous, Decisions: selected}
 	data, err := json.Marshal(extent)
 	if err != nil {
-		return Extent{}, extentRef{}, tip, err
+		return Extent{}, tip, err
+	}
+	if len(data) > maxExtentSize {
+		return Extent{}, tip, fmt.Errorf("archive extent exceeds %d bytes", maxExtentSize)
 	}
 	hash := sha256.Sum256(data)
-	return extent, extentRef{Start: from, End: end, Hash: hash, StartPrefix: startPrefix, EndPrefix: endPrefix}, tip, nil
+	extent.hash = hash
+	return extent, tip, nil
+}
+
+func extentEncodedSize(extent Extent, decisionsBytes, decisions int) (int, error) {
+	extent.Decisions = []quepaxa.DecidedValue{}
+	header, err := json.Marshal(extent)
+	if err != nil {
+		return 0, err
+	}
+	if decisions > 1 {
+		decisionsBytes += decisions - 1
+	}
+	return len(header) + decisionsBytes, nil
 }
 
 func (m *Manager) DecisionsFrom(from quepaxa.Slot, limit int) ([]quepaxa.DecidedValue, quepaxa.Slot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if from <= m.manifest.Base {
-		return nil, m.tip, fmt.Errorf("%w: archive starts after checkpoint %d", quepaxa.ErrCompacted, m.manifest.Base)
+	if from <= m.head.Base {
+		return nil, m.tip, fmt.Errorf("%w: archive starts after checkpoint %d", quepaxa.ErrCompacted, m.head.Base)
 	}
 	if limit <= 0 {
 		limit = 256
@@ -489,8 +481,8 @@ func (m *Manager) Tip() quepaxa.Slot {
 	return m.tip
 }
 
-// Cleanup removes obsolete immutable publications after the grace period.
-// The current manifest and every block it references are always retained.
+// Cleanup removes obsolete immutable blocks after the grace period.
+// Every block reachable from the current head is always retained.
 func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 	if grace < 0 {
 		return fmt.Errorf("archive GC grace period must not be negative")
@@ -501,8 +493,11 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 		return err
 	}
 	if compacted := m.compactExtents(); len(compacted) < len(m.extents) {
-		manifest := archiveManifest{ConfigID: m.configID, Base: m.manifest.Base, BasePrefix: m.manifest.BasePrefix, BaseSeal: m.manifest.BaseSeal, BaseDecision: m.manifest.BaseDecision, Tip: m.tip, Extents: make([]extentRef, 0, len(compacted))}
-		for _, extent := range compacted {
+		head := m.head
+		previous := [32]byte{}
+		for i := range compacted {
+			extent := &compacted[i]
+			extent.PreviousHash = previous
 			data, err := json.Marshal(extent)
 			if err != nil {
 				m.mu.Unlock()
@@ -513,49 +508,29 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 				return fmt.Errorf("compacted archive extent exceeds %d bytes", maxExtentSize)
 			}
 			hash := sha256.Sum256(data)
-			ref := extentRef{Start: extent.Start, End: extent.End, Hash: hash, StartPrefix: extent.StartPrefix, EndPrefix: extent.EndPrefix}
-			if err := m.bucket.Upload(ctx, m.key(extentKey(ref)), bytes.NewReader(data)); err != nil {
+			extent.hash = hash
+			if err := m.bucket.Upload(ctx, m.key(extentKey(hash)), bytes.NewReader(data)); err != nil {
 				m.mu.Unlock()
 				return err
 			}
-			manifest.Extents = append(manifest.Extents, ref)
+			previous = hash
 		}
-		data, err := json.Marshal(manifest)
-		if err != nil {
-			m.mu.Unlock()
-			return fmt.Errorf("encode compacted archive manifest: %w", err)
-		}
-		if len(data) > maxManifestSize {
-			m.mu.Unlock()
-			return fmt.Errorf("compacted archive manifest exceeds %d bytes", maxManifestSize)
-		}
-		hash := sha256.Sum256(data)
-		if err := m.bucket.Upload(ctx, m.key(manifestKey(manifest.Tip, hash)), bytes.NewReader(data)); err != nil {
+		head.TailHash = previous
+		if err := m.publishHeadLocked(ctx, head); err != nil {
 			m.mu.Unlock()
 			return err
 		}
-		if err := m.publishHeadLocked(ctx, manifest, hash); err != nil {
-			m.mu.Unlock()
-			return err
-		}
-		m.extents, m.manifest = compacted, manifest
+		m.extents, m.head = compacted, head
 		if m.cas {
-			if err := m.refreshPublishedHead(ctx, manifest, hash); err != nil {
+			if err := m.refreshPublishedHead(ctx, head); err != nil {
 				m.mu.Unlock()
 				return err
 			}
 		}
 	}
-	keep := make(map[string]struct{}, len(m.manifest.Extents)+1)
-	manifestData, err := json.Marshal(m.manifest)
-	if err != nil {
-		m.mu.Unlock()
-		return err
-	}
-	manifestHash := sha256.Sum256(manifestData)
-	keep[m.key(manifestKey(m.manifest.Tip, manifestHash))] = struct{}{}
-	for _, ref := range m.manifest.Extents {
-		keep[m.key(extentKey(ref))] = struct{}{}
+	keep := make(map[string]struct{}, len(m.extents))
+	for _, extent := range m.extents {
+		keep[m.key(extentKey(extent.hash))] = struct{}{}
 	}
 	m.mu.Unlock()
 	cutoff := time.Now().Add(-grace)
@@ -588,8 +563,8 @@ func (m *Manager) compactExtents() []Extent {
 	}
 	result := make([]Extent, 0, len(m.extents))
 	var current Extent
-	prefix := m.manifest.BasePrefix
-	size := 256
+	prefix := m.head.BasePrefix
+	encodedDecisions := 0
 	flush := func() {
 		if len(current.Decisions) != 0 {
 			result = append(result, current)
@@ -597,10 +572,23 @@ func (m *Manager) compactExtents() []Extent {
 	}
 	for _, extent := range m.extents {
 		for _, decision := range extent.Decisions {
-			nextSize := size + len(decision.Value) + len(decision.Certificate) + 256
+			encoded, err := json.Marshal(decision)
+			if err != nil {
+				return m.extents
+			}
+			candidate := current
+			if len(candidate.Decisions) == 0 {
+				candidate = Extent{ConfigID: m.configID, Start: decision.Slot, StartPrefix: prefix}
+			}
+			candidate.End = decision.Slot
+			candidate.EndPrefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
+			nextSize, err := extentEncodedSize(candidate, encodedDecisions+len(encoded), len(current.Decisions)+1)
+			if err != nil {
+				return m.extents
+			}
 			if len(current.Decisions) == maxExtentItems || len(current.Decisions) != 0 && nextSize > maxExtentSize {
 				flush()
-				current, size = Extent{}, 256
+				current, encodedDecisions = Extent{}, 0
 			}
 			if len(current.Decisions) == 0 {
 				current = Extent{ConfigID: m.configID, Start: decision.Slot, StartPrefix: prefix}
@@ -609,15 +597,15 @@ func (m *Manager) compactExtents() []Extent {
 			current.End = decision.Slot
 			prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
 			current.EndPrefix = prefix
-			size = nextSize
+			encodedDecisions += len(encoded)
 		}
 	}
 	flush()
 	return result
 }
 
-func (m *Manager) readExtent(ctx context.Context, name string, expected [32]byte) (Extent, error) {
-	data, err := m.readObject(ctx, name, maxExtentSize)
+func (m *Manager) readExtent(ctx context.Context, expected [32]byte) (Extent, error) {
+	data, err := m.readObject(ctx, m.key(extentKey(expected)), maxExtentSize)
 	if err != nil {
 		return Extent{}, err
 	}
@@ -631,6 +619,7 @@ func (m *Manager) readExtent(ctx context.Context, name string, expected [32]byte
 	if err := m.validateExtent(extent); err != nil {
 		return Extent{}, err
 	}
+	extent.hash = expected
 	return extent, nil
 }
 
@@ -679,12 +668,8 @@ func decodePersistedJSON(data []byte, value any) error {
 	return nil
 }
 
-func extentKey(ref extentRef) string {
-	return fmt.Sprintf("archive/blocks/%020d_%020d_%x.json", ref.Start, ref.End, ref.Hash)
-}
-
-func manifestKey(tip quepaxa.Slot, hash [32]byte) string {
-	return fmt.Sprintf("archive/manifests/%020d_%x.json", tip, hash)
+func extentKey(hash [32]byte) string {
+	return fmt.Sprintf("archive/blocks/%x.json", hash)
 }
 
 func (m *Manager) key(value string) string {

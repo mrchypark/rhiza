@@ -11,7 +11,6 @@ import (
 	"log"
 	"os"
 	"path"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,25 +21,41 @@ import (
 )
 
 const (
-	chunkSize         = 16 << 20
-	maxCheckpointSize = 16 << 30
-	maxChunks         = maxCheckpointSize/chunkSize + 1
-	maxRootSize       = 1 << 20
+	blockSize         = 64 << 20
+	maxCheckpointSize = 32 << 30
+	maxBlocks         = 512
+	maxRootSize       = 64 << 10
+	RoleSQLite        = "sqlite"
+	RoleGraphData     = "graph-data"
 )
 
-type Chunk struct {
-	Hash [32]byte `json:"hash"`
-	Size int64    `json:"size"`
+type Block struct {
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
 }
 
-// Checkpoint is an immutable, content-addressed recovery root.
+type File struct {
+	Role   string  `json:"role"`
+	Hash   string  `json:"hash"`
+	Size   int64   `json:"size"`
+	Blocks []Block `json:"blocks"`
+	Path   string  `json:"-"`
+}
+
+type Source struct{ Role, Path string }
+
 type Checkpoint struct {
 	ConfigID uint     `json:"config_id"`
 	Index    uint64   `json:"index"`
 	Hash     [32]byte `json:"hash"`
 	Size     int64    `json:"size"`
-	Chunks   []Chunk  `json:"chunks"`
+	Files    []File   `json:"files"`
 	RootHash [32]byte `json:"-"`
+}
+
+type currentPointer struct {
+	Index    uint64 `json:"index"`
+	RootHash string `json:"root_hash"`
 }
 
 type Manager struct {
@@ -54,126 +69,246 @@ type Manager struct {
 
 func NewManager(bucket objstore.Bucket, prefix, localDir string, configID ...uint) *Manager {
 	m := &Manager{bucket: bucket, prefix: prefix, localDir: localDir}
-	if len(configID) != 0 {
+	if len(configID) > 0 {
 		m.configID = configID[0]
 	}
 	return m
 }
 
+// Load performs two exact GETs: CURRENT and its immutable root.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	byRoot := make(map[[32]byte]Checkpoint)
+	r, err := m.bucket.Get(ctx, m.key("checkpoint/CURRENT"))
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			m.checkpoints = nil
+			return nil
+		}
+		return err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(r, maxRootSize+1))
+	closeErr := r.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var pointer currentPointer
+	if err := decodePersistedJSON(data, &pointer); err != nil {
+		return err
+	}
+	hash, err := decodeHash(pointer.RootHash)
+	if err != nil {
+		return fmt.Errorf("invalid CURRENT: %w", err)
+	}
+	root, err := m.readRoot(ctx, m.key(rootName(pointer.Index, hash)), hash)
+	if err != nil {
+		return err
+	}
+	if root.Index != pointer.Index {
+		return fmt.Errorf("CURRENT index mismatch")
+	}
+	m.checkpoints = []Checkpoint{root}
+	return nil
+}
+
+func (m *Manager) loadAll(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var roots []Checkpoint
 	err := m.bucket.Iter(ctx, m.key("checkpoint/roots"), func(name string) error {
-		index, rootHash, ok := parseRootKey(name)
+		index, hash, ok := parseRootKey(name)
 		if !ok {
 			return nil
 		}
-		root, err := m.readRoot(ctx, name, rootHash)
+		root, err := m.readRoot(ctx, name, hash)
 		if err != nil {
 			return err
 		}
 		if root.Index != index {
 			return fmt.Errorf("checkpoint root index mismatch")
 		}
-		byRoot[root.RootHash] = root
+		roots = append(roots, root)
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	m.checkpoints = m.checkpoints[:0]
-	for _, root := range byRoot {
-		m.checkpoints = append(m.checkpoints, root)
-	}
+	m.checkpoints = roots
 	m.sortRoots()
 	return nil
 }
 
-// Create is the bounded in-memory convenience API. CreateReader is the
-// streaming protocol used by the runtime.
-func (m *Manager) Create(ctx context.Context, data []byte, index uint64) error {
-	_, err := m.CreateReader(ctx, bytes.NewReader(data), index)
-	return err
-}
-
-func (m *Manager) CreateReader(ctx context.Context, reader io.Reader, index uint64) (*Checkpoint, error) {
+func (m *Manager) CreateFiles(ctx context.Context, sources []Source, index uint64) (*Checkpoint, error) {
 	if index == 0 {
 		return nil, fmt.Errorf("checkpoint index is required")
+	}
+	if err := validateSources(sources); err != nil {
+		return nil, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	root := Checkpoint{ConfigID: m.configID, Index: index}
-	stateHash := sha256.New()
-	buffer := make([]byte, chunkSize)
-	conditional := slices.Contains(m.bucket.SupportedObjectUploadOptions(), objstore.IfNotExists)
-	for {
-		n, readErr := io.ReadFull(reader, buffer)
-		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
-			return nil, readErr
+	conditional := false
+	for _, option := range m.bucket.SupportedObjectUploadOptions() {
+		conditional = conditional || option == objstore.IfNotExists
+	}
+	blocks := 0
+	for _, source := range sources {
+		file, err := m.uploadFile(ctx, source, conditional)
+		if err != nil {
+			return nil, err
 		}
-		if n != 0 {
-			if root.Size+int64(n) > maxCheckpointSize || len(root.Chunks) >= maxChunks {
-				return nil, fmt.Errorf("checkpoint exceeds %d bytes", maxCheckpointSize)
-			}
+		blocks += len(file.Blocks)
+		if blocks > maxBlocks {
+			return nil, fmt.Errorf("checkpoint exceeds %d blocks", maxBlocks)
+		}
+		root.Size += file.Size
+		root.Files = append(root.Files, file)
+	}
+	if root.Size > maxCheckpointSize {
+		return nil, fmt.Errorf("checkpoint exceeds %d bytes", maxCheckpointSize)
+	}
+	root.Hash = stateHash(root.Files)
+	data, err := json.Marshal(root)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRootSize {
+		return nil, fmt.Errorf("checkpoint root exceeds %d bytes", maxRootSize)
+	}
+	root.RootHash = sha256.Sum256(data)
+	if err := m.bucket.Upload(ctx, m.key(rootName(index, root.RootHash)), bytes.NewReader(data)); err != nil {
+		return nil, fmt.Errorf("publish checkpoint root: %w", err)
+	}
+	pointer, _ := json.Marshal(currentPointer{Index: index, RootHash: hex.EncodeToString(root.RootHash[:])})
+	if err := m.bucket.Upload(ctx, m.key("checkpoint/CURRENT"), bytes.NewReader(pointer)); err != nil {
+		return nil, fmt.Errorf("publish checkpoint CURRENT: %w", err)
+	}
+	m.checkpoints = append(m.checkpoints, root)
+	m.sortRoots()
+	log.Printf("checkpoint root published: index=%d size=%d files=%d", index, root.Size, len(root.Files))
+	copy := root
+	return &copy, nil
+}
+
+func (m *Manager) uploadFile(ctx context.Context, source Source, conditional bool) (File, error) {
+	input, err := os.Open(source.Path)
+	if err != nil {
+		return File{}, err
+	}
+	defer input.Close()
+	file := File{Role: source.Role}
+	hasher := sha256.New()
+	buffer := make([]byte, blockSize)
+	type uploadBlock struct {
+		block  Block
+		hash   [32]byte
+		offset int64
+	}
+	var uploads []uploadBlock
+	for {
+		n, readErr := io.ReadFull(input, buffer)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			return File{}, readErr
+		}
+		if n > 0 {
 			data := buffer[:n]
 			hash := sha256.Sum256(data)
-			name := m.key(chunkKey(hash))
-			if conditional {
-				uploadErr := m.bucket.Upload(ctx, name, bytes.NewReader(data), objstore.WithIfNotExists())
-				if uploadErr != nil && !m.bucket.IsConditionNotMetErr(uploadErr) {
-					return nil, fmt.Errorf("upload checkpoint chunk: %w", uploadErr)
-				}
-			} else if exists, existsErr := m.bucket.Exists(ctx, name); existsErr != nil {
-				return nil, fmt.Errorf("check checkpoint chunk: %w", existsErr)
-			} else if !exists {
-				if err := m.bucket.Upload(ctx, name, bytes.NewReader(data)); err != nil {
-					return nil, fmt.Errorf("upload checkpoint chunk: %w", err)
-				}
-			}
-			_, _ = stateHash.Write(data)
-			root.Size += int64(n)
-			root.Chunks = append(root.Chunks, Chunk{Hash: hash, Size: int64(n)})
+			_, _ = hasher.Write(data)
+			offset := file.Size
+			file.Size += int64(n)
+			block := Block{Hash: hex.EncodeToString(hash[:]), Size: int64(n)}
+			file.Blocks = append(file.Blocks, block)
+			uploads = append(uploads, uploadBlock{block: block, hash: hash, offset: offset})
 		}
 		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
 			break
 		}
 	}
-	if root.Size == 0 {
-		return nil, fmt.Errorf("empty checkpoint")
+	if file.Size == 0 {
+		return File{}, fmt.Errorf("empty checkpoint file %q", source.Role)
 	}
-	copy(root.Hash[:], stateHash.Sum(nil))
-	data, err := json.Marshal(root)
-	if err != nil {
-		return nil, err
-	}
-	root.RootHash = sha256.Sum256(data)
-	rootName := m.key(rootKey(root))
-	if exists, err := m.bucket.Exists(ctx, rootName); err != nil {
-		return nil, fmt.Errorf("check checkpoint root: %w", err)
-	} else if exists {
-		existing, err := m.readRoot(ctx, rootName, root.RootHash)
-		if err != nil {
-			return nil, err
+	file.Hash = hex.EncodeToString(hasher.Sum(nil))
+	if err := runParallel(ctx, len(uploads), func(ctx context.Context, index int) error {
+		upload := uploads[index]
+		reader := io.NewSectionReader(input, upload.offset, upload.block.Size)
+		key := m.key(blockKey(upload.hash))
+		var err error
+		if conditional {
+			err = m.bucket.Upload(ctx, key, reader, objstore.WithIfNotExists())
+			if m.bucket.IsConditionNotMetErr(err) {
+				err = nil
+			}
+		} else {
+			err = m.bucket.Upload(ctx, key, reader)
 		}
-		known := false
-		for _, checkpoint := range m.checkpoints {
-			known = known || checkpoint.RootHash == existing.RootHash
-		}
-		if !known {
-			m.checkpoints = append(m.checkpoints, existing)
-			m.sortRoots()
-		}
-		return &existing, nil
+		return err
+	}); err != nil {
+		return File{}, fmt.Errorf("upload checkpoint block: %w", err)
 	}
-	if err := m.bucket.Upload(ctx, rootName, bytes.NewReader(data)); err != nil {
-		return nil, fmt.Errorf("publish checkpoint root: %w", err)
+	return file, nil
+}
+
+func runParallel(ctx context.Context, count int, work func(context.Context, int) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+	workers := 4
+	if count < workers {
+		workers = count
 	}
-	m.checkpoints = append(m.checkpoints, root)
-	m.sortRoots()
-	log.Printf("checkpoint root published: index=%d size=%d chunks=%d", index, root.Size, len(root.Chunks))
-	copy := root
-	return &copy, nil
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if err := work(ctx, index); err != nil {
+					once.Do(func() { firstErr = err; cancel() })
+					return
+				}
+			}
+		}()
+	}
+dispatch:
+	for index := 0; index < count; index++ {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			break dispatch
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if firstErr == nil {
+		firstErr = ctx.Err()
+	}
+	return firstErr
+}
+
+func validateSources(sources []Source) error {
+	if len(sources) < 1 || len(sources) > 2 {
+		return fmt.Errorf("checkpoint requires one or two fixed-role files")
+	}
+	seen := map[string]bool{}
+	for i, source := range sources {
+		if source.Path == "" || seen[source.Role] || source.Role != RoleSQLite && source.Role != RoleGraphData {
+			return fmt.Errorf("invalid checkpoint source")
+		}
+		if i == 0 && source.Role != RoleSQLite || i == 1 && source.Role != RoleGraphData {
+			return fmt.Errorf("checkpoint sources are not in fixed role order")
+		}
+		seen[source.Role] = true
+	}
+	if !seen[RoleSQLite] || len(sources) == 2 && !seen[RoleGraphData] {
+		return fmt.Errorf("invalid checkpoint role set")
+	}
+	return nil
 }
 
 func (m *Manager) Latest() *Checkpoint {
@@ -183,13 +318,11 @@ func (m *Manager) Latest() *Checkpoint {
 		return nil
 	}
 	root := m.checkpoints[len(m.checkpoints)-1]
-	root.Chunks = append([]Chunk(nil), root.Chunks...)
 	return &root
 }
 
 func (m *Manager) OpenRoot(ctx context.Context, index uint64, rootHash [32]byte) (*Checkpoint, error) {
-	name := m.key(fmt.Sprintf("checkpoint/roots/%020d_%x.json", index, rootHash))
-	root, err := m.readRoot(ctx, name, rootHash)
+	root, err := m.readRoot(ctx, m.key(rootName(index, rootHash)), rootHash)
 	if err != nil {
 		return nil, err
 	}
@@ -199,123 +332,125 @@ func (m *Manager) OpenRoot(ctx context.Context, index uint64, rootHash [32]byte)
 	return &root, nil
 }
 
-func (m *Manager) Download(ctx context.Context, index uint64, dstPath string) error {
-	file, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	err = m.ReadTo(ctx, index, file)
-	if err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func (m *Manager) DownloadRoot(ctx context.Context, index uint64, rootHash [32]byte, dstPath string) error {
-	root, err := m.OpenRoot(ctx, index, rootHash)
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	err = m.verifyAndWrite(ctx, *root, file)
-	if err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-func (m *Manager) Read(ctx context.Context, index uint64) ([]byte, error) {
-	var data bytes.Buffer
-	if err := m.ReadTo(ctx, index, &data); err != nil {
-		return nil, err
-	}
-	return data.Bytes(), nil
-}
-
-func (m *Manager) ReadRoot(ctx context.Context, index uint64, rootHash [32]byte) ([]byte, error) {
+func (m *Manager) DownloadRootFiles(ctx context.Context, index uint64, rootHash [32]byte, dir string) ([]File, error) {
 	root, err := m.OpenRoot(ctx, index, rootHash)
 	if err != nil {
 		return nil, err
 	}
-	var data bytes.Buffer
-	if err := m.verifyAndWrite(ctx, *root, &data); err != nil {
-		return nil, err
-	}
-	return data.Bytes(), nil
-}
-
-func (m *Manager) ReadTo(ctx context.Context, index uint64, writer io.Writer) error {
-	m.mu.Lock()
-	var target *Checkpoint
-	for i := range m.checkpoints {
-		if m.checkpoints[i].Index == index {
-			if target != nil {
-				m.mu.Unlock()
-				return fmt.Errorf("checkpoint %d has multiple candidate roots; a sealed root hash is required", index)
+	files := make([]File, 0, len(root.Files))
+	for _, file := range root.Files {
+		file.Path = filePath(dir, file.Role)
+		if err := m.downloadFile(ctx, index, file); err != nil {
+			for _, created := range files {
+				_ = os.Remove(created.Path)
 			}
-			copy := m.checkpoints[i]
-			target = &copy
+			return nil, err
 		}
+		files = append(files, file)
 	}
-	m.mu.Unlock()
-	if target == nil {
-		return fmt.Errorf("checkpoint %d not found", index)
-	}
-	return m.verifyAndWrite(ctx, *target, writer)
+	return files, nil
 }
 
-// Verify independently strong-reads every object referenced by a proposed
-// checkpoint seal before the recorder may vote for it.
-func (m *Manager) Verify(ctx context.Context, index uint64, rootHash, stateHash [32]byte) error {
-	name := m.key(fmt.Sprintf("checkpoint/roots/%020d_%x.json", index, rootHash))
-	root, err := m.readRoot(ctx, name, rootHash)
+func filePath(dir, role string) string {
+	if role == RoleSQLite {
+		return path.Join(dir, "sqlite.db")
+	}
+	return path.Join(dir, "graph-data.db")
+}
+
+func (m *Manager) downloadFile(ctx context.Context, index uint64, file File) error {
+	output, err := os.OpenFile(file.Path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
-	if root.Index != index || root.Hash != stateHash {
-		return fmt.Errorf("checkpoint seal identity mismatch")
+	complete := false
+	defer func() {
+		if !complete {
+			_ = os.Remove(file.Path)
+		}
+	}()
+	if err := output.Truncate(file.Size); err != nil {
+		_ = output.Close()
+		return err
 	}
-	return m.verifyAndWrite(ctx, root, io.Discard)
-}
-
-func (m *Manager) verifyAndWrite(ctx context.Context, target Checkpoint, writer io.Writer) error {
-	stateHash := sha256.New()
-	var size int64
-	for _, chunk := range target.Chunks {
-		r, err := m.bucket.Get(ctx, m.key(chunkKey(chunk.Hash)))
+	offsets := make([]int64, len(file.Blocks))
+	for i := 1; i < len(offsets); i++ {
+		offsets[i] = offsets[i-1] + file.Blocks[i-1].Size
+	}
+	if err := runParallel(ctx, len(file.Blocks), func(ctx context.Context, blockIndex int) error {
+		block := file.Blocks[blockIndex]
+		hash, err := decodeHash(block.Hash)
 		if err != nil {
-			return fmt.Errorf("download checkpoint chunk: %w", err)
-		}
-		data, readErr := io.ReadAll(io.LimitReader(r, chunk.Size+1))
-		closeErr := r.Close()
-		if readErr != nil {
-			return readErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if int64(len(data)) != chunk.Size || sha256.Sum256(data) != chunk.Hash {
-			return fmt.Errorf("checkpoint %d chunk integrity mismatch", target.Index)
-		}
-		if _, err := writer.Write(data); err != nil {
 			return err
 		}
-		_, _ = stateHash.Write(data)
-		size += int64(len(data))
+		r, err := m.bucket.Get(ctx, m.key(blockKey(hash)))
+		if err != nil {
+			return err
+		}
+		hasher := sha256.New()
+		written, copyErr := io.Copy(io.NewOffsetWriter(output, offsets[blockIndex]), io.TeeReader(io.LimitReader(r, block.Size+1), hasher))
+		closeErr := r.Close()
+		var got [32]byte
+		copy(got[:], hasher.Sum(nil))
+		if copyErr != nil || closeErr != nil || written != block.Size || got != hash {
+			return fmt.Errorf("checkpoint %d block integrity mismatch", index)
+		}
+		return nil
+	}); err != nil {
+		_ = output.Close()
+		return err
 	}
-	var hash [32]byte
-	copy(hash[:], stateHash.Sum(nil))
-	if size != target.Size || hash != target.Hash {
-		return fmt.Errorf("checkpoint %d root integrity mismatch", target.Index)
+	if err := output.Sync(); err != nil {
+		_ = output.Close()
+		return err
+	}
+	if _, err := output.Seek(0, io.SeekStart); err != nil {
+		_ = output.Close()
+		return err
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, output); err != nil || hex.EncodeToString(hasher.Sum(nil)) != file.Hash {
+		_ = output.Close()
+		return fmt.Errorf("checkpoint %d file integrity mismatch", index)
+	}
+	if err := output.Close(); err != nil {
+		return err
+	}
+	complete = true
+	return nil
+}
+
+func (m *Manager) Verify(ctx context.Context, index uint64, rootHash, state [32]byte) error {
+	root, err := m.OpenRoot(ctx, index, rootHash)
+	if err != nil {
+		return err
+	}
+	if root.Hash != state {
+		return fmt.Errorf("checkpoint seal identity mismatch")
+	}
+	for _, file := range root.Files {
+		hasher := sha256.New()
+		var size int64
+		for _, block := range file.Blocks {
+			hash, err := decodeHash(block.Hash)
+			if err != nil {
+				return err
+			}
+			r, err := m.bucket.Get(ctx, m.key(blockKey(hash)))
+			if err != nil {
+				return err
+			}
+			data, readErr := io.ReadAll(io.LimitReader(r, block.Size+1))
+			closeErr := r.Close()
+			if readErr != nil || closeErr != nil || int64(len(data)) != block.Size || sha256.Sum256(data) != hash {
+				return fmt.Errorf("checkpoint block integrity mismatch")
+			}
+			_, _ = hasher.Write(data)
+			size += int64(len(data))
+		}
+		if size != file.Size || hex.EncodeToString(hasher.Sum(nil)) != file.Hash {
+			return fmt.Errorf("checkpoint file integrity mismatch")
+		}
 	}
 	return nil
 }
@@ -331,7 +466,7 @@ func (m *Manager) Cleanup(ctx context.Context, keep int) error {
 	}
 	remove := m.checkpoints[:len(m.checkpoints)-keep]
 	for _, root := range remove {
-		if err := m.bucket.Delete(ctx, m.key(rootKey(root))); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+		if err := m.bucket.Delete(ctx, m.key(rootName(root.Index, root.RootHash))); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
 	}
@@ -339,13 +474,11 @@ func (m *Manager) Cleanup(ctx context.Context, keep int) error {
 	return nil
 }
 
-// GarbageCollect removes old candidate roots and chunks not referenced by any
-// retained root. The grace period protects concurrent checkpoint publishers.
 func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct{}, keep int, grace time.Duration) error {
 	if keep < 1 || grace < 0 {
 		return fmt.Errorf("invalid checkpoint GC policy")
 	}
-	if err := m.Load(ctx); err != nil {
+	if err := m.loadAll(ctx); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -357,16 +490,15 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 		keepRoots[m.checkpoints[i].RootHash] = struct{}{}
 	}
 	cutoff := time.Now().Add(-grace)
-	kept := make([]Checkpoint, 0, len(m.checkpoints))
-	removed := make([]Checkpoint, 0)
+	kept, removed := make([]Checkpoint, 0, len(m.checkpoints)), make([]Checkpoint, 0)
 	for _, root := range m.checkpoints {
-		name := m.key(rootKey(root))
-		_, explicit := keepRoots[root.RootHash]
+		name := m.key(rootName(root.Index, root.RootHash))
 		attributes, err := m.bucket.Attributes(ctx, name)
 		if err != nil {
 			m.mu.Unlock()
 			return err
 		}
+		_, explicit := keepRoots[root.RootHash]
 		if explicit || attributes.LastModified.After(cutoff) {
 			kept = append(kept, root)
 			continue
@@ -378,24 +510,26 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 		removed = append(removed, root)
 	}
 	m.checkpoints = kept
-	keepChunks := make(map[[32]byte]struct{})
-	for _, root := range kept {
-		for _, chunk := range root.Chunks {
-			keepChunks[chunk.Hash] = struct{}{}
-		}
-	}
-	for _, root := range removed {
-		for _, chunk := range root.Chunks {
-			keepChunks[chunk.Hash] = struct{}{}
+	live := map[[32]byte]struct{}{}
+	for _, root := range append(append([]Checkpoint(nil), kept...), removed...) {
+		for _, file := range root.Files {
+			for _, block := range file.Blocks {
+				hash, err := decodeHash(block.Hash)
+				if err != nil {
+					m.mu.Unlock()
+					return err
+				}
+				live[hash] = struct{}{}
+			}
 		}
 	}
 	m.mu.Unlock()
-	return m.bucket.IterWithAttributes(ctx, m.key("checkpoint/chunks"), func(attributes objstore.IterObjectAttributes) error {
-		hash, ok := parseChunkKey(attributes.Name)
+	return m.bucket.IterWithAttributes(ctx, m.key("checkpoint/blocks"), func(attributes objstore.IterObjectAttributes) error {
+		hash, ok := parseBlockKey(attributes.Name)
 		if !ok {
 			return nil
 		}
-		if _, ok := keepChunks[hash]; ok {
+		if _, ok := live[hash]; ok {
 			return nil
 		}
 		modified, ok := attributes.LastModified()
@@ -423,10 +557,7 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 	}
 	defer r.Close()
 	data, err := io.ReadAll(io.LimitReader(r, maxRootSize+1))
-	if err != nil {
-		return Checkpoint{}, err
-	}
-	if len(data) > maxRootSize || sha256.Sum256(data) != expected {
+	if err != nil || len(data) > maxRootSize || sha256.Sum256(data) != expected {
 		return Checkpoint{}, fmt.Errorf("checkpoint root integrity mismatch")
 	}
 	var root Checkpoint
@@ -441,20 +572,45 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 }
 
 func (m *Manager) validateRoot(root Checkpoint) error {
-	if root.ConfigID != m.configID || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Chunks) == 0 || len(root.Chunks) > maxChunks {
+	if root.ConfigID != m.configID || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Files) < 1 || len(root.Files) > 2 {
 		return fmt.Errorf("invalid checkpoint root")
 	}
-	var size int64
-	for i, chunk := range root.Chunks {
-		if chunk.Size <= 0 || chunk.Size > chunkSize || (i+1 < len(root.Chunks) && chunk.Size != chunkSize) {
-			return fmt.Errorf("invalid checkpoint chunk layout")
+	seen, size, blocks := map[string]bool{}, int64(0), 0
+	for _, file := range root.Files {
+		if seen[file.Role] || file.Role != RoleSQLite && file.Role != RoleGraphData || file.Size <= 0 || len(file.Blocks) == 0 {
+			return fmt.Errorf("invalid checkpoint file")
 		}
-		size += chunk.Size
+		seen[file.Role] = true
+		var fileSize int64
+		for i, block := range file.Blocks {
+			if _, err := decodeHash(block.Hash); err != nil || block.Size <= 0 || block.Size > blockSize || i+1 < len(file.Blocks) && block.Size != blockSize {
+				return fmt.Errorf("invalid checkpoint block layout")
+			}
+			fileSize += block.Size
+			blocks++
+		}
+		if fileSize != file.Size {
+			return fmt.Errorf("checkpoint file size mismatch")
+		}
+		if _, err := decodeHash(file.Hash); err != nil {
+			return err
+		}
+		size += file.Size
 	}
-	if size != root.Size {
-		return fmt.Errorf("checkpoint size mismatch")
+	if !seen[RoleSQLite] || blocks > maxBlocks || size != root.Size || root.Hash != stateHash(root.Files) {
+		return fmt.Errorf("checkpoint root mismatch")
 	}
 	return nil
+}
+
+func stateHash(files []File) [32]byte {
+	h := sha256.New()
+	for _, file := range files {
+		_, _ = io.WriteString(h, file.Role+":"+file.Hash+":"+strconv.FormatInt(file.Size, 10)+"\n")
+	}
+	var result [32]byte
+	copy(result[:], h.Sum(nil))
+	return result
 }
 
 func decodePersistedJSON(data []byte, value any) error {
@@ -469,45 +625,39 @@ func decodePersistedJSON(data []byte, value any) error {
 	return nil
 }
 
-func chunkKey(chunk [32]byte) string { return fmt.Sprintf("checkpoint/chunks/%x.chunk", chunk) }
-
-func parseChunkKey(name string) ([32]byte, bool) {
-	base := strings.TrimSuffix(path.Base(name), ".chunk")
-	decoded, err := hex.DecodeString(base)
+func decodeHash(value string) ([32]byte, error) {
+	decoded, err := hex.DecodeString(value)
 	if err != nil || len(decoded) != sha256.Size {
-		return [32]byte{}, false
+		return [32]byte{}, fmt.Errorf("invalid SHA-256 digest")
 	}
 	var hash [32]byte
 	copy(hash[:], decoded)
-	return hash, true
-}
-func rootKey(root Checkpoint) string {
-	return fmt.Sprintf("checkpoint/roots/%020d_%x.json", root.Index, root.RootHash)
+	return hash, nil
 }
 
+func blockKey(hash [32]byte) string { return fmt.Sprintf("checkpoint/blocks/%x.block", hash) }
+func parseBlockKey(name string) ([32]byte, bool) {
+	hash, err := decodeHash(strings.TrimSuffix(path.Base(name), ".block"))
+	return hash, err == nil
+}
+func rootName(index uint64, hash [32]byte) string {
+	return fmt.Sprintf("checkpoint/roots/%020d_%x.json", index, hash)
+}
 func parseRootKey(name string) (uint64, [32]byte, bool) {
-	base := strings.TrimSuffix(path.Base(name), ".json")
-	parts := strings.SplitN(base, "_", 2)
-	if len(parts) != 2 || len(parts[1]) != 64 {
+	parts := strings.SplitN(strings.TrimSuffix(path.Base(name), ".json"), "_", 2)
+	if len(parts) != 2 {
 		return 0, [32]byte{}, false
 	}
 	index, err := strconv.ParseUint(parts[0], 10, 64)
-	decoded, hashErr := hex.DecodeString(parts[1])
-	if err != nil || hashErr != nil || len(decoded) != 32 {
-		return 0, [32]byte{}, false
-	}
-	var hash [32]byte
-	copy(hash[:], decoded)
-	return index, hash, true
+	hash, hashErr := decodeHash(parts[1])
+	return index, hash, err == nil && hashErr == nil
 }
-
 func (m *Manager) key(value string) string {
 	if m.prefix == "" {
 		return value
 	}
 	return m.prefix + "/" + value
 }
-
 func (m *Manager) sortRoots() {
 	sort.Slice(m.checkpoints, func(i, j int) bool {
 		if m.checkpoints[i].Index != m.checkpoints[j].Index {

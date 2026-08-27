@@ -7,8 +7,12 @@ RUN CGO_ENABLED=0 GOEXPERIMENT=arenas,greenteagc go test -tags=graph ./... && \
     CGO_ENABLED=0 GOEXPERIMENT=arenas,greenteagc go build -tags=graph -o rhiza ./cmd/rhiza
 
 FROM alpine:3.19
-RUN apk --no-cache add ca-certificates && adduser -D -u 65532 rhiza
+RUN apk --no-cache add ca-certificates && adduser -D -u 65532 rhiza \
+    && mkdir -p /data && chown 65532:65532 /data
 COPY --from=builder /app/rhiza /usr/local/bin/rhiza
+WORKDIR /data
+ENV RHIZA_DATA_DIR=/data
+VOLUME ["/data"]
 USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["rhiza"]

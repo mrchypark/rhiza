@@ -1,0 +1,56 @@
+[
+  {
+    "config": "graph-async",
+    "baseline_cpu_seconds": 6.247395,
+    "current_cpu_seconds": 6.22159,
+    "cpu_change_pct": -0.41305216014034807,
+    "baseline_peak_mib": 61.9140625,
+    "current_peak_mib": 52.375,
+    "memory_change_pct": -15.40694006309148
+  },
+  {
+    "config": "graph-async-checkpoint-1s",
+    "baseline_cpu_seconds": 11.374783,
+    "current_cpu_seconds": 8.624625,
+    "cpu_change_pct": -24.177674422448327,
+    "baseline_peak_mib": 126.72265625,
+    "current_peak_mib": 88.28125,
+    "memory_change_pct": -30.335069819056137
+  },
+  {
+    "config": "graph-before-ack",
+    "baseline_cpu_seconds": 7.230268,
+    "current_cpu_seconds": 7.497359,
+    "cpu_change_pct": 3.694067771761711,
+    "baseline_peak_mib": 70.69921875,
+    "current_peak_mib": 73.48046875,
+    "memory_change_pct": 3.9339190010497793
+  },
+  {
+    "config": "sql-async",
+    "baseline_cpu_seconds": 7.028955,
+    "current_cpu_seconds": 7.152531,
+    "cpu_change_pct": 1.7580991769046816,
+    "baseline_peak_mib": 63.0078125,
+    "current_peak_mib": 78.8125,
+    "memory_change_pct": 25.083694978301295
+  },
+  {
+    "config": "sql-async-checkpoint-1s",
+    "baseline_cpu_seconds": 7.080323,
+    "current_cpu_seconds": 8.128995,
+    "cpu_change_pct": 14.811075709399123,
+    "baseline_peak_mib": 82.21484375,
+    "current_peak_mib": 93.53515625,
+    "memory_change_pct": 13.769183256521123
+  },
+  {
+    "config": "sql-before-ack",
+    "baseline_cpu_seconds": 7.937201,
+    "current_cpu_seconds": 6.626371,
+    "cpu_change_pct": -16.515015809729405,
+    "baseline_peak_mib": 93.75390625,
+    "current_peak_mib": 67.421875,
+    "memory_change_pct": -28.086329736260986
+  }
+]

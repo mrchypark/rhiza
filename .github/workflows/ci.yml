@@ -32,6 +32,12 @@ jobs:
           GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
         run: go build ./cmd/rhiza
 
+      - name: Production runtime experiments
+        if: matrix.arenas == false
+        env:
+          GOEXPERIMENT: arenas,greenteagc
+        run: go test ./...
+
       - name: Graph profile
         if: matrix.arenas == false
         run: go test -tags graph ./...
@@ -39,6 +45,10 @@ jobs:
       - name: Race detector
         if: matrix.arenas == false
         run: go test -race ./...
+
+      - name: Graph race detector
+        if: matrix.arenas == false
+        run: go test -race -tags graph ./...
 
       - name: Vulnerability scan
         if: matrix.arenas == false

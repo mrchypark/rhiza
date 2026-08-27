@@ -157,13 +157,48 @@ func TestFailedSQLCommandRecordsResultAndAdvancesTip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := m.RequestResult(ctx, "duplicate")
-	if err != nil || result.Error == "" || m.Tip() != 4 {
-		t.Fatalf("result=%+v tip=%d err=%v", result, m.Tip(), err)
+	receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, "duplicate")
+	if err != nil || !found || receipt.Status != types.MutationRejected || m.Tip() != 4 {
+		t.Fatalf("receipt=%+v found=%v tip=%d err=%v", receipt, found, m.Tip(), err)
 	}
 	var count int
 	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM failures").Scan(&count); err != nil || count != 2 {
 		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestIdempotencyReceiptExpiresAtWindowBoundary(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/retention.db", 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "old", SQL: "CREATE TABLE retained (id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [types.ReadBarrierNonceSize]byte
+	for slot := uint64(2); slot <= 1025; slot++ {
+		nonce[0] = byte(slot)
+		if err := m.Apply(ctx, slot, types.EncodeReadBarrier(nonce)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, found, err := m.MutationReceipt(ctx, types.MutationSQL, "old"); err != nil || found {
+		t.Fatalf("expired receipt found=%v err=%v", found, err)
+	}
+}
+
+func TestSQLCommandRejectsMutationRows(t *testing.T) {
+	command := types.SQLCommand{RequestID: "aggregate", Statements: []types.SQLStatement{
+		{SQL: "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<6000) SELECT n FROM seq", WantRows: true},
+	}}
+	if err := ValidateSQLCommand(command); err == nil {
+		t.Fatal("mutation row result was accepted")
 	}
 }
 
@@ -176,7 +211,7 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	defer m.Close()
 	command := types.SQLCommand{RequestID: "tx", Statements: []types.SQLStatement{
 		{SQL: "CREATE TABLE features (id INTEGER PRIMARY KEY, name TEXT)"},
-		{SQL: "INSERT INTO features(name) VALUES (?) RETURNING id, name", Args: []any{"safe"}, WantRows: true},
+		{SQL: "INSERT INTO features(name) VALUES (?)", Args: []any{"safe"}},
 	}}
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
 	if err != nil {
@@ -185,11 +220,11 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	if err := m.Apply(ctx, 1, value); err != nil {
 		t.Fatal(err)
 	}
-	result, err := m.RequestResult(ctx, "tx")
+	result, err := m.QueryResult(ctx, "SELECT name FROM features", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := result.Statements[1].Rows[0][1]; got != "safe" {
+	if got := result.Rows[0][0]; got != "safe" {
 		t.Fatalf("returning name=%v", got)
 	}
 	snapshot, err := m.Snapshot(ctx)
@@ -286,15 +321,9 @@ func TestMaterializerHiqliteSQLSurface(t *testing.T) {
 			{SQL: `CREATE TRIGGER feature_audit AFTER UPDATE OF score ON feature BEGIN INSERT INTO audit VALUES (old.id, old.score, new.score); END`},
 			{SQL: `CREATE VIRTUAL TABLE feature_search USING fts5(name)`},
 		}},
-		{RequestID: "insert", SQL: `INSERT INTO feature(name, score) VALUES (?, ?) RETURNING id, doubled`, Args: []any{"Ada", int64(3)}, WantRows: true},
-		{RequestID: "cte-upsert", SQL: `WITH input(name, score) AS (VALUES ('Ada', 5), ('Grace', 7)) INSERT INTO feature(name, score) SELECT name, score FROM input WHERE true ON CONFLICT(lower(name)) WHERE score >= 0 DO UPDATE SET score = excluded.score RETURNING name, doubled`, WantRows: true},
+		{RequestID: "insert", SQL: `INSERT INTO feature(name, score) VALUES (?, ?)`, Args: []any{"Ada", int64(3)}},
+		{RequestID: "cte-upsert", SQL: `WITH input(name, score) AS (VALUES ('Ada', 5), ('Grace', 7)) INSERT INTO feature(name, score) SELECT name, score FROM input WHERE true ON CONFLICT(lower(name)) WHERE score >= 0 DO UPDATE SET score = excluded.score`},
 		{RequestID: "fts", SQL: `INSERT INTO feature_search(name) SELECT name FROM feature`},
-		{RequestID: "selects", Statements: []types.SQLStatement{
-			{SQL: `WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 3) SELECT json_extract('{"ok":true}', '$.ok'), group_concat(n, '') FROM seq`, WantRows: true},
-			{SQL: `SELECT name, row_number() OVER (ORDER BY score DESC) AS rank FROM feature ORDER BY rank`, WantRows: true},
-			{SQL: `SELECT name FROM feature_search WHERE feature_search MATCH 'Grace'`, WantRows: true},
-			{SQL: `SELECT changes(), last_insert_rowid()`, WantRows: true},
-		}},
 	}
 	for slot, command := range commands {
 		if err := ValidateSQLCommand(command); err != nil {
@@ -308,17 +337,25 @@ func TestMaterializerHiqliteSQLSurface(t *testing.T) {
 			t.Fatalf("apply slot %d: %v", slot+1, err)
 		}
 	}
-	result, err := m.RequestResult(ctx, "selects")
+	result, err := m.QueryResult(ctx, `WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 3) SELECT json_extract('{"ok":true}', '$.ok'), group_concat(n, '') FROM seq`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := result.Statements[0].Rows[0]; len(got) != 2 || got[0] != float64(1) || got[1] != "123" {
+	if got := result.Rows[0]; len(got) != 2 || got[0] != int64(1) || got[1] != "123" {
 		t.Fatalf("recursive CTE/JSON result=%v types=%T,%T", got, got[0], got[1])
 	}
-	if got := result.Statements[1].Rows; len(got) != 2 || got[0][0] != "Grace" || got[0][1] != float64(1) {
+	result, err = m.QueryResult(ctx, `SELECT name, row_number() OVER (ORDER BY score DESC) AS rank FROM feature ORDER BY rank`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Rows; len(got) != 2 || got[0][0] != "Grace" || got[0][1] != int64(1) {
 		t.Fatalf("window result=%v", got)
 	}
-	if got := result.Statements[2].Rows; len(got) != 1 || got[0][0] != "Grace" {
+	result, err = m.QueryResult(ctx, `SELECT name FROM feature_search WHERE feature_search MATCH 'Grace'`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result.Rows; len(got) != 1 || got[0][0] != "Grace" {
 		t.Fatalf("FTS5 result=%v", got)
 	}
 }

@@ -1,0 +1,35 @@
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/checkpoint	0.547s
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	0.476s
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/network	0.480s
+?   	github.com/mrchypark/rhiza/pkg/network/peerfb	[no test files]
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/node	0.595s
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/qlog	0.378s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M3
+BenchmarkCoreProposeThreePeers-8      	      25	  24175475 ns/op	   63106 B/op	     370 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      24	  24523634 ns/op	   65271 B/op	     379 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      36	  24005881 ns/op	   61930 B/op	     355 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      32	  17889676 ns/op	   43537 B/op	     258 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      33	  17309447 ns/op	   44127 B/op	     261 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      32	  17565686 ns/op	   44643 B/op	     261 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  704472	      1608 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  722209	      1048 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  578800	       925.5 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  776308	       907.5 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  767905	      1111 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  778268	       959.0 ns/op	     417 B/op	       7 allocs/op
+BenchmarkCoreLocalReadIndex-8         	49040978	        11.74 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	57043708	        11.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	55085461	        10.46 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	14.443s
+?   	github.com/mrchypark/rhiza/pkg/quepaxa/walfb	[no test files]
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/recovery	0.531s

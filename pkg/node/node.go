@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -277,20 +279,20 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			if quepaxa.Slot(certifiedCheckpoint.Index) > core.Tip() {
 				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", certifiedCheckpoint.Index, core.Tip())
 			}
-			file, fileErr := os.CreateTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
+			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
 			if fileErr != nil {
 				return fileErr
 			}
-			path := file.Name()
-			if closeErr := file.Close(); closeErr != nil {
-				_ = os.Remove(path)
-				return closeErr
-			}
-			defer os.Remove(path)
-			if readErr := n.checkpoints.DownloadRoot(ctx, certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, path); readErr != nil {
+			defer os.RemoveAll(dir)
+			files, readErr := n.checkpoints.DownloadRootFiles(ctx, certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+			if readErr != nil {
 				return readErr
 			}
-			if restoreErr := material.RestoreFile(ctx, path); restoreErr != nil {
+			materialFiles := make([]materializer.CheckpointFile, 0, len(files))
+			for _, file := range files {
+				materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+			}
+			if restoreErr := material.RestoreCheckpoint(ctx, materialFiles); restoreErr != nil {
 				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
 			}
 		}
@@ -354,9 +356,14 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.checkpoints != nil {
 		interval := n.config.CheckpointInterval
 		if interval <= 0 {
-			interval = time.Minute
+			interval = 15 * time.Minute
 		}
 		n.checkpointer = checkpoint.NewAutoCheckpointer(n.checkpoints, material, 1, interval)
+		tailBytes := n.config.CheckpointTailBytes
+		if tailBytes <= 0 {
+			tailBytes = 512 << 20
+		}
+		n.checkpointer.ConfigureTail(n.wal.Bytes, tailBytes)
 		n.checkpointer.ConfigurePublication(
 			func() bool {
 				order := core.ProposerOrder()
@@ -573,24 +580,60 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 }
 
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
+	n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
+	var round uint64
 	for {
-		if err := n.catchUp(ctx, transport, cluster); err != nil {
-			// A transient peer timeout must not make an already caught-up node
-			// reject traffic; quorum operations enforce their own availability.
-			n.ready.Store(false)
-			log.Printf("quorum catch-up failed: %v", err)
-		} else {
-			n.ready.Store(true)
-		}
+		delay := syncInterval(n.config.NodeID, round)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second):
+		case <-time.After(delay):
 		}
+		if !n.ready.Load() {
+			n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
+		} else if source, ok := syncSource(n.config.NodeID, cluster.Members, round); ok {
+			if err := n.catchUpPeer(ctx, transport, source); err != nil {
+				log.Printf("operation sync from %s failed: %v", source, err)
+			}
+		}
+		round++
 	}
 }
 
-func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
+func syncInterval(nodeID quepaxa.NodeID, round uint64) time.Duration {
+	hash := sha256.Sum256([]byte(fmt.Sprintf("rhiza-sync-jitter:%s:%d", nodeID, round)))
+	return time.Duration(900+binary.BigEndian.Uint16(hash[:2])%201) * time.Millisecond
+}
+
+func syncSource(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) (quepaxa.NodeID, bool) {
+	peers := make([]quepaxa.NodeID, 0, len(members)-1)
+	for _, member := range members {
+		if member.ID != nodeID {
+			peers = append(peers, member.ID)
+		}
+	}
+	if len(peers) == 0 {
+		return "", false
+	}
+	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-sync-peer:%s:%d", nodeID, round/uint64(len(peers)))))
+	for i := len(peers) - 1; i > 0; i-- {
+		j := int(binary.BigEndian.Uint64(seed[(i*8)%24:]) % uint64(i+1))
+		peers[i], peers[j] = peers[j], peers[i]
+	}
+	return peers[round%uint64(len(peers))], true
+}
+
+func (n *Node) observeCatchUp(err error) {
+	if err != nil {
+		// A transient peer timeout must not make an already caught-up node
+		// reject traffic; quorum operations enforce their own availability.
+		log.Printf("quorum catch-up failed: %v", err)
+		return
+	}
+	n.ready.Store(true)
+}
+
+func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
 	for {
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return err
@@ -601,7 +644,7 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 			err      error
 		}
 		results := make(chan result, len(cluster.Members)-1)
-		roundCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		roundCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 		pending := 0
 		for _, member := range cluster.Members {
 			if member.ID == n.config.NodeID {
@@ -609,7 +652,7 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 			}
 			pending++
 			go func(source quepaxa.NodeID) {
-				response, err := transport.FetchDecisions(roundCtx, source, applied+1, 256)
+				response, err := transport.FetchDecisions(roundCtx, source, applied+1, 128)
 				results <- result{response: response, err: err}
 			}(member.ID)
 		}
@@ -652,6 +695,36 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 		}
 		if len(best.Decisions) == 0 {
 			return fmt.Errorf("catch-up source reported tip %d without slot %d", best.Tip, expected)
+		}
+	}
+}
+
+func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, source quepaxa.NodeID) error {
+	for {
+		if err := n.replayLocalDecisions(ctx); err != nil {
+			return err
+		}
+		from := quepaxa.Slot(n.material.Tip()) + 1
+		pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		response, err := transport.FetchDecisions(pageCtx, source, from, 128)
+		cancel()
+		if err != nil {
+			return err
+		}
+		if response.Tip < from {
+			return nil
+		}
+		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
+			return fmt.Errorf("operation sync source %s omitted slot %d", source, from)
+		}
+		if err := n.core.AcceptCertifiedValues(response.Decisions); err != nil {
+			return err
+		}
+		if err := n.material.ApplyBatch(ctx, response.Decisions); err != nil {
+			return err
+		}
+		if quepaxa.Slot(n.material.Tip()) >= response.Tip {
+			return nil
 		}
 	}
 }

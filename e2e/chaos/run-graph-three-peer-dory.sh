@@ -8,6 +8,14 @@ two_failures="rhiza-graph-two-peer-failure"
 tmp_dir="$(mktemp -d -t rhiza-graph-3peer.XXXXXX)"
 pf_pids=()
 
+for peer in 0 1 2; do
+  port="$((base_port + peer))"
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null; then
+    echo "local port ${port} is already in use; set RHIZA_GRAPH_E2E_PORT" >&2
+    exit 1
+  fi
+done
+
 cleanup() {
   dory k8s delete podchaos "$one_failure" "$two_failures" -n rhiza-graph-3peer-e2e --ignore-not-found --wait=true >/dev/null
   for pid in "${pf_pids[@]}"; do
@@ -56,6 +64,7 @@ write_seconds="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_total}' -H 'Con
   "{\"request_id\":\"during-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'during', value: 'fault'})\"}" \
   "$node1/graph/execute")"
 dory k8s wait podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=180s
+dory k8s delete podchaos/"$one_failure" -n rhiza-graph-3peer-e2e --wait=true >/dev/null
 dory k8s delete pod rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
 wait_for_pod rhiza-graph-2
 dory k8s wait pod/rhiza-graph-2 -n rhiza-graph-3peer-e2e --for=condition=Ready --timeout=180s
@@ -106,6 +115,7 @@ if [[ "$status" != 503 ]]; then
   exit 1
 fi
 dory k8s wait podchaos/"$two_failures" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=90s
+dory k8s delete podchaos/"$two_failures" -n rhiza-graph-3peer-e2e --wait=true >/dev/null
 dory k8s delete pod rhiza-graph-0 rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
 wait_for_pod rhiza-graph-0
 wait_for_pod rhiza-graph-2

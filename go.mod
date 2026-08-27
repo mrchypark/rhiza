@@ -11,7 +11,7 @@ require (
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
 )
 
-replace github.com/mstrYoda/goraphdb => github.com/mrchypark/goraphdb v0.0.0-20260825112047-b95a252a40fa
+replace github.com/mstrYoda/goraphdb => github.com/mrchypark/goraphdb v0.0.0-20260827101547-daa7ce485e6b
 
 require (
 	cloud.google.com/go v0.121.0 // indirect

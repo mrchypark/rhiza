@@ -3,18 +3,70 @@
 package materializer
 
 import (
-	"archive/zip"
-	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	graphdb "github.com/mstrYoda/goraphdb"
 )
+
+func TestGraphResultUsesAggregateByteBudget(t *testing.T) {
+	value := strings.Repeat("x", 1<<20-2)
+	result := &graphdb.CypherResult{Columns: []string{"value"}}
+	for range 17 {
+		result.Rows = append(result.Rows, map[string]any{"value": value})
+	}
+	if _, err := collectGoraphRows(result); err == nil {
+		t.Fatal("aggregate graph result byte limit was not enforced")
+	}
+}
+
+func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	command := types.GraphCommand{RequestID: "ahead", Cypher: `CREATE (:Item {id: 'one'})`}
+	value, err := types.EncodeGraphCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands, graph, err := types.DecodeGraphBatch(value)
+	if err != nil || !graph {
+		t.Fatalf("decode graph=%v err=%v", graph, err)
+	}
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.applyGraph(ctx, 1, value, commands, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	other, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "other", Cypher: `CREATE (:Item {id: 'other'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, other); err == nil {
+		t.Fatal("graph-ahead state accepted a different decision")
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := m.graph.db.GetMetadata(graphJournalKey)
+	if err != nil || len(journal) != 0 {
+		t.Fatalf("confirmed recovery journal=%x err=%v", journal, err)
+	}
+}
 
 func BenchmarkGraphApply(b *testing.B) {
 	m, err := Open(filepath.Join(b.TempDir(), "sqlite.db"), 1)
@@ -34,13 +86,6 @@ func BenchmarkGraphApply(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-}
-
-type zeroReader struct{}
-
-func (zeroReader) Read(p []byte) (int, error) {
-	clear(p)
-	return len(p), nil
 }
 
 func TestGraphAndKVMaterializer(t *testing.T) {
@@ -78,12 +123,13 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	if err != nil || !found || string(got) != "graph" {
 		t.Fatalf("KV got=%q found=%v err=%v", got, found, err)
 	}
-	snapshot, err := m.Snapshot(ctx)
+	snapshot, _, cleanup, err := m.CheckpointFilesAt(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer cleanup()
 	applyGraph(4, types.GraphCommand{RequestID: "person-2", Cypher: `CREATE (p:Person {id: '2', name: 'Grace'})`})
-	if err := m.Restore(ctx, snapshot); err != nil {
+	if err := m.RestoreCheckpoint(ctx, snapshot); err != nil {
 		t.Fatal(err)
 	}
 	result, err = m.GraphQuery(ctx, `MATCH (p:Person) RETURN p.name ORDER BY p.name`, nil)
@@ -104,29 +150,6 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	defer m.Close()
 	if m.Tip() != 3 {
 		t.Fatalf("tip=%d, want 3", m.Tip())
-	}
-}
-
-func TestGraphSnapshotRejectsExcessiveExpansion(t *testing.T) {
-	var archive bytes.Buffer
-	archive.WriteString(graphSnapshotMagic)
-	zw := zip.NewWriter(&archive)
-	entry, err := zw.Create("sqlite.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := io.CopyN(entry, zeroReader{}, minGraphSnapshotExtracted+1); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(t.TempDir(), "checkpoint.zip")
-	if err := os.WriteFile(path, archive.Bytes(), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := prepareSnapshotFile(path, t.TempDir()); err == nil {
-		t.Fatal("excessively expanded graph checkpoint was accepted")
 	}
 }
 
@@ -151,9 +174,9 @@ func TestFailedGraphCommandRecordsResultAndAdvancesTip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := m.GraphRequestResult(ctx, "invalid")
-	if err != nil || result.Error == "" || m.Tip() != 3 {
-		t.Fatalf("result=%+v tip=%d err=%v", result, m.Tip(), err)
+	receipt, found, err := m.GraphMutationReceipt(ctx, "invalid")
+	if err != nil || !found || receipt.Status != types.MutationRejected || m.Tip() != 3 {
+		t.Fatalf("receipt=%+v found=%v tip=%d err=%v", receipt, found, m.Tip(), err)
 	}
 	rows, err := m.GraphQuery(ctx, `MATCH (n:Item) RETURN n.id ORDER BY n.id`, nil)
 	if err != nil || len(rows.Rows) != 2 {
@@ -183,9 +206,35 @@ func TestGraphBatchAppliesEveryCommandAtOneSlot(t *testing.T) {
 		t.Fatalf("rows=%+v tip=%d err=%v", rows, m.Tip(), err)
 	}
 	for _, command := range commands {
-		if _, err := m.GraphRequestResult(context.Background(), command.RequestID); err != nil {
-			t.Fatalf("request %q: %v", command.RequestID, err)
+		if _, found, err := m.GraphMutationReceipt(context.Background(), command.RequestID); err != nil || !found {
+			t.Fatalf("request %q: found=%v err=%v", command.RequestID, found, err)
 		}
+	}
+}
+
+func TestGraphIdempotencyReceiptExpiresAtWindowBoundary(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "old", Cypher: `CREATE (:Item {id: '1'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [types.ReadBarrierNonceSize]byte
+	for slot := uint64(2); slot <= 1025; slot++ {
+		nonce[0] = byte(slot)
+		if err := m.Apply(ctx, slot, types.EncodeReadBarrier(nonce)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, found, err := m.GraphMutationReceipt(ctx, "old"); err != nil || found {
+		t.Fatalf("expired receipt found=%v err=%v", found, err)
 	}
 }
 
@@ -197,7 +246,7 @@ func TestGraphQueryWaitsForSQLiteApply(t *testing.T) {
 	defer m.Close()
 
 	m.mu.Lock()
-	if err := m.graph.advanceTip(context.Background(), 1); err != nil {
+	if err := m.graph.advanceTip(context.Background(), 1, [32]byte{}); err != nil {
 		m.mu.Unlock()
 		t.Fatal(err)
 	}

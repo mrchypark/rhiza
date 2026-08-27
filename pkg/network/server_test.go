@@ -188,7 +188,7 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 		if !errors.As(err, &unknown) || unknown.Slot == 0 || unknown.RequestID != req.RequestID {
 			t.Fatalf("commit unknown detail=%#v", unknown)
 		}
-		status, statusErr := server.RequestStatus(context.Background(), RequestStatusRequest{RequestID: req.RequestID, Slot: uint64(unknown.Slot)})
+		status, statusErr := server.RequestStatus(context.Background(), RequestStatusRequest{Kind: "sql", RequestID: req.RequestID})
 		if statusErr != nil || status.State != "committed" {
 			t.Fatalf("status=%+v err=%v", status, statusErr)
 		}
@@ -379,8 +379,8 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 		return res
 	}
 
-	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["bound"],"want_rows":true}]}`)
-	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"bound"`)) {
+	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?)","args":["bound"]}]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"status":"committed"`)) {
 		t.Fatalf("SQL status=%d body=%s", res.Code, res.Body.String())
 	}
 	res = request("/sql/query", `{"sql":"SELECT name FROM api WHERE id = ?","args":[1],"consistency":"local"}`)
@@ -464,7 +464,7 @@ func TestNotifyRetryIsIdempotentAndChangedPayloadConflicts(t *testing.T) {
 	}
 	second, err := server.NotifyPublish(context.Background(), command)
 	if err != nil || first != second {
-		t.Fatalf("retry slot=%d want=%d err=%v", second, first, err)
+		t.Fatalf("retry receipt=%+v want=%+v err=%v", second, first, err)
 	}
 	if got := <-ch; !bytes.Equal(got, command.Payload) {
 		t.Fatalf("payload=%q", got)

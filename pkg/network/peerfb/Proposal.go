@@ -7,10 +7,10 @@ import (
 )
 
 type ProposalT struct {
-	Priority []byte `json:"priority"`
+	Priority   []byte `json:"priority"`
 	ProposerId string `json:"proposer_id"`
-	Hash []byte `json:"hash"`
-	Value []byte `json:"value"`
+	Hash       []byte `json:"hash"`
+	Value      []byte `json:"value"`
 }
 
 func (t *ProposalT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {

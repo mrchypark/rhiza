@@ -26,9 +26,13 @@ func main() {
 	if err != nil || hedgeDelay < 0 {
 		log.Fatalf("invalid RHIZA_HEDGE_DELAY")
 	}
-	checkpointInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_CHECKPOINT_INTERVAL", "1m"))
+	checkpointInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_CHECKPOINT_INTERVAL", "15m"))
 	if err != nil || checkpointInterval < 0 {
 		log.Fatalf("invalid RHIZA_CHECKPOINT_INTERVAL")
+	}
+	checkpointTailBytes, err := strconv.ParseInt(getEnvOrDefault("RHIZA_CHECKPOINT_TAIL_BYTES", "536870912"), 10, 64)
+	if err != nil || checkpointTailBytes <= 0 || checkpointTailBytes > 2<<30 {
+		log.Fatalf("invalid RHIZA_CHECKPOINT_TAIL_BYTES")
 	}
 	objStoreSyncInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_SYNC_INTERVAL", "1m"))
 	if err != nil || objStoreSyncInterval < 0 {
@@ -74,6 +78,7 @@ func main() {
 		ObjStoreGCInterval:    objStoreGCInterval,
 		ObjStoreGCGracePeriod: objStoreGCGracePeriod,
 		CheckpointInterval:    checkpointInterval,
+		CheckpointTailBytes:   checkpointTailBytes,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -7,8 +7,8 @@ import (
 )
 
 type RecordRequestT struct {
-	Slot uint64 `json:"slot"`
-	Step uint64 `json:"step"`
+	Slot     uint64     `json:"slot"`
+	Step     uint64     `json:"step"`
 	Proposal *ProposalT `json:"proposal"`
 }
 

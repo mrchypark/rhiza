@@ -1562,7 +1562,7 @@ func (c *Core) recover() error {
 			}
 			c.durable[decision.Slot] = true
 			c.logged[decision.Slot] = true
-			c.byHash[decision.Proposal.Hash] = decision.Slot
+			c.updateHashIndexLocked(decision.Proposal.Hash, decision.Slot)
 			delete(c.recorders, decision.Slot)
 			c.mu.Unlock()
 		}

@@ -62,6 +62,7 @@ type ExecutionConfig struct {
 	ObjStoreGCGracePeriod time.Duration         `json:"objstore_gc_grace_period"`
 
 	// Timing
-	CheckpointInterval time.Duration `json:"checkpoint_interval"`
-	HedgeDelay         time.Duration `json:"hedge_delay"`
+	CheckpointInterval  time.Duration `json:"checkpoint_interval"`
+	CheckpointTailBytes int64         `json:"checkpoint_tail_bytes"`
+	HedgeDelay          time.Duration `json:"hedge_delay"`
 }

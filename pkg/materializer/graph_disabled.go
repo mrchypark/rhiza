@@ -12,12 +12,22 @@ import (
 )
 
 type graphState struct{}
+type graphFileSnapshot struct{}
+
+func (*graphFileSnapshot) WriteTo(context.Context, io.Writer) (int64, error) {
+	return 0, fmt.Errorf("graph is disabled")
+}
+func (*graphFileSnapshot) Close() error { return nil }
+func (*Materializer) beginGraphFileSnapshot() (*graphFileSnapshot, error) {
+	return nil, fmt.Errorf("graph is disabled")
+}
+func (*Materializer) graphTip() uint64 { return 0 }
 
 func BuildProfile() types.Profile { return types.ProfileSQL }
 func GraphEnabled() bool          { return false }
 
-func openGraph(string, uint64) (*graphState, error) { return nil, nil }
-func (*graphState) close()                          {}
+func openGraph(string, uint64, uint64) (*graphState, error) { return nil, nil }
+func (*graphState) close()                                  {}
 
 func (m *Materializer) applyGraph(_ context.Context, _ uint64, _ []byte, _ []types.GraphCommand, graph bool) error {
 	if graph {
@@ -27,10 +37,6 @@ func (m *Materializer) applyGraph(_ context.Context, _ uint64, _ []byte, _ []typ
 }
 
 func (*Materializer) GraphQuery(context.Context, string, map[string]any) (types.GraphCommandResult, error) {
-	return types.GraphCommandResult{}, fmt.Errorf("graph API is not supported by the sql-kv build")
-}
-
-func (*Materializer) GraphRequestResult(context.Context, string) (types.GraphCommandResult, error) {
 	return types.GraphCommandResult{}, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
@@ -64,3 +70,9 @@ func (*Materializer) validateRestoredSnapshot() error { return nil }
 func (*Materializer) graphHealth() error { return nil }
 
 func (*Materializer) graphRequestExists(string) (bool, error) { return false, nil }
+
+func (*Materializer) GraphMutationReceipt(context.Context, string) (types.MutationReceipt, bool, error) {
+	return types.MutationReceipt{}, false, fmt.Errorf("graph API is not supported by the sql-kv build")
+}
+
+func (*Materializer) confirmGraphThrough(context.Context, uint64) error { return nil }

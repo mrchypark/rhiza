@@ -116,6 +116,12 @@ spec:
             - name: peer-quic
               containerPort: 9090
               protocol: UDP
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 90
           readinessProbe:
             httpGet:
               path: /ready

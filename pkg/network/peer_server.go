@@ -210,8 +210,8 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			return nil, err
 		}
 		return &peerfb.ResponseT{}, nil
-	case peerfb.OperationDecisions:
-		if request.From == 0 || request.Limit == 0 || request.Limit > 256 {
+	case peerfb.OperationSync:
+		if request.From == 0 || request.Limit == 0 || request.Limit > 128 {
 			return nil, fmt.Errorf("invalid decisions range")
 		}
 		decisions, tip, err := s.server.core.DecisionsFrom(quepaxa.Slot(request.From), int(request.Limit))

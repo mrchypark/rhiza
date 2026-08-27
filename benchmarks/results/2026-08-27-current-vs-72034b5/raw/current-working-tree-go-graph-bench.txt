@@ -1,0 +1,75 @@
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/checkpoint	0.483s
+2026/08/27 18:59:04 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:04 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply2426190139/001/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:04 INFO database closed
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-8   	2026/08/27 18:59:04 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:04 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply240004934/002/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:04 INFO database closed
+2026/08/27 18:59:04 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:04 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply2994802612/003/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:04 INFO database closed
+2026/08/27 18:59:04 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:04 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply1923226433/004/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:05 INFO database closed
+    3604	    190692 ns/op	  360163 B/op	     458 allocs/op
+BenchmarkGraphApply-8   	2026/08/27 18:59:05 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:05 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply1039360503/001/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:05 INFO database closed
+2026/08/27 18:59:05 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:05 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply1395425091/002/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:05 INFO database closed
+2026/08/27 18:59:05 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:05 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply3146367462/003/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:06 INFO database closed
+    2322	    259240 ns/op	  351918 B/op	     455 allocs/op
+BenchmarkGraphApply-8   	2026/08/27 18:59:06 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:06 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply1018439845/001/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:06 INFO database closed
+2026/08/27 18:59:06 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:06 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply1939067796/002/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:06 INFO database closed
+2026/08/27 18:59:06 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:06 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply1692513886/003/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:06 INFO database closed
+2026/08/27 18:59:06 INFO bloom filter initialized edges=0 bloom_bits=10048 bloom_memory_bytes=1256
+2026/08/27 18:59:06 INFO database opened dir=/var/folders/r4/bygqtzg554v3dh6zd8z41zgw0000gn/T/BenchmarkGraphApply289859801/004/goraphdb shards=1 workers=8 cache_budget_bytes=134217728
+2026/08/27 18:59:07 INFO database closed
+    2869	    181761 ns/op	  355598 B/op	     456 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	3.122s
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/network	0.497s
+?   	github.com/mrchypark/rhiza/pkg/network/peerfb	[no test files]
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/node	0.577s
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/qlog	0.354s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M3
+BenchmarkCoreProposeThreePeers-8      	      22	  23522633 ns/op	   65305 B/op	     385 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      22	  25510216 ns/op	   67761 B/op	     394 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      30	  23474315 ns/op	   63367 B/op	     358 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      27	  19711969 ns/op	   45999 B/op	     275 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      32	  18086508 ns/op	   44153 B/op	     260 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      27	  19132099 ns/op	   46034 B/op	     275 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  641044	      1471 ns/op	     402 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  432888	      1416 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  407476	      1363 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  729076	      1053 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  650349	       993.6 ns/op	     418 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  709884	      1061 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreLocalReadIndex-8         	53988188	        10.94 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	60824678	        11.85 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	50382241	        12.37 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	13.040s
+?   	github.com/mrchypark/rhiza/pkg/quepaxa/walfb	[no test files]
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/recovery	0.519s

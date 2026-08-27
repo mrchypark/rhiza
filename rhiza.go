@@ -22,6 +22,7 @@ type SQLStatement = types.SQLStatement
 type GraphCommand = types.GraphCommand
 type GraphResult = types.GraphCommandResult
 type NotifyCommand = types.NotifyCommand
+type MutationReceipt = types.MutationReceipt
 
 type ExecuteRequest = network.ExecuteRequest
 type ExecuteResponse = network.ExecuteResponse
@@ -64,6 +65,7 @@ type Config struct {
 	ObjStoreGCInterval    time.Duration
 	ObjStoreGCGracePeriod time.Duration
 	CheckpointInterval    time.Duration
+	CheckpointTailBytes   int64
 	HedgeDelay            time.Duration
 }
 
@@ -122,7 +124,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, HedgeDelay: config.HedgeDelay,
+		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, HedgeDelay: config.HedgeDelay,
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {
@@ -171,7 +173,7 @@ func (db *DB) GraphExecute(ctx context.Context, req GraphCommand) (GraphExecuteR
 func (db *DB) GraphQuery(ctx context.Context, req GraphQueryRequest) (GraphResult, error) {
 	return db.api.GraphQuery(ctx, req)
 }
-func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (uint64, error) {
+func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (MutationReceipt, error) {
 	return db.api.NotifyPublish(ctx, req)
 }
 func (db *DB) NotifySubscribe(topic string) (<-chan []byte, func(), error) {

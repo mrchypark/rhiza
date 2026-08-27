@@ -15,7 +15,35 @@ var notifyCommandMagic = []byte("QNTF\x00")
 var graphBatchMagic = []byte("QGRB\x00")
 
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
-const MaxRequestIDBytes = 256
+const MaxRequestIDBytes = 64
+const DefaultIdempotencyWindowSlots = 65_536
+
+type MutationKind uint8
+
+const (
+	MutationSQL MutationKind = iota + 1
+	MutationKV
+	MutationNotify
+	MutationGraph
+)
+
+type MutationStatus string
+
+const (
+	MutationCommitted MutationStatus = "committed"
+	MutationRejected  MutationStatus = "rejected"
+)
+
+// MutationReceipt is the bounded result retained for idempotent retries.
+type MutationReceipt struct {
+	Slot             uint64         `json:"slot"`
+	Status           MutationStatus `json:"status"`
+	ErrorCode        string         `json:"error_code,omitempty"`
+	RowsAffected     int64          `json:"rows_affected,omitempty"`
+	LastInsertID     int64          `json:"last_insert_id,omitempty"`
+	Applied          bool           `json:"applied,omitempty"`
+	RetryThroughSlot uint64         `json:"retry_through_slot"`
+}
 
 // SQLCommand is one submitter command inside a proposer batch.
 type SQLCommand struct {
@@ -100,11 +128,123 @@ func EncodeGraphCommand(command GraphCommand) ([]byte, error) {
 }
 
 func EncodeGraphBatch(commands []GraphCommand) ([]byte, error) {
-	payload, err := json.Marshal(commands)
-	if err != nil {
-		return nil, err
+	items := make([][]byte, len(commands))
+	for i := range commands {
+		var err error
+		items[i], err = EncodeGraphBatchItem(commands[i])
+		if err != nil {
+			return nil, err
+		}
 	}
-	return append(append([]byte(nil), graphBatchMagic...), payload...), nil
+	return AssembleGraphBatch(items), nil
+}
+
+func EncodeGraphBatchItem(command GraphCommand) ([]byte, error) {
+	return json.Marshal(command)
+}
+
+func AssembleGraphBatch(items [][]byte) []byte {
+	return assembleBatch(graphBatchMagic, items)
+}
+
+func assembleBatch(magic []byte, items [][]byte) []byte {
+	size := len(magic) + 2
+	for _, item := range items {
+		size += len(item)
+	}
+	if len(items) > 1 {
+		size += len(items) - 1
+	}
+	payload := make([]byte, 0, size)
+	payload = append(payload, magic...)
+	payload = append(payload, '[')
+	for i, item := range items {
+		if i != 0 {
+			payload = append(payload, ',')
+		}
+		payload = append(payload, item...)
+	}
+	payload = append(payload, ']')
+	return payload
+}
+
+func BatchEncodedSize(magicBytes int, items [][]byte) int {
+	size := magicBytes + 2
+	for _, item := range items {
+		size += len(item)
+	}
+	if len(items) > 1 {
+		size += len(items) - 1
+	}
+	return size
+}
+
+func FingerprintBatchItem(domain string, item []byte) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(domain))
+	h.Write([]byte{0})
+	h.Write(item)
+	var fingerprint [32]byte
+	copy(fingerprint[:], h.Sum(nil))
+	return fingerprint
+}
+
+func SQLFingerprint(command SQLCommand) ([32]byte, error) {
+	command.RequestID = ""
+	item, err := EncodeSQLBatchItem(command)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return FingerprintBatchItem("rhiza/sql", item), nil
+}
+
+func GraphFingerprint(command GraphCommand) ([32]byte, error) {
+	command.RequestID = ""
+	item, err := EncodeGraphBatchItem(command)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return FingerprintBatchItem("rhiza/graph", item), nil
+}
+
+func KVFingerprint(command KVCommand) ([32]byte, error) {
+	command.RequestID = ""
+	command.ExpiresAtUnixMS = 0
+	command.ObservedAtUnixMS = 0
+	item, err := json.Marshal(command)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return FingerprintBatchItem("rhiza/kv", item), nil
+}
+
+func NotifyFingerprint(command NotifyCommand) ([32]byte, error) {
+	command.RequestID = ""
+	item, err := json.Marshal(command)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return FingerprintBatchItem("rhiza/notify", item), nil
+}
+
+func EncodeSQLBatchItem(command SQLCommand) ([]byte, error) {
+	return json.Marshal(command)
+}
+
+func AssembleSQLBatch(items [][]byte) []byte {
+	return assembleBatch(sqlBatchMagic, items)
+}
+
+func EncodeSQLBatch(commands []SQLCommand) ([]byte, error) {
+	items := make([][]byte, len(commands))
+	for i := range commands {
+		var err error
+		items[i], err = EncodeSQLBatchItem(commands[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+	return AssembleSQLBatch(items), nil
 }
 
 func DecodeGraphBatch(value []byte) ([]GraphCommand, bool, error) {
@@ -159,14 +299,6 @@ func DecodeKVCommand(value []byte) (KVCommand, bool, error) {
 		return KVCommand{}, true, err
 	}
 	return command, true, nil
-}
-
-func EncodeSQLBatch(commands []SQLCommand) ([]byte, error) {
-	payload, err := json.Marshal(commands)
-	if err != nil {
-		return nil, err
-	}
-	return append(append([]byte(nil), sqlBatchMagic...), payload...), nil
 }
 
 func DecodeSQLBatch(value []byte) ([]SQLCommand, bool, error) {

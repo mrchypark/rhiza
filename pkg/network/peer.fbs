@@ -5,7 +5,7 @@ enum Operation:ubyte {
   Record = 1,
   Propose = 2,
   Learned = 3,
-  Decisions = 4,
+  Sync = 4,
   ReadIndex = 5,
   StageValue = 6,
   FetchValue = 7,

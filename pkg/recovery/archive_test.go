@@ -3,8 +3,10 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"math/rand"
 	"sync/atomic"
 	"testing"
 
@@ -17,6 +19,7 @@ type countingBucket struct {
 	objstore.Bucket
 	heads atomic.Uint64
 	gets  atomic.Uint64
+	puts  atomic.Uint64
 }
 
 func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
@@ -27,6 +30,11 @@ func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.
 func (b *countingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	b.gets.Add(1)
 	return b.Bucket.Get(ctx, name)
+}
+
+func (b *countingBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	b.puts.Add(1)
+	return b.Bucket.Upload(ctx, name, r, options...)
 }
 
 func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
@@ -58,6 +66,46 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	values, tip, err := reader.DecisionsFrom(1, int(core.Tip()))
 	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()) {
 		t.Fatalf("archive tip=%d values=%d err=%v", tip, len(values), err)
+	}
+}
+
+func TestArchiveExtentSplitUsesEncodedSize(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(1))
+	for range 64 {
+		value := make([]byte, 120<<10)
+		if _, err := rng.Read(value); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.Propose(ctx, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.extents) < 2 {
+		t.Fatal("encoded archive payload was not split")
+	}
+	for _, extent := range manager.extents {
+		data, err := json.Marshal(extent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) > maxExtentSize {
+			t.Fatalf("encoded extent size=%d, limit=%d", len(data), maxExtentSize)
+		}
 	}
 }
 
@@ -213,6 +261,44 @@ func TestArchivePublishDoesNotReloadItsTail(t *testing.T) {
 	}
 	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 1 || gets != 1 {
 		t.Fatalf("publish heads=%d gets=%d, want 1/1", heads, gets)
+	}
+}
+
+func TestArchivePublicationCostDoesNotGrowWithHistory(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	for i := 0; i < 256; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		bucket.puts.Store(0)
+		if err := manager.syncNow(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+		if puts := bucket.puts.Load(); puts != 2 {
+			t.Fatalf("publication %d used %d PUTs, want 2", i+1, puts)
+		}
+	}
+	foundManifest := false
+	if err := bucket.Iter(ctx, "cluster/archive/manifests", func(string) error {
+		foundManifest = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if foundManifest {
+		t.Fatal("linked archive wrote a full-history manifest")
 	}
 }
 

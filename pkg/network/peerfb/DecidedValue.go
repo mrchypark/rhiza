@@ -7,9 +7,9 @@ import (
 )
 
 type DecidedValueT struct {
-	Slot uint64 `json:"slot"`
-	Hash []byte `json:"hash"`
-	Value []byte `json:"value"`
+	Slot        uint64 `json:"slot"`
+	Hash        []byte `json:"hash"`
+	Value       []byte `json:"value"`
 	Certificate []byte `json:"certificate"`
 }
 

@@ -1,0 +1,14 @@
+podchaos.chaos-mesh.org/rhiza-graph-one-peer-failure created
+podchaos.chaos-mesh.org/rhiza-graph-one-peer-failure condition met
+podchaos.chaos-mesh.org/rhiza-graph-one-peer-failure condition met
+pod/rhiza-graph-2 condition met
+podchaos.chaos-mesh.org/rhiza-graph-two-peer-failure created
+podchaos.chaos-mesh.org/rhiza-graph-two-peer-failure condition met
+podchaos.chaos-mesh.org/rhiza-graph-two-peer-failure condition met
+pod/rhiza-graph-0 condition met
+pod/rhiza-graph-1 condition met
+pod/rhiza-graph-2 condition met
+pod/rhiza-graph-0 condition met
+pod/rhiza-graph-1 condition met
+pod/rhiza-graph-2 condition met
+PASS: graph peers=3 failed=1 quorum-write=0.049175s converged=true; failed=2 write-status=503 recovered-write=true; shared-object-recovery=true

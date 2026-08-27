@@ -138,7 +138,7 @@ func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
 func serverPeerHandleDecisions(server *Server, member quepaxa.Member, from uint64) (*peerfb.ResponseT, error) {
 	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
 	return peer.handle(context.Background(), nil, &peerfb.RequestT{
-		Operation: peerfb.OperationDecisions, ClusterId: string(server.cluster), SenderId: string(member.ID),
-		ConfigId: uint64(server.core.ConfigID()), Token: member.Token, From: from, Limit: 256,
+		Operation: peerfb.OperationSync, ClusterId: string(server.cluster), SenderId: string(member.ID),
+		ConfigId: uint64(server.core.ConfigID()), Token: member.Token, From: from, Limit: 128,
 	})
 }

@@ -3,7 +3,6 @@ package network
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -11,55 +10,42 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-func TestSQLBatcherCombinesQueuedCommands(t *testing.T) {
-	var mu sync.Mutex
-	proposals := 0
-	commands := 0
-	ctx, cancel := context.WithCancel(context.Background())
-	b := &mutationBatcher[types.SQLCommand]{
-		input:     make(chan batchItem[types.SQLCommand], 16),
-		inflight:  make(chan struct{}, 16),
-		ctx:       ctx,
-		cancel:    cancel,
-		encode:    types.EncodeSQLBatch,
-		requestID: func(command types.SQLCommand) string { return command.RequestID },
-		propose: func(_ context.Context, value []byte) (quepaxa.Slot, error) {
-			batch, ok, err := types.DecodeSQLBatch(value)
-			if err != nil || !ok {
-				t.Fatalf("decode batch: ok=%v err=%v", ok, err)
-			}
-			mu.Lock()
-			proposals++
-			commands += len(batch)
-			mu.Unlock()
-			return 1, nil
-		},
-		apply: func(context.Context, quepaxa.Slot) error { return nil },
-	}
-	b.wg.Add(1)
-
-	results := make(chan error, 4)
-	for i := 0; i < 4; i++ {
-		go func(i int) {
-			_, err := b.submit(context.Background(), types.SQLCommand{RequestID: string(rune('a' + i)), SQL: "SELECT 1"})
-			results <- err
-		}(i)
-	}
-	deadline := time.Now().Add(time.Second)
-	for len(b.input) < 4 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	go b.run()
+func TestSQLBatcherIdleRequestDispatchesImmediately(t *testing.T) {
+	proposed := make(chan []byte, 1)
+	b := newSQLBatcher(func(_ context.Context, value []byte) (quepaxa.Slot, error) {
+		proposed <- value
+		return 1, nil
+	}, func(context.Context, quepaxa.Slot) error { return nil })
 	defer b.Close()
-	for range 4 {
-		if err := <-results; err != nil {
-			t.Fatal(err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.submit(context.Background(), types.SQLCommand{RequestID: "idle", SQL: "SELECT 1"})
+		done <- err
+	}()
+	select {
+	case value := <-proposed:
+		commands, ok, err := types.DecodeSQLBatch(value)
+		if err != nil || !ok || len(commands) != 1 || commands[0].RequestID != "idle" {
+			t.Fatalf("decode batch: commands=%v ok=%v err=%v", commands, ok, err)
 		}
+	case <-time.After(20 * time.Millisecond):
+		t.Fatal("idle request waited for a batching timer")
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if proposals != 1 || commands != 4 {
-		t.Fatalf("proposals=%d commands=%d", proposals, commands)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdaptiveWaitBounds(t *testing.T) {
+	if got := adaptiveWait(1<<40, 1, 0); got != minAdaptiveLinger {
+		t.Fatalf("minimum wait=%v", got)
+	}
+	if got := adaptiveWait(1, 1, 0); got != maxAdaptiveLinger {
+		t.Fatalf("maximum wait=%v", got)
+	}
+	if got := adaptiveWait(1, 1, maxOldestQueueAge); got != 0 {
+		t.Fatalf("expired wait=%v", got)
 	}
 }
 
@@ -85,33 +71,35 @@ func TestSQLBatcherCloseStopsPendingWork(t *testing.T) {
 	}
 }
 
-func TestSQLBatcherSplitsOversizedCombinedValue(t *testing.T) {
-	var sizes []int
-	b := &mutationBatcher[types.SQLCommand]{
-		ctx:       context.Background(),
-		encode:    types.EncodeSQLBatch,
-		requestID: func(command types.SQLCommand) string { return command.RequestID },
-		propose: func(_ context.Context, value []byte) (quepaxa.Slot, error) {
-			sizes = append(sizes, len(value))
-			return quepaxa.Slot(len(sizes)), nil
-		},
-		apply: func(context.Context, quepaxa.Slot) error { return nil },
+func TestSQLBatcherRejectsOversizedItemAtAdmission(t *testing.T) {
+	b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
+		t.Fatal("oversized item reached proposer")
+		return 0, nil
+	}, func(context.Context, quepaxa.Slot) error { return nil })
+	defer b.Close()
+	_, err := b.submit(context.Background(), types.SQLCommand{
+		RequestID: "oversized", SQL: "INSERT INTO t VALUES (?)", Args: []any{make([]byte, quepaxa.MaxReplicatedValueBytes)},
+	})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("error=%v, want ErrInvalidRequest", err)
 	}
-	items := []batchItem[types.SQLCommand]{
-		{result: make(chan batchResult, 1)},
-		{result: make(chan batchResult, 1)},
+}
+
+func TestBatchAssemblersMatchCanonicalJSON(t *testing.T) {
+	commands := []types.SQLCommand{{RequestID: "a", SQL: "SELECT 1"}, {RequestID: "b", SQL: "SELECT 2"}}
+	want, err := types.EncodeSQLBatch(commands)
+	if err != nil {
+		t.Fatal(err)
 	}
-	commands := []types.SQLCommand{
-		{RequestID: "a", SQL: "INSERT INTO t VALUES (?)", Args: []any{make([]byte, 70<<10)}},
-		{RequestID: "b", SQL: "INSERT INTO t VALUES (?)", Args: []any{make([]byte, 70<<10)}},
-	}
-	b.execute(items, commands)
-	if len(sizes) != 2 {
-		t.Fatalf("proposals=%d, want split into 2", len(sizes))
-	}
-	for _, size := range sizes {
-		if size > quepaxa.MaxReplicatedValueBytes {
-			t.Fatalf("oversized proposal: %d", size)
+	items := make([][]byte, len(commands))
+	for i := range commands {
+		items[i], err = types.EncodeSQLBatchItem(commands[i])
+		if err != nil {
+			t.Fatal(err)
 		}
+	}
+	got := types.AssembleSQLBatch(items)
+	if string(got) != string(want) {
+		t.Fatalf("assembled=%q want=%q", got, want)
 	}
 }
