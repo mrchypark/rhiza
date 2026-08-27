@@ -56,7 +56,6 @@ func main() {
 		BindAddr:              getEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
 		PeerAddr:              getEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"),
 		AdminToken:            os.Getenv("RHIZA_ADMIN_TOKEN"),
-		ClientToken:           os.Getenv("RHIZA_CLIENT_TOKEN"),
 		Members:               members,
 		HedgeDelay:            hedgeDelay,
 		ObjStoreProvider:      os.Getenv("RHIZA_OBJSTORE_PROVIDER"),

@@ -85,12 +85,13 @@ type DecidedValue struct {
 }
 
 type CheckpointSeal struct {
-	ConfigID        uint     `json:"config_id"`
-	Index           Slot     `json:"index"`
-	RootHash        [32]byte `json:"root_hash"`
-	StateHash       [32]byte `json:"state_hash"`
-	PrefixHash      [32]byte `json:"prefix_hash"`
-	NextLeaderOrder []NodeID `json:"next_leader_order"`
+	ConfigID             uint     `json:"config_id"`
+	Index                Slot     `json:"index"`
+	RootHash             [32]byte `json:"root_hash"`
+	StateHash            [32]byte `json:"state_hash"`
+	PrefixHash           [32]byte `json:"prefix_hash"`
+	NextLeaderOrder      []NodeID `json:"next_leader_order"`
+	FollowingLeaderOrder []NodeID `json:"following_leader_order,omitempty"`
 }
 
 type SealedCheckpoint struct {

@@ -60,20 +60,14 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	} else if !matches {
 		return GraphExecuteResponse{}, ErrRequestConflict
 	}
-	value, err := types.EncodeGraphCommand(command)
+	value, err := types.EncodeGraphBatch([]types.GraphCommand{command})
 	if err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	if len(value) > quepaxa.MaxReplicatedValueBytes {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	slot, err := s.proposeHedged(ctx, value)
-	if err == nil {
-		err = s.applyDecisions(ctx, slot)
-	}
-	if err == nil {
-		err = s.waitDurable(ctx, slot)
-	}
+	slot, err := s.graphBatcher.submit(ctx, command)
 	if err != nil {
 		return GraphExecuteResponse{}, err
 	}

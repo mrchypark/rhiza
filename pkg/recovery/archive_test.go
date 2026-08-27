@@ -3,12 +3,31 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
+
+type countingBucket struct {
+	objstore.Bucket
+	heads atomic.Uint64
+	gets  atomic.Uint64
+}
+
+func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	b.heads.Add(1)
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *countingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	b.gets.Add(1)
+	return b.Bucket.Get(ctx, name)
+}
 
 func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	ctx := context.Background()
@@ -122,5 +141,143 @@ func TestArchiveCASDoesNotRegressOnStaleWriter(t *testing.T) {
 	}
 	if reader.Tip() != 2 {
 		t.Fatalf("archive tip regressed to %d", reader.Tip())
+	}
+}
+
+func TestUnchangedArchiveLoadOnlyChecksHead(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	writer := NewManager(bucket, "cluster", 1)
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	reader := NewManager(bucket, "cluster", 1)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	bucket.heads.Store(0)
+	bucket.gets.Store(0)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 1 || gets != 0 {
+		t.Fatalf("unchanged load heads=%d gets=%d, want 1/0", heads, gets)
+	}
+}
+
+func TestArchivePublishDoesNotReloadItsTail(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	for i := 0; i < 2; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+		bucket.heads.Store(0)
+		bucket.gets.Store(0)
+	}
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 0 || gets != 0 {
+		t.Fatalf("counter reset failed heads=%d gets=%d", heads, gets)
+	}
+	if _, _, err := core.Propose(ctx, []byte("third")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 1 || gets != 1 {
+		t.Fatalf("publish heads=%d gets=%d, want 1/1", heads, gets)
+	}
+}
+
+func TestArchiveTrimRetainsOnlyCheckpointTail(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bucket := objstore.NewInMemBucket()
+	manager := NewManager(bucket, "cluster", 1)
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := core.PrefixHash(3)
+	if !ok {
+		t.Fatal("missing prefix")
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: 3, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: prefix, NextLeaderOrder: []quepaxa.NodeID{"n1"}}
+	core.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatal(err)
+	}
+	value, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, err := core.Propose(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := core.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("missing checkpoint decision")
+	}
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.TrimThrough(ctx, quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}, decision); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.DecisionsFrom(3, 1); !errors.Is(err, quepaxa.ErrCompacted) {
+		t.Fatalf("trimmed decision error=%v", err)
+	}
+	values, tip, err := manager.DecisionsFrom(4, 10)
+	if err != nil || tip != slot || len(values) != int(slot-3) {
+		t.Fatalf("tail tip=%d values=%d err=%v", tip, len(values), err)
+	}
+	reloaded := NewManager(bucket, "cluster", 1)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, _, err = reloaded.DecisionsFrom(4, 10)
+	if err != nil || len(values) != int(slot-3) {
+		t.Fatalf("reloaded tail values=%d err=%v", len(values), err)
 	}
 }

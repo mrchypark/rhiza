@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,26 +23,57 @@ var (
 	ErrRequestConflict       = errors.New("request ID conflict")
 	ErrInvalidRequest        = errors.New("invalid request")
 	ErrDurabilityUnavailable = errors.New("object-store durability unavailable")
+	ErrCommitUnknown         = errors.New("commit outcome unknown")
 )
+
+// CommitUnknownError means consensus and local apply succeeded, but the
+// configured before-ACK object-store barrier did not.
+type CommitUnknownError struct {
+	Slot      quepaxa.Slot
+	RequestID string
+	Cause     error
+}
+
+func (e *CommitUnknownError) Error() string {
+	return fmt.Sprintf("%v: request_id=%s slot=%d: %v", ErrCommitUnknown, e.RequestID, e.Slot, e.Cause)
+}
+func (e *CommitUnknownError) Unwrap() []error { return []error{ErrCommitUnknown, e.Cause} }
+
+func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
+	if errors.Is(err, ErrDurabilityUnavailable) {
+		return &CommitUnknownError{Slot: slot, RequestID: requestID, Cause: err}
+	}
+	return err
+}
 
 // Server is the HTTP server for client API.
 type Server struct {
-	core       *quepaxa.Core
-	material   *materializer.Materializer
-	cluster    types.ClusterID
-	mux        *http.ServeMux
-	ready      func() bool
-	writable   bool
-	batcher    *sqlBatcher
-	transport  *Transport
-	members    []quepaxa.Member
-	hedgeDelay time.Duration
-	applyMu    sync.Mutex
-	durability func(context.Context, quepaxa.Slot) error
-	routeMu    sync.Mutex
-	routeBase  quepaxa.NodeID
-	routeFirst quepaxa.NodeID
-	routeGen   uint64
+	core         *quepaxa.Core
+	material     *materializer.Materializer
+	cluster      types.ClusterID
+	mux          *http.ServeMux
+	ready        func() bool
+	writable     bool
+	sqlBatcher   *mutationBatcher[types.SQLCommand]
+	graphBatcher *mutationBatcher[types.GraphCommand]
+	transport    *Transport
+	members      []quepaxa.Member
+	hedgeDelay   time.Duration
+	applyMu      sync.Mutex
+	durability   func(context.Context, quepaxa.Slot) error
+	routeMu      sync.Mutex
+	routeBase    quepaxa.NodeID
+	routeFirst   quepaxa.NodeID
+	routeGen     uint64
+	proposeMu    sync.Mutex
+	inflight     map[[32]byte]*proposalCall
+	objectStats  func() (map[string]uint64, bool)
+}
+
+type proposalCall struct {
+	done chan struct{}
+	slot quepaxa.Slot
+	err  error
 }
 
 // NewServer creates a new HTTP server.
@@ -56,22 +88,35 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		transport:  transport,
 		members:    append([]quepaxa.Member(nil), members...),
 		hedgeDelay: hedgeDelay,
+		inflight:   make(map[[32]byte]*proposalCall),
 	}
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
-	s.batcher = newSQLBatcher(s.proposeHedged, func(ctx context.Context, slot quepaxa.Slot) error {
+	apply := func(ctx context.Context, slot quepaxa.Slot) error {
 		if err := s.applyDecisions(ctx, slot); err != nil {
 			return err
 		}
 		return s.waitDurable(ctx, slot)
-	})
+	}
+	if materializer.GraphEnabled() {
+		s.graphBatcher = newGraphBatcher(s.proposeHedged, apply)
+	} else {
+		s.sqlBatcher = newSQLBatcher(s.proposeHedged, apply)
+	}
 	s.routes()
 	return s
 }
 
 // Close stops background request batching.
-func (s *Server) Close() { s.batcher.Close() }
+func (s *Server) Close() {
+	if s.sqlBatcher != nil {
+		s.sqlBatcher.Close()
+	}
+	if s.graphBatcher != nil {
+		s.graphBatcher.Close()
+	}
+}
 
 // SetDurabilityBarrier installs the mutation ACK barrier before the server is exposed.
 func (s *Server) SetDurabilityBarrier(barrier func(context.Context, quepaxa.Slot) error) {
@@ -105,10 +150,30 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/kv/cas", s.handleKVCAS)
 	s.mux.HandleFunc("/notify/publish", s.handleNotifyPublish)
 	s.mux.HandleFunc("/notify/subscribe", s.handleNotifySubscribe)
+	s.mux.HandleFunc("/request/status", s.handleRequestStatus)
+	s.mux.HandleFunc("/metrics/object-store", s.handleObjectStoreStats)
 
 	// Health
 	s.mux.HandleFunc("/ready", s.handleReady)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+}
+
+func (s *Server) SetObjectStoreStats(stats func() (map[string]uint64, bool)) {
+	s.objectStats = stats
+}
+
+func (s *Server) handleObjectStoreStats(w http.ResponseWriter, _ *http.Request) {
+	if s.objectStats == nil {
+		http.Error(w, "object store disabled", http.StatusNotFound)
+		return
+	}
+	stats, ok := s.objectStats()
+	if !ok {
+		http.Error(w, "object store disabled", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(stats)
 }
 
 type DecisionsResponse struct {
@@ -120,6 +185,29 @@ type DecisionsResponse struct {
 }
 
 func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	hash := sha256.Sum256(value)
+	s.proposeMu.Lock()
+	if call := s.inflight[hash]; call != nil {
+		s.proposeMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-call.done:
+			return call.slot, call.err
+		}
+	}
+	call := &proposalCall{done: make(chan struct{})}
+	s.inflight[hash] = call
+	s.proposeMu.Unlock()
+	call.slot, call.err = s.proposeHedgedOnce(ctx, value)
+	s.proposeMu.Lock()
+	delete(s.inflight, hash)
+	close(call.done)
+	s.proposeMu.Unlock()
+	return call.slot, call.err
+}
+
+func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	if slot, ok := s.core.DecidedSlot(value); ok {
 		if _, err := s.core.CompleteDecision(ctx, slot); err == nil {
 			return slot, nil
@@ -342,7 +430,7 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	} else if !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
-	slot, err := s.batcher.submit(ctx, command)
+	slot, err := s.sqlBatcher.submit(ctx, command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
@@ -414,10 +502,66 @@ func writeAPIError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrRequestConflict):
 		status = http.StatusConflict
-	case errors.Is(err, ErrNotReady), errors.Is(err, ErrDurabilityUnavailable), errors.Is(err, quepaxa.ErrQuorumUnavailable):
+	case errors.Is(err, ErrNotReady), errors.Is(err, ErrDurabilityUnavailable), errors.Is(err, ErrCommitUnknown), errors.Is(err, quepaxa.ErrQuorumUnavailable):
 		status = http.StatusServiceUnavailable
 	}
+	var unknown *CommitUnknownError
+	if errors.As(err, &unknown) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": "commit_unknown", "request_id": unknown.RequestID, "slot": unknown.Slot})
+		return
+	}
 	http.Error(w, err.Error(), status)
+}
+
+type RequestStatusRequest struct {
+	RequestID string `json:"request_id"`
+	Slot      uint64 `json:"slot"`
+}
+
+type RequestStatusResponse struct {
+	State string `json:"state"`
+	Slot  uint64 `json:"slot"`
+	Tip   uint64 `json:"tip"`
+}
+
+func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req RequestStatusRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	response, err := s.RequestStatus(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (RequestStatusResponse, error) {
+	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Slot == 0 {
+		return RequestStatusResponse{}, ErrInvalidRequest
+	}
+	tip := s.material.Tip()
+	if tip < req.Slot {
+		return RequestStatusResponse{State: "pending", Slot: req.Slot, Tip: tip}, nil
+	}
+	committed, err := s.material.RequestCommitted(ctx, req.RequestID)
+	if err != nil {
+		return RequestStatusResponse{}, err
+	}
+	state := "absent"
+	if committed {
+		state = "committed"
+	}
+	return RequestStatusResponse{State: state, Slot: req.Slot, Tip: tip}, nil
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any) error {
@@ -564,7 +708,7 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		err = s.waitDurable(ctx, slot)
 	}
 	if err != nil {
-		return KVMutationResponse{}, err
+		return KVMutationResponse{}, commitUnknown(slot, req.RequestID, err)
 	}
 	if !found {
 		result, err = s.material.KVRequestResult(ctx, req.RequestID)
@@ -655,7 +799,7 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ui
 			err = ErrRequestConflict
 		}
 	}
-	return uint64(slot), err
+	return uint64(slot), commitUnknown(slot, req.RequestID, err)
 }
 
 func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
@@ -728,7 +872,7 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 	} else if sqlValue && materializer.GraphEnabled() {
 		return quepaxa.DecidedValue{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
 	}
-	if _, graphValue, err := types.DecodeGraphCommand(value); err != nil {
+	if _, graphValue, err := types.DecodeGraphBatch(value); err != nil {
 		return quepaxa.DecidedValue{}, err
 	} else if graphValue && !materializer.GraphEnabled() {
 		return quepaxa.DecidedValue{}, fmt.Errorf("%w: graph commands require the graph build", ErrInvalidRequest)
@@ -756,6 +900,10 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
 	}
+	if err := s.core.Health(); err != nil {
+		http.Error(w, "WAL sync failed", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
@@ -780,18 +928,31 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 		if len(decisions) == 0 {
 			return errors.New("decision gap")
 		}
-		for _, decision := range decisions {
+		end := len(decisions)
+		for i, decision := range decisions {
 			if decision.Slot > through {
-				return nil
+				end = i
+				break
 			}
-			if err := s.material.Apply(ctx, uint64(decision.Slot), decision.Value); err != nil {
-				return err
-			}
+		}
+		if err := s.material.ApplyBatch(ctx, decisions[:end]); err != nil {
+			return err
+		}
+		if end < len(decisions) {
+			return nil
 		}
 	}
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if err := s.material.Health(r.Context()); err != nil {
+		http.Error(w, "materializer unhealthy", http.StatusServiceUnavailable)
+		return
+	}
+	if err := s.core.Health(); err != nil {
+		http.Error(w, "WAL sync failed", http.StatusServiceUnavailable)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }

@@ -343,6 +343,130 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	}
 }
 
+func TestCompactionPreservesFollowingEpochLeaderOrder(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Cluster{ConfigID: 9, Members: []Member{{ID: "n1"}}}
+	core := newCore("n1", config, wal, nil)
+	for core.Tip() < 36 {
+		if _, _, err := core.Propose(context.Background(), []byte(fmt.Sprintf("value-%d", core.Tip()+1))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix, ok := core.PrefixHash(36)
+	if !ok {
+		t.Fatal("checkpoint prefix is unavailable")
+	}
+	next, following, err := core.CheckpointLeaderOrders(36)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(following) == 0 {
+		t.Fatal("checkpoint omitted the compacted following epoch leader order")
+	}
+	root := sha256.Sum256([]byte("following-order-root"))
+	seal := CheckpointSeal{
+		ConfigID: config.ConfigID, Index: 36, RootHash: root,
+		StateHash: sha256.Sum256([]byte("following-order-state")), PrefixHash: prefix,
+		NextLeaderOrder: next, FollowingLeaderOrder: following,
+	}
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := core.PrepareCheckpoint(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(context.Background(), encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CompactThrough(36, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	for recovered.Tip() < 50 {
+		if _, _, err := recovered.Propose(context.Background(), []byte(fmt.Sprintf("recovered-%d", recovered.Tip()+1))); err != nil {
+			t.Fatalf("propose across following epoch at tip %d: %v", recovered.Tip(), err)
+		}
+	}
+}
+
+func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
+	config := &Cluster{ConfigID: 12, Members: []Member{{ID: "n1"}}}
+	sourceWAL, err := qlog.Open(t.TempDir() + "/source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceWAL.Close()
+	source := newCore("n1", config, sourceWAL, nil)
+	for i := 1; i <= 5; i++ {
+		if _, _, err := source.Propose(context.Background(), []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix, _ := source.PrefixHash(5)
+	next, following, err := source.CheckpointLeaderOrders(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{
+		ConfigID: config.ConfigID, Index: 5,
+		RootHash: sha256.Sum256([]byte("recovery-root")), StateHash: sha256.Sum256([]byte("recovery-state")),
+		PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following,
+	}
+	source.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := source.PrepareCheckpoint(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.Propose(context.Background(), encoded); err != nil {
+		t.Fatal(err)
+	}
+	baseDecision, ok := source.CertifiedValue(6)
+	if !ok {
+		t.Fatal("checkpoint decision is unavailable")
+	}
+	first, _ := source.CertifiedValue(1)
+
+	targetWAL, err := qlog.Open(t.TempDir() + "/target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer targetWAL.Close()
+	target := newCore("n1", config, targetWAL, nil)
+	if err := target.AcceptCertifiedValues([]DecidedValue{first}); err != nil {
+		t.Fatal(err)
+	}
+	target.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := target.RestoreCheckpointBase(context.Background(), seal, baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	if target.Tip() != 5 || target.CompactionFloor() != 5 {
+		t.Fatalf("tip=%d floor=%d, want 5/5", target.Tip(), target.CompactionFloor())
+	}
+	if err := target.AcceptCertifiedValues([]DecidedValue{baseDecision}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPrepareCheckpointLocksOneRootPerIndexAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)

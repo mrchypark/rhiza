@@ -2,7 +2,6 @@ package qlog
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -31,13 +30,6 @@ type WAL struct {
 }
 
 const defaultMaxSize = 64 * 1024 * 1024 // 64MB per segment
-
-// SegmentSnapshot is an exact, validated WAL segment and its object-store metadata.
-type SegmentSnapshot struct {
-	Meta   SegmentMeta
-	Offset int64
-	Data   []byte
-}
 
 // Open opens or creates a WAL in the given directory.
 func Open(dir string) (*WAL, error) {
@@ -211,64 +203,6 @@ func (w *WAL) Read() ([]Entry, error) {
 		entries = append(entries, segEntries...)
 	}
 	return entries, nil
-}
-
-// SegmentSnapshots returns consistent copies suitable for object-store upload.
-func (w *WAL) SegmentSnapshots() ([]SegmentSnapshot, error) {
-	return w.SegmentSnapshotsSince(nil)
-}
-
-// SegmentSnapshotsSince avoids rereading segments whose validated metadata is unchanged.
-func (w *WAL) SegmentSnapshotsSince(validated map[uint32]SegmentMeta) ([]SegmentSnapshot, error) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	snapshots := make([]SegmentSnapshot, 0, len(w.segments))
-	for _, seg := range w.segments {
-		seg.mu.Lock()
-		known, ok := validated[seg.index]
-		if ok && known.Size > seg.offset {
-			seg.mu.Unlock()
-			return nil, fmt.Errorf("segment %d shrank from %d to %d", seg.index, known.Size, seg.offset)
-		}
-		if ok && known.Size == seg.offset {
-			seg.mu.Unlock()
-			snapshots = append(snapshots, SegmentSnapshot{Meta: known})
-			continue
-		}
-		offset := int64(0)
-		if ok {
-			offset = known.Size
-		}
-		data := make([]byte, seg.offset-offset)
-		_, err := seg.file.ReadAt(data, offset)
-		seg.mu.Unlock()
-		if err != nil && !(err == io.EOF && len(data) == 0) {
-			return nil, err
-		}
-		if len(data) == 0 {
-			continue
-		}
-		start, end := known.StartSlot, known.EndSlot
-		for cursor := 0; cursor < len(data); {
-			entry, used, err := DecodeEntry(data[cursor:])
-			if err != nil {
-				return nil, fmt.Errorf("segment %d: %w", seg.index, err)
-			}
-			if start == 0 || entry.Slot < start {
-				start = entry.Slot
-			}
-			if entry.Slot > end {
-				end = entry.Slot
-			}
-			cursor += used
-		}
-		meta := SegmentMeta{Index: seg.index, StartSlot: start, EndSlot: end, Size: offset + int64(len(data))}
-		if offset == 0 {
-			meta.Hash = sha256.Sum256(data)
-		}
-		snapshots = append(snapshots, SegmentSnapshot{Meta: meta, Offset: offset, Data: data})
-	}
-	return snapshots, nil
 }
 
 // readAll reads all entries from a segment.

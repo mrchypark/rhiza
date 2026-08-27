@@ -33,6 +33,8 @@ type KVMutationRequest = network.KVMutationRequest
 type KVMutationResponse = network.KVMutationResponse
 type GraphQueryRequest = network.GraphQueryRequest
 type GraphExecuteResponse = network.GraphExecuteResponse
+type RequestStatusRequest = network.RequestStatusRequest
+type RequestStatusResponse = network.RequestStatusResponse
 type ObjectStoreStats = objstore.Stats
 type ObjectStoreDurability = types.ObjectStoreDurability
 
@@ -45,7 +47,6 @@ type Config struct {
 	BindAddr              string
 	PeerAddr              string
 	AdminToken            string
-	ClientToken           string
 	Members               []Member
 	ObjStoreEndpoint      string
 	ObjStoreBucket        string
@@ -63,14 +64,12 @@ type Config struct {
 	ObjStoreGCInterval    time.Duration
 	ObjStoreGCGracePeriod time.Duration
 	CheckpointInterval    time.Duration
-	ReadTimeout           time.Duration
 	HedgeDelay            time.Duration
 }
 
 const (
 	ProfileSQL                     = types.ProfileSQL
 	ProfileGraph                   = types.ProfileGraph
-	ProfileKV                      = types.ProfileKV
 	ConsistencyLocal               = "local"
 	ConsistencyLinearizable        = "linearizable"
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
@@ -83,6 +82,7 @@ var (
 	ErrInvalidRequest        = network.ErrInvalidRequest
 	ErrQuorumUnavailable     = quepaxa.ErrQuorumUnavailable
 	ErrDurabilityUnavailable = network.ErrDurabilityUnavailable
+	ErrCommitUnknown         = network.ErrCommitUnknown
 )
 
 // DB owns one embedded Rhiza node and its private QUIC peer endpoint.
@@ -115,14 +115,14 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	internalConfig := &types.ExecutionConfig{
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID), Profile: config.Profile,
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
-		AdminToken: config.AdminToken, ClientToken: config.ClientToken, Members: config.Members,
+		AdminToken: config.AdminToken, Members: config.Members,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,
 		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, ReadTimeout: config.ReadTimeout, HedgeDelay: config.HedgeDelay,
+		CheckpointInterval: config.CheckpointInterval, HedgeDelay: config.HedgeDelay,
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {
@@ -176,6 +176,9 @@ func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (uint64, err
 }
 func (db *DB) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
 	return db.api.NotifySubscribe(topic)
+}
+func (db *DB) RequestStatus(ctx context.Context, req RequestStatusRequest) (RequestStatusResponse, error) {
+	return db.api.RequestStatus(ctx, req)
 }
 
 func (db *DB) ObjectStoreStats() (ObjectStoreStats, bool) {

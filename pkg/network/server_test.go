@@ -181,8 +181,17 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 		return errors.New("bucket unavailable")
 	})
 	req := ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE durable (id INTEGER)"}
-	if _, err := server.Execute(context.Background(), req); !errors.Is(err, ErrDurabilityUnavailable) {
-		t.Fatalf("error=%v, want ErrDurabilityUnavailable", err)
+	if _, err := server.Execute(context.Background(), req); !errors.Is(err, ErrCommitUnknown) {
+		t.Fatalf("error=%v, want ErrCommitUnknown", err)
+	} else {
+		var unknown *CommitUnknownError
+		if !errors.As(err, &unknown) || unknown.Slot == 0 || unknown.RequestID != req.RequestID {
+			t.Fatalf("commit unknown detail=%#v", unknown)
+		}
+		status, statusErr := server.RequestStatus(context.Background(), RequestStatusRequest{RequestID: req.RequestID, Slot: uint64(unknown.Slot)})
+		if statusErr != nil || status.State != "committed" {
+			t.Fatalf("status=%+v err=%v", status, statusErr)
+		}
 	}
 
 	server.SetDurabilityBarrier(nil)

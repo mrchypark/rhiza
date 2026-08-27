@@ -86,6 +86,8 @@ spec:
               value: rhiza-minio.rhiza-objstore-e2e.svc.cluster.local:9000
             - name: RHIZA_OBJSTORE_BUCKET
               value: rhiza
+            - name: RHIZA_OBJSTORE_PREFIX
+              value: active
             - name: RHIZA_OBJSTORE_REGION
               value: us-east-1
             - name: RHIZA_OBJSTORE_INSECURE

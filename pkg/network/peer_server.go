@@ -132,6 +132,9 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 		var request *peerfb.RequestT
 		request, err = decodePeerRequest(data)
 		if err == nil {
+			if request.Operation == peerfb.OperationPrepareCheckpoint {
+				_ = stream.SetDeadline(time.Now().Add(checkpointPrepareTimeout))
+			}
 			response, err = s.handle(stream.Context(), conn, request)
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestNormalizeSQLArgsAcceptsGoIntegers(t *testing.T) {
@@ -91,7 +92,7 @@ func TestMaterializerAppliesSQLBatchAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := m.QueryRow(context.Background(), "SELECT COUNT(*) FROM batched").Scan(&count); err != nil || count != 1 {
+	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM batched").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count=%d err=%v", count, err)
 	}
 }
@@ -116,7 +117,7 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 		}
 	}
 	var count int
-	if err := m.QueryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
+	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count=%d err=%v", count, err)
 	}
 	conflict, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "row", SQL: "INSERT INTO dedupe VALUES (2)"}})
@@ -129,7 +130,7 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 	if m.Tip() != 3 {
 		t.Fatalf("conflicting no-op did not advance tip: %d", m.Tip())
 	}
-	if err := m.QueryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
+	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count after conflicting retry=%d err=%v", count, err)
 	}
 }
@@ -161,7 +162,7 @@ func TestFailedSQLCommandRecordsResultAndAdvancesTip(t *testing.T) {
 		t.Fatalf("result=%+v tip=%d err=%v", result, m.Tip(), err)
 	}
 	var count int
-	if err := m.QueryRow(ctx, "SELECT COUNT(*) FROM failures").Scan(&count); err != nil || count != 2 {
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM failures").Scan(&count); err != nil || count != 2 {
 		t.Fatalf("count=%d err=%v", count, err)
 	}
 }
@@ -202,7 +203,7 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := m.QueryRow(ctx, "SELECT COUNT(*) FROM features").Scan(&count); err != nil || count != 1 || m.Tip() != 1 {
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM features").Scan(&count); err != nil || count != 1 || m.Tip() != 1 {
 		t.Fatalf("restored count=%d tip=%d err=%v", count, m.Tip(), err)
 	}
 	foreignPath := t.TempDir() + "/foreign.db"
@@ -221,7 +222,7 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	if err := m.Restore(ctx, foreignData); err == nil {
 		t.Fatal("expected foreign snapshot rejection")
 	}
-	if err := m.QueryRow(ctx, "SELECT COUNT(*) FROM features").Scan(&count); err != nil || count != 1 || m.Tip() != 1 {
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM features").Scan(&count); err != nil || count != 1 || m.Tip() != 1 {
 		t.Fatalf("failed restore damaged original: count=%d tip=%d err=%v", count, m.Tip(), err)
 	}
 }
@@ -248,6 +249,24 @@ func TestMaterializerRejectsNondeterministicWrite(t *testing.T) {
 	}
 	if err := m.Apply(context.Background(), 2, []byte("INSERT INTO deterministic VALUES (random())")); err == nil {
 		t.Fatal("expected random() to be rejected")
+	}
+}
+
+func TestStateTipIgnoresConsensusOnlyDecisions(t *testing.T) {
+	m, err := Open(t.TempDir()+"/state-tip.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Apply(context.Background(), 1, []byte("CREATE TABLE state_tip (id INTEGER)")); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [types.ReadBarrierNonceSize]byte
+	if err := m.Apply(context.Background(), 2, types.EncodeReadBarrier(nonce)); err != nil {
+		t.Fatal(err)
+	}
+	if m.Tip() != 2 || m.StateTip() != 1 {
+		t.Fatalf("tip=%d state_tip=%d, want 2/1", m.Tip(), m.StateTip())
 	}
 }
 
@@ -458,5 +477,39 @@ func TestMaterializerRejectsUnmanagedDatabaseWithoutAppliedSlot(t *testing.T) {
 	db.Close()
 	if _, err := Open(dbPath, 1); err == nil {
 		t.Fatal("expected unmanaged database rejection")
+	}
+}
+
+func TestPublicSQLCannotAccessInternalTables(t *testing.T) {
+	m, err := Open(t.TempDir()+"/internal.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	if err := m.Apply(ctx, 1, []byte(`INSERT INTO _rhiza_meta(key, value) VALUES ('owned', '1')`)); err == nil {
+		t.Fatal("replicated SQL wrote an internal table")
+	}
+	if _, err := m.QueryResult(ctx, `SELECT * FROM _rhiza_meta`, nil); err == nil {
+		t.Fatal("public query read an internal table")
+	}
+}
+
+func TestApplyBatchAdvancesContiguousPage(t *testing.T) {
+	m, err := Open(t.TempDir()+"/batch.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	decisions := []quepaxa.DecidedValue{
+		{Slot: 1, Value: []byte(`CREATE TABLE batch_page (id INTEGER)`)},
+		{Slot: 2, Value: []byte(`INSERT INTO batch_page VALUES (1)`)},
+	}
+	if err := m.ApplyBatch(context.Background(), decisions); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := m.queryRow(context.Background(), `SELECT COUNT(*) FROM batch_page`).Scan(&count); err != nil || count != 1 || m.Tip() != 2 {
+		t.Fatalf("count=%d tip=%d err=%v", count, m.Tip(), err)
 	}
 }

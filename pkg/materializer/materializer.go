@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/ncruces/go-sqlite3"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 	"github.com/ncruces/go-sqlite3/ext/fts5"
@@ -41,6 +42,7 @@ type Materializer struct {
 	readers  []*sql.DB
 	mu       sync.RWMutex
 	tip      uint64
+	stateTip uint64
 	tipHash  [32]byte
 	dbPath   string
 	readersN int
@@ -175,7 +177,7 @@ func (m *Materializer) loadTip(existing bool) error {
 			return fmt.Errorf("existing database has no applied slot; rebuild it from the decision log")
 		}
 		zeroHash := hex.EncodeToString(make([]byte, sha256.Size))
-		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
+		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
 			return err
 		}
 		value = "0"
@@ -189,6 +191,14 @@ func (m *Materializer) loadTip(existing bool) error {
 		return err
 	}
 	m.tip = tip
+	var stateValue string
+	if err := m.writer.QueryRow(`SELECT value FROM _rhiza_meta WHERE key = 'state_slot'`).Scan(&stateValue); err != nil {
+		return fmt.Errorf("load state slot: %w", err)
+	}
+	m.stateTip, err = strconv.ParseUint(stateValue, 10, 64)
+	if err != nil || m.stateTip > m.tip {
+		return fmt.Errorf("invalid state slot")
+	}
 	var hashValue string
 	if err := m.writer.QueryRow(`SELECT value FROM _rhiza_meta WHERE key = 'applied_hash'`).Scan(&hashValue); err != nil {
 		return err
@@ -244,54 +254,82 @@ func (m *Materializer) initSchema() error {
 	if err != nil {
 		return err
 	}
-	var resultColumn int
-	if err := m.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_rhiza_requests') WHERE name = 'result_json'`).Scan(&resultColumn); err != nil {
-		return err
-	}
-	if resultColumn == 0 {
-		_, err = m.db.Exec(`ALTER TABLE _rhiza_requests ADD COLUMN result_json BLOB`)
-		if err != nil {
-			return err
+	for _, query := range []string{
+		`SELECT result_json FROM _rhiza_requests LIMIT 0`,
+		`SELECT command_json FROM _rhiza_notify_requests LIMIT 0`,
+	} {
+		if rows, err := m.db.Query(query); err != nil {
+			return fmt.Errorf("incompatible materializer schema: %w", err)
+		} else {
+			rows.Close()
 		}
 	}
-	var notifyCommandColumn int
-	if err := m.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_rhiza_notify_requests') WHERE name = 'command_json'`).Scan(&notifyCommandColumn); err != nil {
-		return err
-	}
-	if notifyCommandColumn == 0 {
-		_, err = m.db.Exec(`ALTER TABLE _rhiza_notify_requests ADD COLUMN command_json BLOB`)
-	}
-	return err
+	return nil
 }
 
-// Apply applies a decided value to SQLite.
-func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	hash := sha256.Sum256(value)
+type pendingNotification struct {
+	topic   string
+	payload []byte
+}
 
-	if slot <= m.tip {
-		if slot == m.tip && hash != m.tipHash {
-			return fmt.Errorf("applied slot %d hash conflict", slot)
-		}
+// Apply applies one decided value.
+func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) error {
+	return m.ApplyBatch(ctx, []quepaxa.DecidedValue{{Slot: quepaxa.Slot(slot), Value: value}})
+}
+
+// ApplyBatch materializes a contiguous decision page with one SQLite commit.
+func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) error {
+	if len(decisions) == 0 {
 		return nil
 	}
-	if slot != m.tip+1 {
-		return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
-	}
-	graphCommand, graph, err := types.DecodeGraphCommand(value)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tx, err := m.writer.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("decode graph command: %w", err)
+		return fmt.Errorf("begin apply batch: %w", err)
 	}
-	if err := m.applyGraph(ctx, slot, value, graphCommand, graph); err != nil {
+	defer tx.Rollback()
+	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
+	pending := make([]pendingNotification, 0)
+	for _, decision := range decisions {
+		slot := uint64(decision.Slot)
+		hash := sha256.Sum256(decision.Value)
+		if slot <= m.tip {
+			if slot == m.tip && hash != m.tipHash {
+				m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+				return fmt.Errorf("applied slot %d hash conflict", slot)
+			}
+			continue
+		}
+		if slot != m.tip+1 {
+			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
+		}
+		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, &pending); err != nil {
+			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+			return err
+		}
+		m.tip, m.tipHash = slot, hash
+	}
+	if err := tx.Commit(); err != nil {
+		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		return fmt.Errorf("commit apply batch: %w", err)
+	}
+	for _, notification := range pending {
+		m.publishNotification(notification.topic, notification.payload)
+	}
+	return nil
+}
+
+func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, pending *[]pendingNotification) error {
+	graphCommands, graph, err := types.DecodeGraphBatch(value)
+	if err != nil {
+		return fmt.Errorf("decode graph batch: %w", err)
+	}
+	if err := m.applyGraph(ctx, slot, value, graphCommands, graph); err != nil {
 		return err
 	}
 
-	tx, err := m.writer.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin apply: %w", err)
-	}
-	defer tx.Rollback()
 	notifyCommand, notify, err := types.DecodeNotifyCommand(value)
 	if err != nil {
 		return fmt.Errorf("decode notification: %w", err)
@@ -323,6 +361,7 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 		commands = nil
 		batched = true
 	}
+	mutatesState := graph || notify || kv || len(commands) != 0 || !batched
 	publish := false
 	if notify {
 		if notifyCommand.RequestID == "" || len(notifyCommand.RequestID) > types.MaxRequestIDBytes || notifyCommand.Topic == "" || len(notifyCommand.Topic) > 256 || len(notifyCommand.Payload) > 1<<20 {
@@ -410,26 +449,30 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, hex.EncodeToString(hash[:])); err != nil {
 		return fmt.Errorf("persist applied hash: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit apply: %w", err)
+	if mutatesState {
+		if _, err := tx.ExecContext(ctx, `UPDATE _rhiza_meta SET value = ? WHERE key = 'state_slot'`, strconv.FormatUint(slot, 10)); err != nil {
+			return fmt.Errorf("persist state slot: %w", err)
+		}
+		m.stateTip = slot
 	}
-	m.tip = slot
-	m.tipHash = hash
 	if publish {
-		m.publishNotification(notifyCommand.Topic, notifyCommand.Payload)
+		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: append([]byte(nil), notifyCommand.Payload...)})
 	}
 	return nil
 }
 
 func (m *Materializer) publishNotification(topic string, payload []byte) {
 	m.notifyMu.Lock()
-	defer m.notifyMu.Unlock()
+	channels := make([]chan []byte, 0, len(m.subs))
 	for _, sub := range m.subs {
-		if sub.topic != topic {
-			continue
+		if sub.topic == topic {
+			channels = append(channels, sub.ch)
 		}
+	}
+	m.notifyMu.Unlock()
+	for _, ch := range channels {
 		select {
-		case sub.ch <- append([]byte(nil), payload...):
+		case ch <- append([]byte(nil), payload...):
 		default: // bounded at-most-once delivery: slow subscribers observe a gap.
 		}
 	}
@@ -581,6 +624,21 @@ func (m *Materializer) NotifyRequestMatches(ctx context.Context, command types.N
 	return bytes.Equal(existing, encoded), err
 }
 
+// RequestCommitted reports whether an idempotent mutation reached any local
+// materializer. Callers pair this with the reported consensus slot.
+func (m *Materializer) RequestCommitted(ctx context.Context, requestID string) (bool, error) {
+	var found int
+	err := m.reader().QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM _rhiza_requests WHERE request_id = ?)
+		    OR EXISTS(SELECT 1 FROM _rhiza_kv_requests WHERE request_id = ?)
+		    OR EXISTS(SELECT 1 FROM _rhiza_notify_requests WHERE request_id = ?)
+	`, requestID, requestID, requestID).Scan(&found)
+	if err != nil || found != 0 {
+		return found != 0, err
+	}
+	return m.graphRequestExists(requestID)
+}
+
 // ValidateSQLCommand validates the replicated SQL trust boundary.
 func ValidateSQLCommand(command types.SQLCommand) error {
 	if len(command.RequestID) > types.MaxRequestIDBytes {
@@ -603,6 +661,9 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		if len(statement.Args) > MaxSQLArgs {
 			return fmt.Errorf("SQL has more than %d arguments", MaxSQLArgs)
 		}
+		if err := validatePublicSQL(statement.SQL); err != nil {
+			return err
+		}
 		for _, arg := range statement.Args {
 			if _, err := sqlArg(arg); err != nil {
 				return err
@@ -613,6 +674,13 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		case "PRAGMA", "ATTACH", "DETACH", "VACUUM", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE":
 			return fmt.Errorf("%s is not allowed on the replicated write API", keyword)
 		}
+	}
+	return nil
+}
+
+func validatePublicSQL(query string) error {
+	if strings.Contains(strings.ToLower(query), "_rhiza_") {
+		return fmt.Errorf("the _rhiza_ namespace is reserved")
 	}
 	return nil
 }
@@ -788,6 +856,9 @@ func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLC
 
 // Query executes a read query.
 func (m *Materializer) Query(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	if err := validatePublicSQL(query); err != nil {
+		return nil, err
+	}
 	return m.reader().QueryContext(ctx, query, args...)
 }
 
@@ -795,6 +866,9 @@ func (m *Materializer) Query(ctx context.Context, query string, args ...interfac
 func (m *Materializer) QueryResult(ctx context.Context, query string, args []any) (types.SQLStatementResult, error) {
 	if strings.TrimSpace(query) == "" || len(query) > MaxSQLBytes {
 		return types.SQLStatementResult{}, fmt.Errorf("invalid SQL query")
+	}
+	if err := validatePublicSQL(query); err != nil {
+		return types.SQLStatementResult{}, err
 	}
 	normalized, err := NormalizeSQLArgs(args)
 	if err != nil {
@@ -814,22 +888,12 @@ func (m *Materializer) reader() *sql.DB {
 	return m.readers[0]
 }
 
-// QueryRow executes a single-row read query.
-func (m *Materializer) QueryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
+func (m *Materializer) queryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
 	m.mu.RLock()
 	reader := m.readers[0]
 	m.mu.RUnlock()
 
 	return reader.QueryRowContext(ctx, query, args...)
-}
-
-// Exec executes a write query directly.
-func (m *Materializer) Exec(ctx context.Context, query string, args ...interface{}) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	_, err := m.writer.ExecContext(ctx, query, args...)
-	return err
 }
 
 // Snapshot creates a backup of the database.
@@ -1030,7 +1094,7 @@ func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) err
 	os.Remove(backupPath)
 	os.RemoveAll(graphBackupPath)
 	m.db, m.writer, m.readers, m.graph = restored.db, restored.writer, restored.readers, restored.graph
-	m.tip, m.tipHash = restored.tip, restored.tipHash
+	m.tip, m.stateTip, m.tipHash = restored.tip, restored.stateTip, restored.tipHash
 	restored.db, restored.writer, restored.readers, restored.graph = nil, nil, nil, nil
 	return nil
 }
@@ -1041,7 +1105,7 @@ func (m *Materializer) reopen() error {
 		return err
 	}
 	m.db, m.writer, m.readers, m.graph = reopened.db, reopened.writer, reopened.readers, reopened.graph
-	m.tip, m.tipHash = reopened.tip, reopened.tipHash
+	m.tip, m.stateTip, m.tipHash = reopened.tip, reopened.stateTip, reopened.tipHash
 	reopened.db, reopened.writer, reopened.readers, reopened.graph = nil, nil, nil, nil
 	return nil
 }
@@ -1051,6 +1115,13 @@ func (m *Materializer) Tip() uint64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.tip
+}
+
+// StateTip returns the last slot that changed user-visible state.
+func (m *Materializer) StateTip() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.stateTip
 }
 
 // Close closes all connections.

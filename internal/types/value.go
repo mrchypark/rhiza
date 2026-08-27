@@ -12,7 +12,7 @@ import (
 var sqlBatchMagic = []byte("QBAT\x00")
 var kvCommandMagic = []byte("QKVC\x00")
 var notifyCommandMagic = []byte("QNTF\x00")
-var graphCommandMagic = []byte("QGRF\x00")
+var graphBatchMagic = []byte("QGRB\x00")
 
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
 const MaxRequestIDBytes = 256
@@ -96,24 +96,31 @@ type GraphCommandResult struct {
 }
 
 func EncodeGraphCommand(command GraphCommand) ([]byte, error) {
-	payload, err := json.Marshal(command)
+	return EncodeGraphBatch([]GraphCommand{command})
+}
+
+func EncodeGraphBatch(commands []GraphCommand) ([]byte, error) {
+	payload, err := json.Marshal(commands)
 	if err != nil {
 		return nil, err
 	}
-	return append(append([]byte(nil), graphCommandMagic...), payload...), nil
+	return append(append([]byte(nil), graphBatchMagic...), payload...), nil
 }
 
-func DecodeGraphCommand(value []byte) (GraphCommand, bool, error) {
-	if !bytes.HasPrefix(value, graphCommandMagic) {
-		return GraphCommand{}, false, nil
+func DecodeGraphBatch(value []byte) ([]GraphCommand, bool, error) {
+	if !bytes.HasPrefix(value, graphBatchMagic) {
+		return nil, false, nil
 	}
-	var command GraphCommand
-	decoder := json.NewDecoder(bytes.NewReader(value[len(graphCommandMagic):]))
+	var commands []GraphCommand
+	decoder := json.NewDecoder(bytes.NewReader(value[len(graphBatchMagic):]))
 	decoder.UseNumber()
-	if err := decoder.Decode(&command); err != nil {
-		return GraphCommand{}, true, err
+	if err := decoder.Decode(&commands); err != nil {
+		return nil, true, err
 	}
-	return command, true, nil
+	if len(commands) == 0 {
+		return nil, true, fmt.Errorf("empty graph command batch")
+	}
+	return commands, true, nil
 }
 
 func EncodeNotifyCommand(command NotifyCommand) ([]byte, error) {

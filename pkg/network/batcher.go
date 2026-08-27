@@ -2,7 +2,7 @@ package network
 
 import (
 	"context"
-	"runtime"
+	"errors"
 	"sync"
 	"time"
 
@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	maxSQLBatch = 16
+	maxMutationBatch = 16
+	maxBatchDelay    = 2 * time.Millisecond
 )
 
 type batchResult struct {
@@ -19,33 +20,43 @@ type batchResult struct {
 	err  error
 }
 
-type batchItem struct {
+type batchItem[T any] struct {
 	ctx     context.Context
-	command types.SQLCommand
+	command T
 	result  chan batchResult
 }
 
-type sqlBatcher struct {
-	propose  func(context.Context, []byte) (quepaxa.Slot, error)
-	apply    func(context.Context, quepaxa.Slot) error
-	input    chan batchItem
-	inflight chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	once     sync.Once
-	wg       sync.WaitGroup
+type mutationBatcher[T any] struct {
+	propose   func(context.Context, []byte) (quepaxa.Slot, error)
+	apply     func(context.Context, quepaxa.Slot) error
+	encode    func([]T) ([]byte, error)
+	requestID func(T) string
+	input     chan batchItem[T]
+	inflight  chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	once      sync.Once
+	wg        sync.WaitGroup
 }
 
-func newSQLBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *sqlBatcher {
+func newMutationBatcher[T any](propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error, encode func([]T) ([]byte, error), requestID func(T) string) *mutationBatcher[T] {
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &sqlBatcher{propose: propose, apply: apply, input: make(chan batchItem, 1024), inflight: make(chan struct{}, 16), ctx: ctx, cancel: cancel}
+	b := &mutationBatcher[T]{propose: propose, apply: apply, encode: encode, requestID: requestID, input: make(chan batchItem[T], 1024), inflight: make(chan struct{}, 16), ctx: ctx, cancel: cancel}
 	b.wg.Add(1)
 	go b.run()
 	return b
 }
 
-func (b *sqlBatcher) submit(ctx context.Context, command types.SQLCommand) (quepaxa.Slot, error) {
-	item := batchItem{ctx: ctx, command: command, result: make(chan batchResult, 1)}
+func newSQLBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.SQLCommand] {
+	return newMutationBatcher(propose, apply, types.EncodeSQLBatch, func(command types.SQLCommand) string { return command.RequestID })
+}
+
+func newGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.GraphCommand] {
+	return newMutationBatcher(propose, apply, types.EncodeGraphBatch, func(command types.GraphCommand) string { return command.RequestID })
+}
+
+func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slot, error) {
+	item := batchItem[T]{ctx: ctx, command: command, result: make(chan batchResult, 1)}
 	select {
 	case b.input <- item:
 	case <-ctx.Done():
@@ -63,7 +74,7 @@ func (b *sqlBatcher) submit(ctx context.Context, command types.SQLCommand) (quep
 	}
 }
 
-func (b *sqlBatcher) run() {
+func (b *mutationBatcher[T]) run() {
 	defer b.wg.Done()
 	for {
 		select {
@@ -71,28 +82,35 @@ func (b *sqlBatcher) run() {
 			return
 		default:
 		}
-		var first batchItem
+		var first batchItem[T]
 		select {
 		case <-b.ctx.Done():
 			return
 		case first = <-b.input:
 		}
-		items := []batchItem{first}
-		// Let concurrently submitted commands reach the queue without imposing
-		// a fixed latency floor on an isolated request.
-		runtime.Gosched()
+		items := []batchItem[T]{first}
+		timer := time.NewTimer(maxBatchDelay)
 	collect:
-		for len(items) < maxSQLBatch {
+		for len(items) < maxMutationBatch {
 			select {
 			case item := <-b.input:
 				items = append(items, item)
-			default:
+			case <-timer.C:
 				break collect
+			case <-b.ctx.Done():
+				timer.Stop()
+				return
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
 			}
 		}
 
-		active := make([]batchItem, 0, len(items))
-		commands := make([]types.SQLCommand, 0, len(items))
+		active := make([]batchItem[T], 0, len(items))
+		commands := make([]T, 0, len(items))
 		for _, item := range items {
 			if item.ctx.Err() == nil {
 				active = append(active, item)
@@ -111,8 +129,8 @@ func (b *sqlBatcher) run() {
 	}
 }
 
-func (b *sqlBatcher) execute(items []batchItem, commands []types.SQLCommand) {
-	value, err := types.EncodeSQLBatch(commands)
+func (b *mutationBatcher[T]) execute(items []batchItem[T], commands []T) {
+	value, err := b.encode(commands)
 	if err == nil && len(value) > quepaxa.MaxReplicatedValueBytes && len(items) > 1 {
 		mid := len(items) / 2
 		b.execute(items[:mid], commands[:mid])
@@ -132,11 +150,15 @@ func (b *sqlBatcher) execute(items []batchItem, commands []types.SQLCommand) {
 		cancel()
 	}
 	for _, item := range items {
-		item.result <- batchResult{slot: slot, err: err}
+		itemErr := err
+		if errors.Is(err, ErrDurabilityUnavailable) {
+			itemErr = commitUnknown(slot, b.requestID(item.command), err)
+		}
+		item.result <- batchResult{slot: slot, err: itemErr}
 	}
 }
 
-func (b *sqlBatcher) Close() {
+func (b *mutationBatcher[T]) Close() {
 	b.once.Do(func() {
 		b.cancel()
 		b.wg.Wait()

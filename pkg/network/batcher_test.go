@@ -16,11 +16,13 @@ func TestSQLBatcherCombinesQueuedCommands(t *testing.T) {
 	proposals := 0
 	commands := 0
 	ctx, cancel := context.WithCancel(context.Background())
-	b := &sqlBatcher{
-		input:    make(chan batchItem, 16),
-		inflight: make(chan struct{}, 16),
-		ctx:      ctx,
-		cancel:   cancel,
+	b := &mutationBatcher[types.SQLCommand]{
+		input:     make(chan batchItem[types.SQLCommand], 16),
+		inflight:  make(chan struct{}, 16),
+		ctx:       ctx,
+		cancel:    cancel,
+		encode:    types.EncodeSQLBatch,
+		requestID: func(command types.SQLCommand) string { return command.RequestID },
 		propose: func(_ context.Context, value []byte) (quepaxa.Slot, error) {
 			batch, ok, err := types.DecodeSQLBatch(value)
 			if err != nil || !ok {
@@ -85,15 +87,17 @@ func TestSQLBatcherCloseStopsPendingWork(t *testing.T) {
 
 func TestSQLBatcherSplitsOversizedCombinedValue(t *testing.T) {
 	var sizes []int
-	b := &sqlBatcher{
-		ctx: context.Background(),
+	b := &mutationBatcher[types.SQLCommand]{
+		ctx:       context.Background(),
+		encode:    types.EncodeSQLBatch,
+		requestID: func(command types.SQLCommand) string { return command.RequestID },
 		propose: func(_ context.Context, value []byte) (quepaxa.Slot, error) {
 			sizes = append(sizes, len(value))
 			return quepaxa.Slot(len(sizes)), nil
 		},
 		apply: func(context.Context, quepaxa.Slot) error { return nil },
 	}
-	items := []batchItem{
+	items := []batchItem[types.SQLCommand]{
 		{result: make(chan batchResult, 1)},
 		{result: make(chan batchResult, 1)},
 	}

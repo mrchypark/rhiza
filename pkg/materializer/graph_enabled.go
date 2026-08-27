@@ -57,7 +57,9 @@ func openGraph(path string, sqliteTip uint64) (*graphState, error) {
 	}
 	opts := graphdb.DefaultOptions()
 	opts.ShardCount = 1
-	opts.NoSync = false
+	// The certified QLog is the durable source of truth. GoraphDB is a
+	// replayable materialized view, so per-command fdatasync is redundant.
+	opts.NoSync = true
 	opts.EnableWAL = false
 	opts.Role = "standalone"
 	opts.MaxResultRows = MaxReturningRows
@@ -123,7 +125,7 @@ func (g *graphState) close() {
 	}
 }
 
-func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, command types.GraphCommand, graph bool) error {
+func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, commands []types.GraphCommand, graph bool) error {
 	g := m.graph
 	if g == nil || g.db == nil {
 		return fmt.Errorf("GoraphDB is not open")
@@ -156,14 +158,17 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 		return nil
 	}
 
-	result, hash, err := prepareGraphCommand(command)
-	if err == nil {
-		err = g.applyCommand(ctx, slot, command, hash, &result)
-	}
-	if err != nil {
-		result = types.GraphCommandResult{Error: err.Error()}
-		if recordErr := g.recordFailure(ctx, slot, command, hash, result); recordErr != nil {
-			return recordErr
+	for i, command := range commands {
+		advance := i == len(commands)-1
+		result, hash, err := prepareGraphCommand(command)
+		if err == nil {
+			err = g.applyCommand(ctx, slot, command, hash, &result, advance)
+		}
+		if err != nil {
+			result = types.GraphCommandResult{Error: err.Error()}
+			if recordErr := g.recordFailure(ctx, slot, command, hash, result, advance); recordErr != nil {
+				return recordErr
+			}
 		}
 	}
 	g.tip = slot
@@ -188,7 +193,7 @@ func (g *graphState) advanceTip(ctx context.Context, slot uint64) error {
 	})
 }
 
-func (g *graphState) applyCommand(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result *types.GraphCommandResult) error {
+func (g *graphState) applyCommand(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result *types.GraphCommandResult, advance bool) error {
 	args, err := graphArgs(command.Args)
 	if err != nil {
 		return err
@@ -203,7 +208,10 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, command type
 				return fmt.Errorf("request_id was already used for a different graph command")
 			}
 			*result = existing.Result
-			return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+			if advance {
+				return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+			}
+			return nil
 		}
 		queryResult, err := tx.CypherWithParams(ctx, command.Cypher, args)
 		if err != nil {
@@ -213,11 +221,14 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, command type
 		if err := putRequest(tx, command.RequestID, graphRequest{Hash: hash, Result: *result}); err != nil {
 			return err
 		}
-		return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+		if advance {
+			return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+		}
+		return nil
 	})
 }
 
-func (g *graphState) recordFailure(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result types.GraphCommandResult) error {
+func (g *graphState) recordFailure(ctx context.Context, slot uint64, command types.GraphCommand, hash string, result types.GraphCommandResult, advance bool) error {
 	if hash == "" {
 		encoded, err := json.Marshal(command)
 		if err != nil {
@@ -236,7 +247,10 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, command typ
 				return err
 			}
 		}
-		return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+		if advance {
+			return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+		}
+		return nil
 	})
 }
 
@@ -362,6 +376,15 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 		return !found, err
 	}
 	return request.Hash == hex.EncodeToString(hash[:]), nil
+}
+
+func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	m.graph.mu.Lock()
+	defer m.graph.mu.Unlock()
+	_, found, err := m.graph.request(requestID)
+	return found, err
 }
 
 func (m *Materializer) graphHealth() error {

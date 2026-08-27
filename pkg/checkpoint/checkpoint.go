@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,7 +22,7 @@ import (
 )
 
 const (
-	chunkSize         = 4 << 20
+	chunkSize         = 16 << 20
 	maxCheckpointSize = 16 << 30
 	maxChunks         = maxCheckpointSize/chunkSize + 1
 	maxRootSize       = 1 << 20
@@ -102,18 +103,10 @@ func (m *Manager) CreateReader(ctx context.Context, reader io.Reader, index uint
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	spool, err := os.CreateTemp(m.localDir, ".rhiza-checkpoint-upload-*")
-	if err != nil {
-		return nil, err
-	}
-	spoolPath := spool.Name()
-	defer func() {
-		_ = spool.Close()
-		_ = os.Remove(spoolPath)
-	}()
 	root := Checkpoint{ConfigID: m.configID, Index: index}
 	stateHash := sha256.New()
 	buffer := make([]byte, chunkSize)
+	conditional := slices.Contains(m.bucket.SupportedObjectUploadOptions(), objstore.IfNotExists)
 	for {
 		n, readErr := io.ReadFull(reader, buffer)
 		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
@@ -125,8 +118,18 @@ func (m *Manager) CreateReader(ctx context.Context, reader io.Reader, index uint
 			}
 			data := buffer[:n]
 			hash := sha256.Sum256(data)
-			if _, err := spool.Write(data); err != nil {
-				return nil, err
+			name := m.key(chunkKey(hash))
+			if conditional {
+				uploadErr := m.bucket.Upload(ctx, name, bytes.NewReader(data), objstore.WithIfNotExists())
+				if uploadErr != nil && !m.bucket.IsConditionNotMetErr(uploadErr) {
+					return nil, fmt.Errorf("upload checkpoint chunk: %w", uploadErr)
+				}
+			} else if exists, existsErr := m.bucket.Exists(ctx, name); existsErr != nil {
+				return nil, fmt.Errorf("check checkpoint chunk: %w", existsErr)
+			} else if !exists {
+				if err := m.bucket.Upload(ctx, name, bytes.NewReader(data)); err != nil {
+					return nil, fmt.Errorf("upload checkpoint chunk: %w", err)
+				}
 			}
 			_, _ = stateHash.Write(data)
 			root.Size += int64(n)
@@ -162,23 +165,6 @@ func (m *Manager) CreateReader(ctx context.Context, reader io.Reader, index uint
 			m.sortRoots()
 		}
 		return &existing, nil
-	}
-	if _, err := spool.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	for _, chunk := range root.Chunks {
-		chunkData := buffer[:chunk.Size]
-		if _, err := io.ReadFull(spool, chunkData); err != nil {
-			return nil, err
-		}
-		name := m.key(chunkKey(root.RootHash, chunk.Hash))
-		if exists, err := m.bucket.Exists(ctx, name); err != nil {
-			return nil, fmt.Errorf("check checkpoint chunk: %w", err)
-		} else if !exists {
-			if err := m.bucket.Upload(ctx, name, bytes.NewReader(chunkData)); err != nil {
-				return nil, fmt.Errorf("upload checkpoint chunk: %w", err)
-			}
-		}
 	}
 	if err := m.bucket.Upload(ctx, rootName, bytes.NewReader(data)); err != nil {
 		return nil, fmt.Errorf("publish checkpoint root: %w", err)
@@ -305,7 +291,7 @@ func (m *Manager) verifyAndWrite(ctx context.Context, target Checkpoint, writer 
 	stateHash := sha256.New()
 	var size int64
 	for _, chunk := range target.Chunks {
-		r, err := m.bucket.Get(ctx, m.key(chunkKey(target.RootHash, chunk.Hash)))
+		r, err := m.bucket.Get(ctx, m.key(chunkKey(chunk.Hash)))
 		if err != nil {
 			return fmt.Errorf("download checkpoint chunk: %w", err)
 		}
@@ -372,7 +358,7 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 	}
 	cutoff := time.Now().Add(-grace)
 	kept := make([]Checkpoint, 0, len(m.checkpoints))
-	removed := make(map[[32]byte]struct{})
+	removed := make([]Checkpoint, 0)
 	for _, root := range m.checkpoints {
 		name := m.key(rootKey(root))
 		_, explicit := keepRoots[root.RootHash]
@@ -389,22 +375,28 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 			m.mu.Unlock()
 			return err
 		}
-		removed[root.RootHash] = struct{}{}
+		removed = append(removed, root)
 	}
 	m.checkpoints = kept
-	keepPrefixes := make(map[string]struct{}, len(kept)+len(removed))
+	keepChunks := make(map[[32]byte]struct{})
 	for _, root := range kept {
-		keepPrefixes[m.key(chunkRootPrefix(root.RootHash))] = struct{}{}
+		for _, chunk := range root.Chunks {
+			keepChunks[chunk.Hash] = struct{}{}
+		}
 	}
-	for root := range removed {
-		keepPrefixes[m.key(chunkRootPrefix(root))] = struct{}{}
+	for _, root := range removed {
+		for _, chunk := range root.Chunks {
+			keepChunks[chunk.Hash] = struct{}{}
+		}
 	}
 	m.mu.Unlock()
 	return m.bucket.IterWithAttributes(ctx, m.key("checkpoint/chunks"), func(attributes objstore.IterObjectAttributes) error {
-		for prefix := range keepPrefixes {
-			if strings.HasPrefix(attributes.Name, prefix) {
-				return nil
-			}
+		hash, ok := parseChunkKey(attributes.Name)
+		if !ok {
+			return nil
+		}
+		if _, ok := keepChunks[hash]; ok {
+			return nil
 		}
 		modified, ok := attributes.LastModified()
 		if !ok {
@@ -477,9 +469,17 @@ func decodePersistedJSON(data []byte, value any) error {
 	return nil
 }
 
-func chunkRootPrefix(root [32]byte) string { return fmt.Sprintf("checkpoint/chunks/%x/", root) }
-func chunkKey(root, chunk [32]byte) string {
-	return fmt.Sprintf("%s%x.chunk", chunkRootPrefix(root), chunk)
+func chunkKey(chunk [32]byte) string { return fmt.Sprintf("checkpoint/chunks/%x.chunk", chunk) }
+
+func parseChunkKey(name string) ([32]byte, bool) {
+	base := strings.TrimSuffix(path.Base(name), ".chunk")
+	decoded, err := hex.DecodeString(base)
+	if err != nil || len(decoded) != sha256.Size {
+		return [32]byte{}, false
+	}
+	var hash [32]byte
+	copy(hash[:], decoded)
+	return hash, true
 }
 func rootKey(root Checkpoint) string {
 	return fmt.Sprintf("checkpoint/roots/%020d_%x.json", root.Index, root.RootHash)

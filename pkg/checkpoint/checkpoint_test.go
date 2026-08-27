@@ -16,7 +16,7 @@ func TestReadRejectsCorruptCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	cp := manager.Latest()
-	key := manager.key(chunkKey(cp.RootHash, cp.Chunks[0].Hash))
+	key := manager.key(chunkKey(cp.Chunks[0].Hash))
 	if err := bucket.Upload(ctx, key, bytes.NewReader([]byte("bad!!"))); err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestGarbageCollectRetiresRootBeforeItsChunks(t *testing.T) {
 	if _, err := manager.CreateReader(ctx, bytes.NewReader([]byte("new")), 11); err != nil {
 		t.Fatal(err)
 	}
-	oldChunk := manager.key(chunkKey(old.RootHash, old.Chunks[0].Hash))
+	oldChunk := manager.key(chunkKey(old.Chunks[0].Hash))
 	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
 		t.Fatal(err)
 	}

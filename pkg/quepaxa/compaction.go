@@ -1,19 +1,64 @@
 package quepaxa
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
 
+// RestoreCheckpointBase installs an object-store recovery floor only after
+// verifying both the checkpoint bytes and the consensus certificate that
+// sealed that exact root.
+func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+	if c.Tip() >= seal.Index || seal.ConfigID != c.config.ConfigID || seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("invalid checkpoint recovery base")
+	}
+	value, checkpoint, err := DecodeCheckpointSeal(certified.Value)
+	if err != nil || !checkpoint || value.ConfigID != seal.ConfigID || value.Index != seal.Index || value.RootHash != seal.RootHash || value.StateHash != seal.StateHash || value.PrefixHash != seal.PrefixHash || !slices.Equal(value.NextLeaderOrder, seal.NextLeaderOrder) || !slices.Equal(value.FollowingLeaderOrder, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("checkpoint recovery decision does not match its seal")
+	}
+	decision, err := c.certifiedDecision(certified)
+	if err != nil {
+		return err
+	}
+	validator := c.checkpointValidator
+	if validator == nil {
+		return fmt.Errorf("checkpoint validation is unavailable")
+	}
+	if err := validator(ctx, seal); err != nil {
+		return err
+	}
+	base := consensusBase{ConfigID: seal.ConfigID, ClosedThrough: seal.Index, PrefixHash: seal.PrefixHash, RecoveryRoot: seal.RootHash, LeaderEpoch: leaderEpoch(seal.Index + 1), NextLeaderOrder: append([]NodeID(nil), seal.NextLeaderOrder...), FollowingLeaderOrder: append([]NodeID(nil), seal.FollowingLeaderOrder...)}
+	c.mu.Lock()
+	c.installBaseLocked(base)
+	c.mu.Unlock()
+	if err := c.validateDecisionForRecovery(decision, true); err != nil {
+		return fmt.Errorf("validate checkpoint recovery decision: %w", err)
+	}
+	payload, err := json.Marshal(base)
+	if err != nil {
+		return err
+	}
+	if err := c.wal.Compact(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, nil); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.preparedCheckpoints[seal.Index] = seal.RootHash
+	c.mu.Unlock()
+	return nil
+}
+
 type consensusBase struct {
-	ConfigID        uint     `json:"config_id"`
-	ClosedThrough   Slot     `json:"closed_through"`
-	PrefixHash      [32]byte `json:"prefix_hash"`
-	RecoveryRoot    [32]byte `json:"recovery_root"`
-	LeaderEpoch     uint64   `json:"leader_epoch"`
-	NextLeaderOrder []NodeID `json:"next_leader_order"`
+	ConfigID             uint     `json:"config_id"`
+	ClosedThrough        Slot     `json:"closed_through"`
+	PrefixHash           [32]byte `json:"prefix_hash"`
+	RecoveryRoot         [32]byte `json:"recovery_root"`
+	LeaderEpoch          uint64   `json:"leader_epoch"`
+	NextLeaderOrder      []NodeID `json:"next_leader_order"`
+	FollowingLeaderOrder []NodeID `json:"following_leader_order,omitempty"`
 }
 
 // CompactThrough installs a certified local recovery floor. Callers must have
@@ -54,13 +99,13 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	if !ok {
 		return fmt.Errorf("prefix hash at slot %d is unavailable", through)
 	}
-	order, err := c.leaderOrderLocked(through + 1)
+	order, following, err := c.checkpointLeaderOrdersLocked(through)
 	if err != nil {
 		return err
 	}
 	base := consensusBase{
 		ConfigID: c.config.ConfigID, ClosedThrough: through,
-		PrefixHash: prefix, RecoveryRoot: recoveryRoot, LeaderEpoch: leaderEpoch(through + 1), NextLeaderOrder: order,
+		PrefixHash: prefix, RecoveryRoot: recoveryRoot, LeaderEpoch: leaderEpoch(through + 1), NextLeaderOrder: order, FollowingLeaderOrder: following,
 	}
 	payload, err := json.Marshal(base)
 	if err != nil {
@@ -120,6 +165,12 @@ func (c *Core) installBaseLocked(base consensusBase) {
 	c.floorRoot = base.RecoveryRoot
 	c.baseLeaderEpoch = base.LeaderEpoch
 	c.baseLeaderOrder = append([]NodeID(nil), base.NextLeaderOrder...)
+	c.baseFollowingEpoch = 0
+	c.baseFollowingOrder = nil
+	if len(base.FollowingLeaderOrder) != 0 {
+		c.baseFollowingEpoch = base.LeaderEpoch + 1
+		c.baseFollowingOrder = append([]NodeID(nil), base.FollowingLeaderOrder...)
+	}
 	c.tip = base.ClosedThrough
 	clear(c.prefixes)
 	c.prefixes[base.ClosedThrough] = base.PrefixHash

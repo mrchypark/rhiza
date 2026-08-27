@@ -28,7 +28,6 @@ type ObjectStoreDurability string
 const (
 	ProfileSQL   Profile = "sql"
 	ProfileGraph Profile = "graph"
-	ProfileKV    Profile = "kv"
 
 	ObjectStoreDurabilityAsync     ObjectStoreDurability = "async"
 	ObjectStoreDurabilityBeforeAck ObjectStoreDurability = "before-ack"
@@ -36,16 +35,14 @@ const (
 
 // ExecutionConfig holds runtime configuration.
 type ExecutionConfig struct {
-	ClusterID   ClusterID    `json:"cluster_id"`
-	NodeID      NodeID       `json:"node_id"`
-	Profile     Profile      `json:"profile"`
-	DataDir     string       `json:"data_dir"`
-	BindAddr    string       `json:"bind_addr"`
-	PeerAddr    string       `json:"peer_addr"`
-	LogAddr     string       `json:"log_addr"`
-	AdminToken  string       `json:"admin_token"`
-	ClientToken string       `json:"client_token"`
-	Members     []NodeConfig `json:"members"`
+	ClusterID  ClusterID    `json:"cluster_id"`
+	NodeID     NodeID       `json:"node_id"`
+	Profile    Profile      `json:"profile"`
+	DataDir    string       `json:"data_dir"`
+	BindAddr   string       `json:"bind_addr"`
+	PeerAddr   string       `json:"peer_addr"`
+	AdminToken string       `json:"admin_token"`
+	Members    []NodeConfig `json:"members"`
 
 	// Object store configuration
 	ObjStoreEndpoint      string                `json:"objstore_endpoint"`
@@ -66,6 +63,5 @@ type ExecutionConfig struct {
 
 	// Timing
 	CheckpointInterval time.Duration `json:"checkpoint_interval"`
-	ReadTimeout        time.Duration `json:"read_timeout"`
 	HedgeDelay         time.Duration `json:"hedge_delay"`
 }

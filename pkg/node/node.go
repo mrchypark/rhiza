@@ -139,8 +139,14 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
 		n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
+		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
+			return fmt.Errorf("multi-node shared archive requires conditional object writes")
+		}
 		if loadErr := n.archive.Load(ctx); loadErr != nil {
-			return fmt.Errorf("load shared decision archive: %w", loadErr)
+			if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
+				return fmt.Errorf("load shared decision archive: %w", loadErr)
+			}
+			log.Printf("shared archive unavailable during async startup: %v", loadErr)
 		}
 	}
 
@@ -194,6 +200,11 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		})
 	}
 	if n.archive != nil {
+		if seal, decision, ok := n.archive.RecoveryBase(); ok && core.Tip() < seal.Index {
+			if err := core.RestoreCheckpointBase(ctx, seal, decision); err != nil {
+				return fmt.Errorf("restore checkpoint recovery base: %w", err)
+			}
+		}
 		for core.Tip() < n.archive.Tip() {
 			values, _, archiveErr := n.archive.DecisionsFrom(core.Tip()+1, 256)
 			if archiveErr != nil || len(values) == 0 {
@@ -210,6 +221,15 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
+	server.SetObjectStoreStats(func() (map[string]uint64, bool) {
+		stats, ok := n.ObjectStoreStats()
+		return map[string]uint64{
+			"uploads": stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
+			"deletes": stats.Deletes, "failures": stats.Failures, "bytes_uploaded": stats.BytesUploaded,
+			"bytes_downloaded": stats.BytesDownloaded, "s3_http_requests": stats.S3HTTPRequests,
+			"s3_http_failures": stats.S3HTTPFailures,
+		}, ok
+	})
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
 		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
 			if err := core.EnsureDurable(slot); err != nil {
@@ -351,13 +371,13 @@ func (n *Node) Open(ctx context.Context) (err error) {
 				if !ok {
 					return fmt.Errorf("checkpoint prefix %d is unavailable", root.Index)
 				}
-				order, err := core.LeaderOrder(quepaxa.Slot(root.Index) + 1)
+				order, following, err := core.CheckpointLeaderOrders(quepaxa.Slot(root.Index))
 				if err != nil {
 					return err
 				}
 				seal := quepaxa.CheckpointSeal{
 					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
-					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order,
+					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following,
 				}
 				if err := core.PrepareCheckpoint(ctx, seal); err != nil {
 					return err
@@ -379,7 +399,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 				return n.compactCertifiedCheckpoint(ctx)
 			},
 		)
-		n.checkpointer.Start(ctx, func() uint64 { return uint64(core.Tip()) }, func(ctx context.Context) error {
+		n.checkpointer.Start(ctx, material.StateTip, func(ctx context.Context) error {
 			if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
 				return err
 			}
@@ -435,6 +455,13 @@ func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
 		return err
 	}
 	if err := n.archive.SyncThrough(ctx, n.core, seal.DecisionSlot); err != nil {
+		return err
+	}
+	decision, ok := n.core.CertifiedValue(seal.DecisionSlot)
+	if !ok {
+		return fmt.Errorf("checkpoint seal decision %d is unavailable", seal.DecisionSlot)
+	}
+	if err := n.archive.TrimThrough(ctx, seal, decision); err != nil {
 		return err
 	}
 	return n.core.CompactThrough(seal.Index, seal.RootHash)
@@ -536,10 +563,8 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		for _, decision := range decisions {
-			if err := n.material.Apply(ctx, uint64(decision.Slot), decision.Value); err != nil {
-				return err
-			}
+		if err := n.material.ApplyBatch(ctx, decisions); err != nil {
+			return err
 		}
 		if quepaxa.Slot(n.material.Tip()) >= tip {
 			return nil
@@ -552,9 +577,7 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 		if err := n.catchUp(ctx, transport, cluster); err != nil {
 			// A transient peer timeout must not make an already caught-up node
 			// reject traffic; quorum operations enforce their own availability.
-			if !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
-				n.ready.Store(false)
-			}
+			n.ready.Store(false)
 			log.Printf("quorum catch-up failed: %v", err)
 		} else {
 			n.ready.Store(true)
@@ -569,9 +592,6 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 
 func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
 	for {
-		if err := n.catchUpArchive(ctx); err != nil {
-			return err
-		}
 		if err := n.replayLocalDecisions(ctx); err != nil {
 			return err
 		}
@@ -627,10 +647,8 @@ func (n *Node) catchUp(ctx context.Context, transport *network.Transport, cluste
 		if err := n.core.AcceptCertifiedValues(best.Decisions); err != nil {
 			return err
 		}
-		for _, decision := range best.Decisions {
-			if err := n.material.Apply(ctx, uint64(decision.Slot), decision.Value); err != nil {
-				return err
-			}
+		if err := n.material.ApplyBatch(ctx, best.Decisions); err != nil {
+			return err
 		}
 		if len(best.Decisions) == 0 {
 			return fmt.Errorf("catch-up source reported tip %d without slot %d", best.Tip, expected)
@@ -655,7 +673,7 @@ func (n *Node) Shutdown() error {
 		if err := n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()); err != nil {
 			shutdownErr = errors.Join(shutdownErr, err)
 		} else if n.checkpointer != nil {
-			shutdownErr = errors.Join(shutdownErr, n.checkpointer.CheckpointOnShutdown(shutdownCtx, uint64(n.core.Tip())))
+			shutdownErr = errors.Join(shutdownErr, n.checkpointer.CheckpointOnShutdown(shutdownCtx, n.material.StateTip()))
 		}
 		cancel()
 	}

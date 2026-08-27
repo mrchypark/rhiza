@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,26 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
+
+func BenchmarkGraphApply(b *testing.B) {
+	m, err := Open(filepath.Join(b.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		command := types.GraphCommand{RequestID: fmt.Sprintf("request-%d", i), Cypher: `CREATE (:Bench {id: $id})`, Args: map[string]any{"id": float64(i)}}
+		value, err := types.EncodeGraphCommand(command)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := m.Apply(ctx, uint64(i+1), value); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 type zeroReader struct{}
 
@@ -137,6 +158,34 @@ func TestFailedGraphCommandRecordsResultAndAdvancesTip(t *testing.T) {
 	rows, err := m.GraphQuery(ctx, `MATCH (n:Item) RETURN n.id ORDER BY n.id`, nil)
 	if err != nil || len(rows.Rows) != 2 {
 		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestGraphBatchAppliesEveryCommandAtOneSlot(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	commands := []types.GraphCommand{
+		{RequestID: "first", Cypher: `CREATE (:Item {id: '1'})`},
+		{RequestID: "second", Cypher: `CREATE (:Item {id: '2'})`},
+	}
+	value, err := types.EncodeGraphBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id ORDER BY n.id`, nil)
+	if err != nil || len(rows.Rows) != 2 || m.Tip() != 1 {
+		t.Fatalf("rows=%+v tip=%d err=%v", rows, m.Tip(), err)
+	}
+	for _, command := range commands {
+		if _, err := m.GraphRequestResult(context.Background(), command.RequestID); err != nil {
+			t.Fatalf("request %q: %v", command.RequestID, err)
+		}
 	}
 }
 

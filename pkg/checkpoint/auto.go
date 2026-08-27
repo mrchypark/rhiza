@@ -71,7 +71,7 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 				}
 
 				// Check if we've processed enough new slots
-				if tip-lastCheckpoint < uint64(a.interval) {
+				if tip <= lastCheckpoint || tip-lastCheckpoint < uint64(a.interval) {
 					continue
 				}
 				if before != nil {

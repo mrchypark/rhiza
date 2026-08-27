@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,12 +381,11 @@ func newTestCluster(t testing.TB) (map[NodeID]*Core, *clusterTransport) {
 		}
 		t.Cleanup(func() { _ = wal.Close() })
 		core := newCore(member.ID, config, wal, transport)
-		counter := byte(0)
+		var counter atomic.Uint32
 		seed := member.ID[len(member.ID)-1]
 		core.priority = func() (Priority, error) {
-			counter++
 			var priority Priority
-			priority[30], priority[31] = seed, counter
+			priority[30], priority[31] = seed, byte(counter.Add(1))
 			return priority, nil
 		}
 		transport.cores[member.ID] = core

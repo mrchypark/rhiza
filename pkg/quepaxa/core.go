@@ -61,6 +61,8 @@ type Core struct {
 	floorRoot           [32]byte
 	baseLeaderEpoch     uint64
 	baseLeaderOrder     []NodeID
+	baseFollowingEpoch  uint64
+	baseFollowingOrder  []NodeID
 	tipChanged          chan struct{}
 	decided             map[Slot]DecidedValue
 	durable             map[Slot]bool
@@ -83,6 +85,8 @@ type Core struct {
 	periodicMu          sync.Mutex
 	periodic            context.CancelFunc
 	periodicWG          sync.WaitGroup
+	healthMu            sync.Mutex
+	periodicErr         error
 }
 
 func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport) *Core {
@@ -424,6 +428,9 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		if epoch == c.baseLeaderEpoch && len(c.baseLeaderOrder) != 0 {
 			return append([]NodeID(nil), c.baseLeaderOrder...), nil
 		}
+		if epoch == c.baseFollowingEpoch && len(c.baseFollowingOrder) != 0 {
+			return append([]NodeID(nil), c.baseFollowingOrder...), nil
+		}
 		return nil, fmt.Errorf("leader schedule unavailable for epoch %d", epoch)
 	}
 	order, schedule, err := DecodeLeaderSchedule(decision.Value)
@@ -431,6 +438,39 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		return nil, fmt.Errorf("invalid leader schedule for epoch %d", epoch)
 	}
 	return order, nil
+}
+
+func (c *Core) checkpointNeedsFollowingOrder(index Slot) bool {
+	epoch := leaderEpoch(index + 1)
+	return epoch+1 >= c.explorationEpochs() && leaderEpochFirst(epoch) <= index
+}
+
+func (c *Core) validateCheckpointLeaderOrders(index Slot, next, following []NodeID) bool {
+	if !c.validateLeaderSchedule(next) {
+		return false
+	}
+	if c.checkpointNeedsFollowingOrder(index) {
+		return c.validateLeaderSchedule(following)
+	}
+	return len(following) == 0
+}
+
+func (c *Core) checkpointLeaderOrdersLocked(index Slot) ([]NodeID, []NodeID, error) {
+	next, err := c.leaderOrderLocked(index + 1)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !c.checkpointNeedsFollowingOrder(index) {
+		return next, nil, nil
+	}
+	following, err := c.leaderOrderLocked(leaderEpochFirst(leaderEpoch(index+1) + 1))
+	return next, following, err
+}
+
+func (c *Core) CheckpointLeaderOrders(index Slot) ([]NodeID, []NodeID, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.checkpointLeaderOrdersLocked(index)
 }
 
 func (c *Core) LeaderOrder(slot Slot) ([]NodeID, error) {
@@ -819,10 +859,10 @@ func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Conte
 	prefix, prefixOK := c.prefixes[seal.Index]
 	preparedRoot, prepared := c.preparedCheckpoints[seal.Index]
 	validator := c.checkpointValidator
-	order, orderErr := c.leaderOrderLocked(seal.Index + 1)
+	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
 	tip := c.tip
 	c.mu.RUnlock()
-	if seal.ConfigID != c.config.ConfigID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) {
+	if seal.ConfigID != c.config.ConfigID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
 		return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix")
 	}
 	if prepared && preparedRoot != seal.RootHash {
@@ -1456,7 +1496,7 @@ func (c *Core) recover() error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
 			base, decodeErr := decodeConsensusBase(entry.Payload)
-			if decodeErr != nil || base.ConfigID != c.config.ConfigID || uint64(base.ClosedThrough) != entry.Slot || base.RecoveryRoot != entry.Hash || !c.validateLeaderSchedule(base.NextLeaderOrder) {
+			if decodeErr != nil || base.ConfigID != c.config.ConfigID || uint64(base.ClosedThrough) != entry.Slot || base.RecoveryRoot != entry.Hash || base.LeaderEpoch != leaderEpoch(base.ClosedThrough+1) || !c.validateCheckpointLeaderOrders(base.ClosedThrough, base.NextLeaderOrder, base.FollowingLeaderOrder) {
 				if decodeErr == nil {
 					decodeErr = fmt.Errorf("consensus base identity mismatch")
 				}
@@ -1467,7 +1507,7 @@ func (c *Core) recover() error {
 			c.mu.Unlock()
 		case qlog.EntryCheckpointVerified:
 			seal, checkpoint, decodeErr := DecodeCheckpointSeal(entry.Payload)
-			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.config.ConfigID || !c.validateLeaderSchedule(seal.NextLeaderOrder) {
+			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.config.ConfigID || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
 				if decodeErr == nil {
 					decodeErr = fmt.Errorf("checkpoint verification identity mismatch")
 				}
@@ -1614,10 +1654,21 @@ func (c *Core) StartPeriodicSync(ctx context.Context, interval time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = c.wal.Sync()
+				err := c.wal.Sync()
+				c.healthMu.Lock()
+				c.periodicErr = err
+				c.healthMu.Unlock()
 			}
 		}
 	}()
+}
+
+// Health reports background durability failures that would otherwise be
+// invisible until shutdown.
+func (c *Core) Health() error {
+	c.healthMu.Lock()
+	defer c.healthMu.Unlock()
+	return c.periodicErr
 }
 
 // StopPeriodicSync waits until the background loop no longer uses the WAL.
