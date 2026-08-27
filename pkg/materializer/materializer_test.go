@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,6 +195,29 @@ func TestIdempotencyReceiptExpiresAtWindowBoundary(t *testing.T) {
 	}
 }
 
+func TestKVMutationPhysicallyPrunesExpiredRows(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	commands := []types.KVCommand{
+		{RequestID: "expired", Operation: "put", Key: "expired", Value: []byte("old"), ObservedAtUnixMS: 1, ExpiresAtUnixMS: 10},
+		{RequestID: "next", Operation: "put", Key: "next", Value: []byte("new"), ObservedAtUnixMS: 11},
+	}
+	for i, command := range commands {
+		value, err := types.EncodeKVCommand(command)
+		if err != nil || m.Apply(ctx, uint64(i+1), value) != nil {
+			t.Fatalf("apply %d: encode=%v", i+1, err)
+		}
+	}
+	var count int
+	if err := m.writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM _rhiza_kv WHERE key = 'expired'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("expired physical rows=%d err=%v", count, err)
+	}
+}
+
 func TestSQLCommandRejectsMutationRows(t *testing.T) {
 	command := types.SQLCommand{RequestID: "aggregate", Statements: []types.SQLStatement{
 		{SQL: "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<6000) SELECT n FROM seq", WantRows: true},
@@ -270,6 +295,27 @@ func TestQueryResultRejectsOversizedCell(t *testing.T) {
 	defer m.Close()
 	if _, err := m.QueryResult(context.Background(), "SELECT zeroblob(?)", []any{MaxCellBytes + 1}); err == nil {
 		t.Fatal("oversized result cell was accepted")
+	}
+}
+
+func TestQueryResultBoundsEncodedJSON(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	if _, err := m.writer.ExecContext(ctx, "CREATE TABLE encoded_result (value TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	value := strings.Repeat("\x01", MaxCellBytes)
+	for range 3 {
+		if _, err := m.writer.ExecContext(ctx, "INSERT INTO encoded_result(value) VALUES (?)", value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.QueryResult(ctx, "SELECT value FROM encoded_result", nil); err == nil {
+		t.Fatal("JSON-escaped result exceeded the response budget")
 	}
 }
 
@@ -371,6 +417,23 @@ func TestMaterializerReadAPIRejectsAttachment(t *testing.T) {
 	}
 	if _, err := m.Snapshot(context.Background()); err != nil {
 		t.Fatalf("internal snapshot was blocked: %v", err)
+	}
+}
+
+func BenchmarkCheckpointFilesAt(b *testing.B) {
+	m, err := Open(b.TempDir()+"/checkpoint.db", 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer m.Close()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, _, cleanup, err := m.CheckpointFilesAt(context.Background())
+		if err != nil {
+			b.Fatal(err)
+		}
+		cleanup()
 	}
 }
 

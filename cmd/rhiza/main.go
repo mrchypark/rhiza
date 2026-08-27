@@ -34,6 +34,10 @@ func main() {
 	if err != nil || checkpointTailBytes <= 0 || checkpointTailBytes > 2<<30 {
 		log.Fatalf("invalid RHIZA_CHECKPOINT_TAIL_BYTES")
 	}
+	maxWALBytes, err := strconv.ParseInt(getEnvOrDefault("RHIZA_MAX_WAL_BYTES", "0"), 10, 64)
+	if err != nil || maxWALBytes < 0 {
+		log.Fatalf("invalid RHIZA_MAX_WAL_BYTES")
+	}
 	objStoreSyncInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_SYNC_INTERVAL", "1m"))
 	if err != nil || objStoreSyncInterval < 0 {
 		log.Fatalf("invalid RHIZA_OBJSTORE_SYNC_INTERVAL")
@@ -79,6 +83,7 @@ func main() {
 		ObjStoreGCGracePeriod: objStoreGCGracePeriod,
 		CheckpointInterval:    checkpointInterval,
 		CheckpointTailBytes:   checkpointTailBytes,
+		MaxWALBytes:           maxWALBytes,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

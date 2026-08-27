@@ -1,0 +1,82 @@
+[
+  {
+    "config": "review-p1-graph-async-checkpoint-1s",
+    "cpu_measured_nodes": 3,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 12.954751,
+    "memory_current_bytes": 132292608,
+    "memory_peak_sum_bytes": 153346048
+  },
+  {
+    "config": "review-p1-graph-async-healthy",
+    "cpu_measured_nodes": 2,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 19.743464,
+    "memory_current_bytes": 178114560,
+    "memory_peak_sum_bytes": 201207808
+  },
+  {
+    "config": "review-p1-graph-async-one-fault",
+    "cpu_measured_nodes": 2,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 10.944738,
+    "memory_current_bytes": 129101824,
+    "memory_peak_sum_bytes": 154628096
+  },
+  {
+    "config": "review-p1-graph-before-ack-healthy",
+    "cpu_measured_nodes": 3,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 9.849287,
+    "memory_current_bytes": 124805120,
+    "memory_peak_sum_bytes": 147279872
+  },
+  {
+    "config": "review-p1-graph-before-ack-one-fault",
+    "cpu_measured_nodes": 2,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 10.899999,
+    "memory_current_bytes": 123469824,
+    "memory_peak_sum_bytes": 145203200
+  },
+  {
+    "config": "review-p1-sql-async-checkpoint-1s",
+    "cpu_measured_nodes": 3,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 11.397764,
+    "memory_current_bytes": 125452288,
+    "memory_peak_sum_bytes": 147529728
+  },
+  {
+    "config": "review-p1-sql-async-healthy",
+    "cpu_measured_nodes": 3,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 9.342546,
+    "memory_current_bytes": 121155584,
+    "memory_peak_sum_bytes": 144027648
+  },
+  {
+    "config": "review-p1-sql-async-one-fault",
+    "cpu_measured_nodes": 2,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 10.602136,
+    "memory_current_bytes": 131272704,
+    "memory_peak_sum_bytes": 159145984
+  },
+  {
+    "config": "review-p1-sql-before-ack-healthy",
+    "cpu_measured_nodes": 3,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 14.917858,
+    "memory_current_bytes": 128237568,
+    "memory_peak_sum_bytes": 152563712
+  },
+  {
+    "config": "review-p1-sql-before-ack-one-fault",
+    "cpu_measured_nodes": 2,
+    "memory_measured_nodes": 3,
+    "cpu_seconds": 9.832983,
+    "memory_current_bytes": 117649408,
+    "memory_peak_sum_bytes": 141443072
+  }
+]

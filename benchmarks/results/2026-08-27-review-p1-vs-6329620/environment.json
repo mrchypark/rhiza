@@ -1,0 +1,35 @@
+{
+  "measured_at": "2026-08-28T00:32:18+09:00",
+  "baseline_commit": "6329620981129c5749b8d5d4311767309ee46694",
+  "working_tree_diff_sha256": "c74c761dc7b659164d568a063ae2b37470fa6d1f24cb65b9f07afb119e38027d",
+  "host": {
+    "os": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M3"
+  },
+  "go": {
+    "version": "go1.27.0",
+    "experiment": "arenas,greenteagc"
+  },
+  "cluster": {
+    "runtime": "Dory 0.4.5",
+    "kubernetes_client": "v1.36.3",
+    "kubernetes_server": "v1.36.2+k3s1",
+    "peers": 3,
+    "object_store": "MinIO"
+  },
+  "images": {
+    "sql": "rhiza-sql-kv-e2e@sha256:e6ed6c24898bafdb309c40f1934cf6a170dcff3b3303eb2230818ba0acd77214",
+    "graph": "rhiza-graph-kv-e2e@sha256:3754eff2d852997ad3bcbbfa2091b067f505a291a5851af1d2cd71c926a55dcd"
+  },
+  "matrix": {
+    "profiles": 10,
+    "samples": 180,
+    "requests": 126000,
+    "client_errors": 0,
+    "read_requests_per_sample": 1000,
+    "write_requests_per_sample": 100,
+    "concurrency": 16,
+    "repetitions": 3
+  }
+}

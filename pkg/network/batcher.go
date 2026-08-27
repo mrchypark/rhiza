@@ -335,7 +335,7 @@ func (b *mutationBatcher[T]) releaseInflight(size int) {
 func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
 	slot, err := b.propose(ctx, value)
-	if err == nil {
+	if err == nil && b.apply != nil {
 		err = b.apply(ctx, slot)
 	}
 	cancel()

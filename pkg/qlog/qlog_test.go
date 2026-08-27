@@ -2,11 +2,37 @@ package qlog
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestWALCapacityFailsClosedAndScanStreams(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	entry := Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}
+	if err := wal.SetMaxBytes(int64(len(entry.Encode()))); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 2, Type: EntryProposal, Payload: []byte("other")}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("append error=%v, want capacity", err)
+	}
+	var slots []uint64
+	if err := wal.Scan(func(entry Entry) error { slots = append(slots, entry.Slot); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 1 || slots[0] != 1 {
+		t.Fatalf("slots=%v", slots)
+	}
+}
 
 func TestWALCloseReportsSegmentErrors(t *testing.T) {
 	wal, err := Open(t.TempDir())

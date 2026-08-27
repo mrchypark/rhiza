@@ -393,6 +393,39 @@ func newTestCluster(t testing.TB) (map[NodeID]*Core, *clusterTransport) {
 	return transport.cores, transport
 }
 
+func TestAcceptCertifiedValuesAppliesLeaderScheduleBeforeFollowingDecisions(t *testing.T) {
+	cores, _ := newTestCluster(t)
+	source := cores["n2"]
+	for i := range 160 {
+		value := make([]byte, 8)
+		binary.LittleEndian.PutUint64(value, uint64(i))
+		if _, _, err := source.Propose(context.Background(), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	values := make([]DecidedValue, 0, source.Tip())
+	for slot := Slot(1); slot <= source.Tip(); slot++ {
+		value, ok := source.CertifiedValue(slot)
+		if !ok {
+			t.Fatalf("missing source slot %d", slot)
+		}
+		values = append(values, value)
+	}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	target := newCore("n1", source.config, wal, nil)
+	if err := target.AcceptCertifiedValues(values); err != nil {
+		t.Fatal(err)
+	}
+	if target.Tip() != source.Tip() {
+		t.Fatalf("tip=%d want %d", target.Tip(), source.Tip())
+	}
+}
+
 func TestPipelineAllowsLaterSlotToFinishFirst(t *testing.T) {
 	cores, transport := newTestCluster(t)
 	transport.delay[1] = 50 * time.Millisecond

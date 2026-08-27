@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -438,6 +439,148 @@ func TestKVRetryPreservesFirstAdmissionAndRejectsChangedIntent(t *testing.T) {
 	req.Value = []byte("different")
 	if _, err := server.KVPut(context.Background(), req); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("changed request error=%v, want conflict", err)
+	}
+}
+
+func TestCancelledKVRequestStillMaterializes(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	barrier := make(chan struct{})
+	entered := make(chan struct{})
+	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		select {
+		case <-barrier:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := server.KVPut(ctx, KVMutationRequest{RequestID: "cancelled", Key: "key", Value: []byte("value")})
+		result <- err
+	}()
+	<-entered
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller error=%v, want canceled", err)
+	}
+	close(barrier)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		receipt, found, err := material.MutationReceipt(context.Background(), types.MutationKV, "cancelled")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found {
+			if receipt.Status != types.MutationCommitted || !receipt.Applied {
+				t.Fatalf("receipt=%+v", receipt)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelled request was not materialized")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestKVAdmissionBackpressuresBeyondBackgroundLimit(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	release := make(chan struct{})
+	entered := make(chan struct{}, maxInflightBatches)
+	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	errs := make(chan error, maxInflightBatches)
+	for i := range maxInflightBatches {
+		go func(i int) {
+			_, err := server.KVPut(context.Background(), KVMutationRequest{RequestID: fmt.Sprintf("bounded-%d", i), Key: fmt.Sprintf("key-%d", i), Value: []byte("value")})
+			errs <- err
+		}(i)
+	}
+	for range maxInflightBatches {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("background operations did not reach durability barrier")
+		}
+	}
+	overflowCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := server.KVPut(overflowCtx, KVMutationRequest{RequestID: "overflow", Key: "overflow", Value: []byte("value")}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("backpressure error=%v, want deadline exceeded", err)
+	}
+	close(release)
+	for range maxInflightBatches {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestServerCloseCancelsAndWaitsForInflightMutation(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	entered := make(chan struct{})
+	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
+		close(entered)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := server.KVPut(context.Background(), KVMutationRequest{RequestID: "shutdown", Key: "key", Value: []byte("value")})
+		result <- err
+	}()
+	<-entered
+	closed := make(chan struct{})
+	go func() {
+		server.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server close did not wait for and cancel mutation")
+	}
+	if err := <-result; !errors.Is(err, ErrDurabilityUnavailable) {
+		t.Fatalf("mutation error=%v, want durability unavailable", err)
 	}
 }
 

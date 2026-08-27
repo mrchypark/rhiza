@@ -609,6 +609,9 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	} else if found {
 		return nil
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_kv WHERE rowid IN (SELECT rowid FROM _rhiza_kv WHERE expires_at_unix_ms > 0 AND expires_at_unix_ms <= ? LIMIT 256)`, command.ObservedAtUnixMS); err != nil {
+		return fmt.Errorf("prune expired KV entries: %w", err)
+	}
 	receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true}
 	switch command.Operation {
 	case "put":
@@ -911,7 +914,18 @@ func (m *Materializer) QueryResult(ctx context.Context, query string, args []any
 		return types.SQLStatementResult{}, err
 	}
 	defer rows.Close()
-	return collectRows(rows, MaxReturningRows)
+	result, err := collectRows(rows, MaxReturningRows)
+	if err != nil {
+		return types.SQLStatementResult{}, err
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return types.SQLStatementResult{}, err
+	}
+	if len(encoded) > MaxResultBytes {
+		return types.SQLStatementResult{}, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
+	}
+	return result, nil
 }
 
 func (m *Materializer) reader() *sql.DB {
@@ -977,6 +991,19 @@ func (m *Materializer) backupSQLite(ctx context.Context, path string) (uint64, e
 	if err != nil {
 		return 0, err
 	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return 0, err
+	}
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	var value string
+	if err := conn.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key = 'applied_slot'`).Scan(&value); err != nil {
+		return 0, err
+	}
+	index, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, err
+	}
 	destination := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
 	err = conn.Raw(func(driverConn any) error {
 		raw, ok := driverConn.(sqlite3driver.Conn)
@@ -985,22 +1012,10 @@ func (m *Materializer) backupSQLite(ctx context.Context, path string) (uint64, e
 		}
 		return raw.Raw().Backup("main", destination)
 	})
-	if closeErr := conn.Close(); err == nil {
-		err = closeErr
-	}
 	if err != nil {
 		return 0, err
 	}
-	backup, err := openSQLite(destination+"?mode=ro", false)
-	if err != nil {
-		return 0, err
-	}
-	defer backup.Close()
-	var value string
-	if err := backup.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key = 'applied_slot'`).Scan(&value); err != nil {
-		return 0, err
-	}
-	return strconv.ParseUint(value, 10, 64)
+	return index, nil
 }
 
 // CheckpointFilesAt captures fixed-role database files without packaging them.
@@ -1034,19 +1049,17 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	}
 	graphPath := graph.Name()
 	paths = append(paths, graphPath)
-	m.mu.Lock()
-	if m.graphTip() != m.tip {
-		m.mu.Unlock()
-		_ = graph.Close()
-		cleanup()
-		return nil, 0, nil, fmt.Errorf("cannot checkpoint mismatched materializers: SQLite=%d GoraphDB=%d", m.tip, m.graphTip())
-	}
-	snapshot, err := m.beginGraphFileSnapshot()
+	index, err := m.backupSQLite(ctx, sqlitePath)
+	var snapshot *graphFileSnapshot
 	if err == nil {
-		_, err = m.db.ExecContext(ctx, "VACUUM INTO ?", sqlitePath)
+		m.mu.Lock()
+		if m.tip == index && m.graphTip() == index {
+			snapshot, err = m.beginGraphFileSnapshot()
+		} else {
+			err = fmt.Errorf("checkpoint state advanced during SQLite backup")
+		}
+		m.mu.Unlock()
 	}
-	index := m.tip
-	m.mu.Unlock()
 	if err == nil {
 		_, err = snapshot.WriteTo(ctx, graph)
 	}

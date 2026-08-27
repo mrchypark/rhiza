@@ -20,5 +20,11 @@ group_by(.config, .workload)
     bytes_uploaded: (map(.object_delta.bytes_uploaded) | median),
     bytes_downloaded: (map(.object_delta.bytes_downloaded) | median),
     s3_http_requests: (map(.object_delta.s3_http_requests) | median),
-    s3_http_failures: (map(.object_delta.s3_http_failures) | add)
+    s3_http_failures: (map(.object_delta.s3_http_failures) | add),
+    condition_conflicts: (map(.object_delta.condition_conflicts // 0) | add),
+    dedup_hits: (map(.object_delta.dedup_hits // 0) | add),
+    sdk_retries: (map(.object_delta.sdk_retries // 0) | add),
+    transport_failures: (map(.object_delta.transport_failures // 0) | add),
+    http_4xx_unexpected: (map(.object_delta.http_4xx_unexpected // 0) | add),
+    http_5xx: (map(.object_delta.http_5xx // 0) | add)
   })

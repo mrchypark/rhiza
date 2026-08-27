@@ -70,6 +70,13 @@ type Server struct {
 	routeGen     uint64
 	proposeMu    sync.Mutex
 	inflight     map[[32]byte]*proposalCall
+	proposalCtx  context.Context
+	proposalStop context.CancelFunc
+	proposalWG   sync.WaitGroup
+	closeOnce    sync.Once
+	closing      bool
+	operationCap chan struct{}
+	operationB   int
 	objectStats  func() (map[string]uint64, bool)
 	syncLimit    chan struct{}
 }
@@ -82,32 +89,30 @@ type proposalCall struct {
 
 // NewServer creates a new HTTP server.
 func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, members []quepaxa.Member, hedgeDelay time.Duration, ready ...func() bool) *Server {
+	proposalCtx, proposalStop := context.WithCancel(context.Background())
 	s := &Server{
-		core:       core,
-		material:   material,
-		cluster:    cluster,
-		mux:        http.NewServeMux(),
-		ready:      func() bool { return true },
-		writable:   writable,
-		transport:  transport,
-		members:    append([]quepaxa.Member(nil), members...),
-		hedgeDelay: hedgeDelay,
-		inflight:   make(map[[32]byte]*proposalCall),
-		syncLimit:  make(chan struct{}, 2),
+		core:         core,
+		material:     material,
+		cluster:      cluster,
+		mux:          http.NewServeMux(),
+		ready:        func() bool { return true },
+		writable:     writable,
+		transport:    transport,
+		members:      append([]quepaxa.Member(nil), members...),
+		hedgeDelay:   hedgeDelay,
+		inflight:     make(map[[32]byte]*proposalCall),
+		proposalCtx:  proposalCtx,
+		proposalStop: proposalStop,
+		operationCap: make(chan struct{}, maxInflightBatches),
+		syncLimit:    make(chan struct{}, 2),
 	}
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
-	apply := func(ctx context.Context, slot quepaxa.Slot) error {
-		if err := s.applyDecisions(ctx, slot); err != nil {
-			return err
-		}
-		return s.waitDurable(ctx, slot)
-	}
 	if materializer.GraphEnabled() {
-		s.graphBatcher = newGraphBatcher(s.proposeHedged, apply)
+		s.graphBatcher = newGraphBatcher(s.proposeHedged, nil)
 	} else {
-		s.sqlBatcher = newSQLBatcher(s.proposeHedged, apply)
+		s.sqlBatcher = newSQLBatcher(s.proposeHedged, nil)
 	}
 	s.routes()
 	return s
@@ -115,12 +120,19 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 
 // Close stops background request batching.
 func (s *Server) Close() {
-	if s.sqlBatcher != nil {
-		s.sqlBatcher.Close()
-	}
-	if s.graphBatcher != nil {
-		s.graphBatcher.Close()
-	}
+	s.closeOnce.Do(func() {
+		s.proposeMu.Lock()
+		s.closing = true
+		s.proposalStop()
+		s.proposeMu.Unlock()
+		if s.sqlBatcher != nil {
+			s.sqlBatcher.Close()
+		}
+		if s.graphBatcher != nil {
+			s.graphBatcher.Close()
+		}
+		s.proposalWG.Wait()
+	})
 }
 
 // SetDurabilityBarrier installs the mutation ACK barrier before the server is exposed.
@@ -191,30 +203,77 @@ type DecisionsResponse struct {
 
 func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	hash := sha256.Sum256(value)
-	s.proposeMu.Lock()
-	call := s.inflight[hash]
-	if call == nil {
+	for {
+		s.proposeMu.Lock()
+		if s.closing {
+			s.proposeMu.Unlock()
+			return 0, ErrNotReady
+		}
+		call := s.inflight[hash]
+		s.proposeMu.Unlock()
+		if call != nil {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-call.done:
+				return call.slot, call.err
+			}
+		}
+		select {
+		case s.operationCap <- struct{}{}:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-s.proposalCtx.Done():
+			return 0, ErrNotReady
+		}
+		s.proposeMu.Lock()
+		if s.closing {
+			<-s.operationCap
+			s.proposeMu.Unlock()
+			return 0, ErrNotReady
+		}
+		if s.inflight[hash] != nil {
+			<-s.operationCap
+			s.proposeMu.Unlock()
+			continue
+		}
+		if len(value) > maxInflightEncodedByte-s.operationB {
+			<-s.operationCap
+			s.proposeMu.Unlock()
+			return 0, ErrOverloaded
+		}
 		call = &proposalCall{done: make(chan struct{})}
 		s.inflight[hash] = call
+		s.operationB += len(value)
+		s.proposalWG.Add(1)
 		go s.runProposal(hash, call, bytes.Clone(value))
-	}
-	s.proposeMu.Unlock()
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case <-call.done:
-		return call.slot, call.err
+		s.proposeMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-call.done:
+			return call.slot, call.err
+		}
 	}
 }
 
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer s.proposalWG.Done()
+	ctx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
 	call.slot, call.err = s.proposeHedgedOnce(ctx, value)
+	if call.err == nil {
+		call.err = s.applyDecisions(ctx, call.slot)
+	}
+	if call.err == nil {
+		call.err = s.waitDurable(ctx, call.slot)
+	}
 	cancel()
 	s.proposeMu.Lock()
 	if s.inflight[hash] == call {
 		delete(s.inflight, hash)
 	}
+	s.operationB -= len(value)
+	<-s.operationCap
 	close(call.done)
 	s.proposeMu.Unlock()
 }
@@ -763,12 +822,6 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		return KVMutationResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	slot, err := s.proposeHedged(ctx, value)
-	if err == nil {
-		err = s.applyDecisions(ctx, slot)
-	}
-	if err == nil {
-		err = s.waitDurable(ctx, slot)
-	}
 	if err != nil {
 		return KVMutationResponse{}, commitUnknown(slot, req.RequestID, err)
 	}
@@ -854,12 +907,6 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 		return types.MutationReceipt{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
 	slot, err := s.proposeHedged(ctx, value)
-	if err == nil {
-		err = s.applyDecisions(ctx, slot)
-	}
-	if err == nil {
-		err = s.waitDurable(ctx, slot)
-	}
 	if err == nil {
 		if matches, matchErr := s.material.NotifyRequestMatches(ctx, req); matchErr != nil {
 			err = matchErr

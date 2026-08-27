@@ -1,0 +1,42 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M3
+BenchmarkCoreProposeThreePeers-8      	      55	  24568252 ns/op	   65277 B/op	     382 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      50	  25074118 ns/op	   64419 B/op	     374 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      54	  24386485 ns/op	   65424 B/op	     380 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      50	  23847758 ns/op	   65132 B/op	     378 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      50	  24903148 ns/op	   64681 B/op	     377 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      60	  20742315 ns/op	   49212 B/op	     290 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      66	  19602324 ns/op	   48663 B/op	     289 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      62	  20901111 ns/op	   49773 B/op	     292 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      70	  21323384 ns/op	   48315 B/op	     285 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      63	  21715685 ns/op	   49336 B/op	     292 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  839953	      1774 ns/op	     403 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  865980	      1664 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  971308	      1706 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  790891	      1654 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  761042	      1547 ns/op	     400 B/op	       6 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  927129	      1644 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  835683	      1792 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  770294	      1443 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  809847	      1738 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  926065	      1496 ns/op	     416 B/op	       7 allocs/op
+BenchmarkCoreLocalReadIndex-8         	53493716	        32.12 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	57570294	        18.71 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	74530494	        16.09 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	64364588	        16.94 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	67826146	        16.49 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	42.109s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkCheckpointFilesAt-8   	    1570	    747969 ns/op	    9377 B/op	     120 allocs/op
+BenchmarkCheckpointFilesAt-8   	    1621	    823832 ns/op	    9329 B/op	     120 allocs/op
+BenchmarkCheckpointFilesAt-8   	    1431	    782582 ns/op	    9373 B/op	     120 allocs/op
+BenchmarkCheckpointFilesAt-8   	    1623	    779500 ns/op	    9329 B/op	     120 allocs/op
+BenchmarkCheckpointFilesAt-8   	    1560	    736792 ns/op	    9373 B/op	     120 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	7.188s

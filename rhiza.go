@@ -66,6 +66,7 @@ type Config struct {
 	ObjStoreGCGracePeriod time.Duration
 	CheckpointInterval    time.Duration
 	CheckpointTailBytes   int64
+	MaxWALBytes           int64
 	HedgeDelay            time.Duration
 }
 
@@ -124,7 +125,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, HedgeDelay: config.HedgeDelay,
+		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes, HedgeDelay: config.HedgeDelay,
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {

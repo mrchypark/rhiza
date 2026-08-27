@@ -2,6 +2,8 @@ package checkpoint
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -24,6 +26,7 @@ type AutoCheckpointer struct {
 	publish    func(context.Context, *Checkpoint) error
 	tailBytes  func() int64
 	tailBudget int64
+	candidate  *Checkpoint
 }
 
 func (a *AutoCheckpointer) ConfigureTail(bytes func() int64, budget int64) {
@@ -137,8 +140,29 @@ func (a *AutoCheckpointer) CheckpointOnShutdown(ctx context.Context, tip uint64)
 }
 
 func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
-	if latest := a.manager.Latest(); latest != nil && latest.Index >= a.material.Tip() {
+	tip := a.material.Tip()
+	if latest := a.manager.Latest(); latest != nil && latest.Index >= tip {
 		return latest.Index, nil
+	}
+	if a.candidate != nil {
+		if a.publish == nil {
+			return 0, fmt.Errorf("checkpoint certification callback is required")
+		}
+		if err := a.publish(ctx, a.candidate); err != nil {
+			if errors.Is(err, ErrStaleCheckpoint) {
+				a.candidate = nil
+				if latest := a.manager.Latest(); latest != nil {
+					return latest.Index, nil
+				}
+			}
+			return 0, err
+		}
+		if latest := a.manager.Latest(); latest == nil || latest.Index < a.candidate.Index || latest.RootHash != a.candidate.RootHash {
+			return 0, fmt.Errorf("checkpoint candidate was not promoted after certification")
+		}
+		index := a.candidate.Index
+		a.candidate = nil
+		return index, nil
 	}
 	files, appliedTip, cleanup, err := a.material.CheckpointFilesAt(ctx)
 	if err != nil {
@@ -151,10 +175,11 @@ func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
 	}
 	log.Printf("creating streaming checkpoint at slot %d", appliedTip)
 	root, err := a.manager.CreateFiles(ctx, sources, appliedTip)
-	if err == nil && a.publish != nil {
-		err = a.publish(ctx, root)
+	if err != nil {
+		return appliedTip, err
 	}
-	return appliedTip, err
+	a.candidate = root
+	return a.create(ctx)
 }
 
 // NewManagerFromEnv creates a checkpoint manager from environment.

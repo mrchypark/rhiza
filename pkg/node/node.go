@@ -97,6 +97,12 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck && !objectStoreConfigured {
 		return fmt.Errorf("before-ack durability requires object storage")
 	}
+	if len(n.config.Members) > 1 && !objectStoreConfigured {
+		return fmt.Errorf("multi-node clusters require shared object storage")
+	}
+	if n.config.MaxWALBytes < 0 {
+		return fmt.Errorf("max WAL bytes must not be negative")
+	}
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")
 	}
@@ -120,6 +126,15 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("open WAL: %w", err)
 	}
 	n.wal = wal
+	maxWALBytes := n.config.MaxWALBytes
+	if maxWALBytes == 0 && !objectStoreConfigured {
+		maxWALBytes = 4 << 30
+	}
+	if maxWALBytes > 0 {
+		if err := wal.SetMaxBytes(maxWALBytes); err != nil {
+			return err
+		}
+	}
 	if objectStoreConfigured {
 		provider := objectstore.Provider(n.config.ObjStoreProvider)
 		if provider == "" {
@@ -229,7 +244,10 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			"uploads": stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
 			"deletes": stats.Deletes, "failures": stats.Failures, "bytes_uploaded": stats.BytesUploaded,
 			"bytes_downloaded": stats.BytesDownloaded, "s3_http_requests": stats.S3HTTPRequests,
-			"s3_http_failures": stats.S3HTTPFailures,
+			"s3_http_failures":    stats.S3HTTPFailures,
+			"condition_conflicts": stats.ConditionConflicts, "dedup_hits": stats.DedupHits,
+			"sdk_retries": stats.SDKRetries, "transport_failures": stats.TransportFailures,
+			"http_4xx_unexpected": stats.Unexpected4xx, "http_5xx": stats.HTTP5xx,
 		}, ok
 	})
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
@@ -252,13 +270,20 @@ func (n *Node) Open(ctx context.Context) (err error) {
 
 	var certifiedCheckpoint *checkpoint.Checkpoint
 	if n.checkpoints != nil {
-		if seal, ok := core.LatestCheckpointSeal(); ok {
+		seal, sealed := core.LatestCheckpointSeal()
+		if current := n.checkpoints.Latest(); current != nil && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
+			return fmt.Errorf("checkpoint CURRENT is not backed by the certified seal; start with fresh object storage")
+		}
+		if sealed {
 			certifiedCheckpoint, err = n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
 			if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
 				if err == nil {
 					err = fmt.Errorf("certified checkpoint state hash mismatch")
 				}
 				return err
+			}
+			if err := n.checkpoints.PromoteCertifiedCurrent(ctx, certifiedCheckpoint); err != nil {
+				return fmt.Errorf("promote certified checkpoint: %w", err)
 			}
 		}
 	}
@@ -366,8 +391,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		n.checkpointer.ConfigureTail(n.wal.Bytes, tailBytes)
 		n.checkpointer.ConfigurePublication(
 			func() bool {
-				order := core.ProposerOrder()
-				if len(order) == 0 || order[0] != core.NodeID() {
+				if len(n.config.Members) != 0 && n.config.Members[0].ID != n.config.NodeID {
 					return false
 				}
 				seal, ok := core.LatestCheckpointSeal()
@@ -401,6 +425,9 @@ func (n *Node) Open(ctx context.Context) (err error) {
 					return err
 				}
 				if err := n.replayLocalDecisions(ctx); err != nil {
+					return err
+				}
+				if err := n.checkpoints.PromoteCertifiedCurrent(ctx, root); err != nil {
 					return err
 				}
 				return n.compactCertifiedCheckpoint(ctx)
@@ -644,7 +671,9 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 			err      error
 		}
 		results := make(chan result, len(cluster.Members)-1)
-		roundCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		// Initial QUIC connection establishment can exceed the steady-state RPC
+		// budget after all peers restart and DNS endpoints are republished.
+		roundCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		pending := 0
 		for _, member := range cluster.Members {
 			if member.ID == n.config.NodeID {

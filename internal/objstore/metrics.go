@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 
 	thanosobjstore "github.com/thanos-io/objstore"
@@ -12,16 +13,22 @@ import (
 // Stats exposes object-store operations at both the logical bucket boundary
 // and the billable S3 HTTP boundary.
 type Stats struct {
-	Uploads         uint64 `json:"uploads"`
-	Gets            uint64 `json:"gets"`
-	Lists           uint64 `json:"lists"`
-	Heads           uint64 `json:"heads"`
-	Deletes         uint64 `json:"deletes"`
-	Failures        uint64 `json:"failures"`
-	BytesUploaded   uint64 `json:"bytes_uploaded"`
-	BytesDownloaded uint64 `json:"bytes_downloaded"`
-	S3HTTPRequests  uint64 `json:"s3_http_requests"`
-	S3HTTPFailures  uint64 `json:"s3_http_failures"`
+	Uploads            uint64 `json:"uploads"`
+	Gets               uint64 `json:"gets"`
+	Lists              uint64 `json:"lists"`
+	Heads              uint64 `json:"heads"`
+	Deletes            uint64 `json:"deletes"`
+	Failures           uint64 `json:"failures"`
+	BytesUploaded      uint64 `json:"bytes_uploaded"`
+	BytesDownloaded    uint64 `json:"bytes_downloaded"`
+	S3HTTPRequests     uint64 `json:"s3_http_requests"`
+	S3HTTPFailures     uint64 `json:"s3_http_failures"`
+	ConditionConflicts uint64 `json:"condition_conflicts"`
+	DedupHits          uint64 `json:"dedup_hits"`
+	SDKRetries         uint64 `json:"sdk_retries"`
+	TransportFailures  uint64 `json:"transport_failures"`
+	Unexpected4xx      uint64 `json:"http_4xx_unexpected"`
+	HTTP5xx            uint64 `json:"http_5xx"`
 }
 
 type bucketMetrics struct {
@@ -29,6 +36,9 @@ type bucketMetrics struct {
 	failures                             atomic.Uint64
 	bytesUploaded, bytesDownloaded       atomic.Uint64
 	httpRequests, httpFailures           atomic.Uint64
+	conditionConflicts, dedupHits        atomic.Uint64
+	sdkRetries, transportFailures        atomic.Uint64
+	unexpected4xx, http5xx               atomic.Uint64
 }
 
 type MeteredBucket struct {
@@ -46,6 +56,9 @@ func (b *MeteredBucket) Stats() Stats {
 		Heads: b.metrics.heads.Load(), Deletes: b.metrics.deletes.Load(), Failures: b.metrics.failures.Load(),
 		BytesUploaded: b.metrics.bytesUploaded.Load(), BytesDownloaded: b.metrics.bytesDownloaded.Load(),
 		S3HTTPRequests: b.metrics.httpRequests.Load(), S3HTTPFailures: b.metrics.httpFailures.Load(),
+		ConditionConflicts: b.metrics.conditionConflicts.Load(), DedupHits: b.metrics.dedupHits.Load(),
+		SDKRetries: b.metrics.sdkRetries.Load(), TransportFailures: b.metrics.transportFailures.Load(),
+		Unexpected4xx: b.metrics.unexpected4xx.Load(), HTTP5xx: b.metrics.http5xx.Load(),
 	}
 }
 
@@ -53,6 +66,13 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 	b.metrics.uploads.Add(1)
 	counted := &countingReader{reader: reader, count: &b.metrics.bytesUploaded}
 	err := b.Bucket.Upload(ctx, name, counted, opts...)
+	if err != nil && b.Bucket.IsConditionNotMetErr(err) {
+		if strings.Contains(name, "/blocks/") || strings.Contains(name, "/extents/") || strings.Contains(name, "/roots/") {
+			b.metrics.dedupHits.Add(1)
+		} else {
+			b.metrics.conditionConflicts.Add(1)
+		}
+	}
 	b.record(err)
 	return err
 }
@@ -121,8 +141,23 @@ func (b *MeteredBucket) record(err error) {
 func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 	return roundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		m.httpRequests.Add(1)
+		if value := request.Header.Get("amz-sdk-request"); strings.Contains(value, "attempt=") && !strings.Contains(value, "attempt=1") {
+			m.sdkRetries.Add(1)
+		}
 		response, err := next.RoundTrip(request)
-		if err != nil || response.StatusCode >= http.StatusBadRequest {
+		if err != nil {
+			m.transportFailures.Add(1)
+			m.httpFailures.Add(1)
+			return response, err
+		}
+		switch {
+		case response.StatusCode == http.StatusConflict || response.StatusCode == http.StatusPreconditionFailed:
+			m.httpFailures.Add(1)
+		case response.StatusCode >= 400 && response.StatusCode < 500:
+			m.unexpected4xx.Add(1)
+			m.httpFailures.Add(1)
+		case response.StatusCode >= 500:
+			m.http5xx.Add(1)
 			m.httpFailures.Add(1)
 		}
 		return response, err
@@ -145,7 +180,14 @@ func (r *countingReader) Read(buffer []byte) (int, error) {
 }
 
 func (r *countingReader) ObjectSize() (int64, error) {
-	return thanosobjstore.TryToGetSize(r.reader)
+	size, err := thanosobjstore.TryToGetSize(r.reader)
+	if err == nil {
+		return size, nil
+	}
+	if reader, ok := r.reader.(interface{ Size() int64 }); ok {
+		return reader.Size(), nil
+	}
+	return 0, err
 }
 
 type countingReadCloser struct {

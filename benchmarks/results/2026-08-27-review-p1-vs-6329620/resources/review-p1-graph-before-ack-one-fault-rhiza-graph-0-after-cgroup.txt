@@ -1,0 +1,11 @@
+usage_usec 2699208
+user_usec 1139713
+system_usec 1559494
+nice_usec 0
+nr_periods 228
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+39124992
+45711360

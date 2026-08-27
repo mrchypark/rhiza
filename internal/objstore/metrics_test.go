@@ -43,9 +43,10 @@ func TestMeteredBucketCountsBytesAndHTTPAttempts(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: http.NoBody}, nil
 	}))
 	request, _ := http.NewRequest(http.MethodGet, "http://s3.test/x", nil)
+	request.Header.Set("amz-sdk-request", "attempt=2; max=3")
 	_, _ = transport.RoundTrip(request)
 	stats := bucket.Stats()
-	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 {
+	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 || stats.SDKRetries != 1 || stats.HTTP5xx != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
@@ -58,5 +59,12 @@ func TestMeteredBucketPreservesUploadSize(t *testing.T) {
 	}
 	if underlying.size != 3 {
 		t.Fatalf("upload size = %d, want 3", underlying.size)
+	}
+	section := io.NewSectionReader(bytes.NewReader(make([]byte, 32)), 8, 16)
+	if err := bucket.Upload(context.Background(), "section", section); err != nil {
+		t.Fatal(err)
+	}
+	if underlying.size != 16 {
+		t.Fatalf("section upload size = %d, want 16", underlying.size)
 	}
 }

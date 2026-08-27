@@ -65,18 +65,26 @@ fi
 resource_snapshot() {
 	local suffix="$1"
 	dory k8s top pods -n "$namespace" >"$output_dir/resources/$label-$suffix-top.txt" 2>&1 || true
-	dory k8s exec -n "$namespace" "$pod" -- sh -c \
-		'cat /sys/fs/cgroup/cpu.stat; cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.peak' \
-		>"$output_dir/resources/$label-$suffix-cgroup.txt"
+	for resource_pod in "${pods[@]}"; do
+		dory k8s exec -n "$namespace" "$resource_pod" -- sh -c \
+			'cat /sys/fs/cgroup/cpu.stat; cat /sys/fs/cgroup/memory.current; cat /sys/fs/cgroup/memory.peak' \
+			>"$output_dir/resources/$label-$resource_pod-$suffix-cgroup.txt" 2>/dev/null || true
+	done
+}
+
+object_snapshot() {
+	for metrics_pod in "${pods[@]}"; do
+		dory k8s exec -n "$namespace" "$metrics_pod" -- wget -qO- http://127.0.0.1:8080/metrics/object-store 2>/dev/null || true
+	done | jq -s 'reduce .[] as $stats ({}; reduce ($stats | to_entries[]) as $entry (.; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
 }
 
 capture() {
 	local workload="$1" endpoint_path="$2" body="$3" count="$4" concurrency="$5"
 	local before after measured
-	before="$(curl -fsS "http://127.0.0.1:$port/metrics/object-store")"
+	before="$(object_snapshot)"
 	measured="$(/tmp/rhiza-bench-client -url "http://127.0.0.1:$port" -path "$endpoint_path" \
 		-body "$body" -n "$count" -c "$concurrency")"
-	after="$(curl -fsS "http://127.0.0.1:$port/metrics/object-store")"
+	after="$(object_snapshot)"
 	jq -nc --arg config "$label" --arg workload "$workload" \
 		--argjson result "$measured" --argjson before "$before" --argjson after "$after" \
 		'{config:$config,workload:$workload,result:$result,object_delta:($after|with_entries(.value -= $before[.key]))}' \

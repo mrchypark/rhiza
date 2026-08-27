@@ -63,9 +63,17 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	if err := reader.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
+	for _, extent := range reader.extents {
+		if extent.Decisions != nil {
+			t.Fatal("archive load retained decision payloads")
+		}
+	}
 	values, tip, err := reader.DecisionsFrom(1, int(core.Tip()))
 	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()) {
 		t.Fatalf("archive tip=%d values=%d err=%v", tip, len(values), err)
+	}
+	if len(reader.cache) > maxCachedExtents {
+		t.Fatalf("archive cache=%d, limit=%d", len(reader.cache), maxCachedExtents)
 	}
 }
 

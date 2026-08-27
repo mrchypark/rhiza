@@ -22,6 +22,7 @@ const (
 	archiveGroupDelay  = 2 * time.Millisecond
 	archiveSyncTimeout = 5 * time.Minute
 	maxPublishRetries  = 8
+	maxCachedExtents   = 2
 )
 
 type Extent struct {
@@ -62,6 +63,8 @@ type Manager struct {
 	configID uint
 	mu       sync.Mutex
 	extents  []Extent
+	cache    map[[32]byte]Extent
+	cacheLRU [][32]byte
 	head     archiveHead
 	tip      quepaxa.Slot
 	headCAS  *objstore.ObjectVersion
@@ -72,7 +75,7 @@ type Manager struct {
 
 func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
 	options := bucket.SupportedObjectUploadOptions()
-	return &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists)}
+	return &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists), cache: make(map[[32]byte]Extent)}
 }
 
 func (m *Manager) Load(ctx context.Context) error {
@@ -131,12 +134,17 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 		if extent.End != end {
 			return fmt.Errorf("invalid shared archive block chain")
 		}
-		extents = append(extents, extent)
+		ref := extent
+		ref.Decisions = nil
+		extents = append(extents, ref)
 		hash, end = extent.PreviousHash, extent.Start-1
 	}
 	slices.Reverse(extents)
 	if len(extents) != 0 && extents[0].Start <= head.Base {
-		extent := extents[0]
+		extent, err := m.readExtent(ctx, extents[0].hash)
+		if err != nil {
+			return err
+		}
 		offset := int(head.Base - extent.Start + 1)
 		extent.Decisions = append([]quepaxa.DecidedValue(nil), extent.Decisions[offset:]...)
 		extent.Start = head.Base + 1
@@ -144,14 +152,16 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 		if err := m.validateExtent(extent); err != nil {
 			return fmt.Errorf("invalid shared archive checkpoint boundary: %w", err)
 		}
-		extents[0] = extent
+		extents[0].Start = extent.Start
+		extents[0].StartPrefix = extent.StartPrefix
 	}
 	next, prefix := head.Base+1, head.BasePrefix
-	for _, extent := range extents {
+	for i, extent := range extents {
 		if extent.Start != next || extent.StartPrefix != prefix {
 			return fmt.Errorf("invalid shared archive block chain")
 		}
 		next, prefix = extent.End+1, extent.EndPrefix
+		extents[i].Decisions = nil
 	}
 	if next-1 != head.Tip {
 		return fmt.Errorf("shared archive head tip mismatch")
@@ -193,8 +203,6 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 				continue
 			}
 			if extent.Start <= through {
-				offset := int(through - extent.Start + 1)
-				extent.Decisions = append([]quepaxa.DecidedValue(nil), extent.Decisions[offset:]...)
 				extent.Start = through + 1
 				extent.StartPrefix = prefix
 			}
@@ -338,7 +346,11 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 			}
 		}
 		if err := m.publishHeadLocked(ctx, head); err == nil {
-			m.extents = append(m.extents, added...)
+			for _, extent := range added {
+				m.rememberExtentLocked(extent)
+				extent.Decisions = nil
+				m.extents = append(m.extents, extent)
+			}
 			m.head, m.tip = head, head.Tip
 			if m.cas {
 				return m.refreshPublishedHead(ctx, head)
@@ -455,9 +467,15 @@ func (m *Manager) DecisionsFrom(from quepaxa.Slot, limit int) ([]quepaxa.Decided
 		limit = 256
 	}
 	values := make([]quepaxa.DecidedValue, 0, limit)
-	for _, extent := range m.extents {
-		if extent.End < from {
+	ctx, cancel := context.WithTimeout(context.Background(), archiveSyncTimeout)
+	defer cancel()
+	for i, ref := range m.extents {
+		if ref.End < from {
 			continue
+		}
+		extent, err := m.extentAtLocked(ctx, i)
+		if err != nil {
+			return nil, m.tip, err
 		}
 		for _, decision := range extent.Decisions {
 			if decision.Slot < from {
@@ -492,7 +510,12 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 		m.mu.Unlock()
 		return err
 	}
-	if compacted := m.compactExtents(); len(compacted) < len(m.extents) {
+	compacted, err := m.compactExtents(ctx)
+	if err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	if len(compacted) < len(m.extents) {
 		head := m.head
 		previous := [32]byte{}
 		for i := range compacted {
@@ -520,7 +543,12 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 			m.mu.Unlock()
 			return err
 		}
-		m.extents, m.head = compacted, head
+		m.extents, m.head = nil, head
+		for _, extent := range compacted {
+			m.rememberExtentLocked(extent)
+			extent.Decisions = nil
+			m.extents = append(m.extents, extent)
+		}
 		if m.cas {
 			if err := m.refreshPublishedHead(ctx, head); err != nil {
 				m.mu.Unlock()
@@ -557,9 +585,9 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 	return nil
 }
 
-func (m *Manager) compactExtents() []Extent {
+func (m *Manager) compactExtents(ctx context.Context) ([]Extent, error) {
 	if len(m.extents) < 2 {
-		return m.extents
+		return m.extents, nil
 	}
 	result := make([]Extent, 0, len(m.extents))
 	var current Extent
@@ -570,11 +598,15 @@ func (m *Manager) compactExtents() []Extent {
 			result = append(result, current)
 		}
 	}
-	for _, extent := range m.extents {
+	for i := range m.extents {
+		extent, err := m.extentAtLocked(ctx, i)
+		if err != nil {
+			return nil, err
+		}
 		for _, decision := range extent.Decisions {
 			encoded, err := json.Marshal(decision)
 			if err != nil {
-				return m.extents
+				return nil, err
 			}
 			candidate := current
 			if len(candidate.Decisions) == 0 {
@@ -584,7 +616,7 @@ func (m *Manager) compactExtents() []Extent {
 			candidate.EndPrefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
 			nextSize, err := extentEncodedSize(candidate, encodedDecisions+len(encoded), len(current.Decisions)+1)
 			if err != nil {
-				return m.extents
+				return nil, err
 			}
 			if len(current.Decisions) == maxExtentItems || len(current.Decisions) != 0 && nextSize > maxExtentSize {
 				flush()
@@ -601,7 +633,40 @@ func (m *Manager) compactExtents() []Extent {
 		}
 	}
 	flush()
-	return result
+	return result, nil
+}
+
+func (m *Manager) extentAtLocked(ctx context.Context, index int) (Extent, error) {
+	ref := m.extents[index]
+	if extent, ok := m.cache[ref.hash]; ok {
+		m.touchExtentLocked(ref.hash)
+		return extent, nil
+	}
+	extent, err := m.readExtent(ctx, ref.hash)
+	if err != nil {
+		return Extent{}, err
+	}
+	m.rememberExtentLocked(extent)
+	return extent, nil
+}
+
+func (m *Manager) rememberExtentLocked(extent Extent) {
+	if _, ok := m.cache[extent.hash]; !ok && len(m.cacheLRU) == maxCachedExtents {
+		delete(m.cache, m.cacheLRU[0])
+		m.cacheLRU = m.cacheLRU[1:]
+	}
+	m.cache[extent.hash] = extent
+	m.touchExtentLocked(extent.hash)
+}
+
+func (m *Manager) touchExtentLocked(hash [32]byte) {
+	for i, existing := range m.cacheLRU {
+		if existing == hash {
+			m.cacheLRU = append(m.cacheLRU[:i], m.cacheLRU[i+1:]...)
+			break
+		}
+	}
+	m.cacheLRU = append(m.cacheLRU, hash)
 }
 
 func (m *Manager) readExtent(ctx context.Context, expected [32]byte) (Extent, error) {

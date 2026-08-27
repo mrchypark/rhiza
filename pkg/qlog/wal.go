@@ -28,20 +28,40 @@ type WAL struct {
 	current  *Segment
 	mu       sync.RWMutex
 	maxSize  int64
+	maxBytes int64
 	dirty    bool
 }
+
+var ErrCapacity = errors.New("WAL capacity reached")
 
 // Bytes returns the current on-disk segment bytes.
 func (w *WAL) Bytes() int64 {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
+	return w.bytesLocked()
+}
+
+func (w *WAL) bytesLocked() int64 {
 	var total int64
 	for _, segment := range w.segments {
-		segment.mu.Lock()
 		total += segment.offset
-		segment.mu.Unlock()
 	}
 	return total
+}
+
+// SetMaxBytes rejects future appends before the WAL exceeds max. Existing
+// data above the configured ceiling fails startup instead of filling disk.
+func (w *WAL) SetMaxBytes(max int64) error {
+	if max <= 0 {
+		return fmt.Errorf("WAL capacity must be positive")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if used := w.bytesLocked(); used > max {
+		return fmt.Errorf("%w: used=%d max=%d", ErrCapacity, used, max)
+	}
+	w.maxBytes = max
+	return nil
 }
 
 const defaultMaxSize = 64 * 1024 * 1024 // 64MB per segment
@@ -168,6 +188,9 @@ func (w *WAL) Append(entry Entry) error {
 	defer w.mu.Unlock()
 
 	data := entry.Encode()
+	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
+		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), len(data), w.maxBytes)
+	}
 
 	// Roll over if needed
 	if w.current != nil && w.current.offset+int64(len(data)) > w.maxSize {
@@ -218,20 +241,31 @@ func (w *WAL) Sync() error {
 
 // Read reads all entries from all segments.
 func (w *WAL) Read() ([]Entry, error) {
+	var entries []Entry
+	err := w.Scan(func(entry Entry) error {
+		entries = append(entries, entry)
+		return nil
+	})
+	return entries, err
+}
+
+// Scan streams validated entries in segment order without retaining the WAL
+// tail in a second aggregate slice.
+func (w *WAL) Scan(visit func(Entry) error) error {
+	if visit == nil {
+		return fmt.Errorf("WAL scan callback is required")
+	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	segments := make([]*Segment, len(w.segments))
-	copy(segments, w.segments)
-
-	var entries []Entry
-	for _, seg := range segments {
-		segEntries, err := seg.readAll()
+	for _, seg := range w.segments {
+		seg.mu.Lock()
+		err := seg.scanEntries(false, visit)
+		seg.mu.Unlock()
 		if err != nil {
-			return nil, err
+			return err
 		}
-		entries = append(entries, segEntries...)
 	}
-	return entries, nil
+	return nil
 }
 
 // readAll reads all entries from a segment.
@@ -244,13 +278,21 @@ func (s *Segment) readAll() ([]Entry, error) {
 // scan validates every entry. Only the active segment may repair a torn final
 // write; immutable older segments fail closed on any truncation or corruption.
 func (s *Segment) scan(repairTail bool) ([]Entry, error) {
+	var entries []Entry
+	err := s.scanEntries(repairTail, func(entry Entry) error {
+		entries = append(entries, entry)
+		return nil
+	})
+	return entries, err
+}
+
+func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 	info, err := s.file.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	size := info.Size()
 	var offset int64
-	var entries []Entry
 	memory := newReadArena()
 	defer memory.free()
 	header := memory.bytes(49)
@@ -260,44 +302,46 @@ func (s *Segment) scan(repairTail bool) ([]Entry, error) {
 		if remaining < int64(len(header)) {
 			if repairTail {
 				if err := s.file.Truncate(offset); err != nil {
-					return nil, err
+					return err
 				}
 				s.offset = offset
-				return entries, nil
+				return nil
 			}
-			return nil, io.ErrUnexpectedEOF
+			return io.ErrUnexpectedEOF
 		}
 		if _, err := s.file.ReadAt(header, offset); err != nil {
-			return nil, err
+			return err
 		}
 		payloadLen, _ := entryPayloadLength(binary.LittleEndian.Uint32(header[41:45]))
 		totalLen := int64(len(header)) + int64(payloadLen)
 		if totalLen > remaining {
 			if repairTail {
 				if err := s.file.Truncate(offset); err != nil {
-					return nil, err
+					return err
 				}
 				s.offset = offset
-				return entries, nil
+				return nil
 			}
-			return nil, io.ErrUnexpectedEOF
+			return io.ErrUnexpectedEOF
 		}
 		buf := memory.bytes(int(totalLen))
 		copy(buf, header)
 		if payloadLen > 0 {
 			if _, err := s.file.ReadAt(buf[len(header):], offset+int64(len(header))); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		entry, _, err := DecodeEntry(buf)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		entries = append(entries, entry)
+		if err := visit(entry); err != nil {
+			return err
+		}
 		offset += totalLen
 	}
 	s.offset = offset
-	return entries, nil
+	return nil
 }
 
 // RestoreSegment atomically installs an exact WAL segment downloaded from
@@ -332,9 +376,15 @@ func (w *WAL) RestoreSegment(index uint32, data []byte) error {
 		if len(existing) != 0 && !bytes.HasPrefix(data, existing) {
 			return fmt.Errorf("segment %d conflicts with local WAL", index)
 		}
+		if w.maxBytes > 0 && int64(len(data)-len(existing)) > w.maxBytes-w.bytesLocked() {
+			return fmt.Errorf("%w: restore segment %d", ErrCapacity, index)
+		}
 		return w.replaceEmptySegment(seg, data)
 	}
 
+	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
+		return fmt.Errorf("%w: restore segment %d", ErrCapacity, index)
+	}
 	path := filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", index))
 	if err := writeSegmentAtomically(path, data); err != nil {
 		return err
@@ -455,6 +505,9 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 			return io.ErrShortWrite
 		}
 		offset += int64(n)
+	}
+	if w.maxBytes > 0 && offset > w.maxBytes {
+		return fmt.Errorf("%w: compacted WAL requires %d bytes", ErrCapacity, offset)
 	}
 	if err := temp.Sync(); err != nil {
 		temp.Close()

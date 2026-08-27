@@ -44,6 +44,7 @@ func TestTransientCatchUpFailureKeepsReadyNodeServing(t *testing.T) {
 
 func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 	for name, configure := range map[string]func(*types.ExecutionConfig){
+		"missing": func(*types.ExecutionConfig) {},
 		"filesystem": func(config *types.ExecutionConfig) {
 			config.ObjStoreProvider = "filesystem"
 			config.ObjStoreDir = t.TempDir()
@@ -59,7 +60,7 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 			}
 			configure(config)
 			err := New(config).Open(context.Background())
-			if err == nil || (!strings.Contains(err.Error(), "shared S3-compatible") && !strings.Contains(err.Error(), "S3 bucket is required")) {
+			if err == nil || (!strings.Contains(err.Error(), "shared object storage") && !strings.Contains(err.Error(), "shared S3-compatible") && !strings.Contains(err.Error(), "S3 bucket is required")) {
 				t.Fatalf("error=%v, want object-store rejection", err)
 			}
 			if _, statErr := os.Stat(filepath.Join(dataDir, "qlog")); !os.IsNotExist(statErr) {

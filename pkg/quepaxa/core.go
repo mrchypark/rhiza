@@ -1252,9 +1252,6 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 		if err != nil {
 			return err
 		}
-		if err := c.validateDecisionAtFloor(decision); err != nil {
-			return err
-		}
 		decisions[i] = decision
 	}
 	unlock := c.lockDecisionSlots(values)
@@ -1487,12 +1484,8 @@ func (c *Core) IsQuorum(receipts []Receipt) bool {
 }
 
 func (c *Core) recover() error {
-	entries, err := c.wal.Read()
-	if err != nil {
-		return err
-	}
 	var prepared []CheckpointSeal
-	for _, entry := range entries {
+	if err := c.wal.Scan(func(entry qlog.Entry) error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
 			base, decodeErr := decodeConsensusBase(entry.Payload)
@@ -1518,7 +1511,7 @@ func (c *Core) recover() error {
 			if len(entry.Payload) == 0 || sha256.Sum256(entry.Payload) != entry.Hash {
 				return fmt.Errorf("recover QuePaxa value identity mismatch")
 			}
-			c.values[entry.Hash] = append([]byte(nil), entry.Payload...)
+			c.values[entry.Hash] = entry.Payload
 			c.valueDurable[entry.Hash] = true
 		case qlog.EntryReceipt:
 			persisted, err := decodeRecorderEntry(entry.Payload)
@@ -1555,7 +1548,7 @@ func (c *Core) recover() error {
 				return fmt.Errorf("conflicting decisions at slot %d", decision.Slot)
 			}
 			c.decided[decision.Slot] = DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: value, Certificate: certificate}
-			c.values[decision.Proposal.Hash] = append([]byte(nil), value...)
+			c.values[decision.Proposal.Hash] = value
 			c.valueDurable[decision.Proposal.Hash] = true
 			if seal, checkpoint, _ := DecodeCheckpointSeal(value); checkpoint {
 				c.sealedRoots[seal.RootHash] = SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: decision.Slot}
@@ -1566,6 +1559,9 @@ func (c *Core) recover() error {
 			delete(c.recorders, decision.Slot)
 			c.mu.Unlock()
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	c.mu.RLock()
 	recovered := make([]Decision, 0, len(c.decided))

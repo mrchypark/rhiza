@@ -33,7 +33,7 @@ var graphJournalKey = []byte("rhiza/recovery_journal")
 
 type graphState struct {
 	db                *graphdb.DB
-	mu                sync.Mutex
+	mu                sync.RWMutex
 	tip               uint64
 	idempotencyWindow uint64
 }
@@ -377,15 +377,15 @@ func (m *Materializer) confirmGraphThrough(ctx context.Context, through uint64) 
 }
 
 func putRequest(tx *graphdb.AtomicTx, id string, request graphRequest) error {
+	if id == "" || len(id) > types.MaxRequestIDBytes {
+		return fmt.Errorf("invalid graph request ID length")
+	}
 	if err := tx.PutMetadata(graphRequestKey(id), encodeGraphRequest(request)); err != nil {
 		return err
 	}
 	key := graphSlotKey(request.Receipt.Slot)
 	ids := tx.GetMetadata(key)
-	if len(id) > 255 {
-		return fmt.Errorf("graph request ID exceeds slot index encoding")
-	}
-	ids = append(ids, byte(len(id)))
+	ids = binary.AppendUvarint(ids, uint64(len(id)))
 	ids = append(ids, id...)
 	return tx.PutMetadata(key, ids)
 }
@@ -448,9 +448,13 @@ func pruneGraphRequests(tx *graphdb.AtomicTx, slot uint64) error {
 	key := graphSlotKey(slot)
 	ids := tx.GetMetadata(key)
 	for len(ids) > 0 {
-		length := int(ids[0])
-		ids = ids[1:]
-		if length == 0 || length > len(ids) {
+		encodedLength, n := binary.Uvarint(ids)
+		if n <= 0 || encodedLength == 0 || encodedLength > types.MaxRequestIDBytes {
+			return fmt.Errorf("invalid graph idempotency slot index")
+		}
+		ids = ids[n:]
+		length := int(encodedLength)
+		if length > len(ids) {
 			return fmt.Errorf("invalid graph idempotency slot index")
 		}
 		if err := tx.DeleteMetadata(graphRequestKey(string(ids[:length]))); err != nil {
@@ -480,24 +484,29 @@ func knownNonGraphValue(value []byte) (bool, error) {
 
 func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[string]any) (types.GraphCommandResult, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	if err := ctx.Err(); err != nil {
+		m.mu.RUnlock()
 		return types.GraphCommandResult{}, err
 	}
 	if len(cypher) == 0 || len(cypher) > MaxSQLBytes || len(args) > MaxSQLArgs {
+		m.mu.RUnlock()
 		return types.GraphCommandResult{}, fmt.Errorf("invalid graph query")
 	}
 	converted, err := graphArgs(args)
 	if err != nil {
+		m.mu.RUnlock()
 		return types.GraphCommandResult{}, err
 	}
 	g := m.graph
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.mu.RLock()
 	if g.tip != m.tip {
+		g.mu.RUnlock()
+		m.mu.RUnlock()
 		return types.GraphCommandResult{}, fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
 	}
 	result, err := g.db.CypherReadWithParams(ctx, cypher, converted)
+	g.mu.RUnlock()
+	m.mu.RUnlock()
 	if err != nil {
 		return types.GraphCommandResult{}, err
 	}
@@ -539,8 +548,8 @@ func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	g := m.graph
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	request, found, err := g.request(requestID)
 	return request.Receipt, found, err
 }
@@ -553,8 +562,8 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 		return false, err
 	}
 	g := m.graph
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	request, found, err := g.request(command.RequestID)
 	if err != nil || !found {
 		return !found, err
@@ -565,8 +574,8 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	m.graph.mu.Lock()
-	defer m.graph.mu.Unlock()
+	m.graph.mu.RLock()
+	defer m.graph.mu.RUnlock()
 	_, found, err := m.graph.request(requestID)
 	return found, err
 }
@@ -577,6 +586,8 @@ func (m *Materializer) graphHealth() error {
 	if m.graph == nil || m.graph.db == nil {
 		return fmt.Errorf("GoraphDB is not open")
 	}
+	m.graph.mu.RLock()
+	defer m.graph.mu.RUnlock()
 	if m.graph.tip != m.tip {
 		return fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", m.graph.tip, m.tip)
 	}

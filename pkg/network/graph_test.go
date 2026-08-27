@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -14,6 +15,41 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestGraphRequestIDRejectedBeforeConsensus(t *testing.T) {
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	member := quepaxa.Member{ID: "n1"}
+	core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: quepaxa.Cluster{Members: []quepaxa.Member{member}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer server.Close()
+
+	for _, length := range []int{65, 255, 256} {
+		_, err := server.GraphExecute(context.Background(), types.GraphCommand{RequestID: strings.Repeat("x", length), Cypher: "CREATE (:Item)"})
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("request ID length %d: error=%v", length, err)
+		}
+		if core.Tip() != 0 {
+			t.Fatalf("request ID length %d advanced consensus tip to %d", length, core.Tip())
+		}
+	}
+
+	response, err := server.GraphExecute(context.Background(), types.GraphCommand{RequestID: strings.Repeat("x", types.MaxRequestIDBytes), Cypher: "CREATE (:Item)"})
+	if err != nil || response.Slot != 1 || core.Tip() != 1 {
+		t.Fatalf("valid request: response=%+v tip=%d err=%v", response, core.Tip(), err)
+	}
+}
 
 func TestConcurrentGraphRequestIDConflict(t *testing.T) {
 	wal, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))

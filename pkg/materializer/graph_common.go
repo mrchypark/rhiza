@@ -10,8 +10,8 @@ import (
 
 // ValidateGraphCommand keeps replicated Cypher deterministic and bounded.
 func ValidateGraphCommand(command types.GraphCommand) error {
-	if command.RequestID == "" || len(command.RequestID) > 256 {
-		return fmt.Errorf("request_id is required and must not exceed 256 bytes")
+	if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes {
+		return fmt.Errorf("request_id is required and must not exceed %d bytes", types.MaxRequestIDBytes)
 	}
 	cypher := strings.TrimSpace(command.Cypher)
 	if cypher == "" || len(cypher) > MaxSQLBytes {

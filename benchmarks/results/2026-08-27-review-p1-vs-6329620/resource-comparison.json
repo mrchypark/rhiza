@@ -1,0 +1,62 @@
+[
+  {
+    "scope": "contacted-pod",
+    "config": "graph-async",
+    "previous_cpu_seconds": 6.22159,
+    "current_cpu_seconds": 14.873827,
+    "cpu_change_pct": 139.06793922453906,
+    "previous_peak_mib": 52.375,
+    "current_peak_mib": 78.98828125,
+    "memory_change_pct": 50.81294749403341
+  },
+  {
+    "scope": "contacted-pod",
+    "config": "graph-async-checkpoint-1s",
+    "previous_cpu_seconds": 8.624625,
+    "current_cpu_seconds": 7.936452,
+    "cpu_change_pct": -7.979164311491803,
+    "previous_peak_mib": 88.28125,
+    "current_peak_mib": 54.4609375,
+    "memory_change_pct": -38.309734513274336
+  },
+  {
+    "scope": "contacted-pod",
+    "config": "graph-before-ack",
+    "previous_cpu_seconds": 7.497359,
+    "current_cpu_seconds": 6.59291,
+    "cpu_change_pct": -12.063567984406248,
+    "previous_peak_mib": 73.48046875,
+    "current_peak_mib": 52.80859375,
+    "memory_change_pct": -28.13247567912392
+  },
+  {
+    "scope": "contacted-pod",
+    "config": "sql-async",
+    "previous_cpu_seconds": 7.152531,
+    "current_cpu_seconds": 6.298085,
+    "cpu_change_pct": -11.946064966373433,
+    "previous_peak_mib": 78.8125,
+    "current_peak_mib": 52.49609375,
+    "memory_change_pct": -33.3911578112609
+  },
+  {
+    "scope": "contacted-pod",
+    "config": "sql-async-checkpoint-1s",
+    "previous_cpu_seconds": 8.128995,
+    "current_cpu_seconds": 7.413894,
+    "cpu_change_pct": -8.796917700158504,
+    "previous_peak_mib": 93.53515625,
+    "current_peak_mib": 55.51171875,
+    "memory_change_pct": -40.651493004802674
+  },
+  {
+    "scope": "contacted-pod",
+    "config": "sql-before-ack",
+    "previous_cpu_seconds": 6.626371,
+    "current_cpu_seconds": 9.284206,
+    "cpu_change_pct": 40.109963658841316,
+    "previous_peak_mib": 67.421875,
+    "current_peak_mib": 55.625,
+    "memory_change_pct": -17.497103128621088
+  }
+]
