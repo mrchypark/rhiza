@@ -136,16 +136,36 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	return nil
 }
 
-func (c *Core) LatestCheckpointSeal() (SealedCheckpoint, bool) {
+func (c *Core) LatestCheckpointSeal() (SealedCheckpoint, bool, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	var latest SealedCheckpoint
-	for _, seal := range c.sealedRoots {
+	for root, seal := range c.sealedRoots {
 		if seal.Index > latest.Index {
 			latest = seal
+		} else if seal.Index != 0 && seal.Index == latest.Index && root != latest.RootHash {
+			return SealedCheckpoint{}, false, fmt.Errorf("conflicting checkpoint seals at index %d", seal.Index)
 		}
 	}
-	return latest, latest.Index != 0
+	return latest, latest.Index != 0, nil
+}
+
+// LatestPreparedCheckpoint returns the newest locally verified immutable root.
+func (c *Core) LatestPreparedCheckpoint() (Slot, [32]byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.latestPreparedCheckpointLocked()
+}
+
+func (c *Core) latestPreparedCheckpointLocked() (Slot, [32]byte, bool) {
+	var latest Slot
+	var root [32]byte
+	for slot, candidate := range c.preparedCheckpoints {
+		if slot > latest {
+			latest, root = slot, candidate
+		}
+	}
+	return latest, root, latest != 0
 }
 
 func (c *Core) CompactionFloor() Slot {
@@ -188,6 +208,16 @@ func (c *Core) installBaseLocked(base consensusBase) {
 	for slot := range c.recorders {
 		if slot <= base.ClosedThrough {
 			delete(c.recorders, slot)
+		}
+	}
+	for slot := range c.preparedCheckpoints {
+		if slot < base.ClosedThrough {
+			delete(c.preparedCheckpoints, slot)
+		}
+	}
+	for root, seal := range c.sealedRoots {
+		if seal.Index < base.ClosedThrough {
+			delete(c.sealedRoots, root)
 		}
 	}
 	used := make(map[ValueHash]struct{})

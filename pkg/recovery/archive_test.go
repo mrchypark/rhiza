@@ -7,8 +7,11 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -20,6 +23,53 @@ type countingBucket struct {
 	heads atomic.Uint64
 	gets  atomic.Uint64
 	puts  atomic.Uint64
+}
+
+type blockingUploadBucket struct {
+	objstore.Bucket
+	started chan struct{}
+}
+
+type blockingGetBucket struct {
+	objstore.Bucket
+	block   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+type racingHeadBucket struct {
+	objstore.Bucket
+	once sync.Once
+	run  func()
+}
+
+func (b *racingHeadBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if strings.HasSuffix(name, "archive/latest.json") {
+		b.once.Do(b.run)
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *blockingGetBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if b.block.CompareAndSwap(true, false) {
+		close(b.started)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-b.release:
+		}
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *blockingUploadBucket) Upload(ctx context.Context, _ string, _ io.Reader, _ ...objstore.ObjectUploadOption) error {
+	select {
+	case <-b.started:
+	default:
+		close(b.started)
+	}
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
@@ -68,12 +118,123 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 			t.Fatal("archive load retained decision payloads")
 		}
 	}
-	values, tip, err := reader.DecisionsFrom(1, int(core.Tip()))
+	values, tip, err := reader.DecisionsFrom(ctx, 1, int(core.Tip()))
 	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()) {
 		t.Fatalf("archive tip=%d values=%d err=%v", tip, len(values), err)
 	}
 	if len(reader.cache) > maxCachedExtents {
 		t.Fatalf("archive cache=%d, limit=%d", len(reader.cache), maxCachedExtents)
+	}
+}
+
+func TestArchiveCloseCancelsAndWaitsForFlush(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &blockingUploadBucket{Bucket: objstore.NewInMemBucket(), started: make(chan struct{})}
+	manager := NewManager(bucket, "cluster", 1)
+	done := make(chan error, 1)
+	go func() { done <- manager.SyncThrough(ctx, core, core.Tip()) }()
+	<-bucket.started
+	manager.Close()
+	if err := <-done; !errors.Is(err, context.Canceled) && !errors.Is(err, ErrArchiveClosed) {
+		t.Fatalf("flush error=%v", err)
+	}
+	if err := manager.SyncThrough(ctx, core, core.Tip()); !errors.Is(err, ErrArchiveClosed) {
+		t.Fatalf("sync after close error=%v", err)
+	}
+}
+
+func TestArchiveReadIODoesNotBlockPublication(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := &blockingGetBucket{Bucket: objstore.NewInMemBucket(), started: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	for i := 0; i < maxCachedExtents+1; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bucket.block.Store(true)
+	readDone := make(chan error, 1)
+	go func() {
+		_, _, err := manager.DecisionsFrom(ctx, 1, 1)
+		readDone <- err
+	}()
+	<-bucket.started
+	if _, _, err := core.Propose(ctx, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := manager.SyncThrough(writeCtx, core, core.Tip()); err != nil {
+		t.Fatalf("publication waited for archive read: %v", err)
+	}
+	close(bucket.release)
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArchiveCleanupIODoesNotBlockPublication(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := &blockingGetBucket{Bucket: objstore.NewInMemBucket(), started: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	for i := 0; i < maxCachedExtents+1; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bucket.block.Store(true)
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- manager.Cleanup(ctx, time.Hour) }()
+	<-bucket.started
+	if _, _, err := core.Propose(ctx, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := manager.SyncThrough(writeCtx, core, core.Tip()); err != nil {
+		t.Fatalf("publication waited for archive cleanup: %v", err)
+	}
+	close(bucket.release)
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -150,6 +311,23 @@ func TestArchiveCleanupCompactsCardinality(t *testing.T) {
 	}
 	if err := manager.Cleanup(ctx, 0); err != nil {
 		t.Fatal(err)
+	}
+	count := func(prefix string) int {
+		t.Helper()
+		total := 0
+		if err := bucket.Iter(ctx, prefix, func(string) error { total++; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return total
+	}
+	if blocks, markers := count("cluster/archive/blocks"), count("cluster/archive/gc-candidates"); blocks <= 1 || markers == 0 {
+		t.Fatalf("first GC pass blocks=%d markers=%d, want retained old blocks and markers", blocks, markers)
+	}
+	if err := manager.Cleanup(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if blocks := count("cluster/archive/blocks"); blocks != 1 {
+		t.Fatalf("second GC pass retained %d blocks, want 1", blocks)
 	}
 	if err := manager.Load(ctx); err != nil {
 		t.Fatal(err)
@@ -234,6 +412,90 @@ func TestUnchangedArchiveLoadOnlyChecksHead(t *testing.T) {
 	}
 }
 
+func TestChangedArchiveLoadStopsAtKnownHash(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	writer := NewManager(bucket, "cluster", 1)
+	defer writer.Close()
+	for i := 0; i < 3; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := NewManager(bucket, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	bucket.heads.Store(0)
+	bucket.gets.Store(0)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 3 || gets != 2 {
+		t.Fatalf("incremental load heads=%d gets=%d, want 3/2", heads, gets)
+	}
+}
+
+func TestArchiveLoadRejectsMixedHeadGeneration(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := objstore.NewInMemBucket()
+	writer := NewManager(bucket, "cluster", 1)
+	defer writer.Close()
+	if _, _, err := core.Propose(ctx, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	reader := NewManager(bucket, "cluster", 1)
+	defer reader.Close()
+	if _, _, err := core.Propose(ctx, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	racing := &racingHeadBucket{Bucket: bucket, run: func() {
+		if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Errorf("publish raced head: %v", err)
+		}
+	}}
+	reader.bucket = racing
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if reader.Tip() != 2 {
+		t.Fatalf("mixed-generation head installed tip %d", reader.Tip())
+	}
+}
+
 func TestArchivePublishDoesNotReloadItsTail(t *testing.T) {
 	ctx := context.Background()
 	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
@@ -267,8 +529,8 @@ func TestArchivePublishDoesNotReloadItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 1 || gets != 1 {
-		t.Fatalf("publish heads=%d gets=%d, want 1/1", heads, gets)
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 3 || gets != 1 {
+		t.Fatalf("publish heads=%d gets=%d, want 3/1", heads, gets)
 	}
 }
 
@@ -359,10 +621,10 @@ func TestArchiveTrimRetainsOnlyCheckpointTail(t *testing.T) {
 	if err := manager.TrimThrough(ctx, quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}, decision); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := manager.DecisionsFrom(3, 1); !errors.Is(err, quepaxa.ErrCompacted) {
+	if _, _, err := manager.DecisionsFrom(ctx, 3, 1); !errors.Is(err, quepaxa.ErrCompacted) {
 		t.Fatalf("trimmed decision error=%v", err)
 	}
-	values, tip, err := manager.DecisionsFrom(4, 10)
+	values, tip, err := manager.DecisionsFrom(ctx, 4, 10)
 	if err != nil || tip != slot || len(values) != int(slot-3) {
 		t.Fatalf("tail tip=%d values=%d err=%v", tip, len(values), err)
 	}
@@ -370,8 +632,19 @@ func TestArchiveTrimRetainsOnlyCheckpointTail(t *testing.T) {
 	if err := reloaded.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
-	values, _, err = reloaded.DecisionsFrom(4, 10)
+	values, _, err = reloaded.DecisionsFrom(ctx, 4, 10)
 	if err != nil || len(values) != int(slot-3) {
 		t.Fatalf("reloaded tail values=%d err=%v", len(values), err)
+	}
+	if err := reloaded.Cleanup(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewManager(bucket, "cluster", 1)
+	if err := fresh.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err = fresh.DecisionsFrom(ctx, 4, 10)
+	if err != nil || tip != slot || len(values) != int(slot-3) {
+		t.Fatalf("compacted tail tip=%d values=%d err=%v", tip, len(values), err)
 	}
 }

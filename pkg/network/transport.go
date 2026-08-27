@@ -25,6 +25,7 @@ const checkpointPrepareTimeout = 5 * time.Minute
 
 type peerConnection struct {
 	mu     sync.Mutex
+	gate   chan struct{}
 	conn   *quic.Conn
 	active map[*quic.Conn]int
 }
@@ -45,7 +46,7 @@ type Transport struct {
 func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string) *Transport {
 	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
 	for _, member := range config.Members {
-		peers[member.ID] = &peerConnection{active: make(map[*quic.Conn]int)}
+		peers[member.ID] = &peerConnection{gate: make(chan struct{}, 1), active: make(map[*quic.Conn]int)}
 	}
 	localToken := token
 	if member, ok := config.MemberSet()[localID]; ok && member.Token != "" {
@@ -84,6 +85,12 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 		return nil, fmt.Errorf("unknown node: %s", to)
 	}
 	peer := t.peers[to]
+	select {
+	case peer.gate <- struct{}{}:
+		defer func() { <-peer.gate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 	if peer.conn == nil || peer.conn.Context().Err() != nil {

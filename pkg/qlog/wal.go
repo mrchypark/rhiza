@@ -465,23 +465,6 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var kept []Entry
-	for _, seg := range w.segments {
-		entries, err := seg.readAll()
-		if err != nil {
-			return err
-		}
-		for _, entry := range entries {
-			switch {
-			case entry.Type == EntryProposal:
-				if _, ok := keepValueHashes[entry.Hash]; ok {
-					kept = append(kept, entry)
-				}
-			case entry.Slot > base.Slot:
-				kept = append(kept, entry)
-			}
-		}
-	}
 	index := uint32(1)
 	if w.current != nil {
 		index = w.current.index + 1
@@ -493,21 +476,42 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
 	offset := int64(0)
-	for _, entry := range append([]Entry{base}, kept...) {
+	writeEntry := func(entry Entry) error {
 		data := entry.Encode()
+		if w.maxBytes > 0 && offset+int64(len(data)) > w.maxBytes {
+			return fmt.Errorf("%w: compacted WAL requires more than %d bytes", ErrCapacity, w.maxBytes)
+		}
 		n, writeErr := temp.Write(data)
 		if writeErr != nil {
-			temp.Close()
 			return writeErr
 		}
 		if n != len(data) {
-			temp.Close()
 			return io.ErrShortWrite
 		}
 		offset += int64(n)
+		return nil
 	}
-	if w.maxBytes > 0 && offset > w.maxBytes {
-		return fmt.Errorf("%w: compacted WAL requires %d bytes", ErrCapacity, offset)
+	if err := writeEntry(base); err != nil {
+		temp.Close()
+		return err
+	}
+	for _, seg := range w.segments {
+		seg.mu.Lock()
+		err := seg.scanEntries(false, func(entry Entry) error {
+			if entry.Type == EntryProposal {
+				if _, ok := keepValueHashes[entry.Hash]; !ok {
+					return nil
+				}
+			} else if entry.Slot <= base.Slot {
+				return nil
+			}
+			return writeEntry(entry)
+		})
+		seg.mu.Unlock()
+		if err != nil {
+			temp.Close()
+			return err
+		}
 	}
 	if err := temp.Sync(); err != nil {
 		temp.Close()

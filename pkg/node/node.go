@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -127,7 +128,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	}
 	n.wal = wal
 	maxWALBytes := n.config.MaxWALBytes
-	if maxWALBytes == 0 && !objectStoreConfigured {
+	if maxWALBytes == 0 {
 		maxWALBytes = 4 << 30
 	}
 	if maxWALBytes > 0 {
@@ -223,7 +224,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			}
 		}
 		for core.Tip() < n.archive.Tip() {
-			values, _, archiveErr := n.archive.DecisionsFrom(core.Tip()+1, 256)
+			values, _, archiveErr := n.archive.DecisionsFrom(ctx, core.Tip()+1, 256)
 			if archiveErr != nil || len(values) == 0 {
 				if archiveErr == nil {
 					archiveErr = fmt.Errorf("shared archive omitted slot %d", core.Tip()+1)
@@ -238,6 +239,14 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
+	if n.checkpoints != nil {
+		server.SetCheckpointPrepare(func(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
+				return err
+			}
+			return core.PrepareCheckpoint(ctx, seal)
+		})
+	}
 	server.SetObjectStoreStats(func() (map[string]uint64, bool) {
 		stats, ok := n.ObjectStoreStats()
 		return map[string]uint64{
@@ -270,7 +279,10 @@ func (n *Node) Open(ctx context.Context) (err error) {
 
 	var certifiedCheckpoint *checkpoint.Checkpoint
 	if n.checkpoints != nil {
-		seal, sealed := core.LatestCheckpointSeal()
+		seal, sealed, sealErr := core.LatestCheckpointSeal()
+		if sealErr != nil {
+			return sealErr
+		}
 		if current := n.checkpoints.Latest(); current != nil && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
 			return fmt.Errorf("checkpoint CURRENT is not backed by the certified seal; start with fresh object storage")
 		}
@@ -389,13 +401,34 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			tailBytes = 512 << 20
 		}
 		n.checkpointer.ConfigureTail(n.wal.Bytes, tailBytes)
+		n.checkpointer.ConfigurePublisher(string(core.NodeID()), func() uint64 {
+			floor := material.Tip()
+			if index, _, ok := core.LatestPreparedCheckpoint(); ok {
+				floor = max(floor, uint64(index))
+			}
+			if seal, ok, err := core.LatestCheckpointSeal(); err == nil && ok {
+				floor = max(floor, uint64(seal.Index))
+			}
+			if latest := n.checkpoints.Latest(); latest != nil {
+				floor = max(floor, latest.Index)
+			}
+			return floor
+		}, func(ctx context.Context, reserved uint64) error {
+			for material.Tip() < reserved {
+				var nonce [types.ReadBarrierNonceSize]byte
+				if _, err := rand.Read(nonce[:]); err != nil {
+					return err
+				}
+				if _, err := server.ProposeControl(ctx, types.EncodeReadBarrier(nonce)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 		n.checkpointer.ConfigurePublication(
 			func() bool {
-				if len(n.config.Members) != 0 && n.config.Members[0].ID != n.config.NodeID {
-					return false
-				}
-				seal, ok := core.LatestCheckpointSeal()
-				return !ok || material.Tip() > uint64(seal.Index)
+				seal, ok, err := core.LatestCheckpointSeal()
+				return err == nil && (!ok || material.Tip() > uint64(seal.Index))
 			},
 			func(ctx context.Context, root *checkpoint.Checkpoint) error {
 				prefix, ok := core.PrefixHash(quepaxa.Slot(root.Index))
@@ -409,6 +442,9 @@ func (n *Node) Open(ctx context.Context) (err error) {
 				seal := quepaxa.CheckpointSeal{
 					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
 					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following,
+				}
+				if err := n.checkpoints.ValidatePublisherClaim(ctx, string(core.NodeID()), root.Index, root.RootHash); err != nil {
+					return err
 				}
 				if err := core.PrepareCheckpoint(ctx, seal); err != nil {
 					return err
@@ -459,7 +495,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 					if _, root, ok := core.RecoveryRoot(); ok {
 						retain[root] = struct{}{}
 					}
-					if seal, ok := core.LatestCheckpointSeal(); ok {
+					if seal, ok, err := core.LatestCheckpointSeal(); err == nil && ok {
 						retain[seal.RootHash] = struct{}{}
 					}
 					if err := n.checkpoints.GarbageCollect(ctx, retain, 2, n.config.ObjStoreGCGracePeriod); err != nil {
@@ -478,7 +514,10 @@ func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
 	if n.core == nil || n.archive == nil || n.checkpoints == nil {
 		return nil
 	}
-	seal, ok := n.core.LatestCheckpointSeal()
+	seal, ok, err := n.core.LatestCheckpointSeal()
+	if err != nil {
+		return err
+	}
 	if !ok || seal.Index <= n.core.CompactionFloor() {
 		return nil
 	}
@@ -509,7 +548,7 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 		return err
 	}
 	for n.core.Tip() < n.archive.Tip() {
-		values, _, err := n.archive.DecisionsFrom(n.core.Tip()+1, 256)
+		values, _, err := n.archive.DecisionsFrom(ctx, n.core.Tip()+1, 256)
 		if err != nil || len(values) == 0 {
 			if err == nil {
 				err = fmt.Errorf("shared archive omitted slot %d", n.core.Tip()+1)
@@ -763,10 +802,6 @@ func (n *Node) Shutdown() error {
 	n.opened.Store(false)
 	n.ready.Store(false)
 	var shutdownErr error
-	if n.server != nil {
-		n.server.Close()
-		n.server = nil
-	}
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
 	}
@@ -780,11 +815,19 @@ func (n *Node) Shutdown() error {
 		cancel()
 	}
 	n.checkpointer = nil
+	if n.server != nil {
+		n.server.Close()
+		n.server = nil
+	}
 	if n.cancel != nil {
 		n.cancel()
 		n.cancel = nil
 	}
 	n.wg.Wait()
+	if n.archive != nil {
+		n.archive.Close()
+		n.archive = nil
+	}
 	if n.peer != nil {
 		n.peer.Close()
 		n.peer = nil

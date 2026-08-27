@@ -3,12 +3,14 @@ package checkpoint
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -121,6 +123,27 @@ func TestVerifyReusesDurableBlockCache(t *testing.T) {
 	}
 }
 
+func TestCheckpointSkipsCertifiedBlocks(t *testing.T) {
+	ctx := context.Background()
+	bucket := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", t.TempDir(), 9)
+	snapshot := source(t, RoleSQLite, "stable")
+	root, err := manager.CreateFiles(ctx, []Source{snapshot}, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	bucket.uploads.Store(0)
+	if _, err := manager.CreateFiles(ctx, []Source{snapshot}, 8); err != nil {
+		t.Fatal(err)
+	}
+	if uploads := bucket.uploads.Load(); uploads != 1 {
+		t.Fatalf("unchanged checkpoint uploads=%d, want root only", uploads)
+	}
+}
+
 func TestLoadUsesCurrentAndExactRoot(t *testing.T) {
 	ctx := context.Background()
 	bucket := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
@@ -175,6 +198,56 @@ func TestGarbageCollectRetiresRootBeforeBlocks(t *testing.T) {
 	}
 	if exists, _ := bucket.Exists(ctx, key); exists {
 		t.Fatal("orphaned block survived following GC pass")
+	}
+}
+
+func TestGarbageCollectPrunesVerifiedBlockCache(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", t.TempDir(), 9)
+	old, err := manager.CreateFiles(ctx, []Source{source(t, RoleSQLite, "old")}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.PromoteCertifiedCurrent(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(ctx, old.Index, old.RootHash, old.Hash); err != nil {
+		t.Fatal(err)
+	}
+	newRoot, err := manager.CreateFiles(ctx, []Source{source(t, RoleSQLite, "new")}, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.PromoteCertifiedCurrent(ctx, newRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(ctx, newRoot.Index, newRoot.RootHash, newRoot.Hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.verified[old.Files[0].Blocks[0].Hash]; ok {
+		t.Fatal("verified cache retained retired checkpoint block")
+	}
+	if _, ok := manager.verified[newRoot.Files[0].Blocks[0].Hash]; !ok {
+		t.Fatal("verified cache removed retained checkpoint block")
+	}
+}
+
+func TestVerifyDoesNotRewriteUnchangedBlockCache(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", t.TempDir(), 9)
+	root, err := manager.CreateFiles(ctx, []Source{source(t, RoleSQLite, "state")}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Verify(ctx, root.Index, root.RootHash, root.Hash); err != nil {
+		t.Fatal(err)
+	}
+	manager.localDir = t.TempDir() + "/missing"
+	if err := manager.Verify(ctx, root.Index, root.RootHash, root.Hash); err != nil {
+		t.Fatalf("unchanged verification rewrote cache: %v", err)
 	}
 }
 
@@ -266,5 +339,42 @@ func TestCertificationRetryReusesCandidate(t *testing.T) {
 	}
 	if delta := bucket.uploads.Load() - before; delta != 1 {
 		t.Fatalf("retry uploads=%d, want only CURRENT promotion", delta)
+	}
+}
+
+func TestPublisherClaimFencesStaleOwnerAndIndex(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", t.TempDir(), 9)
+	first, err := manager.AcquirePublisherClaim(ctx, "n1", 10, time.Minute)
+	if err != nil || first.ReservedIndex != 11 {
+		t.Fatalf("first claim=%+v err=%v", first, err)
+	}
+	if _, err := manager.AcquirePublisherClaim(ctx, "n2", 10, time.Minute); !errors.Is(err, ErrPublisherBusy) {
+		t.Fatalf("concurrent owner error=%v", err)
+	}
+	root1 := sha256.Sum256([]byte("root-1"))
+	first, err = manager.BindPublisherClaim(ctx, first, 11, root1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ValidatePublisherClaim(ctx, "n1", 11, root1); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ReleasePublisherClaim(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.AcquirePublisherClaim(ctx, "n2", 11, time.Minute)
+	if err != nil || second.Generation != first.Generation+1 || second.ReservedIndex != 12 {
+		t.Fatalf("takeover claim=%+v err=%v", second, err)
+	}
+	if err := manager.ValidatePublisherClaim(ctx, "n1", 11, root1); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("stale owner validation=%v", err)
+	}
+	if _, err := manager.BindPublisherClaim(ctx, second, 11, root1, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("stale index bind=%v", err)
+	}
+	root2 := sha256.Sum256([]byte("root-2"))
+	if _, err := manager.BindPublisherClaim(ctx, second, 12, root2, time.Minute); err != nil {
+		t.Fatal(err)
 	}
 }

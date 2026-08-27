@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim AS lattice-builder
 ARG TARGETARCH
-ARG LATTICEDB_REF=4f64f6502f469a9e2da4f8e31091a51a85153cbf
+ARG LATTICEDB_REF=5c24ede6fae450a0fa716d437c14993fc99a7dd5
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils && rm -rf /var/lib/apt/lists/*
 RUN case "$TARGETARCH" in amd64) zig_arch=x86_64 ;; arm64) zig_arch=aarch64 ;; *) exit 1 ;; esac && \
     curl -fsSL "https://ziglang.org/download/0.16.0/zig-${zig_arch}-linux-0.16.0.tar.xz" | tar -xJ -C /opt && \

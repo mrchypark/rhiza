@@ -11,6 +11,7 @@ import (
 
 var sqlBatchMagic = []byte("QBAT\x00")
 var kvCommandMagic = []byte("QKVC\x00")
+var kvBatchMagic = []byte("QKVB\x00")
 var notifyCommandMagic = []byte("QNTF\x00")
 var graphBatchMagic = []byte("QGRB\x00")
 
@@ -288,6 +289,28 @@ func EncodeKVCommand(command KVCommand) ([]byte, error) {
 		return nil, err
 	}
 	return append(append([]byte(nil), kvCommandMagic...), payload...), nil
+}
+
+func EncodeKVBatchItem(command KVCommand) ([]byte, error) {
+	return json.Marshal(command)
+}
+
+func AssembleKVBatch(items [][]byte) []byte {
+	return assembleBatch(kvBatchMagic, items)
+}
+
+func DecodeKVBatch(value []byte) ([]KVCommand, bool, error) {
+	if !bytes.HasPrefix(value, kvBatchMagic) {
+		return nil, false, nil
+	}
+	var commands []KVCommand
+	if err := json.Unmarshal(value[len(kvBatchMagic):], &commands); err != nil {
+		return nil, true, err
+	}
+	if len(commands) == 0 {
+		return nil, true, fmt.Errorf("empty KV command batch")
+	}
+	return commands, true, nil
 }
 
 func DecodeKVCommand(value []byte) (KVCommand, bool, error) {

@@ -1,0 +1,11 @@
+usage_usec 62484
+user_usec 36142
+system_usec 26341
+nice_usec 0
+nr_periods 29
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+25710592
+31674368

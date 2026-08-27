@@ -94,6 +94,23 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPeerConnectionWaitHonorsContext(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", PeerURL: "quic://127.0.0.1:1"}
+	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: []quepaxa.Member{member}}, "secret")
+	peer := transport.peers[member.ID]
+	peer.gate <- struct{}{}
+	defer func() { <-peer.gate }()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := transport.connection(ctx, member.ID, false); err == nil {
+		t.Fatal("connection wait ignored cancellation")
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("connection cancellation took %v", elapsed)
+	}
+}
+
 func TestPeerCodecRejectsMalformedFrame(t *testing.T) {
 	if _, err := decodePeerRequest([]byte("not-flatbuffers")); err == nil {
 		t.Fatal("malformed frame accepted")

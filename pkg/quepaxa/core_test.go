@@ -19,6 +19,22 @@ type mockTransport struct {
 	sendDecision      func(context.Context, Decision) error
 }
 
+type cancelReadTransport struct {
+	mockTransport
+	started  chan struct{}
+	canceled chan struct{}
+}
+
+func (t *cancelReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
+	if to == "node-2" {
+		return 0, nil
+	}
+	close(t.started)
+	<-ctx.Done()
+	close(t.canceled)
+	return 0, ctx.Err()
+}
+
 func (m *mockTransport) SendRecord(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
 	return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
 }
@@ -78,6 +94,24 @@ func TestCorePropose(t *testing.T) {
 	// Check quorum
 	if !core.IsQuorum(receipts) {
 		t.Error("expected quorum to be reached")
+	}
+}
+
+func TestReadIndexCancelsOutstandingPeerRPCs(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &cancelReadTransport{started: make(chan struct{}), canceled: make(chan struct{})}
+	core := newCore("node-1", &Cluster{ConfigID: 1, Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	if _, _, err := core.ReadIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-transport.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("read-index left a losing peer RPC running")
 	}
 }
 
@@ -304,6 +338,9 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	if err := core.PrepareCheckpoint(context.Background(), checkpoint); err != nil {
 		t.Fatal(err)
 	}
+	if index, prepared, ok := core.LatestPreparedCheckpoint(); !ok || index != 3 || prepared != root {
+		t.Fatalf("prepared checkpoint index=%d root=%x ok=%v", index, prepared, ok)
+	}
 	seal, err := EncodeCheckpointSeal(checkpoint)
 	if err != nil {
 		t.Fatal(err)
@@ -311,8 +348,17 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	if _, _, err := core.Propose(context.Background(), seal); err != nil {
 		t.Fatal(err)
 	}
+	oldRoot := sha256.Sum256([]byte("old-root"))
+	core.preparedCheckpoints[1] = oldRoot
+	core.sealedRoots[oldRoot] = SealedCheckpoint{CheckpointSeal: CheckpointSeal{Index: 1, RootHash: oldRoot}}
 	if err := core.CompactThrough(3, root); err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := core.preparedCheckpoints[1]; ok {
+		t.Fatal("compaction retained obsolete prepared checkpoint")
+	}
+	if _, ok := core.sealedRoots[oldRoot]; ok {
+		t.Fatal("compaction retained obsolete sealed checkpoint")
 	}
 	if core.Tip() != 6 {
 		t.Fatalf("live compacted tip=%d, want 6", core.Tip())
@@ -806,5 +852,52 @@ func TestDecisionsFromStopsAtGap(t *testing.T) {
 	}
 	if tip != 0 || len(decisions) != 0 {
 		t.Fatalf("exposed non-contiguous decision: tip=%d decisions=%+v", tip, decisions)
+	}
+}
+
+func TestPreparedCheckpointIsMonotonicFence(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{ConfigID: 3, Members: []Member{{ID: "n1"}}}, wal, nil)
+	for i := byte(1); i <= 4; i++ {
+		if _, _, err := core.Propose(context.Background(), []byte{i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	makeSeal := func(index Slot, root [32]byte) CheckpointSeal {
+		prefix, _ := core.PrefixHash(index)
+		order, following, err := core.CheckpointLeaderOrders(index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return CheckpointSeal{ConfigID: 3, Index: index, RootHash: root, StateHash: sha256.Sum256([]byte{byte(index)}), PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following}
+	}
+	root3 := sha256.Sum256([]byte("root-3"))
+	seal3 := makeSeal(3, root3)
+	if err := core.PrepareCheckpoint(context.Background(), seal3); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.PrepareCheckpoint(context.Background(), makeSeal(2, sha256.Sum256([]byte("root-2")))); err == nil {
+		t.Fatal("lower checkpoint crossed prepared fence")
+	}
+	conflict := sha256.Sum256([]byte("conflict"))
+	if err := core.PrepareCheckpoint(context.Background(), makeSeal(3, conflict)); err == nil {
+		t.Fatal("same-index conflicting root crossed prepared fence")
+	}
+	root4 := sha256.Sum256([]byte("root-4"))
+	if err := core.PrepareCheckpoint(context.Background(), makeSeal(4, root4)); err != nil {
+		t.Fatal(err)
+	}
+	if index, root, ok := core.LatestPreparedCheckpoint(); !ok || index != 4 || root != root4 || len(core.preparedCheckpoints) != 1 {
+		t.Fatalf("active fence index=%d root=%x entries=%d", index, root, len(core.preparedCheckpoints))
+	}
+	core.sealedRoots[root3] = SealedCheckpoint{CheckpointSeal: seal3}
+	core.sealedRoots[conflict] = SealedCheckpoint{CheckpointSeal: makeSeal(3, conflict)}
+	if _, _, err := core.LatestCheckpointSeal(); err == nil {
+		t.Fatal("same-index sealed root conflict was hidden")
 	}
 }

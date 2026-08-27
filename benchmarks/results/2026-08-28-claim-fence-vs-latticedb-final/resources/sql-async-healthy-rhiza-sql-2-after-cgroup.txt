@@ -1,0 +1,11 @@
+usage_usec 1077708
+user_usec 370153
+system_usec 707554
+nice_usec 0
+nr_periods 132
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+36401152
+43274240

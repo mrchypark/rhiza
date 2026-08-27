@@ -33,6 +33,11 @@ const (
 
 var ErrStaleCheckpoint = errors.New("stale checkpoint candidate")
 
+var (
+	ErrPublisherBusy   = errors.New("checkpoint publisher is active")
+	ErrPublisherFenced = errors.New("checkpoint publisher was fenced")
+)
+
 type Block struct {
 	Hash string `json:"hash"`
 	Size int64  `json:"size"`
@@ -55,6 +60,18 @@ type Checkpoint struct {
 	Size     int64    `json:"size"`
 	Files    []File   `json:"files"`
 	RootHash [32]byte `json:"-"`
+	claim    *PublisherClaim
+}
+
+type PublisherClaim struct {
+	ConfigID      uint   `json:"config_id"`
+	Generation    uint64 `json:"generation"`
+	OwnerID       string `json:"owner_id"`
+	LeaseUntilMS  int64  `json:"lease_until_unix_ms"`
+	ReservedIndex uint64 `json:"reserved_index"`
+	BoundIndex    uint64 `json:"bound_index,omitempty"`
+	RootHash      string `json:"root_hash,omitempty"`
+	version       *objstore.ObjectVersion
 }
 
 type currentPointer struct {
@@ -123,6 +140,159 @@ func (m *Manager) Load(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) AcquirePublisherClaim(ctx context.Context, owner string, minExclusive uint64, lease time.Duration) (*PublisherClaim, error) {
+	if owner == "" || lease <= 0 {
+		return nil, fmt.Errorf("publisher owner and positive lease are required")
+	}
+	if !slices.Contains(m.bucket.SupportedObjectUploadOptions(), objstore.IfNotExists) || !slices.Contains(m.bucket.SupportedObjectUploadOptions(), objstore.IfMatch) {
+		return nil, fmt.Errorf("checkpoint publisher requires conditional object writes")
+	}
+	key := m.key("checkpoint/PUBLISHER")
+	for range 4 {
+		current, err := m.readPublisherClaim(ctx)
+		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			return nil, err
+		}
+		now := time.Now()
+		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
+			return nil, ErrPublisherBusy
+		}
+		generation, floor := uint64(1), minExclusive
+		var options []objstore.ObjectUploadOption
+		if err == nil {
+			generation = current.Generation + 1
+			floor = max(floor, current.ReservedIndex, current.BoundIndex)
+			options = append(options, objstore.WithIfMatch(current.version))
+		} else {
+			options = append(options, objstore.WithIfNotExists())
+		}
+		claim := &PublisherClaim{ConfigID: m.configID, Generation: generation, OwnerID: owner, LeaseUntilMS: now.Add(lease).UnixMilli(), ReservedIndex: floor + 1}
+		if err := m.uploadPublisherClaim(ctx, key, claim, options...); err != nil {
+			if m.bucket.IsConditionNotMetErr(err) {
+				continue
+			}
+			return nil, err
+		}
+		return m.readPublisherClaim(ctx)
+	}
+	return nil, ErrPublisherBusy
+}
+
+func (m *Manager) BindPublisherClaim(ctx context.Context, claim *PublisherClaim, index uint64, root [32]byte, lease time.Duration) (*PublisherClaim, error) {
+	current, err := m.readPublisherClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if claim == nil || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() || index < current.ReservedIndex {
+		return nil, ErrPublisherFenced
+	}
+	current.BoundIndex, current.RootHash, current.LeaseUntilMS = index, hex.EncodeToString(root[:]), time.Now().Add(lease).UnixMilli()
+	if err := m.uploadPublisherClaim(ctx, m.key("checkpoint/PUBLISHER"), current, objstore.WithIfMatch(current.version)); err != nil {
+		if m.bucket.IsConditionNotMetErr(err) {
+			return nil, ErrPublisherFenced
+		}
+		return nil, err
+	}
+	return m.readPublisherClaim(ctx)
+}
+
+func (m *Manager) RenewPublisherClaim(ctx context.Context, claim *PublisherClaim, lease time.Duration) (*PublisherClaim, error) {
+	current, err := m.readPublisherClaim(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if claim == nil || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.BoundIndex != claim.BoundIndex || current.RootHash != claim.RootHash || current.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrPublisherFenced
+	}
+	current.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
+	if err := m.uploadPublisherClaim(ctx, m.key("checkpoint/PUBLISHER"), current, objstore.WithIfMatch(current.version)); err != nil {
+		if m.bucket.IsConditionNotMetErr(err) {
+			return nil, ErrPublisherFenced
+		}
+		return nil, err
+	}
+	return m.readPublisherClaim(ctx)
+}
+
+func (m *Manager) ValidatePublisherClaim(ctx context.Context, owner string, index uint64, root [32]byte) error {
+	claim, err := m.readPublisherClaim(ctx)
+	if err != nil {
+		return err
+	}
+	if claim.ConfigID != m.configID || claim.OwnerID != owner || claim.LeaseUntilMS <= time.Now().UnixMilli() || claim.BoundIndex != index || claim.RootHash != hex.EncodeToString(root[:]) {
+		return ErrPublisherFenced
+	}
+	return nil
+}
+
+func (m *Manager) ReleasePublisherClaim(ctx context.Context, claim *PublisherClaim) error {
+	current, err := m.readPublisherClaim(ctx)
+	if err != nil {
+		return err
+	}
+	if claim == nil || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID {
+		return ErrPublisherFenced
+	}
+	current.LeaseUntilMS = time.Now().UnixMilli()
+	if err := m.uploadPublisherClaim(ctx, m.key("checkpoint/PUBLISHER"), current, objstore.WithIfMatch(current.version)); err != nil && m.bucket.IsConditionNotMetErr(err) {
+		return ErrPublisherFenced
+	} else {
+		return err
+	}
+}
+
+func (m *Manager) readPublisherClaim(ctx context.Context) (*PublisherClaim, error) {
+	key := m.key("checkpoint/PUBLISHER")
+	for range 4 {
+		before, err := m.bucket.Attributes(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		r, err := m.bucket.Get(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		data, readErr := io.ReadAll(io.LimitReader(r, maxRootSize+1))
+		closeErr := r.Close()
+		if readErr != nil || closeErr != nil || len(data) > maxRootSize {
+			if readErr != nil {
+				return nil, readErr
+			}
+			if closeErr != nil {
+				return nil, closeErr
+			}
+			return nil, fmt.Errorf("checkpoint publisher claim exceeds size limit")
+		}
+		after, err := m.bucket.Attributes(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if before.Version == nil || after.Version == nil || *before.Version != *after.Version {
+			continue
+		}
+		var claim PublisherClaim
+		if err := decodePersistedJSON(data, &claim); err != nil {
+			return nil, err
+		}
+		if claim.ConfigID != m.configID || claim.Generation == 0 || claim.OwnerID == "" || claim.ReservedIndex == 0 {
+			return nil, fmt.Errorf("invalid checkpoint publisher claim")
+		}
+		claim.version = after.Version
+		return &claim, nil
+	}
+	return nil, fmt.Errorf("checkpoint publisher claim did not stabilize")
+}
+
+func (m *Manager) uploadPublisherClaim(ctx context.Context, key string, claim *PublisherClaim, options ...objstore.ObjectUploadOption) error {
+	copy := *claim
+	copy.version = nil
+	data, err := json.Marshal(copy)
+	if err != nil {
+		return err
+	}
+	return m.bucket.Upload(ctx, key, bytes.NewReader(data), options...)
+}
+
 func (m *Manager) loadAll(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -164,9 +334,17 @@ func (m *Manager) CreateFiles(ctx context.Context, sources []Source, index uint6
 	for _, option := range m.bucket.SupportedObjectUploadOptions() {
 		conditional = conditional || option == objstore.IfNotExists
 	}
+	knownBlocks := make(map[string]int64)
+	if m.certified != nil {
+		for _, file := range m.certified.Files {
+			for _, block := range file.Blocks {
+				knownBlocks[block.Hash] = block.Size
+			}
+		}
+	}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, conditional)
+		file, err := m.uploadFile(ctx, source, conditional, knownBlocks)
 		if err != nil {
 			return nil, err
 		}
@@ -293,7 +471,7 @@ func (m *Manager) rememberCertified(root Checkpoint) {
 	m.sortRoots()
 }
 
-func (m *Manager) uploadFile(ctx context.Context, source Source, conditional bool) (File, error) {
+func (m *Manager) uploadFile(ctx context.Context, source Source, conditional bool, known map[string]int64) (File, error) {
 	input, err := os.Open(source.Path)
 	if err != nil {
 		return File{}, err
@@ -332,6 +510,9 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, conditional boo
 	file.Hash = fileDescriptorHash(file.Blocks)
 	if err := runParallel(ctx, len(uploads), func(ctx context.Context, index int) error {
 		upload := uploads[index]
+		if known[upload.block.Hash] == upload.block.Size {
+			return nil
+		}
 		reader := io.NewSectionReader(input, upload.offset, upload.block.Size)
 		key := m.key(blockKey(upload.hash))
 		var err error
@@ -538,6 +719,9 @@ func (m *Manager) Verify(ctx context.Context, index uint64, rootHash, state [32]
 			}
 		}
 	}
+	if len(pending) == 0 {
+		return nil
+	}
 	if err := runParallel(ctx, len(pending), func(ctx context.Context, blockIndex int) error {
 		block := pending[blockIndex]
 		r, err := m.bucket.Get(ctx, m.key(blockKey(block.hash)))
@@ -618,6 +802,14 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 	}
 	m.checkpoints = kept
 	live := map[[32]byte]struct{}{}
+	verifiedKeep := map[string]int64{}
+	for _, root := range kept {
+		for _, file := range root.Files {
+			for _, block := range file.Blocks {
+				verifiedKeep[block.Hash] = block.Size
+			}
+		}
+	}
 	for _, root := range append(append([]Checkpoint(nil), kept...), removed...) {
 		for _, file := range root.Files {
 			for _, block := range file.Blocks {
@@ -631,6 +823,9 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 		}
 	}
 	m.mu.Unlock()
+	if err := m.pruneVerifiedBlocks(verifiedKeep); err != nil {
+		return err
+	}
 	return m.bucket.IterWithAttributes(ctx, m.key("checkpoint/blocks"), func(attributes objstore.IterObjectAttributes) error {
 		hash, ok := parseBlockKey(attributes.Name)
 		if !ok {
@@ -655,6 +850,25 @@ func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct
 		}
 		return nil
 	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter())
+}
+
+func (m *Manager) pruneVerifiedBlocks(keep map[string]int64) error {
+	m.verifiedMu.Lock()
+	defer m.verifiedMu.Unlock()
+	if err := m.loadVerifiedBlocks(); err != nil {
+		return err
+	}
+	changed := false
+	for hash, size := range m.verified {
+		if keep[hash] != size {
+			delete(m.verified, hash)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return m.storeVerifiedBlocks()
 }
 
 func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) (Checkpoint, error) {

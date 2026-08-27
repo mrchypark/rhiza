@@ -51,35 +51,62 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 
 // Server is the HTTP server for client API.
 type Server struct {
-	core         *quepaxa.Core
-	material     *materializer.Materializer
-	cluster      types.ClusterID
-	mux          *http.ServeMux
-	ready        func() bool
-	writable     bool
-	sqlBatcher   *mutationBatcher[types.SQLCommand]
-	graphBatcher *mutationBatcher[types.GraphCommand]
-	transport    *Transport
-	members      []quepaxa.Member
-	hedgeDelay   time.Duration
-	applyMu      sync.Mutex
-	requestLocks [256]sync.Mutex
-	durability   func(context.Context, quepaxa.Slot) error
-	routeMu      sync.Mutex
-	routeBase    quepaxa.NodeID
-	routeFirst   quepaxa.NodeID
-	routeGen     uint64
-	proposeMu    sync.Mutex
-	inflight     map[[32]byte]*proposalCall
-	proposalCtx  context.Context
-	proposalStop context.CancelFunc
-	proposalWG   sync.WaitGroup
-	closeOnce    sync.Once
-	closing      bool
-	operationCap chan struct{}
-	operationB   int
-	objectStats  func() (map[string]uint64, bool)
-	syncLimit    chan struct{}
+	core              *quepaxa.Core
+	material          *materializer.Materializer
+	cluster           types.ClusterID
+	mux               *http.ServeMux
+	ready             func() bool
+	writable          bool
+	sqlBatcher        *mutationBatcher[types.SQLCommand]
+	graphBatcher      *mutationBatcher[types.GraphCommand]
+	kvBatcher         *mutationBatcher[types.KVCommand]
+	transport         *Transport
+	members           []quepaxa.Member
+	hedgeDelay        time.Duration
+	applyMu           sync.Mutex
+	requestLocks      [256]sync.Mutex
+	durability        func(context.Context, quepaxa.Slot) error
+	routeMu           sync.Mutex
+	routeBase         quepaxa.NodeID
+	routeFirst        quepaxa.NodeID
+	routeGen          uint64
+	proposeMu         sync.Mutex
+	inflight          map[[32]byte]*proposalCall
+	proposalCtx       context.Context
+	proposalStop      context.CancelFunc
+	proposalWG        sync.WaitGroup
+	closeOnce         sync.Once
+	closing           bool
+	operationCap      chan struct{}
+	localCap          chan struct{}
+	peerCap           chan struct{}
+	operationB        int
+	localB            int
+	peerB             int
+	peerCounts        map[quepaxa.NodeID]int
+	objectStats       func() (map[string]uint64, bool)
+	syncLimit         chan struct{}
+	checkpointPrepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
+}
+
+func (s *Server) SetCheckpointPrepare(prepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error) {
+	s.checkpointPrepare = prepare
+}
+
+func (s *Server) prepareCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+	if s.checkpointPrepare != nil {
+		return s.checkpointPrepare(ctx, sender, seal)
+	}
+	return s.core.PrepareCheckpoint(ctx, seal)
+}
+
+// ProposeControl commits an internal read barrier through the normal bounded
+// proposal lifecycle.
+func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	if barrier, err := types.DecodeReadBarrier(value); err != nil || !barrier {
+		return 0, fmt.Errorf("read barrier control value is required")
+	}
+	return s.proposeHedged(ctx, value)
 }
 
 func (s *Server) lockRequest(id string) func() {
@@ -111,7 +138,10 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		inflight:     make(map[[32]byte]*proposalCall),
 		proposalCtx:  proposalCtx,
 		proposalStop: proposalStop,
-		operationCap: make(chan struct{}, maxInflightBatches),
+		operationCap: make(chan struct{}, maxProposalOperations),
+		localCap:     make(chan struct{}, maxLocalProposals),
+		peerCap:      make(chan struct{}, maxPeerProposals),
+		peerCounts:   make(map[quepaxa.NodeID]int),
 		syncLimit:    make(chan struct{}, 2),
 	}
 	if len(ready) > 0 {
@@ -122,6 +152,7 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	} else {
 		s.sqlBatcher = newSQLBatcher(s.proposeHedged, nil)
 	}
+	s.kvBatcher = newKVBatcher(s.proposeHedged, nil)
 	s.routes()
 	return s
 }
@@ -139,6 +170,7 @@ func (s *Server) Close() {
 		if s.graphBatcher != nil {
 			s.graphBatcher.Close()
 		}
+		s.kvBatcher.Close()
 		s.proposalWG.Wait()
 	})
 }
@@ -228,31 +260,39 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 			}
 		}
 		select {
+		case s.localCap <- struct{}{}:
+		default:
+			return 0, ErrOverloaded
+		}
+		select {
 		case s.operationCap <- struct{}{}:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-s.proposalCtx.Done():
-			return 0, ErrNotReady
+		default:
+			<-s.localCap
+			return 0, ErrOverloaded
 		}
 		s.proposeMu.Lock()
 		if s.closing {
 			<-s.operationCap
+			<-s.localCap
 			s.proposeMu.Unlock()
 			return 0, ErrNotReady
 		}
 		if s.inflight[hash] != nil {
 			<-s.operationCap
+			<-s.localCap
 			s.proposeMu.Unlock()
 			continue
 		}
-		if len(value) > maxInflightEncodedByte-s.operationB {
+		if len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB {
 			<-s.operationCap
+			<-s.localCap
 			s.proposeMu.Unlock()
 			return 0, ErrOverloaded
 		}
 		call = &proposalCall{done: make(chan struct{})}
 		s.inflight[hash] = call
 		s.operationB += len(value)
+		s.localB += len(value)
 		s.proposalWG.Add(1)
 		go s.runProposal(hash, call, bytes.Clone(value))
 		s.proposeMu.Unlock()
@@ -281,7 +321,9 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 		delete(s.inflight, hash)
 	}
 	s.operationB -= len(value)
+	s.localB -= len(value)
 	<-s.operationCap
+	<-s.localCap
 	close(call.done)
 	s.proposeMu.Unlock()
 }
@@ -824,16 +866,9 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if req.TTLMS > 0 {
 		command.ExpiresAtUnixMS = now + req.TTLMS
 	}
-	value, err := types.EncodeKVCommand(command)
+	_, err := s.kvBatcher.submit(ctx, command)
 	if err != nil {
-		return KVMutationResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
-	if len(value) > quepaxa.MaxReplicatedValueBytes {
-		return KVMutationResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
-	}
-	slot, err := s.proposeHedged(ctx, value)
-	if err != nil {
-		return KVMutationResponse{}, commitUnknown(slot, req.RequestID, err)
+		return KVMutationResponse{}, err
 	}
 	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil || !matches {
 		return KVMutationResponse{}, ErrRequestConflict
@@ -961,6 +996,7 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -990,6 +1026,9 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.DecidedValue, error) {
+	if err := validateReplicatedMutation(value); err != nil {
+		return quepaxa.DecidedValue{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
 	if slot, ok := s.core.DecidedSlot(value); ok {
 		if decision, err := s.core.CompleteDecision(ctx, slot); err == nil {
 			if err := s.applyDecisions(ctx, slot); err != nil {
@@ -999,19 +1038,6 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 		} else if !errors.Is(err, quepaxa.ErrCompacted) {
 			return quepaxa.DecidedValue{}, err
 		}
-	}
-	if len(value) > quepaxa.MaxReplicatedValueBytes {
-		return quepaxa.DecidedValue{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
-	}
-	if _, sqlValue, err := types.DecodeSQLBatch(value); err != nil {
-		return quepaxa.DecidedValue{}, err
-	} else if sqlValue && materializer.GraphEnabled() {
-		return quepaxa.DecidedValue{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
-	}
-	if _, graphValue, err := types.DecodeGraphBatch(value); err != nil {
-		return quepaxa.DecidedValue{}, err
-	} else if graphValue && !materializer.GraphEnabled() {
-		return quepaxa.DecidedValue{}, fmt.Errorf("%w: graph commands require the graph build", ErrInvalidRequest)
 	}
 	slot, _, err := s.core.Propose(ctx, value)
 	if err != nil {
@@ -1025,6 +1051,124 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 		return quepaxa.DecidedValue{}, errors.New("decision unavailable")
 	}
 	return decision, nil
+}
+
+func (s *Server) proposePeer(ctx context.Context, sender quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
+	select {
+	case s.peerCap <- struct{}{}:
+	default:
+		return quepaxa.DecidedValue{}, ErrOverloaded
+	}
+	select {
+	case s.operationCap <- struct{}{}:
+	default:
+		<-s.peerCap
+		return quepaxa.DecidedValue{}, ErrOverloaded
+	}
+	s.proposeMu.Lock()
+	if s.closing || s.peerCounts[sender] >= 2 || len(value) > maxPeerEncodedByte-s.peerB || len(value) > maxProposalEncodedByte-s.operationB {
+		<-s.operationCap
+		<-s.peerCap
+		s.proposeMu.Unlock()
+		if s.closing {
+			return quepaxa.DecidedValue{}, ErrNotReady
+		}
+		return quepaxa.DecidedValue{}, ErrOverloaded
+	}
+	s.operationB += len(value)
+	s.peerB += len(value)
+	s.peerCounts[sender]++
+	s.proposalWG.Add(1)
+	s.proposeMu.Unlock()
+	defer func() {
+		s.proposeMu.Lock()
+		s.operationB -= len(value)
+		s.peerB -= len(value)
+		s.peerCounts[sender]--
+		if s.peerCounts[sender] == 0 {
+			delete(s.peerCounts, sender)
+		}
+		<-s.operationCap
+		<-s.peerCap
+		s.proposeMu.Unlock()
+		s.proposalWG.Done()
+	}()
+	operationCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(s.proposalCtx, cancel)
+	defer func() { stop(); cancel() }()
+	return s.proposeLocal(operationCtx, value)
+}
+
+func validateReplicatedMutation(value []byte) error {
+	if len(value) == 0 || len(value) > quepaxa.MaxReplicatedValueBytes {
+		return fmt.Errorf("encoded command must be between 1 and %d bytes", quepaxa.MaxReplicatedValueBytes)
+	}
+	if commands, ok, err := types.DecodeSQLBatch(value); err != nil {
+		return err
+	} else if ok {
+		if materializer.GraphEnabled() {
+			return fmt.Errorf("SQL is unavailable in the graph build")
+		}
+		for _, command := range commands {
+			if command.RequestID == "" {
+				return fmt.Errorf("request_id is required")
+			}
+			if err := materializer.ValidateSQLCommand(command); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if commands, ok, err := types.DecodeKVBatch(value); err != nil {
+		return err
+	} else if ok {
+		for _, command := range commands {
+			if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || command.TTLMS < 0 || len(command.Value) > 16<<20 {
+				return fmt.Errorf("invalid KV command")
+			}
+			switch command.Operation {
+			case "put", "delete", "cas":
+			default:
+				return fmt.Errorf("unsupported KV operation %q", command.Operation)
+			}
+		}
+		return nil
+	}
+	if commands, ok, err := types.DecodeGraphBatch(value); err != nil {
+		return err
+	} else if ok {
+		if !materializer.GraphEnabled() {
+			return fmt.Errorf("graph commands require the graph build")
+		}
+		for _, command := range commands {
+			if err := materializer.ValidateGraphCommand(command); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if command, ok, err := types.DecodeKVCommand(value); err != nil {
+		return err
+	} else if ok {
+		if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Key == "" || len(command.Key) > 1024 || command.ExpiresAtUnixMS < 0 {
+			return fmt.Errorf("invalid KV command")
+		}
+		switch command.Operation {
+		case "put", "delete", "cas":
+			return nil
+		default:
+			return fmt.Errorf("invalid KV operation")
+		}
+	}
+	if command, ok, err := types.DecodeNotifyCommand(value); err != nil {
+		return err
+	} else if ok {
+		if command.RequestID == "" || len(command.RequestID) > types.MaxRequestIDBytes || command.Topic == "" || len(command.Topic) > 256 || len(command.Payload) > 1<<20 {
+			return fmt.Errorf("invalid notification command")
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown replicated command")
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {

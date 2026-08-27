@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -319,7 +318,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 			}
 			return nil
 		}
-		_, err = tx.QueryContext(ctx, command.Cypher, args, MaxReturningRows)
+		_, err = tx.QueryContext(ctx, command.Cypher, args, MaxReturningRows, MaxResultBytes)
 		if err != nil {
 			return err
 		}
@@ -510,6 +509,9 @@ func pruneGraphRequests(tx *latticedb.Tx, slot uint64) error {
 }
 
 func knownNonGraphValue(value []byte) (bool, error) {
+	if _, ok, err := types.DecodeKVBatch(value); ok || err != nil {
+		return ok, err
+	}
 	if _, ok, err := types.DecodeKVCommand(value); ok || err != nil {
 		return ok, err
 	}
@@ -551,7 +553,7 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	var result latticedb.QueryResult
 	err = g.db.View(func(tx *latticedb.Tx) error {
 		var queryErr error
-		result, queryErr = tx.QueryContext(ctx, cypher, converted, MaxReturningRows)
+		result, queryErr = tx.QueryContext(ctx, cypher, converted, MaxReturningRows, MaxResultBytes)
 		return queryErr
 	})
 	g.mu.RUnlock()
@@ -575,14 +577,14 @@ func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult,
 		row := make([]any, len(result.Columns))
 		for i, column := range result.Columns {
 			value := source[column]
-			encoded, err := json.Marshal(value)
+			encodedBytes, err := encodedJSONSize(value)
 			if err != nil {
 				return types.GraphCommandResult{}, err
 			}
-			if len(encoded) > MaxCellBytes {
+			if encodedBytes > MaxCellBytes {
 				return types.GraphCommandResult{}, fmt.Errorf("graph result cell exceeds %d bytes", MaxCellBytes)
 			}
-			remaining -= len(encoded)
+			remaining -= encodedBytes
 			if remaining < 0 {
 				return types.GraphCommandResult{}, fmt.Errorf("graph result exceeds %d bytes", MaxResultBytes)
 			}

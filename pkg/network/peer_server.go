@@ -190,7 +190,7 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if len(request.Value) == 0 {
 			return nil, fmt.Errorf("value is required")
 		}
-		decision, err := s.server.proposeLocal(ctx, request.Value)
+		decision, err := s.server.proposePeer(ctx, member.ID, request.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -273,7 +273,7 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			}
 			return nil, err
 		}
-		if err := s.server.core.PrepareCheckpoint(ctx, seal); err != nil {
+		if err := s.server.prepareCheckpoint(ctx, quepaxa.NodeID(request.SenderId), seal); err != nil {
 			return nil, err
 		}
 		return &peerfb.ResponseT{}, nil

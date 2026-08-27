@@ -30,6 +30,18 @@ func TestNormalizeSQLArgsAcceptsGoIntegers(t *testing.T) {
 	}
 }
 
+func TestMaterializerCreatesKVExpiryIndex(t *testing.T) {
+	m, err := Open(t.TempDir()+"/index.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var name string
+	if err := m.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = '_rhiza_kv_expiry'`).Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMaterializerApply(t *testing.T) {
 	dir, err := os.MkdirTemp("", "materializer-test")
 	if err != nil {
@@ -215,6 +227,34 @@ func TestKVMutationPhysicallyPrunesExpiredRows(t *testing.T) {
 	var count int
 	if err := m.writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM _rhiza_kv WHERE key = 'expired'`).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("expired physical rows=%d err=%v", count, err)
+	}
+}
+
+func TestKVBatchAppliesAllCommands(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	commands := []types.KVCommand{
+		{RequestID: "batch-a", Operation: "put", Key: "a", Value: []byte("one"), ObservedAtUnixMS: 1},
+		{RequestID: "batch-b", Operation: "put", Key: "b", Value: []byte("two"), ObservedAtUnixMS: 1},
+	}
+	items := make([][]byte, len(commands))
+	for i := range commands {
+		items[i], err = types.EncodeKVBatchItem(commands[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.Apply(context.Background(), 1, types.AssembleKVBatch(items)); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		got, found, err := m.KVGet(context.Background(), command.Key, time.UnixMilli(1))
+		if err != nil || !found || string(got) != string(command.Value) {
+			t.Fatalf("key %q value=%q found=%v err=%v", command.Key, got, found, err)
+		}
 	}
 }
 
@@ -611,5 +651,67 @@ func TestApplyBatchAdvancesContiguousPage(t *testing.T) {
 	var count int
 	if err := m.queryRow(context.Background(), `SELECT COUNT(*) FROM batch_page`).Scan(&count); err != nil || count != 1 || m.Tip() != 2 {
 		t.Fatalf("count=%d tip=%d err=%v", count, m.Tip(), err)
+	}
+}
+
+func TestRecoverInterruptedRestore(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "materialized.db")
+	graphPath := filepath.Join(dir, "latticedb")
+	if err := os.WriteFile(dbPath, []byte("new-sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath+".restore-backup", []byte("old-sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(graphPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphPath, "value"), []byte("new-graph"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(graphPath+".restore-backup", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(graphPath+".restore-backup", "value"), []byte("old-graph"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRestoreState(dbPath, restoreState{Phase: "sqlite-installed", InstallGraph: true, GraphHadOriginal: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverRestore(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(dbPath); err != nil || string(data) != "old-sqlite" {
+		t.Fatalf("sqlite=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(graphPath, "value")); err != nil || string(data) != "old-graph" {
+		t.Fatalf("graph=%q err=%v", data, err)
+	}
+}
+
+func TestRecoverCommittedRestoreFinalizes(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "materialized.db")
+	if err := os.WriteFile(dbPath, []byte("new-sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath+".restore-backup", []byte("old-sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeRestoreState(dbPath, restoreState{Phase: "committed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverRestore(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(dbPath); err != nil || string(data) != "new-sqlite" {
+		t.Fatalf("sqlite=%q err=%v", data, err)
+	}
+	if _, err := os.Stat(dbPath + ".restore-backup"); !os.IsNotExist(err) {
+		t.Fatalf("backup remains: %v", err)
+	}
+	if _, err := os.Stat(restoreStatePath(dbPath)); !os.IsNotExist(err) {
+		t.Fatalf("journal remains: %v", err)
 	}
 }

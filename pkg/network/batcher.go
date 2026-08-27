@@ -20,7 +20,12 @@ const (
 	maxQueuedRequests      = 4096
 	maxQueuedEncodedBytes  = 8 << 20
 	maxInflightBatches     = 8
+	maxProposalOperations  = 12
+	maxLocalProposals      = 8
+	maxPeerProposals       = 4
 	maxInflightEncodedByte = 1 << 20
+	maxProposalEncodedByte = 2 << 20
+	maxPeerEncodedByte     = 1 << 20
 	batchItemOverhead      = 128
 )
 
@@ -83,6 +88,10 @@ func newSQLBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), 
 
 func newGraphBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.GraphCommand] {
 	return newMutationBatcher(propose, apply, types.EncodeGraphBatchItem, types.AssembleGraphBatch, func(command types.GraphCommand) string { return command.RequestID })
+}
+
+func newKVBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), apply func(context.Context, quepaxa.Slot) error) *mutationBatcher[types.KVCommand] {
+	return newMutationBatcher(propose, apply, types.EncodeKVBatchItem, types.AssembleKVBatch, func(command types.KVCommand) string { return command.RequestID })
 }
 
 func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slot, error) {

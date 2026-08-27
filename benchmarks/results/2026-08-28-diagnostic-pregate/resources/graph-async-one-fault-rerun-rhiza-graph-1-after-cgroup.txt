@@ -1,0 +1,11 @@
+usage_usec 5156785
+user_usec 3285304
+system_usec 1871480
+nice_usec 0
+nr_periods 143
+nr_throttled 3
+throttled_usec 243807
+nr_bursts 0
+burst_usec 0
+67301376
+75227136

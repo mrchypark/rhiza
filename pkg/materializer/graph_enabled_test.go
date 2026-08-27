@@ -153,6 +153,50 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	}
 }
 
+func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	stopWrites := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		for slot := uint64(1); ; slot++ {
+			select {
+			case <-stopWrites:
+				done <- nil
+				return
+			default:
+			}
+			value, encodeErr := types.EncodeKVCommand(types.KVCommand{RequestID: fmt.Sprintf("write-%d", slot), Operation: "put", Key: "active", Value: []byte("1")})
+			if encodeErr != nil {
+				done <- encodeErr
+				return
+			}
+			if applyErr := m.Apply(ctx, slot, value); applyErr != nil {
+				done <- applyErr
+				return
+			}
+		}
+	}()
+	deadline, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	files, index, cleanup, err := m.CheckpointFilesAt(deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	if index == 0 || len(files) != 2 {
+		t.Fatalf("checkpoint index=%d files=%d", index, len(files))
+	}
+	close(stopWrites)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFailedGraphCommandRecordsResultAndAdvancesTip(t *testing.T) {
 	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
 	if err != nil {

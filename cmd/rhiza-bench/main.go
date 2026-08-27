@@ -18,14 +18,15 @@ import (
 )
 
 type result struct {
-	Requests   int     `json:"requests"`
-	Errors     uint64  `json:"errors"`
-	DurationMS float64 `json:"duration_ms"`
-	OpsPerSec  float64 `json:"ops_per_sec"`
-	P50MS      float64 `json:"p50_ms"`
-	P95MS      float64 `json:"p95_ms"`
-	P99MS      float64 `json:"p99_ms"`
-	MaxMS      float64 `json:"max_ms"`
+	Requests   int               `json:"requests"`
+	Errors     uint64            `json:"errors"`
+	DurationMS float64           `json:"duration_ms"`
+	OpsPerSec  float64           `json:"ops_per_sec"`
+	P50MS      float64           `json:"p50_ms"`
+	P95MS      float64           `json:"p95_ms"`
+	P99MS      float64           `json:"p99_ms"`
+	MaxMS      float64           `json:"max_ms"`
+	ErrorKinds map[string]uint64 `json:"error_kinds,omitempty"`
 }
 
 func main() {
@@ -47,6 +48,8 @@ func main() {
 	jobs := make(chan int)
 	latencies := make([]time.Duration, *requests)
 	var failures atomic.Uint64
+	var transportFailures atomic.Uint64
+	var statuses [600]atomic.Uint64
 	var workers sync.WaitGroup
 	ctx := context.Background()
 	started := time.Now()
@@ -64,6 +67,7 @@ func main() {
 				request, err := http.NewRequestWithContext(ctx, method, *baseURL+*requestPath, reader)
 				if err != nil {
 					failures.Add(1)
+					transportFailures.Add(1)
 					continue
 				}
 				if payload != "" {
@@ -80,6 +84,9 @@ func main() {
 				response.Body.Close()
 				if copyErr != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 					failures.Add(1)
+					if response.StatusCode >= 0 && response.StatusCode < len(statuses) {
+						statuses[response.StatusCode].Add(1)
+					}
 				}
 			}
 		}()
@@ -95,10 +102,19 @@ func main() {
 		index := int(float64(len(latencies)-1) * q)
 		return float64(latencies[index]) / float64(time.Millisecond)
 	}
+	errorKinds := make(map[string]uint64)
+	if count := transportFailures.Load(); count != 0 {
+		errorKinds["transport"] = count
+	}
+	for status := range statuses {
+		if count := statuses[status].Load(); count != 0 {
+			errorKinds["http_"+strconv.Itoa(status)] = count
+		}
+	}
 	output := result{
 		Requests: *requests, Errors: failures.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
 		OpsPerSec: float64(*requests) / duration.Seconds(), P50MS: quantile(.50), P95MS: quantile(.95),
-		P99MS: quantile(.99), MaxMS: float64(latencies[len(latencies)-1]) / float64(time.Millisecond),
+		P99MS: quantile(.99), MaxMS: float64(latencies[len(latencies)-1]) / float64(time.Millisecond), ErrorKinds: errorKinds,
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fmt.Fprintln(os.Stderr, err)

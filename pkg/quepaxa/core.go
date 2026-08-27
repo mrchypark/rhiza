@@ -291,6 +291,8 @@ func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
 		id  NodeID
 		err error
 	}
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	results := make(chan result, len(c.config.Members))
 	for _, member := range c.config.Members {
 		if member.ID == c.nodeID {
@@ -298,7 +300,7 @@ func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
 			continue
 		}
 		go func(id NodeID) {
-			tip, err := transport.ReadTip(ctx, id)
+			tip, err := transport.ReadTip(readCtx, id)
 			results <- result{tip: tip, id: id, err: err}
 		}(member.ID)
 	}
@@ -857,7 +859,7 @@ func (c *Core) validateCheckpointValue(ctx context.Context, hash ValueHash) erro
 func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Context, CheckpointSeal) error, error) {
 	c.mu.RLock()
 	prefix, prefixOK := c.prefixes[seal.Index]
-	preparedRoot, prepared := c.preparedCheckpoints[seal.Index]
+	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
 	validator := c.checkpointValidator
 	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
 	tip := c.tip
@@ -865,10 +867,16 @@ func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Conte
 	if seal.ConfigID != c.config.ConfigID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
 		return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix")
 	}
-	if prepared && preparedRoot != seal.RootHash {
-		return false, nil, fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+	if prepared && seal.Index < preparedIndex {
+		return false, nil, fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
 	}
-	return prepared, validator, nil
+	if prepared && seal.Index == preparedIndex {
+		if preparedRoot != seal.RootHash {
+			return false, nil, fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+		}
+		return true, validator, nil
+	}
+	return false, validator, nil
 }
 
 // RequirePreparedCheckpoint is the bounded Record-path check. Full object
@@ -913,6 +921,7 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 		return err
 	}
 	c.mu.Lock()
+	clear(c.preparedCheckpoints)
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
 	c.mu.Unlock()
 	return nil
@@ -1571,7 +1580,7 @@ func (c *Core) recover() error {
 			c.mu.RUnlock()
 			return err
 		}
-		decision.Proposal.Value = append([]byte(nil), value.Value...)
+		decision.Proposal.Value = value.Value
 		recovered = append(recovered, decision)
 	}
 	c.mu.RUnlock()

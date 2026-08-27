@@ -11,7 +11,7 @@ require (
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
 )
 
-replace github.com/jeffhajewski/latticedb/bindings/go => github.com/mrchypark/latticedb/bindings/go v0.0.0-20260827204440-4f64f6502f46
+replace github.com/jeffhajewski/latticedb/bindings/go => github.com/mrchypark/latticedb/bindings/go v0.0.0-20260827215024-5c24ede6fae4
 
 require (
 	cloud.google.com/go v0.121.0 // indirect

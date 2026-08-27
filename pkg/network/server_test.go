@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -500,7 +499,7 @@ func TestCancelledKVRequestStillMaterializes(t *testing.T) {
 	}
 }
 
-func TestKVAdmissionBackpressuresBeyondBackgroundLimit(t *testing.T) {
+func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}}
 	core := mustCore(t, "n1", members, nil, nil)
 	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
@@ -511,7 +510,7 @@ func TestKVAdmissionBackpressuresBeyondBackgroundLimit(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil, members, 0)
 	defer server.Close()
 	release := make(chan struct{})
-	entered := make(chan struct{}, maxInflightBatches)
+	entered := make(chan struct{}, maxLocalProposals)
 	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
 		entered <- struct{}{}
 		select {
@@ -521,30 +520,85 @@ func TestKVAdmissionBackpressuresBeyondBackgroundLimit(t *testing.T) {
 			return ctx.Err()
 		}
 	})
-	errs := make(chan error, maxInflightBatches)
-	for i := range maxInflightBatches {
+	errs := make(chan error, maxLocalProposals)
+	for i := range maxLocalProposals {
 		go func(i int) {
-			_, err := server.KVPut(context.Background(), KVMutationRequest{RequestID: fmt.Sprintf("bounded-%d", i), Key: fmt.Sprintf("key-%d", i), Value: []byte("value")})
+			var nonce [types.ReadBarrierNonceSize]byte
+			nonce[0] = byte(i + 1)
+			_, err := server.proposeHedged(context.Background(), types.EncodeReadBarrier(nonce))
 			errs <- err
 		}(i)
 	}
-	for range maxInflightBatches {
+	for range maxLocalProposals {
 		select {
 		case <-entered:
 		case <-time.After(5 * time.Second):
 			t.Fatal("background operations did not reach durability barrier")
 		}
 	}
-	overflowCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if _, err := server.KVPut(overflowCtx, KVMutationRequest{RequestID: "overflow", Key: "overflow", Value: []byte("value")}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("backpressure error=%v, want deadline exceeded", err)
+	if _, err := server.proposeHedged(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{255})); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("overflow error=%v, want ErrOverloaded", err)
 	}
 	close(release)
-	for range maxInflightBatches {
+	for range maxLocalProposals {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestPeerProposalUsesAdmissionAndSemanticValidation(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	invalid, err := types.EncodeKVCommand(types.KVCommand{RequestID: "bad", Operation: "unknown", Key: "key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.proposePeer(context.Background(), "n2", invalid); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("invalid peer proposal error=%v", err)
+	}
+	valid, err := types.EncodeKVCommand(types.KVCommand{RequestID: "valid", Operation: "put", Key: "key", Value: []byte("value")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range maxLocalProposals {
+		server.localCap <- struct{}{}
+		server.operationCap <- struct{}{}
+	}
+	if _, err := server.proposePeer(context.Background(), "n2", valid); err != nil {
+		t.Fatalf("reserved peer capacity failed: %v", err)
+	}
+	for range maxLocalProposals {
+		<-server.localCap
+		<-server.operationCap
+	}
+	server.proposeMu.Lock()
+	server.peerCounts["n2"] = 2
+	server.proposeMu.Unlock()
+	if _, err := server.proposePeer(context.Background(), "n2", valid); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("per-peer admission error=%v", err)
+	}
+	if _, err := server.proposePeer(context.Background(), "n3", valid); err != nil {
+		t.Fatalf("independent peer capacity failed: %v", err)
+	}
+	server.proposeMu.Lock()
+	delete(server.peerCounts, "n2")
+	server.proposeMu.Unlock()
+	for range maxPeerProposals {
+		server.peerCap <- struct{}{}
+	}
+	if _, err := server.proposePeer(context.Background(), "n2", valid); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("peer admission error=%v", err)
+	}
+	for range maxPeerProposals {
+		<-server.peerCap
 	}
 }
 
@@ -579,8 +633,8 @@ func TestServerCloseCancelsAndWaitsForInflightMutation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server close did not wait for and cancel mutation")
 	}
-	if err := <-result; !errors.Is(err, ErrDurabilityUnavailable) {
-		t.Fatalf("mutation error=%v, want durability unavailable", err)
+	if err := <-result; !errors.Is(err, ErrNotReady) && !errors.Is(err, ErrCommitUnknown) {
+		t.Fatalf("mutation error=%v, want not ready or commit unknown", err)
 	}
 }
 

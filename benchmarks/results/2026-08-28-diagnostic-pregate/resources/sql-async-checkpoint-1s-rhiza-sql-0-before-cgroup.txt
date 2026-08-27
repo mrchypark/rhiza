@@ -1,0 +1,11 @@
+usage_usec 79683
+user_usec 7503
+system_usec 72180
+nice_usec 0
+nr_periods 15
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+18767872
+24580096

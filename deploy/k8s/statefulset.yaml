@@ -50,6 +50,8 @@ spec:
                 # are optional when workload identity targets AWS S3 directly.
                 name: rhiza-object-store
           env:
+            - name: RHIZA_MAX_WAL_BYTES
+              value: "4294967296"
             - name: RHIZA_NODE_ID
               valueFrom:
                 fieldRef:

@@ -64,6 +64,12 @@ type snapshotParts struct {
 	cleanup    func()
 }
 
+type restoreState struct {
+	Phase            string `json:"phase"`
+	InstallGraph     bool   `json:"install_graph"`
+	GraphHadOriginal bool   `json:"graph_had_original"`
+}
+
 type CheckpointRole string
 
 const (
@@ -78,6 +84,13 @@ type CheckpointFile struct {
 
 // Open opens or creates a materializer.
 func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
+	if err := recoverRestore(dbPath); err != nil {
+		return nil, fmt.Errorf("recover interrupted restore: %w", err)
+	}
+	return openMaterializer(dbPath, readerCount, idempotencyWindow...)
+}
+
+func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
 	if readerCount < 1 {
 		return nil, fmt.Errorf("reader count must be positive")
 	}
@@ -257,6 +270,8 @@ func (m *Materializer) initSchema() error {
 			value BLOB NOT NULL,
 			expires_at_unix_ms INTEGER NOT NULL DEFAULT 0
 		);
+		CREATE INDEX IF NOT EXISTS _rhiza_kv_expiry
+		ON _rhiza_kv(expires_at_unix_ms) WHERE expires_at_unix_ms > 0;
 		CREATE TABLE IF NOT EXISTS _rhiza_idempotency (
 			kind INTEGER NOT NULL,
 			request_id BLOB NOT NULL,
@@ -437,6 +452,10 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 	if err != nil {
 		return fmt.Errorf("decode KV command: %w", err)
 	}
+	kvCommands, kvBatch, err := types.DecodeKVBatch(value)
+	if err != nil {
+		return fmt.Errorf("decode KV batch: %w", err)
+	}
 	commands, batched, err := types.DecodeSQLBatch(value)
 	if err != nil {
 		return fmt.Errorf("decode SQL batch: %w", err)
@@ -460,7 +479,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		commands = nil
 		batched = true
 	}
-	mutatesState := graph || notify || kv || len(commands) != 0 || !batched
+	mutatesState := graph || notify || kv || kvBatch || len(commands) != 0 || !batched
 	publish := false
 	if notify {
 		if notifyCommand.RequestID == "" || len(notifyCommand.RequestID) > types.MaxRequestIDBytes || notifyCommand.Topic == "" || len(notifyCommand.Topic) > 256 || len(notifyCommand.Payload) > 1<<20 {
@@ -488,6 +507,14 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 	} else if kv {
 		if err := m.applyKV(ctx, tx, slot, kvCommand); err != nil {
 			return err
+		}
+		commands = nil
+		batched = true
+	} else if kvBatch {
+		for _, command := range kvCommands {
+			if err := m.applyKV(ctx, tx, slot, command); err != nil {
+				return err
+			}
 		}
 		commands = nil
 		batched = true
@@ -758,11 +785,11 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 		statementResult.LastInsertID, _ = execResult.LastInsertId()
 		result.Statements = append(result.Statements, statementResult)
 	}
-	encoded, err := json.Marshal(result)
+	encodedBytes, err := encodedJSONSize(result)
 	if err != nil {
 		return result, err
 	}
-	if len(encoded) > MaxResultBytes {
+	if encodedBytes > MaxResultBytes {
 		return result, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
 	}
 	return result, nil
@@ -826,6 +853,21 @@ func NormalizeSQLArgs(args []any) ([]any, error) {
 type resultBudget struct {
 	rows  int
 	bytes int
+}
+
+type countingWriter int
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	*w += countingWriter(len(p))
+	return len(p), nil
+}
+
+func encodedJSONSize(value any) (int, error) {
+	var size countingWriter
+	if err := json.NewEncoder(&size).Encode(value); err != nil {
+		return 0, err
+	}
+	return int(size) - 1, nil
 }
 
 func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
@@ -918,11 +960,11 @@ func (m *Materializer) QueryResult(ctx context.Context, query string, args []any
 	if err != nil {
 		return types.SQLStatementResult{}, err
 	}
-	encoded, err := json.Marshal(result)
+	encodedBytes, err := encodedJSONSize(result)
 	if err != nil {
 		return types.SQLStatementResult{}, err
 	}
-	if len(encoded) > MaxResultBytes {
+	if encodedBytes > MaxResultBytes {
 		return types.SQLStatementResult{}, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
 	}
 	return result, nil
@@ -1051,16 +1093,18 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	_ = graph.Close()
 	_ = os.Remove(graphPath)
 	paths = append(paths, graphPath)
+	// LatticeDB only exposes a bounded file backup, not an online snapshot
+	// handle. Hold the materializer lock across both backups so a checkpoint
+	// always makes progress and both files describe the same applied slot.
+	m.mu.Lock()
 	index, err := m.backupSQLite(ctx, sqlitePath)
-	if err == nil {
-		m.mu.Lock()
-		if m.tip == index && m.graphTip() == index {
-			err = m.backupGraph(graphPath)
-		} else {
-			err = fmt.Errorf("checkpoint state advanced during SQLite backup")
-		}
-		m.mu.Unlock()
+	if err == nil && (m.tip != index || m.graphTip() != index) {
+		err = fmt.Errorf("checkpoint stores disagree at slot %d", index)
 	}
+	if err == nil {
+		err = m.backupGraph(graphPath)
+	}
+	m.mu.Unlock()
 	if err != nil {
 		cleanup()
 		return nil, 0, nil, err
@@ -1168,6 +1212,98 @@ func copyFile(sourcePath, targetPath string) error {
 	return err
 }
 
+func restoreStatePath(dbPath string) string { return dbPath + ".restore-state.json" }
+
+func syncDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func writeRestoreState(dbPath string, state restoreState) error {
+	dir := filepath.Dir(dbPath)
+	file, err := os.CreateTemp(dir, ".rhiza-restore-state-*")
+	if err != nil {
+		return err
+	}
+	name := file.Name()
+	defer os.Remove(name)
+	if err = file.Chmod(0o600); err == nil {
+		err = json.NewEncoder(file).Encode(state)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(name, restoreStatePath(dbPath)); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+func recoverRestore(dbPath string) error {
+	journal := restoreStatePath(dbPath)
+	data, err := os.ReadFile(journal)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var state restoreState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("decode restore journal: %w", err)
+	}
+	dir := filepath.Dir(dbPath)
+	backupPath := dbPath + ".restore-backup"
+	graphPath := filepath.Join(dir, "latticedb")
+	graphBackupPath := graphPath + ".restore-backup"
+	if state.Phase != "committed" {
+		if _, err := os.Stat(backupPath); err == nil {
+			_ = os.Remove(dbPath)
+			if err := os.Rename(backupPath, dbPath); err != nil {
+				return fmt.Errorf("rollback SQLite restore: %w", err)
+			}
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if state.InstallGraph {
+			if state.GraphHadOriginal {
+				if _, err := os.Stat(graphBackupPath); err == nil {
+					_ = os.RemoveAll(graphPath)
+					if err := os.Rename(graphBackupPath, graphPath); err != nil {
+						return fmt.Errorf("rollback graph restore: %w", err)
+					}
+				} else if !os.IsNotExist(err) {
+					return err
+				}
+			} else {
+				_ = os.RemoveAll(graphPath)
+			}
+		}
+	}
+	_ = os.Remove(backupPath)
+	_ = os.RemoveAll(graphBackupPath)
+	if err := syncDirectory(dir); err != nil {
+		return err
+	}
+	if err := os.Remove(journal); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
 func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1214,15 +1350,38 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	backupPath := m.dbPath + ".restore-backup"
 	graphPath := filepath.Join(dir, "latticedb")
 	graphBackupPath := graphPath + ".restore-backup"
-	os.Remove(backupPath)
-	os.RemoveAll(graphBackupPath)
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		return fmt.Errorf("stale SQLite restore backup exists")
+	}
+	if _, err := os.Stat(graphBackupPath); !os.IsNotExist(err) {
+		return fmt.Errorf("stale graph restore backup exists")
+	}
+	_, graphStatErr := os.Stat(graphPath)
+	state := restoreState{Phase: "prepared", InstallGraph: parts.graphDir != "", GraphHadOriginal: graphStatErr == nil}
+	if graphStatErr != nil && !os.IsNotExist(graphStatErr) {
+		return graphStatErr
+	}
+	if err := writeRestoreState(m.dbPath, state); err != nil {
+		return fmt.Errorf("prepare restore journal: %w", err)
+	}
 	if err := m.closeConnections(); err != nil {
+		_ = recoverRestore(m.dbPath)
 		return err
 	}
 	os.Remove(m.dbPath + "-wal")
 	os.Remove(m.dbPath + "-shm")
 	if err := os.Rename(m.dbPath, backupPath); err != nil && !os.IsNotExist(err) {
+		_ = recoverRestore(m.dbPath)
 		return fmt.Errorf("backup database: %w", err)
+	}
+	if err := syncDirectory(dir); err != nil {
+		_ = recoverRestore(m.dbPath)
+		return err
+	}
+	state.Phase = "sqlite-backed-up"
+	if err := writeRestoreState(m.dbPath, state); err != nil {
+		_ = recoverRestore(m.dbPath)
+		return err
 	}
 	graphBackedUp := false
 	graphInstalled := false
@@ -1231,6 +1390,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			graphBackedUp = true
 		} else if !os.IsNotExist(err) {
 			_ = os.Rename(backupPath, m.dbPath)
+			_ = recoverRestore(m.dbPath)
 			return fmt.Errorf("backup graph database: %w", err)
 		}
 		if err := os.Rename(parts.graphDir, graphPath); err != nil {
@@ -1238,9 +1398,19 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 				_ = os.Rename(graphBackupPath, graphPath)
 			}
 			_ = os.Rename(backupPath, m.dbPath)
+			_ = recoverRestore(m.dbPath)
 			return fmt.Errorf("install graph snapshot: %w", err)
 		}
 		graphInstalled = true
+		if err := syncDirectory(dir); err != nil {
+			_ = recoverRestore(m.dbPath)
+			return err
+		}
+		state.Phase = "graph-installed"
+		if err := writeRestoreState(m.dbPath, state); err != nil {
+			_ = recoverRestore(m.dbPath)
+			return err
+		}
 	}
 	if err := os.Rename(tempPath, m.dbPath); err != nil {
 		if graphInstalled {
@@ -1250,12 +1420,22 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			_ = os.Rename(graphBackupPath, graphPath)
 		}
 		_ = os.Rename(backupPath, m.dbPath)
+		_ = recoverRestore(m.dbPath)
 		if reopenErr := m.reopen(); reopenErr != nil {
 			return fmt.Errorf("install snapshot: %w; reopen original: %v", err, reopenErr)
 		}
 		return fmt.Errorf("install snapshot: %w", err)
 	}
-	restored, err := Open(m.dbPath, m.readersN, m.idempotencyWindow)
+	if err := syncDirectory(dir); err != nil {
+		_ = recoverRestore(m.dbPath)
+		return err
+	}
+	state.Phase = "sqlite-installed"
+	if err := writeRestoreState(m.dbPath, state); err != nil {
+		_ = recoverRestore(m.dbPath)
+		return err
+	}
+	restored, err := openMaterializer(m.dbPath, m.readersN, m.idempotencyWindow)
 	if err == nil {
 		err = restored.validateRestoredSnapshot()
 	}
@@ -1271,13 +1451,25 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			_ = os.Rename(graphBackupPath, graphPath)
 		}
 		_ = os.Rename(backupPath, m.dbPath)
+		_ = recoverRestore(m.dbPath)
 		if reopenErr := m.reopen(); reopenErr != nil {
 			return fmt.Errorf("open restored snapshot: %w; reopen original: %v", err, reopenErr)
 		}
 		return fmt.Errorf("open restored snapshot: %w", err)
 	}
-	os.Remove(backupPath)
-	os.RemoveAll(graphBackupPath)
+	state.Phase = "committed"
+	if err := writeRestoreState(m.dbPath, state); err != nil {
+		_ = restored.Close()
+		_ = recoverRestore(m.dbPath)
+		if reopenErr := m.reopen(); reopenErr != nil {
+			return fmt.Errorf("commit restore journal: %w; reopen original: %v", err, reopenErr)
+		}
+		return fmt.Errorf("commit restore journal: %w", err)
+	}
+	if err := recoverRestore(m.dbPath); err != nil {
+		_ = restored.Close()
+		return fmt.Errorf("finalize restore: %w", err)
+	}
 	m.db, m.writer, m.readers, m.graph = restored.db, restored.writer, restored.readers, restored.graph
 	m.tip, m.stateTip, m.tipHash = restored.tip, restored.stateTip, restored.tipHash
 	restored.db, restored.writer, restored.readers, restored.graph = nil, nil, nil, nil
