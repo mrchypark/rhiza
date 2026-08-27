@@ -1,0 +1,722 @@
+[
+  {
+    "config": "graph-engine-graph-async",
+    "workload": "graph_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 3834.341125992615,
+      "p50_ms": 3.188583,
+      "p95_ms": 7.061083,
+      "p99_ms": 54.1115,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 2859.8075849961624,
+      "p50_ms": 4.494459,
+      "p95_ms": 10.497708,
+      "p99_ms": 26.62425,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -25.41593220254159,
+      "p50_ms": 40.95474384703175,
+      "p95_ms": 48.66994199048502,
+      "p99_ms": -50.79742753388836
+    }
+  },
+  {
+    "config": "graph-engine-graph-async",
+    "workload": "graph_read_local",
+    "goraph": {
+      "ops_per_sec": 5148.387255078798,
+      "p50_ms": 2.017584,
+      "p95_ms": 4.853417,
+      "p99_ms": 19.930333,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 3448.0519289309327,
+      "p50_ms": 2.678459,
+      "p95_ms": 9.489583,
+      "p99_ms": 64.916125,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -33.02656233698258,
+      "p50_ms": 32.75576134624385,
+      "p95_ms": 95.5237516166445,
+      "p99_ms": 225.71520505954413
+    }
+  },
+  {
+    "config": "graph-engine-graph-async",
+    "workload": "graph_write",
+    "goraph": {
+      "ops_per_sec": 589.6397327177243,
+      "p50_ms": 18.149958,
+      "p95_ms": 48.849209,
+      "p99_ms": 50.505917,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 863.6834057233898,
+      "p50_ms": 15.341834,
+      "p95_ms": 28.132708,
+      "p99_ms": 34.987334,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 46.47645974306436,
+      "p50_ms": -15.47179337825465,
+      "p95_ms": -42.40908179291092,
+      "p99_ms": -30.726267181724477
+    }
+  },
+  {
+    "config": "graph-engine-graph-async",
+    "workload": "kv_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 2744.8613621992104,
+      "p50_ms": 5.061791,
+      "p95_ms": 11.950042,
+      "p99_ms": 17.2135,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 3974.057353595727,
+      "p50_ms": 3.438875,
+      "p95_ms": 7.689833,
+      "p99_ms": 14.447625,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 44.781714964710375,
+      "p50_ms": -32.06209027595174,
+      "p95_ms": -35.65015922119772,
+      "p99_ms": -16.06805704824701
+    }
+  },
+  {
+    "config": "graph-engine-graph-async",
+    "workload": "kv_read_local",
+    "goraph": {
+      "ops_per_sec": 3598.125907485584,
+      "p50_ms": 3.7535,
+      "p95_ms": 7.00675,
+      "p99_ms": 19.194125,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 7046.388709227507,
+      "p50_ms": 1.864916,
+      "p95_ms": 4.141,
+      "p99_ms": 9.644375,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 95.83496771383449,
+      "p50_ms": -50.31527907286532,
+      "p95_ms": -40.89984657651551,
+      "p99_ms": -49.75350530435745
+    }
+  },
+  {
+    "config": "graph-engine-graph-async",
+    "workload": "kv_write",
+    "goraph": {
+      "ops_per_sec": 216.50305350494085,
+      "p50_ms": 67.153792,
+      "p95_ms": 123.834542,
+      "p99_ms": 175.046584,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 512.3405758155769,
+      "p50_ms": 26.878708,
+      "p95_ms": 42.8225,
+      "p99_ms": 53.934167,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 136.64357962687336,
+      "p50_ms": -59.97440025427008,
+      "p95_ms": -65.41958381854394,
+      "p99_ms": -69.1886777979055
+    }
+  },
+  {
+    "config": "graph-engine-graph-async-one-fault",
+    "workload": "graph_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 2683.954612373586,
+      "p50_ms": 4.093542,
+      "p95_ms": 13.173667,
+      "p99_ms": 20.840375,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 2652.2592971117147,
+      "p50_ms": 3.283875,
+      "p95_ms": 15.473875,
+      "p99_ms": 47.118292,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -1.1809184520389926,
+      "p50_ms": -19.77913015183428,
+      "p95_ms": 17.460650857502323,
+      "p99_ms": 126.09138271264308
+    }
+  },
+  {
+    "config": "graph-engine-graph-async-one-fault",
+    "workload": "graph_read_local",
+    "goraph": {
+      "ops_per_sec": 3184.833395329831,
+      "p50_ms": 3.842875,
+      "p95_ms": 8.824042,
+      "p99_ms": 43.48625,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 4818.309568651581,
+      "p50_ms": 2.40575,
+      "p95_ms": 7.943042,
+      "p99_ms": 13.932792,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 51.28921894994705,
+      "p50_ms": -37.397131054223735,
+      "p95_ms": -9.984086657792425,
+      "p99_ms": -67.96046566443417
+    }
+  },
+  {
+    "config": "graph-engine-graph-async-one-fault",
+    "workload": "graph_write",
+    "goraph": {
+      "ops_per_sec": 531.2728221522576,
+      "p50_ms": 21.283708,
+      "p95_ms": 74.085917,
+      "p99_ms": 74.435458,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 616.5109334360851,
+      "p50_ms": 16.814167,
+      "p95_ms": 56.014209,
+      "p99_ms": 60.524666,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 16.044131702148135,
+      "p50_ms": -20.99982296317916,
+      "p95_ms": -24.392905874405248,
+      "p99_ms": -18.688394447710653
+    }
+  },
+  {
+    "config": "graph-engine-graph-async-one-fault",
+    "workload": "kv_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 1672.899729344564,
+      "p50_ms": 7.078833,
+      "p95_ms": 22.139042,
+      "p99_ms": 39.823917,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 5196.034482090303,
+      "p50_ms": 2.621333,
+      "p95_ms": 5.253666,
+      "p99_ms": 12.242917,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 210.60047359360206,
+      "p50_ms": -62.969418829346594,
+      "p95_ms": -76.26967779364617,
+      "p99_ms": -69.25737616417793
+    }
+  },
+  {
+    "config": "graph-engine-graph-async-one-fault",
+    "workload": "kv_read_local",
+    "goraph": {
+      "ops_per_sec": 3227.4874311795593,
+      "p50_ms": 3.90325,
+      "p95_ms": 10.532208,
+      "p99_ms": 30.01775,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 8071.806793232598,
+      "p50_ms": 1.64275,
+      "p95_ms": 3.409,
+      "p99_ms": 12.347333,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 150.09568481208836,
+      "p50_ms": -57.91327739704093,
+      "p95_ms": -67.6326179657675,
+      "p99_ms": -58.86656061830083
+    }
+  },
+  {
+    "config": "graph-engine-graph-async-one-fault",
+    "workload": "kv_write",
+    "goraph": {
+      "ops_per_sec": 302.3881862983377,
+      "p50_ms": 38.374625,
+      "p95_ms": 91.697708,
+      "p99_ms": 101.231292,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 471.6807767140936,
+      "p50_ms": 22.684875,
+      "p95_ms": 60.576375,
+      "p99_ms": 66.249916,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 55.98518661993328,
+      "p50_ms": -40.885741554477725,
+      "p95_ms": -33.939052217095764,
+      "p99_ms": -34.55589206546924
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack",
+    "workload": "graph_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 3152.7462159857146,
+      "p50_ms": 4.2055,
+      "p95_ms": 10.537,
+      "p99_ms": 39.998083,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 2476.0601137478247,
+      "p50_ms": 4.023208,
+      "p95_ms": 15.264125,
+      "p99_ms": 45.907,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -21.463386390151364,
+      "p50_ms": -4.33460944001901,
+      "p95_ms": 44.86215241529845,
+      "p99_ms": 14.773000496048772
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack",
+    "workload": "graph_read_local",
+    "goraph": {
+      "ops_per_sec": 3911.292542239163,
+      "p50_ms": 3.223,
+      "p95_ms": 7.92325,
+      "p99_ms": 23.9895,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 3304.1057644255193,
+      "p50_ms": 2.266334,
+      "p95_ms": 11.510292,
+      "p99_ms": 36.476417,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -15.523941798176965,
+      "p50_ms": -29.68246974868135,
+      "p95_ms": 45.272356671820255,
+      "p99_ms": 52.0515934054482
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack",
+    "workload": "graph_write",
+    "goraph": {
+      "ops_per_sec": 299.3586241477634,
+      "p50_ms": 49.853291,
+      "p95_ms": 91.356333,
+      "p99_ms": 91.662292,
+      "uploads": 28,
+      "gets": 14,
+      "heads": 14,
+      "s3_http_requests": 56
+    },
+    "lattice": {
+      "ops_per_sec": 419.16389495239736,
+      "p50_ms": 34.183541,
+      "p95_ms": 53.330583,
+      "p99_ms": 72.293542,
+      "uploads": 38,
+      "gets": 19,
+      "heads": 19,
+      "s3_http_requests": 76
+    },
+    "delta_percent": {
+      "ops_per_sec": 40.02065119911096,
+      "p50_ms": -31.431726342800527,
+      "p95_ms": -41.62355115545192,
+      "p99_ms": -21.130553881415047
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack",
+    "workload": "kv_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 1328.1139200021046,
+      "p50_ms": 8.634666,
+      "p95_ms": 22.219167,
+      "p99_ms": 34.563708,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 2540.087876422957,
+      "p50_ms": 3.923791,
+      "p95_ms": 20.765834,
+      "p99_ms": 48.264542,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 91.25527096492836,
+      "p50_ms": -54.55769800476358,
+      "p95_ms": -6.5408977753306345,
+      "p99_ms": 39.639363924727064
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack",
+    "workload": "kv_read_local",
+    "goraph": {
+      "ops_per_sec": 2448.1192487895164,
+      "p50_ms": 5.270084,
+      "p95_ms": 14.256042,
+      "p99_ms": 19.182333,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 7298.741739986602,
+      "p50_ms": 1.865334,
+      "p95_ms": 3.304875,
+      "p99_ms": 9.050792,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 198.13669181333782,
+      "p50_ms": -64.60523209876729,
+      "p95_ms": -76.81772402185683,
+      "p99_ms": -52.81704264022525
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack",
+    "workload": "kv_write",
+    "goraph": {
+      "ops_per_sec": 134.83780102026694,
+      "p50_ms": 108.66,
+      "p95_ms": 190.259583,
+      "p99_ms": 248.698291,
+      "uploads": 46,
+      "gets": 23,
+      "heads": 23,
+      "s3_http_requests": 92
+    },
+    "lattice": {
+      "ops_per_sec": 174.57324640314215,
+      "p50_ms": 68.505417,
+      "p95_ms": 151.268375,
+      "p99_ms": 166.538083,
+      "uploads": 58,
+      "gets": 29,
+      "heads": 29,
+      "s3_http_requests": 116
+    },
+    "delta_percent": {
+      "ops_per_sec": 29.46906956521986,
+      "p50_ms": -36.95433738266152,
+      "p95_ms": -20.493689403282257,
+      "p99_ms": -33.03609673779383
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack-one-fault",
+    "workload": "graph_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 3323.2942153910067,
+      "p50_ms": 3.434458,
+      "p95_ms": 12.635542,
+      "p99_ms": 27.003416,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 1568.4023391152487,
+      "p50_ms": 7.812666,
+      "p95_ms": 23.788709,
+      "p99_ms": 54.582833,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -52.80579336456023,
+      "p50_ms": 127.4788627492315,
+      "p95_ms": 88.2682120007199,
+      "p99_ms": 102.13306716453947
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack-one-fault",
+    "workload": "graph_read_local",
+    "goraph": {
+      "ops_per_sec": 2490.5718902978397,
+      "p50_ms": 5.004584,
+      "p95_ms": 13.00475,
+      "p99_ms": 23.085459,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 2913.9800377797515,
+      "p50_ms": 4.157375,
+      "p95_ms": 9.390041,
+      "p99_ms": 24.547542,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 17.000438699694698,
+      "p50_ms": -16.92865980469106,
+      "p95_ms": -27.795297871931403,
+      "p99_ms": 6.333350357036438
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack-one-fault",
+    "workload": "graph_write",
+    "goraph": {
+      "ops_per_sec": 240.70089694180484,
+      "p50_ms": 56.5645,
+      "p95_ms": 88.282,
+      "p99_ms": 88.524959,
+      "uploads": 26,
+      "gets": 13,
+      "heads": 13,
+      "s3_http_requests": 52
+    },
+    "lattice": {
+      "ops_per_sec": 260.9583189570308,
+      "p50_ms": 43.738542,
+      "p95_ms": 81.44575,
+      "p99_ms": 92.794833,
+      "uploads": 40,
+      "gets": 20,
+      "heads": 20,
+      "s3_http_requests": 80
+    },
+    "delta_percent": {
+      "ops_per_sec": 8.416014345024948,
+      "p50_ms": -22.674925085521835,
+      "p95_ms": -7.743651027389498,
+      "p99_ms": 4.823356088761366
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack-one-fault",
+    "workload": "kv_read_linearizable",
+    "goraph": {
+      "ops_per_sec": 1220.224365680274,
+      "p50_ms": 9.550625,
+      "p95_ms": 27.044542,
+      "p99_ms": 58.516542,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 2551.7559908851276,
+      "p50_ms": 4.701209,
+      "p95_ms": 15.133875,
+      "p99_ms": 24.499542,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 109.12186829366628,
+      "p50_ms": -50.77590210064786,
+      "p95_ms": -44.04092700109323,
+      "p99_ms": -58.13227992863966
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack-one-fault",
+    "workload": "kv_read_local",
+    "goraph": {
+      "ops_per_sec": 2238.1579065166206,
+      "p50_ms": 4.853333,
+      "p95_ms": 16.228125,
+      "p99_ms": 30.599208,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "lattice": {
+      "ops_per_sec": 6351.8579978626,
+      "p50_ms": 2.114917,
+      "p95_ms": 4.615,
+      "p99_ms": 10.857583,
+      "uploads": 0,
+      "gets": 0,
+      "heads": 0,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 183.79847460130182,
+      "p50_ms": -56.42341046864083,
+      "p95_ms": -71.56171769689968,
+      "p99_ms": -64.51678422526493
+    }
+  },
+  {
+    "config": "graph-engine-graph-before-ack-one-fault",
+    "workload": "kv_write",
+    "goraph": {
+      "ops_per_sec": 110.27193142095075,
+      "p50_ms": 124.514,
+      "p95_ms": 249.586792,
+      "p99_ms": 254.442542,
+      "uploads": 52,
+      "gets": 26,
+      "heads": 26,
+      "s3_http_requests": 104
+    },
+    "lattice": {
+      "ops_per_sec": 286.2529524308422,
+      "p50_ms": 47.745416,
+      "p95_ms": 83.646125,
+      "p99_ms": 90.642458,
+      "uploads": 56,
+      "gets": 28,
+      "heads": 28,
+      "s3_http_requests": 112
+    },
+    "delta_percent": {
+      "ops_per_sec": 159.5882277042048,
+      "p50_ms": -61.654580207848106,
+      "p95_ms": -66.48615724825694,
+      "p99_ms": -64.37606019515401
+    }
+  }
+]

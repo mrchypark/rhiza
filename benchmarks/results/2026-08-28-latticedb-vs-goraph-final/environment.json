@@ -1,0 +1,11 @@
+{
+  "rhiza_base_commit": "0c2d4141c5c31a4a5e25f295cdb3461ff304a8ba",
+  "latticedb_commit": "4f64f6502f469a9e2da4f8e31091a51a85153cbf",
+  "image": "rhiza-graph@sha256:8e3181f814ce80c5f90be5f5974742287afaca132073fecd2c96aad8d571bbfa",
+  "host": "Apple arm64, Darwin 25.3.0",
+  "go": "go1.27.0 darwin/arm64",
+  "kubernetes": "v1.36.2+k3s1",
+  "container_runtime": "containerd://2.3.2-k3s2",
+  "peers": 3,
+  "runs_per_workload": 3
+}

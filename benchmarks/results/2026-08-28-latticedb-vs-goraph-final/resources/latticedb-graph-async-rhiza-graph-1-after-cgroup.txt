@@ -1,0 +1,11 @@
+usage_usec 7691573
+user_usec 4745794
+system_usec 2945779
+nice_usec 0
+nr_periods 201
+nr_throttled 2
+throttled_usec 247078
+nr_bursts 0
+burst_usec 0
+65884160
+74006528

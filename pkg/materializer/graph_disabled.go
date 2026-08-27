@@ -12,16 +12,11 @@ import (
 )
 
 type graphState struct{}
-type graphFileSnapshot struct{}
 
-func (*graphFileSnapshot) WriteTo(context.Context, io.Writer) (int64, error) {
-	return 0, fmt.Errorf("graph is disabled")
-}
-func (*graphFileSnapshot) Close() error { return nil }
-func (*Materializer) beginGraphFileSnapshot() (*graphFileSnapshot, error) {
-	return nil, fmt.Errorf("graph is disabled")
-}
 func (*Materializer) graphTip() uint64 { return 0 }
+func (*Materializer) backupGraph(string) error {
+	return fmt.Errorf("graph is disabled")
+}
 
 func BuildProfile() types.Profile { return types.ProfileSQL }
 func GraphEnabled() bool          { return false }

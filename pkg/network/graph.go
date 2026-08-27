@@ -52,6 +52,7 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if err := materializer.ValidateGraphCommand(command); err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	defer s.lockRequest(command.RequestID)()
 	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil {
 		return GraphExecuteResponse{}, err
 	} else if !matches {

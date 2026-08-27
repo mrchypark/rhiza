@@ -63,6 +63,7 @@ type Server struct {
 	members      []quepaxa.Member
 	hedgeDelay   time.Duration
 	applyMu      sync.Mutex
+	requestLocks [256]sync.Mutex
 	durability   func(context.Context, quepaxa.Slot) error
 	routeMu      sync.Mutex
 	routeBase    quepaxa.NodeID
@@ -79,6 +80,13 @@ type Server struct {
 	operationB   int
 	objectStats  func() (map[string]uint64, bool)
 	syncLimit    chan struct{}
+}
+
+func (s *Server) lockRequest(id string) func() {
+	hash := sha256.Sum256([]byte(id))
+	lock := &s.requestLocks[hash[0]]
+	lock.Lock()
+	return lock.Unlock
 }
 
 type proposalCall struct {
@@ -513,6 +521,7 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if err := materializer.ValidateSQLCommand(command); err != nil {
 		return ExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	defer s.lockRequest(req.RequestID)()
 	if encoded, err := types.EncodeSQLBatch([]types.SQLCommand{command}); err != nil || len(encoded) > quepaxa.MaxReplicatedValueBytes {
 		return ExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
@@ -798,6 +807,7 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 		return KVMutationResponse{}, ErrInvalidRequest
 	}
 	intent := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
+	defer s.lockRequest(req.RequestID)()
 	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
 		return KVMutationResponse{}, err
 	} else if !matches {
@@ -889,6 +899,7 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
 		return types.MutationReceipt{}, ErrInvalidRequest
 	}
+	defer s.lockRequest(req.RequestID)()
 	if matches, err := s.material.NotifyRequestMatches(ctx, req); err != nil {
 		return types.MutationReceipt{}, err
 	} else if !matches {

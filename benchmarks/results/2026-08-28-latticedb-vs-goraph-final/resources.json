@@ -1,0 +1,34 @@
+[
+  {
+    "config": "latticedb-graph-async",
+    "duration_s": 26,
+    "cpu_seconds": 11.180,
+    "average_cores": 0.430,
+    "memory_current_mib": 62.8,
+    "memory_peak_mib": 70.6
+  },
+  {
+    "config": "latticedb-graph-async-one-fault",
+    "duration_s": 23,
+    "cpu_seconds": 9.606,
+    "average_cores": 0.418,
+    "memory_current_mib": 66.9,
+    "memory_peak_mib": 81.4
+  },
+  {
+    "config": "latticedb-graph-before-ack",
+    "duration_s": 28,
+    "cpu_seconds": 13.880,
+    "average_cores": 0.496,
+    "memory_current_mib": 62.8,
+    "memory_peak_mib": 69.0
+  },
+  {
+    "config": "latticedb-graph-before-ack-one-fault",
+    "duration_s": 39,
+    "cpu_seconds": 14.819,
+    "average_cores": 0.380,
+    "memory_current_mib": 65.1,
+    "memory_peak_mib": 71.0
+  }
+]

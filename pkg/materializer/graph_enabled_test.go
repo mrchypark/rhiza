@@ -10,17 +10,17 @@ import (
 	"testing"
 	"time"
 
+	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
 	"github.com/mrchypark/rhiza/internal/types"
-	graphdb "github.com/mstrYoda/goraphdb"
 )
 
 func TestGraphResultUsesAggregateByteBudget(t *testing.T) {
 	value := strings.Repeat("x", 1<<20-2)
-	result := &graphdb.CypherResult{Columns: []string{"value"}}
+	result := latticedb.QueryResult{Columns: []string{"value"}}
 	for range 17 {
 		result.Rows = append(result.Rows, map[string]any{"value": value})
 	}
-	if _, err := collectGoraphRows(result); err == nil {
+	if _, err := collectLatticeRows(result); err == nil {
 		t.Fatal("aggregate graph result byte limit was not enforced")
 	}
 }
@@ -62,7 +62,7 @@ func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
 	if err := m.Apply(ctx, 1, value); err != nil {
 		t.Fatal(err)
 	}
-	journal, err := m.graph.db.GetMetadata(graphJournalKey)
+	journal, err := m.graph.getMetadata(graphJournalKey)
 	if err != nil || len(journal) != 0 {
 		t.Fatalf("confirmed recovery journal=%x err=%v", journal, err)
 	}
@@ -162,7 +162,7 @@ func TestFailedGraphCommandRecordsResultAndAdvancesTip(t *testing.T) {
 	ctx := context.Background()
 	commands := []types.GraphCommand{
 		{RequestID: "first", Cypher: `CREATE (:Item {id: '1'})`},
-		{RequestID: "invalid", Cypher: `MATCH (n:Item {id: '1'}) RETURN n`},
+		{RequestID: "invalid", Cypher: `MATCH (`},
 		{RequestID: "after", Cypher: `CREATE (:Item {id: '2'})`},
 	}
 	for i, command := range commands {
@@ -208,6 +208,64 @@ func TestGraphBatchAppliesEveryCommandAtOneSlot(t *testing.T) {
 	for _, command := range commands {
 		if _, found, err := m.GraphMutationReceipt(context.Background(), command.RequestID); err != nil || !found {
 			t.Fatalf("request %q: found=%v err=%v", command.RequestID, found, err)
+		}
+	}
+}
+
+func TestGraphBatchKeepsFirstFingerprintForDuplicateRequestID(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	commands := []types.GraphCommand{
+		{RequestID: "shared", Cypher: `CREATE (:Item {id: $id})`, Args: map[string]any{"id": float64(1)}},
+		{RequestID: "shared", Cypher: `CREATE (:Item {id: $id})`, Args: map[string]any{"id": float64(2)}},
+	}
+	value, err := types.EncodeGraphBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	for i, command := range commands {
+		matches, err := m.GraphRequestMatches(context.Background(), command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if matches != (i == 0) {
+			t.Fatalf("command %d matches=%v", i, matches)
+		}
+	}
+}
+
+func TestGraphSlotsKeepFirstFingerprintForDuplicateRequestID(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	commands := []types.GraphCommand{
+		{RequestID: "shared", Cypher: `CREATE (:Item {id: $id})`, Args: map[string]any{"id": float64(1)}},
+		{RequestID: "shared", Cypher: `CREATE (:Item {id: $id})`, Args: map[string]any{"id": float64(2)}},
+	}
+	for i, command := range commands {
+		value, err := types.EncodeGraphCommand(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Apply(context.Background(), uint64(i+1), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, command := range commands {
+		matches, err := m.GraphRequestMatches(context.Background(), command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if matches != (i == 0) {
+			t.Fatalf("command %d matches=%v", i, matches)
 		}
 	}
 }

@@ -73,9 +73,11 @@ resource_snapshot() {
 }
 
 object_snapshot() {
+	local stats
 	for metrics_pod in "${pods[@]}"; do
-		dory k8s exec -n "$namespace" "$metrics_pod" -- wget -qO- http://127.0.0.1:8080/metrics/object-store 2>/dev/null || true
-	done | jq -s 'reduce .[] as $stats ({}; reduce ($stats | to_entries[]) as $entry (.; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
+		stats="$(dory k8s exec -n "$namespace" "$metrics_pod" -- wget -qO- http://127.0.0.1:8080/metrics/object-store 2>/dev/null || echo '{}')"
+		jq -nc --arg pod "$metrics_pod" --argjson stats "$stats" '{pod:$pod,stats:$stats}'
+	done | jq -s .
 }
 
 capture() {
@@ -87,7 +89,14 @@ capture() {
 	after="$(object_snapshot)"
 	jq -nc --arg config "$label" --arg workload "$workload" \
 		--argjson result "$measured" --argjson before "$before" --argjson after "$after" \
-		'{config:$config,workload:$workload,result:$result,object_delta:($after|with_entries(.value -= $before[.key]))}' \
+		'def bypod: reduce .[] as $item ({}; .[$item.pod] = $item.stats);
+		 ($before|bypod) as $b | ($after|bypod) as $a |
+		 reduce (([($b|keys_unsorted[])]+[($a|keys_unsorted[])])|unique[]) as $pod
+		   ({};
+		    reduce (([($b[$pod]//{}|keys_unsorted[])]+[($a[$pod]//{}|keys_unsorted[])])|unique[]) as $key
+		      (.; ($b[$pod][$key]//0) as $bv | ($a[$pod][$key]//0) as $av |
+		       .[$key] = ((.[$key]//0) + (if $av >= $bv then $av-$bv else $av end)))) as $delta |
+		 {config:$config,workload:$workload,result:$result,object_delta:$delta}' \
 		| tee -a "$results"
 }
 

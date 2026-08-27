@@ -145,7 +145,7 @@ func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materia
 		m.Close()
 		return nil, fmt.Errorf("load applied slot: %w", err)
 	}
-	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "goraphdb"), m.tip, window)
+	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "latticedb"), m.tip, window)
 	if err != nil {
 		m.Close()
 		return nil, fmt.Errorf("open graph materializer: %w", err)
@@ -1048,31 +1048,18 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 		return nil, 0, nil, err
 	}
 	graphPath := graph.Name()
+	_ = graph.Close()
+	_ = os.Remove(graphPath)
 	paths = append(paths, graphPath)
 	index, err := m.backupSQLite(ctx, sqlitePath)
-	var snapshot *graphFileSnapshot
 	if err == nil {
 		m.mu.Lock()
 		if m.tip == index && m.graphTip() == index {
-			snapshot, err = m.beginGraphFileSnapshot()
+			err = m.backupGraph(graphPath)
 		} else {
 			err = fmt.Errorf("checkpoint state advanced during SQLite backup")
 		}
 		m.mu.Unlock()
-	}
-	if err == nil {
-		_, err = snapshot.WriteTo(ctx, graph)
-	}
-	if snapshot != nil {
-		if closeErr := snapshot.Close(); err == nil {
-			err = closeErr
-		}
-	}
-	if err == nil {
-		err = graph.Sync()
-	}
-	if closeErr := graph.Close(); err == nil {
-		err = closeErr
 	}
 	if err != nil {
 		cleanup()
@@ -1140,7 +1127,7 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 		if err != nil {
 			return err
 		}
-		graphDir := filepath.Join(root, "goraphdb")
+		graphDir := filepath.Join(root, "latticedb")
 		if err := os.MkdirAll(graphDir, 0o700); err != nil {
 			_ = os.RemoveAll(root)
 			return err
@@ -1151,7 +1138,7 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 				source = file.Path
 			}
 		}
-		if err := copyFile(source, filepath.Join(graphDir, "shard_0000.db")); err != nil {
+		if err := copyFile(source, filepath.Join(graphDir, "graph.ltdb")); err != nil {
 			_ = os.RemoveAll(root)
 			return err
 		}
@@ -1225,7 +1212,7 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
-	graphPath := filepath.Join(dir, "goraphdb")
+	graphPath := filepath.Join(dir, "latticedb")
 	graphBackupPath := graphPath + ".restore-backup"
 	os.Remove(backupPath)
 	os.RemoveAll(graphBackupPath)

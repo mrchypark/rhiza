@@ -11,16 +11,15 @@ over the same Go API.
 - Green Tea GC is the Go 1.27 default.
 - The container enables `GOEXPERIMENT=arenas` for QLog read scratch buffers.
 - The default `sql-kv` image uses cgo-free `ncruces/go-sqlite3`.
-- The separate `graph-kv` image uses the pure-Go GoraphDB fork.
+- The separate `graph-kv` image uses the Rhiza LatticeDB fork through cgo.
 
 ```bash
 go test ./...
 go vet ./...
 GOEXPERIMENT=arenas go test ./...
 go build ./cmd/rhiza
-CGO_ENABLED=0 GOEXPERIMENT=arenas,greenteagc go build -tags=graph ./cmd/rhiza
-docker build -t rhiza-sql-kv:dev .
 docker build -f Dockerfile.graph -t rhiza-graph-kv:dev .
+docker build -t rhiza-sql-kv:dev .
 ```
 
 ## Embedded Go API
@@ -96,7 +95,7 @@ a quorum is unavailable; they never fall back to a stale read. With three
 peers, one failed peer preserves reads and writes. Two failed peers preserve
 only local reads and reject writes and linearizable reads with HTTP 503.
 
-SQLite and GoraphDB are derived from the certified QLog. Startup replays missing decisions;
+SQLite and LatticeDB are derived from the certified QLog. Startup replays missing decisions;
 an unreadable SQLite database is quarantined and rebuilt from the log. SQLite
 snapshots use `VACUUM INTO`, are integrity-checked before atomic restore, and
 checkpoint uploads consume those consistent bytes rather than the live file.
@@ -129,11 +128,11 @@ samples were 0.29–0.35 ms local read, 4.7–21.6 ms linearizable read, and
 8.1–11.6 ms graph write, including port-forward overhead.
 
 The build profile is fixed into each binary and mismatched
-`RHIZA_EXECUTION_PROFILE` values are rejected at startup. Graph mutations and
-their request IDs commit atomically in GoraphDB before the SQLite sidecar tip,
-so a crash replays without applying the graph mutation twice. GoraphDB is
-rebuilt from the full QLog when local state is missing; graph checkpoints bundle
-the SQLite and GoraphDB materializations.
+`RHIZA_EXECUTION_PROFILE` values are rejected at startup. Graph mutations,
+request receipts, and the applied slot commit atomically in LatticeDB before
+the SQLite sidecar tip, so a crash replays without applying a graph mutation
+twice. LatticeDB is rebuilt from the full QLog when local state is missing;
+graph checkpoints bundle the SQLite and LatticeDB materializations.
 
 ## License
 

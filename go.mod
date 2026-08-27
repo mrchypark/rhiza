@@ -5,13 +5,13 @@ go 1.27.0
 require (
 	github.com/go-kit/log v0.2.1
 	github.com/google/flatbuffers v25.12.19+incompatible
-	github.com/mstrYoda/goraphdb v0.0.0
+	github.com/jeffhajewski/latticedb/bindings/go v0.0.0
 	github.com/ncruces/go-sqlite3 v0.35.3
 	github.com/quic-go/quic-go v0.61.0
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
 )
 
-replace github.com/mstrYoda/goraphdb => github.com/mrchypark/goraphdb v0.0.0-20260827101547-daa7ce485e6b
+replace github.com/jeffhajewski/latticedb/bindings/go => github.com/mrchypark/latticedb/bindings/go v0.0.0-20260827204440-4f64f6502f46
 
 require (
 	cloud.google.com/go v0.121.0 // indirect
@@ -60,9 +60,6 @@ require (
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.8.1 // indirect
 	github.com/tinylib/msgp v1.3.0 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
-	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-	go.etcd.io/bbolt v1.4.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect

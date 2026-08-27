@@ -183,7 +183,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		if rebuildErr := quarantineSQLite(n.config.DataDir + "/sqlite.db"); rebuildErr != nil {
 			return fmt.Errorf("open materializer: %w; quarantine: %v", err, rebuildErr)
 		}
-		if rebuildErr := quarantineGraph(n.config.DataDir + "/goraphdb"); rebuildErr != nil {
+		if rebuildErr := quarantineGraph(n.config.DataDir + "/latticedb"); rebuildErr != nil {
 			return fmt.Errorf("open materializer: %w; quarantine graph: %v", err, rebuildErr)
 		}
 		material, err = materializer.Open(n.config.DataDir+"/sqlite.db", 4)

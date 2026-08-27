@@ -10,10 +10,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
+	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
 	"github.com/mrchypark/rhiza/internal/types"
-	graphdb "github.com/mstrYoda/goraphdb"
 )
 
 func graphArgs(args map[string]any) (map[string]any, error) {
@@ -32,18 +33,18 @@ var graphTipKey = []byte("rhiza/applied_slot")
 var graphJournalKey = []byte("rhiza/recovery_journal")
 
 type graphState struct {
-	db                *graphdb.DB
+	db                *latticedb.DB
 	mu                sync.RWMutex
 	tip               uint64
 	idempotencyWindow uint64
 }
 
-type graphFileSnapshot = graphdb.FileSnapshot
-
-func (m *Materializer) beginGraphFileSnapshot() (*graphFileSnapshot, error) {
+func (m *Materializer) backupGraph(path string) error {
+	// ponytail: checkpointing pauses graph transactions; add an online page
+	// snapshot only if measured checkpoint pauses exceed the service budget.
 	m.graph.mu.Lock()
 	defer m.graph.mu.Unlock()
-	return m.graph.db.BeginFileSnapshot()
+	return m.graph.db.Backup(path)
 }
 func (m *Materializer) graphTip() uint64 { return m.graph.tip }
 
@@ -61,26 +62,27 @@ func BuildProfile() types.Profile { return types.ProfileGraph }
 func GraphEnabled() bool          { return true }
 
 func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, error) {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return nil, err
+	}
+	dbPath := filepath.Join(path, "graph.ltdb")
 	existing := false
-	if entries, err := os.ReadDir(path); err == nil {
-		existing = len(entries) > 0
+	if info, err := os.Stat(dbPath); err == nil {
+		existing = info.Size() > 0
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	opts := graphdb.DefaultOptions()
-	opts.ShardCount = 1
-	// The certified QLog is the durable source of truth. GoraphDB is a
-	// replayable materialized view, so per-command fdatasync is redundant.
-	opts.NoSync = true
-	opts.EnableWAL = false
-	opts.Role = "standalone"
-	opts.MaxResultRows = MaxReturningRows
-	db, err := graphdb.Open(path, opts)
+	db, err := latticedb.Open(dbPath, latticedb.OpenOptions{
+		Create:               true,
+		CacheSizeMB:          32,
+		EnableAdjacencyCache: true,
+		NoSync:               true,
+	})
 	if err != nil {
 		return nil, err
 	}
 	g := &graphState{db: db, idempotencyWindow: idempotencyWindow}
-	encodedTip, err := db.GetMetadata(graphTipKey)
+	encodedTip, err := g.getMetadata(graphTipKey)
 	if err != nil {
 		g.close()
 		return nil, err
@@ -90,11 +92,11 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 			g.close()
 			return nil, fmt.Errorf("existing graph state has no applied slot; rebuild from the decision log")
 		}
-		if err := db.UpdateAtomic(context.Background(), func(tx *graphdb.AtomicTx) error {
-			if err := tx.PutMetadata(graphTipKey, encodeGraphTip(0)); err != nil {
+		if err := db.Update(func(tx *latticedb.Tx) error {
+			if err := tx.PutAppMetadata(graphTipKey, encodeGraphTip(0)); err != nil {
 				return err
 			}
-			return tx.PutMetadata(graphJournalKey, nil)
+			return tx.PutAppMetadata(graphJournalKey, nil)
 		}); err != nil {
 			g.close()
 			return nil, err
@@ -106,7 +108,7 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 			return nil, err
 		}
 	}
-	encodedJournal, err := db.GetMetadata(graphJournalKey)
+	encodedJournal, err := g.getMetadata(graphJournalKey)
 	if err != nil {
 		g.close()
 		return nil, err
@@ -125,13 +127,28 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 		g.close()
 		return nil, fmt.Errorf("graph recovery journal does not cover SQLite gap %d..%d", sqliteTip+1, g.tip)
 	}
-	if err := db.UpdateAtomic(context.Background(), func(tx *graphdb.AtomicTx) error {
-		return tx.PutMetadata(graphJournalKey, encodeGraphJournal(journal))
+	if err := db.Update(func(tx *latticedb.Tx) error {
+		return tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal))
 	}); err != nil {
 		g.close()
 		return nil, err
 	}
 	return g, nil
+}
+
+func (g *graphState) getMetadata(key []byte) ([]byte, error) {
+	var value []byte
+	err := g.db.View(func(tx *latticedb.Tx) error {
+		var ok bool
+		var err error
+		value, ok, err = tx.GetAppMetadata(key)
+		if err != nil || ok {
+			return err
+		}
+		value = nil
+		return nil
+	})
+	return value, err
 }
 
 func encodeGraphJournal(entries []graphJournalEntry) []byte {
@@ -204,13 +221,13 @@ func (g *graphState) close() {
 func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, commands []types.GraphCommand, graph bool) error {
 	g := m.graph
 	if g == nil || g.db == nil {
-		return fmt.Errorf("GoraphDB is not open")
+		return fmt.Errorf("LatticeDB is not open")
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	valueHash := sha256.Sum256(value)
 	if slot <= g.tip {
-		encoded, err := g.db.GetMetadata(graphJournalKey)
+		encoded, err := g.getMetadata(graphJournalKey)
 		if err != nil {
 			return err
 		}
@@ -275,7 +292,10 @@ func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 }
 
 func (g *graphState) advanceTip(ctx context.Context, slot uint64, valueHash [32]byte) error {
-	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+	return g.db.Update(func(tx *latticedb.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
 	})
 }
@@ -285,7 +305,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 	if err != nil {
 		return err
 	}
-	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+	return g.db.Update(func(tx *latticedb.Tx) error {
 		existing, found, err := requestInTx(tx, command.RequestID)
 		if err != nil {
 			return err
@@ -299,7 +319,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 			}
 			return nil
 		}
-		_, err = tx.CypherWithParams(ctx, command.Cypher, args)
+		_, err = tx.QueryContext(ctx, command.Cypher, args, MaxReturningRows)
 		if err != nil {
 			return err
 		}
@@ -322,7 +342,10 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 			return err
 		}
 	}
-	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
+	return g.db.Update(func(tx *latticedb.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_, found, err := requestInTx(tx, command.RequestID)
 		if err != nil {
 			return err
@@ -340,8 +363,12 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 	})
 }
 
-func advanceGraphMetadata(tx *graphdb.AtomicTx, slot uint64, hash [32]byte, window uint64) error {
-	journal, err := decodeGraphJournal(tx.GetMetadata(graphJournalKey))
+func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window uint64) error {
+	journalData, _, err := tx.GetAppMetadata(graphJournalKey)
+	if err != nil {
+		return err
+	}
+	journal, err := decodeGraphJournal(journalData)
 	if err != nil {
 		return err
 	}
@@ -349,7 +376,7 @@ func advanceGraphMetadata(tx *graphdb.AtomicTx, slot uint64, hash [32]byte, wind
 		return fmt.Errorf("graph recovery journal slot gap")
 	}
 	journal = append(journal, graphJournalEntry{Slot: slot, Hash: hash})
-	if err := tx.PutMetadata(graphJournalKey, encodeGraphJournal(journal)); err != nil {
+	if err := tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal)); err != nil {
 		return err
 	}
 	if slot >= window {
@@ -357,45 +384,59 @@ func advanceGraphMetadata(tx *graphdb.AtomicTx, slot uint64, hash [32]byte, wind
 			return err
 		}
 	}
-	return tx.PutMetadata(graphTipKey, encodeGraphTip(slot))
+	return tx.PutAppMetadata(graphTipKey, encodeGraphTip(slot))
 }
 
 func (m *Materializer) confirmGraphThrough(ctx context.Context, through uint64) error {
 	g := m.graph
 	if g == nil || g.db == nil {
-		return fmt.Errorf("GoraphDB is not open")
+		return fmt.Errorf("LatticeDB is not open")
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.db.UpdateAtomic(ctx, func(tx *graphdb.AtomicTx) error {
-		journal, err := decodeGraphJournal(tx.GetMetadata(graphJournalKey))
+	return g.db.Update(func(tx *latticedb.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		journalData, _, err := tx.GetAppMetadata(graphJournalKey)
 		if err != nil {
 			return err
 		}
-		return tx.PutMetadata(graphJournalKey, encodeGraphJournal(pendingGraphJournal(journal, through)))
+		journal, err := decodeGraphJournal(journalData)
+		if err != nil {
+			return err
+		}
+		return tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(pendingGraphJournal(journal, through)))
 	})
 }
 
-func putRequest(tx *graphdb.AtomicTx, id string, request graphRequest) error {
+func putRequest(tx *latticedb.Tx, id string, request graphRequest) error {
 	if id == "" || len(id) > types.MaxRequestIDBytes {
 		return fmt.Errorf("invalid graph request ID length")
 	}
-	if err := tx.PutMetadata(graphRequestKey(id), encodeGraphRequest(request)); err != nil {
+	if err := tx.PutAppMetadata(graphRequestKey(id), encodeGraphRequest(request)); err != nil {
 		return err
 	}
 	key := graphSlotKey(request.Receipt.Slot)
-	ids := tx.GetMetadata(key)
+	ids, _, err := tx.GetAppMetadata(key)
+	if err != nil {
+		return err
+	}
 	ids = binary.AppendUvarint(ids, uint64(len(id)))
 	ids = append(ids, id...)
-	return tx.PutMetadata(key, ids)
+	return tx.PutAppMetadata(key, ids)
 }
 
-func requestInTx(tx *graphdb.AtomicTx, id string) (graphRequest, bool, error) {
-	return decodeGraphRequest(tx.GetMetadata(graphRequestKey(id)))
+func requestInTx(tx *latticedb.Tx, id string) (graphRequest, bool, error) {
+	data, _, err := tx.GetAppMetadata(graphRequestKey(id))
+	if err != nil {
+		return graphRequest{}, false, err
+	}
+	return decodeGraphRequest(data)
 }
 
 func (g *graphState) request(id string) (graphRequest, bool, error) {
-	data, err := g.db.GetMetadata(graphRequestKey(id))
+	data, err := g.getMetadata(graphRequestKey(id))
 	if err != nil {
 		return graphRequest{}, false, err
 	}
@@ -444,9 +485,12 @@ func encodeGraphRequest(request graphRequest) []byte {
 	return data
 }
 
-func pruneGraphRequests(tx *graphdb.AtomicTx, slot uint64) error {
+func pruneGraphRequests(tx *latticedb.Tx, slot uint64) error {
 	key := graphSlotKey(slot)
-	ids := tx.GetMetadata(key)
+	ids, _, err := tx.GetAppMetadata(key)
+	if err != nil {
+		return err
+	}
 	for len(ids) > 0 {
 		encodedLength, n := binary.Uvarint(ids)
 		if n <= 0 || encodedLength == 0 || encodedLength > types.MaxRequestIDBytes {
@@ -457,12 +501,12 @@ func pruneGraphRequests(tx *graphdb.AtomicTx, slot uint64) error {
 		if length > len(ids) {
 			return fmt.Errorf("invalid graph idempotency slot index")
 		}
-		if err := tx.DeleteMetadata(graphRequestKey(string(ids[:length]))); err != nil {
+		if err := tx.DeleteAppMetadata(graphRequestKey(string(ids[:length]))); err != nil {
 			return err
 		}
 		ids = ids[length:]
 	}
-	return tx.DeleteMetadata(key)
+	return tx.DeleteAppMetadata(key)
 }
 
 func knownNonGraphValue(value []byte) (bool, error) {
@@ -504,16 +548,21 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 		m.mu.RUnlock()
 		return types.GraphCommandResult{}, fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
 	}
-	result, err := g.db.CypherReadWithParams(ctx, cypher, converted)
+	var result latticedb.QueryResult
+	err = g.db.View(func(tx *latticedb.Tx) error {
+		var queryErr error
+		result, queryErr = tx.QueryContext(ctx, cypher, converted, MaxReturningRows)
+		return queryErr
+	})
 	g.mu.RUnlock()
 	m.mu.RUnlock()
 	if err != nil {
 		return types.GraphCommandResult{}, err
 	}
-	return collectGoraphRows(result)
+	return collectLatticeRows(result)
 }
 
-func collectGoraphRows(result *graphdb.CypherResult) (types.GraphCommandResult, error) {
+func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult, error) {
 	response := types.GraphCommandResult{Columns: append([]string(nil), result.Columns...)}
 	remaining := MaxResultBytes
 	for _, column := range response.Columns {
@@ -584,7 +633,7 @@ func (m *Materializer) graphHealth() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.graph == nil || m.graph.db == nil {
-		return fmt.Errorf("GoraphDB is not open")
+		return fmt.Errorf("LatticeDB is not open")
 	}
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
@@ -604,10 +653,10 @@ func prepareSnapshotFile(string, string) (snapshotParts, error) {
 
 func (m *Materializer) validateRestoredSnapshot() error {
 	if m.graph == nil {
-		return fmt.Errorf("GoraphDB checkpoint is missing")
+		return fmt.Errorf("LatticeDB checkpoint is missing")
 	}
 	if m.graph.tip != m.tip {
-		return fmt.Errorf("checkpoint materializer tips differ: SQLite=%d GoraphDB=%d", m.tip, m.graph.tip)
+		return fmt.Errorf("checkpoint materializer tips differ: SQLite=%d LatticeDB=%d", m.tip, m.graph.tip)
 	}
 	return nil
 }
