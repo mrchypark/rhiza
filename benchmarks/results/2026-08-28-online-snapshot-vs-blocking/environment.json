@@ -1,0 +1,16 @@
+{
+  "rhiza_commit": "77b9d3346fe9806482666c955f9c44169d884aed",
+  "rhiza_branch": "feature/latticedb-graph-engine",
+  "latticedb_commit": "8ef87c915c66578b87ed02333233902379df2877",
+  "latticedb_branch": "feature/rhiza-engine",
+  "graph_image": "rhiza-graph-kv-e2e@sha256:6863709737a9e8244373773a2ae366f6cb496aea699a52589435e1d327451a2c",
+  "host": "Apple M3 arm64, macOS 26.3",
+  "go": "go1.27.0 darwin/arm64",
+  "goexperiment": "arenas,greenteagc",
+  "kubernetes": "v1.36.2+k3s1",
+  "container_runtime": "containerd://2.3.2-k3s2",
+  "peers": 3,
+  "runs_per_workload": 3,
+  "checkpoint_runs_per_workload": 6,
+  "concurrency": 16
+}

@@ -1,0 +1,50 @@
+[
+  {
+    "config": "online-snapshot-async-healthy",
+    "duration_s": 13,
+    "cpu_seconds": 5.335839,
+    "average_cores": 0.4104491538461538,
+    "memory_current_mib": 56.76953125,
+    "memory_peak_mib": 63.3203125
+  },
+  {
+    "config": "online-snapshot-async-one-fault",
+    "duration_s": 13,
+    "cpu_seconds": 3.869367,
+    "average_cores": 0.29764361538461537,
+    "memory_current_mib": 55.44921875,
+    "memory_peak_mib": 62.015625
+  },
+  {
+    "config": "online-snapshot-before-ack-healthy",
+    "duration_s": 14,
+    "cpu_seconds": 5.39689,
+    "average_cores": 0.38549214285714284,
+    "memory_current_mib": 56.1328125,
+    "memory_peak_mib": 62.8046875
+  },
+  {
+    "config": "online-snapshot-before-ack-one-fault",
+    "duration_s": 13,
+    "cpu_seconds": 4.117597,
+    "average_cores": 0.31673823076923074,
+    "memory_current_mib": 55.2109375,
+    "memory_peak_mib": 61.21875
+  },
+  {
+    "config": "online-snapshot-checkpoint-1s",
+    "duration_s": 17,
+    "cpu_seconds": 7.801603,
+    "average_cores": 0.4589178235294118,
+    "memory_current_mib": 58.609375,
+    "memory_peak_mib": 64.6875
+  },
+  {
+    "config": "online-snapshot-checkpoint-1s-r2",
+    "duration_s": 14,
+    "cpu_seconds": 5.484346,
+    "average_cores": 0.391739,
+    "memory_current_mib": 56.25,
+    "memory_peak_mib": 62.8359375
+  }
+]

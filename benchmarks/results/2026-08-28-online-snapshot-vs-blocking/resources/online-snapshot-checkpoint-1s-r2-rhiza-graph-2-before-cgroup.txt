@@ -1,0 +1,11 @@
+usage_usec 52518
+user_usec 27990
+system_usec 24528
+nice_usec 0
+nr_periods 31
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+25530368
+31813632

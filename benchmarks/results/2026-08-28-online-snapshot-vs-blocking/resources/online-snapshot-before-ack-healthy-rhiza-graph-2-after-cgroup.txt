@@ -1,0 +1,11 @@
+usage_usec 956330
+user_usec 323817
+system_usec 632513
+nice_usec 0
+nr_periods 138
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+46579712
+53891072
