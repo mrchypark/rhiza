@@ -23,13 +23,17 @@ type Segment struct {
 // WAL is the local write-ahead log for QLog entries.
 // It stores proposals, receipts, and decisions for fast recovery.
 type WAL struct {
-	dir      string
-	segments []*Segment
-	current  *Segment
-	mu       sync.RWMutex
-	maxSize  int64
-	maxBytes int64
-	dirty    bool
+	dir        string
+	segments   []*Segment
+	current    *Segment
+	mu         sync.RWMutex
+	compactMu  sync.Mutex
+	generation uint64
+	maxSize    int64
+	maxBytes   int64
+	totalBytes int64
+	dirty      bool
+	syncDir    func(string) error
 }
 
 var ErrCapacity = errors.New("WAL capacity reached")
@@ -42,11 +46,7 @@ func (w *WAL) Bytes() int64 {
 }
 
 func (w *WAL) bytesLocked() int64 {
-	var total int64
-	for _, segment := range w.segments {
-		total += segment.offset
-	}
-	return total
+	return w.totalBytes
 }
 
 // SetMaxBytes rejects future appends before the WAL exceeds max. Existing
@@ -78,6 +78,7 @@ func Open(dir string) (*WAL, error) {
 	w := &WAL{
 		dir:     dir,
 		maxSize: defaultMaxSize,
+		syncDir: syncDir,
 	}
 
 	if err := w.loadSegments(); err != nil {
@@ -89,30 +90,40 @@ func Open(dir string) (*WAL, error) {
 
 // loadSegments loads existing segments from the directory.
 func (w *WAL) loadSegments() error {
-	matches, err := filepath.Glob(filepath.Join(w.dir, "seg_*.log"))
+	manifests, err := filepath.Glob(filepath.Join(w.dir, "manifest_*.bin"))
 	if err != nil {
 		return err
 	}
-
-	type segmentPath struct {
-		index uint32
-		path  string
-	}
-	paths := make([]segmentPath, 0, len(matches))
-	for _, path := range matches {
-		var index uint32
-		if _, err := fmt.Sscanf(filepath.Base(path), "seg_%d.log", &index); err != nil {
-			continue
+	if len(manifests) == 0 {
+		legacy, globErr := filepath.Glob(filepath.Join(w.dir, "seg_*.log"))
+		if globErr != nil {
+			return globErr
 		}
-		paths = append(paths, segmentPath{index: index, path: path})
+		if len(legacy) != 0 {
+			return fmt.Errorf("unsupported WAL layout without manifest")
+		}
+		return w.createSegment(1)
 	}
-	sort.Slice(paths, func(i, j int) bool { return paths[i].index < paths[j].index })
-
-	for i, item := range paths {
-		f, err := os.OpenFile(item.path, os.O_RDWR, 0600)
+	sort.Strings(manifests)
+	latest := manifests[len(manifests)-1]
+	data, err := os.ReadFile(latest)
+	if err != nil {
+		return err
+	}
+	generation, refs, err := decodeManifest(data)
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", filepath.Base(latest), err)
+	}
+	var filenameGeneration uint64
+	if _, err := fmt.Sscanf(filepath.Base(latest), "manifest_%d.bin", &filenameGeneration); err != nil || filenameGeneration != generation {
+		return fmt.Errorf("WAL manifest generation mismatch")
+	}
+	for i, ref := range refs {
+		path := w.segmentPath(ref.index)
+		f, err := os.OpenFile(path, os.O_RDWR, 0600)
 		if err != nil {
 			w.closeSegments()
-			return err
+			return fmt.Errorf("open manifest segment %d: %w", ref.index, err)
 		}
 		if err := f.Chmod(0600); err != nil {
 			f.Close()
@@ -127,24 +138,23 @@ func (w *WAL) loadSegments() error {
 			return err
 		}
 
-		seg := &Segment{
-			file:   f,
-			index:  item.index,
-			offset: info.Size(),
-		}
-		if _, err := seg.scan(i == len(paths)-1); err != nil {
+		if !ref.active && uint64(info.Size()) != ref.length {
 			f.Close()
 			w.closeSegments()
-			return fmt.Errorf("scan segment %d: %w", item.index, err)
+			return fmt.Errorf("sealed WAL segment %d length=%d, want %d", ref.index, info.Size(), ref.length)
+		}
+		seg := &Segment{file: f, index: ref.index, offset: info.Size()}
+		if _, err := seg.scan(i == len(refs)-1); err != nil {
+			f.Close()
+			w.closeSegments()
+			return fmt.Errorf("scan segment %d: %w", ref.index, err)
 		}
 		w.segments = append(w.segments, seg)
 		w.current = seg
+		w.totalBytes += seg.offset
 	}
 
-	if len(w.segments) == 0 {
-		return w.createSegment(1)
-	}
-
+	w.generation = generation
 	return nil
 }
 
@@ -172,6 +182,11 @@ func (w *WAL) createSegment(index uint32) error {
 	if err != nil {
 		return err
 	}
+	if err := w.syncDir(w.dir); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("sync WAL directory after creating segment %d: %w", index, err)
+	}
 
 	seg := &Segment{
 		file:  f,
@@ -179,6 +194,42 @@ func (w *WAL) createSegment(index uint32) error {
 	}
 	w.segments = append(w.segments, seg)
 	w.current = seg
+	if err := w.publishManifestLocked(w.segments); err != nil {
+		w.segments = w.segments[:len(w.segments)-1]
+		if len(w.segments) == 0 {
+			w.current = nil
+		} else {
+			w.current = w.segments[len(w.segments)-1]
+		}
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+func (w *WAL) segmentPath(index uint32) string {
+	return filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", index))
+}
+
+func (w *WAL) publishManifestLocked(segments []*Segment) error {
+	refs := make([]manifestRef, len(segments))
+	for i, seg := range segments {
+		refs[i] = manifestRef{index: seg.index, length: uint64(seg.offset), active: i == len(segments)-1}
+		if refs[i].active {
+			refs[i].length = 0
+		}
+	}
+	generation := w.generation + 1
+	data, err := encodeManifest(generation, refs)
+	if err != nil {
+		return err
+	}
+	target := filepath.Join(w.dir, fmt.Sprintf("manifest_%020d.bin", generation))
+	if err := writeFileAtomically(target, data); err != nil {
+		return fmt.Errorf("publish WAL manifest: %w", err)
+	}
+	w.generation = generation
 	return nil
 }
 
@@ -216,6 +267,7 @@ func (w *WAL) Append(entry Entry) error {
 		return io.ErrShortWrite
 	}
 	w.current.offset += int64(n)
+	w.totalBytes += int64(n)
 	w.dirty = true
 
 	return nil
@@ -373,6 +425,9 @@ func (w *WAL) RestoreSegment(index uint32, data []byte) error {
 		if bytes.Equal(existing, data) {
 			return nil
 		}
+		if seg != w.current {
+			return fmt.Errorf("sealed segment %d conflicts with local WAL", index)
+		}
 		if len(existing) != 0 && !bytes.HasPrefix(data, existing) {
 			return fmt.Errorf("segment %d conflicts with local WAL", index)
 		}
@@ -382,6 +437,9 @@ func (w *WAL) RestoreSegment(index uint32, data []byte) error {
 		return w.replaceEmptySegment(seg, data)
 	}
 
+	if w.current != nil && index <= w.current.index {
+		return fmt.Errorf("restored segment %d is not after active segment %d", index, w.current.index)
+	}
 	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
 		return fmt.Errorf("%w: restore segment %d", ErrCapacity, index)
 	}
@@ -395,8 +453,16 @@ func (w *WAL) RestoreSegment(index uint32, data []byte) error {
 	}
 	seg := &Segment{file: f, index: index, offset: int64(len(data))}
 	w.segments = append(w.segments, seg)
-	sort.Slice(w.segments, func(i, j int) bool { return w.segments[i].index < w.segments[j].index })
-	w.current = w.segments[len(w.segments)-1]
+	w.totalBytes += int64(len(data))
+	w.current = seg
+	if err := w.publishManifestLocked(w.segments); err != nil {
+		w.segments = w.segments[:len(w.segments)-1]
+		w.current = w.segments[len(w.segments)-1]
+		w.totalBytes -= int64(len(data))
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
 	return nil
 }
 
@@ -415,12 +481,17 @@ func (w *WAL) replaceEmptySegment(seg *Segment, data []byte) error {
 		f.Close()
 		return err
 	}
+	w.totalBytes += int64(len(data)) - seg.offset
 	seg.file = f
 	seg.offset = int64(len(data))
 	return nil
 }
 
 func writeSegmentAtomically(path string, data []byte) error {
+	return writeFileAtomically(path, data)
+}
+
+func writeFileAtomically(path string, data []byte) error {
 	f, err := os.CreateTemp(filepath.Dir(path), ".rhiza-segment-*")
 	if err != nil {
 		return err
@@ -456,19 +527,62 @@ func validateSegmentBytes(data []byte) error {
 	return nil
 }
 
-// Compact atomically installs a certified base plus the suffix that remains
-// necessary for consensus recovery. The new higher-numbered segment is made
-// durable before any old segment is removed.
-func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
+// Compaction is a fenced WAL rewrite. Entries appended after BeginCompaction
+// stay in independent tail segments and are never copied by the rewrite.
+type Compaction struct {
+	wal             *WAL
+	base            Entry
+	keepValueHashes map[[32]byte]struct{}
+	prefix          []*Segment
+	tailIndex       uint32
+	targetIndex     uint32
+	targetPath      string
+	maxBytes        int64
+	offset          int64
+	built           bool
+	done            bool
+}
+
+// BeginCompaction seals the current prefix and switches appends to a durable
+// tail generation. The caller may release higher-level locks after it returns.
+func (w *WAL) BeginCompaction(base Entry, keepValueHashes map[[32]byte]struct{}) (*Compaction, error) {
 	if base.Type != EntryCheckpoint || base.Slot == 0 {
-		return fmt.Errorf("invalid WAL compaction base")
+		return nil, fmt.Errorf("invalid WAL compaction base")
 	}
+	w.compactMu.Lock()
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	index := uint32(1)
-	if w.current != nil {
-		index = w.current.index + 1
+	if w.current == nil {
+		w.mu.Unlock()
+		w.compactMu.Unlock()
+		return nil, fmt.Errorf("WAL has no active segment")
 	}
+	if w.current.index > ^uint32(0)-2 {
+		w.mu.Unlock()
+		w.compactMu.Unlock()
+		return nil, fmt.Errorf("WAL segment index exhausted")
+	}
+	prefix := append([]*Segment(nil), w.segments...)
+	targetIndex := w.current.index + 1
+	tailIndex := targetIndex + 1
+	if err := w.createSegment(tailIndex); err != nil {
+		w.mu.Unlock()
+		w.compactMu.Unlock()
+		return nil, err
+	}
+	w.mu.Unlock()
+	keep := make(map[[32]byte]struct{}, len(keepValueHashes))
+	for hash := range keepValueHashes {
+		keep[hash] = struct{}{}
+	}
+	return &Compaction{wal: w, base: base, keepValueHashes: keep, prefix: prefix, tailIndex: tailIndex, targetIndex: targetIndex, targetPath: w.segmentPath(targetIndex), maxBytes: w.maxBytes}, nil
+}
+
+// Build writes and syncs the compacted prefix without blocking appends.
+func (c *Compaction) Build() error {
+	if c == nil || c.done || c.built {
+		return fmt.Errorf("invalid WAL compaction state")
+	}
+	w := c.wal
 	temp, err := os.CreateTemp(w.dir, ".rhiza-compact-*")
 	if err != nil {
 		return err
@@ -478,8 +592,8 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 	offset := int64(0)
 	writeEntry := func(entry Entry) error {
 		data := entry.Encode()
-		if w.maxBytes > 0 && offset+int64(len(data)) > w.maxBytes {
-			return fmt.Errorf("%w: compacted WAL requires more than %d bytes", ErrCapacity, w.maxBytes)
+		if c.maxBytes > 0 && offset+int64(len(data)) > c.maxBytes {
+			return fmt.Errorf("%w: compacted WAL requires more than %d bytes", ErrCapacity, c.maxBytes)
 		}
 		n, writeErr := temp.Write(data)
 		if writeErr != nil {
@@ -491,18 +605,18 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 		offset += int64(n)
 		return nil
 	}
-	if err := writeEntry(base); err != nil {
+	if err := writeEntry(c.base); err != nil {
 		temp.Close()
 		return err
 	}
-	for _, seg := range w.segments {
+	for _, seg := range c.prefix {
 		seg.mu.Lock()
 		err := seg.scanEntries(false, func(entry Entry) error {
 			if entry.Type == EntryProposal {
-				if _, ok := keepValueHashes[entry.Hash]; !ok {
+				if _, ok := c.keepValueHashes[entry.Hash]; !ok {
 					return nil
 				}
-			} else if entry.Slot <= base.Slot {
+			} else if entry.Slot <= c.base.Slot {
 				return nil
 			}
 			return writeEntry(entry)
@@ -520,36 +634,112 @@ func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	target := filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", index))
-	if err := os.Rename(tempPath, target); err != nil {
+	if err := os.Rename(tempPath, c.targetPath); err != nil {
 		return err
 	}
 	if err := syncDir(w.dir); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(target, os.O_RDWR, 0600)
+	c.offset = offset
+	c.built = true
+	return nil
+}
+
+// Commit atomically switches the manifest from the old prefix to the built
+// prefix plus every post-fence tail segment.
+func (c *Compaction) Commit() error {
+	if c == nil || c.done || !c.built {
+		return fmt.Errorf("invalid WAL compaction state")
+	}
+	w := c.wal
+	file, err := os.OpenFile(c.targetPath, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
-	old := append([]*Segment(nil), w.segments...)
-	w.segments = []*Segment{{file: file, index: index, offset: offset}}
-	w.current = w.segments[0]
+	compacted := &Segment{file: file, index: c.targetIndex, offset: c.offset}
+	w.mu.Lock()
+	if w.current == nil {
+		w.mu.Unlock()
+		file.Close()
+		return fmt.Errorf("WAL has no active segment")
+	}
+	w.current.mu.Lock()
+	if err := w.current.file.Sync(); err != nil {
+		w.current.mu.Unlock()
+		w.mu.Unlock()
+		file.Close()
+		return err
+	}
+	w.current.mu.Unlock()
 	w.dirty = false
-	var closeErr error
-	for _, seg := range old {
-		seg.mu.Lock()
-		closeErr = errors.Join(closeErr, seg.file.Close())
-		seg.mu.Unlock()
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	for _, seg := range old {
-		if err := os.Remove(filepath.Join(w.dir, fmt.Sprintf("seg_%03d.log", seg.index))); err != nil && !os.IsNotExist(err) {
-			return err
+	tail := make([]*Segment, 0, len(w.segments))
+	for _, seg := range w.segments {
+		if seg.index >= c.tailIndex {
+			tail = append(tail, seg)
 		}
 	}
-	return syncDir(w.dir)
+	if len(tail) == 0 || tail[len(tail)-1] != w.current {
+		w.mu.Unlock()
+		file.Close()
+		return fmt.Errorf("WAL compaction tail changed")
+	}
+	next := append([]*Segment{compacted}, tail...)
+	var nextBytes int64
+	for _, seg := range next {
+		nextBytes += seg.offset
+	}
+	if w.maxBytes > 0 && nextBytes > w.maxBytes {
+		w.mu.Unlock()
+		file.Close()
+		return fmt.Errorf("%w: compacted WAL requires %d bytes", ErrCapacity, nextBytes)
+	}
+	if err := w.publishManifestLocked(next); err != nil {
+		w.mu.Unlock()
+		file.Close()
+		return err
+	}
+	old := c.prefix
+	w.segments = next
+	w.current = next[len(next)-1]
+	w.totalBytes = nextBytes
+	w.dirty = false
+	w.mu.Unlock()
+	c.done = true
+	w.compactMu.Unlock()
+	for _, seg := range old {
+		seg.mu.Lock()
+		_ = seg.file.Close()
+		seg.mu.Unlock()
+	}
+	for _, seg := range old {
+		_ = os.Remove(w.segmentPath(seg.index))
+	}
+	_ = syncDir(w.dir)
+	return nil
+}
+
+// Abort discards an uncommitted compacted prefix. The fenced tail remains the
+// active WAL generation and contains every concurrent append.
+func (c *Compaction) Abort() {
+	if c == nil || c.done {
+		return
+	}
+	c.done = true
+	_ = os.Remove(c.targetPath)
+	c.wal.compactMu.Unlock()
+}
+
+// Compact preserves the simple API for restore paths.
+func (w *WAL) Compact(base Entry, keepValueHashes map[[32]byte]struct{}) error {
+	compaction, err := w.BeginCompaction(base, keepValueHashes)
+	if err != nil {
+		return err
+	}
+	defer compaction.Abort()
+	if err := compaction.Build(); err != nil {
+		return err
+	}
+	return compaction.Commit()
 }
 
 func syncDir(dir string) error {

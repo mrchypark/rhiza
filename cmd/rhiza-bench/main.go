@@ -18,15 +18,20 @@ import (
 )
 
 type result struct {
-	Requests   int               `json:"requests"`
-	Errors     uint64            `json:"errors"`
-	DurationMS float64           `json:"duration_ms"`
-	OpsPerSec  float64           `json:"ops_per_sec"`
-	P50MS      float64           `json:"p50_ms"`
-	P95MS      float64           `json:"p95_ms"`
-	P99MS      float64           `json:"p99_ms"`
-	MaxMS      float64           `json:"max_ms"`
-	ErrorKinds map[string]uint64 `json:"error_kinds,omitempty"`
+	Requests         int               `json:"requests"`
+	Successes        int               `json:"successes"`
+	Errors           uint64            `json:"errors"`
+	DurationMS       float64           `json:"duration_ms"`
+	OpsPerSec        float64           `json:"ops_per_sec"`
+	SuccessOpsPerSec float64           `json:"success_ops_per_sec"`
+	P50MS            float64           `json:"p50_ms"`
+	P95MS            float64           `json:"p95_ms"`
+	P99MS            float64           `json:"p99_ms"`
+	MaxMS            float64           `json:"max_ms"`
+	ErrorP50MS       float64           `json:"error_p50_ms,omitempty"`
+	ErrorP95MS       float64           `json:"error_p95_ms,omitempty"`
+	ErrorP99MS       float64           `json:"error_p99_ms,omitempty"`
+	ErrorKinds       map[string]uint64 `json:"error_kinds,omitempty"`
 }
 
 func main() {
@@ -46,7 +51,9 @@ func main() {
 		MaxIdleConns: *concurrency, MaxIdleConnsPerHost: *concurrency, MaxConnsPerHost: *concurrency,
 	}}
 	jobs := make(chan int)
-	latencies := make([]time.Duration, *requests)
+	latencies := make([]time.Duration, 0, *requests)
+	errorLatencies := make([]time.Duration, 0)
+	var latencyMu sync.Mutex
 	var failures atomic.Uint64
 	var transportFailures atomic.Uint64
 	var statuses [600]atomic.Uint64
@@ -68,6 +75,7 @@ func main() {
 				if err != nil {
 					failures.Add(1)
 					transportFailures.Add(1)
+					transportFailures.Add(1)
 					continue
 				}
 				if payload != "" {
@@ -75,18 +83,31 @@ func main() {
 				}
 				begin := time.Now()
 				response, err := client.Do(request)
-				latencies[id] = time.Since(begin)
+				elapsed := time.Since(begin)
 				if err != nil {
 					failures.Add(1)
+					latencyMu.Lock()
+					errorLatencies = append(errorLatencies, elapsed)
+					latencyMu.Unlock()
 					continue
 				}
 				_, copyErr := io.Copy(io.Discard, response.Body)
 				response.Body.Close()
 				if copyErr != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 					failures.Add(1)
+					if copyErr != nil {
+						transportFailures.Add(1)
+					}
+					latencyMu.Lock()
+					errorLatencies = append(errorLatencies, elapsed)
+					latencyMu.Unlock()
 					if response.StatusCode >= 0 && response.StatusCode < len(statuses) {
 						statuses[response.StatusCode].Add(1)
 					}
+				} else {
+					latencyMu.Lock()
+					latencies = append(latencies, elapsed)
+					latencyMu.Unlock()
 				}
 			}
 		}()
@@ -98,9 +119,13 @@ func main() {
 	workers.Wait()
 	duration := time.Since(started)
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	quantile := func(q float64) float64 {
-		index := int(float64(len(latencies)-1) * q)
-		return float64(latencies[index]) / float64(time.Millisecond)
+	sort.Slice(errorLatencies, func(i, j int) bool { return errorLatencies[i] < errorLatencies[j] })
+	quantile := func(values []time.Duration, q float64) float64 {
+		if len(values) == 0 {
+			return 0
+		}
+		index := int(float64(len(values)-1) * q)
+		return float64(values[index]) / float64(time.Millisecond)
 	}
 	errorKinds := make(map[string]uint64)
 	if count := transportFailures.Load(); count != 0 {
@@ -112,9 +137,10 @@ func main() {
 		}
 	}
 	output := result{
-		Requests: *requests, Errors: failures.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
-		OpsPerSec: float64(*requests) / duration.Seconds(), P50MS: quantile(.50), P95MS: quantile(.95),
-		P99MS: quantile(.99), MaxMS: float64(latencies[len(latencies)-1]) / float64(time.Millisecond), ErrorKinds: errorKinds,
+		Requests: *requests, Successes: len(latencies), Errors: failures.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
+		OpsPerSec: float64(*requests) / duration.Seconds(), SuccessOpsPerSec: float64(len(latencies)) / duration.Seconds(), P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
+		P99MS: quantile(latencies, .99), MaxMS: quantile(latencies, 1), ErrorP50MS: quantile(errorLatencies, .50),
+		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds,
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fmt.Fprintln(os.Stderr, err)

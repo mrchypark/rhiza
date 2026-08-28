@@ -3,7 +3,7 @@ package recovery
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"math/rand"
@@ -43,8 +43,29 @@ type racingHeadBucket struct {
 	run  func()
 }
 
+type failPostCASBucket struct {
+	objstore.Bucket
+	armed atomic.Bool
+	fail  atomic.Bool
+}
+
+func (b *failPostCASBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	err := b.Bucket.Upload(ctx, name, r, options...)
+	if err == nil && b.armed.Load() && strings.HasSuffix(name, "archive/head.bin") {
+		b.fail.Store(true)
+	}
+	return err
+}
+
+func (b *failPostCASBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if b.fail.CompareAndSwap(true, false) && strings.HasSuffix(name, "archive/head.bin") {
+		return objstore.ObjectAttributes{}, errors.New("injected post-CAS attributes failure")
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
 func (b *racingHeadBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
-	if strings.HasSuffix(name, "archive/latest.json") {
+	if strings.HasSuffix(name, "archive/head.bin") {
 		b.once.Do(b.run)
 	}
 	return b.Bucket.Get(ctx, name)
@@ -251,7 +272,7 @@ func TestArchiveExtentSplitUsesEncodedSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	rng := rand.New(rand.NewSource(1))
-	for range 64 {
+	for range 72 {
 		value := make([]byte, 120<<10)
 		if _, err := rng.Read(value); err != nil {
 			t.Fatal(err)
@@ -267,8 +288,12 @@ func TestArchiveExtentSplitUsesEncodedSize(t *testing.T) {
 	if len(manager.extents) < 2 {
 		t.Fatal("encoded archive payload was not split")
 	}
-	for _, extent := range manager.extents {
-		data, err := json.Marshal(extent)
+	for _, ref := range manager.extents {
+		extent, err := manager.extentForRef(ctx, ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := encodeExtent(extent)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -278,9 +303,43 @@ func TestArchiveExtentSplitUsesEncodedSize(t *testing.T) {
 	}
 }
 
-func TestArchiveRejectsNumberedObject(t *testing.T) {
-	if err := decodePersistedJSON([]byte(`{"version":2}`), &archiveHead{}); err == nil {
-		t.Fatal("accepted numbered archive object")
+func TestArchiveCodecRejectsJSONAndTrailingData(t *testing.T) {
+	if _, err := decodeHead([]byte(`{"version":2}`)); err == nil {
+		t.Fatal("accepted JSON archive head")
+	}
+	data, err := encodeHead(archiveHead{ConfigID: 1, Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeHead(append(data, 0)); err == nil {
+		t.Fatal("accepted trailing archive head data")
+	}
+}
+
+func TestArchiveExtentCodecIsCanonicalAndStrict(t *testing.T) {
+	value := []byte("value")
+	hash := sha256.Sum256(value)
+	endPrefix := quepaxa.AdvancePrefixHash([32]byte{}, 1, hash)
+	extent := Extent{ConfigID: 7, Start: 1, End: 1, EndPrefix: endPrefix, Decisions: []quepaxa.DecidedValue{{Slot: 1, Hash: hash, Value: value, Certificate: []byte("certificate")}}}
+	first, err := encodeExtent(extent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := encodeExtent(extent)
+	if err != nil || !bytes.Equal(first, second) {
+		t.Fatalf("canonical encode mismatch err=%v", err)
+	}
+	decoded, err := decodeExtent(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ConfigID != extent.ConfigID || decoded.Start != 1 || decoded.End != 1 || len(decoded.Decisions) != 1 || decoded.Decisions[0].Hash != hash {
+		t.Fatalf("decoded extent=%#v", decoded)
+	}
+	for _, invalid := range [][]byte{append(append([]byte(nil), first...), 0), func() []byte { b := append([]byte(nil), first...); b[12] = 1; return b }(), func() []byte { b := append([]byte(nil), first...); b[len(b)-1] ^= 1; return b }()} {
+		if _, err := decodeExtent(invalid); err == nil {
+			t.Fatal("accepted non-canonical archive extent")
+		}
 	}
 }
 
@@ -375,6 +434,43 @@ func TestArchiveCASDoesNotRegressOnStaleWriter(t *testing.T) {
 	}
 	if reader.Tip() != 2 {
 		t.Fatalf("archive tip regressed to %d", reader.Tip())
+	}
+}
+
+func TestArchivePostCASFailureKeepsLocalHeadAndTokenTogether(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := &failPostCASBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if _, _, err := core.Propose(ctx, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SyncThrough(ctx, core, 1); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	oldHead, oldCAS := manager.head, manager.headCAS
+	manager.mu.Unlock()
+	if _, _, err := core.Propose(ctx, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	bucket.armed.Store(true)
+	if err := manager.SyncThrough(ctx, core, 2); err == nil {
+		t.Fatal("post-CAS verification failure was ignored")
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if !archiveHeadsEqual(manager.head, oldHead) || !sameNullableObjectVersion(manager.headCAS, oldCAS) {
+		t.Fatal("post-CAS failure mixed candidate head with stale token")
 	}
 }
 
@@ -496,7 +592,7 @@ func TestArchiveLoadRejectsMixedHeadGeneration(t *testing.T) {
 	}
 }
 
-func TestArchivePublishDoesNotReloadItsTail(t *testing.T) {
+func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 	ctx := context.Background()
 	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
 	wal, err := qlog.Open(t.TempDir())
@@ -529,8 +625,8 @@ func TestArchivePublishDoesNotReloadItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 3 || gets != 1 {
-		t.Fatalf("publish heads=%d gets=%d, want 3/1", heads, gets)
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 3 || gets != 2 {
+		t.Fatalf("publish heads=%d gets=%d, want 3/2", heads, gets)
 	}
 }
 

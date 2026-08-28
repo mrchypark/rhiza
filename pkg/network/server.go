@@ -607,8 +607,10 @@ type QueryRequest struct {
 
 // QueryResponse is the response body for query.
 type QueryResponse struct {
-	Columns []string        `json:"columns"`
-	Rows    [][]interface{} `json:"rows"`
+	Columns      []string        `json:"columns"`
+	Rows         [][]interface{} `json:"rows"`
+	AppliedSlot  uint64          `json:"applied_slot"`
+	ConsensusTip uint64          `json:"consensus_tip"`
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -646,7 +648,7 @@ func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	if err != nil {
 		return QueryResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	return QueryResponse{Columns: result.Columns, Rows: result.Rows}, nil
+	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
 func writeAPIError(w http.ResponseWriter, err error) {
@@ -760,8 +762,10 @@ func (s *Server) handleKVPut(w http.ResponseWriter, r *http.Request) {
 
 type KVGetRequest struct{ Key, Consistency string }
 type KVGetResponse struct {
-	Found bool   `json:"found"`
-	Value []byte `json:"value,omitempty"`
+	Found        bool   `json:"found"`
+	Value        []byte `json:"value,omitempty"`
+	AppliedSlot  uint64 `json:"applied_slot"`
+	ConsensusTip uint64 `json:"consensus_tip"`
 }
 type KVMutationRequest struct {
 	RequestID      string `json:"request_id"`
@@ -805,7 +809,7 @@ func (s *Server) KVGet(ctx context.Context, req KVGetRequest) (KVGetResponse, er
 		return KVGetResponse{}, err
 	}
 	value, found, err := s.material.KVGet(ctx, req.Key, time.Now())
-	return KVGetResponse{Found: found, Value: value}, err
+	return KVGetResponse{Found: found, Value: value, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, err
 }
 
 func (s *Server) handleKVDelete(w http.ResponseWriter, r *http.Request) {

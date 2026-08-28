@@ -18,10 +18,23 @@ func ValidateGraphCommand(command types.GraphCommand) error {
 		return fmt.Errorf("request_id is required and must not exceed %d bytes", types.MaxRequestIDBytes)
 	}
 	cypher := strings.TrimSpace(command.Cypher)
-	if cypher == "" || len(cypher) > MaxSQLBytes {
+	operations := 0
+	if cypher != "" {
+		operations++
+	}
+	if command.StreamOffset != nil {
+		operations++
+	}
+	if command.StreamTrim != nil {
+		operations++
+	}
+	if operations != 1 {
+		return fmt.Errorf("exactly one graph mutation is required")
+	}
+	if cypher != "" && len(cypher) > MaxSQLBytes {
 		return fmt.Errorf("cypher is required and must not exceed %d bytes", MaxSQLBytes)
 	}
-	if strings.Count(strings.TrimSuffix(cypher, ";"), ";") != 0 {
+	if cypher != "" && strings.Count(strings.TrimSuffix(cypher, ";"), ";") != 0 {
 		return fmt.Errorf("exactly one cypher statement is allowed")
 	}
 	if len(command.Args) > MaxSQLArgs {
@@ -36,6 +49,9 @@ func ValidateGraphCommand(command types.GraphCommand) error {
 		}
 	}
 	for i, event := range command.Events {
+		if cypher == "" {
+			return fmt.Errorf("stream events require a cypher mutation")
+		}
 		if err := validateGraphStreamName(event.Stream, false); err != nil {
 			return fmt.Errorf("event %d: %w", i, err)
 		}
@@ -44,6 +60,19 @@ func ValidateGraphCommand(command types.GraphCommand) error {
 		}
 		if _, err := graphArg(event.Payload); err != nil {
 			return fmt.Errorf("event %d payload: %w", i, err)
+		}
+	}
+	if command.StreamOffset != nil {
+		if err := validateGraphStreamName(command.StreamOffset.Stream, true); err != nil {
+			return err
+		}
+		if !utf8.ValidString(command.StreamOffset.Consumer) || command.StreamOffset.Consumer == "" || len(command.StreamOffset.Consumer) > 255 {
+			return fmt.Errorf("consumer is required and must be valid UTF-8 not exceeding 255 bytes")
+		}
+	}
+	if command.StreamTrim != nil {
+		if err := validateGraphStreamName(command.StreamTrim.Stream, true); err != nil {
+			return err
 		}
 	}
 	lower := strings.ToLower(cypher)

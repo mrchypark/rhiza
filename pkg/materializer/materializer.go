@@ -722,6 +722,9 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		if strings.TrimSpace(statement.SQL) == "" {
 			return fmt.Errorf("SQL is required")
 		}
+		if strings.IndexByte(statement.SQL, 0) >= 0 {
+			return fmt.Errorf("SQL contains a null byte")
+		}
 		if len(statement.SQL) > MaxSQLBytes {
 			return fmt.Errorf("SQL exceeds %d bytes", MaxSQLBytes)
 		}
@@ -736,13 +739,42 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 				return err
 			}
 		}
-		keyword := strings.ToUpper(strings.Fields(strings.TrimSpace(statement.SQL))[0])
+		keyword := firstSQLKeyword(statement.SQL)
+		if keyword == "" {
+			return fmt.Errorf("SQL statement has no valid leading keyword")
+		}
 		switch keyword {
 		case "PRAGMA", "ATTACH", "DETACH", "VACUUM", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE":
 			return fmt.Errorf("%s is not allowed on the replicated write API", keyword)
 		}
 	}
 	return nil
+}
+
+func firstSQLKeyword(query string) string {
+	for {
+		query = strings.TrimSpace(query)
+		switch {
+		case strings.HasPrefix(query, "--"):
+			if end := strings.IndexByte(query, '\n'); end >= 0 {
+				query = query[end+1:]
+				continue
+			}
+			return ""
+		case strings.HasPrefix(query, "/*"):
+			if end := strings.Index(query[2:], "*/"); end >= 0 {
+				query = query[end+4:]
+				continue
+			}
+			return ""
+		}
+		break
+	}
+	end := 0
+	for end < len(query) && (query[end] >= 'A' && query[end] <= 'Z' || query[end] >= 'a' && query[end] <= 'z' || query[end] == '_') {
+		end++
+	}
+	return strings.ToUpper(query[:end])
 }
 
 func validatePublicSQL(query string) error {
@@ -769,19 +801,30 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 			args[i] = value
 		}
 		if statement.WantRows {
-			rows, err := tx.QueryContext(ctx, statement.SQL, args...)
+			prepared, err := tx.PrepareContext(ctx, statement.SQL)
 			if err != nil {
+				return result, err
+			}
+			rows, err := prepared.QueryContext(ctx, args...)
+			if err != nil {
+				prepared.Close()
 				return result, err
 			}
 			statementResult, err := collectRowsWithBudget(rows, &budget)
 			rows.Close()
+			prepared.Close()
 			if err != nil {
 				return result, err
 			}
 			result.Statements = append(result.Statements, statementResult)
 			continue
 		}
-		execResult, err := tx.ExecContext(ctx, statement.SQL, args...)
+		prepared, err := tx.PrepareContext(ctx, statement.SQL)
+		if err != nil {
+			return result, err
+		}
+		execResult, err := prepared.ExecContext(ctx, args...)
+		prepared.Close()
 		if err != nil {
 			return result, err
 		}
@@ -1422,8 +1465,12 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		_ = recoverRestore(m.dbPath)
 		return err
 	}
-	os.Remove(m.dbPath + "-wal")
-	os.Remove(m.dbPath + "-shm")
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(m.dbPath + suffix); err != nil && !os.IsNotExist(err) {
+			_ = recoverRestore(m.dbPath)
+			return fmt.Errorf("remove SQLite sidecar %s: %w", suffix, err)
+		}
+	}
 	if err := os.Rename(m.dbPath, backupPath); err != nil && !os.IsNotExist(err) {
 		_ = recoverRestore(m.dbPath)
 		return fmt.Errorf("backup database: %w", err)
@@ -1588,7 +1635,15 @@ func (m *Materializer) closeConnections() error {
 func (m *Materializer) Health(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	if err := m.db.PingContext(ctx); err != nil {
+	m.mu.RLock()
+	db := m.db
+	if db == nil {
+		m.mu.RUnlock()
+		return fmt.Errorf("SQLite materializer is not open")
+	}
+	err := db.PingContext(ctx)
+	m.mu.RUnlock()
+	if err != nil {
 		return err
 	}
 	return m.graphHealth()

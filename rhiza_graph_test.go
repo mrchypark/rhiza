@@ -71,14 +71,14 @@ func TestEmbeddedGraphGoAPI(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&httpEvents); err != nil || len(httpEvents.Records) != 1 {
 		t.Fatalf("stream HTTP response=%#v err=%v", httpEvents, err)
 	}
-	if err := db.SetGraphStreamOffset(context.Background(), rhiza.GraphStreamOffsetRequest{Stream: "tea-events", Consumer: "worker-a", Sequence: events.Records[0].Sequence}); err != nil {
+	if err := db.SetGraphStreamOffset(context.Background(), rhiza.GraphStreamOffsetRequest{RequestID: "offset-1", Stream: "tea-events", Consumer: "worker-a", Sequence: events.Records[0].Sequence}); err != nil {
 		t.Fatal(err)
 	}
 	offset, err := db.GraphStreamOffset(context.Background(), rhiza.GraphStreamOffsetRequest{Stream: "tea-events", Consumer: "worker-a"})
 	if err != nil || !offset.Found || offset.Sequence != events.Records[0].Sequence {
 		t.Fatalf("unexpected offset: %+v err=%v", offset, err)
 	}
-	if err := db.TrimGraphStream(context.Background(), rhiza.GraphStreamTrimRequest{Stream: "tea-events", ThroughSequence: events.Records[0].Sequence}); err != nil {
+	if err := db.TrimGraphStream(context.Background(), rhiza.GraphStreamTrimRequest{RequestID: "trim-1", Stream: "tea-events", ThroughSequence: events.Records[0].Sequence}); err != nil {
 		t.Fatal(err)
 	}
 	events, err = db.GraphStreamRead(context.Background(), rhiza.GraphStreamReadRequest{Stream: "tea-events", Limit: 100})

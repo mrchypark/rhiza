@@ -33,21 +33,28 @@ type GraphStreamReadRequest struct {
 }
 
 type GraphStreamReadResponse struct {
-	Records []types.GraphStreamRecord `json:"records"`
+	Records      []types.GraphStreamRecord `json:"records"`
+	AppliedSlot  uint64                    `json:"applied_slot"`
+	ConsensusTip uint64                    `json:"consensus_tip"`
 }
 
 type GraphStreamOffsetRequest struct {
-	Stream   string `json:"stream"`
-	Consumer string `json:"consumer"`
-	Sequence uint64 `json:"sequence,omitempty"`
+	RequestID   string `json:"request_id,omitempty"`
+	Stream      string `json:"stream"`
+	Consumer    string `json:"consumer"`
+	Sequence    uint64 `json:"sequence,omitempty"`
+	Consistency string `json:"consistency,omitempty"`
 }
 
 type GraphStreamOffsetResponse struct {
-	Sequence uint64 `json:"sequence"`
-	Found    bool   `json:"found"`
+	Sequence     uint64 `json:"sequence"`
+	Found        bool   `json:"found"`
+	AppliedSlot  uint64 `json:"applied_slot"`
+	ConsensusTip uint64 `json:"consensus_tip"`
 }
 
 type GraphStreamTrimRequest struct {
+	RequestID       string `json:"request_id"`
 	Stream          string `json:"stream"`
 	ThroughSequence uint64 `json:"through_sequence"`
 }
@@ -149,6 +156,8 @@ func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (typ
 	if err != nil {
 		return types.GraphCommandResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	result.AppliedSlot = s.material.Tip()
+	result.ConsensusTip = uint64(s.core.Tip())
 	return result, nil
 }
 
@@ -177,12 +186,15 @@ func (s *Server) GraphStreamRead(ctx context.Context, request GraphStreamReadReq
 		}
 		return GraphStreamReadResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	return GraphStreamReadResponse{Records: records}, nil
+	return GraphStreamReadResponse{Records: records, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
 func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
 	if !materializer.GraphEnabled() {
 		return GraphStreamOffsetResponse{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
+	}
+	if err := s.readBarrier(ctx, request.Consistency); err != nil {
+		return GraphStreamOffsetResponse{}, err
 	}
 	sequence, found, err := s.material.GraphStreamOffset(ctx, request.Stream, request.Consumer)
 	if err != nil {
@@ -191,33 +203,23 @@ func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffse
 		}
 		return GraphStreamOffsetResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	return GraphStreamOffsetResponse{Sequence: sequence, Found: found}, nil
+	return GraphStreamOffsetResponse{Sequence: sequence, Found: found, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
 func (s *Server) SetGraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) error {
 	if !materializer.GraphEnabled() {
 		return fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
 	}
-	if err := s.material.SetGraphStreamOffset(ctx, request.Stream, request.Consumer, request.Sequence); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
-	return nil
+	_, err := s.GraphExecute(ctx, types.GraphCommand{RequestID: request.RequestID, StreamOffset: &types.GraphStreamOffsetMutation{Stream: request.Stream, Consumer: request.Consumer, Sequence: request.Sequence}})
+	return err
 }
 
 func (s *Server) TrimGraphStream(ctx context.Context, request GraphStreamTrimRequest) error {
 	if !materializer.GraphEnabled() {
 		return fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
 	}
-	if err := s.material.TrimGraphStream(ctx, request.Stream, request.ThroughSequence); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
-	return nil
+	_, err := s.GraphExecute(ctx, types.GraphCommand{RequestID: request.RequestID, StreamTrim: &types.GraphStreamTrimMutation{Stream: request.Stream, ThroughSequence: request.ThroughSequence}})
+	return err
 }
 
 func (s *Server) handleGraphChanges(w http.ResponseWriter, r *http.Request) {

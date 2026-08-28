@@ -267,6 +267,35 @@ func TestSQLCommandRejectsMutationRows(t *testing.T) {
 	}
 }
 
+func TestReplicatedSQLRejectsTailPragmaAndNullByte(t *testing.T) {
+	m, err := Open(t.TempDir()+"/sql-boundary.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "tail", SQL: "CREATE TABLE escaped (id INTEGER); PRAGMA writable_schema=ON"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM sqlite_master WHERE name='escaped'").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("the first statement executed despite a non-whitespace tail")
+	}
+	if err := ValidateSQLCommand(types.SQLCommand{SQL: "SELECT 1\x00; PRAGMA writable_schema=ON"}); err == nil {
+		t.Fatal("SQL containing a null byte was accepted")
+	}
+	if err := ValidateSQLCommand(types.SQLCommand{SQL: "/* leading comment */ PRAGMA writable_schema=ON"}); err == nil {
+		t.Fatal("comment-prefixed PRAGMA was accepted")
+	}
+}
+
 func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(t.TempDir()+"/features.db", 1)

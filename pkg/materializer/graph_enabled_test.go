@@ -167,14 +167,12 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	}
 	applyGraph(1, person)
 	applyGraph(2, person)
-	if err := m.SetGraphStreamOffset(ctx, "people", "projector", 1); err != nil {
-		t.Fatal(err)
-	}
+	applyGraph(3, types.GraphCommand{RequestID: "offset-1", StreamOffset: &types.GraphStreamOffsetMutation{Stream: "people", Consumer: "projector", Sequence: 1}})
 	value, err := types.EncodeKVCommand(types.KVCommand{RequestID: "kv-1", Operation: "put", Key: "mode", Value: []byte("graph")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(ctx, 3, value); err != nil {
+	if err := m.Apply(ctx, 4, value); err != nil {
 		t.Fatalf("apply KV: %v", err)
 	}
 	result, err := m.GraphQuery(ctx, `MATCH (p:Person {id: $id}) RETURN p.name`, map[string]any{"id": "1"})
@@ -190,7 +188,7 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	applyGraph(4, types.GraphCommand{
+	applyGraph(5, types.GraphCommand{
 		RequestID: "person-2", Cypher: `CREATE (p:Person {id: '2', name: 'Grace'})`,
 		Events: []types.GraphStreamEvent{{Stream: "people", Kind: "person.created", Payload: map[string]any{"id": "2"}}},
 	})
@@ -198,7 +196,7 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err = m.GraphQuery(ctx, `MATCH (p:Person) RETURN p.name ORDER BY p.name`, nil)
-	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "Ada" || m.Tip() != 3 {
+	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "Ada" || m.Tip() != 4 {
 		t.Fatalf("restored graph result=%+v tip=%d err=%v", result, m.Tip(), err)
 	}
 	got, found, err = m.KVGet(ctx, "mode", time.Now())
@@ -221,8 +219,8 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if m.Tip() != 3 {
-		t.Fatalf("tip=%d, want 3", m.Tip())
+	if m.Tip() != 4 {
+		t.Fatalf("tip=%d, want 4", m.Tip())
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -113,10 +114,23 @@ type NotifyCommand struct {
 
 // GraphCommand is one idempotent, replicated Cypher mutation.
 type GraphCommand struct {
-	RequestID string             `json:"request_id"`
-	Cypher    string             `json:"cypher"`
-	Args      map[string]any     `json:"args,omitempty"`
-	Events    []GraphStreamEvent `json:"events,omitempty"`
+	RequestID    string                     `json:"request_id"`
+	Cypher       string                     `json:"cypher,omitempty"`
+	Args         map[string]any             `json:"args,omitempty"`
+	Events       []GraphStreamEvent         `json:"events,omitempty"`
+	StreamOffset *GraphStreamOffsetMutation `json:"stream_offset,omitempty"`
+	StreamTrim   *GraphStreamTrimMutation   `json:"stream_trim,omitempty"`
+}
+
+type GraphStreamOffsetMutation struct {
+	Stream   string `json:"stream"`
+	Consumer string `json:"consumer"`
+	Sequence uint64 `json:"sequence"`
+}
+
+type GraphStreamTrimMutation struct {
+	Stream          string `json:"stream"`
+	ThroughSequence uint64 `json:"through_sequence"`
 }
 
 // GraphStreamEvent is published atomically with its GraphCommand.
@@ -134,9 +148,11 @@ type GraphStreamRecord struct {
 }
 
 type GraphCommandResult struct {
-	Columns []string `json:"columns,omitempty"`
-	Rows    [][]any  `json:"rows,omitempty"`
-	Error   string   `json:"error,omitempty"`
+	Columns      []string `json:"columns,omitempty"`
+	Rows         [][]any  `json:"rows,omitempty"`
+	Error        string   `json:"error,omitempty"`
+	AppliedSlot  uint64   `json:"applied_slot,omitempty"`
+	ConsensusTip uint64   `json:"consensus_tip,omitempty"`
 }
 
 func EncodeGraphCommand(command GraphCommand) ([]byte, error) {
@@ -273,6 +289,9 @@ func DecodeGraphBatch(value []byte) ([]GraphCommand, bool, error) {
 	if err := decoder.Decode(&commands); err != nil {
 		return nil, true, err
 	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, true, err
+	}
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty graph command batch")
 	}
@@ -349,10 +368,24 @@ func DecodeSQLBatch(value []byte) ([]SQLCommand, bool, error) {
 	if err := decoder.Decode(&commands); err != nil {
 		return nil, true, err
 	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return nil, true, err
+	}
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty SQL command batch")
 	}
 	return commands, true, nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON value")
+		}
+		return fmt.Errorf("trailing JSON data: %w", err)
+	}
+	return nil
 }
 
 func EncodeLeaderSchedule(members []NodeID) ([]byte, error) {

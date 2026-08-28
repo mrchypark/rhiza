@@ -38,6 +38,8 @@ type graphState struct {
 	mu                sync.RWMutex
 	tip               uint64
 	idempotencyWindow uint64
+	streamWake        chan struct{}
+	queryWG           sync.WaitGroup
 }
 
 type graphSnapshot struct {
@@ -91,7 +93,7 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 	if err != nil {
 		return nil, err
 	}
-	g := &graphState{db: db, idempotencyWindow: idempotencyWindow}
+	g := &graphState{db: db, idempotencyWindow: idempotencyWindow, streamWake: make(chan struct{})}
 	encodedTip, err := g.getMetadata(graphTipKey)
 	if err != nil {
 		g.close()
@@ -222,7 +224,9 @@ func (g *graphState) close() {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.queryWG.Wait()
 	if g.db != nil {
+		close(g.streamWake)
 		_ = g.db.Close()
 		g.db = nil
 	}
@@ -291,6 +295,8 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 		}
 	}
 	g.tip = slot
+	close(g.streamWake)
+	g.streamWake = make(chan struct{})
 	return nil
 }
 
@@ -329,7 +335,14 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 			}
 			return nil
 		}
-		_, err = tx.QueryContext(ctx, command.Cypher, args, MaxReturningRows, MaxResultBytes)
+		switch {
+		case command.StreamOffset != nil:
+			err = tx.SetStreamOffset(command.StreamOffset.Stream, command.StreamOffset.Consumer, command.StreamOffset.Sequence)
+		case command.StreamTrim != nil:
+			err = tx.TrimStream(command.StreamTrim.Stream, command.StreamTrim.ThroughSequence)
+		default:
+			_, err = tx.QueryContext(ctx, command.Cypher, args, MaxReturningRows, MaxResultBytes)
+		}
 		if err != nil {
 			return err
 		}
@@ -564,20 +577,20 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 		return types.GraphCommandResult{}, err
 	}
 	g := m.graph
-	g.mu.RLock()
 	if g.tip != m.tip {
-		g.mu.RUnlock()
 		m.mu.RUnlock()
 		return types.GraphCommandResult{}, fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
 	}
+	db := g.db
+	g.queryWG.Add(1)
+	m.mu.RUnlock()
+	defer g.queryWG.Done()
 	var result latticedb.QueryResult
-	err = g.db.View(func(tx *latticedb.Tx) error {
+	err = db.View(func(tx *latticedb.Tx) error {
 		var queryErr error
 		result, queryErr = tx.QueryContext(ctx, cypher, converted, MaxReturningRows, MaxResultBytes)
 		return queryErr
 	})
-	g.mu.RUnlock()
-	m.mu.RUnlock()
 	if err != nil {
 		return types.GraphCommandResult{}, err
 	}
@@ -604,6 +617,7 @@ func (m *Materializer) GraphReadStream(ctx context.Context, stream string, after
 		}
 		g.mu.RLock()
 		records, err := g.db.ReadStream(stream, afterSequence, limit, 0)
+		wake := g.streamWake
 		g.mu.RUnlock()
 		m.mu.RUnlock()
 		if err != nil || len(records) > 0 || wait == 0 || !time.Now().Before(deadline) {
@@ -613,13 +627,15 @@ func (m *Materializer) GraphReadStream(ctx context.Context, stream string, after
 			}
 			return out, err
 		}
-		delay := min(25*time.Millisecond, time.Until(deadline))
+		delay := time.Until(deadline)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, ctx.Err()
 		case <-timer.C:
+		case <-wake:
+			timer.Stop()
 		}
 	}
 }
@@ -649,47 +665,6 @@ func (m *Materializer) GraphStreamOffset(ctx context.Context, stream, consumer s
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
 	return m.graph.db.GetStreamOffset(stream, consumer)
-}
-
-func (m *Materializer) SetGraphStreamOffset(ctx context.Context, stream, consumer string, sequence uint64) error {
-	if err := validateGraphStreamName(stream, true); err != nil {
-		return err
-	}
-	if err := validateGraphStreamConsumer(consumer); err != nil {
-		return err
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.graph == nil || m.graph.db == nil {
-		return fmt.Errorf("LatticeDB is not open")
-	}
-	m.graph.mu.Lock()
-	defer m.graph.mu.Unlock()
-	return m.graph.db.Update(func(tx *latticedb.Tx) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return tx.SetStreamOffset(stream, consumer, sequence)
-	})
-}
-
-func (m *Materializer) TrimGraphStream(ctx context.Context, stream string, throughSequence uint64) error {
-	if err := validateGraphStreamName(stream, true); err != nil {
-		return err
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.graph == nil || m.graph.db == nil {
-		return fmt.Errorf("LatticeDB is not open")
-	}
-	m.graph.mu.Lock()
-	defer m.graph.mu.Unlock()
-	return m.graph.db.Update(func(tx *latticedb.Tx) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return tx.TrimStream(stream, throughSequence)
-	})
 }
 
 func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult, error) {

@@ -54,6 +54,7 @@ type mutationBatcher[T any] struct {
 	encodeItem func(T) ([]byte, error)
 	assemble   func([][]byte) []byte
 	requestID  func(T) string
+	baseSize   int
 	input      chan *batchItem
 	jobs       chan batchJob
 	inflight   chan struct{}
@@ -71,7 +72,8 @@ func newMutationBatcher[T any](propose func(context.Context, []byte) (quepaxa.Sl
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &mutationBatcher[T]{
 		propose: propose, apply: apply, encodeItem: encodeItem, assemble: assemble, requestID: requestID,
-		input: make(chan *batchItem, maxQueuedRequests), jobs: make(chan batchJob), inflight: make(chan struct{}, maxInflightBatches),
+		baseSize: len(assemble(nil)),
+		input:    make(chan *batchItem, maxQueuedRequests), jobs: make(chan batchJob), inflight: make(chan struct{}, maxInflightBatches),
 		ctx: ctx, cancel: cancel,
 	}
 	b.wg.Add(1 + maxInflightBatches)
@@ -99,7 +101,7 @@ func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slo
 	if err != nil {
 		return 0, err
 	}
-	if len(b.assemble([][]byte{encoded})) > quepaxa.MaxReplicatedValueBytes {
+	if b.baseSize+len(encoded) > quepaxa.MaxReplicatedValueBytes {
 		return 0, ErrInvalidRequest
 	}
 	item := &batchItem{
@@ -172,6 +174,7 @@ func (b *mutationBatcher[T]) run() {
 		idle := b.idle() && len(b.input) == 0
 		items := []*batchItem{first}
 		encoded := [][]byte{first.encoded}
+		encodedSize := b.baseSize + len(first.encoded)
 		now := time.Now()
 		ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(first.encoded))
 		if idle {
@@ -181,8 +184,7 @@ func (b *mutationBatcher[T]) run() {
 
 	collect:
 		for len(items) < maxMutationBatch {
-			current := len(b.assemble(encoded))
-			if current >= targetBatchBytes {
+			if encodedSize >= targetBatchBytes {
 				break
 			}
 			select {
@@ -190,35 +192,35 @@ func (b *mutationBatcher[T]) run() {
 				b.releaseQueue(next.reserved)
 				now = time.Now()
 				ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(next.encoded))
-				if len(b.assemble(append(encoded, next.encoded))) > quepaxa.MaxReplicatedValueBytes {
+				if encodedSize+1+len(next.encoded) > quepaxa.MaxReplicatedValueBytes {
 					carry = next
 					break collect
 				}
 				items = append(items, next)
 				encoded = append(encoded, next.encoded)
+				encodedSize += 1 + len(next.encoded)
 				continue
 			default:
 			}
 
-			wait := adaptiveWait(ewmaRate, current, time.Since(first.enqueued))
+			wait := adaptiveWait(ewmaRate, encodedSize, time.Since(first.enqueued))
 			if wait <= 0 {
 				break
 			}
 			timer := time.NewTimer(wait)
 			select {
 			case next := <-b.input:
-				if !timer.Stop() {
-					<-timer.C
-				}
+				timer.Stop()
 				b.releaseQueue(next.reserved)
 				now = time.Now()
 				ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(next.encoded))
-				if len(b.assemble(append(encoded, next.encoded))) > quepaxa.MaxReplicatedValueBytes {
+				if encodedSize+1+len(next.encoded) > quepaxa.MaxReplicatedValueBytes {
 					carry = next
 					break collect
 				}
 				items = append(items, next)
 				encoded = append(encoded, next.encoded)
+				encodedSize += 1 + len(next.encoded)
 			case <-timer.C:
 				break
 			case <-b.ctx.Done():

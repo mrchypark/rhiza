@@ -42,6 +42,10 @@ func main() {
 	if err != nil || objStoreSyncInterval < 0 {
 		log.Fatalf("invalid RHIZA_OBJSTORE_SYNC_INTERVAL")
 	}
+	objStoreBatchDelay, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_BATCH_DELAY", "2ms"))
+	if err != nil || objStoreBatchDelay <= 0 || objStoreBatchDelay > time.Second {
+		log.Fatalf("invalid RHIZA_OBJSTORE_BATCH_DELAY")
+	}
 	objStoreGCInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_GC_INTERVAL", "1h"))
 	if err != nil || objStoreGCInterval < 0 {
 		log.Fatalf("invalid RHIZA_OBJSTORE_GC_INTERVAL")
@@ -79,6 +83,7 @@ func main() {
 		ObjStoreSessionToken:  os.Getenv("RHIZA_OBJSTORE_SESSION_TOKEN"),
 		ObjStoreDurability:    rhiza.ObjectStoreDurability(getEnvOrDefault("RHIZA_OBJSTORE_DURABILITY", "async")),
 		ObjStoreSyncInterval:  objStoreSyncInterval,
+		ObjStoreBatchDelay:    objStoreBatchDelay,
 		ObjStoreGCInterval:    objStoreGCInterval,
 		ObjStoreGCGracePeriod: objStoreGCGracePeriod,
 		CheckpointInterval:    checkpointInterval,

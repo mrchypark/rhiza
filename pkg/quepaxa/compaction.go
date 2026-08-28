@@ -32,9 +32,6 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 		return err
 	}
 	base := consensusBase{ConfigID: seal.ConfigID, ClosedThrough: seal.Index, PrefixHash: seal.PrefixHash, RecoveryRoot: seal.RootHash, LeaderEpoch: leaderEpoch(seal.Index + 1), NextLeaderOrder: append([]NodeID(nil), seal.NextLeaderOrder...), FollowingLeaderOrder: append([]NodeID(nil), seal.FollowingLeaderOrder...)}
-	c.mu.Lock()
-	c.installBaseLocked(base)
-	c.mu.Unlock()
 	if err := c.validateDecisionForRecovery(decision, true); err != nil {
 		return fmt.Errorf("validate checkpoint recovery decision: %w", err)
 	}
@@ -46,6 +43,7 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 		return err
 	}
 	c.mu.Lock()
+	c.installBaseLocked(base)
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
 	c.mu.Unlock()
 	return nil
@@ -67,40 +65,31 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}
-	for range cap(c.pipeline) {
-		c.pipeline <- struct{}{}
-	}
-	defer func() {
-		for range cap(c.pipeline) {
-			<-c.pipeline
-		}
-	}()
-	c.slotMu.Lock()
-	defer c.slotMu.Unlock()
-	for i := range c.recordLocks {
-		c.recordLocks[i].Lock()
-	}
-	defer func() {
-		for i := len(c.recordLocks) - 1; i >= 0; i-- {
-			c.recordLocks[i].Unlock()
-		}
-	}()
-
+	c.checkpointMu.Lock()
+	defer c.checkpointMu.Unlock()
+	c.lockCompactionBarrier()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if through <= c.floor || through > c.tip {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
 		return fmt.Errorf("compaction floor %d is outside retained range (%d,%d]", through, c.floor, c.tip)
 	}
 	seal, sealed := c.sealedRoots[recoveryRoot]
 	if preparedRoot, prepared := c.preparedCheckpoints[through]; !sealed || seal.Index != through || !prepared || preparedRoot != recoveryRoot {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
 		return fmt.Errorf("recovery root is not locally verified and quorum sealed through %d", through)
 	}
 	prefix, ok := c.prefixes[through]
 	if !ok {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
 		return fmt.Errorf("prefix hash at slot %d is unavailable", through)
 	}
 	order, following, err := c.checkpointLeaderOrdersLocked(through)
 	if err != nil {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
 		return err
 	}
 	base := consensusBase{
@@ -109,31 +98,59 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	}
 	payload, err := json.Marshal(base)
 	if err != nil {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
 		return err
 	}
-	keep := make(map[[32]byte]struct{})
-	for slot, decision := range c.decided {
-		if slot > through {
-			keep[decision.Hash] = struct{}{}
-		}
+	keep := make(map[[32]byte]struct{}, len(c.values))
+	for hash := range c.values {
+		keep[hash] = struct{}{}
 	}
-	for slot, state := range c.recorders {
-		if slot <= through {
-			continue
-		}
-		for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
-			if proposal != nil {
-				keep[proposal.Hash] = struct{}{}
-			}
-		}
+	compaction, err := c.wal.BeginCompaction(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, keep)
+	c.mu.Unlock()
+	c.unlockCompactionBarrier()
+	if err != nil {
+		return err
 	}
-	if err := c.wal.Compact(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, keep); err != nil {
+	defer compaction.Abort()
+	if err := compaction.Build(); err != nil {
+		return err
+	}
+
+	c.lockCompactionBarrier()
+	defer c.unlockCompactionBarrier()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.floor >= through {
+		return fmt.Errorf("compaction floor advanced while rewrite was running")
+	}
+	if err := compaction.Commit(); err != nil {
 		return err
 	}
 	c.installBaseLocked(base)
 	c.advanceTipLocked()
 	c.pruneSlotAllocatorLocked()
 	return nil
+}
+
+func (c *Core) lockCompactionBarrier() {
+	for range cap(c.pipeline) {
+		c.pipeline <- struct{}{}
+	}
+	c.slotMu.Lock()
+	for i := range c.recordLocks {
+		c.recordLocks[i].Lock()
+	}
+}
+
+func (c *Core) unlockCompactionBarrier() {
+	for i := len(c.recordLocks) - 1; i >= 0; i-- {
+		c.recordLocks[i].Unlock()
+	}
+	c.slotMu.Unlock()
+	for range cap(c.pipeline) {
+		<-c.pipeline
+	}
 }
 
 func (c *Core) LatestCheckpointSeal() (SealedCheckpoint, bool, error) {

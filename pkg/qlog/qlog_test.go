@@ -3,7 +3,6 @@ package qlog
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -47,15 +46,37 @@ func TestWALCloseReportsSegmentErrors(t *testing.T) {
 	}
 }
 
+func TestWALRolloverRequiresDirectorySync(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	wantErr := errors.New("directory sync failed")
+	wal.maxSize = 1
+	wal.syncDir = func(string) error { return wantErr }
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); !errors.Is(err, wantErr) {
+		t.Fatalf("append error=%v, want %v", err, wantErr)
+	}
+	if len(wal.segments) != 1 || wal.current.index != 1 {
+		t.Fatalf("failed rollover changed active segments: count=%d current=%d", len(wal.segments), wal.current.index)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "seg_002.log")); !os.IsNotExist(err) {
+		t.Fatalf("failed rollover left segment behind: %v", err)
+	}
+}
+
 func TestWALUsesPrivatePermissions(t *testing.T) {
 	dir := t.TempDir() + "/qlog"
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
 	segment := filepath.Join(dir, "seg_001.log")
-	if err := os.WriteFile(segment, nil, 0644); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Chmod(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -281,25 +302,121 @@ func TestWALRepairsTornTailBeforeAppend(t *testing.T) {
 	}
 }
 
-func TestWALSortsSegmentIndexesNumerically(t *testing.T) {
+func TestWALRejectsManifestlessSegments(t *testing.T) {
 	dir := t.TempDir()
-	for _, entry := range []Entry{{Slot: 999, Type: EntryProposal}, {Slot: 1000, Type: EntryProposal}} {
-		path := filepath.Join(dir, fmt.Sprintf("seg_%03d.log", entry.Slot))
-		if err := os.WriteFile(path, entry.Encode(), 0644); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, "seg_001.log"), (Entry{Slot: 1, Type: EntryProposal}).Encode(), 0600); err != nil {
+		t.Fatal(err)
 	}
+	if _, err := Open(dir); err == nil {
+		t.Fatal("manifestless WAL layout was accepted")
+	}
+}
+
+func TestWALCompactionRetainsConcurrentTailExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
 	wal, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer wal.Close()
-	entries, err := wal.Read()
+	for slot := uint64(1); slot <= 3; slot++ {
+		if err := wal.Append(Entry{Slot: slot, Type: EntryProposal, Payload: []byte{byte(slot)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := Entry{Slot: 1, Type: EntryCheckpoint, Hash: [32]byte{1}, Payload: []byte("base")}
+	plan, err := wal.BeginCompaction(base, map[[32]byte]struct{}{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 || entries[0].Slot != 999 || entries[1].Slot != 1000 || wal.current.index != 1000 {
-		t.Fatalf("segments were not sorted numerically: %#v current=%d", entries, wal.current.index)
+	defer plan.Abort()
+	if err := wal.Append(Entry{Slot: 4, Type: EntryReceipt, Payload: []byte("during-build")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 5, Type: EntryReceipt, Payload: []byte("before-install")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 || entries[0].Type != EntryCheckpoint || entries[1].Slot != 4 || entries[2].Slot != 5 {
+		t.Fatalf("compacted entries=%#v", entries)
+	}
+}
+
+func TestWALRecoveryIgnoresUncommittedCompactionSegment(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("old")}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := wal.BeginCompaction(Entry{Slot: 1, Type: EntryCheckpoint, Hash: [32]byte{1}, Payload: []byte("base")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Build(); err != nil {
+		plan.Abort()
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 2, Type: EntryReceipt, Payload: []byte("tail")}); err != nil {
+		plan.Abort()
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		plan.Abort()
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		plan.Abort()
+		t.Fatal(err)
+	}
+	entries, err := reopened.Read()
+	if err != nil {
+		reopened.Close()
+		plan.Abort()
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Slot != 1 || entries[1].Slot != 2 {
+		t.Fatalf("recovered uncommitted layout=%#v", entries)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	plan.Abort()
+}
+
+func TestWALFailsClosedOnCorruptHighestManifest(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest_99999999999999999999.bin"), []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err == nil {
+		t.Fatal("corrupt highest WAL manifest was ignored")
 	}
 }
 

@@ -58,6 +58,7 @@ type ExecutionConfig struct {
 	ObjStoreSessionToken  string                `json:"objstore_session_token"`
 	ObjStoreDurability    ObjectStoreDurability `json:"objstore_durability"`
 	ObjStoreSyncInterval  time.Duration         `json:"objstore_sync_interval"`
+	ObjStoreBatchDelay    time.Duration         `json:"objstore_batch_delay"`
 	ObjStoreGCInterval    time.Duration         `json:"objstore_gc_interval"`
 	ObjStoreGCGracePeriod time.Duration         `json:"objstore_gc_grace_period"`
 

@@ -502,6 +502,22 @@ func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	target.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	failingWAL, err := qlog.Open(t.TempDir() + "/failing-target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer failingWAL.Close()
+	if err := failingWAL.SetMaxBytes(1); err != nil {
+		t.Fatal(err)
+	}
+	failing := newCore("n1", config, failingWAL, nil)
+	failing.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := failing.RestoreCheckpointBase(context.Background(), seal, baseDecision); !errors.Is(err, qlog.ErrCapacity) {
+		t.Fatalf("restore error=%v, want WAL capacity", err)
+	}
+	if failing.Tip() != 0 || failing.CompactionFloor() != 0 {
+		t.Fatalf("failed restore changed memory state: tip=%d floor=%d", failing.Tip(), failing.CompactionFloor())
+	}
 	if err := target.RestoreCheckpointBase(context.Background(), seal, baseDecision); err != nil {
 		t.Fatal(err)
 	}

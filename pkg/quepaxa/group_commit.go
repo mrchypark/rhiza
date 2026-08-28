@@ -54,9 +54,7 @@ func (g *groupCommit) flush() {
 		select {
 		case <-timer.C:
 		case <-g.wake:
-			if !timer.Stop() {
-				<-timer.C
-			}
+			timer.Stop()
 		}
 		g.mu.Lock()
 		waiters := g.waiters

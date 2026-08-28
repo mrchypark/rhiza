@@ -69,6 +69,7 @@ type Config struct {
 	ObjStoreSessionToken  string
 	ObjStoreDurability    ObjectStoreDurability
 	ObjStoreSyncInterval  time.Duration
+	ObjStoreBatchDelay    time.Duration
 	ObjStoreGCInterval    time.Duration
 	ObjStoreGCGracePeriod time.Duration
 	CheckpointInterval    time.Duration
@@ -131,6 +132,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,
 		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
+		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
 		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes, HedgeDelay: config.HedgeDelay,
 	}
@@ -149,7 +151,10 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 }
 
 func (db *DB) Close() error {
-	db.closeOnce.Do(func() { db.cancel(); db.closeErr = db.node.Shutdown() })
+	db.closeOnce.Do(func() {
+		db.closeErr = db.node.Shutdown()
+		db.cancel()
+	})
 	return db.closeErr
 }
 
@@ -187,22 +192,22 @@ func (db *DB) GraphChanges(ctx context.Context, req GraphStreamReadRequest) (Gra
 	return db.api.GraphChanges(ctx, req)
 }
 
-// GraphStreamRead reads a node-local named stream after its per-stream cursor.
+// GraphStreamRead reads a replicated named stream after its per-stream cursor.
 func (db *DB) GraphStreamRead(ctx context.Context, req GraphStreamReadRequest) (GraphStreamReadResponse, error) {
 	return db.api.GraphStreamRead(ctx, req)
 }
 
-// GraphStreamOffset returns a node-local durable consumer offset.
+// GraphStreamOffset returns a replicated durable consumer offset.
 func (db *DB) GraphStreamOffset(ctx context.Context, req GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
 	return db.api.GraphStreamOffset(ctx, req)
 }
 
-// SetGraphStreamOffset stores a node-local durable consumer offset.
+// SetGraphStreamOffset stores a replicated durable consumer offset.
 func (db *DB) SetGraphStreamOffset(ctx context.Context, req GraphStreamOffsetRequest) error {
 	return db.api.SetGraphStreamOffset(ctx, req)
 }
 
-// TrimGraphStream deletes node-local records through the supplied sequence.
+// TrimGraphStream replicates deletion of records through the supplied sequence.
 func (db *DB) TrimGraphStream(ctx context.Context, req GraphStreamTrimRequest) error {
 	return db.api.TrimGraphStream(ctx, req)
 }

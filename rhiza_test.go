@@ -4,7 +4,8 @@ package rhiza_test
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -132,17 +133,14 @@ func objectStoreTip(t *testing.T, dir, cluster, node string) uint64 {
 }
 
 func readObjectStoreTip(dir, cluster, _ string) (uint64, error) {
-	data, err := os.ReadFile(filepath.Join(dir, cluster, "archive", "latest.json"))
+	data, err := os.ReadFile(filepath.Join(dir, cluster, "archive", "head.bin"))
 	if err != nil {
 		return 0, err
 	}
-	var head struct {
-		Tip uint64 `json:"tip"`
+	if len(data) < 80 || string(data[:8]) != "RHZAHEAD" {
+		return 0, fmt.Errorf("invalid archive head")
 	}
-	if err := json.Unmarshal(data, &head); err != nil {
-		return 0, err
-	}
-	return head.Tip, nil
+	return binary.BigEndian.Uint64(data[72:80]), nil
 }
 
 func TestEmbeddedObjectStoreRecovery(t *testing.T) {

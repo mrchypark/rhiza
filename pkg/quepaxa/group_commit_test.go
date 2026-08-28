@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestGroupCommitSharesOneSync(t *testing.T) {
@@ -34,5 +35,19 @@ func TestGroupCommitSharesOneSync(t *testing.T) {
 	wait.Wait()
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("sync calls=%d, want 1", got)
+	}
+}
+
+func TestGroupCommitWakeTimerRaceMakesProgress(t *testing.T) {
+	commit := newGroupCommit(func() error { return nil })
+	commit.delay = time.Nanosecond
+	commit.max = 1
+	for i := 0; i < 10_000; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		err := commit.Sync(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("iteration %d stopped making progress: %v", i, err)
+		}
 	}
 }

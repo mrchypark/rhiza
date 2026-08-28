@@ -49,14 +49,6 @@ func (*Materializer) GraphStreamOffset(context.Context, string, string) (uint64,
 	return 0, false, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
-func (*Materializer) SetGraphStreamOffset(context.Context, string, string, uint64) error {
-	return fmt.Errorf("graph API is not supported by the sql-kv build")
-}
-
-func (*Materializer) TrimGraphStream(context.Context, string, uint64) error {
-	return fmt.Errorf("graph API is not supported by the sql-kv build")
-}
-
 func (*Materializer) GraphRequestMatches(context.Context, types.GraphCommand) (bool, error) {
 	return false, fmt.Errorf("graph API is not supported by the sql-kv build")
 }

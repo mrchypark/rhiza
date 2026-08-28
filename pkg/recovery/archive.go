@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,7 +42,8 @@ type Extent struct {
 }
 
 type archiveHead struct {
-	ConfigID     uint                    `json:"config_id"`
+	ConfigID     uint `json:"config_id"`
+	Generation   uint64
 	Base         quepaxa.Slot            `json:"base"`
 	BasePrefix   [32]byte                `json:"base_prefix"`
 	BaseSeal     *quepaxa.CheckpointSeal `json:"base_seal,omitempty"`
@@ -82,6 +82,7 @@ type Manager struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	batchWG      sync.WaitGroup
+	groupDelay   time.Duration
 	closed       bool
 	gcMu         sync.Mutex
 	readMu       sync.Mutex
@@ -92,9 +93,16 @@ type Manager struct {
 func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
 	options := bucket.SupportedObjectUploadOptions()
 	ctx, cancel := context.WithCancel(context.Background())
-	m := &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists), cache: make(map[[32]byte]Extent), ctx: ctx, cancel: cancel}
+	m := &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists), cache: make(map[[32]byte]Extent), ctx: ctx, cancel: cancel, groupDelay: archiveGroupDelay}
 	m.readCond = sync.NewCond(&m.readMu)
 	return m
+}
+
+// SetGroupDelay selects the maximum linger used to coalesce archive writes.
+func (m *Manager) SetGroupDelay(delay time.Duration) {
+	if delay > 0 {
+		m.groupDelay = delay
+	}
 }
 
 func (m *Manager) Close() {
@@ -120,7 +128,7 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 	m.mu.Lock()
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
-	name := m.key("archive/latest.json")
+	name := m.key("archive/head.bin")
 	attributes, headData, unchanged, err := m.readStableHead(ctx, name, oldCAS)
 	if err != nil {
 		if !m.bucket.IsObjNotFoundErr(err) {
@@ -148,18 +156,18 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 	if unchanged {
 		return nil
 	}
-	var head archiveHead
-	if err := decodePersistedJSON(headData, &head); err != nil {
+	head, err := decodeHead(headData)
+	if err != nil {
 		return err
 	}
-	if head.ConfigID != m.configID || head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) {
+	if head.ConfigID != m.configID || head.Generation == 0 || head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) {
 		return fmt.Errorf("invalid shared archive head")
 	}
 	if head.Base > 0 && (head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix) {
 		return fmt.Errorf("invalid shared archive recovery base")
 	}
 	extents := make([]Extent, 0)
-	if head.Base < oldHead.Base || head.Tip < oldHead.Tip || oldHead.ConfigID != 0 && head.Base == oldHead.Base && !archiveBaseEqual(head, oldHead) {
+	if head.Generation < oldHead.Generation || head.Base < oldHead.Base || head.Tip < oldHead.Tip || oldHead.ConfigID != 0 && head.Base == oldHead.Base && !archiveBaseEqual(head, oldHead) {
 		return fmt.Errorf("shared archive head regressed or changed recovery base")
 	}
 	known := make(map[[32]byte]int, len(oldExtents))
@@ -281,8 +289,8 @@ func archiveBaseEqual(a, b archiveHead) bool {
 	if a.Base != b.Base || a.BasePrefix != b.BasePrefix {
 		return false
 	}
-	a.Base, a.BasePrefix, a.Tip, a.TailHash = 0, [32]byte{}, 0, [32]byte{}
-	b.Base, b.BasePrefix, b.Tip, b.TailHash = 0, [32]byte{}, 0, [32]byte{}
+	a.Generation, a.Base, a.BasePrefix, a.Tip, a.TailHash = 0, 0, [32]byte{}, 0, [32]byte{}
+	b.Generation, b.Base, b.BasePrefix, b.Tip, b.TailHash = 0, 0, [32]byte{}, 0, [32]byte{}
 	return archiveHeadsEqual(a, b)
 }
 
@@ -312,6 +320,7 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 		}
 		sealCopy, decisionCopy := sealed.CheckpointSeal, decision
 		head.Base, head.BasePrefix, head.BaseSeal, head.BaseDecision = through, prefix, &sealCopy, &decisionCopy
+		head.Generation++
 		extents := make([]Extent, 0, len(refs))
 		for _, extent := range refs {
 			if extent.End <= through {
@@ -327,12 +336,12 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 			head.TailHash = [32]byte{}
 		}
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
-			m.mu.Lock()
-			m.extents, m.head = extents, head
-			m.mu.Unlock()
 			if m.cas {
 				return m.refreshPublishedHead(ctx, head)
 			}
+			m.mu.Lock()
+			m.extents, m.head = extents, head
+			m.mu.Unlock()
 			return nil
 		} else if !m.cas {
 			return err
@@ -406,7 +415,7 @@ func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.
 
 func (m *Manager) flushBatch(batch *syncBatch, core source) {
 	defer m.batchWG.Done()
-	timer := time.NewTimer(archiveGroupDelay)
+	timer := time.NewTimer(m.groupDelay)
 	select {
 	case <-m.ctx.Done():
 		timer.Stop()
@@ -446,7 +455,7 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 			if err != nil {
 				return err
 			}
-			data, err := json.Marshal(extent)
+			data, err := encodeExtent(extent)
 			if err != nil {
 				return fmt.Errorf("encode archive extent: %w", err)
 			}
@@ -463,7 +472,11 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 				return fmt.Errorf("archive source tip %d is behind required slot %d", sourceTip, through)
 			}
 		}
+		head.Generation++
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
+			if m.cas {
+				return m.refreshPublishedHead(ctx, head)
+			}
 			refs = append(refs, added...)
 			for _, extent := range added {
 				m.rememberExtent(extent)
@@ -474,9 +487,6 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 			m.mu.Lock()
 			m.extents, m.head, m.tip = refs, head, head.Tip
 			m.mu.Unlock()
-			if m.cas {
-				return m.refreshPublishedHead(ctx, head)
-			}
 			return nil
 		} else if !m.cas {
 			return err
@@ -489,7 +499,7 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *objstore.ObjectVersion) error {
-	data, err := json.Marshal(head)
+	data, err := encodeHead(head)
 	if err != nil {
 		return err
 	}
@@ -504,7 +514,7 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 			options = append(options, objstore.WithIfMatch(headCAS))
 		}
 	}
-	return m.bucket.Upload(ctx, m.key("archive/latest.json"), bytes.NewReader(data), options...)
+	return m.bucket.Upload(ctx, m.key("archive/head.bin"), bytes.NewReader(data), options...)
 }
 
 func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous [32]byte) (Extent, quepaxa.Slot, error) {
@@ -527,16 +537,13 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 	encodedDecisions := 0
 	var endPrefix [32]byte
 	for _, decision := range decisions {
-		encoded, err := json.Marshal(decision)
-		if err != nil {
-			return Extent{}, tip, err
-		}
+		encodedSize := archiveDecisionSize(decision)
 		candidatePrefix, ok := core.PrefixHash(decision.Slot)
 		if !ok {
 			return Extent{}, tip, fmt.Errorf("archive end prefix %d is unavailable", decision.Slot)
 		}
 		candidate := Extent{ConfigID: m.configID, Start: from, End: decision.Slot, StartPrefix: startPrefix, EndPrefix: candidatePrefix, PreviousHash: previous, Decisions: []quepaxa.DecidedValue{}}
-		size, err := extentEncodedSize(candidate, encodedDecisions+len(encoded), len(selected)+1)
+		size, err := extentEncodedSize(candidate, encodedDecisions+encodedSize, len(selected)+1)
 		if err != nil {
 			return Extent{}, tip, err
 		}
@@ -547,7 +554,7 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 			return Extent{}, tip, fmt.Errorf("decision %d exceeds archive extent limit", decision.Slot)
 		}
 		selected = append(selected, decision)
-		encodedDecisions += len(encoded)
+		encodedDecisions += encodedSize
 		endPrefix = candidatePrefix
 		if decision.Slot >= through {
 			break
@@ -555,7 +562,7 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 	}
 	end := selected[len(selected)-1].Slot
 	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, PreviousHash: previous, Decisions: selected}
-	data, err := json.Marshal(extent)
+	data, err := encodeExtent(extent)
 	if err != nil {
 		return Extent{}, tip, err
 	}
@@ -568,15 +575,10 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 }
 
 func extentEncodedSize(extent Extent, decisionsBytes, decisions int) (int, error) {
-	extent.Decisions = []quepaxa.DecidedValue{}
-	header, err := json.Marshal(extent)
-	if err != nil {
-		return 0, err
+	if decisions <= 0 || decisions > maxExtentItems {
+		return 0, fmt.Errorf("invalid archive extent item count")
 	}
-	if decisions > 1 {
-		decisionsBytes += decisions - 1
-	}
-	return len(header) + decisionsBytes, nil
+	return extentHeaderSize + decisionsBytes + archiveCRCSize, nil
 }
 
 func (m *Manager) DecisionsFrom(ctx context.Context, from quepaxa.Slot, limit int) ([]quepaxa.DecidedValue, quepaxa.Slot, error) {
@@ -672,7 +674,7 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 		for i := range compacted {
 			extent := &compacted[i]
 			extent.PreviousHash = previous
-			data, err := json.Marshal(extent)
+			data, err := encodeExtent(*extent)
 			if err != nil {
 				return fmt.Errorf("encode compacted archive extent: %w", err)
 			}
@@ -687,25 +689,27 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 			previous = hash
 		}
 		head.TailHash = previous
+		head.Generation++
 		if err := m.publishHead(ctx, head, snapshotCAS); err != nil {
 			if m.cas {
 				continue
 			}
 			return err
 		}
-		newRefs := make([]Extent, 0, len(compacted))
-		for _, extent := range compacted {
-			m.rememberExtent(extent)
-			extent.Decisions = nil
-			newRefs = append(newRefs, extent)
-		}
-		m.mu.Lock()
-		m.extents, m.head = newRefs, head
-		m.mu.Unlock()
 		if m.cas {
 			if err := m.refreshPublishedHead(ctx, head); err != nil {
 				return err
 			}
+		} else {
+			newRefs := make([]Extent, 0, len(compacted))
+			for _, extent := range compacted {
+				m.rememberExtent(extent)
+				extent.Decisions = nil
+				newRefs = append(newRefs, extent)
+			}
+			m.mu.Lock()
+			m.extents, m.head = newRefs, head
+			m.mu.Unlock()
 		}
 		verifier := NewManager(m.bucket, m.prefix, m.configID)
 		if err := verifier.Load(ctx); err != nil {
@@ -791,17 +795,14 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 			return nil, err
 		}
 		for _, decision := range extent.Decisions {
-			encoded, err := json.Marshal(decision)
-			if err != nil {
-				return nil, err
-			}
+			encodedSize := archiveDecisionSize(decision)
 			candidate := current
 			if len(candidate.Decisions) == 0 {
 				candidate = Extent{ConfigID: m.configID, Start: decision.Slot, StartPrefix: prefix}
 			}
 			candidate.End = decision.Slot
 			candidate.EndPrefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
-			nextSize, err := extentEncodedSize(candidate, encodedDecisions+len(encoded), len(current.Decisions)+1)
+			nextSize, err := extentEncodedSize(candidate, encodedDecisions+encodedSize, len(current.Decisions)+1)
 			if err != nil {
 				return nil, err
 			}
@@ -816,7 +817,7 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 			current.End = decision.Slot
 			prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
 			current.EndPrefix = prefix
-			encodedDecisions += len(encoded)
+			encodedDecisions += encodedSize
 		}
 	}
 	flush()
@@ -824,8 +825,8 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 }
 
 func archiveHeadsEqual(a, b archiveHead) bool {
-	aData, _ := json.Marshal(a)
-	bData, _ := json.Marshal(b)
+	aData, _ := encodeHead(a)
+	bData, _ := encodeHead(b)
 	return bytes.Equal(aData, bData)
 }
 
@@ -897,8 +898,8 @@ func (m *Manager) readExtent(ctx context.Context, expected [32]byte) (Extent, er
 	if sha256.Sum256(data) != expected {
 		return Extent{}, fmt.Errorf("archive extent integrity mismatch")
 	}
-	var extent Extent
-	if err := decodePersistedJSON(data, &extent); err != nil {
+	extent, err := decodeExtent(data)
+	if err != nil {
 		return Extent{}, err
 	}
 	if err := m.validateExtent(extent); err != nil {
@@ -941,20 +942,8 @@ func (m *Manager) validateExtent(extent Extent) error {
 	return nil
 }
 
-func decodePersistedJSON(data []byte, value any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(value); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return fmt.Errorf("trailing JSON data")
-	}
-	return nil
-}
-
 func extentKey(hash [32]byte) string {
-	return fmt.Sprintf("archive/blocks/%x.json", hash)
+	return fmt.Sprintf("archive/blocks/%x.bin", hash)
 }
 
 func (m *Manager) key(value string) string {

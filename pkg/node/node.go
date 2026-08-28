@@ -88,6 +88,9 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config.ObjStoreSyncInterval < 0 {
 		return fmt.Errorf("object-store sync interval must not be negative")
 	}
+	if n.config.ObjStoreBatchDelay < 0 {
+		return fmt.Errorf("object-store batch delay must not be negative")
+	}
 	if n.config.ObjStoreGCInterval < 0 || n.config.ObjStoreGCGracePeriod < 0 {
 		return fmt.Errorf("object-store GC durations must not be negative")
 	}
@@ -157,6 +160,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
 		n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
+		n.archive.SetGroupDelay(n.config.ObjStoreBatchDelay)
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
@@ -726,9 +730,19 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 		}
 		successes := 1 // local recorder
 		var best *network.DecisionsResponse
+		var grace *time.Timer
 		for pending > 0 {
+			var graceC <-chan time.Time
+			if successes >= cluster.QuorumSize() {
+				if grace == nil {
+					grace = time.NewTimer(10 * time.Millisecond)
+				}
+				graceC = grace.C
+			}
 			select {
 			case <-roundCtx.Done():
+				pending = 0
+			case <-graceC:
 				pending = 0
 			case result := <-results:
 				pending--
@@ -740,6 +754,9 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 					}
 				}
 			}
+		}
+		if grace != nil {
+			grace.Stop()
 		}
 		cancel()
 		if successes < cluster.QuorumSize() {
