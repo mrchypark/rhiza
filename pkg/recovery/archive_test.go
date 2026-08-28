@@ -625,8 +625,8 @@ func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 3 || gets != 2 {
-		t.Fatalf("publish heads=%d gets=%d, want 3/2", heads, gets)
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 2 || gets != 1 {
+		t.Fatalf("publish heads=%d gets=%d, want 2/1", heads, gets)
 	}
 }
 

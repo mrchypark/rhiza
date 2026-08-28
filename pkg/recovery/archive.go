@@ -337,7 +337,7 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 		}
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
 			if m.cas {
-				return m.refreshPublishedHead(ctx, head)
+				return m.refreshPublishedHead(ctx, head, headCAS, extents)
 			}
 			m.mu.Lock()
 			m.extents, m.head = extents, head
@@ -353,15 +353,39 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 	return fmt.Errorf("shared archive trim conflicted too many times")
 }
 
-func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead) error {
-	if err := m.loadLocked(ctx); err != nil {
+func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead, priorCAS *objstore.ObjectVersion, refs []Extent) error {
+	name := m.key("archive/head.bin")
+	attributes, data, _, err := m.readStableHead(ctx, name, nil)
+	if err != nil {
 		return err
+	}
+	head, err := decodeHead(data)
+	if err != nil {
+		return err
+	}
+	if !archiveHeadsEqual(head, expected) {
+		if err := m.loadLocked(ctx); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.head.Base < expected.Base || m.head.Tip < expected.Tip {
+			return fmt.Errorf("published archive head regressed")
+		}
+		return nil
+	}
+	for i := range refs {
+		if len(refs[i].Decisions) != 0 {
+			m.rememberExtent(refs[i])
+		}
+		refs[i].Decisions = nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.head.Base < expected.Base || m.head.Tip < expected.Tip {
-		return fmt.Errorf("published archive head regressed")
+	if !sameNullableObjectVersion(m.headCAS, priorCAS) {
+		return errArchiveStateChanged
 	}
+	m.extents, m.head, m.tip, m.headCAS = refs, head, head.Tip, attributes.Version
 	return nil
 }
 
@@ -475,7 +499,7 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		head.Generation++
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
 			if m.cas {
-				return m.refreshPublishedHead(ctx, head)
+				return m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...))
 			}
 			refs = append(refs, added...)
 			for _, extent := range added {
@@ -697,7 +721,7 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 			return err
 		}
 		if m.cas {
-			if err := m.refreshPublishedHead(ctx, head); err != nil {
+			if err := m.refreshPublishedHead(ctx, head, snapshotCAS, compacted); err != nil {
 				return err
 			}
 		} else {

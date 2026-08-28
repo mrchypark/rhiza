@@ -62,7 +62,7 @@ func (*retryLearnerTransport) FetchValue(context.Context, quepaxa.NodeID, quepax
 	return nil, errors.New("value unavailable")
 }
 
-func mustCore(t *testing.T, nodeID quepaxa.NodeID, members []quepaxa.Member, wal *qlog.WAL, transport quepaxa.Transport) *quepaxa.Core {
+func mustCore(t testing.TB, nodeID quepaxa.NodeID, members []quepaxa.Member, wal *qlog.WAL, transport quepaxa.Transport) *quepaxa.Core {
 	t.Helper()
 	if wal == nil {
 		var err error
@@ -265,6 +265,31 @@ func TestLinearizableQueryFailsClosedWithoutQuorum(t *testing.T) {
 		if res.Code != want {
 			t.Fatalf("%s read status=%d, want %d: %s", consistency, res.Code, want, res.Body.String())
 		}
+	}
+}
+
+func BenchmarkServerQuery(b *testing.B) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(b, "n1", members, nil, nil)
+	material, err := materializer.Open(b.TempDir()+"/db.sqlite", 4)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = material.Close() })
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	b.Cleanup(server.Close)
+	for _, consistency := range []string{"local", "linearizable"} {
+		b.Run(consistency, func(b *testing.B) {
+			request := QueryRequest{SQL: "SELECT 1", Consistency: consistency}
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if _, err := server.Query(context.Background(), request); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
 	}
 }
 
