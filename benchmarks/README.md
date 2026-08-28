@@ -22,7 +22,9 @@ bash benchmarks/run-dory-profile.sh \
 
 Set `RHIZA_BENCH_CHECKPOINT_INTERVAL=1s` to measure checkpoint interference. Add
 `one-fault` as the sixth argument to measure with one peer unavailable. The runner
-uses a fresh object prefix and empty pod volumes for every invocation.
+uses a fresh object prefix and empty pod volumes for every invocation. Override
+the default one-minute async publication timer with
+`RHIZA_BENCH_SYNC_INTERVAL=10m` when a quiet profile may run longer than a minute.
 
 Aggregate all NDJSON files with:
 

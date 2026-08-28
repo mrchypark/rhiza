@@ -1,0 +1,11 @@
+usage_usec 3029337
+user_usec 728673
+system_usec 2300663
+nice_usec 0
+nr_periods 210
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+38871040
+47271936

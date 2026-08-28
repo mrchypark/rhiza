@@ -1,0 +1,11 @@
+usage_usec 417584
+user_usec 22020
+system_usec 395563
+nice_usec 0
+nr_periods 21
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+25952256
+32280576

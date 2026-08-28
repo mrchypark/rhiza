@@ -26,13 +26,14 @@ results="$output_dir/raw/$label.ndjson"
 go build -o /tmp/rhiza-bench-client ./cmd/rhiza-bench
 run_nonce="$(date +%s%N)"
 checkpoint_interval="${RHIZA_BENCH_CHECKPOINT_INTERVAL:-0}"
+sync_interval="${RHIZA_BENCH_SYNC_INTERVAL:-1m}"
 
 dory k8s set image "statefulset/$statefulset" -n "$namespace" "$container=$image" >/dev/null
 dory k8s set env "statefulset/$statefulset" -n "$namespace" \
 	"RHIZA_OBJSTORE_DURABILITY=$mode" \
 	"RHIZA_OBJSTORE_PREFIX=bench-$label-$run_nonce" \
 	"RHIZA_CHECKPOINT_INTERVAL=$checkpoint_interval" \
-	RHIZA_OBJSTORE_SYNC_INTERVAL=1m >/dev/null
+	"RHIZA_OBJSTORE_SYNC_INTERVAL=$sync_interval" >/dev/null
 pods=("$statefulset-0" "$statefulset-1" "$statefulset-2")
 dory k8s delete pod -n "$namespace" "${pods[@]}" --ignore-not-found --wait=true >/dev/null
 for pod in "${pods[@]}"; do

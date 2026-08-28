@@ -1,0 +1,20 @@
+{
+  "rhiza_candidate_commit": "91c3a86eebd0a332429604ee7e0cc31885203efa",
+  "rhiza_baseline_commit": "b98b87759f042d0ff42075a4fffa11e83e74bf58",
+  "rhiza_branch": "main",
+  "latticedb_commit": "8ef87c915c66578b87ed02333233902379df2877",
+  "sql_image": "rhiza-sql-kv-e2e:91c3a86@sha256:2997119cef02e42042536b68602cf4907d6abcfd448c908d65df02a775f774a1",
+  "graph_image": "rhiza-graph-kv-e2e:91c3a86@sha256:6bf57aee45a900036d802bc8ffb88ba8baa06126770fd13f3920fb7feda31f01",
+  "host": "Apple arm64, macOS 26.3",
+  "go": "go1.27.0 darwin/arm64",
+  "goexperiment": "arenas,greenteagc",
+  "kubernetes": "v1.36.2+k3s1",
+  "container_runtime": "containerd://2.3.2-k3s2",
+  "node_capacity": "6 CPU, 12220916 KiB",
+  "peers": 3,
+  "runs_per_workload": 3,
+  "concurrency": 16,
+  "measured_http_operations": 126000,
+  "application_errors": 0,
+  "async_sync_interval": "1m; graph async healthy isolated rerun used 10m to prevent publication during measurement"
+}

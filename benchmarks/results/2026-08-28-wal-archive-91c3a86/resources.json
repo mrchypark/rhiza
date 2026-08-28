@@ -1,0 +1,82 @@
+[
+  {
+    "config": "graph-91c3a86-async-checkpoint-1s",
+    "duration_s": 35,
+    "cpu_seconds": 14.94842,
+    "average_cores": 0.4270977142857143,
+    "memory_current_mib": 57.11328125,
+    "memory_peak_mib": 63.6484375
+  },
+  {
+    "config": "graph-91c3a86-async-healthy",
+    "duration_s": 27,
+    "cpu_seconds": 11.084735,
+    "average_cores": 0.41054574074074074,
+    "memory_current_mib": 56.53515625,
+    "memory_peak_mib": 62.9375
+  },
+  {
+    "config": "graph-91c3a86-async-one-fault",
+    "duration_s": 24,
+    "cpu_seconds": 8.080009,
+    "average_cores": 0.33666704166666667,
+    "memory_current_mib": 59.45703125,
+    "memory_peak_mib": 67.4375
+  },
+  {
+    "config": "graph-91c3a86-before-ack-healthy",
+    "duration_s": 34,
+    "cpu_seconds": 13.428812,
+    "average_cores": 0.39496505882352945,
+    "memory_current_mib": 58.75390625,
+    "memory_peak_mib": 65.01171875
+  },
+  {
+    "config": "graph-91c3a86-before-ack-one-fault",
+    "duration_s": 32,
+    "cpu_seconds": 11.071899,
+    "average_cores": 0.34599684375,
+    "memory_current_mib": 55.3984375,
+    "memory_peak_mib": 61.55859375
+  },
+  {
+    "config": "sql-91c3a86-async-checkpoint-1s",
+    "duration_s": 38,
+    "cpu_seconds": 11.233306,
+    "average_cores": 0.2956133157894737,
+    "memory_current_mib": 39.890625,
+    "memory_peak_mib": 46.06640625
+  },
+  {
+    "config": "sql-91c3a86-async-healthy",
+    "duration_s": 33,
+    "cpu_seconds": 9.711934,
+    "average_cores": 0.2943010303030303,
+    "memory_current_mib": 40.84375,
+    "memory_peak_mib": 48.5703125
+  },
+  {
+    "config": "sql-91c3a86-async-one-fault",
+    "duration_s": 40,
+    "cpu_seconds": 13.067515,
+    "average_cores": 0.326687875,
+    "memory_current_mib": 44.4375,
+    "memory_peak_mib": 51.53125
+  },
+  {
+    "config": "sql-91c3a86-before-ack-healthy",
+    "duration_s": 30,
+    "cpu_seconds": 8.90811,
+    "average_cores": 0.296937,
+    "memory_current_mib": 39.9296875,
+    "memory_peak_mib": 46.4296875
+  },
+  {
+    "config": "sql-91c3a86-before-ack-one-fault",
+    "duration_s": 72,
+    "cpu_seconds": 19.408999,
+    "average_cores": 0.2695694305555556,
+    "memory_current_mib": 40.4375,
+    "memory_peak_mib": 46.70703125
+  }
+]
