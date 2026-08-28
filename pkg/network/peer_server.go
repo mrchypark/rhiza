@@ -124,7 +124,6 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 }
 
 func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
-	defer stream.CancelRead(0)
 	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
 	response := &peerfb.ResponseT{}
 	data, err := readPeerFrame(stream)
