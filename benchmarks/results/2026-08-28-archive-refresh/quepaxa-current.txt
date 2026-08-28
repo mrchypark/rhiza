@@ -1,0 +1,31 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M3
+BenchmarkCoreProposeThreePeers-8      	      44	  25410101 ns/op	   64268 B/op	     372 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      51	  25175593 ns/op	   66128 B/op	     382 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      43	  24598376 ns/op	   64276 B/op	     370 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      48	  24533767 ns/op	   64870 B/op	     376 allocs/op
+BenchmarkCoreProposeThreePeers-8      	      48	  25126667 ns/op	   64781 B/op	     376 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      58	  20332189 ns/op	   49251 B/op	     290 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      61	  24805133 ns/op	   48989 B/op	     290 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      54	  19775608 ns/op	   46941 B/op	     285 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      55	  20514015 ns/op	   47588 B/op	     287 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      62	  20236252 ns/op	   49969 B/op	     293 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  732421	      2181 ns/op	     498 B/op	       8 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  795920	      2236 ns/op	     496 B/op	       8 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  992948	      2093 ns/op	     496 B/op	       8 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	  987379	      1985 ns/op	     496 B/op	       8 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	 1000000	      2085 ns/op	     496 B/op	       8 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	  946729	      2178 ns/op	     512 B/op	       9 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	 1000000	      1334 ns/op	     512 B/op	       9 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	 1000000	      1411 ns/op	     512 B/op	       9 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	 1000000	      1459 ns/op	     512 B/op	       9 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	 1000000	      1279 ns/op	     512 B/op	       9 allocs/op
+BenchmarkCoreLocalReadIndex-8         	80850498	        15.49 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	82883660	        14.41 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	83951554	        14.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	83134876	        14.69 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreLocalReadIndex-8         	83722386	        15.52 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	42.743s

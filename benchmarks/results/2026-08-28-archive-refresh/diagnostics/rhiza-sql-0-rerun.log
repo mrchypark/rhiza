@@ -1,0 +1,24 @@
+2026/08/28 14:18:40 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+2026/08/28 14:18:40 Rhiza HTTP adapter listening on 0.0.0.0:8080
+2026/08/28 14:18:40 quorum catch-up failed: QuePaxa quorum unavailable
+2026/08/28 14:18:41 quorum catch-up failed: QuePaxa quorum unavailable
+2026/08/28 14:18:42 quorum catch-up failed: QuePaxa quorum unavailable
+2026/08/28 14:18:43 quorum catch-up failed: QuePaxa quorum unavailable
+2026/08/28 14:18:44 quorum catch-up failed: QuePaxa quorum unavailable
+2026/08/28 14:18:45 quorum catch-up failed: QuePaxa quorum unavailable
+2026/08/28 14:18:48 creating streaming checkpoint at slot 6
+2026/08/28 14:18:48 checkpoint candidate published: index=6 size=36864 files=1
+2026/08/28 14:18:52 creating streaming checkpoint at slot 75
+2026/08/28 14:18:52 checkpoint candidate published: index=75 size=49152 files=1
+2026/08/28 14:18:55 creating streaming checkpoint at slot 150
+2026/08/28 14:18:55 checkpoint candidate published: index=150 size=65536 files=1
+2026/08/28 14:18:58 creating streaming checkpoint at slot 215
+2026/08/28 14:18:58 checkpoint candidate published: index=215 size=77824 files=1
+2026/08/28 14:19:01 creating streaming checkpoint at slot 285
+2026/08/28 14:19:01 checkpoint candidate published: index=285 size=106496 files=1
+2026/08/28 14:19:04 creating streaming checkpoint at slot 345
+2026/08/28 14:19:04 checkpoint candidate published: index=345 size=118784 files=1
+2026/08/28 14:19:06 creating streaming checkpoint at slot 364
+2026/08/28 14:19:06 checkpoint candidate published: index=364 size=118784 files=1
+2026/08/28 14:19:08 creating streaming checkpoint at slot 442
+2026/08/28 14:19:08 checkpoint candidate published: index=442 size=139264 files=1

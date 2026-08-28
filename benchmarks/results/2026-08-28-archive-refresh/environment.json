@@ -1,0 +1,21 @@
+{
+  "code_commit": "4a2260db77295758ceab1e628799c92d7565f9e1",
+  "benchmark_source_commit": "01dbbaa",
+  "paired_baseline_commit": "b98b87759f042d0ff42075a4fffa11e83e74bf58",
+  "branch": "main",
+  "latticedb_commit": "8ef87c915c66578b87ed02333233902379df2877",
+  "sql_image": "rhiza-sql-kv-e2e@sha256:bad6be3a5db7a99212f9e2493f4db2713f0100bfad57ff3138329a0ffe23ad07",
+  "graph_image": "rhiza-graph-kv-e2e@sha256:66c4c48b1e0a3e062a1a6f499f2509e722def69146c6f4a4f2c16474d7ed3cc6",
+  "host": "Apple M3 arm64, macOS 26.3",
+  "go": "go1.27.0 darwin/arm64",
+  "container_goexperiment": "arenas,greenteagc",
+  "kubernetes": "v1.36.2+k3s1",
+  "container_runtime": "containerd://2.3.2-k3s2",
+  "node_capacity": "6 CPU, 12220916 KiB",
+  "peers": 3,
+  "runs_per_workload": 3,
+  "graph_async_healthy_runs": 6,
+  "concurrency": 16,
+  "canonical_application_errors": 0,
+  "host_interference": "macOS StorageManagement processes consumed about 40-60% host CPU during portions of the suite"
+}

@@ -1,0 +1,26 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkServerQuery/local-8         	  766869	      2604 ns/op	     878 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  532370	      2276 ns/op	     878 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  457922	      2289 ns/op	     878 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  551998	      4110 ns/op	     877 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  372710	      3448 ns/op	     878 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  522372	      3477 ns/op	     877 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  302308	      8310 ns/op	     876 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  389935	      6604 ns/op	     877 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  136477	      8534 ns/op	     875 B/op	      21 allocs/op
+BenchmarkServerQuery/local-8         	  296086	      5357 ns/op	     877 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  353586	     19115 ns/op	     869 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  357172	      4833 ns/op	     871 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  296384	      5234 ns/op	     869 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  316099	      6178 ns/op	     874 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  328329	      8205 ns/op	     869 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	   96558	     20260 ns/op	     868 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  163502	     17788 ns/op	     869 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  123552	     10556 ns/op	     859 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  274882	      4563 ns/op	     870 B/op	      21 allocs/op
+BenchmarkServerQuery/linearizable-8  	  251773	      5051 ns/op	     870 B/op	      21 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/network	46.573s

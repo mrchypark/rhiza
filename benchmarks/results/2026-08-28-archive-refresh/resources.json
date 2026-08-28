@@ -1,0 +1,82 @@
+[
+  {
+    "config": "graph-async-checkpoint-1s",
+    "duration_s": 37,
+    "cpu_seconds": 14.757986,
+    "average_cores": 0.3988644864864865,
+    "memory_current_mib": 56.1484375,
+    "memory_peak_mib": 62.30859375
+  },
+  {
+    "config": "graph-async-healthy",
+    "duration_s": 23,
+    "cpu_seconds": 8.192131,
+    "average_cores": 0.3561796086956522,
+    "memory_current_mib": 58.76953125,
+    "memory_peak_mib": 64.265625
+  },
+  {
+    "config": "graph-async-one-fault",
+    "duration_s": 32,
+    "cpu_seconds": 11.662432,
+    "average_cores": 0.364451,
+    "memory_current_mib": 61.42578125,
+    "memory_peak_mib": 67.59375
+  },
+  {
+    "config": "graph-before-ack-healthy",
+    "duration_s": 24,
+    "cpu_seconds": 10.300917,
+    "average_cores": 0.429204875,
+    "memory_current_mib": 58.328125,
+    "memory_peak_mib": 65.15234375
+  },
+  {
+    "config": "graph-before-ack-one-fault",
+    "duration_s": 33,
+    "cpu_seconds": 11.782164,
+    "average_cores": 0.3570352727272727,
+    "memory_current_mib": 56.4765625,
+    "memory_peak_mib": 62.515625
+  },
+  {
+    "config": "sql-async-checkpoint-1s",
+    "duration_s": 21,
+    "cpu_seconds": 5.787839,
+    "average_cores": 0.27561138095238097,
+    "memory_current_mib": 41.72265625,
+    "memory_peak_mib": 48.05078125
+  },
+  {
+    "config": "sql-async-healthy",
+    "duration_s": 28,
+    "cpu_seconds": 8.480297,
+    "average_cores": 0.30286775,
+    "memory_current_mib": 41.375,
+    "memory_peak_mib": 47.7578125
+  },
+  {
+    "config": "sql-async-one-fault",
+    "duration_s": 32,
+    "cpu_seconds": 8.746919,
+    "average_cores": 0.27334121875,
+    "memory_current_mib": 42.5078125,
+    "memory_peak_mib": 50.85546875
+  },
+  {
+    "config": "sql-before-ack-healthy",
+    "duration_s": 22,
+    "cpu_seconds": 6.085299,
+    "average_cores": 0.2766045,
+    "memory_current_mib": 42.31640625,
+    "memory_peak_mib": 48.5
+  },
+  {
+    "config": "sql-before-ack-one-fault",
+    "duration_s": 25,
+    "cpu_seconds": 5.083343,
+    "average_cores": 0.20333372,
+    "memory_current_mib": 40.77734375,
+    "memory_peak_mib": 46.96875
+  }
+]

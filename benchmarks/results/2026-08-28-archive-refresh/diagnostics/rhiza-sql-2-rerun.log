@@ -1,0 +1,20 @@
+2026/08/28 14:18:40 failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+2026/08/28 14:18:40 Rhiza HTTP adapter listening on 0.0.0.0:8080
+2026/08/28 14:18:43 operation sync from rhiza-sql-1 failed: lookup rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local on 10.43.0.10:53: no such host
+2026/08/28 14:18:44 operation sync from rhiza-sql-1 failed: lookup rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local on 10.43.0.10:53: no such host
+2026/08/28 14:18:47 creating streaming checkpoint at slot 4
+2026/08/28 14:18:47 checkpoint candidate published: index=4 size=36864 files=1
+2026/08/28 14:18:52 creating streaming checkpoint at slot 71
+2026/08/28 14:18:52 checkpoint candidate published: index=71 size=49152 files=1
+2026/08/28 14:18:53 creating streaming checkpoint at slot 79
+2026/08/28 14:18:54 checkpoint candidate published: index=79 size=49152 files=1
+2026/08/28 14:18:55 creating streaming checkpoint at slot 152
+2026/08/28 14:18:55 checkpoint candidate published: index=152 size=65536 files=1
+2026/08/28 14:18:58 creating streaming checkpoint at slot 219
+2026/08/28 14:18:58 checkpoint candidate published: index=219 size=77824 files=1
+2026/08/28 14:19:01 creating streaming checkpoint at slot 287
+2026/08/28 14:19:01 checkpoint candidate published: index=287 size=106496 files=1
+2026/08/28 14:19:04 creating streaming checkpoint at slot 362
+2026/08/28 14:19:04 checkpoint candidate published: index=362 size=118784 files=1
+2026/08/28 14:19:07 creating streaming checkpoint at slot 440
+2026/08/28 14:19:07 checkpoint candidate published: index=440 size=139264 files=1

@@ -1,0 +1,11 @@
+usage_usec 1410968
+user_usec 606227
+system_usec 804740
+nice_usec 0
+nr_periods 184
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+36716544
+44007424
