@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
 )
@@ -38,6 +39,22 @@ func (m *Materializer) applyGraph(_ context.Context, _ uint64, _ []byte, _ []typ
 
 func (*Materializer) GraphQuery(context.Context, string, map[string]any) (types.GraphCommandResult, error) {
 	return types.GraphCommandResult{}, fmt.Errorf("graph API is not supported by the sql-kv build")
+}
+
+func (*Materializer) GraphReadStream(context.Context, string, uint64, uint, time.Duration) ([]types.GraphStreamRecord, error) {
+	return nil, fmt.Errorf("graph API is not supported by the sql-kv build")
+}
+
+func (*Materializer) GraphStreamOffset(context.Context, string, string) (uint64, bool, error) {
+	return 0, false, fmt.Errorf("graph API is not supported by the sql-kv build")
+}
+
+func (*Materializer) SetGraphStreamOffset(context.Context, string, string, uint64) error {
+	return fmt.Errorf("graph API is not supported by the sql-kv build")
+}
+
+func (*Materializer) TrimGraphStream(context.Context, string, uint64) error {
+	return fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
 func (*Materializer) GraphRequestMatches(context.Context, types.GraphCommand) (bool, error) {

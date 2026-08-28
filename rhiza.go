@@ -21,6 +21,8 @@ type Profile = types.Profile
 type SQLStatement = types.SQLStatement
 type GraphCommand = types.GraphCommand
 type GraphResult = types.GraphCommandResult
+type GraphStreamEvent = types.GraphStreamEvent
+type GraphStreamRecord = types.GraphStreamRecord
 type NotifyCommand = types.NotifyCommand
 type MutationReceipt = types.MutationReceipt
 
@@ -34,6 +36,11 @@ type KVMutationRequest = network.KVMutationRequest
 type KVMutationResponse = network.KVMutationResponse
 type GraphQueryRequest = network.GraphQueryRequest
 type GraphExecuteResponse = network.GraphExecuteResponse
+type GraphStreamReadRequest = network.GraphStreamReadRequest
+type GraphStreamReadResponse = network.GraphStreamReadResponse
+type GraphStreamOffsetRequest = network.GraphStreamOffsetRequest
+type GraphStreamOffsetResponse = network.GraphStreamOffsetResponse
+type GraphStreamTrimRequest = network.GraphStreamTrimRequest
 type RequestStatusRequest = network.RequestStatusRequest
 type RequestStatusResponse = network.RequestStatusResponse
 type ObjectStoreStats = objstore.Stats
@@ -173,6 +180,31 @@ func (db *DB) GraphExecute(ctx context.Context, req GraphCommand) (GraphExecuteR
 }
 func (db *DB) GraphQuery(ctx context.Context, req GraphQueryRequest) (GraphResult, error) {
 	return db.api.GraphQuery(ctx, req)
+}
+
+// GraphChanges reads the node-local LatticeDB semantic graph changefeed.
+func (db *DB) GraphChanges(ctx context.Context, req GraphStreamReadRequest) (GraphStreamReadResponse, error) {
+	return db.api.GraphChanges(ctx, req)
+}
+
+// GraphStreamRead reads a node-local named stream after its per-stream cursor.
+func (db *DB) GraphStreamRead(ctx context.Context, req GraphStreamReadRequest) (GraphStreamReadResponse, error) {
+	return db.api.GraphStreamRead(ctx, req)
+}
+
+// GraphStreamOffset returns a node-local durable consumer offset.
+func (db *DB) GraphStreamOffset(ctx context.Context, req GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
+	return db.api.GraphStreamOffset(ctx, req)
+}
+
+// SetGraphStreamOffset stores a node-local durable consumer offset.
+func (db *DB) SetGraphStreamOffset(ctx context.Context, req GraphStreamOffsetRequest) error {
+	return db.api.SetGraphStreamOffset(ctx, req)
+}
+
+// TrimGraphStream deletes node-local records through the supplied sequence.
+func (db *DB) TrimGraphStream(ctx context.Context, req GraphStreamTrimRequest) error {
+	return db.api.TrimGraphStream(ctx, req)
 }
 func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (MutationReceipt, error) {
 	return db.api.NotifyPublish(ctx, req)

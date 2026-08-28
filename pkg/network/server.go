@@ -196,6 +196,10 @@ func (s *Server) routes() {
 	if materializer.GraphEnabled() {
 		s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
 		s.mux.HandleFunc("/graph/query", s.handleGraphQuery)
+		s.mux.HandleFunc("/graph/changes", s.handleGraphChanges)
+		s.mux.HandleFunc("/graph/streams/read", s.handleGraphStreamRead)
+		s.mux.HandleFunc("/graph/streams/offset", s.handleGraphStreamOffset)
+		s.mux.HandleFunc("/graph/streams/trim", s.handleGraphStreamTrim)
 	} else {
 		s.mux.HandleFunc("/sql/execute", s.handleExecute)
 		s.mux.HandleFunc("/sql/transaction", s.handleExecute)

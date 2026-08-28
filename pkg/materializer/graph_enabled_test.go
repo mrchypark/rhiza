@@ -161,9 +161,15 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	person := types.GraphCommand{RequestID: "person-1", Cypher: `CREATE (p:Person {id: $id, name: $name}) RETURN p.name`, Args: map[string]any{"id": "1", "name": "Ada"}}
+	person := types.GraphCommand{
+		RequestID: "person-1", Cypher: `CREATE (p:Person {id: $id, name: $name}) RETURN p.name`, Args: map[string]any{"id": "1", "name": "Ada"},
+		Events: []types.GraphStreamEvent{{Stream: "people", Kind: "person.created", Payload: map[string]any{"id": "1"}}},
+	}
 	applyGraph(1, person)
 	applyGraph(2, person)
+	if err := m.SetGraphStreamOffset(ctx, "people", "projector", 1); err != nil {
+		t.Fatal(err)
+	}
 	value, err := types.EncodeKVCommand(types.KVCommand{RequestID: "kv-1", Operation: "put", Key: "mode", Value: []byte("graph")})
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +190,10 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	applyGraph(4, types.GraphCommand{RequestID: "person-2", Cypher: `CREATE (p:Person {id: '2', name: 'Grace'})`})
+	applyGraph(4, types.GraphCommand{
+		RequestID: "person-2", Cypher: `CREATE (p:Person {id: '2', name: 'Grace'})`,
+		Events: []types.GraphStreamEvent{{Stream: "people", Kind: "person.created", Payload: map[string]any{"id": "2"}}},
+	})
 	if err := m.RestoreCheckpoint(ctx, snapshot); err != nil {
 		t.Fatal(err)
 	}
@@ -195,6 +204,14 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	got, found, err = m.KVGet(ctx, "mode", time.Now())
 	if err != nil || !found || string(got) != "graph" {
 		t.Fatalf("restored KV got=%q found=%v err=%v", got, found, err)
+	}
+	records, err := m.GraphReadStream(ctx, "people", 0, 100, 0)
+	if err != nil || len(records) != 1 || records[0].Kind != "person.created" {
+		t.Fatalf("restored stream records=%#v err=%v", records, err)
+	}
+	offset, found, err := m.GraphStreamOffset(ctx, "people", "projector")
+	if err != nil || !found || offset != 1 {
+		t.Fatalf("restored stream offset=%d found=%v err=%v", offset, found, err)
 	}
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
@@ -259,6 +276,46 @@ func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
 	}
 	if final := m.Tip(); final <= index {
 		t.Fatalf("writes did not progress during checkpoint: snapshot=%d final=%d", index, final)
+	}
+}
+
+func TestGraphStreamWaitDoesNotBlockGraphApply(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := make(chan []types.GraphStreamRecord, 1)
+	errs := make(chan error, 1)
+	go func() {
+		records, err := m.GraphReadStream(ctx, "events", 0, 100, time.Second)
+		if err != nil {
+			errs <- err
+			return
+		}
+		result <- records
+	}()
+	value, err := types.EncodeGraphCommand(types.GraphCommand{
+		RequestID: "create", Cypher: `CREATE (:Item {id: '1'})`,
+		Events: []types.GraphStreamEvent{{Stream: "events", Kind: "item.created", Payload: "1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	case records := <-result:
+		if len(records) != 1 || records[0].Kind != "item.created" {
+			t.Fatalf("records=%#v", records)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 }
 

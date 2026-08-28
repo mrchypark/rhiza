@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+	"unicode/utf8"
 
 	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -331,6 +333,15 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 		if err != nil {
 			return err
 		}
+		for _, event := range command.Events {
+			payload, err := graphArg(event.Payload)
+			if err != nil {
+				return err
+			}
+			if err := tx.PublishStream(event.Stream, event.Kind, payload); err != nil {
+				return err
+			}
+		}
 		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true, RetryThroughSlot: slot + g.idempotencyWindow - 1}
 		if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
 			return err
@@ -571,6 +582,114 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 		return types.GraphCommandResult{}, err
 	}
 	return collectLatticeRows(result)
+}
+
+func (m *Materializer) GraphReadStream(ctx context.Context, stream string, afterSequence uint64, limit uint, wait time.Duration) ([]types.GraphStreamRecord, error) {
+	if err := validateGraphStreamName(stream, true); err != nil {
+		return nil, err
+	}
+	if limit == 0 || limit > MaxGraphStreamRecords || wait < 0 {
+		return nil, fmt.Errorf("invalid graph stream read options")
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		m.mu.RLock()
+		g := m.graph
+		if g == nil || g.db == nil {
+			m.mu.RUnlock()
+			return nil, fmt.Errorf("LatticeDB is not open")
+		}
+		g.mu.RLock()
+		records, err := g.db.ReadStream(stream, afterSequence, limit, 0)
+		g.mu.RUnlock()
+		m.mu.RUnlock()
+		if err != nil || len(records) > 0 || wait == 0 || !time.Now().Before(deadline) {
+			out := make([]types.GraphStreamRecord, len(records))
+			for i, record := range records {
+				out[i] = types.GraphStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: record.Payload}
+			}
+			return out, err
+		}
+		delay := min(25*time.Millisecond, time.Until(deadline))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func validateGraphStreamConsumer(consumer string) error {
+	if !utf8.ValidString(consumer) || consumer == "" || len(consumer) > 255 {
+		return fmt.Errorf("consumer is required and must be valid UTF-8 not exceeding 255 bytes")
+	}
+	return nil
+}
+
+func (m *Materializer) GraphStreamOffset(ctx context.Context, stream, consumer string) (uint64, bool, error) {
+	if err := validateGraphStreamName(stream, true); err != nil {
+		return 0, false, err
+	}
+	if err := validateGraphStreamConsumer(consumer); err != nil {
+		return 0, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.graph == nil || m.graph.db == nil {
+		return 0, false, fmt.Errorf("LatticeDB is not open")
+	}
+	m.graph.mu.RLock()
+	defer m.graph.mu.RUnlock()
+	return m.graph.db.GetStreamOffset(stream, consumer)
+}
+
+func (m *Materializer) SetGraphStreamOffset(ctx context.Context, stream, consumer string, sequence uint64) error {
+	if err := validateGraphStreamName(stream, true); err != nil {
+		return err
+	}
+	if err := validateGraphStreamConsumer(consumer); err != nil {
+		return err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.graph == nil || m.graph.db == nil {
+		return fmt.Errorf("LatticeDB is not open")
+	}
+	m.graph.mu.Lock()
+	defer m.graph.mu.Unlock()
+	return m.graph.db.Update(func(tx *latticedb.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return tx.SetStreamOffset(stream, consumer, sequence)
+	})
+}
+
+func (m *Materializer) TrimGraphStream(ctx context.Context, stream string, throughSequence uint64) error {
+	if err := validateGraphStreamName(stream, true); err != nil {
+		return err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.graph == nil || m.graph.db == nil {
+		return fmt.Errorf("LatticeDB is not open")
+	}
+	m.graph.mu.Lock()
+	defer m.graph.mu.Unlock()
+	return m.graph.db.Update(func(tx *latticedb.Tx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return tx.TrimStream(stream, throughSequence)
+	})
 }
 
 func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult, error) {

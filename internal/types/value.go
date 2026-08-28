@@ -113,9 +113,24 @@ type NotifyCommand struct {
 
 // GraphCommand is one idempotent, replicated Cypher mutation.
 type GraphCommand struct {
-	RequestID string         `json:"request_id"`
-	Cypher    string         `json:"cypher"`
-	Args      map[string]any `json:"args,omitempty"`
+	RequestID string             `json:"request_id"`
+	Cypher    string             `json:"cypher"`
+	Args      map[string]any     `json:"args,omitempty"`
+	Events    []GraphStreamEvent `json:"events,omitempty"`
+}
+
+// GraphStreamEvent is published atomically with its GraphCommand.
+type GraphStreamEvent struct {
+	Stream  string `json:"stream"`
+	Kind    string `json:"kind"`
+	Payload any    `json:"payload"`
+}
+
+// GraphStreamRecord is one cursor-addressable LatticeDB stream record.
+type GraphStreamRecord struct {
+	Sequence uint64 `json:"sequence"`
+	Kind     string `json:"kind"`
+	Payload  any    `json:"payload"`
 }
 
 type GraphCommandResult struct {
