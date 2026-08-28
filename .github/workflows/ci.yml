@@ -38,6 +38,23 @@ jobs:
           GOEXPERIMENT: arenas,greenteagc
         run: go test ./...
 
+      - name: Install LatticeDB
+        if: matrix.arenas == false
+        env:
+          LATTICEDB_REF: 8ef87c915c66578b87ed02333233902379df2877
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config xz-utils
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+            | tar -xJ -C "$RUNNER_TEMP"
+          git clone --filter=blob:none https://github.com/mrchypark/latticedb.git "$RUNNER_TEMP/latticedb"
+          git -C "$RUNNER_TEMP/latticedb" checkout --detach "$LATTICEDB_REF"
+          "$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" build shared \
+            --build-file "$RUNNER_TEMP/latticedb/build.zig" \
+            -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/lattice"
+          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/lattice/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/lattice/lib" >> "$GITHUB_ENV"
+
       - name: Graph profile
         if: matrix.arenas == false
         run: go test -tags graph ./...
