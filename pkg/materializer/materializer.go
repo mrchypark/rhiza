@@ -82,6 +82,11 @@ type CheckpointFile struct {
 	Path string
 }
 
+type sqliteSnapshot struct {
+	conn  *sql.Conn
+	index uint64
+}
+
 // Open opens or creates a materializer.
 func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
 	if err := recoverRestore(dbPath); err != nil {
@@ -1029,35 +1034,63 @@ func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64
 }
 
 func (m *Materializer) backupSQLite(ctx context.Context, path string) (uint64, error) {
-	conn, err := m.db.Conn(ctx)
+	snapshot, err := m.beginSQLiteSnapshot(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+	defer snapshot.Close()
+	if err := snapshot.Backup(path); err != nil {
 		return 0, err
 	}
-	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	return snapshot.index, nil
+}
+
+func (m *Materializer) beginSQLiteSnapshot(ctx context.Context) (*sqliteSnapshot, error) {
+	conn, err := m.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	var value string
 	if err := conn.QueryRowContext(ctx, `SELECT value FROM _rhiza_meta WHERE key = 'applied_slot'`).Scan(&value); err != nil {
-		return 0, err
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		return nil, err
 	}
 	index, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
-		return 0, err
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		_ = conn.Close()
+		return nil, err
 	}
+	return &sqliteSnapshot{conn: conn, index: index}, nil
+}
+
+func (snapshot *sqliteSnapshot) Backup(path string) error {
 	destination := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
-	err = conn.Raw(func(driverConn any) error {
+	return snapshot.conn.Raw(func(driverConn any) error {
 		raw, ok := driverConn.(sqlite3driver.Conn)
 		if !ok {
 			return fmt.Errorf("unexpected SQLite driver connection %T", driverConn)
 		}
 		return raw.Raw().Backup("main", destination)
 	})
-	if err != nil {
-		return 0, err
+}
+
+func (snapshot *sqliteSnapshot) Close() error {
+	if snapshot == nil || snapshot.conn == nil {
+		return nil
 	}
-	return index, nil
+	_, rollbackErr := snapshot.conn.ExecContext(context.Background(), "ROLLBACK")
+	closeErr := snapshot.conn.Close()
+	snapshot.conn = nil
+	if rollbackErr != nil {
+		return rollbackErr
+	}
+	return closeErr
 }
 
 // CheckpointFilesAt captures fixed-role database files without packaging them.
@@ -1093,18 +1126,39 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	_ = graph.Close()
 	_ = os.Remove(graphPath)
 	paths = append(paths, graphPath)
-	// LatticeDB only exposes a bounded file backup, not an online snapshot
-	// handle. Hold the materializer lock across both backups so a checkpoint
-	// always makes progress and both files describe the same applied slot.
 	m.mu.Lock()
-	index, err := m.backupSQLite(ctx, sqlitePath)
+	sqliteSnapshot, err := m.beginSQLiteSnapshot(ctx)
+	index := uint64(0)
+	if err == nil {
+		index = sqliteSnapshot.index
+	}
 	if err == nil && (m.tip != index || m.graphTip() != index) {
 		err = fmt.Errorf("checkpoint stores disagree at slot %d", index)
 	}
+	var graphSnap *graphSnapshot
 	if err == nil {
-		err = m.backupGraph(graphPath)
+		graphSnap, err = m.beginGraphSnapshot()
 	}
 	m.mu.Unlock()
+	if err != nil {
+		if sqliteSnapshot != nil {
+			_ = sqliteSnapshot.Close()
+		}
+		cleanup()
+		return nil, 0, nil, err
+	}
+	if err = sqliteSnapshot.Backup(sqlitePath); err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		err = graphSnap.Backup(graphPath)
+	}
+	if closeErr := graphSnap.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := sqliteSnapshot.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
 		cleanup()
 		return nil, 0, nil, err

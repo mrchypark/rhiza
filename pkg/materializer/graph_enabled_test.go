@@ -3,8 +3,10 @@
 package materializer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -88,6 +90,60 @@ func BenchmarkGraphApply(b *testing.B) {
 	}
 }
 
+func BenchmarkGraphSnapshotFreezeByDatabaseSize(b *testing.B) {
+	for _, sizeMiB := range []int{1, 16, 64} {
+		b.Run(fmt.Sprintf("%dMiB", sizeMiB), func(b *testing.B) {
+			m, err := Open(filepath.Join(b.TempDir(), "sqlite.db"), 1)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer m.Close()
+			chunkMiB := min(sizeMiB, 8)
+			payload := bytes.Repeat([]byte{'x'}, chunkMiB<<20)
+			if err := m.graph.db.Update(func(tx *latticedb.Tx) error {
+				for offset := 0; offset < sizeMiB; offset += chunkMiB {
+					if err := tx.PutAppMetadata(fmt.Appendf(nil, "benchmark/base/%d", offset), payload); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+			payload = nil
+			initial, err := m.beginGraphSnapshot()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := initial.Close(); err != nil {
+				b.Fatal(err)
+			}
+			info, err := os.Stat(filepath.Join(filepath.Dir(m.dbPath), "latticedb", "graph.ltdb"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				if err := m.graph.db.Update(func(tx *latticedb.Tx) error {
+					return tx.PutAppMetadata([]byte("benchmark/dirty"), fmt.Appendf(nil, "%d", i))
+				}); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				snapshot, err := m.beginGraphSnapshot()
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := snapshot.Close(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(info.Size())/(1<<20), "db-MiB")
+		})
+	}
+}
+
 func TestGraphAndKVMaterializer(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sqlite.db")
 	m, err := Open(path, 1)
@@ -161,6 +217,7 @@ func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
 	defer m.Close()
 	ctx := context.Background()
 	stopWrites := make(chan struct{})
+	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
 		for slot := uint64(1); ; slot++ {
@@ -179,11 +236,17 @@ func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
 				done <- applyErr
 				return
 			}
+			if slot == 1 {
+				close(started)
+			}
 		}
 	}()
+	<-started
 	deadline, stop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stop()
 	files, index, cleanup, err := m.CheckpointFilesAt(deadline)
+	close(stopWrites)
+	writeErr := <-done
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,9 +254,11 @@ func TestGraphCheckpointProgressesDuringWrites(t *testing.T) {
 	if index == 0 || len(files) != 2 {
 		t.Fatalf("checkpoint index=%d files=%d", index, len(files))
 	}
-	close(stopWrites)
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if final := m.Tip(); final <= index {
+		t.Fatalf("writes did not progress during checkpoint: snapshot=%d final=%d", index, final)
 	}
 }
 

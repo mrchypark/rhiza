@@ -38,14 +38,23 @@ type graphState struct {
 	idempotencyWindow uint64
 }
 
-func (m *Materializer) backupGraph(path string) error {
-	// ponytail: checkpointing pauses graph transactions; add an online page
-	// snapshot only if measured checkpoint pauses exceed the service budget.
+type graphSnapshot struct {
+	snapshot *latticedb.Snapshot
+}
+
+func (m *Materializer) beginGraphSnapshot() (*graphSnapshot, error) {
 	m.graph.mu.Lock()
 	defer m.graph.mu.Unlock()
-	return m.graph.db.Backup(path)
+	snapshot, err := m.graph.db.BeginSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return &graphSnapshot{snapshot: snapshot}, nil
 }
-func (m *Materializer) graphTip() uint64 { return m.graph.tip }
+
+func (snapshot *graphSnapshot) Backup(path string) error { return snapshot.snapshot.Backup(path) }
+func (snapshot *graphSnapshot) Close() error             { return snapshot.snapshot.Close() }
+func (m *Materializer) graphTip() uint64                 { return m.graph.tip }
 
 type graphRequest struct {
 	Fingerprint [32]byte
