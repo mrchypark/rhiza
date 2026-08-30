@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	latticedb "github.com/mrchypark/latticedb-go"
 	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -44,6 +45,26 @@ type RequestStatusRequest = network.RequestStatusRequest
 type RequestStatusResponse = network.RequestStatusResponse
 type ObjectStoreStats = objstore.Stats
 type ObjectStoreDurability = types.ObjectStoreDurability
+
+var ErrGraphResourceLimit = latticedb.ErrResourceLimit
+
+type GraphReachabilityRequest struct {
+	StartLabel      string
+	StartProperty   string
+	StartValue      any
+	EdgeType        string
+	NodeLabel       string
+	NodeFilters     map[string]any
+	ResultProperty  string
+	MaxDepth        uint32
+	MaxResults      uint
+	MaxScannedEdges uint
+}
+
+type GraphReachabilityResult struct {
+	Values       []any
+	ScannedEdges uint
+}
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
@@ -219,6 +240,19 @@ func (db *DB) GraphExecute(ctx context.Context, req GraphCommand) (GraphExecuteR
 }
 func (db *DB) GraphQuery(ctx context.Context, req GraphQueryRequest) (GraphResult, error) {
 	return db.api.GraphQuery(ctx, req)
+}
+
+// EnsureGraphNodePropertyIndex creates a node-local derived index. It does not
+// mutate logical graph state and is safe to repeat on every embedded peer.
+func (db *DB) EnsureGraphNodePropertyIndex(label, property string) error {
+	return db.node.EnsureGraphNodePropertyIndex(label, property)
+}
+
+// GraphReachable performs a bounded outgoing traversal on the node-local graph
+// after the caller has established any required read barrier.
+func (db *DB) GraphReachable(ctx context.Context, req GraphReachabilityRequest) (GraphReachabilityResult, error) {
+	values, scanned, err := db.node.GraphReachable(ctx, req.StartLabel, req.StartProperty, req.StartValue, req.EdgeType, req.NodeLabel, req.NodeFilters, req.ResultProperty, req.MaxDepth, req.MaxResults, req.MaxScannedEdges)
+	return GraphReachabilityResult{Values: values, ScannedEdges: scanned}, err
 }
 
 // GraphChanges reads the node-local LatticeDB semantic graph changefeed.
