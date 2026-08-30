@@ -12,6 +12,7 @@ import (
 
 	latticedb "github.com/mrchypark/latticedb-go"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestGraphResultUsesAggregateByteBudget(t *testing.T) {
@@ -41,7 +42,7 @@ func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.applyGraph(ctx, 1, value, commands, true); err != nil {
+	if err := m.applyGraph(ctx, 1, value, commands, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Close(); err != nil {
@@ -63,8 +64,55 @@ func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
 		t.Fatal(err)
 	}
 	journal, err := m.graph.getMetadata(graphJournalKey)
+	if err != nil || len(journal) != 40 {
+		t.Fatalf("pending recovery journal=%x err=%v", journal, err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	journal, err = m.graph.getMetadata(graphJournalKey)
 	if err != nil || len(journal) != 0 {
-		t.Fatalf("confirmed recovery journal=%x err=%v", journal, err)
+		t.Fatalf("recovered journal=%x err=%v", journal, err)
+	}
+}
+
+func TestGraphJournalRetainsWholeBatchAndPrunesCommittedPrefix(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	decisions := []quepaxa.DecidedValue{
+		{Slot: 1, Value: []byte("CREATE TABLE batch_1 (id INTEGER)")},
+		{Slot: 2, Value: []byte("CREATE TABLE batch_2 (id INTEGER)")},
+	}
+	if err := m.ApplyBatch(ctx, decisions); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := m.graph.getMetadata(graphJournalKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := decodeGraphJournal(journal)
+	if err != nil || len(entries) != 2 || entries[0].Slot != 1 || entries[1].Slot != 2 {
+		t.Fatalf("whole batch journal=%+v err=%v", entries, err)
+	}
+	if err := m.Apply(ctx, 3, []byte("CREATE TABLE next (id INTEGER)")); err != nil {
+		t.Fatal(err)
+	}
+	journal, err = m.graph.getMetadata(graphJournalKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err = decodeGraphJournal(journal)
+	if err != nil || len(entries) != 1 || entries[0].Slot != 3 {
+		t.Fatalf("pruned journal=%+v err=%v", entries, err)
 	}
 }
 
@@ -511,7 +559,7 @@ func TestGraphQueryWaitsForSQLiteApply(t *testing.T) {
 	defer m.Close()
 
 	m.mu.Lock()
-	if err := m.graph.advanceTip(context.Background(), 1, [32]byte{}); err != nil {
+	if err := m.graph.advanceTip(context.Background(), 1, [32]byte{}, 0); err != nil {
 		m.mu.Unlock()
 		t.Fatal(err)
 	}

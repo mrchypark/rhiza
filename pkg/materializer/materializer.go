@@ -444,7 +444,8 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
-		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, &pending); err != nil {
+		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
+		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -453,10 +454,6 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return fmt.Errorf("commit apply batch: %w", err)
-	}
-	if err := m.confirmGraphThrough(ctx, m.tip); err != nil {
-		m.notifyDrops.Add(uint64(len(pending)))
-		return fmt.Errorf("confirm graph apply: %w", err)
 	}
 	for _, notification := range pending {
 		m.enqueueNotification(notification)
@@ -484,7 +481,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -492,7 +489,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 	if err != nil {
 		return fmt.Errorf("decode graph batch: %w", err)
 	}
-	if err := m.applyGraph(ctx, slot, value, graphCommands, graph); err != nil {
+	if err := m.applyGraph(ctx, slot, value, graphCommands, graph, confirmedGraphThrough); err != nil {
 		return err
 	}
 

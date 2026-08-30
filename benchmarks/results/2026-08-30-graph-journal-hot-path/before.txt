@@ -1,0 +1,11 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-8   	    1623	    692616 ns/op	  513893 B/op	    3603 allocs/op
+BenchmarkGraphApply-8   	    1620	    694515 ns/op	  513351 B/op	    3598 allocs/op
+BenchmarkGraphApply-8   	    1617	    757318 ns/op	  512331 B/op	    3591 allocs/op
+BenchmarkGraphApply-8   	    1672	    668440 ns/op	  523993 B/op	    3702 allocs/op
+BenchmarkGraphApply-8   	    1708	    657725 ns/op	  531864 B/op	    3774 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	7.898s

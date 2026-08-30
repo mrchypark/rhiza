@@ -224,7 +224,7 @@ func (g *graphState) close() {
 	}
 }
 
-func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, commands []types.GraphCommand, graph bool) error {
+func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, commands []types.GraphCommand, graph bool, confirmedThrough uint64) error {
 	g := m.graph
 	if g == nil || g.db == nil {
 		return fmt.Errorf("LatticeDB is not open")
@@ -262,7 +262,7 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 		if !known {
 			return fmt.Errorf("unrecognized replicated command")
 		}
-		if err := g.advanceTip(ctx, slot, valueHash); err != nil {
+		if err := g.advanceTip(ctx, slot, valueHash, confirmedThrough); err != nil {
 			return err
 		}
 		g.tip = slot
@@ -273,10 +273,10 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 		advance := i == len(commands)-1
 		fingerprint, err := prepareGraphCommand(command)
 		if err == nil {
-			err = g.applyCommand(ctx, slot, valueHash, command, fingerprint, advance)
+			err = g.applyCommand(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough)
 		}
 		if err != nil {
-			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance); recordErr != nil {
+			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough); recordErr != nil {
 				return recordErr
 			}
 		}
@@ -294,16 +294,16 @@ func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 	return types.GraphFingerprint(command)
 }
 
-func (g *graphState) advanceTip(ctx context.Context, slot uint64, valueHash [32]byte) error {
+func (g *graphState) advanceTip(ctx context.Context, slot uint64, valueHash [32]byte, confirmedThrough uint64) error {
 	return g.db.Update(func(tx *latticedb.Tx) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
+		return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
 	})
 }
 
-func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool) error {
+func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64) error {
 	args, err := graphArgs(command.Args)
 	if err != nil {
 		return err
@@ -318,7 +318,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 				return fmt.Errorf("request_id was already used for a different graph command")
 			}
 			if advance {
-				return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
+				return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
 			}
 			return nil
 		}
@@ -347,13 +347,13 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 			return err
 		}
 		if advance {
-			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
+			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
 		}
 		return nil
 	})
 }
 
-func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool) error {
+func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64) error {
 	if fingerprint == ([32]byte{}) {
 		var err error
 		fingerprint, err = types.GraphFingerprint(command)
@@ -376,13 +376,13 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 			}
 		}
 		if advance {
-			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow)
+			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
 		}
 		return nil
 	})
 }
 
-func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window uint64) error {
+func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window, confirmedThrough uint64) error {
 	journalData, _, err := tx.GetAppMetadata(graphJournalKey)
 	if err != nil {
 		return err
@@ -391,6 +391,7 @@ func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window u
 	if err != nil {
 		return err
 	}
+	journal = pendingGraphJournal(journal, confirmedThrough)
 	if len(journal) != 0 && journal[len(journal)-1].Slot+1 != slot {
 		return fmt.Errorf("graph recovery journal slot gap")
 	}
@@ -404,29 +405,6 @@ func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window u
 		}
 	}
 	return tx.PutAppMetadata(graphTipKey, encodeGraphTip(slot))
-}
-
-func (m *Materializer) confirmGraphThrough(ctx context.Context, through uint64) error {
-	g := m.graph
-	if g == nil || g.db == nil {
-		return fmt.Errorf("LatticeDB is not open")
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.db.Update(func(tx *latticedb.Tx) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		journalData, _, err := tx.GetAppMetadata(graphJournalKey)
-		if err != nil {
-			return err
-		}
-		journal, err := decodeGraphJournal(journalData)
-		if err != nil {
-			return err
-		}
-		return tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(pendingGraphJournal(journal, through)))
-	})
 }
 
 func putRequest(tx *latticedb.Tx, id string, request graphRequest) error {
