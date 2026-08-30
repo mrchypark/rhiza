@@ -3,6 +3,7 @@ package rhiza
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"sync"
@@ -176,6 +177,17 @@ func (db *DB) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse,
 }
 func (db *DB) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
 	return db.api.Query(ctx, req)
+}
+
+// OpenLocalSQLReader returns a caller-owned read-only handle to the local SQL
+// materialization. Use Query with linearizable consistency when a read barrier
+// is required.
+func (db *DB) OpenLocalSQLReader() (*sql.DB, error) { return db.node.OpenLocalSQLReader() }
+
+// SpeculateSQL runs a rollback-only local transaction for constructing one
+// deterministic replicated Statements batch.
+func (db *DB) SpeculateSQL(ctx context.Context, fn func(*sql.Tx) error) error {
+	return db.node.SpeculateSQL(ctx, fn)
 }
 func (db *DB) KVGet(ctx context.Context, req KVGetRequest) (KVGetResponse, error) {
 	return db.api.KVGet(ctx, req)
