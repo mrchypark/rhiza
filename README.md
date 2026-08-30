@@ -101,30 +101,45 @@ snapshots use `VACUUM INTO`, are integrity-checked before atomic restore, and
 checkpoint uploads consume those consistent bytes rather than the live file.
 QLog compaction and remote object-store bootstrap are not yet enabled.
 
-## Local Kubernetes qualification
+## Docker quick start
 
 ```bash
-dory build -t rhiza-sql-kv-e2e:dev .
-dory save rhiza-sql-kv-e2e:dev | dory exec -i dory-k8s ctr -n k8s.io images import -
-dory k8s apply -f deploy/k8s/sql-server-3peer-e2e.yaml
-bash e2e/chaos/install-dory.sh
-bash e2e/chaos/run-three-peer-dory.sh
+docker build -t rhiza-sql-kv:dev -t rhiza-sql-kv-e2e:dev .
+docker run --rm --name rhiza-sql -p 8080:8080 \
+  -e RHIZA_BIND_ADDR=0.0.0.0:8080 \
+  -v rhiza-sql-data:/data \
+  rhiza-sql-kv:dev
+
+docker build -f Dockerfile.graph \
+  -t rhiza-graph-kv:dev -t rhiza-graph-kv-e2e:dev .
+docker run --rm --name rhiza-graph -p 8081:8080 \
+  -e RHIZA_BIND_ADDR=0.0.0.0:8080 \
+  -e RHIZA_EXECUTION_PROFILE=graph \
+  -v rhiza-graph-data:/data \
+  rhiza-graph-kv:dev
 ```
 
-On the local dory cluster on 2026-08-24, the QUIC/FlatBuffers Chaos Mesh scenario
-passed: one failed peer kept quorum writes available (scenario sample 31.2 ms),
+For Kubernetes qualification, preload the `*-e2e:dev` tags into every node or
+replace the manifest image references with published registry images. Then
+apply `deploy/k8s/sql-server-3peer-e2e.yaml` or
+`deploy/k8s/graph-server-3peer-e2e.yaml` with standard `kubectl`. The Chaos Mesh
+manifests under `e2e/chaos` work with any compatible Kubernetes environment.
+
+On a local Kubernetes cluster on 2026-08-24, the QUIC/FlatBuffers Chaos Mesh
+scenario passed: one failed peer kept quorum writes available (31.2 ms sample),
 the rebuilt peer converged, two failed peers rejected writes with 503, and
 writes resumed after quorum recovery. Normal three-peer SQL benchmark medians
 were 0.207 ms local read, 2.67 ms linearizable read, and 1.24 ms write. With one
 failed peer they were 0.245 ms, 1.98 ms, and 9.10 ms respectively. These include
 local port-forward overhead and showed substantial tail variance.
 
-For Graph/KV qualification, build and import `rhiza-graph-kv-e2e:dev`, then
-apply `deploy/k8s/graph-server-3peer-e2e.yaml`. Set `RHIZA_GRAPH_E2E_URL` to a
-forwarded peer and run `go test ./e2e -run TestGraphServer`. The same Dory
-qualification passed with a 15.2 ms one-peer-failure write, HTTP 503 with two
-failed peers, convergence, and a successful write after quorum recovery. Three-peer
-samples were 0.29–0.35 ms local read, 4.7–21.6 ms linearizable read, and
+For Graph/KV qualification, preload `rhiza-graph-kv-e2e:dev`, then apply
+`deploy/k8s/graph-server-3peer-e2e.yaml`. Set `RHIZA_GRAPH_E2E_URL` to a
+forwarded peer and run `go test ./e2e -run TestGraphServer`. The same local
+Kubernetes qualification passed with a 15.2 ms one-peer-failure write, HTTP 503
+with two failed peers, convergence, and a successful write after quorum
+recovery. Three-peer samples were 0.29–0.35 ms local read, 4.7–21.6 ms
+linearizable read, and
 8.1–11.6 ms graph write, including port-forward overhead.
 
 The build profile is fixed into each binary and mismatched
