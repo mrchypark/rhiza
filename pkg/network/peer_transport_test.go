@@ -34,7 +34,7 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	member.PeerURL = "quic://" + peer.Addr()
 	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: []quepaxa.Member{member}}, "secret")
 	defer transport.Close()
-	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+	callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer callCancel()
 	request := quepaxa.RecordRequest{Slot: 1, Step: 4, Proposal: quepaxa.Proposal{ProposerID: "n1", Value: []byte("value")}}
 	request.Proposal.Priority[31] = 1

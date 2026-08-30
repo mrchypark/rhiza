@@ -46,7 +46,7 @@ jobs:
       - name: Race detector
         if: matrix.arenas == false
         env:
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
         run: go test -race ./...
 
       - name: Vulnerability scan
