@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -48,6 +49,24 @@ type Node struct {
 	recoveryMu   sync.Mutex
 	compactionMu sync.Mutex
 	catchUpWake  chan struct{}
+}
+
+// OpenLocalSQLReader returns a caller-owned read-only handle to this node's
+// materialized SQL state.
+func (n *Node) OpenLocalSQLReader() (*sql.DB, error) {
+	if n.material == nil {
+		return nil, sql.ErrConnDone
+	}
+	return n.material.OpenLocalSQLReader()
+}
+
+// SpeculateSQL delegates a rollback-only planning transaction to the SQL
+// materializer. Replicated commits must still use the normal Execute API.
+func (n *Node) SpeculateSQL(ctx context.Context, fn func(*sql.Tx) error) error {
+	if n.material == nil {
+		return sql.ErrConnDone
+	}
+	return n.material.SpeculateSQL(ctx, fn)
 }
 
 // New creates a new Node.

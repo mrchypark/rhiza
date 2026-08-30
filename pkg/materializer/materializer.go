@@ -29,7 +29,7 @@ import (
 
 const (
 	MaxSQLBytes      = 256 << 10
-	MaxSQLStatements = 64
+	MaxSQLStatements = 128
 	MaxSQLArgs       = 999
 	MaxReturningRows = 10_000
 	MaxResultBytes   = 16 << 20
@@ -126,8 +126,8 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
-	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)"
-	readerDSN := fileURL + "?mode=ro&_pragma=busy_timeout(5000)"
+	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	readerDSN := fileURL + "?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 
 	// Open main database for metadata
 	db, err := openSQLite(writerDSN, false)
@@ -1157,6 +1157,39 @@ func (m *Materializer) reader() (*sql.DB, error) {
 		return nil, sql.ErrConnDone
 	}
 	return m.readers[0], nil
+}
+
+// OpenLocalSQLReader returns a caller-owned read-only handle to the local
+// materialized SQLite state. HA callers that require freshness must establish
+// a linearizable barrier through the Rhiza API before reading.
+func (m *Materializer) OpenLocalSQLReader() (*sql.DB, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.writer == nil {
+		return nil, sql.ErrConnDone
+	}
+	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(m.dbPath)}).String()
+	return openSQLite(fileURL+"?mode=ro&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", false)
+}
+
+// SpeculateSQL runs a transaction against the current local materialization
+// and always rolls it back. It exists for embedded adapters that must plan one
+// deterministic Statements batch; only Execute may commit replicated state.
+func (m *Materializer) SpeculateSQL(ctx context.Context, fn func(*sql.Tx) error) error {
+	if fn == nil {
+		return fmt.Errorf("speculative SQL callback is required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.writer == nil {
+		return sql.ErrConnDone
+	}
+	tx, err := m.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	return fn(tx)
 }
 
 func (m *Materializer) queryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {

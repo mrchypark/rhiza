@@ -2,6 +2,7 @@ package rhiza_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -79,6 +80,41 @@ func TestExecuteContractAndEncodedSizeBoundary(t *testing.T) {
 	}
 	if err := valid(low + 1); !errors.Is(err, rhiza.ErrInvalidRequest) {
 		t.Fatalf("oversized mutation error=%v", err)
+	}
+}
+
+func TestEmbeddedSpeculativeSQLAlwaysRollsBack(t *testing.T) {
+	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Execute(context.Background(), rhiza.ExecuteRequest{RequestID: "schema-speculate", Statements: []rhiza.SQLStatement{
+		{SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"},
+		{SQL: "CREATE TABLE item_children (id INTEGER PRIMARY KEY, item_id INTEGER NOT NULL REFERENCES items(id))"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SpeculateSQL(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO items VALUES (1, 'tea')`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := db.OpenLocalSQLReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var count int
+	if err := reader.QueryRow(`SELECT COUNT(*) FROM items`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("speculative row count=%d err=%v", count, err)
+	}
+	if err := db.SpeculateSQL(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO item_children VALUES (1, 999)`)
+		return err
+	}); err == nil {
+		t.Fatal("speculative SQL did not enforce foreign keys")
 	}
 }
 
