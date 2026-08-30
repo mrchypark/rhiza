@@ -5,13 +5,11 @@ go 1.27.0
 require (
 	github.com/go-kit/log v0.2.1
 	github.com/google/flatbuffers v25.12.19+incompatible
-	github.com/jeffhajewski/latticedb/bindings/go v0.0.0
+	github.com/mrchypark/latticedb-go v0.0.0-20260830110907-32915dd7fe91
 	github.com/ncruces/go-sqlite3 v0.35.3
 	github.com/quic-go/quic-go v0.61.0
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
 )
-
-replace github.com/jeffhajewski/latticedb/bindings/go => github.com/mrchypark/latticedb/bindings/go v0.0.0-20260828003118-8ef87c915c66
 
 require (
 	cloud.google.com/go v0.121.0 // indirect

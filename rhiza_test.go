@@ -1,5 +1,3 @@
-//go:build !graph
-
 package rhiza_test
 
 import (
@@ -32,6 +30,20 @@ func TestEmbeddedGoAPI(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || result.Rows[0][0] != "tea" {
 		t.Fatalf("unexpected rows: %#v", result.Rows)
+	}
+	if _, err := db.GraphExecute(context.Background(), rhiza.GraphCommand{RequestID: "graph-insert", Cypher: "CREATE (:Item {name: 'graph'})"}); err != nil {
+		t.Fatal(err)
+	}
+	graph, err := db.GraphQuery(context.Background(), rhiza.GraphQueryRequest{Cypher: "MATCH (n:Item) RETURN n.name"})
+	if err != nil || len(graph.Rows) != 1 || graph.Rows[0][0] != "graph" {
+		t.Fatalf("unexpected graph rows: %#v, err=%v", graph.Rows, err)
+	}
+	if _, err := db.KVPut(context.Background(), rhiza.KVMutationRequest{RequestID: "kv-put", Key: "kind", Value: []byte("combined")}); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := db.KVGet(context.Background(), rhiza.KVGetRequest{Key: "kind"})
+	if err != nil || !kv.Found || string(kv.Value) != "combined" {
+		t.Fatalf("unexpected KV value: %q found=%v err=%v", kv.Value, kv.Found, err)
 	}
 }
 

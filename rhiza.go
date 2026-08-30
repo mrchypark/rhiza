@@ -10,14 +10,12 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 type Member = quepaxa.Member
-type Profile = types.Profile
 type SQLStatement = types.SQLStatement
 type GraphCommand = types.GraphCommand
 type GraphResult = types.GraphCommandResult
@@ -50,7 +48,6 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 type Config struct {
 	ClusterID             string
 	NodeID                string
-	Profile               Profile
 	DataDir               string
 	BindAddr              string
 	PeerAddr              string
@@ -81,8 +78,6 @@ type Config struct {
 }
 
 const (
-	ProfileSQL                     = types.ProfileSQL
-	ProfileGraph                   = types.ProfileGraph
 	ConsistencyLocal               = "local"
 	ConsistencyLinearizable        = "linearizable"
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
@@ -113,9 +108,6 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	if config.DataDir == "" {
 		return nil, fmt.Errorf("data directory is required")
 	}
-	if config.Profile == "" {
-		config.Profile = materializer.BuildProfile()
-	}
 	if config.BindAddr == "" {
 		config.BindAddr = "127.0.0.1:0"
 	}
@@ -131,7 +123,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	}
 	childCtx, cancel := context.WithCancel(ctx)
 	internalConfig := &types.ExecutionConfig{
-		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID), Profile: config.Profile,
+		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, Members: config.Members,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,

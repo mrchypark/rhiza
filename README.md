@@ -1,6 +1,6 @@
 # rhiza
 
-Rhiza is an embedded, leaderless Go database with SQL/KV or Graph/KV builds.
+Rhiza is an embedded, leaderless Go database with SQL, Graph, and KV.
 Any healthy peer can accept a write; QuePaxa records a certified decision on a
 quorum before the API acknowledges it. An HTTP server is an optional adapter
 over the same Go API.
@@ -10,16 +10,15 @@ over the same Go API.
 - Go 1.27.0; `GOTOOLCHAIN=auto` is expected.
 - Green Tea GC is the Go 1.27 default.
 - The container enables `GOEXPERIMENT=arenas` for QLog read scratch buffers.
-- The default `sql-kv` image uses cgo-free `ncruces/go-sqlite3`.
-- The separate `graph-kv` image uses the Rhiza LatticeDB fork through cgo.
+- SQLite uses cgo-free `ncruces/go-sqlite3`.
+- Graph uses the pure-Go `latticedb-go` engine.
 
 ```bash
 go test ./...
 go vet ./...
 GOEXPERIMENT=arenas go test ./...
 go build ./cmd/rhiza
-docker build -f Dockerfile.graph -t rhiza-graph-kv:dev .
-docker build -t rhiza-sql-kv:dev .
+docker build -t rhiza:dev .
 ```
 
 ## Embedded Go API
@@ -95,31 +94,22 @@ a quorum is unavailable; they never fall back to a stale read. With three
 peers, one failed peer preserves reads and writes. Two failed peers preserve
 only local reads and reject writes and linearizable reads with HTTP 503.
 
-SQLite and LatticeDB are derived from the certified QLog. Startup replays missing decisions;
-an unreadable SQLite database is quarantined and rebuilt from the log. SQLite
-snapshots use `VACUUM INTO`, are integrity-checked before atomic restore, and
-checkpoint uploads consume those consistent bytes rather than the live file.
-QLog compaction and remote object-store bootstrap are not yet enabled.
+SQLite and LatticeDB are derived from the certified QLog. Startup replays
+missing decisions; unreadable local state is quarantined and rebuilt from the
+log. Checkpoints capture both engines at the same applied slot and restore the
+fixed SQLite and Graph files atomically.
 
 ## Docker quick start
 
 ```bash
-docker build -t rhiza-sql-kv:dev -t rhiza-sql-kv-e2e:dev .
-docker run --rm --name rhiza-sql -p 8080:8080 \
+docker build -t rhiza:dev -t rhiza-e2e:dev .
+docker run --rm --name rhiza -p 8080:8080 \
   -e RHIZA_BIND_ADDR=0.0.0.0:8080 \
-  -v rhiza-sql-data:/data \
-  rhiza-sql-kv:dev
-
-docker build -f Dockerfile.graph \
-  -t rhiza-graph-kv:dev -t rhiza-graph-kv-e2e:dev .
-docker run --rm --name rhiza-graph -p 8081:8080 \
-  -e RHIZA_BIND_ADDR=0.0.0.0:8080 \
-  -e RHIZA_EXECUTION_PROFILE=graph \
-  -v rhiza-graph-data:/data \
-  rhiza-graph-kv:dev
+  -v rhiza-data:/data \
+  rhiza:dev
 ```
 
-For Kubernetes qualification, preload the `*-e2e:dev` tags into every node or
+For Kubernetes qualification, preload `rhiza-e2e:dev` into every node or
 replace the manifest image references with published registry images. Then
 apply `deploy/k8s/sql-server-3peer-e2e.yaml` or
 `deploy/k8s/graph-server-3peer-e2e.yaml` with standard `kubectl`. The Chaos Mesh
@@ -133,7 +123,7 @@ were 0.207 ms local read, 2.67 ms linearizable read, and 1.24 ms write. With one
 failed peer they were 0.245 ms, 1.98 ms, and 9.10 ms respectively. These include
 local port-forward overhead and showed substantial tail variance.
 
-For Graph/KV qualification, preload `rhiza-graph-kv-e2e:dev`, then apply
+For Graph qualification, preload `rhiza-e2e:dev`, then apply
 `deploy/k8s/graph-server-3peer-e2e.yaml`. Set `RHIZA_GRAPH_E2E_URL` to a
 forwarded peer and run `go test ./e2e -run TestGraphServer`. The same local
 Kubernetes qualification passed with a 15.2 ms one-peer-failure write, HTTP 503
@@ -142,12 +132,11 @@ recovery. Three-peer samples were 0.29–0.35 ms local read, 4.7–21.6 ms
 linearizable read, and
 8.1–11.6 ms graph write, including port-forward overhead.
 
-The build profile is fixed into each binary and mismatched
-`RHIZA_EXECUTION_PROFILE` values are rejected at startup. Graph mutations,
-request receipts, and the applied slot commit atomically in LatticeDB before
-the SQLite sidecar tip, so a crash replays without applying a graph mutation
-twice. LatticeDB is rebuilt from the full QLog when local state is missing;
-graph checkpoints bundle the SQLite and LatticeDB materializations.
+Every binary and node includes SQL, Graph, and KV. Graph mutations, request
+receipts, and the applied slot commit atomically in LatticeDB before the SQLite
+sidecar tip, so a crash replays without applying a graph mutation twice.
+LatticeDB is rebuilt from the QLog when local state is missing; checkpoints
+always bundle the SQLite and LatticeDB materializations.
 
 ## License
 

@@ -167,11 +167,8 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
-	if materializer.GraphEnabled() {
-		s.graphBatcher = newGraphBatcher(s.proposeHedged, nil)
-	} else {
-		s.sqlBatcher = newSQLBatcher(s.proposeHedged, nil)
-	}
+	s.sqlBatcher = newSQLBatcher(s.proposeHedged, nil)
+	s.graphBatcher = newGraphBatcher(s.proposeHedged, nil)
 	s.kvBatcher = newKVBatcher(s.proposeHedged, nil)
 	s.routes()
 	return s
@@ -213,18 +210,15 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 // routes registers HTTP routes.
 func (s *Server) routes() {
 	// Client API
-	if materializer.GraphEnabled() {
-		s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
-		s.mux.HandleFunc("/graph/query", s.handleGraphQuery)
-		s.mux.HandleFunc("/graph/changes", s.handleGraphChanges)
-		s.mux.HandleFunc("/graph/streams/read", s.handleGraphStreamRead)
-		s.mux.HandleFunc("/graph/streams/offset", s.handleGraphStreamOffset)
-		s.mux.HandleFunc("/graph/streams/trim", s.handleGraphStreamTrim)
-	} else {
-		s.mux.HandleFunc("/sql/execute", s.handleExecute)
-		s.mux.HandleFunc("/sql/transaction", s.handleExecute)
-		s.mux.HandleFunc("/sql/query", s.handleQuery)
-	}
+	s.mux.HandleFunc("/sql/execute", s.handleExecute)
+	s.mux.HandleFunc("/sql/transaction", s.handleExecute)
+	s.mux.HandleFunc("/sql/query", s.handleQuery)
+	s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
+	s.mux.HandleFunc("/graph/query", s.handleGraphQuery)
+	s.mux.HandleFunc("/graph/changes", s.handleGraphChanges)
+	s.mux.HandleFunc("/graph/streams/read", s.handleGraphStreamRead)
+	s.mux.HandleFunc("/graph/streams/offset", s.handleGraphStreamOffset)
+	s.mux.HandleFunc("/graph/streams/trim", s.handleGraphStreamTrim)
 	s.mux.HandleFunc("/kv/put", s.handleKVPut)
 	s.mux.HandleFunc("/kv/get", s.handleKVGet)
 	s.mux.HandleFunc("/kv/delete", s.handleKVDelete)
@@ -628,9 +622,6 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if !s.writable || !s.ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
-	if materializer.GraphEnabled() {
-		return ExecuteResponse{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
-	}
 	if req.RequestID == "" {
 		return ExecuteResponse{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
 	}
@@ -706,9 +697,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 // Query reads SQL locally or after a linearizable consensus barrier.
 func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
-	if materializer.GraphEnabled() {
-		return QueryResponse{}, fmt.Errorf("%w: SQL is unavailable in the graph build", ErrInvalidRequest)
-	}
 	if req.SQL == "" {
 		return QueryResponse{}, fmt.Errorf("%w: sql is required", ErrInvalidRequest)
 	}
@@ -1206,9 +1194,6 @@ func validateReplicatedMutation(value []byte) error {
 	if commands, ok, err := types.DecodeSQLBatch(value); err != nil {
 		return err
 	} else if ok {
-		if materializer.GraphEnabled() {
-			return fmt.Errorf("SQL is unavailable in the graph build")
-		}
 		for _, command := range commands {
 			if command.RequestID == "" {
 				return fmt.Errorf("request_id is required")
@@ -1237,9 +1222,6 @@ func validateReplicatedMutation(value []byte) error {
 	if commands, ok, err := types.DecodeGraphBatch(value); err != nil {
 		return err
 	} else if ok {
-		if !materializer.GraphEnabled() {
-			return fmt.Errorf("graph commands require the graph build")
-		}
 		for _, command := range commands {
 			if err := materializer.ValidateGraphCommand(command); err != nil {
 				return err

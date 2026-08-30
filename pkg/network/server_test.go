@@ -1,5 +1,3 @@
-//go:build !graph
-
 package network
 
 import (
@@ -162,23 +160,6 @@ func TestHTTPAdapterDoesNotExposePeerRPC(t *testing.T) {
 	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/internal/decisions?from=1", nil))
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404", response.Code)
-	}
-}
-
-func TestSQLBuildRejectsNewGraphValueBeforeConsensus(t *testing.T) {
-	members := []quepaxa.Member{{ID: "n1"}}
-	core := mustCore(t, "n1", members, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, members, 0)
-	defer server.Close()
-	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "graph", Cypher: "CREATE (:N)"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := server.proposeLocal(context.Background(), value); !errors.Is(err, ErrInvalidRequest) {
-		t.Fatalf("error=%v, want invalid request", err)
-	}
-	if core.Tip() != 0 {
-		t.Fatalf("rejected graph value advanced consensus tip to %d", core.Tip())
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
-	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -148,7 +147,7 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dataDir := filepath.Join(t.TempDir(), "data")
 			config := &types.ExecutionConfig{
-				NodeID: "n1", Profile: materializer.BuildProfile(), DataDir: dataDir,
+				NodeID: "n1", DataDir: dataDir,
 				Members: []types.NodeConfig{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}},
 			}
 			configure(config)

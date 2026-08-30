@@ -63,7 +63,7 @@ spec:
     spec:
       containers:
         - name: rhiza-sql
-          image: rhiza-sql-kv-e2e:dev
+          image: rhiza-e2e:dev
           imagePullPolicy: Never
           env:
             - name: RHIZA_NODE_ID

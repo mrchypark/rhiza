@@ -63,15 +63,13 @@ spec:
     spec:
       containers:
         - name: rhiza-graph
-          image: rhiza-graph-kv-e2e:dev
+          image: rhiza-e2e:dev
           imagePullPolicy: Never
           env:
             - name: RHIZA_NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: RHIZA_EXECUTION_PROFILE
-              value: graph
             - name: RHIZA_BIND_ADDR
               value: 0.0.0.0:8080
             - name: RHIZA_PEER_ADDR

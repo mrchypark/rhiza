@@ -63,7 +63,6 @@ func main() {
 	config := rhiza.Config{
 		ClusterID:             getEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"),
 		NodeID:                getEnvOrDefault("RHIZA_NODE_ID", "node-1"),
-		Profile:               rhiza.Profile(getEnvOrDefault("RHIZA_EXECUTION_PROFILE", "")),
 		DataDir:               getEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"),
 		BindAddr:              getEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
 		PeerAddr:              getEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"),

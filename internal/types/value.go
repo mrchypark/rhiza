@@ -415,9 +415,6 @@ type Proposal struct {
 
 	// Payload contains the encoded commands (SQL, Graph, KV).
 	Payload []byte
-
-	// Profile indicates the runtime profile: "sql", "graph", or "kv".
-	Profile string
 }
 
 // Hash returns the SHA-256 hash of the proposal.
@@ -425,7 +422,6 @@ func (p *Proposal) Hash() ValueHash {
 	h := sha256.New()
 	h.Write([]byte(p.RequestID))
 	h.Write(p.Payload)
-	h.Write([]byte(p.Profile))
 	var out ValueHash
 	copy(out[:], h.Sum(nil))
 	return out

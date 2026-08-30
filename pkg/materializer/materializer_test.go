@@ -1,5 +1,3 @@
-//go:build !graph
-
 package materializer
 
 import (
@@ -390,14 +388,18 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	if got := result.Rows[0][0]; got != "safe" {
 		t.Fatalf("returning name=%v", got)
 	}
-	snapshot, err := m.Snapshot(ctx)
+	files, index, cleanup, err := m.CheckpointFilesAt(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	defer cleanup()
+	if index != 1 {
+		t.Fatalf("checkpoint index=%d, want 1", index)
 	}
 	if err := m.Apply(ctx, 2, []byte("DELETE FROM features")); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Restore(ctx, snapshot); err != nil {
+	if err := m.RestoreCheckpoint(ctx, files); err != nil {
 		t.Fatal(err)
 	}
 	var count int
@@ -673,8 +675,13 @@ func TestMaterializerReadAPIRejectsAttachment(t *testing.T) {
 	if _, err := m.QueryResult(context.Background(), `ATTACH DATABASE ':memory:' AS other`, nil); err == nil {
 		t.Fatal("read API accepted ATTACH")
 	}
-	if _, err := m.Snapshot(context.Background()); err != nil {
-		t.Fatalf("internal snapshot was blocked: %v", err)
+	files, _, cleanup, err := m.CheckpointFilesAt(context.Background())
+	if err != nil {
+		t.Fatalf("checkpoint was blocked: %v", err)
+	}
+	cleanup()
+	if len(files) != 2 {
+		t.Fatalf("checkpoint files=%d, want 2", len(files))
 	}
 }
 
@@ -848,12 +855,18 @@ func TestQueryAfterCloseReturnsError(t *testing.T) {
 
 func TestAdoptStopsTemporaryDispatcher(t *testing.T) {
 	dir := t.TempDir()
-	target, err := Open(dir+"/target.db", 1)
+	if err := os.MkdirAll(dir+"/target", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir+"/source", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target, err := Open(dir+"/target/target.db", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer target.Close()
-	source, err := Open(dir+"/source.db", 1)
+	source, err := Open(dir+"/source/source.db", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,5 +1,3 @@
-//go:build graph
-
 package materializer
 
 import (
@@ -7,14 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 	"unicode/utf8"
 
-	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
+	latticedb "github.com/mrchypark/latticedb-go"
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
@@ -70,9 +67,6 @@ type graphJournalEntry struct {
 	Hash [32]byte
 }
 
-func BuildProfile() types.Profile { return types.ProfileGraph }
-func GraphEnabled() bool          { return true }
-
 func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, err
@@ -85,10 +79,8 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 		return nil, err
 	}
 	db, err := latticedb.Open(dbPath, latticedb.OpenOptions{
-		Create:               true,
-		CacheSizeMB:          32,
-		EnableAdjacencyCache: true,
-		NoSync:               true,
+		Create:     true,
+		Durability: latticedb.DurabilityStandard,
 	})
 	if err != nil {
 		return nil, err
@@ -262,18 +254,13 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	if slot != g.tip+1 {
 		return fmt.Errorf("graph apply slot gap: have %d, got %d", g.tip, slot)
 	}
-	if commands, sqlBatch, err := types.DecodeSQLBatch(value); err != nil {
-		return err
-	} else if sqlBatch && len(commands) > 0 {
-		return fmt.Errorf("SQL command is not supported by the graph-kv build")
-	}
 	if !graph {
 		known, err := knownNonGraphValue(value)
 		if err != nil {
 			return err
 		}
 		if !known {
-			return fmt.Errorf("unrecognized command is not supported by the graph-kv build")
+			return fmt.Errorf("unrecognized replicated command")
 		}
 		if err := g.advanceTip(ctx, slot, valueHash); err != nil {
 			return err
@@ -341,7 +328,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 		case command.StreamTrim != nil:
 			err = tx.TrimStream(command.StreamTrim.Stream, command.StreamTrim.ThroughSequence)
 		default:
-			_, err = tx.QueryContext(ctx, command.Cypher, args, MaxReturningRows, MaxResultBytes)
+			_, err = tx.QueryContext(ctx, command.Cypher, args, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
 		}
 		if err != nil {
 			return err
@@ -542,6 +529,9 @@ func pruneGraphRequests(tx *latticedb.Tx, slot uint64) error {
 }
 
 func knownNonGraphValue(value []byte) (bool, error) {
+	if _, ok, err := types.DecodeSQLBatch(value); ok || err != nil {
+		return ok, err
+	}
 	if _, ok, err := types.DecodeKVBatch(value); ok || err != nil {
 		return ok, err
 	}
@@ -557,8 +547,10 @@ func knownNonGraphValue(value []byte) (bool, error) {
 	if _, ok, err := types.DecodeCheckpointSeal(value); ok || err != nil {
 		return ok, err
 	}
-	_, ok, err := types.DecodeLeaderSchedule(value)
-	return ok, err
+	if _, ok, err := types.DecodeLeaderSchedule(value); ok || err != nil {
+		return ok, err
+	}
+	return true, nil // Materializer.Apply also accepts raw SQL.
 }
 
 func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[string]any) (types.GraphCommandResult, error) {
@@ -595,7 +587,7 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	g.queryWG.Add(1)
 	m.mu.RUnlock()
 	defer g.queryWG.Done()
-	result, err := tx.QueryContext(ctx, cypher, converted, MaxReturningRows, MaxResultBytes)
+	result, err := tx.QueryContext(ctx, cypher, converted, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
 	rollbackErr := tx.Rollback()
 	if err != nil {
 		return types.GraphCommandResult{}, err
@@ -768,14 +760,6 @@ func (m *Materializer) graphHealth() error {
 		return fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", m.graph.tip, m.tip)
 	}
 	return nil
-}
-
-func (*Materializer) writeSnapshot(string, io.Writer) error {
-	return fmt.Errorf("graph snapshots require CheckpointFilesAt")
-}
-
-func prepareSnapshotFile(string, string) (snapshotParts, error) {
-	return snapshotParts{}, fmt.Errorf("graph snapshots require fixed-role files")
 }
 
 func (m *Materializer) validateRestoredSnapshot() error {

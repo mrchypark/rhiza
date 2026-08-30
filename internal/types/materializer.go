@@ -3,20 +3,11 @@ package types
 import "context"
 
 // Materializer applies decided values to local state.
-// Implementations exist for SQL (SQLite), Graph (LatticeDB), and KV.
+// The implementation materializes SQL, Graph, and KV state together.
 type Materializer interface {
 	// Apply applies a decided value to the local materialization.
 	// The slot is provided for ordering guarantees.
 	Apply(ctx context.Context, slot Slot, value []byte) error
-
-	// Snapshot captures the current state as bytes.
-	Snapshot(ctx context.Context) ([]byte, error)
-
-	// Restore restores state from a snapshot.
-	Restore(ctx context.Context, data []byte) error
-
-	// Profile returns the runtime profile this materializer handles.
-	Profile() Profile
 }
 
 // ReadResult is the result of a read operation.

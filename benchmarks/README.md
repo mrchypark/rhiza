@@ -17,7 +17,7 @@ Run one Dory profile with:
 
 ```bash
 bash benchmarks/run-dory-profile.sh \
-  sql rhiza-sql-kv-e2e:dev async current-sql-async benchmarks/results/<run>
+  sql rhiza-e2e:dev async current-sql-async benchmarks/results/<run>
 ```
 
 Set `RHIZA_BENCH_CHECKPOINT_INTERVAL=1s` to measure checkpoint interference. Add

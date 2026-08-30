@@ -1,7 +1,5 @@
 package network
 
-//lint:file-ignore SA4023 Graph-enabled builds use a different materializer implementation that can return nil errors.
-
 import (
 	"context"
 	"encoding/json"
@@ -82,9 +80,6 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if !s.writable || !s.ready() {
 		return GraphExecuteResponse{}, ErrNotReady
 	}
-	if !materializer.GraphEnabled() {
-		return GraphExecuteResponse{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
-	}
 	if err := materializer.ValidateGraphCommand(command); err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
@@ -143,9 +138,6 @@ func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (types.GraphCommandResult, error) {
-	if !materializer.GraphEnabled() {
-		return types.GraphCommandResult{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
-	}
 	if request.Cypher == "" {
 		return types.GraphCommandResult{}, ErrInvalidRequest
 	}
@@ -166,9 +158,6 @@ func (s *Server) GraphChanges(ctx context.Context, request GraphStreamReadReques
 }
 
 func (s *Server) GraphStreamRead(ctx context.Context, request GraphStreamReadRequest) (GraphStreamReadResponse, error) {
-	if !materializer.GraphEnabled() {
-		return GraphStreamReadResponse{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
-	}
 	if request.Limit == 0 {
 		request.Limit = 100
 	}
@@ -189,9 +178,6 @@ func (s *Server) GraphStreamRead(ctx context.Context, request GraphStreamReadReq
 }
 
 func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
-	if !materializer.GraphEnabled() {
-		return GraphStreamOffsetResponse{}, fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
-	}
 	if err := s.readBarrier(ctx, request.Consistency); err != nil {
 		return GraphStreamOffsetResponse{}, err
 	}
@@ -206,17 +192,11 @@ func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffse
 }
 
 func (s *Server) SetGraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) error {
-	if !materializer.GraphEnabled() {
-		return fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
-	}
 	_, err := s.GraphExecute(ctx, types.GraphCommand{RequestID: request.RequestID, StreamOffset: &types.GraphStreamOffsetMutation{Stream: request.Stream, Consumer: request.Consumer, Sequence: request.Sequence}})
 	return err
 }
 
 func (s *Server) TrimGraphStream(ctx context.Context, request GraphStreamTrimRequest) error {
-	if !materializer.GraphEnabled() {
-		return fmt.Errorf("%w: graph is unavailable in this build", ErrInvalidRequest)
-	}
 	_, err := s.GraphExecute(ctx, types.GraphCommand{RequestID: request.RequestID, StreamTrim: &types.GraphStreamTrimMutation{Stream: request.Stream, ThroughSequence: request.ThroughSequence}})
 	return err
 }

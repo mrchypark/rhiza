@@ -1,5 +1,3 @@
-//go:build !graph
-
 package network
 
 import (

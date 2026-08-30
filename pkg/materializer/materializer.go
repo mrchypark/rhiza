@@ -1170,63 +1170,28 @@ func (m *Materializer) queryRow(ctx context.Context, query string, args ...inter
 	return reader.QueryRowContext(ctx, query, args...)
 }
 
-// Snapshot creates a backup of the database.
+// Snapshot is unavailable for the combined store; use CheckpointFilesAt.
 func (m *Materializer) Snapshot(ctx context.Context) ([]byte, error) {
 	data, _, err := m.SnapshotAt(ctx)
 	return data, err
 }
 
-// SnapshotAt returns a snapshot and the applied slot captured under the same lock.
+// SnapshotAt is unavailable for the combined store; use CheckpointFilesAt.
 func (m *Materializer) SnapshotAt(ctx context.Context) ([]byte, uint64, error) {
 	var data bytes.Buffer
 	index, err := m.SnapshotTo(ctx, &data)
 	return data.Bytes(), index, err
 }
 
-// SnapshotTo streams a transactionally consistent snapshot with bounded memory.
+// SnapshotTo is unavailable for the combined store; use CheckpointFilesAt.
 func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64, error) {
-	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-snapshot-*.db")
-	if err != nil {
-		return 0, err
-	}
-	path := file.Name()
-	file.Close()
-	os.Remove(path)
-	defer os.Remove(path)
-	if !GraphEnabled() {
-		index, err := m.backupSQLite(ctx, path)
-		if err != nil {
-			return 0, fmt.Errorf("snapshot: %w", err)
-		}
-		if err := m.writeSnapshot(path, writer); err != nil {
-			return 0, fmt.Errorf("stream snapshot: %w", err)
-		}
-		return index, nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.db == nil {
+	m.mu.RLock()
+	closed := m.db == nil
+	m.mu.RUnlock()
+	if closed {
 		return 0, sql.ErrConnDone
 	}
-	if _, err := m.db.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
-		return 0, fmt.Errorf("snapshot: %w", err)
-	}
-	if err := m.writeSnapshot(path, writer); err != nil {
-		return 0, fmt.Errorf("stream snapshot: %w", err)
-	}
-	return m.tip, nil
-}
-
-func (m *Materializer) backupSQLite(ctx context.Context, path string) (uint64, error) {
-	snapshot, err := m.beginSQLiteSnapshot(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer snapshot.Close()
-	if err := snapshot.Backup(path); err != nil {
-		return 0, err
-	}
-	return snapshot.index, nil
+	return 0, fmt.Errorf("combined SQL and Graph snapshots require CheckpointFilesAt")
 }
 
 func (m *Materializer) beginSQLiteSnapshot(ctx context.Context) (*sqliteSnapshot, error) {
@@ -1318,14 +1283,6 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 			_ = os.Remove(path)
 		}
 	}
-	if !GraphEnabled() {
-		index, err := m.backupSQLite(ctx, sqlitePath)
-		if err != nil {
-			cleanup()
-			return nil, 0, nil, err
-		}
-		return []CheckpointFile{{Role: CheckpointSQLite, Path: sqlitePath}}, index, cleanup, nil
-	}
 	graph, err := os.CreateTemp(dir, ".rhiza-checkpoint-graph-*")
 	if err != nil {
 		cleanup()
@@ -1375,37 +1332,14 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	return []CheckpointFile{{Role: CheckpointSQLite, Path: sqlitePath}, {Role: CheckpointGraphData, Path: graphPath}}, index, cleanup, nil
 }
 
-// Restore restores from a snapshot.
+// Restore is unavailable for the combined store; use RestoreCheckpoint.
 func (m *Materializer) Restore(ctx context.Context, data []byte) error {
-	if len(data) == 0 {
-		return fmt.Errorf("empty snapshot")
-	}
-	file, err := os.CreateTemp(filepath.Dir(m.dbPath), ".rhiza-restore-input-*")
-	if err != nil {
-		return err
-	}
-	path := file.Name()
-	if _, err = file.Write(data); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	defer os.Remove(path)
-	return m.RestoreFile(ctx, path)
+	return fmt.Errorf("combined SQL and Graph restore requires fixed-role checkpoint files")
 }
 
-// RestoreFile validates and atomically installs a checkpoint without loading
-// the snapshot into the Go heap.
+// RestoreFile is unavailable for the combined store; use RestoreCheckpoint.
 func (m *Materializer) RestoreFile(ctx context.Context, snapshotPath string) error {
-	if GraphEnabled() {
-		return fmt.Errorf("graph build requires fixed-role checkpoint files")
-	}
-	return m.restoreParts(ctx, snapshotParts{sqlitePath: snapshotPath})
+	return fmt.Errorf("combined SQL and Graph restore requires fixed-role checkpoint files")
 }
 
 // RestoreCheckpoint atomically installs the exact fixed-role checkpoint set.
@@ -1426,32 +1360,30 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 			return fmt.Errorf("unknown checkpoint role %q", file.Role)
 		}
 	}
-	if parts.sqlitePath == "" || GraphEnabled() != seen[CheckpointGraphData] {
-		return fmt.Errorf("checkpoint file roles do not match build profile")
+	if parts.sqlitePath == "" || !seen[CheckpointGraphData] {
+		return fmt.Errorf("checkpoint requires SQLite and Graph files")
 	}
-	if GraphEnabled() {
-		root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
-		if err != nil {
-			return err
-		}
-		graphDir := filepath.Join(root, "latticedb")
-		if err := os.MkdirAll(graphDir, 0o700); err != nil {
-			_ = os.RemoveAll(root)
-			return err
-		}
-		source := ""
-		for _, file := range files {
-			if file.Role == CheckpointGraphData {
-				source = file.Path
-			}
-		}
-		if err := copyFile(source, filepath.Join(graphDir, "graph.ltdb")); err != nil {
-			_ = os.RemoveAll(root)
-			return err
-		}
-		parts.graphDir = graphDir
-		parts.cleanup = func() { _ = os.RemoveAll(root) }
+	root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
+	if err != nil {
+		return err
 	}
+	graphDir := filepath.Join(root, "latticedb")
+	if err := os.MkdirAll(graphDir, 0o700); err != nil {
+		_ = os.RemoveAll(root)
+		return err
+	}
+	source := ""
+	for _, file := range files {
+		if file.Role == CheckpointGraphData {
+			source = file.Path
+		}
+	}
+	if err := copyFile(source, filepath.Join(graphDir, "graph.ltdb")); err != nil {
+		_ = os.RemoveAll(root)
+		return err
+	}
+	parts.graphDir = graphDir
+	parts.cleanup = func() { _ = os.RemoveAll(root) }
 	return m.restoreParts(ctx, parts)
 }
 

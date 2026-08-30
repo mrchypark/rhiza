@@ -1,5 +1,3 @@
-//go:build graph
-
 package rhiza_test
 
 import (
@@ -15,7 +13,7 @@ import (
 )
 
 func TestEmbeddedGraphGoAPI(t *testing.T) {
-	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", Profile: rhiza.ProfileGraph, DataDir: t.TempDir()})
+	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +86,7 @@ func TestEmbeddedGraphGoAPI(t *testing.T) {
 }
 
 func TestEmbeddedGraphAfterCloseReturnsErrors(t *testing.T) {
-	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", Profile: rhiza.ProfileGraph, DataDir: t.TempDir()})
+	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}

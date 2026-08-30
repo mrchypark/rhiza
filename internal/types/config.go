@@ -20,15 +20,9 @@ const (
 	RoleVoter
 )
 
-// Profile is the runtime execution profile.
-type Profile string
-
 type ObjectStoreDurability string
 
 const (
-	ProfileSQL   Profile = "sql"
-	ProfileGraph Profile = "graph"
-
 	ObjectStoreDurabilityAsync     ObjectStoreDurability = "async"
 	ObjectStoreDurabilityBeforeAck ObjectStoreDurability = "before-ack"
 )
@@ -37,7 +31,6 @@ const (
 type ExecutionConfig struct {
 	ClusterID  ClusterID    `json:"cluster_id"`
 	NodeID     NodeID       `json:"node_id"`
-	Profile    Profile      `json:"profile"`
 	DataDir    string       `json:"data_dir"`
 	BindAddr   string       `json:"bind_addr"`
 	PeerAddr   string       `json:"peer_addr"`

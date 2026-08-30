@@ -79,9 +79,6 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
-	if n.config.Profile != materializer.BuildProfile() {
-		return fmt.Errorf("execution profile %q does not match %s build", n.config.Profile, materializer.BuildProfile())
-	}
 	if n.config.ObjStoreDurability == "" {
 		n.config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
 	}

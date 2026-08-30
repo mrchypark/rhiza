@@ -22,50 +22,32 @@ jobs:
           cache: true
       - name: Test
         env:
+          CGO_ENABLED: 0
           GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
         run: go test ./...
       - name: Vet
         if: matrix.arenas == false
+        env:
+          CGO_ENABLED: 0
         run: go vet ./...
       - name: Build
         env:
+          CGO_ENABLED: 0
           GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
         run: go build ./cmd/rhiza
 
       - name: Production runtime experiments
         if: matrix.arenas == false
         env:
+          CGO_ENABLED: 0
           GOEXPERIMENT: arenas,greenteagc
         run: go test ./...
 
-      - name: Install LatticeDB
-        if: matrix.arenas == false
-        env:
-          LATTICEDB_REF: 8ef87c915c66578b87ed02333233902379df2877
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config xz-utils
-          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
-            | tar -xJ -C "$RUNNER_TEMP"
-          git clone --filter=blob:none https://github.com/mrchypark/latticedb.git "$RUNNER_TEMP/latticedb"
-          git -C "$RUNNER_TEMP/latticedb" checkout --detach "$LATTICEDB_REF"
-          "$RUNNER_TEMP/zig-x86_64-linux-0.16.0/zig" build shared \
-            --build-file "$RUNNER_TEMP/latticedb/build.zig" \
-            -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/lattice"
-          echo "PKG_CONFIG_PATH=$RUNNER_TEMP/lattice/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/lattice/lib" >> "$GITHUB_ENV"
-
-      - name: Graph profile
-        if: matrix.arenas == false
-        run: go test -tags graph ./...
-
       - name: Race detector
         if: matrix.arenas == false
+        env:
+          CGO_ENABLED: 0
         run: go test -race ./...
-
-      - name: Graph race detector
-        if: matrix.arenas == false
-        run: go test -race -tags graph ./...
 
       - name: Vulnerability scan
         if: matrix.arenas == false
@@ -80,10 +62,4 @@ jobs:
         with:
           context: .
           push: false
-          tags: rhiza-sql-kv:ci
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.graph
-          push: false
-          tags: rhiza-graph-kv:ci
+          tags: rhiza:ci

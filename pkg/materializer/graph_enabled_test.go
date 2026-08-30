@@ -1,5 +1,3 @@
-//go:build graph
-
 package materializer
 
 import (
@@ -12,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	latticedb "github.com/jeffhajewski/latticedb/bindings/go"
+	latticedb "github.com/mrchypark/latticedb-go"
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
