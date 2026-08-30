@@ -252,8 +252,9 @@ func TestWALAppendRead(t *testing.T) {
 
 func TestWALReadLargeEntry(t *testing.T) {
 	dir := t.TempDir()
-	want := Entry{Slot: 1, Type: EntryProposal, Payload: make([]byte, 2*1024*1024)}
-	want.Payload[len(want.Payload)-1] = 1
+	large := Entry{Slot: 1, Type: EntryProposal, Payload: make([]byte, 2*1024*1024)}
+	large.Payload[len(large.Payload)-1] = 1
+	want := []Entry{large, {Slot: 2, Type: EntryReceipt, Payload: []byte("small")}}
 
 	wal, err := Open(dir)
 	if err != nil {
@@ -261,15 +262,22 @@ func TestWALReadLargeEntry(t *testing.T) {
 	}
 	defer wal.Close()
 
-	if err := wal.Append(want); err != nil {
-		t.Fatal(err)
+	for _, entry := range want {
+		if err := wal.Append(entry); err != nil {
+			t.Fatal(err)
+		}
 	}
 	got, err := wal.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || !bytes.Equal(got[0].Payload, want.Payload) {
-		t.Fatal("large WAL entry did not round-trip")
+	if len(got) != len(want) {
+		t.Fatalf("read %d entries, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Slot != want[i].Slot || got[i].Type != want[i].Type || !bytes.Equal(got[i].Payload, want[i].Payload) {
+			t.Fatalf("entry %d did not round-trip: got=%#v want=%#v", i, got[i], want[i])
+		}
 	}
 }
 

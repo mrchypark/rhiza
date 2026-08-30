@@ -11,9 +11,6 @@ permissions:
 jobs:
   go:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arenas: [false, true]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
@@ -23,21 +20,17 @@ jobs:
       - name: Test
         env:
           CGO_ENABLED: 0
-          GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
         run: go test ./...
       - name: Vet
-        if: matrix.arenas == false
         env:
           CGO_ENABLED: 0
         run: go vet ./...
       - name: Build
         env:
           CGO_ENABLED: 0
-          GOEXPERIMENT: ${{ matrix.arenas && 'arenas' || '' }}
         run: go build ./cmd/rhiza
 
       - name: Real server E2E
-        if: matrix.arenas == false
         env:
           CGO_ENABLED: 0
           RHIZA_BIND_ADDR: 127.0.0.1:18086
@@ -63,21 +56,12 @@ jobs:
           cat "$RUNNER_TEMP/rhiza-e2e.log"
           exit 1
 
-      - name: Production runtime experiments
-        if: matrix.arenas == false
-        env:
-          CGO_ENABLED: 0
-          GOEXPERIMENT: arenas,greenteagc
-        run: go test ./...
-
       - name: Race detector
-        if: matrix.arenas == false
         env:
           CGO_ENABLED: 1
         run: go test -race ./...
 
       - name: Vulnerability scan
-        if: matrix.arenas == false
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   containers:

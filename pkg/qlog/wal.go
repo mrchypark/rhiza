@@ -529,11 +529,10 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 	}
 	size := info.Size()
 	var offset int64
-	memory := newReadArena()
-	defer memory.free()
-	header := memory.bytes(49)
+	buf := make([]byte, 49)
 
 	for offset < size {
+		header := buf[:49]
 		remaining := size - offset
 		if remaining < int64(len(header)) {
 			if repairTail {
@@ -560,8 +559,13 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 			}
 			return io.ErrUnexpectedEOF
 		}
-		buf := memory.bytes(int(totalLen))
-		copy(buf, header)
+		if int64(cap(buf)) < totalLen {
+			next := make([]byte, int(totalLen))
+			copy(next, header)
+			buf = next
+		} else {
+			buf = buf[:totalLen]
+		}
 		if payloadLen > 0 {
 			if _, err := s.file.ReadAt(buf[len(header):], offset+int64(len(header))); err != nil {
 				return err

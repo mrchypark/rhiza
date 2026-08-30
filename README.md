@@ -9,14 +9,12 @@ over the same Go API.
 
 - Go 1.27.0; `GOTOOLCHAIN=auto` is expected.
 - Green Tea GC is the Go 1.27 default.
-- The container enables `GOEXPERIMENT=arenas` for QLog read scratch buffers.
 - SQLite uses cgo-free `ncruces/go-sqlite3`.
 - Graph uses the pure-Go `latticedb-go` engine.
 
 ```bash
 go test ./...
 go vet ./...
-GOEXPERIMENT=arenas go test ./...
 go build ./cmd/rhiza
 docker build -t rhiza:dev .
 ```
