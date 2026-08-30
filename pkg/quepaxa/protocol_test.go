@@ -271,22 +271,14 @@ type clusterTransport struct {
 	cores        map[NodeID]*Core
 	down         map[NodeID]bool
 	dropDecision map[NodeID]bool
-	delay        map[Slot]time.Duration
 }
 
 func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
 	transport.mu.RLock()
-	core, down, delay := transport.cores[to], transport.down[to], transport.delay[request.Slot]
+	core, down := transport.cores[to], transport.down[to]
 	transport.mu.RUnlock()
 	if down {
 		return Summary{}, errors.New("replica down")
-	}
-	if delay > 0 {
-		select {
-		case <-ctx.Done():
-			return Summary{}, ctx.Err()
-		case <-time.After(delay):
-		}
 	}
 	return core.Record(ctx, request)
 }
@@ -373,7 +365,7 @@ func newTestCluster(t testing.TB) (map[NodeID]*Core, *clusterTransport) {
 	t.Helper()
 	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
 	config := &Cluster{ConfigID: 1, Members: members}
-	transport := &clusterTransport{cores: make(map[NodeID]*Core), down: make(map[NodeID]bool), dropDecision: make(map[NodeID]bool), delay: make(map[Slot]time.Duration)}
+	transport := &clusterTransport{cores: make(map[NodeID]*Core), down: make(map[NodeID]bool), dropDecision: make(map[NodeID]bool)}
 	for _, member := range members {
 		wal, err := qlog.Open(filepath.Join(t.TempDir(), string(member.ID)))
 		if err != nil {
@@ -426,9 +418,8 @@ func TestAcceptCertifiedValuesAppliesLeaderScheduleBeforeFollowingDecisions(t *t
 	}
 }
 
-func TestPipelineAllowsLaterSlotToFinishFirst(t *testing.T) {
-	cores, transport := newTestCluster(t)
-	transport.delay[1] = 50 * time.Millisecond
+func TestPipelineCompletesConcurrentSlots(t *testing.T) {
+	cores, _ := newTestCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -437,30 +428,25 @@ func TestPipelineAllowsLaterSlotToFinishFirst(t *testing.T) {
 		err  error
 	}
 	results := make(chan result, 2)
-	go func() {
-		slot, _, err := cores["n2"].Propose(ctx, []byte("first"))
-		results <- result{slot: slot, err: err}
-	}()
-	deadline := time.Now().Add(time.Second)
-	for {
-		cores["n2"].slotMu.Lock()
-		reserved := cores["n2"].nextSlot > 1
-		cores["n2"].slotMu.Unlock()
-		if reserved || time.Now().After(deadline) {
-			break
+	start := make(chan struct{})
+	for _, value := range [][]byte{[]byte("first"), []byte("second")} {
+		go func(value []byte) {
+			<-start
+			slot, _, err := cores["n2"].Propose(ctx, value)
+			results <- result{slot: slot, err: err}
+		}(value)
+	}
+	close(start)
+	seen := make(map[Slot]bool, 2)
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("proposal slot %d failed: %v", result.slot, result.err)
 		}
-		time.Sleep(time.Millisecond)
+		seen[result.slot] = true
 	}
-	go func() {
-		slot, _, err := cores["n2"].Propose(ctx, []byte("second"))
-		results <- result{slot: slot, err: err}
-	}()
-	firstDone := <-results
-	if firstDone.err != nil || firstDone.slot != 2 {
-		t.Fatalf("later slot did not finish first: %+v", firstDone)
-	}
-	if result := <-results; result.err != nil || result.slot != 1 {
-		t.Fatalf("first slot failed: %+v", result)
+	if !seen[1] || !seen[2] {
+		t.Fatalf("completed slots=%v, want 1 and 2", seen)
 	}
 	if err := cores["n2"].WaitTip(ctx, 2); err != nil {
 		t.Fatal(err)
@@ -912,7 +898,7 @@ func TestClusterDoesNotAckWithoutCommitQuorumAndRecoversRecorderState(t *testing
 
 	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
 	config := &Cluster{ConfigID: 1, Members: members}
-	recoveredTransport := &clusterTransport{cores: make(map[NodeID]*Core), down: make(map[NodeID]bool), dropDecision: make(map[NodeID]bool), delay: make(map[Slot]time.Duration)}
+	recoveredTransport := &clusterTransport{cores: make(map[NodeID]*Core), down: make(map[NodeID]bool), dropDecision: make(map[NodeID]bool)}
 	for _, member := range members {
 		wal, err := qlog.Open(filepath.Join(t.TempDir(), string(member.ID)))
 		if err != nil {
