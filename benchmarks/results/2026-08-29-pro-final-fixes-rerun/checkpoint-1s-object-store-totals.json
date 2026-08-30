@@ -1,0 +1,94 @@
+[
+  {
+    "config": "checkpoint-graph-async-healthy",
+    "requests": 12600,
+    "errors": 0,
+    "object_store": {
+      "bytes_downloaded": 3631835,
+      "bytes_uploaded": 2222777,
+      "condition_conflicts": 13,
+      "dedup_hits": 0,
+      "deletes": 0,
+      "failures": 18,
+      "gets": 233,
+      "heads": 286,
+      "http_4xx_unexpected": 3,
+      "http_5xx": 0,
+      "lists": 9,
+      "s3_http_failures": 3,
+      "s3_http_requests": 659,
+      "sdk_retries": 0,
+      "transport_failures": 0,
+      "uploads": 131
+    }
+  },
+  {
+    "config": "checkpoint-graph-async-one-fault",
+    "requests": 12600,
+    "errors": 0,
+    "object_store": {
+      "bytes_downloaded": 4759244,
+      "bytes_uploaded": 3998030,
+      "condition_conflicts": 10,
+      "dedup_hits": 0,
+      "deletes": 0,
+      "failures": 10,
+      "gets": 220,
+      "heads": 264,
+      "http_4xx_unexpected": 0,
+      "http_5xx": 0,
+      "lists": 8,
+      "s3_http_failures": 0,
+      "s3_http_requests": 624,
+      "sdk_retries": 0,
+      "transport_failures": 0,
+      "uploads": 132
+    }
+  },
+  {
+    "config": "checkpoint-sql-async-healthy",
+    "requests": 12600,
+    "errors": 0,
+    "object_store": {
+      "bytes_downloaded": 3039641,
+      "bytes_uploaded": 2601198,
+      "condition_conflicts": 13,
+      "dedup_hits": 0,
+      "deletes": 0,
+      "failures": 13,
+      "gets": 301,
+      "heads": 366,
+      "http_4xx_unexpected": 0,
+      "http_5xx": 0,
+      "lists": 10,
+      "s3_http_failures": 0,
+      "s3_http_requests": 832,
+      "sdk_retries": 0,
+      "transport_failures": 0,
+      "uploads": 155
+    }
+  },
+  {
+    "config": "checkpoint-sql-async-one-fault",
+    "requests": 12600,
+    "errors": 0,
+    "object_store": {
+      "bytes_downloaded": 1239996,
+      "bytes_uploaded": 1691248,
+      "condition_conflicts": 7,
+      "dedup_hits": 0,
+      "deletes": 0,
+      "failures": 7,
+      "gets": 168,
+      "heads": 217,
+      "http_4xx_unexpected": 0,
+      "http_5xx": 0,
+      "lists": 7,
+      "s3_http_failures": 0,
+      "s3_http_requests": 494,
+      "sdk_retries": 0,
+      "transport_failures": 0,
+      "uploads": 102
+    }
+  }
+]

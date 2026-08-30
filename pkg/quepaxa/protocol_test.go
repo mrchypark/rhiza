@@ -899,7 +899,7 @@ func TestClusterDoesNotAckWithoutCommitQuorumAndRecoversRecorderState(t *testing
 	for id := range cores {
 		transport.dropDecision[id] = true
 	}
-	if slot, _, err := cores["n1"].Propose(context.Background(), []byte("quorum-only")); !errors.Is(err, ErrQuorumUnavailable) || slot != 0 {
+	if slot, _, err := cores["n1"].Propose(context.Background(), []byte("quorum-only")); !errors.Is(err, ErrQuorumUnavailable) || slot != 1 {
 		t.Fatalf("propose slot=%d err=%v", slot, err)
 	}
 	proposerEntries, err := cores["n1"].wal.Read()

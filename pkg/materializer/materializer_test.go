@@ -5,8 +5,11 @@ package materializer
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -139,14 +142,80 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := m.Apply(context.Background(), 3, conflict); err != nil {
-		t.Fatal(err)
+		t.Fatalf("conflicting retry: %v", err)
 	}
 	if m.Tip() != 3 {
-		t.Fatalf("conflicting no-op did not advance tip: %d", m.Tip())
+		t.Fatalf("conflicting retry did not advance tip: %d", m.Tip())
 	}
 	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count after conflicting retry=%d err=%v", count, err)
 	}
+}
+
+func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
+	t.Run("KV", func(t *testing.T) {
+		m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer m.Close()
+		first := types.KVCommand{RequestID: "same", Operation: "put", Key: "key", Value: []byte("first"), ObservedAtUnixMS: 1}
+		second := first
+		second.Value = []byte("second")
+		for i, command := range []types.KVCommand{first, second} {
+			value, err := types.EncodeKVCommand(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), uint64(i+1), value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		value, found, err := m.KVGet(context.Background(), "key", time.UnixMilli(1))
+		matches, matchErr := m.KVRequestMatches(context.Background(), second)
+		receipt, receiptFound, receiptErr := m.MutationReceipt(context.Background(), types.MutationKV, "same")
+		if err != nil || !found || string(value) != "first" || matchErr != nil || matches || receiptErr != nil || !receiptFound || receipt.Slot != 1 || m.Tip() != 2 {
+			t.Fatalf("value=%q found=%v matches=%v receipt=%+v tip=%d errors=%v/%v/%v", value, found, matches, receipt, m.Tip(), err, matchErr, receiptErr)
+		}
+	})
+
+	t.Run("notify", func(t *testing.T) {
+		m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer m.Close()
+		ch, cancel, err := m.Subscribe("jobs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cancel()
+		first := types.NotifyCommand{RequestID: "same", Topic: "jobs", Payload: []byte("first")}
+		second := first
+		second.Payload = []byte("second")
+		for i, command := range []types.NotifyCommand{first, second} {
+			value, err := types.EncodeNotifyCommand(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), uint64(i+1), value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := <-ch; string(got) != "first" {
+			t.Fatalf("notification=%q", got)
+		}
+		select {
+		case got := <-ch:
+			t.Fatalf("conflicting notification published: %q", got)
+		default:
+		}
+		matches, matchErr := m.NotifyRequestMatches(context.Background(), second)
+		receipt, found, receiptErr := m.MutationReceipt(context.Background(), types.MutationNotify, "same")
+		if matchErr != nil || matches || receiptErr != nil || !found || receipt.Slot != 1 || m.Tip() != 2 {
+			t.Fatalf("matches=%v receipt=%+v found=%v tip=%d errors=%v/%v", matches, receipt, found, m.Tip(), matchErr, receiptErr)
+		}
+	})
 }
 
 func TestFailedSQLCommandRecordsResultAndAdvancesTip(t *testing.T) {
@@ -356,6 +425,126 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	}
 }
 
+func TestReadResultsReportTheirSQLiteSnapshotSlot(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/read-at.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	for slot, value := range [][]byte{
+		[]byte("CREATE TABLE values_at (value TEXT)"),
+		[]byte("INSERT INTO values_at VALUES ('before')"),
+		mustKVValue(t, types.KVCommand{RequestID: "before", Operation: "put", Key: "key", Value: []byte("before"), ObservedAtUnixMS: 1}),
+	} {
+		if err := m.Apply(ctx, uint64(slot+1), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The metadata lookup starts the read transaction, so later applies cannot
+	// make this payload claim a newer applied slot.
+	snapshot, err := m.beginSQLiteSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 4, []byte("UPDATE values_at SET value = 'after'")); err != nil {
+		_ = snapshot.Close()
+		t.Fatal(err)
+	}
+	var value string
+	if err := snapshot.conn.QueryRowContext(ctx, "SELECT value FROM values_at").Scan(&value); err != nil || value != "before" || snapshot.index != 3 {
+		_ = snapshot.Close()
+		t.Fatalf("snapshot value=%q slot=%d err=%v", value, snapshot.index, err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	result, slot, err := m.QueryResultAt(ctx, "SELECT value FROM values_at", nil)
+	if err != nil || slot != 4 || len(result.Rows) != 1 || result.Rows[0][0] != "after" {
+		t.Fatalf("query result=%+v slot=%d err=%v", result, slot, err)
+	}
+	if err := m.Apply(ctx, 5, mustKVValue(t, types.KVCommand{RequestID: "after", Operation: "put", Key: "key", Value: []byte("after"), ObservedAtUnixMS: 1})); err != nil {
+		t.Fatal(err)
+	}
+	got, found, slot, err := m.KVGetAt(ctx, "key", time.UnixMilli(1))
+	if err != nil || !found || string(got) != "after" || slot != 5 {
+		t.Fatalf("KV value=%q found=%v slot=%d err=%v", got, found, slot, err)
+	}
+	for index, command := range []types.KVCommand{
+		{RequestID: "empty", Operation: "put", Key: "empty", Value: []byte{}, ObservedAtUnixMS: 1},
+		{RequestID: "expired", Operation: "put", Key: "expired", Value: []byte("old"), ExpiresAtUnixMS: 2, ObservedAtUnixMS: 1},
+	} {
+		if err := m.Apply(ctx, uint64(index+6), mustKVValue(t, command)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, found, slot, err = m.KVGetAt(ctx, "empty", time.UnixMilli(3))
+	if err != nil || !found || len(got) != 0 || slot != 7 {
+		t.Fatalf("empty KV value=%q found=%v slot=%d err=%v", got, found, slot, err)
+	}
+	for _, key := range []string{"missing", "expired"} {
+		got, found, slot, err = m.KVGetAt(ctx, key, time.UnixMilli(3))
+		if err != nil || found || got != nil || slot != 7 {
+			t.Fatalf("%s KV value=%q found=%v slot=%d err=%v", key, got, found, slot, err)
+		}
+	}
+}
+
+func mustKVValue(t testing.TB, command types.KVCommand) []byte {
+	t.Helper()
+	value, err := types.EncodeKVCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func TestKVGetAtKeepsValueAndSlotTogetherDuringApply(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		for slot := 1; slot <= 200; slot++ {
+			value := strconv.Itoa(slot)
+			command := types.KVCommand{RequestID: value, Operation: "put", Key: "key", Value: []byte(value), ObservedAtUnixMS: 1}
+			encoded, err := types.EncodeKVCommand(command)
+			if err == nil {
+				err = m.Apply(context.Background(), uint64(slot), encoded)
+			}
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+			value, found, slot, err := m.KVGetAt(context.Background(), "key", time.UnixMilli(1))
+			if err != nil || !found || string(value) != strconv.FormatUint(slot, 10) || slot != 200 {
+				t.Fatalf("final value=%q found=%v slot=%d err=%v", value, found, slot, err)
+			}
+			return
+		default:
+			value, found, slot, err := m.KVGetAt(context.Background(), "key", time.UnixMilli(1))
+			if err != nil || slot == 0 && found || slot != 0 && (!found || string(value) != strconv.FormatUint(slot, 10)) {
+				t.Fatalf("value=%q found=%v slot=%d err=%v", value, found, slot, err)
+			}
+		}
+	}
+}
+
 func TestQueryResultRejectsOversizedCell(t *testing.T) {
 	m, err := Open(t.TempDir()+"/db.sqlite", 1)
 	if err != nil {
@@ -512,7 +701,10 @@ func TestMaterializerPublishesCommittedNotificationOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	ch, cancel := m.Subscribe("jobs")
+	ch, cancel, err := m.Subscribe("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer cancel()
 	value, err := types.EncodeNotifyCommand(types.NotifyCommand{RequestID: "notice-1", Topic: "jobs", Payload: []byte("ready")})
 	if err != nil {
@@ -536,6 +728,54 @@ func TestMaterializerPublishesCommittedNotificationOnce(t *testing.T) {
 	case <-ch:
 		t.Fatal("duplicate notification was delivered twice")
 	default:
+	}
+}
+
+func TestMaterializerDropsFullNotificationWithoutPayloadCopy(t *testing.T) {
+	m, err := Open(t.TempDir()+"/notify-drop.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ch, cancel, err := m.Subscribe("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	m.publishNotification("jobs", []byte("fill"))
+	if len(ch) != cap(ch) {
+		t.Fatalf("subscriber queue len=%d cap=%d", len(ch), cap(ch))
+	}
+	payload := make([]byte, 1<<20)
+	nonmatching := testing.AllocsPerRun(20, func() { m.publishNotification("other", payload) })
+	full := testing.AllocsPerRun(20, func() { m.publishNotification("jobs", payload) })
+	if full > nonmatching {
+		t.Fatalf("full queue allocations=%f, nonmatching=%f", full, nonmatching)
+	}
+	if got := m.NotificationDrops(); got == 0 {
+		t.Fatal("full-queue drops were not observed")
+	}
+}
+
+func TestMaterializerBoundsNotificationSubscribers(t *testing.T) {
+	m, err := Open(t.TempDir()+"/notify-limit.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	cancels := make([]func(), 0, notificationSubscriberLimit)
+	for range notificationSubscriberLimit {
+		_, cancel, err := m.Subscribe("jobs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cancels = append(cancels, cancel)
+	}
+	if _, _, err := m.Subscribe("jobs"); err == nil {
+		t.Fatal("subscriber limit was not enforced")
+	}
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 
@@ -573,6 +813,58 @@ func TestMaterializerHealth(t *testing.T) {
 
 	if err := m.Health(context.Background()); err != nil {
 		t.Fatalf("health check failed: %v", err)
+	}
+}
+
+func TestQueryAfterCloseReturnsError(t *testing.T) {
+	m, err := Open(t.TempDir()+"/test.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel, err := m.Subscribe("closed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Query(context.Background(), "SELECT 1"); !errors.Is(err, sql.ErrConnDone) {
+		t.Fatalf("query after close error = %v, want %v", err, sql.ErrConnDone)
+	}
+	if err := m.Apply(context.Background(), 1, []byte("SELECT 1")); !errors.Is(err, sql.ErrConnDone) {
+		t.Fatalf("apply after close error = %v, want %v", err, sql.ErrConnDone)
+	}
+	if _, err := m.SnapshotTo(context.Background(), io.Discard); !errors.Is(err, sql.ErrConnDone) {
+		t.Fatalf("snapshot after close error = %v, want %v", err, sql.ErrConnDone)
+	}
+	if _, ok := <-ch; ok {
+		t.Fatal("notification subscription remained open after close")
+	}
+	if _, _, err := m.Subscribe("closed"); err == nil {
+		t.Fatal("notification subscription succeeded after close")
+	}
+}
+
+func TestAdoptStopsTemporaryDispatcher(t *testing.T) {
+	dir := t.TempDir()
+	target, err := Open(dir+"/target.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	source, err := Open(dir+"/source.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.adopt(source)
+	select {
+	case <-source.notifyStop:
+	default:
+		t.Fatal("temporary notification dispatcher was not stopped")
+	}
+	if err := target.Health(context.Background()); err != nil {
+		t.Fatalf("adopted materializer health: %v", err)
 	}
 }
 
@@ -742,5 +1034,36 @@ func TestRecoverCommittedRestoreFinalizes(t *testing.T) {
 	}
 	if _, err := os.Stat(restoreStatePath(dbPath)); !os.IsNotExist(err) {
 		t.Fatalf("journal remains: %v", err)
+	}
+}
+
+func TestRestoreFailureReopensOriginalMaterializer(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	m, err := Open(filepath.Join(dir, "materialized.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Apply(ctx, 1, []byte("CREATE TABLE restore_live (value TEXT)")); err != nil {
+		t.Fatal(err)
+	}
+	files, _, cleanup, err := m.CheckpointFilesAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if err := m.restoreParts(ctx, snapshotParts{sqlitePath: files[0].Path, graphDir: filepath.Join(dir, "missing-graph")}); err == nil {
+		t.Fatal("restore with a missing graph snapshot succeeded")
+	}
+	if err := m.Health(ctx); err != nil {
+		t.Fatalf("materializer remained closed after failed restore: %v", err)
+	}
+	if err := m.Apply(ctx, 2, []byte("INSERT INTO restore_live VALUES ('ready')")); err != nil {
+		t.Fatalf("apply after failed restore: %v", err)
+	}
+	var value string
+	if err := m.queryRow(ctx, "SELECT value FROM restore_live").Scan(&value); err != nil || value != "ready" {
+		t.Fatalf("query after failed restore value=%q err=%v", value, err)
 	}
 }

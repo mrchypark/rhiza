@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
@@ -32,6 +34,10 @@ const (
 	MaxReturningRows = 10_000
 	MaxResultBytes   = 16 << 20
 	MaxCellBytes     = 1 << 20
+
+	notificationSubscriberLimit = 64
+	notificationQueueDepth      = 1
+	notificationDispatchDepth   = 64
 )
 
 // Materializer applies decided values to SQLite.
@@ -51,6 +57,11 @@ type Materializer struct {
 	notifyMu          sync.Mutex
 	nextSub           uint64
 	subs              map[uint64]notificationSubscription
+	notifyQueue       chan pendingNotification
+	notifyStop        chan struct{}
+	notifyStopOnce    sync.Once
+	notifyWG          sync.WaitGroup
+	notifyDrops       atomic.Uint64
 }
 
 type notificationSubscription struct {
@@ -152,7 +163,11 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		readersN:          readerCount,
 		idempotencyWindow: window,
 		subs:              make(map[uint64]notificationSubscription),
+		notifyQueue:       make(chan pendingNotification, notificationDispatchDepth),
+		notifyStop:        make(chan struct{}),
 	}
+	m.notifyWG.Add(1)
+	go m.runNotifications()
 
 	// Initialize schema
 	if err := m.initSchema(); err != nil {
@@ -331,7 +346,11 @@ func receiptQuery() string {
 }
 
 func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationKind, requestID string) (types.MutationReceipt, bool, error) {
-	record, err := scanReceipt(m.reader().QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+	reader, err := m.reader()
+	if err != nil {
+		return types.MutationReceipt{}, false, err
+	}
+	record, err := scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
 		return types.MutationReceipt{}, false, nil
 	}
@@ -345,7 +364,11 @@ func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationK
 }
 
 func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKind, requestID string, fingerprint [32]byte) (bool, bool, error) {
-	record, err := scanReceipt(m.reader().QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+	reader, err := m.reader()
+	if err != nil {
+		return false, false, err
+	}
+	record, err := scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
 		return true, false, nil
 	}
@@ -397,6 +420,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.writer == nil {
+		return sql.ErrConnDone
+	}
 	tx, err := m.writer.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
@@ -429,12 +455,33 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		return fmt.Errorf("commit apply batch: %w", err)
 	}
 	if err := m.confirmGraphThrough(ctx, m.tip); err != nil {
+		m.notifyDrops.Add(uint64(len(pending)))
 		return fmt.Errorf("confirm graph apply: %w", err)
 	}
 	for _, notification := range pending {
-		m.publishNotification(notification.topic, notification.payload)
+		m.enqueueNotification(notification)
 	}
 	return nil
+}
+
+func (m *Materializer) runNotifications() {
+	defer m.notifyWG.Done()
+	for {
+		select {
+		case <-m.notifyStop:
+			return
+		case notification := <-m.notifyQueue:
+			m.publishNotification(notification.topic, notification.payload)
+		}
+	}
+}
+
+func (m *Materializer) enqueueNotification(notification pendingNotification) {
+	select {
+	case m.notifyQueue <- notification:
+	default:
+		m.notifyDrops.Add(1)
+	}
 }
 
 func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, pending *[]pendingNotification) error {
@@ -494,7 +541,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		if err != nil {
 			return err
 		}
-		existing, found, err := m.receiptInTx(ctx, tx, types.MutationNotify, notifyCommand.RequestID)
+		_, found, err := m.receiptInTx(ctx, tx, types.MutationNotify, notifyCommand.RequestID)
 		if err != nil {
 			return err
 		}
@@ -504,8 +551,6 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 				return err
 			}
 			publish = true
-		} else if existing.fingerprint != fingerprint {
-			publish = false
 		}
 		commands = nil
 		batched = true
@@ -535,12 +580,11 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
 		}
 		if command.RequestID != "" {
-			existing, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID)
+			_, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID)
 			if err != nil {
 				return fmt.Errorf("check SQL request %q: %w", command.RequestID, err)
 			}
 			if found {
-				_ = existing
 				continue
 			}
 		}
@@ -586,7 +630,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		m.stateTip = slot
 	}
 	if publish {
-		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: append([]byte(nil), notifyCommand.Payload...)})
+		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: notifyCommand.Payload})
 	}
 	return nil
 }
@@ -601,26 +645,47 @@ func (m *Materializer) publishNotification(topic string, payload []byte) {
 	}
 	m.notifyMu.Unlock()
 	for _, ch := range channels {
+		if len(ch) == cap(ch) {
+			m.notifyDrops.Add(1)
+			continue
+		}
 		select {
 		case ch <- append([]byte(nil), payload...):
-		default: // bounded at-most-once delivery: slow subscribers observe a gap.
+		default: // A receiver raced another delivery; slow subscribers observe a gap.
+			m.notifyDrops.Add(1)
 		}
 	}
 }
 
 // Subscribe returns live, bounded, at-most-once notifications for a topic.
-func (m *Materializer) Subscribe(topic string) (<-chan []byte, func()) {
+func (m *Materializer) Subscribe(topic string) (<-chan []byte, func(), error) {
 	m.notifyMu.Lock()
+	select {
+	case <-m.notifyStop:
+		m.notifyMu.Unlock()
+		return nil, nil, fmt.Errorf("materializer is closed")
+	default:
+	}
+	if len(m.subs) >= notificationSubscriberLimit {
+		m.notifyMu.Unlock()
+		return nil, nil, fmt.Errorf("notification subscriber limit reached")
+	}
 	id := m.nextSub
 	m.nextSub++
-	ch := make(chan []byte, 64)
+	ch := make(chan []byte, notificationQueueDepth)
 	m.subs[id] = notificationSubscription{topic: topic, ch: ch}
 	m.notifyMu.Unlock()
 	return ch, func() {
 		m.notifyMu.Lock()
 		delete(m.subs, id)
 		m.notifyMu.Unlock()
-	}
+	}, nil
+}
+
+// NotificationDrops reports live at-most-once deliveries discarded before
+// delivery, including confirmation failures and saturated queues.
+func (m *Materializer) NotificationDrops() uint64 {
+	return m.notifyDrops.Load()
 }
 
 func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, command types.KVCommand) error {
@@ -676,12 +741,41 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 
 // KVGet reads a non-expired value from the local materialized state.
 func (m *Materializer) KVGet(ctx context.Context, key string, now time.Time) ([]byte, bool, error) {
+	reader, err := m.reader()
+	if err != nil {
+		return nil, false, err
+	}
 	var value []byte
-	err := m.reader().QueryRowContext(ctx, `SELECT value FROM _rhiza_kv WHERE key = ? AND (expires_at_unix_ms = 0 OR expires_at_unix_ms > ?)`, key, now.UnixMilli()).Scan(&value)
+	err = reader.QueryRowContext(ctx, `SELECT value FROM _rhiza_kv WHERE key = ? AND (expires_at_unix_ms = 0 OR expires_at_unix_ms > ?)`, key, now.UnixMilli()).Scan(&value)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
 	return value, err == nil, err
+}
+
+// KVGetAt reads a value and the applied slot from one SQLite snapshot.
+func (m *Materializer) KVGetAt(ctx context.Context, key string, now time.Time) ([]byte, bool, uint64, error) {
+	reader, err := m.reader()
+	if err != nil {
+		return nil, false, 0, err
+	}
+	var slotText string
+	var found bool
+	var value []byte
+	err = reader.QueryRowContext(ctx, `
+		SELECT meta.value, kv.key IS NOT NULL, kv.value
+		FROM _rhiza_meta AS meta
+		LEFT JOIN _rhiza_kv AS kv
+		  ON kv.key = ? AND (kv.expires_at_unix_ms = 0 OR kv.expires_at_unix_ms > ?)
+		WHERE meta.key = 'applied_slot'`, key, now.UnixMilli()).Scan(&slotText, &found, &value)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	slot, err := strconv.ParseUint(slotText, 10, 64)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	return value, found, slot, nil
 }
 
 func (m *Materializer) KVRequestMatches(ctx context.Context, command types.KVCommand) (bool, error) {
@@ -984,7 +1078,11 @@ func (m *Materializer) Query(ctx context.Context, query string, args ...interfac
 	if err := validatePublicSQL(query); err != nil {
 		return nil, err
 	}
-	return m.reader().QueryContext(ctx, query, args...)
+	reader, err := m.reader()
+	if err != nil {
+		return nil, err
+	}
+	return reader.QueryContext(ctx, query, args...)
 }
 
 // QueryResult executes a bounded read query and materializes its result.
@@ -1018,10 +1116,50 @@ func (m *Materializer) QueryResult(ctx context.Context, query string, args []any
 	return result, nil
 }
 
-func (m *Materializer) reader() *sql.DB {
+// QueryResultAt executes a bounded read query and returns its applied slot from
+// the same SQLite snapshot.
+func (m *Materializer) QueryResultAt(ctx context.Context, query string, args []any) (types.SQLStatementResult, uint64, error) {
+	if strings.TrimSpace(query) == "" || len(query) > MaxSQLBytes {
+		return types.SQLStatementResult{}, 0, fmt.Errorf("invalid SQL query")
+	}
+	if err := validatePublicSQL(query); err != nil {
+		return types.SQLStatementResult{}, 0, err
+	}
+	normalized, err := NormalizeSQLArgs(args)
+	if err != nil {
+		return types.SQLStatementResult{}, 0, err
+	}
+	snapshot, err := m.beginSQLiteReadSnapshot(ctx)
+	if err != nil {
+		return types.SQLStatementResult{}, 0, err
+	}
+	defer snapshot.Close()
+	rows, err := snapshot.conn.QueryContext(ctx, query, normalized...)
+	if err != nil {
+		return types.SQLStatementResult{}, 0, err
+	}
+	defer rows.Close()
+	result, err := collectRows(rows, MaxReturningRows)
+	if err != nil {
+		return types.SQLStatementResult{}, 0, err
+	}
+	encodedBytes, err := encodedJSONSize(result)
+	if err != nil {
+		return types.SQLStatementResult{}, 0, err
+	}
+	if encodedBytes > MaxResultBytes {
+		return types.SQLStatementResult{}, 0, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
+	}
+	return result, snapshot.index, nil
+}
+
+func (m *Materializer) reader() (*sql.DB, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.readers[0]
+	if len(m.readers) == 0 || m.readers[0] == nil {
+		return nil, sql.ErrConnDone
+	}
+	return m.readers[0], nil
 }
 
 func (m *Materializer) queryRow(ctx context.Context, query string, args ...interface{}) *sql.Row {
@@ -1067,6 +1205,9 @@ func (m *Materializer) SnapshotTo(ctx context.Context, writer io.Writer) (uint64
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.db == nil {
+		return 0, sql.ErrConnDone
+	}
 	if _, err := m.db.ExecContext(ctx, "VACUUM INTO ?", path); err != nil {
 		return 0, fmt.Errorf("snapshot: %w", err)
 	}
@@ -1089,7 +1230,32 @@ func (m *Materializer) backupSQLite(ctx context.Context, path string) (uint64, e
 }
 
 func (m *Materializer) beginSQLiteSnapshot(ctx context.Context) (*sqliteSnapshot, error) {
-	conn, err := m.db.Conn(ctx)
+	m.mu.RLock()
+	db := m.db
+	m.mu.RUnlock()
+	return beginSQLiteSnapshot(ctx, db)
+}
+
+func (m *Materializer) beginSQLiteReadSnapshot(ctx context.Context) (*sqliteSnapshot, error) {
+	m.mu.RLock()
+	var reader *sql.DB
+	if len(m.readers) != 0 {
+		reader = m.readers[0]
+	}
+	m.mu.RUnlock()
+	return beginSQLiteSnapshot(ctx, reader)
+}
+
+// beginSQLiteSnapshotLocked is for callers that already hold m.mu.
+func (m *Materializer) beginSQLiteSnapshotLocked(ctx context.Context) (*sqliteSnapshot, error) {
+	return beginSQLiteSnapshot(ctx, m.db)
+}
+
+func beginSQLiteSnapshot(ctx context.Context, db *sql.DB) (*sqliteSnapshot, error) {
+	if db == nil {
+		return nil, sql.ErrConnDone
+	}
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1170,7 +1336,7 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	_ = os.Remove(graphPath)
 	paths = append(paths, graphPath)
 	m.mu.Lock()
-	sqliteSnapshot, err := m.beginSQLiteSnapshot(ctx)
+	sqliteSnapshot, err := m.beginSQLiteSnapshotLocked(ctx)
 	index := uint64(0)
 	if err == nil {
 		index = sqliteSnapshot.index
@@ -1461,28 +1627,33 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	if err := writeRestoreState(m.dbPath, state); err != nil {
 		return fmt.Errorf("prepare restore journal: %w", err)
 	}
+	rollback := func(cause error) error {
+		var recoveryErr, reopenErr error
+		if err := recoverRestore(m.dbPath); err != nil {
+			recoveryErr = fmt.Errorf("recover restore: %w", err)
+		}
+		if err := m.reopen(); err != nil {
+			reopenErr = fmt.Errorf("reopen materializer: %w", err)
+		}
+		return errors.Join(cause, recoveryErr, reopenErr)
+	}
 	if err := m.closeConnections(); err != nil {
-		_ = recoverRestore(m.dbPath)
-		return err
+		return rollback(err)
 	}
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if err := os.Remove(m.dbPath + suffix); err != nil && !os.IsNotExist(err) {
-			_ = recoverRestore(m.dbPath)
-			return fmt.Errorf("remove SQLite sidecar %s: %w", suffix, err)
+			return rollback(fmt.Errorf("remove SQLite sidecar %s: %w", suffix, err))
 		}
 	}
 	if err := os.Rename(m.dbPath, backupPath); err != nil && !os.IsNotExist(err) {
-		_ = recoverRestore(m.dbPath)
-		return fmt.Errorf("backup database: %w", err)
+		return rollback(fmt.Errorf("backup database: %w", err))
 	}
 	if err := syncDirectory(dir); err != nil {
-		_ = recoverRestore(m.dbPath)
-		return err
+		return rollback(err)
 	}
 	state.Phase = "sqlite-backed-up"
 	if err := writeRestoreState(m.dbPath, state); err != nil {
-		_ = recoverRestore(m.dbPath)
-		return err
+		return rollback(err)
 	}
 	graphBackedUp := false
 	graphInstalled := false
@@ -1491,26 +1662,22 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			graphBackedUp = true
 		} else if !os.IsNotExist(err) {
 			_ = os.Rename(backupPath, m.dbPath)
-			_ = recoverRestore(m.dbPath)
-			return fmt.Errorf("backup graph database: %w", err)
+			return rollback(fmt.Errorf("backup graph database: %w", err))
 		}
 		if err := os.Rename(parts.graphDir, graphPath); err != nil {
 			if graphBackedUp {
 				_ = os.Rename(graphBackupPath, graphPath)
 			}
 			_ = os.Rename(backupPath, m.dbPath)
-			_ = recoverRestore(m.dbPath)
-			return fmt.Errorf("install graph snapshot: %w", err)
+			return rollback(fmt.Errorf("install graph snapshot: %w", err))
 		}
 		graphInstalled = true
 		if err := syncDirectory(dir); err != nil {
-			_ = recoverRestore(m.dbPath)
-			return err
+			return rollback(err)
 		}
 		state.Phase = "graph-installed"
 		if err := writeRestoreState(m.dbPath, state); err != nil {
-			_ = recoverRestore(m.dbPath)
-			return err
+			return rollback(err)
 		}
 	}
 	if err := os.Rename(tempPath, m.dbPath); err != nil {
@@ -1521,20 +1688,14 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			_ = os.Rename(graphBackupPath, graphPath)
 		}
 		_ = os.Rename(backupPath, m.dbPath)
-		_ = recoverRestore(m.dbPath)
-		if reopenErr := m.reopen(); reopenErr != nil {
-			return fmt.Errorf("install snapshot: %w; reopen original: %v", err, reopenErr)
-		}
-		return fmt.Errorf("install snapshot: %w", err)
+		return rollback(fmt.Errorf("install snapshot: %w", err))
 	}
 	if err := syncDirectory(dir); err != nil {
-		_ = recoverRestore(m.dbPath)
-		return err
+		return rollback(err)
 	}
 	state.Phase = "sqlite-installed"
 	if err := writeRestoreState(m.dbPath, state); err != nil {
-		_ = recoverRestore(m.dbPath)
-		return err
+		return rollback(err)
 	}
 	restored, err := openMaterializer(m.dbPath, m.readersN, m.idempotencyWindow)
 	if err == nil {
@@ -1552,28 +1713,18 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 			_ = os.Rename(graphBackupPath, graphPath)
 		}
 		_ = os.Rename(backupPath, m.dbPath)
-		_ = recoverRestore(m.dbPath)
-		if reopenErr := m.reopen(); reopenErr != nil {
-			return fmt.Errorf("open restored snapshot: %w; reopen original: %v", err, reopenErr)
-		}
-		return fmt.Errorf("open restored snapshot: %w", err)
+		return rollback(fmt.Errorf("open restored snapshot: %w", err))
 	}
 	state.Phase = "committed"
 	if err := writeRestoreState(m.dbPath, state); err != nil {
 		_ = restored.Close()
-		_ = recoverRestore(m.dbPath)
-		if reopenErr := m.reopen(); reopenErr != nil {
-			return fmt.Errorf("commit restore journal: %w; reopen original: %v", err, reopenErr)
-		}
-		return fmt.Errorf("commit restore journal: %w", err)
+		return rollback(fmt.Errorf("commit restore journal: %w", err))
 	}
 	if err := recoverRestore(m.dbPath); err != nil {
 		_ = restored.Close()
-		return fmt.Errorf("finalize restore: %w", err)
+		return rollback(fmt.Errorf("finalize restore: %w", err))
 	}
-	m.db, m.writer, m.readers, m.graph = restored.db, restored.writer, restored.readers, restored.graph
-	m.tip, m.stateTip, m.tipHash = restored.tip, restored.stateTip, restored.tipHash
-	restored.db, restored.writer, restored.readers, restored.graph = nil, nil, nil, nil
+	m.adopt(restored)
 	return nil
 }
 
@@ -1582,10 +1733,15 @@ func (m *Materializer) reopen() error {
 	if err != nil {
 		return err
 	}
-	m.db, m.writer, m.readers, m.graph = reopened.db, reopened.writer, reopened.readers, reopened.graph
-	m.tip, m.stateTip, m.tipHash = reopened.tip, reopened.stateTip, reopened.tipHash
-	reopened.db, reopened.writer, reopened.readers, reopened.graph = nil, nil, nil, nil
+	m.adopt(reopened)
 	return nil
+}
+
+func (m *Materializer) adopt(source *Materializer) {
+	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
+	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
+	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
+	_ = source.Close()
 }
 
 // Tip returns the last applied slot.
@@ -1606,6 +1762,14 @@ func (m *Materializer) StateTip() uint64 {
 func (m *Materializer) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.notifyStopOnce.Do(func() { close(m.notifyStop) })
+	m.notifyWG.Wait()
+	m.notifyMu.Lock()
+	for id, sub := range m.subs {
+		close(sub.ch)
+		delete(m.subs, id)
+	}
+	m.notifyMu.Unlock()
 	return m.closeConnections()
 }
 

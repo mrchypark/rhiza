@@ -22,8 +22,7 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
-  rm -f "$tmp_dir"/port-forward-*.log
-  rmdir "$tmp_dir"
+  rm -rf "$tmp_dir"
 }
 trap cleanup EXIT
 
@@ -146,13 +145,17 @@ while curl -fsS --max-time 1 "$node0/ready" >/dev/null 2>&1 || \
   (( SECONDS < deadline )) || exit 1
   sleep 0.25
 done
-status="$(curl -sS --max-time 15 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d \
-  "{\"request_id\":\"no-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (3, 'must-not-commit')\"}" \
-  "$node1/sql/execute")"
+unknown_response="$tmp_dir/no-quorum.json"
+status="$(curl -sS --max-time 15 -o "$unknown_response" -w '%{http_code}' -H 'Content-Type: application/json' -d \
+	"{\"request_id\":\"no-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (3, 'uncertain-commit')\"}" \
+	"$node1/sql/execute")"
 if [[ "$status" != "503" ]]; then
   echo "FAIL: peers=3 failed=2 expected-status=503 actual-status=$status" >&2
   exit 1
 fi
+jq -e --arg request_id "no-quorum-${suffix}" \
+  '.code == "commit_unknown" and .request_id == $request_id and .slot > 0 and .retry_through_slot >= .slot' \
+  "$unknown_response" >/dev/null
 dory k8s wait podchaos/"$two_failures" -n rhiza-3peer-e2e --for=condition=AllRecovered=True --timeout=90s
 dory k8s delete podchaos/"$two_failures" -n rhiza-3peer-e2e --wait=true >/dev/null
 dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
@@ -160,6 +163,13 @@ deadline=$((SECONDS + 60))
 until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
+done
+deadline=$((SECONDS + 30))
+until curl -fsS --max-time 20 -o /dev/null -H 'Content-Type: application/json' -d \
+  "{\"request_id\":\"no-quorum-${suffix}\",\"sql\":\"INSERT INTO ${table} VALUES (3, 'uncertain-commit')\"}" \
+  "$node1/sql/execute" 2>/dev/null; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.25
 done
 deadline=$((SECONDS + 30))
 until curl -fsS --max-time 20 -o /dev/null -H 'Content-Type: application/json' -d \
@@ -195,6 +205,10 @@ until result="$(curl -fsS -H 'Content-Type: application/json' -d \
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done
-[[ "$result" == *'before-fault'* && "$result" == *'during-fault'* && "$result" == *'after-quorum'* && "$result" != *'must-not-commit'* ]]
+[[ "$result" == *'before-fault'* && "$result" == *'during-fault'* && "$result" == *'uncertain-commit'* && "$result" == *'after-quorum'* ]]
+count="$(curl -fsS -H 'Content-Type: application/json' -d \
+  "{\"sql\":\"SELECT COUNT(*) FROM ${table} WHERE id = 3\",\"consistency\":\"linearizable\"}" \
+  "$node0/sql/query")"
+jq -e '.rows == [[1]]' <<<"$count" >/dev/null
 
-printf 'PASS: peers=3 failed=1 quorum-write=%ss converged=true rebuilt=true; failed=2 write-status=%s recovered-write=true; shared-object-recovery=true\n' "$write_seconds" "$status"
+printf 'PASS: peers=3 failed=1 quorum-write=%ss converged=true rebuilt=true; failed=2 write-status=%s commit-unknown-resolved=true recovered-write=true; shared-object-recovery=true\n' "$write_seconds" "$status"

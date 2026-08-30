@@ -164,3 +164,41 @@ func TestGraphBuildRejectsNewSQLBeforeConsensus(t *testing.T) {
 		t.Fatalf("rejected SQL advanced consensus tip to %d", core.Tip())
 	}
 }
+
+func TestGraphReadMetadataBoundsItsSnapshot(t *testing.T) {
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "qlog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	member := quepaxa.Member{ID: "n1"}
+	core, err := quepaxa.New(quepaxa.Config{NodeID: member.ID, Cluster: quepaxa.Cluster{Members: []quepaxa.Member{member}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer server.Close()
+	if _, err := server.GraphExecute(context.Background(), types.GraphCommand{
+		RequestID: "seed", Cypher: `CREATE (:Item {id: '1'})`,
+		Events: []types.GraphStreamEvent{{Stream: "events", Kind: "created", Payload: "1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query, err := server.GraphQuery(context.Background(), GraphQueryRequest{Cypher: `MATCH (n:Item) RETURN n.id`})
+	if err != nil || query.AppliedSlot != 1 || query.ConsensusTip < query.AppliedSlot {
+		t.Fatalf("query metadata=%d/%d err=%v", query.AppliedSlot, query.ConsensusTip, err)
+	}
+	stream, err := server.GraphStreamRead(context.Background(), GraphStreamReadRequest{Stream: "events", Limit: 1})
+	if err != nil || stream.AppliedSlot != 1 || stream.ConsensusTip < stream.AppliedSlot || len(stream.Records) != 1 {
+		t.Fatalf("stream metadata=%d/%d records=%d err=%v", stream.AppliedSlot, stream.ConsensusTip, len(stream.Records), err)
+	}
+	offset, err := server.GraphStreamOffset(context.Background(), GraphStreamOffsetRequest{Stream: "events", Consumer: "c"})
+	if err != nil || offset.AppliedSlot != 1 || offset.ConsensusTip < offset.AppliedSlot {
+		t.Fatalf("offset metadata=%d/%d err=%v", offset.AppliedSlot, offset.ConsensusTip, err)
+	}
+}

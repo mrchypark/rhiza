@@ -239,7 +239,7 @@ func (a *AutoCheckpointer) create(ctx context.Context) (uint64, error) {
 		}
 		appliedTip = index
 		log.Printf("creating streaming checkpoint at slot %d", appliedTip)
-		root, err = a.manager.CreateFiles(workCtx, sources, appliedTip)
+		root, err = a.manager.CreateFiles(workCtx, claim, sources, appliedTip)
 		return err
 	}
 	if claim != nil {

@@ -1,0 +1,11 @@
+usage_usec 97190
+user_usec 34515
+system_usec 62675
+nice_usec 0
+nr_periods 21
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+25817088
+32649216

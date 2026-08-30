@@ -75,7 +75,6 @@ func main() {
 				if err != nil {
 					failures.Add(1)
 					transportFailures.Add(1)
-					transportFailures.Add(1)
 					continue
 				}
 				if payload != "" {
@@ -86,6 +85,7 @@ func main() {
 				elapsed := time.Since(begin)
 				if err != nil {
 					failures.Add(1)
+					transportFailures.Add(1)
 					latencyMu.Lock()
 					errorLatencies = append(errorLatencies, elapsed)
 					latencyMu.Unlock()

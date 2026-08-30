@@ -1,0 +1,4 @@
+NAME            CPU(cores)   MEMORY(bytes)   
+rhiza-graph-0   3m           65Mi            
+rhiza-graph-1   2m           74Mi            
+rhiza-graph-2   2m           61Mi            

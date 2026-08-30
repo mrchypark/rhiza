@@ -86,3 +86,19 @@ func TestEmbeddedGraphGoAPI(t *testing.T) {
 		t.Fatalf("trimmed events: %#v err=%v", events.Records, err)
 	}
 }
+
+func TestEmbeddedGraphAfterCloseReturnsErrors(t *testing.T) {
+	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", Profile: rhiza.ProfileGraph, DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GraphQuery(context.Background(), rhiza.GraphQueryRequest{Cypher: "MATCH (n) RETURN n", Consistency: rhiza.ConsistencyLocal}); err == nil {
+		t.Fatal("GraphQuery succeeded after close")
+	}
+	if _, err := db.RequestStatus(context.Background(), rhiza.RequestStatusRequest{Kind: "graph", RequestID: "closed"}); err == nil {
+		t.Fatal("graph RequestStatus succeeded after close")
+	}
+}

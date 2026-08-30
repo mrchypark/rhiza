@@ -1,0 +1,119 @@
+[
+  {
+    "config": "current-graph-async-checkpoint-1s",
+    "duration_s": 13,
+    "cpu_seconds": 4.885169,
+    "average_cores": 0.3757822307692308,
+    "memory_current_mib": 50.76953125,
+    "memory_peak_mib": 58.5859375,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-graph-async-healthy",
+    "duration_s": 14,
+    "cpu_seconds": 5.892191,
+    "average_cores": 0.42087078571428577,
+    "memory_current_mib": 61.171875,
+    "memory_peak_mib": 67.17708333333333,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-graph-async-one-fault",
+    "duration_s": 13,
+    "cpu_seconds": 3.622551,
+    "average_cores": 0.27865776923076924,
+    "memory_current_mib": 48.966796875,
+    "memory_peak_mib": 55.072265625,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-graph-before-ack-healthy",
+    "duration_s": 15,
+    "cpu_seconds": 5.77012,
+    "average_cores": 0.38467466666666666,
+    "memory_current_mib": 53.266927083333336,
+    "memory_peak_mib": 59.859375,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-graph-before-ack-one-fault",
+    "duration_s": 14,
+    "cpu_seconds": 4.782626,
+    "average_cores": 0.3416161428571428,
+    "memory_current_mib": 53.5078125,
+    "memory_peak_mib": 59.421875,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "duration_s": 13,
+    "cpu_seconds": 4.651193,
+    "average_cores": 0.35778407692307695,
+    "memory_current_mib": 52.306640625,
+    "memory_peak_mib": 59.568359375,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-graph-live-recovery-checkpoint-1s",
+    "duration_s": 15,
+    "cpu_seconds": 5.471772,
+    "average_cores": 0.36478479999999996,
+    "memory_current_mib": 51.822916666666664,
+    "memory_peak_mib": 58.38671875,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-async-checkpoint-1s",
+    "duration_s": 14,
+    "cpu_seconds": 3.994587,
+    "average_cores": 0.28532764285714285,
+    "memory_current_mib": 39.0078125,
+    "memory_peak_mib": 46.40234375,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-async-healthy",
+    "duration_s": 14,
+    "cpu_seconds": 3.30327,
+    "average_cores": 0.23594785714285713,
+    "memory_current_mib": 41.188802083333336,
+    "memory_peak_mib": 47.571614583333336,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-async-one-fault",
+    "duration_s": 11,
+    "cpu_seconds": 1.947928,
+    "average_cores": 0.17708436363636365,
+    "memory_current_mib": 36.333984375,
+    "memory_peak_mib": 42.46484375,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-sql-before-ack-healthy",
+    "duration_s": 14,
+    "cpu_seconds": 3.203371,
+    "average_cores": 0.2288122142857143,
+    "memory_current_mib": 39.196614583333336,
+    "memory_peak_mib": 45.296875,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-before-ack-one-fault",
+    "duration_s": 12,
+    "cpu_seconds": 2.246257,
+    "average_cores": 0.18718808333333334,
+    "memory_current_mib": 38.048828125,
+    "memory_peak_mib": 45.599609375,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-sql-live-recovery-checkpoint-1s",
+    "duration_s": 14,
+    "cpu_seconds": 3.796155,
+    "average_cores": 0.27115392857142856,
+    "memory_current_mib": 39.302083333333336,
+    "memory_peak_mib": 46.670572916666664,
+    "observed_pods": 3
+  }
+]

@@ -70,6 +70,7 @@ type Core struct {
 	byHash              map[ValueHash]Slot
 	values              map[ValueHash][]byte
 	valueDurable        map[ValueHash]bool
+	compactionValues    map[[32]byte]struct{}
 	prefixes            map[Slot][32]byte
 	checkpointMu        sync.Mutex
 	checkpointValidator func(context.Context, CheckpointSeal) error
@@ -135,62 +136,26 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			c.releaseSlot(slot)
 			return 0, nil, err
 		}
-		if err := c.storeValueQuorum(ctx, proposed); err != nil {
-			c.releaseSlot(slot)
-			return 0, nil, err
-		}
 		c.markEpochStarted(slot)
 		decision, err := c.runSlot(ctx, slot, proposed, !reused)
 		if err != nil {
 			c.releaseSlot(slot)
-			return 0, nil, err
+			return slot, nil, err
 		}
 		// A durable recorder quorum already makes the decision recoverable. Like
 		// Raft's commit index, the local decision marker need not add a second
 		// synchronous disk barrier to the clustered fast path.
 		if err := c.acceptDecision(decision); err != nil {
 			c.releaseSlot(slot)
-			return 0, nil, err
+			return slot, nil, err
 		}
 		if _, err := c.CompleteDecision(ctx, decision.Slot); err != nil {
-			return 0, nil, err
+			return decision.Slot, nil, err
 		}
 		if decision.Proposal.Hash == offeredHash && bytes.Equal(decision.Proposal.Value, value) {
 			return proposalResult(decision)
 		}
 	}
-}
-
-func (c *Core) storeValueQuorum(ctx context.Context, value []byte) error {
-	hash := sha256.Sum256(value)
-	if len(c.config.Members) == 1 {
-		return c.StageValue(hash, value)
-	}
-	transport := c.transport
-	type result struct{ err error }
-	results := make(chan result, len(c.config.Members))
-	for _, member := range c.config.Members {
-		if member.ID == c.nodeID {
-			results <- result{err: c.StageValue(hash, value)}
-			continue
-		}
-		go func(id NodeID) { results <- result{err: transport.StageValue(ctx, id, hash, value)} }(member.ID)
-	}
-	successes := 0
-	for completed := 0; completed < len(c.config.Members); completed++ {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case item := <-results:
-			if item.err == nil {
-				successes++
-				if successes == c.config.QuorumSize() {
-					return nil
-				}
-			}
-		}
-	}
-	return ErrQuorumUnavailable
 }
 
 func (c *Core) StageValue(hash ValueHash, value []byte) error {
@@ -199,10 +164,21 @@ func (c *Core) StageValue(hash ValueHash, value []byte) error {
 	}
 	c.mu.Lock()
 	if existing, ok := c.values[hash]; ok {
-		c.mu.Unlock()
 		if !bytes.Equal(existing, value) {
+			c.mu.Unlock()
 			return fmt.Errorf("QuePaxa value hash collision")
 		}
+		if c.compactionValues != nil {
+			key := [32]byte(hash)
+			if _, retained := c.compactionValues[key]; !retained {
+				if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
+					c.mu.Unlock()
+					return err
+				}
+				c.compactionValues[key] = struct{}{}
+			}
+		}
+		c.mu.Unlock()
 		return nil
 	}
 	if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
@@ -210,6 +186,9 @@ func (c *Core) StageValue(hash ValueHash, value []byte) error {
 		return err
 	}
 	c.values[hash] = append([]byte(nil), value...)
+	if c.compactionValues != nil {
+		c.compactionValues[[32]byte(hash)] = struct{}{}
+	}
 	c.mu.Unlock()
 	return nil
 }
@@ -571,17 +550,16 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			return decision, err
 		}
 
+		candidate := proposal
+		if step%4 == 0 && (step > 4 || c.nodeID != leader || !allowLeaderFastPath) {
+			priority, err := c.priority()
+			if err != nil {
+				return Decision{}, err
+			}
+			candidate.Priority = priority
+		}
 		requests := make(map[NodeID]RecordRequest, len(c.config.Members))
 		for _, member := range c.config.Members {
-			candidate := proposal
-			candidate.Value = nil
-			if step%4 == 0 && (step > 4 || c.nodeID != leader || !allowLeaderFastPath) {
-				priority, err := c.priority()
-				if err != nil {
-					return Decision{}, err
-				}
-				candidate.Priority = priority
-			}
 			requests[member.ID] = RecordRequest{Slot: slot, Step: step, Proposal: candidate}
 		}
 
@@ -1030,6 +1008,9 @@ func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, e
 	if err != nil {
 		return DecidedValue{}, err
 	}
+	if err := c.WaitTip(ctx, slot); err != nil {
+		return DecidedValue{}, err
+	}
 	if len(c.config.Members) <= 1 {
 		return value, nil
 	}
@@ -1124,9 +1105,6 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 		value, err := c.recoveryValue(ctx, slot)
 		if err != nil {
 			return fmt.Errorf("recover slot %d value: %w", slot, err)
-		}
-		if err := c.storeValueQuorum(ctx, value); err != nil {
-			return fmt.Errorf("recover slot %d value quorum: %w", slot, err)
 		}
 		decision, err := c.runSlot(ctx, slot, value, false)
 		if err != nil {

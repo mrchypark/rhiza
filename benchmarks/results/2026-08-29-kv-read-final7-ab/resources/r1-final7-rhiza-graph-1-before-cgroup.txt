@@ -1,0 +1,11 @@
+usage_usec 9224257
+user_usec 5425737
+system_usec 3798519
+nice_usec 0
+nr_periods 299
+nr_throttled 2
+throttled_usec 89049
+nr_bursts 0
+burst_usec 0
+64888832
+71467008

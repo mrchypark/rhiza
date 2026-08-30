@@ -25,6 +25,8 @@ import (
 const (
 	maxPeerConnections = 64
 	maxPeerStreams     = 1024
+	peerErrorQuorum    = 1
+	peerErrorCompacted = 2
 )
 
 // PeerServer owns the private QUIC listener. Public HTTP remains a separate adapter.
@@ -139,8 +141,11 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	}
 	if err != nil {
 		response = &peerfb.ResponseT{Error: err.Error()}
-		if errors.Is(err, quepaxa.ErrQuorumUnavailable) {
-			response.ErrorCode = 1
+		switch {
+		case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+			response.ErrorCode = peerErrorQuorum
+		case errors.Is(err, quepaxa.ErrCompacted):
+			response.ErrorCode = peerErrorCompacted
 		}
 	}
 	if writeErr := writePeerFrame(stream, encodePeerResponse(response)); writeErr != nil {
@@ -165,6 +170,9 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	if subtle.ConstantTimeCompare([]byte(request.Token), []byte(expectedToken)) != 1 {
 		return nil, fmt.Errorf("peer authentication failed")
 	}
+	if !allows0RTT(request.Operation) && (conn == nil || !conn.ConnectionState().TLS.HandshakeComplete) {
+		return nil, fmt.Errorf("%s is not accepted as replayable early data", request.Operation)
+	}
 	switch request.Operation {
 	case peerfb.OperationRecord:
 		if request.Record == nil {
@@ -182,9 +190,6 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	case peerfb.OperationPropose:
 		if !s.server.ready() {
 			return nil, ErrNotReady
-		}
-		if !conn.ConnectionState().TLS.HandshakeComplete {
-			return nil, fmt.Errorf("propose is not accepted as replayable early data")
 		}
 		if len(request.Value) == 0 {
 			return nil, fmt.Errorf("value is required")

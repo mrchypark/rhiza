@@ -1,0 +1,11 @@
+usage_usec 1092743
+user_usec 307066
+system_usec 785677
+nice_usec 0
+nr_periods 145
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+38895616
+45817856

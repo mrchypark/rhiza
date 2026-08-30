@@ -5,6 +5,8 @@ package network
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,8 +84,30 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatal(err)
 	}
-	if !transport.peers[member.ID].conn.ConnectionState().Used0RTT {
-		t.Fatal("replay-safe Record did not use QUIC 0-RTT")
+	// Record is physically durable, so it must wait for the handshake even on
+	// a resumed connection. The connection may still report 0-RTT capability;
+	// the operation policy below controls when its stream may be opened.
+	if allows0RTT(peerfb.OperationRecord) {
+		t.Fatal("durable Record unexpectedly allowed QUIC 0-RTT")
+	}
+	// A restarted peer has lost its TLS ticket keys. The first Sync is therefore
+	// attempted as 0-RTT and rejected; transport must promote the connection and
+	// replay it before this periodic catch-up round is reported as failed.
+	oldConn := transport.peers[member.ID].conn
+	transport.invalidate(member.ID, oldConn)
+	_ = oldConn.CloseWithError(0, "peer restart")
+	replacement, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	member.PeerURL = "quic://" + replacement.Addr()
+	transport.members[member.ID] = member
+	if _, err := transport.FetchDecisions(callCtx, member.ID, 1, 1); err != nil {
+		t.Fatalf("Sync after 0-RTT rejection did not retry at 1-RTT: %v", err)
+	}
+	if transport.peers[member.ID].conn.ConnectionState().Used0RTT {
+		t.Fatal("restarted peer unexpectedly accepted its previous 0-RTT ticket")
 	}
 	wrongMember := member
 	wrongMember.Token = "wrong"
@@ -91,6 +115,42 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	defer wrong.Close()
 	if _, err := wrong.SendRecord(callCtx, member.ID, request); err == nil {
 		t.Fatal("peer with the wrong token-bound certificate identity was accepted")
+	}
+}
+
+func TestAllows0RTTOnlyForReadOperations(t *testing.T) {
+	allowed := map[peerfb.Operation]bool{
+		peerfb.OperationSync:       true,
+		peerfb.OperationReadIndex:  true,
+		peerfb.OperationFetchValue: true,
+	}
+	for operation := range peerfb.EnumNamesOperation {
+		if got := allows0RTT(operation); got != allowed[operation] {
+			t.Fatalf("allows0RTT(%s) = %v, want %v", operation, got, allowed[operation])
+		}
+	}
+}
+
+func TestPeerServerRejectsMutatingEarlyData(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer server.Close()
+	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
+	for operation := range peerfb.EnumNamesOperation {
+		if allows0RTT(operation) {
+			continue
+		}
+		_, err := peer.handle(context.Background(), nil, &peerfb.RequestT{
+			Operation: operation,
+			ClusterId: string(server.cluster),
+			SenderId:  string(member.ID),
+			ConfigId:  uint64(core.ConfigID()),
+			Token:     member.Token,
+		})
+		if err == nil || !strings.Contains(err.Error(), "not accepted as replayable early data") {
+			t.Fatalf("operation %s early-data error = %v", operation, err)
+		}
 	}
 }
 
@@ -149,6 +209,51 @@ func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
 	next, err := serverPeerHandleDecisions(server, member, uint64(len(response.Decisions)+1))
 	if err != nil || len(next.Decisions) == 0 {
 		t.Fatalf("next page decisions=%d err=%v", len(next.Decisions), err)
+	}
+}
+
+func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	core.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if _, _, err := core.Propose(context.Background(), []byte("state")); err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := core.PrefixHash(1)
+	if !ok {
+		t.Fatal("missing checkpoint prefix")
+	}
+	order, following, err := core.CheckpointLeaderOrders(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: core.ConfigID(), Index: 1, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following}
+	if err := core.PrepareCheckpoint(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	value, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CompactThrough(1, seal.RootHash); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	member.PeerURL = "quic://" + peer.Addr()
+	transport := NewTransport("cluster", member.ID, &quepaxa.Cluster{Members: []quepaxa.Member{member}}, "secret")
+	defer transport.Close()
+	if _, err := transport.FetchDecisions(ctx, member.ID, 1, 1); !errors.Is(err, quepaxa.ErrCompacted) {
+		t.Fatalf("fetch error = %v, want %v", err, quepaxa.ErrCompacted)
 	}
 }
 

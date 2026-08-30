@@ -1,0 +1,20 @@
+{
+  "change": "before-ack archive batch expands to the contiguous certified tip",
+  "client_errors": 0,
+  "healthy_before_ack": {
+    "graph_write": {"baseline_http_per_100": 91.7, "candidate_http_per_100": 70.8, "baseline_p50_ms": 20.41, "candidate_p50_ms": 23.69},
+    "graph_kv_write": {"baseline_http_per_100": 90.8, "candidate_http_per_100": 63.3, "baseline_p50_ms": 22.01, "candidate_p50_ms": 17.91},
+    "sql_write": {"baseline_http_per_100": 76.7, "candidate_http_per_100": 70.0, "baseline_p50_ms": 19.64, "candidate_p50_ms": 17.95},
+    "sql_kv_write": {"baseline_http_per_100": 93.3, "candidate_http_per_100": 76.7, "baseline_p50_ms": 20.26, "candidate_p50_ms": 18.58}
+  },
+  "resource_cpu_us_per_request": {
+    "graph_baseline": 396.3,
+    "graph_candidate": 395.1,
+    "sql_baseline": 206.2,
+    "sql_candidate": 179.0
+  },
+  "one_fault_quorum_ms": {"graph": 123, "sql": 98},
+  "checkpoint_interval": "1s",
+  "object_storage_recovery": {"graph": "pass", "sql": "pass"},
+  "two_fault_behavior": "HTTP 503 commit_unknown; idempotent retry after quorum recovery"
+}

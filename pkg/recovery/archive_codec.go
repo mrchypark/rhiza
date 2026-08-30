@@ -16,8 +16,8 @@ var extentMagic = [8]byte{'R', 'H', 'Z', 'A', 'E', 'X', 'T', '!'}
 var headMagic = [8]byte{'R', 'H', 'Z', 'A', 'H', 'E', 'A', 'D'}
 
 const (
-	extentHeaderSize = 8 + 4 + 4 + 8 + 8 + 4 + 4 + 32 + 32 + 32
-	headHeaderSize   = 8 + 4 + 4 + 8 + 8 + 8 + 32 + 8 + 32 + 4 + 4
+	extentHeaderSize = 8 + 4 + 4 + 8 + 8 + 4 + 4 + 32 + 32 + 32 + 8
+	headHeaderSize   = 8 + 4 + 4 + 8 + 8 + 8 + 32 + 8 + 32 + 8 + 4 + 4
 	archiveCRCSize   = 4
 	headHasBase      = 1
 )
@@ -51,6 +51,7 @@ func encodeExtent(extent Extent) ([]byte, error) {
 	copy(buf[40:72], extent.StartPrefix[:])
 	copy(buf[72:104], extent.EndPrefix[:])
 	copy(buf[104:136], extent.PreviousHash[:])
+	binary.BigEndian.PutUint64(buf[136:144], extent.PreviousObject)
 	offset := extentHeaderSize
 	for _, decision := range extent.Decisions {
 		binary.BigEndian.PutUint32(buf[offset:offset+4], uint32(len(decision.Value)))
@@ -83,6 +84,7 @@ func decodeExtent(data []byte) (Extent, error) {
 	copy(extent.StartPrefix[:], data[40:72])
 	copy(extent.EndPrefix[:], data[72:104])
 	copy(extent.PreviousHash[:], data[104:136])
+	extent.PreviousObject = binary.BigEndian.Uint64(data[136:144])
 	offset, end := extentHeaderSize, len(data)-archiveCRCSize
 	for i := uint32(0); i < count; i++ {
 		if end-offset < 8 {
@@ -107,7 +109,7 @@ func decodeExtent(data []byte) (Extent, error) {
 }
 
 func encodeHead(head archiveHead) ([]byte, error) {
-	if head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) || head.Tip == head.Base && head.Base > 0 && head.BasePrefix == ([32]byte{}) {
+	if head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) || (head.TailHash == ([32]byte{})) != (head.TailObject == 0) || head.TailObject > head.Generation || head.Tip == head.Base && head.Base > 0 && head.BasePrefix == ([32]byte{}) {
 		return nil, fmt.Errorf("invalid archive head range")
 	}
 	var sealData, decisionData []byte
@@ -143,8 +145,9 @@ func encodeHead(head archiveHead) ([]byte, error) {
 	copy(buf[40:72], head.BasePrefix[:])
 	binary.BigEndian.PutUint64(buf[72:80], uint64(head.Tip))
 	copy(buf[80:112], head.TailHash[:])
-	binary.BigEndian.PutUint32(buf[112:116], uint32(len(sealData)))
-	binary.BigEndian.PutUint32(buf[116:120], uint32(len(decisionData)))
+	binary.BigEndian.PutUint64(buf[112:120], head.TailObject)
+	binary.BigEndian.PutUint32(buf[120:124], uint32(len(sealData)))
+	binary.BigEndian.PutUint32(buf[124:128], uint32(len(decisionData)))
 	offset := headHeaderSize
 	copy(buf[offset:], sealData)
 	offset += len(sealData)
@@ -173,8 +176,9 @@ func decodeHead(data []byte) (archiveHead, error) {
 	head := archiveHead{ConfigID: uint(config), Generation: binary.BigEndian.Uint64(data[24:32]), Base: quepaxa.Slot(binary.BigEndian.Uint64(data[32:40])), Tip: quepaxa.Slot(binary.BigEndian.Uint64(data[72:80]))}
 	copy(head.BasePrefix[:], data[40:72])
 	copy(head.TailHash[:], data[80:112])
-	sealLen := int(binary.BigEndian.Uint32(data[112:116]))
-	decisionLen := int(binary.BigEndian.Uint32(data[116:120]))
+	head.TailObject = binary.BigEndian.Uint64(data[112:120])
+	sealLen := int(binary.BigEndian.Uint32(data[120:124]))
+	decisionLen := int(binary.BigEndian.Uint32(data[124:128]))
 	offset, end := headHeaderSize, len(data)-archiveCRCSize
 	if sealLen > end-offset || decisionLen > end-offset-sealLen || offset+sealLen+decisionLen != end {
 		return archiveHead{}, fmt.Errorf("invalid archive head payload length")
@@ -204,7 +208,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 			return archiveHead{}, fmt.Errorf("archive recovery base does not match head")
 		}
 	}
-	if head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) {
+	if head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) || (head.TailHash == ([32]byte{})) != (head.TailObject == 0) || head.TailObject > head.Generation {
 		return archiveHead{}, fmt.Errorf("invalid archive head range")
 	}
 	return head, nil

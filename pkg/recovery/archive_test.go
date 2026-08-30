@@ -20,9 +20,11 @@ import (
 
 type countingBucket struct {
 	objstore.Bucket
-	heads atomic.Uint64
-	gets  atomic.Uint64
-	puts  atomic.Uint64
+	heads       atomic.Uint64
+	markerHeads atomic.Uint64
+	gets        atomic.Uint64
+	blockGets   atomic.Uint64
+	puts        atomic.Uint64
 }
 
 type blockingUploadBucket struct {
@@ -47,6 +49,59 @@ type failPostCASBucket struct {
 	objstore.Bucket
 	armed atomic.Bool
 	fail  atomic.Bool
+}
+
+type racingRecoveryPinBucket struct {
+	objstore.Bucket
+	armed atomic.Bool
+	run   func()
+}
+
+type blockingDeleteBucket struct {
+	objstore.Bucket
+	name    string
+	started chan struct{}
+	release chan struct{}
+	once    atomic.Bool
+}
+
+type blockingHeadUploadBucket struct {
+	objstore.Bucket
+	armed   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingHeadUploadBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "archive/head.bin") && b.armed.CompareAndSwap(true, false) {
+		close(b.started)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.release:
+		}
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func (b *blockingDeleteBucket) Delete(ctx context.Context, name string) error {
+	if name == b.name && b.once.CompareAndSwap(false, true) {
+		close(b.started)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.release:
+		}
+	}
+	return b.Bucket.Delete(ctx, name)
+}
+
+func (b *racingRecoveryPinBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	r, err := b.Bucket.Get(ctx, name)
+	if err == nil && strings.Contains(name, "/archive/recovery-pins/") && b.armed.CompareAndSwap(true, false) {
+		b.run()
+	}
+	return r, err
 }
 
 func (b *failPostCASBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
@@ -95,11 +150,17 @@ func (b *blockingUploadBucket) Upload(ctx context.Context, _ string, _ io.Reader
 
 func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	b.heads.Add(1)
+	if strings.Contains(name, "/archive/gc-candidates/") {
+		b.markerHeads.Add(1)
+	}
 	return b.Bucket.Attributes(ctx, name)
 }
 
 func (b *countingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	b.gets.Add(1)
+	if strings.Contains(name, "/archive/blocks/") {
+		b.blockGets.Add(1)
+	}
 	return b.Bucket.Get(ctx, name)
 }
 
@@ -145,6 +206,123 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	}
 	if len(reader.cache) > maxCachedExtents {
 		t.Fatalf("archive cache=%d, limit=%d", len(reader.cache), maxCachedExtents)
+	}
+}
+
+func TestSyncThroughCoalescesAlreadyDecidedSuffix(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID:  "n1",
+		Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}},
+		WAL:     wal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if _, _, err := core.Propose(ctx, []byte{byte(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.SyncThrough(ctx, core, 1); err != nil {
+		t.Fatal(err)
+	}
+	if tip := manager.Tip(); tip != core.Tip() {
+		t.Fatalf("archive tip=%d, want decided tip=%d", tip, core.Tip())
+	}
+	if puts := bucket.puts.Load(); puts != 2 {
+		t.Fatalf("object uploads=%d, want one extent and one head", puts)
+	}
+}
+
+func TestRecoveryPinGCDoesNotDeleteConcurrentRenewal(t *testing.T) {
+	ctx := context.Background()
+	bucket := &racingRecoveryPinBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	key := manager.recoveryPinKey("recovery")
+	expired := archiveRecoveryPin{OwnerID: "recovery", Token: "token", Base: 1, Tip: 1, LeaseUntilMS: time.Now().Add(-time.Second).UnixMilli()}
+	if err := manager.writeRecoveryPin(ctx, key, expired, objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := manager.readRecoveryPin(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket.run = func() {
+		renewed := *stale
+		renewed.LeaseUntilMS = time.Now().Add(time.Minute).UnixMilli()
+		if err := manager.writeRecoveryPin(ctx, key, renewed, objstore.WithIfMatch(stale.version)); err != nil {
+			t.Errorf("inject renewal: %v", err)
+		}
+	}
+	bucket.armed.Store(true)
+	if _, err := manager.maxActiveRecoveryGeneration(ctx); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("GC error=%v, want archive busy", err)
+	}
+	current, err := manager.readRecoveryPin(ctx, key)
+	if err != nil || current.LeaseUntilMS <= time.Now().UnixMilli() {
+		t.Fatalf("renewed pin was lost: pin=%+v err=%v", current, err)
+	}
+}
+
+func TestRecoveryPinGCKeepsGenerationWithoutReadingExtentChain(t *testing.T) {
+	ctx := context.Background()
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	pin := archiveRecoveryPin{
+		OwnerID:      "recovery",
+		Token:        "token",
+		Base:         1,
+		Tip:          2,
+		TailHash:     [32]byte{1},
+		TailObject:   7,
+		LeaseUntilMS: time.Now().Add(time.Minute).UnixMilli(),
+	}
+	if err := manager.writeRecoveryPin(ctx, manager.recoveryPinKey(pin.OwnerID), pin, objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	bucket.blockGets.Store(0)
+	generation, err := manager.maxActiveRecoveryGeneration(ctx)
+	if err != nil || generation != pin.TailObject {
+		t.Fatalf("pinned generation=%d err=%v", generation, err)
+	}
+	if gets := bucket.blockGets.Load(); gets != 0 {
+		t.Fatalf("recovery pin GC read %d extent blocks, want 0", gets)
+	}
+}
+
+func TestExpiredRecoveryPinIsTombstonedOnce(t *testing.T) {
+	ctx := context.Background()
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	pin := archiveRecoveryPin{OwnerID: "recovery", Token: "token", Base: 1, Tip: 1, LeaseUntilMS: time.Now().Add(-time.Second).UnixMilli()}
+	if err := manager.writeRecoveryPin(ctx, manager.recoveryPinKey(pin.OwnerID), pin, objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	bucket.puts.Store(0)
+	if _, err := manager.maxActiveRecoveryGeneration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if puts := bucket.puts.Load(); puts != 1 {
+		t.Fatalf("first expired pin scan PUTs=%d, want 1", puts)
+	}
+	bucket.puts.Store(0)
+	if _, err := manager.maxActiveRecoveryGeneration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := manager.hasActiveRecoveryPins(ctx); err != nil || active {
+		t.Fatalf("tombstoned pin active=%v err=%v", active, err)
+	}
+	if puts := bucket.puts.Load(); puts != 0 {
+		t.Fatalf("repeated tombstone scan PUTs=%d, want 0", puts)
 	}
 }
 
@@ -301,6 +479,21 @@ func TestArchiveExtentSplitUsesEncodedSize(t *testing.T) {
 			t.Fatalf("encoded extent size=%d, limit=%d", len(data), maxExtentSize)
 		}
 	}
+	ref := manager.extents[0]
+	full, err := manager.extentForRef(ctx, ref)
+	if err != nil || len(full.Decisions) < 2 {
+		t.Fatalf("cached extent is unavailable: decisions=%d err=%v", len(full.Decisions), err)
+	}
+	partial := ref
+	partial.Start++
+	partial.StartPrefix = full.prefixes[1]
+	if _, err := manager.extentForRef(ctx, partial); err != nil {
+		t.Fatalf("valid cached extent suffix: %v", err)
+	}
+	partial.StartPrefix[0] ^= 1
+	if _, err := manager.extentForRef(ctx, partial); err == nil {
+		t.Fatal("cached extent accepted an invalid suffix prefix")
+	}
 }
 
 func TestArchiveCodecRejectsJSONAndTrailingData(t *testing.T) {
@@ -355,7 +548,7 @@ func TestArchiveCleanupCompactsCardinality(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bucket := objstore.NewInMemBucket()
+	bucket := &countingBucket{Bucket: objstore.NewInMemBucket()}
 	manager := NewManager(bucket, "cluster", 1)
 	for i := 0; i < 8; i++ {
 		if _, _, err := core.Propose(ctx, []byte{byte(i + 1)}); err != nil {
@@ -370,6 +563,9 @@ func TestArchiveCleanupCompactsCardinality(t *testing.T) {
 	}
 	if err := manager.Cleanup(ctx, 0); err != nil {
 		t.Fatal(err)
+	}
+	if heads := bucket.markerHeads.Load(); heads != 0 {
+		t.Fatalf("archive cleanup issued %d per-object marker HEADs", heads)
 	}
 	count := func(prefix string) int {
 		t.Helper()
@@ -393,6 +589,143 @@ func TestArchiveCleanupCompactsCardinality(t *testing.T) {
 	}
 	if len(manager.extents) != 1 {
 		t.Fatalf("extents after cleanup=%d, want 1", len(manager.extents))
+	}
+}
+
+func TestArchiveCleanupRemovesOrphanMarker(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	manager := NewManager(bucket, "cluster", 1)
+	orphan := manager.gcMarkerKey("cluster/archive/blocks/missing.bin")
+	if err := bucket.Upload(ctx, orphan, bytes.NewReader([]byte("cluster/archive/blocks/missing.bin"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Cleanup(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := bucket.Exists(ctx, orphan); err != nil || exists {
+		t.Fatalf("orphan marker exists=%t err=%v", exists, err)
+	}
+}
+
+func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	base := objstore.NewInMemBucket()
+	builder := NewManager(base, "cluster", 1)
+	extent, _, err := builder.buildExtent(core, 1, 1, [32]byte{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := encodeExtent(extent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "cluster/" + extentKey(extent.hash)
+	if err := base.Upload(ctx, name, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &blockingDeleteBucket{Bucket: base, name: name, started: make(chan struct{}), release: make(chan struct{})}
+	gc := NewManager(bucket, "cluster", 1)
+	if err := bucket.Upload(ctx, gc.gcMarkerKey(name), bytes.NewReader([]byte(name)), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	gcDone := make(chan error, 1)
+	go func() { gcDone <- gc.Cleanup(ctx, 0) }()
+	<-bucket.started
+	stale, err := gc.readGCLock(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
+	if err := gc.writeGCLock(ctx, *stale, objstore.WithIfMatch(stale.version)); err != nil {
+		t.Fatal(err)
+	}
+	publisher := NewManager(bucket, "cluster", 1)
+	successor, err := publisher.acquireGCLock(ctx, "successor", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.SyncThrough(ctx, core, 1); err != nil {
+		t.Fatal(err)
+	}
+	if publisher.head.TailObject == 0 {
+		t.Fatal("publisher reused a stale GC candidate physical extent")
+	}
+	if err := publisher.releaseGCLock(ctx, successor); err != nil {
+		t.Fatal(err)
+	}
+	close(bucket.release)
+	if err := <-gcDone; err != nil {
+		t.Fatal(err)
+	}
+	reader := NewManager(bucket, "cluster", 1)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := reader.DecisionsFrom(ctx, 1, 1)
+	if err != nil || tip != 1 || len(values) != 1 || !bytes.Equal(values[0].Value, []byte("value")) {
+		t.Fatalf("tip=%d values=%#v err=%v", tip, values, err)
+	}
+}
+
+func TestArchiveCleanupIgnoresFutureGenerationBeforeHeadPublish(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &blockingHeadUploadBucket{Bucket: objstore.NewInMemBucket(), started: make(chan struct{}), release: make(chan struct{})}
+	bucket.armed.Store(true)
+	publisher := NewManager(bucket, "cluster", 1)
+	publishDone := make(chan error, 1)
+	go func() { publishDone <- publisher.SyncThrough(ctx, core, 1) }()
+	<-bucket.started
+	var object string
+	if err := bucket.Iter(ctx, "cluster/archive/blocks", func(name string) error { object = name; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if object == "" {
+		t.Fatal("publisher did not upload extent before head")
+	}
+	gc := NewManager(bucket, "cluster", 1)
+	if err := bucket.Upload(ctx, gc.gcMarkerKey(object), bytes.NewReader([]byte(object)), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	if err := gc.Cleanup(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ := bucket.Exists(ctx, object); !exists {
+		t.Fatal("GC deleted an in-flight future-generation extent")
+	}
+	close(bucket.release)
+	if err := <-publishDone; err != nil {
+		t.Fatal(err)
+	}
+	reader := NewManager(bucket, "cluster", 1)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -668,6 +1001,14 @@ func TestArchivePublicationCostDoesNotGrowWithHistory(t *testing.T) {
 	}
 }
 
+func TestArchiveRejectsGenerationOverflow(t *testing.T) {
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	manager.head.Generation = ^uint64(0)
+	if err := manager.syncNow(context.Background(), nil, 1); err == nil || !strings.Contains(err.Error(), "generation exhausted") {
+		t.Fatalf("overflow error=%v", err)
+	}
+}
+
 func TestArchiveTrimRetainsOnlyCheckpointTail(t *testing.T) {
 	ctx := context.Background()
 	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
@@ -715,6 +1056,48 @@ func TestArchiveTrimRetainsOnlyCheckpointTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := manager.TrimThrough(ctx, quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}, decision); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.BeginRecoverySnapshot(ctx, "crashed-recovery", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := manager.acquireGCLock(ctx, "active-gc", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Renew(ctx, time.Minute); err != nil {
+		t.Fatalf("renew recovery snapshot during GC: %v", err)
+	}
+	if err := manager.releaseGCLock(ctx, lock); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	orphan := archiveRecoveryPin{OwnerID: "crashed-recovery", Token: "orphan", Base: manager.head.Base, Tip: manager.head.Tip, TailHash: manager.head.TailHash, TailObject: manager.head.TailObject, LeaseUntilMS: time.Now().Add(-time.Second).UnixMilli()}
+	expired, err := manager.readRecoveryPin(ctx, manager.recoveryPinKey(orphan.OwnerID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.writeRecoveryPin(ctx, manager.recoveryPinKey(orphan.OwnerID), orphan, objstore.WithIfMatch(expired.version)); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed, err := manager.BeginRecoverySnapshot(ctx, orphan.OwnerID, time.Minute)
+	if err != nil {
+		t.Fatalf("expired archive recovery pin was not reclaimed: %v", err)
+	}
+	if err := snapshot.Close(ctx); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("stale snapshot close error=%v, want busy", err)
+	}
+	current, err := manager.readRecoveryPin(ctx, reclaimed.pinKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Token != reclaimed.pin.Token || current.LeaseUntilMS <= time.Now().UnixMilli() {
+		t.Fatal("stale snapshot close expired the replacement pin")
+	}
+	if err := reclaimed.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := manager.DecisionsFrom(ctx, 3, 1); !errors.Is(err, quepaxa.ErrCompacted) {

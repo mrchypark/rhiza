@@ -1,0 +1,4 @@
+NAME          CPU(cores)   MEMORY(bytes)   
+rhiza-sql-0   48m          31Mi            
+rhiza-sql-1   94m          34Mi            
+rhiza-sql-2   43m          30Mi            

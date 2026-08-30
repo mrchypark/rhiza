@@ -1,0 +1,74 @@
+[
+  {
+    "config": "graph-async-final8",
+    "duration_s": 3.160151,
+    "cpu_seconds": 4.890267,
+    "average_cores": 1.5474789021157533,
+    "memory_current_mib": 71.8984375,
+    "memory_peak_mib": 77.71484375,
+    "observed_pods": 3
+  },
+  {
+    "config": "graph-async-final9",
+    "duration_s": 3.144402,
+    "cpu_seconds": 5.515192,
+    "average_cores": 1.7539716613842633,
+    "memory_current_mib": 63.165364583333336,
+    "memory_peak_mib": 69.46614583333333,
+    "observed_pods": 3
+  },
+  {
+    "config": "graph-before-ack-final8",
+    "duration_s": 4.34179,
+    "cpu_seconds": 6.702885,
+    "average_cores": 1.5438068170040469,
+    "memory_current_mib": 60.305989583333336,
+    "memory_peak_mib": 66.52864583333333,
+    "observed_pods": 3
+  },
+  {
+    "config": "graph-before-ack-final9",
+    "duration_s": 4.139888,
+    "cpu_seconds": 6.223518,
+    "average_cores": 1.503305886536061,
+    "memory_current_mib": 59.860677083333336,
+    "memory_peak_mib": 65.27213541666667,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-async-final8",
+    "duration_s": 2.310451,
+    "cpu_seconds": 1.952931,
+    "average_cores": 0.845259648440932,
+    "memory_current_mib": 53.442708333333336,
+    "memory_peak_mib": 60.270833333333336,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-async-final9",
+    "duration_s": 2.057828,
+    "cpu_seconds": 2.072033,
+    "average_cores": 1.0069029092810475,
+    "memory_current_mib": 45.049479166666664,
+    "memory_peak_mib": 51.14453125,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-before-ack-final8",
+    "duration_s": 2.754542,
+    "cpu_seconds": 2.494661,
+    "average_cores": 0.905653644054075,
+    "memory_current_mib": 46.44921875,
+    "memory_peak_mib": 51.717447916666664,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-before-ack-final9",
+    "duration_s": 3.063192,
+    "cpu_seconds": 2.970436,
+    "average_cores": 0.9697191687625196,
+    "memory_current_mib": 49.079427083333336,
+    "memory_peak_mib": 54.145833333333336,
+    "observed_pods": 3
+  }
+]

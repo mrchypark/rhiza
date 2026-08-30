@@ -1,0 +1,11 @@
+usage_usec 70730
+user_usec 24563
+system_usec 46167
+nice_usec 0
+nr_periods 23
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+25882624
+33533952

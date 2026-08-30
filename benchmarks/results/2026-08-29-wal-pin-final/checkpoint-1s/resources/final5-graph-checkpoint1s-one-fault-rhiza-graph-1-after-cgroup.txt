@@ -1,0 +1,11 @@
+usage_usec 7001860
+user_usec 5289744
+system_usec 1712115
+nice_usec 0
+nr_periods 185
+nr_throttled 11
+throttled_usec 353357
+nr_bursts 0
+burst_usec 0
+71979008
+78503936

@@ -1,0 +1,11 @@
+usage_usec 3223467
+user_usec 1322417
+system_usec 1901049
+nice_usec 0
+nr_periods 165
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+44728320
+53538816

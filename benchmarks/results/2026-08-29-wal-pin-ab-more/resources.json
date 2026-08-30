@@ -1,0 +1,50 @@
+[
+  {
+    "config": "graph-async-r3-final3",
+    "cpu_seconds": 4.2068,
+    "duration_seconds": 2.620554,
+    "avg_cores": 1.6053094116740203,
+    "memory_current_mib": 198.69921875,
+    "memory_peak_mib": 216.6796875
+  },
+  {
+    "config": "graph-async-r3-final6",
+    "cpu_seconds": 4.244576,
+    "duration_seconds": 2.84615,
+    "avg_cores": 1.4913395288372011,
+    "memory_current_mib": 179.36328125,
+    "memory_peak_mib": 197.4375
+  },
+  {
+    "config": "graph-async-r4-final3",
+    "cpu_seconds": 4.835905,
+    "duration_seconds": 3.085989,
+    "avg_cores": 1.567051924034726,
+    "memory_current_mib": 175.296875,
+    "memory_peak_mib": 193.45703125
+  },
+  {
+    "config": "graph-async-r4-final6",
+    "cpu_seconds": 3.705432,
+    "duration_seconds": 2.412445,
+    "avg_cores": 1.5359653795216057,
+    "memory_current_mib": 176.18359375,
+    "memory_peak_mib": 193.7734375
+  },
+  {
+    "config": "graph-async-r5-final3",
+    "cpu_seconds": 4.429223,
+    "duration_seconds": 2.760364,
+    "avg_cores": 1.6045793235964534,
+    "memory_current_mib": 188.80859375,
+    "memory_peak_mib": 207.43359375
+  },
+  {
+    "config": "graph-async-r5-final6",
+    "cpu_seconds": 4.492307,
+    "duration_seconds": 2.87312,
+    "avg_cores": 1.5635640001113773,
+    "memory_current_mib": 187.2578125,
+    "memory_peak_mib": 204.78125
+  }
+]

@@ -1,0 +1,11 @@
+usage_usec 964545
+user_usec 226202
+system_usec 738343
+nice_usec 0
+nr_periods 134
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+49762304
+57516032

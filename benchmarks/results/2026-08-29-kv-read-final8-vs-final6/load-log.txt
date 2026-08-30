@@ -1,0 +1,6 @@
+2026-08-29T23:31:05+09:00
+23:31  up 12 days, 23:13, 9 users, load averages: 9.68 18.56 29.45
+dory-k8s 13.40% 1.492GiB / 11.65GiB
+2026-08-29T23:32:17+09:00
+23:32  up 12 days, 23:14, 9 users, load averages: 12.86 17.75 28.28
+dory-k8s 8.99% 1.519GiB / 11.65GiB

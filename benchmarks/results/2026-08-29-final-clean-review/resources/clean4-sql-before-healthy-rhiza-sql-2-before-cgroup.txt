@@ -1,0 +1,11 @@
+usage_usec 47024
+user_usec 7347
+system_usec 39676
+nice_usec 0
+nr_periods 28
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+19161088
+25534464

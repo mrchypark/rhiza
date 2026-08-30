@@ -1,0 +1,24 @@
+# QuePaxa inline-Record microbenchmark
+
+- Base comparison: `benchmarks/results/2026-08-28-archive-refresh/quepaxa-current.txt`
+- Change: normal proposal value is carried by the first Record quorum; no separate StageValue quorum.
+- Result: in-memory median was about 25.6 ms healthy and 21.9 ms with one peer down versus the prior 25.1 ms and 20.3 ms. The expected QUIC RTT reduction is not visible in this fsync-dominated mock transport benchmark, so Dory latency is the deciding measurement.
+
+```text
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M3
+BenchmarkCoreProposeThreePeers-8    	      50	  24237112 ns/op	   64259 B/op	     373 allocs/op
+BenchmarkCoreProposeThreePeers-8    	      54	  26317543 ns/op	   63644 B/op	     373 allocs/op
+BenchmarkCoreProposeThreePeers-8    	      48	  23695333 ns/op	   63881 B/op	     371 allocs/op
+BenchmarkCoreProposeThreePeers-8    	      52	  25786202 ns/op	   63576 B/op	     373 allocs/op
+BenchmarkCoreProposeThreePeers-8    	      45	  25600556 ns/op	   62080 B/op	     363 allocs/op
+BenchmarkCoreProposeOnePeerDown-8   	      51	  21662758 ns/op	   46227 B/op	     276 allocs/op
+BenchmarkCoreProposeOnePeerDown-8   	      60	  21883966 ns/op	   48399 B/op	     282 allocs/op
+BenchmarkCoreProposeOnePeerDown-8   	      60	  20997969 ns/op	   48031 B/op	     281 allocs/op
+BenchmarkCoreProposeOnePeerDown-8   	      54	  22015001 ns/op	   46467 B/op	     278 allocs/op
+BenchmarkCoreProposeOnePeerDown-8   	      58	  21953239 ns/op	   48079 B/op	     281 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	15.687s
+```

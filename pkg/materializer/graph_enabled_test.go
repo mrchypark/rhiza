@@ -196,18 +196,18 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err = m.GraphQuery(ctx, `MATCH (p:Person) RETURN p.name ORDER BY p.name`, nil)
-	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "Ada" || m.Tip() != 4 {
+	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "Ada" || result.AppliedSlot != 4 || m.Tip() != 4 {
 		t.Fatalf("restored graph result=%+v tip=%d err=%v", result, m.Tip(), err)
 	}
 	got, found, err = m.KVGet(ctx, "mode", time.Now())
 	if err != nil || !found || string(got) != "graph" {
 		t.Fatalf("restored KV got=%q found=%v err=%v", got, found, err)
 	}
-	records, err := m.GraphReadStream(ctx, "people", 0, 100, 0)
-	if err != nil || len(records) != 1 || records[0].Kind != "person.created" {
+	records, streamSlot, err := m.GraphReadStream(ctx, "people", 0, 100, 0)
+	if err != nil || len(records) != 1 || records[0].Kind != "person.created" || streamSlot != 4 {
 		t.Fatalf("restored stream records=%#v err=%v", records, err)
 	}
-	offset, found, err := m.GraphStreamOffset(ctx, "people", "projector")
+	offset, found, _, err := m.GraphStreamOffset(ctx, "people", "projector")
 	if err != nil || !found || offset != 1 {
 		t.Fatalf("restored stream offset=%d found=%v err=%v", offset, found, err)
 	}
@@ -221,6 +221,51 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	defer m.Close()
 	if m.Tip() != 4 {
 		t.Fatalf("tip=%d, want 4", m.Tip())
+	}
+}
+
+func TestGraphRestoreFailureReopensOriginalMaterializer(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	m, err := Open(filepath.Join(dir, "materialized.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	first, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "first", Cypher: "CREATE (:RestoreLive {value: 'ready'})"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, first); err != nil {
+		t.Fatal(err)
+	}
+	files, _, cleanup, err := m.CheckpointFilesAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	var sqlitePath string
+	for _, file := range files {
+		if file.Role == CheckpointSQLite {
+			sqlitePath = file.Path
+		}
+	}
+	if err := m.restoreParts(ctx, snapshotParts{sqlitePath: sqlitePath, graphDir: filepath.Join(dir, "missing-graph")}); err == nil {
+		t.Fatal("restore with a missing graph snapshot succeeded")
+	}
+	if err := m.Health(ctx); err != nil {
+		t.Fatalf("materializer remained closed after failed restore: %v", err)
+	}
+	second, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "second", Cypher: "CREATE (:RestoreLive {value: 'again'})"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 2, second); err != nil {
+		t.Fatalf("apply after failed restore: %v", err)
+	}
+	result, err := m.GraphQuery(ctx, "MATCH (n:RestoreLive) RETURN count(n)", nil)
+	if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != int64(2) {
+		t.Fatalf("query after failed restore result=%+v err=%v", result, err)
 	}
 }
 
@@ -288,7 +333,7 @@ func TestGraphStreamWaitDoesNotBlockGraphApply(t *testing.T) {
 	result := make(chan []types.GraphStreamRecord, 1)
 	errs := make(chan error, 1)
 	go func() {
-		records, err := m.GraphReadStream(ctx, "events", 0, 100, time.Second)
+		records, _, err := m.GraphReadStream(ctx, "events", 0, 100, time.Second)
 		if err != nil {
 			errs <- err
 			return
@@ -488,5 +533,29 @@ func TestGraphQueryWaitsForSQLiteApply(t *testing.T) {
 	m.mu.Unlock()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGraphMethodsAfterCloseReturnError(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "closed.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := m.GraphQuery(ctx, "MATCH (n) RETURN n", nil); err == nil {
+		t.Fatal("GraphQuery succeeded after close")
+	}
+	if _, _, err := m.GraphMutationReceipt(ctx, "closed"); err == nil {
+		t.Fatal("GraphMutationReceipt succeeded after close")
+	}
+	command := types.GraphCommand{RequestID: "closed", Cypher: "CREATE (:Closed)"}
+	if _, err := m.GraphRequestMatches(ctx, command); err == nil {
+		t.Fatal("GraphRequestMatches succeeded after close")
+	}
+	if _, err := m.graphRequestExists("closed"); err == nil {
+		t.Fatal("graphRequestExists succeeded after close")
 	}
 }

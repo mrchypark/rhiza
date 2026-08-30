@@ -41,12 +41,12 @@ func (*Materializer) GraphQuery(context.Context, string, map[string]any) (types.
 	return types.GraphCommandResult{}, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
-func (*Materializer) GraphReadStream(context.Context, string, uint64, uint, time.Duration) ([]types.GraphStreamRecord, error) {
-	return nil, fmt.Errorf("graph API is not supported by the sql-kv build")
+func (*Materializer) GraphReadStream(context.Context, string, uint64, uint, time.Duration) ([]types.GraphStreamRecord, uint64, error) {
+	return nil, 0, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
-func (*Materializer) GraphStreamOffset(context.Context, string, string) (uint64, bool, error) {
-	return 0, false, fmt.Errorf("graph API is not supported by the sql-kv build")
+func (*Materializer) GraphStreamOffset(context.Context, string, string) (uint64, bool, uint64, error) {
+	return 0, false, 0, fmt.Errorf("graph API is not supported by the sql-kv build")
 }
 
 func (*Materializer) GraphRequestMatches(context.Context, types.GraphCommand) (bool, error) {

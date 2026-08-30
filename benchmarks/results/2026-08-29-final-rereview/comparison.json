@@ -1,0 +1,1718 @@
+[
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s",
+    "candidate_config": "final-graph-async-checkpoint-1s-healthy",
+    "workload": "graph_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 5003.780982004527,
+      "p50_ms": 2.244333,
+      "p95_ms": 8.241792,
+      "p99_ms": 12.653625,
+      "s3_http_requests": 54
+    },
+    "candidate": {
+      "ops_per_sec": 5413.72474938623,
+      "p50_ms": 2.408625,
+      "p95_ms": 8.269875,
+      "p99_ms": 11.792833,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 8.192680072449502,
+      "p50_ms": 7.320304072523981,
+      "p95_ms": 0.3407390043330446,
+      "p99_ms": -6.802730442857284,
+      "s3_http_requests": -100
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s",
+    "candidate_config": "final-graph-async-checkpoint-1s-healthy",
+    "workload": "graph_read_local",
+    "baseline": {
+      "ops_per_sec": 7973.488151894949,
+      "p50_ms": 1.466375,
+      "p95_ms": 5.372833,
+      "p99_ms": 8.924625,
+      "s3_http_requests": 71
+    },
+    "candidate": {
+      "ops_per_sec": 3032.4284134321197,
+      "p50_ms": 1.947667,
+      "p95_ms": 14.55575,
+      "p99_ms": 56.716542,
+      "s3_http_requests": 150
+    },
+    "delta_percent": {
+      "ops_per_sec": -61.96860952616523,
+      "p50_ms": 32.82189071690394,
+      "p95_ms": 170.91387355609228,
+      "p99_ms": 535.506164124543,
+      "s3_http_requests": 111.26760563380283
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s",
+    "candidate_config": "final-graph-async-checkpoint-1s-healthy",
+    "workload": "graph_write",
+    "baseline": {
+      "ops_per_sec": 694.7367356277172,
+      "p50_ms": 16.879667,
+      "p95_ms": 51.363875,
+      "p99_ms": 62.838958,
+      "s3_http_requests": 42
+    },
+    "candidate": {
+      "ops_per_sec": 616.4821128824615,
+      "p50_ms": 15.099208,
+      "p95_ms": 56.532375,
+      "p99_ms": 60.971542,
+      "s3_http_requests": 6
+    },
+    "delta_percent": {
+      "ops_per_sec": -11.26392469725242,
+      "p50_ms": -10.547950975573157,
+      "p95_ms": 10.062519621037163,
+      "p99_ms": -2.9717488313539486,
+      "s3_http_requests": -85.71428571428571
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s",
+    "candidate_config": "final-graph-async-checkpoint-1s-healthy",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8361.553576654542,
+      "p50_ms": 1.690917,
+      "p95_ms": 2.936,
+      "p99_ms": 8.292792,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7592.327427745205,
+      "p50_ms": 1.84225,
+      "p95_ms": 3.339291,
+      "p99_ms": 8.102917,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -9.199560127881218,
+      "p50_ms": 8.949759213491847,
+      "p95_ms": 13.736069482288823,
+      "p99_ms": -2.289639002159956,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s",
+    "candidate_config": "final-graph-async-checkpoint-1s-healthy",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 10098.205044053419,
+      "p50_ms": 1.368459,
+      "p95_ms": 2.901875,
+      "p99_ms": 6.367209,
+      "s3_http_requests": 77
+    },
+    "candidate": {
+      "ops_per_sec": 9650.188763482327,
+      "p50_ms": 1.4215,
+      "p95_ms": 2.729959,
+      "p99_ms": 8.276458,
+      "s3_http_requests": 65
+    },
+    "delta_percent": {
+      "ops_per_sec": -4.436593222425377,
+      "p50_ms": 3.875965593415651,
+      "p95_ms": -5.92430755976739,
+      "p99_ms": 29.98564991348643,
+      "s3_http_requests": -15.584415584415584
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s",
+    "candidate_config": "final-graph-async-checkpoint-1s-healthy",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 605.7664422049596,
+      "p50_ms": 20.172583,
+      "p95_ms": 52.908208,
+      "p99_ms": 56.255792,
+      "s3_http_requests": 48
+    },
+    "candidate": {
+      "ops_per_sec": 809.6341082916224,
+      "p50_ms": 10.8525,
+      "p95_ms": 50.536667,
+      "p99_ms": 51.056875,
+      "s3_http_requests": 6
+    },
+    "delta_percent": {
+      "ops_per_sec": 33.65449980104455,
+      "p50_ms": -46.20173331298228,
+      "p95_ms": -4.482368784820685,
+      "p99_ms": -9.24156751717228,
+      "s3_http_requests": -87.5
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "candidate_config": "final-graph-async-checkpoint-1s-one-fault",
+    "workload": "graph_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 4906.521564468933,
+      "p50_ms": 2.292125,
+      "p95_ms": 8.315125,
+      "p99_ms": 15.688333,
+      "s3_http_requests": 50
+    },
+    "candidate": {
+      "ops_per_sec": 3722.8066379220822,
+      "p50_ms": 2.392542,
+      "p95_ms": 10.224667,
+      "p99_ms": 19.904625,
+      "s3_http_requests": 3
+    },
+    "delta_percent": {
+      "ops_per_sec": -24.125338307261117,
+      "p50_ms": 4.380956535965543,
+      "p95_ms": 22.96468182979811,
+      "p99_ms": 26.875334683423656,
+      "s3_http_requests": -94
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "candidate_config": "final-graph-async-checkpoint-1s-one-fault",
+    "workload": "graph_read_local",
+    "baseline": {
+      "ops_per_sec": 4738.887309259785,
+      "p50_ms": 1.951666,
+      "p95_ms": 11.611916,
+      "p99_ms": 22.66175,
+      "s3_http_requests": 65
+    },
+    "candidate": {
+      "ops_per_sec": 6300.891155829109,
+      "p50_ms": 1.853666,
+      "p95_ms": 7.036042,
+      "p99_ms": 12.205042,
+      "s3_http_requests": 8
+    },
+    "delta_percent": {
+      "ops_per_sec": 32.96140517030589,
+      "p50_ms": -5.021350989359854,
+      "p95_ms": -39.406709452600246,
+      "p99_ms": -46.14254415479828,
+      "s3_http_requests": -87.6923076923077
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "candidate_config": "final-graph-async-checkpoint-1s-one-fault",
+    "workload": "graph_write",
+    "baseline": {
+      "ops_per_sec": 999.2018874923655,
+      "p50_ms": 9.272459,
+      "p95_ms": 32.068083,
+      "p99_ms": 46.020375,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 802.6710258980924,
+      "p50_ms": 12.770708,
+      "p95_ms": 49.284042,
+      "p99_ms": 55.474,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -19.668784061997155,
+      "p50_ms": 37.72730620863356,
+      "p95_ms": 53.6856506202756,
+      "p99_ms": 20.542259814267037,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "candidate_config": "final-graph-async-checkpoint-1s-one-fault",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 9022.054412010159,
+      "p50_ms": 1.56975,
+      "p95_ms": 2.675791,
+      "p99_ms": 7.466083,
+      "s3_http_requests": 17
+    },
+    "candidate": {
+      "ops_per_sec": 6352.708728616076,
+      "p50_ms": 2.23225,
+      "p95_ms": 4.263125,
+      "p99_ms": 9.336541,
+      "s3_http_requests": 3
+    },
+    "delta_percent": {
+      "ops_per_sec": -29.586894087455846,
+      "p50_ms": 42.20417263895526,
+      "p95_ms": 59.32204720024845,
+      "p99_ms": 25.052735149073484,
+      "s3_http_requests": -82.35294117647058
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "candidate_config": "final-graph-async-checkpoint-1s-one-fault",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 10042.828445331392,
+      "p50_ms": 1.329875,
+      "p95_ms": 2.684917,
+      "p99_ms": 8.561875,
+      "s3_http_requests": 63
+    },
+    "candidate": {
+      "ops_per_sec": 9725.9944221422,
+      "p50_ms": 1.429125,
+      "p95_ms": 3.009625,
+      "p99_ms": 7.294875,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -3.154828591505803,
+      "p50_ms": 7.463107434909301,
+      "p95_ms": 12.093781669973419,
+      "p99_ms": -14.798160449667863,
+      "s3_http_requests": -100
+    }
+  },
+  {
+    "baseline_config": "current-graph-live-recovery-checkpoint-1s-one-fault",
+    "candidate_config": "final-graph-async-checkpoint-1s-one-fault",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 1202.8435269089869,
+      "p50_ms": 9.634625,
+      "p95_ms": 28.540917,
+      "p99_ms": 28.879583,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 1169.0926918297266,
+      "p50_ms": 10.351708,
+      "p95_ms": 29.242417,
+      "p99_ms": 36.805583,
+      "s3_http_requests": 3
+    },
+    "delta_percent": {
+      "ops_per_sec": -2.805920664177461,
+      "p50_ms": 7.442770216796197,
+      "p95_ms": 2.4578747767634774,
+      "p99_ms": 27.44499461782394,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-healthy",
+    "candidate_config": "final-graph-async-healthy",
+    "workload": "graph_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 3785.033446334497,
+      "p50_ms": 2.340584,
+      "p95_ms": 9.767875,
+      "p99_ms": 27.667791,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 3863.2586765419182,
+      "p50_ms": 3.451208,
+      "p95_ms": 9.826167,
+      "p99_ms": 15.676375,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 2.06669851974957,
+      "p50_ms": 47.45072170022522,
+      "p95_ms": 0.5967725835967372,
+      "p99_ms": -43.340706166242185,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-healthy",
+    "candidate_config": "final-graph-async-healthy",
+    "workload": "graph_read_local",
+    "baseline": {
+      "ops_per_sec": 6567.190153811802,
+      "p50_ms": 1.679875,
+      "p95_ms": 8.287041,
+      "p99_ms": 14.04275,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5745.384660684764,
+      "p50_ms": 1.974541,
+      "p95_ms": 7.69325,
+      "p99_ms": 12.420625,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -12.513806877512698,
+      "p50_ms": 17.540947987201434,
+      "p95_ms": -7.165295791344587,
+      "p99_ms": -11.55133431842054,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-healthy",
+    "candidate_config": "final-graph-async-healthy",
+    "workload": "graph_write",
+    "baseline": {
+      "ops_per_sec": 939.5773409047983,
+      "p50_ms": 13.26425,
+      "p95_ms": 40.453209,
+      "p99_ms": 40.554292,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 644.8821894715077,
+      "p50_ms": 15.04525,
+      "p95_ms": 54.862584,
+      "p99_ms": 57.147084,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -31.36465074280142,
+      "p50_ms": 13.427069001262785,
+      "p95_ms": 35.619856511259705,
+      "p99_ms": 40.91500845335928,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-healthy",
+    "candidate_config": "final-graph-async-healthy",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8180.3968601739,
+      "p50_ms": 1.672292,
+      "p95_ms": 3.419208,
+      "p99_ms": 6.467625,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5377.239078319283,
+      "p50_ms": 2.683834,
+      "p95_ms": 4.987625,
+      "p99_ms": 10.356542,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -34.2667700573518,
+      "p50_ms": 60.48835968837979,
+      "p95_ms": 45.87076890320802,
+      "p99_ms": 60.12898088556463,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-healthy",
+    "candidate_config": "final-graph-async-healthy",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 11001.221135546046,
+      "p50_ms": 1.220041,
+      "p95_ms": 2.25275,
+      "p99_ms": 6.1725,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5803.437591973604,
+      "p50_ms": 2.268875,
+      "p95_ms": 4.886667,
+      "p99_ms": 14.448583,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -47.24733263271914,
+      "p50_ms": 85.96711094135362,
+      "p95_ms": 116.92007546332263,
+      "p99_ms": 134.07991899554474,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-healthy",
+    "candidate_config": "final-graph-async-healthy",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 895.2728527997479,
+      "p50_ms": 12.380583,
+      "p95_ms": 34.844,
+      "p99_ms": 39.162,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 933.0497869674723,
+      "p50_ms": 10.098625,
+      "p95_ms": 31.028708,
+      "p99_ms": 39.116667,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 4.219600097287245,
+      "p50_ms": -18.431749134915535,
+      "p95_ms": -10.949638388244747,
+      "p99_ms": -0.11575762218476943,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-one-fault",
+    "candidate_config": "final-graph-async-one-fault",
+    "workload": "graph_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 5445.833358860677,
+      "p50_ms": 2.067709,
+      "p95_ms": 7.398334,
+      "p99_ms": 14.454792,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5612.590922780273,
+      "p50_ms": 2.049208,
+      "p95_ms": 6.862417,
+      "p99_ms": 11.205458,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 3.062112865577712,
+      "p50_ms": -0.8947584016899699,
+      "p95_ms": -7.243752444807174,
+      "p99_ms": -22.479285762119574,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-one-fault",
+    "candidate_config": "final-graph-async-one-fault",
+    "workload": "graph_read_local",
+    "baseline": {
+      "ops_per_sec": 7634.192402642576,
+      "p50_ms": 1.5495,
+      "p95_ms": 4.8215,
+      "p99_ms": 11.689,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 4816.492641810476,
+      "p50_ms": 1.632458,
+      "p95_ms": 10.5315,
+      "p99_ms": 30.981666,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -36.908943503398646,
+      "p50_ms": 5.353856082607283,
+      "p95_ms": 118.42787514259045,
+      "p99_ms": 165.04975618102492,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-one-fault",
+    "candidate_config": "final-graph-async-one-fault",
+    "workload": "graph_write",
+    "baseline": {
+      "ops_per_sec": 1103.877134412672,
+      "p50_ms": 11.383125,
+      "p95_ms": 30.295791,
+      "p99_ms": 35.515875,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 1105.2420791831678,
+      "p50_ms": 10.057292,
+      "p95_ms": 40.701042,
+      "p99_ms": 41.343791,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 0.12365006285070838,
+      "p50_ms": -11.64735518585625,
+      "p95_ms": 34.34553334487949,
+      "p99_ms": 16.40932681512141,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-one-fault",
+    "candidate_config": "final-graph-async-one-fault",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8507.901939385605,
+      "p50_ms": 1.611666,
+      "p95_ms": 2.861708,
+      "p99_ms": 6.978292,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 8606.975404440267,
+      "p50_ms": 1.614833,
+      "p95_ms": 3.032916,
+      "p99_ms": 7.52,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 1.164487622924066,
+      "p50_ms": 0.1965047348520053,
+      "p95_ms": 5.982720808691873,
+      "p99_ms": 7.762759139342405,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-one-fault",
+    "candidate_config": "final-graph-async-one-fault",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 11288.199889276306,
+      "p50_ms": 1.195417,
+      "p95_ms": 2.0995,
+      "p99_ms": 7.329041,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 11456.875410134657,
+      "p50_ms": 1.220708,
+      "p95_ms": 2.258292,
+      "p99_ms": 6.301459,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 1.4942641210543337,
+      "p50_ms": 2.1156634044856277,
+      "p95_ms": 7.563324601095502,
+      "p99_ms": -14.020688382013413,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-async-one-fault",
+    "candidate_config": "final-graph-async-one-fault",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 920.0633673402862,
+      "p50_ms": 9.309083,
+      "p95_ms": 45.455625,
+      "p99_ms": 49.932708,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 1127.7559493721935,
+      "p50_ms": 9.800333,
+      "p95_ms": 31.572042,
+      "p99_ms": 39.503917,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 22.573725832852563,
+      "p50_ms": 5.277104092852119,
+      "p95_ms": -30.543157200016495,
+      "p99_ms": -20.885690798103713,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-healthy",
+    "candidate_config": "final-graph-before-ack-healthy",
+    "workload": "graph_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 4617.005006564804,
+      "p50_ms": 2.246,
+      "p95_ms": 8.718375,
+      "p99_ms": 25.693,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5122.786796017033,
+      "p50_ms": 2.280584,
+      "p95_ms": 8.128125,
+      "p99_ms": 11.030333,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 10.95475938910768,
+      "p50_ms": 1.539804096170978,
+      "p95_ms": -6.770183663813489,
+      "p99_ms": -57.06872299848208,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-healthy",
+    "candidate_config": "final-graph-before-ack-healthy",
+    "workload": "graph_read_local",
+    "baseline": {
+      "ops_per_sec": 8449.28212786721,
+      "p50_ms": 1.464083,
+      "p95_ms": 5.349125,
+      "p99_ms": 7.146,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 4991.806174795352,
+      "p50_ms": 1.645959,
+      "p95_ms": 8.168917,
+      "p99_ms": 42.738916,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -40.9203515842902,
+      "p50_ms": 12.422519761516247,
+      "p95_ms": 52.71501413782629,
+      "p99_ms": 498.081668066051,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-healthy",
+    "candidate_config": "final-graph-before-ack-healthy",
+    "workload": "graph_write",
+    "baseline": {
+      "ops_per_sec": 498.25724066674746,
+      "p50_ms": 23.952416,
+      "p95_ms": 47.347917,
+      "p99_ms": 56.436125,
+      "s3_http_requests": 85
+    },
+    "candidate": {
+      "ops_per_sec": 404.40109714017655,
+      "p50_ms": 22.375625,
+      "p95_ms": 105.188625,
+      "p99_ms": 119.867834,
+      "s3_http_requests": 105
+    },
+    "delta_percent": {
+      "ops_per_sec": -18.83688501966905,
+      "p50_ms": -6.583014423263191,
+      "p95_ms": 122.16104036847068,
+      "p99_ms": 112.39557818684398,
+      "s3_http_requests": 23.52941176470588
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-healthy",
+    "candidate_config": "final-graph-before-ack-healthy",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8694.675572831527,
+      "p50_ms": 1.648459,
+      "p95_ms": 2.946833,
+      "p99_ms": 7.21425,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7365.094503037412,
+      "p50_ms": 1.878542,
+      "p95_ms": 4.334708,
+      "p99_ms": 7.083166,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -15.29189972250018,
+      "p50_ms": 13.957459663843629,
+      "p95_ms": 47.097171777294484,
+      "p99_ms": -1.817014935717497,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-healthy",
+    "candidate_config": "final-graph-before-ack-healthy",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 10337.301816609195,
+      "p50_ms": 1.28075,
+      "p95_ms": 2.563333,
+      "p99_ms": 6.680625,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 10190.905415883308,
+      "p50_ms": 1.312417,
+      "p95_ms": 2.3575,
+      "p99_ms": 6.850667,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -1.4161954765668996,
+      "p50_ms": 2.472535623658004,
+      "p95_ms": -8.029897012990514,
+      "p99_ms": 2.5453007764991984,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-healthy",
+    "candidate_config": "final-graph-before-ack-healthy",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 473.34038329655823,
+      "p50_ms": 23.9925,
+      "p95_ms": 55.144625,
+      "p99_ms": 62.134167,
+      "s3_http_requests": 85
+    },
+    "candidate": {
+      "ops_per_sec": 713.4219641220094,
+      "p50_ms": 17.939791,
+      "p95_ms": 31.240667,
+      "p99_ms": 34.187042,
+      "s3_http_requests": 85
+    },
+    "delta_percent": {
+      "ops_per_sec": 50.7207052889537,
+      "p50_ms": -25.227504428467228,
+      "p95_ms": -43.34775692100545,
+      "p99_ms": -44.97867493741406,
+      "s3_http_requests": 0
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-one-fault",
+    "candidate_config": "final-graph-before-ack-one-fault",
+    "workload": "graph_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 5741.251849307457,
+      "p50_ms": 1.956791,
+      "p95_ms": 7.329417,
+      "p99_ms": 13.800584,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 6634.768160997586,
+      "p50_ms": 1.946958,
+      "p95_ms": 6.861125,
+      "p99_ms": 9.074625,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 15.563092077173213,
+      "p50_ms": -0.5025063995081733,
+      "p95_ms": -6.38921212969599,
+      "p99_ms": -34.24463051708537,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-one-fault",
+    "candidate_config": "final-graph-before-ack-one-fault",
+    "workload": "graph_read_local",
+    "baseline": {
+      "ops_per_sec": 5085.56785768547,
+      "p50_ms": 1.718166,
+      "p95_ms": 7.2505,
+      "p99_ms": 28.813208,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7962.137361567592,
+      "p50_ms": 1.560375,
+      "p95_ms": 5.033333,
+      "p99_ms": 10.037541,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 56.5633884824673,
+      "p50_ms": -9.183687722839354,
+      "p95_ms": -30.579504861733675,
+      "p99_ms": -65.16340353354614,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-one-fault",
+    "candidate_config": "final-graph-before-ack-one-fault",
+    "workload": "graph_write",
+    "baseline": {
+      "ops_per_sec": 534.1786432590013,
+      "p50_ms": 22.963417,
+      "p95_ms": 59.507041,
+      "p99_ms": 62.054042,
+      "s3_http_requests": 100
+    },
+    "candidate": {
+      "ops_per_sec": 646.7261255456574,
+      "p50_ms": 18.636459,
+      "p95_ms": 41.82175,
+      "p99_ms": 51.407583,
+      "s3_http_requests": 75
+    },
+    "delta_percent": {
+      "ops_per_sec": 21.06925907782622,
+      "p50_ms": -18.84283162214056,
+      "p95_ms": -29.719661241431915,
+      "p99_ms": -17.156753463376326,
+      "s3_http_requests": -25
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-one-fault",
+    "candidate_config": "final-graph-before-ack-one-fault",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8796.183603338493,
+      "p50_ms": 1.674958,
+      "p95_ms": 2.715083,
+      "p99_ms": 7.703917,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7911.123777347687,
+      "p50_ms": 1.749375,
+      "p95_ms": 3.243791,
+      "p99_ms": 7.612083,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -10.061861665266877,
+      "p50_ms": 4.442917374644615,
+      "p95_ms": 19.472995853165447,
+      "p99_ms": -1.1920429568490878,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-one-fault",
+    "candidate_config": "final-graph-before-ack-one-fault",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 10644.275765552546,
+      "p50_ms": 1.3205,
+      "p95_ms": 2.349084,
+      "p99_ms": 7.954083,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 10864.718372049721,
+      "p50_ms": 1.234375,
+      "p95_ms": 2.562333,
+      "p99_ms": 7.949708,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 2.0709967625094934,
+      "p50_ms": -6.522150700492238,
+      "p95_ms": 9.077964006395694,
+      "p99_ms": -0.0550031977287586,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-graph-before-ack-one-fault",
+    "candidate_config": "final-graph-before-ack-one-fault",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 655.5616318106404,
+      "p50_ms": 18.844417,
+      "p95_ms": 37.483333,
+      "p99_ms": 60.825792,
+      "s3_http_requests": 90
+    },
+    "candidate": {
+      "ops_per_sec": 596.295511748083,
+      "p50_ms": 19.255459,
+      "p95_ms": 56.933125,
+      "p99_ms": 70.236083,
+      "s3_http_requests": 75
+    },
+    "delta_percent": {
+      "ops_per_sec": -9.040510790551652,
+      "p50_ms": 2.1812402049901483,
+      "p95_ms": 51.88917431648886,
+      "p99_ms": 15.470889388501499,
+      "s3_http_requests": -16.666666666666664
+    }
+  },
+  {
+    "baseline_config": "current-sql-live-recovery-checkpoint-1s",
+    "candidate_config": "final-sql-async-checkpoint-1s-healthy",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8671.773427788834,
+      "p50_ms": 1.586833,
+      "p95_ms": 3.360625,
+      "p99_ms": 7.370958,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7444.789903375934,
+      "p50_ms": 1.876042,
+      "p95_ms": 3.595,
+      "p99_ms": 8.653417,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -14.149164927222522,
+      "p50_ms": 18.225547363837283,
+      "p95_ms": 6.974149153803236,
+      "p99_ms": 17.398810303898074,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-live-recovery-checkpoint-1s",
+    "candidate_config": "final-sql-async-checkpoint-1s-healthy",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 12042.751768779166,
+      "p50_ms": 1.146583,
+      "p95_ms": 2.043167,
+      "p99_ms": 6.082167,
+      "s3_http_requests": 63
+    },
+    "candidate": {
+      "ops_per_sec": 10379.760778483718,
+      "p50_ms": 1.275875,
+      "p95_ms": 2.648041,
+      "p99_ms": 11.002541,
+      "s3_http_requests": 22
+    },
+    "delta_percent": {
+      "ops_per_sec": -13.809061435665823,
+      "p50_ms": 11.276287891936319,
+      "p95_ms": 29.604726388004508,
+      "p99_ms": 80.89837059719012,
+      "s3_http_requests": -65.07936507936508
+    }
+  },
+  {
+    "baseline_config": "current-sql-live-recovery-checkpoint-1s",
+    "candidate_config": "final-sql-async-checkpoint-1s-healthy",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 592.4925271880008,
+      "p50_ms": 15.87625,
+      "p95_ms": 62.887583,
+      "p99_ms": 74.903916,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 925.8898419412525,
+      "p50_ms": 10.896959,
+      "p95_ms": 45.866916,
+      "p99_ms": 48.354125,
+      "s3_http_requests": 40
+    },
+    "delta_percent": {
+      "ops_per_sec": 56.270298688081674,
+      "p50_ms": -31.363143059601605,
+      "p95_ms": -27.065226850903134,
+      "p99_ms": -35.44513079930292,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-live-recovery-checkpoint-1s",
+    "candidate_config": "final-sql-async-checkpoint-1s-healthy",
+    "workload": "sql_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 7156.7467524758695,
+      "p50_ms": 1.953667,
+      "p95_ms": 3.867708,
+      "p99_ms": 7.446375,
+      "s3_http_requests": 62
+    },
+    "candidate": {
+      "ops_per_sec": 7555.36433096331,
+      "p50_ms": 1.900708,
+      "p95_ms": 3.466292,
+      "p99_ms": 7.497667,
+      "s3_http_requests": 80
+    },
+    "delta_percent": {
+      "ops_per_sec": 5.569815340322599,
+      "p50_ms": -2.7107485564325944,
+      "p95_ms": -10.378653197190681,
+      "p99_ms": 0.6888183847845444,
+      "s3_http_requests": 29.03225806451613
+    }
+  },
+  {
+    "baseline_config": "current-sql-live-recovery-checkpoint-1s",
+    "candidate_config": "final-sql-async-checkpoint-1s-healthy",
+    "workload": "sql_read_local",
+    "baseline": {
+      "ops_per_sec": 10259.922306738332,
+      "p50_ms": 1.3325,
+      "p95_ms": 2.613792,
+      "p99_ms": 7.25725,
+      "s3_http_requests": 81
+    },
+    "candidate": {
+      "ops_per_sec": 8132.80876716785,
+      "p50_ms": 1.404125,
+      "p95_ms": 3.573208,
+      "p99_ms": 9.85975,
+      "s3_http_requests": 77
+    },
+    "delta_percent": {
+      "ops_per_sec": -20.732257769373877,
+      "p50_ms": 5.3752345215759885,
+      "p95_ms": 36.70590467795448,
+      "p99_ms": 35.86069103310482,
+      "s3_http_requests": -4.938271604938271
+    }
+  },
+  {
+    "baseline_config": "current-sql-live-recovery-checkpoint-1s",
+    "candidate_config": "final-sql-async-checkpoint-1s-healthy",
+    "workload": "sql_write",
+    "baseline": {
+      "ops_per_sec": 552.3013255734407,
+      "p50_ms": 16.709292,
+      "p95_ms": 55.448083,
+      "p99_ms": 61.582042,
+      "s3_http_requests": 12
+    },
+    "candidate": {
+      "ops_per_sec": 914.974469421631,
+      "p50_ms": 10.493125,
+      "p95_ms": 47.739584,
+      "p99_ms": 49.261709,
+      "s3_http_requests": 71
+    },
+    "delta_percent": {
+      "ops_per_sec": 65.6658108635962,
+      "p50_ms": -37.201857505392816,
+      "p95_ms": -13.90219207398026,
+      "p99_ms": -20.00637296177999,
+      "s3_http_requests": 491.6666666666667
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-healthy",
+    "candidate_config": "final-sql-async-healthy",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 7983.418439900326,
+      "p50_ms": 1.72,
+      "p95_ms": 3.321209,
+      "p99_ms": 8.705166,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 6551.0014427467,
+      "p50_ms": 2.147333,
+      "p95_ms": 4.309916,
+      "p99_ms": 8.148292,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -17.942401590708926,
+      "p50_ms": 24.844941860465127,
+      "p95_ms": 29.76949056804315,
+      "p99_ms": -6.397052049323363,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-healthy",
+    "candidate_config": "final-sql-async-healthy",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 11421.919563689982,
+      "p50_ms": 1.208333,
+      "p95_ms": 2.188666,
+      "p99_ms": 6.111167,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7732.693647797858,
+      "p50_ms": 1.641916,
+      "p95_ms": 3.604959,
+      "p99_ms": 8.363375,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -32.29952632147829,
+      "p50_ms": 35.88274093316989,
+      "p95_ms": 64.71033040217192,
+      "p99_ms": 36.85397568091331,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-healthy",
+    "candidate_config": "final-sql-async-healthy",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 1100.3067104955505,
+      "p50_ms": 12.867041,
+      "p95_ms": 23.394667,
+      "p99_ms": 26.795125,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 869.799685132514,
+      "p50_ms": 9.3665,
+      "p95_ms": 37.86075,
+      "p99_ms": 44.980167,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -20.949342866337872,
+      "p50_ms": -27.205485705687888,
+      "p95_ms": 61.83496007872223,
+      "p99_ms": 67.86697953452355,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-healthy",
+    "candidate_config": "final-sql-async-healthy",
+    "workload": "sql_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8863.447485584866,
+      "p50_ms": 1.577833,
+      "p95_ms": 2.900208,
+      "p99_ms": 7.113708,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 6458.368147974131,
+      "p50_ms": 2.152542,
+      "p95_ms": 4.454167,
+      "p99_ms": 7.835917,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -27.134806648567096,
+      "p50_ms": 36.42394347183763,
+      "p95_ms": 53.58095005599598,
+      "p99_ms": 10.152356548792843,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-healthy",
+    "candidate_config": "final-sql-async-healthy",
+    "workload": "sql_read_local",
+    "baseline": {
+      "ops_per_sec": 11173.02830966048,
+      "p50_ms": 1.263958,
+      "p95_ms": 2.1785,
+      "p99_ms": 5.905583,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 10236.33999581559,
+      "p50_ms": 1.343542,
+      "p95_ms": 2.276917,
+      "p99_ms": 9.266167,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -8.383477494950998,
+      "p50_ms": 6.296411747858718,
+      "p95_ms": 4.51764975900849,
+      "p99_ms": 56.90520309341176,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-healthy",
+    "candidate_config": "final-sql-async-healthy",
+    "workload": "sql_write",
+    "baseline": {
+      "ops_per_sec": 766.2355720619385,
+      "p50_ms": 12.331583,
+      "p95_ms": 47.296,
+      "p99_ms": 52.835708,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 1054.6163780721251,
+      "p50_ms": 11.787792,
+      "p95_ms": 31.743916,
+      "p99_ms": 35.101458,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": 37.63605039037205,
+      "p50_ms": -4.409742042039539,
+      "p95_ms": -32.88245094722598,
+      "p99_ms": -33.56489516521667,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-one-fault",
+    "candidate_config": "final-sql-async-one-fault",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8329.417327188767,
+      "p50_ms": 1.673667,
+      "p95_ms": 2.892292,
+      "p99_ms": 8.523458,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5642.528868588323,
+      "p50_ms": 2.176292,
+      "p95_ms": 5.073542,
+      "p99_ms": 12.567208,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -32.257820121822206,
+      "p50_ms": 30.031362272184374,
+      "p95_ms": 75.41596768237785,
+      "p99_ms": 47.44259900148509,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-one-fault",
+    "candidate_config": "final-sql-async-one-fault",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 11404.39411305176,
+      "p50_ms": 1.197,
+      "p95_ms": 2.174209,
+      "p99_ms": 7.337709,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 10102.540789008435,
+      "p50_ms": 1.344292,
+      "p95_ms": 2.44975,
+      "p99_ms": 7.6335,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -11.415365964540092,
+      "p50_ms": 12.305096073517124,
+      "p95_ms": 12.673160675905585,
+      "p99_ms": 4.031108347305671,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-one-fault",
+    "candidate_config": "final-sql-async-one-fault",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 1086.1502676730443,
+      "p50_ms": 8.062208,
+      "p95_ms": 29.212917,
+      "p99_ms": 31.417667,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 649.9988924018872,
+      "p50_ms": 15.062375,
+      "p95_ms": 49.764791,
+      "p99_ms": 54.479958,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -40.15571217466646,
+      "p50_ms": 86.82692135950846,
+      "p95_ms": 70.35200901026077,
+      "p99_ms": 73.40548551870512,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-one-fault",
+    "candidate_config": "final-sql-async-one-fault",
+    "workload": "sql_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8507.467655182229,
+      "p50_ms": 1.645,
+      "p95_ms": 2.8505,
+      "p99_ms": 6.7935,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 6699.273504653988,
+      "p50_ms": 2.165666,
+      "p95_ms": 3.860875,
+      "p99_ms": 9.550583,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -21.2541995317114,
+      "p50_ms": 31.651428571428564,
+      "p95_ms": 35.44553587089985,
+      "p99_ms": 40.58413189077795,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-one-fault",
+    "candidate_config": "final-sql-async-one-fault",
+    "workload": "sql_read_local",
+    "baseline": {
+      "ops_per_sec": 11192.4951007371,
+      "p50_ms": 1.220625,
+      "p95_ms": 2.326208,
+      "p99_ms": 7.0585,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 9133.104782257145,
+      "p50_ms": 1.538875,
+      "p95_ms": 2.771417,
+      "p99_ms": 8.513666,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -18.39974286291472,
+      "p50_ms": 26.072708653353803,
+      "p95_ms": 19.138830233581874,
+      "p99_ms": 20.615796557342215,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-async-one-fault",
+    "candidate_config": "final-sql-async-one-fault",
+    "workload": "sql_write",
+    "baseline": {
+      "ops_per_sec": 892.4381511133929,
+      "p50_ms": 8.58625,
+      "p95_ms": 34.596625,
+      "p99_ms": 51.097417,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 632.9681432070676,
+      "p50_ms": 16.569375,
+      "p95_ms": 55.597041,
+      "p99_ms": 57.455208,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -29.074284596934174,
+      "p50_ms": 92.97568787305286,
+      "p95_ms": 60.700764886748324,
+      "p99_ms": 12.442489999054157,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-healthy",
+    "candidate_config": "final-sql-before-ack-healthy",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8309.826288981405,
+      "p50_ms": 1.727083,
+      "p95_ms": 3.022208,
+      "p99_ms": 6.711958,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 6055.39475118383,
+      "p50_ms": 2.269875,
+      "p95_ms": 4.185125,
+      "p99_ms": 11.812625,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -27.129707161109827,
+      "p50_ms": 31.428252145380387,
+      "p95_ms": 38.47905240142307,
+      "p99_ms": 75.99372642081491,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-healthy",
+    "candidate_config": "final-sql-before-ack-healthy",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 11114.265339614494,
+      "p50_ms": 1.185875,
+      "p95_ms": 2.642375,
+      "p99_ms": 5.990167,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 9417.418879860556,
+      "p50_ms": 1.418125,
+      "p95_ms": 2.689458,
+      "p99_ms": 8.286333,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -15.267284052557944,
+      "p50_ms": 19.584694845578166,
+      "p95_ms": 1.781843985051335,
+      "p99_ms": 38.33225350812425,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-healthy",
+    "candidate_config": "final-sql-before-ack-healthy",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 573.3755911143985,
+      "p50_ms": 18.432375,
+      "p95_ms": 45.816458,
+      "p99_ms": 45.959917,
+      "s3_http_requests": 85
+    },
+    "candidate": {
+      "ops_per_sec": 455.1955752113254,
+      "p50_ms": 26.542375,
+      "p95_ms": 60.091958,
+      "p99_ms": 71.222833,
+      "s3_http_requests": 80
+    },
+    "delta_percent": {
+      "ops_per_sec": -20.611274308587394,
+      "p50_ms": 43.998670816972854,
+      "p95_ms": 31.15801749668209,
+      "p99_ms": 54.96727942306771,
+      "s3_http_requests": -5.88235294117647
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-healthy",
+    "candidate_config": "final-sql-before-ack-healthy",
+    "workload": "sql_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8936.097936845325,
+      "p50_ms": 1.584875,
+      "p95_ms": 3.060541,
+      "p99_ms": 6.826917,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 5718.980736030876,
+      "p50_ms": 2.456375,
+      "p95_ms": 4.426125,
+      "p99_ms": 10.700208,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -36.001364617431385,
+      "p50_ms": 54.988563766858576,
+      "p95_ms": 44.61903957502937,
+      "p99_ms": 56.73558064350277,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-healthy",
+    "candidate_config": "final-sql-before-ack-healthy",
+    "workload": "sql_read_local",
+    "baseline": {
+      "ops_per_sec": 11342.122805541676,
+      "p50_ms": 1.13925,
+      "p95_ms": 2.46375,
+      "p99_ms": 9.514959,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 6890.332604967758,
+      "p50_ms": 1.850917,
+      "p95_ms": 4.035875,
+      "p99_ms": 17.598375,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -39.25006171154139,
+      "p50_ms": 62.46802721088434,
+      "p95_ms": 63.810248604769136,
+      "p99_ms": 84.95481693615288,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-healthy",
+    "candidate_config": "final-sql-before-ack-healthy",
+    "workload": "sql_write",
+    "baseline": {
+      "ops_per_sec": 688.0424246959067,
+      "p50_ms": 15.363458,
+      "p95_ms": 38.439042,
+      "p99_ms": 57.9955,
+      "s3_http_requests": 85
+    },
+    "candidate": {
+      "ops_per_sec": 495.419436114985,
+      "p50_ms": 26.5005,
+      "p95_ms": 62.193292,
+      "p99_ms": 62.2295,
+      "s3_http_requests": 105
+    },
+    "delta_percent": {
+      "ops_per_sec": -27.99580108247759,
+      "p50_ms": 72.49046406089046,
+      "p95_ms": 61.79719567412736,
+      "p99_ms": 7.30056642325698,
+      "s3_http_requests": 23.52941176470588
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-one-fault",
+    "candidate_config": "final-sql-before-ack-one-fault",
+    "workload": "kv_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8204.230603398026,
+      "p50_ms": 1.563875,
+      "p95_ms": 2.929,
+      "p99_ms": 10.824084,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7506.375746665764,
+      "p50_ms": 1.871333,
+      "p95_ms": 3.627625,
+      "p99_ms": 7.79825,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -8.506036586090401,
+      "p50_ms": 19.66001119015267,
+      "p95_ms": 23.851997268692397,
+      "p99_ms": -27.954642628420096,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-one-fault",
+    "candidate_config": "final-sql-before-ack-one-fault",
+    "workload": "kv_read_local",
+    "baseline": {
+      "ops_per_sec": 11220.946472921018,
+      "p50_ms": 1.205375,
+      "p95_ms": 2.176292,
+      "p99_ms": 5.904084,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 10297.901080771928,
+      "p50_ms": 1.362708,
+      "p95_ms": 2.498292,
+      "p99_ms": 6.497125,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -8.22609210708412,
+      "p50_ms": 13.052618479726222,
+      "p95_ms": 14.795808650677392,
+      "p99_ms": 10.044589473997991,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-one-fault",
+    "candidate_config": "final-sql-before-ack-one-fault",
+    "workload": "kv_write",
+    "baseline": {
+      "ops_per_sec": 633.6319120956872,
+      "p50_ms": 18.8615,
+      "p95_ms": 37.842291,
+      "p99_ms": 45.290166,
+      "s3_http_requests": 100
+    },
+    "candidate": {
+      "ops_per_sec": 702.9234586645861,
+      "p50_ms": 17.833666,
+      "p95_ms": 30.240542,
+      "p99_ms": 38.889375,
+      "s3_http_requests": 65
+    },
+    "delta_percent": {
+      "ops_per_sec": 10.935615022880175,
+      "p50_ms": -5.449375712430076,
+      "p95_ms": -20.087972475028007,
+      "p99_ms": -14.132849502030966,
+      "s3_http_requests": -35
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-one-fault",
+    "candidate_config": "final-sql-before-ack-one-fault",
+    "workload": "sql_read_linearizable",
+    "baseline": {
+      "ops_per_sec": 8782.82815867103,
+      "p50_ms": 1.616792,
+      "p95_ms": 2.88025,
+      "p99_ms": 7.169333,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 7305.689214154408,
+      "p50_ms": 1.907875,
+      "p95_ms": 3.657583,
+      "p99_ms": 9.056416,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -16.818488507694266,
+      "p50_ms": 18.003738266889,
+      "p95_ms": 26.9883864247895,
+      "p99_ms": 26.321597839017947,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-one-fault",
+    "candidate_config": "final-sql-before-ack-one-fault",
+    "workload": "sql_read_local",
+    "baseline": {
+      "ops_per_sec": 11763.125886961747,
+      "p50_ms": 1.141041,
+      "p95_ms": 2.187666,
+      "p99_ms": 6.959375,
+      "s3_http_requests": 0
+    },
+    "candidate": {
+      "ops_per_sec": 8702.759452691464,
+      "p50_ms": 1.406875,
+      "p95_ms": 2.869292,
+      "p99_ms": 8.894375,
+      "s3_http_requests": 0
+    },
+    "delta_percent": {
+      "ops_per_sec": -26.016608711655415,
+      "p50_ms": 23.29749763593071,
+      "p95_ms": 31.15768129138543,
+      "p99_ms": 27.804220925011236,
+      "s3_http_requests": null
+    }
+  },
+  {
+    "baseline_config": "current-sql-before-ack-one-fault",
+    "candidate_config": "final-sql-before-ack-one-fault",
+    "workload": "sql_write",
+    "baseline": {
+      "ops_per_sec": 694.0923757270288,
+      "p50_ms": 14.159,
+      "p95_ms": 41.72,
+      "p99_ms": 51.180417,
+      "s3_http_requests": 65
+    },
+    "candidate": {
+      "ops_per_sec": 611.1109155556181,
+      "p50_ms": 16.889625,
+      "p95_ms": 41.914709,
+      "p99_ms": 59.669042,
+      "s3_http_requests": 65
+    },
+    "delta_percent": {
+      "ops_per_sec": -11.95539139649697,
+      "p50_ms": 19.285436824634495,
+      "p95_ms": 0.4667042186001993,
+      "p99_ms": 16.58568940538331,
+      "s3_http_requests": 0
+    }
+  }
+]

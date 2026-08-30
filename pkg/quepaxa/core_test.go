@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,12 +19,49 @@ type mockTransport struct {
 	sendDecisionCalls int
 	sendDecisionErr   error
 	sendDecision      func(context.Context, Decision) error
+	stageCalls        atomic.Uint64
+	inlineValues      atomic.Uint64
 }
 
 type cancelReadTransport struct {
 	mockTransport
 	started  chan struct{}
 	canceled chan struct{}
+}
+
+type phaseFaultTransport struct {
+	cores  map[NodeID]*Core
+	n2Down atomic.Bool
+}
+
+func (t *phaseFaultTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
+	if to == "n2" {
+		if request.Step != 4 || t.n2Down.Load() {
+			return Summary{}, errors.New("n2 down")
+		}
+		summary, err := t.cores[to].Record(ctx, request)
+		t.n2Down.Store(true)
+		return summary, err
+	}
+	if to == "n3" && request.Step == 4 {
+		return Summary{}, errors.New("n3 missed first record")
+	}
+	return t.cores[to].Record(ctx, request)
+}
+
+func (t *phaseFaultTransport) SendDecision(context.Context, Decision) error { return nil }
+func (t *phaseFaultTransport) ReadTip(context.Context, NodeID) (Slot, error) {
+	return 0, errors.New("not used")
+}
+func (t *phaseFaultTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	return errors.New("not used")
+}
+func (t *phaseFaultTransport) FetchValue(_ context.Context, from NodeID, hash ValueHash) ([]byte, error) {
+	value, ok := t.cores[from].Value(hash)
+	if !ok {
+		return nil, errors.New("value unavailable")
+	}
+	return value, nil
 }
 
 func (t *cancelReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, error) {
@@ -36,6 +75,9 @@ func (t *cancelReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, err
 }
 
 func (m *mockTransport) SendRecord(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
+	if len(request.Proposal.Value) != 0 {
+		m.inlineValues.Add(1)
+	}
 	return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
 }
 
@@ -47,8 +89,11 @@ func (m *mockTransport) SendDecision(ctx context.Context, decision Decision) err
 	return m.sendDecisionErr
 }
 
-func (m *mockTransport) ReadTip(context.Context, NodeID) (Slot, error)               { return 0, nil }
-func (m *mockTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error { return nil }
+func (m *mockTransport) ReadTip(context.Context, NodeID) (Slot, error) { return 0, nil }
+func (m *mockTransport) StageValue(context.Context, NodeID, ValueHash, []byte) error {
+	m.stageCalls.Add(1)
+	return nil
+}
 func (m *mockTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
 	return nil, errors.New("value unavailable")
 }
@@ -75,7 +120,8 @@ func TestCorePropose(t *testing.T) {
 		},
 	}
 
-	core := newCore("node-1", config, wal, &mockTransport{})
+	transport := &mockTransport{}
+	core := newCore("node-1", config, wal, transport)
 
 	// Propose a value
 	slot, receipts, err := core.Propose(context.Background(), []byte("CREATE TABLE test (id INT)"))
@@ -94,6 +140,37 @@ func TestCorePropose(t *testing.T) {
 	// Check quorum
 	if !core.IsQuorum(receipts) {
 		t.Error("expected quorum to be reached")
+	}
+	if got := transport.stageCalls.Load(); got != 0 {
+		t.Fatalf("normal proposal used %d separate StageValue RPCs", got)
+	}
+	if got := transport.inlineValues.Load(); got == 0 {
+		t.Fatal("first Record round omitted the proposal value")
+	}
+}
+
+func TestSlowPathSurvivesLossOfInitialValueHolder(t *testing.T) {
+	cores, _ := newTestCluster(t)
+	transport := &phaseFaultTransport{cores: cores}
+	cores["n1"].transport = transport
+	cores["n2"].transport = transport
+	cores["n3"].transport = transport
+
+	seed := newProposal(Priority{31: 1}, "n2", []byte("n2 slow-path seed"))
+	if _, err := cores["n2"].Record(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: seed}); err != nil {
+		t.Fatal(err)
+	}
+	offered := []byte("n1 offered value")
+	decision, err := cores["n1"].runSlot(context.Background(), 1, offered, true)
+	if err != nil {
+		t.Fatalf("slow path lost quorum after n2 failed: %v", err)
+	}
+	if decision.Step != 6 || !bytes.Equal(decision.Proposal.Value, offered) {
+		t.Fatalf("slow-path decision=%+v, want n1 value at phase 2", decision)
+	}
+	hash := sha256.Sum256(offered)
+	if value, ok := cores["n3"].Value(hash); !ok || !bytes.Equal(value, offered) {
+		t.Fatalf("n3 did not receive the value after missing phase 0: %q ok=%v", value, ok)
 	}
 }
 
@@ -124,8 +201,9 @@ func TestCompleteDecisionRetriesLearnerQuorum(t *testing.T) {
 	transport := &mockTransport{sendDecisionErr: errors.New("learners unavailable")}
 	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
 	value := []byte("retry learner dissemination")
-	if _, _, err := core.Propose(context.Background(), value); !errors.Is(err, ErrQuorumUnavailable) {
-		t.Fatalf("first proposal error=%v, want quorum unavailable", err)
+	failedSlot, _, err := core.Propose(context.Background(), value)
+	if !errors.Is(err, ErrQuorumUnavailable) || failedSlot != 1 {
+		t.Fatalf("first proposal slot=%d error=%v, want slot 1 with quorum unavailable", failedSlot, err)
 	}
 	slot, ok := core.DecidedSlot(value)
 	if !ok {
@@ -354,6 +432,15 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	if err := core.CompactThrough(3, root); err != nil {
 		t.Fatal(err)
 	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryProposal {
+			t.Fatalf("compacted decided suffix retained duplicate proposal payload for %x", entry.Hash[:8])
+		}
+	}
 	if _, ok := core.preparedCheckpoints[1]; ok {
 		t.Fatal("compaction retained obsolete prepared checkpoint")
 	}
@@ -380,6 +467,9 @@ func TestCertifiedCompactionRestartsFromBaseAndSuffix(t *testing.T) {
 	}
 	if recovered.Tip() != 6 {
 		t.Fatalf("recovered tip=%d, want 6", recovered.Tip())
+	}
+	if got := len(recovered.values); got != 3 {
+		t.Fatalf("recovered live values=%d, want 3 suffix values", got)
 	}
 	if got, ok := recovered.PrefixHash(5); !ok || got != wantPrefix {
 		t.Fatal("recovered suffix prefix hash mismatch")
@@ -452,13 +542,14 @@ func TestCompactionPreservesFollowingEpochLeaderOrder(t *testing.T) {
 	}
 }
 
-func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
+func testCheckpointRecoveryBase(t *testing.T) (*Core, CheckpointSeal, DecidedValue) {
+	t.Helper()
 	config := &Cluster{ConfigID: 12, Members: []Member{{ID: "n1"}}}
 	sourceWAL, err := qlog.Open(t.TempDir() + "/source")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sourceWAL.Close()
+	t.Cleanup(func() { _ = sourceWAL.Close() })
 	source := newCore("n1", config, sourceWAL, nil)
 	for i := 1; i <= 5; i++ {
 		if _, _, err := source.Propose(context.Background(), []byte(fmt.Sprintf("value-%d", i))); err != nil {
@@ -490,7 +581,20 @@ func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
 	if !ok {
 		t.Fatal("checkpoint decision is unavailable")
 	}
+	return source, seal, baseDecision
+}
+
+func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
+	source, seal, baseDecision := testCheckpointRecoveryBase(t)
+	config := source.config
 	first, _ := source.CertifiedValue(1)
+	if _, _, err := source.Propose(context.Background(), []byte("retained suffix")); err != nil {
+		t.Fatal(err)
+	}
+	suffix, ok := source.CertifiedValue(7)
+	if !ok {
+		t.Fatal("suffix decision is unavailable")
+	}
 
 	targetWAL, err := qlog.Open(t.TempDir() + "/target")
 	if err != nil {
@@ -498,9 +602,10 @@ func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
 	}
 	defer targetWAL.Close()
 	target := newCore("n1", config, targetWAL, nil)
-	if err := target.AcceptCertifiedValues([]DecidedValue{first}); err != nil {
+	if err := target.AcceptCertifiedValues([]DecidedValue{first, suffix, baseDecision}); err != nil {
 		t.Fatal(err)
 	}
+	target.releaseSlot(2)
 	target.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
 	failingWAL, err := qlog.Open(t.TempDir() + "/failing-target")
 	if err != nil {
@@ -518,14 +623,405 @@ func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
 	if failing.Tip() != 0 || failing.CompactionFloor() != 0 {
 		t.Fatalf("failed restore changed memory state: tip=%d floor=%d", failing.Tip(), failing.CompactionFloor())
 	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	woken := make(chan error, 1)
+	go func() { woken <- target.WaitTip(waitCtx, 7) }()
 	if err := target.RestoreCheckpointBase(context.Background(), seal, baseDecision); err != nil {
 		t.Fatal(err)
 	}
-	if target.Tip() != 5 || target.CompactionFloor() != 5 {
-		t.Fatalf("tip=%d floor=%d, want 5/5", target.Tip(), target.CompactionFloor())
+	if target.Tip() != 7 || target.CompactionFloor() != 5 {
+		t.Fatalf("tip=%d floor=%d, want 7/5", target.Tip(), target.CompactionFloor())
 	}
-	if err := target.AcceptCertifiedValues([]DecidedValue{baseDecision}); err != nil {
+	select {
+	case err := <-woken:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint base did not wake a retained-suffix waiter")
+	}
+	target.slotMu.Lock()
+	for _, slot := range target.vacant {
+		if slot <= 5 {
+			target.slotMu.Unlock()
+			t.Fatalf("checkpoint base retained compacted vacant slot %d", slot)
+		}
+	}
+	target.slotMu.Unlock()
+}
+
+func TestRestoreCheckpointBasePreservesUnresolvedRecorderValue(t *testing.T) {
+	source, seal, baseDecision := testCheckpointRecoveryBase(t)
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
 		t.Fatal(err)
+	}
+	target := newCore("n1", source.config, wal, nil)
+	target.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := target.AcceptCertifiedValue(baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	proposal := newProposal(Priority{31: 1}, "n1", []byte("unresolved recorder value"))
+	if _, err := target.Record(context.Background(), RecordRequest{Slot: 20, Step: 4, Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.RestoreCheckpointBase(context.Background(), seal, baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", source.config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := recovered.Value(proposal.Hash); !ok || !bytes.Equal(value, proposal.Value) {
+		t.Fatalf("recovered unresolved value=%q ok=%v", value, ok)
+	}
+	if err := recovered.RecoverThrough(context.Background(), 20); err != nil {
+		t.Fatalf("recover unresolved recorder state: %v", err)
+	}
+	decision, ok := recovered.CertifiedValue(20)
+	if !ok || !bytes.Equal(decision.Value, proposal.Value) {
+		t.Fatalf("recovered slot 20 value=%q ok=%v", decision.Value, ok)
+	}
+}
+
+func TestRestoreCheckpointBasePreservesUnloggedHintValue(t *testing.T) {
+	source, seal, baseDecision := testCheckpointRecoveryBase(t)
+	if _, _, err := source.Propose(context.Background(), []byte("hint-only decision")); err != nil {
+		t.Fatal(err)
+	}
+	hint, ok := source.CertifiedValue(7)
+	if !ok {
+		t.Fatal("hint decision is unavailable")
+	}
+	decision, err := decodeDecision(hint.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision.Proposal.Value = hint.Value
+
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newCore("n1", source.config, wal, nil)
+	target.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	if err := target.AcceptCertifiedValue(baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Record(context.Background(), RecordRequest{Slot: decision.Slot, Step: decision.Step, Proposal: decision.Proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AcceptCertifiedHints([]DecidedValue{hint}); err != nil {
+		t.Fatal(err)
+	}
+	if target.logged[hint.Slot] {
+		t.Fatal("hint unexpectedly reached the decision WAL")
+	}
+	if err := target.RestoreCheckpointBase(context.Background(), seal, baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", source.config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := recovered.Value(hint.Hash); !ok || !bytes.Equal(value, hint.Value) {
+		t.Fatalf("recovered hint value=%q ok=%v", value, ok)
+	}
+	if err := recovered.RecoverThrough(context.Background(), hint.Slot); err != nil {
+		t.Fatalf("recover hint recorder state: %v", err)
+	}
+}
+
+func TestCompactionRewritesValueReusedAcrossFloors(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Cluster{ConfigID: 13, Members: []Member{{ID: "n1"}}}
+	core := newCore("n1", config, wal, nil)
+	for i := 1; i <= 5; i++ {
+		if _, _, err := core.Propose(context.Background(), []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reused, ok := core.CertifiedValue(5)
+	if !ok {
+		t.Fatal("reused decision is unavailable")
+	}
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	prepare := func(index Slot, name string) [32]byte {
+		prefix, _ := core.PrefixHash(index)
+		next, following, err := core.CheckpointLeaderOrders(index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root := sha256.Sum256([]byte(name))
+		seal := CheckpointSeal{ConfigID: config.ConfigID, Index: index, RootHash: root, StateHash: sha256.Sum256([]byte(name + "-state")), PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following}
+		if err := core.PrepareCheckpoint(context.Background(), seal); err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := EncodeCheckpointSeal(seal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := core.Propose(context.Background(), encoded); err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+	if err := core.CompactThrough(3, prepare(3, "first-floor")); err != nil {
+		t.Fatal(err)
+	}
+	proposal := newProposal(Priority{31: 1}, "n1", reused.Value)
+	if _, err := core.Record(context.Background(), RecordRequest{Slot: 20, Step: 4, Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.CompactThrough(5, prepare(5, "second-floor")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := recovered.Value(reused.Hash); !ok || !bytes.Equal(value, reused.Value) {
+		t.Fatalf("recovered reused value=%q ok=%v", value, ok)
+	}
+	if err := recovered.RecoverThrough(context.Background(), 20); err != nil {
+		t.Fatalf("recover reused recorder state: %v", err)
+	}
+}
+
+func TestCompactionRetainsHashReusedAfterFence(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := []byte("reused after compaction fence")
+	hash := sha256.Sum256(value)
+	core := newCore("n1", &Cluster{ConfigID: 14, Members: []Member{{ID: "n1"}}}, wal, nil)
+	if err := core.StoreValue(hash, value); err != nil {
+		t.Fatal(err)
+	}
+	core.mu.Lock()
+	plan, err := core.beginCompactionLocked(qlog.Entry{Slot: 1, Type: qlog.EntryCheckpoint, Hash: [32]byte{1}, Payload: []byte("base")}, nil)
+	core.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Abort()
+	finished := false
+	defer func() {
+		if !finished {
+			core.finishCompaction()
+		}
+	}()
+	if err := core.StageValue(hash, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	core.finishCompaction()
+	finished = true
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryProposal && entry.Hash == hash && bytes.Equal(entry.Payload, value) {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("reused proposal count=%d, want 1", count)
+	}
+}
+
+func TestCompactionDoesNotDuplicateLoggedSuffixReusedAfterFence(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Cluster{ConfigID: 15, Members: []Member{{ID: "n1"}}}
+	core := newCore("n1", config, wal, nil)
+	if _, _, err := core.Propose(context.Background(), []byte("base")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(context.Background(), []byte("logged suffix")); err != nil {
+		t.Fatal(err)
+	}
+	suffix, ok := core.CertifiedValue(2)
+	if !ok {
+		t.Fatal("logged suffix is unavailable")
+	}
+	prefix, _ := core.PrefixHash(1)
+	next, following, err := core.CheckpointLeaderOrders(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := sha256.Sum256([]byte("fence-root"))
+	base := consensusBase{ConfigID: config.ConfigID, ClosedThrough: 1, PrefixHash: prefix, RecoveryRoot: root, LeaderEpoch: leaderEpoch(2), NextLeaderOrder: next, FollowingLeaderOrder: following}
+	payload, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.mu.Lock()
+	plan, err := core.beginCompactionLocked(qlog.Entry{Slot: 1, Type: qlog.EntryCheckpoint, Hash: root, Payload: payload}, nil)
+	core.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Abort()
+	finished := false
+	defer func() {
+		if !finished {
+			core.finishCompaction()
+		}
+	}()
+	proposal := newProposal(Priority{31: 1}, "n1", suffix.Value)
+	if _, err := core.Record(context.Background(), RecordRequest{Slot: 20, Step: 4, Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	core.finishCompaction()
+	finished = true
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryProposal && entry.Hash == suffix.Hash {
+			t.Fatal("logged suffix was duplicated as a raw proposal")
+		}
+	}
+	recovered := newCore("n1", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverThrough(context.Background(), 20); err != nil {
+		t.Fatalf("recover reused suffix recorder state: %v", err)
+	}
+}
+
+func TestRestoreCheckpointBaseDropsProposalDuplicatedByDecidedSuffix(t *testing.T) {
+	source, seal, baseDecision := testCheckpointRecoveryBase(t)
+	if _, _, err := source.Propose(context.Background(), []byte("retained slot 7")); err != nil {
+		t.Fatal(err)
+	}
+	shared := []byte("decided suffix also held by unresolved recorder")
+	if _, _, err := source.Propose(context.Background(), shared); err != nil {
+		t.Fatal(err)
+	}
+	slot7, ok := source.CertifiedValue(7)
+	if !ok {
+		t.Fatal("slot 7 decision is unavailable")
+	}
+	slot8, ok := source.CertifiedValue(8)
+	if !ok {
+		t.Fatal("slot 8 decision is unavailable")
+	}
+
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newCore("n1", source.config, wal, nil)
+	target.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	proposal := newProposal(Priority{31: 1}, "n1", shared)
+	if err := target.StageValue(proposal.Hash, proposal.Value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := target.Record(context.Background(), RecordRequest{Slot: 20, Step: 4, Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.AcceptCertifiedValues([]DecidedValue{baseDecision, slot7, slot8}); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.RestoreCheckpointBase(context.Background(), seal, baseDecision); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Type == qlog.EntryProposal && entry.Hash == proposal.Hash {
+			t.Fatal("compacted WAL retained proposal already carried by decided suffix")
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n1", source.config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := recovered.Value(proposal.Hash); !ok || !bytes.Equal(value, proposal.Value) {
+		t.Fatalf("recovered decided value=%q ok=%v", value, ok)
+	}
+	if err := recovered.RecoverThrough(context.Background(), 20); err != nil {
+		t.Fatalf("recover unresolved recorder state: %v", err)
 	}
 }
 
@@ -764,6 +1260,23 @@ func TestCoreDoesNotReuseFastPathPriorityAfterCanceledSlot(t *testing.T) {
 	}
 }
 
+func TestSlowPathDrawsOnePriorityPerRound(t *testing.T) {
+	cores, _ := newTestCluster(t)
+	core := cores["n1"]
+	core.releaseSlot(1)
+	draws := 0
+	core.priority = func() (Priority, error) {
+		draws++
+		return Priority{1}, nil
+	}
+	if _, _, err := core.Propose(context.Background(), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if draws != 1 {
+		t.Fatalf("priority draws=%d, want 1 per proposal round", draws)
+	}
+}
+
 func TestCoreReservesEpochBoundaryForAgreedSchedule(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -868,6 +1381,43 @@ func TestDecisionsFromStopsAtGap(t *testing.T) {
 	}
 	if tip != 0 || len(decisions) != 0 {
 		t.Fatalf("exposed non-contiguous decision: tip=%d decisions=%+v", tip, decisions)
+	}
+}
+
+func TestCompleteDecisionWaitsForContiguousPrefix(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n1", &Cluster{Members: []Member{{ID: "n1"}}}, wal, nil)
+	decision := func(slot Slot, value string) Decision {
+		proposal := newProposal(highestPriority, "n1", []byte(value))
+		return Decision{Slot: slot, Step: 4, Proposal: proposal, Summaries: []Summary{{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)}}}
+	}
+	if err := core.AcceptDecision(decision(2, "two")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := core.CompleteDecision(context.Background(), 2)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("slot 2 completed before slot 1: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := core.AcceptDecision(decision(1, "one")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slot 2 did not complete after prefix became contiguous")
 	}
 }
 

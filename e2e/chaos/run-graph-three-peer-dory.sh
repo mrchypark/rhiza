@@ -102,11 +102,12 @@ while curl -fsS --max-time 1 "$node0/ready" >/dev/null 2>&1 || \
   sleep 0.25
 done
 status=000
+unknown_response="$tmp_dir/no-quorum.json"
 deadline=$((SECONDS + 15))
 while [[ "$status" == 000 ]]; do
-  status="$(curl -sS --max-time 6 -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d \
-    "{\"request_id\":\"no-quorum-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'rejected', value: 'fault'})\"}" \
-    "$node1/graph/execute" 2>/dev/null || true)"
+  status="$(curl -sS --max-time 6 -o "$unknown_response" -w '%{http_code}' -H 'Content-Type: application/json' -d \
+	"{\"request_id\":\"no-quorum-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'uncertain', value: 'fault'})\"}" \
+	"$node1/graph/execute" 2>/dev/null || true)"
   (( SECONDS < deadline )) || break
   [[ "$status" != 000 ]] || sleep 0.25
 done
@@ -114,6 +115,9 @@ if [[ "$status" != 503 ]]; then
   echo "FAIL: graph peers=3 failed=2 expected-status=503 actual-status=$status" >&2
   exit 1
 fi
+jq -e --arg request_id "no-quorum-${suffix}" \
+  '.code == "commit_unknown" and .request_id == $request_id and .slot > 0 and .retry_through_slot >= .slot' \
+  "$unknown_response" >/dev/null
 dory k8s wait podchaos/"$two_failures" -n rhiza-graph-3peer-e2e --for=condition=AllRecovered=True --timeout=90s
 dory k8s delete podchaos/"$two_failures" -n rhiza-graph-3peer-e2e --wait=true >/dev/null
 dory k8s delete pod rhiza-graph-0 rhiza-graph-2 -n rhiza-graph-3peer-e2e --wait=true >/dev/null
@@ -124,6 +128,11 @@ deadline=$((SECONDS + 90))
 until curl -fsS "$node1/ready" >/dev/null 2>&1; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
+done
+deadline=$((SECONDS + 30))
+until post "$node1/graph/execute" "{\"request_id\":\"no-quorum-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'uncertain', value: 'fault'})\"}" 2>/dev/null; do
+  (( SECONDS < deadline )) || exit 1
+  sleep 0.25
 done
 deadline=$((SECONDS + 30))
 until post "$node1/graph/execute" "{\"request_id\":\"after-${suffix}\",\"cypher\":\"CREATE (:${label} {id: 'after', value: 'fault'})\"}" 2>/dev/null; do
@@ -150,9 +159,10 @@ done
 deadline=$((SECONDS + 90))
 until result="$(curl -fsS --max-time 10 -H 'Content-Type: application/json' -d \
   "{\"cypher\":\"MATCH (n:${label}) RETURN n.id\",\"consistency\":\"linearizable\"}" \
-  "$node0/graph/query" 2>/dev/null)" && [[ "$result" == *before* && "$result" == *during* && "$result" == *after* && "$result" != *rejected* ]]; do
+  "$node0/graph/query" 2>/dev/null)" && [[ "$result" == *before* && "$result" == *during* && "$result" == *uncertain* && "$result" == *after* ]] && \
+  jq -e '[.rows[] | select(.[0] == "uncertain")] | length == 1' <<<"$result" >/dev/null; do
   (( SECONDS < deadline )) || exit 1
   sleep 0.5
 done
 
-printf 'PASS: graph peers=3 failed=1 quorum-write=%ss converged=true; failed=2 write-status=%s recovered-write=true; shared-object-recovery=true\n' "$write_seconds" "$status"
+printf 'PASS: graph peers=3 failed=1 quorum-write=%ss converged=true; failed=2 write-status=%s commit-unknown-resolved=true recovered-write=true; shared-object-recovery=true\n' "$write_seconds" "$status"

@@ -1,0 +1,11 @@
+usage_usec 74624
+user_usec 58269
+system_usec 16354
+nice_usec 0
+nr_periods 24
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+25968640
+31739904

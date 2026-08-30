@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -20,6 +21,17 @@ import (
 )
 
 type unavailableTransport struct{}
+
+type flushSignalWriter struct {
+	header  http.Header
+	flushed chan struct{}
+	once    sync.Once
+}
+
+func (w *flushSignalWriter) Header() http.Header             { return w.header }
+func (*flushSignalWriter) Write(payload []byte) (int, error) { return len(payload), nil }
+func (*flushSignalWriter) WriteHeader(int)                   {}
+func (w *flushSignalWriter) Flush()                          { w.once.Do(func() { close(w.flushed) }) }
 
 func (unavailableTransport) SendRecord(context.Context, quepaxa.NodeID, quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	return quepaxa.Summary{}, errors.New("unavailable")
@@ -113,7 +125,7 @@ func TestLocalProposerAppliesAlreadyDecidedValue(t *testing.T) {
 	}
 }
 
-func TestLocalRetryReestablishesLearnerQuorum(t *testing.T) {
+func TestExecuteRetryResolvesCommitUnknownAfterLearnerFailure(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
 	transport := &retryLearnerTransport{sendErr: errors.New("learners unavailable")}
 	core := mustCore(t, "n1", members, nil, transport)
@@ -122,21 +134,24 @@ func TestLocalRetryReestablishesLearnerQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "schema-retry", SQL: "CREATE TABLE retried (id INTEGER)"}})
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+	req := ExecuteRequest{RequestID: "schema-retry", SQL: "CREATE TABLE retried (id INTEGER)"}
+	if _, err := server.Execute(context.Background(), req); !errors.Is(err, ErrCommitUnknown) {
+		t.Fatalf("first proposal error=%v, want commit unknown", err)
+	} else {
+		var unknown *CommitUnknownError
+		if !errors.As(err, &unknown) || unknown.Slot != 1 || unknown.RequestID != req.RequestID {
+			t.Fatalf("commit unknown detail=%#v", unknown)
+		}
+	}
+	transport.sendErr = nil
+	response, err := server.Execute(context.Background(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := core.Propose(context.Background(), value); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
-		t.Fatalf("first proposal error=%v, want quorum unavailable", err)
-	}
-	transport.sendErr = nil
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
-	defer server.Close()
-	if _, err := server.proposeLocal(context.Background(), value); err != nil {
-		t.Fatal(err)
-	}
-	if transport.sendCalls != 2 || material.Tip() != 1 {
-		t.Fatalf("SendDecision calls=%d material tip=%d, want 2 and 1", transport.sendCalls, material.Tip())
+	if response.Slot != 1 || transport.sendCalls != 2 || material.Tip() != 1 {
+		t.Fatalf("slot=%d SendDecision calls=%d material tip=%d, want 1, 2, 1", response.Slot, transport.sendCalls, material.Tip())
 	}
 }
 
@@ -364,6 +379,110 @@ func TestConcurrentApplyDecisionsRemainOrdered(t *testing.T) {
 	}
 }
 
+func TestQuiesceTimeoutKeepsAdmissionClosedUntilDrain(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+
+	server.proposalWG.Add(1)
+	var drain sync.Once
+	defer func() { drain.Do(server.proposalWG.Done) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if resume, err := server.Quiesce(ctx); resume != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("quiesce timeout error=%v", err)
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "after-timeout", SQL: "CREATE TABLE quiesce_timeout (id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.proposeHedged(context.Background(), value); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("proposal during timed-out drain error=%v, want %v", err, ErrNotReady)
+	}
+
+	drain.Do(server.proposalWG.Done)
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.proposeMu.Lock()
+		quiescing := server.quiescing
+		server.proposeMu.Unlock()
+		if !quiescing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("admission stayed closed after proposal drain")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := server.proposeHedged(context.Background(), value); err != nil {
+		t.Fatalf("proposal after drain error=%v", err)
+	}
+}
+
+func TestCatchUpCompactionTriggersHandler(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	source := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	source.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if _, _, err := source.Propose(context.Background(), []byte("state")); err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := source.PrefixHash(1)
+	if !ok {
+		t.Fatal("missing checkpoint prefix")
+	}
+	order, following, err := source.CheckpointLeaderOrders(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: source.ConfigID(), Index: 1, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following}
+	if err := source.PrepareCheckpoint(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.Propose(context.Background(), sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.CompactThrough(1, seal.RootHash); err != nil {
+		t.Fatal(err)
+	}
+	sourceServer := NewServer(source, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer sourceServer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", sourceServer, []quepaxa.Member{member}, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	member.PeerURL = "quic://" + peer.Addr()
+	target := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	transport := NewTransport("cluster", member.ID, &quepaxa.Cluster{Members: []quepaxa.Member{member}}, "secret")
+	defer transport.Close()
+	server := NewServer(target, nil, "cluster", true, transport, []quepaxa.Member{member}, 0)
+	defer server.Close()
+	called := make(chan struct{}, 1)
+	server.SetCompactedHandler(func() { called <- struct{}{} })
+	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer callCancel()
+	if err := server.catchUpFrom(callCtx, member.ID, 1); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("catch-up error=%v, want %v", err, ErrNotReady)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("compacted handler was not called")
+	}
+}
+
 func TestFallbackWinnerBecomesNextRequestFirstWithoutChangingAgreedLeader(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
 	core := mustCore(t, "n1", members, nil, nil)
@@ -463,6 +582,47 @@ func TestKVRetryPreservesFirstAdmissionAndRejectsChangedIntent(t *testing.T) {
 	req.Value = []byte("different")
 	if _, err := server.KVPut(context.Background(), req); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("changed request error=%v, want conflict", err)
+	}
+}
+
+func TestKVMutateRejectsInvalidOperationAndTTLOverflowBeforeConsensus(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+
+	request := KVMutationRequest{RequestID: "invalid", Key: "key", Value: []byte("value")}
+	if _, err := server.KVMutate(context.Background(), "bogus", request); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("invalid operation error=%v", err)
+	}
+	request.RequestID = "overflow"
+	request.TTLMS = math.MaxInt64
+	if _, err := server.KVPut(context.Background(), request); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("overflow TTL error=%v", err)
+	}
+	if core.Tip() != 0 {
+		t.Fatalf("invalid requests advanced consensus tip to %d", core.Tip())
+	}
+	request.RequestID = "valid"
+	request.TTLMS = 0
+	if _, err := server.KVPut(context.Background(), request); err != nil {
+		t.Fatalf("valid request after rejection: %v", err)
+	}
+}
+
+func TestValidateReplicatedMutationAcceptsReadBarrier(t *testing.T) {
+	var nonce [types.ReadBarrierNonceSize]byte
+	nonce[0] = 1
+	if err := validateReplicatedMutation(types.EncodeReadBarrier(nonce)); err != nil {
+		t.Fatalf("read barrier rejected: %v", err)
+	}
+	if err := validateReplicatedMutation([]byte("unknown-control")); err == nil {
+		t.Fatal("unknown control accepted")
 	}
 }
 
@@ -699,5 +859,32 @@ func TestNotifyRetryIsIdempotentAndChangedPayloadConflicts(t *testing.T) {
 	command.Payload = []byte("two")
 	if _, err := server.NotifyPublish(context.Background(), command); !errors.Is(err, ErrRequestConflict) {
 		t.Fatalf("changed notification error=%v, want conflict", err)
+	}
+}
+
+func TestNotifyStreamStopsWhenMaterializerCloses(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	t.Cleanup(server.Close)
+
+	w := &flushSignalWriter{header: make(http.Header), flushed: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/notify/subscribe?topic=topic", nil))
+		close(done)
+	}()
+	<-w.flushed
+	if err := material.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("notification stream did not stop after materializer close")
 	}
 }

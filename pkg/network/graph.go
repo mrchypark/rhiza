@@ -156,7 +156,6 @@ func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (typ
 	if err != nil {
 		return types.GraphCommandResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	result.AppliedSlot = s.material.Tip()
 	result.ConsensusTip = uint64(s.core.Tip())
 	return result, nil
 }
@@ -179,14 +178,14 @@ func (s *Server) GraphStreamRead(ctx context.Context, request GraphStreamReadReq
 	if err := s.readBarrier(ctx, request.Consistency); err != nil {
 		return GraphStreamReadResponse{}, err
 	}
-	records, err := s.material.GraphReadStream(ctx, request.Stream, request.AfterSequence, request.Limit, time.Duration(request.WaitMS)*time.Millisecond)
+	records, appliedSlot, err := s.material.GraphReadStream(ctx, request.Stream, request.AfterSequence, request.Limit, time.Duration(request.WaitMS)*time.Millisecond)
 	if err != nil {
 		if ctx.Err() != nil {
 			return GraphStreamReadResponse{}, ctx.Err()
 		}
 		return GraphStreamReadResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	return GraphStreamReadResponse{Records: records, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, nil
+	return GraphStreamReadResponse{Records: records, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
 func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
@@ -196,14 +195,14 @@ func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffse
 	if err := s.readBarrier(ctx, request.Consistency); err != nil {
 		return GraphStreamOffsetResponse{}, err
 	}
-	sequence, found, err := s.material.GraphStreamOffset(ctx, request.Stream, request.Consumer)
+	sequence, found, appliedSlot, err := s.material.GraphStreamOffset(ctx, request.Stream, request.Consumer)
 	if err != nil {
 		if ctx.Err() != nil {
 			return GraphStreamOffsetResponse{}, ctx.Err()
 		}
 		return GraphStreamOffsetResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	return GraphStreamOffsetResponse{Sequence: sequence, Found: found, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, nil
+	return GraphStreamOffsetResponse{Sequence: sequence, Found: found, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
 func (s *Server) SetGraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) error {

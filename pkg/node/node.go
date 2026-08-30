@@ -45,6 +45,9 @@ type Node struct {
 	opened       atomic.Bool
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
+	recoveryMu   sync.Mutex
+	compactionMu sync.Mutex
+	catchUpWake  chan struct{}
 }
 
 // New creates a new Node.
@@ -209,6 +212,9 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	}
 	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
 	n.transport = transport
+	if len(cluster.Members) > 1 {
+		n.catchUpWake = make(chan struct{}, 1)
+	}
 	core, err := quepaxa.New(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport,
 	})
@@ -275,6 +281,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		})
 	}
 	n.server = server
+	server.SetCompactedHandler(n.wakeCatchUp)
 	peer, err := network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
 	if err != nil {
 		return fmt.Errorf("listen peer QUIC: %w", err)
@@ -486,6 +493,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			defer n.wg.Done()
 			ticker := time.NewTicker(n.config.ObjStoreGCInterval)
 			defer ticker.Stop()
+			var archiveFloor uint64
 			for {
 				select {
 				case <-ctx.Done():
@@ -502,10 +510,24 @@ func (n *Node) Open(ctx context.Context) (err error) {
 					if seal, ok, err := core.LatestCheckpointSeal(); err == nil && ok {
 						retain[seal.RootHash] = struct{}{}
 					}
-					if err := n.checkpoints.GarbageCollect(ctx, retain, 2, n.config.ObjStoreGCGracePeriod); err != nil {
+					if n.archive != nil {
+						if err := n.archive.Load(ctx); err != nil {
+							log.Printf("load shared archive before checkpoint GC failed: %v", err)
+							continue
+						}
+						seal, _, ok := n.archive.RecoveryBase()
+						archiveFloor, ok = advanceArchiveFloor(archiveFloor, uint64(seal.Index), ok)
+						if !ok {
+							continue
+						}
+						retain[seal.RootHash] = struct{}{}
+					}
+					if err := n.checkpoints.GarbageCollectFrom(ctx, retain, 2, archiveFloor, n.config.ObjStoreGCGracePeriod); err != nil {
 						log.Printf("checkpoint GC failed: %v", err)
-					} else if err := n.archive.Cleanup(ctx, n.config.ObjStoreGCGracePeriod); err != nil {
-						log.Printf("archive GC failed: %v", err)
+					} else if n.archive != nil {
+						if err := n.archive.Cleanup(ctx, n.config.ObjStoreGCGracePeriod); err != nil {
+							log.Printf("archive GC failed: %v", err)
+						}
 					}
 				}
 			}
@@ -514,7 +536,19 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	return nil
 }
 
+func advanceArchiveFloor(current, base uint64, ok bool) (uint64, bool) {
+	if !ok {
+		return current, false
+	}
+	return max(current, base), true
+}
+
 func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
+	// Auto-checkpoint completion and the archive ticker can observe the same
+	// seal. Keep the whole trim/compact transition single-flight so the later
+	// caller rechecks the newly installed floor instead of compacting it twice.
+	n.compactionMu.Lock()
+	defer n.compactionMu.Unlock()
 	if n.core == nil || n.archive == nil || n.checkpoints == nil {
 		return nil
 	}
@@ -551,6 +585,11 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 	if err := n.archive.Load(ctx); err != nil {
 		return err
 	}
+	if seal, _, ok := n.archive.RecoveryBase(); ok && archiveRecoveryRequired(n.core.Tip(), seal.Index) {
+		// The archive has trimmed the local next slot. Waiting for a peer to
+		// report ErrCompacted only turns this into a periodic retry loop.
+		return n.restoreArchiveCatchUp(ctx)
+	}
 	for n.core.Tip() < n.archive.Tip() {
 		values, _, err := n.archive.DecisionsFrom(ctx, n.core.Tip()+1, 256)
 		if err != nil || len(values) == 0 {
@@ -564,6 +603,176 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 		}
 	}
 	return n.replayLocalDecisions(ctx)
+}
+
+func archiveRecoveryRequired(localTip, archiveBase quepaxa.Slot) bool {
+	return archiveBase != 0 && localTip < archiveBase
+}
+
+func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
+	n.recoveryMu.Lock()
+	defer n.recoveryMu.Unlock()
+	// A compacted peer means local history may no longer be sufficient for a
+	// linearizable operation. Reject new client traffic before any remote I/O.
+	n.ready.Store(false)
+	if n.archive == nil || n.checkpoints == nil || n.core == nil || n.material == nil || n.server == nil {
+		return fmt.Errorf("live checkpoint recovery is unavailable")
+	}
+	var pinNonce [8]byte
+	if _, err := rand.Read(pinNonce[:]); err != nil {
+		return err
+	}
+	owner := fmt.Sprintf("%s-%x", n.config.NodeID, pinNonce)
+	snapshot, err := n.archive.BeginRecoverySnapshot(ctx, owner, 2*time.Minute)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = snapshot.Close(closeCtx)
+	}()
+	seal, baseDecision, ok := snapshot.RecoveryBase()
+	if !ok {
+		return fmt.Errorf("shared archive has no checkpoint recovery base")
+	}
+	root, err := n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
+	if err != nil {
+		return err
+	}
+	if root.Hash != seal.StateHash {
+		return fmt.Errorf("certified checkpoint state hash mismatch")
+	}
+	checkpointPin, err := n.checkpoints.PinRecoveryRoot(ctx, root, owner, 2*time.Minute)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = checkpointPin.Close(closeCtx)
+	}()
+	root, err = checkpointPin.Root()
+	if err != nil {
+		return err
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var renewMu sync.Mutex
+	var renewFailure error
+	renewDone := make(chan struct{})
+	go func() {
+		defer close(renewDone)
+		ticker := time.NewTicker(40 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workCtx.Done():
+				return
+			case <-ticker.C:
+				if err := checkpointPin.Renew(workCtx, 2*time.Minute); err != nil {
+					renewMu.Lock()
+					renewFailure = err
+					renewMu.Unlock()
+					cancel()
+					return
+				}
+				if err := snapshot.Renew(workCtx, 2*time.Minute); err != nil {
+					renewMu.Lock()
+					renewFailure = err
+					renewMu.Unlock()
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		<-renewDone
+	}()
+	checkRenewFailure := func(err error) error {
+		renewMu.Lock()
+		defer renewMu.Unlock()
+		if renewFailure != nil {
+			return renewFailure
+		}
+		return err
+	}
+	defer func() { resultErr = checkRenewFailure(resultErr) }()
+	dir, err := os.MkdirTemp(n.config.DataDir, ".rhiza-live-restore-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	files, err := n.checkpoints.DownloadAndVerifyRootFiles(workCtx, root, dir)
+	if err != nil {
+		return checkRenewFailure(err)
+	}
+	materialFiles := make([]materializer.CheckpointFile, 0, len(files))
+	for _, file := range files {
+		materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
+	}
+	resume, err := n.server.Quiesce(workCtx)
+	if err != nil {
+		return checkRenewFailure(err)
+	}
+	defer resume()
+	if n.core.Tip() < seal.Index {
+		if err := n.core.RestoreCheckpointBase(workCtx, seal, baseDecision); err != nil {
+			return err
+		}
+	} else if prefix, ok := n.core.PrefixHash(seal.Index); !ok || prefix != seal.PrefixHash {
+		return fmt.Errorf("local consensus prefix does not match checkpoint recovery base")
+	}
+	if n.material.Tip() < uint64(seal.Index) {
+		if err := n.material.RestoreCheckpoint(workCtx, materialFiles); err != nil {
+			return err
+		}
+	}
+	for n.core.Tip() < snapshot.Tip() {
+		values, _, err := snapshot.DecisionsFrom(workCtx, n.core.Tip()+1, 256)
+		if err != nil || len(values) == 0 {
+			if err == nil {
+				err = fmt.Errorf("shared archive omitted slot %d", n.core.Tip()+1)
+			}
+			return err
+		}
+		if err := n.core.AcceptCertifiedValues(values); err != nil {
+			return err
+		}
+	}
+	if err := n.archive.Load(workCtx); err != nil {
+		return err
+	}
+	for n.core.Tip() < n.archive.Tip() {
+		values, _, err := n.archive.DecisionsFrom(workCtx, n.core.Tip()+1, 256)
+		if err != nil || len(values) == 0 {
+			if err == nil {
+				err = fmt.Errorf("shared archive omitted slot %d", n.core.Tip()+1)
+			}
+			return err
+		}
+		if err := n.core.AcceptCertifiedValues(values); err != nil {
+			return err
+		}
+	}
+	if quepaxa.Slot(n.material.Tip()) > n.core.Tip() {
+		return fmt.Errorf("materialized slot %d is ahead of certified log tip %d", n.material.Tip(), n.core.Tip())
+	}
+	if err := n.replayLocalDecisions(workCtx); err != nil {
+		return err
+	}
+	if n.material.Tip() > uint64(n.core.CompactionFloor()) {
+		decision, ok := n.core.CertifiedValue(quepaxa.Slot(n.material.Tip()))
+		if !ok {
+			return fmt.Errorf("materialized slot %d has no recovered decision", n.material.Tip())
+		}
+		if err := n.material.ValidateTip(n.material.Tip(), decision.Value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Start opens the embedded engine and serves the optional public HTTP adapter.
@@ -654,10 +863,24 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 	var round uint64
 	for {
 		delay := syncInterval(n.config.NodeID, round)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
-		case <-time.After(delay):
+		case <-timer.C:
+		case <-n.catchUpWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		}
 		if !n.ready.Load() {
 			n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
@@ -665,8 +888,27 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			if err := n.catchUpPeer(ctx, transport, source); err != nil {
 				log.Printf("operation sync from %s failed: %v", source, err)
 			}
+			// A compacted peer can force checkpoint recovery from catchUpPeer.
+			// Only a fresh quorum round may make that node ready again.
+			if !n.ready.Load() {
+				n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
+			}
 		}
 		round++
+	}
+}
+
+// wakeCatchUp is called by the foreground server when a peer has compacted
+// history needed by this node. The one-slot channel coalesces concurrent
+// callers; startCatchUp is the only recovery worker.
+func (n *Node) wakeCatchUp() {
+	n.ready.Store(false)
+	if n.catchUpWake == nil {
+		return
+	}
+	select {
+	case n.catchUpWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -703,6 +945,10 @@ func (n *Node) observeCatchUp(err error) {
 	n.ready.Store(true)
 }
 
+func hasUsablePeerSuffix(applied quepaxa.Slot, successes, quorum int, best *network.DecisionsResponse) bool {
+	return successes >= quorum && best != nil && best.Tip > applied
+}
+
 func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
 	for {
 		if err := n.replayLocalDecisions(ctx); err != nil {
@@ -730,6 +976,7 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 		}
 		successes := 1 // local recorder
 		var best *network.DecisionsResponse
+		compacted := false
 		var grace *time.Timer
 		for pending > 0 {
 			var graceC <-chan time.Time
@@ -746,7 +993,9 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 				pending = 0
 			case result := <-results:
 				pending--
-				if result.err == nil {
+				if errors.Is(result.err, quepaxa.ErrCompacted) {
+					compacted = true
+				} else if result.err == nil {
 					successes++
 					if best == nil || result.response.Tip > best.Tip {
 						copy := result.response
@@ -759,10 +1008,17 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 			grace.Stop()
 		}
 		cancel()
+		peerSuffix := hasUsablePeerSuffix(applied, successes, cluster.QuorumSize(), best)
+		if compacted && !peerSuffix {
+			if err := n.restoreArchiveCatchUp(ctx); err != nil {
+				return err
+			}
+			continue
+		}
 		if successes < cluster.QuorumSize() {
 			return quepaxa.ErrQuorumUnavailable
 		}
-		if best == nil || best.Tip <= applied {
+		if !peerSuffix {
 			return nil
 		}
 		expected := applied + 1
@@ -794,6 +1050,12 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 		response, err := transport.FetchDecisions(pageCtx, source, from, 128)
 		cancel()
 		if err != nil {
+			if errors.Is(err, quepaxa.ErrCompacted) {
+				if err := n.restoreArchiveCatchUp(ctx); err != nil {
+					return err
+				}
+				continue
+			}
 			return err
 		}
 		if response.Tip < from {

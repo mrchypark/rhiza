@@ -41,6 +41,34 @@ type bucketMetrics struct {
 	unexpected4xx, http5xx               atomic.Uint64
 }
 
+type expectedNotFoundKey struct{}
+type expectedConditionKey struct{}
+
+// WithExpectedNotFound marks a single object-store operation whose missing
+// object result is part of its normal control flow. It only affects S3 HTTP
+// accounting; callers still receive and handle the provider error normally.
+func WithExpectedNotFound(ctx context.Context) context.Context {
+	return context.WithValue(ctx, expectedNotFoundKey{}, struct{}{})
+}
+
+func expectsNotFound(ctx context.Context) bool {
+	_, ok := ctx.Value(expectedNotFoundKey{}).(struct{})
+	return ok
+}
+
+func withExpectedCondition(ctx context.Context, opts ...thanosobjstore.ObjectUploadOption) context.Context {
+	params := thanosobjstore.ApplyObjectUploadOptions(opts...)
+	if !params.IfNotExists && params.Condition == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, expectedConditionKey{}, struct{}{})
+}
+
+func expectsCondition(ctx context.Context) bool {
+	_, ok := ctx.Value(expectedConditionKey{}).(struct{})
+	return ok
+}
+
 type MeteredBucket struct {
 	thanosobjstore.Bucket
 	metrics *bucketMetrics
@@ -65,6 +93,7 @@ func (b *MeteredBucket) Stats() Stats {
 func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
 	b.metrics.uploads.Add(1)
 	counted := &countingReader{reader: reader, count: &b.metrics.bytesUploaded}
+	ctx = withExpectedCondition(ctx, opts...)
 	err := b.Bucket.Upload(ctx, name, counted, opts...)
 	if err != nil && b.Bucket.IsConditionNotMetErr(err) {
 		if strings.Contains(name, "/blocks/") || strings.Contains(name, "/extents/") || strings.Contains(name, "/roots/") {
@@ -151,8 +180,12 @@ func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 			return response, err
 		}
 		switch {
-		case response.StatusCode == http.StatusConflict || response.StatusCode == http.StatusPreconditionFailed:
-			m.httpFailures.Add(1)
+		case request.Method == http.MethodPut && expectsCondition(request.Context()) && (request.Header.Get("If-Match") != "" || request.Header.Get("If-None-Match") != "") && (response.StatusCode == http.StatusConflict || response.StatusCode == http.StatusPreconditionFailed):
+			// Expected CAS and content-addressed dedup outcomes are classified by
+			// the logical Upload path, not as HTTP failures.
+		case response.StatusCode == http.StatusNotFound && expectsNotFound(request.Context()):
+			// Missing-object probes are a normal part of first publication. The
+			// logical operation still records the not-found result.
 		case response.StatusCode >= 400 && response.StatusCode < 500:
 			m.unexpected4xx.Add(1)
 			m.httpFailures.Add(1)

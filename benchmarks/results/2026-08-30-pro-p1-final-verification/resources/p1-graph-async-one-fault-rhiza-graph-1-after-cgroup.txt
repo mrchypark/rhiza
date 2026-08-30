@@ -1,0 +1,11 @@
+usage_usec 7223597
+user_usec 5473160
+system_usec 1750437
+nice_usec 0
+nr_periods 155
+nr_throttled 9
+throttled_usec 471059
+nr_bursts 0
+burst_usec 0
+74461184
+80474112

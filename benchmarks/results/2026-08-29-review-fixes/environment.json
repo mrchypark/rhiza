@@ -1,0 +1,21 @@
+{
+  "baseline": "benchmarks/results/2026-08-28-archive-refresh",
+  "source_commit": "2a118a28294dae48edc0b7af0a54b02230f69fae",
+  "origin_main": "2a118a28294dae48edc0b7af0a54b02230f69fae",
+  "dirty_diff_sha256": "bf1c0d3a58c1198fbc082a48ad4940755c5ab7dc5cd77130a152bf3f984f45da",
+  "go": "go1.27.0 darwin/arm64",
+  "go_experiment": "arenas,greenteagc",
+  "host": "macOS 26.3 arm64",
+  "docker": "29.6.1",
+  "kubernetes": "v1.36.2+k3s1 via Dory",
+  "images": {
+    "sql": "rhiza-sql-kv-e2e@sha256:af79ea9d2c2c4e9adba56bb0f145c24ddbd0fe7052b7b07616d3fe5e56051e20",
+    "graph": "rhiza-graph-kv-e2e@sha256:b2596417cee3d7bde3db7a408a5a680e833f5ae74fbdc4dcd4965b5eee997d26"
+  },
+  "cluster": "three peers, MinIO S3-compatible object store, Chaos Mesh one-peer container kill",
+  "samples": "three repetitions per workload; 1000 reads or 100 writes at concurrency 16",
+  "profiles": ["sql-kv", "graph-kv"],
+  "durability": ["async", "before-ack"],
+  "availability": ["healthy", "one-peer-fault"],
+  "checkpoint_stress": "1s checkpoint and archive sync intervals"
+}

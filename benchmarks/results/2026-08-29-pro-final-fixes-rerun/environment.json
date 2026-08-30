@@ -1,0 +1,13 @@
+{
+  "date": "2026-08-29",
+  "base_commit": "2a118a28294dae48edc0b7af0a54b02230f69fae",
+  "go": "go1.27.0 darwin/arm64",
+  "kubernetes_context": "default",
+  "sql_image": "rhiza-sql-kv-e2e:review-final3",
+  "sql_image_digest": "sha256:a581e24527731099170f4af6c20fa0759ae8020fc59a95c85e4eba7d224bab03",
+  "graph_image": "rhiza-graph-kv-e2e:review-final3",
+  "graph_image_digest": "sha256:bc1fe372aa00c53cc4a8955d58797af60767f1e2c86c977cedf216d998cb08d4",
+  "requests_full_matrix": 100800,
+  "requests_checkpoint_matrix": 50400,
+  "client_errors": 0
+}

@@ -1,0 +1,74 @@
+[
+  {
+    "config": "graph-async-final8",
+    "duration_s": 4.418566144,
+    "cpu_seconds": 6.347142,
+    "average_cores": 1.436470971158557,
+    "memory_current_mib": 63.05859375,
+    "memory_peak_mib": 68.6796875,
+    "observed_pods": 3
+  },
+  {
+    "config": "graph-async-final9",
+    "duration_s": 3.389035008,
+    "cpu_seconds": 5.161176,
+    "average_cores": 1.5229043039734809,
+    "memory_current_mib": 59.260416666666664,
+    "memory_peak_mib": 65.34895833333333,
+    "observed_pods": 3
+  },
+  {
+    "config": "graph-before-ack-final8",
+    "duration_s": 4.810871040,
+    "cpu_seconds": 5.858557,
+    "average_cores": 1.2177746922104151,
+    "memory_current_mib": 64.74739583333333,
+    "memory_peak_mib": 69.81770833333333,
+    "observed_pods": 3
+  },
+  {
+    "config": "graph-before-ack-final9",
+    "duration_s": 3.935971840,
+    "cpu_seconds": 5.581117,
+    "average_cores": 1.4179768623547875,
+    "memory_current_mib": 58.2265625,
+    "memory_peak_mib": 64.640625,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-async-final8",
+    "duration_s": 2.624935168,
+    "cpu_seconds": 2.607867,
+    "average_cores": 0.9934976801682289,
+    "memory_current_mib": 48.579427083333336,
+    "memory_peak_mib": 55.1640625,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-async-final9",
+    "duration_s": 2.165758976,
+    "cpu_seconds": 2.504704,
+    "average_cores": 1.156501728842425,
+    "memory_current_mib": 46.563802083333336,
+    "memory_peak_mib": 54.002604166666664,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-before-ack-final8",
+    "duration_s": 2.876280064,
+    "cpu_seconds": 2.278494,
+    "average_cores": 0.7921669480375051,
+    "memory_current_mib": 46.70703125,
+    "memory_peak_mib": 52.609375,
+    "observed_pods": 3
+  },
+  {
+    "config": "sql-before-ack-final9",
+    "duration_s": 4.290266880,
+    "cpu_seconds": 3.437663,
+    "average_cores": 0.8012701997690177,
+    "memory_current_mib": 46.276041666666664,
+    "memory_peak_mib": 51.975260416666664,
+    "observed_pods": 3
+  }
+]

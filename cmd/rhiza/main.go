@@ -69,7 +69,7 @@ func main() {
 		PeerAddr:              getEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"),
 		AdminToken:            os.Getenv("RHIZA_ADMIN_TOKEN"),
 		Members:               members,
-		HedgeDelay:            hedgeDelay,
+		HedgeDelay:            &hedgeDelay,
 		ObjStoreProvider:      os.Getenv("RHIZA_OBJSTORE_PROVIDER"),
 		ObjStoreDir:           os.Getenv("RHIZA_FILESYSTEM_DIR"),
 		ObjStorePrefix:        os.Getenv("RHIZA_OBJSTORE_PREFIX"),

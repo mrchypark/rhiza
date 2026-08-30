@@ -1,0 +1,11 @@
+usage_usec 37770
+user_usec 0
+system_usec 37770
+nice_usec 0
+nr_periods 15
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+26451968
+32546816

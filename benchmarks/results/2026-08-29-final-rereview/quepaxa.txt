@@ -1,0 +1,11 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M3
+BenchmarkCoreProposeThreePeers-8      	      44	  25702289 ns/op	   62932 B/op	     365 allocs/op
+BenchmarkCoreProposeOnePeerDown-8     	      51	  20352803 ns/op	   46709 B/op	     278 allocs/op
+BenchmarkCoreReadIndexThreePeers-8    	 1809324	       688.5 ns/op	     496 B/op	       8 allocs/op
+BenchmarkCoreReadIndexOnePeerDown-8   	 1865331	       891.7 ns/op	     512 B/op	       9 allocs/op
+BenchmarkCoreLocalReadIndex-8         	135073580	         8.573 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	9.646s

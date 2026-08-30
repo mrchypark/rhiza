@@ -2,6 +2,7 @@ package qlog
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -64,6 +65,49 @@ func TestWALRolloverRequiresDirectorySync(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "seg_002.log")); !os.IsNotExist(err) {
 		t.Fatalf("failed rollover left segment behind: %v", err)
+	}
+}
+
+func TestWALRolloverPostRenameSyncFailureRemainsReopenable(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("manifest directory sync failed")
+	calls := 0
+	wal.maxSize = 1
+	wal.syncDir = func(string) error {
+		calls++
+		if calls == 2 {
+			return wantErr
+		}
+		return nil
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); !errors.Is(err, wantErr) {
+		t.Fatalf("append error=%v, want %v", err, wantErr)
+	}
+	wal.syncDir = syncDir
+	if err := wal.Append(Entry{Slot: 2, Type: EntryProposal, Payload: []byte("must-not-write")}); !errors.Is(err, wantErr) {
+		t.Fatalf("poisoned WAL append error=%v, want %v", err, wantErr)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "manifest_00000000000000000002.bin")); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after uncertain manifest publish: %v", err)
+	}
+	defer reopened.Close()
+	if reopened.current == nil || reopened.current.index != 1 {
+		t.Fatalf("reopened current=%v, want prior segment 1", reopened.current)
+	}
+	entries, err := reopened.Read()
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("uncertain manifest exposed later writes: entries=%#v err=%v", entries, err)
 	}
 }
 
@@ -262,6 +306,38 @@ func TestWALRolloverRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWALRejectsNoncanonicalManifestWithoutDeletingCommittedState(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManifest, err := os.ReadFile(filepath.Join(dir, "manifest_00000000000000000001.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal.maxSize = 1
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("rollover")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	latest := filepath.Join(dir, "manifest_00000000000000000002.bin")
+	segment := filepath.Join(dir, "seg_002.log")
+	if err := os.WriteFile(filepath.Join(dir, "manifest_1.bin"), firstManifest, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir); err == nil {
+		t.Fatal("noncanonical manifest was accepted")
+	}
+	for _, name := range []string{latest, segment} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("committed WAL file %s was removed: %v", filepath.Base(name), err)
+		}
+	}
+}
+
 func TestWALRepairsTornTailBeforeAppend(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := Open(dir)
@@ -312,6 +388,200 @@ func TestWALRejectsManifestlessSegments(t *testing.T) {
 	}
 }
 
+func TestOpenRecoversInitialSegmentCreatedBeforeManifest(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seg_001.log"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Read()
+	if err != nil || len(entries) != 1 || entries[0].Slot != 1 {
+		t.Fatalf("entries=%#v err=%v", entries, err)
+	}
+}
+
+func TestOpenRecoversInitialSegmentAlongsideNoncanonicalFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "seg_001.log"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	note := filepath.Join(dir, "seg_notes.log")
+	if err := os.WriteFile(note, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if data, err := os.ReadFile(note); err != nil || string(data) != "keep" {
+		t.Fatalf("noncanonical file data=%q err=%v", data, err)
+	}
+}
+
+func TestOpenRemovesUnreferencedRolloverSegment(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "seg_002.log"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	reopened.maxSize = 1
+	if err := reopened.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenRemovesAbortedCompactionTarget(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := wal.BeginCompaction(Entry{Slot: 1, Type: EntryCheckpoint, Payload: []byte("base")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	target := plan.targetPath
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("uncommitted compaction target remains: %v", err)
+	}
+	if err := reopened.Append(Entry{Slot: 2, Type: EntryProposal, Payload: []byte("after-restart")}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManifestGenerationsRemainBounded(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wal.maxSize = 1
+	for slot := uint64(1); slot <= 100; slot++ {
+		if err := wal.Append(Entry{Slot: slot, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manifests, err := filepath.Glob(filepath.Join(dir, "manifest_*.bin"))
+	if err != nil || len(manifests) != 1 {
+		t.Fatalf("manifests=%v err=%v", manifests, err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Read()
+	if err != nil || len(entries) != 100 {
+		t.Fatalf("entries=%d err=%v", len(entries), err)
+	}
+}
+
+func TestCommittedManifestCleanupFailureDoesNotFailAppend(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldManifest := filepath.Join(dir, "manifest_00000000000000000001.bin")
+	wantErr := errors.New("injected cleanup failure")
+	wal.remove = func(name string) error {
+		if name == oldManifest {
+			return wantErr
+		}
+		return os.Remove(name)
+	}
+	wal.maxSize = 1
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatalf("durable append reported cleanup failure: %v", err)
+	}
+	wal.remove = os.Remove
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldManifest); err != nil {
+		t.Fatalf("old manifest was unexpectedly removed: %v", err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	manifests, _ := filepath.Glob(filepath.Join(dir, "manifest_*.bin"))
+	if len(manifests) != 1 {
+		t.Fatalf("manifest cleanup was not retried: %v", manifests)
+	}
+}
+
+func TestOpenCleansAtomicWriteTemps(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{".rhiza-segment-crash", ".rhiza-compact-crash"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("partial"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for _, name := range []string{".rhiza-segment-crash", ".rhiza-compact-crash"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("temp %s remains: %v", name, err)
+		}
+	}
+}
+
 func TestWALCompactionRetainsConcurrentTailExactlyOnce(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := Open(dir)
@@ -324,7 +594,7 @@ func TestWALCompactionRetainsConcurrentTailExactlyOnce(t *testing.T) {
 		}
 	}
 	base := Entry{Slot: 1, Type: EntryCheckpoint, Hash: [32]byte{1}, Payload: []byte("base")}
-	plan, err := wal.BeginCompaction(base, map[[32]byte]struct{}{})
+	plan, err := wal.BeginCompaction(base, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,6 +625,91 @@ func TestWALCompactionRetainsConcurrentTailExactlyOnce(t *testing.T) {
 	}
 	if len(entries) != 3 || entries[0].Type != EntryCheckpoint || entries[1].Slot != 4 || entries[2].Slot != 5 {
 		t.Fatalf("compacted entries=%#v", entries)
+	}
+}
+
+func TestWALCompactionPostRenameSyncFailureRemainsReopenable(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("old")}); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := wal.BeginCompaction(Entry{Slot: 1, Type: EntryCheckpoint, Hash: [32]byte{1}, Payload: []byte("base")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Abort()
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("manifest directory sync failed")
+	wal.syncDir = func(string) error { return wantErr }
+	if err := plan.Commit(); !errors.Is(err, wantErr) {
+		t.Fatalf("commit error=%v, want %v", err, wantErr)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatalf("reopen after uncertain compaction manifest: %v", err)
+	}
+	defer reopened.Close()
+	entries, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Type != EntryCheckpoint || entries[0].Slot != 1 {
+		t.Fatalf("reopened entries=%#v", entries)
+	}
+}
+
+func TestWALCompactionSynthesizesRetainedProposalsOnce(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	first, second := []byte("first"), []byte("second")
+	firstHash, secondHash := sha256.Sum256(first), sha256.Sum256(second)
+	for _, entry := range []Entry{
+		{Hash: secondHash, Type: EntryProposal, Payload: second},
+		{Hash: firstHash, Type: EntryProposal, Payload: first},
+		{Hash: secondHash, Type: EntryProposal, Payload: second},
+		{Slot: 3, Type: EntryReceipt, Payload: []byte("receipt")},
+	} {
+		if err := wal.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := wal.BeginCompaction(Entry{Slot: 1, Type: EntryCheckpoint, Hash: [32]byte{1}, Payload: []byte("base")}, map[[32]byte][]byte{firstHash: first, secondHash: second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Abort()
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 || entries[0].Type != EntryCheckpoint || entries[1].Type != EntryProposal || entries[2].Type != EntryProposal || entries[3].Type != EntryReceipt {
+		t.Fatalf("compacted entries=%#v", entries)
+	}
+	if bytes.Compare(entries[1].Hash[:], entries[2].Hash[:]) >= 0 {
+		t.Fatalf("retained proposals are not deterministic: %x then %x", entries[1].Hash, entries[2].Hash)
+	}
+	for _, entry := range entries[1:3] {
+		if sha256.Sum256(entry.Payload) != entry.Hash {
+			t.Fatalf("retained proposal hash mismatch: %x", entry.Hash)
+		}
 	}
 }
 

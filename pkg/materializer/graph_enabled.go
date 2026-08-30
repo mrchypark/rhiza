@@ -577,46 +577,58 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 		return types.GraphCommandResult{}, err
 	}
 	g := m.graph
+	if g == nil || g.db == nil {
+		m.mu.RUnlock()
+		return types.GraphCommandResult{}, fmt.Errorf("LatticeDB is not open")
+	}
 	if g.tip != m.tip {
 		m.mu.RUnlock()
 		return types.GraphCommandResult{}, fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
 	}
 	db := g.db
+	tx, err := db.BeginRead()
+	if err != nil {
+		m.mu.RUnlock()
+		return types.GraphCommandResult{}, err
+	}
+	appliedSlot := m.tip
 	g.queryWG.Add(1)
 	m.mu.RUnlock()
 	defer g.queryWG.Done()
-	var result latticedb.QueryResult
-	err = db.View(func(tx *latticedb.Tx) error {
-		var queryErr error
-		result, queryErr = tx.QueryContext(ctx, cypher, converted, MaxReturningRows, MaxResultBytes)
-		return queryErr
-	})
+	result, err := tx.QueryContext(ctx, cypher, converted, MaxReturningRows, MaxResultBytes)
+	rollbackErr := tx.Rollback()
 	if err != nil {
 		return types.GraphCommandResult{}, err
 	}
-	return collectLatticeRows(result)
+	if rollbackErr != nil {
+		return types.GraphCommandResult{}, rollbackErr
+	}
+	response, err := collectLatticeRows(result)
+	response.AppliedSlot = appliedSlot
+	return response, err
 }
 
-func (m *Materializer) GraphReadStream(ctx context.Context, stream string, afterSequence uint64, limit uint, wait time.Duration) ([]types.GraphStreamRecord, error) {
+func (m *Materializer) GraphReadStream(ctx context.Context, stream string, afterSequence uint64, limit uint, wait time.Duration) ([]types.GraphStreamRecord, uint64, error) {
 	if err := validateGraphStreamName(stream, true); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if limit == 0 || limit > MaxGraphStreamRecords || wait < 0 {
-		return nil, fmt.Errorf("invalid graph stream read options")
+		return nil, 0, fmt.Errorf("invalid graph stream read options")
 	}
 	deadline := time.Now().Add(wait)
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		m.mu.RLock()
 		g := m.graph
 		if g == nil || g.db == nil {
 			m.mu.RUnlock()
-			return nil, fmt.Errorf("LatticeDB is not open")
+			return nil, 0, fmt.Errorf("LatticeDB is not open")
 		}
 		g.mu.RLock()
 		records, err := g.db.ReadStream(stream, afterSequence, limit, 0)
+		appliedSlot := m.tip
 		wake := g.streamWake
 		g.mu.RUnlock()
 		m.mu.RUnlock()
@@ -625,14 +637,14 @@ func (m *Materializer) GraphReadStream(ctx context.Context, stream string, after
 			for i, record := range records {
 				out[i] = types.GraphStreamRecord{Sequence: record.Sequence, Kind: record.Kind, Payload: record.Payload}
 			}
-			return out, err
+			return out, appliedSlot, err
 		}
 		delay := time.Until(deadline)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		case <-timer.C:
 		case <-wake:
 			timer.Stop()
@@ -647,24 +659,25 @@ func validateGraphStreamConsumer(consumer string) error {
 	return nil
 }
 
-func (m *Materializer) GraphStreamOffset(ctx context.Context, stream, consumer string) (uint64, bool, error) {
+func (m *Materializer) GraphStreamOffset(ctx context.Context, stream, consumer string) (uint64, bool, uint64, error) {
 	if err := validateGraphStreamName(stream, true); err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	if err := validateGraphStreamConsumer(consumer); err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, false, err
+		return 0, false, 0, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.graph == nil || m.graph.db == nil {
-		return 0, false, fmt.Errorf("LatticeDB is not open")
+		return 0, false, 0, fmt.Errorf("LatticeDB is not open")
 	}
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
-	return m.graph.db.GetStreamOffset(stream, consumer)
+	sequence, found, err := m.graph.db.GetStreamOffset(stream, consumer)
+	return sequence, found, m.tip, err
 }
 
 func collectLatticeRows(result latticedb.QueryResult) (types.GraphCommandResult, error) {
@@ -702,6 +715,9 @@ func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	g := m.graph
+	if g == nil || g.db == nil {
+		return types.MutationReceipt{}, false, fmt.Errorf("LatticeDB is not open")
+	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	request, found, err := g.request(requestID)
@@ -716,6 +732,9 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 		return false, err
 	}
 	g := m.graph
+	if g == nil || g.db == nil {
+		return false, fmt.Errorf("LatticeDB is not open")
+	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	request, found, err := g.request(command.RequestID)
@@ -728,6 +747,9 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.graph == nil || m.graph.db == nil {
+		return false, fmt.Errorf("LatticeDB is not open")
+	}
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
 	_, found, err := m.graph.request(requestID)

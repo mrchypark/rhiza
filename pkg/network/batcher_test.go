@@ -71,6 +71,46 @@ func TestSQLBatcherCloseStopsPendingWork(t *testing.T) {
 	}
 }
 
+func TestSQLBatcherReportsCommitUnknownAfterProposalStarts(t *testing.T) {
+	b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
+		return 7, quepaxa.ErrQuorumUnavailable
+	}, func(context.Context, quepaxa.Slot) error { return nil })
+	defer b.Close()
+
+	requestID := "uncertain"
+	_, err := b.submit(context.Background(), types.SQLCommand{RequestID: requestID, SQL: "INSERT INTO t VALUES (1)"})
+	var unknown *CommitUnknownError
+	if !errors.As(err, &unknown) || unknown.Slot != 7 || unknown.RequestID != requestID || unknown.RetryThroughSlot < 7 {
+		t.Fatalf("commit unknown detail=%#v err=%v", unknown, err)
+	}
+}
+
+func TestSQLBatcherCancellationAfterDispatchReportsCommitUnknown(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
+		close(started)
+		<-release
+		return 1, nil
+	}, func(context.Context, quepaxa.Slot) error { return nil })
+	defer b.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.submit(ctx, types.SQLCommand{RequestID: "canceled", SQL: "INSERT INTO t VALUES (1)"})
+		done <- err
+	}()
+	<-started
+	cancel()
+	err := <-done
+	var unknown *CommitUnknownError
+	if !errors.As(err, &unknown) || unknown.Slot != 0 || unknown.RequestID != "canceled" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit unknown detail=%#v err=%v", unknown, err)
+	}
+	close(release)
+}
+
 func TestSQLBatcherRejectsOversizedItemAtAdmission(t *testing.T) {
 	b := newSQLBatcher(func(context.Context, []byte) (quepaxa.Slot, error) {
 		t.Fatal("oversized item reached proposer")

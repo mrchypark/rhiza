@@ -1,0 +1,31 @@
+{
+  "baseline": "benchmarks/results/2026-08-29-review-fixes",
+  "source_commit": "2a118a28294dae48edc0b7af0a54b02230f69fae",
+  "origin_main": "2a118a28294dae48edc0b7af0a54b02230f69fae",
+  "dirty_diff_sha256": "78fb40a8dc54a27e800b938472ed2c5b16d08bc3c5624de1344ef61c46222ba2",
+  "go": "go1.27.0 darwin/arm64",
+  "go_experiment": "arenas,greenteagc",
+  "host": "macOS 26.3 arm64",
+  "docker": "29.6.1",
+  "kubernetes": "v1.36.2+k3s1 via Dory",
+  "images": {
+    "sql": "rhiza-sql-kv-e2e:review-final2@sha256:7da4379b505ed0f35f1f564f93b5333115ad7c200c26cc5b56d57a1fefcb1747",
+    "graph": "rhiza-graph-kv-e2e:review-final2@sha256:16cf9b4c79646743cc16539141f89225da3bdb5f6b30fb60d30081c5d4404fd7"
+  },
+  "cluster": "three peers, MinIO S3-compatible object store, Chaos Mesh one-peer container kill",
+  "samples": "three repetitions per workload; 1000 reads or 100 writes at concurrency 16",
+  "profiles": [
+    "sql-kv",
+    "graph-kv"
+  ],
+  "durability": [
+    "async",
+    "before-ack"
+  ],
+  "availability": [
+    "healthy",
+    "one-peer-fault"
+  ],
+  "checkpoint_stress": "1s checkpoint and archive sync intervals",
+  "availability_metric": "post-fault-quorum-seconds measures surviving quorum availability, not killed-peer restart/catch-up"
+}

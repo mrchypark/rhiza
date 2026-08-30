@@ -75,7 +75,9 @@ type Config struct {
 	CheckpointInterval    time.Duration
 	CheckpointTailBytes   int64
 	MaxWALBytes           int64
-	HedgeDelay            time.Duration
+	// HedgeDelay delays each lower-priority proposer. Nil uses
+	// DefaultHedgeDelay; a pointer to zero explicitly enables eager hedging.
+	HedgeDelay *time.Duration
 }
 
 const (
@@ -85,6 +87,7 @@ const (
 	ConsistencyLinearizable        = "linearizable"
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
 	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
+	DefaultHedgeDelay              = 5 * time.Millisecond
 )
 
 var (
@@ -122,6 +125,10 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	if config.ClusterID == "" {
 		config.ClusterID = "cluster-a"
 	}
+	hedgeDelay, err := configuredHedgeDelay(config.HedgeDelay)
+	if err != nil {
+		return nil, err
+	}
 	childCtx, cancel := context.WithCancel(ctx)
 	internalConfig := &types.ExecutionConfig{
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID), Profile: config.Profile,
@@ -134,7 +141,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes, HedgeDelay: config.HedgeDelay,
+		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes, HedgeDelay: hedgeDelay,
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {
@@ -148,6 +155,16 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		return nil, err
 	}
 	return &DB{node: n, api: api, cancel: cancel}, nil
+}
+
+func configuredHedgeDelay(delay *time.Duration) (time.Duration, error) {
+	if delay == nil {
+		return DefaultHedgeDelay, nil
+	}
+	if *delay < 0 {
+		return 0, fmt.Errorf("hedge delay must not be negative")
+	}
+	return *delay, nil
 }
 
 func (db *DB) Close() error {
@@ -216,6 +233,9 @@ func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (MutationRec
 }
 func (db *DB) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
 	return db.api.NotifySubscribe(topic)
+}
+func (db *DB) NotificationDrops() uint64 {
+	return db.api.NotificationDrops()
 }
 func (db *DB) RequestStatus(ctx context.Context, req RequestStatusRequest) (RequestStatusResponse, error) {
 	return db.api.RequestStatus(ctx, req)

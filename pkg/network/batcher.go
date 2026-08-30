@@ -2,7 +2,6 @@ package network
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -127,9 +126,9 @@ func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slo
 	case result := <-item.result:
 		return result.slot, result.err
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, &CommitUnknownError{RequestID: item.requestID, Cause: ctx.Err()}
 	case <-b.ctx.Done():
-		return 0, ErrNotReady
+		return 0, &CommitUnknownError{RequestID: item.requestID, Cause: ErrNotReady}
 	}
 }
 
@@ -352,7 +351,7 @@ func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 	cancel()
 	for _, item := range items {
 		itemErr := err
-		if errors.Is(err, ErrDurabilityUnavailable) {
+		if err != nil {
 			itemErr = commitUnknown(slot, item.requestID, err)
 		}
 		item.result <- batchResult{slot: slot, err: itemErr}

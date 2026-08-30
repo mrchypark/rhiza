@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -28,8 +29,8 @@ var (
 	ErrCommitUnknown         = errors.New("commit outcome unknown")
 )
 
-// CommitUnknownError means consensus and local apply succeeded, but the
-// configured before-ACK object-store barrier did not.
+// CommitUnknownError means a mutation may commit despite the failed call.
+// Retrying the same request ID resolves the outcome without duplicating it.
 type CommitUnknownError struct {
 	Slot             quepaxa.Slot
 	RequestID        string
@@ -43,7 +44,7 @@ func (e *CommitUnknownError) Error() string {
 func (e *CommitUnknownError) Unwrap() []error { return []error{ErrCommitUnknown, e.Cause} }
 
 func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
-	if errors.Is(err, ErrDurabilityUnavailable) {
+	if err != nil && slot != 0 {
 		return &CommitUnknownError{Slot: slot, RequestID: requestID, RetryThroughSlot: uint64(slot) + types.DefaultIdempotencyWindowSlots - 1, Cause: err}
 	}
 	return err
@@ -77,6 +78,7 @@ type Server struct {
 	proposalWG        sync.WaitGroup
 	closeOnce         sync.Once
 	closing           bool
+	quiescing         bool
 	operationCap      chan struct{}
 	localCap          chan struct{}
 	peerCap           chan struct{}
@@ -87,10 +89,28 @@ type Server struct {
 	objectStats       func() (map[string]uint64, bool)
 	syncLimit         chan struct{}
 	checkpointPrepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
+	compactedHandler  func()
 }
 
 func (s *Server) SetCheckpointPrepare(prepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error) {
 	s.checkpointPrepare = prepare
+}
+
+// SetCompactedHandler installs the recovery trigger used when a peer has
+// compacted history this node still needs.
+func (s *Server) SetCompactedHandler(handler func()) {
+	s.proposeMu.Lock()
+	s.compactedHandler = handler
+	s.proposeMu.Unlock()
+}
+
+func (s *Server) handleCompacted() {
+	s.proposeMu.Lock()
+	handler := s.compactedHandler
+	s.proposeMu.Unlock()
+	if handler != nil {
+		handler()
+	}
 }
 
 func (s *Server) prepareCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
@@ -249,7 +269,7 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 	hash := sha256.Sum256(value)
 	for {
 		s.proposeMu.Lock()
-		if s.closing {
+		if s.closing || s.quiescing {
 			s.proposeMu.Unlock()
 			return 0, ErrNotReady
 		}
@@ -275,7 +295,7 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 			return 0, ErrOverloaded
 		}
 		s.proposeMu.Lock()
-		if s.closing {
+		if s.closing || s.quiescing {
 			<-s.operationCap
 			<-s.localCap
 			s.proposeMu.Unlock()
@@ -307,6 +327,45 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 			return call.slot, call.err
 		}
 	}
+}
+
+// Quiesce drains proposals and excludes decision application while a certified
+// checkpoint replaces local consensus and materialized state.
+func (s *Server) Quiesce(ctx context.Context) (func(), error) {
+	s.proposeMu.Lock()
+	if s.closing || s.quiescing {
+		s.proposeMu.Unlock()
+		return nil, ErrNotReady
+	}
+	s.quiescing = true
+	s.proposeMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.proposalWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			<-done
+			s.proposeMu.Lock()
+			if !s.closing {
+				s.quiescing = false
+			}
+			s.proposeMu.Unlock()
+		}()
+		return nil, ctx.Err()
+	case <-done:
+	}
+	s.applyMu.Lock()
+	return func() {
+		s.applyMu.Unlock()
+		s.proposeMu.Lock()
+		if !s.closing {
+			s.quiescing = false
+		}
+		s.proposeMu.Unlock()
+	}, nil
 }
 
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
@@ -357,6 +416,7 @@ func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.S
 	members := plan.members
 	results := make(chan result, len(members))
 	var firstErr error
+	var uncertainSlot quepaxa.Slot
 	for rank, member := range members {
 		go func(rank int, member quepaxa.Member) {
 			delay := time.Duration(rank) * s.hedgeDelay
@@ -400,15 +460,18 @@ func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.S
 				}
 				return result.slot, nil
 			}
+			if uncertainSlot == 0 && result.slot != 0 {
+				uncertainSlot = result.slot
+			}
 			if firstErr == nil {
 				firstErr = result.err
 			}
 		}
 	}
 	if firstErr != nil {
-		return 0, fmt.Errorf("%w: %v", quepaxa.ErrQuorumUnavailable, firstErr)
+		return uncertainSlot, fmt.Errorf("%w: %v", quepaxa.ErrQuorumUnavailable, firstErr)
 	}
-	return 0, quepaxa.ErrQuorumUnavailable
+	return uncertainSlot, quepaxa.ErrQuorumUnavailable
 }
 
 func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision quepaxa.DecidedValue) error {
@@ -449,12 +512,20 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 			}
 		}
 		if err != nil {
+			if errors.Is(err, quepaxa.ErrCompacted) {
+				s.handleCompacted()
+				return ErrNotReady
+			}
 			return err
 		}
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
 		}
 		if err := s.core.AcceptCertifiedHints(response.Decisions); err != nil {
+			if errors.Is(err, quepaxa.ErrCompacted) {
+				s.handleCompacted()
+				return ErrNotReady
+			}
 			return err
 		}
 	}
@@ -644,11 +715,11 @@ func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	if err := s.readBarrier(ctx, req.Consistency); err != nil {
 		return QueryResponse{}, err
 	}
-	result, err := s.material.QueryResult(ctx, req.SQL, req.Args)
+	result, appliedSlot, err := s.material.QueryResultAt(ctx, req.SQL, req.Args)
 	if err != nil {
 		return QueryResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, nil
+	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
 func writeAPIError(w http.ResponseWriter, err error) {
@@ -808,8 +879,8 @@ func (s *Server) KVGet(ctx context.Context, req KVGetRequest) (KVGetResponse, er
 	if err := s.readBarrier(ctx, req.Consistency); err != nil {
 		return KVGetResponse{}, err
 	}
-	value, found, err := s.material.KVGet(ctx, req.Key, time.Now())
-	return KVGetResponse{Found: found, Value: value, AppliedSlot: s.material.Tip(), ConsensusTip: uint64(s.core.Tip())}, err
+	value, found, appliedSlot, err := s.material.KVGetAt(ctx, req.Key, time.Now())
+	return KVGetResponse{Found: found, Value: value, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, err
 }
 
 func (s *Server) handleKVDelete(w http.ResponseWriter, r *http.Request) {
@@ -853,6 +924,9 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if !s.writable || !s.ready() {
 		return KVMutationResponse{}, ErrNotReady
 	}
+	if operation != "put" && operation != "delete" && operation != "cas" {
+		return KVMutationResponse{}, ErrInvalidRequest
+	}
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
 		return KVMutationResponse{}, ErrInvalidRequest
 	}
@@ -870,6 +944,9 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	}
 	command := intent
 	now := time.Now().UnixMilli()
+	if req.TTLMS > math.MaxInt64-now {
+		return KVMutationResponse{}, ErrInvalidRequest
+	}
 	command.ObservedAtUnixMS = now
 	if req.TTLMS > 0 {
 		command.ExpiresAtUnixMS = now + req.TTLMS
@@ -985,8 +1062,15 @@ func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
 	if topic == "" || len(topic) > 256 {
 		return nil, nil, ErrInvalidRequest
 	}
-	ch, cancel := s.material.Subscribe(topic)
+	ch, cancel, err := s.material.Subscribe(topic)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrOverloaded, err)
+	}
 	return ch, cancel, nil
+}
+
+func (s *Server) NotificationDrops() uint64 {
+	return s.material.NotificationDrops()
 }
 
 func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
@@ -1022,7 +1106,10 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case payload := <-ch:
+		case payload, ok := <-ch:
+			if !ok {
+				return
+			}
 			data, _ := json.Marshal(payload)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
@@ -1074,11 +1161,11 @@ func (s *Server) proposePeer(ctx context.Context, sender quepaxa.NodeID, value [
 		return quepaxa.DecidedValue{}, ErrOverloaded
 	}
 	s.proposeMu.Lock()
-	if s.closing || s.peerCounts[sender] >= 2 || len(value) > maxPeerEncodedByte-s.peerB || len(value) > maxProposalEncodedByte-s.operationB {
+	if s.closing || s.quiescing || s.peerCounts[sender] >= 2 || len(value) > maxPeerEncodedByte-s.peerB || len(value) > maxProposalEncodedByte-s.operationB {
 		<-s.operationCap
 		<-s.peerCap
 		s.proposeMu.Unlock()
-		if s.closing {
+		if s.closing || s.quiescing {
 			return quepaxa.DecidedValue{}, ErrNotReady
 		}
 		return quepaxa.DecidedValue{}, ErrOverloaded
@@ -1110,6 +1197,11 @@ func (s *Server) proposePeer(ctx context.Context, sender quepaxa.NodeID, value [
 func validateReplicatedMutation(value []byte) error {
 	if len(value) == 0 || len(value) > quepaxa.MaxReplicatedValueBytes {
 		return fmt.Errorf("encoded command must be between 1 and %d bytes", quepaxa.MaxReplicatedValueBytes)
+	}
+	if barrier, err := types.DecodeReadBarrier(value); err != nil {
+		return err
+	} else if barrier {
+		return nil
 	}
 	if commands, ok, err := types.DecodeSQLBatch(value); err != nil {
 		return err

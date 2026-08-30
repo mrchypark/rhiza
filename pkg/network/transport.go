@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -144,14 +145,54 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool, timeout time.Duration) (*peerfb.ResponseT, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	conn, err := t.connection(ctx, to, waitHandshake)
-	if err != nil {
-		return nil, err
+	waitHandshake = waitHandshake || !allows0RTT(request.Operation)
+	for retried0RTT := false; ; {
+		conn, err := t.connection(ctx, to, waitHandshake)
+		if err != nil {
+			return nil, err
+		}
+		response, err := t.callConnection(ctx, conn, request)
+		t.release(to, conn)
+		if errors.Is(err, quic.Err0RTTRejected) && !retried0RTT {
+			// The early stream was discarded, not executed. Promote this same
+			// connection to 1-RTT and replay the request once within its original
+			// deadline. This prevents a peer restart from consuming one whole
+			// periodic catch-up round (or a remaining quorum attempt).
+			if _, nextErr := conn.NextConnection(ctx); nextErr != nil {
+				t.invalidate(to, conn)
+				return nil, nextErr
+			}
+			retried0RTT = true
+			continue
+		}
+		if response != nil {
+			switch response.ErrorCode {
+			case peerErrorQuorum:
+				return nil, quepaxa.ErrQuorumUnavailable
+			case peerErrorCompacted:
+				return nil, quepaxa.ErrCompacted
+			}
+		}
+		if err != nil {
+			t.invalidate(to, conn)
+			return nil, err
+		}
+		return response, nil
 	}
-	defer t.release(to, conn)
+}
+
+func allows0RTT(operation peerfb.Operation) bool {
+	switch operation {
+	case peerfb.OperationSync, peerfb.OperationReadIndex, peerfb.OperationFetchValue:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		t.invalidate(to, conn)
 		return nil, err
 	}
 	defer stream.CancelRead(0)
@@ -159,24 +200,17 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 		_ = stream.SetDeadline(deadline)
 	}
 	if err := writePeerFrame(stream, encodePeerRequest(request)); err != nil {
-		t.invalidate(to, conn)
 		stream.CancelWrite(1)
 		return nil, err
 	}
 	if err := stream.Close(); err != nil {
-		t.invalidate(to, conn)
 		return nil, err
 	}
 	data, err := readPeerFrame(stream)
 	if err != nil {
-		t.invalidate(to, conn)
 		return nil, err
 	}
-	response, err := decodePeerResponse(data)
-	if response != nil && response.ErrorCode == 1 {
-		return nil, quepaxa.ErrQuorumUnavailable
-	}
-	return response, err
+	return decodePeerResponse(data)
 }
 
 // PrepareCheckpoint waits for a durable verified quorum before the small seal

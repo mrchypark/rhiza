@@ -11,8 +11,25 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestCompactedPeerDoesNotOverrideUsableQuorumSuffix(t *testing.T) {
+	applied := quepaxa.Slot(10)
+	best := &network.DecisionsResponse{Tip: 11}
+	if !hasUsablePeerSuffix(applied, 2, 2, best) {
+		t.Fatal("usable quorum suffix was rejected")
+	}
+	best.Tip = applied
+	if hasUsablePeerSuffix(applied, 2, 2, best) {
+		t.Fatal("stale peer response was accepted as a suffix")
+	}
+	best.Tip = applied + 1
+	if hasUsablePeerSuffix(applied, 2, 3, best) {
+		t.Fatal("non-quorum suffix was accepted")
+	}
+}
 
 func TestOperationSyncPeerPermutationIsDeterministicAndBalanced(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
@@ -39,6 +56,82 @@ func TestTransientCatchUpFailureKeepsReadyNodeServing(t *testing.T) {
 	n.observeCatchUp(errors.New("temporary peer timeout"))
 	if !n.ready.Load() {
 		t.Fatal("transient catch-up failure cleared readiness")
+	}
+}
+
+func TestRestoreArchiveCatchUpMarksNodeNotReadyBeforeValidation(t *testing.T) {
+	n := &Node{}
+	n.ready.Store(true)
+	if err := n.restoreArchiveCatchUp(context.Background()); err == nil {
+		t.Fatal("restore unexpectedly succeeded")
+	}
+	if n.ready.Load() {
+		t.Fatal("restore left node ready before recovery could be validated")
+	}
+}
+
+func TestCompactedWakeMarksNodeNotReadyAndCoalesces(t *testing.T) {
+	n := &Node{catchUpWake: make(chan struct{}, 1)}
+	n.ready.Store(true)
+	n.wakeCatchUp()
+	n.wakeCatchUp()
+	if n.ready.Load() {
+		t.Fatal("compacted foreground path left node ready")
+	}
+	select {
+	case <-n.catchUpWake:
+	default:
+		t.Fatal("compacted foreground path did not wake catch-up worker")
+	}
+	select {
+	case <-n.catchUpWake:
+		t.Fatal("compacted foreground wake was not coalesced")
+	default:
+	}
+}
+
+func TestArchiveRecoveryRequiredBelowTrimmedBase(t *testing.T) {
+	if !archiveRecoveryRequired(148, 149) {
+		t.Fatal("lagging local tip did not require checkpoint recovery")
+	}
+	if archiveRecoveryRequired(149, 149) || archiveRecoveryRequired(150, 149) || archiveRecoveryRequired(0, 0) {
+		t.Fatal("retained archive suffix incorrectly required checkpoint recovery")
+	}
+}
+
+func TestCheckpointGCWaitsForFirstArchiveBase(t *testing.T) {
+	floor, ready := advanceArchiveFloor(0, 0, false)
+	if ready || floor != 0 {
+		t.Fatalf("no-base floor=(%d,%t), want GC blocked", floor, ready)
+	}
+	floor, ready = advanceArchiveFloor(floor, 7, true)
+	if !ready || floor != 7 {
+		t.Fatalf("first-base floor=(%d,%t), want (7,true)", floor, ready)
+	}
+	floor, ready = advanceArchiveFloor(floor, 5, true)
+	if !ready || floor != 7 {
+		t.Fatalf("stale-base floor=(%d,%t), want monotonic 7", floor, ready)
+	}
+}
+
+func TestCertifiedCheckpointCompactionIsSingleFlight(t *testing.T) {
+	n := &Node{}
+	n.compactionMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- n.compactCertifiedCheckpoint(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("compaction entered while another transition held the sequence lock: %v", err)
+	default:
+	}
+	n.compactionMu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("compaction did not resume after sequence lock release")
 	}
 }
 

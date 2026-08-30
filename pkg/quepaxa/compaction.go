@@ -2,6 +2,7 @@ package quepaxa
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -39,13 +40,26 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 	if err != nil {
 		return err
 	}
-	if err := c.wal.Compact(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, nil); err != nil {
+	c.checkpointMu.Lock()
+	defer c.checkpointMu.Unlock()
+	c.lockCompactionBarrier()
+	defer c.unlockCompactionBarrier()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tip >= seal.Index {
+		return fmt.Errorf("checkpoint recovery base no longer advances the certified tip")
+	}
+	retained, err := c.liveProposalValuesAboveLocked(seal.Index)
+	if err != nil {
 		return err
 	}
-	c.mu.Lock()
+	if err := c.wal.Compact(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, retained); err != nil {
+		return err
+	}
 	c.installBaseLocked(base)
+	c.advanceTipLocked()
+	c.pruneSlotAllocatorLocked()
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
-	c.mu.Unlock()
 	return nil
 }
 
@@ -102,16 +116,19 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		c.unlockCompactionBarrier()
 		return err
 	}
-	keep := make(map[[32]byte]struct{}, len(c.values))
-	for hash := range c.values {
-		keep[hash] = struct{}{}
+	retained, err := c.liveProposalValuesAboveLocked(through)
+	if err != nil {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
+		return err
 	}
-	compaction, err := c.wal.BeginCompaction(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, keep)
+	compaction, err := c.beginCompactionLocked(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, retained)
 	c.mu.Unlock()
 	c.unlockCompactionBarrier()
 	if err != nil {
 		return err
 	}
+	defer c.finishCompaction()
 	defer compaction.Abort()
 	if err := compaction.Build(); err != nil {
 		return err
@@ -131,6 +148,73 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	c.advanceTipLocked()
 	c.pruneSlotAllocatorLocked()
 	return nil
+}
+
+func (c *Core) liveProposalValuesAboveLocked(through Slot) (map[[32]byte][]byte, error) {
+	keep := make(map[[32]byte][]byte)
+	retain := func(hash ValueHash, value []byte) error {
+		if len(value) == 0 || sha256.Sum256(value) != hash {
+			return fmt.Errorf("retained proposal %x is unavailable", hash[:8])
+		}
+		keep[[32]byte(hash)] = value
+		return nil
+	}
+	// A retained decision carries its value inline and recover() restores it
+	// before it replays any recorder state. Do not retain a second raw proposal
+	// merely because an unresolved recorder references that same value. A local
+	// decision that has not reached the WAL still needs its proposal retained.
+	decided := make(map[ValueHash]struct{})
+	for slot, value := range c.decided {
+		if slot <= through {
+			continue
+		}
+		if c.logged[slot] {
+			decided[value.Hash] = struct{}{}
+			continue
+		}
+		if err := retain(value.Hash, value.Value); err != nil {
+			return nil, err
+		}
+	}
+	for slot, state := range c.recorders {
+		if slot <= through {
+			continue
+		}
+		for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
+			if proposal != nil {
+				if _, retainedByDecision := decided[proposal.Hash]; retainedByDecision {
+					continue
+				}
+				if err := retain(proposal.Hash, c.values[proposal.Hash]); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return keep, nil
+}
+
+func (c *Core) beginCompactionLocked(base qlog.Entry, retained map[[32]byte][]byte) (*qlog.Compaction, error) {
+	compaction, err := c.wal.BeginCompaction(base, retained)
+	if err != nil {
+		return nil, err
+	}
+	c.compactionValues = make(map[[32]byte]struct{}, len(retained))
+	for hash := range retained {
+		c.compactionValues[hash] = struct{}{}
+	}
+	for slot, value := range c.decided {
+		if uint64(slot) > base.Slot && c.logged[slot] {
+			c.compactionValues[[32]byte(value.Hash)] = struct{}{}
+		}
+	}
+	return compaction, nil
+}
+
+func (c *Core) finishCompaction() {
+	c.mu.Lock()
+	c.compactionValues = nil
+	c.mu.Unlock()
 }
 
 func (c *Core) lockCompactionBarrier() {
@@ -198,6 +282,7 @@ func (c *Core) RecoveryRoot() (Slot, [32]byte, bool) {
 }
 
 func (c *Core) installBaseLocked(base consensusBase) {
+	before := c.tip
 	c.floor = base.ClosedThrough
 	c.floorRoot = base.RecoveryRoot
 	c.baseLeaderEpoch = base.LeaderEpoch
@@ -253,6 +338,10 @@ func (c *Core) installBaseLocked(base consensusBase) {
 			delete(c.values, hash)
 			delete(c.valueDurable, hash)
 		}
+	}
+	if c.tip != before {
+		close(c.tipChanged)
+		c.tipChanged = make(chan struct{})
 	}
 }
 
