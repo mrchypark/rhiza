@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -576,6 +578,112 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	response, err := collectLatticeRows(result)
 	response.AppliedSlot = appliedSlot
 	return response, err
+}
+
+func (m *Materializer) EnsureGraphNodePropertyIndex(label, property string) error {
+	if label == "" || property == "" {
+		return fmt.Errorf("graph index label and property are required")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.graph == nil || m.graph.db == nil {
+		return fmt.Errorf("LatticeDB is not open")
+	}
+	err := m.graph.db.CreateNodePropertyIndex(label, property)
+	if errors.Is(err, latticedb.ErrAlreadyExists) {
+		return nil
+	}
+	return err
+}
+
+func (m *Materializer) GraphReachable(ctx context.Context, startLabel, startProperty string, startValue any, edgeType, nodeLabel string, filters map[string]any, resultProperty string, maxDepth uint32, maxResults, maxScannedEdges uint) ([]any, uint, error) {
+	if startLabel == "" || startProperty == "" || edgeType == "" || resultProperty == "" || maxDepth == 0 || maxResults == 0 || maxScannedEdges == 0 {
+		return nil, 0, fmt.Errorf("invalid graph reachability request")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	if m.graph == nil || m.graph.db == nil || m.graph.tip != m.tip {
+		return nil, 0, fmt.Errorf("graph materializer is unavailable or stale")
+	}
+	tx, err := m.graph.db.BeginRead()
+	if err != nil {
+		return nil, 0, err
+	}
+	defer tx.Rollback()
+	starts, err := tx.FindNodesByLabelProperty(startLabel, startProperty, startValue, 1)
+	if err != nil || len(starts) == 0 {
+		return nil, 0, err
+	}
+	type item struct {
+		id    uint64
+		depth uint32
+	}
+	queue := []item{{id: starts[0]}}
+	visited := map[uint64]bool{starts[0]: true}
+	values := make([]any, 0, maxResults)
+	var scanned uint
+	for len(queue) != 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, scanned, err
+		}
+		current := queue[0]
+		queue = queue[1:]
+		if current.depth == maxDepth {
+			continue
+		}
+		edges, err := tx.GetOutgoingEdgesByType(current.id, edgeType, maxScannedEdges-scanned+1)
+		if err != nil {
+			return nil, scanned, err
+		}
+		for _, edge := range edges {
+			scanned++
+			if scanned > maxScannedEdges {
+				return nil, scanned, latticedb.ErrResourceLimit
+			}
+			if visited[edge.TargetID] {
+				continue
+			}
+			node, err := tx.GetNode(edge.TargetID)
+			if err != nil {
+				return nil, scanned, err
+			}
+			if (nodeLabel != "" && !containsLabel(node.Labels, nodeLabel)) || !matchesProperties(node.Properties, filters) {
+				continue
+			}
+			visited[edge.TargetID] = true
+			value, ok := node.Properties[resultProperty]
+			if !ok {
+				return nil, scanned, fmt.Errorf("reachable node is missing result property %q", resultProperty)
+			}
+			values = append(values, value)
+			if uint(len(values)) > maxResults {
+				return nil, scanned, latticedb.ErrResourceLimit
+			}
+			queue = append(queue, item{id: edge.TargetID, depth: current.depth + 1})
+		}
+	}
+	return values, scanned, nil
+}
+
+func containsLabel(labels []string, target string) bool {
+	for _, label := range labels {
+		if label == target {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesProperties(properties map[string]any, filters map[string]any) bool {
+	for key, expected := range filters {
+		if actual, ok := properties[key]; !ok || !reflect.DeepEqual(actual, expected) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Materializer) GraphReadStream(ctx context.Context, stream string, afterSequence uint64, limit uint, wait time.Duration) ([]types.GraphStreamRecord, uint64, error) {

@@ -3,6 +3,7 @@ package rhiza_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -82,6 +83,39 @@ func TestEmbeddedGraphGoAPI(t *testing.T) {
 	events, err = db.GraphStreamRead(context.Background(), rhiza.GraphStreamReadRequest{Stream: "tea-events", Limit: 100})
 	if err != nil || len(events.Records) != 0 {
 		t.Fatalf("trimmed events: %#v err=%v", events.Records, err)
+	}
+}
+
+func TestEmbeddedGraphReachable(t *testing.T) {
+	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i, cypher := range []string{
+		"CREATE (:Concept {key: 'a', workspace: 'w'})",
+		"CREATE (:Concept {key: 'b', workspace: 'w'})",
+		"CREATE (:Concept {key: 'c', workspace: 'w'})",
+		"MATCH (a:Concept {key: 'a'}), (b:Concept {key: 'b'}) CREATE (a)-[:REL]->(b)",
+		"MATCH (b:Concept {key: 'b'}), (c:Concept {key: 'c'}) CREATE (b)-[:REL]->(c)",
+	} {
+		if _, err := db.GraphExecute(context.Background(), rhiza.GraphCommand{RequestID: fmt.Sprintf("reachable-%d", i), Cypher: cypher}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.EnsureGraphNodePropertyIndex("Concept", "key"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.GraphReachable(context.Background(), rhiza.GraphReachabilityRequest{
+		StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL",
+		NodeLabel: "Concept", NodeFilters: map[string]any{"workspace": "w"}, ResultProperty: "key",
+		MaxDepth: 2, MaxResults: 10, MaxScannedEdges: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.Values, []any{"b", "c"}) || result.ScannedEdges != 2 {
+		t.Fatalf("unexpected reachability result: %#v", result)
 	}
 }
 

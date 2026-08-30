@@ -69,6 +69,20 @@ func (n *Node) SpeculateSQL(ctx context.Context, fn func(*sql.Tx) error) error {
 	return n.material.SpeculateSQL(ctx, fn)
 }
 
+func (n *Node) EnsureGraphNodePropertyIndex(label, property string) error {
+	if n.material == nil {
+		return sql.ErrConnDone
+	}
+	return n.material.EnsureGraphNodePropertyIndex(label, property)
+}
+
+func (n *Node) GraphReachable(ctx context.Context, startLabel, startProperty string, startValue any, edgeType, nodeLabel string, filters map[string]any, resultProperty string, maxDepth uint32, maxResults, maxScannedEdges uint) ([]any, uint, error) {
+	if n.material == nil {
+		return nil, 0, sql.ErrConnDone
+	}
+	return n.material.GraphReachable(ctx, startLabel, startProperty, startValue, edgeType, nodeLabel, filters, resultProperty, maxDepth, maxResults, maxScannedEdges)
+}
+
 // New creates a new Node.
 func New(config *types.ExecutionConfig) *Node {
 	return &Node{
