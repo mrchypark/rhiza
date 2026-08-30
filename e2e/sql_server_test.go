@@ -22,6 +22,10 @@ type queryResponse struct {
 	Rows    [][]any  `json:"rows"`
 }
 
+type mutationReceipt struct {
+	Status string `json:"status"`
+}
+
 func TestSQLServer(t *testing.T) {
 	if baseURL == "" {
 		t.Skip("set RHIZA_E2E_URL to run the SQL server E2E test")
@@ -55,15 +59,19 @@ func TestSQLServer(t *testing.T) {
 		t.Fatalf("unexpected query result: %+v", got)
 	}
 
-	var transaction struct {
-		Success bool `json:"success"`
-	}
+	postStatus(t, "/sql/execute", map[string]any{
+		"request_id": "unsupported-rows-" + suffix,
+		"sql":        "INSERT INTO " + table + " (id, name) VALUES (99, 'unsupported')",
+		"want_rows":  true,
+	}, http.StatusBadRequest)
+
+	var transaction mutationReceipt
 	post(t, "/sql/transaction", map[string]any{
 		"request_id": "transaction-" + suffix,
-		"statements": []map[string]any{{"sql": "INSERT INTO " + table + " (id, name) VALUES (?, ?) RETURNING id", "args": []any{2, "Grace"}, "want_rows": true}},
+		"statements": []map[string]any{{"sql": "INSERT INTO " + table + " (id, name) VALUES (?, ?)", "args": []any{2, "Grace"}}},
 	}, &transaction)
-	if !transaction.Success {
-		t.Fatal("transaction was not committed")
+	if transaction.Status != "committed" {
+		t.Fatalf("transaction receipt: %+v", transaction)
 	}
 	post(t, "/sql/query", map[string]any{"sql": "SELECT name FROM " + table + " WHERE id = ?", "args": []any{2}, "consistency": "linearizable"}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != "Grace" {
@@ -76,11 +84,14 @@ func TestSQLServer(t *testing.T) {
 		"statements": []map[string]any{
 			{"sql": "CREATE VIRTUAL TABLE " + ftsTable + " USING fts5(name)"},
 			{"sql": "INSERT INTO " + ftsTable + "(name) SELECT name FROM " + table},
-			{"sql": "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 3) SELECT json_array(group_concat(n, '')) FROM seq", "want_rows": true},
 		},
 	}, &transaction)
-	if !transaction.Success {
-		t.Fatal("SQLite feature transaction was not committed")
+	if transaction.Status != "committed" {
+		t.Fatalf("SQLite feature transaction receipt: %+v", transaction)
+	}
+	post(t, "/sql/query", map[string]any{"sql": "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 3) SELECT json_array(group_concat(n, '')) FROM seq"}, &got)
+	if len(got.Rows) != 1 || got.Rows[0][0] != `["123"]` {
+		t.Fatalf("SQLite CTE/JSON result: %+v", got)
 	}
 	post(t, "/sql/query", map[string]any{"sql": "SELECT name, row_number() OVER (ORDER BY name) FROM " + ftsTable + " WHERE " + ftsTable + " MATCH ?", "args": []any{"Grace"}}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != "Grace" || got.Rows[0][1] != float64(1) {
@@ -249,5 +260,22 @@ func post(tb testing.TB, path string, request, response any) {
 		if err := json.NewDecoder(res.Body).Decode(response); err != nil {
 			tb.Fatal(err)
 		}
+	}
+}
+
+func postStatus(tb testing.TB, path string, request any, want int) {
+	tb.Helper()
+	body, err := json.Marshal(request)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	res, err := http.Post(baseURL+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != want {
+		message, _ := io.ReadAll(res.Body)
+		tb.Fatalf("%s: status=%s want=%d body=%s", path, res.Status, want, message)
 	}
 }
