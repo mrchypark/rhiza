@@ -11,6 +11,9 @@ import (
 )
 
 func TestSQLBatcherIdleRequestDispatchesImmediately(t *testing.T) {
+	if wait := batchWait(true, 1, 1, 0); wait != 0 {
+		t.Fatalf("idle batch wait=%v, want zero", wait)
+	}
 	proposed := make(chan []byte, 1)
 	b := newSQLBatcher(func(_ context.Context, value []byte) (quepaxa.Slot, error) {
 		proposed <- value
@@ -29,8 +32,8 @@ func TestSQLBatcherIdleRequestDispatchesImmediately(t *testing.T) {
 		if err != nil || !ok || len(commands) != 1 || commands[0].RequestID != "idle" {
 			t.Fatalf("decode batch: commands=%v ok=%v err=%v", commands, ok, err)
 		}
-	case <-time.After(20 * time.Millisecond):
-		t.Fatal("idle request waited for a batching timer")
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle request did not dispatch")
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)

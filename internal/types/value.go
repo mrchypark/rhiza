@@ -49,18 +49,20 @@ type MutationReceipt struct {
 
 // SQLCommand is one submitter command inside a proposer batch.
 type SQLCommand struct {
-	RequestID  string         `json:"request_id"`
-	SQL        string         `json:"sql,omitempty"`
-	Args       []any          `json:"args,omitempty"`
+	RequestID string `json:"request_id"`
+	SQL       string `json:"sql,omitempty"`
+	Args      []any  `json:"args,omitempty"`
+	// WantRows is reserved and rejected for replicated mutations.
 	WantRows   bool           `json:"want_rows,omitempty"`
 	Statements []SQLStatement `json:"statements,omitempty"`
 }
 
 // SQLStatement is one statement in a replicated client transaction.
 type SQLStatement struct {
-	SQL      string `json:"sql"`
-	Args     []any  `json:"args,omitempty"`
-	WantRows bool   `json:"want_rows,omitempty"`
+	SQL  string `json:"sql"`
+	Args []any  `json:"args,omitempty"`
+	// WantRows is reserved and rejected for replicated mutations.
+	WantRows bool `json:"want_rows,omitempty"`
 }
 
 // SQLStatementResult is the deterministic result returned by one statement.
@@ -71,7 +73,8 @@ type SQLStatementResult struct {
 	Rows         [][]any  `json:"rows,omitempty"`
 }
 
-// SQLCommandResult is persisted with the request ID for idempotent retries.
+// SQLCommandResult is the transient deterministic result summarized into the
+// bounded MutationReceipt retained for idempotent retries.
 type SQLCommandResult struct {
 	Statements []SQLStatementResult `json:"statements"`
 	Error      string               `json:"error,omitempty"`

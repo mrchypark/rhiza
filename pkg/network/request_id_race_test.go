@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -16,8 +17,10 @@ import (
 // first Record round until two distinct proposals have reached remote ingress,
 // making the otherwise rare cross-node admission race deterministic.
 type requestIDRaceTransport struct {
-	mu    sync.RWMutex
-	cores map[quepaxa.NodeID]*quepaxa.Core
+	mu               sync.RWMutex
+	cores            map[quepaxa.NodeID]*quepaxa.Core
+	disabled         map[quepaxa.NodeID]bool
+	failNextDecision bool
 
 	gateMu sync.Mutex
 	hashes map[quepaxa.ValueHash]struct{}
@@ -25,7 +28,7 @@ type requestIDRaceTransport struct {
 }
 
 func (t *requestIDRaceTransport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
-	if request.Slot == 1 && request.Step == 4 {
+	if t.gate != nil && request.Slot == 1 && request.Step == 4 {
 		t.gateMu.Lock()
 		t.hashes[request.Proposal.Hash] = struct{}{}
 		if len(t.hashes) == 2 {
@@ -43,22 +46,31 @@ func (t *requestIDRaceTransport) SendRecord(ctx context.Context, to quepaxa.Node
 			return quepaxa.Summary{}, ctx.Err()
 		}
 	}
-	t.mu.RLock()
-	core := t.cores[to]
-	t.mu.RUnlock()
-	if core == nil {
-		return quepaxa.Summary{}, errors.New("unknown peer")
+	core, err := t.peer(to)
+	if err != nil {
+		return quepaxa.Summary{}, err
 	}
 	return core.Record(ctx, request)
 }
 
 func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepaxa.Decision) error {
-	t.mu.RLock()
-	cores := make([]*quepaxa.Core, 0, len(t.cores))
-	for _, core := range t.cores {
-		cores = append(cores, core)
+	t.mu.Lock()
+	if t.failNextDecision {
+		t.failNextDecision = false
+		t.mu.Unlock()
+		return errors.New("injected learner failure")
 	}
-	t.mu.RUnlock()
+	cores := make([]*quepaxa.Core, 0, len(t.cores))
+	for id, core := range t.cores {
+		if !t.disabled[id] {
+			cores = append(cores, core)
+		}
+	}
+	quorum := len(t.cores)/2 + 1
+	t.mu.Unlock()
+	if len(cores) < quorum {
+		return quepaxa.ErrQuorumUnavailable
+	}
 	for _, core := range cores {
 		if err := core.AcceptDecision(decision); err != nil {
 			return err
@@ -68,31 +80,25 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 }
 
 func (t *requestIDRaceTransport) ReadTip(_ context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
-	t.mu.RLock()
-	core := t.cores[to]
-	t.mu.RUnlock()
-	if core == nil {
-		return 0, errors.New("unknown peer")
+	core, err := t.peer(to)
+	if err != nil {
+		return 0, err
 	}
 	return core.Tip(), nil
 }
 
 func (t *requestIDRaceTransport) StageValue(_ context.Context, to quepaxa.NodeID, hash quepaxa.ValueHash, value []byte) error {
-	t.mu.RLock()
-	core := t.cores[to]
-	t.mu.RUnlock()
-	if core == nil {
-		return errors.New("unknown peer")
+	core, err := t.peer(to)
+	if err != nil {
+		return err
 	}
 	return core.StageValue(hash, value)
 }
 
 func (t *requestIDRaceTransport) FetchValue(_ context.Context, from quepaxa.NodeID, hash quepaxa.ValueHash) ([]byte, error) {
-	t.mu.RLock()
-	core := t.cores[from]
-	t.mu.RUnlock()
-	if core == nil {
-		return nil, errors.New("unknown peer")
+	core, err := t.peer(from)
+	if err != nil {
+		return nil, err
 	}
 	value, ok := core.Value(hash)
 	if !ok {
@@ -101,17 +107,46 @@ func (t *requestIDRaceTransport) FetchValue(_ context.Context, from quepaxa.Node
 	return value, nil
 }
 
+func (t *requestIDRaceTransport) peer(id quepaxa.NodeID) (*quepaxa.Core, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.disabled[id] {
+		return nil, errors.New("peer unavailable")
+	}
+	core := t.cores[id]
+	if core == nil {
+		return nil, errors.New("unknown peer")
+	}
+	return core, nil
+}
+
+func (t *requestIDRaceTransport) disable(ids ...quepaxa.NodeID) {
+	t.mu.Lock()
+	for _, id := range ids {
+		t.disabled[id] = true
+	}
+	t.mu.Unlock()
+}
+
 type requestIDRaceCluster struct {
-	servers  map[quepaxa.NodeID]*Server
-	cores    map[quepaxa.NodeID]*quepaxa.Core
-	material map[quepaxa.NodeID]*materializer.Materializer
+	servers   map[quepaxa.NodeID]*Server
+	cores     map[quepaxa.NodeID]*quepaxa.Core
+	material  map[quepaxa.NodeID]*materializer.Materializer
+	transport *requestIDRaceTransport
 }
 
 func newRequestIDRaceCluster(t *testing.T) requestIDRaceCluster {
+	return newInMemoryThreePeerCluster(t, true)
+}
+
+func newInMemoryThreePeerCluster(t *testing.T, gated bool) requestIDRaceCluster {
 	t.Helper()
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
-	transport := &requestIDRaceTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), hashes: make(map[quepaxa.ValueHash]struct{}), gate: make(chan struct{})}
-	cluster := requestIDRaceCluster{servers: make(map[quepaxa.NodeID]*Server), cores: make(map[quepaxa.NodeID]*quepaxa.Core), material: make(map[quepaxa.NodeID]*materializer.Materializer)}
+	transport := &requestIDRaceTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), disabled: make(map[quepaxa.NodeID]bool), hashes: make(map[quepaxa.ValueHash]struct{})}
+	if gated {
+		transport.gate = make(chan struct{})
+	}
+	cluster := requestIDRaceCluster{servers: make(map[quepaxa.NodeID]*Server), cores: make(map[quepaxa.NodeID]*quepaxa.Core), material: make(map[quepaxa.NodeID]*materializer.Materializer), transport: transport}
 	for _, member := range members {
 		core := mustCore(t, member.ID, members, nil, transport)
 		material, err := materializer.Open(t.TempDir()+"/state.sqlite", 1)
@@ -128,6 +163,23 @@ func newRequestIDRaceCluster(t *testing.T) requestIDRaceCluster {
 		t.Cleanup(func() { server.Close(); material.Close() })
 	}
 	return cluster
+}
+
+func (c requestIDRaceCluster) applyAvailable(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tip := c.cores["n1"].Tip()
+	for id, server := range c.servers {
+		c.transport.mu.RLock()
+		disabled := c.transport.disabled[id]
+		c.transport.mu.RUnlock()
+		if !disabled {
+			if err := server.applyDecisions(ctx, tip); err != nil {
+				t.Fatalf("apply %s through %d: %v", id, tip, err)
+			}
+		}
+	}
 }
 
 func (c requestIDRaceCluster) applyAll(t *testing.T) {
@@ -251,5 +303,93 @@ func TestCrossIngressRequestIDConflictDoesNotBlockSQLKVOrNotify(t *testing.T) {
 			t.Fatalf("follow-up mutation: %v", err)
 		}
 		cluster.applyAll(t)
+	})
+}
+
+func TestThreePeerSQLHAContract(t *testing.T) {
+	t.Run("idempotency and conditional transaction", func(t *testing.T) {
+		cluster := newInMemoryThreePeerCluster(t, false)
+		ctx := context.Background()
+		for _, request := range []ExecuteRequest{
+			{RequestID: "schema-claim", SQL: "CREATE TABLE claims (id INTEGER PRIMARY KEY, marker TEXT NOT NULL, generation INTEGER NOT NULL)"},
+			{RequestID: "schema-events", SQL: "CREATE TABLE claim_events (marker TEXT NOT NULL, generation INTEGER NOT NULL)"},
+			{RequestID: "seed", SQL: "INSERT INTO claims VALUES (1, 'open', 0)"},
+		} {
+			if _, err := cluster.servers["n1"].Execute(ctx, request); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cluster.applyAll(t)
+		request := ExecuteRequest{RequestID: "claim", Statements: []types.SQLStatement{
+			{SQL: "UPDATE claims SET marker = ?, generation = generation + 1 WHERE id = 1 AND generation = 0", Args: []any{"worker-a"}},
+			{SQL: "INSERT INTO claim_events SELECT marker, generation FROM claims WHERE id = 1 AND marker = ?", Args: []any{"worker-a"}},
+		}}
+		first, err := cluster.servers["n1"].Execute(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replay, err := cluster.servers["n2"].Execute(ctx, request)
+		if err != nil || !reflect.DeepEqual(first, replay) {
+			t.Fatalf("replay=%#v first=%#v err=%v", replay, first, err)
+		}
+		conflict := request
+		conflict.Statements = []types.SQLStatement{{SQL: "UPDATE claims SET marker = 'other' WHERE id = 1"}}
+		if _, err := cluster.servers["n3"].Execute(ctx, conflict); !errors.Is(err, ErrRequestConflict) {
+			t.Fatalf("conflicting request_id error=%v", err)
+		}
+		cluster.applyAll(t)
+		result, err := cluster.servers["n2"].Query(ctx, QueryRequest{SQL: "SELECT c.marker, c.generation, COUNT(e.marker) FROM claims c LEFT JOIN claim_events e ON e.marker = c.marker AND e.generation = c.generation GROUP BY c.id", Consistency: "linearizable"})
+		if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != "worker-a" || result.Rows[0][1] != int64(1) || result.Rows[0][2] != int64(1) {
+			t.Fatalf("claim rows=%#v err=%v", result.Rows, err)
+		}
+	})
+
+	t.Run("quorum loss", func(t *testing.T) {
+		cluster := newInMemoryThreePeerCluster(t, false)
+		ctx := context.Background()
+		if _, err := cluster.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE availability (id INTEGER PRIMARY KEY)"}); err != nil {
+			t.Fatal(err)
+		}
+		cluster.applyAll(t)
+		cluster.transport.disable("n3")
+		if _, err := cluster.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "one-down", SQL: "INSERT INTO availability VALUES (1)"}); err != nil {
+			t.Fatalf("one-peer loss write: %v", err)
+		}
+		cluster.applyAvailable(t)
+		cluster.transport.disable("n2")
+		if _, err := cluster.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "two-down", SQL: "INSERT INTO availability VALUES (2)"}); err == nil {
+			t.Fatal("two-peer loss write succeeded")
+		}
+		if _, err := cluster.servers["n1"].Query(ctx, QueryRequest{SQL: "SELECT COUNT(*) FROM availability", Consistency: "linearizable"}); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+			t.Fatalf("linearizable read error=%v", err)
+		}
+		result, err := cluster.servers["n1"].Query(ctx, QueryRequest{SQL: "SELECT COUNT(*) FROM availability", Consistency: "local"})
+		if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != int64(1) {
+			t.Fatalf("local rows=%#v err=%v", result.Rows, err)
+		}
+	})
+
+	t.Run("commit unknown retry converges", func(t *testing.T) {
+		cluster := newInMemoryThreePeerCluster(t, false)
+		ctx := context.Background()
+		if _, err := cluster.servers["n1"].Execute(ctx, ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE uncertain (id INTEGER PRIMARY KEY)"}); err != nil {
+			t.Fatal(err)
+		}
+		cluster.applyAll(t)
+		cluster.transport.mu.Lock()
+		cluster.transport.failNextDecision = true
+		cluster.transport.mu.Unlock()
+		request := ExecuteRequest{RequestID: "uncertain", SQL: "INSERT INTO uncertain VALUES (1)"}
+		if _, err := cluster.servers["n1"].Execute(ctx, request); !errors.Is(err, ErrCommitUnknown) {
+			t.Fatalf("first error=%v, want commit unknown", err)
+		}
+		if _, err := cluster.servers["n2"].Execute(ctx, request); err != nil {
+			t.Fatalf("retry: %v", err)
+		}
+		cluster.applyAll(t)
+		result, err := cluster.servers["n3"].Query(ctx, QueryRequest{SQL: "SELECT COUNT(*) FROM uncertain", Consistency: "linearizable"})
+		if err != nil || len(result.Rows) != 1 || result.Rows[0][0] != int64(1) {
+			t.Fatalf("rows=%#v err=%v", result.Rows, err)
+		}
 	})
 }

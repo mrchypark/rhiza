@@ -18,7 +18,9 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-const maxRequestBody = 1 << 20
+// MaxRequestBodyBytes is the HTTP adapter's JSON decoding limit. Replicated
+// mutations have the smaller quepaxa.MaxReplicatedValueBytes consensus limit.
+const MaxRequestBodyBytes = 1 << 20
 
 var (
 	ErrNotReady              = errors.New("node is not ready")
@@ -585,16 +587,43 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ExecuteRequest is the request body for execute.
 type ExecuteRequest struct {
-	RequestID  string               `json:"request_id"`
-	SQL        string               `json:"sql,omitempty"`
-	Args       []any                `json:"args,omitempty"`
+	RequestID string `json:"request_id"`
+	SQL       string `json:"sql,omitempty"`
+	Args      []any  `json:"args,omitempty"`
+	// WantRows is unsupported for replicated mutations; use Query after Execute.
 	WantRows   bool                 `json:"want_rows,omitempty"`
 	Statements []types.SQLStatement `json:"statements,omitempty"`
 }
 
-// ExecuteResponse is the response body for execute.
+// ExecuteResponse contains the bounded aggregate receipt retained for retries.
+// Replicated statement rows are not returned; use Query after Execute.
 type ExecuteResponse struct {
 	types.MutationReceipt
+}
+
+// ValidateExecuteRequest applies the same mutation contract and encoded-size
+// check as Execute without submitting the command.
+func ValidateExecuteRequest(req ExecuteRequest) error {
+	_, err := validatedSQLCommand(req)
+	return err
+}
+
+func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, error) {
+	if req.RequestID == "" {
+		return types.SQLCommand{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+	}
+	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
+	if err := materializer.ValidateSQLCommand(command); err != nil {
+		return types.SQLCommand{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	encoded, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		return types.SQLCommand{}, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
+	}
+	if len(encoded) > quepaxa.MaxReplicatedValueBytes {
+		return types.SQLCommand{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
+	}
+	return command, nil
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -622,17 +651,11 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if !s.writable || !s.ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
-	if req.RequestID == "" {
-		return ExecuteResponse{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
-	}
-	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
-	if err := materializer.ValidateSQLCommand(command); err != nil {
-		return ExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	command, err := validatedSQLCommand(req)
+	if err != nil {
+		return ExecuteResponse{}, err
 	}
 	defer s.lockRequest(req.RequestID)()
-	if encoded, err := types.EncodeSQLBatch([]types.SQLCommand{command}); err != nil || len(encoded) > quepaxa.MaxReplicatedValueBytes {
-		return ExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
-	}
 	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil {
 		return ExecuteResponse{}, err
 	} else if !matches {
@@ -643,7 +666,7 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	} else if found {
 		return ExecuteResponse{MutationReceipt: receipt}, nil
 	}
-	_, err := s.sqlBatcher.submit(ctx, command)
+	_, err = s.sqlBatcher.submit(ctx, command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
@@ -802,7 +825,7 @@ func mutationKind(kind string) (types.MutationKind, bool) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodyBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
 	decoder.DisallowUnknownFields()

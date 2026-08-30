@@ -821,6 +821,10 @@ func (n *Node) API() (*network.Server, error) {
 	return n.server, nil
 }
 
+// Ready reports whether local startup recovery and catch-up have completed.
+// It does not prove current quorum availability.
+func (n *Node) Ready() bool { return n.ready.Load() }
+
 func quarantineSQLite(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil

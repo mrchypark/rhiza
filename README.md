@@ -48,11 +48,17 @@ directly on `DB`.
 
 ## Optional HTTP API
 
-All mutations require a unique `request_id` and are idempotent. JSON request
-bodies are limited to 1 MiB. SQL is limited to 256 KiB, 999 arguments, 64
-statements per transaction, and 10,000 returned rows.
+All mutations require a unique `request_id` and are idempotent. The optional
+HTTP adapter accepts JSON bodies up to 1 MiB, while every canonically encoded
+consensus mutation must fit within 128 KiB. An HTTP request below 1 MiB can
+therefore still be rejected by the consensus limit. Embedded SQL callers can
+preflight the exact mutation contract with `rhiza.ValidateExecuteRequest` and
+inspect `rhiza.MaxReplicatedMutationBytes`; neither limit should be raised
+without evaluating consensus latency and memory. SQL text is limited to 256
+KiB, with at most 999 arguments and 64 statements per transaction. Queries
+return at most 10,000 rows.
 
-- `POST /sql/execute`: one statement, arguments, and optional returned rows.
+- `POST /sql/execute`: one mutation statement and arguments.
 - `POST /sql/transaction`: an atomic `statements` array.
 - `POST /sql/query`: arguments plus `local` or `linearizable` consistency.
 - `POST /graph/execute`: one idempotent Cypher mutation with named arguments.
@@ -68,9 +74,11 @@ transaction endpoint.
 The SQL surface is SQLite's: DDL, views, triggers, generated and STRICT tables,
 partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
 UPSERT, RETURNING, window functions, JSON functions, and FTS5 are supported.
-Read-only statements may also appear in a replicated transaction when their
-rows are needed by setting `want_rows`; raw unprepared SQL batches are omitted
-because the prepared `statements` array covers the same database features.
+Replicated `Execute` and transaction calls never expose statement rows:
+`want_rows` is rejected and their idempotent response is one bounded aggregate
+`MutationReceipt`. Use `Query` for read-only SQL and observe committed state
+with `linearizable` consistency. Raw unprepared SQL batches are omitted because
+the prepared `statements` array covers the same database features.
 
 ## Peer transport
 
@@ -83,8 +91,14 @@ deadlines, and reconnect after transport failure.
 Replay-safe `Record`, certified `Learned`, and read-only `Decisions` operations
 may use QUIC 0-RTT after session resumption. `Propose` waits for the handshake
 because replay before a decision could consume duplicate consensus slots.
-Peer tokens are checked against fixed membership when configured. The public
-HTTP API remains TCP 8080 and contains no registered internal consensus routes.
+Peer tokens are checked against fixed membership when configured. This is
+server authentication and membership-token authorization, not peer mTLS.
+Deploy peer UDP and the optional HTTP adapter only on a private network, limit
+them with firewall or Kubernetes NetworkPolicy, keep membership tokens secret,
+and do not expose the unauthenticated HTTP adapter publicly. Add peer mTLS at a
+deployment boundary where private-network and token trust are insufficient.
+The public HTTP API remains TCP 8080 and contains no registered internal
+consensus routes.
 
 ## Reads and failures
 
@@ -93,6 +107,12 @@ quorum. Linearizable reads decide a unique read barrier and return HTTP 503 if
 a quorum is unavailable; they never fall back to a stale read. With three
 peers, one failed peer preserves reads and writes. Two failed peers preserve
 only local reads and reject writes and linearizable reads with HTTP 503.
+
+For embedded health checks, `DB.Ready()` means local recovery and startup
+catch-up completed; it is not a live quorum signal, so an isolated peer may
+remain locally ready. Use an inexpensive `linearizable` query when current
+quorum readiness is required. Mutations and linearizable reads always enforce
+quorum at operation time and fail closed.
 
 SQLite and LatticeDB are derived from the certified QLog. Startup replays
 missing decisions; unreadable local state is quarantined and rebuilt from the

@@ -3,9 +3,11 @@ package rhiza_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,9 @@ func TestEmbeddedGoAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if !db.Ready() {
+		t.Fatal("opened single-peer DB is not locally ready")
+	}
 	if _, err := db.Execute(context.Background(), rhiza.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"}); err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +49,36 @@ func TestEmbeddedGoAPI(t *testing.T) {
 	kv, err := db.KVGet(context.Background(), rhiza.KVGetRequest{Key: "kind"})
 	if err != nil || !kv.Found || string(kv.Value) != "combined" {
 		t.Fatalf("unexpected KV value: %q found=%v err=%v", kv.Value, kv.Found, err)
+	}
+}
+
+func TestExecuteContractAndEncodedSizeBoundary(t *testing.T) {
+	if rhiza.MaxReplicatedMutationBytes != 128<<10 || rhiza.MaxHTTPBodyBytes != 1<<20 {
+		t.Fatalf("limits consensus=%d HTTP=%d", rhiza.MaxReplicatedMutationBytes, rhiza.MaxHTTPBodyBytes)
+	}
+	if err := rhiza.ValidateExecuteRequest(rhiza.ExecuteRequest{RequestID: "rows", SQL: "SELECT 1", WantRows: true}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("want_rows validation error=%v", err)
+	}
+
+	valid := func(n int) error {
+		return rhiza.ValidateExecuteRequest(rhiza.ExecuteRequest{
+			RequestID: "size", SQL: "CREATE TABLE size_limit (id INTEGER) /*" + strings.Repeat("x", n) + "*/",
+		})
+	}
+	low, high := 0, rhiza.MaxReplicatedMutationBytes
+	for low < high {
+		mid := low + (high-low+1)/2
+		if valid(mid) == nil {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	if err := valid(low); err != nil {
+		t.Fatalf("largest accepted mutation rejected: %v", err)
+	}
+	if err := valid(low + 1); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("oversized mutation error=%v", err)
 	}
 }
 

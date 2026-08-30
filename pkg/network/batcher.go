@@ -176,7 +176,7 @@ func (b *mutationBatcher[T]) run() {
 		encodedSize := b.baseSize + len(first.encoded)
 		now := time.Now()
 		ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(first.encoded))
-		if idle {
+		if batchWait(idle, ewmaRate, encodedSize, time.Since(first.enqueued)) <= 0 {
 			b.dispatch(items, encoded)
 			continue
 		}
@@ -202,7 +202,7 @@ func (b *mutationBatcher[T]) run() {
 			default:
 			}
 
-			wait := adaptiveWait(ewmaRate, encodedSize, time.Since(first.enqueued))
+			wait := batchWait(false, ewmaRate, encodedSize, time.Since(first.enqueued))
 			if wait <= 0 {
 				break
 			}
@@ -243,6 +243,13 @@ func (b *mutationBatcher[T]) run() {
 		}
 		b.dispatch(items, encoded)
 	}
+}
+
+func batchWait(idle bool, rate float64, currentBytes int, oldestAge time.Duration) time.Duration {
+	if idle {
+		return 0
+	}
+	return adaptiveWait(rate, currentBytes, oldestAge)
 }
 
 func (b *mutationBatcher[T]) next(carry *batchItem) (*batchItem, bool) {

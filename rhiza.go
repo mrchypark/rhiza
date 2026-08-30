@@ -83,6 +83,10 @@ const (
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
 	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
 	DefaultHedgeDelay              = 5 * time.Millisecond
+	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
+	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
+	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
+	MaxHTTPBodyBytes = network.MaxRequestBodyBytes
 )
 
 var (
@@ -166,6 +170,15 @@ func (db *DB) Close() error {
 	})
 	return db.closeErr
 }
+
+// Ready reports whether local recovery and catch-up completed. It is not a
+// live quorum probe: an isolated peer may remain locally ready. Mutations and
+// linearizable queries still fail closed when quorum is unavailable.
+func (db *DB) Ready() bool { return db.node.Ready() }
+
+// ValidateExecuteRequest applies the replicated SQL contract and encoded-size
+// limit without submitting the mutation.
+func ValidateExecuteRequest(req ExecuteRequest) error { return network.ValidateExecuteRequest(req) }
 
 // Handler exposes the optional HTTP server API without opening a listener.
 func (db *DB) Handler() http.Handler                            { return db.api }

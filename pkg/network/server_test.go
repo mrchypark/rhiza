@@ -264,6 +264,27 @@ func TestLinearizableQueryFailsClosedWithoutQuorum(t *testing.T) {
 	}
 }
 
+func TestHTTPBodyLimitIsIndependentFromConsensusLimit(t *testing.T) {
+	base := []byte(`{"sql":"SELECT 1"}`)
+	for _, test := range []struct {
+		name string
+		size int
+		ok   bool
+	}{
+		{name: "at limit", size: MaxRequestBodyBytes, ok: true},
+		{name: "over limit", size: MaxRequestBodyBytes + 1, ok: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := append(append([]byte(nil), base...), bytes.Repeat([]byte(" "), test.size-len(base))...)
+			var request QueryRequest
+			err := decodeJSON(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/sql/query", bytes.NewReader(body)), &request)
+			if (err == nil) != test.ok {
+				t.Fatalf("decode error=%v, want ok=%v", err, test.ok)
+			}
+		})
+	}
+}
+
 func BenchmarkServerQuery(b *testing.B) {
 	members := []quepaxa.Member{{ID: "n1"}}
 	core := mustCore(b, "n1", members, nil, nil)

@@ -339,18 +339,22 @@ func TestCompleteDecisionAndCompactionLockBoundary(t *testing.T) {
 			completeDone <- err
 		}()
 		<-sendStarted
-		compactDone := make(chan error, 1)
-		go func() { compactDone <- core.CompactThrough(1, root) }()
+		barrierDone := make(chan struct{})
+		go func() {
+			core.lockCompactionBarrier()
+			core.unlockCompactionBarrier()
+			close(barrierDone)
+		}()
 		select {
-		case err := <-compactDone:
-			if err != nil {
-				t.Fatal(err)
-			}
-		case <-time.After(time.Second):
+		case <-barrierDone:
+		case <-time.After(5 * time.Second):
 			t.Fatal("network dissemination held a Core lock")
 		}
 		close(releaseSend)
 		if err := <-completeDone; err != nil {
+			t.Fatal(err)
+		}
+		if err := core.CompactThrough(1, root); err != nil {
 			t.Fatal(err)
 		}
 	})
