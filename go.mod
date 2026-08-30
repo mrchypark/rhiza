@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/go-kit/log v0.2.1
 	github.com/google/flatbuffers v25.12.19+incompatible
-	github.com/mrchypark/latticedb-go v0.0.0-20260830110907-32915dd7fe91
+	github.com/mrchypark/latticedb-go v0.0.0-20260830120134-035567e370c1
 	github.com/ncruces/go-sqlite3 v0.35.3
 	github.com/quic-go/quic-go v0.61.0
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
