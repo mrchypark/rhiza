@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -636,6 +637,12 @@ func TestRestoreCheckpointBaseReplacesLaggingPrefix(t *testing.T) {
 	}
 	if target.Tip() != 7 || target.CompactionFloor() != 5 {
 		t.Fatalf("tip=%d floor=%d, want 7/5", target.Tip(), target.CompactionFloor())
+	}
+	target.mu.Lock()
+	target.floorRoot = sha256.Sum256([]byte("wrong recovery root"))
+	target.mu.Unlock()
+	if err := target.ValidateCheckpointBase(context.Background(), seal, baseDecision); err == nil || !strings.Contains(err.Error(), "recovery root") {
+		t.Fatalf("warm checkpoint validation error=%v", err)
 	}
 	select {
 	case err := <-woken:

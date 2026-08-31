@@ -33,6 +33,7 @@ func TestNewValidatesAndCopiesMembership(t *testing.T) {
 		})
 	}
 	members := []quepaxa.Member{{ID: "n1"}}
+	_ = quepaxa.Config{"n1", quepaxa.Cluster{}, wal, testTransport{}}
 	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{Members: members}, WAL: wal})
 	if err != nil {
 		t.Fatal(err)
@@ -40,6 +41,41 @@ func TestNewValidatesAndCopiesMembership(t *testing.T) {
 	members[0].ID = "changed"
 	if core.NodeID() != "n1" || core.ProposerOrder()[0] != "n1" {
 		t.Fatal("Core retained caller-owned membership")
+	}
+}
+
+func TestObserverIsOutsideMembershipAndCannotParticipate(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.NewObserver(quepaxa.Config{
+		NodeID: "observer-1", WAL: wal,
+		Cluster: quepaxa.Cluster{Members: []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, members := range [][]quepaxa.Member{{{ID: "n1"}}, {{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}} {
+		if memberCore, err := quepaxa.NewObserver(quepaxa.Config{NodeID: "n1", WAL: wal, Cluster: quepaxa.Cluster{Members: members}}); memberCore != nil || !errors.Is(err, quepaxa.ErrInvalidConfig) {
+			t.Fatalf("member observer core=%v error=%v", memberCore, err)
+		}
+	}
+	if _, _, err := core.Propose(context.Background(), []byte("no")); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("observer proposal error=%v", err)
+	}
+	if _, err := core.Record(context.Background(), quepaxa.RecordRequest{Slot: 1, Step: 4}); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("observer record error=%v", err)
+	}
+	if _, _, err := core.ReadIndex(context.Background()); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("observer read-index error=%v", err)
+	}
+	if _, err := core.CompleteDecision(context.Background(), 1); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("observer decision dissemination error=%v", err)
+	}
+	if err := core.RecoverThrough(context.Background(), 1); !errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+		t.Fatalf("observer recovery error=%v", err)
 	}
 }
 

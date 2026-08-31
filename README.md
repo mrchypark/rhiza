@@ -44,6 +44,38 @@ HTTP listener. Use `db.Handler()` or `db` itself as an `http.Handler` when a
 server endpoint is wanted. SQL, KV, Graph, and Notify methods are available
 directly on `DB`.
 
+## Non-voting read copies
+
+Read copies use the same SQL, Graph, KV, checkpoint, and HTTP read APIs as a
+voter, but never propose, vote, acknowledge decisions, or enter quorum/read
+index calculations. Their `linearizable` reads fail with
+`ErrQuorumUnavailable`; use local reads and inspect `Status().AppliedSlot` and
+`SourceTip` when bounding staleness.
+
+```go
+replica, err := rhiza.OpenReadReplica(ctx, rhiza.ReplicaConfig{
+    ClusterID: "prod", ReplicaID: "read-1", DataDir: "./read-1",
+    Members: []rhiza.ReplicaMember{{ID: "n1"}}, // read-1 is not a voter
+    ObjStoreProvider: "s3", ObjStoreBucket: "rhiza",
+})
+```
+
+`OpenReadReplica` polls certified checkpoint/archive state and is the default
+for broad fan-out (10+ copies): it adds no voter traffic or membership entries,
+at the cost of object-store polling latency and requests. `OpenLearner` first
+pulls certified decisions over the private peer QUIC endpoint, then falls back
+to object storage after compaction or peer loss. It has lower lag but adds one
+read stream per polling learner. Learners authenticate read-only `Sync` with
+the voter `AdminToken`; provision token-free peer identities with
+`rhiza.NewReplicaMember(clusterID, voter)`. Non-members cannot call other peer RPCs. Both modes
+require shared object storage for cold start and checkpoint recovery. Tune
+`SyncInterval` for the desired freshness/cost tradeoff (defaults: one second
+for object-store replicas, 100 ms for learners).
+
+The optional handler on either type registers the normal routes, but all
+mutation routes return 503. `Ready` means that local recovery completed, not
+that the copy is current or that voter quorum is available.
+
 ## Optional HTTP API
 
 All mutations require a unique `request_id` and are idempotent. The optional
@@ -89,7 +121,8 @@ deadlines, and reconnect after transport failure.
 Replay-safe `Record`, certified `Learned`, and read-only `Decisions` operations
 may use QUIC 0-RTT after session resumption. `Propose` waits for the handshake
 because replay before a decision could consume duplicate consensus slots.
-Peer tokens are checked against fixed membership when configured. This is
+Multi-node members require voter-specific tokens, and the admin token must not
+equal any voter token. Credentials are checked against fixed membership. This is
 server authentication and membership-token authorization, not peer mTLS.
 Deploy peer UDP and the optional HTTP adapter only on a private network, limit
 them with firewall or Kubernetes NetworkPolicy, keep membership tokens secret,

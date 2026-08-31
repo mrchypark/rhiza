@@ -79,6 +79,16 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
+	if len(n.config.Members) > 1 {
+		for _, member := range n.config.Members {
+			if member.Token == "" {
+				return fmt.Errorf("voter token is required for multi-node cluster member %s", member.ID)
+			}
+			if n.config.AdminToken != "" && member.Token == n.config.AdminToken {
+				return fmt.Errorf("admin token must differ from voter token for %s", member.ID)
+			}
+		}
+	}
 	if n.config.ObjStoreDurability == "" {
 		n.config.ObjStoreDurability = types.ObjectStoreDurabilityAsync
 	}
@@ -200,13 +210,6 @@ func (n *Node) Open(ctx context.Context) (err error) {
 
 	// 5. Create consensus core through the same public API available to external users.
 	cluster := n.loadClusterConfig()
-	if len(cluster.Members) > 1 {
-		for _, member := range cluster.Members {
-			if member.Token == "" && n.config.AdminToken == "" {
-				return fmt.Errorf("peer token is required for multi-node cluster member %s", member.ID)
-			}
-		}
-	}
 	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
 	n.transport = transport
 	if len(cluster.Members) > 1 {

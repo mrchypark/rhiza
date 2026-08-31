@@ -34,6 +34,7 @@ type peerConnection struct {
 // Transport sends private peer RPCs over persistent raw QUIC connections.
 type Transport struct {
 	members   map[quepaxa.NodeID]quepaxa.Member
+	peerKeys  map[quepaxa.NodeID]ed25519.PublicKey
 	clusterID types.ClusterID
 	configID  uint
 	localID   quepaxa.NodeID
@@ -45,6 +46,40 @@ type Transport struct {
 }
 
 func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string) *Transport {
+	return newTransport(clusterID, localID, config, token, nil)
+}
+
+// PeerIdentity is the token-free endpoint and pinned TLS identity of a voter.
+type PeerIdentity struct {
+	ID        quepaxa.NodeID
+	PeerURL   string
+	PublicKey [ed25519.PublicKeySize]byte
+}
+
+// NewPeerIdentity derives the public identity a learner may retain.
+func NewPeerIdentity(clusterID types.ClusterID, member quepaxa.Member) (PeerIdentity, error) {
+	peerURL := member.PeerURL
+	if peerURL == "" {
+		peerURL = member.URL
+	}
+	if clusterID == "" || member.ID == "" || peerURL == "" || member.Token == "" {
+		return PeerIdentity{}, fmt.Errorf("cluster ID, voter ID, peer URL, and voter token are required")
+	}
+	return PeerIdentity{ID: member.ID, PeerURL: peerURL, PublicKey: [ed25519.PublicKeySize]byte(peerPublicKey(clusterID, member.ID, member.Token))}, nil
+}
+
+// NewLearnerTransport creates a read-only transport without retaining voter tokens.
+func NewLearnerTransport(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, token string) *Transport {
+	members := make([]quepaxa.Member, 0, len(peers))
+	keys := make(map[quepaxa.NodeID]ed25519.PublicKey, len(peers))
+	for _, peer := range peers {
+		members = append(members, quepaxa.Member{ID: peer.ID, PeerURL: peer.PeerURL})
+		keys[peer.ID] = append(ed25519.PublicKey(nil), peer.PublicKey[:]...)
+	}
+	return newTransport(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, token, keys)
+}
+
+func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string, keys map[quepaxa.NodeID]ed25519.PublicKey) *Transport {
 	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
 	for _, member := range config.Members {
 		peers[member.ID] = &peerConnection{gate: make(chan struct{}, 1), active: make(map[*quic.Conn]int)}
@@ -55,7 +90,7 @@ func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *que
 	}
 	return &Transport{
 		members: config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
-		localID: localID, token: localToken, fallback: token, peers: peers,
+		localID: localID, token: localToken, fallback: token, peers: peers, peerKeys: keys,
 		tls: &tls.Config{
 			MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN},
 			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
@@ -108,7 +143,10 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 		if identityToken == "" && len(t.members) > 1 {
 			return nil, fmt.Errorf("peer identity token is required for %s", to)
 		}
-		expectedKey := peerPublicKey(t.clusterID, to, identityToken)
+		expectedKey := t.peerKeys[to]
+		if len(expectedKey) == 0 {
+			expectedKey = peerPublicKey(t.clusterID, to, identityToken)
+		}
 		tlsConfig.InsecureSkipVerify = true // Exact token-bound Ed25519 key pin is verified below.
 		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) != 1 {

@@ -20,6 +20,15 @@ type Config struct {
 
 // New validates and creates a QuePaxa core.
 func New(config Config) (*Core, error) {
+	return newCoreFromConfig(config, false)
+}
+
+// NewObserver creates a passive verifier whose node ID must not be a voter.
+func NewObserver(config Config) (*Core, error) {
+	return newCoreFromConfig(config, true)
+}
+
+func newCoreFromConfig(config Config, observer bool) (*Core, error) {
 	if config.NodeID == "" {
 		return nil, fmt.Errorf("%w: node ID is required", ErrInvalidConfig)
 	}
@@ -41,15 +50,19 @@ func New(config Config) (*Core, error) {
 		seen[member.ID] = struct{}{}
 		local = local || member.ID == config.NodeID
 	}
-	if !local {
+	if !local && !observer {
 		return nil, fmt.Errorf("%w: local node %q is not a member", ErrInvalidConfig, config.NodeID)
 	}
-	if len(config.Cluster.Members) > 1 && config.Transport == nil {
+	if local && observer {
+		return nil, fmt.Errorf("%w: observer node %q is a member", ErrInvalidConfig, config.NodeID)
+	}
+	if len(config.Cluster.Members) > 1 && config.Transport == nil && !observer {
 		return nil, fmt.Errorf("%w: transport is required for multiple members", ErrInvalidConfig)
 	}
 	cluster := config.Cluster
 	cluster.Members = append([]Member(nil), config.Cluster.Members...)
 	core := newCore(config.NodeID, &cluster, config.WAL, config.Transport)
+	core.observer = observer
 	if err := core.recover(); err != nil {
 		return nil, fmt.Errorf("recover QuePaxa: %w", err)
 	}

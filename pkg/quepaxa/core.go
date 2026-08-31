@@ -49,6 +49,7 @@ type Core struct {
 	config    *Cluster
 	wal       *qlog.WAL
 	transport Transport
+	observer  bool
 	priority  func() (Priority, error)
 
 	slotMu              sync.Mutex
@@ -103,6 +104,9 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 // Propose drives Algorithm 4. If another proposer wins this slot, the offered
 // value is retried at the next slot so a successful client command is never lost.
 func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, error) {
+	if c.observer {
+		return 0, nil, ErrQuorumUnavailable
+	}
 	if len(value) > MaxReplicatedValueBytes {
 		return 0, nil, fmt.Errorf("QuePaxa value exceeds %d bytes", MaxReplicatedValueBytes)
 	}
@@ -258,6 +262,9 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 // only after a learner quorum has accepted their decision, so the two quorums
 // intersect and a completed write cannot be missed.
 func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
+	if c.observer {
+		return 0, "", ErrQuorumUnavailable
+	}
 	if len(c.config.Members) == 1 {
 		return c.Tip(), c.nodeID, nil
 	}
@@ -718,6 +725,9 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 
 // Record durably applies the paper's Algorithm 3 before replying.
 func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, error) {
+	if c.observer {
+		return Summary{}, ErrQuorumUnavailable
+	}
 	if request.Slot == 0 || request.Step < 4 {
 		return Summary{}, fmt.Errorf("invalid QuePaxa slot or step")
 	}
@@ -985,6 +995,9 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 // CompleteDecision makes an existing decision safe to acknowledge by
 // re-establishing the learner quorum required by ReadIndex.
 func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, error) {
+	if c.observer {
+		return DecidedValue{}, ErrQuorumUnavailable
+	}
 	lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	if err := c.ensureDurableLocked(slot); err != nil {
@@ -1094,6 +1107,9 @@ func (c *Core) RecorderTip() Slot {
 // deliberately disables the leader fast path so a restarted leader cannot
 // introduce a different highest-priority value for an old slot.
 func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
+	if c.observer {
+		return ErrQuorumUnavailable
+	}
 	select {
 	case c.pipeline <- struct{}{}:
 		defer func() { <-c.pipeline }()
