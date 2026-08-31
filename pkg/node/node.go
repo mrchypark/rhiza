@@ -62,14 +62,14 @@ func validateObjectStoreConfig(config *types.ExecutionConfig) (bool, error) {
 	provider := objectstore.Provider(config.ObjStoreProvider)
 	if len(config.Members) > 1 && configured {
 		if provider == "" || provider == objectstore.ProviderFilesystem || config.ObjStoreDir != "" {
-			return false, fmt.Errorf("multi-node clusters require an explicit shared S3-compatible object store")
+			return false, fmt.Errorf("multi-node clusters require explicit shared object storage")
 		}
-		if provider != objectstore.ProviderS3 {
+		if provider != objectstore.ProviderS3 && provider != objectstore.ProviderGCS && provider != objectstore.ProviderAzure {
 			return false, fmt.Errorf("multi-node object-store provider %q is unsupported", provider)
 		}
 	}
-	if provider == objectstore.ProviderS3 && config.ObjStoreBucket == "" {
-		return false, fmt.Errorf("S3 bucket is required")
+	if (provider == objectstore.ProviderS3 || provider == objectstore.ProviderGCS || provider == objectstore.ProviderAzure) && config.ObjStoreBucket == "" {
+		return false, fmt.Errorf("object-store bucket is required")
 	}
 	return configured, nil
 }
@@ -159,6 +159,10 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
 			Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,
 			AccessKey: n.config.ObjStoreAccessKey, SecretKey: n.config.ObjStoreSecretKey, SessionToken: n.config.ObjStoreSessionToken,
+			ServiceAccount: n.config.ObjStoreServiceAccount, AzureTenantID: n.config.ObjStoreAzureTenantID,
+			AzureClientID: n.config.ObjStoreAzureClientID, AzureClientSecret: n.config.ObjStoreAzureClientSecret,
+			AzureStorageAccount: n.config.ObjStoreAzureStorageAccount, AzureStorageAccountKey: n.config.ObjStoreAzureStorageAccountKey,
+			AzureConnectionString: n.config.ObjStoreAzureConnectionString, AzureUserAssignedID: n.config.ObjStoreAzureUserAssignedID,
 		})
 		if bucketErr != nil {
 			return fmt.Errorf("open object store: %w", bucketErr)

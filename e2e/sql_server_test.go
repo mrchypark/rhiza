@@ -132,6 +132,85 @@ func TestSQLServer(t *testing.T) {
 	}
 }
 
+func TestServerFailurePaths(t *testing.T) {
+	if baseURL == "" {
+		t.Skip("set RHIZA_E2E_URL to run the server E2E test")
+	}
+	for _, tc := range []struct {
+		name, method, path, body string
+		want                     int
+	}{
+		{"wrong method", http.MethodGet, "/sql/query", "", http.StatusMethodNotAllowed},
+		{"malformed JSON", http.MethodPost, "/sql/query", `{`, http.StatusBadRequest},
+		{"unknown field", http.MethodPost, "/sql/query", `{"sql":"SELECT 1","extra":true}`, http.StatusBadRequest},
+		{"trailing JSON", http.MethodPost, "/sql/query", `{"sql":"SELECT 1"}{}`, http.StatusBadRequest},
+		{"missing SQL", http.MethodPost, "/sql/query", `{}`, http.StatusBadRequest},
+		{"invalid consistency", http.MethodPost, "/sql/query", `{"sql":"SELECT 1","consistency":"eventual"}`, http.StatusBadRequest},
+		{"mutation through query", http.MethodPost, "/sql/query", `{"sql":"CREATE TABLE forbidden(id INTEGER)"}`, http.StatusBadRequest},
+		{"missing request ID", http.MethodPost, "/sql/execute", `{"sql":"CREATE TABLE forbidden(id INTEGER)"}`, http.StatusBadRequest},
+		{"missing KV key", http.MethodPost, "/kv/put", `{"request_id":"missing-key"}`, http.StatusBadRequest},
+		{"missing graph request ID", http.MethodPost, "/graph/execute", `{"cypher":"CREATE (:Item)"}`, http.StatusBadRequest},
+		{"unsafe standalone edge create", http.MethodPost, "/graph/execute", `{"request_id":"unsafe-edge","cypher":"CREATE (:Person)-[:KNOWS]->(:Person)"}`, http.StatusBadRequest},
+		{"missing graph query", http.MethodPost, "/graph/query", `{}`, http.StatusBadRequest},
+		{"missing notify topic", http.MethodPost, "/notify/publish", `{"request_id":"missing-topic"}`, http.StatusBadRequest},
+		{"unknown route", http.MethodGet, "/not-a-route", "", http.StatusNotFound},
+		{"oversized body", http.MethodPost, "/sql/query", `{"sql":"` + strings.Repeat("x", 1<<20) + `"}`, http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(tc.method, baseURL+tc.path, strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != tc.want {
+				body, _ := io.ReadAll(res.Body)
+				t.Fatalf("status=%s want=%d body=%s", res.Status, tc.want, body)
+			}
+		})
+	}
+
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	table := "negative_" + suffix
+	post(t, "/sql/execute", map[string]string{"request_id": "negative-schema-" + suffix, "sql": "CREATE TABLE " + table + " (id INTEGER PRIMARY KEY)"}, nil)
+	insert := map[string]string{"request_id": "duplicate-" + suffix, "sql": "INSERT INTO " + table + " VALUES (1)"}
+	post(t, "/sql/execute", insert, nil)
+	post(t, "/sql/execute", insert, nil)
+	postStatus(t, "/sql/execute", map[string]string{"request_id": "duplicate-" + suffix, "sql": "INSERT INTO " + table + " VALUES (2)"}, http.StatusConflict)
+	var got queryResponse
+	post(t, "/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM " + table}, &got)
+	if got.Rows[0][0] != float64(1) {
+		t.Fatalf("idempotent insert count: %+v", got)
+	}
+
+	var rejected mutationReceipt
+	post(t, "/sql/transaction", map[string]any{
+		"request_id": "rollback-" + suffix,
+		"statements": []map[string]string{{"sql": "INSERT INTO " + table + " VALUES (2)"}, {"sql": "INSERT INTO missing_table VALUES (1)"}},
+	}, &rejected)
+	if rejected.Status != "rejected" {
+		t.Fatalf("transaction status=%q", rejected.Status)
+	}
+	post(t, "/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM " + table + " WHERE id = 2"}, &got)
+	if got.Rows[0][0] != float64(0) {
+		t.Fatalf("failed transaction was not rolled back: %+v", got)
+	}
+
+	key := "negative-" + suffix
+	post(t, "/kv/put", map[string]any{"request_id": "negative-kv-" + suffix, "key": key, "value": []byte("original")}, nil)
+	var cas struct {
+		Applied bool `json:"applied"`
+	}
+	post(t, "/kv/cas", map[string]any{"request_id": "negative-cas-" + suffix, "key": key, "expected": []byte("wrong"), "expected_exists": true, "value": []byte("changed")}, &cas)
+	if cas.Applied {
+		t.Fatal("CAS with a mismatched value was applied")
+	}
+}
+
 func BenchmarkSQLServerQueryLocal(b *testing.B) {
 	benchmarkRequests(b, []byte(`{"sql":"SELECT 1","consistency":"local"}`), "/sql/query")
 }
@@ -206,7 +285,11 @@ func benchmarkDynamicRequestsAt(b *testing.B, target, path string, body func() [
 	if target == "" {
 		b.Skip("set RHIZA_E2E_URL to run SQL server benchmarks")
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Transport: &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 100},
+		Timeout:   10 * time.Second,
+	}
+	defer client.CloseIdleConnections()
 	var failures atomic.Uint64
 	var firstFailure atomic.Value
 	recordFailure := func(message string) {

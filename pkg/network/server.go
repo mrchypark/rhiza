@@ -89,9 +89,21 @@ type Server struct {
 	peerB             int
 	peerCounts        map[quepaxa.NodeID]int
 	objectStats       func() (map[string]uint64, bool)
+	replicaStatus     func() ReplicaStatus
 	syncLimit         chan struct{}
 	checkpointPrepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
 	compactedHandler  func()
+}
+
+// ReplicaStatus is the observable catch-up state of a non-voting replica.
+type ReplicaStatus struct {
+	Mode        string    `json:"mode"`
+	AppliedSlot uint64    `json:"applied_slot"`
+	SourceTip   uint64    `json:"source_tip"`
+	LagSlots    uint64    `json:"lag_slots"`
+	Source      string    `json:"source"`
+	LastSync    time.Time `json:"last_sync"`
+	LastError   string    `json:"last_error,omitempty"`
 }
 
 func (s *Server) SetCheckpointPrepare(prepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error) {
@@ -229,6 +241,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/notify/subscribe", s.handleNotifySubscribe)
 	s.mux.HandleFunc("/request/status", s.handleRequestStatus)
 	s.mux.HandleFunc("/metrics/object-store", s.handleObjectStoreStats)
+	s.mux.HandleFunc("/replica/status", s.handleReplicaStatus)
 
 	// Health
 	s.mux.HandleFunc("/ready", s.handleReady)
@@ -237,6 +250,17 @@ func (s *Server) routes() {
 
 func (s *Server) SetObjectStoreStats(stats func() (map[string]uint64, bool)) {
 	s.objectStats = stats
+}
+
+func (s *Server) SetReplicaStatus(status func() ReplicaStatus) { s.replicaStatus = status }
+
+func (s *Server) handleReplicaStatus(w http.ResponseWriter, _ *http.Request) {
+	if s.replicaStatus == nil {
+		http.Error(w, "not a replica", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.replicaStatus())
 }
 
 func (s *Server) handleObjectStoreStats(w http.ResponseWriter, _ *http.Request) {
@@ -1246,7 +1270,7 @@ func validateReplicatedMutation(value []byte) error {
 		return err
 	} else if ok {
 		for _, command := range commands {
-			if err := materializer.ValidateGraphCommand(command); err != nil {
+			if err := materializer.ValidateGraphCommandAdmission(command); err != nil {
 				return err
 			}
 		}

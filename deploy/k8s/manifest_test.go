@@ -22,3 +22,16 @@ func TestThreePeerBootstrapSettings(t *testing.T) {
 		t.Fatal("headless service must publish peers before readiness")
 	}
 }
+
+func TestReadReplicaDeploymentsSelectExplicitRoles(t *testing.T) {
+	manifest, err := os.ReadFile("read-replicas.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(manifest)
+	for _, required := range []string{"value: object-store", "value: learner", "path: /ready", "name: rhiza-object-store"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("read replica manifest missing %q", required)
+		}
+	}
+}

@@ -74,6 +74,21 @@ func TestSyncPeerStopsAtFirstObservedTipAndRejectsNoProgress(t *testing.T) {
 		t.Fatalf("calls=%d core=%d material=%d", calls, r.core.Tip(), r.material.Tip())
 	}
 
+	failover := newReplica(t)
+	failover.config.Members = []network.PeerIdentity{{ID: "n0"}, {ID: "n1"}}
+	failover.fetch = func(_ context.Context, id quepaxa.NodeID, _ quepaxa.Slot, _ int) (network.DecisionsResponse, error) {
+		if id == "n0" {
+			return network.DecisionsResponse{}, errors.New("peer unavailable")
+		}
+		return network.DecisionsResponse{Tip: 1, Decisions: []quepaxa.DecidedValue{decision}}, nil
+	}
+	if err := failover.syncPeer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status := failover.Status(); status.Source != "peer:n1" || failover.material.Tip() != 1 {
+		t.Fatalf("peer failover status=%+v tip=%d", status, failover.material.Tip())
+	}
+
 	stalled := newReplica(t)
 	if err := stalled.core.AcceptCertifiedValues([]quepaxa.DecidedValue{decision}); err != nil {
 		t.Fatal(err)
@@ -131,5 +146,39 @@ func TestReadReplicaCloseCancelsActiveSync(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("close waited for canceled sync")
+	}
+}
+
+func TestLearnerFallsBackToArchiveWhenPeerHistoryIsCompacted(t *testing.T) {
+	ctx := context.Background()
+	storeDir := t.TempDir()
+	voter, err := Open(ctx, Config{ClusterID: "compacted-fallback", NodeID: "n1", DataDir: t.TempDir(),
+		ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, ObjStoreDurability: ObjectStoreDurabilityBeforeAck})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer voter.Close()
+	if _, err := voter.Execute(ctx, ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY)"}); err != nil {
+		t.Fatal(err)
+	}
+	replica, err := OpenReadReplica(ctx, ReplicaConfig{ClusterID: "compacted-fallback", ReplicaID: "read-1", DataDir: t.TempDir(),
+		Members: []network.PeerIdentity{{ID: "n1"}}, ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, SyncInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	if _, err := voter.Execute(ctx, ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1)"}); err != nil {
+		t.Fatal(err)
+	}
+	replica.mode = ReplicaModeLearner
+	replica.fetch = func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (network.DecisionsResponse, error) {
+		return network.DecisionsResponse{}, quepaxa.ErrCompacted
+	}
+	if err := replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := replica.Query(ctx, QueryRequest{SQL: "SELECT id FROM items"})
+	if err != nil || len(rows.Rows) != 1 || replica.Status().Source != "object-store" {
+		t.Fatalf("fallback rows=%#v status=%+v err=%v", rows.Rows, replica.Status(), err)
 	}
 }

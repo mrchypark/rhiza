@@ -1,13 +1,16 @@
 package objstore
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 
 	kitlog "github.com/go-kit/log"
 	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/providers/azure"
 	"github.com/thanos-io/objstore/providers/filesystem"
+	"github.com/thanos-io/objstore/providers/gcs"
 	"github.com/thanos-io/objstore/providers/s3"
 )
 
@@ -26,15 +29,23 @@ type Config struct {
 	Provider Provider `json:"provider"`
 
 	// Filesystem configuration
-	FilesystemDir string `json:"filesystem_dir,omitempty"`
-	Endpoint      string `json:"endpoint,omitempty"`
-	Bucket        string `json:"bucket,omitempty"`
-	Region        string `json:"region,omitempty"`
-	Insecure      bool   `json:"insecure,omitempty"`
-	MaxRetries    int    `json:"max_retries,omitempty"`
-	AccessKey     string `json:"access_key,omitempty"`
-	SecretKey     string `json:"secret_key,omitempty"`
-	SessionToken  string `json:"session_token,omitempty"`
+	FilesystemDir          string `json:"filesystem_dir,omitempty"`
+	Endpoint               string `json:"endpoint,omitempty"`
+	Bucket                 string `json:"bucket,omitempty"`
+	Region                 string `json:"region,omitempty"`
+	Insecure               bool   `json:"insecure,omitempty"`
+	MaxRetries             int    `json:"max_retries,omitempty"`
+	AccessKey              string `json:"access_key,omitempty"`
+	SecretKey              string `json:"secret_key,omitempty"`
+	SessionToken           string `json:"session_token,omitempty"`
+	ServiceAccount         string `json:"service_account,omitempty"`
+	AzureTenantID          string `json:"azure_tenant_id,omitempty"`
+	AzureClientID          string `json:"azure_client_id,omitempty"`
+	AzureClientSecret      string `json:"azure_client_secret,omitempty"`
+	AzureStorageAccount    string `json:"azure_storage_account,omitempty"`
+	AzureStorageAccountKey string `json:"azure_storage_account_key,omitempty"`
+	AzureConnectionString  string `json:"azure_connection_string,omitempty"`
+	AzureUserAssignedID    string `json:"azure_user_assigned_id,omitempty"`
 
 	// Prefix for all objects
 	Prefix string `json:"prefix,omitempty"`
@@ -58,8 +69,22 @@ func NewBucket(cfg Config) (*MeteredBucket, error) {
 			AWSSDKAuth: cfg.AccessKey == "", AccessKey: cfg.AccessKey, SecretKey: cfg.SecretKey,
 			SessionToken: cfg.SessionToken, MaxRetries: cfg.MaxRetries,
 		}, "rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
-	case ProviderGCS, ProviderAzure:
-		return nil, fmt.Errorf("provider %s not yet implemented", cfg.Provider)
+	case ProviderGCS:
+		providerConfig := gcs.DefaultConfig
+		providerConfig.Bucket, providerConfig.ServiceAccount, providerConfig.MaxRetries = cfg.Bucket, cfg.ServiceAccount, cfg.MaxRetries
+		bucket, err = gcs.NewBucketWithConfig(context.Background(), kitlog.NewNopLogger(), providerConfig,
+			"rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
+	case ProviderAzure:
+		providerConfig := azure.DefaultConfig
+		providerConfig.AzTenantID, providerConfig.ClientID, providerConfig.ClientSecret = cfg.AzureTenantID, cfg.AzureClientID, cfg.AzureClientSecret
+		providerConfig.StorageAccountName, providerConfig.StorageAccountKey = cfg.AzureStorageAccount, cfg.AzureStorageAccountKey
+		providerConfig.StorageConnectionString, providerConfig.ContainerName = cfg.AzureConnectionString, cfg.Bucket
+		providerConfig.UserAssignedID, providerConfig.MaxRetries = cfg.AzureUserAssignedID, cfg.MaxRetries
+		if cfg.Endpoint != "" {
+			providerConfig.Endpoint = cfg.Endpoint
+		}
+		bucket, err = azure.NewBucketWithConfig(kitlog.NewNopLogger(), providerConfig,
+			"rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", cfg.Provider)
 	}
@@ -85,11 +110,16 @@ func LoadConfig() Config {
 	}
 
 	cfg := Config{
-		Provider: provider,
-		Prefix:   os.Getenv("RHIZA_OBJSTORE_PREFIX"),
-		Endpoint: os.Getenv("RHIZA_OBJSTORE_ENDPOINT"),
-		Bucket:   os.Getenv("RHIZA_OBJSTORE_BUCKET"),
-		Region:   os.Getenv("AWS_REGION"),
+		Provider:       provider,
+		Prefix:         os.Getenv("RHIZA_OBJSTORE_PREFIX"),
+		Endpoint:       os.Getenv("RHIZA_OBJSTORE_ENDPOINT"),
+		Bucket:         os.Getenv("RHIZA_OBJSTORE_BUCKET"),
+		Region:         os.Getenv("AWS_REGION"),
+		ServiceAccount: os.Getenv("RHIZA_OBJSTORE_SERVICE_ACCOUNT"),
+		AzureTenantID:  os.Getenv("RHIZA_OBJSTORE_AZURE_TENANT_ID"), AzureClientID: os.Getenv("RHIZA_OBJSTORE_AZURE_CLIENT_ID"),
+		AzureClientSecret: os.Getenv("RHIZA_OBJSTORE_AZURE_CLIENT_SECRET"), AzureStorageAccount: os.Getenv("RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT"),
+		AzureStorageAccountKey: os.Getenv("RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT_KEY"), AzureConnectionString: os.Getenv("RHIZA_OBJSTORE_AZURE_CONNECTION_STRING"),
+		AzureUserAssignedID: os.Getenv("RHIZA_OBJSTORE_AZURE_USER_ASSIGNED_ID"),
 	}
 
 	switch provider {

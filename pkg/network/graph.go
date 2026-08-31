@@ -80,7 +80,7 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if !s.writable || !s.ready() {
 		return GraphExecuteResponse{}, ErrNotReady
 	}
-	if err := materializer.ValidateGraphCommand(command); err != nil {
+	if err := materializer.ValidateGraphCommandAdmission(command); err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	defer s.lockRequest(command.RequestID)()

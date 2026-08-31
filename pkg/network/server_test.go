@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -751,6 +752,13 @@ func TestPeerProposalUsesAdmissionAndSemanticValidation(t *testing.T) {
 	if _, err := server.proposePeer(context.Background(), "n2", invalid); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("invalid peer proposal error=%v", err)
 	}
+	unsafeGraph, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "unsafe", Cypher: `CREATE (:Person)-[:KNOWS]->(:Person)`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.proposePeer(context.Background(), "n2", unsafeGraph); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("unsafe graph peer proposal error=%v", err)
+	}
 	valid, err := types.EncodeKVCommand(types.KVCommand{RequestID: "valid", Operation: "put", Key: "key", Value: []byte("value")})
 	if err != nil {
 		t.Fatal(err)
@@ -888,5 +896,23 @@ func TestNotifyStreamStopsWhenMaterializerCloses(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("notification stream did not stop after materializer close")
+	}
+}
+
+func TestReplicaStatusEndpoint(t *testing.T) {
+	server := NewServer(nil, nil, "cluster", false, nil, nil, 0)
+	t.Cleanup(server.Close)
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/replica/status", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("voter status code=%d", response.Code)
+	}
+	server.SetReplicaStatus(func() ReplicaStatus {
+		return ReplicaStatus{Mode: "learner", AppliedSlot: 7, SourceTip: 9, LagSlots: 2, Source: "peer:n2"}
+	})
+	response = httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/replica/status", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"lag_slots":2`) {
+		t.Fatalf("replica status code=%d body=%s", response.Code, response.Body.String())
 	}
 }

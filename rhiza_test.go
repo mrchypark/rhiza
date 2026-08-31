@@ -131,6 +131,22 @@ func TestPeerLearnerUsesVoterWithoutJoiningQuorum(t *testing.T) {
 	if err != nil || len(rows.Rows) != 1 {
 		t.Fatalf("learner rows=%#v err=%v", rows.Rows, err)
 	}
+	if _, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "insert-fallback", SQL: "INSERT INTO items VALUES (2)"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := voter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := learner.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if status := learner.Status(); status.Source != "object-store" {
+		t.Fatalf("learner did not fall back after peer loss: %+v", status)
+	}
+	rows, err = learner.Query(ctx, rhiza.QueryRequest{SQL: "SELECT id FROM items ORDER BY id"})
+	if err != nil || len(rows.Rows) != 2 {
+		t.Fatalf("fallback rows=%#v err=%v", rows.Rows, err)
+	}
 	if _, err := learner.Query(ctx, rhiza.QueryRequest{SQL: "SELECT 1", Consistency: rhiza.ConsistencyLinearizable}); !errors.Is(err, rhiza.ErrQuorumUnavailable) {
 		t.Fatalf("learner linearizable query error=%v", err)
 	}
@@ -174,6 +190,44 @@ func TestElevenObjectStoreReadReplicas(t *testing.T) {
 		if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(1) {
 			t.Fatalf("replica %d rows=%#v err=%v", i, rows.Rows, err)
 		}
+	}
+}
+
+func TestS3ReadReplicaE2E(t *testing.T) {
+	endpoint := os.Getenv("RHIZA_E2E_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("RHIZA_E2E_S3_ENDPOINT is not set")
+	}
+	cluster := fmt.Sprintf("s3-replica-%d", time.Now().UnixNano())
+	store := rhiza.Config{
+		ClusterID: cluster, NodeID: "n1", DataDir: t.TempDir(), ObjStoreProvider: "s3",
+		ObjStoreEndpoint: endpoint, ObjStoreBucket: os.Getenv("RHIZA_E2E_S3_BUCKET"), ObjStoreRegion: "us-east-1",
+		ObjStoreInsecure: true, ObjStoreAccessKey: os.Getenv("RHIZA_E2E_S3_ACCESS_KEY"),
+		ObjStoreSecretKey: os.Getenv("RHIZA_E2E_S3_SECRET_KEY"), ObjStoreDurability: rhiza.ObjectStoreDurabilityBeforeAck,
+	}
+	voter, err := rhiza.Open(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer voter.Close()
+	if _, err := voter.Execute(context.Background(), rhiza.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY)"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := voter.Execute(context.Background(), rhiza.ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1)"}); err != nil {
+		t.Fatal(err)
+	}
+	replica, err := rhiza.OpenReadReplica(context.Background(), rhiza.ReplicaConfig{
+		ClusterID: cluster, ReplicaID: "read-1", DataDir: t.TempDir(), Members: []rhiza.ReplicaMember{{ID: "n1"}},
+		ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint, ObjStoreBucket: store.ObjStoreBucket, ObjStoreRegion: store.ObjStoreRegion,
+		ObjStoreInsecure: true, ObjStoreAccessKey: store.ObjStoreAccessKey, ObjStoreSecretKey: store.ObjStoreSecretKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	rows, err := replica.Query(context.Background(), rhiza.QueryRequest{SQL: "SELECT id FROM items"})
+	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(1) {
+		t.Fatalf("S3 replica rows=%#v err=%v", rows.Rows, err)
 	}
 }
 

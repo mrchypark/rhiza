@@ -84,6 +84,56 @@ func ValidateGraphCommand(command types.GraphCommand) error {
 	return nil
 }
 
+// ValidateGraphCommandAdmission rejects commands that LatticeDB can silently
+// partially execute. Apply-time validation stays stable for committed-log replay.
+func ValidateGraphCommandAdmission(command types.GraphCommand) error {
+	if err := ValidateGraphCommand(command); err != nil {
+		return err
+	}
+	return validateStandaloneGraphCreate(strings.TrimSpace(command.Cypher))
+}
+
+func validateStandaloneGraphCreate(cypher string) error {
+	if !strings.HasPrefix(cypher, "CREATE ") {
+		return nil
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(cypher, "CREATE "))
+	if len(rest) == 0 || rest[0] != '(' {
+		return nil
+	}
+	depth := 0
+	var quote byte
+	for i := 0; i < len(rest); i++ {
+		char := rest[i]
+		if quote != 0 {
+			if char == '\\' {
+				i++
+				continue
+			}
+			if char == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch char {
+		case '\'', '"':
+			quote = char
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				tail := strings.TrimSpace(rest[i+1:])
+				if tail != "" && !strings.HasPrefix(tail, "RETURN ") {
+					return fmt.Errorf("standalone CREATE supports exactly one node; create relationships with MATCH ... CREATE")
+				}
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 func validateGraphStreamName(name string, allowReserved bool) error {
 	if !utf8.ValidString(name) || name == "" || len(name) > 255 {
 		return fmt.Errorf("stream is required and must be valid UTF-8 not exceeding 255 bytes")

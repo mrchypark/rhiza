@@ -42,17 +42,25 @@ type ReplicaConfig struct {
 	Members      []network.PeerIdentity
 	SyncInterval time.Duration
 
-	ObjStoreEndpoint     string
-	ObjStoreBucket       string
-	ObjStoreProvider     string
-	ObjStoreDir          string
-	ObjStorePrefix       string
-	ObjStoreRegion       string
-	ObjStoreInsecure     bool
-	ObjStoreRetries      int
-	ObjStoreAccessKey    string
-	ObjStoreSecretKey    string
-	ObjStoreSessionToken string
+	ObjStoreEndpoint               string
+	ObjStoreBucket                 string
+	ObjStoreProvider               string
+	ObjStoreDir                    string
+	ObjStorePrefix                 string
+	ObjStoreRegion                 string
+	ObjStoreInsecure               bool
+	ObjStoreRetries                int
+	ObjStoreAccessKey              string
+	ObjStoreSecretKey              string
+	ObjStoreSessionToken           string
+	ObjStoreServiceAccount         string
+	ObjStoreAzureTenantID          string
+	ObjStoreAzureClientID          string
+	ObjStoreAzureClientSecret      string
+	ObjStoreAzureStorageAccount    string
+	ObjStoreAzureStorageAccountKey string
+	ObjStoreAzureConnectionString  string
+	ObjStoreAzureUserAssignedID    string
 }
 
 type ReplicaStatus struct {
@@ -74,6 +82,7 @@ type replicaIdentity struct {
 	Bucket    string   `json:"bucket"`
 	Directory string   `json:"directory"`
 	Prefix    string   `json:"prefix"`
+	Account   string   `json:"account,omitempty"`
 }
 
 // ReadReplica is an eventual, read-only copy. It never proposes, votes,
@@ -180,6 +189,10 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 		Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Region: config.ObjStoreRegion,
 		Insecure: config.ObjStoreInsecure, MaxRetries: config.ObjStoreRetries, AccessKey: config.ObjStoreAccessKey,
 		SecretKey: config.ObjStoreSecretKey, SessionToken: config.ObjStoreSessionToken,
+		ServiceAccount: config.ObjStoreServiceAccount, AzureTenantID: config.ObjStoreAzureTenantID,
+		AzureClientID: config.ObjStoreAzureClientID, AzureClientSecret: config.ObjStoreAzureClientSecret,
+		AzureStorageAccount: config.ObjStoreAzureStorageAccount, AzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
+		AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open replica object store: %w", err)
@@ -226,6 +239,15 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	r.ready.Store(true)
 	r.api = network.NewServer(r.core, r.material, types.ClusterID(config.ClusterID), false, nil, nil, 0, r.ready.Load)
 	r.api.SetObjectStoreStats(func() (map[string]uint64, bool) { return objectStatsMap(r.bucket.Stats()), true })
+	r.api.SetReplicaStatus(func() network.ReplicaStatus {
+		status := r.Status()
+		lag := uint64(0)
+		if status.SourceTip > status.AppliedSlot {
+			lag = status.SourceTip - status.AppliedSlot
+		}
+		return network.ReplicaStatus{Mode: string(status.Mode), AppliedSlot: status.AppliedSlot, SourceTip: status.SourceTip,
+			LagSlots: lag, Source: status.Source, LastSync: status.LastSync, LastError: status.LastError}
+	})
 	r.core.StartPeriodicSync(childCtx, time.Second)
 	interval := config.SyncInterval
 	if interval == 0 {
@@ -256,7 +278,7 @@ func ensureReplicaIdentity(config ReplicaConfig) error {
 	}
 	want := replicaIdentity{ClusterID: config.ClusterID, ConfigID: 1, ReplicaID: config.ReplicaID, Voters: voters,
 		Provider: config.ObjStoreProvider, Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket,
-		Directory: directory, Prefix: path.Clean(config.ObjStorePrefix)}
+		Directory: directory, Prefix: path.Clean(config.ObjStorePrefix), Account: config.ObjStoreAzureStorageAccount}
 	manifest := filepath.Join(config.DataDir, "replica-identity.json")
 	data, err := os.ReadFile(manifest)
 	if err == nil {
@@ -266,7 +288,7 @@ func ensureReplicaIdentity(config ReplicaConfig) error {
 		}
 		if !slices.Equal(got.Voters, want.Voters) || got.ClusterID != want.ClusterID || got.ConfigID != want.ConfigID ||
 			got.ReplicaID != want.ReplicaID || got.Provider != want.Provider || got.Endpoint != want.Endpoint ||
-			got.Bucket != want.Bucket || got.Directory != want.Directory || got.Prefix != want.Prefix {
+			got.Bucket != want.Bucket || got.Directory != want.Directory || got.Prefix != want.Prefix || got.Account != want.Account {
 			return fmt.Errorf("replica data directory identity mismatch")
 		}
 		return nil
