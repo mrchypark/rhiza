@@ -26,6 +26,32 @@ func TestGraphResultUsesAggregateByteBudget(t *testing.T) {
 	}
 }
 
+func TestValidateGraphCommandRejectsPartialStandaloneCreate(t *testing.T) {
+	for _, cypher := range []string{
+		`CREATE (:Item {id: $id})`,
+		`CREATE (:Item {text: ")-["})`,
+		`CREATE (item:Item {id: $id}) RETURN item.id`,
+		`MATCH (from:Item), (to:Item) CREATE (from)-[:LINK]->(to)`,
+	} {
+		if err := ValidateGraphCommandAdmission(types.GraphCommand{RequestID: "valid", Cypher: cypher}); err != nil {
+			t.Fatalf("valid cypher %q: %v", cypher, err)
+		}
+	}
+	for _, cypher := range []string{
+		`CREATE (:Item)-[:LINK]->(:Item)`,
+		`CREATE (:Item), (:Item)`,
+		`CREATE (from:Item)-[edge:LINK]->(to:Item)`,
+	} {
+		if err := ValidateGraphCommandAdmission(types.GraphCommand{RequestID: "invalid", Cypher: cypher}); err == nil {
+			t.Fatalf("unsafe cypher %q was accepted", cypher)
+		}
+	}
+	legacy := types.GraphCommand{RequestID: "committed", Cypher: `CREATE (:Item)-[:LINK]->(:Item)`}
+	if err := ValidateGraphCommand(legacy); err != nil {
+		t.Fatalf("committed-log validation changed: %v", err)
+	}
+}
+
 func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "sqlite.db")
@@ -164,9 +190,21 @@ func BenchmarkGraphSnapshotFreezeByDatabaseSize(b *testing.B) {
 			if err := initial.Close(); err != nil {
 				b.Fatal(err)
 			}
-			info, err := os.Stat(filepath.Join(filepath.Dir(m.dbPath), "latticedb", "graph.ltdb"))
+			var databaseBytes int64
+			err = filepath.Walk(filepath.Join(filepath.Dir(m.dbPath), "latticedb", "graph.ltdb"), func(_ string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.Mode().IsRegular() {
+					databaseBytes += info.Size()
+				}
+				return nil
+			})
 			if err != nil {
 				b.Fatal(err)
+			}
+			if databaseBytes < int64(sizeMiB)<<20 {
+				b.Fatalf("database size %d bytes is smaller than requested %d MiB", databaseBytes, sizeMiB)
 			}
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
@@ -185,7 +223,7 @@ func BenchmarkGraphSnapshotFreezeByDatabaseSize(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			b.ReportMetric(float64(info.Size())/(1<<20), "db-MiB")
+			b.ReportMetric(float64(databaseBytes)/(1<<20), "db-MiB")
 		})
 	}
 }

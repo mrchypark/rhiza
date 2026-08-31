@@ -20,14 +20,21 @@ func TestGraphServer(t *testing.T) {
 	}
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	adaID, graceID := "ada-"+suffix, "grace-"+suffix
+	for _, person := range []struct{ id, name string }{{adaID, "Ada"}, {graceID, "Grace"}} {
+		postGraph(t, graphURL, "/graph/execute", map[string]any{
+			"request_id": "person-" + person.id,
+			"cypher":     `CREATE (:Person {id: $id, name: $name})`,
+			"args":       map[string]any{"id": person.id, "name": person.name},
+		}, nil)
+	}
 	postGraph(t, graphURL, "/graph/execute", map[string]any{
 		"request_id": "knows-" + suffix,
-		"cypher":     `CREATE (:Person {id: $from, name: "Ada"})-[:Knows {since: $since}]->(:Person {id: $to, name: "Grace"})`,
+		"cypher":     `MATCH (from:Person {id: $from}), (to:Person {id: $to}) CREATE (from)-[:Knows {since: $since}]->(to)`,
 		"args":       map[string]any{"from": adaID, "to": graceID, "since": 2026},
 	}, nil)
 	var result queryResponse
 	postGraph(t, graphURL, "/graph/query", map[string]any{
-		"cypher":      `MATCH (:Person {id: $id})-[:Knows]->(friend:Person) RETURN friend.name`,
+		"cypher":      `MATCH (person:Person {id: $id})-[:Knows]->(friend:Person) RETURN friend.name`,
 		"args":        map[string]any{"id": adaID},
 		"consistency": "linearizable",
 	}, &result)

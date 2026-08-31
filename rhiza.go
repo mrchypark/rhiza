@@ -53,32 +53,40 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
-	ClusterID             string
-	NodeID                string
-	DataDir               string
-	BindAddr              string
-	PeerAddr              string
-	AdminToken            string
-	Members               []Member
-	ObjStoreEndpoint      string
-	ObjStoreBucket        string
-	ObjStoreProvider      string
-	ObjStoreDir           string
-	ObjStorePrefix        string
-	ObjStoreRegion        string
-	ObjStoreInsecure      bool
-	ObjStoreRetries       int
-	ObjStoreAccessKey     string
-	ObjStoreSecretKey     string
-	ObjStoreSessionToken  string
-	ObjStoreDurability    ObjectStoreDurability
-	ObjStoreSyncInterval  time.Duration
-	ObjStoreBatchDelay    time.Duration
-	ObjStoreGCInterval    time.Duration
-	ObjStoreGCGracePeriod time.Duration
-	CheckpointInterval    time.Duration
-	CheckpointTailBytes   int64
-	MaxWALBytes           int64
+	ClusterID                      string
+	NodeID                         string
+	DataDir                        string
+	BindAddr                       string
+	PeerAddr                       string
+	AdminToken                     string
+	Members                        []Member
+	ObjStoreEndpoint               string
+	ObjStoreBucket                 string
+	ObjStoreProvider               string
+	ObjStoreDir                    string
+	ObjStorePrefix                 string
+	ObjStoreRegion                 string
+	ObjStoreInsecure               bool
+	ObjStoreRetries                int
+	ObjStoreAccessKey              string
+	ObjStoreSecretKey              string
+	ObjStoreSessionToken           string
+	ObjStoreServiceAccount         string
+	ObjStoreAzureTenantID          string
+	ObjStoreAzureClientID          string
+	ObjStoreAzureClientSecret      string
+	ObjStoreAzureStorageAccount    string
+	ObjStoreAzureStorageAccountKey string
+	ObjStoreAzureConnectionString  string
+	ObjStoreAzureUserAssignedID    string
+	ObjStoreDurability             ObjectStoreDurability
+	ObjStoreSyncInterval           time.Duration
+	ObjStoreBatchDelay             time.Duration
+	ObjStoreGCInterval             time.Duration
+	ObjStoreGCGracePeriod          time.Duration
+	CheckpointInterval             time.Duration
+	CheckpointTailBytes            int64
+	MaxWALBytes                    int64
 	// HedgeDelay delays each lower-priority proposer. Nil uses
 	// DefaultHedgeDelay; a pointer to zero explicitly enables eager hedging.
 	HedgeDelay *time.Duration
@@ -141,6 +149,10 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,
 		ObjStoreAccessKey: config.ObjStoreAccessKey, ObjStoreSecretKey: config.ObjStoreSecretKey, ObjStoreSessionToken: config.ObjStoreSessionToken,
+		ObjStoreServiceAccount: config.ObjStoreServiceAccount, ObjStoreAzureTenantID: config.ObjStoreAzureTenantID,
+		ObjStoreAzureClientID: config.ObjStoreAzureClientID, ObjStoreAzureClientSecret: config.ObjStoreAzureClientSecret,
+		ObjStoreAzureStorageAccount: config.ObjStoreAzureStorageAccount, ObjStoreAzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
+		ObjStoreAzureConnectionString: config.ObjStoreAzureConnectionString, ObjStoreAzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,

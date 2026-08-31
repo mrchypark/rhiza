@@ -33,6 +33,20 @@ func TestGraphRequestIDRejectedBeforeConsensus(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
 	defer server.Close()
 
+	for _, cypher := range []string{
+		`CREATE (:Person)-[:KNOWS]->(:Person)`,
+		`CREATE (:Person), (:Person)`,
+		`CREATE (a:Person)-[e:KNOWS]->(b:Person)`,
+	} {
+		_, err := server.GraphExecute(context.Background(), types.GraphCommand{RequestID: "unsupported", Cypher: cypher})
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("cypher %q: error=%v", cypher, err)
+		}
+		if core.Tip() != 0 {
+			t.Fatalf("cypher %q advanced consensus tip to %d", cypher, core.Tip())
+		}
+	}
+
 	for _, length := range []int{65, 255, 256} {
 		_, err := server.GraphExecute(context.Background(), types.GraphCommand{RequestID: strings.Repeat("x", length), Cypher: "CREATE (:Item)"})
 		if !errors.Is(err, ErrInvalidRequest) {

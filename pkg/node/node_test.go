@@ -152,7 +152,7 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 			}
 			configure(config)
 			err := New(config).Open(context.Background())
-			if err == nil || (!strings.Contains(err.Error(), "shared object storage") && !strings.Contains(err.Error(), "shared S3-compatible") && !strings.Contains(err.Error(), "S3 bucket is required")) {
+			if err == nil || (!strings.Contains(err.Error(), "shared object storage") && !strings.Contains(err.Error(), "object-store bucket is required")) {
 				t.Fatalf("error=%v, want object-store rejection", err)
 			}
 			if _, statErr := os.Stat(filepath.Join(dataDir, "qlog")); !os.IsNotExist(statErr) {
@@ -196,6 +196,13 @@ func TestObjectStoreConfigMatrix(t *testing.T) {
 		{name: "multi implicit directory", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreDir = t.TempDir() }, wantErr: true},
 		{name: "multi S3", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider, config.ObjStoreBucket = "s3", "rhiza" }},
 		{name: "multi S3 without bucket", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider = "s3" }, wantErr: true},
+		{name: "multi GCS", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider, config.ObjStoreBucket = "gcs", "rhiza" }},
+		{name: "multi Azure", members: members, apply: func(config *types.ExecutionConfig) {
+			config.ObjStoreProvider, config.ObjStoreBucket, config.ObjStoreAzureStorageAccount = "azure", "rhiza", "account"
+		}},
+		{name: "multi Azure without account", members: members, apply: func(config *types.ExecutionConfig) {
+			config.ObjStoreProvider, config.ObjStoreBucket = "azure", "rhiza"
+		}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			config := &types.ExecutionConfig{Members: test.members}
