@@ -14,28 +14,13 @@ import (
 // verifying both the checkpoint bytes and the consensus certificate that
 // sealed that exact root.
 func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
-	if c.Tip() >= seal.Index || seal.ConfigID != c.config.ConfigID || seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+	if c.Tip() >= seal.Index {
 		return fmt.Errorf("invalid checkpoint recovery base")
 	}
-	value, checkpoint, err := DecodeCheckpointSeal(certified.Value)
-	if err != nil || !checkpoint || value.ConfigID != seal.ConfigID || value.Index != seal.Index || value.RootHash != seal.RootHash || value.StateHash != seal.StateHash || value.PrefixHash != seal.PrefixHash || !slices.Equal(value.NextLeaderOrder, seal.NextLeaderOrder) || !slices.Equal(value.FollowingLeaderOrder, seal.FollowingLeaderOrder) {
-		return fmt.Errorf("checkpoint recovery decision does not match its seal")
-	}
-	decision, err := c.certifiedDecision(certified)
-	if err != nil {
-		return err
-	}
-	validator := c.checkpointValidator
-	if validator == nil {
-		return fmt.Errorf("checkpoint validation is unavailable")
-	}
-	if err := validator(ctx, seal); err != nil {
+	if err := c.ValidateCheckpointBase(ctx, seal, certified); err != nil {
 		return err
 	}
 	base := consensusBase{ConfigID: seal.ConfigID, ClosedThrough: seal.Index, PrefixHash: seal.PrefixHash, RecoveryRoot: seal.RootHash, LeaderEpoch: leaderEpoch(seal.Index + 1), NextLeaderOrder: append([]NodeID(nil), seal.NextLeaderOrder...), FollowingLeaderOrder: append([]NodeID(nil), seal.FollowingLeaderOrder...)}
-	if err := c.validateDecisionForRecovery(decision, true); err != nil {
-		return fmt.Errorf("validate checkpoint recovery decision: %w", err)
-	}
 	payload, err := json.Marshal(base)
 	if err != nil {
 		return err
@@ -60,6 +45,45 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 	c.advanceTipLocked()
 	c.pruneSlotAllocatorLocked()
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
+	return nil
+}
+
+// ValidateCheckpointBase authenticates a recovery base without mutating local state.
+func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+	if seal.ConfigID != c.config.ConfigID || seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("invalid checkpoint recovery base")
+	}
+	value, checkpoint, err := DecodeCheckpointSeal(certified.Value)
+	if err != nil || !checkpoint || value.ConfigID != seal.ConfigID || value.Index != seal.Index || value.RootHash != seal.RootHash || value.StateHash != seal.StateHash || value.PrefixHash != seal.PrefixHash || !slices.Equal(value.NextLeaderOrder, seal.NextLeaderOrder) || !slices.Equal(value.FollowingLeaderOrder, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("checkpoint recovery decision does not match its seal")
+	}
+	decision, err := c.certifiedDecision(certified)
+	if err != nil {
+		return err
+	}
+	if err := c.validateDecisionForRecovery(decision, true); err != nil {
+		return fmt.Errorf("validate checkpoint recovery decision: %w", err)
+	}
+	c.mu.RLock()
+	validator := c.checkpointValidator
+	tip, floor, floorRoot := c.tip, c.floor, c.floorRoot
+	prefix, prefixOK := c.prefixes[seal.Index]
+	c.mu.RUnlock()
+	if validator == nil {
+		return fmt.Errorf("checkpoint validation is unavailable")
+	}
+	if err := validator(ctx, seal); err != nil {
+		return err
+	}
+	if floor > seal.Index {
+		return fmt.Errorf("checkpoint recovery base regressed behind local floor")
+	}
+	if tip >= seal.Index && (!prefixOK || prefix != seal.PrefixHash) {
+		return fmt.Errorf("local certified prefix does not match checkpoint recovery base")
+	}
+	if floor == seal.Index && floorRoot != seal.RootHash {
+		return fmt.Errorf("local recovery root does not match checkpoint recovery base")
+	}
 	return nil
 }
 

@@ -25,7 +25,13 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret")
+	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2", Token: "admin-secret"}}, "admin-secret"); peer != nil || err == nil {
+		t.Fatalf("reused non-local voter token peer=%v error=%v", peer, err)
+	}
+	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2"}}, "admin-secret"); peer != nil || err == nil {
+		t.Fatalf("missing voter token peer=%v error=%v", peer, err)
+	}
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +100,7 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	oldConn := transport.peers[member.ID].conn
 	transport.invalidate(member.ID, oldConn)
 	_ = oldConn.CloseWithError(0, "peer restart")
-	replacement, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret")
+	replacement, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +132,39 @@ func TestAllows0RTTOnlyForReadOperations(t *testing.T) {
 		if got := allows0RTT(operation); got != allowed[operation] {
 			t.Fatalf("allows0RTT(%s) = %v, want %v", operation, got, allowed[operation])
 		}
+	}
+}
+
+func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
+	if identity, err := NewPeerIdentity("cluster", quepaxa.Member{ID: "n1", PeerURL: "quic://127.0.0.1:1"}); identity != (PeerIdentity{}) || err == nil {
+		t.Fatalf("identity=%+v error=%v", identity, err)
+	}
+}
+
+func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", Token: "voter-token"}
+	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	defer server.Close()
+	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: "learner-token"}
+	request := &peerfb.RequestT{
+		Operation: peerfb.OperationSync, ClusterId: "cluster", SenderId: "learner-1",
+		ConfigId: uint64(core.ConfigID()), Token: "learner-token", From: 1, Limit: 1,
+	}
+	if _, err := peer.handle(context.Background(), nil, request); err != nil {
+		t.Fatalf("learner sync rejected: %v", err)
+	}
+	request.Operation = peerfb.OperationReadIndex
+	if _, err := peer.handle(context.Background(), nil, request); err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("learner non-sync operation error=%v", err)
+	}
+	request.SenderId = string(member.ID)
+	if _, err := peer.handle(context.Background(), nil, request); err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("learner voter impersonation error=%v", err)
+	}
+	request.Operation, request.Token = peerfb.OperationSync, "wrong"
+	if _, err := peer.handle(context.Background(), nil, request); err == nil || !strings.Contains(err.Error(), "authentication failed") {
+		t.Fatalf("learner wrong-token error=%v", err)
 	}
 }
 
@@ -242,7 +281,7 @@ func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
 	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}

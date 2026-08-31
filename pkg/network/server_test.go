@@ -460,7 +460,7 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	defer sourceServer.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", sourceServer, []quepaxa.Member{member}, "secret")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", sourceServer, []quepaxa.Member{member}, "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}

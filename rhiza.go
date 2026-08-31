@@ -16,6 +16,13 @@ import (
 )
 
 type Member = quepaxa.Member
+type ReplicaMember = network.PeerIdentity
+
+// NewReplicaMember removes a voter's secret while retaining its pinned peer identity.
+func NewReplicaMember(clusterID string, member Member) (ReplicaMember, error) {
+	return network.NewPeerIdentity(types.ClusterID(clusterID), member)
+}
+
 type SQLStatement = types.SQLStatement
 type GraphCommand = types.GraphCommand
 type GraphResult = types.GraphCommandResult

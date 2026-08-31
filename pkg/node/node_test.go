@@ -148,7 +148,7 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 			dataDir := filepath.Join(t.TempDir(), "data")
 			config := &types.ExecutionConfig{
 				NodeID: "n1", DataDir: dataDir,
-				Members: []types.NodeConfig{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}},
+				Members: []types.NodeConfig{{ID: "n1", Token: "token-1"}, {ID: "n2", Token: "token-2"}, {ID: "n3", Token: "token-3"}},
 			}
 			configure(config)
 			err := New(config).Open(context.Background())
@@ -157,6 +157,23 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 			}
 			if _, statErr := os.Stat(filepath.Join(dataDir, "qlog")); !os.IsNotExist(statErr) {
 				t.Fatalf("invalid config created qlog: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestMultiNodeVoterTokensAreDistinctFromAdmin(t *testing.T) {
+	for name, config := range map[string]*types.ExecutionConfig{
+		"missing voter token": {NodeID: "n1", Members: []types.NodeConfig{{ID: "n1"}, {ID: "n2", Token: "voter-2"}}},
+		"admin token reused":  {NodeID: "n1", AdminToken: "shared", Members: []types.NodeConfig{{ID: "n1", Token: "shared"}, {ID: "n2", Token: "voter-2"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			config.DataDir = filepath.Join(t.TempDir(), "data")
+			if err := New(config).Open(context.Background()); err == nil {
+				t.Fatal("invalid peer credentials were accepted")
+			}
+			if _, err := os.Stat(filepath.Join(config.DataDir, "qlog")); !os.IsNotExist(err) {
+				t.Fatalf("invalid credentials created state: %v", err)
 			}
 		})
 	}

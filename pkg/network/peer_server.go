@@ -44,9 +44,14 @@ type PeerServer struct {
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
 	identityToken := token
 	for _, member := range members {
+		if len(members) > 1 && member.Token == "" {
+			return nil, fmt.Errorf("voter token is required for %q", member.ID)
+		}
+		if token != "" && member.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(member.Token)) == 1 {
+			return nil, fmt.Errorf("admin token must differ from voter token for %q", member.ID)
+		}
 		if member.ID == server.core.NodeID() && member.Token != "" {
 			identityToken = member.Token
-			break
 		}
 	}
 	if identityToken == "" && len(members) > 1 {
@@ -159,15 +164,12 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	if request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(s.server.core.ConfigID()) {
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
-	member, ok := s.members[quepaxa.NodeID(request.SenderId)]
-	if !ok {
-		return nil, fmt.Errorf("unknown peer %q", request.SenderId)
-	}
-	expectedToken := member.Token
-	if expectedToken == "" {
-		expectedToken = s.token
-	}
-	if subtle.ConstantTimeCompare([]byte(request.Token), []byte(expectedToken)) != 1 {
+	member, memberOK := s.members[quepaxa.NodeID(request.SenderId)]
+	voter := memberOK && member.Token != "" && subtle.ConstantTimeCompare([]byte(request.Token), []byte(member.Token)) == 1
+	learner := s.token != "" && subtle.ConstantTimeCompare([]byte(request.Token), []byte(s.token)) == 1
+	// Non-voting learners may only pull already-certified decisions. They use
+	// the cluster admin token and never enter the fixed voter membership.
+	if !voter && !(learner && request.Operation == peerfb.OperationSync) {
 		return nil, fmt.Errorf("peer authentication failed")
 	}
 	if !allows0RTT(request.Operation) && (conn == nil || !conn.ConnectionState().TLS.HandshakeComplete) {
