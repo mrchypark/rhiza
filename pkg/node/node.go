@@ -71,6 +71,14 @@ func validateObjectStoreConfig(config *types.ExecutionConfig) (bool, error) {
 	if (provider == objectstore.ProviderS3 || provider == objectstore.ProviderGCS || provider == objectstore.ProviderAzure) && config.ObjStoreBucket == "" {
 		return false, fmt.Errorf("object-store bucket is required")
 	}
+	if provider != "" {
+		if err := objectstore.ValidateConfig(objectstore.Config{
+			Provider: provider, Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Insecure: config.ObjStoreInsecure,
+			AzureStorageAccount: config.ObjStoreAzureStorageAccount,
+		}); err != nil {
+			return false, err
+		}
+	}
 	return configured, nil
 }
 

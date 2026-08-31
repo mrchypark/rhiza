@@ -54,6 +54,9 @@ type Config struct {
 // NewBucket creates a metered bucket. S3 HTTP request counts include SDK
 // retries and multipart calls, which is the billable request boundary.
 func NewBucket(cfg Config) (*MeteredBucket, error) {
+	if err := ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
 	metrics := &bucketMetrics{}
 	var bucket objstore.Bucket
 	var err error
@@ -61,9 +64,6 @@ func NewBucket(cfg Config) (*MeteredBucket, error) {
 	case ProviderFilesystem:
 		bucket, err = newFilesystemBucket(cfg)
 	case ProviderS3:
-		if cfg.Bucket == "" {
-			return nil, fmt.Errorf("S3 bucket is required")
-		}
 		bucket, err = s3.NewBucketWithConfig(kitlog.NewNopLogger(), s3.Config{
 			Bucket: cfg.Bucket, Endpoint: cfg.Endpoint, Region: cfg.Region, Insecure: cfg.Insecure,
 			AWSSDKAuth: cfg.AccessKey == "", AccessKey: cfg.AccessKey, SecretKey: cfg.SecretKey,
@@ -92,6 +92,36 @@ func NewBucket(cfg Config) (*MeteredBucket, error) {
 		return nil, err
 	}
 	return newMeteredBucket(bucket, metrics), nil
+}
+
+// ValidateConfig rejects invalid or silently ignored provider options before
+// callers create durable local state.
+func ValidateConfig(cfg Config) error {
+	switch cfg.Provider {
+	case ProviderFilesystem:
+		return nil
+	case ProviderS3:
+		if cfg.Bucket == "" {
+			return fmt.Errorf("S3 bucket is required")
+		}
+	case ProviderGCS:
+		if cfg.Bucket == "" {
+			return fmt.Errorf("GCS bucket is required")
+		}
+		if cfg.Endpoint != "" || cfg.Insecure {
+			return fmt.Errorf("GCS endpoint and insecure overrides are unsupported")
+		}
+	case ProviderAzure:
+		if cfg.Bucket == "" || cfg.AzureStorageAccount == "" {
+			return fmt.Errorf("Azure container and storage account are required")
+		}
+		if cfg.Insecure {
+			return fmt.Errorf("Azure insecure transport is unsupported")
+		}
+	default:
+		return fmt.Errorf("unsupported provider: %s", cfg.Provider)
+	}
+	return nil
 }
 
 func newFilesystemBucket(cfg Config) (objstore.Bucket, error) {

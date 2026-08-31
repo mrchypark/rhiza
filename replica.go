@@ -152,6 +152,19 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	if config.ObjStoreProvider == "" {
 		config.ObjStoreProvider = string(objstore.ProviderS3)
 	}
+	bucketConfig := objstore.Config{
+		Provider: objstore.Provider(config.ObjStoreProvider), FilesystemDir: config.ObjStoreDir,
+		Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Region: config.ObjStoreRegion,
+		Insecure: config.ObjStoreInsecure, MaxRetries: config.ObjStoreRetries, AccessKey: config.ObjStoreAccessKey,
+		SecretKey: config.ObjStoreSecretKey, SessionToken: config.ObjStoreSessionToken,
+		ServiceAccount: config.ObjStoreServiceAccount, AzureTenantID: config.ObjStoreAzureTenantID,
+		AzureClientID: config.ObjStoreAzureClientID, AzureClientSecret: config.ObjStoreAzureClientSecret,
+		AzureStorageAccount: config.ObjStoreAzureStorageAccount, AzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
+		AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
+	}
+	if err := objstore.ValidateConfig(bucketConfig); err != nil {
+		return nil, fmt.Errorf("invalid replica object store: %w", err)
+	}
 	if config.SyncInterval < 0 {
 		return nil, fmt.Errorf("replica sync interval must not be negative")
 	}
@@ -184,16 +197,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	if err != nil {
 		return nil, fmt.Errorf("open replica materializer: %w", err)
 	}
-	r.bucket, err = objstore.NewBucket(objstore.Config{
-		Provider: objstore.Provider(config.ObjStoreProvider), FilesystemDir: config.ObjStoreDir,
-		Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket, Region: config.ObjStoreRegion,
-		Insecure: config.ObjStoreInsecure, MaxRetries: config.ObjStoreRetries, AccessKey: config.ObjStoreAccessKey,
-		SecretKey: config.ObjStoreSecretKey, SessionToken: config.ObjStoreSessionToken,
-		ServiceAccount: config.ObjStoreServiceAccount, AzureTenantID: config.ObjStoreAzureTenantID,
-		AzureClientID: config.ObjStoreAzureClientID, AzureClientSecret: config.ObjStoreAzureClientSecret,
-		AzureStorageAccount: config.ObjStoreAzureStorageAccount, AzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
-		AzureConnectionString: config.ObjStoreAzureConnectionString, AzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
-	})
+	r.bucket, err = objstore.NewBucket(bucketConfig)
 	if err != nil {
 		return nil, fmt.Errorf("open replica object store: %w", err)
 	}

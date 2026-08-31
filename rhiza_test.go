@@ -309,6 +309,22 @@ func TestReadReplicaRejectsExistingStateWithoutIdentity(t *testing.T) {
 	}
 }
 
+func TestReadReplicaRejectsUnsupportedProviderOptionsBeforeCreatingState(t *testing.T) {
+	dataDir := t.TempDir()
+	replica, err := rhiza.OpenReadReplica(context.Background(), rhiza.ReplicaConfig{
+		ClusterID: "cluster", ReplicaID: "read-1", DataDir: dataDir,
+		Members: []rhiza.ReplicaMember{{ID: "n1"}}, ObjStoreProvider: "gcs", ObjStoreBucket: "bucket",
+		ObjStoreEndpoint: "emulator:4443",
+	})
+	if replica != nil || err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("replica=%v error=%v", replica, err)
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("invalid provider config created replica state: entries=%v err=%v", entries, err)
+	}
+}
+
 func freeUDPAddr(t testing.TB) string {
 	t.Helper()
 	listener, err := net.ListenPacket("udp", "127.0.0.1:0")

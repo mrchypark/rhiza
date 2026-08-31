@@ -197,7 +197,12 @@ func TestObjectStoreConfigMatrix(t *testing.T) {
 		{name: "multi S3", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider, config.ObjStoreBucket = "s3", "rhiza" }},
 		{name: "multi S3 without bucket", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider = "s3" }, wantErr: true},
 		{name: "multi GCS", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider, config.ObjStoreBucket = "gcs", "rhiza" }},
-		{name: "multi Azure", members: members, apply: func(config *types.ExecutionConfig) { config.ObjStoreProvider, config.ObjStoreBucket = "azure", "rhiza" }},
+		{name: "multi Azure", members: members, apply: func(config *types.ExecutionConfig) {
+			config.ObjStoreProvider, config.ObjStoreBucket, config.ObjStoreAzureStorageAccount = "azure", "rhiza", "account"
+		}},
+		{name: "multi Azure without account", members: members, apply: func(config *types.ExecutionConfig) {
+			config.ObjStoreProvider, config.ObjStoreBucket = "azure", "rhiza"
+		}, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			config := &types.ExecutionConfig{Members: test.members}
