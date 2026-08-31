@@ -80,9 +80,10 @@ slot lag, source, last sync time, and last error; voters return 404.
 
 The `rhiza` binary selects `RHIZA_ROLE=voter|object-store|learner` (`voter` is
 the default) and uses `RHIZA_REPLICA_SYNC_INTERVAL` for replica polling. An
-object-store replica needs voter IDs in `RHIZA_CLUSTER_MEMBERS`; a learner also
-needs each voter's `peer_url` and token so the process can derive and retain
-only pinned public identities. See `deploy/k8s/read-replicas.yaml` for both
+object-store replica needs voter IDs in `RHIZA_CLUSTER_MEMBERS`; a learner uses
+token-free `RHIZA_REPLICA_MEMBERS` entries containing `node_id`, `peer_url`, and
+a base64 Ed25519 `public_key`. Derive those identities out of band with
+`rhiza.NewReplicaMember`; never deploy voter tokens to learners. See `deploy/k8s/read-replicas.yaml` for both
 deployment modes. S3-compatible storage, GCS, Azure Blob, and filesystem
 storage are supported; GCS service-account JSON uses
 `RHIZA_OBJSTORE_SERVICE_ACCOUNT`, while Azure uses the

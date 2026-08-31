@@ -5,7 +5,7 @@ metadata:
   namespace: rhiza
 spec:
   selector:
-    app.kubernetes.io/name: rhiza
+    app.kubernetes.io/name: rhiza-read-replica
     app.kubernetes.io/component: read-replica
   ports:
     - name: http
@@ -20,13 +20,13 @@ spec:
   replicas: 2
   selector:
     matchLabels:
-      app.kubernetes.io/name: rhiza
+      app.kubernetes.io/name: rhiza-read-replica
       app.kubernetes.io/component: read-replica
       rhiza.io/replica-mode: object-store
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: rhiza
+        app.kubernetes.io/name: rhiza-read-replica
         app.kubernetes.io/component: read-replica
         rhiza.io/replica-mode: object-store
     spec:
@@ -72,13 +72,13 @@ spec:
   replicas: 2
   selector:
     matchLabels:
-      app.kubernetes.io/name: rhiza
+      app.kubernetes.io/name: rhiza-read-replica
       app.kubernetes.io/component: read-replica
       rhiza.io/replica-mode: learner
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: rhiza
+        app.kubernetes.io/name: rhiza-read-replica
         app.kubernetes.io/component: read-replica
         rhiza.io/replica-mode: learner
     spec:
@@ -91,8 +91,9 @@ spec:
             - secretRef:
                 name: rhiza-object-store
             - secretRef:
-                # Must provide RHIZA_ADMIN_TOKEN and RHIZA_CLUSTER_MEMBERS
-                # with each voter's peer_url and token for key derivation.
+                # Must provide RHIZA_ADMIN_TOKEN and token-free
+                # RHIZA_REPLICA_MEMBERS with each voter's node_id, peer_url,
+                # and base64 Ed25519 public_key.
                 name: rhiza-learner-peer-credentials
           env:
             - name: RHIZA_ROLE

@@ -29,9 +29,12 @@ func TestReadReplicaDeploymentsSelectExplicitRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(manifest)
-	for _, required := range []string{"value: object-store", "value: learner", "path: /ready", "name: rhiza-object-store"} {
+	for _, required := range []string{"value: object-store", "value: learner", "path: /ready", "name: rhiza-object-store", "app.kubernetes.io/name: rhiza-read-replica"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("read replica manifest missing %q", required)
 		}
+	}
+	if strings.Contains(text, "app.kubernetes.io/name: rhiza\n") || strings.Contains(text, "voter token") {
+		t.Fatal("read replica manifest overlaps voter selectors or requests voter credentials")
 	}
 }

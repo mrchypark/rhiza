@@ -2,17 +2,23 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func main() {
@@ -111,7 +117,10 @@ func main() {
 		}
 		handler, closeService = db.Handler(), db.Close
 	case "object-store", "learner":
-		replicaMembers, err := replicaMembers(config.ClusterID, members, role == "learner")
+		replicaMembers, err := objectReplicaMembers(members)
+		if role == "learner" {
+			replicaMembers, err = learnerReplicaMembers(os.Getenv("RHIZA_REPLICA_MEMBERS"), members)
+		}
 		if err != nil {
 			log.Fatalf("configure %s: %v", role, err)
 		}
@@ -162,18 +171,51 @@ func main() {
 	}
 }
 
-func replicaMembers(clusterID string, members []rhiza.Member, requirePeerIdentity bool) ([]rhiza.ReplicaMember, error) {
+func objectReplicaMembers(members []rhiza.Member) ([]rhiza.ReplicaMember, error) {
 	result := make([]rhiza.ReplicaMember, 0, len(members))
 	for _, member := range members {
-		if !requirePeerIdentity {
-			result = append(result, rhiza.ReplicaMember{ID: member.ID})
-			continue
+		if member.ID == "" {
+			return nil, errors.New("voter ID is required")
 		}
-		identity, err := rhiza.NewReplicaMember(clusterID, member)
-		if err != nil {
-			return nil, err
+		result = append(result, rhiza.ReplicaMember{ID: member.ID})
+	}
+	return result, nil
+}
+
+func learnerReplicaMembers(raw string, voterConfig []rhiza.Member) ([]rhiza.ReplicaMember, error) {
+	for _, member := range voterConfig {
+		if member.Token != "" {
+			return nil, errors.New("learner must not receive voter tokens in RHIZA_CLUSTER_MEMBERS")
+		}
+	}
+	var configured []struct {
+		ID        string `json:"node_id"`
+		PeerURL   string `json:"peer_url"`
+		PublicKey string `json:"public_key"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&configured); err != nil {
+		return nil, fmt.Errorf("invalid RHIZA_REPLICA_MEMBERS: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid RHIZA_REPLICA_MEMBERS: trailing JSON")
+	}
+	result := make([]rhiza.ReplicaMember, 0, len(configured))
+	for _, member := range configured {
+		key, err := base64.StdEncoding.DecodeString(member.PublicKey)
+		if err != nil || len(key) != ed25519.PublicKeySize || member.ID == "" || member.PeerURL == "" {
+			return nil, fmt.Errorf("learner members require node_id, peer_url, and a base64 Ed25519 public_key")
+		}
+		identity := rhiza.ReplicaMember{ID: quepaxa.NodeID(member.ID), PeerURL: member.PeerURL}
+		copy(identity.PublicKey[:], key)
+		if identity.PublicKey == ([ed25519.PublicKeySize]byte{}) {
+			return nil, errors.New("learner public_key must not be zero")
 		}
 		result = append(result, identity)
+	}
+	if len(result) == 0 {
+		return nil, errors.New("learner voter membership is required")
 	}
 	return result, nil
 }
