@@ -40,7 +40,7 @@ const (
 	notificationDispatchDepth   = 64
 	recentSQLReceiptLimit       = 4096
 	// ponytail: fixed-size epochs bound memory; saturation only adds SQLite fallbacks.
-	sqlReceiptBloomBytes        = 4 << 20
+	sqlReceiptBloomBytes = 4 << 20
 )
 
 // Materializer applies decided values to SQLite.
@@ -533,6 +533,12 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
 	defer tx.Rollback()
+	statements := make(map[string]*sql.Stmt)
+	defer func() {
+		for _, statement := range statements {
+			statement.Close()
+		}
+	}()
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
 	pending := make([]pendingNotification, 0)
 	m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
@@ -551,7 +557,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending); err != nil {
+		if err := m.applyValueLocked(ctx, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -600,7 +606,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -698,7 +704,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		if _, err := tx.ExecContext(ctx, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
-		result, executeErr := executeSQLCommand(ctx, tx, command)
+		result, executeErr := executeSQLCommand(ctx, tx, statements, command)
 		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted}
 		if executeErr != nil {
 			if command.RequestID == "" {
@@ -994,7 +1000,7 @@ func validatePublicSQL(query string) error {
 	return nil
 }
 
-func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand) (types.SQLCommandResult, error) {
+func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
 	statements := command.Statements
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
@@ -1010,31 +1016,29 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 			}
 			args[i] = value
 		}
-		if statement.WantRows {
-			prepared, err := tx.PrepareContext(ctx, statement.SQL)
-			if err != nil {
-				return result, err
+		query := prepared[statement.SQL]
+		if query == nil {
+			var prepareErr error
+			query, prepareErr = tx.PrepareContext(ctx, statement.SQL)
+			if prepareErr != nil {
+				return result, prepareErr
 			}
-			rows, err := prepared.QueryContext(ctx, args...)
+			prepared[statement.SQL] = query
+		}
+		if statement.WantRows {
+			rows, err := query.QueryContext(ctx, args...)
 			if err != nil {
-				prepared.Close()
 				return result, err
 			}
 			statementResult, err := collectRowsWithBudget(rows, &budget)
 			rows.Close()
-			prepared.Close()
 			if err != nil {
 				return result, err
 			}
 			result.Statements = append(result.Statements, statementResult)
 			continue
 		}
-		prepared, err := tx.PrepareContext(ctx, statement.SQL)
-		if err != nil {
-			return result, err
-		}
-		execResult, err := prepared.ExecContext(ctx, args...)
-		prepared.Close()
+		execResult, err := query.ExecContext(ctx, args...)
 		if err != nil {
 			return result, err
 		}
