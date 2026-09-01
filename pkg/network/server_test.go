@@ -381,6 +381,30 @@ func TestConcurrentApplyDecisionsRemainOrdered(t *testing.T) {
 	}
 }
 
+func TestApplyDecisionsFinishesKnownDecisionAfterCallerCancellation(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n1"}}
+	core := mustCore(t, "n1", members, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	if _, _, err := core.Propose(context.Background(), []byte("CREATE TABLE cancelled_apply (id INTEGER)")); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := server.applyDecisions(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if material.Tip() != 1 {
+		t.Fatalf("material tip=%d, want 1", material.Tip())
+	}
+}
+
 func TestQuiesceTimeoutKeepsAdmissionClosedUntilDrain(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}}
 	core := mustCore(t, "n1", members, nil, nil)
