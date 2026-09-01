@@ -3,6 +3,9 @@ package network
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,9 +13,9 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-func TestSQLBatcherIdleRequestDispatchesImmediately(t *testing.T) {
-	if wait := batchWait(true, 1, 1, 0); wait != 0 {
-		t.Fatalf("idle batch wait=%v, want zero", wait)
+func TestSQLBatcherIdleRequestUsesBoundedMicrobatchWindow(t *testing.T) {
+	if wait := adaptiveWait(0, 1, 0); wait != maxAdaptiveLinger {
+		t.Fatalf("idle batch wait=%v, want %v", wait, maxAdaptiveLinger)
 	}
 	proposed := make(chan []byte, 1)
 	b := newSQLBatcher(func(_ context.Context, value []byte) (quepaxa.Slot, error) {
@@ -144,5 +147,124 @@ func TestBatchAssemblersMatchCanonicalJSON(t *testing.T) {
 	got := types.AssembleSQLBatch(items)
 	if string(got) != string(want) {
 		t.Fatalf("assembled=%q want=%q", got, want)
+	}
+}
+
+func TestSQLBatcherCoalescesAgedBacklog(t *testing.T) {
+	entered := make(chan struct{}, 64)
+	release := make(chan struct{})
+	sizes := make(chan int, 64)
+	var slots atomic.Uint64
+	batcher := newSQLBatcher(func(_ context.Context, value []byte) (quepaxa.Slot, error) {
+		commands, ok, err := types.DecodeSQLBatch(value)
+		if err != nil || !ok {
+			return 0, errors.New("invalid SQL batch")
+		}
+		sizes <- len(commands)
+		entered <- struct{}{}
+		<-release
+		return quepaxa.Slot(slots.Add(1)), nil
+	}, nil)
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+		batcher.Close()
+	}()
+
+	done := make(chan error, maxInflightBatches)
+	submit := func(id int) {
+		_, err := batcher.submit(context.Background(), types.SQLCommand{RequestID: strconv.Itoa(id), SQL: "INSERT INTO bench(value) VALUES (1)"})
+		done <- err
+	}
+	for i := range maxInflightBatches {
+		go submit(i)
+		<-entered
+	}
+	backlog := make([]*batchItem, 0, maxMutationBatch)
+	batcher.budgetMu.Lock()
+	for i := range maxMutationBatch {
+		id := strconv.Itoa(maxInflightBatches + i)
+		encoded, err := types.EncodeSQLBatchItem(types.SQLCommand{RequestID: id, SQL: "INSERT INTO bench(value) VALUES (1)"})
+		if err != nil {
+			batcher.budgetMu.Unlock()
+			t.Fatal(err)
+		}
+		item := &batchItem{
+			ctx: context.Background(), requestID: id, encoded: encoded,
+			reserved: len(encoded) + batchItemOverhead, enqueued: time.Now().Add(-maxOldestQueueAge - time.Millisecond), result: make(chan batchResult, 1),
+		}
+		batcher.queuedN++
+		batcher.queuedByte += item.reserved
+		batcher.input <- item
+		backlog = append(backlog, item)
+	}
+	batcher.budgetMu.Unlock()
+	close(release)
+	released = true
+	for range maxInflightBatches {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, item := range backlog {
+		if result := <-item.result; result.err != nil {
+			t.Fatal(result.err)
+		}
+	}
+	close(sizes)
+	maxSize := 0
+	for size := range sizes {
+		if size > maxSize {
+			maxSize = size
+		}
+	}
+	if maxSize != maxMutationBatch {
+		t.Fatalf("largest batch=%d, want %d", maxSize, maxMutationBatch)
+	}
+}
+
+func BenchmarkSQLBatcherParallel(b *testing.B) {
+	for _, parallelism := range []int{2, 32} {
+		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {
+			var batches atomic.Uint64
+			var batchSizes [maxMutationBatch + 1]atomic.Uint64
+			batcher := newSQLBatcher(func(_ context.Context, value []byte) (quepaxa.Slot, error) {
+				commands, ok, err := types.DecodeSQLBatch(value)
+				if err != nil || !ok || len(commands) == 0 {
+					b.Fatalf("decode batch: commands=%d ok=%v err=%v", len(commands), ok, err)
+				}
+				batchSizes[len(commands)].Add(1)
+				time.Sleep(5 * time.Millisecond)
+				return quepaxa.Slot(batches.Add(1)), nil
+			}, nil)
+			defer batcher.Close()
+			var sequence atomic.Uint64
+			b.SetParallelism(parallelism)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					id := strconv.FormatUint(sequence.Add(1), 10)
+					if _, err := batcher.submit(context.Background(), types.SQLCommand{RequestID: id, SQL: "INSERT INTO bench(value) VALUES (1)"}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.StopTimer()
+			if count := batches.Load(); count != 0 {
+				b.ReportMetric(float64(b.N)/float64(count), "commands/batch")
+				middle := (count + 1) / 2
+				var cumulative uint64
+				for size := 1; size <= maxMutationBatch; size++ {
+					cumulative += batchSizes[size].Load()
+					if cumulative >= middle {
+						b.ReportMetric(float64(size), "p50-commands/batch")
+						break
+					}
+				}
+			}
+		})
 	}
 }
