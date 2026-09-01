@@ -739,17 +739,15 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, strconv.FormatUint(slot, 10)); err != nil {
-		return fmt.Errorf("persist applied slot: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, hex.EncodeToString(hash[:])); err != nil {
-		return fmt.Errorf("persist applied hash: %w", err)
-	}
+	slotValue := strconv.FormatUint(slot, 10)
+	hashValue := hex.EncodeToString(hash[:])
 	if mutatesState {
-		if _, err := tx.ExecContext(ctx, `UPDATE _rhiza_meta SET value = ? WHERE key = 'state_slot'`, strconv.FormatUint(slot, 10)); err != nil {
-			return fmt.Errorf("persist state slot: %w", err)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?), ('state_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue, slotValue); err != nil {
+			return fmt.Errorf("persist applied state: %w", err)
 		}
 		m.stateTip = slot
+	} else if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue); err != nil {
+		return fmt.Errorf("persist applied position: %w", err)
 	}
 	if publish {
 		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: notifyCommand.Payload})
