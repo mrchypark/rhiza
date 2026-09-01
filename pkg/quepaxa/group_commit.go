@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	recorderCommitDelay = 200 * time.Microsecond
+	recorderCommitDelay = 25 * time.Microsecond
 	recorderCommitMax   = 64
 )
 
