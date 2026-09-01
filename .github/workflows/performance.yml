@@ -33,7 +33,7 @@ concurrency:
 jobs:
   paired-go-benchmarks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       CGO_ENABLED: 0
       RHIZA_BENCH_COUNT: 10
@@ -92,6 +92,15 @@ jobs:
           go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
           printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
 
+      - name: Cache pinned Hiqlite build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/hiqlite-target
+          key: hiqlite-${{ runner.os }}-c3ff2536-rust-1.97.1
+
       - name: Run interleaved base and candidate benchmarks
         run: |
           benchmarks/run-ci-benchmarks.sh \
@@ -115,11 +124,36 @@ jobs:
             printf '```\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Run pinned Hiqlite reference
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/hiqlite-target
+          HIQLITE_COMMIT: c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
+          git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
+          cargo +1.97.1 build --release --locked \
+            --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"
+          hiqlite_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite.txt")
+          [[ $hiqlite_ops =~ ^[0-9]+$ ]]
+          # shellcheck disable=SC2016
+          {
+            printf '\n## Pinned Hiqlite reference\n\n'
+            printf 'Official three-node local-client workload: `%s ops/s` ' "$hiqlite_ops"
+            printf '(`cluster -c 16 -r 100000`, commit `%s`).\n' "$HIQLITE_COMMIT"
+          } >>"$GITHUB_STEP_SUMMARY"
+
       - name: Record runner environment
         run: |
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
+            printf 'rust=%s\n' "$(rustc +1.97.1 --version)"
+            printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
             lscpu
             free -b
           } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"

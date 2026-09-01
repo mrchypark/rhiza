@@ -39,10 +39,13 @@ jq -s -f benchmarks/summarize.jq benchmarks/results/<run>/raw/*.ndjson \
 request with its base commit on the same fixed `ubuntu-24.04` runner. It builds
 the benchmark binaries before measurement, pins `GOMAXPROCS=2`, and alternates
 base and candidate execution order across ten samples. The Job Summary contains
-the `benchstat` comparison; raw Go output and runner provenance are uploaded as
-a 30-day artifact. Until this workflow first lands on `main`, its bootstrap run
-uses the candidate's previous commit so both sides contain the same benchmark
-harness; later pull requests compare against their actual base commit.
+the `benchstat` comparison and a pinned execution of Hiqlite's official
+three-node local-client workload (`cluster -c 16 -r 100000`, commit
+`c3ff2536ac985ecb9f77201d1b58dab66c7b256e`). Raw Go and Hiqlite output plus
+runner provenance are uploaded as a 30-day artifact. Until this workflow first
+lands on `main`, its bootstrap run uses the candidate's previous commit so both
+sides contain the same benchmark harness; later pull requests compare against
+their actual base commit.
 
 The workflow is advisory: benchmark failures fail the job, while a measured
 regression is reported without an arbitrary threshold. Use `workflow_dispatch`
