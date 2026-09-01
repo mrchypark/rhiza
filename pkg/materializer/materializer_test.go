@@ -206,6 +206,11 @@ func TestSQLRequestStatusUsesCommittedReceiptCache(t *testing.T) {
 	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
 		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
 	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
 }
 
 func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
