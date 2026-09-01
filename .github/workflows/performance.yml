@@ -138,6 +138,10 @@ jobs:
             cd "$RUNNER_TEMP/hiqlite/examples/bench"
             "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
           ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"
+          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"; then
+            printf 'Hiqlite benchmark reported runtime errors\n' >&2
+            exit 1
+          fi
           hiqlite_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite.txt")
           [[ $hiqlite_ops =~ ^[0-9]+$ ]]
           # shellcheck disable=SC2016

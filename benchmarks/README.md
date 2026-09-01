@@ -47,10 +47,11 @@ lands on `main`, its bootstrap run uses the candidate's previous commit so both
 sides contain the same benchmark harness; later pull requests compare against
 their actual base commit.
 
-The workflow is advisory: benchmark failures fail the job, while a measured
-regression is reported without an arbitrary threshold. Use `workflow_dispatch`
-to compare the selected commit against another base ref. The same collector can
-be smoke-tested locally with short samples:
+The workflow is advisory: benchmark failures, including errors reported by the
+Hiqlite reference, fail the job, while a measured regression is reported without
+an arbitrary threshold. Use `workflow_dispatch` to compare the selected commit
+against another base ref. The same collector can be smoke-tested locally with
+short samples:
 
 ```bash
 RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=100ms \
