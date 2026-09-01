@@ -381,12 +381,13 @@ func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKi
 	return record.fingerprint == fingerprint, true, nil
 }
 
-func (m *Materializer) receiptInTx(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string) (storedReceipt, bool, error) {
-	record, err := scanReceipt(tx.QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+func receiptExistsInTx(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM _rhiza_idempotency WHERE kind = ? AND request_id = ?`, kind, requestID).Scan(&one)
 	if err == sql.ErrNoRows {
-		return storedReceipt{}, false, nil
+		return false, nil
 	}
-	return record, err == nil, err
+	return err == nil, err
 }
 
 func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) error {
@@ -538,7 +539,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		if err != nil {
 			return err
 		}
-		_, found, err := m.receiptInTx(ctx, tx, types.MutationNotify, notifyCommand.RequestID)
+		found, err := receiptExistsInTx(ctx, tx, types.MutationNotify, notifyCommand.RequestID)
 		if err != nil {
 			return err
 		}
@@ -577,7 +578,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
 		}
 		if command.RequestID != "" {
-			_, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID)
+			found, err := receiptExistsInTx(ctx, tx, types.MutationSQL, command.RequestID)
 			if err != nil {
 				return fmt.Errorf("check SQL request %q: %w", command.RequestID, err)
 			}
@@ -698,7 +699,7 @@ func (m *Materializer) applyKV(ctx context.Context, tx *sql.Tx, slot uint64, com
 	if err != nil {
 		return err
 	}
-	if _, found, err := m.receiptInTx(ctx, tx, types.MutationKV, command.RequestID); err != nil {
+	if found, err := receiptExistsInTx(ctx, tx, types.MutationKV, command.RequestID); err != nil {
 		return err
 	} else if found {
 		return nil
