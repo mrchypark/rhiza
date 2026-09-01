@@ -812,7 +812,11 @@ func BenchmarkSQLBatchApply(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer m.Close()
-			if err := m.Apply(context.Background(), 1, []byte("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")); err != nil {
+			schema, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)"}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), 1, schema); err != nil {
 				b.Fatal(err)
 			}
 			b.ResetTimer()
