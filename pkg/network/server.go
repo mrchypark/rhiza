@@ -1302,8 +1302,6 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 	}
 	// A decided value must finish materializing even if its client goes away.
 	// Server shutdown still bounds the work.
-	applyCtx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
-	defer cancel()
 	for {
 		applied := quepaxa.Slot(s.material.Tip())
 		if applied >= through {
@@ -1324,7 +1322,7 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 				break
 			}
 		}
-		if err := s.material.ApplyBatch(applyCtx, decisions[:end]); err != nil {
+		if err := s.material.ApplyBatch(s.proposalCtx, decisions[:end]); err != nil {
 			return err
 		}
 		if end < len(decisions) {
