@@ -1108,26 +1108,25 @@ func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCo
 	m.mu.RLock()
 	record, cached := m.recentSQLReceipts[command.RequestID]
 	tip := m.tip
+	m.mu.RUnlock()
 	if cached {
-		m.mu.RUnlock()
 		if tip > record.receipt.RetryThroughSlot {
 			return types.MutationReceipt{}, false, true, nil
 		}
 		return record.receipt, true, record.fingerprint == fingerprint, nil
 	}
-	if m.writer == nil {
-		m.mu.RUnlock()
-		return types.MutationReceipt{}, false, false, sql.ErrConnDone
+	reader, err := m.reader()
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
 	}
-	record, err = scanReceipt(m.writer.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, command.RequestID), m.idempotencyWindow)
-	m.mu.RUnlock()
+	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, command.RequestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
 		return types.MutationReceipt{}, false, true, nil
 	}
 	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
-	if tip > record.receipt.RetryThroughSlot {
+	if m.Tip() > record.receipt.RetryThroughSlot {
 		return types.MutationReceipt{}, false, true, nil
 	}
 	return record.receipt, true, record.fingerprint == fingerprint, nil
