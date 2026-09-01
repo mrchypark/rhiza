@@ -53,21 +53,37 @@ jobs:
         id: revisions
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.clone_url }}
           PUSH_BASE_SHA: ${{ github.event.before }}
           INPUT_BASE_REF: ${{ inputs.base_ref }}
         run: |
-          candidate_sha=$(git rev-parse HEAD)
+          candidate_sha=${PR_HEAD_SHA:-$(git rev-parse HEAD)}
+          if ! git cat-file -e "$candidate_sha^{commit}" 2>/dev/null; then
+            git fetch --no-tags "$PR_HEAD_REPOSITORY" "$candidate_sha"
+          fi
           if [[ -n "$PR_BASE_SHA" ]]; then
-            base_sha=$PR_BASE_SHA
+            if git cat-file -e "$PR_BASE_SHA:.github/workflows/performance.yml" 2>/dev/null; then
+              base_sha=$PR_BASE_SHA
+              baseline_mode=pull-request-base
+            else
+              base_sha=$(git rev-parse "$candidate_sha^")
+              baseline_mode=bootstrap-previous-commit
+            fi
           elif [[ -n "$PUSH_BASE_SHA" && "$PUSH_BASE_SHA" != 0000000000000000000000000000000000000000 ]]; then
             base_sha=$PUSH_BASE_SHA
+            baseline_mode=previous-main
           else
             git fetch --no-tags origin "$INPUT_BASE_REF"
             base_sha=$(git rev-parse FETCH_HEAD)
+            baseline_mode=workflow-dispatch
           fi
           git cat-file -e "$base_sha^{commit}"
-          printf 'base_sha=%s\n' "$base_sha" >>"$GITHUB_OUTPUT"
-          printf 'candidate_sha=%s\n' "$candidate_sha" >>"$GITHUB_OUTPUT"
+          {
+            printf 'base_sha=%s\n' "$base_sha"
+            printf 'candidate_sha=%s\n' "$candidate_sha"
+            printf 'baseline_mode=%s\n' "$baseline_mode"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Install pinned benchstat
         env:
@@ -93,6 +109,7 @@ jobs:
           {
             printf '## Paired performance benchmarks\n\n'
             printf 'Fixed `ubuntu-24.04`, `GOMAXPROCS=2`; 10 interleaved samples per revision.\n\n'
+            printf 'Baseline mode: `%s`.\n\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '```text\n'
             cat "$RUNNER_TEMP/rhiza-performance/benchstat.txt"
             printf '```\n'
@@ -101,6 +118,7 @@ jobs:
       - name: Record runner environment
         run: |
           {
+            printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
             lscpu
             free -b

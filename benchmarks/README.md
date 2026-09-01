@@ -40,7 +40,9 @@ request with its base commit on the same fixed `ubuntu-24.04` runner. It builds
 the benchmark binaries before measurement, pins `GOMAXPROCS=2`, and alternates
 base and candidate execution order across ten samples. The Job Summary contains
 the `benchstat` comparison; raw Go output and runner provenance are uploaded as
-a 30-day artifact.
+a 30-day artifact. Until this workflow first lands on `main`, its bootstrap run
+uses the candidate's previous commit so both sides contain the same benchmark
+harness; later pull requests compare against their actual base commit.
 
 The workflow is advisory: benchmark failures fail the job, while a measured
 regression is reported without an arbitrary threshold. Use `workflow_dispatch`
