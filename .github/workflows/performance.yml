@@ -132,7 +132,7 @@ jobs:
           rustup toolchain install 1.97.1 --profile minimal
           git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
           git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
-          cargo +1.97.1 build --release --locked \
+          cargo +1.97.1 build --release \
             --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
           (
             cd "$RUNNER_TEMP/hiqlite/examples/bench"
