@@ -12,7 +12,7 @@ func TestOpenHedgeDelayContract(t *testing.T) {
 		delay *time.Duration
 		want  time.Duration
 	}{
-		"default": {want: DefaultHedgeDelay},
+		"default": {want: 100 * time.Millisecond},
 		"eager":   {delay: ptrDuration(0), want: 0},
 		"custom":  {delay: ptrDuration(17 * time.Millisecond), want: 17 * time.Millisecond},
 	} {

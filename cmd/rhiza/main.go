@@ -28,7 +28,7 @@ func main() {
 			log.Fatalf("invalid RHIZA_CLUSTER_MEMBERS: %v", err)
 		}
 	}
-	hedgeDelay, err := time.ParseDuration(getEnvOrDefault("RHIZA_HEDGE_DELAY", "5ms"))
+	hedgeDelay, err := time.ParseDuration(getEnvOrDefault("RHIZA_HEDGE_DELAY", "100ms"))
 	if err != nil || hedgeDelay < 0 {
 		log.Fatalf("invalid RHIZA_HEDGE_DELAY")
 	}

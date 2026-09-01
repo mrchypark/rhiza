@@ -486,7 +486,7 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	}
 }
 
-func TestAcceptFromUsesReturnedCertifiedDecisionWithoutSync(t *testing.T) {
+func TestAcceptFromPersistsReturnedCertifiedDecision(t *testing.T) {
 	member := quepaxa.Member{ID: "n1"}
 	members := []quepaxa.Member{member}
 	source := mustCore(t, member.ID, members, nil, nil)
@@ -498,14 +498,31 @@ func TestAcceptFromUsesReturnedCertifiedDecisionWithoutSync(t *testing.T) {
 	if !ok {
 		t.Fatal("missing certified decision")
 	}
-	target := mustCore(t, member.ID, members, nil, nil)
+	dir := t.TempDir() + "/target-qlog"
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := mustCore(t, member.ID, members, wal, nil)
 	server := NewServer(target, nil, "cluster", true, nil, members, 0)
-	defer server.Close()
 	if err := server.acceptFrom(context.Background(), member.ID, decision); err != nil {
 		t.Fatal(err)
 	}
 	if target.Tip() != decision.Slot {
 		t.Fatalf("tip=%d, want %d", target.Tip(), decision.Slot)
+	}
+	server.Close()
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := mustCore(t, member.ID, members, reopened, nil)
+	if got, ok := recovered.CertifiedValue(decision.Slot); !ok || !bytes.Equal(got.Value, decision.Value) {
+		t.Fatalf("recovered decision=(%v, %q), want (%v, %q)", ok, got.Value, true, decision.Value)
 	}
 }
 

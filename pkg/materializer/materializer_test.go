@@ -702,6 +702,36 @@ func BenchmarkCheckpointFilesAt(b *testing.B) {
 	}
 }
 
+func BenchmarkSQLBatchApply(b *testing.B) {
+	for _, size := range []int{1, 8, 32, 128} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			m, err := Open(b.TempDir()+"/batch.db", 1)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer m.Close()
+			if err := m.Apply(context.Background(), 1, []byte("CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)")); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for iteration := range b.N {
+				commands := make([]types.SQLCommand, size)
+				for i := range commands {
+					id := iteration*size + i
+					commands[i] = types.SQLCommand{RequestID: strconv.Itoa(id), SQL: "INSERT INTO bench(id, value) VALUES (?, ?)", Args: []any{int64(id), int64(1)}}
+				}
+				value, err := types.EncodeSQLBatch(commands)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := m.Apply(context.Background(), uint64(iteration+2), value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestMaterializerPublishesCommittedNotificationOnce(t *testing.T) {
 	m, err := Open(t.TempDir()+"/notify.db", 1)
 	if err != nil {

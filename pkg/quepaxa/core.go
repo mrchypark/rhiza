@@ -104,6 +104,17 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 // Propose drives Algorithm 4. If another proposer wins this slot, the offered
 // value is retried at the next slot so a successful client command is never lost.
 func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, error) {
+	return c.propose(ctx, value, true)
+}
+
+// ProposeCertified returns after a recorder quorum has durably certified the
+// value. The caller must install the returned decision on another voter before
+// acknowledging the client.
+func (c *Core) ProposeCertified(ctx context.Context, value []byte) (Slot, []Receipt, error) {
+	return c.propose(ctx, value, false)
+}
+
+func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, []Receipt, error) {
 	if c.observer {
 		return 0, nil, ErrQuorumUnavailable
 	}
@@ -153,8 +164,10 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			c.releaseSlot(slot)
 			return slot, nil, err
 		}
-		if _, err := c.CompleteDecision(ctx, decision.Slot); err != nil {
-			return decision.Slot, nil, err
+		if complete {
+			if _, err := c.completeDecision(ctx, decision.Slot, len(c.config.Members) == 1); err != nil {
+				return decision.Slot, nil, err
+			}
 		}
 		if decision.Proposal.Hash == offeredHash && bytes.Equal(decision.Proposal.Value, value) {
 			return proposalResult(decision)
@@ -995,14 +1008,43 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 // CompleteDecision makes an existing decision safe to acknowledge by
 // re-establishing the learner quorum required by ReadIndex.
 func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, error) {
+	return c.completeDecision(ctx, slot, true)
+}
+
+func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) (DecidedValue, error) {
 	if c.observer {
 		return DecidedValue{}, ErrQuorumUnavailable
 	}
 	lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
-	if err := c.ensureDurableLocked(slot); err != nil {
-		lock.Unlock()
-		return DecidedValue{}, err
+	if syncLocal {
+		if err := c.ensureDurableLocked(slot); err != nil {
+			lock.Unlock()
+			return DecidedValue{}, err
+		}
+	} else {
+		c.mu.Lock()
+		value, ok := c.decided[slot]
+		if !ok {
+			c.mu.Unlock()
+			lock.Unlock()
+			return DecidedValue{}, fmt.Errorf("slot %d is not decided", slot)
+		}
+		if !c.logged[slot] {
+			decision, err := decodeDecision(value.Certificate)
+			if err != nil {
+				c.mu.Unlock()
+				lock.Unlock()
+				return DecidedValue{}, err
+			}
+			if err := c.appendDecision(decision, value.Value, value.Certificate); err != nil {
+				c.mu.Unlock()
+				lock.Unlock()
+				return DecidedValue{}, err
+			}
+			c.logged[slot] = true
+		}
+		c.mu.Unlock()
 	}
 	c.mu.RLock()
 	value, ok := c.decided[slot]
@@ -1293,7 +1335,7 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 	if !durable || len(slots) == 0 {
 		return nil
 	}
-	if err := c.wal.Sync(); err != nil {
+	if err := c.commits.Sync(context.Background()); err != nil {
 		return err
 	}
 	c.mu.Lock()

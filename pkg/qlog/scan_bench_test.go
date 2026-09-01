@@ -22,3 +22,24 @@ func BenchmarkWALScanScratch(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkWALAppendSync(b *testing.B) {
+	wal, err := Open(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer wal.Close()
+	payload := make([]byte, 256)
+	var slot uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		slot++
+		if err := wal.Append(Entry{Slot: slot, Type: EntryReceipt, Payload: payload}); err != nil {
+			b.Fatal(err)
+		}
+		if err := wal.Sync(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -22,6 +22,36 @@ func BenchmarkCoreProposeThreePeers(b *testing.B) {
 	benchmarkCorePropose(b, false)
 }
 
+func BenchmarkCoreProposeThreePeersParallel(b *testing.B) {
+	benchmarkCoreProposeParallel(b, false)
+}
+
+func BenchmarkCoreProposeCertifiedThreePeersParallel(b *testing.B) {
+	benchmarkCoreProposeParallel(b, true)
+}
+
+func benchmarkCoreProposeParallel(b *testing.B, certifiedOnly bool) {
+	cores, _ := newTestCluster(b)
+	var sequence atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		value := make([]byte, 8)
+		for pb.Next() {
+			binary.LittleEndian.PutUint64(value, sequence.Add(1))
+			var err error
+			if certifiedOnly {
+				_, _, err = cores["n2"].ProposeCertified(context.Background(), value)
+			} else {
+				_, _, err = cores["n2"].Propose(context.Background(), value)
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func BenchmarkCoreProposeOnePeerDown(b *testing.B) {
 	benchmarkCorePropose(b, true)
 }

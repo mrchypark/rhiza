@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -219,6 +220,64 @@ func TestCompleteDecisionRetriesLearnerQuorum(t *testing.T) {
 	}
 }
 
+func TestFreshClusterDecisionSkipsRedundantLocalSync(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &mockTransport{}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	proposal := newProposal(highestPriority, "node-1", []byte("fresh decision"))
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{
+		{RecorderID: "node-1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+		{RecorderID: "node-2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+	}}
+	if err := core.acceptDecision(decision); err != nil {
+		t.Fatal(err)
+	}
+	syncs := 0
+	core.commits = newGroupCommit(func() error {
+		syncs++
+		return wal.Sync()
+	})
+	if _, err := core.completeDecision(context.Background(), 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 0 {
+		t.Fatalf("fresh completion syncs=%d, want 0", syncs)
+	}
+	if !core.logged[1] || core.durable[1] {
+		t.Fatalf("fresh completion logged=%v durable=%v, want logged without a second barrier", core.logged[1], core.durable[1])
+	}
+	if _, err := core.CompleteDecision(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 1 {
+		t.Fatalf("retry completion syncs=%d, want 1", syncs)
+	}
+}
+
+func TestProposeCertifiedDefersLearnerCompletion(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &mockTransport{}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	slot, _, err := core.ProposeCertified(context.Background(), []byte("certified response"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transport.sendDecisionCalls != 0 {
+		t.Fatalf("learner sends=%d, want 0 before the caller installs the certificate", transport.sendDecisionCalls)
+	}
+	if _, ok := core.CertifiedValue(slot); !ok {
+		t.Fatal("recorder-quorum decision is unavailable")
+	}
+}
+
 func TestCompleteDecisionAfterRestartResendsCertificate(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)
@@ -298,8 +357,9 @@ func TestCompleteDecisionAndCompactionLockBoundary(t *testing.T) {
 		core.mu.Unlock()
 		syncStarted := make(chan struct{})
 		releaseSync := make(chan struct{})
+		var syncStartedOnce sync.Once
 		core.commits = newGroupCommit(func() error {
-			close(syncStarted)
+			syncStartedOnce.Do(func() { close(syncStarted) })
 			<-releaseSync
 			return core.wal.Sync()
 		})

@@ -495,7 +495,7 @@ func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.S
 }
 
 func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision quepaxa.DecidedValue) error {
-	if err := s.core.AcceptCertifiedHints([]quepaxa.DecidedValue{decision}); err != nil {
+	if err := s.core.AcceptCertifiedValue(decision); err != nil {
 		return err
 	}
 	if err := s.catchUpFrom(ctx, source, decision.Slot); err != nil {
@@ -544,7 +544,7 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
 		}
-		if err := s.core.AcceptCertifiedHints(response.Decisions); err != nil {
+		if err := s.core.AcceptCertifiedValues(response.Decisions); err != nil {
 			if errors.Is(err, quepaxa.ErrCompacted) {
 				s.handleCompacted()
 				return ErrNotReady
@@ -1186,6 +1186,26 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 	return decision, nil
 }
 
+func (s *Server) proposeCertified(ctx context.Context, value []byte) (quepaxa.DecidedValue, error) {
+	if err := validateReplicatedMutation(value); err != nil {
+		return quepaxa.DecidedValue{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if slot, ok := s.core.DecidedSlot(value); ok {
+		if decision, found := s.core.CertifiedValue(slot); found {
+			return decision, nil
+		}
+	}
+	slot, _, err := s.core.ProposeCertified(ctx, value)
+	if err != nil {
+		return quepaxa.DecidedValue{}, err
+	}
+	decision, ok := s.core.CertifiedValue(slot)
+	if !ok {
+		return quepaxa.DecidedValue{}, errors.New("decision unavailable")
+	}
+	return decision, nil
+}
+
 func (s *Server) proposePeer(ctx context.Context, sender quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
 	select {
 	case s.peerCap <- struct{}{}:
@@ -1229,7 +1249,7 @@ func (s *Server) proposePeer(ctx context.Context, sender quepaxa.NodeID, value [
 	operationCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(s.proposalCtx, cancel)
 	defer func() { stop(); cancel() }()
-	return s.proposeLocal(operationCtx, value)
+	return s.proposeCertified(operationCtx, value)
 }
 
 func validateReplicatedMutation(value []byte) error {

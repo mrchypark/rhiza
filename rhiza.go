@@ -97,7 +97,7 @@ const (
 	ConsistencyLinearizable        = "linearizable"
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
 	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
-	DefaultHedgeDelay              = 5 * time.Millisecond
+	DefaultHedgeDelay              = 100 * time.Millisecond
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
