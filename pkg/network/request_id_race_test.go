@@ -24,6 +24,7 @@ type requestIDRaceTransport struct {
 	cores            map[quepaxa.NodeID]*quepaxa.Core
 	disabled         map[quepaxa.NodeID]bool
 	failNextDecision bool
+	benchmarkQuorum  bool
 
 	gateMu sync.Mutex
 	hashes map[quepaxa.ValueHash]struct{}
@@ -64,14 +65,31 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 		return errors.New("injected learner failure")
 	}
 	cores := make([]*quepaxa.Core, 0, len(t.cores))
+	proposer := decision.Proposal.ProposerID
+	if core := t.cores[proposer]; core != nil && !t.disabled[proposer] {
+		cores = append(cores, core)
+	}
 	for id, core := range t.cores {
-		if !t.disabled[id] {
+		if id != proposer && !t.disabled[id] {
 			cores = append(cores, core)
 		}
 	}
 	quorum := len(t.cores)/2 + 1
 	t.mu.Unlock()
 	if len(cores) < quorum {
+		return quepaxa.ErrQuorumUnavailable
+	}
+	if t.benchmarkQuorum {
+		// ponytail: serialize the minimum quorum because these in-memory peers share one benchmark disk.
+		successes := 0
+		for _, core := range cores {
+			if err := core.AcceptDecision(decision); err == nil {
+				successes++
+				if successes >= quorum {
+					return nil
+				}
+			}
+		}
 		return quepaxa.ErrQuorumUnavailable
 	}
 	results := make(chan error, len(cores))
@@ -180,6 +198,7 @@ func BenchmarkThreePeerSQLExecute(b *testing.B) {
 	for _, parallelism := range []int{2, 32} {
 		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {
 			cluster := newInMemoryThreePeerCluster(b, false)
+			cluster.transport.benchmarkQuorum = true
 			server := cluster.servers["n1"]
 			if _, err := server.Execute(context.Background(), ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY)"}); err != nil {
 				b.Fatal(err)
