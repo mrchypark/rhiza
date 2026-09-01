@@ -81,7 +81,8 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 	}
 	if t.benchmarkQuorum {
 		// ponytail: serialize the minimum quorum because these in-memory peers share one benchmark disk.
-		successes := 0
+		successes := 1 // proposer is the local learner, matching Transport.SendDecision
+		cores = cores[1:]
 		for _, core := range cores {
 			if err := core.AcceptDecision(decision); err == nil {
 				successes++
