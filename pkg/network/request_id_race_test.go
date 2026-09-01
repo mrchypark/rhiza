@@ -196,7 +196,7 @@ func newInMemoryThreePeerCluster(t testing.TB, gated bool) requestIDRaceCluster 
 }
 
 func BenchmarkThreePeerSQLExecute(b *testing.B) {
-	for _, parallelism := range []int{2, 32} {
+	for _, parallelism := range []int{2, 8, 32} {
 		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {
 			cluster := newInMemoryThreePeerCluster(b, false)
 			cluster.transport.benchmarkQuorum = true
@@ -229,7 +229,7 @@ func BenchmarkThreePeerSQLExecute(b *testing.B) {
 }
 
 func BenchmarkCertifiedThreePeerSQLExecute(b *testing.B) {
-	for _, parallelism := range []int{2, 32} {
+	for _, parallelism := range []int{2, 8, 32} {
 		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {
 			cluster := newInMemoryThreePeerCluster(b, false)
 			proposer := cluster.cores["n1"]
