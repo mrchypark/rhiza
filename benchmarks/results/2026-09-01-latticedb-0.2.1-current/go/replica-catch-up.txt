@@ -1,0 +1,56 @@
+2026/09/01 14:43:28 creating streaming checkpoint at slot 3
+2026/09/01 14:43:28 checkpoint candidate published: index=3 size=37331 files=2
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza
+cpu: Apple M3
+BenchmarkReplicaCatchUp/object-store-8         	2026/09/01 14:43:29 creating streaming checkpoint at slot 22
+2026/09/01 14:43:29 checkpoint candidate published: index=22 size=37332 files=2
+      20	   3870512 ns/op	         3.000 obj_gets/op	         3.000 obj_heads/op	  101238 B/op	     375 allocs/op
+BenchmarkReplicaCatchUp/object-store-8         	2026/09/01 14:43:29 creating streaming checkpoint at slot 3
+2026/09/01 14:43:29 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:30 creating streaming checkpoint at slot 22
+2026/09/01 14:43:30 checkpoint candidate published: index=22 size=37332 files=2
+      20	   4240579 ns/op	         3.000 obj_gets/op	         3.000 obj_heads/op	  102209 B/op	     377 allocs/op
+BenchmarkReplicaCatchUp/object-store-8         	2026/09/01 14:43:30 creating streaming checkpoint at slot 3
+2026/09/01 14:43:30 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:31 creating streaming checkpoint at slot 22
+2026/09/01 14:43:31 checkpoint candidate published: index=22 size=37332 files=2
+      20	   4029029 ns/op	         3.000 obj_gets/op	         3.000 obj_heads/op	  100845 B/op	     373 allocs/op
+BenchmarkReplicaCatchUp/object-store-8         	2026/09/01 14:43:31 creating streaming checkpoint at slot 3
+2026/09/01 14:43:31 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:32 creating streaming checkpoint at slot 22
+2026/09/01 14:43:32 checkpoint candidate published: index=22 size=37332 files=2
+      20	   4240496 ns/op	         3.000 obj_gets/op	         3.000 obj_heads/op	  101762 B/op	     376 allocs/op
+BenchmarkReplicaCatchUp/object-store-8         	2026/09/01 14:43:32 creating streaming checkpoint at slot 3
+2026/09/01 14:43:32 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:33 creating streaming checkpoint at slot 22
+2026/09/01 14:43:33 checkpoint candidate published: index=22 size=37332 files=2
+      20	   4212669 ns/op	         3.000 obj_gets/op	         3.000 obj_heads/op	  101660 B/op	     376 allocs/op
+2026/09/01 14:43:33 creating streaming checkpoint at slot 3
+2026/09/01 14:43:33 checkpoint candidate published: index=3 size=37331 files=2
+BenchmarkReplicaCatchUp/learner-8              	2026/09/01 14:43:33 creating streaming checkpoint at slot 22
+2026/09/01 14:43:33 checkpoint candidate published: index=22 size=37332 files=2
+      20	   3952469 ns/op	         0 obj_gets/op	         0 obj_heads/op	   79951 B/op	     426 allocs/op
+BenchmarkReplicaCatchUp/learner-8              	2026/09/01 14:43:34 creating streaming checkpoint at slot 3
+2026/09/01 14:43:34 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:34 creating streaming checkpoint at slot 22
+2026/09/01 14:43:34 checkpoint candidate published: index=22 size=37332 files=2
+      20	   3822987 ns/op	         0 obj_gets/op	         0 obj_heads/op	   79419 B/op	     426 allocs/op
+BenchmarkReplicaCatchUp/learner-8              	2026/09/01 14:43:35 creating streaming checkpoint at slot 3
+2026/09/01 14:43:35 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:36 creating streaming checkpoint at slot 22
+2026/09/01 14:43:36 checkpoint candidate published: index=22 size=37332 files=2
+      20	   8106671 ns/op	         0 obj_gets/op	         0 obj_heads/op	   78774 B/op	     419 allocs/op
+BenchmarkReplicaCatchUp/learner-8              	2026/09/01 14:43:36 creating streaming checkpoint at slot 3
+2026/09/01 14:43:36 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:37 creating streaming checkpoint at slot 22
+2026/09/01 14:43:37 checkpoint candidate published: index=22 size=37332 files=2
+      20	   5697958 ns/op	         0 obj_gets/op	         0 obj_heads/op	   79489 B/op	     425 allocs/op
+BenchmarkReplicaCatchUp/learner-8              	2026/09/01 14:43:38 creating streaming checkpoint at slot 3
+2026/09/01 14:43:38 checkpoint candidate published: index=3 size=37331 files=2
+2026/09/01 14:43:39 creating streaming checkpoint at slot 22
+2026/09/01 14:43:39 checkpoint candidate published: index=22 size=37332 files=2
+      20	   5821260 ns/op	         0 obj_gets/op	         0 obj_heads/op	   80340 B/op	     429 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza	12.225s

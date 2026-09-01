@@ -38,3 +38,19 @@ func TestReadReplicaDeploymentsSelectExplicitRoles(t *testing.T) {
 		t.Fatal("read replica manifest overlaps voter selectors or requests voter credentials")
 	}
 }
+
+func TestThreePeerE2EManifestsProvideDistinctVoterTokens(t *testing.T) {
+	for _, name := range []string{"sql-server-3peer-e2e.yaml", "graph-server-3peer-e2e.yaml"} {
+		manifest, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(manifest)
+		if strings.Count(text, `"token":"rhiza-`) != 3 {
+			t.Fatalf("%s must provide one voter token per member", name)
+		}
+		if strings.Contains(text, `"token":"rhiza-local-e2e-peer-token"`) {
+			t.Fatalf("%s reuses the admin token as a voter token", name)
+		}
+	}
+}

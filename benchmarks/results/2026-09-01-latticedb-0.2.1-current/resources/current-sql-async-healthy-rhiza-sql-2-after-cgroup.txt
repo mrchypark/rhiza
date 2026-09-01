@@ -1,0 +1,11 @@
+usage_usec 7699063
+user_usec 3663800
+system_usec 4035263
+nice_usec 0
+nr_periods 730
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+37064704
+43257856

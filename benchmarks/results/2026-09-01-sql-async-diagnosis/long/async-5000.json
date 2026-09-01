@@ -1,0 +1,1 @@
+{"requests":5000,"successes":4007,"errors":993,"duration_ms":271619.297125,"ops_per_sec":18.408117732883262,"success_ops_per_sec":14.752265551132645,"p50_ms":338.207667,"p95_ms":2409.967875,"p99_ms":6119.419333,"max_ms":16032.84975,"error_p50_ms":224.637833,"error_p95_ms":5456.053042,"error_p99_ms":9877.878458,"error_kinds":{"http_503":993}}

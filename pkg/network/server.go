@@ -495,6 +495,9 @@ func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.S
 }
 
 func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision quepaxa.DecidedValue) error {
+	if err := s.core.AcceptCertifiedHints([]quepaxa.DecidedValue{decision}); err != nil {
+		return err
+	}
 	if err := s.catchUpFrom(ctx, source, decision.Slot); err != nil {
 		return err
 	}

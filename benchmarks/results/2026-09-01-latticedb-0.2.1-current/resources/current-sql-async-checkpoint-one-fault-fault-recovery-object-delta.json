@@ -1,0 +1,1 @@
+{"bytes_downloaded":11664285,"bytes_uploaded":10224610,"condition_conflicts":42,"dedup_hits":7,"deletes":0,"failures":54,"gets":834,"heads":969,"http_4xx_unexpected":0,"http_5xx":0,"lists":27,"s3_http_failures":3,"s3_http_requests":2289,"sdk_retries":0,"transport_failures":3,"uploads":458}

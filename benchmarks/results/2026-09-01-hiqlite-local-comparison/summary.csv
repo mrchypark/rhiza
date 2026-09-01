@@ -1,0 +1,5 @@
+run,single_insert_ms,single_insert_ops_s,transactional_insert_ms,transactional_insert_ops_s,cache_put_ms,cache_put_ops_s,select_fresh_us,wall_seconds,max_rss_bytes
+1,10706,9340,275,363636,2135,46838,236,635.12,549289984
+2,11283,8862,248,403225,1848,54112,132,36.03,551976960
+3,9184,10888,251,398406,1610,62111,221,33.34,543211520
+median,10706,9340,251,398406,1848,54112,221,36.03,549289984

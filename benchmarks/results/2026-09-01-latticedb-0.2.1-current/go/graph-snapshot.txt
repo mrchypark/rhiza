@@ -1,0 +1,21 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	      10	   2862592 ns/op	         1.335 db-MiB	  396878 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	      10	   2314458 ns/op	         1.335 db-MiB	  396881 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	      10	   2279054 ns/op	         1.335 db-MiB	  396873 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	      10	   2185058 ns/op	         1.335 db-MiB	  396880 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	      10	   2087167 ns/op	         1.335 db-MiB	  396881 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-8        	      10	  10251037 ns/op	        21.33 db-MiB	 7778816 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-8        	      10	  11066138 ns/op	        21.33 db-MiB	 7778853 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-8        	      10	   9738067 ns/op	        21.33 db-MiB	 7778895 B/op	      21 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-8        	      10	  17405229 ns/op	        21.33 db-MiB	 7778659 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-8        	      10	  32466938 ns/op	        21.33 db-MiB	 7778775 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-8        	      10	  66657746 ns/op	        85.34 db-MiB	53729262 B/op	      21 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-8        	      10	  55354238 ns/op	        85.34 db-MiB	53729304 B/op	      22 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-8        	      10	  66456417 ns/op	        85.34 db-MiB	53729392 B/op	      22 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-8        	      10	  40715196 ns/op	        85.34 db-MiB	53729297 B/op	      22 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-8        	      10	  77523088 ns/op	        85.34 db-MiB	53729393 B/op	      22 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	20.543s

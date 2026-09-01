@@ -486,6 +486,29 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	}
 }
 
+func TestAcceptFromUsesReturnedCertifiedDecisionWithoutSync(t *testing.T) {
+	member := quepaxa.Member{ID: "n1"}
+	members := []quepaxa.Member{member}
+	source := mustCore(t, member.ID, members, nil, nil)
+	slot, _, err := source.Propose(context.Background(), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := source.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("missing certified decision")
+	}
+	target := mustCore(t, member.ID, members, nil, nil)
+	server := NewServer(target, nil, "cluster", true, nil, members, 0)
+	defer server.Close()
+	if err := server.acceptFrom(context.Background(), member.ID, decision); err != nil {
+		t.Fatal(err)
+	}
+	if target.Tip() != decision.Slot {
+		t.Fatalf("tip=%d, want %d", target.Tip(), decision.Slot)
+	}
+}
+
 func TestFallbackWinnerBecomesNextRequestFirstWithoutChangingAgreedLeader(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
 	core := mustCore(t, "n1", members, nil, nil)
