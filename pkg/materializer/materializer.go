@@ -38,6 +38,7 @@ const (
 	notificationSubscriberLimit = 64
 	notificationQueueDepth      = 1
 	notificationDispatchDepth   = 64
+	recentSQLReceiptLimit       = 4096
 )
 
 // Materializer applies decided values to SQLite.
@@ -53,6 +54,7 @@ type Materializer struct {
 	dbPath            string
 	readersN          int
 	idempotencyWindow uint64
+	recentSQLReceipts map[string]storedReceipt
 	graph             *graphState
 	notifyMu          sync.Mutex
 	nextSub           uint64
@@ -162,6 +164,7 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		dbPath:            dbPath,
 		readersN:          readerCount,
 		idempotencyWindow: window,
+		recentSQLReceipts: make(map[string]storedReceipt),
 		subs:              make(map[uint64]notificationSubscription),
 		notifyQueue:       make(chan pendingNotification, notificationDispatchDepth),
 		notifyStop:        make(chan struct{}),
@@ -417,6 +420,11 @@ type pendingNotification struct {
 	payload []byte
 }
 
+type pendingSQLReceipt struct {
+	requestID string
+	record    storedReceipt
+}
+
 // Apply applies one decided value.
 func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) error {
 	return m.ApplyBatch(ctx, []quepaxa.DecidedValue{{Slot: quepaxa.Slot(slot), Value: value}})
@@ -439,6 +447,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	defer tx.Rollback()
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
 	pending := make([]pendingNotification, 0)
+	pendingReceipts := make([]pendingSQLReceipt, 0)
 	for _, decision := range decisions {
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
@@ -454,7 +463,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending); err != nil {
+		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending, &pendingReceipts); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -463,6 +472,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return fmt.Errorf("commit apply batch: %w", err)
+	}
+	if len(pendingReceipts) > recentSQLReceiptLimit {
+		pendingReceipts = pendingReceipts[len(pendingReceipts)-recentSQLReceiptLimit:]
+	}
+	if len(m.recentSQLReceipts)+len(pendingReceipts) > recentSQLReceiptLimit {
+		clear(m.recentSQLReceipts)
+	}
+	for _, pending := range pendingReceipts {
+		m.recentSQLReceipts[pending.requestID] = pending.record
 	}
 	for _, notification := range pending {
 		m.enqueueNotification(notification)
@@ -490,7 +508,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification, pendingReceipts *[]pendingSQLReceipt) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -614,6 +632,9 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 				if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
 					return err
 				}
+			} else {
+				receipt.RetryThroughSlot = slot + m.idempotencyWindow - 1
+				*pendingReceipts = append(*pendingReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
@@ -1076,17 +1097,27 @@ func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLC
 	return matches, err
 }
 
-// SQLRequestStatus returns the retained receipt and fingerprint match with one read.
+// SQLRequestStatus returns the retained receipt and fingerprint match.
 func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCommand) (types.MutationReceipt, bool, bool, error) {
 	fingerprint, err := types.SQLFingerprint(command)
 	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
+	m.mu.RLock()
+	record, cached := m.recentSQLReceipts[command.RequestID]
+	tip := m.tip
+	m.mu.RUnlock()
+	if cached {
+		if tip > record.receipt.RetryThroughSlot {
+			return types.MutationReceipt{}, false, true, nil
+		}
+		return record.receipt, true, record.fingerprint == fingerprint, nil
+	}
 	reader, err := m.reader()
 	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
-	record, err := scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, command.RequestID), m.idempotencyWindow)
+	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, command.RequestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
 		return types.MutationReceipt{}, false, true, nil
 	}
@@ -1698,6 +1729,7 @@ func (m *Materializer) reopen() error {
 func (m *Materializer) adopt(source *Materializer) {
 	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
 	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
+	m.recentSQLReceipts = source.recentSQLReceipts
 	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
 	_ = source.Close()
 }

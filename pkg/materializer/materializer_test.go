@@ -180,6 +180,34 @@ func TestSQLRequestStatus(t *testing.T) {
 	}
 }
 
+func TestSQLRequestStatusUsesCommittedReceiptCache(t *testing.T) {
+	m, err := Open(t.TempDir()+"/status-cache.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "cached", SQL: "CREATE TABLE cached_status (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.readers[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.SQLRequestStatus(context.Background(), command)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := command
+	conflict.SQL = "CREATE TABLE conflicting_status (id INTEGER)"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
+		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
 func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
 	t.Run("KV", func(t *testing.T) {
 		m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
