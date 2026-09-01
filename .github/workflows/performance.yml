@@ -1,0 +1,116 @@
+name: Performance
+
+on:
+  pull_request:
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - benchmarks/**
+      - .github/workflows/performance.yml
+  push:
+    branches: [main]
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - benchmarks/**
+      - .github/workflows/performance.yml
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git ref to compare against
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired-go-benchmarks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CGO_ENABLED: 0
+      RHIZA_BENCH_COUNT: 10
+      RHIZA_BENCH_TIME: 1s
+      RHIZA_BENCH_PROCS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve comparison revisions
+        id: revisions
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          INPUT_BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          candidate_sha=$(git rev-parse HEAD)
+          if [[ -n "$PR_BASE_SHA" ]]; then
+            base_sha=$PR_BASE_SHA
+          elif [[ -n "$PUSH_BASE_SHA" && "$PUSH_BASE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+            base_sha=$PUSH_BASE_SHA
+          else
+            git fetch --no-tags origin "$INPUT_BASE_REF"
+            base_sha=$(git rev-parse FETCH_HEAD)
+          fi
+          git cat-file -e "$base_sha^{commit}"
+          printf 'base_sha=%s\n' "$base_sha" >>"$GITHUB_OUTPUT"
+          printf 'candidate_sha=%s\n' "$candidate_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned benchstat
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+          printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
+
+      - name: Run interleaved base and candidate benchmarks
+        run: |
+          benchmarks/run-ci-benchmarks.sh \
+            "${{ steps.revisions.outputs.base_sha }}" \
+            "${{ steps.revisions.outputs.candidate_sha }}" \
+            "$RUNNER_TEMP/rhiza-performance"
+
+      - name: Compare results
+        run: |
+          benchstat \
+            "base=$RUNNER_TEMP/rhiza-performance/base.txt" \
+            "candidate=$RUNNER_TEMP/rhiza-performance/candidate.txt" \
+            | tee "$RUNNER_TEMP/rhiza-performance/benchstat.txt"
+          # shellcheck disable=SC2016
+          {
+            printf '## Paired performance benchmarks\n\n'
+            printf 'Fixed `ubuntu-24.04`, `GOMAXPROCS=2`; 10 interleaved samples per revision.\n\n'
+            printf '```text\n'
+            cat "$RUNNER_TEMP/rhiza-performance/benchstat.txt"
+            printf '```\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Record runner environment
+        run: |
+          {
+            printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
+            lscpu
+            free -b
+          } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-performance-${{ github.run_id }}
+          path: ${{ runner.temp }}/rhiza-performance
+          if-no-files-found: error
+          retention-days: 30

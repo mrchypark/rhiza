@@ -32,3 +32,26 @@ Aggregate all NDJSON files with:
 jq -s -f benchmarks/summarize.jq benchmarks/results/<run>/raw/*.ndjson \
   > benchmarks/results/<run>/summary.json
 ```
+
+## CI performance comparison
+
+`.github/workflows/performance.yml` compares every performance-relevant pull
+request with its base commit on the same fixed `ubuntu-24.04` runner. It builds
+the benchmark binaries before measurement, pins `GOMAXPROCS=2`, and alternates
+base and candidate execution order across ten samples. The Job Summary contains
+the `benchstat` comparison; raw Go output and runner provenance are uploaded as
+a 30-day artifact.
+
+The workflow is advisory: benchmark failures fail the job, while a measured
+regression is reported without an arbitrary threshold. Use `workflow_dispatch`
+to compare the selected commit against another base ref. The same collector can
+be smoke-tested locally with short samples:
+
+```bash
+RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=100ms \
+  benchmarks/run-ci-benchmarks.sh HEAD HEAD /tmp/rhiza-performance
+```
+
+Hosted-runner absolute throughput remains diagnostic. Use paired deltas for PR
+decisions and retain the Dory matrix for Kubernetes, fault, and object-store
+qualification.
