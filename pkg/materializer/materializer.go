@@ -39,6 +39,8 @@ const (
 	notificationQueueDepth      = 1
 	notificationDispatchDepth   = 64
 	recentSQLReceiptLimit       = 4096
+	// ponytail: fixed-size epochs bound memory; saturation only adds SQLite fallbacks.
+	sqlReceiptBloomBytes        = 4 << 20
 )
 
 // Materializer applies decided values to SQLite.
@@ -56,6 +58,7 @@ type Materializer struct {
 	idempotencyWindow  uint64
 	recentSQLReceipts  map[string]storedReceipt
 	pendingSQLReceipts []pendingSQLReceipt
+	sqlReceipts        sqlReceiptBloom
 	graph              *graphState
 	notifyMu           sync.Mutex
 	nextSub            uint64
@@ -181,6 +184,10 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	if err := m.loadTip(existing); err != nil {
 		m.Close()
 		return nil, fmt.Errorf("load applied slot: %w", err)
+	}
+	if err := m.loadSQLReceiptBloom(); err != nil {
+		m.Close()
+		return nil, fmt.Errorf("load SQL receipts: %w", err)
 	}
 	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "latticedb"), m.tip, window)
 	if err != nil {
@@ -328,6 +335,86 @@ type storedReceipt struct {
 	receipt     types.MutationReceipt
 }
 
+type sqlReceiptBloomEpoch struct {
+	epoch uint64
+	valid bool
+	bits  []byte
+}
+
+type sqlReceiptBloom struct {
+	epochs [2]sqlReceiptBloomEpoch
+	window uint64
+}
+
+func (b *sqlReceiptBloom) add(requestID string, slot uint64) {
+	epoch := slot / b.window
+	filter := &b.epochs[epoch%uint64(len(b.epochs))]
+	if !filter.valid || filter.epoch != epoch {
+		if filter.bits == nil {
+			filter.bits = make([]byte, sqlReceiptBloomBytes)
+		} else {
+			clear(filter.bits)
+		}
+		filter.epoch, filter.valid = epoch, true
+	}
+	hash := sha256.Sum256([]byte(requestID))
+	for i := range 3 {
+		bit := bloomBit(hash, i)
+		filter.bits[bit>>3] |= 1 << (bit & 7)
+	}
+}
+
+func (b *sqlReceiptBloom) mightContain(requestID string, tip uint64) bool {
+	epoch := tip / b.window
+	hash := sha256.Sum256([]byte(requestID))
+	for i := range b.epochs {
+		filter := &b.epochs[i]
+		if !filter.valid || filter.epoch > epoch || epoch-filter.epoch > 1 {
+			continue
+		}
+		found := true
+		for j := range 3 {
+			bit := bloomBit(hash, j)
+			if filter.bits[bit>>3]&(1<<(bit&7)) == 0 {
+				found = false
+				break
+			}
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func bloomBit(hash [32]byte, index int) uint32 {
+	offset := index * 4
+	value := uint32(hash[offset]) | uint32(hash[offset+1])<<8 | uint32(hash[offset+2])<<16 | uint32(hash[offset+3])<<24
+	return value & (sqlReceiptBloomBytes*8 - 1)
+}
+
+func (m *Materializer) loadSQLReceiptBloom() error {
+	m.sqlReceipts.window = m.idempotencyWindow
+	floor := uint64(0)
+	if m.tip >= m.idempotencyWindow {
+		floor = m.tip - m.idempotencyWindow + 1
+	}
+	rows, err := m.db.Query(`SELECT request_id, commit_slot FROM _rhiza_idempotency WHERE kind = ? AND commit_slot >= ?`, types.MutationSQL, floor)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var requestID string
+		var slot uint64
+		if err := rows.Scan(&requestID, &slot); err != nil {
+			return err
+		}
+		m.sqlReceipts.add(requestID, slot)
+	}
+	return rows.Err()
+}
+
 func scanReceipt(scanner interface{ Scan(...any) error }, window uint64) (storedReceipt, error) {
 	var record storedReceipt
 	var fingerprint []byte
@@ -473,6 +560,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return fmt.Errorf("commit apply batch: %w", err)
+	}
+	for _, pending := range m.pendingSQLReceipts {
+		m.sqlReceipts.add(pending.requestID, pending.record.receipt.Slot)
 	}
 	pendingReceipts := m.pendingSQLReceipts
 	if len(pendingReceipts) > recentSQLReceiptLimit {
@@ -1108,12 +1198,16 @@ func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCo
 	m.mu.RLock()
 	record, cached := m.recentSQLReceipts[command.RequestID]
 	tip := m.tip
+	mightContain := m.sqlReceipts.mightContain(command.RequestID, tip)
 	m.mu.RUnlock()
 	if cached {
 		if tip > record.receipt.RetryThroughSlot {
 			return types.MutationReceipt{}, false, true, nil
 		}
 		return record.receipt, true, record.fingerprint == fingerprint, nil
+	}
+	if !mightContain {
+		return types.MutationReceipt{}, false, true, nil
 	}
 	reader, err := m.reader()
 	if err != nil {
@@ -1732,6 +1826,7 @@ func (m *Materializer) adopt(source *Materializer) {
 	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
 	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
 	m.recentSQLReceipts = source.recentSQLReceipts
+	m.sqlReceipts = source.sqlReceipts
 	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
 	_ = source.Close()
 }

@@ -206,6 +206,50 @@ func TestSQLRequestStatusUsesCommittedReceiptCache(t *testing.T) {
 	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
 		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
 	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
+func TestSQLReceiptBloomLoadsAndRotates(t *testing.T) {
+	path := t.TempDir() + "/status-bloom.db"
+	m, err := Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := types.SQLCommand{RequestID: "persisted", SQL: "CREATE TABLE bloom_status (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !m.sqlReceipts.mightContain(command.RequestID, m.tip) {
+		t.Fatal("persisted receipt is absent from the startup Bloom filter")
+	}
+
+	var bloom sqlReceiptBloom
+	bloom.window = 1024
+	bloom.add("old", 1023)
+	bloom.add("current", 1024)
+	if !bloom.mightContain("old", 1024) || !bloom.mightContain("current", 1024) {
+		t.Fatal("retained receipts disappeared across an epoch boundary")
+	}
+	bloom.add("next", 2048)
+	if !bloom.mightContain("current", 2047) || !bloom.mightContain("next", 2048) {
+		t.Fatal("retained receipts disappeared during filter rotation")
+	}
 }
 
 func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
