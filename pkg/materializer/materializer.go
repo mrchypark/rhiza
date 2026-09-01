@@ -485,8 +485,8 @@ func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, req
 	return err
 }
 
-func insertReceiptIfAbsent(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) (bool, error) {
-	result, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+func insertReceiptIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) (bool, error) {
+	result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
 	if err != nil {
 		return false, err
 	}
@@ -701,7 +701,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 		if err != nil {
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
 		}
-		if _, err := tx.ExecContext(ctx, "SAVEPOINT rhiza_command"); err != nil {
+		if _, err := execPrepared(ctx, tx, statements, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
 		result, executeErr := executeSQLCommand(ctx, tx, statements, command)
@@ -710,7 +710,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 			if command.RequestID == "" {
 				return executeErr
 			}
-			if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
+			if _, err := execPrepared(ctx, tx, statements, "ROLLBACK TO rhiza_command"); err != nil {
 				return err
 			}
 			receipt.Status = types.MutationRejected
@@ -722,12 +722,12 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 			}
 		}
 		if command.RequestID != "" {
-			inserted, err := insertReceiptIfAbsent(ctx, tx, types.MutationSQL, command.RequestID, fingerprint, receipt)
+			inserted, err := insertReceiptIfAbsent(ctx, tx, statements, types.MutationSQL, command.RequestID, fingerprint, receipt)
 			if err != nil {
 				return fmt.Errorf("record SQL request %q: %w", command.RequestID, err)
 			}
 			if !inserted {
-				if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
+				if _, err := execPrepared(ctx, tx, statements, "ROLLBACK TO rhiza_command"); err != nil {
 					return err
 				}
 			} else {
@@ -735,7 +735,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 				m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
+		if _, err := execPrepared(ctx, tx, statements, "RELEASE rhiza_command"); err != nil {
 			return err
 		}
 	}
@@ -1014,14 +1014,9 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 			}
 			args[i] = value
 		}
-		query := prepared[statement.SQL]
-		if query == nil {
-			var prepareErr error
-			query, prepareErr = tx.PrepareContext(ctx, statement.SQL)
-			if prepareErr != nil {
-				return result, prepareErr
-			}
-			prepared[statement.SQL] = query
+		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
+		if err != nil {
+			return result, err
 		}
 		if statement.WantRows {
 			rows, err := query.QueryContext(ctx, args...)
@@ -1053,6 +1048,25 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 		return result, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
 	}
 	return result, nil
+}
+
+func preparedStatement(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, query string) (*sql.Stmt, error) {
+	if statement := prepared[query]; statement != nil {
+		return statement, nil
+	}
+	statement, err := tx.PrepareContext(ctx, query)
+	if err == nil {
+		prepared[query] = statement
+	}
+	return statement, err
+}
+
+func execPrepared(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, query string, args ...any) (sql.Result, error) {
+	statement, err := preparedStatement(ctx, tx, prepared, query)
+	if err != nil {
+		return nil, err
+	}
+	return statement.ExecContext(ctx, args...)
 }
 
 func sqlArg(arg any) (any, error) {
