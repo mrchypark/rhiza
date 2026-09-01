@@ -595,7 +595,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 				return executeErr
 			}
 			if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
-				return err
+				return fmt.Errorf("rollback rejected SQL command after %v: %w", executeErr, err)
 			}
 			receipt.Status = types.MutationRejected
 			receipt.ErrorCode = "execution_failed"
