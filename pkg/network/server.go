@@ -67,7 +67,7 @@ type Server struct {
 	members           []quepaxa.Member
 	hedgeDelay        time.Duration
 	applyMu           sync.Mutex
-	requestLocks      [256]sync.Mutex
+	requestLocks      [4096]sync.Mutex
 	durability        func(context.Context, quepaxa.Slot) error
 	routeMu           sync.Mutex
 	routeBase         quepaxa.NodeID
@@ -145,7 +145,7 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 
 func (s *Server) lockRequest(id string) func() {
 	hash := sha256.Sum256([]byte(id))
-	lock := &s.requestLocks[hash[0]]
+	lock := &s.requestLocks[uint16(hash[0])<<4|uint16(hash[1])>>4]
 	lock.Lock()
 	return lock.Unlock
 }
