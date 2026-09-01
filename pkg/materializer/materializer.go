@@ -44,26 +44,27 @@ const (
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
 type Materializer struct {
-	db                *sql.DB
-	writer            *sql.DB
-	readers           []*sql.DB
-	mu                sync.RWMutex
-	tip               uint64
-	stateTip          uint64
-	tipHash           [32]byte
-	dbPath            string
-	readersN          int
-	idempotencyWindow uint64
-	recentSQLReceipts map[string]storedReceipt
-	graph             *graphState
-	notifyMu          sync.Mutex
-	nextSub           uint64
-	subs              map[uint64]notificationSubscription
-	notifyQueue       chan pendingNotification
-	notifyStop        chan struct{}
-	notifyStopOnce    sync.Once
-	notifyWG          sync.WaitGroup
-	notifyDrops       atomic.Uint64
+	db                 *sql.DB
+	writer             *sql.DB
+	readers            []*sql.DB
+	mu                 sync.RWMutex
+	tip                uint64
+	stateTip           uint64
+	tipHash            [32]byte
+	dbPath             string
+	readersN           int
+	idempotencyWindow  uint64
+	recentSQLReceipts  map[string]storedReceipt
+	pendingSQLReceipts []pendingSQLReceipt
+	graph              *graphState
+	notifyMu           sync.Mutex
+	nextSub            uint64
+	subs               map[uint64]notificationSubscription
+	notifyQueue        chan pendingNotification
+	notifyStop         chan struct{}
+	notifyStopOnce     sync.Once
+	notifyWG           sync.WaitGroup
+	notifyDrops        atomic.Uint64
 }
 
 type notificationSubscription struct {
@@ -447,7 +448,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	defer tx.Rollback()
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
 	pending := make([]pendingNotification, 0)
-	pendingReceipts := make([]pendingSQLReceipt, 0)
+	m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
 	for _, decision := range decisions {
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
@@ -463,7 +464,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending, &pendingReceipts); err != nil {
+		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -473,6 +474,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return fmt.Errorf("commit apply batch: %w", err)
 	}
+	pendingReceipts := m.pendingSQLReceipts
 	if len(pendingReceipts) > recentSQLReceiptLimit {
 		pendingReceipts = pendingReceipts[len(pendingReceipts)-recentSQLReceiptLimit:]
 	}
@@ -508,7 +510,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification, pendingReceipts *[]pendingSQLReceipt) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -634,7 +636,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 				}
 			} else {
 				receipt.RetryThroughSlot = slot + m.idempotencyWindow - 1
-				*pendingReceipts = append(*pendingReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
+				m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
 			}
 		}
 		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
