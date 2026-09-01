@@ -13,7 +13,7 @@ const (
 	maxMutationBatch       = 64
 	targetBatchBytes       = 64 << 10
 	minAdaptiveLinger      = 25 * time.Microsecond
-	maxAdaptiveLinger      = 5 * time.Millisecond
+	maxAdaptiveLinger      = 250 * time.Microsecond
 	maxOldestQueueAge      = 5 * time.Millisecond
 	idleRateReset          = 10 * time.Millisecond
 	maxQueuedRequests      = 4096
