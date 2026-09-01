@@ -74,12 +74,20 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 	if len(cores) < quorum {
 		return quepaxa.ErrQuorumUnavailable
 	}
+	results := make(chan error, len(cores))
 	for _, core := range cores {
-		if err := core.AcceptDecision(decision); err != nil {
-			return err
+		go func() { results <- core.AcceptDecision(decision) }()
+	}
+	successes := 0
+	for range cores {
+		if err := <-results; err == nil {
+			successes++
+			if successes >= quorum {
+				return nil
+			}
 		}
 	}
-	return nil
+	return quepaxa.ErrQuorumUnavailable
 }
 
 func (t *requestIDRaceTransport) ReadTip(_ context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
