@@ -32,6 +32,7 @@ type result struct {
 	ErrorP95MS       float64           `json:"error_p95_ms,omitempty"`
 	ErrorP99MS       float64           `json:"error_p99_ms,omitempty"`
 	ErrorKinds       map[string]uint64 `json:"error_kinds,omitempty"`
+	ErrorSamples     map[string]string `json:"error_samples,omitempty"`
 }
 
 func main() {
@@ -57,6 +58,8 @@ func main() {
 	var failures atomic.Uint64
 	var transportFailures atomic.Uint64
 	var statuses [600]atomic.Uint64
+	errorSamples := make(map[int]string)
+	var errorSamplesMu sync.Mutex
 	var workers sync.WaitGroup
 	ctx := context.Background()
 	started := time.Now()
@@ -91,7 +94,20 @@ func main() {
 					latencyMu.Unlock()
 					continue
 				}
-				_, copyErr := io.Copy(io.Discard, response.Body)
+				var copyErr error
+				if response.StatusCode >= 200 && response.StatusCode < 300 {
+					_, copyErr = io.Copy(io.Discard, response.Body)
+				} else {
+					var sample []byte
+					sample, copyErr = io.ReadAll(io.LimitReader(response.Body, 4096))
+					if text := strings.TrimSpace(string(sample)); text != "" {
+						errorSamplesMu.Lock()
+						if _, exists := errorSamples[response.StatusCode]; !exists {
+							errorSamples[response.StatusCode] = text
+						}
+						errorSamplesMu.Unlock()
+					}
+				}
 				response.Body.Close()
 				if copyErr != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
 					failures.Add(1)
@@ -136,11 +152,15 @@ func main() {
 			errorKinds["http_"+strconv.Itoa(status)] = count
 		}
 	}
+	samples := make(map[string]string, len(errorSamples))
+	for status, sample := range errorSamples {
+		samples["http_"+strconv.Itoa(status)] = sample
+	}
 	output := result{
 		Requests: *requests, Successes: len(latencies), Errors: failures.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
 		OpsPerSec: float64(*requests) / duration.Seconds(), SuccessOpsPerSec: float64(len(latencies)) / duration.Seconds(), P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
 		P99MS: quantile(latencies, .99), MaxMS: quantile(latencies, 1), ErrorP50MS: quantile(errorLatencies, .50),
-		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds,
+		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds, ErrorSamples: samples,
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fmt.Fprintln(os.Stderr, err)

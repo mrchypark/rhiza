@@ -150,6 +150,36 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 	}
 }
 
+func TestSQLRequestStatus(t *testing.T) {
+	m, err := Open(t.TempDir()+"/status.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "row", SQL: "CREATE TABLE status_row (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.SQLRequestStatus(context.Background(), command)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := command
+	conflict.SQL = "CREATE TABLE other_row (id INTEGER)"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
+		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
+	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
 func TestMaterializerConflictingRequestIDIsNoOp(t *testing.T) {
 	t.Run("KV", func(t *testing.T) {
 		m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
@@ -703,7 +733,7 @@ func BenchmarkCheckpointFilesAt(b *testing.B) {
 }
 
 func BenchmarkSQLBatchApply(b *testing.B) {
-	for _, size := range []int{1, 8, 32, 128} {
+	for _, size := range []int{1, 8, 32, 64, 128} {
 		b.Run(strconv.Itoa(size), func(b *testing.B) {
 			m, err := Open(b.TempDir()+"/batch.db", 1)
 			if err != nil {

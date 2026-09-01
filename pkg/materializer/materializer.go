@@ -394,6 +394,15 @@ func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, req
 	return err
 }
 
+func insertReceiptIfAbsent(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) (bool, error) {
+	result, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
 func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64) error {
 	if tip <= m.idempotencyWindow {
 		return nil
@@ -576,15 +585,6 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 		if err != nil {
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
 		}
-		if command.RequestID != "" {
-			_, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID)
-			if err != nil {
-				return fmt.Errorf("check SQL request %q: %w", command.RequestID, err)
-			}
-			if found {
-				continue
-			}
-		}
 		if _, err := tx.ExecContext(ctx, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
@@ -605,13 +605,19 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 				receipt.LastInsertID = statement.LastInsertID
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
-			return err
-		}
 		if command.RequestID != "" {
-			if err := insertReceipt(ctx, tx, types.MutationSQL, command.RequestID, fingerprint, receipt); err != nil {
+			inserted, err := insertReceiptIfAbsent(ctx, tx, types.MutationSQL, command.RequestID, fingerprint, receipt)
+			if err != nil {
 				return fmt.Errorf("record SQL request %q: %w", command.RequestID, err)
 			}
+			if !inserted {
+				if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
+			return err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, strconv.FormatUint(slot, 10)); err != nil {
@@ -1068,6 +1074,29 @@ func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLC
 	}
 	matches, _, err := m.requestMatches(ctx, types.MutationSQL, command.RequestID, fingerprint)
 	return matches, err
+}
+
+// SQLRequestStatus returns the retained receipt and fingerprint match with one read.
+func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCommand) (types.MutationReceipt, bool, bool, error) {
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	reader, err := m.reader()
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	record, err := scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, command.RequestID), m.idempotencyWindow)
+	if err == sql.ErrNoRows {
+		return types.MutationReceipt{}, false, true, nil
+	}
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	if m.Tip() > record.receipt.RetryThroughSlot {
+		return types.MutationReceipt{}, false, true, nil
+	}
+	return record.receipt, true, record.fingerprint == fingerprint, nil
 }
 
 // Query executes a read query.

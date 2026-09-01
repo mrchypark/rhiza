@@ -683,26 +683,23 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 		return ExecuteResponse{}, err
 	}
 	defer s.lockRequest(req.RequestID)()
-	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil {
+	receipt, found, matches, err := s.material.SQLRequestStatus(ctx, command)
+	if err != nil {
 		return ExecuteResponse{}, err
-	} else if !matches {
+	}
+	if !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
-	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationSQL, req.RequestID); err != nil {
-		return ExecuteResponse{}, err
-	} else if found {
+	if found {
 		return ExecuteResponse{MutationReceipt: receipt}, nil
 	}
 	_, err = s.sqlBatcher.submit(ctx, command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil || !matches {
+	receipt, found, matches, err = s.material.SQLRequestStatus(ctx, command)
+	if err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
-	}
-	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationSQL, req.RequestID)
-	if err != nil {
-		return ExecuteResponse{}, err
 	}
 	if !found {
 		return ExecuteResponse{}, fmt.Errorf("SQL mutation receipt is unavailable")
