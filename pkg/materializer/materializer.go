@@ -496,9 +496,21 @@ func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string
 		rows, err := result.RowsAffected()
 		return rows == 1, err
 	}
+	const receiptArgs = 9
+	if len(receipts) > MaxSQLArgs/receiptArgs {
+		for len(receipts) != 0 {
+			n := min(len(receipts), MaxSQLArgs/receiptArgs)
+			inserted, err := insertReceiptsIfAbsent(ctx, tx, prepared, kind, receipts[:n])
+			if err != nil || !inserted {
+				return inserted, err
+			}
+			receipts = receipts[n:]
+		}
+		return true, nil
+	}
 	var query strings.Builder
 	query.WriteString(`INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES `)
-	args := make([]any, 0, len(receipts)*9)
+	args := make([]any, 0, len(receipts)*receiptArgs)
 	for i, pending := range receipts {
 		if i != 0 {
 			query.WriteByte(',')

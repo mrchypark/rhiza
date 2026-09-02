@@ -196,6 +196,24 @@ func TestSQLReceiptBatchHandlesFailuresAndCrossDecisionDuplicates(t *testing.T) 
 			t.Fatalf("request %q receipt=%+v found=%v err=%v", requestID, receipt, found, err)
 		}
 	}
+	commands := make([]types.SQLCommand, 128)
+	for i := range commands {
+		commands[i] = types.SQLCommand{
+			RequestID: "bulk-" + strconv.Itoa(i),
+			SQL:       "INSERT INTO receipt_batch VALUES (?)",
+			Args:      []any{int64(i + 4)},
+		}
+	}
+	bulk, err := types.EncodeSQLBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 5, bulk); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 131 {
+		t.Fatalf("bulk count=%d err=%v", count, err)
+	}
 }
 
 func TestSQLRequestStatus(t *testing.T) {

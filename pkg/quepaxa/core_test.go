@@ -324,7 +324,9 @@ func TestCompleteDecisionAndCompactionLockBoundary(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = wal.Close() })
 		transport := &mockTransport{}
-		core := newCore("node-1", &Cluster{ConfigID: 11, Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+		// Both recorders are required for quorum, so no recorder goroutine can
+		// outlive setup while the test swaps the group-commit hook.
+		core := newCore("node-1", &Cluster{ConfigID: 11, Members: []Member{{ID: "node-1"}, {ID: "node-2"}}}, wal, transport)
 		for _, value := range [][]byte{[]byte("floor"), []byte("retained")} {
 			if _, _, err := core.Propose(context.Background(), value); err != nil {
 				t.Fatal(err)
