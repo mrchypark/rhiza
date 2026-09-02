@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -31,6 +32,82 @@ func TestWALCapacityFailsClosedAndScanStreams(t *testing.T) {
 	}
 	if len(slots) != 1 || slots[0] != 1 {
 		t.Fatalf("slots=%v", slots)
+	}
+}
+
+func TestWALAppendBatchWritesEntriesInOrder(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	entries := []Entry{
+		{Slot: 1, Type: EntryProposal, Payload: []byte("proposal")},
+		{Slot: 1, Type: EntryReceipt, Payload: []byte("receipt")},
+	}
+	if err := wal.AppendBatch(entries...); err != nil {
+		t.Fatal(err)
+	}
+	if !wal.dirty {
+		t.Fatal("batch append did not mark WAL dirty")
+	}
+	got, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, entries) {
+		t.Fatalf("entries=%#v, want %#v", got, entries)
+	}
+}
+
+func TestWALAppendBatchCapacityFailsWithoutPartialWrite(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	entries := []Entry{
+		{Slot: 1, Type: EntryProposal, Payload: []byte("proposal")},
+		{Slot: 1, Type: EntryReceipt, Payload: []byte("receipt")},
+	}
+	if err := wal.SetMaxBytes(int64(len(entries[0].Encode()) + len(entries[1].Encode()) - 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.AppendBatch(entries...); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("batch append error=%v, want capacity", err)
+	}
+	got, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || wal.Bytes() != 0 || wal.dirty {
+		t.Fatalf("capacity failure wrote entries=%#v bytes=%d dirty=%v", got, wal.Bytes(), wal.dirty)
+	}
+}
+
+func TestWALAppendBatchRolloverFallbackPreservesOrder(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	entries := []Entry{
+		{Slot: 1, Type: EntryProposal, Payload: []byte("proposal")},
+		{Slot: 2, Type: EntryReceipt, Payload: []byte("receipt")},
+	}
+	wal.maxSize = int64(len(entries[0].Encode()))
+	if err := wal.AppendBatch(entries...); err != nil {
+		t.Fatal(err)
+	}
+	if len(wal.segments) != 2 || wal.current.index != 2 {
+		t.Fatalf("segments=%d current=%d, want second segment", len(wal.segments), wal.current.index)
+	}
+	got, err := wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, entries) {
+		t.Fatalf("entries=%#v, want %#v", got, entries)
 	}
 }
 

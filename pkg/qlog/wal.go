@@ -418,25 +418,78 @@ func (w *WAL) Append(entry Entry) error {
 	if w.fatal != nil {
 		return w.fatal
 	}
-
 	data := entry.Encode()
 	if w.maxBytes > 0 && int64(len(data)) > w.maxBytes-w.bytesLocked() {
 		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), len(data), w.maxBytes)
 	}
+	return w.appendLocked(data)
+}
 
-	// Roll over if needed
-	if w.current != nil && w.current.offset+int64(len(data)) > w.maxSize {
-		if err := w.createSegment(w.current.index + 1); err != nil {
-			return err
+// AppendBatch appends entries in order. Entries that fit in one segment use
+// one write; larger batches retain Append's sequential rollover behavior.
+func (w *WAL) AppendBatch(entries ...Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fatal != nil {
+		return w.fatal
+	}
+
+	encoded := make([][]byte, len(entries))
+	total := int64(0)
+	for i, entry := range entries {
+		data := entry.Encode()
+		encoded[i] = data
+		total += int64(len(data))
+	}
+	if w.maxBytes > 0 && total > w.maxBytes-w.bytesLocked() {
+		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), total, w.maxBytes)
+	}
+
+	// A batch larger than a segment must retain single-entry rollover behavior.
+	if total > w.maxSize {
+		for _, data := range encoded {
+			if err := w.appendLocked(data); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
 
 	if w.current == nil {
 		if err := w.createSegment(1); err != nil {
 			return err
 		}
+	} else if w.current.offset+total > w.maxSize {
+		if err := w.createSegment(w.current.index + 1); err != nil {
+			return err
+		}
 	}
 
+	data := make([]byte, 0, total)
+	for _, entry := range encoded {
+		data = append(data, entry...)
+	}
+	return w.writeLocked(data)
+}
+
+func (w *WAL) appendLocked(data []byte) error {
+	if w.current != nil && w.current.offset+int64(len(data)) > w.maxSize {
+		if err := w.createSegment(w.current.index + 1); err != nil {
+			return err
+		}
+	}
+	if w.current == nil {
+		if err := w.createSegment(1); err != nil {
+			return err
+		}
+	}
+	return w.writeLocked(data)
+}
+
+func (w *WAL) writeLocked(data []byte) error {
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
 

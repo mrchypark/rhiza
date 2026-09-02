@@ -747,12 +747,15 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 	if err := c.rejectCompacted(request.Slot); err != nil {
 		return Summary{}, err
 	}
-	if len(request.Proposal.Value) != 0 && len(request.Proposal.Value) <= MaxReplicatedValueBytes {
-		if err := c.StageValue(request.Proposal.Hash, request.Proposal.Value); err != nil {
+	inlineValue := request.Proposal.Value
+	if len(inlineValue) != 0 {
+		if len(inlineValue) > MaxReplicatedValueBytes || sha256.Sum256(inlineValue) != request.Proposal.Hash {
+			return Summary{}, fmt.Errorf("invalid QuePaxa value")
+		}
+		if err := c.validateCheckpointValueBytes(ctx, inlineValue); err != nil {
 			return Summary{}, err
 		}
-	}
-	if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
+	} else if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
 		return Summary{}, err
 	}
 	lock := &c.recordLocks[uint64(request.Slot)%uint64(len(c.recordLocks))]
@@ -809,12 +812,18 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 	known := sameProposal(state.FirstCurrent, &request.Proposal) ||
 		sameProposal(state.AggregateCurrent, &request.Proposal) ||
 		sameProposal(state.AggregatePrior, &request.Proposal)
-	if value, ok := c.values[request.Proposal.Hash]; !ok && !known {
+	value, valueExists := c.values[request.Proposal.Hash]
+	if !valueExists && len(inlineValue) == 0 && !known {
 		c.mu.Unlock()
 		return Summary{}, fmt.Errorf("proposal value is unavailable")
-	} else if ok && len(request.Proposal.Value) != 0 && !bytes.Equal(request.Proposal.Value, value) {
+	} else if valueExists && len(inlineValue) != 0 && !bytes.Equal(inlineValue, value) {
 		c.mu.Unlock()
 		return Summary{}, fmt.Errorf("proposal hash mismatch")
+	}
+	appendProposal := len(inlineValue) != 0 && !valueExists
+	if len(inlineValue) != 0 && c.compactionValues != nil {
+		_, retained := c.compactionValues[[32]byte(request.Proposal.Hash)]
+		appendProposal = appendProposal || !retained
 	}
 	request.Proposal.Value = nil
 	epoch := leaderEpoch(request.Slot)
@@ -823,10 +832,25 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 	}
 	next, summary := state.Record(request.Step, request.Proposal)
 	summary.RecorderID = c.nodeID
-	payload := encodeRecorderEntry(request.Slot, next)
-	if err := c.wal.Append(qlog.Entry{Slot: uint64(request.Slot), Hash: request.Proposal.Hash, Type: qlog.EntryReceipt, Payload: payload}); err != nil {
+	receipt := qlog.Entry{Slot: uint64(request.Slot), Hash: request.Proposal.Hash, Type: qlog.EntryReceipt, Payload: encodeRecorderEntry(request.Slot, next)}
+	var err error
+	if appendProposal {
+		err = c.wal.AppendBatch(
+			qlog.Entry{Hash: request.Proposal.Hash, Type: qlog.EntryProposal, Payload: inlineValue},
+			receipt,
+		)
+	} else {
+		err = c.wal.Append(receipt)
+	}
+	if err != nil {
 		c.mu.Unlock()
 		return Summary{}, err
+	}
+	if !valueExists && len(inlineValue) != 0 {
+		c.values[request.Proposal.Hash] = append([]byte(nil), inlineValue...)
+	}
+	if appendProposal && c.compactionValues != nil {
+		c.compactionValues[[32]byte(request.Proposal.Hash)] = struct{}{}
 	}
 	c.recorders[request.Slot] = next
 	c.mu.Unlock()
@@ -850,6 +874,10 @@ func (c *Core) validateCheckpointValue(ctx context.Context, hash ValueHash) erro
 	if !ok {
 		return nil
 	}
+	return c.validateCheckpointValueBytes(ctx, value)
+}
+
+func (c *Core) validateCheckpointValueBytes(ctx context.Context, value []byte) error {
 	seal, checkpoint, err := DecodeCheckpointSeal(value)
 	if err != nil || !checkpoint {
 		return err
