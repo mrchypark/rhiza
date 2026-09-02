@@ -485,13 +485,35 @@ func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, req
 	return err
 }
 
-func insertReceiptIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) (bool, error) {
-	result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, kind types.MutationKind, receipts []pendingSQLReceipt) (bool, error) {
+	if len(receipts) == 1 {
+		pending := receipts[0]
+		receipt := pending.record.receipt
+		result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+		if err != nil {
+			return false, err
+		}
+		rows, err := result.RowsAffected()
+		return rows == 1, err
+	}
+	var query strings.Builder
+	query.WriteString(`INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES `)
+	args := make([]any, 0, len(receipts)*9)
+	for i, pending := range receipts {
+		if i != 0 {
+			query.WriteByte(',')
+		}
+		query.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		receipt := pending.record.receipt
+		args = append(args, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+	}
+	query.WriteString(` ON CONFLICT(kind, request_id) DO NOTHING`)
+	result, err := execPrepared(ctx, tx, prepared, query.String(), args...)
 	if err != nil {
 		return false, err
 	}
 	rows, err := result.RowsAffected()
-	return rows == 1, err
+	return rows == int64(len(receipts)), err
 }
 
 func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64) error {
@@ -693,6 +715,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 	} else if !batched {
 		commands = []types.SQLCommand{{SQL: string(value)}}
 	}
+	pendingStart := len(m.pendingSQLReceipts)
 	for _, command := range commands {
 		if err := ValidateSQLCommand(command); err != nil {
 			return fmt.Errorf("validate SQL request %q: %w", command.RequestID, err)
@@ -700,6 +723,34 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 		fingerprint, err := types.SQLFingerprint(command)
 		if err != nil {
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
+		}
+		if command.RequestID != "" {
+			duplicate := false
+			for _, pending := range m.pendingSQLReceipts[pendingStart:] {
+				if pending.requestID == command.RequestID {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			mightExist := m.sqlReceipts.mightContain(command.RequestID, m.tip)
+			if !mightExist {
+				for _, pending := range m.pendingSQLReceipts[:pendingStart] {
+					if pending.requestID == command.RequestID {
+						mightExist = true
+						break
+					}
+				}
+			}
+			if mightExist {
+				if _, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID); err != nil {
+					return err
+				} else if found {
+					continue
+				}
+			}
 		}
 		if _, err := execPrepared(ctx, tx, statements, "SAVEPOINT rhiza_command"); err != nil {
 			return err
@@ -722,21 +773,21 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 			}
 		}
 		if command.RequestID != "" {
-			inserted, err := insertReceiptIfAbsent(ctx, tx, statements, types.MutationSQL, command.RequestID, fingerprint, receipt)
-			if err != nil {
-				return fmt.Errorf("record SQL request %q: %w", command.RequestID, err)
-			}
-			if !inserted {
-				if _, err := execPrepared(ctx, tx, statements, "ROLLBACK TO rhiza_command"); err != nil {
-					return err
-				}
-			} else {
-				receipt.RetryThroughSlot = slot + m.idempotencyWindow - 1
-				m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
-			}
+			receipt.RetryThroughSlot = slot + m.idempotencyWindow - 1
+			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
 		}
 		if _, err := execPrepared(ctx, tx, statements, "RELEASE rhiza_command"); err != nil {
 			return err
+		}
+	}
+	pendingReceipts := m.pendingSQLReceipts[pendingStart:]
+	if len(pendingReceipts) != 0 {
+		inserted, err := insertReceiptsIfAbsent(ctx, tx, statements, types.MutationSQL, pendingReceipts)
+		if err != nil {
+			return fmt.Errorf("record SQL receipts: %w", err)
+		}
+		if !inserted {
+			return fmt.Errorf("SQL request appeared during apply")
 		}
 	}
 	slotValue := strconv.FormatUint(slot, 10)

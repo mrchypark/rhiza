@@ -150,6 +150,54 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 	}
 }
 
+func TestSQLReceiptBatchHandlesFailuresAndCrossDecisionDuplicates(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/receipt-batch.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	first, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "same", SQL: "INSERT INTO receipt_batch VALUES (1)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "same", SQL: "INSERT INTO receipt_batch VALUES (2)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyBatch(ctx, []quepaxa.DecidedValue{
+		{Slot: 1, Value: []byte("CREATE TABLE receipt_batch (id INTEGER PRIMARY KEY)")},
+		{Slot: 2, Value: first},
+		{Slot: 3, Value: duplicate},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := types.EncodeSQLBatch([]types.SQLCommand{
+		{RequestID: "two", SQL: "INSERT INTO receipt_batch VALUES (2)"},
+		{RequestID: "rejected", SQL: "INSERT INTO receipt_batch VALUES (2)"},
+		{RequestID: "three", SQL: "INSERT INTO receipt_batch VALUES (3)"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 4, mixed); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 3 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	for requestID, status := range map[string]types.MutationStatus{
+		"same": types.MutationCommitted, "two": types.MutationCommitted,
+		"rejected": types.MutationRejected, "three": types.MutationCommitted,
+	} {
+		receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, requestID)
+		if err != nil || !found || receipt.Status != status {
+			t.Fatalf("request %q receipt=%+v found=%v err=%v", requestID, receipt, found, err)
+		}
+	}
+}
+
 func TestSQLRequestStatus(t *testing.T) {
 	m, err := Open(t.TempDir()+"/status.db", 1)
 	if err != nil {
