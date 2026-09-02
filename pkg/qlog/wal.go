@@ -437,21 +437,18 @@ func (w *WAL) AppendBatch(entries ...Entry) error {
 		return w.fatal
 	}
 
-	encoded := make([][]byte, len(entries))
-	total := int64(0)
-	for i, entry := range entries {
-		data := entry.Encode()
-		encoded[i] = data
-		total += int64(len(data))
+	total := 0
+	for _, entry := range entries {
+		total += entry.encodedLen()
 	}
-	if w.maxBytes > 0 && total > w.maxBytes-w.bytesLocked() {
+	if w.maxBytes > 0 && int64(total) > w.maxBytes-w.bytesLocked() {
 		return fmt.Errorf("%w: used=%d append=%d max=%d", ErrCapacity, w.bytesLocked(), total, w.maxBytes)
 	}
 
 	// A batch larger than a segment must retain single-entry rollover behavior.
-	if total > w.maxSize {
-		for _, data := range encoded {
-			if err := w.appendLocked(data); err != nil {
+	if int64(total) > w.maxSize {
+		for _, entry := range entries {
+			if err := w.appendLocked(entry.Encode()); err != nil {
 				return err
 			}
 		}
@@ -462,15 +459,15 @@ func (w *WAL) AppendBatch(entries ...Entry) error {
 		if err := w.createSegment(1); err != nil {
 			return err
 		}
-	} else if w.current.offset+total > w.maxSize {
+	} else if w.current.offset+int64(total) > w.maxSize {
 		if err := w.createSegment(w.current.index + 1); err != nil {
 			return err
 		}
 	}
 
 	data := make([]byte, 0, total)
-	for _, entry := range encoded {
-		data = append(data, entry...)
+	for _, entry := range entries {
+		data = entry.appendEncoded(data)
 	}
 	return w.writeLocked(data)
 }

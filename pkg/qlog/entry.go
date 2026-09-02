@@ -39,29 +39,25 @@ type Entry struct {
 
 // Encode serializes an entry to bytes with CRC32 checksum.
 func (e Entry) Encode() []byte {
+	return e.appendEncoded(make([]byte, 0, e.encodedLen()))
+}
+
+func (e Entry) encodedLen() int {
+	return 49 + len(e.Payload)
+}
+
+func (e Entry) appendEncoded(buf []byte) []byte {
+	start := len(buf)
 	payloadLen := len(e.Payload)
 	// Layout: Slot(8) + Hash(32) + Type(1) + PayloadLen(4) + CRC(4) + Payload
-	buf := make([]byte, 0, 8+32+1+4+4+payloadLen)
-
-	// Slot
 	buf = binary.LittleEndian.AppendUint64(buf, e.Slot)
-
-	// Hash
 	buf = append(buf, e.Hash[:]...)
-
-	// Type
 	buf = append(buf, byte(e.Type))
-
-	// Payload length
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(payloadLen)|entryLengthMarker)
-
-	// The marker rejects bytes written by any other WAL layout.
 	buf = binary.LittleEndian.AppendUint32(buf, 0)
-
-	// Payload
 	buf = append(buf, e.Payload...)
-	crc := crc32.Update(crc32.Checksum(buf[:45], entryCRCTable), entryCRCTable, buf[49:])
-	binary.LittleEndian.PutUint32(buf[45:49], crc)
+	crc := crc32.Update(crc32.Checksum(buf[start:start+45], entryCRCTable), entryCRCTable, buf[start+49:])
+	binary.LittleEndian.PutUint32(buf[start+45:start+49], crc)
 
 	return buf
 }
