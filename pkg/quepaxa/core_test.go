@@ -1455,6 +1455,17 @@ func TestDecisionsFromStopsAtGap(t *testing.T) {
 	if tip != 0 || len(decisions) != 0 {
 		t.Fatalf("exposed non-contiguous decision: tip=%d decisions=%+v", tip, decisions)
 	}
+	if cap(decisions) != 0 {
+		t.Fatalf("empty decision page capacity=%d, want 0", cap(decisions))
+	}
+}
+
+func TestDecisionsFromBoundsPageCapacity(t *testing.T) {
+	core := &Core{decided: map[Slot]DecidedValue{1: {Slot: 1}}, tip: 1}
+	decisions, tip, err := core.DecisionsFrom(1, 256)
+	if err != nil || tip != 1 || len(decisions) != 1 || cap(decisions) != 1 {
+		t.Fatalf("tip=%d len=%d cap=%d err=%v", tip, len(decisions), cap(decisions), err)
+	}
 }
 
 func TestCompleteDecisionWaitsForContiguousPrefix(t *testing.T) {

@@ -1463,7 +1463,14 @@ func (c *Core) DecisionsFrom(from Slot, limit int) ([]DecidedValue, Slot, error)
 	if from <= c.floor {
 		return nil, c.tip, fmt.Errorf("%w: requested slot %d is at or below floor %d", ErrCompacted, from, c.floor)
 	}
-	page := make([]DecidedValue, 0, limit)
+	capacity := 0
+	if from <= c.tip {
+		capacity = limit
+		if remaining := c.tip - from + 1; remaining < Slot(capacity) {
+			capacity = int(remaining)
+		}
+	}
+	page := make([]DecidedValue, 0, capacity)
 	for slot := from; slot <= c.tip && len(page) < limit; slot++ {
 		decision, ok := c.decided[slot]
 		if !ok {
