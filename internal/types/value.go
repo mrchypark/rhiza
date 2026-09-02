@@ -270,6 +270,10 @@ func AssembleSQLBatch(items [][]byte) []byte {
 	return assembleBatch(sqlBatchMagic, items)
 }
 
+func SQLBatchEncodedSize(items [][]byte) int {
+	return BatchEncodedSize(len(sqlBatchMagic), items)
+}
+
 func EncodeSQLBatch(commands []SQLCommand) ([]byte, error) {
 	items := make([][]byte, len(commands))
 	for i := range commands {

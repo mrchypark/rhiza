@@ -631,26 +631,26 @@ type ExecuteResponse struct {
 // ValidateExecuteRequest applies the same mutation contract and encoded-size
 // check as Execute without submitting the command.
 func ValidateExecuteRequest(req ExecuteRequest) error {
-	_, err := validatedSQLCommand(req)
+	_, _, err := validatedSQLCommand(req)
 	return err
 }
 
-func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, error) {
+func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, []byte, error) {
 	if req.RequestID == "" {
-		return types.SQLCommand{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
 	}
 	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
 	if err := materializer.ValidateSQLCommand(command); err != nil {
-		return types.SQLCommand{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	encoded, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	encoded, err := types.EncodeSQLBatchItem(command)
 	if err != nil {
-		return types.SQLCommand{}, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
 	}
-	if len(encoded) > quepaxa.MaxReplicatedValueBytes {
-		return types.SQLCommand{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
+	if types.SQLBatchEncodedSize([][]byte{encoded}) > quepaxa.MaxReplicatedValueBytes {
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	return command, nil
+	return command, encoded, nil
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -678,12 +678,16 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if !s.writable || !s.ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
-	command, err := validatedSQLCommand(req)
+	command, encoded, err := validatedSQLCommand(req)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	fingerprint, err := types.SQLFingerprint(command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
 	defer s.lockRequest(req.RequestID)()
-	receipt, found, matches, err := s.material.SQLRequestStatus(ctx, command)
+	receipt, found, matches, err := s.material.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
@@ -693,11 +697,11 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if found {
 		return ExecuteResponse{MutationReceipt: receipt}, nil
 	}
-	_, err = s.sqlBatcher.submit(ctx, command)
+	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	receipt, found, matches, err = s.material.SQLRequestStatus(ctx, command)
+	receipt, found, matches, err = s.material.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
 	if err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}

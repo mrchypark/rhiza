@@ -100,6 +100,10 @@ func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slo
 	if err != nil {
 		return 0, err
 	}
+	return b.submitEncoded(ctx, command, encoded)
+}
+
+func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encoded []byte) (quepaxa.Slot, error) {
 	if b.baseSize+len(encoded) > quepaxa.MaxReplicatedValueBytes {
 		return 0, ErrInvalidRequest
 	}

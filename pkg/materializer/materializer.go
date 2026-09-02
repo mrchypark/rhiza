@@ -1274,10 +1274,15 @@ func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCo
 	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
+	return m.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
+}
+
+// SQLRequestStatusFingerprint returns the retained receipt for a precomputed fingerprint.
+func (m *Materializer) SQLRequestStatusFingerprint(ctx context.Context, requestID string, fingerprint [32]byte) (types.MutationReceipt, bool, bool, error) {
 	m.mu.RLock()
-	record, cached := m.recentSQLReceipts[command.RequestID]
+	record, cached := m.recentSQLReceipts[requestID]
 	tip := m.tip
-	mightContain := m.sqlReceipts.mightContain(command.RequestID, tip)
+	mightContain := m.sqlReceipts.mightContain(requestID, tip)
 	m.mu.RUnlock()
 	if cached {
 		if tip > record.receipt.RetryThroughSlot {
@@ -1292,7 +1297,7 @@ func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCo
 	if err != nil {
 		return types.MutationReceipt{}, false, false, err
 	}
-	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, command.RequestID), m.idempotencyWindow)
+	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
 		return types.MutationReceipt{}, false, true, nil
 	}
