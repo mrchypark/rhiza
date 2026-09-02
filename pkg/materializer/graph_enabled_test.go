@@ -107,17 +107,18 @@ func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
 	}
 }
 
-func TestGraphJournalRetainsWholeBatchAndPrunesCommittedPrefix(t *testing.T) {
+func TestGraphJournalTracksOnlyGraphSlotsAndPrunesCommittedPrefix(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	decisions := []quepaxa.DecidedValue{
-		{Slot: 1, Value: []byte("CREATE TABLE batch_1 (id INTEGER)")},
-		{Slot: 2, Value: []byte("CREATE TABLE batch_2 (id INTEGER)")},
+	graphValue, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "batch-graph", Cypher: `CREATE (:Batch {id: '2'})`})
+	if err != nil {
+		t.Fatal(err)
 	}
+	decisions := []quepaxa.DecidedValue{{Slot: 1, Value: []byte("CREATE TABLE batch_1 (id INTEGER)")}, {Slot: 2, Value: graphValue}}
 	if err := m.ApplyBatch(ctx, decisions); err != nil {
 		t.Fatal(err)
 	}
@@ -126,10 +127,17 @@ func TestGraphJournalRetainsWholeBatchAndPrunesCommittedPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries, err := decodeGraphJournal(journal)
-	if err != nil || len(entries) != 2 || entries[0].Slot != 1 || entries[1].Slot != 2 {
-		t.Fatalf("whole batch journal=%+v err=%v", entries, err)
+	if err != nil || len(entries) != 1 || entries[0].Slot != 2 {
+		t.Fatalf("sparse batch journal=%+v err=%v", entries, err)
 	}
 	if err := m.Apply(ctx, 3, []byte("CREATE TABLE next (id INTEGER)")); err != nil {
+		t.Fatal(err)
+	}
+	graphValue, err = types.EncodeGraphCommand(types.GraphCommand{RequestID: "next-graph", Cypher: `CREATE (:Batch {id: '4'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 4, graphValue); err != nil {
 		t.Fatal(err)
 	}
 	journal, err = m.graph.getMetadata(graphJournalKey)
@@ -137,8 +145,63 @@ func TestGraphJournalRetainsWholeBatchAndPrunesCommittedPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries, err = decodeGraphJournal(journal)
-	if err != nil || len(entries) != 1 || entries[0].Slot != 3 {
+	if err != nil || len(entries) != 1 || entries[0].Slot != 4 {
 		t.Fatalf("pruned journal=%+v err=%v", entries, err)
+	}
+}
+
+func TestGraphSparseAheadRecoveryAcceptsOnlyMatchingGraphDecisions(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, []byte("CREATE TABLE durable (id INTEGER)")); err != nil {
+		t.Fatal(err)
+	}
+	encodedTip, err := m.graph.getMetadata(graphTipKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableTip, err := decodeGraphTip(encodedTip)
+	if err != nil || durableTip != 0 {
+		t.Fatalf("durable graph tip=%d err=%v, want 0", durableTip, err)
+	}
+	if err := m.applyGraph(ctx, 2, []byte("CREATE TABLE pending (id INTEGER)"), nil, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	graphValue, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "sparse-ahead", Cypher: `CREATE (:Sparse {id: '3'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands, graph, err := types.DecodeGraphBatch(graphValue)
+	if err != nil || !graph {
+		t.Fatalf("decode graph=%v err=%v", graph, err)
+	}
+	if err := m.applyGraph(ctx, 3, graphValue, commands, true, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Apply(ctx, 2, []byte("CREATE TABLE pending (id INTEGER)")); err != nil {
+		t.Fatal(err)
+	}
+	other, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "conflict", Cypher: `CREATE (:Sparse {id: 'other'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 3, other); err == nil {
+		t.Fatal("sparse graph-ahead state accepted a different graph decision")
+	}
+	if err := m.Apply(ctx, 3, graphValue); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -587,6 +650,13 @@ func TestGraphIdempotencyReceiptExpiresAtWindowBoundary(t *testing.T) {
 	if _, found, err := m.GraphMutationReceipt(ctx, "old"); err != nil || found {
 		t.Fatalf("expired receipt found=%v err=%v", found, err)
 	}
+	reused, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "old", Cypher: `CREATE (:Item {id: 'reused'})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1026, reused); err != nil {
+		t.Fatalf("reuse expired request ID: %v", err)
+	}
 }
 
 func TestGraphQueryWaitsForSQLiteApply(t *testing.T) {
@@ -597,10 +667,6 @@ func TestGraphQueryWaitsForSQLiteApply(t *testing.T) {
 	defer m.Close()
 
 	m.mu.Lock()
-	if err := m.graph.advanceTip(context.Background(), 1, [32]byte{}, 0); err != nil {
-		m.mu.Unlock()
-		t.Fatal(err)
-	}
 	m.graph.tip = 1
 	done := make(chan error, 1)
 	go func() {
