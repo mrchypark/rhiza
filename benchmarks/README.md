@@ -49,9 +49,10 @@ their actual base commit.
 
 The workflow is advisory: benchmark failures, including errors reported by the
 Hiqlite reference, fail the job, while a measured regression is reported without
-an arbitrary threshold. Use `workflow_dispatch` to compare the selected commit
-against another base ref. The same collector can be smoke-tested locally with
-short samples:
+an arbitrary threshold. A failing baseline benchmark is retained as evidence and
+does not prevent the fixed candidate from running; candidate failures still fail
+the job. Use `workflow_dispatch` to compare the selected commit against another
+base ref. The same collector can be smoke-tested locally with short samples:
 
 ```bash
 RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=100ms \

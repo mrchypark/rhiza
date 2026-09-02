@@ -77,7 +77,11 @@ run_revision() {
 				-test.benchmem \
 				-test.cpu "$bench_procs" \
 				-test.timeout 20m
-		) 2>&1 | tee -a "$output"
+		) 2>&1 | tee -a "$output" && continue
+		if [[ $label == candidate ]]; then
+			return 1
+		fi
+		printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
 	done
 }
 
