@@ -55,7 +55,9 @@ Zero final request errors across all three runs is the availability gate. Node
 logs are always uploaded, and each result counts lines containing `error`,
 `failed`, or `timeout` so internal failure noise is visible beside client
 correctness. The known quic-go host UDP receive-buffer warning is excluded from
-that application-failure count.
+that application-failure count. A run fails when the count is nonzero, or when
+a fault-injection request exceeds the configurable 1,500 ms maximum latency
+gate (`RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS`).
 
 Hiqlite remains an external Raft reference, not a direct algorithm comparison.
 Its leader/follower cases gracefully stop one peer and wait for a replacement

@@ -15,6 +15,7 @@ failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 hedge_delay=${RHIZA_SERVER_BENCH_HEDGE_DELAY:-100ms}
+max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
 base_peer_port=${RHIZA_SERVER_BENCH_PEER_PORT:-19100}
 minio_port=${RHIZA_SERVER_BENCH_MINIO_PORT:-19000}
@@ -36,6 +37,10 @@ if [[ $failed_node == "$target_node" ]]; then
 fi
 if [[ ! $fault_after =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 	printf 'RHIZA_SERVER_BENCH_FAULT_AFTER must be seconds expressed as a non-negative number\n' >&2
+	exit 2
+fi
+if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
+	printf 'RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS must be a positive number\n' >&2
 	exit 2
 fi
 
@@ -135,6 +140,7 @@ for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
-jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" --arg hedge_delay "$hedge_delay" \
-	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),hedge_delay:$hedge_delay,concurrency:$concurrency,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" --arg hedge_delay "$hedge_delay" \
+	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),hedge_delay:$hedge_delay,max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
+jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null
