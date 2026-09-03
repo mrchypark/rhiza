@@ -155,18 +155,24 @@ jobs:
             cd "$RUNNER_TEMP/hiqlite/examples/bench"
             "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
           ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"
-          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"; then
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt"
+          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance/hiqlite.txt" || grep -q ERROR "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt"; then
             printf '\n## Pinned Hiqlite reference\n\nInvalid: runtime errors; see artifact.\n' >>"$GITHUB_STEP_SUMMARY"
             printf 'Hiqlite benchmark reported runtime errors\n' >&2
             exit 1
           fi
           hiqlite_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite.txt")
-          [[ $hiqlite_ops =~ ^[0-9]+$ ]]
+          hiqlite_immediate_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt")
+          [[ $hiqlite_ops =~ ^[0-9]+$ && $hiqlite_immediate_ops =~ ^[0-9]+$ ]]
           # shellcheck disable=SC2016
           {
             printf '\n## Pinned Hiqlite reference\n\n'
-            printf 'Official three-node local-client workload: `%s ops/s` ' "$hiqlite_ops"
-            printf '(`cluster -c 16 -r 100000`, commit `%s`).\n' "$HIQLITE_COMMIT"
+            printf 'Official `interval_200` three-node local-client workload: `%s ops/s`.\n\n' "$hiqlite_ops"
+            printf 'Power-loss-durable `immediate` workload: `%s ops/s`.\n\n' "$hiqlite_immediate_ops"
+            printf 'Both use `cluster -c 16 -r 100000`, commit `%s`.\n' "$HIQLITE_COMMIT"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record runner environment
@@ -176,6 +182,8 @@ jobs:
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
             printf 'rust=%s\n' "$(rustc +1.97.1 --version)"
             printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+            printf 'hiqlite_official_log_sync=interval_200\n'
+            printf 'hiqlite_durable_log_sync=immediate\n'
             lscpu
             free -b
           } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"
