@@ -1348,6 +1348,7 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 	if err := s.core.WaitTip(ctx, through); err != nil {
 		return err
 	}
+	through = max(through, s.core.Tip())
 	for {
 		applied := quepaxa.Slot(s.material.Tip())
 		if applied >= through {
