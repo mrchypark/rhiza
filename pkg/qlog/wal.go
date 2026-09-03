@@ -468,7 +468,7 @@ func (w *WAL) Sync() error {
 	}
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
-	if err := w.current.file.Sync(); err != nil {
+	if err := syncData(w.current.file); err != nil {
 		return err
 	}
 	w.dirty = false
