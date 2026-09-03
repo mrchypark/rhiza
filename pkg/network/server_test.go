@@ -545,13 +545,29 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 		return res
 	}
 
-	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?)","args":["bound"]}]}`)
+	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"CREATE TABLE api_copy (id INTEGER, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?)","args":["bound"]}]}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"status":"committed"`)) {
 		t.Fatalf("SQL status=%d body=%s", res.Code, res.Body.String())
 	}
 	res = request("/sql/query", `{"sql":"SELECT name FROM api WHERE id = ?","args":[1],"consistency":"local"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"bound"`)) {
 		t.Fatalf("query status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/execute-returning", `{"request_id":"sql-returning","sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["returned"]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[2,"returned"]]`)) {
+		t.Fatalf("returning status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/transaction", `{"request_id":"sql-refs","statements":[{"sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["linked"],"want_rows":true},{"sql":"INSERT INTO api_copy VALUES (?, ?)","args":[null,null],"output_refs":[{"arg_index":0,"statement_index":0,"column_name":"id"},{"arg_index":1,"statement_index":0,"column_name":"name"}]}]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[3,"linked"]]`)) {
+		t.Fatalf("output refs status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/query", `{"sql":"SELECT id, name FROM api_copy"}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[3,"linked"]]`)) {
+		t.Fatalf("output refs query status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/execute-returning-one", `{"request_id":"sql-returning-one","sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["one"]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[4,"one"]]`)) {
+		t.Fatalf("returning one status=%d body=%s", res.Code, res.Body.String())
 	}
 
 	res = request("/kv/put", `{"request_id":"kv-1","key":"key","value":"dmFsdWU="}`)

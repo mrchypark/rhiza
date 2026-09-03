@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -508,12 +509,236 @@ func TestKVBatchAppliesAllCommands(t *testing.T) {
 	}
 }
 
-func TestSQLCommandRejectsMutationRows(t *testing.T) {
-	command := types.SQLCommand{RequestID: "aggregate", Statements: []types.SQLStatement{
-		{SQL: "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<6000) SELECT n FROM seq", WantRows: true},
+func TestSQLCommandReturningOutputRefsAndRetry(t *testing.T) {
+	path := t.TempDir() + "/returning.db"
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	command := types.SQLCommand{RequestID: "returning", Statements: []types.SQLStatement{
+		{SQL: "CREATE TABLE source (id INTEGER PRIMARY KEY, payload TEXT)"},
+		{SQL: "CREATE TABLE copied (id INTEGER, payload TEXT)"},
+		{SQL: "INSERT INTO source(payload) VALUES (?) RETURNING id, payload", Args: []any{"value"}, WantRows: true},
+		{SQL: "INSERT INTO copied VALUES (?, ?)", Args: []any{nil, nil}, OutputRefs: []types.SQLStatementOutputRef{
+			{ArgIndex: 0, StatementIndex: 2, ColumnIndex: &zero},
+			{ArgIndex: 1, StatementIndex: 2, ColumnName: "payload"},
+		}},
 	}}
-	if err := ValidateSQLCommand(command); err == nil {
-		t.Fatal("mutation row result was accepted")
+	if err := ValidateSQLCommand(command); err != nil {
+		t.Fatal(err)
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, result, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), command.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	if got := result.Statements[2].Rows[0]; got[0] != int64(1) || got[1] != "value" {
+		t.Fatalf("returning row=%#v", got)
+	}
+	query, err := m.QueryResult(context.Background(), "SELECT id, payload FROM copied", nil)
+	if err != nil || query.Rows[0][0] != int64(1) || query.Rows[0][1] != "value" {
+		t.Fatalf("copied rows=%#v err=%v", query.Rows, err)
+	}
+}
+
+func TestSQLCommandRejectsInvalidOutputRefs(t *testing.T) {
+	zero := 0
+	cases := []types.SQLCommand{
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1"}, {SQL: "SELECT ?", OutputRefs: []types.SQLStatementOutputRef{{StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true, OutputRefs: []types.SQLStatementOutputRef{{StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?", OutputRefs: []types.SQLStatementOutputRef{{StatementIndex: 0, ColumnName: "x", ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?", OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}, {ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?", Args: []any{int64(1)}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?1", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT :value", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+	}
+	for i, command := range cases {
+		if err := ValidateSQLCommand(command); err == nil {
+			t.Fatalf("case %d accepted", i)
+		}
+	}
+}
+
+func TestOutputReferenceRequiresOneSourceRowAndUniqueColumn(t *testing.T) {
+	for name, source := range map[string]string{
+		"multiple rows":    "SELECT 1 AS value UNION ALL SELECT 2",
+		"duplicate column": "SELECT 1 AS value, 2 AS value",
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, err := Open(t.TempDir()+"/refs.db", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			command := types.SQLCommand{RequestID: name, Statements: []types.SQLStatement{
+				{SQL: "CREATE TABLE target (value INTEGER)"},
+				{SQL: source, WantRows: true},
+				{SQL: "INSERT INTO target VALUES (?)", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 1, ColumnName: "value"}}},
+			}}
+			value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), 1, value); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, _ := types.SQLFingerprint(command)
+			receipt, _, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), command.RequestID, fingerprint, true)
+			if err != nil || !found || !matches || receipt.Status != types.MutationRejected {
+				t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+			}
+			var exists int
+			if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='target'`).Scan(&exists); err != nil || exists != 0 {
+				t.Fatalf("transaction was not rolled back: exists=%d err=%v", exists, err)
+			}
+		})
+	}
+}
+
+func TestSQLResultEncodingPreservesSQLiteTypes(t *testing.T) {
+	want := types.SQLCommandResult{Statements: []types.SQLStatementResult{{
+		Columns: []string{"null", "integer", "real", "text", "blob"},
+		Rows:    [][]any{{nil, int64(math.MinInt64), math.Copysign(0, -1), "", []byte{}}},
+	}}}
+	encoded, err := encodeSQLResult(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeSQLResult(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := got.Statements[0].Rows[0]
+	if row[0] != nil || row[1] != int64(math.MinInt64) || !math.Signbit(row[2].(float64)) || row[3] != "" || len(row[4].([]byte)) != 0 {
+		t.Fatalf("decoded row=%#v", row)
+	}
+	if _, err := decodeSQLResult(append(encoded, 0)); err == nil {
+		t.Fatal("trailing bytes were accepted")
+	}
+}
+
+func TestRejectedTransactionDoesNotRetainReturningRows(t *testing.T) {
+	m, err := Open(t.TempDir()+"/rejected-returning.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "rejected", Statements: []types.SQLStatement{
+		{SQL: "CREATE TABLE rolled_back (id INTEGER PRIMARY KEY)"},
+		{SQL: "INSERT INTO rolled_back DEFAULT VALUES RETURNING id", WantRows: true},
+		{SQL: "INSERT INTO missing_table DEFAULT VALUES"},
+	}}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ := types.SQLFingerprint(command)
+	receipt, result, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), command.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Status != types.MutationRejected || len(result.Statements) != 0 {
+		t.Fatalf("receipt=%+v result=%+v found=%v matches=%v err=%v", receipt, result, found, matches, err)
+	}
+	var count int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'rolled_back'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rolled-back table count=%d err=%v", count, err)
+	}
+}
+
+func TestMaterializerUpgradesLegacyReceiptSchema(t *testing.T) {
+	path := t.TempDir() + "/legacy.db"
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE _rhiza_idempotency DROP COLUMN sql_result`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var columns int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_rhiza_idempotency') WHERE name = 'sql_result'`).Scan(&columns); err != nil || columns != 1 {
+		t.Fatalf("sql_result columns=%d err=%v", columns, err)
+	}
+}
+
+func TestMaterializerRejectsIncompatibleMigrationLedger(t *testing.T) {
+	path := t.TempDir() + "/invalid-migrations.db"
+	db, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE _rhiza_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL) STRICT`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := Open(path, 1); err == nil {
+		m.Close()
+		t.Fatal("incompatible migration ledger was accepted")
+	}
+}
+
+func TestMaterializerRejectsMigrationVersionGapAtApply(t *testing.T) {
+	m, err := Open(t.TempDir()+"/migration-gap.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{
+		RequestID: "migration-gap",
+		Migration: &types.SQLMigration{Version: 2, Name: "gap", Checksum: strings.Repeat("a", 64)},
+		Statements: []types.SQLStatement{{SQL: "CREATE TABLE gap_was_applied (id INTEGER)"}},
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ := types.SQLFingerprint(command)
+	receipt, found, matches, err := m.SQLRequestStatusFingerprint(context.Background(), command.RequestID, fingerprint)
+	if err != nil || !found || !matches || receipt.Status != types.MutationRejected {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	var exists int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='gap_was_applied'`).Scan(&exists); err != nil || exists != 0 {
+		t.Fatalf("gap migration changed schema: exists=%d err=%v", exists, err)
 	}
 }
 
