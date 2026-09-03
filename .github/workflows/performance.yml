@@ -22,6 +22,10 @@ on:
         description: Git ref to compare against
         required: true
         default: main
+      candidate_ref:
+        description: Candidate Git ref (defaults to this workflow ref)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -57,9 +61,17 @@ jobs:
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.clone_url }}
           PUSH_BASE_SHA: ${{ github.event.before }}
           INPUT_BASE_REF: ${{ inputs.base_ref }}
+          INPUT_CANDIDATE_REF: ${{ inputs.candidate_ref }}
         run: |
           candidate_sha=${PR_HEAD_SHA:-$(git rev-parse HEAD)}
-          if ! git cat-file -e "$candidate_sha^{commit}" 2>/dev/null; then
+          if [[ -n "$INPUT_CANDIDATE_REF" ]]; then
+            if candidate_sha=$(git rev-parse --verify "$INPUT_CANDIDATE_REF^{commit}" 2>/dev/null); then
+              :
+            else
+              git fetch --no-tags origin "$INPUT_CANDIDATE_REF"
+              candidate_sha=$(git rev-parse FETCH_HEAD)
+            fi
+          elif ! git cat-file -e "$candidate_sha^{commit}" 2>/dev/null; then
             git fetch --no-tags "$PR_HEAD_REPOSITORY" "$candidate_sha"
           fi
           if [[ -n "$PR_BASE_SHA" ]]; then
