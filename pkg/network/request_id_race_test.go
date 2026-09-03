@@ -278,7 +278,7 @@ func BenchmarkCertifiedThreePeerSQLExecute(b *testing.B) {
 				if !ok {
 					return slot, errors.New("certified decision unavailable")
 				}
-				if err := ingress.AcceptCertifiedValue(decision); err != nil {
+				if err := ingress.AcceptCertifiedValueForAck(decision); err != nil {
 					return slot, err
 				}
 				if err := proposer.WaitTip(ctx, slot); err != nil {

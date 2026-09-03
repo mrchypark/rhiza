@@ -1279,6 +1279,31 @@ func (c *Core) AcceptCertifiedValue(value DecidedValue) error {
 	return c.AcceptCertifiedValues([]DecidedValue{value})
 }
 
+// AcceptCertifiedValueForAck installs a proposer-returned decision. A voter
+// already named by its durable recorder certificate does not need a second
+// local disk barrier; every other voter persists the decision before ACK.
+func (c *Core) AcceptCertifiedValueForAck(value DecidedValue) error {
+	decision, err := c.certifiedDecision(value)
+	if err != nil {
+		return err
+	}
+	for _, summary := range decision.Summaries {
+		if summary.RecorderID == c.nodeID && len(c.config.Members) > 1 {
+			c.mu.RLock()
+			state := c.recorders[value.Slot]
+			recorded := sameProposal(state.FirstCurrent, &decision.Proposal) ||
+				sameProposal(state.AggregateCurrent, &decision.Proposal) ||
+				sameProposal(state.AggregatePrior, &decision.Proposal)
+			durable := c.valueDurable[value.Hash]
+			c.mu.RUnlock()
+			if recorded && durable {
+				return c.AcceptCertifiedHints([]DecidedValue{value})
+			}
+		}
+	}
+	return c.AcceptCertifiedValue(value)
+}
+
 // AcceptCertifiedValues validates and persists a catch-up page with one sync.
 func (c *Core) AcceptCertifiedValues(values []DecidedValue) error {
 	return c.acceptCertifiedValues(values, true)

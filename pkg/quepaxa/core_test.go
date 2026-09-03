@@ -258,6 +258,49 @@ func TestFreshClusterDecisionSkipsRedundantLocalSync(t *testing.T) {
 	}
 }
 
+func TestAcceptCertifiedValueForAckReusesRecorderDurability(t *testing.T) {
+	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	config := &Cluster{ConfigID: 1, Members: members}
+	proposal := newProposal(highestPriority, "n1", []byte("proxied value"))
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{
+		{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+		{RecorderID: "n2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+	}}
+	certificate, err := encodeCertificate(config.ConfigID, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := DecidedValue{Slot: decision.Slot, Hash: proposal.Hash, Value: proposal.Value, Certificate: certificate}
+	for _, id := range []NodeID{"n2", "n3"} {
+		wal, err := qlog.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer wal.Close()
+		core := newCore(id, config, wal, nil)
+		if id == "n2" {
+			if _, err := core.Record(context.Background(), RecordRequest{Slot: decision.Slot, Step: decision.Step, Proposal: proposal}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		syncs := 0
+		core.commits = newGroupCommit(func() error {
+			syncs++
+			return core.wal.Sync()
+		})
+		if err := core.AcceptCertifiedValueForAck(value); err != nil {
+			t.Fatal(err)
+		}
+		want := 1
+		if id == "n2" {
+			want = 0
+		}
+		if syncs != want {
+			t.Fatalf("node %s syncs=%d, want %d", id, syncs, want)
+		}
+	}
+}
+
 func TestProposeCertifiedDefersLearnerCompletion(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
