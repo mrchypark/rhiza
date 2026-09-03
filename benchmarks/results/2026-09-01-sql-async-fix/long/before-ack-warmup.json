@@ -1,0 +1,1 @@
+{"requests":500,"successes":500,"errors":0,"duration_ms":4484.664208,"ops_per_sec":111.4910675158402,"success_ops_per_sec":111.4910675158402,"p50_ms":105.198042,"p95_ms":338.245083,"p99_ms":412.538083,"max_ms":522.681292}

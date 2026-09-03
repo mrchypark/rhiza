@@ -7,7 +7,6 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -115,7 +114,7 @@ func TestLocalProposerAppliesAlreadyDecidedValue(t *testing.T) {
 	if _, _, err := core.Propose(context.Background(), value); err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	if _, err := server.proposeLocal(context.Background(), value); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +132,7 @@ func TestExecuteRetryResolvesCommitUnknownAfterLearnerFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	req := ExecuteRequest{RequestID: "schema-retry", SQL: "CREATE TABLE retried (id INTEGER)"}
 	if _, err := server.Execute(context.Background(), req); !errors.Is(err, ErrCommitUnknown) {
@@ -156,7 +155,7 @@ func TestExecuteRetryResolvesCommitUnknownAfterLearnerFailure(t *testing.T) {
 
 func TestHTTPAdapterDoesNotExposePeerRPC(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}}
-	server := NewServer(mustCore(t, "n1", members, nil, nil), nil, "cluster", true, nil, members, 0)
+	server := NewServer(mustCore(t, "n1", members, nil, nil), nil, "cluster", true, nil)
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/internal/decisions?from=1", nil))
 	if response.Code != http.StatusNotFound {
@@ -172,7 +171,7 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error {
 		return errors.New("bucket unavailable")
@@ -217,7 +216,7 @@ func TestLinearizableQueryUsesReadIndexWithoutConsumingSlots(t *testing.T) {
 	if _, _, err := core.Propose(context.Background(), []byte("CREATE TABLE barrier_read (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	body := []byte(`{"sql":"SELECT COUNT(*) FROM barrier_read","consistency":"linearizable"}`)
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/sql/query", bytes.NewReader(body)))
@@ -253,7 +252,7 @@ func TestLinearizableQueryFailsClosedWithoutQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 
 	for consistency, want := range map[string]int{"local": http.StatusOK, "linearizable": http.StatusServiceUnavailable} {
 		body := []byte(`{"sql":"SELECT 1","consistency":"` + consistency + `"}`)
@@ -294,7 +293,7 @@ func BenchmarkServerQuery(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = material.Close() })
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	b.Cleanup(server.Close)
 	for _, consistency := range []string{"local", "linearizable"} {
 		b.Run(consistency, func(b *testing.B) {
@@ -327,7 +326,7 @@ func TestReadyAllowsIntentionalCommitApplyGap(t *testing.T) {
 	if _, _, err := core.Propose(context.Background(), []byte("CREATE TABLE pending (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(core, material, "cluster", true, nil, members, 0, func() bool { return true })
+	server := NewServer(core, material, "cluster", true, nil, func() bool { return true })
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/ready", nil))
 	if res.Code != http.StatusOK {
@@ -356,7 +355,7 @@ func TestConcurrentApplyDecisionsRemainOrdered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 
 	start := make(chan struct{})
 	errs := make(chan error, 32)
@@ -390,7 +389,7 @@ func TestQuiesceTimeoutKeepsAdmissionClosedUntilDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 
 	server.proposalWG.Add(1)
@@ -405,7 +404,7 @@ func TestQuiesceTimeoutKeepsAdmissionClosedUntilDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.proposeHedged(context.Background(), value); !errors.Is(err, ErrNotReady) {
+	if _, err := server.propose(context.Background(), value); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("proposal during timed-out drain error=%v, want %v", err, ErrNotReady)
 	}
 
@@ -423,7 +422,7 @@ func TestQuiesceTimeoutKeepsAdmissionClosedUntilDrain(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, err := server.proposeHedged(context.Background(), value); err != nil {
+	if _, err := server.propose(context.Background(), value); err != nil {
 		t.Fatalf("proposal after drain error=%v", err)
 	}
 }
@@ -457,7 +456,7 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	if err := source.CompactThrough(1, seal.RootHash); err != nil {
 		t.Fatal(err)
 	}
-	sourceServer := NewServer(source, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	sourceServer := NewServer(source, nil, "cluster", true, nil)
 	defer sourceServer.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -470,7 +469,7 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	target := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	transport := NewTransport("cluster", member.ID, &quepaxa.Cluster{Members: []quepaxa.Member{member}}, "secret")
 	defer transport.Close()
-	server := NewServer(target, nil, "cluster", true, transport, []quepaxa.Member{member}, 0)
+	server := NewServer(target, nil, "cluster", true, transport)
 	defer server.Close()
 	called := make(chan struct{}, 1)
 	server.SetCompactedHandler(func() { called <- struct{}{} })
@@ -486,23 +485,43 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	}
 }
 
-func TestFallbackWinnerBecomesNextRequestFirstWithoutChangingAgreedLeader(t *testing.T) {
-	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
-	core := mustCore(t, "n1", members, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, members, 20*time.Millisecond)
-	first := server.proposerPlan()
-	server.observeProposer(first, "n2", 1)
-	second := server.proposerPlan()
-	got := []quepaxa.NodeID{second.members[0].ID, second.members[1].ID, second.members[2].ID}
-	if want := []quepaxa.NodeID{"n2", "n1", "n3"}; !slices.Equal(got, want) {
-		t.Fatalf("order=%v, want %v", got, want)
+func TestAcceptFromPersistsReturnedCertifiedDecision(t *testing.T) {
+	member := quepaxa.Member{ID: "n1"}
+	members := []quepaxa.Member{member}
+	source := mustCore(t, member.ID, members, nil, nil)
+	slot, _, err := source.Propose(context.Background(), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	server.observeProposer(first, "n3", 2)
-	if got := server.proposerPlan().members[0].ID; got != "n2" {
-		t.Fatalf("stale observation reverted first proposer to %s", got)
+	decision, ok := source.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("missing certified decision")
 	}
-	if agreed := core.ProposerOrder()[0]; agreed != "n1" {
-		t.Fatalf("routing hint changed agreed fast-path leader to %s", agreed)
+	dir := t.TempDir() + "/target-qlog"
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := mustCore(t, member.ID, members, wal, nil)
+	server := NewServer(target, nil, "cluster", true, nil)
+	if err := server.acceptFrom(context.Background(), member.ID, decision); err != nil {
+		t.Fatal(err)
+	}
+	if target.Tip() != decision.Slot {
+		t.Fatalf("tip=%d, want %d", target.Tip(), decision.Slot)
+	}
+	server.Close()
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := mustCore(t, member.ID, members, reopened, nil)
+	if got, ok := recovered.CertifiedValue(decision.Slot); !ok || !bytes.Equal(got.Value, decision.Value) {
+		t.Fatalf("recovered decision=(%v, %q), want (%v, %q)", ok, got.Value, true, decision.Value)
 	}
 }
 
@@ -519,7 +538,7 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	request := func(path, body string) *httptest.ResponseRecorder {
 		res := httptest.NewRecorder()
 		server.ServeHTTP(res, httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body)))
@@ -566,7 +585,7 @@ func TestKVRetryPreservesFirstAdmissionAndRejectsChangedIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 
 	req := KVMutationRequest{RequestID: "retry", Key: "key", Value: []byte("value"), TTLMS: 60_000}
@@ -596,7 +615,7 @@ func TestKVMutateRejectsInvalidOperationAndTTLOverflowBeforeConsensus(t *testing
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 
 	request := KVMutationRequest{RequestID: "invalid", Key: "key", Value: []byte("value")}
@@ -637,7 +656,7 @@ func TestCancelledKVRequestStillMaterializes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	barrier := make(chan struct{})
 	entered := make(chan struct{})
@@ -695,7 +714,7 @@ func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	release := make(chan struct{})
 	entered := make(chan struct{}, maxLocalProposals)
@@ -713,7 +732,7 @@ func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 		go func(i int) {
 			var nonce [types.ReadBarrierNonceSize]byte
 			nonce[0] = byte(i + 1)
-			_, err := server.proposeHedged(context.Background(), types.EncodeReadBarrier(nonce))
+			_, err := server.propose(context.Background(), types.EncodeReadBarrier(nonce))
 			errs <- err
 		}(i)
 	}
@@ -724,7 +743,7 @@ func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 			t.Fatal("background operations did not reach durability barrier")
 		}
 	}
-	if _, err := server.proposeHedged(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{255})); !errors.Is(err, ErrOverloaded) {
+	if _, err := server.propose(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{255})); !errors.Is(err, ErrOverloaded) {
 		t.Fatalf("overflow error=%v, want ErrOverloaded", err)
 	}
 	close(release)
@@ -732,68 +751,6 @@ func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
-	}
-}
-
-func TestPeerProposalUsesAdmissionAndSemanticValidation(t *testing.T) {
-	members := []quepaxa.Member{{ID: "n1"}}
-	core := mustCore(t, "n1", members, nil, nil)
-	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
-	defer server.Close()
-	invalid, err := types.EncodeKVCommand(types.KVCommand{RequestID: "bad", Operation: "unknown", Key: "key"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := server.proposePeer(context.Background(), "n2", invalid); !errors.Is(err, ErrInvalidRequest) {
-		t.Fatalf("invalid peer proposal error=%v", err)
-	}
-	unsafeGraph, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "unsafe", Cypher: `CREATE (:Person)-[:KNOWS]->(:Person)`})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := server.proposePeer(context.Background(), "n2", unsafeGraph); !errors.Is(err, ErrInvalidRequest) {
-		t.Fatalf("unsafe graph peer proposal error=%v", err)
-	}
-	valid, err := types.EncodeKVCommand(types.KVCommand{RequestID: "valid", Operation: "put", Key: "key", Value: []byte("value")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for range maxLocalProposals {
-		server.localCap <- struct{}{}
-		server.operationCap <- struct{}{}
-	}
-	if _, err := server.proposePeer(context.Background(), "n2", valid); err != nil {
-		t.Fatalf("reserved peer capacity failed: %v", err)
-	}
-	for range maxLocalProposals {
-		<-server.localCap
-		<-server.operationCap
-	}
-	server.proposeMu.Lock()
-	server.peerCounts["n2"] = 2
-	server.proposeMu.Unlock()
-	if _, err := server.proposePeer(context.Background(), "n2", valid); !errors.Is(err, ErrOverloaded) {
-		t.Fatalf("per-peer admission error=%v", err)
-	}
-	if _, err := server.proposePeer(context.Background(), "n3", valid); err != nil {
-		t.Fatalf("independent peer capacity failed: %v", err)
-	}
-	server.proposeMu.Lock()
-	delete(server.peerCounts, "n2")
-	server.proposeMu.Unlock()
-	for range maxPeerProposals {
-		server.peerCap <- struct{}{}
-	}
-	if _, err := server.proposePeer(context.Background(), "n2", valid); !errors.Is(err, ErrOverloaded) {
-		t.Fatalf("peer admission error=%v", err)
-	}
-	for range maxPeerProposals {
-		<-server.peerCap
 	}
 }
 
@@ -805,7 +762,7 @@ func TestServerCloseCancelsAndWaitsForInflightMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	entered := make(chan struct{})
 	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
 		close(entered)
@@ -841,7 +798,7 @@ func TestNotifyRetryIsIdempotentAndChangedPayloadConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	ch, cancel, err := server.NotifySubscribe("topic")
 	if err != nil {
@@ -879,7 +836,7 @@ func TestNotifyStreamStopsWhenMaterializerCloses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	t.Cleanup(server.Close)
 
 	w := &flushSignalWriter{header: make(http.Header), flushed: make(chan struct{})}
@@ -900,7 +857,7 @@ func TestNotifyStreamStopsWhenMaterializerCloses(t *testing.T) {
 }
 
 func TestReplicaStatusEndpoint(t *testing.T) {
-	server := NewServer(nil, nil, "cluster", false, nil, nil, 0)
+	server := NewServer(nil, nil, "cluster", false, nil)
 	t.Cleanup(server.Close)
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/replica/status", nil))

@@ -1,0 +1,11 @@
+usage_usec 4465996
+user_usec 2406031
+system_usec 2059964
+nice_usec 0
+nr_periods 422
+nr_throttled 0
+throttled_usec 0
+nr_bursts 0
+burst_usec 0
+35786752
+41639936

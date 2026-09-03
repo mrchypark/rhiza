@@ -87,9 +87,6 @@ type Config struct {
 	CheckpointInterval             time.Duration
 	CheckpointTailBytes            int64
 	MaxWALBytes                    int64
-	// HedgeDelay delays each lower-priority proposer. Nil uses
-	// DefaultHedgeDelay; a pointer to zero explicitly enables eager hedging.
-	HedgeDelay *time.Duration
 }
 
 const (
@@ -97,7 +94,6 @@ const (
 	ConsistencyLinearizable        = "linearizable"
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
 	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
-	DefaultHedgeDelay              = 5 * time.Millisecond
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
@@ -136,10 +132,6 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	if config.ClusterID == "" {
 		config.ClusterID = "cluster-a"
 	}
-	hedgeDelay, err := configuredHedgeDelay(config.HedgeDelay)
-	if err != nil {
-		return nil, err
-	}
 	childCtx, cancel := context.WithCancel(ctx)
 	internalConfig := &types.ExecutionConfig{
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
@@ -156,7 +148,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes, HedgeDelay: hedgeDelay,
+		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes,
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {
@@ -170,16 +162,6 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		return nil, err
 	}
 	return &DB{node: n, api: api, cancel: cancel}, nil
-}
-
-func configuredHedgeDelay(delay *time.Duration) (time.Duration, error) {
-	if delay == nil {
-		return DefaultHedgeDelay, nil
-	}
-	if *delay < 0 {
-		return 0, fmt.Errorf("hedge delay must not be negative")
-	}
-	return *delay, nil
 }
 
 func (db *DB) Close() error {

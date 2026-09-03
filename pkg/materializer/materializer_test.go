@@ -43,6 +43,21 @@ func TestMaterializerCreatesKVExpiryIndex(t *testing.T) {
 	}
 }
 
+func TestMaterializerDisablesForegroundWALCheckpoint(t *testing.T) {
+	m, err := Open(t.TempDir()+"/checkpoint.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var pages int
+	if err := m.writer.QueryRow(`PRAGMA wal_autocheckpoint`).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != 0 {
+		t.Fatalf("wal_autocheckpoint=%d, want 0", pages)
+	}
+}
+
 func TestMaterializerApply(t *testing.T) {
 	dir, err := os.MkdirTemp("", "materializer-test")
 	if err != nil {
@@ -147,6 +162,174 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 	}
 	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count after conflicting retry=%d err=%v", count, err)
+	}
+}
+
+func TestSQLReceiptBatchHandlesFailuresAndCrossDecisionDuplicates(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/receipt-batch.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	first, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "same", SQL: "INSERT INTO receipt_batch VALUES (1)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "same", SQL: "INSERT INTO receipt_batch VALUES (2)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyBatch(ctx, []quepaxa.DecidedValue{
+		{Slot: 1, Value: []byte("CREATE TABLE receipt_batch (id INTEGER PRIMARY KEY)")},
+		{Slot: 2, Value: first},
+		{Slot: 3, Value: duplicate},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := types.EncodeSQLBatch([]types.SQLCommand{
+		{RequestID: "two", SQL: "INSERT INTO receipt_batch VALUES (2)"},
+		{RequestID: "rejected", SQL: "INSERT INTO receipt_batch VALUES (2)"},
+		{RequestID: "three", SQL: "INSERT INTO receipt_batch VALUES (3)"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 4, mixed); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 3 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	for requestID, status := range map[string]types.MutationStatus{
+		"same": types.MutationCommitted, "two": types.MutationCommitted,
+		"rejected": types.MutationRejected, "three": types.MutationCommitted,
+	} {
+		receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, requestID)
+		if err != nil || !found || receipt.Status != status {
+			t.Fatalf("request %q receipt=%+v found=%v err=%v", requestID, receipt, found, err)
+		}
+	}
+	commands := make([]types.SQLCommand, 128)
+	for i := range commands {
+		commands[i] = types.SQLCommand{
+			RequestID: "bulk-" + strconv.Itoa(i),
+			SQL:       "INSERT INTO receipt_batch VALUES (?)",
+			Args:      []any{int64(i + 4)},
+		}
+	}
+	bulk, err := types.EncodeSQLBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 5, bulk); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 131 {
+		t.Fatalf("bulk count=%d err=%v", count, err)
+	}
+}
+
+func TestSQLRequestStatus(t *testing.T) {
+	m, err := Open(t.TempDir()+"/status.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "row", SQL: "CREATE TABLE status_row (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.SQLRequestStatus(context.Background(), command)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := command
+	conflict.SQL = "CREATE TABLE other_row (id INTEGER)"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
+		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
+	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
+func TestSQLRequestStatusUsesCommittedReceiptCache(t *testing.T) {
+	m, err := Open(t.TempDir()+"/status-cache.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "cached", SQL: "CREATE TABLE cached_status (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.readers[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.SQLRequestStatus(context.Background(), command)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := command
+	conflict.SQL = "CREATE TABLE conflicting_status (id INTEGER)"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
+		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
+	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
+func TestSQLReceiptBloomLoadsAndRotates(t *testing.T) {
+	path := t.TempDir() + "/status-bloom.db"
+	m, err := Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := types.SQLCommand{RequestID: "persisted", SQL: "CREATE TABLE bloom_status (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !m.sqlReceipts.mightContain(command.RequestID, m.tip) {
+		t.Fatal("persisted receipt is absent from the startup Bloom filter")
+	}
+
+	var bloom sqlReceiptBloom
+	bloom.window = 1024
+	bloom.add("old", 1023)
+	bloom.add("current", 1024)
+	if !bloom.mightContain("old", 1024) || !bloom.mightContain("current", 1024) {
+		t.Fatal("retained receipts disappeared across an epoch boundary")
+	}
+	bloom.add("next", 2048)
+	if !bloom.mightContain("current", 2047) || !bloom.mightContain("next", 2048) {
+		t.Fatal("retained receipts disappeared during filter rotation")
 	}
 }
 
@@ -699,6 +882,40 @@ func BenchmarkCheckpointFilesAt(b *testing.B) {
 			b.Fatal(err)
 		}
 		cleanup()
+	}
+}
+
+func BenchmarkSQLBatchApply(b *testing.B) {
+	for _, size := range []int{1, 8, 32, 64, 128} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			m, err := Open(b.TempDir()+"/batch.db", 1)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer m.Close()
+			schema, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)"}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), 1, schema); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for iteration := range b.N {
+				commands := make([]types.SQLCommand, size)
+				for i := range commands {
+					id := iteration*size + i
+					commands[i] = types.SQLCommand{RequestID: strconv.Itoa(id), SQL: "INSERT INTO bench(id, value) VALUES (?, ?)", Args: []any{int64(id), int64(1)}}
+				}
+				value, err := types.EncodeSQLBatch(commands)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := m.Apply(context.Background(), uint64(iteration+2), value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

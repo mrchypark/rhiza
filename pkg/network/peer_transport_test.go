@@ -22,7 +22,7 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2", Token: "admin-secret"}}, "admin-secret"); peer != nil || err == nil {
@@ -55,6 +55,11 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	if summary.RecorderID != member.ID || summary.Step != request.Step {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
+	for range 300 {
+		if _, err := transport.ReadTip(callCtx, member.ID); err != nil {
+			t.Fatalf("stream was not released: %v", err)
+		}
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, ok := transport.tls.ClientSessionCache.Get(string(member.ID)); ok {
@@ -77,13 +82,27 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	if first.Context().Err() != nil {
 		t.Fatal("failed stream closed a connection with another active stream")
 	}
+	transport.invalidate(member.ID, first)
+	if first.Context().Err() != nil {
+		t.Fatal("invalidated connection closed before its last active stream")
+	}
 	transport.release(member.ID, first)
+	select {
+	case <-first.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("invalidated connection remained open after its last release")
+	}
 	request.Step++
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatalf("request after stream cancellation: %v", err)
 	}
-	transport.invalidate(member.ID, first)
-	_ = first.CloseWithError(0, "reconnect")
+	second := transport.peers[member.ID].conn
+	transport.invalidate(member.ID, second)
+	select {
+	case <-second.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("idle invalidated connection remained open")
+	}
 	request.Step++
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatal(err)
@@ -135,6 +154,13 @@ func TestAllows0RTTOnlyForReadOperations(t *testing.T) {
 	}
 }
 
+func TestDecisionHasRecorder(t *testing.T) {
+	decision := quepaxa.Decision{Summaries: []quepaxa.Summary{{RecorderID: "n1"}, {RecorderID: "n2"}}}
+	if !decisionHasRecorder(decision, "n1") || !decisionHasRecorder(decision, "n2") || decisionHasRecorder(decision, "n3") {
+		t.Fatal("decision recorder membership mismatch")
+	}
+}
+
 func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
 	if identity, err := NewPeerIdentity("cluster", quepaxa.Member{ID: "n1", PeerURL: "quic://127.0.0.1:1"}); identity != (PeerIdentity{}) || err == nil {
 		t.Fatalf("identity=%+v error=%v", identity, err)
@@ -144,7 +170,7 @@ func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
 func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "voter-token"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: "learner-token"}
 	request := &peerfb.RequestT{
@@ -171,7 +197,7 @@ func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 func TestPeerServerRejectsMutatingEarlyData(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
 	for operation := range peerfb.EnumNamesOperation {
@@ -227,7 +253,7 @@ func TestPeerCodecRejectsWrongMarker(t *testing.T) {
 func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	for slot := quepaxa.Slot(1); slot <= 256; slot++ {
 		value := make([]byte, 8<<10)
@@ -278,7 +304,7 @@ func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
 	if err := core.CompactThrough(1, seal.RootHash); err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")

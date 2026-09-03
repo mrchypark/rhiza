@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,14 +33,14 @@ func TestCompactedPeerDoesNotOverrideUsableQuorumSuffix(t *testing.T) {
 
 func TestOperationSyncPeerPermutationIsDeterministicAndBalanced(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
-	first, ok := syncSource("n1", members, 0)
-	if !ok {
+	first := syncSources("n1", members, 0)
+	if len(first) != 2 {
 		t.Fatal("no sync peer")
 	}
-	second, _ := syncSource("n1", members, 1)
-	again, _ := syncSource("n1", members, 0)
-	if first != again || first == second || first == "n1" || second == "n1" {
-		t.Fatalf("sources=%s,%s again=%s", first, second, again)
+	second := syncSources("n1", members, 1)
+	again := syncSources("n1", members, 0)
+	if !slices.Equal(first, again) || first[0] == second[0] || first[0] == "n1" || second[0] == "n1" || first[1] != second[0] {
+		t.Fatalf("sources=%v,%v again=%v", first, second, again)
 	}
 	for round := uint64(0); round < 32; round++ {
 		delay := syncInterval("n1", round)

@@ -22,6 +22,36 @@ func BenchmarkCoreProposeThreePeers(b *testing.B) {
 	benchmarkCorePropose(b, false)
 }
 
+func BenchmarkCoreProposeThreePeersParallel(b *testing.B) {
+	benchmarkCoreProposeParallel(b, false)
+}
+
+func BenchmarkCoreProposeCertifiedThreePeersParallel(b *testing.B) {
+	benchmarkCoreProposeParallel(b, true)
+}
+
+func benchmarkCoreProposeParallel(b *testing.B, certifiedOnly bool) {
+	cores, _ := newTestCluster(b)
+	var sequence atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		value := make([]byte, 8)
+		for pb.Next() {
+			binary.LittleEndian.PutUint64(value, sequence.Add(1))
+			var err error
+			if certifiedOnly {
+				_, _, err = cores["n2"].ProposeCertified(context.Background(), value)
+			} else {
+				_, _, err = cores["n2"].Propose(context.Background(), value)
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func BenchmarkCoreProposeOnePeerDown(b *testing.B) {
 	benchmarkCorePropose(b, true)
 }
@@ -474,6 +504,55 @@ func TestNonLeaderDecidesWithPreferredReplicaDown(t *testing.T) {
 		decisions, tip, err := cores[id].DecisionsFrom(1, 1)
 		if err != nil || tip != 1 || len(decisions) != 1 || string(decisions[0].Value) != "value" {
 			t.Fatalf("%s did not learn decision: tip=%d decisions=%+v err=%v", id, tip, decisions, err)
+		}
+	}
+}
+
+func TestProposalRecoversEarlierSlotWithoutFailureTimeout(t *testing.T) {
+	cores, transport := newTestCluster(t)
+	transport.fail("n1")
+	core := cores["n2"]
+	core.nextSlot = 2
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	slot, _, err := core.Propose(ctx, []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot != 2 || core.Tip() != 2 || !core.IsDecided(1) {
+		t.Fatalf("slot=%d tip=%d recovered=%t", slot, core.Tip(), core.IsDecided(1))
+	}
+}
+
+func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
+	cores, transport := newTestCluster(t)
+	transport.fail("n1")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	jobs := make(chan int, 400)
+	errs := make(chan error, 8)
+	for range 8 {
+		go func() {
+			for i := range jobs {
+				value := make([]byte, 8)
+				binary.LittleEndian.PutUint64(value, uint64(i))
+				if _, _, err := cores["n2"].Propose(ctx, value); err != nil {
+					errs <- err
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for i := range 400 {
+		jobs <- i
+	}
+	close(jobs)
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Fatalf("tip=%d next-decided=%t err=%v", cores["n2"].Tip(), cores["n2"].IsDecided(cores["n2"].Tip()+1), err)
 		}
 	}
 }

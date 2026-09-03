@@ -104,6 +104,17 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 // Propose drives Algorithm 4. If another proposer wins this slot, the offered
 // value is retried at the next slot so a successful client command is never lost.
 func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, error) {
+	return c.propose(ctx, value, true)
+}
+
+// ProposeCertified returns after a recorder quorum has durably certified the
+// value. The caller must install the returned decision on another voter before
+// acknowledging the client.
+func (c *Core) ProposeCertified(ctx context.Context, value []byte) (Slot, []Receipt, error) {
+	return c.propose(ctx, value, false)
+}
+
+func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, []Receipt, error) {
 	if c.observer {
 		return 0, nil, ErrQuorumUnavailable
 	}
@@ -153,8 +164,15 @@ func (c *Core) Propose(ctx context.Context, value []byte) (Slot, []Receipt, erro
 			c.releaseSlot(slot)
 			return slot, nil, err
 		}
-		if _, err := c.CompleteDecision(ctx, decision.Slot); err != nil {
-			return decision.Slot, nil, err
+		if complete {
+			if tip := c.Tip(); tip+1 < decision.Slot {
+				if err := c.RecoverThrough(ctx, decision.Slot-1); err != nil {
+					return decision.Slot, nil, err
+				}
+			}
+			if _, err := c.completeDecision(ctx, decision.Slot, len(c.config.Members) == 1); err != nil {
+				return decision.Slot, nil, err
+			}
 		}
 		if decision.Proposal.Hash == offeredHash && bytes.Equal(decision.Proposal.Value, value) {
 			return proposalResult(decision)
@@ -244,16 +262,46 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 	if transport == nil {
 		return fmt.Errorf("value %x is unavailable", proposal.Hash[:8])
 	}
+	type result struct {
+		value []byte
+	}
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan result, len(sources))
+	pending := 0
+	seen := make(map[NodeID]struct{}, len(sources))
 	for _, source := range sources {
-		value, err := transport.FetchValue(ctx, source, proposal.Hash)
-		if err != nil || sha256.Sum256(value) != proposal.Hash {
+		if source == c.nodeID {
 			continue
 		}
-		if err := c.StoreValue(proposal.Hash, value); err != nil {
-			return err
+		if _, duplicate := seen[source]; duplicate {
+			continue
 		}
-		proposal.Value = value
-		return nil
+		seen[source] = struct{}{}
+		pending++
+		go func(source NodeID) {
+			value, err := transport.FetchValue(fetchCtx, source, proposal.Hash)
+			if err != nil || sha256.Sum256(value) != proposal.Hash {
+				results <- result{}
+				return
+			}
+			results <- result{value: value}
+		}(source)
+	}
+	for range pending {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case result := <-results:
+			if len(result.value) == 0 {
+				continue
+			}
+			if err := c.StoreValue(proposal.Hash, result.value); err != nil {
+				return err
+			}
+			proposal.Value = result.value
+			return nil
+		}
 	}
 	return fmt.Errorf("value %x is unavailable", proposal.Hash[:8])
 }
@@ -467,7 +515,7 @@ func (c *Core) LeaderOrder(slot Slot) ([]NodeID, error) {
 	return c.leaderOrderLocked(slot)
 }
 
-// ProposerOrder returns the agreed hedging order for the next undecided slot.
+// ProposerOrder returns the agreed proposer preference for the next undecided slot.
 func (c *Core) ProposerOrder() []NodeID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -995,14 +1043,43 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 // CompleteDecision makes an existing decision safe to acknowledge by
 // re-establishing the learner quorum required by ReadIndex.
 func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, error) {
+	return c.completeDecision(ctx, slot, true)
+}
+
+func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) (DecidedValue, error) {
 	if c.observer {
 		return DecidedValue{}, ErrQuorumUnavailable
 	}
 	lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
-	if err := c.ensureDurableLocked(slot); err != nil {
-		lock.Unlock()
-		return DecidedValue{}, err
+	if syncLocal {
+		if err := c.ensureDurableLocked(slot); err != nil {
+			lock.Unlock()
+			return DecidedValue{}, err
+		}
+	} else {
+		c.mu.Lock()
+		value, ok := c.decided[slot]
+		if !ok {
+			c.mu.Unlock()
+			lock.Unlock()
+			return DecidedValue{}, fmt.Errorf("slot %d is not decided", slot)
+		}
+		if !c.logged[slot] {
+			decision, err := decodeDecision(value.Certificate)
+			if err != nil {
+				c.mu.Unlock()
+				lock.Unlock()
+				return DecidedValue{}, err
+			}
+			if err := c.appendDecision(decision, value.Value, value.Certificate); err != nil {
+				c.mu.Unlock()
+				lock.Unlock()
+				return DecidedValue{}, err
+			}
+			c.logged[slot] = true
+		}
+		c.mu.Unlock()
 	}
 	c.mu.RLock()
 	value, ok := c.decided[slot]
@@ -1152,6 +1229,9 @@ func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 		return proposal.Value, nil
 	}
 	c.mu.RUnlock()
+	if c.isLeaderScheduleSlot(slot) {
+		return EncodeLeaderSchedule(c.calculateLeaderSchedule())
+	}
 	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-recovery:%s:%d", c.nodeID, slot)))
 	var nonce [ReadBarrierNonceSize]byte
 	copy(nonce[:], seed[:])
@@ -1237,6 +1317,31 @@ func (c *Core) AcceptCertifiedValue(value DecidedValue) error {
 	return c.AcceptCertifiedValues([]DecidedValue{value})
 }
 
+// AcceptCertifiedValueForAck installs a proposer-returned decision. A voter
+// already named by its durable recorder certificate does not need a second
+// local disk barrier; every other voter persists the decision before ACK.
+func (c *Core) AcceptCertifiedValueForAck(value DecidedValue) error {
+	decision, err := c.certifiedDecision(value)
+	if err != nil {
+		return err
+	}
+	for _, summary := range decision.Summaries {
+		if summary.RecorderID == c.nodeID && len(c.config.Members) > 1 {
+			c.mu.RLock()
+			state := c.recorders[value.Slot]
+			recorded := sameProposal(state.FirstCurrent, &decision.Proposal) ||
+				sameProposal(state.AggregateCurrent, &decision.Proposal) ||
+				sameProposal(state.AggregatePrior, &decision.Proposal)
+			durable := c.valueDurable[value.Hash]
+			c.mu.RUnlock()
+			if recorded && durable {
+				return c.AcceptCertifiedHints([]DecidedValue{value})
+			}
+		}
+	}
+	return c.AcceptCertifiedValue(value)
+}
+
 // AcceptCertifiedValues validates and persists a catch-up page with one sync.
 func (c *Core) AcceptCertifiedValues(values []DecidedValue) error {
 	return c.acceptCertifiedValues(values, true)
@@ -1293,7 +1398,7 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 	if !durable || len(slots) == 0 {
 		return nil
 	}
-	if err := c.wal.Sync(); err != nil {
+	if err := c.commits.Sync(context.Background()); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -1421,7 +1526,14 @@ func (c *Core) DecisionsFrom(from Slot, limit int) ([]DecidedValue, Slot, error)
 	if from <= c.floor {
 		return nil, c.tip, fmt.Errorf("%w: requested slot %d is at or below floor %d", ErrCompacted, from, c.floor)
 	}
-	page := make([]DecidedValue, 0, limit)
+	capacity := 0
+	if from <= c.tip {
+		capacity = limit
+		if remaining := c.tip - from + 1; remaining < Slot(capacity) {
+			capacity = int(remaining)
+		}
+	}
+	page := make([]DecidedValue, 0, capacity)
 	for slot := from; slot <= c.tip && len(page) < limit; slot++ {
 		decision, ok := c.decided[slot]
 		if !ok {

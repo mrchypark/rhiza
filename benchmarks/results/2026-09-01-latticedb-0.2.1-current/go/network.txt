@@ -1,0 +1,16 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkServerQuery/local-8         	   58033	     25681 ns/op	    1568 B/op	      43 allocs/op
+BenchmarkServerQuery/local-8         	   87201	     42353 ns/op	    1569 B/op	      43 allocs/op
+BenchmarkServerQuery/local-8         	   72330	     30092 ns/op	    1568 B/op	      43 allocs/op
+BenchmarkServerQuery/local-8         	   92713	     23897 ns/op	    1568 B/op	      43 allocs/op
+BenchmarkServerQuery/local-8         	   48848	     22535 ns/op	    1568 B/op	      43 allocs/op
+BenchmarkServerQuery/linearizable-8  	   83970	     18243 ns/op	    1566 B/op	      42 allocs/op
+BenchmarkServerQuery/linearizable-8  	  107580	     13860 ns/op	    1567 B/op	      42 allocs/op
+BenchmarkServerQuery/linearizable-8  	  104796	     12904 ns/op	    1567 B/op	      42 allocs/op
+BenchmarkServerQuery/linearizable-8  	  101781	     12531 ns/op	    1568 B/op	      43 allocs/op
+BenchmarkServerQuery/linearizable-8  	  115096	     25563 ns/op	    1567 B/op	      42 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/network	23.555s

@@ -34,6 +34,7 @@ type graphState struct {
 	db                *latticedb.DB
 	mu                sync.RWMutex
 	tip               uint64
+	durableTip        uint64
 	idempotencyWindow uint64
 	streamWake        chan struct{}
 	queryWG           sync.WaitGroup
@@ -106,7 +107,7 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 			return nil, err
 		}
 	} else {
-		g.tip, err = decodeGraphTip(encodedTip)
+		g.durableTip, err = decodeGraphTip(encodedTip)
 		if err != nil {
 			g.close()
 			return nil, err
@@ -122,15 +123,18 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 		g.close()
 		return nil, err
 	}
-	if g.tip < sqliteTip {
-		g.close()
-		return nil, fmt.Errorf("graph applied slot %d is behind SQLite slot %d; rebuild from the decision log", g.tip, sqliteTip)
+	for _, entry := range journal {
+		if entry.Slot > g.durableTip {
+			g.close()
+			return nil, fmt.Errorf("graph recovery journal exceeds durable graph slot %d", g.durableTip)
+		}
 	}
 	journal = pendingGraphJournal(journal, sqliteTip)
-	if g.tip > sqliteTip && (len(journal) != int(g.tip-sqliteTip) || journal[0].Slot != sqliteTip+1 || journal[len(journal)-1].Slot != g.tip) {
+	if g.durableTip > sqliteTip && (len(journal) == 0 || journal[len(journal)-1].Slot != g.durableTip) {
 		g.close()
-		return nil, fmt.Errorf("graph recovery journal does not cover SQLite gap %d..%d", sqliteTip+1, g.tip)
+		return nil, fmt.Errorf("graph recovery journal does not cover durable graph slot %d", g.durableTip)
 	}
+	g.tip = max(g.durableTip, sqliteTip)
 	if err := db.Update(func(tx *latticedb.Tx) error {
 		return tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal))
 	}); err != nil {
@@ -174,7 +178,7 @@ func decodeGraphJournal(data []byte) ([]graphJournalEntry, error) {
 		offset := i * 40
 		entries[i].Slot = binary.BigEndian.Uint64(data[offset : offset+8])
 		copy(entries[i].Hash[:], data[offset+8:offset+40])
-		if entries[i].Slot == 0 || i > 0 && entries[i-1].Slot+1 != entries[i].Slot {
+		if entries[i].Slot == 0 || i > 0 && entries[i-1].Slot >= entries[i].Slot {
 			return nil, fmt.Errorf("invalid graph recovery journal")
 		}
 	}
@@ -249,7 +253,17 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 				return nil
 			}
 		}
-		return fmt.Errorf("graph applied slot %d is missing from recovery journal", slot)
+		if graph {
+			return fmt.Errorf("graph applied slot %d is missing from recovery journal", slot)
+		}
+		known, err := knownNonGraphValue(value)
+		if err != nil {
+			return err
+		}
+		if !known {
+			return fmt.Errorf("unrecognized replicated command")
+		}
+		return nil
 	}
 	if slot != g.tip+1 {
 		return fmt.Errorf("graph apply slot gap: have %d, got %d", g.tip, slot)
@@ -261,9 +275,6 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 		}
 		if !known {
 			return fmt.Errorf("unrecognized replicated command")
-		}
-		if err := g.advanceTip(ctx, slot, valueHash, confirmedThrough); err != nil {
-			return err
 		}
 		g.tip = slot
 		return nil
@@ -281,7 +292,7 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 			}
 		}
 	}
-	g.tip = slot
+	g.tip, g.durableTip = slot, slot
 	close(g.streamWake)
 	g.streamWake = make(chan struct{})
 	return nil
@@ -294,21 +305,15 @@ func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 	return types.GraphFingerprint(command)
 }
 
-func (g *graphState) advanceTip(ctx context.Context, slot uint64, valueHash [32]byte, confirmedThrough uint64) error {
-	return g.db.Update(func(tx *latticedb.Tx) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
-	})
-}
-
 func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64) error {
 	args, err := graphArgs(command.Args)
 	if err != nil {
 		return err
 	}
 	return g.db.Update(func(tx *latticedb.Tx) error {
+		if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
+			return err
+		}
 		existing, found, err := requestInTx(tx, command.RequestID)
 		if err != nil {
 			return err
@@ -318,7 +323,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 				return fmt.Errorf("request_id was already used for a different graph command")
 			}
 			if advance {
-				return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
+				return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
 			}
 			return nil
 		}
@@ -347,7 +352,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 			return err
 		}
 		if advance {
-			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
+			return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
 		}
 		return nil
 	})
@@ -365,6 +370,9 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
+			return err
+		}
 		_, found, err := requestInTx(tx, command.RequestID)
 		if err != nil {
 			return err
@@ -376,13 +384,13 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 			}
 		}
 		if advance {
-			return advanceGraphMetadata(tx, slot, valueHash, g.idempotencyWindow, confirmedThrough)
+			return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
 		}
 		return nil
 	})
 }
 
-func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window, confirmedThrough uint64) error {
+func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, confirmedThrough uint64) error {
 	journalData, _, err := tx.GetAppMetadata(graphJournalKey)
 	if err != nil {
 		return err
@@ -392,19 +400,33 @@ func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, window, 
 		return err
 	}
 	journal = pendingGraphJournal(journal, confirmedThrough)
-	if len(journal) != 0 && journal[len(journal)-1].Slot+1 != slot {
-		return fmt.Errorf("graph recovery journal slot gap")
+	if len(journal) != 0 && journal[len(journal)-1].Slot >= slot {
+		return fmt.Errorf("graph recovery journal slot order")
 	}
 	journal = append(journal, graphJournalEntry{Slot: slot, Hash: hash})
 	if err := tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal)); err != nil {
 		return err
 	}
-	if slot >= window {
-		if err := pruneGraphRequests(tx, slot-window); err != nil {
+	return tx.PutAppMetadata(graphTipKey, encodeGraphTip(slot))
+}
+
+func pruneGraphRequestsForApply(tx *latticedb.Tx, slot, durableTip, window uint64) error {
+	if durableTip == 0 || slot <= window {
+		return nil
+	}
+	through := min(durableTip, slot-window)
+	start := uint64(1)
+	if durableTip >= window {
+		start = durableTip - window + 1
+	}
+	// ponytail: scan at most one idempotency window on graph writes; persist an
+	// active-slot index only if graph-write latency shows this map scan matters.
+	for requestSlot := start; requestSlot <= through; requestSlot++ {
+		if err := pruneGraphRequests(tx, requestSlot); err != nil {
 			return err
 		}
 	}
-	return tx.PutAppMetadata(graphTipKey, encodeGraphTip(slot))
+	return nil
 }
 
 func putRequest(tx *latticedb.Tx, id string, request graphRequest) error {
@@ -484,9 +506,12 @@ func encodeGraphRequest(request graphRequest) []byte {
 
 func pruneGraphRequests(tx *latticedb.Tx, slot uint64) error {
 	key := graphSlotKey(slot)
-	ids, _, err := tx.GetAppMetadata(key)
+	ids, found, err := tx.GetAppMetadata(key)
 	if err != nil {
 		return err
+	}
+	if !found {
+		return nil
 	}
 	for len(ids) > 0 {
 		encodedLength, n := binary.Uvarint(ids)
@@ -691,6 +716,9 @@ func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string)
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	request, found, err := g.request(requestID)
+	if found && m.tip > request.Receipt.RetryThroughSlot {
+		found = false
+	}
 	return request.Receipt, found, err
 }
 
@@ -708,6 +736,9 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	request, found, err := g.request(command.RequestID)
+	if found && m.tip > request.Receipt.RetryThroughSlot {
+		found = false
+	}
 	if err != nil || !found {
 		return !found, err
 	}
@@ -722,7 +753,10 @@ func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
 	}
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
-	_, found, err := m.graph.request(requestID)
+	request, found, err := m.graph.request(requestID)
+	if found && m.tip > request.Receipt.RetryThroughSlot {
+		found = false
+	}
 	return found, err
 }
 

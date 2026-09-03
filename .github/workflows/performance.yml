@@ -1,0 +1,257 @@
+name: Performance
+
+on:
+  pull_request:
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - benchmarks/**
+      - .github/workflows/performance.yml
+  push:
+    branches: [main]
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - benchmarks/**
+      - .github/workflows/performance.yml
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Git ref to compare against
+        required: true
+        default: main
+      candidate_ref:
+        description: Candidate Git ref (defaults to this workflow ref)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paired-go-benchmarks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CGO_ENABLED: 0
+      RHIZA_BENCH_COUNT: 10
+      RHIZA_BENCH_TIME: 1s
+      RHIZA_BENCH_PROCS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve comparison revisions
+        id: revisions
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.clone_url }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          INPUT_BASE_REF: ${{ inputs.base_ref }}
+          INPUT_CANDIDATE_REF: ${{ inputs.candidate_ref }}
+        run: |
+          candidate_sha=${PR_HEAD_SHA:-$(git rev-parse HEAD)}
+          if [[ -n "$INPUT_CANDIDATE_REF" ]]; then
+            if candidate_sha=$(git rev-parse --verify "$INPUT_CANDIDATE_REF^{commit}" 2>/dev/null); then
+              :
+            else
+              git fetch --no-tags origin "$INPUT_CANDIDATE_REF"
+              candidate_sha=$(git rev-parse FETCH_HEAD)
+            fi
+          elif ! git cat-file -e "$candidate_sha^{commit}" 2>/dev/null; then
+            git fetch --no-tags "$PR_HEAD_REPOSITORY" "$candidate_sha"
+          fi
+          if [[ -n "$PR_BASE_SHA" ]]; then
+            if git cat-file -e "$PR_BASE_SHA:.github/workflows/performance.yml" 2>/dev/null; then
+              base_sha=$PR_BASE_SHA
+              baseline_mode=pull-request-base
+            else
+              base_sha=$(git rev-parse "$candidate_sha^")
+              baseline_mode=bootstrap-previous-commit
+            fi
+          elif [[ -n "$PUSH_BASE_SHA" && "$PUSH_BASE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+            base_sha=$PUSH_BASE_SHA
+            baseline_mode=previous-main
+          else
+            if base_sha=$(git rev-parse --verify "$INPUT_BASE_REF^{commit}" 2>/dev/null); then
+              :
+            else
+              git fetch --no-tags origin "$INPUT_BASE_REF"
+              base_sha=$(git rev-parse FETCH_HEAD)
+            fi
+            baseline_mode=workflow-dispatch
+          fi
+          git cat-file -e "$base_sha^{commit}"
+          {
+            printf 'base_sha=%s\n' "$base_sha"
+            printf 'candidate_sha=%s\n' "$candidate_sha"
+            printf 'baseline_mode=%s\n' "$baseline_mode"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned benchstat
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+          printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
+
+      - name: Cache pinned Hiqlite build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/hiqlite-target
+          key: hiqlite-${{ runner.os }}-c3ff2536-rust-1.97.1
+
+      - name: Run interleaved base and candidate benchmarks
+        run: |
+          benchmarks/run-ci-benchmarks.sh \
+            "${{ steps.revisions.outputs.base_sha }}" \
+            "${{ steps.revisions.outputs.candidate_sha }}" \
+            "$RUNNER_TEMP/rhiza-performance"
+
+      - name: Compare results
+        run: |
+          benchstat \
+            "base=$RUNNER_TEMP/rhiza-performance/base.txt" \
+            "candidate=$RUNNER_TEMP/rhiza-performance/candidate.txt" \
+            | tee "$RUNNER_TEMP/rhiza-performance/benchstat.txt"
+          # shellcheck disable=SC2016
+          {
+            printf '## Paired performance benchmarks\n\n'
+            printf 'Fixed `ubuntu-24.04`, `GOMAXPROCS=2`; 10 interleaved samples per revision.\n\n'
+            printf 'Baseline mode: `%s`.\n\n' '${{ steps.revisions.outputs.baseline_mode }}'
+            printf '```text\n'
+            cat "$RUNNER_TEMP/rhiza-performance/benchstat.txt"
+            printf '```\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Run pinned Hiqlite reference
+        continue-on-error: true
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/hiqlite-target
+          HIQLITE_COMMIT: c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
+          git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
+          git -C "$RUNNER_TEMP/hiqlite" apply --unidiff-zero --whitespace=nowarn \
+            "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch"
+          cargo +1.97.1 build --release \
+            --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt"
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-remote-immediate.txt"
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-non-leader-failed-immediate.txt"
+          (
+            cd "$RUNNER_TEMP/hiqlite/examples/bench"
+            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000
+          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-leader-failed-immediate.txt"
+          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance"/hiqlite*.txt; then
+            printf '\n## Pinned Hiqlite reference\n\nInvalid: runtime errors; see artifact.\n' >>"$GITHUB_STEP_SUMMARY"
+            printf 'Hiqlite benchmark reported runtime errors\n' >&2
+            exit 1
+          fi
+          hiqlite_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite.txt")
+          hiqlite_immediate_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt")
+          hiqlite_remote_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-remote-immediate.txt")
+          hiqlite_non_leader_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-non-leader-failed-immediate.txt")
+          hiqlite_leader_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-leader-failed-immediate.txt")
+          [[ $hiqlite_ops =~ ^[0-9]+$ && $hiqlite_immediate_ops =~ ^[0-9]+$ && $hiqlite_remote_ops =~ ^[0-9]+$ && $hiqlite_non_leader_ops =~ ^[0-9]+$ && $hiqlite_leader_ops =~ ^[0-9]+$ ]]
+          # shellcheck disable=SC2016
+          {
+            printf '\n## Pinned Hiqlite reference\n\n'
+            printf 'Official `interval_200` three-node local-client workload: `%s ops/s`.\n\n' "$hiqlite_ops"
+            printf 'Power-loss-durable `immediate` workload: `%s ops/s`.\n\n' "$hiqlite_immediate_ops"
+            printf 'Power-loss-durable remote-client workload: `%s ops/s`.\n\n' "$hiqlite_remote_ops"
+            printf 'Raft follower gracefully stopped before measurement: `%s ops/s`.\n\n' "$hiqlite_non_leader_ops"
+            printf 'Raft leader gracefully stopped before measurement: `%s ops/s`.\n\n' "$hiqlite_leader_ops"
+            printf 'All use `cluster -c 16 -r 100000`, commit `%s`.\n' "$HIQLITE_COMMIT"
+            printf 'This is a native Hiqlite diagnostic, not an algorithm-level ratio against Rhiza.\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Run Rhiza real-server reference
+        env:
+          RHIZA_SERVER_BENCH_REQUESTS: 100000
+          RHIZA_SERVER_BENCH_CONCURRENCY: 16
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/rhiza-server-candidate" "${{ steps.revisions.outputs.candidate_sha }}"
+          benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
+          RHIZA_SERVER_BENCH_FAILED_NODE=n0 RHIZA_SERVER_BENCH_TARGET_NODE=n1 benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-n0-failed.json"
+          RHIZA_SERVER_BENCH_FAILED_NODE=n1 RHIZA_SERVER_BENCH_TARGET_NODE=n2 benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-n1-failed.json"
+          RHIZA_SERVER_BENCH_FAILED_NODE=n2 RHIZA_SERVER_BENCH_TARGET_NODE=n0 benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-n2-failed.json"
+          rhiza_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
+          rhiza_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
+          # shellcheck disable=SC2016
+          {
+            printf '\n## Rhiza leaderless availability qualification\n\n'
+            printf 'Quorum-WAL-durable three-voter HTTP/QUIC workload: `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
+            for peer in n0 n1 n2; do
+              file="$RUNNER_TEMP/rhiza-performance/rhiza-server-$peer-failed.json"
+              ops=$(jq -r '.result.success_ops_per_sec | floor' "$file")
+              p99=$(jq -r '.result.p99_ms' "$file")
+              max=$(jq -r '.result.max_ms' "$file")
+              retries=$(jq -r '.result.retries // 0' "$file")
+              log_failures=$(jq -r '.runtime_failure_lines' "$file")
+              printf 'Peer `%s` SIGKILL during load: `%s ops/s`, p99 `%s ms`, max `%s ms`, `%s` commit-unknown retries, zero failed writes, `%s` runtime failure log lines.\n\n' "$peer" "$ops" "$p99" "$max" "$retries" "$log_failures"
+            done
+            printf 'QuePaxa has no stable leader role, so failures are reported by peer identity. Each fault is injected during `-c 16 -n 100000`; every acknowledged row is verified by a linearizable query.\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Record runner environment
+        run: |
+          {
+            printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
+            printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
+            printf 'rust=%s\n' "$(rustc +1.97.1 --version)"
+            printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+            printf 'hiqlite_official_log_sync=interval_200\n'
+            printf 'hiqlite_durable_log_sync=immediate\n'
+            printf 'rhiza_failure_scenarios=each_peer_sigkill_during_timed_workload\n'
+            printf 'hiqlite_failure_scenarios=raft_leader_or_follower_gracefully_stopped_before_timed_workload\n'
+            lscpu
+            free -b
+          } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"
+
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-performance-${{ github.run_id }}
+          path: ${{ runner.temp }}/rhiza-performance
+          if-no-files-found: error
+          retention-days: 30

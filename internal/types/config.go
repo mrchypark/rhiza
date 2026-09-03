@@ -67,5 +67,4 @@ type ExecutionConfig struct {
 	CheckpointInterval  time.Duration `json:"checkpoint_interval"`
 	CheckpointTailBytes int64         `json:"checkpoint_tail_bytes"`
 	MaxWALBytes         int64         `json:"max_wal_bytes"`
-	HedgeDelay          time.Duration `json:"hedge_delay"`
 }

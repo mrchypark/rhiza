@@ -2,9 +2,13 @@ package network
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"reflect"
+	"runtime"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +25,7 @@ type requestIDRaceTransport struct {
 	cores            map[quepaxa.NodeID]*quepaxa.Core
 	disabled         map[quepaxa.NodeID]bool
 	failNextDecision bool
+	benchmarkQuorum  bool
 
 	gateMu sync.Mutex
 	hashes map[quepaxa.ValueHash]struct{}
@@ -61,8 +66,12 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 		return errors.New("injected learner failure")
 	}
 	cores := make([]*quepaxa.Core, 0, len(t.cores))
+	proposer := decision.Proposal.ProposerID
+	if core := t.cores[proposer]; core != nil && !t.disabled[proposer] {
+		cores = append(cores, core)
+	}
 	for id, core := range t.cores {
-		if !t.disabled[id] {
+		if id != proposer && !t.disabled[id] {
 			cores = append(cores, core)
 		}
 	}
@@ -71,12 +80,67 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 	if len(cores) < quorum {
 		return quepaxa.ErrQuorumUnavailable
 	}
+	if t.benchmarkQuorum {
+		// ponytail: serialize the minimum quorum because these in-memory peers share one benchmark disk.
+		successes := 1 // proposer is the local learner, matching Transport.SendDecision
+		cores = cores[1:]
+		for i, core := range cores {
+			if decisionHasRecorder(decision, core.NodeID()) {
+				cores[0], cores[i] = cores[i], cores[0]
+				break
+			}
+		}
+		for _, core := range cores {
+			var err error
+			if decisionHasRecorder(decision, core.NodeID()) {
+				err = core.AcceptDecisionHint(decision)
+			} else {
+				err = core.AcceptDecision(decision)
+			}
+			if err == nil {
+				successes++
+				if successes >= quorum {
+					return nil
+				}
+			}
+		}
+		return quepaxa.ErrQuorumUnavailable
+	}
+	results := make(chan error, len(cores))
 	for _, core := range cores {
-		if err := core.AcceptDecision(decision); err != nil {
-			return err
+		go func() { results <- core.AcceptDecision(decision) }()
+	}
+	successes := 0
+	for range cores {
+		if err := <-results; err == nil {
+			successes++
+			if successes >= quorum {
+				return nil
+			}
 		}
 	}
-	return nil
+	return quepaxa.ErrQuorumUnavailable
+}
+
+func TestBenchmarkDecisionQuorumPrefersDurableRecorder(t *testing.T) {
+	cluster := newInMemoryThreePeerCluster(t, false)
+	cluster.transport.benchmarkQuorum = true
+	value := []byte("recorder-first")
+	priority := quepaxa.Priority{}
+	for i := range priority {
+		priority[i] = 0xff
+	}
+	proposal := quepaxa.Proposal{Priority: priority, ProposerID: "n1", Hash: sha256.Sum256(value), Value: value}
+	decision := quepaxa.Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []quepaxa.Summary{
+		{RecorderID: "n1", Step: 4, FirstCurrent: &proposal},
+		{RecorderID: "n2", Step: 4, FirstCurrent: &proposal},
+	}}
+	if err := cluster.transport.SendDecision(context.Background(), decision); err != nil {
+		t.Fatal(err)
+	}
+	if !cluster.cores["n2"].IsDecided(1) || cluster.cores["n3"].IsDecided(1) {
+		t.Fatal("benchmark decision quorum did not use the recorder learner")
+	}
 }
 
 func (t *requestIDRaceTransport) ReadTip(_ context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
@@ -139,7 +203,7 @@ func newRequestIDRaceCluster(t *testing.T) requestIDRaceCluster {
 	return newInMemoryThreePeerCluster(t, true)
 }
 
-func newInMemoryThreePeerCluster(t *testing.T, gated bool) requestIDRaceCluster {
+func newInMemoryThreePeerCluster(t testing.TB, gated bool) requestIDRaceCluster {
 	t.Helper()
 	members := []quepaxa.Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
 	transport := &requestIDRaceTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core), disabled: make(map[quepaxa.NodeID]bool), hashes: make(map[quepaxa.ValueHash]struct{})}
@@ -153,7 +217,7 @@ func newInMemoryThreePeerCluster(t *testing.T, gated bool) requestIDRaceCluster 
 		if err != nil {
 			t.Fatal(err)
 		}
-		server := NewServer(core, material, "cluster", true, nil, members, 0)
+		server := NewServer(core, material, "cluster", true, nil)
 		cluster.cores[member.ID] = core
 		cluster.material[member.ID] = material
 		cluster.servers[member.ID] = server
@@ -163,6 +227,106 @@ func newInMemoryThreePeerCluster(t *testing.T, gated bool) requestIDRaceCluster 
 		t.Cleanup(func() { server.Close(); material.Close() })
 	}
 	return cluster
+}
+
+func BenchmarkThreePeerSQLExecute(b *testing.B) {
+	for _, parallelism := range []int{2, 8, 32} {
+		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {
+			cluster := newInMemoryThreePeerCluster(b, false)
+			cluster.transport.benchmarkQuorum = true
+			server := cluster.servers["n1"]
+			if _, err := server.Execute(context.Background(), ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY)"}); err != nil {
+				b.Fatal(err)
+			}
+			before := cluster.cores["n1"].Tip()
+			var sequence atomic.Uint64
+			b.SetParallelism(parallelism)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					id := sequence.Add(1)
+					if _, err := server.Execute(context.Background(), ExecuteRequest{
+						RequestID: strconv.FormatUint(id, 10), SQL: "INSERT INTO bench(id) VALUES (?)", Args: []any{int64(id)},
+					}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.StopTimer()
+			slots := cluster.cores["n1"].Tip() - before
+			if slots != 0 {
+				b.ReportMetric(float64(b.N)/float64(slots), "commands/slot")
+			}
+		})
+	}
+}
+
+func BenchmarkCertifiedThreePeerSQLExecute(b *testing.B) {
+	for _, parallelism := range []int{2, 8, 32} {
+		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {
+			cluster := newInMemoryThreePeerCluster(b, false)
+			proposer := cluster.cores["n1"]
+			ingress := cluster.cores["n2"]
+			apply := cluster.servers["n2"].applyDecisions
+			propose := func(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+				slot, _, err := proposer.ProposeCertified(ctx, value)
+				if err != nil {
+					return slot, err
+				}
+				decision, ok := proposer.CertifiedValue(slot)
+				if !ok {
+					return slot, errors.New("certified decision unavailable")
+				}
+				if err := ingress.AcceptCertifiedValueForAck(decision); err != nil {
+					return slot, err
+				}
+				if err := proposer.WaitTip(ctx, slot); err != nil {
+					return slot, err
+				}
+				from := ingress.Tip() + 1
+				if from <= slot {
+					missing := make([]quepaxa.DecidedValue, 0, int(slot-from+1))
+					for candidate := from; candidate <= slot; candidate++ {
+						value, ok := proposer.CertifiedValue(candidate)
+						if !ok {
+							return slot, errors.New("catch-up decision unavailable")
+						}
+						missing = append(missing, value)
+					}
+					if err := ingress.AcceptCertifiedValues(missing); err != nil {
+						return slot, err
+					}
+				}
+				return slot, nil
+			}
+			batcher := newSQLBatcher(propose, apply)
+			defer batcher.Close()
+			if _, err := batcher.submit(context.Background(), types.SQLCommand{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY)"}); err != nil {
+				b.Fatal(err)
+			}
+			before := ingress.Tip()
+			var sequence atomic.Uint64
+			b.SetParallelism(parallelism)
+			b.ReportAllocs()
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					id := sequence.Add(1)
+					if _, err := batcher.submit(context.Background(), types.SQLCommand{
+						RequestID: strconv.FormatUint(id, 10), SQL: "INSERT INTO bench(id) VALUES (?)", Args: []any{int64(id)},
+					}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.StopTimer()
+			slots := ingress.Tip() - before
+			if slots != 0 {
+				b.ReportMetric(float64(b.N)/float64(slots), "commands/slot")
+			}
+		})
+	}
 }
 
 func (c requestIDRaceCluster) applyAvailable(t *testing.T) {

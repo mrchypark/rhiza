@@ -38,30 +38,39 @@ const (
 	notificationSubscriberLimit = 64
 	notificationQueueDepth      = 1
 	notificationDispatchDepth   = 64
+	recentSQLReceiptLimit       = 4096
+	// ponytail: fixed-size epochs bound memory; saturation only adds SQLite fallbacks.
+	sqlReceiptBloomBytes = 4 << 20
 )
 
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
 type Materializer struct {
-	db                *sql.DB
-	writer            *sql.DB
-	readers           []*sql.DB
-	mu                sync.RWMutex
-	tip               uint64
-	stateTip          uint64
-	tipHash           [32]byte
-	dbPath            string
-	readersN          int
-	idempotencyWindow uint64
-	graph             *graphState
-	notifyMu          sync.Mutex
-	nextSub           uint64
-	subs              map[uint64]notificationSubscription
-	notifyQueue       chan pendingNotification
-	notifyStop        chan struct{}
-	notifyStopOnce    sync.Once
-	notifyWG          sync.WaitGroup
-	notifyDrops       atomic.Uint64
+	db                 *sql.DB
+	writer             *sql.DB
+	readers            []*sql.DB
+	mu                 sync.RWMutex
+	tip                uint64
+	stateTip           uint64
+	tipHash            [32]byte
+	dbPath             string
+	readersN           int
+	idempotencyWindow  uint64
+	recentSQLReceipts  map[string]storedReceipt
+	pendingSQLReceipts []pendingSQLReceipt
+	sqlReceipts        sqlReceiptBloom
+	graph              *graphState
+	notifyMu           sync.Mutex
+	nextSub            uint64
+	subs               map[uint64]notificationSubscription
+	notifyQueue        chan pendingNotification
+	notifyStop         chan struct{}
+	notifyStopOnce     sync.Once
+	notifyWG           sync.WaitGroup
+	notifyDrops        atomic.Uint64
+	walCheckpointStop  chan struct{}
+	walCheckpointOnce  sync.Once
+	walCheckpointWG    sync.WaitGroup
 }
 
 type notificationSubscription struct {
@@ -126,7 +135,7 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
-	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)"
+	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)"
 	readerDSN := fileURL + "?mode=ro&_pragma=busy_timeout(5000)"
 
 	// Open main database for metadata
@@ -162,9 +171,11 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		dbPath:            dbPath,
 		readersN:          readerCount,
 		idempotencyWindow: window,
+		recentSQLReceipts: make(map[string]storedReceipt),
 		subs:              make(map[uint64]notificationSubscription),
 		notifyQueue:       make(chan pendingNotification, notificationDispatchDepth),
 		notifyStop:        make(chan struct{}),
+		walCheckpointStop: make(chan struct{}),
 	}
 	m.notifyWG.Add(1)
 	go m.runNotifications()
@@ -178,12 +189,18 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		m.Close()
 		return nil, fmt.Errorf("load applied slot: %w", err)
 	}
+	if err := m.loadSQLReceiptBloom(); err != nil {
+		m.Close()
+		return nil, fmt.Errorf("load SQL receipts: %w", err)
+	}
 	graph, err := openGraph(filepath.Join(filepath.Dir(dbPath), "latticedb"), m.tip, window)
 	if err != nil {
 		m.Close()
 		return nil, fmt.Errorf("open graph materializer: %w", err)
 	}
 	m.graph = graph
+	m.walCheckpointWG.Add(1)
+	go m.runSQLiteCheckpoints()
 
 	return m, nil
 }
@@ -324,6 +341,86 @@ type storedReceipt struct {
 	receipt     types.MutationReceipt
 }
 
+type sqlReceiptBloomEpoch struct {
+	epoch uint64
+	valid bool
+	bits  []byte
+}
+
+type sqlReceiptBloom struct {
+	epochs [2]sqlReceiptBloomEpoch
+	window uint64
+}
+
+func (b *sqlReceiptBloom) add(requestID string, slot uint64) {
+	epoch := slot / b.window
+	filter := &b.epochs[epoch%uint64(len(b.epochs))]
+	if !filter.valid || filter.epoch != epoch {
+		if filter.bits == nil {
+			filter.bits = make([]byte, sqlReceiptBloomBytes)
+		} else {
+			clear(filter.bits)
+		}
+		filter.epoch, filter.valid = epoch, true
+	}
+	hash := sha256.Sum256([]byte(requestID))
+	for i := range 3 {
+		bit := bloomBit(hash, i)
+		filter.bits[bit>>3] |= 1 << (bit & 7)
+	}
+}
+
+func (b *sqlReceiptBloom) mightContain(requestID string, tip uint64) bool {
+	epoch := tip / b.window
+	hash := sha256.Sum256([]byte(requestID))
+	for i := range b.epochs {
+		filter := &b.epochs[i]
+		if !filter.valid || filter.epoch > epoch || epoch-filter.epoch > 1 {
+			continue
+		}
+		found := true
+		for j := range 3 {
+			bit := bloomBit(hash, j)
+			if filter.bits[bit>>3]&(1<<(bit&7)) == 0 {
+				found = false
+				break
+			}
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+func bloomBit(hash [32]byte, index int) uint32 {
+	offset := index * 4
+	value := uint32(hash[offset]) | uint32(hash[offset+1])<<8 | uint32(hash[offset+2])<<16 | uint32(hash[offset+3])<<24
+	return value & (sqlReceiptBloomBytes*8 - 1)
+}
+
+func (m *Materializer) loadSQLReceiptBloom() error {
+	m.sqlReceipts.window = m.idempotencyWindow
+	floor := uint64(0)
+	if m.tip >= m.idempotencyWindow {
+		floor = m.tip - m.idempotencyWindow + 1
+	}
+	rows, err := m.db.Query(`SELECT request_id, commit_slot FROM _rhiza_idempotency WHERE kind = ? AND commit_slot >= ?`, types.MutationSQL, floor)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var requestID string
+		var slot uint64
+		if err := rows.Scan(&requestID, &slot); err != nil {
+			return err
+		}
+		m.sqlReceipts.add(requestID, slot)
+	}
+	return rows.Err()
+}
+
 func scanReceipt(scanner interface{ Scan(...any) error }, window uint64) (storedReceipt, error) {
 	var record storedReceipt
 	var fingerprint []byte
@@ -394,6 +491,49 @@ func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, req
 	return err
 }
 
+func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, kind types.MutationKind, receipts []pendingSQLReceipt) (bool, error) {
+	if len(receipts) == 1 {
+		pending := receipts[0]
+		receipt := pending.record.receipt
+		result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+		if err != nil {
+			return false, err
+		}
+		rows, err := result.RowsAffected()
+		return rows == 1, err
+	}
+	const receiptArgs = 9
+	if len(receipts) > MaxSQLArgs/receiptArgs {
+		for len(receipts) != 0 {
+			n := min(len(receipts), MaxSQLArgs/receiptArgs)
+			inserted, err := insertReceiptsIfAbsent(ctx, tx, prepared, kind, receipts[:n])
+			if err != nil || !inserted {
+				return inserted, err
+			}
+			receipts = receipts[n:]
+		}
+		return true, nil
+	}
+	var query strings.Builder
+	query.WriteString(`INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES `)
+	args := make([]any, 0, len(receipts)*receiptArgs)
+	for i, pending := range receipts {
+		if i != 0 {
+			query.WriteByte(',')
+		}
+		query.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		receipt := pending.record.receipt
+		args = append(args, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+	}
+	query.WriteString(` ON CONFLICT(kind, request_id) DO NOTHING`)
+	result, err := execPrepared(ctx, tx, prepared, query.String(), args...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == int64(len(receipts)), err
+}
+
 func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64) error {
 	if tip <= m.idempotencyWindow {
 		return nil
@@ -406,6 +546,11 @@ func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64
 type pendingNotification struct {
 	topic   string
 	payload []byte
+}
+
+type pendingSQLReceipt struct {
+	requestID string
+	record    storedReceipt
 }
 
 // Apply applies one decided value.
@@ -428,8 +573,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
 	defer tx.Rollback()
+	statements := make(map[string]*sql.Stmt)
+	defer func() {
+		for _, statement := range statements {
+			statement.Close()
+		}
+	}()
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
 	pending := make([]pendingNotification, 0)
+	m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
 	for _, decision := range decisions {
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
@@ -445,7 +597,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, tx, slot, decision.Value, hash, oldTip, &pending); err != nil {
+		if err := m.applyValueLocked(ctx, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -454,6 +606,19 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return fmt.Errorf("commit apply batch: %w", err)
+	}
+	for _, pending := range m.pendingSQLReceipts {
+		m.sqlReceipts.add(pending.requestID, pending.record.receipt.Slot)
+	}
+	pendingReceipts := m.pendingSQLReceipts
+	if len(pendingReceipts) > recentSQLReceiptLimit {
+		pendingReceipts = pendingReceipts[len(pendingReceipts)-recentSQLReceiptLimit:]
+	}
+	if len(m.recentSQLReceipts)+len(pendingReceipts) > recentSQLReceiptLimit {
+		clear(m.recentSQLReceipts)
+	}
+	for _, pending := range pendingReceipts {
+		m.recentSQLReceipts[pending.requestID] = pending.record
 	}
 	for _, notification := range pending {
 		m.enqueueNotification(notification)
@@ -473,6 +638,30 @@ func (m *Materializer) runNotifications() {
 	}
 }
 
+func (m *Materializer) runSQLiteCheckpoints() {
+	defer m.walCheckpointWG.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.walCheckpointStop:
+			return
+		case <-ticker.C:
+			m.mu.RLock()
+			db := m.db
+			m.mu.RUnlock()
+			if db != nil {
+				_, _ = db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+			}
+		}
+	}
+}
+
+func (m *Materializer) stopSQLiteCheckpoints() {
+	m.walCheckpointOnce.Do(func() { close(m.walCheckpointStop) })
+	m.walCheckpointWG.Wait()
+}
+
 func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	select {
 	case m.notifyQueue <- notification:
@@ -481,7 +670,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -568,6 +757,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 	} else if !batched {
 		commands = []types.SQLCommand{{SQL: string(value)}}
 	}
+	pendingStart := len(m.pendingSQLReceipts)
 	for _, command := range commands {
 		if err := ValidateSQLCommand(command); err != nil {
 			return fmt.Errorf("validate SQL request %q: %w", command.RequestID, err)
@@ -577,24 +767,43 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 			return fmt.Errorf("encode SQL request %q: %w", command.RequestID, err)
 		}
 		if command.RequestID != "" {
-			_, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID)
-			if err != nil {
-				return fmt.Errorf("check SQL request %q: %w", command.RequestID, err)
+			duplicate := false
+			for _, pending := range m.pendingSQLReceipts[pendingStart:] {
+				if pending.requestID == command.RequestID {
+					duplicate = true
+					break
+				}
 			}
-			if found {
+			if duplicate {
 				continue
 			}
+			mightExist := m.sqlReceipts.mightContain(command.RequestID, m.tip)
+			if !mightExist {
+				for _, pending := range m.pendingSQLReceipts[:pendingStart] {
+					if pending.requestID == command.RequestID {
+						mightExist = true
+						break
+					}
+				}
+			}
+			if mightExist {
+				if _, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID); err != nil {
+					return err
+				} else if found {
+					continue
+				}
+			}
 		}
-		if _, err := tx.ExecContext(ctx, "SAVEPOINT rhiza_command"); err != nil {
+		if _, err := execPrepared(ctx, tx, statements, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
-		result, executeErr := executeSQLCommand(ctx, tx, command)
+		result, executeErr := executeSQLCommand(ctx, tx, statements, command)
 		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted}
 		if executeErr != nil {
 			if command.RequestID == "" {
 				return executeErr
 			}
-			if _, err := tx.ExecContext(ctx, "ROLLBACK TO rhiza_command"); err != nil {
+			if _, err := execPrepared(ctx, tx, statements, "ROLLBACK TO rhiza_command"); err != nil {
 				return err
 			}
 			receipt.Status = types.MutationRejected
@@ -605,26 +814,33 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, slot ui
 				receipt.LastInsertID = statement.LastInsertID
 			}
 		}
-		if _, err := tx.ExecContext(ctx, "RELEASE rhiza_command"); err != nil {
+		if command.RequestID != "" {
+			receipt.RetryThroughSlot = slot + m.idempotencyWindow - 1
+			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
+		}
+		if _, err := execPrepared(ctx, tx, statements, "RELEASE rhiza_command"); err != nil {
 			return err
 		}
-		if command.RequestID != "" {
-			if err := insertReceipt(ctx, tx, types.MutationSQL, command.RequestID, fingerprint, receipt); err != nil {
-				return fmt.Errorf("record SQL request %q: %w", command.RequestID, err)
-			}
+	}
+	pendingReceipts := m.pendingSQLReceipts[pendingStart:]
+	if len(pendingReceipts) != 0 {
+		inserted, err := insertReceiptsIfAbsent(ctx, tx, statements, types.MutationSQL, pendingReceipts)
+		if err != nil {
+			return fmt.Errorf("record SQL receipts: %w", err)
+		}
+		if !inserted {
+			return fmt.Errorf("SQL request appeared during apply")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, strconv.FormatUint(slot, 10)); err != nil {
-		return fmt.Errorf("persist applied slot: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, hex.EncodeToString(hash[:])); err != nil {
-		return fmt.Errorf("persist applied hash: %w", err)
-	}
+	slotValue := strconv.FormatUint(slot, 10)
+	hashValue := hex.EncodeToString(hash[:])
 	if mutatesState {
-		if _, err := tx.ExecContext(ctx, `UPDATE _rhiza_meta SET value = ? WHERE key = 'state_slot'`, strconv.FormatUint(slot, 10)); err != nil {
-			return fmt.Errorf("persist state slot: %w", err)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?), ('state_slot', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue, slotValue); err != nil {
+			return fmt.Errorf("persist applied state: %w", err)
 		}
 		m.stateTip = slot
+	} else if _, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', ?), ('applied_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, slotValue, hashValue); err != nil {
+		return fmt.Errorf("persist applied position: %w", err)
 	}
 	if publish {
 		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: notifyCommand.Payload})
@@ -875,7 +1091,7 @@ func validatePublicSQL(query string) error {
 	return nil
 }
 
-func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand) (types.SQLCommandResult, error) {
+func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
 	statements := command.Statements
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
@@ -891,31 +1107,24 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 			}
 			args[i] = value
 		}
+		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
+		if err != nil {
+			return result, err
+		}
 		if statement.WantRows {
-			prepared, err := tx.PrepareContext(ctx, statement.SQL)
+			rows, err := query.QueryContext(ctx, args...)
 			if err != nil {
-				return result, err
-			}
-			rows, err := prepared.QueryContext(ctx, args...)
-			if err != nil {
-				prepared.Close()
 				return result, err
 			}
 			statementResult, err := collectRowsWithBudget(rows, &budget)
 			rows.Close()
-			prepared.Close()
 			if err != nil {
 				return result, err
 			}
 			result.Statements = append(result.Statements, statementResult)
 			continue
 		}
-		prepared, err := tx.PrepareContext(ctx, statement.SQL)
-		if err != nil {
-			return result, err
-		}
-		execResult, err := prepared.ExecContext(ctx, args...)
-		prepared.Close()
+		execResult, err := query.ExecContext(ctx, args...)
 		if err != nil {
 			return result, err
 		}
@@ -932,6 +1141,25 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, command types.SQLCommand
 		return result, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
 	}
 	return result, nil
+}
+
+func preparedStatement(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, query string) (*sql.Stmt, error) {
+	if statement := prepared[query]; statement != nil {
+		return statement, nil
+	}
+	statement, err := tx.PrepareContext(ctx, query)
+	if err == nil {
+		prepared[query] = statement
+	}
+	return statement, err
+}
+
+func execPrepared(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, query string, args ...any) (sql.Result, error) {
+	statement, err := preparedStatement(ctx, tx, prepared, query)
+	if err != nil {
+		return nil, err
+	}
+	return statement.ExecContext(ctx, args...)
 }
 
 func sqlArg(arg any) (any, error) {
@@ -1068,6 +1296,48 @@ func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLC
 	}
 	matches, _, err := m.requestMatches(ctx, types.MutationSQL, command.RequestID, fingerprint)
 	return matches, err
+}
+
+// SQLRequestStatus returns the retained receipt and fingerprint match.
+func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCommand) (types.MutationReceipt, bool, bool, error) {
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	return m.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
+}
+
+// SQLRequestStatusFingerprint returns the retained receipt for a precomputed fingerprint.
+func (m *Materializer) SQLRequestStatusFingerprint(ctx context.Context, requestID string, fingerprint [32]byte) (types.MutationReceipt, bool, bool, error) {
+	m.mu.RLock()
+	record, cached := m.recentSQLReceipts[requestID]
+	tip := m.tip
+	mightContain := m.sqlReceipts.mightContain(requestID, tip)
+	m.mu.RUnlock()
+	if cached {
+		if tip > record.receipt.RetryThroughSlot {
+			return types.MutationReceipt{}, false, true, nil
+		}
+		return record.receipt, true, record.fingerprint == fingerprint, nil
+	}
+	if !mightContain {
+		return types.MutationReceipt{}, false, true, nil
+	}
+	reader, err := m.reader()
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, requestID), m.idempotencyWindow)
+	if err == sql.ErrNoRows {
+		return types.MutationReceipt{}, false, true, nil
+	}
+	if err != nil {
+		return types.MutationReceipt{}, false, false, err
+	}
+	if m.Tip() > record.receipt.RetryThroughSlot {
+		return types.MutationReceipt{}, false, true, nil
+	}
+	return record.receipt, true, record.fingerprint == fingerprint, nil
 }
 
 // Query executes a read query.
@@ -1667,8 +1937,11 @@ func (m *Materializer) reopen() error {
 }
 
 func (m *Materializer) adopt(source *Materializer) {
+	source.stopSQLiteCheckpoints()
 	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
 	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
+	m.recentSQLReceipts = source.recentSQLReceipts
+	m.sqlReceipts = source.sqlReceipts
 	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
 	_ = source.Close()
 }
@@ -1689,6 +1962,7 @@ func (m *Materializer) StateTip() uint64 {
 
 // Close closes all connections.
 func (m *Materializer) Close() error {
+	m.stopSQLiteCheckpoints()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.notifyStopOnce.Do(func() { close(m.notifyStop) })

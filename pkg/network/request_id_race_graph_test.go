@@ -121,7 +121,7 @@ func TestCrossIngressGraphRequestIDConflictDoesNotBlockApply(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		server := NewServer(core, material, "cluster", true, nil, members, 0)
+		server := NewServer(core, material, "cluster", true, nil)
 		cores[member.ID], materials[member.ID], servers[member.ID] = core, material, server
 		transport.mu.Lock()
 		transport.cores[member.ID] = core

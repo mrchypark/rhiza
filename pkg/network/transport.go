@@ -24,6 +24,8 @@ const peerALPN = "rhiza-peer"
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
 
+var errPeerRejected = errors.New("peer rejected request")
+
 type peerConnection struct {
 	mu     sync.Mutex
 	gate   chan struct{}
@@ -183,6 +185,16 @@ func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb
 func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool, timeout time.Duration) (*peerfb.ResponseT, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	return t.callContext(ctx, to, request, waitHandshake)
+}
+
+// callQuorum sends one asynchronous quorum attempt. A failed recorder does not
+// need an in-phase retry: the enclosing quorum completes from other replies.
+func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
+	return t.callContext(ctx, to, request, waitHandshake)
+}
+
+func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
 	waitHandshake = waitHandshake || !allows0RTT(request.Operation)
 	for retried0RTT := false; ; {
 		conn, err := t.connection(ctx, to, waitHandshake)
@@ -190,8 +202,8 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 			return nil, err
 		}
 		response, err := t.callConnection(ctx, conn, request)
-		t.release(to, conn)
 		if errors.Is(err, quic.Err0RTTRejected) && !retried0RTT {
+			t.release(to, conn)
 			// The early stream was discarded, not executed. Promote this same
 			// connection to 1-RTT and replay the request once within its original
 			// deadline. This prevents a peer restart from consuming one whole
@@ -203,16 +215,24 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 			retried0RTT = true
 			continue
 		}
+		if err != nil && response == nil {
+			t.invalidate(to, conn)
+		}
+		t.release(to, conn)
 		if response != nil {
 			switch response.ErrorCode {
 			case peerErrorQuorum:
 				return nil, quepaxa.ErrQuorumUnavailable
 			case peerErrorCompacted:
 				return nil, quepaxa.ErrCompacted
+			case peerErrorRetryable:
+				return nil, err
 			}
 		}
 		if err != nil {
-			t.invalidate(to, conn)
+			if response != nil {
+				return nil, fmt.Errorf("%w: %v", errPeerRejected, err)
+			}
 			return nil, err
 		}
 		return response, nil
@@ -303,7 +323,11 @@ func (t *Transport) invalidate(to quepaxa.NodeID, conn *quic.Conn) {
 	if peer.conn == conn {
 		peer.conn = nil
 	}
+	idle := peer.active[conn] == 0
 	peer.mu.Unlock()
+	if idle {
+		_ = conn.CloseWithError(0, "reconnect")
+	}
 }
 
 func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {
@@ -344,7 +368,7 @@ func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, f
 func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	req := t.request(peerfb.OperationRecord)
 	req.Record = &peerfb.RecordRequestT{Slot: uint64(request.Slot), Step: uint64(request.Step), Proposal: proposalToWire(request.Proposal)}
-	response, err := t.call(ctx, to, req, false)
+	response, err := t.callQuorum(ctx, to, req, false)
 	if err != nil {
 		return quepaxa.Summary{}, err
 	}
@@ -353,16 +377,6 @@ func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request q
 		err = fmt.Errorf("recorder identity mismatch: want %s got %s", to, summary.RecorderID)
 	}
 	return summary, err
-}
-
-func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
-	req := t.request(peerfb.OperationPropose)
-	req.Value = value
-	response, err := t.call(ctx, to, req, true)
-	if err != nil {
-		return quepaxa.DecidedValue{}, err
-	}
-	return decidedFromWire(response.Decided)
 }
 
 func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {
@@ -378,7 +392,7 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 		go func(member quepaxa.Member) {
 			req := t.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
-			_, err := t.call(callCtx, member.ID, req, false)
+			_, err := t.callQuorum(callCtx, member.ID, req, false)
 			results <- err
 		}(member)
 	}
@@ -402,8 +416,17 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 	return quepaxa.ErrQuorumUnavailable
 }
 
+func decisionHasRecorder(decision quepaxa.Decision, id quepaxa.NodeID) bool {
+	for _, summary := range decision.Summaries {
+		if summary.RecorderID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
-	response, err := t.call(ctx, to, t.request(peerfb.OperationReadIndex), false)
+	response, err := t.callQuorum(ctx, to, t.request(peerfb.OperationReadIndex), false)
 	if err != nil {
 		return 0, err
 	}
