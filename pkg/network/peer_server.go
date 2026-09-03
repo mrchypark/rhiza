@@ -27,6 +27,7 @@ const (
 	maxPeerStreams     = 1024
 	peerErrorQuorum    = 1
 	peerErrorCompacted = 2
+	peerErrorRetryable = 3
 )
 
 // PeerServer owns the private QUIC listener. Public HTTP remains a separate adapter.
@@ -151,6 +152,8 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			response.ErrorCode = peerErrorQuorum
 		case errors.Is(err, quepaxa.ErrCompacted):
 			response.ErrorCode = peerErrorCompacted
+		case errors.Is(err, ErrNotReady), errors.Is(err, ErrOverloaded):
+			response.ErrorCode = peerErrorRetryable
 		}
 	}
 	if writeErr := writePeerFrame(stream, encodePeerResponse(response)); writeErr != nil {
