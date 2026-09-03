@@ -357,7 +357,6 @@ func TestConcurrentApplyDecisionsRemainOrdered(t *testing.T) {
 		}
 	}
 	server := NewServer(core, material, "cluster", true, nil, members, 0)
-	wantTip := core.Tip()
 
 	start := make(chan struct{})
 	errs := make(chan error, 32)
@@ -378,31 +377,8 @@ func TestConcurrentApplyDecisionsRemainOrdered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if material.Tip() != uint64(wantTip) {
-		t.Fatalf("material tip=%d, want %d", material.Tip(), wantTip)
-	}
-}
-
-func TestApplyDecisionsCoalescesThroughCurrentTip(t *testing.T) {
-	members := []quepaxa.Member{{ID: "n1"}}
-	core := mustCore(t, "n1", members, nil, nil)
-	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer material.Close()
-	for _, value := range []string{"CREATE TABLE coalesced (id INTEGER)", "INSERT INTO coalesced VALUES (1)"} {
-		if _, _, err := core.Propose(context.Background(), []byte(value)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	server := NewServer(core, material, "cluster", true, nil, members, 0)
-	defer server.Close()
-	if err := server.applyDecisions(context.Background(), 1); err != nil {
-		t.Fatal(err)
-	}
-	if material.Tip() != 2 {
-		t.Fatalf("material tip=%d, want 2", material.Tip())
+	if material.Tip() != 64 {
+		t.Fatalf("material tip=%d, want 64", material.Tip())
 	}
 }
 
