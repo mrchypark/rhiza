@@ -368,10 +368,10 @@ func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte
 func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan error, len(decision.Summaries))
+	results := make(chan error, len(t.members)-1)
 	pending := 0
 	for _, member := range t.members {
-		if member.ID == t.localID || !decisionHasRecorder(decision, member.ID) {
+		if member.ID == t.localID {
 			continue
 		}
 		pending++
