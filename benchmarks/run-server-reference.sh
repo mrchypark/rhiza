@@ -107,7 +107,7 @@ if [[ $failed_role != none ]]; then
 fi
 result=$("$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
-	-n "$requests" -c "$concurrency")
+	-n "$requests" -c "$concurrency" -commit-unknown-retries 3)
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null
 count=$(curl -fsS -H 'Content-Type: application/json' \

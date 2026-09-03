@@ -21,6 +21,7 @@ type result struct {
 	Requests         int               `json:"requests"`
 	Successes        int               `json:"successes"`
 	Errors           uint64            `json:"errors"`
+	Retries          uint64            `json:"retries,omitempty"`
 	DurationMS       float64           `json:"duration_ms"`
 	OpsPerSec        float64           `json:"ops_per_sec"`
 	SuccessOpsPerSec float64           `json:"success_ops_per_sec"`
@@ -42,9 +43,10 @@ func main() {
 	requests := flag.Int("n", 1000, "request count")
 	concurrency := flag.Int("c", 16, "worker count")
 	timeout := flag.Duration("timeout", 30*time.Second, "request timeout")
+	commitUnknownRetries := flag.Int("commit-unknown-retries", 0, "maximum same-request retries after commit_unknown")
 	flag.Parse()
-	if *requests < 1 || *concurrency < 1 || *concurrency > *requests {
-		fmt.Fprintln(os.Stderr, "invalid request count or concurrency")
+	if *requests < 1 || *concurrency < 1 || *concurrency > *requests || *commitUnknownRetries < 0 {
+		fmt.Fprintln(os.Stderr, "invalid request count, concurrency, or commit-unknown retry count")
 		os.Exit(2)
 	}
 
@@ -56,6 +58,7 @@ func main() {
 	errorLatencies := make([]time.Duration, 0)
 	var latencyMu sync.Mutex
 	var failures atomic.Uint64
+	var retries atomic.Uint64
 	var transportFailures atomic.Uint64
 	var statuses [600]atomic.Uint64
 	errorSamples := make(map[int]string)
@@ -70,55 +73,32 @@ func main() {
 			for id := range jobs {
 				payload := strings.ReplaceAll(*body, "{{id}}", strconv.Itoa(id))
 				method := http.MethodGet
-				var reader io.Reader
 				if payload != "" {
-					method, reader = http.MethodPost, bytes.NewBufferString(payload)
-				}
-				request, err := http.NewRequestWithContext(ctx, method, *baseURL+*requestPath, reader)
-				if err != nil {
-					failures.Add(1)
-					transportFailures.Add(1)
-					continue
-				}
-				if payload != "" {
-					request.Header.Set("Content-Type", "application/json")
+					method = http.MethodPost
 				}
 				begin := time.Now()
-				response, err := client.Do(request)
+				status, sample, retryCount, requestErr := doRequest(ctx, client, method, *baseURL+*requestPath, payload, *commitUnknownRetries)
+				retries.Add(uint64(retryCount))
 				elapsed := time.Since(begin)
-				if err != nil {
-					failures.Add(1)
-					transportFailures.Add(1)
-					latencyMu.Lock()
-					errorLatencies = append(errorLatencies, elapsed)
-					latencyMu.Unlock()
-					continue
-				}
-				var copyErr error
-				if response.StatusCode >= 200 && response.StatusCode < 300 {
-					_, copyErr = io.Copy(io.Discard, response.Body)
-				} else {
-					var sample []byte
-					sample, copyErr = io.ReadAll(io.LimitReader(response.Body, 4096))
+				if status < 200 || status >= 300 {
 					if text := strings.TrimSpace(string(sample)); text != "" {
 						errorSamplesMu.Lock()
-						if _, exists := errorSamples[response.StatusCode]; !exists {
-							errorSamples[response.StatusCode] = text
+						if _, exists := errorSamples[status]; !exists {
+							errorSamples[status] = text
 						}
 						errorSamplesMu.Unlock()
 					}
 				}
-				response.Body.Close()
-				if copyErr != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
+				if requestErr != nil || status < 200 || status >= 300 {
 					failures.Add(1)
-					if copyErr != nil {
+					if requestErr != nil {
 						transportFailures.Add(1)
 					}
 					latencyMu.Lock()
 					errorLatencies = append(errorLatencies, elapsed)
 					latencyMu.Unlock()
-					if response.StatusCode >= 0 && response.StatusCode < len(statuses) {
-						statuses[response.StatusCode].Add(1)
+					if status >= 0 && status < len(statuses) {
+						statuses[status].Add(1)
 					}
 				} else {
 					latencyMu.Lock()
@@ -157,7 +137,7 @@ func main() {
 		samples["http_"+strconv.Itoa(status)] = sample
 	}
 	output := result{
-		Requests: *requests, Successes: len(latencies), Errors: failures.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
+		Requests: *requests, Successes: len(latencies), Errors: failures.Load(), Retries: retries.Load(), DurationMS: float64(duration) / float64(time.Millisecond),
 		OpsPerSec: float64(*requests) / duration.Seconds(), SuccessOpsPerSec: float64(len(latencies)) / duration.Seconds(), P50MS: quantile(latencies, .50), P95MS: quantile(latencies, .95),
 		P99MS: quantile(latencies, .99), MaxMS: quantile(latencies, 1), ErrorP50MS: quantile(errorLatencies, .50),
 		ErrorP95MS: quantile(errorLatencies, .95), ErrorP99MS: quantile(errorLatencies, .99), ErrorKinds: errorKinds, ErrorSamples: samples,
@@ -166,4 +146,40 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func doRequest(ctx context.Context, client *http.Client, method, url, payload string, maxRetries int) (int, []byte, int, error) {
+	for retries := 0; ; retries++ {
+		request, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBufferString(payload))
+		if err != nil {
+			return 0, nil, retries, err
+		}
+		if payload != "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return 0, nil, retries, err
+		}
+		var body []byte
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			_, err = io.Copy(io.Discard, response.Body)
+		} else {
+			body, err = io.ReadAll(io.LimitReader(response.Body, 4096))
+		}
+		response.Body.Close()
+		if err != nil || !isCommitUnknown(response.StatusCode, body) || retries == maxRetries {
+			return response.StatusCode, body, retries, err
+		}
+	}
+}
+
+func isCommitUnknown(status int, body []byte) bool {
+	if status != http.StatusServiceUnavailable {
+		return false
+	}
+	var response struct {
+		Code string `json:"code"`
+	}
+	return json.Unmarshal(body, &response) == nil && response.Code == "commit_unknown"
 }

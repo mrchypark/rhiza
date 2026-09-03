@@ -216,16 +216,18 @@ jobs:
           rhiza_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
           rhiza_non_leader_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json")
           rhiza_non_leader_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json")
+          rhiza_non_leader_retries=$(jq -r '.result.retries // 0' "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json")
           rhiza_leader_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json")
           rhiza_leader_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json")
+          rhiza_leader_retries=$(jq -r '.result.retries // 0' "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json")
           rhiza_non_leader_retention=$(awk -v fault="$rhiza_non_leader_ops" -v healthy="$rhiza_ops" 'BEGIN { printf "%.1f", fault * 100 / healthy }')
           rhiza_leader_retention=$(awk -v fault="$rhiza_leader_ops" -v healthy="$rhiza_ops" 'BEGIN { printf "%.1f", fault * 100 / healthy }')
           # shellcheck disable=SC2016
           {
             printf '\n## Rhiza real-server reference\n\n'
             printf 'Power-loss-durable three-voter HTTP/QUIC workload: `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
-            printf 'Non-leader unavailable: `%s ops/s`, p99 `%s ms` (`%s%%` of healthy).\n\n' "$rhiza_non_leader_ops" "$rhiza_non_leader_p99" "$rhiza_non_leader_retention"
-            printf 'Leader unavailable: `%s ops/s`, p99 `%s ms` (`%s%%` of healthy).\n\n' "$rhiza_leader_ops" "$rhiza_leader_p99" "$rhiza_leader_retention"
+            printf 'Non-leader unavailable: `%s ops/s`, p99 `%s ms`, `%s` commit-unknown retries (`%s%%` of healthy).\n\n' "$rhiza_non_leader_ops" "$rhiza_non_leader_p99" "$rhiza_non_leader_retries" "$rhiza_non_leader_retention"
+            printf 'Leader unavailable: `%s ops/s`, p99 `%s ms`, `%s` commit-unknown retries (`%s%%` of healthy).\n\n' "$rhiza_leader_ops" "$rhiza_leader_p99" "$rhiza_leader_retries" "$rhiza_leader_retention"
             printf 'Uses `-c 16 -n 100000`; every row is verified by a linearizable query.\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
