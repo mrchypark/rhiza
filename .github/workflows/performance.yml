@@ -74,8 +74,12 @@ jobs:
             base_sha=$PUSH_BASE_SHA
             baseline_mode=previous-main
           else
-            git fetch --no-tags origin "$INPUT_BASE_REF"
-            base_sha=$(git rev-parse FETCH_HEAD)
+            if base_sha=$(git rev-parse --verify "$INPUT_BASE_REF^{commit}" 2>/dev/null); then
+              :
+            else
+              git fetch --no-tags origin "$INPUT_BASE_REF"
+              base_sha=$(git rev-parse FETCH_HEAD)
+            fi
             baseline_mode=workflow-dispatch
           fi
           git cat-file -e "$base_sha^{commit}"
