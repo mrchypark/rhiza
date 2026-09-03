@@ -59,11 +59,17 @@ func TestSQLServer(t *testing.T) {
 		t.Fatalf("unexpected query result: %+v", got)
 	}
 
-	postStatus(t, "/sql/execute", map[string]any{
-		"request_id": "unsupported-rows-" + suffix,
-		"sql":        "INSERT INTO " + table + " (id, name) VALUES (99, 'unsupported')",
-		"want_rows":  true,
-	}, http.StatusBadRequest)
+	var returning struct {
+		mutationReceipt
+		Statements []queryResponse `json:"statements"`
+	}
+	post(t, "/sql/execute-returning", map[string]any{
+		"request_id": "returning-" + suffix,
+		"sql":        "INSERT INTO " + table + " (id, name) VALUES (99, 'returning') RETURNING id, name",
+	}, &returning)
+	if returning.Status != "committed" || len(returning.Statements) != 1 || len(returning.Statements[0].Rows) != 1 || returning.Statements[0].Rows[0][0] != float64(99) || returning.Statements[0].Rows[0][1] != "returning" {
+		t.Fatalf("returning result: %+v", returning)
+	}
 
 	var transaction mutationReceipt
 	post(t, "/sql/transaction", map[string]any{
