@@ -21,6 +21,14 @@ fi
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
 container="rhiza-bench-minio-$$"
+on_error() {
+	local code=$?
+	for log in "$run_dir"/node-*.log; do
+		[[ -f $log ]] || continue
+		cp "$log" "$(dirname "$output_file")/rhiza-server-$(basename "$log")"
+	done
+	return "$code"
+}
 cleanup() {
 	for pid_file in "$run_dir"/node-*.pid; do
 		[[ -f $pid_file ]] || continue
@@ -33,6 +41,7 @@ cleanup() {
 		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
 	esac
 }
+trap on_error ERR
 trap cleanup EXIT
 
 (cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
@@ -82,6 +91,8 @@ curl -fsS -H 'Content-Type: application/json' \
 result=$("$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
 	-n "$requests" -c "$concurrency")
+# Preserve the client result even when the subsequent correctness gate fails.
+tee "$output_file" <<<"$result" >/dev/null
 count=$(curl -fsS -H 'Content-Type: application/json' \
 	-d '{"sql":"SELECT COUNT(*) FROM benchmark_writes","consistency":"linearizable"}' \
 	"$target/sql/query")
