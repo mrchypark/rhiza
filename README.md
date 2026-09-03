@@ -88,9 +88,23 @@ partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
 UPSERT, `RETURNING`, window functions, JSON functions, and FTS5.
 
 Replicated execution rejects explicit transaction control, attachment, and
-known nondeterministic functions. Use `Execute` for one mutation or a prepared
-`Statements` array for an atomic multi-statement transaction. Mutation calls
-return one bounded `MutationReceipt`; use `Query` for result rows.
+known nondeterministic functions. Use `Execute` for one mutation,
+`ExecuteReturning` for bounded mutation rows, `ExecuteReturningOne` when the
+mutation must produce exactly one row, or a prepared `Statements` array for an
+atomic multi-statement transaction. Generic `ExecuteReturningMap` helpers map
+rows through a typed Go callback. A later statement can bind a value
+from the exactly one row of an earlier `WantRows` statement through
+`OutputRefs`, by a unique column name or index. Reference targets use plain `?`
+parameters and must have a matching `null` entry in `Args`. Returned rows and
+idempotency receipts are retained together, so retrying the same request ID
+returns the original result without re-executing the mutation.
+
+`DB.Migrate` applies named, contiguous migration versions starting at 1 through
+the same replicated transaction path. Reapplying an identical migration list
+is a no-op; changing an already-applied version or leaving a gap is an error.
+Migration statements are SQL-only (no arguments, returned rows, or output references). The private
+`_rhiza_migrations` ledger and each migration are committed atomically, and the
+reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
 
 ### Graph and Cypher
 
@@ -149,7 +163,9 @@ durable cursor is required.
 - SQL or Cypher text: 256 KiB.
 - SQL/Cypher arguments: 999.
 - Statements in one SQL transaction: 64.
-- Query result rows: 10,000.
+- SQL query or `RETURNING` result rows: 10,000.
+- SQL query result size: 16 MiB total; replicated `RETURNING` result size: 1
+  MiB total. Each cell is limited to 1 MiB.
 - Request IDs: 64 bytes.
 
 An HTTP request below 1 MiB may still exceed the encoded consensus limit.
@@ -160,7 +176,8 @@ Embedded SQL callers can preflight the exact mutation with
 
 The optional adapter exposes:
 
-- SQL: `POST /sql/execute`, `/sql/transaction`, `/sql/query`.
+- SQL: `POST /sql/execute`, `/sql/execute-returning`,
+  `/sql/execute-returning-one`, `/sql/transaction`, `/sql/query`.
 - Graph: `POST /graph/execute`, `/graph/query`, `/graph/changes`.
 - Graph streams: `POST /graph/streams/read`, `POST /graph/streams/offset`,
   `PUT /graph/streams/offset`, and `POST /graph/streams/trim`.

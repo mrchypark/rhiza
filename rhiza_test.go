@@ -445,11 +445,141 @@ func TestEmbeddedGoAPI(t *testing.T) {
 	}
 }
 
+func TestExecuteReturningAndMigrate(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	migrations := []rhiza.Migration{
+		{Version: 1, Name: "items", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE migration_items (id INTEGER PRIMARY KEY, name TEXT)"}}},
+		{Version: 2, Name: "index", Statements: []rhiza.SQLStatement{{SQL: "CREATE INDEX migration_items_name ON migration_items(name)"}}},
+	}
+	if err := db.Migrate(ctx, migrations); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(ctx, migrations); err != nil {
+		t.Fatalf("repeat migration: %v", err)
+	}
+	response, err := db.ExecuteReturning(ctx, rhiza.ExecuteRequest{RequestID: "returning", SQL: "INSERT INTO migration_items(name) VALUES (?) RETURNING id, name", Args: []any{"tea"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := response.Statements[0].Rows[0]; got[0] != int64(1) || got[1] != "tea" {
+		t.Fatalf("returning row=%#v", got)
+	}
+	retry, err := db.ExecuteReturning(ctx, rhiza.ExecuteRequest{RequestID: "returning", SQL: "INSERT INTO migration_items(name) VALUES (?) RETURNING id, name", Args: []any{"tea"}})
+	if err != nil || retry.Slot != response.Slot || fmt.Sprint(retry.Statements) != fmt.Sprint(response.Statements) {
+		t.Fatalf("retry=%+v original=%+v err=%v", retry, response, err)
+	}
+	changed := append([]rhiza.Migration(nil), migrations...)
+	changed[0].Statements = []rhiza.SQLStatement{{SQL: "CREATE TABLE migration_items (id INTEGER PRIMARY KEY)"}}
+	if err := db.Migrate(ctx, changed); err == nil {
+		t.Fatal("changed applied migration was accepted")
+	}
+	withGap := append(append([]rhiza.Migration(nil), migrations...), rhiza.Migration{Version: 4, Name: "later", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE migration_later (id INTEGER)"}}})
+	if err := db.Migrate(ctx, withGap); err == nil {
+		t.Fatal("migration version gap was accepted")
+	}
+	_, err = db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "migration-order-guard", SQL: "INSERT INTO _rhiza_migrations VALUES (3, 'out-of-order', 'invalid')"})
+	if !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("migration ledger was publicly writable: %v", err)
+	}
+	contiguous := append(append([]rhiza.Migration(nil), migrations...), rhiza.Migration{Version: 3, Name: "next", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE migration_next (id INTEGER)"}}})
+	if err := db.Migrate(ctx, contiguous); err != nil {
+		t.Fatalf("contiguous migration failed: %v", err)
+	}
+}
+
+func TestExecuteReturningOneAndTypedMapping(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if response, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "map-schema", SQL: "CREATE TABLE mapped (id INTEGER PRIMARY KEY, name TEXT)"}); err != nil || response.Status != "committed" {
+		t.Fatalf("schema response=%+v err=%v", response, err)
+	}
+	type item struct {
+		ID   int64
+		Name string
+	}
+	response, got, err := rhiza.ExecuteReturningMapOne(ctx, db, rhiza.ExecuteRequest{
+		RequestID: "map-one", SQL: "INSERT INTO mapped(name) VALUES (?) RETURNING id, name", Args: []any{"tea"},
+	}, func(row rhiza.SQLRow) (item, error) {
+		id, err := row.Named("id")
+		if err != nil {
+			return item{}, err
+		}
+		name, err := row.Named("name")
+		if err != nil {
+			return item{}, err
+		}
+		return item{ID: id.(int64), Name: name.(string)}, nil
+	})
+	if err != nil || response.Status != "committed" || got != (item{ID: 1, Name: "tea"}) {
+		t.Fatalf("response=%+v mapped=%+v err=%v", response, got, err)
+	}
+	many, err := db.ExecuteReturningOne(ctx, rhiza.ExecuteRequest{RequestID: "map-many", SQL: "INSERT INTO mapped(name) VALUES ('a'), ('b') RETURNING id"})
+	if err != nil || many.Status != "rejected" {
+		t.Fatalf("multi-row response=%+v err=%v", many, err)
+	}
+	rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT COUNT(*) FROM mapped"})
+	if err != nil || rows.Rows[0][0] != int64(1) {
+		t.Fatalf("multi-row mutation was not rolled back: rows=%#v err=%v", rows.Rows, err)
+	}
+}
+
+func TestMigrateValidatesWholePlanBeforeApplying(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	err = db.Migrate(ctx, []rhiza.Migration{
+		{Version: 2, Name: "would-apply", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE should_not_exist (id INTEGER)"}}},
+		{Version: 1, Name: "out-of-order", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE invalid_order (id INTEGER)"}}},
+	})
+	if err == nil {
+		t.Fatal("out-of-order plan was accepted")
+	}
+	result, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT COUNT(*) FROM sqlite_master WHERE name = 'should_not_exist'"})
+	if err != nil || result.Rows[0][0] != int64(0) {
+		t.Fatalf("invalid plan changed schema: rows=%#v err=%v", result.Rows, err)
+	}
+}
+
+func TestFailedMigrationRollsBackLedger(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	failed := rhiza.Migration{Version: 1, Name: "broken", Statements: []rhiza.SQLStatement{
+		{SQL: "CREATE TABLE migration_retry (id INTEGER)"},
+		{SQL: "CREATE TABLE migration_retry (id INTEGER)"},
+	}}
+	if err := db.Migrate(ctx, []rhiza.Migration{failed}); err == nil {
+		t.Fatal("broken migration succeeded")
+	}
+	corrected := rhiza.Migration{Version: 1, Name: "fixed", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE migration_retry (id INTEGER)"}}}
+	if err := db.Migrate(ctx, []rhiza.Migration{corrected}); err != nil {
+		t.Fatalf("corrected migration could not reuse rolled-back version: %v", err)
+	}
+	if _, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT COUNT(*) FROM migration_retry"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestExecuteContractAndEncodedSizeBoundary(t *testing.T) {
 	if rhiza.MaxReplicatedMutationBytes != 128<<10 || rhiza.MaxHTTPBodyBytes != 1<<20 {
 		t.Fatalf("limits consensus=%d HTTP=%d", rhiza.MaxReplicatedMutationBytes, rhiza.MaxHTTPBodyBytes)
 	}
-	if err := rhiza.ValidateExecuteRequest(rhiza.ExecuteRequest{RequestID: "rows", SQL: "SELECT 1", WantRows: true}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+	if err := rhiza.ValidateExecuteRequest(rhiza.ExecuteRequest{RequestID: "rows", SQL: "INSERT INTO t DEFAULT VALUES RETURNING rowid", WantRows: true}); err != nil {
 		t.Fatalf("want_rows validation error=%v", err)
 	}
 

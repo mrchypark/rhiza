@@ -212,6 +212,8 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 func (s *Server) routes() {
 	// Client API
 	s.mux.HandleFunc("/sql/execute", s.handleExecute)
+	s.mux.HandleFunc("/sql/execute-returning", s.handleExecuteReturning)
+	s.mux.HandleFunc("/sql/execute-returning-one", s.handleExecuteReturningOne)
 	s.mux.HandleFunc("/sql/transaction", s.handleExecute)
 	s.mux.HandleFunc("/sql/query", s.handleQuery)
 	s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
@@ -480,15 +482,25 @@ type ExecuteRequest struct {
 	RequestID string `json:"request_id"`
 	SQL       string `json:"sql,omitempty"`
 	Args      []any  `json:"args,omitempty"`
-	// WantRows is unsupported for replicated mutations; use Query after Execute.
+	// WantRows requests bounded rows from a replicated mutation.
 	WantRows   bool                 `json:"want_rows,omitempty"`
+	RequireOne bool                 `json:"require_one,omitempty"`
 	Statements []types.SQLStatement `json:"statements,omitempty"`
 }
 
-// ExecuteResponse contains the bounded aggregate receipt retained for retries.
-// Replicated statement rows are not returned; use Query after Execute.
+// ExecuteResponse contains the bounded aggregate receipt and requested rows.
 type ExecuteResponse struct {
 	types.MutationReceipt
+	Statements []types.SQLStatementResult `json:"statements,omitempty"`
+}
+
+// MigrationRequest is the in-process engine command used by DB.Migrate.
+type MigrationRequest struct {
+	RequestID  string
+	Version    int64
+	Name       string
+	Checksum   string
+	Statements []types.SQLStatement
 }
 
 // ValidateExecuteRequest applies the same mutation contract and encoded-size
@@ -502,7 +514,7 @@ func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, []byte, error) {
 	if req.RequestID == "" {
 		return types.SQLCommand{}, nil, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
 	}
-	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
+	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements}
 	if err := materializer.ValidateSQLCommand(command); err != nil {
 		return types.SQLCommand{}, nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
@@ -536,6 +548,63 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func (s *Server) handleExecuteReturning(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ExecuteRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := s.ExecuteReturning(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleExecuteReturningOne(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ExecuteRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := s.ExecuteReturningOne(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ExecuteReturning executes one replicated mutation and returns its bounded rows.
+func (s *Server) ExecuteReturning(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	if len(req.Statements) != 0 {
+		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturning accepts one SQL statement", ErrInvalidRequest)
+	}
+	req.WantRows = true
+	return s.Execute(ctx, req)
+}
+
+// ExecuteReturningOne commits only when exactly one row is returned.
+func (s *Server) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	if len(req.Statements) != 0 {
+		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturningOne accepts one SQL statement", ErrInvalidRequest)
+	}
+	req.WantRows = true
+	req.RequireOne = true
+	return s.Execute(ctx, req)
+}
+
 // Execute applies one SQL statement or an atomic statements transaction.
 func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
 	if !s.writable || !s.ready() {
@@ -545,12 +614,39 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
+	return s.executeSQLCommand(ctx, command, encoded)
+}
+
+// Migrate applies one engine-owned migration atomically with its ledger row.
+func (s *Server) Migrate(ctx context.Context, req MigrationRequest) (ExecuteResponse, error) {
+	if !s.writable || !s.ready() {
+		return ExecuteResponse{}, ErrNotReady
+	}
+	command := types.SQLCommand{RequestID: req.RequestID, Statements: req.Statements, Migration: &types.SQLMigration{Version: req.Version, Name: req.Name, Checksum: req.Checksum}}
+	if command.RequestID == "" {
+		return ExecuteResponse{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+	}
+	if err := materializer.ValidateSQLCommand(command); err != nil {
+		return ExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	encoded, err := types.EncodeSQLBatchItem(command)
+	if err != nil || types.SQLBatchEncodedSize([][]byte{encoded}) > quepaxa.MaxReplicatedValueBytes {
+		return ExecuteResponse{}, fmt.Errorf("%w: invalid encoded migration", ErrInvalidRequest)
+	}
+	return s.executeSQLCommand(ctx, command, encoded)
+}
+
+func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand, encoded []byte) (ExecuteResponse, error) {
 	fingerprint, err := types.SQLFingerprint(command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	defer s.lockRequest(req.RequestID)()
-	receipt, found, matches, err := s.material.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
+	wantRows := command.WantRows
+	for _, statement := range command.Statements {
+		wantRows = wantRows || statement.WantRows
+	}
+	defer s.lockRequest(command.RequestID)()
+	receipt, sqlResult, found, matches, err := s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
@@ -558,20 +654,20 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 		return ExecuteResponse{}, ErrRequestConflict
 	}
 	if found {
-		return ExecuteResponse{MutationReceipt: receipt}, nil
+		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 	}
 	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	receipt, found, matches, err = s.material.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
+	receipt, sqlResult, found, matches, err = s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
 	if err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
 	if !found {
 		return ExecuteResponse{}, fmt.Errorf("SQL mutation receipt is unavailable")
 	}
-	return ExecuteResponse{MutationReceipt: receipt}, nil
+	return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 }
 
 // QueryRequest is the request body for query.

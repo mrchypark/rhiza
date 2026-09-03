@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,12 +29,13 @@ import (
 )
 
 const (
-	MaxSQLBytes      = 256 << 10
-	MaxSQLStatements = 64
-	MaxSQLArgs       = 999
-	MaxReturningRows = 10_000
-	MaxResultBytes   = 16 << 20
-	MaxCellBytes     = 1 << 20
+	MaxSQLBytes            = 256 << 10
+	MaxSQLStatements       = 64
+	MaxSQLArgs             = 999
+	MaxReturningRows       = 10_000
+	MaxResultBytes         = 16 << 20
+	MaxMutationResultBytes = 1 << 20
+	MaxCellBytes           = 1 << 20
 
 	notificationSubscriberLimit = 64
 	notificationQueueDepth      = 1
@@ -42,6 +44,12 @@ const (
 	// ponytail: fixed-size epochs bound memory; saturation only adds SQLite fallbacks.
 	sqlReceiptBloomBytes = 4 << 20
 )
+
+const migrationTableDDL = `CREATE TABLE IF NOT EXISTS _rhiza_migrations (
+	version INTEGER PRIMARY KEY CHECK(version > 0),
+	name TEXT NOT NULL,
+	checksum TEXT NOT NULL CHECK(length(checksum) = 64)
+) STRICT`
 
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
@@ -319,11 +327,27 @@ func (m *Materializer) initSchema() error {
 			rows_affected INTEGER NOT NULL,
 			last_insert_id INTEGER NOT NULL,
 			applied INTEGER NOT NULL,
+			sql_result BLOB NOT NULL DEFAULT X'',
 			PRIMARY KEY(kind, request_id)
 		) WITHOUT ROWID;
 		CREATE INDEX IF NOT EXISTS _rhiza_idempotency_slot ON _rhiza_idempotency(commit_slot);
 		`)
 	if err != nil {
+		return err
+	}
+	var hasSQLResult int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_rhiza_idempotency') WHERE name = 'sql_result'`).Scan(&hasSQLResult); err != nil {
+		return err
+	}
+	if hasSQLResult == 0 {
+		if _, err := m.db.Exec(`ALTER TABLE _rhiza_idempotency ADD COLUMN sql_result BLOB NOT NULL DEFAULT X''`); err != nil {
+			return err
+		}
+	}
+	if _, err := m.db.Exec(migrationTableDDL); err != nil {
+		return err
+	}
+	if err := validateMigrationTable(m.db); err != nil {
 		return err
 	}
 	var incompatible int
@@ -336,9 +360,53 @@ func (m *Materializer) initSchema() error {
 	return nil
 }
 
+func validateMigrationTable(db *sql.DB) error {
+	var schema string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='_rhiza_migrations'`).Scan(&schema); err != nil {
+		return err
+	}
+	wantSchema := `CREATE TABLE _rhiza_migrations ( version INTEGER PRIMARY KEY CHECK(version > 0), name TEXT NOT NULL, checksum TEXT NOT NULL CHECK(length(checksum) = 64) ) STRICT`
+	if strings.Join(strings.Fields(schema), " ") != wantSchema {
+		return fmt.Errorf("incompatible _rhiza_migrations schema")
+	}
+	rows, err := db.Query(`PRAGMA table_info('_rhiza_migrations')`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type column struct {
+		name, kind       string
+		notNull, primary int
+	}
+	var got []column
+	for rows.Next() {
+		var cid int
+		var item column
+		var defaultValue any
+		if err := rows.Scan(&cid, &item.name, &item.kind, &item.notNull, &defaultValue, &item.primary); err != nil {
+			return err
+		}
+		got = append(got, item)
+	}
+	want := []column{{"version", "INTEGER", 0, 1}, {"name", "TEXT", 1, 0}, {"checksum", "TEXT", 1, 0}}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(got) != len(want) {
+		return fmt.Errorf("incompatible _rhiza_migrations schema")
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("incompatible _rhiza_migrations schema")
+		}
+	}
+	return nil
+}
+
 type storedReceipt struct {
 	fingerprint [32]byte
 	receipt     types.MutationReceipt
+	sqlResult   types.SQLCommandResult
 }
 
 type sqlReceiptBloomEpoch struct {
@@ -424,8 +492,9 @@ func (m *Materializer) loadSQLReceiptBloom() error {
 func scanReceipt(scanner interface{ Scan(...any) error }, window uint64) (storedReceipt, error) {
 	var record storedReceipt
 	var fingerprint []byte
+	var encodedResult []byte
 	var applied int
-	err := scanner.Scan(&fingerprint, &record.receipt.Slot, &record.receipt.Status, &record.receipt.ErrorCode, &record.receipt.RowsAffected, &record.receipt.LastInsertID, &applied)
+	err := scanner.Scan(&fingerprint, &record.receipt.Slot, &record.receipt.Status, &record.receipt.ErrorCode, &record.receipt.RowsAffected, &record.receipt.LastInsertID, &applied, &encodedResult)
 	if err != nil {
 		return storedReceipt{}, err
 	}
@@ -435,11 +504,18 @@ func scanReceipt(scanner interface{ Scan(...any) error }, window uint64) (stored
 	copy(record.fingerprint[:], fingerprint)
 	record.receipt.Applied = applied != 0
 	record.receipt.RetryThroughSlot = record.receipt.Slot + window - 1
+	if len(encodedResult) != 0 {
+		var err error
+		record.sqlResult, err = decodeSQLResult(encodedResult)
+		if err != nil {
+			return storedReceipt{}, fmt.Errorf("decode SQL result: %w", err)
+		}
+	}
 	return record, nil
 }
 
 func receiptQuery() string {
-	return `SELECT fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied FROM _rhiza_idempotency WHERE kind = ? AND request_id = ?`
+	return `SELECT fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result FROM _rhiza_idempotency WHERE kind = ? AND request_id = ?`
 }
 
 func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationKind, requestID string) (types.MutationReceipt, bool, error) {
@@ -487,22 +563,186 @@ func (m *Materializer) receiptInTx(ctx context.Context, tx *sql.Tx, kind types.M
 }
 
 func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, requestID string, fingerprint [32]byte, receipt types.MutationReceipt) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+	_, err := tx.ExecContext(ctx, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, X'')`, kind, requestID, fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
 	return err
+}
+
+func encodeSQLResult(result types.SQLCommandResult) ([]byte, error) {
+	if len(result.Statements) == 0 {
+		return nil, nil
+	}
+	var encoded bytes.Buffer
+	encoded.WriteString("RSQL")
+	writeUint32(&encoded, uint32(len(result.Statements)))
+	for _, statement := range result.Statements {
+		writeInt64(&encoded, statement.RowsAffected)
+		writeInt64(&encoded, statement.LastInsertID)
+		writeUint32(&encoded, uint32(len(statement.Columns)))
+		for _, column := range statement.Columns {
+			writeBytes(&encoded, []byte(column))
+		}
+		writeUint32(&encoded, uint32(len(statement.Rows)))
+		for _, row := range statement.Rows {
+			writeUint32(&encoded, uint32(len(row)))
+			for _, value := range row {
+				if err := writeSQLValue(&encoded, value); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	writeBytes(&encoded, []byte(result.Error))
+	if encoded.Len() > MaxMutationResultBytes {
+		return nil, fmt.Errorf("stored SQL result exceeds %d bytes", MaxMutationResultBytes)
+	}
+	return encoded.Bytes(), nil
+}
+
+func writeUint32(dst *bytes.Buffer, value uint32) { _ = binary.Write(dst, binary.BigEndian, value) }
+func writeInt64(dst *bytes.Buffer, value int64)   { _ = binary.Write(dst, binary.BigEndian, value) }
+func writeBytes(dst *bytes.Buffer, value []byte) {
+	writeUint32(dst, uint32(len(value)))
+	dst.Write(value)
+}
+
+func writeSQLValue(dst *bytes.Buffer, value any) error {
+	switch value := value.(type) {
+	case nil:
+		dst.WriteByte(0)
+	case int64:
+		dst.WriteByte(1)
+		writeInt64(dst, value)
+	case float64:
+		dst.WriteByte(2)
+		writeInt64(dst, int64(math.Float64bits(value)))
+	case string:
+		dst.WriteByte(3)
+		writeBytes(dst, []byte(value))
+	case []byte:
+		dst.WriteByte(4)
+		writeBytes(dst, value)
+	default:
+		return fmt.Errorf("unsupported SQL result type %T", value)
+	}
+	return nil
+}
+
+func decodeSQLResult(encoded []byte) (types.SQLCommandResult, error) {
+	reader := bytes.NewReader(encoded)
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(reader, magic); err != nil || string(magic) != "RSQL" {
+		return types.SQLCommandResult{}, fmt.Errorf("invalid result encoding")
+	}
+	count, err := readUint32(reader)
+	if err != nil || count > MaxSQLStatements {
+		return types.SQLCommandResult{}, fmt.Errorf("invalid statement count")
+	}
+	result := types.SQLCommandResult{Statements: make([]types.SQLStatementResult, count)}
+	for i := range result.Statements {
+		statement := &result.Statements[i]
+		if statement.RowsAffected, err = readInt64(reader); err != nil {
+			return types.SQLCommandResult{}, err
+		}
+		if statement.LastInsertID, err = readInt64(reader); err != nil {
+			return types.SQLCommandResult{}, err
+		}
+		columns, readErr := readUint32(reader)
+		if readErr != nil || columns > MaxSQLArgs {
+			return types.SQLCommandResult{}, fmt.Errorf("invalid column count")
+		}
+		statement.Columns = make([]string, columns)
+		for j := range statement.Columns {
+			value, readErr := readBytes(reader)
+			if readErr != nil {
+				return types.SQLCommandResult{}, readErr
+			}
+			statement.Columns[j] = string(value)
+		}
+		rowCount, readErr := readUint32(reader)
+		if readErr != nil || rowCount > MaxReturningRows {
+			return types.SQLCommandResult{}, fmt.Errorf("invalid row count")
+		}
+		statement.Rows = make([][]any, rowCount)
+		for j := range statement.Rows {
+			cellCount, readErr := readUint32(reader)
+			if readErr != nil || cellCount != columns {
+				return types.SQLCommandResult{}, fmt.Errorf("invalid cell count")
+			}
+			statement.Rows[j] = make([]any, cellCount)
+			for k := range statement.Rows[j] {
+				statement.Rows[j][k], readErr = readSQLValue(reader)
+				if readErr != nil {
+					return types.SQLCommandResult{}, readErr
+				}
+			}
+		}
+	}
+	errorText, err := readBytes(reader)
+	if err != nil || reader.Len() != 0 {
+		return types.SQLCommandResult{}, fmt.Errorf("invalid trailing result data")
+	}
+	result.Error = string(errorText)
+	return result, nil
+}
+
+func readUint32(reader *bytes.Reader) (uint32, error) {
+	var value uint32
+	err := binary.Read(reader, binary.BigEndian, &value)
+	return value, err
+}
+func readInt64(reader *bytes.Reader) (int64, error) {
+	var value int64
+	err := binary.Read(reader, binary.BigEndian, &value)
+	return value, err
+}
+func readBytes(reader *bytes.Reader) ([]byte, error) {
+	size, err := readUint32(reader)
+	if err != nil || uint64(size) > uint64(reader.Len()) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	value := make([]byte, size)
+	_, err = io.ReadFull(reader, value)
+	return value, err
+}
+func readSQLValue(reader *bytes.Reader) (any, error) {
+	tag, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	switch tag {
+	case 0:
+		return nil, nil
+	case 1:
+		return readInt64(reader)
+	case 2:
+		bits, err := readInt64(reader)
+		return math.Float64frombits(uint64(bits)), err
+	case 3:
+		value, err := readBytes(reader)
+		return string(value), err
+	case 4:
+		return readBytes(reader)
+	default:
+		return nil, fmt.Errorf("invalid SQL value tag %d", tag)
+	}
 }
 
 func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, kind types.MutationKind, receipts []pendingSQLReceipt) (bool, error) {
 	if len(receipts) == 1 {
 		pending := receipts[0]
 		receipt := pending.record.receipt
-		result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+		encodedResult, err := encodeSQLResult(pending.record.sqlResult)
+		if err != nil {
+			return false, err
+		}
+		result, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(kind, request_id) DO NOTHING`, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied, encodedResult)
 		if err != nil {
 			return false, err
 		}
 		rows, err := result.RowsAffected()
 		return rows == 1, err
 	}
-	const receiptArgs = 9
+	const receiptArgs = 10
 	if len(receipts) > MaxSQLArgs/receiptArgs {
 		for len(receipts) != 0 {
 			n := min(len(receipts), MaxSQLArgs/receiptArgs)
@@ -515,15 +755,19 @@ func insertReceiptsIfAbsent(ctx context.Context, tx *sql.Tx, prepared map[string
 		return true, nil
 	}
 	var query strings.Builder
-	query.WriteString(`INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied) VALUES `)
+	query.WriteString(`INSERT INTO _rhiza_idempotency(kind, request_id, fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result) VALUES `)
 	args := make([]any, 0, len(receipts)*receiptArgs)
 	for i, pending := range receipts {
 		if i != 0 {
 			query.WriteByte(',')
 		}
-		query.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		query.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 		receipt := pending.record.receipt
-		args = append(args, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied)
+		encodedResult, err := encodeSQLResult(pending.record.sqlResult)
+		if err != nil {
+			return false, err
+		}
+		args = append(args, kind, pending.requestID, pending.record.fingerprint[:], receipt.Slot, receipt.Status, receipt.ErrorCode, receipt.RowsAffected, receipt.LastInsertID, receipt.Applied, encodedResult)
 	}
 	query.WriteString(` ON CONFLICT(kind, request_id) DO NOTHING`)
 	result, err := execPrepared(ctx, tx, prepared, query.String(), args...)
@@ -618,7 +862,9 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		clear(m.recentSQLReceipts)
 	}
 	for _, pending := range pendingReceipts {
-		m.recentSQLReceipts[pending.requestID] = pending.record
+		record := pending.record
+		record.sqlResult = types.SQLCommandResult{}
+		m.recentSQLReceipts[pending.requestID] = record
 	}
 	for _, notification := range pending {
 		m.enqueueNotification(notification)
@@ -806,6 +1052,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 			if _, err := execPrepared(ctx, tx, statements, "ROLLBACK TO rhiza_command"); err != nil {
 				return err
 			}
+			result = types.SQLCommandResult{}
 			receipt.Status = types.MutationRejected
 			receipt.ErrorCode = "execution_failed"
 		} else {
@@ -816,7 +1063,17 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 		}
 		if command.RequestID != "" {
 			receipt.RetryThroughSlot = slot + m.idempotencyWindow - 1
-			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt}})
+			storedResult := types.SQLCommandResult{}
+			for _, statement := range command.Statements {
+				if statement.WantRows {
+					storedResult = result
+					break
+				}
+			}
+			if len(command.Statements) == 0 && command.WantRows {
+				storedResult = result
+			}
+			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}})
 		}
 		if _, err := execPrepared(ctx, tx, statements, "RELEASE rhiza_command"); err != nil {
 			return err
@@ -1016,16 +1273,24 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		return fmt.Errorf("request_id must not exceed %d bytes", types.MaxRequestIDBytes)
 	}
 	statements := command.Statements
+	if command.RequireOne && (!command.WantRows || len(statements) != 0) {
+		return fmt.Errorf("require_one is only valid for one row-returning statement")
+	}
+	if command.Migration != nil {
+		if command.SQL != "" || len(command.Args) != 0 || command.WantRows || command.Migration.Version <= 0 || command.Migration.Name == "" || len(command.Migration.Checksum) != 64 {
+			return fmt.Errorf("invalid migration command")
+		}
+		if _, err := hex.DecodeString(command.Migration.Checksum); err != nil {
+			return fmt.Errorf("invalid migration checksum")
+		}
+	}
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
 	}
 	if len(statements) == 0 || len(statements) > MaxSQLStatements {
 		return fmt.Errorf("statement count must be between 1 and %d", MaxSQLStatements)
 	}
-	for _, statement := range statements {
-		if statement.WantRows {
-			return fmt.Errorf("mutation row results are unsupported; issue a query after the returned slot")
-		}
+	for statementIndex, statement := range statements {
 		if strings.TrimSpace(statement.SQL) == "" {
 			return fmt.Errorf("SQL is required")
 		}
@@ -1035,7 +1300,45 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		if len(statement.SQL) > MaxSQLBytes {
 			return fmt.Errorf("SQL exceeds %d bytes", MaxSQLBytes)
 		}
-		if len(statement.Args) > MaxSQLArgs {
+		argCount := len(statement.Args)
+		if len(statement.OutputRefs) > MaxSQLArgs {
+			return fmt.Errorf("SQL has more than %d output references", MaxSQLArgs)
+		}
+		if command.Migration != nil && (len(statement.Args) != 0 || statement.WantRows || len(statement.OutputRefs) != 0) {
+			return fmt.Errorf("migration statements do not support arguments, returned rows, or output references")
+		}
+		if len(statement.OutputRefs) != 0 {
+			parameterCount, err := countPlainParameters(statement.SQL)
+			if err != nil {
+				return err
+			}
+			if parameterCount != len(statement.Args) {
+				return fmt.Errorf("output references require one argument for every positional parameter")
+			}
+		}
+		seenArgs := make(map[int]struct{}, len(statement.OutputRefs))
+		for _, ref := range statement.OutputRefs {
+			if ref.ArgIndex < 0 || ref.ArgIndex >= len(statement.Args) {
+				return fmt.Errorf("output reference argument index is out of bounds")
+			}
+			if statement.Args[ref.ArgIndex] != nil {
+				return fmt.Errorf("output reference argument %d must be null", ref.ArgIndex)
+			}
+			if _, exists := seenArgs[ref.ArgIndex]; exists {
+				return fmt.Errorf("duplicate output reference argument index %d", ref.ArgIndex)
+			}
+			seenArgs[ref.ArgIndex] = struct{}{}
+			if ref.StatementIndex < 0 || ref.StatementIndex >= statementIndex || !statements[ref.StatementIndex].WantRows {
+				return fmt.Errorf("output reference must target an earlier row-returning statement")
+			}
+			if (ref.ColumnName == "") == (ref.ColumnIndex == nil) {
+				return fmt.Errorf("output reference requires exactly one column name or index")
+			}
+			if ref.ColumnIndex != nil && *ref.ColumnIndex < 0 {
+				return fmt.Errorf("output reference column index is out of bounds")
+			}
+		}
+		if argCount > MaxSQLArgs {
 			return fmt.Errorf("SQL has more than %d arguments", MaxSQLArgs)
 		}
 		if err := validatePublicSQL(statement.SQL); err != nil {
@@ -1056,6 +1359,71 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		}
 	}
 	return nil
+}
+
+func countPlainParameters(query string) (int, error) {
+	count := 0
+	for i := 0; i < len(query); {
+		switch query[i] {
+		case '\'', '"', '`':
+			quote := query[i]
+			i++
+			for i < len(query) {
+				if query[i] == quote {
+					if i+1 < len(query) && query[i+1] == quote {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case '[':
+			i++
+			for i < len(query) && query[i] != ']' {
+				i++
+			}
+			if i < len(query) {
+				i++
+			}
+		case '-':
+			if i+1 < len(query) && query[i+1] == '-' {
+				i += 2
+				for i < len(query) && query[i] != '\n' {
+					i++
+				}
+			} else {
+				i++
+			}
+		case '/':
+			if i+1 < len(query) && query[i+1] == '*' {
+				i += 2
+				for i+1 < len(query) && !(query[i] == '*' && query[i+1] == '/') {
+					i++
+				}
+				if i+1 < len(query) {
+					i += 2
+				}
+			} else {
+				i++
+			}
+		case '?':
+			if i+1 < len(query) && query[i+1] >= '0' && query[i+1] <= '9' {
+				return 0, fmt.Errorf("output references require unnumbered ? parameters")
+			}
+			count++
+			i++
+		case ':', '@', '$':
+			if i+1 < len(query) && (query[i+1] == '_' || query[i+1] >= 'A' && query[i+1] <= 'Z' || query[i+1] >= 'a' && query[i+1] <= 'z') {
+				return 0, fmt.Errorf("output references do not support named parameters")
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return count, nil
 }
 
 func firstSQLKeyword(query string) string {
@@ -1097,7 +1465,36 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
 	}
 	result := types.SQLCommandResult{Statements: make([]types.SQLStatementResult, 0, len(statements))}
-	budget := resultBudget{rows: MaxReturningRows, bytes: MaxResultBytes}
+	if command.Migration != nil {
+		var name, checksum string
+		err := tx.QueryRowContext(ctx, `SELECT name, checksum FROM _rhiza_migrations WHERE version = ?`, command.Migration.Version).Scan(&name, &checksum)
+		if err == nil {
+			if name == command.Migration.Name && checksum == command.Migration.Checksum {
+				return result, nil
+			}
+			return result, fmt.Errorf("migration %d conflicts with the applied definition", command.Migration.Version)
+		}
+		if err != sql.ErrNoRows {
+			return result, err
+		}
+		var maxVersion sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT MAX(version) FROM _rhiza_migrations`).Scan(&maxVersion); err != nil {
+			return result, err
+		}
+		expectedVersion := int64(1)
+		if maxVersion.Valid {
+			expectedVersion = maxVersion.Int64 + 1
+		}
+		if command.Migration.Version != expectedVersion {
+			return result, fmt.Errorf("migration version %d does not follow %d", command.Migration.Version, expectedVersion-1)
+		}
+		if _, err := execPrepared(ctx, tx, prepared, `INSERT INTO _rhiza_migrations(version, name, checksum) VALUES (?, ?, ?)`, command.Migration.Version, command.Migration.Name, command.Migration.Checksum); err != nil {
+			return result, err
+		}
+	}
+	budget := resultBudget{rows: MaxReturningRows, bytes: MaxMutationResultBytes, limit: MaxMutationResultBytes}
+	resolvedBytes := 0
+	wantsRows := command.WantRows
 	for _, statement := range statements {
 		args := make([]any, len(statement.Args))
 		for i, arg := range statement.Args {
@@ -1107,11 +1504,42 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 			}
 			args[i] = value
 		}
+		for _, ref := range statement.OutputRefs {
+			prior := result.Statements[ref.StatementIndex]
+			if len(prior.Rows) != 1 {
+				return result, fmt.Errorf("statement %d must return exactly one row", ref.StatementIndex)
+			}
+			column := -1
+			if ref.ColumnIndex != nil {
+				column = *ref.ColumnIndex
+			} else {
+				matches := 0
+				for i, name := range prior.Columns {
+					if name == ref.ColumnName {
+						column = i
+						matches++
+					}
+				}
+				if matches != 1 {
+					return result, fmt.Errorf("statement %d output column %q must be unique", ref.StatementIndex, ref.ColumnName)
+				}
+			}
+			if column < 0 || column >= len(prior.Rows[0]) {
+				return result, fmt.Errorf("statement %d output column is out of bounds", ref.StatementIndex)
+			}
+			value := prior.Rows[0][column]
+			resolvedBytes += sqlValueSize(value)
+			if resolvedBytes > MaxMutationResultBytes {
+				return result, fmt.Errorf("resolved output references exceed %d bytes", MaxMutationResultBytes)
+			}
+			args[ref.ArgIndex] = value
+		}
 		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
 		if err != nil {
 			return result, err
 		}
 		if statement.WantRows {
+			wantsRows = true
 			rows, err := query.QueryContext(ctx, args...)
 			if err != nil {
 				return result, err
@@ -1120,6 +1548,9 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 			rows.Close()
 			if err != nil {
 				return result, err
+			}
+			if command.RequireOne && len(statementResult.Rows) != 1 {
+				return result, fmt.Errorf("statement must return exactly one row")
 			}
 			result.Statements = append(result.Statements, statementResult)
 			continue
@@ -1133,12 +1564,10 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 		statementResult.LastInsertID, _ = execResult.LastInsertId()
 		result.Statements = append(result.Statements, statementResult)
 	}
-	encodedBytes, err := encodedJSONSize(result)
-	if err != nil {
-		return result, err
-	}
-	if encodedBytes > MaxResultBytes {
-		return result, fmt.Errorf("result exceeds %d encoded bytes", MaxResultBytes)
+	if wantsRows {
+		if _, err := encodeSQLResult(result); err != nil {
+			return result, err
+		}
 	}
 	return result, nil
 }
@@ -1220,6 +1649,7 @@ func NormalizeSQLArgs(args []any) ([]any, error) {
 type resultBudget struct {
 	rows  int
 	bytes int
+	limit int
 }
 
 type countingWriter int
@@ -1238,7 +1668,7 @@ func encodedJSONSize(value any) (int, error) {
 }
 
 func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
-	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes})
+	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes, limit: MaxResultBytes})
 }
 
 func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget) (types.SQLStatementResult, error) {
@@ -1251,7 +1681,7 @@ func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget) (types.SQLState
 		budget.bytes -= len(column)
 	}
 	if budget.bytes < 0 {
-		return result, fmt.Errorf("result exceeds %d bytes", MaxResultBytes)
+		return result, fmt.Errorf("result exceeds %d bytes", budget.limit)
 	}
 	for rows.Next() {
 		if budget.rows == 0 {
@@ -1266,27 +1696,32 @@ func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget) (types.SQLState
 			return result, err
 		}
 		for _, value := range values {
-			size := 16
-			switch value := value.(type) {
-			case string:
-				size = len(value)
-			case []byte:
-				size = len(value)
-			case nil:
-				size = 1
-			}
+			size := sqlValueSize(value)
 			if size > MaxCellBytes {
 				return result, fmt.Errorf("result cell exceeds %d bytes", MaxCellBytes)
 			}
 			budget.bytes -= size
 			if budget.bytes < 0 {
-				return result, fmt.Errorf("result exceeds %d bytes", MaxResultBytes)
+				return result, fmt.Errorf("result exceeds %d bytes", budget.limit)
 			}
 		}
 		result.Rows = append(result.Rows, values)
 		budget.rows--
 	}
 	return result, rows.Err()
+}
+
+func sqlValueSize(value any) int {
+	switch value := value.(type) {
+	case string:
+		return len(value)
+	case []byte:
+		return len(value)
+	case nil:
+		return 1
+	default:
+		return 16
+	}
 }
 
 func (m *Materializer) SQLRequestMatches(ctx context.Context, command types.SQLCommand) (bool, error) {
@@ -1307,8 +1742,9 @@ func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCo
 	return m.SQLRequestStatusFingerprint(ctx, command.RequestID, fingerprint)
 }
 
-// SQLRequestStatusFingerprint returns the retained receipt for a precomputed fingerprint.
-func (m *Materializer) SQLRequestStatusFingerprint(ctx context.Context, requestID string, fingerprint [32]byte) (types.MutationReceipt, bool, bool, error) {
+// SQLRequestResultFingerprint returns the retained receipt and row results for
+// an idempotent SQL mutation.
+func (m *Materializer) SQLRequestResultFingerprint(ctx context.Context, requestID string, fingerprint [32]byte, wantRows bool) (types.MutationReceipt, types.SQLCommandResult, bool, bool, error) {
 	m.mu.RLock()
 	record, cached := m.recentSQLReceipts[requestID]
 	tip := m.tip
@@ -1316,28 +1752,36 @@ func (m *Materializer) SQLRequestStatusFingerprint(ctx context.Context, requestI
 	m.mu.RUnlock()
 	if cached {
 		if tip > record.receipt.RetryThroughSlot {
-			return types.MutationReceipt{}, false, true, nil
+			return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 		}
-		return record.receipt, true, record.fingerprint == fingerprint, nil
+		if !wantRows {
+			return record.receipt, types.SQLCommandResult{}, true, record.fingerprint == fingerprint, nil
+		}
 	}
 	if !mightContain {
-		return types.MutationReceipt{}, false, true, nil
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 	}
 	reader, err := m.reader()
 	if err != nil {
-		return types.MutationReceipt{}, false, false, err
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, false, err
 	}
 	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
-		return types.MutationReceipt{}, false, true, nil
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 	}
 	if err != nil {
-		return types.MutationReceipt{}, false, false, err
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, false, err
 	}
 	if m.Tip() > record.receipt.RetryThroughSlot {
-		return types.MutationReceipt{}, false, true, nil
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 	}
-	return record.receipt, true, record.fingerprint == fingerprint, nil
+	return record.receipt, record.sqlResult, true, record.fingerprint == fingerprint, nil
+}
+
+// SQLRequestStatusFingerprint returns the retained receipt for a precomputed fingerprint.
+func (m *Materializer) SQLRequestStatusFingerprint(ctx context.Context, requestID string, fingerprint [32]byte) (types.MutationReceipt, bool, bool, error) {
+	receipt, _, found, matches, err := m.SQLRequestResultFingerprint(ctx, requestID, fingerprint, false)
+	return receipt, found, matches, err
 }
 
 // Query executes a read query.
