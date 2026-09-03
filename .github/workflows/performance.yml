@@ -173,7 +173,7 @@ jobs:
             cd "$RUNNER_TEMP/hiqlite/examples/bench"
             HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000
           ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-leader-failed-immediate.txt"
-          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance/hiqlite.txt" "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt"; then
+          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance"/hiqlite*.txt; then
             printf '\n## Pinned Hiqlite reference\n\nInvalid: runtime errors; see artifact.\n' >>"$GITHUB_STEP_SUMMARY"
             printf 'Hiqlite benchmark reported runtime errors\n' >&2
             exit 1
@@ -184,17 +184,16 @@ jobs:
           hiqlite_non_leader_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-non-leader-failed-immediate.txt")
           hiqlite_leader_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-leader-failed-immediate.txt")
           [[ $hiqlite_ops =~ ^[0-9]+$ && $hiqlite_immediate_ops =~ ^[0-9]+$ && $hiqlite_remote_ops =~ ^[0-9]+$ && $hiqlite_non_leader_ops =~ ^[0-9]+$ && $hiqlite_leader_ops =~ ^[0-9]+$ ]]
-          hiqlite_non_leader_retention=$(awk -v fault="$hiqlite_non_leader_ops" -v healthy="$hiqlite_remote_ops" 'BEGIN { printf "%.1f", fault * 100 / healthy }')
-          hiqlite_leader_retention=$(awk -v fault="$hiqlite_leader_ops" -v healthy="$hiqlite_remote_ops" 'BEGIN { printf "%.1f", fault * 100 / healthy }')
           # shellcheck disable=SC2016
           {
             printf '\n## Pinned Hiqlite reference\n\n'
             printf 'Official `interval_200` three-node local-client workload: `%s ops/s`.\n\n' "$hiqlite_ops"
             printf 'Power-loss-durable `immediate` workload: `%s ops/s`.\n\n' "$hiqlite_immediate_ops"
             printf 'Power-loss-durable remote-client workload: `%s ops/s`.\n\n' "$hiqlite_remote_ops"
-            printf 'Non-leader unavailable: `%s ops/s` (`%s%%` of healthy).\n\n' "$hiqlite_non_leader_ops" "$hiqlite_non_leader_retention"
-            printf 'Leader unavailable: `%s ops/s` (`%s%%` of healthy).\n\n' "$hiqlite_leader_ops" "$hiqlite_leader_retention"
+            printf 'Raft follower gracefully stopped before measurement: `%s ops/s`.\n\n' "$hiqlite_non_leader_ops"
+            printf 'Raft leader gracefully stopped before measurement: `%s ops/s`.\n\n' "$hiqlite_leader_ops"
             printf 'All use `cluster -c 16 -r 100000`, commit `%s`.\n' "$HIQLITE_COMMIT"
+            printf 'This is a native Hiqlite diagnostic, not an algorithm-level ratio against Rhiza.\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run Rhiza real-server reference
@@ -206,29 +205,30 @@ jobs:
           benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
-          RHIZA_SERVER_BENCH_FAILED_ROLE=non-leader benchmarks/run-server-reference.sh \
+          RHIZA_SERVER_BENCH_FAILED_NODE=n0 RHIZA_SERVER_BENCH_TARGET_NODE=n1 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
-            "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json"
-          RHIZA_SERVER_BENCH_FAILED_ROLE=leader benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-n0-failed.json"
+          RHIZA_SERVER_BENCH_FAILED_NODE=n1 RHIZA_SERVER_BENCH_TARGET_NODE=n2 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
-            "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json"
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-n1-failed.json"
+          RHIZA_SERVER_BENCH_FAILED_NODE=n2 RHIZA_SERVER_BENCH_TARGET_NODE=n0 benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server-n2-failed.json"
           rhiza_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
           rhiza_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
-          rhiza_non_leader_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json")
-          rhiza_non_leader_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json")
-          rhiza_non_leader_retries=$(jq -r '.result.retries // 0' "$RUNNER_TEMP/rhiza-performance/rhiza-server-non-leader-failed.json")
-          rhiza_leader_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json")
-          rhiza_leader_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json")
-          rhiza_leader_retries=$(jq -r '.result.retries // 0' "$RUNNER_TEMP/rhiza-performance/rhiza-server-leader-failed.json")
-          rhiza_non_leader_retention=$(awk -v fault="$rhiza_non_leader_ops" -v healthy="$rhiza_ops" 'BEGIN { printf "%.1f", fault * 100 / healthy }')
-          rhiza_leader_retention=$(awk -v fault="$rhiza_leader_ops" -v healthy="$rhiza_ops" 'BEGIN { printf "%.1f", fault * 100 / healthy }')
           # shellcheck disable=SC2016
           {
-            printf '\n## Rhiza real-server reference\n\n'
-            printf 'Power-loss-durable three-voter HTTP/QUIC workload: `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
-            printf 'Non-leader unavailable: `%s ops/s`, p99 `%s ms`, `%s` commit-unknown retries (`%s%%` of healthy).\n\n' "$rhiza_non_leader_ops" "$rhiza_non_leader_p99" "$rhiza_non_leader_retries" "$rhiza_non_leader_retention"
-            printf 'Leader unavailable: `%s ops/s`, p99 `%s ms`, `%s` commit-unknown retries (`%s%%` of healthy).\n\n' "$rhiza_leader_ops" "$rhiza_leader_p99" "$rhiza_leader_retries" "$rhiza_leader_retention"
-            printf 'Uses `-c 16 -n 100000`; every row is verified by a linearizable query.\n'
+            printf '\n## Rhiza leaderless availability qualification\n\n'
+            printf 'Quorum-WAL-durable three-voter HTTP/QUIC workload: `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
+            for peer in n0 n1 n2; do
+              file="$RUNNER_TEMP/rhiza-performance/rhiza-server-$peer-failed.json"
+              ops=$(jq -r '.result.success_ops_per_sec | floor' "$file")
+              p99=$(jq -r '.result.p99_ms' "$file")
+              max=$(jq -r '.result.max_ms' "$file")
+              retries=$(jq -r '.result.retries // 0' "$file")
+              printf 'Peer `%s` SIGKILL during load: `%s ops/s`, p99 `%s ms`, max `%s ms`, `%s` commit-unknown retries, zero failed writes.\n\n' "$peer" "$ops" "$p99" "$max" "$retries"
+            done
+            printf 'QuePaxa has no stable leader role, so failures are reported by peer identity. Each fault is injected during `-c 16 -n 100000`; every acknowledged row is verified by a linearizable query.\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record runner environment
@@ -240,7 +240,8 @@ jobs:
             printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
             printf 'hiqlite_official_log_sync=interval_200\n'
             printf 'hiqlite_durable_log_sync=immediate\n'
-            printf 'failure_scenarios=one_leader_or_non_leader_peer_unavailable_before_timed_workload\n'
+            printf 'rhiza_failure_scenarios=each_peer_sigkill_during_timed_workload\n'
+            printf 'hiqlite_failure_scenarios=raft_leader_or_follower_gracefully_stopped_before_timed_workload\n'
             lscpu
             free -b
           } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"

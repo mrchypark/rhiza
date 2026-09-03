@@ -11,7 +11,9 @@ source_dir=$(cd "$1" && pwd)
 output_file=$2
 requests=${RHIZA_SERVER_BENCH_REQUESTS:-100000}
 concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
-failed_role=${RHIZA_SERVER_BENCH_FAILED_ROLE:-none}
+failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
+target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
+fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
 base_peer_port=${RHIZA_SERVER_BENCH_PEER_PORT:-19100}
 minio_port=${RHIZA_SERVER_BENCH_MINIO_PORT:-19000}
@@ -19,8 +21,20 @@ if [[ ! $requests =~ ^[1-9][0-9]*$ || ! $concurrency =~ ^[1-9][0-9]*$ || $concur
 	printf 'request count and concurrency must be positive, with concurrency <= requests\n' >&2
 	exit 2
 fi
-if [[ $failed_role != none && $failed_role != leader && $failed_role != non-leader ]]; then
-	printf 'RHIZA_SERVER_BENCH_FAILED_ROLE must be none, leader, or non-leader\n' >&2
+if [[ $failed_node != none && $failed_node != n0 && $failed_node != n1 && $failed_node != n2 ]]; then
+	printf 'RHIZA_SERVER_BENCH_FAILED_NODE must be none, n0, n1, or n2\n' >&2
+	exit 2
+fi
+if [[ $target_node != n0 && $target_node != n1 && $target_node != n2 ]]; then
+	printf 'RHIZA_SERVER_BENCH_TARGET_NODE must be n0, n1, or n2\n' >&2
+	exit 2
+fi
+if [[ $failed_node == "$target_node" ]]; then
+	printf 'failed node and client target must differ\n' >&2
+	exit 2
+fi
+if [[ ! $fault_after =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+	printf 'RHIZA_SERVER_BENCH_FAULT_AFTER must be seconds expressed as a non-negative number\n' >&2
 	exit 2
 fi
 
@@ -89,25 +103,29 @@ for i in 0 1 2; do
 	fi
 done
 
-target="http://127.0.0.1:$((base_http_port + 1))"
+target_index=${target_node#n}
+target="http://127.0.0.1:$((base_http_port + target_index))"
 curl -fsS -H 'Content-Type: application/json' \
 	-d '{"request_id":"schema","sql":"CREATE TABLE benchmark_writes (id INTEGER PRIMARY KEY)"}' \
 	"$target/sql/execute" >/dev/null
-if [[ $failed_role != none ]]; then
-	# Slot 1 creates the schema; QuePaxa's deterministic epoch-0 leader for the
-	# next slot is n0. n2 is an unambiguous non-leader and n1 remains the client.
-	failed_node=2
-	[[ $failed_role == leader ]] && failed_node=0
-	failed_pid=$(<"$run_dir/node-$failed_node.pid")
-	kill "$failed_pid"
-	wait "$failed_pid" || true
-	curl -fsS -H 'Content-Type: application/json' \
-		-d '{"request_id":"fault-warmup","sql":"INSERT INTO benchmark_writes(id) VALUES (-1)"}' \
-		"$target/sql/execute" >/dev/null
-fi
-result=$("$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
+result_file="$run_dir/result.json"
+"$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
-	-n "$requests" -c "$concurrency" -commit-unknown-retries 3)
+	-n "$requests" -c "$concurrency" -commit-unknown-retries 3 >"$result_file" &
+bench_pid=$!
+if [[ $failed_node != none ]]; then
+	sleep "$fault_after"
+	if ! kill -0 "$bench_pid" 2>/dev/null; then
+		printf 'benchmark completed before fault injection; increase requests or reduce RHIZA_SERVER_BENCH_FAULT_AFTER\n' >&2
+		exit 1
+	fi
+	failed_index=${failed_node#n}
+	failed_pid=$(<"$run_dir/node-$failed_index.pid")
+	kill -KILL "$failed_pid"
+	wait "$failed_pid" 2>/dev/null || true
+fi
+wait "$bench_pid"
+result=$(<"$result_file")
 # Preserve the client result even when the subsequent correctness gate fails.
 tee "$output_file" <<<"$result" >/dev/null
 count=$(curl -fsS -H 'Content-Type: application/json' \
@@ -115,6 +133,6 @@ count=$(curl -fsS -H 'Content-Type: application/json' \
 	"$target/sql/query")
 jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests' <<<"$result" >/dev/null
 jq -e --argjson requests "$requests" '.rows == [[$requests]]' <<<"$count" >/dev/null
-jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --arg failed_role "$failed_role" \
-	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_role == "none" then "healthy" else "one-peer-unavailable" end),failed_role:$failed_role,concurrency:$concurrency,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" \
+	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),concurrency:$concurrency,result:$result,verification:$count}' \
 	| tee "$output_file"

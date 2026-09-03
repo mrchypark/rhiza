@@ -47,11 +47,17 @@ lands on `main`, its bootstrap run uses the candidate's previous commit so both
 sides contain the same benchmark harness; later pull requests compare against
 their actual base commit.
 
-The server references also repeat the power-loss-durable 100,000-write workload
-after stopping either the current leader or a non-leader voter. The summary
-reports throughput and healthy-run retention for both systems, plus Rhiza p99
-latency. The pinned Hiqlite source patch that adds this fault switch is kept in
-`benchmarks/hiqlite-one-peer.patch`.
+The Rhiza server qualification injects `SIGKILL` into each named voter while
+the 100,000-write workload is running. QuePaxa has no stable leader role, so
+results are reported by peer identity (`n0`, `n1`, `n2`) with throughput, p99,
+maximum request latency, retries, and a linearizable final row-count check.
+Zero final request errors across all three runs is the availability gate.
+
+Hiqlite remains an external Raft reference, not a direct algorithm comparison.
+Its leader/follower cases gracefully stop one peer and wait for a replacement
+leader before measurement, so they describe post-failover steady state rather
+than failover interruption. Any `ERROR` line invalidates that reference run.
+The pinned source patch is kept in `benchmarks/hiqlite-one-peer.patch`.
 
 The workflow is advisory: candidate benchmark failures fail the job, while a
 measured regression is reported without an arbitrary threshold. A failing
