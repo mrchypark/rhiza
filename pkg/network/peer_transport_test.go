@@ -135,6 +135,13 @@ func TestAllows0RTTOnlyForReadOperations(t *testing.T) {
 	}
 }
 
+func TestDecisionHasRecorder(t *testing.T) {
+	decision := quepaxa.Decision{Summaries: []quepaxa.Summary{{RecorderID: "n1"}, {RecorderID: "n2"}}}
+	if !decisionHasRecorder(decision, "n1") || !decisionHasRecorder(decision, "n2") || decisionHasRecorder(decision, "n3") {
+		t.Fatal("decision recorder membership mismatch")
+	}
+}
+
 func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
 	if identity, err := NewPeerIdentity("cluster", quepaxa.Member{ID: "n1", PeerURL: "quic://127.0.0.1:1"}); identity != (PeerIdentity{}) || err == nil {
 		t.Fatalf("identity=%+v error=%v", identity, err)

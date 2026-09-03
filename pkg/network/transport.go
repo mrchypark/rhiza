@@ -368,10 +368,10 @@ func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte
 func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan error, len(t.members)-1)
+	results := make(chan error, len(decision.Summaries))
 	pending := 0
 	for _, member := range t.members {
-		if member.ID == t.localID {
+		if member.ID == t.localID || !decisionHasRecorder(decision, member.ID) {
 			continue
 		}
 		pending++
@@ -400,6 +400,15 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 		return firstErr
 	}
 	return quepaxa.ErrQuorumUnavailable
+}
+
+func decisionHasRecorder(decision quepaxa.Decision, id quepaxa.NodeID) bool {
+	for _, summary := range decision.Summaries {
+		if summary.RecorderID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {

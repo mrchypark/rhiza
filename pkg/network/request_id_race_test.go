@@ -84,7 +84,10 @@ func (t *requestIDRaceTransport) SendDecision(_ context.Context, decision quepax
 		successes := 1 // proposer is the local learner, matching Transport.SendDecision
 		cores = cores[1:]
 		for _, core := range cores {
-			if err := core.AcceptDecision(decision); err == nil {
+			if !decisionHasRecorder(decision, core.NodeID()) {
+				continue
+			}
+			if err := core.AcceptDecisionHint(decision); err == nil {
 				successes++
 				if successes >= quorum {
 					return nil

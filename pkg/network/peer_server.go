@@ -209,7 +209,10 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if err != nil {
 			return nil, err
 		}
-		if err := s.server.core.AcceptDecision(decision); err != nil {
+		if !decisionHasRecorder(decision, s.server.core.NodeID()) {
+			return nil, fmt.Errorf("learned decision target is not a durable recorder")
+		}
+		if err := s.server.core.AcceptDecisionHint(decision); err != nil {
 			return nil, err
 		}
 		if err := s.server.applyDecisions(ctx, decision.Slot); err != nil {
