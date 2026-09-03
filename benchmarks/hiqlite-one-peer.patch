@@ -2,25 +2,16 @@ diff --git a/examples/bench/src/bench.rs b/examples/bench/src/bench.rs
 index 7ec078e..d9cf12a 100644
 --- a/examples/bench/src/bench.rs
 +++ b/examples/bench/src/bench.rs
-@@ -59,6 +59,10 @@ pub async fn start_benchmark(client: Client, options: Options, remote: bool) ->
- 
-     select_timings(client.clone(), remote).await?;
- 
+@@ -61,0 +62,4 @@ pub async fn start_benchmark(client: Client, options: Options, remote: bool) ->
 +    if options.sql_only {
 +        return Ok(());
 +    }
 +
-     let elapsed = put_cache(client.clone(), &options, data).await?;
-     let per_second = rows * 1000 / max(elapsed as usize, 1);
-     log(format!(
 diff --git a/examples/bench/src/main.rs b/examples/bench/src/main.rs
 index b89c75c..4da571d 100644
 --- a/examples/bench/src/main.rs
 +++ b/examples/bench/src/main.rs
-@@ -26,6 +26,18 @@ enum Args {
- 
- #[derive(Debug, Clone, PartialEq, Parser)]
- pub struct Options {
+@@ -28,0 +29,12 @@ pub struct Options {
 +    /// Stop one node with the selected role before starting the timed workload.
 +    #[clap(long, value_parser = ["leader", "non-leader"])]
 +    pub fail_peer: Option<String>,
@@ -33,26 +24,14 @@ index b89c75c..4da571d 100644
 +    #[clap(long, default_value_t = false)]
 +    pub sql_only: bool,
 +
-     /// How many concurrent threads should be started for inserts
-     #[clap(short, long)]
-     pub concurrency: usize,
-@@ -269,6 +281,9 @@ async fn main() -> Result<(), Error> {
-         time::sleep(Duration::from_secs(1)).await;
- 
-         let options = Options {
+@@ -271,0 +284,3 @@ async fn main() -> Result<(), Error> {
 +            fail_peer: None,
 +            remote_client: true,
 +            sql_only: false,
-             concurrency: opts.concurrency,
-             cache_rps: opts.cache_rps,
-             cache_burst: opts.cache_burst,
-@@ -288,21 +303,89 @@ async fn main() -> Result<(), Error> {
-             Args::Remote(_) => unreachable!(),
-         };
- 
+@@ -291 +306 @@ async fn main() -> Result<(), Error> {
 -        let (client_1, client_2, _client_3) = start_cluster(full_cluster, &options).await?;
 +        let (client_1, client_2, client_3) = start_cluster(full_cluster, &options).await?;
- 
+@@ -293,5 +308,19 @@ async fn main() -> Result<(), Error> {
 -        let leader = {
 -            let metrics = client_1.metrics_db().await?;
 -            let leader = metrics.current_leader.unwrap();
@@ -71,15 +50,14 @@ index b89c75c..4da571d 100644
 +                (leader_id, &leader)
 +            } else if leader_id == 3 {
 +                (2, client_2.as_ref().unwrap())
-             } else {
--                client_2.unwrap()
--            }
++            } else {
 +                (3, client_3.as_ref().unwrap())
 +            };
 +            failed.shutdown().await?;
 +            let survivor = if failed_id != 1 {
 +                client_1.clone()
-+            } else {
+@@ -299 +328,17 @@ async fn main() -> Result<(), Error> {
+-                client_2.unwrap()
 +                client_2.as_ref().unwrap().clone()
 +            };
 +            let mut replacement_elected = false;
@@ -97,7 +75,7 @@ index b89c75c..4da571d 100644
 +            }
 +            if !replacement_elected {
 +                return Err(Error::Error("replacement leader election timed out".into()));
-+            }
+@@ -300,0 +346,27 @@ async fn main() -> Result<(), Error> {
 +            log(format!("One {role} peer stopped before benchmark"));
 +            Some(failed_id)
 +        } else {
@@ -125,8 +103,7 @@ index b89c75c..4da571d 100644
 +                "leader failure requires --remote-client"
 +            );
 +            leader
-         };
- 
+@@ -303,3 +375,14 @@ async fn main() -> Result<(), Error> {
 -        leader.migrate::<Migrations>().await?;
 -
 -        bench::start_benchmark(leader, options, false).await?;
@@ -144,6 +121,3 @@ index b89c75c..4da571d 100644
 +
 +        let remote = options.remote_client;
 +        bench::start_benchmark(benchmark_client, options, remote).await?;
-     }
- 
-     time::sleep(Duration::from_secs(3)).await;
