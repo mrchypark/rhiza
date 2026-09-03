@@ -175,6 +175,24 @@ jobs:
             printf 'Both use `cluster -c 16 -r 100000`, commit `%s`.\n' "$HIQLITE_COMMIT"
           } >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Run Rhiza real-server reference
+        env:
+          RHIZA_SERVER_BENCH_REQUESTS: 100000
+          RHIZA_SERVER_BENCH_CONCURRENCY: 16
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/rhiza-server-candidate" "${{ steps.revisions.outputs.candidate_sha }}"
+          benchmarks/run-server-reference.sh \
+            "$RUNNER_TEMP/rhiza-server-candidate" \
+            "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
+          rhiza_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
+          rhiza_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
+          # shellcheck disable=SC2016
+          {
+            printf '\n## Rhiza real-server reference\n\n'
+            printf 'Power-loss-durable three-voter HTTP/QUIC workload: `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
+            printf 'Uses `-c 16 -n 100000`; every row is verified by a linearizable query.\n'
+          } >>"$GITHUB_STEP_SUMMARY"
+
       - name: Record runner environment
         run: |
           {
