@@ -36,6 +36,21 @@ type phaseFaultTransport struct {
 	n2Down atomic.Bool
 }
 
+type parallelFetchTransport struct {
+	mockTransport
+	value    []byte
+	canceled chan struct{}
+}
+
+func (t *parallelFetchTransport) FetchValue(ctx context.Context, from NodeID, _ ValueHash) ([]byte, error) {
+	if from == "n1" {
+		<-ctx.Done()
+		close(t.canceled)
+		return nil, ctx.Err()
+	}
+	return append([]byte(nil), t.value...), nil
+}
+
 func (t *phaseFaultTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
 	if to == "n2" {
 		if request.Step != 4 || t.n2Down.Load() {
@@ -98,6 +113,29 @@ func (m *mockTransport) StageValue(context.Context, NodeID, ValueHash, []byte) e
 }
 func (m *mockTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
 	return nil, errors.New("value unavailable")
+}
+
+func TestHydrateProposalUsesFirstAvailableSource(t *testing.T) {
+	value := []byte("value")
+	transport := &parallelFetchTransport{value: value, canceled: make(chan struct{})}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n2", &Cluster{Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}, wal, transport)
+	proposal := Proposal{Hash: sha256.Sum256(value)}
+	if err := core.hydrateProposal(context.Background(), &proposal, "n1", "n3"); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(proposal.Value, value) {
+		t.Fatalf("value=%q", proposal.Value)
+	}
+	select {
+	case <-transport.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("slower fetch was not canceled")
+	}
 }
 
 func TestCorePropose(t *testing.T) {

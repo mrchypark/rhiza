@@ -165,6 +165,11 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 			return slot, nil, err
 		}
 		if complete {
+			if tip := c.Tip(); tip+1 < decision.Slot {
+				if err := c.RecoverThrough(ctx, decision.Slot-1); err != nil {
+					return decision.Slot, nil, err
+				}
+			}
 			if _, err := c.completeDecision(ctx, decision.Slot, len(c.config.Members) == 1); err != nil {
 				return decision.Slot, nil, err
 			}
@@ -257,16 +262,46 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 	if transport == nil {
 		return fmt.Errorf("value %x is unavailable", proposal.Hash[:8])
 	}
+	type result struct {
+		value []byte
+	}
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan result, len(sources))
+	pending := 0
+	seen := make(map[NodeID]struct{}, len(sources))
 	for _, source := range sources {
-		value, err := transport.FetchValue(ctx, source, proposal.Hash)
-		if err != nil || sha256.Sum256(value) != proposal.Hash {
+		if source == c.nodeID {
 			continue
 		}
-		if err := c.StoreValue(proposal.Hash, value); err != nil {
-			return err
+		if _, duplicate := seen[source]; duplicate {
+			continue
 		}
-		proposal.Value = value
-		return nil
+		seen[source] = struct{}{}
+		pending++
+		go func(source NodeID) {
+			value, err := transport.FetchValue(fetchCtx, source, proposal.Hash)
+			if err != nil || sha256.Sum256(value) != proposal.Hash {
+				results <- result{}
+				return
+			}
+			results <- result{value: value}
+		}(source)
+	}
+	for range pending {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case result := <-results:
+			if len(result.value) == 0 {
+				continue
+			}
+			if err := c.StoreValue(proposal.Hash, result.value); err != nil {
+				return err
+			}
+			proposal.Value = result.value
+			return nil
+		}
 	}
 	return fmt.Errorf("value %x is unavailable", proposal.Hash[:8])
 }
@@ -480,7 +515,7 @@ func (c *Core) LeaderOrder(slot Slot) ([]NodeID, error) {
 	return c.leaderOrderLocked(slot)
 }
 
-// ProposerOrder returns the agreed hedging order for the next undecided slot.
+// ProposerOrder returns the agreed proposer preference for the next undecided slot.
 func (c *Core) ProposerOrder() []NodeID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -1194,6 +1229,9 @@ func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 		return proposal.Value, nil
 	}
 	c.mu.RUnlock()
+	if c.isLeaderScheduleSlot(slot) {
+		return EncodeLeaderSchedule(c.calculateLeaderSchedule())
+	}
 	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-recovery:%s:%d", c.nodeID, slot)))
 	var nonce [ReadBarrierNonceSize]byte
 	copy(nonce[:], seed[:])

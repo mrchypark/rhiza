@@ -132,6 +132,7 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 }
 
 func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
+	defer stream.CancelRead(0)
 	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
 	response := &peerfb.ResponseT{}
 	data, err := readPeerFrame(stream)
@@ -192,18 +193,6 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			return nil, err
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
-	case peerfb.OperationPropose:
-		if !s.server.ready() {
-			return nil, ErrNotReady
-		}
-		if len(request.Value) == 0 {
-			return nil, fmt.Errorf("value is required")
-		}
-		decision, err := s.server.proposePeer(ctx, member.ID, request.Value)
-		if err != nil {
-			return nil, err
-		}
-		return &peerfb.ResponseT{Decided: decidedToWire(decision)}, nil
 	case peerfb.OperationLearned:
 		if !s.server.ready() {
 			return nil, ErrNotReady

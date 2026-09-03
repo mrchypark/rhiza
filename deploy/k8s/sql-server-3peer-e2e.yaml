@@ -103,8 +103,6 @@ spec:
                 secretKeyRef:
                   name: rhiza-peer-auth
                   key: token
-            - name: RHIZA_HEDGE_DELAY
-              value: 100ms
             - name: GOMEMLIMIT
               value: 384MiB
             - name: RHIZA_CLUSTER_MEMBERS

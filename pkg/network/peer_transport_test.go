@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,29 +14,6 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-type blockedProposalTransport struct{}
-
-func (blockedProposalTransport) SendRecord(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.RecordRequest) (quepaxa.Summary, error) {
-	<-ctx.Done()
-	return quepaxa.Summary{}, ctx.Err()
-}
-func (blockedProposalTransport) SendDecision(ctx context.Context, _ quepaxa.Decision) error {
-	<-ctx.Done()
-	return ctx.Err()
-}
-func (blockedProposalTransport) ReadTip(ctx context.Context, _ quepaxa.NodeID) (quepaxa.Slot, error) {
-	<-ctx.Done()
-	return 0, ctx.Err()
-}
-func (blockedProposalTransport) StageValue(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.ValueHash, _ []byte) error {
-	<-ctx.Done()
-	return ctx.Err()
-}
-func (blockedProposalTransport) FetchValue(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.ValueHash) ([]byte, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
 func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
@@ -46,7 +22,7 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2", Token: "admin-secret"}}, "admin-secret"); peer != nil || err == nil {
@@ -78,6 +54,11 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	}
 	if summary.RecorderID != member.ID || summary.Step != request.Step {
 		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	for range 300 {
+		if _, err := transport.ReadTip(callCtx, member.ID); err != nil {
+			t.Fatalf("stream was not released: %v", err)
+		}
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -160,57 +141,6 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	}
 }
 
-func TestRemoteProposerUsesOperationContext(t *testing.T) {
-	members := []quepaxa.Member{{ID: "n0", Token: "n0-token"}, {ID: "n1", Token: "n1-token"}, {ID: "n2", Token: "n2-token"}}
-	core := mustCore(t, "n0", members, nil, blockedProposalTransport{})
-	server := NewServer(core, nil, "cluster", true, nil, members, 0)
-	defer server.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, members, "admin-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	members[0].PeerURL = "quic://" + peer.Addr()
-	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: members}, "n1-token")
-	defer transport.Close()
-
-	callCtx, callCancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer callCancel()
-	_, err = transport.Propose(callCtx, "n0", quepaxa.EncodeReadBarrier([quepaxa.ReadBarrierNonceSize]byte{1}))
-	if err == nil || !errors.Is(callCtx.Err(), context.DeadlineExceeded) {
-		t.Fatalf("blocked proposer error=%v context=%v, want caller deadline", err, callCtx.Err())
-	}
-}
-
-func TestQuorumRPCRetriesTransientPeerFailure(t *testing.T) {
-	members := []quepaxa.Member{{ID: "n0", Token: "n0-token"}, {ID: "n1", Token: "n1-token"}, {ID: "n2", Token: "n2-token"}}
-	core := mustCore(t, "n0", members, nil, nil)
-	var attempts atomic.Int32
-	server := NewServer(core, nil, "cluster", true, nil, members, 0, func() bool { return attempts.Add(1) > 1 })
-	defer server.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, members, "admin-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	members[0].PeerURL = "quic://" + peer.Addr()
-	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: members}, "n1-token")
-	defer transport.Close()
-
-	callCtx, callCancel := context.WithTimeout(ctx, time.Second)
-	defer callCancel()
-	if _, err := transport.ReadTip(callCtx, "n0"); err != nil {
-		t.Fatalf("quorum RPC did not survive transient peer failure: %v", err)
-	}
-	if attempts.Load() < 2 {
-		t.Fatal("quorum RPC was not retried")
-	}
-}
-
 func TestAllows0RTTOnlyForReadOperations(t *testing.T) {
 	allowed := map[peerfb.Operation]bool{
 		peerfb.OperationSync:       true,
@@ -240,7 +170,7 @@ func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
 func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "voter-token"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: "learner-token"}
 	request := &peerfb.RequestT{
@@ -267,7 +197,7 @@ func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 func TestPeerServerRejectsMutatingEarlyData(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
 	for operation := range peerfb.EnumNamesOperation {
@@ -323,7 +253,7 @@ func TestPeerCodecRejectsWrongMarker(t *testing.T) {
 func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	for slot := quepaxa.Slot(1); slot <= 256; slot++ {
 		value := make([]byte, 8<<10)
@@ -374,7 +304,7 @@ func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
 	if err := core.CompactThrough(1, seal.RootHash); err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(core, nil, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, nil, "cluster", true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")

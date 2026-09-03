@@ -21,10 +21,8 @@ const (
 	maxInflightBatches     = 8
 	maxProposalOperations  = 12
 	maxLocalProposals      = 8
-	maxPeerProposals       = 4
 	maxInflightEncodedByte = 1 << 20
 	maxProposalEncodedByte = 2 << 20
-	maxPeerEncodedByte     = 1 << 20
 	batchItemOverhead      = 128
 )
 

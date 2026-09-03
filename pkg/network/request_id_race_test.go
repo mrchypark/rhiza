@@ -217,7 +217,7 @@ func newInMemoryThreePeerCluster(t testing.TB, gated bool) requestIDRaceCluster 
 		if err != nil {
 			t.Fatal(err)
 		}
-		server := NewServer(core, material, "cluster", true, nil, members, 0)
+		server := NewServer(core, material, "cluster", true, nil)
 		cluster.cores[member.ID] = core
 		cluster.material[member.ID] = material
 		cluster.servers[member.ID] = server

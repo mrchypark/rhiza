@@ -22,7 +22,6 @@ import (
 
 const peerALPN = "rhiza-peer"
 const peerRPCTimeout = 5 * time.Second
-const quorumRetryDelay = 10 * time.Millisecond
 const checkpointPrepareTimeout = 5 * time.Minute
 
 var errPeerRejected = errors.New("peer rejected request")
@@ -189,25 +188,10 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 	return t.callContext(ctx, to, request, waitHandshake)
 }
 
-// callQuorum retransmits failed attempts, but never turns a slow attempt into
-// a failure. The enclosing quorum cancels the call after enough peers reply.
+// callQuorum sends one asynchronous quorum attempt. A failed recorder does not
+// need an in-phase retry: the enclosing quorum completes from other replies.
 func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
-	for {
-		response, err := t.callContext(ctx, to, request, waitHandshake)
-		if err == nil {
-			return response, nil
-		}
-		if errors.Is(err, errPeerRejected) || errors.Is(err, quepaxa.ErrQuorumUnavailable) || errors.Is(err, quepaxa.ErrCompacted) {
-			return nil, err
-		}
-		timer := time.NewTimer(quorumRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
+	return t.callContext(ctx, to, request, waitHandshake)
 }
 
 func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
@@ -393,19 +377,6 @@ func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request q
 		err = fmt.Errorf("recorder identity mismatch: want %s got %s", to, summary.RecorderID)
 	}
 	return summary, err
-}
-
-func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
-	req := t.request(peerfb.OperationPropose)
-	req.Value = value
-	// Later proposers are activated by Server's hedge schedule. Keep this RPC
-	// alive until another proposer wins or the operation itself is canceled;
-	// a transport deadline must not become a synchrony assumption.
-	response, err := t.callContext(ctx, to, req, true)
-	if err != nil {
-		return quepaxa.DecidedValue{}, err
-	}
-	return decidedFromWire(response.Decided)
 }
 
 func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision) error {

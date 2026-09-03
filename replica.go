@@ -241,7 +241,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	r.status.AppliedSlot, r.status.LastSync = r.material.Tip(), time.Now()
 	r.statusMu.Unlock()
 	r.ready.Store(true)
-	r.api = network.NewServer(r.core, r.material, types.ClusterID(config.ClusterID), false, nil, nil, 0, r.ready.Load)
+	r.api = network.NewServer(r.core, r.material, types.ClusterID(config.ClusterID), false, nil, r.ready.Load)
 	r.api.SetObjectStoreStats(func() (map[string]uint64, bool) { return objectStatsMap(r.bucket.Stats()), true })
 	r.api.SetReplicaStatus(func() network.ReplicaStatus {
 		status := r.Status()

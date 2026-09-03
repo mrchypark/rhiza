@@ -262,7 +262,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
+	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
 	if n.checkpoints != nil {
 		server.SetCheckpointPrepare(func(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
 			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
