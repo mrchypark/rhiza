@@ -43,6 +43,21 @@ func TestMaterializerCreatesKVExpiryIndex(t *testing.T) {
 	}
 }
 
+func TestMaterializerDisablesForegroundWALCheckpoint(t *testing.T) {
+	m, err := Open(t.TempDir()+"/checkpoint.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var pages int
+	if err := m.writer.QueryRow(`PRAGMA wal_autocheckpoint`).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != 0 {
+		t.Fatalf("wal_autocheckpoint=%d, want 0", pages)
+	}
+}
+
 func TestMaterializerApply(t *testing.T) {
 	dir, err := os.MkdirTemp("", "materializer-test")
 	if err != nil {

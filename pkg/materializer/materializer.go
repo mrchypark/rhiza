@@ -68,6 +68,9 @@ type Materializer struct {
 	notifyStopOnce     sync.Once
 	notifyWG           sync.WaitGroup
 	notifyDrops        atomic.Uint64
+	walCheckpointStop  chan struct{}
+	walCheckpointOnce  sync.Once
+	walCheckpointWG    sync.WaitGroup
 }
 
 type notificationSubscription struct {
@@ -132,7 +135,7 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
-	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=busy_timeout(5000)"
+	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)"
 	readerDSN := fileURL + "?mode=ro&_pragma=busy_timeout(5000)"
 
 	// Open main database for metadata
@@ -172,6 +175,7 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		subs:              make(map[uint64]notificationSubscription),
 		notifyQueue:       make(chan pendingNotification, notificationDispatchDepth),
 		notifyStop:        make(chan struct{}),
+		walCheckpointStop: make(chan struct{}),
 	}
 	m.notifyWG.Add(1)
 	go m.runNotifications()
@@ -195,6 +199,8 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		return nil, fmt.Errorf("open graph materializer: %w", err)
 	}
 	m.graph = graph
+	m.walCheckpointWG.Add(1)
+	go m.runSQLiteCheckpoints()
 
 	return m, nil
 }
@@ -630,6 +636,30 @@ func (m *Materializer) runNotifications() {
 			m.publishNotification(notification.topic, notification.payload)
 		}
 	}
+}
+
+func (m *Materializer) runSQLiteCheckpoints() {
+	defer m.walCheckpointWG.Done()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.walCheckpointStop:
+			return
+		case <-ticker.C:
+			m.mu.RLock()
+			db := m.db
+			m.mu.RUnlock()
+			if db != nil {
+				_, _ = db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+			}
+		}
+	}
+}
+
+func (m *Materializer) stopSQLiteCheckpoints() {
+	m.walCheckpointOnce.Do(func() { close(m.walCheckpointStop) })
+	m.walCheckpointWG.Wait()
 }
 
 func (m *Materializer) enqueueNotification(notification pendingNotification) {
@@ -1907,6 +1937,7 @@ func (m *Materializer) reopen() error {
 }
 
 func (m *Materializer) adopt(source *Materializer) {
+	source.stopSQLiteCheckpoints()
 	m.db, m.writer, m.readers, m.graph = source.db, source.writer, source.readers, source.graph
 	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
 	m.recentSQLReceipts = source.recentSQLReceipts
@@ -1931,6 +1962,7 @@ func (m *Materializer) StateTip() uint64 {
 
 // Close closes all connections.
 func (m *Materializer) Close() error {
+	m.stopSQLiteCheckpoints()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.notifyStopOnce.Do(func() { close(m.notifyStop) })
