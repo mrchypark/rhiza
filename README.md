@@ -94,7 +94,7 @@ return one bounded `MutationReceipt`; use `Query` for result rows.
 
 ### Graph and Cypher
 
-Rhiza uses `latticedb-go v0.2.1` and exposes its deliberately small,
+Rhiza uses `latticedb-go v0.3.0` and exposes its deliberately small,
 case-sensitive Cypher subset. This is not full openCypher. Structural keywords
 must be uppercase.
 
@@ -126,8 +126,8 @@ replicated mutations. Mutation statements are applied atomically with their
 request receipt and optional stream events.
 
 The dependency owns the complete language contract. See the version-pinned
-[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.2.1/docs/engine_conformance.md#supported-cypher-subset)
-and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.2.1/internal/engine/testdata/query_grammar.ebnf).
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/internal/engine/testdata/query_grammar.ebnf).
 
 ### Graph streams
 
@@ -285,7 +285,7 @@ three-peer manifests under `deploy/k8s`, and run the matching tests under
 Benchmark instructions and durable result artifacts live under
 [`benchmarks`](benchmarks). Performance claims belong with the exact code,
 environment, and raw measurements that produced them rather than in this
-README. The current LatticeDB v0.2.1 qualification is attached in
+README. The last archived LatticeDB v0.2.1 qualification is attached in
 [`2026-09-01-latticedb-0.2.1-current`](benchmarks/results/2026-09-01-latticedb-0.2.1-current/REPORT.md).
 The same-host reproduction of Hiqlite's official three-node benchmark and its
 comparison boundaries are in
