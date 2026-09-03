@@ -149,7 +149,8 @@ jobs:
           rustup toolchain install 1.97.1 --profile minimal
           git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
           git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
-          git -C "$RUNNER_TEMP/hiqlite" apply "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch"
+          git -C "$RUNNER_TEMP/hiqlite" apply --unidiff-zero --whitespace=nowarn \
+            "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch"
           cargo +1.97.1 build --release \
             --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
           (
