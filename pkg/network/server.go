@@ -140,7 +140,7 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 	if barrier, err := types.DecodeReadBarrier(value); err != nil || !barrier {
 		return 0, fmt.Errorf("read barrier control value is required")
 	}
-	return s.proposeHedged(ctx, value)
+	return s.proposeHedged(ctx, bytes.Clone(value))
 }
 
 func (s *Server) lockRequest(id string) func() {
@@ -338,7 +338,7 @@ func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot,
 		s.operationB += len(value)
 		s.localB += len(value)
 		s.proposalWG.Add(1)
-		go s.runProposal(hash, call, bytes.Clone(value))
+		go s.runProposal(hash, call, value)
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
