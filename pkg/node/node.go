@@ -902,9 +902,15 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 		}
 		if !n.ready.Load() {
 			n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
-		} else if source, ok := syncSource(n.config.NodeID, cluster.Members, round); ok {
-			if err := n.catchUpPeer(ctx, transport, source); err != nil {
-				log.Printf("operation sync from %s failed: %v", source, err)
+		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
+			var syncErr error
+			for _, source := range sources {
+				if syncErr = n.catchUpPeer(ctx, transport, source); syncErr == nil {
+					break
+				}
+			}
+			if syncErr != nil {
+				log.Printf("operation sync from all peers failed: %v", syncErr)
 			}
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
@@ -935,7 +941,7 @@ func syncInterval(nodeID quepaxa.NodeID, round uint64) time.Duration {
 	return time.Duration(900+binary.BigEndian.Uint16(hash[:2])%201) * time.Millisecond
 }
 
-func syncSource(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) (quepaxa.NodeID, bool) {
+func syncSources(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) []quepaxa.NodeID {
 	peers := make([]quepaxa.NodeID, 0, len(members)-1)
 	for _, member := range members {
 		if member.ID != nodeID {
@@ -943,14 +949,15 @@ func syncSource(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) (
 		}
 	}
 	if len(peers) == 0 {
-		return "", false
+		return nil
 	}
 	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-sync-peer:%s:%d", nodeID, round/uint64(len(peers)))))
 	for i := len(peers) - 1; i > 0; i-- {
 		j := int(binary.BigEndian.Uint64(seed[(i*8)%24:]) % uint64(i+1))
 		peers[i], peers[j] = peers[j], peers[i]
 	}
-	return peers[round%uint64(len(peers))], true
+	first := int(round % uint64(len(peers)))
+	return append(peers[first:], peers[:first]...)
 }
 
 func (n *Node) observeCatchUp(err error) {

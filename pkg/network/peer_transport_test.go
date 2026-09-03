@@ -14,6 +14,29 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+type blockedProposalTransport struct{}
+
+func (blockedProposalTransport) SendRecord(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.RecordRequest) (quepaxa.Summary, error) {
+	<-ctx.Done()
+	return quepaxa.Summary{}, ctx.Err()
+}
+func (blockedProposalTransport) SendDecision(ctx context.Context, _ quepaxa.Decision) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (blockedProposalTransport) ReadTip(ctx context.Context, _ quepaxa.NodeID) (quepaxa.Slot, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+func (blockedProposalTransport) StageValue(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.ValueHash, _ []byte) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+func (blockedProposalTransport) FetchValue(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.ValueHash) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
@@ -133,6 +156,32 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	defer wrong.Close()
 	if _, err := wrong.SendRecord(callCtx, member.ID, request); err == nil {
 		t.Fatal("peer with the wrong token-bound certificate identity was accepted")
+	}
+}
+
+func TestRemoteProposerDoesNotHoldHedgedRequestForGeneralPeerTimeout(t *testing.T) {
+	members := []quepaxa.Member{{ID: "n0", Token: "n0-token"}, {ID: "n1", Token: "n1-token"}, {ID: "n2", Token: "n2-token"}}
+	core := mustCore(t, "n0", members, nil, blockedProposalTransport{})
+	server := NewServer(core, nil, "cluster", true, nil, members, 0)
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, members, "admin-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	members[0].PeerURL = "quic://" + peer.Addr()
+	transport := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: members}, "n1-token")
+	defer transport.Close()
+
+	started := time.Now()
+	_, err = transport.Propose(ctx, "n0", quepaxa.EncodeReadBarrier([quepaxa.ReadBarrierNonceSize]byte{1}))
+	if err == nil {
+		t.Fatal("blocked proposer unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 2*proposerRPCTimeout {
+		t.Fatalf("blocked proposer took %s, want at most %s", elapsed, 2*proposerRPCTimeout)
 	}
 }
 

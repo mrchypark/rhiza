@@ -226,7 +226,8 @@ jobs:
               p99=$(jq -r '.result.p99_ms' "$file")
               max=$(jq -r '.result.max_ms' "$file")
               retries=$(jq -r '.result.retries // 0' "$file")
-              printf 'Peer `%s` SIGKILL during load: `%s ops/s`, p99 `%s ms`, max `%s ms`, `%s` commit-unknown retries, zero failed writes.\n\n' "$peer" "$ops" "$p99" "$max" "$retries"
+              log_failures=$(jq -r '.runtime_failure_lines' "$file")
+              printf 'Peer `%s` SIGKILL during load: `%s ops/s`, p99 `%s ms`, max `%s ms`, `%s` commit-unknown retries, zero failed writes, `%s` runtime failure log lines.\n\n' "$peer" "$ops" "$p99" "$max" "$retries" "$log_failures"
             done
             printf 'QuePaxa has no stable leader role, so failures are reported by peer identity. Each fault is injected during `-c 16 -n 100000`; every acknowledged row is verified by a linearizable query.\n'
           } >>"$GITHUB_STEP_SUMMARY"

@@ -14,6 +14,7 @@ concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
 failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
+hedge_delay=${RHIZA_SERVER_BENCH_HEDGE_DELAY:-100ms}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
 base_peer_port=${RHIZA_SERVER_BENCH_PEER_PORT:-19100}
 minio_port=${RHIZA_SERVER_BENCH_MINIO_PORT:-19000}
@@ -40,15 +41,12 @@ fi
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
 container="rhiza-bench-minio-$$"
-on_error() {
-	local code=$?
+cleanup() {
+	output_stem=$(basename "$output_file" .json)
 	for log in "$run_dir"/node-*.log; do
 		[[ -f $log ]] || continue
-		cp "$log" "$(dirname "$output_file")/rhiza-server-$(basename "$log")"
+		cp "$log" "$(dirname "$output_file")/$output_stem-$(basename "$log")"
 	done
-	return "$code"
-}
-cleanup() {
 	for pid_file in "$run_dir"/node-*.pid; do
 		[[ -f $pid_file ]] || continue
 		pid=$(<"$pid_file")
@@ -60,7 +58,6 @@ cleanup() {
 		"${TMPDIR:-/tmp}"/rhiza-server-bench.*) rm -rf -- "$run_dir" ;;
 	esac
 }
-trap on_error ERR
 trap cleanup EXIT
 
 (cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
@@ -88,7 +85,7 @@ for i in 0 1 2; do
 		RHIZA_OBJSTORE_PREFIX=server-bench RHIZA_OBJSTORE_REGION=us-east-1 RHIZA_OBJSTORE_INSECURE=true \
 		RHIZA_OBJSTORE_ACCESS_KEY=rhiza-e2e RHIZA_OBJSTORE_SECRET_KEY=rhiza-e2e-secret \
 		RHIZA_OBJSTORE_DURABILITY=async RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
-		RHIZA_HEDGE_DELAY=100ms "$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
+		RHIZA_HEDGE_DELAY="$hedge_delay" "$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
 	printf '%s' "$!" >"$run_dir/node-$i.pid"
 done
 for i in 0 1 2; do
@@ -133,6 +130,11 @@ count=$(curl -fsS -H 'Content-Type: application/json' \
 	"$target/sql/query")
 jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests' <<<"$result" >/dev/null
 jq -e --argjson requests "$requests" '.rows == [[$requests]]' <<<"$count" >/dev/null
-jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),concurrency:$concurrency,result:$result,verification:$count}' \
+runtime_failure_lines=0
+for log in "$run_dir"/node-*.log; do
+	log_failures=$(grep -Eic 'error|failed|timeout' "$log" || true)
+	runtime_failure_lines=$((runtime_failure_lines + log_failures))
+done
+jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" --arg hedge_delay "$hedge_delay" \
+	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),hedge_delay:$hedge_delay,concurrency:$concurrency,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"

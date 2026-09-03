@@ -51,7 +51,10 @@ The Rhiza server qualification injects `SIGKILL` into each named voter while
 the 100,000-write workload is running. QuePaxa has no stable leader role, so
 results are reported by peer identity (`n0`, `n1`, `n2`) with throughput, p99,
 maximum request latency, retries, and a linearizable final row-count check.
-Zero final request errors across all three runs is the availability gate.
+Zero final request errors across all three runs is the availability gate. Node
+logs are always uploaded, and each result counts lines containing `error`,
+`failed`, or `timeout` so internal failure noise is visible beside client
+correctness.
 
 Hiqlite remains an external Raft reference, not a direct algorithm comparison.
 Its leader/follower cases gracefully stop one peer and wait for a replacement

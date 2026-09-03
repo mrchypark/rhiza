@@ -22,6 +22,7 @@ import (
 
 const peerALPN = "rhiza-peer"
 const peerRPCTimeout = 5 * time.Second
+const proposerRPCTimeout = 500 * time.Millisecond
 const checkpointPrepareTimeout = 5 * time.Minute
 
 type peerConnection struct {
@@ -365,7 +366,10 @@ func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request q
 func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
 	req := t.request(peerfb.OperationPropose)
 	req.Value = value
-	response, err := t.call(ctx, to, req, true)
+	// Every ingress also starts its local proposer. A remote proposer is only a
+	// hedge, so a dead peer must not hold the client path for the general RPC
+	// timeout while the local and other remote proposers can still make quorum.
+	response, err := t.callWithTimeout(ctx, to, req, true, proposerRPCTimeout)
 	if err != nil {
 		return quepaxa.DecidedValue{}, err
 	}
