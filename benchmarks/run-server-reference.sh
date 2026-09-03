@@ -132,7 +132,7 @@ jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests' 
 jq -e --argjson requests "$requests" '.rows == [[$requests]]' <<<"$count" >/dev/null
 runtime_failure_lines=0
 for log in "$run_dir"/node-*.log; do
-	log_failures=$(grep -Eic 'error|failed|timeout' "$log" || true)
+	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
 jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" --arg hedge_delay "$hedge_delay" \

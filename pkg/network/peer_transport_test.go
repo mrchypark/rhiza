@@ -180,8 +180,8 @@ func TestRemoteProposerDoesNotHoldHedgedRequestForGeneralPeerTimeout(t *testing.
 	if err == nil {
 		t.Fatal("blocked proposer unexpectedly succeeded")
 	}
-	if elapsed := time.Since(started); elapsed > 2*proposerRPCTimeout {
-		t.Fatalf("blocked proposer took %s, want at most %s", elapsed, 2*proposerRPCTimeout)
+	if elapsed := time.Since(started); elapsed > 2*quorumRPCTimeout {
+		t.Fatalf("blocked proposer took %s, want at most %s", elapsed, 2*quorumRPCTimeout)
 	}
 }
 

@@ -54,7 +54,8 @@ maximum request latency, retries, and a linearizable final row-count check.
 Zero final request errors across all three runs is the availability gate. Node
 logs are always uploaded, and each result counts lines containing `error`,
 `failed`, or `timeout` so internal failure noise is visible beside client
-correctness.
+correctness. The known quic-go host UDP receive-buffer warning is excluded from
+that application-failure count.
 
 Hiqlite remains an external Raft reference, not a direct algorithm comparison.
 Its leader/follower cases gracefully stop one peer and wait for a replacement

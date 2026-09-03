@@ -22,7 +22,7 @@ import (
 
 const peerALPN = "rhiza-peer"
 const peerRPCTimeout = 5 * time.Second
-const proposerRPCTimeout = 500 * time.Millisecond
+const quorumRPCTimeout = 500 * time.Millisecond
 const checkpointPrepareTimeout = 5 * time.Minute
 
 type peerConnection struct {
@@ -352,7 +352,7 @@ func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, f
 func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	req := t.request(peerfb.OperationRecord)
 	req.Record = &peerfb.RecordRequestT{Slot: uint64(request.Slot), Step: uint64(request.Step), Proposal: proposalToWire(request.Proposal)}
-	response, err := t.call(ctx, to, req, false)
+	response, err := t.callWithTimeout(ctx, to, req, false, quorumRPCTimeout)
 	if err != nil {
 		return quepaxa.Summary{}, err
 	}
@@ -369,7 +369,7 @@ func (t *Transport) Propose(ctx context.Context, to quepaxa.NodeID, value []byte
 	// Every ingress also starts its local proposer. A remote proposer is only a
 	// hedge, so a dead peer must not hold the client path for the general RPC
 	// timeout while the local and other remote proposers can still make quorum.
-	response, err := t.callWithTimeout(ctx, to, req, true, proposerRPCTimeout)
+	response, err := t.callWithTimeout(ctx, to, req, true, quorumRPCTimeout)
 	if err != nil {
 		return quepaxa.DecidedValue{}, err
 	}
@@ -389,7 +389,7 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 		go func(member quepaxa.Member) {
 			req := t.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
-			_, err := t.call(callCtx, member.ID, req, false)
+			_, err := t.callWithTimeout(callCtx, member.ID, req, false, quorumRPCTimeout)
 			results <- err
 		}(member)
 	}
@@ -423,7 +423,7 @@ func decisionHasRecorder(decision quepaxa.Decision, id quepaxa.NodeID) bool {
 }
 
 func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slot, error) {
-	response, err := t.call(ctx, to, t.request(peerfb.OperationReadIndex), false)
+	response, err := t.callWithTimeout(ctx, to, t.request(peerfb.OperationReadIndex), false, quorumRPCTimeout)
 	if err != nil {
 		return 0, err
 	}
