@@ -24,6 +24,8 @@ var (
 
 const leaderEpochSize Slot = 16
 
+const recorderHedgeDelay = time.Millisecond
+
 type leaderTiming struct {
 	average time.Duration
 	samples uint64
@@ -578,12 +580,7 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			}
 			candidate.Priority = priority
 		}
-		requests := make(map[NodeID]RecordRequest, len(c.config.Members))
-		for _, member := range c.config.Members {
-			requests[member.ID] = RecordRequest{Slot: slot, Step: step, Proposal: candidate}
-		}
-
-		summaries, err := c.recordQuorum(ctx, requests)
+		summaries, err := c.recordQuorum(ctx, RecordRequest{Slot: slot, Step: step, Proposal: candidate}, leaderOrder)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -689,15 +686,32 @@ func maxPrior(summaries []Summary) *Proposal {
 	return best
 }
 
-func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordRequest) ([]Summary, error) {
+func (c *Core) recordQuorum(ctx context.Context, request RecordRequest, order []NodeID) ([]Summary, error) {
 	type result struct {
 		summary Summary
 		err     error
 	}
-	results := make(chan result, len(requests))
+	targets := make([]NodeID, 0, len(c.config.Members))
+	targets = append(targets, c.nodeID)
+	for _, nodeID := range order {
+		if !slices.Contains(targets, nodeID) {
+			targets = append(targets, nodeID)
+		}
+	}
+	for _, member := range c.config.Members {
+		if !slices.Contains(targets, member.ID) {
+			targets = append(targets, member.ID)
+		}
+	}
+
+	quorum := c.config.QuorumSize()
+	if len(targets) < quorum {
+		return nil, ErrQuorumUnavailable
+	}
+	results := make(chan result, len(targets))
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	for nodeID, request := range requests {
+	launch := func(nodeID NodeID) {
 		go func(nodeID NodeID, request RecordRequest) {
 			var summary Summary
 			var err error
@@ -708,18 +722,37 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 			} else {
 				summary, err = c.transport.SendRecord(callCtx, nodeID, request)
 			}
+			if err == nil && summary.RecorderID != nodeID {
+				err = fmt.Errorf("recorder identity mismatch: want %s got %s", nodeID, summary.RecorderID)
+			}
 			results <- result{summary: summary, err: err}
 		}(nodeID, request)
 	}
 
-	quorum := c.config.QuorumSize()
+	next := 0
+	launched := 0
+	// Start the minimum durable quorum; a failure or bounded delay fans out to standby voters.
+	for launched < quorum {
+		launch(targets[next])
+		next++
+		launched++
+	}
+	var hedge *time.Timer
+	var hedgeC <-chan time.Time
+	if next < len(targets) {
+		hedge = time.NewTimer(recorderHedgeDelay)
+		hedgeC = hedge.C
+		defer hedge.Stop()
+	}
 	summaries := make([]Summary, 0, quorum)
 	var firstErr error
-	for completed := 0; completed < len(requests); completed++ {
+	completed := 0
+	for completed < launched || next < len(targets) {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case result := <-results:
+			completed++
 			if result.err == nil {
 				summaries = append(summaries, result.summary)
 				if len(summaries) == quorum {
@@ -727,6 +760,23 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 				}
 			} else if firstErr == nil {
 				firstErr = result.err
+			}
+			if result.err != nil && next < len(targets) {
+				launch(targets[next])
+				next++
+				launched++
+				if next == len(targets) {
+					hedgeC = nil
+				}
+			}
+		case <-hedgeC:
+			launch(targets[next])
+			next++
+			launched++
+			if next < len(targets) {
+				hedge.Reset(recorderHedgeDelay)
+			} else {
+				hedgeC = nil
 			}
 		}
 	}

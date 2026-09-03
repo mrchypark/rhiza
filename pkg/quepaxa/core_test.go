@@ -21,6 +21,7 @@ type mockTransport struct {
 	sendDecisionCalls int
 	sendDecisionErr   error
 	sendDecision      func(context.Context, Decision) error
+	sendRecord        func(context.Context, NodeID, RecordRequest) (Summary, error)
 	stageCalls        atomic.Uint64
 	inlineValues      atomic.Uint64
 }
@@ -76,11 +77,122 @@ func (t *cancelReadTransport) ReadTip(ctx context.Context, to NodeID) (Slot, err
 	return 0, ctx.Err()
 }
 
-func (m *mockTransport) SendRecord(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
+func (m *mockTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
+	if m.sendRecord != nil {
+		return m.sendRecord(ctx, to, request)
+	}
 	if len(request.Proposal.Value) != 0 {
 		m.inlineValues.Add(1)
 	}
 	return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
+}
+
+func TestRecordQuorumHedgesFailedRecorder(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	var fallback atomic.Bool
+	transport := &mockTransport{sendRecord: func(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
+		if to == "node-2" {
+			return Summary{}, errors.New("node-2 down")
+		}
+		fallback.Store(true)
+		return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
+	}}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	proposal := newProposal(highestPriority, "node-1", []byte("fallback"))
+	summaries, err := core.recordQuorum(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}, []NodeID{"node-1", "node-2", "node-3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 2 || !fallback.Load() {
+		t.Fatalf("summaries=%v fallback=%v", summaries, fallback.Load())
+	}
+}
+
+func TestRecordQuorumUsesRemoteQuorumWhenLocalRecordFails(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &mockTransport{}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	core.observer = true
+	proposal := newProposal(highestPriority, "node-1", []byte("remote quorum"))
+	summaries, err := core.recordQuorum(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}, []NodeID{"node-1", "node-2", "node-3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[NodeID]bool{}
+	for _, summary := range summaries {
+		seen[summary.RecorderID] = true
+	}
+	if !seen["node-2"] || !seen["node-3"] {
+		t.Fatalf("summaries=%v, want remote quorum", summaries)
+	}
+}
+
+func TestRecordQuorumHedgesHungRecorder(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	transport := &mockTransport{sendRecord: func(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
+		if to == "node-2" {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return Summary{}, ctx.Err()
+		}
+		return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
+	}}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	proposal := newProposal(highestPriority, "node-1", []byte("hedge"))
+	if _, err := core.recordQuorum(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}, []NodeID{"node-1", "node-2", "node-3"}); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("hung recorder was not canceled after quorum")
+	}
+}
+
+func TestRecordQuorumRejectsDuplicateRecorderIdentity(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &mockTransport{sendRecord: func(_ context.Context, to NodeID, request RecordRequest) (Summary, error) {
+		if to == "node-2" {
+			to = "node-1"
+		}
+		return Summary{RecorderID: to, Step: request.Step, FirstCurrent: cloneProposal(&request.Proposal)}, nil
+	}}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	proposal := newProposal(highestPriority, "node-1", []byte("identity"))
+	summaries, err := core.recordQuorum(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}, []NodeID{"node-1", "node-2", "node-3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[NodeID]bool, len(summaries))
+	for _, summary := range summaries {
+		if seen[summary.RecorderID] {
+			t.Fatalf("duplicate recorder identity in summaries: %v", summaries)
+		}
+		seen[summary.RecorderID] = true
+	}
+	if !seen["node-1"] || !seen["node-3"] {
+		t.Fatalf("summaries=%v, want node-1 and node-3", summaries)
+	}
 }
 
 func (m *mockTransport) SendDecision(ctx context.Context, decision Decision) error {
