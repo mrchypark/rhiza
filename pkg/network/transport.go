@@ -190,8 +190,8 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 			return nil, err
 		}
 		response, err := t.callConnection(ctx, conn, request)
-		t.release(to, conn)
 		if errors.Is(err, quic.Err0RTTRejected) && !retried0RTT {
+			t.release(to, conn)
 			// The early stream was discarded, not executed. Promote this same
 			// connection to 1-RTT and replay the request once within its original
 			// deadline. This prevents a peer restart from consuming one whole
@@ -203,6 +203,10 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 			retried0RTT = true
 			continue
 		}
+		if err != nil && response == nil {
+			t.invalidate(to, conn)
+		}
+		t.release(to, conn)
 		if response != nil {
 			switch response.ErrorCode {
 			case peerErrorQuorum:
@@ -212,7 +216,6 @@ func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, requ
 			}
 		}
 		if err != nil {
-			t.invalidate(to, conn)
 			return nil, err
 		}
 		return response, nil
