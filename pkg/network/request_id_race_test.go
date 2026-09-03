@@ -207,7 +207,6 @@ func BenchmarkThreePeerSQLExecute(b *testing.B) {
 			cluster := newInMemoryThreePeerCluster(b, false)
 			cluster.transport.benchmarkQuorum = true
 			server := cluster.servers["n1"]
-			server.hedgeDelay = 100 * time.Millisecond // Match rhiza.DefaultHedgeDelay.
 			if _, err := server.Execute(context.Background(), ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY)"}); err != nil {
 				b.Fatal(err)
 			}
