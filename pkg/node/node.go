@@ -35,6 +35,7 @@ type Node struct {
 	server       *network.Server
 	peer         *network.PeerServer
 	transport    *network.Transport
+	catchUp      *network.Transport
 	wal          *qlog.WAL
 	lock         *qlog.LockFile
 	bucket       *objectstore.MeteredBucket
@@ -226,6 +227,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
+		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
 	}
 	core, err := quepaxa.New(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport,
@@ -381,7 +383,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
-			n.startCatchUp(ctx, transport, cluster)
+			n.startCatchUp(ctx, n.catchUp, cluster)
 		}()
 	}
 
@@ -1130,6 +1132,10 @@ func (n *Node) Shutdown() error {
 	if n.transport != nil {
 		n.transport.Close()
 		n.transport = nil
+	}
+	if n.catchUp != nil {
+		n.catchUp.Close()
+		n.catchUp = nil
 	}
 	if n.core != nil {
 		n.core.StopPeriodicSync()

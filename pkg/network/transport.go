@@ -303,7 +303,11 @@ func (t *Transport) invalidate(to quepaxa.NodeID, conn *quic.Conn) {
 	if peer.conn == conn {
 		peer.conn = nil
 	}
+	idle := peer.active[conn] == 0
 	peer.mu.Unlock()
+	if idle {
+		_ = conn.CloseWithError(0, "reconnect")
+	}
 }
 
 func (t *Transport) release(to quepaxa.NodeID, conn *quic.Conn) {

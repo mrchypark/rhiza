@@ -83,7 +83,11 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 		t.Fatalf("request after stream cancellation: %v", err)
 	}
 	transport.invalidate(member.ID, first)
-	_ = first.CloseWithError(0, "reconnect")
+	select {
+	case <-first.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("idle invalidated connection remained open")
+	}
 	request.Step++
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatal(err)
