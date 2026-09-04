@@ -65,7 +65,7 @@ run_revision() {
 			qlog) benchmark='^BenchmarkWAL(AppendSync|ScanScratch)$' ;;
 			quepaxa) benchmark='^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' ;;
 			materializer) benchmark='^BenchmarkSQLBatchApply/(1|8|32|64|128)$' ;;
-			network) benchmark='^Benchmark(ThreePeerSQLExecute|CertifiedThreePeerSQLExecute)/(c4|c16|c64)$' ;;
+			network) benchmark='^Benchmark(ThreePeerSQLExecute|CertifiedThreePeerSQLExecute|ThreePeerSQLExecuteReturning)' ;;
 		esac
 		(
 			cd "$source"

@@ -262,6 +262,57 @@ func BenchmarkThreePeerSQLExecute(b *testing.B) {
 	}
 }
 
+func BenchmarkThreePeerSQLExecuteReturning(b *testing.B) {
+	const nearLimitPayload = materializer.MaxMutationResultBytes - 128
+	for _, benchmark := range []struct {
+		name        string
+		rows        int
+		payloadSize int
+	}{
+		{name: "rows1", rows: 1},
+		{name: "rows100", rows: 100},
+		{name: "bytes1MiB", rows: 1, payloadSize: nearLimitPayload},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			cluster := newInMemoryThreePeerCluster(b, false)
+			cluster.transport.benchmarkQuorum = true
+			server := cluster.servers["n1"]
+			if _, err := server.Execute(context.Background(), ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY, version INTEGER NOT NULL, payload BLOB NOT NULL)"}); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := server.Execute(context.Background(), ExecuteRequest{
+				RequestID: "seed",
+				SQL:       "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < ?) INSERT INTO bench SELECT n, 0, zeroblob(?) FROM seq",
+				Args:      []any{int64(benchmark.rows), int64(benchmark.payloadSize)},
+			}); err != nil {
+				b.Fatal(err)
+			}
+			var sequence atomic.Uint64
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				id := sequence.Add(1)
+				response, err := server.ExecuteReturning(context.Background(), ExecuteRequest{
+					RequestID: strconv.FormatUint(id, 10),
+					SQL:       "UPDATE bench SET version = version + 1 RETURNING id, version, payload",
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if response.Status != types.MutationCommitted || len(response.Statements) != 1 || len(response.Statements[0].Rows) != benchmark.rows {
+					b.Fatalf("unexpected returning response: %+v", response)
+				}
+				if benchmark.payloadSize != 0 && len(response.Statements[0].Rows[0][2].([]byte)) != benchmark.payloadSize {
+					b.Fatalf("payload size=%d", len(response.Statements[0].Rows[0][2].([]byte)))
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(benchmark.rows), "rows/op")
+			b.ReportMetric(float64(benchmark.payloadSize), "payload-bytes/op")
+		})
+	}
+}
+
 func BenchmarkCertifiedThreePeerSQLExecute(b *testing.B) {
 	for _, parallelism := range []int{2, 8, 32} {
 		b.Run("c"+strconv.Itoa(parallelism*runtime.GOMAXPROCS(0)), func(b *testing.B) {

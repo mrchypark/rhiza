@@ -39,7 +39,9 @@ jq -s -f benchmarks/summarize.jq benchmarks/results/<run>/raw/*.ndjson \
 request with its base commit on the same fixed `ubuntu-24.04` runner. It builds
 the benchmark binaries before measurement, pins `GOMAXPROCS=2`, and alternates
 base and candidate execution order across ten samples. The Job Summary contains
-the `benchstat` comparison and a pinned execution of Hiqlite's official
+three-peer `ExecuteReturning` measurements for 1 row, 100 rows, and a
+near-1-MiB result through the in-process server API, plus the `benchstat`
+comparison and a pinned execution of Hiqlite's official
 three-node local-client workload (`cluster -c 16 -r 100000`, commit
 `c3ff2536ac985ecb9f77201d1b58dab66c7b256e`). Raw Go and Hiqlite output plus
 runner provenance are uploaded as a 30-day artifact. Until this workflow first
