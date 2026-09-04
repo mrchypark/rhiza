@@ -950,6 +950,10 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 	if err != nil {
 		return err
 	}
+	pending, err := c.appendUndurablePrefix(seal.Index)
+	if err != nil {
+		return err
+	}
 	if err := c.wal.Append(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}); err != nil {
 		return err
 	}
@@ -957,10 +961,60 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 		return err
 	}
 	c.mu.Lock()
+	for _, value := range pending {
+		if decided, ok := c.decided[value.Slot]; ok && decided.Hash == value.Hash {
+			c.durable[value.Slot] = true
+			c.valueDurable[value.Hash] = true
+		}
+	}
 	clear(c.preparedCheckpoints)
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Core) appendUndurablePrefix(through Slot) ([]SlotValue, error) {
+	c.mu.RLock()
+	floor := c.floor
+	c.mu.RUnlock()
+	pending := make([]SlotValue, 0)
+	if floor >= through {
+		return pending, nil
+	}
+	for slot := floor + 1; ; slot++ {
+		lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
+		lock.Lock()
+		c.mu.Lock()
+		decided, ok := c.decided[slot]
+		if !ok {
+			c.mu.Unlock()
+			lock.Unlock()
+			return nil, fmt.Errorf("slot %d is not decided", slot)
+		}
+		if !c.logged[slot] {
+			decision, err := decodeDecision(decided.Certificate)
+			if err != nil {
+				c.mu.Unlock()
+				lock.Unlock()
+				return nil, err
+			}
+			if err := c.appendDecision(decision, decided.Value, decided.Certificate); err != nil {
+				c.mu.Unlock()
+				lock.Unlock()
+				return nil, err
+			}
+			c.logged[slot] = true
+		}
+		if !c.durable[slot] {
+			pending = append(pending, SlotValue{Slot: slot, Hash: decided.Hash})
+		}
+		c.mu.Unlock()
+		lock.Unlock()
+		if slot == through {
+			break
+		}
+	}
+	return pending, nil
 }
 
 // VerifyCheckpoint preserves the public API while using the prepare protocol.

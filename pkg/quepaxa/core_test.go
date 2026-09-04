@@ -1222,6 +1222,74 @@ func TestPrepareCheckpointLocksOneRootPerIndexAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestPrepareCheckpointPersistsLearnedPrefixAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &Cluster{ConfigID: 3, Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}
+	core := newCore("n2", config, wal, nil)
+	for slot := Slot(1); slot <= 3; slot++ {
+		proposal := newProposal(highestPriority, "n1", []byte(fmt.Sprintf("learned-%d", slot)))
+		recorded, err := core.Record(context.Background(), RecordRequest{Slot: slot, Step: 4, Proposal: proposal})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decision := Decision{Slot: slot, Step: 4, Proposal: proposal, Summaries: []Summary{{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)}, recorded}}
+		if err := core.AcceptDecisionHint(decision); err != nil {
+			t.Fatal(err)
+		}
+		if core.logged[slot] || core.durable[slot] {
+			t.Fatalf("learned decision %d was already durable before checkpoint prepare", slot)
+		}
+	}
+	prefix, ok := core.PrefixHash(3)
+	if !ok {
+		t.Fatal("learned decision did not advance the certified prefix")
+	}
+	order, err := core.LeaderOrder(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	seal := CheckpointSeal{ConfigID: 3, Index: 3, RootHash: sha256.Sum256([]byte("root")), StateHash: sha256.Sum256([]byte("state")), PrefixHash: prefix, NextLeaderOrder: order}
+	core.commits = newGroupCommit(func() error { return errors.New("sync failed") })
+	if err := core.PrepareCheckpoint(context.Background(), seal); err == nil {
+		t.Fatal("failed prefix sync was acknowledged")
+	}
+	for slot := Slot(1); slot <= 3; slot++ {
+		if core.durable[slot] {
+			t.Fatalf("learned decision %d became durable after failed sync", slot)
+		}
+	}
+	core.commits = newGroupCommit(wal.Sync)
+	if err := core.PrepareCheckpoint(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	for slot := Slot(1); slot <= 3; slot++ {
+		if !core.logged[slot] || !core.durable[slot] {
+			t.Fatalf("checkpoint prepare did not make certified prefix slot %d durable", slot)
+		}
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered := newCore("n2", config, reopened, nil)
+	if err := recovered.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RequirePreparedCheckpoint(seal); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCompactionPrunesAllocatorAndRejectsClosedSlots(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)

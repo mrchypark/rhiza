@@ -64,6 +64,17 @@ for peer in 0 1 2; do
   wait_value "$peer" before-fault
 done
 
+for peer in 0 1 2; do
+  deadline=$((SECONDS + 60))
+  until dory k8s logs "pod/rhiza-sql-${peer}" -n rhiza-3peer-e2e | grep -Fq 'checkpoint prepared: index='; do
+    (( SECONDS < deadline )) || {
+      echo "peer ${peer} did not durably prepare a checkpoint before restart" >&2
+      exit 1
+    }
+    sleep 1
+  done
+done
+
 restart_before="$(dory k8s get pod rhiza-sql-0 -n rhiza-3peer-e2e -o jsonpath='{.status.containerStatuses[0].restartCount}')"
 
 dory k8s apply -f "$script_dir/preferred-peer-failure.yaml"
@@ -187,13 +198,23 @@ for peer in 0 1 2; do
   kill "${pf_pids[$peer]}" 2>/dev/null || true
   wait "${pf_pids[$peer]}" 2>/dev/null || true
 done
-dory k8s delete pod rhiza-sql-0 rhiza-sql-1 rhiza-sql-2 -n rhiza-3peer-e2e --wait=true >/dev/null
-deadline=$((SECONDS + 90))
-until dory k8s get pod rhiza-sql-0 rhiza-sql-1 rhiza-sql-2 -n rhiza-3peer-e2e >/dev/null 2>&1; do
-  (( SECONDS < deadline )) || exit 1
-  sleep 0.5
+for peer in 0 1 2; do
+  pod="rhiza-sql-${peer}"
+  old_uid="$(dory k8s get pod "$pod" -n rhiza-3peer-e2e -o jsonpath='{.metadata.uid}')"
+  dory k8s delete pod "$pod" -n rhiza-3peer-e2e --wait=true >/dev/null
+  deadline=$((SECONDS + 90))
+  while true; do
+    new_uid="$(dory k8s get pod "$pod" -n rhiza-3peer-e2e -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    [[ -n "$new_uid" && "$new_uid" != "$old_uid" ]] && break
+    (( SECONDS < deadline )) || exit 1
+    sleep 0.5
+  done
+  dory k8s wait "pod/$pod" -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
+  if ! dory k8s logs "pod/$pod" -n rhiza-3peer-e2e | grep -Fq 'checkpoint recovered: state='; then
+    echo "peer ${peer} did not recover its locally verified checkpoint from PVC" >&2
+    exit 1
+  fi
 done
-dory k8s wait pod/rhiza-sql-0 pod/rhiza-sql-1 pod/rhiza-sql-2 -n rhiza-3peer-e2e --for=condition=Ready --timeout=180s
 for peer in 0 1 2; do
   dory k8s port-forward "pod/rhiza-sql-${peer}" -n rhiza-3peer-e2e "$((base_port + peer)):8080" >"$tmp_dir/port-forward-${peer}.log" 2>&1 &
   pf_pids[$peer]="$!"
