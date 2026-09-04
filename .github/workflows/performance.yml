@@ -108,15 +108,6 @@ jobs:
           go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
           printf '%s\n' "$GOBIN" >>"$GITHUB_PATH"
 
-      - name: Cache pinned Hiqlite build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ${{ runner.temp }}/hiqlite-target
-          key: hiqlite-${{ runner.os }}-c3ff2536-rust-1.97.1
-
       - name: Run interleaved base and candidate benchmarks
         run: |
           benchmarks/run-ci-benchmarks.sh \
@@ -140,60 +131,28 @@ jobs:
             printf '```\n'
           } >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Run pinned Hiqlite reference
-        continue-on-error: true
+      - name: Reuse pinned Hiqlite reference
         env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/hiqlite-target
           HIQLITE_COMMIT: c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+          HIQLITE_PATCH_SHA256: 1adc6028d28bb0c6b80cf429a69dab30d744eb4ed13830dcb028325522d717b7
         run: |
-          rustup toolchain install 1.97.1 --profile minimal
-          git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
-          git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
-          git -C "$RUNNER_TEMP/hiqlite" apply --unidiff-zero --whitespace=nowarn \
-            "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch"
-          cargo +1.97.1 build --release \
-            --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
-          (
-            cd "$RUNNER_TEMP/hiqlite/examples/bench"
-            "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
-          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite.txt"
-          (
-            cd "$RUNNER_TEMP/hiqlite/examples/bench"
-            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000
-          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt"
-          (
-            cd "$RUNNER_TEMP/hiqlite/examples/bench"
-            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c 16 -r 100000
-          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-remote-immediate.txt"
-          (
-            cd "$RUNNER_TEMP/hiqlite/examples/bench"
-            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c 16 -r 100000
-          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-non-leader-failed-immediate.txt"
-          (
-            cd "$RUNNER_TEMP/hiqlite/examples/bench"
-            HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000
-          ) 2>&1 | tee "$RUNNER_TEMP/rhiza-performance/hiqlite-leader-failed-immediate.txt"
-          if grep -q ERROR "$RUNNER_TEMP/rhiza-performance"/hiqlite*.txt; then
-            printf '\n## Pinned Hiqlite reference\n\nInvalid: runtime errors; see artifact.\n' >>"$GITHUB_STEP_SUMMARY"
-            printf 'Hiqlite benchmark reported runtime errors\n' >&2
-            exit 1
-          fi
-          hiqlite_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite.txt")
-          hiqlite_immediate_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-immediate.txt")
-          hiqlite_remote_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-remote-immediate.txt")
-          hiqlite_non_leader_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-non-leader-failed-immediate.txt")
-          hiqlite_leader_ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$RUNNER_TEMP/rhiza-performance/hiqlite-leader-failed-immediate.txt")
-          [[ $hiqlite_ops =~ ^[0-9]+$ && $hiqlite_immediate_ops =~ ^[0-9]+$ && $hiqlite_remote_ops =~ ^[0-9]+$ && $hiqlite_non_leader_ops =~ ^[0-9]+$ && $hiqlite_leader_ops =~ ^[0-9]+$ ]]
+          reference=benchmarks/hiqlite-reference.json
+          latest_version=$(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git 'refs/tags/v*' | awk -F/ '{print $3}' | sort -V | tail -1)
+          [[ $latest_version == "$(jq -r '.version' "$reference")" ]]
+          [[ $(sha256sum benchmarks/hiqlite-one-peer.patch | cut -d' ' -f1) == "$HIQLITE_PATCH_SHA256" ]]
+          jq -e --arg commit "$HIQLITE_COMMIT" --arg patch "$HIQLITE_PATCH_SHA256" \
+            '.commit == $commit and .patch_sha256 == $patch and all(.ops_per_sec[]; type == "number")' "$reference" >/dev/null
+          cp "$reference" "$RUNNER_TEMP/rhiza-performance/hiqlite-reference.json"
           # shellcheck disable=SC2016
           {
             printf '\n## Pinned Hiqlite reference\n\n'
-            printf 'Official `interval_200` three-node local-client workload: `%s ops/s`.\n\n' "$hiqlite_ops"
-            printf 'Power-loss-durable `immediate` workload: `%s ops/s`.\n\n' "$hiqlite_immediate_ops"
-            printf 'Power-loss-durable remote-client workload: `%s ops/s`.\n\n' "$hiqlite_remote_ops"
-            printf 'Raft follower gracefully stopped before measurement: `%s ops/s`.\n\n' "$hiqlite_non_leader_ops"
-            printf 'Raft leader gracefully stopped before measurement: `%s ops/s`.\n\n' "$hiqlite_leader_ops"
-            printf 'All use `cluster -c 16 -r 100000`, commit `%s`.\n' "$HIQLITE_COMMIT"
-            printf 'This is a native Hiqlite diagnostic, not an algorithm-level ratio against Rhiza.\n'
+            printf 'Reused verified result for latest Hiqlite `%s`, unchanged commit `%s`, and benchmark patch.\n\n' "$latest_version" "$HIQLITE_COMMIT"
+            printf 'Official `interval_200` three-node local-client workload: `%s ops/s`.\n\n' "$(jq -r '.ops_per_sec.interval_200_local' "$reference")"
+            printf 'Power-loss-durable `immediate` workload: `%s ops/s`.\n\n' "$(jq -r '.ops_per_sec.immediate_local' "$reference")"
+            printf 'Power-loss-durable remote-client workload: `%s ops/s`.\n\n' "$(jq -r '.ops_per_sec.immediate_remote' "$reference")"
+            printf 'Raft follower gracefully stopped before measurement: `%s ops/s`.\n\n' "$(jq -r '.ops_per_sec.immediate_follower_stopped' "$reference")"
+            printf 'Raft leader gracefully stopped before measurement: `%s ops/s`.\n\n' "$(jq -r '.ops_per_sec.immediate_leader_stopped' "$reference")"
+            printf 'Source run: %s.\n' "$(jq -r '.source_run' "$reference")"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run Rhiza real-server reference
@@ -237,8 +196,8 @@ jobs:
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
-            printf 'rust=%s\n' "$(rustc +1.97.1 --version)"
             printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+            printf 'hiqlite_result=reused-verified-reference\n'
             printf 'hiqlite_official_log_sync=interval_200\n'
             printf 'hiqlite_durable_log_sync=immediate\n'
             printf 'rhiza_failure_scenarios=each_peer_sigkill_during_timed_workload\n'

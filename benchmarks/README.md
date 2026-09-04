@@ -41,10 +41,13 @@ the benchmark binaries before measurement, pins `GOMAXPROCS=2`, and alternates
 base and candidate execution order across ten samples. The Job Summary contains
 three-peer `ExecuteReturning` measurements for 1 row, 100 rows, and a
 near-1-MiB result through the in-process server API, plus the `benchstat`
-comparison and a pinned execution of Hiqlite's official
-three-node local-client workload (`cluster -c 16 -r 100000`, commit
-`c3ff2536ac985ecb9f77201d1b58dab66c7b256e`). Raw Go and Hiqlite output plus
-runner provenance are uploaded as a 30-day artifact. Until this workflow first
+comparison. Hiqlite's verified result is reused from
+`hiqlite-reference.json` while its pinned commit and benchmark patch are
+unchanged. CI checks Hiqlite's remote release tags on every run and only reuses
+the result when its recorded version is still latest; a newer release or a
+changed patch requires a fresh reference run and an updated JSON record.
+Current-run Rhiza output, the reused reference, and runner provenance are
+uploaded as a 30-day artifact. Until this workflow first
 lands on `main`, its bootstrap run uses the candidate's previous commit so both
 sides contain the same benchmark harness; later pull requests compare against
 their actual base commit.
@@ -64,17 +67,16 @@ gate (`RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS`).
 Hiqlite remains an external Raft reference, not a direct algorithm comparison.
 Its leader/follower cases gracefully stop one peer and wait for a replacement
 leader before measurement, so they describe post-failover steady state rather
-than failover interruption. Any `ERROR` line invalidates that reference run.
-The pinned source patch is kept in `benchmarks/hiqlite-one-peer.patch`.
+than failover interruption. The pinned source patch is kept in
+`benchmarks/hiqlite-one-peer.patch`; CI verifies its recorded digest before
+reusing the result.
 
 The workflow is advisory: candidate benchmark failures fail the job, while a
 measured regression is reported without an arbitrary threshold. A failing
 baseline benchmark is retained as evidence and does not prevent the fixed
-candidate from running. Errors from the external Hiqlite reference invalidate
-that reference run and remain in the artifact without blocking Rhiza's paired
-comparison. Use `workflow_dispatch` to compare the selected commit against
-another base ref. The same collector can be smoke-tested locally with short
-samples:
+candidate from running. Use `workflow_dispatch` to compare the selected commit
+against another base ref. The same collector can be smoke-tested locally with
+short samples:
 
 ```bash
 RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=100ms \
