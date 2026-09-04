@@ -240,6 +240,11 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	if index, root, ok := core.LatestPreparedCheckpoint(); ok {
+		log.Printf("checkpoint recovered: state=prepared index=%d root=%x", index, root)
+	} else if index, root, ok := core.RecoveryRoot(); ok {
+		log.Printf("checkpoint recovered: state=compacted index=%d root=%x", index, root)
+	}
 	if n.checkpoints != nil {
 		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
@@ -272,7 +277,11 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
 				return err
 			}
-			return core.PrepareCheckpoint(ctx, seal)
+			if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+				return err
+			}
+			log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
+			return nil
 		})
 	}
 	server.SetObjectStoreStats(func() (map[string]uint64, bool) {
@@ -478,6 +487,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 				if err := core.PrepareCheckpoint(ctx, seal); err != nil {
 					return err
 				}
+				log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
 				if err := transport.PrepareCheckpoint(ctx, seal); err != nil {
 					return err
 				}
