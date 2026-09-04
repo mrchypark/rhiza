@@ -1,6 +1,7 @@
 package rhiza_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -50,7 +51,7 @@ func TestObjectStoreReadReplicaRestoresAndStaysReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replica.Close()
-	if !replica.Ready() || replica.Status().Mode != rhiza.ReplicaModeObjectStore {
+	if !replica.Ready() || replica.Status().Mode != rhiza.ReplicaModeObjectStore || replica.Status().LagSlots != 0 {
 		t.Fatalf("replica is not ready: %+v", replica.Status())
 	}
 	rows, err := replica.Query(ctx, rhiza.QueryRequest{SQL: "SELECT name FROM items ORDER BY id"})
@@ -499,7 +500,7 @@ func TestExecuteReturningOneAndTypedMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if response, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "map-schema", SQL: "CREATE TABLE mapped (id INTEGER PRIMARY KEY, name TEXT)"}); err != nil || response.Status != "committed" {
+	if response, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "map-schema", SQL: "CREATE TABLE mapped (id INTEGER PRIMARY KEY, name TEXT)"}); err != nil || response.Status != rhiza.MutationCommitted {
 		t.Fatalf("schema response=%+v err=%v", response, err)
 	}
 	type item struct {
@@ -519,16 +520,58 @@ func TestExecuteReturningOneAndTypedMapping(t *testing.T) {
 		}
 		return item{ID: id.(int64), Name: name.(string)}, nil
 	})
-	if err != nil || response.Status != "committed" || got != (item{ID: 1, Name: "tea"}) {
+	if err != nil || response.Status != rhiza.MutationCommitted || got != (item{ID: 1, Name: "tea"}) {
 		t.Fatalf("response=%+v mapped=%+v err=%v", response, got, err)
 	}
 	many, err := db.ExecuteReturningOne(ctx, rhiza.ExecuteRequest{RequestID: "map-many", SQL: "INSERT INTO mapped(name) VALUES ('a'), ('b') RETURNING id"})
-	if err != nil || many.Status != "rejected" {
+	if err != nil || many.Status != rhiza.MutationRejected {
 		t.Fatalf("multi-row response=%+v err=%v", many, err)
 	}
 	rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT COUNT(*) FROM mapped"})
 	if err != nil || rows.Rows[0][0] != int64(1) {
 		t.Fatalf("multi-row mutation was not rolled back: rows=%#v err=%v", rows.Rows, err)
+	}
+}
+
+func TestSQLRowAccessorsDoNotMutateReturnedResponse(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "row-schema", SQL: "CREATE TABLE row_values (payload BLOB)"}); err != nil {
+		t.Fatal(err)
+	}
+	response, _, err := rhiza.ExecuteReturningMapOne(ctx, db, rhiza.ExecuteRequest{
+		RequestID: "row-insert", SQL: "INSERT INTO row_values VALUES (?) RETURNING payload", Args: []any{[]byte{1, 2, 3}},
+	}, func(row rhiza.SQLRow) (struct{}, error) {
+		if row.Len() != 1 || row.Columns()[0] != "payload" {
+			return struct{}{}, fmt.Errorf("unexpected row metadata")
+		}
+		row.Columns()[0] = "changed"
+		row.Values()[0] = "changed"
+		value, err := row.Value(0)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if !bytes.Equal(value.([]byte), []byte{1, 2, 3}) {
+			return struct{}{}, fmt.Errorf("unexpected value %v", value)
+		}
+		named, err := row.Named("payload")
+		if err != nil {
+			return struct{}{}, err
+		}
+		if !bytes.Equal(named.([]byte), []byte{1, 2, 3}) {
+			return struct{}{}, fmt.Errorf("unexpected named value %v", named)
+		}
+		return struct{}{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := response.Statements[0]; got.Columns[0] != "payload" || !bytes.Equal(got.Rows[0][0].([]byte), []byte{1, 2, 3}) {
+		t.Fatalf("mapping callback mutated response: %+v", got)
 	}
 }
 
@@ -539,6 +582,9 @@ func TestMigrateValidatesWholePlanBeforeApplying(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if err := db.Migrate(ctx, []rhiza.Migration{{Version: -1, Name: "negative", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE invalid_negative (id INTEGER)"}}}}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("negative migration version error=%v", err)
+	}
 	err = db.Migrate(ctx, []rhiza.Migration{
 		{Version: 2, Name: "would-apply", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE should_not_exist (id INTEGER)"}}},
 		{Version: 1, Name: "out-of-order", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE invalid_order (id INTEGER)"}}},

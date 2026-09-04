@@ -1,0 +1,16 @@
+{
+  "version": "v0.14.0",
+  "commit": "c3ff2536ac985ecb9f77201d1b58dab66c7b256e",
+  "patch_sha256": "1adc6028d28bb0c6b80cf429a69dab30d744eb4ed13830dcb028325522d717b7",
+  "measured_at": "2026-09-04T02:55:10Z",
+  "source_run": "https://github.com/mrchypark/rhiza/actions/runs/33829988020",
+  "requests": 100000,
+  "concurrency": 16,
+  "ops_per_sec": {
+    "interval_200_local": 12448,
+    "immediate_local": 2422,
+    "immediate_remote": 2190,
+    "immediate_follower_stopped": 2581,
+    "immediate_leader_stopped": 2580
+  }
+}

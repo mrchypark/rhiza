@@ -59,12 +59,12 @@ type GraphStreamTrimRequest struct {
 
 func (s *Server) handleGraphExecute(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var command types.GraphCommand
 	if err := decodeJSON(w, r, &command); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	response, err := s.GraphExecute(r.Context(), command)
@@ -120,12 +120,12 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 
 func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var request GraphQueryRequest
 	if err := decodeJSON(w, r, &request); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	result, err := s.GraphQuery(r.Context(), request)
@@ -211,12 +211,12 @@ func (s *Server) handleGraphStreamRead(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) serveGraphStreamRead(w http.ResponseWriter, r *http.Request, changes bool) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var request GraphStreamReadRequest
 	if err := decodeJSON(w, r, &request); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	var response GraphStreamReadResponse
@@ -236,12 +236,12 @@ func (s *Server) serveGraphStreamRead(w http.ResponseWriter, r *http.Request, ch
 
 func (s *Server) handleGraphStreamOffset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost, http.MethodPut)
 		return
 	}
 	var request GraphStreamOffsetRequest
 	if err := decodeJSON(w, r, &request); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if r.Method == http.MethodPut {
@@ -263,12 +263,12 @@ func (s *Server) handleGraphStreamOffset(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleGraphStreamTrim(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var request GraphStreamTrimRequest
 	if err := decodeJSON(w, r, &request); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if err := s.TrimGraphStream(r.Context(), request); err != nil {

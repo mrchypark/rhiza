@@ -8,8 +8,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"math"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -21,6 +21,7 @@ import (
 )
 
 type Member = quepaxa.Member
+type NodeID = quepaxa.NodeID
 type ReplicaMember = network.PeerIdentity
 
 // NewReplicaMember removes a voter's secret while retaining its pinned peer identity.
@@ -37,9 +38,11 @@ type GraphStreamEvent = types.GraphStreamEvent
 type GraphStreamRecord = types.GraphStreamRecord
 type NotifyCommand = types.NotifyCommand
 type MutationReceipt = types.MutationReceipt
+type MutationStatus = types.MutationStatus
 
 type ExecuteRequest = network.ExecuteRequest
 type ExecuteResponse = network.ExecuteResponse
+type HTTPErrorResponse = network.ErrorResponse
 type QueryRequest = network.QueryRequest
 type QueryResponse = network.QueryResponse
 type KVGetRequest = network.KVGetRequest
@@ -97,10 +100,32 @@ type Config struct {
 }
 
 const (
-	ConsistencyLocal               = "local"
-	ConsistencyLinearizable        = "linearizable"
-	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
-	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
+	ConsistencyLocal                   = "local"
+	ConsistencyLinearizable            = "linearizable"
+	ObjectStoreDurabilityAsync         = types.ObjectStoreDurabilityAsync
+	ObjectStoreDurabilityBeforeAck     = types.ObjectStoreDurabilityBeforeAck
+	MutationCommitted                  = types.MutationCommitted
+	MutationRejected                   = types.MutationRejected
+	RequestKindSQL                     = "sql"
+	RequestKindKV                      = "kv"
+	RequestKindNotify                  = "notify"
+	RequestKindGraph                   = "graph"
+	RequestStateCommitted              = "committed"
+	RequestStateRejected               = "rejected"
+	RequestStateUnknownOrExpired       = "unknown_or_expired"
+	ObjectStoreProviderFilesystem      = "filesystem"
+	ObjectStoreProviderS3              = "s3"
+	ObjectStoreProviderGCS             = "gcs"
+	ObjectStoreProviderAzure           = "azure"
+	HTTPErrorCodeInvalidRequest        = "invalid_request"
+	HTTPErrorCodeRequestConflict       = "request_conflict"
+	HTTPErrorCodeNotReady              = "not_ready"
+	HTTPErrorCodeOverloaded            = "overloaded"
+	HTTPErrorCodeDurabilityUnavailable = "durability_unavailable"
+	HTTPErrorCodeCommitUnknown         = "commit_unknown"
+	HTTPErrorCodeQuorumUnavailable     = "quorum_unavailable"
+	HTTPErrorCodeMethodNotAllowed      = "method_not_allowed"
+	HTTPErrorCodeNotFound              = "not_found"
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
@@ -127,7 +152,7 @@ type DB struct {
 
 // Migration is one ordered, repeatable schema change.
 type Migration struct {
-	Version    uint64         `json:"version"`
+	Version    int64          `json:"version"`
 	Name       string         `json:"name"`
 	Statements []SQLStatement `json:"statements"`
 }
@@ -215,22 +240,37 @@ func (db *DB) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (Exec
 
 // SQLRow is one immutable row passed to a typed mapping callback.
 type SQLRow struct {
-	Columns []string
-	Values  []any
+	columns []string
+	values  []any
+}
+
+// Len returns the number of columns in the row.
+func (r SQLRow) Len() int { return len(r.values) }
+
+// Columns returns a copy of the column names in result order.
+func (r SQLRow) Columns() []string { return slices.Clone(r.columns) }
+
+// Values returns a copy of the values in result order.
+func (r SQLRow) Values() []any {
+	values := slices.Clone(r.values)
+	for i := range values {
+		values[i] = cloneSQLRowValue(values[i])
+	}
+	return values
 }
 
 // Value returns one column by index.
 func (r SQLRow) Value(index int) (any, error) {
-	if index < 0 || index >= len(r.Values) {
+	if index < 0 || index >= len(r.values) {
 		return nil, fmt.Errorf("SQL row column index %d is out of bounds", index)
 	}
-	return r.Values[index], nil
+	return cloneSQLRowValue(r.values[index]), nil
 }
 
 // Named returns a uniquely named column.
 func (r SQLRow) Named(name string) (any, error) {
 	index := -1
-	for i, column := range r.Columns {
+	for i, column := range r.columns {
 		if column == name {
 			if index >= 0 {
 				return nil, fmt.Errorf("SQL row column %q is not unique", name)
@@ -238,16 +278,23 @@ func (r SQLRow) Named(name string) (any, error) {
 			index = i
 		}
 	}
-	if index < 0 || index >= len(r.Values) {
+	if index < 0 || index >= len(r.values) {
 		return nil, fmt.Errorf("SQL row column %q does not exist", name)
 	}
-	return r.Values[index], nil
+	return cloneSQLRowValue(r.values[index]), nil
+}
+
+func cloneSQLRowValue(value any) any {
+	if bytes, ok := value.([]byte); ok {
+		return slices.Clone(bytes)
+	}
+	return value
 }
 
 // ExecuteReturningMap maps replicated RETURNING rows to an application type.
 func ExecuteReturningMap[T any](ctx context.Context, db *DB, req ExecuteRequest, mapper func(SQLRow) (T, error)) (ExecuteResponse, []T, error) {
-	if mapper == nil {
-		return ExecuteResponse{}, nil, fmt.Errorf("row mapper is required")
+	if db == nil || mapper == nil {
+		return ExecuteResponse{}, nil, fmt.Errorf("%w: database and row mapper are required", ErrInvalidRequest)
 	}
 	response, err := db.ExecuteReturning(ctx, req)
 	if err != nil {
@@ -262,7 +309,7 @@ func ExecuteReturningMap[T any](ctx context.Context, db *DB, req ExecuteRequest,
 	statement := response.Statements[0]
 	result := make([]T, len(statement.Rows))
 	for i, values := range statement.Rows {
-		result[i], err = mapper(SQLRow{Columns: statement.Columns, Values: values})
+		result[i], err = mapper(SQLRow{columns: statement.Columns, values: values})
 		if err != nil {
 			return response, nil, fmt.Errorf("map returned row %d: %w", i, err)
 		}
@@ -273,8 +320,8 @@ func ExecuteReturningMap[T any](ctx context.Context, db *DB, req ExecuteRequest,
 // ExecuteReturningMapOne maps one row and rolls back unless exactly one exists.
 func ExecuteReturningMapOne[T any](ctx context.Context, db *DB, req ExecuteRequest, mapper func(SQLRow) (T, error)) (ExecuteResponse, T, error) {
 	var zero T
-	if mapper == nil {
-		return ExecuteResponse{}, zero, fmt.Errorf("row mapper is required")
+	if db == nil || mapper == nil {
+		return ExecuteResponse{}, zero, fmt.Errorf("%w: database and row mapper are required", ErrInvalidRequest)
 	}
 	response, err := db.ExecuteReturningOne(ctx, req)
 	if err != nil {
@@ -287,7 +334,7 @@ func ExecuteReturningMapOne[T any](ctx context.Context, db *DB, req ExecuteReque
 		return response, zero, fmt.Errorf("SQL RETURNING result is unavailable")
 	}
 	statement := response.Statements[0]
-	result, err := mapper(SQLRow{Columns: statement.Columns, Values: statement.Rows[0]})
+	result, err := mapper(SQLRow{columns: statement.Columns, values: statement.Rows[0]})
 	if err != nil {
 		return response, zero, fmt.Errorf("map returned row: %w", err)
 	}
@@ -304,9 +351,9 @@ func (db *DB) Migrate(ctx context.Context, migrations []Migration) error {
 		migration Migration
 		request   network.MigrationRequest
 	}, len(migrations))
-	var previous uint64
+	var previous int64
 	for i, migration := range migrations {
-		if migration.Version == 0 || migration.Version > math.MaxInt64 || migration.Version != previous+1 || migration.Name == "" || len(migration.Statements) == 0 {
+		if migration.Version <= 0 || migration.Version != previous+1 || migration.Name == "" || len(migration.Statements) == 0 {
 			return fmt.Errorf("%w: migrations require a name, statements, and contiguous versions starting at 1", ErrInvalidRequest)
 		}
 		previous = migration.Version
@@ -321,7 +368,7 @@ func (db *DB) Migrate(ctx context.Context, migrations []Migration) error {
 		if err := ValidateExecuteRequest(ExecuteRequest{RequestID: requestID, Statements: migration.Statements}); err != nil {
 			return fmt.Errorf("migration %d: %w", migration.Version, err)
 		}
-		request := network.MigrationRequest{RequestID: requestID, Version: int64(migration.Version), Name: migration.Name, Checksum: checksum, Statements: migration.Statements}
+		request := network.MigrationRequest{RequestID: requestID, Version: migration.Version, Name: migration.Name, Checksum: checksum, Statements: migration.Statements}
 		prepared[i] = struct {
 			migration Migration
 			request   network.MigrationRequest

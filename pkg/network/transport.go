@@ -262,7 +262,10 @@ func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request
 		return nil, err
 	}
 	if err := stream.Close(); err != nil {
-		return nil, err
+		var streamErr *quic.StreamError
+		if !errors.As(context.Cause(stream.Context()), &streamErr) || !streamErr.Remote || streamErr.ErrorCode != 0 {
+			return nil, err
+		}
 	}
 	data, err := readPeerFrame(stream)
 	if err != nil {

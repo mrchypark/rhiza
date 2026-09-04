@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -235,6 +236,9 @@ func (s *Server) routes() {
 	// Health
 	s.mux.HandleFunc("/ready", s.handleReady)
 	s.mux.HandleFunc("/healthz", s.handleHealthz)
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		writeHTTPError(w, http.StatusNotFound, "not_found", "route not found")
+	})
 }
 
 func (s *Server) SetObjectStoreStats(stats func() (map[string]uint64, bool)) {
@@ -243,23 +247,31 @@ func (s *Server) SetObjectStoreStats(stats func() (map[string]uint64, bool)) {
 
 func (s *Server) SetReplicaStatus(status func() ReplicaStatus) { s.replicaStatus = status }
 
-func (s *Server) handleReplicaStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReplicaStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if s.replicaStatus == nil {
-		http.Error(w, "not a replica", http.StatusNotFound)
+		writeHTTPError(w, http.StatusNotFound, "not_a_replica", "not a replica")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.replicaStatus())
 }
 
-func (s *Server) handleObjectStoreStats(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleObjectStoreStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if s.objectStats == nil {
-		http.Error(w, "object store disabled", http.StatusNotFound)
+		writeHTTPError(w, http.StatusNotFound, "object_store_disabled", "object store disabled")
 		return
 	}
 	stats, ok := s.objectStats()
 	if !ok {
-		http.Error(w, "object store disabled", http.StatusNotFound)
+		writeHTTPError(w, http.StatusNotFound, "object_store_disabled", "object store disabled")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -530,12 +542,12 @@ func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, []byte, error) {
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req ExecuteRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 
@@ -550,12 +562,12 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleExecuteReturning(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req ExecuteRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	resp, err := s.ExecuteReturning(r.Context(), req)
@@ -569,12 +581,12 @@ func (s *Server) handleExecuteReturning(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleExecuteReturningOne(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req ExecuteRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	resp, err := s.ExecuteReturningOne(r.Context(), req)
@@ -687,13 +699,13 @@ type QueryResponse struct {
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 
 	var req QueryRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	resp, err := s.Query(r.Context(), req)
@@ -720,24 +732,60 @@ func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
+// ErrorResponse is the stable JSON error envelope returned by the HTTP adapter.
+type ErrorResponse struct {
+	Code             string `json:"code"`
+	Error            string `json:"error"`
+	RequestID        string `json:"request_id,omitempty"`
+	Slot             uint64 `json:"slot,omitempty"`
+	RetryThroughSlot uint64 `json:"retry_through_slot,omitempty"`
+}
+
+func writeHTTPError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(ErrorResponse{Code: code, Error: message})
+}
+
+func writeMethodNotAllowed(w http.ResponseWriter, methods ...string) {
+	w.Header().Set("Allow", strings.Join(methods, ", "))
+	writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+}
+
 func writeAPIError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
+	code := "internal_error"
 	switch {
 	case errors.Is(err, ErrInvalidRequest), errors.Is(err, errConsistency):
 		status = http.StatusBadRequest
+		code = "invalid_request"
 	case errors.Is(err, ErrRequestConflict):
 		status = http.StatusConflict
-	case errors.Is(err, ErrNotReady), errors.Is(err, ErrOverloaded), errors.Is(err, ErrDurabilityUnavailable), errors.Is(err, ErrCommitUnknown), errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		code = "request_conflict"
+	case errors.Is(err, ErrNotReady):
 		status = http.StatusServiceUnavailable
+		code = "not_ready"
+	case errors.Is(err, ErrOverloaded):
+		status = http.StatusServiceUnavailable
+		code = "overloaded"
+	case errors.Is(err, ErrDurabilityUnavailable):
+		status = http.StatusServiceUnavailable
+		code = "durability_unavailable"
+	case errors.Is(err, ErrCommitUnknown):
+		status = http.StatusServiceUnavailable
+		code = "commit_unknown"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		status = http.StatusServiceUnavailable
+		code = "quorum_unavailable"
 	}
 	var unknown *CommitUnknownError
 	if errors.As(err, &unknown) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_ = json.NewEncoder(w).Encode(map[string]any{"code": "commit_unknown", "request_id": unknown.RequestID, "slot": unknown.Slot, "retry_through_slot": unknown.RetryThroughSlot})
+		_ = json.NewEncoder(w).Encode(ErrorResponse{Code: "commit_unknown", Error: err.Error(), RequestID: unknown.RequestID, Slot: uint64(unknown.Slot), RetryThroughSlot: unknown.RetryThroughSlot})
 		return
 	}
-	http.Error(w, err.Error(), status)
+	writeHTTPError(w, status, code, err.Error())
 }
 
 type RequestStatusRequest struct {
@@ -753,12 +801,12 @@ type RequestStatusResponse struct {
 
 func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req RequestStatusRequest
 	if err := decodeJSON(w, r, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	response, err := s.RequestStatus(r.Context(), req)
@@ -850,7 +898,7 @@ type KVMutationResponse struct {
 
 func (s *Server) handleKVGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req struct {
@@ -858,7 +906,7 @@ func (s *Server) handleKVGet(w http.ResponseWriter, r *http.Request) {
 		Consistency string `json:"consistency,omitempty"`
 	}
 	if err := decodeJSON(w, r, &req); err != nil || req.Key == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "key is required and the request must be valid JSON")
 		return
 	}
 	response, err := s.KVGet(r.Context(), KVGetRequest{Key: req.Key, Consistency: req.Consistency})
@@ -891,12 +939,12 @@ func (s *Server) handleKVCAS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleKVMutation(w http.ResponseWriter, r *http.Request, operation string) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req KVMutationRequest
 	if err := decodeJSON(w, r, &req); err != nil || req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid KV mutation request")
 		return
 	}
 	response, err := s.KVMutate(r.Context(), operation, req)
@@ -993,12 +1041,12 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 
 func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodPost)
 		return
 	}
 	var req types.NotifyCommand
 	if err := decodeJSON(w, r, &req); err != nil || req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
-		http.Error(w, "bad request", http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "invalid notification request")
 		return
 	}
 	receipt, err := s.NotifyPublish(r.Context(), req)
@@ -1073,17 +1121,17 @@ func (s *Server) NotificationDrops() uint64 {
 
 func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
 	topic := r.URL.Query().Get("topic")
 	if topic == "" || len(topic) > 256 {
-		http.Error(w, "topic is required", http.StatusBadRequest)
+		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "topic is required")
 		return
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		writeHTTPError(w, http.StatusInternalServerError, "streaming_unsupported", "streaming unsupported")
 		return
 	}
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
@@ -1218,16 +1266,20 @@ func validateReplicatedMutation(value []byte) error {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if !s.ready() {
-		http.Error(w, "catching up", http.StatusServiceUnavailable)
+		writeHTTPError(w, http.StatusServiceUnavailable, "catching_up", "catching up")
 		return
 	}
 	if err := s.material.Health(r.Context()); err != nil {
-		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		writeHTTPError(w, http.StatusServiceUnavailable, "not_ready", "not ready")
 		return
 	}
 	if err := s.core.Health(); err != nil {
-		http.Error(w, "WAL sync failed", http.StatusServiceUnavailable)
+		writeHTTPError(w, http.StatusServiceUnavailable, "wal_unhealthy", "WAL sync failed")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -1271,12 +1323,16 @@ func (s *Server) applyDecisions(ctx context.Context, through quepaxa.Slot) error
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeMethodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if err := s.material.Health(r.Context()); err != nil {
-		http.Error(w, "materializer unhealthy", http.StatusServiceUnavailable)
+		writeHTTPError(w, http.StatusServiceUnavailable, "materializer_unhealthy", "materializer unhealthy")
 		return
 	}
 	if err := s.core.Health(); err != nil {
-		http.Error(w, "WAL sync failed", http.StatusServiceUnavailable)
+		writeHTTPError(w, http.StatusServiceUnavailable, "wal_unhealthy", "WAL sync failed")
 		return
 	}
 	w.WriteHeader(http.StatusOK)

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,47 +19,62 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza"
-	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	if err := run(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context) (resultErr error) {
 	var members []rhiza.Member
 	if raw := os.Getenv("RHIZA_CLUSTER_MEMBERS"); raw != "" {
-		if err := json.Unmarshal([]byte(raw), &members); err != nil {
-			log.Fatalf("invalid RHIZA_CLUSTER_MEMBERS: %v", err)
+		if err := decodeStrictJSON(raw, &members); err != nil {
+			return fmt.Errorf("invalid RHIZA_CLUSTER_MEMBERS: %w", err)
 		}
 	}
 	checkpointInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_CHECKPOINT_INTERVAL", "15m"))
 	if err != nil || checkpointInterval < 0 {
-		log.Fatalf("invalid RHIZA_CHECKPOINT_INTERVAL")
+		return errors.New("invalid RHIZA_CHECKPOINT_INTERVAL")
 	}
 	checkpointTailBytes, err := strconv.ParseInt(getEnvOrDefault("RHIZA_CHECKPOINT_TAIL_BYTES", "536870912"), 10, 64)
 	if err != nil || checkpointTailBytes <= 0 || checkpointTailBytes > 2<<30 {
-		log.Fatalf("invalid RHIZA_CHECKPOINT_TAIL_BYTES")
+		return errors.New("invalid RHIZA_CHECKPOINT_TAIL_BYTES")
 	}
 	maxWALBytes, err := strconv.ParseInt(getEnvOrDefault("RHIZA_MAX_WAL_BYTES", "0"), 10, 64)
 	if err != nil || maxWALBytes < 0 {
-		log.Fatalf("invalid RHIZA_MAX_WAL_BYTES")
+		return errors.New("invalid RHIZA_MAX_WAL_BYTES")
 	}
 	objStoreSyncInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_SYNC_INTERVAL", "1m"))
 	if err != nil || objStoreSyncInterval < 0 {
-		log.Fatalf("invalid RHIZA_OBJSTORE_SYNC_INTERVAL")
+		return errors.New("invalid RHIZA_OBJSTORE_SYNC_INTERVAL")
 	}
 	objStoreBatchDelay, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_BATCH_DELAY", "2ms"))
 	if err != nil || objStoreBatchDelay <= 0 || objStoreBatchDelay > time.Second {
-		log.Fatalf("invalid RHIZA_OBJSTORE_BATCH_DELAY")
+		return errors.New("invalid RHIZA_OBJSTORE_BATCH_DELAY")
 	}
 	objStoreGCInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_GC_INTERVAL", "1h"))
 	if err != nil || objStoreGCInterval < 0 {
-		log.Fatalf("invalid RHIZA_OBJSTORE_GC_INTERVAL")
+		return errors.New("invalid RHIZA_OBJSTORE_GC_INTERVAL")
 	}
 	objStoreGCGracePeriod, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_GC_GRACE_PERIOD", "24h"))
 	if err != nil || objStoreGCGracePeriod < 0 {
-		log.Fatalf("invalid RHIZA_OBJSTORE_GC_GRACE_PERIOD")
+		return errors.New("invalid RHIZA_OBJSTORE_GC_GRACE_PERIOD")
 	}
 	objStoreRetries, err := strconv.Atoi(getEnvOrDefault("RHIZA_OBJSTORE_MAX_RETRIES", "3"))
 	if err != nil || objStoreRetries < 0 {
-		log.Fatalf("invalid RHIZA_OBJSTORE_MAX_RETRIES")
+		return errors.New("invalid RHIZA_OBJSTORE_MAX_RETRIES")
+	}
+	objStoreInsecure, err := boolEnv("RHIZA_OBJSTORE_INSECURE")
+	if err != nil {
+		return err
+	}
+	objStoreDir, err := objectStoreDirEnv()
+	if err != nil {
+		return err
 	}
 
 	// Parse config from environment
@@ -71,12 +87,12 @@ func main() {
 		AdminToken:                     os.Getenv("RHIZA_ADMIN_TOKEN"),
 		Members:                        members,
 		ObjStoreProvider:               os.Getenv("RHIZA_OBJSTORE_PROVIDER"),
-		ObjStoreDir:                    os.Getenv("RHIZA_FILESYSTEM_DIR"),
+		ObjStoreDir:                    objStoreDir,
 		ObjStorePrefix:                 os.Getenv("RHIZA_OBJSTORE_PREFIX"),
 		ObjStoreEndpoint:               os.Getenv("RHIZA_OBJSTORE_ENDPOINT"),
 		ObjStoreBucket:                 os.Getenv("RHIZA_OBJSTORE_BUCKET"),
 		ObjStoreRegion:                 os.Getenv("RHIZA_OBJSTORE_REGION"),
-		ObjStoreInsecure:               os.Getenv("RHIZA_OBJSTORE_INSECURE") == "true",
+		ObjStoreInsecure:               objStoreInsecure,
 		ObjStoreRetries:                objStoreRetries,
 		ObjStoreAccessKey:              os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY"),
 		ObjStoreSecretKey:              os.Getenv("RHIZA_OBJSTORE_SECRET_KEY"),
@@ -99,8 +115,6 @@ func main() {
 		MaxWALBytes:                    maxWALBytes,
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 	role := getEnvOrDefault("RHIZA_ROLE", "voter")
 	var handler http.Handler
 	var closeService func() error
@@ -108,7 +122,7 @@ func main() {
 	case "voter":
 		db, err := rhiza.Open(ctx, config)
 		if err != nil {
-			log.Fatalf("open rhiza: %v", err)
+			return fmt.Errorf("open rhiza: %w", err)
 		}
 		handler, closeService = db.Handler(), db.Close
 	case "object-store", "learner":
@@ -117,11 +131,11 @@ func main() {
 			replicaMembers, err = learnerReplicaMembers(os.Getenv("RHIZA_REPLICA_MEMBERS"), members)
 		}
 		if err != nil {
-			log.Fatalf("configure %s: %v", role, err)
+			return fmt.Errorf("configure %s: %w", role, err)
 		}
 		syncInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_REPLICA_SYNC_INTERVAL", "0s"))
 		if err != nil || syncInterval < 0 {
-			log.Fatalf("invalid RHIZA_REPLICA_SYNC_INTERVAL")
+			return errors.New("invalid RHIZA_REPLICA_SYNC_INTERVAL")
 		}
 		replicaConfig := rhiza.ReplicaConfig{
 			ClusterID: config.ClusterID, ReplicaID: config.NodeID, DataDir: config.DataDir, AdminToken: config.AdminToken,
@@ -142,28 +156,47 @@ func main() {
 			replica, err = rhiza.OpenReadReplica(ctx, replicaConfig)
 		}
 		if err != nil {
-			log.Fatalf("open %s: %v", role, err)
+			return fmt.Errorf("open %s: %w", role, err)
 		}
 		handler, closeService = replica.Handler(), replica.Close
 	default:
-		log.Fatalf("invalid RHIZA_ROLE %q (want voter, object-store, or learner)", role)
+		return fmt.Errorf("invalid RHIZA_ROLE %q (want voter, object-store, or learner)", role)
 	}
-	defer closeService()
+	defer func() { resultErr = errors.Join(resultErr, closeService()) }()
 
 	server := &http.Server{
 		Addr: config.BindAddr, Handler: handler,
-		ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second,
+		IdleTimeout: 120 * time.Second, MaxHeaderBytes: 64 << 10,
 	}
+	listener, err := net.Listen("tcp", config.BindAddr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", config.BindAddr, err)
+	}
+	defer listener.Close()
+	serverCtx, stopServer := context.WithCancel(ctx)
+	defer stopServer()
+	shutdownDone := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
+		<-serverCtx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
-		_ = server.Shutdown(shutdownCtx)
+		err := server.Shutdown(shutdownCtx)
+		if err != nil {
+			err = errors.Join(err, server.Close())
+		}
+		shutdownDone <- err
 	}()
-	log.Printf("Rhiza %s HTTP adapter listening on %s", role, config.BindAddr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("serve rhiza: %v", err)
+	log.Printf("Rhiza %s HTTP adapter listening on %s", role, listener.Addr())
+	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve rhiza: %w", err)
 	}
+	if ctx.Err() != nil {
+		if err := <-shutdownDone; err != nil {
+			return fmt.Errorf("shut down HTTP server: %w", err)
+		}
+	}
+	return nil
 }
 
 func objectReplicaMembers(members []rhiza.Member) ([]rhiza.ReplicaMember, error) {
@@ -188,13 +221,8 @@ func learnerReplicaMembers(raw string, voterConfig []rhiza.Member) ([]rhiza.Repl
 		PeerURL   string `json:"peer_url"`
 		PublicKey string `json:"public_key"`
 	}
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&configured); err != nil {
+	if err := decodeStrictJSON(raw, &configured); err != nil {
 		return nil, fmt.Errorf("invalid RHIZA_REPLICA_MEMBERS: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, errors.New("invalid RHIZA_REPLICA_MEMBERS: trailing JSON")
 	}
 	result := make([]rhiza.ReplicaMember, 0, len(configured))
 	for _, member := range configured {
@@ -202,7 +230,7 @@ func learnerReplicaMembers(raw string, voterConfig []rhiza.Member) ([]rhiza.Repl
 		if err != nil || len(key) != ed25519.PublicKeySize || member.ID == "" || member.PeerURL == "" {
 			return nil, fmt.Errorf("learner members require node_id, peer_url, and a base64 Ed25519 public_key")
 		}
-		identity := rhiza.ReplicaMember{ID: quepaxa.NodeID(member.ID), PeerURL: member.PeerURL}
+		identity := rhiza.ReplicaMember{ID: rhiza.NodeID(member.ID), PeerURL: member.PeerURL}
 		copy(identity.PublicKey[:], key)
 		if identity.PublicKey == ([ed25519.PublicKeySize]byte{}) {
 			return nil, errors.New("learner public_key must not be zero")
@@ -220,4 +248,39 @@ func getEnvOrDefault(key, defaultValue string) string {
 		return v
 	}
 	return defaultValue
+}
+
+func decodeStrictJSON(raw string, value any) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+
+func boolEnv(key string) (bool, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return value, nil
+}
+
+func objectStoreDirEnv() (string, error) {
+	value, legacy := os.Getenv("RHIZA_OBJSTORE_DIR"), os.Getenv("RHIZA_FILESYSTEM_DIR")
+	if value != "" && legacy != "" && value != legacy {
+		return "", errors.New("RHIZA_OBJSTORE_DIR conflicts with legacy RHIZA_FILESYSTEM_DIR")
+	}
+	if value != "" {
+		return value, nil
+	}
+	return legacy, nil
 }

@@ -78,6 +78,8 @@ retrying the same request with the same payload returns its retained result;
 reusing the ID with different intent returns `ErrRequestConflict`.
 `ErrCommitUnknown` means the caller must inspect the request status rather than
 submit a different operation under the same ID.
+Use the `RequestKind*`, `RequestState*`, and `MutationCommitted`/
+`MutationRejected` constants instead of comparing wire strings directly.
 
 ## Data APIs
 
@@ -92,7 +94,10 @@ known nondeterministic functions. Use `Execute` for one mutation,
 `ExecuteReturning` for bounded mutation rows, `ExecuteReturningOne` when the
 mutation must produce exactly one row, or a prepared `Statements` array for an
 atomic multi-statement transaction. Generic `ExecuteReturningMap` helpers map
-rows through a typed Go callback. A later statement can bind a value
+rows through a typed Go callback; `SQLRow` exposes read-only `Len`, `Columns`,
+`Values`, `Value`, and `Named` accessors. SQL values are `nil`, `int64`,
+`float64`, `string`, or `[]byte`, and replicated BLOB arguments retain their
+Go type. A later statement can bind a value
 from the exactly one row of an earlier `WantRows` statement through
 `OutputRefs`, by a unique column name or index. Reference targets use plain `?`
 parameters and must have a matching `null` entry in `Args`. Returned rows and
@@ -187,6 +192,22 @@ The optional adapter exposes:
   `GET /replica/status`.
 - Health: `GET /ready`, `GET /healthz`.
 
+```bash
+curl --fail-with-body http://127.0.0.1:8080/sql/query \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT 1","consistency":"local"}'
+```
+
+Errors use one JSON envelope: `{"code":"invalid_request","error":"..."}`.
+Stable codes include `invalid_request`, `request_conflict`, `not_ready`,
+`overloaded`, `durability_unavailable`, `commit_unknown`, and
+`quorum_unavailable`. A `commit_unknown` response also carries `request_id`,
+`slot`, and `retry_through_slot`. Unsupported methods return an `Allow` header.
+Go clients can decode `rhiza.HTTPErrorResponse` and compare its code with the
+`rhiza.HTTPErrorCode*` constants.
+SQL BLOB parameters use `{"$rhiza_blob":"<base64>"}` in HTTP JSON; returned
+BLOB values are base64 JSON strings.
+
 Query endpoints accept `local` or `linearizable` consistency. Read replicas
 serve the read routes but return HTTP 503 for mutations. The HTTP adapter has no
 built-in client authentication and must not be exposed directly to an
@@ -197,8 +218,8 @@ untrusted network.
 Read replicas serve the SQL, Graph, KV, graph-stream, request-status, and HTTP
 read APIs, but never propose, vote, acknowledge decisions, or participate in
 quorum and read-index calculations. Linearizable reads return
-`ErrQuorumUnavailable`; bound staleness by comparing `Status().AppliedSlot` and
-`Status().SourceTip`. The HTTP status response also includes `lag_slots`.
+`ErrQuorumUnavailable`; use `Status().LagSlots` to observe bounded staleness.
+The HTTP status response also includes `lag_slots`.
 
 | Mode | Source | Tradeoff |
 | --- | --- | --- |
@@ -211,7 +232,7 @@ replica, err := rhiza.OpenReadReplica(ctx, rhiza.ReplicaConfig{
     ReplicaID:        "read-1",
     DataDir:          "./read-1",
     Members:          []rhiza.ReplicaMember{{ID: "n1"}},
-    ObjStoreProvider: "s3",
+    ObjStoreProvider: rhiza.ObjectStoreProviderS3,
     ObjStoreBucket:   "rhiza",
 })
 ```
@@ -256,12 +277,27 @@ runtime:
 - `object-store`: non-voting object-store replica.
 - `learner`: non-voting peer-first learner.
 
-Common settings are `RHIZA_CLUSTER_ID`, `RHIZA_NODE_ID`, `RHIZA_DATA_DIR`,
-`RHIZA_BIND_ADDR`, `RHIZA_PEER_ADDR`, `RHIZA_CLUSTER_MEMBERS`, and
-`RHIZA_ADMIN_TOKEN`. Object-store settings use `RHIZA_OBJSTORE_*`; learner peer
-identities use `RHIZA_REPLICA_MEMBERS`, and replica polling uses
-`RHIZA_REPLICA_SYNC_INTERVAL`. See [`cmd/rhiza/main.go`](cmd/rhiza/main.go) for
-the complete environment mapping.
+Common settings are:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `RHIZA_ROLE` | `voter` | `voter`, `object-store`, or `learner` |
+| `RHIZA_CLUSTER_ID` | `cluster-a` | Stable cluster identity |
+| `RHIZA_NODE_ID` | `node-1` | Unique voter or replica identity |
+| `RHIZA_DATA_DIR` | `./rhiza-data` | Durable local state |
+| `RHIZA_BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
+| `RHIZA_PEER_ADDR` | `127.0.0.1:9090` | Voter QUIC listen address |
+| `RHIZA_CLUSTER_MEMBERS` | empty | JSON fixed voter membership |
+| `RHIZA_REPLICA_MEMBERS` | empty | Learner JSON pinned voter identities |
+| `RHIZA_REPLICA_SYNC_INTERVAL` | `0s` | Replica polling interval; zero selects the engine default |
+| `RHIZA_ADMIN_TOKEN` | empty | Learner-to-voter sync credential |
+| `RHIZA_OBJSTORE_PROVIDER` | empty | `filesystem`, `s3`, `gcs`, or `azure` |
+| `RHIZA_OBJSTORE_DIR` | empty | Filesystem provider directory |
+
+Cloud credentials and tuning use the remaining `RHIZA_OBJSTORE_*` variables.
+`RHIZA_FILESYSTEM_DIR` remains an alias for `RHIZA_OBJSTORE_DIR`; conflicting
+values are rejected. Invalid boolean and duration values fail startup instead
+of silently changing behavior.
 
 ```bash
 docker build -t rhiza:dev .

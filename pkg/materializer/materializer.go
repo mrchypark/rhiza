@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -1595,6 +1596,20 @@ func sqlArg(arg any) (any, error) {
 	switch value := arg.(type) {
 	case nil, bool, string, []byte, int64, float64:
 		return value, nil
+	case map[string]any:
+		encoded, ok := value["$rhiza_blob"]
+		if !ok || len(value) != 1 {
+			return nil, fmt.Errorf("unsupported SQL argument type %T", arg)
+		}
+		text, ok := encoded.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid SQL blob argument")
+		}
+		blob, err := base64.StdEncoding.DecodeString(text)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SQL blob argument: %w", err)
+		}
+		return blob, nil
 	case int:
 		return int64(value), nil
 	case int8:
