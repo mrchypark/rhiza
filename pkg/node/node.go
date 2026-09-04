@@ -910,7 +910,7 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 				}
 			}
 			if syncErr != nil {
-				log.Printf("operation sync from all peers failed: %v", syncErr)
+				log.Printf("operation sync deferred: %v", syncErr)
 			}
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.

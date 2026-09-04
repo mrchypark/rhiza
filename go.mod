@@ -2,6 +2,9 @@ module github.com/mrchypark/rhiza
 
 go 1.27.0
 
+// v0.9.0 was cached by module proxies from the wrong commit.
+retract v0.9.0
+
 require (
 	github.com/go-kit/log v0.2.1
 	github.com/google/flatbuffers v25.12.19+incompatible
