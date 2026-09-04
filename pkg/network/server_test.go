@@ -574,6 +574,22 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[3,"linked"]]`)) {
 		t.Fatalf("output refs query status=%d body=%s", res.Code, res.Body.String())
 	}
+	res = request("/sql/transaction", `{"request_id":"sql-precondition","statements":[{"sql":"UPDATE api SET name = 'never' WHERE id = 999","expected_rows_affected":1},{"sql":"INSERT INTO api_copy VALUES (999, 'never')"}]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"status":"rejected"`)) || !bytes.Contains(res.Body.Bytes(), []byte(`"error_code":"precondition_failed"`)) {
+		t.Fatalf("precondition status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/transaction", `{"request_id":"sql-precondition","statements":[{"sql":"UPDATE api SET name = 'never' WHERE id = 999","expected_rows_affected":1},{"sql":"INSERT INTO api_copy VALUES (999, 'never')"}]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"error_code":"precondition_failed"`)) {
+		t.Fatalf("precondition retry status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/transaction", `{"request_id":"sql-precondition","statements":[{"sql":"UPDATE api SET name = 'never' WHERE id = 999","expected_rows_affected":0},{"sql":"INSERT INTO api_copy VALUES (999, 'never')"}]}`)
+	if res.Code != http.StatusConflict || !bytes.Contains(res.Body.Bytes(), []byte(`"code":"request_conflict"`)) {
+		t.Fatalf("changed precondition status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/query", `{"sql":"SELECT COUNT(*) FROM api_copy WHERE id = 999"}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[0]]`)) {
+		t.Fatalf("precondition rollback status=%d body=%s", res.Code, res.Body.String())
+	}
 	res = request("/sql/execute-returning-one", `{"request_id":"sql-returning-one","sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["one"]}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[4,"one"]]`)) {
 		t.Fatalf("returning one status=%d body=%s", res.Code, res.Body.String())

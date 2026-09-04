@@ -56,6 +56,8 @@ const migrationTableDDL = `CREATE TABLE IF NOT EXISTS _rhiza_migrations (
 	checksum TEXT NOT NULL CHECK(length(checksum) = 64)
 ) STRICT`
 
+var errSQLPreconditionFailed = errors.New("SQL precondition failed")
+
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
 type Materializer struct {
@@ -1087,7 +1089,10 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 			}
 			result = types.SQLCommandResult{}
 			receipt.Status = types.MutationRejected
-			receipt.ErrorCode = "execution_failed"
+			receipt.ErrorCode = types.MutationErrorCodeExecutionFailed
+			if errors.Is(executeErr, errSQLPreconditionFailed) {
+				receipt.ErrorCode = types.MutationErrorCodePreconditionFailed
+			}
 		} else {
 			for _, statement := range result.Statements {
 				receipt.RowsAffected += statement.RowsAffected
@@ -1337,8 +1342,24 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		if len(statement.OutputRefs) > MaxSQLArgs {
 			return fmt.Errorf("SQL has more than %d output references", MaxSQLArgs)
 		}
-		if command.Migration != nil && (len(statement.Args) != 0 || statement.WantRows || len(statement.OutputRefs) != 0) {
-			return fmt.Errorf("migration statements do not support arguments, returned rows, or output references")
+		if command.Migration != nil && (len(statement.Args) != 0 || statement.WantRows || statement.ExpectedRowsAffected != nil || statement.ExpectedReturnedRows != nil || len(statement.OutputRefs) != 0) {
+			return fmt.Errorf("migration statements do not support arguments, returned rows, preconditions, or output references")
+		}
+		if statement.ExpectedRowsAffected != nil {
+			if statement.WantRows {
+				return fmt.Errorf("expected_rows_affected is not valid for a row-returning statement")
+			}
+			if *statement.ExpectedRowsAffected < 0 {
+				return fmt.Errorf("expected_rows_affected must not be negative")
+			}
+		}
+		if statement.ExpectedReturnedRows != nil {
+			if !statement.WantRows {
+				return fmt.Errorf("expected_returned_rows requires want_rows")
+			}
+			if *statement.ExpectedReturnedRows < 0 || *statement.ExpectedReturnedRows > MaxReturningRows {
+				return fmt.Errorf("expected_returned_rows must be between 0 and %d", MaxReturningRows)
+			}
 		}
 		if len(statement.OutputRefs) != 0 {
 			parameterCount, err := countPlainParameters(statement.SQL)
@@ -1528,7 +1549,7 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 	budget := resultBudget{rows: MaxReturningRows, bytes: MaxMutationResultBytes, limit: MaxMutationResultBytes}
 	resolvedBytes := 0
 	wantsRows := command.WantRows
-	for _, statement := range statements {
+	for statementIndex, statement := range statements {
 		args := make([]any, len(statement.Args))
 		for i, arg := range statement.Args {
 			value, err := sqlArg(arg)
@@ -1577,13 +1598,16 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 			if err != nil {
 				return result, err
 			}
-			statementResult, err := collectRowsWithBudget(rows, &budget)
+			statementResult, err := collectRowsWithBudget(rows, &budget, statement.ExpectedReturnedRows)
 			rows.Close()
 			if err != nil {
 				return result, err
 			}
 			if command.RequireOne && len(statementResult.Rows) != 1 {
-				return result, fmt.Errorf("statement must return exactly one row")
+				return result, fmt.Errorf("%w: statement must return exactly one row", errSQLPreconditionFailed)
+			}
+			if statement.ExpectedReturnedRows != nil && int64(len(statementResult.Rows)) != *statement.ExpectedReturnedRows {
+				return result, fmt.Errorf("%w: statement %d returned %d rows, expected %d", errSQLPreconditionFailed, statementIndex, len(statementResult.Rows), *statement.ExpectedReturnedRows)
 			}
 			result.Statements = append(result.Statements, statementResult)
 			continue
@@ -1593,8 +1617,14 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 			return result, err
 		}
 		statementResult := types.SQLStatementResult{}
-		statementResult.RowsAffected, _ = execResult.RowsAffected()
+		statementResult.RowsAffected, err = execResult.RowsAffected()
+		if err != nil && statement.ExpectedRowsAffected != nil {
+			return result, err
+		}
 		statementResult.LastInsertID, _ = execResult.LastInsertId()
+		if statement.ExpectedRowsAffected != nil && statementResult.RowsAffected != *statement.ExpectedRowsAffected {
+			return result, fmt.Errorf("%w: statement %d affected %d rows, expected %d", errSQLPreconditionFailed, statementIndex, statementResult.RowsAffected, *statement.ExpectedRowsAffected)
+		}
 		result.Statements = append(result.Statements, statementResult)
 	}
 	if wantsRows {
@@ -1715,10 +1745,10 @@ func encodedJSONSize(value any) (int, error) {
 }
 
 func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
-	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes, limit: MaxResultBytes})
+	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes, limit: MaxResultBytes}, nil)
 }
 
-func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget) (types.SQLStatementResult, error) {
+func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget, expectedRows *int64) (types.SQLStatementResult, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return types.SQLStatementResult{}, err
@@ -1731,6 +1761,9 @@ func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget) (types.SQLState
 		return result, fmt.Errorf("result exceeds %d bytes", budget.limit)
 	}
 	for rows.Next() {
+		if expectedRows != nil && int64(len(result.Rows)) == *expectedRows {
+			return result, fmt.Errorf("%w: statement returned more than %d rows", errSQLPreconditionFailed, *expectedRows)
+		}
 		if budget.rows == 0 {
 			return result, fmt.Errorf("result exceeds %d rows", MaxReturningRows)
 		}
