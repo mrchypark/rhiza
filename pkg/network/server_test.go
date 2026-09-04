@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
@@ -545,7 +546,7 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 		return res
 	}
 
-	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"CREATE TABLE api_copy (id INTEGER, name TEXT)"},{"sql":"INSERT INTO api(name) VALUES (?)","args":["bound"]}]}`)
+	res := request("/sql/transaction", `{"request_id":"sql-1","statements":[{"sql":"CREATE TABLE api (id INTEGER PRIMARY KEY, name TEXT)"},{"sql":"CREATE TABLE api_copy (id INTEGER, name TEXT)"},{"sql":"CREATE TABLE api_blob (payload BLOB)"},{"sql":"INSERT INTO api(name) VALUES (?)","args":["bound"]}]}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"status":"committed"`)) {
 		t.Fatalf("SQL status=%d body=%s", res.Code, res.Body.String())
 	}
@@ -553,9 +554,17 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"bound"`)) {
 		t.Fatalf("query status=%d body=%s", res.Code, res.Body.String())
 	}
+	res = request("/sql/query", `{"sql":"SELECT typeof(?), hex(?)","args":[{"$rhiza_blob":"AQID"},{"$rhiza_blob":"AQID"}]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[["blob","010203"]]`)) {
+		t.Fatalf("blob query status=%d body=%s", res.Code, res.Body.String())
+	}
 	res = request("/sql/execute-returning", `{"request_id":"sql-returning","sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["returned"]}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[2,"returned"]]`)) {
 		t.Fatalf("returning status=%d body=%s", res.Code, res.Body.String())
+	}
+	res = request("/sql/execute-returning", `{"request_id":"sql-blob","sql":"INSERT INTO api_blob VALUES (?) RETURNING payload","args":[{"$rhiza_blob":"AQID"}]}`)
+	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[["AQID"]]`)) {
+		t.Fatalf("blob returning status=%d body=%s", res.Code, res.Body.String())
 	}
 	res = request("/sql/transaction", `{"request_id":"sql-refs","statements":[{"sql":"INSERT INTO api(name) VALUES (?) RETURNING id, name","args":["linked"],"want_rows":true},{"sql":"INSERT INTO api_copy VALUES (?, ?)","args":[null,null],"output_refs":[{"arg_index":0,"statement_index":0,"column_name":"id"},{"arg_index":1,"statement_index":0,"column_name":"name"}]}]}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"rows":[[3,"linked"]]`)) {
@@ -590,6 +599,17 @@ func TestSQLAndKVAPIEndToEnd(t *testing.T) {
 	res = request("/kv/get", `{"key":"short"}`)
 	if res.Code != http.StatusOK || !bytes.Contains(res.Body.Bytes(), []byte(`"found":false`)) {
 		t.Fatalf("TTL get status=%d body=%s", res.Code, res.Body.String())
+	}
+
+	res = request("/sql/query", `{}`)
+	var apiError ErrorResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &apiError); err != nil || res.Code != http.StatusBadRequest || apiError.Code != "invalid_request" || apiError.Error == "" {
+		t.Fatalf("error status=%d body=%s decode=%v", res.Code, res.Body.String(), err)
+	}
+	res = httptest.NewRecorder()
+	server.ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/sql/query", nil))
+	if res.Code != http.StatusMethodNotAllowed || res.Header().Get("Allow") != http.MethodPost || !bytes.Contains(res.Body.Bytes(), []byte(`"code":"method_not_allowed"`)) {
+		t.Fatalf("method status=%d allow=%q body=%s", res.Code, res.Header().Get("Allow"), res.Body.String())
 	}
 }
 

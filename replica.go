@@ -39,7 +39,7 @@ type ReplicaConfig struct {
 	ReplicaID    string
 	DataDir      string
 	AdminToken   string
-	Members      []network.PeerIdentity
+	Members      []ReplicaMember
 	SyncInterval time.Duration
 
 	ObjStoreEndpoint               string
@@ -67,6 +67,7 @@ type ReplicaStatus struct {
 	Mode        ReplicaMode
 	AppliedSlot uint64
 	SourceTip   uint64
+	LagSlots    uint64
 	Source      string
 	LastSync    time.Time
 	LastError   string
@@ -674,6 +675,9 @@ func (r *ReadReplica) Status() ReplicaStatus {
 	defer r.statusMu.RUnlock()
 	status := r.status
 	status.AppliedSlot = r.material.Tip()
+	if status.SourceTip > status.AppliedSlot {
+		status.LagSlots = status.SourceTip - status.AppliedSlot
+	}
 	return status
 }
 

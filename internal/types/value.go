@@ -3,6 +3,7 @@ package types
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -280,7 +281,60 @@ func NotifyFingerprint(command NotifyCommand) ([32]byte, error) {
 }
 
 func EncodeSQLBatchItem(command SQLCommand) ([]byte, error) {
-	return json.Marshal(command)
+	wire := command
+	wire.Args, _ = encodeSQLArgs(command.Args)
+	statementsCloned := false
+	for i, statement := range command.Statements {
+		args, changed := encodeSQLArgs(statement.Args)
+		if !changed {
+			continue
+		}
+		if !statementsCloned {
+			wire.Statements = append([]SQLStatement(nil), command.Statements...)
+			statementsCloned = true
+		}
+		wire.Statements[i].Args = args
+	}
+	return json.Marshal(wire)
+}
+
+func encodeSQLArgs(args []any) ([]any, bool) {
+	var result []any
+	for i, arg := range args {
+		if value, ok := arg.([]byte); ok {
+			if result == nil {
+				result = append([]any(nil), args...)
+			}
+			result[i] = map[string]string{"$rhiza_blob": base64.StdEncoding.EncodeToString(value)}
+		}
+	}
+	if result == nil {
+		return args, false
+	}
+	return result, true
+}
+
+func decodeSQLArgs(args []any) error {
+	for i, arg := range args {
+		object, ok := arg.(map[string]any)
+		if !ok {
+			continue
+		}
+		encoded, tagged := object["$rhiza_blob"]
+		if !tagged || len(object) != 1 {
+			continue
+		}
+		text, ok := encoded.(string)
+		if !ok {
+			return fmt.Errorf("invalid SQL blob argument")
+		}
+		value, err := base64.StdEncoding.DecodeString(text)
+		if err != nil {
+			return fmt.Errorf("invalid SQL blob argument: %w", err)
+		}
+		args[i] = value
+	}
+	return nil
 }
 
 func AssembleSQLBatch(items [][]byte) []byte {
@@ -397,6 +451,16 @@ func DecodeSQLBatch(value []byte) ([]SQLCommand, bool, error) {
 	}
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty SQL command batch")
+	}
+	for i := range commands {
+		if err := decodeSQLArgs(commands[i].Args); err != nil {
+			return nil, true, err
+		}
+		for j := range commands[i].Statements {
+			if err := decodeSQLArgs(commands[i].Statements[j].Args); err != nil {
+				return nil, true, err
+			}
+		}
 	}
 	return commands, true, nil
 }
