@@ -524,7 +524,7 @@ func TestExecuteReturningOneAndTypedMapping(t *testing.T) {
 		t.Fatalf("response=%+v mapped=%+v err=%v", response, got, err)
 	}
 	many, err := db.ExecuteReturningOne(ctx, rhiza.ExecuteRequest{RequestID: "map-many", SQL: "INSERT INTO mapped(name) VALUES ('a'), ('b') RETURNING id"})
-	if err != nil || many.Status != rhiza.MutationRejected {
+	if err != nil || many.Status != rhiza.MutationRejected || many.ErrorCode != rhiza.MutationErrorCodePreconditionFailed {
 		t.Fatalf("multi-row response=%+v err=%v", many, err)
 	}
 	rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT COUNT(*) FROM mapped"})

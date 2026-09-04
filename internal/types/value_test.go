@@ -50,3 +50,20 @@ func TestSQLBatchPreservesBlobArguments(t *testing.T) {
 		t.Fatal("invalid blob argument was accepted")
 	}
 }
+
+func TestSQLFingerprintIncludesStatementPreconditions(t *testing.T) {
+	one, two := int64(1), int64(2)
+	command := SQLCommand{RequestID: "same", Statements: []SQLStatement{{SQL: "UPDATE t SET value = 1", ExpectedRowsAffected: &one}}}
+	first, err := SQLFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Statements[0].ExpectedRowsAffected = &two
+	second, err := SQLFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("statement precondition did not change request fingerprint")
+	}
+}

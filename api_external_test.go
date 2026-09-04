@@ -28,13 +28,17 @@ var _ http.Handler = (*rhiza.DB)(nil)
 var _ http.Handler = (*rhiza.ReadReplica)(nil)
 var _ = rhiza.ExecuteReturningMapOne[int64]
 
+var expectedOne = int64(1)
+
 func TestEmbeddedLifecycle(t *testing.T) {
 	_ = rhiza.Config{NodeID: "n1", DataDir: "data", Members: []rhiza.Member{{ID: "n1"}}, ObjStoreProvider: rhiza.ObjectStoreProviderFilesystem}
 	_ = rhiza.NodeID("n1")
 	_ = rhiza.ReplicaConfig{ReplicaID: "r1", DataDir: "replica", Members: []rhiza.ReplicaMember{{ID: "n1"}}, ObjStoreProvider: rhiza.ObjectStoreProviderS3}
 	_ = rhiza.Migration{Version: 1, Name: "schema", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE t (id INTEGER)"}}}
+	_ = rhiza.SQLStatement{SQL: "UPDATE t SET id = id", ExpectedRowsAffected: &expectedOne}
 	_ = rhiza.RequestStatusRequest{Kind: rhiza.RequestKindSQL, RequestID: "request"}
 	_ = rhiza.MutationCommitted
+	_ = rhiza.MutationErrorCodePreconditionFailed
 	_ = rhiza.RequestStateUnknownOrExpired
 	_ = rhiza.HTTPErrorResponse{Code: "invalid_request", Error: "invalid request"}
 	_ = rhiza.HTTPErrorCodeInvalidRequest

@@ -398,7 +398,7 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 			return err
 		}
 		if !found && command.RequestID != "" {
-			receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: "execution_failed", RetryThroughSlot: slot + g.idempotencyWindow - 1}
+			receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeExecutionFailed, RetryThroughSlot: slot + g.idempotencyWindow - 1}
 			if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
 				return err
 			}
@@ -502,7 +502,7 @@ func decodeGraphRequest(data []byte) (graphRequest, bool, error) {
 		request.Receipt.Status = types.MutationCommitted
 	case 2:
 		request.Receipt.Status = types.MutationRejected
-		request.Receipt.ErrorCode = "execution_failed"
+		request.Receipt.ErrorCode = types.MutationErrorCodeExecutionFailed
 	default:
 		return graphRequest{}, false, fmt.Errorf("invalid graph request status")
 	}
