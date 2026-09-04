@@ -1,0 +1,600 @@
+ Downloading crates ...
+  Downloaded anstream v0.6.18
+  Downloaded anstyle-query v1.1.2
+  Downloaded borsh-derive v1.5.3
+  Downloaded anstyle v1.0.10
+  Downloaded cfg-if v1.0.0
+  Downloaded axum-core v0.5.0
+  Downloaded base64ct v1.6.0
+  Downloaded anstyle-parse v0.2.6
+  Downloaded async-trait v0.1.83
+  Downloaded autocfg v1.4.0
+  Downloaded byte-unit v5.1.6
+  Downloaded cc v1.2.55
+  Downloaded arc-swap v1.7.1
+  Downloaded borsh v1.5.3
+  Downloaded crc v3.3.0
+  Downloaded colorchoice v1.0.3
+  Downloaded cpufeatures v0.2.16
+  Downloaded clap_lex v0.7.3
+  Downloaded clap_derive v4.5.18
+  Downloaded async-compression v0.4.18
+  Downloaded clap v4.5.21
+  Downloaded axum v0.8.1
+  Downloaded brotli-decompressor v4.0.1
+  Downloaded clap_builder v4.5.21
+  Downloaded ctrlc v3.4.5
+  Downloaded brotli v7.0.0
+  Downloaded digest v0.11.2
+  Downloaded either v1.13.0
+  Downloaded equivalent v1.0.1
+  Downloaded errno v0.3.12
+  Downloaded fs-err v3.2.0
+  Downloaded getrandom v0.2.15
+  Downloaded getrandom v0.3.1
+  Downloaded getrandom v0.4.1
+  Downloaded h2 v0.3.26
+  Downloaded h2 v0.4.7
+  Downloaded hostname v0.4.0
+  Downloaded http-body v0.4.6
+  Downloaded http v1.1.0
+  Downloaded http-body-util v0.1.2
+  Downloaded httparse v1.9.5
+  Downloaded hyper v0.14.31
+  Downloaded hyper-rustls v0.24.2
+  Downloaded hyper-rustls v0.27.3
+  Downloaded hyper-timeout v0.4.1
+  Downloaded hyper-util v0.1.19
+  Downloaded iana-time-zone v0.1.61
+  Downloaded icu_collections v1.5.0
+  Downloaded icu_locid_transform_data v1.5.0
+  Downloaded icu_properties v1.5.1
+  Downloaded icu_provider v1.5.0
+  Downloaded icu_provider_macros v1.5.0
+  Downloaded idna_adapter v1.2.0
+  Downloaded inout v0.1.3
+  Downloaded ipnet v2.10.1
+  Downloaded iri-string v0.7.11
+  Downloaded itoa v1.0.14
+  Downloaded icu_locid v1.5.0
+  Downloaded icu_locid_transform v1.5.0
+  Downloaded icu_normalizer v1.5.0
+  Downloaded icu_normalizer_data v1.5.0
+  Downloaded icu_properties_data v1.5.0
+  Downloaded jobserver v0.1.32
+  Downloaded litemap v0.7.4
+  Downloaded lock_api v0.4.12
+  Downloaded log v0.4.22
+  Downloaded matchers v0.1.0
+  Downloaded memchr v2.7.4
+  Downloaded memmap2 v0.9.5
+  Downloaded libc v0.2.172
+  Downloaded mio v1.0.2
+  Downloaded nu-ansi-term v0.46.0
+  Downloaded num_cpus v1.16.0
+  Downloaded once_cell v1.20.2
+  Downloaded openraft-macros v0.9.18
+  Downloaded overload v0.1.1
+  Downloaded pin-project-internal v1.1.7
+  Downloaded pin-project-lite v0.2.15
+  Downloaded pkg-config v0.3.31
+  Downloaded ppv-lite86 v0.2.20
+  Downloaded proc-macro-crate v3.2.0
+  Downloaded quinn-udp v0.5.7
+  Downloaded quote v1.0.44
+  Downloaded rand v0.10.0
+  Downloaded pin-project v1.1.7
+  Downloaded quick-xml v0.39.2
+  Downloaded rand v0.9.1
+  Downloaded rand_core v0.9.3
+  Downloaded rand_core v0.10.0
+  Downloaded regex-automata v0.1.10
+  Downloaded regex v1.11.1
+  Downloaded reqwest v0.13.2
+  Downloaded regex-syntax v0.6.29
+  Downloaded rust-embed-utils v8.5.0
+  Downloaded rust-embed-impl v8.5.0
+  Downloaded rustc-hash v2.0.0
+  Downloaded rustls-pemfile v1.0.4
+  Downloaded rustls-native-certs v0.6.3
+  Downloaded rustix v1.0.7
+  Downloaded rust_decimal v1.36.0
+  Downloaded rustls v0.21.12
+  Downloaded rust-embed v8.5.0
+  Downloaded rustversion v1.0.18
+  Downloaded rustls-webpki v0.101.7
+  Downloaded ryu v1.0.18
+  Downloaded sct v0.7.1
+  Downloaded security-framework v2.11.1
+  Downloaded semver v1.0.23
+  Downloaded serde_json v1.0.133
+  Downloaded serde_path_to_error v0.1.16
+  Downloaded serde_spanned v1.1.0
+  Downloaded slab v0.4.9
+  Downloaded smallvec v1.13.2
+  Downloaded socket2 v0.5.7
+  Downloaded socket2 v0.6.1
+  Downloaded synstructure v0.13.1
+  Downloaded thread_local v1.1.8
+  Downloaded tinystr v0.7.6
+  Downloaded tinyvec v1.8.0
+  Downloaded tokio-rustls v0.24.1
+  Downloaded toml_datetime v0.6.9
+  Downloaded toml_write v0.1.1
+  Downloaded toml_writer v1.1.0+spec-1.1.0
+  Downloaded tokio-io-timeout v1.2.0
+  Downloaded toml_datetime v1.1.0+spec-1.1.0
+  Downloaded toml_edit v0.22.26
+  Downloaded toml_parser v1.1.0+spec-1.1.0
+  Downloaded tokio-util v0.7.12
+  Downloaded toml v1.1.0+spec-1.1.0
+  Downloaded tracing v0.1.40
+  Downloaded tracing-attributes v0.1.27
+  Downloaded tracing-core v0.1.33
+  Downloaded unicode-ident v1.0.14
+  Downloaded typenum v1.17.0
+  Downloaded tracing-subscriber v0.3.18
+  Downloaded utf16_iter v1.0.5
+  Downloaded validit v0.2.4
+  Downloaded utf8-width v0.1.7
+  Downloaded uuid v1.11.0
+  Downloaded winnow v0.7.10
+  Downloaded write16 v1.0.0
+  Downloaded writeable v0.5.5
+  Downloaded x509-parser v0.18.0
+  Downloaded yoke-derive v0.7.5
+  Downloaded yoke v0.7.5
+  Downloaded zerocopy v0.7.35
+  Downloaded zerocopy-derive v0.7.35
+  Downloaded zeroize v1.8.1
+  Downloaded zerovec-derive v0.10.3
+  Downloaded zerofrom v0.1.5
+  Downloaded zerovec v0.10.4
+  Downloaded zerofrom-derive v0.1.5
+  Downloaded anyerror v0.1.12
+  Downloaded eventsource-client v0.16.1
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.44
+   Compiling unicode-ident v1.0.14
+   Compiling libc v0.2.172
+   Compiling cfg-if v1.0.0
+   Compiling autocfg v1.4.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v1.3.0
+   Compiling pin-project-lite v0.2.15
+   Compiling bytes v1.11.1
+   Compiling log v0.4.22
+   Compiling once_cell v1.20.2
+   Compiling memchr v2.7.4
+   Compiling version_check v0.9.5
+   Compiling futures-core v0.3.31
+   Compiling slab v0.4.9
+   Compiling itoa v1.0.14
+   Compiling typenum v1.17.0
+   Compiling generic-array v0.14.7
+   Compiling tracing-core v0.1.33
+   Compiling futures-sink v0.3.31
+   Compiling serde_core v1.0.228
+   Compiling futures-channel v0.3.31
+   Compiling pin-utils v0.1.0
+   Compiling subtle v2.6.1
+   Compiling fnv v1.0.7
+   Compiling futures-task v0.3.31
+   Compiling syn v2.0.114
+   Compiling jobserver v0.1.32
+   Compiling futures-io v0.3.31
+   Compiling core-foundation-sys v0.8.7
+   Compiling cc v1.2.55
+   Compiling foldhash v0.2.0
+   Compiling bitflags v2.11.0
+   Compiling hashbrown v0.16.1
+   Compiling serde v1.0.228
+   Compiling untrusted v0.9.0
+   Compiling zeroize v1.8.1
+   Compiling dunce v1.0.5
+   Compiling getrandom v0.2.15
+   Compiling socket2 v0.6.1
+   Compiling mio v1.0.2
+   Compiling rand_core v0.6.4
+   Compiling stable_deref_trait v1.2.0
+   Compiling fs_extra v1.3.0
+   Compiling cmake v0.1.58
+   Compiling smallvec v1.13.2
+   Compiling crypto-common v0.1.6
+   Compiling equivalent v1.0.1
+   Compiling byteorder v1.5.0
+   Compiling indexmap v2.13.0
+   Compiling httparse v1.9.5
+   Compiling ring v0.17.14
+   Compiling aws-lc-sys v0.39.0
+   Compiling tower-service v0.3.3
+   Compiling http v1.1.0
+   Compiling aws-lc-rs v1.16.2
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling percent-encoding v2.3.1
+   Compiling writeable v0.5.5
+   Compiling httpdate v1.0.3
+   Compiling litemap v0.7.4
+   Compiling rustls-pki-types v1.14.0
+   Compiling http-body v1.0.1
+   Compiling untrusted v0.7.1
+   Compiling cfg_aliases v0.2.1
+   Compiling block-buffer v0.10.4
+   Compiling security-framework-sys v2.17.0
+   Compiling icu_locid_transform_data v1.5.0
+   Compiling rustls v0.23.37
+   Compiling base64 v0.22.1
+   Compiling digest v0.10.7
+   Compiling num-traits v0.2.19
+   Compiling icu_properties_data v1.5.0
+   Compiling atomic-waker v1.1.2
+   Compiling getrandom v0.3.1
+   Compiling ryu v1.0.18
+   Compiling utf16_iter v1.0.5
+   Compiling utf8_iter v1.0.4
+   Compiling write16 v1.0.0
+   Compiling icu_normalizer_data v1.5.0
+   Compiling form_urlencoded v1.2.1
+   Compiling socket2 v0.5.7
+   Compiling sync_wrapper v1.0.2
+   Compiling siphasher v1.0.2
+   Compiling ipnet v2.10.1
+   Compiling serde_json v1.0.133
+   Compiling synstructure v0.13.1
+   Compiling tower-layer v0.3.3
+   Compiling alloc-no-stdlib v2.0.4
+   Compiling alloc-stdlib v0.2.2
+   Compiling rand_core v0.9.3
+   Compiling cpufeatures v0.2.16
+   Compiling core-foundation v0.10.1
+   Compiling lock_api v0.4.12
+   Compiling crossbeam-utils v0.8.21
+   Compiling rustversion v1.0.18
+   Compiling libm v0.2.16
+   Compiling thiserror v2.0.18
+   Compiling security-framework v3.7.0
+   Compiling tokio-macros v2.6.1
+   Compiling tracing-attributes v0.1.27
+   Compiling futures-macro v0.3.31
+   Compiling zerofrom-derive v0.1.5
+   Compiling serde_derive v1.0.228
+   Compiling tokio v1.50.0
+   Compiling futures-util v0.3.31
+   Compiling tracing v0.1.40
+   Compiling zerofrom v0.1.5
+   Compiling yoke-derive v0.7.5
+   Compiling zerovec-derive v0.10.3
+   Compiling yoke v0.7.5
+   Compiling displaydoc v0.2.5
+   Compiling zerovec v0.10.4
+   Compiling zerocopy-derive v0.7.35
+   Compiling zerocopy v0.7.35
+   Compiling icu_provider_macros v1.5.0
+   Compiling tinystr v0.7.6
+   Compiling ppv-lite86 v0.2.20
+   Compiling icu_locid v1.5.0
+   Compiling icu_collections v1.5.0
+   Compiling rand_chacha v0.9.0
+   Compiling http-body-util v0.1.2
+   Compiling pin-project-internal v1.1.7
+   Compiling icu_provider v1.5.0
+   Compiling thiserror-impl v2.0.18
+   Compiling brotli-decompressor v4.0.1
+   Compiling icu_locid_transform v1.5.0
+   Compiling iana-time-zone v0.1.61
+   Compiling http v0.2.12
+   Compiling scopeguard v1.2.0
+   Compiling mime v0.3.17
+   Compiling utf8parse v0.2.2
+   Compiling tokio-util v0.7.12
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.9
+   Compiling time-macros v0.2.30
+   Compiling h2 v0.4.7
+   Compiling icu_properties v1.5.1
+   Compiling anstyle-parse v0.2.6
+   Compiling tower v0.5.2
+   Compiling brotli v7.0.0
+   Compiling chrono v0.4.44
+   Compiling pin-project v1.1.7
+   Compiling rand v0.9.1
+   Compiling futures-executor v0.3.31
+   Compiling icu_normalizer v1.5.0
+   Compiling rand_chacha v0.3.1
+   Compiling idna_adapter v1.2.0
+   Compiling idna v1.0.3
+   Compiling url v2.5.4
+   Compiling quinn-udp v0.5.7
+   Compiling hyper v1.8.1
+   Compiling base64 v0.21.7
+   Compiling anstyle v1.0.10
+   Compiling vcpkg v0.2.15
+   Compiling deranged v0.5.8
+   Compiling tinyvec_macros v0.1.1
+   Compiling powerfmt v0.2.0
+   Compiling is_terminal_polyfill v1.70.1
+   Compiling rustls v0.21.12
+   Compiling thiserror v1.0.69
+   Compiling semver v1.0.23
+   Compiling rust_decimal v1.36.0
+   Compiling colorchoice v1.0.3
+   Compiling anstyle-query v1.1.2
+   Compiling pkg-config v0.3.31
+   Compiling phf_shared v0.11.3
+   Compiling hyper-util v0.1.19
+   Compiling anstream v0.6.18
+   Compiling time v0.3.51
+   Compiling libsqlite3-sys v0.38.0
+   Compiling rand v0.8.6
+   Compiling tinyvec v1.8.0
+   Compiling fastbloom v0.14.1
+   Compiling async-compression v0.4.18
+   Compiling futures v0.3.31
+   Compiling spin v0.9.8
+   Compiling h2 v0.3.26
+   Compiling http-body v0.4.6
+   Compiling sct v0.7.1
+   Compiling rustls-webpki v0.101.7
+   Compiling thiserror-impl v1.0.69
+   Compiling sha2 v0.10.9
+   Compiling quinn v0.11.9
+   Compiling inout v0.1.3
+   Compiling core-foundation v0.9.4
+   Compiling hybrid-array v0.4.8
+   Compiling aho-corasick v1.1.3
+   Compiling unicode-xid v0.2.6
+   Compiling regex-syntax v0.6.29
+   Compiling heck v0.5.0
+   Compiling lru-slab v0.1.2
+   Compiling iri-string v0.7.11
+   Compiling strsim v0.11.1
+   Compiling arrayvec v0.7.6
+   Compiling fastrand v2.3.0
+   Compiling same-file v1.0.6
+   Compiling rustix v1.0.7
+   Compiling virtue v0.0.18
+   Compiling regex-syntax v0.8.5
+   Compiling rand_core v0.10.0
+   Compiling rustc-hash v2.0.0
+   Compiling clap_lex v0.7.3
+   Compiling getrandom v0.4.1
+   Compiling bincode_derive v2.0.1
+   Compiling clap_builder v4.5.21
+   Compiling regex-automata v0.1.10
+   Compiling regex-automata v0.4.9
+   Compiling hyper v0.14.31
+   Compiling tower-http v0.6.8
+   Compiling flume v0.12.0
+   Compiling walkdir v2.5.0
+   Compiling clap_derive v4.5.18
+   Compiling derive_more-impl v1.0.0
+   Compiling security-framework v2.11.1
+   Compiling cipher v0.4.4
+   Compiling phf_generator v0.11.3
+   Compiling rustls-pemfile v1.0.4
+   Compiling anyerror v0.1.12
+   Compiling nix v0.29.0
+   Compiling tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8
+   Compiling universal-hash v0.5.1
+   Compiling errno v0.3.12
+   Compiling csv-core v0.1.13
+   Compiling fs-err v3.2.0
+   Compiling encoding_rs v0.8.35
+   Compiling unty v0.0.4
+   Compiling lazy_static v1.5.0
+   Compiling overload v0.1.1
+   Compiling base64ct v1.6.0
+   Compiling utf8-width v0.1.7
+   Compiling opaque-debug v0.3.1
+   Compiling poly1305 v0.8.0
+   Compiling byte-unit v5.1.6
+   Compiling password-hash v0.5.0
+   Compiling nu-ansi-term v0.46.0
+   Compiling sharded-slab v0.1.7
+   Compiling bincode v2.0.1
+   Compiling csv v1.4.0
+   Compiling validit v0.2.4
+   Compiling tokio-rustls v0.24.1
+   Compiling rustls-native-certs v0.6.3
+   Compiling openraft-macros v0.9.18
+   Compiling phf_macros v0.11.3
+   Compiling derive_more v1.0.0
+   Compiling chacha20 v0.9.1
+   Compiling clap v4.5.21
+   Compiling rust-embed-utils v8.5.0
+   Compiling regex v1.11.1
+   Compiling matchers v0.1.0
+   Compiling chacha20 v0.10.0
+   Compiling crypto-common v0.2.1
+   Compiling block-buffer v0.12.0
+   Compiling axum-core v0.5.0
+   Compiling crossbeam-epoch v0.9.18
+   Compiling tracing-futures v0.2.5
+   Compiling tokio-io-timeout v1.2.0
+   Compiling quick-xml v0.39.2
+   Compiling async-stream-impl v0.3.6
+   Compiling async-trait v0.1.83
+   Compiling hmac v0.12.1
+   Compiling blake2 v0.10.6
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling aead v0.5.2
+   Compiling hashlink v0.11.0
+   Compiling uuid v1.11.0
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.8
+   Compiling maplit v1.0.2
+   Compiling const-oid v0.10.2
+   Compiling md5 v0.8.0
+   Compiling hex v0.4.3
+   Compiling dotenvy v0.15.7
+   Compiling fallible-iterator v0.3.0
+   Compiling crc-catalog v2.4.0
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling winnow v1.0.0
+   Compiling crc v3.3.0
+   Compiling digest v0.11.2
+   Compiling openraft v0.9.21
+   Compiling toml_parser v1.1.0+spec-1.1.0
+   Compiling tracing-subscriber v0.3.18
+   Compiling chacha20poly1305 v0.10.1
+   Compiling argon2 v0.5.3
+   Compiling phf v0.11.3
+   Compiling async-stream v0.3.6
+   Compiling hyper-timeout v0.4.1
+   Compiling crossbeam-deque v0.8.6
+   Compiling rand v0.10.0
+   Compiling rust-embed-impl v8.5.0
+   Compiling fs4 v1.1.0
+   Compiling hyper-rustls v0.24.2
+   Compiling yasna v0.5.2
+   Compiling thread-priority v3.0.0
+   Compiling crossbeam-channel v0.5.15
+   Compiling crossbeam-queue v0.3.12
+   Compiling deadpool-runtime v0.3.1
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_path_to_error v0.1.16
+   Compiling sha1 v0.10.6
+   Compiling pem v3.0.6
+   Compiling toml_datetime v1.1.0+spec-1.1.0
+   Compiling serde_spanned v1.1.0
+   Compiling cpufeatures v0.3.0
+   Compiling memmap2 v0.9.5
+   Compiling num_cpus v1.16.0
+   Compiling either v1.13.0
+   Compiling winnow v0.7.10
+   Compiling toml_writer v1.1.0+spec-1.1.0
+   Compiling arc-swap v1.7.1
+   Compiling utf-8 v0.7.6
+   Compiling simdutf8 v0.1.5
+   Compiling matchit v0.8.4
+   Compiling fastwebsockets v0.10.0
+   Compiling axum v0.8.1
+   Compiling toml v1.1.0+spec-1.1.0
+   Compiling deadpool v0.13.0
+   Compiling cron v0.17.0
+   Compiling sha2 v0.11.0
+   Compiling rcgen v0.14.7
+   Compiling crossbeam v0.8.4
+   Compiling rust-embed v8.5.0
+   Compiling ctrlc v3.4.5
+   Compiling eventsource-client v0.16.1
+   Compiling hiqlite-derive v0.14.0 (/private/tmp/hiqlite-bench.5IDvwZ/hiqlite-derive)
+   Compiling hostname v0.4.0
+   Compiling hiqlite-wal v0.14.0 (/private/tmp/hiqlite-bench.5IDvwZ/hiqlite-wal)
+   Compiling rustls-webpki v0.103.13
+   Compiling rusqlite v0.40.0
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.6.2
+   Compiling quinn-proto v0.11.15
+   Compiling hyper-rustls v0.27.3
+   Compiling reqwest v0.13.2
+   Compiling serde_rusqlite v0.43.0
+   Compiling axum-server v0.8.0
+   Compiling s3-simple v0.8.0
+   Compiling cryptr v0.10.0
+   Compiling tikv-jemallocator v0.7.0
+   Compiling hiqlite v0.14.0 (/private/tmp/hiqlite-bench.5IDvwZ/hiqlite)
+   Compiling bench v0.1.0 (/private/tmp/hiqlite-bench.5IDvwZ/examples/bench)
+    Finished `release` profile [optimized] target(s) in 10m 00s
+     Running `target/release/bench cluster -c 16 -r 100000`
+
+
+>>> Waiting for other nodes to join the cluster. Nodes joined: 3
+
+
+
+>>> All Cluster Members online
+
+
+
+>>> 100000 single INSERTs with concurrency 16 took:
+10706 ms -> 9340 inserts / s
+
+
+
+>>> 100000 transactional / batched INSERTs with concurrency 16 took:
+275 ms -> 363636 inserts / s
+
+
+
+>>> SELECT a single row with a fresh connection and no cached prepared query using `query_map_one` took:
+236 micros
+
+
+
+>>> SELECT a single row with a cached prepared statement using `query_map_one`:
+
+16 micros
+13 micros
+22 micros
+15 micros
+21 micros
+21 micros
+7 micros
+7 micros
+12 micros
+8 micros
+
+
+>>> SELECT a single row with a cached prepared statement using `query_as_one`:
+
+46 micros
+6 micros
+7 micros
+6 micros
+6 micros
+6 micros
+9 micros
+6 micros
+6 micros
+6 micros
+
+
+>>> SELECT all rows using `query_map` took:
+19281 micros
+
+
+
+>>> SELECT all rows using `query_as` took:
+11506 micros
+
+
+
+>>> 100000 single cache PUTs with concurrency 16 took:
+2135 ms -> 46838 inserts / s
+
+
+
+>>> Cache GET for a single entry :
+
+15 micros
+6 micros
+5 micros
+7 micros
+5 micros
+33 micros
+7 micros
+6 micros
+7 micros
+6 micros
+real 635.12
+user 9.26
+sys 30.48
+           549289984  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              150998  page reclaims
+                6091  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+              205982  messages sent
+              208067  messages received
+                   0  signals received
+               75787  voluntary context switches
+             2665462  involuntary context switches
+        208953675764  instructions retired
+        121374188364  cycles elapsed
+           466764808  peak memory footprint

@@ -1,207 +1,313 @@
-# rhiza
+# Rhiza
 
-Rhiza is an embedded, leaderless Go database with SQL, Graph, and KV.
-Any healthy peer can accept a write; QuePaxa records a certified decision on a
-quorum before the API acknowledges it. An HTTP server is an optional adapter
-over the same Go API.
+Rhiza is an embedded-first, leaderless Go database with SQL, Graph, KV, and
+notification APIs. Any healthy voter can accept a write. QuePaxa records a
+certified decision on a quorum before Rhiza acknowledges it, while local reads
+remain available without a quorum. The HTTP server is an optional adapter over
+the same Go API.
 
-## Runtime
+## Highlights
 
-- Go 1.27.0; `GOTOOLCHAIN=auto` is expected.
-- Green Tea GC is the Go 1.27 default.
-- SQLite uses cgo-free `ncruces/go-sqlite3`.
-- Graph uses the pure-Go `latticedb-go` engine.
+- One cgo-free runtime for SQLite, Graph, KV, and notifications.
+- Fixed-membership, leaderless replication over QUIC.
+- Local and linearizable read consistency.
+- Idempotent mutations with bounded receipts and request-status lookup.
+- Certified object-store archives and checkpoints.
+- Non-voting object-store replicas and low-lag learners.
+- Embedded Go API first; HTTP and the `rhiza` server binary are optional.
+
+## Requirements and installation
+
+Rhiza requires Go 1.27 or newer. `GOTOOLCHAIN=auto` is expected. SQLite uses
+[`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3), and Graph uses
+[`latticedb-go`](https://github.com/mrchypark/latticedb-go), both without cgo.
 
 ```bash
-go test ./...
-go vet ./...
-go build ./cmd/rhiza
-docker build -t rhiza:dev .
+go get github.com/mrchypark/rhiza
 ```
 
-## Embedded Go API
+## Quick start
+
+`Open` starts the embedded engine and its private peer endpoint. It does not
+open a public HTTP listener.
 
 ```go
 db, err := rhiza.Open(ctx, rhiza.Config{
-    NodeID: "node-1",
+    NodeID:  "node-1",
     DataDir: "./rhiza-data",
 })
-if err != nil { return err }
+if err != nil {
+    return err
+}
 defer db.Close()
 
 _, err = db.Execute(ctx, rhiza.ExecuteRequest{
     RequestID: "schema-1",
-    SQL: "CREATE TABLE tea (id INTEGER PRIMARY KEY, name TEXT)",
+    SQL:       "CREATE TABLE tea (id INTEGER PRIMARY KEY, name TEXT)",
 })
+if err != nil {
+    return err
+}
+
 rows, err := db.Query(ctx, rhiza.QueryRequest{
-    SQL: "SELECT id, name FROM tea",
+    SQL:         "SELECT id, name FROM tea",
     Consistency: rhiza.ConsistencyLocal,
 })
+if err != nil {
+    return err
+}
 ```
 
-`Open` starts the embedded engine and its private peer endpoint, but no public
-HTTP listener. Use `db.Handler()` or `db` itself as an `http.Handler` when a
-server endpoint is wanted. SQL, KV, Graph, and Notify methods are available
-directly on `DB`.
+SQL, Graph, KV, notification, stream, and request-status methods are available
+directly on `DB`. Use `db.Handler()` or `db` itself as an `http.Handler` when
+the HTTP adapter is needed.
 
-## Non-voting read copies
+## Consistency and failure model
 
-Read copies use the same SQL, Graph, KV, checkpoint, and HTTP read APIs as a
-voter, but never propose, vote, acknowledge decisions, or enter quorum/read
-index calculations. Their `linearizable` reads fail with
-`ErrQuorumUnavailable`; use local reads and inspect `Status().AppliedSlot` and
-`SourceTip` when bounding staleness.
+Local reads use the node's applied state. Linearizable reads first decide a
+unique read barrier and return `ErrQuorumUnavailable` when a quorum cannot be
+reached; they never fall back to stale data.
+
+With three voters, one failed voter preserves writes and linearizable reads.
+Two failed voters preserve local reads only. `DB.Ready()` means local recovery
+and startup catch-up completed; it is not a live quorum probe. Use an
+inexpensive linearizable query when current quorum readiness matters.
+
+All mutations require a unique `request_id`. During the idempotency window,
+retrying the same request with the same payload returns its retained result;
+reusing the ID with different intent returns `ErrRequestConflict`.
+`ErrCommitUnknown` means the caller must inspect the request status rather than
+submit a different operation under the same ID.
+
+## Data APIs
+
+### SQL
+
+Rhiza exposes SQLite's DDL, views, triggers, generated and STRICT tables,
+partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
+UPSERT, `RETURNING`, window functions, JSON functions, and FTS5.
+
+Replicated execution rejects explicit transaction control, attachment, and
+known nondeterministic functions. Use `Execute` for one mutation,
+`ExecuteReturning` for bounded mutation rows, `ExecuteReturningOne` when the
+mutation must produce exactly one row, or a prepared `Statements` array for an
+atomic multi-statement transaction. Generic `ExecuteReturningMap` helpers map
+rows through a typed Go callback. A later statement can bind a value
+from the exactly one row of an earlier `WantRows` statement through
+`OutputRefs`, by a unique column name or index. Reference targets use plain `?`
+parameters and must have a matching `null` entry in `Args`. Returned rows and
+idempotency receipts are retained together, so retrying the same request ID
+returns the original result without re-executing the mutation.
+
+`DB.Migrate` applies named, contiguous migration versions starting at 1 through
+the same replicated transaction path. Reapplying an identical migration list
+is a no-op; changing an already-applied version or leaving a gap is an error.
+Migration statements are SQL-only (no arguments, returned rows, or output references). The private
+`_rhiza_migrations` ledger and each migration are committed atomically, and the
+reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
+
+### Graph and Cypher
+
+Rhiza uses `latticedb-go v0.3.0` and exposes its deliberately small,
+case-sensitive Cypher subset. This is not full openCypher. Structural keywords
+must be uppercase.
+
+Supported query building blocks include:
+
+- `MATCH` with fixed-length incoming, outgoing, or undirected patterns.
+- `WHERE` with comparisons, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`,
+  `IS NULL`, `IS NOT NULL`, `AND`, `OR`, and `NOT`.
+- `RETURN`, `DISTINCT`, `count`, `ORDER BY`, `SKIP`, and `LIMIT`.
+- Standalone `CREATE` of one node.
+- `MATCH ... SET`, `MATCH ... CREATE` for relationships, `REMOVE`, `DELETE`,
+  and `DETACH DELETE`.
+- `UNWIND ... RETURN`, `UNWIND ... CREATE`, and `UNWIND ... MATCH`.
+- Full-text `@@` predicates, subject to the engine's ranking restrictions.
+
+`OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, variable-length paths, list
+literals, and backtick identifiers are not supported. A standalone relationship
+creation such as `CREATE (:Person)-[:KNOWS]->(:Person)` is also unsupported;
+create or match the nodes first, then use `MATCH ... CREATE`. Named parameters
+accept JSON-compatible null, boolean, string, number, list, and map values.
+
+The dependency grammar also includes vector-distance `<=>`, but Rhiza does not
+currently configure LatticeDB vector mode or expose typed vector parameters, so
+vector search is not part of Rhiza's supported Graph surface.
+
+Use `GraphQuery` or `POST /graph/query` for read-only `MATCH ... RETURN` and
+`UNWIND ... RETURN` queries. Use `GraphExecute` or `POST /graph/execute` for
+replicated mutations. Mutation statements are applied atomically with their
+request receipt and optional stream events.
+
+The dependency owns the complete language contract. See the version-pinned
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/internal/engine/testdata/query_grammar.ebnf).
+
+### Graph streams
+
+`GraphChanges` reads the node-local semantic changefeed. Named graph streams
+can be published atomically with a graph mutation, read by sequence, trimmed,
+and tracked with replicated durable consumer offsets.
+
+### KV and notifications
+
+The KV API supports get, put, delete, compare-and-swap, and TTL. Notification
+publication is replicated; subscriptions are bounded, live, at-most-once
+streams. Slow subscribers may drop notifications, so use graph streams when a
+durable cursor is required.
+
+## Limits
+
+- HTTP JSON bodies: 1 MiB.
+- Canonically encoded consensus mutations: 128 KiB.
+- SQL or Cypher text: 256 KiB.
+- SQL/Cypher arguments: 999.
+- Statements in one SQL transaction: 64.
+- SQL query or `RETURNING` result rows: 10,000.
+- SQL query result size: 16 MiB total; replicated `RETURNING` result size: 1
+  MiB total. Each cell is limited to 1 MiB.
+- Request IDs: 64 bytes.
+
+An HTTP request below 1 MiB may still exceed the encoded consensus limit.
+Embedded SQL callers can preflight the exact mutation with
+`rhiza.ValidateExecuteRequest` and inspect `rhiza.MaxReplicatedMutationBytes`.
+
+## HTTP adapter
+
+The optional adapter exposes:
+
+- SQL: `POST /sql/execute`, `/sql/execute-returning`,
+  `/sql/execute-returning-one`, `/sql/transaction`, `/sql/query`.
+- Graph: `POST /graph/execute`, `/graph/query`, `/graph/changes`.
+- Graph streams: `POST /graph/streams/read`, `POST /graph/streams/offset`,
+  `PUT /graph/streams/offset`, and `POST /graph/streams/trim`.
+- KV: `POST /kv/put`, `/kv/get`, `/kv/delete`, `/kv/cas`.
+- Notifications: `POST /notify/publish`, `GET /notify/subscribe`.
+- Operations: `POST /request/status`, `GET /metrics/object-store`,
+  `GET /replica/status`.
+- Health: `GET /ready`, `GET /healthz`.
+
+Query endpoints accept `local` or `linearizable` consistency. Read replicas
+serve the read routes but return HTTP 503 for mutations. The HTTP adapter has no
+built-in client authentication and must not be exposed directly to an
+untrusted network.
+
+## Non-voting read replicas
+
+Read replicas serve the SQL, Graph, KV, graph-stream, request-status, and HTTP
+read APIs, but never propose, vote, acknowledge decisions, or participate in
+quorum and read-index calculations. Linearizable reads return
+`ErrQuorumUnavailable`; bound staleness by comparing `Status().AppliedSlot` and
+`Status().SourceTip`. The HTTP status response also includes `lag_slots`.
+
+| Mode | Source | Tradeoff |
+| --- | --- | --- |
+| `object-store` | Certified checkpoints and archives | Best for broad fan-out; adds object-store polling latency and requests. |
+| `learner` | Voter decision streams, then object storage | Lower lag; adds one read stream per polling learner. |
 
 ```go
 replica, err := rhiza.OpenReadReplica(ctx, rhiza.ReplicaConfig{
-    ClusterID: "prod", ReplicaID: "read-1", DataDir: "./read-1",
-    Members: []rhiza.ReplicaMember{{ID: "n1"}}, // read-1 is not a voter
-    ObjStoreProvider: "s3", ObjStoreBucket: "rhiza",
+    ClusterID:        "prod",
+    ReplicaID:        "read-1",
+    DataDir:          "./read-1",
+    Members:          []rhiza.ReplicaMember{{ID: "n1"}},
+    ObjStoreProvider: "s3",
+    ObjStoreBucket:   "rhiza",
 })
 ```
 
-`OpenReadReplica` polls certified checkpoint/archive state and is the default
-for broad fan-out (10+ copies): it adds no voter traffic or membership entries,
-at the cost of object-store polling latency and requests. `OpenLearner` first
-pulls certified decisions over the private peer QUIC endpoint, then falls back
-to object storage after compaction or peer loss. It has lower lag but adds one
-read stream per polling learner. Learners authenticate read-only `Sync` with
-the voter `AdminToken`; provision token-free peer identities with
-`rhiza.NewReplicaMember(clusterID, voter)`. Non-members cannot call other peer RPCs. Both modes
-require shared object storage for cold start and checkpoint recovery. Tune
-`SyncInterval` for the desired freshness/cost tradeoff (defaults: one second
-for object-store replicas, 100 ms for learners).
+Both modes require shared object storage for cold start and recovery. Learners
+authenticate the read-only `Sync` RPC with the voter `AdminToken`, but must not
+receive voter tokens. Build token-free pinned peer identities with
+`rhiza.NewReplicaMember(clusterID, voter)`.
 
-The optional handler on either type registers the normal routes, but all
-mutation routes return 503. `Ready` means that local recovery completed, not
-that the copy is current or that voter quorum is available. `GET
-/replica/status` exposes the mode, applied slot, last observed source tip,
-slot lag, source, last sync time, and last error; voters return 404.
+`GET /replica/status` reports the mode, applied slot, observed source tip, lag,
+source, last sync time, and last error. Replica `Ready` means local recovery
+completed, not that the copy is current.
 
-The `rhiza` binary selects `RHIZA_ROLE=voter|object-store|learner` (`voter` is
-the default) and uses `RHIZA_REPLICA_SYNC_INTERVAL` for replica polling. An
-object-store replica needs voter IDs in `RHIZA_CLUSTER_MEMBERS`; a learner uses
-token-free `RHIZA_REPLICA_MEMBERS` entries containing `node_id`, `peer_url`, and
-a base64 Ed25519 `public_key`. Derive those identities out of band with
-`rhiza.NewReplicaMember`; never deploy voter tokens to learners. See `deploy/k8s/read-replicas.yaml` for both
-deployment modes. S3-compatible storage, GCS, Azure Blob, and filesystem
-storage are supported; GCS service-account JSON uses
-`RHIZA_OBJSTORE_SERVICE_ACCOUNT`, while Azure uses the
-`RHIZA_OBJSTORE_AZURE_*` credential variables.
+## Storage, durability, and recovery
 
-## Optional HTTP API
+The certified QLog is the source of truth. SQLite and LatticeDB are rebuildable
+materialized state. Startup replays missing decisions; unreadable local state is
+quarantined and rebuilt. Checkpoints capture both engines at the same applied
+slot and restore them together.
 
-All mutations require a unique `request_id` and are idempotent. The optional
-HTTP adapter accepts JSON bodies up to 1 MiB, while every canonically encoded
-consensus mutation must fit within 128 KiB. An HTTP request below 1 MiB can
-therefore still be rejected by the consensus limit. Embedded SQL callers can
-preflight the exact mutation contract with `rhiza.ValidateExecuteRequest` and
-inspect `rhiza.MaxReplicatedMutationBytes`; neither limit should be raised
-without evaluating consensus latency and memory. SQL text is limited to 256
-KiB, with at most 999 arguments and 64 statements per transaction. Queries
-return at most 10,000 rows.
+Single-voter deployments may use local filesystem storage. Multi-voter
+clusters require shared S3-compatible, GCS, or Azure Blob storage. Read
+replicas must reach the same published namespace; their filesystem provider is
+useful only when that directory is shared or mounted. Object-store durability
+modes are:
 
-- `POST /sql/execute`: one mutation statement and arguments.
-- `POST /sql/transaction`: an atomic `statements` array.
-- `POST /sql/query`: arguments plus `local` or `linearizable` consistency.
-- `POST /graph/execute`: one idempotent Cypher mutation with named arguments.
-- `POST /graph/query`: read-only Cypher with `local` or `linearizable` consistency.
-- `POST /kv/put`, `/get`, `/delete`, `/cas`: binary values, TTL, and CAS.
-- `POST /notify/publish`: replicated notification publication.
-- `GET /notify/subscribe?topic=...`: bounded, live, at-most-once SSE stream.
+- `async`: acknowledge after quorum certification and publish in the
+  background.
+- `before-ack`: wait for durable object-store publication before acknowledging.
 
-Replicated SQL rejects explicit transaction control, attachment, and known
-nondeterministic functions. Multi-statement client transactions use the
-transaction endpoint.
+S3 supports custom endpoints and insecure HTTP for local-compatible stores.
+GCS uses service-account JSON. Azure supports its standard credentials and
+custom endpoint, but GCS endpoint overrides and insecure GCS/Azure transports
+are rejected rather than ignored.
 
-The SQL surface is SQLite's: DDL, views, triggers, generated and STRICT tables,
-partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
-UPSERT, RETURNING, window functions, JSON functions, and FTS5 are supported.
-Replicated `Execute` and transaction calls never expose statement rows:
-`want_rows` is rejected and their idempotent response is one bounded aggregate
-`MutationReceipt`. Use `Query` for read-only SQL and observe committed state
-with `linearizable` consistency. Raw unprepared SQL batches are omitted because
-the prepared `statements` array covers the same database features.
+## Server binary and deployment
 
-## Peer transport
+`go run ./cmd/rhiza` starts the optional HTTP server. `RHIZA_ROLE` selects the
+runtime:
 
-Peer consensus and catch-up traffic uses raw QUIC over UDP 9090 with a private
-`rhiza-peer` ALPN and FlatBuffers messages. Each RPC uses an independent
-bidirectional QUIC stream on a reused connection. Frames are capped at 1 MiB;
-connections use TLS 1.3, keepalive, bounded stream counts, five-second RPC
-deadlines, and reconnect after transport failure.
+- `voter` (default): voting read/write node.
+- `object-store`: non-voting object-store replica.
+- `learner`: non-voting peer-first learner.
 
-Replay-safe `Record`, certified `Learned`, and read-only `Decisions` operations
-may use QUIC 0-RTT after session resumption. `Propose` waits for the handshake
-because replay before a decision could consume duplicate consensus slots.
-Multi-node members require voter-specific tokens, and the admin token must not
-equal any voter token. Credentials are checked against fixed membership. This is
-server authentication and membership-token authorization, not peer mTLS.
-Deploy peer UDP and the optional HTTP adapter only on a private network, limit
-them with firewall or Kubernetes NetworkPolicy, keep membership tokens secret,
-and do not expose the unauthenticated HTTP adapter publicly. Add peer mTLS at a
-deployment boundary where private-network and token trust are insufficient.
-The public HTTP API remains TCP 8080 and contains no registered internal
-consensus routes.
-
-## Reads and failures
-
-Local reads use the peer's applied state and remain available without a
-quorum. Linearizable reads decide a unique read barrier and return HTTP 503 if
-a quorum is unavailable; they never fall back to a stale read. With three
-peers, one failed peer preserves reads and writes. Two failed peers preserve
-only local reads and reject writes and linearizable reads with HTTP 503.
-
-For embedded health checks, `DB.Ready()` means local recovery and startup
-catch-up completed; it is not a live quorum signal, so an isolated peer may
-remain locally ready. Use an inexpensive `linearizable` query when current
-quorum readiness is required. Mutations and linearizable reads always enforce
-quorum at operation time and fail closed.
-
-SQLite and LatticeDB are derived from the certified QLog. Startup replays
-missing decisions; unreadable local state is quarantined and rebuilt from the
-log. Checkpoints capture both engines at the same applied slot and restore the
-fixed SQLite and Graph files atomically.
-
-## Docker quick start
+Common settings are `RHIZA_CLUSTER_ID`, `RHIZA_NODE_ID`, `RHIZA_DATA_DIR`,
+`RHIZA_BIND_ADDR`, `RHIZA_PEER_ADDR`, `RHIZA_CLUSTER_MEMBERS`, and
+`RHIZA_ADMIN_TOKEN`. Object-store settings use `RHIZA_OBJSTORE_*`; learner peer
+identities use `RHIZA_REPLICA_MEMBERS`, and replica polling uses
+`RHIZA_REPLICA_SYNC_INTERVAL`. See [`cmd/rhiza/main.go`](cmd/rhiza/main.go) for
+the complete environment mapping.
 
 ```bash
-docker build -t rhiza:dev -t rhiza-e2e:dev .
+docker build -t rhiza:dev .
 docker run --rm --name rhiza -p 8080:8080 \
   -e RHIZA_BIND_ADDR=0.0.0.0:8080 \
   -v rhiza-data:/data \
   rhiza:dev
 ```
 
-For Kubernetes qualification, preload `rhiza-e2e:dev` into every node or
-replace the manifest image references with published registry images. Then
-apply `deploy/k8s/sql-server-3peer-e2e.yaml` or
-`deploy/k8s/graph-server-3peer-e2e.yaml` with standard `kubectl`. The Chaos Mesh
-manifests under `e2e/chaos` work with any compatible Kubernetes environment.
+Kubernetes examples live under [`deploy/k8s`](deploy/k8s), including three-peer
+SQL and Graph qualification manifests and both read-replica modes.
 
-On a local Kubernetes cluster on 2026-08-24, the QUIC/FlatBuffers Chaos Mesh
-scenario passed: one failed peer kept quorum writes available (31.2 ms sample),
-the rebuilt peer converged, two failed peers rejected writes with 503, and
-writes resumed after quorum recovery. Normal three-peer SQL benchmark medians
-were 0.207 ms local read, 2.67 ms linearizable read, and 1.24 ms write. With one
-failed peer they were 0.245 ms, 1.98 ms, and 9.10 ms respectively. These include
-local port-forward overhead and showed substantial tail variance.
+## Peer security
 
-For Graph qualification, preload `rhiza-e2e:dev`, then apply
-`deploy/k8s/graph-server-3peer-e2e.yaml`. Set `RHIZA_GRAPH_E2E_URL` to a
-forwarded peer and run `go test ./e2e -run TestGraphServer`. The same local
-Kubernetes qualification passed with a 15.2 ms one-peer-failure write, HTTP 503
-with two failed peers, convergence, and a successful write after quorum
-recovery. Three-peer samples were 0.29–0.35 ms local read, 4.7–21.6 ms
-linearizable read, and
-8.1–11.6 ms graph write, including port-forward overhead.
+Peer traffic uses QUIC over UDP with TLS 1.3, pinned identities, bounded frames,
+and voter-specific membership tokens. The admin token must differ from every
+voter token. Learners receive only the admin token and token-free pinned voter
+identities.
 
-Every binary and node includes SQL, Graph, and KV. Graph mutations, request
-receipts, and the applied slot commit atomically in LatticeDB before the SQLite
-sidecar tip, so a crash replays without applying a graph mutation twice.
-LatticeDB is rebuilt from the QLog when local state is missing; checkpoints
-always bundle the SQLite and LatticeDB materializations.
+This is server authentication and token authorization, not peer mTLS. Keep peer
+UDP and the unauthenticated HTTP adapter on private networks, restrict them with
+firewalls or Kubernetes NetworkPolicy, and add authentication or mTLS at the
+deployment boundary when private-network trust is insufficient.
+
+## Development and qualification
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/rhiza
+```
+
+For local Kubernetes qualification, preload `rhiza-e2e:dev`, apply one of the
+three-peer manifests under `deploy/k8s`, and run the matching tests under
+[`e2e`](e2e). Chaos Mesh scenarios live in [`e2e/chaos`](e2e/chaos).
+
+Benchmark instructions and durable result artifacts live under
+[`benchmarks`](benchmarks). Performance claims belong with the exact code,
+environment, and raw measurements that produced them rather than in this
+README. The last archived LatticeDB v0.2.1 qualification is attached in
+[`2026-09-01-latticedb-0.2.1-current`](benchmarks/results/2026-09-01-latticedb-0.2.1-current/REPORT.md).
+The same-host reproduction of Hiqlite's official three-node benchmark and its
+comparison boundaries are in
+[`2026-09-01-hiqlite-local-comparison`](benchmarks/results/2026-09-01-hiqlite-local-comparison/REPORT.md).
 
 ## License
 
-MIT
+[MIT](LICENSE)

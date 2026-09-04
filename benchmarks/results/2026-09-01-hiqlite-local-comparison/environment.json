@@ -1,0 +1,36 @@
+{
+  "run": "2026-09-01-hiqlite-local-comparison",
+  "hiqlite": {
+    "repository": "https://github.com/sebadob/hiqlite",
+    "commit": "c3ff2536ac985ecb9f77201d1b58dab66c7b256e",
+    "commit_date": "2026-08-24T12:34:40+02:00",
+    "crate_version": "0.14.0",
+    "benchmark": "examples/bench",
+    "command": "cargo run --release -- cluster -c 16 -r 100000",
+    "repetitions": 3,
+    "allocator": "jemalloc",
+    "logs_until_snapshot": 10000
+  },
+  "rhiza_reference": {
+    "report": "../2026-09-01-latticedb-0.2.1-current/REPORT.md",
+    "base_commit": "87950f8a87743ca61e51afe56e614a45b054e33a",
+    "latticedb_go": "v0.2.1",
+    "profile": "SQL async healthy",
+    "async_sync_interval": "10m",
+    "concurrency": 16,
+    "repetitions": 3,
+    "writes_per_repetition": 100
+  },
+  "host": {
+    "model": "MacBook Air",
+    "cpu": "Apple M3",
+    "logical_cpus": 8,
+    "memory_bytes": 25769803776,
+    "os": "macOS 26.3 (25D125)",
+    "architecture": "arm64"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)"
+  }
+}

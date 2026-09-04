@@ -2,8 +2,13 @@
 package rhiza
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"time"
@@ -24,6 +29,8 @@ func NewReplicaMember(clusterID string, member Member) (ReplicaMember, error) {
 }
 
 type SQLStatement = types.SQLStatement
+type SQLStatementOutputRef = types.SQLStatementOutputRef
+type SQLStatementResult = types.SQLStatementResult
 type GraphCommand = types.GraphCommand
 type GraphResult = types.GraphCommandResult
 type GraphStreamEvent = types.GraphStreamEvent
@@ -87,9 +94,6 @@ type Config struct {
 	CheckpointInterval             time.Duration
 	CheckpointTailBytes            int64
 	MaxWALBytes                    int64
-	// HedgeDelay delays each lower-priority proposer. Nil uses
-	// DefaultHedgeDelay; a pointer to zero explicitly enables eager hedging.
-	HedgeDelay *time.Duration
 }
 
 const (
@@ -97,7 +101,6 @@ const (
 	ConsistencyLinearizable        = "linearizable"
 	ObjectStoreDurabilityAsync     = types.ObjectStoreDurabilityAsync
 	ObjectStoreDurabilityBeforeAck = types.ObjectStoreDurabilityBeforeAck
-	DefaultHedgeDelay              = 5 * time.Millisecond
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
@@ -122,6 +125,13 @@ type DB struct {
 	closeErr  error
 }
 
+// Migration is one ordered, repeatable schema change.
+type Migration struct {
+	Version    uint64         `json:"version"`
+	Name       string         `json:"name"`
+	Statements []SQLStatement `json:"statements"`
+}
+
 // Open starts the embedded engine. It does not start a public HTTP listener.
 func Open(ctx context.Context, config Config) (*DB, error) {
 	if config.DataDir == "" {
@@ -135,10 +145,6 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	}
 	if config.ClusterID == "" {
 		config.ClusterID = "cluster-a"
-	}
-	hedgeDelay, err := configuredHedgeDelay(config.HedgeDelay)
-	if err != nil {
-		return nil, err
 	}
 	childCtx, cancel := context.WithCancel(ctx)
 	internalConfig := &types.ExecutionConfig{
@@ -156,7 +162,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreDurability: config.ObjStoreDurability, ObjStoreSyncInterval: config.ObjStoreSyncInterval,
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
-		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes, HedgeDelay: hedgeDelay,
+		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes,
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {
@@ -170,16 +176,6 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		return nil, err
 	}
 	return &DB{node: n, api: api, cancel: cancel}, nil
-}
-
-func configuredHedgeDelay(delay *time.Duration) (time.Duration, error) {
-	if delay == nil {
-		return DefaultHedgeDelay, nil
-	}
-	if *delay < 0 {
-		return 0, fmt.Errorf("hedge delay must not be negative")
-	}
-	return *delay, nil
 }
 
 func (db *DB) Close() error {
@@ -205,6 +201,158 @@ func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) { db.api.ServeHT
 
 func (db *DB) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
 	return db.api.Execute(ctx, req)
+}
+
+// ExecuteReturning executes one replicated mutation and returns its bounded rows.
+func (db *DB) ExecuteReturning(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	return db.api.ExecuteReturning(ctx, req)
+}
+
+// ExecuteReturningOne commits only when exactly one row is returned.
+func (db *DB) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	return db.api.ExecuteReturningOne(ctx, req)
+}
+
+// SQLRow is one immutable row passed to a typed mapping callback.
+type SQLRow struct {
+	Columns []string
+	Values  []any
+}
+
+// Value returns one column by index.
+func (r SQLRow) Value(index int) (any, error) {
+	if index < 0 || index >= len(r.Values) {
+		return nil, fmt.Errorf("SQL row column index %d is out of bounds", index)
+	}
+	return r.Values[index], nil
+}
+
+// Named returns a uniquely named column.
+func (r SQLRow) Named(name string) (any, error) {
+	index := -1
+	for i, column := range r.Columns {
+		if column == name {
+			if index >= 0 {
+				return nil, fmt.Errorf("SQL row column %q is not unique", name)
+			}
+			index = i
+		}
+	}
+	if index < 0 || index >= len(r.Values) {
+		return nil, fmt.Errorf("SQL row column %q does not exist", name)
+	}
+	return r.Values[index], nil
+}
+
+// ExecuteReturningMap maps replicated RETURNING rows to an application type.
+func ExecuteReturningMap[T any](ctx context.Context, db *DB, req ExecuteRequest, mapper func(SQLRow) (T, error)) (ExecuteResponse, []T, error) {
+	if mapper == nil {
+		return ExecuteResponse{}, nil, fmt.Errorf("row mapper is required")
+	}
+	response, err := db.ExecuteReturning(ctx, req)
+	if err != nil {
+		return response, nil, err
+	}
+	if response.Status != types.MutationCommitted {
+		return response, nil, fmt.Errorf("SQL mutation was rejected: %s", response.ErrorCode)
+	}
+	if len(response.Statements) != 1 {
+		return response, nil, fmt.Errorf("SQL RETURNING result is unavailable")
+	}
+	statement := response.Statements[0]
+	result := make([]T, len(statement.Rows))
+	for i, values := range statement.Rows {
+		result[i], err = mapper(SQLRow{Columns: statement.Columns, Values: values})
+		if err != nil {
+			return response, nil, fmt.Errorf("map returned row %d: %w", i, err)
+		}
+	}
+	return response, result, nil
+}
+
+// ExecuteReturningMapOne maps one row and rolls back unless exactly one exists.
+func ExecuteReturningMapOne[T any](ctx context.Context, db *DB, req ExecuteRequest, mapper func(SQLRow) (T, error)) (ExecuteResponse, T, error) {
+	var zero T
+	if mapper == nil {
+		return ExecuteResponse{}, zero, fmt.Errorf("row mapper is required")
+	}
+	response, err := db.ExecuteReturningOne(ctx, req)
+	if err != nil {
+		return response, zero, err
+	}
+	if response.Status != types.MutationCommitted {
+		return response, zero, fmt.Errorf("SQL mutation was rejected: %s", response.ErrorCode)
+	}
+	if len(response.Statements) != 1 || len(response.Statements[0].Rows) != 1 {
+		return response, zero, fmt.Errorf("SQL RETURNING result is unavailable")
+	}
+	statement := response.Statements[0]
+	result, err := mapper(SQLRow{Columns: statement.Columns, Values: statement.Rows[0]})
+	if err != nil {
+		return response, zero, fmt.Errorf("map returned row: %w", err)
+	}
+	return response, result, nil
+}
+
+// Migrate applies strictly ordered migrations exactly once. A repeated version
+// must have the same name and statements.
+func (db *DB) Migrate(ctx context.Context, migrations []Migration) error {
+	if len(migrations) == 0 {
+		return nil
+	}
+	prepared := make([]struct {
+		migration Migration
+		request   network.MigrationRequest
+	}, len(migrations))
+	var previous uint64
+	for i, migration := range migrations {
+		if migration.Version == 0 || migration.Version > math.MaxInt64 || migration.Version != previous+1 || migration.Name == "" || len(migration.Statements) == 0 {
+			return fmt.Errorf("%w: migrations require a name, statements, and contiguous versions starting at 1", ErrInvalidRequest)
+		}
+		previous = migration.Version
+		for _, statement := range migration.Statements {
+			if len(statement.Args) != 0 || statement.WantRows || len(statement.OutputRefs) != 0 {
+				return fmt.Errorf("%w: migration statements do not support arguments, returned rows, or output references", ErrInvalidRequest)
+			}
+		}
+		digest := migrationChecksum(migration)
+		checksum := hex.EncodeToString(digest[:])
+		requestID := checksum
+		if err := ValidateExecuteRequest(ExecuteRequest{RequestID: requestID, Statements: migration.Statements}); err != nil {
+			return fmt.Errorf("migration %d: %w", migration.Version, err)
+		}
+		request := network.MigrationRequest{RequestID: requestID, Version: int64(migration.Version), Name: migration.Name, Checksum: checksum, Statements: migration.Statements}
+		prepared[i] = struct {
+			migration Migration
+			request   network.MigrationRequest
+		}{migration, request}
+	}
+	for _, item := range prepared {
+		result, err := db.api.Migrate(ctx, item.request)
+		if err != nil {
+			return err
+		}
+		if result.Status != types.MutationCommitted {
+			return fmt.Errorf("migration %d failed: %s", item.migration.Version, result.ErrorCode)
+		}
+	}
+	return nil
+}
+
+func migrationChecksum(migration Migration) [32]byte {
+	var canonical bytes.Buffer
+	canonical.WriteString("rhiza/migration\x00")
+	_ = binary.Write(&canonical, binary.BigEndian, migration.Version)
+	writeMigrationField := func(value string) {
+		_ = binary.Write(&canonical, binary.BigEndian, uint64(len(value)))
+		canonical.WriteString(value)
+	}
+	writeMigrationField(migration.Name)
+	_ = binary.Write(&canonical, binary.BigEndian, uint64(len(migration.Statements)))
+	for _, statement := range migration.Statements {
+		writeMigrationField(statement.SQL)
+	}
+	return sha256.Sum256(canonical.Bytes())
 }
 func (db *DB) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
 	return db.api.Query(ctx, req)

@@ -1,0 +1,12 @@
+{
+  "samples": 216,
+  "requests": 151200,
+  "successes": 151200,
+  "errors": 0,
+  "http_4xx_unexpected": 0,
+  "http_5xx": 0,
+  "transport_failures": 3,
+  "s3_http_failures": 3,
+  "condition_conflicts": 100,
+  "object_failures": 111
+}

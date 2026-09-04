@@ -1,0 +1,110 @@
+[
+  {
+    "config": "current-graph-async-checkpoint-healthy",
+    "duration_s": 24.227736,
+    "cpu_seconds": 26.957889,
+    "average_cores": 1.1126870872292813,
+    "memory_current_mib": 43.3125,
+    "memory_peak_mib": 50.662760416666664,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-graph-async-checkpoint-one-fault",
+    "duration_s": 15.026508,
+    "cpu_seconds": 16.416804,
+    "average_cores": 1.0925228935425315,
+    "memory_current_mib": 38.84765625,
+    "memory_peak_mib": 44.322265625,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-graph-async-healthy",
+    "duration_s": 17.21212,
+    "cpu_seconds": 18.884835,
+    "average_cores": 1.0971823924072108,
+    "memory_current_mib": 46.216145833333336,
+    "memory_peak_mib": 53.649739583333336,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-graph-async-one-fault",
+    "duration_s": 29.47354,
+    "cpu_seconds": 18.550391,
+    "average_cores": 0.6293913455933695,
+    "memory_current_mib": 44.06640625,
+    "memory_peak_mib": 52.263671875,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-graph-before-ack-healthy",
+    "duration_s": 29.684885,
+    "cpu_seconds": 24.389235,
+    "average_cores": 0.8216044966992461,
+    "memory_current_mib": 43.048177083333336,
+    "memory_peak_mib": 49.555989583333336,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-graph-before-ack-one-fault",
+    "duration_s": 20.413296,
+    "cpu_seconds": 17.735816,
+    "average_cores": 0.8688364681529137,
+    "memory_current_mib": 39.8203125,
+    "memory_peak_mib": 47.609375,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-sql-async-checkpoint-healthy",
+    "duration_s": 14.946473,
+    "cpu_seconds": 12.026054,
+    "average_cores": 0.8046081506988305,
+    "memory_current_mib": 36.483072916666664,
+    "memory_peak_mib": 42.549479166666664,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-async-checkpoint-one-fault",
+    "duration_s": 47.88094,
+    "cpu_seconds": 12.525147,
+    "average_cores": 0.2615894132404251,
+    "memory_current_mib": 32.330078125,
+    "memory_peak_mib": 38.404296875,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-sql-async-healthy",
+    "duration_s": 21.523989,
+    "cpu_seconds": 13.653858,
+    "average_cores": 0.6343553697225919,
+    "memory_current_mib": 41.479166666666664,
+    "memory_peak_mib": 47.53125,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-async-one-fault",
+    "duration_s": 12.859978,
+    "cpu_seconds": 7.915878,
+    "average_cores": 0.615543665782321,
+    "memory_current_mib": 34.6171875,
+    "memory_peak_mib": 40.28125,
+    "observed_pods": 2
+  },
+  {
+    "config": "current-sql-before-ack-healthy",
+    "duration_s": 10.927617,
+    "cpu_seconds": 10.770764,
+    "average_cores": 0.9856461843419293,
+    "memory_current_mib": 41.705729166666664,
+    "memory_peak_mib": 48.119791666666664,
+    "observed_pods": 3
+  },
+  {
+    "config": "current-sql-before-ack-one-fault",
+    "duration_s": 11.408055,
+    "cpu_seconds": 7.472846,
+    "average_cores": 0.6550499625045637,
+    "memory_current_mib": 36.439453125,
+    "memory_peak_mib": 42.154296875,
+    "observed_pods": 2
+  }
+]

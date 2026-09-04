@@ -1,0 +1,102 @@
+    Finished `release` profile [optimized] target(s) in 0.98s
+     Running `target/release/bench cluster -c 16 -r 100000`
+
+
+>>> Waiting for other nodes to join the cluster. Nodes joined: 3
+
+
+
+>>> All Cluster Members online
+
+
+
+>>> 100000 single INSERTs with concurrency 16 took:
+11283 ms -> 8862 inserts / s
+
+
+
+>>> 100000 transactional / batched INSERTs with concurrency 16 took:
+248 ms -> 403225 inserts / s
+
+
+
+>>> SELECT a single row with a fresh connection and no cached prepared query using `query_map_one` took:
+132 micros
+
+
+
+>>> SELECT a single row with a cached prepared statement using `query_map_one`:
+
+23 micros
+15 micros
+11 micros
+19 micros
+7 micros
+16 micros
+13 micros
+19 micros
+5 micros
+5 micros
+
+
+>>> SELECT a single row with a cached prepared statement using `query_as_one`:
+
+34 micros
+5 micros
+5 micros
+14 micros
+5 micros
+5 micros
+5 micros
+5 micros
+5 micros
+5 micros
+
+
+>>> SELECT all rows using `query_map` took:
+15647 micros
+
+
+
+>>> SELECT all rows using `query_as` took:
+11518 micros
+
+
+
+>>> 100000 single cache PUTs with concurrency 16 took:
+1848 ms -> 54112 inserts / s
+
+
+
+>>> Cache GET for a single entry :
+
+8 micros
+33 micros
+7 micros
+17 micros
+6 micros
+18 micros
+6 micros
+8 micros
+9 micros
+6 micros
+real 36.03
+user 8.33
+sys 26.03
+           551976960  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               55779  page reclaims
+                5975  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+              204808  messages sent
+              206736  messages received
+                   0  signals received
+               74080  voluntary context switches
+             2730364  involuntary context switches
+        190581467770  instructions retired
+        113715858763  cycles elapsed
+           469713880  peak memory footprint

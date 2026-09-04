@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/qlog
+cpu: Apple M3
+BenchmarkWALScanScratch-8   	     253	   1993851 ns/op	 1053762 B/op	     259 allocs/op
+BenchmarkWALScanScratch-8   	     494	   1108956 ns/op	 1053718 B/op	     259 allocs/op
+BenchmarkWALScanScratch-8   	     466	   1210931 ns/op	 1053716 B/op	     259 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/qlog	2.253s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-8                          	     193	   2667420 ns/op	   69543 B/op	     504 allocs/op
+BenchmarkGraphApply-8                          	     861	   1367918 ns/op	  143751 B/op	    1182 allocs/op
+BenchmarkGraphApply-8                          	     595	   1755953 ns/op	  119007 B/op	     913 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	   58368	     14308 ns/op	         1.335 db-MiB	     228 B/op	       3 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-8         	

@@ -7,18 +7,24 @@ import (
 )
 
 const (
-	recorderCommitDelay = 200 * time.Microsecond
+	recorderCommitDelay = 25 * time.Microsecond
 	recorderCommitMax   = 64
 )
 
 type groupCommit struct {
 	sync    func() error
 	mu      sync.Mutex
-	waiters []chan error
+	pending *commitBatch
 	running bool
 	wake    chan struct{}
 	delay   time.Duration
 	max     int
+}
+
+type commitBatch struct {
+	done    chan struct{}
+	err     error
+	waiters int
 }
 
 func newGroupCommit(syncFn func() error) *groupCommit {
@@ -26,14 +32,17 @@ func newGroupCommit(syncFn func() error) *groupCommit {
 }
 
 func (g *groupCommit) Sync(ctx context.Context) error {
-	done := make(chan error, 1)
 	g.mu.Lock()
-	g.waiters = append(g.waiters, done)
+	if g.pending == nil {
+		g.pending = &commitBatch{done: make(chan struct{})}
+	}
+	batch := g.pending
+	batch.waiters++
 	if !g.running {
 		g.running = true
 		go g.flush()
 	}
-	if len(g.waiters) >= g.max {
+	if batch.waiters >= g.max {
 		select {
 		case g.wake <- struct{}{}:
 		default:
@@ -41,8 +50,8 @@ func (g *groupCommit) Sync(ctx context.Context) error {
 	}
 	g.mu.Unlock()
 	select {
-	case err := <-done:
-		return err
+	case <-batch.done:
+		return batch.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -57,15 +66,13 @@ func (g *groupCommit) flush() {
 			timer.Stop()
 		}
 		g.mu.Lock()
-		waiters := g.waiters
-		g.waiters = nil
+		batch := g.pending
+		g.pending = nil
 		g.mu.Unlock()
-		err := g.sync()
-		for _, waiter := range waiters {
-			waiter <- err
-		}
+		batch.err = g.sync()
+		close(batch.done)
 		g.mu.Lock()
-		if len(g.waiters) == 0 {
+		if g.pending == nil {
 			g.running = false
 			g.mu.Unlock()
 			return

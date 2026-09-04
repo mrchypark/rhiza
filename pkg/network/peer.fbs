@@ -3,7 +3,7 @@ namespace peerfb;
 enum Operation:ubyte {
   None = 0,
   Record = 1,
-  Propose = 2,
+  ReservedPropose = 2,
   Learned = 3,
   Sync = 4,
   ReadIndex = 5,

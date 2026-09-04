@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,6 +34,21 @@ type cancelReadTransport struct {
 type phaseFaultTransport struct {
 	cores  map[NodeID]*Core
 	n2Down atomic.Bool
+}
+
+type parallelFetchTransport struct {
+	mockTransport
+	value    []byte
+	canceled chan struct{}
+}
+
+func (t *parallelFetchTransport) FetchValue(ctx context.Context, from NodeID, _ ValueHash) ([]byte, error) {
+	if from == "n1" {
+		<-ctx.Done()
+		close(t.canceled)
+		return nil, ctx.Err()
+	}
+	return append([]byte(nil), t.value...), nil
 }
 
 func (t *phaseFaultTransport) SendRecord(ctx context.Context, to NodeID, request RecordRequest) (Summary, error) {
@@ -97,6 +113,29 @@ func (m *mockTransport) StageValue(context.Context, NodeID, ValueHash, []byte) e
 }
 func (m *mockTransport) FetchValue(context.Context, NodeID, ValueHash) ([]byte, error) {
 	return nil, errors.New("value unavailable")
+}
+
+func TestHydrateProposalUsesFirstAvailableSource(t *testing.T) {
+	value := []byte("value")
+	transport := &parallelFetchTransport{value: value, canceled: make(chan struct{})}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core := newCore("n2", &Cluster{Members: []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}, wal, transport)
+	proposal := Proposal{Hash: sha256.Sum256(value)}
+	if err := core.hydrateProposal(context.Background(), &proposal, "n1", "n3"); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(proposal.Value, value) {
+		t.Fatalf("value=%q", proposal.Value)
+	}
+	select {
+	case <-transport.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("slower fetch was not canceled")
+	}
 }
 
 func TestCorePropose(t *testing.T) {
@@ -219,6 +258,107 @@ func TestCompleteDecisionRetriesLearnerQuorum(t *testing.T) {
 	}
 }
 
+func TestFreshClusterDecisionSkipsRedundantLocalSync(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &mockTransport{}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	proposal := newProposal(highestPriority, "node-1", []byte("fresh decision"))
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{
+		{RecorderID: "node-1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+		{RecorderID: "node-2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+	}}
+	if err := core.acceptDecision(decision); err != nil {
+		t.Fatal(err)
+	}
+	syncs := 0
+	core.commits = newGroupCommit(func() error {
+		syncs++
+		return wal.Sync()
+	})
+	if _, err := core.completeDecision(context.Background(), 1, false); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 0 {
+		t.Fatalf("fresh completion syncs=%d, want 0", syncs)
+	}
+	if !core.logged[1] || core.durable[1] {
+		t.Fatalf("fresh completion logged=%v durable=%v, want logged without a second barrier", core.logged[1], core.durable[1])
+	}
+	if _, err := core.CompleteDecision(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 1 {
+		t.Fatalf("retry completion syncs=%d, want 1", syncs)
+	}
+}
+
+func TestAcceptCertifiedValueForAckReusesRecorderDurability(t *testing.T) {
+	members := []Member{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}
+	config := &Cluster{ConfigID: 1, Members: members}
+	proposal := newProposal(highestPriority, "n1", []byte("proxied value"))
+	decision := Decision{Slot: 1, Step: 4, Proposal: proposal, Summaries: []Summary{
+		{RecorderID: "n1", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+		{RecorderID: "n2", Step: 4, FirstCurrent: cloneProposal(&proposal)},
+	}}
+	certificate, err := encodeCertificate(config.ConfigID, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := DecidedValue{Slot: decision.Slot, Hash: proposal.Hash, Value: proposal.Value, Certificate: certificate}
+	for _, id := range []NodeID{"n2", "n3"} {
+		wal, err := qlog.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer wal.Close()
+		core := newCore(id, config, wal, nil)
+		if id == "n2" {
+			if _, err := core.Record(context.Background(), RecordRequest{Slot: decision.Slot, Step: decision.Step, Proposal: proposal}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		syncs := 0
+		core.commits = newGroupCommit(func() error {
+			syncs++
+			return core.wal.Sync()
+		})
+		if err := core.AcceptCertifiedValueForAck(value); err != nil {
+			t.Fatal(err)
+		}
+		want := 1
+		if id == "n2" {
+			want = 0
+		}
+		if syncs != want {
+			t.Fatalf("node %s syncs=%d, want %d", id, syncs, want)
+		}
+	}
+}
+
+func TestProposeCertifiedDefersLearnerCompletion(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	transport := &mockTransport{}
+	core := newCore("node-1", &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+	slot, _, err := core.ProposeCertified(context.Background(), []byte("certified response"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transport.sendDecisionCalls != 0 {
+		t.Fatalf("learner sends=%d, want 0 before the caller installs the certificate", transport.sendDecisionCalls)
+	}
+	if _, ok := core.CertifiedValue(slot); !ok {
+		t.Fatal("recorder-quorum decision is unavailable")
+	}
+}
+
 func TestCompleteDecisionAfterRestartResendsCertificate(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := qlog.Open(dir)
@@ -265,7 +405,9 @@ func TestCompleteDecisionAndCompactionLockBoundary(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = wal.Close() })
 		transport := &mockTransport{}
-		core := newCore("node-1", &Cluster{ConfigID: 11, Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}, wal, transport)
+		// Both recorders are required for quorum, so no recorder goroutine can
+		// outlive setup while the test swaps the group-commit hook.
+		core := newCore("node-1", &Cluster{ConfigID: 11, Members: []Member{{ID: "node-1"}, {ID: "node-2"}}}, wal, transport)
 		for _, value := range [][]byte{[]byte("floor"), []byte("retained")} {
 			if _, _, err := core.Propose(context.Background(), value); err != nil {
 				t.Fatal(err)
@@ -298,8 +440,9 @@ func TestCompleteDecisionAndCompactionLockBoundary(t *testing.T) {
 		core.mu.Unlock()
 		syncStarted := make(chan struct{})
 		releaseSync := make(chan struct{})
+		var syncStartedOnce sync.Once
 		core.commits = newGroupCommit(func() error {
-			close(syncStarted)
+			syncStartedOnce.Do(func() { close(syncStarted) })
 			<-releaseSync
 			return core.wal.Sync()
 		})
@@ -1392,6 +1535,17 @@ func TestDecisionsFromStopsAtGap(t *testing.T) {
 	}
 	if tip != 0 || len(decisions) != 0 {
 		t.Fatalf("exposed non-contiguous decision: tip=%d decisions=%+v", tip, decisions)
+	}
+	if cap(decisions) != 0 {
+		t.Fatalf("empty decision page capacity=%d, want 0", cap(decisions))
+	}
+}
+
+func TestDecisionsFromBoundsPageCapacity(t *testing.T) {
+	core := &Core{decided: map[Slot]DecidedValue{1: {Slot: 1}}, tip: 1}
+	decisions, tip, err := core.DecisionsFrom(1, 256)
+	if err != nil || tip != 1 || len(decisions) != 1 || cap(decisions) != 1 {
+		t.Fatalf("tip=%d len=%d cap=%d err=%v", tip, len(decisions), cap(decisions), err)
 	}
 }
 

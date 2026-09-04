@@ -30,7 +30,7 @@ func TestGraphRequestIDRejectedBeforeConsensus(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 
 	for _, cypher := range []string{
@@ -79,7 +79,7 @@ func TestReservedGraphStreamRejectedBeforeConsensus(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 
 	_, err = server.GraphExecute(context.Background(), types.GraphCommand{
@@ -110,7 +110,7 @@ func TestConcurrentGraphRequestIDConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 
 	const contenders = 32
@@ -163,7 +163,7 @@ func TestGraphReadMetadataBoundsItsSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	server := NewServer(core, material, "cluster", true, nil, []quepaxa.Member{member}, 0)
+	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	if _, err := server.GraphExecute(context.Background(), types.GraphCommand{
 		RequestID: "seed", Cypher: `CREATE (:Item {id: '1'})`,

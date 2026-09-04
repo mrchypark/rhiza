@@ -27,6 +27,7 @@ const (
 	maxPeerStreams     = 1024
 	peerErrorQuorum    = 1
 	peerErrorCompacted = 2
+	peerErrorRetryable = 3
 )
 
 // PeerServer owns the private QUIC listener. Public HTTP remains a separate adapter.
@@ -131,6 +132,7 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 }
 
 func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
+	defer stream.CancelRead(0)
 	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
 	response := &peerfb.ResponseT{}
 	data, err := readPeerFrame(stream)
@@ -151,6 +153,8 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			response.ErrorCode = peerErrorQuorum
 		case errors.Is(err, quepaxa.ErrCompacted):
 			response.ErrorCode = peerErrorCompacted
+		case errors.Is(err, ErrNotReady), errors.Is(err, ErrOverloaded):
+			response.ErrorCode = peerErrorRetryable
 		}
 	}
 	if writeErr := writePeerFrame(stream, encodePeerResponse(response)); writeErr != nil {
@@ -189,18 +193,6 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			return nil, err
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
-	case peerfb.OperationPropose:
-		if !s.server.ready() {
-			return nil, ErrNotReady
-		}
-		if len(request.Value) == 0 {
-			return nil, fmt.Errorf("value is required")
-		}
-		decision, err := s.server.proposePeer(ctx, member.ID, request.Value)
-		if err != nil {
-			return nil, err
-		}
-		return &peerfb.ResponseT{Decided: decidedToWire(decision)}, nil
 	case peerfb.OperationLearned:
 		if !s.server.ready() {
 			return nil, ErrNotReady
@@ -209,7 +201,12 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if err != nil {
 			return nil, err
 		}
-		if err := s.server.core.AcceptDecision(decision); err != nil {
+		if decisionHasRecorder(decision, s.server.core.NodeID()) {
+			err = s.server.core.AcceptDecisionHint(decision)
+		} else {
+			err = s.server.core.AcceptDecision(decision)
+		}
+		if err != nil {
 			return nil, err
 		}
 		if err := s.server.applyDecisions(ctx, decision.Slot); err != nil {

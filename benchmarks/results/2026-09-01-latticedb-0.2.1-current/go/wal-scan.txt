@@ -1,0 +1,11 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/qlog
+cpu: Apple M3
+BenchmarkWALScanScratch-8   	    1303	   1625800 ns/op	 1053733 B/op	     259 allocs/op
+BenchmarkWALScanScratch-8   	    1490	    821837 ns/op	 1053717 B/op	     259 allocs/op
+BenchmarkWALScanScratch-8   	    1333	    828750 ns/op	 1053715 B/op	     259 allocs/op
+BenchmarkWALScanScratch-8   	    1719	    725763 ns/op	 1053717 B/op	     259 allocs/op
+BenchmarkWALScanScratch-8   	    1568	    769964 ns/op	 1053715 B/op	     259 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/qlog	7.436s

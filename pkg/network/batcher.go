@@ -10,21 +10,19 @@ import (
 )
 
 const (
-	maxMutationBatch       = 32
+	maxMutationBatch       = 64
 	targetBatchBytes       = 64 << 10
 	minAdaptiveLinger      = 25 * time.Microsecond
 	maxAdaptiveLinger      = 250 * time.Microsecond
-	maxOldestQueueAge      = 500 * time.Microsecond
+	maxOldestQueueAge      = 5 * time.Millisecond
 	idleRateReset          = 10 * time.Millisecond
 	maxQueuedRequests      = 4096
 	maxQueuedEncodedBytes  = 8 << 20
 	maxInflightBatches     = 8
 	maxProposalOperations  = 12
 	maxLocalProposals      = 8
-	maxPeerProposals       = 4
 	maxInflightEncodedByte = 1 << 20
 	maxProposalEncodedByte = 2 << 20
-	maxPeerEncodedByte     = 1 << 20
 	batchItemOverhead      = 128
 )
 
@@ -100,6 +98,10 @@ func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slo
 	if err != nil {
 		return 0, err
 	}
+	return b.submitEncoded(ctx, command, encoded)
+}
+
+func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encoded []byte) (quepaxa.Slot, error) {
 	if b.baseSize+len(encoded) > quepaxa.MaxReplicatedValueBytes {
 		return 0, ErrInvalidRequest
 	}
@@ -150,13 +152,6 @@ func (b *mutationBatcher[T]) releaseQueue(size int) {
 	b.budgetMu.Unlock()
 }
 
-func (b *mutationBatcher[T]) idle() bool {
-	b.budgetMu.Lock()
-	idle := b.inflightB == 0 && b.queuedN == 0
-	b.budgetMu.Unlock()
-	return idle
-}
-
 func (b *mutationBatcher[T]) run() {
 	defer b.wg.Done()
 	defer close(b.jobs)
@@ -170,16 +165,11 @@ func (b *mutationBatcher[T]) run() {
 			b.rejectQueued(ErrNotReady)
 			return
 		}
-		idle := b.idle() && len(b.input) == 0
 		items := []*batchItem{first}
 		encoded := [][]byte{first.encoded}
 		encodedSize := b.baseSize + len(first.encoded)
 		now := time.Now()
 		ewmaRate, lastArrival = observeArrivalRate(ewmaRate, lastArrival, now, len(first.encoded))
-		if batchWait(idle, ewmaRate, encodedSize, time.Since(first.enqueued)) <= 0 {
-			b.dispatch(items, encoded)
-			continue
-		}
 
 	collect:
 		for len(items) < maxMutationBatch {
@@ -202,7 +192,7 @@ func (b *mutationBatcher[T]) run() {
 			default:
 			}
 
-			wait := batchWait(false, ewmaRate, encodedSize, time.Since(first.enqueued))
+			wait := adaptiveWait(ewmaRate, encodedSize, time.Since(first.enqueued))
 			if wait <= 0 {
 				break
 			}
@@ -221,7 +211,7 @@ func (b *mutationBatcher[T]) run() {
 				encoded = append(encoded, next.encoded)
 				encodedSize += 1 + len(next.encoded)
 			case <-timer.C:
-				break
+				break collect
 			case <-b.ctx.Done():
 				if !timer.Stop() {
 					select {
@@ -236,20 +226,12 @@ func (b *mutationBatcher[T]) run() {
 				b.rejectQueued(ErrNotReady)
 				return
 			}
-			break
 		}
 		if !lastArrival.IsZero() && time.Since(lastArrival) >= idleRateReset {
 			ewmaRate = 0
 		}
 		b.dispatch(items, encoded)
 	}
-}
-
-func batchWait(idle bool, rate float64, currentBytes int, oldestAge time.Duration) time.Duration {
-	if idle {
-		return 0
-	}
-	return adaptiveWait(rate, currentBytes, oldestAge)
 }
 
 func (b *mutationBatcher[T]) next(carry *batchItem) (*batchItem, bool) {

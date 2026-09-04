@@ -52,17 +52,35 @@ type SQLCommand struct {
 	RequestID string `json:"request_id"`
 	SQL       string `json:"sql,omitempty"`
 	Args      []any  `json:"args,omitempty"`
-	// WantRows is reserved and rejected for replicated mutations.
+	// WantRows requests bounded rows from a replicated mutation.
 	WantRows   bool           `json:"want_rows,omitempty"`
+	RequireOne bool           `json:"require_one,omitempty"`
 	Statements []SQLStatement `json:"statements,omitempty"`
+	Migration  *SQLMigration  `json:"migration,omitempty"`
+}
+
+// SQLMigration marks an engine-owned, atomically applied migration command.
+type SQLMigration struct {
+	Version  int64  `json:"version"`
+	Name     string `json:"name"`
+	Checksum string `json:"checksum"`
 }
 
 // SQLStatement is one statement in a replicated client transaction.
 type SQLStatement struct {
-	SQL  string `json:"sql"`
-	Args []any  `json:"args,omitempty"`
-	// WantRows is reserved and rejected for replicated mutations.
-	WantRows bool `json:"want_rows,omitempty"`
+	SQL        string                  `json:"sql"`
+	Args       []any                   `json:"args,omitempty"`
+	WantRows   bool                    `json:"want_rows,omitempty"`
+	OutputRefs []SQLStatementOutputRef `json:"output_refs,omitempty"`
+}
+
+// SQLStatementOutputRef replaces a null positional argument with a column
+// from the single row returned by an earlier statement in the transaction.
+type SQLStatementOutputRef struct {
+	ArgIndex       int    `json:"arg_index"`
+	StatementIndex int    `json:"statement_index"`
+	ColumnName     string `json:"column_name,omitempty"`
+	ColumnIndex    *int   `json:"column_index,omitempty"`
 }
 
 // SQLStatementResult is the deterministic result returned by one statement.
@@ -73,8 +91,7 @@ type SQLStatementResult struct {
 	Rows         [][]any  `json:"rows,omitempty"`
 }
 
-// SQLCommandResult is the transient deterministic result summarized into the
-// bounded MutationReceipt retained for idempotent retries.
+// SQLCommandResult is retained with the bounded MutationReceipt for retries.
 type SQLCommandResult struct {
 	Statements []SQLStatementResult `json:"statements"`
 	Error      string               `json:"error,omitempty"`
@@ -268,6 +285,10 @@ func EncodeSQLBatchItem(command SQLCommand) ([]byte, error) {
 
 func AssembleSQLBatch(items [][]byte) []byte {
 	return assembleBatch(sqlBatchMagic, items)
+}
+
+func SQLBatchEncodedSize(items [][]byte) int {
+	return BatchEncodedSize(len(sqlBatchMagic), items)
 }
 
 func EncodeSQLBatch(commands []SQLCommand) ([]byte, error) {

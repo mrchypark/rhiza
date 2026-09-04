@@ -103,13 +103,11 @@ spec:
                 secretKeyRef:
                   name: rhiza-peer-auth
                   key: token
-            - name: RHIZA_HEDGE_DELAY
-              value: 20ms
             - name: GOMEMLIMIT
               value: 384MiB
             - name: RHIZA_CLUSTER_MEMBERS
               value: >-
-                [{"node_id":"rhiza-sql-0","url":"http://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090"},{"node_id":"rhiza-sql-1","url":"http://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090"},{"node_id":"rhiza-sql-2","url":"http://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090"}]
+                [{"node_id":"rhiza-sql-0","url":"http://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","token":"rhiza-sql-0-voter-token"},{"node_id":"rhiza-sql-1","url":"http://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","token":"rhiza-sql-1-voter-token"},{"node_id":"rhiza-sql-2","url":"http://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","token":"rhiza-sql-2-voter-token"}]
           ports:
             - name: http
               containerPort: 8080

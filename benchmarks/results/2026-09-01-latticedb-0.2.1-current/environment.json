@@ -1,0 +1,55 @@
+{
+  "run": "2026-09-01-latticedb-0.2.1-current",
+  "started_at_utc": "2026-09-01T05:50:36Z",
+  "finished_at_utc": "2026-09-01T06:11:55Z",
+  "branch": "feature/latticedb-0.2.1",
+  "base_commit": "87950f8a87743ca61e51afe56e614a45b054e33a",
+  "origin_main": "87950f8a87743ca61e51afe56e614a45b054e33a",
+  "latticedb_go": "v0.2.1",
+  "image_source_diff_sha256": "d55ad479d540c4c7a7e5f73ca37459be6fe8a4c87cc990c61ee76fc94c00b588",
+  "qualification_diff_sha256": "c0aac4390be79df06376e2ba110d3115adb6177d7a0ac78e36b0f3c908988918",
+  "image": {
+    "tag": "rhiza-e2e:latticedb-0.2.1-current",
+    "digest": "sha256:9ac82c70d4875294e01d5dd6adf8e2727adb219e71b58ff839a5a2e99e150529",
+    "platform": "linux/arm64"
+  },
+  "host": {
+    "model": "MacBook Air",
+    "cpu": "Apple M3",
+    "logical_cpus": 8,
+    "memory_bytes": 25769803776,
+    "os": "macOS 26.3 (25D125)",
+    "architecture": "arm64"
+  },
+  "toolchain": {
+    "go": "go1.27.0 darwin/arm64",
+    "dory": "0.4.5",
+    "docker_engine": "29.6.1 linux/arm64",
+    "kubectl_client": "v1.36.1",
+    "k3s_server": "v1.36.2+k3s1"
+  },
+  "go_benchmarks": {
+    "time_based": "5 samples, 1s per sample, package parallelism 1",
+    "graph_snapshot": "5 samples, fixed 10 operations for 1/16/64 MiB inputs",
+    "replica_catch_up": "5 samples, fixed 20 operations per object-store and learner mode"
+  },
+  "integration": {
+    "cluster": "single-node Dory k3s hosting three Rhiza voters and MinIO",
+    "concurrency": 16,
+    "repetitions": 3,
+    "requests_per_profile_pass": 12600,
+    "profiles": 12,
+    "matrix": [
+      "SQL and Graph",
+      "async and before-ack durability",
+      "healthy and one-peer-fault",
+      "async checkpoint-at-1s for SQL and Graph in healthy and one-peer-fault states"
+    ],
+    "async_sync_interval": "10m",
+    "checkpoint_stress_interval": "1s",
+    "confirmation_profiles": [
+      "Graph async checkpoint-at-1s healthy",
+      "SQL async checkpoint-at-1s one-peer-fault"
+    ]
+  }
+}

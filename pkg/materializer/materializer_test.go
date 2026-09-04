@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -40,6 +41,21 @@ func TestMaterializerCreatesKVExpiryIndex(t *testing.T) {
 	var name string
 	if err := m.db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = '_rhiza_kv_expiry'`).Scan(&name); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMaterializerDisablesForegroundWALCheckpoint(t *testing.T) {
+	m, err := Open(t.TempDir()+"/checkpoint.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var pages int
+	if err := m.writer.QueryRow(`PRAGMA wal_autocheckpoint`).Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if pages != 0 {
+		t.Fatalf("wal_autocheckpoint=%d, want 0", pages)
 	}
 }
 
@@ -147,6 +163,174 @@ func TestMaterializerDeduplicatesRequestID(t *testing.T) {
 	}
 	if err := m.queryRow(context.Background(), "SELECT COUNT(*) FROM dedupe").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("count after conflicting retry=%d err=%v", count, err)
+	}
+}
+
+func TestSQLReceiptBatchHandlesFailuresAndCrossDecisionDuplicates(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/receipt-batch.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	first, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "same", SQL: "INSERT INTO receipt_batch VALUES (1)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "same", SQL: "INSERT INTO receipt_batch VALUES (2)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyBatch(ctx, []quepaxa.DecidedValue{
+		{Slot: 1, Value: []byte("CREATE TABLE receipt_batch (id INTEGER PRIMARY KEY)")},
+		{Slot: 2, Value: first},
+		{Slot: 3, Value: duplicate},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mixed, err := types.EncodeSQLBatch([]types.SQLCommand{
+		{RequestID: "two", SQL: "INSERT INTO receipt_batch VALUES (2)"},
+		{RequestID: "rejected", SQL: "INSERT INTO receipt_batch VALUES (2)"},
+		{RequestID: "three", SQL: "INSERT INTO receipt_batch VALUES (3)"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 4, mixed); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 3 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	for requestID, status := range map[string]types.MutationStatus{
+		"same": types.MutationCommitted, "two": types.MutationCommitted,
+		"rejected": types.MutationRejected, "three": types.MutationCommitted,
+	} {
+		receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, requestID)
+		if err != nil || !found || receipt.Status != status {
+			t.Fatalf("request %q receipt=%+v found=%v err=%v", requestID, receipt, found, err)
+		}
+	}
+	commands := make([]types.SQLCommand, 128)
+	for i := range commands {
+		commands[i] = types.SQLCommand{
+			RequestID: "bulk-" + strconv.Itoa(i),
+			SQL:       "INSERT INTO receipt_batch VALUES (?)",
+			Args:      []any{int64(i + 4)},
+		}
+	}
+	bulk, err := types.EncodeSQLBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 5, bulk); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 131 {
+		t.Fatalf("bulk count=%d err=%v", count, err)
+	}
+}
+
+func TestSQLRequestStatus(t *testing.T) {
+	m, err := Open(t.TempDir()+"/status.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "row", SQL: "CREATE TABLE status_row (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.SQLRequestStatus(context.Background(), command)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := command
+	conflict.SQL = "CREATE TABLE other_row (id INTEGER)"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
+		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
+	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
+func TestSQLRequestStatusUsesCommittedReceiptCache(t *testing.T) {
+	m, err := Open(t.TempDir()+"/status-cache.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "cached", SQL: "CREATE TABLE cached_status (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.readers[0].Close(); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, matches, err := m.SQLRequestStatus(context.Background(), command)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	conflict := command
+	conflict.SQL = "CREATE TABLE conflicting_status (id INTEGER)"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), conflict); err != nil || !found || matches {
+		t.Fatalf("conflict found=%v matches=%v err=%v", found, matches, err)
+	}
+	missing := command
+	missing.RequestID = "missing"
+	if _, found, matches, err := m.SQLRequestStatus(context.Background(), missing); err != nil || found || !matches {
+		t.Fatalf("missing found=%v matches=%v err=%v", found, matches, err)
+	}
+}
+
+func TestSQLReceiptBloomLoadsAndRotates(t *testing.T) {
+	path := t.TempDir() + "/status-bloom.db"
+	m, err := Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := types.SQLCommand{RequestID: "persisted", SQL: "CREATE TABLE bloom_status (id INTEGER)"}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if !m.sqlReceipts.mightContain(command.RequestID, m.tip) {
+		t.Fatal("persisted receipt is absent from the startup Bloom filter")
+	}
+
+	var bloom sqlReceiptBloom
+	bloom.window = 1024
+	bloom.add("old", 1023)
+	bloom.add("current", 1024)
+	if !bloom.mightContain("old", 1024) || !bloom.mightContain("current", 1024) {
+		t.Fatal("retained receipts disappeared across an epoch boundary")
+	}
+	bloom.add("next", 2048)
+	if !bloom.mightContain("current", 2047) || !bloom.mightContain("next", 2048) {
+		t.Fatal("retained receipts disappeared during filter rotation")
 	}
 }
 
@@ -325,12 +509,236 @@ func TestKVBatchAppliesAllCommands(t *testing.T) {
 	}
 }
 
-func TestSQLCommandRejectsMutationRows(t *testing.T) {
-	command := types.SQLCommand{RequestID: "aggregate", Statements: []types.SQLStatement{
-		{SQL: "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<6000) SELECT n FROM seq", WantRows: true},
+func TestSQLCommandReturningOutputRefsAndRetry(t *testing.T) {
+	path := t.TempDir() + "/returning.db"
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	command := types.SQLCommand{RequestID: "returning", Statements: []types.SQLStatement{
+		{SQL: "CREATE TABLE source (id INTEGER PRIMARY KEY, payload TEXT)"},
+		{SQL: "CREATE TABLE copied (id INTEGER, payload TEXT)"},
+		{SQL: "INSERT INTO source(payload) VALUES (?) RETURNING id, payload", Args: []any{"value"}, WantRows: true},
+		{SQL: "INSERT INTO copied VALUES (?, ?)", Args: []any{nil, nil}, OutputRefs: []types.SQLStatementOutputRef{
+			{ArgIndex: 0, StatementIndex: 2, ColumnIndex: &zero},
+			{ArgIndex: 1, StatementIndex: 2, ColumnName: "payload"},
+		}},
 	}}
-	if err := ValidateSQLCommand(command); err == nil {
-		t.Fatal("mutation row result was accepted")
+	if err := ValidateSQLCommand(command); err != nil {
+		t.Fatal(err)
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, result, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), command.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Slot != 1 {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	if got := result.Statements[2].Rows[0]; got[0] != int64(1) || got[1] != "value" {
+		t.Fatalf("returning row=%#v", got)
+	}
+	query, err := m.QueryResult(context.Background(), "SELECT id, payload FROM copied", nil)
+	if err != nil || query.Rows[0][0] != int64(1) || query.Rows[0][1] != "value" {
+		t.Fatalf("copied rows=%#v err=%v", query.Rows, err)
+	}
+}
+
+func TestSQLCommandRejectsInvalidOutputRefs(t *testing.T) {
+	zero := 0
+	cases := []types.SQLCommand{
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1"}, {SQL: "SELECT ?", OutputRefs: []types.SQLStatementOutputRef{{StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true, OutputRefs: []types.SQLStatementOutputRef{{StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?", OutputRefs: []types.SQLStatementOutputRef{{StatementIndex: 0, ColumnName: "x", ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?", OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}, {ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?", Args: []any{int64(1)}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT ?1", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true}, {SQL: "SELECT :value", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 0, ColumnIndex: &zero}}}}},
+	}
+	for i, command := range cases {
+		if err := ValidateSQLCommand(command); err == nil {
+			t.Fatalf("case %d accepted", i)
+		}
+	}
+}
+
+func TestOutputReferenceRequiresOneSourceRowAndUniqueColumn(t *testing.T) {
+	for name, source := range map[string]string{
+		"multiple rows":    "SELECT 1 AS value UNION ALL SELECT 2",
+		"duplicate column": "SELECT 1 AS value, 2 AS value",
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, err := Open(t.TempDir()+"/refs.db", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			command := types.SQLCommand{RequestID: name, Statements: []types.SQLStatement{
+				{SQL: "CREATE TABLE target (value INTEGER)"},
+				{SQL: source, WantRows: true},
+				{SQL: "INSERT INTO target VALUES (?)", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 1, ColumnName: "value"}}},
+			}}
+			value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), 1, value); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, _ := types.SQLFingerprint(command)
+			receipt, _, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), command.RequestID, fingerprint, true)
+			if err != nil || !found || !matches || receipt.Status != types.MutationRejected {
+				t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+			}
+			var exists int
+			if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='target'`).Scan(&exists); err != nil || exists != 0 {
+				t.Fatalf("transaction was not rolled back: exists=%d err=%v", exists, err)
+			}
+		})
+	}
+}
+
+func TestSQLResultEncodingPreservesSQLiteTypes(t *testing.T) {
+	want := types.SQLCommandResult{Statements: []types.SQLStatementResult{{
+		Columns: []string{"null", "integer", "real", "text", "blob"},
+		Rows:    [][]any{{nil, int64(math.MinInt64), math.Copysign(0, -1), "", []byte{}}},
+	}}}
+	encoded, err := encodeSQLResult(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeSQLResult(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := got.Statements[0].Rows[0]
+	if row[0] != nil || row[1] != int64(math.MinInt64) || !math.Signbit(row[2].(float64)) || row[3] != "" || len(row[4].([]byte)) != 0 {
+		t.Fatalf("decoded row=%#v", row)
+	}
+	if _, err := decodeSQLResult(append(encoded, 0)); err == nil {
+		t.Fatal("trailing bytes were accepted")
+	}
+}
+
+func TestRejectedTransactionDoesNotRetainReturningRows(t *testing.T) {
+	m, err := Open(t.TempDir()+"/rejected-returning.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{RequestID: "rejected", Statements: []types.SQLStatement{
+		{SQL: "CREATE TABLE rolled_back (id INTEGER PRIMARY KEY)"},
+		{SQL: "INSERT INTO rolled_back DEFAULT VALUES RETURNING id", WantRows: true},
+		{SQL: "INSERT INTO missing_table DEFAULT VALUES"},
+	}}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ := types.SQLFingerprint(command)
+	receipt, result, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), command.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Status != types.MutationRejected || len(result.Statements) != 0 {
+		t.Fatalf("receipt=%+v result=%+v found=%v matches=%v err=%v", receipt, result, found, matches, err)
+	}
+	var count int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'rolled_back'`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rolled-back table count=%d err=%v", count, err)
+	}
+}
+
+func TestMaterializerUpgradesLegacyReceiptSchema(t *testing.T) {
+	path := t.TempDir() + "/legacy.db"
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`ALTER TABLE _rhiza_idempotency DROP COLUMN sql_result`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	var columns int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('_rhiza_idempotency') WHERE name = 'sql_result'`).Scan(&columns); err != nil || columns != 1 {
+		t.Fatalf("sql_result columns=%d err=%v", columns, err)
+	}
+}
+
+func TestMaterializerRejectsIncompatibleMigrationLedger(t *testing.T) {
+	path := t.TempDir() + "/invalid-migrations.db"
+	db, err := sql.Open("sqlite3", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE _rhiza_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL) STRICT`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := Open(path, 1); err == nil {
+		m.Close()
+		t.Fatal("incompatible migration ledger was accepted")
+	}
+}
+
+func TestMaterializerRejectsMigrationVersionGapAtApply(t *testing.T) {
+	m, err := Open(t.TempDir()+"/migration-gap.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	command := types.SQLCommand{
+		RequestID: "migration-gap",
+		Migration: &types.SQLMigration{Version: 2, Name: "gap", Checksum: strings.Repeat("a", 64)},
+		Statements: []types.SQLStatement{{SQL: "CREATE TABLE gap_was_applied (id INTEGER)"}},
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ := types.SQLFingerprint(command)
+	receipt, found, matches, err := m.SQLRequestStatusFingerprint(context.Background(), command.RequestID, fingerprint)
+	if err != nil || !found || !matches || receipt.Status != types.MutationRejected {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	var exists int
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='gap_was_applied'`).Scan(&exists); err != nil || exists != 0 {
+		t.Fatalf("gap migration changed schema: exists=%d err=%v", exists, err)
 	}
 }
 
@@ -699,6 +1107,40 @@ func BenchmarkCheckpointFilesAt(b *testing.B) {
 			b.Fatal(err)
 		}
 		cleanup()
+	}
+}
+
+func BenchmarkSQLBatchApply(b *testing.B) {
+	for _, size := range []int{1, 8, 32, 64, 128} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			m, err := Open(b.TempDir()+"/batch.db", 1)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer m.Close()
+			schema, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "schema", SQL: "CREATE TABLE bench (id INTEGER PRIMARY KEY, value INTEGER NOT NULL)"}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := m.Apply(context.Background(), 1, schema); err != nil {
+				b.Fatal(err)
+			}
+			b.ResetTimer()
+			for iteration := range b.N {
+				commands := make([]types.SQLCommand, size)
+				for i := range commands {
+					id := iteration*size + i
+					commands[i] = types.SQLCommand{RequestID: strconv.Itoa(id), SQL: "INSERT INTO bench(id, value) VALUES (?, ?)", Args: []any{int64(id), int64(1)}}
+				}
+				value, err := types.EncodeSQLBatch(commands)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := m.Apply(context.Background(), uint64(iteration+2), value); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

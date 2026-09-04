@@ -1,0 +1,102 @@
+    Finished `release` profile [optimized] target(s) in 0.53s
+     Running `target/release/bench cluster -c 16 -r 100000`
+
+
+>>> Waiting for other nodes to join the cluster. Nodes joined: 3
+
+
+
+>>> All Cluster Members online
+
+
+
+>>> 100000 single INSERTs with concurrency 16 took:
+9184 ms -> 10888 inserts / s
+
+
+
+>>> 100000 transactional / batched INSERTs with concurrency 16 took:
+251 ms -> 398406 inserts / s
+
+
+
+>>> SELECT a single row with a fresh connection and no cached prepared query using `query_map_one` took:
+221 micros
+
+
+
+>>> SELECT a single row with a cached prepared statement using `query_map_one`:
+
+18 micros
+15 micros
+19 micros
+19 micros
+14 micros
+15 micros
+9 micros
+14 micros
+6 micros
+12 micros
+
+
+>>> SELECT a single row with a cached prepared statement using `query_as_one`:
+
+35 micros
+6 micros
+8 micros
+9 micros
+8 micros
+9 micros
+5 micros
+5 micros
+6 micros
+7 micros
+
+
+>>> SELECT all rows using `query_map` took:
+15651 micros
+
+
+
+>>> SELECT all rows using `query_as` took:
+10265 micros
+
+
+
+>>> 100000 single cache PUTs with concurrency 16 took:
+1610 ms -> 62111 inserts / s
+
+
+
+>>> Cache GET for a single entry :
+
+12 micros
+6 micros
+7 micros
+7 micros
+6 micros
+6 micros
+7 micros
+7 micros
+5 micros
+6 micros
+real 33.34
+user 7.03
+sys 22.03
+           543211520  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               53318  page reclaims
+                5943  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+              200814  messages sent
+              202770  messages received
+                   0  signals received
+               71033  voluntary context switches
+             2713971  involuntary context switches
+        188540292260  instructions retired
+         99753150242  cycles elapsed
+           457376752  peak memory footprint

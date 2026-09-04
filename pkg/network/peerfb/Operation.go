@@ -9,7 +9,7 @@ type Operation byte
 const (
 	OperationNone              Operation = 0
 	OperationRecord            Operation = 1
-	OperationPropose           Operation = 2
+	OperationReservedPropose   Operation = 2
 	OperationLearned           Operation = 3
 	OperationSync              Operation = 4
 	OperationReadIndex         Operation = 5
@@ -21,7 +21,7 @@ const (
 var EnumNamesOperation = map[Operation]string{
 	OperationNone:              "None",
 	OperationRecord:            "Record",
-	OperationPropose:           "Propose",
+	OperationReservedPropose:   "ReservedPropose",
 	OperationLearned:           "Learned",
 	OperationSync:              "Sync",
 	OperationReadIndex:         "ReadIndex",
@@ -33,7 +33,7 @@ var EnumNamesOperation = map[Operation]string{
 var EnumValuesOperation = map[string]Operation{
 	"None":              OperationNone,
 	"Record":            OperationRecord,
-	"Propose":           OperationPropose,
+	"ReservedPropose":   OperationReservedPropose,
 	"Learned":           OperationLearned,
 	"Sync":              OperationSync,
 	"ReadIndex":         OperationReadIndex,

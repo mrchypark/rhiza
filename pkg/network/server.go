@@ -64,15 +64,9 @@ type Server struct {
 	graphBatcher      *mutationBatcher[types.GraphCommand]
 	kvBatcher         *mutationBatcher[types.KVCommand]
 	transport         *Transport
-	members           []quepaxa.Member
-	hedgeDelay        time.Duration
 	applyMu           sync.Mutex
-	requestLocks      [256]sync.Mutex
+	requestLocks      [4096]sync.Mutex
 	durability        func(context.Context, quepaxa.Slot) error
-	routeMu           sync.Mutex
-	routeBase         quepaxa.NodeID
-	routeFirst        quepaxa.NodeID
-	routeGen          uint64
 	proposeMu         sync.Mutex
 	inflight          map[[32]byte]*proposalCall
 	proposalCtx       context.Context
@@ -83,11 +77,8 @@ type Server struct {
 	quiescing         bool
 	operationCap      chan struct{}
 	localCap          chan struct{}
-	peerCap           chan struct{}
 	operationB        int
 	localB            int
-	peerB             int
-	peerCounts        map[quepaxa.NodeID]int
 	objectStats       func() (map[string]uint64, bool)
 	replicaStatus     func() ReplicaStatus
 	syncLimit         chan struct{}
@@ -140,12 +131,12 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 	if barrier, err := types.DecodeReadBarrier(value); err != nil || !barrier {
 		return 0, fmt.Errorf("read barrier control value is required")
 	}
-	return s.proposeHedged(ctx, value)
+	return s.propose(ctx, value)
 }
 
 func (s *Server) lockRequest(id string) func() {
 	hash := sha256.Sum256([]byte(id))
-	lock := &s.requestLocks[hash[0]]
+	lock := &s.requestLocks[uint16(hash[0])<<4|uint16(hash[1])>>4]
 	lock.Lock()
 	return lock.Unlock
 }
@@ -157,7 +148,7 @@ type proposalCall struct {
 }
 
 // NewServer creates a new HTTP server.
-func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, members []quepaxa.Member, hedgeDelay time.Duration, ready ...func() bool) *Server {
+func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, ready ...func() bool) *Server {
 	proposalCtx, proposalStop := context.WithCancel(context.Background())
 	s := &Server{
 		core:         core,
@@ -167,23 +158,19 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		ready:        func() bool { return true },
 		writable:     writable,
 		transport:    transport,
-		members:      append([]quepaxa.Member(nil), members...),
-		hedgeDelay:   hedgeDelay,
 		inflight:     make(map[[32]byte]*proposalCall),
 		proposalCtx:  proposalCtx,
 		proposalStop: proposalStop,
 		operationCap: make(chan struct{}, maxProposalOperations),
 		localCap:     make(chan struct{}, maxLocalProposals),
-		peerCap:      make(chan struct{}, maxPeerProposals),
-		peerCounts:   make(map[quepaxa.NodeID]int),
 		syncLimit:    make(chan struct{}, 2),
 	}
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
-	s.sqlBatcher = newSQLBatcher(s.proposeHedged, nil)
-	s.graphBatcher = newGraphBatcher(s.proposeHedged, nil)
-	s.kvBatcher = newKVBatcher(s.proposeHedged, nil)
+	s.sqlBatcher = newSQLBatcher(s.propose, nil)
+	s.graphBatcher = newGraphBatcher(s.propose, nil)
+	s.kvBatcher = newKVBatcher(s.propose, nil)
 	s.routes()
 	return s
 }
@@ -225,6 +212,8 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 func (s *Server) routes() {
 	// Client API
 	s.mux.HandleFunc("/sql/execute", s.handleExecute)
+	s.mux.HandleFunc("/sql/execute-returning", s.handleExecuteReturning)
+	s.mux.HandleFunc("/sql/execute-returning-one", s.handleExecuteReturningOne)
 	s.mux.HandleFunc("/sql/transaction", s.handleExecute)
 	s.mux.HandleFunc("/sql/query", s.handleQuery)
 	s.mux.HandleFunc("/graph/execute", s.handleGraphExecute)
@@ -285,7 +274,7 @@ type DecisionsResponse struct {
 	Decisions  []quepaxa.DecidedValue `json:"decisions"`
 }
 
-func (s *Server) proposeHedged(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	hash := sha256.Sum256(value)
 	for {
 		s.proposeMu.Lock()
@@ -391,7 +380,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	defer s.proposalWG.Done()
 	ctx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
-	call.slot, call.err = s.proposeHedgedOnce(ctx, value)
+	call.slot, call.err = s.proposeOnce(ctx, value)
 	if call.err == nil {
 		call.err = s.applyDecisions(ctx, call.slot)
 	}
@@ -410,8 +399,7 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	close(call.done)
 	s.proposeMu.Unlock()
 }
-
-func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+func (s *Server) proposeOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	if slot, ok := s.core.DecidedSlot(value); ok {
 		if _, err := s.core.CompleteDecision(ctx, slot); err == nil {
 			return slot, nil
@@ -419,82 +407,14 @@ func (s *Server) proposeHedgedOnce(ctx context.Context, value []byte) (quepaxa.S
 			return slot, err
 		}
 	}
-	if len(s.members) <= 1 || s.transport == nil {
-		slot, _, err := s.core.Propose(ctx, value)
-		return slot, err
-	}
-	type result struct {
-		slot   quepaxa.Slot
-		err    error
-		member quepaxa.NodeID
-		rank   int
-		worked bool
-	}
-	hedgeCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	plan := s.proposerPlan()
-	members := plan.members
-	results := make(chan result, len(members))
-	var firstErr error
-	var uncertainSlot quepaxa.Slot
-	for rank, member := range members {
-		go func(rank int, member quepaxa.Member) {
-			delay := time.Duration(rank) * s.hedgeDelay
-			if delay > 0 {
-				timer := time.NewTimer(delay)
-				defer timer.Stop()
-				select {
-				case <-hedgeCtx.Done():
-					return
-				case <-timer.C:
-				}
-			}
-			if slot, ok := s.core.DecidedSlot(value); ok {
-				if _, err := s.core.CompleteDecision(hedgeCtx, slot); !errors.Is(err, quepaxa.ErrCompacted) {
-					results <- result{slot: slot, err: err, member: member.ID, rank: rank}
-					return
-				}
-			}
-			proposeCtx, cancelPropose := context.WithTimeout(hedgeCtx, 30*time.Second)
-			defer cancelPropose()
-			if member.ID == s.core.NodeID() {
-				slot, _, err := s.core.Propose(proposeCtx, value)
-				results <- result{slot: slot, err: err, member: member.ID, rank: rank, worked: true}
-				return
-			}
-			decision, err := s.transport.Propose(proposeCtx, member.ID, value)
-			if err == nil {
-				err = s.acceptFrom(proposeCtx, member.ID, decision)
-			}
-			results <- result{slot: decision.Slot, err: err, member: member.ID, rank: rank, worked: true}
-		}(rank, member)
-	}
-	for range members {
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case result := <-results:
-			if result.err == nil {
-				if result.worked {
-					s.observeProposer(plan, result.member, result.rank)
-				}
-				return result.slot, nil
-			}
-			if uncertainSlot == 0 && result.slot != 0 {
-				uncertainSlot = result.slot
-			}
-			if firstErr == nil {
-				firstErr = result.err
-			}
-		}
-	}
-	if firstErr != nil {
-		return uncertainSlot, fmt.Errorf("%w: %v", quepaxa.ErrQuorumUnavailable, firstErr)
-	}
-	return uncertainSlot, quepaxa.ErrQuorumUnavailable
+	slot, _, err := s.core.Propose(ctx, value)
+	return slot, err
 }
 
 func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision quepaxa.DecidedValue) error {
+	if err := s.core.AcceptCertifiedValueForAck(decision); err != nil {
+		return err
+	}
 	if err := s.catchUpFrom(ctx, source, decision.Slot); err != nil {
 		return err
 	}
@@ -541,7 +461,7 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
 		}
-		if err := s.core.AcceptCertifiedHints(response.Decisions); err != nil {
+		if err := s.core.AcceptCertifiedValues(response.Decisions); err != nil {
 			if errors.Is(err, quepaxa.ErrCompacted) {
 				s.handleCompacted()
 				return ErrNotReady
@@ -550,58 +470,6 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		}
 	}
 	return nil
-}
-
-type proposerPlan struct {
-	members    []quepaxa.Member
-	base       quepaxa.NodeID
-	generation uint64
-}
-
-func (s *Server) proposerPlan() proposerPlan {
-	byID := make(map[quepaxa.NodeID]quepaxa.Member, len(s.members))
-	for _, member := range s.members {
-		byID[member.ID] = member
-	}
-	agreed := s.core.ProposerOrder()
-	s.routeMu.Lock()
-	if len(agreed) > 0 && s.routeBase != agreed[0] {
-		s.routeBase = agreed[0]
-		s.routeFirst = agreed[0]
-		s.routeGen++
-	}
-	first, generation, base := s.routeFirst, s.routeGen, s.routeBase
-	s.routeMu.Unlock()
-
-	ordered := make([]quepaxa.Member, 0, len(s.members))
-	if member, ok := byID[first]; ok {
-		ordered = append(ordered, member)
-	}
-	for _, id := range agreed {
-		if id == first {
-			continue
-		}
-		if member, ok := byID[id]; ok {
-			ordered = append(ordered, member)
-		}
-	}
-	if len(ordered) != len(s.members) {
-		ordered = append([]quepaxa.Member(nil), s.members...)
-	}
-	return proposerPlan{members: ordered, base: base, generation: generation}
-}
-
-func (s *Server) observeProposer(plan proposerPlan, winner quepaxa.NodeID, rank int) {
-	if rank == 0 {
-		return
-	}
-	s.routeMu.Lock()
-	defer s.routeMu.Unlock()
-	if s.routeGen != plan.generation || s.routeBase != plan.base {
-		return
-	}
-	s.routeFirst = winner
-	s.routeGen++
 }
 
 // ServeHTTP implements http.Handler.
@@ -614,40 +482,50 @@ type ExecuteRequest struct {
 	RequestID string `json:"request_id"`
 	SQL       string `json:"sql,omitempty"`
 	Args      []any  `json:"args,omitempty"`
-	// WantRows is unsupported for replicated mutations; use Query after Execute.
+	// WantRows requests bounded rows from a replicated mutation.
 	WantRows   bool                 `json:"want_rows,omitempty"`
+	RequireOne bool                 `json:"require_one,omitempty"`
 	Statements []types.SQLStatement `json:"statements,omitempty"`
 }
 
-// ExecuteResponse contains the bounded aggregate receipt retained for retries.
-// Replicated statement rows are not returned; use Query after Execute.
+// ExecuteResponse contains the bounded aggregate receipt and requested rows.
 type ExecuteResponse struct {
 	types.MutationReceipt
+	Statements []types.SQLStatementResult `json:"statements,omitempty"`
+}
+
+// MigrationRequest is the in-process engine command used by DB.Migrate.
+type MigrationRequest struct {
+	RequestID  string
+	Version    int64
+	Name       string
+	Checksum   string
+	Statements []types.SQLStatement
 }
 
 // ValidateExecuteRequest applies the same mutation contract and encoded-size
 // check as Execute without submitting the command.
 func ValidateExecuteRequest(req ExecuteRequest) error {
-	_, err := validatedSQLCommand(req)
+	_, _, err := validatedSQLCommand(req)
 	return err
 }
 
-func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, error) {
+func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, []byte, error) {
 	if req.RequestID == "" {
-		return types.SQLCommand{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
 	}
-	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, Statements: req.Statements}
+	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements}
 	if err := materializer.ValidateSQLCommand(command); err != nil {
-		return types.SQLCommand{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	encoded, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	encoded, err := types.EncodeSQLBatchItem(command)
 	if err != nil {
-		return types.SQLCommand{}, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
 	}
-	if len(encoded) > quepaxa.MaxReplicatedValueBytes {
-		return types.SQLCommand{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
+	if types.SQLBatchEncodedSize([][]byte{encoded}) > quepaxa.MaxReplicatedValueBytes {
+		return types.SQLCommand{}, nil, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	return command, nil
+	return command, encoded, nil
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -670,41 +548,126 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+func (s *Server) handleExecuteReturning(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ExecuteRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := s.ExecuteReturning(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleExecuteReturningOne(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ExecuteRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := s.ExecuteReturningOne(r.Context(), req)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ExecuteReturning executes one replicated mutation and returns its bounded rows.
+func (s *Server) ExecuteReturning(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	if len(req.Statements) != 0 {
+		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturning accepts one SQL statement", ErrInvalidRequest)
+	}
+	req.WantRows = true
+	return s.Execute(ctx, req)
+}
+
+// ExecuteReturningOne commits only when exactly one row is returned.
+func (s *Server) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	if len(req.Statements) != 0 {
+		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturningOne accepts one SQL statement", ErrInvalidRequest)
+	}
+	req.WantRows = true
+	req.RequireOne = true
+	return s.Execute(ctx, req)
+}
+
 // Execute applies one SQL statement or an atomic statements transaction.
 func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
 	if !s.writable || !s.ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
-	command, err := validatedSQLCommand(req)
+	command, encoded, err := validatedSQLCommand(req)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	defer s.lockRequest(req.RequestID)()
-	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil {
+	return s.executeSQLCommand(ctx, command, encoded)
+}
+
+// Migrate applies one engine-owned migration atomically with its ledger row.
+func (s *Server) Migrate(ctx context.Context, req MigrationRequest) (ExecuteResponse, error) {
+	if !s.writable || !s.ready() {
+		return ExecuteResponse{}, ErrNotReady
+	}
+	command := types.SQLCommand{RequestID: req.RequestID, Statements: req.Statements, Migration: &types.SQLMigration{Version: req.Version, Name: req.Name, Checksum: req.Checksum}}
+	if command.RequestID == "" {
+		return ExecuteResponse{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+	}
+	if err := materializer.ValidateSQLCommand(command); err != nil {
+		return ExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	encoded, err := types.EncodeSQLBatchItem(command)
+	if err != nil || types.SQLBatchEncodedSize([][]byte{encoded}) > quepaxa.MaxReplicatedValueBytes {
+		return ExecuteResponse{}, fmt.Errorf("%w: invalid encoded migration", ErrInvalidRequest)
+	}
+	return s.executeSQLCommand(ctx, command, encoded)
+}
+
+func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand, encoded []byte) (ExecuteResponse, error) {
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
 		return ExecuteResponse{}, err
-	} else if !matches {
+	}
+	wantRows := command.WantRows
+	for _, statement := range command.Statements {
+		wantRows = wantRows || statement.WantRows
+	}
+	defer s.lockRequest(command.RequestID)()
+	receipt, sqlResult, found, matches, err := s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	if !matches {
 		return ExecuteResponse{}, ErrRequestConflict
 	}
-	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationSQL, req.RequestID); err != nil {
-		return ExecuteResponse{}, err
-	} else if found {
-		return ExecuteResponse{MutationReceipt: receipt}, nil
+	if found {
+		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 	}
-	_, err = s.sqlBatcher.submit(ctx, command)
+	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	if matches, err := s.material.SQLRequestMatches(ctx, command); err != nil || !matches {
+	receipt, sqlResult, found, matches, err = s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
+	if err != nil || !matches {
 		return ExecuteResponse{}, ErrRequestConflict
-	}
-	receipt, found, err := s.material.MutationReceipt(ctx, types.MutationSQL, req.RequestID)
-	if err != nil {
-		return ExecuteResponse{}, err
 	}
 	if !found {
 		return ExecuteResponse{}, fmt.Errorf("SQL mutation receipt is unavailable")
 	}
-	return ExecuteResponse{MutationReceipt: receipt}, nil
+	return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 }
 
 // QueryRequest is the request body for query.
@@ -1072,7 +1035,7 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 	if len(value) > quepaxa.MaxReplicatedValueBytes {
 		return types.MutationReceipt{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	slot, err := s.proposeHedged(ctx, value)
+	slot, err := s.propose(ctx, value)
 	if err == nil {
 		if matches, matchErr := s.material.NotifyRequestMatches(ctx, req); matchErr != nil {
 			err = matchErr
@@ -1181,52 +1144,6 @@ func (s *Server) proposeLocal(ctx context.Context, value []byte) (quepaxa.Decide
 		return quepaxa.DecidedValue{}, errors.New("decision unavailable")
 	}
 	return decision, nil
-}
-
-func (s *Server) proposePeer(ctx context.Context, sender quepaxa.NodeID, value []byte) (quepaxa.DecidedValue, error) {
-	select {
-	case s.peerCap <- struct{}{}:
-	default:
-		return quepaxa.DecidedValue{}, ErrOverloaded
-	}
-	select {
-	case s.operationCap <- struct{}{}:
-	default:
-		<-s.peerCap
-		return quepaxa.DecidedValue{}, ErrOverloaded
-	}
-	s.proposeMu.Lock()
-	if s.closing || s.quiescing || s.peerCounts[sender] >= 2 || len(value) > maxPeerEncodedByte-s.peerB || len(value) > maxProposalEncodedByte-s.operationB {
-		<-s.operationCap
-		<-s.peerCap
-		s.proposeMu.Unlock()
-		if s.closing || s.quiescing {
-			return quepaxa.DecidedValue{}, ErrNotReady
-		}
-		return quepaxa.DecidedValue{}, ErrOverloaded
-	}
-	s.operationB += len(value)
-	s.peerB += len(value)
-	s.peerCounts[sender]++
-	s.proposalWG.Add(1)
-	s.proposeMu.Unlock()
-	defer func() {
-		s.proposeMu.Lock()
-		s.operationB -= len(value)
-		s.peerB -= len(value)
-		s.peerCounts[sender]--
-		if s.peerCounts[sender] == 0 {
-			delete(s.peerCounts, sender)
-		}
-		<-s.operationCap
-		<-s.peerCap
-		s.proposeMu.Unlock()
-		s.proposalWG.Done()
-	}()
-	operationCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(s.proposalCtx, cancel)
-	defer func() { stop(); cancel() }()
-	return s.proposeLocal(operationCtx, value)
 }
 
 func validateReplicatedMutation(value []byte) error {

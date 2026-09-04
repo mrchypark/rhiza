@@ -35,6 +35,7 @@ type Node struct {
 	server       *network.Server
 	peer         *network.PeerServer
 	transport    *network.Transport
+	catchUp      *network.Transport
 	wal          *qlog.WAL
 	lock         *qlog.LockFile
 	bucket       *objectstore.MeteredBucket
@@ -226,6 +227,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
+		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
 	}
 	core, err := quepaxa.New(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport,
@@ -260,7 +262,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	}
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
-	server := network.NewServer(core, material, n.config.ClusterID, true, transport, cluster.Members, n.config.HedgeDelay, n.ready.Load)
+	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
 	if n.checkpoints != nil {
 		server.SetCheckpointPrepare(func(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
 			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
@@ -381,7 +383,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
-			n.startCatchUp(ctx, transport, cluster)
+			n.startCatchUp(ctx, n.catchUp, cluster)
 		}()
 	}
 
@@ -900,9 +902,15 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 		}
 		if !n.ready.Load() {
 			n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
-		} else if source, ok := syncSource(n.config.NodeID, cluster.Members, round); ok {
-			if err := n.catchUpPeer(ctx, transport, source); err != nil {
-				log.Printf("operation sync from %s failed: %v", source, err)
+		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
+			var syncErr error
+			for _, source := range sources {
+				if syncErr = n.catchUpPeer(ctx, transport, source); syncErr == nil {
+					break
+				}
+			}
+			if syncErr != nil {
+				log.Printf("operation sync from all peers failed: %v", syncErr)
 			}
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
@@ -933,7 +941,7 @@ func syncInterval(nodeID quepaxa.NodeID, round uint64) time.Duration {
 	return time.Duration(900+binary.BigEndian.Uint16(hash[:2])%201) * time.Millisecond
 }
 
-func syncSource(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) (quepaxa.NodeID, bool) {
+func syncSources(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) []quepaxa.NodeID {
 	peers := make([]quepaxa.NodeID, 0, len(members)-1)
 	for _, member := range members {
 		if member.ID != nodeID {
@@ -941,14 +949,15 @@ func syncSource(nodeID quepaxa.NodeID, members []quepaxa.Member, round uint64) (
 		}
 	}
 	if len(peers) == 0 {
-		return "", false
+		return nil
 	}
 	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-sync-peer:%s:%d", nodeID, round/uint64(len(peers)))))
 	for i := len(peers) - 1; i > 0; i-- {
 		j := int(binary.BigEndian.Uint64(seed[(i*8)%24:]) % uint64(i+1))
 		peers[i], peers[j] = peers[j], peers[i]
 	}
-	return peers[round%uint64(len(peers))], true
+	first := int(round % uint64(len(peers)))
+	return append(peers[first:], peers[:first]...)
 }
 
 func (n *Node) observeCatchUp(err error) {
@@ -1130,6 +1139,10 @@ func (n *Node) Shutdown() error {
 	if n.transport != nil {
 		n.transport.Close()
 		n.transport = nil
+	}
+	if n.catchUp != nil {
+		n.catchUp.Close()
+		n.catchUp = nil
 	}
 	if n.core != nil {
 		n.core.StopPeriodicSync()
