@@ -35,6 +35,9 @@ type MutationStatus string
 const (
 	MutationCommitted MutationStatus = "committed"
 	MutationRejected  MutationStatus = "rejected"
+
+	MutationErrorCodeExecutionFailed    = "execution_failed"
+	MutationErrorCodePreconditionFailed = "precondition_failed"
 )
 
 // MutationReceipt is the bounded result retained for idempotent retries.
@@ -69,10 +72,14 @@ type SQLMigration struct {
 
 // SQLStatement is one statement in a replicated client transaction.
 type SQLStatement struct {
-	SQL        string                  `json:"sql"`
-	Args       []any                   `json:"args,omitempty"`
-	WantRows   bool                    `json:"want_rows,omitempty"`
-	OutputRefs []SQLStatementOutputRef `json:"output_refs,omitempty"`
+	SQL      string `json:"sql"`
+	Args     []any  `json:"args,omitempty"`
+	WantRows bool   `json:"want_rows,omitempty"`
+	// ExpectedRowsAffected requires an exact count from a non-row-returning statement.
+	ExpectedRowsAffected *int64 `json:"expected_rows_affected,omitempty"`
+	// ExpectedReturnedRows requires an exact count from a WantRows statement.
+	ExpectedReturnedRows *int64                  `json:"expected_returned_rows,omitempty"`
+	OutputRefs           []SQLStatementOutputRef `json:"output_refs,omitempty"`
 }
 
 // SQLStatementOutputRef replaces a null positional argument with a column

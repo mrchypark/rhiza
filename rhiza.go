@@ -108,32 +108,34 @@ type Config struct {
 }
 
 const (
-	ConsistencyLocal                   = "local"
-	ConsistencyLinearizable            = "linearizable"
-	ObjectStoreDurabilityAsync         = types.ObjectStoreDurabilityAsync
-	ObjectStoreDurabilityBeforeAck     = types.ObjectStoreDurabilityBeforeAck
-	MutationCommitted                  = types.MutationCommitted
-	MutationRejected                   = types.MutationRejected
-	RequestKindSQL                     = "sql"
-	RequestKindKV                      = "kv"
-	RequestKindNotify                  = "notify"
-	RequestKindGraph                   = "graph"
-	RequestStateCommitted              = "committed"
-	RequestStateRejected               = "rejected"
-	RequestStateUnknownOrExpired       = "unknown_or_expired"
-	ObjectStoreProviderFilesystem      = "filesystem"
-	ObjectStoreProviderS3              = "s3"
-	ObjectStoreProviderGCS             = "gcs"
-	ObjectStoreProviderAzure           = "azure"
-	HTTPErrorCodeInvalidRequest        = "invalid_request"
-	HTTPErrorCodeRequestConflict       = "request_conflict"
-	HTTPErrorCodeNotReady              = "not_ready"
-	HTTPErrorCodeOverloaded            = "overloaded"
-	HTTPErrorCodeDurabilityUnavailable = "durability_unavailable"
-	HTTPErrorCodeCommitUnknown         = "commit_unknown"
-	HTTPErrorCodeQuorumUnavailable     = "quorum_unavailable"
-	HTTPErrorCodeMethodNotAllowed      = "method_not_allowed"
-	HTTPErrorCodeNotFound              = "not_found"
+	ConsistencyLocal                    = "local"
+	ConsistencyLinearizable             = "linearizable"
+	ObjectStoreDurabilityAsync          = types.ObjectStoreDurabilityAsync
+	ObjectStoreDurabilityBeforeAck      = types.ObjectStoreDurabilityBeforeAck
+	MutationCommitted                   = types.MutationCommitted
+	MutationRejected                    = types.MutationRejected
+	MutationErrorCodeExecutionFailed    = types.MutationErrorCodeExecutionFailed
+	MutationErrorCodePreconditionFailed = types.MutationErrorCodePreconditionFailed
+	RequestKindSQL                      = "sql"
+	RequestKindKV                       = "kv"
+	RequestKindNotify                   = "notify"
+	RequestKindGraph                    = "graph"
+	RequestStateCommitted               = "committed"
+	RequestStateRejected                = "rejected"
+	RequestStateUnknownOrExpired        = "unknown_or_expired"
+	ObjectStoreProviderFilesystem       = "filesystem"
+	ObjectStoreProviderS3               = "s3"
+	ObjectStoreProviderGCS              = "gcs"
+	ObjectStoreProviderAzure            = "azure"
+	HTTPErrorCodeInvalidRequest         = "invalid_request"
+	HTTPErrorCodeRequestConflict        = "request_conflict"
+	HTTPErrorCodeNotReady               = "not_ready"
+	HTTPErrorCodeOverloaded             = "overloaded"
+	HTTPErrorCodeDurabilityUnavailable  = "durability_unavailable"
+	HTTPErrorCodeCommitUnknown          = "commit_unknown"
+	HTTPErrorCodeQuorumUnavailable      = "quorum_unavailable"
+	HTTPErrorCodeMethodNotAllowed       = "method_not_allowed"
+	HTTPErrorCodeNotFound               = "not_found"
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.

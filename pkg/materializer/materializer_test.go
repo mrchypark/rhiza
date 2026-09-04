@@ -665,6 +665,127 @@ func TestRejectedTransactionDoesNotRetainReturningRows(t *testing.T) {
 	}
 }
 
+func TestSQLStatementPreconditionsRollbackWholeTransaction(t *testing.T) {
+	m, err := Open(t.TempDir()+"/preconditions.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	one := int64(1)
+	schema := types.SQLCommand{RequestID: "precondition-schema", Statements: []types.SQLStatement{
+		{SQL: "CREATE TABLE accounts (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)"},
+		{SQL: "CREATE TABLE audit (account_id INTEGER NOT NULL)"},
+		{SQL: "INSERT INTO accounts VALUES (1, 1)"},
+	}}
+	encoded, err := types.EncodeSQLBatch([]types.SQLCommand{schema})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, encoded); err != nil {
+		t.Fatal(err)
+	}
+
+	affected := types.SQLCommand{RequestID: "affected-precondition", Statements: []types.SQLStatement{
+		{SQL: "UPDATE accounts SET version = 2 WHERE id = 1 AND version = 2", ExpectedRowsAffected: &one},
+		{SQL: "INSERT INTO audit VALUES (1)"},
+	}}
+	encoded, err = types.EncodeSQLBatch([]types.SQLCommand{affected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 2, encoded); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ := types.SQLFingerprint(affected)
+	receipt, _, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), affected.RequestID, fingerprint, false)
+	if err != nil || !found || !matches || receipt.Status != types.MutationRejected || receipt.ErrorCode != types.MutationErrorCodePreconditionFailed {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	var version, auditCount int
+	if err := m.db.QueryRow(`SELECT version FROM accounts WHERE id = 1`).Scan(&version); err != nil || version != 1 {
+		t.Fatalf("version=%d err=%v", version, err)
+	}
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil || auditCount != 0 {
+		t.Fatalf("audit count=%d err=%v", auditCount, err)
+	}
+
+	returnedMismatch := types.SQLCommand{RequestID: "returned-precondition-mismatch", Statements: []types.SQLStatement{
+		{SQL: "UPDATE accounts SET version = 2 WHERE id = 999 RETURNING id", WantRows: true, ExpectedReturnedRows: &one},
+		{SQL: "INSERT INTO audit VALUES (999)"},
+	}}
+	encoded, err = types.EncodeSQLBatch([]types.SQLCommand{returnedMismatch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 3, encoded); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ = types.SQLFingerprint(returnedMismatch)
+	receipt, _, found, matches, err = m.SQLRequestResultFingerprint(context.Background(), returnedMismatch.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Status != types.MutationRejected || receipt.ErrorCode != types.MutationErrorCodePreconditionFailed {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM audit`).Scan(&auditCount); err != nil || auditCount != 0 {
+		t.Fatalf("audit count=%d err=%v", auditCount, err)
+	}
+
+	returned := types.SQLCommand{RequestID: "returned-precondition", Statements: []types.SQLStatement{
+		{SQL: "UPDATE accounts SET version = 2 WHERE id = 1 AND version = 1 RETURNING id", WantRows: true, ExpectedReturnedRows: &one},
+		{SQL: "INSERT INTO audit VALUES (1)", ExpectedRowsAffected: &one},
+	}}
+	encoded, err = types.EncodeSQLBatch([]types.SQLCommand{returned})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 4, encoded); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ = types.SQLFingerprint(returned)
+	receipt, result, found, matches, err := m.SQLRequestResultFingerprint(context.Background(), returned.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Status != types.MutationCommitted || len(result.Statements) != 2 {
+		t.Fatalf("receipt=%+v result=%+v found=%v matches=%v err=%v", receipt, result, found, matches, err)
+	}
+
+	zero := int64(0)
+	zeroMatches := types.SQLCommand{RequestID: "zero-preconditions", Statements: []types.SQLStatement{
+		{SQL: "UPDATE accounts SET version = 3 WHERE id = 999", ExpectedRowsAffected: &zero},
+		{SQL: "SELECT id FROM accounts WHERE id = 999", WantRows: true, ExpectedReturnedRows: &zero},
+		{SQL: "INSERT INTO audit VALUES (2)", ExpectedRowsAffected: &one},
+	}}
+	encoded, err = types.EncodeSQLBatch([]types.SQLCommand{zeroMatches})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 5, encoded); err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, _ = types.SQLFingerprint(zeroMatches)
+	receipt, _, found, matches, err = m.SQLRequestResultFingerprint(context.Background(), zeroMatches.RequestID, fingerprint, true)
+	if err != nil || !found || !matches || receipt.Status != types.MutationCommitted {
+		t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+	}
+	if err := m.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE account_id = 2`).Scan(&auditCount); err != nil || auditCount != 1 {
+		t.Fatalf("zero-match transaction audit count=%d err=%v", auditCount, err)
+	}
+}
+
+func TestSQLStatementRejectsInvalidPreconditions(t *testing.T) {
+	negative, tooMany := int64(-1), int64(MaxReturningRows+1)
+	one := int64(1)
+	cases := []types.SQLCommand{
+		{Statements: []types.SQLStatement{{SQL: "UPDATE t SET value = 1", ExpectedRowsAffected: &negative}}},
+		{Statements: []types.SQLStatement{{SQL: "UPDATE t SET value = 1 RETURNING value", WantRows: true, ExpectedRowsAffected: &one}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", ExpectedReturnedRows: &one}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true, ExpectedReturnedRows: &negative}}},
+		{Statements: []types.SQLStatement{{SQL: "SELECT 1", WantRows: true, ExpectedReturnedRows: &tooMany}}},
+	}
+	for i, command := range cases {
+		if err := ValidateSQLCommand(command); err == nil {
+			t.Fatalf("case %d accepted", i)
+		}
+	}
+}
+
 func TestMaterializerUpgradesLegacyReceiptSchema(t *testing.T) {
 	path := t.TempDir() + "/legacy.db"
 	m, err := Open(path, 1)
@@ -720,8 +841,8 @@ func TestMaterializerRejectsMigrationVersionGapAtApply(t *testing.T) {
 	}
 	defer m.Close()
 	command := types.SQLCommand{
-		RequestID: "migration-gap",
-		Migration: &types.SQLMigration{Version: 2, Name: "gap", Checksum: strings.Repeat("a", 64)},
+		RequestID:  "migration-gap",
+		Migration:  &types.SQLMigration{Version: 2, Name: "gap", Checksum: strings.Repeat("a", 64)},
 		Statements: []types.SQLStatement{{SQL: "CREATE TABLE gap_was_applied (id INTEGER)"}},
 	}
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})

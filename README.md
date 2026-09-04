@@ -104,6 +104,13 @@ parameters and must have a matching `null` entry in `Args`. Returned rows and
 idempotency receipts are retained together, so retrying the same request ID
 returns the original result without re-executing the mutation.
 
+Each statement can require an exact result with `ExpectedRowsAffected` for a
+non-row-returning statement or `ExpectedReturnedRows` for a `WantRows`
+statement. A mismatch rolls back the whole transaction and returns a rejected
+receipt with `MutationErrorCodePreconditionFailed`. Use these checks with
+version predicates and database constraints to keep validation and mutation in
+the same replicated transaction.
+
 `DB.Migrate` applies named, contiguous migration versions starting at 1 through
 the same replicated transaction path. Reapplying an identical migration list
 is a no-op; changing an already-applied version or leaving a gap is an error.
