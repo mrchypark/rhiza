@@ -15,6 +15,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -56,6 +57,10 @@ type GraphStreamReadResponse = network.GraphStreamReadResponse
 type GraphStreamOffsetRequest = network.GraphStreamOffsetRequest
 type GraphStreamOffsetResponse = network.GraphStreamOffsetResponse
 type GraphStreamTrimRequest = network.GraphStreamTrimRequest
+type GraphReachableRequest = types.GraphReachableRequest
+type GraphReachableNode = types.GraphReachableNode
+type GraphReachableResult = types.GraphReachableResult
+type GraphNodePropertyIndex = types.GraphNodePropertyIndex
 type RequestStatusRequest = network.RequestStatusRequest
 type RequestStatusResponse = network.RequestStatusResponse
 type ObjectStoreStats = objstore.Stats
@@ -97,6 +102,9 @@ type Config struct {
 	CheckpointInterval             time.Duration
 	CheckpointTailBytes            int64
 	MaxWALBytes                    int64
+	// LocalGraphNodePropertyIndexes are node-local derived indexes. Rhiza
+	// reconciles them at open and after checkpoint restore; they are not replicated.
+	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex
 }
 
 const (
@@ -129,7 +137,12 @@ const (
 	// MaxReplicatedMutationBytes is the encoded consensus-value limit.
 	MaxReplicatedMutationBytes = quepaxa.MaxReplicatedValueBytes
 	// MaxHTTPBodyBytes is the optional HTTP adapter's larger JSON envelope limit.
-	MaxHTTPBodyBytes = network.MaxRequestBodyBytes
+	MaxHTTPBodyBytes              = network.MaxRequestBodyBytes
+	MaxGraphReachableDepth        = materializer.MaxGraphReachableDepth
+	MaxGraphReachableResults      = materializer.MaxReturningRows
+	MaxGraphReachableScannedEdges = materializer.MaxGraphReachableEdges
+	MaxGraphReachableBytes        = materializer.MaxResultBytes
+	MaxLocalGraphPropertyIndexes  = materializer.MaxGraphPropertyIndexes
 )
 
 var (
@@ -139,6 +152,8 @@ var (
 	ErrQuorumUnavailable     = quepaxa.ErrQuorumUnavailable
 	ErrDurabilityUnavailable = network.ErrDurabilityUnavailable
 	ErrCommitUnknown         = network.ErrCommitUnknown
+	ErrGraphResourceLimit    = network.ErrGraphResourceLimit
+	ErrReadVersionMismatch   = network.ErrReadVersionMismatch
 )
 
 // DB owns one embedded Rhiza node and its private QUIC peer endpoint.
@@ -188,6 +203,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
 		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes,
+		LocalGraphNodePropertyIndexes: slices.Clone(config.LocalGraphNodePropertyIndexes),
 	}
 	n := node.New(internalConfig)
 	if err := n.Open(childCtx); err != nil {
@@ -219,6 +235,14 @@ func (db *DB) Ready() bool { return db.node.Ready() }
 // ValidateExecuteRequest applies the replicated SQL contract and encoded-size
 // limit without submitting the mutation.
 func ValidateExecuteRequest(req ExecuteRequest) error { return network.ValidateExecuteRequest(req) }
+
+// ValidateGraphReachableRequest checks limits and value types without reading data.
+func ValidateGraphReachableRequest(req GraphReachableRequest) error {
+	if err := materializer.ValidateGraphReachableRequest(req); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	return nil
+}
 
 // Handler exposes the optional HTTP server API without opening a listener.
 func (db *DB) Handler() http.Handler                            { return db.api }
@@ -421,6 +445,12 @@ func (db *DB) GraphExecute(ctx context.Context, req GraphCommand) (GraphExecuteR
 }
 func (db *DB) GraphQuery(ctx context.Context, req GraphQueryRequest) (GraphResult, error) {
 	return db.api.GraphQuery(ctx, req)
+}
+
+// GraphReachable performs a bounded, deterministic outgoing traversal on one
+// immutable local graph snapshot. Results are ordered by distance, then node ID.
+func (db *DB) GraphReachable(ctx context.Context, req GraphReachableRequest) (GraphReachableResult, error) {
+	return db.api.GraphReachable(ctx, req)
 }
 
 // GraphChanges reads the node-local LatticeDB semantic graph changefeed.

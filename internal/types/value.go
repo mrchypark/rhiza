@@ -176,6 +176,41 @@ type GraphCommandResult struct {
 	ConsensusTip uint64   `json:"consensus_tip,omitempty"`
 }
 
+// GraphReachableRequest describes one bounded outgoing traversal. Matching
+// nodes are both returned and expanded; the start node is never returned.
+type GraphReachableRequest struct {
+	StartLabel     string         `json:"start_label"`
+	StartProperty  string         `json:"start_property"`
+	StartValue     any            `json:"start_value"`
+	EdgeType       string         `json:"edge_type"`
+	NodeLabel      string         `json:"node_label,omitempty"`
+	NodeFilters    map[string]any `json:"node_filters,omitempty"`
+	ResultProperty string         `json:"result_property"`
+	MaxDepth       uint32         `json:"max_depth"`
+	MaxResults     uint           `json:"max_results"`
+	// MaxScannedEdges counts fetched outgoing edges, including duplicate
+	// targets and targets rejected by NodeLabel or NodeFilters.
+	MaxScannedEdges uint `json:"max_scanned_edges"`
+	// MaxBytes bounds the JSON encoding of Nodes.
+	MaxBytes    uint   `json:"max_bytes"`
+	Consistency string `json:"consistency,omitempty"`
+	// RequireAppliedSlot requires an exact local materializer version.
+	RequireAppliedSlot *uint64 `json:"require_applied_slot,omitempty"`
+}
+
+type GraphReachableNode struct {
+	Value    any    `json:"value"`
+	Distance uint32 `json:"distance"`
+}
+
+type GraphReachableResult struct {
+	Nodes        []GraphReachableNode `json:"nodes"`
+	StartFound   bool                 `json:"start_found"`
+	ScannedEdges uint                 `json:"scanned_edges"`
+	AppliedSlot  uint64               `json:"applied_slot"`
+	ConsensusTip uint64               `json:"consensus_tip"`
+}
+
 func EncodeGraphCommand(command GraphCommand) ([]byte, error) {
 	return EncodeGraphBatch([]GraphCommand{command})
 }

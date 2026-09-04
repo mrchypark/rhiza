@@ -220,6 +220,10 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		}
 	}
 	n.material = material
+	if err := material.ConfigureLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
+		_ = material.Close()
+		return fmt.Errorf("configure local graph indexes: %w", err)
+	}
 
 	// 5. Create consensus core through the same public API available to external users.
 	cluster := n.loadClusterConfig()

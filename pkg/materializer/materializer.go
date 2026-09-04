@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,13 +31,16 @@ import (
 )
 
 const (
-	MaxSQLBytes            = 256 << 10
-	MaxSQLStatements       = 64
-	MaxSQLArgs             = 999
-	MaxReturningRows       = 10_000
-	MaxResultBytes         = 16 << 20
-	MaxMutationResultBytes = 1 << 20
-	MaxCellBytes           = 1 << 20
+	MaxSQLBytes             = 256 << 10
+	MaxSQLStatements        = 64
+	MaxSQLArgs              = 999
+	MaxReturningRows        = 10_000
+	MaxResultBytes          = 16 << 20
+	MaxMutationResultBytes  = 1 << 20
+	MaxCellBytes            = 1 << 20
+	MaxGraphReachableDepth  = 64
+	MaxGraphReachableEdges  = 1_000_000
+	MaxGraphPropertyIndexes = 64
 
 	notificationSubscriberLimit = 64
 	notificationQueueDepth      = 1
@@ -55,31 +59,32 @@ const migrationTableDDL = `CREATE TABLE IF NOT EXISTS _rhiza_migrations (
 // Materializer applies decided values to SQLite.
 // Uses single writer, multiple readers pattern like Hiqlite.
 type Materializer struct {
-	db                 *sql.DB
-	writer             *sql.DB
-	readers            []*sql.DB
-	mu                 sync.RWMutex
-	tip                uint64
-	stateTip           uint64
-	tipHash            [32]byte
-	dbPath             string
-	readersN           int
-	idempotencyWindow  uint64
-	recentSQLReceipts  map[string]storedReceipt
-	pendingSQLReceipts []pendingSQLReceipt
-	sqlReceipts        sqlReceiptBloom
-	graph              *graphState
-	notifyMu           sync.Mutex
-	nextSub            uint64
-	subs               map[uint64]notificationSubscription
-	notifyQueue        chan pendingNotification
-	notifyStop         chan struct{}
-	notifyStopOnce     sync.Once
-	notifyWG           sync.WaitGroup
-	notifyDrops        atomic.Uint64
-	walCheckpointStop  chan struct{}
-	walCheckpointOnce  sync.Once
-	walCheckpointWG    sync.WaitGroup
+	db                       *sql.DB
+	writer                   *sql.DB
+	readers                  []*sql.DB
+	mu                       sync.RWMutex
+	tip                      uint64
+	stateTip                 uint64
+	tipHash                  [32]byte
+	dbPath                   string
+	readersN                 int
+	idempotencyWindow        uint64
+	recentSQLReceipts        map[string]storedReceipt
+	pendingSQLReceipts       []pendingSQLReceipt
+	sqlReceipts              sqlReceiptBloom
+	graph                    *graphState
+	graphNodePropertyIndexes []types.GraphNodePropertyIndex
+	notifyMu                 sync.Mutex
+	nextSub                  uint64
+	subs                     map[uint64]notificationSubscription
+	notifyQueue              chan pendingNotification
+	notifyStop               chan struct{}
+	notifyStopOnce           sync.Once
+	notifyWG                 sync.WaitGroup
+	notifyDrops              atomic.Uint64
+	walCheckpointStop        chan struct{}
+	walCheckpointOnce        sync.Once
+	walCheckpointWG          sync.WaitGroup
 }
 
 type notificationSubscription struct {
@@ -122,6 +127,33 @@ func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materia
 		return nil, fmt.Errorf("recover interrupted restore: %w", err)
 	}
 	return openMaterializer(dbPath, readerCount, idempotencyWindow...)
+}
+
+// ConfigureLocalGraphNodePropertyIndexes declares node-local derived indexes.
+// The declaration is retained and reconciled after materializer replacement.
+func (m *Materializer) ConfigureLocalGraphNodePropertyIndexes(indexes []types.GraphNodePropertyIndex) error {
+	if len(indexes) > MaxGraphPropertyIndexes {
+		return fmt.Errorf("at most %d local graph property indexes are allowed", MaxGraphPropertyIndexes)
+	}
+	deduped := make([]types.GraphNodePropertyIndex, 0, len(indexes))
+	seen := make(map[types.GraphNodePropertyIndex]struct{}, len(indexes))
+	for _, index := range indexes {
+		if index.Label == "" || index.Property == "" {
+			return fmt.Errorf("graph index label and property are required")
+		}
+		if _, ok := seen[index]; ok {
+			continue
+		}
+		seen[index] = struct{}{}
+		deduped = append(deduped, index)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ensureGraphNodePropertyIndexes(m.graph, deduped); err != nil {
+		return err
+	}
+	m.graphNodePropertyIndexes = deduped
+	return nil
 }
 
 func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
@@ -2359,6 +2391,10 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 	if err == nil {
 		err = restored.validateRestoredSnapshot()
 	}
+	if err == nil {
+		err = ensureGraphNodePropertyIndexes(restored.graph, m.graphNodePropertyIndexes)
+		restored.graphNodePropertyIndexes = slices.Clone(m.graphNodePropertyIndexes)
+	}
 	if err != nil {
 		if restored != nil {
 			_ = restored.Close()
@@ -2391,6 +2427,11 @@ func (m *Materializer) reopen() error {
 	if err != nil {
 		return err
 	}
+	if err := ensureGraphNodePropertyIndexes(reopened.graph, m.graphNodePropertyIndexes); err != nil {
+		_ = reopened.Close()
+		return err
+	}
+	reopened.graphNodePropertyIndexes = slices.Clone(m.graphNodePropertyIndexes)
 	m.adopt(reopened)
 	return nil
 }
@@ -2401,6 +2442,7 @@ func (m *Materializer) adopt(source *Materializer) {
 	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
 	m.recentSQLReceipts = source.recentSQLReceipts
 	m.sqlReceipts = source.sqlReceipts
+	m.graphNodePropertyIndexes = slices.Clone(source.graphNodePropertyIndexes)
 	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
 	_ = source.Close()
 }

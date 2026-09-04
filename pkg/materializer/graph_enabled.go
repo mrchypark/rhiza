@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -29,6 +32,23 @@ func graphArgs(args map[string]any) (map[string]any, error) {
 
 var graphTipKey = []byte("rhiza/applied_slot")
 var graphJournalKey = []byte("rhiza/recovery_journal")
+
+var (
+	ErrGraphResourceLimit  = errors.New("graph resource limit exceeded")
+	ErrReadVersionMismatch = errors.New("read version mismatch")
+)
+
+func ensureGraphNodePropertyIndexes(graph *graphState, indexes []types.GraphNodePropertyIndex) error {
+	if graph == nil || graph.db == nil {
+		return fmt.Errorf("LatticeDB is not open")
+	}
+	for _, index := range indexes {
+		if err := graph.db.CreateNodePropertyIndex(index.Label, index.Property); err != nil && !errors.Is(err, latticedb.ErrAlreadyExists) {
+			return fmt.Errorf("create local graph index %s.%s: %w", index.Label, index.Property, err)
+		}
+	}
+	return nil
+}
 
 type graphState struct {
 	db                *latticedb.DB
@@ -601,6 +621,154 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	response, err := collectLatticeRows(result)
 	response.AppliedSlot = appliedSlot
 	return response, err
+}
+
+func ValidateGraphReachableRequest(request types.GraphReachableRequest) error {
+	if request.StartLabel == "" || request.StartProperty == "" || request.EdgeType == "" || request.ResultProperty == "" ||
+		request.MaxDepth == 0 || request.MaxDepth > MaxGraphReachableDepth || request.MaxResults == 0 || request.MaxResults > MaxReturningRows ||
+		request.MaxScannedEdges == 0 || request.MaxScannedEdges > MaxGraphReachableEdges || request.MaxBytes == 0 || request.MaxBytes > MaxResultBytes {
+		return fmt.Errorf("invalid graph reachability request")
+	}
+	if _, err := graphArg(request.StartValue); err != nil {
+		return err
+	}
+	_, err := graphArgs(request.NodeFilters)
+	return err
+}
+
+// GraphReachable traverses one immutable LatticeDB read transaction. Nodes
+// which fail NodeLabel or NodeFilters are neither returned nor expanded.
+func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphReachableRequest) (types.GraphReachableResult, error) {
+	if err := ValidateGraphReachableRequest(request); err != nil {
+		return types.GraphReachableResult{}, err
+	}
+	startValue, err := graphArg(request.StartValue)
+	if err != nil {
+		return types.GraphReachableResult{}, err
+	}
+	filters, err := graphArgs(request.NodeFilters)
+	if err != nil {
+		return types.GraphReachableResult{}, err
+	}
+	m.mu.RLock()
+	if err := ctx.Err(); err != nil {
+		m.mu.RUnlock()
+		return types.GraphReachableResult{}, err
+	}
+	g := m.graph
+	if g == nil || g.db == nil || g.tip != m.tip {
+		m.mu.RUnlock()
+		return types.GraphReachableResult{}, fmt.Errorf("graph materializer is unavailable or stale")
+	}
+	tx, err := g.db.BeginRead()
+	if err != nil {
+		m.mu.RUnlock()
+		return types.GraphReachableResult{}, err
+	}
+	appliedSlot := m.tip
+	g.queryWG.Add(1)
+	m.mu.RUnlock()
+	defer g.queryWG.Done()
+	defer tx.Rollback()
+	if request.RequireAppliedSlot != nil && *request.RequireAppliedSlot != appliedSlot {
+		return types.GraphReachableResult{AppliedSlot: appliedSlot}, fmt.Errorf("%w: required %d, got %d", ErrReadVersionMismatch, *request.RequireAppliedSlot, appliedSlot)
+	}
+	starts, err := tx.FindNodesByLabelProperty(request.StartLabel, request.StartProperty, startValue, 2)
+	if err != nil {
+		return types.GraphReachableResult{}, err
+	}
+	result := types.GraphReachableResult{Nodes: []types.GraphReachableNode{}, StartFound: len(starts) != 0, AppliedSlot: appliedSlot}
+	if len(starts) == 0 {
+		return result, nil
+	}
+	if len(starts) != 1 {
+		return types.GraphReachableResult{}, fmt.Errorf("start selector matched more than one node")
+	}
+	current := []uint64{starts[0]}
+	visited := map[uint64]struct{}{starts[0]: {}}
+	encodedBytes := 2 // JSON array brackets.
+	for depth := uint32(1); depth <= request.MaxDepth && len(current) != 0; depth++ {
+		nextSet := make(map[uint64]struct{})
+		for _, source := range current {
+			if err := ctx.Err(); err != nil {
+				return types.GraphReachableResult{}, err
+			}
+			remaining := request.MaxScannedEdges - result.ScannedEdges
+			edges, err := tx.GetOutgoingEdgesByType(source, request.EdgeType, remaining+1)
+			if err != nil {
+				return types.GraphReachableResult{}, err
+			}
+			for _, edge := range edges {
+				result.ScannedEdges++
+				if result.ScannedEdges > request.MaxScannedEdges {
+					return types.GraphReachableResult{}, ErrGraphResourceLimit
+				}
+				if result.ScannedEdges&1023 == 0 {
+					if err := ctx.Err(); err != nil {
+						return types.GraphReachableResult{}, err
+					}
+				}
+				if _, ok := visited[edge.TargetID]; ok {
+					continue
+				}
+				visited[edge.TargetID] = struct{}{}
+				nextSet[edge.TargetID] = struct{}{}
+			}
+		}
+		next := make([]uint64, 0, len(nextSet))
+		for id := range nextSet {
+			next = append(next, id)
+		}
+		slices.Sort(next)
+		current = current[:0]
+		for _, id := range next {
+			node, err := tx.GetNode(id)
+			if err != nil {
+				return types.GraphReachableResult{}, err
+			}
+			if node == nil || (request.NodeLabel != "" && !containsGraphLabel(node.Labels, request.NodeLabel)) || !matchesGraphProperties(node.Properties, filters) {
+				continue
+			}
+			value, ok := node.Properties[request.ResultProperty]
+			if !ok {
+				return types.GraphReachableResult{}, fmt.Errorf("reachable node %d is missing result property %q", id, request.ResultProperty)
+			}
+			if size, err := encodedJSONSize(value); err != nil {
+				return types.GraphReachableResult{}, err
+			} else if size > MaxCellBytes {
+				return types.GraphReachableResult{}, ErrGraphResourceLimit
+			}
+			item := types.GraphReachableNode{Value: value, Distance: depth}
+			itemBytes, err := encodedJSONSize(item)
+			if err != nil {
+				return types.GraphReachableResult{}, err
+			}
+			if len(result.Nodes) != 0 {
+				itemBytes++ // JSON array comma.
+			}
+			encodedBytes += itemBytes
+			result.Nodes = append(result.Nodes, item)
+			if uint(len(result.Nodes)) > request.MaxResults {
+				return types.GraphReachableResult{}, ErrGraphResourceLimit
+			}
+			if encodedBytes > int(request.MaxBytes) {
+				return types.GraphReachableResult{}, ErrGraphResourceLimit
+			}
+			current = append(current, id)
+		}
+	}
+	return result, nil
+}
+
+func containsGraphLabel(labels []string, target string) bool { return slices.Contains(labels, target) }
+
+func matchesGraphProperties(properties map[string]any, filters map[string]any) bool {
+	for key, expected := range filters {
+		if actual, ok := properties[key]; !ok || !reflect.DeepEqual(actual, expected) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Materializer) GraphReadStream(ctx context.Context, stream string, afterSequence uint64, limit uint, wait time.Duration) ([]types.GraphStreamRecord, uint64, error) {
