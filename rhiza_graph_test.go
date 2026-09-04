@@ -3,6 +3,8 @@ package rhiza_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -11,6 +13,81 @@ import (
 
 	"github.com/mrchypark/rhiza"
 )
+
+func TestEmbeddedGraphReachableContract(t *testing.T) {
+	db, err := rhiza.Open(context.Background(), rhiza.Config{
+		NodeID:                        "n1",
+		DataDir:                       t.TempDir(),
+		LocalGraphNodePropertyIndexes: []rhiza.GraphNodePropertyIndex{{Label: "Concept", Property: "key"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i, cypher := range []string{
+		"CREATE (:Concept {key: 'a', workspace: 'w'})",
+		"CREATE (:Concept {key: 'b', workspace: 'w'})",
+		"CREATE (:Concept {key: 'c', workspace: 'w'})",
+		"CREATE (:Concept {key: 'd', workspace: 'w'})",
+		"MATCH (a:Concept {key: 'a'}), (c:Concept {key: 'c'}) CREATE (a)-[:REL]->(c)",
+		"MATCH (a:Concept {key: 'a'}), (b:Concept {key: 'b'}) CREATE (a)-[:REL]->(b)",
+		"MATCH (b:Concept {key: 'b'}), (d:Concept {key: 'd'}) CREATE (b)-[:REL]->(d)",
+	} {
+		if _, err := db.GraphExecute(context.Background(), rhiza.GraphCommand{RequestID: fmt.Sprintf("reachable-%d", i), Cypher: cypher}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := rhiza.GraphReachableRequest{
+		StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL",
+		NodeLabel: "Concept", NodeFilters: map[string]any{"workspace": "w"}, ResultProperty: "key",
+		MaxDepth: 2, MaxResults: 10, MaxScannedEdges: 10, MaxBytes: 1024, Consistency: rhiza.ConsistencyLocal,
+	}
+	result, err := db.GraphReachable(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []rhiza.GraphReachableNode{{Value: "b", Distance: 1}, {Value: "c", Distance: 1}, {Value: "d", Distance: 2}}
+	if !result.StartFound || !reflect.DeepEqual(result.Nodes, want) || result.ScannedEdges != 3 || result.AppliedSlot == 0 || result.ConsensusTip < result.AppliedSlot {
+		t.Fatalf("unexpected reachability result: %#v", result)
+	}
+	request.RequireAppliedSlot = &result.AppliedSlot
+	if pinned, err := db.GraphReachable(context.Background(), request); err != nil || !reflect.DeepEqual(pinned.Nodes, want) {
+		t.Fatalf("pinned result=%#v error=%v", pinned, err)
+	}
+
+	required := uint64(0)
+	request.RequireAppliedSlot = &required
+	if _, err := db.GraphReachable(context.Background(), request); !errors.Is(err, rhiza.ErrReadVersionMismatch) {
+		t.Fatalf("version error=%v, want ErrReadVersionMismatch", err)
+	}
+	request.RequireAppliedSlot = nil
+	request.MaxResults = 1
+	if limited, err := db.GraphReachable(context.Background(), request); !errors.Is(err, rhiza.ErrGraphResourceLimit) || len(limited.Nodes) != 0 {
+		t.Fatalf("limit result=%#v error=%v", limited, err)
+	}
+	request.MaxResults = 10
+	request.MaxBytes = 2
+	if limited, err := db.GraphReachable(context.Background(), request); !errors.Is(err, rhiza.ErrGraphResourceLimit) || len(limited.Nodes) != 0 {
+		t.Fatalf("byte limit result=%#v error=%v", limited, err)
+	}
+	request.MaxBytes = 1024
+	request.MaxScannedEdges = 1
+	if limited, err := db.GraphReachable(context.Background(), request); !errors.Is(err, rhiza.ErrGraphResourceLimit) || len(limited.Nodes) != 0 {
+		t.Fatalf("edge limit result=%#v error=%v", limited, err)
+	}
+	request.MaxScannedEdges = 10
+	request.StartValue = "missing"
+	if missing, err := db.GraphReachable(context.Background(), request); err != nil || missing.StartFound || len(missing.Nodes) != 0 {
+		t.Fatalf("missing result=%#v error=%v", missing, err)
+	}
+	if _, err := db.GraphExecute(context.Background(), rhiza.GraphCommand{RequestID: "reachable-duplicate", Cypher: "CREATE (:Concept {key: 'a', workspace: 'w'})"}); err != nil {
+		t.Fatal(err)
+	}
+	request.StartValue = "a"
+	if _, err := db.GraphReachable(context.Background(), request); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("duplicate start error=%v, want ErrInvalidRequest", err)
+	}
+}
 
 func TestEmbeddedGraphGoAPI(t *testing.T) {
 	db, err := rhiza.Open(context.Background(), rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})

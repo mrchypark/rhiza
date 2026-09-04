@@ -371,6 +371,46 @@ func TestGraphAndKVMaterializer(t *testing.T) {
 	}
 }
 
+func TestLocalGraphIndexIsReconciledAfterRestore(t *testing.T) {
+	ctx := context.Background()
+	source, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	value, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "source", Cypher: "CREATE (:Concept {key: 'a'})"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	files, _, cleanup, err := source.CheckpointFilesAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	target, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	if err := target.ConfigureLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{{Label: "Concept", Property: "key"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := target.RestoreCheckpoint(ctx, files); err != nil {
+		t.Fatal(err)
+	}
+	result, err := target.GraphReachable(ctx, types.GraphReachableRequest{
+		StartLabel: "Concept", StartProperty: "key", StartValue: "a", EdgeType: "REL", ResultProperty: "key",
+		MaxDepth: 1, MaxResults: 1, MaxScannedEdges: 1, MaxBytes: 128,
+	})
+	if err != nil || !result.StartFound || result.AppliedSlot != 1 {
+		t.Fatalf("restored reachability=%#v error=%v", result, err)
+	}
+}
+
 func TestGraphRestoreFailureReopensOriginalMaterializer(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

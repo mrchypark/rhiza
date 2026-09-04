@@ -30,6 +30,8 @@ var (
 	ErrOverloaded            = errors.New("mutation queue overloaded")
 	ErrDurabilityUnavailable = errors.New("object-store durability unavailable")
 	ErrCommitUnknown         = errors.New("commit outcome unknown")
+	ErrGraphResourceLimit    = errors.New("graph resource limit exceeded")
+	ErrReadVersionMismatch   = errors.New("read version mismatch")
 )
 
 // CommitUnknownError means a mutation may commit despite the failed call.

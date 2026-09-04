@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -21,6 +22,9 @@ type GraphQueryRequest struct {
 	Args        map[string]any `json:"args,omitempty"`
 	Consistency string         `json:"consistency,omitempty"`
 }
+
+type GraphReachableRequest = types.GraphReachableRequest
+type GraphReachableResult = types.GraphReachableResult
 
 type GraphStreamReadRequest struct {
 	Stream        string `json:"stream,omitempty"`
@@ -149,6 +153,31 @@ func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (typ
 		return types.GraphCommandResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
 	result.ConsensusTip = uint64(s.core.Tip())
+	return result, nil
+}
+
+func (s *Server) GraphReachable(ctx context.Context, request GraphReachableRequest) (GraphReachableResult, error) {
+	if err := materializer.ValidateGraphReachableRequest(request); err != nil {
+		return GraphReachableResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if err := s.readBarrier(ctx, request.Consistency); err != nil {
+		return GraphReachableResult{}, err
+	}
+	result, err := s.material.GraphReachable(ctx, request)
+	result.ConsensusTip = uint64(s.core.Tip())
+	if err != nil {
+		if ctx.Err() != nil {
+			return GraphReachableResult{}, ctx.Err()
+		}
+		switch {
+		case errors.Is(err, materializer.ErrGraphResourceLimit):
+			return GraphReachableResult{}, ErrGraphResourceLimit
+		case errors.Is(err, materializer.ErrReadVersionMismatch):
+			return result, fmt.Errorf("%w: %v", ErrReadVersionMismatch, err)
+		default:
+			return GraphReachableResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	}
 	return result, nil
 }
 

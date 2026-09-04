@@ -27,15 +27,22 @@ const (
 	ObjectStoreDurabilityBeforeAck ObjectStoreDurability = "before-ack"
 )
 
+// GraphNodePropertyIndex is node-local derived state rebuilt when a materializer is replaced.
+type GraphNodePropertyIndex struct {
+	Label    string `json:"label"`
+	Property string `json:"property"`
+}
+
 // ExecutionConfig holds runtime configuration.
 type ExecutionConfig struct {
-	ClusterID  ClusterID    `json:"cluster_id"`
-	NodeID     NodeID       `json:"node_id"`
-	DataDir    string       `json:"data_dir"`
-	BindAddr   string       `json:"bind_addr"`
-	PeerAddr   string       `json:"peer_addr"`
-	AdminToken string       `json:"admin_token"`
-	Members    []NodeConfig `json:"members"`
+	ClusterID                     ClusterID                `json:"cluster_id"`
+	NodeID                        NodeID                   `json:"node_id"`
+	DataDir                       string                   `json:"data_dir"`
+	BindAddr                      string                   `json:"bind_addr"`
+	PeerAddr                      string                   `json:"peer_addr"`
+	AdminToken                    string                   `json:"admin_token"`
+	Members                       []NodeConfig             `json:"members"`
+	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex `json:"local_graph_node_property_indexes,omitempty"`
 
 	// Object store configuration
 	ObjStoreEndpoint               string                `json:"objstore_endpoint"`

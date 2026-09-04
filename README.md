@@ -144,6 +144,19 @@ Use `GraphQuery` or `POST /graph/query` for read-only `MATCH ... RETURN` and
 replicated mutations. Mutation statements are applied atomically with their
 request receipt and optional stream events.
 
+The embedded `GraphReachable` API performs a bounded outgoing traversal on one
+immutable local graph snapshot. Callers must provide depth, result, scanned-edge,
+and encoded-byte limits. It reports `StartFound`, `AppliedSlot`, and
+`ConsensusTip`, supports an optional `RequireAppliedSlot` precondition, and
+orders results by distance then internal node ID. A limit failure returns
+`ErrGraphResourceLimit` without partial nodes.
+
+The exported `MaxGraphReachable*` constants expose the library ceilings.
+
+Declare lookup indexes with `Config.LocalGraphNodePropertyIndexes`. These
+indexes are node-local derived state: they are not replicated, and Rhiza
+reconciles them when the node opens or installs a checkpoint.
+
 The dependency owns the complete language contract. See the version-pinned
 [`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/docs/engine_conformance.md#supported-cypher-subset)
 and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/internal/engine/testdata/query_grammar.ebnf).
