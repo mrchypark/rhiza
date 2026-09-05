@@ -48,6 +48,14 @@ func run(ctx context.Context) (resultErr error) {
 	if err != nil || maxWALBytes < 0 {
 		return errors.New("invalid RHIZA_MAX_WAL_BYTES")
 	}
+	maxConcurrentReads, err := strconv.Atoi(getEnvOrDefault("RHIZA_MAX_CONCURRENT_READS", "0"))
+	if err != nil || maxConcurrentReads < 0 {
+		return errors.New("invalid RHIZA_MAX_CONCURRENT_READS")
+	}
+	maxLongPollReads, err := strconv.Atoi(getEnvOrDefault("RHIZA_MAX_LONG_POLL_READS", "0"))
+	if err != nil || maxLongPollReads < 0 || maxConcurrentReads == 0 && maxLongPollReads != 0 || maxLongPollReads > maxConcurrentReads {
+		return errors.New("invalid RHIZA_MAX_LONG_POLL_READS")
+	}
 	objStoreSyncInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_SYNC_INTERVAL", "1m"))
 	if err != nil || objStoreSyncInterval < 0 {
 		return errors.New("invalid RHIZA_OBJSTORE_SYNC_INTERVAL")
@@ -113,6 +121,8 @@ func run(ctx context.Context) (resultErr error) {
 		CheckpointInterval:             checkpointInterval,
 		CheckpointTailBytes:            checkpointTailBytes,
 		MaxWALBytes:                    maxWALBytes,
+		MaxConcurrentReads:             maxConcurrentReads,
+		MaxLongPollReads:               maxLongPollReads,
 	}
 
 	role := getEnvOrDefault("RHIZA_ROLE", "voter")
@@ -148,6 +158,7 @@ func run(ctx context.Context) (resultErr error) {
 			ObjStoreAzureClientID: config.ObjStoreAzureClientID, ObjStoreAzureClientSecret: config.ObjStoreAzureClientSecret,
 			ObjStoreAzureStorageAccount: config.ObjStoreAzureStorageAccount, ObjStoreAzureStorageAccountKey: config.ObjStoreAzureStorageAccountKey,
 			ObjStoreAzureConnectionString: config.ObjStoreAzureConnectionString, ObjStoreAzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
+			MaxConcurrentReads: config.MaxConcurrentReads, MaxLongPollReads: config.MaxLongPollReads,
 		}
 		var replica *rhiza.ReadReplica
 		if role == "learner" {

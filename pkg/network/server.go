@@ -87,6 +87,30 @@ type Server struct {
 	syncLimit         chan struct{}
 	checkpointPrepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
 	compactedHandler  func()
+	readAdmissionMu   sync.RWMutex
+	readAdmission     *readAdmission
+}
+
+// ReadAdmissionLimits bounds concurrent read work in one Server. Long-poll
+// stream reads additionally use MaxLongPoll so they leave capacity for normal
+// queries. Configure the limits before exposing the Server.
+type ReadAdmissionLimits struct {
+	MaxConcurrent int
+	MaxLongPoll   int
+}
+
+var defaultReadAdmissionLimits = ReadAdmissionLimits{MaxConcurrent: 64, MaxLongPoll: 8}
+
+type readAdmission struct {
+	concurrent chan struct{}
+	longPoll   chan struct{}
+}
+
+func newReadAdmission(limits ReadAdmissionLimits) (*readAdmission, error) {
+	if limits.MaxConcurrent <= 0 || limits.MaxLongPoll < 0 || limits.MaxLongPoll > limits.MaxConcurrent {
+		return nil, fmt.Errorf("invalid read admission limits")
+	}
+	return &readAdmission{concurrent: make(chan struct{}, limits.MaxConcurrent), longPoll: make(chan struct{}, limits.MaxLongPoll)}, nil
 }
 
 // ReplicaStatus is the observable catch-up state of a non-voting replica.
@@ -168,6 +192,11 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		localCap:     make(chan struct{}, maxLocalProposals),
 		syncLimit:    make(chan struct{}, 2),
 	}
+	admission, err := newReadAdmission(defaultReadAdmissionLimits)
+	if err != nil {
+		panic(err)
+	}
+	s.readAdmission = admission
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
@@ -176,6 +205,47 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	s.kvBatcher = newKVBatcher(s.propose, nil)
 	s.routes()
 	return s
+}
+
+// SetReadAdmissionLimits replaces admission limits for subsequently started
+// reads. It is intended for setup before the Server is exposed.
+func (s *Server) SetReadAdmissionLimits(limits ReadAdmissionLimits) error {
+	admission, err := newReadAdmission(limits)
+	if err != nil {
+		return err
+	}
+	s.readAdmissionMu.Lock()
+	s.readAdmission = admission
+	s.readAdmissionMu.Unlock()
+	return nil
+}
+
+func (s *Server) acquireRead(ctx context.Context, longPoll bool) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.readAdmissionMu.RLock()
+	admission := s.readAdmission
+	s.readAdmissionMu.RUnlock()
+	select {
+	case admission.concurrent <- struct{}{}:
+	default:
+		return nil, ErrOverloaded
+	}
+	if longPoll {
+		select {
+		case admission.longPoll <- struct{}{}:
+		default:
+			<-admission.concurrent
+			return nil, ErrOverloaded
+		}
+	}
+	return func() {
+		if longPoll {
+			<-admission.longPoll
+		}
+		<-admission.concurrent
+	}, nil
 }
 
 // Close stops background request batching.
@@ -710,7 +780,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	resp, err := s.Query(r.Context(), req)
+	release, err := s.acquireRead(r.Context(), false)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	resp, err := s.query(r.Context(), req)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -721,6 +797,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 // Query reads SQL locally or after a linearizable consensus barrier.
 func (s *Server) Query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
+	release, err := s.acquireRead(ctx, false)
+	if err != nil {
+		return QueryResponse{}, err
+	}
+	defer release()
+	return s.query(ctx, req)
+}
+
+func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, error) {
 	if req.SQL == "" {
 		return QueryResponse{}, fmt.Errorf("%w: sql is required", ErrInvalidRequest)
 	}
@@ -911,7 +996,13 @@ func (s *Server) handleKVGet(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", "key is required and the request must be valid JSON")
 		return
 	}
-	response, err := s.KVGet(r.Context(), KVGetRequest{Key: req.Key, Consistency: req.Consistency})
+	release, err := s.acquireRead(r.Context(), false)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	response, err := s.kvGet(r.Context(), KVGetRequest{Key: req.Key, Consistency: req.Consistency})
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -921,6 +1012,15 @@ func (s *Server) handleKVGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) KVGet(ctx context.Context, req KVGetRequest) (KVGetResponse, error) {
+	release, err := s.acquireRead(ctx, false)
+	if err != nil {
+		return KVGetResponse{}, err
+	}
+	defer release()
+	return s.kvGet(ctx, req)
+}
+
+func (s *Server) kvGet(ctx context.Context, req KVGetRequest) (KVGetResponse, error) {
 	if req.Key == "" {
 		return KVGetResponse{}, fmt.Errorf("%w: key is required", ErrInvalidRequest)
 	}

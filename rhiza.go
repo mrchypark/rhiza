@@ -102,6 +102,10 @@ type Config struct {
 	CheckpointInterval             time.Duration
 	CheckpointTailBytes            int64
 	MaxWALBytes                    int64
+	// Both zero use 64 concurrent reads / 8 long-poll reads. With an explicit
+	// total, zero MaxLongPollReads disables waiting stream reads.
+	MaxConcurrentReads int
+	MaxLongPollReads   int
 	// LocalGraphNodePropertyIndexes are node-local derived indexes. Rhiza
 	// reconciles them at open and after checkpoint restore; they are not replicated.
 	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex
@@ -205,6 +209,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		ObjStoreBatchDelay: config.ObjStoreBatchDelay,
 		ObjStoreGCInterval: config.ObjStoreGCInterval, ObjStoreGCGracePeriod: config.ObjStoreGCGracePeriod,
 		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes,
+		MaxConcurrentReads: config.MaxConcurrentReads, MaxLongPollReads: config.MaxLongPollReads,
 		LocalGraphNodePropertyIndexes: slices.Clone(config.LocalGraphNodePropertyIndexes),
 	}
 	n := node.New(internalConfig)

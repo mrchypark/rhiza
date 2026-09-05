@@ -1,0 +1,28 @@
+File: materializer.test
+Type: cpu
+Time: 2026-09-05 11:04:34 KST
+Duration: 6.73s, Total samples = 5.33s (79.25%)
+Showing nodes accounting for 4.52s, 84.80% of 5.33s total
+Dropped 193 nodes (cum <= 0.03s)
+Showing top 20 nodes out of 216
+      flat  flat%   sum%        cum   cum%
+     1.37s 25.70% 25.70%      1.37s 25.70%  syscall.rawsyscalln
+     0.48s  9.01% 34.71%      0.92s 17.26%  runtime.scanObjectsSmall
+     0.44s  8.26% 42.96%      0.44s  8.26%  runtime.pthread_cond_wait
+     0.43s  8.07% 51.03%      0.53s  9.94%  runtime.tryDeferToSpanScan
+     0.35s  6.57% 57.60%      0.35s  6.57%  runtime.usleep
+     0.24s  4.50% 62.10%      0.45s  8.44%  runtime.mapassign_faststr
+     0.18s  3.38% 65.48%      0.18s  3.38%  runtime.pthread_cond_signal
+     0.17s  3.19% 68.67%      0.41s  7.69%  runtime.scanObject
+     0.16s  3.00% 71.67%      0.32s  6.00%  internal/runtime/maps.(*Iter).Next
+     0.11s  2.06% 73.73%      0.11s  2.06%  runtime.findObject
+     0.09s  1.69% 75.42%      0.09s  1.69%  runtime.extractHeapBitsSmall
+     0.08s  1.50% 76.92%      0.08s  1.50%  runtime.memclrNoHeapPointers
+     0.08s  1.50% 78.42%      0.08s  1.50%  runtime.pthread_kill
+     0.07s  1.31% 79.74%      1.03s 19.32%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).ensureAppMetadataWritable
+     0.06s  1.13% 80.86%      0.20s  3.75%  gcWriteBarrier
+     0.06s  1.13% 81.99%      0.06s  1.13%  runtime.(*spanScanOwnership).or (inline)
+     0.05s  0.94% 82.93%      0.05s  0.94%  internal/runtime/maps.(*Map).directoryIndex (inline)
+     0.04s  0.75% 83.68%      0.04s  0.75%  internal/runtime/atomic.(*UnsafePointer).Load
+     0.03s  0.56% 84.24%      0.03s  0.56%  internal/abi.(*MapType).IndirectKey (inline)
+     0.03s  0.56% 84.80%      0.03s  0.56%  internal/runtime/maps.(*ctrlGroup).get (inline)

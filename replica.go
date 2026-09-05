@@ -23,6 +23,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	thanosobjstore "github.com/thanos-io/objstore"
 )
 
 type ReplicaMode string
@@ -41,6 +42,10 @@ type ReplicaConfig struct {
 	AdminToken   string
 	Members      []ReplicaMember
 	SyncInterval time.Duration
+	// Both zero use 64 concurrent reads / 8 long-poll reads. With an explicit
+	// total, zero MaxLongPollReads disables waiting stream reads.
+	MaxConcurrentReads int
+	MaxLongPollReads   int
 
 	ObjStoreEndpoint               string
 	ObjStoreBucket                 string
@@ -111,6 +116,8 @@ type ReadReplica struct {
 	closeOnce   sync.Once
 	closeErr    error
 	peerCursor  int
+	pinOwner    string
+	syncedHead  *thanosobjstore.ObjectVersion
 }
 
 // OpenReadReplica follows certified checkpoint/archive state only.
@@ -125,6 +132,9 @@ func OpenLearner(ctx context.Context, config ReplicaConfig) (*ReadReplica, error
 }
 
 func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_ *ReadReplica, resultErr error) {
+	if config.MaxConcurrentReads < 0 || config.MaxLongPollReads < 0 || config.MaxLongPollReads > config.MaxConcurrentReads {
+		return nil, fmt.Errorf("read admission requires 0 <= max long-poll reads <= max concurrent reads")
+	}
 	if config.DataDir == "" || config.ReplicaID == "" {
 		return nil, fmt.Errorf("replica ID and data directory are required")
 	}
@@ -243,6 +253,13 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	r.statusMu.Unlock()
 	r.ready.Store(true)
 	r.api = network.NewServer(r.core, r.material, types.ClusterID(config.ClusterID), false, nil, r.ready.Load)
+	if config.MaxConcurrentReads != 0 {
+		if err := r.api.SetReadAdmissionLimits(network.ReadAdmissionLimits{
+			MaxConcurrent: config.MaxConcurrentReads, MaxLongPoll: config.MaxLongPollReads,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	r.api.SetObjectStoreStats(func() (map[string]uint64, bool) { return objectStatsMap(r.bucket.Stats()), true })
 	r.api.SetReplicaStatus(func() network.ReplicaStatus {
 		status := r.Status()
@@ -481,15 +498,39 @@ func (r *ReadReplica) syncObjectStore(ctx context.Context) (resultErr error) {
 	if floor := r.core.CompactionFloor(); seal.Index < floor {
 		return fmt.Errorf("object-store checkpoint base %d regressed behind replica floor %d", seal.Index, floor)
 	}
-	owner, err := replicaOwner(r.config.ReplicaID)
-	if err != nil {
-		return err
+	version, versioned := r.archive.HeadVersion()
+	// The previous successful pass verified this exact history. No object data
+	// is consumed here, so there is nothing to protect from GC with a pin.
+	if versioned && r.syncedHead != nil && *r.syncedHead == version &&
+		r.core.Tip() == r.archive.Tip() && r.material.Tip() == uint64(r.core.Tip()) &&
+		r.core.CompactionFloor() == seal.Index {
+		r.setSource("object-store", uint64(r.archive.Tip()))
+		return nil
 	}
+	r.syncedHead = nil
+	if r.pinOwner == "" {
+		var err error
+		r.pinOwner, err = replicaOwner(r.config.ReplicaID)
+		if err != nil {
+			return err
+		}
+	}
+	owner := r.pinOwner
+	// Run after pin cleanup and renewal have completed. A failed release must
+	// not allow reuse of an owner whose previous lease may still be active.
+	defer func() {
+		if resultErr != nil {
+			r.pinOwner = ""
+		} else if versioned {
+			r.syncedHead = &version
+		}
+	}()
 	snapshot, err := r.archive.BeginRecoverySnapshot(ctx, owner, 2*time.Minute)
 	if err != nil {
 		return err
 	}
-	defer closeRecoverySnapshot(snapshot)
+	defer func() { resultErr = errors.Join(resultErr, closeRecoverySnapshot(snapshot)) }()
+	version, versioned = r.archive.HeadVersion()
 	seal, baseDecision, hasBase = snapshot.RecoveryBase()
 	if !hasBase {
 		return fmt.Errorf("recovery snapshot omitted checkpoint base")
@@ -512,7 +553,7 @@ func (r *ReadReplica) syncObjectStore(ctx context.Context) (resultErr error) {
 		if err != nil {
 			return err
 		}
-		defer closeCheckpointPin(checkpointPin)
+		defer func() { resultErr = errors.Join(resultErr, closeCheckpointPin(checkpointPin)) }()
 	}
 	renewDone := make(chan error, 1)
 	go renewReplicaPins(workCtx, cancel, snapshot, checkpointPin, renewDone)
@@ -638,16 +679,16 @@ func renewReplicaPins(ctx context.Context, cancel context.CancelFunc, snapshot *
 	}
 }
 
-func closeRecoverySnapshot(snapshot *recovery.RecoverySnapshot) {
+func closeRecoverySnapshot(snapshot *recovery.RecoverySnapshot) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = snapshot.Close(ctx)
+	return snapshot.Close(ctx)
 }
 
-func closeCheckpointPin(pin *checkpoint.RecoveryPin) {
+func closeCheckpointPin(pin *checkpoint.RecoveryPin) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = pin.Close(ctx)
+	return pin.Close(ctx)
 }
 
 func (r *ReadReplica) setSource(source string, tip uint64) {
@@ -664,7 +705,11 @@ func objectStatsMap(stats objstore.Stats) map[string]uint64 {
 		"s3_http_failures": stats.S3HTTPFailures, "condition_conflicts": stats.ConditionConflicts,
 		"dedup_hits": stats.DedupHits, "sdk_retries": stats.SDKRetries,
 		"transport_failures": stats.TransportFailures, "http_4xx_unexpected": stats.Unexpected4xx,
-		"http_5xx": stats.HTTP5xx,
+		"http_5xx":      stats.HTTP5xx,
+		"http_requests": stats.HTTPRequests, "http_failures": stats.HTTPFailures,
+		"http_get_requests": stats.HTTPGetRequests, "http_put_requests": stats.HTTPPutRequests,
+		"http_head_requests": stats.HTTPHeadRequests, "http_delete_requests": stats.HTTPDeleteRequests,
+		"http_other_requests": stats.HTTPOtherRequests,
 	}
 }
 
@@ -691,6 +736,9 @@ func (r *ReadReplica) KVGet(ctx context.Context, req KVGetRequest) (KVGetRespons
 }
 func (r *ReadReplica) GraphQuery(ctx context.Context, req GraphQueryRequest) (GraphResult, error) {
 	return r.api.GraphQuery(ctx, req)
+}
+func (r *ReadReplica) GraphReachable(ctx context.Context, req GraphReachableRequest) (GraphReachableResult, error) {
+	return r.api.GraphReachable(ctx, req)
 }
 func (r *ReadReplica) GraphChanges(ctx context.Context, req GraphStreamReadRequest) (GraphStreamReadResponse, error) {
 	return r.api.GraphChanges(ctx, req)
