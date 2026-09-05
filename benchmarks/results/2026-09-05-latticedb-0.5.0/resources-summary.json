@@ -1,0 +1,14 @@
+{
+  "030": {
+    "samples": 10,
+    "process_cpu_seconds_median": 0.435,
+    "process_peak_rss_mib_median": 75.4375,
+    "scope": "entire process including setup/cleanup for GraphApply, metadata update and graph query; excludes separate snapshot and HTTP invocations"
+  },
+  "050": {
+    "samples": 10,
+    "process_cpu_seconds_median": 0.44999999999999996,
+    "process_peak_rss_mib_median": 75.71875,
+    "scope": "entire process including setup/cleanup for GraphApply, metadata update and graph query; excludes separate snapshot and HTTP invocations"
+  }
+}

@@ -1,0 +1,15 @@
+goos: darwin
+goarch: arm64
+pkg: latticedb-snapshot-contention-repro
+cpu: Apple M3
+BenchmarkAppMetadataOneKey/1-8 	     100	    437549 ns/op	    8320 B/op	      34 allocs/op
+BenchmarkAppMetadataOneKey/1-8 	     100	    429032 ns/op	    8320 B/op	      34 allocs/op
+BenchmarkAppMetadataOneKey/1-8 	     100	   1078940 ns/op	    8328 B/op	      34 allocs/op
+BenchmarkAppMetadataOneKey/4096-8         	     100	    255341 ns/op	    9433 B/op	      36 allocs/op
+BenchmarkAppMetadataOneKey/4096-8         	     100	    104347 ns/op	    9424 B/op	      36 allocs/op
+BenchmarkAppMetadataOneKey/4096-8         	     100	     67336 ns/op	    9418 B/op	      36 allocs/op
+BenchmarkAppMetadataOneKey/16384-8        	     100	    167823 ns/op	   13386 B/op	      36 allocs/op
+BenchmarkAppMetadataOneKey/16384-8        	     100	    202474 ns/op	   13395 B/op	      36 allocs/op
+BenchmarkAppMetadataOneKey/16384-8        	     100	    119528 ns/op	   13386 B/op	      36 allocs/op
+PASS
+ok  	latticedb-snapshot-contention-repro	5.065s

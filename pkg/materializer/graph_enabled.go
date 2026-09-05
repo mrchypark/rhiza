@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -64,14 +65,31 @@ type graphSnapshot struct {
 	snapshot *latticedb.Snapshot
 }
 
-func (m *Materializer) beginGraphSnapshot() (*graphSnapshot, error) {
+func (m *Materializer) beginGraphSnapshot(ctx context.Context) (*graphSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.graph.mu.Lock()
 	defer m.graph.mu.Unlock()
-	snapshot, err := m.graph.db.BeginSnapshot()
-	if err != nil {
-		return nil, err
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		snapshot, err := m.graph.db.BeginSnapshot()
+		if !errors.Is(err, latticedb.ErrWriteTxActive) {
+			if err != nil {
+				return nil, err
+			}
+			return &graphSnapshot{snapshot: snapshot}, nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return &graphSnapshot{snapshot: snapshot}, nil
 }
 
 func (snapshot *graphSnapshot) Backup(path string) error { return snapshot.snapshot.Backup(path) }
@@ -307,6 +325,9 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 			err = g.applyCommand(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough)
 		}
 		if err != nil {
+			if isRetryableGraphApplyError(err) {
+				return err
+			}
 			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough); recordErr != nil {
 				return recordErr
 			}
@@ -316,6 +337,13 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	close(g.streamWake)
 	g.streamWake = make(chan struct{})
 	return nil
+}
+
+func isRetryableGraphApplyError(err error) bool {
+	// LatticeDB v0.5 shares ErrResourceLimit between query limits and transient
+	// checkpoint backpressure; only the latter must not become a durable rejection.
+	return errors.Is(err, latticedb.ErrWriteTxActive) ||
+		(errors.Is(err, latticedb.ErrResourceLimit) && strings.Contains(err.Error(), "WAL checkpoint is in progress"))
 }
 
 func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {

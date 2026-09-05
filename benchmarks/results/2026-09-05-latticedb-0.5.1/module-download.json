@@ -1,0 +1,16 @@
+{
+	"Path": "github.com/mrchypark/latticedb-go",
+	"Version": "v0.5.1",
+	"Info": "/Users/cypark/go/pkg/mod/cache/download/github.com/mrchypark/latticedb-go/@v/v0.5.1.info",
+	"GoMod": "/Users/cypark/go/pkg/mod/cache/download/github.com/mrchypark/latticedb-go/@v/v0.5.1.mod",
+	"Zip": "/Users/cypark/go/pkg/mod/cache/download/github.com/mrchypark/latticedb-go/@v/v0.5.1.zip",
+	"Dir": "/Users/cypark/go/pkg/mod/github.com/mrchypark/latticedb-go@v0.5.1",
+	"Sum": "h1:mrXz7LlApwKlSr6fQ7vqMyXVSdW7BadgpvUBsHajD34=",
+	"GoModSum": "h1:zBf3fWXvnArVT2EO47AZc2nihz4kzas+Mj04IT2f6V8=",
+	"Origin": {
+		"VCS": "git",
+		"URL": "https://github.com/mrchypark/latticedb-go",
+		"Hash": "33293c219a2c33ec0222cebca06291013a0c14f7",
+		"Ref": "refs/tags/v0.5.1"
+	}
+}

@@ -1,0 +1,66 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-2                         	     100	    351020 ns/op	   54105 B/op	     280 allocs/op
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	     100	    189356 ns/op	  396649 B/op	      44 allocs/op
+BenchmarkGraphQuery4096Nodes-2                	     100	    946652 ns/op	 1687878 B/op	   12330 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-2         	      10	   2672062 ns/op	         1.334 db-MiB	  396577 B/op	      19 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-2        	      10	  16170558 ns/op	        21.33 db-MiB	 7778427 B/op	      19 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-2        	      10	  51913075 ns/op	        85.33 db-MiB	53729109 B/op	      21 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkHTTPQueryLoopback-2   	    1000	     36728 ns/op	   10585 B/op	     150 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-2                         	     100	    430906 ns/op	   54092 B/op	     280 allocs/op
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	     100	    189377 ns/op	  396601 B/op	      43 allocs/op
+BenchmarkGraphQuery4096Nodes-2                	     100	   1136591 ns/op	 1687893 B/op	   12330 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-2         	      10	   5345725 ns/op	         1.334 db-MiB	  396612 B/op	      19 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-2        	      10	  26655729 ns/op	        21.33 db-MiB	 3926537 B/op	      19 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-2        	      10	  71099962 ns/op	        85.33 db-MiB	53729163 B/op	      22 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkHTTPQueryLoopback-2   	    1000	     58209 ns/op	   10563 B/op	     150 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-2                         	     100	    764925 ns/op	   54118 B/op	     280 allocs/op
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	     100	    194387 ns/op	  396596 B/op	      43 allocs/op
+BenchmarkGraphQuery4096Nodes-2                	     100	   1048616 ns/op	 1687881 B/op	   12330 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-2         	      10	   5138138 ns/op	         1.334 db-MiB	  396608 B/op	      19 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-2        	      10	  24200912 ns/op	        21.33 db-MiB	 7778506 B/op	      20 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-2        	      10	  88566166 ns/op	        85.33 db-MiB	53729206 B/op	      22 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkHTTPQueryLoopback-2   	    1000	     29362 ns/op	   10584 B/op	     150 allocs/op
+PASS
