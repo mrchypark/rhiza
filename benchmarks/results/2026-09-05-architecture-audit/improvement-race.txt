@@ -1,0 +1,5 @@
+ok  	github.com/mrchypark/rhiza	34.859s
+ok  	github.com/mrchypark/rhiza/pkg/network	22.369s
+ok  	github.com/mrchypark/rhiza/internal/objstore	3.028s
+ok  	github.com/mrchypark/rhiza/pkg/recovery	24.069s
+ok  	github.com/mrchypark/rhiza/pkg/node	4.875s

@@ -1,0 +1,19 @@
+{
+  "basis": "static logical-operation model, same-process previously verified unchanged archive head/base, no retries/conflicts/renewals",
+  "per_successful_sync": {
+    "HEAD": 8,
+    "GET": 5,
+    "PUT": 4
+  },
+  "successful_syncs_per_second_assumed": 1,
+  "replicas_assumed": 1,
+  "per_day": {
+    "HEAD": 691200,
+    "GET": 432000,
+    "PUT": 345600
+  },
+  "daily_total": 1468800,
+  "new_expired_pin_keys_per_day": 86400,
+  "proposed_steady_sync_calls": 1,
+  "proposed_reduction_percent": 94.11764705882354
+}

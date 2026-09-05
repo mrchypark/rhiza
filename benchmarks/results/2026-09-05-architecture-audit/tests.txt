@@ -1,0 +1,16 @@
+ok  	github.com/mrchypark/rhiza	28.610s
+ok  	github.com/mrchypark/rhiza/cmd/rhiza	0.748s
+ok  	github.com/mrchypark/rhiza/cmd/rhiza-bench	2.207s
+ok  	github.com/mrchypark/rhiza/deploy/k8s	2.479s
+ok  	github.com/mrchypark/rhiza/e2e	2.516s
+ok  	github.com/mrchypark/rhiza/internal/objstore	1.395s
+ok  	github.com/mrchypark/rhiza/internal/types	1.361s
+ok  	github.com/mrchypark/rhiza/pkg/checkpoint	2.128s
+ok  	github.com/mrchypark/rhiza/pkg/materializer	24.712s
+ok  	github.com/mrchypark/rhiza/pkg/network	21.891s
+?   	github.com/mrchypark/rhiza/pkg/network/peerfb	[no test files]
+ok  	github.com/mrchypark/rhiza/pkg/node	0.834s
+ok  	github.com/mrchypark/rhiza/pkg/qlog	5.297s
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	22.420s
+?   	github.com/mrchypark/rhiza/pkg/quepaxa/walfb	[no test files]
+ok  	github.com/mrchypark/rhiza/pkg/recovery	12.862s

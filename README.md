@@ -233,6 +233,17 @@ serve the read routes but return HTTP 503 for mutations. The HTTP adapter has no
 built-in client authentication and must not be exposed directly to an
 untrusted network.
 
+SQL, KV, and Graph reads share a per-instance admission limit: 64 concurrent
+reads, including at most 8 waiting graph-stream reads. Saturation returns
+`ErrOverloaded` (HTTP 503). `Config` and `ReplicaConfig` accept
+`MaxConcurrentReads` and `MaxLongPollReads`; both zero use the defaults, while
+an explicit total with zero long polls disables waiting stream reads. The CLI
+exposes `RHIZA_MAX_CONCURRENT_READS` and `RHIZA_MAX_LONG_POLL_READS`.
+HTTP reads retain their slot until the response write completes; embedded
+calls release it on return. This bounds active reads, not total process memory
+or results retained by callers. Request-status checks and SSE use their
+existing paths separately.
+
 ## Non-voting read replicas
 
 Read replicas serve the SQL, Graph, KV, graph-stream, request-status, and HTTP
@@ -265,6 +276,17 @@ receive voter tokens. Build token-free pinned peer identities with
 `GET /replica/status` reports the mode, applied slot, observed source tip, lag,
 source, last sync time, and last error. Replica `Ready` means local recovery
 completed, not that the copy is current.
+
+After a successful certified recovery, an unchanged archive head with no local
+apply gap requires only one metadata check per sync. New heads and restarts
+still use recovery pins and certificate validation. A running replica reuses
+its pin owner across successful recovery passes, so idle polling does not
+create a new pin object each time.
+
+`/metrics/object-store` exposes logical bucket calls separately from actual
+`http_requests`, `http_failures`, and HTTP method counters. Legacy `s3_http_*`
+fields remain aliases. HTTP counts include SDK attempts, not a provider billing
+estimate; `sdk_retries` currently recognizes the AWS retry header only.
 
 ## Storage, durability, and recovery
 

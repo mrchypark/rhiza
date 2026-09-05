@@ -1,0 +1,37 @@
+{
+  "date": "2026-09-05",
+  "commit": "f6c01b19ea6957a4dbdfd5636a7fdb5ffaad2c35",
+  "go": "go version go1.27.0 darwin/arm64",
+  "os_arch": "darwin/arm64",
+  "cpu": "Apple M3",
+  "model": "Mac15,13",
+  "logical_cpus": 8,
+  "memory_bytes": 25769803776,
+  "gomaxprocs": 4,
+  "microbench_samples": 3,
+  "microbench_benchtime": "500ms",
+  "graph_profile_benchtime": "3s",
+  "graph_dependency": "github.com/mrchypark/latticedb-go v0.3.0",
+  "conditions": [
+    "Shared development host, not isolated performance runner",
+    "No paired baseline/candidate comparison",
+    "Microbenchmark network calls bypass HTTP",
+    "Graph benchmark dataset grows with b.N",
+    "Profiles are separate from unprofiled samples",
+    "No production or real cloud workload was run"
+  ],
+  "verification": {
+    "tests": "passed, GOMAXPROCS=4 go test ./... -count=1",
+    "vet": "passed, GOMAXPROCS=4 go vet ./...",
+    "remote_e2e": "opt-in URL absent; skipped",
+    "race": "not run"
+  },
+  "commands": [
+    "GOMAXPROCS=4 go test ./pkg/network ./pkg/materializer ./pkg/qlog -run '^$' -bench '^(BenchmarkServerQuery|BenchmarkSQLBatchApply|BenchmarkGraphApply|BenchmarkCheckpointFilesAt|BenchmarkWALAppendSync|BenchmarkWALScanScratch)$' -benchmem -benchtime=500ms -count=3",
+    "GOMAXPROCS=4 go test ./... -count=1",
+    "GOMAXPROCS=4 go vet ./...",
+    "GOMAXPROCS=4 go test ./pkg/materializer -run '^$' -bench '^BenchmarkGraphApply$' -benchtime=3s -count=1 -cpuprofile <OUT>/graph-cpu.pprof -memprofile <OUT>/graph-mem.pprof -o <TMP>/materializer.test",
+    "go tool pprof -top -nodecount=20 <TMP>/materializer.test <OUT>/graph-cpu.pprof",
+    "go tool pprof -top -alloc_space -nodecount=20 <TMP>/materializer.test <OUT>/graph-mem.pprof"
+  ]
+}

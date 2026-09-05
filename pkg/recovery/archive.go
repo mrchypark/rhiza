@@ -456,6 +456,17 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead
 	return nil
 }
 
+// HeadVersion returns the conditional-write identity of the loaded archive head.
+// Call Load before using it to check whether remote state has changed.
+func (m *Manager) HeadVersion() (objstore.ObjectVersion, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.headCAS == nil {
+		return objstore.ObjectVersion{}, false
+	}
+	return *m.headCAS, true
+}
+
 func (m *Manager) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.DecidedValue, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

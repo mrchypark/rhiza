@@ -1,0 +1,27 @@
+File: materializer.test
+Type: alloc_space
+Time: 2026-09-05 11:04:40 KST
+Showing nodes accounting for 5404.40MB, 95.73% of 5645.30MB total
+Dropped 212 nodes (cum <= 28.23MB)
+Showing top 20 nodes out of 49
+      flat  flat%   sum%        cum   cum%
+ 5223.04MB 92.52% 92.52%  5223.04MB 92.52%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).ensureAppMetadataWritable (inline)
+   49.16MB  0.87% 93.39%    49.16MB  0.87%  maps.clone
+   39.07MB  0.69% 94.08%    55.07MB  0.98%  github.com/mrchypark/latticedb-go/internal/store.(*StreamStore).Publish
+   35.07MB  0.62% 94.70%    36.57MB  0.65%  github.com/mrchypark/latticedb-go/internal/store.(*ShardMap[go.shape.map[string]github.com/mrchypark/latticedb-go/internal/store.postingList]).CloneShardOnce
+   31.57MB  0.56% 95.26%    63.72MB  1.13%  github.com/mrchypark/latticedb-go/internal/store.(*ShardMap[go.shape.struct {}]).CloneShardOnce
+    6.62MB  0.12% 95.38%  5230.16MB 92.65%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).PutAppMetadata
+       4MB 0.071% 95.45%    48.08MB  0.85%  github.com/mrchypark/latticedb-go/internal/store.(*StringPostings).writable
+    3.37MB  0.06% 95.51%    53.72MB  0.95%  encoding/json/v2.makeStructArshaler.func2
+       3MB 0.053% 95.56%    73.58MB  1.30%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).appendNodeChanges
+    2.50MB 0.044% 95.61%  5638.22MB 99.87%  github.com/mrchypark/rhiza/pkg/materializer.BenchmarkGraphApply
+       2MB 0.035% 95.64%    50.02MB  0.89%  github.com/mrchypark/latticedb-go/internal/store.(*WALWriter).AppendDelta
+       1MB 0.018% 95.66%   157.33MB  2.79%  github.com/mrchypark/latticedb-go/internal/engine.(*Tx).QueryContext
+       1MB 0.018% 95.68%   142.83MB  2.53%  github.com/mrchypark/latticedb-go/internal/engine.(*createNodeClause).apply
+       1MB 0.018% 95.70%   145.83MB  2.58%  github.com/mrchypark/latticedb-go/internal/engine.(*queryPlan).execute
+       1MB 0.018% 95.71%  5566.63MB 98.61%  github.com/mrchypark/rhiza/pkg/materializer.(*Materializer).applyValueLocked
+    0.50MB 0.0089% 95.72%  5545.11MB 98.23%  github.com/mrchypark/rhiza/pkg/materializer.(*Materializer).applyGraph
+    0.50MB 0.0089% 95.73%    64.05MB  1.13%  github.com/mrchypark/latticedb-go/internal/store.writePersistedStateJSON
+         0     0% 95.73%    70.86MB  1.26%  encoding/json.Marshal (inline)
+         0     0% 95.73%    70.86MB  1.26%  encoding/json/v2.Marshal
+         0     0% 95.73%    40.86MB  0.72%  encoding/json/v2.makeMapArshaler.func2

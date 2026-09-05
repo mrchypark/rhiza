@@ -3,8 +3,10 @@ package objstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 
 	thanosobjstore "github.com/thanos-io/objstore"
@@ -19,6 +21,28 @@ type contextBucket struct {
 	thanosobjstore.Bucket
 	ctx context.Context
 }
+
+type readErrorBucket struct {
+	thanosobjstore.Bucket
+}
+
+func (b *readErrorBucket) Get(context.Context, string) (io.ReadCloser, error) {
+	return &readErrorCloser{Reader: strings.NewReader("ab")}, nil
+}
+
+type readErrorCloser struct {
+	*strings.Reader
+}
+
+func (r *readErrorCloser) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF {
+		return n, errors.New("response body read failed")
+	}
+	return n, err
+}
+
+func (r *readErrorCloser) Close() error { return nil }
 
 func (b *contextBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
 	b.ctx = ctx
@@ -56,8 +80,96 @@ func TestMeteredBucketCountsBytesAndHTTPAttempts(t *testing.T) {
 	request.Header.Set("amz-sdk-request", "attempt=2; max=3")
 	_, _ = transport.RoundTrip(request)
 	stats := bucket.Stats()
-	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 || stats.SDKRetries != 1 || stats.HTTP5xx != 1 {
+	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.HTTPRequests != 1 || stats.HTTPFailures != 1 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 || stats.HTTPGetRequests != 1 || stats.SDKRetries != 1 || stats.HTTP5xx != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestMeteredBucketClassifiesHTTPMethods(t *testing.T) {
+	metrics := &bucketMetrics{}
+	transport := metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	}))
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodHead, http.MethodDelete, http.MethodPost} {
+		request, err := http.NewRequest(method, "http://object.test/object", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transport.RoundTrip(request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics).Stats()
+	if stats.HTTPRequests != 5 || stats.HTTPGetRequests != 1 || stats.HTTPPutRequests != 1 || stats.HTTPHeadRequests != 1 || stats.HTTPDeleteRequests != 1 || stats.HTTPOtherRequests != 1 {
+		t.Fatalf("unexpected method stats: %+v", stats)
+	}
+}
+
+func TestAWSSDKRetry(t *testing.T) {
+	for header, want := range map[string]bool{
+		"attempt=1; max=10":  false,
+		"attempt=2; max=10":  true,
+		"attempt=10; max=10": true,
+		"attempt=unknown":    false,
+		"":                   false,
+	} {
+		if got := awsSDKRetry(header); got != want {
+			t.Errorf("awsSDKRetry(%q) = %t, want %t", header, got, want)
+		}
+	}
+}
+
+func TestMeteredBucketCountsResponseBodyReadFailure(t *testing.T) {
+	bucket := newMeteredBucket(&readErrorBucket{Bucket: thanosobjstore.NewInMemBucket()}, &bucketMetrics{})
+	reader, err := bucket.Get(context.Background(), "object")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := reader.Read(make([]byte, 2)); err == nil {
+			t.Fatal("Read succeeded, want response body read error")
+		}
+	}
+	stats := bucket.Stats()
+	if stats.Gets != 1 || stats.BytesDownloaded != 2 || stats.Failures != 1 || stats.HTTPRequests != 0 || stats.HTTPFailures != 0 || stats.S3HTTPRequests != 0 || stats.S3HTTPFailures != 0 || stats.TransportFailures != 0 {
+		t.Fatalf("unexpected response body failure stats: %+v", stats)
+	}
+}
+
+func TestHTTPResponseBodyReadFailureIsCountedOnce(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			metrics := &bucketMetrics{}
+			transport := metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: status, Body: &readErrorCloser{Reader: strings.NewReader("ab")}}, nil
+			}))
+			request, err := http.NewRequest(http.MethodGet, "http://object.test/object", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := transport.RoundTrip(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := response.Body.Read(make([]byte, 2)); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				if _, err := response.Body.Read(make([]byte, 2)); err == nil {
+					t.Fatal("Read succeeded, want response body read error")
+				}
+			}
+			if err := response.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			stats := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics).Stats()
+			if stats.HTTPRequests != 1 || stats.HTTPFailures != 1 || stats.S3HTTPFailures != 1 || stats.TransportFailures != 1 {
+				t.Fatalf("unexpected response body failure stats: %+v", stats)
+			}
+		})
 	}
 }
 

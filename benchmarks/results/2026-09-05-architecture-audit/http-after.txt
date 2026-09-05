@@ -1,0 +1,10 @@
+$ GOMAXPROCS=4 go test ./pkg/network -run '^$' -bench '^BenchmarkHTTPQueryLoopback$' -benchtime=500ms -count=3 -benchmem
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkHTTPQueryLoopback-4    10000     58070 ns/op    10847 B/op    150 allocs/op
+BenchmarkHTTPQueryLoopback-4     5751     99990 ns/op    10761 B/op    150 allocs/op
+BenchmarkHTTPQueryLoopback-4    13136    106939 ns/op    10666 B/op    150 allocs/op
+PASS
+ok      github.com/mrchypark/rhiza/pkg/network  11.430s

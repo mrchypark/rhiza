@@ -132,7 +132,13 @@ func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	result, err := s.GraphQuery(r.Context(), request)
+	release, err := s.acquireRead(r.Context(), false)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	result, err := s.graphQuery(r.Context(), request)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -142,6 +148,15 @@ func (s *Server) handleGraphQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (types.GraphCommandResult, error) {
+	release, err := s.acquireRead(ctx, false)
+	if err != nil {
+		return types.GraphCommandResult{}, err
+	}
+	defer release()
+	return s.graphQuery(ctx, request)
+}
+
+func (s *Server) graphQuery(ctx context.Context, request GraphQueryRequest) (types.GraphCommandResult, error) {
 	if request.Cypher == "" {
 		return types.GraphCommandResult{}, ErrInvalidRequest
 	}
@@ -157,6 +172,15 @@ func (s *Server) GraphQuery(ctx context.Context, request GraphQueryRequest) (typ
 }
 
 func (s *Server) GraphReachable(ctx context.Context, request GraphReachableRequest) (GraphReachableResult, error) {
+	release, err := s.acquireRead(ctx, false)
+	if err != nil {
+		return GraphReachableResult{}, err
+	}
+	defer release()
+	return s.graphReachable(ctx, request)
+}
+
+func (s *Server) graphReachable(ctx context.Context, request GraphReachableRequest) (GraphReachableResult, error) {
 	if err := materializer.ValidateGraphReachableRequest(request); err != nil {
 		return GraphReachableResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
@@ -183,10 +207,23 @@ func (s *Server) GraphReachable(ctx context.Context, request GraphReachableReque
 
 func (s *Server) GraphChanges(ctx context.Context, request GraphStreamReadRequest) (GraphStreamReadResponse, error) {
 	request.Stream = "__lattice_changes"
-	return s.GraphStreamRead(ctx, request)
+	return s.graphStreamReadAdmitted(ctx, request)
 }
 
 func (s *Server) GraphStreamRead(ctx context.Context, request GraphStreamReadRequest) (GraphStreamReadResponse, error) {
+	return s.graphStreamReadAdmitted(ctx, request)
+}
+
+func (s *Server) graphStreamReadAdmitted(ctx context.Context, request GraphStreamReadRequest) (GraphStreamReadResponse, error) {
+	release, err := s.acquireRead(ctx, request.WaitMS != 0)
+	if err != nil {
+		return GraphStreamReadResponse{}, err
+	}
+	defer release()
+	return s.graphStreamRead(ctx, request)
+}
+
+func (s *Server) graphStreamRead(ctx context.Context, request GraphStreamReadRequest) (GraphStreamReadResponse, error) {
 	if request.Limit == 0 {
 		request.Limit = 100
 	}
@@ -207,6 +244,15 @@ func (s *Server) GraphStreamRead(ctx context.Context, request GraphStreamReadReq
 }
 
 func (s *Server) GraphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
+	release, err := s.acquireRead(ctx, false)
+	if err != nil {
+		return GraphStreamOffsetResponse{}, err
+	}
+	defer release()
+	return s.graphStreamOffset(ctx, request)
+}
+
+func (s *Server) graphStreamOffset(ctx context.Context, request GraphStreamOffsetRequest) (GraphStreamOffsetResponse, error) {
 	if err := s.readBarrier(ctx, request.Consistency); err != nil {
 		return GraphStreamOffsetResponse{}, err
 	}
@@ -248,13 +294,16 @@ func (s *Server) serveGraphStreamRead(w http.ResponseWriter, r *http.Request, ch
 		writeHTTPError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	var response GraphStreamReadResponse
-	var err error
-	if changes {
-		response, err = s.GraphChanges(r.Context(), request)
-	} else {
-		response, err = s.GraphStreamRead(r.Context(), request)
+	release, err := s.acquireRead(r.Context(), request.WaitMS != 0)
+	if err != nil {
+		writeAPIError(w, err)
+		return
 	}
+	defer release()
+	if changes {
+		request.Stream = "__lattice_changes"
+	}
+	response, err := s.graphStreamRead(r.Context(), request)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -281,7 +330,13 @@ func (s *Server) handleGraphStreamOffset(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	response, err := s.GraphStreamOffset(r.Context(), request)
+	release, err := s.acquireRead(r.Context(), false)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	defer release()
+	response, err := s.graphStreamOffset(r.Context(), request)
 	if err != nil {
 		writeAPIError(w, err)
 		return

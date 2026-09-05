@@ -1,0 +1,299 @@
+{
+  "BenchmarkServerQuery/local-4": {
+    "samples": [
+      {
+        "iterations": 196980,
+        "ns_per_op": 2610.0,
+        "bytes_per_op": 1416,
+        "allocs_per_op": 40
+      },
+      {
+        "iterations": 226902,
+        "ns_per_op": 2616.0,
+        "bytes_per_op": 1416,
+        "allocs_per_op": 40
+      },
+      {
+        "iterations": 228145,
+        "ns_per_op": 2634.0,
+        "bytes_per_op": 1416,
+        "allocs_per_op": 40
+      }
+    ],
+    "medians": {
+      "ns_per_op": 2616.0,
+      "bytes_per_op": 1416,
+      "allocs_per_op": 40
+    }
+  },
+  "BenchmarkServerQuery/linearizable-4": {
+    "samples": [
+      {
+        "iterations": 231684,
+        "ns_per_op": 2594.0,
+        "bytes_per_op": 1416,
+        "allocs_per_op": 40
+      },
+      {
+        "iterations": 234921,
+        "ns_per_op": 2613.0,
+        "bytes_per_op": 1416,
+        "allocs_per_op": 40
+      },
+      {
+        "iterations": 232480,
+        "ns_per_op": 2602.0,
+        "bytes_per_op": 1416,
+        "allocs_per_op": 40
+      }
+    ],
+    "medians": {
+      "ns_per_op": 2602.0,
+      "bytes_per_op": 1416,
+      "allocs_per_op": 40
+    }
+  },
+  "BenchmarkGraphApply-4": {
+    "samples": [
+      {
+        "iterations": 3295,
+        "ns_per_op": 230736.0,
+        "bytes_per_op": 305485,
+        "allocs_per_op": 300
+      },
+      {
+        "iterations": 3102,
+        "ns_per_op": 199384.0,
+        "bytes_per_op": 296357,
+        "allocs_per_op": 300
+      },
+      {
+        "iterations": 2691,
+        "ns_per_op": 190149.0,
+        "bytes_per_op": 273701,
+        "allocs_per_op": 298
+      }
+    ],
+    "medians": {
+      "ns_per_op": 199384.0,
+      "bytes_per_op": 296357,
+      "allocs_per_op": 300
+    }
+  },
+  "BenchmarkCheckpointFilesAt-4": {
+    "samples": [
+      {
+        "iterations": 43,
+        "ns_per_op": 14067935.0,
+        "bytes_per_op": 99971,
+        "allocs_per_op": 683
+      },
+      {
+        "iterations": 39,
+        "ns_per_op": 13843921.0,
+        "bytes_per_op": 99769,
+        "allocs_per_op": 683
+      },
+      {
+        "iterations": 48,
+        "ns_per_op": 12095031.0,
+        "bytes_per_op": 99930,
+        "allocs_per_op": 682
+      }
+    ],
+    "medians": {
+      "ns_per_op": 13843921.0,
+      "bytes_per_op": 99930,
+      "allocs_per_op": 683
+    }
+  },
+  "BenchmarkSQLBatchApply/1-4": {
+    "samples": [
+      {
+        "iterations": 6915,
+        "ns_per_op": 86220.0,
+        "bytes_per_op": 6956,
+        "allocs_per_op": 148
+      },
+      {
+        "iterations": 7234,
+        "ns_per_op": 81446.0,
+        "bytes_per_op": 6944,
+        "allocs_per_op": 148
+      },
+      {
+        "iterations": 7318,
+        "ns_per_op": 80382.0,
+        "bytes_per_op": 6947,
+        "allocs_per_op": 148
+      }
+    ],
+    "medians": {
+      "ns_per_op": 81446.0,
+      "bytes_per_op": 6947,
+      "allocs_per_op": 148
+    }
+  },
+  "BenchmarkSQLBatchApply/8-4": {
+    "samples": [
+      {
+        "iterations": 3037,
+        "ns_per_op": 170213.0,
+        "bytes_per_op": 33398,
+        "allocs_per_op": 561
+      },
+      {
+        "iterations": 3571,
+        "ns_per_op": 169493.0,
+        "bytes_per_op": 33381,
+        "allocs_per_op": 562
+      },
+      {
+        "iterations": 3493,
+        "ns_per_op": 165967.0,
+        "bytes_per_op": 33377,
+        "allocs_per_op": 561
+      }
+    ],
+    "medians": {
+      "ns_per_op": 169493.0,
+      "bytes_per_op": 33381,
+      "allocs_per_op": 561
+    }
+  },
+  "BenchmarkSQLBatchApply/32-4": {
+    "samples": [
+      {
+        "iterations": 1386,
+        "ns_per_op": 381223.0,
+        "bytes_per_op": 122749,
+        "allocs_per_op": 1925
+      },
+      {
+        "iterations": 1389,
+        "ns_per_op": 381220.0,
+        "bytes_per_op": 122770,
+        "allocs_per_op": 1925
+      },
+      {
+        "iterations": 1365,
+        "ns_per_op": 388600.0,
+        "bytes_per_op": 122783,
+        "allocs_per_op": 1925
+      }
+    ],
+    "medians": {
+      "ns_per_op": 381223.0,
+      "bytes_per_op": 122770,
+      "allocs_per_op": 1925
+    }
+  },
+  "BenchmarkSQLBatchApply/64-4": {
+    "samples": [
+      {
+        "iterations": 848,
+        "ns_per_op": 659135.0,
+        "bytes_per_op": 241989,
+        "allocs_per_op": 3725
+      },
+      {
+        "iterations": 848,
+        "ns_per_op": 664301.0,
+        "bytes_per_op": 241976,
+        "allocs_per_op": 3725
+      },
+      {
+        "iterations": 847,
+        "ns_per_op": 659958.0,
+        "bytes_per_op": 242000,
+        "allocs_per_op": 3725
+      }
+    ],
+    "medians": {
+      "ns_per_op": 659958.0,
+      "bytes_per_op": 241989,
+      "allocs_per_op": 3725
+    }
+  },
+  "BenchmarkSQLBatchApply/128-4": {
+    "samples": [
+      {
+        "iterations": 459,
+        "ns_per_op": 1262238.0,
+        "bytes_per_op": 484806,
+        "allocs_per_op": 7294
+      },
+      {
+        "iterations": 457,
+        "ns_per_op": 1303542.0,
+        "bytes_per_op": 484885,
+        "allocs_per_op": 7294
+      },
+      {
+        "iterations": 451,
+        "ns_per_op": 1241398.0,
+        "bytes_per_op": 484839,
+        "allocs_per_op": 7292
+      }
+    ],
+    "medians": {
+      "ns_per_op": 1262238.0,
+      "bytes_per_op": 484839,
+      "allocs_per_op": 7294
+    }
+  },
+  "BenchmarkWALScanScratch-4": {
+    "samples": [
+      {
+        "iterations": 1281,
+        "ns_per_op": 440877.0,
+        "bytes_per_op": 1053718,
+        "allocs_per_op": 259
+      },
+      {
+        "iterations": 1503,
+        "ns_per_op": 398432.0,
+        "bytes_per_op": 1053713,
+        "allocs_per_op": 259
+      },
+      {
+        "iterations": 1460,
+        "ns_per_op": 398307.0,
+        "bytes_per_op": 1053713,
+        "allocs_per_op": 259
+      }
+    ],
+    "medians": {
+      "ns_per_op": 398432.0,
+      "bytes_per_op": 1053713,
+      "allocs_per_op": 259
+    }
+  },
+  "BenchmarkWALAppendSync-4": {
+    "samples": [
+      {
+        "iterations": 212,
+        "ns_per_op": 2970264.0,
+        "bytes_per_op": 320,
+        "allocs_per_op": 1
+      },
+      {
+        "iterations": 210,
+        "ns_per_op": 2931295.0,
+        "bytes_per_op": 320,
+        "allocs_per_op": 1
+      },
+      {
+        "iterations": 198,
+        "ns_per_op": 3023494.0,
+        "bytes_per_op": 320,
+        "allocs_per_op": 1
+      }
+    ],
+    "medians": {
+      "ns_per_op": 2970264.0,
+      "bytes_per_op": 320,
+      "allocs_per_op": 1
+    }
+  }
+}

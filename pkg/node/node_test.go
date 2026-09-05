@@ -215,3 +215,23 @@ func TestObjectStoreConfigMatrix(t *testing.T) {
 		})
 	}
 }
+
+func TestReadAdmissionConfig(t *testing.T) {
+	for name, config := range map[string]*types.ExecutionConfig{
+		"defaults":                {},
+		"configured":              {MaxConcurrentReads: 4, MaxLongPollReads: 1},
+		"long poll disabled":      {MaxConcurrentReads: 1},
+		"negative total":          {MaxConcurrentReads: -1},
+		"negative long poll":      {MaxConcurrentReads: 1, MaxLongPollReads: -1},
+		"missing total":           {MaxLongPollReads: 1},
+		"long poll exceeds total": {MaxConcurrentReads: 1, MaxLongPollReads: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateReadAdmissionConfig(config)
+			valid := name == "defaults" || name == "configured" || name == "long poll disabled"
+			if (err == nil) != valid {
+				t.Fatalf("error=%v valid=%t", err, valid)
+			}
+		})
+	}
+}

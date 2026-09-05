@@ -1,0 +1,21 @@
+2026/09/05 11:53:37 creating streaming checkpoint at slot 2
+2026/09/05 11:53:37 checkpoint candidate published: index=2 size=41371 files=2
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza
+cpu: Apple M3
+BenchmarkReadReplicaIdleSync-8   	2026/09/05 11:53:39 creating streaming checkpoint at slot 2
+2026/09/05 11:53:39 checkpoint candidate published: index=2 size=41371 files=2
+     200	     12639 ns/op	         0 GET/op	         1.000 HEAD/op	         0 PUT/op	    2338 B/op	      16 allocs/op
+BenchmarkReadReplicaIdleSync-8   	2026/09/05 11:53:43 creating streaming checkpoint at slot 2
+2026/09/05 11:53:43 checkpoint candidate published: index=2 size=41371 files=2
+2026/09/05 11:53:47 creating streaming checkpoint at slot 2
+2026/09/05 11:53:47 checkpoint candidate published: index=2 size=41371 files=2
+     200	     16079 ns/op	         0 GET/op	         1.000 HEAD/op	         0 PUT/op	    2336 B/op	      16 allocs/op
+BenchmarkReadReplicaIdleSync-8   	2026/09/05 11:53:52 creating streaming checkpoint at slot 2
+2026/09/05 11:53:52 checkpoint candidate published: index=2 size=41371 files=2
+2026/09/05 11:53:59 creating streaming checkpoint at slot 2
+2026/09/05 11:53:59 checkpoint candidate published: index=2 size=41371 files=2
+     200	     14459 ns/op	         0 GET/op	         1.000 HEAD/op	         0 PUT/op	    2342 B/op	      16 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza	28.696s

@@ -83,6 +83,19 @@ func validateObjectStoreConfig(config *types.ExecutionConfig) (bool, error) {
 	return configured, nil
 }
 
+func validateReadAdmissionConfig(config *types.ExecutionConfig) error {
+	if config.MaxConcurrentReads < 0 || config.MaxLongPollReads < 0 {
+		return fmt.Errorf("read admission limits must not be negative")
+	}
+	if config.MaxConcurrentReads == 0 && config.MaxLongPollReads == 0 {
+		return nil
+	}
+	if config.MaxConcurrentReads == 0 || config.MaxLongPollReads > config.MaxConcurrentReads {
+		return fmt.Errorf("max long-poll reads must not exceed max concurrent reads")
+	}
+	return nil
+}
+
 // Open starts the embedded engine and its private peer transport without serving HTTP.
 func (n *Node) Open(ctx context.Context) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
@@ -125,6 +138,9 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	}
 	if n.config.MaxWALBytes < 0 {
 		return fmt.Errorf("max WAL bytes must not be negative")
+	}
+	if err := validateReadAdmissionConfig(n.config); err != nil {
+		return err
 	}
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")
@@ -272,6 +288,14 @@ func (n *Node) Open(ctx context.Context) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
+	if n.config.MaxConcurrentReads != 0 {
+		if err := server.SetReadAdmissionLimits(network.ReadAdmissionLimits{
+			MaxConcurrent: n.config.MaxConcurrentReads,
+			MaxLongPoll:   n.config.MaxLongPollReads,
+		}); err != nil {
+			return fmt.Errorf("configure read admission: %w", err)
+		}
+	}
 	if n.checkpoints != nil {
 		server.SetCheckpointPrepare(func(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
 			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
@@ -290,7 +314,11 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			"uploads": stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
 			"deletes": stats.Deletes, "failures": stats.Failures, "bytes_uploaded": stats.BytesUploaded,
 			"bytes_downloaded": stats.BytesDownloaded, "s3_http_requests": stats.S3HTTPRequests,
-			"s3_http_failures":    stats.S3HTTPFailures,
+			"s3_http_failures": stats.S3HTTPFailures,
+			"http_requests":    stats.HTTPRequests, "http_failures": stats.HTTPFailures,
+			"http_get_requests": stats.HTTPGetRequests, "http_put_requests": stats.HTTPPutRequests,
+			"http_head_requests": stats.HTTPHeadRequests, "http_delete_requests": stats.HTTPDeleteRequests,
+			"http_other_requests": stats.HTTPOtherRequests,
 			"condition_conflicts": stats.ConditionConflicts, "dedup_hits": stats.DedupHits,
 			"sdk_retries": stats.SDKRetries, "transport_failures": stats.TransportFailures,
 			"http_4xx_unexpected": stats.Unexpected4xx, "http_5xx": stats.HTTP5xx,

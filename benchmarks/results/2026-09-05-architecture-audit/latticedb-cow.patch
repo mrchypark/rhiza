@@ -1,0 +1,377 @@
+diff --git a/app_metadata_snapshot_test.go b/app_metadata_snapshot_test.go
+index b652fb2..4de5322 100644
+--- a/app_metadata_snapshot_test.go
++++ b/app_metadata_snapshot_test.go
+@@ -94,6 +94,30 @@ func TestAppMetadataIsTransactionalAndDurable(t *testing.T) {
+ 	assertMetadataAndItem(t, reopened, []byte{0xff, 0, 1}, "committed", 1)
+ }
+ 
++func BenchmarkAppMetadataCOWFixedCohort(b *testing.B) {
++	db, err := Open(filepath.Join(b.TempDir(), "metadata.ltdb"), OpenOptions{Create: true})
++	if err != nil {
++		b.Fatal(err)
++	}
++	defer db.Close()
++	if err := db.Update(func(tx *Tx) error {
++		for i := range 4096 {
++			if err := tx.PutAppMetadata(fmt.Appendf(nil, "cohort/%04d", i), []byte("value")); err != nil {
++				return err
++			}
++		}
++		return nil
++	}); err != nil {
++		b.Fatal(err)
++	}
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if err := db.Update(func(tx *Tx) error { return tx.PutAppMetadata([]byte("cohort/0000"), fmt.Appendf(nil, "%d", i)) }); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
+ func TestAppMetadataAndGraphRecoverTogetherFromWAL(t *testing.T) {
+ 	path := filepath.Join(t.TempDir(), "metadata-recovery.ltdb")
+ 	if os.Getenv("LATTICEDB_METADATA_RECOVERY_CHILD") == "1" {
+diff --git a/internal/engine/app_metadata.go b/internal/engine/app_metadata.go
+index 2b702f4..9f5af07 100644
+--- a/internal/engine/app_metadata.go
++++ b/internal/engine/app_metadata.go
+@@ -20,7 +20,7 @@ func (tx *Tx) GetAppMetadata(key []byte) ([]byte, bool, error) {
+ 	if err := validateAppMetadataKey(key); err != nil {
+ 		return nil, false, err
+ 	}
+-	value, ok := tx.graph.AppMetadata[string(key)]
++	value, ok := tx.graph.AppMetadata.Get(string(key))
+ 	return slices.Clone(value), ok, nil
+ }
+ 
+@@ -31,10 +31,12 @@ func (tx *Tx) PutAppMetadata(key, value []byte) error {
+ 	if err := validateAppMetadataKey(key); err != nil {
+ 		return err
+ 	}
+-	tx.ensureAppMetadataWritable()
+ 	cloned := slices.Clone(value)
+ 	textKey := string(key)
+-	tx.graph.AppMetadata[textKey] = cloned
++	tx.graph.AppMetadata.Set(textKey, cloned)
++	if tx.changes.appMetadata == nil {
++		tx.changes.appMetadata = make(map[string]appMetadataChange)
++	}
+ 	tx.changes.appMetadata[textKey] = appMetadataChange{value: cloned}
+ 	return nil
+ }
+@@ -46,26 +48,15 @@ func (tx *Tx) DeleteAppMetadata(key []byte) error {
+ 	if err := validateAppMetadataKey(key); err != nil {
+ 		return err
+ 	}
+-	tx.ensureAppMetadataWritable()
+ 	textKey := string(key)
+-	delete(tx.graph.AppMetadata, textKey)
++	tx.graph.AppMetadata.Delete(textKey)
++	if tx.changes.appMetadata == nil {
++		tx.changes.appMetadata = make(map[string]appMetadataChange)
++	}
+ 	tx.changes.appMetadata[textKey] = appMetadataChange{delete: true}
+ 	return nil
+ }
+ 
+-func (tx *Tx) ensureAppMetadataWritable() {
+-	if tx.appMetadataWritable {
+-		return
+-	}
+-	metadata := make(map[string][]byte, len(tx.graph.AppMetadata))
+-	for key, value := range tx.graph.AppMetadata {
+-		metadata[key] = value
+-	}
+-	tx.graph.AppMetadata = metadata
+-	tx.changes.appMetadata = make(map[string]appMetadataChange)
+-	tx.appMetadataWritable = true
+-}
+-
+ func validateAppMetadataKey(key []byte) error {
+ 	if len(key) == 0 || len(key) > math.MaxUint16 {
+ 		return fmt.Errorf("%w: application metadata key length must be 1..%d", ErrInvalidArgument, math.MaxUint16)
+diff --git a/internal/engine/db.go b/internal/engine/db.go
+index f265b25..ab47567 100644
+--- a/internal/engine/db.go
++++ b/internal/engine/db.go
+@@ -249,7 +249,6 @@ type Tx struct {
+ 	vectorIndexApplied     bool
+ 	propertyIndexesApplied bool
+ 	changefeedApplied      bool
+-	appMetadataWritable    bool
+ 	queryIndexesDisabled   bool
+ }
+ 
+diff --git a/internal/store/app_metadata.go b/internal/store/app_metadata.go
+new file mode 100644
+index 0000000..bcffcac
+--- /dev/null
++++ b/internal/store/app_metadata.go
+@@ -0,0 +1,75 @@
++package store
++
++import (
++	"iter"
++	"maps"
++	"slices"
++)
++
++type AppMetadata struct {
++	root   *[shardFanout]map[string][]byte
++	cloned [shardFanout / 64]uint64
++}
++
++func NewAppMetadata() AppMetadata              { return AppMetadata{root: new([shardFanout]map[string][]byte)} }
++func (metadata AppMetadata) Fork() AppMetadata { return AppMetadata{root: metadata.root} }
++
++func (metadata AppMetadata) Clone() AppMetadata {
++	cloned := NewAppMetadata()
++	for key, value := range metadata.All() {
++		cloned.Set(key, slices.Clone(value))
++	}
++	return cloned
++}
++func (metadata AppMetadata) Get(key string) ([]byte, bool) {
++	if metadata.root == nil {
++		return nil, false
++	}
++	value, ok := metadata.root[uint8(hashString(key))][key]
++	return value, ok
++}
++func (metadata *AppMetadata) Set(key string, value []byte) {
++	shard := uint8(hashString(key))
++	metadata.cloneShard(shard)
++	metadata.root[shard][key] = value
++}
++func (metadata *AppMetadata) Delete(key string) {
++	shard := uint8(hashString(key))
++	if metadata.root == nil || metadata.root[shard] == nil {
++		return
++	}
++	metadata.cloneShard(shard)
++	delete(metadata.root[shard], key)
++}
++func (metadata AppMetadata) All() iter.Seq2[string, []byte] {
++	return func(yield func(string, []byte) bool) {
++		if metadata.root == nil {
++			return
++		}
++		for _, shard := range metadata.root {
++			for key, value := range shard {
++				if !yield(key, value) {
++					return
++				}
++			}
++		}
++	}
++}
++func (metadata *AppMetadata) cloneShard(shard uint8) {
++	if metadata.root == nil {
++		metadata.root = new([shardFanout]map[string][]byte)
++	}
++	word, bit := shard/64, uint64(1)<<(shard%64)
++	if metadata.cloned[word]&bit != 0 {
++		return
++	}
++	root := new([shardFanout]map[string][]byte)
++	*root = *metadata.root
++	metadata.root = root
++	if current := root[shard]; current != nil {
++		root[shard] = maps.Clone(current)
++	} else {
++		root[shard] = map[string][]byte{}
++	}
++	metadata.cloned[word] |= bit
++}
+diff --git a/internal/store/app_metadata_test.go b/internal/store/app_metadata_test.go
+new file mode 100644
+index 0000000..41b254d
+--- /dev/null
++++ b/internal/store/app_metadata_test.go
+@@ -0,0 +1,32 @@
++package store
++
++import "testing"
++
++func TestAppMetadataForkClonesOnlyTouchedShard(t *testing.T) {
++	first := "first"
++	second := ""
++	for candidate := 0; ; candidate++ {
++		key := string(rune(candidate))
++		if key != first && uint8(hashString(key)) == uint8(hashString(first)) {
++			second = key
++			break
++		}
++	}
++	metadata := NewAppMetadata()
++	metadata.Set(first, []byte("base"))
++	fork := metadata.Fork()
++	fork.Set(second, []byte("fork"))
++	fork.Set(first, []byte("changed"))
++	if value, _ := metadata.Get(first); string(value) != "base" {
++		t.Fatalf("base value = %q", value)
++	}
++	if _, ok := metadata.Get(second); ok {
++		t.Fatal("base acquired fork-only value")
++	}
++	if value, _ := fork.Get(first); string(value) != "changed" {
++		t.Fatalf("fork value = %q", value)
++	}
++	if value, _ := fork.Get(second); string(value) != "fork" {
++		t.Fatalf("fork collision value = %q", value)
++	}
++}
+diff --git a/internal/store/recovery.go b/internal/store/recovery.go
+index 4e7bd83..89053c4 100644
+--- a/internal/store/recovery.go
++++ b/internal/store/recovery.go
+@@ -2113,9 +2113,9 @@ func buildPersistedState(graph *GraphState, nextNodeID uint64, nextEdgeID uint64
+ 	return snapshot, nil
+ }
+ 
+-func buildPersistedAppMetadata(metadata map[string][]byte) ([]persistedAppMetadata, error) {
+-	keys := make([]string, 0, len(metadata))
+-	for key := range metadata {
++func buildPersistedAppMetadata(metadata AppMetadata) ([]persistedAppMetadata, error) {
++	keys := make([]string, 0)
++	for key := range metadata.All() {
+ 		if len(key) == 0 || len(key) > maxAppMetadataKeyBytes {
+ 			return nil, errors.New("invalid application metadata key length")
+ 		}
+@@ -2124,7 +2124,8 @@ func buildPersistedAppMetadata(metadata map[string][]byte) ([]persistedAppMetada
+ 	slices.Sort(keys)
+ 	persisted := make([]persistedAppMetadata, 0, len(keys))
+ 	for _, key := range keys {
+-		persisted = append(persisted, persistedAppMetadata{Key: []byte(key), Value: slices.Clone(metadata[key])})
++		value, _ := metadata.Get(key)
++		persisted = append(persisted, persistedAppMetadata{Key: []byte(key), Value: slices.Clone(value)})
+ 	}
+ 	return persisted, nil
+ }
+@@ -2239,7 +2240,7 @@ func persistedPropertyIndexDefinitions(definitions []PropertyIndexDefinition) []
+ 
+ func EstimateSnapshotBytes(graph *GraphState) (uint64, error) {
+ 	size := uint64(4096)
+-	for key, value := range graph.AppMetadata {
++	for key, value := range graph.AppMetadata.All() {
+ 		size = snapshotAdd(size, appMetadataSnapshotBytes(key, value))
+ 	}
+ 	for _, node := range graph.Nodes.All() {
+@@ -2275,12 +2276,12 @@ func ApplyDeltaSnapshotBytes(base *GraphState, graph *GraphState, changes GraphD
+ 	for _, change := range changes.AppMetadata {
+ 		key := string(change.Key)
+ 		oldSize := uint64(0)
+-		if old, exists := base.AppMetadata[key]; exists {
++		if old, exists := base.AppMetadata.Get(key); exists {
+ 			oldSize = appMetadataSnapshotBytes(key, old)
+ 		}
+ 		newSize := uint64(0)
+ 		if !change.Delete {
+-			value, exists := graph.AppMetadata[key]
++			value, exists := graph.AppMetadata.Get(key)
+ 			if !exists {
+ 				return 0, errors.New("application metadata delta value is missing")
+ 			}
+@@ -2466,10 +2467,10 @@ func decodePersistedStateContext(ctx context.Context, snapshot persistedState, m
+ 			return nil, 0, 0, 0, errors.New("invalid stored application metadata key length")
+ 		}
+ 		key := string(entry.Key)
+-		if _, exists := graph.AppMetadata[key]; exists {
++		if _, exists := graph.AppMetadata.Get(key); exists {
+ 			return nil, 0, 0, 0, errors.New("duplicate stored application metadata key")
+ 		}
+-		graph.AppMetadata[key] = slices.Clone(entry.Value)
++		graph.AppMetadata.Set(key, slices.Clone(entry.Value))
+ 	}
+ 	var maxNodeID uint64
+ 	for index, storedNode := range snapshot.Nodes {
+diff --git a/internal/store/recovery_test.go b/internal/store/recovery_test.go
+index c218b0f..abb0b3e 100644
+--- a/internal/store/recovery_test.go
++++ b/internal/store/recovery_test.go
+@@ -489,7 +489,7 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	large := bytes.Repeat([]byte("x"), 1<<20)
+-	graph.AppMetadata["large"] = large
++	graph.AppMetadata.Set("large", large)
+ 	if err := AppendWALDelta(path, graph, 1, 1, 1, GraphDelta{AppMetadata: []AppMetadataChange{{Key: []byte("large"), Value: large}}}); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -497,7 +497,7 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	graph.AppMetadata["small"] = []byte("value")
++	graph.AppMetadata.Set("small", []byte("value"))
+ 	if err := AppendWALDelta(path, graph, 1, 1, 2, GraphDelta{AppMetadata: []AppMetadataChange{{Key: []byte("small"), Value: []byte("value")}}}); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -512,7 +512,9 @@ func TestAppMetadataWALDeltaIsIncremental(t *testing.T) {
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if commitID != 2 || !bytes.Equal(recovered.AppMetadata["large"], large) || string(recovered.AppMetadata["small"]) != "value" {
++	recoveredLarge, largeOK := recovered.AppMetadata.Get("large")
++	recoveredSmall, smallOK := recovered.AppMetadata.Get("small")
++	if commitID != 2 || !largeOK || !smallOK || !bytes.Equal(recoveredLarge, large) || string(recoveredSmall) != "value" {
+ 		t.Fatal("incremental metadata WAL did not recover both values")
+ 	}
+ }
+diff --git a/internal/store/store.go b/internal/store/store.go
+index 85ef440..d101851 100644
+--- a/internal/store/store.go
++++ b/internal/store/store.go
+@@ -411,7 +411,7 @@ type GraphState struct {
+ 	DatabaseID       string
+ 	VectorDimensions uint16
+ 	SnapshotBytes    uint64
+-	AppMetadata      map[string][]byte
++	AppMetadata      AppMetadata
+ 	Nodes            PagedMap[*NodeRecord]
+ 	Edges            PagedMap[*EdgeRecord]
+ 	FTS              PagedMap[*FTSRecord]
+@@ -603,7 +603,7 @@ type persistedValue struct {
+ func NewGraphState() *GraphState {
+ 	return &GraphState{
+ 		SnapshotBytes:    4096,
+-		AppMetadata:      map[string][]byte{},
++		AppMetadata:      NewAppMetadata(),
+ 		Nodes:            NewPagedMap[*NodeRecord](),
+ 		Edges:            NewPagedMap[*EdgeRecord](),
+ 		FTS:              NewPagedMap[*FTSRecord](),
+@@ -625,7 +625,7 @@ func CloneGraphState(graph *GraphState) *GraphState {
+ 	cloned.DatabaseID = graph.DatabaseID
+ 	cloned.VectorDimensions = graph.VectorDimensions
+ 	cloned.SnapshotBytes = graph.SnapshotBytes
+-	cloned.AppMetadata = CloneAppMetadata(graph.AppMetadata)
++	cloned.AppMetadata = graph.AppMetadata.Clone()
+ 	cloned.DerivedIndexWork = graph.DerivedIndexWork
+ 	cloned.DerivedIndexLogicalBytes = graph.DerivedIndexLogicalBytes
+ 	for id, node := range graph.Nodes.All() {
+@@ -718,7 +718,7 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
+ 		DatabaseID:               graph.DatabaseID,
+ 		VectorDimensions:         graph.VectorDimensions,
+ 		SnapshotBytes:            graph.SnapshotBytes,
+-		AppMetadata:              graph.AppMetadata,
++		AppMetadata:              graph.AppMetadata.Fork(),
+ 		Nodes:                    graph.Nodes.Fork(),
+ 		Edges:                    graph.Edges.Fork(),
+ 		FTS:                      graph.FTS.Fork(),
+@@ -738,14 +738,6 @@ func CloneGraphStateShallow(graph *GraphState) *GraphState {
+ 	}
+ }
+ 
+-func CloneAppMetadata(metadata map[string][]byte) map[string][]byte {
+-	cloned := make(map[string][]byte, len(metadata))
+-	for key, value := range metadata {
+-		cloned[key] = slices.Clone(value)
+-	}
+-	return cloned
+-}
+-
+ func ClonePropertyMap(in map[string]any) map[string]any {
+ 	if len(in) == 0 {
+ 		return map[string]any{}

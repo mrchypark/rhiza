@@ -1,0 +1,51 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M3
+BenchmarkServerQuery/local-4         	  196980	      2610 ns/op	    1416 B/op	      40 allocs/op
+BenchmarkServerQuery/local-4         	  226902	      2616 ns/op	    1416 B/op	      40 allocs/op
+BenchmarkServerQuery/local-4         	  228145	      2634 ns/op	    1416 B/op	      40 allocs/op
+BenchmarkServerQuery/linearizable-4  	  231684	      2594 ns/op	    1416 B/op	      40 allocs/op
+BenchmarkServerQuery/linearizable-4  	  234921	      2613 ns/op	    1416 B/op	      40 allocs/op
+BenchmarkServerQuery/linearizable-4  	  232480	      2602 ns/op	    1416 B/op	      40 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/network	4.404s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkGraphApply-4          	    3295	    230736 ns/op	  305485 B/op	     300 allocs/op
+BenchmarkGraphApply-4          	    3102	    199384 ns/op	  296357 B/op	     300 allocs/op
+BenchmarkGraphApply-4          	    2691	    190149 ns/op	  273701 B/op	     298 allocs/op
+BenchmarkCheckpointFilesAt-4   	      43	  14067935 ns/op	   99971 B/op	     683 allocs/op
+BenchmarkCheckpointFilesAt-4   	      39	  13843921 ns/op	   99769 B/op	     683 allocs/op
+BenchmarkCheckpointFilesAt-4   	      48	  12095031 ns/op	   99930 B/op	     682 allocs/op
+BenchmarkSQLBatchApply/1-4     	    6915	     86220 ns/op	    6956 B/op	     148 allocs/op
+BenchmarkSQLBatchApply/1-4     	    7234	     81446 ns/op	    6944 B/op	     148 allocs/op
+BenchmarkSQLBatchApply/1-4     	    7318	     80382 ns/op	    6947 B/op	     148 allocs/op
+BenchmarkSQLBatchApply/8-4     	    3037	    170213 ns/op	   33398 B/op	     561 allocs/op
+BenchmarkSQLBatchApply/8-4     	    3571	    169493 ns/op	   33381 B/op	     562 allocs/op
+BenchmarkSQLBatchApply/8-4     	    3493	    165967 ns/op	   33377 B/op	     561 allocs/op
+BenchmarkSQLBatchApply/32-4    	    1386	    381223 ns/op	  122749 B/op	    1925 allocs/op
+BenchmarkSQLBatchApply/32-4    	    1389	    381220 ns/op	  122770 B/op	    1925 allocs/op
+BenchmarkSQLBatchApply/32-4    	    1365	    388600 ns/op	  122783 B/op	    1925 allocs/op
+BenchmarkSQLBatchApply/64-4    	     848	    659135 ns/op	  241989 B/op	    3725 allocs/op
+BenchmarkSQLBatchApply/64-4    	     848	    664301 ns/op	  241976 B/op	    3725 allocs/op
+BenchmarkSQLBatchApply/64-4    	     847	    659958 ns/op	  242000 B/op	    3725 allocs/op
+BenchmarkSQLBatchApply/128-4   	     459	   1262238 ns/op	  484806 B/op	    7294 allocs/op
+BenchmarkSQLBatchApply/128-4   	     457	   1303542 ns/op	  484885 B/op	    7294 allocs/op
+BenchmarkSQLBatchApply/128-4   	     451	   1241398 ns/op	  484839 B/op	    7292 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	24.123s
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/qlog
+cpu: Apple M3
+BenchmarkWALScanScratch-4   	    1281	    440877 ns/op	 1053718 B/op	     259 allocs/op
+BenchmarkWALScanScratch-4   	    1503	    398432 ns/op	 1053713 B/op	     259 allocs/op
+BenchmarkWALScanScratch-4   	    1460	    398307 ns/op	 1053713 B/op	     259 allocs/op
+BenchmarkWALAppendSync-4    	     212	   2970264 ns/op	     320 B/op	       1 allocs/op
+BenchmarkWALAppendSync-4    	     210	   2931295 ns/op	     320 B/op	       1 allocs/op
+BenchmarkWALAppendSync-4    	     198	   3023494 ns/op	     320 B/op	       1 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/qlog	4.109s

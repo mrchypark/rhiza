@@ -1,0 +1,2 @@
+ok  	github.com/mrchypark/latticedb-go/internal/store	1.597s
+ok  	github.com/mrchypark/latticedb-go	2.567s

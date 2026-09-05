@@ -74,4 +74,6 @@ type ExecutionConfig struct {
 	CheckpointInterval  time.Duration `json:"checkpoint_interval"`
 	CheckpointTailBytes int64         `json:"checkpoint_tail_bytes"`
 	MaxWALBytes         int64         `json:"max_wal_bytes"`
+	MaxConcurrentReads  int           `json:"max_concurrent_reads"`
+	MaxLongPollReads    int           `json:"max_long_poll_reads"`
 }
