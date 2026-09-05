@@ -1,0 +1,1 @@
+ok  	github.com/mrchypark/rhiza/e2e	0.811s

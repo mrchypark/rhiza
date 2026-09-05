@@ -2094,7 +2094,7 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	}
 	var graphSnap *graphSnapshot
 	if err == nil {
-		graphSnap, err = m.beginGraphSnapshot()
+		graphSnap, err = m.beginGraphSnapshot(ctx)
 	}
 	m.mu.Unlock()
 	if err != nil {

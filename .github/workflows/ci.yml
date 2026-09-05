@@ -9,6 +9,38 @@ permissions:
   contents: read
 
 jobs:
+  rust-sdk:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: 1
+      GOEXPERIMENT: cgocheck2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: FFI lifecycle and concurrency
+        run: go test -race ./cmd/rhiza-ffi
+      - name: Rust format
+        run: cargo fmt --manifest-path sdk/rust/Cargo.toml --check
+      - name: Rust lint
+        run: cargo clippy --manifest-path sdk/rust/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Embedded Rust integration
+        run: cargo test --manifest-path sdk/rust/Cargo.toml --locked --all-targets
+      - name: Standalone crates.io package
+        run: |
+          sh sdk/rust/scripts/prepare-native.sh
+          cargo package --manifest-path sdk/rust/Cargo.toml --locked --allow-dirty
+          crate_version=$(cargo metadata --manifest-path sdk/rust/Cargo.toml --no-deps --format-version 1 | jq -r '.packages[0].version')
+          cargo test --manifest-path "sdk/rust/target/package/rhizadb-$crate_version/Cargo.toml" --locked --all-targets
+
   go:
     runs-on: ubuntu-latest
     steps:

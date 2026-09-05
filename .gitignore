@@ -36,3 +36,7 @@ data/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Rust SDK build output
+/sdk/rust/target/
+/sdk/rust/native/

@@ -1,0 +1,10 @@
+writer: SQL/KV/Graph writes and receipts verified
+reader: old values/receipts verified; v0.5 writes committed
+reopen: old/new SQL/KV/Graph values and receipts verified
+reopen: old/new SQL/KV/Graph values and receipts verified
+writer: SQL/KV/Graph writes and receipts verified
+checkpoint writer: close will archive and certify a checkpoint
+2026/09/05 17:33:35 creating streaming checkpoint at slot 6
+2026/09/05 17:33:35 checkpoint candidate published: index=6 size=42722 files=2
+2026/09/05 17:33:35 checkpoint prepared: index=6 root=2e8c06e2dc7e95e4031f47c6601aec566b6bca58044384fefab8730a5445cd52
+checkpoint reader: v0.3 archive/checkpoint recovered into fresh v0.5 data directory

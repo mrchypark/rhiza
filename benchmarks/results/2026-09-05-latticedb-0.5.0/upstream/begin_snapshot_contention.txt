@@ -1,0 +1,21 @@
+round 01: ErrWriteTxActive on snapshot attempt 1
+round 02: ErrWriteTxActive on snapshot attempt 111247
+round 03: ErrWriteTxActive on snapshot attempt 245597
+round 04: ErrWriteTxActive on snapshot attempt 346
+round 05: ErrWriteTxActive on snapshot attempt 669
+round 06: ErrWriteTxActive on snapshot attempt 15850
+round 07: ErrWriteTxActive on snapshot attempt 218
+round 08: ErrWriteTxActive on snapshot attempt 47
+round 09: ErrWriteTxActive on snapshot attempt 24
+round 10: ErrWriteTxActive on snapshot attempt 158136
+round 11: ErrWriteTxActive on snapshot attempt 48633
+round 12: ErrWriteTxActive on snapshot attempt 42
+round 13: ErrWriteTxActive on snapshot attempt 157
+round 14: ErrWriteTxActive on snapshot attempt 56
+round 15: ErrWriteTxActive on snapshot attempt 341
+round 16: ErrWriteTxActive on snapshot attempt 219327
+round 17: ErrWriteTxActive on snapshot attempt 34
+round 18: ErrWriteTxActive on snapshot attempt 244107
+round 19: ErrWriteTxActive on snapshot attempt 204183
+round 20: ErrWriteTxActive on snapshot attempt 67
+observed ErrWriteTxActive in 20/20 rounds

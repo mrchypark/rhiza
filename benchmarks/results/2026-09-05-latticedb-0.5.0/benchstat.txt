@@ -1,0 +1,55 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+                                          │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                                          │                                           sec/op                                            │                               sec/op                                 vs base                │
+GraphApply-2                                                                                                               414.0µ ± 21%                                                          423.6µ ± 20%        ~ (p=0.739 n=10)
+LatticeAppMetadataUpdate4096Keys-2                                                                                         176.0µ ± 13%                                                          196.4µ ± 22%        ~ (p=0.436 n=10)
+GraphQuery4096Nodes-2                                                                                                      922.9µ ±  8%                                                          965.6µ ±  4%   +4.63% (p=0.009 n=10)
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                                                   2.859m ± 13%                                                          2.895m ± 53%        ~ (p=0.579 n=10)
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                                                  10.51m ± 23%                                                          11.38m ± 92%        ~ (p=0.218 n=10)
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                                                  34.95m ± 58%                                                          57.88m ± 36%  +65.60% (p=0.009 n=10)
+geomean                                                                                                                    2.033m                                                                2.313m        +13.79%
+
+                                          │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                                          │                                            B/op                                             │                                 B/op                                  vs base               │
+GraphApply-2                                                                                                               52.83Ki ± 0%                                                          53.47Ki ±  0%  +1.20% (p=0.000 n=10)
+LatticeAppMetadataUpdate4096Keys-2                                                                                         387.3Ki ± 0%                                                          387.3Ki ±  0%       ~ (p=0.324 n=10)
+GraphQuery4096Nodes-2                                                                                                      1.610Mi ± 0%                                                          1.610Mi ±  0%  +0.01% (p=0.000 n=10)
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                                                   387.3Ki ± 0%                                                          387.9Ki ±  0%  +0.16% (p=0.000 n=10)
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                                                  7.418Mi ± 0%                                                          7.418Mi ±  0%  +0.00% (p=0.049 n=10)
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                                                  51.24Mi ± 0%                                                          51.24Mi ± 71%  +0.00% (p=0.022 n=10)
+geomean                                                                                                                    1.286Mi                                                               1.289Mi        +0.23%
+
+                                          │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                                          │                                          allocs/op                                          │                              allocs/op                               vs base                │
+GraphApply-2                                                                                                                 279.5 ± 0%                                                            283.5 ± 0%   +1.43% (p=0.000 n=10)
+LatticeAppMetadataUpdate4096Keys-2                                                                                           44.00 ± 2%                                                            44.00 ± 2%        ~ (p=0.628 n=10)
+GraphQuery4096Nodes-2                                                                                                       12.33k ± 0%                                                           12.33k ± 0%   +0.00% (p=0.033 n=10)
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                                                     19.00 ± 0%                                                            21.00 ± 5%  +10.53% (p=0.000 n=10)
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                                                    19.00 ± 5%                                                            21.00 ± 5%  +10.53% (p=0.000 n=10)
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                                                    21.00 ± 5%                                                            25.00 ± 4%  +19.05% (p=0.000 n=10)
+geomean                                                                                                                      102.3                                                                 109.2        +6.69%
+
+                                          │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                                          │                                           db-MiB                                            │                               db-MiB                                vs base                 │
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                                                     1.334 ± 0%                                                           1.334 ± 0%       ~ (p=1.000 n=10) ¹
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                                                    21.33 ± 0%                                                           21.33 ± 0%       ~ (p=1.000 n=10) ¹
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                                                    85.33 ± 0%                                                           85.33 ± 0%       ~ (p=1.000 n=10) ¹
+geomean                                                                                                                      13.44                                                                13.44       +0.00%
+¹ all samples are equal
+
+pkg: github.com/mrchypark/rhiza/pkg/network
+                    │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                    │                                           sec/op                                            │                                  sec/op                                    vs base          │
+HTTPQueryLoopback-2                                                                                  38.42µ ± 12%                                                                36.79µ ± 41%  ~ (p=0.971 n=10)
+
+                    │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                    │                                            B/op                                             │                                   B/op                                     vs base          │
+HTTPQueryLoopback-2                                                                                  10.35Ki ± 0%                                                                10.36Ki ± 0%  ~ (p=0.119 n=10)
+
+                    │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/030.txt │ /Users/cypark/Documents/project/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/050.txt │
+                    │                                          allocs/op                                          │                                allocs/op                                 vs base            │
+HTTPQueryLoopback-2                                                                                    150.0 ± 0%                                                                150.0 ± 0%  ~ (p=1.000 n=10) ¹
+¹ all samples are equal

@@ -3,6 +3,7 @@ package materializer
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,54 @@ func TestGraphResultUsesAggregateByteBudget(t *testing.T) {
 	}
 	if _, err := collectLatticeRows(result); err == nil {
 		t.Fatal("aggregate graph result byte limit was not enforced")
+	}
+}
+
+func TestRetryableGraphApplyErrorOnlyMatchesTransientContention(t *testing.T) {
+	checkpoint := fmt.Errorf("%w: WAL checkpoint is in progress", latticedb.ErrResourceLimit)
+	if !isRetryableGraphApplyError(checkpoint) {
+		t.Fatalf("checkpoint backpressure = %v, want retryable", checkpoint)
+	}
+	if !isRetryableGraphApplyError(latticedb.ErrWriteTxActive) {
+		t.Fatal("active writer = not retryable")
+	}
+	for _, err := range []error{
+		fmt.Errorf("%w: query rows exceed 1", latticedb.ErrResourceLimit),
+		context.DeadlineExceeded,
+		fmt.Errorf("execution failed"),
+	} {
+		if isRetryableGraphApplyError(err) {
+			t.Fatalf("error = %v, unexpectedly retryable", err)
+		}
+	}
+}
+
+func TestBeginGraphSnapshotWaitsForWriterOrContext(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	writer, err := m.graph.db.Begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	defer writer.Rollback()
+	if snapshot, err := m.beginGraphSnapshot(blocked); snapshot != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("snapshot while writer is active = (%v, %v), want context cancellation", snapshot, err)
+	}
+	if err := writer.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := m.beginGraphSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot after writer release: %v", err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -246,26 +295,24 @@ func BenchmarkGraphSnapshotFreezeByDatabaseSize(b *testing.B) {
 				b.Fatal(err)
 			}
 			payload = nil
-			initial, err := m.beginGraphSnapshot()
+			initial, err := m.beginGraphSnapshot(context.Background())
 			if err != nil {
+				b.Fatal(err)
+			}
+			// Measure an immutable backup: the live WAL may rotate during directory walks.
+			backupPath := filepath.Join(b.TempDir(), "initial.ltdb")
+			if err := initial.Backup(backupPath); err != nil {
+				_ = initial.Close()
 				b.Fatal(err)
 			}
 			if err := initial.Close(); err != nil {
 				b.Fatal(err)
 			}
-			var databaseBytes int64
-			err = filepath.Walk(filepath.Join(filepath.Dir(m.dbPath), "latticedb", "graph.ltdb"), func(_ string, info os.FileInfo, err error) error {
-				if err != nil {
-					return err
-				}
-				if info.Mode().IsRegular() {
-					databaseBytes += info.Size()
-				}
-				return nil
-			})
+			info, err := os.Stat(backupPath)
 			if err != nil {
 				b.Fatal(err)
 			}
+			databaseBytes := info.Size()
 			if databaseBytes < int64(sizeMiB)<<20 {
 				b.Fatalf("database size %d bytes is smaller than requested %d MiB", databaseBytes, sizeMiB)
 			}
@@ -278,7 +325,7 @@ func BenchmarkGraphSnapshotFreezeByDatabaseSize(b *testing.B) {
 					b.Fatal(err)
 				}
 				b.StartTimer()
-				snapshot, err := m.beginGraphSnapshot()
+				snapshot, err := m.beginGraphSnapshot(context.Background())
 				if err != nil {
 					b.Fatal(err)
 				}

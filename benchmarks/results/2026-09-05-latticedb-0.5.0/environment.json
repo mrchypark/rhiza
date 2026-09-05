@@ -1,0 +1,14 @@
+{
+  "base_commit": "0445347eb15657d354541f79ea3b039ae1b0bc6c",
+  "go": "go version go1.27.0 darwin/arm64",
+  "cpu": "Apple M3",
+  "GOOS": "darwin",
+  "GOARCH": "arm64",
+  "GOMAXPROCS": 2,
+  "baseline": "v0.3.0",
+  "candidate": "v0.5.0",
+  "candidate_dependency_commit": "299e3003e84f85becd504217a63e63dde784b36c",
+  "samples": 10,
+  "order": "alternating 030/050 and 050/030",
+  "concurrent_load": "Other user processes including Dory VM and macOS background work remained active; no capacity claim."
+}

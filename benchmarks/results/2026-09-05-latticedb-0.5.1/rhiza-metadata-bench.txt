@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M3
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	     100	   9012999 ns/op	    8774 B/op	      36 allocs/op
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	     100	   7902877 ns/op	    8768 B/op	      36 allocs/op
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	     100	   3473248 ns/op	    8762 B/op	      36 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	11.077s
