@@ -1,0 +1,52 @@
+{
+  "baseline_sha": "3b5a5a07aaf83b5ed279f75b920395bda7179577",
+  "candidate": "working tree: receipt barrier fix and reuse encoded archive bytes",
+  "go": "go version go1.27.0 darwin/arm64",
+  "os": "macOS arm64 Apple M3; MinIO in local Docker linux/aarch64",
+  "server_samples_per_revision": 3,
+  "requests_per_sample": 3000,
+  "concurrency": 16,
+  "order": [
+    "base1",
+    "candidate1",
+    "candidate2",
+    "base2",
+    "base3",
+    "candidate3"
+  ],
+  "checkpoint_interval": "0",
+  "object_sync_interval": "1h",
+  "durability": "before-ack",
+  "micro_command": "go test ./pkg/recovery -run '^$' -bench '^BenchmarkArchiveBeforeAckPublishExtent$' -benchmem -count=5 -benchtime=500ms",
+  "micro_gomaxprocs": 8,
+  "micro_boundary": "static valid hash/prefix source and in-memory bucket; syncNow publication, no network, group delay or fsync; baseline uses same benchmark fixture with original production code",
+  "production_file_sha256": {
+    "pkg/network/server.go": "b71d37818c154fde5309ad89075df04c9b084262717ddb5c4b78922d55b52432",
+    "pkg/network/graph.go": "52841b90199dc5ceeeada906fe75101d8cd62d59d31fd04df06966f4b3698748",
+    "pkg/recovery/archive.go": "e186a2ec80bbb4a033567a9378a8f17cc5afe796531a8b60c219ddd2848be68b"
+  },
+  "server_summary": {
+    "base": {
+      "success_ops_per_sec": 252.28995709998497,
+      "p50_ms": 51.728375,
+      "p95_ms": 127.790708,
+      "p99_ms": 213.144333,
+      "http_requests_per_write": 0.39666666666666667,
+      "ops_range": [
+        126.6596927623103,
+        335.07845450144885
+      ]
+    },
+    "candidate": {
+      "success_ops_per_sec": 218.0667747472573,
+      "p50_ms": 44.17425,
+      "p95_ms": 199.196416,
+      "p99_ms": 382.364084,
+      "http_requests_per_write": 0.31333333333333335,
+      "ops_range": [
+        163.6639465967693,
+        492.5480894808036
+      ]
+    }
+  }
+}

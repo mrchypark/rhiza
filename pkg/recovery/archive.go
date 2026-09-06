@@ -705,16 +705,9 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		previous, previousObject := head.TailHash, head.TailObject
 		from := tip + 1
 		for from <= through {
-			extent, sourceTip, err := m.buildExtent(core, from, through, previous, previousObject)
+			extent, data, sourceTip, err := m.buildExtent(core, from, through, previous, previousObject)
 			if err != nil {
 				return err
-			}
-			data, err := encodeExtent(extent)
-			if err != nil {
-				return fmt.Errorf("encode archive extent: %w", err)
-			}
-			if len(data) > maxExtentSize {
-				return fmt.Errorf("archive extent exceeds %d bytes", maxExtentSize)
 			}
 			if err := m.uploadExtent(ctx, extent.hash, data, nextGeneration); err != nil {
 				return err
@@ -785,20 +778,20 @@ func (m *Manager) uploadExtent(ctx context.Context, hash [32]byte, data []byte, 
 	return err
 }
 
-func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous [32]byte, previousObject uint64) (Extent, quepaxa.Slot, error) {
+func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous [32]byte, previousObject uint64) (Extent, []byte, quepaxa.Slot, error) {
 	decisions, tip, err := core.DecisionsFrom(from, maxExtentItems)
 	if err != nil {
-		return Extent{}, tip, err
+		return Extent{}, nil, tip, err
 	}
 	if len(decisions) == 0 || decisions[0].Slot != from {
-		return Extent{}, tip, fmt.Errorf("shared archive source omitted slot %d", from)
+		return Extent{}, nil, tip, fmt.Errorf("shared archive source omitted slot %d", from)
 	}
 	var startPrefix [32]byte
 	if from > 1 {
 		var ok bool
 		startPrefix, ok = core.PrefixHash(from - 1)
 		if !ok {
-			return Extent{}, tip, fmt.Errorf("archive start prefix %d is unavailable", from-1)
+			return Extent{}, nil, tip, fmt.Errorf("archive start prefix %d is unavailable", from-1)
 		}
 	}
 	selected := decisions[:0]
@@ -808,18 +801,18 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 		encodedSize := archiveDecisionSize(decision)
 		candidatePrefix, ok := core.PrefixHash(decision.Slot)
 		if !ok {
-			return Extent{}, tip, fmt.Errorf("archive end prefix %d is unavailable", decision.Slot)
+			return Extent{}, nil, tip, fmt.Errorf("archive end prefix %d is unavailable", decision.Slot)
 		}
 		candidate := Extent{ConfigID: m.configID, Start: from, End: decision.Slot, StartPrefix: startPrefix, EndPrefix: candidatePrefix, PreviousHash: previous, PreviousObject: previousObject, Decisions: []quepaxa.DecidedValue{}}
 		size, err := extentEncodedSize(candidate, encodedDecisions+encodedSize, len(selected)+1)
 		if err != nil {
-			return Extent{}, tip, err
+			return Extent{}, nil, tip, err
 		}
 		if len(selected) != 0 && size > maxExtentSize {
 			break
 		}
 		if size > maxExtentSize {
-			return Extent{}, tip, fmt.Errorf("decision %d exceeds archive extent limit", decision.Slot)
+			return Extent{}, nil, tip, fmt.Errorf("decision %d exceeds archive extent limit", decision.Slot)
 		}
 		selected = append(selected, decision)
 		encodedDecisions += encodedSize
@@ -832,14 +825,14 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, PreviousHash: previous, PreviousObject: previousObject, Decisions: selected}
 	data, err := encodeExtent(extent)
 	if err != nil {
-		return Extent{}, tip, err
+		return Extent{}, nil, tip, err
 	}
 	if len(data) > maxExtentSize {
-		return Extent{}, tip, fmt.Errorf("archive extent exceeds %d bytes", maxExtentSize)
+		return Extent{}, nil, tip, fmt.Errorf("archive extent exceeds %d bytes", maxExtentSize)
 	}
 	hash := sha256.Sum256(data)
 	extent.hash = hash
-	return extent, tip, nil
+	return extent, data, tip, nil
 }
 
 func extentEncodedSize(extent Extent, decisionsBytes, decisions int) (int, error) {
