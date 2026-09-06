@@ -96,6 +96,9 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if receipt, found, err := s.material.GraphMutationReceipt(ctx, command.RequestID); err != nil {
 		return GraphExecuteResponse{}, err
 	} else if found {
+		if err := s.waitReceiptDurable(ctx, receipt, command.RequestID); err != nil {
+			return GraphExecuteResponse{}, err
+		}
 		return GraphExecuteResponse{MutationReceipt: receipt}, nil
 	}
 	value, err := types.EncodeGraphBatch([]types.GraphCommand{command})

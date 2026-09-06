@@ -281,6 +281,12 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 	return nil
 }
 
+// waitReceiptDurable confirms that a previously applied mutation still meets
+// the configured before-ack durability policy before its receipt is returned.
+func (s *Server) waitReceiptDurable(ctx context.Context, receipt types.MutationReceipt, requestID string) error {
+	return commitUnknown(quepaxa.Slot(receipt.Slot), requestID, s.waitDurable(ctx, quepaxa.Slot(receipt.Slot)))
+}
+
 // routes registers HTTP routes.
 func (s *Server) routes() {
 	// Client API
@@ -738,6 +744,9 @@ func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand
 		return ExecuteResponse{}, ErrRequestConflict
 	}
 	if found {
+		if err := s.waitReceiptDurable(ctx, receipt, command.RequestID); err != nil {
+			return ExecuteResponse{}, err
+		}
 		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 	}
 	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded)
@@ -1088,6 +1097,9 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationKV, req.RequestID); err != nil {
 		return KVMutationResponse{}, err
 	} else if found {
+		if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+			return KVMutationResponse{}, err
+		}
 		return KVMutationResponse{MutationReceipt: receipt}, nil
 	}
 	command := intent
@@ -1176,6 +1188,9 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 	if receipt, found, err := s.material.MutationReceipt(ctx, types.MutationNotify, req.RequestID); err != nil {
 		return types.MutationReceipt{}, err
 	} else if found {
+		if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+			return types.MutationReceipt{}, err
+		}
 		return receipt, nil
 	}
 	value, err := types.EncodeNotifyCommand(req)

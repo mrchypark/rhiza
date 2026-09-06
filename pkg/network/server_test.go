@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -198,6 +199,104 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 	}
 	if response.Slot == 0 {
 		t.Fatal("retry returned no slot")
+	}
+}
+
+func TestCachedReceiptsWaitForDurabilityBeforeAcknowledging(t *testing.T) {
+	tests := []struct {
+		name    string
+		request string
+		call    func(*Server, context.Context) (uint64, error)
+	}{
+		{
+			name: "sql", request: "durable-sql",
+			call: func(server *Server, ctx context.Context) (uint64, error) {
+				response, err := server.Execute(ctx, ExecuteRequest{RequestID: "durable-sql", SQL: "CREATE TABLE durable_receipt (id INTEGER)"})
+				return response.Slot, err
+			},
+		},
+		{
+			name: "graph", request: "durable-graph",
+			call: func(server *Server, ctx context.Context) (uint64, error) {
+				response, err := server.GraphExecute(ctx, types.GraphCommand{RequestID: "durable-graph", Cypher: "CREATE (:DurableReceipt)"})
+				return response.Slot, err
+			},
+		},
+		{
+			name: "kv", request: "durable-kv",
+			call: func(server *Server, ctx context.Context) (uint64, error) {
+				response, err := server.KVPut(ctx, KVMutationRequest{RequestID: "durable-kv", Key: "receipt", Value: []byte("value")})
+				return response.Slot, err
+			},
+		},
+		{
+			name: "notify", request: "durable-notify",
+			call: func(server *Server, ctx context.Context) (uint64, error) {
+				receipt, err := server.NotifyPublish(ctx, types.NotifyCommand{RequestID: "durable-notify", Topic: "receipt", Payload: []byte("value")})
+				return receipt.Slot, err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			members := []quepaxa.Member{{ID: "n1"}}
+			core := mustCore(t, "n1", members, nil, nil)
+			material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer material.Close()
+			server := NewServer(core, material, "cluster", true, nil)
+			defer server.Close()
+			var unavailable atomic.Bool
+			unavailable.Store(true)
+			var barrierCalls atomic.Uint64
+			var barrierSlot atomic.Uint64
+			server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+				barrierCalls.Add(1)
+				barrierSlot.Store(uint64(slot))
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if unavailable.Load() {
+					return errors.New("bucket unavailable")
+				}
+				return nil
+			})
+
+			if _, err := test.call(server, context.Background()); !errors.Is(err, ErrCommitUnknown) {
+				t.Fatalf("first call error=%v, want commit unknown", err)
+			}
+			if barrierCalls.Load() != 1 || barrierSlot.Load() != 1 {
+				t.Fatalf("first barrier calls=%d slot=%d, want 1/1", barrierCalls.Load(), barrierSlot.Load())
+			}
+			if slot, err := test.call(server, context.Background()); !errors.Is(err, ErrDurabilityUnavailable) || !errors.Is(err, ErrCommitUnknown) {
+				t.Fatalf("cached receipt slot=%d error=%v, want durability unavailable", slot, err)
+			} else {
+				var unknown *CommitUnknownError
+				if !errors.As(err, &unknown) || unknown.Slot != 1 || unknown.RequestID != test.request {
+					t.Fatalf("cached receipt commit unknown=%#v", unknown)
+				}
+			}
+			if barrierCalls.Load() != 2 || barrierSlot.Load() != 1 {
+				t.Fatalf("cached barrier calls=%d slot=%d, want 2/1", barrierCalls.Load(), barrierSlot.Load())
+			}
+			if tip := core.Tip(); tip != 1 {
+				t.Fatalf("cached retry advanced consensus tip to %d", tip)
+			}
+
+			unavailable.Store(false)
+			slot, err := test.call(server, context.Background())
+			if err != nil || slot != 1 {
+				t.Fatalf("durable retry slot=%d err=%v, want slot 1", slot, err)
+			}
+			if barrierCalls.Load() != 3 || barrierSlot.Load() != 1 {
+				t.Fatalf("recovered barrier calls=%d slot=%d, want 3/1", barrierCalls.Load(), barrierSlot.Load())
+			}
+			if tip := core.Tip(); tip != 1 {
+				t.Fatalf("recovered retry advanced consensus tip to %d", tip)
+			}
+		})
 	}
 }
 
