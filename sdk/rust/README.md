@@ -52,7 +52,16 @@ and graph reads request local consistency. Pass an explicit `consistency` value
 through `call` when a supported operation needs a linearizable read.
 
 Opening a DB starts the engine's private voter-peer endpoint, but no public HTTP
-listener. Notification callbacks are not exposed by this SDK. Graph stream
+listener. `notify_publish` and `notify_subscribe` provide bounded pull-based
+subscriptions. `NotificationSubscription::recv_timeout` returns binary payloads
+and `Drop` unsubscribes. Delivery is live, at-most-once, and has no replay;
+slow subscribers can lose events and `notification_drops` is a node-level
+counter. Notifications provide no security or cache-coherence guarantee, so the
+host must reconcile missed events from durable application state. Concurrent raw
+FFI receive and unsubscribe calls have no strict post-unsubscribe delivery
+barrier: an already queued payload may still be returned. The typed Rust API
+requires `&mut self` for receive and unsubscribe, preventing that race in safe
+Rust. Graph stream
 operations use `call`: `graph_stream_read`, `graph_stream_offset`,
 `set_graph_stream_offset`, and `trim_graph_stream`, with the corresponding
 [Go request fields](../../rhiza.go).
