@@ -13,6 +13,7 @@ requests=${RHIZA_SERVER_BENCH_REQUESTS:-100000}
 concurrency=${RHIZA_SERVER_BENCH_CONCURRENCY:-16}
 failed_node=${RHIZA_SERVER_BENCH_FAILED_NODE:-none}
 target_node=${RHIZA_SERVER_BENCH_TARGET_NODE:-n1}
+durability=${RHIZA_SERVER_BENCH_DURABILITY:-async}
 fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
@@ -28,6 +29,10 @@ if [[ $failed_node != none && $failed_node != n0 && $failed_node != n1 && $faile
 fi
 if [[ $target_node != n0 && $target_node != n1 && $target_node != n2 ]]; then
 	printf 'RHIZA_SERVER_BENCH_TARGET_NODE must be n0, n1, or n2\n' >&2
+	exit 2
+fi
+if [[ $durability != async && $durability != before-ack ]]; then
+	printf 'RHIZA_SERVER_BENCH_DURABILITY must be async or before-ack\n' >&2
 	exit 2
 fi
 if [[ $failed_node == "$target_node" ]]; then
@@ -75,9 +80,9 @@ for _ in {1..100}; do
 	sleep 0.1
 done
 curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null
-docker run --rm --network host --entrypoint /bin/sh \
+docker run --rm --add-host host.docker.internal:host-gateway --entrypoint /bin/sh \
 	minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
-	-c "mc alias set local http://127.0.0.1:$minio_port rhiza-e2e rhiza-e2e-secret >/dev/null && mc mb --ignore-existing local/rhiza >/dev/null"
+	-c "mc alias set local http://host.docker.internal:$minio_port rhiza-e2e rhiza-e2e-secret >/dev/null && mc mb --ignore-existing local/rhiza >/dev/null"
 
 members=$(printf '[{"node_id":"n0","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n0-token"},{"node_id":"n1","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n1-token"},{"node_id":"n2","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n2-token"}]' \
 	"$base_http_port" "$base_peer_port" "$((base_http_port + 1))" "$((base_peer_port + 1))" "$((base_http_port + 2))" "$((base_peer_port + 2))")
@@ -88,7 +93,7 @@ for i in 0 1 2; do
 		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$minio_port" RHIZA_OBJSTORE_BUCKET=rhiza \
 		RHIZA_OBJSTORE_PREFIX=server-bench RHIZA_OBJSTORE_REGION=us-east-1 RHIZA_OBJSTORE_INSECURE=true \
 		RHIZA_OBJSTORE_ACCESS_KEY=rhiza-e2e RHIZA_OBJSTORE_SECRET_KEY=rhiza-e2e-secret \
-		RHIZA_OBJSTORE_DURABILITY=async RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
+		RHIZA_OBJSTORE_DURABILITY="$durability" RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \
 		"$run_dir/rhiza" >"$run_dir/node-$i.log" 2>&1 &
 	printf '%s' "$!" >"$run_dir/node-$i.pid"
 done
@@ -109,6 +114,21 @@ target="http://127.0.0.1:$((base_http_port + target_index))"
 curl -fsS -H 'Content-Type: application/json' \
 	-d '{"request_id":"schema","sql":"CREATE TABLE benchmark_writes (id INTEGER PRIMARY KEY)"}' \
 	"$target/sql/execute" >/dev/null
+metric_nodes=(n0 n1 n2)
+case "$failed_node" in
+	n0) metric_nodes=(n1 n2) ;;
+	n1) metric_nodes=(n0 n2) ;;
+	n2) metric_nodes=(n0 n1) ;;
+esac
+object_stats() {
+	local node index
+	for node in "${metric_nodes[@]}"; do
+		index=${node#n}
+		curl -fsS "http://127.0.0.1:$((base_http_port + index))/metrics/object-store" \
+			| jq -c --arg node "$node" '{node:$node,stats:.}'
+	done | jq -sc 'reduce .[] as $item ({}; reduce ($item.stats | to_entries[]) as $entry (. ; .[$entry.key] = ((.[$entry.key] // 0) + $entry.value)))'
+}
+object_before=$(object_stats)
 result_file="$run_dir/result.json"
 "$run_dir/rhiza-bench" -url "$target" -path /sql/execute \
 	-body '{"request_id":"bench-{{id}}","sql":"INSERT INTO benchmark_writes(id) VALUES ({{id}})"}' \
@@ -132,6 +152,11 @@ tee "$output_file" <<<"$result" >/dev/null
 count=$(curl -fsS -H 'Content-Type: application/json' \
 	-d '{"sql":"SELECT COUNT(*) FROM benchmark_writes WHERE id >= 0","consistency":"linearizable"}' \
 	"$target/sql/query")
+object_after=$(object_stats)
+object_delta=$(jq -nc --argjson before "$object_before" --argjson after "$object_after" \
+	'reduce ((($before|keys_unsorted) + ($after|keys_unsorted)) | unique[]) as $key
+		({}; .[$key] = (($after[$key] // 0) - ($before[$key] // 0)))')
+object_metric_nodes=$(printf '%s\n' "${metric_nodes[@]}" | jq -R . | jq -sc .)
 jq -e --argjson requests "$requests" '.errors == 0 and .successes == $requests' <<<"$result" >/dev/null
 jq -e --argjson requests "$requests" '.rows == [[$requests]]' <<<"$count" >/dev/null
 runtime_failure_lines=0
@@ -139,7 +164,7 @@ for log in "$run_dir"/node-*.log; do
 	log_failures=$(grep -Ei 'error|failed|timeout' "$log" | grep -Eivc 'failed to sufficiently increase receive buffer size' || true)
 	runtime_failure_lines=$((runtime_failure_lines + log_failures))
 done
-jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg fault_after "$fault_after" \
-	'{transport:"HTTP client + three QUIC voters",durability:"quorum WAL sync",failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
+jq -nc --argjson result "$result" --argjson count "$count" --argjson concurrency "$concurrency" --argjson runtime_failure_lines "$runtime_failure_lines" --argjson max_fault_latency_ms "$max_fault_latency_ms" --argjson object_delta "$object_delta" --argjson object_metric_nodes "$object_metric_nodes" --arg failed_node "$failed_node" --arg target_node "$target_node" --arg durability "$durability" --arg fault_after "$fault_after" \
+	'{transport:"HTTP client + three QUIC voters",durability_mode:$durability,ack_contract:(if $durability == "before-ack" then "quorum WAL sync and object-store durability before acknowledgement" else "quorum WAL sync; object-store publication async" end),failure_mode:(if $failed_node == "none" then "healthy" else "peer-sigkill-during-load" end),failed_node:$failed_node,target_node:$target_node,fault_after:(if $failed_node == "none" then null else $fault_after end),max_fault_latency_ms:(if $failed_node == "none" then null else $max_fault_latency_ms end),concurrency:$concurrency,object_metric_nodes:$object_metric_nodes,object_measurement:"after schema through final linearizable verification",object_store_delta:$object_delta,runtime_failure_lines:$runtime_failure_lines,result:$result,verification:$count}' \
 	| tee "$output_file"
 jq -e '.runtime_failure_lines == 0 and (.failed_node == "none" or .result.max_ms <= .max_fault_latency_ms)' "$output_file" >/dev/null

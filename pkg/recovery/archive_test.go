@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"strings"
@@ -625,11 +626,7 @@ func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
 	}
 	base := objstore.NewInMemBucket()
 	builder := NewManager(base, "cluster", 1)
-	extent, _, err := builder.buildExtent(core, 1, 1, [32]byte{}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := encodeExtent(extent)
+	extent, data, _, err := builder.buildExtent(core, 1, 1, [32]byte{}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,6 +675,91 @@ func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
 	values, tip, err := reader.DecisionsFrom(ctx, 1, 1)
 	if err != nil || tip != 1 || len(values) != 1 || !bytes.Equal(values[0].Value, []byte("value")) {
 		t.Fatalf("tip=%d values=%#v err=%v", tip, values, err)
+	}
+}
+
+func TestBuildExtentPublishedBytesRecoverExactly(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range [][]byte{[]byte("first"), bytes.Repeat([]byte("second"), 512)} {
+		if _, _, err := core.Propose(ctx, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	extent, data, _, err := manager.buildExtent(core, 1, core.Tip(), [32]byte{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sha256.Sum256(data) != extent.hash {
+		t.Fatal("extent hash does not match published bytes")
+	}
+	if err := manager.uploadExtent(ctx, extent.hash, data, 1); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := manager.readExtent(ctx, extent.hash, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered.Decisions) != len(extent.Decisions) {
+		t.Fatalf("recovered decisions=%d, want %d", len(recovered.Decisions), len(extent.Decisions))
+	}
+	for i := range extent.Decisions {
+		if recovered.Decisions[i].Slot != extent.Decisions[i].Slot || !bytes.Equal(recovered.Decisions[i].Value, extent.Decisions[i].Value) || !bytes.Equal(recovered.Decisions[i].Certificate, extent.Decisions[i].Certificate) {
+			t.Fatalf("recovered decision %d differs from published bytes", i)
+		}
+	}
+}
+
+type archiveBenchmarkSource struct {
+	decisions []quepaxa.DecidedValue
+	prefixes  [][32]byte
+}
+
+func (s archiveBenchmarkSource) DecisionsFrom(from quepaxa.Slot, limit int) ([]quepaxa.DecidedValue, quepaxa.Slot, error) {
+	start := int(from - 1)
+	end := min(start+limit, len(s.decisions))
+	return s.decisions[start:end], quepaxa.Slot(len(s.decisions)), nil
+}
+
+func (s archiveBenchmarkSource) PrefixHash(slot quepaxa.Slot) ([32]byte, bool) {
+	if int(slot) >= len(s.prefixes) {
+		return [32]byte{}, false
+	}
+	return s.prefixes[slot], true
+}
+
+func (s archiveBenchmarkSource) Tip() quepaxa.Slot { return quepaxa.Slot(len(s.decisions)) }
+
+func BenchmarkArchiveBeforeAckPublishExtent(b *testing.B) {
+	value := bytes.Repeat([]byte("v"), 4<<10)
+	for _, count := range []int{1, 32, maxExtentItems} {
+		b.Run(fmt.Sprintf("%dx4KiB", count), func(b *testing.B) {
+			source := archiveBenchmarkSource{decisions: make([]quepaxa.DecidedValue, count), prefixes: make([][32]byte, count+1)}
+			for i := range source.decisions {
+				slot := quepaxa.Slot(i + 1)
+				hash := sha256.Sum256(value)
+				source.decisions[i] = quepaxa.DecidedValue{Slot: slot, Hash: hash, Value: value, Certificate: []byte("certificate")}
+				source.prefixes[i+1] = quepaxa.AdvancePrefixHash(source.prefixes[i], slot, hash)
+			}
+			b.SetBytes(int64(count * len(value)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+				if err := manager.syncNow(context.Background(), source, source.Tip()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

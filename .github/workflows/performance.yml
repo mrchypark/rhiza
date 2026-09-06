@@ -161,6 +161,7 @@ jobs:
           RHIZA_SERVER_BENCH_CONCURRENCY: 16
         run: |
           git worktree add --detach "$RUNNER_TEMP/rhiza-server-candidate" "${{ steps.revisions.outputs.candidate_sha }}"
+          git worktree add --detach "$RUNNER_TEMP/rhiza-server-base" "${{ steps.revisions.outputs.base_sha }}"
           benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server.json"
@@ -173,12 +174,36 @@ jobs:
           RHIZA_SERVER_BENCH_FAILED_NODE=n2 RHIZA_SERVER_BENCH_TARGET_NODE=n0 benchmarks/run-server-reference.sh \
             "$RUNNER_TEMP/rhiza-server-candidate" \
             "$RUNNER_TEMP/rhiza-performance/rhiza-server-n2-failed.json"
+          for sample in 1 2 3; do
+            if (( sample % 2 )); then
+              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+                "$RUNNER_TEMP/rhiza-server-base" \
+                "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-$sample.json"
+              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+                "$RUNNER_TEMP/rhiza-server-candidate" \
+                "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-$sample.json"
+            else
+              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+                "$RUNNER_TEMP/rhiza-server-candidate" \
+                "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-candidate-$sample.json"
+              RHIZA_SERVER_BENCH_DURABILITY=before-ack RHIZA_SERVER_BENCH_REQUESTS=10000 benchmarks/run-server-reference.sh \
+                "$RUNNER_TEMP/rhiza-server-base" \
+                "$RUNNER_TEMP/rhiza-performance/rhiza-server-before-ack-base-$sample.json"
+            fi
+          done
           rhiza_ops=$(jq -r '.result.success_ops_per_sec | floor' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
           rhiza_p99=$(jq -r '.result.p99_ms' "$RUNNER_TEMP/rhiza-performance/rhiza-server.json")
+          before_ack_base_ops=$(jq -sr '[.[].result.success_ops_per_sec] | sort | .[length / 2 | floor] | floor' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-base-*.json)
+          before_ack_base_p99=$(jq -sr '[.[].result.p99_ms] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-base-*.json)
+          before_ack_base_http=$(jq -sr '[.[].object_store_delta.http_requests] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-base-*.json)
+          before_ack_candidate_ops=$(jq -sr '[.[].result.success_ops_per_sec] | sort | .[length / 2 | floor] | floor' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
+          before_ack_candidate_p99=$(jq -sr '[.[].result.p99_ms] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
+          before_ack_candidate_http=$(jq -sr '[.[].object_store_delta.http_requests] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
+          before_ack_candidate_put=$(jq -sr '[.[].object_store_delta.http_put_requests] | sort | .[length / 2 | floor]' "$RUNNER_TEMP"/rhiza-performance/rhiza-server-before-ack-candidate-*.json)
           # shellcheck disable=SC2016
           {
             printf '\n## Rhiza leaderless availability qualification\n\n'
-            printf 'Quorum-WAL-durable three-voter HTTP/QUIC workload: `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
+            printf 'Async three-voter HTTP/QUIC workload (quorum-WAL ACK): `%s ops/s`, p99 `%s ms`.\n\n' "$rhiza_ops" "$rhiza_p99"
             for peer in n0 n1 n2; do
               file="$RUNNER_TEMP/rhiza-performance/rhiza-server-$peer-failed.json"
               ops=$(jq -r '.result.success_ops_per_sec | floor' "$file")
@@ -189,6 +214,10 @@ jobs:
               printf 'Peer `%s` SIGKILL during load: `%s ops/s`, p99 `%s ms`, max `%s ms`, `%s` commit-unknown retries, zero failed writes, `%s` runtime failure log lines.\n\n' "$peer" "$ops" "$p99" "$max" "$retries" "$log_failures"
             done
             printf 'QuePaxa has no stable leader role, so failures are reported by peer identity. Each fault is injected during `-c 16 -n 100000`; every acknowledged row is verified by a linearizable query.\n'
+            printf '\n## Rhiza before-ack durability qualification\n\n'
+            printf 'Three interleaved healthy HTTP/QUIC samples (`-c 16 -n 10000`) wait for object-store durability before each acknowledgement. Median base: `%s ops/s`, p99 `%s ms`; candidate: `%s ops/s`, p99 `%s ms`.\n\n' "$before_ack_base_ops" "$before_ack_base_p99" "$before_ack_candidate_ops" "$before_ack_candidate_p99"
+            printf 'Base object-store HTTP request delta: `%s`.\n\n' "$before_ack_base_http"
+            printf 'Candidate object-store delta from post-schema setup through final linearizable verification: `%s` HTTP requests, `%s` PUT requests. Full logical and HTTP method counters are retained in the JSON artifacts.\n' "$before_ack_candidate_http" "$before_ack_candidate_put"
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record runner environment
@@ -201,6 +230,7 @@ jobs:
             printf 'hiqlite_official_log_sync=interval_200\n'
             printf 'hiqlite_durable_log_sync=immediate\n'
             printf 'rhiza_failure_scenarios=each_peer_sigkill_during_timed_workload\n'
+            printf 'rhiza_before_ack_scenarios=three_interleaved_healthy_base_and_candidate_http_quic_samples\n'
             printf 'hiqlite_failure_scenarios=raft_leader_or_follower_gracefully_stopped_before_timed_workload\n'
             lscpu
             free -b
