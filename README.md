@@ -71,7 +71,7 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.12.0"` in your Cargo dependencies.
+Use `rhizadb = "0.12.3"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous, and the embedded engine still starts its private peer
@@ -136,7 +136,7 @@ reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
 
 ### Graph and Cypher
 
-Rhiza uses `latticedb-go v0.3.0` and exposes its deliberately small,
+Rhiza uses `latticedb-go v0.6.0` and exposes its deliberately small,
 case-sensitive Cypher subset. This is not full openCypher. Structural keywords
 must be uppercase.
 
@@ -181,8 +181,8 @@ indexes are node-local derived state: they are not replicated, and Rhiza
 reconciles them when the node opens or installs a checkpoint.
 
 The dependency owns the complete language contract. See the version-pinned
-[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/docs/engine_conformance.md#supported-cypher-subset)
-and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.3.0/internal/engine/testdata/query_grammar.ebnf).
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.6.0/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.6.0/internal/engine/testdata/query_grammar.ebnf).
 
 ### Graph streams
 

@@ -12,7 +12,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.12.2"
+rhizadb = "0.12.3"
 serde_json = "1"
 ```
 
