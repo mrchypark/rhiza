@@ -675,6 +675,8 @@ func TestReadIndexSurvivesOneFailureAndFailsWithoutQuorum(t *testing.T) {
 }
 
 func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	cores, _ := newTestCluster(t)
 	if _, _, err := cores["n1"].Propose(context.Background(), []byte("state")); err != nil {
 		t.Fatal(err)
@@ -700,8 +702,12 @@ func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
 	}
 	order, _ := cores["n1"].LeaderOrder(2)
 	checkpoint := CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix, NextLeaderOrder: order}
+	// Propose waits for a quorum; this test prepares every voter.
 	for _, core := range cores {
-		if err := core.PrepareCheckpoint(context.Background(), checkpoint); err != nil {
+		if err := core.WaitTip(ctx, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := core.PrepareCheckpoint(ctx, checkpoint); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -721,6 +727,8 @@ func TestCheckpointSealRequiresPrefixAndObjectQuorum(t *testing.T) {
 }
 
 func TestCompactedLearnerCountsAsCoveredQuorum(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	cores, transport := newTestCluster(t)
 	if _, _, err := cores["n1"].Propose(context.Background(), []byte("covered write")); err != nil {
 		t.Fatal(err)
@@ -741,8 +749,12 @@ func TestCompactedLearnerCountsAsCoveredQuorum(t *testing.T) {
 	}
 	order, _ := cores["n1"].LeaderOrder(2)
 	checkpointSeal := CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root, StateHash: state, PrefixHash: prefix, NextLeaderOrder: order}
+	// Propose waits for a quorum; this test prepares every voter.
 	for _, core := range cores {
-		if err := core.PrepareCheckpoint(context.Background(), checkpointSeal); err != nil {
+		if err := core.WaitTip(ctx, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := core.PrepareCheckpoint(ctx, checkpointSeal); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -751,6 +763,9 @@ func TestCompactedLearnerCountsAsCoveredQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, _, err := cores["n1"].Propose(context.Background(), seal); err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["n2"].WaitTip(ctx, 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := cores["n2"].CompactThrough(1, root); err != nil {
