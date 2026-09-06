@@ -1,6 +1,6 @@
 [package]
 name = "rhizadb"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 description = "Embedded Rust SDK for Rhiza via its local Go C archive"
 license = "MIT"
