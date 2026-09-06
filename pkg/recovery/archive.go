@@ -20,6 +20,7 @@ import (
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -1027,8 +1028,15 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter()); err != nil {
 		return err
 	}
+	deleteCtx, cancelDeletes := context.WithCancel(ctx)
+	defer cancelDeletes()
+	deletes, deleteCtx := errgroup.WithContext(deleteCtx)
+	deletes.SetLimit(4)
 	for _, dir := range []string{"archive/manifests", "archive/blocks"} {
-		if err := m.bucket.Iter(ctx, m.key(dir), func(name string) error {
+		if err := m.bucket.Iter(deleteCtx, m.key(dir), func(name string) error {
+			if err := deleteCtx.Err(); err != nil {
+				return err
+			}
 			marker := m.gcMarkerKey(name)
 			markedAt, marked := markers[marker]
 			delete(markers, marker)
@@ -1068,16 +1076,26 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 			if markedAt.After(cutoff) {
 				return nil
 			}
-			if err := m.bucket.Delete(ctx, name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
-				return err
-			}
-			if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
-				return err
-			}
-			return nil
+			deletes.Go(func() error {
+				if err := deleteCtx.Err(); err != nil {
+					return err
+				}
+				if err := m.bucket.Delete(deleteCtx, name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+					return err
+				}
+				if err := m.bucket.Delete(deleteCtx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+					return err
+				}
+				return nil
+			})
+			return deleteCtx.Err()
 		}); err != nil {
-			return err
+			cancelDeletes()
+			return errors.Join(err, deletes.Wait())
 		}
+	}
+	if err := deletes.Wait(); err != nil {
+		return err
 	}
 	for marker := range markers {
 		if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
