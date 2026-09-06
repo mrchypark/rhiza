@@ -255,10 +255,76 @@ impl Db {
     pub fn object_store_stats(&self) -> Result<Value> {
         self.call("object_store_stats", json!({}))
     }
+    /// Publishes one replicated notification. `payload` is binary data, encoded
+    /// as base64 through the same FFI JSON boundary as KV values.
+    pub fn notify_publish(
+        &self,
+        request_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<MutationReceipt> {
+        self.call(
+            "notify_publish",
+            json!({"request_id":request_id,"topic":topic,"payload":STANDARD.encode(payload)}),
+        )
+    }
+    /// Starts a bounded, live notification subscription for this DB handle.
+    pub fn notify_subscribe(&self, topic: &str) -> Result<NotificationSubscription<'_>> {
+        let response: NotificationSubscriptionResponse =
+            self.call("notify_subscribe", json!({"topic":topic}))?;
+        Ok(NotificationSubscription {
+            db: self,
+            id: response.subscription_id,
+            closed: false,
+        })
+    }
+    /// Reports node-local notification deliveries dropped by saturated queues.
+    pub fn notification_drops(&self) -> Result<u64> {
+        self.call("notification_drops", json!({}))
+    }
 }
 impl Drop for Db {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+/// A borrowed, pull-based live notification subscription. It has no replay;
+/// callers must reconcile missed events from durable application state. Safe
+/// Rust serializes receive and unsubscribe with `&mut self`; raw FFI users can
+/// still receive an already queued payload while unsubscribing concurrently.
+pub struct NotificationSubscription<'a> {
+    db: &'a Db,
+    id: u64,
+    closed: bool,
+}
+impl NotificationSubscription<'_> {
+    /// Waits for one payload. A deadline expiry returns `Error { code: "timeout", .. }`.
+    pub fn recv_timeout(&mut self, timeout_ms: u64) -> Result<Vec<u8>> {
+        let response: NotificationResponse = self.db.call_timeout(
+            "notify_recv",
+            json!({"subscription_id":self.id}),
+            timeout_ms,
+        )?;
+        STANDARD.decode(response.payload).map_err(|error| Error {
+            code: "invalid_response".into(),
+            message: error.to_string(),
+        })
+    }
+    /// Stops the subscription. It is also stopped when dropped.
+    pub fn unsubscribe(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.db
+            .call::<()>("notify_unsubscribe", json!({"subscription_id":self.id}))?;
+        self.closed = true;
+        Ok(())
+    }
+}
+impl Drop for NotificationSubscription<'_> {
+    fn drop(&mut self) {
+        let _ = self.unsubscribe();
     }
 }
 
@@ -325,6 +391,14 @@ pub struct QueryResult {
 struct KVGetResponse {
     found: bool,
     value: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct NotificationSubscriptionResponse {
+    subscription_id: u64,
+}
+#[derive(Clone, Debug, Deserialize)]
+struct NotificationResponse {
+    payload: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct RequestStatus {
@@ -580,5 +654,23 @@ mod tests {
         };
         db.close().unwrap();
         assert_eq!(db.ready().unwrap_err().code, "closed");
+    }
+    #[test]
+    fn notifications_deliver_binary_payloads_and_drop_unsubscribes() {
+        let db = db();
+        {
+            let mut subscription = db.notify_subscribe("jobs").unwrap();
+            db.notify_publish("notice", "jobs", &[0, 255, b'o', b'k'])
+                .unwrap()
+                .require_committed()
+                .unwrap();
+            assert_eq!(
+                subscription.recv_timeout(1_000).unwrap(),
+                vec![0, 255, b'o', b'k']
+            );
+        }
+        let mut replacement = db.notify_subscribe("jobs").unwrap();
+        replacement.unsubscribe().unwrap();
+        assert_eq!(db.notification_drops().unwrap(), 0);
     }
 }
