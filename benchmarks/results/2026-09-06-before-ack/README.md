@@ -8,7 +8,7 @@ local measurements, not measurements against the current PR base. The receipt
 fix has since shipped in v0.12.1; this PR contains only archive encoding and
 benchmark/CI changes on top of that release.
 
-## Archive CPU/allocation measurement
+## Archive CPU/allocated-byte measurement
 
 Five samples per revision, Apple M3, Go 1.27.0, GOMAXPROCS=8, 500ms/sample.
 The identical benchmark fixture measures `syncNow` publication using a static
@@ -16,7 +16,7 @@ source and in-memory bucket. It excludes network latency, WAL fsync, and group
 delay. Baseline ran before the production edit. Raw samples transcribed from
 the measurement tool output are in `archive-micro-samples.json`.
 
-| Payload per extent | Baseline median | Candidate median | Time change | Allocation change |
+| Payload per extent | Baseline median | Candidate median | Time change | Allocated bytes/op change |
 | --- | ---: | ---: | ---: | ---: |
 | 1 × 4 KiB | 12.434 µs | 8.264 µs | -33.5% | -19.0% |
 | 32 × 4 KiB | 267.631 µs | 171.393 µs | -36.0% | -23.5% |
@@ -48,7 +48,7 @@ Candidate median throughput was 13.6% lower and p99 79.4% higher, while ranges
 overlap widely: baseline 126.7–335.1 and candidate 163.7–492.5 writes/s.
 This is a shared developer machine with Docker virtualization, not an isolated
 performance runner; three samples cannot distinguish a regression from this
-variation. Archive CPU/allocation improvement must not be presented as an HTTP
+variation. Archive CPU/allocated-byte improvement must not be presented as an HTTP
 performance improvement.
 
 Object counters cover all three nodes, after schema creation through the final
