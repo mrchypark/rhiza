@@ -1,0 +1,22 @@
+{
+  "baseline_revision": "bc944c1521f588feee9c5f5a59abe37d15f8063d",
+  "candidate_revision": "38af008dd99f1073b682a224ae01f0a4c83c1f30",
+  "go": "go1.27.0 darwin/arm64",
+  "host": "Apple M3, Darwin arm64",
+  "provider": "disposable local Docker MinIO",
+  "image": "minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+  "health_http_ms": [
+    25.81945899873972,
+    1.1127920006401837,
+    1.4248749939724803,
+    0.8451250032521784,
+    0.861792010255158
+  ],
+  "sha256": {
+    "baseline_binary": "2bcba4f6d63d39e18eec81ff54a537c428d76be0402bdddf4217e9605cca6581",
+    "candidate_binary": "0d26f35d59b2bdc2da75006ca2bc9c650f7e657e4457820de42a1dfddba3bb53",
+    "baseline_archive_go": "e186a2ec80bbb4a033567a9378a8f17cc5afe796531a8b60c219ddd2848be68b",
+    "candidate_archive_go": "a79b6ce9b4dd4d745e4fdaf7275a7d5a80e6084777e293d513ded5d0021a3d0e",
+    "fixture": "19b2f84a0dc2a4a910fc34fc84d54a13f6341712d9dffa37d00c46021e0b217f"
+  }
+}
