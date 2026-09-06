@@ -22,21 +22,33 @@ import (
 	"unsafe"
 
 	"github.com/mrchypark/rhiza"
+	"github.com/mrchypark/rhiza/pkg/network"
 )
 
 const (
-	maxInputBytes  = 16 << 20
-	defaultTimeout = 30 * time.Second
+	maxInputBytes    = 16 << 20
+	defaultTimeout   = 30 * time.Second
+	maxSubscriptions = 64
 )
 
 type ffiEntry struct {
-	db      *rhiza.DB
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	active  int
-	closed  bool
-	drained chan struct{}
+	db            *rhiza.DB
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	active        int
+	closed        bool
+	drained       chan struct{}
+	nextSub       uint64
+	pendingSubs   int
+	subscriptions map[uint64]*ffiSubscription
+}
+
+type ffiSubscription struct {
+	ch     <-chan []byte
+	cancel func()
+	ctx    context.Context
+	stop   context.CancelFunc
 }
 
 var ffiRegistry = struct {
@@ -124,7 +136,7 @@ func goOpen(input []byte) []byte {
 		return errorJSON(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	entry := &ffiEntry{db: db, ctx: ctx, cancel: cancel, drained: make(chan struct{})}
+	entry := &ffiEntry{db: db, ctx: ctx, cancel: cancel, drained: make(chan struct{}), nextSub: 1, subscriptions: make(map[uint64]*ffiSubscription)}
 	ffiRegistry.Lock()
 	handle := ffiRegistry.next
 	if handle == 0 || handle == math.MaxUint64 {
@@ -162,7 +174,7 @@ func goCall(handle uint64, input []byte, timeoutMS uint64) []byte {
 	if call.Operation == "" || len(call.Request) == 0 || bytes.Equal(bytes.TrimSpace(call.Request), []byte("null")) {
 		return errorJSON(&ffiError{Code: "invalid_request", Message: "operation and request are required"})
 	}
-	result, err := dispatch(ctx, entry.db, call)
+	result, err := dispatch(ctx, entry, call)
 	if err != nil {
 		var syntax *json.SyntaxError
 		var typeError *json.UnmarshalTypeError
@@ -187,10 +199,19 @@ func goClose(handle uint64) []byte {
 	entry.mu.Lock()
 	entry.closed = true
 	entry.cancel()
+	subscriptions := make([]*ffiSubscription, 0, len(entry.subscriptions))
+	for _, sub := range entry.subscriptions {
+		subscriptions = append(subscriptions, sub)
+	}
+	entry.subscriptions = nil
 	if entry.active == 0 {
 		close(entry.drained)
 	}
 	entry.mu.Unlock()
+	for _, sub := range subscriptions {
+		sub.stop()
+		sub.cancel()
+	}
 	<-entry.drained
 	if err := entry.db.Close(); err != nil {
 		return errorJSON(err)
@@ -255,7 +276,8 @@ func decodeStrict(input []byte, value any) error {
 	return nil
 }
 
-func dispatch(ctx context.Context, db *rhiza.DB, call callEnvelope) (any, error) {
+func dispatch(ctx context.Context, entry *ffiEntry, call callEnvelope) (any, error) {
+	db := entry.db
 	decode := func(target any) error {
 		if err := decodeStrict(call.Request, target); err != nil {
 			return &ffiError{Code: "invalid_request", Message: err.Error()}
@@ -263,6 +285,41 @@ func dispatch(ctx context.Context, db *rhiza.DB, call callEnvelope) (any, error)
 		return nil
 	}
 	switch call.Operation {
+	case "notify_publish":
+		var r rhiza.NotifyCommand
+		if err := decode(&r); err != nil {
+			return nil, err
+		}
+		return db.NotifyPublish(ctx, r)
+	case "notify_subscribe":
+		var r struct {
+			Topic string `json:"topic"`
+		}
+		if err := decode(&r); err != nil {
+			return nil, err
+		}
+		return entry.subscribe(r.Topic)
+	case "notify_recv":
+		var r struct {
+			SubscriptionID uint64 `json:"subscription_id"`
+		}
+		if err := decode(&r); err != nil {
+			return nil, err
+		}
+		return entry.recv(ctx, r.SubscriptionID)
+	case "notify_unsubscribe":
+		var r struct {
+			SubscriptionID uint64 `json:"subscription_id"`
+		}
+		if err := decode(&r); err != nil {
+			return nil, err
+		}
+		return nil, entry.unsubscribe(r.SubscriptionID)
+	case "notification_drops":
+		if err := decode(&struct{}{}); err != nil {
+			return nil, err
+		}
+		return db.NotificationDrops(), nil
 	case "execute", "execute_returning":
 		var r rhiza.ExecuteRequest
 		if err := decode(&r); err != nil {
@@ -360,6 +417,83 @@ func dispatch(ctx context.Context, db *rhiza.DB, call callEnvelope) (any, error)
 	}
 }
 
+func (entry *ffiEntry) subscribe(topic string) (map[string]uint64, error) {
+	entry.mu.Lock()
+	if entry.closed {
+		entry.mu.Unlock()
+		return nil, &ffiError{Code: "closed", Message: "Rhiza handle is closing"}
+	}
+	if len(entry.subscriptions)+entry.pendingSubs >= maxSubscriptions {
+		entry.mu.Unlock()
+		return nil, &ffiError{Code: "overloaded", Message: "notification subscription limit reached"}
+	}
+	entry.pendingSubs++
+	entry.mu.Unlock()
+
+	ch, cancel, err := entry.db.NotifySubscribe(topic)
+	if err != nil {
+		entry.mu.Lock()
+		entry.pendingSubs--
+		entry.mu.Unlock()
+		return nil, err
+	}
+	ctx, stop := context.WithCancel(entry.ctx)
+	entry.mu.Lock()
+	entry.pendingSubs--
+	if entry.closed {
+		entry.mu.Unlock()
+		stop()
+		cancel()
+		return nil, &ffiError{Code: "closed", Message: "Rhiza handle is closing"}
+	}
+	id := entry.nextSub
+	if id == 0 || id == math.MaxUint64 {
+		entry.mu.Unlock()
+		stop()
+		cancel()
+		return nil, &ffiError{Code: "handle_exhausted", Message: "notification subscription space exhausted"}
+	}
+	entry.nextSub++
+	entry.subscriptions[id] = &ffiSubscription{ch: ch, cancel: cancel, ctx: ctx, stop: stop}
+	entry.mu.Unlock()
+	return map[string]uint64{"subscription_id": id}, nil
+}
+
+func (entry *ffiEntry) recv(ctx context.Context, id uint64) (map[string][]byte, error) {
+	entry.mu.Lock()
+	sub := entry.subscriptions[id]
+	entry.mu.Unlock()
+	if sub == nil {
+		return nil, &ffiError{Code: "invalid_subscription", Message: "unknown or closed notification subscription"}
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-sub.ctx.Done():
+		return nil, context.Canceled
+	case payload, ok := <-sub.ch:
+		if !ok {
+			return nil, context.Canceled
+		}
+		return map[string][]byte{"payload": payload}, nil
+	}
+}
+
+func (entry *ffiEntry) unsubscribe(id uint64) error {
+	entry.mu.Lock()
+	sub := entry.subscriptions[id]
+	if sub != nil {
+		delete(entry.subscriptions, id)
+	}
+	entry.mu.Unlock()
+	if sub == nil {
+		return &ffiError{Code: "invalid_subscription", Message: "unknown or closed notification subscription"}
+	}
+	sub.stop()
+	sub.cancel()
+	return nil
+}
+
 func dataJSON(value any) []byte {
 	b, err := json.Marshal(map[string]any{"data": value})
 	if err != nil {
@@ -399,6 +533,8 @@ func errorCode(err error) string {
 		return "request_conflict"
 	case errors.Is(err, rhiza.ErrDurabilityUnavailable):
 		return "durability_unavailable"
+	case errors.Is(err, network.ErrOverloaded):
+		return "overloaded"
 	default:
 		return "internal"
 	}
