@@ -250,6 +250,73 @@ func TestWALAppendRead(t *testing.T) {
 	}
 }
 
+func TestWALIdentitySurvivesCompactionAndRejectsReplacement(t *testing.T) {
+	dir := t.TempDir()
+	identity := []byte("voter-identity-32-byte-nonce-000")
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := wal.Identity(); ok {
+		t.Fatal("new WAL unexpectedly has an identity")
+	}
+	if err := wal.BindIdentity(identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.BindIdentity([]byte("different")); err == nil {
+		t.Fatal("WAL identity was replaced")
+	}
+	if err := wal.Compact(Entry{Slot: 1, Type: EntryCheckpoint, Payload: []byte("base")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reopened.Identity()
+	if !ok || !bytes.Equal(got, identity) {
+		t.Fatalf("reopened identity=%x present=%t", got, ok)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keeping an external voter marker while replacing the WAL must not carry
+	// forward this WAL-bound value.
+	marker := filepath.Join(dir, "voter-identity.json")
+	if err := os.WriteFile(marker, identity, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifests, err := filepath.Glob(filepath.Join(dir, "manifest_*.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	segments, err := filepath.Glob(filepath.Join(dir, "seg_*.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range append(manifests, segments...) {
+		if err := os.Remove(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replacement, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if got, ok := replacement.Identity(); ok || bytes.Equal(got, identity) {
+		t.Fatalf("replacement WAL retained identity=%x present=%t", got, ok)
+	}
+	if markerData, err := os.ReadFile(marker); err != nil || !bytes.Equal(markerData, identity) {
+		t.Fatalf("external marker was not preserved: %v", err)
+	}
+}
+
 func TestWALReadLargeEntry(t *testing.T) {
 	dir := t.TempDir()
 	large := Entry{Slot: 1, Type: EntryProposal, Payload: make([]byte, 2*1024*1024)}

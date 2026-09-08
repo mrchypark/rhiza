@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -22,14 +23,20 @@ import (
 )
 
 func main() {
+	enroll := flag.Bool("enroll-existing-voter", false, "register an original pre-upgrade WAL while every voter is offline, then exit")
+	flag.Parse()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx); err != nil {
+	if err := runCommand(ctx, *enroll); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func run(ctx context.Context) (resultErr error) {
+	return runCommand(ctx, false)
+}
+
+func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 	var members []rhiza.Member
 	if raw := os.Getenv("RHIZA_CLUSTER_MEMBERS"); raw != "" {
 		if err := decodeStrictJSON(raw, &members); err != nil {
@@ -126,6 +133,12 @@ func run(ctx context.Context) (resultErr error) {
 	}
 
 	role := getEnvOrDefault("RHIZA_ROLE", "voter")
+	if enroll {
+		if role != "voter" {
+			return fmt.Errorf("offline enrollment requires RHIZA_ROLE=voter")
+		}
+		return rhiza.EnrollExistingVoter(ctx, config)
+	}
 	var handler http.Handler
 	var closeService func() error
 	switch role {

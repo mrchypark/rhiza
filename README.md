@@ -81,8 +81,8 @@ the SDK README.
 
 ## Consistency and failure model
 
-Local reads use the node's applied state. Linearizable reads first decide a
-unique read barrier and return `ErrQuorumUnavailable` when a quorum cannot be
+Local reads use the node's applied state. Linearizable reads obtain a
+quorum read index and return `ErrQuorumUnavailable` when a quorum cannot be
 reached; they never fall back to stale data.
 
 With three voters, one failed voter preserves writes and linearizable reads.
@@ -313,6 +313,12 @@ The certified QLog is the source of truth. SQLite and LatticeDB are rebuildable
 materialized state. Startup replays missing decisions; unreadable local state is
 quarantined and rebuilt. Checkpoints capture both engines at the same applied
 slot and restore them together.
+
+Multi-voter recovery preserves each voter's original WAL identity. A lost WAL
+cannot safely rejoin under the same voter ID just by replaying an archive.
+See [recovery and voter registration](docs/recovery.md) for the supported failure
+model, required offline upgrade enrollment, and the boundary for a recovery
+Operator.
 
 Single-voter deployments may use local filesystem storage. Multi-voter
 clusters require shared S3-compatible, GCS, or Azure Blob storage. Read
