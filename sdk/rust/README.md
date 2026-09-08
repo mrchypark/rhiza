@@ -23,7 +23,9 @@ the bundled native tree with `./scripts/prepare-native.sh` before packaging.
 
 Existing multi-voter deployments must stop all voters and enroll each original
 intact WAL with the matching `rhiza --enroll-existing-voter` CLI before starting
-0.13. The Rust SDK does not expose this offline administrative operation.
+0.13. The Rust SDK does not expose this offline administrative operation. Install
+the matching CLI with `go install github.com/mrchypark/rhiza/cmd/rhiza@v0.13.0`
+or build `./cmd/rhiza` from the v0.13.0 source checkout.
 Keep the same cluster, membership, voting credentials and object-store namespace.
 Never clear WALs or registration objects to bypass a startup error. See the
 [recovery and upgrade guide](https://github.com/mrchypark/rhiza/blob/v0.13.0/docs/recovery.md).
