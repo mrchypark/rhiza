@@ -192,6 +192,10 @@ func TestDurabilityFailureIsRetryableWithSameRequestID(t *testing.T) {
 		}
 	}
 
+	// A committed request status does not prove object-store durability.
+	if response, err := server.Execute(context.Background(), req); !errors.Is(err, ErrDurabilityUnavailable) || !errors.Is(err, ErrCommitUnknown) {
+		t.Fatalf("retry after committed status: response=%+v err=%v, want durability unavailable and commit unknown", response, err)
+	}
 	server.SetDurabilityBarrier(nil)
 	response, err := server.Execute(context.Background(), req)
 	if err != nil {
