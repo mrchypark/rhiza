@@ -18,6 +18,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/qlog"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -71,17 +72,9 @@ func loadVoterIdentity(config *types.ExecutionConfig) (localVoterState, error) {
 }
 
 func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
-	members := make([]string, 0, len(config.Members))
-	for _, member := range config.Members {
-		// Bind voting credentials, not addresses: moving an intact disk need not
-		// change its authority. Never store credentials in registration metadata.
-		encoded, _ := json.Marshal([]string{string(member.ID), fmt.Sprintf("%x", sha256.Sum256([]byte(member.Token)))})
-		members = append(members, string(encoded))
-	}
-	slices.Sort(members)
-	encoded, _ := json.Marshal(members)
+	membership := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
 	store, _ := json.Marshal([]string{config.ObjStoreProvider, config.ObjStoreEndpoint, config.ObjStoreBucket, path.Clean(config.ObjStorePrefix), config.ObjStoreAzureStorageAccount})
-	return voterIdentity{Version: 1, Cluster: string(config.ClusterID), Node: string(config.NodeID), Membership: fmt.Sprintf("%x", sha256.Sum256(encoded)), Store: fmt.Sprintf("%x", sha256.Sum256(store))}
+	return voterIdentity{Version: 1, Cluster: string(config.ClusterID), Node: string(config.NodeID), Membership: membership.Membership, Store: fmt.Sprintf("%x", sha256.Sum256(store))}
 }
 
 // ensureVoterIdentity runs before any archive replay or peer listener. An
@@ -158,11 +151,7 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 			return err
 		}
 	}
-	clusterWant, _ := json.Marshal(struct {
-		Version    int    `json:"version"`
-		Cluster    string `json:"cluster"`
-		Membership string `json:"membership"`
-	}{1, want.Cluster, want.Membership})
+	clusterWant, _ := json.Marshal(recovery.NewMembershipRecord(want.Cluster, config.Members, string(config.ObjStoreDurability)))
 	if local.identity == nil {
 		var nonce [32]byte
 		if _, err := rand.Read(nonce[:]); err != nil {

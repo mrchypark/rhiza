@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-operator
+  namespace: rhiza
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhiza-operator
+  namespace: rhiza
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [get, update]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizarecoveries]
+    verbs: [get, list]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizarecoveries/status]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rhiza-operator
+  namespace: rhiza
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-operator
+    namespace: rhiza
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rhiza-operator

@@ -317,7 +317,7 @@ slot and restore them together.
 Multi-voter recovery preserves each voter's original WAL identity. A lost WAL
 cannot safely rejoin under the same voter ID just by replaying an archive.
 See [recovery and voter registration](docs/recovery.md) for the supported failure
-model, required offline upgrade enrollment, and the boundary for a recovery
+model, required offline upgrade enrollment, and the contract for a recovery
 Operator.
 
 Single-voter deployments may use local filesystem storage. Multi-voter
@@ -373,6 +373,9 @@ docker run --rm --name rhiza -p 8080:8080 \
   -v rhiza-data:/data \
   rhiza:dev
 ```
+
+The [no-PVC recovery operator](deploy/operator/README.md) supports explicit,
+fenced full-generation recovery in both durability modes.
 
 Kubernetes examples live under [`deploy/k8s`](deploy/k8s), including three-peer
 SQL and Graph qualification manifests and both read-replica modes.

@@ -20,6 +20,7 @@ const (
 	headHeaderSize   = 8 + 4 + 4 + 8 + 8 + 8 + 32 + 8 + 32 + 8 + 4 + 4
 	archiveCRCSize   = 4
 	headHasBase      = 1
+	headSealed       = 2
 )
 
 func archiveDecisionSize(decision quepaxa.DecidedValue) int {
@@ -114,6 +115,9 @@ func encodeHead(head archiveHead) ([]byte, error) {
 	}
 	var sealData, decisionData []byte
 	flags := uint32(0)
+	if head.Sealed {
+		flags |= headSealed
+	}
 	if head.Base != 0 {
 		if head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix {
 			return nil, fmt.Errorf("archive head base is incomplete")
@@ -127,7 +131,7 @@ func encodeHead(head archiveHead) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		flags = headHasBase
+		flags |= headHasBase
 	} else if head.BaseSeal != nil || head.BaseDecision != nil || head.BasePrefix != ([32]byte{}) {
 		return nil, fmt.Errorf("archive head has payload without base")
 	}
@@ -162,7 +166,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 		return archiveHead{}, fmt.Errorf("invalid archive head header")
 	}
 	flags := binary.BigEndian.Uint32(data[12:16])
-	if flags & ^uint32(headHasBase) != 0 {
+	if flags & ^uint32(headHasBase|headSealed) != 0 {
 		return archiveHead{}, fmt.Errorf("unknown archive head flags")
 	}
 	stored := binary.BigEndian.Uint32(data[len(data)-archiveCRCSize:])
@@ -173,7 +177,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 	if config != uint64(uint(config)) {
 		return archiveHead{}, fmt.Errorf("archive config ID overflows uint")
 	}
-	head := archiveHead{ConfigID: uint(config), Generation: binary.BigEndian.Uint64(data[24:32]), Base: quepaxa.Slot(binary.BigEndian.Uint64(data[32:40])), Tip: quepaxa.Slot(binary.BigEndian.Uint64(data[72:80]))}
+	head := archiveHead{ConfigID: uint(config), Generation: binary.BigEndian.Uint64(data[24:32]), Base: quepaxa.Slot(binary.BigEndian.Uint64(data[32:40])), Tip: quepaxa.Slot(binary.BigEndian.Uint64(data[72:80])), Sealed: flags&headSealed != 0}
 	copy(head.BasePrefix[:], data[40:72])
 	copy(head.TailHash[:], data[80:112])
 	head.TailObject = binary.BigEndian.Uint64(data[112:120])

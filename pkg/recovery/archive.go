@@ -37,6 +37,7 @@ const (
 var (
 	ErrArchiveClosed       = errors.New("archive manager is closed")
 	ErrArchiveBusy         = errors.New("archive maintenance is active")
+	ErrArchiveSealed       = errors.New("archive is sealed for recovery")
 	errArchiveStateChanged = errors.New("archive state changed during I/O")
 )
 
@@ -64,6 +65,7 @@ type archiveHead struct {
 	Tip          quepaxa.Slot            `json:"tip"`
 	TailHash     [32]byte                `json:"tail_hash"`
 	TailObject   uint64                  `json:"tail_object"`
+	Sealed       bool                    `json:"-"`
 }
 
 type archiveGCLock struct {
@@ -215,7 +217,7 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 		return fmt.Errorf("invalid shared archive recovery base")
 	}
 	extents := make([]Extent, 0)
-	if head.Generation < oldHead.Generation || head.Base < oldHead.Base || head.Tip < oldHead.Tip || oldHead.ConfigID != 0 && head.Base == oldHead.Base && !archiveBaseEqual(head, oldHead) {
+	if oldHead.Sealed && !head.Sealed || head.Generation < oldHead.Generation || head.Base < oldHead.Base || head.Tip < oldHead.Tip || oldHead.ConfigID != 0 && head.Base == oldHead.Base && !archiveBaseEqual(head, oldHead) {
 		return fmt.Errorf("shared archive head regressed or changed recovery base")
 	}
 	known := make(map[extentObject]int, len(oldExtents))
@@ -343,6 +345,7 @@ func archiveBaseEqual(a, b archiveHead) bool {
 	}
 	a.Generation, a.Base, a.BasePrefix, a.Tip, a.TailHash, a.TailObject = 0, 0, [32]byte{}, 0, [32]byte{}, 0
 	b.Generation, b.Base, b.BasePrefix, b.Tip, b.TailHash, b.TailObject = 0, 0, [32]byte{}, 0, [32]byte{}, 0
+	a.Sealed, b.Sealed = false, false
 	return archiveHeadsEqual(a, b)
 }
 
@@ -377,6 +380,9 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 		m.mu.Lock()
 		head, tip, refs, headCAS := m.head, m.tip, slices.Clone(m.extents), m.headCAS
 		m.mu.Unlock()
+		if head.Sealed {
+			return ErrArchiveSealed
+		}
 		if through <= head.Base {
 			return nil
 		}
@@ -691,6 +697,9 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		m.mu.Lock()
 		tip, head, refs, headCAS := m.tip, m.head, slices.Clone(m.extents), m.headCAS
 		m.mu.Unlock()
+		if head.Sealed {
+			return ErrArchiveSealed
+		}
 		if tip >= through {
 			return nil
 		}
@@ -904,6 +913,14 @@ func (m *Manager) Tip() quepaxa.Slot {
 	return m.tip
 }
 
+// Sealed reports whether the loaded archive head permanently rejects new
+// publication for recovery. Call Load before using it as remote state.
+func (m *Manager) Sealed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.head.Sealed
+}
+
 // Cleanup removes obsolete immutable blocks after the grace period.
 // Every block reachable from the current head is always retained.
 func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
@@ -926,6 +943,9 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		m.mu.Lock()
 		refs, snapshotHead, snapshotCAS := slices.Clone(m.extents), m.head, m.headCAS
 		m.mu.Unlock()
+		if snapshotHead.Sealed {
+			return ErrArchiveSealed
+		}
 		compacted, err := m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
 		if err != nil {
 			return err

@@ -1,0 +1,64 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rhizarecoveries.rhiza.mrchypark.dev
+spec:
+  group: rhiza.mrchypark.dev
+  scope: Namespaced
+  names:
+    plural: rhizarecoveries
+    singular: rhizarecovery
+    kind: RhizaRecovery
+    shortNames:
+      - rhizarecovery
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [statefulSet, sourceClusterID, durability]
+              properties:
+                statefulSet:
+                  type: string
+                  minLength: 1
+                container:
+                  type: string
+                sourceClusterID:
+                  type: string
+                  minLength: 1
+                durability:
+                  type: string
+                  enum: [async, before-ack]
+                recoveryID:
+                  type: string
+                allowDataLoss:
+                  type: boolean
+                maxArchiveAgeSeconds:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                fence:
+                  type: object
+                  description: Trusted out-of-band administrator attestation. The controller never infers it from pod disappearance.
+                  properties:
+                    recoveryID:
+                      type: string
+                    clusterID:
+                      type: string
+                    statefulSetUID:
+                      type: string
+                    confirmed:
+                      type: boolean
+                    evidence:
+                      type: string
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
