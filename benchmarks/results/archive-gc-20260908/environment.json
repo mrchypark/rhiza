@@ -1,0 +1,26 @@
+{
+  "revision": "eb94a0d588a409b114a06bfbe2ee78b4f8143279",
+  "date": "2026-09-08",
+  "go": "go1.27.0 darwin/arm64",
+  "host_architecture": "arm64",
+  "provider": "disposable local Docker MinIO",
+  "image": "minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
+  "endpoint_form": "host:port over HTTP",
+  "bucket_lifecycle": "created solely for this run; fixture uses unique prefixes and removes them",
+  "test": {
+    "command": "go test ./pkg/recovery -run '^TestArchiveGCCost$' -count=1 -v",
+    "environment": {
+      "RHIZA_GC_BENCH_ENDPOINT": "127.0.0.1:19000",
+      "RHIZA_GC_BENCH_BUCKET": "rhiza-gc-cost-20260908",
+      "RHIZA_GC_BENCH_ACCESS_KEY": "rhiza-test",
+      "RHIZA_GC_BENCH_SECRET_KEY": "redacted"
+    },
+    "object_bytes": 1024,
+    "cpu_count": 8,
+    "gomaxprocs": "default",
+    "sha256": {
+      "archive_go": "a79b6ce9b4dd4d745e4fdaf7275a7d5a80e6084777e293d513ded5d0021a3d0e",
+      "fixture": "19b2f84a0dc2a4a910fc34fc84d54a13f6341712d9dffa37d00c46021e0b217f"
+    }
+  }
+}

@@ -78,3 +78,8 @@ Set `RHIZA_NATIVE_LIB_DIR` to a directory containing a compatible
 `librhiza_ffi.a` built from the exact matching Rhiza bridge/source version to
 skip the default Go build. Cross-compilation is deliberately unsupported rather
 than guessed.
+
+Repository integration guides: [host-managed shutdown](https://github.com/mrchypark/rhiza/blob/main/docs/embedded-lifecycle.md),
+[notification reconciliation](https://github.com/mrchypark/rhiza/blob/main/docs/notification-integration.md), and
+[cache expiry](https://github.com/mrchypark/rhiza/blob/main/docs/cache-expiry.md). These guides cover host lifecycle, live notification
+delivery, and application-controlled cleanup using the existing APIs.

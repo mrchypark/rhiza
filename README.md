@@ -60,7 +60,8 @@ if err != nil {
 
 SQL, Graph, KV, notification, stream, and request-status methods are available
 directly on `DB`. Use `db.Handler()` or `db` itself as an `http.Handler` when
-the HTTP adapter is needed.
+the HTTP adapter is needed. See [embedded lifecycle](docs/embedded-lifecycle.md)
+for host-managed cancellation, shutdown, and close-error handling.
 
 ## Embedded Rust SDK
 
@@ -195,7 +196,9 @@ and tracked with replicated durable consumer offsets.
 The KV API supports get, put, delete, compare-and-swap, and TTL. Notification
 publication is replicated; subscriptions are bounded, live, at-most-once
 streams. Slow subscribers may drop notifications, so use graph streams when a
-durable cursor is required.
+durable cursor is required. See [notification integration](docs/notification-integration.md)
+for reconciling missed hints, and
+[cache expiry](docs/cache-expiry.md) for bounded application-owned SQL cleanup.
 
 ## Limits
 

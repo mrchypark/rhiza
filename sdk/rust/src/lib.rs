@@ -673,4 +673,77 @@ mod tests {
         replacement.unsubscribe().unwrap();
         assert_eq!(db.notification_drops().unwrap(), 0);
     }
+    #[test]
+    fn missed_notifications_reconcile_from_durable_state() {
+        let db = db();
+        db.execute(
+            "schema",
+            "CREATE TABLE revision (value INTEGER NOT NULL)",
+            json!([]),
+        )
+        .unwrap()
+        .require_committed()
+        .unwrap();
+        db.execute("initial", "INSERT INTO revision VALUES (0)", json!([]))
+            .unwrap()
+            .require_committed()
+            .unwrap();
+        let snapshot = || {
+            db.call::<QueryResult>(
+                "query",
+                json!({
+                    "sql": "SELECT value FROM revision", "consistency": "linearizable"
+                }),
+            )
+            .unwrap()
+            .rows[0][0]
+                .as_i64()
+                .unwrap()
+        };
+        // A marker on a separate, drained topic waits for this node's FIFO
+        // dispatcher; a committed receipt alone does not mean delivery finished.
+        let mut dispatched = db.notify_subscribe("dispatch-check").unwrap();
+        let mut wait_for_dispatch = |id: &str| {
+            db.notify_publish(id, "dispatch-check", b"dispatched")
+                .unwrap()
+                .require_committed()
+                .unwrap();
+            assert_eq!(dispatched.recv_timeout(5_000).unwrap(), b"dispatched");
+        };
+        let mut subscription = db.notify_subscribe("revision").unwrap();
+        assert_eq!(snapshot(), 0);
+        let drops = db.notification_drops().unwrap();
+        for version in 1..=2 {
+            db.execute(
+                &format!("update-{version}"),
+                "UPDATE revision SET value = ?",
+                json!([version]),
+            )
+            .unwrap()
+            .require_committed()
+            .unwrap();
+            db.notify_publish(&format!("hint-{version}"), "revision", b"changed")
+                .unwrap()
+                .require_committed()
+                .unwrap();
+        }
+        wait_for_dispatch("after-live-hints");
+        // The live queue retains one hint; the other is deliberately lost.
+        assert!(db.notification_drops().unwrap() > drops);
+        assert_eq!(subscription.recv_timeout(1_000).unwrap(), b"changed");
+        assert_eq!(snapshot(), 2);
+        drop(subscription);
+        db.execute("offline-update", "UPDATE revision SET value = 3", json!([]))
+            .unwrap()
+            .require_committed()
+            .unwrap();
+        db.notify_publish("offline-hint", "revision", b"changed")
+            .unwrap()
+            .require_committed()
+            .unwrap();
+        wait_for_dispatch("after-offline-hint");
+        let mut reconnected = db.notify_subscribe("revision").unwrap();
+        assert_eq!(snapshot(), 3);
+        assert_eq!(reconnected.recv_timeout(1).unwrap_err().code, "timeout");
+    }
 }
