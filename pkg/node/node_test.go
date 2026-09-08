@@ -11,8 +11,12 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	objstore "github.com/thanos-io/objstore"
 )
 
 func TestCompactedPeerDoesNotOverrideUsableQuorumSuffix(t *testing.T) {
@@ -132,6 +136,101 @@ func TestCertifiedCheckpointCompactionIsSingleFlight(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("compaction did not resume after sequence lock release")
+	}
+}
+
+func TestCertifiedCheckpointPublicationWaitsForArchiveSync(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	archive := recovery.NewManager(bucket, "cluster", 1)
+	defer archive.Close()
+	checkpoints := checkpoint.NewManager(bucket, "cluster", t.TempDir(), 1)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("decision")); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "sqlite.db")
+	if err := os.WriteFile(file, []byte("checkpoint"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := checkpoints.AcquirePublisherClaim(ctx, "test", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := checkpoints.CreateFiles(ctx, claim, []checkpoint.Source{{Role: checkpoint.RoleSQLite, Path: file}}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoints.ReleasePublisherClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	root, err = checkpoints.OpenRoot(ctx, root.Index, root.RootHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	n := &Node{archive: archive, checkpoints: checkpoints, core: core}
+	if err := n.publishCertifiedCheckpoint(canceled, root); err == nil {
+		t.Fatal("archive sync unexpectedly succeeded")
+	}
+	if current := checkpoints.Latest(); current != nil {
+		t.Fatalf("CURRENT advanced despite failed archive sync: index=%d", current.Index)
+	}
+}
+
+func TestStartupRecoveryPinProtectsSelectedRootFromGC(t *testing.T) {
+	ctx := context.Background()
+	manager := checkpoint.NewManager(objstore.NewInMemBucket(), "cluster", t.TempDir(), 1)
+	create := func(index uint64, contents string) *checkpoint.Checkpoint {
+		file := filepath.Join(t.TempDir(), "sqlite.db")
+		if err := os.WriteFile(file, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := manager.AcquirePublisherClaim(ctx, "test", index-1, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := manager.CreateFiles(ctx, claim, []checkpoint.Source{{Role: checkpoint.RoleSQLite, Path: file}}, index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		opened, err := manager.OpenRoot(ctx, root.Index, root.RootHash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return opened
+	}
+	selected := create(7, "selected")
+	newer := create(8, "newer")
+	if err := manager.PromoteCertifiedCurrent(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	guard, err := newStartupRecoveryGuard(ctx, nil, "startup-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Close()
+	pinned, err := guard.PinRoot(guard.Context(), manager, selected, guard.Owner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.GarbageCollect(ctx, map[[32]byte]struct{}{}, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.DownloadRootFiles(guard.Context(), pinned.Index, pinned.RootHash, t.TempDir()); err != nil {
+		t.Fatalf("GC deleted startup recovery root: %v", err)
 	}
 }
 

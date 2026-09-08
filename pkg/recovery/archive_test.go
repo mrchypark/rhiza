@@ -210,6 +210,38 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	}
 }
 
+func TestRecoverySnapshotPinsUncompactedArchiveHead(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("uncompacted")); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := manager.BeginRecoverySnapshot(ctx, "cold-start", time.Minute)
+	if err != nil {
+		t.Fatalf("pin uncompacted archive: %v", err)
+	}
+	defer snapshot.Close(ctx)
+	if _, _, ok := snapshot.RecoveryBase(); ok {
+		t.Fatal("uncompacted archive unexpectedly has a checkpoint base")
+	}
+	values, tip, err := snapshot.DecisionsFrom(ctx, 1, 1)
+	if err != nil || tip != core.Tip() || len(values) != 1 {
+		t.Fatalf("snapshot values=%d tip=%d err=%v", len(values), tip, err)
+	}
+}
+
 func TestSyncThroughCoalescesAlreadyDecidedSuffix(t *testing.T) {
 	ctx := context.Background()
 	wal, err := qlog.Open(t.TempDir())

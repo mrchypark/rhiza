@@ -96,10 +96,47 @@ func validateReadAdmissionConfig(config *types.ExecutionConfig) error {
 	return nil
 }
 
+// validateVoterMembership mirrors Core's fixed-membership checks before
+// offline enrollment can write a remote registration.
+func validateVoterMembership(config *types.ExecutionConfig) error {
+	if len(config.Members) == 0 {
+		return nil // loadClusterConfig supplies the single-node default later.
+	}
+	seen := make(map[quepaxa.NodeID]struct{}, len(config.Members))
+	local := false
+	for _, member := range config.Members {
+		if member.ID == "" {
+			return fmt.Errorf("voter member ID is required")
+		}
+		if _, duplicate := seen[member.ID]; duplicate {
+			return fmt.Errorf("duplicate voter member %q", member.ID)
+		}
+		seen[member.ID] = struct{}{}
+		local = local || member.ID == config.NodeID
+	}
+	if !local {
+		return fmt.Errorf("local node %q is not a voter member", config.NodeID)
+	}
+	return nil
+}
+
 // Open starts the embedded engine and its private peer transport without serving HTTP.
-func (n *Node) Open(ctx context.Context) (err error) {
+func (n *Node) Open(ctx context.Context) error {
+	return n.open(ctx, false)
+}
+
+// EnrollExistingVoter registers a pre-registration WAL while all voters are
+// offline. It neither restores missing voting state nor starts any listeners.
+func (n *Node) EnrollExistingVoter(ctx context.Context) error {
+	return n.open(ctx, true)
+}
+
+func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
+	}
+	if err := validateVoterMembership(n.config); err != nil {
+		return err
 	}
 	if len(n.config.Members) > 1 {
 		for _, member := range n.config.Members {
@@ -158,6 +195,10 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
 	n.lock = lock
+	localVoter, err := loadVoterIdentity(n.config)
+	if err != nil {
+		return err
+	}
 
 	// 2. Open WAL
 	wal, err := qlog.Open(n.config.DataDir + "/qlog")
@@ -193,6 +234,12 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			return fmt.Errorf("open object store: %w", bucketErr)
 		}
 		n.bucket = bucket
+		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll); err != nil {
+			return err
+		}
+		if enroll {
+			return n.Shutdown()
+		}
 		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
 		n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
@@ -209,6 +256,23 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			}
 			log.Printf("shared archive unavailable during async startup: %v", loadErr)
 		}
+	}
+	if !objectStoreConfigured {
+		if err := ensureVoterIdentity(ctx, n.config, nil, n.wal, localVoter, enroll); err != nil {
+			return err
+		}
+	}
+	startupRecovery := &startupRecoveryGuard{ctx: ctx}
+	if n.checkpoints != nil {
+		owner, ownerErr := startupRecoveryOwner(string(n.config.NodeID))
+		if ownerErr != nil {
+			return ownerErr
+		}
+		startupRecovery, err = newStartupRecoveryGuard(ctx, n.archive, owner)
+		if err != nil {
+			return fmt.Errorf("pin startup recovery evidence: %w", err)
+		}
+		defer startupRecovery.Close()
 	}
 
 	// 3. Recovery is completed below by Core.Recover plus deterministic replay.
@@ -267,18 +331,26 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		})
 	}
 	if n.archive != nil {
-		if seal, decision, ok := n.archive.RecoveryBase(); ok && core.Tip() < seal.Index {
-			if err := core.RestoreCheckpointBase(ctx, seal, decision); err != nil {
-				return fmt.Errorf("restore checkpoint recovery base: %w", err)
+		archiveTip := n.archive.Tip()
+		archiveDecisions := n.archive.DecisionsFrom
+		archiveBase := n.archive.RecoveryBase
+		if snapshot := startupRecovery.Snapshot(); snapshot != nil {
+			archiveTip = snapshot.Tip()
+			archiveDecisions = snapshot.DecisionsFrom
+			archiveBase = snapshot.RecoveryBase
+		}
+		if seal, decision, ok := archiveBase(); ok && core.Tip() < seal.Index {
+			if err := core.RestoreCheckpointBase(startupRecovery.Context(), seal, decision); err != nil {
+				return fmt.Errorf("restore checkpoint recovery base: %w", startupRecovery.Check(err))
 			}
 		}
-		for core.Tip() < n.archive.Tip() {
-			values, _, archiveErr := n.archive.DecisionsFrom(ctx, core.Tip()+1, 256)
+		for core.Tip() < archiveTip {
+			values, _, archiveErr := archiveDecisions(startupRecovery.Context(), core.Tip()+1, 256)
 			if archiveErr != nil || len(values) == 0 {
 				if archiveErr == nil {
 					archiveErr = fmt.Errorf("shared archive omitted slot %d", core.Tip()+1)
 				}
-				return archiveErr
+				return startupRecovery.Check(archiveErr)
 			}
 			if archiveErr := core.AcceptCertifiedValues(values); archiveErr != nil {
 				return fmt.Errorf("recover shared archive: %w", archiveErr)
@@ -350,18 +422,19 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			return sealErr
 		}
 		if current := n.checkpoints.Latest(); current != nil && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
-			return fmt.Errorf("checkpoint CURRENT is not backed by the certified seal; start with fresh object storage")
+			return fmt.Errorf("checkpoint CURRENT is not backed by the certified seal")
 		}
 		if sealed {
-			certifiedCheckpoint, err = n.checkpoints.OpenRoot(ctx, uint64(seal.Index), seal.RootHash)
+			certifiedCheckpoint, err = n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
 			if err != nil || certifiedCheckpoint.Hash != seal.StateHash {
 				if err == nil {
 					err = fmt.Errorf("certified checkpoint state hash mismatch")
 				}
 				return err
 			}
-			if err := n.checkpoints.PromoteCertifiedCurrent(ctx, certifiedCheckpoint); err != nil {
-				return fmt.Errorf("promote certified checkpoint: %w", err)
+			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+			if err != nil {
+				return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
 			}
 		}
 	}
@@ -373,8 +446,8 @@ func (n *Node) Open(ctx context.Context) (err error) {
 		recoveryTarget = quepaxa.Slot(certifiedCheckpoint.Index)
 	}
 	if recoveryTarget > core.Tip() {
-		if err := core.RecoverThrough(ctx, recoveryTarget); err != nil {
-			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, err)
+		if err := core.RecoverThrough(startupRecovery.Context(), recoveryTarget); err != nil {
+			return fmt.Errorf("recover certified log through %d: %w", recoveryTarget, startupRecovery.Check(err))
 		}
 	}
 	if certifiedCheckpoint != nil {
@@ -387,7 +460,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 				return fileErr
 			}
 			defer os.RemoveAll(dir)
-			files, readErr := n.checkpoints.DownloadRootFiles(ctx, certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
 			if readErr != nil {
 				return readErr
 			}
@@ -395,7 +468,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			for _, file := range files {
 				materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
 			}
-			if restoreErr := material.RestoreCheckpoint(ctx, materialFiles); restoreErr != nil {
+			if restoreErr := material.RestoreCheckpoint(startupRecovery.Context(), materialFiles); restoreErr != nil {
 				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
 			}
 		}
@@ -415,8 +488,21 @@ func (n *Node) Open(ctx context.Context) (err error) {
 			return err
 		}
 	}
-	if err := n.replayLocalDecisions(ctx); err != nil {
-		return fmt.Errorf("replay local decisions: %w", err)
+	if err := n.replayLocalDecisions(startupRecovery.Context()); err != nil {
+		return fmt.Errorf("replay local decisions: %w", startupRecovery.Check(err))
+	}
+	if err := startupRecovery.Check(nil); err != nil {
+		return fmt.Errorf("renew startup recovery evidence: %w", err)
+	}
+	// The selected archive head and checkpoint root have been consumed. Release
+	// their GC pins before a newly sealed checkpoint attempts the next trim.
+	if n.checkpoints != nil {
+		startupRecovery.Close()
+	}
+	if certifiedCheckpoint != nil {
+		if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
+			return fmt.Errorf("publish certified checkpoint: %w", err)
+		}
 	}
 	if len(cluster.Members) == 1 {
 		n.ready.Store(true)
@@ -530,10 +616,7 @@ func (n *Node) Open(ctx context.Context) (err error) {
 				if err := n.replayLocalDecisions(ctx); err != nil {
 					return err
 				}
-				if err := n.checkpoints.PromoteCertifiedCurrent(ctx, root); err != nil {
-					return err
-				}
-				return n.compactCertifiedCheckpoint(ctx)
+				return n.publishCertifiedCheckpoint(ctx, root)
 			},
 		)
 		n.checkpointer.Start(ctx, material.StateTip, func(ctx context.Context) error {
@@ -597,6 +680,21 @@ func advanceArchiveFloor(current, base uint64, ok bool) (uint64, bool) {
 		return current, false
 	}
 	return max(current, base), true
+}
+
+// publishCertifiedCheckpoint only makes a checkpoint discoverable after its
+// decision archive has been made durable. Compaction follows publication so
+// this startup's own recovery pins cannot block the current pointer repair.
+func (n *Node) publishCertifiedCheckpoint(ctx context.Context, root *checkpoint.Checkpoint) error {
+	if n.archive != nil {
+		if err := n.archive.SyncThrough(ctx, n.core, n.core.Tip()); err != nil {
+			return err
+		}
+	}
+	if err := n.checkpoints.PromoteCertifiedCurrent(ctx, root); err != nil {
+		return err
+	}
+	return n.compactCertifiedCheckpoint(ctx)
 }
 
 func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {

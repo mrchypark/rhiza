@@ -84,8 +84,8 @@ type archiveRecoveryPin struct {
 	version      *objstore.ObjectVersion
 }
 
-// RecoverySnapshot pins one immutable archive head while a lagging node
-// restores its checkpoint and then replays the matching suffix.
+// RecoverySnapshot pins one immutable archive head while a node replays its
+// suffix, with or without a checkpoint recovery base.
 type RecoverySnapshot struct {
 	manager *Manager
 	head    archiveHead
@@ -493,9 +493,6 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 		m.mu.Lock()
 		head, refs := m.head, slices.Clone(m.extents)
 		m.mu.Unlock()
-		if head.BaseSeal == nil || head.BaseDecision == nil {
-			return fmt.Errorf("shared archive has no checkpoint recovery base")
-		}
 		pin := archiveRecoveryPin{OwnerID: owner, Token: hex.EncodeToString(token[:]), Base: head.Base, Tip: head.Tip, TailHash: head.TailHash, TailObject: head.TailObject, LeaseUntilMS: time.Now().Add(lease).UnixMilli()}
 		key := m.recoveryPinKey(owner)
 		for range maxPublishRetries {
@@ -1285,7 +1282,7 @@ func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*archiveReco
 	if err := json.Unmarshal(data, &pin); err != nil {
 		return nil, err
 	}
-	if pin.OwnerID == "" || pin.Token == "" || pin.Base == 0 || pin.Tip < pin.Base || pin.Tip > pin.Base && pin.TailHash == ([32]byte{}) || (pin.TailHash == ([32]byte{})) != (pin.TailObject == 0) {
+	if pin.OwnerID == "" || pin.Token == "" || pin.Tip < pin.Base || pin.Tip > pin.Base && pin.TailHash == ([32]byte{}) || (pin.TailHash == ([32]byte{})) != (pin.TailObject == 0) {
 		return nil, fmt.Errorf("invalid archive recovery pin")
 	}
 	pin.version = attributes.Version

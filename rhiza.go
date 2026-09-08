@@ -152,14 +152,16 @@ const (
 )
 
 var (
-	ErrNotReady              = network.ErrNotReady
-	ErrRequestConflict       = network.ErrRequestConflict
-	ErrInvalidRequest        = network.ErrInvalidRequest
-	ErrQuorumUnavailable     = quepaxa.ErrQuorumUnavailable
-	ErrDurabilityUnavailable = network.ErrDurabilityUnavailable
-	ErrCommitUnknown         = network.ErrCommitUnknown
-	ErrGraphResourceLimit    = network.ErrGraphResourceLimit
-	ErrReadVersionMismatch   = network.ErrReadVersionMismatch
+	ErrVoterStateLost          = node.ErrVoterStateLost
+	ErrVoterEnrollmentRequired = node.ErrVoterEnrollmentRequired
+	ErrNotReady                = network.ErrNotReady
+	ErrRequestConflict         = network.ErrRequestConflict
+	ErrInvalidRequest          = network.ErrInvalidRequest
+	ErrQuorumUnavailable       = quepaxa.ErrQuorumUnavailable
+	ErrDurabilityUnavailable   = network.ErrDurabilityUnavailable
+	ErrCommitUnknown           = network.ErrCommitUnknown
+	ErrGraphResourceLimit      = network.ErrGraphResourceLimit
+	ErrReadVersionMismatch     = network.ErrReadVersionMismatch
 )
 
 // DB owns one embedded Rhiza node and its private QUIC peer endpoint.
@@ -180,6 +182,37 @@ type Migration struct {
 
 // Open starts the embedded engine. It does not start a public HTTP listener.
 func Open(ctx context.Context, config Config) (*DB, error) {
+	internalConfig, err := executionConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	childCtx, cancel := context.WithCancel(ctx)
+	n := node.New(internalConfig)
+	if err := n.Open(childCtx); err != nil {
+		cancel()
+		return nil, err
+	}
+	api, err := n.API()
+	if err != nil {
+		cancel()
+		_ = n.Shutdown()
+		return nil, err
+	}
+	return &DB{node: n, api: api, cancel: cancel}, nil
+}
+
+// EnrollExistingVoter performs one-time registration of an original pre-upgrade
+// WAL. Stop every voter first and retain each original disk. This does not
+// recover lost voting state, replace a voter, or start a peer/HTTP listener.
+func EnrollExistingVoter(ctx context.Context, config Config) error {
+	internalConfig, err := executionConfig(config)
+	if err != nil {
+		return err
+	}
+	return node.New(internalConfig).EnrollExistingVoter(ctx)
+}
+
+func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	if config.DataDir == "" {
 		return nil, fmt.Errorf("data directory is required")
 	}
@@ -192,8 +225,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 	if config.ClusterID == "" {
 		config.ClusterID = "cluster-a"
 	}
-	childCtx, cancel := context.WithCancel(ctx)
-	internalConfig := &types.ExecutionConfig{
+	return &types.ExecutionConfig{
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, Members: config.Members,
@@ -211,19 +243,7 @@ func Open(ctx context.Context, config Config) (*DB, error) {
 		CheckpointInterval: config.CheckpointInterval, CheckpointTailBytes: config.CheckpointTailBytes, MaxWALBytes: config.MaxWALBytes,
 		MaxConcurrentReads: config.MaxConcurrentReads, MaxLongPollReads: config.MaxLongPollReads,
 		LocalGraphNodePropertyIndexes: slices.Clone(config.LocalGraphNodePropertyIndexes),
-	}
-	n := node.New(internalConfig)
-	if err := n.Open(childCtx); err != nil {
-		cancel()
-		return nil, err
-	}
-	api, err := n.API()
-	if err != nil {
-		cancel()
-		_ = n.Shutdown()
-		return nil, err
-	}
-	return &DB{node: n, api: api, cancel: cancel}, nil
+	}, nil
 }
 
 func (db *DB) Close() error {

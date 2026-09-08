@@ -9,11 +9,13 @@ import (
 var manifestMagic = [8]byte{'R', 'H', 'Z', 'A', 'W', 'A', 'L', '!'}
 
 const (
-	manifestHeaderSize = 8 + 8 + 4
-	manifestRefSize    = 4 + 8 + 4
-	manifestCRCSize    = 4
-	manifestActive     = 1
-	manifestSealed     = 2
+	manifestHeaderSize  = 8 + 8 + 4
+	manifestRefSize     = 4 + 8 + 4
+	manifestIdentityLen = 2
+	manifestCRCSize     = 4
+	manifestActive      = 1
+	manifestSealed      = 2
+	maxIdentitySize     = 64
 )
 
 type manifestRef struct {
@@ -22,11 +24,18 @@ type manifestRef struct {
 	active bool
 }
 
-func encodeManifest(generation uint64, refs []manifestRef) ([]byte, error) {
+func encodeManifest(generation uint64, refs []manifestRef, identity []byte) ([]byte, error) {
 	if generation == 0 || len(refs) == 0 {
 		return nil, fmt.Errorf("invalid WAL manifest")
 	}
-	buf := make([]byte, manifestHeaderSize+len(refs)*manifestRefSize+manifestCRCSize)
+	if len(identity) > maxIdentitySize {
+		return nil, fmt.Errorf("WAL identity is too large")
+	}
+	identitySize := 0
+	if len(identity) != 0 {
+		identitySize = manifestIdentityLen + len(identity)
+	}
+	buf := make([]byte, manifestHeaderSize+len(refs)*manifestRefSize+identitySize+manifestCRCSize)
 	copy(buf, manifestMagic[:])
 	binary.BigEndian.PutUint64(buf[8:16], generation)
 	binary.BigEndian.PutUint32(buf[16:20], uint32(len(refs)))
@@ -44,26 +53,45 @@ func encodeManifest(generation uint64, refs []manifestRef) ([]byte, error) {
 		binary.BigEndian.PutUint32(buf[offset+12:offset+16], flag)
 		offset += manifestRefSize
 	}
+	if len(identity) != 0 {
+		binary.BigEndian.PutUint16(buf[offset:offset+manifestIdentityLen], uint16(len(identity)))
+		offset += manifestIdentityLen
+		copy(buf[offset:], identity)
+		offset += len(identity)
+	}
 	binary.BigEndian.PutUint32(buf[offset:], crc32.Checksum(buf[:offset], entryCRCTable))
 	return buf, nil
 }
 
-func decodeManifest(data []byte) (uint64, []manifestRef, error) {
+func decodeManifest(data []byte) (uint64, []manifestRef, []byte, error) {
 	if len(data) < manifestHeaderSize+manifestRefSize+manifestCRCSize || string(data[:8]) != string(manifestMagic[:]) {
-		return 0, nil, fmt.Errorf("invalid WAL manifest")
+		return 0, nil, nil, fmt.Errorf("invalid WAL manifest")
 	}
 	generation := binary.BigEndian.Uint64(data[8:16])
 	count := binary.BigEndian.Uint32(data[16:20])
 	if count > uint32((len(data)-manifestHeaderSize-manifestCRCSize)/manifestRefSize) {
-		return 0, nil, fmt.Errorf("invalid WAL manifest count")
+		return 0, nil, nil, fmt.Errorf("invalid WAL manifest count")
 	}
-	want := manifestHeaderSize + int(count)*manifestRefSize + manifestCRCSize
-	if generation == 0 || count == 0 || want != len(data) {
-		return 0, nil, fmt.Errorf("invalid WAL manifest length")
+	refsEnd := manifestHeaderSize + int(count)*manifestRefSize
+	if generation == 0 || count == 0 || refsEnd+manifestCRCSize > len(data) {
+		return 0, nil, nil, fmt.Errorf("invalid WAL manifest length")
 	}
-	stored := binary.BigEndian.Uint32(data[len(data)-manifestCRCSize:])
-	if actual := crc32.Checksum(data[:len(data)-manifestCRCSize], entryCRCTable); stored != actual {
-		return 0, nil, fmt.Errorf("WAL manifest checksum mismatch")
+	identity := []byte(nil)
+	checksumOffset := refsEnd
+	if len(data) != refsEnd+manifestCRCSize {
+		if len(data) < refsEnd+manifestIdentityLen+manifestCRCSize {
+			return 0, nil, nil, fmt.Errorf("invalid WAL manifest identity")
+		}
+		identityLen := int(binary.BigEndian.Uint16(data[refsEnd : refsEnd+manifestIdentityLen]))
+		checksumOffset = refsEnd + manifestIdentityLen + identityLen
+		if identityLen == 0 || identityLen > maxIdentitySize || checksumOffset+manifestCRCSize != len(data) {
+			return 0, nil, nil, fmt.Errorf("invalid WAL manifest identity")
+		}
+		identity = append([]byte(nil), data[refsEnd+manifestIdentityLen:checksumOffset]...)
+	}
+	stored := binary.BigEndian.Uint32(data[checksumOffset:])
+	if actual := crc32.Checksum(data[:checksumOffset], entryCRCTable); stored != actual {
+		return 0, nil, nil, fmt.Errorf("WAL manifest checksum mismatch")
 	}
 	refs := make([]manifestRef, 0, count)
 	seen := make(map[uint32]struct{}, count)
@@ -73,17 +101,17 @@ func decodeManifest(data []byte) (uint64, []manifestRef, error) {
 		flag := binary.BigEndian.Uint32(data[offset+12 : offset+16])
 		ref.active = flag == manifestActive
 		if ref.index == 0 || flag != manifestActive && flag != manifestSealed || ref.active != (i == count-1) || ref.active && ref.length != 0 {
-			return 0, nil, fmt.Errorf("invalid WAL manifest reference")
+			return 0, nil, nil, fmt.Errorf("invalid WAL manifest reference")
 		}
 		if _, ok := seen[ref.index]; ok {
-			return 0, nil, fmt.Errorf("duplicate WAL segment %d", ref.index)
+			return 0, nil, nil, fmt.Errorf("duplicate WAL segment %d", ref.index)
 		}
 		if len(refs) != 0 && ref.index <= refs[len(refs)-1].index {
-			return 0, nil, fmt.Errorf("WAL segments are not strictly ordered")
+			return 0, nil, nil, fmt.Errorf("WAL segments are not strictly ordered")
 		}
 		seen[ref.index] = struct{}{}
 		refs = append(refs, ref)
 		offset += manifestRefSize
 	}
-	return generation, refs, nil
+	return generation, refs, identity, nil
 }

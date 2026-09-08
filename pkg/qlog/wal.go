@@ -34,6 +34,7 @@ type WAL struct {
 	maxSize    int64
 	maxBytes   int64
 	totalBytes int64
+	identity   []byte
 	dirty      bool
 	fatal      error
 	syncDir    func(string) error
@@ -117,7 +118,7 @@ func (w *WAL) loadSegments() error {
 	if err != nil {
 		return err
 	}
-	generation, refs, err := decodeManifest(data)
+	generation, refs, identity, err := decodeManifest(data)
 	if err != nil {
 		return fmt.Errorf("decode %s: %w", filepath.Base(latest), err)
 	}
@@ -162,6 +163,7 @@ func (w *WAL) loadSegments() error {
 	}
 
 	w.generation = generation
+	w.identity = identity
 	if err := w.reconcileCommittedFiles(latest, refs); err != nil {
 		log.Printf("WAL startup cleanup deferred: %v", err)
 	}
@@ -369,7 +371,7 @@ func (w *WAL) publishManifestLocked(segments []*Segment) error {
 		}
 	}
 	generation := w.generation + 1
-	data, err := encodeManifest(generation, refs)
+	data, err := encodeManifest(generation, refs, w.identity)
 	if err != nil {
 		return err
 	}
@@ -386,6 +388,46 @@ func (w *WAL) publishManifestLocked(segments []*Segment) error {
 	}
 	if cleanupErr := w.cleanupOldManifests(target); cleanupErr != nil {
 		log.Printf("WAL manifest cleanup deferred until reopen: %v", cleanupErr)
+	}
+	return nil
+}
+
+// Identity returns the durable identity bound to this WAL. A legacy WAL has
+// no identity until BindIdentity is explicitly called during offline enrollment.
+func (w *WAL) Identity() ([]byte, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if len(w.identity) == 0 {
+		return nil, false
+	}
+	return append([]byte(nil), w.identity...), true
+}
+
+// BindIdentity durably adds an immutable identity to a legacy WAL. It never
+// replaces an existing identity and publishes a new manifest referencing the
+// same segments, so compaction retains the binding.
+func (w *WAL) BindIdentity(identity []byte) error {
+	if len(identity) == 0 || len(identity) > maxIdentitySize {
+		return fmt.Errorf("invalid WAL identity")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.fatal != nil {
+		return w.fatal
+	}
+	if len(w.identity) != 0 {
+		if bytes.Equal(w.identity, identity) {
+			return nil
+		}
+		return fmt.Errorf("WAL identity is already bound")
+	}
+	previousGeneration := w.generation
+	w.identity = append([]byte(nil), identity...)
+	if err := w.publishManifestLocked(w.segments); err != nil {
+		if w.generation == previousGeneration {
+			w.identity = nil
+		}
+		return err
 	}
 	return nil
 }
