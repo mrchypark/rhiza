@@ -176,6 +176,25 @@ func TestCertifiedCheckpointPublicationWaitsForArchiveSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prefix, _ := core.PrefixHash(1)
+	next, following, err := core.CheckpointLeaderOrders(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, encoded); err != nil {
+		t.Fatal(err)
+	}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
 	n := &Node{archive: archive, checkpoints: checkpoints, core: core}
@@ -184,6 +203,19 @@ func TestCertifiedCheckpointPublicationWaitsForArchiveSync(t *testing.T) {
 	}
 	if current := checkpoints.Latest(); current != nil {
 		t.Fatalf("CURRENT advanced despite failed archive sync: index=%d", current.Index)
+	}
+	// Another cold-start reader may still pin history. Publication must not
+	// attempt compaction or make completion depend on that reader finishing.
+	snapshot, err := archive.BeginRecoverySnapshot(ctx, "other-startup", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close(ctx)
+	if err := n.publishCertifiedCheckpoint(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints.Latest() == nil || core.CompactionFloor() != 0 {
+		t.Fatal("publication must preserve pinned history")
 	}
 }
 

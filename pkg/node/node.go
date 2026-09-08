@@ -616,7 +616,10 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				if err := n.replayLocalDecisions(ctx); err != nil {
 					return err
 				}
-				return n.publishCertifiedCheckpoint(ctx, root)
+				if err := n.publishCertifiedCheckpoint(ctx, root); err != nil {
+					return err
+				}
+				return n.compactCertifiedCheckpoint(ctx)
 			},
 		)
 		n.checkpointer.Start(ctx, material.StateTip, func(ctx context.Context) error {
@@ -683,18 +686,15 @@ func advanceArchiveFloor(current, base uint64, ok bool) (uint64, bool) {
 }
 
 // publishCertifiedCheckpoint only makes a checkpoint discoverable after its
-// decision archive has been made durable. Compaction follows publication so
-// this startup's own recovery pins cannot block the current pointer repair.
+// decision archive has been made durable. Startup does not require compaction;
+// another recovering voter may still pin the retained history.
 func (n *Node) publishCertifiedCheckpoint(ctx context.Context, root *checkpoint.Checkpoint) error {
 	if n.archive != nil {
 		if err := n.archive.SyncThrough(ctx, n.core, n.core.Tip()); err != nil {
 			return err
 		}
 	}
-	if err := n.checkpoints.PromoteCertifiedCurrent(ctx, root); err != nil {
-		return err
-	}
-	return n.compactCertifiedCheckpoint(ctx)
+	return n.checkpoints.PromoteCertifiedCurrent(ctx, root)
 }
 
 func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
