@@ -700,6 +700,16 @@ mod tests {
                 .as_i64()
                 .unwrap()
         };
+        // A marker on a separate, drained topic waits for this node's FIFO
+        // dispatcher; a committed receipt alone does not mean delivery finished.
+        let mut dispatched = db.notify_subscribe("dispatch-check").unwrap();
+        let mut wait_for_dispatch = |id: &str| {
+            db.notify_publish(id, "dispatch-check", b"dispatched")
+                .unwrap()
+                .require_committed()
+                .unwrap();
+            assert_eq!(dispatched.recv_timeout(5_000).unwrap(), b"dispatched");
+        };
         let mut subscription = db.notify_subscribe("revision").unwrap();
         assert_eq!(snapshot(), 0);
         let drops = db.notification_drops().unwrap();
@@ -717,6 +727,7 @@ mod tests {
                 .require_committed()
                 .unwrap();
         }
+        wait_for_dispatch("after-live-hints");
         // The live queue retains one hint; the other is deliberately lost.
         assert!(db.notification_drops().unwrap() > drops);
         assert_eq!(subscription.recv_timeout(1_000).unwrap(), b"changed");
@@ -730,6 +741,7 @@ mod tests {
             .unwrap()
             .require_committed()
             .unwrap();
+        wait_for_dispatch("after-offline-hint");
         let mut reconnected = db.notify_subscribe("revision").unwrap();
         assert_eq!(snapshot(), 3);
         assert_eq!(reconnected.recv_timeout(1).unwrap_err().code, "timeout");
