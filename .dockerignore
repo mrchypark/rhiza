@@ -1,3 +1,5 @@
 .git
 /rhiza
 *.db
+
+/sdk/rust/target

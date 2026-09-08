@@ -77,12 +77,36 @@ acknowledged changes newer than the last published prefix after permanent
 loss of the authoritative voter disks; the publication interval is not a
 guaranteed maximum loss window.
 
-## Operator responsibilities
+## No-PVC recovery operator
 
-A recovery Operator can restore original processes, disks and connectivity
-after a temporary majority outage. For permanent loss it must distinguish
-missing voting state from ordinary lag, fence old instances and use a supported
-re-registration or disaster-recovery protocol. Rhiza currently refuses the
-unsafe replacement; it does not implement that protocol or automatic membership
-changes. An Operator must not bypass this refusal by reducing quorum, clearing
-registrations or promoting a learner through configuration alone.
+The namespace-scoped [recovery operator](../deploy/operator/README.md) supports
+both `async` and `before-ack` for an existing three-voter, `emptyDir` StatefulSet.
+Two or three lost WALs use the same full-generation disaster-recovery path.
+Preserved WALs should first regain their original quorum; missing pods and
+failed probes alone never authorize a generation change.
+
+A requested recovery requires an out-of-band fence attestation tied to the
+source cluster, StatefulSet UID, and recovery operation. All old voters,
+clients, read replicas, and archive/GC writers must be fenced. The operator
+reserves one successor, atomically seals the source archive HEAD against late
+publication, verifies and copies its certified checkpoint and suffix into a
+new namespace, and restarts the StatefulSet with a new ClusterID and peer
+credentials. The ordinal names remain unchanged. This is a service-interrupting
+whole-generation recovery, not online voter replacement or membership changes.
+
+The source generation's immutable membership record binds its durability mode.
+An `async` source requires explicit `allowDataLoss`, even when the target uses
+`before-ack`. Changing an environment variable cannot retroactively protect
+past acknowledgements. Unknown legacy durability records fail closed and must
+not be rewritten or removed to bypass validation. Archive age is evidence age,
+not a bound on the number or age of missing acknowledged writes.
+
+`before-ack` protects successful write acknowledgements under the remote-store
+and fencing contract. It does not promise preservation of every earlier read:
+a concurrent read or request-status lookup can observe an applied write before
+that write's remote publication and acknowledgement complete.
+
+Empty replacement voters in an already-started generation still fail with
+`ErrVoterStateLost`. Replaying the recovery manifest does not give such a voter
+permission to forget newer votes. Retain the original source archive and all
+registration/lineage records; do not clear them to force recovery.

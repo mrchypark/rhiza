@@ -57,38 +57,41 @@ func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
 
 // Server is the HTTP server for client API.
 type Server struct {
-	core              *quepaxa.Core
-	material          *materializer.Materializer
-	cluster           types.ClusterID
-	mux               *http.ServeMux
-	ready             func() bool
-	writable          bool
-	sqlBatcher        *mutationBatcher[types.SQLCommand]
-	graphBatcher      *mutationBatcher[types.GraphCommand]
-	kvBatcher         *mutationBatcher[types.KVCommand]
-	transport         *Transport
-	applyMu           sync.Mutex
-	requestLocks      [4096]sync.Mutex
-	durability        func(context.Context, quepaxa.Slot) error
-	proposeMu         sync.Mutex
-	inflight          map[[32]byte]*proposalCall
-	proposalCtx       context.Context
-	proposalStop      context.CancelFunc
-	proposalWG        sync.WaitGroup
-	closeOnce         sync.Once
-	closing           bool
-	quiescing         bool
-	operationCap      chan struct{}
-	localCap          chan struct{}
-	operationB        int
-	localB            int
-	objectStats       func() (map[string]uint64, bool)
-	replicaStatus     func() ReplicaStatus
-	syncLimit         chan struct{}
-	checkpointPrepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
-	compactedHandler  func()
-	readAdmissionMu   sync.RWMutex
-	readAdmission     *readAdmission
+	core                 *quepaxa.Core
+	material             *materializer.Materializer
+	cluster              types.ClusterID
+	mux                  *http.ServeMux
+	ready                func() bool
+	writable             bool
+	sqlBatcher           *mutationBatcher[types.SQLCommand]
+	graphBatcher         *mutationBatcher[types.GraphCommand]
+	kvBatcher            *mutationBatcher[types.KVCommand]
+	transport            *Transport
+	applyMu              sync.Mutex
+	requestLocks         [4096]sync.Mutex
+	durability           func(context.Context, quepaxa.Slot) error
+	proposeMu            sync.Mutex
+	inflight             map[[32]byte]*proposalCall
+	proposalCtx          context.Context
+	proposalStop         context.CancelFunc
+	proposalWG           sync.WaitGroup
+	closeOnce            sync.Once
+	closing              bool
+	quiescing            bool
+	operationCap         chan struct{}
+	localCap             chan struct{}
+	operationB           int
+	localB               int
+	objectStats          func() (map[string]uint64, bool)
+	replicaStatus        func() ReplicaStatus
+	voterRecoveryStatus  func(context.Context) VoterRecoveryStatus
+	recoveryArchiveToken string
+	recoveryArchive      func(context.Context) error
+	syncLimit            chan struct{}
+	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
+	compactedHandler     func()
+	readAdmissionMu      sync.RWMutex
+	readAdmission        *readAdmission
 }
 
 // ReadAdmissionLimits bounds concurrent read work in one Server. Long-poll
@@ -310,6 +313,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/request/status", s.handleRequestStatus)
 	s.mux.HandleFunc("/metrics/object-store", s.handleObjectStoreStats)
 	s.mux.HandleFunc("/replica/status", s.handleReplicaStatus)
+	s.mux.HandleFunc("/recovery/status", s.handleVoterRecoveryStatus)
+	s.mux.HandleFunc("/recovery/archive", s.handleRecoveryArchive)
 
 	// Health
 	s.mux.HandleFunc("/ready", s.handleReady)

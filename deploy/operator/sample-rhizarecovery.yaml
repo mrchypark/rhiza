@@ -1,0 +1,23 @@
+apiVersion: rhiza.mrchypark.dev/v1alpha1
+kind: RhizaRecovery
+metadata:
+  name: rhiza-recovery-20260909
+  namespace: rhiza
+spec:
+  # An existing three-voter StatefulSet. This resource never creates a new
+  # database or PVCs.
+  statefulSet: rhiza
+  sourceClusterID: production-rhiza
+  durability: before-ack
+  # Empty recoveryID observes only. Set an explicit ID only after the fence is
+  # confirmed; it is used to derive a distinct target generation.
+  recoveryID: ""
+  allowDataLoss: false
+  fence:
+    # This is a trusted administrator attestation from outside Kubernetes. Pod
+    # disappearance is not evidence that the old voters are fenced.
+    recoveryID: ""
+    clusterID: production-rhiza
+    statefulSetUID: ""
+    confirmed: false
+    evidence: ""

@@ -256,6 +256,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 			log.Printf("shared archive unavailable during async startup: %v", loadErr)
 		}
+		if n.archive.Sealed() {
+			return recovery.ErrArchiveSealed
+		}
 	}
 	if !objectStoreConfigured {
 		if err := ensureVoterIdentity(ctx, n.config, nil, n.wal, localVoter, enroll); err != nil {
@@ -396,6 +399,29 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			"http_4xx_unexpected": stats.Unexpected4xx, "http_5xx": stats.HTTP5xx,
 		}, ok
 	})
+	archive := n.archive
+	server.SetVoterRecoveryStatus(func(ctx context.Context) network.VoterRecoveryStatus {
+		_, _, quorumErr := core.ReadIndex(ctx)
+		archiveTip := uint64(0)
+		if archive != nil {
+			archiveTip = uint64(archive.Tip())
+		}
+		return network.VoterRecoveryStatus{
+			NodeID:       string(n.config.NodeID),
+			ClusterID:    string(n.config.ClusterID),
+			Durability:   string(n.config.ObjStoreDurability),
+			Ready:        n.ready.Load(),
+			Quorum:       quorumErr == nil,
+			CertifiedTip: uint64(core.Tip()),
+			AppliedTip:   material.Tip(),
+			ArchiveTip:   archiveTip,
+		}
+	})
+	if archive != nil {
+		server.SetRecoveryArchive(n.config.AdminToken, func(ctx context.Context) error {
+			return archive.SyncThrough(ctx, core, core.Tip())
+		})
+	}
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
 		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
 			if err := core.EnsureDurable(slot); err != nil {

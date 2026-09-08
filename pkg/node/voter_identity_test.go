@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -86,6 +87,7 @@ func TestVoterIdentityRejectsMissingManifestAndConfigurationChanges(t *testing.T
 		func(c *types.ExecutionConfig) { c.NodeID = "b" },
 		func(c *types.ExecutionConfig) { c.Members = c.Members[:1] },
 		func(c *types.ExecutionConfig) { c.ObjStorePrefix = "other" },
+		func(c *types.ExecutionConfig) { c.ObjStoreDurability = types.ObjectStoreDurabilityBeforeAck },
 	} {
 		changed := *config
 		change(&changed)
@@ -222,5 +224,25 @@ func TestConcurrentVoterRegistrationHasOneWinner(t *testing.T) {
 	}
 	if successes != 1 {
 		t.Fatalf("got %d registrations for one identity", successes)
+	}
+}
+
+func TestVoterIdentityRejectsUnknownDurabilityHistory(t *testing.T) {
+	config, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	if err := registerTestVoter(t, config, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+	// A legacy record has no mode history. Editing the environment must not
+	// retroactively promise that every historical acknowledgement was archived.
+	state, err := loadVoterIdentity(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := []byte(`{"version":1,"cluster":"cluster","membership":"` + state.identity.Membership + `"}`)
+	if err := bucket.Upload(context.Background(), "cluster/voters/membership.json", bytes.NewReader(record)); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerTestVoter(t, config, bucket, false); !errors.Is(err, ErrVoterStateLost) {
+		t.Fatalf("unknown durability history accepted: %v", err)
 	}
 }

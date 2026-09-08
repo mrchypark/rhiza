@@ -60,7 +60,7 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: 0
-        run: go build ./cmd/rhiza
+        run: go build ./cmd/rhiza ./cmd/rhiza-operator
 
       - name: Real server E2E
         env:
@@ -106,3 +106,10 @@ jobs:
           context: .
           push: false
           tags: rhiza:ci
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.operator
+          push: false
+          tags: rhiza-operator:ci
