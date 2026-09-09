@@ -22,6 +22,10 @@ type testClusterResolver struct {
 }
 
 func (r testClusterResolver) CurrentCluster() quepaxa.Cluster { return r.current }
+func (r testClusterResolver) ConfigID() uint                  { return r.current.ConfigID }
+func (r testClusterResolver) ConfigIDForSlot(slot quepaxa.Slot) uint {
+	return r.ClusterForSlot(slot).ConfigID
+}
 func (r testClusterResolver) ClusterForSlot(slot quepaxa.Slot) quepaxa.Cluster {
 	if config, ok := r.slots[slot]; ok {
 		return config

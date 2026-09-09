@@ -30,6 +30,9 @@ func TestClusterSnapshotsDoNotExposeMembership(t *testing.T) {
 	cores, _ := reconfigCluster(t)
 	core := cores["a"]
 	before := core.clusterForSlot(1)
+	if core.ConfigID() != before.ConfigID || core.ConfigIDForSlot(1) != before.ConfigID {
+		t.Fatal("configuration ID lookup differs from initial snapshot")
+	}
 	for _, snapshot := range []Cluster{core.CurrentCluster(), core.ClusterForSlot(1)} {
 		snapshot.Members[0].ID = "intruder"
 	}
@@ -47,6 +50,15 @@ func TestClusterSnapshotsDoNotExposeMembership(t *testing.T) {
 		t.Fatal("reconfiguration mutated historical snapshot")
 	}
 	snapshot := core.CurrentCluster()
+	if core.ConfigID() != snapshot.ConfigID || core.ConfigIDForSlot(core.Tip()+1) != snapshot.ConfigID || core.ConfigIDForSlot(1) != before.ConfigID {
+		t.Fatal("configuration ID lookup lost transition boundary or historical configuration")
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		_ = core.ConfigID()
+		_ = core.ConfigIDForSlot(1)
+	}); allocs != 0 {
+		t.Fatalf("configuration ID lookup allocated %g times", allocs)
+	}
 	snapshot.Members[0].ID = "intruder"
 	if !core.IsVoter() || core.CurrentCluster().Members[0].ID != "a" {
 		t.Fatal("public snapshot changed new voter membership")

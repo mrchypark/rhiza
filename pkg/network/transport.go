@@ -39,6 +39,8 @@ type peerConnection struct {
 type clusterResolver interface {
 	CurrentCluster() quepaxa.Cluster
 	ClusterForSlot(quepaxa.Slot) quepaxa.Cluster
+	ConfigID() uint
+	ConfigIDForSlot(quepaxa.Slot) uint
 }
 
 // Transport sends private peer RPCs over persistent raw QUIC connections.
@@ -157,11 +159,20 @@ func membersSlice(members map[quepaxa.NodeID]quepaxa.Member) []quepaxa.Member {
 }
 
 func (t *Transport) transportFor(config quepaxa.Cluster) (*Transport, error) {
+	return t.transportForID(config.ConfigID, func() quepaxa.Cluster { return config })
+}
+
+func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*Transport, error) {
 	t.dynamicMu.Lock()
 	defer t.dynamicMu.Unlock()
 	if t.closed {
 		return nil, errTransportClosed
 	}
+	if peer := t.dynamic[id]; peer != nil {
+		return peer, nil
+	}
+	config := snapshot()
+	// The current configuration may have advanced since the ID lookup.
 	if peer := t.dynamic[config.ConfigID]; peer != nil {
 		return peer, nil
 	}
@@ -175,14 +186,14 @@ func (t *Transport) transportFor(config quepaxa.Cluster) (*Transport, error) {
 
 func (t *Transport) transportForSlot(slot quepaxa.Slot) (*Transport, error) {
 	if core := t.resolverSnapshot(); core != nil {
-		return t.transportFor(core.ClusterForSlot(slot))
+		return t.transportForID(core.ConfigIDForSlot(slot), func() quepaxa.Cluster { return core.ClusterForSlot(slot) })
 	}
 	return t, nil
 }
 
 func (t *Transport) transportForCurrent() (*Transport, error) {
 	if core := t.resolverSnapshot(); core != nil {
-		return t.transportFor(core.CurrentCluster())
+		return t.transportForID(core.ConfigID(), core.CurrentCluster)
 	}
 	return t, nil
 }

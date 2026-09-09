@@ -198,6 +198,13 @@ func (c *Core) ClusterForSlot(slot Slot) Cluster {
 	return cloneCluster(c.clusterForSlot(slot))
 }
 
+// ConfigIDForSlot returns the certifying configuration ID without copying members.
+func (c *Core) ConfigIDForSlot(slot Slot) uint {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clusterForSlotLocked(slot).ConfigID
+}
+
 // clusterForSlot shares an immutable history snapshot inside Core. Callers must
 // not modify its Members; public accessors return their own copy.
 func (c *Core) clusterForSlot(slot Slot) Cluster {
@@ -2273,7 +2280,11 @@ func (c *Core) WaitTip(ctx context.Context, slot Slot) error {
 }
 
 func (c *Core) NodeID() NodeID { return c.nodeID }
-func (c *Core) ConfigID() uint { return c.CurrentCluster().ConfigID }
+func (c *Core) ConfigID() uint {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clusterForSlotLocked(c.tip + 1).ConfigID
+}
 
 func (c *Core) IsDecided(slot Slot) bool {
 	_, ok := c.decision(slot)
