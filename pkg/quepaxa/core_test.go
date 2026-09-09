@@ -1420,9 +1420,13 @@ func TestEnsureDurableWritesDecisionMarker(t *testing.T) {
 	defer wal.Close()
 	config := &Cluster{Members: []Member{{ID: "node-1"}, {ID: "node-2"}, {ID: "node-3"}}}
 	core := newCore("node-1", config, wal, &mockTransport{})
-	slot, _, err := core.Propose(context.Background(), []byte("value"))
+	slot, _, err := core.ProposeCertified(context.Background(), []byte("value"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	certified, ok := core.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("missing certified value")
 	}
 	if err := core.EnsureDurable(slot); err != nil {
 		t.Fatal(err)
@@ -1433,6 +1437,13 @@ func TestEnsureDurableWritesDecisionMarker(t *testing.T) {
 	}
 	for _, entry := range entries {
 		if entry.Slot == uint64(slot) && entry.Type == qlog.EntryDecide {
+			if entry.Hash != certified.Hash || !bytes.HasPrefix(entry.Payload, decisionEntryMagic) {
+				t.Fatal("decision WAL metadata changed")
+			}
+			value, certificate, err := decodeDecisionRecord(entry.Payload[len(decisionEntryMagic):])
+			if err != nil || !bytes.Equal(value, certified.Value) || !bytes.Equal(certificate, certified.Certificate) {
+				t.Fatalf("decision WAL payload changed: %v", err)
+			}
 			return
 		}
 	}

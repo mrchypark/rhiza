@@ -9,7 +9,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa/walfb"
 )
 
-func encodeRecorderEntry(slot Slot, state ISR) []byte {
+func encodeRecorderEntry(slot Slot, state ISR, reconfiguration ...bool) []byte {
 	builder := flatbuffers.NewBuilder(256)
 	first := proposalToFlatBuffer(state.FirstCurrent).Pack(builder)
 	current := first
@@ -31,18 +31,30 @@ func encodeRecorderEntry(slot Slot, state ISR) []byte {
 	walfb.RecorderStateAddAggregatePrior(builder, prior)
 	offset := walfb.RecorderStateEnd(builder)
 	walfb.FinishRecorderStateBuffer(builder, offset)
-	payload := make([]byte, len(isrEntryMagic)+len(builder.FinishedBytes()))
-	copy(payload, isrEntryMagic)
-	copy(payload[len(isrEntryMagic):], builder.FinishedBytes())
+	magic := isrEntryMagic
+	if len(reconfiguration) != 0 && reconfiguration[0] {
+		magic = isrEntryV2Magic
+	}
+	payload := make([]byte, len(magic)+len(builder.FinishedBytes()))
+	copy(payload, magic)
+	copy(payload[len(magic):], builder.FinishedBytes())
 	return payload
 }
 
 func decodeRecorderEntry(payload []byte) (persisted recorderEntry, err error) {
-	if !bytes.HasPrefix(payload, isrEntryMagic) {
+	if bytes.Equal(payload, isrEntryV2Magic) {
+		return recorderEntry{Reconfiguration: true}, nil
+	}
+	marker := false
+	magic := isrEntryMagic
+	if bytes.HasPrefix(payload, isrEntryV2Magic) {
+		marker = true
+		magic = isrEntryV2Magic
+	} else if !bytes.HasPrefix(payload, magic) {
 		return persisted, fmt.Errorf("unknown recorder WAL format")
 	}
 
-	data := payload[len(isrEntryMagic):]
+	data := payload[len(magic):]
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("invalid FlatBuffers recorder WAL: %v", recovered)
@@ -53,6 +65,7 @@ func decodeRecorderEntry(payload []byte) (persisted recorderEntry, err error) {
 	}
 	state := walfb.GetRootAsRecorderState(data, 0).UnPack()
 	persisted.Slot = Slot(state.Slot)
+	persisted.Reconfiguration = marker
 	persisted.State.Step = Step(state.Step)
 	if persisted.Slot == 0 {
 		return recorderEntry{}, fmt.Errorf("invalid recorder slot")

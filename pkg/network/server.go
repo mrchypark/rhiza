@@ -510,7 +510,7 @@ func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision
 	if err := s.core.AcceptCertifiedValueForAck(decision); err != nil {
 		return err
 	}
-	if err := s.catchUpFrom(ctx, source, decision.Slot); err != nil {
+	if err := s.catchUpFrom(ctx, source, decision.Slot, true); err != nil {
 		return err
 	}
 	if certified, ok := s.core.CertifiedValue(decision.Slot); !ok || certified.Hash != decision.Hash {
@@ -519,7 +519,7 @@ func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision
 	return nil
 }
 
-func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot) error {
+func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot, durable bool) error {
 	select {
 	case s.syncLimit <- struct{}{}:
 		defer func() { <-s.syncLimit }()
@@ -556,7 +556,11 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
 		}
-		if err := s.core.AcceptCertifiedValues(response.Decisions); err != nil {
+		accept := s.core.AcceptCertifiedValues
+		if !durable {
+			accept = s.core.AcceptCertifiedHints
+		}
+		if err := accept(response.Decisions); err != nil {
 			if errors.Is(err, quepaxa.ErrCompacted) {
 				s.handleCompacted()
 				return ErrNotReady
@@ -1148,7 +1152,7 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 			if s.transport == nil || source == s.core.NodeID() {
 				return fmt.Errorf("read-index source cannot supply slot %d", index)
 			}
-			if err := s.catchUpFrom(ctx, source, index); err != nil {
+			if err := s.catchUpFrom(ctx, source, index, true); err != nil {
 				return err
 			}
 		}

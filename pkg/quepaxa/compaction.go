@@ -14,6 +14,9 @@ import (
 // verifying both the checkpoint bytes and the consensus certificate that
 // sealed that exact root.
 func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+	if c.reconfigEnabled {
+		return fmt.Errorf("checkpoint recovery is unavailable with reconfiguration enabled")
+	}
 	if c.Tip() >= seal.Index {
 		return fmt.Errorf("invalid checkpoint recovery base")
 	}
@@ -50,6 +53,9 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 
 // ValidateCheckpointBase authenticates a recovery base without mutating local state.
 func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+	if c.reconfigEnabled {
+		return fmt.Errorf("checkpoint recovery is unavailable with reconfiguration enabled")
+	}
 	if seal.ConfigID != c.config.ConfigID || seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
 		return fmt.Errorf("invalid checkpoint recovery base")
 	}
@@ -100,6 +106,9 @@ type consensusBase struct {
 // CompactThrough installs a certified local recovery floor. Callers must have
 // independently verified and quorum-sealed recoveryRoot before invoking it.
 func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
+	if c.reconfigEnabled {
+		return fmt.Errorf("compaction is unavailable with reconfiguration enabled")
+	}
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}

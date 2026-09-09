@@ -601,6 +601,9 @@ func knownNonGraphValue(value []byte) (bool, error) {
 	if _, ok, err := types.DecodeLeaderSchedule(value); ok || err != nil {
 		return ok, err
 	}
+	if ok, err := types.DecodeReconfiguration(value); ok || err != nil {
+		return ok, err
+	}
 	return true, nil // Materializer.Apply also accepts raw SQL.
 }
 

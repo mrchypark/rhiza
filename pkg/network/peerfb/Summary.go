@@ -7,10 +7,11 @@ import (
 )
 
 type SummaryT struct {
-	RecorderId     string     `json:"recorder_id"`
-	Step           uint64     `json:"step"`
-	FirstCurrent   *ProposalT `json:"first_current"`
-	AggregatePrior *ProposalT `json:"aggregate_prior"`
+	RecorderId        string     `json:"recorder_id"`
+	Step              uint64     `json:"step"`
+	FirstCurrent      *ProposalT `json:"first_current"`
+	AggregatePrior    *ProposalT `json:"aggregate_prior"`
+	ReconfigurationId []byte     `json:"reconfiguration_id"`
 }
 
 func (t *SummaryT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -23,11 +24,16 @@ func (t *SummaryT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	}
 	firstCurrentOffset := t.FirstCurrent.Pack(builder)
 	aggregatePriorOffset := t.AggregatePrior.Pack(builder)
+	reconfigurationIdOffset := flatbuffers.UOffsetT(0)
+	if t.ReconfigurationId != nil {
+		reconfigurationIdOffset = builder.CreateByteString(t.ReconfigurationId)
+	}
 	SummaryStart(builder)
 	SummaryAddRecorderId(builder, recorderIdOffset)
 	SummaryAddStep(builder, t.Step)
 	SummaryAddFirstCurrent(builder, firstCurrentOffset)
 	SummaryAddAggregatePrior(builder, aggregatePriorOffset)
+	SummaryAddReconfigurationId(builder, reconfigurationIdOffset)
 	return SummaryEnd(builder)
 }
 
@@ -36,6 +42,7 @@ func (rcv *Summary) UnPackTo(t *SummaryT) {
 	t.Step = rcv.Step()
 	t.FirstCurrent = rcv.FirstCurrent(nil).UnPack()
 	t.AggregatePrior = rcv.AggregatePrior(nil).UnPack()
+	t.ReconfigurationId = rcv.ReconfigurationIdBytes()
 }
 
 func (rcv *Summary) UnPack() *SummaryT {
@@ -128,8 +135,42 @@ func (rcv *Summary) AggregatePrior(obj *Proposal) *Proposal {
 	return nil
 }
 
+func (rcv *Summary) ReconfigurationId(j int) byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(12))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.GetByte(a + flatbuffers.UOffsetT(j*1))
+	}
+	return 0
+}
+
+func (rcv *Summary) ReconfigurationIdLength() int {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(12))
+	if o != 0 {
+		return rcv._tab.VectorLen(o)
+	}
+	return 0
+}
+
+func (rcv *Summary) ReconfigurationIdBytes() []byte {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(12))
+	if o != 0 {
+		return rcv._tab.ByteVector(o + rcv._tab.Pos)
+	}
+	return nil
+}
+
+func (rcv *Summary) MutateReconfigurationId(j int, n byte) bool {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(12))
+	if o != 0 {
+		a := rcv._tab.Vector(o)
+		return rcv._tab.MutateByte(a+flatbuffers.UOffsetT(j*1), n)
+	}
+	return false
+}
+
 func SummaryStart(builder *flatbuffers.Builder) {
-	builder.StartObject(4)
+	builder.StartObject(5)
 }
 func SummaryAddRecorderId(builder *flatbuffers.Builder, recorderId flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(0, flatbuffers.UOffsetT(recorderId), 0)
@@ -142,6 +183,12 @@ func SummaryAddFirstCurrent(builder *flatbuffers.Builder, firstCurrent flatbuffe
 }
 func SummaryAddAggregatePrior(builder *flatbuffers.Builder, aggregatePrior flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(3, flatbuffers.UOffsetT(aggregatePrior), 0)
+}
+func SummaryAddReconfigurationId(builder *flatbuffers.Builder, reconfigurationId flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(4, flatbuffers.UOffsetT(reconfigurationId), 0)
+}
+func SummaryStartReconfigurationIdVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
+	return builder.StartVector(1, numElems, 1)
 }
 func SummaryEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

@@ -87,6 +87,9 @@ func proposalFromWire(value *peerfb.ProposalT) (quepaxa.Proposal, error) {
 
 func summaryToWire(value quepaxa.Summary) *peerfb.SummaryT {
 	result := &peerfb.SummaryT{RecorderId: string(value.RecorderID), Step: uint64(value.Step)}
+	if value.ReconfigurationID != (quepaxa.ValueHash{}) {
+		result.ReconfigurationId = append([]byte(nil), value.ReconfigurationID[:]...)
+	}
 	if value.FirstCurrent != nil {
 		result.FirstCurrent = proposalToWire(*value.FirstCurrent)
 	}
@@ -111,7 +114,11 @@ func summaryFromWire(value *peerfb.SummaryT) (quepaxa.Summary, error) {
 	if value == nil || value.RecorderId == "" {
 		return quepaxa.Summary{}, fmt.Errorf("invalid summary")
 	}
+	if len(value.ReconfigurationId) != 0 && len(value.ReconfigurationId) != 32 {
+		return quepaxa.Summary{}, fmt.Errorf("invalid summary reconfiguration ID")
+	}
 	result := quepaxa.Summary{RecorderID: quepaxa.NodeID(value.RecorderId), Step: quepaxa.Step(value.Step)}
+	copy(result.ReconfigurationID[:], value.ReconfigurationId)
 	if value.FirstCurrent != nil {
 		proposal, err := proposalFromWire(value.FirstCurrent)
 		if err != nil {
@@ -134,7 +141,7 @@ func decisionToWire(value quepaxa.Decision) *peerfb.DecisionT {
 	for i := range value.Summaries {
 		summaries[i] = certificateSummaryToWire(value.Summaries[i])
 	}
-	return &peerfb.DecisionT{Slot: uint64(value.Slot), Step: uint64(value.Step), Proposal: proposalToWire(value.Proposal), Summaries: summaries}
+	return &peerfb.DecisionT{Slot: uint64(value.Slot), Step: uint64(value.Step), ConfigId: uint64(value.ConfigID), Proposal: proposalToWire(value.Proposal), Summaries: summaries}
 }
 
 func decisionFromWire(value *peerfb.DecisionT) (quepaxa.Decision, error) {
@@ -145,7 +152,7 @@ func decisionFromWire(value *peerfb.DecisionT) (quepaxa.Decision, error) {
 	if err != nil {
 		return quepaxa.Decision{}, err
 	}
-	result := quepaxa.Decision{Slot: quepaxa.Slot(value.Slot), Step: quepaxa.Step(value.Step), Proposal: proposal, Summaries: make([]quepaxa.Summary, len(value.Summaries))}
+	result := quepaxa.Decision{Slot: quepaxa.Slot(value.Slot), Step: quepaxa.Step(value.Step), ConfigID: uint(value.ConfigId), Proposal: proposal, Summaries: make([]quepaxa.Summary, len(value.Summaries))}
 	for i := range value.Summaries {
 		result.Summaries[i], err = summaryFromWire(value.Summaries[i])
 		if err != nil {

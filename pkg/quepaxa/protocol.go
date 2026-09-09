@@ -112,20 +112,24 @@ func (state ISR) Record(step Step, proposal Proposal) (ISR, Summary) {
 
 // RecordRequest and Summary are the proposer-to-recorder RPC values in Algorithms 3 and 4.
 type RecordRequest struct {
-	Slot     Slot     `json:"slot"`
-	Step     Step     `json:"step"`
-	Proposal Proposal `json:"proposal"`
+	Slot              Slot      `json:"slot"`
+	Step              Step      `json:"step"`
+	ConfigID          uint      `json:"config_id"`
+	ReconfigurationID ValueHash `json:"reconfiguration_id,omitempty"`
+	Proposal          Proposal  `json:"proposal"`
 }
 
 type Summary struct {
-	RecorderID     NodeID    `json:"recorder_id"`
-	Step           Step      `json:"step"`
-	FirstCurrent   *Proposal `json:"first_current,omitempty"`
-	AggregatePrior *Proposal `json:"aggregate_prior,omitempty"`
+	RecorderID        NodeID    `json:"recorder_id"`
+	ReconfigurationID ValueHash `json:"reconfiguration_id,omitempty"`
+	Step              Step      `json:"step"`
+	FirstCurrent      *Proposal `json:"first_current,omitempty"`
+	AggregatePrior    *Proposal `json:"aggregate_prior,omitempty"`
 }
 
 // Decision carries the quorum evidence for an Algorithm 4 decision.
 type Decision struct {
+	ConfigID  uint      `json:"config_id"`
 	Slot      Slot      `json:"slot"`
 	Step      Step      `json:"step"`
 	Proposal  Proposal  `json:"proposal"`

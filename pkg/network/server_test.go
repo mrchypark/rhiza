@@ -579,7 +579,7 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	server.SetCompactedHandler(func() { called <- struct{}{} })
 	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer callCancel()
-	if err := server.catchUpFrom(callCtx, member.ID, 1); !errors.Is(err, ErrNotReady) {
+	if err := server.catchUpFrom(callCtx, member.ID, 1, true); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("catch-up error=%v, want %v", err, ErrNotReady)
 	}
 	select {

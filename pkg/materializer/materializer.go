@@ -994,6 +994,11 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 	} else if checkpoint {
 		commands = nil
 		batched = true
+	} else if reconfiguration, err := types.DecodeReconfiguration(value); err != nil {
+		return fmt.Errorf("decode reconfiguration: %w", err)
+	} else if reconfiguration {
+		commands = nil
+		batched = true
 	} else if graph {
 		commands = nil
 		batched = true

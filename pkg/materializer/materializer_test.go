@@ -1367,6 +1367,20 @@ func TestMaterializerAdvancesPastLeaderSchedule(t *testing.T) {
 	}
 }
 
+func TestMaterializerRejectsMalformedReconfiguration(t *testing.T) {
+	m, err := Open(t.TempDir()+"/membership.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Apply(context.Background(), 1, []byte("QRCF\x00{}")); err == nil {
+		t.Fatal("malformed membership control was applied")
+	}
+	if m.Tip() != 0 {
+		t.Fatalf("invalid control advanced tip to %d", m.Tip())
+	}
+}
+
 func TestMaterializerHealth(t *testing.T) {
 	dir, err := os.MkdirTemp("", "materializer-test")
 	if err != nil {

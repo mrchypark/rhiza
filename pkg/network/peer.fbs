@@ -9,7 +9,8 @@ enum Operation:ubyte {
   ReadIndex = 5,
   StageValue = 6,
   FetchValue = 7,
-  PrepareCheckpoint = 8
+  PrepareCheckpoint = 8,
+  VerifyPrefix = 9
 }
 
 table Proposal {
@@ -24,6 +25,7 @@ table Summary {
   step:ulong (id: 1);
   first_current:Proposal (id: 2);
   aggregate_prior:Proposal (id: 3);
+  reconfiguration_id:[ubyte] (id: 4);
 }
 
 table RecordRequest {
@@ -37,6 +39,7 @@ table Decision {
   step:ulong (id: 1);
   proposal:Proposal (id: 2);
   summaries:[Summary] (id: 3);
+  config_id:ulong (id: 4);
 }
 
 table DecidedValue {
