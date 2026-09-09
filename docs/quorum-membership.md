@@ -188,14 +188,54 @@ watermark is deferred until repeated scans of long WALs justify it. Different
 sources can still fetch overlapping pages; the limit remains two, and the normal
 pipeline remains sixteen. These changes do not complete any deployment gate above.
 
-Measurement for steps 2–4 will use the existing Performance CI on
-`ubuntu-24.04`, with `GOMAXPROCS=2`, ten alternating samples per revision,
-and the focused `transport`, `auth`, and `catchup` modes. CI dispatch is pending:
-the candidate and workflow additions are uncommitted, and publishing the
-comparison snapshots requires extending the earlier no-commit/no-push scope.
-No valid performance result for these three steps is available yet. A local
-sample that overlapped another task's tests was discarded. The full Go tests,
-race detector, vet, CLI/Operator build, and CI configuration lint passed.
-See [the optimization plan](performance-optimization-plan.md) for exact workloads
-and the sequential revision comparisons. Allocation-free cache hits and a
-single fetch in the concurrency test are correctness checks, not CI latency results.
+Measurement for steps 2–4 used the Performance CI on `ubuntu-24.04`, Go 1.27.0,
+`CGO_ENABLED=0`, and `GOMAXPROCS=2`, with ten alternating one-second samples per
+revision. Each comparison used identical benchmark fixtures on both revisions.
+The baseline includes the existing uncommitted membership prototype and WAL
+metadata optimization; commits `e63b66e` → `b989d0c` → `d6b0eec` → `72a35ff`
+add transport, authentication, and catch-up changes in order.
+
+| Workload | Median time/op before → after | Median bytes/op before → after | Median allocations/op before → after |
+| --- | ---: | ---: | ---: |
+| Bound transport, real QUIC ReadTip | 113.0 → 112.8 µs | 7,946.5 → 7,370 | 92 → 90 |
+| Peer authentication, 3 members | 444.2 → 313.4 ns | 720 → 720 | 3 → 3 |
+| Peer authentication, 16 members | 3,347 → 885.7 ns | 12,000 → 3,728 | 9 → 3 |
+| Same-source catch-up, real QUIC | 5.835 → 5.680 ms | 212,005.5 → 108,199 | 793 → 430 |
+
+Transport reduced allocated bytes by 7.25%, without a significant time change
+(p=0.971). Authentication time fell 29.45% / 73.54% for 3 / 16 members; only
+the 16-member case reduced heap allocation (68.93% fewer bytes). The authentication
+benchmark includes configuration lookup and an empty Sync response, not QUIC I/O.
+
+Catch-up uses a fresh follower eight slots behind, two concurrent hint requests
+from one source, a warmed connection, and an intentional 5ms delay per reply.
+Follower/WAL creation and teardown are outside the timer. Fetches fell 2→1 and
+received decision candidates 16→8, while the installed prefix remained eight
+unique slots. Allocated bytes fell 48.96%; time fell 2.65% in this controlled
+workload. Authentication and catch-up time differences have benchstat p<0.001.
+Durable/hint mixing and terminal persistence are separately covered by correctness
+tests; this hint-only benchmark does not measure durable catch-up latency.
+
+Transport and catch-up ran on EPYC 9V74 runners; authentication ran on EPYC 7763.
+Each before/after pair shares its runner, but cross-workload percentages must not
+be combined into an end-to-end throughput claim. No tail latency, SQL deployment,
+or Kubernetes performance claim follows. An overlapping local sample was discarded.
+
+All three performance runs passed:
+[transport](https://github.com/mrchypark/rhiza/actions/runs/34375805234),
+[authentication](https://github.com/mrchypark/rhiza/actions/runs/34376322012),
+[catch-up](https://github.com/mrchypark/rhiza/actions/runs/34376555468).
+[Raw outputs, benchstat and runner metadata](../benchmarks/results/2026-09-10-network-optimization/)
+are retained in the repository. The full local Go tests, race detector, vet,
+CLI/Operator build, and CI configuration lint passed. The first
+[full CI run](https://github.com/mrchypark/rhiza/actions/runs/34376849217) exposed
+a UDP reservation close/rebind race in the QUIC membership test (address already
+in use, not a race-detector memory warning). Commit `809d59e` keeps the bound
+QUIC transport alive across listener restarts and adds a deterministic port
+ownership/restart check. Authentication still shares the existing validation path.
+The focused race tests and [corrected full CI](https://github.com/mrchypark/rhiza/actions/runs/34378032446)
+passed at `809d59e`: Go tests/race/vet/build, real-server E2E, vulnerability scan,
+Linux/macOS Rust SDK tests and packaging, and both container builds. The
+[CI metadata](../benchmarks/results/2026-09-10-network-optimization/validation.json) is retained. This startup/test correction does not change the measured cache,
+authentication handler, or catch-up paths; performance results refer to the exact
+comparison revisions above.

@@ -9,9 +9,9 @@
 | --- | --- | --- |
 | 코어 내부 설정 조회의 멤버 목록 복사 제거 | 완료 | 공개 API는 복사 유지. 작업당 할당량 7.4% 감소 |
 | 1. WAL 기록 전 인증서 중복 해석 제거 | 완료 | 작업당 할당량 54,663 → 42,971 bytes, 21.4% 감소. 할당 횟수 299 → 240 |
-| 2. 네트워크 설정 캐시 조회 개선 | 구현·기능 검증 완료 | ConfigID로 먼저 조회. 캐시 hit에서 설정 복사·할당 0 |
-| 3. RPC 인증용 임시 멤버 맵 제거 | 구현·기능 검증 완료 | 과거·현재 sender를 멤버 slice에서 직접 조회 |
-| 4. 중복 catch-up 합치기 | 구현·기능 검증 완료 | source별 직렬화. durable 완료 전에 retained prefix를 WAL 동기화 |
+| 2. 네트워크 설정 캐시 조회 개선 | 구현·기능 검증·CI 측정 완료 | 실제 QUIC 할당량 7.25% 감소. 시간 유의차 없음 |
+| 3. RPC 인증용 임시 멤버 맵 제거 | 구현·기능 검증·CI 측정 완료 | 인증 시간 3명 29.45%, 16명 73.54% 감소 |
+| 4. 중복 catch-up 합치기 | 구현·기능 검증·CI 측정 완료 | 같은 source fetch 2→1, 할당량 48.96% 감소. durable prefix 장벽 유지 |
 
 1번의 시간 중앙값은 14.18 → 14.55ms로, 속도 개선은 확인되지 않았다.
 수치는 Apple M3 / Go 1.27, 인프로세스 3-peer transport와 로컬 WAL,
@@ -143,13 +143,13 @@ Core 테스트는 sync 실패 후 재시도, hint 여러 슬롯의 단일 sync, 
 
 기존 미커밋 변경을 포함한 최적화 전 snapshot과 파일 해시를 비교했다.
 `docs/automatic-recovery-design.md` 및 이번 최적화 범위 밖의 기존 파일은 그대로다.
-커밋·푸시·릴리즈는 하지 않았다. Node·Operator·no-PVC 연동은 여전히 미완성이다.
+기능 검증 시점에는 커밋·푸시·릴리즈를 하지 않았다. 이후 CI 측정용 임시 브랜치 게시만
+별도로 승인받았다. Node·Operator·no-PVC 연동은 여전히 미완성이고 릴리즈하지 않았다.
 
-## CI 성능 측정 — 원격 후보 준비 대기
+## CI 성능 측정
 
-로컬에서 다른 작업의 테스트와 겹친 샘플은 폐기했다. 2~4번의 유효한 성능 수치는
-아직 없으며, 할당량·지연 개선율을 주장하지 않는다. 기능 테스트의 무할당 캐시 hit와
-단일 fetch 확인은 위의 동작 검증 결과다.
+로컬에서 다른 작업의 테스트와 겹친 샘플은 폐기했다. 아래 CI 결과만 성능 판정에
+사용한다. 기능 테스트의 무할당 캐시 hit와 단일 fetch 확인은 별도의 동작 검증 결과다.
 
 기존 `Performance` workflow에 `network_optimization` 선택 입력을 추가했다.
 `none`은 기존 전체 측정을 유지하고, 아래 모드는 해당 네트워크 벤치마크만 실행한다.
@@ -179,10 +179,53 @@ gh workflow run performance.yml --ref CI_BRANCH \
 
 동일 workflow ref의 동시 실행은 기존 concurrency 정책으로 취소될 수 있으므로
 2번 완료와 artifact 수집 후 3번(`auth`), 4번(`catchup`)을 순차 실행한다.
-현재 후보와 이 workflow 변경은 미커밋 상태이고 원격 `feature/quorum-membership`
-브랜치도 없어, 아직 CI를 dispatch하지 않았다. 기존 커밋·푸시 제외 범위를 바꾸는
-승인이 있으면 독립된 임시 CI 브랜치에 기준·2·3·4 스냅샷을 게시해 실행할 수 있다.
-기존 작업 브랜치와 작업 디렉터리의 미커밋 상태는 유지한다.
+사용자 승인 후 `feature/quorum-membership-perf-ci`에 기준·2·3·4 스냅샷을
+커밋·푸시했다. 기존 작업 브랜치와 작업 디렉터리의 미커밋 상태는 유지한다.
+기준 `e63b66e` → transport `b989d0c` → auth `d6b0eec` → catch-up `72a35ff`이며,
+각 단계는 바로 전 단계와 비교한다. CI 설정만 바꾸는 후속 commit은 측정 대상 Go 코드를 바꾸지 않는다.
 
 CI 변경의 `bash -n`, `shellcheck`, `actionlint` 검사는 통과했다.
-CI 결과 수집 후 이 절과 멤버십 문서에 시간·bytes/op·allocs/op 및 실제 중복량을 갱신한다.
+세 단계 결과와 원본 artifact를 아래에 기록했다. 전체 CI 결과는 별도로 확인한다.
+
+### 단계별 CI 측정 결과 (2026-09-10)
+
+아래는 각 revision 10회 중앙값이다. 각 행의 전후는 같은 runner에서 교대로 측정했다.
+transport·catch-up runner는 AMD EPYC 9V74, auth runner는 AMD EPYC 7763이었다.
+모두 Go 1.27.0 / linux amd64 / Ubuntu 24.04다. 서로 다른 단계의 수치를 합산해
+전체 성능 개선율로 해석하지 않는다.
+
+| 경로 | 시간/op 전 → 후 | 시간 변화 | B/op 전 → 후 | allocs/op 전 → 후 |
+| --- | ---: | ---: | ---: | ---: |
+| 2. 실제 QUIC ReadTip | 113.0 → 112.8 µs | 유의차 없음 (p=0.971) | 7,946.5 → 7,370 (−7.25%) | 92 → 90 |
+| 3. 인증, 3명 | 444.2 → 313.4 ns | −29.45% | 720 → 720 | 3 → 3 |
+| 3. 인증, 16명 | 3,347 → 885.7 ns | −73.54% | 12,000 → 3,728 (−68.93%) | 9 → 3 |
+| 4. 동일 source catch-up | 5.835 → 5.680 ms | −2.65% | 212,005.5 → 108,199 (−48.96%) | 793 → 430 |
+
+인증과 catch-up 시간 차이는 `benchstat p<0.001`이다. 3명 인증의 할당량·횟수는
+변하지 않았으므로 임시 맵 제거가 모든 설정 크기에서 힙 할당 감소를 뜻하지는 않는다.
+catch-up의 성공한 두 호출 한 쌍당 fetch는 **2→1회**, 받은 decision 후보는
+**16→8개**, 고유 설치 슬롯은 **8→8개**였다. 줄인 것은 중복 전송·후보 처리이며,
+필요한 prefix 설치량을 줄인 것이 아니다. 시간 개선 2.65%는 의도적 5ms 지연을 둔
+이 실험 조건에 한정한다. tail latency나 일반 SQL/Kubernetes 처리량은 측정하지 않았다.
+
+- [transport CI 성공](https://github.com/mrchypark/rhiza/actions/runs/34375805234), [benchstat](../benchmarks/results/2026-09-10-network-optimization/transport/benchstat.txt).
+- [auth CI 성공](https://github.com/mrchypark/rhiza/actions/runs/34376322012), [benchstat](../benchmarks/results/2026-09-10-network-optimization/auth/benchstat.txt).
+- [catch-up CI 성공](https://github.com/mrchypark/rhiza/actions/runs/34376555468), [benchstat](../benchmarks/results/2026-09-10-network-optimization/catchup/benchstat.txt).
+
+각 결과 디렉터리에 `base.txt`, `candidate.txt`, `environment.txt`도 보존했다.
+최초 [전체 CI](https://github.com/mrchypark/rhiza/actions/runs/34376849217)는 측정 종료 후
+실행했다. 일반 Go 테스트·vet·빌드·실제 서버 E2E, 양 플랫폼 Rust, 컨테이너 빌드는
+통과했지만 race 단계의 `TestQuorumMembershipQUIC`에서 UDP `address already in use`로
+실패했다. 데이터 race 경고가 아니라 테스트의 예약 소켓 close/rebind 경쟁이었다.
+
+`809d59e`에서 예약한 UDP 소켓을 `quic.Transport`가 계속 보유하고 listener만
+재시작하도록 수정했다. `StartPeerServerOnTransport`는 기존 인증·TLS 검사를 공통으로
+사용하며, 호출자가 transport/socket을 소유한다. 포트가 listener 종료 사이에도
+점유되어 있고 재시작 후 실제 QUIC 요청이 성공하는 회귀 검사를 추가했다.
+관련 두 테스트의 로컬 `go test -race`가 통과했다. 측정 대상 handler·캐시·catch-up
+코드는 바뀌지 않았으며 위 성능 수치는 표시된 원래 revision 비교 결과다.
+[수정 후보 전체 CI](https://github.com/mrchypark/rhiza/actions/runs/34378032446)가 통과했다.
+검증한 commit은 `809d59e`다. Go 일반 테스트·race·vet·CLI/Operator 빌드·실제 서버
+E2E·취약점 검사, Linux/macOS Rust SDK 검사와 패키징, 두 컨테이너 빌드가 모두
+성공했다. [CI 결과 메타데이터](../benchmarks/results/2026-09-10-network-optimization/validation.json)를 보존했다.
+최종 문서·측정 artifact 커밋은 검증된 Go 코드를 변경하지 않는다. `git diff --check`도 통과했다.

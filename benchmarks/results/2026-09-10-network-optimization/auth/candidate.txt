@@ -1,0 +1,70 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3761167	       313.7 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1404219	       924.5 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 2955286	       417.7 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1342232	       889.3 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3881667	       306.2 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1342758	       884.6 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3689180	       322.8 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1304212	       918.7 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3725766	       313.1 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1332061	       890.1 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3900577	       311.9 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1358092	       874.5 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3806853	       312.1 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1352272	       882.3 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3758726	       315.7 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1352721	       875.1 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3868896	       311.5 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1373626	       864.1 ns/op	    3728 B/op	       3 allocs/op
+PASS
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+BenchmarkPeerAuthentication/3-2 	 3904440	       315.0 ns/op	     720 B/op	       3 allocs/op
+BenchmarkPeerAuthentication/16-2         	 1352932	       886.8 ns/op	    3728 B/op	       3 allocs/op
+PASS

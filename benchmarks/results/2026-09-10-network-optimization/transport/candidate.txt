@@ -1,0 +1,70 @@
+2026/09/09 16:20:47 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    113522 ns/op	    7370 B/op	      90 allocs/op
+PASS
+2026/09/09 16:20:49 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    112802 ns/op	    7371 B/op	      90 allocs/op
+PASS
+2026/09/09 16:20:52 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    112515 ns/op	    7372 B/op	      90 allocs/op
+PASS
+2026/09/09 16:20:53 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	    9904	    112358 ns/op	    7367 B/op	      90 allocs/op
+PASS
+2026/09/09 16:20:57 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    112401 ns/op	    7367 B/op	      90 allocs/op
+PASS
+2026/09/09 16:20:58 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    112599 ns/op	    7371 B/op	      90 allocs/op
+PASS
+2026/09/09 16:21:01 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    112878 ns/op	    7368 B/op	      90 allocs/op
+PASS
+2026/09/09 16:21:02 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    115063 ns/op	    7370 B/op	      90 allocs/op
+PASS
+2026/09/09 16:21:06 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	   10000	    113727 ns/op	    7374 B/op	      90 allocs/op
+PASS
+2026/09/09 16:21:07 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkBoundTransportQUICReadTip-2   	    9697	    114220 ns/op	    7366 B/op	      90 allocs/op
+PASS
