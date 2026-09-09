@@ -19,7 +19,9 @@ struct RhizaBuffer {
 
 extern "C" {
     fn RhizaOpen(data: *mut c_void, len: usize) -> RhizaBuffer;
+    fn RhizaOpenFromEnv() -> RhizaBuffer;
     fn RhizaCall(handle: u64, data: *mut c_void, len: usize, timeout_ms: u64) -> RhizaBuffer;
+    fn RhizaStartOperator(handle: u64, address: *mut c_void, len: usize) -> RhizaBuffer;
     fn RhizaClose(handle: u64) -> RhizaBuffer;
     fn RhizaFree(buffer: RhizaBuffer);
 }
@@ -114,6 +116,35 @@ impl Db {
             handle,
             closed: false,
         })
+    }
+    /// Opens from the process `RHIZA_*` configuration used by the Rhiza server.
+    /// Read the environment before starting this process; changes do not alter an
+    /// already-open DB.
+    pub fn open_from_env() -> Result<Self> {
+        let value = native_open_from_env()?;
+        let handle = value
+            .get("handle")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error {
+                code: "invalid_response".into(),
+                message: "open response has no handle".into(),
+            })?;
+        Ok(Self {
+            handle,
+            closed: false,
+        })
+    }
+    /// Starts a private recovery-only HTTP listener and returns its bound address.
+    /// It serves only `/recovery/status` and authenticated `/recovery/archive`;
+    /// it is closed when this `Db` closes and cannot be started twice.
+    pub fn start_operator(&mut self, address: &str) -> Result<String> {
+        if self.closed {
+            return Err(Error {
+                code: "closed".into(),
+                message: "Rhiza DB is closed".into(),
+            });
+        }
+        native_start_operator(self.handle, address)
     }
     pub fn close(&mut self) -> Result<()> {
         if self.closed {
@@ -464,6 +495,28 @@ fn native_open(value: Value) -> Result<Value> {
     let mut input = encode(value)?;
     decode(unsafe { RhizaOpen(input.as_mut_ptr().cast(), input.len()) })
 }
+fn native_open_from_env() -> Result<Value> {
+    decode(unsafe { RhizaOpenFromEnv() })
+}
+fn native_start_operator(handle: u64, address: &str) -> Result<String> {
+    if address.len() > MAX_INPUT_BYTES {
+        return Err(Error {
+            code: "invalid_request".into(),
+            message: "operator address exceeds 16 MiB".into(),
+        });
+    }
+    let mut input = address.as_bytes().to_vec();
+    let value: Value =
+        decode(unsafe { RhizaStartOperator(handle, input.as_mut_ptr().cast(), input.len()) })?;
+    value
+        .get("address")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| Error {
+            code: "invalid_response".into(),
+            message: "operator start response has no address".into(),
+        })
+}
 fn native_call<T: DeserializeOwned>(handle: u64, value: Value, timeout_ms: u64) -> Result<T> {
     let mut input = encode(value)?;
     decode(unsafe { RhizaCall(handle, input.as_mut_ptr().cast(), input.len(), timeout_ms) })
@@ -489,13 +542,15 @@ where
 mod tests {
     use super::*;
     use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc,
         },
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
     fn path() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -654,6 +709,47 @@ mod tests {
         };
         db.close().unwrap();
         assert_eq!(db.ready().unwrap_err().code, "closed");
+    }
+    #[test]
+    fn operator_listener_is_recovery_only_and_closes_with_db() {
+        let mut instance = db();
+        let address = instance.start_operator("127.0.0.1:0").unwrap();
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream
+            .write_all(
+                b"GET /recovery/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream
+            .write_all(b"GET /sql/query HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert_eq!(
+            instance.start_operator("127.0.0.1:0").unwrap_err().code,
+            "invalid_request"
+        );
+
+        instance.close().unwrap();
+        assert!(
+            TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(100))
+                .is_err()
+        );
+
+        let blocked = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut other = db();
+        assert_eq!(
+            other
+                .start_operator(&blocked.local_addr().unwrap().to_string())
+                .unwrap_err()
+                .code,
+            "internal"
+        );
     }
     #[test]
     fn notifications_deliver_binary_payloads_and_drop_unsubscribes() {

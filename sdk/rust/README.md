@@ -66,6 +66,23 @@ operations use `call`: `graph_stream_read`, `graph_stream_offset`,
 `set_graph_stream_offset`, and `trim_graph_stream`, with the corresponding
 [Go request fields](../../rhiza.go).
 
+## Recovery operator for embedded hosts
+
+An embedded host that runs the Rhiza recovery operator opens its generation
+from the same process `RHIZA_*` configuration as the server binary:
+
+```rust
+let mut db = rhizadb::Db::open_from_env()?;
+let recovery_addr = db.start_operator("127.0.0.1:9091")?;
+```
+
+`start_operator` serves only `GET /recovery/status` and authenticated
+`POST /recovery/archive`; application SQL, KV, graph, readiness, and metrics
+routes return 404. Keep the bound address private to the operator. It can be
+started once and stops with `Db::close` or `Drop`. The environment is read at
+open time, so recovery generations require the host process to restart with
+the operator-provided `RHIZA_*` values.
+
 SQL and graph parameters use `serde_json::Value`. Integer values preserve Rust
 `i64`/`u64` ranges accepted by JSON and Go's `UseNumber`; do not pass important
 integers through `f64`. KV byte values are base64-encoded by the SDK and accept

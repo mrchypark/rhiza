@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -37,100 +36,11 @@ func run(ctx context.Context) (resultErr error) {
 }
 
 func runCommand(ctx context.Context, enroll bool) (resultErr error) {
-	var members []rhiza.Member
-	if raw := os.Getenv("RHIZA_CLUSTER_MEMBERS"); raw != "" {
-		if err := decodeStrictJSON(raw, &members); err != nil {
-			return fmt.Errorf("invalid RHIZA_CLUSTER_MEMBERS: %w", err)
-		}
-	}
-	checkpointInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_CHECKPOINT_INTERVAL", "15m"))
-	if err != nil || checkpointInterval < 0 {
-		return errors.New("invalid RHIZA_CHECKPOINT_INTERVAL")
-	}
-	checkpointTailBytes, err := strconv.ParseInt(getEnvOrDefault("RHIZA_CHECKPOINT_TAIL_BYTES", "536870912"), 10, 64)
-	if err != nil || checkpointTailBytes <= 0 || checkpointTailBytes > 2<<30 {
-		return errors.New("invalid RHIZA_CHECKPOINT_TAIL_BYTES")
-	}
-	maxWALBytes, err := strconv.ParseInt(getEnvOrDefault("RHIZA_MAX_WAL_BYTES", "0"), 10, 64)
-	if err != nil || maxWALBytes < 0 {
-		return errors.New("invalid RHIZA_MAX_WAL_BYTES")
-	}
-	maxConcurrentReads, err := strconv.Atoi(getEnvOrDefault("RHIZA_MAX_CONCURRENT_READS", "0"))
-	if err != nil || maxConcurrentReads < 0 {
-		return errors.New("invalid RHIZA_MAX_CONCURRENT_READS")
-	}
-	maxLongPollReads, err := strconv.Atoi(getEnvOrDefault("RHIZA_MAX_LONG_POLL_READS", "0"))
-	if err != nil || maxLongPollReads < 0 || maxConcurrentReads == 0 && maxLongPollReads != 0 || maxLongPollReads > maxConcurrentReads {
-		return errors.New("invalid RHIZA_MAX_LONG_POLL_READS")
-	}
-	objStoreSyncInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_SYNC_INTERVAL", "1m"))
-	if err != nil || objStoreSyncInterval < 0 {
-		return errors.New("invalid RHIZA_OBJSTORE_SYNC_INTERVAL")
-	}
-	objStoreBatchDelay, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_BATCH_DELAY", "2ms"))
-	if err != nil || objStoreBatchDelay <= 0 || objStoreBatchDelay > time.Second {
-		return errors.New("invalid RHIZA_OBJSTORE_BATCH_DELAY")
-	}
-	objStoreGCInterval, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_GC_INTERVAL", "1h"))
-	if err != nil || objStoreGCInterval < 0 {
-		return errors.New("invalid RHIZA_OBJSTORE_GC_INTERVAL")
-	}
-	objStoreGCGracePeriod, err := time.ParseDuration(getEnvOrDefault("RHIZA_OBJSTORE_GC_GRACE_PERIOD", "24h"))
-	if err != nil || objStoreGCGracePeriod < 0 {
-		return errors.New("invalid RHIZA_OBJSTORE_GC_GRACE_PERIOD")
-	}
-	objStoreRetries, err := strconv.Atoi(getEnvOrDefault("RHIZA_OBJSTORE_MAX_RETRIES", "3"))
-	if err != nil || objStoreRetries < 0 {
-		return errors.New("invalid RHIZA_OBJSTORE_MAX_RETRIES")
-	}
-	objStoreInsecure, err := boolEnv("RHIZA_OBJSTORE_INSECURE")
+	config, err := rhiza.ConfigFromEnv()
 	if err != nil {
 		return err
 	}
-	objStoreDir, err := objectStoreDirEnv()
-	if err != nil {
-		return err
-	}
-
-	// Parse config from environment
-	config := rhiza.Config{
-		ClusterID:                      getEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"),
-		NodeID:                         getEnvOrDefault("RHIZA_NODE_ID", "node-1"),
-		DataDir:                        getEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"),
-		BindAddr:                       getEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
-		PeerAddr:                       getEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"),
-		AdminToken:                     os.Getenv("RHIZA_ADMIN_TOKEN"),
-		Members:                        members,
-		ObjStoreProvider:               os.Getenv("RHIZA_OBJSTORE_PROVIDER"),
-		ObjStoreDir:                    objStoreDir,
-		ObjStorePrefix:                 os.Getenv("RHIZA_OBJSTORE_PREFIX"),
-		ObjStoreEndpoint:               os.Getenv("RHIZA_OBJSTORE_ENDPOINT"),
-		ObjStoreBucket:                 os.Getenv("RHIZA_OBJSTORE_BUCKET"),
-		ObjStoreRegion:                 os.Getenv("RHIZA_OBJSTORE_REGION"),
-		ObjStoreInsecure:               objStoreInsecure,
-		ObjStoreRetries:                objStoreRetries,
-		ObjStoreAccessKey:              os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY"),
-		ObjStoreSecretKey:              os.Getenv("RHIZA_OBJSTORE_SECRET_KEY"),
-		ObjStoreSessionToken:           os.Getenv("RHIZA_OBJSTORE_SESSION_TOKEN"),
-		ObjStoreServiceAccount:         os.Getenv("RHIZA_OBJSTORE_SERVICE_ACCOUNT"),
-		ObjStoreAzureTenantID:          os.Getenv("RHIZA_OBJSTORE_AZURE_TENANT_ID"),
-		ObjStoreAzureClientID:          os.Getenv("RHIZA_OBJSTORE_AZURE_CLIENT_ID"),
-		ObjStoreAzureClientSecret:      os.Getenv("RHIZA_OBJSTORE_AZURE_CLIENT_SECRET"),
-		ObjStoreAzureStorageAccount:    os.Getenv("RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT"),
-		ObjStoreAzureStorageAccountKey: os.Getenv("RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT_KEY"),
-		ObjStoreAzureConnectionString:  os.Getenv("RHIZA_OBJSTORE_AZURE_CONNECTION_STRING"),
-		ObjStoreAzureUserAssignedID:    os.Getenv("RHIZA_OBJSTORE_AZURE_USER_ASSIGNED_ID"),
-		ObjStoreDurability:             rhiza.ObjectStoreDurability(getEnvOrDefault("RHIZA_OBJSTORE_DURABILITY", "async")),
-		ObjStoreSyncInterval:           objStoreSyncInterval,
-		ObjStoreBatchDelay:             objStoreBatchDelay,
-		ObjStoreGCInterval:             objStoreGCInterval,
-		ObjStoreGCGracePeriod:          objStoreGCGracePeriod,
-		CheckpointInterval:             checkpointInterval,
-		CheckpointTailBytes:            checkpointTailBytes,
-		MaxWALBytes:                    maxWALBytes,
-		MaxConcurrentReads:             maxConcurrentReads,
-		MaxLongPollReads:               maxLongPollReads,
-	}
+	members := config.Members
 
 	role := getEnvOrDefault("RHIZA_ROLE", "voter")
 	if enroll {
@@ -284,27 +194,4 @@ func decodeStrictJSON(raw string, value any) error {
 		return errors.New("trailing JSON")
 	}
 	return nil
-}
-
-func boolEnv(key string) (bool, error) {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return false, nil
-	}
-	value, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("invalid %s: %w", key, err)
-	}
-	return value, nil
-}
-
-func objectStoreDirEnv() (string, error) {
-	value, legacy := os.Getenv("RHIZA_OBJSTORE_DIR"), os.Getenv("RHIZA_FILESYSTEM_DIR")
-	if value != "" && legacy != "" && value != legacy {
-		return "", errors.New("RHIZA_OBJSTORE_DIR conflicts with legacy RHIZA_FILESYSTEM_DIR")
-	}
-	if value != "" {
-		return value, nil
-	}
-	return legacy, nil
 }
