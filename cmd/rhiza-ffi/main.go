@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 	"unsafe"
@@ -28,6 +30,7 @@ import (
 const (
 	maxInputBytes    = 16 << 20
 	defaultTimeout   = 30 * time.Second
+	operatorShutdown = 30 * time.Second
 	maxSubscriptions = 64
 )
 
@@ -42,6 +45,7 @@ type ffiEntry struct {
 	nextSub       uint64
 	pendingSubs   int
 	subscriptions map[uint64]*ffiSubscription
+	operator      *http.Server
 }
 
 type ffiSubscription struct {
@@ -83,6 +87,11 @@ func RhizaOpen(data unsafe.Pointer, length C.size_t) C.RhizaBuffer {
 	return cBuffer(goOpen(copiedInput(data, length)))
 }
 
+// RhizaOpenFromEnv opens an embedded DB from the process RHIZA_* configuration.
+//
+//export RhizaOpenFromEnv
+func RhizaOpenFromEnv() C.RhizaBuffer { return cBuffer(goOpenFromEnv()) }
+
 // RhizaCall invokes one public embedded DB operation.
 //
 //export RhizaCall
@@ -94,6 +103,14 @@ func RhizaCall(handle C.uint64_t, data unsafe.Pointer, length C.size_t, timeoutM
 //
 //export RhizaClose
 func RhizaClose(handle C.uint64_t) C.RhizaBuffer { return cBuffer(goClose(uint64(handle))) }
+
+// RhizaStartOperator starts the private recovery-only HTTP listener and returns
+// its bound address. It may be called once for each DB handle.
+//
+//export RhizaStartOperator
+func RhizaStartOperator(handle C.uint64_t, address unsafe.Pointer, length C.size_t) C.RhizaBuffer {
+	return cBuffer(goStartOperator(uint64(handle), copiedInput(address, length)))
+}
 
 // RhizaFree frees a buffer returned by RhizaOpen, RhizaCall, or RhizaClose.
 //
@@ -151,6 +168,61 @@ func goOpen(input []byte) []byte {
 	return dataJSON(map[string]uint64{"handle": handle})
 }
 
+func goOpenFromEnv() []byte {
+	config, err := rhiza.ConfigFromEnv()
+	if err != nil {
+		return errorJSON(err)
+	}
+	input, err := json.Marshal(config)
+	if err != nil {
+		return errorJSON(err)
+	}
+	return goOpen(input)
+}
+
+func goStartOperator(handle uint64, input []byte) []byte {
+	if err := validInput(input); err != nil {
+		return errorJSON(err)
+	}
+	address := string(bytes.TrimSpace(input))
+	if address == "" {
+		return errorJSON(&ffiError{Code: "invalid_request", Message: "operator address is required"})
+	}
+	entry, release, err := acquire(handle)
+	if err != nil {
+		return errorJSON(err)
+	}
+	defer release()
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.closed {
+		return errorJSON(&ffiError{Code: "closed", Message: "Rhiza handle is closing"})
+	}
+	if entry.operator != nil {
+		return errorJSON(&ffiError{Code: "invalid_request", Message: "operator listener is already running"})
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return errorJSON(err)
+	}
+	handler := entry.db.OperatorHandler()
+	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entry.mu.Lock()
+		if entry.closed {
+			entry.mu.Unlock()
+			http.Error(w, "Rhiza is closing", http.StatusServiceUnavailable)
+			return
+		}
+		entry.active++
+		entry.mu.Unlock()
+		defer entry.releaseActivity()
+		handler.ServeHTTP(w, r)
+	})}
+	entry.operator = server
+	go func() { _ = server.Serve(listener) }()
+	return dataJSON(map[string]string{"address": listener.Addr().String()})
+}
+
 func goCall(handle uint64, input []byte, timeoutMS uint64) []byte {
 	if err := validInput(input); err != nil {
 		return errorJSON(err)
@@ -199,6 +271,8 @@ func goClose(handle uint64) []byte {
 	entry.mu.Lock()
 	entry.closed = true
 	entry.cancel()
+	operator := entry.operator
+	entry.operator = nil
 	subscriptions := make([]*ffiSubscription, 0, len(entry.subscriptions))
 	for _, sub := range entry.subscriptions {
 		subscriptions = append(subscriptions, sub)
@@ -208,6 +282,14 @@ func goClose(handle uint64) []byte {
 		close(entry.drained)
 	}
 	entry.mu.Unlock()
+	if operator != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), operatorShutdown)
+		err := operator.Shutdown(shutdownCtx)
+		cancel()
+		if err != nil {
+			_ = operator.Close()
+		}
+	}
 	for _, sub := range subscriptions {
 		sub.stop()
 		sub.cancel()
@@ -233,14 +315,16 @@ func acquire(handle uint64) (*ffiEntry, func(), error) {
 	}
 	entry.active++
 	entry.mu.Unlock()
-	return entry, func() {
-		entry.mu.Lock()
-		entry.active--
-		if entry.closed && entry.active == 0 {
-			close(entry.drained)
-		}
-		entry.mu.Unlock()
-	}, nil
+	return entry, entry.releaseActivity, nil
+}
+
+func (entry *ffiEntry) releaseActivity() {
+	entry.mu.Lock()
+	entry.active--
+	if entry.closed && entry.active == 0 {
+		close(entry.drained)
+	}
+	entry.mu.Unlock()
 }
 
 func timeoutDuration(ms uint64) (time.Duration, error) {

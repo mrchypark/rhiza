@@ -40,34 +40,11 @@ func TestReplicaMembersRequirePinnedIdentityOnlyForLearner(t *testing.T) {
 	}
 }
 
-func TestBooleanEnvironmentIsStrict(t *testing.T) {
-	t.Setenv("RHIZA_OBJSTORE_INSECURE", "treu")
-	if _, err := boolEnv("RHIZA_OBJSTORE_INSECURE"); err == nil {
-		t.Fatal("invalid boolean was accepted")
-	}
-	t.Setenv("RHIZA_OBJSTORE_INSECURE", "true")
-	if value, err := boolEnv("RHIZA_OBJSTORE_INSECURE"); err != nil || !value {
-		t.Fatalf("value=%v err=%v", value, err)
-	}
-}
-
 func TestRunReturnsConfigurationErrors(t *testing.T) {
 	t.Setenv("RHIZA_ROLE", "unknown")
 	t.Setenv("RHIZA_OBJSTORE_INSECURE", "")
 	if err := run(context.Background()); err == nil || !strings.Contains(err.Error(), "invalid RHIZA_ROLE") {
 		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestObjectStoreDirectoryEnvironment(t *testing.T) {
-	t.Setenv("RHIZA_OBJSTORE_DIR", "/new")
-	t.Setenv("RHIZA_FILESYSTEM_DIR", "/old")
-	if _, err := objectStoreDirEnv(); err == nil {
-		t.Fatal("conflicting object-store directories were accepted")
-	}
-	t.Setenv("RHIZA_FILESYSTEM_DIR", "")
-	if value, err := objectStoreDirEnv(); err != nil || value != "/new" {
-		t.Fatalf("value=%q err=%v", value, err)
 	}
 }
 

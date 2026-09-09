@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -146,6 +147,59 @@ func TestHandleLifetimeAndInputValidation(t *testing.T) {
 	}
 	if code := responseErrorCode(t, goCall(h, []byte(`{"operation":"ready","request":{}}`), 0)); code != "invalid_handle" {
 		t.Fatalf("stale call=%q", code)
+	}
+}
+
+func TestOperatorListenerAndEnvOpen(t *testing.T) {
+	t.Setenv("RHIZA_DATA_DIR", t.TempDir())
+	t.Setenv("RHIZA_NODE_ID", "ffi-env")
+	t.Setenv("RHIZA_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("RHIZA_PEER_ADDR", "127.0.0.1:0")
+	t.Setenv("RHIZA_CLUSTER_MEMBERS", "")
+	var opened struct {
+		Data struct {
+			Handle uint64 `json:"handle"`
+		} `json:"data"`
+		Error *ffiError `json:"error"`
+	}
+	if err := json.Unmarshal(goOpenFromEnv(), &opened); err != nil || opened.Error != nil || opened.Data.Handle == 0 {
+		t.Fatalf("open from env: %#v err=%v", opened, err)
+	}
+	h := opened.Data.Handle
+	response := goStartOperator(h, []byte("127.0.0.1:0"))
+	var started struct {
+		Data struct {
+			Address string `json:"address"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response, &started); err != nil || started.Data.Address == "" {
+		t.Fatalf("start operator: %s err=%v", response, err)
+	}
+	if status, err := http.Get("http://" + started.Data.Address + "/recovery/status"); err != nil || status.StatusCode != http.StatusOK {
+		if status != nil {
+			status.Body.Close()
+		}
+		t.Fatalf("recovery status: status=%v err=%v", status, err)
+	} else {
+		status.Body.Close()
+	}
+	if status, err := http.Get("http://" + started.Data.Address + "/sql/query"); err != nil || status.StatusCode != http.StatusNotFound {
+		if status != nil {
+			status.Body.Close()
+		}
+		t.Fatalf("application endpoint: status=%v err=%v", status, err)
+	} else {
+		status.Body.Close()
+	}
+	if code := responseErrorCode(t, goStartOperator(h, []byte("127.0.0.1:0"))); code != "invalid_request" {
+		t.Fatalf("duplicate start code=%q", code)
+	}
+	if response := goClose(h); string(response) != `{"data":null}` {
+		t.Fatalf("close=%s", response)
+	}
+	if conn, err := net.DialTimeout("tcp", started.Data.Address, 100*time.Millisecond); err == nil {
+		conn.Close()
+		t.Fatal("operator listener remains open after DB close")
 	}
 }
 

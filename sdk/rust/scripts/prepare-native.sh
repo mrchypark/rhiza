@@ -13,7 +13,7 @@ cleanup() { rm -rf "$temporary_dir"; }
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$temporary_dir"
-cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica.go" "$temporary_dir/"
+cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica.go" "$repo_dir/config_env.go" "$repo_dir/operator_handler.go" "$temporary_dir/"
 
 (
     cd "$repo_dir"

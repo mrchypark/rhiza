@@ -106,6 +106,8 @@ fn main() {
         "go.sum",
         "rhiza.go",
         "replica.go",
+        "config_env.go",
+        "operator_handler.go",
         "cmd/rhiza-ffi",
         "pkg",
         "internal",

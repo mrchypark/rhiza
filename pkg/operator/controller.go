@@ -430,14 +430,18 @@ func podEndpoint(pod object, containerName, endpoint string) (string, error) {
 		return "", err
 	}
 	port := "8080"
-	for _, p := range list(ctr["ports"]) {
-		v := asObject(p)
-		if str(v["name"]) == "http" {
-			n := number(v["containerPort"])
-			if n < 1 || n > 65535 {
-				return "", fmt.Errorf("invalid HTTP port")
+	// Embedded hosts can keep the application HTTP port separate.
+	for _, name := range []string{"recovery", "http"} {
+		for _, p := range list(ctr["ports"]) {
+			v := asObject(p)
+			if str(v["name"]) != name {
+				continue
 			}
-			port = fmt.Sprint(n)
+			n := number(v["containerPort"])
+			if n < 1 || n > 65535 || str(v["protocol"]) != "" && str(v["protocol"]) != "TCP" {
+				return "", fmt.Errorf("invalid recovery HTTP port")
+			}
+			return "http://" + net.JoinHostPort(ip, fmt.Sprint(n)) + endpoint, nil
 		}
 	}
 	return "http://" + net.JoinHostPort(ip, port) + endpoint, nil

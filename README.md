@@ -417,3 +417,5 @@ comparison boundaries are in
 ## License
 
 [MIT](LICENSE)
+
+For applications embedding Rhiza, see the [Go/Rust Operator integration guide](docs/embedded-operator.md).

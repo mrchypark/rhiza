@@ -1,5 +1,8 @@
 # Rhiza recovery operator
 
+For Go or Rust applications embedding Rhiza, see the dedicated
+[embedded application integration guide](../../docs/embedded-operator.md).
+
 These manifests deploy a namespace-scoped controller for `RhizaRecovery`.
 It monitors an **existing three-voter StatefulSet**. It does not create a
 database, PVCs, or a new membership from scratch.
