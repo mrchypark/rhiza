@@ -1363,7 +1363,7 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 	if err != nil {
 		return err
 	}
-	pending, err := c.appendUndurablePrefix(seal.Index)
+	pending, err := c.appendUndurablePrefix(ctx, seal.Index)
 	if err != nil {
 		return err
 	}
@@ -1386,7 +1386,7 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 	return nil
 }
 
-func (c *Core) appendUndurablePrefix(through Slot) ([]SlotValue, error) {
+func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotValue, error) {
 	c.mu.RLock()
 	floor := c.floor
 	c.mu.RUnlock()
@@ -1395,9 +1395,22 @@ func (c *Core) appendUndurablePrefix(through Slot) ([]SlotValue, error) {
 		return pending, nil
 	}
 	for slot := floor + 1; ; slot++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
 		lock.Lock()
 		c.mu.Lock()
+		if slot <= c.floor {
+			// Compaction may have covered this slot since the scan began.
+			slot = min(c.floor, through)
+			c.mu.Unlock()
+			lock.Unlock()
+			if slot == through {
+				break
+			}
+			continue
+		}
 		decided, ok := c.decided[slot]
 		if !ok {
 			c.mu.Unlock()
@@ -1464,6 +1477,35 @@ func (c *Core) EnsureDurable(slot Slot) error {
 	lock.Lock()
 	defer lock.Unlock()
 	return c.ensureDurableLocked(slot)
+}
+
+// EnsureDurableThrough persists the retained decision prefix with one sync.
+// Decisions already covered by the certified recovery base need no marker.
+func (c *Core) EnsureDurableThrough(ctx context.Context, through Slot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// ponytail: scans the retained prefix; add a durable watermark if long WALs
+	// make repeated catch-up checks costly.
+	pending, err := c.appendUndurablePrefix(ctx, through)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return ctx.Err()
+	}
+	if err := c.commits.Sync(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, value := range pending {
+		if decided, ok := c.decided[value.Slot]; ok && decided.Hash == value.Hash {
+			c.durable[value.Slot] = true
+			c.valueDurable[value.Hash] = true
+		}
+	}
+	return nil
 }
 
 func (c *Core) ensureDurableLocked(slot Slot) error {

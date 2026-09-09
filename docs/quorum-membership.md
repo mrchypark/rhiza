@@ -152,3 +152,50 @@ this run does not establish a latency improvement.
 Before times: 12.99 / 14.18 / 14.40 ms. After: 13.94 / 14.59 / 14.55 ms.
 
 Remaining performance work is tracked in [the optimization plan](performance-optimization-plan.md).
+
+### Network optimizations 2–4
+
+Bound transports now resolve `Core.ConfigIDForSlot` / `Core.ConfigID` before
+consulting their cache. A hit copies no members; a miss obtains a public
+snapshot and caches under its actual ID, even if the configuration advanced
+between lookups. Each configuration still owns its credentials, connection
+pools, and TLS session cache. Public cluster accessors continue returning copies.
+
+Peer authentication directly scans the historical and current member slices
+for the sender, preserving last-entry lookup semantics. Both membership checks,
+constant-time token comparisons, removed-voter fencing, and the restricted
+learner administrator exception remain intact. Actual QUIC membership tests
+exercise historical sync by a surviving voter and rejection of a removed voter.
+
+Catch-up serializes callers per source before taking either of the two global
+fetch slots. Waiters recheck their own target and keep their own cancellation
+context. Another source can use the second slot. Durable completion calls
+`EnsureDurableThrough`: existing hints are appended and covered by one shared
+sync before being marked durable. A raised in-memory Tip is insufficient.
+Membership control pages still force durable installation, including the
+terminal prefix barrier; the control-page test reopens the WAL in configuration 2.
+
+The helper reuses checkpoint prefix appends, checks concurrent recovery-base
+advancement under the slot and Core locks, and never recreates compacted state.
+WAL rollover syncs the old segment, and compaction preserves post-fence tails.
+Group commit detaches a batch before starting its sync, so new appends cannot
+join a completed earlier barrier. Failure/retry, one-sync hint promotion,
+cancellation, and a real recovery-base installation racing with sync are tested.
+Cancellation does not undo prior appends or stop an already running shared fsync.
+
+The deliberate limit is an O(retained prefix length) durability scan. A durable
+watermark is deferred until repeated scans of long WALs justify it. Different
+sources can still fetch overlapping pages; the limit remains two, and the normal
+pipeline remains sixteen. These changes do not complete any deployment gate above.
+
+Measurement for steps 2–4 will use the existing Performance CI on
+`ubuntu-24.04`, with `GOMAXPROCS=2`, ten alternating samples per revision,
+and the focused `transport`, `auth`, and `catchup` modes. CI dispatch is pending:
+the candidate and workflow additions are uncommitted, and publishing the
+comparison snapshots requires extending the earlier no-commit/no-push scope.
+No valid performance result for these three steps is available yet. A local
+sample that overlapped another task's tests was discarded. The full Go tests,
+race detector, vet, CLI/Operator build, and CI configuration lint passed.
+See [the optimization plan](performance-optimization-plan.md) for exact workloads
+and the sequential revision comparisons. Allocation-free cache hits and a
+single fetch in the concurrency test are correctness checks, not CI latency results.
