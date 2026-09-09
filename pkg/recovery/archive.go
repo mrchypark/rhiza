@@ -492,42 +492,61 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 		return nil, err
 	}
 	var snapshot *RecoverySnapshot
-	err := m.withGCLock(ctx, "snapshot:"+owner, func(ctx context.Context) error {
-		if err := m.Load(ctx); err != nil {
-			return err
-		}
-		m.mu.Lock()
-		head, refs := m.head, slices.Clone(m.extents)
-		m.mu.Unlock()
-		pin := archiveRecoveryPin{OwnerID: owner, Token: hex.EncodeToString(token[:]), Base: head.Base, Tip: head.Tip, TailHash: head.TailHash, TailObject: head.TailObject, LeaseUntilMS: time.Now().Add(lease).UnixMilli()}
-		key := m.recoveryPinKey(owner)
-		for range maxPublishRetries {
-			existing, err := m.readRecoveryPin(objmetrics.WithExpectedNotFound(ctx), key)
-			if err != nil && !m.bucket.IsObjNotFoundErr(err) {
+	// Concurrent startup snapshots and GC briefly share this lock. Wait only
+	// for acquisition; never retry work after a pin might have been written.
+	waitCtx, cancel := context.WithTimeout(ctx, lease)
+	defer cancel()
+	var err error
+	for {
+		entered := false
+		err = m.withGCLock(waitCtx, "snapshot:"+owner, func(ctx context.Context) error {
+			entered = true
+			if err := m.Load(ctx); err != nil {
 				return err
 			}
-			if err == nil && existing.LeaseUntilMS > time.Now().UnixMilli() {
-				return ErrArchiveBusy
-			}
-			options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
-			if err == nil {
-				options = []objstore.ObjectUploadOption{objstore.WithIfMatch(existing.version)}
-			}
-			if err := m.writeRecoveryPin(ctx, key, pin, options...); err != nil {
-				if m.bucket.IsConditionNotMetErr(err) {
-					continue
+			m.mu.Lock()
+			head, refs := m.head, slices.Clone(m.extents)
+			m.mu.Unlock()
+			pin := archiveRecoveryPin{OwnerID: owner, Token: hex.EncodeToString(token[:]), Base: head.Base, Tip: head.Tip, TailHash: head.TailHash, TailObject: head.TailObject, LeaseUntilMS: time.Now().Add(lease).UnixMilli()}
+			key := m.recoveryPinKey(owner)
+			for range maxPublishRetries {
+				existing, err := m.readRecoveryPin(objmetrics.WithExpectedNotFound(ctx), key)
+				if err != nil && !m.bucket.IsObjNotFoundErr(err) {
+					return err
 				}
-				return err
+				if err == nil && existing.LeaseUntilMS > time.Now().UnixMilli() {
+					return ErrArchiveBusy
+				}
+				options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
+				if err == nil {
+					options = []objstore.ObjectUploadOption{objstore.WithIfMatch(existing.version)}
+				}
+				if err := m.writeRecoveryPin(ctx, key, pin, options...); err != nil {
+					if m.bucket.IsConditionNotMetErr(err) {
+						continue
+					}
+					return err
+				}
+				stored, err := m.readRecoveryPin(ctx, key)
+				if err != nil {
+					return err
+				}
+				snapshot = &RecoverySnapshot{manager: m, head: head, refs: refs, pinKey: key, pin: *stored}
+				return nil
 			}
-			stored, err := m.readRecoveryPin(ctx, key)
-			if err != nil {
-				return err
-			}
-			snapshot = &RecoverySnapshot{manager: m, head: head, refs: refs, pinKey: key, pin: *stored}
-			return nil
+			return ErrArchiveBusy
+		})
+		if entered || !errors.Is(err, ErrArchiveBusy) {
+			break
 		}
-		return ErrArchiveBusy
-	})
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			return nil, waitCtx.Err()
+		case <-timer.C:
+		}
+	}
 	return snapshot, err
 }
 
