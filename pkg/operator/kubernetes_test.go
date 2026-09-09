@@ -106,12 +106,17 @@ func TestKubernetesObjectRoundTripPreservesResourceVersion(t *testing.T) {
 
 func TestKubernetesHonorsContextCancellation(t *testing.T) {
 	started := make(chan struct{})
+	release := make(chan struct{})
 	client, _, closeServer := testKubernetes(t, http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
 		close(started)
 		<-request.Context().Done()
+		// Do not race cancellation with an implicit successful HTTP response.
+		<-release
 	}))
 	defer closeServer()
+	defer close(release)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- client.Get(ctx, "/api/v1/namespaces/test/pods", nil) }()
 	select {
