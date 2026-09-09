@@ -183,14 +183,23 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	_ = stream.Close()
 }
 
+func peerMember(config quepaxa.Cluster, id quepaxa.NodeID) (quepaxa.Member, bool) {
+	for i := len(config.Members) - 1; i >= 0; i-- {
+		if config.Members[i].ID == id {
+			return config.Members[i], true
+		}
+	}
+	return quepaxa.Member{}, false
+}
+
 func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
 	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
-	historical, historicalOK := config.MemberSet()[quepaxa.NodeID(request.SenderId)]
+	historical, historicalOK := peerMember(config, quepaxa.NodeID(request.SenderId))
 	current := s.server.core.CurrentCluster()
-	active, activeOK := current.MemberSet()[quepaxa.NodeID(request.SenderId)]
+	active, activeOK := peerMember(current, quepaxa.NodeID(request.SenderId))
 	// A historical envelope does not keep a removed voter authorized after the
 	// boundary. Existing voters need credentials valid in both configurations.
 	voter := historicalOK && activeOK && historical.Token != "" && active.Token != "" &&

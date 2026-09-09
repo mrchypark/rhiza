@@ -162,6 +162,14 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	if err := peers[0].core.FinishReconfiguration(ctx); err != nil {
 		t.Fatal(err)
 	}
+	historical := network.NewTransport("membership-test", members[0].ID, &genesis, admin)
+	t.Cleanup(func() { _ = historical.Close() })
+	if page, err := historical.FetchDecisions(ctx, members[0].ID, 1, 1); err != nil || len(page.Decisions) != 1 {
+		t.Fatalf("active voter historical sync: %v", err)
+	}
+	if _, err := peers[2].transport.FetchDecisions(ctx, members[0].ID, 1, 1); err == nil {
+		t.Fatal("removed voter retained historical sync authority")
+	}
 	execute(0, "degraded", "INSERT INTO recovered VALUES (2)")
 	start(3, true)
 	if err := syncLearner(peers[0].core.Tip()); err != nil {
