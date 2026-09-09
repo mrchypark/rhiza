@@ -129,14 +129,20 @@ impl Db {
                 code: "invalid_response".into(),
                 message: "open response has no handle".into(),
             })?;
-        Ok(Self { handle, closed: false })
+        Ok(Self {
+            handle,
+            closed: false,
+        })
     }
     /// Starts a private recovery-only HTTP listener and returns its bound address.
     /// It serves only `/recovery/status` and authenticated `/recovery/archive`;
     /// it is closed when this `Db` closes and cannot be started twice.
     pub fn start_operator(&mut self, address: &str) -> Result<String> {
         if self.closed {
-            return Err(Error { code: "closed".into(), message: "Rhiza DB is closed".into() });
+            return Err(Error {
+                code: "closed".into(),
+                message: "Rhiza DB is closed".into(),
+            });
         }
         native_start_operator(self.handle, address)
     }
@@ -494,14 +500,22 @@ fn native_open_from_env() -> Result<Value> {
 }
 fn native_start_operator(handle: u64, address: &str) -> Result<String> {
     if address.len() > MAX_INPUT_BYTES {
-        return Err(Error { code: "invalid_request".into(), message: "operator address exceeds 16 MiB".into() });
+        return Err(Error {
+            code: "invalid_request".into(),
+            message: "operator address exceeds 16 MiB".into(),
+        });
     }
     let mut input = address.as_bytes().to_vec();
-    let value: Value = decode(unsafe { RhizaStartOperator(handle, input.as_mut_ptr().cast(), input.len()) })?;
-    value.get("address").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| Error {
-        code: "invalid_response".into(),
-        message: "operator start response has no address".into(),
-    })
+    let value: Value =
+        decode(unsafe { RhizaStartOperator(handle, input.as_mut_ptr().cast(), input.len()) })?;
+    value
+        .get("address")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| Error {
+            code: "invalid_response".into(),
+            message: "operator start response has no address".into(),
+        })
 }
 fn native_call<T: DeserializeOwned>(handle: u64, value: Value, timeout_ms: u64) -> Result<T> {
     let mut input = encode(value)?;
@@ -702,7 +716,9 @@ mod tests {
         let address = instance.start_operator("127.0.0.1:0").unwrap();
         let mut stream = TcpStream::connect(&address).unwrap();
         stream
-            .write_all(b"GET /recovery/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"GET /recovery/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
             .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
@@ -714,14 +730,26 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
-        assert_eq!(instance.start_operator("127.0.0.1:0").unwrap_err().code, "invalid_request");
+        assert_eq!(
+            instance.start_operator("127.0.0.1:0").unwrap_err().code,
+            "invalid_request"
+        );
 
         instance.close().unwrap();
-        assert!(TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(100)).is_err());
+        assert!(
+            TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(100))
+                .is_err()
+        );
 
         let blocked = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut other = db();
-        assert_eq!(other.start_operator(&blocked.local_addr().unwrap().to_string()).unwrap_err().code, "internal");
+        assert_eq!(
+            other
+                .start_operator(&blocked.local_addr().unwrap().to_string())
+                .unwrap_err()
+                .code,
+            "internal"
+        );
     }
     #[test]
     fn notifications_deliver_binary_payloads_and_drop_unsubscribes() {
