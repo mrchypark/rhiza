@@ -266,3 +266,27 @@ func reconfigurationAdds(current, target Cluster) bool {
 	}
 	return false
 }
+
+// RecordCatchUpThrough returns the certified prefix needed before handling a
+// record. Ordinary traffic retains the 16-slot window; a terminal vote must
+// verify the entire drain even when it is inside that window.
+func (c *Core) RecordCatchUpThrough(request RecordRequest) Slot {
+	if !c.reconfigEnabled || request.Slot == 0 {
+		return 0
+	}
+	c.mu.RLock()
+	value := request.Proposal.Value
+	if len(value) == 0 {
+		value = c.values[request.Proposal.Hash]
+	}
+	terminal := c.reconfiguration != nil && request.Slot == c.reconfiguration.terminal
+	c.mu.RUnlock()
+	control, ok, _ := decodeReconfiguration(value)
+	if terminal || (ok && control.Terminal) {
+		return request.Slot - 1
+	}
+	if request.Slot > 16 {
+		return request.Slot - 16
+	}
+	return 0
+}

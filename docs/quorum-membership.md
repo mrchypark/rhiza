@@ -80,6 +80,12 @@ must provide equivalent prefix catch-up to keep certified-only writes moving.
 Gap recovery has its own single-operation gate, so it can run while all sixteen
 frontend pipeline positions are occupied.
 
+Terminal Record requests fetch the complete certified drain through `T-1`,
+even inside the 16-slot window. Per-slot dissemination quorums can differ,
+leaving a freeze voter with a gap. QUIC and the in-process transport share the
+core prefix requirement; ordinary Record requests keep their 16-slot window.
+A deterministic lagged-recorder regression covers full and hash-only proposals.
+
 ## Current limits and deployment gate
 
 - This prototype retains the complete WAL. Checkpoint creation, compaction,

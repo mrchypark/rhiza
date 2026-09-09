@@ -324,12 +324,12 @@ func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, re
 	if down {
 		return Summary{}, errors.New("replica down")
 	}
-	if core.reconfigEnabled && request.Slot > core.Tip()+16 {
-		// Model authenticated QUIC catch-up when a recorder exhausts its window.
+	if through := core.RecordCatchUpThrough(request); through > core.Tip() {
+		// Model the same authenticated prefix catch-up as the QUIC handler.
 		gate, _ := transport.catchup.LoadOrStore(to, &sync.Mutex{})
 		gate.(*sync.Mutex).Lock()
 		defer gate.(*sync.Mutex).Unlock()
-		if request.Slot <= core.Tip()+16 {
+		if through <= core.Tip() {
 			return core.Record(ctx, request)
 		}
 		transport.mu.RLock()

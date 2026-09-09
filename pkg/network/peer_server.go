@@ -244,12 +244,12 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		}
 		record := quepaxa.RecordRequest{Slot: quepaxa.Slot(request.Record.Slot), Step: quepaxa.Step(request.Record.Step), ConfigID: uint(request.ConfigId), Proposal: proposal}
 		copy(record.ReconfigurationID[:], request.Hash)
-		if s.server.core.ReconfigurationEnabled() && record.Slot > s.server.core.Tip()+16 {
+		if through := s.server.core.RecordCatchUpThrough(record); through > s.server.core.Tip() {
 			source := quepaxa.NodeID(request.SenderId)
 			if s.server.transport == nil || source == s.server.core.NodeID() {
 				return nil, fmt.Errorf("record prefix is unavailable")
 			}
-			if err := s.server.catchUpFrom(ctx, source, record.Slot-16, false); err != nil {
+			if err := s.server.catchUpFrom(ctx, source, through, false); err != nil {
 				return nil, err
 			}
 		}

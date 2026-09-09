@@ -263,3 +263,65 @@ func TestReconfigurationWALCannotStartDisabled(t *testing.T) {
 		t.Fatal("disabled startup accepted a reconfiguration-enabled WAL")
 	}
 }
+
+func TestTerminalRecordCatchesUpInsidePipelineWindow(t *testing.T) {
+	cores, _ := reconfigCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	if _, err := cores["a"].BeginReconfiguration(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := cores["a"].RecoverThrough(ctx, 16); err != nil {
+		t.Fatal(err)
+	}
+	prefix, ok := cores["a"].PrefixHash(16)
+	if !ok {
+		t.Fatal("missing drain prefix")
+	}
+	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Freeze: 1, TerminalSlot: 17, Target: target, PrefixHash: prefix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	laggedCores, _ := reconfigCluster(t)
+	lagged := laggedCores["b"]
+	freeze, ok := cores["a"].decision(1)
+	if !ok {
+		t.Fatal("missing freeze")
+	}
+	if err := lagged.AcceptCertifiedValue(freeze); err != nil {
+		t.Fatal(err)
+	}
+	request := RecordRequest{Slot: 17, Step: 4, ConfigID: 1, ReconfigurationID: freeze.Hash, Proposal: newProposal(highestPriority, "a", value)}
+	if request.Slot > lagged.Tip()+16 {
+		t.Fatal("fixture is outside ordinary pipeline window")
+	}
+	if _, err := lagged.Record(ctx, request); err == nil {
+		t.Fatal("voted without drain prefix")
+	}
+	through := lagged.RecordCatchUpThrough(request)
+	if through != 16 {
+		t.Fatalf("catch-up through=%d, want 16", through)
+	}
+	if err := lagged.StageValue(request.Proposal.Hash, value); err != nil {
+		t.Fatal(err)
+	}
+	request.Proposal.Value = nil
+	if got := lagged.RecordCatchUpThrough(request); got != through {
+		t.Fatalf("hash-only catch-up=%d", got)
+	}
+	values, _, err := cores["a"].DecisionsFrom(lagged.Tip()+1, int(through-lagged.Tip()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lagged.AcceptCertifiedHints(values); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lagged.Record(ctx, request); err != nil {
+		t.Fatalf("terminal vote after catch-up: %v", err)
+	}
+	ordinary := RecordRequest{Slot: 18, Proposal: newProposal(highestPriority, "a", []byte("ordinary"))}
+	if got := lagged.RecordCatchUpThrough(ordinary); got != 2 {
+		t.Fatalf("ordinary window changed: %d", got)
+	}
+}
