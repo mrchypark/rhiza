@@ -43,6 +43,22 @@ type PeerServer struct {
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
+	return startPeerServer(ctx, server, members, token, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
+		return quic.ListenAddrEarly(addr, tlsConfig, config)
+	})
+}
+
+// StartPeerServerOnTransport serves on an already-bound QUIC transport. The
+// caller owns the transport and its UDP socket; closing this PeerServer leaves
+// them available for a subsequent listener without releasing the port.
+func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
+	if transport == nil {
+		return nil, fmt.Errorf("peer QUIC transport is required")
+	}
+	return startPeerServer(ctx, server, members, token, transport.ListenEarly)
+}
+
+func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, token string, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
 	identityToken := token
 	for _, member := range members {
 		if len(members) > 1 && member.Token == "" {
@@ -62,7 +78,7 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 	if err != nil {
 		return nil, err
 	}
-	listener, err := quic.ListenAddrEarly(addr, &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate}}, &quic.Config{
+	listener, err := listen(&tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate}}, &quic.Config{
 		HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second,
 		MaxIncomingStreams: 256, MaxIncomingUniStreams: -1, Allow0RTT: true,
 	})

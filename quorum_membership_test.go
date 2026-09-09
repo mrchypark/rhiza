@@ -14,6 +14,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
 
 // Exercise the public Core and real authenticated QUIC path together. This
@@ -23,11 +24,12 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	defer cancel()
 	const admin = "membership-test-admin"
 	members := make([]quepaxa.Member, 4)
-	reserved := make([]net.PacketConn, len(members))
+	reserved := make([]*quic.Transport, len(members))
 	t.Cleanup(func() {
 		for _, listener := range reserved {
 			if listener != nil {
 				_ = listener.Close()
+				_ = listener.Conn.Close()
 			}
 		}
 	})
@@ -37,7 +39,7 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 			t.Fatal(err)
 		}
 		members[i] = quepaxa.Member{ID: quepaxa.NodeID(fmt.Sprintf("v%d", i)), PeerURL: "quic://" + listener.LocalAddr().String(), Token: fmt.Sprintf("membership-test-voter-%d", i)}
-		reserved[i] = listener
+		reserved[i] = &quic.Transport{Conn: listener}
 	}
 	genesis := quepaxa.Cluster{ConfigID: 1, Members: members[:3]}
 	type peer struct {
@@ -109,19 +111,13 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 		t.Cleanup(func() { _ = material.Close() })
 		server := network.NewServer(core, material, "membership-test", true, transport)
 		t.Cleanup(server.Close)
-		addr := members[index].PeerURL[len("quic://"):]
-		if reserved[index] != nil {
-			if err := reserved[index].Close(); err != nil {
-				t.Fatal(err)
-			}
-			reserved[index] = nil
-		}
-		var listener *network.PeerServer
+		// Keep the UDP port bound across startup and the fresh-WAL restart.
+		// A learner needs its own TLS identity, as in StartLearnerPeerServer.
+		identities := genesis.Members
 		if learner {
-			listener, err = network.StartLearnerPeerServer(ctx, addr, server, genesis.Members, admin, members[index])
-		} else {
-			listener, err = network.StartPeerServer(ctx, addr, server, genesis.Members, admin)
+			identities = append(append([]quepaxa.Member(nil), identities...), members[index])
 		}
+		listener, err := network.StartPeerServerOnTransport(ctx, reserved[index], server, identities, admin)
 		if err != nil {
 			t.Fatal(err)
 		}

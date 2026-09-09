@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
 
 type testClusterResolver struct {
@@ -483,4 +485,42 @@ func serverPeerHandleDecisions(server *Server, member quepaxa.Member, from uint6
 		Operation: peerfb.OperationSync, ClusterId: string(server.cluster), SenderId: string(member.ID),
 		ConfigId: uint64(server.core.ConfigID()), Token: member.Token, From: from, Limit: 128,
 	})
+}
+
+func TestPeerTransportRetainsUDPPortAcrossRestart(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	bound := &quic.Transport{Conn: conn}
+	defer bound.Close()
+	members := []quepaxa.Member{{ID: "n1", Token: "voter", PeerURL: "quic://" + conn.LocalAddr().String()}}
+	core := mustCore(t, "n1", members, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for range 2 {
+		peer, err := StartPeerServerOnTransport(ctx, bound, server, members, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = peer.Close() })
+		config := core.CurrentCluster()
+		client := NewTransport("cluster", "n1", &config, "admin")
+		_, callErr := client.ReadTip(ctx, "n1")
+		_ = client.Close()
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+		if err := peer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		other, err := net.ListenPacket("udp", conn.LocalAddr().String())
+		if err == nil {
+			_ = other.Close()
+			t.Fatal("closing a listener released the reserved UDP port")
+		}
+	}
 }
