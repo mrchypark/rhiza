@@ -11,6 +11,7 @@ type DecisionT struct {
 	Step      uint64      `json:"step"`
 	Proposal  *ProposalT  `json:"proposal"`
 	Summaries []*SummaryT `json:"summaries"`
+	ConfigId  uint64      `json:"config_id"`
 }
 
 func (t *DecisionT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -36,6 +37,7 @@ func (t *DecisionT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	DecisionAddStep(builder, t.Step)
 	DecisionAddProposal(builder, proposalOffset)
 	DecisionAddSummaries(builder, summariesOffset)
+	DecisionAddConfigId(builder, t.ConfigId)
 	return DecisionEnd(builder)
 }
 
@@ -50,6 +52,7 @@ func (rcv *Decision) UnPackTo(t *DecisionT) {
 		rcv.Summaries(&x, j)
 		t.Summaries[j] = x.UnPack()
 	}
+	t.ConfigId = rcv.ConfigId()
 }
 
 func (rcv *Decision) UnPack() *DecisionT {
@@ -153,8 +156,20 @@ func (rcv *Decision) SummariesLength() int {
 	return 0
 }
 
+func (rcv *Decision) ConfigId() uint64 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(12))
+	if o != 0 {
+		return rcv._tab.GetUint64(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *Decision) MutateConfigId(n uint64) bool {
+	return rcv._tab.MutateUint64Slot(12, n)
+}
+
 func DecisionStart(builder *flatbuffers.Builder) {
-	builder.StartObject(4)
+	builder.StartObject(5)
 }
 func DecisionAddSlot(builder *flatbuffers.Builder, slot uint64) {
 	builder.PrependUint64Slot(0, slot, 0)
@@ -170,6 +185,9 @@ func DecisionAddSummaries(builder *flatbuffers.Builder, summaries flatbuffers.UO
 }
 func DecisionStartSummariesVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(4, numElems, 4)
+}
+func DecisionAddConfigId(builder *flatbuffers.Builder, configId uint64) {
+	builder.PrependUint64Slot(4, configId, 0)
 }
 func DecisionEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

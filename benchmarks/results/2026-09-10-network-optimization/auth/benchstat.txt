@@ -1,0 +1,23 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 7763 64-Core Processor
+                        │     base     │              candidate              │
+                        │    sec/op    │   sec/op     vs base                │
+PeerAuthentication/3-2     444.2n ± 1%   313.4n ± 3%  -29.45% (p=0.000 n=10)
+PeerAuthentication/16-2   3347.0n ± 6%   885.7n ± 4%  -73.54% (p=0.000 n=10)
+geomean                    1.219µ        526.9n       -56.79%
+
+                        │     base      │               candidate                │
+                        │     B/op      │     B/op      vs base                  │
+PeerAuthentication/3-2       720.0 ± 0%     720.0 ± 0%        ~ (p=1.000 n=10) ¹
+PeerAuthentication/16-2   11.719Ki ± 0%   3.641Ki ± 0%  -68.93% (p=0.000 n=10)
+geomean                    2.870Ki        1.600Ki       -44.26%
+¹ all samples are equal
+
+                        │    base    │              candidate               │
+                        │ allocs/op  │ allocs/op   vs base                  │
+PeerAuthentication/3-2    3.000 ± 0%   3.000 ± 0%        ~ (p=1.000 n=10) ¹
+PeerAuthentication/16-2   9.000 ± 0%   3.000 ± 0%  -66.67% (p=0.000 n=10)
+geomean                   5.196        3.000       -42.26%
+¹ all samples are equal

@@ -30,8 +30,21 @@ func BenchmarkCoreProposeCertifiedThreePeersParallel(b *testing.B) {
 	benchmarkCoreProposeParallel(b, true)
 }
 
-func benchmarkCoreProposeParallel(b *testing.B, certifiedOnly bool) {
+func BenchmarkCoreProposeCertifiedThreePeersParallelReconfigurationEnabled(b *testing.B) {
+	benchmarkCoreProposeParallel(b, true, true)
+}
+
+func BenchmarkCoreProposeThreePeersParallelReconfigurationEnabled(b *testing.B) {
+	benchmarkCoreProposeParallel(b, false, true)
+}
+
+func benchmarkCoreProposeParallel(b *testing.B, certifiedOnly bool, reconfiguration ...bool) {
 	cores, _ := newTestCluster(b)
+	if len(reconfiguration) != 0 && reconfiguration[0] {
+		for _, core := range cores {
+			core.reconfigEnabled = true
+		}
+	}
 	var sequence atomic.Uint64
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -298,6 +311,7 @@ func TestFastPathUsesEpochLeader(t *testing.T) {
 
 type clusterTransport struct {
 	mu           sync.RWMutex
+	catchup      sync.Map
 	cores        map[NodeID]*Core
 	down         map[NodeID]bool
 	dropDecision map[NodeID]bool
@@ -310,27 +324,80 @@ func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, re
 	if down {
 		return Summary{}, errors.New("replica down")
 	}
+	if through := core.RecordCatchUpThrough(request); through > core.Tip() {
+		// Model the same authenticated prefix catch-up as the QUIC handler.
+		gate, _ := transport.catchup.LoadOrStore(to, &sync.Mutex{})
+		gate.(*sync.Mutex).Lock()
+		defer gate.(*sync.Mutex).Unlock()
+		if through <= core.Tip() {
+			return core.Record(ctx, request)
+		}
+		transport.mu.RLock()
+		var source *Core
+		for id, candidate := range transport.cores {
+			if !transport.down[id] && (source == nil || candidate.Tip() > source.Tip()) {
+				source = candidate
+			}
+		}
+		transport.mu.RUnlock()
+		if source != nil && source != core {
+			values, _, err := source.DecisionsFrom(core.Tip()+1, 128)
+			if err != nil {
+				return Summary{}, err
+			}
+			if err := core.AcceptCertifiedHints(values); err != nil {
+				return Summary{}, err
+			}
+		}
+	}
 	return core.Record(ctx, request)
 }
 
-func (transport *clusterTransport) SendDecision(_ context.Context, decision Decision) error {
+func (transport *clusterTransport) SendDecision(ctx context.Context, decision Decision) error {
 	transport.mu.RLock()
 	targets := make([]*Core, 0, len(transport.cores))
+	var nextMembers, added map[NodeID]Member
 	for id, core := range transport.cores {
+		if core.reconfigEnabled {
+			old, next := core.ClusterForSlot(decision.Slot), core.ClusterForSlot(decision.Slot+1)
+			if old.ConfigID != next.ConfigID {
+				nextMembers, added = next.MemberSet(), next.MemberSet()
+				for _, member := range old.Members {
+					delete(added, member.ID)
+				}
+			}
+		}
 		if !transport.down[id] && !transport.dropDecision[id] {
 			targets = append(targets, core)
 		}
 	}
 	transport.mu.RUnlock()
-	results := make(chan error, len(targets))
+	type result struct {
+		id  NodeID
+		err error
+	}
+	results := make(chan result, len(targets))
 	for _, core := range targets {
-		go func() { results <- core.AcceptDecision(decision) }()
+		go func() {
+			if nextMembers != nil {
+				if err := core.WaitTip(ctx, decision.Slot-1); err != nil {
+					results <- result{core.nodeID, err}
+					return
+				}
+			}
+			results <- result{core.nodeID, core.AcceptDecision(decision)}
+		}()
 	}
 	successes := 0
+	nextSuccesses := 0
 	for range targets {
-		if err := <-results; err == nil {
+		if result := <-results; result.err == nil {
 			successes++
-			if successes >= len(transport.cores)/2+1 {
+			if _, ok := nextMembers[result.id]; ok {
+				nextSuccesses++
+			}
+			delete(added, result.id)
+			if successes >= len(transport.cores)/2+1 && (nextMembers == nil || nextSuccesses >= len(nextMembers)/2+1 && len(added) == 0) {
 				return nil
 			}
 		}

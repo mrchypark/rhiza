@@ -43,6 +43,22 @@ type PeerServer struct {
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
+	return startPeerServer(ctx, server, members, token, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
+		return quic.ListenAddrEarly(addr, tlsConfig, config)
+	})
+}
+
+// StartPeerServerOnTransport serves on an already-bound QUIC transport. The
+// caller owns the transport and its UDP socket; closing this PeerServer leaves
+// them available for a subsequent listener without releasing the port.
+func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
+	if transport == nil {
+		return nil, fmt.Errorf("peer QUIC transport is required")
+	}
+	return startPeerServer(ctx, server, members, token, transport.ListenEarly)
+}
+
+func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, token string, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
 	identityToken := token
 	for _, member := range members {
 		if len(members) > 1 && member.Token == "" {
@@ -62,7 +78,7 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 	if err != nil {
 		return nil, err
 	}
-	listener, err := quic.ListenAddrEarly(addr, &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate}}, &quic.Config{
+	listener, err := listen(&tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate}}, &quic.Config{
 		HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second,
 		MaxIncomingStreams: 256, MaxIncomingUniStreams: -1, Allow0RTT: true,
 	})
@@ -80,6 +96,25 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 	peer.wg.Add(1)
 	go func() { defer peer.wg.Done(); peer.serve(runCtx) }()
 	return peer, nil
+}
+
+// StartLearnerPeerServer gives an unpromoted learner its own token-bound TLS
+// identity. The learner is not admitted as a voter until its core applies the
+// reconfiguration, so its token cannot authenticate voting RPCs meanwhile.
+func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, voters []quepaxa.Member, token string, learner quepaxa.Member) (*PeerServer, error) {
+	if learner.ID == "" || learner.Token == "" {
+		return nil, fmt.Errorf("learner ID and token are required")
+	}
+	if learner.ID != server.core.NodeID() {
+		return nil, fmt.Errorf("learner ID must match the local node")
+	}
+	for _, voter := range voters {
+		if voter.ID == learner.ID {
+			return nil, fmt.Errorf("learner is already a voter")
+		}
+	}
+	members := append(append([]quepaxa.Member(nil), voters...), learner)
+	return StartPeerServer(ctx, addr, server, members, token)
 }
 
 func (s *PeerServer) Close() error {
@@ -164,12 +199,28 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	_ = stream.Close()
 }
 
+func peerMember(config quepaxa.Cluster, id quepaxa.NodeID) (quepaxa.Member, bool) {
+	for i := len(config.Members) - 1; i >= 0; i-- {
+		if config.Members[i].ID == id {
+			return config.Members[i], true
+		}
+	}
+	return quepaxa.Member{}, false
+}
+
 func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
-	if request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(s.server.core.ConfigID()) {
+	config, err := s.configurationFor(request)
+	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
 		return nil, fmt.Errorf("cluster identity mismatch")
 	}
-	member, memberOK := s.members[quepaxa.NodeID(request.SenderId)]
-	voter := memberOK && member.Token != "" && subtle.ConstantTimeCompare([]byte(request.Token), []byte(member.Token)) == 1
+	historical, historicalOK := peerMember(config, quepaxa.NodeID(request.SenderId))
+	current := s.server.core.CurrentCluster()
+	active, activeOK := peerMember(current, quepaxa.NodeID(request.SenderId))
+	// A historical envelope does not keep a removed voter authorized after the
+	// boundary. Existing voters need credentials valid in both configurations.
+	voter := historicalOK && activeOK && historical.Token != "" && active.Token != "" &&
+		subtle.ConstantTimeCompare([]byte(request.Token), []byte(historical.Token)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(request.Token), []byte(active.Token)) == 1
 	learner := s.token != "" && subtle.ConstantTimeCompare([]byte(request.Token), []byte(s.token)) == 1
 	// Non-voting learners may only pull already-certified decisions. They use
 	// the cluster admin token and never enter the fixed voter membership.
@@ -188,7 +239,21 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if err != nil {
 			return nil, err
 		}
-		summary, err := s.server.core.Record(ctx, quepaxa.RecordRequest{Slot: quepaxa.Slot(request.Record.Slot), Step: quepaxa.Step(request.Record.Step), Proposal: proposal})
+		if len(request.Hash) != 0 && len(request.Hash) != sha256.Size {
+			return nil, fmt.Errorf("invalid reconfiguration ID")
+		}
+		record := quepaxa.RecordRequest{Slot: quepaxa.Slot(request.Record.Slot), Step: quepaxa.Step(request.Record.Step), ConfigID: uint(request.ConfigId), Proposal: proposal}
+		copy(record.ReconfigurationID[:], request.Hash)
+		if through := s.server.core.RecordCatchUpThrough(record); through > s.server.core.Tip() {
+			source := quepaxa.NodeID(request.SenderId)
+			if s.server.transport == nil || source == s.server.core.NodeID() {
+				return nil, fmt.Errorf("record prefix is unavailable")
+			}
+			if err := s.server.catchUpFrom(ctx, source, through, false); err != nil {
+				return nil, err
+			}
+		}
+		summary, err := s.server.core.Record(ctx, record)
 		if err != nil {
 			return nil, err
 		}
@@ -200,6 +265,21 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		decision, err := decisionFromWire(request.Decision)
 		if err != nil {
 			return nil, err
+		}
+		if control, err := quepaxa.DecodeReconfiguration(decision.Proposal.Value); err != nil {
+			return nil, err
+		} else if control && decision.Slot > 1 {
+			if s.server.core.Tip() < decision.Slot-1 {
+				if s.server.transport == nil {
+					return nil, fmt.Errorf("reconfiguration control prefix is unavailable")
+				}
+				if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
+					return nil, err
+				}
+			}
+			if err := s.server.core.WaitTip(ctx, decision.Slot-1); err != nil {
+				return nil, err
+			}
 		}
 		if decisionHasRecorder(decision, s.server.core.NodeID()) {
 			err = s.server.core.AcceptDecisionHint(decision)
@@ -221,7 +301,7 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		if err != nil {
 			return nil, err
 		}
-		response := &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(tip)}
+		response := &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: request.ConfigId, Tip: uint64(tip)}
 		wireDecisions := make([]*peerfb.DecidedValueT, len(decisions))
 		for i := range decisions {
 			wireDecisions[i] = decidedToWire(decisions[i])
@@ -243,6 +323,9 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		response.Decisions = wireDecisions[:fit]
 		return response, nil
 	case peerfb.OperationReadIndex:
+		if !s.server.core.CanParticipateReadIndex() {
+			return nil, quepaxa.ErrQuorumUnavailable
+		}
 		if !s.server.ready() {
 			return nil, ErrNotReady
 		}
@@ -268,6 +351,23 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 			return nil, fmt.Errorf("value is unavailable")
 		}
 		return &peerfb.ResponseT{Value: value}, nil
+	case peerfb.OperationVerifyPrefix:
+		if request.From == 0 || len(request.Hash) != sha256.Size || len(request.Value) != sha256.Size {
+			return nil, fmt.Errorf("invalid durable-prefix request")
+		}
+		if !matchesWALIdentity(s.server.core.WALIdentity(), request.Value) {
+			return nil, fmt.Errorf("learner WAL identity mismatch")
+		}
+		var expected quepaxa.ValueHash
+		copy(expected[:], request.Hash)
+		actual, err := s.server.core.DurablePrefix(quepaxa.Slot(request.From))
+		if err != nil {
+			return nil, err
+		}
+		if actual != expected {
+			return nil, fmt.Errorf("durable prefix mismatch")
+		}
+		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: request.ConfigId, Tip: request.From}, nil
 	case peerfb.OperationPrepareCheckpoint:
 		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value)
 		if err != nil || !checkpoint {
@@ -283,6 +383,36 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	default:
 		return nil, fmt.Errorf("unknown peer operation %d", request.Operation)
 	}
+}
+
+func (s *PeerServer) configurationFor(request *peerfb.RequestT) (quepaxa.Cluster, error) {
+	switch request.Operation {
+	case peerfb.OperationRecord:
+		if request.Record != nil {
+			return s.server.core.ClusterForSlot(quepaxa.Slot(request.Record.Slot)), nil
+		}
+	case peerfb.OperationLearned:
+		if request.Decision != nil {
+			return s.server.core.ClusterForSlot(quepaxa.Slot(request.Decision.Slot)), nil
+		}
+	case peerfb.OperationSync:
+		current := s.server.core.CurrentCluster()
+		if request.ConfigId == uint64(current.ConfigID) {
+			return current, nil
+		}
+		if request.From != 0 {
+			return s.server.core.ClusterForSlot(quepaxa.Slot(request.From)), nil
+		}
+	case peerfb.OperationPrepareCheckpoint:
+		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(request.Value)
+		if err != nil {
+			return quepaxa.Cluster{}, err
+		}
+		if checkpoint {
+			return s.server.core.ClusterForSlot(seal.Index), nil
+		}
+	}
+	return s.server.core.CurrentCluster(), nil
 }
 
 func peerPublicKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) ed25519.PublicKey {

@@ -1,9 +1,11 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -11,8 +13,27 @@ import (
 	flatbuffers "github.com/google/flatbuffers/go"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/quic-go/quic-go"
 )
+
+type testClusterResolver struct {
+	current quepaxa.Cluster
+	slots   map[quepaxa.Slot]quepaxa.Cluster
+}
+
+func (r testClusterResolver) CurrentCluster() quepaxa.Cluster { return r.current }
+func (r testClusterResolver) ConfigID() uint                  { return r.current.ConfigID }
+func (r testClusterResolver) ConfigIDForSlot(slot quepaxa.Slot) uint {
+	return r.ClusterForSlot(slot).ConfigID
+}
+func (r testClusterResolver) ClusterForSlot(slot quepaxa.Slot) quepaxa.Cluster {
+	if config, ok := r.slots[slot]; ok {
+		return config
+	}
+	return r.current
+}
 
 func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
@@ -167,6 +188,20 @@ func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
 	}
 }
 
+func TestStartLearnerPeerServerValidatesIdentity(t *testing.T) {
+	member := quepaxa.Member{ID: "n1", Token: "voter"}
+	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil)
+	defer server.Close()
+	ctx := context.Background()
+	if peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin", quepaxa.Member{ID: "n2", Token: "learner"}); peer != nil || err == nil {
+		t.Fatalf("foreign learner peer=%v err=%v", peer, err)
+	}
+	if peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin", member); peer != nil || err == nil {
+		t.Fatalf("voter learner peer=%v err=%v", peer, err)
+	}
+}
+
 func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "voter-token"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
@@ -250,6 +285,130 @@ func TestPeerCodecRejectsWrongMarker(t *testing.T) {
 	}
 }
 
+func TestRecordEnvelopeCarriesConfigurationAndReconfigurationID(t *testing.T) {
+	var reconfigurationID quepaxa.ValueHash
+	reconfigurationID[0] = 7
+	encoded := encodePeerRequest(&peerfb.RequestT{
+		Operation: peerfb.OperationRecord, ClusterId: "cluster", SenderId: "n1", ConfigId: 9,
+		Hash: reconfigurationID[:], Record: &peerfb.RecordRequestT{Slot: 12, Step: 4, Proposal: &peerfb.ProposalT{Priority: make([]byte, 32), ProposerId: "n1", Hash: make([]byte, 32)}},
+	})
+	decoded, err := decodePeerRequest(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ConfigId != 9 || !bytes.Equal(decoded.Hash, reconfigurationID[:]) {
+		t.Fatalf("configuration envelope lost: config=%d hash=%x", decoded.ConfigId, decoded.Hash)
+	}
+}
+
+func TestSummaryCarriesReconfigurationID(t *testing.T) {
+	var id quepaxa.ValueHash
+	id[0] = 9
+	summary, err := summaryFromWire(summaryToWire(quepaxa.Summary{RecorderID: "n1", Step: 4, ReconfigurationID: id}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ReconfigurationID != id {
+		t.Fatalf("reconfiguration ID lost: %x", summary.ReconfigurationID)
+	}
+}
+
+func TestBoundTransportSeparatesConfigurationConnectionPools(t *testing.T) {
+	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1", Token: "old"}, {ID: "n2", Token: "old-2"}}}
+	current := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "n1", Token: "new"}, {ID: "n3", Token: "new-3"}}}
+	transport := NewTransport("cluster", "n1", &old, "old")
+	defer transport.Close()
+	transport.BindCore(testClusterResolver{current: current, slots: map[quepaxa.Slot]quepaxa.Cluster{1: old}})
+	historical, err := transport.transportFor(transport.clusterForSlot(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := transport.transportFor(transport.currentCluster())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if historical == transport || active == transport || historical == active {
+		t.Fatal("configurations reused a connection pool")
+	}
+	if historical.token != "old" || active.token != "new" {
+		t.Fatalf("configuration credentials leaked: old=%q active=%q", historical.token, active.token)
+	}
+}
+
+func TestBoundTransportSyncRoutesThroughCurrentConfiguration(t *testing.T) {
+	historical := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "a", Token: "a"}, {ID: "b", Token: "b"}}}
+	current := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "a", Token: "a"}, {ID: "d", Token: "d"}}}
+	transport := NewTransport("cluster", "a", &historical, "a")
+	defer transport.Close()
+	transport.BindCore(testClusterResolver{current: current, slots: map[quepaxa.Slot]quepaxa.Cluster{1: historical}})
+	peer, err := transport.transportForCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := peer.members["d"]; !ok {
+		t.Fatal("current replacement cannot serve historical sync")
+	}
+	if _, ok := peer.members["b"]; ok {
+		t.Fatal("historical membership selected for active sync")
+	}
+}
+
+func TestBoundTransportCloseDoesNotCreateNewPools(t *testing.T) {
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1", Token: "token"}}}
+	transport := NewTransport("cluster", "n1", &config, "token")
+	transport.BindCore(testClusterResolver{current: config})
+	if _, err := transport.transportForCurrent(); err != nil {
+		t.Fatal(err)
+	}
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.transportForCurrent(); !errors.Is(err, errTransportClosed) {
+		t.Fatalf("post-close pool error = %v", err)
+	}
+}
+
+func TestVerifyLearnerRejectsCurrentVoter(t *testing.T) {
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1", Token: "one"}, {ID: "n2", Token: "two"}}}
+	transport := NewTransport("cluster", "n1", &config, "one")
+	defer transport.Close()
+	if err := transport.VerifyLearner(context.Background(), config.Members[1], 1, quepaxa.ValueHash{1}); err == nil {
+		t.Fatal("current voter accepted as learner")
+	}
+}
+
+func TestDecodeWALIdentityRejectsNonCanonicalAndMismatchedValues(t *testing.T) {
+	valid := strings.Repeat("a", 64)
+	identity, err := decodeWALIdentity(valid)
+	if err != nil || identity[0] != 0xaa {
+		t.Fatalf("valid identity=%x err=%v", identity, err)
+	}
+	if _, err := decodeWALIdentity(strings.ToUpper(valid)); err == nil {
+		t.Fatal("uppercase identity accepted")
+	}
+	if _, err := decodeWALIdentity(valid[:63]); err == nil {
+		t.Fatal("short identity accepted")
+	}
+	wal, err := qlog.Open(t.TempDir() + "/qlog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	learner, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "n2", Cluster: quepaxa.Cluster{Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := decodeWALIdentity(learner.WALIdentity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := append([]byte(nil), actual[:]...)
+	wrong[0] ^= 1
+	if matchesWALIdentity(learner.WALIdentity(), wrong) {
+		t.Fatal("mismatched learner WAL identity accepted")
+	}
+}
+
 func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
 	member := quepaxa.Member{ID: "n1", Token: "secret"}
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
@@ -326,4 +485,42 @@ func serverPeerHandleDecisions(server *Server, member quepaxa.Member, from uint6
 		Operation: peerfb.OperationSync, ClusterId: string(server.cluster), SenderId: string(member.ID),
 		ConfigId: uint64(server.core.ConfigID()), Token: member.Token, From: from, Limit: 128,
 	})
+}
+
+func TestPeerTransportRetainsUDPPortAcrossRestart(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	bound := &quic.Transport{Conn: conn}
+	defer bound.Close()
+	members := []quepaxa.Member{{ID: "n1", Token: "voter", PeerURL: "quic://" + conn.LocalAddr().String()}}
+	core := mustCore(t, "n1", members, nil, nil)
+	server := NewServer(core, nil, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for range 2 {
+		peer, err := StartPeerServerOnTransport(ctx, bound, server, members, "admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = peer.Close() })
+		config := core.CurrentCluster()
+		client := NewTransport("cluster", "n1", &config, "admin")
+		_, callErr := client.ReadTip(ctx, "n1")
+		_ = client.Close()
+		if callErr != nil {
+			t.Fatal(callErr)
+		}
+		if err := peer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		other, err := net.ListenPacket("udp", conn.LocalAddr().String())
+		if err == nil {
+			_ = other.Close()
+			t.Fatal("closing a listener released the reserved UDP port")
+		}
+	}
 }

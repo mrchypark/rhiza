@@ -14,10 +14,11 @@ type proposalRef struct {
 }
 
 type summaryRef struct {
-	RecorderID     NodeID       `json:"recorder_id"`
-	Step           Step         `json:"step"`
-	FirstCurrent   *proposalRef `json:"first_current,omitempty"`
-	AggregatePrior *proposalRef `json:"aggregate_prior,omitempty"`
+	RecorderID        NodeID       `json:"recorder_id"`
+	ReconfigurationID *ValueHash   `json:"reconfiguration_id,omitempty"`
+	Step              Step         `json:"step"`
+	FirstCurrent      *proposalRef `json:"first_current,omitempty"`
+	AggregatePrior    *proposalRef `json:"aggregate_prior,omitempty"`
 }
 
 type certificate struct {
@@ -57,6 +58,10 @@ func encodeCertificate(configID uint, decision Decision) ([]byte, error) {
 			RecorderID: summary.RecorderID, Step: summary.Step,
 			FirstCurrent: ref(summary.FirstCurrent), AggregatePrior: ref(summary.AggregatePrior),
 		}
+		if summary.ReconfigurationID != (ValueHash{}) {
+			id := summary.ReconfigurationID
+			certificate.Summaries[i].ReconfigurationID = &id
+		}
 	}
 	return json.Marshal(certificate)
 }
@@ -77,6 +82,9 @@ func decodeCertificate(data []byte) (uint, Decision, error) {
 		decision.Summaries[i] = Summary{
 			RecorderID: summary.RecorderID, Step: summary.Step,
 			FirstCurrent: proposalFromRef(summary.FirstCurrent), AggregatePrior: proposalFromRef(summary.AggregatePrior),
+		}
+		if summary.ReconfigurationID != nil {
+			decision.Summaries[i].ReconfigurationID = *summary.ReconfigurationID
 		}
 	}
 	return certificate.ConfigID, decision, nil

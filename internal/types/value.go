@@ -538,6 +538,10 @@ func DecodeCheckpointSeal(value []byte) (quepaxa.CheckpointSeal, bool, error) {
 	return quepaxa.DecodeCheckpointSeal(value)
 }
 
+func DecodeReconfiguration(value []byte) (bool, error) {
+	return quepaxa.DecodeReconfiguration(value)
+}
+
 // Proposal is a value proposed for a slot.
 type Proposal struct {
 	// RequestID is the client's idempotency key.

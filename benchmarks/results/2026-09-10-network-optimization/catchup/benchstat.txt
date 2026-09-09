@@ -1,0 +1,28 @@
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+                        │    base     │             candidate              │
+                        │   sec/op    │   sec/op     vs base               │
+CatchUpSameSourceQUIC-2   5.835m ± 0%   5.680m ± 0%  -2.65% (p=0.000 n=10)
+
+                        │         base         │                  candidate                   │
+                        │ decisions_fetched/op │ decisions_fetched/op  vs base                │
+CatchUpSameSourceQUIC-2            16.000 ± 0%             8.000 ± 0%  -50.00% (p=0.000 n=10)
+
+                        │    base    │             candidate              │
+                        │ fetches/op │ fetches/op  vs base                │
+CatchUpSameSourceQUIC-2   2.000 ± 0%   1.000 ± 0%  -50.00% (p=0.000 n=10)
+
+                        │        base         │                candidate                │
+                        │ unique_installed/op │ unique_installed/op  vs base            │
+CatchUpSameSourceQUIC-2            8.000 ± 0%            8.000 ± 0%  ~ (p=1.000 n=10) ¹
+¹ all samples are equal
+
+                        │     base     │              candidate               │
+                        │     B/op     │     B/op      vs base                │
+CatchUpSameSourceQUIC-2   207.0Ki ± 0%   105.7Ki ± 0%  -48.96% (p=0.000 n=10)
+
+                        │    base    │             candidate              │
+                        │ allocs/op  │ allocs/op   vs base                │
+CatchUpSameSourceQUIC-2   793.0 ± 0%   430.0 ± 0%  -45.78% (p=0.000 n=10)

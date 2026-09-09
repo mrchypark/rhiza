@@ -27,6 +27,12 @@ on:
         required: false
         default: ""
 
+      network_optimization:
+        description: Focused network optimization (none runs the full suite)
+        type: choice
+        options: [none, transport, auth, catchup]
+        default: none
+
 permissions:
   contents: read
 
@@ -43,6 +49,7 @@ jobs:
       RHIZA_BENCH_COUNT: 10
       RHIZA_BENCH_TIME: 1s
       RHIZA_BENCH_PROCS: 2
+      RHIZA_BENCH_NETWORK_OPTIMIZATION: ${{ inputs.network_optimization || 'none' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,6 +139,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Reuse pinned Hiqlite reference
+        if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         env:
           HIQLITE_COMMIT: c3ff2536ac985ecb9f77201d1b58dab66c7b256e
           HIQLITE_PATCH_SHA256: 1adc6028d28bb0c6b80cf429a69dab30d744eb4ed13830dcb028325522d717b7
@@ -156,6 +164,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Run Rhiza real-server reference
+        if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         env:
           RHIZA_SERVER_BENCH_REQUESTS: 100000
           RHIZA_SERVER_BENCH_CONCURRENCY: 16
@@ -221,6 +230,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record runner environment
+        if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         run: |
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
@@ -232,6 +242,15 @@ jobs:
             printf 'rhiza_failure_scenarios=each_peer_sigkill_during_timed_workload\n'
             printf 'rhiza_before_ack_scenarios=three_interleaved_healthy_base_and_candidate_http_quic_samples\n'
             printf 'hiqlite_failure_scenarios=raft_leader_or_follower_gracefully_stopped_before_timed_workload\n'
+            lscpu
+            free -b
+          } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"
+
+      - name: Record focused network environment
+        if: ${{ inputs.network_optimization && inputs.network_optimization != 'none' }}
+        run: |
+          {
+            printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
             lscpu
             free -b
           } >>"$RUNNER_TEMP/rhiza-performance/environment.txt"

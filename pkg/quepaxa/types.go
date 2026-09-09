@@ -11,6 +11,7 @@ import (
 var leaderScheduleMagic = []byte("QLDR\x00")
 var readBarrierMagic = []byte("QRDB\x00")
 var checkpointSealMagic = []byte("QCKP\x00")
+var reconfigurationMagic = []byte("QRCF\x00")
 
 const (
 	ReadBarrierNonceSize    = 16
@@ -43,17 +44,48 @@ func AdvancePrefixHash(previous [32]byte, slot Slot, value ValueHash) [32]byte {
 
 // Member describes one fixed cluster member.
 type Member struct {
-	ID      NodeID `json:"node_id"`
-	URL     string `json:"url"`
-	PeerURL string `json:"peer_url,omitempty"`
-	LogURL  string `json:"log_url"`
-	Token   string `json:"token"`
+	ID          NodeID `json:"node_id"`
+	URL         string `json:"url"`
+	PeerURL     string `json:"peer_url,omitempty"`
+	LogURL      string `json:"log_url"`
+	Token       string `json:"token"`
+	WALIdentity string `json:"wal_identity,omitempty"`
 }
 
-// Cluster describes the fixed membership used for the lifetime of a Core.
+// Cluster describes one voter configuration.
 type Cluster struct {
 	ConfigID uint     `json:"config_id"`
 	Members  []Member `json:"members"`
+}
+
+type reconfigurationValue struct {
+	Terminal     bool     `json:"terminal,omitempty"`
+	Freeze       Slot     `json:"freeze"`
+	TerminalSlot Slot     `json:"terminal_slot"`
+	Target       Cluster  `json:"target"`
+	PrefixHash   [32]byte `json:"prefix_hash"`
+}
+
+func encodeReconfiguration(value reconfigurationValue) ([]byte, error) {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]byte(nil), reconfigurationMagic...), payload...), nil
+}
+
+func decodeReconfiguration(value []byte) (reconfigurationValue, bool, error) {
+	if !bytes.HasPrefix(value, reconfigurationMagic) {
+		return reconfigurationValue{}, false, nil
+	}
+	var decoded reconfigurationValue
+	if err := decodeStrictJSON(value[len(reconfigurationMagic):], &decoded); err != nil {
+		return reconfigurationValue{}, true, err
+	}
+	if decoded.Freeze == 0 || decoded.TerminalSlot != decoded.Freeze+16 || decoded.Target.ConfigID == 0 || len(decoded.Target.Members) == 0 {
+		return reconfigurationValue{}, true, fmt.Errorf("invalid reconfiguration value")
+	}
+	return decoded, true, nil
 }
 
 func (c *Cluster) QuorumSize() int { return len(c.Members)/2 + 1 }
@@ -64,6 +96,18 @@ func (c *Cluster) MemberSet() map[NodeID]Member {
 		members[member.ID] = member
 	}
 	return members
+}
+
+func cloneCluster(cluster Cluster) Cluster {
+	cluster.Members = append([]Member(nil), cluster.Members...)
+	return cluster
+}
+
+// DecodeReconfiguration identifies a valid in-band reconfiguration control
+// value. Hosts must treat it as a replicated no-op.
+func DecodeReconfiguration(value []byte) (bool, error) {
+	_, ok, err := decodeReconfiguration(value)
+	return ok, err
 }
 
 // SlotValue identifies a decided value without copying its payload.

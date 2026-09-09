@@ -1,0 +1,70 @@
+2026/09/09 16:25:50 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     206	   5835554 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  211925 B/op	     793 allocs/op
+PASS
+2026/09/09 16:25:57 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     206	   5808090 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  212279 B/op	     793 allocs/op
+PASS
+2026/09/09 16:25:59 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     206	   5796670 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  212139 B/op	     793 allocs/op
+PASS
+2026/09/09 16:26:06 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     205	   5856420 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  212094 B/op	     793 allocs/op
+PASS
+2026/09/09 16:26:08 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     205	   5834913 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  211480 B/op	     793 allocs/op
+PASS
+2026/09/09 16:26:15 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     205	   5838635 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  212038 B/op	     794 allocs/op
+PASS
+2026/09/09 16:26:18 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     205	   5856942 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  211973 B/op	     793 allocs/op
+PASS
+2026/09/09 16:26:25 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     206	   5809545 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  212219 B/op	     793 allocs/op
+PASS
+2026/09/09 16:26:27 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     206	   5846134 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  211647 B/op	     793 allocs/op
+PASS
+2026/09/09 16:26:34 failed to sufficiently increase receive buffer size (was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB). See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.
+goos: linux
+goarch: amd64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: AMD EPYC 9V74 80-Core Processor
+BenchmarkCatchUpSameSourceQUIC-2   	     205	   5816024 ns/op	        16.00 decisions_fetched/op	         2.000 fetches/op	         8.000 unique_installed/op	  211655 B/op	     793 allocs/op
+PASS

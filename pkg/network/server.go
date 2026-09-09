@@ -88,6 +88,8 @@ type Server struct {
 	recoveryArchiveToken string
 	recoveryArchive      func(context.Context) error
 	syncLimit            chan struct{}
+	syncMu               sync.Mutex
+	syncSources          map[quepaxa.NodeID]chan struct{}
 	checkpointPrepare    func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error
 	compactedHandler     func()
 	readAdmissionMu      sync.RWMutex
@@ -510,7 +512,7 @@ func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision
 	if err := s.core.AcceptCertifiedValueForAck(decision); err != nil {
 		return err
 	}
-	if err := s.catchUpFrom(ctx, source, decision.Slot); err != nil {
+	if err := s.catchUpFrom(ctx, source, decision.Slot, true); err != nil {
 		return err
 	}
 	if certified, ok := s.core.CertifiedValue(decision.Slot); !ok || certified.Hash != decision.Hash {
@@ -519,12 +521,58 @@ func (s *Server) acceptFrom(ctx context.Context, source quepaxa.NodeID, decision
 	return nil
 }
 
-func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot) error {
+// lockCatchUp waits for the previous source owner, then claims a fresh entry.
+// Waiters never consume a global syncLimit token or inherit an owner's error.
+func (s *Server) lockCatchUp(ctx context.Context, source quepaxa.NodeID) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		s.syncMu.Lock()
+		done := s.syncSources[source]
+		if done == nil {
+			if s.syncSources == nil {
+				s.syncSources = make(map[quepaxa.NodeID]chan struct{})
+			}
+			done = make(chan struct{})
+			s.syncSources[source] = done
+			s.syncMu.Unlock()
+			return func() {
+				s.syncMu.Lock()
+				delete(s.syncSources, source)
+				close(done)
+				s.syncMu.Unlock()
+			}, nil
+		}
+		s.syncMu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through quepaxa.Slot, durable bool) error {
+	unlock, err := s.lockCatchUp(ctx, source)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !durable && s.core.Tip() >= through {
+		return nil
+	}
 	select {
 	case s.syncLimit <- struct{}{}:
 		defer func() { <-s.syncLimit }()
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	backoff := [...]time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
 	for s.core.Tip() < through {
@@ -556,7 +604,11 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
 		}
-		if err := s.core.AcceptCertifiedValues(response.Decisions); err != nil {
+		accept := s.core.AcceptCertifiedValues
+		if !durable {
+			accept = s.core.AcceptCertifiedHints
+		}
+		if err := accept(response.Decisions); err != nil {
 			if errors.Is(err, quepaxa.ErrCompacted) {
 				s.handleCompacted()
 				return ErrNotReady
@@ -564,7 +616,10 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 			return err
 		}
 	}
-	return nil
+	if durable {
+		return s.core.EnsureDurableThrough(ctx, through)
+	}
+	return ctx.Err()
 }
 
 // ServeHTTP implements http.Handler.
@@ -1148,7 +1203,7 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 			if s.transport == nil || source == s.core.NodeID() {
 				return fmt.Errorf("read-index source cannot supply slot %d", index)
 			}
-			if err := s.catchUpFrom(ctx, source, index); err != nil {
+			if err := s.catchUpFrom(ctx, source, index, true); err != nil {
 				return err
 			}
 		}

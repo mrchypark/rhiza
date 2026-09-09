@@ -33,7 +33,7 @@ func TestNewValidatesAndCopiesMembership(t *testing.T) {
 		})
 	}
 	members := []quepaxa.Member{{ID: "n1"}}
-	_ = quepaxa.Config{"n1", quepaxa.Cluster{}, wal, testTransport{}}
+	_ = quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{}, WAL: wal, Transport: testTransport{}}
 	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{Members: members}, WAL: wal})
 	if err != nil {
 		t.Fatal(err)
