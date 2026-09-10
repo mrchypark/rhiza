@@ -243,6 +243,7 @@ class Chaos:
     def run(self):
         self.setup()
 
+
         # SIGKILL the real process, preserving the Pod's emptyDir/WAL.
         before = self.status("rhiza-1")
         uid, cid, pid = self.runtime("rhiza-1")
