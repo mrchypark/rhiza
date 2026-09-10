@@ -135,7 +135,7 @@ impl Db {
         })
     }
     /// Starts a private recovery-only HTTP listener and returns its bound address.
-    /// It serves only `/recovery/status` and authenticated `/recovery/archive`;
+    /// It serves recovery status and authenticated archive/membership operations;
     /// it is closed when this `Db` closes and cannot be started twice.
     pub fn start_operator(&mut self, address: &str) -> Result<String> {
         if self.closed {
@@ -285,6 +285,24 @@ impl Db {
     }
     pub fn object_store_stats(&self) -> Result<Value> {
         self.call("object_store_stats", json!({}))
+    }
+    /// Requests a membership configuration change (add or remove a voter/learner).
+    pub fn change_membership(&self, change: &MembershipChange) -> Result<()> {
+        self.call(
+            "membership_change",
+            serde_json::to_value(change).map_err(internal)?,
+        )
+    }
+    /// Terminates a pending addition under its original voter quorum.
+    pub fn abort_membership(&self, change: &MembershipChange) -> Result<()> {
+        self.call(
+            "membership_abort",
+            serde_json::to_value(change).map_err(internal)?,
+        )
+    }
+    /// Returns the current membership status of this node.
+    pub fn membership_status(&self) -> Result<MembershipStatus> {
+        self.call("membership_status", json!({}))
     }
     /// Publishes one replicated notification. `payload` is binary data, encoded
     /// as base64 through the same FFI JSON boundary as KV values.
@@ -538,9 +556,99 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+// A membership fence attesting external exclusion.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MembershipFence {
+    pub node_id: String,
+    pub wal_identity: String,
+    pub workload_uid: String,
+    pub confirmed: bool,
+    pub evidence: String,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct MembershipMember {
+    #[serde(rename = "node_id")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    pub peer_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub log_url: String,
+    pub token: String,
+    pub wal_identity: String,
+}
+
+impl std::fmt::Debug for MembershipMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("MembershipMember")
+            .field("id", &self.id)
+            .field("peer_url", &self.peer_url)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MembershipChange {
+    pub operation_id: String,
+    pub cluster_id: String,
+    pub expected_config_id: u64,
+    #[serde(default)]
+    pub expected_abort_slot: u64,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub remove: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub add: Option<MembershipMember>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fence: Option<MembershipFence>,
+}
+
+// Observational membership snapshot; never a fencing authorization.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MembershipStatus {
+    pub node_id: String,
+    pub cluster_id: String,
+    pub config_id: u64,
+    #[serde(default)]
+    pub voters: Vec<String>,
+    pub wal_identity: String,
+    pub voting: bool,
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub abort_slot: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn membership_wire_credentials_are_sent_but_not_debugged() {
+        let member = MembershipMember {
+            id: "new-voter".into(),
+            peer_url: "quic://127.0.0.1:9000".into(),
+            token: "private-peer-token".into(),
+            wal_identity: "ab".repeat(32),
+            ..Default::default()
+        };
+        let change = MembershipChange {
+            operation_id: "replace".into(),
+            cluster_id: "cluster".into(),
+            expected_config_id: 2,
+            expected_abort_slot: 17,
+            remove: String::new(),
+            add: Some(member),
+            fence: None,
+        };
+        let wire = serde_json::to_value(&change).unwrap();
+        assert_eq!(wire["add"]["node_id"], "new-voter");
+        assert_eq!(wire["add"]["token"], "private-peer-token");
+        assert_eq!(wire["add"]["wal_identity"], "ab".repeat(32));
+        assert_eq!(wire["expected_abort_slot"], 17);
+        assert!(wire["add"].get("id").is_none());
+        assert!(!format!("{change:?}").contains("private-peer-token"));
+    }
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},

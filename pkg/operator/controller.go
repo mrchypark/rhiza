@@ -18,6 +18,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,11 +46,12 @@ type podList struct {
 	Items []object `json:"items"`
 }
 type sourceState struct {
-	prefix     string
-	members    []quepaxa.Member
-	durability string
-	env        map[string]string
-	stateful   object
+	prefix          string
+	members         []quepaxa.Member
+	durability      string
+	reconfiguration bool
+	env             map[string]string
+	stateful        object
 }
 
 func (c *Controller) Run(ctx context.Context, interval time.Duration) error {
@@ -87,6 +89,9 @@ func (c *Controller) operationID(r *Resource) string {
 	return str(r.Metadata["uid"]) + ":" + r.Spec.RecoveryID
 }
 func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
+	if r.Spec.Membership != nil {
+		return c.reconcileMembership(ctx, r)
+	}
 	reject := func(message string) error { return c.record(ctx, r, "Blocked", message) }
 	for _, value := range []string{resourceName(r), r.Spec.StatefulSet, r.Spec.SourceClusterID} {
 		if !identifier.MatchString(value) {
@@ -151,6 +156,10 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if mode == "" {
 		mode = "async"
 	}
+	reconfiguration, err := reconfigurationEnabled(env)
+	if err != nil {
+		return reject(err.Error())
+	}
 	prefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
 	registered, err := c.sourceMembership(ctx, prefix)
 	if err != nil {
@@ -165,7 +174,7 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	}
 	r.Status.Source, r.Status.SourceDurability, r.Status.SourceMembership = r.Spec.SourceClusterID, registered.Durability, fingerprint
 	r.Status.StatefulSetUID = uid
-	source := sourceState{prefix, members, mode, env, sts}
+	source := sourceState{prefix, members, mode, reconfiguration, env, sts}
 	if r.Spec.RecoveryID == "" {
 		peers, err := c.probe(ctx, r, sts)
 		if err != nil {
@@ -232,27 +241,38 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), s.stateful, &s.stateful); err != nil {
 				return err
 			}
-			return c.record(ctx, r, "Recovering", "waiting for fenced source pods to terminate")
+			return c.record(ctx, r, "Recovering", "waiting for source StatefulSet Pods to terminate after external fence")
 		}
 		pods, err := c.ownedPods(ctx, r.Status.StatefulSetUID)
 		if err != nil {
 			return err
 		}
 		if len(pods) > 0 {
-			return c.record(ctx, r, "Recovering", "waiting for fenced source pods to terminate")
+			return c.record(ctx, r, "Recovering", "waiting for source StatefulSet Pods to terminate after external fence")
 		}
 		r.Status.Stage = "Starting"
-		return c.record(ctx, r, "Recovering", "fenced source pods terminated; verified target may start")
+		return c.record(ctx, r, "Recovering", "source StatefulSet Pods terminated; externally fenced target may start")
 	case "Sealed":
-		result, err := recovery.Fork(ctx, c.Bucket, recovery.ForkOptions{SourcePrefix: s.prefix, TargetPrefix: path.Join(c.Prefix, r.Status.Target), Members: s.members, OperationID: c.operationID(r)})
+		secret := "rhiza-recovery-" + shortID(c.operationID(r))
+		var targetMembers []quepaxa.Member
+		if s.reconfiguration {
+			var err error
+			targetMembers, err = c.targetCredentials(ctx, r, secret, s.members)
+			if err != nil {
+				return c.record(ctx, r, "Blocked", err.Error())
+			}
+		}
+		result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, s.prefix, s.members, s.reconfiguration, targetMembers))
 		if err != nil {
 			return c.record(ctx, r, "Blocked", "certified archive fork failed: "+err.Error())
 		}
-		secret := "rhiza-recovery-" + shortID(c.operationID(r))
-		members, err := c.targetCredentials(ctx, r, secret, s.members)
-		if err != nil {
-			return c.record(ctx, r, "Blocked", err.Error())
+		if !s.reconfiguration {
+			targetMembers, err = c.targetCredentials(ctx, r, secret, s.members)
+			if err != nil {
+				return c.record(ctx, r, "Blocked", err.Error())
+			}
 		}
+		members := targetMembers
 		record := recovery.NewMembershipRecord(r.Status.Target, members, r.Spec.Durability)
 		if err := c.immutable(ctx, path.Join(c.Prefix, r.Status.Target, "voters/membership.json"), jsonBytes(record)); err != nil {
 			return c.record(ctx, r, "Blocked", "target membership is unavailable or inconsistent")
@@ -316,7 +336,11 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			}
 			// Validate the durable copy again after a paused/restarted controller,
 			// before any target voter can interpret an absent archive as empty.
-			result, err := recovery.Fork(ctx, c.Bucket, recovery.ForkOptions{SourcePrefix: sourcePrefix, TargetPrefix: path.Join(c.Prefix, r.Status.Target), Members: sourceMembers, OperationID: c.operationID(r)})
+			reconfiguration, err := reconfigurationEnabled(env)
+			if err != nil {
+				return c.record(ctx, r, "Blocked", err.Error())
+			}
+			result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, sourcePrefix, sourceMembers, reconfiguration, members))
 			if err != nil || result.Tip != r.Status.RecoveredTip || result.ManifestHash != r.Status.ManifestHash {
 				return c.record(ctx, r, "Blocked", "prepared target evidence changed before activation")
 			}
@@ -376,6 +400,26 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 
 func (c *Controller) reservation(r *Resource) object {
 	return object{"version": 1, "operation_id": c.operationID(r), "target": r.Status.Target, "source": r.Spec.SourceClusterID, "source_membership": r.Status.SourceMembership, "statefulset_uid": r.Status.StatefulSetUID, "spec_hash": r.Status.SpecHash}
+}
+func reconfigurationEnabled(env map[string]string) (bool, error) {
+	raw := env["RHIZA_ENABLE_RECONFIGURATION"]
+	if raw == "" {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("RHIZA_ENABLE_RECONFIGURATION must be a boolean")
+	}
+	return enabled, nil
+}
+func (c *Controller) forkOptions(r *Resource, sourcePrefix string, sourceMembers []quepaxa.Member, reconfiguration bool, targetMembers []quepaxa.Member) recovery.ForkOptions {
+	options := recovery.ForkOptions{SourcePrefix: sourcePrefix, TargetPrefix: path.Join(c.Prefix, r.Status.Target), Members: sourceMembers, OperationID: c.operationID(r)}
+	if reconfiguration {
+		options.SourceBootstrap = quepaxa.Cluster{ConfigID: 1, Members: sourceMembers}
+		options.TargetMembers = targetMembers
+		options.TargetMembership = recovery.NewMembershipRecord(r.Status.Target, targetMembers, r.Spec.Durability)
+	}
+	return options
 }
 func (c *Controller) verifyReservation(ctx context.Context, r *Resource) error {
 	reader, err := c.Bucket.Get(ctx, path.Join(c.Prefix, r.Spec.SourceClusterID, "recovery/successor.json"))

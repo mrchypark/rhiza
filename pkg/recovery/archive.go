@@ -56,17 +56,23 @@ type Extent struct {
 }
 
 type archiveHead struct {
-	ConfigID     uint `json:"config_id"`
-	Generation   uint64
-	Base         quepaxa.Slot            `json:"base"`
-	BasePrefix   [32]byte                `json:"base_prefix"`
-	BaseSeal     *quepaxa.CheckpointSeal `json:"base_seal,omitempty"`
-	BaseDecision *quepaxa.DecidedValue   `json:"base_decision,omitempty"`
-	Tip          quepaxa.Slot            `json:"tip"`
-	TailHash     [32]byte                `json:"tail_hash"`
-	TailObject   uint64                  `json:"tail_object"`
-	Sealed       bool                    `json:"-"`
+	ConfigID      uint `json:"config_id"`
+	Generation    uint64
+	Base          quepaxa.Slot            `json:"base"`
+	BasePrefix    [32]byte                `json:"base_prefix"`
+	BaseSeal      *quepaxa.CheckpointSeal `json:"base_seal,omitempty"`
+	BaseDecision  *quepaxa.DecidedValue   `json:"base_decision,omitempty"`
+	BaseAnchor    *archiveAnchorRef       `json:"base_anchor,omitempty"`
+	LineageAnchor *archiveAnchorRef       `json:"lineage_anchor,omitempty"`
+	Tip           quepaxa.Slot            `json:"tip"`
+	TailHash      [32]byte                `json:"tail_hash"`
+	TailObject    uint64                  `json:"tail_object"`
+	Sealed        bool                    `json:"-"`
 }
+
+// archiveAnchorRef identifies an externally fenced generation base. It is not
+// a consensus certificate and can only be consumed through GenerationAnchor.
+type archiveAnchorRef struct{ Hash [32]byte }
 
 type archiveGCLock struct {
 	OwnerID      string `json:"owner_id"`
@@ -140,6 +146,9 @@ type Manager struct {
 	readers      int
 }
 
+// NewManager opens one archive namespace. configID is the immutable archive
+// identity, not Core.ConfigID(): certificates inside extents may span multiple
+// consensus configurations. Keep this identity stable during voter replacement.
 func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
 	options := bucket.SupportedObjectUploadOptions()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -213,7 +222,10 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 	if head.ConfigID != m.configID || head.Generation == 0 || head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) {
 		return fmt.Errorf("invalid shared archive head")
 	}
-	if head.Base > 0 && (head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix) {
+	if head.BaseAnchor != nil && (head.BaseSeal != nil || head.BaseDecision != nil) {
+		return fmt.Errorf("invalid shared archive mixed recovery base")
+	}
+	if head.Base > 0 && (head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix) && (head.BaseAnchor == nil || head.BaseAnchor.Hash == ([32]byte{})) {
 		return fmt.Errorf("invalid shared archive recovery base")
 	}
 	extents := make([]Extent, 0)
@@ -353,6 +365,31 @@ func archiveBaseEqual(a, b archiveHead) bool {
 // without regressing under concurrent writers.
 func (m *Manager) CASSupported() bool { return m.cas }
 
+// InitializeFencedGeneration publishes an empty archive whose first future
+// decision follows an externally attested materialized generation base.
+func (m *Manager) InitializeFencedGeneration(ctx context.Context, tip quepaxa.Slot, prefix, anchorHash [32]byte) error {
+	if tip == 0 || prefix == ([32]byte{}) || anchorHash == ([32]byte{}) || !m.cas {
+		return fmt.Errorf("invalid fenced generation archive base")
+	}
+	if err := m.Load(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	head, cas := m.head, m.headCAS
+	m.mu.Unlock()
+	want := archiveHead{ConfigID: m.configID, Generation: 1, Base: tip, BasePrefix: prefix, Tip: tip, BaseAnchor: &archiveAnchorRef{Hash: anchorHash}, LineageAnchor: &archiveAnchorRef{Hash: anchorHash}}
+	if archiveHeadsEqual(head, want) {
+		return nil
+	}
+	if head.Tip != 0 || head.Base != 0 {
+		return fmt.Errorf("fenced generation archive is not empty")
+	}
+	if err := m.publishHead(ctx, want, cas); err != nil {
+		return err
+	}
+	return m.Load(ctx)
+}
+
 // TrimThrough removes decisions covered by a certified checkpoint while
 // retaining the authenticated prefix needed to validate the remaining tail.
 func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoint, decision quepaxa.DecidedValue) error {
@@ -393,7 +430,7 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 			return fmt.Errorf("archive generation exhausted")
 		}
 		sealCopy, decisionCopy := sealed.CheckpointSeal, decision
-		head.Base, head.BasePrefix, head.BaseSeal, head.BaseDecision = through, prefix, &sealCopy, &decisionCopy
+		head.Base, head.BasePrefix, head.BaseSeal, head.BaseDecision, head.BaseAnchor = through, prefix, &sealCopy, &decisionCopy, nil
 		head.Generation++
 		extents := make([]Extent, 0, len(refs))
 		for _, extent := range refs {
@@ -483,6 +520,21 @@ func (m *Manager) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.DecidedValue, 
 	return *m.head.BaseSeal, *m.head.BaseDecision, true
 }
 
+// GenerationAnchor returns the immutable external base reference, if this
+// archive begins at a fenced generation anchor.
+func (m *Manager) GenerationAnchor() ([32]byte, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	anchor := m.head.LineageAnchor
+	if anchor == nil {
+		anchor = m.head.BaseAnchor
+	}
+	if anchor == nil {
+		return [32]byte{}, false
+	}
+	return anchor.Hash, true
+}
+
 func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease time.Duration) (*RecoverySnapshot, error) {
 	if owner == "" || lease <= 0 {
 		return nil, fmt.Errorf("archive recovery snapshot requires owner and lease")
@@ -555,6 +607,20 @@ func (s *RecoverySnapshot) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.Decid
 		return quepaxa.CheckpointSeal{}, quepaxa.DecidedValue{}, false
 	}
 	return *s.head.BaseSeal, *s.head.BaseDecision, true
+}
+
+func (s *RecoverySnapshot) GenerationAnchor() ([32]byte, bool) {
+	if s == nil {
+		return [32]byte{}, false
+	}
+	anchor := s.head.LineageAnchor
+	if anchor == nil {
+		anchor = s.head.BaseAnchor
+	}
+	if anchor == nil {
+		return [32]byte{}, false
+	}
+	return anchor.Hash, true
 }
 
 func (s *RecoverySnapshot) Tip() quepaxa.Slot {

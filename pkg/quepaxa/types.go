@@ -60,6 +60,7 @@ type Cluster struct {
 
 type reconfigurationValue struct {
 	Terminal     bool     `json:"terminal,omitempty"`
+	Abort        bool     `json:"abort,omitempty"`
 	Freeze       Slot     `json:"freeze"`
 	TerminalSlot Slot     `json:"terminal_slot"`
 	Target       Cluster  `json:"target"`
@@ -81,6 +82,9 @@ func decodeReconfiguration(value []byte) (reconfigurationValue, bool, error) {
 	var decoded reconfigurationValue
 	if err := decodeStrictJSON(value[len(reconfigurationMagic):], &decoded); err != nil {
 		return reconfigurationValue{}, true, err
+	}
+	if decoded.Abort && !decoded.Terminal {
+		return reconfigurationValue{}, true, fmt.Errorf("invalid reconfiguration abort")
 	}
 	if decoded.Freeze == 0 || decoded.TerminalSlot != decoded.Freeze+16 || decoded.Target.ConfigID == 0 || len(decoded.Target.Members) == 0 {
 		return reconfigurationValue{}, true, fmt.Errorf("invalid reconfiguration value")
@@ -136,6 +140,20 @@ type CheckpointSeal struct {
 	PrefixHash           [32]byte `json:"prefix_hash"`
 	NextLeaderOrder      []NodeID `json:"next_leader_order"`
 	FollowingLeaderOrder []NodeID `json:"following_leader_order,omitempty"`
+	// Membership is required when the checkpoint can span reconfiguration.
+	// Fixed-membership checkpoints retain their compact legacy encoding.
+	Membership           *MembershipRecord `json:"membership,omitempty"`
+	GenerationAnchorHash [32]byte          `json:"generation_anchor_hash,omitzero"`
+}
+
+// FencedGenerationBase is an externally verified immutable recovery anchor
+// for a fresh target generation. It carries no source quorum certificate.
+type FencedGenerationBase struct {
+	ConfigID   uint
+	Index      Slot
+	PrefixHash [32]byte
+	RootHash   [32]byte
+	AnchorHash [32]byte
 }
 
 type SealedCheckpoint struct {
@@ -148,6 +166,9 @@ func EncodeCheckpointSeal(seal CheckpointSeal) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(checkpointSealMagic)+len(payload) > MaxReplicatedValueBytes {
+		return nil, fmt.Errorf("checkpoint seal exceeds %d bytes", MaxReplicatedValueBytes)
+	}
 	return append(append([]byte(nil), checkpointSealMagic...), payload...), nil
 }
 
@@ -159,7 +180,7 @@ func DecodeCheckpointSeal(value []byte) (CheckpointSeal, bool, error) {
 	if err := json.Unmarshal(value[len(checkpointSealMagic):], &seal); err != nil {
 		return CheckpointSeal{}, true, err
 	}
-	if seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.StateHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || len(seal.NextLeaderOrder) == 0 {
+	if len(value) > MaxReplicatedValueBytes || seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.StateHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || len(seal.NextLeaderOrder) == 0 {
 		return CheckpointSeal{}, true, fmt.Errorf("invalid checkpoint seal")
 	}
 	return seal, true, nil

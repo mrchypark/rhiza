@@ -27,7 +27,12 @@ type ForkOptions struct {
 	SourcePrefix string
 	TargetPrefix string
 	Members      []quepaxa.Member
-	OperationID  string
+	// SourceBootstrap is the independently supplied original source trust
+	// anchor. TargetMembers select anchored generation materialization.
+	SourceBootstrap  quepaxa.Cluster
+	TargetMembers    []quepaxa.Member
+	TargetMembership MembershipRecord
+	OperationID      string
 }
 
 type ForkResult struct {
@@ -37,12 +42,14 @@ type ForkResult struct {
 }
 
 type forkIntent struct {
-	Version      int      `json:"version"`
-	OperationID  string   `json:"operation_id"`
-	SourcePrefix string   `json:"source_prefix"`
-	TargetPrefix string   `json:"target_prefix"`
-	MemberIDs    []string `json:"member_ids"`
-	ManifestHash string   `json:"manifest_hash"`
+	Version              int      `json:"version"`
+	OperationID          string   `json:"operation_id"`
+	SourcePrefix         string   `json:"source_prefix"`
+	TargetPrefix         string   `json:"target_prefix"`
+	MemberIDs            []string `json:"member_ids"`
+	ManifestHash         string   `json:"manifest_hash"`
+	SourceBootstrapHash  string   `json:"source_bootstrap_hash,omitempty"`
+	TargetMembershipHash string   `json:"target_membership_hash,omitempty"`
 }
 
 const forkLease = 10 * time.Minute
@@ -51,6 +58,9 @@ const forkLease = 10 * time.Minute
 // checkpoint into an isolated target prefix. The caller must fence every old
 // writer before calling it and must not start the target until it returns.
 func Fork(ctx context.Context, bucket objstore.Bucket, options ForkOptions) (ForkResult, error) {
+	if len(options.SourceBootstrap.Members) != 0 || len(options.TargetMembers) != 0 {
+		return forkAnchoredGeneration(ctx, bucket, options)
+	}
 	if bucket == nil || !supportsCAS(bucket) {
 		return ForkResult{}, fmt.Errorf("generation fork requires conditional object writes")
 	}
@@ -187,6 +197,98 @@ func Fork(ctx context.Context, bucket objstore.Bucket, options ForkOptions) (For
 	return result, nil
 }
 
+func forkAnchoredGeneration(ctx context.Context, bucket objstore.Bucket, options ForkOptions) (ForkResult, error) {
+	if bucket == nil || !supportsCAS(bucket) || len(options.SourceBootstrap.Members) == 0 || len(options.TargetMembers) == 0 || options.TargetMembership != NewMembershipRecord(options.TargetMembership.Cluster, options.TargetMembers, options.TargetMembership.Durability) {
+		return ForkResult{}, fmt.Errorf("anchored generation fork requires source bootstrap and immutable target membership")
+	}
+	sourcePrefix, targetPrefix, err := forkPrefixes(options.SourcePrefix, options.TargetPrefix)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	if options.OperationID == "" || !validForkMemberIDs(forkMemberIDs(options.SourceBootstrap.Members)) {
+		return ForkResult{}, fmt.Errorf("fork operation ID and source bootstrap are required")
+	}
+	if existing, has, err := readForkIntent(ctx, bucket, targetPrefix); err != nil {
+		return ForkResult{}, err
+	} else if has {
+		bootstrap, err := bootstrapHash(options.SourceBootstrap)
+		if err != nil {
+			return ForkResult{}, err
+		}
+		targetHash, err := membershipHash(options.TargetMembership)
+		if err != nil {
+			return ForkResult{}, err
+		}
+		if existing.Version != 2 || existing.OperationID != options.OperationID || existing.SourcePrefix != sourcePrefix || existing.TargetPrefix != targetPrefix || existing.SourceBootstrapHash != bootstrap || existing.TargetMembershipHash != targetHash || !bytes.Equal(mustJSON(existing.MemberIDs), mustJSON(forkMemberIDs(options.SourceBootstrap.Members))) {
+			return ForkResult{}, fmt.Errorf("fork target belongs to a different operation")
+		}
+		if result, ok, err := readForkResult(ctx, bucket, targetPrefix); err != nil || ok {
+			if err != nil {
+				return ForkResult{}, err
+			}
+			target := NewManager(bucket, targetPrefix, 1)
+			if err := target.Load(ctx); err != nil {
+				target.Close()
+				return ForkResult{}, err
+			}
+			anchorHash, present := target.GenerationAnchor()
+			target.Close()
+			if !present {
+				return ForkResult{}, fmt.Errorf("anchored fork result is incomplete")
+			}
+			anchor, err := VerifyGenerationAnchor(ctx, bucket, targetPrefix, options.TargetMembership, anchorHash)
+			if err != nil || anchor.SourceManifest != result.ManifestHash || anchor.SourceTip != result.Tip || anchor.SourcePrefixHash != result.PrefixHash || anchor.SourceBootstrap != bootstrap {
+				return ForkResult{}, fmt.Errorf("anchored fork result is incomplete")
+			}
+			return result, nil
+		}
+	} else if err := ensureForkTargetEmpty(ctx, bucket, targetPrefix); err != nil {
+		return ForkResult{}, err
+	}
+	source := NewManager(bucket, sourcePrefix, 1)
+	defer source.Close()
+	if err := source.Load(ctx); err != nil {
+		return ForkResult{}, fmt.Errorf("load source archive: %w", err)
+	}
+	snapshot, err := source.BeginRecoverySnapshot(ctx, "fork-"+shortHash(options.OperationID), forkLease)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	defer closeSnapshot(snapshot)
+	if !snapshot.head.Sealed || snapshot.Tip() == 0 {
+		return ForkResult{}, fmt.Errorf("anchored fork requires a sealed certified source")
+	}
+	headData, err := encodeHead(snapshot.head)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	manifest := sha256.Sum256(headData)
+	bootstrap, err := bootstrapHash(options.SourceBootstrap)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	targetHash, err := membershipHash(options.TargetMembership)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	intent := forkIntent{Version: 2, OperationID: options.OperationID, SourcePrefix: sourcePrefix, TargetPrefix: targetPrefix, MemberIDs: forkMemberIDs(options.SourceBootstrap.Members), ManifestHash: hex.EncodeToString(manifest[:]), SourceBootstrapHash: bootstrap, TargetMembershipHash: targetHash}
+	if err := acquireForkIntent(ctx, bucket, targetPrefix, intent); err != nil {
+		return ForkResult{}, err
+	}
+	result := ForkResult{Tip: uint64(snapshot.Tip()), ManifestHash: intent.ManifestHash}
+	anchor, err := MaterializeGeneration(ctx, bucket, result, sourcePrefix, targetPrefix, options.OperationID, options.SourceBootstrap, options.TargetMembership)
+	if err != nil {
+		return ForkResult{}, err
+	}
+	result.PrefixHash = anchor.SourcePrefixHash
+	if err := writeForkResult(ctx, bucket, targetPrefix, result); err != nil {
+		return ForkResult{}, err
+	}
+	return result, nil
+}
+
+func mustJSON(value any) []byte { data, _ := json.Marshal(value); return data }
+
 type forkEvidenceGuard struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -234,6 +336,14 @@ func (g *forkEvidenceGuard) Check() error             { g.mu.Lock(); defer g.mu.
 func (g *forkEvidenceGuard) Close()                   { g.cancel(); <-g.done }
 
 func verifyForkSnapshot(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, members []quepaxa.Member) ([32]byte, error) {
+	return verifyForkSnapshotWithMode(ctx, snapshot, seal, decision, checkpoints, quepaxa.Cluster{ConfigID: 1, Members: members}, false)
+}
+
+func verifyForkSnapshotConfig(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, bootstrap quepaxa.Cluster) ([32]byte, error) {
+	return verifyForkSnapshotWithMode(ctx, snapshot, seal, decision, checkpoints, bootstrap, seal.Membership != nil)
+}
+
+func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot, seal quepaxa.CheckpointSeal, decision quepaxa.DecidedValue, checkpoints *checkpoint.Manager, bootstrap quepaxa.Cluster, reconfiguration bool) ([32]byte, error) {
 	var zero [32]byte
 	dir, err := os.MkdirTemp("", "rhiza-fork-verify-*")
 	if err != nil {
@@ -246,12 +356,12 @@ func verifyForkSnapshot(ctx context.Context, snapshot *RecoverySnapshot, seal qu
 	}
 	defer wal.Close()
 	observerID := quepaxa.NodeID("rhiza-fork-observer")
-	for _, member := range members {
+	for _, member := range bootstrap.Members {
 		if member.ID == observerID {
 			return zero, fmt.Errorf("fork observer ID collides with member")
 		}
 	}
-	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: observerID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: members}, WAL: wal})
+	core, err := quepaxa.NewObserver(quepaxa.Config{NodeID: observerID, Cluster: bootstrap, WAL: wal, EnableReconfiguration: reconfiguration})
 	if err != nil {
 		return zero, err
 	}
@@ -340,18 +450,29 @@ func verifyCachedForkResult(ctx context.Context, bucket objstore.Bucket, targetP
 }
 
 func forkPrefixes(source, target string) (string, string, error) {
-	for _, prefix := range []string{source, target} {
-		for _, segment := range strings.Split(prefix, "/") {
-			if segment == ".." {
-				return "", "", fmt.Errorf("fork prefixes must not traverse namespaces")
-			}
-		}
+	var err error
+	source, err = normalizeForkPrefix(source)
+	if err != nil {
+		return "", "", err
 	}
-	source, target = strings.Trim(path.Clean(source), "/"), strings.Trim(path.Clean(target), "/")
-	if source == "" || target == "" || source == "." || target == "." || source == target || source == ".." || target == ".." || strings.HasPrefix(source, "../") || strings.HasPrefix(target, "../") || strings.HasPrefix(source, target+"/") || strings.HasPrefix(target, source+"/") {
+	target, err = normalizeForkPrefix(target)
+	if err != nil || source == target || strings.HasPrefix(source, target+"/") || strings.HasPrefix(target, source+"/") {
 		return "", "", fmt.Errorf("distinct source and target prefixes are required")
 	}
 	return source, target, nil
+}
+
+func normalizeForkPrefix(prefix string) (string, error) {
+	for _, segment := range strings.Split(prefix, "/") {
+		if segment == ".." {
+			return "", fmt.Errorf("fork prefixes must not traverse namespaces")
+		}
+	}
+	prefix = strings.Trim(path.Clean(prefix), "/")
+	if prefix == "" || prefix == "." || prefix == ".." || strings.HasPrefix(prefix, "../") {
+		return "", fmt.Errorf("fork prefix is required")
+	}
+	return prefix, nil
 }
 
 func supportsCAS(bucket objstore.Bucket) bool {
@@ -458,7 +579,7 @@ func readForkIntent(ctx context.Context, bucket objstore.Bucket, prefix string) 
 		return forkIntent{}, false, fmt.Errorf("read fork intent")
 	}
 	var intent forkIntent
-	if err := json.Unmarshal(data, &intent); err != nil || intent.Version != 1 || intent.OperationID == "" || !validForkHash(intent.ManifestHash) {
+	if err := json.Unmarshal(data, &intent); err != nil || (intent.Version != 1 && intent.Version != 2) || intent.OperationID == "" || !validForkHash(intent.ManifestHash) {
 		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
 	}
 	canonical, _ := json.Marshal(intent)
@@ -467,6 +588,12 @@ func readForkIntent(ctx context.Context, bucket objstore.Bucket, prefix string) 
 	}
 	source, target, err := forkPrefixes(intent.SourcePrefix, intent.TargetPrefix)
 	if err != nil || source != intent.SourcePrefix || target != intent.TargetPrefix || !validForkMemberIDs(intent.MemberIDs) {
+		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
+	}
+	if intent.Version == 1 && (intent.SourceBootstrapHash != "" || intent.TargetMembershipHash != "") {
+		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
+	}
+	if intent.Version == 2 && (!validForkHash(intent.SourceBootstrapHash) || !validForkHash(intent.TargetMembershipHash)) {
 		return forkIntent{}, false, fmt.Errorf("invalid fork intent")
 	}
 	return intent, true, nil

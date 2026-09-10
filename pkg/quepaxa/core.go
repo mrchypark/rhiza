@@ -47,21 +47,25 @@ type Transport interface {
 
 // Core runs one QuePaxa proposer and recorder per replica.
 type Core struct {
-	nodeID            NodeID
-	config            *Cluster
-	wal               *qlog.WAL
-	transport         Transport
-	observer          bool
-	learner           bool
-	walIdentity       string
-	reconfigEnabled   bool
-	reconfigWAL       bool
-	reconfigAdmission func(context.Context, Cluster, Slot, [32]byte) error
-	configHistory     []configEpoch
-	retiredIDs        map[NodeID]struct{}
-	reconfiguration   *reconfigurationState
-	reconfigurationMu sync.Mutex
-	priority          func() (Priority, error)
+	nodeID               NodeID
+	config               *Cluster
+	wal                  *qlog.WAL
+	transport            Transport
+	observer             bool
+	learner              bool
+	walIdentity          string
+	reconfigEnabled      bool
+	reconfigWAL          bool
+	reconfigAdmission    func(context.Context, Cluster, Slot, [32]byte) error
+	configHistory        []configEpoch
+	retiredIDs           map[NodeID]struct{}
+	baseMembership       *MembershipRecord
+	membershipVersion    uint64
+	lastAbort            *ConfigTransition
+	generationAnchorHash [32]byte
+	reconfiguration      *reconfigurationState
+	reconfigurationMu    sync.Mutex
+	priority             func() (Priority, error)
 
 	slotMu              sync.Mutex
 	nextSlot            Slot
@@ -160,7 +164,7 @@ func (c *Core) voterForClusterLocked(cluster Cluster) bool {
 		return false
 	}
 	for _, epoch := range c.configHistory {
-		if sameCluster(epoch.cluster, cluster) && epoch.start > 1 && !c.durable[epoch.start-1] {
+		if sameCluster(epoch.cluster, cluster) && epoch.start > 1 && !c.epochTerminalDurableLocked(epoch) {
 			return false
 		}
 	}
@@ -170,6 +174,25 @@ func (c *Core) voterForClusterLocked(cluster Cluster) bool {
 				return member.WALIdentity == c.walIdentity
 			}
 			return !c.learner
+		}
+	}
+	return false
+}
+
+// epochTerminalDurableLocked accepts a compacted terminal only when the
+// verified membership base retains that exact transition. It never recreates
+// a durable marker for an unretained suffix decision.
+func (c *Core) epochTerminalDurableLocked(epoch configEpoch) bool {
+	terminal := epoch.start - 1
+	if c.durable[terminal] {
+		return true
+	}
+	if terminal > c.floor || c.baseMembership == nil {
+		return false
+	}
+	for _, transition := range c.baseMembership.Transitions {
+		if transition.Terminal.Slot == terminal {
+			return true // installMembershipBaseLocked fully validated this proof.
 		}
 	}
 	return false
@@ -191,6 +214,40 @@ func (c *Core) CanParticipateReadIndex() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.reconfiguration == nil
+}
+
+// PendingReconfiguration returns the frozen target while its old-configuration
+// drain is active. The returned cluster is safe for management retries to edit.
+func (c *Core) PendingReconfiguration() (Cluster, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.reconfiguration == nil {
+		return Cluster{}, false
+	}
+	return cloneCluster(c.reconfiguration.target), true
+}
+
+// LastReconfigurationAbort returns the certified abort terminal revision and
+// its original target. The result is absent after a successful transition.
+func (c *Core) LastReconfigurationAbort() (Slot, Cluster, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.lastAbort == nil {
+		return 0, Cluster{}, false
+	}
+	control, ok, err := decodeReconfiguration(c.lastAbort.Terminal.Value)
+	if err != nil || !ok || !control.Abort {
+		return 0, Cluster{}, false
+	}
+	return c.lastAbort.Terminal.Slot, cloneCluster(control.Target), true
+}
+
+// GenerationAnchorHash identifies this WAL's immutable externally fenced
+// generation lineage, or is zero for ordinary consensus history.
+func (c *Core) GenerationAnchorHash() [32]byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.generationAnchorHash
 }
 
 // ClusterForSlot returns the immutable configuration that certifies slot.
@@ -614,6 +671,13 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		controlSlot := start + Slot(epoch-1)*leaderEpochSize
 		decision, ok := c.decided[controlSlot]
 		if !ok {
+			key := c.leaderEpochKeyLocked(slot)
+			if c.generationAnchorHash != ([32]byte{}) && key == c.baseLeaderEpoch && len(c.baseLeaderOrder) != 0 {
+				return append([]NodeID(nil), c.baseLeaderOrder...), nil
+			}
+			if c.generationAnchorHash != ([32]byte{}) && key == c.baseFollowingEpoch && len(c.baseFollowingOrder) != 0 {
+				return append([]NodeID(nil), c.baseFollowingOrder...), nil
+			}
 			return nil, fmt.Errorf("leader schedule unavailable for generation epoch %d", epoch)
 		}
 		order, scheduled, err := DecodeLeaderSchedule(decision.Value)
@@ -673,17 +737,28 @@ func validateLeaderSchedule(cluster Cluster, order []NodeID) bool {
 	return true
 }
 
-func (c *Core) checkpointNeedsFollowingOrder(index Slot) bool {
-	epoch := leaderEpoch(index + 1)
-	return epoch+1 >= c.explorationEpochs() && leaderEpochFirst(epoch) <= index
+// checkpointEpochLocked uses the configuration active immediately after the
+// checkpoint, whose leader epochs restart at its activation slot.
+func (c *Core) checkpointEpochLocked(index Slot) (uint64, Slot, uint64) {
+	start := Slot(1)
+	cluster := *c.config
+	if c.reconfigEnabled {
+		start = c.configEpochStartLocked(index + 1)
+		cluster = c.clusterForSlotLocked(index + 1)
+	}
+	return uint64((index + 1 - start) / leaderEpochSize), start, uint64(2*len(cluster.Members) + 1)
 }
 
 func (c *Core) validateCheckpointLeaderOrders(index Slot, next, following []NodeID) bool {
-	if !c.validateLeaderSchedule(next) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	cluster := c.clusterForSlotLocked(index + 1)
+	if !validateLeaderSchedule(cluster, next) {
 		return false
 	}
-	if c.checkpointNeedsFollowingOrder(index) {
-		return c.validateLeaderSchedule(following)
+	epoch, start, exploration := c.checkpointEpochLocked(index)
+	if epoch+1 >= exploration && start+Slot(epoch)*leaderEpochSize <= index {
+		return validateLeaderSchedule(cluster, following)
 	}
 	return len(following) == 0
 }
@@ -693,10 +768,11 @@ func (c *Core) checkpointLeaderOrdersLocked(index Slot) ([]NodeID, []NodeID, err
 	if err != nil {
 		return nil, nil, err
 	}
-	if !c.checkpointNeedsFollowingOrder(index) {
+	epoch, start, exploration := c.checkpointEpochLocked(index)
+	if epoch+1 < exploration || start+Slot(epoch)*leaderEpochSize > index {
 		return next, nil, nil
 	}
-	following, err := c.leaderOrderLocked(leaderEpochFirst(leaderEpoch(index+1) + 1))
+	following, err := c.leaderOrderLocked(start + Slot(epoch+1)*leaderEpochSize)
 	return next, following, err
 }
 
@@ -1077,7 +1153,10 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 			if state == nil || request.Slot != state.terminal || tip != state.terminal-1 || control.Freeze != state.freeze || control.TerminalSlot != state.terminal || control.PrefixHash != tipPrefix || !sameCluster(control.Target, state.target) {
 				return Summary{}, fmt.Errorf("invalid reconfiguration terminal record")
 			}
-			if reconfigurationAdds(cluster, state.target) {
+			if control.Abort && !reconfigurationAdds(cluster, state.target) {
+				return Summary{}, fmt.Errorf("only a pending addition may be aborted")
+			}
+			if !control.Abort && reconfigurationAdds(cluster, state.target) {
 				if c.reconfigAdmission == nil {
 					return Summary{}, fmt.Errorf("reconfiguration admission is unavailable")
 				}
@@ -1306,9 +1385,26 @@ func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Conte
 	validator := c.checkpointValidator
 	order, following, orderErr := c.checkpointLeaderOrdersLocked(seal.Index)
 	tip := c.tip
+	anchor := c.generationAnchorHash
+	configID := c.clusterForSlotLocked(seal.Index + 1).ConfigID
+	var expected MembershipRecord
+	var membershipErr error
+	if c.reconfigEnabled {
+		if c.reconfiguration != nil {
+			membershipErr = fmt.Errorf("checkpoint membership is not stable during reconfiguration")
+		} else {
+			expected, membershipErr = c.membershipHistoryLocked(seal.Index)
+		}
+	}
 	c.mu.RUnlock()
-	if seal.ConfigID != c.config.ConfigID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
+	if membershipErr != nil || seal.GenerationAnchorHash != anchor || seal.ConfigID != configID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
 		return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix")
+	}
+	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+		return false, nil, fmt.Errorf("checkpoint seal has stale membership history")
+	}
+	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
+		return false, nil, err
 	}
 	if prepared && seal.Index < preparedIndex {
 		return false, nil, fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
@@ -1325,9 +1421,6 @@ func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Conte
 // RequirePreparedCheckpoint is the bounded Record-path check. Full object
 // verification happens before consensus through PrepareCheckpoint.
 func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
-	if c.reconfigEnabled {
-		return fmt.Errorf("checkpoints are unavailable with reconfiguration enabled")
-	}
 	verified, _, err := c.checkpointIdentity(seal)
 	if err != nil {
 		return err
@@ -1341,9 +1434,6 @@ func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
 // PrepareCheckpoint verifies a candidate outside Record RPC and persists the
 // verified identity before this node may vote for its seal.
 func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error {
-	if c.reconfigEnabled {
-		return fmt.Errorf("checkpoints are unavailable with reconfiguration enabled")
-	}
 	c.checkpointMu.Lock()
 	defer c.checkpointMu.Unlock()
 	verified, validator, err := c.checkpointIdentity(seal)
@@ -1538,7 +1628,10 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 		}
 		// A new epoch must remain reconstructible after a crash, even if earlier
 		// ordinary decisions were learned without local decision markers.
-		first = 1
+		// A verified recovery base already contains the certified membership
+		// history below floor, so only the retained suffix needs decision WAL
+		// markers before a new terminal becomes durable.
+		first = c.floor + 1
 	}
 	for index := first; index <= slot; index++ {
 		if c.logged[index] {
@@ -1716,6 +1809,9 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 			decoded.Proposal.Value = decision.Value
 			if err := c.applyReconfigurationLocked(decoded); err != nil {
 				return err
+			}
+			if control, ok, _ := decodeReconfiguration(decision.Value); ok && control.Terminal {
+				c.membershipVersion++
 			}
 		}
 		c.tip++
@@ -1919,8 +2015,15 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 	case 0:
 		order, err := c.LeaderOrder(decision.Slot)
 		if err != nil {
-			epoch := leaderEpoch(decision.Slot)
-			missingControl := epoch >= c.explorationEpochs() && !c.IsDecided(leaderEpochFirst(epoch-1))
+			c.mu.RLock()
+			epoch, start, exploration := c.checkpointEpochLocked(decision.Slot - 1)
+			controlSlot := start
+			if epoch > 0 {
+				controlSlot += Slot(epoch-1) * leaderEpochSize
+			}
+			_, knownControl := c.decided[controlSlot]
+			missingControl := epoch >= exploration && !knownControl
+			c.mu.RUnlock()
 			if !allowMissingLeader || !missingControl {
 				return err
 			}
@@ -2352,11 +2455,20 @@ func (c *Core) recover() error {
 	if err := c.wal.Scan(func(entry qlog.Entry) error {
 		switch entry.Type {
 		case qlog.EntryCheckpoint:
-			if c.reconfigEnabled {
-				return fmt.Errorf("checkpoint restoration is unavailable with reconfiguration enabled")
-			}
 			base, decodeErr := decodeConsensusBase(entry.Payload)
-			if decodeErr != nil || base.ConfigID != c.config.ConfigID || uint64(base.ClosedThrough) != entry.Slot || base.RecoveryRoot != entry.Hash || base.LeaderEpoch != leaderEpoch(base.ClosedThrough+1) || !c.validateCheckpointLeaderOrders(base.ClosedThrough, base.NextLeaderOrder, base.FollowingLeaderOrder) {
+			if decodeErr == nil {
+				c.mu.Lock()
+				decodeErr = c.installGenerationAnchorBaseLocked(base.GenerationAnchorHash)
+				if decodeErr == nil {
+					decodeErr = c.installMembershipBaseLocked(base)
+				}
+				c.mu.Unlock()
+			}
+			c.mu.RLock()
+			configID := c.clusterForSlotLocked(base.ClosedThrough + 1).ConfigID
+			leaderEpoch := c.leaderEpochKeyLocked(base.ClosedThrough + 1)
+			c.mu.RUnlock()
+			if decodeErr != nil || base.ConfigID != configID || uint64(base.ClosedThrough) != entry.Slot || base.RecoveryRoot != entry.Hash || base.LeaderEpoch != leaderEpoch || !c.validateCheckpointLeaderOrders(base.ClosedThrough, base.NextLeaderOrder, base.FollowingLeaderOrder) {
 				if decodeErr == nil {
 					decodeErr = fmt.Errorf("consensus base identity mismatch")
 				}
@@ -2367,7 +2479,10 @@ func (c *Core) recover() error {
 			c.mu.Unlock()
 		case qlog.EntryCheckpointVerified:
 			seal, checkpoint, decodeErr := DecodeCheckpointSeal(entry.Payload)
-			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.config.ConfigID || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+			if decodeErr == nil && checkpoint {
+				_, decodeErr = c.checkpointMembershipForSeal(seal)
+			}
+			if decodeErr != nil || !checkpoint || uint64(seal.Index) != entry.Slot || seal.RootHash != entry.Hash || seal.ConfigID != c.ConfigID() || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
 				if decodeErr == nil {
 					decodeErr = fmt.Errorf("checkpoint verification identity mismatch")
 				}
@@ -2492,6 +2607,11 @@ func (c *Core) recover() error {
 			return fmt.Errorf("recover verified checkpoint: conflicting roots at index %d", seal.Index)
 		}
 		c.preparedCheckpoints[seal.Index] = seal.RootHash
+		c.mu.Unlock()
+	}
+	if c.reconfigEnabled {
+		c.mu.Lock()
+		c.membershipVersion = uint64(len(c.configHistory) - 1)
 		c.mu.Unlock()
 	}
 	return nil

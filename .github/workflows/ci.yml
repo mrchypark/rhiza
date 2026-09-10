@@ -10,6 +10,37 @@ permissions:
   contents: read
 
 jobs:
+  membership-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Membership lifecycle with real QUIC and object storage
+        env:
+          CGO_ENABLED: 1
+          RHIZA_E2E_S3_ENDPOINT: 127.0.0.1:19000
+          RHIZA_E2E_S3_BUCKET: rhiza
+          RHIZA_E2E_S3_ACCESS_KEY: rhiza-e2e
+          RHIZA_E2E_S3_SECRET_KEY: rhiza-e2e-secret
+        run: |
+          docker run --rm -d --name rhiza-membership-minio -p 19000:9000 \
+            -e MINIO_ROOT_USER=rhiza-e2e -e MINIO_ROOT_PASSWORD=rhiza-e2e-secret \
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          trap 'docker logs rhiza-membership-minio; docker rm -f rhiza-membership-minio' EXIT
+          for _ in {1..100}; do
+            curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null 2>&1 && break
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null
+          docker run --rm --network host --entrypoint /bin/sh \
+            minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            -c 'mc alias set local http://127.0.0.1:19000 rhiza-e2e rhiza-e2e-secret && mc mb --ignore-existing local/rhiza'
+          go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
+
   rust-sdk:
     strategy:
       matrix:

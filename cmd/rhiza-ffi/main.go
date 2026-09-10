@@ -491,6 +491,23 @@ func dispatch(ctx context.Context, entry *ffiEntry, call callEnvelope) (any, err
 			return nil, err
 		}
 		return db.RequestStatus(ctx, r)
+	case "membership_change":
+		var r rhiza.MembershipChange
+		if err := decode(&r); err != nil {
+			return nil, err
+		}
+		return nil, db.ChangeMembership(ctx, r)
+	case "membership_status":
+		if err := decode(&struct{}{}); err != nil {
+			return nil, err
+		}
+		return db.MembershipStatus()
+	case "membership_abort":
+		var r rhiza.MembershipChange
+		if err := decode(&r); err != nil {
+			return nil, err
+		}
+		return nil, db.AbortMembership(ctx, r)
 	case "ready":
 		return db.Ready(), nil
 	case "object_store_stats":

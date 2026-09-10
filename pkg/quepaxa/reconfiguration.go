@@ -11,6 +11,16 @@ import (
 // next fifteen slots are drained under that same configuration; FinishReconfiguration
 // then commits the terminal control record and activates target at T+1.
 func (c *Core) BeginReconfiguration(ctx context.Context, target Cluster) (Slot, error) {
+	return c.beginReconfiguration(ctx, target, nil)
+}
+
+// BeginReconfigurationAt starts a new operation only when the latest durable
+// abort terminal still matches expectedAbortSlot. Zero means no prior abort.
+func (c *Core) BeginReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) (Slot, error) {
+	return c.beginReconfiguration(ctx, target, &expectedAbortSlot)
+}
+
+func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expectedAbortSlot *Slot) (Slot, error) {
 	if !c.reconfigEnabled || c.observer {
 		return 0, ErrQuorumUnavailable
 	}
@@ -24,6 +34,17 @@ func (c *Core) BeginReconfiguration(ctx context.Context, target Cluster) (Slot, 
 	if c.reconfiguration != nil {
 		c.mu.RUnlock()
 		return 0, fmt.Errorf("reconfiguration is already frozen")
+	}
+	if expectedAbortSlot != nil {
+		actual, err := c.abortRevisionLocked()
+		if err != nil {
+			c.mu.RUnlock()
+			return 0, err
+		}
+		if actual != *expectedAbortSlot {
+			c.mu.RUnlock()
+			return 0, fmt.Errorf("reconfiguration abort revision %d does not match expected %d", actual, *expectedAbortSlot)
+		}
 	}
 	current := c.clusterForSlotLocked(c.tip + 1)
 	freeze := c.tip + 1
@@ -60,9 +81,53 @@ func (c *Core) BeginReconfiguration(ctx context.Context, target Cluster) (Slot, 
 	return freeze, nil
 }
 
+// abortRevisionLocked returns zero only when no abort revision exists. A
+// terminal observed before its durable marker must block a compare-and-start.
+func (c *Core) abortRevisionLocked() (Slot, error) {
+	if c.lastAbort == nil {
+		return 0, nil
+	}
+	freeze, terminal := c.lastAbort.Freeze, c.lastAbort.Terminal
+	if terminal.Slot <= c.floor {
+		if c.baseMembership != nil && c.baseMembership.Abort != nil && sameMembershipTransition(*c.lastAbort, *c.baseMembership.Abort) {
+			return terminal.Slot, nil
+		}
+		return 0, fmt.Errorf("retained abort revision is not anchored in recovery base")
+	}
+	if !c.durable[freeze.Slot] || !c.durable[terminal.Slot] {
+		return 0, fmt.Errorf("abort revision is not durable")
+	}
+	return terminal.Slot, nil
+}
+
 // FinishReconfiguration fills the bounded old-configuration drain and commits
 // its terminal record. It never changes membership before that record is durable.
 func (c *Core) FinishReconfiguration(ctx context.Context) error {
+	return c.finishReconfiguration(ctx, false, nil, nil)
+}
+
+// FinishReconfigurationAt commits a terminal only for the frozen target and
+// abort revision that the caller previously recorded. Zero means no prior
+// abort revision.
+func (c *Core) FinishReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) error {
+	return c.finishReconfiguration(ctx, false, &target, &expectedAbortSlot)
+}
+
+// AbortReconfiguration certifies the frozen terminal under the old voter
+// quorum without activating an added learner. It is only available for a
+// pending addition; the original learner identity remains untouched.
+func (c *Core) AbortReconfiguration(ctx context.Context) error {
+	return c.finishReconfiguration(ctx, true, nil, nil)
+}
+
+// AbortReconfigurationAt certifies an abort only for the frozen target and
+// abort revision that the caller previously recorded. It rejects a stale
+// management round before draining or proposing a terminal control.
+func (c *Core) AbortReconfigurationAt(ctx context.Context, target Cluster, expectedAbortSlot Slot) error {
+	return c.finishReconfiguration(ctx, true, &target, &expectedAbortSlot)
+}
+
+func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTarget *Cluster, expectedAbortSlot *Slot) error {
 	if !c.reconfigEnabled || c.observer {
 		return ErrQuorumUnavailable
 	}
@@ -77,6 +142,24 @@ func (c *Core) FinishReconfiguration(ctx context.Context) error {
 	if len(c.configHistory) > 1 {
 		previousTerminal = c.configHistory[len(c.configHistory)-1].start - 1
 	}
+	if expectedAbortSlot != nil {
+		actual, err := c.abortRevisionLocked()
+		if err != nil {
+			c.mu.RUnlock()
+			c.releasePipeline()
+			return err
+		}
+		if actual != *expectedAbortSlot {
+			c.mu.RUnlock()
+			c.releasePipeline()
+			return fmt.Errorf("reconfiguration abort revision %d does not match expected %d", actual, *expectedAbortSlot)
+		}
+	}
+	if expectedTarget != nil && (state == nil || !sameCluster(state.target, *expectedTarget)) {
+		c.mu.RUnlock()
+		c.releasePipeline()
+		return fmt.Errorf("reconfiguration target no longer matches the requested round")
+	}
 	c.mu.RUnlock()
 	if state == nil {
 		c.releasePipeline()
@@ -85,6 +168,10 @@ func (c *Core) FinishReconfiguration(ctx context.Context) error {
 			return err
 		}
 		return fmt.Errorf("reconfiguration is not frozen")
+	}
+	if abort && !reconfigurationAdds(c.clusterForSlot(state.freeze), state.target) {
+		c.releasePipeline()
+		return fmt.Errorf("only a pending addition may be aborted")
 	}
 	c.releasePipeline()
 	if _, err := c.completeDecision(ctx, state.freeze, true); err != nil {
@@ -106,7 +193,7 @@ func (c *Core) FinishReconfiguration(ctx context.Context) error {
 	if !ok {
 		return fmt.Errorf("reconfiguration drain prefix is unavailable")
 	}
-	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix})
+	value, err := encodeReconfiguration(reconfigurationValue{Terminal: true, Abort: abort, Freeze: state.freeze, TerminalSlot: state.terminal, Target: cloneCluster(state.target), PrefixHash: prefix})
 	if err != nil {
 		return err
 	}
@@ -185,6 +272,19 @@ func validateReconfigurationTarget(current, target Cluster, retiredIDs map[NodeI
 	return nil
 }
 
+// ValidateReconfigurationTarget checks a proposed next configuration against
+// the active cluster and retired identities without changing Core state.
+func (c *Core) ValidateReconfigurationTarget(target Cluster) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	current := c.clusterForSlotLocked(c.tip + 1)
+	retired := make(map[NodeID]struct{}, len(c.retiredIDs))
+	for id := range c.retiredIDs {
+		retired[id] = struct{}{}
+	}
+	return validateReconfigurationTarget(current, target, retired)
+}
+
 func (c *Core) applyReconfigurationLocked(decision Decision) error {
 	control, ok, err := decodeReconfiguration(decision.Proposal.Value)
 	if err != nil {
@@ -222,6 +322,18 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 			return fmt.Errorf("terminal quorum does not bind its freeze")
 		}
 	}
+	if control.Abort {
+		if !reconfigurationAdds(c.clusterForSlotLocked(decision.Slot), state.target) {
+			return fmt.Errorf("only a pending addition may be aborted")
+		}
+		freeze, ok := c.decided[state.freeze]
+		if !ok {
+			return fmt.Errorf("abort terminal has no freeze decision")
+		}
+		c.lastAbort = &ConfigTransition{Freeze: cloneDecidedValue(freeze), Terminal: DecidedValue{Slot: decision.Slot, Hash: decision.Proposal.Hash, Value: append([]byte(nil), decision.Proposal.Value...), Certificate: append([]byte(nil), c.decided[decision.Slot].Certificate...)}}
+		c.reconfiguration = nil
+		return nil
+	}
 	old := c.clusterForSlotLocked(decision.Slot)
 	for id := range old.MemberSet() {
 		if _, kept := state.target.MemberSet()[id]; !kept {
@@ -229,6 +341,7 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 		}
 	}
 	c.configHistory = append(c.configHistory, configEpoch{start: state.terminal + 1, cluster: cloneCluster(state.target)})
+	c.lastAbort = nil
 	clear(c.epochStart)
 	clear(c.timings)
 	c.reconfiguration = nil

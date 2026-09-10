@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"sync"
 	"time"
 
@@ -32,20 +33,42 @@ const (
 
 // PeerServer owns the private QUIC listener. Public HTTP remains a separate adapter.
 type PeerServer struct {
-	listener    *quic.EarlyListener
-	server      *Server
-	members     map[quepaxa.NodeID]quepaxa.Member
-	token       string
-	connections chan struct{}
-	streams     chan struct{}
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	listener       *quic.EarlyListener
+	server         *Server
+	members        map[quepaxa.NodeID]quepaxa.Member
+	token          string
+	connections    chan struct{}
+	streams        chan struct{}
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	closeOnce      sync.Once
+	closeErr       error
+	closeTransport func() error
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
-	return startPeerServer(ctx, server, members, token, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
-		return quic.ListenAddrEarly(addr, tlsConfig, config)
+	var conn net.PacketConn
+	var transport *quic.Transport
+	peer, err := startPeerServer(ctx, server, members, token, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
+		var err error
+		conn, err = net.ListenPacket("udp", addr)
+		if err != nil {
+			return nil, err
+		}
+		transport = &quic.Transport{Conn: conn}
+		return transport.ListenEarly(tlsConfig, config)
 	})
+	if err != nil {
+		if transport != nil {
+			_ = transport.Close()
+		}
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, err
+	}
+	peer.closeTransport = func() error { return errors.Join(transport.Close(), conn.Close()) }
+	return peer, nil
 }
 
 // StartPeerServerOnTransport serves on an already-bound QUIC transport. The
@@ -118,10 +141,17 @@ func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, vo
 }
 
 func (s *PeerServer) Close() error {
-	s.cancel()
-	err := s.listener.Close()
-	s.wg.Wait()
-	return err
+	s.closeOnce.Do(func() {
+		s.cancel()
+		s.closeErr = s.listener.Close()
+		s.wg.Wait()
+		// Listener.Close leaves established QUIC handlers alive. Explicitly
+		// release sockets we own so the next process can bind immediately.
+		if s.closeTransport != nil {
+			s.closeErr = errors.Join(s.closeErr, s.closeTransport())
+		}
+	})
+	return s.closeErr
 }
 
 func (s *PeerServer) Addr() string { return s.listener.Addr().String() }
@@ -357,6 +387,14 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 		}
 		if !matchesWALIdentity(s.server.core.WALIdentity(), request.Value) {
 			return nil, fmt.Errorf("learner WAL identity mismatch")
+		}
+		// The authenticated voter supplies a certified prefix; learner admission
+		// must not depend on a background poll racing the terminal proposal.
+		if s.server.core.Tip() < quepaxa.Slot(request.From) && s.server.transport == nil {
+			return nil, fmt.Errorf("learner prefix source is unavailable")
+		}
+		if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), quepaxa.Slot(request.From), true); err != nil {
+			return nil, err
 		}
 		var expected quepaxa.ValueHash
 		copy(expected[:], request.Hash)

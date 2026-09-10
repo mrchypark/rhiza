@@ -21,6 +21,7 @@ const (
 	archiveCRCSize   = 4
 	headHasBase      = 1
 	headSealed       = 2
+	headHasAnchor    = 4
 )
 
 func archiveDecisionSize(decision quepaxa.DecidedValue) int {
@@ -119,21 +120,38 @@ func encodeHead(head archiveHead) ([]byte, error) {
 		flags |= headSealed
 	}
 	if head.Base != 0 {
-		if head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix {
-			return nil, fmt.Errorf("archive head base is incomplete")
+		if head.BaseAnchor != nil {
+			if head.BaseAnchor.Hash == ([32]byte{}) || head.BaseSeal != nil || head.BaseDecision != nil {
+				return nil, fmt.Errorf("archive head anchor is incomplete")
+			}
+			decisionData = head.BaseAnchor.Hash[:]
+			flags |= headHasAnchor
+		} else {
+			if head.BaseSeal == nil || head.BaseDecision == nil || head.BaseSeal.Index != head.Base || head.BaseSeal.PrefixHash != head.BasePrefix {
+				return nil, fmt.Errorf("archive head base is incomplete")
+			}
+			var err error
+			sealData, err = quepaxa.EncodeCheckpointSeal(*head.BaseSeal)
+			if err != nil {
+				return nil, err
+			}
+			decisionData, err = encodeBaseDecision(*head.BaseDecision)
+			if err != nil {
+				return nil, err
+			}
+			flags |= headHasBase
 		}
-		var err error
-		sealData, err = quepaxa.EncodeCheckpointSeal(*head.BaseSeal)
-		if err != nil {
-			return nil, err
-		}
-		decisionData, err = encodeBaseDecision(*head.BaseDecision)
-		if err != nil {
-			return nil, err
-		}
-		flags |= headHasBase
-	} else if head.BaseSeal != nil || head.BaseDecision != nil || head.BasePrefix != ([32]byte{}) {
+	} else if head.BaseSeal != nil || head.BaseDecision != nil || head.BaseAnchor != nil || head.BasePrefix != ([32]byte{}) {
 		return nil, fmt.Errorf("archive head has payload without base")
+	}
+	if head.LineageAnchor != nil {
+		if head.LineageAnchor.Hash == ([32]byte{}) || head.BaseAnchor != nil && head.LineageAnchor.Hash != head.BaseAnchor.Hash {
+			return nil, fmt.Errorf("archive head lineage anchor is incomplete")
+		}
+		if head.BaseAnchor == nil {
+			decisionData = append(decisionData, head.LineageAnchor.Hash[:]...)
+			flags |= headHasAnchor
+		}
 	}
 	size := headHeaderSize + len(sealData) + len(decisionData) + archiveCRCSize
 	if size > maxHeadSize {
@@ -166,7 +184,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 		return archiveHead{}, fmt.Errorf("invalid archive head header")
 	}
 	flags := binary.BigEndian.Uint32(data[12:16])
-	if flags & ^uint32(headHasBase|headSealed) != 0 {
+	if flags & ^uint32(headHasBase|headSealed|headHasAnchor) != 0 {
 		return archiveHead{}, fmt.Errorf("unknown archive head flags")
 	}
 	stored := binary.BigEndian.Uint32(data[len(data)-archiveCRCSize:])
@@ -187,13 +205,27 @@ func decodeHead(data []byte) (archiveHead, error) {
 	if sealLen > end-offset || decisionLen > end-offset-sealLen || offset+sealLen+decisionLen != end {
 		return archiveHead{}, fmt.Errorf("invalid archive head payload length")
 	}
-	if flags&headHasBase == 0 {
+	if flags&headHasBase == 0 && flags&headHasAnchor == 0 {
 		if head.Base != 0 || sealLen != 0 || decisionLen != 0 || head.BasePrefix != ([32]byte{}) {
 			return archiveHead{}, fmt.Errorf("invalid archive head without base")
 		}
+	} else if flags&headHasAnchor != 0 && flags&headHasBase == 0 {
+		if head.Base == 0 || head.BasePrefix == ([32]byte{}) || sealLen != 0 || decisionLen != sha256.Size {
+			return archiveHead{}, fmt.Errorf("invalid archive anchor base")
+		}
+		var hash [32]byte
+		copy(hash[:], data[offset:offset+decisionLen])
+		head.BaseAnchor, head.LineageAnchor = &archiveAnchorRef{Hash: hash}, &archiveAnchorRef{Hash: hash}
 	} else {
 		if head.Base == 0 || head.BasePrefix == ([32]byte{}) || sealLen == 0 || decisionLen == 0 {
 			return archiveHead{}, fmt.Errorf("invalid archive head recovery base")
+		}
+		baseDecisionLen := decisionLen
+		if flags&headHasAnchor != 0 {
+			if baseDecisionLen <= sha256.Size {
+				return archiveHead{}, fmt.Errorf("invalid archive lineage anchor")
+			}
+			baseDecisionLen -= sha256.Size
 		}
 		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(data[offset : offset+sealLen])
 		if err != nil {
@@ -203,13 +235,19 @@ func decodeHead(data []byte) (archiveHead, error) {
 			return archiveHead{}, fmt.Errorf("archive base payload is not a checkpoint seal")
 		}
 		offset += sealLen
-		decision, err := decodeBaseDecision(data[offset : offset+decisionLen])
+		decision, err := decodeBaseDecision(data[offset : offset+baseDecisionLen])
 		if err != nil {
 			return archiveHead{}, err
 		}
 		head.BaseSeal, head.BaseDecision = &seal, &decision
 		if seal.Index != head.Base || seal.PrefixHash != head.BasePrefix {
 			return archiveHead{}, fmt.Errorf("archive recovery base does not match head")
+		}
+		if flags&headHasAnchor != 0 {
+			offset += baseDecisionLen
+			var hash [32]byte
+			copy(hash[:], data[offset:offset+sha256.Size])
+			head.LineageAnchor = &archiveAnchorRef{Hash: hash}
 		}
 	}
 	if head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) || (head.TailHash == ([32]byte{})) != (head.TailObject == 0) || head.TailObject > head.Generation {

@@ -42,6 +42,8 @@ type ExecutionConfig struct {
 	PeerAddr                      string                   `json:"peer_addr"`
 	AdminToken                    string                   `json:"admin_token"`
 	Members                       []NodeConfig             `json:"members"`
+	EnableReconfiguration         bool                     `json:"enable_reconfiguration,omitempty"`
+	Learner                       *NodeConfig              `json:"learner,omitempty"`
 	LocalGraphNodePropertyIndexes []GraphNodePropertyIndex `json:"local_graph_node_property_indexes,omitempty"`
 
 	// Object store configuration
