@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import http.client
 from pathlib import Path
 import socket
 import subprocess
@@ -63,7 +64,7 @@ class Chaos:
                 value = predicate()
                 if value:
                     return value
-            except (RuntimeError, urllib.error.URLError, TimeoutError, ValueError, KeyError) as exc:
+            except (RuntimeError, OSError, http.client.HTTPException, ValueError, KeyError) as exc:
                 last = str(exc)
             time.sleep(0.5)
         raise AssertionError(f"timeout: {label}; last={last}")
@@ -126,7 +127,9 @@ class Chaos:
     def runtime(self, pod):
         obj = self.get("pod", pod)
         statuses = obj["status"].get("containerStatuses", [])
-        item = next(s for s in statuses if s["name"] == "rhiza")
+        item = next((s for s in statuses if s["name"] == "rhiza" and s.get("state", {}).get("running")), None)
+        if item is None:
+            raise RuntimeError("rhiza container is not running")
         cid = item["containerID"].split("://", 1)[1]
         info = json.loads(self.command(["docker", "exec", self.node, "crictl", "inspect", cid]))
         return obj["metadata"]["uid"], cid, int(info["info"]["pid"])
@@ -189,7 +192,7 @@ class Chaos:
                     self.execute("rhiza-0", f"chaos-write-{i}", f"INSERT INTO chaos_items VALUES ({i}, 'acknowledged')")
                     self.acks.add(i)
                     i += 1
-                except (RuntimeError, urllib.error.URLError, TimeoutError, ValueError):
+                except (RuntimeError, OSError, http.client.HTTPException, ValueError):
                     pass  # Retry the same request ID after the injected fault.
                 self.stop.wait(0.15)
         self.writer = threading.Thread(target=write, daemon=True)
@@ -219,7 +222,10 @@ class Chaos:
                 subject["namespace"] = self.ns
         self.apply(rbac)
         fixture = resources(self.ns, self.args.db_image, self.args.operator_image)
-        self.apply(fixture)
+        workloads = [o for o in fixture if o["kind"] == "StatefulSet" or o["metadata"]["name"] == "rhiza-operator"]
+        self.apply([o for o in fixture if o not in workloads])
+        self.k("wait", "--for=condition=Complete", "job/rhiza-create-bucket", "--timeout=180s")
+        self.apply(workloads)
         config = self.get("configmap", "rhiza-config")["data"]
         self.members = json.loads(config["RHIZA_CLUSTER_MEMBERS"])
         self.k("rollout", "status", "deployment/rhiza-operator", "--timeout=180s")
