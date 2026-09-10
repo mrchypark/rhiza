@@ -378,6 +378,7 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 		return GenerationAnchor{}, fmt.Errorf("source materialization prefix mismatch")
 	}
 	targetCP := checkpoint.NewManager(bucket, targetPrefix, "", 1)
+
 	checkpointFiles, index, cleanup, err := material.CheckpointFilesAt(ctx)
 	if err != nil {
 		return GenerationAnchor{}, err

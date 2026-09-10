@@ -111,7 +111,6 @@ source durability and explicit data-loss policy still apply. It never recycles a
 lost WAL identity or invents quorum. The supplied executor is CI-only for
 single-node kind and dedicated MinIO; production needs a trusted executor for
 its actual runtime and storage environment.
-
 ## Archive identity decision
 
 Keep the archive's configured identity and its HEAD/extent equality checks.

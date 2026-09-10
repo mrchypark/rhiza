@@ -427,6 +427,7 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			if err != nil || sourceFingerprint(r.Spec.SourceClusterID, r.Status.SourceDurability, sourceMembers, sourcePrefix) != r.Status.SourceMembership {
 				return c.record(ctx, r, "Blocked", "source configuration changed before activation")
 			}
+
 			reconfiguration, err := reconfigurationEnabled(env)
 			if err != nil {
 				return c.record(ctx, r, "Blocked", err.Error())

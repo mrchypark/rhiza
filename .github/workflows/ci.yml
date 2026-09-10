@@ -98,7 +98,6 @@ jobs:
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
-
   membership-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
