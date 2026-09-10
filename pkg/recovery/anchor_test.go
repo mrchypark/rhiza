@@ -252,6 +252,24 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	if _, err := Fork(ctx, bucket, cOptions); err != nil {
 		t.Fatalf("B to C retry: %v", err)
 	}
+	// Model interruption after anchor/head publication but before result commit.
+	if err := bucket.Delete(ctx, forkResultKey("third-generation")); err != nil {
+		t.Fatal(err)
+	}
+	if resumed, err := Fork(ctx, bucket, cOptions); err != nil || resumed != cResult {
+		t.Fatalf("resume incomplete B to C result: %+v %v", resumed, err)
+	}
+	// Model interruption after CURRENT publication but before anchor/head/result.
+	// The retry must compare the rebuilt checkpoint bytes to CURRENT rather than
+	// acquiring a normal publisher slot above C's fixed generation tip.
+	for _, key := range []string{forkResultKey("third-generation"), GenerationAnchorKey("third-generation"), forkKey("third-generation", "archive/head.bin")} {
+		if err := bucket.Delete(ctx, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if resumed, err := Fork(ctx, bucket, cOptions); err != nil || resumed != cResult {
+		t.Fatalf("resume pre-anchor B to C result: %+v %v", resumed, err)
+	}
 	cAnchor, _, err := ReadGenerationAnchor(ctx, bucket, "third-generation")
 	if err != nil {
 		t.Fatal(err)

@@ -49,7 +49,10 @@ func ReadGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix st
 	data, readErr := io.ReadAll(io.LimitReader(r, maxHeadSize+1))
 	closeErr := r.Close()
 	if readErr != nil || closeErr != nil || len(data) > maxHeadSize {
-		return GenerationAnchor{}, [32]byte{}, fmt.Errorf("read generation anchor")
+		if readErr != nil {
+			return GenerationAnchor{}, [32]byte{}, fmt.Errorf("read generation anchor: %w", readErr)
+		}
+		return GenerationAnchor{}, [32]byte{}, fmt.Errorf("read generation anchor: %w", closeErr)
 	}
 	var anchor GenerationAnchor
 	if err := json.Unmarshal(data, &anchor); err != nil {
@@ -242,6 +245,11 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 	if err != nil || hex.EncodeToString(headHash[:]) != result.ManifestHash {
 		return GenerationAnchor{}, fmt.Errorf("materialization source manifest does not match result")
 	}
+	if anchor, ok, err := resumeMaterializedGeneration(ctx, bucket, result, sourcePrefix, targetPrefix, operationID, sourceBootstrap, targetMembership); err != nil {
+		return GenerationAnchor{}, err
+	} else if ok {
+		return anchor, nil
+	}
 	seal, decision, hasCheckpoint := snapshot.RecoveryBase()
 	sourceCP := checkpoint.NewManager(bucket, sourcePrefix, "", 1)
 	var root *checkpoint.Checkpoint
@@ -370,11 +378,6 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 		return GenerationAnchor{}, fmt.Errorf("source materialization prefix mismatch")
 	}
 	targetCP := checkpoint.NewManager(bucket, targetPrefix, "", 1)
-	claim, err := targetCP.AcquirePublisherClaim(ctx, "generation-"+shortHash(operationID), 0, forkLease)
-	if err != nil {
-		return GenerationAnchor{}, err
-	}
-	defer targetCP.ReleasePublisherClaim(context.Background(), claim)
 	checkpointFiles, index, cleanup, err := material.CheckpointFilesAt(ctx)
 	if err != nil {
 		return GenerationAnchor{}, err
@@ -387,16 +390,35 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 	for _, file := range checkpointFiles {
 		sources = append(sources, checkpoint.Source{Role: string(file.Role), Path: file.Path})
 	}
-	targetRoot, err := targetCP.CreateFiles(ctx, claim, sources, index)
-	if err != nil {
+	if err := targetCP.Load(ctx); err != nil {
 		return GenerationAnchor{}, err
 	}
-	claim, err = targetCP.BindPublisherClaim(ctx, claim, index, targetRoot.RootHash, forkLease)
-	if err != nil {
-		return GenerationAnchor{}, err
-	}
-	if err := targetCP.PromoteCertifiedCurrent(ctx, targetRoot); err != nil {
-		return GenerationAnchor{}, err
+	targetRoot := targetCP.Latest()
+	if targetRoot != nil {
+		if targetRoot.Index != index {
+			return GenerationAnchor{}, fmt.Errorf("target checkpoint CURRENT does not match materialized tip")
+		}
+		matches, err := checkpointSourcesMatch(ctx, targetCP, targetRoot, sources)
+		if err != nil || !matches {
+			return GenerationAnchor{}, fmt.Errorf("target checkpoint CURRENT does not match materialized state")
+		}
+	} else {
+		claim, err := targetCP.AcquireGenerationClaim(ctx, "generation-"+shortHash(operationID), index, forkLease)
+		if err != nil {
+			return GenerationAnchor{}, err
+		}
+		defer targetCP.ReleasePublisherClaim(context.Background(), claim)
+		targetRoot, err = targetCP.CreateFiles(ctx, claim, sources, index)
+		if err != nil {
+			return GenerationAnchor{}, err
+		}
+		claim, err = targetCP.BindPublisherClaim(ctx, claim, index, targetRoot.RootHash, forkLease)
+		if err != nil {
+			return GenerationAnchor{}, err
+		}
+		if err := targetCP.PromoteCertifiedCurrent(ctx, targetRoot); err != nil {
+			return GenerationAnchor{}, err
+		}
 	}
 	bootstrap, err := bootstrapHash(sourceBootstrap)
 	if err != nil {
@@ -423,4 +445,102 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 		return GenerationAnchor{}, err
 	}
 	return anchor, nil
+}
+
+func checkpointSourcesMatch(ctx context.Context, manager *checkpoint.Manager, root *checkpoint.Checkpoint, sources []checkpoint.Source) (bool, error) {
+	dir, err := os.MkdirTemp("", "rhiza-generation-current-*")
+	if err != nil {
+		return false, err
+	}
+	defer os.RemoveAll(dir)
+	files, err := manager.DownloadAndVerifyRootFiles(ctx, root, dir)
+	if err != nil || len(files) != len(sources) {
+		return false, err
+	}
+	want := make(map[string]string, len(sources))
+	for _, source := range sources {
+		want[source.Role] = source.Path
+	}
+	for _, file := range files {
+		source, ok := want[file.Role]
+		if !ok {
+			return false, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		left, err := os.Open(source)
+		if err != nil {
+			return false, err
+		}
+		leftHash := sha256.New()
+		_, leftErr := io.Copy(leftHash, left)
+		leftCloseErr := left.Close()
+		if leftErr != nil || leftCloseErr != nil {
+			if leftErr != nil {
+				return false, leftErr
+			}
+			return false, leftCloseErr
+		}
+		right, err := os.Open(file.Path)
+		if err != nil {
+			return false, err
+		}
+		rightHash := sha256.New()
+		_, rightErr := io.Copy(rightHash, right)
+		rightCloseErr := right.Close()
+		if rightErr != nil || rightCloseErr != nil {
+			if rightErr != nil {
+				return false, rightErr
+			}
+			return false, rightCloseErr
+		}
+		if !bytes.Equal(leftHash.Sum(nil), rightHash.Sum(nil)) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// resumeMaterializedGeneration recognizes the durable point after target root
+// and anchor publication. Replaying from the source here would try to acquire
+// an obsolete publisher floor and could overwrite a fenced target generation.
+func resumeMaterializedGeneration(ctx context.Context, bucket objstore.Bucket, result ForkResult, sourcePrefix, targetPrefix, operationID string, sourceBootstrap quepaxa.Cluster, targetMembership MembershipRecord) (GenerationAnchor, bool, error) {
+	anchor, anchorHash, err := ReadGenerationAnchor(ctx, bucket, targetPrefix)
+	if bucket.IsObjNotFoundErr(err) {
+		return GenerationAnchor{}, false, nil
+	}
+	if err != nil {
+		return GenerationAnchor{}, false, err
+	}
+	bootstrap, err := bootstrapHash(sourceBootstrap)
+	if err != nil || anchor.OperationID != operationID || anchor.SourcePrefix != sourcePrefix || anchor.TargetPrefix != targetPrefix || anchor.SourceManifest != result.ManifestHash || anchor.SourceTip != result.Tip || anchor.SourceBootstrap != bootstrap || anchor.TargetMembership != targetMembership || result.PrefixHash != "" && anchor.SourcePrefixHash != result.PrefixHash {
+		return GenerationAnchor{}, false, fmt.Errorf("published generation anchor does not match fork request")
+	}
+	intent, present, err := readForkIntent(ctx, bucket, targetPrefix)
+	targetHash, hashErr := membershipHash(targetMembership)
+	if err != nil || !present || intent.Version != 2 || intent.OperationID != operationID || intent.SourcePrefix != sourcePrefix || intent.TargetPrefix != targetPrefix || intent.ManifestHash != result.ManifestHash || intent.SourceBootstrapHash != bootstrap || hashErr != nil || intent.TargetMembershipHash != targetHash {
+		return GenerationAnchor{}, false, fmt.Errorf("published generation anchor does not match fork intent")
+	}
+	pin, err := PinGenerationAnchor(ctx, bucket, targetPrefix, "resume-"+shortHash(operationID), forkLease)
+	if err != nil {
+		return GenerationAnchor{}, false, fmt.Errorf("verify published generation root: %w", err)
+	}
+	defer closeRootPin(pin.RecoveryPin)
+	prefix, err := parseGenerationHash(anchor.SourcePrefixHash)
+	if err != nil {
+		return GenerationAnchor{}, false, err
+	}
+	target := NewManager(bucket, targetPrefix, 1)
+	defer target.Close()
+	if err := target.Load(ctx); err != nil {
+		return GenerationAnchor{}, false, err
+	}
+	if err := target.InitializeFencedGeneration(ctx, quepaxa.Slot(anchor.SourceTip), prefix, anchorHash); err != nil {
+		return GenerationAnchor{}, false, err
+	}
+	if got, ok := target.GenerationAnchor(); !ok || got != anchorHash {
+		return GenerationAnchor{}, false, fmt.Errorf("published target archive does not match generation anchor")
+	}
+	return anchor, true, nil
 }

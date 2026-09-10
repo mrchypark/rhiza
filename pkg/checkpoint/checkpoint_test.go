@@ -27,6 +27,60 @@ type getCountingBucket struct {
 	uploads   atomic.Uint64
 }
 
+func TestGenerationClaimRetriesFixedIndexWithoutRegressingPublisher(t *testing.T) {
+	ctx := context.Background()
+	legacyBucket := objstore.NewInMemBucket()
+	legacy := NewManager(legacyBucket, "legacy", "", 1)
+	legacyRoot := createFiles(t, legacy, ctx, []Source{source(t, RoleSQLite, "legacy")}, 1)
+	if err := legacy.PromoteCertifiedCurrent(ctx, legacyRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyBucket.Delete(ctx, "legacy/checkpoint/PUBLISHER"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.AcquireGenerationClaim(ctx, "operation", 1, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("legacy CURRENT admitted generation claim=%v", err)
+	}
+	manager := NewManager(objstore.NewInMemBucket(), "generation", "", 1)
+	first, err := manager.AcquireGenerationClaim(ctx, "operation", 1, time.Minute)
+	if err != nil || first.ReservedIndex != 1 {
+		t.Fatalf("first generation claim=%+v err=%v", first, err)
+	}
+	if err := manager.ReleasePublisherClaim(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.AcquireGenerationClaim(ctx, "operation", 1, time.Minute)
+	if err != nil || second.Generation != first.Generation+1 || second.ReservedIndex != 1 {
+		t.Fatalf("retry generation claim=%+v err=%v", second, err)
+	}
+	root := sha256.Sum256([]byte("generation-root"))
+	if _, err := manager.BindPublisherClaim(ctx, first, 1, root, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("stale generation claim bind=%v", err)
+	}
+	if _, err := manager.AcquireGenerationClaim(ctx, "other-operation", 1, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("active different owner=%v", err)
+	}
+	if err := manager.ReleasePublisherClaim(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AcquireGenerationClaim(ctx, "other-operation", 1, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("different owner takeover=%v", err)
+	}
+	if _, err := manager.AcquireGenerationClaim(ctx, "operation", 2, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("different index retry=%v", err)
+	}
+	publisher, err := manager.AcquirePublisherClaim(ctx, "normal", 0, time.Minute)
+	if err != nil || publisher.ReservedIndex != 2 {
+		t.Fatalf("normal publisher=%+v err=%v", publisher, err)
+	}
+	if err := manager.ReleasePublisherClaim(ctx, publisher); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AcquireGenerationClaim(ctx, "operation", 1, time.Minute); !errors.Is(err, ErrPublisherFenced) {
+		t.Fatalf("generation regressed normal publisher=%v", err)
+	}
+}
+
 type blockingIterBucket struct {
 	objstore.Bucket
 	started  chan struct{}

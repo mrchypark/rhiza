@@ -181,6 +181,57 @@ func (m *Manager) AcquirePublisherClaim(ctx context.Context, owner string, minEx
 	return m.acquireClaim(ctx, owner, minExclusive, lease, "publisher")
 }
 
+// AcquireGenerationClaim reserves one externally fenced recovery index. Unlike
+// consensus publishers it never advances that index on a retry. A generation
+// claim may only succeed in an empty checkpoint namespace or after an earlier
+// claim for the same operation has expired.
+func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, index uint64, lease time.Duration) (*PublisherClaim, error) {
+	if owner == "" || index == 0 || lease <= 0 {
+		return nil, fmt.Errorf("generation owner, index, and positive lease are required")
+	}
+	if err := m.refreshCertifiedCurrent(ctx); err != nil {
+		return nil, err
+	}
+	currentRoot := m.Latest()
+	key := m.key("checkpoint/PUBLISHER")
+	for range 4 {
+		current, err := m.readPublisherClaim(objmetrics.WithExpectedNotFound(ctx))
+		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			return nil, err
+		}
+		now := time.Now()
+		generation := uint64(1)
+		options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
+		if err == nil {
+			if current.Purpose != "generation" || current.OwnerID != owner || current.BoundIndex > index || current.ReservedIndex != index {
+				return nil, ErrPublisherFenced
+			}
+			if currentRoot != nil && (currentRoot.Index != index || current.BoundIndex != index) {
+				return nil, ErrPublisherFenced
+			}
+			if current.LeaseUntilMS > now.UnixMilli() {
+				return nil, ErrPublisherBusy
+			}
+			if current.Generation == ^uint64(0) {
+				return nil, fmt.Errorf("checkpoint publisher generation exhausted")
+			}
+			generation = current.Generation + 1
+			options = []objstore.ObjectUploadOption{objstore.WithIfMatch(current.version)}
+		} else if currentRoot != nil {
+			return nil, ErrPublisherFenced
+		}
+		claim := &PublisherClaim{ConfigID: m.configID, Generation: generation, OwnerID: owner, Purpose: "generation", ReservedIndex: index, LeaseUntilMS: now.Add(lease).UnixMilli()}
+		if err := m.uploadPublisherClaim(ctx, key, claim, options...); err != nil {
+			if m.bucket.IsConditionNotMetErr(err) {
+				continue
+			}
+			return nil, err
+		}
+		return m.readPublisherClaim(ctx)
+	}
+	return nil, ErrPublisherBusy
+}
+
 // acquireMaintenanceClaim serializes the root/block sweep with checkpoint
 // publication. It deliberately does not reserve a consensus slot.
 func (m *Manager) acquireMaintenanceClaim(ctx context.Context, owner string, lease time.Duration) (*PublisherClaim, error) {
@@ -241,7 +292,7 @@ func (m *Manager) BindPublisherClaim(ctx context.Context, claim *PublisherClaim,
 	if err != nil {
 		return nil, err
 	}
-	if claim == nil || current.Purpose != "publisher" || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() || index < current.ReservedIndex {
+	if claim == nil || (current.Purpose != "publisher" && current.Purpose != "generation") || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() || index < current.ReservedIndex || current.Purpose == "generation" && index != current.ReservedIndex {
 		return nil, ErrPublisherFenced
 	}
 	current.BoundIndex, current.RootHash, current.LeaseUntilMS = index, hex.EncodeToString(root[:]), time.Now().Add(lease).UnixMilli()
@@ -332,7 +383,7 @@ func (m *Manager) readPublisherClaim(ctx context.Context) (*PublisherClaim, erro
 		if err := decodePersistedJSON(data, &claim); err != nil {
 			return nil, err
 		}
-		if claim.ConfigID != m.configID || claim.Generation == 0 || claim.OwnerID == "" || claim.Purpose != "publisher" && claim.Purpose != "maintenance" || claim.Purpose == "publisher" && claim.ReservedIndex == 0 {
+		if claim.ConfigID != m.configID || claim.Generation == 0 || claim.OwnerID == "" || claim.Purpose != "publisher" && claim.Purpose != "maintenance" && claim.Purpose != "generation" || (claim.Purpose == "publisher" || claim.Purpose == "generation") && claim.ReservedIndex == 0 {
 			return nil, fmt.Errorf("invalid checkpoint publisher claim")
 		}
 		claim.version = after.Version
@@ -500,7 +551,7 @@ func (m *Manager) validatePublisherLease(ctx context.Context, claim *PublisherCl
 		}
 		return err
 	}
-	if claim == nil || current.Purpose != "publisher" || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() {
+	if claim == nil || (current.Purpose != "publisher" && current.Purpose != "generation") || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() {
 		return ErrPublisherFenced
 	}
 	return nil
