@@ -86,7 +86,11 @@ class Chaos:
                                  "port-forward", "pod/" + pod, f"{port}:8080"], stdout=log, stderr=log)
         log.close()
         self.forwards[key] = (uid, proc, port)
-        self.wait("port forward " + pod, lambda: self.port_open(port), 15)
+        try:
+            self.wait("port forward " + pod, lambda: self.port_open(port), 15)
+        except AssertionError as exc:
+            proc.terminate()
+            raise RuntimeError(str(exc)) from exc
         return port
 
     @staticmethod
@@ -110,7 +114,9 @@ class Chaos:
         return self.http(pod, "/membership/status")
 
     def execute(self, pod, rid, sql):
-        return self.http(pod, "/sql/execute", {"request_id": rid, "sql": sql})
+        result = self.http(pod, "/sql/execute", {"request_id": rid, "sql": sql})
+        assert not result.get("error_code"), result
+        return result
 
     def ready(self, pod):
         return self.status(pod).get("voting") and any(
@@ -201,8 +207,13 @@ class Chaos:
         self.k("apply", "-f", str(root / "deploy/operator/crd.yaml"))
         self.k("wait", "--for=condition=Established", "crd/rhizarecoveries.rhiza.mrchypark.dev", "--timeout=60s")
         self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": self.ns}})
-        rbac = json.loads(self.command(["kubectl", "--context", self.context, "create", "--dry-run=client", "-f", str(root / "deploy/operator/rbac.yaml"), "-o", "json"]))
-        for obj in rbac["items"]:
+        raw = self.command(["kubectl", "--context", self.context, "create", "--dry-run=client", "-f", str(root / "deploy/operator/rbac.yaml"), "-o", "json"])
+        rbac = []
+        while raw.strip():
+            obj, end = json.JSONDecoder().raw_decode(raw.lstrip())
+            rbac.append(obj)
+            raw = raw.lstrip()[end:]
+        for obj in rbac:
             obj["metadata"]["namespace"] = self.ns
             for subject in obj.get("subjects", []):
                 subject["namespace"] = self.ns
