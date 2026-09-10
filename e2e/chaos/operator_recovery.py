@@ -170,7 +170,7 @@ class Chaos:
                 "removedPod": removed, "voterPods": [{"nodeID": p, "pod": p} for p in voters],
                 "replacementPod": learner, "replacementSecret": learner + "-credentials",
                 "fence": {"nodeID": removed, "walIdentity": nonce, "workloadUID": removed_uid,
-                          "confirmed": False, "evidence": ""}}}
+                          "confirmed": False, "evidence": "Awaiting explicit runtime fence verification"}}}
         self.apply({"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaRecovery",
                     "metadata": {"name": name, "namespace": self.ns}, "spec": spec})
         self.wait("unfenced request blocked", lambda: self.phase(name, "Blocked"))
@@ -302,7 +302,7 @@ class Chaos:
         self.wait("all old runtimes fenced", lambda: all(self.runtime_gone(uid) for uid in old_uids))
         sts_uid = self.get("statefulset", "rhiza")["metadata"]["uid"]
         fence = {"recoveryID": "whole-generation", "clusterID": "chaos-source", "statefulSetUID": sts_uid,
-                 "confirmed": False, "evidence": ""}
+                 "confirmed": False, "evidence": "Awaiting explicit runtime fence verification"}
         self.apply({"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaRecovery",
             "metadata": {"name": "whole-generation", "namespace": self.ns},
             "spec": {"statefulSet": "rhiza", "sourceClusterID": "chaos-source", "durability": "before-ack",
