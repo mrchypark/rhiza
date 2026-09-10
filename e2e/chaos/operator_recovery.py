@@ -149,7 +149,8 @@ class Chaos:
         return self.get("rhizarecovery", name)
 
     def phase(self, name, phase):
-        return self.cr(name).get("status", {}).get("membership", {}).get("phase") == phase
+        status = self.cr(name).get("status", {})
+        return status.get("membership", {}).get("phase", status.get("phase")) == phase
 
     def operator_restart(self):
         pod = json.loads(self.k("get", "pods", "-l", "app.kubernetes.io/name=rhiza-operator", "-o", "json"))["items"][0]
