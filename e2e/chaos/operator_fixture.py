@@ -82,7 +82,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
         },
         "type": "Opaque",
         "stringData": {
-            "RHIZA_OBJSTORE_ENDPOINT": "http://rhiza-minio:9000",
+            "RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000",
             "RHIZA_OBJSTORE_BUCKET": "rhiza",
             "RHIZA_OBJSTORE_ACCESS_KEY": _MINIO_ACCESS,
             "RHIZA_OBJSTORE_SECRET_KEY": _MINIO_SECRET,
