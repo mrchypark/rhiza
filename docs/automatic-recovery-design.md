@@ -310,3 +310,21 @@ operation ID로 결정되어 대상이 바뀐 재시도를 별도 작업으로 �
 CI의 `kind_fencer.py`는 이 계약을 실제 kind 런타임과 admission webhook으로 실행하는
 테스트 전용 구현이다. 단일 폐기형 노드와 독점 MinIO를 사용하며 공유 운영 클러스터에
 배포하는 node agent가 아니다. 운영 환경의 종료/저장소 격리 수단은 별도 연동이 필요하다.
+
+### 확인된 무인 CI 근거
+
+2026-09-11, candidate `ef65375`, CI run `34554367214`, job `103123753569`에서
+기본 무인 카오스 6개 시나리오가 최종 `PASS`를 기록했다.
+https://github.com/mrchypark/rhiza/actions/runs/34554367214/job/103123753569
+
+- 동일 Pod/WAL의 SIGKILL 재시작: 불필요한 fencing 없이 복귀.
+- emptyDir 유실: Operator가 voter fencing 요청과 learner 교체를 생성·완료.
+- 실행기 중단 중 복구 대기 및 Operator 재시작 후 동일 operation 재사용.
+- 실행기 재시작 후 완료된 구 voter identity의 admission 차단 유지.
+- 살아 있는 구 프로세스의 QUIC 단절: proof 전 새 세대 복구 금지.
+- generation fencing 이후 새 세대로 자동 복구: ACK 349행 전부 보존,
+  중복 요청 처리 유지 및 새 쓰기 성공.
+
+Operator가 fencing status를 갱신할 권한이 없음과 요청 spec의 API 불변성도 확인했다.
+이 결과는 단일 폐기형 kind 노드와 독점 MinIO에서의 실제 실행 근거다. 물리 호스트
+단절, 공유 운영 저장소의 credential fencing, 운영 node agent를 검증한 결과는 아니다.

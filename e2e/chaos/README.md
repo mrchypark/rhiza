@@ -58,3 +58,9 @@ The executor has disposable-cluster administrator/runtime access. These privileg
 are not added to the Operator, and the fixture is not a production shared-node
 fencing service. Never run this harness against a shared cluster. A final `PASS`
 event in the uploaded artifact is required to claim unattended qualification.
+
+The automatic harness also gates learner startup in the test StatefulSet template
+so UDP loss can be installed before membership admission. After the addition is
+frozen it deletes that learner; the Operator must fence it, abort the addition,
+provision a different identity, and complete recovery. The harness only releases
+the injected startup gate; it does not issue an abort or create the replacement.

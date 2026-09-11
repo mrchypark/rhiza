@@ -12,6 +12,28 @@ from kind_fencer import KindFencer
 
 
 class AutomaticChaos(Chaos):
+    def apply(self, objs):
+        # Hold only newly provisioned learners before the database starts. This
+        # gives the fault injector a deterministic window to install UDP loss.
+        for obj in objs if isinstance(objs, list) else [objs]:
+            if obj.get("kind") == "StatefulSet" and obj["metadata"]["name"] == "rhiza":
+                ctr = obj["spec"]["template"]["spec"]["containers"][0]
+                ctr["command"] = ["/bin/sh", "-ec"]
+                ctr["args"] = ['if [ -n "${RHIZA_LEARNER:-}" ]; then while [ ! -f /data/.chaos-start ]; do sleep 0.2; done; fi; exec /usr/local/bin/rhiza-entrypoint']
+        super().apply(objs)
+
+    def pending_learner(self, excluded=""):
+        pods = json.loads(self.k("get", "pods", "-l", "rhiza.mrchypark.dev/automatic-learner", "-o", "json"))["items"]
+        for pod in pods:
+            name = pod["metadata"]["name"]
+            if name != excluded:
+                self.runtime(name)
+                return name
+        return None
+
+    def start_learner(self, name):
+        self.k("exec", name, "-c", "rhiza", "--", "touch", "/data/.chaos-start")
+
     def cluster(self):
         return self.get("rhizacluster", "rhiza")
 
@@ -71,7 +93,18 @@ class AutomaticChaos(Chaos):
         assert self.fences()[0]["spec"]["operationID"] == operation
         self.event("automatic_executor_outage_restart_pass", operation=operation)
         self.executor.enabled = True
+        first_learner = self.wait("automatic learner provisioned", self.pending_learner, 240)
+        self.udp(first_learner, True)
+        self.start_learner(first_learner)
+        self.wait("automatic addition frozen", lambda: self.cr(operation).get("status", {}).get("membership", {}).get("add") and self.status("rhiza-0").get("pending"), 180)
+        first_uid = self.runtime(first_learner)[0]
+        self.k("delete", "pod", first_learner, "--wait=true")
+        fresh = self.wait("automatic failed learner abort and retry", lambda: self.pending_learner(first_learner), 300)
+        self.start_learner(fresh)
         self.wait("unattended online replacement", self.healthy, 360)
+        assert self.runtime_gone(first_uid)
+        assert self.status("rhiza-0")["abort_slot"] > 0
+        self.event("automatic_lost_learner_abort_retry_pass", old_learner=first_learner, new_learner=fresh, old_uid=first_uid)
         child = self.cr(operation)
         assert child["status"]["phase"] == "Complete"
         learner = child["spec"]["membership"]["replacementPod"]
@@ -116,7 +149,7 @@ class AutomaticChaos(Chaos):
         assert all(self.runtime_gone(uid) for uid in old_uids)
         self.event("automatic_generation_recovery_pass", acknowledged_rows=len(self.acks), recovered_rows=count,
                    target=child["status"]["target"], new_write=True, dedup_preserved=True)
-        self.event("PASS", scenarios=6, unattended=True)
+        self.event("PASS", scenarios=7, unattended=True)
 
     def cleanup(self):
         for kind in ("rhizaclusters","rhizafences"):
