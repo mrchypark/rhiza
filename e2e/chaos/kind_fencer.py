@@ -361,7 +361,7 @@ def _install_vwc(gateway_ip, port, ca_cert_path, context):
     }
     r = subprocess.run(
         ["kubectl", "--context", context, "apply", "-f", "-"],
-        input=json.dumps(vwc).encode(),
+        input=json.dumps(vwc),
         capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise RuntimeError(f"VWC install failed: {r.stderr}")
@@ -600,9 +600,10 @@ class KindFencer:
             self._wait_no_recreation(spec, merged_uids)
 
 
-            self._check_no_orphaned_containers(spec, merged_uids)
             self._quiesce_storage()
 
+
+            self._check_no_orphaned_containers(spec, merged_uids)
             proof = {
                 "operationID": op_id,
                 "sourceClusterID": spec["sourceClusterID"],
@@ -719,27 +720,31 @@ class KindFencer:
                         f"recreation detected: {pod['metadata']['name']}")
         _log("recreation denial confirmed")
 
-
     def _check_no_orphaned_containers(self, spec, verified_uids):
-        """CRI-vs-API check: no running container whose Pod is gone from API and not in verified set."""
+        """CRI-vs-API: raise if verified UID still running, or if namespace runtime UID absent from API."""
         ns = spec["namespace"]
         data = json.loads(self.chaos.command(
             ["docker", "exec", self.chaos.node, "crictl", "ps", "-a", "-o", "json"]))
         running = [c for c in data.get("containers", [])
                    if c.get("state") == "CONTAINER_RUNNING"
                    and c.get("labels", {}).get("io.kubernetes.pod.namespace") == ns]
+        for c in running:
+            pod_uid = c.get("labels", {}).get("io.kubernetes.pod.uid", "")
+            if not pod_uid:
+                continue
+            if pod_uid in verified_uids:
+                raise AssertionError(
+                    f"verified UID {pod_uid} still running in CRI after termination wait")
         if not running:
             return
         raw = self.chaos.k("get", "pods", "-n", ns, "-o", "json")
         api_uids = {p["metadata"]["uid"] for p in json.loads(raw).get("items", [])}
         for c in running:
             pod_uid = c.get("labels", {}).get("io.kubernetes.pod.uid", "")
-            if not pod_uid:
-                continue
-            if pod_uid in api_uids or pod_uid in verified_uids:
+            if not pod_uid or pod_uid in api_uids:
                 continue
             raise AssertionError(
-                f"orphaned CRI container: Pod UID {pod_uid} running but absent from API and verified set")
+                f"orphaned CRI container: Pod UID {pod_uid} running but absent from API")
     # ── storage quiesce ──────────────────────────────────────────────────
 
     def _quiesce_storage(self):
