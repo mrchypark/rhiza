@@ -19,7 +19,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	intent := state.Intent
 	block := func(message string) error { return c.autoStatus(ctx, r, state, "Blocked", message) }
 	if c.Fencer == nil {
-		return block("external fencing service is unavailable")
+		return block("fencing backend is unavailable")
 	}
 	if intent.Request.BindingUID != state.BindingUID || intent.Request.SourceClusterID != state.ActiveClusterID || intent.Request.StatefulSetUID != state.StatefulSetUID {
 		return block("recovery intent differs from durable binding")
@@ -30,15 +30,15 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		proof, err := c.fence(ctx, intent.Request)
 		if err != nil {
 			if errors.Is(err, ErrFencePending) {
-				return c.autoStatus(ctx, r, state, "Fencing", "waiting for external termination and recreation barrier")
+				return c.autoStatus(ctx, r, state, "Fencing", "waiting for verified termination and recreation barrier")
 			}
-			return block("external fencing did not return a valid completion proof")
+			return block("fencing backend did not return a valid completion proof")
 		}
 		intent.Proof = proof
 		if err := c.saveAuto(ctx, r, state, version); err != nil {
 			return err
 		}
-		return c.autoStatus(ctx, r, state, "Fenced", "external fencing proof persisted")
+		return c.autoStatus(ctx, r, state, "Fenced", "fencing backend proof persisted")
 	}
 	if err := validateFenceProof(intent.Request, intent.Proof); err != nil {
 		return block("persisted fencing proof is invalid")

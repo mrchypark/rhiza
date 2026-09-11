@@ -231,7 +231,7 @@ class _FenceHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        if self.path != WEBHOOK_PATH:
+        if urllib.parse.urlsplit(self.path).path != WEBHOOK_PATH:
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", 0))

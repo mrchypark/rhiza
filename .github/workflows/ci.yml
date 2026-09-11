@@ -54,6 +54,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Fencing executor regression checks
+        run: python3 e2e/chaos/kind_fencer_test.py
       - name: Build test images and Kubernetes cluster
         env:
           CGO_ENABLED: 0

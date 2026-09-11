@@ -19,7 +19,7 @@ import (
 )
 
 // ClusterResource opts an existing workload into unattended recovery. The
-// external fencing service is a trusted authority, configured by the operator
+// fencing backend is a trusted authority, configured by the operator
 // administrator rather than an arbitrary URL supplied by this resource.
 type ClusterResource struct {
 	APIVersion string         `json:"apiVersion"`
@@ -268,7 +268,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	}
 	if decision == AutoRecover {
 		if c.Fencer == nil {
-			return block(state, "external fencing service is not configured")
+			return block(state, "fencing backend is not configured")
 		}
 		if failed != "" && (state.Identities[failed].WALIdentity == "" || state.Identities[failed].PodUID == "") {
 			return block(state, "failed voter identity has not been authenticated")
