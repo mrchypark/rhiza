@@ -260,3 +260,53 @@ Kubernetes 공식 근거:
 미확정: 실제 배포 환경/fencing provider, 전용 노드 범위, 자동 takeover 유예,
 단일 voter 유실 때 계획 중단 허용 시간. 앞의 정책 값은 제안이며 합의된 기본값이 아니다.
 Pro 신규 상담은 지정 프로젝트 페이지 로딩 실패로 수행하지 못했다.
+
+## Fencing 소유권과 backend 경계 — 2026-09-11 결정
+
+Operator가 장애 판정, quorum 확인, fencing 범위 선정, immutable operation ID와
+identity 저널, 재시도 및 복구 상태 전환을 소유한다. `Fencer`는 그 요청을 실행하는
+경계이며 HTTP 서비스가 복구 정책을 결정하지 않는다. 현재 구현체는 HTTPS
+`FencingClient`이다. 독립 서비스 배포는 인터페이스의 필수 조건이 아니며, 동일한
+증거 계약을 만족하는 backend를 Operator 내부에 연결할 수 있다.
+
+모든 backend의 결과는 Operator에서 다시 검증한다. operation ID, source generation,
+binding UID 및 전체 요청 해시가 일치하고, 프로세스 종료·재생성 차단·저장소 작업
+정지가 모두 확인되어야 복구를 진행한다. 성공 응답이나 proof ID만으로 충분하지 않다.
+이 검증은 증거의 연결 관계를 확인하는 것이며, backend가 실제 격리를 수행했다는
+신뢰를 대신하지 않는다. backend별 실제 장애 주입 검증이 별도로 필요하다.
+
+현재 대상은 공유 Kubernetes 노드의 StatefulSet + emptyDir이다. Pod DELETE와
+admission 차단만으로 단절된 노드의 기존 프로세스 또는 이미 전송된 저장소 쓰기의
+종료를 증명할 수 없다. 관찰 가능한 Pod만 사라진 상태에서도 보이지 않는 프로세스가
+남을 수 있으므로 이를 완료 증거로 낮추지 않는다. Kubernetes backend를 추가하려면
+실제 런타임 종료와 재실행 차단, 저장소 quiescence를 확인할 수 있는 수단이 필요하다.
+확인할 수 없으면 pending/blocked로 남긴다. 공유 노드 전체의 전원 차단은 다른
+workload에 영향을 주므로 일반 Pod 복구의 기본 동작으로 삼지 않는다.
+
+현재 변경은 backend 경계와 검증 계약을 추가한 단계다. Kubernetes 전용 backend와
+자동 제어 루프의 무인 카오스 검증 완료를 의미하지 않는다.
+
+## Kubernetes backend 실행 계약
+
+`RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`를 설정하고
+`deploy/operator/cluster-crd.yaml`, `deploy/operator/fence-crd.yaml`, RBAC를 적용한다.
+HTTP backend는 `RHIZA_FENCER_BACKEND=http` 및 기존 URL/토큰/CA 설정으로 선택한다.
+
+Kubernetes backend는 `RhizaFence`에 고정된 요청을 생성한다. 요청 이름은 binding UID와
+operation ID로 결정되어 대상이 바뀐 재시도를 별도 작업으로 숨길 수 없다. CRD가 spec
+변경을 금지하며 backend도 전체 요청 해시를 비교한다. Operator의 권한은 요청 get/create
+뿐이다. 별도 실행 권한을 가진 실행기가 `/status`에 완료 증거를 기록해야 한다.
+이 요청 전달만으로 프로세스를 종료하지는 않는다. 실행기가 없거나 증거가 불완전하면
+자동 복구는 계속 대기한다. 배포 환경별 실행기는 동일 프로세스에 구현할 수도 있으나
+권한과 책임은 이 계약을 유지해야 한다.
+
+실행기는 요청을 영속화한 뒤 재생성 차단을 먼저 설정하고, 해당 voter/generation의
+실제 실행 중인 모든 incarnation을 조사·종료해야 한다. 관찰 목록인 targets만 믿고
+다른 incarnation을 누락해서는 안 된다. Pod 이름을 다시 해석한 늦은 종료 명령이
+새 generation을 중단하지 않도록 UID/컨테이너 ID를 고정한다. 저장소에 이미 전송된
+작업까지 정지한 뒤에만 완료 증거를 기록한다. 완료 이후에도 이전 identity의 재생성
+차단은 유지되어야 하므로 완료 CR 또는 barrier를 자동으로 삭제하지 않는다.
+
+CI의 `kind_fencer.py`는 이 계약을 실제 kind 런타임과 admission webhook으로 실행하는
+테스트 전용 구현이다. 단일 폐기형 노드와 독점 MinIO를 사용하며 공유 운영 클러스터에
+배포하는 node agent가 아니다. 운영 환경의 종료/저장소 격리 수단은 별도 연동이 필요하다.

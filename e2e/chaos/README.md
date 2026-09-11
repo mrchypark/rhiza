@@ -39,3 +39,22 @@ python3 -u e2e/chaos/operator_recovery.py
 The CI workflow contains the exact image and cluster setup commands. The harness
 creates namespace `rhiza-chaos`; delete the disposable cluster after collecting
 results. Do not run it against a shared cluster.
+
+## Unattended Kubernetes backend qualification
+
+`automatic-operator-chaos` runs `automatic_recovery.py` in a separate disposable
+kind cluster. It creates one automatic `RhizaCluster` policy, then injects faults.
+It never submits a `RhizaRecovery`, changes a recovery spec, provisions a learner,
+or manually approves fencing. The Operator creates those actions from its journal.
+
+The Kubernetes backend submits immutable `RhizaFence` requests. A test-only kind
+executor establishes admission, runtime and isolated storage barriers before
+reporting proof. Executor unavailability must leave recovery pending; restarting
+the Operator must reuse the same request. Scenarios cover intact WAL restart,
+Pod/WAL loss with online replacement, and QUIC partition of live old processes
+followed by generation recovery, acknowledged-row preservation and new writes.
+
+The executor has disposable-cluster administrator/runtime access. These privileges
+are not added to the Operator, and the fixture is not a production shared-node
+fencing service. Never run this harness against a shared cluster. A final `PASS`
+event in the uploaded artifact is required to claim unattended qualification.

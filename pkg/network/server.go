@@ -319,6 +319,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/metrics/object-store", s.handleObjectStoreStats)
 	s.mux.HandleFunc("/replica/status", s.handleReplicaStatus)
 	s.mux.HandleFunc("/recovery/status", s.handleVoterRecoveryStatus)
+	s.mux.HandleFunc("/recovery/probe", s.handleRecoveryProbe)
 	s.mux.HandleFunc("/membership/status", s.handleMembershipStatus)
 	s.mux.HandleFunc("/membership/change", s.handleMembershipChange)
 	s.mux.HandleFunc("/membership/abort", s.handleMembershipAbort)

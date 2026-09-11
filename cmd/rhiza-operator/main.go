@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -59,6 +61,35 @@ func run(ctx context.Context, namespace string, poll time.Duration) error {
 		Bucket:        bucket,
 		Prefix:        bucketConfig.Prefix,
 		HTTP:          &http.Client{Timeout: 30 * time.Second},
+	}
+
+	if os.Getenv("RHIZA_AUTOMATIC_RECOVERY") == "true" {
+		backend := os.Getenv("RHIZA_FENCER_BACKEND")
+		if backend == "kubernetes" {
+			controller.Fencer = &operator.KubernetesFencer{Kube: kube}
+		} else if backend == "" || backend == "http" {
+			endpoint, tokenFile := os.Getenv("RHIZA_FENCER_URL"), os.Getenv("RHIZA_FENCER_TOKEN_FILE")
+			if endpoint == "" || tokenFile == "" {
+				return fmt.Errorf("automatic recovery requires RHIZA_FENCER_URL and RHIZA_FENCER_TOKEN_FILE")
+			}
+			roots, err := x509.SystemCertPool()
+			if err != nil {
+				return err
+			}
+			if caFile := os.Getenv("RHIZA_FENCER_CA_FILE"); caFile != "" {
+				data, err := os.ReadFile(caFile)
+				if err != nil {
+					return fmt.Errorf("read fencing CA: %w", err)
+				}
+				if !roots.AppendCertsFromPEM(data) {
+					return fmt.Errorf("fencing CA contains no certificates")
+				}
+			}
+			controller.Fencer = &operator.FencingClient{URL: endpoint, TokenFile: tokenFile, Client: &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}}
+		} else {
+			return fmt.Errorf("unsupported RHIZA_FENCER_BACKEND")
+		}
+		controller.Automatic = true
 	}
 	return controller.Run(ctx, poll)
 }

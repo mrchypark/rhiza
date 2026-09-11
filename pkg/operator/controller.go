@@ -33,6 +33,8 @@ const ownerAnnotation = "rhiza.mrchypark.dev/recovery-owner"
 var identifier = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 
 type Controller struct {
+	Fencer        Fencer
+	Automatic     bool
 	Kube          *Kubernetes
 	Bucket        objstore.Bucket
 	Prefix        string
@@ -82,6 +84,11 @@ func (c *Controller) reconcileAll(ctx context.Context) error {
 			failures = append(failures, fmt.Errorf("resource %s: %w", resourceName(&resources.Items[i]), err))
 		}
 	}
+	if c.Automatic {
+		if err := c.reconcileClusters(ctx); err != nil {
+			failures = append(failures, err)
+		}
+	}
 	return errors.Join(failures...)
 }
 func resourceName(r *Resource) string { return str(r.Metadata["name"]) }
@@ -89,6 +96,10 @@ func (c *Controller) operationID(r *Resource) string {
 	return str(r.Metadata["uid"]) + ":" + r.Spec.RecoveryID
 }
 func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
+	authorized, err := c.authorizeAutomaticChild(ctx, r)
+	if err != nil || !authorized {
+		return err
+	}
 	if r.Spec.Membership != nil {
 		return c.reconcileMembership(ctx, r)
 	}

@@ -206,7 +206,7 @@ class Chaos:
         self.execute(pod, "chaos-seed", "INSERT INTO chaos_items VALUES (0, 'seed')")
         return len(found)
 
-    def run(self):
+    def setup(self):
         root = Path(__file__).resolve().parents[2]
         self.k("apply", "-f", str(root / "deploy/operator/crd.yaml"))
         self.k("wait", "--for=condition=Established", "crd/rhizarecoveries.rhiza.mrchypark.dev", "--timeout=60s")
@@ -236,6 +236,9 @@ class Chaos:
         self.execute("rhiza-0", "chaos-seed", "INSERT INTO chaos_items VALUES (0, 'seed')")
         self.start_writer()
         self.wait("workload began", lambda: len(self.acks) >= 5)
+
+    def run(self):
+        self.setup()
 
         # SIGKILL the real process, preserving the Pod's emptyDir/WAL.
         before = self.status("rhiza-1")

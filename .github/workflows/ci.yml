@@ -45,6 +45,41 @@ jobs:
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
 
+  automatic-operator-chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build test images and Kubernetes cluster
+        env:
+          CGO_ENABLED: 0
+        run: |
+          go install sigs.k8s.io/kind@v0.32.0
+          mkdir -p "$RUNNER_TEMP/chaos-images"
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza
+          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
+          kind create cluster --name rhiza-operator-chaos --wait 120s
+          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
+      - name: Inject faults and verify unattended Operator recovery
+        run: python3 -u e2e/chaos/automatic_recovery.py
+      - name: Collect cluster diagnostics
+        if: always()
+        run: kind export logs automatic-chaos-results/kind --name rhiza-operator-chaos || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: automatic-operator-chaos-${{ github.run_id }}
+          path: automatic-chaos-results
+      - name: Remove test cluster
+        if: always()
+        run: kind delete cluster --name rhiza-operator-chaos
+
   membership-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15

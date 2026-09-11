@@ -257,6 +257,8 @@ func (c *Controller) membershipStatuses(ctx context.Context, pods map[quepaxa.No
 	return result
 }
 
+var ErrMembershipUnauthorized = errors.New("membership management authentication failed")
+
 func (c *Controller) membershipStatus(ctx context.Context, endpoint, admin string) (network.MembershipStatus, error) {
 	call, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -268,6 +270,9 @@ func (c *Controller) membershipStatus(ctx context.Context, endpoint, admin strin
 	}
 	defer response.Body.Close()
 	var status network.MembershipStatus
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return status, ErrMembershipUnauthorized
+	}
 	if response.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&status) != nil {
 		return status, fmt.Errorf("membership status unavailable")
 	}

@@ -504,6 +504,18 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 // only after a learner quorum has accepted their decision, so the two quorums
 // intersect and a completed write cannot be missed.
 func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
+	return c.readIndexExcluding(ctx, "")
+}
+
+// ReadIndexExcluding verifies the current quorum without counting or contacting
+// one voter. Recovery uses this before fencing that voter's authority.
+func (c *Core) ReadIndexExcluding(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
+	if excluded == c.nodeID {
+		return 0, "", ErrQuorumUnavailable
+	}
+	return c.readIndexExcluding(ctx, excluded)
+}
+func (c *Core) readIndexExcluding(ctx context.Context, excluded NodeID) (Slot, NodeID, error) {
 	if c.observer || !c.CanParticipateReadIndex() {
 		return 0, "", ErrQuorumUnavailable
 	}
@@ -527,6 +539,10 @@ func (c *Core) ReadIndex(ctx context.Context) (Slot, NodeID, error) {
 	defer cancel()
 	results := make(chan result, len(cluster.Members))
 	for _, member := range cluster.Members {
+		if member.ID == excluded {
+			results <- result{err: ErrQuorumUnavailable}
+			continue
+		}
 		if member.ID == c.nodeID {
 			results <- result{tip: c.Tip(), id: c.nodeID}
 			continue
