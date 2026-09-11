@@ -26,12 +26,18 @@ class AutomaticChaos(Chaos):
         pods = json.loads(self.k("get", "pods", "-l", "rhiza.mrchypark.dev/automatic-learner", "-o", "json"))["items"]
         for pod in pods:
             name = pod["metadata"]["name"]
-            if name != excluded:
+            if name != excluded and not pod["metadata"].get("deletionTimestamp"):
                 self.runtime(name)
                 return name
         return None
 
     def start_learner(self, name):
+        if not hasattr(self, "learner_logs"):
+            self.learner_logs = []
+        with (self.out / f"{name}-startup.log").open("a") as log:
+            self.learner_logs.append(subprocess.Popen(
+                ["kubectl", "--context", self.context, "-n", self.ns, "logs", "-f", name, "-c", "rhiza"],
+                stdout=log, stderr=subprocess.STDOUT))
         self.k("exec", name, "-c", "rhiza", "--", "touch", "/data/.chaos-start")
 
     def cluster(self):
@@ -93,10 +99,22 @@ class AutomaticChaos(Chaos):
         assert self.fences()[0]["spec"]["operationID"] == operation
         self.event("automatic_executor_outage_restart_pass", operation=operation)
         self.executor.enabled = True
-        first_learner = self.wait("automatic learner provisioned", self.pending_learner, 240)
-        self.udp(first_learner, True)
-        self.start_learner(first_learner)
-        self.wait("automatic addition frozen", lambda: self.cr(operation).get("status", {}).get("membership", {}).get("add") and self.status("rhiza-0").get("pending"), 180)
+        started = set()
+        def frozen_learner():
+            # Startup can fail before admission. Follow the Operator's retries
+            # instead of leaving its next Pod trapped behind our test gate.
+            pods = json.loads(self.k("get", "pods", "-l", "rhiza.mrchypark.dev/automatic-learner", "-o", "json"))["items"]
+            for pod in pods:
+                name = pod["metadata"]["name"]
+                if name not in started and not pod["metadata"].get("deletionTimestamp"):
+                    self.udp(name, True)
+                    self.start_learner(name)
+                    started.add(name)
+            addition = self.cr(operation).get("status", {}).get("membership", {}).get("add")
+            if addition and self.status("rhiza-0").get("pending"):
+                return addition["memberID"]
+            return None
+        first_learner = self.wait("automatic addition frozen", frozen_learner, 360)
         first_uid = self.runtime(first_learner)[0]
         self.k("delete", "pod", first_learner, "--wait=true")
         fresh = self.wait("automatic failed learner abort and retry", lambda: self.pending_learner(first_learner), 300)
@@ -177,6 +195,10 @@ class AutomaticChaos(Chaos):
             except RuntimeError:
                 pass
         super().cleanup()
+        for proc in getattr(self, "learner_logs", []):
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=10)
         if hasattr(self,"executor"):
             self.executor.close()
 
