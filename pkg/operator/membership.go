@@ -302,6 +302,22 @@ func (c *Controller) membershipMutation(ctx context.Context, pod object, contain
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, (16<<10)+1))
+		var detail network.ErrorResponse
+		if readErr == nil && len(data) <= 16<<10 && json.Unmarshal(data, &detail) == nil && detail.Code != "" && detail.Error != "" {
+			message := detail.Code + ": " + detail.Error
+			// Do not echo known credentials even if a server includes them in its error.
+			secrets := []string{admin}
+			if change.Add != nil {
+				secrets = append(secrets, change.Add.Token)
+			}
+			for _, secret := range secrets {
+				if secret != "" {
+					message = strings.ReplaceAll(message, secret, "[redacted]")
+				}
+			}
+			return fmt.Errorf("membership change returned HTTP %d: %s", response.StatusCode, message)
+		}
 		return fmt.Errorf("membership change returned HTTP %d", response.StatusCode)
 	}
 	return nil

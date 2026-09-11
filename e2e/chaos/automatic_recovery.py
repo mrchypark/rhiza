@@ -155,6 +155,22 @@ class AutomaticChaos(Chaos):
         self.event("PASS", scenarios=7, unattended=True)
 
     def cleanup(self):
+        # Observe management state before closing port forwards; never replay a
+        # mutation from the fault injector to diagnose an unattended failure.
+        try:
+            pods = json.loads(self.k("get", "pods", "-o", "json"))["items"]
+            statuses = {}
+            for pod in pods:
+                if not any(c["name"] == "rhiza" for c in pod["spec"]["containers"]):
+                    continue
+                name = pod["metadata"]["name"]
+                try:
+                    statuses[name] = self.status(name)
+                except (RuntimeError, OSError, ValueError):
+                    statuses[name] = {"unavailable": True}
+            (self.out / "membership-status.json").write_text(json.dumps(statuses, indent=2))
+        except (RuntimeError, OSError, ValueError):
+            pass
         for kind in ("rhizaclusters","rhizafences"):
             try:
                 (self.out / f"{kind}.json").write_text(self.k("get",kind,"-o","json"))
