@@ -727,13 +727,23 @@ func TestUniqueReadBarrierOnStaleReplicaFollowsCompletedWrite(t *testing.T) {
 
 func TestReadIndexSurvivesOneFailureAndFailsWithoutQuorum(t *testing.T) {
 	cores, transport := newTestCluster(t)
+	transport.mu.Lock()
+	transport.dropDecision["n2"] = true
+	transport.mu.Unlock()
 	if _, _, err := cores["n1"].Propose(context.Background(), []byte("write")); err != nil {
 		t.Fatal(err)
 	}
 	transport.fail("n1")
-	index, _, err := cores["n2"].ReadIndex(context.Background())
-	if err != nil || index != 1 || cores["n2"].Tip() != 1 {
-		t.Fatalf("read-index=%d tip=%d err=%v", index, cores["n2"].Tip(), err)
+	index, source, err := cores["n2"].ReadIndex(context.Background())
+	if err != nil || index != 1 || source != "n3" {
+		t.Fatalf("read-index=%d source=%s err=%v", index, source, err)
+	}
+	if value, ok := cores[source].CertifiedValue(index); !ok || string(value.Value) != "write" {
+		t.Fatalf("source %s does not hold the certified write at index %d", source, index)
+	}
+	// ReadIndex identifies a source; catching up the local replica is the caller's job.
+	if tip := cores["n2"].Tip(); tip != 0 {
+		t.Fatalf("stale local tip=%d, want 0", tip)
 	}
 	transport.fail("n3")
 	if _, _, err := cores["n2"].ReadIndex(context.Background()); !errors.Is(err, ErrQuorumUnavailable) {

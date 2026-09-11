@@ -265,8 +265,8 @@ Pro 신규 상담은 지정 프로젝트 페이지 로딩 실패로 수행하지
 
 Operator가 장애 판정, quorum 확인, fencing 범위 선정, immutable operation ID와
 identity 저널, 재시도 및 복구 상태 전환을 소유한다. `Fencer`는 그 요청을 실행하는
-경계이며 HTTP 서비스가 복구 정책을 결정하지 않는다. 현재 구현체는 HTTPS
-`FencingClient`이다. 독립 서비스 배포는 인터페이스의 필수 조건이 아니며, 동일한
+경계이며 HTTP 서비스가 복구 정책을 결정하지 않는다. 구현체는 HTTPS
+`FencingClient`와 Kubernetes `RhizaFence` backend이다. 독립 서비스 배포는 인터페이스의 필수 조건이 아니며, 동일한
 증거 계약을 만족하는 backend를 Operator 내부에 연결할 수 있다.
 
 모든 backend의 결과는 Operator에서 다시 검증한다. operation ID, source generation,
@@ -278,13 +278,13 @@ binding UID 및 전체 요청 해시가 일치하고, 프로세스 종료·재�
 현재 대상은 공유 Kubernetes 노드의 StatefulSet + emptyDir이다. Pod DELETE와
 admission 차단만으로 단절된 노드의 기존 프로세스 또는 이미 전송된 저장소 쓰기의
 종료를 증명할 수 없다. 관찰 가능한 Pod만 사라진 상태에서도 보이지 않는 프로세스가
-남을 수 있으므로 이를 완료 증거로 낮추지 않는다. Kubernetes backend를 추가하려면
+남을 수 있으므로 이를 완료 증거로 낮추지 않는다. Kubernetes backend의 실행기는
 실제 런타임 종료와 재실행 차단, 저장소 quiescence를 확인할 수 있는 수단이 필요하다.
 확인할 수 없으면 pending/blocked로 남긴다. 공유 노드 전체의 전원 차단은 다른
 workload에 영향을 주므로 일반 Pod 복구의 기본 동작으로 삼지 않는다.
 
-현재 변경은 backend 경계와 검증 계약을 추가한 단계다. Kubernetes 전용 backend와
-자동 제어 루프의 무인 카오스 검증 완료를 의미하지 않는다.
+Kubernetes backend와 CI 전용 실행기의 구현 및 무인 검증 범위는 아래에 기록한다.
+운영 환경의 실행기 연동과 물리 장애 검증은 별도 자격 조건이다.
 
 ## Kubernetes backend 실행 계약
 

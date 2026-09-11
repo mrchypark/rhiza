@@ -3,7 +3,8 @@
 For Go or Rust applications embedding Rhiza, see the dedicated
 [embedded application integration guide](../../docs/embedded-operator.md).
 
-These manifests deploy a namespace-scoped controller for `RhizaRecovery`.
+These manifests deploy a namespace-scoped controller for `RhizaRecovery`
+and opt-in automatic recovery through `RhizaCluster`.
 It monitors an **existing three-voter StatefulSet**. It does not create a
 database, PVCs, or a new membership from scratch.
 
@@ -71,7 +72,7 @@ automation; do not grant it to ordinary application service accounts. The CR
 attestation is an authorization boundary, not an independently verified power
 or network fence.
 
-`spec.fence` is a trusted out-of-band administrator attestation. It must bind
+For manual requests, `spec.fence` is a trusted out-of-band administrator attestation. It must bind
 the same `recoveryID`, `sourceClusterID`, and live StatefulSet UID, set
 `confirmed: true`, and contain concrete evidence. The operator never infers a
 fence from missing pods, failed probes, or Kubernetes deletion state.
@@ -101,3 +102,26 @@ termination of the original voters, both async → before-ack and before-ack →
 async recovery reached Complete, preserved archived SQL rows, and accepted new
 writes. Unit tests cover interrupted status writes and credential reuse. This
 qualifies the controller flow, not a production infrastructure fencing provider.
+
+## Automatic recovery with Kubernetes fencing
+
+Apply `cluster-crd.yaml` and `fence-crd.yaml` in addition to `crd.yaml`, then
+apply the current RBAC. Enable `RHIZA_AUTOMATIC_RECOVERY=true` and
+`RHIZA_FENCER_BACKEND=kubernetes` on the Operator. Adapt
+[`automatic-example.yaml`](automatic-example.yaml) to the existing StatefulSet,
+source generation and voter identities before applying it. All database voters
+must opt into membership replacement.
+
+The Operator persists the incident, checks the surviving quorum, creates an
+immutable `RhizaFence`, and waits for matching completion evidence. A separately
+authorized executor must terminate the complete requested identity scope,
+prevent recreation and quiesce storage before updating the fence status. The
+Operator service account cannot write that status. Missing executor or incomplete
+proof leaves recovery pending; a Pod DELETE response is insufficient.
+
+After proof, the Operator provisions and promotes a learner, fences and aborts a
+lost learner before retrying a fresh identity, or restores a new generation when
+quorum is lost. The StatefulSet remains the deployment basis. The kind executor
+in `e2e/chaos/` is CI-only; production runtime/storage isolation still requires an
+environment-specific executor. See the
+[execution contract and CI evidence](../../docs/automatic-recovery-design.md#kubernetes-backend-실행-계약).

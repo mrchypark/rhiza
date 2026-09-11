@@ -103,9 +103,12 @@ class AutomaticChaos(Chaos):
         self.start_learner(fresh)
         self.wait("unattended online replacement", self.healthy, 360)
         assert self.runtime_gone(first_uid)
-        assert self.status("rhiza-0")["abort_slot"] > 0
-        self.event("automatic_lost_learner_abort_retry_pass", old_learner=first_learner, new_learner=fresh, old_uid=first_uid)
         child = self.cr(operation)
+        # Promotion clears the live abort marker; the new addition journal
+        # retains the abort revision that authorized this fresh learner.
+        abort_slot = child["status"]["membership"]["add"]["expectedAbortSlot"]
+        assert abort_slot > 0
+        self.event("automatic_lost_learner_abort_retry_pass", old_learner=first_learner, new_learner=fresh, old_uid=first_uid, abort_slot=abort_slot)
         assert child["status"]["phase"] == "Complete"
         learner = child["spec"]["membership"]["replacementPod"]
         assert self.status(learner)["voting"]
