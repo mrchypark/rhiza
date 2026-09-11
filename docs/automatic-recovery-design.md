@@ -351,3 +351,19 @@ abort revision **384**, 새 learner `-learner-1` 승격을 자동 수행했다.
 당시 응답 본문이 보존되지 않아 정확한 원인은 미확정이다. 이후 bounded/redacted
 오류 본문과 멤버십 상태 수집을 추가했다. 위 성공 실행은 이 간헐적 실패의 원인이
 해결됐다는 증거가 아니며, 운영 자격 검증에서는 재현 여부와 원인을 계속 확인해야 한다.
+
+### 쓰기 중 learner 시작 실패의 재현과 수정
+
+후속 candidate `6dc3e44` / CI `34557413623`의 보존된 learner 시작 로그에서
+세 번 모두 `load shared decision archive: shared archive head changed during chain load`가
+확인됐다. 쓰기가 진행되는 archive 전체를 읽는 동안 HEAD가 전진하면 `Load`가 즉시
+실패했고, 시작 실패가 자동 learner 교체 상한을 소진했다. 이는 Operator가 재시도하지
+않은 문제가 아니라 archive 로더의 정상적인 동시 append 처리 문제다.
+
+수정은 마지막 HEAD 버전 일치와 manager CAS 검사를 유지하면서 기존 bounded retry를
+사용한다. 한 번의 `Load` 안에서 검증된 불변 extent 참조만 재사용하여, 재시도 때 전체
+과거 체인을 다시 읽지 않는다. 취소·손상·지속적인 HEAD 변경은 실패로 남기며, 검증이
+끝나기 전의 manager 상태는 공개하지 않는다. 내부 publication/trim 후 재조회도 같은
+재시도 경로를 사용한다. MiMo의 결정적 회귀 테스트는 기존 코드에서 실패했으며,
+수정 코드에서 append 재시도·중복 extent GET 방지·취소/손상 시 기존 상태 보존을
+race 검사와 함께 통과했다. 이 수정의 실제 카오스 결과는 후속 CI에서 검증한다.

@@ -175,15 +175,21 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) Load(ctx context.Context) error {
+	// Keep validated immutable references across HEAD retries. A live writer
+	// must not force each retry to download the entire historical chain again.
+	verified := make(map[extentObject]Extent)
 	for range maxPublishRetries {
-		if err := m.loadLocked(ctx); !errors.Is(err, errArchiveStateChanged) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.loadLocked(ctx, verified); !errors.Is(err, errArchiveStateChanged) {
 			return err
 		}
 	}
 	return fmt.Errorf("shared archive state changed too often")
 }
 
-func (m *Manager) loadLocked(ctx context.Context) error {
+func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Extent) error {
 	m.mu.Lock()
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
@@ -257,9 +263,15 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 			reused = true
 			break
 		}
-		extent, err := m.readExtent(ctx, hash, object)
-		if err != nil {
-			return err
+		key := extentObject{hash: hash, id: object}
+		extent, ok := verified[key]
+		if !ok {
+			extent, err = m.readExtent(ctx, hash, object)
+			if err != nil {
+				return err
+			}
+			extent.Decisions = nil
+			verified[key] = extent
 		}
 		if extent.End != end {
 			return fmt.Errorf("invalid shared archive block chain")
@@ -303,7 +315,7 @@ func (m *Manager) loadLocked(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("shared archive head changed during chain load")
+		return errArchiveStateChanged
 	}
 	m.mu.Lock()
 	if !sameNullableObjectVersion(m.headCAS, oldCAS) {
@@ -457,7 +469,7 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 		} else if !m.cas {
 			return err
 		}
-		if err := m.loadLocked(ctx); err != nil {
+		if err := m.Load(ctx); err != nil {
 			return err
 		}
 	}
@@ -475,7 +487,7 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead
 		return err
 	}
 	if !archiveHeadsEqual(head, expected) {
-		if err := m.loadLocked(ctx); err != nil {
+		if err := m.Load(ctx); err != nil {
 			return err
 		}
 		m.mu.Lock()
@@ -832,7 +844,7 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		} else if !m.cas {
 			return err
 		}
-		if err := m.loadLocked(ctx); err != nil {
+		if err := m.Load(ctx); err != nil {
 			return err
 		}
 	}
