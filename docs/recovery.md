@@ -45,6 +45,15 @@ WAL returns `ErrVoterEnrollmentRequired` and needs a one-time offline upgrade:
 3. After every original voter is enrolled, restart all voters using the updated
    binary and the same membership, credentials, namespace and original disks.
 
+For Rust hosts upgrading from 0.12, the `rhizadb` crate does not contain the
+administrative CLI or expose enrollment through FFI. Obtain the matching CLI
+with `go install github.com/mrchypark/rhiza/cmd/rhiza@v0.13.0`, or build
+`./cmd/rhiza` from the v0.13.0 source checkout (Go 1.27+ required). While every
+host is stopped, supply its original Rust configuration through the CLI's
+matching environment variables, including `RHIZA_CLUSTER_ID`, `RHIZA_NODE_ID`,
+`RHIZA_DATA_DIR`, `RHIZA_CLUSTER_MEMBERS` and object-store settings, then run
+`rhiza --enroll-existing-voter`. Only then deploy/start `rhizadb` 0.13.0.
+
 Enrollment is an operator assertion about the original state, **not** repair
 for a lost disk. It cannot replace an existing registration, restore forgotten
 votes, or turn an empty replacement into an old voter. Do not remove identity
