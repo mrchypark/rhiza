@@ -328,3 +328,26 @@ https://github.com/mrchypark/rhiza/actions/runs/34554367214/job/103123753569
 Operator가 fencing status를 갱신할 권한이 없음과 요청 spec의 API 불변성도 확인했다.
 이 결과는 단일 폐기형 kind 노드와 독점 MinIO에서의 실제 실행 근거다. 물리 호스트
 단절, 공유 운영 저장소의 credential fencing, 운영 node agent를 검증한 결과는 아니다.
+
+### Learner 유실을 포함한 7개 시나리오
+
+Candidate `12fe7f27b7461a2f9e78a4eaad316226a3ebf541`의 CI run
+`34556748732`, job `103130932550`에서 무인 7개 시나리오가 `PASS`했다.
+https://github.com/mrchypark/rhiza/actions/runs/34556748732/job/103130932550
+
+추가 도중 learner Pod를 실제 삭제한 뒤 Operator가 failed incarnation fencing,
+abort revision **384**, 새 learner `-learner-1` 승격을 자동 수행했다.
+이후 live-process QUIC 단절과 generation fencing을 거쳐 **ACK 430행 / 복구 430행**,
+중복 요청 처리 보존, 새 세대 쓰기를 확인했다. 같은 후보의 Go/race, Rust,
+컨테이너, 멤버십 E2E와 수동 카오스도 통과했다. Artifact는
+`automatic-operator-chaos-34556748732`이다.
+
+테스트는 learner 시작 전 QUIC 장애를 설치하며, Operator의 자동 재시도로 생성된
+새 Pod도 추적해야 한다. 테스트의 시작 대기 장치가 재시도 Pod를 막던 문제를 수정했다.
+승격 이후 live abort marker는 초기화되므로 성공 판정은 새 addition의 영속
+`expectedAbortSlot`을 사용한다.
+
+앞선 candidate `2a1a0b8`은 제거 단계의 HTTP 500으로 제한 시간 내 완료되지 않았다.
+당시 응답 본문이 보존되지 않아 정확한 원인은 미확정이다. 이후 bounded/redacted
+오류 본문과 멤버십 상태 수집을 추가했다. 위 성공 실행은 이 간헐적 실패의 원인이
+해결됐다는 증거가 아니며, 운영 자격 검증에서는 재현 여부와 원인을 계속 확인해야 한다.

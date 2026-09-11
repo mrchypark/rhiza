@@ -1,5 +1,5 @@
-# Apply only after configuring a trusted external fencing service and installing
-# cluster-crd.yaml. Durations are explicit deployment choices, not inferred defaults.
+# Apply only after configuring a trusted fencing executor/backend and installing
+# cluster-crd.yaml (and fence-crd.yaml for the Kubernetes backend). Durations are explicit deployment choices, not inferred defaults.
 apiVersion: rhiza.mrchypark.dev/v1alpha1
 kind: RhizaCluster
 metadata:

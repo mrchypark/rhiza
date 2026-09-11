@@ -109,7 +109,8 @@ Apply `cluster-crd.yaml` and `fence-crd.yaml` in addition to `crd.yaml`, then
 apply the current RBAC. Enable `RHIZA_AUTOMATIC_RECOVERY=true` and
 `RHIZA_FENCER_BACKEND=kubernetes` on the Operator. Adapt
 [`automatic-example.yaml`](automatic-example.yaml) to the existing StatefulSet,
-source generation and voter identities before applying it. All database voters
+source generation and voter identities, and set `spec.automatic: true` only after
+configuring the executor. The sample defaults to observation. All database voters
 must opt into membership replacement.
 
 The Operator persists the incident, checks the surviving quorum, creates an

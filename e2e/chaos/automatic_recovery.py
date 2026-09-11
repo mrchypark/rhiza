@@ -22,15 +22,6 @@ class AutomaticChaos(Chaos):
                 ctr["args"] = ['if [ -n "${RHIZA_LEARNER:-}" ]; then while [ ! -f /data/.chaos-start ]; do sleep 0.2; done; fi; exec /usr/local/bin/rhiza-entrypoint']
         super().apply(objs)
 
-    def pending_learner(self, excluded=""):
-        pods = json.loads(self.k("get", "pods", "-l", "rhiza.mrchypark.dev/automatic-learner", "-o", "json"))["items"]
-        for pod in pods:
-            name = pod["metadata"]["name"]
-            if name != excluded and not pod["metadata"].get("deletionTimestamp"):
-                self.runtime(name)
-                return name
-        return None
-
     def start_learner(self, name):
         if not hasattr(self, "learner_logs"):
             self.learner_logs = []
@@ -100,35 +91,54 @@ class AutomaticChaos(Chaos):
         self.event("automatic_executor_outage_restart_pass", operation=operation)
         self.executor.enabled = True
         started = set()
-        def frozen_learner():
-            # Startup can fail before admission. Follow the Operator's retries
-            # instead of leaving its next Pod trapped behind our test gate.
+        last_progress = None
+        def recovery_progress():
+            nonlocal last_progress
+            child = self.cr(operation)
+            status = child.get("status", {})
+            progress = (status.get("phase"), status.get("message"))
+            if progress != last_progress:
+                self.event("automatic_recovery_progress", phase=progress[0], message=progress[1])
+                last_progress = progress
+            return child
+
+        def release_new_learners(blocked):
+            # Startup can fail before admission. Follow every automatic retry
+            # instead of leaving the next Pod trapped behind our test gate.
             pods = json.loads(self.k("get", "pods", "-l", "rhiza.mrchypark.dev/automatic-learner", "-o", "json"))["items"]
             for pod in pods:
                 name = pod["metadata"]["name"]
                 if name not in started and not pod["metadata"].get("deletionTimestamp"):
-                    self.udp(name, True)
+                    self.runtime(name)
+                    if blocked:
+                        self.udp(name, True)
                     self.start_learner(name)
                     started.add(name)
-            addition = self.cr(operation).get("status", {}).get("membership", {}).get("add")
+
+        def frozen_learner():
+            release_new_learners(True)
+            addition = recovery_progress().get("status", {}).get("membership", {}).get("add")
             if addition and self.status("rhiza-0").get("pending"):
                 return addition["memberID"]
             return None
         first_learner = self.wait("automatic addition frozen", frozen_learner, 360)
         first_uid = self.runtime(first_learner)[0]
         self.k("delete", "pod", first_learner, "--wait=true")
-        fresh = self.wait("automatic failed learner abort and retry", lambda: self.pending_learner(first_learner), 300)
-        self.start_learner(fresh)
-        self.wait("unattended online replacement", self.healthy, 360)
+        def replacement_healthy():
+            release_new_learners(False)
+            recovery_progress()
+            return self.healthy()
+        self.wait("automatic failed learner abort and retry", replacement_healthy, 420)
         assert self.runtime_gone(first_uid)
         child = self.cr(operation)
         # Promotion clears the live abort marker; the new addition journal
         # retains the abort revision that authorized this fresh learner.
         abort_slot = child["status"]["membership"]["add"]["expectedAbortSlot"]
         assert abort_slot > 0
-        self.event("automatic_lost_learner_abort_retry_pass", old_learner=first_learner, new_learner=fresh, old_uid=first_uid, abort_slot=abort_slot)
         assert child["status"]["phase"] == "Complete"
         learner = child["spec"]["membership"]["replacementPod"]
+        assert learner != first_learner
+        self.event("automatic_lost_learner_abort_retry_pass", old_learner=first_learner, new_learner=learner, old_uid=first_uid, abort_slot=abort_slot)
         assert self.status(learner)["voting"]
         self.verify_data(learner)
         self.event("automatic_online_replacement_pass", learner=learner, old_uid=lost_uid)
