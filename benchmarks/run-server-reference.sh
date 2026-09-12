@@ -74,14 +74,14 @@ trap cleanup EXIT
 
 docker run --rm -d --name "$container" -p "$minio_port:9000" \
 	-e MINIO_ROOT_USER=rhiza-e2e -e MINIO_ROOT_PASSWORD=rhiza-e2e-secret \
-	minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data >/dev/null
+	quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data >/dev/null
 for _ in {1..100}; do
 	curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null 2>&1 && break
 	sleep 0.1
 done
 curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null
 docker run --rm --add-host host.docker.internal:host-gateway --entrypoint /bin/sh \
-	minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+	quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
 	-c "mc alias set local http://host.docker.internal:$minio_port rhiza-e2e rhiza-e2e-secret >/dev/null && mc mb --ignore-existing local/rhiza >/dev/null"
 
 members=$(printf '[{"node_id":"n0","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n0-token"},{"node_id":"n1","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n1-token"},{"node_id":"n2","url":"http://127.0.0.1:%d","peer_url":"quic://127.0.0.1:%d","token":"n2-token"}]' \
