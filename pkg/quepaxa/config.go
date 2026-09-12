@@ -102,6 +102,14 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 		}
 		core.walIdentity = hex.EncodeToString(identity)
 	}
+	if !learner && localMember.WALIdentity == "" {
+		if identity, ok := config.WAL.Identity(); ok {
+			if len(identity) != 32 {
+				return nil, fmt.Errorf("%w: WAL identity must be 32 bytes", ErrInvalidConfig)
+			}
+			core.walIdentity = hex.EncodeToString(identity)
+		}
+	}
 	if localMember.WALIdentity != "" {
 		identity, ok := config.WAL.Identity()
 		if !ok || len(identity) != 32 || hex.EncodeToString(identity) != localMember.WALIdentity {

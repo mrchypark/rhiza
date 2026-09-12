@@ -1,9 +1,9 @@
 # Quorum-controlled membership (experimental)
 
-This work adds a **QuePaxa protocol prototype**, not automatic recovery for
-`rhiza.Open`, the Kubernetes Operator, or no-PVC deployments. Those hosts still
-use fixed membership and retain their lost-WAL protection. Do not enable this
-prototype on a production cluster.
+This work implements experimental quorum-controlled membership across QuePaxa,
+`rhiza.Open`, Go/Rust management, and the Kubernetes Operator. It is not automatic
+recovery or infrastructure fencing, and it is not enabled for production use.
+CI qualification remains outstanding; local functional results are recorded below.
 
 ## Protocol boundary
 
@@ -66,9 +66,12 @@ identity and cannot reuse the previous incarnation's promotion.
 token-pinned QUIC endpoint. Readiness, Pod identity, or a reported log index
 alone is not admission evidence. Removed voter IDs must not be reused.
 
-The core APIs are `BeginReconfiguration`, `FinishReconfiguration`,
-`CurrentCluster`, and `ClusterForSlot`. Enable the prototype through
-`quepaxa.Config.EnableReconfiguration`. Bind a network transport to its core
+The core APIs are `BeginReconfiguration`, `BeginReconfigurationAt`,
+`FinishReconfigurationAt`, `AbortReconfigurationAt`, `CurrentCluster`, and
+`ClusterForSlot`. Enable it through `quepaxa.Config.EnableReconfiguration`.
+Go exposes `ChangeMembership`, `MembershipStatus`, and `AbortMembership`;
+the Rust methods are `change_membership`, `membership_status`, and
+`abort_membership`. HTTP management requires the admin bearer token. Bind a network transport to its core
 with `BindCore` before starting traffic. A plain `NewObserver` remains a
 nonvoting verifier; it must never acquire voting authority by replaying a
 membership record.
@@ -88,23 +91,35 @@ A deterministic lagged-recorder regression covers full and hash-only proposals.
 
 ## Current limits and deployment gate
 
-- This prototype retains the complete WAL. Checkpoint creation, compaction,
-  and checkpoint restoration in reconfiguration mode must fail closed until
-  checkpoint certificates also bind configuration history and retirement
-  state. An unbounded retained WAL is not an acceptable no-PVC recovery model.
-- Archive publication, before-ack durability, GC authority, and remote voter
-  registration still use fixed-generation contracts. They require certified
-  configuration history and epoch fencing before Node can enable this feature.
-- Learner provisioning, retry orchestration, discovery after losing a local
-  identity, and Go/Rust/Operator integration are not provided by the core API.
-- Quorum-controlled removal fences consensus participation. It does not kill
-  the previous process or revoke its object-store credentials.
-- Loss of the existing quorum still requires the separate generation recovery
-  procedure. Membership changes cannot manufacture the missing quorum.
+Checkpoint seals now bind complete configuration history and retirement state;
+compaction, restart, and cold restore validate it. Archive publication,
+before-ack durability, GC authority, and immutable registration retain one archive
+generation identity across membership transitions. A checkpoint proof is still
+bounded by the 128 KiB replicated-value limit and fails closed when too large.
 
-The feature must remain disabled in the production Node until these gates and
-the crash/concurrency qualification are complete. A passing protocol test is
-not a claim that automatic no-PVC recovery is ready.
+The Operator requires an explicit external fence for a removed voter and only
+coordinates existing workloads. It does not kill the old process, revoke object
+store credentials, provision learners, or discover Pods. `voterPods` must name
+each reachable voter (`nodeID`, `pod`); `removedPod` may name the fenced workload
+and otherwise defaults to `remove`. The replacement Secret must be immutable and
+contain a strict `data.member` JSON `quepaxa.Member`; status retains its UID,
+resource version, and request hash, never the token.
+
+Set `abortAddition: true` to submit the journaled add's
+`operationID`, `clusterID`, `expectedConfigID`, and `expectedAbortSlot` to the
+surviving quorum. Once it records a newer abort revision, set it false and use a
+fresh replacement Pod/Secret to resume. A stale revision or changed Secret blocks
+the operation.
+
+Real MinIO/QUIC E2E passes cover replacement and restart for `async` and
+`before-ack`, plus externally fenced, sealed, anchored generation materialization
+that preserves SQL data and request-ID deduplication. Loss of the existing quorum
+still requires this separate generation-recovery procedure; membership cannot
+manufacture a quorum. Passive fixed read replicas are outside reconfiguration.
+
+The feature remains disabled for production pending final CI
+qualification. Passing focused and E2E tests do not claim production-ready,
+automatic no-PVC recovery.
 
 ## Local performance qualification
 

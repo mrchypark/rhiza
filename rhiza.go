@@ -68,13 +68,18 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
-	ClusterID                      string
-	NodeID                         string
-	DataDir                        string
-	BindAddr                       string
-	PeerAddr                       string
-	AdminToken                     string
-	Members                        []Member
+	ClusterID  string
+	NodeID     string
+	DataDir    string
+	BindAddr   string
+	PeerAddr   string
+	AdminToken string
+	Members    []Member
+	// EnableReconfiguration enables externally fenced voter replacement.
+	// All voters must opt in; workload fencing and learner provisioning are external.
+	EnableReconfiguration bool
+	// Learner supplies a new identity absent from the immutable bootstrap members.
+	Learner                        *Member
 	ObjStoreEndpoint               string
 	ObjStoreBucket                 string
 	ObjStoreProvider               string
@@ -228,7 +233,7 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	return &types.ExecutionConfig{
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
-		AdminToken: config.AdminToken, Members: config.Members,
+		AdminToken: config.AdminToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,

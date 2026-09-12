@@ -1,0 +1,63 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rhizafences.rhiza.mrchypark.dev
+spec:
+  group: rhiza.mrchypark.dev
+  scope: Namespaced
+  names:
+    plural: rhizafences
+    singular: rhizafence
+    kind: RhizaFence
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: fencing requests are immutable
+              required: [logicalID, bindingUID, namespace, statefulSet, statefulSetUID, sourceClusterID, operationID, scope, targets]
+              properties:
+                logicalID: {type: string, maxLength: 256, minLength: 1}
+                bindingUID: {type: string, maxLength: 256, minLength: 1}
+                namespace: {type: string, maxLength: 256, minLength: 1}
+                statefulSet: {type: string, maxLength: 256, minLength: 1}
+                statefulSetUID: {type: string, maxLength: 256, minLength: 1}
+                sourceClusterID: {type: string, maxLength: 256, minLength: 1}
+                operationID: {type: string, maxLength: 256, minLength: 1}
+                scope: {type: string, enum: [Voter, Generation]}
+                targets:
+                  type: array
+                  maxItems: 16
+                  items:
+                    type: object
+                    required: [nodeID, pod, podUID, walIdentity]
+                    properties:
+                      nodeID: {type: string, maxLength: 256, minLength: 1}
+                      pod: {type: string, maxLength: 256, minLength: 1}
+                      podUID: {type: string, maxLength: 256}
+                      walIdentity: {type: string, maxLength: 256}
+            status:
+              type: object
+              properties:
+                proof:
+                  type: object
+                  required: [operationID, sourceClusterID, bindingUID, requestHash, proofID, processesTerminated, recreationBlocked, storageQuiesced]
+                  properties:
+                    operationID: {type: string, maxLength: 256, minLength: 1}
+                    sourceClusterID: {type: string, maxLength: 256, minLength: 1}
+                    bindingUID: {type: string, maxLength: 256, minLength: 1}
+                    requestHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                    proofID: {type: string, maxLength: 256, minLength: 1}
+                    processesTerminated: {type: boolean}
+                    recreationBlocked: {type: boolean}
+                    storageQuiesced: {type: boolean}

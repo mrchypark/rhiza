@@ -260,3 +260,110 @@ Kubernetes 공식 근거:
 미확정: 실제 배포 환경/fencing provider, 전용 노드 범위, 자동 takeover 유예,
 단일 voter 유실 때 계획 중단 허용 시간. 앞의 정책 값은 제안이며 합의된 기본값이 아니다.
 Pro 신규 상담은 지정 프로젝트 페이지 로딩 실패로 수행하지 못했다.
+
+## Fencing 소유권과 backend 경계 — 2026-09-11 결정
+
+Operator가 장애 판정, quorum 확인, fencing 범위 선정, immutable operation ID와
+identity 저널, 재시도 및 복구 상태 전환을 소유한다. `Fencer`는 그 요청을 실행하는
+경계이며 HTTP 서비스가 복구 정책을 결정하지 않는다. 구현체는 HTTPS
+`FencingClient`와 Kubernetes `RhizaFence` backend이다. 독립 서비스 배포는 인터페이스의 필수 조건이 아니며, 동일한
+증거 계약을 만족하는 backend를 Operator 내부에 연결할 수 있다.
+
+모든 backend의 결과는 Operator에서 다시 검증한다. operation ID, source generation,
+binding UID 및 전체 요청 해시가 일치하고, 프로세스 종료·재생성 차단·저장소 작업
+정지가 모두 확인되어야 복구를 진행한다. 성공 응답이나 proof ID만으로 충분하지 않다.
+이 검증은 증거의 연결 관계를 확인하는 것이며, backend가 실제 격리를 수행했다는
+신뢰를 대신하지 않는다. backend별 실제 장애 주입 검증이 별도로 필요하다.
+
+현재 대상은 공유 Kubernetes 노드의 StatefulSet + emptyDir이다. Pod DELETE와
+admission 차단만으로 단절된 노드의 기존 프로세스 또는 이미 전송된 저장소 쓰기의
+종료를 증명할 수 없다. 관찰 가능한 Pod만 사라진 상태에서도 보이지 않는 프로세스가
+남을 수 있으므로 이를 완료 증거로 낮추지 않는다. Kubernetes backend의 실행기는
+실제 런타임 종료와 재실행 차단, 저장소 quiescence를 확인할 수 있는 수단이 필요하다.
+확인할 수 없으면 pending/blocked로 남긴다. 공유 노드 전체의 전원 차단은 다른
+workload에 영향을 주므로 일반 Pod 복구의 기본 동작으로 삼지 않는다.
+
+Kubernetes backend와 CI 전용 실행기의 구현 및 무인 검증 범위는 아래에 기록한다.
+운영 환경의 실행기 연동과 물리 장애 검증은 별도 자격 조건이다.
+
+## Kubernetes backend 실행 계약
+
+`RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`를 설정하고
+`deploy/operator/cluster-crd.yaml`, `deploy/operator/fence-crd.yaml`, RBAC를 적용한다.
+HTTP backend는 `RHIZA_FENCER_BACKEND=http` 및 기존 URL/토큰/CA 설정으로 선택한다.
+
+Kubernetes backend는 `RhizaFence`에 고정된 요청을 생성한다. 요청 이름은 binding UID와
+operation ID로 결정되어 대상이 바뀐 재시도를 별도 작업으로 숨길 수 없다. CRD가 spec
+변경을 금지하며 backend도 전체 요청 해시를 비교한다. Operator의 권한은 요청 get/create
+뿐이다. 별도 실행 권한을 가진 실행기가 `/status`에 완료 증거를 기록해야 한다.
+이 요청 전달만으로 프로세스를 종료하지는 않는다. 실행기가 없거나 증거가 불완전하면
+자동 복구는 계속 대기한다. 배포 환경별 실행기는 동일 프로세스에 구현할 수도 있으나
+권한과 책임은 이 계약을 유지해야 한다.
+
+실행기는 요청을 영속화한 뒤 재생성 차단을 먼저 설정하고, 해당 voter/generation의
+실제 실행 중인 모든 incarnation을 조사·종료해야 한다. 관찰 목록인 targets만 믿고
+다른 incarnation을 누락해서는 안 된다. Pod 이름을 다시 해석한 늦은 종료 명령이
+새 generation을 중단하지 않도록 UID/컨테이너 ID를 고정한다. 저장소에 이미 전송된
+작업까지 정지한 뒤에만 완료 증거를 기록한다. 완료 이후에도 이전 identity의 재생성
+차단은 유지되어야 하므로 완료 CR 또는 barrier를 자동으로 삭제하지 않는다.
+
+CI의 `kind_fencer.py`는 이 계약을 실제 kind 런타임과 admission webhook으로 실행하는
+테스트 전용 구현이다. 단일 폐기형 노드와 독점 MinIO를 사용하며 공유 운영 클러스터에
+배포하는 node agent가 아니다. 운영 환경의 종료/저장소 격리 수단은 별도 연동이 필요하다.
+
+### 확인된 무인 CI 근거
+
+2026-09-11, candidate `ef65375`, CI run `34554367214`, job `103123753569`에서
+기본 무인 카오스 6개 시나리오가 최종 `PASS`를 기록했다.
+https://github.com/mrchypark/rhiza/actions/runs/34554367214/job/103123753569
+
+- 동일 Pod/WAL의 SIGKILL 재시작: 불필요한 fencing 없이 복귀.
+- emptyDir 유실: Operator가 voter fencing 요청과 learner 교체를 생성·완료.
+- 실행기 중단 중 복구 대기 및 Operator 재시작 후 동일 operation 재사용.
+- 실행기 재시작 후 완료된 구 voter identity의 admission 차단 유지.
+- 살아 있는 구 프로세스의 QUIC 단절: proof 전 새 세대 복구 금지.
+- generation fencing 이후 새 세대로 자동 복구: ACK 349행 전부 보존,
+  중복 요청 처리 유지 및 새 쓰기 성공.
+
+Operator가 fencing status를 갱신할 권한이 없음과 요청 spec의 API 불변성도 확인했다.
+이 결과는 단일 폐기형 kind 노드와 독점 MinIO에서의 실제 실행 근거다. 물리 호스트
+단절, 공유 운영 저장소의 credential fencing, 운영 node agent를 검증한 결과는 아니다.
+
+### Learner 유실을 포함한 7개 시나리오
+
+Candidate `12fe7f27b7461a2f9e78a4eaad316226a3ebf541`의 CI run
+`34556748732`, job `103130932550`에서 무인 7개 시나리오가 `PASS`했다.
+https://github.com/mrchypark/rhiza/actions/runs/34556748732/job/103130932550
+
+추가 도중 learner Pod를 실제 삭제한 뒤 Operator가 failed incarnation fencing,
+abort revision **384**, 새 learner `-learner-1` 승격을 자동 수행했다.
+이후 live-process QUIC 단절과 generation fencing을 거쳐 **ACK 430행 / 복구 430행**,
+중복 요청 처리 보존, 새 세대 쓰기를 확인했다. 같은 후보의 Go/race, Rust,
+컨테이너, 멤버십 E2E와 수동 카오스도 통과했다. Artifact는
+`automatic-operator-chaos-34556748732`이다.
+
+테스트는 learner 시작 전 QUIC 장애를 설치하며, Operator의 자동 재시도로 생성된
+새 Pod도 추적해야 한다. 테스트의 시작 대기 장치가 재시도 Pod를 막던 문제를 수정했다.
+승격 이후 live abort marker는 초기화되므로 성공 판정은 새 addition의 영속
+`expectedAbortSlot`을 사용한다.
+
+앞선 candidate `2a1a0b8`은 제거 단계의 HTTP 500으로 제한 시간 내 완료되지 않았다.
+당시 응답 본문이 보존되지 않아 정확한 원인은 미확정이다. 이후 bounded/redacted
+오류 본문과 멤버십 상태 수집을 추가했다. 위 성공 실행은 이 간헐적 실패의 원인이
+해결됐다는 증거가 아니며, 운영 자격 검증에서는 재현 여부와 원인을 계속 확인해야 한다.
+
+### 쓰기 중 learner 시작 실패의 재현과 수정
+
+후속 candidate `6dc3e44` / CI `34557413623`의 보존된 learner 시작 로그에서
+세 번 모두 `load shared decision archive: shared archive head changed during chain load`가
+확인됐다. 쓰기가 진행되는 archive 전체를 읽는 동안 HEAD가 전진하면 `Load`가 즉시
+실패했고, 시작 실패가 자동 learner 교체 상한을 소진했다. 이는 Operator가 재시도하지
+않은 문제가 아니라 archive 로더의 정상적인 동시 append 처리 문제다.
+
+수정은 마지막 HEAD 버전 일치와 manager CAS 검사를 유지하면서 기존 bounded retry를
+사용한다. 한 번의 `Load` 안에서 검증된 불변 extent 참조만 재사용하여, 재시도 때 전체
+과거 체인을 다시 읽지 않는다. 취소·손상·지속적인 HEAD 변경은 실패로 남기며, 검증이
+끝나기 전의 manager 상태는 공개하지 않는다. 내부 publication/trim 후 재조회도 같은
+재시도 경로를 사용한다. MiMo의 결정적 회귀 테스트는 기존 코드에서 실패했으며,
+수정 코드에서 append 재시도·중복 extent GET 방지·취소/손상 시 기존 상태 보존을
+race 검사와 함께 통과했다. 이 수정의 실제 카오스 결과는 후속 CI에서 검증한다.

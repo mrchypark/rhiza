@@ -30,13 +30,14 @@ var (
 // The registration is immutable. It detects lost/replaced WAL directories, not
 // cloned disks or rolled-back storage; those still require external fencing.
 type voterIdentity struct {
-	Version    int    `json:"version"`
-	Cluster    string `json:"cluster"`
-	Node       string `json:"node"`
-	Membership string `json:"membership"`
-	Store      string `json:"store"`
-	Nonce      string `json:"nonce"`
-	Registered bool   `json:"registered"`
+	Version          int    `json:"version"`
+	Cluster          string `json:"cluster"`
+	Node             string `json:"node"`
+	Membership       string `json:"membership"`
+	Store            string `json:"store"`
+	Nonce            string `json:"nonce"`
+	Registered       bool   `json:"registered"`
+	LearnerTokenHash string `json:"learner_token_hash,omitempty"`
 }
 
 type localVoterState struct {
@@ -74,7 +75,11 @@ func loadVoterIdentity(config *types.ExecutionConfig) (localVoterState, error) {
 func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 	membership := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
 	store, _ := json.Marshal([]string{config.ObjStoreProvider, config.ObjStoreEndpoint, config.ObjStoreBucket, path.Clean(config.ObjStorePrefix), config.ObjStoreAzureStorageAccount})
-	return voterIdentity{Version: 1, Cluster: string(config.ClusterID), Node: string(config.NodeID), Membership: membership.Membership, Store: fmt.Sprintf("%x", sha256.Sum256(store))}
+	identity := voterIdentity{Version: 1, Cluster: string(config.ClusterID), Node: string(config.NodeID), Membership: membership.Membership, Store: fmt.Sprintf("%x", sha256.Sum256(store))}
+	if config.Learner != nil {
+		identity.LearnerTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte(config.Learner.Token)))
+	}
+	return identity
 }
 
 // ensureVoterIdentity runs before any archive replay or peer listener. An

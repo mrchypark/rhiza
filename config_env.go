@@ -21,6 +21,16 @@ func ConfigFromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("invalid RHIZA_CLUSTER_MEMBERS: %w", err)
 		}
 	}
+	enableReconfiguration, err := parseConfigEnvBool("RHIZA_ENABLE_RECONFIGURATION")
+	if err != nil {
+		return Config{}, err
+	}
+	var learner *Member
+	if raw := os.Getenv("RHIZA_LEARNER"); raw != "" {
+		if err := decodeConfigEnvJSON(raw, &learner); err != nil {
+			return Config{}, fmt.Errorf("invalid RHIZA_LEARNER: %w", err)
+		}
+	}
 	checkpointInterval, err := parseConfigEnvDuration("RHIZA_CHECKPOINT_INTERVAL", "15m", func(v time.Duration) bool { return v >= 0 })
 	if err != nil {
 		return Config{}, err
@@ -73,7 +83,7 @@ func ConfigFromEnv() (Config, error) {
 	return Config{
 		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: configEnvOrDefault("RHIZA_NODE_ID", "node-1"),
 		DataDir: configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
-		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), Members: members,
+		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), Members: members, EnableReconfiguration: enableReconfiguration, Learner: learner,
 		ObjStoreProvider: os.Getenv("RHIZA_OBJSTORE_PROVIDER"), ObjStoreDir: objStoreDir, ObjStorePrefix: os.Getenv("RHIZA_OBJSTORE_PREFIX"),
 		ObjStoreEndpoint: os.Getenv("RHIZA_OBJSTORE_ENDPOINT"), ObjStoreBucket: os.Getenv("RHIZA_OBJSTORE_BUCKET"), ObjStoreRegion: os.Getenv("RHIZA_OBJSTORE_REGION"),
 		ObjStoreInsecure: objStoreInsecure, ObjStoreRetries: objStoreRetries, ObjStoreAccessKey: os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY"),

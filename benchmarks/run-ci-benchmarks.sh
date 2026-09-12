@@ -85,20 +85,28 @@ run_revision() {
 	local label=$1
 	local source=$2
 	local output="$output_dir/$label.txt"
-	local package benchmark
+	local package benchmark sample_time
+	local -a selected
 	for package in "${packages[@]}"; do
 		case "$package" in
-			qlog) benchmark='^BenchmarkWAL(AppendSync|ScanScratch)$' ;;
-			quepaxa) benchmark='^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' ;;
-			materializer) benchmark='^BenchmarkSQLBatchApply/(1|8|32|64|128)$' ;;
-			network) benchmark=$network_benchmark ;;
+			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
+			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$') ;;
+			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$') ;;
+			network) selected=("$network_benchmark") ;;
 		esac
+		for benchmark in "${selected[@]}"; do
+			sample_time=$bench_time
+			# Snapshot setup is excluded from timing; bound iterations to avoid
+			# calibration multiplying expensive untimed database updates.
+			if [[ $benchmark == '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' ]]; then
+				sample_time=20x
+			fi
 		(
 			cd "$source"
 			GOMAXPROCS=$bench_procs "$work_root/bin/$label-$package.test" \
 				-test.run '^$' \
 				-test.bench "$benchmark" \
-				-test.benchtime "$bench_time" \
+				-test.benchtime "$sample_time" \
 				-test.count 1 \
 				-test.benchmem \
 				-test.cpu "$bench_procs" \
@@ -108,6 +116,7 @@ run_revision() {
 			return 1
 		fi
 		printf 'baseline %s benchmark failed; continuing with available comparisons\n' "$package" | tee -a "$output"
+		done
 	done
 }
 
@@ -128,6 +137,7 @@ done
 	printf 'network_optimization=%s\n' "$network_optimization"
 	printf 'samples=%s\n' "$bench_count"
 	printf 'benchtime=%s\n' "$bench_time"
+	printf 'graph_snapshot_benchtime=20x\n'
 	printf 'gomaxprocs=%s\n' "$bench_procs"
 	printf 'go=%s\n' "$(go version)"
 	printf 'kernel=%s\n' "$(uname -srvmo)"

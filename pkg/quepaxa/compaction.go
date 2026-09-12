@@ -14,16 +14,19 @@ import (
 // verifying both the checkpoint bytes and the consensus certificate that
 // sealed that exact root.
 func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
-	if c.reconfigEnabled {
-		return fmt.Errorf("checkpoint recovery is unavailable with reconfiguration enabled")
-	}
 	if c.Tip() >= seal.Index {
 		return fmt.Errorf("invalid checkpoint recovery base")
 	}
 	if err := c.ValidateCheckpointBase(ctx, seal, certified); err != nil {
 		return err
 	}
-	base := consensusBase{ConfigID: seal.ConfigID, ClosedThrough: seal.Index, PrefixHash: seal.PrefixHash, RecoveryRoot: seal.RootHash, LeaderEpoch: leaderEpoch(seal.Index + 1), NextLeaderOrder: append([]NodeID(nil), seal.NextLeaderOrder...), FollowingLeaderOrder: append([]NodeID(nil), seal.FollowingLeaderOrder...)}
+	leaderEpoch := leaderEpoch(seal.Index + 1)
+	if verifier, err := c.checkpointMembershipForSeal(seal); err == nil && verifier != nil {
+		verifier.mu.RLock()
+		leaderEpoch = verifier.leaderEpochKeyLocked(seal.Index + 1)
+		verifier.mu.RUnlock()
+	}
+	base := consensusBase{ConfigID: seal.ConfigID, ClosedThrough: seal.Index, PrefixHash: seal.PrefixHash, RecoveryRoot: seal.RootHash, LeaderEpoch: leaderEpoch, NextLeaderOrder: append([]NodeID(nil), seal.NextLeaderOrder...), FollowingLeaderOrder: append([]NodeID(nil), seal.FollowingLeaderOrder...), Membership: cloneMembershipPointer(seal.Membership), GenerationAnchorHash: seal.GenerationAnchorHash}
 	payload, err := json.Marshal(base)
 	if err != nil {
 		return err
@@ -44,6 +47,12 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 	if err := c.wal.Compact(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, retained); err != nil {
 		return err
 	}
+	if err := c.installGenerationAnchorBaseLocked(base.GenerationAnchorHash); err != nil {
+		return err
+	}
+	if err := c.installMembershipBaseLocked(base); err != nil {
+		return err
+	}
 	c.installBaseLocked(base)
 	c.advanceTipLocked()
 	c.pruneSlotAllocatorLocked()
@@ -51,28 +60,128 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 	return nil
 }
 
-// ValidateCheckpointBase authenticates a recovery base without mutating local state.
-func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+// InstallFencedGenerationBase installs a fresh target WAL's externally
+// verified recovery floor. Its anchor is administrative lineage evidence, not
+// a substitute for a source quorum certificate.
+func (c *Core) InstallFencedGenerationBase(ctx context.Context, fenced FencedGenerationBase) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if fenced.ConfigID == 0 || fenced.Index == 0 || fenced.Index == ^Slot(0) || fenced.PrefixHash == ([32]byte{}) || fenced.RootHash == ([32]byte{}) || fenced.AnchorHash == ([32]byte{}) {
+		return fmt.Errorf("invalid fenced generation base")
+	}
+	c.checkpointMu.Lock()
+	defer c.checkpointMu.Unlock()
+	c.lockCompactionBarrier()
+	defer c.unlockCompactionBarrier()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fenced.ConfigID != c.config.ConfigID {
+		return fmt.Errorf("fenced generation base config does not match target bootstrap configuration")
+	}
+	if c.generationAnchorHash != ([32]byte{}) {
+		if c.generationAnchorHash != fenced.AnchorHash {
+			return fmt.Errorf("fenced generation base anchor does not match local lineage")
+		}
+		prefix, ok := c.prefixes[fenced.Index]
+		if c.floor != fenced.Index || c.floorRoot != fenced.RootHash || !ok || prefix != fenced.PrefixHash {
+			return fmt.Errorf("fenced generation base is inconsistent with local lineage")
+		}
+		return nil
+	}
+	if c.tip != 0 || c.floor != 0 || len(c.decided) != 0 || len(c.recorders) != 0 || len(c.preparedCheckpoints) != 0 || c.reconfiguration != nil || len(c.configHistory) != 1 {
+		return fmt.Errorf("fenced generation base requires an empty target core")
+	}
+	if err := c.freshFencedGenerationWALLocked(); err != nil {
+		return err
+	}
+	leaderKey := c.leaderEpochKeyLocked(fenced.Index + 1)
+	first := uint64(leaderKey)
 	if c.reconfigEnabled {
-		return fmt.Errorf("checkpoint recovery is unavailable with reconfiguration enabled")
+		first = uint64((Slot(leaderKey) - 1) / leaderEpochSize)
 	}
-	if seal.ConfigID != c.config.ConfigID || seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
-		return fmt.Errorf("invalid checkpoint recovery base")
+	base := consensusBase{
+		ConfigID: fenced.ConfigID, ClosedThrough: fenced.Index,
+		PrefixHash: fenced.PrefixHash, RecoveryRoot: fenced.RootHash,
+		LeaderEpoch:          leaderKey,
+		NextLeaderOrder:      rotateMembers(c.config.Members, int(first%uint64(len(c.config.Members)))),
+		GenerationAnchorHash: fenced.AnchorHash,
 	}
-	value, checkpoint, err := DecodeCheckpointSeal(certified.Value)
-	if err != nil || !checkpoint || value.ConfigID != seal.ConfigID || value.Index != seal.Index || value.RootHash != seal.RootHash || value.StateHash != seal.StateHash || value.PrefixHash != seal.PrefixHash || !slices.Equal(value.NextLeaderOrder, seal.NextLeaderOrder) || !slices.Equal(value.FollowingLeaderOrder, seal.FollowingLeaderOrder) {
-		return fmt.Errorf("checkpoint recovery decision does not match its seal")
+	epoch, start, exploration := c.checkpointEpochLocked(fenced.Index)
+	if epoch+1 >= exploration && start+Slot(epoch)*leaderEpochSize <= fenced.Index {
+		base.FollowingLeaderOrder = rotateMembers(c.config.Members, int((first+1)%uint64(len(c.config.Members))))
 	}
-	decision, err := c.certifiedDecision(certified)
+	payload, err := json.Marshal(base)
 	if err != nil {
 		return err
 	}
-	if err := c.validateDecisionForRecovery(decision, true); err != nil {
+	if err := c.wal.Compact(qlog.Entry{Slot: uint64(fenced.Index), Hash: fenced.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, nil); err != nil {
+		return err
+	}
+	if err := c.installGenerationAnchorBaseLocked(fenced.AnchorHash); err != nil {
+		return err
+	}
+	if err := c.installMembershipBaseLocked(base); err != nil {
+		return err
+	}
+	c.installBaseLocked(base)
+	c.advanceTipLocked()
+	c.pruneSlotAllocatorLocked()
+	return nil
+}
+
+// freshFencedGenerationWALLocked permits only the reconfiguration capability
+// marker emitted while creating an otherwise empty target WAL.
+func (c *Core) freshFencedGenerationWALLocked() error {
+	entries, err := c.wal.Read()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Type != qlog.EntryReceipt {
+			return fmt.Errorf("fenced generation base requires an unanchored WAL without consensus history")
+		}
+		marker, err := decodeRecorderEntry(entry.Payload)
+		if err != nil || marker.Slot != 0 || !marker.Reconfiguration {
+			return fmt.Errorf("fenced generation base requires an unanchored WAL without consensus history")
+		}
+	}
+	return nil
+}
+
+// ValidateCheckpointBase authenticates a recovery base without mutating local state.
+func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+	if seal.Index == 0 || seal.RootHash == ([32]byte{}) || seal.PrefixHash == ([32]byte{}) {
+		return fmt.Errorf("invalid checkpoint recovery base")
+	}
+	verifier, err := c.checkpointMembershipForSeal(seal)
+	if err != nil {
+		return err
+	}
+	if verifier != nil && !verifier.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder) {
+		return fmt.Errorf("invalid checkpoint recovery base")
+	}
+	if verifier == nil && (seal.ConfigID != c.config.ConfigID || !c.validateCheckpointLeaderOrders(seal.Index, seal.NextLeaderOrder, seal.FollowingLeaderOrder)) {
+		return fmt.Errorf("invalid checkpoint recovery base")
+	}
+	value, checkpoint, err := DecodeCheckpointSeal(certified.Value)
+	if err != nil || !checkpoint || value.ConfigID != seal.ConfigID || value.Index != seal.Index || value.RootHash != seal.RootHash || value.StateHash != seal.StateHash || value.PrefixHash != seal.PrefixHash || value.GenerationAnchorHash != seal.GenerationAnchorHash || !slices.Equal(value.NextLeaderOrder, seal.NextLeaderOrder) || !slices.Equal(value.FollowingLeaderOrder, seal.FollowingLeaderOrder) || !sameCheckpointMembership(value.Membership, seal.Membership) {
+		return fmt.Errorf("checkpoint recovery decision does not match its seal")
+	}
+	validatorCore := c
+	if verifier != nil {
+		validatorCore = verifier
+	}
+	decision, err := validatorCore.certifiedDecision(certified)
+	if err != nil {
+		return err
+	}
+	if err := validatorCore.validateDecisionForRecovery(decision, true); err != nil {
 		return fmt.Errorf("validate checkpoint recovery decision: %w", err)
 	}
 	c.mu.RLock()
 	validator := c.checkpointValidator
-	tip, floor, floorRoot := c.tip, c.floor, c.floorRoot
+	tip, floor, floorRoot, anchor := c.tip, c.floor, c.floorRoot, c.generationAnchorHash
 	prefix, prefixOK := c.prefixes[seal.Index]
 	c.mu.RUnlock()
 	if validator == nil {
@@ -90,25 +199,27 @@ func (c *Core) ValidateCheckpointBase(ctx context.Context, seal CheckpointSeal, 
 	if floor == seal.Index && floorRoot != seal.RootHash {
 		return fmt.Errorf("local recovery root does not match checkpoint recovery base")
 	}
+	if seal.GenerationAnchorHash != anchor {
+		return fmt.Errorf("checkpoint generation anchor does not match local lineage")
+	}
 	return nil
 }
 
 type consensusBase struct {
-	ConfigID             uint     `json:"config_id"`
-	ClosedThrough        Slot     `json:"closed_through"`
-	PrefixHash           [32]byte `json:"prefix_hash"`
-	RecoveryRoot         [32]byte `json:"recovery_root"`
-	LeaderEpoch          uint64   `json:"leader_epoch"`
-	NextLeaderOrder      []NodeID `json:"next_leader_order"`
-	FollowingLeaderOrder []NodeID `json:"following_leader_order,omitempty"`
+	ConfigID             uint              `json:"config_id"`
+	ClosedThrough        Slot              `json:"closed_through"`
+	PrefixHash           [32]byte          `json:"prefix_hash"`
+	RecoveryRoot         [32]byte          `json:"recovery_root"`
+	LeaderEpoch          uint64            `json:"leader_epoch"`
+	NextLeaderOrder      []NodeID          `json:"next_leader_order"`
+	FollowingLeaderOrder []NodeID          `json:"following_leader_order,omitempty"`
+	Membership           *MembershipRecord `json:"membership,omitempty"`
+	GenerationAnchorHash [32]byte          `json:"generation_anchor_hash,omitzero"`
 }
 
 // CompactThrough installs a certified local recovery floor. Callers must have
 // independently verified and quorum-sealed recoveryRoot before invoking it.
 func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
-	if c.reconfigEnabled {
-		return fmt.Errorf("compaction is unavailable with reconfiguration enabled")
-	}
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}
@@ -140,9 +251,25 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		return err
 	}
 	base := consensusBase{
-		ConfigID: c.config.ConfigID, ClosedThrough: through,
-		PrefixHash: prefix, RecoveryRoot: recoveryRoot, LeaderEpoch: leaderEpoch(through + 1), NextLeaderOrder: order, FollowingLeaderOrder: following,
+		ConfigID: seal.ConfigID, ClosedThrough: through,
+		PrefixHash: prefix, RecoveryRoot: recoveryRoot, LeaderEpoch: c.leaderEpochKeyLocked(through + 1), NextLeaderOrder: order, FollowingLeaderOrder: following,
 	}
+	base.GenerationAnchorHash = c.generationAnchorHash
+	if c.reconfigEnabled {
+		if c.reconfiguration != nil {
+			c.mu.Unlock()
+			c.unlockCompactionBarrier()
+			return fmt.Errorf("compaction cannot cross active reconfiguration")
+		}
+		membership, membershipErr := c.membershipHistoryLocked(through)
+		if membershipErr != nil || seal.Membership == nil || !sameMembershipRecord(membership, *seal.Membership) {
+			c.mu.Unlock()
+			c.unlockCompactionBarrier()
+			return fmt.Errorf("compaction seal has stale membership history")
+		}
+		base.Membership = cloneMembershipPointer(seal.Membership)
+	}
+	membershipVersion := c.membershipVersion
 	payload, err := json.Marshal(base)
 	if err != nil {
 		c.mu.Unlock()
@@ -171,10 +298,13 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	defer c.unlockCompactionBarrier()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.floor >= through {
+	if c.floor >= through || c.membershipVersion != membershipVersion || c.reconfiguration != nil {
 		return fmt.Errorf("compaction floor advanced while rewrite was running")
 	}
 	if err := compaction.Commit(); err != nil {
+		return err
+	}
+	if err := c.installMembershipBaseLocked(base); err != nil {
 		return err
 	}
 	c.installBaseLocked(base)
@@ -324,6 +454,9 @@ func (c *Core) installBaseLocked(base consensusBase) {
 	c.baseFollowingOrder = nil
 	if len(base.FollowingLeaderOrder) != 0 {
 		c.baseFollowingEpoch = base.LeaderEpoch + 1
+		if c.reconfigEnabled {
+			c.baseFollowingEpoch = base.LeaderEpoch + uint64(leaderEpochSize)
+		}
 		c.baseFollowingOrder = append([]NodeID(nil), base.FollowingLeaderOrder...)
 	}
 	c.tip = base.ClosedThrough
@@ -376,6 +509,67 @@ func (c *Core) installBaseLocked(base consensusBase) {
 		close(c.tipChanged)
 		c.tipChanged = make(chan struct{})
 	}
+}
+
+func cloneMembershipPointer(record *MembershipRecord) *MembershipRecord {
+	if record == nil {
+		return nil
+	}
+	copy := cloneMembershipRecord(*record)
+	return &copy
+}
+
+func sameCheckpointMembership(left, right *MembershipRecord) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return sameMembershipRecord(*left, *right)
+}
+
+// installMembershipBaseLocked restores certificate-routing authority before
+// suffix replay. The bootstrap cluster remains immutable in c.config.
+func (c *Core) installMembershipBaseLocked(base consensusBase) error {
+	if !c.reconfigEnabled {
+		if base.Membership != nil {
+			return fmt.Errorf("fixed-membership base includes membership history")
+		}
+		return nil
+	}
+	if base.Membership == nil {
+		if base.GenerationAnchorHash != ([32]byte{}) && len(c.configHistory) == 1 && c.config.ConfigID == base.ConfigID {
+			return nil
+		}
+		return fmt.Errorf("reconfiguration base lacks membership history")
+	}
+	verifier, err := validateMembershipHistory(*c.config, *base.Membership)
+	if err != nil {
+		return fmt.Errorf("recover base membership: %w", err)
+	}
+	c.configHistory = append([]configEpoch(nil), verifier.configHistory...)
+	c.retiredIDs = make(map[NodeID]struct{}, len(verifier.retiredIDs))
+	for id := range verifier.retiredIDs {
+		c.retiredIDs[id] = struct{}{}
+	}
+	c.baseMembership = cloneMembershipPointer(base.Membership)
+	c.lastAbort = nil
+	if base.Membership.Abort != nil {
+		abort := ConfigTransition{Freeze: cloneDecidedValue(base.Membership.Abort.Freeze), Terminal: cloneDecidedValue(base.Membership.Abort.Terminal)}
+		c.lastAbort = &abort
+	}
+	c.membershipVersion = uint64(len(base.Membership.Transitions))
+	return nil
+}
+
+// installGenerationAnchorBaseLocked keeps an externally fenced lineage stable
+// across every subsequent local recovery base.
+func (c *Core) installGenerationAnchorBaseLocked(anchor [32]byte) error {
+	if c.generationAnchorHash != ([32]byte{}) && c.generationAnchorHash != anchor {
+		return fmt.Errorf("consensus base generation anchor does not match local lineage")
+	}
+	if c.generationAnchorHash == ([32]byte{}) && anchor != ([32]byte{}) {
+		c.generationAnchorHash = anchor
+	}
+	return nil
 }
 
 // pruneSlotAllocatorLocked requires slotMu and mu.

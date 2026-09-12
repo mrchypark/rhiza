@@ -1,0 +1,22 @@
+# Apply only after configuring a trusted fencing executor/backend and installing
+# cluster-crd.yaml (and fence-crd.yaml for the Kubernetes backend). Durations are explicit deployment choices, not inferred defaults.
+apiVersion: rhiza.mrchypark.dev/v1alpha1
+kind: RhizaCluster
+metadata:
+  name: rhiza
+  namespace: rhiza
+spec:
+  logicalID: rhiza-production
+  statefulSet: rhiza
+  container: rhiza
+  adoptClusterID: CHANGE_TO_INITIAL_CLUSTER_ID
+  voterPods:
+    - {nodeID: rhiza-0, pod: rhiza-0}
+    - {nodeID: rhiza-1, pod: rhiza-1}
+    - {nodeID: rhiza-2, pod: rhiza-2}
+  automatic: false
+  policy:
+    failureGraceSeconds: 120
+    cooldownSeconds: 1800
+    maxRecoveriesPerDay: 3
+    allowDataLoss: false

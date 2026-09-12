@@ -43,6 +43,7 @@ type Node struct {
 	archive      *recovery.Manager
 	checkpointer *checkpoint.AutoCheckpointer
 	ready        atomic.Bool
+	membershipMu sync.Mutex
 	opened       atomic.Bool
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
@@ -99,6 +100,12 @@ func validateReadAdmissionConfig(config *types.ExecutionConfig) error {
 // validateVoterMembership mirrors Core's fixed-membership checks before
 // offline enrollment can write a remote registration.
 func validateVoterMembership(config *types.ExecutionConfig) error {
+	if config.EnableReconfiguration && (len(config.Members) < 2 || config.AdminToken == "") {
+		return fmt.Errorf("managed membership requires bootstrap voters and an admin token")
+	}
+	if config.Learner != nil && len(config.Members) == 0 {
+		return fmt.Errorf("learner requires bootstrap members")
+	}
 	if len(config.Members) == 0 {
 		return nil // loadClusterConfig supplies the single-node default later.
 	}
@@ -114,7 +121,11 @@ func validateVoterMembership(config *types.ExecutionConfig) error {
 		seen[member.ID] = struct{}{}
 		local = local || member.ID == config.NodeID
 	}
-	if !local {
+	if config.Learner != nil {
+		if !config.EnableReconfiguration || local || config.Learner.ID != config.NodeID || config.Learner.Token == "" || config.Learner.Token == config.AdminToken {
+			return fmt.Errorf("learner requires reconfiguration, a new local ID, and its own token")
+		}
+	} else if !local {
 		return fmt.Errorf("local node %q is not a voter member", config.NodeID)
 	}
 	return nil
@@ -316,13 +327,28 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.catchUpWake = make(chan struct{}, 1)
 		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
 	}
-	core, err := quepaxa.New(quepaxa.Config{
+	makeCore := quepaxa.New
+	if n.config.Learner != nil {
+		makeCore = quepaxa.NewLearner
+	}
+	core, err := makeCore(quepaxa.Config{
 		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport,
+		EnableReconfiguration:    n.config.EnableReconfiguration,
+		ReconfigurationAdmission: n.verifyMembershipAdmission,
 	})
 	if err != nil {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	if n.config.Learner != nil && n.config.Learner.WALIdentity != "" && n.config.Learner.WALIdentity != core.WALIdentity() {
+		return fmt.Errorf("learner WAL identity differs from configured incarnation")
+	}
+	if n.config.EnableReconfiguration {
+		transport.BindCore(core)
+		if n.catchUp != nil {
+			n.catchUp.BindCore(core)
+		}
+	}
 	if index, root, ok := core.LatestPreparedCheckpoint(); ok {
 		log.Printf("checkpoint recovered: state=prepared index=%d root=%x", index, root)
 	} else if index, root, ok := core.RecoveryRoot(); ok {
@@ -332,6 +358,10 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 			return n.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 		})
+	}
+	generationCheckpoint, err := n.installGenerationAnchor(startupRecovery)
+	if err != nil {
+		return fmt.Errorf("restore generation anchor: %w", startupRecovery.Check(err))
 	}
 	if n.archive != nil {
 		archiveTip := n.archive.Tip()
@@ -400,6 +430,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}, ok
 	})
 	archive := n.archive
+	if n.config.EnableReconfiguration {
+		server.SetMembershipToken(n.config.AdminToken)
+		server.SetMembershipChange(n.changeMembership)
+		server.SetMembershipAbort(n.abortMembership)
+	}
 	server.SetVoterRecoveryStatus(func(ctx context.Context) network.VoterRecoveryStatus {
 		_, _, quorumErr := core.ReadIndex(ctx)
 		archiveTip := uint64(0)
@@ -419,6 +454,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	})
 	if archive != nil {
 		server.SetRecoveryArchive(n.config.AdminToken, func(ctx context.Context) error {
+			if n.config.EnableReconfiguration && !core.IsVoter() {
+				return network.ErrNotReady
+			}
 			return archive.SyncThrough(ctx, core, core.Tip())
 		})
 	}
@@ -435,20 +473,28 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.server = server
 	server.SetCompactedHandler(n.wakeCatchUp)
-	peer, err := network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
+	var peer *network.PeerServer
+	if n.config.Learner != nil {
+		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken, *n.config.Learner)
+	} else {
+		peer, err = network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
+	}
 	if err != nil {
 		return fmt.Errorf("listen peer QUIC: %w", err)
 	}
 	n.peer = peer
 
-	var certifiedCheckpoint *checkpoint.Checkpoint
+	certifiedCheckpoint := generationCheckpoint
 	if n.checkpoints != nil {
 		seal, sealed, sealErr := core.LatestCheckpointSeal()
 		if sealErr != nil {
 			return sealErr
 		}
-		if current := n.checkpoints.Latest(); current != nil && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
-			return fmt.Errorf("checkpoint CURRENT is not backed by the certified seal")
+		if current := n.checkpoints.Latest(); current != nil {
+			anchorCurrent := !sealed && generationCheckpoint != nil && current.Index == generationCheckpoint.Index && current.RootHash == generationCheckpoint.RootHash
+			if !anchorCurrent && (!sealed || current.Index > uint64(seal.Index) || current.Index == uint64(seal.Index) && current.RootHash != seal.RootHash) {
+				return fmt.Errorf("checkpoint CURRENT is not backed by certified recovery evidence")
+			}
 		}
 		if sealed {
 			certifiedCheckpoint, err = n.checkpoints.OpenRoot(startupRecovery.Context(), uint64(seal.Index), seal.RootHash)
@@ -461,6 +507,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
 			if err != nil {
 				return fmt.Errorf("pin certified checkpoint recovery root: %w", startupRecovery.Check(err))
+			}
+		} else if certifiedCheckpoint != nil {
+			certifiedCheckpoint, err = startupRecovery.PinRoot(startupRecovery.Context(), n.checkpoints, certifiedCheckpoint, startupRecovery.Owner())
+			if err != nil {
+				return fmt.Errorf("pin generation recovery root: %w", startupRecovery.Check(err))
 			}
 		}
 	}
@@ -557,6 +608,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					if n.config.EnableReconfiguration && !core.IsVoter() {
+						continue
+					}
 					if err := n.catchUpArchive(ctx); err != nil {
 						log.Printf("shared archive catch-up error: %v", err)
 					} else if err := n.archive.SyncThrough(ctx, core, core.Tip()); err != nil {
@@ -606,7 +660,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.checkpointer.ConfigurePublication(
 			func() bool {
 				seal, ok, err := core.LatestCheckpointSeal()
-				return err == nil && (!ok || material.Tip() > uint64(seal.Index))
+				return core.IsVoter() && err == nil && (!ok || material.Tip() > uint64(seal.Index))
 			},
 			func(ctx context.Context, root *checkpoint.Checkpoint) error {
 				prefix, ok := core.PrefixHash(quepaxa.Slot(root.Index))
@@ -620,6 +674,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				seal := quepaxa.CheckpointSeal{
 					ConfigID: core.ConfigID(), Index: quepaxa.Slot(root.Index), RootHash: root.RootHash,
 					StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: order, FollowingLeaderOrder: following,
+					GenerationAnchorHash: core.GenerationAnchorHash(),
+				}
+				if n.config.EnableReconfiguration {
+					history, err := core.CheckpointMembership(quepaxa.Slot(root.Index))
+					if err != nil {
+						return err
+					}
+					seal.Membership = &history
 				}
 				if err := n.checkpoints.ValidatePublisherClaim(ctx, string(core.NodeID()), root.Index, root.RootHash); err != nil {
 					return err
@@ -1042,8 +1104,33 @@ func (n *Node) replayLocalDecisions(ctx context.Context) error {
 	}
 }
 
+// A learner pulls certified history without running voter recovery. Its WAL
+// identity remains distinct, and only a terminal decision grants voting rights.
+func (n *Node) catchUpMembership(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) error {
+	if n.config.EnableReconfiguration {
+		current := n.core.CurrentCluster()
+		cluster = &current
+	}
+	if n.config.Learner == nil || n.core.IsVoter() {
+		return n.catchUpQuorum(ctx, transport, cluster)
+	}
+	var last error = quepaxa.ErrQuorumUnavailable
+	for _, member := range cluster.Members {
+		if member.ID == n.core.NodeID() {
+			continue
+		}
+		if last = n.catchUpPeer(ctx, transport, member.ID); last == nil {
+			if err := n.core.EnsureDurableThrough(ctx, n.core.Tip()); err != nil {
+				return err
+			}
+			return n.replayLocalDecisions(ctx)
+		}
+	}
+	return last
+}
+
 func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, cluster *quepaxa.Cluster) {
-	n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
+	n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
 	var round uint64
 	for {
 		delay := syncInterval(n.config.NodeID, round)
@@ -1066,8 +1153,12 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 				}
 			}
 		}
+		if n.config.EnableReconfiguration {
+			current := n.core.CurrentCluster()
+			cluster = &current
+		}
 		if !n.ready.Load() {
-			n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
+			n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
 		} else if sources := syncSources(n.config.NodeID, cluster.Members, round); len(sources) > 0 {
 			var syncErr error
 			for _, source := range sources {
@@ -1081,7 +1172,7 @@ func (n *Node) startCatchUp(ctx context.Context, transport *network.Transport, c
 			// A compacted peer can force checkpoint recovery from catchUpPeer.
 			// Only a fresh quorum round may make that node ready again.
 			if !n.ready.Load() {
-				n.observeCatchUp(n.catchUpQuorum(ctx, transport, cluster))
+				n.observeCatchUp(n.catchUpMembership(ctx, transport, cluster))
 			}
 		}
 		round++
@@ -1275,7 +1366,7 @@ func (n *Node) Shutdown() error {
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
 	}
-	if n.archive != nil && n.material != nil && n.core != nil {
+	if n.archive != nil && n.material != nil && n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()); err != nil {
 			shutdownErr = errors.Join(shutdownErr, err)

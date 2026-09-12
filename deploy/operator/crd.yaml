@@ -47,7 +47,7 @@ spec:
                   minimum: 0
                 fence:
                   type: object
-                  description: Trusted out-of-band administrator attestation. The controller never infers it from pod disappearance.
+                  description: Trusted out-of-band administrator attestation covering every old process, archive/GC writer, and standalone voter workload. The controller never infers it from Pod disappearance or StatefulSet scale-down.
                   properties:
                     recoveryID:
                       type: string
@@ -59,6 +59,62 @@ spec:
                       type: boolean
                     evidence:
                       type: string
+                membership:
+                  type: object
+                  description: Externally fenced online voter replacement. The replacement learner Pod and immutable credential Secret are provisioned separately; this never rolls the StatefulSet.
+                  required: [operationID, remove, fence, voterPods, replacementPod, replacementSecret]
+                  properties:
+                    operationID:
+                      type: string
+                      minLength: 1
+                    remove:
+                      type: string
+                      minLength: 1
+                    voterPods:
+                      type: array
+                      minItems: 1
+                      description: Explicit node ID to Pod mappings for every currently reachable voter that may form quorum, including standalone replacements from earlier operations. This controller does not discover voter workloads.
+                      items:
+                        type: object
+                        required: [nodeID, pod]
+                        properties:
+                          nodeID:
+                            type: string
+                            minLength: 1
+                          pod:
+                            type: string
+                            minLength: 1
+                    removedPod:
+                      type: string
+                      description: Optional failed-workload Pod name when it differs from remove. Its UID must match the external fence if the Pod still exists.
+                    abortAddition:
+                      type: boolean
+                      description: Explicitly abort the journaled addition through the surviving quorum. Learner or Secret unavailability never aborts automatically.
+                    replacementPod:
+                      type: string
+                      minLength: 1
+                    replacementSecret:
+                      type: string
+                      minLength: 1
+                    fence:
+                      type: object
+                      description: Trusted external attestation that revokes the failed incarnation's process, archive/GC writers, and recreation authority. Pod deletion is not a fence.
+                      required: [nodeID, walIdentity, workloadUID, confirmed, evidence]
+                      properties:
+                        nodeID:
+                          type: string
+                          minLength: 1
+                        walIdentity:
+                          type: string
+                          minLength: 1
+                        workloadUID:
+                          type: string
+                          minLength: 1
+                        confirmed:
+                          type: boolean
+                        evidence:
+                          type: string
+                          minLength: 1
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true

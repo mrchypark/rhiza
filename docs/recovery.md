@@ -14,13 +14,19 @@ process permission to forget an existing voter's recorded proposals.
 | Voter falls behind | Fetch certified peer/archive history; restore a pinned checkpoint when needed. |
 | One of three voters unavailable | The remaining majority continues quorum operations. |
 | Two of three voters temporarily unavailable | Restore the original nodes/disks/network. Quorum operations remain unavailable; local reads on running nodes remain possible. |
-| Voter WAL permanently lost | Refuse automatic reuse of its registered identity. Recover the original voting state or use a separately designed, explicitly fenced disaster-recovery procedure. |
-| Membership change or learner promotion | Not an online operation currently supported by Rhiza. Editing the member list is not reconfiguration. |
+| Voter WAL permanently lost | Never reuse its registered identity with an empty WAL. With a surviving quorum, fence the lost voter and replace it through a fresh learner; otherwise use explicitly fenced whole-generation recovery. |
+| Membership change or learner promotion | Supported through opt-in authenticated reconfiguration with a surviving quorum, fencing, and durable learner admission. Editing the bootstrap member list is not reconfiguration. |
 
 `Ready()` describes completed local startup/catch-up, not current quorum
 availability. Do not turn quorum loss into a liveness policy that restarts all
 voters or replaces their volumes. Recovery-time Record RPCs remain necessary
 for voters with intact state to resolve unfinished slots during a full restart.
+
+Online replacement has two Operator paths: manual `RhizaRecovery.spec.membership`
+uses an externally provisioned learner and trusted fence attestation; opt-in
+`RhizaCluster` automatic recovery requests fencing and provisions the learner
+after matching proof. See the [membership workflow](membership-completion-plan.md).
+Passive fixed read replicas remain outside membership reconfiguration.
 
 ## Voter registration and upgrades
 
@@ -85,7 +91,7 @@ Two or three lost WALs use the same full-generation disaster-recovery path.
 Preserved WALs should first regain their original quorum; missing pods and
 failed probes alone never authorize a generation change.
 
-A requested recovery requires an out-of-band fence attestation tied to the
+A manual recovery request requires an out-of-band fence attestation tied to the
 source cluster, StatefulSet UID, and recovery operation. All old voters,
 clients, read replicas, and archive/GC writers must be fenced. The operator
 reserves one successor, atomically seals the source archive HEAD against late
@@ -93,6 +99,14 @@ publication, verifies and copies its certified checkpoint and suffix into a
 new namespace, and restarts the StatefulSet with a new ClusterID and peer
 credentials. The ordinal names remain unchanged. This is a service-interrupting
 whole-generation recovery, not online voter replacement or membership changes.
+
+The opt-in automatic loop can choose online voter replacement when quorum
+survives or whole-generation recovery when it is lost. Its Kubernetes backend
+submits an immutable `RhizaFence` and waits for proof of termination of the
+requested identity scope, recreation prevention, and storage quiescence. A Pod
+delete response is not proof. The supplied executor is qualified only in CI on
+single-node kind with dedicated MinIO; production requires a trusted,
+environment-specific runtime/storage executor. Missing proof blocks recovery.
 
 The source generation's immutable membership record binds its durability mode.
 An `async` source requires explicit `allowDataLoss`, even when the target uses

@@ -10,6 +10,109 @@ permissions:
   contents: read
 
 jobs:
+  operator-chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build test images and Kubernetes cluster
+        env:
+          CGO_ENABLED: 0
+        run: |
+          go install sigs.k8s.io/kind@v0.32.0
+          mkdir -p "$RUNNER_TEMP/chaos-images"
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza
+          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
+          kind create cluster --name rhiza-operator-chaos --wait 120s
+          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
+      - name: Inject faults and verify Operator recovery
+        run: python3 -u e2e/chaos/operator_recovery.py
+      - name: Collect cluster diagnostics
+        if: always()
+        run: kind export logs operator-chaos-results/kind --name rhiza-operator-chaos || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: operator-chaos-${{ github.run_id }}
+          path: operator-chaos-results
+      - name: Remove test cluster
+        if: always()
+        run: kind delete cluster --name rhiza-operator-chaos
+
+  automatic-operator-chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Fencing executor regression checks
+        run: python3 e2e/chaos/kind_fencer_test.py
+      - name: Build test images and Kubernetes cluster
+        env:
+          CGO_ENABLED: 0
+        run: |
+          go install sigs.k8s.io/kind@v0.32.0
+          mkdir -p "$RUNNER_TEMP/chaos-images"
+          go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza
+          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
+          kind create cluster --name rhiza-operator-chaos --wait 120s
+          kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
+      - name: Inject faults and verify unattended Operator recovery
+        run: python3 -u e2e/chaos/automatic_recovery.py
+      - name: Collect cluster diagnostics
+        if: always()
+        run: kind export logs automatic-chaos-results/kind --name rhiza-operator-chaos || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: automatic-operator-chaos-${{ github.run_id }}
+          path: automatic-chaos-results
+      - name: Remove test cluster
+        if: always()
+        run: kind delete cluster --name rhiza-operator-chaos
+
+  membership-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Membership lifecycle with real QUIC and object storage
+        env:
+          CGO_ENABLED: 1
+          RHIZA_E2E_S3_ENDPOINT: 127.0.0.1:19000
+          RHIZA_E2E_S3_BUCKET: rhiza
+          RHIZA_E2E_S3_ACCESS_KEY: rhiza-e2e
+          RHIZA_E2E_S3_SECRET_KEY: rhiza-e2e-secret
+        run: |
+          docker run --rm -d --name rhiza-membership-minio -p 19000:9000 \
+            -e MINIO_ROOT_USER=rhiza-e2e -e MINIO_ROOT_PASSWORD=rhiza-e2e-secret \
+            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          trap 'docker logs rhiza-membership-minio; docker rm -f rhiza-membership-minio' EXIT
+          for _ in {1..100}; do
+            curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null 2>&1 && break
+            sleep 0.1
+          done
+          curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null
+          docker run --rm --network host --entrypoint /bin/sh \
+            quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
+            -c 'mc alias set local http://127.0.0.1:19000 rhiza-e2e rhiza-e2e-secret && mc mb --ignore-existing local/rhiza'
+          go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
+
   rust-sdk:
     strategy:
       matrix:
