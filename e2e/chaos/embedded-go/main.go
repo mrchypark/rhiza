@@ -59,6 +59,7 @@ func main() {
 	app.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]bool{"alive": true}, nil)
 	})
+
 	app.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
 		if !db.Ready() {
 			http.Error(w, "not ready", http.StatusServiceUnavailable)
@@ -91,6 +92,7 @@ func main() {
 			respond(w, result, nil)
 			return
 		}
+
 		result, err := db.Execute(r.Context(), req)
 		respond(w, result, err)
 	})
@@ -213,3 +215,4 @@ func (g *anchorGuard) clear(ctx context.Context, s *snap) error {
 }
 
 func (g *anchorGuard) fail(_ context.Context, _ *snap) {}
+
