@@ -173,15 +173,22 @@ NetworkPolicy로 Operator에서의 접근을 허용한다. HTTP이므로 신뢰�
 namespace를 맞춘다. Operator의 `rhiza-config`, `rhiza-object-store` 참조도
 애플리케이션과 동일한 저장소를 가리키도록 설정한다.
 
-Operator 이미지는 Rhiza 저장소 루트에서 직접 빌드할 수 있다.
+GitHub Release 발행 시 Operator 이미지를
+`ghcr.io/mrchypark/rhiza-operator:v0.14.1`처럼 릴리즈 태그로 게시한다.
+정식 릴리즈는 `latest`도 갱신하며 prerelease는 버전 태그만 게시한다.
+현재 지원 플랫폼은 `linux/amd64`다. CLI 실행 파일은 별도로 배포하지 않는다.
+이미지 게시와 Kubernetes 설치는 별개이며, 운영 클러스터에는 직접 적용한다.
+
+자체 레지스트리를 사용하면 Rhiza 저장소 루트에서 직접 빌드할 수 있다.
 
 ```sh
 docker build -f Dockerfile.operator -t YOUR_REGISTRY/rhiza-operator:YOUR_VERSION .
 docker push YOUR_REGISTRY/rhiza-operator:YOUR_VERSION
 ```
 
-Deployment의 image를 이 태그로 교체한다. 샘플 `rhiza-operator:latest`는
-공개 레지스트리에 배포되었다는 의미가 아니다. CRD를 먼저 설치하고 해당
+Deployment의 image를 GHCR의 버전 태그(또는 자체 이미지)로 교체한다.
+샘플 `rhiza-operator:latest`는 로컬 이미지 이름이다. GHCR 패키지가 private이면
+읽기 권한을 가진 `imagePullSecrets`를 설정한다. CRD를 먼저 설치하고 해당
 namespace에 RBAC와 Operator Deployment를 적용한다.
 
 ```yaml
