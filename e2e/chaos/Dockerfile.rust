@@ -1,0 +1,5 @@
+# Rust SDK links the native Go archive for linux-gnu.
+FROM ubuntu:24.04
+COPY rhiza /usr/local/bin/rhiza-entrypoint
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/rhiza-entrypoint"]

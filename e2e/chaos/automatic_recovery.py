@@ -6,6 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 import time
+import urllib.error
 
 from operator_recovery import Chaos
 from kind_fencer import KindFencer
@@ -16,11 +17,34 @@ class AutomaticChaos(Chaos):
         # Hold only newly provisioned learners before the database starts. This
         # gives the fault injector a deterministic window to install UDP loss.
         for obj in objs if isinstance(objs, list) else [objs]:
+            if self.args.embedded_host != "server" and obj.get("kind") == "ConfigMap" and obj["metadata"]["name"] == "rhiza-config":
+                obj["data"]["RHIZA_BIND_ADDR"] = "0.0.0.0:9091"
             if obj.get("kind") == "StatefulSet" and obj["metadata"]["name"] == "rhiza":
                 ctr = obj["spec"]["template"]["spec"]["containers"][0]
+                if self.args.embedded_host != "server":
+                    ctr["ports"].append({"name": "recovery", "containerPort": 9091})
                 ctr["command"] = ["/bin/sh", "-ec"]
                 ctr["args"] = ['if [ -n "${RHIZA_LEARNER:-}" ]; then while [ ! -f /data/.chaos-start ]; do sleep 0.2; done; fi; exec /usr/local/bin/rhiza-entrypoint']
         super().apply(objs)
+
+    def verify_embedded(self, pod):
+        if self.args.embedded_host == "server":
+            return
+        host = self.http(pod, "/host")
+        assert host["host"] == self.args.embedded_host + "-embedded", host
+        for route, port in (("/membership/status", 8080), ("/sql/query", 9091)):
+            try:
+                self.http(pod, route, remote_port=port)
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 404, (route, port, exc.code)
+            else:
+                raise AssertionError(f"unexpected API exposure: {route} on {port}")
+        self.event("embedded_host_verified", pod=pod, host=host["host"], management_port=9091)
+
+    def verify_data(self, pod):
+        result = super().verify_data(pod)
+        self.verify_embedded(pod)
+        return result
 
     def start_learner(self, name):
         if not hasattr(self, "learner_logs"):
@@ -46,6 +70,8 @@ class AutomaticChaos(Chaos):
             self.k("apply", "-f", str(root / f"deploy/operator/{name}-crd.yaml"))
             self.k("wait", "--for=condition=Established", f"crd/{plural}.rhiza.mrchypark.dev", "--timeout=60s")
         self.setup()
+        for pod in ("rhiza-0", "rhiza-1", "rhiza-2"):
+            self.verify_embedded(pod)
         permission = subprocess.run(["kubectl", "--context", self.context, "-n", self.ns,
             "auth", "can-i", "update", "rhizafences.rhiza.mrchypark.dev", "--subresource=status",
             "--as=system:serviceaccount:" + self.ns + ":rhiza-operator"], capture_output=True, text=True, timeout=30)
@@ -215,6 +241,7 @@ class AutomaticChaos(Chaos):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--embedded-host", choices=("server", "go", "rust"), default="server")
     parser.add_argument("--cluster",default="rhiza-operator-chaos")
     parser.add_argument("--db-image",default="rhiza-chaos:local")
     parser.add_argument("--operator-image",default="rhiza-operator-chaos:local")
