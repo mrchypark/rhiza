@@ -76,9 +76,10 @@ let mut db = rhizadb::Db::open_from_env()?;
 let recovery_addr = db.start_operator("127.0.0.1:9091")?;
 ```
 
-`start_operator` serves only `GET /recovery/status` and authenticated
-`POST /recovery/archive`; application SQL, KV, graph, readiness, and metrics
-routes return 404. Keep the bound address private to the operator. It can be
+`start_operator` serves `GET /recovery/status` plus authenticated
+`GET /recovery/probe`, `POST /recovery/archive`, `GET /membership/status`,
+`POST /membership/change`, and `POST /membership/abort`; application SQL, KV,
+graph, readiness, and metrics routes return 404. Keep the bound address private to the operator. It can be
 started once and stops with `Db::close` or `Drop`. The environment is read at
 open time, so recovery generations require the host process to restart with
 the operator-provided `RHIZA_*` values.

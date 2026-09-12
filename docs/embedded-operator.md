@@ -32,16 +32,20 @@ return server.ListenAndServe()
 
 [실행 가능한 Go 예제](../examples/operator-embedded/main.go)를 참고한다.
 업무 처리는 같은 `db`의 인프로세스 API를 사용한다. 기존 애플리케이션 HTTP
-서버가 있다면 별도 포트에 위 핸들러를 제공하거나, 정확한 `/recovery/status`,
-`/recovery/archive` 경로만 라우터에 연결한다. 접두 경로를 추가하지 않는다.
+서버가 있다면 별도 포트에 위 핸들러를 제공하거나, 아래 정확한 경로만 라우터에
+연결한다. 접두 경로를 추가하지 않는다.
 
-`OperatorHandler()`는 다음 두 경로만 제공한다. SQL·KV·Graph 등 일반 DB API와
+`OperatorHandler()`는 다음 여섯 경로만 제공한다. SQL·KV·Graph 등 일반 DB API와
 `/ready`는 노출하지 않는다. 기존 `db.Handler()`를 사용하는 서버도 계속 호환된다.
 
 | 경로 | 동작 |
 | --- | --- |
 | `GET /recovery/status` | 현재 세대·durability·복구 위치와 실제 quorum 확인. 로컬 Ready와 quorum은 다르다. |
+| `GET /recovery/probe` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>`와 query nonce를 보내고, 응답 HMAC으로 새 recovery 상태를 검증. |
 | `POST /recovery/archive` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 로컬 확정 suffix를 저장소에 발행. 빈 토큰은 비활성화. |
+| `GET /membership/status` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 현재 membership 상태를 반환. |
+| `POST /membership/change` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 membership 변경을 요청. |
+| `POST /membership/abort` | `Authorization: Bearer <RHIZA_ADMIN_TOKEN>` 인증 후 진행 중인 membership 추가를 중단. |
 
 ### Rust
 
@@ -158,7 +162,7 @@ Operator는 소유 StatefulSet UID에 속한 Pod IP로 직접 접근한다.
 `recovery`라는 컨테이너 포트가 있으면 사용하고, 없으면 기존 `http` 포트,
 그것도 없으면 8080을 사용한다. 복구 포트는 인터넷/Ingress로 공개하지 말고
 NetworkPolicy로 Operator에서의 접근을 허용한다. HTTP이므로 신뢰할 수 있는
-클러스터 네트워크에서 사용한다. 애플리케이션의 로그인 middleware로 두 복구
+클러스터 네트워크에서 사용한다. 애플리케이션의 로그인 middleware로 관리
 경로를 가로막지 않는다. readiness/liveness는 별도의 애플리케이션 경로를
 사용하고, quorum 상실만으로 모든 Pod를 재시작하는 probe를 만들지 않는다.
 
@@ -169,15 +173,22 @@ NetworkPolicy로 Operator에서의 접근을 허용한다. HTTP이므로 신뢰�
 namespace를 맞춘다. Operator의 `rhiza-config`, `rhiza-object-store` 참조도
 애플리케이션과 동일한 저장소를 가리키도록 설정한다.
 
-Operator 이미지는 Rhiza 저장소 루트에서 직접 빌드할 수 있다.
+GitHub Release 발행 시 Operator 이미지를
+`ghcr.io/mrchypark/rhiza-operator:v0.14.1`처럼 릴리즈 태그로 게시한다.
+정식 릴리즈는 `latest`도 갱신하며 prerelease는 버전 태그만 게시한다.
+현재 지원 플랫폼은 `linux/amd64`다. CLI 실행 파일은 별도로 배포하지 않는다.
+이미지 게시와 Kubernetes 설치는 별개이며, 운영 클러스터에는 직접 적용한다.
+
+자체 레지스트리를 사용하면 Rhiza 저장소 루트에서 직접 빌드할 수 있다.
 
 ```sh
 docker build -f Dockerfile.operator -t YOUR_REGISTRY/rhiza-operator:YOUR_VERSION .
 docker push YOUR_REGISTRY/rhiza-operator:YOUR_VERSION
 ```
 
-Deployment의 image를 이 태그로 교체한다. 샘플 `rhiza-operator:latest`는
-공개 레지스트리에 배포되었다는 의미가 아니다. CRD를 먼저 설치하고 해당
+Deployment의 image를 GHCR의 버전 태그(또는 자체 이미지)로 교체한다.
+샘플 `rhiza-operator:latest`는 로컬 이미지 이름이다. GHCR 패키지가 private이면
+읽기 권한을 가진 `imagePullSecrets`를 설정한다. CRD를 먼저 설치하고 해당
 namespace에 RBAC와 Operator Deployment를 적용한다.
 
 ```yaml
@@ -198,6 +209,11 @@ spec:
 `container`는 Rhiza를 연 애플리케이션 컨테이너의 정확한 이름이다. 빈
 `recoveryID`는 관찰만 한다. `kubectl get rhizarecoveries -n YOUR_NAMESPACE -o yaml`로
 peer의 Ready/Quorum과 상태 메시지를 확인한다.
+
+자동 복구는 [Operator 배포 안내](../deploy/operator/README.md#automatic-recovery-with-kubernetes-fencing)의
+`RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`로 켜며 모든 voter의
+opt-in이 필요하다. executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
+command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
 
 ## 5. 두 개 또는 전체 Pod 유실 후 복구
 

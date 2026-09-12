@@ -1,6 +1,6 @@
 // Run inside a three-voter no-PVC StatefulSet configured as documented in
 // docs/embedded-operator.md. The application uses db in process; this listener
-// exposes only the two operator recovery endpoints.
+// exposes only the six operator recovery and membership endpoints.
 package main
 
 import (

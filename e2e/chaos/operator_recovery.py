@@ -69,9 +69,9 @@ class Chaos:
             time.sleep(0.5)
         raise AssertionError(f"timeout: {label}; last={last}")
 
-    def forward(self, pod):
+    def forward(self, pod, remote_port=8080):
         # Each writer has its own forward; replacing a Pod invalidates its UID.
-        key = (threading.get_ident(), pod)
+        key = (threading.get_ident(), pod, remote_port)
         uid = self.get("pod", pod)["metadata"]["uid"]
         old = self.forwards.get(key)
         if old and old[0] == uid and old[1].poll() is None:
@@ -82,9 +82,9 @@ class Chaos:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        log = open(self.out / f"forward-{pod}-{key[0]}.log", "a")
+        log = open(self.out / f"forward-{pod}-{key[0]}-{remote_port}.log", "a")
         proc = subprocess.Popen(["kubectl", "--context", self.context, "-n", self.ns,
-                                 "port-forward", "pod/" + pod, f"{port}:8080"], stdout=log, stderr=log)
+                                 "port-forward", "pod/" + pod, f"{port}:{remote_port}"], stdout=log, stderr=log)
         log.close()
         self.forwards[key] = (uid, proc, port)
         try:
@@ -102,8 +102,11 @@ class Chaos:
         except OSError:
             return False
 
-    def http(self, pod, route, body=None, admin=None):
-        port = self.forward(pod)
+    def http(self, pod, route, body=None, admin=None, remote_port=None):
+        if remote_port is None:
+            embedded = getattr(self.args, "embedded_host", "server") != "server"
+            remote_port = 9091 if embedded and route.startswith(("/membership/", "/recovery/")) else 8080
+        port = self.forward(pod, remote_port)
         request = urllib.request.Request(f"http://127.0.0.1:{port}{route}",
             data=None if body is None else json.dumps(body).encode(),
             headers={"Content-Type": "application/json", "Authorization": "Bearer " + (admin or self.admin)})

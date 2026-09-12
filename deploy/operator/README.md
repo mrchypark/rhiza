@@ -34,6 +34,19 @@ the bucket endpoint and credentials appropriate for the selected provider.
 Generation-specific peer credentials are distinct secrets created by the
 controller; they must not reuse the source voters' credentials.
 
+## Operator image
+
+Published GitHub releases build and push `ghcr.io/mrchypark/rhiza-operator`
+with the release tag (for example, `v0.14.1`). Stable releases also update
+`latest`; prereleases do not. The image currently targets `linux/amd64`.
+Pull requests validate the same Docker build without publishing.
+
+Set the Deployment image to the versioned GHCR image or its digest instead
+of the sample's local `rhiza-operator:latest` name. If the package is private,
+configure an `imagePullSecrets` entry with package read access. Release
+publishing does not install anything in your Kubernetes cluster and does not
+upload standalone CLI binaries.
+
 ## Observation and recovery requests
 
 The supplied `sample-rhizarecovery.yaml` is observation-only because

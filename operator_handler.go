@@ -10,6 +10,7 @@ func (db *DB) OperatorHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/recovery/status", db.api)
 	mux.Handle("/recovery/archive", db.api)
+	mux.Handle("/recovery/probe", db.api)
 	mux.Handle("/membership/status", db.api)
 	mux.Handle("/membership/change", db.api)
 	mux.Handle("/membership/abort", db.api)
