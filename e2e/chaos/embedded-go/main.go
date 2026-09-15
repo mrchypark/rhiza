@@ -92,7 +92,6 @@ func main() {
 			respond(w, result, nil)
 			return
 		}
-
 		result, err := db.Execute(r.Context(), req)
 		respond(w, result, err)
 	})
