@@ -34,8 +34,10 @@ type ClusterSpec struct {
 	Container      string     `json:"container"`
 	AdoptClusterID string     `json:"adoptClusterID"`
 	VoterPods      []VoterPod `json:"voterPods"`
-	Automatic      bool       `json:"automatic"`
-	Policy         AutoPolicy `json:"policy"`
+	AnchorID       string     `json:"anchorID,omitempty"`
+
+	Automatic bool       `json:"automatic"`
+	Policy    AutoPolicy `json:"policy"`
 }
 type ClusterStatus struct {
 	Phase              string `json:"phase"`
@@ -55,27 +57,29 @@ type autoControl struct {
 	SuspectedSince  time.Time                      `json:"suspectedSince"`
 	Completions     []time.Time                    `json:"completions,omitempty"`
 	Sequence        uint64                         `json:"sequence"`
-	Intent          *autoIntent                    `json:"intent,omitempty"`
+
+	Intent *autoIntent `json:"intent,omitempty"`
 }
 type autoIntent struct {
-	Supersedes          string         `json:"supersedes,omitempty"`
-	LearnerUID          string         `json:"learnerUID,omitempty"`
-	LearnerWAL          string         `json:"learnerWAL,omitempty"`
-	LearnerMissingSince time.Time      `json:"learnerMissingSince"`
-	LearnerAttempt      int            `json:"learnerAttempt"`
-	Aborting            bool           `json:"aborting"`
-	PreviousSpecHash    string         `json:"previousSpecHash,omitempty"`
-	NoQuorumSince       time.Time      `json:"noQuorumSince"`
-	Request             FenceRequest   `json:"request"`
-	Policy              AutoPolicy     `json:"policy"`
-	Durability          string         `json:"durability"`
-	Voters              []VoterPod     `json:"voters"`
-	Failed              quepaxa.NodeID `json:"failed,omitempty"`
-	Proof               *FenceProof    `json:"proof,omitempty"`
-	RecoveryName        string         `json:"recoveryName"`
-	RecoveryUID         string         `json:"recoveryUID,omitempty"`
-	SpecHash            string         `json:"specHash,omitempty"`
-	LearnerName         string         `json:"learnerName,omitempty"`
+	Supersedes          string    `json:"supersedes,omitempty"`
+	LearnerUID          string    `json:"learnerUID,omitempty"`
+	LearnerWAL          string    `json:"learnerWAL,omitempty"`
+	LearnerMissingSince time.Time `json:"learnerMissingSince"`
+	LearnerAttempt      int       `json:"learnerAttempt"`
+	Aborting            bool      `json:"aborting"`
+
+	PreviousSpecHash string         `json:"previousSpecHash,omitempty"`
+	NoQuorumSince    time.Time      `json:"noQuorumSince"`
+	Request          FenceRequest   `json:"request"`
+	Policy           AutoPolicy     `json:"policy"`
+	Durability       string         `json:"durability"`
+	Voters           []VoterPod     `json:"voters"`
+	Failed           quepaxa.NodeID `json:"failed,omitempty"`
+	Proof            *FenceProof    `json:"proof,omitempty"`
+	RecoveryName     string         `json:"recoveryName"`
+	RecoveryUID      string         `json:"recoveryUID,omitempty"`
+	SpecHash         string         `json:"specHash,omitempty"`
+	LearnerName      string         `json:"learnerName,omitempty"`
 }
 
 func (c *Controller) clusterPath(name string) string {
@@ -91,8 +95,9 @@ func (c *Controller) autoKey(r *ClusterResource) string {
 func autoBinding(r *ClusterResource) string {
 	return hashJSON(struct {
 		LogicalID, StatefulSet, Container, AdoptClusterID string
+		AnchorID                                          string `json:"anchorID,omitempty"`
 		Voters                                            []VoterPod
-	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.VoterPods})
+	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, r.Spec.VoterPods})
 }
 func (c *Controller) autoStatus(ctx context.Context, r *ClusterResource, state *autoControl, phase, message string) error {
 	r.Status = ClusterStatus{Phase: phase, Message: message, ObservedGeneration: number(r.Metadata["generation"])}
@@ -182,6 +187,17 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	uid := str(nested(sts, "metadata", "uid"))
 	if uid == "" {
 		return block(nil, "workload UID is unavailable")
+	}
+	ctr, err := container(sts, r.Spec.Container)
+	if err != nil {
+		return block(nil, err.Error())
+	}
+	env, err := c.environment(ctx, ctr)
+	if err != nil {
+		return err
+	}
+	if err := anchorEnvGate(r.Spec.AnchorID, env, env["RHIZA_ENABLE_RECONFIGURATION"] == "true", c.Anchor); err != nil {
+		return block(nil, err.Error())
 	}
 	state, version, err := c.loadAuto(ctx, c.autoKey(r))
 	if err != nil && !c.Bucket.IsObjNotFoundErr(err) {

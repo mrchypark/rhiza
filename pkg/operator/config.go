@@ -214,3 +214,22 @@ func (c *Controller) storeConfigMatches(env map[string]string) error {
 	}
 	return nil
 }
+
+// anchorEnvGate checks that RHIZA_RECOVERY_ANCHOR_ID matches spec.anchorID.
+// If either is non-empty, reconfiguration must be enabled and anchor client
+// must be configured. Returns nil if both are empty (no anchor opt-in).
+func anchorEnvGate(anchorID string, env map[string]string, reconfiguration bool, client AnchorClient) error {
+	if anchorID == "" && env["RHIZA_RECOVERY_ANCHOR_ID"] == "" {
+		return nil
+	}
+	if anchorID != env["RHIZA_RECOVERY_ANCHOR_ID"] {
+		return fmt.Errorf("RHIZA_RECOVERY_ANCHOR_ID does not match spec anchorID")
+	}
+	if !reconfiguration {
+		return fmt.Errorf("anchor opt-in requires RHIZA_ENABLE_RECONFIGURATION=true")
+	}
+	if client == nil {
+		return fmt.Errorf("anchor backend is not configured for anchorID %s", anchorID)
+	}
+	return nil
+}
