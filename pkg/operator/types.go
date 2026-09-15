@@ -3,6 +3,7 @@ package operator
 import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 type Resource struct {
@@ -19,12 +20,15 @@ type Spec struct {
 	SourceClusterID string `json:"sourceClusterID"`
 	// Durability is the NEW generation's mode. The immutable source record,
 	// not this desired setting, determines whether recovery can lose ACKs.
-	Durability           string          `json:"durability"`
-	RecoveryID           string          `json:"recoveryID,omitempty"`
-	AllowDataLoss        bool            `json:"allowDataLoss,omitempty"`
-	MaxArchiveAgeSeconds int64           `json:"maxArchiveAgeSeconds,omitempty"`
-	Fence                Fence           `json:"fence,omitempty"`
-	Membership           *MembershipSpec `json:"membership,omitempty"`
+	Durability           string `json:"durability"`
+	RecoveryID           string `json:"recoveryID,omitempty"`
+	AllowDataLoss        bool   `json:"allowDataLoss,omitempty"`
+	MaxArchiveAgeSeconds int64  `json:"maxArchiveAgeSeconds,omitempty"`
+	Fence                Fence  `json:"fence,omitempty"`
+	// AnchorID opts this recovery into external anchor verification. When set,
+	// the workload must export RHIZA_RECOVERY_ANCHOR_ID matching this value.
+	AnchorID   string          `json:"anchorID,omitempty"`
+	Membership *MembershipSpec `json:"membership,omitempty"`
 }
 
 // MembershipSpec replaces one externally fenced voter through a separately
@@ -82,6 +86,10 @@ type Status struct {
 	ArchiveCapture     string                        `json:"archiveCapture,omitempty"`
 	Peers              []network.VoterRecoveryStatus `json:"peers,omitempty"`
 	Membership         *MembershipStatus             `json:"membership,omitempty"`
+	// Anchor request and receipt are the exact persisted contract. Only these
+	// fields expose anchor evidence; no application-sensitive data.
+	AnchorRequest *recoveryanchor.Request `json:"anchorRequest,omitempty"`
+	AnchorReceipt *recoveryanchor.Receipt `json:"anchorReceipt,omitempty"`
 }
 
 // MembershipStatus is the CR's durable side-effect journal. The remove request

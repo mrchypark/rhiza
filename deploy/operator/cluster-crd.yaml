@@ -36,6 +36,12 @@ spec:
                 adoptClusterID:
                   type: string
                   minLength: 1
+                anchorID:
+                  type: string
+                  description: >-
+                    External recovery anchor identifier for automatic child recovery
+                    resources. When set, every generated RhizaRecovery inherits this
+                    anchorID and the workload must export RHIZA_RECOVERY_ANCHOR_ID.
                 voterPods:
                   type: array
                   minItems: 3

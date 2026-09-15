@@ -64,7 +64,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			return err
 		}
 	}
-	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
 	if intent.Failed != "" {
 		var voters []VoterPod
 		for _, ref := range intent.Voters {

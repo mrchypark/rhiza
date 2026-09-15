@@ -25,12 +25,21 @@ import (
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 	"github.com/thanos-io/objstore"
 )
 
 const ownerAnnotation = "rhiza.mrchypark.dev/recovery-owner"
 
 var identifier = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
+
+// AnchorClient is the recovery anchor interface. The shared recoveryanchor
+// package or an HTTP Client implements it. The Controller never issues
+// receipts directly; it delegates to this interface.
+type AnchorClient interface {
+	Activate(context.Context, recoveryanchor.Request) (recoveryanchor.Receipt, error)
+	Verify(context.Context, recoveryanchor.Request, recoveryanchor.Receipt) error
+}
 
 type Controller struct {
 	Fencer        Fencer
@@ -40,6 +49,7 @@ type Controller struct {
 	Prefix        string
 	HTTP          *http.Client
 	StoreIdentity map[string]string
+	Anchor        AnchorClient
 }
 type recoveryList struct {
 	Items []Resource `json:"items"`
@@ -171,6 +181,9 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if err != nil {
 		return reject(err.Error())
 	}
+	if err := anchorEnvGate(r.Spec.AnchorID, env, reconfiguration, c.Anchor); err != nil {
+		return reject(err.Error())
+	}
 	prefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
 	registered, err := c.sourceMembership(ctx, prefix)
 	if err != nil {
@@ -292,6 +305,35 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 		if err := c.immutable(ctx, path.Join(c.Prefix, r.Status.Target, "recovery/generation.json"), jsonBytes(lineage)); err != nil {
 			return c.record(ctx, r, "Blocked", "target lineage is unavailable or inconsistent")
 		}
+
+		// External anchor activation: delegate to trusted Coordinator/Client.
+		if r.Spec.AnchorID != "" {
+			if c.Anchor == nil {
+				return c.record(ctx, r, "Blocked", "anchor backend is not configured for anchorID "+r.Spec.AnchorID)
+			}
+			targetPrefix := path.Join(c.Prefix, r.Status.Target)
+			anchor, anchorH, anchorErr := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
+			if anchorErr != nil {
+				return c.record(ctx, r, "Blocked", "target generation anchor unavailable: "+anchorErr.Error())
+			}
+			gaRecord, gaRecErr := c.sourceMembership(ctx, targetPrefix)
+			if gaRecErr != nil {
+				return c.record(ctx, r, "Blocked", "target membership unavailable: "+gaRecErr.Error())
+			}
+			if _, vErr := recovery.VerifyGenerationAnchor(ctx, c.Bucket, targetPrefix, gaRecord, anchorH); vErr != nil {
+				return c.record(ctx, r, "Blocked", "target generation anchor verification failed: "+vErr.Error())
+			}
+			if anchor.OperationID != c.operationID(r) || anchor.SourcePrefix != s.prefix || anchor.SourcePrefixHash != result.PrefixHash || anchor.SourceTip != result.Tip || anchor.SourceManifest != result.ManifestHash {
+				return c.record(ctx, r, "Blocked", "target generation anchor does not match fork result")
+			}
+			req := c.buildAnchorRequest(r, s, record, result, hex.EncodeToString(anchorH[:]))
+			receipt, actErr := c.Anchor.Activate(ctx, req)
+			if actErr != nil {
+				return c.record(ctx, r, "Blocked", "anchor activation failed: "+actErr.Error())
+			}
+			r.Status.AnchorRequest = &req
+			r.Status.AnchorReceipt = &receipt
+		}
 		r.Status.SecretName, r.Status.ManifestHash, r.Status.RecoveredTip = secret, result.ManifestHash, result.Tip
 		r.Status.Stage = "Stopping"
 		return c.record(ctx, r, "Recovering", "verified target and credentials preserved before deleting source pods")
@@ -327,6 +369,14 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if err := c.storeConfigMatches(env); err != nil {
 		return c.record(ctx, r, "Blocked", err.Error())
 	}
+	// Anchor opt-in gate: requires env and reconfiguration.
+	reconfiguration, reconfigErr := reconfigurationEnabled(env)
+	if reconfigErr != nil {
+		return c.record(ctx, r, "Blocked", reconfigErr.Error())
+	}
+	if err := anchorEnvGate(r.Spec.AnchorID, env, reconfiguration, c.Anchor); err != nil {
+		return c.record(ctx, r, "Blocked", err.Error())
+	}
 	if err := noPVC(sts, ctr, env); err != nil {
 		return c.record(ctx, r, "Blocked", err.Error())
 	}
@@ -338,15 +388,45 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if err != nil || record != recovery.NewMembershipRecord(r.Status.Target, members, r.Spec.Durability) {
 		return c.record(ctx, r, "Blocked", "target membership changed")
 	}
+	// Common anchor verification: covers Starting (both branches) and Restarted.
+	sourcePrefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
+	if r.Spec.AnchorID != "" {
+		if err := c.requireAnchorReceipt(r); err != nil {
+			return c.record(ctx, r, "Blocked", err.Error())
+		}
+		targetPrefix := path.Join(c.Prefix, r.Status.Target)
+		gaRecord, gaRecErr := c.sourceMembership(ctx, targetPrefix)
+		if gaRecErr != nil {
+			return c.record(ctx, r, "Blocked", "target membership unavailable: "+gaRecErr.Error())
+		}
+		anchor, anchorH, anchorErr := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
+		if anchorErr != nil {
+			return c.record(ctx, r, "Blocked", "target generation anchor unavailable: "+anchorErr.Error())
+		}
+		if _, vErr := recovery.VerifyGenerationAnchor(ctx, c.Bucket, targetPrefix, gaRecord, anchorH); vErr != nil {
+			return c.record(ctx, r, "Blocked", "target generation anchor verification failed: "+vErr.Error())
+		}
+		if anchor.SourcePrefix != sourcePrefix {
+			return c.record(ctx, r, "Blocked", "anchor source prefix does not match spec")
+		}
+		if anchor.OperationID != c.operationID(r) {
+			return c.record(ctx, r, "Blocked", "anchor operation ID does not match")
+		}
+		if anchor.SourceTip != r.Status.RecoveredTip || anchor.SourceManifest != r.Status.ManifestHash {
+			return c.record(ctx, r, "Blocked", "anchor source tip/manifest does not match journal")
+		}
+		result := recovery.ForkResult{Tip: anchor.SourceTip, ManifestHash: anchor.SourceManifest, PrefixHash: anchor.SourcePrefixHash}
+		s := sourceState{prefix: sourcePrefix}
+		if vErr := c.verifyAnchorRequest(ctx, r, s, record, result, hex.EncodeToString(anchorH[:])); vErr != nil {
+			return c.record(ctx, r, "Blocked", vErr.Error())
+		}
+	}
 	if r.Status.Stage == "Starting" {
 		if env["RHIZA_CLUSTER_ID"] == r.Spec.SourceClusterID {
 			sourceMembers, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
-			sourcePrefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
 			if err != nil || sourceFingerprint(r.Spec.SourceClusterID, r.Status.SourceDurability, sourceMembers, sourcePrefix) != r.Status.SourceMembership {
 				return c.record(ctx, r, "Blocked", "source configuration changed before activation")
 			}
-			// Validate the durable copy again after a paused/restarted controller,
-			// before any target voter can interpret an absent archive as empty.
 			reconfiguration, err := reconfigurationEnabled(env)
 			if err != nil {
 				return c.record(ctx, r, "Blocked", err.Error())
@@ -364,6 +444,25 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			}
 			if len(pods) != 0 {
 				return c.record(ctx, r, "Blocked", "source pods reappeared before activation")
+			}
+			// Live re-verify anchor receipt just before StatefulSet PUT.
+			if r.Spec.AnchorID != "" {
+				targetPrefix := path.Join(c.Prefix, r.Status.Target)
+				gaRecord, gaRecErr := c.sourceMembership(ctx, targetPrefix)
+				if gaRecErr != nil {
+					return c.record(ctx, r, "Blocked", "target membership unavailable: "+gaRecErr.Error())
+				}
+				_, anchorH, anchorErr := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
+				if anchorErr != nil {
+					return c.record(ctx, r, "Blocked", "target generation anchor unavailable: "+anchorErr.Error())
+				}
+				if _, vErr := recovery.VerifyGenerationAnchor(ctx, c.Bucket, targetPrefix, gaRecord, anchorH); vErr != nil {
+					return c.record(ctx, r, "Blocked", "target generation anchor verification failed: "+vErr.Error())
+				}
+				s := sourceState{prefix: sourcePrefix}
+				if vErr := c.verifyAnchorRequest(ctx, r, s, record, result, hex.EncodeToString(anchorH[:])); vErr != nil {
+					return c.record(ctx, r, "Blocked", vErr.Error())
+				}
 			}
 			values := list(ctr["env"])
 			values = replaceEnv(values, "RHIZA_CLUSTER_ID", object{"value": r.Status.Target})
@@ -734,4 +833,54 @@ func recoveryMembers(raw string) ([]quepaxa.Member, error) {
 		}
 	}
 	return members, nil
+}
+
+// buildAnchorRequest constructs the canonical recoveryanchor.Request from
+// current controller state. Shared by Sealed-stage activation and
+// Starting/Restarted-stage revalidation.
+func (c *Controller) buildAnchorRequest(r *Resource, s sourceState, record recovery.MembershipRecord, result recovery.ForkResult, anchorHash string) recoveryanchor.Request {
+	return recoveryanchor.Request{
+		AnchorID:         r.Spec.AnchorID,
+		OperationID:      c.operationID(r),
+		StatefulSetUID:   r.Status.StatefulSetUID,
+		SourceClusterID:  r.Spec.SourceClusterID,
+		TargetClusterID:  r.Status.Target,
+		SourcePrefix:     s.prefix,
+		TargetPrefix:     path.Join(c.Prefix, r.Status.Target),
+		SourceMembership: r.Status.SourceMembership,
+		FenceHash:        hashJSON(r.Spec.Fence),
+		TargetAnchorHash: anchorHash,
+		TargetMembership: record,
+		Fork:             result,
+	}
+}
+
+// requireAnchorReceipt verifies that AnchorRequest and AnchorReceipt are
+// both present when Spec.AnchorID is set, and that the Anchor client is
+// available. Returns nil when no anchor verification is required.
+func (c *Controller) requireAnchorReceipt(r *Resource) error {
+	if r.Spec.AnchorID == "" {
+		return nil
+	}
+	if r.Status.AnchorRequest == nil || r.Status.AnchorReceipt == nil {
+		return fmt.Errorf("anchor receipt missing for anchored recovery")
+	}
+	if c.Anchor == nil {
+		return fmt.Errorf("anchor backend unavailable for receipt verification")
+	}
+	return nil
+}
+
+// verifyAnchorRequest reconstructs the request from current state and
+// verifies it matches the persisted request before live-verifying the
+// receipt. Called from Starting and Restarted stages.
+func (c *Controller) verifyAnchorRequest(ctx context.Context, r *Resource, s sourceState, record recovery.MembershipRecord, result recovery.ForkResult, anchorHash string) error {
+	if err := c.requireAnchorReceipt(r); err != nil {
+		return err
+	}
+	wantReq := c.buildAnchorRequest(r, s, record, result, anchorHash)
+	if wantReq != *r.Status.AnchorRequest {
+		return fmt.Errorf("anchor request does not match current operation state")
+	}
+	return c.Anchor.Verify(ctx, *r.Status.AnchorRequest, *r.Status.AnchorReceipt)
 }

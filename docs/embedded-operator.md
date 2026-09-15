@@ -4,6 +4,8 @@ Rhiza를 라이브러리로 사용하는 **Go·Rust 애플리케이션의 프로
 Operator가 복구할 수 있다. 별도의 Rhiza 서버 프로세스나 데이터베이스 sidecar는
 필요하지 않다. Operator는 Kubernetes에 별도 Deployment로 실행한다.
 
+외부 앵커 검증 서비스를 구축하는 방법은 [Recovery Anchor](recovery-anchor.md)를 참고한다.
+
 이 기능은 기존 **3-voter StatefulSet + emptyDir(no-PVC) + 공유 오브젝트 저장소**를
 대상으로 한다. 소스 세대의 복구 자료를 검증하고 새 세대로 복사한 다음,
 애플리케이션 Pod 전체를 재시작한다. Pod 이름·peer 주소는 유지하지만
@@ -244,3 +246,60 @@ before-ack는 성공 응답한 쓰기의 내구성 계약이다. 장애 직전 �
 문제가 남아 있다. 상태 메시지를 해결한 뒤 같은 요청을 재개한다. source archive를
 수정하거나 seal을 제거해 강제로 진행하지 않는다. 상세 계약은
 [복구 설계](recovery.md)와 [Operator 운영 설명](../deploy/operator/README.md)에 있다.
+
+## 6. Recovery Anchor 연동
+
+Operator가 복구를 오케스트레이션할 때, 외부 recovery-anchor 서비스가 anchor
+CAS와 검증을 담당한다. 서비스는 `recoveryanchor.Coordinator`를 사용하여
+ConfigMap에 anchor를 기록하고 검증한다.
+
+### Operator 환경 변수
+
+Operator Deployment에 다음 환경 변수를 추가한다:
+
+| 변수 | 설명 |
+|------|------|
+| `RHIZA_RECOVERY_ANCHOR_URL` | recovery-anchor 서비스 URL. 예: `https://anchor.svc:9191` |
+| `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE` | Bearer token 파일 경로 |
+| `RHIZA_RECOVERY_ANCHOR_CA_FILE` | TLS CA 인증서 파일 경로 |
+
+### Workload 환경 변수
+
+임베디드 애플리케이션 Pod에 다음 환경 변수를 추가한다:
+
+| 변수 | 설명 |
+|------|------|
+| `RHIZA_RECOVERY_ANCHOR_ID` | Anchor ConfigMap 식별자 (예: `myapp-production`) |
+| `RHIZA_NAMESPACE` | Anchor ConfigMap이 위치한 Kubernetes namespace |
+
+### Host write guard responsibility
+
+환경 변수만으로 애플리케이션의 쓰기를 보호하지 않는다. 임베디드 호스트는
+`CheckBinding`, `UpdateApplication` 헬퍼를 사용하여 write reservation,
+CAS+binding, evidence startup check를 구현해야 한다. 환경 변수는 서비스 연결
+ opt-in 표시일 뿐이고, 해당 코드가 없으면 쓰기 경로가 보호되지 않는다.
+
+### CRD spec.anchorID
+
+`RhizaCluster` 및 `RhizaRecovery` CRD에 `spec.anchorID` 필드를 추가하여
+어떤 anchor와 연결할지 지정한다:
+
+기존 CR의 `spec`에 다음 필드를 추가한다:
+
+```yaml
+spec:
+  anchorID: myapp-production
+```
+
+`anchorID`가 지정되면 Operator는 recovery-anchor 서비스에 HTTPS로 요청하고, 서비스가
+ConfigMap `rhiza-anchor-<anchorID>`를 읽어서 anchor를 활성화하고 검증한다.
+
+### 서비스 활성화
+
+1. Recovery Anchor 서비스를 Kubernetes에 배포한다 (TLS 필수).
+2. ServiceAccount에 ConfigMap get/update 권한을 부여한다.
+3. Operator Deployment에 `RHIZA_RECOVERY_ANCHOR_URL`, `RHIZA_RECOVERY_ANCHOR_TOKEN_FILE`,
+   `RHIZA_RECOVERY_ANCHOR_CA_FILE` 환경 변수를 설정한다.
+4. Workload Pod에 `RHIZA_RECOVERY_ANCHOR_ID`, `RHIZA_NAMESPACE`를 설정한다.
+5. CRD에 `spec.anchorID`를 지정한다.
+6. `kubectl apply`로 적용하면 Operator가 구성된 서비스에 연결하여 anchor 연동을 시작한다. 애플리케이션의 write guard는 별도 구현된 클래스에 의존한다.

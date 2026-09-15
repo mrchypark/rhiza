@@ -45,6 +45,11 @@ spec:
                   type: integer
                   format: int64
                   minimum: 0
+                anchorID:
+                  type: string
+                  description: >-
+                    External recovery anchor identifier. When set, the workload must export
+                    RHIZA_RECOVERY_ANCHOR_ID matching this value. Requires reconfiguration.
                 fence:
                   type: object
                   description: Trusted out-of-band administrator attestation covering every old process, archive/GC writer, and standalone voter workload. The controller never infers it from Pod disappearance or StatefulSet scale-down.

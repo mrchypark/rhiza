@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/recoveryanchor"
 )
 
 func main() {
@@ -91,7 +93,57 @@ func run(ctx context.Context, namespace string, poll time.Duration) error {
 		}
 		controller.Automatic = true
 	}
+
+	// Configure recovery anchor client from environment.
+	anchorURL := os.Getenv("RHIZA_RECOVERY_ANCHOR_URL")
+	anchorTokenFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_TOKEN_FILE")
+	if anchorURL != "" || anchorTokenFile != "" {
+		if anchorURL == "" || anchorTokenFile == "" {
+			return fmt.Errorf("RHIZA_RECOVERY_ANCHOR_URL and RHIZA_RECOVERY_ANCHOR_TOKEN_FILE must both be set")
+		}
+		if err := validateAnchorEndpoint(anchorURL); err != nil {
+			return err
+		}
+		anchorRoots, anchorErr := x509.SystemCertPool()
+		if anchorErr != nil {
+			return anchorErr
+		}
+		if caFile := os.Getenv("RHIZA_RECOVERY_ANCHOR_CA_FILE"); caFile != "" {
+			data, caErr := os.ReadFile(caFile)
+			if caErr != nil {
+				return fmt.Errorf("read anchor CA: %w", caErr)
+			}
+			if !anchorRoots.AppendCertsFromPEM(data) {
+				return fmt.Errorf("anchor CA contains no certificates")
+			}
+		}
+		controller.Anchor = &recoveryanchor.Client{
+			URL:       anchorURL,
+			TokenFile: anchorTokenFile,
+			Client:    &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: anchorRoots}}},
+		}
+	}
 	return controller.Run(ctx, poll)
+}
+
+func validateAnchorEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || raw == "" {
+		return fmt.Errorf("anchor: invalid endpoint")
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("anchor: endpoint must use https")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("anchor: endpoint host is empty")
+	}
+	if u.User != nil {
+		return fmt.Errorf("anchor: endpoint must not contain credentials")
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("anchor: endpoint must not contain query or fragment")
+	}
+	return nil
 }
 
 func operatorBucketConfig() (objectstore.Config, error) {
