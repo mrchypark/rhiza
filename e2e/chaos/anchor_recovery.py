@@ -180,13 +180,13 @@ class AnchorChaos(AutomaticChaos):
             "VALUES (1, 1, 'initial')")
         rows = self.http(pod, "/sql/query",
             {"sql": "SELECT epoch, token FROM trust_state WHERE id=1"})
-        assert rows["rows"] == [["1", "initial"]]
+        assert rows['rows'] == [[1, 'initial']], rows
         self.event("trust_state_seeded")
 
     def verify_trust_state(self, pod, epoch, token):
         rows = self.http(pod, "/sql/query",
             {"sql": "SELECT epoch, token FROM trust_state WHERE id=1"})
-        assert rows["rows"] == [[str(epoch), token]]
+        assert rows['rows'] == [[epoch, token]], rows
 
     def _read_anchor(self):
         cm = self.get("configmap", ANCHOR_CM)
