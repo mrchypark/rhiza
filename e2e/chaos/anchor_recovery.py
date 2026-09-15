@@ -389,10 +389,17 @@ class AnchorChaos(AutomaticChaos):
         self.event("anchor_cm_restored_pending", op=operation)
 
         # ── Gate 2: PendingWrite flag ──
+        # Kubernetes status PUT is no-op when nothing changed; RV won't advance.
+        # Restart operator + force re-reconciliation via observedGeneration=0.
+        self.operator_restart()
+        self.k("patch", "rhizarecovery", operation, "--subresource=status",
+               "--type=merge", "-p",
+               json.dumps({"status": {"observedGeneration": 0}}))
         prev_rv_gate2 = self._child_for_op(operation)["metadata"]["resourceVersion"]
         self.wait("pending flag blocked", lambda: (
             self._child_sealed_blocked(operation)
-            and self._child_for_op(operation)["metadata"]["resourceVersion"] != prev_rv_gate2
+            and self._child_for_op(operation)["status"].get("observedGeneration", 0)
+                >= self._child_for_op(operation)["metadata"].get("generation", 0)
             and "anchor activation" in self._child_message(operation).lower()
         ), 60)
         msg2 = self._child_message(operation)
