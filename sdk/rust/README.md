@@ -15,7 +15,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.15.1"
+rhizadb = "0.15.2"
 serde_json = "1"
 ```
 
@@ -113,7 +113,7 @@ and point `RHIZA_NATIVE_LIB_DIR` at a directory that holds it as
 `librhiza_ffi.a`:
 
 ```sh
-version=0.15.1
+version=0.15.2
 target=aarch64-apple-darwin
 asset=librhiza_ffi-${version}-${target}.a
 base=https://github.com/mrchypark/rhiza/releases/download/v${version}
