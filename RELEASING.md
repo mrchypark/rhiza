@@ -28,7 +28,10 @@ is not backed by a published crate fails CI.
 6. `sdk/rust/native` is generated from the Go sources and ignored by Git, so it is
    never committed. `sdk/rust/scripts/stage-crate.sh` regenerates it inside a
    throwaway worktree of the release commit, so packaging never reads the
-   caller's working tree.
+   caller's working tree. `prepare-native.sh` also vendors the Go module closure
+   into that tree, which is what makes the published crate self-contained. The
+   packaged crate must stay under the crates.io 10 MB limit; `stage-crate.sh`
+   prints the size and fails when it exceeds the limit.
 
 ## Procedure
 
@@ -49,6 +52,8 @@ is not backed by a published crate fails CI.
    only contain that commit's sources plus the `sdk/rust/native` tree generated
    from them. Cargo sees no repository inside the stage, so there is no
    `--allow-dirty` escape hatch and no way to publish working-tree state.
+   Vendoring the Go closure needs the module cache or network access; the
+   published crate does not.
 3. Confirm the registry serves it, then tag and push:
 
    ```

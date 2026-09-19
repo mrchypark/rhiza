@@ -2,10 +2,11 @@
 
 `rhizadb` is a synchronous embedded SDK. It builds Rhiza's local Go C archive
 from the native source bundled in the crate, so consumer builds need Rust, Go
-1.27+, a C compiler, and a macOS or Linux GNU host (ARM64 or x86-64). Go module
-dependencies are fetched by the Go toolchain during that build; no precompiled
-native archive is downloaded. Each release also attaches a stripped archive per
-supported target, so `RHIZA_NATIVE_LIB_DIR` can replace the Go build; see
+1.27+, a C compiler, and a macOS or Linux GNU host (ARM64 or x86-64). The Go
+dependency closure is vendored inside the crate, so the build resolves every
+module from the crate and needs no network access; no precompiled native archive
+is downloaded. Each release also attaches a stripped archive per supported
+target, so `RHIZA_NATIVE_LIB_DIR` can replace the Go build; see
 [Prebuilt native archives](#prebuilt-native-archives).
 
 docs.rs builds API documentation without the native archive (`DOCS_RS=1` only).
