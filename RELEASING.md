@@ -68,7 +68,7 @@ gh run list --workflow=release-sync.yml
 
 ## Backlog
 
-`rhizadb` published nothing between 0.14.1 and 0.15.1. `v0.15.1` and `v0.15.2`
-were deleted on 2026-09-19; both were lightweight tags pointing at the `v0.14.1`
-commit with no crate behind them. `v0.15.0` stays as a tag on a distinct commit
-and is not backfilled.
+`v0.15.0` is tagged on a commit with no crates.io release and is not backfilled.
+The `v0.15.1` and `v0.15.2` releases that predated 0.15.1 were deleted, because
+both were lightweight tags pointing at the `v0.14.1` commit with no crate behind
+them; 0.15.1 was then cut from `main` as the first release under these rules.
