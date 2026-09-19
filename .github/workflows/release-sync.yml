@@ -3,6 +3,11 @@ name: Release sync
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify, for example v0.15.1
+        required: true
 
 permissions:
   contents: read
@@ -15,4 +20,10 @@ jobs:
         with:
           fetch-depth: 0
       - name: Tag, crate version, and registry agree
-        run: ./scripts/check-release-sync.sh "$GITHUB_REF_NAME"
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          # actions/checkout fetches with --no-tags, so the tag object that
+          # check-release-sync.sh inspects is not in the clone yet.
+          git fetch --tags --force origin
+          ./scripts/check-release-sync.sh "${INPUT_TAG:-$GITHUB_REF_NAME}"
