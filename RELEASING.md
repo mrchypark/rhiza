@@ -25,26 +25,26 @@ is not backed by a published crate fails CI.
 4. Never move or reuse a published tag or version. crates.io versions are
    immutable, so a moved tag misrepresents the artifact it points at.
 5. Tag the merge commit on `main` that CI passed, never a branch tip.
-6. `prepare-native.sh` rewrites `sdk/rust/native` from the Go sources. Run it and
-   commit the result in the release pull request, so the tag, the checkout, and
-   the packaged crate carry the same Go code.
+6. `prepare-native.sh` regenerates `sdk/rust/native` from the Go sources. That tree
+   is generated and ignored by Git, so it is never committed; run the script
+   immediately before packaging, as the release step below does.
 
 ## Procedure
 
-1. On a `feature/` branch, bump the version and refresh the bundle:
+1. On a `feature/` branch, set `version = "X.Y.Z"` in `sdk/rust/Cargo.toml`, refresh
+   `sdk/rust/Cargo.lock` (CI runs cargo with `--locked`), and point the dependency
+   snippets in `README.md` and `sdk/rust/README.md` at it. Open a pull request and
+   merge it once CI passes.
+2. From the merged `main`, regenerate the bundled Go tree and publish:
 
    ```
    sh sdk/rust/scripts/prepare-native.sh
-   # set version = "X.Y.Z" in sdk/rust/Cargo.toml
+   cargo publish --manifest-path sdk/rust/Cargo.toml --locked --allow-dirty --dry-run
+   cargo publish --manifest-path sdk/rust/Cargo.toml --locked --allow-dirty
    ```
 
-   Commit both, open a pull request, and merge it once CI passes.
-2. Publish the crate from the merged `main`:
-
-   ```
-   cargo publish --manifest-path sdk/rust/Cargo.toml --locked --dry-run
-   cargo publish --manifest-path sdk/rust/Cargo.toml --locked
-   ```
+   `--allow-dirty` is required: the package includes `sdk/rust/native`, which is
+   generated and ignored by Git.
 3. Confirm the registry serves it, then tag and push:
 
    ```
@@ -68,6 +68,7 @@ gh run list --workflow=release-sync.yml
 
 ## Backlog
 
-Tags `v0.15.0` through `v0.15.2` predate this rule and have no crates.io
-release; `rhizadb` 0.14.1 is the newest published version. They are not
-backfilled. The next release from `main` resynchronises the three channels.
+`rhizadb` published nothing between 0.14.1 and 0.15.1. `v0.15.1` and `v0.15.2`
+were deleted on 2026-09-19; both were lightweight tags pointing at the `v0.14.1`
+commit with no crate behind them. `v0.15.0` stays as a tag on a distinct commit
+and is not backfilled.
