@@ -25,9 +25,10 @@ is not backed by a published crate fails CI.
 4. Never move or reuse a published tag or version. crates.io versions are
    immutable, so a moved tag misrepresents the artifact it points at.
 5. Tag the merge commit on `main` that CI passed, never a branch tip.
-6. `prepare-native.sh` regenerates `sdk/rust/native` from the Go sources. That tree
-   is generated and ignored by Git, so it is never committed; run the script
-   immediately before packaging, as the release step below does.
+6. `sdk/rust/native` is generated from the Go sources and ignored by Git, so it is
+   never committed. `sdk/rust/scripts/stage-crate.sh` regenerates it inside a
+   throwaway worktree of the release commit, so packaging never reads the
+   caller's working tree.
 
 ## Procedure
 
@@ -35,16 +36,19 @@ is not backed by a published crate fails CI.
    `sdk/rust/Cargo.lock` (CI runs cargo with `--locked`), and point the dependency
    snippets in `README.md` and `sdk/rust/README.md` at it. Open a pull request and
    merge it once CI passes.
-2. From the merged `main`, regenerate the bundled Go tree and publish:
+2. From the merged `main`, stage the crate outside the repository and publish
+   from that stage:
 
    ```
-   sh sdk/rust/scripts/prepare-native.sh
-   cargo publish --manifest-path sdk/rust/Cargo.toml --locked --allow-dirty --dry-run
-   cargo publish --manifest-path sdk/rust/Cargo.toml --locked --allow-dirty
+   stage=$(sdk/rust/scripts/stage-crate.sh origin/main)
+   cargo publish --manifest-path "$stage/Cargo.toml" --locked --dry-run
+   cargo publish --manifest-path "$stage/Cargo.toml" --locked
    ```
 
-   `--allow-dirty` is required: the package includes `sdk/rust/native`, which is
-   generated and ignored by Git.
+   The stage is built from one commit in a detached worktree, so the package can
+   only contain that commit's sources plus the `sdk/rust/native` tree generated
+   from them. Cargo sees no repository inside the stage, so there is no
+   `--allow-dirty` escape hatch and no way to publish working-tree state.
 3. Confirm the registry serves it, then tag and push:
 
    ```
@@ -55,7 +59,10 @@ is not backed by a published crate fails CI.
    ```
 4. Create the GitHub release for the tag that now exists.
    `.github/workflows/operator-release.yml` publishes the operator image to GHCR
-   from a published release.
+   from a published release, and `.github/workflows/native-archives.yml` builds
+   and attaches the stripped `librhiza_ffi.a` archives for the supported targets
+   from the same tag. To attach archives to a release that already exists, run
+   that workflow with `gh workflow run native-archives.yml -f tag=vX.Y.Z`.
 5. Watch the `Release sync` workflow run for the tag.
 
 ## Verification
@@ -64,6 +71,7 @@ is not backed by a published crate fails CI.
 scripts/check-release-sync.sh            # the tag pointing at HEAD
 scripts/check-release-sync.sh vX.Y.Z     # an explicit tag
 gh run list --workflow=release-sync.yml
+gh release view vX.Y.Z --json assets     # attached native archives
 ```
 
 ## Backlog

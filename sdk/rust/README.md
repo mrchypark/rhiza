@@ -4,7 +4,9 @@
 from the native source bundled in the crate, so consumer builds need Rust, Go
 1.27+, a C compiler, and a macOS or Linux GNU host (ARM64 or x86-64). Go module
 dependencies are fetched by the Go toolchain during that build; no precompiled
-native archive is downloaded.
+native archive is downloaded. Each release also attaches a stripped archive per
+supported target, so `RHIZA_NATIVE_LIB_DIR` can replace the Go build; see
+[Prebuilt native archives](#prebuilt-native-archives).
 
 docs.rs builds API documentation without the native archive (`DOCS_RS=1` only).
 That mode is documentation-only; normal builds always require the Go and C
@@ -16,8 +18,9 @@ rhizadb = "0.15.1"
 serde_json = "1"
 ```
 
-For a repository checkout, use `rhizadb = { path = "sdk/rust" }`. Maintainers refresh
-the bundled native tree with `./scripts/prepare-native.sh` before packaging.
+For a repository checkout, use `rhizadb = { path = "sdk/rust" }`. Maintainers
+refresh the bundled native tree with `prepare-native.sh`; releases stage it with
+`stage-crate.sh`.
 
 ## Migration from `rhizadb` 0.4
 
@@ -92,10 +95,43 @@ to 16 MiB before it enters the native bridge. Responses use the Go engine's
 existing result limits. JSON encoding, C buffers, and owned Rust results incur
 copies; this is not a zero-copy interface or a process-wide memory limit.
 
-Set `RHIZA_NATIVE_LIB_DIR` to a directory containing a compatible
-`librhiza_ffi.a` built from the exact matching Rhiza bridge/source version to
-skip the default Go build. Cross-compilation is deliberately unsupported rather
-than guessed.
+## Prebuilt native archives
+
+Every release attaches stripped archives built from that release tag, with a
+`.sha256` beside each one:
+
+```
+librhiza_ffi-<version>-aarch64-apple-darwin.a
+librhiza_ffi-<version>-x86_64-apple-darwin.a
+librhiza_ffi-<version>-x86_64-unknown-linux-gnu.a
+librhiza_ffi-<version>-aarch64-unknown-linux-gnu.a
+```
+
+Download the archive matching the crate version and your Rust target, verify it,
+and point `RHIZA_NATIVE_LIB_DIR` at a directory that holds it as
+`librhiza_ffi.a`:
+
+```sh
+version=0.15.1
+target=aarch64-apple-darwin
+asset=librhiza_ffi-${version}-${target}.a
+base=https://github.com/mrchypark/rhiza/releases/download/v${version}
+
+curl -fLO "$base/$asset"
+curl -fLO "$base/$asset.sha256"
+shasum -a 256 -c "$asset.sha256"     # sha256sum -c on Linux
+mkdir -p /opt/rhiza-native
+mv "$asset" /opt/rhiza-native/librhiza_ffi.a
+export RHIZA_NATIVE_LIB_DIR=/opt/rhiza-native
+```
+
+With `RHIZA_NATIVE_LIB_DIR` set, the build does not invoke Go and does not need
+the Go toolchain. The archive must come from the same release as the crate
+version, because the bridge ABI is only guaranteed between matching versions.
+Nothing is fetched automatically: supplying an archive is the consumer's
+explicit choice, so removing a release asset later removes only that
+convenience. Cross-compilation is deliberately unsupported rather than guessed;
+build for the host target, or supply an archive for the target you link for.
 
 Repository integration guides: [host-managed shutdown](https://github.com/mrchypark/rhiza/blob/main/docs/embedded-lifecycle.md),
 [notification reconciliation](https://github.com/mrchypark/rhiza/blob/main/docs/notification-integration.md), and
