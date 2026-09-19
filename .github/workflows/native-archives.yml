@@ -1,0 +1,92 @@
+name: Native archives
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach the archives to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            asset: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            cc: clang
+            link_test: true
+          - runner: macos-14
+            asset: x86_64-apple-darwin
+            goos: darwin
+            goarch: amd64
+            cc: clang -arch x86_64
+            link_test: false
+          - runner: ubuntu-latest
+            asset: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            link_test: true
+          - runner: ubuntu-latest
+            asset: aarch64-unknown-linux-gnu
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            link_test: false
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      NATIVE_DIR: ${{ runner.temp }}/native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install the aarch64 cross compiler
+        if: matrix.cc == 'aarch64-linux-gnu-gcc'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.link_test
+      - name: Build the stripped archive
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          mkdir -p "$NATIVE_DIR"
+          go build -trimpath -buildmode=c-archive -ldflags='-s -w' -o "$NATIVE_DIR/librhiza_ffi.a" ./cmd/rhiza-ffi
+      - name: Link the archive with Go disabled
+        if: matrix.link_test
+        env:
+          RHIZA_NATIVE_LIB_DIR: ${{ runner.temp }}/native
+          GOROOT: /nonexistent
+        run: cargo build --manifest-path sdk/rust/Cargo.toml --locked --example embedded
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' sdk/rust/Cargo.toml | head -n 1)
+          asset="librhiza_ffi-${version}-${{ matrix.asset }}.a"
+          cp "$NATIVE_DIR/librhiza_ffi.a" "$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          gh release upload "$TAG" "$asset" "$asset.sha256" --clobber
