@@ -340,7 +340,7 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 }
 
 func isRetryableGraphApplyError(err error) bool {
-	// LatticeDB v0.5 shares ErrResourceLimit between query limits and transient
+	// LatticeDB shares ErrResourceLimit between query limits and transient
 	// checkpoint backpressure; only the latter must not become a durable rejection.
 	return errors.Is(err, latticedb.ErrWriteTxActive) ||
 		(errors.Is(err, latticedb.ErrResourceLimit) && strings.Contains(err.Error(), "WAL checkpoint is in progress"))
