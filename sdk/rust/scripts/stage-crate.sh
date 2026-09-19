@@ -39,6 +39,12 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$stage_dir/Cargo.toml" | head -n 
 cargo package --manifest-path "$stage_dir/Cargo.toml" --locked >&2
 
 crate=$(ls "$stage_dir"/target/package/*.crate)
+size=$(wc -c < "$crate" | tr -d ' ')
+limit=10000000
+if [ "$size" -gt "$limit" ]; then
+    echo "FAIL the packaged crate is $size bytes, over the $limit byte crates.io limit" >&2
+    exit 1
+fi
 if command -v shasum >/dev/null 2>&1; then
     hash=$(shasum -a 256 "$crate" | awk '{print $1}')
 else
@@ -48,6 +54,7 @@ fi
 {
     echo "staged rhizadb $version from $ref ($commit)"
     echo "crate:  $crate"
+    echo "size:   $size bytes of the $limit byte crates.io limit"
     echo "sha256: $hash"
 } >&2
 
