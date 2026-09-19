@@ -125,6 +125,14 @@ type sqliteSnapshot struct {
 
 // Open opens or creates a materializer.
 func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
+	// SQLite receives this path as a file: URL, where a relative path lands in the
+	// authority part and resolves against the filesystem root. Resolve it first so
+	// a relative data directory stays where the caller's working directory is.
+	absolute, err := filepath.Abs(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve database path: %w", err)
+	}
+	dbPath = absolute
 	if err := recoverRestore(dbPath); err != nil {
 		return nil, fmt.Errorf("recover interrupted restore: %w", err)
 	}
