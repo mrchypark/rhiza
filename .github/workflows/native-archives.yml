@@ -44,10 +44,11 @@ jobs:
             goarch: arm64
             cc: aarch64-linux-gnu-gcc
             link_test: false
-    env:
-      TAG: ${{ inputs.tag || github.event.release.tag_name }}
-      NATIVE_DIR: ${{ runner.temp }}/native
     steps:
+      - name: Resolve the release tag
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: echo "TAG=${DISPATCH_TAG:-${{ github.event.release.tag_name }}}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.event.release.tag_name }}
@@ -69,21 +70,22 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CC: ${{ matrix.cc }}
         run: |
-          mkdir -p "$NATIVE_DIR"
-          go build -trimpath -buildmode=c-archive -ldflags='-s -w' -o "$NATIVE_DIR/librhiza_ffi.a" ./cmd/rhiza-ffi
+          mkdir -p "$RUNNER_TEMP/native"
+          go build -trimpath -buildmode=c-archive -ldflags='-s -w' -o "$RUNNER_TEMP/native/librhiza_ffi.a" ./cmd/rhiza-ffi
       - name: Link the archive with Go disabled
         if: matrix.link_test
         env:
-          RHIZA_NATIVE_LIB_DIR: ${{ runner.temp }}/native
           GOROOT: /nonexistent
-        run: cargo build --manifest-path sdk/rust/Cargo.toml --locked --example embedded
+        run: |
+          export RHIZA_NATIVE_LIB_DIR="$RUNNER_TEMP/native"
+          cargo build --manifest-path sdk/rust/Cargo.toml --locked --example embedded
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' sdk/rust/Cargo.toml | head -n 1)
           asset="librhiza_ffi-${version}-${{ matrix.asset }}.a"
-          cp "$NATIVE_DIR/librhiza_ffi.a" "$asset"
+          cp "$RUNNER_TEMP/native/librhiza_ffi.a" "$asset"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" > "$asset.sha256"
           else
