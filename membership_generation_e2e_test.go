@@ -104,7 +104,11 @@ func TestS3MembershipGenerationForkE2E(t *testing.T) {
 	wrong := e2eS3Config(t, targetID, string(targetMembers[0].ID), strings.TrimPrefix(targetMembers[0].PeerURL, "quic://"), targetMembers)
 	wrong.ObjStoreDurability = rhiza.ObjectStoreDurabilityBeforeAck
 	wrong.Members = append([]rhiza.Member(nil), targetMembers...)
-	wrong.Members[0].PublicKey = rhiza.PeerPublicKey(targetID, string(wrong.Members[0].ID), "wrong-target-token")
+	// The local secret and its published key stay self-consistent, so the only
+	// reason to reject this start is that the credentials are not the ones the
+	// anchored target membership registered.
+	wrong.PeerToken = "wrong-target-token"
+	wrong.Members[0].PublicKey = rhiza.PeerPublicKey(targetID, string(wrong.Members[0].ID), wrong.PeerToken)
 	blocker, err := net.ListenPacket("udp", wrong.PeerAddr)
 	if err != nil {
 		t.Fatal(err)
