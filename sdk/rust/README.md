@@ -126,23 +126,27 @@ librhiza_ffi-<version>-x86_64-unknown-linux-gnu.a
 librhiza_ffi-<version>-aarch64-unknown-linux-gnu.a
 ```
 
-Download the archive matching the crate version and your Rust target, verify it,
-and point `RHIZA_NATIVE_LIB_DIR` at a directory that holds it as
-`librhiza_ffi.a`:
+`sdk/rust/scripts/fetch-native.sh` downloads the archive for a crate version and
+target, verifies it against the published checksum, and writes it as
+`librhiza_ffi.a`. The target defaults to the host triple, and the destination to
+`$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-version=0.15.3
-target=aarch64-apple-darwin
-asset=librhiza_ffi-${version}-${target}.a
-base=https://github.com/mrchypark/rhiza/releases/download/v${version}
-
-curl -fLO "$base/$asset"
-curl -fLO "$base/$asset.sha256"
-shasum -a 256 -c "$asset.sha256"     # sha256sum -c on Linux
-mkdir -p /opt/rhiza-native
-mv "$asset" /opt/rhiza-native/librhiza_ffi.a
-export RHIZA_NATIVE_LIB_DIR=/opt/rhiza-native
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.15.3/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.15.3
+export RHIZA_NATIVE_LIB_DIR=./.rhiza-native
 ```
+
+For containers and cross builds, pass the target and destination explicitly:
+
+```sh
+sh fetch-native.sh 0.15.3 x86_64-unknown-linux-gnu /opt/rhiza-native
+```
+
+The same files can be fetched by hand: download
+`librhiza_ffi-<version>-<target>.a` and its `.sha256` from
+`https://github.com/mrchypark/rhiza/releases/tag/v<version>`, verify the
+checksum, and place the archive as `librhiza_ffi.a`.
 
 With `RHIZA_NATIVE_LIB_DIR` set, the build does not invoke Go and does not need
 the Go toolchain. The archive must come from the same release as the crate

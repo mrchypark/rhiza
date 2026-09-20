@@ -15,6 +15,15 @@ fn watch_go(path: &Path) {
     }
 }
 
+// Shown when the Go build is unavailable, so the Go-free path is discoverable
+// from the failure itself.
+const NATIVE_HINT: &str = concat!(
+    "install Go 1.27+ and a C compiler, or point RHIZA_NATIVE_LIB_DIR at a directory containing librhiza_ffi.a; ",
+    "prebuilt archives: https://github.com/mrchypark/rhiza/releases/tag/v",
+    env!("CARGO_PKG_VERSION"),
+    " (sdk/rust/scripts/fetch-native.sh)",
+);
+
 fn main() {
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     // docs.rs builds Rust documentation only and cannot supply the Go/C toolchain.
@@ -74,9 +83,9 @@ fn main() {
                 .arg(&archive)
                 .arg("./cmd/rhiza-ffi")
                 .status()
-                .expect("failed to start Go; install Go or set RHIZA_NATIVE_LIB_DIR to a directory containing librhiza_ffi.a");
+                .expect(NATIVE_HINT);
             if !status.success() {
-                panic!("building the Rhiza native archive failed; set RHIZA_NATIVE_LIB_DIR to a compatible prebuilt archive to avoid the local Go build");
+                panic!("{}", NATIVE_HINT);
             }
             out
         }
