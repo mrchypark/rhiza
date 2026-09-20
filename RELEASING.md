@@ -36,10 +36,10 @@ is not backed by a published crate fails CI.
 ## Procedure
 
 1. On a `feature/` branch, set `version = "X.Y.Z"` in `sdk/rust/Cargo.toml`, refresh
-   `sdk/rust/Cargo.lock` (CI runs cargo with `--locked`), and update every version
-   reference in `README.md` and `sdk/rust/README.md`, including the
-   `fetch-native.sh` release-tag URL. Open a pull request and merge it once CI
-   passes.
+   `sdk/rust/Cargo.lock` (CI runs cargo with `--locked`), and update the dependency
+   snippets and the `fetch-native.sh` tag URL in `README.md` and `sdk/rust/README.md`.
+   Leave historical versions in the Known issues section alone. Open a pull
+   request and merge it once CI passes.
 2. From the merged `main`, stage the crate outside the repository and publish
    from that stage:
 
