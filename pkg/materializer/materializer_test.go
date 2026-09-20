@@ -17,6 +17,23 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+func TestOpenResolvesRelativePath(t *testing.T) {
+	dir := filepath.Join(".", "relative-open-"+strconv.Itoa(os.Getpid()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("create relative directory: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	m, err := Open(filepath.Join(dir, "sqlite.db"), 1)
+	if err != nil {
+		t.Fatalf("open relative path: %v", err)
+	}
+	defer m.Close()
+	if !filepath.IsAbs(m.dbPath) {
+		t.Fatalf("dbPath %q is not absolute", m.dbPath)
+	}
+}
+
 func TestNormalizeSQLArgsAcceptsGoIntegers(t *testing.T) {
 	values, err := NormalizeSQLArgs([]any{int(1), int32(2), uint64(3), "ok"})
 	if err != nil {
