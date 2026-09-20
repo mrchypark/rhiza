@@ -15,13 +15,31 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.15.2"
+rhizadb = "0.15.3"
 serde_json = "1"
 ```
 
 For a repository checkout, use `rhizadb = { path = "sdk/rust" }`. Maintainers
 refresh the bundled native tree with `prepare-native.sh`; releases stage it with
 `stage-crate.sh`.
+
+## Known issues
+
+`rhizadb` 0.15.2 and earlier fail to open a database when the data directory is
+a relative path, for example `Config::new("./rhiza-rust-data")`:
+
+```
+Error { code: "internal", message: "rebuild materializer: init schema: sqlite3:
+unable to open database file: lstat /rhiza-rust-data: no such file or directory" }
+```
+
+The engine built a `file://` URL from the relative path, which resolved the
+database against the filesystem root instead of the working directory. 0.15.3
+resolves the path first, so relative and absolute data directories both work. On
+0.15.2 and earlier, pass an absolute path.
+
+The Rhiza server has the same defect for a relative `RHIZA_DATA_DIR`, which is
+its default `./rhiza-data`; the fix is in the same release.
 
 ## Migration from `rhizadb` 0.4
 
@@ -113,7 +131,7 @@ and point `RHIZA_NATIVE_LIB_DIR` at a directory that holds it as
 `librhiza_ffi.a`:
 
 ```sh
-version=0.15.2
+version=0.15.3
 target=aarch64-apple-darwin
 asset=librhiza_ffi-${version}-${target}.a
 base=https://github.com/mrchypark/rhiza/releases/download/v${version}
