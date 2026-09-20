@@ -55,7 +55,7 @@ table Request {
   cluster_id:string (id: 2);
   sender_id:string (id: 3);
   config_id:ulong (id: 4);
-  token:string (id: 5);
+  admin_token:string (id: 5);
   record:RecordRequest (id: 6);
   value:[ubyte] (id: 7);
   decision:Decision (id: 8);

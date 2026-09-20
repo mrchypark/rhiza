@@ -384,14 +384,17 @@ func TestNotificationFFIThreeNode(t *testing.T) {
 		t.Skip("RHIZA_E2E_S3_ENDPOINT and RHIZA_E2E_S3_BUCKET are required")
 	}
 	addresses := []string{freeUDPAddr(t), freeUDPAddr(t), freeUDPAddr(t)}
+	cluster := fmt.Sprintf("ffi-notify-%d", time.Now().UnixNano())
+	tokens := make([]string, len(addresses))
 	members := make([]rhiza.Member, len(addresses))
 	for i, address := range addresses {
-		members[i] = rhiza.Member{ID: rhiza.NodeID(fmt.Sprintf("n%d", i+1)), PeerURL: "quic://" + address, Token: fmt.Sprintf("voter-token-%d", i+1)}
+		id, token := fmt.Sprintf("n%d", i+1), fmt.Sprintf("voter-token-%d", i+1)
+		tokens[i] = token
+		members[i] = rhiza.Member{ID: rhiza.NodeID(id), PeerURL: "quic://" + address, PublicKey: rhiza.PeerPublicKey(cluster, id, token)}
 	}
-	cluster := fmt.Sprintf("ffi-notify-%d", time.Now().UnixNano())
 	config := func(index int) rhiza.Config {
 		return rhiza.Config{
-			ClusterID: cluster, NodeID: string(members[index].ID), DataDir: t.TempDir(), PeerAddr: addresses[index], Members: members,
+			ClusterID: cluster, NodeID: string(members[index].ID), DataDir: t.TempDir(), PeerAddr: addresses[index], PeerToken: tokens[index], Members: members,
 			ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint, ObjStoreBucket: bucket, ObjStoreRegion: "us-east-1", ObjStoreInsecure: true,
 			ObjStoreAccessKey: os.Getenv("RHIZA_E2E_S3_ACCESS_KEY"), ObjStoreSecretKey: os.Getenv("RHIZA_E2E_S3_SECRET_KEY"),
 		}

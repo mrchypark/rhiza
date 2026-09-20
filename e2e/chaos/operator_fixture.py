@@ -19,12 +19,26 @@ MC_IMAGE = (
 _MINIO_ACCESS = "chaos-minio"
 _MINIO_SECRET = "chaos-minio-secret"
 
+# Peer identity tokens stay in the Secret; the replicated membership publishes
+# only the public key each token derives for cluster "chaos-source". The values
+# below are the Go KDF output (rhiza.PeerPublicKey) for those exact tokens.
+_PEER_TOKENS = {f"rhiza-{i}": f"chaos-peer-{i}" for i in range(3)}
+
+_PEER_PUBLIC_KEYS = {
+    "rhiza-0": "w/9aNKUMViLY3om/rhV1cdEi0Ze/RRHoWVVASKtxEZ0=",
+    "rhiza-1": "20cqK3U/vCHM97okdruQevaHJQTLwFQwt3JSBRyU4I4=",
+    "rhiza-2": "duahgYsvhEXer27GZRWtAaQKXxTUxgPjP/Zo4ZSy7ZQ=",
+    "learner-a": "KG0UGao23Awl505BjApO1UQuPHgh3N7530FNo7VoXyY=",
+    "learner-b": "81VijYuEB04X3clLPkoSGs+gun03Drf/PfsPjA2Ed9E=",
+    "learner-c": "jGmOr56lfg2S+6TiI44aUzEoJ/eHSrOpKdggldq6+XY=",
+}
+
 _MEMBERS = [
     {
         "node_id": f"rhiza-{i}",
         "url": f"http://rhiza-{i}.rhiza-headless:8080",
         "peer_url": f"quic://rhiza-{i}.rhiza-headless:9090",
-        "token": f"chaos-peer-{i}",
+        "public_key": _PEER_PUBLIC_KEYS[f"rhiza-{i}"],
     }
     for i in range(3)
 ]
@@ -70,6 +84,9 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
         "type": "Opaque",
         "stringData": {
             "RHIZA_ADMIN_TOKEN": "chaos-admin",
+            "RHIZA_PEER_TOKENS": json.dumps(
+                _PEER_TOKENS, separators=(",", ":")
+            ),
         },
     }
 
@@ -477,7 +494,11 @@ def learner_resources(
     token = f"chaos-peer-{name}"
     peer_url = f"quic://{name}:9090"
     learner_json = json.dumps(
-        {"node_id": name, "peer_url": peer_url, "token": token},
+        {
+            "node_id": name,
+            "peer_url": peer_url,
+            "public_key": _PEER_PUBLIC_KEYS[name],
+        },
         separators=(",", ":"),
     )
 
@@ -492,6 +513,7 @@ def learner_resources(
         "immutable": True,
         "stringData": {
             "member": learner_json,
+            "RHIZA_PEER_TOKEN": token,
         },
     }
 
@@ -561,8 +583,25 @@ def learner_resources(
                         {"name": "RHIZA_NODE_ID", "value": name},
                         {
                             "name": "RHIZA_LEARNER",
-                            "value": learner_json,
+                            "valueFrom": {
+                                "secretKeyRef": {
+                                    "name": f"{name}-credentials",
+                                    "key": "member",
+                                }
+                            },
                         },
+                        {
+                            "name": "RHIZA_PEER_TOKEN",
+                            "valueFrom": {
+                                "secretKeyRef": {
+                                    "name": f"{name}-credentials",
+                                    "key": "RHIZA_PEER_TOKEN",
+                                }
+                            },
+                        },
+                        # The voter token map is shared through envFrom; a
+                        # learner uses its single RHIZA_PEER_TOKEN instead.
+                        {"name": "RHIZA_PEER_TOKENS", "value": ""},
                     ],
                     "volumeMounts": [
                         {"name": "data", "mountPath": "/data"}

@@ -31,10 +31,10 @@ func (r *countedResolver) ConfigID() uint {
 }
 
 func TestTransportCacheCopiesOnlyOnMiss(t *testing.T) {
-	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "a", Token: "old"}}}
-	next := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "a", Token: "new"}}}
+	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "old")}}
+	next := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{testMember("cluster", "a", "new")}}
 	r := &countedResolver{testClusterResolver: testClusterResolver{current: next, slots: map[quepaxa.Slot]quepaxa.Cluster{1: old}}}
-	transport := NewTransport("cluster", "a", &old, "admin")
+	transport := NewTransport("cluster", "a", &old, "a-token")
 	t.Cleanup(func() { _ = transport.Close() })
 	transport.BindCore(r)
 	var wg sync.WaitGroup
@@ -54,7 +54,9 @@ func TestTransportCacheCopiesOnlyOnMiss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if historical == active || active == transport || historical == transport || historical.token != "old" || active.token != "new" || historical.tls.ClientSessionCache == active.tls.ClientSessionCache || historical.peers["a"] == active.peers["a"] {
+	// The process identity is shared, but each configuration owns its pools and
+	// TLS session cache so a stale ticket or connection is never reused.
+	if historical == active || active == transport || historical == transport || historical.peerToken != "a-token" || active.peerToken != "a-token" || historical.members["a"].PublicKey != old.Members[0].PublicKey || active.members["a"].PublicKey != next.Members[0].PublicKey || historical.tls.ClientSessionCache == active.tls.ClientSessionCache || historical.peers["a"] == active.peers["a"] {
 		t.Fatal("configuration credentials, pools or TLS sessions were shared")
 	}
 	if allocs := testing.AllocsPerRun(100, func() {
@@ -78,8 +80,8 @@ func TestTransportCacheCopiesOnlyOnMiss(t *testing.T) {
 }
 
 func TestTransportCacheUsesSnapshotIDAfterTransition(t *testing.T) {
-	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "a", Token: "old"}}}
-	next := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "a", Token: "new"}}}
+	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "old")}}
+	next := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{testMember("cluster", "a", "new")}}
 	r := &countedResolver{testClusterResolver: testClusterResolver{current: next, slots: map[quepaxa.Slot]quepaxa.Cluster{1: old}}, staleID: 1}
 	transport := NewTransport("cluster", "a", &old, "admin")
 	defer transport.Close()
@@ -92,7 +94,7 @@ func TestTransportCacheUsesSnapshotIDAfterTransition(t *testing.T) {
 		t.Fatal("snapshot cached under stale ID")
 	}
 	historical, err := transport.transportForSlot(1)
-	if err != nil || historical.configID != 1 || historical.token != "old" {
+	if err != nil || historical.configID != 1 || historical.members["a"].PublicKey != old.Members[0].PublicKey {
 		t.Fatalf("historical routing after race: %v", err)
 	}
 }

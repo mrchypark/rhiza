@@ -11,8 +11,8 @@ import (
 
 func TestOfflineEnrollmentRejectsInvalidMembershipBeforeRegistration(t *testing.T) {
 	for name, members := range map[string][]types.NodeConfig{
-		"duplicate member": {{ID: "a", Token: "a-token"}, {ID: "a", Token: "other-token"}},
-		"local absent":     {{ID: "b", Token: "b-token"}, {ID: "c", Token: "c-token"}},
+		"duplicate member": {{ID: "a"}, {ID: "a"}},
+		"local absent":     {{ID: "b"}, {ID: "c"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			dataDir := t.TempDir()

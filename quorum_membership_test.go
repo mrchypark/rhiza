@@ -23,7 +23,9 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	const admin = "membership-test-admin"
+	const clusterID = "membership-test"
 	members := make([]quepaxa.Member, 4)
+	tokens := make([]string, 4)
 	reserved := make([]*quic.Transport, len(members))
 	t.Cleanup(func() {
 		for _, listener := range reserved {
@@ -38,7 +40,9 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		members[i] = quepaxa.Member{ID: quepaxa.NodeID(fmt.Sprintf("v%d", i)), PeerURL: "quic://" + listener.LocalAddr().String(), Token: fmt.Sprintf("membership-test-voter-%d", i)}
+		id, token := fmt.Sprintf("v%d", i), fmt.Sprintf("membership-test-voter-%d", i)
+		tokens[i] = token
+		members[i] = quepaxa.Member{ID: quepaxa.NodeID(id), PeerURL: "quic://" + listener.LocalAddr().String(), PublicKey: quepaxa.PublicKey(network.PeerPublicKey(clusterID, quepaxa.NodeID(id), token))}
 		reserved[i] = &quic.Transport{Conn: listener}
 	}
 	genesis := quepaxa.Cluster{ConfigID: 1, Members: members[:3]}
@@ -77,7 +81,12 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = wal.Close() })
-		transport := network.NewTransport("membership-test", members[index].ID, &genesis, admin)
+		transport := network.NewTransport(clusterID, members[index].ID, &genesis, tokens[index])
+		if learner {
+			// An unpromoted learner holds no voting identity and syncs with the
+			// cluster admin token, as pkg/node does.
+			transport.SetAdminToken(admin)
+		}
 		t.Cleanup(func() { _ = transport.Close() })
 		config := quepaxa.Config{NodeID: members[index].ID, Cluster: genesis, WAL: wal, Transport: transport, EnableReconfiguration: true}
 		config.ReconfigurationAdmission = func(callCtx context.Context, _ quepaxa.Cluster, through quepaxa.Slot, prefix [32]byte) error {
@@ -117,7 +126,7 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 		if learner {
 			identities = append(append([]quepaxa.Member(nil), identities...), members[index])
 		}
-		listener, err := network.StartPeerServerOnTransport(ctx, reserved[index], server, identities, admin)
+		listener, err := network.StartPeerServerOnTransport(ctx, reserved[index], server, identities, tokens[index], admin)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -158,7 +167,7 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	if err := peers[0].core.FinishReconfiguration(ctx); err != nil {
 		t.Fatal(err)
 	}
-	historical := network.NewTransport("membership-test", members[0].ID, &genesis, admin)
+	historical := network.NewTransport(clusterID, members[0].ID, &genesis, tokens[0])
 	t.Cleanup(func() { _ = historical.Close() })
 	if page, err := historical.FetchDecisions(ctx, members[0].ID, 1, 1); err != nil || len(page.Decisions) != 1 {
 		t.Fatalf("active voter historical sync: %v", err)
@@ -231,7 +240,7 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	if peers[3].core.IsVoter() {
 		t.Fatal("fresh WAL reused the old incarnation's promotion")
 	}
-	probe := network.NewTransport("membership-test", members[0].ID, &replacement, admin)
+	probe := network.NewTransport(clusterID, members[0].ID, &replacement, tokens[0])
 	t.Cleanup(func() { _ = probe.Close() })
 	probe.BindCore(peers[0].core)
 	if batch, err := probe.FetchDecisions(ctx, members[3].ID, 1, 1); err != nil || len(batch.Decisions) != 1 {

@@ -73,7 +73,8 @@ func TestS3MembershipGenerationForkE2E(t *testing.T) {
 
 	targetMembers := make([]rhiza.Member, 3)
 	for i := range targetMembers {
-		targetMembers[i] = rhiza.Member{ID: quepaxa.NodeID(fmt.Sprintf("target-%d", i+1)), PeerURL: "quic://" + freeUDPAddr(t), Token: fmt.Sprintf("target-token-%d", i+1)}
+		id := fmt.Sprintf("target-%d", i+1)
+		targetMembers[i] = rhiza.Member{ID: quepaxa.NodeID(id), PeerURL: "quic://" + freeUDPAddr(t), PublicKey: rhiza.PeerPublicKey(targetID, id, fmt.Sprintf("target-token-%d", i+1))}
 	}
 	sourcePrefix, targetPrefix := sourceID, targetID
 	operationID := generation + "-fork"
@@ -103,7 +104,7 @@ func TestS3MembershipGenerationForkE2E(t *testing.T) {
 	wrong := e2eS3Config(t, targetID, string(targetMembers[0].ID), strings.TrimPrefix(targetMembers[0].PeerURL, "quic://"), targetMembers)
 	wrong.ObjStoreDurability = rhiza.ObjectStoreDurabilityBeforeAck
 	wrong.Members = append([]rhiza.Member(nil), targetMembers...)
-	wrong.Members[0].Token = "wrong-target-token"
+	wrong.Members[0].PublicKey = rhiza.PeerPublicKey(targetID, string(wrong.Members[0].ID), "wrong-target-token")
 	blocker, err := net.ListenPacket("udp", wrong.PeerAddr)
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +124,7 @@ func TestS3MembershipGenerationForkE2E(t *testing.T) {
 	configs := make([]rhiza.Config, len(targetMembers))
 	for i, member := range targetMembers {
 		configs[i] = e2eS3Config(t, targetID, string(member.ID), strings.TrimPrefix(member.PeerURL, "quic://"), targetMembers)
+		configs[i].PeerToken = fmt.Sprintf("target-token-%d", i+1)
 		configs[i].ObjStoreDurability = rhiza.ObjectStoreDurabilityBeforeAck
 		target[i], err = rhiza.Open(ctx, configs[i])
 		if err != nil {

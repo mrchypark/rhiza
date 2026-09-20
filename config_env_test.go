@@ -10,7 +10,8 @@ func TestConfigFromEnvParsesOperatorEnvironment(t *testing.T) {
 	for key, value := range map[string]string{
 		"RHIZA_CLUSTER_ID": "recovered", "RHIZA_NODE_ID": "rhiza-r-1", "RHIZA_DATA_DIR": "/data/rhiza",
 		"RHIZA_BIND_ADDR": ":8080", "RHIZA_PEER_ADDR": ":9090", "RHIZA_ADMIN_TOKEN": "admin",
-		"RHIZA_CLUSTER_MEMBERS":   `[{"node_id":"rhiza-r-1","peer_url":"quic://rhiza-r-1:9090","token":"secret"}]`,
+		"RHIZA_CLUSTER_MEMBERS":   `[{"node_id":"rhiza-r-1","peer_url":"quic://rhiza-r-1:9090","public_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="}]`,
+		"RHIZA_PEER_TOKEN":        "peer-secret",
 		"RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_DIR": "/archive", "RHIZA_OBJSTORE_PREFIX": "recovered/",
 		"RHIZA_OBJSTORE_ENDPOINT": "http://minio:9000", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_REGION": "us-east-1",
 		"RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_MAX_RETRIES": "4", "RHIZA_OBJSTORE_ACCESS_KEY": "access",
@@ -32,8 +33,8 @@ func TestConfigFromEnvParsesOperatorEnvironment(t *testing.T) {
 	if config.ClusterID != "recovered" || config.NodeID != "rhiza-r-1" || config.DataDir != "/data/rhiza" || config.BindAddr != ":8080" || config.PeerAddr != ":9090" || config.AdminToken != "admin" {
 		t.Fatalf("identity config=%+v", config)
 	}
-	if len(config.Members) != 1 || config.Members[0].ID != "rhiza-r-1" || config.Members[0].Token != "secret" {
-		t.Fatalf("members=%+v", config.Members)
+	if config.PeerToken != "peer-secret" || len(config.Members) != 1 || config.Members[0].ID != "rhiza-r-1" || config.Members[0].PublicKey == (PublicKey{}) {
+		t.Fatalf("peer token=%q members=%+v", config.PeerToken, config.Members)
 	}
 	if config.ObjStoreProvider != "s3" || config.ObjStoreDir != "/archive" || config.ObjStoreDurability != ObjectStoreDurabilityBeforeAck || !config.ObjStoreInsecure || config.ObjStoreRetries != 4 {
 		t.Fatalf("object store config=%+v", config)

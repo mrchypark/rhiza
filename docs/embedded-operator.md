@@ -78,7 +78,8 @@ Operator는 컨테이너의 `RHIZA_*` 환경 설정을 읽고 다음 항목을 �
 | 환경 변수 | 의미 |
 | --- | --- |
 | `RHIZA_CLUSTER_ID` | 세대별 클러스터 ID |
-| `RHIZA_CLUSTER_MEMBERS` | 3개 member의 JSON. 각 항목은 `node_id`, `url`, `peer_url`, `token`을 포함 |
+| `RHIZA_CLUSTER_MEMBERS` | 3개 member의 JSON. 각 항목은 `node_id`, `url`, `peer_url`, base64 Ed25519 `public_key`를 포함 |
+| `RHIZA_PEER_TOKENS` | 노드별 비공개 peer 토큰의 JSON map. StatefulSet은 Pod 템플릿 하나로 replica별 Secret을 마운트할 수 없어 각 Pod가 자기 `RHIZA_NODE_ID` 항목을 선택한다. `RHIZA_PEER_TOKEN`(단일 값)과 동시에 설정할 수 없다 |
 | `RHIZA_ADMIN_TOKEN` | 복구 archive 발행 인증 토큰 |
 | `RHIZA_OBJSTORE_DURABILITY` | `async` 또는 `before-ack` |
 | `RHIZA_NODE_ID` | `metadata.name` downward API. 예: `myapp-0` |
@@ -157,8 +158,10 @@ spec:
 headless Service에는 `publishNotReadyAddresses: true`와 peer UDP 포트를 설정한다.
 멤버 ID는 `myapp-0`부터 `myapp-2`, peer URL은 예를 들어
 `quic://myapp-0.myapp-peers.NAMESPACE.svc.cluster.local:9090` 형태다.
-초기 `rhiza-peer-credentials`는 고유한 member별 토큰과 admin 토큰을 담은 Secret으로
-별도 생성한다. 실제 자격 증명을 Git에 기록하지 않는다.
+초기 `rhiza-peer-credentials`는 admin 토큰과 노드별 peer 토큰 map을 담은 Secret으로
+별도 생성한다. 공개 멤버십에는 각 노드의 `public_key`만 실리므로 복제되는
+membership, checkpoint, archive에는 비공개 토큰이 남지 않는다. 실제 자격 증명을
+Git에 기록하지 않는다.
 
 Operator는 소유 StatefulSet UID에 속한 Pod IP로 직접 접근한다.
 `recovery`라는 컨테이너 포트가 있으면 사용하고, 없으면 기존 `http` 포트,

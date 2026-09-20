@@ -60,7 +60,7 @@ func catchUpTestServer(t *testing.T, config quepaxa.Cluster, peers ...*catchUpPe
 	for i, p := range peers {
 		members[i] = p.member
 	}
-	transport := NewTransport("cluster", "follower", &quepaxa.Cluster{ConfigID: 1, Members: members}, "admin")
+	transport := adminTransport("cluster", "follower", &quepaxa.Cluster{ConfigID: 1, Members: members}, "admin")
 	t.Cleanup(func() { _ = transport.Close() })
 	dir := t.TempDir()
 	server, wal := newCatchUpFollower(t, dir, config, transport, false)
@@ -217,7 +217,7 @@ func TestCatchUpDifferentSourceProgresses(t *testing.T) {
 }
 
 func TestCatchUpControlPageIsDurableEvenAsHint(t *testing.T) {
-	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "a", Token: "a-token"}}}
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "a-token")}}
 	sourceWAL, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +234,9 @@ func TestCatchUpControlPageIsDurableEvenAsHint(t *testing.T) {
 	if _, _, err := source.Propose(ctx, []byte("ordinary-prefix")); err != nil {
 		t.Fatal(err)
 	}
-	target := quepaxa.Cluster{ConfigID: 2, Members: append(append([]quepaxa.Member(nil), config.Members...), quepaxa.Member{ID: "b", Token: "b-token", WALIdentity: strings.Repeat("b", 64)})}
+	joiner := testMember("cluster", "b", "b-token")
+	joiner.WALIdentity = strings.Repeat("b", 64)
+	target := quepaxa.Cluster{ConfigID: 2, Members: append(append([]quepaxa.Member(nil), config.Members...), joiner)}
 	if _, err := source.BeginReconfiguration(ctx, target); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +248,7 @@ func TestCatchUpControlPageIsDurableEvenAsHint(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer := startCatchUpPeer(t, "a", values, nil)
-	transport := NewTransport("cluster", "follower", &quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{peer.member}}, "admin")
+	transport := adminTransport("cluster", "follower", &quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{peer.member}}, "admin")
 	defer transport.Close()
 	dir := t.TempDir()
 	server, wal := newCatchUpFollower(t, dir, config, transport, true)

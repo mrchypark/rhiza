@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 )
@@ -42,14 +43,39 @@ func AdvancePrefixHash(previous [32]byte, slot Slot, value ValueHash) [32]byte {
 	return next
 }
 
-// Member describes one fixed cluster member.
+// PublicKey is a fixed-size Ed25519 peer identity key. Membership publishes it
+// so peers can authenticate each other without replicating a shared secret.
+// It is an array, not a slice, because membership comparisons are by value.
+type PublicKey [32]byte
+
+// MarshalJSON encodes the key as canonical standard base64.
+func (key PublicKey) MarshalJSON() ([]byte, error) {
+	return json.Marshal(base64.StdEncoding.EncodeToString(key[:]))
+}
+
+func (key *PublicKey) UnmarshalJSON(data []byte) error {
+	var encoded string
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		return fmt.Errorf("public key must be a base64 string")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(decoded) != len(key) {
+		return fmt.Errorf("public key must be %d base64-encoded bytes", len(key))
+	}
+	copy(key[:], decoded)
+	return nil
+}
+
+// Member describes one fixed cluster member. It carries only public identity:
+// the matching private credential stays in the owning process configuration and
+// is never replicated into membership, checkpoints, or archives.
 type Member struct {
-	ID          NodeID `json:"node_id"`
-	URL         string `json:"url"`
-	PeerURL     string `json:"peer_url,omitempty"`
-	LogURL      string `json:"log_url"`
-	Token       string `json:"token"`
-	WALIdentity string `json:"wal_identity,omitempty"`
+	ID          NodeID    `json:"node_id"`
+	URL         string    `json:"url"`
+	PeerURL     string    `json:"peer_url,omitempty"`
+	LogURL      string    `json:"log_url"`
+	PublicKey   PublicKey `json:"public_key"`
+	WALIdentity string    `json:"wal_identity,omitempty"`
 }
 
 // Cluster describes one voter configuration.

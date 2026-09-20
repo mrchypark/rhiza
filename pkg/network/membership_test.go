@@ -11,7 +11,7 @@ import (
 )
 
 func TestMembershipStatusAuthenticationAndRedaction(t *testing.T) {
-	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1", Token: "peer-secret"}}, nil, nil)
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	t.Cleanup(server.Close)
 	server.SetMembershipToken("admin-secret")

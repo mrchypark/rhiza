@@ -7,18 +7,18 @@ import (
 )
 
 type RequestT struct {
-	Magic     uint32          `json:"magic"`
-	Operation Operation       `json:"operation"`
-	ClusterId string          `json:"cluster_id"`
-	SenderId  string          `json:"sender_id"`
-	ConfigId  uint64          `json:"config_id"`
-	Token     string          `json:"token"`
-	Record    *RecordRequestT `json:"record"`
-	Value     []byte          `json:"value"`
-	Decision  *DecisionT      `json:"decision"`
-	From      uint64          `json:"from"`
-	Limit     uint32          `json:"limit"`
-	Hash      []byte          `json:"hash"`
+	Magic uint32 `json:"magic"`
+	Operation Operation `json:"operation"`
+	ClusterId string `json:"cluster_id"`
+	SenderId string `json:"sender_id"`
+	ConfigId uint64 `json:"config_id"`
+	AdminToken string `json:"admin_token"`
+	Record *RecordRequestT `json:"record"`
+	Value []byte `json:"value"`
+	Decision *DecisionT `json:"decision"`
+	From uint64 `json:"from"`
+	Limit uint32 `json:"limit"`
+	Hash []byte `json:"hash"`
 }
 
 func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
@@ -33,9 +33,9 @@ func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	if t.SenderId != "" {
 		senderIdOffset = builder.CreateString(t.SenderId)
 	}
-	tokenOffset := flatbuffers.UOffsetT(0)
-	if t.Token != "" {
-		tokenOffset = builder.CreateString(t.Token)
+	adminTokenOffset := flatbuffers.UOffsetT(0)
+	if t.AdminToken != "" {
+		adminTokenOffset = builder.CreateString(t.AdminToken)
 	}
 	recordOffset := t.Record.Pack(builder)
 	valueOffset := flatbuffers.UOffsetT(0)
@@ -53,7 +53,7 @@ func (t *RequestT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	RequestAddClusterId(builder, clusterIdOffset)
 	RequestAddSenderId(builder, senderIdOffset)
 	RequestAddConfigId(builder, t.ConfigId)
-	RequestAddToken(builder, tokenOffset)
+	RequestAddAdminToken(builder, adminTokenOffset)
 	RequestAddRecord(builder, recordOffset)
 	RequestAddValue(builder, valueOffset)
 	RequestAddDecision(builder, decisionOffset)
@@ -69,7 +69,7 @@ func (rcv *Request) UnPackTo(t *RequestT) {
 	t.ClusterId = string(rcv.ClusterId())
 	t.SenderId = string(rcv.SenderId())
 	t.ConfigId = rcv.ConfigId()
-	t.Token = string(rcv.Token())
+	t.AdminToken = string(rcv.AdminToken())
 	t.Record = rcv.Record(nil).UnPack()
 	t.Value = rcv.ValueBytes()
 	t.Decision = rcv.Decision(nil).UnPack()
@@ -186,7 +186,7 @@ func (rcv *Request) MutateConfigId(n uint64) bool {
 	return rcv._tab.MutateUint64Slot(12, n)
 }
 
-func (rcv *Request) Token() []byte {
+func (rcv *Request) AdminToken() []byte {
 	o := flatbuffers.UOffsetT(rcv._tab.Offset(14))
 	if o != 0 {
 		return rcv._tab.ByteVector(o + rcv._tab.Pos)
@@ -330,8 +330,8 @@ func RequestAddSenderId(builder *flatbuffers.Builder, senderId flatbuffers.UOffs
 func RequestAddConfigId(builder *flatbuffers.Builder, configId uint64) {
 	builder.PrependUint64Slot(4, configId, 0)
 }
-func RequestAddToken(builder *flatbuffers.Builder, token flatbuffers.UOffsetT) {
-	builder.PrependUOffsetTSlot(5, flatbuffers.UOffsetT(token), 0)
+func RequestAddAdminToken(builder *flatbuffers.Builder, adminToken flatbuffers.UOffsetT) {
+	builder.PrependUOffsetTSlot(5, flatbuffers.UOffsetT(adminToken), 0)
 }
 func RequestAddRecord(builder *flatbuffers.Builder, record flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(6, flatbuffers.UOffsetT(record), 0)

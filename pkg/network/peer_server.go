@@ -36,7 +36,7 @@ type PeerServer struct {
 	listener       *quic.EarlyListener
 	server         *Server
 	members        map[quepaxa.NodeID]quepaxa.Member
-	token          string
+	adminToken     string
 	connections    chan struct{}
 	streams        chan struct{}
 	cancel         context.CancelFunc
@@ -46,10 +46,10 @@ type PeerServer struct {
 	closeTransport func() error
 }
 
-func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
+func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string) (*PeerServer, error) {
 	var conn net.PacketConn
 	var transport *quic.Transport
-	peer, err := startPeerServer(ctx, server, members, token, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
+	peer, err := startPeerServer(ctx, server, members, peerToken, adminToken, func(tlsConfig *tls.Config, config *quic.Config) (*quic.EarlyListener, error) {
 		var err error
 		conn, err = net.ListenPacket("udp", addr)
 		if err != nil {
@@ -74,43 +74,53 @@ func StartPeerServer(ctx context.Context, addr string, server *Server, members [
 // StartPeerServerOnTransport serves on an already-bound QUIC transport. The
 // caller owns the transport and its UDP socket; closing this PeerServer leaves
 // them available for a subsequent listener without releasing the port.
-func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, server *Server, members []quepaxa.Member, token string) (*PeerServer, error) {
+func StartPeerServerOnTransport(ctx context.Context, transport *quic.Transport, server *Server, members []quepaxa.Member, peerToken, adminToken string) (*PeerServer, error) {
 	if transport == nil {
 		return nil, fmt.Errorf("peer QUIC transport is required")
 	}
-	return startPeerServer(ctx, server, members, token, transport.ListenEarly)
+	return startPeerServer(ctx, server, members, peerToken, adminToken, transport.ListenEarly)
 }
 
-func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, token string, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
-	identityToken := token
+func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Member, peerToken, adminToken string, listen func(*tls.Config, *quic.Config) (*quic.EarlyListener, error)) (*PeerServer, error) {
+	local, hasLocal := peerMember(quepaxa.Cluster{Members: members}, server.core.NodeID())
 	for _, member := range members {
-		if len(members) > 1 && member.Token == "" {
-			return nil, fmt.Errorf("voter token is required for %q", member.ID)
-		}
-		if token != "" && member.Token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(member.Token)) == 1 {
-			return nil, fmt.Errorf("admin token must differ from voter token for %q", member.ID)
-		}
-		if member.ID == server.core.NodeID() && member.Token != "" {
-			identityToken = member.Token
+		if len(members) > 1 && member.PublicKey == (quepaxa.PublicKey{}) {
+			return nil, fmt.Errorf("voter public key is required for %q", member.ID)
 		}
 	}
-	if identityToken == "" && len(members) > 1 {
+	if peerToken == "" && len(members) > 1 {
 		return nil, fmt.Errorf("peer identity token is required")
 	}
-	certificate, err := peerCertificate(server.cluster, server.core.NodeID(), identityToken)
+	if adminToken != "" && peerToken == adminToken {
+		return nil, fmt.Errorf("admin token must differ from the peer identity token")
+	}
+	certificate, err := peerCertificate(server.cluster, server.core.NodeID(), peerToken)
 	if err != nil {
 		return nil, err
 	}
-	listener, err := listen(&tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate}}, &quic.Config{
+	// A published local key must match this process's private token. Single-node
+	// members may omit both; multi-node members always publish a key.
+	if hasLocal && local.PublicKey != (quepaxa.PublicKey{}) {
+		if local.PublicKey != quepaxa.PublicKey(PeerPublicKey(server.cluster, server.core.NodeID(), peerToken)) {
+			return nil, fmt.Errorf("local peer identity does not match the configured public key for %q", local.ID)
+		}
+	}
+	listener, err := listen(&tls.Config{
+		MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN}, Certificates: []tls.Certificate{certificate},
+		// Voters authenticate with a certificate derived from their private
+		// peer token. Requesting (not requiring) it keeps the admin-token
+		// read-only sync path working for clients without a peer identity.
+		ClientAuth: tls.RequestClientCert,
+	}, &quic.Config{
 		HandshakeIdleTimeout: 5 * time.Second, MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second,
-		MaxIncomingStreams: 256, MaxIncomingUniStreams: -1, Allow0RTT: true,
+		MaxIncomingStreams: 256, MaxIncomingUniStreams: -1,
 	})
 	if err != nil {
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	peer := &PeerServer{
-		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), token: token,
+		listener: listener, server: server, members: make(map[quepaxa.NodeID]quepaxa.Member, len(members)), adminToken: adminToken,
 		connections: make(chan struct{}, maxPeerConnections), streams: make(chan struct{}, maxPeerStreams), cancel: cancel,
 	}
 	for _, member := range members {
@@ -121,12 +131,12 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 	return peer, nil
 }
 
-// StartLearnerPeerServer gives an unpromoted learner its own token-bound TLS
-// identity. The learner is not admitted as a voter until its core applies the
-// reconfiguration, so its token cannot authenticate voting RPCs meanwhile.
-func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, voters []quepaxa.Member, token string, learner quepaxa.Member) (*PeerServer, error) {
-	if learner.ID == "" || learner.Token == "" {
-		return nil, fmt.Errorf("learner ID and token are required")
+// StartLearnerPeerServer gives an unpromoted learner its own peer-token-bound
+// TLS identity. The learner is not admitted as a voter until its core applies
+// the reconfiguration, so its certificate cannot authenticate voting RPCs.
+func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, voters []quepaxa.Member, peerToken, adminToken string, learner quepaxa.Member) (*PeerServer, error) {
+	if learner.ID == "" {
+		return nil, fmt.Errorf("learner ID is required")
 	}
 	if learner.ID != server.core.NodeID() {
 		return nil, fmt.Errorf("learner ID must match the local node")
@@ -136,8 +146,12 @@ func StartLearnerPeerServer(ctx context.Context, addr string, server *Server, vo
 			return nil, fmt.Errorf("learner is already a voter")
 		}
 	}
+	if peerToken == "" {
+		return nil, fmt.Errorf("learner peer identity token is required")
+	}
 	members := append(append([]quepaxa.Member(nil), voters...), learner)
-	return StartPeerServer(ctx, addr, server, members, token)
+	// startPeerServer validates that the local public key matches the token.
+	return StartPeerServer(ctx, addr, server, members, peerToken, adminToken)
 }
 
 func (s *PeerServer) Close() error {
@@ -208,7 +222,13 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			if request.Operation == peerfb.OperationPrepareCheckpoint {
 				_ = stream.SetDeadline(time.Now().Add(checkpointPrepareTimeout))
 			}
-			response, err = s.handle(stream.Context(), conn, request)
+			// Voter authorization is bound to the handshake certificate, so a
+			// request is never accepted as replayable early data.
+			if !conn.ConnectionState().TLS.HandshakeComplete {
+				err = fmt.Errorf("peer authentication requires a completed TLS handshake")
+			} else {
+				response, err = s.handle(stream.Context(), peerCertificateKey(conn), request)
+			}
 		}
 	}
 	if err != nil {
@@ -238,7 +258,29 @@ func peerMember(config quepaxa.Cluster, id quepaxa.NodeID) (quepaxa.Member, bool
 	return quepaxa.Member{}, false
 }
 
-func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
+// peerCertificateKey returns the Ed25519 public key of the certificate the
+// client presented during the TLS handshake. A client without a client
+// certificate yields nil and can only authenticate as a non-voter.
+func peerCertificateKey(conn *quic.Conn) ed25519.PublicKey {
+	if conn == nil || !conn.ConnectionState().TLS.HandshakeComplete {
+		return nil
+	}
+	certificates := conn.ConnectionState().TLS.PeerCertificates
+	if len(certificates) != 1 {
+		return nil
+	}
+	key, ok := certificates[0].PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return nil
+	}
+	return key
+}
+
+// handle serves one authenticated request. certificateKey is the Ed25519 key
+// of the certificate the client proved possession of during the TLS
+// handshake; nil means the client presented no peer identity and may only use
+// the cluster admin token for the read-only sync path.
+func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKey, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
 	config, err := s.configurationFor(request)
 	if err != nil || request.ClusterId != string(s.server.cluster) || request.ConfigId != uint64(config.ConfigID) {
 		return nil, fmt.Errorf("cluster identity mismatch")
@@ -247,18 +289,16 @@ func (s *PeerServer) handle(ctx context.Context, conn *quic.Conn, request *peerf
 	current := s.server.core.CurrentCluster()
 	active, activeOK := peerMember(current, quepaxa.NodeID(request.SenderId))
 	// A historical envelope does not keep a removed voter authorized after the
-	// boundary. Existing voters need credentials valid in both configurations.
-	voter := historicalOK && activeOK && historical.Token != "" && active.Token != "" &&
-		subtle.ConstantTimeCompare([]byte(request.Token), []byte(historical.Token)) == 1 &&
-		subtle.ConstantTimeCompare([]byte(request.Token), []byte(active.Token)) == 1
-	learner := s.token != "" && subtle.ConstantTimeCompare([]byte(request.Token), []byte(s.token)) == 1
-	// Non-voting learners may only pull already-certified decisions. They use
+	// boundary. Existing voters must present the certificate key that the
+	// historical and the active configuration both pin.
+	voter := historicalOK && activeOK && certificateKey != nil &&
+		subtle.ConstantTimeCompare(certificateKey, historical.PublicKey[:]) == 1 &&
+		subtle.ConstantTimeCompare(certificateKey, active.PublicKey[:]) == 1
+	// Non-voting clients may only pull already-certified decisions. They use
 	// the cluster admin token and never enter the fixed voter membership.
-	if !voter && !(learner && request.Operation == peerfb.OperationSync) {
+	admin := s.adminToken != "" && subtle.ConstantTimeCompare([]byte(request.AdminToken), []byte(s.adminToken)) == 1
+	if !voter && !(admin && request.Operation == peerfb.OperationSync) {
 		return nil, fmt.Errorf("peer authentication failed")
-	}
-	if !allows0RTT(request.Operation) && (conn == nil || !conn.ConnectionState().TLS.HandshakeComplete) {
-		return nil, fmt.Errorf("%s is not accepted as replayable early data", request.Operation)
 	}
 	switch request.Operation {
 	case peerfb.OperationRecord:
@@ -453,7 +493,10 @@ func (s *PeerServer) configurationFor(request *peerfb.RequestT) (quepaxa.Cluster
 	return s.server.core.CurrentCluster(), nil
 }
 
-func peerPublicKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) ed25519.PublicKey {
+// PeerPublicKey derives the pinned public identity a peer token grants to one
+// node. Callers use it to publish a public member without ever replicating the
+// secret that owns the key.
+func PeerPublicKey(clusterID types.ClusterID, nodeID quepaxa.NodeID, token string) ed25519.PublicKey {
 	return peerPrivateKey(clusterID, nodeID, token).Public().(ed25519.PublicKey)
 }
 
@@ -475,7 +518,7 @@ func peerCertificate(clusterID types.ClusterID, nodeID quepaxa.NodeID, token str
 		SerialNumber: serial, Subject: pkix.Name{CommonName: string(nodeID)}, DNSNames: []string{string(nodeID)},
 		NotBefore: time.Unix(0, 0), NotAfter: time.Date(2125, 1, 1, 0, 0, 0, 0, time.UTC),
 		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
 	if err != nil {

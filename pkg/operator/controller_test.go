@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -155,7 +156,8 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Add == nil || r.Status.Membership.Add.ExpectedAbortSlot != 7 || bytes.Contains(jsonBytes(r.Status), []byte("new-token")) {
+	added := voterMember("source", "n4", "new-token")
+	if r.Status.Membership.Add == nil || r.Status.Membership.Add.ExpectedAbortSlot != 7 || bytes.Contains(jsonBytes(r.Status), []byte(hex.EncodeToString(added.PublicKey[:]))) {
 		t.Fatalf("add journal leaks credentials: status=%+v journal=%+v", r.Status, r.Status.Membership)
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "2"
@@ -180,7 +182,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	api.membership["n2"] = network.MembershipStatus{NodeID: "n2", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, Voting: true}
 	api.membership["n4"] = network.MembershipStatus{NodeID: "n4", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, WALIdentity: strings.Repeat("a", 64), Voting: true}
 	originalCredential := api.membershipSecret["data"].(object)["member"]
-	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(quepaxa.Member{ID: "n4", URL: "http://n4", PeerURL: "quic://n4", Token: "changed-token"}))
+	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "n4", "changed-token")))
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +275,7 @@ func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 		t.Fatal(err)
 	}
 	api.replacement2 = object{"metadata": object{"name": "learner2", "uid": "learner2-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}}}
-	member := quepaxa.Member{ID: "n5", URL: "http://n5", PeerURL: "quic://n5", Token: "newer-token"}
+	member := voterMember("source", "n5", "newer-token")
 	api.membershipSecrets["learner2-credentials"] = object{"immutable": true, "metadata": object{"name": "learner2-credentials", "uid": "secret2-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
 	api.learnerID = "n5"
 	api.membership["n5"] = network.MembershipStatus{NodeID: "n5", ClusterID: "source", ConfigID: 2, Voters: []quepaxa.NodeID{"n1", "n2"}, WALIdentity: strings.Repeat("d", 64)}
@@ -335,7 +337,7 @@ func membershipFixture(t *testing.T) (context.Context, *Resource, *operatorAPI, 
 		t.Fatal(err)
 	}
 	api.replacement = object{"metadata": object{"name": "learner", "uid": "learner-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}}}
-	member := quepaxa.Member{ID: "n4", URL: "http://n4", PeerURL: "quic://n4", Token: "new-token"}
+	member := voterMember("source", "n4", "new-token")
 	api.membershipSecret = object{"immutable": true, "metadata": object{"name": "learner-credentials", "uid": "secret-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
 	api.learnerID = "n4"
 	api.membershipSecrets = map[string]object{"learner-credentials": api.membershipSecret}
@@ -451,6 +453,12 @@ func TestControllerRejectsUnknownTargetDurability(t *testing.T) {
 
 func fence(r *Resource) Fence {
 	return Fence{RecoveryID: r.Spec.RecoveryID, ClusterID: r.Spec.SourceClusterID, StatefulSetUID: "sts-uid", Confirmed: true, Evidence: "incident-42"}
+}
+
+// voterMember derives the public identity a peer token grants one voter, so
+// fixtures carry no secret in the replicated member record.
+func voterMember(clusterID, name, token string) quepaxa.Member {
+	return quepaxa.Member{ID: quepaxa.NodeID(name), URL: "http://" + name, PeerURL: "quic://" + name, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), quepaxa.NodeID(name), token))}
 }
 
 func controllerFixture(t *testing.T, sourceMode, targetMode string) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
@@ -693,7 +701,7 @@ func fakeSTS(mode string) object {
 	}
 }
 func members() []quepaxa.Member {
-	return []quepaxa.Member{{ID: "n1", URL: "http://n1", PeerURL: "quic://n1", Token: "old1"}, {ID: "n2", URL: "http://n2", PeerURL: "quic://n2", Token: "old2"}, {ID: "n3", URL: "http://n3", PeerURL: "quic://n3", Token: "old3"}}
+	return []quepaxa.Member{voterMember("source", "n1", "old1"), voterMember("source", "n2", "old2"), voterMember("source", "n3", "old3")}
 }
 func storeIdentity() map[string]string {
 	return map[string]string{"RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "https://store.example", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_PREFIX": "root", "RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT": ""}

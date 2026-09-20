@@ -26,8 +26,8 @@ type catchUpPeer struct {
 
 func startCatchUpPeer(t testing.TB, id quepaxa.NodeID, values []quepaxa.DecidedValue, beforeReply func(context.Context, *peerfb.RequestT) error) *catchUpPeer {
 	t.Helper()
-	p := &catchUpPeer{member: quepaxa.Member{ID: id, Token: string(id) + "-token"}}
-	cert, err := peerCertificate("cluster", id, p.member.Token)
+	p := &catchUpPeer{member: testMember("cluster", id, string(id)+"-token")}
+	cert, err := peerCertificate("cluster", id, string(id)+"-token")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func startCatchUpPeer(t testing.TB, id quepaxa.NodeID, values []quepaxa.DecidedV
 						if err != nil {
 							return
 						}
-						if req.Operation != peerfb.OperationSync || req.Token != "admin" || req.ClusterId != "cluster" || req.ConfigId != 1 {
+						if req.Operation != peerfb.OperationSync || req.AdminToken != "admin" || req.ClusterId != "cluster" || req.ConfigId != 1 {
 							_ = writePeerFrame(stream, encodePeerResponse(&peerfb.ResponseT{Error: "invalid test request"}))
 							return
 						}
@@ -92,7 +92,7 @@ func startCatchUpPeer(t testing.TB, id quepaxa.NodeID, values []quepaxa.DecidedV
 
 func catchUpValues(t testing.TB, count int) (quepaxa.Cluster, []quepaxa.DecidedValue) {
 	t.Helper()
-	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "a", Token: "a-token"}}}
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "a-token")}}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

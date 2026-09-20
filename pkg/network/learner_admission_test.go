@@ -20,7 +20,7 @@ func TestVerifyLearnerFetchesAndPersistsAdmissionPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer wal.Close()
-	pull := NewTransport("cluster", "learner", &config, "admin")
+	pull := adminTransport("cluster", "learner", &config, "admin")
 	defer pull.Close()
 	core, err := quepaxa.NewLearner(quepaxa.Config{NodeID: "learner", Cluster: config, WAL: wal, Transport: pull, EnableReconfiguration: true})
 	if err != nil {
@@ -28,14 +28,15 @@ func TestVerifyLearnerFetchesAndPersistsAdmissionPrefix(t *testing.T) {
 	}
 	server := NewServer(core, nil, "cluster", false, pull)
 	defer server.Close()
-	learner := quepaxa.Member{ID: "learner", Token: "learner-token", WALIdentity: core.WALIdentity()}
-	peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, config.Members, "admin", learner)
+	learner := testMember("cluster", "learner", "learner-token")
+	learner.WALIdentity = core.WALIdentity()
+	peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, config.Members, "learner-token", "admin", learner)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer peer.Close()
 	learner.PeerURL = "quic://" + peer.Addr()
-	probe := NewTransport("cluster", "a", &config, "admin")
+	probe := NewTransport("cluster", "a", &config, "a-token")
 	defer probe.Close()
 	var prefix quepaxa.ValueHash
 	for _, value := range values {

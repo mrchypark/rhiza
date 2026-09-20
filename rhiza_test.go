@@ -96,10 +96,10 @@ func TestPeerLearnerUsesVoterWithoutJoiningQuorum(t *testing.T) {
 	ctx := context.Background()
 	peerAddr := freeUDPAddr(t)
 	storeDir := t.TempDir()
-	members := []rhiza.Member{{ID: "n1", PeerURL: "quic://" + peerAddr, Token: "voter-token"}}
+	members := []rhiza.Member{{ID: "n1", PeerURL: "quic://" + peerAddr, PublicKey: rhiza.PeerPublicKey("learner", "n1", "voter-token")}}
 	voter, err := rhiza.Open(ctx, rhiza.Config{
 		ClusterID: "learner", NodeID: "n1", DataDir: t.TempDir(), PeerAddr: peerAddr,
-		AdminToken: "learner-token", Members: members,
+		AdminToken: "learner-token", PeerToken: "voter-token", Members: members,
 		ObjStoreProvider: "filesystem", ObjStoreDir: storeDir,
 		ObjStoreDurability: rhiza.ObjectStoreDurabilityBeforeAck,
 	})
@@ -358,10 +358,11 @@ func BenchmarkReplicaCatchUp(b *testing.B) {
 			ctx := context.Background()
 			peerAddr := freeUDPAddr(b)
 			storeDir := b.TempDir()
-			members := []rhiza.Member{{ID: "n1", PeerURL: "quic://" + peerAddr, Token: "voter-token"}}
+			cluster := "bench-" + string(mode)
+			members := []rhiza.Member{{ID: "n1", PeerURL: "quic://" + peerAddr, PublicKey: rhiza.PeerPublicKey(cluster, "n1", "voter-token")}}
 			voter, err := rhiza.Open(ctx, rhiza.Config{
-				ClusterID: "bench-" + string(mode), NodeID: "n1", DataDir: b.TempDir(), PeerAddr: peerAddr,
-				AdminToken: "learner-token", Members: members,
+				ClusterID: cluster, NodeID: "n1", DataDir: b.TempDir(), PeerAddr: peerAddr,
+				AdminToken: "learner-token", PeerToken: "voter-token", Members: members,
 				ObjStoreProvider: "filesystem", ObjStoreDir: storeDir,
 				ObjStoreDurability: rhiza.ObjectStoreDurabilityBeforeAck,
 			})
@@ -373,8 +374,8 @@ func BenchmarkReplicaCatchUp(b *testing.B) {
 				b.Fatal(err)
 			}
 			config := rhiza.ReplicaConfig{
-				ClusterID: "bench-" + string(mode), ReplicaID: "read-1", DataDir: b.TempDir(),
-				AdminToken: "learner-token", Members: replicaMembers(b, "bench-"+string(mode), members),
+				ClusterID: cluster, ReplicaID: "read-1", DataDir: b.TempDir(),
+				AdminToken: "learner-token", Members: replicaMembers(b, cluster, members),
 				ObjStoreProvider: "filesystem", ObjStoreDir: storeDir, SyncInterval: time.Hour,
 			}
 			var replica *rhiza.ReadReplica

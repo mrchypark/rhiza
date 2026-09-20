@@ -7,11 +7,11 @@ import (
 )
 
 type SummaryT struct {
-	RecorderId        string     `json:"recorder_id"`
-	Step              uint64     `json:"step"`
-	FirstCurrent      *ProposalT `json:"first_current"`
-	AggregatePrior    *ProposalT `json:"aggregate_prior"`
-	ReconfigurationId []byte     `json:"reconfiguration_id"`
+	RecorderId string `json:"recorder_id"`
+	Step uint64 `json:"step"`
+	FirstCurrent *ProposalT `json:"first_current"`
+	AggregatePrior *ProposalT `json:"aggregate_prior"`
+	ReconfigurationId []byte `json:"reconfiguration_id"`
 }
 
 func (t *SummaryT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {

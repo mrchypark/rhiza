@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,13 @@ import (
 )
 
 var errNodeNotFound = errors.New("node not found")
+
+// testPublicKey derives a deterministic non-secret member identity. Membership
+// records bind public identity only, so tests must vary that instead of a
+// retired peer token.
+func testPublicKey(seed string) quepaxa.PublicKey {
+	return quepaxa.PublicKey(sha256.Sum256([]byte(seed)))
+}
 
 type archiveTestTransport struct {
 	mu    sync.RWMutex

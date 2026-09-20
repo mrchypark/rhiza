@@ -86,7 +86,7 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 
 	malformed := network.MembershipChange{
 		OperationID: "malformed-add", ClusterID: "cluster", ExpectedConfigID: 2,
-		Add: &quepaxa.Member{Token: "candidate-token", WALIdentity: identities["c"], PeerURL: "https://candidate"},
+		Add: &quepaxa.Member{WALIdentity: identities["c"], PeerURL: "https://candidate"},
 	}
 	if err := n.changeMembership(ctx, malformed); !errors.Is(err, network.ErrInvalidRequest) {
 		t.Fatalf("malformed add error=%v, want invalid request", err)
@@ -95,7 +95,7 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 
 	retired := network.MembershipChange{
 		OperationID: "retired-add", ClusterID: "cluster", ExpectedConfigID: 2,
-		Add: &quepaxa.Member{ID: "c", Token: "c-token", WALIdentity: identities["c"], PeerURL: "https://c"},
+		Add: &quepaxa.Member{ID: "c", PublicKey: peerMember("cluster", "c", "c-token").PublicKey, WALIdentity: identities["c"], PeerURL: "https://c"},
 	}
 	if err := n.changeMembership(ctx, retired); !errors.Is(err, network.ErrInvalidRequest) {
 		t.Fatalf("retired add error=%v, want invalid request", err)
@@ -164,9 +164,9 @@ func TestMembershipAdditionAbortAllowsNextRevision(t *testing.T) {
 
 func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 	ctx := context.Background()
-	initial := []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}}
+	initial := []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}
 	target := quepaxa.Cluster{ConfigID: 2, Members: append(append([]quepaxa.Member(nil), initial...), quepaxa.Member{
-		ID: "learner", Token: "learner-token", PeerURL: "https://127.0.0.1:1", WALIdentity: strings.Repeat("1", 64),
+		ID: "learner", PublicKey: peerMember("cluster", "learner", "learner-token").PublicKey, PeerURL: "https://127.0.0.1:1", WALIdentity: strings.Repeat("1", 64),
 	})}
 	transport := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core)}
 	var admitted atomic.Bool
@@ -217,7 +217,7 @@ func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string,
 	if !slices.Contains(bucket.SupportedObjectUploadOptions(), thanosobjstore.IfNotExists) {
 		t.Fatal("filesystem bucket lacks atomic conditional writes")
 	}
-	members := []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}, {ID: "c", Token: "c-token"}}
+	members := []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token"), peerMember("cluster", "c", "c-token")}
 	bootstrap := members[:2]
 	identities := make(map[quepaxa.NodeID]string, len(members))
 	wals := make(map[quepaxa.NodeID]*qlog.WAL, len(members))
@@ -227,7 +227,7 @@ func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string,
 		if member.ID == "c" {
 			// c's immutable registration was created while it was a valid learner
 			// against the earlier a,b configuration, before it became a voter.
-			config.Learner = &quepaxa.Member{ID: "c", Token: member.Token}
+			config.Learner = &quepaxa.Member{ID: "c", PublicKey: member.PublicKey}
 		}
 		state, err := loadVoterIdentity(config)
 		if err != nil {
@@ -274,7 +274,7 @@ func registerMembershipLearner(t *testing.T, bucket *objectstore.MeteredBucket, 
 	t.Helper()
 	config := &types.ExecutionConfig{
 		DataDir: t.TempDir(), ClusterID: "cluster", NodeID: types.NodeID(id), ObjStoreProvider: "filesystem", ObjStoreDir: "unused",
-		Members: []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}}, Learner: &quepaxa.Member{ID: id, Token: "fresh-token"},
+		Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}, Learner: &quepaxa.Member{ID: id, PublicKey: peerMember("cluster", id, "fresh-token").PublicKey},
 	}
 	state, err := loadVoterIdentity(config)
 	if err != nil {
@@ -292,7 +292,7 @@ func registerMembershipLearner(t *testing.T, bucket *objectstore.MeteredBucket, 
 	if err != nil || state.identity == nil {
 		t.Fatalf("load learner registration: %v", err)
 	}
-	return quepaxa.Member{ID: id, Token: "fresh-token", PeerURL: "https://fresh", WALIdentity: state.identity.Nonce}
+	return quepaxa.Member{ID: id, PublicKey: peerMember("cluster", id, "fresh-token").PublicKey, PeerURL: "https://fresh", WALIdentity: state.identity.Nonce}
 }
 
 func assertDurableArchivedMembership(t *testing.T, ctx context.Context, n *Node, bucket *objectstore.MeteredBucket, through quepaxa.Slot) {

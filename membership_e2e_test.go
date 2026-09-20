@@ -41,12 +41,13 @@ func e2eVoters(t *testing.T, ctx context.Context, clusterID string, count int, d
 	for i := range members {
 		members[i] = rhiza.Member{
 			ID: quepaxa.NodeID(names[i]), PeerURL: "quic://" + freeUDPAddr(t),
-			Token: tokens[i],
+			PublicKey: rhiza.PeerPublicKey(clusterID, names[i], tokens[i]),
 		}
 	}
 	dbs := make([]*rhiza.DB, count)
 	for i, m := range members {
 		config := e2eS3Config(t, clusterID, string(m.ID), strings.TrimPrefix(m.PeerURL, "quic://"), members)
+		config.PeerToken = tokens[i]
 		if len(durability) != 0 {
 			config.ObjStoreDurability = durability[0]
 		}
@@ -76,8 +77,8 @@ func learnerS3Config(t *testing.T, clusterID, peerAddr string, members []rhiza.M
 	t.Helper()
 	return rhiza.Config{
 		ClusterID: clusterID, NodeID: "learner", DataDir: t.TempDir(), PeerAddr: peerAddr,
-		AdminToken: "admin", Members: members, EnableReconfiguration: true,
-		Learner:          &rhiza.Member{ID: "learner", Token: token},
+		AdminToken: "admin", PeerToken: token, Members: members, EnableReconfiguration: true,
+		Learner:          &rhiza.Member{ID: "learner", PublicKey: rhiza.PeerPublicKey(clusterID, "learner", token)},
 		ObjStoreProvider: "s3", ObjStoreEndpoint: os.Getenv("RHIZA_E2E_S3_ENDPOINT"),
 		ObjStoreBucket: os.Getenv("RHIZA_E2E_S3_BUCKET"), ObjStoreRegion: "us-east-1", ObjStoreInsecure: true,
 		ObjStoreAccessKey: os.Getenv("RHIZA_E2E_S3_ACCESS_KEY"), ObjStoreSecretKey: os.Getenv("RHIZA_E2E_S3_SECRET_KEY"),
@@ -160,9 +161,9 @@ func TestS3MembershipLearnerRestartPreservesIdentity(t *testing.T) {
 	}
 }
 
-// TestS3MembershipLearnerRestartRejectsWrongToken proves that reopening a learner with a
-// different token is rejected — the voter identity system detects the token/
-// identity mismatch and returns ErrVoterStateLost.
+// TestS3MembershipLearnerRestartRejectsWrongToken proves that reopening a
+// learner with a different public key is rejected — the voter identity system
+// detects the identity mismatch and returns ErrVoterStateLost.
 func TestS3MembershipLearnerRestartRejectsWrongToken(t *testing.T) {
 	_, _ = requireS3E2E(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -182,7 +183,8 @@ func TestS3MembershipLearnerRestartRejectsWrongToken(t *testing.T) {
 
 	// Reopen with a different token — must be rejected.
 	wrongConfig := config
-	wrongConfig.Learner = &rhiza.Member{ID: "learner", Token: "wrong-token"}
+	wrongConfig.PeerToken = "wrong-token"
+	wrongConfig.Learner = &rhiza.Member{ID: "learner", PublicKey: rhiza.PeerPublicKey(clusterID, "learner", "wrong-token")}
 	_, err = rhiza.Open(ctx, wrongConfig)
 	if !errors.Is(err, rhiza.ErrVoterStateLost) {
 		t.Fatalf("wrong token restart: err=%v, want ErrVoterStateLost", err)

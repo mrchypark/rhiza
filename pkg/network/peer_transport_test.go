@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
 	"net"
@@ -36,7 +37,7 @@ func (r testClusterResolver) ClusterForSlot(slot quepaxa.Slot) quepaxa.Cluster {
 }
 
 func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	member := testMember("cluster", "n1", "secret")
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
 	if err != nil {
@@ -46,13 +47,13 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2", Token: "admin-secret"}}, "admin-secret"); peer != nil || err == nil {
-		t.Fatalf("reused non-local voter token peer=%v error=%v", peer, err)
+	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, testMember("cluster", "n2", "admin-secret")}, "admin-secret", "admin-secret"); peer != nil || err == nil {
+		t.Fatalf("reused admin token as peer identity peer=%v error=%v", peer, err)
 	}
-	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2"}}, "admin-secret"); peer != nil || err == nil {
-		t.Fatalf("missing voter token peer=%v error=%v", peer, err)
+	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2"}}, "secret", "admin-secret"); peer != nil || err == nil {
+		t.Fatalf("missing voter public key peer=%v error=%v", peer, err)
 	}
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret", "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,19 +129,13 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	if _, err := transport.SendRecord(callCtx, member.ID, request); err != nil {
 		t.Fatal(err)
 	}
-	// Record is physically durable, so it must wait for the handshake even on
-	// a resumed connection. The connection may still report 0-RTT capability;
-	// the operation policy below controls when its stream may be opened.
-	if allows0RTT(peerfb.OperationRecord) {
-		t.Fatal("durable Record unexpectedly allowed QUIC 0-RTT")
-	}
-	// A restarted peer has lost its TLS ticket keys. The first Sync is therefore
-	// attempted as 0-RTT and rejected; transport must promote the connection and
-	// replay it before this periodic catch-up round is reported as failed.
+	// A restarted peer has lost its TLS ticket keys. Voter authorization is
+	// bound to the handshake certificate, so the request must wait for the
+	// completed handshake and never travel as replayable early data.
 	oldConn := transport.peers[member.ID].conn
 	transport.invalidate(member.ID, oldConn)
 	_ = oldConn.CloseWithError(0, "peer restart")
-	replacement, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")
+	replacement, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret", "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,30 +143,14 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	member.PeerURL = "quic://" + replacement.Addr()
 	transport.members[member.ID] = member
 	if _, err := transport.FetchDecisions(callCtx, member.ID, 1, 1); err != nil {
-		t.Fatalf("Sync after 0-RTT rejection did not retry at 1-RTT: %v", err)
-	}
-	if transport.peers[member.ID].conn.ConnectionState().Used0RTT {
-		t.Fatal("restarted peer unexpectedly accepted its previous 0-RTT ticket")
+		t.Fatalf("Sync after peer restart failed: %v", err)
 	}
 	wrongMember := member
-	wrongMember.Token = "wrong"
+	wrongMember.PublicKey = quepaxa.PublicKey(PeerPublicKey("cluster", "n1", "wrong"))
 	wrong := NewTransport("cluster", "n1", &quepaxa.Cluster{Members: []quepaxa.Member{wrongMember}}, "wrong")
 	defer wrong.Close()
 	if _, err := wrong.SendRecord(callCtx, member.ID, request); err == nil {
-		t.Fatal("peer with the wrong token-bound certificate identity was accepted")
-	}
-}
-
-func TestAllows0RTTOnlyForReadOperations(t *testing.T) {
-	allowed := map[peerfb.Operation]bool{
-		peerfb.OperationSync:       true,
-		peerfb.OperationReadIndex:  true,
-		peerfb.OperationFetchValue: true,
-	}
-	for operation := range peerfb.EnumNamesOperation {
-		if got := allows0RTT(operation); got != allowed[operation] {
-			t.Fatalf("allows0RTT(%s) = %v, want %v", operation, got, allowed[operation])
-		}
+		t.Fatal("peer with the wrong certificate identity was accepted")
 	}
 }
 
@@ -189,28 +168,28 @@ func TestPeerIdentityRequiresVoterCredential(t *testing.T) {
 }
 
 func TestStartLearnerPeerServerValidatesIdentity(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "voter"}
+	member := testMember("cluster", "n1", "voter")
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	ctx := context.Background()
-	if peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin", quepaxa.Member{ID: "n2", Token: "learner"}); peer != nil || err == nil {
+	if peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "learner-token", "admin", quepaxa.Member{ID: "n2", PublicKey: quepaxa.PublicKey(PeerPublicKey("cluster", "n2", "learner-token"))}); peer != nil || err == nil {
 		t.Fatalf("foreign learner peer=%v err=%v", peer, err)
 	}
-	if peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin", member); peer != nil || err == nil {
+	if peer, err := StartLearnerPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "voter", "admin", member); peer != nil || err == nil {
 		t.Fatalf("voter learner peer=%v err=%v", peer, err)
 	}
 }
 
 func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "voter-token"}
+	member := testMember("cluster", "n1", "voter-token")
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
-	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: "learner-token"}
+	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, adminToken: "learner-token"}
 	request := &peerfb.RequestT{
 		Operation: peerfb.OperationSync, ClusterId: "cluster", SenderId: "learner-1",
-		ConfigId: uint64(core.ConfigID()), Token: "learner-token", From: 1, Limit: 1,
+		ConfigId: uint64(core.ConfigID()), AdminToken: "learner-token", From: 1, Limit: 1,
 	}
 	if _, err := peer.handle(context.Background(), nil, request); err != nil {
 		t.Fatalf("learner sync rejected: %v", err)
@@ -223,32 +202,9 @@ func TestNonMemberLearnerMayOnlyFetchCertifiedDecisions(t *testing.T) {
 	if _, err := peer.handle(context.Background(), nil, request); err == nil || !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("learner voter impersonation error=%v", err)
 	}
-	request.Operation, request.Token = peerfb.OperationSync, "wrong"
+	request.Operation, request.AdminToken = peerfb.OperationSync, "wrong"
 	if _, err := peer.handle(context.Background(), nil, request); err == nil || !strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("learner wrong-token error=%v", err)
-	}
-}
-
-func TestPeerServerRejectsMutatingEarlyData(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "secret"}
-	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
-	server := NewServer(core, nil, "cluster", true, nil)
-	defer server.Close()
-	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
-	for operation := range peerfb.EnumNamesOperation {
-		if allows0RTT(operation) {
-			continue
-		}
-		_, err := peer.handle(context.Background(), nil, &peerfb.RequestT{
-			Operation: operation,
-			ClusterId: string(server.cluster),
-			SenderId:  string(member.ID),
-			ConfigId:  uint64(core.ConfigID()),
-			Token:     member.Token,
-		})
-		if err == nil || !strings.Contains(err.Error(), "not accepted as replayable early data") {
-			t.Fatalf("operation %s early-data error = %v", operation, err)
-		}
 	}
 }
 
@@ -261,7 +217,7 @@ func TestPeerConnectionWaitHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if _, err := transport.connection(ctx, member.ID, false); err == nil {
+	if _, err := transport.connection(ctx, member.ID); err == nil {
 		t.Fatal("connection wait ignored cancellation")
 	}
 	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
@@ -314,8 +270,8 @@ func TestSummaryCarriesReconfigurationID(t *testing.T) {
 }
 
 func TestBoundTransportSeparatesConfigurationConnectionPools(t *testing.T) {
-	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1", Token: "old"}, {ID: "n2", Token: "old-2"}}}
-	current := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "n1", Token: "new"}, {ID: "n3", Token: "new-3"}}}
+	old := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "n1", "old"), testMember("cluster", "n2", "old-2")}}
+	current := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{testMember("cluster", "n1", "new"), testMember("cluster", "n3", "new-3")}}
 	transport := NewTransport("cluster", "n1", &old, "old")
 	defer transport.Close()
 	transport.BindCore(testClusterResolver{current: current, slots: map[quepaxa.Slot]quepaxa.Cluster{1: old}})
@@ -330,14 +286,20 @@ func TestBoundTransportSeparatesConfigurationConnectionPools(t *testing.T) {
 	if historical == transport || active == transport || historical == active {
 		t.Fatal("configurations reused a connection pool")
 	}
-	if historical.token != "old" || active.token != "new" {
-		t.Fatalf("configuration credentials leaked: old=%q active=%q", historical.token, active.token)
+	// The process identity is shared; each configuration keeps its own copy of
+	// the published member keys, so a stale configuration cannot authorize a
+	// replacement member.
+	if historical.peerToken != "old" || active.peerToken != "old" {
+		t.Fatalf("process identity not shared: old=%q active=%q", historical.peerToken, active.peerToken)
+	}
+	if historical.members["n1"].PublicKey != old.Members[0].PublicKey || historical.members["n2"].PublicKey != old.Members[1].PublicKey || active.members["n1"].PublicKey != current.Members[0].PublicKey || active.members["n3"].PublicKey != current.Members[1].PublicKey {
+		t.Fatal("configuration public identities leaked across pools")
 	}
 }
 
 func TestBoundTransportSyncRoutesThroughCurrentConfiguration(t *testing.T) {
-	historical := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "a", Token: "a"}, {ID: "b", Token: "b"}}}
-	current := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{{ID: "a", Token: "a"}, {ID: "d", Token: "d"}}}
+	historical := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "a", "a"), testMember("cluster", "b", "b")}}
+	current := quepaxa.Cluster{ConfigID: 2, Members: []quepaxa.Member{testMember("cluster", "a", "a"), testMember("cluster", "d", "d")}}
 	transport := NewTransport("cluster", "a", &historical, "a")
 	defer transport.Close()
 	transport.BindCore(testClusterResolver{current: current, slots: map[quepaxa.Slot]quepaxa.Cluster{1: historical}})
@@ -354,7 +316,7 @@ func TestBoundTransportSyncRoutesThroughCurrentConfiguration(t *testing.T) {
 }
 
 func TestBoundTransportCloseDoesNotCreateNewPools(t *testing.T) {
-	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1", Token: "token"}}}
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "n1", "token")}}
 	transport := NewTransport("cluster", "n1", &config, "token")
 	transport.BindCore(testClusterResolver{current: config})
 	if _, err := transport.transportForCurrent(); err != nil {
@@ -369,7 +331,7 @@ func TestBoundTransportCloseDoesNotCreateNewPools(t *testing.T) {
 }
 
 func TestVerifyLearnerRejectsCurrentVoter(t *testing.T) {
-	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1", Token: "one"}, {ID: "n2", Token: "two"}}}
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{testMember("cluster", "n1", "one"), testMember("cluster", "n2", "two")}}
 	transport := NewTransport("cluster", "n1", &config, "one")
 	defer transport.Close()
 	if err := transport.VerifyLearner(context.Background(), config.Members[1], 1, quepaxa.ValueHash{1}); err == nil {
@@ -410,7 +372,7 @@ func TestDecodeWALIdentityRejectsNonCanonicalAndMismatchedValues(t *testing.T) {
 }
 
 func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	member := testMember("cluster", "n1", "secret")
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
@@ -435,7 +397,7 @@ func TestDecisionCatchUpPageIsBoundedByEncodedBytes(t *testing.T) {
 }
 
 func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	member := testMember("cluster", "n1", "secret")
 	core := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	core.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
 	if _, _, err := core.Propose(context.Background(), []byte("state")); err != nil {
@@ -466,7 +428,7 @@ func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
 	server := NewServer(core, nil, "cluster", true, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "admin-secret")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret", "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,10 +442,10 @@ func TestFetchDecisionsPreservesCompactedError(t *testing.T) {
 }
 
 func serverPeerHandleDecisions(server *Server, member quepaxa.Member, from uint64) (*peerfb.ResponseT, error) {
-	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}, token: member.Token}
-	return peer.handle(context.Background(), nil, &peerfb.RequestT{
+	peer := &PeerServer{server: server, members: map[quepaxa.NodeID]quepaxa.Member{member.ID: member}}
+	return peer.handle(context.Background(), ed25519.PublicKey(member.PublicKey[:]), &peerfb.RequestT{
 		Operation: peerfb.OperationSync, ClusterId: string(server.cluster), SenderId: string(member.ID),
-		ConfigId: uint64(server.core.ConfigID()), Token: member.Token, From: from, Limit: 128,
+		ConfigId: uint64(server.core.ConfigID()), From: from, Limit: 128,
 	})
 }
 
@@ -495,20 +457,21 @@ func TestPeerTransportRetainsUDPPortAcrossRestart(t *testing.T) {
 	defer conn.Close()
 	bound := &quic.Transport{Conn: conn}
 	defer bound.Close()
-	members := []quepaxa.Member{{ID: "n1", Token: "voter", PeerURL: "quic://" + conn.LocalAddr().String()}}
+	members := []quepaxa.Member{testMember("cluster", "n1", "voter")}
+	members[0].PeerURL = "quic://" + conn.LocalAddr().String()
 	core := mustCore(t, "n1", members, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for range 2 {
-		peer, err := StartPeerServerOnTransport(ctx, bound, server, members, "admin")
+		peer, err := StartPeerServerOnTransport(ctx, bound, server, members, "voter", "admin")
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = peer.Close() })
 		config := core.CurrentCluster()
-		client := NewTransport("cluster", "n1", &config, "admin")
+		client := NewTransport("cluster", "n1", &config, "voter")
 		_, callErr := client.ReadTip(ctx, "n1")
 		_ = client.Close()
 		if callErr != nil {
