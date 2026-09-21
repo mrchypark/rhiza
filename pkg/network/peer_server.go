@@ -94,6 +94,16 @@ func startPeerServer(ctx context.Context, server *Server, members []quepaxa.Memb
 	if adminToken != "" && peerToken == adminToken {
 		return nil, fmt.Errorf("admin token must differ from the peer identity token")
 	}
+	if adminToken != "" {
+		// A member's pinned key is derived from its private token. An admin token
+		// that derives a member key would let a read-only admin client present
+		// that member's certificate and pass the voter gate.
+		for _, member := range members {
+			if member.PublicKey != (quepaxa.PublicKey{}) && subtle.ConstantTimeCompare(member.PublicKey[:], PeerPublicKey(server.cluster, member.ID, adminToken)) == 1 {
+				return nil, fmt.Errorf("admin token must differ from the voter token for %q", member.ID)
+			}
+		}
+	}
 	certificate, err := peerCertificate(server.cluster, server.core.NodeID(), peerToken)
 	if err != nil {
 		return nil, err

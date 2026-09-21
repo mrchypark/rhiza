@@ -475,10 +475,10 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			// entry by node ID; a StatefulSet cannot mount a per-Pod Secret.
 			values = replaceEnv(values, "RHIZA_PEER_TOKENS", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "peer_tokens"}}})
 			// An inherited scalar RHIZA_PEER_TOKEN conflicts with the map above
-			// and fails startup, so drop the entry: the map supersedes it.
-			// ponytail: a scalar delivered through envFrom still conflicts;
-			// switch such a template to the token map.
-			values = removeEnv(values, "RHIZA_PEER_TOKEN")
+			// and fails startup. An explicit empty value supersedes it for both
+			// an env entry and an envFrom-provided scalar, which a deletion
+			// cannot clear.
+			values = replaceEnv(values, "RHIZA_PEER_TOKEN", object{"value": ""})
 			ctr["env"] = values
 			asObject(sts["spec"])["replicas"] = float64(3)
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {

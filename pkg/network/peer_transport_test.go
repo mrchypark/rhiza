@@ -53,6 +53,11 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, {ID: "n2"}}, "secret", "admin-secret"); peer != nil || err == nil {
 		t.Fatalf("missing voter public key peer=%v error=%v", peer, err)
 	}
+	// A distinct admin token that derives a voter's pinned key would let a
+	// read-only admin client present that voter's certificate and pass the gate.
+	if peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member, testMember("cluster", "n2", "admin-secret")}, "secret", "admin-secret"); peer != nil || err == nil {
+		t.Fatalf("admin token derived a voter key peer=%v error=%v", peer, err)
+	}
 	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "secret", "admin-secret")
 	if err != nil {
 		t.Fatal(err)

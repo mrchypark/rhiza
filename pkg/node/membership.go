@@ -75,7 +75,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 				return err
 			}
 			var registration voterIdentity
-			if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Node != string(request.Add.ID) || registration.Cluster != request.ClusterID || registration.Nonce != request.Add.WALIdentity || registration.LearnerPublicKey != fmt.Sprintf("%x", request.Add.PublicKey[:]) {
+			if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Add.ID) || registration.Cluster != request.ClusterID || registration.Nonce != request.Add.WALIdentity || registration.LearnerPublicKey != fmt.Sprintf("%x", request.Add.PublicKey[:]) {
 				return network.ErrInvalidRequest
 			}
 		} else {
@@ -204,7 +204,7 @@ func (n *Node) validateMembershipFence(ctx context.Context, request network.Memb
 		return err
 	}
 	var registration voterIdentity
-	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Node != string(request.Remove) || registration.Cluster != request.ClusterID || registration.Nonce != fence.WALIdentity {
+	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Remove) || registration.Cluster != request.ClusterID || registration.Nonce != fence.WALIdentity {
 		return network.ErrInvalidRequest
 	}
 	return nil

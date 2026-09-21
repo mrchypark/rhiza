@@ -1,7 +1,10 @@
 package node
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -315,6 +318,43 @@ func assertNoMembershipOperation(t *testing.T, ctx context.Context, n *Node, buc
 	data, err := readVoterRegistration(ctx, bucket, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "membership", fmt.Sprintf("%d.json", configID)))
 	if err != nil || data != nil {
 		t.Fatalf("membership/%d journal=%q err=%v", configID, data, err)
+	}
+}
+
+// A version 1 registration proves only a hash of the voter's retired private
+// token, so it cannot authorize adding or removing the node it names.
+func TestMembershipOperationRejectsLegacyRegistrationVersion(t *testing.T) {
+	ctx := context.Background()
+	n, identities, bucket, transport := newMembershipOperationNode(t)
+	transport.disable("c")
+
+	learner := registerMembershipLearner(t, bucket, "fresh")
+	legacyRegistration(t, ctx, n, bucket, "fresh", learner.WALIdentity)
+	if err := n.changeMembership(ctx, network.MembershipChange{OperationID: "add-legacy-fresh", ClusterID: "cluster", ExpectedConfigID: 1, Add: &learner}); !errors.Is(err, network.ErrInvalidRequest) {
+		t.Fatalf("legacy learner registration accepted: %v", err)
+	}
+	assertNoMembershipOperation(t, ctx, n, bucket, 1)
+
+	legacyRegistration(t, ctx, n, bucket, "c", identities["c"])
+	remove := network.MembershipChange{
+		OperationID: "remove-legacy-c", ClusterID: "cluster", ExpectedConfigID: 1, Remove: "c",
+		Fence: &network.MembershipFence{NodeID: "c", WALIdentity: identities["c"], WorkloadUID: "workload-c", Confirmed: true, Evidence: "external-fence"},
+	}
+	if err := n.changeMembership(ctx, remove); !errors.Is(err, network.ErrInvalidRequest) {
+		t.Fatalf("legacy registration fence error=%v, want invalid request", err)
+	}
+	assertNoMembershipOperation(t, ctx, n, bucket, 1)
+}
+
+func legacyRegistration(t *testing.T, ctx context.Context, n *Node, bucket *objectstore.MeteredBucket, id quepaxa.NodeID, nonce string) {
+	t.Helper()
+	record, err := json.Marshal(voterIdentity{Version: 1, Cluster: "cluster", Node: string(id), Nonce: nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(id))))
+	if err := bucket.Upload(ctx, key, bytes.NewReader(record)); err != nil {
+		t.Fatal(err)
 	}
 }
 

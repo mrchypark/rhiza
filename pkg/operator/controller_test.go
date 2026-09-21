@@ -131,12 +131,12 @@ func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
 }
 
 // A recovered StatefulSet can inherit a scalar RHIZA_PEER_TOKEN from its source
-// template. The activation write injects the voter token map, and configEnvPeerToken
-// rejects that combination, so the scalar entry must be dropped in the same write.
-// An empty override is not an option: the apiserver drops EnvVar.Value on
-// serialization, and the operator's own environment reader rejects the resulting
-// name-only entry as an unsupported dynamic source.
-func TestControllerActivationDropsInheritedScalarPeerToken(t *testing.T) {
+// template. The activation write injects the voter token map, and
+// configEnvPeerToken rejects that combination, so the scalar must be overridden
+// in the same write. EnvVar.Value carries omitempty, so the clearing override is
+// stored name-only; the kubelet still applies it after envFrom, and the
+// operator's own environment reader must read it back as an empty value.
+func TestControllerActivationOverridesInheritedScalarPeerToken(t *testing.T) {
 	ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
 	r.Spec.RecoveryID = "recovery-1"
 	r.Spec.Fence = fence(r)
@@ -161,26 +161,35 @@ func TestControllerActivationDropsInheritedScalarPeerToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var scalarPresent, mapInjected bool
+	var overrides int
+	var mapInjected bool
 	for _, item := range list(activated["env"]) {
 		entry := asObject(item)
 		switch str(entry["name"]) {
 		case "RHIZA_PEER_TOKEN":
-			scalarPresent = true
+			overrides++
+			if entry["value"] != nil || entry["valueFrom"] != nil {
+				t.Fatalf("clearing override must be a name-only entry: %+v", entry)
+			}
 		case "RHIZA_PEER_TOKENS":
 			mapInjected = nested(entry, "valueFrom", "secretKeyRef", "key") == "peer_tokens"
 		}
 	}
-	if scalarPresent {
-		t.Fatalf("inherited scalar RHIZA_PEER_TOKEN survived activation: %+v", activated["env"])
+	if overrides != 1 {
+		t.Fatalf("activation wrote %d RHIZA_PEER_TOKEN entries, want one override: %+v", overrides, activated["env"])
 	}
 	if !mapInjected {
 		t.Fatalf("voter token map was not injected: %+v", activated["env"])
 	}
-	// The operator reads the same StatefulSet back during activation; a surviving
-	// dynamic entry would block recovery there instead of at node startup.
-	if _, err := c.environment(ctx, activated); err != nil {
+	// The operator reads the same StatefulSet back during activation; a name-only
+	// entry the reader could not resolve would block recovery there instead of at
+	// node startup, and a non-empty value would reintroduce the conflict.
+	env, err := c.environment(ctx, activated)
+	if err != nil {
 		t.Fatalf("activated StatefulSet environment is unreadable: %v", err)
+	}
+	if env["RHIZA_PEER_TOKEN"] != "" {
+		t.Fatalf("clearing override read back as %q", env["RHIZA_PEER_TOKEN"])
 	}
 }
 
