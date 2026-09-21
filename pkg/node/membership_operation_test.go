@@ -1,7 +1,10 @@
 package node
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -86,7 +89,7 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 
 	malformed := network.MembershipChange{
 		OperationID: "malformed-add", ClusterID: "cluster", ExpectedConfigID: 2,
-		Add: &quepaxa.Member{Token: "candidate-token", WALIdentity: identities["c"], PeerURL: "https://candidate"},
+		Add: &quepaxa.Member{WALIdentity: identities["c"], PeerURL: "https://candidate"},
 	}
 	if err := n.changeMembership(ctx, malformed); !errors.Is(err, network.ErrInvalidRequest) {
 		t.Fatalf("malformed add error=%v, want invalid request", err)
@@ -95,7 +98,7 @@ func TestMembershipOperationJournalAndFence(t *testing.T) {
 
 	retired := network.MembershipChange{
 		OperationID: "retired-add", ClusterID: "cluster", ExpectedConfigID: 2,
-		Add: &quepaxa.Member{ID: "c", Token: "c-token", WALIdentity: identities["c"], PeerURL: "https://c"},
+		Add: &quepaxa.Member{ID: "c", PublicKey: peerMember("cluster", "c", "c-token").PublicKey, WALIdentity: identities["c"], PeerURL: "https://c"},
 	}
 	if err := n.changeMembership(ctx, retired); !errors.Is(err, network.ErrInvalidRequest) {
 		t.Fatalf("retired add error=%v, want invalid request", err)
@@ -164,9 +167,9 @@ func TestMembershipAdditionAbortAllowsNextRevision(t *testing.T) {
 
 func TestMembershipAdmissionUsesDrainConfigurationAfterTerminal(t *testing.T) {
 	ctx := context.Background()
-	initial := []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}}
+	initial := []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}
 	target := quepaxa.Cluster{ConfigID: 2, Members: append(append([]quepaxa.Member(nil), initial...), quepaxa.Member{
-		ID: "learner", Token: "learner-token", PeerURL: "https://127.0.0.1:1", WALIdentity: strings.Repeat("1", 64),
+		ID: "learner", PublicKey: peerMember("cluster", "learner", "learner-token").PublicKey, PeerURL: "https://127.0.0.1:1", WALIdentity: strings.Repeat("1", 64),
 	})}
 	transport := &membershipOperationTransport{cores: make(map[quepaxa.NodeID]*quepaxa.Core)}
 	var admitted atomic.Bool
@@ -217,7 +220,7 @@ func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string,
 	if !slices.Contains(bucket.SupportedObjectUploadOptions(), thanosobjstore.IfNotExists) {
 		t.Fatal("filesystem bucket lacks atomic conditional writes")
 	}
-	members := []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}, {ID: "c", Token: "c-token"}}
+	members := []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token"), peerMember("cluster", "c", "c-token")}
 	bootstrap := members[:2]
 	identities := make(map[quepaxa.NodeID]string, len(members))
 	wals := make(map[quepaxa.NodeID]*qlog.WAL, len(members))
@@ -227,7 +230,7 @@ func newMembershipOperationNode(t *testing.T) (*Node, map[quepaxa.NodeID]string,
 		if member.ID == "c" {
 			// c's immutable registration was created while it was a valid learner
 			// against the earlier a,b configuration, before it became a voter.
-			config.Learner = &quepaxa.Member{ID: "c", Token: member.Token}
+			config.Learner = &quepaxa.Member{ID: "c", PublicKey: member.PublicKey}
 		}
 		state, err := loadVoterIdentity(config)
 		if err != nil {
@@ -274,7 +277,7 @@ func registerMembershipLearner(t *testing.T, bucket *objectstore.MeteredBucket, 
 	t.Helper()
 	config := &types.ExecutionConfig{
 		DataDir: t.TempDir(), ClusterID: "cluster", NodeID: types.NodeID(id), ObjStoreProvider: "filesystem", ObjStoreDir: "unused",
-		Members: []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}}, Learner: &quepaxa.Member{ID: id, Token: "fresh-token"},
+		Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token")}, Learner: &quepaxa.Member{ID: id, PublicKey: peerMember("cluster", id, "fresh-token").PublicKey},
 	}
 	state, err := loadVoterIdentity(config)
 	if err != nil {
@@ -292,7 +295,7 @@ func registerMembershipLearner(t *testing.T, bucket *objectstore.MeteredBucket, 
 	if err != nil || state.identity == nil {
 		t.Fatalf("load learner registration: %v", err)
 	}
-	return quepaxa.Member{ID: id, Token: "fresh-token", PeerURL: "https://fresh", WALIdentity: state.identity.Nonce}
+	return quepaxa.Member{ID: id, PublicKey: peerMember("cluster", id, "fresh-token").PublicKey, PeerURL: "https://fresh", WALIdentity: state.identity.Nonce}
 }
 
 func assertDurableArchivedMembership(t *testing.T, ctx context.Context, n *Node, bucket *objectstore.MeteredBucket, through quepaxa.Slot) {
@@ -315,6 +318,43 @@ func assertNoMembershipOperation(t *testing.T, ctx context.Context, n *Node, buc
 	data, err := readVoterRegistration(ctx, bucket, path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "membership", fmt.Sprintf("%d.json", configID)))
 	if err != nil || data != nil {
 		t.Fatalf("membership/%d journal=%q err=%v", configID, data, err)
+	}
+}
+
+// A version 1 registration proves only a hash of the voter's retired private
+// token, so it cannot authorize adding or removing the node it names.
+func TestMembershipOperationRejectsLegacyRegistrationVersion(t *testing.T) {
+	ctx := context.Background()
+	n, identities, bucket, transport := newMembershipOperationNode(t)
+	transport.disable("c")
+
+	learner := registerMembershipLearner(t, bucket, "fresh")
+	legacyRegistration(t, ctx, n, bucket, "fresh", learner.WALIdentity)
+	if err := n.changeMembership(ctx, network.MembershipChange{OperationID: "add-legacy-fresh", ClusterID: "cluster", ExpectedConfigID: 1, Add: &learner}); !errors.Is(err, network.ErrInvalidRequest) {
+		t.Fatalf("legacy learner registration accepted: %v", err)
+	}
+	assertNoMembershipOperation(t, ctx, n, bucket, 1)
+
+	legacyRegistration(t, ctx, n, bucket, "c", identities["c"])
+	remove := network.MembershipChange{
+		OperationID: "remove-legacy-c", ClusterID: "cluster", ExpectedConfigID: 1, Remove: "c",
+		Fence: &network.MembershipFence{NodeID: "c", WALIdentity: identities["c"], WorkloadUID: "workload-c", Confirmed: true, Evidence: "external-fence"},
+	}
+	if err := n.changeMembership(ctx, remove); !errors.Is(err, network.ErrInvalidRequest) {
+		t.Fatalf("legacy registration fence error=%v, want invalid request", err)
+	}
+	assertNoMembershipOperation(t, ctx, n, bucket, 1)
+}
+
+func legacyRegistration(t *testing.T, ctx context.Context, n *Node, bucket *objectstore.MeteredBucket, id quepaxa.NodeID, nonce string) {
+	t.Helper()
+	record, err := json.Marshal(voterIdentity{Version: 1, Cluster: "cluster", Node: string(id), Nonce: nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID), "voters", fmt.Sprintf("%x.json", sha256.Sum256([]byte(id))))
+	if err := bucket.Upload(ctx, key, bytes.NewReader(record)); err != nil {
+		t.Fatal(err)
 	}
 }
 

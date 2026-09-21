@@ -43,7 +43,7 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		return block("automatic learner retry limit reached; existing journal retained")
 	}
 	if intent.LearnerUID == "" {
-		if _, err := c.ensureAutomaticLearner(ctx, sts, r.Spec.Container, intent.Request.OperationID, intent.LearnerName); err != nil {
+		if _, err := c.ensureAutomaticLearner(ctx, sts, r.Spec.Container, intent.Request.OperationID, state.ActiveClusterID, intent.LearnerName); err != nil {
 			return block("replacement provisioning is unavailable or conflicts with ownership")
 		}
 		var pod object

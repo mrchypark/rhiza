@@ -3,6 +3,7 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -149,7 +150,7 @@ func TestForkRejectsMissingRecoveryBase(t *testing.T) {
 func TestForkCopiesUncompactedCertifiedSuffix(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	members := []quepaxa.Member{{ID: "n1", Token: "secret"}}
+	members := []quepaxa.Member{{ID: "n1", PublicKey: testPublicKey("secret")}}
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -192,8 +193,8 @@ func TestForkCopiesUncompactedCertifiedSuffix(t *testing.T) {
 	}
 	data, err := io.ReadAll(r)
 	_ = r.Close()
-	if err != nil || bytes.Contains(data, []byte("secret")) {
-		t.Fatalf("intent leaked token: %s", data)
+	if err != nil || bytes.Contains(data, []byte(hex.EncodeToString(members[0].PublicKey[:]))) {
+		t.Fatalf("intent leaked member identity: %s", data)
 	}
 }
 

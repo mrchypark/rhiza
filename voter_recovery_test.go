@@ -22,14 +22,15 @@ func TestS3VoterIdentityRejectsLostDiskBeforePeerStart(t *testing.T) {
 	for _, durability := range []rhiza.ObjectStoreDurability{rhiza.ObjectStoreDurabilityAsync, rhiza.ObjectStoreDurabilityBeforeAck} {
 		t.Run(string(durability), func(t *testing.T) {
 			peerAddr := freeUDPAddr(t)
+			clusterID := fmt.Sprintf("voter-recovery-%d", time.Now().UnixNano())
 			members := []rhiza.Member{
-				{ID: "n1", PeerURL: "quic://" + peerAddr, Token: "voter-1"},
-				{ID: "n2", PeerURL: "quic://" + freeUDPAddr(t), Token: "voter-2"},
-				{ID: "n3", PeerURL: "quic://" + freeUDPAddr(t), Token: "voter-3"},
+				{ID: "n1", PeerURL: "quic://" + peerAddr, PublicKey: rhiza.PeerPublicKey(clusterID, "n1", "voter-1")},
+				{ID: "n2", PeerURL: "quic://" + freeUDPAddr(t), PublicKey: rhiza.PeerPublicKey(clusterID, "n2", "voter-2")},
+				{ID: "n3", PeerURL: "quic://" + freeUDPAddr(t), PublicKey: rhiza.PeerPublicKey(clusterID, "n3", "voter-3")},
 			}
 			originDir := t.TempDir()
 			config := rhiza.Config{
-				ClusterID: fmt.Sprintf("voter-recovery-%d", time.Now().UnixNano()), NodeID: "n1", DataDir: originDir,
+				ClusterID: clusterID, NodeID: "n1", DataDir: originDir, PeerToken: "voter-1",
 				PeerAddr: peerAddr, Members: members, ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint,
 				ObjStoreBucket: bucket, ObjStoreRegion: "us-east-1", ObjStoreInsecure: true,
 				ObjStoreAccessKey: os.Getenv("RHIZA_E2E_S3_ACCESS_KEY"), ObjStoreSecretKey: os.Getenv("RHIZA_E2E_S3_SECRET_KEY"),

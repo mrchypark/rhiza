@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -470,6 +471,14 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			values = replaceEnv(values, "RHIZA_OBJSTORE_DURABILITY", object{"value": r.Spec.Durability})
 			values = replaceEnv(values, "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "members"}}})
 			values = replaceEnv(values, "RHIZA_ADMIN_TOKEN", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "admin"}}})
+			// Each target Pod receives the whole token map and selects its own
+			// entry by node ID; a StatefulSet cannot mount a per-Pod Secret.
+			values = replaceEnv(values, "RHIZA_PEER_TOKENS", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "peer_tokens"}}})
+			// An inherited scalar RHIZA_PEER_TOKEN conflicts with the map above
+			// and fails startup. An explicit empty value supersedes it for both
+			// an env entry and an envFrom-provided scalar, which a deletion
+			// cannot clear.
+			values = replaceEnv(values, "RHIZA_PEER_TOKEN", object{"value": ""})
 			ctr["env"] = values
 			asObject(sts["spec"])["replicas"] = float64(3)
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
@@ -688,11 +697,15 @@ func (c *Controller) targetCredentials(ctx context.Context, r *Resource, name st
 	err := c.Kube.Get(ctx, c.corePath("secrets", name), &secret)
 	var api *APIError
 	if errors.As(err, &api) && api.StatusCode == 404 && source != nil {
-		members, admin, err := freshMembers(source)
+		members, admin, peerTokens, err := freshMembers(source, r.Status.Target)
 		if err != nil {
 			return nil, err
 		}
-		secret = object{"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "immutable": true, "metadata": object{"name": name, "annotations": object{ownerAnnotation: c.operationID(r)}}, "data": object{"members": base64.StdEncoding.EncodeToString(jsonBytes(members)), "admin": base64.StdEncoding.EncodeToString([]byte(admin))}}
+		secret = object{"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "immutable": true, "metadata": object{"name": name, "annotations": object{ownerAnnotation: c.operationID(r)}}, "data": object{
+			"members":     base64.StdEncoding.EncodeToString(jsonBytes(members)),
+			"admin":       base64.StdEncoding.EncodeToString([]byte(admin)),
+			"peer_tokens": base64.StdEncoding.EncodeToString(jsonBytes(peerTokens)),
+		}}
 		// Even an uncertain create is resolved by reading the same deterministic key.
 		createErr := c.Kube.Post(ctx, c.corePath("secrets", ""), secret, nil)
 		if err = c.Kube.Get(ctx, c.corePath("secrets", name), &secret); err != nil {
@@ -716,6 +729,18 @@ func (c *Controller) targetCredentials(ctx context.Context, r *Resource, name st
 	if err != nil || len(admin) < 32 {
 		return nil, fmt.Errorf("invalid target admin credential")
 	}
+	// Peer identities are process-local secrets: the target generation's
+	// private tokens live only in this Secret and are mounted per Pod.
+	var peerTokens map[string]string
+	rawTokens, err := base64.StdEncoding.DecodeString(str(nested(secret, "data", "peer_tokens")))
+	if err != nil || json.Unmarshal(rawTokens, &peerTokens) != nil {
+		return nil, fmt.Errorf("invalid target peer credentials")
+	}
+	for _, m := range members {
+		if peerTokens[string(m.ID)] == "" {
+			return nil, fmt.Errorf("target peer credentials are incomplete")
+		}
+	}
 	if source != nil {
 		old := map[quepaxa.NodeID]quepaxa.Member{}
 		for _, m := range source {
@@ -723,24 +748,26 @@ func (c *Controller) targetCredentials(ctx context.Context, r *Resource, name st
 		}
 		for _, m := range members {
 			prior, ok := old[m.ID]
-			if !ok || m.Token == prior.Token || m.URL != prior.URL || m.PeerURL != prior.PeerURL || m.LogURL != prior.LogURL {
+			if !ok || m.PublicKey == prior.PublicKey || m.URL != prior.URL || m.PeerURL != prior.PeerURL || m.LogURL != prior.LogURL {
 				return nil, fmt.Errorf("target credentials do not preserve source voter endpoints")
 			}
 		}
 	}
 	return members, nil
 }
-func freshMembers(source []quepaxa.Member) ([]quepaxa.Member, string, error) {
+func freshMembers(source []quepaxa.Member, clusterID string) ([]quepaxa.Member, string, map[string]string, error) {
 	members := append([]quepaxa.Member(nil), source...)
+	peerTokens := make(map[string]string, len(members))
 	for i := range members {
 		token, err := randomToken()
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
-		members[i].Token = token
+		members[i].PublicKey = quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), members[i].ID, token))
+		peerTokens[string(members[i].ID)] = token
 	}
 	admin, err := randomToken()
-	return members, admin, err
+	return members, admin, peerTokens, err
 }
 func randomToken() (string, error) {
 	b := make([]byte, 32)
@@ -770,7 +797,7 @@ func (c *Controller) sourceMembership(ctx context.Context, prefix string) (recov
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, 64<<10))
 	closeErr := reader.Close()
-	if err != nil || closeErr != nil || len(data) == 64<<10 || json.Unmarshal(data, &record) != nil || record.Version != 1 || (record.Durability != "async" && record.Durability != "before-ack") || !bytes.Equal(data, jsonBytes(record)) {
+	if err != nil || closeErr != nil || len(data) == 64<<10 || json.Unmarshal(data, &record) != nil || record.Version != 2 || (record.Durability != "async" && record.Durability != "before-ack") || !bytes.Equal(data, jsonBytes(record)) {
 		return record, fmt.Errorf("source membership or durability history is invalid")
 	}
 	return record, nil
@@ -790,13 +817,16 @@ func replaceEnv(env []any, name string, value object) []any {
 	for k, v := range value {
 		entry[k] = v
 	}
+	return append(removeEnv(env, name), entry)
+}
+func removeEnv(env []any, name string) []any {
 	var result []any
 	for _, item := range env {
 		if str(asObject(item)["name"]) != name {
 			result = append(result, item)
 		}
 	}
-	return append(result, entry)
+	return result
 }
 func shortID(value string) string { return hashJSON(value)[:24] }
 func hashJSON(value any) string {
@@ -819,7 +849,7 @@ func recoveryMembers(raw string) ([]quepaxa.Member, error) {
 	}
 	seen := map[quepaxa.NodeID]bool{}
 	for _, m := range members {
-		if !identifier.MatchString(string(m.ID)) || m.Token == "" || seen[m.ID] {
+		if !identifier.MatchString(string(m.ID)) || m.PublicKey == (quepaxa.PublicKey{}) || seen[m.ID] {
 			return nil, fmt.Errorf("incomplete or duplicate voter identity")
 		}
 		seen[m.ID] = true

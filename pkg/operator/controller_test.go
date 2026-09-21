@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -129,6 +130,69 @@ func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
 	}
 }
 
+// A recovered StatefulSet can inherit a scalar RHIZA_PEER_TOKEN from its source
+// template. The activation write injects the voter token map, and
+// configEnvPeerToken rejects that combination, so the scalar must be overridden
+// in the same write. EnvVar.Value carries omitempty, so the clearing override is
+// stored name-only; the kubelet still applies it after envFrom, and the
+// operator's own environment reader must read it back as an empty value.
+func TestControllerActivationOverridesInheritedScalarPeerToken(t *testing.T) {
+	ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+	r.Spec.RecoveryID = "recovery-1"
+	r.Spec.Fence = fence(r)
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_PEER_TOKEN", "value": "inherited-secret"})
+
+	// Stopping needs one reconcile to scale the source down and one more to
+	// observe the terminated Pods; the activation write happens on the next
+	// reconcile, when the recorded stage is already Starting.
+	for _, stage := range []string{"Reserved", "Sealed", "Stopping", "Stopping", "Starting", "Restarted"} {
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Stage != stage {
+			t.Fatalf("stage=%q want=%q status=%+v", r.Status.Stage, stage, r.Status)
+		}
+	}
+	activated, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overrides int
+	var mapInjected bool
+	for _, item := range list(activated["env"]) {
+		entry := asObject(item)
+		switch str(entry["name"]) {
+		case "RHIZA_PEER_TOKEN":
+			overrides++
+			if entry["value"] != nil || entry["valueFrom"] != nil {
+				t.Fatalf("clearing override must be a name-only entry: %+v", entry)
+			}
+		case "RHIZA_PEER_TOKENS":
+			mapInjected = nested(entry, "valueFrom", "secretKeyRef", "key") == "peer_tokens"
+		}
+	}
+	if overrides != 1 {
+		t.Fatalf("activation wrote %d RHIZA_PEER_TOKEN entries, want one override: %+v", overrides, activated["env"])
+	}
+	if !mapInjected {
+		t.Fatalf("voter token map was not injected: %+v", activated["env"])
+	}
+	// The operator reads the same StatefulSet back during activation; a name-only
+	// entry the reader could not resolve would block recovery there instead of at
+	// node startup, and a non-empty value would reintroduce the conflict.
+	env, err := c.environment(ctx, activated)
+	if err != nil {
+		t.Fatalf("activated StatefulSet environment is unreadable: %v", err)
+	}
+	if env["RHIZA_PEER_TOKEN"] != "" {
+		t.Fatalf("clearing override read back as %q", env["RHIZA_PEER_TOKEN"])
+	}
+}
+
 func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, Voting: true, AbortSlot: 7}
@@ -155,7 +219,8 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Membership.Add == nil || r.Status.Membership.Add.ExpectedAbortSlot != 7 || bytes.Contains(jsonBytes(r.Status), []byte("new-token")) {
+	added := voterMember("source", "n4", "new-token")
+	if r.Status.Membership.Add == nil || r.Status.Membership.Add.ExpectedAbortSlot != 7 || bytes.Contains(jsonBytes(r.Status), []byte(hex.EncodeToString(added.PublicKey[:]))) {
 		t.Fatalf("add journal leaks credentials: status=%+v journal=%+v", r.Status, r.Status.Membership)
 	}
 	api.membershipSecret["metadata"].(object)["resourceVersion"] = "2"
@@ -180,7 +245,7 @@ func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	api.membership["n2"] = network.MembershipStatus{NodeID: "n2", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, Voting: true}
 	api.membership["n4"] = network.MembershipStatus{NodeID: "n4", ClusterID: "source", ConfigID: 3, Voters: []quepaxa.NodeID{"n1", "n2", "n4"}, WALIdentity: strings.Repeat("a", 64), Voting: true}
 	originalCredential := api.membershipSecret["data"].(object)["member"]
-	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(quepaxa.Member{ID: "n4", URL: "http://n4", PeerURL: "quic://n4", Token: "changed-token"}))
+	api.membershipSecret["data"].(object)["member"] = base64.StdEncoding.EncodeToString(jsonBytes(voterMember("source", "n4", "changed-token")))
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +338,7 @@ func TestControllerMembershipAbortThenResumeWithNewLearner(t *testing.T) {
 		t.Fatal(err)
 	}
 	api.replacement2 = object{"metadata": object{"name": "learner2", "uid": "learner2-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}}}
-	member := quepaxa.Member{ID: "n5", URL: "http://n5", PeerURL: "quic://n5", Token: "newer-token"}
+	member := voterMember("source", "n5", "newer-token")
 	api.membershipSecrets["learner2-credentials"] = object{"immutable": true, "metadata": object{"name": "learner2-credentials", "uid": "secret2-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
 	api.learnerID = "n5"
 	api.membership["n5"] = network.MembershipStatus{NodeID: "n5", ClusterID: "source", ConfigID: 2, Voters: []quepaxa.NodeID{"n1", "n2"}, WALIdentity: strings.Repeat("d", 64)}
@@ -335,7 +400,7 @@ func membershipFixture(t *testing.T) (context.Context, *Resource, *operatorAPI, 
 		t.Fatal(err)
 	}
 	api.replacement = object{"metadata": object{"name": "learner", "uid": "learner-uid"}, "status": object{"podIP": "127.0.0.1"}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}}}
-	member := quepaxa.Member{ID: "n4", URL: "http://n4", PeerURL: "quic://n4", Token: "new-token"}
+	member := voterMember("source", "n4", "new-token")
 	api.membershipSecret = object{"immutable": true, "metadata": object{"name": "learner-credentials", "uid": "secret-uid", "resourceVersion": "1"}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))}}
 	api.learnerID = "n4"
 	api.membershipSecrets = map[string]object{"learner-credentials": api.membershipSecret}
@@ -451,6 +516,12 @@ func TestControllerRejectsUnknownTargetDurability(t *testing.T) {
 
 func fence(r *Resource) Fence {
 	return Fence{RecoveryID: r.Spec.RecoveryID, ClusterID: r.Spec.SourceClusterID, StatefulSetUID: "sts-uid", Confirmed: true, Evidence: "incident-42"}
+}
+
+// voterMember derives the public identity a peer token grants one voter, so
+// fixtures carry no secret in the replicated member record.
+func voterMember(clusterID, name, token string) quepaxa.Member {
+	return quepaxa.Member{ID: quepaxa.NodeID(name), URL: "http://" + name, PeerURL: "quic://" + name, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), quepaxa.NodeID(name), token))}
 }
 
 func controllerFixture(t *testing.T, sourceMode, targetMode string) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
@@ -592,6 +663,7 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 			var next object
 			if json.NewDecoder(q.Body).Decode(&next) == nil {
 				a.sts = next
+				apiserverNormalize(a.sts)
 				a.stsPuts++
 				if number(nested(next, "spec", "replicas")) == 0 {
 					a.zeroPuts++
@@ -692,8 +764,24 @@ func fakeSTS(mode string) object {
 		},
 	}
 }
+
+// apiserverNormalize applies the serialization the real API server performs on
+// a StatefulSet write: EnvVar.Value carries omitempty, so an empty string is
+// dropped and only the name survives. A fake that keeps `"value":""` would
+// hide exactly the defect the operator hit when it cleared an env entry.
+func apiserverNormalize(sts object) {
+	for _, cRef := range list(nested(sts, "spec", "template", "spec", "containers")) {
+		for _, eRef := range list(asObject(cRef)["env"]) {
+			entry := asObject(eRef)
+			if str(entry["value"]) == "" {
+				delete(entry, "value")
+			}
+		}
+	}
+}
+
 func members() []quepaxa.Member {
-	return []quepaxa.Member{{ID: "n1", URL: "http://n1", PeerURL: "quic://n1", Token: "old1"}, {ID: "n2", URL: "http://n2", PeerURL: "quic://n2", Token: "old2"}, {ID: "n3", URL: "http://n3", PeerURL: "quic://n3", Token: "old3"}}
+	return []quepaxa.Member{voterMember("source", "n1", "old1"), voterMember("source", "n2", "old2"), voterMember("source", "n3", "old3")}
 }
 func storeIdentity() map[string]string {
 	return map[string]string{"RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "https://store.example", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_PREFIX": "root", "RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT": ""}

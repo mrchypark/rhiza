@@ -295,7 +295,7 @@ replica, err := rhiza.OpenReadReplica(ctx, rhiza.ReplicaConfig{
 
 Both modes require shared object storage for cold start and recovery. Learners
 authenticate the read-only `Sync` RPC with the voter `AdminToken`, but must not
-receive voter tokens. Build token-free pinned peer identities with
+receive voter peer tokens. Build token-free pinned peer identities with
 `rhiza.NewReplicaMember(clusterID, voter)`.
 
 `GET /replica/status` reports the mode, applied slot, observed source tip, lag,
@@ -360,7 +360,9 @@ Common settings are:
 | `RHIZA_DATA_DIR` | `./rhiza-data` | Durable local state |
 | `RHIZA_BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `RHIZA_PEER_ADDR` | `127.0.0.1:9090` | Voter QUIC listen address |
-| `RHIZA_CLUSTER_MEMBERS` | empty | JSON fixed voter membership |
+| `RHIZA_CLUSTER_MEMBERS` | empty | JSON fixed voter membership; each member carries `node_id`, `url`, `peer_url`, and a base64 Ed25519 `public_key` |
+| `RHIZA_PEER_TOKEN` | empty | This process's private peer identity secret |
+| `RHIZA_PEER_TOKENS` | empty | JSON node-ID to peer token map for StatefulSets where one Pod template cannot mount a per-replica Secret; conflicts with `RHIZA_PEER_TOKEN` |
 | `RHIZA_REPLICA_MEMBERS` | empty | Learner JSON pinned voter identities |
 | `RHIZA_REPLICA_SYNC_INTERVAL` | `0s` | Replica polling interval; zero selects the engine default |
 | `RHIZA_ADMIN_TOKEN` | empty | Learner-to-voter sync credential |
@@ -389,9 +391,12 @@ SQL and Graph qualification manifests and both read-replica modes.
 ## Peer security
 
 Peer traffic uses QUIC over UDP with TLS 1.3, pinned identities, bounded frames,
-and voter-specific membership tokens. The admin token must differ from every
-voter token. Learners receive only the admin token and token-free pinned voter
-identities.
+and per-voter peer identities. Membership publishes only each voter's Ed25519
+public key; the matching private token stays in that process's own
+`RHIZA_PEER_TOKEN` or `RHIZA_PEER_TOKENS` entry and is never replicated into
+membership, checkpoints, or archives. The admin token must differ from every
+voter peer token. Learners receive only the admin token and pinned voter public
+keys.
 
 This is server authentication and token authorization, not peer mTLS. Keep peer
 UDP and the unauthenticated HTTP adapter on private networks, restrict them with

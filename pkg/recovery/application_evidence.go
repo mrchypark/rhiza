@@ -56,7 +56,7 @@ func RecoverApplicationEvidence(ctx context.Context, bucket objstore.Bucket, tar
 	if fn == nil {
 		return ApplicationEvidence{}, fmt.Errorf("recovery callback is required")
 	}
-	if opts.ExpectedAnchorHash == ([32]byte{}) || opts.ExpectedMembership.Version != 1 {
+	if opts.ExpectedAnchorHash == ([32]byte{}) || opts.ExpectedMembership.Version != MembershipRecordVersion {
 		return ApplicationEvidence{}, fmt.Errorf("expected generation anchor and immutable membership are required")
 	}
 	if opts.ExpectedForkResult.Tip == 0 {

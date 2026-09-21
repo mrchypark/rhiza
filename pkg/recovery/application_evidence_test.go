@@ -23,7 +23,7 @@ func buildSourceWithSQL(t *testing.T) (objstore.Bucket, string, quepaxa.Cluster)
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
 	srcPrefix := "source"
-	sourceMembers := []quepaxa.Member{{ID: "old", Token: "old"}}
+	sourceMembers := []quepaxa.Member{{ID: "old", PublicKey: testPublicKey("old")}}
 	w, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +126,7 @@ func forkToTarget(t *testing.T, bucket objstore.Bucket, srcPrefix, targetPrefix,
 	if err := Seal(ctx, bucket, srcPrefix, opID); err != nil {
 		t.Fatal(err)
 	}
-	targetMembers := []quepaxa.Member{{ID: "new", Token: "new"}}
+	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord(targetPrefix, targetMembers, "async")
 	result, err := Fork(ctx, bucket, ForkOptions{
 		SourcePrefix: srcPrefix, TargetPrefix: targetPrefix,
@@ -213,7 +213,7 @@ func TestRecoverApplicationEvidenceBadHash(t *testing.T) {
 func TestRecoverApplicationEvidenceMissingAnchor(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	targetMembers := []quepaxa.Member{{ID: "new", Token: "new"}}
+	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord("missing", targetMembers, "async")
 	var badHash [32]byte
 	badHash[0] = 0x01
@@ -239,7 +239,7 @@ func TestRecoverApplicationEvidenceBadMembership(t *testing.T) {
 	opID := "membership-op"
 	result, _, anchorHash := forkToTarget(t, bucket, srcPrefix, targetPrefix, opID, sourceBootstrap)
 
-	wrongMembers := []quepaxa.Member{{ID: "wrong", Token: "wrong"}}
+	wrongMembers := []quepaxa.Member{{ID: "wrong", PublicKey: testPublicKey("wrong")}}
 	wrongMembership := NewMembershipRecord(targetPrefix, wrongMembers, "async")
 	_, err := RecoverApplicationEvidence(ctx, bucket, targetPrefix, EvidenceOptions{
 		ExpectedAnchorHash:   anchorHash,
@@ -325,7 +325,7 @@ func TestRecoverApplicationEvidenceBadOperationID(t *testing.T) {
 func TestRecoverApplicationEvidenceNilCallback(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	targetMembers := []quepaxa.Member{{ID: "new", Token: "new"}}
+	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord("nil-cb", targetMembers, "async")
 	var h [32]byte
 	h[0] = 0x01
@@ -344,7 +344,7 @@ func TestRecoverApplicationEvidenceNilCallback(t *testing.T) {
 func TestRecoverApplicationEvidenceEmptySourcePrefix(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	targetMembers := []quepaxa.Member{{ID: "new", Token: "new"}}
+	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord("empty-src", targetMembers, "async")
 	var h [32]byte
 	h[0] = 0x01
@@ -363,7 +363,7 @@ func TestRecoverApplicationEvidenceEmptySourcePrefix(t *testing.T) {
 func TestRecoverApplicationEvidenceEmptyOperationID(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	targetMembers := []quepaxa.Member{{ID: "new", Token: "new"}}
+	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord("empty-opid", targetMembers, "async")
 	var h [32]byte
 	h[0] = 0x01

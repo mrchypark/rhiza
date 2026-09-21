@@ -38,7 +38,7 @@ func TestMembershipHistoryValidation(t *testing.T) {
 		name   string
 		mutate func(*MembershipRecord)
 	}{
-		{"bootstrap", func(r *MembershipRecord) { r.Genesis.Members[0].Token = "other" }},
+		{"bootstrap", func(r *MembershipRecord) { r.Genesis.Members[0].PublicKey = PublicKey{1} }},
 		{"value", func(r *MembershipRecord) { r.Transitions[0].Terminal.Value[0] ^= 1 }},
 		{"slot", func(r *MembershipRecord) { r.Transitions[0].Terminal.Slot++ }},
 		{"missing-quorum", func(r *MembershipRecord) {

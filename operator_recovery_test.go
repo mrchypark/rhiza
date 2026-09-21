@@ -38,8 +38,8 @@ func TestOperatorRecoveryForkE2E(t *testing.T) {
 			generation := fmt.Sprintf("operator-fork-%d", time.Now().UnixNano())
 			sourceCluster, targetCluster := generation+"-source", generation+"-target"
 			storePrefix := generation + "/store"
-			sourceMembers := recoveryTestMembers(t, "source-token")
-			targetMembers := recoveryTestMembers(t, "target-token")
+			sourceMembers, sourceTokens := recoveryTestMembers(t, sourceCluster, "source-token")
+			targetMembers, targetTokens := recoveryTestMembers(t, targetCluster, "target-token")
 			base := rhiza.Config{
 				ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint, ObjStoreBucket: bucketName,
 				ObjStoreRegion: "us-east-1", ObjStoreInsecure: true,
@@ -49,7 +49,7 @@ func TestOperatorRecoveryForkE2E(t *testing.T) {
 				ObjStoreSyncInterval: 10 * time.Millisecond,
 			}
 
-			source, sourceConfigs := openRecoveryTestVoters(t, ctx, base, sourceCluster, sourceMembers)
+			source, sourceConfigs := openRecoveryTestVoters(t, ctx, base, sourceCluster, sourceMembers, sourceTokens)
 			if _, _, err := executeRecoveryTest(ctx, source, rhiza.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE recovered_items (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
 				t.Fatal(err)
 			}
@@ -101,7 +101,7 @@ func TestOperatorRecoveryForkE2E(t *testing.T) {
 				t.Fatalf("record target generation membership: %v", err)
 			}
 
-			target, _ := openRecoveryTestVoters(t, ctx, base, targetCluster, targetMembers)
+			target, _ := openRecoveryTestVoters(t, ctx, base, targetCluster, targetMembers, targetTokens)
 			defer closeRecoveryTestVoters(t, target)
 			for _, voter := range target {
 				if err := waitRecoveryValue(ctx, voter, 1, "preserved"); err != nil {
@@ -119,25 +119,28 @@ func TestOperatorRecoveryForkE2E(t *testing.T) {
 	}
 }
 
-func recoveryTestMembers(t testing.TB, tokenPrefix string) []rhiza.Member {
+// recoveryTestMembers publishes only public identity; the private tokens stay
+// with the test's per-node process configuration.
+func recoveryTestMembers(t testing.TB, cluster, tokenPrefix string) ([]rhiza.Member, map[string]string) {
 	t.Helper()
 	members := make([]rhiza.Member, 3)
+	tokens := make(map[string]string, len(members))
 	for i := range members {
-		members[i] = rhiza.Member{
-			ID: quepaxa.NodeID(fmt.Sprintf("n%d", i+1)), PeerURL: "quic://" + freeUDPAddr(t),
-			Token: fmt.Sprintf("%s-%d", tokenPrefix, i+1),
-		}
+		id, token := fmt.Sprintf("n%d", i+1), fmt.Sprintf("%s-%d", tokenPrefix, i+1)
+		members[i] = rhiza.Member{ID: quepaxa.NodeID(id), PeerURL: "quic://" + freeUDPAddr(t), PublicKey: rhiza.PeerPublicKey(cluster, id, token)}
+		tokens[id] = token
 	}
-	return members
+	return members, tokens
 }
 
-func openRecoveryTestVoters(t testing.TB, ctx context.Context, base rhiza.Config, cluster string, members []rhiza.Member) ([]*rhiza.DB, []rhiza.Config) {
+func openRecoveryTestVoters(t testing.TB, ctx context.Context, base rhiza.Config, cluster string, members []rhiza.Member, tokens map[string]string) ([]*rhiza.DB, []rhiza.Config) {
 	t.Helper()
 	voters := make([]*rhiza.DB, 0, len(members))
 	configs := make([]rhiza.Config, 0, len(members))
 	for _, member := range members {
 		config := base
 		config.ClusterID, config.NodeID, config.DataDir, config.Members = cluster, string(member.ID), t.TempDir(), members
+		config.PeerToken = tokens[string(member.ID)]
 		config.PeerAddr = strings.TrimPrefix(member.PeerURL, "quic://")
 		voter, err := rhiza.Open(ctx, config)
 		if err != nil {

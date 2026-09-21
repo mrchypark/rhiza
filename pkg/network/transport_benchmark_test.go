@@ -8,13 +8,13 @@ import (
 )
 
 func BenchmarkBoundTransportQUICReadTip(b *testing.B) {
-	members := []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}, {ID: "c", Token: "c-token"}}
+	members := []quepaxa.Member{testMember("cluster", "a", "a-token"), testMember("cluster", "b", "b-token"), testMember("cluster", "c", "c-token")}
 	source := mustCore(b, "a", members, nil, nil)
 	server := NewServer(source, nil, "cluster", true, nil)
 	defer server.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, members, "admin")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, members, "a-token", "admin")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func BenchmarkBoundTransportQUICReadTip(b *testing.B) {
 	members[0].PeerURL = "quic://" + peer.Addr()
 	core := mustCore(b, "b", members, nil, nil)
 	config := core.CurrentCluster()
-	transport := NewTransport("cluster", "b", &config, "admin")
+	transport := NewTransport("cluster", "b", &config, "b-token")
 	defer transport.Close()
 	transport.BindCore(core)
 	for range 10 {

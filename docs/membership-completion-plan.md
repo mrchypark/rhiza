@@ -68,12 +68,13 @@ All voters must run the supporting binary with `RHIZA_ENABLE_RECONFIGURATION=tru
 and a configured `RHIZA_ADMIN_TOKEN`. Keep `RHIZA_CLUSTER_MEMBERS` equal to the
 original immutable bootstrap on both surviving voters and new learners. A learner
 uses its fresh `RHIZA_NODE_ID` and `RHIZA_LEARNER` JSON member (the same `node_id`,
-`peer_url`, and `token` as its Secret). Go hosts use `EnableReconfiguration` and
+`peer_url`, and `public_key` as its Secret). Its private token comes from
+`RHIZA_PEER_TOKEN`. Go hosts use `EnableReconfiguration`, `PeerToken`, and
 `Learner`; Rust hosts can set the same Go configuration fields with `set_option`.
 
 1. Provision the replacement learner out of band with a fresh node ID and an
    immutable Secret containing only `data.member`: a strict JSON `quepaxa.Member`
-   object with `node_id`, `peer_url`, and `token` fields. Do not put the
+   object with `node_id`, `peer_url`, and `public_key` fields. Do not put the
    token in the resource status or this document.
 2. Submit `spec.membership` with `operationID`, `remove`, `fence`, every reachable
    surviving voter in `voterPods` (`nodeID`, `pod`), `replacementPod`, and

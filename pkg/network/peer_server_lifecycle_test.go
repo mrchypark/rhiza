@@ -11,20 +11,20 @@ import (
 )
 
 func TestPeerServerCloseReleasesOwnedSocketAfterConnection(t *testing.T) {
-	config := quepaxa.Cluster{Members: []quepaxa.Member{{ID: "n1", Token: "voter"}}}
+	config := quepaxa.Cluster{Members: []quepaxa.Member{testMember("cluster", "n1", "voter")}}
 	core := mustCore(t, "n1", config.Members, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	t.Cleanup(server.Close)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, config.Members, "admin")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", server, config.Members, "voter", "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = peer.Close() })
 	addr := peer.Addr()
 	config.Members[0].PeerURL = "quic://" + addr
-	client := NewTransport("cluster", "n1", &config, "admin")
+	client := NewTransport("cluster", "n1", &config, "voter")
 	t.Cleanup(func() { _ = client.Close() })
 	if _, err := client.ReadTip(ctx, "n1"); err != nil {
 		t.Fatal(err)
@@ -47,18 +47,18 @@ func TestPeerServerClosePreservesCallerTransport(t *testing.T) {
 	defer conn.Close()
 	transport := &quic.Transport{Conn: conn}
 	defer transport.Close()
-	members := []quepaxa.Member{{ID: "n1", Token: "voter"}}
+	members := []quepaxa.Member{testMember("cluster", "n1", "voter")}
 	core := mustCore(t, "n1", members, nil, nil)
 	server := NewServer(core, nil, "cluster", true, nil)
 	defer server.Close()
-	peer, err := StartPeerServerOnTransport(context.Background(), transport, server, members, "admin")
+	peer, err := StartPeerServerOnTransport(context.Background(), transport, server, members, "voter", "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := peer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	next, err := StartPeerServerOnTransport(context.Background(), transport, server, members, "admin")
+	next, err := StartPeerServerOnTransport(context.Background(), transport, server, members, "voter", "admin")
 	if err != nil {
 		t.Fatalf("peer closed caller-owned transport: %v", err)
 	}

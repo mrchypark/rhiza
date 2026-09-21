@@ -9,14 +9,21 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
 
+// peerMember derives the public identity a peer token grants one node, so test
+// members carry no secret.
+func peerMember(clusterID string, id quepaxa.NodeID, token string) quepaxa.Member {
+	return quepaxa.Member{ID: id, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), id, token))}
+}
+
 func voterTestConfig(t *testing.T) *types.ExecutionConfig {
 	t.Helper()
-	return &types.ExecutionConfig{DataDir: t.TempDir(), ClusterID: "cluster", NodeID: "a", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", Members: []quepaxa.Member{{ID: "a", Token: "a-token"}, {ID: "b", Token: "b-token"}, {ID: "c", Token: "c-token"}}}
+	return &types.ExecutionConfig{DataDir: t.TempDir(), ClusterID: "cluster", NodeID: "a", ObjStoreProvider: "s3", ObjStoreBucket: "bucket", Members: []quepaxa.Member{peerMember("cluster", "a", "a-token"), peerMember("cluster", "b", "b-token"), peerMember("cluster", "c", "c-token")}}
 }
 
 func registerTestVoter(t *testing.T, config *types.ExecutionConfig, bucket objstore.Bucket, enroll bool) error {

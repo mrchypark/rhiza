@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -17,7 +19,7 @@ import (
 // Pod cloned from the source STS template). It is idempotent: an existing Pod
 // or Service with a matching ownerAnnotation is accepted as-is without deletion
 // or recreation, preserving WAL identity across controller restarts.
-func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, containerName, operationID, learnerName string) (quepaxa.Member, error) {
+func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, containerName, operationID, clusterID, learnerName string) (quepaxa.Member, error) {
 	if !identifier.MatchString(learnerName) {
 		return quepaxa.Member{}, fmt.Errorf("invalid learner name")
 	}
@@ -58,7 +60,7 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 		return quepaxa.Member{}, err
 	}
 
-	// Generate a fresh token for the credential, or reuse the existing one.
+	// Generate a fresh peer identity for the credential, or reuse the existing one.
 	newToken, err := randomToken()
 	if err != nil {
 		return quepaxa.Member{}, fmt.Errorf("generate token: %w", err)
@@ -67,16 +69,21 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 	peerURL := "quic://" + learnerName + ":" + fmt.Sprint(peerPort)
 
 	secretName := learnerName + "-credentials"
+	var member quepaxa.Member
 	var existingSecret object
 	err = c.Kube.Get(ctx, c.corePath("secrets", secretName), &existingSecret)
 	var apiErr *APIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
-		// Secret absent — create with the fresh token.
-		member := quepaxa.Member{ID: quepaxa.NodeID(learnerName), URL: httpURL, PeerURL: peerURL, Token: newToken}
+		// Secret absent — create with the fresh private peer token. Only the
+		// public half is stored in the replicated member record.
+		member = quepaxa.Member{ID: quepaxa.NodeID(learnerName), URL: httpURL, PeerURL: peerURL, PublicKey: quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), quepaxa.NodeID(learnerName), newToken))}
 		secret := object{
 			"apiVersion": "v1", "kind": "Secret", "type": "Opaque", "immutable": true,
 			"metadata": object{"name": secretName, "annotations": object{ownerAnnotation: operationID}},
-			"data":     object{"member": base64.StdEncoding.EncodeToString(jsonBytes(member))},
+			"data": object{
+				"member":           base64.StdEncoding.EncodeToString(jsonBytes(member)),
+				"RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte(newToken)),
+			},
 		}
 		if err := c.Kube.Post(ctx, c.corePath("secrets", ""), secret, nil); err != nil {
 			return quepaxa.Member{}, fmt.Errorf("create secret: %w", err)
@@ -101,10 +108,13 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 		if dec.Decode(&stored) != nil || dec.Decode(new(any)) != io.EOF {
 			return quepaxa.Member{}, fmt.Errorf("invalid secret member payload")
 		}
-		if string(stored.ID) != learnerName || stored.URL != httpURL || stored.PeerURL != peerURL || stored.Token == "" {
+		if string(stored.ID) != learnerName || stored.URL != httpURL || stored.PeerURL != peerURL || stored.PublicKey == (quepaxa.PublicKey{}) {
 			return quepaxa.Member{}, fmt.Errorf("existing secret credentials do not match")
 		}
-		newToken = stored.Token
+		if _, err := base64.StdEncoding.DecodeString(str(nested(existingSecret, "data", "RHIZA_PEER_TOKEN"))); err != nil {
+			return quepaxa.Member{}, fmt.Errorf("existing secret peer identity is unavailable")
+		}
+		member = stored
 	}
 
 	// Create or validate headless Service.
@@ -152,6 +162,10 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 		if str(ctr["name"]) == containerName {
 			values := replaceEnv(list(ctr["env"]), "RHIZA_NODE_ID", object{"value": learnerName})
 			ctr["env"] = replaceEnv(values, "RHIZA_LEARNER", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "member"}}})
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKEN", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "RHIZA_PEER_TOKEN"}}})
+			// The voter token map arrives through the inherited envFrom; an empty
+			// env entry clears it so the single RHIZA_PEER_TOKEN above applies.
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKENS", object{"value": ""})
 		}
 	}
 	if str(podSpec["restartPolicy"]) == "" {
@@ -185,7 +199,7 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 		}
 	}
 
-	return quepaxa.Member{ID: quepaxa.NodeID(learnerName), URL: httpURL, PeerURL: peerURL, Token: newToken}, nil
+	return member, nil
 }
 
 // validateServiceSpec checks that an existing Service still matches the

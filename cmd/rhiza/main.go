@@ -61,7 +61,7 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 	case "object-store", "learner":
 		replicaMembers, err := objectReplicaMembers(members)
 		if role == "learner" {
-			replicaMembers, err = learnerReplicaMembers(os.Getenv("RHIZA_REPLICA_MEMBERS"), members)
+			replicaMembers, err = learnerReplicaMembers(os.Getenv("RHIZA_REPLICA_MEMBERS"))
 		}
 		if err != nil {
 			return fmt.Errorf("configure %s: %w", role, err)
@@ -144,12 +144,9 @@ func objectReplicaMembers(members []rhiza.Member) ([]rhiza.ReplicaMember, error)
 	return result, nil
 }
 
-func learnerReplicaMembers(raw string, voterConfig []rhiza.Member) ([]rhiza.ReplicaMember, error) {
-	for _, member := range voterConfig {
-		if member.Token != "" {
-			return nil, errors.New("learner must not receive voter tokens in RHIZA_CLUSTER_MEMBERS")
-		}
-	}
+// learnerReplicaMembers parses the public voter identities a learner may pin.
+// Voter peer tokens are never part of a learner's configuration.
+func learnerReplicaMembers(raw string) ([]rhiza.ReplicaMember, error) {
 	var configured []struct {
 		ID        string `json:"node_id"`
 		PeerURL   string `json:"peer_url"`

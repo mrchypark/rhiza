@@ -12,7 +12,7 @@ func TestMembershipDispatchAndStrictWireFormat(t *testing.T) {
 	for _, operation := range []string{"membership_change", "membership_abort", "membership_status"} {
 		request := `{}`
 		if operation != "membership_status" {
-			request = `{"operation_id":"replace","cluster_id":"cluster","expected_config_id":2,"expected_abort_slot":17,"add":{"node_id":"new","peer_url":"quic://127.0.0.1:9000","token":"peer-token","wal_identity":"identity"}}`
+			request = `{"operation_id":"replace","cluster_id":"cluster","expected_config_id":2,"expected_abort_slot":17,"add":{"node_id":"new","peer_url":"quic://127.0.0.1:9000","public_key":"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=","wal_identity":"identity"}}`
 		}
 		payload, _ := json.Marshal(callEnvelope{Operation: operation, Request: json.RawMessage(request)})
 		var response ffiEnvelope

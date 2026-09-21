@@ -7,11 +7,11 @@ import (
 )
 
 type DecisionT struct {
-	Slot      uint64      `json:"slot"`
-	Step      uint64      `json:"step"`
-	Proposal  *ProposalT  `json:"proposal"`
+	Slot uint64 `json:"slot"`
+	Step uint64 `json:"step"`
+	Proposal *ProposalT `json:"proposal"`
 	Summaries []*SummaryT `json:"summaries"`
-	ConfigId  uint64      `json:"config_id"`
+	ConfigId uint64 `json:"config_id"`
 }
 
 func (t *DecisionT) Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {

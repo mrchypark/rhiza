@@ -27,6 +27,10 @@ var (
 	ErrVoterEnrollmentRequired = errors.New("existing voter requires offline enrollment")
 )
 
+// voterIdentityVersion 2 records the learner's public key instead of a hash of
+// its retired private peer token. Version 1 registrations are rejected.
+const voterIdentityVersion = 2
+
 // The registration is immutable. It detects lost/replaced WAL directories, not
 // cloned disks or rolled-back storage; those still require external fencing.
 type voterIdentity struct {
@@ -37,7 +41,7 @@ type voterIdentity struct {
 	Store            string `json:"store"`
 	Nonce            string `json:"nonce"`
 	Registered       bool   `json:"registered"`
-	LearnerTokenHash string `json:"learner_token_hash,omitempty"`
+	LearnerPublicKey string `json:"learner_public_key,omitempty"`
 }
 
 type localVoterState struct {
@@ -65,7 +69,7 @@ func loadVoterIdentity(config *types.ExecutionConfig) (localVoterState, error) {
 		return state, fmt.Errorf("%w: invalid local identity", ErrVoterStateLost)
 	}
 	nonce, err := hex.DecodeString(identity.Nonce)
-	if err != nil || len(nonce) != 32 || identity.Version != 1 || !state.hadWAL {
+	if err != nil || len(nonce) != 32 || identity.Version != voterIdentityVersion || !state.hadWAL {
 		return state, fmt.Errorf("%w: local identity or WAL manifest is missing/invalid; preserve the original disk", ErrVoterStateLost)
 	}
 	state.identity = &identity
@@ -75,9 +79,9 @@ func loadVoterIdentity(config *types.ExecutionConfig) (localVoterState, error) {
 func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 	membership := recovery.NewMembershipRecord(string(config.ClusterID), config.Members, string(config.ObjStoreDurability))
 	store, _ := json.Marshal([]string{config.ObjStoreProvider, config.ObjStoreEndpoint, config.ObjStoreBucket, path.Clean(config.ObjStorePrefix), config.ObjStoreAzureStorageAccount})
-	identity := voterIdentity{Version: 1, Cluster: string(config.ClusterID), Node: string(config.NodeID), Membership: membership.Membership, Store: fmt.Sprintf("%x", sha256.Sum256(store))}
+	identity := voterIdentity{Version: voterIdentityVersion, Cluster: string(config.ClusterID), Node: string(config.NodeID), Membership: membership.Membership, Store: fmt.Sprintf("%x", sha256.Sum256(store))}
 	if config.Learner != nil {
-		identity.LearnerTokenHash = fmt.Sprintf("%x", sha256.Sum256([]byte(config.Learner.Token)))
+		identity.LearnerPublicKey = fmt.Sprintf("%x", config.Learner.PublicKey[:])
 	}
 	return identity
 }

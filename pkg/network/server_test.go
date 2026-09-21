@@ -96,6 +96,20 @@ func mustCore(t testing.TB, nodeID quepaxa.NodeID, members []quepaxa.Member, wal
 	return core
 }
 
+// testMember builds a member whose published key matches the private token a
+// test process would run with. Membership itself never carries the token.
+func testMember(clusterID types.ClusterID, id quepaxa.NodeID, token string) quepaxa.Member {
+	return quepaxa.Member{ID: id, PublicKey: quepaxa.PublicKey(PeerPublicKey(clusterID, id, token))}
+}
+
+// adminTransport builds a non-voting client that authenticates only the
+// read-only sync path with the cluster admin token.
+func adminTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, adminToken string) *Transport {
+	transport := NewTransport(clusterID, localID, config, "")
+	transport.adminToken = adminToken
+	return transport
+}
+
 func TestLocalProposerAppliesAlreadyDecidedValue(t *testing.T) {
 	wal, err := qlog.Open(t.TempDir() + "/qlog")
 	if err != nil {
@@ -532,7 +546,7 @@ func TestQuiesceTimeoutKeepsAdmissionClosedUntilDrain(t *testing.T) {
 }
 
 func TestCatchUpCompactionTriggersHandler(t *testing.T) {
-	member := quepaxa.Member{ID: "n1", Token: "secret"}
+	member := testMember("cluster", "n1", "secret")
 	source := mustCore(t, member.ID, []quepaxa.Member{member}, nil, nil)
 	source.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
 	if _, _, err := source.Propose(context.Background(), []byte("state")); err != nil {
@@ -564,7 +578,7 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	defer sourceServer.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	peer, err := StartPeerServer(ctx, "127.0.0.1:0", sourceServer, []quepaxa.Member{member}, "admin-secret")
+	peer, err := StartPeerServer(ctx, "127.0.0.1:0", sourceServer, []quepaxa.Member{member}, "secret", "admin-secret")
 	if err != nil {
 		t.Fatal(err)
 	}

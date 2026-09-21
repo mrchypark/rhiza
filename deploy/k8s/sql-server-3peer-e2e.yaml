@@ -11,6 +11,10 @@ metadata:
 type: Opaque
 stringData:
   token: rhiza-local-e2e-peer-token
+  # One Pod template cannot mount a distinct Secret per replica, so every Pod
+  # receives the map and selects its own entry by RHIZA_NODE_ID.
+  peer_tokens: >-
+    {"rhiza-sql-0":"rhiza-sql-0-voter-token","rhiza-sql-1":"rhiza-sql-1-voter-token","rhiza-sql-2":"rhiza-sql-2-voter-token"}
 ---
 apiVersion: v1
 kind: Service
@@ -103,11 +107,16 @@ spec:
                 secretKeyRef:
                   name: rhiza-peer-auth
                   key: token
+            - name: RHIZA_PEER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: rhiza-peer-auth
+                  key: peer_tokens
             - name: GOMEMLIMIT
               value: 384MiB
             - name: RHIZA_CLUSTER_MEMBERS
               value: >-
-                [{"node_id":"rhiza-sql-0","url":"http://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","token":"rhiza-sql-0-voter-token"},{"node_id":"rhiza-sql-1","url":"http://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","token":"rhiza-sql-1-voter-token"},{"node_id":"rhiza-sql-2","url":"http://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","token":"rhiza-sql-2-voter-token"}]
+                [{"node_id":"rhiza-sql-0","url":"http://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-0.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","public_key":"1KW8LQrrJehDnMdxTpVLg0A07vojn7KOdlig8FOFUUk="},{"node_id":"rhiza-sql-1","url":"http://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-1.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","public_key":"s9JYsfmRegWw6WGDgBZ6nNCuMePjHUUxSjWqgzHGLuQ="},{"node_id":"rhiza-sql-2","url":"http://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:8080","peer_url":"quic://rhiza-sql-2.rhiza-sql-headless.rhiza-3peer-e2e.svc.cluster.local:9090","public_key":"Wj5v6HxpgYZrOpKMKM+Itr7wliDp40/QUfHnk0aZ7kk="}]
           ports:
             - name: http
               containerPort: 8080

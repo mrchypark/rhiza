@@ -122,8 +122,8 @@ func validateVoterMembership(config *types.ExecutionConfig) error {
 		local = local || member.ID == config.NodeID
 	}
 	if config.Learner != nil {
-		if !config.EnableReconfiguration || local || config.Learner.ID != config.NodeID || config.Learner.Token == "" || config.Learner.Token == config.AdminToken {
-			return fmt.Errorf("learner requires reconfiguration, a new local ID, and its own token")
+		if !config.EnableReconfiguration || local || config.Learner.ID != config.NodeID || config.Learner.PublicKey == (quepaxa.PublicKey{}) {
+			return fmt.Errorf("learner requires reconfiguration, a new local ID, and its own public key")
 		}
 	} else if !local {
 		return fmt.Errorf("local node %q is not a voter member", config.NodeID)
@@ -150,12 +150,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		return err
 	}
 	if len(n.config.Members) > 1 {
+		if n.config.PeerToken == "" {
+			return fmt.Errorf("peer token is required for multi-node clusters")
+		}
+		if n.config.PeerToken == n.config.AdminToken {
+			return fmt.Errorf("admin token must differ from the peer token")
+		}
 		for _, member := range n.config.Members {
-			if member.Token == "" {
-				return fmt.Errorf("voter token is required for multi-node cluster member %s", member.ID)
-			}
-			if n.config.AdminToken != "" && member.Token == n.config.AdminToken {
-				return fmt.Errorf("admin token must differ from voter token for %s", member.ID)
+			if member.PublicKey == (quepaxa.PublicKey{}) {
+				return fmt.Errorf("voter public key is required for multi-node cluster member %s", member.ID)
 			}
 		}
 	}
@@ -321,11 +324,19 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 
 	// 5. Create consensus core through the same public API available to external users.
 	cluster := n.loadClusterConfig()
-	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
+	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
-		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.AdminToken)
+		n.catchUp = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+	}
+	// An unpromoted learner holds no voting identity, so it authenticates its
+	// read-only sync with the cluster admin token until its promotion applies.
+	if n.config.Learner != nil {
+		transport.SetAdminToken(n.config.AdminToken)
+		if n.catchUp != nil {
+			n.catchUp.SetAdminToken(n.config.AdminToken)
+		}
 	}
 	makeCore := quepaxa.New
 	if n.config.Learner != nil {
@@ -475,9 +486,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	server.SetCompactedHandler(n.wakeCatchUp)
 	var peer *network.PeerServer
 	if n.config.Learner != nil {
-		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken, *n.config.Learner)
+		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner)
 	} else {
-		peer, err = network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.AdminToken)
+		peer, err = network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.PeerToken, n.config.AdminToken)
 	}
 	if err != nil {
 		return fmt.Errorf("listen peer QUIC: %w", err)

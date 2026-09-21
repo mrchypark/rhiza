@@ -575,7 +575,9 @@ pub struct MembershipMember {
     pub peer_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub log_url: String,
-    pub token: String,
+    /// Base64 Ed25519 peer identity key. The matching private token never
+    /// leaves the owning process configuration.
+    pub public_key: String,
     pub wal_identity: String,
 }
 
@@ -624,11 +626,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn membership_wire_credentials_are_sent_but_not_debugged() {
+    fn membership_wire_carries_only_the_public_identity() {
         let member = MembershipMember {
             id: "new-voter".into(),
             peer_url: "quic://127.0.0.1:9000".into(),
-            token: "private-peer-token".into(),
+            public_key: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".into(),
             wal_identity: "ab".repeat(32),
             ..Default::default()
         };
@@ -643,11 +645,14 @@ mod tests {
         };
         let wire = serde_json::to_value(&change).unwrap();
         assert_eq!(wire["add"]["node_id"], "new-voter");
-        assert_eq!(wire["add"]["token"], "private-peer-token");
+        assert_eq!(
+            wire["add"]["public_key"],
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+        );
         assert_eq!(wire["add"]["wal_identity"], "ab".repeat(32));
         assert_eq!(wire["expected_abort_slot"], 17);
         assert!(wire["add"].get("id").is_none());
-        assert!(!format!("{change:?}").contains("private-peer-token"));
+        assert!(wire["add"].get("token").is_none());
     }
     use std::{
         io::{Read, Write},

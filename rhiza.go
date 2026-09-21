@@ -23,11 +23,18 @@ import (
 
 type Member = quepaxa.Member
 type NodeID = quepaxa.NodeID
+type PublicKey = quepaxa.PublicKey
 type ReplicaMember = network.PeerIdentity
 
 // NewReplicaMember removes a voter's secret while retaining its pinned peer identity.
 func NewReplicaMember(clusterID string, member Member) (ReplicaMember, error) {
 	return network.NewPeerIdentity(types.ClusterID(clusterID), member)
+}
+
+// PeerPublicKey derives the public member identity a peer token grants to one
+// node, so embedders can publish members without replicating the secret.
+func PeerPublicKey(clusterID, nodeID, token string) PublicKey {
+	return quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), quepaxa.NodeID(nodeID), token))
 }
 
 type SQLStatement = types.SQLStatement
@@ -74,6 +81,9 @@ type Config struct {
 	BindAddr   string
 	PeerAddr   string
 	AdminToken string
+	// PeerToken is this process's private peer identity secret. Members carry
+	// only public identity, so a replicated membership never holds a secret.
+	PeerToken  string
 	Members    []Member
 	// EnableReconfiguration enables externally fenced voter replacement.
 	// All voters must opt in; workload fencing and learner provisioning are external.
@@ -233,7 +243,7 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	return &types.ExecutionConfig{
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
-		AdminToken: config.AdminToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
+		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
 		ObjStoreEndpoint: config.ObjStoreEndpoint, ObjStoreBucket: config.ObjStoreBucket,
 		ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir, ObjStorePrefix: config.ObjStorePrefix,
 		ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure, ObjStoreRetries: config.ObjStoreRetries,

@@ -12,8 +12,16 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+// learnerMember builds the replicated learner record a Secret stores: public
+// identity only, derived from the node-private peer token.
+func learnerMember(clusterID, name string) quepaxa.Member {
+	return quepaxa.Member{ID: quepaxa.NodeID(name), URL: "http://" + name + ":8080", PeerURL: "quic://" + name + ":9090", PublicKey: quepaxa.PublicKey(network.PeerPublicKey(types.ClusterID(clusterID), quepaxa.NodeID(name), "tok"))}
+}
 
 // --- STS fixture ---
 
@@ -34,6 +42,9 @@ func learnerSTS(t *testing.T) object {
 						object{"name": "RHIZA_CLUSTER_ID", "value": "source"},
 						object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"},
 					},
+					// The voter token map reaches the container through envFrom, not
+					// through an inline entry; the learner template inherits it.
+					"envFrom":      []any{object{"secretRef": object{"name": "rhiza-peer-credentials"}}},
 					"volumeMounts": []any{object{"name": "data", "mountPath": "/data"}},
 				}},
 				"volumes": []any{object{"name": "data", "emptyDir": object{}}},
@@ -74,6 +85,13 @@ func (a *learnerAPI) serve(w http.ResponseWriter, r *http.Request) {
 
 	// GET /secrets/{name}
 	if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/secrets/") {
+		// The source voter token map the learner template inherits via envFrom.
+		if strings.HasSuffix(r.URL.Path, "/rhiza-peer-credentials") {
+			json.NewEncoder(w).Encode(object{"data": object{
+				"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString([]byte(`{"rhiza-0":"chaos-peer-0"}`)),
+			}})
+			return
+		}
 		if a.secretExists && a.secret != nil {
 			json.NewEncoder(w).Encode(a.secret)
 			return
@@ -166,11 +184,11 @@ func learnerFixture(t *testing.T) (context.Context, *learnerAPI, *Controller) {
 
 func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 	ctx, api, c := learnerFixture(t)
-	m, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-a")
+	m, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.ID != "l-a" || m.URL == "" || m.PeerURL == "" || m.Token == "" {
+	if m.ID != "l-a" || m.URL == "" || m.PeerURL == "" || m.PublicKey == (quepaxa.PublicKey{}) {
 		t.Fatalf("incomplete member: %+v", m)
 	}
 	if !api.secretExists || !api.serviceExists || !api.podExists {
@@ -179,6 +197,13 @@ func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 	if api.secret["immutable"] != true {
 		t.Fatal("secret not immutable")
 	}
+	secretData := asObject(api.secret["data"])
+	if _, ok := secretData["member"]; !ok {
+		t.Fatal("secret lacks the replicated member record")
+	}
+	if _, ok := secretData["RHIZA_PEER_TOKEN"]; !ok {
+		t.Fatal("secret lacks the node-private peer token")
+	}
 	if api.service["spec"].(object)["clusterIP"] != "None" {
 		t.Fatal("service not headless")
 	}
@@ -186,7 +211,7 @@ func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 		t.Fatal("learner DNS must resolve before voting readiness")
 	}
 	ctr := asObject(list(nested(api.pod, "spec", "containers"))[0])
-	found := false
+	found, cleared := false, false
 	for _, item := range list(ctr["env"]) {
 		entry := asObject(item)
 		if str(entry["name"]) == "RHIZA_LEARNER" {
@@ -195,6 +220,22 @@ func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 				t.Fatal("learner credential must remain a Secret reference")
 			}
 		}
+		if str(entry["name"]) == "RHIZA_PEER_TOKEN" {
+			if nested(entry, "valueFrom", "secretKeyRef", "key") != "RHIZA_PEER_TOKEN" || entry["value"] != nil {
+				t.Fatal("peer token must remain a Secret reference")
+			}
+		}
+		if str(entry["name"]) == "RHIZA_PEER_TOKENS" {
+			// The source envFrom still supplies the voter map; without this
+			// empty override the learner refuses to start.
+			if entry["value"] != "" || entry["valueFrom"] != nil {
+				t.Fatalf("voter token map must be cleared for a learner: %+v", entry)
+			}
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("learner environment must clear the inherited voter token map")
 	}
 	if !found {
 		t.Fatal("learner environment missing")
@@ -217,18 +258,18 @@ func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 // on retry causes the stored secret to never match.
 func TestReuseAcrossFreshControllers(t *testing.T) {
 	ctx, api, c := learnerFixture(t)
-	m1, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-reuse")
+	m1, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-reuse")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// New controller, same API state (secret exists).
 	c2 := &Controller{Kube: api.kube(t)}
-	m2, err := c2.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-reuse")
+	m2, err := c2.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-reuse")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m1.Token != m2.Token {
-		t.Fatalf("tokens differ across controllers: %q vs %q", m1.Token, m2.Token)
+	if m1.PublicKey != m2.PublicKey {
+		t.Fatalf("public identities differ across controllers: %x vs %x", m1.PublicKey, m2.PublicKey)
 	}
 	if m1.URL != m2.URL || m1.PeerURL != m2.PeerURL {
 		t.Fatalf("endpoints differ: %+v vs %+v", m1, m2)
@@ -243,7 +284,7 @@ func TestRejectsDifferentOwner(t *testing.T) {
 	api0 := newLearnerAPI(t)
 	defer api0.Close()
 	c0 := &Controller{Kube: api0.kube(t)}
-	_, err := c0.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-own")
+	_, err := c0.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-own")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,15 +293,15 @@ func TestRejectsDifferentOwner(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/secrets/") {
 			meta := object{"name": "l-own-credentials", "annotations": object{ownerAnnotation: "op-1"}}
-			data := base64.StdEncoding.EncodeToString(jsonBytes(quepaxa.Member{ID: "l-own", URL: "http://l-own:8080", PeerURL: "quic://l-own:9090", Token: "tok"}))
-			json.NewEncoder(w).Encode(object{"immutable": true, "metadata": meta, "data": object{"member": data}})
+			data := base64.StdEncoding.EncodeToString(jsonBytes(learnerMember("source", "l-own")))
+			json.NewEncoder(w).Encode(object{"immutable": true, "metadata": meta, "data": object{"member": data, "RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte("tok"))}})
 			return
 		}
 		http.NotFound(w, r)
 	}))}
 	defer api.Close()
 	c2 := &Controller{Kube: api.kube(t)}
-	_, err = c2.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-2", "l-own")
+	_, err = c2.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-2", "source", "l-own")
 	if err == nil || !strings.Contains(err.Error(), "another operation") {
 		t.Fatalf("expected owner conflict, got: %v", err)
 	}
@@ -268,12 +309,12 @@ func TestRejectsDifferentOwner(t *testing.T) {
 
 func TestRejectsDeletingPod(t *testing.T) {
 	ctx, api, c := learnerFixture(t)
-	_, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-del")
+	_, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-del")
 	if err != nil {
 		t.Fatal(err)
 	}
 	api.podDeleting = true
-	_, err = c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-del")
+	_, err = c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-del")
 	if err == nil || !strings.Contains(err.Error(), "being deleted") {
 		t.Fatalf("expected deleting error, got: %v", err)
 	}
@@ -286,14 +327,14 @@ func TestRejectsNonImmutableSecret(t *testing.T) {
 	api := &learnerAPI{server: httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/secrets/") {
-			json.NewEncoder(w).Encode(object{"immutable": false, "metadata": object{"name": "l-mut-credentials", "annotations": object{ownerAnnotation: "op-1"}}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(quepaxa.Member{ID: "l-mut", URL: "http://l-mut:8080", PeerURL: "quic://l-mut:9090", Token: "tok"}))}})
+			json.NewEncoder(w).Encode(object{"immutable": false, "metadata": object{"name": "l-mut-credentials", "annotations": object{ownerAnnotation: "op-1"}}, "data": object{"member": base64.StdEncoding.EncodeToString(jsonBytes(learnerMember("source", "l-mut"))), "RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte("tok"))}})
 			return
 		}
 		http.NotFound(w, r)
 	}))}
 	defer api.Close()
 	c2 := &Controller{Kube: api.kube(t)}
-	_, err := c2.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-mut")
+	_, err := c2.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-mut")
 	if err == nil || !strings.Contains(err.Error(), "not immutable") {
 		t.Fatalf("expected immutable error, got: %v", err)
 	}
@@ -302,18 +343,18 @@ func TestRejectsNonImmutableSecret(t *testing.T) {
 func TestRejectsCredentialMismatch(t *testing.T) {
 	ctx := context.Background()
 	sts := learnerSTS(t)
-	wrongData := base64.StdEncoding.EncodeToString(jsonBytes(quepaxa.Member{ID: "wrong-id", URL: "http://wrong", PeerURL: "quic://wrong", Token: "tok"}))
+	wrongData := base64.StdEncoding.EncodeToString(jsonBytes(learnerMember("source", "wrong-id")))
 	api := &learnerAPI{server: httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/secrets/") {
-			json.NewEncoder(w).Encode(object{"immutable": true, "metadata": object{"name": "l-mismatch-credentials", "annotations": object{ownerAnnotation: "op-1"}}, "data": object{"member": wrongData}})
+			json.NewEncoder(w).Encode(object{"immutable": true, "metadata": object{"name": "l-mismatch-credentials", "annotations": object{ownerAnnotation: "op-1"}}, "data": object{"member": wrongData, "RHIZA_PEER_TOKEN": base64.StdEncoding.EncodeToString([]byte("tok"))}})
 			return
 		}
 		http.NotFound(w, r)
 	}))}
 	defer api.Close()
 	c2 := &Controller{Kube: api.kube(t)}
-	_, err := c2.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-mismatch")
+	_, err := c2.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-mismatch")
 	if err == nil || !strings.Contains(err.Error(), "do not match") {
 		t.Fatalf("expected mismatch error, got: %v", err)
 	}
@@ -323,7 +364,7 @@ func TestRejectsHostNetwork(t *testing.T) {
 	ctx, _, c := learnerFixture(t)
 	sts := learnerSTS(t)
 	asObject(nested(sts, "spec", "template", "spec"))["hostNetwork"] = true
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-hn")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-hn")
 	if err == nil || !strings.Contains(err.Error(), "hostNetwork") {
 		t.Fatalf("expected hostNetwork error, got: %v", err)
 	}
@@ -335,7 +376,7 @@ func TestRejectsSidecar(t *testing.T) {
 	containers := list(nested(sts, "spec", "template", "spec", "containers"))
 	containers = append(containers, object{"name": "sidecar"})
 	asObject(nested(sts, "spec", "template", "spec"))["containers"] = containers
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-sc")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-sc")
 	if err == nil || !strings.Contains(err.Error(), "exactly one container") {
 		t.Fatalf("expected sidecar error, got: %v", err)
 	}
@@ -346,7 +387,7 @@ func TestRejectsMissingHTTPPort(t *testing.T) {
 	sts := learnerSTS(t)
 	ctr, _ := container(sts, "rhiza")
 	ctr["ports"] = []any{asObject(list(ctr["ports"])[1])} // only peer-quic
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-np")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-np")
 	if err == nil || !strings.Contains(err.Error(), "http") {
 		t.Fatalf("expected http port error, got: %v", err)
 	}
@@ -360,7 +401,7 @@ func TestRejectsUDPHTTPPort(t *testing.T) {
 		object{"name": "http", "containerPort": float64(8080), "protocol": "UDP"},
 		object{"name": "peer-quic", "containerPort": float64(9090), "protocol": "UDP"},
 	}
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-udp")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-udp")
 	if err == nil || !strings.Contains(err.Error(), "http port must be TCP") {
 		t.Fatalf("expected TCP error, got: %v", err)
 	}
@@ -374,7 +415,7 @@ func TestRejectsTCPPeerPort(t *testing.T) {
 		object{"name": "http", "containerPort": float64(8080)},
 		object{"name": "peer-quic", "containerPort": float64(9090), "protocol": "TCP"},
 	}
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-tcp")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-tcp")
 	if err == nil || !strings.Contains(err.Error(), "peer-quic port must be UDP") {
 		t.Fatalf("expected UDP error, got: %v", err)
 	}
@@ -384,7 +425,7 @@ func TestRejectsPVC(t *testing.T) {
 	ctx, _, c := learnerFixture(t)
 	sts := learnerSTS(t)
 	asObject(sts["spec"])["volumeClaimTemplates"] = []any{object{"metadata": object{"name": "data"}}}
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-pvc")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-pvc")
 	if err == nil || !strings.Contains(err.Error(), "volumeClaimTemplates") {
 		t.Fatalf("expected PVC error, got: %v", err)
 	}
@@ -392,12 +433,12 @@ func TestRejectsPVC(t *testing.T) {
 
 func TestRejectsServiceBadOwner(t *testing.T) {
 	ctx, api, c := learnerFixture(t)
-	_, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-svc")
+	_, err := c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-svc")
 	if err != nil {
 		t.Fatal(err)
 	}
 	api.serviceBadOwner = true
-	_, err = c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "l-svc")
+	_, err = c.ensureAutomaticLearner(ctx, learnerSTS(t), "rhiza", "op-1", "source", "l-svc")
 	if err == nil || !strings.Contains(err.Error(), "another operation") {
 		t.Fatalf("expected owner conflict, got: %v", err)
 	}
@@ -409,7 +450,7 @@ func TestPreservesReadinessProbe(t *testing.T) {
 	ctr, _ := container(sts, "rhiza")
 	ctr["readinessProbe"] = object{"httpGet": object{"path": "/ready", "port": float64(8080)}}
 	ctr["livenessProbe"] = object{"httpGet": object{"path": "/healthz", "port": float64(8080)}}
-	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "l-prb")
+	_, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-prb")
 	if err != nil {
 		t.Fatal(err)
 	}

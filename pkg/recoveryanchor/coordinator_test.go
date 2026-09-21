@@ -127,7 +127,7 @@ func makeRequest(anchorID, opID string) Request {
 			PrefixHash:   hex64('c'),
 			ManifestHash: hex64('d'),
 		},
-		TargetMembership: recovery.MembershipRecord{Version: 1, Cluster: "tgt", Membership: "mem", Durability: "async"},
+		TargetMembership: recovery.MembershipRecord{Version: recovery.MembershipRecordVersion, Cluster: "tgt", Membership: "mem", Durability: "async"},
 	}
 }
 
@@ -545,6 +545,24 @@ func TestValidateRequestRejectsNilBackend(t *testing.T) {
 	_, err := co.Activate(context.Background(), makeRequest("a1", "op1"))
 	if err == nil {
 		t.Fatal("expected error for nil backend")
+	}
+}
+
+// TestValidateRequestAcceptsCurrentMembershipVersion pins the membership
+// record version the coordinator accepts to the one the recovery package
+// produces. It failed when the coordinator kept comparing against the anchor
+// record version constant, so every activation was rejected with HTTP 400.
+func TestValidateRequestAcceptsCurrentMembershipVersion(t *testing.T) {
+	be := newInMemoryBackend()
+	seedRecord(be, "a1", seededRecord(Binding{ClusterID: "src", StorageID: "src/pfx"}, 0, []byte("ev")))
+	co := &Coordinator{Backend: be, EvidenceFormat: "test/v1", Verifier: goodVerifier}
+	if err := co.validateRequest(makeRequest("a1", "op1")); err != nil {
+		t.Fatalf("current membership version rejected: %v", err)
+	}
+	req := makeRequest("a1", "op1")
+	req.TargetMembership.Version = recovery.MembershipRecordVersion - 1
+	if err := co.validateRequest(req); err == nil {
+		t.Fatal("superseded membership version accepted")
 	}
 }
 

@@ -22,7 +22,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const peerALPN = "rhiza-peer"
+const peerALPN = "rhiza-peer-v2"
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
 
@@ -50,8 +50,12 @@ type Transport struct {
 	clusterID types.ClusterID
 	configID  uint
 	localID   quepaxa.NodeID
-	token     string
-	fallback  string
+	// peerToken is the local process's private identity secret. It never
+	// travels on the wire and is not part of any replicated configuration.
+	peerToken string
+	// adminToken authenticates the read-only sync path of a non-voting client
+	// that has no peer identity of its own.
+	adminToken string
 	tls       *tls.Config
 	quic      *quic.Config
 	peers     map[quepaxa.NodeID]*peerConnection
@@ -64,9 +68,14 @@ type Transport struct {
 	closed     bool
 }
 
-func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string) *Transport {
-	return newTransport(clusterID, localID, config, token, nil)
+func NewTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string) *Transport {
+	return newTransport(clusterID, localID, config, peerToken, nil)
 }
+
+// SetAdminToken lets a process without voter identity (a learner before its
+// promotion) authenticate the read-only sync path with the cluster admin
+// token. Voters keep authenticating with their peer certificate.
+func (t *Transport) SetAdminToken(token string) { t.adminToken = token }
 
 // PeerIdentity is the token-free endpoint and pinned TLS identity of a voter.
 type PeerIdentity struct {
@@ -81,35 +90,33 @@ func NewPeerIdentity(clusterID types.ClusterID, member quepaxa.Member) (PeerIden
 	if peerURL == "" {
 		peerURL = member.URL
 	}
-	if clusterID == "" || member.ID == "" || peerURL == "" || member.Token == "" {
-		return PeerIdentity{}, fmt.Errorf("cluster ID, voter ID, peer URL, and voter token are required")
+	if clusterID == "" || member.ID == "" || peerURL == "" || member.PublicKey == (quepaxa.PublicKey{}) {
+		return PeerIdentity{}, fmt.Errorf("cluster ID, voter ID, peer URL, and voter public key are required")
 	}
-	return PeerIdentity{ID: member.ID, PeerURL: peerURL, PublicKey: [ed25519.PublicKeySize]byte(peerPublicKey(clusterID, member.ID, member.Token))}, nil
+	return PeerIdentity{ID: member.ID, PeerURL: peerURL, PublicKey: [ed25519.PublicKeySize]byte(member.PublicKey)}, nil
 }
 
 // NewLearnerTransport creates a read-only transport without retaining voter tokens.
-func NewLearnerTransport(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, token string) *Transport {
+func NewLearnerTransport(clusterID types.ClusterID, localID quepaxa.NodeID, configID uint, peers []PeerIdentity, adminToken string) *Transport {
 	members := make([]quepaxa.Member, 0, len(peers))
 	keys := make(map[quepaxa.NodeID]ed25519.PublicKey, len(peers))
 	for _, peer := range peers {
-		members = append(members, quepaxa.Member{ID: peer.ID, PeerURL: peer.PeerURL})
+		members = append(members, quepaxa.Member{ID: peer.ID, PeerURL: peer.PeerURL, PublicKey: quepaxa.PublicKey(peer.PublicKey)})
 		keys[peer.ID] = append(ed25519.PublicKey(nil), peer.PublicKey[:]...)
 	}
-	return newTransport(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, token, keys)
+	learner := newTransport(clusterID, localID, &quepaxa.Cluster{ConfigID: configID, Members: members}, "", keys)
+	learner.adminToken = adminToken
+	return learner
 }
 
-func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, token string, keys map[quepaxa.NodeID]ed25519.PublicKey) *Transport {
+func newTransport(clusterID types.ClusterID, localID quepaxa.NodeID, config *quepaxa.Cluster, peerToken string, keys map[quepaxa.NodeID]ed25519.PublicKey) *Transport {
 	peers := make(map[quepaxa.NodeID]*peerConnection, len(config.Members))
 	for _, member := range config.Members {
 		peers[member.ID] = &peerConnection{gate: make(chan struct{}, 1), active: make(map[*quic.Conn]int)}
 	}
-	localToken := token
-	if member, ok := config.MemberSet()[localID]; ok && member.Token != "" {
-		localToken = member.Token
-	}
 	return &Transport{
 		members: config.MemberSet(), clusterID: clusterID, configID: config.ConfigID,
-		localID: localID, token: localToken, fallback: token, peers: peers, peerKeys: keys,
+		localID: localID, peerToken: peerToken, peers: peers, peerKeys: keys,
 		tls: &tls.Config{
 			MinVersion: tls.VersionTLS13, NextProtos: []string{peerALPN},
 			ClientSessionCache: tls.NewLRUClientSessionCache(len(config.Members)),
@@ -179,7 +186,8 @@ func (t *Transport) transportForID(id uint, snapshot func() quepaxa.Cluster) (*T
 	// Each immutable configuration owns its pools and TLS session cache. A
 	// changed voter token therefore cannot reuse a previous configuration's
 	// connection or 0-RTT ticket.
-	peer := newTransport(t.clusterID, t.localID, &config, t.fallback, nil)
+	peer := newTransport(t.clusterID, t.localID, &config, t.peerToken, nil)
+	peer.adminToken = t.adminToken
 	t.dynamic[config.ConfigID] = peer
 	return peer, nil
 }
@@ -199,7 +207,7 @@ func (t *Transport) transportForCurrent() (*Transport, error) {
 }
 
 func (t *Transport) request(operation peerfb.Operation) *peerfb.RequestT {
-	return &peerfb.RequestT{Operation: operation, ClusterId: string(t.clusterID), SenderId: string(t.localID), ConfigId: uint64(t.configID), Token: t.token}
+	return &peerfb.RequestT{Operation: operation, ClusterId: string(t.clusterID), SenderId: string(t.localID), ConfigId: uint64(t.configID), AdminToken: t.adminToken}
 }
 
 func memberQUICAddr(member quepaxa.Member) (string, error) {
@@ -214,7 +222,7 @@ func memberQUICAddr(member quepaxa.Member) (string, error) {
 	return endpoint.Host, nil
 }
 
-func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHandshake bool) (*quic.Conn, error) {
+func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (*quic.Conn, error) {
 	member, ok := t.members[to]
 	if !ok {
 		return nil, fmt.Errorf("unknown node: %s", to)
@@ -235,18 +243,23 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 		}
 		tlsConfig := t.tls.Clone()
 		tlsConfig.ServerName = string(to)
-		identityToken := member.Token
-		if identityToken == "" {
-			identityToken = t.fallback
-		}
-		if identityToken == "" && len(t.members) > 1 {
-			return nil, fmt.Errorf("peer identity token is required for %s", to)
-		}
 		expectedKey := t.peerKeys[to]
 		if len(expectedKey) == 0 {
-			expectedKey = peerPublicKey(t.clusterID, to, identityToken)
+			if member.PublicKey == (quepaxa.PublicKey{}) {
+				return nil, fmt.Errorf("peer public key is required for %s", to)
+			}
+			expectedKey = ed25519.PublicKey(member.PublicKey[:])
 		}
-		tlsConfig.InsecureSkipVerify = true // Exact token-bound Ed25519 key pin is verified below.
+		// A voter presents its own peer-token-derived certificate so the
+		// listener can authorize voting RPCs from the handshake identity.
+		if t.peerToken != "" {
+			certificate, err := peerCertificate(t.clusterID, t.localID, t.peerToken)
+			if err != nil {
+				return nil, err
+			}
+			tlsConfig.Certificates = []tls.Certificate{certificate}
+		}
+		tlsConfig.InsecureSkipVerify = true // Exact public-key pin is verified below.
 		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) != 1 {
 				return fmt.Errorf("peer %s presented %d certificates", to, len(state.PeerCertificates))
@@ -263,86 +276,62 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID, waitHands
 			return nil, err
 		}
 	}
-	if waitHandshake {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-peer.conn.HandshakeComplete():
-		}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-peer.conn.HandshakeComplete():
 	}
 	conn := peer.conn
 	peer.active[conn]++
 	return conn, nil
 }
 
-func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
-	return t.callWithTimeout(ctx, to, request, waitHandshake, peerRPCTimeout)
+func (t *Transport) call(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
+	return t.callWithTimeout(ctx, to, request, peerRPCTimeout)
 }
 
-func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool, timeout time.Duration) (*peerfb.ResponseT, error) {
+func (t *Transport) callWithTimeout(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, timeout time.Duration) (*peerfb.ResponseT, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return t.callContext(ctx, to, request, waitHandshake)
+	return t.callContext(ctx, to, request)
 }
 
 // callQuorum sends one asynchronous quorum attempt. A failed recorder does not
 // need an in-phase retry: the enclosing quorum completes from other replies.
-func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
-	return t.callContext(ctx, to, request, waitHandshake)
+func (t *Transport) callQuorum(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
+	return t.callContext(ctx, to, request)
 }
 
-func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT, waitHandshake bool) (*peerfb.ResponseT, error) {
-	waitHandshake = waitHandshake || !allows0RTT(request.Operation)
-	for retried0RTT := false; ; {
-		conn, err := t.connection(ctx, to, waitHandshake)
-		if err != nil {
+// callContext always waits for the TLS handshake. Voting authorization is
+// bound to the certificate the peer presents during the handshake, so a
+// request must never be accepted (or sent) as replayable early data.
+func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
+	conn, err := t.connection(ctx, to)
+	if err != nil {
+		return nil, err
+	}
+	response, err := t.callConnection(ctx, conn, request)
+	if err != nil && response == nil {
+		t.invalidate(to, conn)
+	}
+	t.release(to, conn)
+	if response != nil {
+		switch response.ErrorCode {
+		case peerErrorQuorum:
+			return nil, quepaxa.ErrQuorumUnavailable
+		case peerErrorCompacted:
+			return nil, quepaxa.ErrCompacted
+		case peerErrorRetryable:
 			return nil, err
 		}
-		response, err := t.callConnection(ctx, conn, request)
-		if errors.Is(err, quic.Err0RTTRejected) && !retried0RTT {
-			t.release(to, conn)
-			// The early stream was discarded, not executed. Promote this same
-			// connection to 1-RTT and replay the request once within its original
-			// deadline. This prevents a peer restart from consuming one whole
-			// periodic catch-up round (or a remaining quorum attempt).
-			if _, nextErr := conn.NextConnection(ctx); nextErr != nil {
-				t.invalidate(to, conn)
-				return nil, nextErr
-			}
-			retried0RTT = true
-			continue
-		}
-		if err != nil && response == nil {
-			t.invalidate(to, conn)
-		}
-		t.release(to, conn)
+	}
+	if err != nil {
 		if response != nil {
-			switch response.ErrorCode {
-			case peerErrorQuorum:
-				return nil, quepaxa.ErrQuorumUnavailable
-			case peerErrorCompacted:
-				return nil, quepaxa.ErrCompacted
-			case peerErrorRetryable:
-				return nil, err
-			}
+			return nil, fmt.Errorf("%w: %v", errPeerRejected, err)
 		}
-		if err != nil {
-			if response != nil {
-				return nil, fmt.Errorf("%w: %v", errPeerRejected, err)
-			}
-			return nil, err
-		}
-		return response, nil
+		return nil, err
 	}
-}
-
-func allows0RTT(operation peerfb.Operation) bool {
-	switch operation {
-	case peerfb.OperationSync, peerfb.OperationReadIndex, peerfb.OperationFetchValue:
-		return true
-	default:
-		return false
-	}
+	return response, nil
 }
 
 func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
@@ -397,7 +386,7 @@ func (t *Transport) PrepareCheckpoint(ctx context.Context, seal quepaxa.Checkpoi
 		go func(member quepaxa.Member) {
 			request := t.request(peerfb.OperationPrepareCheckpoint)
 			request.Value = value
-			_, err := t.callWithTimeout(callCtx, member.ID, request, false, checkpointPrepareTimeout)
+			_, err := t.callWithTimeout(callCtx, member.ID, request, checkpointPrepareTimeout)
 			results <- err
 		}(member)
 	}
@@ -465,7 +454,7 @@ func (t *Transport) FetchDecisions(ctx context.Context, source quepaxa.NodeID, f
 	}
 	req := t.request(peerfb.OperationSync)
 	req.From, req.Limit = uint64(from), uint32(limit)
-	response, err := t.call(ctx, source, req, false)
+	response, err := t.call(ctx, source, req)
 	if err != nil {
 		return DecisionsResponse{}, err
 	}
@@ -498,7 +487,7 @@ func (t *Transport) SendRecord(ctx context.Context, to quepaxa.NodeID, request q
 	if request.ReconfigurationID != (quepaxa.ValueHash{}) {
 		req.Hash = append([]byte(nil), request.ReconfigurationID[:]...)
 	}
-	response, err := t.callQuorum(ctx, to, req, false)
+	response, err := t.callQuorum(ctx, to, req)
 	if err != nil {
 		return quepaxa.Summary{}, err
 	}
@@ -544,7 +533,7 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 		go func(member quepaxa.Member) {
 			req := t.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
-			_, err := t.callQuorum(callCtx, member.ID, req, false)
+			_, err := t.callQuorum(callCtx, member.ID, req)
 			results <- err
 		}(member)
 	}
@@ -595,7 +584,7 @@ func (t *Transport) sendFreezeDecision(ctx context.Context, decision quepaxa.Dec
 		go func(member quepaxa.Member) {
 			req := t.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
-			_, err := t.callQuorum(callCtx, member.ID, req, false)
+			_, err := t.callQuorum(callCtx, member.ID, req)
 			results <- result{id: member.ID, err: err}
 		}(member)
 	}
@@ -649,7 +638,7 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 			union.Members = append(union.Members, member)
 		}
 	}
-	peer := newTransport(t.clusterID, t.localID, &union, t.fallback, nil)
+	peer := newTransport(t.clusterID, t.localID, &union, t.peerToken, nil)
 	defer peer.Close()
 	type result struct {
 		id  quepaxa.NodeID
@@ -665,7 +654,7 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		go func(member quepaxa.Member) {
 			req := peer.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
-			_, err := peer.callQuorum(ctx, member.ID, req, false)
+			_, err := peer.callQuorum(ctx, member.ID, req)
 			results <- result{id: member.ID, err: err}
 		}(member)
 	}
@@ -737,7 +726,7 @@ func (t *Transport) ReadTip(ctx context.Context, to quepaxa.NodeID) (quepaxa.Slo
 	if peer != t {
 		return peer.ReadTip(ctx, to)
 	}
-	response, err := t.callQuorum(ctx, to, t.request(peerfb.OperationReadIndex), false)
+	response, err := t.callQuorum(ctx, to, t.request(peerfb.OperationReadIndex))
 	if err != nil {
 		return 0, err
 	}
@@ -758,7 +747,7 @@ func (t *Transport) StageValue(ctx context.Context, to quepaxa.NodeID, hash quep
 	request := t.request(peerfb.OperationStageValue)
 	request.Hash = append([]byte(nil), hash[:]...)
 	request.Value = append([]byte(nil), value...)
-	_, err = t.call(ctx, to, request, false)
+	_, err = t.call(ctx, to, request)
 	return err
 }
 
@@ -772,7 +761,7 @@ func (t *Transport) FetchValue(ctx context.Context, from quepaxa.NodeID, hash qu
 	}
 	request := t.request(peerfb.OperationFetchValue)
 	request.Hash = append([]byte(nil), hash[:]...)
-	response, err := t.call(ctx, from, request, false)
+	response, err := t.call(ctx, from, request)
 	if err != nil {
 		return nil, err
 	}
@@ -786,7 +775,7 @@ func (t *Transport) FetchValue(ctx context.Context, from quepaxa.NodeID, hash qu
 // durably contains the exact certified prefix. It is an admission check only;
 // it neither copies data nor changes membership.
 func (t *Transport) VerifyLearner(ctx context.Context, learner quepaxa.Member, through quepaxa.Slot, prefix quepaxa.ValueHash) error {
-	if learner.ID == "" || learner.Token == "" || through == 0 {
+	if learner.ID == "" || learner.PublicKey == (quepaxa.PublicKey{}) || through == 0 {
 		return fmt.Errorf("learner identity and prefix are required")
 	}
 	identity, err := decodeWALIdentity(learner.WALIdentity)
@@ -802,13 +791,13 @@ func (t *Transport) VerifyLearner(ctx context.Context, learner quepaxa.Member, t
 	}
 	probeConfig := config
 	probeConfig.Members = append(append([]quepaxa.Member(nil), config.Members...), learner)
-	probe := newTransport(t.clusterID, t.localID, &probeConfig, t.fallback, nil)
+	probe := newTransport(t.clusterID, t.localID, &probeConfig, t.peerToken, nil)
 	defer probe.Close()
 	request := probe.request(peerfb.OperationVerifyPrefix)
 	request.ConfigId = uint64(config.ConfigID)
 	request.From, request.Hash = uint64(through), append([]byte(nil), prefix[:]...)
 	request.Value = append([]byte(nil), identity[:]...)
-	response, err := probe.call(ctx, learner.ID, request, false)
+	response, err := probe.call(ctx, learner.ID, request)
 	if err != nil {
 		return err
 	}

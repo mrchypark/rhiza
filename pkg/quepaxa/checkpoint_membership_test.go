@@ -135,7 +135,7 @@ func TestCheckpointMembershipColdObserverRestoreAndRejectsTampering(t *testing.T
 	}
 	tampered := seal
 	membership := cloneMembershipRecord(*seal.Membership)
-	membership.Genesis.Members[0].Token = "tampered"
+	membership.Genesis.Members[0].PublicKey = PublicKey{9}
 	tampered.Membership = &membership
 	if err := observer.ValidateCheckpointBase(context.Background(), tampered, decision); err == nil {
 		t.Fatal("accepted tampered membership history")
@@ -171,7 +171,7 @@ func TestCheckpointMembershipProofRespectsValueLimit(t *testing.T) {
 		ConfigID: 1, Index: 1, RootHash: sha256.Sum256([]byte("root")), StateHash: sha256.Sum256([]byte("state")), PrefixHash: sha256.Sum256([]byte("prefix")), NextLeaderOrder: []NodeID{"a"},
 		Membership: &MembershipRecord{Genesis: Cluster{
 			ConfigID: 1,
-			Members:  []Member{{ID: "a", Token: string(make([]byte, MaxReplicatedValueBytes))}},
+			Members:  []Member{{ID: "a", WALIdentity: string(make([]byte, MaxReplicatedValueBytes))}},
 		}},
 	}
 	if _, err := EncodeCheckpointSeal(seal); err == nil {

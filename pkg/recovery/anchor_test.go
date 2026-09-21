@@ -18,7 +18,7 @@ import (
 func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	sourceMembers := []quepaxa.Member{{ID: "old", Token: "old"}}
+	sourceMembers := []quepaxa.Member{{ID: "old", PublicKey: testPublicKey("old")}}
 	w, err := qlog.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	if err := cp.ReleasePublisherClaim(ctx, claim); err != nil {
 		t.Fatal(err)
 	}
-	targetMembers := []quepaxa.Member{{ID: "new", Token: "new"}}
+	targetMembers := []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("new")}}
 	targetMembership := NewMembershipRecord("anchor-source", targetMembers, "async")
 	result, err := Fork(ctx, bucket, ForkOptions{SourcePrefix: "source", TargetPrefix: "anchor-source", SourceBootstrap: quepaxa.Cluster{ConfigID: 1, Members: sourceMembers}, TargetMembers: targetMembers, TargetMembership: targetMembership, OperationID: "op"})
 	if err != nil {
@@ -243,7 +243,7 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	if err := Seal(ctx, bucket, "anchor-source", "b-to-c"); err != nil {
 		t.Fatal(err)
 	}
-	cMembers := []quepaxa.Member{{ID: "third", Token: "third"}}
+	cMembers := []quepaxa.Member{{ID: "third", PublicKey: testPublicKey("third")}}
 	cOptions := ForkOptions{SourcePrefix: "anchor-source", TargetPrefix: "third-generation", SourceBootstrap: quepaxa.Cluster{ConfigID: 1, Members: targetMembers}, TargetMembers: cMembers, TargetMembership: NewMembershipRecord("third-generation", cMembers, "async"), OperationID: "b-to-c"}
 	cResult, err := Fork(ctx, bucket, cOptions)
 	if err != nil || cResult.Tip != uint64(targetCore.Tip()) {
@@ -299,11 +299,11 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	if _, found, err := cState.GraphMutationReceipt(ctx, "dedupe"); err != nil || !found {
 		t.Fatalf("C lost A receipt: found=%v err=%v", found, err)
 	}
-	wrongBootstrap := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "wrong", Token: "wrong"}}}
+	wrongBootstrap := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "wrong", PublicKey: testPublicKey("wrong")}}}
 	if _, err := Fork(ctx, bucket, ForkOptions{SourcePrefix: "source", TargetPrefix: "wrong-bootstrap", SourceBootstrap: wrongBootstrap, TargetMembers: targetMembers, TargetMembership: targetMembership, OperationID: "wrong-bootstrap"}); err == nil {
 		t.Fatal("fork accepted an incorrect source bootstrap")
 	}
-	wrongTarget := NewMembershipRecord("anchor-source", []quepaxa.Member{{ID: "new", Token: "other"}}, "async")
+	wrongTarget := NewMembershipRecord("anchor-source", []quepaxa.Member{{ID: "new", PublicKey: testPublicKey("other")}}, "async")
 	if _, err := Fork(ctx, bucket, ForkOptions{SourcePrefix: "source", TargetPrefix: "wrong-target", SourceBootstrap: quepaxa.Cluster{ConfigID: 1, Members: sourceMembers}, TargetMembers: targetMembers, TargetMembership: wrongTarget, OperationID: "wrong-target"}); err == nil {
 		t.Fatal("fork accepted mismatched target membership")
 	}
@@ -312,7 +312,7 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 func TestForkMaterializesBaseZeroMembershipTransition(t *testing.T) {
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	initial := []quepaxa.Member{{ID: "a", Token: "a"}, {ID: "b", Token: "b"}}
+	initial := []quepaxa.Member{{ID: "a", PublicKey: testPublicKey("a")}, {ID: "b", PublicKey: testPublicKey("b")}}
 	transport := newArchiveTestCluster(t, initial)
 	source := transport.cores["a"]
 	if _, err := source.BeginReconfiguration(ctx, quepaxa.Cluster{ConfigID: 2, Members: initial[:1]}); err != nil {
@@ -329,7 +329,7 @@ func TestForkMaterializesBaseZeroMembershipTransition(t *testing.T) {
 	if err := Seal(ctx, bucket, "base-zero", "base-zero-op"); err != nil {
 		t.Fatal(err)
 	}
-	targetMembers := []quepaxa.Member{{ID: "c", Token: "c"}}
+	targetMembers := []quepaxa.Member{{ID: "c", PublicKey: testPublicKey("c")}}
 	result, err := Fork(ctx, bucket, ForkOptions{
 		SourcePrefix: "base-zero", TargetPrefix: "base-zero-target", SourceBootstrap: quepaxa.Cluster{ConfigID: 1, Members: initial},
 		TargetMembers: targetMembers, TargetMembership: NewMembershipRecord("base-zero-target", targetMembers, "async"), OperationID: "base-zero-op",

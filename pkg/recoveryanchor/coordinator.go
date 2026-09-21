@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 type Coordinator struct {
@@ -73,8 +75,8 @@ func (c *Coordinator) validateRequest(req Request) error {
 	if !validateHex64(req.Fork.PrefixHash) {
 		return fmt.Errorf("fork prefix_hash must be 32-byte hex")
 	}
-	if req.TargetMembership.Version != Version1 {
-		return fmt.Errorf("target_membership version must be 1")
+	if req.TargetMembership.Version != recovery.MembershipRecordVersion {
+		return fmt.Errorf("target_membership version must be %d", recovery.MembershipRecordVersion)
 	}
 	if req.TargetMembership.Cluster != req.TargetClusterID {
 		return fmt.Errorf("target_membership.cluster must match target_cluster_id")

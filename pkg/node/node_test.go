@@ -279,8 +279,8 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dataDir := filepath.Join(t.TempDir(), "data")
 			config := &types.ExecutionConfig{
-				NodeID: "n1", DataDir: dataDir,
-				Members: []types.NodeConfig{{ID: "n1", Token: "token-1"}, {ID: "n2", Token: "token-2"}, {ID: "n3", Token: "token-3"}},
+				NodeID: "n1", DataDir: dataDir, PeerToken: "peer-token",
+				Members: []types.NodeConfig{{ID: "n1", PublicKey: quepaxa.PublicKey{1}}, {ID: "n2", PublicKey: quepaxa.PublicKey{2}}, {ID: "n3", PublicKey: quepaxa.PublicKey{3}}},
 			}
 			configure(config)
 			err := New(config).Open(context.Background())
@@ -294,10 +294,12 @@ func TestMultiNodeFilesystemObjectStoreFailsClosed(t *testing.T) {
 	}
 }
 
-func TestMultiNodeVoterTokensAreDistinctFromAdmin(t *testing.T) {
+func TestMultiNodePeerIdentityIsRequiredAndDistinctFromAdmin(t *testing.T) {
 	for name, config := range map[string]*types.ExecutionConfig{
-		"missing voter token": {NodeID: "n1", Members: []types.NodeConfig{{ID: "n1"}, {ID: "n2", Token: "voter-2"}}},
-		"admin token reused":  {NodeID: "n1", AdminToken: "shared", Members: []types.NodeConfig{{ID: "n1", Token: "shared"}, {ID: "n2", Token: "voter-2"}}},
+		"missing peer token": {NodeID: "n1", Members: []types.NodeConfig{{ID: "n1", PublicKey: quepaxa.PublicKey{1}}, {ID: "n2", PublicKey: quepaxa.PublicKey{2}}}},
+		"admin token reused": {NodeID: "n1", AdminToken: "shared", PeerToken: "shared",
+			Members: []types.NodeConfig{{ID: "n1", PublicKey: quepaxa.PublicKey{1}}, {ID: "n2", PublicKey: quepaxa.PublicKey{2}}}},
+		"missing public key": {NodeID: "n1", PeerToken: "voter-1", Members: []types.NodeConfig{{ID: "n1", PublicKey: quepaxa.PublicKey{1}}, {ID: "n2"}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			config.DataDir = filepath.Join(t.TempDir(), "data")

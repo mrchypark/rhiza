@@ -79,11 +79,16 @@ func ConfigFromEnv() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	nodeID := configEnvOrDefault("RHIZA_NODE_ID", "node-1")
+	peerToken, err := configEnvPeerToken(nodeID)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
-		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: configEnvOrDefault("RHIZA_NODE_ID", "node-1"),
+		ClusterID: configEnvOrDefault("RHIZA_CLUSTER_ID", "cluster-a"), NodeID: nodeID,
 		DataDir: configEnvOrDefault("RHIZA_DATA_DIR", "./rhiza-data"), BindAddr: configEnvOrDefault("RHIZA_BIND_ADDR", "127.0.0.1:8080"),
-		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), Members: members, EnableReconfiguration: enableReconfiguration, Learner: learner,
+		PeerAddr: configEnvOrDefault("RHIZA_PEER_ADDR", "127.0.0.1:9090"), AdminToken: os.Getenv("RHIZA_ADMIN_TOKEN"), PeerToken: peerToken, Members: members, EnableReconfiguration: enableReconfiguration, Learner: learner,
 		ObjStoreProvider: os.Getenv("RHIZA_OBJSTORE_PROVIDER"), ObjStoreDir: objStoreDir, ObjStorePrefix: os.Getenv("RHIZA_OBJSTORE_PREFIX"),
 		ObjStoreEndpoint: os.Getenv("RHIZA_OBJSTORE_ENDPOINT"), ObjStoreBucket: os.Getenv("RHIZA_OBJSTORE_BUCKET"), ObjStoreRegion: os.Getenv("RHIZA_OBJSTORE_REGION"),
 		ObjStoreInsecure: objStoreInsecure, ObjStoreRetries: objStoreRetries, ObjStoreAccessKey: os.Getenv("RHIZA_OBJSTORE_ACCESS_KEY"),
@@ -104,6 +109,29 @@ func configEnvOrDefault(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// configEnvPeerToken resolves this process's private peer identity secret.
+// RHIZA_PEER_TOKENS is the per-node map a StatefulSet needs because one Pod
+// template cannot mount a distinct Secret per replica; RHIZA_PEER_TOKEN is the
+// single-node form used by learners and standalone processes.
+func configEnvPeerToken(nodeID string) (string, error) {
+	raw := os.Getenv("RHIZA_PEER_TOKENS")
+	if raw == "" {
+		return os.Getenv("RHIZA_PEER_TOKEN"), nil
+	}
+	if os.Getenv("RHIZA_PEER_TOKEN") != "" {
+		return "", errors.New("RHIZA_PEER_TOKENS conflicts with RHIZA_PEER_TOKEN")
+	}
+	var tokens map[string]string
+	if err := decodeConfigEnvJSON(raw, &tokens); err != nil {
+		return "", fmt.Errorf("invalid RHIZA_PEER_TOKENS: %w", err)
+	}
+	token, ok := tokens[nodeID]
+	if !ok || token == "" {
+		return "", fmt.Errorf("RHIZA_PEER_TOKENS has no entry for node %q", nodeID)
+	}
+	return token, nil
 }
 
 func parseConfigEnvDuration(key, defaultValue string, valid func(time.Duration) bool) (time.Duration, error) {

@@ -65,7 +65,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 			operation.Target.Members = append(operation.Target.Members, member)
 		}
 		if request.Add != nil {
-			if request.Fence != nil || request.Add.ID == "" || request.Add.Token == "" || request.Add.Token == n.config.AdminToken || request.Add.WALIdentity == "" || request.Add.PeerURL == "" {
+			if request.Fence != nil || request.Add.ID == "" || request.Add.PublicKey == (quepaxa.PublicKey{}) || request.Add.WALIdentity == "" || request.Add.PeerURL == "" {
 				return network.ErrInvalidRequest
 			}
 			operation.Target.Members = append(operation.Target.Members, *request.Add)
@@ -75,7 +75,7 @@ func (n *Node) changeMembership(ctx context.Context, request network.MembershipC
 				return err
 			}
 			var registration voterIdentity
-			if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Node != string(request.Add.ID) || registration.Cluster != request.ClusterID || registration.Nonce != request.Add.WALIdentity || registration.LearnerTokenHash != fmt.Sprintf("%x", sha256.Sum256([]byte(request.Add.Token))) {
+			if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Add.ID) || registration.Cluster != request.ClusterID || registration.Nonce != request.Add.WALIdentity || registration.LearnerPublicKey != fmt.Sprintf("%x", request.Add.PublicKey[:]) {
 				return network.ErrInvalidRequest
 			}
 		} else {
@@ -204,7 +204,7 @@ func (n *Node) validateMembershipFence(ctx context.Context, request network.Memb
 		return err
 	}
 	var registration voterIdentity
-	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Node != string(request.Remove) || registration.Cluster != request.ClusterID || registration.Nonce != fence.WALIdentity {
+	if len(data) == 0 || json.Unmarshal(data, &registration) != nil || registration.Version != voterIdentityVersion || registration.Node != string(request.Remove) || registration.Cluster != request.ClusterID || registration.Nonce != fence.WALIdentity {
 		return network.ErrInvalidRequest
 	}
 	return nil

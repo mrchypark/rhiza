@@ -12,12 +12,11 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/network"
-	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestMembershipMutationErrorDetails(t *testing.T) {
 	const admin = "admin-secret"
-	const memberToken = "member-secret"
+	member := voterMember("source", "n4", "new-token")
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -29,7 +28,7 @@ func TestMembershipMutationErrorDetails(t *testing.T) {
 		{"oversized", 500, `{"code":"internal_error","error":"` + strings.Repeat("x", 16<<10) + `"}`, "membership change returned HTTP 500"},
 		{"trailing data", 500, `{"code":"internal_error","error":"failed"} garbage`, "membership change returned HTTP 500"},
 		{"unauthorized", 401, `{"code":"unauthorized","error":"access denied"}`, "membership change returned HTTP 401: unauthorized: access denied"},
-		{"redacted", 500, `{"code":"internal_error","error":"admin-secret member-secret"}`, "membership change returned HTTP 500: internal_error: [redacted] [redacted]"},
+		{"redacted", 500, `{"code":"internal_error","error":"admin-secret"}`, "membership change returned HTTP 500: internal_error: [redacted]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +36,7 @@ func TestMembershipMutationErrorDetails(t *testing.T) {
 					t.Error("unexpected mutation request or authorization")
 				}
 				var change network.MembershipChange
-				if err := json.NewDecoder(r.Body).Decode(&change); err != nil || change.Add == nil || change.Add.Token != memberToken {
+				if err := json.NewDecoder(r.Body).Decode(&change); err != nil || change.Add == nil || change.Add.PublicKey != member.PublicKey {
 					t.Error("mutation request was not preserved")
 				}
 				w.WriteHeader(tc.status)
@@ -54,7 +53,7 @@ func TestMembershipMutationErrorDetails(t *testing.T) {
 			}
 			pod := object{"status": object{"podIP": host}, "spec": object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(port)}}}}}}
 			c := &Controller{HTTP: server.Client()}
-			err = c.membershipMutation(context.Background(), pod, "rhiza", admin, "/membership/change", network.MembershipChange{Add: &quepaxa.Member{Token: memberToken}})
+			err = c.membershipMutation(context.Background(), pod, "rhiza", admin, "/membership/change", network.MembershipChange{Add: &member})
 			if err == nil || err.Error() != tc.want {
 				t.Fatalf("error=%v, want %q", err, tc.want)
 			}

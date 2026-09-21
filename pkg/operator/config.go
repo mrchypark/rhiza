@@ -91,6 +91,13 @@ func (c *Controller) environment(ctx context.Context, container object) (map[str
 			env[name] = str(value)
 			continue
 		}
+		if item["valueFrom"] == nil {
+			// EnvVar.Value carries omitempty, so an explicit empty override is
+			// stored as a name-only entry. The kubelet still applies it after
+			// envFrom, which is how the operator clears an inherited scalar.
+			env[name] = ""
+			continue
+		}
 		from := asObject(item["valueFrom"])
 		if from["secretKeyRef"] == nil && from["configMapKeyRef"] == nil && strings.HasPrefix(name, "RHIZA_") {
 			if name == "RHIZA_NODE_ID" && str(nested(from, "fieldRef", "fieldPath")) == "metadata.name" {
