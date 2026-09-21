@@ -222,7 +222,12 @@ func TestPeerBoundsChargesSharedReferencesPerReference(t *testing.T) {
 }
 
 func TestPeerBoundsChargesObjectSlots(t *testing.T) {
-	frame := requestWithSharedSummaries(peerObjectBudget+1, "n1")
+	// Half the budget in references: the root, decision, and summary tables alone
+	// (2+refs) fit, so only the vector slots (2+2*refs) push the frame over the
+	// budget. A fixture larger than the budget is rejected by the tables alone and
+	// would not fail if the slot charge were dropped.
+	const refs = peerObjectBudget / 2
+	frame := requestWithSharedSummaries(refs, "n1")
 	allocated, _ := allocatedBytes(func() {
 		if err := peerRequestBounds(frame); err == nil {
 			t.Error("an object-dense frame was accepted")
@@ -230,6 +235,12 @@ func TestPeerBoundsChargesObjectSlots(t *testing.T) {
 	})
 	if allocated > 64<<10 {
 		t.Fatalf("rejecting an object-dense frame allocated %d bytes", allocated)
+	}
+
+	// One reference fewer lands exactly on the budget and must be accepted.
+	frame = requestWithSharedSummaries(refs-1, "n1")
+	if err := peerRequestBounds(frame); err != nil {
+		t.Fatalf("frame at exactly the object budget rejected: %v", err)
 	}
 }
 
