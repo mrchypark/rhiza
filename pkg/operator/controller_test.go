@@ -130,6 +130,60 @@ func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
 	}
 }
 
+// A recovered StatefulSet can inherit a scalar RHIZA_PEER_TOKEN from its source
+// template. The activation write injects the voter token map, and configEnvPeerToken
+// rejects that combination, so the scalar entry must be dropped in the same write.
+// An empty override is not an option: the apiserver drops EnvVar.Value on
+// serialization, and the operator's own environment reader rejects the resulting
+// name-only entry as an unsupported dynamic source.
+func TestControllerActivationDropsInheritedScalarPeerToken(t *testing.T) {
+	ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+	r.Spec.RecoveryID = "recovery-1"
+	r.Spec.Fence = fence(r)
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_PEER_TOKEN", "value": "inherited-secret"})
+
+	// Stopping needs one reconcile to scale the source down and one more to
+	// observe the terminated Pods; the activation write happens on the next
+	// reconcile, when the recorded stage is already Starting.
+	for _, stage := range []string{"Reserved", "Sealed", "Stopping", "Stopping", "Starting", "Restarted"} {
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Stage != stage {
+			t.Fatalf("stage=%q want=%q status=%+v", r.Status.Stage, stage, r.Status)
+		}
+	}
+	activated, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scalarPresent, mapInjected bool
+	for _, item := range list(activated["env"]) {
+		entry := asObject(item)
+		switch str(entry["name"]) {
+		case "RHIZA_PEER_TOKEN":
+			scalarPresent = true
+		case "RHIZA_PEER_TOKENS":
+			mapInjected = nested(entry, "valueFrom", "secretKeyRef", "key") == "peer_tokens"
+		}
+	}
+	if scalarPresent {
+		t.Fatalf("inherited scalar RHIZA_PEER_TOKEN survived activation: %+v", activated["env"])
+	}
+	if !mapInjected {
+		t.Fatalf("voter token map was not injected: %+v", activated["env"])
+	}
+	// The operator reads the same StatefulSet back during activation; a surviving
+	// dynamic entry would block recovery there instead of at node startup.
+	if _, err := c.environment(ctx, activated); err != nil {
+		t.Fatalf("activated StatefulSet environment is unreadable: %v", err)
+	}
+}
+
 func TestControllerMembershipRetryUsesExactJournaledPayloads(t *testing.T) {
 	ctx, r, api, c := membershipFixture(t)
 	api.membership["n1"] = network.MembershipStatus{NodeID: "n1", ClusterID: "source", ConfigID: 1, Voters: []quepaxa.NodeID{"n1", "n2", "n3"}, Voting: true, AbortSlot: 7}
