@@ -226,19 +226,21 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	response := &peerfb.ResponseT{}
 	data, err := readPeerFrame(stream)
 	if err == nil {
+		// Voter authorization is bound to the handshake certificate, so a
+		// request is never accepted as replayable early data. Checked before
+		// decoding so unauthenticated bytes are not materialized.
+		if !conn.ConnectionState().TLS.HandshakeComplete {
+			err = fmt.Errorf("peer authentication requires a completed TLS handshake")
+		}
+	}
+	if err == nil {
 		var request *peerfb.RequestT
 		request, err = decodePeerRequest(data)
 		if err == nil {
 			if request.Operation == peerfb.OperationPrepareCheckpoint {
 				_ = stream.SetDeadline(time.Now().Add(checkpointPrepareTimeout))
 			}
-			// Voter authorization is bound to the handshake certificate, so a
-			// request is never accepted as replayable early data.
-			if !conn.ConnectionState().TLS.HandshakeComplete {
-				err = fmt.Errorf("peer authentication requires a completed TLS handshake")
-			} else {
-				response, err = s.handle(stream.Context(), peerCertificateKey(conn), request)
-			}
+			response, err = s.handle(stream.Context(), peerCertificateKey(conn), request)
 		}
 	}
 	if err != nil {

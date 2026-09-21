@@ -24,7 +24,7 @@ func encodePeerRequest(request *peerfb.RequestT) []byte {
 }
 
 func decodePeerRequest(data []byte) (request *peerfb.RequestT, err error) {
-	if len(data) < 8 || !peerfb.RequestBufferHasIdentifier(data) {
+	if len(data) < 8 || len(data) > maxPeerFrame || !peerfb.RequestBufferHasIdentifier(data) {
 		return nil, fmt.Errorf("invalid peer frame")
 	}
 	defer func() {
@@ -33,6 +33,12 @@ func decodePeerRequest(data []byte) (request *peerfb.RequestT, err error) {
 			err = fmt.Errorf("invalid peer frame: %v", recovered)
 		}
 	}()
+	// Cap the slice so an accessor cannot read past the logical frame, then
+	// bound what UnPack may materialize before it runs.
+	data = data[:len(data):len(data)]
+	if err := peerRequestBounds(data); err != nil {
+		return nil, fmt.Errorf("invalid peer frame: %w", err)
+	}
 	request = peerfb.GetRootAsRequest(data, 0).UnPack()
 	if request.Magic != peerWireMagic {
 		return nil, fmt.Errorf("invalid peer frame marker")
@@ -49,7 +55,7 @@ func encodePeerResponse(response *peerfb.ResponseT) []byte {
 }
 
 func decodePeerResponse(data []byte) (response *peerfb.ResponseT, err error) {
-	if len(data) < 4 {
+	if len(data) < 4 || len(data) > maxPeerFrame {
 		return nil, fmt.Errorf("invalid peer response")
 	}
 	defer func() {
@@ -58,6 +64,10 @@ func decodePeerResponse(data []byte) (response *peerfb.ResponseT, err error) {
 			err = fmt.Errorf("invalid peer response: %v", recovered)
 		}
 	}()
+	data = data[:len(data):len(data)]
+	if err := peerResponseBounds(data); err != nil {
+		return nil, fmt.Errorf("invalid peer response: %w", err)
+	}
 	response = peerfb.GetRootAsResponse(data, 0).UnPack()
 	if response.Magic != peerWireMagic {
 		return nil, fmt.Errorf("invalid peer response marker")
