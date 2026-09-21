@@ -1139,6 +1139,108 @@ func TestMaterializerRejectsNondeterministicWrite(t *testing.T) {
 	}
 }
 
+// A function in a column DEFAULT is resolved when the row is written, and the
+// authorizer never observes it, so the engine-level replacement has to reject
+// it. Without that, the same certified command stored a different durable
+// value on a voter whose writer connection a restart had recreated (#152).
+func TestMaterializerRejectsConnectionLocalSQLFunctions(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/connection-local.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	apply := func(slot uint64, query string) error {
+		value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "req-" + strconv.FormatUint(slot, 10), SQL: query}})
+		if err != nil {
+			t.Fatalf("encode %q: %v", query, err)
+		}
+		return m.Apply(ctx, slot, value)
+	}
+
+	if err := apply(1, "CREATE TABLE local_state (value INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct use is rejected by the authorizer. A rejected statement is recorded
+	// as a rejected receipt, so the durable state is what proves the rejection.
+	for i, function := range []string{"changes()", "total_changes()", "last_insert_rowid()"} {
+		if err := apply(uint64(i+2), "INSERT INTO local_state VALUES ("+function+")"); err != nil {
+			t.Fatalf("apply %s: %v", function, err)
+		}
+	}
+
+	// A DEFAULT expression reaches the engine without an authorizer callback.
+	if err := apply(5, "CREATE TABLE local_default (value INTEGER DEFAULT (changes()))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := apply(6, "INSERT INTO local_default DEFAULT VALUES"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same route through a trigger, a generated column, a CHECK constraint,
+	// an expression index, and a view.
+	for slot, query := range []string{
+		"CREATE TABLE local_trigger_target (value INTEGER)",
+		"CREATE TRIGGER local_trigger AFTER INSERT ON local_state BEGIN INSERT INTO local_trigger_target VALUES (total_changes()); END",
+		"INSERT INTO local_state VALUES (1)",
+		"CREATE TABLE local_generated (a INTEGER, b INTEGER GENERATED ALWAYS AS (changes()) VIRTUAL)",
+		"CREATE TABLE local_check (value INTEGER CHECK (value > last_insert_rowid()))",
+		"CREATE INDEX local_index ON local_state (changes())",
+		"CREATE VIEW local_view AS SELECT changes() AS value",
+	} {
+		if err := apply(uint64(slot+7), query); err != nil {
+			t.Fatalf("apply %q: %v", query, err)
+		}
+	}
+	// A read may resolve the view on a reader connection, where the value is
+	// local by design. A write that reads through it must still be rejected.
+	if err := apply(14, "INSERT INTO local_state SELECT value FROM local_view"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deterministic SQL and the driver-reported insert identity keep working.
+	if err := apply(15, "CREATE TABLE local_ok (id INTEGER PRIMARY KEY, value TEXT DEFAULT (upper('x')))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := apply(16, "INSERT INTO local_ok DEFAULT VALUES"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.QueryResult(ctx, "SELECT value FROM local_ok", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "X" {
+		t.Fatalf("deterministic default stored %v, want X", result.Rows)
+	}
+
+	// No connection-local function may leave a durable value behind, and a
+	// rejected DDL statement must roll back entirely.
+	for _, query := range []string{
+		"SELECT COUNT(*) FROM local_state",
+		"SELECT COUNT(*) FROM local_default",
+		"SELECT COUNT(*) FROM local_trigger_target",
+	} {
+		result, err := m.QueryResult(ctx, query, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		if len(result.Rows) != 1 || result.Rows[0][0] != int64(0) {
+			t.Fatalf("%s stored %v, want 0 rows", query, result.Rows)
+		}
+	}
+	for _, name := range []string{"local_generated", "local_check", "local_index"} {
+		result, err := m.QueryResult(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE name = ?", []any{name})
+		if err != nil {
+			t.Fatalf("lookup %s: %v", name, err)
+		}
+		if len(result.Rows) != 1 || result.Rows[0][0] != int64(0) {
+			t.Fatalf("rejected DDL left %s behind", name)
+		}
+	}
+}
+
 func TestStateTipIgnoresConsensusOnlyDecisions(t *testing.T) {
 	m, err := Open(t.TempDir()+"/state-tip.db", 1)
 	if err != nil {

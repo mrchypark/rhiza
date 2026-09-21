@@ -268,6 +268,17 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 		if _, err := conn.Config(sqlite3.DBCONFIG_DEFENSIVE, true); err != nil {
 			return err
 		}
+		if writer {
+			// The authorizer below never sees a function that is only resolved
+			// when a column DEFAULT is applied, so such a write was certified and
+			// then materialized a different durable value on a voter whose writer
+			// connection a restart had recreated (issue #152). Replacing the
+			// functions themselves closes every durable path, including the ones
+			// the authorizer cannot observe.
+			if err := denySQLFunctions(conn); err != nil {
+				return err
+			}
+		}
 		return conn.SetAuthorizer(func(action sqlite3.AuthorizerActionCode, _, name string, _, _ string) sqlite3.AuthorizerReturnCode {
 			if (writer || readOnly) && (action == sqlite3.AUTH_ATTACH || action == sqlite3.AUTH_DETACH) {
 				return sqlite3.AUTH_DENY
@@ -280,15 +291,34 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 	})
 }
 
+// sqlFunctionDenylist holds functions a replicated write must not use. The
+// clock and randomness entries read the host, and the three connection-local
+// entries return counters owned by the writer connection, so a voter whose
+// writer connection a restart had recreated would materialize a different
+// durable value for the same certified command (issue #152).
+var sqlFunctionDenylist = []string{
+	"random", "randomblob", "now", "current_time", "current_date", "current_timestamp",
+	"date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
+	"load_extension", "changes", "total_changes", "last_insert_rowid",
+}
+
 func nondeterministicSQLFunction(name string) bool {
-	switch strings.ToLower(name) {
-	case "random", "randomblob", "now", "current_time", "current_date", "current_timestamp",
-		"date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
-		"load_extension":
-		return true
-	default:
-		return false
+	return slices.Contains(sqlFunctionDenylist, strings.ToLower(name))
+}
+
+// denySQLFunctions replaces every denylisted function with one that fails, so
+// the write fails instead of storing a value that is not reproducible from the
+// certified log. Any arity is accepted because the caller never supplies a
+// valid result.
+func denySQLFunctions(conn *sqlite3.Conn) error {
+	for _, name := range sqlFunctionDenylist {
+		if err := conn.CreateFunction(name, -1, 0, func(ctx sqlite3.Context, _ ...sqlite3.Value) {
+			ctx.ResultError(fmt.Errorf("function %s is not reproducible on the replicated write API", name))
+		}); err != nil {
+			return fmt.Errorf("deny SQL function %s: %w", name, err)
+		}
 	}
+	return nil
 }
 
 func (m *Materializer) loadTip(existing bool) error {
