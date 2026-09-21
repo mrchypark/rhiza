@@ -42,6 +42,9 @@ func learnerSTS(t *testing.T) object {
 						object{"name": "RHIZA_CLUSTER_ID", "value": "source"},
 						object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"},
 					},
+					// The voter token map reaches the container through envFrom, not
+					// through an inline entry; the learner template inherits it.
+					"envFrom":      []any{object{"secretRef": object{"name": "rhiza-peer-credentials"}}},
 					"volumeMounts": []any{object{"name": "data", "mountPath": "/data"}},
 				}},
 				"volumes": []any{object{"name": "data", "emptyDir": object{}}},
@@ -82,6 +85,13 @@ func (a *learnerAPI) serve(w http.ResponseWriter, r *http.Request) {
 
 	// GET /secrets/{name}
 	if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/default/secrets/") {
+		// The source voter token map the learner template inherits via envFrom.
+		if strings.HasSuffix(r.URL.Path, "/rhiza-peer-credentials") {
+			json.NewEncoder(w).Encode(object{"data": object{
+				"RHIZA_PEER_TOKENS": base64.StdEncoding.EncodeToString([]byte(`{"rhiza-0":"chaos-peer-0"}`)),
+			}})
+			return
+		}
 		if a.secretExists && a.secret != nil {
 			json.NewEncoder(w).Encode(a.secret)
 			return
@@ -201,7 +211,7 @@ func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 		t.Fatal("learner DNS must resolve before voting readiness")
 	}
 	ctr := asObject(list(nested(api.pod, "spec", "containers"))[0])
-	found := false
+	found, cleared := false, false
 	for _, item := range list(ctr["env"]) {
 		entry := asObject(item)
 		if str(entry["name"]) == "RHIZA_LEARNER" {
@@ -215,6 +225,17 @@ func TestEnsureAutomaticLearnerCreatesAllResources(t *testing.T) {
 				t.Fatal("peer token must remain a Secret reference")
 			}
 		}
+		if str(entry["name"]) == "RHIZA_PEER_TOKENS" {
+			// The source envFrom still supplies the voter map; without this
+			// empty override the learner refuses to start.
+			if entry["value"] != "" || entry["valueFrom"] != nil {
+				t.Fatalf("voter token map must be cleared for a learner: %+v", entry)
+			}
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("learner environment must clear the inherited voter token map")
 	}
 	if !found {
 		t.Fatal("learner environment missing")

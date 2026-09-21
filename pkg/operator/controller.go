@@ -474,7 +474,6 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			// Each target Pod receives the whole token map and selects its own
 			// entry by node ID; a StatefulSet cannot mount a per-Pod Secret.
 			values = replaceEnv(values, "RHIZA_PEER_TOKENS", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "peer_tokens"}}})
-			values = replaceEnv(values, "RHIZA_PEER_TOKEN", object{"value": ""})
 			ctr["env"] = values
 			asObject(sts["spec"])["replicas"] = float64(3)
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {

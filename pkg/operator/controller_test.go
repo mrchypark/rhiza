@@ -600,6 +600,7 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 			var next object
 			if json.NewDecoder(q.Body).Decode(&next) == nil {
 				a.sts = next
+				apiserverNormalize(a.sts)
 				a.stsPuts++
 				if number(nested(next, "spec", "replicas")) == 0 {
 					a.zeroPuts++
@@ -700,6 +701,22 @@ func fakeSTS(mode string) object {
 		},
 	}
 }
+
+// apiserverNormalize applies the serialization the real API server performs on
+// a StatefulSet write: EnvVar.Value carries omitempty, so an empty string is
+// dropped and only the name survives. A fake that keeps `"value":""` would
+// hide exactly the defect the operator hit when it cleared an env entry.
+func apiserverNormalize(sts object) {
+	for _, cRef := range list(nested(sts, "spec", "template", "spec", "containers")) {
+		for _, eRef := range list(asObject(cRef)["env"]) {
+			entry := asObject(eRef)
+			if str(entry["value"]) == "" {
+				delete(entry, "value")
+			}
+		}
+	}
+}
+
 func members() []quepaxa.Member {
 	return []quepaxa.Member{voterMember("source", "n1", "old1"), voterMember("source", "n2", "old2"), voterMember("source", "n3", "old3")}
 }

@@ -163,6 +163,9 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 			values := replaceEnv(list(ctr["env"]), "RHIZA_NODE_ID", object{"value": learnerName})
 			ctr["env"] = replaceEnv(values, "RHIZA_LEARNER", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "member"}}})
 			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKEN", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "RHIZA_PEER_TOKEN"}}})
+			// The voter token map arrives through the inherited envFrom; an empty
+			// env entry clears it so the single RHIZA_PEER_TOKEN above applies.
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_TOKENS", object{"value": ""})
 		}
 	}
 	if str(podSpec["restartPolicy"]) == "" {
