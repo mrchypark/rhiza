@@ -73,7 +73,7 @@ func ReadGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix st
 }
 
 func ValidateGenerationAnchor(anchor GenerationAnchor) error {
-	if anchor.Version != 1 || anchor.OperationID == "" || anchor.SourcePrefix == "" || anchor.TargetPrefix == "" || anchor.SourceTip == 0 || !validForkHash(anchor.SourceManifest) || !validForkHash(anchor.SourcePrefixHash) || !validForkHash(anchor.SourceBootstrap) || anchor.TargetMembership.Version != membershipRecordVersion || anchor.Checkpoint.Index != anchor.SourceTip || !validForkHash(anchor.Checkpoint.RootHash) || !validForkHash(anchor.Checkpoint.StateHash) {
+	if anchor.Version != 1 || anchor.OperationID == "" || anchor.SourcePrefix == "" || anchor.TargetPrefix == "" || anchor.SourceTip == 0 || !validForkHash(anchor.SourceManifest) || !validForkHash(anchor.SourcePrefixHash) || !validForkHash(anchor.SourceBootstrap) || anchor.TargetMembership.Version != MembershipRecordVersion || anchor.Checkpoint.Index != anchor.SourceTip || !validForkHash(anchor.Checkpoint.RootHash) || !validForkHash(anchor.Checkpoint.StateHash) {
 		return fmt.Errorf("invalid generation anchor")
 	}
 	return nil
@@ -152,7 +152,7 @@ func PinGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix, ow
 // intent/result bindings, but does not require the original anchor checkpoint
 // to remain present after a newer certified target checkpoint has superseded it.
 func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix string, expectedMembership MembershipRecord, expectedAnchorHash [32]byte) (GenerationAnchor, error) {
-	if expectedAnchorHash == ([32]byte{}) || expectedMembership.Version != membershipRecordVersion {
+	if expectedAnchorHash == ([32]byte{}) || expectedMembership.Version != MembershipRecordVersion {
 		return GenerationAnchor{}, fmt.Errorf("expected generation anchor and immutable membership are required")
 	}
 	anchor, hash, err := ReadGenerationAnchor(ctx, bucket, prefix)
@@ -224,7 +224,7 @@ func mustGenerationHash(value string) [32]byte {
 // suffix into a temporary materializer, and publishes a target-only root and
 // empty anchored archive. The caller must have fenced every source writer.
 func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result ForkResult, sourcePrefix, targetPrefix, operationID string, sourceBootstrap quepaxa.Cluster, targetMembership MembershipRecord) (GenerationAnchor, error) {
-	if bucket == nil || operationID == "" || len(sourceBootstrap.Members) == 0 || targetMembership.Version != membershipRecordVersion || result.Tip == 0 || !validForkHash(result.ManifestHash) || result.PrefixHash != "" && !validForkHash(result.PrefixHash) {
+	if bucket == nil || operationID == "" || len(sourceBootstrap.Members) == 0 || targetMembership.Version != MembershipRecordVersion || result.Tip == 0 || !validForkHash(result.ManifestHash) || result.PrefixHash != "" && !validForkHash(result.PrefixHash) {
 		return GenerationAnchor{}, fmt.Errorf("invalid generation materialization")
 	}
 	source := NewManager(bucket, sourcePrefix, 1)

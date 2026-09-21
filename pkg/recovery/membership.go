@@ -10,9 +10,9 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-// membershipRecordVersion 2 binds voter identity by public key. Version 1
+// MembershipRecordVersion 2 binds voter identity by public key. Version 1
 // hashed the retired private peer token and is rejected on read.
-const membershipRecordVersion = 2
+const MembershipRecordVersion = 2
 
 // MembershipRecord binds a generation's voting authority and durability mode.
 // A mode change requires a new generation; an environment edit is not a
@@ -38,5 +38,5 @@ func NewMembershipRecord(cluster string, members []quepaxa.Member, durability st
 	slices.Sort(encodedMembers)
 	encoded, _ := json.Marshal(encodedMembers)
 	sum := sha256.Sum256(append([]byte("rhiza-membership-v2\x00"), encoded...))
-	return MembershipRecord{Version: membershipRecordVersion, Cluster: cluster, Membership: fmt.Sprintf("%x", sum), Durability: durability}
+	return MembershipRecord{Version: MembershipRecordVersion, Cluster: cluster, Membership: fmt.Sprintf("%x", sum), Durability: durability}
 }

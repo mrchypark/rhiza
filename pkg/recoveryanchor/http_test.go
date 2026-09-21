@@ -94,7 +94,7 @@ func testReq() Request {
 		FenceHash:        httpHex64(1),
 		TargetAnchorHash: httpHex64(2),
 		Fork:             recovery.ForkResult{Tip: 10, ManifestHash: httpHex64(3), PrefixHash: httpHex64(4)},
-		TargetMembership: recovery.MembershipRecord{Version: 1, Cluster: "tgt"},
+		TargetMembership: recovery.MembershipRecord{Version: recovery.MembershipRecordVersion, Cluster: "tgt"},
 	}
 }
 
