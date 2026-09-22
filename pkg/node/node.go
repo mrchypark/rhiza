@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"log"
 	"net"
 	"net/http"
@@ -145,6 +146,9 @@ func (n *Node) EnrollExistingVoter(ctx context.Context) error {
 func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
+	}
+	if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
+		return err
 	}
 	if err := validateVoterMembership(n.config); err != nil {
 		return err
@@ -304,6 +308,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	)
 	if err != nil {
 		// Rebuilding from the retained consensus base and suffix is safer and
+		if errors.Is(err, sqlpolicy.ErrIncompatible) {
+			return err
+		}
 		// smaller than database-specific corruption repair.
 		if rebuildErr := quarantineSQLite(n.config.DataDir + "/sqlite.db"); rebuildErr != nil {
 			return fmt.Errorf("open materializer: %w; quarantine: %v", err, rebuildErr)
@@ -395,6 +402,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 					archiveErr = fmt.Errorf("shared archive omitted slot %d", core.Tip()+1)
 				}
 				return startupRecovery.Check(archiveErr)
+			}
+			for _, decision := range values {
+				if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+					return err
+				}
 			}
 			if archiveErr := core.AcceptCertifiedValues(values); archiveErr != nil {
 				return fmt.Errorf("recover shared archive: %w", archiveErr)
@@ -851,6 +863,11 @@ func (n *Node) catchUpArchive(ctx context.Context) error {
 			}
 			return err
 		}
+		for _, decision := range values {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
+		}
 		if err := n.core.AcceptCertifiedValues(values); err != nil {
 			return err
 		}
@@ -991,6 +1008,11 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 			}
 			return err
 		}
+		for _, decision := range values {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
+		}
 		if err := n.core.AcceptCertifiedValues(values); err != nil {
 			return err
 		}
@@ -1005,6 +1027,11 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 				err = fmt.Errorf("shared archive omitted slot %d", n.core.Tip()+1)
 			}
 			return err
+		}
+		for _, decision := range values {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
 		}
 		if err := n.core.AcceptCertifiedValues(values); err != nil {
 			return err
@@ -1321,6 +1348,11 @@ func (n *Node) catchUpQuorum(ctx context.Context, transport *network.Transport, 
 			}
 			expected++
 		}
+		for _, decision := range best.Decisions {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
+		}
 		if err := n.core.AcceptCertifiedValues(best.Decisions); err != nil {
 			return err
 		}
@@ -1356,6 +1388,11 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 		}
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("operation sync source %s omitted slot %d", source, from)
+		}
+		for _, decision := range response.Decisions {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
 		}
 		if err := n.core.AcceptCertifiedValues(response.Decisions); err != nil {
 			return err

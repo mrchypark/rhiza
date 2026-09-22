@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"io"
 	"math"
 	"net/url"
@@ -178,12 +179,17 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		return nil, fmt.Errorf("idempotency window must be between 1024 and 1048576 slots")
 	}
 	existing := false
-	if info, err := os.Stat(dbPath); err == nil {
-		existing = info.Size() > 0
+	if _, err := os.Stat(dbPath); err == nil {
+		existing = true
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("stat database: %w", err)
 	}
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+	if existing {
+		if err := sqlpolicy.CheckFile(context.Background(), dbPath); err != nil {
+			return nil, err
+		}
+	}
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
 	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)"
@@ -268,6 +274,18 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 		if _, err := conn.Config(sqlite3.DBCONFIG_DEFENSIVE, true); err != nil {
 			return err
 		}
+		if writer {
+			// The authorizer below never sees a function that is only resolved
+			// when a column DEFAULT is applied, so such a write was certified and
+			// then materialized a different durable value on a voter whose writer
+			// connection a restart had recreated (issue #152). Replacing the
+			// functions themselves also rejects those scalar-function evaluations
+			// the authorizer cannot observe. Name-based restrictions also cover
+			// fixed-input date/time defaults, not just clock-dependent arguments.
+			if err := denySQLFunctions(conn); err != nil {
+				return err
+			}
+		}
 		return conn.SetAuthorizer(func(action sqlite3.AuthorizerActionCode, _, name string, _, _ string) sqlite3.AuthorizerReturnCode {
 			if (writer || readOnly) && (action == sqlite3.AUTH_ATTACH || action == sqlite3.AUTH_DETACH) {
 				return sqlite3.AUTH_DENY
@@ -280,15 +298,34 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 	})
 }
 
+// sqlFunctionDenylist holds functions a replicated write must not use. The
+// clock and randomness entries read the host, and the three connection-local
+// entries return counters owned by the writer connection, so a voter whose
+// writer connection a restart had recreated would materialize a different
+// durable value for the same certified command (issue #152).
+var sqlFunctionDenylist = []string{
+	"random", "randomblob", "now", "current_time", "current_date", "current_timestamp",
+	"date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
+	"load_extension", "changes", "total_changes", "last_insert_rowid",
+}
+
 func nondeterministicSQLFunction(name string) bool {
-	switch strings.ToLower(name) {
-	case "random", "randomblob", "now", "current_time", "current_date", "current_timestamp",
-		"date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
-		"load_extension":
-		return true
-	default:
-		return false
+	return slices.Contains(sqlFunctionDenylist, strings.ToLower(name))
+}
+
+// denySQLFunctions replaces every denylisted function with one that fails, so
+// the write fails instead of storing a value that is not reproducible from the
+// certified log. Any arity is accepted because the caller never supplies a
+// valid result.
+func denySQLFunctions(conn *sqlite3.Conn) error {
+	for _, name := range sqlFunctionDenylist {
+		if err := conn.CreateFunction(name, -1, 0, func(ctx sqlite3.Context, _ ...sqlite3.Value) {
+			ctx.ResultError(fmt.Errorf("function %s is not reproducible on the replicated write API", name))
+		}); err != nil {
+			return fmt.Errorf("deny SQL function %s: %w", name, err)
+		}
 	}
+	return nil
 }
 
 func (m *Materializer) loadTip(existing bool) error {
@@ -299,7 +336,7 @@ func (m *Materializer) loadTip(existing bool) error {
 			return fmt.Errorf("existing database has no applied slot; rebuild it from the decision log")
 		}
 		zeroHash := hex.EncodeToString(make([]byte, sha256.Size))
-		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
+		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', '1'), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
 			return err
 		}
 		value = "0"
@@ -335,6 +372,9 @@ func (m *Materializer) loadTip(existing bool) error {
 
 // ValidateTip checks that materialized state agrees with the recovered log.
 func (m *Materializer) ValidateTip(slot uint64, value []byte) error {
+	if err := types.ValidateExecutionPolicy(value); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.tip != slot {
@@ -847,6 +887,11 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
 func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) error {
+	for _, decision := range decisions {
+		if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			return err
+		}
+	}
 	if len(decisions) == 0 {
 		return nil
 	}
@@ -855,7 +900,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if m.writer == nil {
 		return sql.ErrConnDone
 	}
-	tx, err := m.writer.BeginTx(ctx, nil)
+	conn, err := m.writer.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire apply connection: %w", err)
+	}
+	defer conn.Close()
+	// Own rollback synchronously: automatic context rollback can close conn
+	// while the per-statement Raw callback is acquiring it. SQL operations
+	// still use ctx, and cancellation is checked again before committing.
+	tx, err := conn.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
@@ -884,11 +937,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
+		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
 		m.tip, m.tipHash = slot, hash
+	}
+	if err := ctx.Err(); err != nil {
+		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
@@ -959,7 +1016,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -1049,7 +1106,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 		commands = nil
 		batched = true
 	} else if !batched {
-		commands = []types.SQLCommand{{SQL: string(value)}}
+		return sqlpolicy.ErrIncompatible
 	}
 	pendingStart := len(m.pendingSQLReceipts)
 	for _, command := range commands {
@@ -1091,7 +1148,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 		if _, err := execPrepared(ctx, tx, statements, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
-		result, executeErr := executeSQLCommand(ctx, tx, statements, command)
+		result, executeErr := executeSQLCommand(ctx, conn, tx, statements, command)
 		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted}
 		if executeErr != nil {
 			if command.RequestID == "" {
@@ -1526,7 +1583,7 @@ func validatePublicSQL(query string) error {
 	return nil
 }
 
-func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
+func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
 	statements := command.Statements
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
@@ -1603,6 +1660,24 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 		}
 		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
 		if err != nil {
+			return result, err
+		}
+		// SQLite preserves Changes across non-DML statements. A zero-row
+		// internal delete clears it without changing durable state.
+		reset, err := preparedStatement(ctx, tx, prepared, `DELETE FROM _rhiza_meta WHERE 0`)
+		if err != nil {
+			return result, err
+		}
+		if _, err := reset.ExecContext(ctx); err != nil {
+			return result, err
+		}
+		// The driver's LastInsertId reads native connection state even for an
+		// UPDATE. Reset it for each user statement so receipts cannot inherit
+		// an earlier insert (or differ after reconnecting the writer).
+		if err := conn.Raw(func(driverConn any) error {
+			driverConn.(sqlite3driver.Conn).Raw().SetLastInsertRowID(0)
+			return nil
+		}); err != nil {
 			return result, err
 		}
 		if statement.WantRows {
@@ -2167,6 +2242,9 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 	if parts.sqlitePath == "" || !seen[CheckpointGraphData] {
 		return fmt.Errorf("checkpoint requires SQLite and Graph files")
 	}
+	if err := sqlpolicy.CheckFile(ctx, parts.sqlitePath); err != nil {
+		return err
+	}
 	root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
 	if err != nil {
 		return err
@@ -2347,6 +2425,9 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
+	if err := sqlpolicy.CheckFile(ctx, tempPath); err != nil {
+		return err
+	}
 	graphPath := filepath.Join(dir, "latticedb")
 	graphBackupPath := graphPath + ".restore-backup"
 	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {

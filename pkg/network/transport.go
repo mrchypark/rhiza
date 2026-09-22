@@ -22,7 +22,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const peerALPN = "rhiza-peer-v2"
+const peerALPN = "rhiza-peer-v3"
 const peerRPCTimeout = 5 * time.Second
 const checkpointPrepareTimeout = 5 * time.Minute
 
@@ -56,9 +56,9 @@ type Transport struct {
 	// adminToken authenticates the read-only sync path of a non-voting client
 	// that has no peer identity of its own.
 	adminToken string
-	tls       *tls.Config
-	quic      *quic.Config
-	peers     map[quepaxa.NodeID]*peerConnection
+	tls        *tls.Config
+	quic       *quic.Config
+	peers      map[quepaxa.NodeID]*peerConnection
 
 	resolverMu sync.RWMutex
 	resolver   clusterResolver

@@ -331,7 +331,7 @@ func TestLinearizableQueryUsesReadIndexWithoutConsumingSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	if _, _, err := core.Propose(context.Background(), []byte("CREATE TABLE barrier_read (id INTEGER)")); err != nil {
+	if _, _, err := core.Propose(context.Background(), policySQL(t, "CREATE TABLE barrier_read (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	server := NewServer(core, material, "cluster", true, nil)
@@ -441,7 +441,7 @@ func TestReadyAllowsIntentionalCommitApplyGap(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	if _, _, err := core.Propose(context.Background(), []byte("CREATE TABLE pending (id INTEGER)")); err != nil {
+	if _, _, err := core.Propose(context.Background(), policySQL(t, "CREATE TABLE pending (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	server := NewServer(core, material, "cluster", true, nil, func() bool { return true })
@@ -465,11 +465,11 @@ func TestConcurrentApplyDecisionsRemainOrdered(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer material.Close()
-	if _, _, err := core.Propose(context.Background(), []byte("CREATE TABLE concurrent_apply (id INTEGER)")); err != nil {
+	if _, _, err := core.Propose(context.Background(), policySQL(t, "CREATE TABLE concurrent_apply (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i < 64; i++ {
-		if _, _, err := core.Propose(context.Background(), []byte("INSERT INTO concurrent_apply VALUES (1)")); err != nil {
+		if _, _, err := core.Propose(context.Background(), policySQL(t, "INSERT INTO concurrent_apply VALUES (1)")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1041,4 +1041,13 @@ func TestReplicaStatusEndpoint(t *testing.T) {
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"lag_slots":2`) {
 		t.Fatalf("replica status code=%d body=%s", response.Code, response.Body.String())
 	}
+}
+
+func policySQL(t testing.TB, query string) []byte {
+	t.Helper()
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: query}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
 }

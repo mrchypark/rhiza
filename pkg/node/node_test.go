@@ -16,6 +16,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/ncruces/go-sqlite3/driver"
 	objstore "github.com/thanos-io/objstore"
 )
 
@@ -158,9 +159,7 @@ func TestCertifiedCheckpointPublicationWaitsForArchiveSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := filepath.Join(t.TempDir(), "sqlite.db")
-	if err := os.WriteFile(file, []byte("checkpoint"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	policySnapshot(t, file, "checkpoint")
 	claim, err := checkpoints.AcquirePublisherClaim(ctx, "test", 0, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -224,9 +223,7 @@ func TestStartupRecoveryPinProtectsSelectedRootFromGC(t *testing.T) {
 	manager := checkpoint.NewManager(objstore.NewInMemBucket(), "cluster", t.TempDir(), 1)
 	create := func(index uint64, contents string) *checkpoint.Checkpoint {
 		file := filepath.Join(t.TempDir(), "sqlite.db")
-		if err := os.WriteFile(file, []byte(contents), 0o600); err != nil {
-			t.Fatal(err)
-		}
+		policySnapshot(t, file, contents)
 		claim, err := manager.AcquirePublisherClaim(ctx, "test", index-1, time.Minute)
 		if err != nil {
 			t.Fatal(err)
@@ -366,5 +363,20 @@ func TestReadAdmissionConfig(t *testing.T) {
 				t.Fatalf("error=%v valid=%t", err, valid)
 			}
 		})
+	}
+}
+
+func policySnapshot(t testing.TB, path, contents string) {
+	t.Helper()
+	db, err := driver.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO _rhiza_meta VALUES('sql_execution_policy','1'); CREATE TABLE payload(value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO payload VALUES(?)`, contents); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -35,9 +34,7 @@ func TestForkCopiesVerifiedGenerationAndIsIdempotent(t *testing.T) {
 	}
 	checkpoints := checkpoint.NewManager(bucket, "source", t.TempDir(), 1)
 	file := filepath.Join(t.TempDir(), "sqlite.db")
-	if err := os.WriteFile(file, []byte("checkpoint"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	policySnapshot(t, file)
 	claim, err := checkpoints.AcquirePublisherClaim(ctx, "test", 0, time.Minute)
 	if err != nil {
 		t.Fatal(err)

@@ -504,6 +504,9 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	s.proposeMu.Unlock()
 }
 func (s *Server) proposeOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	if err := types.ValidateExecutionPolicy(value); err != nil {
+		return 0, err
+	}
 	if slot, ok := s.core.DecidedSlot(value); ok {
 		if _, err := s.core.CompleteDecision(ctx, slot); err == nil {
 			return slot, nil
@@ -612,6 +615,11 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
 		}
 		accept := s.core.AcceptCertifiedValues
+		for _, decision := range response.Decisions {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
+		}
 		if !durable {
 			accept = s.core.AcceptCertifiedHints
 		}
