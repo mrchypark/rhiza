@@ -372,3 +372,46 @@ func TestRowIDPolicyCachedStatementDoesNotLeakLatch(t *testing.T) {
 		t.Fatal(rows, err)
 	}
 }
+
+func TestPolicyCatalogNameDoesNotBreakReopen(t *testing.T) {
+	for _, q := range []string{"CREATE TABLE pragma_table_list(id INTEGER PRIMARY KEY)", "CREATE VIEW pragma_table_list AS SELECT 1 AS id"} {
+		t.Run(q, func(t *testing.T) {
+			ctx := context.Background()
+			path := t.TempDir() + "/state.db"
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { m.Close() }()
+			v, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "catalog-name", SQL: q}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = m.Apply(ctx, 1, v); err != nil {
+				t.Fatal(err)
+			}
+			receipt, ok, err := m.MutationReceipt(ctx, types.MutationSQL, "catalog-name")
+			if err != nil || !ok || receipt.Status != types.MutationCommitted {
+				t.Fatal(receipt, ok, err)
+			}
+			files, _, cleanup, err := m.CheckpointFilesAt(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+			if err = m.RestoreCheckpoint(ctx, files); err != nil {
+				t.Fatal(err)
+			}
+			if err = m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, err = Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = m.QueryResult(ctx, "SELECT id FROM pragma_table_list", nil); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

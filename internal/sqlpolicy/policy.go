@@ -47,12 +47,23 @@ func CheckFile(ctx context.Context, path string) error {
 	if policy != Marker() {
 		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
 	}
-	var unsupported int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_list WHERE schema='main' AND type IN ('virtual','shadow')`).Scan(&unsupported); err != nil {
+	rows, err := db.QueryContext(ctx, `PRAGMA main.table_list`)
+	if err != nil {
 		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
 	}
-	if unsupported != 0 {
-		return fmt.Errorf("%w: persistent virtual tables are unsupported", ErrIncompatible)
+	defer rows.Close()
+	for rows.Next() {
+		var schema, name, kind string
+		var columns, withoutRowID, strict int
+		if err := rows.Scan(&schema, &name, &kind, &columns, &withoutRowID, &strict); err != nil {
+			return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+		}
+		if kind == "virtual" || kind == "shadow" {
+			return fmt.Errorf("%w: persistent virtual tables are unsupported", ErrIncompatible)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
 	}
 	return nil
 }
