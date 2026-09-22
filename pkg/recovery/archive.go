@@ -194,7 +194,7 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
 	name := m.key("archive/head.bin")
-	attributes, headData, unchanged, err := m.readStableHead(ctx, name, oldCAS, oldHead.Tip == 0)
+	attributes, headData, unchanged, err := m.readStableObject(ctx, name, oldCAS, oldHead.Tip == 0)
 	if err != nil {
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
@@ -327,7 +327,7 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	return nil
 }
 
-func (m *Manager) readStableHead(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool) (objstore.ObjectAttributes, []byte, bool, error) {
+func (m *Manager) readStableObject(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool) (objstore.ObjectAttributes, []byte, bool, error) {
 	for range maxPublishRetries {
 		beforeCtx := ctx
 		if allowMissing {
@@ -352,7 +352,7 @@ func (m *Manager) readStableHead(ctx context.Context, name string, known *objsto
 			return after, data, false, nil
 		}
 	}
-	return objstore.ObjectAttributes{}, nil, false, fmt.Errorf("shared archive head did not stabilize")
+	return objstore.ObjectAttributes{}, nil, false, fmt.Errorf("shared archive object did not stabilize")
 }
 
 func sameObjectVersion(a, b *objstore.ObjectVersion) bool {
@@ -478,7 +478,7 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 
 func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead, priorCAS *objstore.ObjectVersion, refs []Extent) error {
 	name := m.key("archive/head.bin")
-	attributes, data, _, err := m.readStableHead(ctx, name, nil, false)
+	attributes, data, _, err := m.readStableObject(ctx, name, nil, false)
 	if err != nil {
 		return err
 	}
@@ -591,7 +591,7 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 					}
 					return err
 				}
-				stored, err := m.readRecoveryPin(ctx, key)
+				stored, err := m.confirmRecoveryPin(ctx, key, pin)
 				if err != nil {
 					return err
 				}
@@ -611,7 +611,13 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 		case <-timer.C:
 		}
 	}
-	return snapshot, err
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil || snapshot.pin.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrArchiveBusy
+	}
+	return snapshot, nil
 }
 
 func (s *RecoverySnapshot) RecoveryBase() (quepaxa.CheckpointSeal, quepaxa.DecidedValue, bool) {
@@ -685,7 +691,7 @@ func (s *RecoverySnapshot) Renew(ctx context.Context, lease time.Duration) error
 	if err != nil {
 		return err
 	}
-	if pin.OwnerID != s.pin.OwnerID || pin.Token != s.pin.Token || pin.Base != s.pin.Base || pin.TailHash != s.pin.TailHash || pin.TailObject != s.pin.TailObject || pin.LeaseUntilMS <= time.Now().UnixMilli() {
+	if pin.OwnerID != s.pin.OwnerID || pin.Token != s.pin.Token || pin.Base != s.pin.Base || pin.Tip != s.pin.Tip || pin.TailHash != s.pin.TailHash || pin.TailObject != s.pin.TailObject || pin.LeaseUntilMS <= time.Now().UnixMilli() {
 		return ErrArchiveBusy
 	}
 	pin.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
@@ -694,6 +700,9 @@ func (s *RecoverySnapshot) Renew(ctx context.Context, lease time.Duration) error
 			return ErrArchiveBusy
 		}
 		return err
+	}
+	if pin.LeaseUntilMS <= time.Now().UnixMilli() {
+		return ErrArchiveBusy
 	}
 	return nil
 }
@@ -709,7 +718,7 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 		}
 		return err
 	}
-	if pin.OwnerID != s.pin.OwnerID || pin.Token != s.pin.Token || pin.Base != s.pin.Base || pin.TailHash != s.pin.TailHash || pin.TailObject != s.pin.TailObject {
+	if pin.OwnerID != s.pin.OwnerID || pin.Token != s.pin.Token || pin.Base != s.pin.Base || pin.Tip != s.pin.Tip || pin.TailHash != s.pin.TailHash || pin.TailObject != s.pin.TailObject {
 		return ErrArchiveBusy
 	}
 	pin.LeaseUntilMS = time.Now().UnixMilli()
@@ -1291,6 +1300,9 @@ func (m *Manager) withGCLock(ctx context.Context, owner string, work func(contex
 }
 
 func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Duration) (*archiveGCLock, error) {
+	if owner == "" || lease <= 0 {
+		return nil, ErrArchiveBusy
+	}
 	for range maxPublishRetries {
 		current, err := m.readGCLock(objmetrics.WithExpectedNotFound(ctx))
 		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
@@ -1312,7 +1324,7 @@ func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Du
 			}
 			return nil, err
 		}
-		return m.readGCLock(ctx)
+		return m.confirmGCLock(ctx, lock)
 	}
 	return nil, ErrArchiveBusy
 }
@@ -1353,16 +1365,28 @@ func (m *Manager) renewGCLock(ctx context.Context, lock *archiveGCLock, lease ti
 		}
 		return nil, err
 	}
-	return m.readGCLock(ctx)
+	return m.confirmGCLock(ctx, *current)
+}
+
+func (m *Manager) confirmGCLock(ctx context.Context, expected archiveGCLock) (*archiveGCLock, error) {
+	stored, err := m.readGCLock(ctx)
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return nil, ErrArchiveBusy
+		}
+		return nil, err
+	}
+	observed := *stored
+	observed.version, expected.version = nil, nil
+	if observed != expected || observed.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrArchiveBusy
+	}
+	return stored, nil
 }
 
 func (m *Manager) readGCLock(ctx context.Context) (*archiveGCLock, error) {
 	key := m.gcLockKey()
-	attributes, err := m.bucket.Attributes(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	data, err := m.readObject(ctx, key, maxHeadSize)
+	attributes, data, _, err := m.readStableObject(ctx, key, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1387,11 +1411,7 @@ func (m *Manager) writeGCLock(ctx context.Context, lock archiveGCLock, options .
 }
 
 func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*archiveRecoveryPin, error) {
-	attributes, err := m.bucket.Attributes(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	data, err := m.readObject(ctx, key, maxHeadSize)
+	attributes, data, _, err := m.readStableObject(ctx, key, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1404,6 +1424,22 @@ func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*archiveReco
 	}
 	pin.version = attributes.Version
 	return &pin, nil
+}
+
+func (m *Manager) confirmRecoveryPin(ctx context.Context, key string, expected archiveRecoveryPin) (*archiveRecoveryPin, error) {
+	stored, err := m.readRecoveryPin(ctx, key)
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return nil, ErrArchiveBusy
+		}
+		return nil, err
+	}
+	observed := *stored
+	observed.version, expected.version = nil, nil
+	if observed != expected || observed.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrArchiveBusy
+	}
+	return stored, nil
 }
 
 func (m *Manager) writeRecoveryPin(ctx context.Context, key string, pin archiveRecoveryPin, options ...objstore.ObjectUploadOption) error {

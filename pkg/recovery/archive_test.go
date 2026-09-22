@@ -281,7 +281,7 @@ func TestRecoveryPinGCDoesNotDeleteConcurrentRenewal(t *testing.T) {
 	bucket := &racingRecoveryPinBucket{Bucket: objstore.NewInMemBucket()}
 	manager := NewManager(bucket, "cluster", 1)
 	key := manager.recoveryPinKey("recovery")
-	expired := archiveRecoveryPin{OwnerID: "recovery", Token: "token", Base: 1, Tip: 1, LeaseUntilMS: time.Now().Add(-time.Second).UnixMilli()}
+	expired := archiveRecoveryPin{OwnerID: "recovery", Token: "token", Base: 1, Tip: 2, TailHash: [32]byte{1}, TailObject: 7, LeaseUntilMS: time.Now().Add(-time.Second).UnixMilli()}
 	if err := manager.writeRecoveryPin(ctx, key, expired, objstore.WithIfNotExists()); err != nil {
 		t.Fatal(err)
 	}
@@ -297,8 +297,8 @@ func TestRecoveryPinGCDoesNotDeleteConcurrentRenewal(t *testing.T) {
 		}
 	}
 	bucket.armed.Store(true)
-	if _, err := manager.maxActiveRecoveryGeneration(ctx); !errors.Is(err, ErrArchiveBusy) {
-		t.Fatalf("GC error=%v, want archive busy", err)
+	if generation, err := manager.maxActiveRecoveryGeneration(ctx); err != nil || generation != 7 {
+		t.Fatalf("renewed generation is not protected: generation=%d err=%v", generation, err)
 	}
 	current, err := manager.readRecoveryPin(ctx, key)
 	if err != nil || current.LeaseUntilMS <= time.Now().UnixMilli() {

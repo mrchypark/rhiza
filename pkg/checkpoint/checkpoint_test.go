@@ -383,8 +383,12 @@ func TestRecoveryPinGCDoesNotDeleteConcurrentRenewal(t *testing.T) {
 		}
 	}
 	bucket.armed.Store(true)
-	if _, err := manager.activeRecoveryRoots(ctx); !errors.Is(err, ErrPublisherBusy) {
-		t.Fatalf("GC error=%v, want publisher busy", err)
+	roots, err := manager.activeRecoveryRoots(ctx)
+	if err != nil {
+		t.Fatalf("stable read did not observe renewal: %v", err)
+	}
+	if _, ok := roots[root.RootHash]; !ok {
+		t.Fatal("renewed root is not protected from GC")
 	}
 	current, err := manager.readRecoveryPin(ctx, key)
 	if err != nil || current.LeaseUntilMS <= time.Now().UnixMilli() {
