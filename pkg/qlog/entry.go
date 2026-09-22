@@ -10,12 +10,16 @@ import (
 var entryCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 const (
-	entryLengthMarker uint32 = 3 << 30
-	entryLengthMask   uint32 = ^entryLengthMarker
+	entryHeaderSize             = 53
+	entryRecordCRCOffset        = 45
+	entryHeaderCRCOffset        = 49
+	entryFormatMask      uint32 = 3 << 30
+	entryLengthMarker    uint32 = 2 << 30
+	entryLengthMask      uint32 = (1 << 30) - 1
 )
 
 func entryPayloadLength(encoded uint32) (uint32, bool) {
-	return encoded & entryLengthMask, encoded&entryLengthMarker == entryLengthMarker
+	return encoded & entryLengthMask, encoded&entryFormatMask == entryLengthMarker
 }
 
 // EntryType is the type of QLog entry.
@@ -40,8 +44,8 @@ type Entry struct {
 // Encode serializes an entry to bytes with CRC32 checksum.
 func (e Entry) Encode() []byte {
 	payloadLen := len(e.Payload)
-	// Layout: Slot(8) + Hash(32) + Type(1) + PayloadLen(4) + CRC(4) + Payload
-	buf := make([]byte, 0, 8+32+1+4+4+payloadLen)
+	// Layout: Slot(8) + Hash(32) + Type(1) + PayloadLen(4) + RecordCRC(4) + HeaderCRC(4) + Payload
+	buf := make([]byte, 0, entryHeaderSize+payloadLen)
 
 	// Slot
 	buf = binary.LittleEndian.AppendUint64(buf, e.Slot)
@@ -57,19 +61,22 @@ func (e Entry) Encode() []byte {
 
 	// The marker rejects bytes written by any other WAL layout.
 	buf = binary.LittleEndian.AppendUint32(buf, 0)
+	buf = binary.LittleEndian.AppendUint32(buf, 0)
 
 	// Payload
 	buf = append(buf, e.Payload...)
-	crc := crc32.Update(crc32.Checksum(buf[:45], entryCRCTable), entryCRCTable, buf[49:])
-	binary.LittleEndian.PutUint32(buf[45:49], crc)
+	crc := crc32.Update(crc32.Checksum(buf[:entryRecordCRCOffset], entryCRCTable), entryCRCTable, buf[entryHeaderSize:])
+	binary.LittleEndian.PutUint32(buf[entryRecordCRCOffset:entryHeaderCRCOffset], crc)
+	binary.LittleEndian.PutUint32(buf[entryHeaderCRCOffset:entryHeaderSize], crc32.Checksum(buf[:entryHeaderCRCOffset], entryCRCTable))
 
 	return buf
 }
 
 // DecodeEntry deserializes an entry from bytes.
 func DecodeEntry(data []byte) (Entry, int, error) {
-	if len(data) < 49 { // 8+32+1+4+4 minimum
-		return Entry{}, 0, io.ErrUnexpectedEOF
+	payloadLen, storedCRC, err := decodeEntryHeader(data)
+	if err != nil {
+		return Entry{}, 0, err
 	}
 
 	entry := Entry{
@@ -78,24 +85,36 @@ func DecodeEntry(data []byte) (Entry, int, error) {
 	}
 	copy(entry.Hash[:], data[8:40])
 
-	payloadLen, current := entryPayloadLength(binary.LittleEndian.Uint32(data[41:45]))
-	if !current {
-		return Entry{}, 0, fmt.Errorf("unknown WAL entry format")
-	}
-	storedCRC := binary.LittleEndian.Uint32(data[45:49])
-
-	totalLen := 49 + int(payloadLen)
+	totalLen := entryHeaderSize + int(payloadLen)
 	if len(data) < totalLen {
 		return Entry{}, 0, io.ErrUnexpectedEOF
 	}
 
-	actualCRC := crc32.Update(crc32.Checksum(data[:45], entryCRCTable), entryCRCTable, data[49:totalLen])
+	actualCRC := crc32.Update(crc32.Checksum(data[:entryRecordCRCOffset], entryCRCTable), entryCRCTable, data[entryHeaderSize:totalLen])
 	if storedCRC != actualCRC {
 		return Entry{}, 0, fmt.Errorf("CRC mismatch: stored=%08x actual=%08x", storedCRC, actualCRC)
 	}
 
 	entry.Payload = make([]byte, payloadLen)
-	copy(entry.Payload, data[49:totalLen])
+	copy(entry.Payload, data[entryHeaderSize:totalLen])
 
 	return entry, totalLen, nil
+}
+
+// decodeEntryHeader never exposes a length until its independent checksum passes.
+func decodeEntryHeader(data []byte) (uint32, uint32, error) {
+	if len(data) >= entryRecordCRCOffset {
+		if _, current := entryPayloadLength(binary.LittleEndian.Uint32(data[41:45])); !current {
+			return 0, 0, fmt.Errorf("unsupported WAL entry format; preserve old data and migrate logically")
+		}
+	}
+	if len(data) < entryHeaderSize {
+		return 0, 0, io.ErrUnexpectedEOF
+	}
+	stored := binary.LittleEndian.Uint32(data[entryHeaderCRCOffset:entryHeaderSize])
+	if actual := crc32.Checksum(data[:entryHeaderCRCOffset], entryCRCTable); stored != actual {
+		return 0, 0, fmt.Errorf("WAL header CRC mismatch: stored=%08x actual=%08x", stored, actual)
+	}
+	length, _ := entryPayloadLength(binary.LittleEndian.Uint32(data[41:45]))
+	return length, binary.LittleEndian.Uint32(data[entryRecordCRCOffset:entryHeaderCRCOffset]), nil
 }
