@@ -6,7 +6,7 @@ import (
 	"hash/crc32"
 )
 
-var manifestMagic = [8]byte{'R', 'H', 'Z', 'A', 'W', 'A', 'L', '!'}
+var manifestMagic = [8]byte{'R', 'H', 'Z', 'A', 'W', 'A', 'L', '2'}
 
 const (
 	manifestHeaderSize  = 8 + 8 + 4
@@ -26,7 +26,7 @@ type manifestRef struct {
 
 func encodeManifest(generation uint64, refs []manifestRef, identity []byte) ([]byte, error) {
 	if generation == 0 || len(refs) == 0 {
-		return nil, fmt.Errorf("invalid WAL manifest")
+		return nil, fmt.Errorf("invalid or unsupported WAL manifest; preserve old data and migrate logically")
 	}
 	if len(identity) > maxIdentitySize {
 		return nil, fmt.Errorf("WAL identity is too large")
@@ -65,7 +65,7 @@ func encodeManifest(generation uint64, refs []manifestRef, identity []byte) ([]b
 
 func decodeManifest(data []byte) (uint64, []manifestRef, []byte, error) {
 	if len(data) < manifestHeaderSize+manifestRefSize+manifestCRCSize || string(data[:8]) != string(manifestMagic[:]) {
-		return 0, nil, nil, fmt.Errorf("invalid WAL manifest")
+		return 0, nil, nil, fmt.Errorf("invalid or unsupported WAL manifest; preserve old data and migrate logically")
 	}
 	generation := binary.BigEndian.Uint64(data[8:16])
 	count := binary.BigEndian.Uint32(data[16:20])

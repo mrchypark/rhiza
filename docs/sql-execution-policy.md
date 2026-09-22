@@ -35,3 +35,19 @@ For an existing installation:
    traffic. Retain the old installation to resolve outstanding old outcomes.
 
 No migration or deployment is performed automatically by this change.
+
+## WAL framing compatibility
+
+The local WAL now uses a 53-byte header with independent CRC32C protection for
+its length and record checksum, and the `RHZAWAL2` manifest discriminator.
+All previous 49-byte WAL artifacts, including development builds of policy 2,
+are rejected before scanning or modifying their segments. Old raw segments are
+also rejected by restore. Preserve the old binary and data for the logical
+migration above; never relabel a manifest or mix old and new records.
+
+Only a physically incomplete final append under a current-format manifest can
+be truncated automatically. A complete header must pass its checksum before a
+short payload is repairable. Repairs are synced before startup succeeds;
+checksum or format failures preserve the evidence and fail closed. This does
+not distinguish an incomplete write from later physical deletion of identical
+tail bytes, and does not provide automatic migration of previous WAL formats.
