@@ -1,15 +1,15 @@
-# SQL execution policy 2 compatibility boundary
+# SQL execution policy 3 compatibility boundary
 
-The SQL counter/default and TEMP fixes are incompatible execution-policy changes. This is
-not an in-place upgrade. Certified SQL uses `QBAT\x02`; policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
+The SQL counter/default, TEMP and ROWID fixes are incompatible execution-policy changes. This is
+not an in-place upgrade. Certified SQL uses `QBAT\x03`; policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
 unknown policy versions and raw SQL decisions cannot be applied by this binary.
 Unsupported history is an error, not a rejected SQL receipt. Already-applied
 slots are checked too. Do not rewrite stored decision bytes.
 
-Existing unmarked or policy-1 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
-`sql_execution_policy=2` metadata value identifies newly initialized state; it
+Existing unmarked, policy-1 or policy-2 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
+`sql_execution_policy=3` metadata value identifies newly initialized state; it
 is not a migration certificate. Do not manually insert it into old databases or
-stamp old checkpoint descriptors. Peer ALPN v4 separates this binary from v2/v3
+stamp old checkpoint descriptors. Peer ALPN v5 separates this binary from v2/v3/v4
 peers. Mixed-version clusters and downgrades are unsupported.
 
 Replicated writes cannot create TEMP/TEMPORARY objects or use `temp` as a dotted
@@ -18,6 +18,26 @@ would otherwise be a table alias; use another alias. Persistent objects named
 `temp`, ordinary string values, and SQLite's internal sort/group workspace remain
 supported. Writer authorization also refuses resolved TEMP objects. Main-schema
 ALTER operations retain their narrowly scoped internal catalog maintenance.
+
+Policy 3 reserves the maximum actual SQLite ROWID (`9223372036854775807`).
+Effective INSERT/UPDATE of that key rejects and rolls back the entire command,
+including trigger writes and earlier statements. An implicit insert after
+`9223372036854775806` also rejects. Maximum integers in ordinary columns or
+WITHOUT ROWID keys remain supported. AUTOINCREMENT tables use the same restriction,
+although SQLite already handles their exhaustion deterministically.
+
+Persistent virtual tables (including every FTS5 storage mode), direct sequence or
+statistics table mutations, and ANALYZE are unsupported by replicated writes.
+Native preupdate hooks cannot cover those storage paths. Normal engine-managed
+AUTOINCREMENT bookkeeping and narrowly scoped ALTER/DROP maintenance remain supported.
+Old virtual-table materializations/checkpoints are refused before installation.
+
+Policy-3 physical state must originate from guarded execution or its supported
+checkpoint path. The marker does not validate arbitrary externally manufactured or
+relabeled files. Logical imports must use the guarded SQL API. A preexisting maximum
+application key needs an explicit application remapping decision, never automatic
+rewriting. If a later SQL error ends the whole transaction, application fails without
+a durable rejection receipt or tip advancement; it is not converted into success.
 
 For an existing installation:
 

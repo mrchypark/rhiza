@@ -92,16 +92,28 @@ func TestSQLServer(t *testing.T) {
 			{"sql": "INSERT INTO " + ftsTable + "(name) SELECT name FROM " + table},
 		},
 	}, &transaction)
-	if transaction.Status != "committed" {
-		t.Fatalf("SQLite feature transaction receipt: %+v", transaction)
+	if transaction.Status != "rejected" {
+		t.Fatalf("unsupported virtual-table transaction receipt: %+v", transaction)
+	}
+	post(t, "/sql/query", map[string]any{"sql": "SELECT COUNT(*) FROM sqlite_master WHERE name = ?", "args": []any{ftsTable}}, &got)
+	if len(got.Rows) != 1 || got.Rows[0][0] != float64(0) {
+		t.Fatalf("virtual table survived rejection: %+v", got)
+	}
+	post(t, "/sql/execute", map[string]string{"request_id": "max-rowid-" + suffix, "sql": "INSERT INTO " + table + " VALUES (9223372036854775807, 'unsafe')"}, &transaction)
+	if transaction.Status != "rejected" {
+		t.Fatalf("maximum rowid receipt: %+v", transaction)
+	}
+	post(t, "/sql/query", map[string]string{"sql": "SELECT COUNT(*) FROM " + table + " WHERE id=9223372036854775807"}, &got)
+	if len(got.Rows) != 1 || got.Rows[0][0] != float64(0) {
+		t.Fatalf("maximum rowid survived rejection: %+v", got)
 	}
 	post(t, "/sql/query", map[string]any{"sql": "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < 3) SELECT json_array(group_concat(n, '')) FROM seq"}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != `["123"]` {
 		t.Fatalf("SQLite CTE/JSON result: %+v", got)
 	}
-	post(t, "/sql/query", map[string]any{"sql": "SELECT name, row_number() OVER (ORDER BY name) FROM " + ftsTable + " WHERE " + ftsTable + " MATCH ?", "args": []any{"Grace"}}, &got)
+	post(t, "/sql/query", map[string]any{"sql": "SELECT name, row_number() OVER (ORDER BY name) FROM " + table + " WHERE name = ?", "args": []any{"Grace"}}, &got)
 	if len(got.Rows) != 1 || got.Rows[0][0] != "Grace" || got.Rows[0][1] != float64(1) {
-		t.Fatalf("SQLite FTS/window result: %+v", got)
+		t.Fatalf("SQLite window result: %+v", got)
 	}
 
 	key := "e2e-" + suffix

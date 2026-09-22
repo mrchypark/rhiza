@@ -51,7 +51,7 @@ func TestTempAdmissionNeverCertifies(t *testing.T) {
 	}
 }
 
-func TestPolicyOnePeerCannotNegotiate(t *testing.T) {
+func TestOldPolicyPeersCannotNegotiate(t *testing.T) {
 	member := testMember("policy-peer", "n1", "voter")
 	cluster := quepaxa.Cluster{Members: []quepaxa.Member{member}}
 	core := mustCore(t, "n1", cluster.Members, nil, nil)
@@ -65,10 +65,13 @@ func TestPolicyOnePeerCannotNegotiate(t *testing.T) {
 	}
 	defer peer.Close()
 	cluster.Members[0].PeerURL = "quic://" + peer.Addr()
-	client := NewTransport("policy-peer", "n1", &cluster, "voter")
-	defer client.Close()
-	client.tls.NextProtos = []string{"rhiza-peer-v3"}
-	if _, err = client.ReadTip(ctx, "n1"); err == nil || !strings.Contains(err.Error(), "application protocol") {
-		t.Fatalf("old ALPN handshake=%v", err)
+	for _, protocol := range []string{"rhiza-peer-v3", "rhiza-peer-v4"} {
+		client := NewTransport("policy-peer", "n1", &cluster, "voter")
+		client.tls.NextProtos = []string{protocol}
+		_, err = client.ReadTip(ctx, "n1")
+		client.Close()
+		if err == nil || !strings.Contains(err.Error(), "application protocol") {
+			t.Fatalf("%s handshake=%v", protocol, err)
+		}
 	}
 }

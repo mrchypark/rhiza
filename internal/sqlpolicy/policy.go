@@ -13,8 +13,8 @@ import (
 	"github.com/ncruces/go-sqlite3/driver"
 )
 
-const Version = 2
-const PeerALPN = "rhiza-peer-v4"
+const Version = 3
+const PeerALPN = "rhiza-peer-v5"
 
 func Marker() string { return strconv.Itoa(Version) }
 
@@ -46,6 +46,24 @@ func CheckFile(ctx context.Context, path string) error {
 	}
 	if policy != Marker() {
 		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA main.table_list`)
+	if err != nil {
+		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var schema, name, kind string
+		var columns, withoutRowID, strict int
+		if err := rows.Scan(&schema, &name, &kind, &columns, &withoutRowID, &strict); err != nil {
+			return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+		}
+		if kind == "virtual" || kind == "shadow" {
+			return fmt.Errorf("%w: persistent virtual tables are unsupported", ErrIncompatible)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
 	}
 	return nil
 }
