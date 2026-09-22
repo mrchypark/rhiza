@@ -1826,10 +1826,22 @@ func (c *Core) acceptDecision(decision Decision) error {
 // arrives, preserving the normal 16-slot pipeline after a crash.
 func (c *Core) advanceReconfigurationTipLocked() error {
 	before := c.tip
+	defer func() {
+		if c.tip != before {
+			close(c.tipChanged)
+			c.tipChanged = make(chan struct{})
+		}
+	}()
 	for {
 		decision, ok := c.decided[c.tip+1]
 		if !ok {
 			break
+		}
+		if c.isLeaderScheduleSlotLocked(c.tip + 1) {
+			order, scheduled, err := DecodeLeaderSchedule(decision.Value)
+			if err != nil || !scheduled || !validateLeaderSchedule(c.clusterForSlotLocked(c.tip+1), order) {
+				return fmt.Errorf("incompatible leader schedule history at slot %d", c.tip+1)
+			}
 		}
 		if bytes.HasPrefix(decision.Value, reconfigurationMagic) {
 			decoded, err := decodeDecision(decision.Certificate)
@@ -1847,10 +1859,6 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 		c.tip++
 		c.prefixes[c.tip] = AdvancePrefixHash(c.prefixes[c.tip-1], c.tip, decision.Hash)
 		c.observeLeaderEpochLocked(c.tip)
-	}
-	if c.tip != before {
-		close(c.tipChanged)
-		c.tipChanged = make(chan struct{})
 	}
 	return nil
 }
