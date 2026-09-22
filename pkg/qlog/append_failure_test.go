@@ -45,6 +45,7 @@ func TestWALUncertainAppendPreservesTail(t *testing.T) {
 			cause error
 		}{
 			{"zero-error", 0, injected}, {"header-error", 12, injected}, {"payload-error", 128, injected},
+			{"header44", 44, injected}, {"header45", 45, injected}, {"header48", 48, injected}, {"header49", 49, injected}, {"header52", 52, injected}, {"header53", 53, injected},
 			{"short-nil", 128, nil}, {"zero-nil", 0, nil}, {"full-error", -1, injected},
 		} {
 			t.Run(fmt.Sprintf("%s/dirty=%v", tc.name, dirty), func(t *testing.T) {

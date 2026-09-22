@@ -19,6 +19,7 @@ the same Go API.
 ## Requirements and installation
 
 SQL execution policy 2 requires a new cluster for existing installations, including policy 1.
+The protected WAL framing also rejects all previous 49-byte WAL artifacts, including earlier development builds.
 Old materializations, checkpoints and SQL history are rejected; mixed-version
 peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
 and preserve the old installation before changing binaries.

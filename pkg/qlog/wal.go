@@ -3,7 +3,6 @@ package qlog
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -576,36 +575,32 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 	}
 	size := info.Size()
 	var offset int64
-	buf := make([]byte, 49)
+	buf := make([]byte, entryHeaderSize)
 
 	for offset < size {
-		header := buf[:49]
+		header := buf[:entryHeaderSize]
 		remaining := size - offset
 		if remaining < int64(len(header)) {
-			if repairTail {
-				if err := s.file.Truncate(offset); err != nil {
-					return err
-				}
-				s.offset = offset
-				return nil
-			}
-			return io.ErrUnexpectedEOF
+			header = header[:int(remaining)]
 		}
 		if _, err := s.file.ReadAt(header, offset); err != nil {
 			return err
 		}
-		payloadLen, _ := entryPayloadLength(binary.LittleEndian.Uint32(header[41:45]))
-		totalLen := int64(len(header)) + int64(payloadLen)
+		payloadLen, _, err := decodeEntryHeader(header)
+		if err != nil {
+			if repairTail && errors.Is(err, io.ErrUnexpectedEOF) {
+				return s.repairTail(offset, s.file.Truncate, s.file.Sync)
+			}
+			return err
+		}
+		totalLen := int64(entryHeaderSize) + int64(payloadLen)
 		if totalLen > remaining {
 			if repairTail {
-				if err := s.file.Truncate(offset); err != nil {
-					return err
-				}
-				s.offset = offset
-				return nil
+				return s.repairTail(offset, s.file.Truncate, s.file.Sync)
 			}
 			return io.ErrUnexpectedEOF
 		}
+
 		if int64(cap(buf)) < totalLen {
 			next := make([]byte, int(totalLen))
 			copy(next, header)
@@ -1043,4 +1038,16 @@ func (w *WAL) Close() error {
 		seg.mu.Unlock()
 	}
 	return err
+}
+
+// repairTail is only called for a physically incomplete current-format suffix.
+func (s *Segment) repairTail(offset int64, truncate func(int64) error, syncFile func() error) error {
+	if err := truncate(offset); err != nil {
+		return err
+	}
+	if err := syncFile(); err != nil {
+		return err
+	}
+	s.offset = offset
+	return nil
 }
