@@ -17,8 +17,12 @@ func sqlPolicyTokens(query string) ([]sqlPolicyToken, error) {
 	var tokens []sqlPolicyToken
 	for i := 0; i < len(query); {
 		c := query[i]
-		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' {
+		if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v' {
 			i++
+			continue
+		}
+		if strings.HasPrefix(query[i:], "\ufeff") {
+			i += len("\ufeff")
 			continue
 		}
 		if c == '-' && i+1 < len(query) && query[i+1] == '-' {
@@ -69,7 +73,7 @@ func sqlPolicyTokens(query string) ([]sqlPolicyToken, error) {
 			for i < len(query) && (sqlNameByte(query[i]) || query[i] == ':') {
 				i++
 			}
-			if c == '$' && i < len(query) && query[i] == '(' {
+			if c != '?' && i < len(query) && query[i] == '(' {
 				for i < len(query) && query[i] != ')' {
 					i++
 				}

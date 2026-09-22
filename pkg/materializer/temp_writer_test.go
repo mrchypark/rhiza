@@ -116,3 +116,44 @@ func TestAlterScopeClearsOnSuccessAndFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestTempTokenizerMatchesSQLiteWriter(t *testing.T) {
+	for _, separator := range []string{" \v", " \ufeff"} {
+		t.Run(separator, func(t *testing.T) {
+			ctx := context.Background()
+			m, err := Open(t.TempDir()+"/db", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			statements := []types.SQLStatement{{SQL: "CREATE TABLE items(id INTEGER)"}, {SQL: "ALTER" + separator + "TABLE items RENAME TO renamed"}, {SQL: "INSERT INTO renamed VALUES(:x(temp.foo))", Args: []any{int64(7)}}, {SQL: "INSERT INTO renamed VALUES(@x(temp.foo))", Args: []any{int64(8)}}, {SQL: "INSERT INTO renamed VALUES($x(temp.foo))", Args: []any{int64(9)}}}
+			command := types.SQLCommand{RequestID: "forms", Statements: statements}
+			if err = ValidateSQLCommand(command); err != nil {
+				t.Fatal(err)
+			}
+			value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = m.Apply(ctx, 1, value); err != nil {
+				t.Fatal(err)
+			}
+			receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, "forms")
+			if err != nil || !found || receipt.Status != types.MutationCommitted {
+				t.Fatalf("receipt=%+v err=%v", receipt, err)
+			}
+			rows, err := m.QueryResult(ctx, "SELECT id FROM renamed ORDER BY id", nil)
+			if err != nil || len(rows.Rows) != 3 {
+				t.Fatalf("rows=%+v err=%v", rows, err)
+			}
+			for i, want := range []int64{7, 8, 9} {
+				if rows.Rows[i][0] != want {
+					t.Fatalf("rows=%v", rows.Rows)
+				}
+			}
+			if _, err = m.writer.ExecContext(ctx, "SELECT * FROM sqlite_temp_master"); err == nil {
+				t.Fatal("scope leaked")
+			}
+		})
+	}
+}

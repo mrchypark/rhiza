@@ -8,6 +8,10 @@ import (
 func TestReplicatedSQLRejectsTempAdmission(t *testing.T) {
 	for _, query := range []string{
 		"CREATE TEMP TABLE scratch (id INTEGER)",
+		"CREATE\vTEMP TABLE scratch (id INTEGER)",
+		"CREATE \vTEMP TABLE scratch (id INTEGER)",
+		"CREATE \ufeff TEMP TABLE scratch (id INTEGER)",
+		"CREATE TABLE \ufefftemp.scratch(id INTEGER)",
 		"CREATE TEMPORARY VIEW scratch AS SELECT 1",
 		"CREATE TEMP TRIGGER scratch AFTER INSERT ON items BEGIN SELECT 1; END",
 		"CREATE TABLE temp.scratch (id INTEGER)",
@@ -35,6 +39,9 @@ func TestReplicatedSQLAllowsPersistentTempNames(t *testing.T) {
 		"CREATE TABLE temperature(id INTEGER)",
 		"CREATE TABLE items(temporary INTEGER)",
 		"ALTER TABLE items RENAME TO renamed",
+		"SELECT :p(temp.x)",
+		"SELECT @p(temp.x)",
+		"SELECT $p(temp.x)",
 	} {
 		if err := ValidateSQLCommand(types.SQLCommand{RequestID: "persistent", SQL: query}); err != nil {
 			t.Errorf("%s: %v", query, err)

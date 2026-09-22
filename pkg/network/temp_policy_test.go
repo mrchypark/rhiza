@@ -35,6 +35,9 @@ func TestTempAdmissionNeverCertifies(t *testing.T) {
 			return s.Migrate(ctx, MigrationRequest{RequestID: "temp", Version: 1, Name: "temp", Checksum: strings.Repeat("0", 64), Statements: []types.SQLStatement{{SQL: "CREATE TABLE durable(id)"}, {SQL: "CREATE TEMP TRIGGER scratch AFTER INSERT ON durable BEGIN SELECT 1; END"}}})
 		},
 	}
+	for _, query := range []string{"CREATE \vTEMP TABLE scratch(id)", "CREATE \ufeffTEMP TABLE scratch(id)", "CREATE TABLE \ufefftemp.scratch(id)"} {
+		calls = append(calls, func() (ExecuteResponse, error) { return s.Execute(ctx, ExecuteRequest{RequestID: "temp", SQL: query}) })
+	}
 	for _, call := range calls {
 		if _, err := call(); !errors.Is(err, ErrInvalidRequest) {
 			t.Fatalf("admission=%v", err)
