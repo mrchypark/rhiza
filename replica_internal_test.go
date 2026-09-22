@@ -3,6 +3,8 @@ package rhiza
 import (
 	"context"
 	"errors"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -180,5 +182,83 @@ func TestLearnerFallsBackToArchiveWhenPeerHistoryIsCompacted(t *testing.T) {
 	rows, err := replica.Query(ctx, QueryRequest{SQL: "SELECT id FROM items"})
 	if err != nil || len(rows.Rows) != 1 || replica.Status().Source != "object-store" {
 		t.Fatalf("fallback rows=%#v status=%+v err=%v", rows.Rows, replica.Status(), err)
+	}
+}
+
+func TestLearnerPreservesPeerPolicyError(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	member := quepaxa.Member{ID: "n1", PublicKey: quepaxa.PublicKey(network.PeerPublicKey("policy-peer", "n1", "voter"))}
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", WAL: wal, Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{member}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := network.NewServer(core, nil, "policy-peer", true, nil)
+	defer server.Close()
+	peer, err := network.StartPeerServer(ctx, "127.0.0.1:0", server, []quepaxa.Member{member}, "voter", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	config := ReplicaConfig{ClusterID: "policy-peer", ReplicaID: "reader", DataDir: t.TempDir(), AdminToken: "admin", Members: []network.PeerIdentity{{ID: "n1", PeerURL: "quic://" + peer.Addr(), PublicKey: [32]byte(member.PublicKey)}}, ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(), SyncInterval: time.Hour}
+	running, err := OpenLearner(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer running.Close()
+	legacy, err := os.ReadFile("pkg/materializer/testdata/sql-policy-legacy/slot2.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := running.Sync(ctx); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("sync: %v", err)
+	}
+	if running.material.Tip() != 0 || running.Status().LastError == "" {
+		t.Fatalf("status: %+v", running.Status())
+	}
+	config.DataDir = t.TempDir()
+	config.ReplicaID = "new-reader"
+	opened, err := OpenLearner(ctx, config)
+	if opened != nil {
+		opened.Close()
+		t.Fatal("incompatible learner became ready")
+	}
+	if !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("startup: %v", err)
+	}
+}
+
+func TestRelativeDataDirReopen(t *testing.T) {
+	dir, err := os.MkdirTemp(".", "relative-policy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	config := Config{ClusterID: "relative-policy", NodeID: "n1", DataDir: dir, ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir()}
+	node, err := Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = node.Execute(context.Background(), ExecuteRequest{RequestID: "table", SQL: "CREATE TABLE items(id INTEGER PRIMARY KEY)"}); err != nil {
+		node.Close()
+		t.Fatal(err)
+	}
+	if err = node.Close(); err != nil {
+		t.Fatal(err)
+	}
+	node, err = Open(context.Background(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	if _, err = node.Query(context.Background(), QueryRequest{SQL: "SELECT * FROM items"}); err != nil {
+		t.Fatal(err)
 	}
 }

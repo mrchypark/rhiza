@@ -252,7 +252,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 		if objectErr != nil {
 			return nil, objectErr
 		}
-	} else if peerErr := r.syncPeer(childCtx); peerErr != nil && objectErr != nil {
+	} else if peerErr := r.syncPeer(childCtx); errors.Is(peerErr, sqlpolicy.ErrIncompatible) || (peerErr != nil && objectErr != nil) {
 		return nil, errors.Join(objectErr, peerErr)
 	}
 	r.statusMu.Lock()
@@ -407,7 +407,7 @@ func (r *ReadReplica) Sync(ctx context.Context) error {
 	var err error
 	if r.mode == ReplicaModeLearner {
 		err = r.syncPeer(ctx)
-		if err != nil && ctx.Err() == nil {
+		if err != nil && !errors.Is(err, sqlpolicy.ErrIncompatible) && ctx.Err() == nil {
 			err = r.syncObjectStore(ctx)
 		}
 	} else {

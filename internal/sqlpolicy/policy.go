@@ -27,6 +27,10 @@ func CheckExisting(ctx context.Context, path string) error {
 
 // CheckFile inspects provenance without opening a writer or upgrading the file.
 func CheckFile(ctx context.Context, path string) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
 	db, err := driver.Open((&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String() + "?mode=ro")
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrIncompatible, err)
