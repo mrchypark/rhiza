@@ -116,7 +116,9 @@ Use the `RequestKind*`, `RequestState*`, and `MutationCommitted`/
 
 Rhiza exposes SQLite's DDL, views, triggers, generated and STRICT tables,
 partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
-UPSERT, `RETURNING`, window functions, JSON functions, and FTS5.
+UPSERT, `RETURNING`, window functions, and JSON functions. Execution policy 3
+reserves the maximum actual ROWID and excludes persistent virtual-table writes
+(including FTS5); see [migration requirements](docs/sql-execution-policy.md).
 
 Replicated execution rejects explicit transaction control, attachment, and
 known nondeterministic functions. Use `Execute` for one mutation,

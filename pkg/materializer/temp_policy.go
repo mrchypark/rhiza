@@ -118,9 +118,9 @@ func validateReplicatedTempSQL(query string) error {
 	return nil
 }
 
-func singleAlterSQL(query string) bool {
+func singleSchemaMaintenanceSQL(query string) bool {
 	tokens, err := sqlPolicyTokens(query)
-	if err != nil || len(tokens) < 3 || !tokens[0].bare || !strings.EqualFold(tokens[0].text, "ALTER") || !tokens[1].bare || !strings.EqualFold(tokens[1].text, "TABLE") {
+	if err != nil || len(tokens) < 3 || !tokens[0].bare || !(strings.EqualFold(tokens[0].text, "ALTER") || strings.EqualFold(tokens[0].text, "DROP")) || !tokens[1].bare || !strings.EqualFold(tokens[1].text, "TABLE") {
 		return false
 	}
 	for len(tokens) > 0 && tokens[len(tokens)-1].symbol && tokens[len(tokens)-1].text == ";" {

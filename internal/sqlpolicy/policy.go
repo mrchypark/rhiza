@@ -13,8 +13,8 @@ import (
 	"github.com/ncruces/go-sqlite3/driver"
 )
 
-const Version = 2
-const PeerALPN = "rhiza-peer-v4"
+const Version = 3
+const PeerALPN = "rhiza-peer-v5"
 
 func Marker() string { return strconv.Itoa(Version) }
 
@@ -46,6 +46,13 @@ func CheckFile(ctx context.Context, path string) error {
 	}
 	if policy != Marker() {
 		return fmt.Errorf("%w: marker %q", ErrIncompatible, policy)
+	}
+	var unsupported int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_list WHERE schema='main' AND type IN ('virtual','shadow')`).Scan(&unsupported); err != nil {
+		return fmt.Errorf("%w: inspect table kinds: %v", ErrIncompatible, err)
+	}
+	if unsupported != 0 {
+		return fmt.Errorf("%w: persistent virtual tables are unsupported", ErrIncompatible)
 	}
 	return nil
 }

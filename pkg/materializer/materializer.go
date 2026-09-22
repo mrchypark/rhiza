@@ -1654,7 +1654,7 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			args[ref.ArgIndex] = value
 		}
 		statementResult, err := func() (out types.SQLStatementResult, resultErr error) {
-			if singleAlterSQL(statement.SQL) {
+			if singleSchemaMaintenanceSQL(statement.SQL) {
 				set := func(allow bool) error {
 					return conn.Raw(func(raw any) error { return setSQLAuthorizer(raw.(sqlite3driver.Conn).Raw(), true, false, allow) })
 				}
@@ -1685,6 +1685,15 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			}); err != nil {
 				return types.SQLStatementResult{}, err
 			}
+			finishRowID, err := watchRowID(ctx, conn, tx)
+			if err != nil {
+				return out, err
+			}
+			defer func() {
+				if err := finishRowID(); err != nil {
+					out, resultErr = types.SQLStatementResult{}, err
+				}
+			}()
 			if statement.WantRows {
 				wantsRows = true
 				rows, err := query.QueryContext(ctx, args...)

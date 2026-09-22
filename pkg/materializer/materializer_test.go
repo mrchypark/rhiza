@@ -1332,11 +1332,9 @@ func TestMaterializerHiqliteSQLSurface(t *testing.T) {
 			{SQL: `CREATE UNIQUE INDEX feature_name ON feature(lower(name)) WHERE score >= 0`},
 			{SQL: `CREATE TABLE audit (feature_id INTEGER, old_score INTEGER, new_score INTEGER)`},
 			{SQL: `CREATE TRIGGER feature_audit AFTER UPDATE OF score ON feature BEGIN INSERT INTO audit VALUES (old.id, old.score, new.score); END`},
-			{SQL: `CREATE VIRTUAL TABLE feature_search USING fts5(name)`},
 		}},
 		{RequestID: "insert", SQL: `INSERT INTO feature(name, score) VALUES (?, ?)`, Args: []any{"Ada", int64(3)}},
 		{RequestID: "cte-upsert", SQL: `WITH input(name, score) AS (VALUES ('Ada', 5), ('Grace', 7)) INSERT INTO feature(name, score) SELECT name, score FROM input WHERE true ON CONFLICT(lower(name)) WHERE score >= 0 DO UPDATE SET score = excluded.score`},
-		{RequestID: "fts", SQL: `INSERT INTO feature_search(name) SELECT name FROM feature`},
 	}
 	for slot, command := range commands {
 		if err := ValidateSQLCommand(command); err != nil {
@@ -1363,13 +1361,6 @@ func TestMaterializerHiqliteSQLSurface(t *testing.T) {
 	}
 	if got := result.Rows; len(got) != 2 || got[0][0] != "Grace" || got[0][1] != int64(1) {
 		t.Fatalf("window result=%v", got)
-	}
-	result, err = m.QueryResult(ctx, `SELECT name FROM feature_search WHERE feature_search MATCH 'Grace'`, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := result.Rows; len(got) != 1 || got[0][0] != "Grace" {
-		t.Fatalf("FTS5 result=%v", got)
 	}
 }
 

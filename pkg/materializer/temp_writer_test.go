@@ -185,7 +185,7 @@ func TestAlterTrailingEmptyStatements(t *testing.T) {
 	if _, err = m.writer.ExecContext(ctx, "SELECT * FROM sqlite_temp_master"); err == nil {
 		t.Fatal("ALTER authorization scope leaked")
 	}
-	if singleAlterSQL("ALTER TABLE renamed RENAME TO final; SELECT 1") {
+	if singleSchemaMaintenanceSQL("ALTER TABLE renamed RENAME TO final; SELECT 1") {
 		t.Fatal("second executable statement accepted")
 	}
 }
