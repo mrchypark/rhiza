@@ -35,3 +35,19 @@ For an existing installation:
    traffic. Retain the old installation to resolve outstanding old outcomes.
 
 No migration or deployment is performed automatically by this change.
+
+## Graph engine upgrade
+
+The new-cluster requirement also covers the upgrade from latticedb-go v0.7.0
+to v0.9.0. Export actual application nodes, relationships, and properties with
+the old compatible binary, then import them with new graph request IDs into
+the fresh cluster. Do not copy graph files, checkpoints, receipts, or replay
+old graph decision history, and do not mix graph engine versions among peers.
+
+The underlying storage format is unchanged, but query grammar and resource
+accounting are not: a previously rejected certified query can commit under the
+new engine. Graph batches retain their existing envelope and are not universally
+fenced by an engine version when replayed without materializations. The supported
+migration is logical import, not cross-version history replay. This also applies
+to earlier development builds carrying SQL policy 2. SQL policy metadata alone
+is not proof of graph replay compatibility.
