@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"io"
 	"math"
 	"net/url"
@@ -178,12 +179,17 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		return nil, fmt.Errorf("idempotency window must be between 1024 and 1048576 slots")
 	}
 	existing := false
-	if info, err := os.Stat(dbPath); err == nil {
-		existing = info.Size() > 0
+	if _, err := os.Stat(dbPath); err == nil {
+		existing = true
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("stat database: %w", err)
 	}
 	fileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+	if existing {
+		if err := sqlpolicy.CheckFile(context.Background(), dbPath); err != nil {
+			return nil, err
+		}
+	}
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
 	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)"
@@ -330,7 +336,7 @@ func (m *Materializer) loadTip(existing bool) error {
 			return fmt.Errorf("existing database has no applied slot; rebuild it from the decision log")
 		}
 		zeroHash := hex.EncodeToString(make([]byte, sha256.Size))
-		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
+		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', '1'), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
 			return err
 		}
 		value = "0"
@@ -366,6 +372,9 @@ func (m *Materializer) loadTip(existing bool) error {
 
 // ValidateTip checks that materialized state agrees with the recovered log.
 func (m *Materializer) ValidateTip(slot uint64, value []byte) error {
+	if err := types.ValidateExecutionPolicy(value); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.tip != slot {
@@ -878,6 +887,11 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
 func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) error {
+	for _, decision := range decisions {
+		if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+			return err
+		}
+	}
 	if len(decisions) == 0 {
 		return nil
 	}
@@ -1092,7 +1106,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		commands = nil
 		batched = true
 	} else if !batched {
-		commands = []types.SQLCommand{{SQL: string(value)}}
+		return sqlpolicy.ErrIncompatible
 	}
 	pendingStart := len(m.pendingSQLReceipts)
 	for _, command := range commands {
@@ -2228,6 +2242,9 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 	if parts.sqlitePath == "" || !seen[CheckpointGraphData] {
 		return fmt.Errorf("checkpoint requires SQLite and Graph files")
 	}
+	if err := sqlpolicy.CheckFile(ctx, parts.sqlitePath); err != nil {
+		return err
+	}
 	root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
 	if err != nil {
 		return err
@@ -2408,6 +2425,9 @@ func (m *Materializer) restoreParts(ctx context.Context, parts snapshotParts) er
 		return fmt.Errorf("invalid snapshot: quick_check=%q err=%v", status, err)
 	}
 	backupPath := m.dbPath + ".restore-backup"
+	if err := sqlpolicy.CheckFile(ctx, tempPath); err != nil {
+		return err
+	}
 	graphPath := filepath.Join(dir, "latticedb")
 	graphBackupPath := graphPath + ".restore-backup"
 	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {

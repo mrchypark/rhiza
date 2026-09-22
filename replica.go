@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"net/http"
 	"os"
 	"path"
@@ -138,6 +139,9 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	if config.DataDir == "" || config.ReplicaID == "" {
 		return nil, fmt.Errorf("replica ID and data directory are required")
 	}
+	if err := sqlpolicy.CheckExisting(ctx, path.Join(config.DataDir, "sqlite.db")); err != nil {
+		return nil, err
+	}
 	if config.ClusterID == "" {
 		config.ClusterID = "cluster-a"
 	}
@@ -241,6 +245,9 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 		return nil, fmt.Errorf("replica materialized slot %d is ahead of certified tip %d", r.material.Tip(), r.core.Tip())
 	}
 	objectErr := r.syncObjectStore(childCtx)
+	if errors.Is(objectErr, sqlpolicy.ErrIncompatible) {
+		return nil, objectErr
+	}
 	if mode == ReplicaModeObjectStore {
 		if objectErr != nil {
 			return nil, objectErr
@@ -458,6 +465,11 @@ func (r *ReadReplica) syncPeer(ctx context.Context) error {
 				}
 			}
 			before := r.core.Tip()
+			for _, decision := range values {
+				if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+					return err
+				}
+			}
 			if err := r.core.AcceptCertifiedValues(values); err != nil {
 				return err
 			}
@@ -622,6 +634,11 @@ func (r *ReadReplica) acceptArchive(ctx context.Context, read archiveReader, tip
 		}
 		if len(values) == 0 {
 			return fmt.Errorf("shared archive omitted slot %d", r.core.Tip()+1)
+		}
+		for _, decision := range values {
+			if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
+				return err
+			}
 		}
 		if err := r.core.AcceptCertifiedValues(values); err != nil {
 			return err

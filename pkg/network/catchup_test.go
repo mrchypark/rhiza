@@ -231,7 +231,7 @@ func TestCatchUpControlPageIsDurableEvenAsHint(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, _, err := source.Propose(ctx, []byte("ordinary-prefix")); err != nil {
+	if _, _, err := source.Propose(ctx, policySQL(t, "SELECT 1")); err != nil {
 		t.Fatal(err)
 	}
 	joiner := testMember("cluster", "b", "b-token")

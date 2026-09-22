@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"io"
 	"log"
 	"os"
@@ -58,14 +59,15 @@ type File struct {
 type Source struct{ Role, Path string }
 
 type Checkpoint struct {
-	ConfigID   uint     `json:"config_id"`
-	Generation uint64   `json:"generation"`
-	Index      uint64   `json:"index"`
-	Hash       [32]byte `json:"hash"`
-	Size       int64    `json:"size"`
-	Files      []File   `json:"files"`
-	RootHash   [32]byte `json:"-"`
-	claim      *PublisherClaim
+	SQLExecutionPolicy int      `json:"sql_execution_policy"`
+	ConfigID           uint     `json:"config_id"`
+	Generation         uint64   `json:"generation"`
+	Index              uint64   `json:"index"`
+	Hash               [32]byte `json:"hash"`
+	Size               int64    `json:"size"`
+	Files              []File   `json:"files"`
+	RootHash           [32]byte `json:"-"`
+	claim              *PublisherClaim
 }
 
 type PublisherClaim struct {
@@ -430,6 +432,13 @@ func (m *Manager) loadAll(ctx context.Context) error {
 }
 
 func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64) (*Checkpoint, error) {
+	for _, source := range sources {
+		if source.Role == RoleSQLite {
+			if err := sqlpolicy.CheckFile(ctx, source.Path); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if index == 0 {
 		return nil, fmt.Errorf("checkpoint index is required")
 	}
@@ -444,7 +453,7 @@ func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, source
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	root := Checkpoint{ConfigID: m.configID, Generation: claim.Generation, Index: index}
+	root := Checkpoint{SQLExecutionPolicy: sqlpolicy.Version, ConfigID: m.configID, Generation: claim.Generation, Index: index}
 	conditional := false
 	for _, option := range m.bucket.SupportedObjectUploadOptions() {
 		conditional = conditional || option == objstore.IfNotExists
@@ -820,6 +829,9 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 	if root == nil || root.ConfigID != m.configID || root.Index == 0 {
 		return nil, fmt.Errorf("invalid checkpoint root")
 	}
+	if err := m.validateRoot(*root); err != nil {
+		return nil, err
+	}
 	files := make([]File, 0, len(root.Files))
 	for _, file := range root.Files {
 		file.Path = filePath(dir, file.Role)
@@ -830,6 +842,13 @@ func (m *Manager) DownloadAndVerifyRootFiles(ctx context.Context, root *Checkpoi
 			return nil, err
 		}
 		files = append(files, file)
+	}
+	for _, file := range files {
+		if file.Role == RoleSQLite {
+			if err := sqlpolicy.CheckFile(ctx, file.Path); err != nil {
+				return nil, err
+			}
+		}
 	}
 	m.verifiedMu.Lock()
 	if err := m.loadVerifiedBlocks(); err != nil {
@@ -1471,6 +1490,9 @@ func (m *Manager) readRoot(ctx context.Context, name string, expected [32]byte) 
 }
 
 func (m *Manager) validateRoot(root Checkpoint) error {
+	if root.SQLExecutionPolicy != sqlpolicy.Version {
+		return sqlpolicy.ErrIncompatible
+	}
 	if root.ConfigID != m.configID || root.Generation == 0 || root.Index == 0 || root.Size <= 0 || root.Size > maxCheckpointSize || len(root.Files) < 1 || len(root.Files) > 2 {
 		return fmt.Errorf("invalid checkpoint root")
 	}

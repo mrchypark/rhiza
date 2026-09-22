@@ -604,7 +604,7 @@ func knownNonGraphValue(value []byte) (bool, error) {
 	if ok, err := types.DecodeReconfiguration(value); ok || err != nil {
 		return ok, err
 	}
-	return true, nil // Materializer.Apply also accepts raw SQL.
+	return false, types.ValidateExecutionPolicy(value)
 }
 
 func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[string]any) (types.GraphCommandResult, error) {

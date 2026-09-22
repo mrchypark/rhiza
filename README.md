@@ -18,6 +18,11 @@ the same Go API.
 
 ## Requirements and installation
 
+SQL execution policy 1 requires a new cluster for existing installations.
+Old materializations, checkpoints and SQL history are rejected; mixed-version
+peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
+and preserve the old installation before changing binaries.
+
 Rhiza requires Go 1.27 or newer. `GOTOOLCHAIN=auto` is expected. SQLite uses
 [`ncruces/go-sqlite3`](https://github.com/ncruces/go-sqlite3), and Graph uses
 [`latticedb-go`](https://github.com/mrchypark/latticedb-go), both without cgo.

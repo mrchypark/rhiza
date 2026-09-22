@@ -321,6 +321,11 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		if err != nil {
 			return nil, err
 		}
+		if len(proposal.Value) != 0 {
+			if err := types.ValidateExecutionPolicy(proposal.Value); err != nil {
+				return nil, err
+			}
+		}
 		if len(request.Hash) != 0 && len(request.Hash) != sha256.Size {
 			return nil, fmt.Errorf("invalid reconfiguration ID")
 		}
@@ -347,6 +352,11 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		decision, err := decisionFromWire(request.Decision)
 		if err != nil {
 			return nil, err
+		}
+		if len(decision.Proposal.Value) != 0 {
+			if err := types.ValidateExecutionPolicy(decision.Proposal.Value); err != nil {
+				return nil, err
+			}
 		}
 		if control, err := quepaxa.DecodeReconfiguration(decision.Proposal.Value); err != nil {
 			return nil, err
@@ -413,6 +423,9 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(s.server.core.Tip())}, nil
 	case peerfb.OperationStageValue:
+		if err := types.ValidateExecutionPolicy(request.Value); err != nil {
+			return nil, err
+		}
 		if len(request.Hash) != sha256.Size {
 			return nil, fmt.Errorf("invalid value hash")
 		}

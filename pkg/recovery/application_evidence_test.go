@@ -33,10 +33,10 @@ func buildSourceWithSQL(t *testing.T) (objstore.Bucket, string, quepaxa.Cluster)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := core.Propose(ctx, []byte("CREATE TABLE epoch_proof (epoch INTEGER, token TEXT)")); err != nil {
+	if _, _, err := core.Propose(ctx, policySQL(t, "CREATE TABLE epoch_proof (epoch INTEGER, token TEXT)")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := core.Propose(ctx, []byte("INSERT INTO epoch_proof VALUES (7, 'proof-token')")); err != nil {
+	if _, _, err := core.Propose(ctx, policySQL(t, "INSERT INTO epoch_proof VALUES (7, 'proof-token')")); err != nil {
 		t.Fatal(err)
 	}
 	graphVal, err := types.EncodeGraphCommand(types.GraphCommand{

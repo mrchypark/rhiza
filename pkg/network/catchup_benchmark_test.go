@@ -103,7 +103,7 @@ func catchUpValues(t testing.TB, count int) (quepaxa.Cluster, []quepaxa.DecidedV
 		t.Fatal(err)
 	}
 	for i := 0; i < count; i++ {
-		if _, _, err := core.Propose(context.Background(), []byte(fmt.Sprint(i))); err != nil {
+		if _, _, err := core.Propose(context.Background(), policySQL(t, "SELECT "+fmt.Sprint(i))); err != nil {
 			t.Fatal(err)
 		}
 	}

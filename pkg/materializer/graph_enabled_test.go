@@ -167,7 +167,7 @@ func TestGraphJournalTracksOnlyGraphSlotsAndPrunesCommittedPrefix(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	decisions := []quepaxa.DecidedValue{{Slot: 1, Value: []byte("CREATE TABLE batch_1 (id INTEGER)")}, {Slot: 2, Value: graphValue}}
+	decisions := []quepaxa.DecidedValue{{Slot: 1, Value: policySQL(t, "CREATE TABLE batch_1 (id INTEGER)")}, {Slot: 2, Value: graphValue}}
 	if err := m.ApplyBatch(ctx, decisions); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestGraphJournalTracksOnlyGraphSlotsAndPrunesCommittedPrefix(t *testing.T) 
 	if err != nil || len(entries) != 1 || entries[0].Slot != 2 {
 		t.Fatalf("sparse batch journal=%+v err=%v", entries, err)
 	}
-	if err := m.Apply(ctx, 3, []byte("CREATE TABLE next (id INTEGER)")); err != nil {
+	if err := m.Apply(ctx, 3, policySQL(t, "CREATE TABLE next (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	graphValue, err = types.EncodeGraphCommand(types.GraphCommand{RequestID: "next-graph", Cypher: `CREATE (:Batch {id: '4'})`})
@@ -206,7 +206,7 @@ func TestGraphSparseAheadRecoveryAcceptsOnlyMatchingGraphDecisions(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(ctx, 1, []byte("CREATE TABLE durable (id INTEGER)")); err != nil {
+	if err := m.Apply(ctx, 1, policySQL(t, "CREATE TABLE durable (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	encodedTip, err := m.graph.getMetadata(graphTipKey)
@@ -217,7 +217,7 @@ func TestGraphSparseAheadRecoveryAcceptsOnlyMatchingGraphDecisions(t *testing.T)
 	if err != nil || durableTip != 0 {
 		t.Fatalf("durable graph tip=%d err=%v, want 0", durableTip, err)
 	}
-	if err := m.applyGraph(ctx, 2, []byte("CREATE TABLE pending (id INTEGER)"), nil, false, 1); err != nil {
+	if err := m.applyGraph(ctx, 2, policySQL(t, "CREATE TABLE pending (id INTEGER)"), nil, false, 1); err != nil {
 		t.Fatal(err)
 	}
 	graphValue, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "sparse-ahead", Cypher: `CREATE (:Sparse {id: '3'})`})
@@ -239,7 +239,7 @@ func TestGraphSparseAheadRecoveryAcceptsOnlyMatchingGraphDecisions(t *testing.T)
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.Apply(ctx, 2, []byte("CREATE TABLE pending (id INTEGER)")); err != nil {
+	if err := m.Apply(ctx, 2, policySQL(t, "CREATE TABLE pending (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	other, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "conflict", Cypher: `CREATE (:Sparse {id: 'other'})`})

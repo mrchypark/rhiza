@@ -94,13 +94,13 @@ func TestMaterializerApply(t *testing.T) {
 	defer m.Close()
 
 	// Create table
-	err = m.Apply(context.Background(), 1, []byte("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)"))
+	err = m.Apply(context.Background(), 1, policySQL(t, "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)"))
 	if err != nil {
 		t.Fatalf("apply error: %v", err)
 	}
 
 	// Insert data
-	err = m.Apply(context.Background(), 2, []byte("INSERT INTO test (id, name) VALUES (1, 'hello')"))
+	err = m.Apply(context.Background(), 2, policySQL(t, "INSERT INTO test (id, name) VALUES (1, 'hello')"))
 	if err != nil {
 		t.Fatalf("apply error: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestSQLReceiptBatchHandlesFailuresAndCrossDecisionDuplicates(t *testing.T) 
 		t.Fatal(err)
 	}
 	if err := m.ApplyBatch(ctx, []quepaxa.DecidedValue{
-		{Slot: 1, Value: []byte("CREATE TABLE receipt_batch (id INTEGER PRIMARY KEY)")},
+		{Slot: 1, Value: policySQL(t, "CREATE TABLE receipt_batch (id INTEGER PRIMARY KEY)")},
 		{Slot: 2, Value: first},
 		{Slot: 3, Value: duplicate},
 	}); err != nil {
@@ -945,7 +945,7 @@ func TestMaterializerArgumentsTransactionsResultsAndSnapshot(t *testing.T) {
 	if index != 1 {
 		t.Fatalf("checkpoint index=%d, want 1", index)
 	}
-	if err := m.Apply(ctx, 2, []byte("DELETE FROM features")); err != nil {
+	if err := m.Apply(ctx, 2, policySQL(t, "DELETE FROM features")); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.RestoreCheckpoint(ctx, files); err != nil {
@@ -984,8 +984,8 @@ func TestReadResultsReportTheirSQLiteSnapshotSlot(t *testing.T) {
 	}
 	defer m.Close()
 	for slot, value := range [][]byte{
-		[]byte("CREATE TABLE values_at (value TEXT)"),
-		[]byte("INSERT INTO values_at VALUES ('before')"),
+		policySQL(t, "CREATE TABLE values_at (value TEXT)"),
+		policySQL(t, "INSERT INTO values_at VALUES ('before')"),
 		mustKVValue(t, types.KVCommand{RequestID: "before", Operation: "put", Key: "key", Value: []byte("before"), ObservedAtUnixMS: 1}),
 	} {
 		if err := m.Apply(ctx, uint64(slot+1), value); err != nil {
@@ -999,7 +999,7 @@ func TestReadResultsReportTheirSQLiteSnapshotSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(ctx, 4, []byte("UPDATE values_at SET value = 'after'")); err != nil {
+	if err := m.Apply(ctx, 4, policySQL(t, "UPDATE values_at SET value = 'after'")); err != nil {
 		_ = snapshot.Close()
 		t.Fatal(err)
 	}
@@ -1134,10 +1134,10 @@ func TestMaterializerRejectsNondeterministicWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.Apply(context.Background(), 1, []byte("CREATE TABLE deterministic (value INTEGER DEFAULT (random()))")); err != nil {
+	if err := m.Apply(context.Background(), 1, policySQL(t, "CREATE TABLE deterministic (value INTEGER DEFAULT (random()))")); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(context.Background(), 2, []byte("INSERT INTO deterministic VALUES (random())")); err == nil {
+	if err := m.Apply(context.Background(), 2, policySQL(t, "INSERT INTO deterministic VALUES (random())")); err == nil {
 		t.Fatal("expected random() to be rejected")
 	}
 }
@@ -1306,7 +1306,7 @@ func TestStateTipIgnoresConsensusOnlyDecisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.Apply(context.Background(), 1, []byte("CREATE TABLE state_tip (id INTEGER)")); err != nil {
+	if err := m.Apply(context.Background(), 1, policySQL(t, "CREATE TABLE state_tip (id INTEGER)")); err != nil {
 		t.Fatal(err)
 	}
 	var nonce [types.ReadBarrierNonceSize]byte
@@ -1594,7 +1594,7 @@ func TestQueryAfterCloseReturnsError(t *testing.T) {
 	if _, err := m.Query(context.Background(), "SELECT 1"); !errors.Is(err, sql.ErrConnDone) {
 		t.Fatalf("query after close error = %v, want %v", err, sql.ErrConnDone)
 	}
-	if err := m.Apply(context.Background(), 1, []byte("SELECT 1")); !errors.Is(err, sql.ErrConnDone) {
+	if err := m.Apply(context.Background(), 1, policySQL(t, "SELECT 1")); !errors.Is(err, sql.ErrConnDone) {
 		t.Fatalf("apply after close error = %v, want %v", err, sql.ErrConnDone)
 	}
 	if _, err := m.SnapshotTo(context.Background(), io.Discard); !errors.Is(err, sql.ErrConnDone) {
@@ -1642,10 +1642,10 @@ func TestMaterializerPersistsAppliedSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(context.Background(), 1, []byte("CREATE TABLE durable (id INTEGER PRIMARY KEY)")); err != nil {
+	if err := m.Apply(context.Background(), 1, policySQL(t, "CREATE TABLE durable (id INTEGER PRIMARY KEY)")); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Apply(context.Background(), 2, []byte("INSERT INTO durable VALUES (1)")); err != nil {
+	if err := m.Apply(context.Background(), 2, policySQL(t, "INSERT INTO durable VALUES (1)")); err != nil {
 		t.Fatal(err)
 	}
 	m.Close()
@@ -1658,16 +1658,16 @@ func TestMaterializerPersistsAppliedSlot(t *testing.T) {
 	if m.Tip() != 2 {
 		t.Fatalf("tip=%d, want 2", m.Tip())
 	}
-	if err := m.Apply(context.Background(), 2, []byte("INSERT INTO durable VALUES (1)")); err != nil {
+	if err := m.Apply(context.Background(), 2, policySQL(t, "INSERT INTO durable VALUES (1)")); err != nil {
 		t.Fatalf("duplicate apply: %v", err)
 	}
-	if err := m.Apply(context.Background(), 2, []byte("INSERT INTO durable VALUES (2)")); err == nil {
+	if err := m.Apply(context.Background(), 2, policySQL(t, "INSERT INTO durable VALUES (2)")); err == nil {
 		t.Fatal("expected duplicate slot hash conflict")
 	}
-	if err := m.Apply(context.Background(), 4, []byte("SELECT 1")); err == nil {
+	if err := m.Apply(context.Background(), 4, policySQL(t, "SELECT 1")); err == nil {
 		t.Fatal("expected slot gap")
 	}
-	if err := m.Apply(context.Background(), 3, []byte("not valid SQL")); err == nil {
+	if err := m.Apply(context.Background(), 3, policySQL(t, "not valid SQL")); err == nil {
 		t.Fatal("expected SQL error")
 	}
 	if m.Tip() != 2 {
@@ -1682,7 +1682,7 @@ func TestValidateTipRejectsRecoveredDecisionConflict(t *testing.T) {
 	}
 	defer m.Close()
 	ctx := context.Background()
-	value := []byte("CREATE TABLE validate_tip (id INTEGER)")
+	value := policySQL(t, "CREATE TABLE validate_tip (id INTEGER)")
 	if err := m.Apply(ctx, 1, value); err != nil {
 		t.Fatal(err)
 	}
@@ -1716,7 +1716,7 @@ func TestPublicSQLCannotAccessInternalTables(t *testing.T) {
 	}
 	defer m.Close()
 	ctx := context.Background()
-	if err := m.Apply(ctx, 1, []byte(`INSERT INTO _rhiza_meta(key, value) VALUES ('owned', '1')`)); err == nil {
+	if err := m.Apply(ctx, 1, policySQL(t, `INSERT INTO _rhiza_meta(key, value) VALUES ('owned', '1')`)); err == nil {
 		t.Fatal("replicated SQL wrote an internal table")
 	}
 	if _, err := m.QueryResult(ctx, `SELECT * FROM _rhiza_meta`, nil); err == nil {
@@ -1731,8 +1731,8 @@ func TestApplyBatchAdvancesContiguousPage(t *testing.T) {
 	}
 	defer m.Close()
 	decisions := []quepaxa.DecidedValue{
-		{Slot: 1, Value: []byte(`CREATE TABLE batch_page (id INTEGER)`)},
-		{Slot: 2, Value: []byte(`INSERT INTO batch_page VALUES (1)`)},
+		{Slot: 1, Value: policySQL(t, `CREATE TABLE batch_page (id INTEGER)`)},
+		{Slot: 2, Value: policySQL(t, `INSERT INTO batch_page VALUES (1)`)},
 	}
 	if err := m.ApplyBatch(context.Background(), decisions); err != nil {
 		t.Fatal(err)
@@ -1813,7 +1813,7 @@ func TestRestoreFailureReopensOriginalMaterializer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Close()
-	if err := m.Apply(ctx, 1, []byte("CREATE TABLE restore_live (value TEXT)")); err != nil {
+	if err := m.Apply(ctx, 1, policySQL(t, "CREATE TABLE restore_live (value TEXT)")); err != nil {
 		t.Fatal(err)
 	}
 	files, _, cleanup, err := m.CheckpointFilesAt(ctx)
@@ -1827,7 +1827,7 @@ func TestRestoreFailureReopensOriginalMaterializer(t *testing.T) {
 	if err := m.Health(ctx); err != nil {
 		t.Fatalf("materializer remained closed after failed restore: %v", err)
 	}
-	if err := m.Apply(ctx, 2, []byte("INSERT INTO restore_live VALUES ('ready')")); err != nil {
+	if err := m.Apply(ctx, 2, policySQL(t, "INSERT INTO restore_live VALUES ('ready')")); err != nil {
 		t.Fatalf("apply after failed restore: %v", err)
 	}
 	var value string
@@ -2025,4 +2025,13 @@ func TestApplyCancellationRollsBackAndReusesWriter(t *testing.T) {
 	if err != nil || !found || r.Status != types.MutationCommitted || r.LastInsertID != 42 || r.RowsAffected != 1 {
 		t.Fatalf("retry receipt: %+v %v", r, err)
 	}
+}
+
+func policySQL(t testing.TB, query string) []byte {
+	t.Helper()
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{SQL: query}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
 }

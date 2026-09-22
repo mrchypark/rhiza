@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -295,7 +296,11 @@ func TestReadReplicaBootstrapsFromCertifiedCheckpoint(t *testing.T) {
 
 func TestReadReplicaRejectsExistingStateWithoutIdentity(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dataDir, "sqlite.db"), []byte("old state"), 0o600); err != nil {
+	state, err := materializer.Open(filepath.Join(dataDir, "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Close(); err != nil {
 		t.Fatal(err)
 	}
 	replica, err := rhiza.OpenReadReplica(context.Background(), rhiza.ReplicaConfig{

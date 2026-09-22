@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-var sqlBatchMagic = []byte("QBAT\x00")
+var sqlBatchMagic = []byte("QBAT\x01")
 var kvCommandMagic = []byte("QKVC\x00")
 var kvBatchMagic = []byte("QKVB\x00")
 var notifyCommandMagic = []byte("QNTF\x00")
@@ -479,6 +480,9 @@ func DecodeKVCommand(value []byte) (KVCommand, bool, error) {
 }
 
 func DecodeSQLBatch(value []byte) ([]SQLCommand, bool, error) {
+	if bytes.HasPrefix(value, []byte("QBAT")) && !bytes.HasPrefix(value, sqlBatchMagic) {
+		return nil, true, sqlpolicy.ErrIncompatible
+	}
 	if !bytes.HasPrefix(value, sqlBatchMagic) {
 		return nil, false, nil
 	}
@@ -569,3 +573,35 @@ type DecidedValue = quepaxa.DecidedValue
 
 // Receipt is a recorder's confirmation of a proposal.
 type Receipt = quepaxa.Receipt
+
+// ValidateExecutionPolicy rejects unsupported history before any engine changes.
+func ValidateExecutionPolicy(value []byte) error {
+	if _, ok, err := DecodeSQLBatch(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeGraphBatch(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeKVBatch(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeKVCommand(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeNotifyCommand(value); ok || err != nil {
+		return err
+	}
+	if ok, err := DecodeReadBarrier(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeCheckpointSeal(value); ok || err != nil {
+		return err
+	}
+	if _, ok, err := DecodeLeaderSchedule(value); ok || err != nil {
+		return err
+	}
+	if ok, err := DecodeReconfiguration(value); ok || err != nil {
+		return err
+	}
+	return sqlpolicy.ErrIncompatible
+}

@@ -14,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
+	"github.com/ncruces/go-sqlite3/driver"
 	"github.com/thanos-io/objstore"
 )
 
@@ -173,6 +175,23 @@ func (b *getCountingBucket) Upload(ctx context.Context, name string, r io.Reader
 func source(t *testing.T, role, value string) Source {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), role+".db")
+	if role == RoleSQLite {
+		db, err := driver.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO _rhiza_meta VALUES ('sql_execution_policy','1'); CREATE TABLE payload(value TEXT)`)
+		if err == nil {
+			_, err = db.Exec(`INSERT INTO payload VALUES (?)`, value)
+		}
+		if closeErr := db.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Source{Role: role, Path: path}
+	}
 	if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +244,18 @@ func TestFixedRoleCheckpointRoundTrip(t *testing.T) {
 		if file.Role == RoleGraphData {
 			want = "graph"
 		}
-		if string(got) != want {
+		if file.Role == RoleSQLite {
+			db, err := driver.Open(file.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload string
+			err = db.QueryRow(`SELECT value FROM payload`).Scan(&payload)
+			db.Close()
+			if err != nil || payload != want {
+				t.Fatalf("payload=%q err=%v", payload, err)
+			}
+		} else if string(got) != want {
 			t.Fatalf("role %s=%q", file.Role, got)
 		}
 	}
@@ -757,7 +787,11 @@ func TestRecoveryPinDescriptorSurvivesCanonicalRootDeletion(t *testing.T) {
 
 func TestStaleCheckpointGCCannotDeleteRepublishedBlock(t *testing.T) {
 	ctx := context.Background()
-	content := []byte("reused block")
+	sqlSource := source(t, RoleSQLite, "reused block")
+	content, err := os.ReadFile(sqlSource.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	hash := sha256.Sum256(content)
 	base := objstore.NewInMemBucket()
 	blocked := &blockingDeleteBucket{
@@ -788,7 +822,7 @@ func TestStaleCheckpointGCCannotDeleteRepublishedBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root, err := publisher.CreateFiles(ctx, claim, []Source{source(t, RoleSQLite, string(content))}, 1)
+	root, err := publisher.CreateFiles(ctx, claim, []Source{sqlSource}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -942,5 +976,32 @@ func TestPublisherClaimFencesStaleOwnerAndIndex(t *testing.T) {
 	root2 := sha256.Sum256([]byte("root-2"))
 	if _, err := manager.BindPublisherClaim(ctx, second, 12, root2, time.Minute); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCheckpointRejectsUnmarkedSQLiteSource(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(objstore.NewInMemBucket(), "policy", t.TempDir(), 1)
+	file := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := driver.Open(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`CREATE TABLE application(id INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	claim, err := manager.AcquirePublisherClaim(ctx, "test", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.CreateFiles(ctx, claim, []Source{{Role: RoleSQLite, Path: file}}, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("source: %v", err)
+	}
+	for _, version := range []int{0, 2} {
+		root := Checkpoint{SQLExecutionPolicy: version, ConfigID: 1, Index: 1}
+		if _, err = manager.DownloadAndVerifyRootFiles(ctx, &root, t.TempDir()); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+			t.Fatalf("root: %v", err)
+		}
 	}
 }
