@@ -180,7 +180,7 @@ func source(t *testing.T, role, value string) Source {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO _rhiza_meta VALUES ('sql_execution_policy','1'); CREATE TABLE payload(value TEXT)`)
+		_, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY, value TEXT); INSERT INTO _rhiza_meta VALUES ('sql_execution_policy','` + sqlpolicy.Marker() + `'); CREATE TABLE payload(value TEXT)`)
 		if err == nil {
 			_, err = db.Exec(`INSERT INTO payload VALUES (?)`, value)
 		}
@@ -998,7 +998,7 @@ func TestCheckpointRejectsUnmarkedSQLiteSource(t *testing.T) {
 	if _, err = manager.CreateFiles(ctx, claim, []Source{{Role: RoleSQLite, Path: file}}, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 		t.Fatalf("source: %v", err)
 	}
-	for _, version := range []int{0, 2} {
+	for _, version := range []int{0, 1, 3} {
 		root := Checkpoint{SQLExecutionPolicy: version, ConfigID: 1, Index: 1}
 		if _, err = manager.DownloadAndVerifyRootFiles(ctx, &root, t.TempDir()); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Fatalf("root: %v", err)

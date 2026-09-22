@@ -12,7 +12,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-var sqlBatchMagic = []byte("QBAT\x01")
+var sqlBatchMagic = []byte{'Q', 'B', 'A', 'T', byte(sqlpolicy.Version)}
 var kvCommandMagic = []byte("QKVC\x00")
 var kvBatchMagic = []byte("QKVB\x00")
 var notifyCommandMagic = []byte("QNTF\x00")

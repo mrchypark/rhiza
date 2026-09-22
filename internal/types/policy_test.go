@@ -7,12 +7,12 @@ import (
 )
 
 func TestExecutionPolicyRejectsLegacyAndUnknownValues(t *testing.T) {
-	for _, value := range []string{"", "Q", "QBAT", "QBAT\x00[]", "QBAT\x02[]", `QBAT`, "SELECT 1", "QBAT\x00[{\"policy\":1,\"sql\":\"SELECT 1\"}]"} {
+	for _, value := range []string{"", "Q", "QBAT", "QBAT\x00[]", "QBAT\x01[]", "QBAT\x03[]", `QBAT`, "SELECT 1", "QBAT\x00[{\"policy\":1,\"sql\":\"SELECT 1\"}]"} {
 		if err := ValidateExecutionPolicy([]byte(value)); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Errorf("%q: %v", value, err)
 		}
 	}
-	if err := ValidateExecutionPolicy([]byte("QBAT\x01{bad")); err == nil {
+	if err := ValidateExecutionPolicy([]byte("QBAT\x02{bad")); err == nil {
 		t.Fatal("accepted malformed envelope")
 	}
 	value, err := EncodeSQLBatch([]SQLCommand{{SQL: "SELECT 1"}})
@@ -22,7 +22,7 @@ func TestExecutionPolicyRejectsLegacyAndUnknownValues(t *testing.T) {
 	if err = ValidateExecutionPolicy(value); err != nil {
 		t.Fatal(err)
 	}
-	if string(value[:5]) != "QBAT\x01" {
+	if string(value[:5]) != "QBAT\x02" {
 		t.Fatalf("policy header %q", value[:5])
 	}
 }

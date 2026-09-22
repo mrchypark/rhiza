@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -373,7 +374,7 @@ func policySnapshot(t testing.TB, path, contents string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO _rhiza_meta VALUES('sql_execution_policy','1'); CREATE TABLE payload(value TEXT)`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO _rhiza_meta VALUES('sql_execution_policy','` + sqlpolicy.Marker() + `'); CREATE TABLE payload(value TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = db.Exec(`INSERT INTO payload VALUES(?)`, contents); err != nil {
