@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	sqldriver "database/sql/driver"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -878,7 +879,7 @@ func (m *Materializer) Apply(ctx context.Context, slot uint64, value []byte) err
 }
 
 // ApplyBatch materializes a contiguous decision page with one SQLite commit.
-func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) error {
+func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.DecidedValue) (applyErr error) {
 	for _, decision := range decisions {
 		if err := types.ValidateExecutionPolicy(decision.Value); err != nil {
 			return err
@@ -904,7 +905,14 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		_ = tx.Rollback()
+		if errors.Is(applyErr, errSQLPolicyState) {
+			// Discard only after rollback releases the transaction's Conn lock.
+			// ErrBadConn from Raw while the transaction is active deadlocks Close.
+			_ = conn.Raw(func(any) error { return sqldriver.ErrBadConn })
+		}
+	}()
 	statements := make(map[string]*sql.Stmt)
 	defer func() {
 		for _, statement := range statements {
@@ -1141,6 +1149,9 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 			return err
 		}
 		result, executeErr := executeSQLCommand(ctx, conn, tx, statements, command)
+		if errors.Is(executeErr, errSQLPolicyState) {
+			return executeErr
+		}
 		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted}
 		if executeErr != nil {
 			if command.RequestID == "" {
@@ -1654,15 +1665,22 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			args[ref.ArgIndex] = value
 		}
 		statementResult, err := func() (out types.SQLStatementResult, resultErr error) {
-			if singleSchemaMaintenanceSQL(statement.SQL) {
-				set := func(allow bool) error {
-					return conn.Raw(func(raw any) error { return setSQLAuthorizer(raw.(sqlite3driver.Conn).Raw(), true, false, allow) })
-				}
-				if err := set(true); err != nil {
-					return out, err
-				}
-				defer func() { resultErr = errors.Join(resultErr, set(false)) }()
+			restore, err := beginUserSQL(conn, singleSchemaMaintenanceSQL(statement.SQL))
+			if err != nil {
+				return out, err
 			}
+			var finishRowID func() error
+			defer func() {
+				if err := restore(); err != nil {
+					out, resultErr = types.SQLStatementResult{}, errors.Join(resultErr, err)
+					return
+				}
+				if finishRowID != nil {
+					if err := finishRowID(); err != nil {
+						out, resultErr = types.SQLStatementResult{}, err
+					}
+				}
+			}()
 			query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
 			if err != nil {
 				return types.SQLStatementResult{}, err
@@ -1685,15 +1703,10 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			}); err != nil {
 				return types.SQLStatementResult{}, err
 			}
-			finishRowID, err := watchRowID(ctx, conn, tx)
+			finishRowID, err = watchRowID(ctx, conn, tx)
 			if err != nil {
 				return out, err
 			}
-			defer func() {
-				if err := finishRowID(); err != nil {
-					out, resultErr = types.SQLStatementResult{}, err
-				}
-			}()
 			if statement.WantRows {
 				wantsRows = true
 				rows, err := query.QueryContext(ctx, args...)

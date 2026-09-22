@@ -65,7 +65,7 @@ func TestOldPolicyPeersCannotNegotiate(t *testing.T) {
 	}
 	defer peer.Close()
 	cluster.Members[0].PeerURL = "quic://" + peer.Addr()
-	for _, protocol := range []string{"rhiza-peer-v3", "rhiza-peer-v4"} {
+	for _, protocol := range []string{"rhiza-peer-v3", "rhiza-peer-v4", "rhiza-peer-v5"} {
 		client := NewTransport("policy-peer", "n1", &cluster, "voter")
 		client.tls.NextProtos = []string{protocol}
 		_, err = client.ReadTip(ctx, "n1")
