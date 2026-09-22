@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/ncruces/go-sqlite3/driver"
 	"testing"
@@ -21,7 +22,7 @@ func policySnapshot(t testing.TB, path string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT);INSERT INTO _rhiza_meta VALUES('sql_execution_policy','1')`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT);INSERT INTO _rhiza_meta VALUES('sql_execution_policy','` + sqlpolicy.Marker() + `')`); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -107,7 +107,7 @@ func TestLegacySnapshotRefusalPreservesLiveState(t *testing.T) {
 }
 
 func TestMaterializationPolicyMarkerIsRequired(t *testing.T) {
-	for _, marker := range []string{"", "2", "not-a-version"} {
+	for _, marker := range []string{"", "1", "3", "not-a-version"} {
 		t.Run(marker, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state.db")
 			m, err := Open(path, 1)
@@ -128,6 +128,67 @@ func TestMaterializationPolicyMarkerIsRequired(t *testing.T) {
 					other.Close()
 				}
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// These are actual policy-1 artifacts made at dd6a153, not relabeled current data.
+func TestPolicyOneArtifactsAreNotReinterpreted(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{"ordinary", "temp"} {
+		t.Run(name, func(t *testing.T) {
+			oldPath := filepath.Join("testdata/sql-policy-1", name+".db")
+			before, err := os.ReadFile(oldPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(t.TempDir(), "old.db")
+			if err = os.WriteFile(target, before, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if m, err := Open(target, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+				if m != nil {
+					m.Close()
+				}
+				t.Fatalf("open=%v", err)
+			}
+			after, err := os.ReadFile(target)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("changed legacy data", err)
+			}
+			value, err := os.ReadFile(filepath.Join("testdata/sql-policy-1", name+".bin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := Open(filepath.Join(t.TempDir(), "new.db"), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if err = m.Apply(ctx, 1, policySQL(t, "CREATE TABLE sentinel(id INTEGER)")); err != nil {
+				t.Fatal(err)
+			}
+			for _, slot := range []uint64{0, 1, 2} {
+				if err = m.Apply(ctx, slot, value); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+					t.Fatalf("apply slot%d=%v", slot, err)
+				}
+			}
+			if err = m.ValidateTip(1, value); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+				t.Fatal(err)
+			}
+			if err = m.ApplyBatch(ctx, []quepaxa.DecidedValue{{Slot: 2, Value: policySQL(t, "INSERT INTO sentinel VALUES(1)")}, {Slot: 3, Value: value}}); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+				t.Fatal(err)
+			}
+			if m.Tip() != 1 {
+				t.Fatal("legacy page advanced tip")
+			}
+			if err = m.RestoreCheckpoint(ctx, []CheckpointFile{{Role: CheckpointSQLite, Path: target}, {Role: CheckpointGraphData, Path: "not-installed"}}); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+				t.Fatal(err)
+			}
+			result, err := m.QueryResult(ctx, "SELECT COUNT(*) FROM sentinel", nil)
+			if err != nil || result.Rows[0][0] != int64(0) {
+				t.Fatalf("result=%+v err=%v", result, err)
 			}
 		})
 	}

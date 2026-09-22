@@ -286,15 +286,7 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 				return err
 			}
 		}
-		return conn.SetAuthorizer(func(action sqlite3.AuthorizerActionCode, _, name string, _, _ string) sqlite3.AuthorizerReturnCode {
-			if (writer || readOnly) && (action == sqlite3.AUTH_ATTACH || action == sqlite3.AUTH_DETACH) {
-				return sqlite3.AUTH_DENY
-			}
-			if action == sqlite3.AUTH_FUNCTION && (strings.EqualFold(name, "load_extension") || writer && nondeterministicSQLFunction(name)) {
-				return sqlite3.AUTH_DENY
-			}
-			return sqlite3.AUTH_OK
-		})
+		return setSQLAuthorizer(conn, writer, readOnly, false)
 	})
 }
 
@@ -336,7 +328,7 @@ func (m *Materializer) loadTip(existing bool) error {
 			return fmt.Errorf("existing database has no applied slot; rebuild it from the decision log")
 		}
 		zeroHash := hex.EncodeToString(make([]byte, sha256.Size))
-		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', '1'), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, zeroHash); err != nil {
+		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', ?), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, sqlpolicy.Marker(), zeroHash); err != nil {
 			return err
 		}
 		value = "0"
@@ -1465,6 +1457,9 @@ func ValidateSQLCommand(command types.SQLCommand) error {
 		if argCount > MaxSQLArgs {
 			return fmt.Errorf("SQL has more than %d arguments", MaxSQLArgs)
 		}
+		if err := validateReplicatedTempSQL(statement.SQL); err != nil {
+			return err
+		}
 		if err := validatePublicSQL(statement.SQL); err != nil {
 			return err
 		}
@@ -1658,60 +1653,74 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			}
 			args[ref.ArgIndex] = value
 		}
-		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
-		if err != nil {
-			return result, err
-		}
-		// SQLite preserves Changes across non-DML statements. A zero-row
-		// internal delete clears it without changing durable state.
-		reset, err := preparedStatement(ctx, tx, prepared, `DELETE FROM _rhiza_meta WHERE 0`)
-		if err != nil {
-			return result, err
-		}
-		if _, err := reset.ExecContext(ctx); err != nil {
-			return result, err
-		}
-		// The driver's LastInsertId reads native connection state even for an
-		// UPDATE. Reset it for each user statement so receipts cannot inherit
-		// an earlier insert (or differ after reconnecting the writer).
-		if err := conn.Raw(func(driverConn any) error {
-			driverConn.(sqlite3driver.Conn).Raw().SetLastInsertRowID(0)
-			return nil
-		}); err != nil {
-			return result, err
-		}
-		if statement.WantRows {
-			wantsRows = true
-			rows, err := query.QueryContext(ctx, args...)
+		statementResult, err := func() (out types.SQLStatementResult, resultErr error) {
+			if singleAlterSQL(statement.SQL) {
+				set := func(allow bool) error {
+					return conn.Raw(func(raw any) error { return setSQLAuthorizer(raw.(sqlite3driver.Conn).Raw(), true, false, allow) })
+				}
+				if err := set(true); err != nil {
+					return out, err
+				}
+				defer func() { resultErr = errors.Join(resultErr, set(false)) }()
+			}
+			query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
 			if err != nil {
-				return result, err
+				return types.SQLStatementResult{}, err
 			}
-			statementResult, err := collectRowsWithBudget(rows, &budget, statement.ExpectedReturnedRows)
-			rows.Close()
+			// SQLite preserves Changes across non-DML statements. A zero-row
+			// internal delete clears it without changing durable state.
+			reset, err := preparedStatement(ctx, tx, prepared, `DELETE FROM _rhiza_meta WHERE 0`)
 			if err != nil {
-				return result, err
+				return types.SQLStatementResult{}, err
 			}
-			if command.RequireOne && len(statementResult.Rows) != 1 {
-				return result, fmt.Errorf("%w: statement must return exactly one row", errSQLPreconditionFailed)
+			if _, err := reset.ExecContext(ctx); err != nil {
+				return types.SQLStatementResult{}, err
 			}
-			if statement.ExpectedReturnedRows != nil && int64(len(statementResult.Rows)) != *statement.ExpectedReturnedRows {
-				return result, fmt.Errorf("%w: statement %d returned %d rows, expected %d", errSQLPreconditionFailed, statementIndex, len(statementResult.Rows), *statement.ExpectedReturnedRows)
+			// The driver's LastInsertId reads native connection state even for an
+			// UPDATE. Reset it for each user statement so receipts cannot inherit
+			// an earlier insert (or differ after reconnecting the writer).
+			if err := conn.Raw(func(driverConn any) error {
+				driverConn.(sqlite3driver.Conn).Raw().SetLastInsertRowID(0)
+				return nil
+			}); err != nil {
+				return types.SQLStatementResult{}, err
 			}
-			result.Statements = append(result.Statements, statementResult)
-			continue
-		}
-		execResult, err := query.ExecContext(ctx, args...)
+			if statement.WantRows {
+				wantsRows = true
+				rows, err := query.QueryContext(ctx, args...)
+				if err != nil {
+					return types.SQLStatementResult{}, err
+				}
+				statementResult, err := collectRowsWithBudget(rows, &budget, statement.ExpectedReturnedRows)
+				rows.Close()
+				if err != nil {
+					return types.SQLStatementResult{}, err
+				}
+				if command.RequireOne && len(statementResult.Rows) != 1 {
+					return types.SQLStatementResult{}, fmt.Errorf("%w: statement must return exactly one row", errSQLPreconditionFailed)
+				}
+				if statement.ExpectedReturnedRows != nil && int64(len(statementResult.Rows)) != *statement.ExpectedReturnedRows {
+					return types.SQLStatementResult{}, fmt.Errorf("%w: statement %d returned %d rows, expected %d", errSQLPreconditionFailed, statementIndex, len(statementResult.Rows), *statement.ExpectedReturnedRows)
+				}
+				return statementResult, nil
+			}
+			execResult, err := query.ExecContext(ctx, args...)
+			if err != nil {
+				return types.SQLStatementResult{}, err
+			}
+			statementResult := types.SQLStatementResult{}
+			statementResult.RowsAffected, err = execResult.RowsAffected()
+			if err != nil && statement.ExpectedRowsAffected != nil {
+				return types.SQLStatementResult{}, err
+			}
+			statementResult.LastInsertID, _ = execResult.LastInsertId()
+			if statement.ExpectedRowsAffected != nil && statementResult.RowsAffected != *statement.ExpectedRowsAffected {
+				return types.SQLStatementResult{}, fmt.Errorf("%w: statement %d affected %d rows, expected %d", errSQLPreconditionFailed, statementIndex, statementResult.RowsAffected, *statement.ExpectedRowsAffected)
+			}
+			return statementResult, nil
+		}()
 		if err != nil {
 			return result, err
-		}
-		statementResult := types.SQLStatementResult{}
-		statementResult.RowsAffected, err = execResult.RowsAffected()
-		if err != nil && statement.ExpectedRowsAffected != nil {
-			return result, err
-		}
-		statementResult.LastInsertID, _ = execResult.LastInsertId()
-		if statement.ExpectedRowsAffected != nil && statementResult.RowsAffected != *statement.ExpectedRowsAffected {
-			return result, fmt.Errorf("%w: statement %d affected %d rows, expected %d", errSQLPreconditionFailed, statementIndex, statementResult.RowsAffected, *statement.ExpectedRowsAffected)
 		}
 		result.Statements = append(result.Statements, statementResult)
 	}

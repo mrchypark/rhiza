@@ -22,7 +22,7 @@ func TestCheckFileRelativePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT);INSERT INTO _rhiza_meta VALUES('sql_execution_policy','1')`); err != nil {
+	if _, err = db.Exec(`CREATE TABLE _rhiza_meta(key TEXT PRIMARY KEY,value TEXT);INSERT INTO _rhiza_meta VALUES('sql_execution_policy','` + Marker() + `')`); err != nil {
 		t.Fatal(err)
 	}
 	if err = db.Close(); err != nil {

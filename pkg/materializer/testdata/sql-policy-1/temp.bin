@@ -1,0 +1,1 @@
+QBAT[{"request_id":"2","sql":"CREATE TEMP TRIGGER scratch AFTER INSERT ON main.source BEGIN INSERT INTO audit VALUES(NEW.id); END"}]
