@@ -149,7 +149,7 @@ reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
 
 ### Graph and Cypher
 
-Rhiza uses `latticedb-go v0.7.0` and exposes its deliberately small,
+Rhiza uses `latticedb-go v0.9.0` and exposes its deliberately small,
 case-sensitive Cypher subset. This is not full openCypher. Structural keywords
 must be uppercase.
 
@@ -158,15 +158,17 @@ Supported query building blocks include:
 - `MATCH` with fixed-length incoming, outgoing, or undirected patterns.
 - `WHERE` with comparisons, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`,
   `IS NULL`, `IS NOT NULL`, `AND`, `OR`, and `NOT`.
-- `RETURN`, `DISTINCT`, `count`, `ORDER BY`, `SKIP`, and `LIMIT`.
+- `RETURN`, `WITH`, `DISTINCT`, grouped `count`/`sum`/`avg`/`min`/`max`/`collect`,
+  `ORDER BY`, `SKIP`, and `LIMIT`.
+- Value functions and nested list expressions in parameters, projections, and properties.
 - Standalone `CREATE` of one node.
 - `MATCH ... SET`, `MATCH ... CREATE` for relationships, `REMOVE`, `DELETE`,
   and `DETACH DELETE`.
 - `UNWIND ... RETURN`, `UNWIND ... CREATE`, and `UNWIND ... MATCH`.
 - Full-text `@@` predicates, subject to the engine's ranking restrictions.
 
-`OPTIONAL MATCH`, `MERGE`, `WITH`, `UNION`, variable-length paths, list
-literals, and backtick identifiers are not supported. A standalone relationship
+`OPTIONAL MATCH`, `MERGE`, `UNION`, aggregate-level `DISTINCT`, variable-length
+paths, arithmetic expressions, and backtick identifiers are not supported. A standalone relationship
 creation such as `CREATE (:Person)-[:KNOWS]->(:Person)` is also unsupported;
 create or match the nodes first, then use `MATCH ... CREATE`. Named parameters
 accept JSON-compatible null, boolean, string, number, list, and map values.
@@ -194,8 +196,8 @@ indexes are node-local derived state: they are not replicated, and Rhiza
 reconciles them when the node opens or installs a checkpoint.
 
 The dependency owns the complete language contract. See the version-pinned
-[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.7.0/docs/engine_conformance.md#supported-cypher-subset)
-and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.7.0/internal/engine/testdata/query_grammar.ebnf).
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.9.0/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.9.0/internal/engine/testdata/query_grammar.ebnf).
 
 ### Graph streams
 
