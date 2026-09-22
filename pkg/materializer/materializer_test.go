@@ -1241,6 +1241,62 @@ func TestMaterializerRejectsConnectionLocalSQLFunctions(t *testing.T) {
 	}
 }
 
+func TestSQLFunctionDefaultsRemainRejectedAfterRestart(t *testing.T) {
+	for _, function := range []string{"changes()", "total_changes()", "last_insert_rowid()", "CURRENT_TIMESTAMP", "random()"} {
+		t.Run(function, func(t *testing.T) {
+			ctx := context.Background()
+			path := t.TempDir() + "/defaults.db"
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if m != nil {
+					m.Close()
+				}
+			}()
+			apply := func(slot uint64, query string, status types.MutationStatus) types.MutationReceipt {
+				t.Helper()
+				id := strconv.FormatUint(slot, 10)
+				value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: id, SQL: query}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := m.Apply(ctx, slot, value); err != nil {
+					t.Fatal(err)
+				}
+				receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, id)
+				if err != nil || !found || receipt.Status != status {
+					t.Fatalf("receipt=%+v found=%v err=%v, want %s", receipt, found, err, status)
+				}
+				return receipt
+			}
+			apply(1, "CREATE TABLE guarded (id INTEGER PRIMARY KEY, value DEFAULT ("+function+"))", types.MutationCommitted)
+			apply(2, "INSERT INTO guarded DEFAULT VALUES", types.MutationRejected)
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, err = Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prior, found, err := m.MutationReceipt(ctx, types.MutationSQL, "2")
+			if err != nil || !found || prior.Status != types.MutationRejected {
+				t.Fatalf("reopened receipt=%+v found=%v err=%v", prior, found, err)
+			}
+			apply(3, "INSERT INTO guarded DEFAULT VALUES", types.MutationRejected)
+			var count int
+			if err := m.queryRow(ctx, "SELECT COUNT(*) FROM guarded").Scan(&count); err != nil || count != 0 {
+				t.Fatalf("rejected defaults left %d rows: %v", count, err)
+			}
+			ok := apply(4, "INSERT INTO guarded (id, value) VALUES (42, 'safe')", types.MutationCommitted)
+			if ok.LastInsertID != 42 || ok.RowsAffected != 1 {
+				t.Fatalf("ordinary insert receipt=%+v", ok)
+			}
+		})
+	}
+}
+
 func TestStateTipIgnoresConsensusOnlyDecisions(t *testing.T) {
 	m, err := Open(t.TempDir()+"/state-tip.db", 1)
 	if err != nil {
