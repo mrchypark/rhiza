@@ -41,6 +41,7 @@ func sqlAuthorizer(conn *sqlite3.Conn, writer, readOnly bool) (func(bool, bool) 
 	}
 	return func(user, allowMainMaintenance bool) error {
 		mainAlter := false
+		alterTarget := ""
 		mainDrop := false
 		return conn.SetAuthorizer(func(action sqlite3.AuthorizerActionCode, object, name, database, inner string) sqlite3.AuthorizerReturnCode {
 			if (writer || readOnly) && (action == sqlite3.AUTH_ATTACH || action == sqlite3.AUTH_DETACH) {
@@ -51,6 +52,11 @@ func sqlAuthorizer(conn *sqlite3.Conn, writer, readOnly bool) (func(bool, bool) 
 			}
 			if writer {
 				if user && action == sqlite3.AUTH_PRAGMA {
+					// SQLite validates ADD COLUMN constraints with this native
+					// check. Bind it to the authorized single ALTER's exact target.
+					if mainAlter && object == "quick_check" && name == alterTarget && database == "main" && inner == "" {
+						return sqlite3.AUTH_OK
+					}
 					return sqlite3.AUTH_DENY
 				}
 				switch action {
@@ -76,6 +82,7 @@ func sqlAuthorizer(conn *sqlite3.Conn, writer, readOnly bool) (func(bool, bool) 
 						return sqlite3.AUTH_DENY
 					}
 					mainAlter = allowMainMaintenance
+					alterTarget = name
 				}
 				if strings.EqualFold(database, "temp") {
 					// SQLite's main-schema ALTER maintenance reads/updates this catalog.

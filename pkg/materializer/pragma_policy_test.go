@@ -53,6 +53,7 @@ func TestPragmaScopeRollbackAndLifecycle(t *testing.T) {
 		{"scalar", nil, []types.SQLStatement{{SQL: "INSERT INTO probe VALUES((SELECT file FROM pragma_database_list WHERE name='main'))"}}},
 		{"quoted", nil, []types.SQLStatement{{SQL: "INSERT INTO probe SELECT file FROM main.\"pragma_database_list\" WHERE name='main'"}}},
 		{"returning", nil, []types.SQLStatement{{SQL: "SELECT file FROM pragma_database_list", WantRows: true}}},
+		{"dml-returning", nil, []types.SQLStatement{{SQL: "INSERT INTO probe VALUES('rolled-back') RETURNING (SELECT file FROM pragma_database_list WHERE name='main')", WantRows: true}}},
 		{"output-reference", nil, []types.SQLStatement{{SQL: "SELECT file FROM pragma_database_list WHERE name='main'", WantRows: true}, {SQL: "INSERT INTO probe VALUES(?)", Args: []any{nil}, OutputRefs: []types.SQLStatementOutputRef{{ArgIndex: 0, StatementIndex: 1, ColumnName: "file"}}}}},
 		{"table-list", nil, []types.SQLStatement{{SQL: "SELECT * FROM pragma_table_list", WantRows: true}}},
 		{"table-info", nil, []types.SQLStatement{{SQL: "SELECT * FROM pragma_table_info('probe')", WantRows: true}}},
@@ -216,5 +217,73 @@ func TestPragmaPolicySetupFailureAbortsAndDiscardsConnection(t *testing.T) {
 	}
 	if r, ok, e := m.MutationReceipt(ctx, types.MutationSQL, "retry"); e != nil || !ok || r.Status != types.MutationCommitted {
 		t.Fatal(r, ok, e)
+	}
+}
+
+func TestPragmaAllowsNativeAlterValidation(t *testing.T) {
+	cases := []struct {
+		name, create, alter string
+		want                types.MutationStatus
+	}{
+		{"check", "CREATE TABLE t(id INTEGER)", "ALTER TABLE t ADD COLUMN x INTEGER CHECK(x>=0)", types.MutationCommitted},
+		{"strict", "CREATE TABLE t(id INTEGER) STRICT", "ALTER TABLE t ADD COLUMN x INTEGER", types.MutationCommitted},
+		{"generated", "CREATE TABLE t(id INTEGER)", "ALTER TABLE t ADD COLUMN x INTEGER GENERATED ALWAYS AS (id+1) VIRTUAL NOT NULL", types.MutationCommitted},
+		{"invalid", "CREATE TABLE t(id INTEGER)", "ALTER TABLE t ADD COLUMN x INTEGER DEFAULT -1 CHECK(x>=0)", types.MutationRejected},
+	}
+	for _, tc := range cases {
+		for phase := 0; phase < 3; phase++ {
+			t.Run(fmt.Sprintf("%s/%d", tc.name, phase), func(t *testing.T) {
+				ctx := context.Background()
+				path := t.TempDir() + "/state.db"
+				m, err := Open(path, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { m.Close() }()
+				slot := uint64(0)
+				apply := func(q string, want types.MutationStatus) {
+					t.Helper()
+					slot++
+					id := fmt.Sprint(slot)
+					v, e := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: id, SQL: q}})
+					if e != nil {
+						t.Fatal(e)
+					}
+					if e = m.Apply(ctx, slot, v); e != nil {
+						t.Fatal(e)
+					}
+					r, ok, e := m.MutationReceipt(ctx, types.MutationSQL, id)
+					if e != nil || !ok || r.Status != want {
+						t.Fatal(q, r, ok, e)
+					}
+				}
+				apply(tc.create, types.MutationCommitted)
+				apply("INSERT INTO t VALUES(1)", types.MutationCommitted)
+				if phase == 1 {
+					m.writer.SetMaxIdleConns(0)
+				}
+				if phase == 2 {
+					files, _, cleanup, e := m.CheckpointFilesAt(ctx)
+					if e != nil {
+						t.Fatal(e)
+					}
+					if e = m.RestoreCheckpoint(ctx, files); e != nil {
+						cleanup()
+						t.Fatal(e)
+					}
+					cleanup()
+					if e = m.Close(); e != nil {
+						t.Fatal(e)
+					}
+					m, e = Open(path, 1)
+					if e != nil {
+						t.Fatal(e)
+					}
+				}
+				apply(tc.alter, tc.want)
+				apply("SELECT * FROM pragma_quick_check('t')", types.MutationRejected)
+				apply("INSERT INTO t(id) VALUES(2)", types.MutationCommitted)
+			})
+		}
 	}
 }

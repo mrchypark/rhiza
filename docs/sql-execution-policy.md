@@ -39,7 +39,7 @@ application key needs an explicit application remapping decision, never automati
 rewriting. If a later SQL error ends the whole transaction, application fails without
 a durable rejection receipt or tip advancement; it is not converted into success.
 
-Policy 4 denies every PRAGMA evaluation inside replicated SQL, including table-valued sources in SELECT, INSERT, views, triggers and returned results. Ordinary tables and CTEs named `pragma_*` remain valid; this is an execution restriction, not an identifier ban. The read API retains PRAGMA access. Internal initialization and ROWID checks run outside the user statement scope.
+Policy 4 denies user PRAGMA evaluation inside replicated SQL, including table-valued sources in SELECT, INSERT, views, triggers and returned results. Ordinary tables and CTEs named `pragma_*` remain valid; this is an execution restriction, not an identifier ban. The read API retains PRAGMA access. Internal initialization and ROWID checks run outside the user statement scope. SQLite's internal ADD COLUMN constraint validation may run `quick_check` only for the exact main-schema target authorized by a single ALTER; this does not permit user PRAGMA queries.
 
 Policy versions identify SQL envelopes, SQLite provenance and live peers; they do not universally identify every non-SQL historical artifact after its surrounding provenance is removed. Never reuse old history or physical namespaces.
 
