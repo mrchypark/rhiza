@@ -158,3 +158,34 @@ func TestTempTokenizerMatchesSQLiteWriter(t *testing.T) {
 		})
 	}
 }
+
+func TestAlterTrailingEmptyStatements(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	cmd := types.SQLCommand{RequestID: "empty-tail", Statements: []types.SQLStatement{{SQL: "CREATE TABLE items(id INTEGER)"}, {SQL: "ALTER TABLE items RENAME TO renamed;; -- trailing empty statement\n;"}}}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{cmd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = m.Apply(ctx, 1, value); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, "empty-tail")
+	if err != nil || !found || receipt.Status != types.MutationCommitted {
+		t.Fatalf("receipt=%+v found=%v err=%v", receipt, found, err)
+	}
+	rows, err := m.QueryResult(ctx, "SELECT id FROM renamed", nil)
+	if err != nil || len(rows.Rows) != 0 {
+		t.Fatalf("schema result=%+v err=%v", rows, err)
+	}
+	if _, err = m.writer.ExecContext(ctx, "SELECT * FROM sqlite_temp_master"); err == nil {
+		t.Fatal("ALTER authorization scope leaked")
+	}
+	if singleAlterSQL("ALTER TABLE renamed RENAME TO final; SELECT 1") {
+		t.Fatal("second executable statement accepted")
+	}
+}

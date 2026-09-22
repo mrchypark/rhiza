@@ -123,8 +123,11 @@ func singleAlterSQL(query string) bool {
 	if err != nil || len(tokens) < 3 || !tokens[0].bare || !strings.EqualFold(tokens[0].text, "ALTER") || !tokens[1].bare || !strings.EqualFold(tokens[1].text, "TABLE") {
 		return false
 	}
-	for i, t := range tokens {
-		if t.symbol && t.text == ";" && i != len(tokens)-1 {
+	for len(tokens) > 0 && tokens[len(tokens)-1].symbol && tokens[len(tokens)-1].text == ";" {
+		tokens = tokens[:len(tokens)-1]
+	}
+	for _, t := range tokens {
+		if t.symbol && t.text == ";" {
 			return false
 		}
 	}
