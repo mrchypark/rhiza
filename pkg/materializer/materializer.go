@@ -273,8 +273,9 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 			// when a column DEFAULT is applied, so such a write was certified and
 			// then materialized a different durable value on a voter whose writer
 			// connection a restart had recreated (issue #152). Replacing the
-			// functions themselves closes every durable path, including the ones
-			// the authorizer cannot observe.
+			// functions themselves also rejects those scalar-function evaluations
+			// the authorizer cannot observe. Name-based restrictions also cover
+			// fixed-input date/time defaults, not just clock-dependent arguments.
 			if err := denySQLFunctions(conn); err != nil {
 				return err
 			}
@@ -885,7 +886,12 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if m.writer == nil {
 		return sql.ErrConnDone
 	}
-	tx, err := m.writer.BeginTx(ctx, nil)
+	conn, err := m.writer.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire apply connection: %w", err)
+	}
+	defer conn.Close()
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
@@ -914,7 +920,7 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return fmt.Errorf("apply slot gap: have %d, got %d", m.tip, slot)
 		}
 		// oldTip is the last SQLite-durable tip; m.tip advances before this batch commits.
-		if err := m.applyValueLocked(ctx, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
+		if err := m.applyValueLocked(ctx, conn, tx, statements, slot, decision.Value, hash, oldTip, &pending); err != nil {
 			m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 			return err
 		}
@@ -989,7 +995,7 @@ func (m *Materializer) enqueueNotification(notification pendingNotification) {
 	}
 }
 
-func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
+func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx *sql.Tx, statements map[string]*sql.Stmt, slot uint64, value []byte, hash [32]byte, confirmedGraphThrough uint64, pending *[]pendingNotification) error {
 	if err := m.pruneReceipts(ctx, tx, slot); err != nil {
 		return fmt.Errorf("prune idempotency receipts: %w", err)
 	}
@@ -1121,7 +1127,7 @@ func (m *Materializer) applyValueLocked(ctx context.Context, tx *sql.Tx, stateme
 		if _, err := execPrepared(ctx, tx, statements, "SAVEPOINT rhiza_command"); err != nil {
 			return err
 		}
-		result, executeErr := executeSQLCommand(ctx, tx, statements, command)
+		result, executeErr := executeSQLCommand(ctx, conn, tx, statements, command)
 		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted}
 		if executeErr != nil {
 			if command.RequestID == "" {
@@ -1556,7 +1562,7 @@ func validatePublicSQL(query string) error {
 	return nil
 }
 
-func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
+func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared map[string]*sql.Stmt, command types.SQLCommand) (types.SQLCommandResult, error) {
 	statements := command.Statements
 	if len(statements) == 0 {
 		statements = []types.SQLStatement{{SQL: command.SQL, Args: command.Args, WantRows: command.WantRows}}
@@ -1633,6 +1639,15 @@ func executeSQLCommand(ctx context.Context, tx *sql.Tx, prepared map[string]*sql
 		}
 		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
 		if err != nil {
+			return result, err
+		}
+		// The driver's LastInsertId reads native connection state even for an
+		// UPDATE. Reset it for each user statement so receipts cannot inherit
+		// an earlier insert (or differ after reconnecting the writer).
+		if err := conn.Raw(func(driverConn any) error {
+			driverConn.(sqlite3driver.Conn).Raw().SetLastInsertRowID(0)
+			return nil
+		}); err != nil {
 			return result, err
 		}
 		if statement.WantRows {

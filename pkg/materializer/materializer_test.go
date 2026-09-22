@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -1830,5 +1831,87 @@ func TestRestoreFailureReopensOriginalMaterializer(t *testing.T) {
 	var value string
 	if err := m.queryRow(ctx, "SELECT value FROM restore_live").Scan(&value); err != nil || value != "ready" {
 		t.Fatalf("query after failed restore value=%q err=%v", value, err)
+	}
+}
+
+func TestSQLReceiptInsertIdentityIsStatementLocal(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprint(restart), func(t *testing.T) {
+			ctx := context.Background()
+			path := t.TempDir() + "/receipt.db"
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if m != nil {
+					m.Close()
+				}
+			}()
+			slot := uint64(0)
+			apply := func(sqls ...string) types.MutationReceipt {
+				t.Helper()
+				slot++
+				statements := make([]types.SQLStatement, len(sqls))
+				for i, q := range sqls {
+					statements[i] = types.SQLStatement{SQL: q}
+				}
+				command := types.SQLCommand{RequestID: fmt.Sprint(slot), Statements: statements}
+				value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = m.Apply(ctx, slot, value); err != nil {
+					t.Fatal(err)
+				}
+				receipt, found, err := m.MutationReceipt(ctx, types.MutationSQL, command.RequestID)
+				if err != nil || !found {
+					t.Fatalf("receipt %+v %v", receipt, err)
+				}
+				return receipt
+			}
+			apply("CREATE TABLE identity_probe(id INTEGER PRIMARY KEY, value TEXT)")
+			if r := apply("INSERT INTO identity_probe VALUES(42,'before')"); r.LastInsertID != 42 {
+				t.Fatalf("insert: %+v", r)
+			}
+			if restart {
+				if err = m.Close(); err != nil {
+					t.Fatal(err)
+				}
+				m, err = Open(path, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := apply("UPDATE identity_probe SET value='after' WHERE id=42")
+			if r.Status != types.MutationCommitted || r.LastInsertID != 0 || r.RowsAffected != 1 {
+				t.Fatalf("update: %+v", r)
+			}
+			// A preceding statement in the same command must not supply an update ID.
+			r = apply("INSERT INTO identity_probe VALUES(77,'new')", "UPDATE identity_probe SET value='again' WHERE id=42")
+			if r.Status != types.MutationCommitted || r.LastInsertID != 0 {
+				t.Fatalf("batch: %+v", r)
+			}
+			// Even rolled-back inserts change native connection state.
+			r = apply("INSERT INTO identity_probe VALUES(88,'rollback')", "INSERT INTO identity_probe VALUES(42,'duplicate')")
+			if r.Status != types.MutationRejected {
+				t.Fatalf("rollback: %+v", r)
+			}
+			r = apply("UPDATE identity_probe SET value='final' WHERE id=42")
+			if r.LastInsertID != 0 || r.RowsAffected != 1 {
+				t.Fatalf("after rollback: %+v", r)
+			}
+			if err = m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, err = Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			saved, found, err := m.MutationReceipt(ctx, types.MutationSQL, fmt.Sprint(slot))
+			if err != nil || !found || saved.LastInsertID != 0 || saved.RowsAffected != 1 {
+				t.Fatalf("persisted: %+v %v", saved, err)
+			}
+		})
 	}
 }
