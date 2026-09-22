@@ -39,6 +39,7 @@ type WAL struct {
 	fatal      error
 	syncDir    func(string) error
 	remove     func(string) error
+	writeAt    func(*os.File, []byte, int64) (int, error)
 }
 
 var ErrCapacity = errors.New("WAL capacity reached")
@@ -85,6 +86,7 @@ func Open(dir string) (*WAL, error) {
 		maxSize: defaultMaxSize,
 		syncDir: syncDir,
 		remove:  os.Remove,
+		writeAt: (*os.File).WriteAt,
 	}
 
 	if err := w.loadSegments(); err != nil {
@@ -482,12 +484,15 @@ func (w *WAL) Append(entry Entry) error {
 	w.current.mu.Lock()
 	defer w.current.mu.Unlock()
 
-	n, err := w.current.file.WriteAt(data, w.current.offset)
-	if err != nil {
-		return err
-	}
-	if n != len(data) {
-		return io.ErrShortWrite
+	n, err := w.writeAt(w.current.file, data, w.current.offset)
+	if err != nil || n != len(data) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		// The physical tail is uncertain, even when a full count accompanies an
+		// error. Only reopening may validate it; a shorter retry must not overwrite it.
+		w.fatal = fmt.Errorf("WAL append at %d is uncertain: %w", w.current.offset, err)
+		return w.fatal
 	}
 	w.current.offset += int64(n)
 	w.totalBytes += int64(n)
