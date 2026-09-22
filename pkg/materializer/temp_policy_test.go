@@ -21,6 +21,7 @@ func TestReplicatedSQLRejectsTempAdmission(t *testing.T) {
 		"INSERT INTO items SELECT * FROM \"TeMp\" /* comment */ .scratch",
 		"INSERT INTO items SELECT * FROM [temp].scratch",
 		"INSERT INTO items SELECT * FROM `temp`.scratch",
+		"SELECT #x(temp.foo) FROM temp.scratch",
 	} {
 		t.Run(query, func(t *testing.T) {
 			if err := ValidateSQLCommand(types.SQLCommand{RequestID: "temp", SQL: query}); err == nil {
@@ -42,6 +43,7 @@ func TestReplicatedSQLAllowsPersistentTempNames(t *testing.T) {
 		"SELECT :p(temp.x)",
 		"SELECT @p(temp.x)",
 		"SELECT $p(temp.x)",
+		"SELECT #p(temp.x)",
 	} {
 		if err := ValidateSQLCommand(types.SQLCommand{RequestID: "persistent", SQL: query}); err != nil {
 			t.Errorf("%s: %v", query, err)

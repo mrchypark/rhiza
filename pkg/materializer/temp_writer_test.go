@@ -127,6 +127,7 @@ func TestTempTokenizerMatchesSQLiteWriter(t *testing.T) {
 			}
 			defer m.Close()
 			statements := []types.SQLStatement{{SQL: "CREATE TABLE items(id INTEGER)"}, {SQL: "ALTER" + separator + "TABLE items RENAME TO renamed"}, {SQL: "INSERT INTO renamed VALUES(:x(temp.foo))", Args: []any{int64(7)}}, {SQL: "INSERT INTO renamed VALUES(@x(temp.foo))", Args: []any{int64(8)}}, {SQL: "INSERT INTO renamed VALUES($x(temp.foo))", Args: []any{int64(9)}}}
+			statements = append(statements, types.SQLStatement{SQL: "INSERT INTO renamed VALUES(#x(temp.foo))", Args: []any{int64(10)}})
 			command := types.SQLCommand{RequestID: "forms", Statements: statements}
 			if err = ValidateSQLCommand(command); err != nil {
 				t.Fatal(err)
@@ -143,10 +144,10 @@ func TestTempTokenizerMatchesSQLiteWriter(t *testing.T) {
 				t.Fatalf("receipt=%+v err=%v", receipt, err)
 			}
 			rows, err := m.QueryResult(ctx, "SELECT id FROM renamed ORDER BY id", nil)
-			if err != nil || len(rows.Rows) != 3 {
+			if err != nil || len(rows.Rows) != 4 {
 				t.Fatalf("rows=%+v err=%v", rows, err)
 			}
-			for i, want := range []int64{7, 8, 9} {
+			for i, want := range []int64{7, 8, 9, 10} {
 				if rows.Rows[i][0] != want {
 					t.Fatalf("rows=%v", rows.Rows)
 				}

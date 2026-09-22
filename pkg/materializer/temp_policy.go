@@ -68,7 +68,7 @@ func sqlPolicyTokens(query string) ([]sqlPolicyToken, error) {
 			tokens = append(tokens, sqlPolicyToken{text: b.String()})
 			continue
 		}
-		if c == '?' || c == ':' || c == '@' || c == '$' {
+		if c == '?' || c == ':' || c == '@' || c == '$' || c == '#' {
 			i++
 			for i < len(query) && (sqlNameByte(query[i]) || query[i] == ':') {
 				i++
