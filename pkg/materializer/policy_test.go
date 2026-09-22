@@ -108,7 +108,7 @@ func TestLegacySnapshotRefusalPreservesLiveState(t *testing.T) {
 }
 
 func TestMaterializationPolicyMarkerIsRequired(t *testing.T) {
-	for _, marker := range []string{"", "1", "2", "4", "not-a-version"} {
+	for _, marker := range []string{"", "1", "2", "3", "5", "not-a-version"} {
 		t.Run(marker, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state.db")
 			m, err := Open(path, 1)
@@ -198,19 +198,29 @@ func TestPolicyOneArtifactsAreNotReinterpreted(t *testing.T) {
 // Actual policy-2 artifacts generated at f3372dd using Materializer.Apply.
 // The maximum-rowid command committed under policy 2 and rejects under policy 3.
 func TestPolicyTwoMaxRowIDArtifactsAreNotReinterpreted(t *testing.T) {
+	checkHistoricalSQLArtifacts(t, "testdata/sql-policy-2/max-rowid", "2", "SELECT max(id) FROM items", int64(9223372036854775807))
+}
+
+// Produced by the policy-3 Materializer at 4056e67, not a relabeled current DB.
+func TestPolicyThreePragmaArtifactsAreNotReinterpreted(t *testing.T) {
+	checkHistoricalSQLArtifacts(t, "testdata/sql-policy-3/pragma", "3", "SELECT value FROM probe", "/private/tmp/rhiza-policy3-pragma-fixture-v2/state.db")
+}
+
+func checkHistoricalSQLArtifacts(t *testing.T, prefix, expectedMarker, query string, expected any) {
+	t.Helper()
 	ctx := context.Background()
-	oldPath := "testdata/sql-policy-2/max-rowid.db"
+	oldPath := prefix + ".db"
 	oldDB, err := driver.Open("file:" + oldPath + "?mode=ro")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var marker string
-	var maximum int64
-	if err = oldDB.QueryRow(`SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&marker); err != nil || marker != "2" {
+	var observed any
+	if err = oldDB.QueryRow(`SELECT value FROM _rhiza_meta WHERE key='sql_execution_policy'`).Scan(&marker); err != nil || marker != expectedMarker {
 		t.Fatal(marker, err)
 	}
-	if err = oldDB.QueryRow(`SELECT max(id) FROM items`).Scan(&maximum); err != nil || maximum != int64(9223372036854775807) {
-		t.Fatal(maximum, err)
+	if err = oldDB.QueryRow(query).Scan(&observed); err != nil || observed != expected {
+		t.Fatal(observed, err)
 	}
 	if err = oldDB.Close(); err != nil {
 		t.Fatal(err)
@@ -233,7 +243,7 @@ func TestPolicyTwoMaxRowIDArtifactsAreNotReinterpreted(t *testing.T) {
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatal("modified old state", err)
 	}
-	old, err := os.ReadFile("testdata/sql-policy-2/max-rowid.bin")
+	old, err := os.ReadFile(prefix + ".bin")
 	if err != nil {
 		t.Fatal(err)
 	}

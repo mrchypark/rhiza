@@ -1,15 +1,15 @@
-# SQL execution policy 3 compatibility boundary
+# SQL execution policy 4 compatibility boundary
 
-The SQL counter/default, TEMP and ROWID fixes are incompatible execution-policy changes. This is
-not an in-place upgrade. Certified SQL uses `QBAT\x03`; policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
+The SQL counter/default, TEMP, ROWID and PRAGMA fixes are incompatible execution-policy changes. This is
+not an in-place upgrade. Certified SQL uses `QBAT\x04`; policy-3 `QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
 unknown policy versions and raw SQL decisions cannot be applied by this binary.
 Unsupported history is an error, not a rejected SQL receipt. Already-applied
 slots are checked too. Do not rewrite stored decision bytes.
 
-Existing unmarked, policy-1 or policy-2 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
-`sql_execution_policy=3` metadata value identifies newly initialized state; it
+Existing unmarked, policy-1, policy-2 or policy-3 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
+`sql_execution_policy=4` metadata value identifies newly initialized state; it
 is not a migration certificate. Do not manually insert it into old databases or
-stamp old checkpoint descriptors. Peer ALPN v5 separates this binary from v2/v3/v4
+stamp old checkpoint descriptors. Peer ALPN v6 separates this binary from v2/v3/v4/v5
 peers. Mixed-version clusters and downgrades are unsupported.
 
 Replicated writes cannot create TEMP/TEMPORARY objects or use `temp` as a dotted
@@ -32,12 +32,16 @@ Native preupdate hooks cannot cover those storage paths. Normal engine-managed
 AUTOINCREMENT bookkeeping and narrowly scoped ALTER/DROP maintenance remain supported.
 Old virtual-table materializations/checkpoints are refused before installation.
 
-Policy-3 physical state must originate from guarded execution or its supported
+Policy-4 physical state must originate from guarded execution or its supported
 checkpoint path. The marker does not validate arbitrary externally manufactured or
 relabeled files. Logical imports must use the guarded SQL API. A preexisting maximum
 application key needs an explicit application remapping decision, never automatic
 rewriting. If a later SQL error ends the whole transaction, application fails without
 a durable rejection receipt or tip advancement; it is not converted into success.
+
+Policy 4 denies user PRAGMA evaluation inside replicated SQL, including table-valued sources in SELECT, INSERT, views, triggers and returned results. Ordinary tables and CTEs named `pragma_*` remain valid; this is an execution restriction, not an identifier ban. The read API retains PRAGMA access. Internal initialization and ROWID checks run outside the user statement scope. SQLite's internal ADD COLUMN constraint validation may run `quick_check` only for the exact main-schema target authorized by a single ALTER; this does not permit user PRAGMA queries.
+
+Policy versions identify SQL envelopes, SQLite provenance and live peers; they do not universally identify every non-SQL historical artifact after its surrounding provenance is removed. Never reuse old history or physical namespaces.
 
 For an existing installation:
 
@@ -46,7 +50,7 @@ For an existing installation:
 2. Export the selected actual application state under the old binary. If voters
    disagree, reconcile their application state before choosing the export.
 3. Initialize a distinct cluster with fresh directories, object namespace and
-   peer identities. Review schema defaults and triggers for denied functions and TEMP dependencies.
+   peer identities. Review schema defaults and triggers for denied functions, TEMP dependencies and PRAGMA reads. Review previously stored node-local values; copying them does not repair their meaning.
 4. Import explicit application keys and stored values through new SQL commands.
    Do not import old QLog history, `_rhiza_` receipts, applied slots or the old
    migration ledger. Use new import request IDs; old retry guarantees do not
