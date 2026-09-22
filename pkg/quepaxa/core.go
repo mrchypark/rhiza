@@ -1824,6 +1824,16 @@ func (c *Core) acceptDecision(decision Decision) error {
 // advanceReconfigurationTipLocked applies controls only as they enter the
 // contiguous prefix. Sparse certified slots stay buffered until their prefix
 // arrives, preserving the normal 16-slot pipeline after a crash.
+func (c *Core) validateScheduledValueLocked(slot Slot, value []byte) error {
+	if c.isLeaderScheduleSlotLocked(slot) {
+		order, scheduled, err := DecodeLeaderSchedule(value)
+		if err != nil || !scheduled || !validateLeaderSchedule(c.clusterForSlotLocked(slot), order) {
+			return fmt.Errorf("incompatible leader schedule history at slot %d", slot)
+		}
+	}
+	return nil
+}
+
 func (c *Core) advanceReconfigurationTipLocked() error {
 	before := c.tip
 	defer func() {
@@ -1837,11 +1847,8 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 		if !ok {
 			break
 		}
-		if c.isLeaderScheduleSlotLocked(c.tip + 1) {
-			order, scheduled, err := DecodeLeaderSchedule(decision.Value)
-			if err != nil || !scheduled || !validateLeaderSchedule(c.clusterForSlotLocked(c.tip+1), order) {
-				return fmt.Errorf("incompatible leader schedule history at slot %d", c.tip+1)
-			}
+		if err := c.validateScheduledValueLocked(c.tip+1, decision.Value); err != nil {
+			return err
 		}
 		if bytes.HasPrefix(decision.Value, reconfigurationMagic) {
 			decoded, err := decodeDecision(decision.Certificate)
@@ -2620,6 +2627,10 @@ func (c *Core) recover() error {
 			if decision.Slot != c.tip+1 {
 				c.mu.Unlock()
 				continue // Keep certified sparse slots until their prefix is recovered.
+			}
+			if err := c.validateScheduledValueLocked(decision.Slot, decision.Proposal.Value); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
 			}
 			if err := c.applyReconfigurationLocked(decision); err != nil {
 				c.mu.Unlock()

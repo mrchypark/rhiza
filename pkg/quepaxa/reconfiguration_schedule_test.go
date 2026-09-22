@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/mrchypark/rhiza/pkg/qlog"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,6 +115,57 @@ func TestReconfigurationSparseScheduleFreezeFailsClosed(t *testing.T) {
 			}
 			if got, ok := c.decision(97); ok && !bytes.Equal(got.Value, value) {
 				t.Fatal("poisoned evidence overwritten")
+			}
+		})
+	}
+}
+
+func TestLegacyContiguousScheduleWALRejected(t *testing.T) {
+	for _, phase := range []string{"drain", "abort"} {
+		t.Run(phase, func(t *testing.T) {
+			source := filepath.Join("..", "..", "testdata", "reconfiguration-schedule", phase)
+			entries, err := os.ReadDir(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			before := map[string][]byte{}
+			for _, entry := range entries {
+				data, err := os.ReadFile(filepath.Join(source, entry.Name()))
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[entry.Name()] = data
+				if err := os.WriteFile(filepath.Join(dir, entry.Name()), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wal, err := qlog.Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = New(Config{NodeID: "a", Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}}, WAL: wal, Transport: &clusterTransport{}, EnableReconfiguration: true})
+			if err == nil || !strings.Contains(err.Error(), "incompatible leader schedule history at slot 97") {
+				t.Fatalf("recovery error=%v", err)
+			}
+			if err := wal.Close(); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(after) != len(before) {
+				t.Fatal("recovery changed WAL file set")
+			}
+			for name, expected := range before {
+				actual, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(actual, expected) {
+					t.Fatalf("recovery changed evidence %s", name)
+				}
 			}
 		})
 	}
