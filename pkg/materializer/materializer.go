@@ -891,7 +891,10 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		return fmt.Errorf("acquire apply connection: %w", err)
 	}
 	defer conn.Close()
-	tx, err := conn.BeginTx(ctx, nil)
+	// Own rollback synchronously: automatic context rollback can close conn
+	// while the per-statement Raw callback is acquiring it. SQL operations
+	// still use ctx, and cancellation is checked again before committing.
+	tx, err := conn.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return fmt.Errorf("begin apply batch: %w", err)
 	}
@@ -925,6 +928,10 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return err
 		}
 		m.tip, m.tipHash = slot, hash
+	}
+	if err := ctx.Err(); err != nil {
+		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
@@ -1639,6 +1646,15 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 		}
 		query, err := preparedStatement(ctx, tx, prepared, statement.SQL)
 		if err != nil {
+			return result, err
+		}
+		// SQLite preserves Changes across non-DML statements. A zero-row
+		// internal delete clears it without changing durable state.
+		reset, err := preparedStatement(ctx, tx, prepared, `DELETE FROM _rhiza_meta WHERE 0`)
+		if err != nil {
+			return result, err
+		}
+		if _, err := reset.ExecContext(ctx); err != nil {
 			return result, err
 		}
 		// The driver's LastInsertId reads native connection state even for an

@@ -16,6 +16,8 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/ncruces/go-sqlite3"
+	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
 
 func TestOpenResolvesRelativePath(t *testing.T) {
@@ -1913,5 +1915,114 @@ func TestSQLReceiptInsertIdentityIsStatementLocal(t *testing.T) {
 				t.Fatalf("persisted: %+v %v", saved, err)
 			}
 		})
+	}
+}
+
+func TestSQLReceiptChangesAreStatementLocal(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprint(restart), func(t *testing.T) {
+			ctx := context.Background()
+			path := t.TempDir() + "/changes.db"
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { m.Close() }()
+			apply := func(slot uint64, statements ...types.SQLStatement) types.MutationReceipt {
+				t.Helper()
+				command := types.SQLCommand{RequestID: fmt.Sprint(slot), Statements: statements}
+				value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := m.Apply(ctx, slot, value); err != nil {
+					t.Fatal(err)
+				}
+				r, found, err := m.MutationReceipt(ctx, types.MutationSQL, command.RequestID)
+				if err != nil || !found {
+					t.Fatalf("receipt: %+v %v", r, err)
+				}
+				return r
+			}
+			apply(1, types.SQLStatement{SQL: "CREATE TABLE changes_probe(id INTEGER PRIMARY KEY)"})
+			apply(2, types.SQLStatement{SQL: "INSERT INTO changes_probe VALUES(42)"})
+			if restart {
+				if err := m.Close(); err != nil {
+					t.Fatal(err)
+				}
+				m, err = Open(path, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			zero := int64(0)
+			for i, q := range []string{"CREATE TABLE ddl_probe(x INTEGER)", "SELECT * FROM changes_probe"} {
+				r := apply(uint64(3+i), types.SQLStatement{SQL: q, ExpectedRowsAffected: &zero})
+				if r.Status != types.MutationCommitted || r.RowsAffected != 0 {
+					t.Fatalf("%s: %+v", q, r)
+				}
+			}
+			r := apply(5, types.SQLStatement{SQL: "INSERT INTO changes_probe VALUES(77)"}, types.SQLStatement{SQL: "CREATE TABLE second_ddl(x INTEGER)", ExpectedRowsAffected: &zero})
+			if r.Status != types.MutationCommitted {
+				t.Fatalf("same command: %+v", r)
+			}
+		})
+	}
+}
+
+func TestApplyCancellationRollsBackAndReusesWriter(t *testing.T) {
+	m, err := Open(t.TempDir()+"/cancel.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn, err := m.writer.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = conn.Raw(func(raw any) error {
+		return raw.(sqlite3driver.Conn).Raw().CreateFunction("cancel_apply", 0, 0, func(out sqlite3.Context, _ ...sqlite3.Value) {
+			cancel()
+			out.ResultInt(0)
+		})
+	})
+	conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := types.SQLCommand{RequestID: "cancelled", Statements: []types.SQLStatement{
+		{SQL: "CREATE TABLE cancellation_probe(id INTEGER PRIMARY KEY)"},
+		{SQL: "INSERT INTO cancellation_probe VALUES(42)"},
+		{SQL: "SELECT cancel_apply()"},
+	}}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, value); err == nil {
+		t.Fatal("cancelled apply succeeded")
+	}
+	if m.tip != 0 {
+		t.Fatalf("cancelled tip = %d", m.tip)
+	}
+	if _, found, err := m.MutationReceipt(context.Background(), types.MutationSQL, command.RequestID); err != nil || found {
+		t.Fatalf("cancelled receipt exists: %v %v", found, err)
+	}
+	// Reapplying the same slot must create the rolled-back table successfully
+	// and use the writer without a discarded-connection panic or deadlock.
+	command.RequestID = "retry"
+	command.Statements = command.Statements[:2]
+	value, err = types.EncodeSQLBatch([]types.SQLCommand{command})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatal(err)
+	}
+	r, found, err := m.MutationReceipt(context.Background(), types.MutationSQL, command.RequestID)
+	if err != nil || !found || r.Status != types.MutationCommitted || r.LastInsertID != 42 || r.RowsAffected != 1 {
+		t.Fatalf("retry receipt: %+v %v", r, err)
 	}
 }
