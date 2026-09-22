@@ -229,7 +229,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 			}
 			return nil, err
 		}
-		return m.readPublisherClaim(ctx)
+		return m.confirmPublisherClaim(ctx, *claim)
 	}
 	return nil, ErrPublisherBusy
 }
@@ -284,17 +284,20 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 			}
 			return nil, err
 		}
-		return m.readPublisherClaim(ctx)
+		return m.confirmPublisherClaim(ctx, *claim)
 	}
 	return nil, ErrPublisherBusy
 }
 
 func (m *Manager) BindPublisherClaim(ctx context.Context, claim *PublisherClaim, index uint64, root [32]byte, lease time.Duration) (*PublisherClaim, error) {
+	if lease <= 0 {
+		return nil, ErrPublisherFenced
+	}
 	current, err := m.readPublisherClaim(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if claim == nil || (current.Purpose != "publisher" && current.Purpose != "generation") || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() || index < current.ReservedIndex || current.Purpose == "generation" && index != current.ReservedIndex {
+	if claim == nil || current.ConfigID != claim.ConfigID || current.ReservedIndex != claim.ReservedIndex || (current.Purpose != "publisher" && current.Purpose != "generation") || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.LeaseUntilMS <= time.Now().UnixMilli() || index < current.ReservedIndex || current.Purpose == "generation" && index != current.ReservedIndex {
 		return nil, ErrPublisherFenced
 	}
 	current.BoundIndex, current.RootHash, current.LeaseUntilMS = index, hex.EncodeToString(root[:]), time.Now().Add(lease).UnixMilli()
@@ -304,15 +307,18 @@ func (m *Manager) BindPublisherClaim(ctx context.Context, claim *PublisherClaim,
 		}
 		return nil, err
 	}
-	return m.readPublisherClaim(ctx)
+	return m.confirmPublisherClaim(ctx, *current)
 }
 
 func (m *Manager) RenewPublisherClaim(ctx context.Context, claim *PublisherClaim, lease time.Duration) (*PublisherClaim, error) {
+	if lease <= 0 {
+		return nil, ErrPublisherFenced
+	}
 	current, err := m.readPublisherClaim(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if claim == nil || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.BoundIndex != claim.BoundIndex || current.RootHash != claim.RootHash || current.LeaseUntilMS <= time.Now().UnixMilli() {
+	if claim == nil || current.ConfigID != claim.ConfigID || current.ReservedIndex != claim.ReservedIndex || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID || current.BoundIndex != claim.BoundIndex || current.RootHash != claim.RootHash || current.LeaseUntilMS <= time.Now().UnixMilli() {
 		return nil, ErrPublisherFenced
 	}
 	current.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
@@ -322,7 +328,23 @@ func (m *Manager) RenewPublisherClaim(ctx context.Context, claim *PublisherClaim
 		}
 		return nil, err
 	}
-	return m.readPublisherClaim(ctx)
+	return m.confirmPublisherClaim(ctx, *current)
+}
+
+func (m *Manager) confirmPublisherClaim(ctx context.Context, expected PublisherClaim) (*PublisherClaim, error) {
+	stored, err := m.readPublisherClaim(ctx)
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return nil, ErrPublisherFenced
+		}
+		return nil, err
+	}
+	observed := *stored
+	observed.version, expected.version = nil, nil
+	if observed != expected || observed.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrPublisherFenced
+	}
+	return stored, nil
 }
 
 func (m *Manager) ValidatePublisherClaim(ctx context.Context, owner string, index uint64, root [32]byte) error {
@@ -353,45 +375,52 @@ func (m *Manager) ReleasePublisherClaim(ctx context.Context, claim *PublisherCla
 }
 
 func (m *Manager) readPublisherClaim(ctx context.Context) (*PublisherClaim, error) {
-	key := m.key("checkpoint/PUBLISHER")
+	data, version, err := m.readStableLeaseObject(ctx, m.key("checkpoint/PUBLISHER"), maxRootSize)
+	if err != nil {
+		return nil, err
+	}
+	var claim PublisherClaim
+	if err := decodePersistedJSON(data, &claim); err != nil {
+		return nil, err
+	}
+	if claim.ConfigID != m.configID || claim.Generation == 0 || claim.OwnerID == "" || claim.Purpose != "publisher" && claim.Purpose != "maintenance" && claim.Purpose != "generation" || (claim.Purpose == "publisher" || claim.Purpose == "generation") && claim.ReservedIndex == 0 {
+		return nil, fmt.Errorf("invalid checkpoint publisher claim")
+	}
+	claim.version = version
+	return &claim, nil
+}
+
+func (m *Manager) readStableLeaseObject(ctx context.Context, key string, limit int64) ([]byte, *objstore.ObjectVersion, error) {
 	for range 4 {
 		before, err := m.bucket.Attributes(ctx, key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		r, err := m.bucket.Get(ctx, key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		data, readErr := io.ReadAll(io.LimitReader(r, maxRootSize+1))
+		data, readErr := io.ReadAll(io.LimitReader(r, limit+1))
 		closeErr := r.Close()
-		if readErr != nil || closeErr != nil || len(data) > maxRootSize {
+		if readErr != nil || closeErr != nil || int64(len(data)) > limit {
 			if readErr != nil {
-				return nil, readErr
+				return nil, nil, readErr
 			}
 			if closeErr != nil {
-				return nil, closeErr
+				return nil, nil, closeErr
 			}
-			return nil, fmt.Errorf("checkpoint publisher claim exceeds size limit")
+			return nil, nil, fmt.Errorf("checkpoint lease object exceeds size limit")
 		}
 		after, err := m.bucket.Attributes(ctx, key)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if before.Version == nil || after.Version == nil || *before.Version != *after.Version {
 			continue
 		}
-		var claim PublisherClaim
-		if err := decodePersistedJSON(data, &claim); err != nil {
-			return nil, err
-		}
-		if claim.ConfigID != m.configID || claim.Generation == 0 || claim.OwnerID == "" || claim.Purpose != "publisher" && claim.Purpose != "maintenance" && claim.Purpose != "generation" || (claim.Purpose == "publisher" || claim.Purpose == "generation") && claim.ReservedIndex == 0 {
-			return nil, fmt.Errorf("invalid checkpoint publisher claim")
-		}
-		claim.version = after.Version
-		return &claim, nil
+		return data, after.Version, nil
 	}
-	return nil, fmt.Errorf("checkpoint publisher claim did not stabilize")
+	return nil, nil, fmt.Errorf("checkpoint lease object did not stabilize")
 }
 
 func (m *Manager) uploadPublisherClaim(ctx context.Context, key string, claim *PublisherClaim, options ...objstore.ObjectUploadOption) error {
@@ -1045,7 +1074,7 @@ func (m *Manager) PinRecoveryRoot(ctx context.Context, root *Checkpoint, owner s
 				}
 				return err
 			}
-			stored, err := m.readRecoveryPin(ctx, key)
+			stored, err := m.confirmRecoveryPin(ctx, key, record)
 			if err != nil {
 				return err
 			}
@@ -1054,7 +1083,13 @@ func (m *Manager) PinRecoveryRoot(ctx context.Context, root *Checkpoint, owner s
 		}
 		return ErrPublisherBusy
 	})
-	return pin, err
+	if err != nil {
+		return nil, err
+	}
+	if pin == nil || pin.record.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrPublisherFenced
+	}
+	return pin, nil
 }
 
 func (p *RecoveryPin) Renew(ctx context.Context, lease time.Duration) error {
@@ -1065,7 +1100,7 @@ func (p *RecoveryPin) Renew(ctx context.Context, lease time.Duration) error {
 	if err != nil {
 		return err
 	}
-	if current.OwnerID != p.record.OwnerID || current.Token != p.record.Token || current.RootHash != p.record.RootHash || current.LeaseUntilMS <= time.Now().UnixMilli() {
+	if current.ConfigID != p.record.ConfigID || current.OwnerID != p.record.OwnerID || current.Token != p.record.Token || current.Index != p.record.Index || current.RootHash != p.record.RootHash || current.LeaseUntilMS <= time.Now().UnixMilli() {
 		return ErrPublisherFenced
 	}
 	current.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
@@ -1074,6 +1109,9 @@ func (p *RecoveryPin) Renew(ctx context.Context, lease time.Duration) error {
 			return ErrPublisherFenced
 		}
 		return err
+	}
+	if current.LeaseUntilMS <= time.Now().UnixMilli() {
+		return ErrPublisherFenced
 	}
 	return nil
 }
@@ -1089,7 +1127,7 @@ func (p *RecoveryPin) Close(ctx context.Context) error {
 		}
 		return err
 	}
-	if current.OwnerID != p.record.OwnerID || current.Token != p.record.Token || current.RootHash != p.record.RootHash {
+	if current.ConfigID != p.record.ConfigID || current.OwnerID != p.record.OwnerID || current.Token != p.record.Token || current.Index != p.record.Index || current.RootHash != p.record.RootHash {
 		return ErrPublisherFenced
 	}
 	current.LeaseUntilMS = time.Now().UnixMilli()
@@ -1130,28 +1168,13 @@ func (m *Manager) uploadRecoveryPin(ctx context.Context, key string, record reco
 }
 
 func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*recoveryPinRecord, error) {
-	attributes, err := m.bucket.Attributes(ctx, key)
+	data, version, err := m.readStableLeaseObject(ctx, key, maxRootSize+1024)
 	if err != nil {
 		return nil, err
-	}
-	r, err := m.bucket.Get(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(r, maxRootSize+1025))
-	closeErr := r.Close()
-	if readErr != nil {
-		return nil, readErr
-	}
-	if closeErr != nil {
-		return nil, closeErr
 	}
 	var record recoveryPinRecord
 	if err := decodePersistedJSON(data, &record); err != nil {
 		return nil, err
-	}
-	if readErr == nil && len(data) > maxRootSize+1024 {
-		return nil, fmt.Errorf("checkpoint recovery pin exceeds size limit")
 	}
 	if record.ConfigID != m.configID || record.OwnerID == "" || record.Token == "" || record.Index == 0 {
 		return nil, fmt.Errorf("invalid checkpoint recovery pin")
@@ -1159,8 +1182,30 @@ func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*recoveryPin
 	if _, err := m.recoveryPinRoot(record); err != nil {
 		return nil, fmt.Errorf("invalid checkpoint recovery pin: %w", err)
 	}
-	record.version = attributes.Version
+	record.version = version
 	return &record, nil
+}
+
+func (m *Manager) confirmRecoveryPin(ctx context.Context, key string, expected recoveryPinRecord) (*recoveryPinRecord, error) {
+	stored, err := m.readRecoveryPin(ctx, key)
+	if err != nil {
+		if m.bucket.IsObjNotFoundErr(err) {
+			return nil, ErrPublisherFenced
+		}
+		return nil, err
+	}
+	want, err := json.Marshal(expected)
+	if err != nil {
+		return nil, err
+	}
+	got, err := json.Marshal(stored)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(want, got) || stored.LeaseUntilMS <= time.Now().UnixMilli() {
+		return nil, ErrPublisherFenced
+	}
+	return stored, nil
 }
 
 func (m *Manager) recoveryPinRoot(record recoveryPinRecord) (*Checkpoint, error) {
