@@ -14,7 +14,7 @@ import (
 )
 
 const Version = 4
-const PeerALPN = "rhiza-peer-v6"
+const PeerALPN = "rhiza-peer-v7"
 
 func Marker() string { return strconv.Itoa(Version) }
 

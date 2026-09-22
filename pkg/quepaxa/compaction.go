@@ -381,6 +381,7 @@ func (c *Core) finishCompaction() {
 }
 
 func (c *Core) lockCompactionBarrier() {
+	c.pipelineExclusive <- struct{}{}
 	for range cap(c.pipeline) {
 		c.pipeline <- struct{}{}
 	}
@@ -398,6 +399,7 @@ func (c *Core) unlockCompactionBarrier() {
 	for range cap(c.pipeline) {
 		<-c.pipeline
 	}
+	<-c.pipelineExclusive
 }
 
 func (c *Core) LatestCheckpointSeal() (SealedCheckpoint, bool, error) {

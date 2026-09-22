@@ -71,6 +71,7 @@ type Core struct {
 	nextSlot            Slot
 	vacant              []Slot
 	pipeline            chan struct{}
+	pipelineExclusive   chan struct{}
 	recoveryGate        chan struct{}
 	mu                  sync.RWMutex
 	tip                 Slot
@@ -122,7 +123,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 	core := &Core{
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
-		nextSlot: 1, pipeline: make(chan struct{}, 16), recoveryGate: make(chan struct{}, 1), tipChanged: make(chan struct{}),
+		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), tipChanged: make(chan struct{}),
 		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
@@ -328,7 +329,12 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 				c.releaseSlot(slot)
 				return 0, nil, err
 			}
-			encoded, err := EncodeLeaderSchedule(c.calculateLeaderSchedule())
+			order, err := c.calculateLeaderSchedule(slot)
+			if err != nil {
+				c.releaseSlot(slot)
+				return 0, nil, err
+			}
+			encoded, err := EncodeLeaderSchedule(order)
 			if err != nil {
 				c.releaseSlot(slot)
 				return 0, nil, err
@@ -637,11 +643,15 @@ func (c *Core) explorationEpochs() uint64 {
 }
 
 func (c *Core) isLeaderScheduleSlot(slot Slot) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.isLeaderScheduleSlotLocked(slot)
+}
+
+func (c *Core) isLeaderScheduleSlotLocked(slot Slot) bool {
 	if c.reconfigEnabled {
-		c.mu.RLock()
 		start := c.configEpochStartLocked(slot)
 		cluster := c.clusterForSlotLocked(slot)
-		c.mu.RUnlock()
 		epoch := uint64((slot - start) / leaderEpochSize)
 		return epoch+1 >= uint64(2*len(cluster.Members)+1) && slot == start+Slot(epoch)*leaderEpochSize
 	}
@@ -688,10 +698,10 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		decision, ok := c.decided[controlSlot]
 		if !ok {
 			key := c.leaderEpochKeyLocked(slot)
-			if c.generationAnchorHash != ([32]byte{}) && key == c.baseLeaderEpoch && len(c.baseLeaderOrder) != 0 {
+			if controlSlot <= c.floor && key == c.baseLeaderEpoch && validateLeaderSchedule(cluster, c.baseLeaderOrder) {
 				return append([]NodeID(nil), c.baseLeaderOrder...), nil
 			}
-			if c.generationAnchorHash != ([32]byte{}) && key == c.baseFollowingEpoch && len(c.baseFollowingOrder) != 0 {
+			if controlSlot <= c.floor && key == c.baseFollowingEpoch && validateLeaderSchedule(cluster, c.baseFollowingOrder) {
 				return append([]NodeID(nil), c.baseFollowingOrder...), nil
 			}
 			return nil, fmt.Errorf("leader schedule unavailable for generation epoch %d", epoch)
@@ -846,12 +856,12 @@ func (c *Core) markEpochStarted(slot Slot) {
 	c.mu.Unlock()
 }
 
-func (c *Core) calculateLeaderSchedule() []NodeID {
+func (c *Core) calculateLeaderSchedule(slot Slot) ([]NodeID, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	order, err := c.leaderOrderLocked(c.tip)
+	order, err := c.leaderOrderLocked(slot)
 	if err != nil {
-		order = rotateMembers(c.config.Members, 0)
+		return nil, err
 	}
 	position := make(map[NodeID]int, len(order))
 	for i, id := range order {
@@ -868,7 +878,7 @@ func (c *Core) calculateLeaderSchedule() []NodeID {
 		}
 		return left.average < right.average
 	})
-	return order
+	return order, nil
 }
 
 func (c *Core) releaseSlot(slot Slot) {
@@ -1249,6 +1259,10 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 			}
 		}
 		if isControl && !control.Terminal && c.reconfiguration == nil {
+			if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil && request.Slot == c.tip+1 {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
 			if control.Freeze != request.Slot {
 				c.mu.Unlock()
 				return Summary{}, fmt.Errorf("freeze control slot mismatch")
@@ -1947,7 +1961,11 @@ func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 	}
 	c.mu.RUnlock()
 	if c.isLeaderScheduleSlot(slot) {
-		return EncodeLeaderSchedule(c.calculateLeaderSchedule())
+		order, err := c.calculateLeaderSchedule(slot)
+		if err != nil {
+			return nil, err
+		}
+		return EncodeLeaderSchedule(order)
 	}
 	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-recovery:%s:%d", c.nodeID, slot)))
 	var nonce [ReadBarrierNonceSize]byte

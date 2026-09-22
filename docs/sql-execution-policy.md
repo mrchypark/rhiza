@@ -1,5 +1,17 @@
 # SQL execution policy 4 compatibility boundary
 
+The reconfiguration schedule repair uses peer ALPN `rhiza-peer-v7`, with no
+v6 fallback; SQL policy remains 4. Upgrade all participants while quiesced.
+Do not downgrade after activation. This transport gate does not mechanically
+prevent reopening WALs with older binaries.
+
+Certified reconfigurations whose freeze or terminal occupies a source-generation
+leader-schedule slot are incompatible. Preserve the installation, WAL, ISR and
+certificates; do not rewrite controls, truncate to the pre-freeze prefix, or
+invent a schedule. Migrate verified committed application state (including
+committed drain writes) into a fresh cluster with a separate lineage. This change
+does not perform that migration automatically.
+
 The SQL counter/default, TEMP, ROWID and PRAGMA fixes are incompatible execution-policy changes. This is
 not an in-place upgrade. Certified SQL uses `QBAT\x04`; policy-3 `QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
 unknown policy versions and raw SQL decisions cannot be applied by this binary.

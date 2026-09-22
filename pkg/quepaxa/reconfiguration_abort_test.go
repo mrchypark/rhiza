@@ -35,6 +35,12 @@ func TestAbortPendingAdditionPreservesOldConfigurationAcrossCompactionAndRestart
 		}
 	})
 	core := transport.cores["a"]
+	// Reach adaptive scheduling through real consensus before checkpointing.
+	for core.Tip() < 96 {
+		if _, _, err := core.Propose(context.Background(), []byte("before-abort")); err != nil {
+			t.Fatal(err)
+		}
+	}
 	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "lost", WALIdentity: "0000000000000000000000000000000000000000000000000000000000000000"}}}
 	freeze, err := core.BeginReconfiguration(context.Background(), target)
 	if err != nil {
@@ -120,6 +126,17 @@ func TestAbortPendingAdditionPreservesOldConfigurationAcrossCompactionAndRestart
 	}
 	if slot, gotTarget, ok := restarted.LastReconfigurationAbort(); !ok || slot != freeze+16 || !sameCluster(gotTarget, target) {
 		t.Fatalf("restarted abort outcome slot=%d target=%+v ok=%v", slot, gotTarget, ok)
+	}
+	for restarted.Tip() < index+40 {
+		if _, _, err := restarted.Propose(context.Background(), []byte("after-checkpoint")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := restarted.BeginReconfiguration(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.AbortReconfiguration(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
