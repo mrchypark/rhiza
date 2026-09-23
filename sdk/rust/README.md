@@ -15,7 +15,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.15.4"
+rhizadb = "0.16.0"
 serde_json = "1"
 ```
 
@@ -132,15 +132,15 @@ target, verifies it against the published checksum, and writes it as
 `$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.15.4/sdk/rust/scripts/fetch-native.sh
-sh fetch-native.sh 0.15.4
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.16.0/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.16.0
 export RHIZA_NATIVE_LIB_DIR=./.rhiza-native
 ```
 
 For containers and cross builds, pass the target and destination explicitly:
 
 ```sh
-sh fetch-native.sh 0.15.4 x86_64-unknown-linux-gnu /opt/rhiza-native
+sh fetch-native.sh 0.16.0 x86_64-unknown-linux-gnu /opt/rhiza-native
 ```
 
 The same files can be fetched by hand: download
