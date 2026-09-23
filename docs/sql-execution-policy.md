@@ -21,7 +21,7 @@ slots are checked too. Do not rewrite stored decision bytes.
 Existing unmarked, policy-1, policy-2 or policy-3 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
 `sql_execution_policy=4` metadata value identifies newly initialized state; it
 is not a migration certificate. Do not manually insert it into old databases or
-stamp old checkpoint descriptors. Peer ALPN v6 separates this binary from v2/v3/v4/v5
+stamp old checkpoint descriptors. Peer ALPN v7 separates this binary from v2/v3/v4/v5/v6
 peers. Mixed-version clusters and downgrades are unsupported.
 
 Replicated writes cannot create TEMP/TEMPORARY objects or use `temp` as a dotted
