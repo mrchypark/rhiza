@@ -1788,6 +1788,11 @@ func (c *Core) acceptDecision(decision Decision) error {
 			c.mu.Unlock()
 			return fmt.Errorf("slot %d already decided with another value", decision.Slot)
 		}
+		if c.reconfigEnabled && decision.Slot == c.tip+1 {
+			err := c.advanceReconfigurationTipLocked()
+			c.mu.Unlock()
+			return err
+		}
 		c.mu.Unlock()
 		return nil
 	}
@@ -1936,6 +1941,9 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 		return ctx.Err()
 	}
 	for c.Tip() < through {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		slot := c.Tip() + 1
 		value, err := c.recoveryValue(ctx, slot)
 		if err != nil {
@@ -1947,6 +1955,9 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 		}
 		if err := c.AcceptDecision(decision); err != nil {
 			return fmt.Errorf("persist recovered slot %d: %w", slot, err)
+		}
+		if c.Tip() < slot {
+			return fmt.Errorf("recover slot %d made no checked prefix progress", slot)
 		}
 	}
 	return nil

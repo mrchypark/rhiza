@@ -279,4 +279,20 @@ func TestCompactionCannotAdvanceRejectedSchedule(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(before, after) {
 		t.Fatalf("compaction changed WAL evidence: %v", err)
 	}
+	for i := 0; i < 2; i++ {
+		retryCtx, stop := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		err := c.RecoverThrough(retryCtx, 97)
+		stop()
+		if err == nil || !strings.Contains(err.Error(), "incompatible leader schedule") {
+			t.Fatalf("retry %d failed to reject retained schedule: %v", i, err)
+		}
+		if c.Tip() != 96 {
+			t.Fatalf("retry changed checked tip: %d", c.Tip())
+		}
+	}
+	beginCtx, stop := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer stop()
+	if _, err := c.BeginReconfiguration(beginCtx, target); err == nil {
+		t.Fatal("begin accepted poisoned schedule")
+	}
 }
