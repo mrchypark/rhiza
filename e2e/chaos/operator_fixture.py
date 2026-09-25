@@ -8,13 +8,11 @@ from __future__ import annotations
 
 import json
 
-# Pinned images from existing repo manifests.
+# This public image contains both the MinIO server and mc client.
 MINIO_IMAGE = (
-    "quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+    "ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9"
 )
-MC_IMAGE = (
-    "quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
-)
+MC_IMAGE = MINIO_IMAGE
 
 _MINIO_ACCESS = "chaos-minio"
 _MINIO_SECRET = "chaos-minio-secret"
