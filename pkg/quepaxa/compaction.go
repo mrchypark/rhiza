@@ -44,17 +44,17 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 	if err != nil {
 		return err
 	}
+	verified, err := c.verifyBaseSuffixLocked(base)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := c.wal.Compact(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, retained); err != nil {
 		return err
 	}
-	if err := c.installGenerationAnchorBaseLocked(base.GenerationAnchorHash); err != nil {
-		return err
-	}
-	if err := c.installMembershipBaseLocked(base); err != nil {
-		return err
-	}
-	c.installBaseLocked(base)
-	c.advanceTipLocked()
+	c.installVerifiedBaseLocked(base, verified)
 	c.pruneSlotAllocatorLocked()
 	c.preparedCheckpoints[seal.Index] = seal.RootHash
 	return nil
@@ -282,6 +282,11 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 		c.unlockCompactionBarrier()
 		return err
 	}
+	if _, err := c.verifyBaseSuffixLocked(base); err != nil {
+		c.mu.Unlock()
+		c.unlockCompactionBarrier()
+		return err
+	}
 	compaction, err := c.beginCompactionLocked(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, retained)
 	c.mu.Unlock()
 	c.unlockCompactionBarrier()
@@ -301,16 +306,90 @@ func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
 	if c.floor >= through || c.membershipVersion != membershipVersion || c.reconfiguration != nil {
 		return fmt.Errorf("compaction floor advanced while rewrite was running")
 	}
+	verified, err := c.verifyBaseSuffixLocked(base)
+	if err != nil {
+		return err
+	}
 	if err := compaction.Commit(); err != nil {
 		return err
 	}
-	if err := c.installMembershipBaseLocked(base); err != nil {
-		return err
-	}
-	c.installBaseLocked(base)
-	c.advanceTipLocked()
+	c.installVerifiedBaseLocked(base, verified)
 	c.pruneSlotAllocatorLocked()
 	return nil
+}
+
+// Verify the exact retained contiguous suffix under the final barrier before
+// replacing the WAL. A rejected decision must remain evidence, not become tip.
+func (c *Core) verifyBaseSuffixLocked(base consensusBase) (*Core, error) {
+	v := newCore(c.nodeID, c.config, nil, nil)
+	v.reconfigEnabled = c.reconfigEnabled
+	v.generationAnchorHash = c.generationAnchorHash
+	if err := v.installGenerationAnchorBaseLocked(base.GenerationAnchorHash); err != nil {
+		return nil, err
+	}
+	if err := v.installMembershipBaseLocked(base); err != nil {
+		return nil, err
+	}
+	v.installBaseLocked(base)
+	slots := make([]Slot, 0, len(c.decided))
+	for slot := range c.decided {
+		if slot > base.ClosedThrough {
+			slots = append(slots, slot)
+		}
+	}
+	slices.Sort(slots)
+	for _, slot := range slots {
+		value := c.decided[slot]
+		decision, err := v.certifiedDecision(value)
+		if err != nil {
+			return nil, err
+		}
+		if err := v.validateDecisionForRecovery(decision, true); err != nil {
+			return nil, err
+		}
+		v.decided[slot] = value
+		if v.reconfigEnabled {
+			if err := v.advanceReconfigurationTipLocked(); err != nil {
+				return nil, err
+			}
+		} else {
+			v.advanceTipLocked()
+		}
+	}
+	if c.tip >= base.ClosedThrough {
+		if v.tip != c.tip || v.prefixes[v.tip] != c.prefixes[c.tip] || v.reconfiguration != nil {
+			return nil, fmt.Errorf("compaction suffix changed checked prefix")
+		}
+		if c.reconfigEnabled {
+			before, err := c.membershipHistoryLocked(c.tip)
+			if err != nil {
+				return nil, err
+			}
+			after, err := v.membershipHistoryLocked(v.tip)
+			if err != nil {
+				return nil, err
+			}
+			if !sameMembershipRecord(before, after) {
+				return nil, fmt.Errorf("compaction suffix changed checked membership")
+			}
+		}
+	}
+	return v, nil
+}
+
+// The verifier owns these reconstructed maps; no fallible work remains after
+// the WAL replacement. Retained sparse decisions remain in the live Core.
+func (c *Core) installVerifiedBaseLocked(base consensusBase, v *Core) {
+	if len(c.configHistory) != len(v.configHistory) {
+		clear(c.epochStart)
+		clear(c.timings)
+	}
+	c.configHistory, c.retiredIDs = v.configHistory, v.retiredIDs
+	c.baseMembership, c.lastAbort = v.baseMembership, v.lastAbort
+	c.reconfiguration, c.membershipVersion = v.reconfiguration, v.membershipVersion
+	c.generationAnchorHash = v.generationAnchorHash
+	c.installBaseLocked(base)
+	c.tip, c.prefixes = v.tip, v.prefixes
 }
 
 func (c *Core) liveProposalValuesAboveLocked(through Slot) (map[[32]byte][]byte, error) {

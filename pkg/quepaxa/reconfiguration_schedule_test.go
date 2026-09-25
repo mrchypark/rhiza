@@ -7,6 +7,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -168,5 +169,130 @@ func TestLegacyContiguousScheduleWALRejected(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCompactionCannotAdvanceRejectedSchedule(t *testing.T) {
+	cores, _ := reconfigCluster(t)
+	c := cores["a"]
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := c.RecoverThrough(ctx, 64); err != nil {
+		t.Fatal(err)
+	}
+	membership, err := c.CheckpointMembership(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, _ := c.PrefixHash(64)
+	next, following, err := c.CheckpointLeaderOrders(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := CheckpointSeal{ConfigID: 1, Index: 64, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following, Membership: &membership}
+	for _, core := range cores {
+		if err := core.RecoverThrough(ctx, 64); err != nil {
+			t.Fatal(err)
+		}
+		core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+		if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.Propose(ctx, encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RecoverThrough(ctx, 81); err != nil {
+		t.Fatal(err)
+	}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "lost", WALIdentity: strings.Repeat("0", 64)}}}
+	value, err := encodeReconfiguration(reconfigurationValue{Freeze: 97, TerminalSlot: 113, Target: target, PrefixHash: [32]byte{3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	late, err := c.runSlot(ctx, 97, value, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AcceptDecision(late); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RecoverThrough(ctx, 96); err == nil || !strings.Contains(err.Error(), "incompatible leader schedule") {
+		t.Fatalf("expected schedule rejection, got %v", err)
+	}
+	if c.Tip() != 96 {
+		t.Fatalf("tip before compaction = %d", c.Tip())
+	}
+	t.Run("restore", func(t *testing.T) {
+		restored, _ := reconfigCluster(t)
+		r := restored["a"]
+		r.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+		for slot := Slot(65); slot <= 97; slot++ {
+			decision, err := historyDecision(1, mustCertified(t, c, slot))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.AcceptDecision(decision); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before, err := r.wal.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.RestoreCheckpointBase(ctx, seal, mustCertified(t, c, 65)); err == nil || !strings.Contains(err.Error(), "incompatible leader schedule") {
+			t.Fatalf("restore accepted rejected suffix: %v", err)
+		}
+		if r.Tip() != 0 || r.CompactionFloor() != 0 {
+			t.Fatal("failed restore changed base")
+		}
+		if got, ok := r.CertifiedValue(97); !ok || !bytes.Equal(got.Value, value) {
+			t.Fatal("restore lost rejected certificate")
+		}
+		after, err := r.wal.Read()
+		if err != nil || !reflect.DeepEqual(before, after) {
+			t.Fatalf("restore changed WAL evidence: %v", err)
+		}
+	})
+	before, err := c.wal.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CompactThrough(64, seal.RootHash); err == nil || !strings.Contains(err.Error(), "incompatible leader schedule") {
+		t.Fatalf("compaction accepted rejected suffix: %v", err)
+	}
+	if c.CompactionFloor() != 0 {
+		t.Fatal("failed compaction changed floor")
+	}
+	if c.Tip() != 96 {
+		t.Fatalf("compaction advanced rejected schedule: tip=%d", c.Tip())
+	}
+	got, ok := c.CertifiedValue(97)
+	if !ok || !bytes.Equal(got.Value, value) {
+		t.Fatal("compaction lost rejected certificate")
+	}
+	after, err := c.wal.Read()
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("compaction changed WAL evidence: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		retryCtx, stop := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		err := c.RecoverThrough(retryCtx, 97)
+		stop()
+		if err == nil || !strings.Contains(err.Error(), "incompatible leader schedule") {
+			t.Fatalf("retry %d failed to reject retained schedule: %v", i, err)
+		}
+		if c.Tip() != 96 {
+			t.Fatalf("retry changed checked tip: %d", c.Tip())
+		}
+	}
+	beginCtx, stop := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer stop()
+	if _, err := c.BeginReconfiguration(beginCtx, target); err == nil {
+		t.Fatal("begin accepted poisoned schedule")
 	}
 }
