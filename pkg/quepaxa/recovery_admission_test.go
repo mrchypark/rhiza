@@ -210,14 +210,52 @@ func TestSparseLaterFreezeWALRestartsBeforePrefixArrives(t *testing.T) {
 		bad.Summaries[i].ReconfigurationID = bad.Proposal.Hash
 	}
 	bad.Summaries[0].ReconfigurationID = [32]byte{9}
-	if err := restarted.validateDecisionForRecovery(bad, true); err == nil {
-		t.Fatal("unrelated freeze binding accepted during sparse recovery")
-	}
 	if err := restarted.AcceptDecision(first); err != nil {
 		t.Fatal(err)
 	}
 	if restarted.Tip() != 3 || restarted.reconfiguration == nil || restarted.reconfiguration.freeze != 2 {
 		t.Fatal("replayed controls did not advance after prefix recovery")
+	}
+	restarted.mu.RLock()
+	err = restarted.validateFreezeBindingLocked(bad)
+	restarted.mu.RUnlock()
+	if err == nil {
+		t.Fatal("unrelated freeze binding accepted after prefix recovery")
+	}
+	thirdValue, err := encodeReconfiguration(reconfigurationValue{Freeze: 4, TerminalSlot: 20, Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := late
+	third.Slot = 4
+	third.Proposal = newProposal(highestPriority, "a", thirdValue)
+	third.Summaries = append(late.Summaries[:0:0], late.Summaries...)
+	for i := range third.Summaries {
+		third.Summaries[i].ReconfigurationID = late.Proposal.Hash
+	}
+	restarted.mu.RLock()
+	err = restarted.validateFreezeBindingLocked(third)
+	restarted.mu.RUnlock()
+	if err == nil {
+		t.Fatal("later freeze bound to a no-op freeze rather than active drain")
+	}
+	badWAL, err := qlog.Open(filepath.Join(t.TempDir(), "bad-wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badWAL.Close()
+	badReplica, err := New(Config{NodeID: "c", Cluster: *core.config, WAL: badWAL, Transport: transport, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := badReplica.AcceptDecision(bad); err != nil {
+		t.Fatalf("sparse certificate rejected before its state was known: %v", err)
+	}
+	if err := badReplica.AcceptDecision(freeze); err != nil {
+		t.Fatal(err)
+	}
+	if err := badReplica.AcceptDecision(first); err == nil {
+		t.Fatal("unrelated binding advanced after the prefix arrived")
 	}
 }
 
