@@ -134,7 +134,7 @@ target, verifies it against the published checksum, and writes it as
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.16.0/sdk/rust/scripts/fetch-native.sh
 sh fetch-native.sh 0.16.0
-export RHIZA_NATIVE_LIB_DIR=./.rhiza-native
+export RHIZA_NATIVE_LIB_DIR="$(pwd)/.rhiza-native"
 ```
 
 For containers and cross builds, pass the target and destination explicitly:
