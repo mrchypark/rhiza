@@ -2050,10 +2050,28 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 		if !control.Terminal {
 			c.mu.RLock()
 			state := c.reconfiguration
+			// A later freeze can bind to an earlier certified freeze even when
+			// that freeze is still sparse and has not installed drain state.
+			boundFreeze := make(map[ValueHash]bool)
+			if state == nil {
+				for _, summary := range decision.Summaries {
+					if slot, ok := c.byHash[summary.ReconfigurationID]; ok && slot < decision.Slot {
+						if earlier, ok := c.decided[slot]; ok {
+							freeze, controlOK, err := decodeReconfiguration(earlier.Value)
+							_, certificate, certErr := decodeCertificate(earlier.Certificate)
+							selfBound := certErr == nil
+							for _, source := range certificate.Summaries {
+								selfBound = selfBound && source.ReconfigurationID == earlier.Hash
+							}
+							boundFreeze[summary.ReconfigurationID] = err == nil && controlOK && !freeze.Terminal && freeze.Freeze == slot && decision.Slot < freeze.TerminalSlot && selfBound
+						}
+					}
+				}
+			}
 			c.mu.RUnlock()
 			expected := decision.Proposal.Hash
 			for _, summary := range decision.Summaries {
-				if summary.ReconfigurationID != expected && !(state != nil && decision.Slot > state.freeze && summary.ReconfigurationID == state.id) {
+				if summary.ReconfigurationID != expected && !(state != nil && decision.Slot > state.freeze && summary.ReconfigurationID == state.id) && !boundFreeze[summary.ReconfigurationID] {
 					return fmt.Errorf("freeze quorum lacks reconfiguration capability")
 				}
 			}
