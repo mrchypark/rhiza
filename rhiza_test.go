@@ -826,7 +826,17 @@ func TestLocalModePersistsSQLKVGraph(t *testing.T) {
 	if _, err := db.GraphExecute(ctx, rhiza.GraphCommand{RequestID: "graph", Cypher: "CREATE (:Item {name: 'local'})"}); err != nil {
 		t.Fatal(err)
 	}
+	// Cross singleton leader-schedule slots before rebuilding derived state.
+	for i := 0; i < 40; i++ {
+		if _, err := db.KVPut(ctx, rhiza.KVMutationRequest{RequestID: fmt.Sprintf("schedule-%d", i), Key: "schedule", Value: []byte("value")}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Only this test's derived database is removed; the certified WAL remains.
+	if err := os.Remove(filepath.Join(config.DataDir, "sqlite.db")); err != nil {
 		t.Fatal(err)
 	}
 	db, err = rhiza.Open(ctx, config)
@@ -836,6 +846,12 @@ func TestLocalModePersistsSQLKVGraph(t *testing.T) {
 	rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT name FROM items", Consistency: rhiza.ConsistencyLinearizable})
 	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "local" {
 		t.Fatalf("SQL: %+v %v", rows, err)
+	}
+	if receipt, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1, 'local')"}); err != nil || receipt.Status != "committed" {
+		t.Fatalf("replayed receipt retry: %+v %v", receipt, err)
+	}
+	if _, err := db.KVPut(ctx, rhiza.KVMutationRequest{RequestID: "after-replay", Key: "after", Value: []byte("recovered")}); err != nil {
+		t.Fatal(err)
 	}
 	kv, err := db.KVGet(ctx, rhiza.KVGetRequest{Key: "key"})
 	if err != nil || !kv.Found || string(kv.Value) != "value" {
