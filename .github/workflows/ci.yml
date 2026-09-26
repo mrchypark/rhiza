@@ -181,6 +181,8 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
+      - name: Bucket fixture retry regression
+        run: python3 e2e/chaos/operator_fixture_test.py
       - name: Vet
         env:
           CGO_ENABLED: 0

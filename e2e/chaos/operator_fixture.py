@@ -351,7 +351,10 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                             "image": AWS_CLI_IMAGE,
                             "command": ["/bin/sh", "-c"],
                             "args": [
-                                "until aws --endpoint-url http://rhiza-minio:9000 s3 mb s3://rhiza; do sleep 1; done"
+                                "i=0; while [ \"$i\" -lt 120 ]; do "
+                                "aws --endpoint-url http://rhiza-minio:9000 s3api head-bucket --bucket rhiza && exit 0; "
+                                "aws --endpoint-url http://rhiza-minio:9000 s3 mb s3://rhiza && exit 0; "
+                                "i=$((i+1)); sleep 1; done; exit 1"
                             ],
                             "env": [
                                 {
