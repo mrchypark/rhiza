@@ -146,8 +146,8 @@ jobs:
       - name: Reuse pinned Hiqlite reference
         if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         env:
-          HIQLITE_COMMIT: c3ff2536ac985ecb9f77201d1b58dab66c7b256e
-          HIQLITE_PATCH_SHA256: 1adc6028d28bb0c6b80cf429a69dab30d744eb4ed13830dcb028325522d717b7
+          HIQLITE_COMMIT: cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
+          HIQLITE_PATCH_SHA256: e056c066efc27a96a7c7372ede87bbd794fdc65c0f41fa4daf958b3f68c2b07e
         run: |
           reference=benchmarks/hiqlite-reference.json
           latest_version=$(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git 'refs/tags/v*' | awk -F/ '{print $3}' | sort -V | tail -1)
@@ -240,7 +240,7 @@ jobs:
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
-            printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+            printf 'hiqlite_commit=%s\n' cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
             printf 'hiqlite_result=reused-verified-reference\n'
             printf 'hiqlite_official_log_sync=interval_200\n'
             printf 'hiqlite_durable_log_sync=immediate\n'
