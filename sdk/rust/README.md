@@ -15,7 +15,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.16.0"
+rhizadb = "0.17.0"
 serde_json = "1"
 ```
 
@@ -62,9 +62,9 @@ hard upper bound on native cleanup, and `Drop` cannot report a close failure.
 `bind_addr`, `peer_addr`, and `set_option("GoFieldName", value)` for other
 Go `rhiza.Config` fields. `Debug` prints field names only and never values.
 
-In a source checkout with local-mode support, use
+Since 0.17.0, use
 `Db::open(Config::new("./data").node_id("local").local())` for a local-only
-database. This option is not in the published 0.16.0 release. It opens no peer
+database. It opens no peer
 transport or listener; `start_operator` is rejected. SQL, KV, graph, receipts,
 and WAL recovery use the existing engine. Listener addresses, members, tokens,
 learner/reconfiguration and object-storage settings must be omitted. There is no
@@ -140,15 +140,15 @@ target, verifies it against the published checksum, and writes it as
 `$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.16.0/sdk/rust/scripts/fetch-native.sh
-sh fetch-native.sh 0.16.0
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.17.0/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.17.0
 export RHIZA_NATIVE_LIB_DIR="$(pwd)/.rhiza-native"
 ```
 
 For containers, pass the host target and destination explicitly:
 
 ```sh
-sh fetch-native.sh 0.16.0 x86_64-unknown-linux-gnu /opt/rhiza-native
+sh fetch-native.sh 0.17.0 x86_64-unknown-linux-gnu /opt/rhiza-native
 ```
 
 The same files can be fetched by hand: download
