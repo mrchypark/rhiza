@@ -14,7 +14,7 @@ import time
 
 from automatic_recovery import AutomaticChaos
 from kind_fencer import KindFencer
-from operator_fixture import MC_IMAGE
+from operator_fixture import AWS_CLI_IMAGE
 
 ANCHOR_ID = "chaos-anchor"
 ANCHOR_CM = "rhiza-anchor-chaos-anchor"
@@ -204,17 +204,22 @@ class AnchorChaos(AutomaticChaos):
 
     def _mc_run(self, mc_args, expect_phase="Succeeded"):
         ns = self.ns
-        alias = ("mc alias set local http://rhiza-minio:9000 "
-                 "chaos-minio chaos-minio-secret")
-        full = alias + " && mc " + " ".join(mc_args)
+        full = ("aws --endpoint-url http://rhiza-minio:9000 s3 "
+                + mc_args[0] + " " + " ".join(
+                    "s3://" + arg.removeprefix("local/") for arg in mc_args[1:]))
         pod = f"mc-{int(time.time())}"
         self.apply({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": pod, "namespace": ns},
             "spec": {"restartPolicy": "Never",
-                     "containers": [{"name": "mc", "image": MC_IMAGE,
+                     "containers": [{"name": "aws-cli", "image": AWS_CLI_IMAGE,
                          "command": ["/bin/sh", "-c"],
-                         "args": [full]}]}})
+                         "args": [full],
+                         "env": [
+                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-minio"},
+                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-minio-secret"},
+                             {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
+                         ]}]}})
         self.wait(f"mc {mc_args[0]}", lambda: self._mc_done(pod), 120)
         p = self.get("pod", pod)
         phase = p["status"].get("phase", "")
@@ -243,18 +248,21 @@ class AnchorChaos(AutomaticChaos):
 
     def mc_corrupt_anchor(self, tp):
         ns = self.ns
-        alias = ("mc alias set local http://rhiza-minio:9000 "
-                 "chaos-minio chaos-minio-secret")
-        dst = f"local/rhiza/rhiza/{tp}/recovery/anchor.json"
-        full = f'{alias} && printf CORRUPTED | mc pipe {dst}'
+        dst = f"s3://rhiza/rhiza/{tp}/recovery/anchor.json"
+        full = f'printf CORRUPTED | aws --endpoint-url http://rhiza-minio:9000 s3 cp - {dst}'
         pod = f"mc-corrupt-{int(time.time())}"
         self.apply({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": pod, "namespace": ns},
             "spec": {"restartPolicy": "Never",
-                     "containers": [{"name": "mc", "image": MC_IMAGE,
+                     "containers": [{"name": "aws-cli", "image": AWS_CLI_IMAGE,
                          "command": ["/bin/sh", "-c"],
-                         "args": [full]}]}})
+                         "args": [full],
+                         "env": [
+                             {"name": "AWS_ACCESS_KEY_ID", "value": "chaos-minio"},
+                             {"name": "AWS_SECRET_ACCESS_KEY", "value": "chaos-minio-secret"},
+                             {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
+                         ]}]}})
         self.wait(f"mc corrupt {pod}",
             lambda: self._mc_done(pod), 60)
         p = self.get("pod", pod)

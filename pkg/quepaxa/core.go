@@ -71,6 +71,7 @@ type Core struct {
 	nextSlot            Slot
 	vacant              []Slot
 	pipeline            chan struct{}
+	pipelineExclusive   chan struct{}
 	recoveryGate        chan struct{}
 	mu                  sync.RWMutex
 	tip                 Slot
@@ -122,7 +123,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 	core := &Core{
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
-		nextSlot: 1, pipeline: make(chan struct{}, 16), recoveryGate: make(chan struct{}, 1), tipChanged: make(chan struct{}),
+		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), tipChanged: make(chan struct{}),
 		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
@@ -328,7 +329,12 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 				c.releaseSlot(slot)
 				return 0, nil, err
 			}
-			encoded, err := EncodeLeaderSchedule(c.calculateLeaderSchedule())
+			order, err := c.calculateLeaderSchedule(slot)
+			if err != nil {
+				c.releaseSlot(slot)
+				return 0, nil, err
+			}
+			encoded, err := EncodeLeaderSchedule(order)
 			if err != nil {
 				c.releaseSlot(slot)
 				return 0, nil, err
@@ -637,11 +643,15 @@ func (c *Core) explorationEpochs() uint64 {
 }
 
 func (c *Core) isLeaderScheduleSlot(slot Slot) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.isLeaderScheduleSlotLocked(slot)
+}
+
+func (c *Core) isLeaderScheduleSlotLocked(slot Slot) bool {
 	if c.reconfigEnabled {
-		c.mu.RLock()
 		start := c.configEpochStartLocked(slot)
 		cluster := c.clusterForSlotLocked(slot)
-		c.mu.RUnlock()
 		epoch := uint64((slot - start) / leaderEpochSize)
 		return epoch+1 >= uint64(2*len(cluster.Members)+1) && slot == start+Slot(epoch)*leaderEpochSize
 	}
@@ -688,10 +698,10 @@ func (c *Core) leaderOrderLocked(slot Slot) ([]NodeID, error) {
 		decision, ok := c.decided[controlSlot]
 		if !ok {
 			key := c.leaderEpochKeyLocked(slot)
-			if c.generationAnchorHash != ([32]byte{}) && key == c.baseLeaderEpoch && len(c.baseLeaderOrder) != 0 {
+			if controlSlot <= c.floor && key == c.baseLeaderEpoch && validateLeaderSchedule(cluster, c.baseLeaderOrder) {
 				return append([]NodeID(nil), c.baseLeaderOrder...), nil
 			}
-			if c.generationAnchorHash != ([32]byte{}) && key == c.baseFollowingEpoch && len(c.baseFollowingOrder) != 0 {
+			if controlSlot <= c.floor && key == c.baseFollowingEpoch && validateLeaderSchedule(cluster, c.baseFollowingOrder) {
 				return append([]NodeID(nil), c.baseFollowingOrder...), nil
 			}
 			return nil, fmt.Errorf("leader schedule unavailable for generation epoch %d", epoch)
@@ -846,12 +856,12 @@ func (c *Core) markEpochStarted(slot Slot) {
 	c.mu.Unlock()
 }
 
-func (c *Core) calculateLeaderSchedule() []NodeID {
+func (c *Core) calculateLeaderSchedule(slot Slot) ([]NodeID, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	order, err := c.leaderOrderLocked(c.tip)
+	order, err := c.leaderOrderLocked(slot)
 	if err != nil {
-		order = rotateMembers(c.config.Members, 0)
+		return nil, err
 	}
 	position := make(map[NodeID]int, len(order))
 	for i, id := range order {
@@ -868,7 +878,7 @@ func (c *Core) calculateLeaderSchedule() []NodeID {
 		}
 		return left.average < right.average
 	})
-	return order
+	return order, nil
 }
 
 func (c *Core) releaseSlot(slot Slot) {
@@ -1249,6 +1259,10 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 			}
 		}
 		if isControl && !control.Terminal && c.reconfiguration == nil {
+			if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil && request.Slot == c.tip+1 {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
 			if control.Freeze != request.Slot {
 				c.mu.Unlock()
 				return Summary{}, fmt.Errorf("freeze control slot mismatch")
@@ -1774,6 +1788,11 @@ func (c *Core) acceptDecision(decision Decision) error {
 			c.mu.Unlock()
 			return fmt.Errorf("slot %d already decided with another value", decision.Slot)
 		}
+		if c.reconfigEnabled && decision.Slot == c.tip+1 {
+			err := c.advanceReconfigurationTipLocked()
+			c.mu.Unlock()
+			return err
+		}
 		c.mu.Unlock()
 		return nil
 	}
@@ -1810,12 +1829,31 @@ func (c *Core) acceptDecision(decision Decision) error {
 // advanceReconfigurationTipLocked applies controls only as they enter the
 // contiguous prefix. Sparse certified slots stay buffered until their prefix
 // arrives, preserving the normal 16-slot pipeline after a crash.
+func (c *Core) validateScheduledValueLocked(slot Slot, value []byte) error {
+	if c.isLeaderScheduleSlotLocked(slot) {
+		order, scheduled, err := DecodeLeaderSchedule(value)
+		if err != nil || !scheduled || !validateLeaderSchedule(c.clusterForSlotLocked(slot), order) {
+			return fmt.Errorf("incompatible leader schedule history at slot %d", slot)
+		}
+	}
+	return nil
+}
+
 func (c *Core) advanceReconfigurationTipLocked() error {
 	before := c.tip
+	defer func() {
+		if c.tip != before {
+			close(c.tipChanged)
+			c.tipChanged = make(chan struct{})
+		}
+	}()
 	for {
 		decision, ok := c.decided[c.tip+1]
 		if !ok {
 			break
+		}
+		if err := c.validateScheduledValueLocked(c.tip+1, decision.Value); err != nil {
+			return err
 		}
 		if bytes.HasPrefix(decision.Value, reconfigurationMagic) {
 			decoded, err := decodeDecision(decision.Certificate)
@@ -1823,6 +1861,9 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 				return err
 			}
 			decoded.Proposal.Value = decision.Value
+			if err := c.validateFreezeBindingLocked(decoded); err != nil {
+				return err
+			}
 			if err := c.applyReconfigurationLocked(decoded); err != nil {
 				return err
 			}
@@ -1833,10 +1874,6 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 		c.tip++
 		c.prefixes[c.tip] = AdvancePrefixHash(c.prefixes[c.tip-1], c.tip, decision.Hash)
 		c.observeLeaderEpochLocked(c.tip)
-	}
-	if c.tip != before {
-		close(c.tipChanged)
-		c.tipChanged = make(chan struct{})
 	}
 	return nil
 }
@@ -1907,6 +1944,9 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 		return ctx.Err()
 	}
 	for c.Tip() < through {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		slot := c.Tip() + 1
 		value, err := c.recoveryValue(ctx, slot)
 		if err != nil {
@@ -1918,6 +1958,9 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 		}
 		if err := c.AcceptDecision(decision); err != nil {
 			return fmt.Errorf("persist recovered slot %d: %w", slot, err)
+		}
+		if c.Tip() < slot {
+			return fmt.Errorf("recover slot %d made no checked prefix progress", slot)
 		}
 	}
 	return nil
@@ -1947,7 +1990,11 @@ func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 	}
 	c.mu.RUnlock()
 	if c.isLeaderScheduleSlot(slot) {
-		return EncodeLeaderSchedule(c.calculateLeaderSchedule())
+		order, err := c.calculateLeaderSchedule(slot)
+		if err != nil {
+			return nil, err
+		}
+		return EncodeLeaderSchedule(order)
 	}
 	seed := sha256.Sum256([]byte(fmt.Sprintf("rhiza-recovery:%s:%d", c.nodeID, slot)))
 	var nonce [ReadBarrierNonceSize]byte
@@ -1957,6 +2004,27 @@ func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 
 func (c *Core) validateDecision(decision Decision) error {
 	return c.validateDecisionForRecovery(decision, false)
+}
+
+// Call with c.mu held once the decision is next in the certified prefix.
+func (c *Core) validateFreezeBindingLocked(decision Decision) error {
+	control, ok, err := decodeReconfiguration(decision.Proposal.Value)
+	if err != nil || !ok || control.Terminal {
+		return err
+	}
+	expected := decision.Proposal.Hash
+	var active ValueHash
+	hasActive := false
+	if state := c.reconfiguration; state != nil && decision.Slot > state.freeze && decision.Slot < state.terminal {
+		active = state.id
+		hasActive = true
+	}
+	for _, summary := range decision.Summaries {
+		if summary.ReconfigurationID != expected && !(hasActive && summary.ReconfigurationID == active) {
+			return fmt.Errorf("freeze quorum lacks reconfiguration capability")
+		}
+	}
+	return nil
 }
 
 func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader bool) error {
@@ -2005,13 +2073,13 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 		}
 		if !control.Terminal {
 			c.mu.RLock()
-			state := c.reconfiguration
+			contiguous := decision.Slot == c.tip+1
+			if contiguous {
+				err = c.validateFreezeBindingLocked(decision)
+			}
 			c.mu.RUnlock()
-			expected := decision.Proposal.Hash
-			for _, summary := range decision.Summaries {
-				if summary.ReconfigurationID != expected && !(state != nil && decision.Slot > state.freeze && summary.ReconfigurationID == state.id) {
-					return fmt.Errorf("freeze quorum lacks reconfiguration capability")
-				}
+			if err != nil {
+				return err
 			}
 		} else {
 			c.mu.RLock()
@@ -2594,6 +2662,14 @@ func (c *Core) recover() error {
 			if decision.Slot != c.tip+1 {
 				c.mu.Unlock()
 				continue // Keep certified sparse slots until their prefix is recovered.
+			}
+			if err := c.validateScheduledValueLocked(decision.Slot, decision.Proposal.Value); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
+			}
+			if err := c.validateFreezeBindingLocked(decision); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
 			}
 			if err := c.applyReconfigurationLocked(decision); err != nil {
 				c.mu.Unlock()

@@ -38,8 +38,14 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 		if err := validateReconfigurationTarget(current, f.Target, verifier.retiredIDs); err != nil {
 			return nil, err
 		}
+		if err := verifier.validateReconfigurationSlotsLocked(f.Freeze, f.TerminalSlot); err != nil {
+			return nil, err
+		}
 		if err := verifier.validateDecisionForRecovery(freeze, true); err != nil {
 			return nil, fmt.Errorf("transition %d freeze quorum: %w", i, err)
+		}
+		if err := verifier.validateFreezeBindingLocked(freeze); err != nil {
+			return nil, fmt.Errorf("transition %d freeze binding: %w", i, err)
 		}
 		verifier.decided[freeze.Slot] = transition.Freeze
 		terminal, err := historyDecision(current.ConfigID, transition.Terminal)
@@ -91,6 +97,12 @@ func validateMembershipHistory(initial Cluster, history MembershipRecord) (*Core
 		}
 		if err := verifier.validateDecisionForRecovery(freeze, true); err != nil {
 			return nil, fmt.Errorf("abort freeze quorum: %w", err)
+		}
+		if err := verifier.validateFreezeBindingLocked(freeze); err != nil {
+			return nil, fmt.Errorf("abort freeze binding: %w", err)
+		}
+		if err := verifier.validateReconfigurationSlotsLocked(f.Freeze, f.TerminalSlot); err != nil {
+			return nil, err
 		}
 		verifier.decided[freeze.Slot] = abort.Freeze
 		terminal, err := historyDecision(current.ConfigID, abort.Terminal)

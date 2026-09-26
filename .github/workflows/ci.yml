@@ -115,18 +115,23 @@ jobs:
           RHIZA_E2E_S3_ACCESS_KEY: rhiza-e2e
           RHIZA_E2E_S3_SECRET_KEY: rhiza-e2e-secret
         run: |
-          docker run --rm -d --name rhiza-membership-minio -p 19000:9000 \
-            -e MINIO_ROOT_USER=rhiza-e2e -e MINIO_ROOT_PASSWORD=rhiza-e2e-secret \
-            quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
-          trap 'docker logs rhiza-membership-minio; docker rm -f rhiza-membership-minio' EXIT
+          mkdir -p "$RUNNER_TEMP/rhiza-s3-data"
+          docker run --rm -d --name rhiza-membership-s3 -p 19000:9000 \
+            -v "$RUNNER_TEMP/rhiza-s3-data:/data" \
+            -e ROOT_ACCESS_KEY=rhiza-e2e -e ROOT_SECRET_KEY=rhiza-e2e-secret \
+            ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+            --port :9000 --health /_/health posix /data
+          trap 'docker logs rhiza-membership-s3; docker rm -f rhiza-membership-s3' EXIT
           for _ in {1..100}; do
-            curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null 2>&1 && break
+            curl -fsS http://127.0.0.1:19000/_/health >/dev/null 2>&1 && break
             sleep 0.1
           done
-          curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null
-          docker run --rm --network host --entrypoint /bin/sh \
-            quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
-            -c 'mc alias set local http://127.0.0.1:19000 rhiza-e2e rhiza-e2e-secret && mc mb --ignore-existing local/rhiza'
+          curl -fsS http://127.0.0.1:19000/_/health >/dev/null
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
+            --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
   rust-sdk:
@@ -176,6 +181,8 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
+      - name: Bucket fixture retry regression
+        run: python3 e2e/chaos/operator_fixture_test.py
       - name: Vet
         env:
           CGO_ENABLED: 0

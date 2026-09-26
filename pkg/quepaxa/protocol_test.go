@@ -262,7 +262,11 @@ func TestLeaderScheduleSortsByAverageEpochCompletion(t *testing.T) {
 	core.timings["n1"] = leaderTiming{average: 30 * time.Millisecond, samples: 2}
 	core.timings["n2"] = leaderTiming{average: 5 * time.Millisecond, samples: 2}
 	core.timings["n3"] = leaderTiming{average: 10 * time.Millisecond, samples: 2}
-	if got, want := core.calculateLeaderSchedule(), []NodeID{"n2", "n3", "n1"}; !slices.Equal(got, want) {
+	got, err := core.calculateLeaderSchedule(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []NodeID{"n2", "n3", "n1"}; !slices.Equal(got, want) {
 		t.Fatalf("schedule=%v, want %v", got, want)
 	}
 }

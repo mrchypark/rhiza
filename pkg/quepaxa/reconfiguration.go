@@ -30,55 +30,79 @@ func (c *Core) beginReconfiguration(ctx context.Context, target Cluster, expecte
 		return 0, err
 	}
 	defer c.releasePipeline()
-	c.mu.RLock()
-	if c.reconfiguration != nil {
-		c.mu.RUnlock()
-		return 0, fmt.Errorf("reconfiguration is already frozen")
-	}
-	if expectedAbortSlot != nil {
-		actual, err := c.abortRevisionLocked()
-		if err != nil {
+	for {
+		c.mu.RLock()
+		if c.reconfiguration != nil {
 			c.mu.RUnlock()
+			return 0, fmt.Errorf("reconfiguration is already frozen")
+		}
+		if expectedAbortSlot != nil {
+			actual, err := c.abortRevisionLocked()
+			if err != nil {
+				c.mu.RUnlock()
+				return 0, err
+			}
+			if actual != *expectedAbortSlot {
+				c.mu.RUnlock()
+				return 0, fmt.Errorf("reconfiguration abort revision %d does not match expected %d", actual, *expectedAbortSlot)
+			}
+		}
+		current := c.clusterForSlotLocked(c.tip + 1)
+		freeze := c.tip + 1
+		if freeze == 0 || freeze > ^Slot(0)-17 {
+			c.mu.RUnlock()
+			return 0, fmt.Errorf("reconfiguration slot range exhausted")
+		}
+		freezeSchedule := c.isLeaderScheduleSlotLocked(freeze)
+		terminalSchedule := c.isLeaderScheduleSlotLocked(freeze + 16)
+		prefix := c.prefixes[c.tip]
+		highest := c.highestKnownSlotLocked()
+		retired := make(map[NodeID]struct{}, len(c.retiredIDs))
+		for id := range c.retiredIDs {
+			retired[id] = struct{}{}
+		}
+		c.mu.RUnlock()
+		if highest > freeze+15 {
+			return 0, fmt.Errorf("reconfiguration cannot freeze with legacy slot %d beyond terminal %d", highest, freeze+16)
+		}
+		if err := validateReconfigurationTarget(current, target, retired); err != nil {
 			return 0, err
 		}
-		if actual != *expectedAbortSlot {
-			c.mu.RUnlock()
-			return 0, fmt.Errorf("reconfiguration abort revision %d does not match expected %d", actual, *expectedAbortSlot)
+		if freezeSchedule || terminalSchedule {
+			if err := c.RecoverThrough(ctx, freeze); err != nil {
+				return 0, err
+			}
+			decided, err := c.completeDecision(ctx, freeze, true)
+			if err != nil {
+				return 0, err
+			}
+			if freezeSchedule {
+				order, scheduled, err := DecodeLeaderSchedule(decided.Value)
+				if err != nil || !scheduled || !validateLeaderSchedule(current, order) {
+					return 0, fmt.Errorf("incompatible leader schedule history at slot %d", freeze)
+				}
+			}
+			continue
 		}
+		value, err := encodeReconfiguration(reconfigurationValue{Freeze: freeze, TerminalSlot: freeze + 16, Target: cloneCluster(target), PrefixHash: prefix})
+		if err != nil {
+			return 0, err
+		}
+		decision, err := c.runSlot(ctx, freeze, value, false)
+		if err != nil {
+			return 0, err
+		}
+		if err := c.acceptDecision(decision); err != nil {
+			return 0, err
+		}
+		if _, err := c.completeDecision(ctx, freeze, true); err != nil {
+			return 0, err
+		}
+		if decision.Proposal.Hash != reconfigurationHash(value) {
+			return 0, fmt.Errorf("freeze slot was decided by another value")
+		}
+		return freeze, nil
 	}
-	current := c.clusterForSlotLocked(c.tip + 1)
-	freeze := c.tip + 1
-	prefix := c.prefixes[c.tip]
-	highest := c.highestKnownSlotLocked()
-	retired := make(map[NodeID]struct{}, len(c.retiredIDs))
-	for id := range c.retiredIDs {
-		retired[id] = struct{}{}
-	}
-	c.mu.RUnlock()
-	if highest > freeze+15 {
-		return 0, fmt.Errorf("reconfiguration cannot freeze with legacy slot %d beyond terminal %d", highest, freeze+16)
-	}
-	if err := validateReconfigurationTarget(current, target, retired); err != nil {
-		return 0, err
-	}
-	value, err := encodeReconfiguration(reconfigurationValue{Freeze: freeze, TerminalSlot: freeze + 16, Target: cloneCluster(target), PrefixHash: prefix})
-	if err != nil {
-		return 0, err
-	}
-	decision, err := c.runSlot(ctx, freeze, value, true)
-	if err != nil {
-		return 0, err
-	}
-	if decision.Proposal.Hash != reconfigurationHash(value) {
-		return 0, fmt.Errorf("freeze slot was decided by another value")
-	}
-	if err := c.acceptDecision(decision); err != nil {
-		return 0, err
-	}
-	if _, err := c.completeDecision(ctx, freeze, true); err != nil {
-		return 0, err
-	}
-	return freeze, nil
 }
 
 // abortRevisionLocked returns zero only when no abort revision exists. A
@@ -173,6 +197,13 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 		c.releasePipeline()
 		return fmt.Errorf("only a pending addition may be aborted")
 	}
+	c.mu.RLock()
+	geometryErr := c.validateReconfigurationSlotsLocked(state.freeze, state.terminal)
+	c.mu.RUnlock()
+	if geometryErr != nil {
+		c.releasePipeline()
+		return geometryErr
+	}
 	c.releasePipeline()
 	if _, err := c.completeDecision(ctx, state.freeze, true); err != nil {
 		return err
@@ -189,6 +220,12 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 		return err
 	}
 	defer c.releasePipeline()
+	c.mu.RLock()
+	unchanged := c.reconfiguration == state
+	c.mu.RUnlock()
+	if !unchanged {
+		return fmt.Errorf("reconfiguration changed while draining")
+	}
 	prefix, ok := c.PrefixHash(state.terminal - 1)
 	if !ok {
 		return fmt.Errorf("reconfiguration drain prefix is unavailable")
@@ -197,21 +234,26 @@ func (c *Core) finishReconfiguration(ctx context.Context, abort bool, expectedTa
 	if err != nil {
 		return err
 	}
-	decision, err := c.runSlot(ctx, state.terminal, value, true)
+	decision, err := c.runSlot(ctx, state.terminal, value, false)
 	if err != nil {
 		return err
-	}
-	if decision.Proposal.Hash != reconfigurationHash(value) {
-		return fmt.Errorf("terminal slot was decided by another value")
 	}
 	if err := c.acceptDecision(decision); err != nil {
 		return err
 	}
 	_, err = c.completeDecision(ctx, state.terminal, true)
+	if err == nil && decision.Proposal.Hash != reconfigurationHash(value) {
+		return fmt.Errorf("terminal slot was decided by another value")
+	}
 	return err
 }
 
 func (c *Core) takePipeline(ctx context.Context) error {
+	select {
+	case c.pipelineExclusive <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	acquired := 0
 	for acquired < cap(c.pipeline) {
 		select {
@@ -222,6 +264,7 @@ func (c *Core) takePipeline(ctx context.Context) error {
 				<-c.pipeline
 				acquired--
 			}
+			<-c.pipelineExclusive
 			return ctx.Err()
 		}
 	}
@@ -231,6 +274,7 @@ func (c *Core) releasePipeline() {
 	for range cap(c.pipeline) {
 		<-c.pipeline
 	}
+	<-c.pipelineExclusive
 }
 
 func validateReconfigurationTarget(current, target Cluster, retiredIDs map[NodeID]struct{}) error {
@@ -285,6 +329,13 @@ func (c *Core) ValidateReconfigurationTarget(target Cluster) error {
 	return validateReconfigurationTarget(current, target, retired)
 }
 
+func (c *Core) validateReconfigurationSlotsLocked(freeze, terminal Slot) error {
+	if freeze == 0 || freeze > ^Slot(0)-17 || terminal != freeze+16 || c.isLeaderScheduleSlotLocked(freeze) || c.isLeaderScheduleSlotLocked(terminal) {
+		return fmt.Errorf("incompatible reconfiguration schedule boundary: freeze=%d terminal=%d", freeze, terminal)
+	}
+	return nil
+}
+
 func (c *Core) applyReconfigurationLocked(decision Decision) error {
 	control, ok, err := decodeReconfiguration(decision.Proposal.Value)
 	if err != nil {
@@ -299,6 +350,9 @@ func (c *Core) applyReconfigurationLocked(decision Decision) error {
 	if !control.Terminal {
 		if state := c.reconfiguration; state != nil && decision.Slot > state.freeze && decision.Slot < state.terminal {
 			return nil // any certified later freeze control is a drain no-op.
+		}
+		if err := c.validateReconfigurationSlotsLocked(control.Freeze, control.TerminalSlot); err != nil {
+			return err
 		}
 		if c.reconfiguration != nil || decision.Slot != control.Freeze || c.tip+1 != decision.Slot || c.prefixes[c.tip] != control.PrefixHash {
 			return fmt.Errorf("invalid reconfiguration freeze")

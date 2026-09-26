@@ -145,6 +145,24 @@ func TestCheckpointMembershipColdObserverRestoreAndRejectsTampering(t *testing.T
 	}
 }
 
+func TestCheckpointMembershipRejectsUnboundFreeze(t *testing.T) {
+	_, _, initial, seal, _ := checkpointMembershipSource(t)
+	history := cloneMembershipRecord(*seal.Membership)
+	freeze := &history.Transitions[1].Freeze
+	id, decision, err := decodeCertificate(freeze.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision.Summaries[0].ReconfigurationID = ValueHash{9}
+	freeze.Certificate, err = encodeCertificate(id, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateMembershipHistory(initial, history); err == nil {
+		t.Fatal("accepted a freeze not bound to its own proposal")
+	}
+}
+
 func TestCheckpointMembershipRejectsPendingTerminal(t *testing.T) {
 	cores, _ := reconfigCluster(t)
 	core := cores["a"]
@@ -176,5 +194,63 @@ func TestCheckpointMembershipProofRespectsValueLimit(t *testing.T) {
 	}
 	if _, err := EncodeCheckpointSeal(seal); err == nil {
 		t.Fatal("accepted an oversized checkpoint membership proof")
+	}
+}
+
+func TestRestoreReplaysAbortAboveCheckpoint(t *testing.T) {
+	core, _, initial, seal, sealed := checkpointMembershipSource(t)
+	target := core.CurrentCluster()
+	target.ConfigID++
+	target.Members = append(target.Members, Member{ID: "lost", WALIdentity: "0000000000000000000000000000000000000000000000000000000000000000"})
+	freeze, err := core.BeginReconfiguration(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AbortReconfiguration(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tip := core.Tip()
+	prefix, _ := core.PrefixHash(tip)
+	walDir := t.TempDir()
+	restoreWAL, err := qlog.Open(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := newCore("a", &initial, restoreWAL, nil)
+	restored.reconfigEnabled = true
+	restored.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+	// Retain the certified suffix while the earlier prefix is still absent.
+	for slot := seal.Index + 1; slot <= tip; slot++ {
+		value := mustCertified(t, core, slot)
+		restored.decided[slot] = value
+		if err := restored.appendDecision(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := restored.RestoreCheckpointBase(context.Background(), seal, sealed); err != nil {
+		t.Fatal(err)
+	}
+	core = restored
+	if got, ok := core.PrefixHash(tip); core.Tip() != tip || !ok || got != prefix {
+		t.Fatal("compaction changed checked prefix")
+	}
+	if slot, _, ok := core.LastReconfigurationAbort(); !ok || slot != freeze+16 {
+		t.Fatal("compaction lost suffix abort")
+	}
+	if err := core.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wal, err := qlog.Open(walDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	restarted := newCore("a", &initial, wal, nil)
+	restarted.reconfigEnabled = true
+	if err := restarted.recover(); err != nil {
+		t.Fatal(err)
+	}
+	if slot, _, ok := restarted.LastReconfigurationAbort(); !ok || slot != freeze+16 || restarted.Tip() != tip {
+		t.Fatal("restart lost suffix state")
 	}
 }

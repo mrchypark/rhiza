@@ -18,6 +18,10 @@ on:
       - .github/workflows/performance.yml
   workflow_dispatch:
     inputs:
+      refresh_hiqlite_reference:
+        description: Measure the pinned Hiqlite reference on the CI runner
+        type: boolean
+        default: false
       base_ref:
         description: Git ref to compare against
         required: true
@@ -42,6 +46,7 @@ concurrency:
 
 jobs:
   paired-go-benchmarks:
+    if: ${{ !inputs.refresh_hiqlite_reference }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -141,15 +146,13 @@ jobs:
       - name: Reuse pinned Hiqlite reference
         if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         env:
-          HIQLITE_COMMIT: c3ff2536ac985ecb9f77201d1b58dab66c7b256e
-          HIQLITE_PATCH_SHA256: 1adc6028d28bb0c6b80cf429a69dab30d744eb4ed13830dcb028325522d717b7
+          HIQLITE_COMMIT: cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
         run: |
           reference=benchmarks/hiqlite-reference.json
           latest_version=$(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git 'refs/tags/v*' | awk -F/ '{print $3}' | sort -V | tail -1)
           [[ $latest_version == "$(jq -r '.version' "$reference")" ]]
-          [[ $(sha256sum benchmarks/hiqlite-one-peer.patch | cut -d' ' -f1) == "$HIQLITE_PATCH_SHA256" ]]
-          jq -e --arg commit "$HIQLITE_COMMIT" --arg patch "$HIQLITE_PATCH_SHA256" \
-            '.commit == $commit and .patch_sha256 == $patch and all(.ops_per_sec[]; type == "number")' "$reference" >/dev/null
+          [[ $(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git refs/tags/v0.15.0 | cut -f1) == "$HIQLITE_COMMIT" ]]
+          bash benchmarks/verify-hiqlite-reference.sh "$reference"
           cp "$reference" "$RUNNER_TEMP/rhiza-performance/hiqlite-reference.json"
           # shellcheck disable=SC2016
           {
@@ -235,7 +238,7 @@ jobs:
           {
             printf '\nbaseline_mode=%s\n' '${{ steps.revisions.outputs.baseline_mode }}'
             printf '\nrunner_image=%s\n' "$ImageOS-$ImageVersion"
-            printf 'hiqlite_commit=%s\n' c3ff2536ac985ecb9f77201d1b58dab66c7b256e
+            printf 'hiqlite_commit=%s\n' cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
             printf 'hiqlite_result=reused-verified-reference\n'
             printf 'hiqlite_official_log_sync=interval_200\n'
             printf 'hiqlite_durable_log_sync=immediate\n'
@@ -261,5 +264,59 @@ jobs:
         with:
           name: paired-performance-${{ github.run_id }}
           path: ${{ runner.temp }}/rhiza-performance
+          if-no-files-found: error
+          retention-days: 30
+
+  refresh-hiqlite-reference:
+    if: ${{ inputs.refresh_hiqlite_reference }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      HIQLITE_COMMIT: cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
+    steps:
+      - uses: actions/checkout@v4
+      - name: Measure Hiqlite v0.15.0
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/hiqlite-target"
+          rustup toolchain install 1.97.1 --profile minimal
+          git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
+          git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
+          git -C "$RUNNER_TEMP/hiqlite" apply --unidiff-zero --whitespace=nowarn "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch"
+          cargo +1.97.1 build --release --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
+          mkdir -p "$RUNNER_TEMP/hiqlite-reference"
+          cd "$RUNNER_TEMP/hiqlite/examples/bench"
+          printf 'Measuring interval_200_local\n'
+          HQL_LOG_SYNC=interval_200 timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/interval_200_local.txt" 2>&1
+          printf 'Measuring immediate_local\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_local.txt" 2>&1
+          printf 'Measuring immediate_remote\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_remote.txt" 2>&1
+          printf 'Measuring immediate_follower_stopped\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_follower_stopped.txt" 2>&1
+          printf 'Measuring immediate_leader_stopped\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_leader_stopped.txt" 2>&1
+          for scenario in interval_200_local immediate_local immediate_remote immediate_follower_stopped immediate_leader_stopped; do
+            file="$RUNNER_TEMP/hiqlite-reference/$scenario.txt"
+            ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$file")
+            [[ $ops =~ ^[0-9]+$ ]]
+            printf '%s=%s\n' "$scenario" "$ops" >>"$RUNNER_TEMP/hiqlite-reference/ops.txt"
+          done
+          jq -n \
+            --arg version v0.15.0 \
+            --arg commit "$HIQLITE_COMMIT" \
+            --arg patch "$(sha256sum "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch" | cut -d' ' -f1)" \
+            --arg measured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg source_run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --rawfile ops "$RUNNER_TEMP/hiqlite-reference/ops.txt" \
+            '{version:$version,commit:$commit,patch_sha256:$patch,measured_at:$measured_at,source_run:$source_run,requests:100000,concurrency:16,ops_per_sec:($ops|split("\n")|map(select(length>0)|split("="))|map({(.[0]):(.[1]|tonumber)})|add)}' \
+            >"$RUNNER_TEMP/hiqlite-reference/hiqlite-reference.json"
+          cat "$RUNNER_TEMP/hiqlite-reference/hiqlite-reference.json"
+          printf 'runner_image=%s\nrust=%s\n' "$ImageOS-$ImageVersion" "$(rustc +1.97.1 --version)" >"$RUNNER_TEMP/hiqlite-reference/environment.txt"
+      - name: Upload reference evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiqlite-reference-${{ github.run_id }}
+          path: ${{ runner.temp }}/hiqlite-reference
           if-no-files-found: error
           retention-days: 30
