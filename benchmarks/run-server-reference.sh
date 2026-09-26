@@ -86,7 +86,7 @@ curl -fsS "http://127.0.0.1:$s3_port/_/health" >/dev/null
 docker run --rm --add-host host.docker.internal:host-gateway \
 	-e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
 	-e AWS_DEFAULT_REGION=us-east-1 \
-	public.ecr.aws/aws-cli/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
+	amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
 	--endpoint-url "http://host.docker.internal:$s3_port" s3 mb s3://rhiza >/dev/null
 
 # The membership record shape follows the revision under test: v2 publishes
