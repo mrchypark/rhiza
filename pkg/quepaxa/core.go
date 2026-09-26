@@ -1861,6 +1861,9 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 				return err
 			}
 			decoded.Proposal.Value = decision.Value
+			if err := c.validateFreezeBindingLocked(decoded); err != nil {
+				return err
+			}
 			if err := c.applyReconfigurationLocked(decoded); err != nil {
 				return err
 			}
@@ -2003,6 +2006,27 @@ func (c *Core) validateDecision(decision Decision) error {
 	return c.validateDecisionForRecovery(decision, false)
 }
 
+// Call with c.mu held once the decision is next in the certified prefix.
+func (c *Core) validateFreezeBindingLocked(decision Decision) error {
+	control, ok, err := decodeReconfiguration(decision.Proposal.Value)
+	if err != nil || !ok || control.Terminal {
+		return err
+	}
+	expected := decision.Proposal.Hash
+	var active ValueHash
+	hasActive := false
+	if state := c.reconfiguration; state != nil && decision.Slot > state.freeze && decision.Slot < state.terminal {
+		active = state.id
+		hasActive = true
+	}
+	for _, summary := range decision.Summaries {
+		if summary.ReconfigurationID != expected && !(hasActive && summary.ReconfigurationID == active) {
+			return fmt.Errorf("freeze quorum lacks reconfiguration capability")
+		}
+	}
+	return nil
+}
+
 func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader bool) error {
 	if decision.Slot == 0 || sha256.Sum256(decision.Proposal.Value) != decision.Proposal.Hash {
 		return fmt.Errorf("invalid QuePaxa decision value")
@@ -2049,13 +2073,13 @@ func (c *Core) validateDecisionForRecovery(decision Decision, allowMissingLeader
 		}
 		if !control.Terminal {
 			c.mu.RLock()
-			state := c.reconfiguration
+			contiguous := decision.Slot == c.tip+1
+			if contiguous {
+				err = c.validateFreezeBindingLocked(decision)
+			}
 			c.mu.RUnlock()
-			expected := decision.Proposal.Hash
-			for _, summary := range decision.Summaries {
-				if summary.ReconfigurationID != expected && !(state != nil && decision.Slot > state.freeze && summary.ReconfigurationID == state.id) {
-					return fmt.Errorf("freeze quorum lacks reconfiguration capability")
-				}
+			if err != nil {
+				return err
 			}
 		} else {
 			c.mu.RLock()
@@ -2640,6 +2664,10 @@ func (c *Core) recover() error {
 				continue // Keep certified sparse slots until their prefix is recovered.
 			}
 			if err := c.validateScheduledValueLocked(decision.Slot, decision.Proposal.Value); err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("recover reconfiguration: %w", err)
+			}
+			if err := c.validateFreezeBindingLocked(decision); err != nil {
 				c.mu.Unlock()
 				return fmt.Errorf("recover reconfiguration: %w", err)
 			}

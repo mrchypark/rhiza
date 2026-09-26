@@ -135,6 +135,130 @@ func TestSparseFreezeWALRestartsBeforePrefixArrives(t *testing.T) {
 	}
 }
 
+func TestSparseLaterFreezeWALRestartsBeforePrefixArrives(t *testing.T) {
+	cores, transport := reconfigCluster(t)
+	transport.dropDecision["c"] = true
+	core := cores["a"]
+	learner := cores["c"]
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := core.runSlot(ctx, 1, []byte("prefix-gap"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := Cluster{ConfigID: 2, Members: []Member{{ID: "a"}, {ID: "b"}}}
+	freezeValue, err := encodeReconfiguration(reconfigurationValue{
+		Freeze: 2, TerminalSlot: 18, Target: target,
+		PrefixHash: AdvancePrefixHash([32]byte{}, 1, first.Proposal.Hash),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	freeze, err := core.runSlot(ctx, 2, freezeValue, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AcceptDecision(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := core.AcceptDecision(freeze); err != nil {
+		t.Fatal(err)
+	}
+	lateValue, err := encodeReconfiguration(reconfigurationValue{
+		Freeze: 3, TerminalSlot: 19, Target: target,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	late, err := core.runSlot(ctx, 3, lateValue, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := learner.AcceptDecisionHint(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := learner.AcceptDecision(freeze); err != nil {
+		t.Fatal(err)
+	}
+	if err := learner.AcceptDecision(late); err != nil {
+		t.Fatal(err)
+	}
+	if learner.logged[1] {
+		t.Fatal("ordinary predecessor unexpectedly durable")
+	}
+	wal, err := qlog.Open(filepath.Join(t.TempDir(), "wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := learner.wal.Scan(func(entry qlog.Entry) error { return wal.Append(entry) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(Config{NodeID: "c", Cluster: *core.config, WAL: wal, Transport: transport, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Tip() != 0 || restarted.reconfiguration != nil {
+		t.Fatal("sparse controls activated before their prefix")
+	}
+	bad := late
+	bad.Summaries = append(late.Summaries[:0:0], late.Summaries...)
+	for i := range bad.Summaries {
+		bad.Summaries[i].ReconfigurationID = bad.Proposal.Hash
+	}
+	bad.Summaries[0].ReconfigurationID = [32]byte{9}
+	if err := restarted.AcceptDecision(first); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Tip() != 3 || restarted.reconfiguration == nil || restarted.reconfiguration.freeze != 2 {
+		t.Fatal("replayed controls did not advance after prefix recovery")
+	}
+	restarted.mu.RLock()
+	err = restarted.validateFreezeBindingLocked(bad)
+	restarted.mu.RUnlock()
+	if err == nil {
+		t.Fatal("unrelated freeze binding accepted after prefix recovery")
+	}
+	thirdValue, err := encodeReconfiguration(reconfigurationValue{Freeze: 4, TerminalSlot: 20, Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := late
+	third.Slot = 4
+	third.Proposal = newProposal(highestPriority, "a", thirdValue)
+	third.Summaries = append(late.Summaries[:0:0], late.Summaries...)
+	for i := range third.Summaries {
+		third.Summaries[i].ReconfigurationID = late.Proposal.Hash
+	}
+	restarted.mu.RLock()
+	err = restarted.validateFreezeBindingLocked(third)
+	restarted.mu.RUnlock()
+	if err == nil {
+		t.Fatal("later freeze bound to a no-op freeze rather than active drain")
+	}
+	badWAL, err := qlog.Open(filepath.Join(t.TempDir(), "bad-wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer badWAL.Close()
+	badReplica, err := New(Config{NodeID: "c", Cluster: *core.config, WAL: badWAL, Transport: transport, EnableReconfiguration: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := badReplica.AcceptDecision(bad); err != nil {
+		t.Fatalf("sparse certificate rejected before its state was known: %v", err)
+	}
+	if err := badReplica.AcceptDecision(freeze); err != nil {
+		t.Fatal(err)
+	}
+	if err := badReplica.AcceptDecision(first); err == nil {
+		t.Fatal("unrelated binding advanced after the prefix arrived")
+	}
+}
+
 func TestFreezeAdmissionRejectsUnsafeStagedValues(t *testing.T) {
 	for _, kind := range []string{"legacy", "slot", "prefix", "disabled"} {
 		t.Run(kind, func(t *testing.T) {

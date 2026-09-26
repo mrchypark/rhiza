@@ -18,7 +18,7 @@ fault_after=${RHIZA_SERVER_BENCH_FAULT_AFTER:-1}
 max_fault_latency_ms=${RHIZA_SERVER_BENCH_MAX_FAULT_LATENCY_MS:-1500}
 base_http_port=${RHIZA_SERVER_BENCH_HTTP_PORT:-18100}
 base_peer_port=${RHIZA_SERVER_BENCH_PEER_PORT:-19100}
-minio_port=${RHIZA_SERVER_BENCH_MINIO_PORT:-19000}
+s3_port=${RHIZA_SERVER_BENCH_S3_PORT:-19000}
 if [[ ! $requests =~ ^[1-9][0-9]*$ || ! $concurrency =~ ^[1-9][0-9]*$ || $concurrency -gt $requests ]]; then
 	printf 'request count and concurrency must be positive, with concurrency <= requests\n' >&2
 	exit 2
@@ -49,7 +49,7 @@ if [[ ! $max_fault_latency_ms =~ ^[1-9][0-9]*([.][0-9]+)?$ ]]; then
 fi
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-server-bench.XXXXXX")
-container="rhiza-bench-minio-$$"
+container="rhiza-bench-s3-$$"
 cleanup() {
 	output_stem=$(basename "$output_file" .json)
 	for log in "$run_dir"/node-*.log; do
@@ -72,17 +72,22 @@ trap cleanup EXIT
 (cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza" ./cmd/rhiza)
 (cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
 
-docker run --rm -d --name "$container" -p "$minio_port:9000" \
-	-e MINIO_ROOT_USER=rhiza-e2e -e MINIO_ROOT_PASSWORD=rhiza-e2e-secret \
-	quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data >/dev/null
+mkdir -p "$run_dir/s3-data"
+docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
+	-v "$run_dir/s3-data:/data" \
+	-e ROOT_ACCESS_KEY=rhiza-e2e -e ROOT_SECRET_KEY=rhiza-e2e-secret \
+	ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
+	--port :9000 --health /_/health posix /data >/dev/null
 for _ in {1..100}; do
-	curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null 2>&1 && break
+	curl -fsS "http://127.0.0.1:$s3_port/_/health" >/dev/null 2>&1 && break
 	sleep 0.1
 done
-curl -fsS "http://127.0.0.1:$minio_port/minio/health/ready" >/dev/null
-docker run --rm --add-host host.docker.internal:host-gateway --entrypoint /bin/sh \
-	quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 \
-	-c "mc alias set local http://host.docker.internal:$minio_port rhiza-e2e rhiza-e2e-secret >/dev/null && mc mb --ignore-existing local/rhiza >/dev/null"
+curl -fsS "http://127.0.0.1:$s3_port/_/health" >/dev/null
+docker run --rm --add-host host.docker.internal:host-gateway \
+	-e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
+	-e AWS_DEFAULT_REGION=us-east-1 \
+	public.ecr.aws/aws-cli/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
+	--endpoint-url "http://host.docker.internal:$s3_port" s3 mb s3://rhiza >/dev/null
 
 # The membership record shape follows the revision under test: v2 publishes
 # only the public key each node's private peer token derives for cluster
@@ -103,7 +108,7 @@ for i in 0 1 2; do
 	env RHIZA_CLUSTER_ID=server-bench RHIZA_NODE_ID="n$i" \
 		RHIZA_BIND_ADDR="127.0.0.1:$((base_http_port + i))" RHIZA_PEER_ADDR="127.0.0.1:$((base_peer_port + i))" \
 		RHIZA_DATA_DIR="$run_dir/node-$i" RHIZA_CLUSTER_MEMBERS="$members" "${peer_token_env[@]+${peer_token_env[@]}}" \
-		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$minio_port" RHIZA_OBJSTORE_BUCKET=rhiza \
+		RHIZA_OBJSTORE_PROVIDER=s3 RHIZA_OBJSTORE_ENDPOINT="127.0.0.1:$s3_port" RHIZA_OBJSTORE_BUCKET=rhiza \
 		RHIZA_OBJSTORE_PREFIX=server-bench RHIZA_OBJSTORE_REGION=us-east-1 RHIZA_OBJSTORE_INSECURE=true \
 		RHIZA_OBJSTORE_ACCESS_KEY=rhiza-e2e RHIZA_OBJSTORE_SECRET_KEY=rhiza-e2e-secret \
 		RHIZA_OBJSTORE_DURABILITY="$durability" RHIZA_OBJSTORE_SYNC_INTERVAL=1h RHIZA_CHECKPOINT_INTERVAL=0 \

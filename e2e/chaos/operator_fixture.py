@@ -1,6 +1,6 @@
 """Ephemeral Kubernetes manifests for the chaos operator fixture.
 
-Provides resources() for the 3-voter StatefulSet, MinIO, and operator,
+Provides resources() for the 3-voter StatefulSet, S3 test gateway, and operator,
 and learner_resources() for standalone learner pods with immutable credentials.
 """
 
@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 
-# This public image contains both the MinIO server and mc client.
-MINIO_IMAGE = (
-    "ghcr.io/coollabsio/minio@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9"
+S3_IMAGE = (
+    "ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499"
 )
-MC_IMAGE = MINIO_IMAGE
+AWS_CLI_IMAGE = (
+    "public.ecr.aws/aws-cli/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5"
+)
 
 _MINIO_ACCESS = "chaos-minio"
 _MINIO_SECRET = "chaos-minio-secret"
@@ -289,14 +290,11 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                     "containers": [
                         {
                             "name": "minio",
-                            "image": MINIO_IMAGE,
-                            "command": ["/bin/sh", "-c"],
-                            "args": [
-                                "exec minio server /data"
-                            ],
+                            "image": S3_IMAGE,
+                            "args": ["--port", ":9000", "--health", "/_/health", "posix", "/data"],
                             "env": [
                                 {
-                                    "name": "MINIO_ROOT_USER",
+                                    "name": "ROOT_ACCESS_KEY",
                                     "valueFrom": {
                                         "secretKeyRef": {
                                             "name": "rhiza-minio",
@@ -305,7 +303,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                     },
                                 },
                                 {
-                                    "name": "MINIO_ROOT_PASSWORD",
+                                    "name": "ROOT_SECRET_KEY",
                                     "valueFrom": {
                                         "secretKeyRef": {
                                             "name": "rhiza-minio",
@@ -319,7 +317,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                             ],
                             "readinessProbe": {
                                 "httpGet": {
-                                    "path": "/minio/health/ready",
+                                    "path": "/_/health",
                                     "port": "s3",
                                 }
                             },
@@ -349,16 +347,18 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                     "restartPolicy": "OnFailure",
                     "containers": [
                         {
-                            "name": "mc",
-                            "image": MC_IMAGE,
+                            "name": "aws-cli",
+                            "image": AWS_CLI_IMAGE,
                             "command": ["/bin/sh", "-c"],
                             "args": [
-                                'until mc alias set local http://rhiza-minio:9000 "$ACCESS_KEY" "$SECRET_KEY"; do sleep 1; done; '
-                                "mc mb --ignore-existing local/rhiza"
+                                "i=0; while [ \"$i\" -lt 120 ]; do "
+                                "aws --endpoint-url http://rhiza-minio:9000 s3api head-bucket --bucket rhiza && exit 0; "
+                                "aws --endpoint-url http://rhiza-minio:9000 s3 mb s3://rhiza && exit 0; "
+                                "i=$((i+1)); sleep 1; done; exit 1"
                             ],
                             "env": [
                                 {
-                                    "name": "ACCESS_KEY",
+                                    "name": "AWS_ACCESS_KEY_ID",
                                     "valueFrom": {
                                         "secretKeyRef": {
                                             "name": "rhiza-minio",
@@ -367,7 +367,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                     },
                                 },
                                 {
-                                    "name": "SECRET_KEY",
+                                    "name": "AWS_SECRET_ACCESS_KEY",
                                     "valueFrom": {
                                         "secretKeyRef": {
                                             "name": "rhiza-minio",
@@ -375,6 +375,7 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                         }
                                     },
                                 },
+                                {"name": "AWS_DEFAULT_REGION", "value": "us-east-1"},
                             ],
                         }
                     ],
