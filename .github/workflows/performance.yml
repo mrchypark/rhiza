@@ -147,14 +147,12 @@ jobs:
         if: ${{ !inputs.network_optimization || inputs.network_optimization == 'none' }}
         env:
           HIQLITE_COMMIT: cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
-          HIQLITE_PATCH_SHA256: e056c066efc27a96a7c7372ede87bbd794fdc65c0f41fa4daf958b3f68c2b07e
         run: |
           reference=benchmarks/hiqlite-reference.json
           latest_version=$(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git 'refs/tags/v*' | awk -F/ '{print $3}' | sort -V | tail -1)
           [[ $latest_version == "$(jq -r '.version' "$reference")" ]]
-          [[ $(sha256sum benchmarks/hiqlite-one-peer.patch | cut -d' ' -f1) == "$HIQLITE_PATCH_SHA256" ]]
-          jq -e --arg commit "$HIQLITE_COMMIT" --arg patch "$HIQLITE_PATCH_SHA256" \
-            '.commit == $commit and .patch_sha256 == $patch and all(.ops_per_sec[]; type == "number")' "$reference" >/dev/null
+          [[ $(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git refs/tags/v0.15.0 | cut -f1) == "$HIQLITE_COMMIT" ]]
+          bash benchmarks/verify-hiqlite-reference.sh "$reference"
           cp "$reference" "$RUNNER_TEMP/rhiza-performance/hiqlite-reference.json"
           # shellcheck disable=SC2016
           {

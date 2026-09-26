@@ -13,7 +13,12 @@ scenario. The patch digest is recorded in `../../hiqlite-reference.json`.
 | Immediate WAL sync, follower stopped before load | 1,739 |
 | Immediate WAL sync, leader stopped before load | 1,739 |
 
-The CI artifact contains all five raw logs. Each process completed its 100,000
+The five raw logs and runner environment are retained as compressed text in
+[`evidence/`](evidence/), with SHA-256 digests in
+[`hiqlite-reference.json`](../../hiqlite-reference.json). The CI artifact also
+contains the original logs. `bash benchmarks/verify-hiqlite-reference.sh`
+checks the reference fields, digests, and parsed throughput against the retained
+logs. Each process completed its 100,000
 inserts successfully. The upstream split-brain check logs self-signed certificate
 verification errors during the healthy remote run; the stopped-peer runs also
 log expected unreachable-peer replication errors. These numbers are diagnostic
