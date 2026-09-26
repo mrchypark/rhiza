@@ -253,3 +253,19 @@ func TestVoterIdentityRejectsUnknownDurabilityHistory(t *testing.T) {
 		t.Fatalf("unknown durability history accepted: %v", err)
 	}
 }
+
+func TestLocalModeCannotRebindRegisteredVoter(t *testing.T) {
+	config, bucket := voterTestConfig(t), objstore.NewInMemBucket()
+	if err := registerTestVoter(t, config, bucket, false); err != nil {
+		t.Fatal(err)
+	}
+	local := &types.ExecutionConfig{Local: true, DataDir: config.DataDir, NodeID: config.NodeID, ClusterID: config.ClusterID}
+	n := New(local)
+	if err := n.Open(context.Background()); !errors.Is(err, ErrVoterStateLost) {
+		n.Shutdown()
+		t.Fatalf("registered directory accepted: %v", err)
+	}
+	if err := registerTestVoter(t, config, bucket, false); err != nil {
+		t.Fatalf("rejection altered original voter: %v", err)
+	}
+}

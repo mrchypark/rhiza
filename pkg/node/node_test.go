@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -393,6 +394,44 @@ func TestLocalModeHasNoNetwork(t *testing.T) {
 	}
 	if err := n.Start(context.Background()); err == nil {
 		t.Fatal("local HTTP listener allowed")
+	}
+}
+
+func TestLocalModeRecoversUndecidedRecorderState(t *testing.T) {
+	ctx := context.Background()
+	config := types.ExecutionConfig{Local: true, NodeID: "local", DataDir: t.TempDir()}
+	n := New(&config)
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "recorded", SQL: "CREATE TABLE recorded(id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.core.Record(ctx, quepaxa.RecordRequest{Slot: 1, Step: 4, Proposal: quepaxa.Proposal{
+		Priority: quepaxa.Priority{1}, ProposerID: "local", Hash: sha256.Sum256(value), Value: value,
+	}})
+	if err != nil {
+		n.Shutdown()
+		t.Fatal(err)
+	}
+	if n.core.Tip() != 0 || n.core.RecorderTip() != 1 {
+		n.Shutdown()
+		t.Fatal("fixture already decided")
+	}
+	if err := n.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	n = New(&config)
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Shutdown()
+	if n.core.Tip() != 1 {
+		t.Fatalf("recovered tip=%d", n.core.Tip())
+	}
+	if _, err := n.server.Query(ctx, network.QueryRequest{SQL: "SELECT * FROM recorded", Consistency: "linearizable"}); err != nil {
+		t.Fatal(err)
 	}
 }
 
