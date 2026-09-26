@@ -62,6 +62,14 @@ hard upper bound on native cleanup, and `Drop` cannot report a close failure.
 `bind_addr`, `peer_addr`, and `set_option("GoFieldName", value)` for other
 Go `rhiza.Config` fields. `Debug` prints field names only and never values.
 
+In a source checkout with local-mode support, use
+`Db::open(Config::new("./data").node_id("local").local())` for a local-only
+database. This option is not in the published 0.16.0 release. It opens no peer
+transport or listener; `start_operator` is rejected. SQL, KV, graph, receipts,
+and WAL recovery use the existing engine. Listener addresses, members, tokens,
+learner/reconfiguration and object-storage settings must be omitted. There is no
+replication or remote backup; the existing local WAL size limit still applies.
+
 `execute` and other mutations return `MutationReceipt`; always call
 `require_committed()` because an execution-level rejection is a valid API
 response. `Error.code` preserves `commit_unknown`. A mutation timeout or response

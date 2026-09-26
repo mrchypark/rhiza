@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -379,5 +380,77 @@ func policySnapshot(t testing.TB, path, contents string) {
 	}
 	if _, err = db.Exec(`INSERT INTO payload VALUES(?)`, contents); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLocalModeHasNoNetwork(t *testing.T) {
+	n := New(&types.ExecutionConfig{Local: true, NodeID: "local", DataDir: t.TempDir()})
+	if err := n.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Shutdown()
+	if n.peer != nil || n.transport != nil || n.catchUp != nil || !n.ready.Load() {
+		t.Fatal("local mode created networking or is not ready")
+	}
+	if err := n.Start(context.Background()); err == nil {
+		t.Fatal("local HTTP listener allowed")
+	}
+}
+
+func TestLocalModeRecoversUndecidedRecorderState(t *testing.T) {
+	ctx := context.Background()
+	config := types.ExecutionConfig{Local: true, NodeID: "local", DataDir: t.TempDir()}
+	n := New(&config)
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "recorded", SQL: "CREATE TABLE recorded(id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.core.Record(ctx, quepaxa.RecordRequest{Slot: 1, Step: 4, Proposal: quepaxa.Proposal{
+		Priority: quepaxa.Priority{1}, ProposerID: "local", Hash: sha256.Sum256(value), Value: value,
+	}})
+	if err != nil {
+		n.Shutdown()
+		t.Fatal(err)
+	}
+	if n.core.Tip() != 0 || n.core.RecorderTip() != 1 {
+		n.Shutdown()
+		t.Fatal("fixture already decided")
+	}
+	if err := n.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	n = New(&config)
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Shutdown()
+	if n.core.Tip() != 1 {
+		t.Fatalf("recovered tip=%d", n.core.Tip())
+	}
+	if _, err := n.server.Query(ctx, network.QueryRequest{SQL: "SELECT * FROM recorded", Consistency: "linearizable"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalModeRejectsConflictingConfiguration(t *testing.T) {
+	cases := []types.ExecutionConfig{
+		{BindAddr: "127.0.0.1:0"}, {PeerAddr: "127.0.0.1:0"},
+		{Members: []quepaxa.Member{{ID: "local"}}}, {Learner: &quepaxa.Member{ID: "learner"}},
+		{EnableReconfiguration: true}, {PeerToken: "secret"}, {AdminToken: "secret"},
+		{ObjStoreProvider: "filesystem"}, {ObjStoreDir: "archive"}, {ObjStoreEndpoint: "localhost"}, {ObjStoreBucket: "archive"},
+	}
+	for _, config := range cases {
+		config.Local, config.NodeID, config.DataDir = true, "local", filepath.Join(t.TempDir(), "absent")
+		n := New(&config)
+		if err := n.Open(context.Background()); err == nil {
+			n.Shutdown()
+			t.Fatalf("accepted conflicting config: %+v", config)
+		}
+		if _, err := os.Stat(config.DataDir); !os.IsNotExist(err) {
+			t.Fatalf("created state for invalid config: %v", err)
+		}
 	}
 }

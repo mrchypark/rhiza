@@ -147,6 +147,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
+	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
+		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "" ||
+		n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
+		return fmt.Errorf("local mode requires standalone local storage without listeners, membership, enrollment, or object storage")
+	}
 	if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
 		return err
 	}
@@ -331,7 +336,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 
 	// 5. Create consensus core through the same public API available to external users.
 	cluster := n.loadClusterConfig()
-	transport := network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+	var transport *network.Transport
+	var coreTransport quepaxa.Transport
+	if !n.config.Local {
+		transport = network.NewTransport(n.config.ClusterID, n.config.NodeID, cluster, n.config.PeerToken)
+		coreTransport = transport
+	}
 	n.transport = transport
 	if len(cluster.Members) > 1 {
 		n.catchUpWake = make(chan struct{}, 1)
@@ -350,7 +360,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		makeCore = quepaxa.NewLearner
 	}
 	core, err := makeCore(quepaxa.Config{
-		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: transport,
+		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
 	})
@@ -358,6 +368,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		return fmt.Errorf("create QuePaxa core: %w", err)
 	}
 	n.core = core
+	if n.config.Local {
+		recovered := core.CurrentCluster()
+		if len(recovered.Members) != 1 || recovered.Members[0].ID != n.config.NodeID {
+			return fmt.Errorf("local mode cannot open a multi-voter or foreign WAL")
+		}
+	}
 	if n.config.Learner != nil && n.config.Learner.WALIdentity != "" && n.config.Learner.WALIdentity != core.WALIdentity() {
 		return fmt.Errorf("learner WAL identity differs from configured incarnation")
 	}
@@ -499,7 +515,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	var peer *network.PeerServer
 	if n.config.Learner != nil {
 		peer, err = network.StartLearnerPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.PeerToken, n.config.AdminToken, *n.config.Learner)
-	} else {
+	} else if !n.config.Local {
 		peer, err = network.StartPeerServer(ctx, n.peerAddr(), server, cluster.Members, n.config.PeerToken, n.config.AdminToken)
 	}
 	if err != nil {
@@ -1057,6 +1073,9 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 
 // Start opens the embedded engine and serves the optional public HTTP adapter.
 func (n *Node) Start(ctx context.Context) error {
+	if n.config != nil && n.config.Local {
+		return fmt.Errorf("local mode does not support an HTTP listener; use Open")
+	}
 	if err := n.Open(ctx); err != nil {
 		return err
 	}

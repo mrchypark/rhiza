@@ -803,3 +803,77 @@ func TestEmbeddedObjectStoreRecovery(t *testing.T) {
 		t.Fatalf("object store metrics unavailable: ok=%v stats=%+v", ok, stats)
 	}
 }
+
+func TestLocalModePersistsSQLKVGraph(t *testing.T) {
+	ctx := context.Background()
+	config := rhiza.Config{Local: true, NodeID: "local", DataDir: t.TempDir()}
+	db, err := rhiza.Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { db.Close() }()
+	for _, req := range []rhiza.ExecuteRequest{
+		{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"},
+		{RequestID: "insert", SQL: "INSERT INTO items VALUES (1, 'local')"},
+	} {
+		if _, err := db.Execute(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.KVPut(ctx, rhiza.KVMutationRequest{RequestID: "kv", Key: "key", Value: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GraphExecute(ctx, rhiza.GraphCommand{RequestID: "graph", Cypher: "CREATE (:Item {name: 'local'})"}); err != nil {
+		t.Fatal(err)
+	}
+	// Cross singleton leader-schedule slots before rebuilding derived state.
+	for i := 0; i < 40; i++ {
+		if _, err := db.KVPut(ctx, rhiza.KVMutationRequest{RequestID: fmt.Sprintf("schedule-%d", i), Key: "schedule", Value: []byte("value")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Only this test's derived database is removed; the certified WAL remains.
+	if err := os.Remove(filepath.Join(config.DataDir, "sqlite.db")); err != nil {
+		t.Fatal(err)
+	}
+	db, err = rhiza.Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT name FROM items", Consistency: rhiza.ConsistencyLinearizable})
+	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "local" {
+		t.Fatalf("SQL: %+v %v", rows, err)
+	}
+	if receipt, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1, 'local')"}); err != nil || receipt.Status != "committed" {
+		t.Fatalf("replayed receipt retry: %+v %v", receipt, err)
+	}
+	if _, err := db.KVPut(ctx, rhiza.KVMutationRequest{RequestID: "after-replay", Key: "after", Value: []byte("recovered")}); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := db.KVGet(ctx, rhiza.KVGetRequest{Key: "key"})
+	if err != nil || !kv.Found || string(kv.Value) != "value" {
+		t.Fatalf("KV: %+v %v", kv, err)
+	}
+	graph, err := db.GraphQuery(ctx, rhiza.GraphQueryRequest{Cypher: "MATCH (n:Item) RETURN n.name"})
+	if err != nil || len(graph.Rows) != 1 || graph.Rows[0][0] != "local" {
+		t.Fatalf("graph: %+v %v", graph, err)
+	}
+	// Both startup modes must reopen the same standalone WAL without migration.
+	for _, local := range []bool{false, true} {
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		config.Local = local
+		db, err = rhiza.Open(ctx, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT name FROM items"})
+		if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "local" {
+			t.Fatalf("mode Local=%v: %+v %v", local, rows, err)
+		}
+	}
+}

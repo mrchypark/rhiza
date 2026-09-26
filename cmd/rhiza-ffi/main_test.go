@@ -483,3 +483,11 @@ func TestErrorJSONAndCommitUnknownPriority(t *testing.T) {
 }
 
 func Example_build() { fmt.Println("go build -buildmode=c-archive -o rhiza_ffi.a ./cmd/rhiza-ffi") }
+
+func TestLocalModeRejectsOperatorListener(t *testing.T) {
+	h := openConfig(t, rhiza.Config{Local: true, NodeID: "local", DataDir: t.TempDir()})
+	if code := responseErrorCode(t, goStartOperator(h, []byte("127.0.0.1:0"))); code != "invalid_request" {
+		t.Fatal(code)
+	}
+	requireData(t, call(t, h, "query", rhiza.QueryRequest{SQL: "SELECT 1"}))
+}

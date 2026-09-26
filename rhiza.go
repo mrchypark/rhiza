@@ -75,6 +75,8 @@ type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
 type Config struct {
+	// Local disables peer networking and requires standalone, local-disk configuration.
+	Local      bool
 	ClusterID  string
 	NodeID     string
 	DataDir    string
@@ -83,8 +85,8 @@ type Config struct {
 	AdminToken string
 	// PeerToken is this process's private peer identity secret. Members carry
 	// only public identity, so a replicated membership never holds a secret.
-	PeerToken  string
-	Members    []Member
+	PeerToken string
+	Members   []Member
 	// EnableReconfiguration enables externally fenced voter replacement.
 	// All voters must opt in; workload fencing and learner provisioning are external.
 	EnableReconfiguration bool
@@ -231,16 +233,17 @@ func executionConfig(config Config) (*types.ExecutionConfig, error) {
 	if config.DataDir == "" {
 		return nil, fmt.Errorf("data directory is required")
 	}
-	if config.BindAddr == "" {
+	if !config.Local && config.BindAddr == "" {
 		config.BindAddr = "127.0.0.1:0"
 	}
-	if config.PeerAddr == "" {
+	if !config.Local && config.PeerAddr == "" {
 		config.PeerAddr = "127.0.0.1:0"
 	}
 	if config.ClusterID == "" {
 		config.ClusterID = "cluster-a"
 	}
 	return &types.ExecutionConfig{
+		Local:     config.Local,
 		ClusterID: types.ClusterID(config.ClusterID), NodeID: types.NodeID(config.NodeID),
 		DataDir: config.DataDir, BindAddr: config.BindAddr, PeerAddr: config.PeerAddr,
 		AdminToken: config.AdminToken, PeerToken: config.PeerToken, Members: config.Members, EnableReconfiguration: config.EnableReconfiguration, Learner: config.Learner,
