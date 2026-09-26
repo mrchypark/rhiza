@@ -18,7 +18,7 @@ the same Go API.
 
 ## Requirements and installation
 
-SQL execution policy 2 requires a new cluster for existing installations, including policy 1.
+SQL execution policy 4 requires a new cluster for existing installations, including earlier policies.
 The protected WAL framing also rejects all previous 49-byte WAL artifacts, including earlier development builds.
 Old materializations, checkpoints and SQL history are rejected; mixed-version
 peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
@@ -78,7 +78,7 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.15.4"` in your Cargo dependencies.
+Use `rhizadb = "0.16.0"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous, and the embedded engine still starts its private peer

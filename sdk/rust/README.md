@@ -15,7 +15,7 @@ toolchains above.
 
 ```toml
 [dependencies]
-rhizadb = "0.15.4"
+rhizadb = "0.16.0"
 serde_json = "1"
 ```
 
@@ -132,15 +132,15 @@ target, verifies it against the published checksum, and writes it as
 `$RHIZA_NATIVE_LIB_DIR` or `./.rhiza-native`:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.15.4/sdk/rust/scripts/fetch-native.sh
-sh fetch-native.sh 0.15.4
-export RHIZA_NATIVE_LIB_DIR=./.rhiza-native
+curl -fsSLO https://raw.githubusercontent.com/mrchypark/rhiza/v0.16.0/sdk/rust/scripts/fetch-native.sh
+sh fetch-native.sh 0.16.0
+export RHIZA_NATIVE_LIB_DIR="$(pwd)/.rhiza-native"
 ```
 
-For containers and cross builds, pass the target and destination explicitly:
+For containers, pass the host target and destination explicitly:
 
 ```sh
-sh fetch-native.sh 0.15.4 x86_64-unknown-linux-gnu /opt/rhiza-native
+sh fetch-native.sh 0.16.0 x86_64-unknown-linux-gnu /opt/rhiza-native
 ```
 
 The same files can be fetched by hand: download
@@ -153,8 +153,9 @@ the Go toolchain. The archive must come from the same release as the crate
 version, because the bridge ABI is only guaranteed between matching versions.
 Nothing is fetched automatically: supplying an archive is the consumer's
 explicit choice, so removing a release asset later removes only that
-convenience. Cross-compilation is deliberately unsupported rather than guessed;
-build for the host target, or supply an archive for the target you link for.
+convenience. Cross-compilation is unsupported even with a prebuilt archive:
+Rust HOST must equal TARGET. The explicit target argument selects an archive
+for a native host build; it does not enable cross-compilation.
 
 Repository integration guides: [host-managed shutdown](https://github.com/mrchypark/rhiza/blob/main/docs/embedded-lifecycle.md),
 [notification reconciliation](https://github.com/mrchypark/rhiza/blob/main/docs/notification-integration.md), and

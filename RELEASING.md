@@ -40,11 +40,13 @@ is not backed by a published crate fails CI.
    snippets and the `fetch-native.sh` tag URL in `README.md` and `sdk/rust/README.md`.
    Leave historical versions in the Known issues section alone. Open a pull
    request and merge it once CI passes.
-2. From the merged `main`, stage the crate outside the repository and publish
-   from that stage:
+2. Fetch the merged `main`, verify required CI passed for that exact commit,
+   then stage the crate outside the repository and publish from that stage:
 
    ```
-   stage=$(sdk/rust/scripts/stage-crate.sh origin/main)
+   git fetch origin main
+   release_commit=$(git rev-parse --verify 'origin/main^{commit}')
+   stage=$(sdk/rust/scripts/stage-crate.sh "$release_commit")
    cargo publish --manifest-path "$stage/Cargo.toml" --locked --dry-run
    cargo publish --manifest-path "$stage/Cargo.toml" --locked
    ```
@@ -59,8 +61,7 @@ is not backed by a published crate fails CI.
 
    ```
    curl -fsS -H 'User-Agent: rhiza' https://crates.io/api/v1/crates/rhizadb/X.Y.Z
-   git switch main && git pull
-   git tag -a vX.Y.Z -m "Rhiza vX.Y.Z"
+   git tag -a vX.Y.Z "$release_commit" -m "Rhiza vX.Y.Z"
    git push origin vX.Y.Z
    ```
 4. Create the GitHub release for the tag that now exists.
