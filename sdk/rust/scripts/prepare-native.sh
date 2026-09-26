@@ -43,6 +43,9 @@ hash_files() {
 
 before=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
 (cd "$native_dir" && GOWORK=off go mod vendor)
+# Dependency changelogs are not build inputs; keep the crate below crates.io's
+# 10 MB limit without dropping source or license files.
+find "$native_dir/vendor" -type f -name CHANGELOG.md -delete
 after=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
 if [ "$before" != "$after" ]; then
     echo "FAIL go.mod or go.sum changed while vendoring; run go mod tidy on the module and retry" >&2
