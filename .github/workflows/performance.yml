@@ -274,12 +274,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/hiqlite-target
       HIQLITE_COMMIT: cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
     steps:
       - uses: actions/checkout@v4
       - name: Measure Hiqlite v0.15.0
         run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/hiqlite-target"
           rustup toolchain install 1.97.1 --profile minimal
           git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
           git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
