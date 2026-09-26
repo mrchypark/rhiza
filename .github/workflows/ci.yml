@@ -130,7 +130,7 @@ jobs:
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
             -e AWS_DEFAULT_REGION=us-east-1 \
-            public.ecr.aws/aws-cli/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
+            amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
             --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
