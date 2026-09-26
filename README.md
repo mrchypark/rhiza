@@ -37,6 +37,12 @@ go get github.com/mrchypark/rhiza
 `Open` starts the embedded engine and its private peer endpoint. It does not
 open a public HTTP listener.
 
+For an embedded local-only database, set `Local: true`. Rhiza then creates no
+peer transport or network listener, and uses the same durable WAL and SQL/KV/graph
+engines. Do not set listener addresses, members, learner/reconfiguration options,
+tokens, or object-storage configuration in this mode. It provides no replication
+or remote backup; the existing local WAL size limit still applies.
+
 ```go
 db, err := rhiza.Open(ctx, rhiza.Config{
     NodeID:  "node-1",

@@ -48,6 +48,11 @@ pub struct Config {
     fields: Map<String, Value>,
 }
 impl Config {
+    /// Run on local disk without peer or operator listeners or object storage.
+    pub fn local(mut self) -> Self {
+        self.fields.insert("Local".into(), Value::Bool(true));
+        self
+    }
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         let mut fields = Map::new();
         fields.insert(
@@ -624,6 +629,26 @@ pub struct MembershipStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_mode_reopens_without_operator_listener() {
+        let dir = path();
+        let mut db = Db::open(Config::new(&dir).node_id("local").local()).unwrap();
+        db.kv_put("put", "key", b"value")
+            .unwrap()
+            .require_committed()
+            .unwrap();
+        assert!(db.start_operator("127.0.0.1:0").is_err());
+        db.close().unwrap();
+        let mut reopened = Db::open(Config::new(&dir).node_id("local").local()).unwrap();
+        assert_eq!(reopened.kv_get("key").unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            reopened.query("SELECT 1", json!([])).unwrap().rows[0][0],
+            json!(1)
+        );
+        reopened.close().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn membership_wire_carries_only_the_public_identity() {

@@ -35,12 +35,13 @@ type GraphNodePropertyIndex struct {
 
 // ExecutionConfig holds runtime configuration.
 type ExecutionConfig struct {
-	ClusterID                     ClusterID                `json:"cluster_id"`
-	NodeID                        NodeID                   `json:"node_id"`
-	DataDir                       string                   `json:"data_dir"`
-	BindAddr                      string                   `json:"bind_addr"`
-	PeerAddr                      string                   `json:"peer_addr"`
-	AdminToken                    string                   `json:"admin_token"`
+	Local      bool      `json:"local,omitempty"`
+	ClusterID  ClusterID `json:"cluster_id"`
+	NodeID     NodeID    `json:"node_id"`
+	DataDir    string    `json:"data_dir"`
+	BindAddr   string    `json:"bind_addr"`
+	PeerAddr   string    `json:"peer_addr"`
+	AdminToken string    `json:"admin_token"`
 	// PeerToken is this process's private peer identity secret. It is never
 	// replicated; Members carry only public identity.
 	PeerToken                     string                   `json:"peer_token"`

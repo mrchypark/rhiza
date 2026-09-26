@@ -381,3 +381,37 @@ func policySnapshot(t testing.TB, path, contents string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLocalModeHasNoNetwork(t *testing.T) {
+	n := New(&types.ExecutionConfig{Local: true, NodeID: "local", DataDir: t.TempDir()})
+	if err := n.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Shutdown()
+	if n.peer != nil || n.transport != nil || n.catchUp != nil || !n.ready.Load() {
+		t.Fatal("local mode created networking or is not ready")
+	}
+	if err := n.Start(context.Background()); err == nil {
+		t.Fatal("local HTTP listener allowed")
+	}
+}
+
+func TestLocalModeRejectsConflictingConfiguration(t *testing.T) {
+	cases := []types.ExecutionConfig{
+		{BindAddr: "127.0.0.1:0"}, {PeerAddr: "127.0.0.1:0"},
+		{Members: []quepaxa.Member{{ID: "local"}}}, {Learner: &quepaxa.Member{ID: "learner"}},
+		{EnableReconfiguration: true}, {PeerToken: "secret"}, {AdminToken: "secret"},
+		{ObjStoreProvider: "filesystem"}, {ObjStoreDir: "archive"}, {ObjStoreEndpoint: "localhost"}, {ObjStoreBucket: "archive"},
+	}
+	for _, config := range cases {
+		config.Local, config.NodeID, config.DataDir = true, "local", filepath.Join(t.TempDir(), "absent")
+		n := New(&config)
+		if err := n.Open(context.Background()); err == nil {
+			n.Shutdown()
+			t.Fatalf("accepted conflicting config: %+v", config)
+		}
+		if _, err := os.Stat(config.DataDir); !os.IsNotExist(err) {
+			t.Fatalf("created state for invalid config: %v", err)
+		}
+	}
+}

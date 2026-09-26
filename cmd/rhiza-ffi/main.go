@@ -35,6 +35,7 @@ const (
 )
 
 type ffiEntry struct {
+	local         bool
 	db            *rhiza.DB
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -154,6 +155,7 @@ func goOpen(input []byte) []byte {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	entry := &ffiEntry{db: db, ctx: ctx, cancel: cancel, drained: make(chan struct{}), nextSub: 1, subscriptions: make(map[uint64]*ffiSubscription)}
+	entry.local = config.Local
 	ffiRegistry.Lock()
 	handle := ffiRegistry.next
 	if handle == 0 || handle == math.MaxUint64 {
@@ -200,6 +202,9 @@ func goStartOperator(handle uint64, input []byte) []byte {
 	}
 	if entry.operator != nil {
 		return errorJSON(&ffiError{Code: "invalid_request", Message: "operator listener is already running"})
+	}
+	if entry.local {
+		return errorJSON(&ffiError{Code: "invalid_request", Message: "local mode does not support an operator listener"})
 	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
