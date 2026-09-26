@@ -343,7 +343,10 @@ func isRetryableGraphApplyError(err error) bool {
 	// LatticeDB shares ErrResourceLimit between query limits and transient
 	// checkpoint backpressure; only the latter must not become a durable rejection.
 	return errors.Is(err, latticedb.ErrWriteTxActive) ||
-		(errors.Is(err, latticedb.ErrResourceLimit) && strings.Contains(err.Error(), "WAL checkpoint is in progress"))
+		(errors.Is(err, latticedb.ErrResourceLimit) &&
+			(strings.Contains(err.Error(), "WAL checkpoint is in progress") ||
+				strings.Contains(err.Error(), "pagestore: write may require mmap growth while read snapshots are open") ||
+				strings.Contains(err.Error(), "pagestore: write exceeds snapshot growth limit")))
 }
 
 func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {

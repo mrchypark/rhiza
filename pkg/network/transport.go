@@ -312,7 +312,7 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 		return nil, err
 	}
 	response, err := t.callConnection(ctx, conn, request)
-	if err != nil && response == nil {
+	if err != nil && response == nil && ctx.Err() == nil {
 		t.invalidate(to, conn)
 	}
 	t.release(to, conn)
@@ -335,12 +335,22 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 	return response, nil
 }
 
-func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (*peerfb.ResponseT, error) {
+func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (response *peerfb.ResponseT, err error) {
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer stream.CancelRead(0)
+	stop := context.AfterFunc(ctx, func() {
+		stream.CancelRead(1)
+		stream.CancelWrite(1)
+	})
+	defer func() {
+		stop()
+		if ctx.Err() != nil {
+			response, err = nil, ctx.Err()
+		}
+	}()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = stream.SetDeadline(deadline)
 	}
@@ -364,6 +374,9 @@ func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request
 // PrepareCheckpoint waits for a durable verified quorum before the small seal
 // value enters normal consensus.
 func (t *Transport) PrepareCheckpoint(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	peer, err := t.transportForSlot(seal.Index)
 	if err != nil {
 		return err
@@ -397,7 +410,16 @@ func (t *Transport) PrepareCheckpoint(ctx context.Context, seal quepaxa.Checkpoi
 	}
 	var firstErr error
 	for range pending {
-		if err := <-results; err != nil {
+		var err error
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err = <-results:
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
