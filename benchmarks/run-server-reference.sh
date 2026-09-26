@@ -73,7 +73,7 @@ trap cleanup EXIT
 (cd "$source_dir" && CGO_ENABLED=0 go build -o "$run_dir/rhiza-bench" ./cmd/rhiza-bench)
 
 mkdir -p "$run_dir/s3-data"
-docker run --rm -d --name "$container" -p "$s3_port:9000" \
+docker run --rm -d --name "$container" -p "$s3_port:9000" --user "$(id -u):$(id -g)" \
 	-v "$run_dir/s3-data:/data" \
 	-e ROOT_ACCESS_KEY=rhiza-e2e -e ROOT_SECRET_KEY=rhiza-e2e-secret \
 	ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499 \
