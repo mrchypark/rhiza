@@ -287,11 +287,16 @@ jobs:
           cargo +1.97.1 build --release --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
           mkdir -p "$RUNNER_TEMP/hiqlite-reference"
           cd "$RUNNER_TEMP/hiqlite/examples/bench"
-          HQL_LOG_SYNC=interval_200 "$CARGO_TARGET_DIR/release/bench" cluster -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/interval_200_local.txt" 2>&1
-          HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_local.txt" 2>&1
-          HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_remote.txt" 2>&1
-          HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_follower_stopped.txt" 2>&1
-          HQL_LOG_SYNC=immediate "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_leader_stopped.txt" 2>&1
+          printf 'Measuring interval_200_local\n'
+          HQL_LOG_SYNC=interval_200 timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/interval_200_local.txt" 2>&1
+          printf 'Measuring immediate_local\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_local.txt" 2>&1
+          printf 'Measuring immediate_remote\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_remote.txt" 2>&1
+          printf 'Measuring immediate_follower_stopped\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_follower_stopped.txt" 2>&1
+          printf 'Measuring immediate_leader_stopped\n'
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_leader_stopped.txt" 2>&1
           for scenario in interval_200_local immediate_local immediate_remote immediate_follower_stopped immediate_leader_stopped; do
             file="$RUNNER_TEMP/hiqlite-reference/$scenario.txt"
             ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$file")

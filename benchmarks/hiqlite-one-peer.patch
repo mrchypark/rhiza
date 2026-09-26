@@ -8,7 +8,7 @@ index 7ec078e..d9cf12a 100644
 +    }
 +
 diff --git a/examples/bench/src/main.rs b/examples/bench/src/main.rs
-index 2b6a861..cec5da0 100644
+index 2b6a861..b29381a 100644
 --- a/examples/bench/src/main.rs
 +++ b/examples/bench/src/main.rs
 @@ -28,0 +29,12 @@ pub struct Options {
@@ -92,8 +92,8 @@ index 2b6a861..cec5da0 100644
 +                .collect();
 +            Client::remote(
 +                nodes,
-+                false,
-+                false,
++                true,
++                true,
 +                "SuperSecureSecret1337".to_string(),
 +                true,
 +                None,
