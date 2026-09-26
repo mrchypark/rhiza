@@ -24,6 +24,8 @@ index b89c75c..4da571d 100644
 +    #[clap(long, default_value_t = false)]
 +    pub sql_only: bool,
 +
+@@ -223 +234,0 @@ async fn node_config(nodes: Vec<Node>, options: &Options) -> NodeConfig {
+-    config.wal_sync = hiqlite::LogSync::IntervalMillis(200);
 @@ -271,0 +284,3 @@ async fn main() -> Result<(), Error> {
 +            fail_peer: None,
 +            remote_client: true,
