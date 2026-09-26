@@ -46,6 +46,36 @@ func TestRetryableGraphApplyErrorOnlyMatchesTransientContention(t *testing.T) {
 	}
 }
 
+func TestGraphSnapshotGrowthBackpressureIsRetryable(t *testing.T) {
+	for _, size := range []int{2 << 20, 17 << 20} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			snapshot, err := m.graph.db.BeginSnapshot()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer snapshot.Close()
+			payload := bytes.Repeat([]byte{'x'}, size)
+			write := func(tx *latticedb.Tx) error {
+				return tx.PutAppMetadata([]byte("backpressure-test"), payload)
+			}
+			if err := m.graph.db.Update(write); !errors.Is(err, latticedb.ErrResourceLimit) || !isRetryableGraphApplyError(err) {
+				t.Fatalf("snapshot backpressure = %v, want retryable resource limit", err)
+			}
+			if err := snapshot.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.graph.db.Update(write); err != nil {
+				t.Fatalf("retry after snapshot release: %v", err)
+			}
+		})
+	}
+}
+
 func TestBeginGraphSnapshotWaitsForWriterOrContext(t *testing.T) {
 	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
 	if err != nil {

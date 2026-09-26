@@ -49,8 +49,12 @@ func (e *CommitUnknownError) Error() string {
 func (e *CommitUnknownError) Unwrap() []error { return []error{ErrCommitUnknown, e.Cause} }
 
 func commitUnknown(slot quepaxa.Slot, requestID string, err error) error {
-	if err != nil && slot != 0 {
-		return &CommitUnknownError{Slot: slot, RequestID: requestID, RetryThroughSlot: uint64(slot) + types.DefaultIdempotencyWindowSlots - 1, Cause: err}
+	if err != nil && (slot != 0 || errors.Is(err, ErrCommitUnknown)) {
+		unknown := &CommitUnknownError{Slot: slot, RequestID: requestID, Cause: err}
+		if slot != 0 {
+			unknown.RetryThroughSlot = uint64(slot) + types.DefaultIdempotencyWindowSlots - 1
+		}
+		return unknown
 	}
 	return err
 }
@@ -379,6 +383,9 @@ type DecisionsResponse struct {
 }
 
 func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	hash := sha256.Sum256(value)
 	for {
 		s.proposeMu.Lock()
@@ -391,7 +398,7 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 		if call != nil {
 			select {
 			case <-ctx.Done():
-				return 0, ctx.Err()
+				return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
 			case <-call.done:
 				return call.slot, call.err
 			}
@@ -435,7 +442,7 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
-			return 0, ctx.Err()
+			return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
 		case <-call.done:
 			return call.slot, call.err
 		}
