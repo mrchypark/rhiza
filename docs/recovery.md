@@ -105,7 +105,7 @@ survives or whole-generation recovery when it is lost. Its Kubernetes backend
 submits an immutable `RhizaFence` and waits for proof of termination of the
 requested identity scope, recreation prevention, and storage quiescence. A Pod
 delete response is not proof. The supplied executor is qualified only in CI on
-single-node kind with dedicated MinIO; production requires a trusted,
+single-node kind with a dedicated S3 test gateway; production requires a trusted,
 environment-specific runtime/storage executor. Missing proof blocks recovery.
 
 The source generation's immutable membership record binds its durability mode.

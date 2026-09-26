@@ -111,7 +111,7 @@ surviving quorum. Once it records a newer abort revision, set it false and use a
 fresh replacement Pod/Secret to resume. A stale revision or changed Secret blocks
 the operation.
 
-Real MinIO/QUIC E2E passes cover replacement and restart for `async` and
+Real S3 gateway/QUIC E2E passes cover replacement and restart for `async` and
 `before-ack`, plus externally fenced, sealed, anchored generation materialization
 that preserves SQL data and request-ID deduplication. Loss of the existing quorum
 still requires this separate generation-recovery procedure; membership cannot
