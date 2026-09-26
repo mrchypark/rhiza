@@ -145,6 +145,24 @@ func TestCheckpointMembershipColdObserverRestoreAndRejectsTampering(t *testing.T
 	}
 }
 
+func TestCheckpointMembershipRejectsUnboundFreeze(t *testing.T) {
+	_, _, initial, seal, _ := checkpointMembershipSource(t)
+	history := cloneMembershipRecord(*seal.Membership)
+	freeze := &history.Transitions[1].Freeze
+	id, decision, err := decodeCertificate(freeze.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision.Summaries[0].ReconfigurationID = ValueHash{9}
+	freeze.Certificate, err = encodeCertificate(id, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateMembershipHistory(initial, history); err == nil {
+		t.Fatal("accepted a freeze not bound to its own proposal")
+	}
+}
+
 func TestCheckpointMembershipRejectsPendingTerminal(t *testing.T) {
 	cores, _ := reconfigCluster(t)
 	core := cores["a"]
