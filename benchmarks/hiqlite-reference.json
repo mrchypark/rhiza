@@ -1,16 +1,27 @@
 {
-  "version": "v0.14.0",
-  "commit": "c3ff2536ac985ecb9f77201d1b58dab66c7b256e",
-  "patch_sha256": "1adc6028d28bb0c6b80cf429a69dab30d744eb4ed13830dcb028325522d717b7",
-  "measured_at": "2026-09-04T02:55:10Z",
-  "source_run": "https://github.com/mrchypark/rhiza/actions/runs/33829988020",
+  "version": "v0.15.0",
+  "commit": "cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249",
+  "patch_sha256": "e056c066efc27a96a7c7372ede87bbd794fdc65c0f41fa4daf958b3f68c2b07e",
+  "measured_at": "2026-09-26T07:27:30Z",
+  "source_run": "https://github.com/mrchypark/rhiza/actions/runs/36226289455",
+  "source_head_sha": "2708a49b5ff35321bed67779b0f27c4f14f6e203",
+  "runner_image": "ubuntu24-20260920.314.1",
+  "rust_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
   "requests": 100000,
   "concurrency": 16,
+  "evidence_sha256": {
+    "environment.txt": "c3e5043134e23a4ba07a2379d43e62094b9217bb4b2c06db797beb6ab6768c17",
+    "interval_200_local.txt.gz": "aa3b4994c6d57b65364aab332fac75b7f07b90c6cc4151040e296ccaf988a005",
+    "immediate_local.txt.gz": "84b8012a84b3b13eb155e35441661c8ba4c62be2afdaf3aaf57f09729b454981",
+    "immediate_remote.txt.gz": "cbabdf3416e41691c2c3fd5395f650fa67972e40274c049719c63e3801a31d39",
+    "immediate_follower_stopped.txt.gz": "b00300639acdf1ef06a26c86569d1a75951f9d418a5c18df55d9358db60d01f1",
+    "immediate_leader_stopped.txt.gz": "a74d27215152573a02b3c42152b30d90629f1d9246339d0c418bed0c09e4dc07"
+  },
   "ops_per_sec": {
-    "interval_200_local": 12448,
-    "immediate_local": 2422,
-    "immediate_remote": 2190,
-    "immediate_follower_stopped": 2581,
-    "immediate_leader_stopped": 2580
+    "interval_200_local": 14088,
+    "immediate_local": 1632,
+    "immediate_remote": 1471,
+    "immediate_follower_stopped": 1739,
+    "immediate_leader_stopped": 1739
   }
 }
