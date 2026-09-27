@@ -54,6 +54,7 @@ type Core struct {
 	observer             bool
 	learner              bool
 	localMode            bool
+	localExecutionOwner  chan struct{}
 	walIdentity          string
 	reconfigEnabled      bool
 	reconfigWAL          bool
@@ -125,7 +126,7 @@ func newCore(nodeID NodeID, config *Cluster, wal *qlog.WAL, transport Transport)
 	core := &Core{
 		nodeID: nodeID, config: config, wal: wal, transport: transport,
 		priority: randomPriority,
-		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), tipChanged: make(chan struct{}),
+		nextSlot: 1, pipeline: make(chan struct{}, 16), pipelineExclusive: make(chan struct{}, 1), recoveryGate: make(chan struct{}, 1), localExecutionOwner: make(chan struct{}, 1), tipChanged: make(chan struct{}),
 		decided: make(map[Slot]DecidedValue), durable: make(map[Slot]bool), logged: make(map[Slot]bool), byHash: make(map[ValueHash]Slot), values: make(map[ValueHash][]byte), valueDurable: make(map[ValueHash]bool), prefixes: make(map[Slot][32]byte), preparedCheckpoints: make(map[Slot][32]byte), sealedRoots: make(map[[32]byte]SealedCheckpoint), recorders: make(map[Slot]ISR),
 		now: time.Now, epochStart: make(map[uint64]time.Time), timings: make(map[NodeID]leaderTiming), commits: newGroupCommit(wal.Sync),
 	}
@@ -298,6 +299,12 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 	} else if control {
 		return 0, nil, fmt.Errorf("reconfiguration controls require BeginReconfiguration or FinishReconfiguration")
 	}
+	if err := c.acquireLocalExecution(ctx); err != nil {
+		return 0, nil, err
+	}
+	if c.localMode {
+		defer c.releaseLocalExecution()
+	}
 	select {
 	case c.pipeline <- struct{}{}:
 		defer func() { <-c.pipeline }()
@@ -318,9 +325,16 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 		if err := ctx.Err(); err != nil {
 			return 0, nil, err
 		}
+		if c.localMode {
+			if pending := c.RecorderTip(); pending > c.Tip() {
+				if err := c.recoverThroughOwned(ctx, pending); err != nil {
+					return 0, nil, fmt.Errorf("recover pending local records through slot %d: %w", pending, err)
+				}
+			}
+		}
 		slot, reused := c.reserveSlot()
 		if c.reconfigEnabled && slot > c.Tip()+16 {
-			if err := c.RecoverThrough(ctx, slot-16); err != nil {
+			if err := c.recoverThroughOwned(ctx, slot-16); err != nil {
 				c.releaseSlot(slot)
 				return slot, nil, err
 			}
@@ -362,7 +376,7 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 		}
 		if complete {
 			if tip := c.Tip(); tip+1 < decision.Slot {
-				if err := c.RecoverThrough(ctx, decision.Slot-1); err != nil {
+				if err := c.recoverThroughOwned(ctx, decision.Slot-1); err != nil {
 					return decision.Slot, nil, err
 				}
 			}
@@ -1954,6 +1968,21 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 	if c.observer {
 		return ErrQuorumUnavailable
 	}
+	if err := c.acquireLocalExecution(ctx); err != nil {
+		return err
+	}
+	if c.localMode {
+		defer c.releaseLocalExecution()
+	}
+	return c.recoverThroughOwned(ctx, through)
+}
+
+// recoverThroughOwned is used when the caller already owns local execution or
+// when ordinary clustered proposal internals recover a gap themselves.
+func (c *Core) recoverThroughOwned(ctx context.Context, through Slot) error {
+	if c.observer {
+		return ErrQuorumUnavailable
+	}
 	// A proposal may hold the last frontend permit while waiting for this gap.
 	// Recovery must be able to re-drive it independently of the write pipeline.
 	select {
@@ -1984,6 +2013,20 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 	}
 	return nil
 }
+
+func (c *Core) acquireLocalExecution(ctx context.Context) error {
+	if !c.localMode {
+		return nil
+	}
+	select {
+	case c.localExecutionOwner <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Core) releaseLocalExecution() { <-c.localExecutionOwner }
 
 func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 	c.mu.RLock()
