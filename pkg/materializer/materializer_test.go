@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -577,6 +578,97 @@ func TestSQLCommandReturningOutputRefsAndRetry(t *testing.T) {
 	query, err := m.QueryResult(context.Background(), "SELECT id, payload FROM copied", nil)
 	if err != nil || query.Rows[0][0] != int64(1) || query.Rows[0][1] != "value" {
 		t.Fatalf("copied rows=%#v err=%v", query.Rows, err)
+	}
+}
+
+func TestWideSQLResultSurvivesRestartAndRetry(t *testing.T) {
+	for _, columns := range []int{999, 1000, 2000, 2001} {
+		t.Run(strconv.Itoa(columns), func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "wide.db")
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { m.Close() }()
+			schema, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "schema", Statements: []types.SQLStatement{
+				{SQL: "CREATE TABLE counter (n INTEGER)"},
+				{SQL: "INSERT INTO counter VALUES (0)"},
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Apply(ctx, 1, schema); err != nil {
+				t.Fatal(err)
+			}
+			command := types.SQLCommand{RequestID: "wide", Statements: []types.SQLStatement{
+				{SQL: "UPDATE counter SET n = n + 1"},
+				{SQL: "UPDATE counter SET n = n RETURNING " + strings.Repeat("n,", columns-1) + "n", WantRows: true},
+			}}
+			value, err := types.EncodeSQLBatch([]types.SQLCommand{command, {RequestID: "independent", SQL: "UPDATE counter SET n = n"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Apply(ctx, 2, value); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, err := types.SQLFingerprint(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeReceipt, beforeResult, _, _, err := m.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, err = Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, result, found, matches, err := m.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, true)
+			if err != nil || !found || !matches || receipt.Slot != 2 {
+				t.Fatalf("receipt=%+v found=%v matches=%v err=%v", receipt, found, matches, err)
+			}
+			wantCount := int64(1)
+			if columns == 2001 {
+				wantCount = 0
+				if receipt.Status != types.MutationRejected || len(result.Statements) != 0 {
+					t.Fatalf("oversized result was not rejected: %+v %+v", receipt, result)
+				}
+			} else if receipt.Status != types.MutationCommitted || len(result.Statements) != 2 || len(result.Statements[1].Columns) != columns || len(result.Statements[1].Rows) != 1 || len(result.Statements[1].Rows[0]) != columns {
+				t.Fatalf("wide result did not round trip: receipt=%+v", receipt)
+			}
+			if !reflect.DeepEqual(beforeReceipt, receipt) || !reflect.DeepEqual(beforeResult, result) {
+				t.Fatal("receipt/result changed after reopen")
+			}
+			if columns <= 2000 {
+				for i, name := range result.Statements[1].Columns {
+					if name != "n" || result.Statements[1].Rows[0][i] != int64(1) {
+						t.Fatalf("column %d name/type/value changed", i)
+					}
+				}
+			}
+			if err := m.Apply(ctx, 3, value); err != nil {
+				t.Fatal(err)
+			}
+			afterReceipt, afterResult, _, _, err := m.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, true)
+			if err != nil || !reflect.DeepEqual(receipt, afterReceipt) || !reflect.DeepEqual(result, afterResult) {
+				t.Fatalf("retry changed receipt/result: %v", err)
+			}
+			independent, _, found, _, err := m.SQLRequestResultFingerprint(ctx, "independent", [32]byte{}, true)
+			if err != nil || !found || independent.Status != types.MutationCommitted {
+				t.Fatalf("independent command failed: %+v %v", independent, err)
+			}
+			query, err := m.QueryResult(ctx, "SELECT n FROM counter", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := query.Rows[0][0]; got != wantCount {
+				t.Fatalf("counter=%v want=%d after retry", got, wantCount)
+			}
+		})
 	}
 }
 
