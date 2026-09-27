@@ -2423,6 +2423,22 @@ func (c *Core) DecisionsFrom(from Slot, limit int) ([]DecidedValue, Slot, error)
 	if limit <= 0 {
 		limit = 256
 	}
+	return c.decisionsFromBounded(from, limit, int(^uint(0)>>1))
+}
+
+// DecisionsFromBounded returns a contiguous decision prefix bounded by both
+// item count and the combined Value and Certificate payload bytes.
+func (c *Core) DecisionsFromBounded(from Slot, itemLimit, payloadByteLimit int) ([]DecidedValue, Slot, error) {
+	if from == 0 {
+		from = 1
+	}
+	if itemLimit <= 0 || payloadByteLimit <= 0 {
+		return nil, 0, fmt.Errorf("decision item and payload limits must be positive")
+	}
+	return c.decisionsFromBounded(from, itemLimit, payloadByteLimit)
+}
+
+func (c *Core) decisionsFromBounded(from Slot, itemLimit, payloadByteLimit int) ([]DecidedValue, Slot, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if from <= c.floor {
@@ -2430,20 +2446,34 @@ func (c *Core) DecisionsFrom(from Slot, limit int) ([]DecidedValue, Slot, error)
 	}
 	capacity := 0
 	if from <= c.tip {
-		capacity = limit
-		if remaining := c.tip - from + 1; remaining < Slot(capacity) {
-			capacity = int(remaining)
+		capacity = min(itemLimit, 1024)
+		if remaining := c.tip - from; remaining < Slot(capacity-1) {
+			capacity = int(remaining) + 1
 		}
 	}
 	page := make([]DecidedValue, 0, capacity)
-	for slot := from; slot <= c.tip && len(page) < limit; slot++ {
+	usedBytes := 0
+	for slot := from; slot <= c.tip && len(page) < itemLimit; {
 		decision, ok := c.decided[slot]
 		if !ok {
 			return nil, 0, fmt.Errorf("decision gap at slot %d", slot)
 		}
+		remaining := payloadByteLimit - usedBytes
+		if len(decision.Value) > remaining || len(decision.Certificate) > remaining-len(decision.Value) {
+			if len(page) == 0 {
+				return nil, c.tip, fmt.Errorf("decision %d exceeds bounded payload limit of %d bytes", slot, payloadByteLimit)
+			}
+			break
+		}
 		decision.Value = append([]byte(nil), decision.Value...)
 		decision.Certificate = append([]byte(nil), decision.Certificate...)
 		page = append(page, decision)
+		usedBytes += len(decision.Value)
+		usedBytes += len(decision.Certificate)
+		if slot == c.tip {
+			break
+		}
+		slot++
 	}
 	return page, c.tip, nil
 }

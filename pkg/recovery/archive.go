@@ -26,6 +26,7 @@ import (
 const (
 	maxExtentSize      = 8 << 20
 	maxExtentItems     = 1024
+	maxExtentPayload   = maxExtentSize - extentHeaderSize - archiveCRCSize - 8
 	maxHeadSize        = 64 << 10
 	archiveGroupDelay  = 2 * time.Millisecond
 	archiveSyncTimeout = 5 * time.Minute
@@ -103,7 +104,7 @@ type RecoverySnapshot struct {
 }
 
 type source interface {
-	DecisionsFrom(quepaxa.Slot, int) ([]quepaxa.DecidedValue, quepaxa.Slot, error)
+	DecisionsFromBounded(quepaxa.Slot, int, int) ([]quepaxa.DecidedValue, quepaxa.Slot, error)
 	PrefixHash(quepaxa.Slot) ([32]byte, bool)
 	Tip() quepaxa.Slot
 }
@@ -270,15 +271,13 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 			if err != nil {
 				return err
 			}
-			extent.Decisions = nil
+			extent = extentRef(extent)
 			verified[key] = extent
 		}
 		if extent.End != end {
 			return fmt.Errorf("invalid shared archive block chain")
 		}
-		ref := extent
-		ref.Decisions = nil
-		extents = append(extents, ref)
+		extents = append(extents, extentRef(extent))
 		hash, object, end = extent.PreviousHash, extent.PreviousObject, extent.Start-1
 	}
 	if !reused {
@@ -305,7 +304,7 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 			return fmt.Errorf("invalid shared archive block chain")
 		}
 		next, prefix = extent.End+1, extent.EndPrefix
-		extents[i].Decisions = nil
+		extents[i] = extentRef(extents[i])
 	}
 	if next-1 != head.Tip {
 		return fmt.Errorf("shared archive head tip mismatch")
@@ -453,7 +452,7 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 				extent.Start = through + 1
 				extent.StartPrefix = prefix
 			}
-			extents = append(extents, extent)
+			extents = append(extents, extentRef(extent))
 		}
 		if through == tip {
 			head.TailHash, head.TailObject = [32]byte{}, 0
@@ -476,7 +475,7 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 	return fmt.Errorf("shared archive trim conflicted too many times")
 }
 
-func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead, priorCAS *objstore.ObjectVersion, refs []Extent) error {
+func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead, priorCAS *objstore.ObjectVersion, refs []Extent, candidates ...Extent) error {
 	name := m.key("archive/head.bin")
 	attributes, data, _, err := m.readStableObject(ctx, name, nil, false)
 	if err != nil {
@@ -497,19 +496,35 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead
 		}
 		return nil
 	}
+	metadataRefs := make([]Extent, len(refs))
 	for i := range refs {
-		if len(refs[i].Decisions) != 0 {
-			m.rememberExtent(refs[i])
-		}
-		refs[i].Decisions = nil
+		metadataRefs[i] = extentRef(refs[i])
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !sameNullableObjectVersion(m.headCAS, priorCAS) {
+		m.mu.Unlock()
 		return errArchiveStateChanged
 	}
-	m.extents, m.head, m.tip, m.headCAS = refs, head, head.Tip, attributes.Version
+	m.extents, m.head, m.tip, m.headCAS = metadataRefs, head, head.Tip, attributes.Version
+	m.mu.Unlock()
+	remember := func(ref Extent) {
+		if len(ref.Decisions) != 0 {
+			m.rememberExtent(ref)
+		}
+	}
+	for _, ref := range refs {
+		remember(ref)
+	}
+	for _, ref := range candidates {
+		remember(ref)
+	}
 	return nil
+}
+
+func extentRef(extent Extent) Extent {
+	extent.Decisions = nil
+	extent.prefixes = nil
+	return extent
 }
 
 // HeadVersion returns the conditional-write identity of the loaded archive head.
@@ -810,6 +825,8 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 			return nil
 		}
 		added := make([]Extent, 0, 1)
+		var cacheTail [2]Extent
+		cacheTailCount := 0
 		head.ConfigID = m.configID
 		if head.Generation == ^uint64(0) {
 			return fmt.Errorf("archive generation exhausted")
@@ -826,30 +843,29 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 				return err
 			}
 			extent.object = nextGeneration
-			added = append(added, extent)
+			if cacheTailCount < len(cacheTail) {
+				cacheTail[cacheTailCount] = extent
+				cacheTailCount++
+			} else {
+				cacheTail[0] = Extent{}
+				cacheTail[0] = cacheTail[1]
+				cacheTail[1] = Extent{}
+				cacheTail[1] = extent
+			}
+			added = append(added, extentRef(extent))
 			head.Tip, head.TailHash, head.TailObject = extent.End, extent.hash, nextGeneration
 			previous, previousObject = extent.hash, nextGeneration
-			from = extent.End + 1
 			if sourceTip < through && extent.End == sourceTip {
 				return fmt.Errorf("archive source tip %d is behind required slot %d", sourceTip, through)
 			}
+			if extent.End == through {
+				break
+			}
+			from = extent.End + 1
 		}
 		head.Generation = nextGeneration
 		if err := m.publishHead(ctx, head, headCAS); err == nil {
-			if m.cas {
-				return m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...))
-			}
-			refs = append(refs, added...)
-			for _, extent := range added {
-				m.rememberExtent(extent)
-			}
-			for i := range refs {
-				refs[i].Decisions = nil
-			}
-			m.mu.Lock()
-			m.extents, m.head, m.tip = refs, head, head.Tip
-			m.mu.Unlock()
-			return nil
+			return m.refreshPublishedHead(ctx, head, headCAS, append(refs, added...), cacheTail[:cacheTailCount]...)
 		} else if !m.cas {
 			return err
 		}
@@ -892,7 +908,14 @@ func (m *Manager) uploadExtent(ctx context.Context, hash [32]byte, data []byte, 
 }
 
 func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous [32]byte, previousObject uint64) (Extent, []byte, quepaxa.Slot, error) {
-	decisions, tip, err := core.DecisionsFrom(from, maxExtentItems)
+	if from == 0 || through < from {
+		return Extent{}, nil, 0, fmt.Errorf("invalid archive slot range %d-%d", from, through)
+	}
+	itemLimit := maxExtentItems
+	if remaining := uint64(through) - uint64(from) + 1; remaining < uint64(itemLimit) {
+		itemLimit = int(remaining)
+	}
+	decisions, tip, err := core.DecisionsFromBounded(from, itemLimit, maxExtentPayload)
 	if err != nil {
 		return Extent{}, nil, tip, err
 	}
@@ -907,35 +930,27 @@ func (m *Manager) buildExtent(core source, from, through quepaxa.Slot, previous 
 			return Extent{}, nil, tip, fmt.Errorf("archive start prefix %d is unavailable", from-1)
 		}
 	}
-	selected := decisions[:0]
-	encodedDecisions := 0
-	var endPrefix [32]byte
-	for _, decision := range decisions {
-		encodedSize := archiveDecisionSize(decision)
-		candidatePrefix, ok := core.PrefixHash(decision.Slot)
-		if !ok {
-			return Extent{}, nil, tip, fmt.Errorf("archive end prefix %d is unavailable", decision.Slot)
-		}
-		candidate := Extent{ConfigID: m.configID, Start: from, End: decision.Slot, StartPrefix: startPrefix, EndPrefix: candidatePrefix, PreviousHash: previous, PreviousObject: previousObject, Decisions: []quepaxa.DecidedValue{}}
-		size, err := extentEncodedSize(candidate, encodedDecisions+encodedSize, len(selected)+1)
-		if err != nil {
-			return Extent{}, nil, tip, err
-		}
-		if len(selected) != 0 && size > maxExtentSize {
+	encodedBytes := extentHeaderSize + archiveCRCSize
+	selected := 0
+	for selected < len(decisions) && selected < maxExtentItems {
+		decisionSize := archiveDecisionSize(decisions[selected])
+		if decisionSize > maxExtentSize-encodedBytes {
 			break
 		}
-		if size > maxExtentSize {
-			return Extent{}, nil, tip, fmt.Errorf("decision %d exceeds archive extent limit", decision.Slot)
-		}
-		selected = append(selected, decision)
-		encodedDecisions += encodedSize
-		endPrefix = candidatePrefix
-		if decision.Slot >= through {
-			break
-		}
+		encodedBytes += decisionSize
+		selected++
 	}
-	end := selected[len(selected)-1].Slot
-	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, PreviousHash: previous, PreviousObject: previousObject, Decisions: selected}
+	if selected == 0 {
+		return Extent{}, nil, tip, fmt.Errorf("decision %d exceeds archive extent limit", decisions[0].Slot)
+	}
+	clear(decisions[selected:])
+	decisions = decisions[:selected:selected]
+	end := decisions[len(decisions)-1].Slot
+	endPrefix, ok := core.PrefixHash(end)
+	if !ok {
+		return Extent{}, nil, tip, fmt.Errorf("archive end prefix %d is unavailable", end)
+	}
+	extent := Extent{ConfigID: m.configID, Start: from, End: end, StartPrefix: startPrefix, EndPrefix: endPrefix, PreviousHash: previous, PreviousObject: previousObject, Decisions: decisions}
 	data, err := encodeExtent(extent)
 	if err != nil {
 		return Extent{}, nil, tip, err
@@ -1092,20 +1107,8 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 			}
 			return err
 		}
-		if m.cas {
-			if err := m.refreshPublishedHead(ctx, head, snapshotCAS, compacted); err != nil {
-				return err
-			}
-		} else {
-			newRefs := make([]Extent, 0, len(compacted))
-			for _, extent := range compacted {
-				m.rememberExtent(extent)
-				extent.Decisions = nil
-				newRefs = append(newRefs, extent)
-			}
-			m.mu.Lock()
-			m.extents, m.head = newRefs, head
-			m.mu.Unlock()
+		if err := m.refreshPublishedHead(ctx, head, snapshotCAS, compacted); err != nil {
+			return err
 		}
 		verifier := NewManager(m.bucket, m.prefix, m.configID)
 		if err := verifier.Load(ctx); err != nil {
