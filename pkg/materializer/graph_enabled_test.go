@@ -321,6 +321,155 @@ func TestUnknownCommitPoisonsReadsAndApplyUntilReopen(t *testing.T) {
 	}
 }
 
+func TestGraphCommitAcknowledgementLossPoisonsUntilReopen(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		cause error
+	}{
+		{name: "wrapped cancellation", cause: fmt.Errorf("commit acknowledgement: %w", context.Canceled)},
+		{name: "unclassified error", cause: errors.New("simulated commit acknowledgement loss")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sqlite.db")
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := types.GraphCommand{
+				RequestID: "committed-before-ack-loss",
+				Cypher:    `CREATE (:Item {id: 'committed'})`,
+				Events:    []types.GraphStreamEvent{{Stream: "events", Kind: "created", Payload: "committed"}},
+			}
+			value, err := types.EncodeGraphCommand(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			injected := false
+			m.graph.afterCommitError = func() error {
+				injected = true
+				return tc.cause
+			}
+			applyErr := m.Apply(context.Background(), 1, value)
+			if !injected || !errors.Is(applyErr, ErrGraphCommitUnknown) || !errors.Is(applyErr, tc.cause) {
+				t.Fatalf("Apply error=%v injected=%v, want unknown commit and cause %v", applyErr, injected, tc.cause)
+			}
+			if _, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil); !errors.Is(err, ErrGraphCommitUnknown) {
+				t.Fatalf("GraphQuery error=%v, want unknown commit", err)
+			}
+			if err := m.Apply(context.Background(), 1, value); !errors.Is(err, ErrGraphCommitUnknown) {
+				t.Fatalf("same-instance Apply error=%v, want unknown commit", err)
+			}
+			committed, found, err := m.graph.request(command.RequestID)
+			if err != nil || !found || committed.Receipt.Status != types.MutationCommitted {
+				t.Fatalf("durable request=%+v found=%v err=%v, want original committed receipt", committed, found, err)
+			}
+			rows, err := m.graph.db.Query(`MATCH (n:Item {id: 'committed'}) RETURN n.id`, nil)
+			if err != nil || len(rows.Rows) != 1 {
+				t.Fatalf("durable graph effects rows=%v err=%v, want one committed node", rows.Rows, err)
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, err = Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			if err := m.Apply(context.Background(), 1, value); err != nil {
+				t.Fatalf("exact replay after reopen: %v", err)
+			}
+			result, err := m.GraphQuery(context.Background(), `MATCH (n:Item {id: 'committed'}) RETURN n.id`, nil)
+			if err != nil || result.AppliedSlot != 1 || len(result.Rows) != 1 {
+				t.Fatalf("replayed result slot=%d rows=%v err=%v", result.AppliedSlot, result.Rows, err)
+			}
+			receipt, found, err := m.GraphMutationReceipt(context.Background(), command.RequestID)
+			if err != nil || !found || receipt.Status != types.MutationCommitted {
+				t.Fatalf("replayed receipt=%+v found=%v err=%v", receipt, found, err)
+			}
+			records, _, err := m.GraphReadStream(context.Background(), "events", 0, 10, 0)
+			if err != nil || len(records) != 1 {
+				t.Fatalf("replayed records=%v err=%v, want one event", records, err)
+			}
+		})
+	}
+}
+
+func TestRejectedReceiptCommitAcknowledgementLossPoisonsUntilReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := types.GraphCommand{RequestID: "rejected-before-ack-loss", Cypher: `MATCH (`}
+	value, err := types.EncodeGraphCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	m.graph.afterCommitError = func() error {
+		injected = true
+		return errors.New("simulated rejection commit acknowledgement loss")
+	}
+	applyErr := m.Apply(context.Background(), 1, value)
+	if !injected || !errors.Is(applyErr, ErrGraphCommitUnknown) {
+		t.Fatalf("Apply error=%v injected=%v, want unknown rejection commit", applyErr, injected)
+	}
+	stored, found, err := m.graph.request(command.RequestID)
+	if err != nil || !found || stored.Receipt.Status != types.MutationRejected {
+		t.Fatalf("stored rejection=%+v found=%v err=%v", stored, found, err)
+	}
+	if _, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil); !errors.Is(err, ErrGraphCommitUnknown) {
+		t.Fatalf("GraphQuery error=%v, want unknown commit", err)
+	}
+	if err := m.Apply(context.Background(), 1, value); !errors.Is(err, ErrGraphCommitUnknown) {
+		t.Fatalf("same-instance Apply error=%v, want unknown commit", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatalf("exact replay after reopen: %v", err)
+	}
+	if _, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil); err != nil {
+		t.Fatal(err)
+	}
+	receipt, found, err := m.GraphMutationReceipt(context.Background(), command.RequestID)
+	if err != nil || !found || receipt.Status != types.MutationRejected {
+		t.Fatalf("replayed rejection=%+v found=%v err=%v", receipt, found, err)
+	}
+}
+
+func TestFailedRejectionRecordingDoesNotPersistReceipt(t *testing.T) {
+	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.graph.db.Update(func(tx *latticedb.Tx) error { return tx.PutAppMetadata(graphJournalKey, []byte{1}) }); err != nil {
+		t.Fatal(err)
+	}
+	command := types.GraphCommand{RequestID: "no-rejection-on-record-failure", Cypher: `MATCH (`}
+	value, err := types.EncodeGraphCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(context.Background(), 1, value); err == nil {
+		t.Fatal("Apply succeeded despite failed rejection metadata transaction")
+	}
+	if _, found, err := m.graph.request(command.RequestID); err != nil || found {
+		t.Fatalf("request after failed rejection recording found=%v err=%v, want no receipt", found, err)
+	}
+	rows, err := m.graph.db.Query(`MATCH (n:Item) RETURN n.id`, nil)
+	if err != nil || len(rows.Rows) != 0 {
+		t.Fatalf("graph effects after rejected command rows=%v err=%v", rows.Rows, err)
+	}
+}
+
 func TestGraphEffectsAndPendingMarkerRollbackTogether(t *testing.T) {
 	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)
 	if err != nil {

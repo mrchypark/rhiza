@@ -65,6 +65,7 @@ type graphState struct {
 	durableTip        uint64
 	pending           *graphJournalEntry
 	commitUnknown     bool
+	afterCommitError  func() error
 	idempotencyWindow uint64
 	streamWake        chan struct{}
 	queryWG           sync.WaitGroup
@@ -331,6 +332,18 @@ func (g *graphState) close() {
 	}
 }
 
+// update is the graph transaction boundary. afterCommitError is an unexported
+// test seam used to model a lost commit acknowledgement after a real commit.
+func (g *graphState) update(fn func(*latticedb.Tx) error) error {
+	if err := g.db.Update(fn); err != nil {
+		return err
+	}
+	if g.afterCommitError != nil {
+		return g.afterCommitError()
+	}
+	return nil
+}
+
 func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte, commands []types.GraphCommand, graph bool, confirmedThrough uint64) error {
 	g := m.graph
 	if g == nil || g.db == nil {
@@ -461,7 +474,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 		return &graphRejectedCommandError{err: err}
 	}
 	callbackStarted, callbackSucceeded := false, false
-	updateErr := g.db.Update(func(tx *latticedb.Tx) error {
+	updateErr := g.update(func(tx *latticedb.Tx) error {
 		callbackStarted = true
 		callbackErr := func() error {
 			if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
@@ -544,7 +557,7 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 		}
 	}
 	callbackSucceeded := false
-	updateErr := g.db.Update(func(tx *latticedb.Tx) error {
+	updateErr := g.update(func(tx *latticedb.Tx) error {
 		callbackErr := func() error {
 			if err := ctx.Err(); err != nil {
 				return err
