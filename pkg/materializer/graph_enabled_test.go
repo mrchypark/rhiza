@@ -645,6 +645,84 @@ func TestSQLiteCommitAcknowledgementLossReopensAtCommittedTip(t *testing.T) {
 	}
 }
 
+func TestSQLReceiptLookupsFailClosedAfterSQLiteCommitAcknowledgementLoss(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := types.SQLCommand{RequestID: "old-receipt", SQL: "CREATE TABLE old_receipt (id INTEGER)"}
+	oldValue, err := types.EncodeSQLBatch([]types.SQLCommand{old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, oldValue); err != nil {
+		t.Fatal(err)
+	}
+	var nonce [types.ReadBarrierNonceSize]byte
+	decisions := make([]quepaxa.DecidedValue, 0, 1023)
+	for slot := uint64(2); slot <= 1024; slot++ {
+		decisions = append(decisions, quepaxa.DecidedValue{Slot: quepaxa.Slot(slot), Value: types.EncodeReadBarrier(nonce)})
+	}
+	if err := m.ApplyBatch(ctx, decisions); err != nil {
+		t.Fatalf("advance to receipt expiry boundary: %v", err)
+	}
+	newCommand := types.SQLCommand{RequestID: "landed-receipt", SQL: "CREATE TABLE landed_receipt (id INTEGER)"}
+	newValue, err := types.EncodeSQLBatch([]types.SQLCommand{newCommand})
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := false
+	m.afterApplyCommitError = func() error {
+		injected = true
+		return errors.New("simulated SQLite acknowledgement loss")
+	}
+	if err := m.Apply(ctx, 1025, newValue); !errors.Is(err, ErrGraphCommitUnknown) || !injected {
+		t.Fatalf("Apply error=%v injected=%v, want unknown committed outcome", err, injected)
+	}
+	if m.Tip() != 1024 {
+		t.Fatalf("in-memory tip=%d, want stale pre-commit tip 1024", m.Tip())
+	}
+
+	if _, found, _, err := m.SQLRequestStatus(ctx, newCommand); !errors.Is(err, ErrGraphCommitUnknown) || found {
+		t.Fatalf("new receipt status found=%v err=%v, want explicit unknown outcome", found, err)
+	}
+	if _, found, err := m.MutationReceipt(ctx, types.MutationSQL, newCommand.RequestID); !errors.Is(err, ErrGraphCommitUnknown) || found {
+		t.Fatalf("new MutationReceipt found=%v err=%v, want explicit unknown outcome", found, err)
+	}
+	oldFingerprint, err := types.SQLFingerprint(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _, err := m.SQLRequestStatusFingerprint(ctx, old.RequestID, oldFingerprint); !errors.Is(err, ErrGraphCommitUnknown) || found {
+		t.Fatalf("old receipt status found=%v err=%v, want explicit unknown outcome", found, err)
+	}
+	if matches, err := m.SQLRequestMatches(ctx, newCommand); !errors.Is(err, ErrGraphCommitUnknown) || matches {
+		t.Fatalf("new request preflight matches=%v err=%v, want explicit unknown outcome", matches, err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1, 1024)
+	if err != nil {
+		t.Fatalf("reopen committed receipts: %v", err)
+	}
+	defer m.Close()
+	if receipt, found, _, err := m.SQLRequestStatus(ctx, newCommand); err != nil || !found || receipt.Slot != 1025 {
+		t.Fatalf("reopened new receipt=%+v found=%v err=%v", receipt, found, err)
+	}
+	if _, found, _, err := m.SQLRequestStatusFingerprint(ctx, old.RequestID, oldFingerprint); err != nil || found {
+		t.Fatalf("reopened expired old receipt found=%v err=%v, want expired", found, err)
+	}
+	if _, found, err := m.MutationReceipt(ctx, types.MutationSQL, newCommand.RequestID); err != nil || !found {
+		t.Fatalf("reopened new MutationReceipt found=%v err=%v", found, err)
+	}
+	if matches, err := m.SQLRequestMatches(ctx, newCommand); err != nil || !matches {
+		t.Fatalf("reopened new request preflight matches=%v err=%v", matches, err)
+	}
+}
+
 func TestEarlierCompletedGraphSlotCannotUnlockLaterPendingSlot(t *testing.T) {
 	ctx := context.Background()
 	m, err := Open(filepath.Join(t.TempDir(), "sqlite.db"), 1)

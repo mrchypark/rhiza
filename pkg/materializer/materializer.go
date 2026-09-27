@@ -601,7 +601,41 @@ func receiptQuery() string {
 	return `SELECT fingerprint, commit_slot, status, error_code, rows_affected, last_insert_id, applied, sql_result FROM _rhiza_idempotency WHERE kind = ? AND request_id = ?`
 }
 
+// sqlReceiptReadLocked checks the uncertainty state while m.mu is held.
+func (m *Materializer) sqlReceiptReadLocked() error {
+	if m.graph == nil {
+		return nil
+	}
+	m.graph.mu.RLock()
+	defer m.graph.mu.RUnlock()
+	if m.graph.commitUnknown {
+		return ErrGraphCommitUnknown
+	}
+	return nil
+}
+
 func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationKind, requestID string) (types.MutationReceipt, bool, error) {
+	if kind == types.MutationSQL {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		if err := m.sqlReceiptReadLocked(); err != nil {
+			return types.MutationReceipt{}, false, err
+		}
+		if len(m.readers) == 0 || m.readers[0] == nil {
+			return types.MutationReceipt{}, false, sql.ErrConnDone
+		}
+		record, err := scanReceipt(m.readers[0].QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+		if err == sql.ErrNoRows {
+			return types.MutationReceipt{}, false, nil
+		}
+		if err != nil {
+			return types.MutationReceipt{}, false, err
+		}
+		if m.tip > record.receipt.RetryThroughSlot {
+			return types.MutationReceipt{}, false, nil
+		}
+		return record.receipt, true, nil
+	}
 	reader, err := m.reader()
 	if err != nil {
 		return types.MutationReceipt{}, false, err
@@ -620,6 +654,27 @@ func (m *Materializer) MutationReceipt(ctx context.Context, kind types.MutationK
 }
 
 func (m *Materializer) requestMatches(ctx context.Context, kind types.MutationKind, requestID string, fingerprint [32]byte) (bool, bool, error) {
+	if kind == types.MutationSQL {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		if err := m.sqlReceiptReadLocked(); err != nil {
+			return false, false, err
+		}
+		if len(m.readers) == 0 || m.readers[0] == nil {
+			return false, false, sql.ErrConnDone
+		}
+		record, err := scanReceipt(m.readers[0].QueryRowContext(ctx, receiptQuery(), kind, requestID), m.idempotencyWindow)
+		if err == sql.ErrNoRows {
+			return true, false, nil
+		}
+		if err != nil {
+			return false, false, err
+		}
+		if m.tip > record.receipt.RetryThroughSlot {
+			return true, false, nil
+		}
+		return record.fingerprint == fingerprint, true, nil
+	}
 	reader, err := m.reader()
 	if err != nil {
 		return false, false, err
@@ -1999,10 +2054,13 @@ func (m *Materializer) SQLRequestStatus(ctx context.Context, command types.SQLCo
 // an idempotent SQL mutation.
 func (m *Materializer) SQLRequestResultFingerprint(ctx context.Context, requestID string, fingerprint [32]byte, wantRows bool) (types.MutationReceipt, types.SQLCommandResult, bool, bool, error) {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if err := m.sqlReceiptReadLocked(); err != nil {
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, false, err
+	}
 	record, cached := m.recentSQLReceipts[requestID]
 	tip := m.tip
 	mightContain := m.sqlReceipts.mightContain(requestID, tip)
-	m.mu.RUnlock()
 	if cached {
 		if tip > record.receipt.RetryThroughSlot {
 			return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
@@ -2014,18 +2072,17 @@ func (m *Materializer) SQLRequestResultFingerprint(ctx context.Context, requestI
 	if !mightContain {
 		return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 	}
-	reader, err := m.reader()
-	if err != nil {
-		return types.MutationReceipt{}, types.SQLCommandResult{}, false, false, err
+	if len(m.readers) == 0 || m.readers[0] == nil {
+		return types.MutationReceipt{}, types.SQLCommandResult{}, false, false, sql.ErrConnDone
 	}
-	record, err = scanReceipt(reader.QueryRowContext(ctx, receiptQuery(), types.MutationSQL, requestID), m.idempotencyWindow)
+	record, err := scanReceipt(m.readers[0].QueryRowContext(ctx, receiptQuery(), types.MutationSQL, requestID), m.idempotencyWindow)
 	if err == sql.ErrNoRows {
 		return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 	}
 	if err != nil {
 		return types.MutationReceipt{}, types.SQLCommandResult{}, false, false, err
 	}
-	if m.Tip() > record.receipt.RetryThroughSlot {
+	if tip > record.receipt.RetryThroughSlot {
 		return types.MutationReceipt{}, types.SQLCommandResult{}, false, true, nil
 	}
 	return record.receipt, record.sqlResult, true, record.fingerprint == fingerprint, nil
