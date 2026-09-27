@@ -361,6 +361,48 @@ func TestRecoveryPinReclaimsExpiredOwnerRecord(t *testing.T) {
 	}
 }
 
+func TestActiveRecoveryRootsTombstonesExpiredPinsOnce(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		lease       func() int64
+		wantUploads uint64
+		wantRoot    bool
+	}{
+		{name: "tombstone", lease: func() int64 { return 0 }},
+		{name: "newly_expired", lease: func() int64 { return time.Now().Add(-time.Second).UnixMilli() }, wantUploads: 1},
+		{name: "active", lease: func() int64 { return time.Now().Add(time.Minute).UnixMilli() }, wantRoot: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			bucket := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
+			manager := NewManager(bucket, "node", t.TempDir())
+			root := createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "stable")}, 7)
+			key := manager.recoveryPinKey("recovery")
+			record := recoveryPinRecord{
+				ConfigID: manager.configID, OwnerID: "recovery", Token: "token", Index: root.Index,
+				RootHash: hex.EncodeToString(root.RootHash[:]), Root: *root, LeaseUntilMS: test.lease(),
+			}
+			if err := manager.uploadRecoveryPin(ctx, key, record, objstore.WithIfNotExists()); err != nil {
+				t.Fatal(err)
+			}
+			before := bucket.uploads.Load()
+			for range 2 {
+				roots, err := manager.activeRecoveryRoots(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, ok := roots[root.RootHash]
+				if ok != test.wantRoot {
+					t.Fatalf("root protected=%v, want %v", ok, test.wantRoot)
+				}
+			}
+			if got := bucket.uploads.Load() - before; got != test.wantUploads {
+				t.Fatalf("recovery pin PUTs=%d, want %d", got, test.wantUploads)
+			}
+		})
+	}
+}
+
 func TestRecoveryPinGCDoesNotDeleteConcurrentRenewal(t *testing.T) {
 	ctx := context.Background()
 	bucket := &racingRecoveryPinBucket{Bucket: objstore.NewInMemBucket()}

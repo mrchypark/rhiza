@@ -203,9 +203,20 @@ class Chaos:
         self.writer.start()
 
     def verify_data(self, pod):
-        data = self.http(pod, "/sql/query", {"sql": "SELECT id FROM chaos_items ORDER BY id"})
+        expected = self.acks.copy()
+        data = self.http(pod, "/sql/query", {
+            "sql": "SELECT id FROM chaos_items ORDER BY id",
+            "consistency": "linearizable",
+        })
         found = {int(row[0]) for row in data["rows"]}
-        assert self.acks <= found, f"lost acknowledged rows: {self.acks - found}"
+        missing = sorted(expected - found)
+        self.event("data_verification", pod=pod, consistency="linearizable",
+                   expected_count=len(expected), found_count=len(found), missing=missing,
+                   applied_slot=data.get("applied_slot"), consensus_tip=data.get("consensus_tip"))
+        assert not missing, (
+            f"missing acknowledged rows: {missing}; "
+            f"applied_slot={data.get('applied_slot')} consensus_tip={data.get('consensus_tip')}"
+        )
         self.execute(pod, "chaos-seed", "INSERT INTO chaos_items VALUES (0, 'seed')")
         return len(found)
 
