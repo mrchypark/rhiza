@@ -20,7 +20,7 @@ bench_count=${RHIZA_BENCH_COUNT:-10}
 bench_time=${RHIZA_BENCH_TIME:-1s}
 bench_procs=${RHIZA_BENCH_PROCS:-2}
 network_optimization=${RHIZA_BENCH_NETWORK_OPTIMIZATION:-none}
-packages=(qlog quepaxa materializer network)
+packages=(qlog quepaxa recovery materializer network)
 network_benchmark='^Benchmark(ThreePeerSQLExecute|CertifiedThreePeerSQLExecute|ThreePeerSQLExecuteReturning)'
 case "$network_optimization" in
 	none) ;;
@@ -90,7 +90,10 @@ run_revision() {
 	for package in "${packages[@]}"; do
 		case "$package" in
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
-			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$') ;;
+			# The bounded API is new, so an older base has no baseline sample;
+			# Go treats a benchmark pattern with no match as a successful run.
+			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$') ;;
+			recovery) selected=('^BenchmarkArchiveMemoryPublication$') ;;
 			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$') ;;
 			network) selected=("$network_benchmark") ;;
 		esac

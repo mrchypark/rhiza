@@ -33,6 +33,17 @@ type blockingUploadBucket struct {
 	started chan struct{}
 }
 
+type failArchiveHeadBucket struct {
+	objstore.Bucket
+}
+
+func (b *failArchiveHeadBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "archive/head.bin") {
+		return errors.New("injected archive head upload failure")
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
 type blockingGetBucket struct {
 	objstore.Bucket
 	block   atomic.Bool
@@ -841,6 +852,32 @@ func (s archiveBenchmarkSource) DecisionsFrom(from quepaxa.Slot, limit int) ([]q
 	return s.decisions[start:end], quepaxa.Slot(len(s.decisions)), nil
 }
 
+func (s archiveBenchmarkSource) DecisionsFromBounded(from quepaxa.Slot, itemLimit, payloadByteLimit int) ([]quepaxa.DecidedValue, quepaxa.Slot, error) {
+	if itemLimit <= 0 || payloadByteLimit <= 0 || from == 0 || uint64(from) > uint64(len(s.decisions))+1 {
+		return nil, quepaxa.Slot(len(s.decisions)), fmt.Errorf("decision limits must be positive")
+	}
+	start := int(from - 1)
+	page := make([]quepaxa.DecidedValue, 0, min(itemLimit, max(0, len(s.decisions)-start)))
+	used := 0
+	for _, decision := range s.decisions[start:] {
+		remaining := payloadByteLimit - used
+		if len(decision.Value) > remaining || len(decision.Certificate) > remaining-len(decision.Value) {
+			if len(page) == 0 {
+				return nil, quepaxa.Slot(len(s.decisions)), fmt.Errorf("decision %d exceeds payload budget", decision.Slot)
+			}
+			break
+		}
+		decision.Value = append([]byte(nil), decision.Value...)
+		decision.Certificate = append([]byte(nil), decision.Certificate...)
+		page = append(page, decision)
+		used += len(decision.Value) + len(decision.Certificate)
+		if len(page) == itemLimit || decision.Slot == quepaxa.Slot(len(s.decisions)) {
+			break
+		}
+	}
+	return page, quepaxa.Slot(len(s.decisions)), nil
+}
+
 func (s archiveBenchmarkSource) PrefixHash(slot quepaxa.Slot) ([32]byte, bool) {
 	if int(slot) >= len(s.prefixes) {
 		return [32]byte{}, false
@@ -849,6 +886,144 @@ func (s archiveBenchmarkSource) PrefixHash(slot quepaxa.Slot) ([32]byte, bool) {
 }
 
 func (s archiveBenchmarkSource) Tip() quepaxa.Slot { return quepaxa.Slot(len(s.decisions)) }
+
+func TestBuildExtentRespectsEncodedPayloadAndCountBounds(t *testing.T) {
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	t.Run("exact byte budget and later oversize is a prefix boundary", func(t *testing.T) {
+		value := []byte{1}
+		certificate := bytes.Repeat([]byte{2}, maxExtentPayload-len(value))
+		decisions := []quepaxa.DecidedValue{
+			{Slot: 1, Hash: sha256.Sum256(value), Value: value, Certificate: certificate},
+			{Slot: 2, Hash: sha256.Sum256([]byte{3}), Value: []byte{3}, Certificate: []byte{4}},
+		}
+		prefixes := make([][32]byte, len(decisions)+1)
+		for i, decision := range decisions {
+			prefixes[i+1] = quepaxa.AdvancePrefixHash(prefixes[i], decision.Slot, decision.Hash)
+		}
+		source := archiveBenchmarkSource{decisions: decisions, prefixes: prefixes}
+		extent, data, tip, err := manager.buildExtent(source, 1, 2, [32]byte{}, 0)
+		if err != nil || tip != 2 || len(data) != maxExtentSize || len(extent.Decisions) != 1 || extent.End != 1 || extent.EndPrefix != prefixes[1] {
+			t.Fatalf("extent=%+v bytes=%d tip=%d err=%v, want exact-size slot 1 prefix", extent, len(data), tip, err)
+		}
+		if _, err := encodeExtent(extent); err != nil {
+			t.Fatalf("exact-budget extent failed encoding: %v", err)
+		}
+	})
+	t.Run("first decision over budget errors", func(t *testing.T) {
+		value := []byte{1}
+		decision := quepaxa.DecidedValue{Slot: 1, Hash: sha256.Sum256(value), Value: value, Certificate: bytes.Repeat([]byte{2}, maxExtentPayload)}
+		prefixes := [][32]byte{{}, quepaxa.AdvancePrefixHash([32]byte{}, 1, decision.Hash)}
+		source := archiveBenchmarkSource{decisions: []quepaxa.DecidedValue{decision}, prefixes: prefixes}
+		if _, _, _, err := manager.buildExtent(source, 1, 1, [32]byte{}, 0); err == nil || !strings.Contains(err.Error(), "decision 1") {
+			t.Fatalf("first oversize error=%v, want slot 1 error", err)
+		}
+	})
+	t.Run("per-decision framing selects and clears the rejected tail", func(t *testing.T) {
+		firstValue := []byte{1}
+		first := quepaxa.DecidedValue{Slot: 1, Hash: sha256.Sum256(firstValue), Value: firstValue, Certificate: bytes.Repeat([]byte{2}, maxExtentPayload-9)}
+		secondValue := []byte{3}
+		second := quepaxa.DecidedValue{Slot: 2, Hash: sha256.Sum256(secondValue), Value: secondValue, Certificate: []byte{4}}
+		prefixes := [][32]byte{
+			{},
+			quepaxa.AdvancePrefixHash([32]byte{}, first.Slot, first.Hash),
+			quepaxa.AdvancePrefixHash(quepaxa.AdvancePrefixHash([32]byte{}, first.Slot, first.Hash), second.Slot, second.Hash),
+		}
+		source := archiveBenchmarkSource{decisions: []quepaxa.DecidedValue{first, second}, prefixes: prefixes}
+		extent, data, _, err := manager.buildExtent(source, 1, 2, [32]byte{}, 0)
+		if err != nil || len(data) != maxExtentSize-8 || len(extent.Decisions) != 1 || cap(extent.Decisions) != 1 || extent.End != 1 || extent.EndPrefix != prefixes[1] {
+			t.Fatalf("extent=%+v bytes=%d cap=%d err=%v, want one exact-prefix item with cleared tail", extent, len(data), cap(extent.Decisions), err)
+		}
+	})
+	if _, _, _, err := manager.buildExtent(archiveBenchmarkSource{}, 0, quepaxa.Slot(^uint64(0)), [32]byte{}, 0); err == nil {
+		t.Fatal("zero start with maximum range unexpectedly succeeded")
+	}
+	t.Run("count and through bounds are exact prefixes", func(t *testing.T) {
+		decisions := make([]quepaxa.DecidedValue, 1025)
+		prefixes := make([][32]byte, len(decisions)+1)
+		for i := range decisions {
+			slot := quepaxa.Slot(i + 1)
+			value := []byte{byte(i)}
+			hash := sha256.Sum256(value)
+			decisions[i] = quepaxa.DecidedValue{Slot: slot, Hash: hash, Value: value, Certificate: []byte{1}}
+			prefixes[i+1] = quepaxa.AdvancePrefixHash(prefixes[i], slot, hash)
+		}
+		source := archiveBenchmarkSource{decisions: decisions, prefixes: prefixes}
+		first, _, _, err := manager.buildExtent(source, 1, 1025, [32]byte{}, 0)
+		if err != nil || len(first.Decisions) != 1024 || first.Start != 1 || first.End != 1024 || first.EndPrefix != prefixes[1024] {
+			t.Fatalf("first extent=%d decisions %d-%d err=%v", len(first.Decisions), first.Start, first.End, err)
+		}
+		tail, _, _, err := manager.buildExtent(source, 1025, 1025, first.hash, 1)
+		if err != nil || len(tail.Decisions) != 1 || tail.Start != 1025 || tail.End != 1025 || tail.StartPrefix != prefixes[1024] || tail.EndPrefix != prefixes[1025] {
+			t.Fatalf("tail extent=%d decisions %d-%d err=%v", len(tail.Decisions), tail.Start, tail.End, err)
+		}
+		throughBounded, _, _, err := manager.buildExtent(source, 1, 1, [32]byte{}, 0)
+		if err != nil || len(throughBounded.Decisions) != 1 || throughBounded.End != 1 || throughBounded.EndPrefix != prefixes[1] {
+			t.Fatalf("through-bounded extent=%d end=%d err=%v", len(throughBounded.Decisions), throughBounded.End, err)
+		}
+	})
+}
+
+func TestArchiveSyncStoresMetadataRefsAndCachesOnlyStableTail(t *testing.T) {
+	ctx := context.Background()
+	decisions := make([]quepaxa.DecidedValue, 2049)
+	prefixes := make([][32]byte, len(decisions)+1)
+	for i := range decisions {
+		slot := quepaxa.Slot(i + 1)
+		value := []byte{byte(i)}
+		hash := sha256.Sum256(value)
+		decisions[i] = quepaxa.DecidedValue{Slot: slot, Hash: hash, Value: value, Certificate: []byte{1}}
+		prefixes[i+1] = quepaxa.AdvancePrefixHash(prefixes[i], slot, hash)
+	}
+	source := archiveBenchmarkSource{decisions: decisions, prefixes: prefixes}
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	defer manager.Close()
+	if err := manager.syncNow(ctx, source, source.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.extents) != 3 {
+		t.Fatalf("published extents=%d, want 3", len(manager.extents))
+	}
+	start := quepaxa.Slot(1)
+	var previousHash [32]byte
+	var previousObject uint64
+	for _, ref := range manager.extents {
+		if len(ref.Decisions) != 0 || len(ref.prefixes) != 0 {
+			t.Fatalf("retained archive reference contains payload: decisions=%d prefixes=%d", len(ref.Decisions), len(ref.prefixes))
+		}
+		if ref.ConfigID != 1 || ref.object != 1 || ref.Start != start || ref.EndPrefix != prefixes[ref.End] || ref.StartPrefix != prefixes[start-1] || ref.PreviousHash != previousHash || ref.PreviousObject != previousObject {
+			t.Fatalf("metadata ref lost chain fields: %+v", ref)
+		}
+		start, previousHash, previousObject = ref.End+1, ref.hash, ref.object
+	}
+	if len(manager.cache) != 2 {
+		t.Fatalf("cached extents=%d, want only two-tail cache", len(manager.cache))
+	}
+	for i, ref := range manager.extents {
+		_, cached := manager.cache[extentObject{hash: ref.hash, id: ref.object}]
+		if cached != (i >= 1) {
+			t.Fatalf("extent %d cached=%v, want %v", i, cached, i >= 1)
+		}
+	}
+}
+
+func TestArchiveSyncUploadFailureDoesNotCacheCandidate(t *testing.T) {
+	ctx := context.Background()
+	value := []byte("decision")
+	hash := sha256.Sum256(value)
+	source := archiveBenchmarkSource{
+		decisions: []quepaxa.DecidedValue{{Slot: 1, Hash: hash, Value: value, Certificate: []byte("certificate")}},
+		prefixes:  [][32]byte{{}, quepaxa.AdvancePrefixHash([32]byte{}, 1, hash)},
+	}
+	bucket := &failArchiveHeadBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.syncNow(ctx, source, 1); err == nil {
+		t.Fatal("sync unexpectedly succeeded after injected head upload failure")
+	}
+	if len(manager.cache) != 0 || len(manager.extents) != 0 || manager.Tip() != 0 {
+		t.Fatalf("failed candidate was adopted: cache=%d refs=%d tip=%d", len(manager.cache), len(manager.extents), manager.Tip())
+	}
+}
 
 func BenchmarkArchiveBeforeAckPublishExtent(b *testing.B) {
 	value := bytes.Repeat([]byte("v"), 4<<10)
