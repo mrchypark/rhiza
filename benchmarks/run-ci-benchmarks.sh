@@ -90,13 +90,13 @@ run_revision() {
 	for package in "${packages[@]}"; do
 		case "$package" in
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
-			# The bounded API is new, so an older base has no baseline sample;
-			# Go treats a benchmark pattern with no match as a successful run.
 			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$') ;;
-			recovery) selected=('^BenchmarkArchiveMemoryPublication$') ;;
+			recovery) selected=('^BenchmarkArchiveMemoryPublication$' '^BenchmarkAuthenticatedMembershipCheckpointProof$' '^BenchmarkArchiveHeadEvidenceStages$') ;;
 			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$') ;;
 			network) selected=("$network_benchmark") ;;
 		esac
+		# Go treats benchmark patterns with no match as a successful run, so
+		# candidate-only benchmarks remain compatible with older baselines.
 		for benchmark in "${selected[@]}"; do
 			sample_time=$bench_time
 			# Snapshot setup is excluded from timing; bound iterations to avoid

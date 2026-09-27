@@ -759,7 +759,7 @@ func readObjectStoreTip(dir, cluster, _ string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(data) < 80 || string(data[:8]) != "RHZAHEAD" {
+	if len(data) < 80 || string(data[:8]) != "RHZAHD2!" {
 		return 0, fmt.Errorf("invalid archive head")
 	}
 	return binary.BigEndian.Uint64(data[72:80]), nil

@@ -528,7 +528,7 @@ func copyArchiveObject(ctx context.Context, bucket objstore.Bucket, source, targ
 }
 
 func writeForkArchiveHead(ctx context.Context, bucket objstore.Bucket, target string, data []byte) error {
-	if len(data) > maxHeadSize {
+	if len(data) > maxArchiveHeadSize {
 		return fmt.Errorf("fork archive head is too large")
 	}
 	err := bucket.Upload(ctx, target, bytes.NewReader(data), objstore.WithIfNotExists())
@@ -539,9 +539,9 @@ func writeForkArchiveHead(ctx context.Context, bucket objstore.Bucket, target st
 	if err != nil {
 		return err
 	}
-	got, readErr := io.ReadAll(io.LimitReader(r, maxHeadSize+1))
+	got, readErr := io.ReadAll(io.LimitReader(r, maxArchiveHeadSize+1))
 	closeErr := r.Close()
-	if readErr != nil || closeErr != nil || len(got) > maxHeadSize || !bytes.Equal(got, data) {
+	if readErr != nil || closeErr != nil || len(got) > maxArchiveHeadSize || !bytes.Equal(got, data) {
 		return fmt.Errorf("fork archive head integrity mismatch")
 	}
 	return nil

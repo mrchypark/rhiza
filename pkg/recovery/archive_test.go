@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"math/rand"
 	"strings"
@@ -629,6 +631,129 @@ func TestArchiveCodecRejectsJSONAndTrailingData(t *testing.T) {
 	}
 	if _, err := decodeHead(append(data, 0)); err == nil {
 		t.Fatal("accepted trailing archive head data")
+	}
+}
+
+func TestArchivePayloadAndHeadBoundaries(t *testing.T) {
+	value, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{
+		ConfigID: 1, Index: 2, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: [32]byte{3}, NextLeaderOrder: []quepaxa.NodeID{"n1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := quepaxa.DecidedValue{Slot: 3, Hash: sha256.Sum256(value), Value: value, Certificate: make([]byte, maxExtentPayload-len(value))}
+	seal, _, err := quepaxa.DecodeCheckpointSeal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := archiveHead{
+		ConfigID: 1, Generation: 1, Base: seal.Index, BasePrefix: seal.PrefixHash,
+		BaseSeal: &seal, BaseDecision: &decision, Tip: seal.Index,
+		LineageAnchor: &archiveAnchorRef{Hash: [32]byte{4}},
+	}
+	data, err := encodeHead(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != maxArchiveHeadSize {
+		t.Fatalf("head size=%d, want exact max %d", len(data), maxArchiveHeadSize)
+	}
+	got, err := decodeHead(data)
+	if err != nil || !archiveHeadsEqual(got, head) {
+		t.Fatalf("decode max head: equal=%v err=%v", archiveHeadsEqual(got, head), err)
+	}
+	if err := validateArchivePayload(value, decision.Certificate[:len(decision.Certificate)-1]); err != nil {
+		t.Fatalf("payload one byte under budget: %v", err)
+	}
+	if err := validateArchivePayload(value, append(append([]byte(nil), decision.Certificate...), 0)); err == nil {
+		t.Fatal("accepted payload one byte over budget")
+	}
+	if _, err := encodeBaseDecision(quepaxa.DecidedValue{Value: make([]byte, quepaxa.MaxReplicatedValueBytes+1), Certificate: []byte{1}}); err == nil {
+		t.Fatal("accepted value over replicated-value limit")
+	}
+
+	extent := Extent{
+		ConfigID: 1, Start: 1, End: 1,
+		Decisions: []quepaxa.DecidedValue{{Slot: 1, Value: []byte("x"), Hash: sha256.Sum256([]byte("x")), Certificate: make([]byte, maxExtentPayload-1)}},
+	}
+	extent.EndPrefix = quepaxa.AdvancePrefixHash([32]byte{}, 1, extent.Decisions[0].Hash)
+	extentData, err := encodeExtent(extent)
+	if err != nil || len(extentData) != maxExtentSize {
+		t.Fatalf("exact extent boundary size=%d err=%v", len(extentData), err)
+	}
+	extent.Decisions[0].Certificate = append(extent.Decisions[0].Certificate, 0)
+	if _, err := encodeExtent(extent); err == nil {
+		t.Fatal("accepted extent payload one byte over budget")
+	}
+}
+
+func TestArchiveHeadV2StrictnessAndProofIdentity(t *testing.T) {
+	value, err := quepaxa.EncodeCheckpointSeal(quepaxa.CheckpointSeal{
+		ConfigID: 1, Index: 1, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: [32]byte{3}, NextLeaderOrder: []quepaxa.NodeID{"n1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal, _, err := quepaxa.DecodeCheckpointSeal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := quepaxa.DecidedValue{Slot: 2, Hash: sha256.Sum256(value), Value: value, Certificate: []byte("proof-a")}
+	head := archiveHead{ConfigID: 1, Generation: 1, Base: 1, BasePrefix: seal.PrefixHash, BaseSeal: &seal, BaseDecision: &decision, Tip: 1}
+	data, err := encodeHead(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := decodeHead(data); err != nil || !archiveHeadsEqual(got, head) {
+		t.Fatalf("round trip: equal=%v err=%v", archiveHeadsEqual(got, head), err)
+	}
+	oldVersion := append([]byte(nil), data...)
+	copy(oldVersion[:8], []byte("RHZAHEAD"))
+	if _, err := decodeHead(oldVersion); err == nil {
+		t.Fatal("accepted old archive-head magic")
+	}
+	truncated := append([]byte(nil), data[:len(data)-1]...)
+	if _, err := decodeHead(truncated); err == nil {
+		t.Fatal("accepted truncated archive head")
+	}
+	badFlags := append([]byte(nil), data...)
+	binary.BigEndian.PutUint32(badFlags[12:16], binary.BigEndian.Uint32(badFlags[12:16])|1<<31)
+	binary.BigEndian.PutUint32(badFlags[len(badFlags)-archiveCRCSize:], crc32.Checksum(badFlags[:len(badFlags)-archiveCRCSize], archiveCRCTable))
+	if _, err := decodeHead(badFlags); err == nil {
+		t.Fatal("accepted reserved archive-head flag")
+	}
+	badCRC := append([]byte(nil), data...)
+	badCRC[len(badCRC)-1] ^= 1
+	if _, err := decodeHead(badCRC); err == nil {
+		t.Fatal("accepted archive head with invalid CRC")
+	}
+	otherProof := head
+	otherDecision := decision
+	otherDecision.Certificate = []byte("proof-b")
+	otherProof.BaseDecision = &otherDecision
+	if archiveHeadsEqual(head, otherProof) || archiveBaseEqual(head, otherProof) {
+		t.Fatal("treated different base proof bytes as equal")
+	}
+	otherBase := head
+	otherBase.Generation++
+	otherBase.Tip++
+	otherBase.TailHash, otherBase.TailObject = [32]byte{5}, 1
+	if !archiveBaseEqual(head, otherBase) {
+		t.Fatal("base comparison included mutable tip metadata")
+	}
+}
+
+func TestArchiveTrimRejectsOversizePayloadWithoutAdvancing(t *testing.T) {
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	defer manager.Close()
+	before := manager.head
+	decision := quepaxa.DecidedValue{Value: []byte("x"), Certificate: make([]byte, maxExtentPayload)}
+	err := manager.trimThrough(context.Background(), quepaxa.SealedCheckpoint{}, decision)
+	if err == nil {
+		t.Fatal("accepted oversized trim decision")
+	}
+	if !archiveHeadsEqual(before, manager.head) || manager.tip != 0 || len(manager.extents) != 0 {
+		t.Fatal("oversized trim advanced archive state")
 	}
 }
 
