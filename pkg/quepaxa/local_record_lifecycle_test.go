@@ -94,49 +94,38 @@ func TestLocalProposeAndRecoveryCancellationPersistBeforeReturning(t *testing.T)
 		t.Run(mode, func(t *testing.T) {
 			core, wal := localReserveCore(t, t.TempDir(), "local")
 			defer wal.Close()
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			result := make(chan error, 1)
-			go func() {
-				if mode == "propose" {
-					_, _, err := core.Propose(ctx, []byte("cancelled propose"))
-					result <- err
-					return
-				}
-				result <- core.RecoverThrough(ctx, 1)
-			}()
-
-			waitForLocalReceipt(t, core, 1)
-			cancel()
-			select {
-			case err := <-result:
-				if !errors.Is(err, context.Canceled) {
-					t.Fatalf("operation error=%v, want context cancellation", err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("operation did not return after cancellation")
-			}
-			core.mu.RLock()
-			state := core.recorders[1]
-			core.mu.RUnlock()
-			if state.Step < 4 {
-				t.Fatalf("record state at return=%+v, want persisted partial phase", state)
-			}
+			assertRecordBarrierWaitsForOuter(t, core, mode)
 			entries := localReserveEntries(t, wal)
 			if got := localReserveReceiptCount(entries); got == 0 {
-				t.Fatal("operation returned before its local receipt was appended")
+				t.Fatal("operation returned without appending its local receipt")
 			}
 		})
 	}
 }
 
-func TestLocalOuterCallWaitsForInFlightRecordOnCancellation(t *testing.T) {
-	for _, mode := range []string{"propose", "recovery"} {
-		t.Run(mode, func(t *testing.T) {
-			core, wal := localReserveCore(t, t.TempDir(), "local")
-			defer wal.Close()
-			assertRecordBarrierWaitsForOuter(t, core, mode)
-		})
+func TestSuccessfulProposeRetiresLiveRecorderAfterPersistingReceipt(t *testing.T) {
+	core, wal := localReserveCore(t, t.TempDir(), "local")
+	defer wal.Close()
+	if slot, _, err := core.Propose(context.Background(), []byte("completed proposal")); err != nil {
+		t.Fatalf("Propose: %v", err)
+	} else if slot != 1 {
+		t.Fatalf("Propose slot=%d, want 1", slot)
+	}
+
+	core.mu.RLock()
+	state, recorderLive := core.recorders[1]
+	_, decided := core.decided[1]
+	tip := core.tip
+	core.mu.RUnlock()
+	if recorderLive || state.Step >= 4 {
+		t.Fatalf("live recorder=%v state=%+v, want retired entry after decision", recorderLive, state)
+	}
+	if !decided || tip != 1 {
+		t.Fatalf("decision present=%v tip=%d, want decided slot 1", decided, tip)
+	}
+	entries := localReserveEntries(t, wal)
+	if got := localReserveReceiptCount(entries); got != 1 {
+		t.Fatalf("persisted receipt entries=%d, want 1 despite live-map retirement", got)
 	}
 }
 
@@ -174,7 +163,7 @@ func assertRecordBarrierWaitsForOuter(t *testing.T, core *Core, mode string) {
 		result <- core.RecoverThrough(ctx, 1)
 	}()
 
-	awaitRecordBarrier(t, started)
+	awaitRecordBarrier(t, started, result)
 	cancel()
 	select {
 	case err := <-result:
@@ -211,7 +200,7 @@ func assertRecordBarrierReturnsOnOuterCancellation(t *testing.T, core *Core) {
 		result <- err
 	}()
 
-	awaitRecordBarrier(t, started)
+	awaitRecordBarrier(t, started, result)
 	cancel()
 	select {
 	case err := <-result:
@@ -237,12 +226,14 @@ func makeRecordBarrier(core *Core) (started, release chan struct{}) {
 	return started, release
 }
 
-func awaitRecordBarrier(t *testing.T, started <-chan struct{}) {
+func awaitRecordBarrier(t *testing.T, started <-chan struct{}, result <-chan error) {
 	t.Helper()
 	select {
 	case <-started:
+	case err := <-result:
+		t.Fatalf("operation returned before reaching Record barrier: %v", err)
 	case <-time.After(2 * time.Second):
-		t.Fatal("Record did not reach the held pre-append boundary")
+		t.Fatal("operation neither returned nor reached the held Record boundary")
 	}
 }
 
