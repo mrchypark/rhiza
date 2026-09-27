@@ -346,7 +346,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		return &peerfb.ResponseT{Summary: summaryToWire(summary)}, nil
 	case peerfb.OperationLearned:
-		if !s.server.ready() {
+		if !s.server.Ready() {
 			return nil, ErrNotReady
 		}
 		decision, err := decisionFromWire(request.Decision)
@@ -418,7 +418,7 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		if !s.server.core.CanParticipateReadIndex() {
 			return nil, quepaxa.ErrQuorumUnavailable
 		}
-		if !s.server.ready() {
+		if !s.server.Ready() {
 			return nil, ErrNotReady
 		}
 		return &peerfb.ResponseT{ClusterId: string(s.server.cluster), ProposerId: string(s.server.core.NodeID()), ConfigId: uint64(s.server.core.ConfigID()), Tip: uint64(s.server.core.Tip())}, nil

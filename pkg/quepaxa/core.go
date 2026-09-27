@@ -163,6 +163,10 @@ func (c *Core) IsVoter() bool {
 	return c.voterForClusterLocked(c.clusterForSlotLocked(c.tip + 1))
 }
 
+// LocalMode reports whether this Core was explicitly configured for standalone
+// local execution. Singleton cluster membership alone does not imply LocalMode.
+func (c *Core) LocalMode() bool { return c.localMode }
+
 func (c *Core) voterForClusterLocked(cluster Cluster) bool {
 	if c.observer {
 		return false

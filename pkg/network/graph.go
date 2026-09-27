@@ -81,7 +81,7 @@ func (s *Server) handleGraphExecute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (GraphExecuteResponse, error) {
-	if !s.writable || !s.ready() {
+	if !s.writable || !s.Ready() {
 		return GraphExecuteResponse{}, ErrNotReady
 	}
 	if err := materializer.ValidateGraphCommandAdmission(command); err != nil {
