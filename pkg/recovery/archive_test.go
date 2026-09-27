@@ -210,6 +210,85 @@ func TestSharedArchiveRoundTripUsesBoundedExtents(t *testing.T) {
 	}
 }
 
+func TestCompactExtentsFlushesAtCountAndByteLimits(t *testing.T) {
+	for _, test := range []struct {
+		count, valueSize, wantExtents int
+	}{{1023, 1, 1}, {1024, 1, 1}, {1025, 1, 2}, {2048, 1, 2}, {1024, 8 << 10, 2}} {
+		name := fmt.Sprintf("count_%d_value_%d", test.count, test.valueSize)
+		t.Run(name, func(t *testing.T) {
+			assertCompactedDecisions(t, test.count, test.valueSize, test.wantExtents)
+		})
+	}
+}
+
+func assertCompactedDecisions(t *testing.T, count, valueSize, wantExtents int) {
+	t.Helper()
+	manager := NewManager(objstore.NewInMemBucket(), "compact-test", 1)
+	defer manager.Close()
+	refs := make([]Extent, 0, (count+maxExtentItems-1)/maxExtentItems)
+	decisions := make([]quepaxa.DecidedValue, 0, count)
+	var prefix [32]byte
+	for start := 0; start < count; {
+		end := min(start+maxExtentItems/2, count)
+		extent := Extent{ConfigID: 1, Start: quepaxa.Slot(start + 1), StartPrefix: prefix}
+		for i := start; i < end; i++ {
+			value := bytes.Repeat([]byte{byte(i%251 + 1)}, valueSize)
+			decision := quepaxa.DecidedValue{Slot: quepaxa.Slot(i + 1), Value: value, Hash: sha256.Sum256(value), Certificate: []byte{byte(i%251 + 1)}}
+			extent.Decisions = append(extent.Decisions, decision)
+			decisions = append(decisions, decision)
+			prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
+		}
+		extent.End, extent.EndPrefix = quepaxa.Slot(end), prefix
+		extent.hash, extent.object = sha256.Sum256([]byte(fmt.Sprint(start))), uint64(len(refs)+1)
+		ref := extent
+		ref.Decisions = nil
+		refs = append(refs, ref)
+		manager.cache[extentObject{hash: extent.hash, id: extent.object}] = extent
+		start = end
+	}
+	compacted, err := manager.compactExtents(context.Background(), refs, [32]byte{})
+	if err != nil {
+		t.Fatalf("compact %d decisions: %v", count, err)
+	}
+	if len(compacted) != wantExtents {
+		t.Fatalf("compacted extents=%d, want %d", len(compacted), wantExtents)
+	}
+	var got []quepaxa.DecidedValue
+	var lastPrefix [32]byte
+	var nextSlot quepaxa.Slot = 1
+	for _, extent := range compacted {
+		if len(extent.Decisions) > maxExtentItems {
+			t.Fatalf("extent has %d decisions, limit %d", len(extent.Decisions), maxExtentItems)
+		}
+		encoded, err := encodeExtent(extent)
+		if err != nil || len(encoded) > maxExtentSize {
+			t.Fatalf("extent %d-%d encoded bytes=%d err=%v", extent.Start, extent.End, len(encoded), err)
+		}
+		if extent.StartPrefix != lastPrefix {
+			t.Fatalf("extent starts at discontinuous prefix for slot %d", extent.Start)
+		}
+		if extent.Start != nextSlot || extent.End != extent.Start+quepaxa.Slot(len(extent.Decisions))-1 {
+			t.Fatalf("extent has discontinuous slot range %d-%d", extent.Start, extent.End)
+		}
+		for _, decision := range extent.Decisions {
+			got = append(got, decision)
+			lastPrefix = quepaxa.AdvancePrefixHash(lastPrefix, decision.Slot, decision.Hash)
+		}
+		if extent.EndPrefix != lastPrefix {
+			t.Fatalf("extent ending at slot %d (%d decisions) has wrong prefix: got %x want %x", extent.End, len(extent.Decisions), extent.EndPrefix, lastPrefix)
+		}
+		nextSlot = extent.End + 1
+	}
+	if len(got) != len(decisions) {
+		t.Fatalf("compacted decisions=%d, want %d", len(got), len(decisions))
+	}
+	for i := range decisions {
+		if got[i].Slot != decisions[i].Slot || got[i].Hash != decisions[i].Hash || !bytes.Equal(got[i].Value, decisions[i].Value) || !bytes.Equal(got[i].Certificate, decisions[i].Certificate) {
+			t.Fatalf("decision %d or certificate changed", i+1)
+		}
+	}
+}
+
 func TestRecoverySnapshotPinsUncompactedArchiveHead(t *testing.T) {
 	ctx := context.Background()
 	wal, err := qlog.Open(t.TempDir())

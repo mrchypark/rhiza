@@ -1530,6 +1530,10 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 		}
 		for _, decision := range extent.Decisions {
 			encodedSize := archiveDecisionSize(decision)
+			if len(current.Decisions) == maxExtentItems {
+				flush()
+				current, encodedDecisions = Extent{}, 0
+			}
 			candidate := current
 			if len(candidate.Decisions) == 0 {
 				candidate = Extent{ConfigID: m.configID, Start: decision.Slot, StartPrefix: prefix}
@@ -1540,7 +1544,7 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 			if err != nil {
 				return nil, err
 			}
-			if len(current.Decisions) == maxExtentItems || len(current.Decisions) != 0 && nextSize > maxExtentSize {
+			if len(current.Decisions) != 0 && nextSize > maxExtentSize {
 				flush()
 				current, encodedDecisions = Extent{}, 0
 			}
