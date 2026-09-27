@@ -53,6 +53,7 @@ type Core struct {
 	transport            Transport
 	observer             bool
 	learner              bool
+	localMode            bool
 	walIdentity          string
 	reconfigEnabled      bool
 	reconfigWAL          bool
@@ -66,6 +67,7 @@ type Core struct {
 	reconfiguration      *reconfigurationState
 	reconfigurationMu    sync.Mutex
 	priority             func() (Priority, error)
+	recordBeforeAppend   func()
 
 	slotMu              sync.Mutex
 	nextSlot            Slot
@@ -1071,6 +1073,20 @@ func maxPrior(summaries []Summary) *Proposal {
 }
 
 func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordRequest) ([]Summary, error) {
+	if c.localMode {
+		if len(requests) != 1 {
+			return nil, ErrQuorumUnavailable
+		}
+		request, ok := requests[c.nodeID]
+		if !ok {
+			return nil, ErrQuorumUnavailable
+		}
+		summary, err := c.Record(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrQuorumUnavailable, err)
+		}
+		return []Summary{summary}, nil
+	}
 	type result struct {
 		summary Summary
 		err     error
@@ -1218,6 +1234,9 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 	lock := &c.recordLocks[uint64(request.Slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	defer lock.Unlock()
+	if c.recordBeforeAppend != nil {
+		c.recordBeforeAppend()
+	}
 	c.mu.Lock()
 	if err := c.compactedErrorLocked(request.Slot); err != nil {
 		c.mu.Unlock()

@@ -360,7 +360,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		makeCore = quepaxa.NewLearner
 	}
 	core, err := makeCore(quepaxa.Config{
-		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport,
+		NodeID: n.config.NodeID, Cluster: *cluster, WAL: wal, Transport: coreTransport, LocalMode: n.config.Local,
 		EnableReconfiguration:    n.config.EnableReconfiguration,
 		ReconfigurationAdmission: n.verifyMembershipAdmission,
 	})

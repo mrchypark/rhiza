@@ -16,6 +16,9 @@ var ErrInvalidConfig = errors.New("invalid QuePaxa config")
 type Config struct {
 	NodeID  NodeID
 	Cluster Cluster
+	// LocalMode marks the explicitly embedded, single-node execution path.
+	// It must not be inferred from singleton membership in a normal cluster.
+	LocalMode bool
 	// WAL must be open for the Core's lifetime; the caller retains ownership.
 	WAL       *qlog.WAL
 	Transport Transport
@@ -53,6 +56,9 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	if len(config.Cluster.Members) == 0 {
 		return nil, fmt.Errorf("%w: at least one member is required", ErrInvalidConfig)
 	}
+	if config.LocalMode && (observer || learner || len(config.Cluster.Members) != 1 || config.Cluster.Members[0].ID != config.NodeID || config.Transport != nil || config.EnableReconfiguration) {
+		return nil, fmt.Errorf("%w: local mode requires one matching voter without transport or reconfiguration", ErrInvalidConfig)
+	}
 	seen := make(map[NodeID]struct{}, len(config.Cluster.Members))
 	local := false
 	var localMember Member
@@ -84,6 +90,7 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	cluster := config.Cluster
 	cluster.Members = append([]Member(nil), config.Cluster.Members...)
 	core := newCore(config.NodeID, &cluster, config.WAL, config.Transport)
+	core.localMode = config.LocalMode
 	core.observer = observer
 	core.learner = learner
 	if learner {
