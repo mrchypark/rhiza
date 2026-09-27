@@ -1239,6 +1239,9 @@ func (m *Manager) activeRecoveryRoots(ctx context.Context) (map[[32]byte]Checkpo
 			}
 			return err
 		}
+		if record.LeaseUntilMS == 0 {
+			return nil
+		}
 		if record.LeaseUntilMS <= now {
 			record.LeaseUntilMS = 0
 			if err := m.uploadRecoveryPin(ctx, key, *record, objstore.WithIfMatch(record.version)); err != nil {
