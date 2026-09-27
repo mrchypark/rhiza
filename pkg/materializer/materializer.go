@@ -36,6 +36,7 @@ const (
 	MaxSQLBytes             = 256 << 10
 	MaxSQLStatements        = 64
 	MaxSQLArgs              = 999
+	MaxSQLResultColumns     = 2000
 	MaxReturningRows        = 10_000
 	MaxResultBytes          = 16 << 20
 	MaxMutationResultBytes  = 1 << 20
@@ -272,6 +273,11 @@ func openSQLite(dsn string, writer bool) (*sql.DB, error) {
 		conn.Limit(sqlite3.LIMIT_SQL_LENGTH, MaxSQLBytes)
 		conn.Limit(sqlite3.LIMIT_LENGTH, 16<<20)
 		conn.Limit(sqlite3.LIMIT_VARIABLE_NUMBER, MaxSQLArgs)
+		// SQLite also applies this limit to schema columns and ORDER BY terms.
+		conn.Limit(sqlite3.LIMIT_COLUMN, MaxSQLResultColumns)
+		if conn.Limit(sqlite3.LIMIT_COLUMN, -1) != MaxSQLResultColumns {
+			return fmt.Errorf("SQLite does not support %d result columns", MaxSQLResultColumns)
+		}
 		if _, err := conn.Config(sqlite3.DBCONFIG_DEFENSIVE, true); err != nil {
 			return err
 		}
@@ -645,20 +651,37 @@ func insertReceipt(ctx context.Context, tx *sql.Tx, kind types.MutationKind, req
 
 func encodeSQLResult(result types.SQLCommandResult) ([]byte, error) {
 	if len(result.Statements) == 0 {
+		if result.Error != "" {
+			return nil, fmt.Errorf("SQL result error without statements")
+		}
 		return nil, nil
+	}
+	if len(result.Statements) > MaxSQLStatements {
+		return nil, fmt.Errorf("invalid statement count")
 	}
 	var encoded bytes.Buffer
 	encoded.WriteString("RSQL")
 	writeUint32(&encoded, uint32(len(result.Statements)))
 	for _, statement := range result.Statements {
+		if len(statement.Columns) > MaxSQLResultColumns {
+			return nil, fmt.Errorf("invalid column count")
+		}
+		if len(statement.Rows) > MaxReturningRows {
+			return nil, fmt.Errorf("invalid row count")
+		}
 		writeInt64(&encoded, statement.RowsAffected)
 		writeInt64(&encoded, statement.LastInsertID)
 		writeUint32(&encoded, uint32(len(statement.Columns)))
 		for _, column := range statement.Columns {
-			writeBytes(&encoded, []byte(column))
+			if err := writeBytes(&encoded, []byte(column)); err != nil {
+				return nil, err
+			}
 		}
 		writeUint32(&encoded, uint32(len(statement.Rows)))
 		for _, row := range statement.Rows {
+			if len(row) != len(statement.Columns) {
+				return nil, fmt.Errorf("invalid cell count")
+			}
 			writeUint32(&encoded, uint32(len(row)))
 			for _, value := range row {
 				if err := writeSQLValue(&encoded, value); err != nil {
@@ -667,18 +690,21 @@ func encodeSQLResult(result types.SQLCommandResult) ([]byte, error) {
 			}
 		}
 	}
-	writeBytes(&encoded, []byte(result.Error))
-	if encoded.Len() > MaxMutationResultBytes {
-		return nil, fmt.Errorf("stored SQL result exceeds %d bytes", MaxMutationResultBytes)
+	if err := writeBytes(&encoded, []byte(result.Error)); err != nil {
+		return nil, err
 	}
 	return encoded.Bytes(), nil
 }
 
 func writeUint32(dst *bytes.Buffer, value uint32) { _ = binary.Write(dst, binary.BigEndian, value) }
 func writeInt64(dst *bytes.Buffer, value int64)   { _ = binary.Write(dst, binary.BigEndian, value) }
-func writeBytes(dst *bytes.Buffer, value []byte) {
+func writeBytes(dst *bytes.Buffer, value []byte) error {
+	if len(value) > MaxMutationResultBytes-4 || dst.Len() > MaxMutationResultBytes-4-len(value) {
+		return fmt.Errorf("stored SQL result exceeds %d bytes", MaxMutationResultBytes)
+	}
 	writeUint32(dst, uint32(len(value)))
 	dst.Write(value)
+	return nil
 }
 
 func writeSQLValue(dst *bytes.Buffer, value any) error {
@@ -693,17 +719,23 @@ func writeSQLValue(dst *bytes.Buffer, value any) error {
 		writeInt64(dst, int64(math.Float64bits(value)))
 	case string:
 		dst.WriteByte(3)
-		writeBytes(dst, []byte(value))
+		return writeBytes(dst, []byte(value))
 	case []byte:
 		dst.WriteByte(4)
-		writeBytes(dst, value)
+		return writeBytes(dst, value)
 	default:
 		return fmt.Errorf("unsupported SQL result type %T", value)
+	}
+	if dst.Len() > MaxMutationResultBytes {
+		return fmt.Errorf("stored SQL result exceeds %d bytes", MaxMutationResultBytes)
 	}
 	return nil
 }
 
 func decodeSQLResult(encoded []byte) (types.SQLCommandResult, error) {
+	if len(encoded) > MaxMutationResultBytes {
+		return types.SQLCommandResult{}, fmt.Errorf("stored SQL result exceeds %d bytes", MaxMutationResultBytes)
+	}
 	reader := bytes.NewReader(encoded)
 	magic := make([]byte, 4)
 	if _, err := io.ReadFull(reader, magic); err != nil || string(magic) != "RSQL" {
@@ -723,7 +755,7 @@ func decodeSQLResult(encoded []byte) (types.SQLCommandResult, error) {
 			return types.SQLCommandResult{}, err
 		}
 		columns, readErr := readUint32(reader)
-		if readErr != nil || columns > MaxSQLArgs {
+		if readErr != nil || columns > MaxSQLResultColumns {
 			return types.SQLCommandResult{}, fmt.Errorf("invalid column count")
 		}
 		statement.Columns = make([]string, columns)
@@ -1871,6 +1903,9 @@ func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget, expectedRows *i
 	columns, err := rows.Columns()
 	if err != nil {
 		return types.SQLStatementResult{}, err
+	}
+	if len(columns) > MaxSQLResultColumns {
+		return types.SQLStatementResult{}, fmt.Errorf("invalid column count")
 	}
 	result := types.SQLStatementResult{Columns: columns}
 	for _, column := range columns {
