@@ -18,6 +18,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/node"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
@@ -175,6 +176,7 @@ var (
 	ErrRequestConflict         = network.ErrRequestConflict
 	ErrInvalidRequest          = network.ErrInvalidRequest
 	ErrQuorumUnavailable       = quepaxa.ErrQuorumUnavailable
+	ErrWALCapacity             = qlog.ErrCapacity
 	ErrDurabilityUnavailable   = network.ErrDurabilityUnavailable
 	ErrCommitUnknown           = network.ErrCommitUnknown
 	ErrGraphResourceLimit      = network.ErrGraphResourceLimit

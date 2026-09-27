@@ -36,6 +36,15 @@ type phaseFaultTransport struct {
 	n2Down atomic.Bool
 }
 
+type recordErrorTransport struct {
+	mockTransport
+	err error
+}
+
+func (t *recordErrorTransport) SendRecord(context.Context, NodeID, RecordRequest) (Summary, error) {
+	return Summary{}, t.err
+}
+
 type parallelFetchTransport struct {
 	mockTransport
 	value    []byte
@@ -135,6 +144,46 @@ func TestHydrateProposalUsesFirstAvailableSource(t *testing.T) {
 	case <-transport.canceled:
 	case <-time.After(time.Second):
 		t.Fatal("slower fetch was not canceled")
+	}
+}
+
+func TestRecordQuorumPreservesUnderlyingError(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	if err := wal.SetMaxBytes(1); err != nil {
+		t.Fatal(err)
+	}
+	core := newCore("n1", &Cluster{Members: []Member{{ID: "n1"}}}, wal, nil)
+
+	_, _, err = core.Propose(context.Background(), []byte("capacity failure"))
+	if !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("error=%v, want quorum unavailable", err)
+	}
+	if !errors.Is(err, qlog.ErrCapacity) {
+		t.Fatalf("error=%v, want underlying WAL capacity error", err)
+	}
+}
+
+func TestRecordQuorumPreservesCommitUnknownCause(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	cause := errors.New("commit outcome unknown")
+	transport := &recordErrorTransport{err: cause}
+	core := newCore("n1", &Cluster{Members: []Member{{ID: "n2"}}}, wal, transport)
+	request := RecordRequest{Slot: 1, Step: 4}
+
+	_, err = core.recordQuorum(context.Background(), map[NodeID]RecordRequest{"n2": request})
+	if !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("error=%v, want quorum unavailable", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("error=%v, want original commit-unknown cause", err)
 	}
 }
 

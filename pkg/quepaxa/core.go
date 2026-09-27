@@ -1116,7 +1116,7 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 		}
 	}
 	if firstErr != nil {
-		return nil, fmt.Errorf("%w: %v", ErrQuorumUnavailable, firstErr)
+		return nil, fmt.Errorf("%w: %w", ErrQuorumUnavailable, firstErr)
 	}
 	return nil, ErrQuorumUnavailable
 }
