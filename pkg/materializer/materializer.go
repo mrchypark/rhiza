@@ -925,6 +925,14 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	if m.writer == nil {
 		return sql.ErrConnDone
 	}
+	if m.graph != nil {
+		m.graph.mu.RLock()
+		commitUnknown := m.graph.commitUnknown
+		m.graph.mu.RUnlock()
+		if commitUnknown {
+			return ErrGraphCommitUnknown
+		}
+	}
 	conn, err := m.writer.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire apply connection: %w", err)
@@ -981,7 +989,12 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 	}
 	if err := tx.Commit(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
-		return fmt.Errorf("commit apply batch: %w", err)
+		if m.graph != nil {
+			m.graph.mu.Lock()
+			m.graph.poisonCommitOutcome()
+			m.graph.mu.Unlock()
+		}
+		return fmt.Errorf("%w: SQLite commit apply batch: %w", ErrGraphCommitUnknown, err)
 	}
 	for _, pending := range m.pendingSQLReceipts {
 		m.sqlReceipts.add(pending.requestID, pending.record.receipt.Slot)
@@ -2238,7 +2251,11 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 	_ = os.Remove(graphPath)
 	paths = append(paths, graphPath)
 	m.mu.Lock()
-	sqliteSnapshot, err := m.beginSQLiteSnapshotLocked(ctx)
+	err = m.graphReadableLocked()
+	var sqliteSnapshot *sqliteSnapshot
+	if err == nil {
+		sqliteSnapshot, err = m.beginSQLiteSnapshotLocked(ctx)
+	}
 	index := uint64(0)
 	if err == nil {
 		index = sqliteSnapshot.index
@@ -2694,6 +2711,9 @@ func (m *Materializer) closeConnections() error {
 
 // Health check
 func (m *Materializer) Health(ctx context.Context) error {
+	if err := m.graphHealth(); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 	m.mu.RLock()

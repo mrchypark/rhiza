@@ -1,6 +1,7 @@
 package materializer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -33,10 +34,16 @@ func graphArgs(args map[string]any) (map[string]any, error) {
 
 var graphTipKey = []byte("rhiza/applied_slot")
 var graphJournalKey = []byte("rhiza/recovery_journal")
+var graphFormatKey = []byte("rhiza/storage_policy")
+var graphPendingKey = []byte("rhiza/pending_apply")
+
+var graphStoragePolicy = []byte("slot-publication-v1")
 
 var (
 	ErrGraphResourceLimit  = errors.New("graph resource limit exceeded")
 	ErrReadVersionMismatch = errors.New("read version mismatch")
+	ErrGraphApplyPending   = errors.New("graph slot publication is incomplete")
+	ErrGraphCommitUnknown  = errors.New("graph commit outcome is unknown; reopen before use")
 )
 
 func ensureGraphNodePropertyIndexes(graph *graphState, indexes []types.GraphNodePropertyIndex) error {
@@ -56,6 +63,8 @@ type graphState struct {
 	mu                sync.RWMutex
 	tip               uint64
 	durableTip        uint64
+	pending           *graphJournalEntry
+	commitUnknown     bool
 	idempotencyWindow uint64
 	streamWake        chan struct{}
 	queryWG           sync.WaitGroup
@@ -125,25 +134,43 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 		return nil, err
 	}
 	g := &graphState{db: db, idempotencyWindow: idempotencyWindow, streamWake: make(chan struct{})}
+	encodedFormat, err := g.getMetadata(graphFormatKey)
+	if err != nil {
+		g.close()
+		return nil, err
+	}
+	if encodedFormat == nil {
+		if existing || sqliteTip != 0 {
+			g.close()
+			return nil, fmt.Errorf("existing graph state has no storage policy; rebuild from the decision log")
+		}
+		if err := db.Update(func(tx *latticedb.Tx) error {
+			if err := tx.PutAppMetadata(graphFormatKey, graphStoragePolicy); err != nil {
+				return err
+			}
+			if err := tx.PutAppMetadata(graphTipKey, encodeGraphTip(0)); err != nil {
+				return err
+			}
+			if err := tx.PutAppMetadata(graphJournalKey, nil); err != nil {
+				return err
+			}
+			return tx.DeleteAppMetadata(graphPendingKey)
+		}); err != nil {
+			g.close()
+			return nil, err
+		}
+	} else if !bytes.Equal(encodedFormat, graphStoragePolicy) {
+		g.close()
+		return nil, fmt.Errorf("unsupported graph storage policy %q", encodedFormat)
+	}
 	encodedTip, err := g.getMetadata(graphTipKey)
 	if err != nil {
 		g.close()
 		return nil, err
 	}
 	if encodedTip == nil {
-		if existing || sqliteTip != 0 {
-			g.close()
-			return nil, fmt.Errorf("existing graph state has no applied slot; rebuild from the decision log")
-		}
-		if err := db.Update(func(tx *latticedb.Tx) error {
-			if err := tx.PutAppMetadata(graphTipKey, encodeGraphTip(0)); err != nil {
-				return err
-			}
-			return tx.PutAppMetadata(graphJournalKey, nil)
-		}); err != nil {
-			g.close()
-			return nil, err
-		}
+		g.close()
+		return nil, fmt.Errorf("graph storage policy has no applied slot; rebuild from the decision log")
 	} else {
 		g.durableTip, err = decodeGraphTip(encodedTip)
 		if err != nil {
@@ -161,17 +188,36 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 		g.close()
 		return nil, err
 	}
+	encodedPending, hasPending, err := g.getMetadataValue(graphPendingKey)
+	if err != nil {
+		g.close()
+		return nil, err
+	}
+	if hasPending && len(encodedPending) == 0 {
+		g.close()
+		return nil, fmt.Errorf("invalid pending graph apply marker")
+	}
+	pending, err := decodeGraphPending(encodedPending)
+	if err != nil {
+		g.close()
+		return nil, err
+	}
 	for _, entry := range journal {
 		if entry.Slot > g.durableTip {
 			g.close()
 			return nil, fmt.Errorf("graph recovery journal exceeds durable graph slot %d", g.durableTip)
 		}
 	}
+	if pending != nil && (pending.Slot <= sqliteTip || pending.Slot <= g.durableTip) {
+		g.close()
+		return nil, fmt.Errorf("pending graph slot %d is not ahead of SQLite and completed graph tips", pending.Slot)
+	}
 	journal = pendingGraphJournal(journal, sqliteTip)
 	if g.durableTip > sqliteTip && (len(journal) == 0 || journal[len(journal)-1].Slot != g.durableTip) {
 		g.close()
 		return nil, fmt.Errorf("graph recovery journal does not cover durable graph slot %d", g.durableTip)
 	}
+	g.pending = pending
 	g.tip = max(g.durableTip, sqliteTip)
 	if err := db.Update(func(tx *latticedb.Tx) error {
 		return tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal))
@@ -183,18 +229,19 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 }
 
 func (g *graphState) getMetadata(key []byte) ([]byte, error) {
-	var value []byte
-	err := g.db.View(func(tx *latticedb.Tx) error {
-		var ok bool
-		var err error
-		value, ok, err = tx.GetAppMetadata(key)
-		if err != nil || ok {
-			return err
-		}
-		value = nil
-		return nil
-	})
+	value, _, err := g.getMetadataValue(key)
 	return value, err
+}
+
+func (g *graphState) getMetadataValue(key []byte) ([]byte, bool, error) {
+	var value []byte
+	var found bool
+	err := g.db.View(func(tx *latticedb.Tx) error {
+		var err error
+		value, found, err = tx.GetAppMetadata(key)
+		return err
+	})
+	return value, found, err
 }
 
 func encodeGraphJournal(entries []graphJournalEntry) []byte {
@@ -221,6 +268,24 @@ func decodeGraphJournal(data []byte) ([]graphJournalEntry, error) {
 		}
 	}
 	return entries, nil
+}
+
+func encodeGraphPending(entry graphJournalEntry) []byte {
+	return encodeGraphJournal([]graphJournalEntry{entry})
+}
+
+func decodeGraphPending(data []byte) (*graphJournalEntry, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if len(data) != 40 {
+		return nil, fmt.Errorf("invalid pending graph apply marker")
+	}
+	entries, err := decodeGraphJournal(data)
+	if err != nil || len(entries) != 1 {
+		return nil, fmt.Errorf("invalid pending graph apply marker")
+	}
+	return &entries[0], nil
 }
 
 func pendingGraphJournal(entries []graphJournalEntry, through uint64) []graphJournalEntry {
@@ -273,7 +338,16 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.commitUnknown {
+		return ErrGraphCommitUnknown
+	}
 	valueHash := sha256.Sum256(value)
+	if g.pending != nil && (slot > g.pending.Slot || slot == g.pending.Slot && (!graph || g.pending.Hash != valueHash)) {
+		return fmt.Errorf("%w: expected slot %d with matching decision hash", ErrGraphApplyPending, g.pending.Slot)
+	}
+	if g.pending != nil && slot < g.pending.Slot && graph && slot > g.tip {
+		return fmt.Errorf("%w: graph slot %d has no completed recovery evidence before pending slot %d", ErrGraphApplyPending, slot, g.pending.Slot)
+	}
 	if slot <= g.tip {
 		encoded, err := g.getMetadata(graphJournalKey)
 		if err != nil {
@@ -321,21 +395,33 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	for i, command := range commands {
 		advance := i == len(commands)-1
 		fingerprint, err := prepareGraphCommand(command)
+		if err != nil {
+			err = &graphRejectedCommandError{err: err}
+		}
 		if err == nil {
 			err = g.applyCommand(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough)
 		}
 		if err != nil {
-			if isRetryableGraphApplyError(err) {
+			if isRetryableGraphApplyError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			var rejected *graphRejectedCommandError
+			if !errors.As(err, &rejected) {
 				return err
 			}
 			if recordErr := g.recordFailure(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough); recordErr != nil {
 				return recordErr
 			}
 		}
+		if advance {
+			g.pending = nil
+		} else {
+			g.pending = &graphJournalEntry{Slot: slot, Hash: valueHash}
+		}
+		g.signalPublicationChange()
 	}
 	g.tip, g.durableTip = slot, slot
-	close(g.streamWake)
-	g.streamWake = make(chan struct{})
+	g.signalPublicationChange()
 	return nil
 }
 
@@ -356,57 +442,97 @@ func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 	return types.GraphFingerprint(command)
 }
 
+type graphRejectedCommandError struct{ err error }
+
+func (e *graphRejectedCommandError) Error() string { return e.err.Error() }
+func (e *graphRejectedCommandError) Unwrap() error { return e.err }
+
+func isDeterministicGraphQueryError(err error) bool {
+	var queryErr *latticedb.QueryError
+	if !errors.As(err, &queryErr) {
+		return false
+	}
+	return queryErr.Stage == latticedb.QueryErrorStageParse || queryErr.Stage == latticedb.QueryErrorStageSemantic || queryErr.Stage == latticedb.QueryErrorStagePlan
+}
+
 func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64) error {
 	args, err := graphArgs(command.Args)
 	if err != nil {
-		return err
+		return &graphRejectedCommandError{err: err}
 	}
-	return g.db.Update(func(tx *latticedb.Tx) error {
-		if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
-			return err
-		}
-		existing, found, err := requestInTx(tx, command.RequestID)
-		if err != nil {
-			return err
-		}
-		if found {
-			if existing.Fingerprint != fingerprint {
-				return fmt.Errorf("request_id was already used for a different graph command")
+	callbackStarted, callbackSucceeded := false, false
+	updateErr := g.db.Update(func(tx *latticedb.Tx) error {
+		callbackStarted = true
+		callbackErr := func() error {
+			if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
+				return err
+			}
+			existing, found, err := requestInTx(tx, command.RequestID)
+			if err != nil {
+				return err
+			}
+			if found {
+				if existing.Fingerprint != fingerprint {
+					return &graphRejectedCommandError{err: fmt.Errorf("request_id was already used for a different graph command")}
+				}
+				if advance {
+					return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
+				}
+				return setPendingGraphApply(tx, slot, valueHash)
+			}
+			switch {
+			case command.StreamOffset != nil:
+				err = tx.SetStreamOffset(command.StreamOffset.Stream, command.StreamOffset.Consumer, command.StreamOffset.Sequence)
+			case command.StreamTrim != nil:
+				err = tx.TrimStream(command.StreamTrim.Stream, command.StreamTrim.ThroughSequence)
+			default:
+				_, err = tx.QueryContext(ctx, command.Cypher, args, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
+				if isDeterministicGraphQueryError(err) {
+					err = &graphRejectedCommandError{err: err}
+				}
+			}
+			if err != nil {
+				return err
+			}
+			for _, event := range command.Events {
+				payload, err := graphArg(event.Payload)
+				if err != nil {
+					return err
+				}
+				if err := tx.PublishStream(event.Stream, event.Kind, payload); err != nil {
+					return err
+				}
+			}
+			receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true, RetryThroughSlot: slot + g.idempotencyWindow - 1}
+			if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
+				return err
 			}
 			if advance {
 				return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
 			}
-			return nil
-		}
-		switch {
-		case command.StreamOffset != nil:
-			err = tx.SetStreamOffset(command.StreamOffset.Stream, command.StreamOffset.Consumer, command.StreamOffset.Sequence)
-		case command.StreamTrim != nil:
-			err = tx.TrimStream(command.StreamTrim.Stream, command.StreamTrim.ThroughSequence)
-		default:
-			_, err = tx.QueryContext(ctx, command.Cypher, args, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
-		}
-		if err != nil {
-			return err
-		}
-		for _, event := range command.Events {
-			payload, err := graphArg(event.Payload)
-			if err != nil {
-				return err
-			}
-			if err := tx.PublishStream(event.Stream, event.Kind, payload); err != nil {
-				return err
-			}
-		}
-		receipt := types.MutationReceipt{Slot: slot, Status: types.MutationCommitted, Applied: true, RetryThroughSlot: slot + g.idempotencyWindow - 1}
-		if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
-			return err
-		}
-		if advance {
-			return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
-		}
-		return nil
+			return setPendingGraphApply(tx, slot, valueHash)
+		}()
+		callbackSucceeded = callbackErr == nil
+		return callbackErr
 	})
+	if updateErr == nil {
+		return nil
+	}
+	if callbackSucceeded {
+		g.poisonCommitOutcome()
+		return fmt.Errorf("%w: %w", ErrGraphCommitUnknown, updateErr)
+	}
+	if isRetryableGraphApplyError(updateErr) || errors.Is(updateErr, context.Canceled) || errors.Is(updateErr, context.DeadlineExceeded) {
+		return updateErr
+	}
+	if !callbackStarted {
+		return updateErr
+	}
+	var rejected *graphRejectedCommandError
+	if errors.As(updateErr, &rejected) {
+		return updateErr
+	}
+	return updateErr
 }
 
 func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64) error {
@@ -417,31 +543,81 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 			return err
 		}
 	}
-	return g.db.Update(func(tx *latticedb.Tx) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
-			return err
-		}
-		_, found, err := requestInTx(tx, command.RequestID)
-		if err != nil {
-			return err
-		}
-		if !found && command.RequestID != "" {
-			receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeExecutionFailed, RetryThroughSlot: slot + g.idempotencyWindow - 1}
-			if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
+	callbackSucceeded := false
+	updateErr := g.db.Update(func(tx *latticedb.Tx) error {
+		callbackErr := func() error {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
-		}
-		if advance {
-			return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
-		}
-		return nil
+			if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
+				return err
+			}
+			_, found, err := requestInTx(tx, command.RequestID)
+			if err != nil {
+				return err
+			}
+			if !found && command.RequestID != "" {
+				receipt := types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeExecutionFailed, RetryThroughSlot: slot + g.idempotencyWindow - 1}
+				if err := putRequest(tx, command.RequestID, graphRequest{Fingerprint: fingerprint, Receipt: receipt}); err != nil {
+					return err
+				}
+			}
+			if advance {
+				return advanceGraphMetadata(tx, slot, valueHash, confirmedThrough)
+			}
+			return setPendingGraphApply(tx, slot, valueHash)
+		}()
+		callbackSucceeded = callbackErr == nil
+		return callbackErr
 	})
+	if updateErr == nil {
+		return nil
+	}
+	if callbackSucceeded {
+		g.poisonCommitOutcome()
+		return fmt.Errorf("%w: %w", ErrGraphCommitUnknown, updateErr)
+	}
+	return updateErr
+}
+
+func setPendingGraphApply(tx *latticedb.Tx, slot uint64, hash [32]byte) error {
+	data, _, err := tx.GetAppMetadata(graphPendingKey)
+	if err != nil {
+		return err
+	}
+	pending, err := decodeGraphPending(data)
+	if err != nil {
+		return err
+	}
+	want := graphJournalEntry{Slot: slot, Hash: hash}
+	if pending != nil && *pending != want {
+		return fmt.Errorf("pending graph apply marker conflicts with slot %d", slot)
+	}
+	return tx.PutAppMetadata(graphPendingKey, encodeGraphPending(want))
+}
+
+func (g *graphState) signalPublicationChange() {
+	close(g.streamWake)
+	g.streamWake = make(chan struct{})
+}
+
+func (g *graphState) poisonCommitOutcome() {
+	g.commitUnknown = true
+	g.signalPublicationChange()
 }
 
 func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, confirmedThrough uint64) error {
+	pendingData, _, err := tx.GetAppMetadata(graphPendingKey)
+	if err != nil {
+		return err
+	}
+	pending, err := decodeGraphPending(pendingData)
+	if err != nil {
+		return err
+	}
+	if pending != nil && *pending != (graphJournalEntry{Slot: slot, Hash: hash}) {
+		return fmt.Errorf("pending graph apply marker conflicts with completed slot %d", slot)
+	}
 	journalData, _, err := tx.GetAppMetadata(graphJournalKey)
 	if err != nil {
 		return err
@@ -458,7 +634,10 @@ func advanceGraphMetadata(tx *latticedb.Tx, slot uint64, hash [32]byte, confirme
 	if err := tx.PutAppMetadata(graphJournalKey, encodeGraphJournal(journal)); err != nil {
 		return err
 	}
-	return tx.PutAppMetadata(graphTipKey, encodeGraphTip(slot))
+	if err := tx.PutAppMetadata(graphTipKey, encodeGraphTip(slot)); err != nil {
+		return err
+	}
+	return tx.DeleteAppMetadata(graphPendingKey)
 }
 
 func pruneGraphRequestsForApply(tx *latticedb.Tx, slot, durableTip, window uint64) error {
@@ -612,10 +791,6 @@ func knownNonGraphValue(value []byte) (bool, error) {
 
 func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[string]any) (types.GraphCommandResult, error) {
 	m.mu.RLock()
-	if err := ctx.Err(); err != nil {
-		m.mu.RUnlock()
-		return types.GraphCommandResult{}, err
-	}
 	if len(cypher) == 0 || len(cypher) > MaxSQLBytes || len(args) > MaxSQLArgs {
 		m.mu.RUnlock()
 		return types.GraphCommandResult{}, fmt.Errorf("invalid graph query")
@@ -626,13 +801,13 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 		return types.GraphCommandResult{}, err
 	}
 	g := m.graph
-	if g == nil || g.db == nil {
+	if err := m.graphReadableLocked(); err != nil {
 		m.mu.RUnlock()
-		return types.GraphCommandResult{}, fmt.Errorf("LatticeDB is not open")
+		return types.GraphCommandResult{}, err
 	}
-	if g.tip != m.tip {
+	if err := ctx.Err(); err != nil {
 		m.mu.RUnlock()
-		return types.GraphCommandResult{}, fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
+		return types.GraphCommandResult{}, err
 	}
 	db := g.db
 	tx, err := db.BeginRead()
@@ -685,14 +860,14 @@ func (m *Materializer) GraphReachable(ctx context.Context, request types.GraphRe
 		return types.GraphReachableResult{}, err
 	}
 	m.mu.RLock()
-	if err := ctx.Err(); err != nil {
+	g := m.graph
+	if err := m.graphReadableLocked(); err != nil {
 		m.mu.RUnlock()
 		return types.GraphReachableResult{}, err
 	}
-	g := m.graph
-	if g == nil || g.db == nil || g.tip != m.tip {
+	if err := ctx.Err(); err != nil {
 		m.mu.RUnlock()
-		return types.GraphReachableResult{}, fmt.Errorf("graph materializer is unavailable or stale")
+		return types.GraphReachableResult{}, err
 	}
 	tx, err := g.db.BeginRead()
 	if err != nil {
@@ -814,14 +989,15 @@ func (m *Materializer) GraphReadStream(ctx context.Context, stream string, after
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, 0, err
-		}
 		m.mu.RLock()
 		g := m.graph
-		if g == nil || g.db == nil {
+		if err := m.graphReadableLocked(); err != nil {
 			m.mu.RUnlock()
-			return nil, 0, fmt.Errorf("LatticeDB is not open")
+			return nil, 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			m.mu.RUnlock()
+			return nil, 0, err
 		}
 		g.mu.RLock()
 		records, err := g.db.ReadStream(stream, afterSequence, limit, 0)
@@ -863,13 +1039,16 @@ func (m *Materializer) GraphStreamOffset(ctx context.Context, stream, consumer s
 	if err := validateGraphStreamConsumer(consumer); err != nil {
 		return 0, false, 0, err
 	}
-	if err := ctx.Err(); err != nil {
-		return 0, false, 0, err
-	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.graph == nil || m.graph.db == nil {
 		return 0, false, 0, fmt.Errorf("LatticeDB is not open")
+	}
+	if err := m.graphReadableLocked(); err != nil {
+		return 0, false, 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, false, 0, err
 	}
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
@@ -912,8 +1091,8 @@ func (m *Materializer) GraphMutationReceipt(_ context.Context, requestID string)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	g := m.graph
-	if g == nil || g.db == nil {
-		return types.MutationReceipt{}, false, fmt.Errorf("LatticeDB is not open")
+	if err := m.graphReadableLocked(); err != nil {
+		return types.MutationReceipt{}, false, err
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -932,8 +1111,8 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 		return false, err
 	}
 	g := m.graph
-	if g == nil || g.db == nil {
-		return false, fmt.Errorf("LatticeDB is not open")
+	if err := m.graphReadableLocked(); err != nil {
+		return false, err
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -950,8 +1129,8 @@ func (m *Materializer) GraphRequestMatches(_ context.Context, command types.Grap
 func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.graph == nil || m.graph.db == nil {
-		return false, fmt.Errorf("LatticeDB is not open")
+	if err := m.graphReadableLocked(); err != nil {
+		return false, err
 	}
 	m.graph.mu.RLock()
 	defer m.graph.mu.RUnlock()
@@ -965,13 +1144,27 @@ func (m *Materializer) graphRequestExists(requestID string) (bool, error) {
 func (m *Materializer) graphHealth() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.graph == nil || m.graph.db == nil {
+	return m.graphReadableLocked()
+}
+
+// graphReadableLocked is called while m.mu is held. Graph state is protected
+// separately because stream readers can outlive that lock after opening a
+// snapshot.
+func (m *Materializer) graphReadableLocked() error {
+	g := m.graph
+	if g == nil || g.db == nil {
 		return fmt.Errorf("LatticeDB is not open")
 	}
-	m.graph.mu.RLock()
-	defer m.graph.mu.RUnlock()
-	if m.graph.tip != m.tip {
-		return fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", m.graph.tip, m.tip)
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.commitUnknown {
+		return ErrGraphCommitUnknown
+	}
+	if g.pending != nil {
+		return fmt.Errorf("%w: slot %d", ErrGraphApplyPending, g.pending.Slot)
+	}
+	if g.tip != m.tip {
+		return fmt.Errorf("graph materializer tip %d does not match SQLite tip %d", g.tip, m.tip)
 	}
 	return nil
 }
@@ -979,6 +1172,9 @@ func (m *Materializer) graphHealth() error {
 func (m *Materializer) validateRestoredSnapshot() error {
 	if m.graph == nil {
 		return fmt.Errorf("LatticeDB checkpoint is missing")
+	}
+	if err := m.graphReadableLocked(); err != nil {
+		return fmt.Errorf("checkpoint graph state is not clean: %w", err)
 	}
 	if m.graph.tip != m.tip {
 		return fmt.Errorf("checkpoint materializer tips differ: SQLite=%d LatticeDB=%d", m.tip, m.graph.tip)
