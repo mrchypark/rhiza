@@ -82,6 +82,9 @@ type Server struct {
 	closeOnce            sync.Once
 	closing              bool
 	quiescing            bool
+	localMode            bool
+	lifecycleFailure     error
+	localFailureHandler  func(error)
 	operationCap         chan struct{}
 	localCap             chan struct{}
 	operationB           int
@@ -189,6 +192,11 @@ type proposalCall struct {
 // NewServer creates a new HTTP server.
 func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster types.ClusterID, writable bool, transport *Transport, ready ...func() bool) *Server {
 	proposalCtx, proposalStop := context.WithCancel(context.Background())
+	localMode := core != nil && core.LocalMode()
+	localLimit := maxLocalProposals
+	if localMode {
+		localLimit = 1
+	}
 	s := &Server{
 		core:         core,
 		material:     material,
@@ -201,7 +209,8 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		proposalCtx:  proposalCtx,
 		proposalStop: proposalStop,
 		operationCap: make(chan struct{}, maxProposalOperations),
-		localCap:     make(chan struct{}, maxLocalProposals),
+		localCap:     make(chan struct{}, localLimit),
+		localMode:    localMode,
 		syncLimit:    make(chan struct{}, 2),
 	}
 	admission, err := newReadAdmission(defaultReadAdmissionLimits)
@@ -219,6 +228,33 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	return s
 }
 
+// SetLocalFailureHandler installs the root-readiness hook before the server is
+// exposed. It is called once, on the first failed Local lifecycle.
+func (s *Server) SetLocalFailureHandler(handler func(error)) {
+	s.proposeMu.Lock()
+	s.localFailureHandler = handler
+	if s.lifecycleFailure != nil && handler != nil {
+		handler(s.lifecycleFailure)
+	}
+	s.proposeMu.Unlock()
+}
+
+// Ready reports root readiness, including a sticky Local lifecycle failure.
+func (s *Server) Ready() bool {
+	if s.ready == nil || !s.ready() {
+		return false
+	}
+	s.proposeMu.Lock()
+	defer s.proposeMu.Unlock()
+	return s.lifecycleFailure == nil
+}
+
+func (s *Server) localFailure() error {
+	s.proposeMu.Lock()
+	defer s.proposeMu.Unlock()
+	return s.lifecycleFailure
+}
+
 // SetReadAdmissionLimits replaces admission limits for subsequently started
 // reads. It is intended for setup before the Server is exposed.
 func (s *Server) SetReadAdmissionLimits(limits ReadAdmissionLimits) error {
@@ -233,6 +269,9 @@ func (s *Server) SetReadAdmissionLimits(limits ReadAdmissionLimits) error {
 }
 
 func (s *Server) acquireRead(ctx context.Context, longPoll bool) (func(), error) {
+	if s.localFailure() != nil {
+		return nil, ErrNotReady
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -288,6 +327,9 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 		return nil
 	}
 	if err := s.durability(ctx, slot); err != nil {
+		if s.localMode {
+			return fmt.Errorf("local durability wait: %w", err)
+		}
 		return fmt.Errorf("%w: %v", ErrDurabilityUnavailable, err)
 	}
 	return nil
@@ -296,7 +338,26 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 // waitReceiptDurable confirms that a previously applied mutation still meets
 // the configured before-ack durability policy before its receipt is returned.
 func (s *Server) waitReceiptDurable(ctx context.Context, receipt types.MutationReceipt, requestID string) error {
-	return commitUnknown(quepaxa.Slot(receipt.Slot), requestID, s.waitDurable(ctx, quepaxa.Slot(receipt.Slot)))
+	if !s.localMode {
+		return commitUnknown(quepaxa.Slot(receipt.Slot), requestID, s.waitDurable(ctx, quepaxa.Slot(receipt.Slot)))
+	}
+	if err := s.beginLocalLifecycle(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		durableCtx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
+		err := s.waitDurable(durableCtx, quepaxa.Slot(receipt.Slot))
+		cancel()
+		s.finishLocalLifecycle(err)
+		done <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return commitUnknown(quepaxa.Slot(receipt.Slot), requestID, ctx.Err())
+	case err := <-done:
+		return commitUnknown(quepaxa.Slot(receipt.Slot), requestID, err)
+	}
 }
 
 // routes registers HTTP routes.
@@ -387,58 +448,12 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 		return 0, err
 	}
 	hash := sha256.Sum256(value)
-	for {
-		s.proposeMu.Lock()
-		if s.closing || s.quiescing {
-			s.proposeMu.Unlock()
-			return 0, ErrNotReady
-		}
-		call := s.inflight[hash]
+	s.proposeMu.Lock()
+	if s.closing || s.quiescing || s.lifecycleFailure != nil {
 		s.proposeMu.Unlock()
-		if call != nil {
-			select {
-			case <-ctx.Done():
-				return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
-			case <-call.done:
-				return call.slot, call.err
-			}
-		}
-		select {
-		case s.localCap <- struct{}{}:
-		default:
-			return 0, ErrOverloaded
-		}
-		select {
-		case s.operationCap <- struct{}{}:
-		default:
-			<-s.localCap
-			return 0, ErrOverloaded
-		}
-		s.proposeMu.Lock()
-		if s.closing || s.quiescing {
-			<-s.operationCap
-			<-s.localCap
-			s.proposeMu.Unlock()
-			return 0, ErrNotReady
-		}
-		if s.inflight[hash] != nil {
-			<-s.operationCap
-			<-s.localCap
-			s.proposeMu.Unlock()
-			continue
-		}
-		if len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB {
-			<-s.operationCap
-			<-s.localCap
-			s.proposeMu.Unlock()
-			return 0, ErrOverloaded
-		}
-		call = &proposalCall{done: make(chan struct{})}
-		s.inflight[hash] = call
-		s.operationB += len(value)
-		s.localB += len(value)
-		s.proposalWG.Add(1)
-		go s.runProposal(hash, call, bytes.Clone(value))
+		return 0, ErrNotReady
+	}
+	if call := s.inflight[hash]; call != nil {
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -447,13 +462,43 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 			return call.slot, call.err
 		}
 	}
+	if len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB {
+		s.proposeMu.Unlock()
+		return 0, ErrOverloaded
+	}
+	select {
+	case s.localCap <- struct{}{}:
+	default:
+		s.proposeMu.Unlock()
+		return 0, ErrOverloaded
+	}
+	select {
+	case s.operationCap <- struct{}{}:
+	default:
+		<-s.localCap
+		s.proposeMu.Unlock()
+		return 0, ErrOverloaded
+	}
+	call := &proposalCall{done: make(chan struct{})}
+	s.inflight[hash] = call
+	s.operationB += len(value)
+	s.localB += len(value)
+	s.proposalWG.Add(1)
+	go s.runProposal(hash, call, bytes.Clone(value))
+	s.proposeMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
+	case <-call.done:
+		return call.slot, call.err
+	}
 }
 
 // Quiesce drains proposals and excludes decision application while a certified
 // checkpoint replaces local consensus and materialized state.
 func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 	s.proposeMu.Lock()
-	if s.closing || s.quiescing {
+	if s.closing || s.quiescing || s.lifecycleFailure != nil {
 		s.proposeMu.Unlock()
 		return nil, ErrNotReady
 	}
@@ -477,6 +522,12 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 		return nil, ctx.Err()
 	case <-done:
 	}
+	s.proposeMu.Lock()
+	failed := s.lifecycleFailure != nil
+	s.proposeMu.Unlock()
+	if failed {
+		return nil, ErrNotReady
+	}
 	s.applyMu.Lock()
 	return func() {
 		s.applyMu.Unlock()
@@ -489,9 +540,19 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 }
 
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
-	defer s.proposalWG.Done()
 	ctx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
-	call.slot, call.err = s.proposeOnce(ctx, value)
+	coreStarted := false
+	if s.localMode {
+		if err := types.ValidateExecutionPolicy(value); err != nil {
+			call.err = fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		} else if err := validateReplicatedMutation(value); err != nil {
+			call.err = fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+		}
+	}
+	if call.err == nil {
+		coreStarted = true
+		call.slot, call.err = s.proposeOnce(ctx, value)
+	}
 	if call.err == nil {
 		call.err = s.applyDecisions(ctx, call.slot)
 	}
@@ -500,6 +561,13 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	}
 	cancel()
 	s.proposeMu.Lock()
+	if s.localMode && coreStarted && call.err != nil && s.lifecycleFailure == nil {
+		s.lifecycleFailure = call.err
+		if s.localFailureHandler != nil {
+			s.localFailureHandler(call.err)
+		}
+		call.err = fmt.Errorf("%w: local lifecycle requires reopen: %w", ErrCommitUnknown, call.err)
+	}
 	if s.inflight[hash] == call {
 		delete(s.inflight, hash)
 	}
@@ -509,6 +577,42 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	<-s.localCap
 	close(call.done)
 	s.proposeMu.Unlock()
+	s.proposalWG.Done()
+}
+
+func (s *Server) beginLocalLifecycle() error {
+	s.proposeMu.Lock()
+	defer s.proposeMu.Unlock()
+	if s.closing || s.quiescing || s.lifecycleFailure != nil {
+		return ErrNotReady
+	}
+	select {
+	case s.localCap <- struct{}{}:
+	default:
+		return ErrOverloaded
+	}
+	select {
+	case s.operationCap <- struct{}{}:
+	default:
+		<-s.localCap
+		return ErrOverloaded
+	}
+	s.proposalWG.Add(1)
+	return nil
+}
+
+func (s *Server) finishLocalLifecycle(err error) {
+	s.proposeMu.Lock()
+	if err != nil && s.lifecycleFailure == nil {
+		s.lifecycleFailure = err
+		if s.localFailureHandler != nil {
+			s.localFailureHandler(err)
+		}
+	}
+	<-s.operationCap
+	<-s.localCap
+	s.proposeMu.Unlock()
+	s.proposalWG.Done()
 }
 func (s *Server) proposeOnce(ctx context.Context, value []byte) (quepaxa.Slot, error) {
 	if err := types.ValidateExecutionPolicy(value); err != nil {
@@ -779,7 +883,7 @@ func (s *Server) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (E
 
 // Execute applies one SQL statement or an atomic statements transaction.
 func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
-	if !s.writable || !s.ready() {
+	if !s.writable || !s.Ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
 	command, encoded, err := validatedSQLCommand(req)
@@ -791,7 +895,7 @@ func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 
 // Migrate applies one engine-owned migration atomically with its ledger row.
 func (s *Server) Migrate(ctx context.Context, req MigrationRequest) (ExecuteResponse, error) {
-	if !s.writable || !s.ready() {
+	if !s.writable || !s.Ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
 	command := types.SQLCommand{RequestID: req.RequestID, Statements: req.Statements, Migration: &types.SQLMigration{Version: req.Version, Name: req.Name, Checksum: req.Checksum}}
@@ -997,6 +1101,9 @@ func (s *Server) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (RequestStatusResponse, error) {
+	if s.localFailure() != nil {
+		return RequestStatusResponse{}, ErrNotReady
+	}
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes {
 		return RequestStatusResponse{}, ErrInvalidRequest
 	}
@@ -1160,7 +1267,7 @@ func (s *Server) KVCAS(ctx context.Context, req KVMutationRequest) (KVMutationRe
 }
 
 func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationRequest) (KVMutationResponse, error) {
-	if !s.writable || !s.ready() {
+	if !s.writable || !s.Ready() {
 		return KVMutationResponse{}, ErrNotReady
 	}
 	if operation != "put" && operation != "delete" && operation != "cas" {
@@ -1229,6 +1336,28 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 				return err
 			}
 		}
+		if s.localMode {
+			if uint64(index) <= s.material.Tip() {
+				return nil
+			}
+			if err := s.beginLocalLifecycle(); err != nil {
+				return err
+			}
+			done := make(chan error, 1)
+			go func() {
+				applyCtx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
+				err := s.applyDecisions(applyCtx, index)
+				cancel()
+				s.finishLocalLifecycle(err)
+				done <- err
+			}()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case err := <-done:
+				return err
+			}
+		}
 		return s.applyDecisions(ctx, index)
 	default:
 		return errConsistency
@@ -1255,7 +1384,7 @@ func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (types.MutationReceipt, error) {
-	if !s.writable || !s.ready() {
+	if !s.writable || !s.Ready() {
 		return types.MutationReceipt{}, ErrNotReady
 	}
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
@@ -1304,6 +1433,9 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 }
 
 func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
+	if s.localFailure() != nil {
+		return nil, nil, ErrNotReady
+	}
 	if topic == "" || len(topic) > 256 {
 		return nil, nil, ErrInvalidRequest
 	}
@@ -1469,7 +1601,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w, http.MethodGet)
 		return
 	}
-	if !s.ready() {
+	if !s.Ready() {
 		writeHTTPError(w, http.StatusServiceUnavailable, "catching_up", "catching up")
 		return
 	}

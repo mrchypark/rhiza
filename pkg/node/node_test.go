@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -432,6 +433,92 @@ func TestLocalModeRecoversUndecidedRecorderState(t *testing.T) {
 	}
 	if _, err := n.server.Query(ctx, network.QueryRequest{SQL: "SELECT * FROM recorded", Consistency: "linearizable"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLocalLifecycleFailureReopensAndReplaysMultiCommandBatchExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	config := types.ExecutionConfig{Local: true, NodeID: "local", DataDir: t.TempDir()}
+	n := New(&config)
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	commands := []types.GraphCommand{
+		{RequestID: "reopen-a", Cypher: `CREATE (:ReopenBatch {id: 'A'})`, Events: []types.GraphStreamEvent{{Stream: "reopen-events", Kind: "created", Payload: "A"}}},
+		{RequestID: "reopen-b", Cypher: `CREATE (:ReopenBatch {id: 'B'})`, Events: []types.GraphStreamEvent{{Stream: "reopen-events", Kind: "created", Payload: "B"}}},
+	}
+	value, err := types.EncodeGraphBatch(commands)
+	if err != nil {
+		_ = n.Shutdown()
+		t.Fatal(err)
+	}
+	if slot, _, err := n.core.Propose(ctx, value); err != nil || slot != 1 {
+		_ = n.Shutdown()
+		t.Fatalf("seed batch slot=%d error=%v; want slot 1", slot, err)
+	}
+	if err := n.material.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.server.GraphQuery(ctx, network.GraphQueryRequest{Cypher: `MATCH (n:ReopenBatch) RETURN n.id`, Consistency: "linearizable"})
+	if err == nil || n.core.Tip() != 1 {
+		_ = n.Shutdown()
+		t.Fatalf("core tip=%d error=%v; want apply failure for committed multi-command batch", n.core.Tip(), err)
+	}
+	if n.Ready() {
+		_ = n.Shutdown()
+		t.Fatal("failed Local lifecycle remained ready")
+	}
+	if _, err := n.server.GraphExecute(ctx, commands[0]); !errors.Is(err, network.ErrNotReady) {
+		_ = n.Shutdown()
+		t.Fatalf("same batch command before reopen error=%v, want ErrNotReady", err)
+	}
+	if err := n.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	n = New(&config)
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer n.Shutdown()
+	if !n.Ready() || n.material.Tip() != 1 || n.core.Tip() != 1 {
+		t.Fatalf("reopened readiness=%t core=%d material=%d", n.Ready(), n.core.Tip(), n.material.Tip())
+	}
+	for _, command := range commands {
+		retry, err := n.server.GraphExecute(ctx, command)
+		if err != nil {
+			t.Fatalf("retry request %q: %v", command.RequestID, err)
+		}
+		if retry.Slot != 1 {
+			t.Fatalf("retry request %q returned slot %d, want original slot 1", command.RequestID, retry.Slot)
+		}
+	}
+	query, err := n.server.GraphQuery(ctx, network.GraphQueryRequest{Cypher: `MATCH (n:ReopenBatch) RETURN n.id`})
+	if err != nil || len(query.Rows) != 2 {
+		t.Fatalf("graph rows=%v error=%v; want both batch effects exactly once", query.Rows, err)
+	}
+	rowCounts := map[string]int{}
+	for _, row := range query.Rows {
+		if len(row) != 1 {
+			t.Fatalf("graph row=%v; want one id column", row)
+		}
+		rowCounts[fmt.Sprint(row[0])]++
+	}
+	if rowCounts["A"] != 1 || rowCounts["B"] != 1 {
+		t.Fatalf("graph row counts=%v; want A and B exactly once", rowCounts)
+	}
+	stream, err := n.server.GraphStreamRead(ctx, network.GraphStreamReadRequest{Stream: "reopen-events", Limit: 10})
+	if err != nil || len(stream.Records) != 2 {
+		t.Fatalf("event records=%v error=%v; want two events exactly once", stream.Records, err)
+	}
+	eventCounts := map[string]int{}
+	for _, record := range stream.Records {
+		eventCounts[fmt.Sprint(record.Payload)]++
+	}
+	if eventCounts["A"] != 1 || eventCounts["B"] != 1 {
+		t.Fatalf("event counts=%v; want A and B exactly once", eventCounts)
+	}
+	if n.core.Tip() != 1 || n.material.Tip() != 1 {
+		t.Fatalf("retry created another slot: core=%d material=%d", n.core.Tip(), n.material.Tip())
 	}
 }
 

@@ -432,6 +432,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
+	if n.config.Local {
+		server.SetLocalFailureHandler(func(error) { n.ready.Store(false) })
+	}
 	if n.config.MaxConcurrentReads != 0 {
 		if err := server.SetReadAdmissionLimits(network.ReadAdmissionLimits{
 			MaxConcurrent: n.config.MaxConcurrentReads,
