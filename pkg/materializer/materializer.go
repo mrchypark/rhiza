@@ -74,6 +74,7 @@ type Materializer struct {
 	dbPath                   string
 	readersN                 int
 	idempotencyWindow        uint64
+	afterApplyCommitError    func() error
 	recentSQLReceipts        map[string]storedReceipt
 	pendingSQLReceipts       []pendingSQLReceipt
 	sqlReceipts              sqlReceiptBloom
@@ -987,14 +988,19 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	commitErr := tx.Commit()
+	if commitErr == nil && m.afterApplyCommitError != nil {
+		// Test seam: model a lost acknowledgement after SQLite committed.
+		commitErr = m.afterApplyCommitError()
+	}
+	if commitErr != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
 		if m.graph != nil {
 			m.graph.mu.Lock()
 			m.graph.poisonCommitOutcome()
 			m.graph.mu.Unlock()
 		}
-		return fmt.Errorf("%w: SQLite commit apply batch: %w", ErrGraphCommitUnknown, err)
+		return fmt.Errorf("%w: SQLite commit apply batch: %w", ErrGraphCommitUnknown, commitErr)
 	}
 	for _, pending := range m.pendingSQLReceipts {
 		m.sqlReceipts.add(pending.requestID, pending.record.receipt.Slot)

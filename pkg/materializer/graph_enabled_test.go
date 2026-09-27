@@ -518,6 +518,19 @@ func TestCompletedGraphSlotRemainsHiddenUntilSQLiteBatchReplays(t *testing.T) {
 	if _, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil); err == nil {
 		t.Fatal("GraphQuery exposed graph-complete/SQLite-uncommitted slot")
 	}
+	m.graph.mu.RLock()
+	commitUnknown := m.graph.commitUnknown
+	m.graph.mu.RUnlock()
+	if commitUnknown {
+		t.Fatal("known pre-commit rollback poisoned graph state")
+	}
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatalf("same-instance replay after known rollback: %v", err)
+	}
+	result, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil)
+	if err != nil || result.AppliedSlot != 1 || len(result.Rows) != 1 {
+		t.Fatalf("same-instance replay slot=%d rows=%v err=%v", result.AppliedSlot, result.Rows, err)
+	}
 	if err := m.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -529,9 +542,106 @@ func TestCompletedGraphSlotRemainsHiddenUntilSQLiteBatchReplays(t *testing.T) {
 	if err := m.Apply(context.Background(), 1, value); err != nil {
 		t.Fatalf("replay graph-complete/SQLite-uncommitted slot: %v", err)
 	}
-	result, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil)
+	result, err = m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil)
 	if err != nil || result.AppliedSlot != 1 || len(result.Rows) != 1 {
 		t.Fatalf("replayed graph slot=%d rows=%v err=%v", result.AppliedSlot, result.Rows, err)
+	}
+}
+
+func TestSQLiteCommitAcknowledgementLossReopensAtCommittedTip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphCommand := types.GraphCommand{
+		RequestID: "sqlite-commit-graph",
+		Cypher:    `CREATE (:Item {id: 'sqlite-committed'})`,
+		Events:    []types.GraphStreamEvent{{Stream: "events", Kind: "created", Payload: "sqlite-committed"}},
+	}
+	graphValue, err := types.EncodeGraphCommand(graphCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decisions := []quepaxa.DecidedValue{
+		{Slot: 1, Value: graphValue},
+		{Slot: 2, Value: policySQL(t, "CREATE TABLE sql_commit_effect (value INTEGER)")},
+		{Slot: 3, Value: policySQL(t, "INSERT INTO sql_commit_effect VALUES (7)")},
+	}
+	commitCause := errors.New("simulated SQLite commit acknowledgement loss")
+	injected := false
+	m.afterApplyCommitError = func() error {
+		injected = true
+		return commitCause
+	}
+	applyErr := m.ApplyBatch(context.Background(), decisions)
+	if !injected || !errors.Is(applyErr, ErrGraphCommitUnknown) || !errors.Is(applyErr, commitCause) {
+		t.Fatalf("ApplyBatch error=%v injected=%v, want unknown commit and cause", applyErr, injected)
+	}
+	if m.Tip() != 0 {
+		t.Fatalf("in-memory tip=%d, want old tip while outcome is unknown", m.Tip())
+	}
+	if _, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil); !errors.Is(err, ErrGraphCommitUnknown) {
+		t.Fatalf("GraphQuery error=%v, want unknown commit", err)
+	}
+	if err := m.ApplyBatch(context.Background(), decisions); !errors.Is(err, ErrGraphCommitUnknown) {
+		t.Fatalf("same-instance ApplyBatch error=%v, want unknown commit", err)
+	}
+	rows, err := m.Query(context.Background(), "SELECT COUNT(*) FROM sql_commit_effect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sqlRows int
+	if !rows.Next() || rows.Scan(&sqlRows) != nil || sqlRows != 1 {
+		rows.Close()
+		t.Fatalf("committed SQL row count=%d, want 1", sqlRows)
+	}
+	rows.Close()
+	if request, found, err := m.graph.request(graphCommand.RequestID); err != nil || !found || request.Receipt.Status != types.MutationCommitted {
+		t.Fatalf("committed graph request=%+v found=%v err=%v", request, found, err)
+	}
+	journalBytes, err := m.graph.getMetadata(graphJournalKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := decodeGraphJournal(journalBytes)
+	if err != nil || len(journal) != 1 || journal[0].Slot != 1 {
+		t.Fatalf("graph journal before reopen=%+v err=%v, want completed slot 1", journal, err)
+	}
+	if _, found, err := m.graph.getMetadataValue(graphPendingKey); err != nil || found {
+		t.Fatalf("pending graph marker before reopen found=%v err=%v", found, err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatalf("reopen committed SQLite state: %v", err)
+	}
+	defer m.Close()
+	if m.Tip() != 3 {
+		t.Fatalf("reopened tip=%d, want committed SQLite tip 3", m.Tip())
+	}
+	if err := m.ApplyBatch(context.Background(), decisions); err != nil {
+		t.Fatalf("replay committed decision prefix: %v", err)
+	}
+	rows, err = m.Query(context.Background(), "SELECT COUNT(*) FROM sql_commit_effect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlRows = 0
+	if !rows.Next() || rows.Scan(&sqlRows) != nil || sqlRows != 1 {
+		rows.Close()
+		t.Fatalf("SQL row count after replay=%d, want 1", sqlRows)
+	}
+	rows.Close()
+	graphResult, err := m.GraphQuery(context.Background(), `MATCH (n:Item {id: 'sqlite-committed'}) RETURN n.id`, nil)
+	if err != nil || graphResult.AppliedSlot != 3 || len(graphResult.Rows) != 1 {
+		t.Fatalf("graph after replay slot=%d rows=%v err=%v", graphResult.AppliedSlot, graphResult.Rows, err)
+	}
+	streamRecords, _, err := m.GraphReadStream(context.Background(), "events", 0, 10, 0)
+	if err != nil || len(streamRecords) != 1 {
+		t.Fatalf("stream after replay records=%v err=%v, want exactly one event", streamRecords, err)
 	}
 }
 
