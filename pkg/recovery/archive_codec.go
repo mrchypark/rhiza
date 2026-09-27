@@ -13,7 +13,7 @@ import (
 var archiveCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 var extentMagic = [8]byte{'R', 'H', 'Z', 'A', 'E', 'X', 'T', '!'}
-var headMagic = [8]byte{'R', 'H', 'Z', 'A', 'H', 'E', 'A', 'D'}
+var headMagic = [8]byte{'R', 'H', 'Z', 'A', 'H', 'D', '2', '!'}
 
 const (
 	extentHeaderSize = 8 + 4 + 4 + 8 + 8 + 4 + 4 + 32 + 32 + 32 + 8
@@ -28,6 +28,14 @@ func archiveDecisionSize(decision quepaxa.DecidedValue) int {
 	return 8 + len(decision.Value) + len(decision.Certificate)
 }
 
+func validateArchivePayload(value, certificate []byte) error {
+	if len(value) == 0 || len(value) > quepaxa.MaxReplicatedValueBytes || len(certificate) == 0 ||
+		len(value) > maxExtentPayload || len(certificate) > maxExtentPayload-len(value) {
+		return fmt.Errorf("invalid archive decision payload size")
+	}
+	return nil
+}
+
 func encodeExtent(extent Extent) ([]byte, error) {
 	if extent.Start == 0 || len(extent.Decisions) == 0 || uint64(extent.Start) > math.MaxUint64-uint64(len(extent.Decisions)-1) || extent.End != extent.Start+quepaxa.Slot(len(extent.Decisions))-1 {
 		return nil, fmt.Errorf("invalid archive extent range")
@@ -35,10 +43,14 @@ func encodeExtent(extent Extent) ([]byte, error) {
 	size := extentHeaderSize + archiveCRCSize
 	prefix := extent.StartPrefix
 	for i, decision := range extent.Decisions {
-		if decision.Slot != extent.Start+quepaxa.Slot(i) || len(decision.Value) == 0 || len(decision.Value) > quepaxa.MaxReplicatedValueBytes || sha256.Sum256(decision.Value) != decision.Hash || len(decision.Certificate) == 0 || len(decision.Certificate) > maxExtentSize {
+		if decision.Slot != extent.Start+quepaxa.Slot(i) || validateArchivePayload(decision.Value, decision.Certificate) != nil || sha256.Sum256(decision.Value) != decision.Hash {
 			return nil, fmt.Errorf("invalid archived decision size")
 		}
-		size += archiveDecisionSize(decision)
+		decisionSize := archiveDecisionSize(decision)
+		if decisionSize > maxExtentSize-size {
+			return nil, fmt.Errorf("invalid archive extent size")
+		}
+		size += decisionSize
 		prefix = quepaxa.AdvancePrefixHash(prefix, decision.Slot, decision.Hash)
 	}
 	if size > maxExtentSize || len(extent.Decisions) > maxExtentItems || prefix != extent.EndPrefix {
@@ -95,7 +107,8 @@ func decodeExtent(data []byte) (Extent, error) {
 		valueLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		certificateLen := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
 		offset += 8
-		if valueLen == 0 || valueLen > quepaxa.MaxReplicatedValueBytes || certificateLen == 0 || valueLen > end-offset || certificateLen > end-offset-valueLen {
+		if valueLen == 0 || valueLen > quepaxa.MaxReplicatedValueBytes || certificateLen == 0 ||
+			valueLen > maxExtentPayload || certificateLen > maxExtentPayload-valueLen || valueLen > end-offset || certificateLen > end-offset-valueLen {
 			return Extent{}, fmt.Errorf("invalid archive decision length")
 		}
 		value := append([]byte(nil), data[offset:offset+valueLen]...)
@@ -114,7 +127,7 @@ func encodeHead(head archiveHead) ([]byte, error) {
 	if head.Tip < head.Base || (head.Tip > head.Base) != (head.TailHash != [32]byte{}) || (head.TailHash == ([32]byte{})) != (head.TailObject == 0) || head.TailObject > head.Generation || head.Tip == head.Base && head.Base > 0 && head.BasePrefix == ([32]byte{}) {
 		return nil, fmt.Errorf("invalid archive head range")
 	}
-	var sealData, decisionData []byte
+	var decisionData []byte
 	flags := uint32(0)
 	if head.Sealed {
 		flags |= headSealed
@@ -131,13 +144,13 @@ func encodeHead(head archiveHead) ([]byte, error) {
 				return nil, fmt.Errorf("archive head base is incomplete")
 			}
 			var err error
-			sealData, err = quepaxa.EncodeCheckpointSeal(*head.BaseSeal)
-			if err != nil {
-				return nil, err
-			}
 			decisionData, err = encodeBaseDecision(*head.BaseDecision)
 			if err != nil {
 				return nil, err
+			}
+			seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(head.BaseDecision.Value)
+			if err != nil || !checkpoint || !checkpointSealsEqual(&seal, head.BaseSeal) {
+				return nil, fmt.Errorf("archive base decision does not match checkpoint seal")
 			}
 			flags |= headHasBase
 		}
@@ -153,9 +166,9 @@ func encodeHead(head archiveHead) ([]byte, error) {
 			flags |= headHasAnchor
 		}
 	}
-	size := headHeaderSize + len(sealData) + len(decisionData) + archiveCRCSize
-	if size > maxHeadSize {
-		return nil, fmt.Errorf("archive head exceeds %d bytes", maxHeadSize)
+	size := headHeaderSize + len(decisionData) + archiveCRCSize
+	if size > maxArchiveHeadSize {
+		return nil, fmt.Errorf("archive head exceeds %d bytes", maxArchiveHeadSize)
 	}
 	buf := make([]byte, size)
 	copy(buf, headMagic[:])
@@ -168,11 +181,9 @@ func encodeHead(head archiveHead) ([]byte, error) {
 	binary.BigEndian.PutUint64(buf[72:80], uint64(head.Tip))
 	copy(buf[80:112], head.TailHash[:])
 	binary.BigEndian.PutUint64(buf[112:120], head.TailObject)
-	binary.BigEndian.PutUint32(buf[120:124], uint32(len(sealData)))
+	binary.BigEndian.PutUint32(buf[120:124], 0)
 	binary.BigEndian.PutUint32(buf[124:128], uint32(len(decisionData)))
 	offset := headHeaderSize
-	copy(buf[offset:], sealData)
-	offset += len(sealData)
 	copy(buf[offset:], decisionData)
 	offset += len(decisionData)
 	binary.BigEndian.PutUint32(buf[offset:], crc32.Checksum(buf[:offset], archiveCRCTable))
@@ -180,7 +191,7 @@ func encodeHead(head archiveHead) ([]byte, error) {
 }
 
 func decodeHead(data []byte) (archiveHead, error) {
-	if len(data) < headHeaderSize+archiveCRCSize || len(data) > maxHeadSize || string(data[:8]) != string(headMagic[:]) || binary.BigEndian.Uint32(data[8:12]) != uint32(len(data)) {
+	if len(data) < headHeaderSize+archiveCRCSize || len(data) > maxArchiveHeadSize || string(data[:8]) != string(headMagic[:]) || binary.BigEndian.Uint32(data[8:12]) != uint32(len(data)) {
 		return archiveHead{}, fmt.Errorf("invalid archive head header")
 	}
 	flags := binary.BigEndian.Uint32(data[12:16])
@@ -202,7 +213,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 	sealLen := int(binary.BigEndian.Uint32(data[120:124]))
 	decisionLen := int(binary.BigEndian.Uint32(data[124:128]))
 	offset, end := headHeaderSize, len(data)-archiveCRCSize
-	if sealLen > end-offset || decisionLen > end-offset-sealLen || offset+sealLen+decisionLen != end {
+	if sealLen != 0 || decisionLen > end-offset || offset+decisionLen != end {
 		return archiveHead{}, fmt.Errorf("invalid archive head payload length")
 	}
 	if flags&headHasBase == 0 && flags&headHasAnchor == 0 {
@@ -217,7 +228,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 		copy(hash[:], data[offset:offset+decisionLen])
 		head.BaseAnchor, head.LineageAnchor = &archiveAnchorRef{Hash: hash}, &archiveAnchorRef{Hash: hash}
 	} else {
-		if head.Base == 0 || head.BasePrefix == ([32]byte{}) || sealLen == 0 || decisionLen == 0 {
+		if head.Base == 0 || head.BasePrefix == ([32]byte{}) || decisionLen == 0 {
 			return archiveHead{}, fmt.Errorf("invalid archive head recovery base")
 		}
 		baseDecisionLen := decisionLen
@@ -227,17 +238,16 @@ func decodeHead(data []byte) (archiveHead, error) {
 			}
 			baseDecisionLen -= sha256.Size
 		}
-		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(data[offset : offset+sealLen])
+		decision, err := decodeBaseDecision(data[offset : offset+baseDecisionLen])
+		if err != nil {
+			return archiveHead{}, err
+		}
+		seal, checkpoint, err := quepaxa.DecodeCheckpointSeal(decision.Value)
 		if err != nil {
 			return archiveHead{}, fmt.Errorf("decode archive checkpoint seal: %w", err)
 		}
 		if !checkpoint {
 			return archiveHead{}, fmt.Errorf("archive base payload is not a checkpoint seal")
-		}
-		offset += sealLen
-		decision, err := decodeBaseDecision(data[offset : offset+baseDecisionLen])
-		if err != nil {
-			return archiveHead{}, err
 		}
 		head.BaseSeal, head.BaseDecision = &seal, &decision
 		if seal.Index != head.Base || seal.PrefixHash != head.BasePrefix {
@@ -257,7 +267,7 @@ func decodeHead(data []byte) (archiveHead, error) {
 }
 
 func encodeBaseDecision(decision quepaxa.DecidedValue) ([]byte, error) {
-	if len(decision.Value) == 0 || len(decision.Certificate) == 0 {
+	if validateArchivePayload(decision.Value, decision.Certificate) != nil || sha256.Sum256(decision.Value) != decision.Hash {
 		return nil, fmt.Errorf("invalid archive base decision")
 	}
 	buf := make([]byte, 16+len(decision.Value)+len(decision.Certificate))
@@ -275,7 +285,8 @@ func decodeBaseDecision(data []byte) (quepaxa.DecidedValue, error) {
 	}
 	valueLen := int(binary.BigEndian.Uint32(data[8:12]))
 	certificateLen := int(binary.BigEndian.Uint32(data[12:16]))
-	if valueLen == 0 || certificateLen == 0 || 16+valueLen+certificateLen != len(data) {
+	if valueLen == 0 || certificateLen == 0 || valueLen > quepaxa.MaxReplicatedValueBytes || valueLen > maxExtentPayload ||
+		certificateLen > maxExtentPayload-valueLen || valueLen > len(data)-16 || certificateLen != len(data)-16-valueLen {
 		return quepaxa.DecidedValue{}, fmt.Errorf("invalid archive base decision length")
 	}
 	value := append([]byte(nil), data[16:16+valueLen]...)

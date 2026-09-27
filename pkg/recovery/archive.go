@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ const (
 	maxExtentItems     = 1024
 	maxExtentPayload   = maxExtentSize - extentHeaderSize - archiveCRCSize - 8
 	maxHeadSize        = 64 << 10
+	maxArchiveHeadSize = headHeaderSize + 16 + maxExtentPayload + sha256.Size + archiveCRCSize
 	archiveGroupDelay  = 2 * time.Millisecond
 	archiveSyncTimeout = 5 * time.Minute
 	maxPublishRetries  = 8
@@ -195,7 +197,7 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	oldExtents, oldHead, oldCAS := slices.Clone(m.extents), m.head, m.headCAS
 	m.mu.Unlock()
 	name := m.key("archive/head.bin")
-	attributes, headData, unchanged, err := m.readStableObject(ctx, name, oldCAS, oldHead.Tip == 0)
+	attributes, headData, unchanged, err := m.readStableObject(ctx, name, oldCAS, oldHead.Tip == 0, maxArchiveHeadSize)
 	if err != nil {
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
@@ -326,7 +328,7 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 	return nil
 }
 
-func (m *Manager) readStableObject(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool) (objstore.ObjectAttributes, []byte, bool, error) {
+func (m *Manager) readStableObject(ctx context.Context, name string, known *objstore.ObjectVersion, allowMissing bool, limit int64) (objstore.ObjectAttributes, []byte, bool, error) {
 	for range maxPublishRetries {
 		beforeCtx := ctx
 		if allowMissing {
@@ -339,7 +341,7 @@ func (m *Manager) readStableObject(ctx context.Context, name string, known *objs
 		if sameObjectVersion(known, before.Version) {
 			return before, nil, true, nil
 		}
-		data, err := m.readObject(ctx, name, maxHeadSize)
+		data, err := m.readObject(ctx, name, limit)
 		if err != nil {
 			return objstore.ObjectAttributes{}, nil, false, err
 		}
@@ -366,10 +368,8 @@ func archiveBaseEqual(a, b archiveHead) bool {
 	if a.Base != b.Base || a.BasePrefix != b.BasePrefix {
 		return false
 	}
-	a.Generation, a.Base, a.BasePrefix, a.Tip, a.TailHash, a.TailObject = 0, 0, [32]byte{}, 0, [32]byte{}, 0
-	b.Generation, b.Base, b.BasePrefix, b.Tip, b.TailHash, b.TailObject = 0, 0, [32]byte{}, 0, [32]byte{}, 0
-	a.Sealed, b.Sealed = false, false
-	return archiveHeadsEqual(a, b)
+	return a.ConfigID == b.ConfigID && checkpointSealsEqual(a.BaseSeal, b.BaseSeal) && archiveDecisionsEqual(a.BaseDecision, b.BaseDecision) &&
+		archiveAnchorsEqual(a.BaseAnchor, b.BaseAnchor) && archiveAnchorsEqual(a.LineageAnchor, b.LineageAnchor)
 }
 
 // CASSupported reports whether the shared mutable head can be published
@@ -418,6 +418,9 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 
 func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoint, decision quepaxa.DecidedValue) error {
 	through, prefix := sealed.Index, sealed.PrefixHash
+	if err := validateArchivePayload(decision.Value, decision.Certificate); err != nil {
+		return fmt.Errorf("archive trim decision: %w", err)
+	}
 	encoded, err := quepaxa.EncodeCheckpointSeal(sealed.CheckpointSeal)
 	if err != nil || !bytes.Equal(encoded, decision.Value) || decision.Slot != sealed.DecisionSlot {
 		return fmt.Errorf("archive trim requires the certified checkpoint decision")
@@ -477,7 +480,7 @@ func (m *Manager) trimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 
 func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead, priorCAS *objstore.ObjectVersion, refs []Extent, candidates ...Extent) error {
 	name := m.key("archive/head.bin")
-	attributes, data, _, err := m.readStableObject(ctx, name, nil, false)
+	attributes, data, _, err := m.readStableObject(ctx, name, nil, false, maxArchiveHeadSize)
 	if err != nil {
 		return err
 	}
@@ -881,8 +884,8 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 	if err != nil {
 		return err
 	}
-	if len(data) > maxHeadSize {
-		return fmt.Errorf("archive head exceeds %d bytes", maxHeadSize)
+	if len(data) > maxArchiveHeadSize {
+		return fmt.Errorf("archive head exceeds %d bytes", maxArchiveHeadSize)
 	}
 	var options []objstore.ObjectUploadOption
 	if m.cas {
@@ -1389,7 +1392,7 @@ func (m *Manager) confirmGCLock(ctx context.Context, expected archiveGCLock) (*a
 
 func (m *Manager) readGCLock(ctx context.Context) (*archiveGCLock, error) {
 	key := m.gcLockKey()
-	attributes, data, _, err := m.readStableObject(ctx, key, nil, false)
+	attributes, data, _, err := m.readStableObject(ctx, key, nil, false, maxHeadSize)
 	if err != nil {
 		return nil, err
 	}
@@ -1414,7 +1417,7 @@ func (m *Manager) writeGCLock(ctx context.Context, lock archiveGCLock, options .
 }
 
 func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*archiveRecoveryPin, error) {
-	attributes, data, _, err := m.readStableObject(ctx, key, nil, false)
+	attributes, data, _, err := m.readStableObject(ctx, key, nil, false, maxHeadSize)
 	if err != nil {
 		return nil, err
 	}
@@ -1566,9 +1569,22 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 }
 
 func archiveHeadsEqual(a, b archiveHead) bool {
-	aData, _ := encodeHead(a)
-	bData, _ := encodeHead(b)
-	return bytes.Equal(aData, bData)
+	return a.ConfigID == b.ConfigID && a.Generation == b.Generation && a.Base == b.Base && a.BasePrefix == b.BasePrefix &&
+		checkpointSealsEqual(a.BaseSeal, b.BaseSeal) && archiveDecisionsEqual(a.BaseDecision, b.BaseDecision) &&
+		archiveAnchorsEqual(a.BaseAnchor, b.BaseAnchor) && archiveAnchorsEqual(a.LineageAnchor, b.LineageAnchor) &&
+		a.Tip == b.Tip && a.TailHash == b.TailHash && a.TailObject == b.TailObject && a.Sealed == b.Sealed
+}
+
+func checkpointSealsEqual(a, b *quepaxa.CheckpointSeal) bool {
+	return a == nil && b == nil || a != nil && b != nil && reflect.DeepEqual(*a, *b)
+}
+
+func archiveDecisionsEqual(a, b *quepaxa.DecidedValue) bool {
+	return a == nil && b == nil || a != nil && b != nil && a.Slot == b.Slot && a.Hash == b.Hash && bytes.Equal(a.Value, b.Value) && bytes.Equal(a.Certificate, b.Certificate)
+}
+
+func archiveAnchorsEqual(a, b *archiveAnchorRef) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
 func (m *Manager) extentAtLocked(ctx context.Context, index int) (Extent, error) {
