@@ -47,28 +47,29 @@ type Transport interface {
 
 // Core runs one QuePaxa proposer and recorder per replica.
 type Core struct {
-	nodeID               NodeID
-	config               *Cluster
-	wal                  *qlog.WAL
-	transport            Transport
-	observer             bool
-	learner              bool
-	localMode            bool
-	localExecutionOwner  chan struct{}
-	walIdentity          string
-	reconfigEnabled      bool
-	reconfigWAL          bool
-	reconfigAdmission    func(context.Context, Cluster, Slot, [32]byte) error
-	configHistory        []configEpoch
-	retiredIDs           map[NodeID]struct{}
-	baseMembership       *MembershipRecord
-	membershipVersion    uint64
-	lastAbort            *ConfigTransition
-	generationAnchorHash [32]byte
-	reconfiguration      *reconfigurationState
-	reconfigurationMu    sync.Mutex
-	priority             func() (Priority, error)
-	recordBeforeAppend   func()
+	nodeID                  NodeID
+	config                  *Cluster
+	wal                     *qlog.WAL
+	transport               Transport
+	observer                bool
+	learner                 bool
+	localMode               bool
+	localExecutionOwner     chan struct{}
+	localRecordAttemptLimit int // private test seam; zero selects the production limit
+	walIdentity             string
+	reconfigEnabled         bool
+	reconfigWAL             bool
+	reconfigAdmission       func(context.Context, Cluster, Slot, [32]byte) error
+	configHistory           []configEpoch
+	retiredIDs              map[NodeID]struct{}
+	baseMembership          *MembershipRecord
+	membershipVersion       uint64
+	lastAbort               *ConfigTransition
+	generationAnchorHash    [32]byte
+	reconfiguration         *reconfigurationState
+	reconfigurationMu       sync.Mutex
+	priority                func() (Priority, error)
+	recordBeforeAppend      func()
 
 	slotMu              sync.Mutex
 	nextSlot            Slot
@@ -401,43 +402,59 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 }
 
 func (c *Core) StageValue(hash ValueHash, value []byte) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
+	return c.stageValue(hash, value)
+}
+
+var errLocalExternalMutation = errors.New("local QuePaxa mutation requires the execution owner")
+
+func (c *Core) stageValue(hash ValueHash, value []byte) error {
 	if len(value) == 0 || len(value) > MaxReplicatedValueBytes || sha256.Sum256(value) != hash {
 		return fmt.Errorf("invalid QuePaxa value")
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stageValueLocked(hash, value)
+}
+
+func (c *Core) stageValueLocked(hash ValueHash, value []byte) error {
 	if existing, ok := c.values[hash]; ok {
 		if !bytes.Equal(existing, value) {
-			c.mu.Unlock()
 			return fmt.Errorf("QuePaxa value hash collision")
 		}
 		if c.compactionValues != nil {
 			key := [32]byte(hash)
 			if _, retained := c.compactionValues[key]; !retained {
 				if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
-					c.mu.Unlock()
 					return err
 				}
 				c.compactionValues[key] = struct{}{}
 			}
 		}
-		c.mu.Unlock()
 		return nil
 	}
 	if err := c.wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: append([]byte(nil), value...)}); err != nil {
-		c.mu.Unlock()
 		return err
 	}
 	c.values[hash] = append([]byte(nil), value...)
 	if c.compactionValues != nil {
 		c.compactionValues[[32]byte(hash)] = struct{}{}
 	}
-	c.mu.Unlock()
 	return nil
 }
 
 // StoreValue durably installs one content-addressed proposal value.
 func (c *Core) StoreValue(hash ValueHash, value []byte) error {
-	if err := c.StageValue(hash, value); err != nil {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
+	return c.storeValue(hash, value)
+}
+
+func (c *Core) storeValue(hash ValueHash, value []byte) error {
+	if err := c.stageValue(hash, value); err != nil {
 		return err
 	}
 	c.mu.RLock()
@@ -516,7 +533,7 @@ func (c *Core) hydrateProposal(ctx context.Context, proposal *Proposal, sources 
 			if len(result.value) == 0 {
 				continue
 			}
-			if err := c.StoreValue(proposal.Hash, result.value); err != nil {
+			if err := c.storeValue(proposal.Hash, result.value); err != nil {
 				return err
 			}
 			proposal.Value = result.value
@@ -931,11 +948,17 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 	leader := leaderOrder[0]
 	proposal := newProposal(highestPriority, c.nodeID, value)
 	step := Step(4)
+	localRecordAttempts := 0
 	for {
 		if decided, ok := c.decision(slot); ok {
 			decision, err := decodeDecision(decided.Certificate)
 			decision.Proposal.Value = append([]byte(nil), decided.Value...)
 			return decision, err
+		}
+		if c.localMode {
+			if err := c.validateLocalPendingISR(slot); err != nil {
+				return Decision{}, err
+			}
 		}
 
 		candidate := proposal
@@ -984,6 +1007,11 @@ func (c *Core) runSlot(ctx context.Context, slot Slot, value []byte, allowLeader
 			requests[member.ID] = RecordRequest{Slot: slot, Step: step, ConfigID: configID, ReconfigurationID: reconfigurationID, Proposal: candidate}
 		}
 
+		if c.localMode {
+			if !c.takeLocalRecordAttempt(&localRecordAttempts) {
+				return Decision{}, fmt.Errorf("local QuePaxa record attempt limit exceeded at slot %d", slot)
+			}
+		}
 		summaries, err := c.recordQuorum(ctx, requests)
 		if err != nil {
 			return Decision{}, err
@@ -1099,7 +1127,7 @@ func (c *Core) recordQuorum(ctx context.Context, requests map[NodeID]RecordReque
 		if !ok {
 			return nil, ErrQuorumUnavailable
 		}
-		summary, err := c.Record(ctx, request)
+		summary, err := c.recordLocalOwned(ctx, request)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrQuorumUnavailable, err)
 		}
@@ -1162,8 +1190,139 @@ func nextRequestSlot(requests map[NodeID]RecordRequest) Slot {
 	return 0
 }
 
-// Record durably applies the paper's Algorithm 3 before replying.
+// Record durably applies the paper's Algorithm 3 before replying. Explicit
+// Local cores reserve recorder writes for the owner-held local proposal path.
 func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, error) {
+	if c.localMode {
+		return Summary{}, errLocalExternalMutation
+	}
+	return c.record(ctx, request)
+}
+
+// recordLocalOwned is the only explicit-Local recorder path. The caller holds
+// localExecutionOwner; the slot lock then makes validation, staging, and the
+// receipt append one indivisible Local mutation.
+func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Summary, error) {
+	if !c.localMode || c.observer || c.reconfigEnabled {
+		return Summary{}, ErrQuorumUnavailable
+	}
+	if len(c.localExecutionOwner) == 0 {
+		return Summary{}, errLocalExternalMutation
+	}
+	if request.Slot == 0 || request.Step < 4 {
+		return Summary{}, fmt.Errorf("invalid QuePaxa slot or step")
+	}
+	lock := &c.recordLocks[uint64(request.Slot)%uint64(len(c.recordLocks))]
+	lock.Lock()
+	defer lock.Unlock()
+	if err := c.rejectCompacted(request.Slot); err != nil {
+		return Summary{}, err
+	}
+	if len(request.Proposal.Value) != 0 && (len(request.Proposal.Value) > MaxReplicatedValueBytes || sha256.Sum256(request.Proposal.Value) != request.Proposal.Hash) {
+		return Summary{}, fmt.Errorf("invalid QuePaxa value")
+	}
+	if _, control, err := decodeReconfiguration(request.Proposal.Value); err != nil {
+		return Summary{}, err
+	} else if control {
+		return Summary{}, fmt.Errorf("reconfiguration control is disabled")
+	}
+	if err := c.validateCheckpointValue(ctx, request.Proposal.Hash); err != nil {
+		return Summary{}, err
+	}
+	c.mu.Lock()
+	if err := c.compactedErrorLocked(request.Slot); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
+	state := c.recorders[request.Slot]
+	if err := c.validateLocalISRLocked(request.Slot, state, nil); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
+	if decided, ok := c.decided[request.Slot]; ok {
+		if !c.durable[request.Slot] && !c.logged[request.Slot] {
+			if err := c.appendDecision(decided); err != nil {
+				c.mu.Unlock()
+				return Summary{}, err
+			}
+			c.logged[request.Slot] = true
+		}
+		decision, err := decodeDecision(decided.Certificate)
+		if err != nil {
+			c.mu.Unlock()
+			return Summary{}, err
+		}
+		decision.Proposal.Value = append([]byte(nil), decided.Value...)
+		step := max(decision.Step, request.Step)
+		summary := Summary{RecorderID: c.nodeID, Step: step, FirstCurrent: cloneProposal(&decision.Proposal), AggregatePrior: cloneProposal(&decision.Proposal)}
+		needsSync := !c.durable[request.Slot]
+		c.mu.Unlock()
+		if needsSync {
+			if err := c.commits.Sync(ctx); err != nil {
+				return Summary{}, err
+			}
+			c.mu.Lock()
+			c.durable[request.Slot] = true
+			c.valueDurable[decided.Hash] = true
+			c.mu.Unlock()
+		}
+		return summary, nil
+	}
+	known := sameProposal(state.FirstCurrent, &request.Proposal) || sameProposal(state.AggregateCurrent, &request.Proposal) || sameProposal(state.AggregatePrior, &request.Proposal)
+	value := request.Proposal.Value
+	if len(value) == 0 {
+		value = c.values[request.Proposal.Hash]
+	}
+	if len(value) == 0 {
+		c.mu.Unlock()
+		return Summary{}, fmt.Errorf("proposal value is unavailable")
+	}
+	if sha256.Sum256(value) != request.Proposal.Hash {
+		c.mu.Unlock()
+		return Summary{}, fmt.Errorf("proposal hash mismatch")
+	}
+	if !known && len(request.Proposal.Value) == 0 && c.values[request.Proposal.Hash] == nil {
+		c.mu.Unlock()
+		return Summary{}, fmt.Errorf("proposal value is unavailable")
+	}
+	proposal := request.Proposal
+	proposal.Value = nil
+	next, summary := state.Record(request.Step, proposal)
+	if err := c.validateLocalISRLocked(request.Slot, next, &request.Proposal); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
+	if len(request.Proposal.Value) != 0 {
+		if err := c.stageValueLocked(request.Proposal.Hash, request.Proposal.Value); err != nil {
+			c.mu.Unlock()
+			return Summary{}, err
+		}
+	}
+	if c.recordBeforeAppend != nil {
+		c.recordBeforeAppend()
+	}
+	request.Proposal.Value = nil
+	if _, ok := c.epochStart[c.leaderEpochKeyLocked(request.Slot)]; !ok {
+		c.epochStart[c.leaderEpochKeyLocked(request.Slot)] = c.now()
+	}
+	summary.RecorderID = c.nodeID
+	payload := encodeRecorderEntry(request.Slot, next, false)
+	if err := c.wal.Append(qlog.Entry{Slot: uint64(request.Slot), Hash: request.Proposal.Hash, Type: qlog.EntryReceipt, Payload: payload}); err != nil {
+		c.mu.Unlock()
+		return Summary{}, err
+	}
+	c.recorders[request.Slot] = next
+	c.mu.Unlock()
+	if err := c.commits.Sync(ctx); err != nil {
+		return Summary{}, err
+	}
+	c.mu.Lock()
+	c.valueDurable[request.Proposal.Hash] = true
+	c.mu.Unlock()
+	return summary, nil
+}
+
+func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, error) {
 	if c.observer {
 		return Summary{}, ErrQuorumUnavailable
 	}
@@ -1232,7 +1391,7 @@ func (c *Core) Record(ctx context.Context, request RecordRequest) (Summary, erro
 		return Summary{}, err
 	}
 	if len(request.Proposal.Value) != 0 && len(request.Proposal.Value) <= MaxReplicatedValueBytes {
-		if err := c.StageValue(request.Proposal.Hash, request.Proposal.Value); err != nil {
+		if err := c.stageValue(request.Proposal.Hash, request.Proposal.Value); err != nil {
 			return Summary{}, err
 		}
 	}
@@ -1501,6 +1660,16 @@ func (c *Core) RequirePreparedCheckpoint(seal CheckpointSeal) error {
 // PrepareCheckpoint verifies a candidate outside Record RPC and persists the
 // verified identity before this node may vote for its seal.
 func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error {
+	if c.localMode {
+		if err := c.acquireLocalExecution(ctx); err != nil {
+			return err
+		}
+		defer c.releaseLocalExecution()
+	}
+	return c.prepareCheckpointOwned(ctx, seal)
+}
+
+func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) error {
 	c.checkpointMu.Lock()
 	defer c.checkpointMu.Unlock()
 	verified, validator, err := c.checkpointIdentity(seal)
@@ -1596,11 +1765,25 @@ func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotV
 
 // VerifyCheckpoint preserves the public API while using the prepare protocol.
 func (c *Core) VerifyCheckpoint(ctx context.Context, seal CheckpointSeal) error {
+	if c.localMode {
+		if err := c.acquireLocalExecution(ctx); err != nil {
+			return err
+		}
+		defer c.releaseLocalExecution()
+		return c.prepareCheckpointOwned(ctx, seal)
+	}
 	return c.PrepareCheckpoint(ctx, seal)
 }
 
 // AcceptDecision validates Algorithm 4 quorum evidence and records the decision durably.
 func (c *Core) AcceptDecision(decision Decision) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
+	return c.acceptDecisionDurable(decision)
+}
+
+func (c *Core) acceptDecisionDurable(decision Decision) error {
 	lock := &c.recordLocks[uint64(decision.Slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	defer lock.Unlock()
@@ -1614,6 +1797,9 @@ func (c *Core) AcceptDecision(decision Decision) error {
 // barrier. The durable recorder quorum remains the recovery source; catch-up
 // callers that require a local durable copy use AcceptDecision instead.
 func (c *Core) AcceptDecisionHint(decision Decision) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	if c.reconfigEnabled {
 		if _, control, err := decodeReconfiguration(decision.Proposal.Value); err != nil {
 			return err
@@ -1630,6 +1816,16 @@ func (c *Core) AcceptDecisionHint(decision Decision) error {
 // EnsureDurable ensures the slot has a durable local decision marker or is
 // already covered by the certified recovery base.
 func (c *Core) EnsureDurable(slot Slot) error {
+	if c.localMode {
+		if err := c.acquireLocalExecution(context.Background()); err != nil {
+			return err
+		}
+		defer c.releaseLocalExecution()
+	}
+	return c.ensureDurable(slot)
+}
+
+func (c *Core) ensureDurable(slot Slot) error {
 	lock := &c.recordLocks[uint64(slot)%uint64(len(c.recordLocks))]
 	lock.Lock()
 	defer lock.Unlock()
@@ -1639,6 +1835,16 @@ func (c *Core) EnsureDurable(slot Slot) error {
 // EnsureDurableThrough persists the retained decision prefix with one sync.
 // Decisions already covered by the certified recovery base need no marker.
 func (c *Core) EnsureDurableThrough(ctx context.Context, through Slot) error {
+	if c.localMode {
+		if err := c.acquireLocalExecution(ctx); err != nil {
+			return err
+		}
+		defer c.releaseLocalExecution()
+	}
+	return c.ensureDurableThroughOwned(ctx, through)
+}
+
+func (c *Core) ensureDurableThroughOwned(ctx context.Context, through Slot) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -1731,6 +1937,12 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 // CompleteDecision makes an existing decision safe to acknowledge by
 // re-establishing the learner quorum required by ReadIndex.
 func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, error) {
+	if c.localMode {
+		if err := c.acquireLocalExecution(ctx); err != nil {
+			return DecidedValue{}, err
+		}
+		defer c.releaseLocalExecution()
+	}
 	return c.completeDecision(ctx, slot, true)
 }
 
@@ -2000,15 +2212,30 @@ func (c *Core) recoverThroughOwned(ctx context.Context, through Slot) error {
 			return err
 		}
 		slot := c.Tip() + 1
-		value, err := c.recoveryValue(ctx, slot)
-		if err != nil {
-			return fmt.Errorf("recover slot %d value: %w", slot, err)
+		var decision Decision
+		if decided, ok := c.decision(slot); ok {
+			var err error
+			decision, err = decodeDecision(decided.Certificate)
+			if err != nil {
+				return fmt.Errorf("recover slot %d certificate: %w", slot, err)
+			}
+			decision.Proposal.Value = append([]byte(nil), decided.Value...)
+		} else {
+			if c.localMode {
+				if err := c.validateLocalPendingISR(slot); err != nil {
+					return err
+				}
+			}
+			value, err := c.recoveryValue(ctx, slot)
+			if err != nil {
+				return fmt.Errorf("recover slot %d value: %w", slot, err)
+			}
+			decision, err = c.runSlot(ctx, slot, value, false)
+			if err != nil {
+				return fmt.Errorf("recover slot %d: %w", slot, err)
+			}
 		}
-		decision, err := c.runSlot(ctx, slot, value, false)
-		if err != nil {
-			return fmt.Errorf("recover slot %d: %w", slot, err)
-		}
-		if err := c.AcceptDecision(decision); err != nil {
+		if err := c.acceptDecisionDurable(decision); err != nil {
 			return fmt.Errorf("persist recovered slot %d: %w", slot, err)
 		}
 		if c.Tip() < slot {
@@ -2031,6 +2258,75 @@ func (c *Core) acquireLocalExecution(ctx context.Context) error {
 }
 
 func (c *Core) releaseLocalExecution() { <-c.localExecutionOwner }
+
+func (c *Core) takeLocalRecordAttempt(attempts *int) bool {
+	limit := c.localRecordAttemptLimit
+	if limit == 0 {
+		limit = 3
+	}
+	if *attempts >= limit {
+		return false
+	}
+	(*attempts)++
+	return true
+}
+
+func (c *Core) validateLocalPendingISR(slot Slot) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.validateLocalISRLocked(slot, c.recorders[slot], nil)
+}
+
+// validateLocalISRLocked accepts only reachable one-voter recorder states.
+// Existing references must already resolve to retained, hash-matching values;
+// incoming is permitted only for a reference introduced by this transition.
+func (c *Core) validateLocalISRLocked(slot Slot, state ISR, incoming *Proposal) error {
+	invalid := func(reason string) error {
+		return fmt.Errorf("unsupported pending local ISR at slot %d: %s", slot, reason)
+	}
+	validRef := func(proposal *Proposal) error {
+		if proposal == nil {
+			return nil
+		}
+		if proposal.ProposerID != c.nodeID || len(proposal.Value) != 0 {
+			return invalid("proposal reference is not value-stripped local state")
+		}
+		value, ok := c.values[proposal.Hash]
+		if incoming != nil && sameProposal(proposal, incoming) && len(incoming.Value) != 0 {
+			value, ok = incoming.Value, true
+		}
+		if !ok || len(value) == 0 || sha256.Sum256(value) != proposal.Hash {
+			return invalid("proposal reference has no retained hash-matching value")
+		}
+		return nil
+	}
+	for _, proposal := range []*Proposal{state.FirstCurrent, state.AggregateCurrent, state.AggregatePrior} {
+		if err := validRef(proposal); err != nil {
+			return err
+		}
+	}
+	switch state.Step {
+	case 0:
+		if state.FirstCurrent != nil || state.AggregateCurrent != nil || state.AggregatePrior != nil {
+			return invalid("step 0 requires an empty register")
+		}
+	case 4:
+		if state.FirstCurrent == nil || state.AggregateCurrent == nil || state.AggregatePrior != nil || compareProposal(state.AggregateCurrent, state.FirstCurrent) < 0 {
+			return invalid("step 4 requires F and A with A >= F and no P")
+		}
+	case 5:
+		if state.FirstCurrent == nil || state.AggregateCurrent == nil || state.AggregatePrior == nil || !sameProposal(state.FirstCurrent, state.AggregateCurrent) || compareProposal(state.AggregatePrior, state.FirstCurrent) < 0 {
+			return invalid("step 5 requires F = A and P >= F")
+		}
+	case 6:
+		if state.FirstCurrent == nil || state.AggregateCurrent == nil || state.AggregatePrior == nil || !sameProposal(state.FirstCurrent, state.AggregateCurrent) || !sameProposal(state.FirstCurrent, state.AggregatePrior) {
+			return invalid("step 6 requires F = A = P")
+		}
+	default:
+		return invalid("step is not reachable by the local proposer")
+	}
+	return nil
+}
 
 func (c *Core) recoveryValue(ctx context.Context, slot Slot) ([]byte, error) {
 	c.mu.RLock()
@@ -2210,6 +2506,9 @@ func decodeDecision(certificate []byte) (Decision, error) {
 
 // AcceptCertifiedValue binds catch-up metadata to its certificate before mutation.
 func (c *Core) AcceptCertifiedValue(value DecidedValue) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	return c.AcceptCertifiedValues([]DecidedValue{value})
 }
 
@@ -2217,6 +2516,9 @@ func (c *Core) AcceptCertifiedValue(value DecidedValue) error {
 // already named by its durable recorder certificate does not need a second
 // local disk barrier; every other voter persists the decision before ACK.
 func (c *Core) AcceptCertifiedValueForAck(value DecidedValue) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	decision, err := c.certifiedDecision(value)
 	if err != nil {
 		return err
@@ -2244,12 +2546,18 @@ func (c *Core) AcceptCertifiedValueForAck(value DecidedValue) error {
 
 // AcceptCertifiedValues validates and persists a catch-up page with one sync.
 func (c *Core) AcceptCertifiedValues(values []DecidedValue) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	return c.acceptCertifiedValues(values, true)
 }
 
 // AcceptCertifiedHints installs an on-demand page without adding a frontend
 // disk barrier; the source recorder quorum remains durable.
 func (c *Core) AcceptCertifiedHints(values []DecidedValue) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	return c.acceptCertifiedValues(values, false)
 }
 
@@ -2561,6 +2869,16 @@ func (c *Core) PrefixHash(slot Slot) ([32]byte, bool) {
 // returns the authenticated decision-prefix hash. Reconfiguration mode keeps
 // the whole WAL, so a compacted floor is deliberately rejected here.
 func (c *Core) DurablePrefix(through Slot) ([32]byte, error) {
+	if c.localMode {
+		if err := c.acquireLocalExecution(context.Background()); err != nil {
+			return [32]byte{}, err
+		}
+		defer c.releaseLocalExecution()
+	}
+	return c.durablePrefixOwned(through)
+}
+
+func (c *Core) durablePrefixOwned(through Slot) ([32]byte, error) {
 	if through == 0 {
 		return [32]byte{}, nil
 	}
@@ -2575,7 +2893,7 @@ func (c *Core) DurablePrefix(through Slot) ([32]byte, error) {
 	}
 	c.mu.RUnlock()
 	for slot := Slot(1); slot <= through; slot++ {
-		if err := c.EnsureDurable(slot); err != nil {
+		if err := c.ensureDurable(slot); err != nil {
 			return [32]byte{}, err
 		}
 	}

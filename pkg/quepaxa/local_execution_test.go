@@ -77,7 +77,7 @@ func TestLocalProposeRecoversPendingRecorderBeforeAllocating(t *testing.T) {
 	core, wal := localReserveCore(t, t.TempDir(), "local")
 	defer wal.Close()
 	proposal := newProposal(highestPriority, "local", []byte("already recorded"))
-	if _, err := core.Record(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
+	if _, err := localRecordForTest(t, core, RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
 		t.Fatal(err)
 	}
 	if core.RecorderTip() <= core.Tip() {
@@ -100,7 +100,7 @@ func TestLocalPendingRecoveryFailureOrCancellationDoesNotAllocate(t *testing.T) 
 		core, wal := localReserveCore(t, t.TempDir(), "local")
 		defer wal.Close()
 		proposal := newProposal(highestPriority, "local", []byte("pending"))
-		if _, err := core.Record(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
+		if _, err := localRecordForTest(t, core, RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
 			t.Fatal(err)
 		}
 		started, release := makeOneShotRecordBarrier(core)
@@ -127,7 +127,7 @@ func TestLocalPendingRecoveryFailureOrCancellationDoesNotAllocate(t *testing.T) 
 	t.Run("recovery error", func(t *testing.T) {
 		core, wal := localReserveCore(t, t.TempDir(), "local")
 		proposal := newProposal(highestPriority, "local", []byte("pending"))
-		if _, err := core.Record(context.Background(), RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
+		if _, err := localRecordForTest(t, core, RecordRequest{Slot: 1, Step: 4, Proposal: proposal}); err != nil {
 			t.Fatal(err)
 		}
 		if err := wal.Close(); err != nil {
@@ -153,6 +153,26 @@ func TestNonLocalExecutionDoesNotUseLocalOwner(t *testing.T) {
 		t.Fatalf("non-local acquire error=%v, want bypass", err)
 	}
 	<-core.localExecutionOwner
+}
+
+func TestLocalPublicDurabilityHelpersDoNotReenterOwner(t *testing.T) {
+	core, wal := localReserveCore(t, t.TempDir(), "local")
+	defer wal.Close()
+	if slot, _, err := core.Propose(context.Background(), []byte("durability helpers")); err != nil || slot != 1 {
+		t.Fatalf("Propose slot=%d err=%v", slot, err)
+	}
+	if err := core.EnsureDurable(1); err != nil {
+		t.Fatalf("EnsureDurable: %v", err)
+	}
+	if err := core.EnsureDurableThrough(context.Background(), 1); err != nil {
+		t.Fatalf("EnsureDurableThrough: %v", err)
+	}
+	if _, err := core.CompleteDecision(context.Background(), 1); err != nil {
+		t.Fatalf("CompleteDecision: %v", err)
+	}
+	if _, err := core.DurablePrefix(1); err != nil {
+		t.Fatalf("DurablePrefix: %v", err)
+	}
 }
 
 func makeOneShotRecordBarrier(core *Core) (started, release chan struct{}) {

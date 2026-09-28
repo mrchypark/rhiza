@@ -12,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	flatbuffers "github.com/google/flatbuffers/go"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/quepaxa/walfb"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/ncruces/go-sqlite3/driver"
 	objstore "github.com/thanos-io/objstore"
@@ -405,22 +407,19 @@ func TestLocalModeRecoversUndecidedRecorderState(t *testing.T) {
 	if err := n.Open(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := n.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "recorded", SQL: "CREATE TABLE recorded(id INTEGER)"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = n.core.Record(ctx, quepaxa.RecordRequest{Slot: 1, Step: 4, Proposal: quepaxa.Proposal{
-		Priority: quepaxa.Priority{1}, ProposerID: "local", Hash: sha256.Sum256(value), Value: value,
-	}})
+	wal, err := qlog.Open(filepath.Join(config.DataDir, "qlog"))
 	if err != nil {
-		n.Shutdown()
 		t.Fatal(err)
 	}
-	if n.core.Tip() != 0 || n.core.RecorderTip() != 1 {
-		n.Shutdown()
-		t.Fatal("fixture already decided")
-	}
-	if err := n.Shutdown(); err != nil {
+	appendLocalRecorderFixture(t, wal, value)
+	if err := wal.Close(); err != nil {
 		t.Fatal(err)
 	}
 	n = New(&config)
@@ -432,6 +431,34 @@ func TestLocalModeRecoversUndecidedRecorderState(t *testing.T) {
 		t.Fatalf("recovered tip=%d", n.core.Tip())
 	}
 	if _, err := n.server.Query(ctx, network.QueryRequest{SQL: "SELECT * FROM recorded", Consistency: "linearizable"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendLocalRecorderFixture(t *testing.T, wal *qlog.WAL, value []byte) {
+	t.Helper()
+	hash := sha256.Sum256(value)
+	priority := make([]byte, 32)
+	for i := range priority {
+		priority[i] = 0xff
+	}
+	proposal := &walfb.ProposalT{Priority: priority, ProposerId: "local", Hash: hash[:]}
+	builder := flatbuffers.NewBuilder(256)
+	first := proposal.Pack(builder)
+	walfb.RecorderStateStart(builder)
+	walfb.RecorderStateAddSlot(builder, 1)
+	walfb.RecorderStateAddStep(builder, 4)
+	walfb.RecorderStateAddFirstCurrent(builder, first)
+	walfb.RecorderStateAddAggregateCurrent(builder, first)
+	offset := walfb.RecorderStateEnd(builder)
+	walfb.FinishRecorderStateBuffer(builder, offset)
+	if err := wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: value}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(qlog.Entry{Slot: 1, Hash: hash, Type: qlog.EntryReceipt, Payload: append([]byte("QISR\x00"), builder.FinishedBytes()...)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Sync(); err != nil {
 		t.Fatal(err)
 	}
 }

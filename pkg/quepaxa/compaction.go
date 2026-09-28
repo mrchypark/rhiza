@@ -14,6 +14,9 @@ import (
 // verifying both the checkpoint bytes and the consensus certificate that
 // sealed that exact root.
 func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, certified DecidedValue) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	if c.Tip() >= seal.Index {
 		return fmt.Errorf("invalid checkpoint recovery base")
 	}
@@ -64,6 +67,9 @@ func (c *Core) RestoreCheckpointBase(ctx context.Context, seal CheckpointSeal, c
 // verified recovery floor. Its anchor is administrative lineage evidence, not
 // a substitute for a source quorum certificate.
 func (c *Core) InstallFencedGenerationBase(ctx context.Context, fenced FencedGenerationBase) error {
+	if c.localMode {
+		return errLocalExternalMutation
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -220,6 +226,16 @@ type consensusBase struct {
 // CompactThrough installs a certified local recovery floor. Callers must have
 // independently verified and quorum-sealed recoveryRoot before invoking it.
 func (c *Core) CompactThrough(through Slot, recoveryRoot [32]byte) error {
+	if c.localMode {
+		if err := c.acquireLocalExecution(context.Background()); err != nil {
+			return err
+		}
+		defer c.releaseLocalExecution()
+	}
+	return c.compactThroughOwned(through, recoveryRoot)
+}
+
+func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 	if through == 0 || recoveryRoot == ([32]byte{}) {
 		return fmt.Errorf("invalid consensus compaction floor")
 	}
