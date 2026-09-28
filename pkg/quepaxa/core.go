@@ -54,6 +54,7 @@ type Core struct {
 	observer                bool
 	learner                 bool
 	localMode               bool
+	localCost               localCostModel
 	localExecutionOwner     chan struct{}
 	localRecordAttemptLimit int // private test seam; zero selects the production limit
 	walIdentity             string
@@ -2129,12 +2130,11 @@ func (c *Core) advanceReconfigurationTipLocked() error {
 
 // appendDecision writes metadata already validated when the value was installed.
 func (c *Core) appendDecision(value DecidedValue) error {
-	record, err := encodeDecisionRecord(value.Value, value.Certificate)
+	entry, err := decisionEntry(value)
 	if err != nil {
 		return err
 	}
-	payload := append(append([]byte(nil), decisionEntryMagic...), record...)
-	return c.wal.Append(qlog.Entry{Slot: uint64(value.Slot), Hash: value.Hash, Type: qlog.EntryDecide, Payload: payload})
+	return c.wal.Append(entry)
 }
 
 // RecorderTip returns the highest slot represented by recovered durable ISR
