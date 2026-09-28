@@ -561,6 +561,9 @@ func (c *Core) installBaseLocked(base consensusBase) {
 	c.prefixes[base.ClosedThrough] = base.PrefixHash
 	for slot := range c.decided {
 		if slot <= base.ClosedThrough {
+			if c.localMode && !c.logged[slot] && c.localUnloggedCount > 0 {
+				c.localUnloggedCount--
+			}
 			delete(c.decided, slot)
 			delete(c.durable, slot)
 			delete(c.logged, slot)

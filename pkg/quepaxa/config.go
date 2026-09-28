@@ -22,6 +22,9 @@ type Config struct {
 	// path; use a non-Local Core for externally supplied recorder state.
 	LocalMode bool
 	// WAL must be open for the Core's lifetime; the caller retains ownership.
+	// With LocalMode, the caller must configure a finite positive hard byte
+	// limit before New and must not append, compact, change that limit, bind, or
+	// share the WAL while Core is active. Close it only after Core has stopped.
 	WAL       *qlog.WAL
 	Transport Transport
 	// EnableReconfiguration opts into the bounded, in-band prototype. It is
@@ -63,6 +66,13 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	}
 	var localCost localCostModel
 	if config.LocalMode {
+		capacity := config.WAL.Capacity()
+		if capacity.Fatal != nil {
+			return nil, capacity.Fatal
+		}
+		if capacity.Limit <= 0 || capacity.Used < 0 {
+			return nil, fmt.Errorf("%w: Local mode requires a finite positive WAL capacity", ErrInvalidConfig)
+		}
 		var err error
 		localCost, err = newLocalCostModel(config.NodeID, config.Cluster.ConfigID)
 		if err != nil {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -31,9 +32,16 @@ func (c observedCancelContext) Done() <-chan struct{} {
 }
 
 func newLocalLifecycleServer(t *testing.T) (*Server, *materializer.Materializer, *qlog.WAL) {
+	return newLocalLifecycleServerWithLimit(t, math.MaxInt64)
+}
+
+func newLocalLifecycleServerWithLimit(t *testing.T, limit int64) (*Server, *materializer.Materializer, *qlog.WAL) {
 	t.Helper()
 	wal, err := qlog.Open(t.TempDir() + "/qlog")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.SetMaxBytes(limit); err != nil {
 		t.Fatal(err)
 	}
 	core, err := quepaxa.New(quepaxa.Config{
@@ -62,6 +70,9 @@ func newLocalLifecycleServerWithPending(t *testing.T, value []byte) (*Server, *m
 	t.Helper()
 	wal, err := qlog.Open(t.TempDir() + "/qlog")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.SetMaxBytes(math.MaxInt64); err != nil {
 		t.Fatal(err)
 	}
 	appendLocalPendingReceipt(t, wal, value)
@@ -164,6 +175,33 @@ func TestExplicitLocalProposalOwnsWholeLifecycleAndDedupCancellation(t *testing.
 	}
 	if !server.Ready() {
 		t.Fatal("deterministic rejection poisoned the server")
+	}
+}
+
+func TestExplicitLocalPrewriteCapacityDenialDoesNotPoisonLifecycle(t *testing.T) {
+	server, _, wal := newLocalLifecycleServerWithLimit(t, 1)
+	value := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{7})
+	if _, err := server.propose(context.Background(), value); err == nil || !quepaxa.IsLocalAdmissionDenial(err) {
+		t.Fatalf("prewrite capacity result=%v, want Local admission denial", err)
+	}
+	if !server.Ready() || server.localFailure() != nil || wal.Bytes() != 0 {
+		t.Fatalf("prewrite denial poisoned or mutated lifecycle: ready=%v failure=%v bytes=%d", server.Ready(), server.localFailure(), wal.Bytes())
+	}
+	if _, err := server.propose(context.Background(), value); err == nil || !quepaxa.IsLocalAdmissionDenial(err) {
+		t.Fatalf("retry after prewrite denial=%v, want another admission denial", err)
+	}
+}
+
+func TestExplicitLocalNestedRawCapacityFailurePoisonsLifecycle(t *testing.T) {
+	server, _, _ := newLocalLifecycleServer(t)
+	server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error { return qlog.ErrCapacity })
+	value := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{9})
+	_, err := server.propose(context.Background(), value)
+	if !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, qlog.ErrCapacity) {
+		t.Fatalf("nested capacity failure=%v, want commit-unknown preserving capacity cause", err)
+	}
+	if server.Ready() || server.localFailure() == nil {
+		t.Fatalf("nested capacity failure did not poison lifecycle: ready=%v failure=%v", server.Ready(), server.localFailure())
 	}
 }
 

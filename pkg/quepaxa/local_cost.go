@@ -15,6 +15,29 @@ const localQLogEntryHeaderBytes = 53
 
 var errLocalCostsUnavailable = errors.New("Local WAL costs require explicit local mode")
 
+// localAdmissionDenial is returned only by a top-level Local preflight before
+// that operation has changed Core or WAL state. It is not a generic capacity
+// error and must not be used to classify failures from nested callbacks.
+type localAdmissionDenial struct {
+	operation string
+	reason    string
+	used      uint64
+	limit     uint64
+	immediate uint64
+	protected uint64
+}
+
+func (e *localAdmissionDenial) Error() string {
+	return fmt.Sprintf("Local WAL admission denied: operation=%s reason=%s used=%d immediate=%d protected=%d limit=%d", e.operation, e.reason, e.used, e.immediate, e.protected, e.limit)
+}
+
+// IsLocalAdmissionDenial recognizes Core's dedicated pre-write refusal. The
+// unexported concrete type prevents callers from manufacturing the exemption.
+func IsLocalAdmissionDenial(err error) bool {
+	var denial *localAdmissionDenial
+	return errors.As(err, &denial)
+}
+
 // LocalWALCost is a read-only encoded-byte estimate. SlotBytes bounds one
 // supported slot attempt. ForegroundBytes bounds one offered-value slot plus
 // one maximal normalized-prefix/schedule slot. RecoveryBytes bounds one
@@ -388,6 +411,153 @@ func (c *Core) localUndurableDecisionBytesOwned(through Slot) (uint64, error) {
 		}
 	}
 	return total, nil
+}
+
+// localRecoveryBytesOwned plans the whole retained suffix without allocating
+// or iterating by slot. Exact QDEC bytes are counted for retained undecided
+// history markers; undecided holes use the proven maximum supported slot cost.
+func (c *Core) localRecoveryBytesOwned(through Slot, operation string, immediate, protected uint64) (uint64, error) {
+	if !c.localMode || len(c.localExecutionOwner) == 0 {
+		return 0, errLocalExternalMutation
+	}
+	c.mu.RLock()
+	contiguous := c.tip
+	hasUnlogged := c.localUnloggedCount != 0
+	if through <= c.tip && !hasUnlogged {
+		c.mu.RUnlock()
+		return 0, nil
+	}
+	c.mu.RUnlock()
+	rangeCount := uint64(0)
+	if through > contiguous {
+		rangeCount = uint64(through - contiguous)
+	}
+	decidedCount := uint64(0)
+	if rangeCount != 0 {
+		c.mu.RLock()
+		for slot := range c.decided {
+			if slot > contiguous && slot <= through {
+				decidedCount++
+			}
+		}
+		c.mu.RUnlock()
+	}
+	if decidedCount > rangeCount {
+		return 0, fmt.Errorf("Local recovery decision count exceeds suffix length")
+	}
+	undecided := rangeCount - decidedCount
+	lowerBound, err := checkedMul(undecided, c.localCost.maxSlotBytes)
+	if err != nil {
+		return 0, fmt.Errorf("Local recovery byte count overflows: %w", err)
+	}
+	lowerProtected, err := checkedAdd(protected, lowerBound)
+	if err != nil {
+		return 0, err
+	}
+	if err := c.localCapacityAdmissionOwned(operation, "protected_reserve", immediate, lowerProtected); err != nil {
+		return 0, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var exact uint64
+	for slot, decision := range c.decided {
+		if slot > through || slot <= c.floor {
+			continue
+		}
+		if !c.logged[slot] {
+			entry, err := decisionEntry(decision)
+			if err != nil {
+				return 0, fmt.Errorf("estimate Local decision slot %d: %w", slot, err)
+			}
+			exact, err = checkedAdd(exact, uint64(len(entry.Encode())))
+			if err != nil {
+				return 0, fmt.Errorf("Local recovery byte count overflows: %w", err)
+			}
+		}
+	}
+	for slot, state := range c.recorders {
+		if slot <= c.tip || slot > through {
+			continue
+		}
+		if _, decided := c.decided[slot]; decided {
+			continue
+		}
+		if err := c.validateLocalISRLocked(slot, state, nil); err != nil {
+			return 0, err
+		}
+	}
+	unknown, err := checkedMul(undecided, c.localCost.maxSlotBytes)
+	if err != nil {
+		return 0, fmt.Errorf("Local recovery byte count overflows: %w", err)
+	}
+	return checkedAdd(exact, unknown)
+}
+
+func (c *Core) localCapacityAdmissionOwned(operation, reason string, immediate, protected uint64) error {
+	if !c.localMode || len(c.localExecutionOwner) == 0 {
+		return errLocalExternalMutation
+	}
+	snapshot := c.wal.Capacity()
+	if snapshot.Fatal != nil {
+		return snapshot.Fatal
+	}
+	if snapshot.Limit <= 0 || snapshot.Used < 0 {
+		return fmt.Errorf("Local WAL requires a finite positive capacity limit")
+	}
+	used, limit := uint64(snapshot.Used), uint64(snapshot.Limit)
+	needed, err := checkedAdd(used, immediate, protected)
+	if err != nil || needed > limit {
+		return &localAdmissionDenial{operation: operation, reason: reason, used: used, limit: limit, immediate: immediate, protected: protected}
+	}
+	return nil
+}
+
+func (c *Core) localMissingDecisionBytesOwned(first, through Slot) (uint64, error) {
+	if !c.localMode || len(c.localExecutionOwner) == 0 {
+		return 0, errLocalExternalMutation
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.localUnloggedCount == 0 || through < first {
+		return 0, nil
+	}
+	var total uint64
+	for slot, decision := range c.decided {
+		if slot < first || slot > through || slot <= c.floor || c.logged[slot] {
+			continue
+		}
+		entry, err := decisionEntry(decision)
+		if err != nil {
+			return 0, fmt.Errorf("estimate Local decision slot %d: %w", slot, err)
+		}
+		total, err = checkedAdd(total, uint64(len(entry.Encode())))
+		if err != nil {
+			return 0, fmt.Errorf("Local decision byte count overflows: %w", err)
+		}
+	}
+	return total, nil
+}
+
+func (c *Core) localValidateDecisionPrefixOwned(through Slot) error {
+	if !c.localMode || len(c.localExecutionOwner) == 0 {
+		return errLocalExternalMutation
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if through <= c.floor {
+		return nil
+	}
+	rangeCount := uint64(through - c.floor)
+	var found uint64
+	for slot := range c.decided {
+		if slot > c.floor && slot <= through {
+			found++
+		}
+	}
+	if found != rangeCount {
+		return fmt.Errorf("Local decision prefix through slot %d contains gaps", through)
+	}
+	return nil
 }
 
 func decisionEntry(value DecidedValue) (qlog.Entry, error) {
