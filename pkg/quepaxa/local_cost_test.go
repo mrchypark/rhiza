@@ -469,11 +469,18 @@ func TestLocalPendingPrefixThenScheduleAndOfferedValueCosts(t *testing.T) {
 		if i < beforeEntries {
 			continue
 		}
-		if entry.Type == qlog.EntryDecide && entry.Slot >= 1 && entry.Slot <= 32 {
+		switch {
+		case entry.Slot >= 1 && entry.Slot <= 32:
 			recoveryDelta += uint64(len(entry.Encode()))
-			recovered++
-		} else {
+			if entry.Type == qlog.EntryDecide {
+				recovered++
+			}
+		case entry.Slot == 0 && entry.Type == qlog.EntryProposal:
 			foregroundDelta += uint64(len(entry.Encode()))
+		case entry.Slot == 33 || entry.Slot == 34:
+			foregroundDelta += uint64(len(entry.Encode()))
+		default:
+			t.Fatalf("unexpected appended WAL entry slot=%d type=%d", entry.Slot, entry.Type)
 		}
 		if entry.Type == qlog.EntryDecide && entry.Slot == 33 {
 			scheduleDecisionSeen = true
@@ -546,11 +553,18 @@ func TestLocalTip31MaxPending32ThenSchedule33AndOffered34(t *testing.T) {
 		if i < beforeEntries {
 			continue
 		}
-		if entry.Type == qlog.EntryDecide && entry.Slot == 32 {
+		switch {
+		case entry.Slot == 32:
 			recoveryDelta += uint64(len(entry.Encode()))
-			recovered32 = true
-		} else {
+			if entry.Type == qlog.EntryDecide {
+				recovered32 = true
+			}
+		case entry.Slot == 0 && entry.Type == qlog.EntryProposal:
 			foregroundDelta += uint64(len(entry.Encode()))
+		case entry.Slot == 33 || entry.Slot == 34:
+			foregroundDelta += uint64(len(entry.Encode()))
+		default:
+			t.Fatalf("unexpected appended WAL entry slot=%d type=%d", entry.Slot, entry.Type)
 		}
 		if entry.Type == qlog.EntryDecide && entry.Slot == 33 {
 			scheduleDecisionSeen = true
