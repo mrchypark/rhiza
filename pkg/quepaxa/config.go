@@ -18,6 +18,8 @@ type Config struct {
 	Cluster Cluster
 	// LocalMode marks the explicitly embedded, single-node execution path.
 	// It must not be inferred from singleton membership in a normal cluster.
+	// Recorder mutations are reserved for Core's owner-held proposal/recovery
+	// path; use a non-Local Core for externally supplied recorder state.
 	LocalMode bool
 	// WAL must be open for the Core's lifetime; the caller retains ownership.
 	WAL       *qlog.WAL

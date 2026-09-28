@@ -1,16 +1,19 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
 
+	flatbuffers "github.com/google/flatbuffers/go"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/quepaxa/walfb"
 )
 
 type observedCancelContext struct {
@@ -53,6 +56,54 @@ func newLocalLifecycleServer(t *testing.T) (*Server, *materializer.Materializer,
 		_ = wal.Close()
 	})
 	return server, material, wal
+}
+
+func newLocalLifecycleServerWithPending(t *testing.T, value []byte) (*Server, *materializer.Materializer, *qlog.WAL) {
+	t.Helper()
+	wal, err := qlog.Open(t.TempDir() + "/qlog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendLocalPendingReceipt(t, wal, value)
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "local", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "local"}}}, WAL: wal, LocalMode: true})
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	server := NewServer(core, material, "cluster", true, nil)
+	t.Cleanup(func() { server.Close(); _ = material.Close(); _ = wal.Close() })
+	return server, material, wal
+}
+
+func appendLocalPendingReceipt(t *testing.T, wal *qlog.WAL, value []byte) {
+	t.Helper()
+	hash := sha256.Sum256(value)
+	priority := bytes.Repeat([]byte{0xff}, 32)
+	proposal := &walfb.ProposalT{Priority: priority, ProposerId: "local", Hash: hash[:]}
+	builder := flatbuffers.NewBuilder(256)
+	first := proposal.Pack(builder)
+	walfb.RecorderStateStart(builder)
+	walfb.RecorderStateAddSlot(builder, 1)
+	walfb.RecorderStateAddStep(builder, 4)
+	walfb.RecorderStateAddFirstCurrent(builder, first)
+	walfb.RecorderStateAddAggregateCurrent(builder, first)
+	offset := walfb.RecorderStateEnd(builder)
+	walfb.FinishRecorderStateBuffer(builder, offset)
+	payload := append([]byte("QISR\x00"), builder.FinishedBytes()...)
+	if err := wal.Append(qlog.Entry{Hash: hash, Type: qlog.EntryProposal, Payload: value}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(qlog.Entry{Slot: 1, Hash: hash, Type: qlog.EntryReceipt, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestExplicitLocalProposalOwnsWholeLifecycleAndDedupCancellation(t *testing.T) {
@@ -152,17 +203,12 @@ func TestExplicitLocalDurabilityFailureIsStickyAndPreservesCause(t *testing.T) {
 }
 
 func TestExplicitLocalFailedPendingRecoveryAtSlotZeroPoisonsServer(t *testing.T) {
-	server, _, wal := newLocalLifecycleServer(t)
-	// Force pending-record recovery to fail before allocation by closing the WAL
-	// after recording a partial local proposal.
-	core := server.core
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "pending", SQL: "CREATE TABLE pending(id INTEGER)"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := core.Record(context.Background(), quepaxa.RecordRequest{Slot: 1, Step: 4, ConfigID: 1, Proposal: quepaxa.Proposal{Priority: quepaxa.Priority{1}, ProposerID: "local", Hash: sha256.Sum256(value), Value: value}}); err != nil {
-		t.Fatal(err)
-	}
+	server, _, wal := newLocalLifecycleServerWithPending(t, value)
+	// Force pending-record recovery to fail before allocation by closing the WAL.
 	if err := wal.Close(); err != nil {
 		t.Fatal(err)
 	}

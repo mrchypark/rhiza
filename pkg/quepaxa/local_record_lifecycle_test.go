@@ -72,9 +72,13 @@ func TestLocalRecordQuorumRunsSelfRecordBeforeReturningCancellation(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	proposal := newProposal(highestPriority, "local", []byte("cancelled local record"))
+	if err := core.acquireLocalExecution(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	_, err := core.recordQuorum(ctx, map[NodeID]RecordRequest{
 		"local": {Slot: 1, Step: 4, Proposal: proposal},
 	})
+	core.releaseLocalExecution()
 	if !errors.Is(err, ErrQuorumUnavailable) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("recordQuorum error=%v, want quorum unavailable and cancellation", err)
 	}
