@@ -811,7 +811,13 @@ func TestLocalModePersistsSQLKVGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { db.Close() }()
+	defer func() {
+		if db != nil {
+			if err := db.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
 	for _, req := range []rhiza.ExecuteRequest{
 		{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)"},
 		{RequestID: "insert", SQL: "INSERT INTO items VALUES (1, 'local')"},
@@ -861,19 +867,25 @@ func TestLocalModePersistsSQLKVGraph(t *testing.T) {
 	if err != nil || len(graph.Rows) != 1 || graph.Rows[0][0] != "local" {
 		t.Fatalf("graph: %+v %v", graph, err)
 	}
-	// Both startup modes must reopen the same standalone WAL without migration.
-	for _, local := range []bool{false, true} {
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
-		}
-		config.Local = local
-		db, err = rhiza.Open(ctx, config)
-		if err != nil {
-			t.Fatal(err)
-		}
-		rows, err := db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT name FROM items"})
-		if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "local" {
-			t.Fatalf("mode Local=%v: %+v %v", local, rows, err)
-		}
+	// A Local store must not be reopened as non-Local: the mode is part of
+	// its persisted identity. Reopening in Local mode must preserve all stores.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config.Local = false
+	if nonLocal, openErr := rhiza.Open(ctx, config); openErr == nil {
+		_ = nonLocal.Close()
+		t.Fatal("Local store opened in non-Local mode")
+	} else if !strings.Contains(openErr.Error(), "Local store cannot be opened in non-Local mode") {
+		t.Fatalf("non-Local reopen failed for an unexpected reason: %v", openErr)
+	}
+	config.Local = true
+	db, err = rhiza.Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.Query(ctx, rhiza.QueryRequest{SQL: "SELECT name FROM items"})
+	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != "local" {
+		t.Fatalf("Local reopen: %+v %v", rows, err)
 	}
 }

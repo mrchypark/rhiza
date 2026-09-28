@@ -30,27 +30,31 @@ import (
 
 // Node is the main runtime container.
 type Node struct {
-	config       *types.ExecutionConfig
-	core         *quepaxa.Core
-	material     *materializer.Materializer
-	server       *network.Server
-	peer         *network.PeerServer
-	transport    *network.Transport
-	catchUp      *network.Transport
-	wal          *qlog.WAL
-	lock         *qlog.LockFile
-	bucket       *objectstore.MeteredBucket
-	checkpoints  *checkpoint.Manager
-	archive      *recovery.Manager
-	checkpointer *checkpoint.AutoCheckpointer
-	ready        atomic.Bool
-	membershipMu sync.Mutex
-	opened       atomic.Bool
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	recoveryMu   sync.Mutex
-	compactionMu sync.Mutex
-	catchUpWake  chan struct{}
+	config                    *types.ExecutionConfig
+	core                      *quepaxa.Core
+	material                  *materializer.Materializer
+	server                    *network.Server
+	peer                      *network.PeerServer
+	transport                 *network.Transport
+	catchUp                   *network.Transport
+	wal                       *qlog.WAL
+	lock                      *qlog.LockFile
+	bucket                    *objectstore.MeteredBucket
+	checkpoints               *checkpoint.Manager
+	archive                   *recovery.Manager
+	checkpointer              *checkpoint.AutoCheckpointer
+	localStore                *localCheckpointIdentity
+	localRoot                 *localCheckpointDescriptor
+	localRestoreSuffixPending bool
+	ready                     atomic.Bool
+	membershipMu              sync.Mutex
+	opened                    atomic.Bool
+	cancel                    context.CancelFunc
+	wg                        sync.WaitGroup
+	recoveryMu                sync.Mutex
+	replayMu                  sync.Mutex
+	compactionMu              sync.Mutex
+	catchUpWake               chan struct{}
 }
 
 // New creates a new Node.
@@ -144,6 +148,8 @@ func (n *Node) EnrollExistingVoter(ctx context.Context) error {
 }
 
 func (n *Node) open(ctx context.Context, enroll bool) (err error) {
+	var localRestoreAuthority *materializer.LocalRestoreAuthority
+	var localRestoreFiles []materializer.CheckpointFile
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
 	}
@@ -152,8 +158,10 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
 		return fmt.Errorf("local mode requires standalone local storage without listeners, membership, enrollment, or object storage")
 	}
-	if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
-		return err
+	if !n.config.Local {
+		if err := sqlpolicy.CheckExisting(ctx, n.config.DataDir+"/sqlite.db"); err != nil {
+			return err
+		}
 	}
 	if err := validateVoterMembership(n.config); err != nil {
 		return err
@@ -202,6 +210,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if err := validateReadAdmissionConfig(n.config); err != nil {
 		return err
 	}
+	if n.config.Local {
+		if _, err := materializer.ValidateLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
+			return err
+		}
+	}
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")
 	}
@@ -222,9 +235,97 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if err != nil {
 		return err
 	}
+	if n.config.Local && localVoter.identity != nil {
+		return fmt.Errorf("%w: registered voter cannot be reopened as standalone Local data", ErrVoterStateLost)
+	}
+	if !n.config.Local {
+		if _, err := os.Lstat(filepath.Join(n.config.DataDir, "local-store.json")); err == nil {
+			return fmt.Errorf("Local store cannot be opened in non-Local mode; preserve existing data")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else {
+		identity, identityErr := openLocalCheckpointIdentity(n.config)
+		if identityErr != nil {
+			return identityErr
+		}
+		n.localStore = &identity
+		readOnlyWAL, inspectErr := qlog.OpenReadOnly(n.config.DataDir + "/qlog")
+		if inspectErr != nil {
+			return inspectErr
+		}
+		maxWALBytes := n.config.MaxWALBytes
+		if maxWALBytes == 0 {
+			maxWALBytes = 4 << 30
+		}
+		if inspectErr = readOnlyWAL.SetMaxBytes(maxWALBytes); inspectErr == nil {
+			inspectCore, coreErr := quepaxa.New(quepaxa.Config{NodeID: n.config.NodeID, Cluster: *n.loadClusterConfig(), WAL: readOnlyWAL, LocalMode: true})
+			inspectErr = coreErr
+			if inspectErr == nil {
+				inspectErr = n.validateLocalRoots(inspectCore)
+			}
+			if inspectErr == nil {
+				if floor, root, hasBase := inspectCore.RecoveryRoot(); hasBase {
+					prefix, prefixOK := inspectCore.PrefixHash(floor)
+					if !prefixOK {
+						inspectErr = fmt.Errorf("Local recovery base prefix is unavailable")
+					} else {
+						roots, rootsErr := inspectCore.LocalCheckpointRoots(ctx)
+						if rootsErr != nil {
+							inspectErr = rootsErr
+						} else {
+							var expected *quepaxa.LocalCheckpointRoot
+							for i := range roots {
+								if roots[i].RootHash == root && roots[i].Index == floor && roots[i].PrefixHash == prefix {
+									copy := roots[i]
+									expected = &copy
+									break
+								}
+							}
+							if expected == nil {
+								inspectErr = fmt.Errorf("Local recovery base has no complete WAL authority tuple")
+							} else {
+								descriptor, sourceFiles, openErr := n.localStore.OpenExpected(*expected)
+								if openErr != nil {
+									inspectErr = openErr
+								} else {
+									authority := materializer.LocalRestoreAuthority{StoreUUID: n.localStore.policy.StoreUUID, ConfigDigest: n.localStore.configDigest, Index: uint64(expected.Index), ConfigID: expected.ConfigID, RootHash: descriptor.RootHash, PrefixHash: descriptor.Prefix, StateHash: descriptor.StateHash}
+									if prepareErr := materializer.PrepareLocalRestore(filepath.Join(n.config.DataDir, "sqlite.db"), authority, sourceFiles); prepareErr != nil {
+										inspectErr = prepareErr
+									} else {
+										localRestoreAuthority = &authority
+										localRestoreFiles = sourceFiles
+									}
+								}
+							}
+						}
+					}
+				} else {
+					inspectErr = materializer.ValidateNoLocalRestore(filepath.Join(n.config.DataDir, "sqlite.db"))
+					if inspectErr == nil {
+						inspectErr = sqlpolicy.CheckExisting(ctx, filepath.Join(n.config.DataDir, "sqlite.db"))
+					}
+					if inspectErr == nil {
+						_, sqliteErr := os.Lstat(filepath.Join(n.config.DataDir, "sqlite.db"))
+						allowAbsentGraph := inspectCore.Tip() == 0 && errors.Is(sqliteErr, os.ErrNotExist)
+						inspectErr = materializer.ValidateLocalGraphStorage(filepath.Join(n.config.DataDir, "latticedb", "graph.ltdb"), allowAbsentGraph)
+					}
+				}
+			}
+		}
+		closeErr := readOnlyWAL.Close()
+		if inspectErr != nil || closeErr != nil {
+			return errors.Join(inspectErr, closeErr)
+		}
+	}
 
 	// 2. Open WAL
-	wal, err := qlog.Open(n.config.DataDir + "/qlog")
+	var wal *qlog.WAL
+	if n.config.Local {
+		wal, err = qlog.OpenLocalDeferredCleanup(n.config.DataDir + "/qlog")
+	} else {
+		wal, err = qlog.Open(n.config.DataDir + "/qlog")
+	}
 	if err != nil {
 		return fmt.Errorf("open WAL: %w", err)
 	}
@@ -306,32 +407,28 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		log.Println("non-clean start detected, recovering from WAL...")
 	}
 
-	// 4. Open materializer
-	material, err := materializer.Open(
-		n.config.DataDir+"/sqlite.db",
-		4, // reader count
-	)
-	if err != nil {
-		// Rebuilding from the retained consensus base and suffix is safer and
-		if errors.Is(err, sqlpolicy.ErrIncompatible) {
-			return err
-		}
-		// smaller than database-specific corruption repair.
-		if rebuildErr := quarantineSQLite(n.config.DataDir + "/sqlite.db"); rebuildErr != nil {
-			return fmt.Errorf("open materializer: %w; quarantine: %v", err, rebuildErr)
-		}
-		if rebuildErr := quarantineGraph(n.config.DataDir + "/latticedb"); rebuildErr != nil {
-			return fmt.Errorf("open materializer: %w; quarantine graph: %v", err, rebuildErr)
-		}
-		material, err = materializer.Open(n.config.DataDir+"/sqlite.db", 4)
+	var material *materializer.Materializer
+	if localRestoreAuthority == nil {
+		material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
 		if err != nil {
-			return fmt.Errorf("rebuild materializer: %w", err)
+			if errors.Is(err, sqlpolicy.ErrIncompatible) {
+				return fmt.Errorf("open materializer: %w", err)
+			}
+			if rebuildErr := quarantineSQLite(n.config.DataDir + "/sqlite.db"); rebuildErr != nil {
+				return fmt.Errorf("open materializer: %w; quarantine: %v", err, rebuildErr)
+			}
+			if rebuildErr := quarantineGraph(n.config.DataDir + "/latticedb"); rebuildErr != nil {
+				return fmt.Errorf("open materializer: %w; quarantine graph: %v", err, rebuildErr)
+			}
+			material, err = materializer.Open(filepath.Join(n.config.DataDir, "sqlite.db"), 4)
+			if err != nil {
+				return fmt.Errorf("rebuild materializer: %w", err)
+			}
 		}
-	}
-	n.material = material
-	if err := material.ConfigureLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
-		_ = material.Close()
-		return fmt.Errorf("configure local graph indexes: %w", err)
+		if err := material.ConfigureLocalGraphNodePropertyIndexes(n.config.LocalGraphNodePropertyIndexes); err != nil {
+			_ = material.Close()
+			return fmt.Errorf("configure local graph indexes: %w", err)
+		}
 	}
 
 	// 5. Create consensus core through the same public API available to external users.
@@ -373,6 +470,20 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if len(recovered.Members) != 1 || recovered.Members[0].ID != n.config.NodeID {
 			return fmt.Errorf("local mode cannot open a multi-voter or foreign WAL")
 		}
+		core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+			prefix, ok := core.PrefixHash(seal.Index)
+			if !ok || prefix != seal.PrefixHash {
+				return fmt.Errorf("Local checkpoint prefix is not in the certified history")
+			}
+			descriptor, _, err := n.localStore.OpenExpected(quepaxa.LocalCheckpointRoot{RootHash: seal.RootHash, Index: seal.Index, PrefixHash: prefix, StateHash: seal.StateHash, ConfigID: seal.ConfigID})
+			if err != nil {
+				return err
+			}
+			if descriptor.StateHash != fmt.Sprintf("%x", seal.StateHash) {
+				return fmt.Errorf("Local checkpoint state hash mismatch")
+			}
+			return ctx.Err()
+		})
 	}
 	if n.config.Learner != nil && n.config.Learner.WALIdentity != "" && n.config.Learner.WALIdentity != core.WALIdentity() {
 		return fmt.Errorf("learner WAL identity differs from configured incarnation")
@@ -382,6 +493,26 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if n.catchUp != nil {
 			n.catchUp.BindCore(core)
 		}
+	}
+	// The writable WAL has now been scanned into Core. Confirm that the exact
+	// base authorized by the read-only pass is still selected before installing
+	// the snapshot pair.
+	if localRestoreAuthority != nil {
+		floor, root, ok := core.RecoveryRoot()
+		prefix, prefixOK := core.PrefixHash(quepaxa.Slot(localRestoreAuthority.Index))
+		if !ok || !prefixOK || uint64(floor) != localRestoreAuthority.Index || fmt.Sprintf("%x", root) != localRestoreAuthority.RootHash || fmt.Sprintf("%x", prefix) != localRestoreAuthority.PrefixHash {
+			return fmt.Errorf("writable WAL recovery base differs from authorized Local restore")
+		}
+		material, err = materializer.OpenLocalFromBase(filepath.Join(n.config.DataDir, "sqlite.db"), 4, *localRestoreAuthority, localRestoreFiles, n.config.LocalGraphNodePropertyIndexes)
+	} else if material == nil {
+		return fmt.Errorf("materializer was not opened before Core initialization")
+	}
+	n.material = material
+	if localRestoreAuthority != nil {
+		if err := materializer.FinalizeLocalRestore(filepath.Join(n.config.DataDir, "sqlite.db"), *localRestoreAuthority); err != nil {
+			return fmt.Errorf("finalize exact-base Local restore before WAL suffix replay: %w", err)
+		}
+		n.localRestoreSuffixPending = true
 	}
 	if index, root, ok := core.LatestPreparedCheckpoint(); ok {
 		log.Printf("checkpoint recovered: state=prepared index=%d root=%x", index, root)
@@ -434,6 +565,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
 	if n.config.Local {
 		server.SetLocalFailureHandler(func(error) { n.ready.Store(false) })
+		server.SetLocalReclaimHandler(n.reclaimLocalCheckpoint)
 	}
 	if n.config.MaxConcurrentReads != 0 {
 		if err := server.SetReadAdmissionLimits(network.ReadAdmissionLimits{
@@ -557,7 +689,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 		}
 	}
+	if n.config.Local && localRestoreAuthority == nil {
+		if err := n.resumePreparedLocalCheckpoint(startupRecovery.Context()); err != nil {
+			return fmt.Errorf("resume prepared Local checkpoint: %w", startupRecovery.Check(err))
+		}
+	}
 	recoveryTarget := quepaxa.Slot(material.Tip())
+	if n.config.Local {
+		recoveryTarget = core.Tip()
+	}
 	if recorderTip := core.RecorderTip(); recorderTip > recoveryTarget {
 		recoveryTarget = recorderTip
 	}
@@ -621,6 +761,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if certifiedCheckpoint != nil {
 		if err := n.publishCertifiedCheckpoint(ctx, certifiedCheckpoint); err != nil {
 			return fmt.Errorf("publish certified checkpoint: %w", err)
+		}
+	}
+	if n.config.Local {
+		if err := wal.FinalizeDeferredCleanup(); err != nil {
+			log.Printf("Local WAL committed-file cleanup deferred: %v", err)
 		}
 	}
 	if len(cluster.Members) == 1 {
@@ -860,6 +1005,241 @@ func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
 		return err
 	}
 	return n.core.CompactThrough(seal.Index, seal.RootHash)
+}
+
+func (n *Node) reclaimLocalCheckpoint(ctx context.Context) (resultErr error) {
+	if n.config == nil || !n.config.Local || n.server == nil || n.core == nil || n.material == nil || n.localStore == nil {
+		return network.ErrLocalMaintenanceRefused
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: canceled before Local maintenance admission", network.ErrLocalMaintenanceRefused)
+	}
+	resume, err := n.server.Quiesce(ctx)
+	if err != nil {
+		if errors.Is(err, network.ErrNotReady) {
+			return network.ErrNotReady
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: canceled while quiescing before Local maintenance mutation", network.ErrLocalMaintenanceRefused)
+		}
+		return err
+	}
+	defer func() {
+		if resultErr != nil && !errors.Is(resultErr, network.ErrLocalMaintenanceRefused) && !quepaxa.IsLocalAdmissionDenial(resultErr) && !errors.Is(resultErr, network.ErrNotReady) {
+			n.server.FailLocalLifecycle(resultErr)
+		}
+		resume()
+	}()
+	if err := n.localCheckpointSpacePreflight(); err != nil {
+		return fmt.Errorf("%w: %v", network.ErrLocalMaintenanceRefused, err)
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: canceled before Local state replay", network.ErrLocalMaintenanceRefused)
+	}
+	if n.material.Tip() < uint64(n.core.Tip()) {
+		if err := n.replayLocalDecisions(ctx); err != nil {
+			return fmt.Errorf("replay Local state before checkpoint: %w", err)
+		}
+	}
+	index := n.material.Tip()
+	if index == 0 || quepaxa.Slot(index) != n.core.Tip() || quepaxa.Slot(index) <= n.core.CompactionFloor() {
+		return fmt.Errorf("%w: no reclaimable Local prefix", network.ErrLocalMaintenanceRefused)
+	}
+	prefix, ok := n.core.PrefixHash(quepaxa.Slot(index))
+	if !ok {
+		return fmt.Errorf("Local checkpoint prefix is unavailable")
+	}
+	files, capturedIndex, cleanup, err := n.material.CheckpointFilesAt(ctx)
+	if err != nil {
+		return fmt.Errorf("capture Local checkpoint: %w", err)
+	}
+	defer cleanup()
+	if capturedIndex != index {
+		return fmt.Errorf("Local checkpoint snapshot moved from slot %d to %d", index, capturedIndex)
+	}
+	var sourceBytes, graphBytes uint64
+	for _, file := range files {
+		info, statErr := os.Lstat(file.Path)
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() < 0 {
+			return fmt.Errorf("Local checkpoint capture produced an invalid fixed-role file")
+		}
+		sourceBytes += uint64(info.Size())
+		if file.Role == materializer.CheckpointGraphData {
+			graphBytes = uint64(info.Size())
+		}
+	}
+	if sourceBytes > localCheckpointMaxBytes {
+		return fmt.Errorf("Local checkpoint exceeds the combined %d-byte bound", localCheckpointMaxBytes)
+	}
+	if err := n.localStore.requireFreeBytes(n.config.DataDir, sourceBytes, graphBytes, uint64(max(int64(0), n.wal.Bytes()))); err != nil {
+		return fmt.Errorf("Local checkpoint space changed during capture: %w", err)
+	}
+	descriptor, err := n.localStore.Publish(ctx, files, index, prefix, n.core.ConfigIDForSlot(quepaxa.Slot(index)))
+	if err != nil {
+		return fmt.Errorf("publish Local checkpoint: %w", err)
+	}
+	hitLocalNodeCheckpointCrashBoundary("after-checkpoint-root-durable-before-prepare")
+	seal, err := sealFromLocalDescriptor(n.core, descriptor)
+	if err != nil {
+		return err
+	}
+	slot, err := n.core.ReclaimLocalCheckpointWithSpacePreflight(ctx, seal, func(rewriteBytes, remainingBytes uint64) error {
+		return n.localCheckpointSpacePreflight(rewriteBytes, remainingBytes)
+	}, func(applyCtx context.Context, appliedThrough quepaxa.Slot) error {
+		if err := n.replayLocalDecisions(applyCtx); err != nil {
+			return err
+		}
+		if quepaxa.Slot(n.material.Tip()) < appliedThrough {
+			return fmt.Errorf("Local materializer stopped at %d before seal slot %d", n.material.Tip(), appliedThrough)
+		}
+		return n.localCheckpointSpacePreflight()
+	})
+	if err != nil {
+		if quepaxa.IsLocalAdmissionDenial(err) {
+			return err
+		}
+		return fmt.Errorf("reclaim Local checkpoint: %w", err)
+	}
+	if floor, _, ok := n.core.RecoveryRoot(); !ok || floor != seal.Index {
+		return fmt.Errorf("Local checkpoint compacted through unexpected floor after seal slot %d", slot)
+	}
+	n.localRoot = &descriptor
+	// Collection is post-commit cleanup: authority and materialized state are
+	// already durable. A deletion failure is retained as cleanup debt and must
+	// not turn a successful checkpoint into an ambiguous proposal result.
+	if roots, rootErr := n.core.LocalCheckpointRoots(ctx); rootErr != nil {
+		log.Printf("Local checkpoint GC deferred: cannot resolve live roots: %v", rootErr)
+	} else if gcErr := n.localStore.Collect(roots); gcErr != nil {
+		log.Printf("Local checkpoint GC deferred: %v", gcErr)
+	}
+	return nil
+}
+
+func (n *Node) resumePreparedLocalCheckpoint(ctx context.Context) error {
+	index, root, prepared := n.core.LatestPreparedCheckpoint()
+	if !prepared {
+		return nil
+	}
+	if sealed, ok, err := n.core.LatestCheckpointSeal(); err != nil {
+		return err
+	} else if ok && sealed.Index == index && sealed.RootHash == root && n.core.CompactionFloor() >= index {
+		floor, floorRoot, hasFloor := n.core.RecoveryRoot()
+		if hasFloor && floor == index && floorRoot == root {
+			return nil
+		}
+	}
+	prefix, ok := n.core.PrefixHash(index)
+	if !ok {
+		return fmt.Errorf("prepared Local checkpoint has no certified prefix")
+	}
+	descriptor, _, err := n.localStore.OpenExpected(quepaxa.LocalCheckpointRoot{RootHash: root, Index: index, PrefixHash: prefix, ConfigID: n.core.ConfigIDForSlot(index)})
+	if err != nil {
+		return fmt.Errorf("open exact prepared Local checkpoint: %w", err)
+	}
+	if n.localRoot == nil || descriptor.Slot >= n.localRoot.Slot {
+		n.localRoot = &descriptor
+	}
+	if err := n.localCheckpointSpacePreflight(); err != nil {
+		return err
+	}
+	resume, err := n.server.Quiesce(ctx)
+	if err != nil {
+		return err
+	}
+	defer resume()
+	seal, err := sealFromLocalDescriptor(n.core, descriptor)
+	if err != nil {
+		return err
+	}
+	_, err = n.core.ReclaimLocalCheckpointWithSpacePreflight(ctx, seal, func(rewriteBytes, remainingBytes uint64) error {
+		return n.localCheckpointSpacePreflight(rewriteBytes, remainingBytes)
+	}, func(applyCtx context.Context, through quepaxa.Slot) error {
+		if err := n.replayLocalDecisions(applyCtx); err != nil {
+			return err
+		}
+		if quepaxa.Slot(n.material.Tip()) < through {
+			return fmt.Errorf("resumed Local materializer stopped at %d before seal slot %d", n.material.Tip(), through)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("complete prepared Local checkpoint: %w", err)
+	}
+	n.localRoot = &descriptor
+	return nil
+}
+
+func (n *Node) localCheckpointSpacePreflight(reserve ...uint64) error {
+	if n.localStore == nil || n.wal == nil {
+		return fmt.Errorf("Local checkpoint storage is unavailable")
+	}
+	var live uint64
+	for _, path := range []string{filepath.Join(n.config.DataDir, "sqlite.db"), filepath.Join(n.config.DataDir, "latticedb", "graph.ltdb")} {
+		size, err := localTreeBytes(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("invalid Local materializer data for disk estimate at %s: %w", path, err)
+		}
+		if live > ^uint64(0)-size {
+			return fmt.Errorf("Local checkpoint disk estimate overflow")
+		}
+		live += size
+	}
+	if live > localCheckpointMaxBytes {
+		return fmt.Errorf("Local state exceeds the supported checkpoint size bound")
+	}
+	// Backup output, durable publication copy, possible graph restore copy, and
+	// a conservative WAL rewrite are all included; existing root files remain
+	// charged as cleanup debt until deletion and directory sync succeed.
+	values := []uint64{live, live, live, uint64(max(int64(0), n.wal.Bytes()))}
+	values = append(values, reserve...)
+	required, err := checkedLocalDiskAdd(values...)
+	if err != nil {
+		return err
+	}
+	return n.localStore.requireFreeBytes(n.config.DataDir, required)
+}
+
+func localTreeBytes(root string) (uint64, error) {
+	var total uint64
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink in Local materializer data")
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !info.Mode().IsRegular() || info.Size() < 0 {
+			return fmt.Errorf("non-regular file in Local materializer data")
+		}
+		size := uint64(info.Size())
+		if total > ^uint64(0)-size {
+			return fmt.Errorf("Local checkpoint disk estimate overflow")
+		}
+		total += size
+		return nil
+	})
+	return total, err
+}
+
+func checkedLocalDiskAdd(values ...uint64) (uint64, error) {
+	var total uint64
+	for _, value := range values {
+		if total > ^uint64(0)-value {
+			return 0, fmt.Errorf("Local checkpoint disk estimate overflow")
+		}
+		total += value
+	}
+	return total, nil
 }
 
 func (n *Node) catchUpArchive(ctx context.Context) error {
@@ -1149,16 +1529,30 @@ func quarantineSQLite(path string) error {
 }
 
 func (n *Node) replayLocalDecisions(ctx context.Context) error {
+	// Archive catch-up and checkpoint verification can both request local
+	// replay. Keep the tip read, decision selection, apply, and restore-suffix
+	// state transition under one owner so neither path races or replays stale
+	// state concurrently.
+	n.replayMu.Lock()
+	defer n.replayMu.Unlock()
 	for {
 		from := quepaxa.Slot(n.material.Tip() + 1)
 		decisions, tip, err := n.core.DecisionsFrom(from, 256)
 		if err != nil {
 			return err
 		}
-		if err := n.material.ApplyBatch(ctx, decisions); err != nil {
+		if n.localRestoreSuffixPending && localRestoreSuffixCrashBoundary != nil {
+			for _, decision := range decisions {
+				if err := n.material.ApplyBatch(ctx, []quepaxa.DecidedValue{decision}); err != nil {
+					return err
+				}
+				localRestoreSuffixCrashBoundary(uint64(decision.Slot))
+			}
+		} else if err := n.material.ApplyBatch(ctx, decisions); err != nil {
 			return err
 		}
 		if quepaxa.Slot(n.material.Tip()) >= tip {
+			n.localRestoreSuffixPending = false
 			return nil
 		}
 	}

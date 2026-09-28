@@ -588,6 +588,84 @@ func TestOpenRemovesAbortedCompactionTarget(t *testing.T) {
 	}
 }
 
+func TestLocalDeferredCleanupWaitsForSuccessfulRecovery(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(dir, "seg_999.log")
+	temp := filepath.Join(dir, ".rhiza-compact-orphan")
+	for _, path := range []string{orphan, temp} {
+		if err := os.WriteFile(path, []byte("preserve until recovery"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	local, err := OpenLocalDeferredCleanup(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	for _, path := range []string{orphan, temp} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("Local open cleaned %s before recovery: %v", filepath.Base(path), err)
+		}
+	}
+	if err := local.FinalizeDeferredCleanup(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{orphan, temp} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("successful Local recovery left %s: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+func TestLocalDeferredCleanupRetainsPreCompactionSegments(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryProposal, Payload: []byte("value")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	local, err := OpenLocalDeferredCleanup(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	oldSegment := local.segmentPath(local.segments[0].index)
+	compaction, err := local.BeginCompaction(Entry{Slot: 1, Type: EntryCheckpoint, Payload: []byte("base")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compaction.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if err := compaction.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldSegment); err != nil {
+		t.Fatalf("Local compaction removed old segment before recovery finalization: %v", err)
+	}
+	if err := local.FinalizeDeferredCleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldSegment); !os.IsNotExist(err) {
+		t.Fatalf("successful recovery cleanup left old segment: %v", err)
+	}
+}
+
 func TestManifestGenerationsRemainBounded(t *testing.T) {
 	dir := t.TempDir()
 	wal, err := Open(dir)
@@ -907,5 +985,125 @@ func TestLockFile(t *testing.T) {
 
 	if !cleanStart {
 		t.Error("expected clean start after release")
+	}
+}
+
+func TestOpenReadOnlyDoesNotRepairOrCreateWAL(t *testing.T) {
+	dir := t.TempDir()
+	wal, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Append(Entry{Slot: 1, Type: EntryReceipt, Payload: []byte("durable")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segment := filepath.Join(dir, "seg_001.log")
+	file, err := os.OpenFile(segment, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("read-only authority inspection rejected an otherwise valid torn active tail: %v", err)
+	}
+	entries, err := view.Read()
+	if err != nil || len(entries) != 1 || string(entries[0].Payload) != "durable" {
+		t.Fatalf("read-only WAL entries=%+v err=%v", entries, err)
+	}
+	if err := view.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("read-only inspection changed the WAL tail")
+	}
+	if repaired, err := Open(dir); err != nil {
+		t.Fatal(err)
+	} else {
+		if err := repaired.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stat, err := os.Stat(segment)
+	if err != nil || stat.Size() != int64(len(before)-3) {
+		t.Fatalf("authorized writable open did not repair active tail: size=%v err=%v", stat, err)
+	}
+
+	empty := t.TempDir()
+	view, err = OpenReadOnly(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Bytes() != 0 {
+		t.Fatalf("empty inspection bytes=%d, want 0", view.Bytes())
+	}
+	if err := view.Append(Entry{Type: EntryReceipt}); err == nil {
+		t.Fatal("read-only inspection accepted append")
+	}
+	if err := view.Close(); err != nil {
+		t.Fatal(err)
+	}
+	emptyEntries, err := os.ReadDir(empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyEntries) != 0 {
+		t.Fatalf("read-only inspection created files: %v", emptyEntries)
+	}
+}
+
+func TestEstimateCompactedBytesMatchesBuildSelection(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	retained := []byte("retained proposal")
+	hash := sha256.Sum256(retained)
+	for _, entry := range []Entry{
+		{Slot: 2, Type: EntryProposal, Hash: hash, Payload: retained},
+		{Slot: 1, Type: EntryReceipt, Payload: []byte("below-floor")},
+		{Slot: 4, Type: EntryReceipt, Payload: []byte("duplicate")},
+		{Slot: 4, Type: EntryReceipt, Payload: []byte("duplicate")},
+	} {
+		if err := wal.Append(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := Entry{Slot: 3, Type: EntryCheckpoint, Payload: []byte("base")}
+	retainedValues := map[[32]byte][]byte{hash: retained}
+	got, err := wal.EstimateCompactedBytes(base, retainedValues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := wal.BeginCompaction(base, retainedValues)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Abort()
+	if err := plan.Build(); err != nil {
+		t.Fatal(err)
+	}
+	if got != uint64(plan.offset) {
+		t.Fatalf("estimate=%d built=%d", got, plan.offset)
 	}
 }
