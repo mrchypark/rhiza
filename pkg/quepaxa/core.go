@@ -17,6 +17,16 @@ import (
 var ErrQuorumUnavailable = errors.New("QuePaxa quorum unavailable")
 var ErrCompacted = errors.New("QuePaxa history compacted")
 
+// localCheckpointCrashBoundary is a package-private subprocess-test seam.
+// Production leaves it nil and it does not participate in error handling.
+var localCheckpointCrashBoundary func(string)
+
+func hitLocalCheckpointCrashBoundary(name string) {
+	if localCheckpointCrashBoundary != nil {
+		localCheckpointCrashBoundary(name)
+	}
+}
+
 var (
 	isrEntryMagic      = []byte("QISR\x00")
 	isrEntryV2Magic    = []byte("QISR2\x00")
@@ -295,6 +305,10 @@ func (c *Core) ProposeCertified(ctx context.Context, value []byte) (Slot, []Rece
 }
 
 func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, []Receipt, error) {
+	return c.proposeOwned(ctx, value, complete, false, false)
+}
+
+func (c *Core) proposeOwned(ctx context.Context, value []byte, complete, executionOwned, capacityPreflightDone bool) (Slot, []Receipt, error) {
 	if c.observer || ((c.reconfigEnabled || c.learner) && !c.IsVoter()) {
 		return 0, nil, ErrQuorumUnavailable
 	}
@@ -306,13 +320,13 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 	} else if control {
 		return 0, nil, fmt.Errorf("reconfiguration controls require BeginReconfiguration or FinishReconfiguration")
 	}
-	if err := c.acquireLocalExecution(ctx); err != nil {
-		return 0, nil, err
-	}
-	if c.localMode {
+	if c.localMode && !executionOwned {
+		if err := c.acquireLocalExecution(ctx); err != nil {
+			return 0, nil, err
+		}
 		defer c.releaseLocalExecution()
 	}
-	if c.localMode {
+	if c.localMode && !capacityPreflightDone {
 		pending := c.RecorderTip()
 		cost, err := c.localCost.estimate(len(value))
 		if err != nil {
@@ -1694,6 +1708,10 @@ func (c *Core) PrepareCheckpoint(ctx context.Context, seal CheckpointSeal) error
 }
 
 func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) error {
+	return c.prepareCheckpointOwnedWithAdmission(ctx, seal, true)
+}
+
+func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal CheckpointSeal, admission bool) error {
 	c.checkpointMu.Lock()
 	defer c.checkpointMu.Unlock()
 	verified, validator, err := c.checkpointIdentity(seal)
@@ -1710,7 +1728,7 @@ func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) 
 	if err != nil {
 		return err
 	}
-	if c.localMode {
+	if c.localMode && admission {
 		if err := c.localValidateDecisionPrefixOwned(seal.Index); err != nil {
 			return err
 		}
@@ -1739,6 +1757,9 @@ func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) 
 	}
 	if err := c.commits.Sync(ctx); err != nil {
 		return err
+	}
+	if c.localMode {
+		hitLocalCheckpointCrashBoundary("after-prepared-marker-sync-before-seal")
 	}
 	c.mu.Lock()
 	for _, value := range pending {

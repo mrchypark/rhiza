@@ -192,6 +192,86 @@ func TestExplicitLocalPrewriteCapacityDenialDoesNotPoisonLifecycle(t *testing.T)
 	}
 }
 
+func TestExplicitLocalPrewriteDenialReclaimsThenRetriesSameBytesOnce(t *testing.T) {
+	server, _, wal := newLocalLifecycleServerWithLimit(t, 1)
+	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "reclaim", SQL: "CREATE TABLE reclaimed(id INTEGER)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	server.SetLocalReclaimHandler(func(ctx context.Context) error {
+		resume, err := server.Quiesce(ctx)
+		if err != nil {
+			return err
+		}
+		defer resume()
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		return wal.SetMaxBytes(math.MaxInt64)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() { _, err := server.propose(ctx, value); first <- err }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Local maintenance did not start after prewrite refusal")
+	}
+	cancel()
+	if err := <-first; !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled caller error=%v, want detached commit-unknown", err)
+	}
+	hash := sha256.Sum256(value)
+	server.proposeMu.Lock()
+	call := server.inflight[hash]
+	charged := server.localB
+	server.proposeMu.Unlock()
+	if call == nil || charged != len(value) {
+		t.Fatalf("logical continuation lost during maintenance: call=%v charged=%d want=%d", call != nil, charged, len(value))
+	}
+	if _, err := server.propose(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{5})); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("proposal admitted during maintenance: %v", err)
+	}
+	close(release)
+	select {
+	case <-call.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("logical proposal did not finish its exact-byte retry")
+	}
+	if call.err != nil || !server.Ready() {
+		t.Fatalf("retried proposal error=%v ready=%v", call.err, server.Ready())
+	}
+	if slot, ok := server.core.DecidedSlot(value); !ok || slot != call.slot || slot == 0 {
+		t.Fatalf("retried value decision slot=%d found=%v call slot=%d", slot, ok, call.slot)
+	}
+	server.proposeMu.Lock()
+	charged = server.localB
+	server.proposeMu.Unlock()
+	if charged != 0 {
+		t.Fatalf("logical byte charge after completion=%d, want 0", charged)
+	}
+}
+
+func TestExplicitLocalPrewriteMaintenanceFailurePoisonsAmbiguousProposal(t *testing.T) {
+	server, _, wal := newLocalLifecycleServerWithLimit(t, 1)
+	maintenanceFailure := errors.New("checkpoint publication failed")
+	server.SetLocalReclaimHandler(func(context.Context) error { return maintenanceFailure })
+	value := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{9})
+	if _, err := server.propose(context.Background(), value); !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, maintenanceFailure) {
+		t.Fatalf("proposal error=%v, want commit-unknown wrapping maintenance failure", err)
+	}
+	if server.Ready() || !errors.Is(server.localFailure(), maintenanceFailure) {
+		t.Fatalf("maintenance failure did not close Local lifecycle: ready=%v failure=%v", server.Ready(), server.localFailure())
+	}
+	if wal.Bytes() != 0 {
+		t.Fatalf("prewrite-denied proposal mutated WAL before maintenance failure: %d bytes", wal.Bytes())
+	}
+}
+
 func TestExplicitLocalNestedRawCapacityFailurePoisonsLifecycle(t *testing.T) {
 	server, _, _ := newLocalLifecycleServer(t)
 	server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error { return qlog.ErrCapacity })

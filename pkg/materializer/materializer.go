@@ -118,8 +118,10 @@ const (
 )
 
 type CheckpointFile struct {
-	Role CheckpointRole
-	Path string
+	Role           CheckpointRole
+	Path           string
+	ExpectedLength uint64
+	ExpectedSHA256 string
 }
 
 type sqliteSnapshot struct {
@@ -137,29 +139,42 @@ func Open(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materia
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
 	dbPath = absolute
+	if _, err := os.Lstat(localRestoreJournalPath(dbPath)); err == nil {
+		return nil, fmt.Errorf("Local restore journal requires exact validated WAL-base recovery")
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 	if err := recoverRestore(dbPath); err != nil {
 		return nil, fmt.Errorf("recover interrupted restore: %w", err)
 	}
 	return openMaterializer(dbPath, readerCount, idempotencyWindow...)
 }
 
+// ValidateCleanRestoreState is a read-only Local startup guard. Restore
+// journals do not identify the exact certified checkpoint root, so Local
+// startup preserves and refuses interrupted restore state instead of allowing
+// Open to roll it forward or back after WAL repair has begun.
+func ValidateCleanRestoreState(dbPath string) error {
+	absolute, err := filepath.Abs(dbPath)
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{restoreStatePath(absolute), absolute + ".restore-backup", filepath.Join(filepath.Dir(absolute), "latticedb.restore-backup")} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("Local startup found interrupted materializer restore state at %s; preserve it for exact-root recovery", path)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // ConfigureLocalGraphNodePropertyIndexes declares node-local derived indexes.
 // The declaration is retained and reconciled after materializer replacement.
 func (m *Materializer) ConfigureLocalGraphNodePropertyIndexes(indexes []types.GraphNodePropertyIndex) error {
-	if len(indexes) > MaxGraphPropertyIndexes {
-		return fmt.Errorf("at most %d local graph property indexes are allowed", MaxGraphPropertyIndexes)
-	}
-	deduped := make([]types.GraphNodePropertyIndex, 0, len(indexes))
-	seen := make(map[types.GraphNodePropertyIndex]struct{}, len(indexes))
-	for _, index := range indexes {
-		if index.Label == "" || index.Property == "" {
-			return fmt.Errorf("graph index label and property are required")
-		}
-		if _, ok := seen[index]; ok {
-			continue
-		}
-		seen[index] = struct{}{}
-		deduped = append(deduped, index)
+	deduped, err := ValidateLocalGraphNodePropertyIndexes(indexes)
+	if err != nil {
+		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -168,6 +183,28 @@ func (m *Materializer) ConfigureLocalGraphNodePropertyIndexes(indexes []types.Gr
 	}
 	m.graphNodePropertyIndexes = deduped
 	return nil
+}
+
+// ValidateLocalGraphNodePropertyIndexes validates and canonicalizes the
+// configured derived-index policy without opening or mutating materializer
+// files. Duplicate declarations are harmless and collapse to one entry.
+func ValidateLocalGraphNodePropertyIndexes(indexes []types.GraphNodePropertyIndex) ([]types.GraphNodePropertyIndex, error) {
+	if len(indexes) > MaxGraphPropertyIndexes {
+		return nil, fmt.Errorf("at most %d local graph property indexes are allowed", MaxGraphPropertyIndexes)
+	}
+	deduped := make([]types.GraphNodePropertyIndex, 0, len(indexes))
+	seen := make(map[types.GraphNodePropertyIndex]struct{}, len(indexes))
+	for _, index := range indexes {
+		if index.Label == "" || index.Property == "" {
+			return nil, fmt.Errorf("graph index label and property are required")
+		}
+		if _, ok := seen[index]; ok {
+			continue
+		}
+		seen[index] = struct{}{}
+		deduped = append(deduped, index)
+	}
+	return deduped, nil
 }
 
 func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint64) (*Materializer, error) {
@@ -2388,7 +2425,7 @@ func (m *Materializer) RestoreCheckpoint(ctx context.Context, files []Checkpoint
 	if parts.sqlitePath == "" || !seen[CheckpointGraphData] {
 		return fmt.Errorf("checkpoint requires SQLite and Graph files")
 	}
-	if err := sqlpolicy.CheckFile(ctx, parts.sqlitePath); err != nil {
+	if err := sqlpolicy.CheckSnapshotFile(ctx, parts.sqlitePath); err != nil {
 		return err
 	}
 	root, err := os.MkdirTemp(filepath.Dir(m.dbPath), ".rhiza-graph-restore-*")
@@ -2483,6 +2520,15 @@ func recoverRestore(dbPath string) error {
 	}
 	if err != nil {
 		return err
+	}
+	var discriminator struct {
+		LocalVersion int `json:"local_version"`
+	}
+	if err := json.Unmarshal(data, &discriminator); err != nil {
+		return fmt.Errorf("decode restore journal: %w", err)
+	}
+	if discriminator.LocalVersion != 0 {
+		return fmt.Errorf("Local restore journal requires exact validated WAL-base recovery")
 	}
 	var state restoreState
 	if err := json.Unmarshal(data, &state); err != nil {

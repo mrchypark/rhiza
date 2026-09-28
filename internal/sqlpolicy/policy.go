@@ -31,11 +31,25 @@ func CheckExisting(ctx context.Context, path string) error {
 
 // CheckFile inspects provenance without opening a writer or upgrading the file.
 func CheckFile(ctx context.Context, path string) error {
+	return checkFile(ctx, path, false)
+}
+
+// CheckSnapshotFile inspects a standalone checkpoint SQLite image without
+// allowing SQLite to create WAL/SHM sidecars beside the immutable source.
+func CheckSnapshotFile(ctx context.Context, path string) error {
+	return checkFile(ctx, path, true)
+}
+
+func checkFile(ctx context.Context, path string, immutable bool) error {
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return err
 	}
-	db, err := driver.Open((&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String() + "?mode=ro")
+	query := "?mode=ro"
+	if immutable {
+		query += "&immutable=1"
+	}
+	db, err := driver.Open((&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String() + query)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrIncompatible, err)
 	}

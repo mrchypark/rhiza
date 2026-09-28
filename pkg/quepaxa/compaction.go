@@ -303,6 +303,26 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 		c.unlockCompactionBarrier()
 		return err
 	}
+	if c.localMode {
+		baseEntry := qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}
+		rewriteBytes, estimateErr := c.wal.EstimateCompactedBytes(baseEntry, retained)
+		if estimateErr != nil {
+			c.mu.Unlock()
+			c.unlockCompactionBarrier()
+			return estimateErr
+		}
+		capacity := c.wal.Capacity()
+		if capacity.Fatal != nil {
+			c.mu.Unlock()
+			c.unlockCompactionBarrier()
+			return capacity.Fatal
+		}
+		if capacity.Limit <= 0 || rewriteBytes > uint64(capacity.Limit) {
+			c.mu.Unlock()
+			c.unlockCompactionBarrier()
+			return fmt.Errorf("%w: exact compacted WAL requires %d bytes (limit %d)", qlog.ErrCapacity, rewriteBytes, capacity.Limit)
+		}
+	}
 	compaction, err := c.beginCompactionLocked(qlog.Entry{Slot: uint64(through), Hash: recoveryRoot, Type: qlog.EntryCheckpoint, Payload: payload}, retained)
 	c.mu.Unlock()
 	c.unlockCompactionBarrier()
@@ -332,6 +352,51 @@ func (c *Core) compactThroughOwned(through Slot, recoveryRoot [32]byte) error {
 	c.installVerifiedBaseLocked(base, verified)
 	c.pruneSlotAllocatorLocked()
 	return nil
+}
+
+// estimateLocalCompactionOwned uses the same base encoding and retained-entry
+// selection as compactThroughOwned before the checkpoint seal is written.
+func (c *Core) estimateLocalCompactionOwned(seal CheckpointSeal) (uint64, error) {
+	c.mu.RLock()
+	if seal.Index <= c.floor || seal.Index > c.tip {
+		c.mu.RUnlock()
+		return 0, fmt.Errorf("Local checkpoint floor is outside retained history")
+	}
+	prefix, ok := c.prefixes[seal.Index]
+	if !ok {
+		c.mu.RUnlock()
+		return 0, fmt.Errorf("Local checkpoint prefix is unavailable")
+	}
+	order, following, err := c.checkpointLeaderOrdersLocked(seal.Index)
+	if err != nil {
+		c.mu.RUnlock()
+		return 0, err
+	}
+	base := consensusBase{
+		ConfigID: seal.ConfigID, ClosedThrough: seal.Index,
+		PrefixHash: prefix, RecoveryRoot: seal.RootHash,
+		LeaderEpoch: c.leaderEpochKeyLocked(seal.Index + 1), NextLeaderOrder: order,
+		FollowingLeaderOrder: following, GenerationAnchorHash: c.generationAnchorHash,
+	}
+	if c.reconfigEnabled {
+		membership, err := c.membershipHistoryLocked(seal.Index)
+		if err != nil {
+			c.mu.RUnlock()
+			return 0, err
+		}
+		membershipCopy := membership
+		base.Membership = &membershipCopy
+	}
+	retained, err := c.liveProposalValuesAboveLocked(seal.Index)
+	c.mu.RUnlock()
+	if err != nil {
+		return 0, err
+	}
+	payload, err := json.Marshal(base)
+	if err != nil {
+		return 0, err
+	}
+	return c.wal.EstimateCompactedBytes(qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpoint, Payload: payload}, retained)
 }
 
 // Verify the exact retained contiguous suffix under the final barrier before

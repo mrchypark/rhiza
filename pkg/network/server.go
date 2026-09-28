@@ -24,14 +24,15 @@ import (
 const MaxRequestBodyBytes = 1 << 20
 
 var (
-	ErrNotReady              = errors.New("node is not ready")
-	ErrRequestConflict       = errors.New("request ID conflict")
-	ErrInvalidRequest        = errors.New("invalid request")
-	ErrOverloaded            = errors.New("mutation queue overloaded")
-	ErrDurabilityUnavailable = errors.New("object-store durability unavailable")
-	ErrCommitUnknown         = errors.New("commit outcome unknown")
-	ErrGraphResourceLimit    = errors.New("graph resource limit exceeded")
-	ErrReadVersionMismatch   = errors.New("read version mismatch")
+	ErrNotReady                = errors.New("node is not ready")
+	ErrRequestConflict         = errors.New("request ID conflict")
+	ErrInvalidRequest          = errors.New("invalid request")
+	ErrOverloaded              = errors.New("mutation queue overloaded")
+	ErrDurabilityUnavailable   = errors.New("object-store durability unavailable")
+	ErrCommitUnknown           = errors.New("commit outcome unknown")
+	ErrLocalMaintenanceRefused = errors.New("local checkpoint maintenance refused before mutation")
+	ErrGraphResourceLimit      = errors.New("graph resource limit exceeded")
+	ErrReadVersionMismatch     = errors.New("read version mismatch")
 )
 
 // CommitUnknownError means a mutation may commit despite the failed call.
@@ -79,12 +80,14 @@ type Server struct {
 	proposalCtx          context.Context
 	proposalStop         context.CancelFunc
 	proposalWG           sync.WaitGroup
+	logicalWG            sync.WaitGroup
 	closeOnce            sync.Once
 	closing              bool
 	quiescing            bool
 	localMode            bool
 	lifecycleFailure     error
 	localFailureHandler  func(error)
+	localReclaimHandler  func(context.Context) error
 	operationCap         chan struct{}
 	localCap             chan struct{}
 	operationB           int
@@ -184,9 +187,11 @@ func (s *Server) lockRequest(id string) func() {
 }
 
 type proposalCall struct {
-	done chan struct{}
-	slot quepaxa.Slot
-	err  error
+	done        chan struct{}
+	slot        quepaxa.Slot
+	err         error
+	deadline    time.Time
+	hasDeadline bool
 }
 
 // NewServer creates a new HTTP server.
@@ -235,6 +240,31 @@ func (s *Server) SetLocalFailureHandler(handler func(error)) {
 	s.localFailureHandler = handler
 	if s.lifecycleFailure != nil && handler != nil {
 		handler(s.lifecycleFailure)
+	}
+	s.proposeMu.Unlock()
+}
+
+// SetLocalReclaimHandler installs the one-shot Local checkpoint coordinator.
+// The handler runs only after a trusted new-proposal prewrite refusal and only
+// after that attempt has left proposalWG and returned its physical permits.
+func (s *Server) SetLocalReclaimHandler(handler func(context.Context) error) {
+	s.proposeMu.Lock()
+	s.localReclaimHandler = handler
+	s.proposeMu.Unlock()
+}
+
+// FailLocalLifecycle closes readiness before a quiesced Local maintenance
+// handler reopens proposal admission after an uncertain state transition.
+func (s *Server) FailLocalLifecycle(err error) {
+	if err == nil || !s.localMode {
+		return
+	}
+	s.proposeMu.Lock()
+	if s.lifecycleFailure == nil {
+		s.lifecycleFailure = err
+		if s.localFailureHandler != nil {
+			s.localFailureHandler(err)
+		}
 	}
 	s.proposeMu.Unlock()
 }
@@ -314,6 +344,7 @@ func (s *Server) Close() {
 		}
 		s.kvBatcher.Close()
 		s.proposalWG.Wait()
+		s.logicalWG.Wait()
 	})
 }
 
@@ -480,10 +511,12 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 		return 0, ErrOverloaded
 	}
 	call := &proposalCall{done: make(chan struct{})}
+	call.deadline, call.hasDeadline = ctx.Deadline()
 	s.inflight[hash] = call
 	s.operationB += len(value)
 	s.localB += len(value)
 	s.proposalWG.Add(1)
+	s.logicalWG.Add(1)
 	go s.runProposal(hash, call, bytes.Clone(value))
 	s.proposeMu.Unlock()
 	select {
@@ -540,46 +573,130 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 }
 
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
-	ctx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
-	coreStarted := false
-	prewriteDenied := false
+	ctx, cancel := s.proposalWorkContext(call)
+	defer cancel()
+	var coreStarted, prewriteDenied bool
+	call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value)
+	if s.localMode && prewriteDenied {
+		s.releaseProposalAttempt()
+		s.proposeMu.Lock()
+		handler := s.localReclaimHandler
+		s.proposeMu.Unlock()
+		if handler != nil && ctx.Err() == nil {
+			maintenanceErr := handler(ctx)
+			if maintenanceErr == nil {
+				if err := s.beginLocalRetry(ctx); err != nil {
+					call.err = err
+				} else {
+					call.slot, call.err, coreStarted, prewriteDenied = s.runProposalAttempt(ctx, value)
+					if coreStarted && call.err != nil && !prewriteDenied {
+						s.FailLocalLifecycle(call.err)
+					}
+					s.releaseProposalAttempt()
+				}
+			} else if !errors.Is(maintenanceErr, ErrLocalMaintenanceRefused) && !errors.Is(maintenanceErr, ErrNotReady) {
+				s.FailLocalLifecycle(maintenanceErr)
+				call.err = maintenanceErr
+				// Maintenance ran after a Core capacity denial. Any failure other
+				// than a clean refusal means the original proposal's outcome must
+				// be treated as unknown, even if maintenance itself failed before
+				// the retry reached Core.
+				coreStarted = true
+				prewriteDenied = false
+			} else if !errors.Is(maintenanceErr, ErrLocalMaintenanceRefused) {
+				call.err = maintenanceErr
+			}
+		}
+	} else {
+		if s.localMode && coreStarted && call.err != nil && !prewriteDenied {
+			s.FailLocalLifecycle(call.err)
+		}
+		s.releaseProposalAttempt()
+	}
+	if s.localMode && coreStarted && call.err != nil && !prewriteDenied && !errors.Is(call.err, ErrLocalMaintenanceRefused) {
+		failure := s.localFailure()
+		if failure == nil {
+			failure = call.err
+		}
+		call.err = fmt.Errorf("%w: local lifecycle requires reopen: %w", ErrCommitUnknown, failure)
+	}
+	s.finishProposalLogical(hash, call, len(value))
+}
+
+func (s *Server) proposalWorkContext(call *proposalCall) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(30 * time.Second)
+	if call.hasDeadline && call.deadline.Before(deadline) {
+		deadline = call.deadline
+	}
+	return context.WithDeadline(s.proposalCtx, deadline)
+}
+
+func (s *Server) runProposalAttempt(ctx context.Context, value []byte) (quepaxa.Slot, error, bool, bool) {
 	if s.localMode {
 		if err := types.ValidateExecutionPolicy(value); err != nil {
-			call.err = fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-		} else if err := validateReplicatedMutation(value); err != nil {
-			call.err = fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
+		}
+		if err := validateReplicatedMutation(value); err != nil {
+			return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err), false, false
 		}
 	}
-	if call.err == nil {
-		coreStarted = true
-		call.slot, call.err = s.proposeOnce(ctx, value)
-		prewriteDenied = s.localMode && call.err != nil && quepaxa.IsLocalAdmissionDenial(call.err)
+	slot, err := s.proposeOnce(ctx, value)
+	if err != nil {
+		return slot, err, true, s.localMode && quepaxa.IsLocalAdmissionDenial(err)
 	}
-	if call.err == nil {
-		call.err = s.applyDecisions(ctx, call.slot)
+	if err = s.applyDecisions(ctx, slot); err == nil {
+		err = s.waitDurable(ctx, slot)
 	}
-	if call.err == nil {
-		call.err = s.waitDurable(ctx, call.slot)
-	}
-	cancel()
+	return slot, err, true, false
+}
+
+func (s *Server) releaseProposalAttempt() {
 	s.proposeMu.Lock()
-	if s.localMode && coreStarted && !prewriteDenied && call.err != nil && s.lifecycleFailure == nil {
-		s.lifecycleFailure = call.err
-		if s.localFailureHandler != nil {
-			s.localFailureHandler(call.err)
-		}
-		call.err = fmt.Errorf("%w: local lifecycle requires reopen: %w", ErrCommitUnknown, call.err)
+	<-s.operationCap
+	<-s.localCap
+	s.proposeMu.Unlock()
+	s.proposalWG.Done()
+}
+
+func (s *Server) beginLocalRetry(ctx context.Context) error {
+	select {
+	case s.localCap <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.proposalCtx.Done():
+		return ErrNotReady
 	}
+	select {
+	case s.operationCap <- struct{}{}:
+	case <-ctx.Done():
+		<-s.localCap
+		return ctx.Err()
+	case <-s.proposalCtx.Done():
+		<-s.localCap
+		return ErrNotReady
+	}
+	s.proposeMu.Lock()
+	if s.closing || s.quiescing || s.lifecycleFailure != nil {
+		s.proposeMu.Unlock()
+		<-s.operationCap
+		<-s.localCap
+		return ErrNotReady
+	}
+	s.proposalWG.Add(1)
+	s.proposeMu.Unlock()
+	return nil
+}
+
+func (s *Server) finishProposalLogical(hash [32]byte, call *proposalCall, size int) {
+	s.proposeMu.Lock()
 	if s.inflight[hash] == call {
 		delete(s.inflight, hash)
 	}
-	s.operationB -= len(value)
-	s.localB -= len(value)
-	<-s.operationCap
-	<-s.localCap
+	s.operationB -= size
+	s.localB -= size
 	close(call.done)
 	s.proposeMu.Unlock()
-	s.proposalWG.Done()
+	s.logicalWG.Done()
 }
 
 func (s *Server) beginLocalLifecycle() error {

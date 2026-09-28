@@ -229,6 +229,72 @@ func openGraph(path string, sqliteTip, idempotencyWindow uint64) (*graphState, e
 	return g, nil
 }
 
+// ValidateLocalGraphStorage inspects the actual graph storage marker using a
+// read-only open. It never creates the database or repairs pending graph
+// publication metadata before Local WAL authority has been checked.
+func ValidateLocalGraphStorage(path string, allowAbsent bool) error {
+	return validateLocalGraphStorage(path, allowAbsent, false)
+}
+
+func validateLocalGraphStorage(path string, allowAbsent, disableLock bool) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if allowAbsent {
+			return nil
+		}
+		return fmt.Errorf("Local graph storage is missing")
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("Local graph storage path is a symlink")
+	}
+	db, err := latticedb.Open(path, latticedb.OpenOptions{ReadOnly: true, DisableLock: disableLock})
+	if err != nil {
+		return fmt.Errorf("open Local graph storage read-only: %w", err)
+	}
+	defer db.Close()
+	return db.View(func(tx *latticedb.Tx) error {
+		format, found, err := tx.GetAppMetadata(graphFormatKey)
+		if err != nil {
+			return err
+		}
+		if !found || !bytes.Equal(format, graphStoragePolicy) {
+			return fmt.Errorf("Local graph storage policy is missing or unsupported")
+		}
+		tip, found, err := tx.GetAppMetadata(graphTipKey)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("Local graph applied-slot marker is missing")
+		}
+		if _, err := decodeGraphTip(tip); err != nil {
+			return err
+		}
+		journal, journalFound, err := tx.GetAppMetadata(graphJournalKey)
+		if err != nil {
+			return err
+		}
+		pending, pendingFound, err := tx.GetAppMetadata(graphPendingKey)
+		if err != nil {
+			return err
+		}
+		if journalFound {
+			if _, err := decodeGraphJournal(journal); err != nil {
+				return err
+			}
+		}
+		if pendingFound {
+			if _, err := decodeGraphPending(pending); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (g *graphState) getMetadata(key []byte) ([]byte, error) {
 	value, _, err := g.getMetadataValue(key)
 	return value, err

@@ -15,33 +15,48 @@ import (
 
 // Segment is a single WAL segment file.
 type Segment struct {
-	file   *os.File
-	index  uint32
-	offset int64
-	mu     sync.Mutex
+	file                  *os.File
+	index                 uint32
+	offset                int64
+	mu                    sync.Mutex
+	allowTornTailReadOnly bool
 }
 
 // WAL is the local write-ahead log for QLog entries.
 // It stores proposals, receipts, and decisions for fast recovery.
 type WAL struct {
-	dir        string
-	segments   []*Segment
-	current    *Segment
-	mu         sync.RWMutex
-	compactMu  sync.Mutex
-	generation uint64
-	maxSize    int64
-	maxBytes   int64
-	totalBytes int64
-	identity   []byte
-	dirty      bool
-	fatal      error
-	syncDir    func(string) error
-	remove     func(string) error
-	writeAt    func(*os.File, []byte, int64) (int, error)
+	dir            string
+	segments       []*Segment
+	current        *Segment
+	mu             sync.RWMutex
+	compactMu      sync.Mutex
+	generation     uint64
+	maxSize        int64
+	maxBytes       int64
+	totalBytes     int64
+	identity       []byte
+	dirty          bool
+	fatal          error
+	readOnly       bool
+	deferCleanup   bool
+	pendingCleanup bool
+	syncDir        func(string) error
+	remove         func(string) error
+	writeAt        func(*os.File, []byte, int64) (int, error)
+	syncFile       func(*os.File) error
 }
 
 var ErrCapacity = errors.New("WAL capacity reached")
+
+// localWALCrashBoundary is a package-private subprocess-test seam. Production
+// leaves it nil; callbacks must not be used for WAL behavior or error policy.
+var localWALCrashBoundary func(string)
+
+func hitLocalWALCrashBoundary(name string) {
+	if localWALCrashBoundary != nil {
+		localWALCrashBoundary(name)
+	}
+}
 
 // CapacitySnapshot is a coherent view of the configured byte ceiling and the
 // bytes currently charged to the WAL. Fatal reports an earlier uncertain WAL
@@ -90,6 +105,18 @@ const defaultMaxSize = 64 * 1024 * 1024 // 64MB per segment
 
 // Open opens or creates a WAL in the given directory.
 func Open(dir string) (*WAL, error) {
+	return open(dir, false)
+}
+
+// OpenLocalDeferredCleanup opens a mutable Local WAL but retains unreferenced
+// generations and temporary files until startup recovery has restored the
+// selected base and replayed its suffix. Call FinalizeDeferredCleanup only
+// after that recovery succeeds.
+func OpenLocalDeferredCleanup(dir string) (*WAL, error) {
+	return open(dir, true)
+}
+
+func open(dir string, deferCleanup bool) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create WAL dir: %w", err)
 	}
@@ -98,11 +125,13 @@ func Open(dir string) (*WAL, error) {
 	}
 
 	w := &WAL{
-		dir:     dir,
-		maxSize: defaultMaxSize,
-		syncDir: syncDir,
-		remove:  os.Remove,
-		writeAt: (*os.File).WriteAt,
+		dir:          dir,
+		maxSize:      defaultMaxSize,
+		deferCleanup: deferCleanup,
+		syncDir:      syncDir,
+		remove:       os.Remove,
+		writeAt:      (*os.File).WriteAt,
+		syncFile:     (*os.File).Sync,
 	}
 
 	if err := w.loadSegments(); err != nil {
@@ -111,6 +140,156 @@ func Open(dir string) (*WAL, error) {
 	}
 
 	return w, nil
+}
+
+// FinalizeDeferredCleanup removes committed-WAL leftovers only after the
+// Local caller has successfully completed exact-base restore and suffix replay.
+func (w *WAL) FinalizeDeferredCleanup() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.deferCleanup {
+		return fmt.Errorf("WAL cleanup was not deferred")
+	}
+	if !w.pendingCleanup {
+		w.deferCleanup = false
+		return nil
+	}
+	refs := make([]manifestRef, len(w.segments))
+	for i, seg := range w.segments {
+		refs[i] = manifestRef{index: seg.index, length: uint64(seg.offset), active: i == len(w.segments)-1}
+		if refs[i].active {
+			refs[i].length = 0
+		}
+	}
+	latest := filepath.Join(w.dir, fmt.Sprintf("manifest_%020d.bin", w.generation))
+	if err := w.reconcileCommittedFiles(latest, refs); err != nil {
+		return err
+	}
+	w.pendingCleanup = false
+	w.deferCleanup = false
+	return nil
+}
+
+// OpenReadOnly selects and validates the manifest-backed WAL without creating,
+// truncating, chmodding, or removing files. Local startup uses it to validate
+// an exact recovered root before normal Open is allowed to repair a torn tail.
+func OpenReadOnly(dir string) (*WAL, error) {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, fmt.Errorf("WAL path is not a directory")
+	}
+	w := &WAL{dir: dir, maxSize: defaultMaxSize, readOnly: true}
+	if err := w.loadSegmentsReadOnly(); err != nil {
+		w.closeSegments()
+		return nil, fmt.Errorf("inspect WAL: %w", err)
+	}
+	return w, nil
+}
+
+func (w *WAL) loadSegmentsReadOnly() error {
+	manifests, err := filepath.Glob(filepath.Join(w.dir, "manifest_*.bin"))
+	if err != nil {
+		return err
+	}
+	if len(manifests) == 0 {
+		segments, err := filepath.Glob(filepath.Join(w.dir, "seg_*.log"))
+		if err != nil {
+			return err
+		}
+		for _, file := range segments {
+			if _, ok := segmentIndex(file); !ok {
+				return fmt.Errorf("noncanonical WAL segment name %q", filepath.Base(file))
+			}
+			info, err := os.Lstat(file)
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink != 0 || info.Size() != 0 {
+				return fmt.Errorf("nonempty WAL has no authoritative manifest")
+			}
+		}
+		return nil
+	}
+	for _, manifest := range manifests {
+		if !isManifestName(manifest) {
+			return fmt.Errorf("noncanonical WAL manifest name %q", filepath.Base(manifest))
+		}
+		info, err := os.Lstat(manifest)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("WAL manifest is not a regular file: %s", filepath.Base(manifest))
+		}
+	}
+	sort.Strings(manifests)
+	latest := manifests[len(manifests)-1]
+	data, err := os.ReadFile(latest)
+	if err != nil {
+		return err
+	}
+	generation, refs, identity, err := decodeManifest(data)
+	if err != nil {
+		return fmt.Errorf("decode %s: %w", filepath.Base(latest), err)
+	}
+	var filenameGeneration uint64
+	if _, err := fmt.Sscanf(filepath.Base(latest), "manifest_%d.bin", &filenameGeneration); err != nil || filenameGeneration != generation {
+		return fmt.Errorf("WAL manifest generation mismatch")
+	}
+	for i, ref := range refs {
+		path := w.segmentPath(ref.index)
+		linkInfo, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("stat manifest segment %d: %w", ref.index, err)
+		}
+		if linkInfo.Mode()&os.ModeSymlink != 0 || !linkInfo.Mode().IsRegular() {
+			return fmt.Errorf("manifest segment %d is not a regular file", ref.index)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open manifest segment %d: %w", ref.index, err)
+		}
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return err
+		}
+		if !ref.active && uint64(info.Size()) != ref.length {
+			f.Close()
+			return fmt.Errorf("sealed WAL segment %d length=%d, want %d", ref.index, info.Size(), ref.length)
+		}
+		seg := &Segment{file: f, index: ref.index, offset: info.Size(), allowTornTailReadOnly: w.readOnly && ref.active}
+		if _, err := seg.scan(false); err != nil {
+			f.Close()
+			return fmt.Errorf("scan segment %d: %w", ref.index, err)
+		}
+		w.segments = append(w.segments, seg)
+		w.current = seg
+		w.totalBytes += seg.offset
+		if i == len(refs)-1 && !ref.active {
+			return fmt.Errorf("WAL manifest has no active segment")
+		}
+	}
+	// Validate every discovered segment path even when it is an unreferenced
+	// leftover from an interrupted compaction. The selected manifest remains
+	// authoritative; mutable Open may clean leftovers only after Node validates
+	// the recovered checkpoint roots.
+	segmentFiles, err := filepath.Glob(filepath.Join(w.dir, "seg_*.log"))
+	if err != nil {
+		return err
+	}
+	for _, file := range segmentFiles {
+		if _, ok := segmentIndex(file); !ok {
+			return fmt.Errorf("noncanonical WAL segment name %q", filepath.Base(file))
+		}
+		info, err := os.Lstat(file)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("WAL segment is not a regular file: %s", filepath.Base(file))
+		}
+	}
+	w.generation = generation
+	w.identity = identity
+	return nil
 }
 
 // loadSegments loads existing segments from the directory.
@@ -182,7 +361,9 @@ func (w *WAL) loadSegments() error {
 
 	w.generation = generation
 	w.identity = identity
-	if err := w.reconcileCommittedFiles(latest, refs); err != nil {
+	if w.deferCleanup {
+		w.pendingCleanup = true
+	} else if err := w.reconcileCommittedFiles(latest, refs); err != nil {
 		log.Printf("WAL startup cleanup deferred: %v", err)
 	}
 	return nil
@@ -394,7 +575,7 @@ func (w *WAL) publishManifestLocked(segments []*Segment) error {
 		return err
 	}
 	target := filepath.Join(w.dir, fmt.Sprintf("manifest_%020d.bin", generation))
-	published, err := writeFileAtomically(target, data, w.syncDir)
+	published, err := writeFileAtomicallyWith(target, data, w.writeAt, w.syncFile, w.syncDir)
 	if published {
 		w.generation = generation
 	}
@@ -430,6 +611,9 @@ func (w *WAL) BindIdentity(identity []byte) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.readOnly {
+		return fmt.Errorf("WAL inspection is read-only")
+	}
 	if w.fatal != nil {
 		return w.fatal
 	}
@@ -475,6 +659,9 @@ func (w *WAL) cleanupOldManifests(current string) error {
 func (w *WAL) Append(entry Entry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.readOnly {
+		return fmt.Errorf("WAL inspection is read-only")
+	}
 	if w.fatal != nil {
 		return w.fatal
 	}
@@ -522,6 +709,9 @@ func (w *WAL) Append(entry Entry) error {
 func (w *WAL) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.readOnly {
+		return nil
+	}
 	if w.fatal != nil {
 		return w.fatal
 	}
@@ -567,6 +757,64 @@ func (w *WAL) Scan(visit func(Entry) error) error {
 	return nil
 }
 
+// EstimateCompactedBytes returns the exact encoded size for the base,
+// retained proposal values, and nonproposal entries above the base selected
+// by Compaction.Build. Local callers serialize all WAL mutation around this
+// read-only preflight and the subsequent compaction.
+func (w *WAL) EstimateCompactedBytes(base Entry, retainedValues map[[32]byte][]byte) (uint64, error) {
+	if base.Type != EntryCheckpoint || base.Slot == 0 {
+		return 0, fmt.Errorf("invalid WAL compaction base")
+	}
+	for hash, value := range retainedValues {
+		if len(value) == 0 || sha256.Sum256(value) != hash {
+			return 0, fmt.Errorf("invalid retained WAL proposal")
+		}
+	}
+	w.mu.RLock()
+	prefix := append([]*Segment(nil), w.segments...)
+	w.mu.RUnlock()
+	var size uint64
+	err := visitCompactedEntries(base, retainedValues, prefix, func(entry Entry) error {
+		encoded := uint64(len(entry.Encode()))
+		if size > ^uint64(0)-encoded {
+			return fmt.Errorf("compacted WAL size overflow")
+		}
+		size += encoded
+		return nil
+	})
+	return size, err
+}
+
+func visitCompactedEntries(base Entry, retainedValues map[[32]byte][]byte, prefix []*Segment, visit func(Entry) error) error {
+	if err := visit(base); err != nil {
+		return err
+	}
+	hashes := make([][32]byte, 0, len(retainedValues))
+	for hash := range retainedValues {
+		hashes = append(hashes, hash)
+	}
+	sort.Slice(hashes, func(i, j int) bool { return bytes.Compare(hashes[i][:], hashes[j][:]) < 0 })
+	for _, hash := range hashes {
+		if err := visit(Entry{Hash: hash, Type: EntryProposal, Payload: retainedValues[hash]}); err != nil {
+			return err
+		}
+	}
+	for _, seg := range prefix {
+		seg.mu.Lock()
+		err := seg.scanEntries(false, func(entry Entry) error {
+			if entry.Type == EntryProposal || entry.Slot <= base.Slot {
+				return nil
+			}
+			return visit(entry)
+		})
+		seg.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // readAll reads all entries from a segment.
 func (s *Segment) readAll() ([]Entry, error) {
 	s.mu.Lock()
@@ -598,6 +846,10 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 		header := buf[:entryHeaderSize]
 		remaining := size - offset
 		if remaining < int64(len(header)) {
+			if s.allowTornTailReadOnly {
+				s.offset = offset
+				return nil
+			}
 			header = header[:int(remaining)]
 		}
 		if _, err := s.file.ReadAt(header, offset); err != nil {
@@ -605,6 +857,10 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 		}
 		payloadLen, _, err := decodeEntryHeader(header)
 		if err != nil {
+			if s.allowTornTailReadOnly && errors.Is(err, io.ErrUnexpectedEOF) {
+				s.offset = offset
+				return nil
+			}
 			if repairTail && errors.Is(err, io.ErrUnexpectedEOF) {
 				return s.repairTail(offset, s.file.Truncate, s.file.Sync)
 			}
@@ -612,6 +868,10 @@ func (s *Segment) scanEntries(repairTail bool, visit func(Entry) error) error {
 		}
 		totalLen := int64(entryHeaderSize) + int64(payloadLen)
 		if totalLen > remaining {
+			if s.allowTornTailReadOnly {
+				s.offset = offset
+				return nil
+			}
 			if repairTail {
 				return s.repairTail(offset, s.file.Truncate, s.file.Sync)
 			}
@@ -754,6 +1014,10 @@ func writeSegmentAtomically(path string, data []byte) (bool, error) {
 }
 
 func writeFileAtomically(path string, data []byte, syncDirectory func(string) error) (bool, error) {
+	return writeFileAtomicallyWith(path, data, (*os.File).WriteAt, (*os.File).Sync, syncDirectory)
+}
+
+func writeFileAtomicallyWith(path string, data []byte, writeAt func(*os.File, []byte, int64) (int, error), syncFile func(*os.File) error, syncDirectory func(string) error) (bool, error) {
 	f, err := os.CreateTemp(filepath.Dir(path), ".rhiza-segment-*")
 	if err != nil {
 		return false, err
@@ -761,10 +1025,14 @@ func writeFileAtomically(path string, data []byte, syncDirectory func(string) er
 	temp := f.Name()
 	defer os.Remove(temp)
 	if err = f.Chmod(0600); err == nil {
-		_, err = f.Write(data)
+		var n int
+		n, err = writeAt(f, data, 0)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
 	}
 	if err == nil {
-		err = f.Sync()
+		err = syncFile(f)
 	}
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
@@ -820,6 +1088,11 @@ func (w *WAL) BeginCompaction(base Entry, retainedValues map[[32]byte][]byte) (*
 	}
 	w.compactMu.Lock()
 	w.mu.Lock()
+	if w.readOnly {
+		w.mu.Unlock()
+		w.compactMu.Unlock()
+		return nil, fmt.Errorf("WAL inspection is read-only")
+	}
 	if w.fatal != nil {
 		err := w.fatal
 		w.mu.Unlock()
@@ -866,7 +1139,7 @@ func (c *Compaction) Build() error {
 		if c.maxBytes > 0 && offset+int64(len(data)) > c.maxBytes {
 			return fmt.Errorf("%w: compacted WAL requires more than %d bytes", ErrCapacity, c.maxBytes)
 		}
-		n, writeErr := temp.Write(data)
+		n, writeErr := w.writeAt(temp, data, offset)
 		if writeErr != nil {
 			return writeErr
 		}
@@ -876,39 +1149,11 @@ func (c *Compaction) Build() error {
 		offset += int64(n)
 		return nil
 	}
-	if err := writeEntry(c.base); err != nil {
+	if err := visitCompactedEntries(c.base, c.retainedValues, c.prefix, writeEntry); err != nil {
 		temp.Close()
 		return err
 	}
-	hashes := make([][32]byte, 0, len(c.retainedValues))
-	for hash := range c.retainedValues {
-		hashes = append(hashes, hash)
-	}
-	sort.Slice(hashes, func(i, j int) bool { return bytes.Compare(hashes[i][:], hashes[j][:]) < 0 })
-	for _, hash := range hashes {
-		if err := writeEntry(Entry{Hash: hash, Type: EntryProposal, Payload: c.retainedValues[hash]}); err != nil {
-			temp.Close()
-			return err
-		}
-	}
-	for _, seg := range c.prefix {
-		seg.mu.Lock()
-		err := seg.scanEntries(false, func(entry Entry) error {
-			if entry.Type == EntryProposal {
-				return nil
-			}
-			if entry.Slot <= c.base.Slot {
-				return nil
-			}
-			return writeEntry(entry)
-		})
-		seg.mu.Unlock()
-		if err != nil {
-			temp.Close()
-			return err
-		}
-	}
-	if err := temp.Sync(); err != nil {
+	if err := w.syncFile(temp); err != nil {
 		temp.Close()
 		return err
 	}
@@ -918,9 +1163,10 @@ func (c *Compaction) Build() error {
 	if err := os.Rename(tempPath, c.targetPath); err != nil {
 		return err
 	}
-	if err := syncDir(w.dir); err != nil {
+	if err := w.syncDir(w.dir); err != nil {
 		return err
 	}
+	hitLocalWALCrashBoundary("after-compaction-build-synced-before-manifest")
 	c.offset = offset
 	c.built = true
 	return nil
@@ -951,7 +1197,7 @@ func (c *Compaction) Commit() error {
 		return fmt.Errorf("WAL has no active segment")
 	}
 	w.current.mu.Lock()
-	if err := w.current.file.Sync(); err != nil {
+	if err := w.syncFile(w.current.file); err != nil {
 		w.current.mu.Unlock()
 		w.mu.Unlock()
 		file.Close()
@@ -992,9 +1238,13 @@ func (c *Compaction) Commit() error {
 	w.current = next[len(next)-1]
 	w.totalBytes = nextBytes
 	w.dirty = false
+	if w.deferCleanup {
+		w.pendingCleanup = true
+	}
 	w.mu.Unlock()
 	c.done = true
 	w.compactMu.Unlock()
+	hitLocalWALCrashBoundary("after-manifest-switch-before-old-cleanup")
 	for _, seg := range old {
 		seg.mu.Lock()
 		_ = seg.file.Close()
@@ -1003,10 +1253,16 @@ func (c *Compaction) Commit() error {
 	if publishErr != nil {
 		return publishErr
 	}
-	for _, seg := range old {
-		_ = os.Remove(w.segmentPath(seg.index))
+	if w.deferCleanup {
+		// Startup may compact while it is resuming an exact Local base. Keep
+		// the old generation until Node has replayed the WAL suffix and invokes
+		// FinalizeDeferredCleanup against the then-current manifest.
+		return nil
 	}
-	_ = syncDir(w.dir)
+	for _, seg := range old {
+		_ = w.remove(w.segmentPath(seg.index))
+	}
+	_ = w.syncDir(w.dir)
 	return nil
 }
 
@@ -1051,7 +1307,10 @@ func (w *WAL) Close() error {
 	var err error
 	for _, seg := range w.segments {
 		seg.mu.Lock()
-		err = errors.Join(err, seg.file.Sync(), seg.file.Close())
+		if !w.readOnly {
+			err = errors.Join(err, seg.file.Sync())
+		}
+		err = errors.Join(err, seg.file.Close())
 		seg.mu.Unlock()
 	}
 	return err

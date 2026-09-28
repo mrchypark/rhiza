@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -119,6 +120,9 @@ func TestGraphBatchDoesNotExposePartialStateAtOldSlotAfterCancellation(t *testin
 	}
 	if closeErr := m.Close(); closeErr != nil {
 		t.Fatal(closeErr)
+	}
+	if err := ValidateLocalGraphStorage(filepath.Join(filepath.Dir(path), "latticedb", "graph.ltdb"), false); err != nil {
+		t.Fatalf("read-only graph policy validation rejected recoverable publication marker: %v", err)
 	}
 	reopened, err := Open(path, 1, 1024)
 	if err != nil {
@@ -290,6 +294,68 @@ func TestGraphStoragePolicyRejectsMalformedMetadata(t *testing.T) {
 				t.Fatal("open accepted malformed or unsupported graph metadata")
 			}
 		})
+	}
+}
+
+func TestReadonlyLocalGraphPolicyValidationPreservesGraphFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	graphPath := filepath.Join(filepath.Dir(path), "latticedb", "graph.ltdb")
+	if err := ValidateLocalGraphStorage(graphPath, false); err != nil {
+		t.Fatalf("valid graph storage rejected: %v", err)
+	}
+	db, err := latticedb.Open(graphPath, latticedb.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *latticedb.Tx) error { return tx.PutAppMetadata(graphFormatKey, []byte("future-policy")) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before := make(map[string][]byte)
+	if err := filepath.WalkDir(graphPath, func(file string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		before[filepath.Base(file)] = data
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateLocalGraphStorage(graphPath, false); err == nil {
+		t.Fatal("unsupported graph storage policy was accepted")
+	}
+	after := make(map[string][]byte)
+	if err := filepath.WalkDir(graphPath, func(file string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		after[filepath.Base(file)] = data
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("read-only graph policy validation changed graph storage files")
+	}
+	if err := ValidateLocalGraphStorage(filepath.Join(t.TempDir(), "missing", "graph.ltdb"), true); err != nil {
+		t.Fatalf("fresh absent graph storage was rejected: %v", err)
 	}
 }
 
