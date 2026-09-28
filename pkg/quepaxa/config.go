@@ -61,6 +61,14 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	if config.LocalMode && (observer || learner || len(config.Cluster.Members) != 1 || config.Cluster.Members[0].ID != config.NodeID || config.Transport != nil || config.EnableReconfiguration) {
 		return nil, fmt.Errorf("%w: local mode requires one matching voter without transport or reconfiguration", ErrInvalidConfig)
 	}
+	var localCost localCostModel
+	if config.LocalMode {
+		var err error
+		localCost, err = newLocalCostModel(config.NodeID, config.Cluster.ConfigID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	seen := make(map[NodeID]struct{}, len(config.Cluster.Members))
 	local := false
 	var localMember Member
@@ -93,6 +101,7 @@ func newCoreFromConfig(config Config, observer, learner bool) (*Core, error) {
 	cluster.Members = append([]Member(nil), config.Cluster.Members...)
 	core := newCore(config.NodeID, &cluster, config.WAL, config.Transport)
 	core.localMode = config.LocalMode
+	core.localCost = localCost
 	core.observer = observer
 	core.learner = learner
 	if learner {
