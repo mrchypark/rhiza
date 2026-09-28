@@ -55,6 +55,7 @@ type Core struct {
 	learner                 bool
 	localMode               bool
 	localCost               localCostModel
+	localUnloggedCount      uint64
 	localExecutionOwner     chan struct{}
 	localRecordAttemptLimit int // private test seam; zero selects the production limit
 	walIdentity             string
@@ -311,6 +312,28 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 	if c.localMode {
 		defer c.releaseLocalExecution()
 	}
+	if c.localMode {
+		pending := c.RecorderTip()
+		cost, err := c.localCost.estimate(len(value))
+		if err != nil {
+			return 0, nil, err
+		}
+		protected, err := checkedAdd(cost.RecoveryBytes, cost.CheckpointBytes)
+		if err != nil {
+			return 0, nil, err
+		}
+		recoveryBytes, err := c.localRecoveryBytesOwned(pending, "propose", cost.ForegroundBytes, protected)
+		if err != nil {
+			return 0, nil, err
+		}
+		protected, err = checkedAdd(protected, recoveryBytes)
+		if err != nil {
+			return 0, nil, err
+		}
+		if err := c.localCapacityAdmissionOwned("propose", "protected_reserve", cost.ForegroundBytes, protected); err != nil {
+			return 0, nil, err
+		}
+	}
 	select {
 	case c.pipeline <- struct{}{}:
 		defer func() { <-c.pipeline }()
@@ -333,7 +356,7 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 		}
 		if c.localMode {
 			if pending := c.RecorderTip(); pending > c.Tip() {
-				if err := c.recoverThroughOwned(ctx, pending); err != nil {
+				if err := c.recoverThroughOwnedAdmitted(ctx, pending); err != nil {
 					return 0, nil, fmt.Errorf("recover pending local records through slot %d: %w", pending, err)
 				}
 			}
@@ -382,7 +405,7 @@ func (c *Core) propose(ctx context.Context, value []byte, complete bool) (Slot, 
 		}
 		if complete {
 			if tip := c.Tip(); tip+1 < decision.Slot {
-				if err := c.recoverThroughOwned(ctx, decision.Slot-1); err != nil {
+				if err := c.recoverThroughOwnedAdmitted(ctx, decision.Slot-1); err != nil {
 					return decision.Slot, nil, err
 				}
 			}
@@ -1246,7 +1269,7 @@ func (c *Core) recordLocalOwned(ctx context.Context, request RecordRequest) (Sum
 				c.mu.Unlock()
 				return Summary{}, err
 			}
-			c.logged[request.Slot] = true
+			c.markDecisionLoggedLocked(request.Slot)
 		}
 		decision, err := decodeDecision(decided.Certificate)
 		if err != nil {
@@ -1512,7 +1535,7 @@ func (c *Core) record(ctx context.Context, request RecordRequest) (Summary, erro
 					c.mu.Unlock()
 					return Summary{}, err
 				}
-				c.logged[request.Slot] = true
+				c.markDecisionLoggedLocked(request.Slot)
 			}
 		}
 		decision, err := decodeDecision(decided.Certificate)
@@ -1683,11 +1706,28 @@ func (c *Core) prepareCheckpointOwned(ctx context.Context, seal CheckpointSeal) 
 	if validator == nil {
 		return fmt.Errorf("checkpoint validation is unavailable")
 	}
-	if err := validator(ctx, seal); err != nil {
-		return err
-	}
 	payload, err := EncodeCheckpointSeal(seal)
 	if err != nil {
+		return err
+	}
+	if c.localMode {
+		if err := c.localValidateDecisionPrefixOwned(seal.Index); err != nil {
+			return err
+		}
+		missing, err := c.localMissingDecisionBytesOwned(0, seal.Index)
+		if err != nil {
+			return err
+		}
+		marker := qlog.Entry{Slot: uint64(seal.Index), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: payload}
+		immediate, err := checkedAdd(missing, uint64(len(marker.Encode())))
+		if err != nil {
+			return err
+		}
+		if err := c.localCapacityAdmissionOwned("prepare_checkpoint", "checkpoint_required", immediate, c.localCost.maxCheckpointCostBytes); err != nil {
+			return err
+		}
+	}
+	if err := validator(ctx, seal); err != nil {
 		return err
 	}
 	pending, err := c.appendUndurablePrefix(ctx, seal.Index)
@@ -1750,7 +1790,7 @@ func (c *Core) appendUndurablePrefix(ctx context.Context, through Slot) ([]SlotV
 				lock.Unlock()
 				return nil, err
 			}
-			c.logged[slot] = true
+			c.markDecisionLoggedLocked(slot)
 		}
 		if !c.durable[slot] {
 			pending = append(pending, SlotValue{Slot: slot, Hash: decided.Hash})
@@ -1822,6 +1862,15 @@ func (c *Core) EnsureDurable(slot Slot) error {
 			return err
 		}
 		defer c.releaseLocalExecution()
+		missing, err := c.localMissingDecisionBytesOwned(slot, slot)
+		if err != nil {
+			return err
+		}
+		if missing != 0 {
+			if err := c.localCapacityAdmissionOwned("ensure_durable", "checkpoint_required", missing, c.localCost.maxCheckpointCostBytes); err != nil {
+				return err
+			}
+		}
 	}
 	return c.ensureDurable(slot)
 }
@@ -1841,6 +1890,18 @@ func (c *Core) EnsureDurableThrough(ctx context.Context, through Slot) error {
 			return err
 		}
 		defer c.releaseLocalExecution()
+		if err := c.localValidateDecisionPrefixOwned(through); err != nil {
+			return err
+		}
+		missing, err := c.localMissingDecisionBytesOwned(0, through)
+		if err != nil {
+			return err
+		}
+		if missing != 0 {
+			if err := c.localCapacityAdmissionOwned("ensure_durable_through", "checkpoint_required", missing, c.localCost.maxCheckpointCostBytes); err != nil {
+				return err
+			}
+		}
 	}
 	return c.ensureDurableThroughOwned(ctx, through)
 }
@@ -1920,7 +1981,7 @@ func (c *Core) ensureDurableLocked(slot Slot) error {
 			c.mu.Unlock()
 			return err
 		}
-		c.logged[index] = true
+		c.markDecisionLoggedLocked(index)
 	}
 	c.mu.Unlock()
 	if err := c.commits.Sync(context.Background()); err != nil {
@@ -1944,7 +2005,31 @@ func (c *Core) CompleteDecision(ctx context.Context, slot Slot) (DecidedValue, e
 		}
 		defer c.releaseLocalExecution()
 	}
+	if c.localMode {
+		if err := c.admitLocalCompletionOwned(slot); err != nil {
+			return DecidedValue{}, err
+		}
+	}
 	return c.completeDecision(ctx, slot, true)
+}
+
+func (c *Core) admitLocalCompletionOwned(slot Slot) error {
+	c.mu.RLock()
+	_, ok := c.decided[slot]
+	logged := c.logged[slot]
+	compacted := slot <= c.floor
+	c.mu.RUnlock()
+	if compacted || !ok || logged {
+		return nil // compacted/missing errors and sync-only completion are not capacity denials.
+	}
+	missing, err := c.localMissingDecisionBytesOwned(slot, slot)
+	if err != nil {
+		return err
+	}
+	if missing == 0 {
+		return nil
+	}
+	return c.localCapacityAdmissionOwned("complete_decision", "checkpoint_required", missing, c.localCost.maxCheckpointCostBytes)
 }
 
 func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) (DecidedValue, error) {
@@ -1972,7 +2057,7 @@ func (c *Core) completeDecision(ctx context.Context, slot Slot, syncLocal bool) 
 				lock.Unlock()
 				return DecidedValue{}, err
 			}
-			c.logged[slot] = true
+			c.markDecisionLoggedLocked(slot)
 		}
 		c.mu.Unlock()
 	}
@@ -2054,6 +2139,9 @@ func (c *Core) acceptDecision(decision Decision) error {
 	c.decided[decision.Slot] = value
 	c.durable[decision.Slot] = false
 	c.logged[decision.Slot] = false
+	if c.localMode {
+		c.localUnloggedCount++
+	}
 	c.updateHashIndexLocked(decision.Proposal.Hash, decision.Slot)
 	delete(c.recorders, decision.Slot)
 	if c.reconfigEnabled {
@@ -2137,6 +2225,18 @@ func (c *Core) appendDecision(value DecidedValue) error {
 	return c.wal.Append(entry)
 }
 
+// markDecisionLoggedLocked updates the small Local debt indicator while the
+// caller holds c.mu. It lets the clean foreground path skip retained history.
+func (c *Core) markDecisionLoggedLocked(slot Slot) {
+	if c.logged[slot] {
+		return
+	}
+	c.logged[slot] = true
+	if c.localMode && c.localUnloggedCount > 0 {
+		c.localUnloggedCount--
+	}
+}
+
 // RecorderTip returns the highest slot represented by recovered durable ISR
 // state, including a decision whose certificate marker may have been lost.
 func (c *Core) RecorderTip() Slot {
@@ -2196,6 +2296,22 @@ func (c *Core) RecoverThrough(ctx context.Context, through Slot) error {
 // recoverThroughOwned is used when the caller already owns local execution or
 // when ordinary clustered proposal internals recover a gap themselves.
 func (c *Core) recoverThroughOwned(ctx context.Context, through Slot) error {
+	if c.localMode {
+		if through <= c.Tip() {
+			return nil
+		}
+		needed, err := c.localRecoveryBytesOwned(through, "recover_through", 0, c.localCost.maxCheckpointCostBytes)
+		if err != nil {
+			return err
+		}
+		if err := c.localCapacityAdmissionOwned("recover_through", "checkpoint_required", needed, c.localCost.maxCheckpointCostBytes); err != nil {
+			return err
+		}
+	}
+	return c.recoverThroughOwnedAdmitted(ctx, through)
+}
+
+func (c *Core) recoverThroughOwnedAdmitted(ctx context.Context, through Slot) error {
 	if c.observer {
 		return ErrQuorumUnavailable
 	}
@@ -2297,6 +2413,9 @@ func (c *Core) validateLocalISRLocked(slot Slot, state ISR, incoming *Proposal) 
 		}
 		if !ok || len(value) == 0 || sha256.Sum256(value) != proposal.Hash {
 			return invalid("proposal reference has no retained hash-matching value")
+		}
+		if _, err := c.localCost.estimate(len(value)); err != nil {
+			return invalid("proposal value exceeds the supported Local cost bound")
 		}
 		return nil
 	}
@@ -2600,7 +2719,7 @@ func (c *Core) acceptCertifiedValues(values []DecidedValue, durable bool) error 
 					c.mu.Unlock()
 					return err
 				}
-				c.logged[decision.Slot] = true
+				c.markDecisionLoggedLocked(decision.Slot)
 			}
 			c.mu.Unlock()
 		}
@@ -2655,7 +2774,7 @@ func (c *Core) acceptReconfigurationValues(values []DecidedValue, durable bool) 
 					c.mu.Unlock()
 					return err
 				}
-				c.logged[decision.Slot] = true
+				c.markDecisionLoggedLocked(decision.Slot)
 			}
 			c.mu.Unlock()
 			if control, ok, _ := decodeReconfiguration(value.Value); ok && control.Terminal {
@@ -2874,6 +2993,18 @@ func (c *Core) DurablePrefix(through Slot) ([32]byte, error) {
 			return [32]byte{}, err
 		}
 		defer c.releaseLocalExecution()
+		if err := c.localValidateDecisionPrefixOwned(through); err != nil {
+			return [32]byte{}, err
+		}
+		missing, err := c.localMissingDecisionBytesOwned(0, through)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		if missing != 0 {
+			if err := c.localCapacityAdmissionOwned("durable_prefix", "checkpoint_required", missing, c.localCost.maxCheckpointCostBytes); err != nil {
+				return [32]byte{}, err
+			}
+		}
 	}
 	return c.durablePrefixOwned(through)
 }

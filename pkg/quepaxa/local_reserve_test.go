@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -14,9 +15,16 @@ import (
 )
 
 func localReserveCore(t *testing.T, dir string, nodeID NodeID) (*Core, *qlog.WAL) {
+	return localReserveCoreWithLimit(t, dir, nodeID, math.MaxInt64)
+}
+
+func localReserveCoreWithLimit(t *testing.T, dir string, nodeID NodeID, limit int64) (*Core, *qlog.WAL) {
 	t.Helper()
 	wal, err := qlog.Open(dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.SetMaxBytes(limit); err != nil {
 		t.Fatal(err)
 	}
 	core, err := New(Config{
@@ -25,6 +33,34 @@ func localReserveCore(t *testing.T, dir string, nodeID NodeID) (*Core, *qlog.WAL
 		WAL:       wal,
 		LocalMode: true,
 	})
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	return core, wal
+}
+
+func localCoreFromEntries(t *testing.T, dir string, nodeID NodeID, entries []qlog.Entry, limit int64) (*Core, *qlog.WAL) {
+	t.Helper()
+	wal, err := qlog.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if err := wal.Append(entry); err != nil {
+			_ = wal.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := wal.Sync(); err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	if err := wal.SetMaxBytes(limit); err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	core, err := New(Config{NodeID: nodeID, Cluster: Cluster{ConfigID: 1, Members: []Member{{ID: nodeID}}}, WAL: wal, LocalMode: true})
 	if err != nil {
 		_ = wal.Close()
 		t.Fatal(err)
@@ -158,6 +194,227 @@ func TestLocalReserveRecorderBounds(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestLocalAdmissionDeniesBeforeMutationAndAllowsExactFit(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		short bool
+	}{
+		{name: "one byte short", short: true},
+		{name: "exact fit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model, err := newLocalCostModel("admission", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := []byte("offered-value")
+			cost, err := model.estimate(len(value))
+			if err != nil {
+				t.Fatal(err)
+			}
+			limit := cost.ForegroundBytes + cost.RecoveryBytes + cost.CheckpointBytes
+			if tc.short {
+				limit--
+			}
+			core, wal := localReserveCoreWithLimit(t, t.TempDir(), "admission", int64(limit))
+			defer wal.Close()
+			if _, _, err := core.Propose(context.Background(), value); err != nil {
+				if !tc.short || !IsLocalAdmissionDenial(err) {
+					t.Fatalf("Propose() error=%v", err)
+				}
+				var denial *localAdmissionDenial
+				wantProtected := cost.RecoveryBytes + cost.CheckpointBytes
+				if !errors.As(err, &denial) || denial.operation != "propose" || denial.reason != "protected_reserve" || denial.used != 0 || denial.limit != limit || denial.immediate != cost.ForegroundBytes || denial.protected != wantProtected {
+					t.Fatalf("prewrite denial details=%+v, err=%v", denial, err)
+				}
+				if got := len(localReserveEntries(t, wal)); got != 0 || core.Tip() != 0 || core.RecorderTip() != 0 {
+					t.Fatalf("denial mutated state: entries=%d tip=%d recorder=%d", got, core.Tip(), core.RecorderTip())
+				}
+				return
+			} else if tc.short {
+				t.Fatal("one-byte-short proposal unexpectedly succeeded")
+			}
+			if wal.Bytes() > int64(limit) {
+				t.Fatalf("exact-fit proposal exceeded limit: used=%d limit=%d", wal.Bytes(), limit)
+			}
+		})
+	}
+}
+
+func TestLocalCoreRequiresConfiguredFiniteWALLimit(t *testing.T) {
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	config := Config{NodeID: "finite", Cluster: Cluster{Members: []Member{{ID: "finite"}}}, WAL: wal, LocalMode: true}
+	if _, err := New(config); err == nil {
+		t.Fatal("Local Core accepted an unbounded WAL")
+	}
+	if err := wal.SetMaxBytes(1 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(config); err != nil {
+		t.Fatalf("Local Core rejected a finite positive WAL limit: %v", err)
+	}
+}
+
+func TestLocalRecoveryAdmissionPlansEntirePendingRangeBeforeWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		short bool
+	}{
+		{name: "one byte short", short: true},
+		{name: "whole range fits"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			seed, seedWAL := localReserveCore(t, dir+"/seed", "recovery-budget")
+			proposal := newProposal(highestPriority, seed.nodeID, []byte("pending slot 32"))
+			if _, err := localRecordForTest(t, seed, RecordRequest{Slot: 32, Step: 4, ConfigID: seed.ConfigID(), Proposal: proposal}); err != nil {
+				t.Fatal(err)
+			}
+			before := localReserveEntries(t, seedWAL)
+			used := seedWAL.Bytes()
+			unknown, err := checkedMul(32, seed.localCost.maxSlotBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			need, err := checkedAdd(unknown, seed.localCost.maxCheckpointCostBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			limit := uint64(used) + need
+			if tc.short {
+				limit--
+			}
+			_ = seedWAL.Close()
+			core, wal := localCoreFromEntries(t, dir+"/target", "recovery-budget", before, int64(limit))
+			defer wal.Close()
+			err = core.RecoverThrough(context.Background(), 32)
+			if tc.short {
+				if !IsLocalAdmissionDenial(err) {
+					t.Fatalf("RecoverThrough error=%v, want prewrite admission denial", err)
+				}
+				if wal.Bytes() != used || !reflect.DeepEqual(before, localReserveEntries(t, wal)) || core.Tip() != 0 || core.RecorderTip() != 32 {
+					t.Fatalf("denial changed pending evidence: used=%d/%d tip=%d recorder=%d", used, wal.Bytes(), core.Tip(), core.RecorderTip())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("adequately budgeted recovery failed: %v", err)
+			}
+			if wal.Bytes() > int64(limit) || core.Tip() != 32 {
+				t.Fatalf("recovery exceeded budget or missed target: used=%d limit=%d tip=%d", wal.Bytes(), limit, core.Tip())
+			}
+		})
+	}
+}
+
+func TestLocalForegroundAdmissionIncludesUnloggedHistoricalDecision(t *testing.T) {
+	dir := t.TempDir()
+	seed, seedWAL := localReserveCore(t, dir+"/seed", "unlogged-history")
+	if _, _, err := seed.ProposeCertified(context.Background(), []byte("certified but not logged")); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := seed.CertifiedValue(1)
+	if !ok {
+		t.Fatal("first proposal was not retained")
+	}
+	h := uint64(len(mustDecisionEntry(t, first).Encode()))
+	if h == 0 {
+		t.Fatal("empty missing QDEC cost")
+	}
+	value := []byte("next foreground proposal")
+	cost, err := seed.LocalWALCosts(len(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := localReserveEntries(t, seedWAL)
+	used := seedWAL.Bytes()
+	limit := uint64(used) + cost.ForegroundBytes + cost.RecoveryBytes + cost.CheckpointBytes
+	_ = seedWAL.Close()
+	core, wal := localCoreFromEntries(t, dir+"/target", "unlogged-history", entries, int64(limit))
+	defer wal.Close()
+	decision, err := decodeDecision(first.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision.Proposal.Value = append([]byte(nil), first.Value...)
+	if err := core.acquireLocalExecution(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	core.acceptDecision(decision)
+	core.releaseLocalExecution()
+	before := localReserveEntries(t, wal)
+	if _, _, err := core.Propose(context.Background(), value); !IsLocalAdmissionDenial(err) {
+		t.Fatalf("proposal omitting historical QDEC reserve error=%v, want prewrite denial", err)
+	}
+	if wal.Bytes() != used || !reflect.DeepEqual(before, localReserveEntries(t, wal)) || core.Tip() != 1 {
+		t.Fatalf("denial changed retained history: used=%d/%d tip=%d", used, wal.Bytes(), core.Tip())
+	}
+}
+
+func TestLocalDecisionCompletionReservesExactMissingQDECAndCheckpoint(t *testing.T) {
+	seed, seedWAL := localReserveCore(t, t.TempDir()+"/seed", "completion-cost")
+	slot, _, err := seed.ProposeCertified(context.Background(), []byte("needs QDEC"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := seed.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("certified decision was not retained")
+	}
+	missing := uint64(len(mustDecisionEntry(t, decision).Encode()))
+	_ = seedWAL.Close()
+	core, wal := localReserveCoreWithLimit(t, t.TempDir(), "completion-cost", int64(missing+seed.localCost.maxCheckpointCostBytes-1))
+	defer wal.Close()
+	decoded, err := decodeDecision(decision.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded.Proposal.Value = append([]byte(nil), decision.Value...)
+	if err := core.acquireLocalExecution(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	core.acceptDecision(decoded)
+	core.releaseLocalExecution()
+	used := wal.Bytes()
+	before := localReserveEntries(t, wal)
+	if _, err := core.CompleteDecision(context.Background(), slot); !IsLocalAdmissionDenial(err) {
+		t.Fatalf("CompleteDecision error=%v, want protected-reserve prewrite denial", err)
+	}
+	if wal.Bytes() != used || !reflect.DeepEqual(before, localReserveEntries(t, wal)) {
+		t.Fatalf("completion denial appended QDEC: bytes=%d/%d", used, wal.Bytes())
+	}
+}
+
+func TestLocalRecoveryPrevalidatesLatePendingISRBeforeAnyAppend(t *testing.T) {
+	dir := t.TempDir()
+	seed, seedWAL := localReserveCore(t, dir+"/seed", "late-isr")
+	proposal := newProposal(highestPriority, seed.nodeID, []byte("pending"))
+	if _, err := localRecordForTest(t, seed, RecordRequest{Slot: 32, Step: 4, ConfigID: seed.ConfigID(), Proposal: proposal}); err != nil {
+		t.Fatal(err)
+	}
+	entries := localReserveEntries(t, seedWAL)
+	_ = seedWAL.Close()
+	for i := range entries {
+		if entries[i].Type == qlog.EntryReceipt && entries[i].Slot == 32 {
+			entries[i].Payload = encodeRecorderEntry(32, ISR{Step: 7}, false)
+		}
+	}
+	core, wal := localCoreFromEntries(t, dir+"/target", "late-isr", entries, math.MaxInt64)
+	defer wal.Close()
+	before := localReserveEntries(t, wal)
+	used := wal.Bytes()
+	if err := core.RecoverThrough(context.Background(), 32); err == nil {
+		t.Fatal("recovery accepted unsupported late-range ISR")
+	}
+	if wal.Bytes() != used || !reflect.DeepEqual(before, localReserveEntries(t, wal)) || core.Tip() != 0 {
+		t.Fatalf("late ISR validation partially recovered: bytes=%d/%d tip=%d", used, wal.Bytes(), core.Tip())
+	}
 }
 
 func TestLocalRecordAttemptLimitStopsBeforeThirdRoundRecord(t *testing.T) {

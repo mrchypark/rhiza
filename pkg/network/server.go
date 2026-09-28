@@ -542,6 +542,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	ctx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
 	coreStarted := false
+	prewriteDenied := false
 	if s.localMode {
 		if err := types.ValidateExecutionPolicy(value); err != nil {
 			call.err = fmt.Errorf("%w: %v", ErrInvalidRequest, err)
@@ -552,6 +553,7 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	if call.err == nil {
 		coreStarted = true
 		call.slot, call.err = s.proposeOnce(ctx, value)
+		prewriteDenied = s.localMode && call.err != nil && quepaxa.IsLocalAdmissionDenial(call.err)
 	}
 	if call.err == nil {
 		call.err = s.applyDecisions(ctx, call.slot)
@@ -561,7 +563,7 @@ func (s *Server) runProposal(hash [32]byte, call *proposalCall, value []byte) {
 	}
 	cancel()
 	s.proposeMu.Lock()
-	if s.localMode && coreStarted && call.err != nil && s.lifecycleFailure == nil {
+	if s.localMode && coreStarted && !prewriteDenied && call.err != nil && s.lifecycleFailure == nil {
 		s.lifecycleFailure = call.err
 		if s.localFailureHandler != nil {
 			s.localFailureHandler(call.err)

@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -93,6 +95,9 @@ func TestLocalCostRejectsInvalidOrImpossibleIDsBeforeWALMutation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if err := wal.SetMaxBytes(math.MaxInt64); err != nil {
+			t.Fatal(err)
+		}
 		core, err := New(Config{NodeID: nodeID, Cluster: Cluster{ConfigID: 7, Members: []Member{{ID: nodeID}}}, WAL: wal, LocalMode: true})
 		if err == nil {
 			_ = wal.Close()
@@ -177,6 +182,55 @@ func TestLocalUndurableDecisionBytesMatchesAppendSerializer(t *testing.T) {
 	}
 	if wal.Bytes() != before {
 		t.Fatal("read-only recovery cost changed WAL in logged/floor cases")
+	}
+}
+
+func TestLocalRecoveryPlannerCountsSparseHistoricalDecisionExactly(t *testing.T) {
+	core, wal := localReserveCore(t, t.TempDir(), "sparse-cost")
+	defer wal.Close()
+	value := []byte("sparse historical value")
+	decision := DecidedValue{Slot: 2, Hash: sha256.Sum256(value), Value: value, Certificate: []byte(` { "proof" : "retained" } `)}
+	core.mu.Lock()
+	core.decided[2] = decision
+	core.logged[2] = false
+	core.localUnloggedCount = 1
+	core.mu.Unlock()
+	core.localExecutionOwner <- struct{}{}
+	defer core.releaseLocalExecution()
+	exact := uint64(len(mustDecisionEntry(t, decision).Encode()))
+	want, err := checkedAdd(2*core.localCost.maxSlotBytes, exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := core.localRecoveryBytesOwned(3, "test", 0, 0)
+	if err != nil || got != want {
+		t.Fatalf("sparse recovery bytes=%d err=%v, want exact H plus two missing slots %d", got, err, want)
+	}
+	if wal.Bytes() != 0 {
+		t.Fatalf("read-only sparse recovery planning wrote %d WAL bytes", wal.Bytes())
+	}
+}
+
+func TestLocalLoggedUndurableCompletionNeedsNoUnusedReserve(t *testing.T) {
+	dir := t.TempDir()
+	seed, seedWAL := localReserveCore(t, dir+"/seed", "sync-only")
+	slot, _, err := seed.Propose(context.Background(), []byte("completed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := localReserveEntries(t, seedWAL)
+	used := seedWAL.Bytes()
+	_ = seedWAL.Close()
+	core, wal := localCoreFromEntries(t, dir+"/target", "sync-only", entries, used)
+	defer wal.Close()
+	core.mu.Lock()
+	core.durable[slot] = false
+	core.mu.Unlock()
+	if _, err := core.CompleteDecision(context.Background(), slot); err != nil {
+		t.Fatalf("sync-only completion was denied for unused reserve: %v", err)
+	}
+	if wal.Bytes() != used {
+		t.Fatalf("sync-only completion appended bytes: before=%d after=%d", used, wal.Bytes())
 	}
 }
 
@@ -351,6 +405,178 @@ func TestLocalRecoveryAppendDeltaMatchesExactReadOnlyCost(t *testing.T) {
 	if actual := uint64(wal.Bytes() - before); actual != expected {
 		t.Fatalf("recovery append delta=%d, exact read-only H=%d", actual, expected)
 	}
+}
+
+func TestLocalDurabilityEntrypointsPreflightExactMarkerAndProtectedReserve(t *testing.T) {
+	for _, operation := range []string{"ensure_durable", "ensure_durable_through", "durable_prefix"} {
+		for _, short := range []bool{true, false} {
+			name := "exact-fit"
+			if short {
+				name = "one-byte-short"
+			}
+			t.Run(operation+"/"+name, func(t *testing.T) {
+				decision, missing, protected := localUnloggedDecisionFixture(t)
+				limit := int64(missing + protected)
+				if short {
+					limit--
+				}
+				core, wal := installLocalUnloggedDecision(t, "durability-admission", limit, decision)
+				defer wal.Close()
+				const used int64 = 0
+				slot := Slot(1)
+				before := localReserveEntries(t, wal)
+				var err error
+				switch operation {
+				case "ensure_durable":
+					err = core.EnsureDurable(slot)
+				case "ensure_durable_through":
+					err = core.EnsureDurableThrough(context.Background(), slot)
+				case "durable_prefix":
+					_, err = core.DurablePrefix(slot)
+				}
+				if short {
+					if !IsLocalAdmissionDenial(err) {
+						t.Fatalf("operation error=%v, want prewrite admission denial", err)
+					}
+					if wal.Bytes() != used || !reflect.DeepEqual(before, localReserveEntries(t, wal)) {
+						t.Fatalf("denial mutated WAL: bytes=%d/%d", used, wal.Bytes())
+					}
+					core.mu.RLock()
+					logged, durable := core.logged[slot], core.durable[slot]
+					core.mu.RUnlock()
+					if logged || durable || core.Tip() != slot {
+						t.Fatalf("denial changed decision state: logged=%v durable=%v tip=%d", logged, durable, core.Tip())
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("exact-fit %s failed: %v", operation, err)
+				}
+				if wal.Bytes() != used+int64(missing) {
+					t.Fatalf("exact-fit WAL delta=%d, want QDEC bytes=%d", wal.Bytes()-used, missing)
+				}
+				core.mu.RLock()
+				logged, durable := core.logged[slot], core.durable[slot]
+				core.mu.RUnlock()
+				if !logged || !durable {
+					t.Fatalf("successful operation did not promote decision: logged=%v durable=%v", logged, durable)
+				}
+			})
+		}
+	}
+}
+
+func TestLocalCheckpointEntrypointsPreflightExactAppendAndReserve(t *testing.T) {
+	for _, operation := range []string{"prepare_checkpoint", "verify_checkpoint"} {
+		for _, short := range []bool{true, false} {
+			name := "exact-fit"
+			if short {
+				name = "one-byte-short"
+			}
+			t.Run(operation+"/"+name, func(t *testing.T) {
+				entries, seal, reserve, markerBytes := localCheckpointFixture(t)
+				used := localReserveBytes(entries)
+				limit := used + int64(reserve) + int64(markerBytes)
+				if short {
+					limit--
+				}
+				core, wal := localCoreFromEntries(t, t.TempDir(), "checkpoint-admission", entries, limit)
+				defer wal.Close()
+				var validatorCalls int
+				core.SetCheckpointValidator(func(context.Context, CheckpointSeal) error {
+					validatorCalls++
+					return nil
+				})
+				beforeEntries := localReserveEntries(t, wal)
+				var err error
+				if operation == "prepare_checkpoint" {
+					err = core.PrepareCheckpoint(context.Background(), seal)
+				} else {
+					err = core.VerifyCheckpoint(context.Background(), seal)
+				}
+				if short {
+					if !IsLocalAdmissionDenial(err) {
+						t.Fatalf("%s error=%v, want prewrite denial", operation, err)
+					}
+					if wal.Bytes() != used || !reflect.DeepEqual(beforeEntries, localReserveEntries(t, wal)) || validatorCalls != 0 {
+						t.Fatalf("denial mutated checkpoint operation: bytes=%d/%d entriesEqual=%v validatorCalls=%d", used, wal.Bytes(), reflect.DeepEqual(beforeEntries, localReserveEntries(t, wal)), validatorCalls)
+					}
+					core.mu.RLock()
+					_, prepared := core.preparedCheckpoints[seal.Index]
+					core.mu.RUnlock()
+					if prepared {
+						t.Fatal("denial installed prepared checkpoint identity")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("exact-fit %s failed: %v", operation, err)
+				}
+				if wal.Bytes() != used+int64(markerBytes) || validatorCalls != 1 {
+					t.Fatalf("exact-fit checkpoint delta=%d want=%d validatorCalls=%d", wal.Bytes()-used, markerBytes, validatorCalls)
+				}
+			})
+		}
+	}
+}
+
+func localUnloggedDecisionFixture(t *testing.T) (DecidedValue, uint64, uint64) {
+	t.Helper()
+	core, wal := localReserveCore(t, t.TempDir(), "durability-admission")
+	_, _, err := core.ProposeCertified(context.Background(), []byte("unlogged durability decision"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := core.CertifiedValue(1)
+	if !ok {
+		t.Fatal("test setup did not retain certified decision")
+	}
+	entry := mustDecisionEntry(t, decision)
+	protected := core.localCost.maxCheckpointCostBytes
+	_ = wal.Close()
+	return decision, uint64(len(entry.Encode())), protected
+}
+
+func installLocalUnloggedDecision(t *testing.T, nodeID NodeID, limit int64, value DecidedValue) (*Core, *qlog.WAL) {
+	t.Helper()
+	target, wal := localReserveCoreWithLimit(t, t.TempDir(), nodeID, limit)
+	decision, err := decodeDecision(value.Certificate)
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	decision.Proposal.Value = append([]byte(nil), value.Value...)
+	if err := target.acquireLocalExecution(context.Background()); err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	err = target.acceptDecision(decision)
+	target.releaseLocalExecution()
+	if err != nil {
+		_ = wal.Close()
+		t.Fatal(err)
+	}
+	return target, wal
+}
+
+func localCheckpointFixture(t *testing.T) ([]qlog.Entry, CheckpointSeal, uint64, uint64) {
+	t.Helper()
+	source, wal := localReserveCore(t, t.TempDir(), "checkpoint-admission")
+	slot, _, err := source.Propose(context.Background(), []byte("checkpoint preflight"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := testLocalSeal(t, source, slot)
+	entries := localReserveEntries(t, wal)
+	encoded, err := EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := qlog.Entry{Slot: uint64(slot), Hash: seal.RootHash, Type: qlog.EntryCheckpointVerified, Payload: encoded}
+	markerBytes := uint64(len(marker.Encode()))
+	reserve := source.localCost.maxCheckpointCostBytes
+	_ = wal.Close()
+	return entries, seal, reserve, markerBytes
 }
 
 func TestLocalPendingRecordRecoveryActualBytesFitSlotCost(t *testing.T) {
@@ -598,6 +824,47 @@ func TestLocalTip31MaxPending32ThenSchedule33AndOffered34(t *testing.T) {
 		t.Fatalf("WAL delta=%d exceeds ForegroundBytes+RecoveryBytes=%d+%d", actual, cost.ForegroundBytes, cost.RecoveryBytes)
 	}
 	t.Logf("trace: clean tip31; recovered only max-value pending slot32 (%d bytes); schedule33 + offered value34 (%d bytes); total %d <= foreground %d + recovery %d", recoveryDelta, foregroundDelta, actual, cost.ForegroundBytes, cost.RecoveryBytes)
+}
+
+func BenchmarkLocalRecoveryPlannerRetainedHistory(b *testing.B) {
+	for _, history := range []int{0, 1_000, 10_000} {
+		for _, suffix := range []bool{false, true} {
+			name := "clean-prefix"
+			through := Slot(history)
+			if suffix {
+				name = "one-pending-slot"
+				through++
+			}
+			b.Run(fmt.Sprintf("decisions-%d/%s", history, name), func(b *testing.B) {
+				wal, err := qlog.Open(b.TempDir())
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer wal.Close()
+				if err := wal.SetMaxBytes(math.MaxInt64); err != nil {
+					b.Fatal(err)
+				}
+				core, err := New(Config{NodeID: "bench", Cluster: Cluster{Members: []Member{{ID: "bench"}}}, WAL: wal, LocalMode: true})
+				if err != nil {
+					b.Fatal(err)
+				}
+				core.tip = Slot(history)
+				for slot := 1; slot <= history; slot++ {
+					core.decided[Slot(slot)] = DecidedValue{Slot: Slot(slot)}
+					core.logged[Slot(slot)] = true
+				}
+				core.localExecutionOwner <- struct{}{}
+				defer core.releaseLocalExecution()
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := core.localRecoveryBytesOwned(through, "benchmark", 0, 0); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestLocalCheckpointSyncFailureDeltaFitsHPlusCheckpointBound(t *testing.T) {

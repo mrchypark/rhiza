@@ -34,6 +34,29 @@ func TestWALCapacityFailsClosedAndScanStreams(t *testing.T) {
 	}
 }
 
+func TestWALCapacitySnapshotIsCoherent(t *testing.T) {
+	wal, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	entry := Entry{Type: EntryProposal, Payload: []byte("value")}
+	if err := wal.SetMaxBytes(int64(len(entry.Encode()))); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := wal.Capacity()
+	if snapshot.Used != 0 || snapshot.Limit != int64(len(entry.Encode())) || snapshot.Fatal != nil {
+		t.Fatalf("initial capacity snapshot=%+v", snapshot)
+	}
+	if err := wal.Append(entry); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = wal.Capacity()
+	if snapshot.Used != int64(len(entry.Encode())) || snapshot.Limit != int64(len(entry.Encode())) || snapshot.Fatal != nil {
+		t.Fatalf("post-append capacity snapshot=%+v", snapshot)
+	}
+}
+
 func TestWALCloseReportsSegmentErrors(t *testing.T) {
 	wal, err := Open(t.TempDir())
 	if err != nil {

@@ -43,6 +43,23 @@ type WAL struct {
 
 var ErrCapacity = errors.New("WAL capacity reached")
 
+// CapacitySnapshot is a coherent view of the configured byte ceiling and the
+// bytes currently charged to the WAL. Fatal reports an earlier uncertain WAL
+// operation; callers must not use the byte values to admit more writes then.
+type CapacitySnapshot struct {
+	Used  int64
+	Limit int64
+	Fatal error
+}
+
+// Capacity returns the used bytes, configured hard limit, and fatal state
+// under the same WAL lock. A zero Limit means no hard limit is configured.
+func (w *WAL) Capacity() CapacitySnapshot {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return CapacitySnapshot{Used: w.totalBytes, Limit: w.maxBytes, Fatal: w.fatal}
+}
+
 // Bytes returns the current on-disk segment bytes.
 func (w *WAL) Bytes() int64 {
 	w.mu.RLock()
