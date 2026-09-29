@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
@@ -73,7 +74,9 @@ type Server struct {
 	kvBatcher            *mutationBatcher[types.KVCommand]
 	transport            *Transport
 	applyMu              sync.Mutex
-	requestLocks         [4096]sync.Mutex
+	requestLocks         [4096]chan struct{}
+	mutationMu           sync.Mutex
+	mutationAdmission    mutationAdmission
 	durability           func(context.Context, quepaxa.Slot) error
 	proposeMu            sync.Mutex
 	inflight             map[[32]byte]*proposalCall
@@ -179,11 +182,30 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 	return s.propose(ctx, value)
 }
 
-func (s *Server) lockRequest(id string) func() {
+func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	hash := sha256.Sum256([]byte(id))
-	lock := &s.requestLocks[uint16(hash[0])<<4|uint16(hash[1])>>4]
-	lock.Lock()
-	return lock.Unlock
+	lock := s.requestLocks[uint16(hash[0])<<4|uint16(hash[1])>>4]
+	select {
+	case lock <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock
+			return nil, err
+		}
+		select {
+		case <-s.proposalCtx.Done():
+			<-lock
+			return nil, ErrNotReady
+		default:
+		}
+		return func() { <-lock }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.proposalCtx.Done():
+		return nil, ErrNotReady
+	}
 }
 
 type proposalCall struct {
@@ -192,6 +214,7 @@ type proposalCall struct {
 	err         error
 	deadline    time.Time
 	hasDeadline bool
+	leases      []*mutationLease
 }
 
 // NewServer creates a new HTTP server.
@@ -217,6 +240,9 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		localCap:     make(chan struct{}, localLimit),
 		localMode:    localMode,
 		syncLimit:    make(chan struct{}, 2),
+	}
+	for i := range s.requestLocks {
+		s.requestLocks[i] = make(chan struct{}, 1)
 	}
 	admission, err := newReadAdmission(defaultReadAdmissionLimits)
 	if err != nil {
@@ -475,6 +501,10 @@ type DecisionsResponse struct {
 }
 
 func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	return s.proposeWithLease(ctx, value, nil)
+}
+
+func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *mutationLease) (quepaxa.Slot, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -485,6 +515,10 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 		return 0, ErrNotReady
 	}
 	if call := s.inflight[hash]; call != nil {
+		if !s.retainProposalLease(call, lease) {
+			s.proposeMu.Unlock()
+			return 0, ErrInvalidRequest
+		}
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -511,6 +545,12 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 		return 0, ErrOverloaded
 	}
 	call := &proposalCall{done: make(chan struct{})}
+	if !s.retainProposalLease(call, lease) {
+		<-s.operationCap
+		<-s.localCap
+		s.proposeMu.Unlock()
+		return 0, ErrInvalidRequest
+	}
 	call.deadline, call.hasDeadline = ctx.Deadline()
 	s.inflight[hash] = call
 	s.operationB += len(value)
@@ -525,6 +565,19 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 	case <-call.done:
 		return call.slot, call.err
 	}
+}
+
+// retainProposalLease transfers ownership only after a proposal is accepted
+// or joined. The logical proposal, rather than its initiating caller, then
+// retains the charged input until the underlying work has really completed.
+func (s *Server) retainProposalLease(call *proposalCall, lease *mutationLease) bool {
+	if lease != nil {
+		if !lease.transfer() {
+			return false
+		}
+		call.leases = append(call.leases, lease)
+	}
+	return true
 }
 
 // Quiesce drains proposals and excludes decision application while a certified
@@ -694,6 +747,10 @@ func (s *Server) finishProposalLogical(hash [32]byte, call *proposalCall, size i
 	}
 	s.operationB -= size
 	s.localB -= size
+	for _, lease := range call.leases {
+		lease.releaseWorker()
+	}
+	call.leases = nil
 	close(call.done)
 	s.proposeMu.Unlock()
 	s.logicalWG.Done()
@@ -898,6 +955,27 @@ type MigrationRequest struct {
 	Statements []types.SQLStatement
 }
 
+// MigrationAdmission is an opaque, server-bound, single-use reservation used
+// by the embedded migration wrapper while it prepares checksums and validation.
+type MigrationAdmission struct {
+	server *Server
+	charge int
+	lease  *mutationLease
+	state  atomic.Uint32 // 0 available, 1 released, 2 consumed
+}
+
+// Release returns a migration reservation that was not consumed. It is safe
+// to call after MigrateAdmitted as well.
+func (a *MigrationAdmission) Release() {
+	if a != nil && a.state.CompareAndSwap(0, 1) {
+		a.lease.releaseCaller()
+	}
+}
+
+func (a *MigrationAdmission) consume(server *Server, charge int) bool {
+	return a != nil && a.server == server && a.charge == charge && a.lease != nil && a.state.CompareAndSwap(0, 2)
+}
+
 // ValidateExecuteRequest applies the same mutation contract and encoded-size
 // check as Execute without submitting the command.
 func ValidateExecuteRequest(req ExecuteRequest) error {
@@ -910,17 +988,36 @@ func validatedSQLCommand(req ExecuteRequest) (types.SQLCommand, []byte, error) {
 		return types.SQLCommand{}, nil, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
 	}
 	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements}
-	if err := materializer.ValidateSQLCommand(command); err != nil {
-		return types.SQLCommand{}, nil, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	encoded, err := validateEncodeSQLCommand(command)
+	return command, encoded, err
+}
+
+func validateEncodeSQLCommand(command types.SQLCommand) ([]byte, error) {
+	if err := validateSQLCommand(command); err != nil {
+		return nil, err
 	}
+	return encodeSQLCommand(command)
+}
+
+func validateSQLCommand(command types.SQLCommand) error {
+	if command.RequestID == "" {
+		return fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+	}
+	if err := materializer.ValidateSQLCommand(command); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	return nil
+}
+
+func encodeSQLCommand(command types.SQLCommand) ([]byte, error) {
 	encoded, err := types.EncodeSQLBatchItem(command)
 	if err != nil {
-		return types.SQLCommand{}, nil, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
+		return nil, fmt.Errorf("%w: encode SQL command: %v", ErrInvalidRequest, err)
 	}
 	if types.SQLBatchEncodedSize([][]byte{encoded}) > quepaxa.MaxReplicatedValueBytes {
-		return types.SQLCommand{}, nil, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
+		return nil, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	return command, encoded, nil
+	return encoded, nil
 }
 
 func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
@@ -983,33 +1080,58 @@ func (s *Server) handleExecuteReturningOne(w http.ResponseWriter, r *http.Reques
 
 // ExecuteReturning executes one replicated mutation and returns its bounded rows.
 func (s *Server) ExecuteReturning(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
-	if len(req.Statements) != 0 {
-		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturning accepts one SQL statement", ErrInvalidRequest)
-	}
 	req.WantRows = true
-	return s.Execute(ctx, req)
+	return s.execute(ctx, req, true)
 }
 
 // ExecuteReturningOne commits only when exactly one row is returned.
 func (s *Server) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
-	if len(req.Statements) != 0 {
-		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturningOne accepts one SQL statement", ErrInvalidRequest)
-	}
 	req.WantRows = true
 	req.RequireOne = true
-	return s.Execute(ctx, req)
+	return s.execute(ctx, req, true)
 }
 
 // Execute applies one SQL statement or an atomic statements transaction.
 func (s *Server) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	return s.execute(ctx, req, false)
+}
+
+func (s *Server) execute(ctx context.Context, req ExecuteRequest, oneStatement bool) (ExecuteResponse, error) {
 	if !s.writable || !s.Ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
-	command, encoded, err := validatedSQLCommand(req)
+	if err := ctx.Err(); err != nil {
+		return ExecuteResponse{}, err
+	}
+	command := types.SQLCommand{RequestID: req.RequestID, SQL: req.SQL, Args: req.Args, WantRows: req.WantRows, RequireOne: req.RequireOne, Statements: req.Statements}
+	charge, err := mutationCharge(command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
-	return s.executeSQLCommand(ctx, command, encoded)
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	defer lease.releaseCaller()
+	command, err = cloneSQLCommand(command)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	if oneStatement && len(command.Statements) != 0 {
+		return ExecuteResponse{}, fmt.Errorf("%w: ExecuteReturning accepts one SQL statement", ErrInvalidRequest)
+	}
+	if err := validateSQLCommand(command); err != nil {
+		return ExecuteResponse{}, err
+	}
+	fingerprint, err := types.SQLFingerprint(command)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	encoded, err := encodeSQLCommand(command)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	return s.executeSQLCommand(ctx, command, encoded, fingerprint, lease)
 }
 
 // Migrate applies one engine-owned migration atomically with its ledger row.
@@ -1017,30 +1139,92 @@ func (s *Server) Migrate(ctx context.Context, req MigrationRequest) (ExecuteResp
 	if !s.writable || !s.Ready() {
 		return ExecuteResponse{}, ErrNotReady
 	}
+	if err := ctx.Err(); err != nil {
+		return ExecuteResponse{}, err
+	}
 	command := types.SQLCommand{RequestID: req.RequestID, Statements: req.Statements, Migration: &types.SQLMigration{Version: req.Version, Name: req.Name, Checksum: req.Checksum}}
-	if command.RequestID == "" {
-		return ExecuteResponse{}, fmt.Errorf("%w: request_id is required", ErrInvalidRequest)
+	charge, err := mutationCharge(command)
+	if err != nil {
+		return ExecuteResponse{}, err
 	}
-	if err := materializer.ValidateSQLCommand(command); err != nil {
-		return ExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return ExecuteResponse{}, err
 	}
-	encoded, err := types.EncodeSQLBatchItem(command)
-	if err != nil || types.SQLBatchEncodedSize([][]byte{encoded}) > quepaxa.MaxReplicatedValueBytes {
-		return ExecuteResponse{}, fmt.Errorf("%w: invalid encoded migration", ErrInvalidRequest)
-	}
-	return s.executeSQLCommand(ctx, command, encoded)
+	admission := &MigrationAdmission{server: s, charge: charge, lease: lease}
+	defer admission.Release()
+	return s.MigrateAdmitted(ctx, req, admission)
 }
 
-func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand, encoded []byte) (ExecuteResponse, error) {
+// AdmitMigration reserves bounded capacity before the embedded wrapper
+// computes a checksum or validates/encodes caller-owned statements.
+func (s *Server) AdmitMigration(ctx context.Context, version int64, name string, statements []types.SQLStatement) (*MigrationAdmission, error) {
+	if !s.writable || !s.Ready() {
+		return nil, ErrNotReady
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	command := types.SQLCommand{RequestID: strings.Repeat("0", 64), Statements: statements, Migration: &types.SQLMigration{Version: version, Name: name, Checksum: strings.Repeat("0", 64)}}
+	charge, err := mutationCharge(command)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return nil, err
+	}
+	return &MigrationAdmission{server: s, charge: charge, lease: lease}, nil
+}
+
+// MigrateAdmitted submits a migration using a reservation acquired before
+// checksum construction and request validation.
+func (s *Server) MigrateAdmitted(ctx context.Context, req MigrationRequest, admission *MigrationAdmission) (ExecuteResponse, error) {
+	if admission == nil || admission.lease == nil {
+		return ExecuteResponse{}, ErrInvalidRequest
+	}
+	if !s.writable || !s.Ready() {
+		return ExecuteResponse{}, ErrNotReady
+	}
+	if err := ctx.Err(); err != nil {
+		return ExecuteResponse{}, err
+	}
+	command := types.SQLCommand{RequestID: req.RequestID, Statements: req.Statements, Migration: &types.SQLMigration{Version: req.Version, Name: req.Name, Checksum: req.Checksum}}
+	charge, err := mutationCharge(command)
+	if err != nil || !admission.consume(s, charge) {
+		return ExecuteResponse{}, ErrInvalidRequest
+	}
+	lease := admission.lease
+	defer lease.releaseCaller()
+	command, err = cloneSQLCommand(command)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	if err := validateSQLCommand(command); err != nil {
+		return ExecuteResponse{}, err
+	}
 	fingerprint, err := types.SQLFingerprint(command)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
+	encoded, err := encodeSQLCommand(command)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	return s.executeSQLCommand(ctx, command, encoded, fingerprint, lease)
+}
+
+func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand, encoded []byte, fingerprint [32]byte, lease *mutationLease) (ExecuteResponse, error) {
+	var err error
 	wantRows := command.WantRows
 	for _, statement := range command.Statements {
 		wantRows = wantRows || statement.WantRows
 	}
-	defer s.lockRequest(command.RequestID)()
+	unlock, err := s.lockRequest(ctx, command.RequestID)
+	if err != nil {
+		return ExecuteResponse{}, err
+	}
+	defer unlock()
 	receipt, sqlResult, found, matches, err := s.material.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, wantRows)
 	if err != nil {
 		return ExecuteResponse{}, err
@@ -1054,7 +1238,7 @@ func (s *Server) executeSQLCommand(ctx context.Context, command types.SQLCommand
 		}
 		return ExecuteResponse{MutationReceipt: receipt, Statements: sqlResult.Statements}, nil
 	}
-	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded)
+	_, err = s.sqlBatcher.submitEncoded(ctx, command, encoded, lease)
 	if err != nil {
 		return ExecuteResponse{}, err
 	}
@@ -1389,14 +1573,33 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if !s.writable || !s.Ready() {
 		return KVMutationResponse{}, ErrNotReady
 	}
+	if err := ctx.Err(); err != nil {
+		return KVMutationResponse{}, err
+	}
+	intent := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
+	charge, err := mutationCharge(intent)
+	if err != nil {
+		return KVMutationResponse{}, err
+	}
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return KVMutationResponse{}, err
+	}
+	defer lease.releaseCaller()
+	intent.RequestID, intent.Operation, intent.Key = cloneMutationString(intent.RequestID), cloneMutationString(intent.Operation), cloneMutationString(intent.Key)
+	intent.Value, intent.Expected = append([]byte(nil), intent.Value...), append([]byte(nil), intent.Expected...)
+	req.RequestID, req.Key, req.Value, req.Expected = intent.RequestID, intent.Key, intent.Value, intent.Expected
 	if operation != "put" && operation != "delete" && operation != "cas" {
 		return KVMutationResponse{}, ErrInvalidRequest
 	}
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Key == "" || len(req.Key) > 1024 || req.TTLMS < 0 || len(req.Value) > 16<<20 {
 		return KVMutationResponse{}, ErrInvalidRequest
 	}
-	intent := types.KVCommand{RequestID: req.RequestID, Operation: operation, Key: req.Key, Value: req.Value, Expected: req.Expected, ExpectedExists: req.ExpectedExists, TTLMS: req.TTLMS}
-	defer s.lockRequest(req.RequestID)()
+	unlock, err := s.lockRequest(ctx, req.RequestID)
+	if err != nil {
+		return KVMutationResponse{}, err
+	}
+	defer unlock()
 	if matches, err := s.material.KVRequestMatches(ctx, intent); err != nil {
 		return KVMutationResponse{}, err
 	} else if !matches {
@@ -1419,7 +1622,7 @@ func (s *Server) KVMutate(ctx context.Context, operation string, req KVMutationR
 	if req.TTLMS > 0 {
 		command.ExpiresAtUnixMS = now + req.TTLMS
 	}
-	_, err := s.kvBatcher.submit(ctx, command)
+	_, err = s.kvBatcher.submit(ctx, command, lease)
 	if err != nil {
 		return KVMutationResponse{}, err
 	}
@@ -1506,10 +1709,28 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 	if !s.writable || !s.Ready() {
 		return types.MutationReceipt{}, ErrNotReady
 	}
+	if err := ctx.Err(); err != nil {
+		return types.MutationReceipt{}, err
+	}
+	charge, err := mutationCharge(req)
+	if err != nil {
+		return types.MutationReceipt{}, err
+	}
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return types.MutationReceipt{}, err
+	}
+	defer lease.releaseCaller()
+	req.RequestID, req.Topic = cloneMutationString(req.RequestID), cloneMutationString(req.Topic)
+	req.Payload = append([]byte(nil), req.Payload...)
 	if req.RequestID == "" || len(req.RequestID) > types.MaxRequestIDBytes || req.Topic == "" || len(req.Topic) > 256 || len(req.Payload) > 1<<20 {
 		return types.MutationReceipt{}, ErrInvalidRequest
 	}
-	defer s.lockRequest(req.RequestID)()
+	unlock, err := s.lockRequest(ctx, req.RequestID)
+	if err != nil {
+		return types.MutationReceipt{}, err
+	}
+	defer unlock()
 	if matches, err := s.material.NotifyRequestMatches(ctx, req); err != nil {
 		return types.MutationReceipt{}, err
 	} else if !matches {
@@ -1530,7 +1751,7 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 	if len(value) > quepaxa.MaxReplicatedValueBytes {
 		return types.MutationReceipt{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
 	}
-	slot, err := s.propose(ctx, value)
+	slot, err := s.proposeWithLease(ctx, value, lease)
 	if err == nil {
 		if matches, matchErr := s.material.NotifyRequestMatches(ctx, req); matchErr != nil {
 			err = matchErr

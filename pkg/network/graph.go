@@ -10,7 +10,6 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
-	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 type GraphExecuteResponse struct {
@@ -84,10 +83,30 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 	if !s.writable || !s.Ready() {
 		return GraphExecuteResponse{}, ErrNotReady
 	}
+	if err := ctx.Err(); err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	charge, err := mutationCharge(command)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	lease, err := s.admitMutation(charge)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	defer lease.releaseCaller()
+	command, err = cloneGraphCommand(command)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
 	if err := materializer.ValidateGraphCommandAdmission(command); err != nil {
 		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
-	defer s.lockRequest(command.RequestID)()
+	unlock, err := s.lockRequest(ctx, command.RequestID)
+	if err != nil {
+		return GraphExecuteResponse{}, err
+	}
+	defer unlock()
 	if matches, err := s.material.GraphRequestMatches(ctx, command); err != nil {
 		return GraphExecuteResponse{}, err
 	} else if !matches {
@@ -101,14 +120,7 @@ func (s *Server) GraphExecute(ctx context.Context, command types.GraphCommand) (
 		}
 		return GraphExecuteResponse{MutationReceipt: receipt}, nil
 	}
-	value, err := types.EncodeGraphBatch([]types.GraphCommand{command})
-	if err != nil {
-		return GraphExecuteResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
-	}
-	if len(value) > quepaxa.MaxReplicatedValueBytes {
-		return GraphExecuteResponse{}, fmt.Errorf("%w: encoded command exceeds %d bytes", ErrInvalidRequest, quepaxa.MaxReplicatedValueBytes)
-	}
-	_, err = s.graphBatcher.submit(ctx, command)
+	_, err = s.graphBatcher.submit(ctx, command, lease)
 	if err != nil {
 		return GraphExecuteResponse{}, err
 	}
