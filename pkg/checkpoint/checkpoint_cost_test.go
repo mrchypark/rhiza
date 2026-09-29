@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -63,9 +64,6 @@ func TestCheckpointCost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
-		t.Fatal(err)
-	}
 	before = bucket.Stats()
 	started = time.Now()
 	if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
@@ -73,6 +71,9 @@ func TestCheckpointCost(t *testing.T) {
 	}
 	publishTime := time.Since(started)
 	publishStats := checkpointCostDelta(before, bucket.Stats())
+	if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
 
 	loaded := NewManager(bucket, prefix, t.TempDir(), 1)
 	before = bucket.Stats()
@@ -101,6 +102,47 @@ func TestCheckpointCost(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("CHECKPOINT_COST %s", result)
+}
+
+func TestCheckpointCostPublisherClaimLifetime(t *testing.T) {
+	ctx := context.Background()
+	sources := []Source{source(t, RoleSQLite, "checkpoint-cost"), source(t, RoleGraphData, "graph")}
+
+	t.Run("release before promotion is fenced", func(t *testing.T) {
+		manager := NewManager(objstore.NewInMemBucket(), "checkpoint-cost-early-release", t.TempDir(), 1)
+		claim, err := manager.AcquirePublisherClaim(ctx, "checkpoint-cost", 0, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := manager.CreateFiles(ctx, claim, sources, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.PromoteCertifiedCurrent(ctx, root); !errors.Is(err, ErrPublisherFenced) {
+			t.Fatalf("promotion after releasing claim=%v, want ErrPublisherFenced", err)
+		}
+	})
+
+	t.Run("promote before release succeeds", func(t *testing.T) {
+		manager := NewManager(objstore.NewInMemBucket(), "checkpoint-cost-valid-lifetime", t.TempDir(), 1)
+		claim, err := manager.AcquirePublisherClaim(ctx, "checkpoint-cost", 0, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, err := manager.CreateFiles(ctx, claim, sources, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
+			t.Fatalf("promote with active claim: %v", err)
+		}
+		if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
+			t.Fatalf("release after promotion: %v", err)
+		}
+	})
 }
 
 func checkpointCostGraphSource(t *testing.T, size int64) Source {
