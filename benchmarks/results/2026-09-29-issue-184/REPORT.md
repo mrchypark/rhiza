@@ -33,3 +33,32 @@ Raw Go output is retained in `raw/`. Graph samples are single-operation
 observations with substantial per-case cost; rely on the repeated CI samples
 and inspect the workload model before drawing conclusions. No production code
 was changed.
+
+## Paired collector verification
+
+After committing and rebasing the benchmark change, the existing collector ran
+against base `ade2139c9dd2deb101edc58797fc19987910c839` and candidate
+`19ae79ab1e5a45ec4b4596a9fffeb55553b54a79` with three interleaved samples,
+`RHIZA_BENCH_TIME=100ms`, and `RHIZA_BENCH_PROCS=2`:
+
+```sh
+/usr/bin/time -l env RHIZA_BENCH_COUNT=3 RHIZA_BENCH_TIME=100ms RHIZA_BENCH_PROCS=2 \
+  benchmarks/run-ci-benchmarks.sh origin/main HEAD \
+  benchmarks/results/2026-09-29-issue-184/paired-local
+```
+
+The paired raw outputs, environment, `benchstat` summary, parser warnings, and
+native resource totals are in `paired-local/` and
+`paired-local-time.txt`. The targeted latency comparisons were all reported as
+inconclusive (`~`, n=3); `benchstat` notes that three samples are insufficient
+for its 95% confidence intervals. Graph timings varied materially between
+single-operation samples, so they are especially unsuitable for speed claims.
+The native timer measured the whole collector process (including worktree
+creation/build and all existing suites), not per-benchmark CPU: 378.61 s real,
+89.26 s user, 46.48 s system, and 1,100,595,200 bytes maximum RSS. This is
+run-level resource evidence only.
+
+The full normal `CGO_ENABLED=0 go test ./...` suite passed; its output is
+retained in `raw/go-test-all.txt`. `CGO_ENABLED=0 go vet ./...` also passed
+with no diagnostics. No production optimization or correctness change was
+included.
