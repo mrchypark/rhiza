@@ -83,6 +83,17 @@ RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=100ms \
   benchmarks/run-ci-benchmarks.sh HEAD HEAD /tmp/rhiza-performance
 ```
 
+Issue-184 measurements run in that same paired job with identical benchmark
+fixtures added to both revisions. They report latency and Go allocation metrics
+(`-benchmem`) for retained durability prefixes (1/64/1,024 slots), SQL
+authorizer catalog sizes (1/64/256 tables), and graph pruning (256-slot
+windows, populated every 1/8 slots, with 1/8 requests per populated slot).
+Graph pruning uses one measured operation per sample because its untimed setup
+repopulates the graph metadata; the job still collects ten interleaved samples
+per revision. Existing `BenchmarkSQLBatchApply` continues to cover SQL command
+batch sizes 1/8/32/64/128. These are measurements only: do not infer a production
+bottleneck or optimization from the matrix without paired results.
+
 Hosted-runner absolute throughput remains diagnostic. Use paired deltas for PR
 decisions and retain the Dory matrix for Kubernetes, fault, and object-store
 qualification.
