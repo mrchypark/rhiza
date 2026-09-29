@@ -13,6 +13,8 @@ import (
 
 // Stats exposes object-store operations at both the logical bucket boundary
 // and the provider-neutral HTTP boundary. S3HTTP* remains for compatibility.
+// BytesUploaded counts bytes read for upload attempts; BytesPublished counts
+// bytes from Upload calls acknowledged without error by the provider.
 type Stats struct {
 	Uploads            uint64 `json:"uploads"`
 	Gets               uint64 `json:"gets"`
@@ -21,6 +23,7 @@ type Stats struct {
 	Deletes            uint64 `json:"deletes"`
 	Failures           uint64 `json:"failures"`
 	BytesUploaded      uint64 `json:"bytes_uploaded"`
+	BytesPublished     uint64 `json:"bytes_published"`
 	BytesDownloaded    uint64 `json:"bytes_downloaded"`
 	HTTPRequests       uint64 `json:"http_requests"`
 	HTTPFailures       uint64 `json:"http_failures"`
@@ -43,6 +46,7 @@ type bucketMetrics struct {
 	uploads, gets, lists, heads, deletes atomic.Uint64
 	failures                             atomic.Uint64
 	bytesUploaded, bytesDownloaded       atomic.Uint64
+	bytesPublished                       atomic.Uint64
 	httpRequests, httpFailures           atomic.Uint64
 	httpGetRequests, httpPutRequests     atomic.Uint64
 	httpHeadRequests, httpDeleteRequests atomic.Uint64
@@ -95,7 +99,8 @@ func (b *MeteredBucket) Stats() Stats {
 		Uploads: b.metrics.uploads.Load(), Gets: b.metrics.gets.Load(), Lists: b.metrics.lists.Load(),
 		Heads: b.metrics.heads.Load(), Deletes: b.metrics.deletes.Load(), Failures: b.metrics.failures.Load(),
 		BytesUploaded: b.metrics.bytesUploaded.Load(), BytesDownloaded: b.metrics.bytesDownloaded.Load(),
-		HTTPRequests: httpRequests, HTTPFailures: httpFailures,
+		BytesPublished: b.metrics.bytesPublished.Load(),
+		HTTPRequests:   httpRequests, HTTPFailures: httpFailures,
 		S3HTTPRequests: httpRequests, S3HTTPFailures: httpFailures,
 		HTTPGetRequests: b.metrics.httpGetRequests.Load(), HTTPPutRequests: b.metrics.httpPutRequests.Load(),
 		HTTPHeadRequests: b.metrics.httpHeadRequests.Load(), HTTPDeleteRequests: b.metrics.httpDeleteRequests.Load(),
@@ -111,6 +116,9 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 	counted := &countingReader{reader: reader, count: &b.metrics.bytesUploaded}
 	ctx = withExpectedCondition(ctx, opts...)
 	err := b.Bucket.Upload(ctx, name, counted, opts...)
+	if err == nil {
+		b.metrics.bytesPublished.Add(counted.read.Load())
+	}
 	if err != nil && b.Bucket.IsConditionNotMetErr(err) {
 		if strings.Contains(name, "/blocks/") || strings.Contains(name, "/extents/") || strings.Contains(name, "/roots/") {
 			b.metrics.dedupHits.Add(1)
@@ -263,11 +271,13 @@ func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, erro
 type countingReader struct {
 	reader io.Reader
 	count  *atomic.Uint64
+	read   atomic.Uint64
 }
 
 func (r *countingReader) Read(buffer []byte) (int, error) {
 	n, err := r.reader.Read(buffer)
 	r.count.Add(uint64(n))
+	r.read.Add(uint64(n))
 	return n, err
 }
 
