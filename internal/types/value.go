@@ -21,6 +21,7 @@ var graphBatchMagic = []byte("QGRB\x00")
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
 const MaxRequestIDBytes = 64
 const DefaultIdempotencyWindowSlots = 65_536
+const MaxSQLCommandsPerDecidedValue = 64
 
 type MutationKind uint8
 
@@ -37,8 +38,9 @@ const (
 	MutationCommitted MutationStatus = "committed"
 	MutationRejected  MutationStatus = "rejected"
 
-	MutationErrorCodeExecutionFailed    = "execution_failed"
-	MutationErrorCodePreconditionFailed = "precondition_failed"
+	MutationErrorCodeExecutionFailed     = "execution_failed"
+	MutationErrorCodePreconditionFailed  = "precondition_failed"
+	MutationErrorCodeResultRetentionFull = "result_retention_full"
 )
 
 // MutationReceipt is the bounded result retained for idempotent retries.
@@ -497,6 +499,9 @@ func DecodeSQLBatch(value []byte) ([]SQLCommand, bool, error) {
 	}
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty SQL command batch")
+	}
+	if len(commands) > MaxSQLCommandsPerDecidedValue {
+		return nil, true, fmt.Errorf("SQL batch exceeds %d commands", MaxSQLCommandsPerDecidedValue)
 	}
 	for i := range commands {
 		if err := decodeSQLArgs(commands[i].Args); err != nil {
