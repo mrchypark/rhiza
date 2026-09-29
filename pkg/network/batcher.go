@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	maxMutationBatch       = 64
+	maxMutationBatch       = types.MaxSQLCommandsPerDecidedValue
 	targetBatchBytes       = 64 << 10
 	minAdaptiveLinger      = 25 * time.Microsecond
 	maxAdaptiveLinger      = 250 * time.Microsecond
