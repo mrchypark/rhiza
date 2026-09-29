@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -59,13 +58,16 @@ func ensureGraphNodePropertyIndexes(graph *graphState, indexes []types.GraphNode
 }
 
 type graphState struct {
-	db                *latticedb.DB
-	mu                sync.RWMutex
-	tip               uint64
-	durableTip        uint64
-	pending           *graphJournalEntry
-	commitUnknown     bool
-	afterCommitError  func() error
+	db               *latticedb.DB
+	mu               sync.RWMutex
+	tip              uint64
+	durableTip       uint64
+	pending          *graphJournalEntry
+	commitUnknown    bool
+	afterCommitError func() error
+	// queryError and failureError are unexported fault-injection seams.
+	queryError        func() error
+	failureError      func() error
 	idempotencyWindow uint64
 	streamWake        chan struct{}
 	queryWG           sync.WaitGroup
@@ -481,9 +483,6 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 			err = g.applyCommand(ctx, slot, valueHash, command, fingerprint, advance, confirmedThrough)
 		}
 		if err != nil {
-			if isRetryableGraphApplyError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
 			var rejected *graphRejectedCommandError
 			if !errors.As(err, &rejected) {
 				return err
@@ -504,16 +503,6 @@ func (m *Materializer) applyGraph(ctx context.Context, slot uint64, value []byte
 	return nil
 }
 
-func isRetryableGraphApplyError(err error) bool {
-	// LatticeDB shares ErrResourceLimit between query limits and transient
-	// checkpoint backpressure; only the latter must not become a durable rejection.
-	return errors.Is(err, latticedb.ErrWriteTxActive) ||
-		(errors.Is(err, latticedb.ErrResourceLimit) &&
-			(strings.Contains(err.Error(), "WAL checkpoint is in progress") ||
-				strings.Contains(err.Error(), "pagestore: write may require mmap growth while read snapshots are open") ||
-				strings.Contains(err.Error(), "pagestore: write exceeds snapshot growth limit")))
-}
-
 func prepareGraphCommand(command types.GraphCommand) ([32]byte, error) {
 	if err := ValidateGraphCommand(command); err != nil {
 		return [32]byte{}, err
@@ -527,11 +516,32 @@ func (e *graphRejectedCommandError) Error() string { return e.err.Error() }
 func (e *graphRejectedCommandError) Unwrap() error { return e.err }
 
 func isDeterministicGraphQueryError(err error) bool {
+	if isInfrastructureGraphError(err) {
+		return false
+	}
 	var queryErr *latticedb.QueryError
 	if !errors.As(err, &queryErr) {
 		return false
 	}
-	return queryErr.Stage == latticedb.QueryErrorStageParse || queryErr.Stage == latticedb.QueryErrorStageSemantic || queryErr.Stage == latticedb.QueryErrorStagePlan
+	return queryErr.Stage == latticedb.QueryErrorStageParse
+}
+
+func isInfrastructureGraphError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, latticedb.ErrResourceLimit) || errors.Is(err, latticedb.ErrWriteTxActive) ||
+		errors.Is(err, latticedb.ErrRecoveryRequired) || errors.Is(err, ErrGraphCommitUnknown) {
+		return true
+	}
+	var dbErr *latticedb.Error
+	if errors.As(err, &dbErr) && (dbErr.Code == latticedb.ErrorIO || dbErr.Code == latticedb.ErrorCorruption ||
+		dbErr.Code == latticedb.ErrorChecksum || dbErr.Code == latticedb.ErrorVersionMismatch || dbErr.Code == latticedb.ErrorOutOfMemory ||
+		dbErr.Code == latticedb.ErrorDatabaseLocked || dbErr.Code == latticedb.ErrorFull || dbErr.Code == latticedb.ErrorValueTooLarge) {
+		return true
+	}
+	var queryErr *latticedb.QueryError
+	return errors.As(err, &queryErr) && (queryErr.Code == latticedb.ErrorIO || queryErr.Code == latticedb.ErrorCorruption ||
+		queryErr.Code == latticedb.ErrorChecksum || queryErr.Code == latticedb.ErrorVersionMismatch || queryErr.Code == latticedb.ErrorOutOfMemory ||
+		queryErr.Code == latticedb.ErrorDatabaseLocked || queryErr.Code == latticedb.ErrorFull || queryErr.Code == latticedb.ErrorValueTooLarge)
 }
 
 func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [32]byte, command types.GraphCommand, fingerprint [32]byte, advance bool, confirmedThrough uint64) error {
@@ -539,9 +549,8 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 	if err != nil {
 		return &graphRejectedCommandError{err: err}
 	}
-	callbackStarted, callbackSucceeded := false, false
+	callbackSucceeded := false
 	updateErr := g.update(func(tx *latticedb.Tx) error {
-		callbackStarted = true
 		callbackErr := func() error {
 			if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
 				return err
@@ -565,7 +574,12 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 			case command.StreamTrim != nil:
 				err = tx.TrimStream(command.StreamTrim.Stream, command.StreamTrim.ThroughSequence)
 			default:
-				_, err = tx.QueryContext(ctx, command.Cypher, args, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
+				if g.queryError != nil {
+					err = g.queryError()
+				}
+				if err == nil {
+					_, err = tx.QueryContext(ctx, command.Cypher, args, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
+				}
 				if isDeterministicGraphQueryError(err) {
 					err = &graphRejectedCommandError{err: err}
 				}
@@ -601,16 +615,6 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 		g.poisonCommitOutcome()
 		return fmt.Errorf("%w: %w", ErrGraphCommitUnknown, updateErr)
 	}
-	if isRetryableGraphApplyError(updateErr) || errors.Is(updateErr, context.Canceled) || errors.Is(updateErr, context.DeadlineExceeded) {
-		return updateErr
-	}
-	if !callbackStarted {
-		return updateErr
-	}
-	var rejected *graphRejectedCommandError
-	if errors.As(updateErr, &rejected) {
-		return updateErr
-	}
 	return updateErr
 }
 
@@ -627,6 +631,11 @@ func (g *graphState) recordFailure(ctx context.Context, slot uint64, valueHash [
 		callbackErr := func() error {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if g.failureError != nil {
+				if err := g.failureError(); err != nil {
+					return err
+				}
 			}
 			if err := pruneGraphRequestsForApply(tx, slot, g.durableTip, g.idempotencyWindow); err != nil {
 				return err
