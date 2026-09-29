@@ -578,7 +578,7 @@ func (g *graphState) applyCommand(ctx context.Context, slot uint64, valueHash [3
 					err = g.queryError()
 				}
 				if err == nil {
-					_, err = tx.QueryContext(ctx, command.Cypher, args, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
+					_, err = tx.QueryContext(ctx, command.Cypher, args, graphQueryOptions())
 				}
 				if isDeterministicGraphQueryError(err) {
 					err = &graphRejectedCommandError{err: err}
@@ -907,7 +907,7 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	g.queryWG.Add(1)
 	m.mu.RUnlock()
 	defer g.queryWG.Done()
-	result, err := tx.QueryContext(ctx, cypher, converted, latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxBytes: MaxResultBytes})
+	result, err := tx.QueryContext(ctx, cypher, converted, graphQueryOptions())
 	rollbackErr := tx.Rollback()
 	if err != nil {
 		return types.GraphCommandResult{}, err
@@ -918,6 +918,10 @@ func (m *Materializer) GraphQuery(ctx context.Context, cypher string, args map[s
 	response, err := collectLatticeRows(result)
 	response.AppliedSlot = appliedSlot
 	return response, err
+}
+
+func graphQueryOptions() latticedb.QueryOptions {
+	return latticedb.QueryOptions{MaxRows: MaxReturningRows, MaxWork: MaxGraphQueryWork, MaxBytes: MaxResultBytes}
 }
 
 func ValidateGraphReachableRequest(request types.GraphReachableRequest) error {

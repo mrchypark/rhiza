@@ -1107,6 +1107,204 @@ func TestValidateGraphCommandRejectsPartialStandaloneCreate(t *testing.T) {
 	}
 }
 
+func TestGraphCommandDeterminismUsesPinnedEngineGrammar(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ConfigureLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{{Label: "Probe", Property: "v"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.GraphQuery(ctx, `MATCH (n:NoSuchProbe) RETURN random ()`, nil)
+	var queryErr *latticedb.QueryError
+	if !errors.As(err, &queryErr) || queryErr.Stage != latticedb.QueryErrorStageParse {
+		t.Fatalf("unknown function on zero rows error=%v, want engine parse rejection", err)
+	}
+	commands := []types.GraphCommand{
+		{RequestID: "literal", Cypher: `CREATE (:Probe {v: 'random('})`, Events: []types.GraphStreamEvent{{Stream: "determinism", Kind: "accepted", Payload: "literal"}}},
+		{RequestID: "parameter", Cypher: `CREATE (:Probe {v: $payload})`, Args: map[string]any{"payload": "uuid() current_timestamp LOAD FROM"}},
+		{RequestID: "quoted-identifier", Cypher: "CREATE (:Probe {`random()`: 'quoted'})"},
+		{RequestID: "parameter-order-a", Cypher: `CREATE (:Probe {v: $left, w: $right})`, Args: map[string]any{"left": 1, "right": 2}},
+		{RequestID: "parameter-order-b", Cypher: `CREATE (:Probe {v: $left, w: $right})`, Args: map[string]any{"right": 2, "left": 1}},
+		{RequestID: "random-space", Cypher: `CREATE (:Probe {v: random ()})`},
+		{RequestID: "uuid-newline", Cypher: "CREATE (:Probe {v: uuid\n('x')})"},
+		{RequestID: "nested-unknown", Cypher: `CREATE (:Probe {v: coalesce('safe', toString(uuid()))})`},
+		{RequestID: "comment", Cypher: `CREATE (:Probe {v: 'comment'}) /* random() */`},
+		{RequestID: "external", Cypher: `LOAD FROM '/tmp/input.csv'`},
+		{RequestID: "multi-statement", Cypher: `CREATE (:Probe {v: 'first'}); CREATE (:Probe {v: 'second'})`},
+	}
+	first, err := types.GraphFingerprint(commands[3])
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := types.GraphFingerprint(commands[4])
+	if err != nil || first != second {
+		t.Fatalf("parameter map iteration changed fingerprint: equal=%v err=%v", first == second, err)
+	}
+
+	var values [][]byte
+	accepted := 0
+	for i, command := range commands {
+		value, err := types.EncodeGraphCommand(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		values = append(values, value)
+		if err := m.Apply(ctx, uint64(i+1), value); err != nil {
+			t.Fatalf("apply %q: %v", command.RequestID, err)
+		}
+		request, found, err := m.graph.request(command.RequestID)
+		if err != nil || !found {
+			t.Fatalf("receipt %q found=%v err=%v", command.RequestID, found, err)
+		}
+		want := types.MutationCommitted
+		if i >= 5 {
+			want = types.MutationRejected
+		} else {
+			accepted++
+		}
+		if request.Receipt.Status != want {
+			t.Fatalf("receipt %q status=%v, want %v", command.RequestID, request.Receipt.Status, want)
+		}
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.ConfigureLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{{Label: "Probe", Property: "v"}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, value := range values {
+		if err := m.Apply(ctx, uint64(i+1), value); err != nil {
+			t.Fatalf("exact replay slot %d: %v", i+1, err)
+		}
+	}
+	result, err := m.GraphQuery(ctx, `MATCH (n:Probe) RETURN count(n)`, nil)
+	if err != nil || result.AppliedSlot != uint64(len(commands)) || len(result.Rows) != 1 || result.Rows[0][0] != int64(accepted) {
+		t.Fatalf("reopened graph slot=%d rows=%v err=%v, want %d accepted nodes", result.AppliedSlot, result.Rows, err, accepted)
+	}
+	indexed, err := m.GraphQuery(ctx, `MATCH (n:Probe {v: 'random('}) RETURN count(n)`, nil)
+	if err != nil || len(indexed.Rows) != 1 || indexed.Rows[0][0] != int64(1) {
+		t.Fatalf("reopened indexed literal lookup rows=%v err=%v", indexed.Rows, err)
+	}
+	records, slot, err := m.GraphReadStream(ctx, "determinism", 0, 10, 0)
+	if err != nil || slot != uint64(len(commands)) || len(records) != 1 || records[0].Kind != "accepted" {
+		t.Fatalf("reopened stream slot=%d records=%+v err=%v", slot, records, err)
+	}
+	files, _, cleanup, err := m.CheckpointFilesAt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	checkpoint, err := Open(filepath.Join(t.TempDir(), "checkpoint.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checkpoint.Close()
+	if err := checkpoint.ConfigureLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{{Label: "Probe", Property: "v"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkpoint.RestoreCheckpoint(ctx, files); err != nil {
+		t.Fatal(err)
+	}
+	result, err = checkpoint.GraphQuery(ctx, `MATCH (n:Probe) RETURN count(n)`, nil)
+	if err != nil || result.AppliedSlot != uint64(len(commands)) || len(result.Rows) != 1 || result.Rows[0][0] != int64(accepted) {
+		t.Fatalf("checkpoint graph slot=%d rows=%v err=%v", result.AppliedSlot, result.Rows, err)
+	}
+	indexed, err = checkpoint.GraphQuery(ctx, `MATCH (n:Probe {v: 'random('}) RETURN count(n)`, nil)
+	if err != nil || len(indexed.Rows) != 1 || indexed.Rows[0][0] != int64(1) {
+		t.Fatalf("checkpoint indexed literal lookup rows=%v err=%v", indexed.Rows, err)
+	}
+	for i, command := range commands {
+		request, found, err := checkpoint.graph.request(command.RequestID)
+		if err != nil || !found {
+			t.Fatalf("checkpoint receipt %q found=%v err=%v", command.RequestID, found, err)
+		}
+		want := types.MutationCommitted
+		if i >= 5 {
+			want = types.MutationRejected
+		}
+		if request.Receipt.Status != want {
+			t.Fatalf("checkpoint receipt %q status=%v, want %v", command.RequestID, request.Receipt.Status, want)
+		}
+	}
+	checkpointRecords, _, err := checkpoint.GraphReadStream(ctx, "determinism", 0, 10, 0)
+	if err != nil || len(checkpointRecords) != 1 {
+		t.Fatalf("checkpoint stream=%+v err=%v", checkpointRecords, err)
+	}
+}
+
+func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
+	if options := graphQueryOptions(); options.MaxWork != MaxGraphQueryWork {
+		t.Fatalf("graph query work limit=%d, want fixed limit %d", options.MaxWork, MaxGraphQueryWork)
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sqlite.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "seed-work-items", Cypher: `UNWIND range(0, 9999) AS i CREATE (:WorkItem {id: i, value: 0})`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(ctx, 1, seed); err != nil {
+		t.Fatal(err)
+	}
+	expression := strings.TrimSuffix(strings.Repeat("1 + ", 1200), " + ")
+	readQuery := `MATCH (n:WorkItem) WHERE n.value = ` + expression + ` RETURN n.id`
+	if _, err := m.GraphQuery(ctx, readQuery, nil); !errors.Is(err, latticedb.ErrResourceLimit) {
+		t.Fatalf("over-budget read error=%v, want resource limit", err)
+	}
+	command := types.GraphCommand{
+		RequestID: "over-budget",
+		Cypher:    `MATCH (n:WorkItem) SET n.value = ` + expression,
+		Events:    []types.GraphStreamEvent{{Stream: "work-limit", Kind: "must-not-publish", Payload: "none"}},
+	}
+	value, err := types.EncodeGraphCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, attempt := range []string{"first", "same-instance retry"} {
+		if err := m.Apply(ctx, 2, value); !errors.Is(err, latticedb.ErrResourceLimit) {
+			t.Fatalf("%s apply error=%v, want resource limit", attempt, err)
+		}
+		if m.Tip() != 1 {
+			t.Fatalf("tip after %s=%d, want 1", attempt, m.Tip())
+		}
+		if _, found, err := m.graph.request(command.RequestID); err != nil || found {
+			t.Fatalf("receipt after %s found=%v err=%v, want no rejection receipt", attempt, found, err)
+		}
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Apply(ctx, 2, value); !errors.Is(err, latticedb.ErrResourceLimit) {
+		t.Fatalf("replay after reopen error=%v, want repeatable resource-limit failure", err)
+	}
+	result, err := m.GraphQuery(ctx, `MATCH (n:WorkItem {value: 0}) RETURN count(n)`, nil)
+	if err != nil || result.AppliedSlot != 1 || len(result.Rows) != 1 || result.Rows[0][0] != int64(10_000) {
+		t.Fatalf("graph after failed mutation slot=%d rows=%v err=%v, want unchanged data at slot 1", result.AppliedSlot, result.Rows, err)
+	}
+	if _, found, err := m.graph.request(command.RequestID); err != nil || found {
+		t.Fatalf("receipt after reopened failure found=%v err=%v, want none", found, err)
+	}
+	if records, _, err := m.GraphReadStream(ctx, "work-limit", 0, 10, 0); err != nil || len(records) != 0 {
+		t.Fatalf("stream after failed mutation records=%+v err=%v, want no publication", records, err)
+	}
+}
+
 func TestGraphAheadRecoveryRequiresMatchingDecision(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "sqlite.db")

@@ -33,16 +33,19 @@ import (
 )
 
 const (
-	MaxSQLBytes             = 256 << 10
-	MaxSQLStatements        = 64
-	MaxSQLArgs              = 999
-	MaxSQLResultColumns     = 2000
-	MaxReturningRows        = 10_000
-	MaxResultBytes          = 16 << 20
-	MaxMutationResultBytes  = 1 << 20
-	MaxCellBytes            = 1 << 20
-	MaxGraphReachableDepth  = 64
-	MaxGraphReachableEdges  = 1_000_000
+	MaxSQLBytes            = 256 << 10
+	MaxSQLStatements       = 64
+	MaxSQLArgs             = 999
+	MaxSQLResultColumns    = 2000
+	MaxReturningRows       = 10_000
+	MaxResultBytes         = 16 << 20
+	MaxMutationResultBytes = 1 << 20
+	MaxCellBytes           = 1 << 20
+	MaxGraphReachableDepth = 64
+	MaxGraphReachableEdges = 1_000_000
+	// MaxGraphQueryWork matches LatticeDB's default per-query execution budget.
+	// It does not bound parsing time or wall-clock duration.
+	MaxGraphQueryWork       = 10_000_000
 	MaxGraphPropertyIndexes = 64
 
 	notificationSubscriberLimit = 64
