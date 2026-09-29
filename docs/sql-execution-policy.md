@@ -12,7 +12,6 @@ The graph work cap is 10,000,000 execution work units per operation; it is not
 a parser CPU, wall-clock, or replica-slot bound. Resource exhaustion aborts
 the mutation without a receipt or partial stream/slot publication; retrying
 the same decision may block again, including after reopen.
-
 Durable SQL result retention advances the SQL policy to 6. The retained window
 allows 256 MiB of encoded SQL result blobs plus a charged 256-byte envelope for
 each of at most 64 SQL commands per slot. The deterministic charge ceiling is
