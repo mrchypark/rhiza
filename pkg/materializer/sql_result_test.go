@@ -3,12 +3,14 @@ package materializer
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/ncruces/go-sqlite3"
 	sqlite3driver "github.com/ncruces/go-sqlite3/driver"
 )
@@ -157,6 +159,68 @@ func TestOversizedSQLResultRollsBackOnlyItsCommand(t *testing.T) {
 	var count int
 	if err := m.db.QueryRow("SELECT count(*) FROM sqlite_schema WHERE name = 'rolled_back'").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("failed command was not rolled back: count=%d err=%v", count, err)
+	}
+}
+
+func TestSQLResultWorkingSetChargesRowsCellsAndNamesExactly(t *testing.T) {
+	m, err := Open(t.TempDir()+"/working-set.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	query := func() *sql.Rows {
+		reader, err := m.reader()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := reader.QueryContext(context.Background(), "SELECT 'abc' AS c")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	for _, test := range []struct {
+		budget  int
+		wantErr bool
+	}{{163, true}, {164, false}} {
+		budget := &resultBudget{rows: MaxReturningRows, bytes: test.budget, limit: MaxResultBytes}
+		rows := query()
+		_, err := collectRowsWithBudget(rows, budget, nil)
+		rows.Close()
+		if (err != nil) != test.wantErr {
+			t.Fatalf("budget=%d err=%v", test.budget, err)
+		}
+	}
+}
+
+func TestSQLReceiptResultsFlushAtAggregateWorkingSetBudget(t *testing.T) {
+	ctx := context.Background()
+	m, err := Open(t.TempDir()+"/receipt-page.db", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	commands := []types.SQLCommand{
+		{RequestID: "rows-a", SQL: "SELECT zeroblob(?) AS value", Args: []any{600_000}, WantRows: true},
+		{RequestID: "rows-b", SQL: "SELECT zeroblob(?) AS value", Args: []any{600_000}, WantRows: true},
+	}
+	decisions := make([]quepaxa.DecidedValue, len(commands))
+	for i, command := range commands {
+		value, err := types.EncodeSQLBatch([]types.SQLCommand{command})
+		if err != nil {
+			t.Fatal(err)
+		}
+		decisions[i] = quepaxa.DecidedValue{Slot: quepaxa.Slot(i + 1), Value: value}
+	}
+	if err := m.ApplyBatch(ctx, decisions); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range commands {
+		fingerprint, _ := types.SQLFingerprint(command)
+		_, result, found, matches, err := m.SQLRequestResultFingerprint(ctx, command.RequestID, fingerprint, true)
+		if err != nil || !found || !matches || len(result.Statements) != 1 || len(result.Statements[0].Rows) != 1 || len(result.Statements[0].Rows[0][0].([]byte)) != 600_000 {
+			t.Fatalf("request=%s found=%v match=%v result=%#v err=%v", command.RequestID, found, matches, result, err)
+		}
 	}
 }
 

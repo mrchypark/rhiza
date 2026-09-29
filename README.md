@@ -18,7 +18,9 @@ the same Go API.
 
 ## Requirements and installation
 
-SQL execution policy 4 requires a new cluster for existing installations, including earlier policies.
+SQL execution policy 5 adds bounded embedded mutation admission and SQL result
+working-set accounting; it requires a new cluster for existing installations,
+including earlier policies.
 The protected WAL framing also rejects all previous 49-byte WAL artifacts, including earlier development builds.
 Old materializations, checkpoints and SQL history are rejected; mixed-version
 peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
@@ -122,7 +124,7 @@ Use the `RequestKind*`, `RequestState*`, and `MutationCommitted`/
 
 Rhiza exposes SQLite's DDL, views, triggers, generated and STRICT tables,
 partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
-UPSERT, `RETURNING`, window functions, and JSON functions. Execution policy 4
+UPSERT, `RETURNING`, window functions, and JSON functions. Execution policy 5
 reserves the maximum actual ROWID and excludes persistent virtual-table writes
 (including FTS5); see [migration requirements](docs/sql-execution-policy.md).
 

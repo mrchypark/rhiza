@@ -1,9 +1,10 @@
-# SQL execution policy 4 compatibility boundary
+# SQL execution policy 5 compatibility boundary
 
-The reconfiguration schedule repair uses peer ALPN `rhiza-peer-v7`, with no
-v6 fallback; SQL policy remains 4. Upgrade all participants while quiesced.
-Do not downgrade after activation. This transport gate does not mechanically
-prevent reopening WALs with older binaries.
+Embedded mutation admission and SQL result working-set accounting advance the
+SQL policy to 5. Peer ALPN remains `rhiza-peer-v7`, with no v6 fallback.
+Upgrade all participants while quiesced. Do not downgrade after activation.
+This transport gate does not mechanically prevent reopening WALs with older
+binaries.
 
 Certified reconfigurations whose freeze or terminal occupies a source-generation
 leader-schedule slot are incompatible. Preserve the installation, WAL, ISR and
@@ -12,14 +13,16 @@ invent a schedule. Migrate verified committed application state (including
 committed drain writes) into a fresh cluster with a separate lineage. This change
 does not perform that migration automatically.
 
-The SQL counter/default, TEMP, ROWID and PRAGMA fixes are incompatible execution-policy changes. This is
-not an in-place upgrade. Certified SQL uses `QBAT\x04`; policy-3 `QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
+The SQL counter/default, TEMP, ROWID, PRAGMA, mutation-admission and result
+working-set rules are incompatible execution-policy changes. This is not an
+in-place upgrade. Certified SQL uses `QBAT\x05`; policy-4 `QBAT\x04`, policy-3
+`QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
 unknown policy versions and raw SQL decisions cannot be applied by this binary.
 Unsupported history is an error, not a rejected SQL receipt. Already-applied
 slots are checked too. Do not rewrite stored decision bytes.
 
-Existing unmarked, policy-1, policy-2 or policy-3 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
-`sql_execution_policy=4` metadata value identifies newly initialized state; it
+Existing unmarked, policy-1, policy-2, policy-3 or policy-4 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
+`sql_execution_policy=5` metadata value identifies newly initialized state; it
 is not a migration certificate. Do not manually insert it into old databases or
 stamp old checkpoint descriptors. Peer ALPN v7 separates this binary from v2/v3/v4/v5/v6
 peers. Mixed-version clusters and downgrades are unsupported.
