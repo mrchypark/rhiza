@@ -1496,6 +1496,8 @@ func BenchmarkCheckpointFilesAt(b *testing.B) {
 }
 
 func BenchmarkSQLBatchApply(b *testing.B) {
+	// The 128-command workload is split into two decided values because the
+	// execution policy caps each value at MaxSQLCommandsPerDecidedValue.
 	for _, size := range []int{1, 8, 32, 64, 128} {
 		b.Run(strconv.Itoa(size), func(b *testing.B) {
 			m, err := Open(b.TempDir()+"/batch.db", 1)
@@ -1517,11 +1519,17 @@ func BenchmarkSQLBatchApply(b *testing.B) {
 					id := iteration*size + i
 					commands[i] = types.SQLCommand{RequestID: strconv.Itoa(id), SQL: "INSERT INTO bench(id, value) VALUES (?, ?)", Args: []any{int64(id), int64(1)}}
 				}
-				value, err := types.EncodeSQLBatch(commands)
-				if err != nil {
-					b.Fatal(err)
+				decisions := make([]quepaxa.DecidedValue, 0, (size+types.MaxSQLCommandsPerDecidedValue-1)/types.MaxSQLCommandsPerDecidedValue)
+				for start := 0; start < size; start += types.MaxSQLCommandsPerDecidedValue {
+					end := min(start+types.MaxSQLCommandsPerDecidedValue, size)
+					value, err := types.EncodeSQLBatch(commands[start:end])
+					if err != nil {
+						b.Fatal(err)
+					}
+					slot := uint64(iteration*((size+types.MaxSQLCommandsPerDecidedValue-1)/types.MaxSQLCommandsPerDecidedValue) + start/types.MaxSQLCommandsPerDecidedValue + 2)
+					decisions = append(decisions, quepaxa.DecidedValue{Slot: quepaxa.Slot(slot), Value: value})
 				}
-				if err := m.Apply(context.Background(), uint64(iteration+2), value); err != nil {
+				if err := m.ApplyBatch(context.Background(), decisions); err != nil {
 					b.Fatal(err)
 				}
 			}
