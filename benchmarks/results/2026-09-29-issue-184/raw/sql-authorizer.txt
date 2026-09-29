@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+BenchmarkSQLAuthorizerSchemaCount/1-2 	   24093	      4658 ns/op	     240 B/op	       9 allocs/op
+BenchmarkSQLAuthorizerSchemaCount/64-2         	    3998	     28902 ns/op	     240 B/op	       9 allocs/op
+BenchmarkSQLAuthorizerSchemaCount/256-2        	    1027	    113056 ns/op	     241 B/op	       9 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	2.176s
