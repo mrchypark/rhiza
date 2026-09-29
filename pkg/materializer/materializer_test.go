@@ -241,12 +241,15 @@ func TestSQLReceiptBatchHandlesFailuresAndCrossDecisionDuplicates(t *testing.T) 
 			Args:      []any{int64(i + 4)},
 		}
 	}
-	bulk, err := types.EncodeSQLBatch(commands)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := m.Apply(ctx, 5, bulk); err != nil {
-		t.Fatal(err)
+	for start, slot := 0, uint64(5); start < len(commands); start, slot = start+types.MaxSQLCommandsPerDecidedValue, slot+1 {
+		end := min(start+types.MaxSQLCommandsPerDecidedValue, len(commands))
+		bulk, err := types.EncodeSQLBatch(commands[start:end])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Apply(ctx, slot, bulk); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := m.queryRow(ctx, "SELECT COUNT(*) FROM receipt_batch").Scan(&count); err != nil || count != 131 {
 		t.Fatalf("bulk count=%d err=%v", count, err)

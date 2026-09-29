@@ -16,11 +16,12 @@ var sqlBatchMagic = []byte{'Q', 'B', 'A', 'T', byte(sqlpolicy.Version)}
 var kvCommandMagic = []byte("QKVC\x00")
 var kvBatchMagic = []byte("QKVB\x00")
 var notifyCommandMagic = []byte("QNTF\x00")
-var graphBatchMagic = []byte("QGRB\x00")
+var graphBatchMagic = []byte{'Q', 'G', 'R', 'B', byte(sqlpolicy.Version)}
 
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
 const MaxRequestIDBytes = 64
 const DefaultIdempotencyWindowSlots = 65_536
+const MaxSQLCommandsPerDecidedValue = 64
 
 type MutationKind uint8
 
@@ -37,8 +38,9 @@ const (
 	MutationCommitted MutationStatus = "committed"
 	MutationRejected  MutationStatus = "rejected"
 
-	MutationErrorCodeExecutionFailed    = "execution_failed"
-	MutationErrorCodePreconditionFailed = "precondition_failed"
+	MutationErrorCodeExecutionFailed     = "execution_failed"
+	MutationErrorCodePreconditionFailed  = "precondition_failed"
+	MutationErrorCodeResultRetentionFull = "result_retention_full"
 )
 
 // MutationReceipt is the bounded result retained for idempotent retries.
@@ -401,8 +403,11 @@ func EncodeSQLBatch(commands []SQLCommand) ([]byte, error) {
 }
 
 func DecodeGraphBatch(value []byte) ([]GraphCommand, bool, error) {
-	if !bytes.HasPrefix(value, graphBatchMagic) {
+	if !bytes.HasPrefix(value, []byte("QGRB")) {
 		return nil, false, nil
+	}
+	if !bytes.HasPrefix(value, graphBatchMagic) {
+		return nil, true, fmt.Errorf("%w: unsupported graph batch policy", sqlpolicy.ErrIncompatible)
 	}
 	var commands []GraphCommand
 	decoder := json.NewDecoder(bytes.NewReader(value[len(graphBatchMagic):]))
@@ -497,6 +502,9 @@ func DecodeSQLBatch(value []byte) ([]SQLCommand, bool, error) {
 	}
 	if len(commands) == 0 {
 		return nil, true, fmt.Errorf("empty SQL command batch")
+	}
+	if len(commands) > MaxSQLCommandsPerDecidedValue {
+		return nil, true, fmt.Errorf("SQL batch exceeds %d commands", MaxSQLCommandsPerDecidedValue)
 	}
 	for i := range commands {
 		if err := decodeSQLArgs(commands[i].Args); err != nil {

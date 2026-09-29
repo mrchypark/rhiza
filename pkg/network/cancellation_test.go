@@ -22,15 +22,17 @@ func TestNotifyCancellationReportsUnknownWithRequestID(t *testing.T) {
 	server := NewServer(core, material, "cluster", true, nil)
 	defer server.Close()
 	entered, release := make(chan struct{}), make(chan struct{})
-	defer close(release)
-	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
-		close(entered)
+	defer func() {
 		select {
 		case <-release:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		default:
+			close(release)
 		}
+	}()
+	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
+		close(entered)
+		<-release
+		return ctx.Err()
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -53,6 +55,22 @@ func TestNotifyCancellationReportsUnknownWithRequestID(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("call did not cancel")
+	}
+	admissionCount := func() int {
+		server.mutationMu.Lock()
+		defer server.mutationMu.Unlock()
+		return server.mutationAdmission.count
+	}
+	if got := admissionCount(); got != 1 {
+		t.Fatalf("canceled caller released proposal-owned mutation lease: count=%d", got)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for admissionCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := admissionCount(); got != 0 {
+		t.Fatalf("proposal completion leaked mutation lease: count=%d", got)
 	}
 	receipt, found, err := material.MutationReceipt(context.Background(), types.MutationNotify, "cancel-notify")
 	if err != nil || !found || receipt.Slot == 0 {

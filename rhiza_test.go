@@ -499,6 +499,30 @@ func TestExecuteReturningAndMigrate(t *testing.T) {
 	}
 }
 
+func TestEmbeddedMutationAdmissionRejectsOversizedInputsWithoutHTTP(t *testing.T) {
+	ctx := context.Background()
+	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "large-sql", SQL: "SELECT ?", Args: []any{make([]byte, 300<<10)}}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("embedded Execute oversized input error=%v", err)
+	}
+	if _, err := db.KVPut(ctx, rhiza.KVMutationRequest{RequestID: "large-kv", Key: "k", Value: make([]byte, 300<<10)}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("embedded KVPut oversized input error=%v", err)
+	}
+	if _, err := db.GraphExecute(ctx, rhiza.GraphCommand{RequestID: "large-graph", Cypher: "CREATE (:Item {value: $value})", Args: map[string]any{"value": strings.Repeat("x", 80<<10)}}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("embedded GraphExecute oversized input error=%v", err)
+	}
+	if err := db.Migrate(ctx, []rhiza.Migration{{Version: 1, Name: "large", Statements: []rhiza.SQLStatement{{SQL: strings.Repeat("x", 100<<10)}}}}); !errors.Is(err, rhiza.ErrInvalidRequest) {
+		t.Fatalf("embedded Migrate oversized input error=%v", err)
+	}
+	if _, err := db.Execute(ctx, rhiza.ExecuteRequest{RequestID: "valid-after-rejection", SQL: "CREATE TABLE admission_ok (id INTEGER)"}); err != nil {
+		t.Fatalf("valid embedded mutation after rejection: %v", err)
+	}
+}
+
 func TestExecuteReturningOneAndTypedMapping(t *testing.T) {
 	ctx := context.Background()
 	db, err := rhiza.Open(ctx, rhiza.Config{NodeID: "n1", DataDir: t.TempDir()})

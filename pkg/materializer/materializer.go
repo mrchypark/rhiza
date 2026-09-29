@@ -41,6 +41,10 @@ const (
 	MaxResultBytes         = 16 << 20
 	MaxMutationResultBytes = 1 << 20
 	MaxCellBytes           = 1 << 20
+	maxSQLColumnCharge     = 32
+	maxSQLStatementCharge  = 256
+	maxSQLRowCharge        = 64
+	maxSQLCellCharge       = 64
 	MaxGraphReachableDepth = 64
 	MaxGraphReachableEdges = 1_000_000
 	// MaxGraphQueryWork matches LatticeDB's default per-query execution budget.
@@ -77,9 +81,11 @@ type Materializer struct {
 	dbPath                   string
 	readersN                 int
 	idempotencyWindow        uint64
+	sqlReceiptRetention      sqlReceiptRetentionUsage
 	afterApplyCommitError    func() error
 	recentSQLReceipts        map[string]storedReceipt
 	pendingSQLReceipts       []pendingSQLReceipt
+	pendingSQLResultBytes    int
 	sqlReceipts              sqlReceiptBloom
 	graph                    *graphState
 	graphNodePropertyIndexes []types.GraphNodePropertyIndex
@@ -233,6 +239,11 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 			return nil, err
 		}
 	}
+	// Check an existing graph policy before opening SQLite with a writer or
+	// opening LatticeDB writable. Old graph state is incompatible, not migrated.
+	if err := ValidateLocalGraphStorage(filepath.Join(filepath.Dir(dbPath), "latticedb", "graph.ltdb"), true); err != nil {
+		return nil, fmt.Errorf("incompatible graph materialization: %w", err)
+	}
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.
 	writerDSN := fileURL + "?_pragma=journal_mode(wal)&_pragma=synchronous(normal)&_pragma=wal_autocheckpoint(0)&_pragma=busy_timeout(5000)"
@@ -288,6 +299,10 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 	if err := m.loadTip(existing); err != nil {
 		m.Close()
 		return nil, fmt.Errorf("load applied slot: %w", err)
+	}
+	if err := m.loadSQLReceiptRetention(); err != nil {
+		m.Close()
+		return nil, fmt.Errorf("load SQL receipt retention: %w", err)
 	}
 	if err := m.loadSQLReceiptBloom(); err != nil {
 		m.Close()
@@ -376,7 +391,7 @@ func (m *Materializer) loadTip(existing bool) error {
 			return fmt.Errorf("existing database has no applied slot; rebuild it from the decision log")
 		}
 		zeroHash := hex.EncodeToString(make([]byte, sha256.Size))
-		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', ?), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, sqlpolicy.Marker(), zeroHash); err != nil {
+		if _, err := m.writer.Exec(`INSERT INTO _rhiza_meta(key, value) VALUES ('sql_execution_policy', ?), ('sql_idempotency_window', ?), ('sql_receipt_result_bytes', '0'), ('sql_receipt_count', '0'), ('applied_slot', '0'), ('state_slot', '0'), ('applied_hash', ?)`, sqlpolicy.Marker(), strconv.FormatUint(m.idempotencyWindow, 10), zeroHash); err != nil {
 			return err
 		}
 		value = "0"
@@ -841,6 +856,7 @@ func decodeSQLResult(encoded []byte) (types.SQLCommandResult, error) {
 	if err != nil || count > MaxSQLStatements {
 		return types.SQLCommandResult{}, fmt.Errorf("invalid statement count")
 	}
+	budget := MaxResultBytes - int(count)*maxSQLStatementCharge
 	result := types.SQLCommandResult{Statements: make([]types.SQLStatementResult, count)}
 	for i := range result.Statements {
 		statement := &result.Statements[i]
@@ -854,39 +870,90 @@ func decodeSQLResult(encoded []byte) (types.SQLCommandResult, error) {
 		if readErr != nil || columns > MaxSQLResultColumns {
 			return types.SQLCommandResult{}, fmt.Errorf("invalid column count")
 		}
-		statement.Columns = make([]string, columns)
-		for j := range statement.Columns {
-			value, readErr := readBytes(reader)
+		statement.Columns = make([]string, 0, columns)
+		for range columns {
+			value, readErr := readBudgetBytes(reader, &budget, maxSQLColumnCharge, MaxMutationResultBytes)
 			if readErr != nil {
 				return types.SQLCommandResult{}, readErr
 			}
-			statement.Columns[j] = string(value)
+			statement.Columns = append(statement.Columns, string(value))
 		}
 		rowCount, readErr := readUint32(reader)
-		if readErr != nil || rowCount > MaxReturningRows {
+		if readErr != nil || rowCount > MaxReturningRows || int(rowCount) > budget/maxSQLRowCharge {
 			return types.SQLCommandResult{}, fmt.Errorf("invalid row count")
 		}
+		budget -= int(rowCount) * maxSQLRowCharge
 		statement.Rows = make([][]any, rowCount)
 		for j := range statement.Rows {
 			cellCount, readErr := readUint32(reader)
 			if readErr != nil || cellCount != columns {
 				return types.SQLCommandResult{}, fmt.Errorf("invalid cell count")
 			}
+			if int(cellCount) > budget/maxSQLCellCharge {
+				return types.SQLCommandResult{}, fmt.Errorf("stored SQL result exceeds working-memory budget")
+			}
+			budget -= int(cellCount) * maxSQLCellCharge
 			statement.Rows[j] = make([]any, cellCount)
 			for k := range statement.Rows[j] {
-				statement.Rows[j][k], readErr = readSQLValue(reader)
+				statement.Rows[j][k], readErr = readSQLValueBudget(reader, &budget)
 				if readErr != nil {
 					return types.SQLCommandResult{}, readErr
 				}
 			}
 		}
 	}
-	errorText, err := readBytes(reader)
+	errorText, err := readBudgetBytes(reader, &budget, 0, MaxMutationResultBytes)
 	if err != nil || reader.Len() != 0 {
 		return types.SQLCommandResult{}, fmt.Errorf("invalid trailing result data")
 	}
 	result.Error = string(errorText)
 	return result, nil
+}
+
+func readBudgetBytes(reader *bytes.Reader, budget *int, overhead, maximum int) ([]byte, error) {
+	size, err := readUint32(reader)
+	if err != nil || int(size) > maximum || uint64(size) > uint64(reader.Len()) || int(size)+overhead > *budget {
+		return nil, fmt.Errorf("stored SQL result exceeds working-memory budget")
+	}
+	*budget -= int(size) + overhead
+	value := make([]byte, int(size))
+	_, err = io.ReadFull(reader, value)
+	return value, err
+}
+
+func readSQLValueBudget(reader *bytes.Reader, budget *int) (any, error) {
+	tag, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	switch tag {
+	case 0:
+		if *budget < 65 {
+			return nil, fmt.Errorf("stored SQL result exceeds working-memory budget")
+		}
+		*budget -= 65
+		return nil, nil
+	case 1:
+		if *budget < 80 {
+			return nil, fmt.Errorf("stored SQL result exceeds working-memory budget")
+		}
+		*budget -= 80
+		return readInt64(reader)
+	case 2:
+		if *budget < 80 {
+			return nil, fmt.Errorf("stored SQL result exceeds working-memory budget")
+		}
+		*budget -= 80
+		bits, err := readInt64(reader)
+		return math.Float64frombits(uint64(bits)), err
+	case 3:
+		value, err := readBudgetBytes(reader, budget, 0, MaxCellBytes)
+		return string(value), err
+	case 4:
+		return readBudgetBytes(reader, budget, 0, MaxCellBytes)
+	default:
+		return nil, fmt.Errorf("invalid SQL result tag %d", tag)
+	}
 }
 
 func readUint32(reader *bytes.Reader) (uint32, error) {
@@ -987,6 +1054,16 @@ func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64
 		return nil
 	}
 	floor := tip - m.idempotencyWindow + 1
+	var resultBytes, receipts int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(length(sql_result)), 0), COUNT(*) FROM _rhiza_idempotency WHERE kind = ? AND commit_slot < ?`, types.MutationSQL, floor).Scan(&resultBytes, &receipts); err != nil {
+		return fmt.Errorf("count expired SQL receipts: %w", err)
+	}
+	if resultBytes < 0 || receipts < 0 {
+		return fmt.Errorf("invalid expired SQL receipt accounting")
+	}
+	if err := m.sqlReceiptRetention.remove(uint64(resultBytes), uint64(receipts)); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM _rhiza_idempotency WHERE commit_slot < ?`, floor)
 	return err
 }
@@ -999,6 +1076,7 @@ type pendingNotification struct {
 type pendingSQLReceipt struct {
 	requestID string
 	record    storedReceipt
+	persisted bool
 }
 
 // Apply applies one decided value.
@@ -1056,8 +1134,15 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 		}
 	}()
 	oldTip, oldStateTip, oldHash := m.tip, m.stateTip, m.tipHash
+	oldRetention := m.sqlReceiptRetention
+	defer func() {
+		if applyErr != nil {
+			m.sqlReceiptRetention = oldRetention
+		}
+	}()
 	pending := make([]pendingNotification, 0)
 	m.pendingSQLReceipts = m.pendingSQLReceipts[:0]
+	m.pendingSQLResultBytes = 0
 	for _, decision := range decisions {
 		slot := uint64(decision.Slot)
 		hash := sha256.Sum256(decision.Value)
@@ -1078,6 +1163,14 @@ func (m *Materializer) ApplyBatch(ctx context.Context, decisions []quepaxa.Decid
 			return err
 		}
 		m.tip, m.tipHash = slot, hash
+	}
+	if err := m.flushPendingSQLReceipts(ctx, tx, nil); err != nil {
+		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		return err
+	}
+	if err := m.persistSQLReceiptRetention(ctx, tx); err != nil {
+		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		m.tip, m.stateTip, m.tipHash = oldTip, oldStateTip, oldHash
@@ -1275,13 +1368,16 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 				continue
 			}
 			mightExist := m.sqlReceipts.mightContain(command.RequestID, m.tip)
-			if !mightExist {
-				for _, pending := range m.pendingSQLReceipts[:pendingStart] {
-					if pending.requestID == command.RequestID {
-						mightExist = true
-						break
-					}
+			pendingEarlier := false
+			for _, pending := range m.pendingSQLReceipts[:pendingStart] {
+				if pending.requestID == command.RequestID {
+					mightExist = true
+					pendingEarlier = true
+					break
 				}
+			}
+			if pendingEarlier {
+				continue
 			}
 			if mightExist {
 				if _, found, err := m.receiptInTx(ctx, tx, types.MutationSQL, command.RequestID); err != nil {
@@ -1330,20 +1426,33 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 			if len(command.Statements) == 0 && command.WantRows {
 				storedResult = result
 			}
+			encodedResult, err := encodeSQLResult(storedResult)
+			if err != nil {
+				return fmt.Errorf("encode retained SQL result: %w", err)
+			}
+			if !m.sqlReceiptRetention.admits(0, m.idempotencyWindow) {
+				return fmt.Errorf("SQL receipt envelope counter exceeds policy bounds")
+			}
+			if !m.sqlReceiptRetention.admits(uint64(len(encodedResult)), m.idempotencyWindow) {
+				if _, err := execPrepared(ctx, tx, statements, "ROLLBACK TO rhiza_command"); err != nil {
+					return err
+				}
+				result = types.SQLCommandResult{}
+				storedResult = types.SQLCommandResult{}
+				encodedResult = nil
+				receipt = types.MutationReceipt{Slot: slot, Status: types.MutationRejected, ErrorCode: types.MutationErrorCodeResultRetentionFull, RetryThroughSlot: slot + m.idempotencyWindow - 1}
+			}
+			m.sqlReceiptRetention.add(uint64(len(encodedResult)))
 			m.pendingSQLReceipts = append(m.pendingSQLReceipts, pendingSQLReceipt{requestID: command.RequestID, record: storedReceipt{fingerprint: fingerprint, receipt: receipt, sqlResult: storedResult}})
+			m.pendingSQLResultBytes += sqlResultWorkingBytes(storedResult)
+			if m.pendingSQLResultBytes >= MaxMutationResultBytes {
+				if err := m.flushPendingSQLReceipts(ctx, tx, statements); err != nil {
+					return err
+				}
+			}
 		}
 		if _, err := execPrepared(ctx, tx, statements, "RELEASE rhiza_command"); err != nil {
 			return err
-		}
-	}
-	pendingReceipts := m.pendingSQLReceipts[pendingStart:]
-	if len(pendingReceipts) != 0 {
-		inserted, err := insertReceiptsIfAbsent(ctx, tx, statements, types.MutationSQL, pendingReceipts)
-		if err != nil {
-			return fmt.Errorf("record SQL receipts: %w", err)
-		}
-		if !inserted {
-			return fmt.Errorf("SQL request appeared during apply")
 		}
 	}
 	slotValue := strconv.FormatUint(slot, 10)
@@ -1768,10 +1877,14 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 			return result, err
 		}
 	}
-	budget := resultBudget{rows: MaxReturningRows, bytes: MaxMutationResultBytes, limit: MaxMutationResultBytes}
+	budget := resultBudget{rows: MaxReturningRows, bytes: MaxResultBytes, limit: MaxResultBytes}
 	resolvedBytes := 0
 	wantsRows := command.WantRows
 	for statementIndex, statement := range statements {
+		budget.bytes -= maxSQLStatementCharge
+		if budget.bytes < 0 {
+			return result, fmt.Errorf("SQL result exceeds %d bytes of working memory", budget.limit)
+		}
 		args := make([]any, len(statement.Args))
 		for i, arg := range statement.Args {
 			value, err := sqlArg(arg)
@@ -1901,11 +2014,11 @@ func executeSQLCommand(ctx context.Context, conn *sql.Conn, tx *sql.Tx, prepared
 }
 
 func preparedStatement(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt, query string) (*sql.Stmt, error) {
-	if statement := prepared[query]; statement != nil {
+	if statement := prepared[query]; prepared != nil && statement != nil {
 		return statement, nil
 	}
 	statement, err := tx.PrepareContext(ctx, query)
-	if err == nil {
+	if err == nil && prepared != nil {
 		prepared[query] = statement
 	}
 	return statement, err
@@ -1994,6 +2107,53 @@ type resultBudget struct {
 	limit int
 }
 
+func sqlResultWorkingBytes(result types.SQLCommandResult) int {
+	size := 0
+	add := func(n int) {
+		if n > MaxResultBytes-size {
+			size = MaxResultBytes + 1
+		} else {
+			size += n
+		}
+	}
+	for _, statement := range result.Statements {
+		add(maxSQLStatementCharge)
+		for _, column := range statement.Columns {
+			add(maxSQLColumnCharge + len(column))
+		}
+		for _, row := range statement.Rows {
+			add(maxSQLRowCharge + len(row)*maxSQLCellCharge)
+			for _, value := range row {
+				add(sqlValueSize(value))
+			}
+		}
+	}
+	return size
+}
+
+func (m *Materializer) flushPendingSQLReceipts(ctx context.Context, tx *sql.Tx, prepared map[string]*sql.Stmt) error {
+	start := 0
+	for start < len(m.pendingSQLReceipts) && m.pendingSQLReceipts[start].persisted {
+		start++
+	}
+	if start == len(m.pendingSQLReceipts) {
+		return nil
+	}
+	inserted, err := insertReceiptsIfAbsent(ctx, tx, prepared, types.MutationSQL, m.pendingSQLReceipts[start:])
+	if err != nil {
+		return fmt.Errorf("record SQL receipts: %w", err)
+	}
+	if !inserted {
+		return fmt.Errorf("SQL request appeared during apply")
+	}
+	for i := start; i < len(m.pendingSQLReceipts); i++ {
+		m.pendingSQLReceipts[i].record.sqlResult = types.SQLCommandResult{}
+		m.pendingSQLReceipts[i].persisted = true
+	}
+	m.pendingSQLResultBytes = 0
+	return nil
+}
+
 type countingWriter int
 
 func (w *countingWriter) Write(p []byte) (int, error) {
@@ -2010,7 +2170,7 @@ func encodedJSONSize(value any) (int, error) {
 }
 
 func collectRows(rows *sql.Rows, limit int) (types.SQLStatementResult, error) {
-	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes, limit: MaxResultBytes}, nil)
+	return collectRowsWithBudget(rows, &resultBudget{rows: limit, bytes: MaxResultBytes - maxSQLStatementCharge, limit: MaxResultBytes}, nil)
 }
 
 func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget, expectedRows *int64) (types.SQLStatementResult, error) {
@@ -2023,7 +2183,7 @@ func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget, expectedRows *i
 	}
 	result := types.SQLStatementResult{Columns: columns}
 	for _, column := range columns {
-		budget.bytes -= len(column)
+		budget.bytes -= maxSQLColumnCharge + len(column)
 	}
 	if budget.bytes < 0 {
 		return result, fmt.Errorf("result exceeds %d bytes", budget.limit)
@@ -2035,6 +2195,11 @@ func collectRowsWithBudget(rows *sql.Rows, budget *resultBudget, expectedRows *i
 		if budget.rows == 0 {
 			return result, fmt.Errorf("result exceeds %d rows", MaxReturningRows)
 		}
+		rowCharge := maxSQLRowCharge + len(columns)*maxSQLCellCharge
+		if rowCharge > budget.bytes {
+			return result, fmt.Errorf("result exceeds %d bytes of working memory", budget.limit)
+		}
+		budget.bytes -= rowCharge
 		values := make([]any, len(columns))
 		pointers := make([]any, len(columns))
 		for i := range values {
@@ -2764,6 +2929,7 @@ func (m *Materializer) adopt(source *Materializer) {
 	m.tip, m.stateTip, m.tipHash = source.tip, source.stateTip, source.tipHash
 	m.recentSQLReceipts = source.recentSQLReceipts
 	m.sqlReceipts = source.sqlReceipts
+	m.sqlReceiptRetention = source.sqlReceiptRetention
 	m.graphNodePropertyIndexes = slices.Clone(source.graphNodePropertyIndexes)
 	source.db, source.writer, source.readers, source.graph = nil, nil, nil, nil
 	_ = source.Close()

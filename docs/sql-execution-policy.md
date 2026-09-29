@@ -1,9 +1,29 @@
-# SQL execution policy 4 compatibility boundary
+# SQL execution policy 7 compatibility boundary
 
-The reconfiguration schedule repair uses peer ALPN `rhiza-peer-v7`, with no
-v6 fallback; SQL policy remains 4. Upgrade all participants while quiesced.
-Do not downgrade after activation. This transport gate does not mechanically
-prevent reopening WALs with older binaries.
+Graph query work accounting advances the execution policy to 7 after SQL
+policies 5 and 6. Certified SQL uses `QBAT\x07`; certified graph batches use
+`QGRB\x07`. Policy-6-or-earlier graph envelopes and graph storage markers are
+incompatible even when their queries happen to satisfy the new work limit.
+Policy-7 graph materializations use a distinct storage marker, and checkpoint
+roots carry policy 7. Old history, graph files, and checkpoints are rejected
+before application or installation. There is no automatic migration or
+old-history replay fallback; use a fresh cluster and logical export/import.
+The graph work cap is 10,000,000 execution work units per operation; it is not
+a parser CPU, wall-clock, or replica-slot bound. Resource exhaustion aborts
+the mutation without a receipt or partial stream/slot publication; retrying
+the same decision may block again, including after reopen.
+
+Durable SQL result retention advances the SQL policy to 6. The retained window
+allows 256 MiB of encoded SQL result blobs plus a charged 256-byte envelope for
+each of at most 64 SQL commands per slot. The deterministic charge ceiling is
+`256 MiB + 256 * 64 * W`, where W is the stored retry window: 1.25 GiB at the
+default 65,536 slots and 16.25 GiB at the 1,048,576-slot maximum. This charge is
+not a physical SQLite or disk-space guarantee; existing 32 GiB checkpoint
+limits and Local free-space preflight remain unchanged. Peer ALPN remains
+`rhiza-peer-v7`.
+Upgrade all participants while quiesced. Do not downgrade after activation.
+This transport gate does not mechanically prevent reopening WALs with older
+binaries.
 
 Certified reconfigurations whose freeze or terminal occupies a source-generation
 leader-schedule slot are incompatible. Preserve the installation, WAL, ISR and
@@ -12,17 +32,23 @@ invent a schedule. Migrate verified committed application state (including
 committed drain writes) into a fresh cluster with a separate lineage. This change
 does not perform that migration automatically.
 
-The SQL counter/default, TEMP, ROWID and PRAGMA fixes are incompatible execution-policy changes. This is
-not an in-place upgrade. Certified SQL uses `QBAT\x04`; policy-3 `QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
+The SQL counter/default, TEMP, ROWID, PRAGMA, mutation-admission, result
+working-set and durable-retention rules are incompatible execution-policy
+changes. Policy 6 introduced the SQL rules and policy 7 fences them together
+with graph work accounting. This is not an in-place upgrade. Certified SQL
+uses `QBAT\x07`; policy-6 `QBAT\x06`, policy-5 `QBAT\x05`, policy-4
+`QBAT\x04`, policy-3 `QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`,
+unversioned `QBAT\x00`,
 unknown policy versions and raw SQL decisions cannot be applied by this binary.
 Unsupported history is an error, not a rejected SQL receipt. Already-applied
 slots are checked too. Do not rewrite stored decision bytes.
 
-Existing unmarked, policy-1, policy-2 or policy-3 SQLite materializations and checkpoints are refused, even if TEMP was never knowingly used. The
-`sql_execution_policy=4` metadata value identifies newly initialized state; it
+Existing unmarked or policy-1 through policy-6 SQLite materializations and
+checkpoints are refused, even if TEMP was never knowingly used. The
+`sql_execution_policy=7` metadata value identifies newly initialized state; it
 is not a migration certificate. Do not manually insert it into old databases or
-stamp old checkpoint descriptors. Peer ALPN v7 separates this binary from v2/v3/v4/v5/v6
-peers. Mixed-version clusters and downgrades are unsupported.
+stamp old checkpoint descriptors. Mixed-version clusters and downgrades are
+unsupported.
 
 Replicated writes cannot create TEMP/TEMPORARY objects or use `temp` as a dotted
 qualifier (including quoted spellings). This also reserves `temp.id` when `temp`

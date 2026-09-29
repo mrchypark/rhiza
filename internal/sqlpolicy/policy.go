@@ -13,7 +13,7 @@ import (
 	"github.com/ncruces/go-sqlite3/driver"
 )
 
-const Version = 4
+const Version = 7
 const PeerALPN = "rhiza-peer-v7"
 
 func Marker() string { return strconv.Itoa(Version) }

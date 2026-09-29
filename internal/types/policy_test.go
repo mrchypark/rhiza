@@ -7,12 +7,12 @@ import (
 )
 
 func TestExecutionPolicyRejectsLegacyAndUnknownValues(t *testing.T) {
-	for _, value := range []string{"", "Q", "QBAT", "QBAT\x00[]", "QBAT\x01[]", "QBAT\x02[]", "QBAT\x03[]", "QBAT\x05[]", `QBAT`, "SELECT 1", "QBAT\x00[{\"policy\":1,\"sql\":\"SELECT 1\"}]"} {
+	for _, value := range []string{"", "Q", "QBAT", "QBAT\x00[]", "QBAT\x01[]", "QBAT\x02[]", "QBAT\x03[]", "QBAT\x04[]", "QBAT\x05[]", "QBAT\x06[]", `QBAT`, "SELECT 1", "QBAT\x00[{\"policy\":1,\"sql\":\"SELECT 1\"}]"} {
 		if err := ValidateExecutionPolicy([]byte(value)); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Errorf("%q: %v", value, err)
 		}
 	}
-	if err := ValidateExecutionPolicy([]byte("QBAT\x04{bad")); err == nil {
+	if err := ValidateExecutionPolicy([]byte("QBAT\x07{bad")); err == nil {
 		t.Fatal("accepted malformed envelope")
 	}
 	value, err := EncodeSQLBatch([]SQLCommand{{SQL: "SELECT 1"}})
@@ -22,7 +22,35 @@ func TestExecutionPolicyRejectsLegacyAndUnknownValues(t *testing.T) {
 	if err = ValidateExecutionPolicy(value); err != nil {
 		t.Fatal(err)
 	}
-	if string(value[:5]) != "QBAT\x04" {
+	if string(value[:5]) != "QBAT\x07" {
 		t.Fatalf("policy header %q", value[:5])
+	}
+}
+
+func TestDecodeSQLBatchCommandLimit(t *testing.T) {
+	commands := make([]SQLCommand, MaxSQLCommandsPerDecidedValue+1)
+	value, err := EncodeSQLBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := DecodeSQLBatch(value); !ok || err == nil {
+		t.Fatalf("oversized SQL batch ok=%v err=%v", ok, err)
+	}
+}
+
+func TestExecutionPolicyRejectsOldGraphBatchBeforeApply(t *testing.T) {
+	old := []byte("QGRB\x00[{\"request_id\":\"legacy\",\"cypher\":\"CREATE (:Legacy)\"}]")
+	if _, ok, err := DecodeGraphBatch(old); !ok || !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("old graph batch decode ok=%v err=%v", ok, err)
+	}
+	if err := ValidateExecutionPolicy(old); !errors.Is(err, sqlpolicy.ErrIncompatible) {
+		t.Fatalf("old graph batch policy validation: %v", err)
+	}
+	current, err := EncodeGraphCommand(GraphCommand{RequestID: "current", Cypher: "RETURN 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current[:5]) != "QGRB\x07" {
+		t.Fatalf("current graph marker %q", current[:5])
 	}
 }

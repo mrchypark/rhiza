@@ -108,7 +108,7 @@ func TestLegacySnapshotRefusalPreservesLiveState(t *testing.T) {
 }
 
 func TestMaterializationPolicyMarkerIsRequired(t *testing.T) {
-	for _, marker := range []string{"", "1", "2", "3", "5", "not-a-version"} {
+	for _, marker := range []string{"", "1", "2", "3", "4", "5", "not-a-version"} {
 		t.Run(marker, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "state.db")
 			m, err := Open(path, 1)

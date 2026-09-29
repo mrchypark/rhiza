@@ -36,7 +36,7 @@ var graphJournalKey = []byte("rhiza/recovery_journal")
 var graphFormatKey = []byte("rhiza/storage_policy")
 var graphPendingKey = []byte("rhiza/pending_apply")
 
-var graphStoragePolicy = []byte("slot-publication-v1")
+var graphStoragePolicy = []byte("slot-publication-v2-policy-7")
 
 var (
 	ErrGraphResourceLimit  = errors.New("graph resource limit exceeded")

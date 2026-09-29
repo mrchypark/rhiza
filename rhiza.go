@@ -295,16 +295,20 @@ func ValidateGraphReachableRequest(req GraphReachableRequest) error {
 func (db *DB) Handler() http.Handler                            { return db.api }
 func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) { db.api.ServeHTTP(w, r) }
 
+// Execute synchronously inspects and clones req; callers must not mutate its
+// strings, slices, or maps until this method returns.
 func (db *DB) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
 	return db.api.Execute(ctx, req)
 }
 
 // ExecuteReturning executes one replicated mutation and returns its bounded rows.
+// Callers must not mutate req or its nested values until this method returns.
 func (db *DB) ExecuteReturning(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
 	return db.api.ExecuteReturning(ctx, req)
 }
 
 // ExecuteReturningOne commits only when exactly one row is returned.
+// Callers must not mutate req or its nested values until this method returns.
 func (db *DB) ExecuteReturningOne(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
 	return db.api.ExecuteReturningOne(ctx, req)
 }
@@ -414,9 +418,26 @@ func ExecuteReturningMapOne[T any](ctx context.Context, db *DB, req ExecuteReque
 
 // Migrate applies strictly ordered migrations exactly once. A repeated version
 // must have the same name and statements.
+// Migrate synchronously inspects and clones migrations; callers must not mutate
+// them or nested values until this method returns.
 func (db *DB) Migrate(ctx context.Context, migrations []Migration) error {
 	if len(migrations) == 0 {
 		return nil
+	}
+	// Reserve every migration before making checksum buffers or encoding the
+	// caller's statement lists. Admissions cap this slice to 128 entries/32MiB.
+	admissions := make([]*network.MigrationAdmission, 0)
+	defer func() {
+		for _, admission := range admissions {
+			admission.Release()
+		}
+	}()
+	for _, migration := range migrations {
+		admission, err := db.api.AdmitMigration(ctx, migration.Version, migration.Name, migration.Statements)
+		if err != nil {
+			return err
+		}
+		admissions = append(admissions, admission)
 	}
 	prepared := make([]struct {
 		migration Migration
@@ -445,8 +466,8 @@ func (db *DB) Migrate(ctx context.Context, migrations []Migration) error {
 			request   network.MigrationRequest
 		}{migration, request}
 	}
-	for _, item := range prepared {
-		result, err := db.api.Migrate(ctx, item.request)
+	for i, item := range prepared {
+		result, err := db.api.MigrateAdmitted(ctx, item.request, admissions[i])
 		if err != nil {
 			return err
 		}
@@ -478,6 +499,9 @@ func (db *DB) Query(ctx context.Context, req QueryRequest) (QueryResponse, error
 func (db *DB) KVGet(ctx context.Context, req KVGetRequest) (KVGetResponse, error) {
 	return db.api.KVGet(ctx, req)
 }
+
+// KVPut synchronously inspects and clones req; callers must not mutate its
+// strings or byte slices until this method returns.
 func (db *DB) KVPut(ctx context.Context, req KVMutationRequest) (KVMutationResponse, error) {
 	return db.api.KVPut(ctx, req)
 }
@@ -487,6 +511,9 @@ func (db *DB) KVDelete(ctx context.Context, req KVMutationRequest) (KVMutationRe
 func (db *DB) KVCAS(ctx context.Context, req KVMutationRequest) (KVMutationResponse, error) {
 	return db.api.KVCAS(ctx, req)
 }
+
+// GraphExecute synchronously inspects and clones req; callers must not mutate
+// its strings, slices, or maps until this method returns.
 func (db *DB) GraphExecute(ctx context.Context, req GraphCommand) (GraphExecuteResponse, error) {
 	return db.api.GraphExecute(ctx, req)
 }
@@ -524,6 +551,9 @@ func (db *DB) SetGraphStreamOffset(ctx context.Context, req GraphStreamOffsetReq
 func (db *DB) TrimGraphStream(ctx context.Context, req GraphStreamTrimRequest) error {
 	return db.api.TrimGraphStream(ctx, req)
 }
+
+// NotifyPublish synchronously inspects and clones req; callers must not mutate
+// its strings or byte slices until this method returns.
 func (db *DB) NotifyPublish(ctx context.Context, req NotifyCommand) (MutationReceipt, error) {
 	return db.api.NotifyPublish(ctx, req)
 }

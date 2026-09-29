@@ -314,7 +314,7 @@ func TestReadonlyLocalGraphPolicyValidationPreservesGraphFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Update(func(tx *latticedb.Tx) error { return tx.PutAppMetadata(graphFormatKey, []byte("future-policy")) }); err != nil {
+	if err := db.Update(func(tx *latticedb.Tx) error { return tx.PutAppMetadata(graphFormatKey, []byte("slot-publication-v1")) }); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -335,7 +335,10 @@ func TestReadonlyLocalGraphPolicyValidationPreservesGraphFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := ValidateLocalGraphStorage(graphPath, false); err == nil {
-		t.Fatal("unsupported graph storage policy was accepted")
+		t.Fatal("pre-policy-7 graph storage was accepted")
+	}
+	if _, err := Open(path, 1); err == nil {
+		t.Fatal("materializer opened pre-policy-7 graph storage")
 	}
 	after := make(map[string][]byte)
 	if err := filepath.WalkDir(graphPath, func(file string, entry os.DirEntry, walkErr error) error {
