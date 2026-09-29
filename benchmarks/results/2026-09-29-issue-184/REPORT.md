@@ -62,3 +62,39 @@ The full normal `CGO_ENABLED=0 go test ./...` suite passed; its output is
 retained in `raw/go-test-all.txt`. `CGO_ENABLED=0 go vet ./...` also passed
 with no diagnostics. No production optimization or correctness change was
 included.
+
+## Fresh-main integration verification
+
+After PR #209 merged, `origin/main` was fetched at
+`3bde2f62c3f964784696e262968a1cdb5cb176d1` and merged into the benchmark
+branch with merge commit `6beeff5966e805929b544eafcc228d3b5025872b` (no
+force-push). This preserves PR #209's SQL benchmark policy: the 128-command
+case splits at `types.MaxSQLCommandsPerDecidedValue` and applies each decided
+batch through `ApplyBatch`. The focused receipt/failure test and the 128-case
+benchmark both pass at this merge head.
+
+On the merged head, `CGO_ENABLED=0 go test ./...`, `CGO_ENABLED=0 go vet ./...`,
+and `CGO_ENABLED=1 go test -race ./...` all passed. Outputs are retained in
+`raw/go-test-all-after-merge.txt`, `raw/go-vet-all-after-merge.txt`, and
+`raw/go-test-race-all.txt`, respectively.
+
+The paired collector was run once at reduced smoke settings against fresh main
+and the merge head (base `3bde2f62c3f964784696e262968a1cdb5cb176d1`, candidate
+`6beeff5966e805929b544eafcc228d3b5025872b`):
+
+```sh
+/usr/bin/time -l env RHIZA_BENCH_COUNT=1 RHIZA_BENCH_TIME=50ms RHIZA_BENCH_PROCS=2 \
+  benchmarks/run-ci-benchmarks.sh origin/main HEAD \
+  benchmarks/results/2026-09-29-issue-184/paired-merge-smoke
+```
+
+Raw outputs and environment are retained in `paired-merge-smoke/`; native
+whole-collector resource output is `paired-merge-smoke-time.txt`. The process
+used 283.95 s real, 49.03 s user, 27.11 s system, and 1,105,936,384 bytes max
+RSS. This is whole-command resource data, not per-benchmark CPU profiling.
+Because this was one reduced-duration sample on a contended host (other Go
+test/race processes were active), the latency/alloc values are smoke evidence
+only; they support no performance conclusion. In particular, graph cases ran
+one operation and are noisy. The fresh-main GitHub CI workflow completed
+successfully before integration; its separate Performance workflow was still
+in progress at last check. No push was made.

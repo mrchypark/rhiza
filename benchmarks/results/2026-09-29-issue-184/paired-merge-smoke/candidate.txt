@@ -1,0 +1,132 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/qlog
+cpu: Apple M1
+BenchmarkWALScanScratch-2   	      69	    779521 ns/op	 1053790 B/op	     259 allocs/op
+BenchmarkWALAppendSync-2    	       5	  12686008 ns/op	     320 B/op	       1 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M1
+BenchmarkCoreProposeThreePeersParallel-2            	       1	 103751458 ns/op	  115488 B/op	     713 allocs/op
+BenchmarkCoreProposeCertifiedThreePeersParallel-2   	       1	  63869750 ns/op	   34008 B/op	     287 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M1
+BenchmarkDecisionsFromBounded/small-2         	    1980	     28589 ns/op	7728.87 MB/s	       128.0 fixture-items	    220960 payload-B/op	  236608 B/op	     257 allocs/op
+BenchmarkDecisionsFromBounded/max-value-2     	    1455	     35797 ns/op	25768.13 MB/s	        64.00 fixture-items	    922421 payload-B/op	  928704 B/op	      15 allocs/op
+BenchmarkDecisionsFromBounded/large-certificate-2         	     991	     51757 ns/op	20180.32 MB/s	        64.00 fixture-items	   1044480 payload-B/op	 1050624 B/op	      31 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M1
+BenchmarkEnsureDurableThroughRetainedPrefix/1-2 	 1010442	        50.23 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnsureDurableThroughRetainedPrefix/64-2         	   21877	      2321 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnsureDurableThroughRetainedPrefix/1024-2       	    1120	     47502 ns/op	       0 B/op	       0 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/recovery
+cpu: Apple M1
+BenchmarkArchiveMemoryPublication/short-one-extent-2         	       1	  71629791 ns/op	  15.55 MB/s	         2.000 ATTR/op	         1.000 GET/op	         2.000 PUT/op	   1113641 decision-payload-B/op	         1.000 extents/op	   1122113 uploaded-B/op	 2923720 B/op	    8324 allocs/op
+BenchmarkArchiveMemoryPublication/long-six-extents-2         	       1	 439709041 ns/op	  15.21 MB/s	         2.000 ATTR/op	         1.000 GET/op	         7.000 PUT/op	   6686051 decision-payload-B/op	         6.000 extents/op	   6736223 uploaded-B/op	17071568 B/op	   45424 allocs/op
+BenchmarkArchiveMemoryPublication/cas-conflict-one-extent-2  	       1	  62380958 ns/op	  17.85 MB/s	         5.000 ATTR/op	         3.000 GET/op	         4.000 PUT/op	   1113641 decision-payload-B/op	         1.000 extents/op	   1122113 uploaded-B/op	 9355088 B/op	   19766 allocs/op
+PASS
+2026/09/29 15:15:39 checkpoint candidate published: index=1 size=37241 files=2
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/recovery
+cpu: Apple M1
+BenchmarkAuthenticatedMembershipCheckpointProof/small-head-2         	2026/09/29 15:15:40 checkpoint candidate published: index=1 size=37241 files=2
+2026/09/29 15:15:40 checkpoint candidate published: index=1 size=37241 files=2
+2026/09/29 15:15:41 checkpoint candidate published: index=1 size=37241 files=2
+2026/09/29 15:15:41 checkpoint candidate published: index=1 size=37241 files=2
+    2247	     47412 ns/op	  23.60 MB/s	      1933 head-B	      1119 seal-B	    6796 B/op	      31 allocs/op
+2026/09/29 15:15:42 checkpoint candidate published: index=1 size=37241 files=2
+BenchmarkAuthenticatedMembershipCheckpointProof/duplicate-head-boundary-2         	2026/09/29 15:15:42 checkpoint candidate published: index=1 size=37241 files=2
+2026/09/29 15:15:43 checkpoint candidate published: index=1 size=37241 files=2
+     321	    179317 ns/op	 197.54 MB/s	     36249 head-B	     35423 seal-B	   87061 B/op	      31 allocs/op
+2026/09/29 15:15:43 checkpoint candidate published: index=1 size=37241 files=2
+BenchmarkAuthenticatedMembershipCheckpointProof/near-max-decision-value-2         	2026/09/29 15:15:44 checkpoint candidate published: index=1 size=37241 files=2
+     100	    500588 ns/op	 254.87 MB/s	    128416 head-B	    127586 seal-B	  267350 B/op	      31 allocs/op
+2026/09/29 15:15:47 checkpoint candidate published: index=35 size=37241 files=2
+BenchmarkAuthenticatedMembershipCheckpointProof/real-large-history-2              	2026/09/29 15:15:51 checkpoint candidate published: index=35 size=37241 files=2
+2026/09/29 15:15:53 checkpoint candidate published: index=35 size=37241 files=2
+2026/09/29 15:15:56 checkpoint candidate published: index=35 size=37241 files=2
+      68	   1114862 ns/op	  85.16 MB/s	     95764 head-B	     94939 seal-B	  795727 B/op	     398 allocs/op
+PASS
+2026/09/29 15:15:56 checkpoint candidate published: index=1 size=37263 files=2
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/recovery
+cpu: Apple M1
+BenchmarkArchiveHeadEvidenceStages/small-authenticated/encode-2  	    5488	      9466 ns/op	         0 ATTR/op	         0 GET/op	      1949 HEAD-B/op	         0 ITER/op	         0 PUT/op	         0 read-B/op	         0 write-B/op	    5491 B/op	      11 allocs/op
+BenchmarkArchiveHeadEvidenceStages/small-authenticated/decode-2  	    8776	      6987 ns/op	         0 ATTR/op	         0 GET/op	      1949 HEAD-B/op	         0 ITER/op	         0 PUT/op	         0 read-B/op	         0 write-B/op	    3137 B/op	      11 allocs/op
+BenchmarkArchiveHeadEvidenceStages/small-authenticated/stable-readback-2         	     370	    156925 ns/op	         3.000 ATTR/op	         3.000 GET/op	      1949 HEAD-B/op	         0 ITER/op	         0 PUT/op	      7471 read-B/op	         0 write-B/op	   40318 B/op	     136 allocs/op
+BenchmarkArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2         	      24	   4557245 ns/op	        15.75 ATTR/op	         8.750 GET/op	      1949 HEAD-B/op	         0 ITER/op	         4.000 PUT/op	      8433 read-B/op	       684.3 write-B/op	  234635 B/op	     548 allocs/op
+2026/09/29 15:15:59 checkpoint candidate published: index=35 size=37279 files=2
+BenchmarkArchiveHeadEvidenceStages/large-authenticated-history/encode-2          	     204	    262494 ns/op	         0 ATTR/op	         0 GET/op	     95723 HEAD-B/op	         0 ITER/op	         0 PUT/op	         0 read-B/op	         0 write-B/op	  278314 B/op	      30 allocs/op
+BenchmarkArchiveHeadEvidenceStages/large-authenticated-history/decode-2          	     242	    250084 ns/op	         0 ATTR/op	         0 GET/op	     95723 HEAD-B/op	         0 ITER/op	         0 PUT/op	         0 read-B/op	         0 write-B/op	  179804 B/op	      27 allocs/op
+BenchmarkArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2 	      52	   1217182 ns/op	         3.000 ATTR/op	         3.000 GET/op	     95723 HEAD-B/op	         0 ITER/op	         0 PUT/op	    523359 read-B/op	         0 write-B/op	 1818014 B/op	     461 allocs/op
+BenchmarkArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2 	      18	   6075900 ns/op	        15.06 ATTR/op	         8.056 GET/op	     95723 HEAD-B/op	         0 ITER/op	         4.000 PUT/op	    524164 read-B/op	       707.0 write-B/op	 2010423 B/op	     854 allocs/op
+BenchmarkArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2  	      21	   2416294 ns/op	         0 ATTR/op	         0 GET/op	   8388600 HEAD-B/op	         0 ITER/op	         0 PUT/op	         0 read-B/op	         0 write-B/op	16779713 B/op	       8 allocs/op
+BenchmarkArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2  	      39	   1383080 ns/op	         0 ATTR/op	         0 GET/op	   8388600 HEAD-B/op	         0 ITER/op	         0 PUT/op	         0 read-B/op	         0 write-B/op	 8390079 B/op	       6 allocs/op
+BenchmarkArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2         	      19	   3107757 ns/op	         3.000 ATTR/op	         1.000 GET/op	   8388600 HEAD-B/op	         0 ITER/op	         0 PUT/op	   8388600 read-B/op	         0 write-B/op	25462862 B/op	      84 allocs/op
+BenchmarkArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2         	      10	   6541796 ns/op	        15.40 ATTR/op	         6.400 GET/op	   8388600 HEAD-B/op	         0 ITER/op	         4.000 PUT/op	   8389357 read-B/op	       589.8 write-B/op	25660512 B/op	     489 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+BenchmarkGraphApply-2                         	       3	  18770625 ns/op	  114826 B/op	     813 allocs/op
+BenchmarkLatticeAppMetadataUpdate4096Keys-2   	       3	  20198014 ns/op	 2406125 B/op	   51559 allocs/op
+BenchmarkGraphQuery4096Nodes-2                	       6	   9958736 ns/op	 7141861 B/op	  173036 allocs/op
+BenchmarkSQLBatchApply/1-2                    	     148	    340789 ns/op	   11407 B/op	     242 allocs/op
+BenchmarkSQLBatchApply/8-2                    	      94	   1795572 ns/op	   56807 B/op	    1042 allocs/op
+BenchmarkSQLBatchApply/32-2                   	      25	   3593955 ns/op	  212879 B/op	    3732 allocs/op
+BenchmarkSQLBatchApply/64-2                   	      13	   4568619 ns/op	  422657 B/op	    7323 allocs/op
+BenchmarkSQLBatchApply/128-2                  	       9	   5673611 ns/op	  852292 B/op	   14642 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+BenchmarkGraphSnapshotFreezeByDatabaseSize/1MiB-2         	      20	    638571 ns/op	         1.000 db-MiB	     790 B/op	       7 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/16MiB-2        	      20	    528571 ns/op	        16.00 db-MiB	     581 B/op	       7 allocs/op
+BenchmarkGraphSnapshotFreezeByDatabaseSize/64MiB-2        	      20	    137083 ns/op	        64.00 db-MiB	     575 B/op	       7 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+BenchmarkSQLAuthorizerSchemaCount/1-2 	   10999	      4867 ns/op	     240 B/op	       9 allocs/op
+BenchmarkSQLAuthorizerSchemaCount/64-2         	    1876	     32674 ns/op	     240 B/op	       9 allocs/op
+BenchmarkSQLAuthorizerSchemaCount/256-2        	     386	    149553 ns/op	     244 B/op	       9 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=1/batch=1-2         	       1	  33582459 ns/op	  956296 B/op	    9774 allocs/op
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=1/batch=8-2         	       1	  33817041 ns/op	 4055256 B/op	   42446 allocs/op
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=8/batch=1-2         	       1	  39237251 ns/op	  174416 B/op	    1418 allocs/op
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=8/batch=8-2         	       1	  23630834 ns/op	  627304 B/op	    6177 allocs/op
+PASS
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/network
+cpu: Apple M1
+BenchmarkThreePeerSQLExecute/c4-2         	      15	   3504133 ns/op	         3.750 commands/slot	   17543 B/op	     208 allocs/op
+BenchmarkThreePeerSQLExecute/c16-2        	      51	   1196713 ns/op	        12.75 commands/slot	   12972 B/op	     152 allocs/op
+BenchmarkThreePeerSQLExecute/c64-2        	     219	    248435 ns/op	        54.75 commands/slot	   11274 B/op	     132 allocs/op
+BenchmarkThreePeerSQLExecuteReturning/rows1-2         	       4	  13989677 ns/op	         0 payload-bytes/op	         1.000 rows/op	   53562 B/op	     732 allocs/op
+BenchmarkThreePeerSQLExecuteReturning/rows100-2       	       4	  13455802 ns/op	         0 payload-bytes/op	       100.0 rows/op	  119190 B/op	    2935 allocs/op
+BenchmarkThreePeerSQLExecuteReturning/bytes1MiB-2     	       2	  32202396 ns/op	   1048448 payload-bytes/op	         1.000 rows/op	 6362836 B/op	     919 allocs/op
+BenchmarkCertifiedThreePeerSQLExecute/c4-2            	      20	   5168912 ns/op	         4.000 commands/slot	   16088 B/op	     176 allocs/op
+BenchmarkCertifiedThreePeerSQLExecute/c16-2           	      40	   1348299 ns/op	        13.33 commands/slot	   11591 B/op	     123 allocs/op
+BenchmarkCertifiedThreePeerSQLExecute/c64-2           	     168	    369167 ns/op	        56.00 commands/slot	    9446 B/op	     103 allocs/op
+PASS
