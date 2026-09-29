@@ -1,0 +1,20 @@
+Preparing worktree (detached HEAD 3bde2f6)
+Preparing worktree (detached HEAD 6beeff5)
+      283.95 real        49.03 user        27.11 sys
+          1105936384  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              986603  page reclaims
+               64233  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+               27921  signals received
+              216836  voluntary context switches
+              822465  involuntary context switches
+           117906927  instructions retired
+            90455759  cycles elapsed
+             1655680  peak memory footprint

@@ -1,0 +1,9 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+cpu: Apple M1
+BenchmarkEnsureDurableThroughRetainedPrefix/1-2 	 3001022	        39.61 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnsureDurableThroughRetainedPrefix/64-2         	   54166	      1859 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEnsureDurableThroughRetainedPrefix/1024-2       	    2800	     36082 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	1.002s

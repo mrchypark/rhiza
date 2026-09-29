@@ -1,0 +1,510 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+                                                  │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                  │                            sec/op                             │                  sec/op                    vs base                 │
+GraphApply-2                                                                                         25.86m ± ∞ ¹                                12.24m ± ∞ ¹        ~ (p=0.700 n=3) ²
+LatticeAppMetadataUpdate4096Keys-2                                                                   13.21m ± ∞ ¹                                13.51m ± ∞ ¹        ~ (p=1.000 n=3) ²
+GraphQuery4096Nodes-2                                                                                9.543m ± ∞ ¹                                9.489m ± ∞ ¹        ~ (p=0.700 n=3) ²
+SQLBatchApply/1-2                                                                                   1256.1µ ± ∞ ¹                                209.2µ ± ∞ ¹        ~ (p=0.400 n=3) ²
+SQLBatchApply/8-2                                                                                   1065.5µ ± ∞ ¹                                470.0µ ± ∞ ¹        ~ (p=0.700 n=3) ²
+SQLBatchApply/32-2                                                                                   2.607m ± ∞ ¹                                2.701m ± ∞ ¹        ~ (p=1.000 n=3) ²
+SQLBatchApply/64-2                                                                                   4.901m ± ∞ ¹                                3.186m ± ∞ ¹        ~ (p=1.000 n=3) ²
+SQLBatchApply/128-2                                                                                  8.792m ± ∞ ¹                                5.559m ± ∞ ¹        ~ (p=1.000 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                             187.9µ ± ∞ ¹                                149.9µ ± ∞ ¹        ~ (p=0.400 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                            167.5µ ± ∞ ¹                                132.1µ ± ∞ ¹        ~ (p=0.100 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                            131.0µ ± ∞ ¹                                128.2µ ± ∞ ¹        ~ (p=0.700 n=3) ²
+SQLAuthorizerSchemaCount/1-2                                                                         8.844µ ± ∞ ¹                                4.514µ ± ∞ ¹        ~ (p=1.000 n=3) ²
+SQLAuthorizerSchemaCount/64-2                                                                        31.62µ ± ∞ ¹                                29.90µ ± ∞ ¹        ~ (p=1.000 n=3) ²
+SQLAuthorizerSchemaCount/256-2                                                                       124.8µ ± ∞ ¹                                122.4µ ± ∞ ¹        ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=1/batch=1-2                                                    12.59m ± ∞ ¹                                12.67m ± ∞ ¹        ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=1/batch=8-2                                                    17.99m ± ∞ ¹                                18.43m ± ∞ ¹        ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=8/batch=1-2                                                    20.49m ± ∞ ¹                                12.63m ± ∞ ¹        ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=8/batch=8-2                                                    13.04m ± ∞ ¹                                13.47m ± ∞ ¹        ~ (p=1.000 n=3) ²
+geomean                                                                                              1.591m                                      1.150m        -27.75%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                                  │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                  │                             B/op                              │                    B/op                     vs base                │
+GraphApply-2                                                                                        144.5Ki ± ∞ ¹                                140.0Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+LatticeAppMetadataUpdate4096Keys-2                                                                  2.281Mi ± ∞ ¹                                2.288Mi ± ∞ ¹       ~ (p=0.100 n=3) ²
+GraphQuery4096Nodes-2                                                                               6.908Mi ± ∞ ¹                                6.915Mi ± ∞ ¹       ~ (p=0.700 n=3) ²
+SQLBatchApply/1-2                                                                                   10.21Ki ± ∞ ¹                                10.21Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+SQLBatchApply/8-2                                                                                   54.90Ki ± ∞ ¹                                54.90Ki ± ∞ ¹       ~ (p=0.800 n=3) ²
+SQLBatchApply/32-2                                                                                  207.4Ki ± ∞ ¹                                208.4Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+SQLBatchApply/64-2                                                                                  413.1Ki ± ∞ ¹                                412.9Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+SQLBatchApply/128-2                                                                                 829.9Ki ± ∞ ¹                                826.9Ki ± ∞ ¹       ~ (p=0.400 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                              563.0 ± ∞ ¹                                  536.0 ± ∞ ¹       ~ (p=0.200 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                             596.0 ± ∞ ¹                                  590.0 ± ∞ ¹       ~ (p=0.700 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                             572.0 ± ∞ ¹                                  572.0 ± ∞ ¹       ~ (p=0.700 n=3) ²
+SQLAuthorizerSchemaCount/1-2                                                                          240.0 ± ∞ ¹                                  240.0 ± ∞ ¹       ~ (p=1.000 n=3) ³
+SQLAuthorizerSchemaCount/64-2                                                                         240.0 ± ∞ ¹                                  240.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+SQLAuthorizerSchemaCount/256-2                                                                        241.0 ± ∞ ¹                                  241.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=1/batch=1-2                                                   933.9Ki ± ∞ ¹                                933.9Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=1/batch=8-2                                                   3.867Mi ± ∞ ¹                                3.868Mi ± ∞ ¹       ~ (p=0.200 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=8/batch=1-2                                                   170.3Ki ± ∞ ¹                                170.3Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=8/batch=8-2                                                   612.4Ki ± ∞ ¹                                612.4Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                             40.47Ki                                      40.28Ki        -0.48%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+
+                                                  │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                  │                           allocs/op                           │                 allocs/op                   vs base                │
+GraphApply-2                                                                                          860.0 ± ∞ ¹                                  848.0 ± ∞ ¹       ~ (p=0.700 n=3) ²
+LatticeAppMetadataUpdate4096Keys-2                                                                   51.56k ± ∞ ¹                                 51.56k ± ∞ ¹       ~ (p=0.400 n=3) ²
+GraphQuery4096Nodes-2                                                                                176.8k ± ∞ ¹                                 177.3k ± ∞ ¹       ~ (p=0.700 n=3) ²
+SQLBatchApply/1-2                                                                                     214.0 ± ∞ ¹                                  214.0 ± ∞ ¹       ~ (p=0.600 n=3) ²
+SQLBatchApply/8-2                                                                                    1.019k ± ∞ ¹                                 1.018k ± ∞ ¹       ~ (p=0.900 n=3) ²
+SQLBatchApply/32-2                                                                                   3.715k ± ∞ ¹                                 3.723k ± ∞ ¹       ~ (p=0.400 n=3) ²
+SQLBatchApply/64-2                                                                                   7.315k ± ∞ ¹                                 7.325k ± ∞ ¹       ~ (p=0.800 n=3) ²
+SQLBatchApply/128-2                                                                                  14.56k ± ∞ ¹                                 14.58k ± ∞ ¹       ~ (p=0.700 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                              7.000 ± ∞ ¹                                  7.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                             7.000 ± ∞ ¹                                  7.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                             7.000 ± ∞ ¹                                  7.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+SQLAuthorizerSchemaCount/1-2                                                                          9.000 ± ∞ ¹                                  9.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+SQLAuthorizerSchemaCount/64-2                                                                         9.000 ± ∞ ¹                                  9.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+SQLAuthorizerSchemaCount/256-2                                                                        9.000 ± ∞ ¹                                  9.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+GraphPruneSparseSlotsAndBatchSize/gap=1/batch=1-2                                                    9.774k ± ∞ ¹                                 9.774k ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=1/batch=8-2                                                    42.45k ± ∞ ¹                                 42.45k ± ∞ ¹       ~ (p=0.200 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=8/batch=1-2                                                    1.418k ± ∞ ¹                                 1.418k ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphPruneSparseSlotsAndBatchSize/gap=8/batch=8-2                                                    6.175k ± ∞ ¹                                 6.175k ± ∞ ¹       ~ (p=1.000 n=3) ³
+geomean                                                                                               663.1                                        662.8        -0.04%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+
+                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                          │                            db-MiB                             │                   db-MiB                    vs base                │
+GraphSnapshotFreezeByDatabaseSize/1MiB-2                                                      1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/16MiB-2                                                     16.00 ± ∞ ¹                                  16.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+GraphSnapshotFreezeByDatabaseSize/64MiB-2                                                     64.00 ± ∞ ¹                                  64.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                       10.08                                        10.08        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+pkg: github.com/mrchypark/rhiza/pkg/network
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                            sec/op                             │                   sec/op                    vs base                │
+ThreePeerSQLExecute/c4-2                                                                    4.014m ± ∞ ¹                                 3.945m ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecute/c16-2                                                                   1.135m ± ∞ ¹                                 1.243m ± ∞ ¹       ~ (p=0.700 n=3) ²
+ThreePeerSQLExecute/c64-2                                                                   326.9µ ± ∞ ¹                                 308.3µ ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows1-2                                                        13.14m ± ∞ ¹                                 12.93m ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows100-2                                                      14.71m ± ∞ ¹                                 14.97m ± ∞ ¹       ~ (p=0.700 n=3) ²
+ThreePeerSQLExecuteReturning/bytes1MiB-2                                                    37.32m ± ∞ ¹                                 35.55m ± ∞ ¹       ~ (p=1.000 n=3) ²
+CertifiedThreePeerSQLExecute/c4-2                                                           4.746m ± ∞ ¹                                 5.335m ± ∞ ¹       ~ (p=1.000 n=3) ²
+CertifiedThreePeerSQLExecute/c16-2                                                          1.311m ± ∞ ¹                                 1.746m ± ∞ ¹       ~ (p=1.000 n=3) ²
+CertifiedThreePeerSQLExecute/c64-2                                                          478.3µ ± ∞ ¹                                 393.8µ ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                     3.166m                                       3.229m        +1.98%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                             B/op                              │                    B/op                     vs base                │
+ThreePeerSQLExecute/c4-2                                                                   17.23Ki ± ∞ ¹                                17.32Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecute/c16-2                                                                  11.86Ki ± ∞ ¹                                11.98Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecute/c64-2                                                                  10.98Ki ± ∞ ¹                                10.96Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ThreePeerSQLExecuteReturning/rows1-2                                                       46.20Ki ± ∞ ¹                                46.05Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows100-2                                                     100.1Ki ± ∞ ¹                                100.4Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ThreePeerSQLExecuteReturning/bytes1MiB-2                                                   5.051Mi ± ∞ ¹                                5.053Mi ± ∞ ¹       ~ (p=0.400 n=3) ²
+CertifiedThreePeerSQLExecute/c4-2                                                          15.59Ki ± ∞ ¹                                16.62Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+CertifiedThreePeerSQLExecute/c16-2                                                        10.206Ki ± ∞ ¹                                9.893Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+CertifiedThreePeerSQLExecute/c64-2                                                         9.242Ki ± ∞ ¹                                8.934Ki ± ∞ ¹       ~ (p=0.100 n=3) ²
+geomean                                                                                    35.01Ki                                      35.06Ki        +0.14%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                           allocs/op                           │                 allocs/op                   vs base                │
+ThreePeerSQLExecute/c4-2                                                                     199.0 ± ∞ ¹                                  202.0 ± ∞ ¹       ~ (p=0.800 n=3) ²
+ThreePeerSQLExecute/c16-2                                                                    145.0 ± ∞ ¹                                  145.0 ± ∞ ¹       ~ (p=0.600 n=3) ²
+ThreePeerSQLExecute/c64-2                                                                    134.0 ± ∞ ¹                                  134.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows1-2                                                         601.0 ± ∞ ¹                                  600.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows100-2                                                      2.408k ± ∞ ¹                                 2.410k ± ∞ ¹       ~ (p=0.700 n=3) ²
+ThreePeerSQLExecuteReturning/bytes1MiB-2                                                     700.0 ± ∞ ¹                                  706.0 ± ∞ ¹       ~ (p=0.400 n=3) ²
+CertifiedThreePeerSQLExecute/c4-2                                                            175.0 ± ∞ ¹                                  179.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+CertifiedThreePeerSQLExecute/c16-2                                                           117.0 ± ∞ ¹                                  115.0 ± ∞ ¹       ~ (p=0.600 n=3) ²
+CertifiedThreePeerSQLExecute/c64-2                                                           104.0 ± ∞ ¹                                  104.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                      272.7                                        273.6        +0.31%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                   │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                   │                         commands/slot                         │               commands/slot                 vs base                │
+ThreePeerSQLExecute/c4-2                                                               3.857 ± ∞ ¹                                  3.778 ± ∞ ¹       ~ (p=0.800 n=3) ²
+ThreePeerSQLExecute/c16-2                                                              15.11 ± ∞ ¹                                  15.14 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecute/c64-2                                                              56.25 ± ∞ ¹                                  59.38 ± ∞ ¹       ~ (p=0.200 n=3) ²
+CertifiedThreePeerSQLExecute/c4-2                                                      3.571 ± ∞ ¹                                  3.500 ± ∞ ¹       ~ (p=1.000 n=3) ²
+CertifiedThreePeerSQLExecute/c16-2                                                     14.67 ± ∞ ¹                                  15.80 ± ∞ ¹       ~ (p=0.700 n=3) ²
+CertifiedThreePeerSQLExecute/c64-2                                                     52.40 ± ∞ ¹                                  57.86 ± ∞ ¹       ~ (p=0.400 n=3) ²
+geomean                                                                                14.42                                        14.88        +3.19%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                       payload-bytes/op                        │              payload-bytes/op               vs base                │
+ThreePeerSQLExecuteReturning/rows1-2                                                         0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows100-2                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/bytes1MiB-2                                                  1023.9Ki ± ∞ ¹                               1023.9Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                                ³                                               +0.00%               ³
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ summaries must be >0 to compute geomean
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                            rows/op                            │                  rows/op                    vs base                │
+ThreePeerSQLExecuteReturning/rows1-2                                                         1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/rows100-2                                                       100.0 ± ∞ ¹                                  100.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ThreePeerSQLExecuteReturning/bytes1MiB-2                                                     1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                      4.642                                        4.642        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+pkg: github.com/mrchypark/rhiza/pkg/qlog
+                 │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                 │                            sec/op                             │                  sec/op                    vs base                 │
+WALScanScratch-2                                                    642.9µ ± ∞ ¹                                612.6µ ± ∞ ¹        ~ (p=0.400 n=3) ²
+WALAppendSync-2                                                     4.891m ± ∞ ¹                                4.029m ± ∞ ¹        ~ (p=0.100 n=3) ²
+geomean                                                             1.773m                                      1.571m        -11.41%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                 │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                 │                             B/op                              │                    B/op                     vs base                │
+WALScanScratch-2                                                   1.005Mi ± ∞ ¹                                1.005Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALAppendSync-2                                                      320.0 ± ∞ ¹                                  320.0 ± ∞ ¹       ~ (p=1.000 n=3) ³
+geomean                                                            17.93Ki                                      17.93Ki        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+
+                 │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                 │                           allocs/op                           │                 allocs/op                   vs base                │
+WALScanScratch-2                                                     259.0 ± ∞ ¹                                  259.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+WALAppendSync-2                                                      1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                              16.09                                        16.09        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+pkg: github.com/mrchypark/rhiza/pkg/quepaxa
+                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                          │                            sec/op                             │                   sec/op                    vs base                │
+CoreProposeThreePeersParallel-2                                                              39.64m ± ∞ ¹                                 38.49m ± ∞ ¹       ~ (p=0.700 n=3) ²
+CoreProposeCertifiedThreePeersParallel-2                                                     26.94m ± ∞ ¹                                 24.18m ± ∞ ¹       ~ (p=0.700 n=3) ²
+DecisionsFromBounded/small-2                                                                 31.89µ ± ∞ ¹                                 29.55µ ± ∞ ¹       ~ (p=0.100 n=3) ²
+DecisionsFromBounded/max-value-2                                                             36.90µ ± ∞ ¹                                 36.52µ ± ∞ ¹       ~ (p=0.700 n=3) ²
+DecisionsFromBounded/large-certificate-2                                                     57.57µ ± ∞ ¹                                 56.73µ ± ∞ ¹       ~ (p=0.400 n=3) ²
+EnsureDurableThroughRetainedPrefix/1-2                                                       44.58n ± ∞ ¹                                 39.36n ± ∞ ¹       ~ (p=0.700 n=3) ²
+EnsureDurableThroughRetainedPrefix/64-2                                                      1.996µ ± ∞ ¹                                 3.131µ ± ∞ ¹       ~ (p=0.400 n=3) ²
+EnsureDurableThroughRetainedPrefix/1024-2                                                    39.44µ ± ∞ ¹                                 37.11µ ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                      63.18µ                                       63.38µ        +0.32%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                          │                             B/op                              │                    B/op                     vs base                │
+CoreProposeThreePeersParallel-2                                                             58.66Ki ± ∞ ¹                                58.53Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+CoreProposeCertifiedThreePeersParallel-2                                                    25.48Ki ± ∞ ¹                                25.06Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+DecisionsFromBounded/small-2                                                                231.1Ki ± ∞ ¹                                231.1Ki ± ∞ ¹       ~ (p=1.000 n=3) ³
+DecisionsFromBounded/max-value-2                                                            906.9Ki ± ∞ ¹                                906.9Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+DecisionsFromBounded/large-certificate-2                                                    1.002Mi ± ∞ ¹                                1.002Mi ± ∞ ¹       ~ (p=1.000 n=3) ³
+EnsureDurableThroughRetainedPrefix/1-2                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+EnsureDurableThroughRetainedPrefix/64-2                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+EnsureDurableThroughRetainedPrefix/1024-2                                                     0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+geomean                                                                                                 ⁴                                               -0.23%               ⁴
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+⁴ summaries must be >0 to compute geomean
+
+                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                          │                           allocs/op                           │                 allocs/op                   vs base                │
+CoreProposeThreePeersParallel-2                                                               365.0 ± ∞ ¹                                  371.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+CoreProposeCertifiedThreePeersParallel-2                                                      243.0 ± ∞ ¹                                  242.0 ± ∞ ¹       ~ (p=0.800 n=3) ²
+DecisionsFromBounded/small-2                                                                  257.0 ± ∞ ¹                                  257.0 ± ∞ ¹       ~ (p=1.000 n=3) ³
+DecisionsFromBounded/max-value-2                                                              15.00 ± ∞ ¹                                  15.00 ± ∞ ¹       ~ (p=1.000 n=3) ³
+DecisionsFromBounded/large-certificate-2                                                      31.00 ± ∞ ¹                                  31.00 ± ∞ ¹       ~ (p=1.000 n=3) ³
+EnsureDurableThroughRetainedPrefix/1-2                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+EnsureDurableThroughRetainedPrefix/64-2                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+EnsureDurableThroughRetainedPrefix/1024-2                                                     0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+geomean                                                                                                 ⁴                                               +0.15%               ⁴
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+⁴ summaries must be >0 to compute geomean
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                              B/s                              │                    B/s                      vs base                │
+DecisionsFromBounded/small-2                                                               6.453Gi ± ∞ ¹                                6.965Gi ± ∞ ¹       ~ (p=0.100 n=3) ²
+DecisionsFromBounded/max-value-2                                                           23.28Gi ± ∞ ¹                                23.52Gi ± ∞ ¹       ~ (p=0.700 n=3) ²
+DecisionsFromBounded/large-certificate-2                                                   16.90Gi ± ∞ ¹                                17.15Gi ± ∞ ¹       ~ (p=0.400 n=3) ²
+geomean                                                                                    13.64Gi                                      14.11Gi        +3.44%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                         fixture-items                         │               fixture-items                 vs base                │
+DecisionsFromBounded/small-2                                                                 128.0 ± ∞ ¹                                  128.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+DecisionsFromBounded/max-value-2                                                             64.00 ± ∞ ¹                                  64.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+DecisionsFromBounded/large-certificate-2                                                     64.00 ± ∞ ¹                                  64.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                      80.63                                        80.63        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                         │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                         │                         payload-B/op                          │                payload-B/op                 vs base                │
+DecisionsFromBounded/small-2                                                               215.8Ki ± ∞ ¹                                215.8Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+DecisionsFromBounded/max-value-2                                                           900.8Ki ± ∞ ¹                                900.8Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+DecisionsFromBounded/large-certificate-2                                                  1020.0Ki ± ∞ ¹                               1020.0Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                    583.1Ki                                      583.1Ki        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+pkg: github.com/mrchypark/rhiza/pkg/recovery
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                            sec/op                             │                  sec/op                    vs base                 │
+ArchiveMemoryPublication/short-one-extent-2                                                                                                  16.18m ± ∞ ¹                                12.94m ± ∞ ¹        ~ (p=0.400 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                                                                 105.90m ± ∞ ¹                                71.12m ± ∞ ¹        ~ (p=0.200 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                                                           32.07m ± ∞ ¹                                14.95m ± ∞ ¹        ~ (p=0.100 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                       9.834µ ± ∞ ¹                                9.500µ ± ∞ ¹        ~ (p=0.100 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                       7.327µ ± ∞ ¹                                6.961µ ± ∞ ¹        ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                              163.2µ ± ∞ ¹                                152.4µ ± ∞ ¹        ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                              2.564m ± ∞ ¹                                1.612m ± ∞ ¹        ~ (p=0.400 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                               273.4µ ± ∞ ¹                                267.7µ ± ∞ ¹        ~ (p=0.400 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                               253.7µ ± ∞ ¹                                240.3µ ± ∞ ¹        ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                      1.176m ± ∞ ¹                                1.129m ± ∞ ¹        ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                      3.205m ± ∞ ¹                                2.834m ± ∞ ¹        ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                             2.126m ± ∞ ¹                                2.080m ± ∞ ¹        ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                             1.391m ± ∞ ¹                                1.360m ± ∞ ¹        ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                    3.055m ± ∞ ¹                                2.953m ± ∞ ¹        ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                    5.222m ± ∞ ¹                                4.802m ± ∞ ¹        ~ (p=0.200 n=3) ²
+geomean                                                                                                                                      1.223m                                      1.042m        -14.81%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                             B/op                              │                    B/op                     vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                                                                 2.789Mi ± ∞ ¹                                2.788Mi ± ∞ ¹       ~ (p=0.400 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                                                                 16.28Mi ± ∞ ¹                                16.28Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                                                          8.920Mi ± ∞ ¹                                8.919Mi ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                      5.362Ki ± ∞ ¹                                5.362Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                      3.063Ki ± ∞ ¹                                3.063Ki ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                             39.36Ki ± ∞ ¹                                39.37Ki ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                             229.3Ki ± ∞ ¹                                228.8Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                              272.3Ki ± ∞ ¹                                272.3Ki ± ∞ ¹       ~ (p=0.400 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                              176.1Ki ± ∞ ¹                                176.0Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                     1.736Mi ± ∞ ¹                                1.735Mi ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                     1.919Mi ± ∞ ¹                                1.918Mi ± ∞ ¹       ~ (p=0.400 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                            16.00Mi ± ∞ ¹                                16.00Mi ± ∞ ¹       ~ (p=0.400 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                            8.001Mi ± ∞ ¹                                8.001Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                   24.28Mi ± ∞ ¹                                24.28Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                   24.47Mi ± ∞ ¹                                24.47Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                                                                     993.3Ki                                      993.0Ki        -0.03%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                           allocs/op                           │                 allocs/op                   vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                                                                  8.327k ± ∞ ¹                                 8.320k ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                                                                  45.40k ± ∞ ¹                                 45.40k ± ∞ ¹       ~ (p=0.800 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                                                           19.75k ± ∞ ¹                                 19.74k ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        11.00 ± ∞ ¹                                  11.00 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        11.00 ± ∞ ¹                                  11.00 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                               136.0 ± ∞ ¹                                  136.0 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                               549.0 ± ∞ ¹                                  546.0 ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                30.00 ± ∞ ¹                                  30.00 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                27.00 ± ∞ ¹                                  27.00 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                       461.0 ± ∞ ¹                                  461.0 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                       850.0 ± ∞ ¹                                  849.0 ± ∞ ¹       ~ (p=0.500 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              8.000 ± ∞ ¹                                  8.000 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              6.000 ± ∞ ¹                                  6.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                     84.00 ± ∞ ¹                                  84.00 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                     473.0 ± ∞ ¹                                  475.0 ± ∞ ¹       ~ (p=0.400 n=3) ²
+geomean                                                                                                                                       203.0                                        202.9        -0.02%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+
+                                                   │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                   │                              B/s                              │                    B/s                     vs base                 │
+ArchiveMemoryPublication/short-one-extent-2                                                          65.65Mi ± ∞ ¹                               82.08Mi ± ∞ ¹        ~ (p=0.400 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                          60.21Mi ± ∞ ¹                               89.65Mi ± ∞ ¹        ~ (p=0.200 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                   33.11Mi ± ∞ ¹                               71.05Mi ± ∞ ¹        ~ (p=0.100 n=3) ²
+geomean                                                                                              50.77Mi                                     80.56Mi        +58.68%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                            ATTR/op                            │                  ATTR/op                    vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                                                                   2.000 ± ∞ ¹                                  2.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                                                                   2.000 ± ∞ ¹                                  2.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                                                            5.000 ± ∞ ¹                                  5.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                               3.000 ± ∞ ¹                                  3.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                               15.02 ± ∞ ¹                                  15.73 ± ∞ ¹       ~ (p=0.800 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                       3.000 ± ∞ ¹                                  3.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                       15.03 ± ∞ ¹                                  15.03 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                     3.000 ± ∞ ¹                                  3.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                     15.05 ± ∞ ¹                                  15.05 ± ∞ ¹       ~ (p=0.700 n=3) ³
+geomean                                                                                                                                                 ⁴                                               +0.31%               ⁴
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ need >= 4 samples to detect a difference at alpha level 0.05
+⁴ summaries must be >0 to compute geomean
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                            GET/op                             │                   GET/op                    vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                                                                   1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                                                                   1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                                                            3.000 ± ∞ ¹                                  3.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                               3.000 ± ∞ ¹                                  3.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                               8.019 ± ∞ ¹                                  8.731 ± ∞ ¹       ~ (p=0.700 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                       3.000 ± ∞ ¹                                  3.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                       8.026 ± ∞ ¹                                  8.028 ± ∞ ¹       ~ (p=0.300 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                     1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                     6.048 ± ∞ ¹                                  6.048 ± ∞ ¹       ~ (p=0.700 n=3) ³
+geomean                                                                                                                                                 ⁴                                               +0.57%               ⁴
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ need >= 4 samples to detect a difference at alpha level 0.05
+⁴ summaries must be >0 to compute geomean
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                            PUT/op                             │                   PUT/op                    vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                                                                   2.000 ± ∞ ¹                                  2.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                                                                   7.000 ± ∞ ¹                                  7.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                                                            4.000 ± ∞ ¹                                  4.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                               0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                               4.000 ± ∞ ¹                                  4.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                       4.000 ± ∞ ¹                                  4.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                     0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                     4.000 ± ∞ ¹                                  4.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                                                                                 ³                                               +0.00%               ³
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ summaries must be >0 to compute geomean
+
+                                                   │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                   │                     decision-payload-B/op                     │           decision-payload-B/op             vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                          1.062Mi ± ∞ ¹                                1.062Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                          6.376Mi ± ∞ ¹                                6.376Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                   1.062Mi ± ∞ ¹                                1.062Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                              1.930Mi                                      1.930Mi        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                                   │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                   │                          extents/op                           │                 extents/op                  vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                            1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                            6.000 ± ∞ ¹                                  6.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                     1.000 ± ∞ ¹                                  1.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                                1.817                                        1.817        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                                   │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                   │                         uploaded-B/op                         │               uploaded-B/op                 vs base                │
+ArchiveMemoryPublication/short-one-extent-2                                                          1.070Mi ± ∞ ¹                                1.070Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/long-six-extents-2                                                          6.424Mi ± ∞ ¹                                6.424Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveMemoryPublication/cas-conflict-one-extent-2                                                   1.070Mi ± ∞ ¹                                1.070Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                              1.945Mi                                      1.945Mi        +0.00%
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                           HEAD-B/op                           │                 HEAD-B/op                   vs base                │
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                      1.888Ki ± ∞ ¹                                1.904Ki ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                      1.888Ki ± ∞ ¹                                1.904Ki ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                             1.888Ki ± ∞ ¹                                1.904Ki ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                             1.888Ki ± ∞ ¹                                1.904Ki ± ∞ ¹       ~ (p=0.200 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                              93.53Ki ± ∞ ¹                                93.55Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                              93.53Ki ± ∞ ¹                                93.55Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                     93.53Ki ± ∞ ¹                                93.55Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                     93.53Ki ± ∞ ¹                                93.55Ki ± ∞ ¹       ~ (p=0.700 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                            8.000Mi ± ∞ ¹                                8.000Mi ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                            8.000Mi ± ∞ ¹                                8.000Mi ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                   8.000Mi ± ∞ ¹                                8.000Mi ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                   8.000Mi ± ∞ ¹                                8.000Mi ± ∞ ¹       ~ (p=1.000 n=3) ³
+geomean                                                                                                                                     113.1Ki                                      113.4Ki        +0.30%
+¹ need >= 6 samples for confidence interval at level 0.95
+² need >= 4 samples to detect a difference at alpha level 0.05
+³ all samples are equal
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                            ITER/op                            │                  ITER/op                    vs base                │
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                               0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                               0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                     0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                     0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+geomean                                                                                                                                                 ³                                               +0.00%               ³
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ summaries must be >0 to compute geomean
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                           read-B/op                           │                 read-B/op                   vs base                │
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                             7.249Ki ± ∞ ¹                                7.299Ki ± ∞ ¹       ~ (p=0.200 n=3) ³
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                             8.049Ki ± ∞ ¹                                8.240Ki ± ∞ ¹       ~ (p=0.200 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                     511.6Ki ± ∞ ¹                                511.6Ki ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                     512.3Ki ± ∞ ¹                                512.3Ki ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                   8.000Mi ± ∞ ¹                                8.000Mi ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                   8.001Mi ± ∞ ¹                                8.001Mi ± ∞ ¹       ~ (p=0.700 n=3) ³
+geomean                                                                                                                                                 ⁴                                               +0.25%               ⁴
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ need >= 4 samples to detect a difference at alpha level 0.05
+⁴ summaries must be >0 to compute geomean
+
+                                                                                          │ benchmarks/results/2026-09-29-issue-184/paired-local/base.txt │ benchmarks/results/2026-09-29-issue-184/paired-local/candidate.txt │
+                                                                                          │                          write-B/op                           │                 write-B/op                  vs base                │
+ArchiveHeadEvidenceStages/small-authenticated/encode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/decode-2                                                                                        0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/stable-readback-2                                                                               0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/small-authenticated/pinned-snapshot-2                                                                               693.8 ± ∞ ¹                                  694.8 ± ∞ ¹       ~ (p=1.000 n=3) ³
+ArchiveHeadEvidenceStages/large-authenticated-history/encode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/decode-2                                                                                0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/stable-readback-2                                                                       0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/large-authenticated-history/pinned-snapshot-2                                                                       692.6 ± ∞ ¹                                  688.5 ± ∞ ¹       ~ (p=0.700 n=3) ³
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/encode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/decode-2                                                              0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/stable-readback-2                                                     0.000 ± ∞ ¹                                  0.000 ± ∞ ¹       ~ (p=1.000 n=3) ²
+ArchiveHeadEvidenceStages/maximum-combined-format-only-fake-certificate/pinned-snapshot-2                                                     591.3 ± ∞ ¹                                  591.3 ± ∞ ¹       ~ (p=0.700 n=3) ³
+geomean                                                                                                                                                 ⁴                                               -0.04%               ⁴
+¹ need >= 6 samples for confidence interval at level 0.95
+² all samples are equal
+³ need >= 4 samples to detect a difference at alpha level 0.05
+⁴ summaries must be >0 to compute geomean

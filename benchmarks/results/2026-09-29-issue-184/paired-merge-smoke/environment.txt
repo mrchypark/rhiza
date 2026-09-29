@@ -1,0 +1,9 @@
+base_sha=3bde2f62c3f964784696e262968a1cdb5cb176d1
+candidate_sha=6beeff5966e805929b544eafcc228d3b5025872b
+network_optimization=none
+samples=1
+benchtime=50ms
+graph_snapshot_benchtime=20x
+gomaxprocs=2
+go=go version go1.27.0 darwin/arm64
+kernel=Darwin 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:17:12 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T8103 arm64
