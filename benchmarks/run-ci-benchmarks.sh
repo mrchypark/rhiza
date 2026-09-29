@@ -56,6 +56,15 @@ if [[ $network_optimization != none ]]; then
 	done
 fi
 
+# Keep new candidate-only measurements comparable by running identical fixtures
+# against the base implementation.
+for fixture in \
+	pkg/quepaxa/durable_prefix_bench_test.go \
+	pkg/materializer/sql_authorizer_bench_test.go \
+	pkg/materializer/graph_prune_bench_test.go; do
+	git show "$head_sha:$fixture" >"$work_root/base/$fixture"
+done
+
 build_revision() {
 	local label=$1
 	local source=$2
@@ -90,9 +99,9 @@ run_revision() {
 	for package in "${packages[@]}"; do
 		case "$package" in
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
-			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$') ;;
+			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$' '^BenchmarkEnsureDurableThroughRetainedPrefix$') ;;
 			recovery) selected=('^BenchmarkArchiveMemoryPublication$' '^BenchmarkAuthenticatedMembershipCheckpointProof$' '^BenchmarkArchiveHeadEvidenceStages$') ;;
-			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$') ;;
+			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' '^BenchmarkSQLAuthorizerSchemaCount$' '^BenchmarkGraphPruneSparseSlotsAndBatchSize$') ;;
 			network) selected=("$network_benchmark") ;;
 		esac
 		# Go treats benchmark patterns with no match as a successful run, so
@@ -103,6 +112,9 @@ run_revision() {
 			# calibration multiplying expensive untimed database updates.
 			if [[ $benchmark == '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' ]]; then
 				sample_time=20x
+			fi
+			if [[ $benchmark == '^BenchmarkGraphPruneSparseSlotsAndBatchSize$' ]]; then
+				sample_time=1x
 			fi
 		(
 			cd "$source"
