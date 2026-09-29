@@ -1,0 +1,25 @@
+ok  	github.com/mrchypark/rhiza	91.395s
+?   	github.com/mrchypark/rhiza/benchmarks/results/2026-09-05-latticedb-0.5.0/compat	[no test files]
+ok  	github.com/mrchypark/rhiza/cmd/rhiza	3.571s
+ok  	github.com/mrchypark/rhiza/cmd/rhiza-bench	2.699s
+ok  	github.com/mrchypark/rhiza/cmd/rhiza-operator	0.817s
+ok  	github.com/mrchypark/rhiza/deploy/k8s	1.895s
+ok  	github.com/mrchypark/rhiza/deploy/operator	1.170s
+ok  	github.com/mrchypark/rhiza/e2e	2.267s
+ok  	github.com/mrchypark/rhiza/e2e/chaos/embedded-go	5.073s
+?   	github.com/mrchypark/rhiza/examples/operator-embedded	[no test files]
+ok  	github.com/mrchypark/rhiza/examples/recovery-anchor	4.966s
+ok  	github.com/mrchypark/rhiza/internal/objstore	5.273s
+ok  	github.com/mrchypark/rhiza/internal/sqlpolicy	4.987s
+ok  	github.com/mrchypark/rhiza/internal/types	4.963s
+ok  	github.com/mrchypark/rhiza/pkg/checkpoint	7.110s
+ok  	github.com/mrchypark/rhiza/pkg/materializer	168.096s
+ok  	github.com/mrchypark/rhiza/pkg/network	60.190s
+?   	github.com/mrchypark/rhiza/pkg/network/peerfb	[no test files]
+ok  	github.com/mrchypark/rhiza/pkg/node	134.753s
+ok  	github.com/mrchypark/rhiza/pkg/operator	18.136s
+ok  	github.com/mrchypark/rhiza/pkg/qlog	29.487s
+ok  	github.com/mrchypark/rhiza/pkg/quepaxa	158.537s
+?   	github.com/mrchypark/rhiza/pkg/quepaxa/walfb	[no test files]
+ok  	github.com/mrchypark/rhiza/pkg/recovery	112.341s
+ok  	github.com/mrchypark/rhiza/pkg/recoveryanchor	1.848s
