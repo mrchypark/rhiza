@@ -258,6 +258,9 @@ func TestLegacyWideSQLReceipt(t *testing.T) {
 		if _, err := m.db.Exec("UPDATE _rhiza_idempotency SET sql_result = ?", encoded); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := m.db.Exec(`UPDATE _rhiza_meta SET value = (SELECT COALESCE(SUM(length(sql_result)), 0) FROM _rhiza_idempotency WHERE kind = ?) WHERE key = 'sql_receipt_result_bytes'`, types.MutationSQL); err != nil {
+			t.Fatal(err)
+		}
 		if err := m.Close(); err != nil {
 			t.Fatal(err)
 		}

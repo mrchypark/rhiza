@@ -1044,7 +1044,7 @@ func TestCheckpointRejectsUnmarkedSQLiteSource(t *testing.T) {
 	if _, err = manager.CreateFiles(ctx, claim, []Source{{Role: RoleSQLite, Path: file}}, 1); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 		t.Fatalf("source: %v", err)
 	}
-	for _, version := range []int{0, 1, 2, 3, 4, 6} {
+	for _, version := range []int{0, 1, 2, 3, 4, 5} {
 		root := Checkpoint{SQLExecutionPolicy: version, ConfigID: 1, Index: 1}
 		if _, err = manager.DownloadAndVerifyRootFiles(ctx, &root, t.TempDir()); !errors.Is(err, sqlpolicy.ErrIncompatible) {
 			t.Fatalf("root: %v", err)
