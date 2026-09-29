@@ -910,22 +910,115 @@ func TestGraphResultUsesAggregateByteBudget(t *testing.T) {
 	}
 }
 
-func TestRetryableGraphApplyErrorOnlyMatchesTransientContention(t *testing.T) {
-	checkpoint := fmt.Errorf("%w: WAL checkpoint is in progress", latticedb.ErrResourceLimit)
-	if !isRetryableGraphApplyError(checkpoint) {
-		t.Fatalf("checkpoint backpressure = %v, want retryable", checkpoint)
-	}
-	if !isRetryableGraphApplyError(latticedb.ErrWriteTxActive) {
-		t.Fatal("active writer = not retryable")
-	}
-	for _, err := range []error{
-		fmt.Errorf("%w: query rows exceed 1", latticedb.ErrResourceLimit),
-		context.DeadlineExceeded,
-		fmt.Errorf("execution failed"),
+func TestGraphQueryRejectionRequiresParseErrorWithoutInfrastructureCause(t *testing.T) {
+	parse := &latticedb.QueryError{Stage: latticedb.QueryErrorStageParse}
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "parse", err: parse, want: true},
+		{name: "execution", err: &latticedb.QueryError{Stage: latticedb.QueryErrorStageExecution}},
+		{name: "unknown", err: errors.New("unknown upstream error")},
+		{name: "joined io", err: errors.Join(parse, &latticedb.Error{Code: latticedb.ErrorIO, Message: "io"})},
+		{name: "io query code", err: &latticedb.QueryError{Code: latticedb.ErrorIO, Stage: latticedb.QueryErrorStageParse}},
+		{name: "cancellation", err: errors.Join(parse, context.Canceled)},
+		{name: "resource limit", err: errors.Join(parse, latticedb.ErrResourceLimit)},
 	} {
-		if isRetryableGraphApplyError(err) {
-			t.Fatalf("error = %v, unexpectedly retryable", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDeterministicGraphQueryError(tc.err); got != tc.want {
+				t.Fatalf("isDeterministicGraphQueryError(%v)=%v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnknownGraphQueryErrorsDoNotPersistRejection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "unknown", err: errors.New("unknown upstream error")},
+		{name: "wrapped io", err: fmt.Errorf("query: %w", &latticedb.Error{Code: latticedb.ErrorIO, Message: "io"})},
+		{name: "joined parse and io", err: errors.Join(&latticedb.QueryError{Stage: latticedb.QueryErrorStageParse}, &latticedb.Error{Code: latticedb.ErrorIO, Message: "io"})},
+		{name: "joined parse and cancel", err: errors.Join(&latticedb.QueryError{Stage: latticedb.QueryErrorStageParse}, context.Canceled)},
+		{name: "joined parse and resource limit", err: errors.Join(&latticedb.QueryError{Stage: latticedb.QueryErrorStageParse}, latticedb.ErrResourceLimit)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "graph.db")
+			m, err := Open(path, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			command := types.GraphCommand{RequestID: "request", Cypher: `CREATE (:Item {id: 'once'})`}
+			value, err := types.EncodeGraphCommand(command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.graph.queryError = func() error { return tc.err }
+			if err := m.Apply(context.Background(), 1, value); err == nil {
+				t.Fatal("Apply error=nil, want infrastructure/unknown abort")
+			}
+			if receipt, found, err := m.GraphMutationReceipt(context.Background(), command.RequestID); err != nil || found {
+				t.Fatalf("receipt after abort=%+v found=%v err=%v, want absent", receipt, found, err)
+			}
+			if m.Tip() != 0 {
+				t.Fatalf("tip after abort=%d, want 0", m.Tip())
+			}
+			m.graph.queryError = nil
+			if err := m.Apply(context.Background(), 1, value); err != nil {
+				t.Fatalf("Apply after abort: %v", err)
+			}
+			rows, err := m.GraphQuery(context.Background(), `MATCH (n:Item) RETURN n.id`, nil)
+			if err != nil || len(rows.Rows) != 1 {
+				t.Fatalf("rows=%v err=%v, want one applied mutation", rows.Rows, err)
+			}
+		})
+	}
+}
+
+func TestRejectedGraphCommandReceiptWriteFailureIsNotPersisted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "graph.db")
+	m, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := types.GraphCommand{RequestID: "invalid", Cypher: `MATCH (`}
+	value, err := types.EncodeGraphCommand(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.graph.failureError = func() error {
+		return fmt.Errorf("record rejection: %w", &latticedb.Error{Code: latticedb.ErrorIO, Message: "injected I/O failure"})
+	}
+	if err := m.Apply(context.Background(), 1, value); err == nil {
+		t.Fatal("Apply error=nil, want rejection receipt write failure")
+	}
+	if receipt, found, err := m.GraphMutationReceipt(context.Background(), command.RequestID); err != nil || found {
+		t.Fatalf("receipt after write failure=%+v found=%v err=%v, want absent", receipt, found, err)
+	}
+	if m.Tip() != 0 {
+		t.Fatalf("tip after write failure=%d, want 0", m.Tip())
+	}
+	m.graph.failureError = nil
+	if err := m.Apply(context.Background(), 1, value); err != nil {
+		t.Fatalf("Apply retry: %v", err)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Apply(context.Background(), 1, value); err != nil {
+		t.Fatalf("exact replay after reopen: %v", err)
+	}
+	receipt, found, err := reopened.GraphMutationReceipt(context.Background(), command.RequestID)
+	if err != nil || !found || receipt.Status != types.MutationRejected || reopened.Tip() != 1 {
+		t.Fatalf("reopened receipt=%+v found=%v tip=%d err=%v, want durable rejection", receipt, found, reopened.Tip(), err)
 	}
 }
 
@@ -946,8 +1039,8 @@ func TestGraphSnapshotGrowthBackpressureIsRetryable(t *testing.T) {
 			write := func(tx *latticedb.Tx) error {
 				return tx.PutAppMetadata([]byte("backpressure-test"), payload)
 			}
-			if err := m.graph.db.Update(write); !errors.Is(err, latticedb.ErrResourceLimit) || !isRetryableGraphApplyError(err) {
-				t.Fatalf("snapshot backpressure = %v, want retryable resource limit", err)
+			if err := m.graph.db.Update(write); !errors.Is(err, latticedb.ErrResourceLimit) {
+				t.Fatalf("snapshot backpressure = %v, want resource limit", err)
 			}
 			if err := snapshot.Close(); err != nil {
 				t.Fatal(err)
