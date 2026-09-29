@@ -7,9 +7,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -602,30 +604,76 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	type workerResult struct {
+		worker      int
+		request     int
+		phase       string
+		slot        Slot
+		tipBefore   Slot
+		orderBefore []NodeID
+		elapsed     time.Duration
+		err         error
+	}
 	jobs := make(chan int, 400)
-	errs := make(chan error, 8)
-	for range 8 {
-		go func() {
+	results := make(chan workerResult, 8)
+	for worker := range 8 {
+		go func(worker int) {
+			last := workerResult{worker: worker, request: -1, phase: "waiting-for-job"}
 			for i := range jobs {
 				value := make([]byte, 8)
 				binary.LittleEndian.PutUint64(value, uint64(i))
-				if _, _, err := cores["n2"].Propose(ctx, value); err != nil {
-					errs <- err
+				last = workerResult{
+					worker:      worker,
+					request:     i,
+					phase:       "Propose",
+					tipBefore:   cores["n2"].Tip(),
+					orderBefore: cores["n2"].ProposerOrder(),
+				}
+				started := time.Now()
+				last.slot, _, last.err = cores["n2"].Propose(ctx, value)
+				last.elapsed = time.Since(started)
+				if last.err != nil {
+					results <- last
 					return
 				}
 			}
-			errs <- nil
-		}()
+			last.phase = "worker-drained"
+			results <- last
+		}(worker)
 	}
 	for i := range 400 {
 		jobs <- i
 	}
 	close(jobs)
+	var failures []workerResult
 	for range 8 {
-		if err := <-errs; err != nil {
-			t.Fatalf("tip=%d next-decided=%t err=%v", cores["n2"].Tip(), cores["n2"].IsDecided(cores["n2"].Tip()+1), err)
+		result := <-results
+		if result.err != nil {
+			failures = append(failures, result)
 		}
 	}
+	if len(failures) == 0 {
+		return
+	}
+
+	core := cores["n2"]
+	tip := core.Tip()
+	from := Slot(1)
+	if tip > 16 {
+		from = tip - 15
+	}
+	decisions, through, tailErr := core.DecisionsFrom(from, 16)
+	tail := make([]string, 0, len(decisions))
+	for _, decision := range decisions {
+		if len(decision.Value) == 8 {
+			tail = append(tail, fmt.Sprintf("%d:value=%d", decision.Slot, binary.LittleEndian.Uint64(decision.Value)))
+			continue
+		}
+		tail = append(tail, fmt.Sprintf("%d:value-bytes=%d", decision.Slot, len(decision.Value)))
+	}
+	t.Fatalf("Propose workers failed: failures=%+v replica-tips={n1:%d n2:%d n3:%d} n2-next-decided=%t n2-next-proposers=%v n2-tail=[%s] through=%d tail-err=%v",
+		failures,
+		cores["n1"].Tip(), core.Tip(), cores["n3"].Tip(), core.IsDecided(core.Tip()+1), core.ProposerOrder(), strings.Join(tail, ","), through, tailErr)
 }
 
 func TestOneOfThreeCannotDecide(t *testing.T) {
