@@ -26,6 +26,15 @@ type readErrorBucket struct {
 	thanosobjstore.Bucket
 }
 
+type uploadErrorBucket struct{ thanosobjstore.Bucket }
+
+func (b *uploadErrorBucket) Upload(_ context.Context, _ string, reader io.Reader, _ ...thanosobjstore.ObjectUploadOption) error {
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return err
+	}
+	return errors.New("upload failed after reading body")
+}
+
 func (b *readErrorBucket) Get(context.Context, string) (io.ReadCloser, error) {
 	return &readErrorCloser{Reader: strings.NewReader("ab")}, nil
 }
@@ -82,6 +91,22 @@ func TestMeteredBucketCountsBytesAndHTTPAttempts(t *testing.T) {
 	stats := bucket.Stats()
 	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.HTTPRequests != 1 || stats.HTTPFailures != 1 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 || stats.HTTPGetRequests != 1 || stats.SDKRetries != 1 || stats.HTTP5xx != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestMeteredBucketSeparatesAttemptedAndPublishedUploadBytes(t *testing.T) {
+	metrics := &bucketMetrics{}
+	failed := newMeteredBucket(&uploadErrorBucket{Bucket: thanosobjstore.NewInMemBucket()}, metrics)
+	if err := failed.Upload(context.Background(), "failed", strings.NewReader("attempt")); err == nil {
+		t.Fatal("failed upload succeeded")
+	}
+	succeeded := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics)
+	if err := succeeded.Upload(context.Background(), "ok", strings.NewReader("published")); err != nil {
+		t.Fatal(err)
+	}
+	stats := failed.Stats()
+	if stats.BytesUploaded != uint64(len("attempt")+len("published")) || stats.BytesPublished != uint64(len("published")) {
+		t.Fatalf("attempted=%d published=%d", stats.BytesUploaded, stats.BytesPublished)
 	}
 }
 

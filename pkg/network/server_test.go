@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -1040,6 +1041,20 @@ func TestReplicaStatusEndpoint(t *testing.T) {
 	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/replica/status", nil))
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"lag_slots":2`) {
 		t.Fatalf("replica status code=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestReplicatedMutationRejectsTooManySQLCommands(t *testing.T) {
+	commands := make([]types.SQLCommand, types.MaxSQLCommandsPerDecidedValue+1)
+	for i := range commands {
+		commands[i] = types.SQLCommand{RequestID: fmt.Sprint(i), SQL: "SELECT 1"}
+	}
+	value, err := types.EncodeSQLBatch(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReplicatedMutation(value); err == nil {
+		t.Fatal("admitted SQL batch above the per-value command limit")
 	}
 }
 

@@ -1,0 +1,10 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/mrchypark/rhiza/pkg/materializer
+cpu: Apple M1
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=1/batch=1-2         	       1	  12876542 ns/op	  956184 B/op	    9773 allocs/op
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=1/batch=8-2         	       1	  21293916 ns/op	 4055272 B/op	   42446 allocs/op
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=8/batch=1-2         	       1	   9988166 ns/op	  174416 B/op	    1418 allocs/op
+BenchmarkGraphPruneSparseSlotsAndBatchSize/gap=8/batch=8-2         	       1	  11817959 ns/op	  627128 B/op	    6175 allocs/op
+PASS
+ok  	github.com/mrchypark/rhiza/pkg/materializer	0.743s

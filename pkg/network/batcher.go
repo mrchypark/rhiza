@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	maxMutationBatch       = 64
+	maxMutationBatch       = types.MaxSQLCommandsPerDecidedValue
 	targetBatchBytes       = 64 << 10
 	minAdaptiveLinger      = 25 * time.Microsecond
 	maxAdaptiveLinger      = 250 * time.Microsecond
@@ -38,6 +38,7 @@ type batchItem struct {
 	reserved  int
 	enqueued  time.Time
 	result    chan batchResult
+	lease     *mutationLease
 }
 
 type batchJob struct {
@@ -93,15 +94,15 @@ func newKVBatcher(propose func(context.Context, []byte) (quepaxa.Slot, error), a
 	return newMutationBatcher(propose, apply, types.EncodeKVBatchItem, types.AssembleKVBatch, func(command types.KVCommand) string { return command.RequestID })
 }
 
-func (b *mutationBatcher[T]) submit(ctx context.Context, command T) (quepaxa.Slot, error) {
+func (b *mutationBatcher[T]) submit(ctx context.Context, command T, leases ...*mutationLease) (quepaxa.Slot, error) {
 	encoded, err := b.encodeItem(command)
 	if err != nil {
 		return 0, err
 	}
-	return b.submitEncoded(ctx, command, encoded)
+	return b.submitEncoded(ctx, command, encoded, leases...)
 }
 
-func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encoded []byte) (quepaxa.Slot, error) {
+func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encoded []byte, leases ...*mutationLease) (quepaxa.Slot, error) {
 	if b.baseSize+len(encoded) > quepaxa.MaxReplicatedValueBytes {
 		return 0, ErrInvalidRequest
 	}
@@ -109,19 +110,29 @@ func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encod
 		ctx: ctx, requestID: b.requestID(command), encoded: encoded,
 		reserved: len(encoded) + batchItemOverhead, enqueued: time.Now(), result: make(chan batchResult, 1),
 	}
+	if len(leases) != 0 {
+		item.lease = leases[0]
+		if item.lease != nil && !item.lease.transfer() {
+			return 0, ErrInvalidRequest
+		}
+	}
 	if !b.reserveQueue(item.reserved) {
+		item.releaseLease()
 		return 0, ErrOverloaded
 	}
 	select {
 	case b.input <- item:
 	case <-ctx.Done():
 		b.releaseQueue(item.reserved)
+		item.releaseLease()
 		return 0, ctx.Err()
 	case <-b.ctx.Done():
 		b.releaseQueue(item.reserved)
+		item.releaseLease()
 		return 0, ErrNotReady
 	default:
 		b.releaseQueue(item.reserved)
+		item.releaseLease()
 		return 0, ErrOverloaded
 	}
 	select {
@@ -131,6 +142,17 @@ func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encod
 		return 0, &CommitUnknownError{RequestID: item.requestID, Cause: ctx.Err()}
 	case <-b.ctx.Done():
 		return 0, &CommitUnknownError{RequestID: item.requestID, Cause: ErrNotReady}
+	}
+}
+
+func (item *batchItem) finish(result batchResult) {
+	item.result <- result
+	item.releaseLease()
+}
+
+func (item *batchItem) releaseLease() {
+	if item.lease != nil {
+		item.lease.releaseWorker()
 	}
 }
 
@@ -288,7 +310,7 @@ func (b *mutationBatcher[T]) dispatch(items []*batchItem, encoded [][]byte) {
 	activeEncoded := encoded[:0]
 	for i, item := range items {
 		if item.ctx.Err() != nil {
-			item.result <- batchResult{err: item.ctx.Err()}
+			item.finish(batchResult{err: item.ctx.Err()})
 			continue
 		}
 		active = append(active, item)
@@ -343,13 +365,13 @@ func (b *mutationBatcher[T]) execute(items []*batchItem, value []byte) {
 		if err != nil {
 			itemErr = commitUnknown(slot, item.requestID, err)
 		}
-		item.result <- batchResult{slot: slot, err: itemErr}
+		item.finish(batchResult{slot: slot, err: itemErr})
 	}
 }
 
 func (b *mutationBatcher[T]) fail(items []*batchItem, err error) {
 	for _, item := range items {
-		item.result <- batchResult{err: err}
+		item.finish(batchResult{err: err})
 	}
 }
 
@@ -358,7 +380,7 @@ func (b *mutationBatcher[T]) rejectQueued(err error) {
 		select {
 		case item := <-b.input:
 			b.releaseQueue(item.reserved)
-			item.result <- batchResult{err: err}
+			item.finish(batchResult{err: err})
 		default:
 			return
 		}
