@@ -1290,7 +1290,7 @@ func TestGraphResultsAreStableAcrossMaterializerIndexAndParameterOrder(t *testin
 		t.Fatal(err)
 	}
 	if !bytes.Equal(forwardValue, reverseValue) {
-		t.Fatalf("argument insertion order changed decision bytes: forward=%s reverse=%s", forwardValue, reverseValue)
+		t.Fatalf("equivalent argument maps changed decision bytes: forward=%s reverse=%s", forwardValue, reverseValue)
 	}
 	forwardFingerprint, err := types.GraphFingerprint(forward)
 	if err != nil {
@@ -1298,7 +1298,7 @@ func TestGraphResultsAreStableAcrossMaterializerIndexAndParameterOrder(t *testin
 	}
 	reverseFingerprint, err := types.GraphFingerprint(reverse)
 	if err != nil || forwardFingerprint != reverseFingerprint {
-		t.Fatalf("argument insertion order changed fingerprint: equal=%v err=%v", forwardFingerprint == reverseFingerprint, err)
+		t.Fatalf("equivalent argument maps changed fingerprint: equal=%v err=%v", forwardFingerprint == reverseFingerprint, err)
 	}
 	if err := first.Apply(ctx, 1, forwardValue); err != nil {
 		t.Fatalf("apply to first materializer: %v", err)
@@ -1308,12 +1308,13 @@ func TestGraphResultsAreStableAcrossMaterializerIndexAndParameterOrder(t *testin
 	}
 
 	for _, query := range []struct {
-		cypher string
-		args   map[string]any
+		cypher   string
+		args     map[string]any
+		wantRows [][]any
 	}{
-		{cypher: `MATCH (n:Probe) RETURN n.v, n.w ORDER BY n.v, n.w`},
-		{cypher: `MATCH (n:Probe {v: $value}) RETURN n.w ORDER BY n.w`, args: map[string]any{"value": "alpha"}},
-		{cypher: `MATCH (n:Probe {w: $value}) RETURN n.v ORDER BY n.v`, args: map[string]any{"value": int64(7)}},
+		{cypher: `MATCH (n:Probe) RETURN n.v, n.w ORDER BY n.v, n.w`, wantRows: [][]any{{"alpha", int64(7)}}},
+		{cypher: `MATCH (n:Probe {v: $value}) RETURN n.w ORDER BY n.w`, args: map[string]any{"value": "alpha"}, wantRows: [][]any{{int64(7)}}},
+		{cypher: `MATCH (n:Probe {w: $value}) RETURN n.v ORDER BY n.v`, args: map[string]any{"value": int64(7)}, wantRows: [][]any{{"alpha"}}},
 	} {
 		firstResult, err := first.GraphQuery(ctx, query.cypher, query.args)
 		if err != nil {
@@ -1325,6 +1326,9 @@ func TestGraphResultsAreStableAcrossMaterializerIndexAndParameterOrder(t *testin
 		}
 		if !reflect.DeepEqual(firstResult, secondResult) {
 			t.Fatalf("query %q differs across materializers: first=%+v second=%+v", query.cypher, firstResult, secondResult)
+		}
+		if !reflect.DeepEqual(firstResult.Rows, query.wantRows) {
+			t.Fatalf("query %q rows=%v, want %v", query.cypher, firstResult.Rows, query.wantRows)
 		}
 	}
 
