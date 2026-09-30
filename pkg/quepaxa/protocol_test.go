@@ -601,9 +601,17 @@ func TestProposalRecoversEarlierSlotWithoutFailureTimeout(t *testing.T) {
 func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 	cores, transport := newTestCluster(t)
 	transport.fail("n1")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	deadline, ok := t.Deadline()
+	if !ok {
+		t.Fatal("test deadline is unavailable")
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
+	type completedProposal struct {
+		request int
+		slot    Slot
+	}
 	type workerResult struct {
 		worker      int
 		request     int
@@ -613,12 +621,14 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 		orderBefore []NodeID
 		elapsed     time.Duration
 		err         error
+		completed   []completedProposal
 	}
 	jobs := make(chan int, 400)
 	results := make(chan workerResult, 8)
 	for worker := range 8 {
 		go func(worker int) {
 			last := workerResult{worker: worker, request: -1, phase: "waiting-for-job"}
+			completed := make([]completedProposal, 0, 50)
 			for i := range jobs {
 				value := make([]byte, 8)
 				binary.LittleEndian.PutUint64(value, uint64(i))
@@ -630,14 +640,18 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 					orderBefore: cores["n2"].ProposerOrder(),
 				}
 				started := time.Now()
-				last.slot, _, last.err = cores["n2"].Propose(ctx, value)
+				proposalCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+				last.slot, _, last.err = cores["n2"].Propose(proposalCtx, value)
+				stop()
 				last.elapsed = time.Since(started)
 				if last.err != nil {
 					results <- last
 					return
 				}
+				completed = append(completed, completedProposal{request: i, slot: last.slot})
 			}
 			last.phase = "worker-drained"
+			last.completed = completed
 			results <- last
 		}(worker)
 	}
@@ -646,17 +660,63 @@ func TestPipelineCrossesLeaderScheduleWithPreferredReplicaDown(t *testing.T) {
 	}
 	close(jobs)
 	var failures []workerResult
+	completed := make([]completedProposal, 0, 400)
 	for range 8 {
 		result := <-results
+		completed = append(completed, result.completed...)
 		if result.err != nil {
 			failures = append(failures, result)
 		}
 	}
+	core := cores["n2"]
 	if len(failures) == 0 {
+		if len(completed) != 400 {
+			t.Fatalf("completed proposals=%d, want 400", len(completed))
+		}
+		seenRequests := make(map[int]struct{}, len(completed))
+		seenSlots := make(map[Slot]struct{}, len(completed))
+		for _, proposal := range completed {
+			if _, duplicate := seenRequests[proposal.request]; duplicate {
+				t.Fatalf("request %d completed more than once", proposal.request)
+			}
+			seenRequests[proposal.request] = struct{}{}
+			if _, duplicate := seenSlots[proposal.slot]; duplicate {
+				t.Fatalf("slot %d returned for more than one request", proposal.slot)
+			}
+			seenSlots[proposal.slot] = struct{}{}
+			decision, decided := core.decision(proposal.slot)
+			if !decided || len(decision.Value) != 8 || binary.LittleEndian.Uint64(decision.Value) != uint64(proposal.request) {
+				t.Fatalf("request %d slot %d decision=%+v decided=%v", proposal.request, proposal.slot, decision, decided)
+			}
+		}
+		if len(seenRequests) != 400 || len(seenSlots) != 400 {
+			t.Fatalf("unique requests=%d slots=%d, want 400 each", len(seenRequests), len(seenSlots))
+		}
+		for request := range 400 {
+			if _, ok := seenRequests[request]; !ok {
+				t.Fatalf("request %d did not complete", request)
+			}
+		}
+
+		firstScheduleSlot := leaderEpochFirst(core.explorationEpochs() - 1)
+		var schedules int
+		for slot := firstScheduleSlot; slot <= core.Tip(); slot += leaderEpochSize {
+			decision, decided := core.decision(slot)
+			if !decided {
+				t.Fatalf("leader schedule slot %d is undecided", slot)
+			}
+			order, scheduled, err := DecodeLeaderSchedule(decision.Value)
+			if err != nil || !scheduled || !core.validateLeaderSchedule(order) {
+				t.Fatalf("slot %d schedule=%v order=%v err=%v", slot, scheduled, order, err)
+			}
+			schedules++
+		}
+		if schedules < 3 {
+			t.Fatalf("leader schedule boundaries=%d, want at least 3", schedules)
+		}
 		return
 	}
 
-	core := cores["n2"]
 	tip := core.Tip()
 	from := Slot(1)
 	if tip > 16 {
