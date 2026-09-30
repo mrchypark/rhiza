@@ -67,9 +67,7 @@ func TestLocalReclamationPreservesFixedCardinalityOverwritesAcrossHardKills(t *t
 		}
 		cmd := exec.Command(os.Args[0], "-test.run=^TestLocalReclamationOverwriteHelper$")
 		cmd.Env = append(os.Environ(), "RHIZA_LOCAL_RECLAMATION_OVERWRITE="+string(request))
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start overwrite phase %d: %v", cycle, err)
-		}
+		startLocalNodeCrashChild(t, cmd, readyFile)
 		waitForLocalNodeCrashBoundary(t, cmd, readyFile)
 
 		markerBytes, err := os.ReadFile(readyFile)

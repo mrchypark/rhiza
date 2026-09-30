@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 )
 
 // Segment is a single WAL segment file.
@@ -53,6 +55,7 @@ var ErrCapacity = errors.New("WAL capacity reached")
 var localWALCrashBoundary func(string)
 
 func hitLocalWALCrashBoundary(name string) {
+	localtesthooks.Hit("qlog:" + name)
 	if localWALCrashBoundary != nil {
 		localWALCrashBoundary(name)
 	}

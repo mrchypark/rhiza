@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
@@ -677,7 +678,19 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		go func(member quepaxa.Member) {
 			req := peer.request(peerfb.OperationLearned)
 			req.Decision = decisionToWire(decision)
+			trace := ""
+			if localtesthooks.Enabled {
+				trace = fmt.Sprintf("network:terminal-decision:slot=%d:peer=%s:old=%d:next=%d", decision.Slot, member.ID, old.ConfigID, next.ConfigID)
+				localtesthooks.Hit(trace + ":phase=dispatch")
+			}
 			_, err := peer.callQuorum(ctx, member.ID, req)
+			if localtesthooks.Enabled {
+				message := ""
+				if err != nil {
+					message = err.Error()
+				}
+				localtesthooks.Hit(trace + fmt.Sprintf(":phase=result:error=%q", message))
+			}
 			results <- result{id: member.ID, err: err}
 		}(member)
 	}
@@ -697,11 +710,18 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 	var firstErr error
 	for range pending {
 		result := <-results
+		_, required := added[result.id]
 		if result.err != nil {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:peer=%s:phase=consumed:error=%q:required-added=%t:old-acks=%d/%d:next-acks=%d/%d", decision.Slot, result.id, result.err, required, oldAcks, old.QuorumSize(), nextAcks, next.QuorumSize()))
+			}
 			if firstErr == nil {
 				firstErr = result.err
 			}
-			if _, required := added[result.id]; required {
+			if required {
+				if localtesthooks.Enabled {
+					localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:phase=failed:reason=required-added-ack:peer=%s", decision.Slot, result.id))
+				}
 				return result.err
 			}
 			continue
@@ -712,8 +732,11 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		if _, ok := nextMembers[result.id]; ok {
 			nextAcks++
 		}
-		if _, required := added[result.id]; required {
+		if required {
 			added[result.id] = true
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:peer=%s:phase=consumed:required-added=%t:old-acks=%d/%d:next-acks=%d/%d", decision.Slot, result.id, required, oldAcks, old.QuorumSize(), nextAcks, next.QuorumSize()))
 		}
 		allAdded := true
 		for _, acknowledged := range added {
@@ -723,11 +746,20 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 			}
 		}
 		if allAdded && oldAcks >= old.QuorumSize() && nextAcks >= next.QuorumSize() {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:phase=complete:old-acks=%d/%d:next-acks=%d/%d:all-added=%t", decision.Slot, oldAcks, old.QuorumSize(), nextAcks, next.QuorumSize(), allAdded))
+			}
 			return nil
 		}
 	}
 	if firstErr != nil {
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:phase=failed:reason=results-exhausted:old-acks=%d/%d:next-acks=%d/%d", decision.Slot, oldAcks, old.QuorumSize(), nextAcks, next.QuorumSize()))
+		}
 		return firstErr
+	}
+	if localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("network:terminal-decision:slot=%d:phase=failed:reason=quorum-unavailable:old-acks=%d/%d:next-acks=%d/%d", decision.Slot, oldAcks, old.QuorumSize(), nextAcks, next.QuorumSize()))
 	}
 	return quepaxa.ErrQuorumUnavailable
 }

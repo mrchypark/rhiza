@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
@@ -22,6 +23,7 @@ import (
 func TestQuorumMembershipQUIC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	deadline, _ := ctx.Deadline()
 	const admin = "membership-test-admin"
 	const clusterID = "membership-test"
 	members := make([]quepaxa.Member, 4)
@@ -164,6 +166,7 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	if _, err := peers[0].core.BeginReconfiguration(ctx, survivors); err != nil {
 		t.Fatal(err)
 	}
+	localtesthooks.Hit(fmt.Sprintf("test:membership:finish-start:round=remove-v2:remaining=%s", time.Until(deadline)))
 	if err := peers[0].core.FinishReconfiguration(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -203,6 +206,7 @@ func TestQuorumMembershipQUIC(t *testing.T) {
 	if _, err := peers[0].core.BeginReconfiguration(ctx, replacement); err != nil {
 		t.Fatal(err)
 	}
+	localtesthooks.Hit(fmt.Sprintf("test:membership:finish-start:round=promote-v3:remaining=%s", time.Until(deadline)))
 	if err := peers[0].core.FinishReconfiguration(ctx); err != nil {
 		t.Fatal(err)
 	}

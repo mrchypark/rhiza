@@ -1,13 +1,13 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"log"
 	"net"
 	"net/http"
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -916,6 +917,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					// Checkpoint deletion is safe only while a validated, published
+					// archive recovery base is available and retained below.
+					if n.archive == nil {
+						continue
+					}
 					order := core.ProposerOrder()
 					if len(order) == 0 || order[0] != core.NodeID() {
 						continue
@@ -927,18 +933,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 					if seal, ok, err := core.LatestCheckpointSeal(); err == nil && ok {
 						retain[seal.RootHash] = struct{}{}
 					}
-					if n.archive != nil {
-						if err := n.archive.Load(ctx); err != nil {
-							log.Printf("load shared archive before checkpoint GC failed: %v", err)
-							continue
-						}
-						seal, _, ok := n.archive.RecoveryBase()
-						archiveFloor, ok = advanceArchiveFloor(archiveFloor, uint64(seal.Index), ok)
-						if !ok {
-							continue
-						}
-						retain[seal.RootHash] = struct{}{}
+					seal, ok := n.validatedArchiveRecoveryBase(ctx)
+					archiveFloor, ok = advanceArchiveFloor(archiveFloor, uint64(seal.Index), ok)
+					if !ok {
+						continue
 					}
+					retain[seal.RootHash] = struct{}{}
 					if err := n.checkpoints.GarbageCollectFrom(ctx, retain, 2, archiveFloor, n.config.ObjStoreGCGracePeriod); err != nil {
 						log.Printf("checkpoint GC failed: %v", err)
 					} else if n.archive != nil {
@@ -951,6 +951,34 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}()
 	}
 	return nil
+}
+
+// validatedArchiveRecoveryBase returns an archive floor only after both the
+// archive chain and its certified checkpoint base have been checked against
+// this Core's checkpoint verifier and local lineage. Archive metadata alone
+// is not authority to delete checkpoint roots.
+func (n *Node) validatedArchiveRecoveryBase(ctx context.Context) (quepaxa.CheckpointSeal, bool) {
+	if n.archive == nil || n.core == nil {
+		return quepaxa.CheckpointSeal{}, false
+	}
+	if err := n.archive.Load(ctx); err != nil {
+		log.Printf("load shared archive before checkpoint GC failed: %v", err)
+		return quepaxa.CheckpointSeal{}, false
+	}
+	seal, decision, ok := n.archive.RecoveryBase()
+	if !ok || decision.Slot <= seal.Index {
+		return quepaxa.CheckpointSeal{}, false
+	}
+	if local, exists := n.core.CertifiedValue(decision.Slot); exists &&
+		(local.Hash != decision.Hash || !bytes.Equal(local.Value, decision.Value) || !bytes.Equal(local.Certificate, decision.Certificate)) {
+		log.Printf("archive recovery base decision conflicts with local certified history")
+		return quepaxa.CheckpointSeal{}, false
+	}
+	if err := n.core.ValidateCheckpointBase(ctx, seal, decision); err != nil {
+		log.Printf("validate shared archive checkpoint base before GC failed: %v", err)
+		return quepaxa.CheckpointSeal{}, false
+	}
+	return seal, true
 }
 
 func advanceArchiveFloor(current, base uint64, ok bool) (uint64, bool) {

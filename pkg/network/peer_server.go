@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -224,6 +225,9 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	defer stream.CancelRead(0)
 	_ = stream.SetDeadline(time.Now().Add(30 * time.Second))
 	response := &peerfb.ResponseT{}
+	var learnedSlot quepaxa.Slot
+	var learnedSender quepaxa.NodeID
+	learned := false
 	data, err := readPeerFrame(stream)
 	if err == nil {
 		// Voter authorization is bound to the handshake certificate, so a
@@ -237,10 +241,25 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 		var request *peerfb.RequestT
 		request, err = decodePeerRequest(data)
 		if err == nil {
+			if request.Operation == peerfb.OperationLearned && request.Decision != nil {
+				learned = true
+				learnedSlot = quepaxa.Slot(request.Decision.Slot)
+				learnedSender = quepaxa.NodeID(request.SenderId)
+				if localtesthooks.Enabled {
+					localtesthooks.Hit(fmt.Sprintf("network:learned:phase=received:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), learnedSender, learnedSlot))
+				}
+			}
 			if request.Operation == peerfb.OperationPrepareCheckpoint {
 				_ = stream.SetDeadline(time.Now().Add(checkpointPrepareTimeout))
 			}
 			response, err = s.handle(stream.Context(), peerCertificateKey(conn), request)
+			if learned && localtesthooks.Enabled {
+				message := ""
+				if err != nil {
+					message = err.Error()
+				}
+				localtesthooks.Hit(fmt.Sprintf("network:learned:phase=handler-result:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), learnedSender, learnedSlot, message))
+			}
 		}
 	}
 	if err != nil {
@@ -257,6 +276,9 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	if writeErr := writePeerFrame(stream, encodePeerResponse(response)); writeErr != nil {
 		stream.CancelWrite(1)
 		return
+	}
+	if learned && localtesthooks.Enabled {
+		localtesthooks.Hit(fmt.Sprintf("network:learned:phase=response-written:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), learnedSender, learnedSlot))
 	}
 	_ = stream.Close()
 }
@@ -358,20 +380,42 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 				return nil, err
 			}
 		}
-		if control, err := quepaxa.DecodeReconfiguration(decision.Proposal.Value); err != nil {
-			return nil, err
+		control, controlErr := quepaxa.DecodeReconfiguration(decision.Proposal.Value)
+		if control && localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=received:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
+		}
+		if controlErr != nil {
+			return nil, controlErr
 		} else if control && decision.Slot > 1 {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
+			}
 			if s.server.core.Tip() < decision.Slot-1 {
 				if s.server.transport == nil {
+					if localtesthooks.Enabled {
+						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, "transport unavailable"))
+					}
 					return nil, fmt.Errorf("reconfiguration control prefix is unavailable")
 				}
 				if err := s.server.catchUpFrom(ctx, quepaxa.NodeID(request.SenderId), decision.Slot-1, true); err != nil {
+					if localtesthooks.Enabled {
+						localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
+					}
 					return nil, err
 				}
 			}
 			if err := s.server.core.WaitTip(ctx, decision.Slot-1); err != nil {
+				if localtesthooks.Enabled {
+					localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
+				}
 				return nil, err
 			}
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned-control:phase=catchup-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
+			}
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 		}
 		if decisionHasRecorder(decision, s.server.core.NodeID()) {
 			err = s.server.core.AcceptDecisionHint(decision)
@@ -379,10 +423,23 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 			err = s.server.core.AcceptDecision(decision)
 		}
 		if err != nil {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
+			}
 			return nil, err
 		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=accept-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
+			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=apply-start:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
+		}
 		if err := s.server.applyDecisions(ctx, decision.Slot); err != nil {
+			if localtesthooks.Enabled {
+				localtesthooks.Hit(fmt.Sprintf("network:learned:phase=apply-failed:node=%s:sender=%s:slot=%d:error=%q", s.server.core.NodeID(), request.SenderId, decision.Slot, err.Error()))
+			}
 			return nil, err
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit(fmt.Sprintf("network:learned:phase=apply-complete:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), request.SenderId, decision.Slot))
 		}
 		return &peerfb.ResponseT{}, nil
 	case peerfb.OperationSync:

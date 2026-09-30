@@ -185,6 +185,20 @@ jobs:
         run: |
           python3 e2e/chaos/operator_fixture_test.py
           python3 e2e/chaos/operator_recovery_test.py
+      - name: Learner checkpoint adoption crash and lease boundaries
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -tags rhiza_local_testhooks .
+          -run '^(TestLearnerHardKillAtAdoptionWALBoundaries|TestLearnerExpiredPinDuringBuildAllowsSuccessorGCAndRestart|TestLearnerExpiredPinAtManifestAllowsSuccessorGCAndRestart)$'
+          -count=1 -timeout=8m
+      - name: Learner checkpoint adoption crash and lease boundaries (race)
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -race -tags rhiza_local_testhooks .
+          -run '^(TestLearnerHardKillAtAdoptionWALBoundaries|TestLearnerExpiredPinDuringBuildAllowsSuccessorGCAndRestart|TestLearnerExpiredPinAtManifestAllowsSuccessorGCAndRestart)$'
+          -count=1 -timeout=8m
       - name: Vet
         env:
           CGO_ENABLED: 0

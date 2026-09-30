@@ -38,8 +38,9 @@ const (
 var ErrStaleCheckpoint = errors.New("stale checkpoint candidate")
 
 var (
-	ErrPublisherBusy   = errors.New("checkpoint publisher is active")
-	ErrPublisherFenced = errors.New("checkpoint publisher was fenced")
+	ErrAuthoritativeRecoveryBaseRequired = errors.New("checkpoint GC requires an authoritative recovery base")
+	ErrPublisherBusy                     = errors.New("checkpoint publisher is active")
+	ErrPublisherFenced                   = errors.New("checkpoint publisher was fenced")
 )
 
 type Block struct {
@@ -1262,32 +1263,13 @@ func (m *Manager) activeRecoveryRoots(ctx context.Context) (map[[32]byte]Checkpo
 	return roots, err
 }
 
-func (m *Manager) Cleanup(ctx context.Context, keep int) error {
-	if keep < 1 {
-		return fmt.Errorf("checkpoint retention must be positive")
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(m.checkpoints) <= keep {
-		return nil
-	}
-	remove := m.checkpoints[:len(m.checkpoints)-keep]
-	for _, root := range remove {
-		if err := m.bucket.Delete(ctx, m.key(rootName(root.Index, root.RootHash))); err != nil && !m.bucket.IsObjNotFoundErr(err) {
-			return err
-		}
-	}
-	m.checkpoints = append([]Checkpoint(nil), m.checkpoints[len(remove):]...)
-	return nil
-}
-
-func (m *Manager) GarbageCollect(ctx context.Context, retain map[[32]byte]struct{}, keep int, grace time.Duration) error {
-	return m.GarbageCollectFrom(ctx, retain, keep, 0, grace)
-}
-
-// GarbageCollectFrom retains every root at or above floor. The shared archive
-// recovery base is authoritative for this lower bound.
+// GarbageCollectFrom retains every root at or above floor. The caller must
+// supply the validated, published archive RecoveryBase floor and retain its
+// root. A zero floor has no authoritative recovery base and is rejected.
 func (m *Manager) GarbageCollectFrom(ctx context.Context, retain map[[32]byte]struct{}, keep int, floor uint64, grace time.Duration) error {
+	if floor == 0 {
+		return ErrAuthoritativeRecoveryBaseRequired
+	}
 	if keep < 1 || grace < 0 {
 		return fmt.Errorf("invalid checkpoint GC policy")
 	}
