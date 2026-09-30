@@ -16,7 +16,7 @@ var sqlBatchMagic = []byte{'Q', 'B', 'A', 'T', byte(sqlpolicy.Version)}
 var kvCommandMagic = []byte("QKVC\x00")
 var kvBatchMagic = []byte("QKVB\x00")
 var notifyCommandMagic = []byte("QNTF\x00")
-var graphBatchMagic = []byte("QGRB\x00")
+var graphBatchMagic = []byte{'Q', 'G', 'R', 'B', byte(sqlpolicy.Version)}
 
 const ReadBarrierNonceSize = quepaxa.ReadBarrierNonceSize
 const MaxRequestIDBytes = 64
@@ -403,8 +403,11 @@ func EncodeSQLBatch(commands []SQLCommand) ([]byte, error) {
 }
 
 func DecodeGraphBatch(value []byte) ([]GraphCommand, bool, error) {
-	if !bytes.HasPrefix(value, graphBatchMagic) {
+	if !bytes.HasPrefix(value, []byte("QGRB")) {
 		return nil, false, nil
+	}
+	if !bytes.HasPrefix(value, graphBatchMagic) {
+		return nil, true, fmt.Errorf("%w: unsupported graph batch policy", sqlpolicy.ErrIncompatible)
 	}
 	var commands []GraphCommand
 	decoder := json.NewDecoder(bytes.NewReader(value[len(graphBatchMagic):]))

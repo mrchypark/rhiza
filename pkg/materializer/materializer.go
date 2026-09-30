@@ -33,20 +33,23 @@ import (
 )
 
 const (
-	MaxSQLBytes             = 256 << 10
-	MaxSQLStatements        = 64
-	MaxSQLArgs              = 999
-	MaxSQLResultColumns     = 2000
-	MaxReturningRows        = 10_000
-	MaxResultBytes          = 16 << 20
-	MaxMutationResultBytes  = 1 << 20
-	MaxCellBytes            = 1 << 20
-	maxSQLColumnCharge      = 32
-	maxSQLStatementCharge   = 256
-	maxSQLRowCharge         = 64
-	maxSQLCellCharge        = 64
-	MaxGraphReachableDepth  = 64
-	MaxGraphReachableEdges  = 1_000_000
+	MaxSQLBytes            = 256 << 10
+	MaxSQLStatements       = 64
+	MaxSQLArgs             = 999
+	MaxSQLResultColumns    = 2000
+	MaxReturningRows       = 10_000
+	MaxResultBytes         = 16 << 20
+	MaxMutationResultBytes = 1 << 20
+	MaxCellBytes           = 1 << 20
+	maxSQLColumnCharge     = 32
+	maxSQLStatementCharge  = 256
+	maxSQLRowCharge        = 64
+	maxSQLCellCharge       = 64
+	MaxGraphReachableDepth = 64
+	MaxGraphReachableEdges = 1_000_000
+	// MaxGraphQueryWork matches LatticeDB's default per-query execution budget.
+	// It does not bound parsing time or wall-clock duration.
+	MaxGraphQueryWork       = 10_000_000
 	MaxGraphPropertyIndexes = 64
 
 	notificationSubscriberLimit = 64
@@ -235,6 +238,11 @@ func openMaterializer(dbPath string, readerCount int, idempotencyWindow ...uint6
 		if err := sqlpolicy.CheckFile(context.Background(), dbPath); err != nil {
 			return nil, err
 		}
+	}
+	// Check an existing graph policy before opening SQLite with a writer or
+	// opening LatticeDB writable. Old graph state is incompatible, not migrated.
+	if err := ValidateLocalGraphStorage(filepath.Join(filepath.Dir(dbPath), "latticedb", "graph.ltdb"), true); err != nil {
+		return nil, fmt.Errorf("incompatible graph materialization: %w", err)
 	}
 	// QLog is the durable source of truth; SQLite is replayable materialized
 	// state, so NORMAL avoids a redundant per-command durability barrier.

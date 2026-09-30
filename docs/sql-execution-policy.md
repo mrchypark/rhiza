@@ -1,5 +1,17 @@
-# SQL execution policy 6 compatibility boundary
+# SQL execution policy 7 compatibility boundary
 
+Graph query work accounting advances the execution policy to 7 after SQL
+policies 5 and 6. Certified SQL uses `QBAT\x07`; certified graph batches use
+`QGRB\x07`. Policy-6-or-earlier graph envelopes and graph storage markers are
+incompatible even when their queries happen to satisfy the new work limit.
+Policy-7 graph materializations use a distinct storage marker, and checkpoint
+roots carry policy 7. Old history, graph files, and checkpoints are rejected
+before application or installation. There is no automatic migration or
+old-history replay fallback; use a fresh cluster and logical export/import.
+The graph work cap is 10,000,000 execution work units per operation; it is not
+a parser CPU, wall-clock, or replica-slot bound. Resource exhaustion aborts
+the mutation without a receipt or partial stream/slot publication; retrying
+the same decision may block again, including after reopen.
 Durable SQL result retention advances the SQL policy to 6. The retained window
 allows 256 MiB of encoded SQL result blobs plus a charged 256-byte envelope for
 each of at most 64 SQL commands per slot. The deterministic charge ceiling is
@@ -21,16 +33,18 @@ does not perform that migration automatically.
 
 The SQL counter/default, TEMP, ROWID, PRAGMA, mutation-admission, result
 working-set and durable-retention rules are incompatible execution-policy
-changes. This is not an in-place upgrade. Certified SQL uses `QBAT\x06`;
-policy-5 `QBAT\x05`, policy-4 `QBAT\x04`, policy-3 `QBAT\x03`, policy-2
-`QBAT\x02`, policy-1 `QBAT\x01`, unversioned `QBAT\x00`,
+changes. Policy 6 introduced the SQL rules and policy 7 fences them together
+with graph work accounting. This is not an in-place upgrade. Certified SQL
+uses `QBAT\x07`; policy-6 `QBAT\x06`, policy-5 `QBAT\x05`, policy-4
+`QBAT\x04`, policy-3 `QBAT\x03`, policy-2 `QBAT\x02`, policy-1 `QBAT\x01`,
+unversioned `QBAT\x00`,
 unknown policy versions and raw SQL decisions cannot be applied by this binary.
 Unsupported history is an error, not a rejected SQL receipt. Already-applied
 slots are checked too. Do not rewrite stored decision bytes.
 
-Existing unmarked or policy-1 through policy-5 SQLite materializations and
+Existing unmarked or policy-1 through policy-6 SQLite materializations and
 checkpoints are refused, even if TEMP was never knowingly used. The
-`sql_execution_policy=6` metadata value identifies newly initialized state; it
+`sql_execution_policy=7` metadata value identifies newly initialized state; it
 is not a migration certificate. Do not manually insert it into old databases or
 stamp old checkpoint descriptors. Mixed-version clusters and downgrades are
 unsupported.

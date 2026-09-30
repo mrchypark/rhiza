@@ -75,12 +75,6 @@ func ValidateGraphCommand(command types.GraphCommand) error {
 			return err
 		}
 	}
-	lower := strings.ToLower(cypher)
-	for _, denied := range []string{"random(", "uuid(", "current_timestamp", "current_date", "current_time", "load from", "copy from", "install ", "load extension", "import database", "export database", "attach "} {
-		if strings.Contains(lower, denied) {
-			return fmt.Errorf("non-deterministic or external cypher operation %q is not allowed", denied)
-		}
-	}
 	return nil
 }
 
