@@ -199,6 +199,20 @@ jobs:
           go test -race -tags rhiza_local_testhooks .
           -run '^(TestLearnerHardKillAtAdoptionWALBoundaries|TestLearnerExpiredPinDuringBuildAllowsSuccessorGCAndRestart|TestLearnerExpiredPinAtManifestAllowsSuccessorGCAndRestart)$'
           -count=1 -timeout=8m
+      - name: Terminal decision handshake cancellation
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -tags rhiza_local_testhooks ./pkg/network
+          -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$'
+          -count=1 -timeout=30s
+      - name: Terminal decision handshake cancellation (race)
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -race -tags rhiza_local_testhooks ./pkg/network
+          -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$'
+          -count=1 -timeout=30s
       - name: Vet
         env:
           CGO_ENABLED: 0
