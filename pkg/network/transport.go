@@ -663,7 +663,10 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 		}
 	}
 	peer := newTransport(t.clusterID, t.localID, &union, t.peerToken, nil)
+	peer.quic = t.quic
 	defer peer.Close()
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	type result struct {
 		id  quepaxa.NodeID
 		err error
@@ -683,7 +686,7 @@ func (t *Transport) sendTerminalDecision(ctx context.Context, decision quepaxa.D
 				trace = fmt.Sprintf("network:terminal-decision:slot=%d:peer=%s:old=%d:next=%d", decision.Slot, member.ID, old.ConfigID, next.ConfigID)
 				localtesthooks.Hit(trace + ":phase=dispatch")
 			}
-			_, err := peer.callQuorum(ctx, member.ID, req)
+			_, err := peer.callQuorum(callCtx, member.ID, req)
 			if localtesthooks.Enabled {
 				message := ""
 				if err != nil {
