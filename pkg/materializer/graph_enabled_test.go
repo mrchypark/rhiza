@@ -1243,6 +1243,116 @@ func TestGraphCommandDeterminismUsesPinnedEngineGrammar(t *testing.T) {
 	}
 }
 
+func TestGraphResultsAreStableAcrossMaterializerIndexAndParameterOrder(t *testing.T) {
+	ctx := context.Background()
+	first, err := Open(filepath.Join(t.TempDir(), "first.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(filepath.Join(t.TempDir(), "second.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	indexes := []types.GraphNodePropertyIndex{
+		{Label: "Probe", Property: "v"},
+		{Label: "Probe", Property: "w"},
+	}
+	if err := first.ConfigureLocalGraphNodePropertyIndexes(indexes); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.ConfigureLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{indexes[1], indexes[0]}); err != nil {
+		t.Fatal(err)
+	}
+
+	forwardArgs := make(map[string]any, 2)
+	forwardArgs["left"] = "alpha"
+	forwardArgs["right"] = int64(7)
+	reverseArgs := make(map[string]any, 2)
+	reverseArgs["right"] = int64(7)
+	reverseArgs["left"] = "alpha"
+	forward := types.GraphCommand{
+		RequestID: "same-command",
+		Cypher:    `CREATE (:Probe {v: $left, w: $right})`,
+		Args:      forwardArgs,
+		Events:    []types.GraphStreamEvent{{Stream: "graph-events", Kind: "created", Payload: "alpha-7"}},
+	}
+	reverse := forward
+	reverse.Args = reverseArgs
+	forwardValue, err := types.EncodeGraphCommand(forward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverseValue, err := types.EncodeGraphCommand(reverse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(forwardValue, reverseValue) {
+		t.Fatalf("argument insertion order changed decision bytes: forward=%s reverse=%s", forwardValue, reverseValue)
+	}
+	forwardFingerprint, err := types.GraphFingerprint(forward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverseFingerprint, err := types.GraphFingerprint(reverse)
+	if err != nil || forwardFingerprint != reverseFingerprint {
+		t.Fatalf("argument insertion order changed fingerprint: equal=%v err=%v", forwardFingerprint == reverseFingerprint, err)
+	}
+	if err := first.Apply(ctx, 1, forwardValue); err != nil {
+		t.Fatalf("apply to first materializer: %v", err)
+	}
+	if err := second.Apply(ctx, 1, reverseValue); err != nil {
+		t.Fatalf("apply to second materializer: %v", err)
+	}
+
+	for _, query := range []struct {
+		cypher string
+		args   map[string]any
+	}{
+		{cypher: `MATCH (n:Probe) RETURN n.v, n.w ORDER BY n.v, n.w`},
+		{cypher: `MATCH (n:Probe {v: $value}) RETURN n.w ORDER BY n.w`, args: map[string]any{"value": "alpha"}},
+		{cypher: `MATCH (n:Probe {w: $value}) RETURN n.v ORDER BY n.v`, args: map[string]any{"value": int64(7)}},
+	} {
+		firstResult, err := first.GraphQuery(ctx, query.cypher, query.args)
+		if err != nil {
+			t.Fatalf("first materializer query %q: %v", query.cypher, err)
+		}
+		secondResult, err := second.GraphQuery(ctx, query.cypher, query.args)
+		if err != nil {
+			t.Fatalf("second materializer query %q: %v", query.cypher, err)
+		}
+		if !reflect.DeepEqual(firstResult, secondResult) {
+			t.Fatalf("query %q differs across materializers: first=%+v second=%+v", query.cypher, firstResult, secondResult)
+		}
+	}
+
+	firstReceipt, firstFound, err := first.GraphMutationReceipt(ctx, "same-command")
+	if err != nil || !firstFound {
+		t.Fatalf("first receipt=%+v found=%v err=%v", firstReceipt, firstFound, err)
+	}
+	secondReceipt, secondFound, err := second.GraphMutationReceipt(ctx, "same-command")
+	if err != nil || !secondFound {
+		t.Fatalf("second receipt=%+v found=%v err=%v", secondReceipt, secondFound, err)
+	}
+	if firstReceipt != secondReceipt {
+		t.Fatalf("receipts differ: first=%+v second=%+v", firstReceipt, secondReceipt)
+	}
+
+	firstRecords, firstStreamTip, err := first.GraphReadStream(ctx, "graph-events", 0, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRecords, secondStreamTip, err := second.GraphReadStream(ctx, "graph-events", 0, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstStreamTip != secondStreamTip || !reflect.DeepEqual(firstRecords, secondRecords) {
+		t.Fatalf("streams differ: first tip=%d records=%+v second tip=%d records=%+v", firstStreamTip, firstRecords, secondStreamTip, secondRecords)
+	}
+}
+
 func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	if options := graphQueryOptions(); options.MaxWork != MaxGraphQueryWork {
 		t.Fatalf("graph query work limit=%d, want fixed limit %d", options.MaxWork, MaxGraphQueryWork)
