@@ -21,7 +21,7 @@ import (
 func TestTerminalDecisionCancelsUnneededPeerHandshake(t *testing.T) {
 	clusterID := types.ClusterID("cluster")
 	a := testMember(clusterID, "a", "a-token")
-	b, _, bAcked := terminalACKPeerControlled(t, clusterID, "b", "b-token", nil)
+	b, _, _ := terminalACKPeerControlled(t, clusterID, "b", "b-token", nil)
 	dAckGate := make(chan struct{})
 	d, dReceived, dAcked := terminalACKPeerControlled(t, clusterID, "d", "d-token", dAckGate)
 	blackhole, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -46,8 +46,16 @@ func TestTerminalDecisionCancelsUnneededPeerHandshake(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	bQuorumsConsumed := make(chan struct{})
 	cDialResult := make(chan string, 1)
 	restoreHook := localtesthooks.Set(func(event string) {
+		if strings.Contains(event, ":peer=b:phase=consumed:") && strings.Contains(event, "old-acks=2/2:next-acks=2/2") {
+			select {
+			case <-bQuorumsConsumed:
+			default:
+				close(bQuorumsConsumed)
+			}
+		}
 		if strings.Contains(event, ":peer=c:") && strings.Contains(event, ":phase=result:error=") {
 			select {
 			case cDialResult <- event:
@@ -59,8 +67,8 @@ func TestTerminalDecisionCancelsUnneededPeerHandshake(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- transport.sendTerminalDecision(ctx, quepaxa.Decision{Slot: 1}, old, next) }()
 	awaitTerminalSignal(t, blackholeReceived, "blackhole UDP packet")
-	awaitTerminalSignal(t, bAcked, "old peer ACK")
 	awaitTerminalSignal(t, dReceived, "added peer request")
+	awaitTerminalSignal(t, bQuorumsConsumed, "old and next quorum consumption")
 	select {
 	case err := <-done:
 		t.Fatalf("terminal decision returned before required added-peer ACK: %v", err)
@@ -105,6 +113,7 @@ func terminalACKPeerControlled(t *testing.T, clusterID types.ClusterID, id quepa
 	member.PeerURL = "quic://" + listener.Addr().String()
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+	var receivedOnce, ackedOnce sync.Once
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -123,7 +132,7 @@ func terminalACKPeerControlled(t *testing.T, clusterID types.ClusterID, id quepa
 						return
 					}
 					if _, err := readPeerFrame(stream); err == nil {
-						close(received)
+						receivedOnce.Do(func() { close(received) })
 						if ackGate != nil {
 							select {
 							case <-ctx.Done():
@@ -132,7 +141,7 @@ func terminalACKPeerControlled(t *testing.T, clusterID types.ClusterID, id quepa
 							}
 						}
 						if err := writePeerFrame(stream, encodePeerResponse(&peerfb.ResponseT{})); err == nil {
-							close(acked)
+							ackedOnce.Do(func() { close(acked) })
 						}
 					}
 					_ = stream.Close()
