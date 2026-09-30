@@ -230,7 +230,7 @@ func TestReconfigurationRestartReplaysCertifiedMembershipHistory(t *testing.T) {
 		t.Fatalf("restart did not replay certified membership history: %v", err)
 	}
 	wals["a"] = reopenedWAL
-	transport.cores["a"] = restarted
+	transport.setCore("a", restarted)
 	if got := restarted.CurrentCluster(); !sameCluster(got, target) {
 		t.Fatalf("restarted cluster=%+v want=%+v", got, target)
 	}

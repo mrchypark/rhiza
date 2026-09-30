@@ -361,6 +361,7 @@ func (transport *clusterTransport) SendRecord(ctx context.Context, to NodeID, re
 
 func (transport *clusterTransport) SendDecision(ctx context.Context, decision Decision) error {
 	transport.mu.RLock()
+	coreCount := len(transport.cores)
 	targets := make([]*Core, 0, len(transport.cores))
 	var nextMembers, added map[NodeID]Member
 	for id, core := range transport.cores {
@@ -403,7 +404,7 @@ func (transport *clusterTransport) SendDecision(ctx context.Context, decision De
 				nextSuccesses++
 			}
 			delete(added, result.id)
-			if successes >= len(transport.cores)/2+1 && (nextMembers == nil || nextSuccesses >= len(nextMembers)/2+1 && len(added) == 0) {
+			if successes >= coreCount/2+1 && (nextMembers == nil || nextSuccesses >= len(nextMembers)/2+1 && len(added) == 0) {
 				return nil
 			}
 		}
@@ -462,6 +463,12 @@ func (transport *clusterTransport) recover(ids ...NodeID) {
 	for _, id := range ids {
 		delete(transport.down, id)
 	}
+}
+
+func (transport *clusterTransport) setCore(id NodeID, core *Core) {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	transport.cores[id] = core
 }
 
 func newTestCluster(t testing.TB) (map[NodeID]*Core, *clusterTransport) {

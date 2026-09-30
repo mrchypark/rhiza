@@ -90,7 +90,7 @@ func TestPromotedLearnerVotesAfterMembershipBaseRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport.cores["d"] = restarted
+	transport.setCore("d", restarted)
 	if !restarted.IsVoter() || restarted.ConfigID() != target.ConfigID {
 		t.Fatalf("restarted learner voter=%v config=%d", restarted.IsVoter(), restarted.ConfigID())
 	}
