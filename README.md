@@ -18,11 +18,11 @@ the same Go API.
 
 ## Requirements and installation
 
-SQL execution policy 6 adds bounded embedded mutation admission, SQL result
-working-set accounting, and durable SQL result retention; it requires a new
+SQL execution policy 7 adds graph query work accounting to policy 6's bounded
+embedded mutation admission and durable SQL result retention; it requires a new
 cluster for existing installations, including earlier policies.
 The protected WAL framing also rejects all previous 49-byte WAL artifacts, including earlier development builds.
-Old materializations, checkpoints and SQL history are rejected; mixed-version
+Old materializations, checkpoints, SQL history, and graph history are rejected; mixed-version
 peers are unsupported. Follow the [logical migration procedure](docs/sql-execution-policy.md)
 and preserve the old installation before changing binaries.
 
@@ -124,7 +124,7 @@ Use the `RequestKind*`, `RequestState*`, and `MutationCommitted`/
 
 Rhiza exposes SQLite's DDL, views, triggers, generated and STRICT tables,
 partial and expression indexes, CTEs and recursive CTEs, joins, subqueries,
-UPSERT, `RETURNING`, window functions, and JSON functions. Execution policy 6
+UPSERT, `RETURNING`, window functions, and JSON functions. Execution policy 7
 reserves the maximum actual ROWID and excludes persistent virtual-table writes
 (including FTS5); see [migration requirements](docs/sql-execution-policy.md).
 Durable SQL result blobs are capped at 1 MiB per command and 256 MiB across the
@@ -163,26 +163,29 @@ reserved `_rhiza_` namespace is inaccessible through public SQL APIs.
 
 ### Graph and Cypher
 
-Rhiza uses `latticedb-go v0.9.0` and exposes its deliberately small,
+Rhiza uses `latticedb-go v0.10.0` and exposes its deliberately small,
 case-sensitive Cypher subset. This is not full openCypher. Structural keywords
-must be uppercase.
+and built-in function names are case-sensitive.
 
-Supported query building blocks include:
+Supported query building blocks follow the pinned engine grammar and include:
 
-- `MATCH` with fixed-length incoming, outgoing, or undirected patterns.
+- `MATCH` with incoming, outgoing, or undirected fixed- and variable-length paths.
 - `WHERE` with comparisons, `IN`, `STARTS WITH`, `ENDS WITH`, `CONTAINS`,
   `IS NULL`, `IS NOT NULL`, `AND`, `OR`, and `NOT`.
-- `RETURN`, `WITH`, `DISTINCT`, grouped `count`/`sum`/`avg`/`min`/`max`/`collect`,
-  `ORDER BY`, `SKIP`, and `LIMIT`.
-- Value functions and nested list expressions in parameters, projections, and properties.
+- `RETURN`, `WITH`, `DISTINCT`, scalar/arithmetic expressions, built-in functions,
+  grouped `count`/`sum`/`avg`/`min`/`max`/`collect`, `ORDER BY`, `SKIP`, and `LIMIT`.
+- Lists, maps, and backtick-quoted identifiers.
 - Standalone `CREATE` of one node.
-- `MATCH ... SET`, `MATCH ... CREATE` for relationships, `REMOVE`, `DELETE`,
-  and `DETACH DELETE`.
-- `UNWIND ... RETURN`, `UNWIND ... CREATE`, and `UNWIND ... MATCH`.
+- `MERGE`, `MATCH ... SET`, `MATCH ... CREATE` for relationships, `REMOVE`,
+  `DELETE`, and `DETACH DELETE`.
+- `UNWIND` with supported query parts.
 - Full-text `@@` predicates, subject to the engine's ranking restrictions.
 
-`OPTIONAL MATCH`, `MERGE`, `UNION`, aggregate-level `DISTINCT`, variable-length
-paths, arithmetic expressions, and backtick identifiers are not supported. A standalone relationship
+`OPTIONAL MATCH`, `UNION`, `CALL`, comments, multiple statements, and user-defined
+functions are not supported. Only the engine's known built-ins are callable; the
+pinned engine currently has no clock, random, or external-I/O built-ins. This is
+a version-pinned supported-language contract, not a determinism guarantee for
+arbitrary Cypher or future engine extensions. A standalone relationship
 creation such as `CREATE (:Person)-[:KNOWS]->(:Person)` is also unsupported;
 create or match the nodes first, then use `MATCH ... CREATE`. Named parameters
 accept JSON-compatible null, boolean, string, number, list, and map values.
@@ -196,6 +199,12 @@ Use `GraphQuery` or `POST /graph/query` for read-only `MATCH ... RETURN` and
 replicated mutations. Mutation statements are applied atomically with their
 request receipt and optional stream events.
 
+Graph reads and replicated mutations share a per-query execution-work ceiling
+of `MaxGraphQueryWork` (10,000,000), in addition to row and logical-byte limits.
+It does not bound parser CPU or wall-clock time. A mutation exceeding the budget
+rolls back and returns an error, not a rejected receipt; its committed slot
+cannot be skipped, and exact replay can fail again after reopen.
+
 The embedded `GraphReachable` API performs a bounded outgoing traversal on one
 immutable local graph snapshot. Callers must provide depth, result, scanned-edge,
 and encoded-byte limits. It reports `StartFound`, `AppliedSlot`, and
@@ -203,15 +212,16 @@ and encoded-byte limits. It reports `StartFound`, `AppliedSlot`, and
 orders results by distance then internal node ID. A limit failure returns
 `ErrGraphResourceLimit` without partial nodes.
 
-The exported `MaxGraphReachable*` constants expose the library ceilings.
+The exported `MaxGraphReachable*` and `MaxGraphQueryWork` constants expose the
+library ceilings.
 
 Declare lookup indexes with `Config.LocalGraphNodePropertyIndexes`. These
 indexes are node-local derived state: they are not replicated, and Rhiza
 reconciles them when the node opens or installs a checkpoint.
 
 The dependency owns the complete language contract. See the version-pinned
-[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.9.0/docs/engine_conformance.md#supported-cypher-subset)
-and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.9.0/internal/engine/testdata/query_grammar.ebnf).
+[`Supported Cypher Subset`](https://github.com/mrchypark/latticedb-go/blob/v0.10.0/docs/engine_conformance.md#supported-cypher-subset)
+and [canonical EBNF grammar](https://github.com/mrchypark/latticedb-go/blob/v0.10.0/internal/engine/testdata/query_grammar.ebnf).
 
 ### Graph streams
 
