@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -27,6 +28,20 @@ type getCountingBucket struct {
 	rootGets  atomic.Uint64
 	blockGets atomic.Uint64
 	uploads   atomic.Uint64
+}
+
+func TestGarbageCollectRequiresRecoveryBaseBeforeStorageAccess(t *testing.T) {
+	bucket := &getCountingBucket{Bucket: objstore.NewInMemBucket()}
+	manager := NewManager(bucket, "cluster", t.TempDir(), 9)
+	if err := manager.GarbageCollectFrom(context.Background(), nil, 1, 0, 0); !errors.Is(err, ErrAuthoritativeRecoveryBaseRequired) {
+		t.Fatalf("zero-floor GC error=%v", err)
+	}
+	if got := bucket.gets.Load(); got != 0 {
+		t.Fatalf("zero-floor GC performed %d GETs before refusal", got)
+	}
+	if got := bucket.uploads.Load(); got != 0 {
+		t.Fatalf("zero-floor GC performed %d uploads before refusal", got)
+	}
 }
 
 func TestGenerationClaimRetriesFixedIndexWithoutRegressingPublisher(t *testing.T) {
@@ -108,6 +123,19 @@ type streamingIterBucket struct {
 	objstore.Bucket
 	extra *atomic.Value
 	once  atomic.Bool
+}
+
+type oldAttributesBucket struct {
+	objstore.Bucket
+	modified time.Time
+}
+
+func (b *oldAttributesBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	attributes, err := b.Bucket.Attributes(ctx, name)
+	if err == nil {
+		attributes.LastModified = b.modified
+	}
+	return attributes, err
 }
 
 func (b *streamingIterBucket) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
@@ -573,13 +601,13 @@ func TestGarbageCollectDropsRemoteDeletedLocalRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := NewManager(bucket, "cluster", t.TempDir(), 9)
-	if err := second.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := second.GarbageCollectFrom(ctx, nil, 1, current.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	if exists, err := bucket.Exists(ctx, first.key(rootName(old.Index, old.RootHash))); err != nil || exists {
 		t.Fatalf("old root exists=%v err=%v", exists, err)
 	}
-	if err := first.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := first.GarbageCollectFrom(ctx, nil, 1, current.Index, 0); err != nil {
 		t.Fatalf("stale local root was resurrected: %v", err)
 	}
 	if len(first.checkpoints) != 1 || first.checkpoints[0].RootHash != current.RootHash {
@@ -597,7 +625,7 @@ func TestGarbageCollectFencesPublisherBeforeListSnapshot(t *testing.T) {
 	}
 	collector := NewManager(bucket, "cluster", t.TempDir(), 9)
 	done := make(chan error, 1)
-	go func() { done <- collector.GarbageCollect(ctx, nil, 1, 0) }()
+	go func() { done <- collector.GarbageCollectFrom(ctx, nil, 1, root.Index, 0) }()
 	<-bucket.started // Iter has taken its snapshot only after GC acquired maintenance.
 	if _, err := publisher.AcquirePublisherClaim(ctx, "publisher", 1, time.Minute); !errors.Is(err, ErrPublisherBusy) {
 		t.Fatalf("publisher acquired during GC snapshot: %v", err)
@@ -630,7 +658,7 @@ func TestGarbageCollectSkipsPublishedCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	collector := NewManager(bucket, "cluster", t.TempDir(), 9)
-	if err := collector.GarbageCollect(ctx, nil, 1, 0); !errors.Is(err, ErrPublisherBusy) {
+	if err := collector.GarbageCollectFrom(ctx, nil, 1, current.Index, 0); !errors.Is(err, ErrPublisherBusy) {
 		t.Fatalf("GC ran during candidate publication: %v", err)
 	}
 	hash, err := decodeHash(candidate.Files[0].Blocks[0].Hash)
@@ -682,13 +710,13 @@ func TestGarbageCollectRetiresRootBeforeBlocks(t *testing.T) {
 	}
 	hash, _ := decodeHash(old.Files[0].Blocks[0].Hash)
 	key := manager.key(blockKey(hash))
-	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, newRoot.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	if exists, _ := bucket.Exists(ctx, key); !exists {
 		t.Fatal("retired root block deleted in same GC pass")
 	}
-	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, newRoot.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	if exists, _ := bucket.Exists(ctx, key); exists {
@@ -713,7 +741,7 @@ func TestGarbageCollectPrunesVerifiedBlockCache(t *testing.T) {
 	if err := manager.Verify(ctx, newRoot.Index, newRoot.RootHash, newRoot.Hash); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, newRoot.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := manager.verified[blockObjectKey(old.Files[0].Blocks[0])]; ok {
@@ -733,7 +761,7 @@ func TestGarbageCollectAlwaysRetainsCurrentRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "candidate")}, 2)
-	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, current.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	restarted := NewManager(bucket, "cluster", t.TempDir(), 9)
@@ -758,11 +786,100 @@ func TestGarbageCollectFromRetainsArchiveBaseFloor(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "candidate")}, 3)
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, old.Index, 0); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := bucket.Exists(ctx, manager.key(rootName(old.Index, old.RootHash))); err != nil || !exists {
+		t.Fatalf("old root before successor floor exists=%v err=%v", exists, err)
+	}
 	if err := manager.GarbageCollectFrom(ctx, nil, 1, base.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	if exists, err := bucket.Exists(ctx, manager.key(rootName(base.Index, base.RootHash))); err != nil || !exists {
 		t.Fatalf("archive base root exists=%v err=%v", exists, err)
+	}
+	if exists, err := bucket.Exists(ctx, manager.key(rootName(old.Index, old.RootHash))); err != nil || exists {
+		t.Fatalf("predecessor root after successor floor exists=%v err=%v", exists, err)
+	}
+}
+
+func TestGarbageCollectRetainsEveryRootAtOrAboveFloorRegardlessOfKeepAndAge(t *testing.T) {
+	ctx := context.Background()
+	baseBucket := objstore.NewInMemBucket()
+	bucket := &oldAttributesBucket{Bucket: baseBucket, modified: time.Now().Add(-24 * time.Hour)}
+	manager := NewManager(bucket, "cluster", t.TempDir(), 9)
+	var roots []*Checkpoint
+	for index := uint64(1); index <= 4; index++ {
+		root := createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, fmt.Sprintf("root-%d", index))}, index)
+		if err := manager.PromoteCertifiedCurrent(ctx, root); err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, roots[1].Index, 0); err != nil {
+		t.Fatal(err)
+	}
+	for i, root := range roots {
+		exists, err := baseBucket.Exists(ctx, manager.key(rootName(root.Index, root.RootHash)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := i != 0
+		if exists != want {
+			t.Fatalf("root %d exists=%v, want %v (floor=%d, keep=1, age=24h)", root.Index, exists, want, roots[1].Index)
+		}
+		if i >= 1 {
+			for _, file := range root.Files {
+				for _, block := range file.Blocks {
+					if blockExists, err := baseBucket.Exists(ctx, manager.key(blockObjectKey(block))); err != nil || !blockExists {
+						t.Fatalf("floor-protected root %d block exists=%v err=%v", root.Index, blockExists, err)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestGarbageCollectHonorsRecoveryPinLeaseAndFloor(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		leaseUntil time.Time
+		wantOld    bool
+	}{
+		{name: "active pin", leaseUntil: time.Now().Add(time.Minute), wantOld: true},
+		{name: "expired pin", leaseUntil: time.Now().Add(-time.Second)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			bucket := objstore.NewInMemBucket()
+			manager := NewManager(bucket, "cluster", t.TempDir(), 9)
+			old := createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "old")}, 1)
+			if err := manager.PromoteCertifiedCurrent(ctx, old); err != nil {
+				t.Fatal(err)
+			}
+			base := createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "base")}, 2)
+			if err := manager.PromoteCertifiedCurrent(ctx, base); err != nil {
+				t.Fatal(err)
+			}
+			pin := recoveryPinRecord{
+				ConfigID: manager.configID, OwnerID: "learner", Token: "test", Index: old.Index,
+				RootHash: hex.EncodeToString(old.RootHash[:]), Root: *old,
+				LeaseUntilMS: test.leaseUntil.UnixMilli(),
+			}
+			if err := manager.uploadRecoveryPin(ctx, manager.recoveryPinKey(pin.OwnerID), pin, objstore.WithIfNotExists()); err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.GarbageCollectFrom(ctx, nil, 1, base.Index, 0); err != nil {
+				t.Fatal(err)
+			}
+			exists, err := bucket.Exists(ctx, manager.key(rootName(old.Index, old.RootHash)))
+			if err != nil || exists != test.wantOld {
+				t.Fatalf("old root exists=%v, want %v (err=%v)", exists, test.wantOld, err)
+			}
+			if exists, err := bucket.Exists(ctx, manager.key(rootName(base.Index, base.RootHash))); err != nil || !exists {
+				t.Fatalf("floor root exists=%v err=%v", exists, err)
+			}
+		})
 	}
 }
 
@@ -819,7 +936,7 @@ func TestRecoveryPinDescriptorSurvivesCanonicalRootDeletion(t *testing.T) {
 	if err != nil || descriptor.RootHash != old.RootHash {
 		t.Fatalf("pinned descriptor=%+v err=%v", descriptor, err)
 	}
-	if err := manager.GarbageCollect(ctx, nil, 1, 0); err != nil {
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, current.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	block := manager.key(blockObjectKey(old.Files[0].Blocks[0]))
@@ -853,7 +970,7 @@ func TestStaleCheckpointGCCannotDeleteRepublishedBlock(t *testing.T) {
 	}
 	gc := NewManager(bucket, "cluster", t.TempDir(), 9)
 	gcDone := make(chan error, 1)
-	go func() { gcDone <- gc.GarbageCollect(ctx, nil, 1, 0) }()
+	go func() { gcDone <- gc.GarbageCollectFrom(ctx, nil, 1, 1, 0) }()
 	<-blocked.started
 	stale, err := gc.readPublisherClaim(ctx)
 	if err != nil {

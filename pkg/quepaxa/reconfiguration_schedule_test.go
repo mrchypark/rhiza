@@ -102,7 +102,7 @@ func TestReconfigurationSparseScheduleFreezeFailsClosed(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				cores[id] = restarted
+				transport.setCore(id, restarted)
 			}
 			c = cores["a"]
 			if _, err := c.BeginReconfiguration(ctx, target); err != nil {

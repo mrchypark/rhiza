@@ -260,7 +260,7 @@ func TestStartupRecoveryPinProtectsSelectedRootFromGC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.GarbageCollect(ctx, map[[32]byte]struct{}{}, 1, 0); err != nil {
+	if err := manager.GarbageCollectFrom(ctx, map[[32]byte]struct{}{}, 1, newer.Index, 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.DownloadRootFiles(guard.Context(), pinned.Index, pinned.RootHash, t.TempDir()); err != nil {

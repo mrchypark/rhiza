@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -44,6 +45,7 @@ var (
 )
 
 func hitLocalNodeCheckpointCrashBoundary(name string) {
+	localtesthooks.Hit("node:" + name)
 	if localNodeCheckpointCrashBoundary != nil {
 		localNodeCheckpointCrashBoundary(name)
 	}

@@ -59,9 +59,7 @@ func TestLocalRestoreJournalFinalizedBeforeSuffixAndRestartReplaysAfterHardKill(
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLocalRestoreSuffixHardKillHelper$")
 	cmd.Env = append(os.Environ(), "RHIZA_LOCAL_RESTORE_SUFFIX_KILL="+string(payload))
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
+	startLocalNodeCrashChild(t, cmd, readyFile)
 	waitForLocalNodeCrashBoundary(t, cmd, readyFile)
 	if _, err := os.Lstat(filepath.Join(config.DataDir, "sqlite.db.local-restore.json")); !os.IsNotExist(err) {
 		t.Fatalf("restore journal remains after first suffix application: %v", err)

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
 
@@ -22,6 +23,7 @@ var ErrCompacted = errors.New("QuePaxa history compacted")
 var localCheckpointCrashBoundary func(string)
 
 func hitLocalCheckpointCrashBoundary(name string) {
+	localtesthooks.Hit("core:" + name)
 	if localCheckpointCrashBoundary != nil {
 		localCheckpointCrashBoundary(name)
 	}
@@ -1760,6 +1762,8 @@ func (c *Core) prepareCheckpointOwnedWithAdmission(ctx context.Context, seal Che
 	}
 	if c.localMode {
 		hitLocalCheckpointCrashBoundary("after-prepared-marker-sync-before-seal")
+	} else {
+		localtesthooks.Hit("core:after-prepared-marker-sync-before-seal")
 	}
 	c.mu.Lock()
 	for _, value := range pending {

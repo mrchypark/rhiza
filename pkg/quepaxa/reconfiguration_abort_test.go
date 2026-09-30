@@ -120,7 +120,7 @@ func TestAbortPendingAdditionPreservesOldConfigurationAcrossCompactionAndRestart
 		t.Fatal(err)
 	}
 	wals["a"] = reopened
-	transport.cores["a"] = restarted
+	transport.setCore("a", restarted)
 	if restarted.CompactionFloor() != index || restarted.ConfigID() != initial.ConfigID {
 		t.Fatalf("restart floor=%d config=%d", restarted.CompactionFloor(), restarted.ConfigID())
 	}
