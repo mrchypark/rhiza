@@ -20,7 +20,7 @@ bench_count=${RHIZA_BENCH_COUNT:-10}
 bench_time=${RHIZA_BENCH_TIME:-1s}
 bench_procs=${RHIZA_BENCH_PROCS:-2}
 network_optimization=${RHIZA_BENCH_NETWORK_OPTIMIZATION:-none}
-packages=(qlog quepaxa recovery materializer network)
+packages=(qlog quepaxa recovery materializer network internal-types)
 network_benchmark='^Benchmark(ThreePeerSQLExecute|CertifiedThreePeerSQLExecute|ThreePeerSQLExecuteReturning)'
 case "$network_optimization" in
 	none) ;;
@@ -59,6 +59,7 @@ fi
 # Keep new candidate-only measurements comparable by running identical fixtures
 # against the base implementation.
 for fixture in \
+	internal/types/value_benchmark_test.go \
 	pkg/quepaxa/durable_prefix_bench_test.go \
 	pkg/materializer/sql_authorizer_bench_test.go \
 	pkg/materializer/graph_prune_bench_test.go; do
@@ -68,10 +69,15 @@ done
 build_revision() {
 	local label=$1
 	local source=$2
+	local package test_package
 	for package in "${packages[@]}"; do
+		test_package="./pkg/$package"
+		if [[ $package == internal-types ]]; then
+			test_package=./internal/types
+		fi
 		(
 			cd "$source"
-			CGO_ENABLED=0 go test -c -o "$work_root/bin/$label-$package.test" "./pkg/$package"
+			CGO_ENABLED=0 go test -c -o "$work_root/bin/$label-$package.test" "$test_package"
 		)
 	done
 }
@@ -99,10 +105,11 @@ run_revision() {
 	for package in "${packages[@]}"; do
 		case "$package" in
 			qlog) selected=('^BenchmarkWAL(AppendSync|ScanScratch)$') ;;
-			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$' '^BenchmarkEnsureDurableThroughRetainedPrefix$') ;;
+			quepaxa) selected=('^BenchmarkCorePropose(ThreePeersParallel|CertifiedThreePeersParallel)$' '^BenchmarkDecisionsFromBounded$' '^BenchmarkEnsureDurableThroughRetainedPrefix$' '^BenchmarkCoreReadIndexThreePeers$') ;;
 			recovery) selected=('^BenchmarkArchiveMemoryPublication$' '^BenchmarkAuthenticatedMembershipCheckpointProof$' '^BenchmarkArchiveHeadEvidenceStages$') ;;
 			materializer) selected=('^Benchmark(SQLBatchApply|GraphApply|GraphQuery4096Nodes|LatticeAppMetadataUpdate4096Keys)$' '^BenchmarkGraphSnapshotFreezeByDatabaseSize$' '^BenchmarkSQLAuthorizerSchemaCount$' '^BenchmarkGraphPruneSparseSlotsAndBatchSize$') ;;
 			network) selected=("$network_benchmark") ;;
+			internal-types) selected=('^BenchmarkSQLBatchCodec$') ;;
 		esac
 		# Go treats benchmark patterns with no match as a successful run, so
 		# candidate-only benchmarks remain compatible with older baselines.
