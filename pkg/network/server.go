@@ -36,6 +36,13 @@ var (
 	ErrReadVersionMismatch     = errors.New("read version mismatch")
 )
 
+// proposalAdmissionOverload identifies only a proposal rejected before it was
+// admitted. It preserves the public overload text and errors.Is contract.
+type proposalAdmissionOverload struct{}
+
+func (proposalAdmissionOverload) Error() string { return ErrOverloaded.Error() }
+func (proposalAdmissionOverload) Unwrap() error { return ErrOverloaded }
+
 // CommitUnknownError means a mutation may commit despite the failed call.
 // Retrying the same request ID resolves the outcome without duplicating it.
 type CommitUnknownError struct {
@@ -529,20 +536,20 @@ func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *muta
 	}
 	if len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB {
 		s.proposeMu.Unlock()
-		return 0, ErrOverloaded
+		return 0, proposalAdmissionOverload{}
 	}
 	select {
 	case s.localCap <- struct{}{}:
 	default:
 		s.proposeMu.Unlock()
-		return 0, ErrOverloaded
+		return 0, proposalAdmissionOverload{}
 	}
 	select {
 	case s.operationCap <- struct{}{}:
 	default:
 		<-s.localCap
 		s.proposeMu.Unlock()
-		return 0, ErrOverloaded
+		return 0, proposalAdmissionOverload{}
 	}
 	call := &proposalCall{done: make(chan struct{})}
 	if !s.retainProposalLease(call, lease) {

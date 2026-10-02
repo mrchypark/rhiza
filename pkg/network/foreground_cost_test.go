@@ -29,12 +29,14 @@ import (
 )
 
 const (
-	foregroundAPIWorkers              = 16
-	foregroundAPIKeys                 = 4096
-	foregroundAPIValue                = 1024
-	foregroundAPISeedLogEvery         = 512
-	foregroundAPIWindowTotal          = 150 * time.Second
-	foregroundAPIWindowCleanupReserve = 15 * time.Second
+	foregroundAPIWorkers                   = 16
+	foregroundAPIKeys                      = 4096
+	foregroundAPIValue                     = 1024
+	foregroundAPISeedLogEvery              = 512
+	foregroundAPIWindowTotal               = 150 * time.Second
+	foregroundAPIWindowCleanupReserve      = 15 * time.Second
+	foregroundCheckpointBarrierMaxAttempts = 50
+	foregroundCheckpointBarrierRetryDelay  = 20 * time.Millisecond
 )
 
 var errForegroundAPISeedBudgetExpired = errors.New("foreground API seed budget expired")
@@ -51,6 +53,12 @@ type foregroundAPIPeers struct {
 	listeners   []*quic.Transport
 	connections []net.PacketConn
 	wals        []*qlog.WAL
+}
+
+type foregroundCheckpointBarrierStats struct {
+	attempts          atomic.Uint64
+	retries           atomic.Uint64
+	admissionRefusals atomic.Uint64
 }
 
 func newForegroundAPIPeers(t testing.TB, root string) *foregroundAPIPeers {
@@ -665,6 +673,7 @@ func TestForegroundAPICost(t *testing.T) {
 	var maintenanceErrors atomic.Uint64
 	firstMaintenanceError := "none"
 	var checkpointPublications atomic.Uint64
+	checkpointBarrierStats := &foregroundCheckpointBarrierStats{}
 	var maintenanceWG sync.WaitGroup
 	var checkpointBucket *objmetrics.MeteredBucket
 	var checkpointManager *checkpoint.Manager
@@ -686,7 +695,7 @@ func TestForegroundAPICost(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		checkpointer = foregroundCheckpointPublisher(cluster, checkpointManager, archive)
+		checkpointer = foregroundCheckpointPublisher(cluster, checkpointManager, archive, checkpointBarrierStats)
 		checkpointMaintenance = "full publisher claim, snapshot/upload, peer prepare quorum, certified seal, CURRENT CAS promotion, and fresh-manager readback verification"
 	}
 	if scenario == "gc-active" {
@@ -765,9 +774,12 @@ func TestForegroundAPICost(t *testing.T) {
 		"total_successful_ops_per_second":     float64(len(putStats.success)+len(getStats.success)) / 120,
 		"total_all_completion_ops_per_second": float64(len(putStats.all)+len(getStats.all)) / 120,
 		"maintenance_errors":                  maintenanceErrors.Load(), "maintenance_first_error": firstMaintenanceError,
-		"checkpoint_publications_verified": checkpointPublications.Load(),
-		"storage":                          "local filesystem object-store fixture",
-		"go":                               runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0),
+		"checkpoint_publications_verified":      checkpointPublications.Load(),
+		"checkpoint_barrier_attempts":           checkpointBarrierStats.attempts.Load(),
+		"checkpoint_barrier_retries":            checkpointBarrierStats.retries.Load(),
+		"checkpoint_barrier_admission_refusals": checkpointBarrierStats.admissionRefusals.Load(),
+		"storage":                               "local filesystem object-store fixture",
+		"go":                                    runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -800,7 +812,107 @@ func configureForegroundCheckpoint(t testing.TB, peers *foregroundAPIPeers, buck
 	return peers.checkpoints["n1"], nil
 }
 
-func foregroundCheckpointPublisher(peers *foregroundAPIPeers, manager *checkpoint.Manager, archive *recovery.Manager) *checkpoint.AutoCheckpointer {
+func retryForegroundCheckpointBarrier(ctx context.Context, value []byte, stats *foregroundCheckpointBarrierStats, propose func(context.Context, []byte) error) error {
+	for attempt := 0; attempt < foregroundCheckpointBarrierMaxAttempts; attempt++ {
+		if attempt > 0 {
+			stats.retries.Add(1)
+		}
+		stats.attempts.Add(1)
+		err := propose(ctx, value)
+		if err == nil {
+			return nil
+		}
+		var admissionErr proposalAdmissionOverload
+		if !errors.As(err, &admissionErr) {
+			return err
+		}
+		stats.admissionRefusals.Add(1)
+		if attempt+1 == foregroundCheckpointBarrierMaxAttempts {
+			return err
+		}
+		timer := time.NewTimer(foregroundCheckpointBarrierRetryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		}
+	}
+	return proposalAdmissionOverload{}
+}
+
+func TestForegroundCheckpointBarrierRetriesOnlyTypedPreAdmissionOverload(t *testing.T) {
+	t.Run("same barrier payload retries after admission refusal", func(t *testing.T) {
+		ctx := context.Background()
+		stats := &foregroundCheckpointBarrierStats{}
+		value := []byte("same-read-barrier")
+		var calls int
+		err := retryForegroundCheckpointBarrier(ctx, value, stats, func(_ context.Context, got []byte) error {
+			calls++
+			if !bytes.Equal(got, value) {
+				t.Fatalf("retry payload=%q, want unchanged %q", got, value)
+			}
+			if calls == 1 {
+				return fmt.Errorf("wrapped advance: %w", proposalAdmissionOverload{})
+			}
+			return nil
+		})
+		if err != nil || calls != 2 || stats.attempts.Load() != 2 || stats.retries.Load() != 1 || stats.admissionRefusals.Load() != 1 {
+			t.Fatalf("err=%v calls=%d attempts=%d retries=%d refusals=%d", err, calls, stats.attempts.Load(), stats.retries.Load(), stats.admissionRefusals.Load())
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "untyped overload", err: ErrOverloaded},
+		{name: "commit outcome unknown", err: fmt.Errorf("%w: proposal already admitted", ErrCommitUnknown)},
+		{name: "fencing", err: errors.New("publisher fenced")},
+	} {
+		t.Run(test.name+" is not retried", func(t *testing.T) {
+			stats := &foregroundCheckpointBarrierStats{}
+			calls := 0
+			err := retryForegroundCheckpointBarrier(context.Background(), []byte("barrier"), stats, func(context.Context, []byte) error {
+				calls++
+				return test.err
+			})
+			if !errors.Is(err, test.err) || calls != 1 || stats.attempts.Load() != 1 || stats.retries.Load() != 0 {
+				t.Fatalf("err=%v calls=%d attempts=%d retries=%d", err, calls, stats.attempts.Load(), stats.retries.Load())
+			}
+		})
+	}
+
+	t.Run("cancellation during retry wait", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		stats := &foregroundCheckpointBarrierStats{}
+		calls := 0
+		err := retryForegroundCheckpointBarrier(ctx, []byte("barrier"), stats, func(context.Context, []byte) error {
+			calls++
+			cancel()
+			return proposalAdmissionOverload{}
+		})
+		if !errors.Is(err, context.Canceled) || calls != 1 || stats.attempts.Load() != 1 || stats.retries.Load() != 0 {
+			t.Fatalf("err=%v calls=%d attempts=%d retries=%d", err, calls, stats.attempts.Load(), stats.retries.Load())
+		}
+	})
+
+	t.Run("attempt cap preserves overload cause", func(t *testing.T) {
+		stats := &foregroundCheckpointBarrierStats{}
+		calls := 0
+		err := retryForegroundCheckpointBarrier(context.Background(), []byte("barrier"), stats, func(context.Context, []byte) error {
+			calls++
+			return proposalAdmissionOverload{}
+		})
+		var admissionErr proposalAdmissionOverload
+		if !errors.As(err, &admissionErr) || calls != foregroundCheckpointBarrierMaxAttempts || stats.attempts.Load() != foregroundCheckpointBarrierMaxAttempts || stats.retries.Load() != foregroundCheckpointBarrierMaxAttempts-1 {
+			t.Fatalf("err=%v calls=%d attempts=%d retries=%d", err, calls, stats.attempts.Load(), stats.retries.Load())
+		}
+	})
+}
+
+func foregroundCheckpointPublisher(peers *foregroundAPIPeers, manager *checkpoint.Manager, archive *recovery.Manager, barrierStats *foregroundCheckpointBarrierStats) *checkpoint.AutoCheckpointer {
 	core, server, material := peers.cores["n1"], peers.servers["n1"], peers.materials["n1"]
 	transport := peers.transports[0]
 	auto := checkpoint.NewAutoCheckpointer(manager, material, 1, time.Hour)
@@ -819,7 +931,10 @@ func foregroundCheckpointPublisher(peers *foregroundAPIPeers, manager *checkpoin
 			if _, err := rand.Read(nonce[:]); err != nil {
 				return err
 			}
-			if _, err := server.ProposeControl(ctx, types.EncodeReadBarrier(nonce)); err != nil {
+			if err := retryForegroundCheckpointBarrier(ctx, types.EncodeReadBarrier(nonce), barrierStats, func(proposalCtx context.Context, value []byte) error {
+				_, err := server.ProposeControl(proposalCtx, value)
+				return err
+			}); err != nil {
 				return err
 			}
 		}
@@ -959,10 +1074,52 @@ func TestForegroundAPICheckpointUsesCertifiedLoopbackPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkpointer := foregroundCheckpointPublisher(peers, manager, archive)
+	barrierStats := &foregroundCheckpointBarrierStats{}
+	checkpointer := foregroundCheckpointPublisher(peers, manager, archive, barrierStats)
 	for i, requestID := range []string{"foreground-checkpoint-fixture-1", "foreground-checkpoint-fixture-2"} {
 		if _, err := server.KVPut(ctx, KVMutationRequest{RequestID: requestID, Key: "key", Value: []byte(fmt.Sprintf("value-%d", i))}); err != nil {
 			t.Fatal(err)
+		}
+		if i == 0 {
+			if len(server.localCap) != 0 {
+				t.Fatalf("local proposal permits unexpectedly occupied before fixture setup: %d", len(server.localCap))
+			}
+			for range cap(server.localCap) {
+				server.localCap <- struct{}{}
+			}
+			publication := make(chan struct {
+				created bool
+				err     error
+			}, 1)
+			go func() {
+				created, err := createForegroundCertifiedCheckpoint(ctx, checkpointer, manager, checkpointBucket, archive, peers)
+				publication <- struct {
+					created bool
+					err     error
+				}{created: created, err: err}
+			}()
+			waitUntil := time.Now().Add(2 * time.Second)
+			for barrierStats.admissionRefusals.Load() == 0 && time.Now().Before(waitUntil) {
+				time.Sleep(time.Millisecond)
+			}
+			sawRefusal := barrierStats.admissionRefusals.Load() > 0
+			for range cap(server.localCap) {
+				<-server.localCap
+			}
+			result := <-publication
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			if !result.created {
+				t.Fatalf("checkpoint publication helper did not publish certified CURRENT %d", i+1)
+			}
+			if !sawRefusal {
+				t.Fatal("checkpoint advance did not report the held proposal admission slots")
+			}
+			if barrierStats.attempts.Load() < 2 || barrierStats.retries.Load() == 0 {
+				t.Fatalf("barrier attempts=%d retries=%d; want an observed admission retry", barrierStats.attempts.Load(), barrierStats.retries.Load())
+			}
+			continue
 		}
 		created, err := createForegroundCertifiedCheckpoint(ctx, checkpointer, manager, checkpointBucket, archive, peers)
 		if err != nil {

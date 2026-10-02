@@ -924,6 +924,57 @@ func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 	}
 }
 
+func TestProposeWithLeaseMarksOnlyPreAdmissionCapacityRejections(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Server)
+	}{
+		{
+			name: "encoded-byte-budget",
+			setup: func(server *Server) {
+				server.proposeMu.Lock()
+				server.localB = maxInflightEncodedByte
+				server.proposeMu.Unlock()
+			},
+		},
+		{
+			name: "local-proposal-permits",
+			setup: func(server *Server) {
+				for range cap(server.localCap) {
+					server.localCap <- struct{}{}
+				}
+			},
+		},
+		{
+			name: "operation-permits",
+			setup: func(server *Server) {
+				for range cap(server.operationCap) {
+					server.operationCap <- struct{}{}
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+			material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer material.Close()
+			server := NewServer(core, material, "cluster", true, nil)
+			defer server.Close()
+			test.setup(server)
+
+			_, err = server.ProposeControl(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{1}))
+			var admissionErr proposalAdmissionOverload
+			if !errors.As(err, &admissionErr) || !errors.Is(err, ErrOverloaded) || err.Error() != ErrOverloaded.Error() {
+				t.Fatalf("error=%v; want typed pre-admission overload with public sentinel text", err)
+			}
+		})
+	}
+}
+
 func TestServerCloseCancelsAndWaitsForInflightMutation(t *testing.T) {
 	members := []quepaxa.Member{{ID: "n1"}}
 	core := mustCore(t, "n1", members, nil, nil)
