@@ -47,6 +47,7 @@ type Node struct {
 	localStore                *localCheckpointIdentity
 	localRoot                 *localCheckpointDescriptor
 	localRestoreSuffixPending bool
+	recoveryPhases            nodeRecoveryPhases
 	ready                     atomic.Bool
 	membershipMu              sync.Mutex
 	opened                    atomic.Bool
@@ -56,6 +57,20 @@ type Node struct {
 	replayMu                  sync.Mutex
 	compactionMu              sync.Mutex
 	catchUpWake               chan struct{}
+}
+
+// nodeRecoveryPhases records the selected certified checkpoint restore path.
+// It is written synchronously during open and observed after Open returns.
+type nodeRecoveryPhases struct {
+	selectedCheckpoint               bool
+	checkpointIndex                  uint64
+	checkpointRootHash               [32]byte
+	checkpointDownloadVerify         time.Duration
+	checkpointDownloadVerifyStarted  bool
+	checkpointDownloadVerifyComplete bool
+	materializerRestore              time.Duration
+	materializerRestoreStarted       bool
+	materializerRestoreComplete      bool
 }
 
 // New creates a new Node.
@@ -219,6 +234,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")
 	}
+	n.recoveryPhases = nodeRecoveryPhases{}
 	defer func() {
 		if err != nil {
 			_ = n.Shutdown()
@@ -715,12 +731,19 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			if quepaxa.Slot(certifiedCheckpoint.Index) > core.Tip() {
 				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", certifiedCheckpoint.Index, core.Tip())
 			}
+			n.recoveryPhases.selectedCheckpoint = true
+			n.recoveryPhases.checkpointIndex = certifiedCheckpoint.Index
+			n.recoveryPhases.checkpointRootHash = certifiedCheckpoint.RootHash
 			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
 			if fileErr != nil {
 				return fileErr
 			}
 			defer os.RemoveAll(dir)
+			n.recoveryPhases.checkpointDownloadVerifyStarted = true
+			downloadStarted := time.Now()
 			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+			n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
+			n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
 			if readErr != nil {
 				return readErr
 			}
@@ -728,9 +751,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			for _, file := range files {
 				materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
 			}
+			n.recoveryPhases.materializerRestoreStarted = true
+			restoreStarted := time.Now()
 			if restoreErr := material.RestoreCheckpoint(startupRecovery.Context(), materialFiles); restoreErr != nil {
+				n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
 				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
 			}
+			n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
+			n.recoveryPhases.materializerRestoreComplete = true
 		}
 	}
 

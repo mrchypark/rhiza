@@ -97,3 +97,38 @@ bottleneck or optimization from the matrix without paired results.
 Hosted-runner absolute throughput remains diagnostic. Use paired deltas for PR
 decisions and retain the Dory matrix for Kubernetes, fault, and object-store
 qualification.
+
+## Issue #185 local S3 cost evidence
+
+Use the `Performance` workflow's `workflow_dispatch` input
+`issue185_cost_evidence=true` to run the opt-in #185 evidence job. It is
+separate from the ordinary paired benchmark job and runs the provider-backed
+fixtures serially on a `macos-15` arm64 runner. The job downloads the official
+Versity Gateway v1.8.0 Darwin arm64 archive and verifies its SHA-256
+(`4953096f65a9c0d62ab184fb6b2ba7c2435229205cf00a56cb62cd4bf6b216ca`) before
+starting tests. Each S3 fixture starts its own loopback gateway with a fresh
+temporary POSIX root and generated test credentials; it does not use ambient
+credentials or cloud storage.
+
+The run selects `TestVersityGatewayCostEvidence` and
+`TestVersitySDKRetryEvidence`, followed by `TestCheckpointCost`,
+`TestArchiveGCCost`, and
+`TestCheckpointRestoreCostExercisesNodeRecoveryPathS3`, then runs
+`TestForegroundAPICost` serially for `baseline`, `checkpoint-active`, and
+`gc-active`, three repetitions each. Each foreground repetition retains its
+30-second warm-up and 120-second measured window. The restore case publishes a
+certified checkpoint through one node, removes only the local SQLite files,
+then verifies that a second `Node.Open` recovers the value and reaches ready.
+
+The artifact `issue-185-cost-evidence-<run_id>` includes the exact commands,
+per-command exit codes, environment and binary provenance, Go output, and raw
+Versity access records. Server request records and client transport-attempt
+counters are reported independently. Retry attribution remains unknown when
+the SDK supplies no recognized attempt metadata; it must not be reported as
+zero. The retry control fixture injects one 503 through a local reverse proxy:
+it expects two client attempts, one injected failure, and one request reaching
+the Versity backend. That establishes the controlled fixture's retry, not a
+general retry count for other operations; SDK retry metadata can remain
+unknown. Upload-attempt bytes, per-upload acknowledged bytes, and winner/root
+reachable bytes are distinct measures. The local Versity results are local S3
+compatibility evidence only—not AWS/GCS qualification or a release gate.

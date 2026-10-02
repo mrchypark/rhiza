@@ -89,7 +89,7 @@ func TestMeteredBucketCountsBytesAndHTTPAttempts(t *testing.T) {
 	request.Header.Set("amz-sdk-request", "attempt=2; max=3")
 	_, _ = transport.RoundTrip(request)
 	stats := bucket.Stats()
-	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.HTTPRequests != 1 || stats.HTTPFailures != 1 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 || stats.HTTPGetRequests != 1 || stats.SDKRetries != 1 || stats.HTTP5xx != 1 {
+	if stats.Uploads != 1 || stats.Gets != 1 || stats.BytesUploaded != 3 || stats.BytesDownloaded != 3 || stats.HTTPRequests != 1 || stats.HTTPFailures != 1 || stats.S3HTTPRequests != 1 || stats.S3HTTPFailures != 1 || stats.HTTPGetRequests != 1 || stats.SDKRetries != 1 || stats.RetryMetadataRequests != 1 || stats.RetryMetadataUnknownRequests != 0 || stats.HTTP5xx != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
@@ -130,17 +130,75 @@ func TestMeteredBucketClassifiesHTTPMethods(t *testing.T) {
 	}
 }
 
-func TestAWSSDKRetry(t *testing.T) {
-	for header, want := range map[string]bool{
-		"attempt=1; max=10":  false,
-		"attempt=2; max=10":  true,
-		"attempt=10; max=10": true,
-		"attempt=unknown":    false,
-		"":                   false,
-	} {
-		if got := awsSDKRetry(header); got != want {
-			t.Errorf("awsSDKRetry(%q) = %t, want %t", header, got, want)
+func TestHTTPAttemptBodyBytesAndRetryMetadataAvailability(t *testing.T) {
+	metrics := &bucketMetrics{}
+	transport := metrics.transport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if _, err := io.Copy(io.Discard, request.Body); err != nil {
+			return nil, err
 		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("response"))}, nil
+	}))
+	request, err := http.NewRequest(http.MethodPut, "http://s3.test/object", strings.NewReader("request-body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, response.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics).Stats()
+	if stats.HTTPRequestBodyBytes != uint64(len("request-body")) || stats.HTTPResponseBodyBytes != uint64(len("response")) {
+		t.Fatalf("consumed attempt body bytes: request=%d response=%d", stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes)
+	}
+	if stats.RetryMetadataRequests != 0 || stats.RetryMetadataUnknownRequests != 1 || stats.SDKRetries != 0 {
+		t.Fatalf("missing retry metadata was not reported as unknown: %+v", stats)
+	}
+}
+
+func TestAWSSDKRetry(t *testing.T) {
+	for header, want := range map[string]struct{ retry, recognized bool }{
+		"attempt=1; max=10":  {false, true},
+		"attempt=2; max=10":  {true, true},
+		"attempt=10; max=10": {true, true},
+		"attempt=unknown":    {false, false},
+		"attempt=0":          {false, false},
+		"max=10":             {false, false},
+		"":                   {false, false},
+	} {
+		if retry, recognized := awsSDKRetry(header); retry != want.retry || recognized != want.recognized {
+			t.Errorf("awsSDKRetry(%q) = (%t, %t), want (%t, %t)", header, retry, recognized, want.retry, want.recognized)
+		}
+	}
+}
+
+func TestRetryMetadataStatsRequireRecognizedAttempt(t *testing.T) {
+	metrics := &bucketMetrics{}
+	transport := metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	}))
+	for _, header := range []string{"", "attempt=unknown", "max=10", "attempt=1; max=10", "attempt=2; max=10"} {
+		request, err := http.NewRequest(http.MethodGet, "http://example.test/object", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header != "" {
+			request.Header.Set("amz-sdk-request", header)
+		}
+		response, err := transport.RoundTrip(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+	}
+	stats := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics).Stats()
+	if stats.RetryMetadataRequests != 2 || stats.RetryMetadataUnknownRequests != 3 || stats.SDKRetries != 1 {
+		t.Fatalf("retry metadata classification: known=%d unknown=%d retries=%d; want 2, 3, 1", stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests, stats.SDKRetries)
 	}
 }
 

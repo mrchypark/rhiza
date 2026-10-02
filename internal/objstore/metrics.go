@@ -16,44 +16,52 @@ import (
 // BytesUploaded counts bytes read for upload attempts; BytesPublished counts
 // bytes from Upload calls acknowledged without error by the provider.
 type Stats struct {
-	Uploads            uint64 `json:"uploads"`
-	Gets               uint64 `json:"gets"`
-	Lists              uint64 `json:"lists"`
-	Heads              uint64 `json:"heads"`
-	Deletes            uint64 `json:"deletes"`
-	Failures           uint64 `json:"failures"`
-	BytesUploaded      uint64 `json:"bytes_uploaded"`
-	BytesPublished     uint64 `json:"bytes_published"`
-	BytesDownloaded    uint64 `json:"bytes_downloaded"`
-	HTTPRequests       uint64 `json:"http_requests"`
-	HTTPFailures       uint64 `json:"http_failures"`
-	S3HTTPRequests     uint64 `json:"s3_http_requests"`
-	S3HTTPFailures     uint64 `json:"s3_http_failures"`
-	HTTPGetRequests    uint64 `json:"http_get_requests"`
-	HTTPPutRequests    uint64 `json:"http_put_requests"`
-	HTTPHeadRequests   uint64 `json:"http_head_requests"`
-	HTTPDeleteRequests uint64 `json:"http_delete_requests"`
-	HTTPOtherRequests  uint64 `json:"http_other_requests"`
-	ConditionConflicts uint64 `json:"condition_conflicts"`
-	DedupHits          uint64 `json:"dedup_hits"`
-	SDKRetries         uint64 `json:"sdk_retries"`
-	TransportFailures  uint64 `json:"transport_failures"`
-	Unexpected4xx      uint64 `json:"http_4xx_unexpected"`
-	HTTP5xx            uint64 `json:"http_5xx"`
+	Uploads         uint64 `json:"uploads"`
+	Gets            uint64 `json:"gets"`
+	Lists           uint64 `json:"lists"`
+	Heads           uint64 `json:"heads"`
+	Deletes         uint64 `json:"deletes"`
+	Failures        uint64 `json:"failures"`
+	BytesUploaded   uint64 `json:"bytes_uploaded"`
+	BytesPublished  uint64 `json:"bytes_published"`
+	BytesDownloaded uint64 `json:"bytes_downloaded"`
+	HTTPRequests    uint64 `json:"http_requests"`
+	// HTTP body bytes are read by the transport wrappers; they exclude protocol overhead.
+	HTTPRequestBodyBytes  uint64 `json:"http_request_body_bytes"`
+	HTTPResponseBodyBytes uint64 `json:"http_response_body_bytes"`
+	HTTPFailures          uint64 `json:"http_failures"`
+	S3HTTPRequests        uint64 `json:"s3_http_requests"`
+	S3HTTPFailures        uint64 `json:"s3_http_failures"`
+	HTTPGetRequests       uint64 `json:"http_get_requests"`
+	HTTPPutRequests       uint64 `json:"http_put_requests"`
+	HTTPHeadRequests      uint64 `json:"http_head_requests"`
+	HTTPDeleteRequests    uint64 `json:"http_delete_requests"`
+	HTTPOtherRequests     uint64 `json:"http_other_requests"`
+	ConditionConflicts    uint64 `json:"condition_conflicts"`
+	DedupHits             uint64 `json:"dedup_hits"`
+	SDKRetries            uint64 `json:"sdk_retries"`
+	// RetryMetadataRequests counts recognized attempt metadata; unknown counts missing or unusable metadata.
+	RetryMetadataRequests        uint64 `json:"retry_metadata_requests"`
+	RetryMetadataUnknownRequests uint64 `json:"retry_metadata_unknown_requests"`
+	TransportFailures            uint64 `json:"transport_failures"`
+	Unexpected4xx                uint64 `json:"http_4xx_unexpected"`
+	HTTP5xx                      uint64 `json:"http_5xx"`
 }
 
 type bucketMetrics struct {
-	uploads, gets, lists, heads, deletes atomic.Uint64
-	failures                             atomic.Uint64
-	bytesUploaded, bytesDownloaded       atomic.Uint64
-	bytesPublished                       atomic.Uint64
-	httpRequests, httpFailures           atomic.Uint64
-	httpGetRequests, httpPutRequests     atomic.Uint64
-	httpHeadRequests, httpDeleteRequests atomic.Uint64
-	httpOtherRequests                    atomic.Uint64
-	conditionConflicts, dedupHits        atomic.Uint64
-	sdkRetries, transportFailures        atomic.Uint64
-	unexpected4xx, http5xx               atomic.Uint64
+	uploads, gets, lists, heads, deletes                            atomic.Uint64
+	failures                                                        atomic.Uint64
+	bytesUploaded, bytesDownloaded                                  atomic.Uint64
+	bytesPublished                                                  atomic.Uint64
+	httpRequests, httpRequestBodyBytes, httpResponseBodyBytes       atomic.Uint64
+	httpFailures                                                    atomic.Uint64
+	httpGetRequests, httpPutRequests                                atomic.Uint64
+	httpHeadRequests, httpDeleteRequests                            atomic.Uint64
+	httpOtherRequests                                               atomic.Uint64
+	conditionConflicts, dedupHits                                   atomic.Uint64
+	sdkRetries, retryMetadataRequests, retryMetadataUnknownRequests atomic.Uint64
+	transportFailures                                               atomic.Uint64
+	unexpected4xx, http5xx                                          atomic.Uint64
 }
 
 type expectedNotFoundKey struct{}
@@ -100,13 +108,15 @@ func (b *MeteredBucket) Stats() Stats {
 		Heads: b.metrics.heads.Load(), Deletes: b.metrics.deletes.Load(), Failures: b.metrics.failures.Load(),
 		BytesUploaded: b.metrics.bytesUploaded.Load(), BytesDownloaded: b.metrics.bytesDownloaded.Load(),
 		BytesPublished: b.metrics.bytesPublished.Load(),
-		HTTPRequests:   httpRequests, HTTPFailures: httpFailures,
+		HTTPRequests:   httpRequests, HTTPRequestBodyBytes: b.metrics.httpRequestBodyBytes.Load(),
+		HTTPResponseBodyBytes: b.metrics.httpResponseBodyBytes.Load(), HTTPFailures: httpFailures,
 		S3HTTPRequests: httpRequests, S3HTTPFailures: httpFailures,
 		HTTPGetRequests: b.metrics.httpGetRequests.Load(), HTTPPutRequests: b.metrics.httpPutRequests.Load(),
 		HTTPHeadRequests: b.metrics.httpHeadRequests.Load(), HTTPDeleteRequests: b.metrics.httpDeleteRequests.Load(),
 		HTTPOtherRequests:  b.metrics.httpOtherRequests.Load(),
 		ConditionConflicts: b.metrics.conditionConflicts.Load(), DedupHits: b.metrics.dedupHits.Load(),
-		SDKRetries: b.metrics.sdkRetries.Load(), TransportFailures: b.metrics.transportFailures.Load(),
+		SDKRetries: b.metrics.sdkRetries.Load(), RetryMetadataRequests: b.metrics.retryMetadataRequests.Load(),
+		RetryMetadataUnknownRequests: b.metrics.retryMetadataUnknownRequests.Load(), TransportFailures: b.metrics.transportFailures.Load(),
 		Unexpected4xx: b.metrics.unexpected4xx.Load(), HTTP5xx: b.metrics.http5xx.Load(),
 	}
 }
@@ -212,8 +222,17 @@ func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 		default:
 			m.httpOtherRequests.Add(1)
 		}
-		if awsSDKRetry(request.Header.Get("amz-sdk-request")) {
+		retry, recognized := awsSDKRetry(request.Header.Get("amz-sdk-request"))
+		if recognized {
+			m.retryMetadataRequests.Add(1)
+		} else {
+			m.retryMetadataUnknownRequests.Add(1)
+		}
+		if retry {
 			m.sdkRetries.Add(1)
+		}
+		if request.Body != nil {
+			request.Body = &countingReadCloser{ReadCloser: request.Body, count: &m.httpRequestBodyBytes}
 		}
 		response, err := next.RoundTrip(request)
 		if err != nil {
@@ -239,7 +258,7 @@ func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 			statusFailure = true
 		}
 		if response.Body != nil {
-			response.Body = &countingReadCloser{ReadCloser: response.Body, onReadError: func() {
+			response.Body = &countingReadCloser{ReadCloser: response.Body, count: &m.httpResponseBodyBytes, onReadError: func() {
 				m.transportFailures.Add(1)
 				if !statusFailure {
 					m.httpFailures.Add(1)
@@ -252,16 +271,19 @@ func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 
 // awsSDKRetry recognizes the AWS SDK's documented attempt header. Other
 // providers do not expose a shared retry-attempt header at this transport layer.
-func awsSDKRetry(value string) bool {
+func awsSDKRetry(value string) (retry, recognized bool) {
 	for _, part := range strings.Split(value, ";") {
 		attempt, ok := strings.CutPrefix(strings.TrimSpace(part), "attempt=")
 		if !ok {
 			continue
 		}
 		n, err := strconv.Atoi(attempt)
-		return err == nil && n > 1
+		if err != nil || n < 1 {
+			return false, false
+		}
+		return n > 1, true
 	}
-	return false
+	return false, false
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
