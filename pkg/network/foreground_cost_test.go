@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +61,79 @@ type foregroundCheckpointBarrierStats struct {
 	attempts          atomic.Uint64
 	retries           atomic.Uint64
 	admissionRefusals atomic.Uint64
+	successes         atomic.Uint64
+	failures          atomic.Uint64
+}
+
+type foregroundLearnObservation struct {
+	mu    sync.Mutex
+	first string
+	count int
+}
+
+func (o *foregroundLearnObservation) capture(event string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.first == "" && strings.HasPrefix(event, "network:foreground-learn-failure:") {
+		o.first = event
+	}
+	if strings.HasPrefix(event, "network:foreground-learn-failure:") {
+		o.count++
+	}
+}
+
+func (o *foregroundLearnObservation) eventCount() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.count
+}
+
+func (o *foregroundLearnObservation) firstEvent() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.first
+}
+
+func foregroundLearnEventField(event, name string) string {
+	for _, field := range strings.Split(event, ":") {
+		key, value, ok := strings.Cut(field, "=")
+		if ok && key == name {
+			return value
+		}
+	}
+	return ""
+}
+
+func foregroundLearnObservationSummary(peers *foregroundAPIPeers, observation *foregroundLearnObservation) string {
+	event := observation.firstEvent()
+	if event == "" {
+		return "none"
+	}
+	var expected quepaxa.ValueHash
+	hashBytes, err := hex.DecodeString(foregroundLearnEventField(event, "hash"))
+	hasHash := err == nil && len(hashBytes) == len(expected)
+	if hasHash {
+		copy(expected[:], hashBytes)
+	}
+	slotNumber, err := strconv.ParseUint(foregroundLearnEventField(event, "slot"), 10, 64)
+	if err != nil {
+		return event + ":snapshot=unavailable"
+	}
+	slot := quepaxa.Slot(slotNumber)
+	snapshots := make([]string, 0, len(peers.cores))
+	for _, member := range peers.config.Members {
+		core := peers.cores[member.ID]
+		decision, ok := core.CertifiedValue(slot)
+		state := "missing"
+		if ok {
+			state = "different-hash"
+			if hasHash && decision.Hash == expected {
+				state = "matching-hash"
+			}
+		}
+		snapshots = append(snapshots, fmt.Sprintf("%s=%s/tip-%d", member.ID, state, core.Tip()))
+	}
+	return event + ":observation_time_local_certified=" + strings.Join(snapshots, ",")
 }
 
 func newForegroundAPIPeers(t testing.TB, root string) *foregroundAPIPeers {
@@ -633,6 +708,8 @@ func TestForegroundAPICost(t *testing.T) {
 	defer archiveBucket.Close()
 	cluster := newForegroundAPIPeers(t, filepath.Join(root, "peers"))
 	defer cluster.close()
+	learnObservation := &foregroundLearnObservation{}
+	installForegroundLearnHook(t, learnObservation)
 	server := cluster.servers["n1"]
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -672,6 +749,7 @@ func TestForegroundAPICost(t *testing.T) {
 	maintenanceEpoch := atomic.Uint64{}
 	var maintenanceErrors atomic.Uint64
 	firstMaintenanceError := "none"
+	firstLearnDiagnostic := "none"
 	var checkpointPublications atomic.Uint64
 	checkpointBarrierStats := &foregroundCheckpointBarrierStats{}
 	var maintenanceWG sync.WaitGroup
@@ -727,6 +805,10 @@ func TestForegroundAPICost(t *testing.T) {
 								if firstMaintenanceError == "none" {
 									firstMaintenanceError = observation
 									t.Logf("FOREGROUND_MAINTENANCE_ERROR %s", firstMaintenanceError)
+									firstLearnDiagnostic = foregroundLearnObservationSummary(cluster, learnObservation)
+									if firstLearnDiagnostic != "none" {
+										t.Logf("FOREGROUND_LEARN_FAILURE %s", firstLearnDiagnostic)
+									}
 								}
 							}
 						} else if created {
@@ -774,10 +856,13 @@ func TestForegroundAPICost(t *testing.T) {
 		"total_successful_ops_per_second":     float64(len(putStats.success)+len(getStats.success)) / 120,
 		"total_all_completion_ops_per_second": float64(len(putStats.all)+len(getStats.all)) / 120,
 		"maintenance_errors":                  maintenanceErrors.Load(), "maintenance_first_error": firstMaintenanceError,
+		"learn_failure_diagnostic":              firstLearnDiagnostic,
 		"checkpoint_publications_verified":      checkpointPublications.Load(),
 		"checkpoint_barrier_attempts":           checkpointBarrierStats.attempts.Load(),
 		"checkpoint_barrier_retries":            checkpointBarrierStats.retries.Load(),
 		"checkpoint_barrier_admission_refusals": checkpointBarrierStats.admissionRefusals.Load(),
+		"checkpoint_barrier_successes":          checkpointBarrierStats.successes.Load(),
+		"checkpoint_barrier_failures":           checkpointBarrierStats.failures.Load(),
 		"storage":                               "local filesystem object-store fixture",
 		"go":                                    runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0),
 	})
@@ -820,8 +905,10 @@ func retryForegroundCheckpointBarrier(ctx context.Context, value []byte, stats *
 		stats.attempts.Add(1)
 		err := propose(ctx, value)
 		if err == nil {
+			stats.successes.Add(1)
 			return nil
 		}
+		stats.failures.Add(1)
 		var admissionErr proposalAdmissionOverload
 		if !errors.As(err, &admissionErr) {
 			return err
@@ -933,6 +1020,9 @@ func foregroundCheckpointPublisher(peers *foregroundAPIPeers, manager *checkpoin
 			}
 			if err := retryForegroundCheckpointBarrier(ctx, types.EncodeReadBarrier(nonce), barrierStats, func(proposalCtx context.Context, value []byte) error {
 				_, err := server.ProposeControl(proposalCtx, value)
+				if err != nil {
+					return fmt.Errorf("read-barrier-advance: %w", err)
+				}
 				return err
 			}); err != nil {
 				return err
@@ -972,7 +1062,7 @@ func foregroundCheckpointPublisher(peers *foregroundAPIPeers, manager *checkpoin
 		}
 		sealSlot, _, err := core.Propose(ctx, value)
 		if err != nil {
-			return err
+			return fmt.Errorf("checkpoint-seal-proposal: %w", err)
 		}
 		if err := server.applyDecisions(ctx, sealSlot); err != nil {
 			return err

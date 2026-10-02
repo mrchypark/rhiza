@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -547,24 +549,56 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 	}
 	callCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	type learnerDiagnosticResult struct {
+		id  quepaxa.NodeID
+		err error
+	}
+	diagnosticKind := ""
+	var diagnosticResults *[2]learnerDiagnosticResult
+	if localtesthooks.Enabled && len(t.members) == 3 {
+		diagnosticKind = foregroundLearnDiagnosticKind(decision.Proposal.Value)
+		if diagnosticKind != "" {
+			diagnosticResults = new([2]learnerDiagnosticResult)
+		}
+	}
 	results := make(chan error, len(t.members)-1)
 	pending := 0
-	for _, member := range t.members {
-		if member.ID == t.localID {
-			continue
+	if diagnosticResults == nil {
+		for _, member := range t.members {
+			if member.ID == t.localID {
+				continue
+			}
+			pending++
+			go func(member quepaxa.Member) {
+				req := t.request(peerfb.OperationLearned)
+				req.Decision = decisionToWire(decision)
+				_, err := t.callQuorum(callCtx, member.ID, req)
+				results <- err
+			}(member)
 		}
-		pending++
-		go func(member quepaxa.Member) {
-			req := t.request(peerfb.OperationLearned)
-			req.Decision = decisionToWire(decision)
-			_, err := t.callQuorum(callCtx, member.ID, req)
-			results <- err
-		}(member)
+	} else {
+		peerIndex := 0
+		for _, member := range t.members {
+			if member.ID == t.localID {
+				continue
+			}
+			pending++
+			index := peerIndex
+			peerIndex++
+			go func(member quepaxa.Member, index int) {
+				req := t.request(peerfb.OperationLearned)
+				req.Decision = decisionToWire(decision)
+				_, err := t.callQuorum(callCtx, member.ID, req)
+				diagnosticResults[index] = learnerDiagnosticResult{id: member.ID, err: err}
+				results <- err
+			}(member, index)
+		}
 	}
 	successes := 1 // local learner
 	var firstErr error
 	for range pending {
-		if err := <-results; err != nil {
+		err := <-results
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -576,9 +610,53 @@ func (t *Transport) SendDecision(ctx context.Context, decision quepaxa.Decision)
 		}
 	}
 	if firstErr != nil {
+		if diagnosticKind != "" {
+			contextState := "active"
+			if ctx.Err() != nil {
+				contextState = foregroundLearnDiagnosticErrorCategory(ctx.Err())
+			}
+			orderedResults := diagnosticResults[:]
+			sort.Slice(orderedResults, func(i, j int) bool { return orderedResults[i].id < orderedResults[j].id })
+			peerStates := make([]string, 0, len(orderedResults))
+			for _, result := range orderedResults {
+				category := "ack"
+				if result.err != nil {
+					category = foregroundLearnDiagnosticErrorCategory(result.err)
+				}
+				peerStates = append(peerStates, fmt.Sprintf("%s=%s", result.id, category))
+			}
+			phase := "checkpoint-seal"
+			if diagnosticKind == "read-barrier" {
+				phase = "read-barrier-advance"
+			}
+			localtesthooks.Hit(fmt.Sprintf("network:foreground-learn-failure:node=%s:kind=%s:phase=%s:slot=%d:hash=%x:context=%s:local=ack:peers=%s", t.localID, diagnosticKind, phase, decision.Slot, decision.Proposal.Hash, contextState, strings.Join(peerStates, ",")))
+		}
 		return firstErr
 	}
 	return quepaxa.ErrQuorumUnavailable
+}
+
+func foregroundLearnDiagnosticKind(value []byte) string {
+	if _, checkpoint, err := quepaxa.DecodeCheckpointSeal(value); checkpoint && err == nil {
+		return "checkpoint-seal"
+	}
+	if barrier, err := quepaxa.DecodeReadBarrier(value); barrier && err == nil {
+		return "read-barrier"
+	}
+	return ""
+}
+
+func foregroundLearnDiagnosticErrorCategory(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline"
+	default:
+		return "other"
+	}
 }
 
 // sendFreezeDecision requires every recorder named by the freeze certificate.
