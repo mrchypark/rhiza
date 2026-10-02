@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -222,6 +223,39 @@ func nearestRankDurationP99(values []time.Duration) float64 {
 func stopForegroundMaintenance(cancel context.CancelFunc, workers *sync.WaitGroup) {
 	cancel()
 	workers.Wait()
+}
+
+func foregroundMaintenanceFailure(scenario, stage string, err error, ctx context.Context, elapsed time.Duration) (string, bool) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return "", false
+	}
+	if prefix, _, ok := strings.Cut(err.Error(), ": "); ok {
+		switch prefix {
+		case "checkpoint-pre-sync", "checkpoint-publication", "certified-seal-read", "certified-seal-validation", "fresh-current-readback", "fresh-current-comparison":
+			stage = prefix
+		}
+	}
+	return fmt.Sprintf("scenario=%s stage=%s error=%q error_is_canceled=%t error_is_deadline_exceeded=%t context_error=%v elapsed=%s", scenario, stage, err, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded), ctx.Err(), elapsed), true
+}
+
+func TestForegroundMaintenanceFailureKeepsCauseAndFiltersWrappedCancellation(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if observation, counted := foregroundMaintenanceFailure("checkpoint-active", "checkpoint-publication", fmt.Errorf("publication: %w", context.Canceled), canceled, time.Second); counted || observation != "" {
+		t.Fatalf("wrapped cancellation observation=%q counted=%t; want filtered", observation, counted)
+	}
+
+	deadlineErr := fmt.Errorf("archive sync: %w", context.DeadlineExceeded)
+	observation, counted := foregroundMaintenanceFailure("checkpoint-active", "checkpoint-pre-sync", deadlineErr, context.Background(), 2*time.Second)
+	if !counted || !strings.Contains(observation, "scenario=checkpoint-active") || !strings.Contains(observation, "stage=checkpoint-pre-sync") || !strings.Contains(observation, "error_is_deadline_exceeded=true") || !strings.Contains(observation, "error=\"archive sync: context deadline exceeded\"") {
+		t.Fatalf("deadline failure observation=%q counted=%t", observation, counted)
+	}
+
+	nonContextErr := errors.New("publication mismatch")
+	observation, counted = foregroundMaintenanceFailure("checkpoint-active", "fresh-current-readback", nonContextErr, canceled, 3*time.Second)
+	if !counted || !strings.Contains(observation, "context_error=context canceled") || !strings.Contains(observation, "error_is_canceled=false") {
+		t.Fatalf("non-context failure observation=%q counted=%t", observation, counted)
+	}
 }
 
 func TestStopForegroundMaintenanceCancelsBlockedOperationBeforeJoin(t *testing.T) {
@@ -629,6 +663,7 @@ func TestForegroundAPICost(t *testing.T) {
 	maintenanceActive := atomic.Bool{}
 	maintenanceEpoch := atomic.Uint64{}
 	var maintenanceErrors atomic.Uint64
+	firstMaintenanceError := "none"
 	var checkpointPublications atomic.Uint64
 	var maintenanceWG sync.WaitGroup
 	var checkpointBucket *objmetrics.MeteredBucket
@@ -673,11 +708,17 @@ func TestForegroundAPICost(t *testing.T) {
 				case <-ticker.C:
 					maintenanceEpoch.Add(1)
 					maintenanceActive.Store(true)
+					maintenanceStarted := time.Now()
 					if scenario == "checkpoint-active" {
 						created, err := createForegroundCertifiedCheckpoint(maintenanceCtx, checkpointer, checkpointManager, checkpointBucket, archive, cluster)
 						if err != nil {
-							if !errors.Is(err, context.Canceled) {
+							observation, counted := foregroundMaintenanceFailure(scenario, "checkpoint-maintenance", err, maintenanceCtx, time.Since(maintenanceStarted))
+							if counted {
 								maintenanceErrors.Add(1)
+								if firstMaintenanceError == "none" {
+									firstMaintenanceError = observation
+									t.Logf("FOREGROUND_MAINTENANCE_ERROR %s", firstMaintenanceError)
+								}
 							}
 						} else if created {
 							checkpointPublications.Add(1)
@@ -685,8 +726,13 @@ func TestForegroundAPICost(t *testing.T) {
 					}
 					if scenario == "gc-active" {
 						if err := archive.Cleanup(maintenanceCtx, 0); err != nil {
-							if !errors.Is(err, context.Canceled) {
+							observation, counted := foregroundMaintenanceFailure(scenario, "archive-cleanup", err, maintenanceCtx, time.Since(maintenanceStarted))
+							if counted {
 								maintenanceErrors.Add(1)
+								if firstMaintenanceError == "none" {
+									firstMaintenanceError = observation
+									t.Logf("FOREGROUND_MAINTENANCE_ERROR %s", firstMaintenanceError)
+								}
 							}
 						}
 					}
@@ -718,9 +764,10 @@ func TestForegroundAPICost(t *testing.T) {
 		"put": putJSON, "linearizable_get": getJSON,
 		"total_successful_ops_per_second":     float64(len(putStats.success)+len(getStats.success)) / 120,
 		"total_all_completion_ops_per_second": float64(len(putStats.all)+len(getStats.all)) / 120,
-		"maintenance_errors":                  maintenanceErrors.Load(), "checkpoint_publications_verified": checkpointPublications.Load(),
-		"storage": "local filesystem object-store fixture",
-		"go":      runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0),
+		"maintenance_errors":                  maintenanceErrors.Load(), "maintenance_first_error": firstMaintenanceError,
+		"checkpoint_publications_verified": checkpointPublications.Load(),
+		"storage":                          "local filesystem object-store fixture",
+		"go":                               runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH, "gomaxprocs": runtime.GOMAXPROCS(0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -856,10 +903,10 @@ func createForegroundCertifiedCheckpoint(ctx context.Context, auto *checkpoint.A
 		return false, nil
 	}
 	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
-		return false, fmt.Errorf("sync archive before checkpoint publication: %w", err)
+		return false, fmt.Errorf("checkpoint-pre-sync: %w", err)
 	}
 	if err := auto.CheckpointOnShutdown(ctx, material.Tip()); err != nil {
-		return false, err
+		return false, fmt.Errorf("checkpoint-publication: %w", err)
 	}
 	winner := manager.Latest()
 	if winner == nil || before != nil && (winner.Index <= before.Index || winner.RootHash == before.RootHash) {
@@ -867,18 +914,18 @@ func createForegroundCertifiedCheckpoint(ctx context.Context, auto *checkpoint.A
 	}
 	seal, sealed, err := core.LatestCheckpointSeal()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("certified-seal-read: %w", err)
 	}
 	if !sealed || uint64(seal.Index) != winner.Index || seal.RootHash != winner.RootHash || seal.StateHash != winner.Hash {
-		return false, fmt.Errorf("checkpoint CURRENT candidate %d is not certified by the local Core", winner.Index)
+		return false, fmt.Errorf("certified-seal-validation: checkpoint CURRENT candidate %d is not certified by the local Core", winner.Index)
 	}
 	readback := checkpoint.NewManager(bucket, "foreground-api/checkpoint", "", 1)
 	if err := readback.Load(ctx); err != nil {
-		return false, fmt.Errorf("reload checkpoint CURRENT: %w", err)
+		return false, fmt.Errorf("fresh-current-readback: %w", err)
 	}
 	verified := readback.Latest()
 	if verified == nil || verified.Index != winner.Index || verified.RootHash != winner.RootHash || verified.Hash != winner.Hash {
-		return false, fmt.Errorf("checkpoint CURRENT readback does not match certified winner %d", winner.Index)
+		return false, fmt.Errorf("fresh-current-comparison: checkpoint CURRENT readback does not match certified winner %d", winner.Index)
 	}
 	return true, nil
 }
