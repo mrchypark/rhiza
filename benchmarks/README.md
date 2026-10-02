@@ -125,10 +125,13 @@ per-command exit codes, environment and binary provenance, Go output, and raw
 Versity access records. Server request records and client transport-attempt
 counters are reported independently. Retry attribution remains unknown when
 the SDK supplies no recognized attempt metadata; it must not be reported as
-zero. The retry control fixture injects one 503 through a local reverse proxy:
-it expects two client attempts, one injected failure, and one request reaching
-the Versity backend. That establishes the controlled fixture's retry, not a
-general retry count for other operations; SDK retry metadata can remain
-unknown. Upload-attempt bytes, per-upload acknowledged bytes, and winner/root
-reachable bytes are distinct measures. The local Versity results are local S3
-compatibility evidence only—not AWS/GCS qualification or a release gate.
+zero. The retry control fixture seeds an object during setup, then injects one
+503 through a local reverse proxy on its first GET. With MinIO `MaxRetries=2`
+(two total request attempts for the pinned client), it expects two client GET
+attempts, one injected failure, and one GET reaching the Versity backend. The
+proxy counter proves this controlled GET retry; missing MinIO attempt metadata
+remains unknown and is not presented as zero retries. It does not measure PUT
+retries or upload-body replay. Upload-attempt bytes, per-upload acknowledged
+bytes, and winner/root reachable bytes are distinct measures. The local Versity
+results are local S3 compatibility evidence only—not AWS/GCS qualification or
+a release gate.

@@ -181,6 +181,11 @@ func TestVersitySDKRetryEvidence(t *testing.T) {
 	if err := setup.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{Region: "us-east-1"}); err != nil {
 		t.Fatalf("create task-owned bucket: %v", err)
 	}
+	const key = "issue185/retry/injected-once"
+	payload := []byte("deterministic retry evidence")
+	if _, err := setup.PutObject(ctx, bucketName, key, bytes.NewReader(payload), int64(len(payload)), minio.PutObjectOptions{}); err != nil {
+		t.Fatalf("seed retry read object: %v", err)
+	}
 	setupAttempts, setupResponses := setupCounts.Snapshot()
 	setupServerCalls := versityfixture.RequestCount(mustAccessRecords(t, server))
 	if setupServerCalls != setupResponses {
@@ -193,13 +198,9 @@ func TestVersitySDKRetryEvidence(t *testing.T) {
 	}
 	forwarder := httputil.NewSingleHostReverseProxy(backend)
 	var proxyAttempts, injectedFailures atomic.Uint64
-	const key = "issue185/retry/injected-once"
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		proxyAttempts.Add(1)
-		if request.Method == http.MethodPut && strings.Contains(request.URL.Path, key) && injectedFailures.CompareAndSwap(0, 1) {
-			if _, err := io.Copy(io.Discard, request.Body); err != nil {
-				t.Errorf("consume injected attempt body: %v", err)
-			}
+		if request.Method == http.MethodGet && strings.Contains(request.URL.Path, key) && injectedFailures.CompareAndSwap(0, 1) {
 			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = io.WriteString(w, `<Error><Code>SlowDown</Code><Message>deterministic measurement fault</Message></Error>`)
@@ -211,17 +212,23 @@ func TestVersitySDKRetryEvidence(t *testing.T) {
 	bucket, err := NewBucket(Config{
 		Provider: ProviderS3, Endpoint: strings.TrimPrefix(proxyServer.URL, "http://"),
 		Bucket: bucketName, Region: "us-east-1", Insecure: true,
-		AccessKey: server.AccessKey, SecretKey: server.SecretKey, MaxRetries: 1,
+		AccessKey: server.AccessKey, SecretKey: server.SecretKey, MaxRetries: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer bucket.Close()
 	backendBefore := versityfixture.RequestCount(mustAccessRecords(t, server))
+	backendGetsBefore := versityOperationCount(mustAccessRecords(t, server), "s3_GetObject")
 	before := bucket.Stats()
-	payload := []byte("deterministic retry evidence")
-	if err := bucket.Upload(ctx, key, bytes.NewReader(payload), thanosobjstore.WithIfNotExists()); err != nil {
-		t.Fatalf("upload after one injected 503: %v", err)
+	got, err := bucket.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("GET after one injected 503: %v", err)
+	}
+	body, readErr := io.ReadAll(got)
+	closeErr := got.Close()
+	if readErr != nil || closeErr != nil || !bytes.Equal(body, payload) {
+		t.Fatalf("GET body=%q read_err=%v close_err=%v; want seeded payload", body, readErr, closeErr)
 	}
 	stats := subtractStats(before, bucket.Stats())
 	stopCtx, stop := context.WithTimeout(context.Background(), 7*time.Second)
@@ -230,17 +237,25 @@ func TestVersitySDKRetryEvidence(t *testing.T) {
 		t.Fatalf("stop Versity before reading flushed access log: %v", err)
 	}
 	stop()
-	backendCalls := versityfixture.RequestCount(mustAccessRecords(t, server)) - backendBefore
+	backendRecords := mustAccessRecords(t, server)
+	backendCalls := versityfixture.RequestCount(backendRecords) - backendBefore
+	backendGets := versityOperationCount(backendRecords, "s3_GetObject") - backendGetsBefore
 	if proxyAttempts.Load() != 2 || injectedFailures.Load() != 1 {
 		t.Fatalf("proxy attempts=%d injected failures=%d; want two attempts and one injected failure", proxyAttempts.Load(), injectedFailures.Load())
 	}
-	if backendCalls != 1 || stats.HTTPRequests != 2 {
-		t.Fatalf("actual backend requests=%d client attempts=%d; want 1 backend request after 2 attempts", backendCalls, stats.HTTPRequests)
+	if backendCalls != 1 || backendGets != 1 || stats.HTTPRequests != 2 || stats.HTTPGetRequests != 2 || stats.HTTP5xx != 1 || stats.HTTPFailures != 1 {
+		t.Fatalf("actual backend requests=%d GETs=%d client attempts=%d GETs=%d HTTP5xx=%d HTTPFailures=%d; want 1 backend GET after 2 client GET attempts (one injected 503)", backendCalls, backendGets, stats.HTTPRequests, stats.HTTPGetRequests, stats.HTTP5xx, stats.HTTPFailures)
 	}
-	if stats.Uploads != 1 || stats.Failures != 0 || stats.BytesUploaded != uint64(len(payload)) || stats.BytesPublished != uint64(len(payload)) {
+	if stats.Gets != 1 || stats.Uploads != 0 || stats.Failures != 0 || stats.BytesDownloaded != uint64(len(payload)) || stats.BytesUploaded != 0 || stats.BytesPublished != 0 {
 		t.Fatalf("logical retry outcome is unexpected: %+v", stats)
 	}
-	t.Logf("VERSITY_RETRY provider=local-versity-s3 qualification=false version=%q binary_sha256=%s setup_attempts=%d setup_responses=%d setup_backend_requests=%d injected_failures=%d proxy_client_attempts=%d actual_backend_requests=%d logical_uploads=%d attempted_bytes=%d acknowledged_bytes=%d request_body_bytes_consumed=%d response_body_bytes_consumed=%d sdk_retries=%d retry_metadata_known=%d retry_metadata_unknown=%d", server.Version, server.BinarySHA256, setupAttempts, setupResponses, setupServerCalls, injectedFailures.Load(), proxyAttempts.Load(), backendCalls, stats.Uploads, stats.BytesUploaded, stats.BytesPublished, stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes, stats.SDKRetries, stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests)
+	if stats.HTTPRequestBodyBytes != 0 || stats.HTTPResponseBodyBytes <= stats.BytesDownloaded {
+		t.Fatalf("wire body accounting=%+v; want no GET request body and response bytes including the injected error body", stats)
+	}
+	if stats.RetryMetadataRequests != 0 || stats.RetryMetadataUnknownRequests != 2 || stats.SDKRetries != 0 {
+		t.Fatalf("MinIO attempt metadata=%+v; want both attempts classified unknown (proxy counter is retry evidence)", stats)
+	}
+	t.Logf("VERSITY_RETRY provider=local-versity-s3 qualification=false version=%q binary_sha256=%s setup_attempts=%d setup_responses=%d setup_backend_requests=%d injected_failures=%d proxy_client_attempts=%d actual_backend_get_requests=%d logical_gets=%d downloaded_payload_bytes=%d request_body_bytes=%d response_body_bytes=%d controlled_proxy_proved_retries=1 sdk_retry_metadata=unknown retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d", server.Version, server.BinarySHA256, setupAttempts, setupResponses, setupServerCalls, injectedFailures.Load(), proxyAttempts.Load(), backendGets, stats.Gets, stats.BytesDownloaded, stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes, stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests, stats.SDKRetries)
 }
 
 func mustAccessRecords(t *testing.T, server *versityfixture.Server) []string {
@@ -252,12 +267,26 @@ func mustAccessRecords(t *testing.T, server *versityfixture.Server) []string {
 	return records
 }
 
+func versityOperationCount(records []string, operation string) uint64 {
+	var count uint64
+	for _, record := range records {
+		if strings.Contains(record, " "+operation+" ") {
+			count++
+		}
+	}
+	return count
+}
+
 func subtractStats(before, after Stats) Stats {
 	return Stats{
-		Uploads: after.Uploads - before.Uploads, Failures: after.Failures - before.Failures,
+		Uploads: after.Uploads - before.Uploads, Gets: after.Gets - before.Gets, Failures: after.Failures - before.Failures,
 		BytesUploaded:                after.BytesUploaded - before.BytesUploaded,
 		BytesPublished:               after.BytesPublished - before.BytesPublished,
+		BytesDownloaded:              after.BytesDownloaded - before.BytesDownloaded,
 		HTTPRequests:                 after.HTTPRequests - before.HTTPRequests,
+		HTTPGetRequests:              after.HTTPGetRequests - before.HTTPGetRequests,
+		HTTP5xx:                      after.HTTP5xx - before.HTTP5xx,
+		HTTPFailures:                 after.HTTPFailures - before.HTTPFailures,
 		HTTPRequestBodyBytes:         after.HTTPRequestBodyBytes - before.HTTPRequestBodyBytes,
 		HTTPResponseBodyBytes:        after.HTTPResponseBodyBytes - before.HTTPResponseBodyBytes,
 		SDKRetries:                   after.SDKRetries - before.SDKRetries,
