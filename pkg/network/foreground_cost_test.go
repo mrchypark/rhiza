@@ -35,8 +35,9 @@ const (
 	foregroundAPIKeys                      = 4096
 	foregroundAPIValue                     = 1024
 	foregroundAPISeedLogEvery              = 512
-	foregroundAPIWindowTotal               = 150 * time.Second
+	foregroundAPIWindowTotal               = 210 * time.Second // 30s warm-up + 120s measurement + 2x30s bounded drains
 	foregroundAPIWindowCleanupReserve      = 15 * time.Second
+	foregroundAPICallMaxDuration           = 30 * time.Second
 	foregroundCheckpointBarrierMaxAttempts = 50
 	foregroundCheckpointBarrierRetryDelay  = 20 * time.Millisecond
 )
@@ -226,8 +227,13 @@ func (p *foregroundAPIPeers) close() {
 
 type apiLatencySample struct {
 	all, success, overlapAll, overlapSuccess []time.Duration
-	errors, rejections, timeouts             int
-	recording                                time.Duration
+	drainAll, drainSuccess                   []time.Duration
+	drainOverlapAll, drainOverlapSuccess     []time.Duration
+	started, errors, rejections, timeouts    int
+	commitUnknown                            int
+	drainErrors, drainRejections             int
+	drainTimeouts, drainCommitUnknown        int
+	recording, drainRecording                time.Duration
 }
 
 type apiLatencyAccumulator struct {
@@ -235,28 +241,64 @@ type apiLatencyAccumulator struct {
 	apiLatencySample
 }
 
-func (a *apiLatencyAccumulator) add(elapsed time.Duration, err error, overlap bool) {
+func (a *apiLatencyAccumulator) add(elapsed time.Duration, err error, overlap, inWindow bool) {
 	recordingStarted := time.Now()
 	a.mu.Lock()
-	a.all = append(a.all, elapsed)
-	if err == nil {
-		a.success = append(a.success, elapsed)
+	a.started++
+	if inWindow {
+		a.all = append(a.all, elapsed)
 	} else {
-		a.errors++
-		if errors.Is(err, ErrNotReady) || errors.Is(err, quepaxa.ErrQuorumUnavailable) {
-			a.rejections++
+		a.drainAll = append(a.drainAll, elapsed)
+	}
+	if err == nil {
+		if inWindow {
+			a.success = append(a.success, elapsed)
+		} else {
+			a.drainSuccess = append(a.drainSuccess, elapsed)
 		}
-		if errors.Is(err, context.DeadlineExceeded) || isForegroundTimeout(err) {
-			a.timeouts++
+	} else {
+		if inWindow {
+			a.errors++
+			if errors.Is(err, ErrNotReady) || errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+				a.rejections++
+			}
+			if errors.Is(err, context.DeadlineExceeded) || isForegroundTimeout(err) {
+				a.timeouts++
+			}
+			if errors.Is(err, ErrCommitUnknown) {
+				a.commitUnknown++
+			}
+		} else {
+			a.drainErrors++
+			if errors.Is(err, ErrNotReady) || errors.Is(err, quepaxa.ErrQuorumUnavailable) {
+				a.drainRejections++
+			}
+			if errors.Is(err, context.DeadlineExceeded) || isForegroundTimeout(err) {
+				a.drainTimeouts++
+			}
+			if errors.Is(err, ErrCommitUnknown) {
+				a.drainCommitUnknown++
+			}
 		}
 	}
 	if overlap {
-		a.overlapAll = append(a.overlapAll, elapsed)
-		if err == nil {
-			a.overlapSuccess = append(a.overlapSuccess, elapsed)
+		if inWindow {
+			a.overlapAll = append(a.overlapAll, elapsed)
+			if err == nil {
+				a.overlapSuccess = append(a.overlapSuccess, elapsed)
+			}
+		} else {
+			a.drainOverlapAll = append(a.drainOverlapAll, elapsed)
+			if err == nil {
+				a.drainOverlapSuccess = append(a.drainOverlapSuccess, elapsed)
+			}
 		}
 	}
-	a.recording += time.Since(recordingStarted)
+	if inWindow {
+		a.recording += time.Since(recordingStarted)
+	} else {
+		a.drainRecording += time.Since(recordingStarted)
+	}
 	a.mu.Unlock()
 }
 
@@ -271,14 +313,19 @@ func (a *apiLatencyAccumulator) snapshot() apiLatencySample {
 	return apiLatencySample{
 		all: append([]time.Duration(nil), a.all...), success: append([]time.Duration(nil), a.success...),
 		overlapAll: append([]time.Duration(nil), a.overlapAll...), overlapSuccess: append([]time.Duration(nil), a.overlapSuccess...),
-		errors: a.errors, rejections: a.rejections, timeouts: a.timeouts, recording: a.recording,
+		drainAll: append([]time.Duration(nil), a.drainAll...), drainSuccess: append([]time.Duration(nil), a.drainSuccess...),
+		drainOverlapAll: append([]time.Duration(nil), a.drainOverlapAll...), drainOverlapSuccess: append([]time.Duration(nil), a.drainOverlapSuccess...),
+		started: a.started, errors: a.errors, rejections: a.rejections, timeouts: a.timeouts, commitUnknown: a.commitUnknown,
+		drainErrors: a.drainErrors, drainRejections: a.drainRejections, drainTimeouts: a.drainTimeouts,
+		drainCommitUnknown: a.drainCommitUnknown, recording: a.recording, drainRecording: a.drainRecording,
 	}
 }
 
 func apiLatencyJSON(sample apiLatencySample, seconds float64) map[string]any {
 	return map[string]any{
-		"requests": len(sample.all), "successes": len(sample.success), "errors": sample.errors,
-		"rejections": sample.rejections, "timeouts": sample.timeouts,
+		"started_requests": sample.started,
+		"requests":         len(sample.all), "successes": len(sample.success), "errors": sample.errors,
+		"rejections": sample.rejections, "timeouts": sample.timeouts, "commit_unknown": sample.commitUnknown,
 		"successful_ops_per_second":     float64(len(sample.success)) / seconds,
 		"all_completion_ops_per_second": float64(len(sample.all)) / seconds,
 		"sample_recording_ns_per_operation": func() float64 {
@@ -287,11 +334,101 @@ func apiLatencyJSON(sample apiLatencySample, seconds float64) map[string]any {
 			}
 			return float64(sample.recording) / float64(len(sample.all))
 		}(),
+		"drain_sample_recording_ns_per_operation": func() float64 {
+			if len(sample.drainAll) == 0 {
+				return 0
+			}
+			return float64(sample.drainRecording) / float64(len(sample.drainAll))
+		}(),
 		"success_p99_ms": nearestRankDurationP99(sample.success), "all_completion_p99_ms": nearestRankDurationP99(sample.all),
-		"maintenance_overlap_requests":              len(sample.overlapAll),
-		"maintenance_overlap_success_p99_ms":        nearestRankDurationP99(sample.overlapSuccess),
-		"maintenance_overlap_all_completion_p99_ms": nearestRankDurationP99(sample.overlapAll),
+		"maintenance_overlap_requests":                    len(sample.overlapAll),
+		"maintenance_overlap_success_p99_ms":              nearestRankDurationP99(sample.overlapSuccess),
+		"maintenance_overlap_all_completion_p99_ms":       nearestRankDurationP99(sample.overlapAll),
+		"drain_completions":                               len(sample.drainAll),
+		"drain_successes":                                 len(sample.drainSuccess),
+		"drain_errors":                                    sample.drainErrors,
+		"drain_rejections":                                sample.drainRejections,
+		"drain_timeouts":                                  sample.drainTimeouts,
+		"drain_commit_unknown":                            sample.drainCommitUnknown,
+		"drain_all_completion_p99_ms":                     nearestRankDurationP99(sample.drainAll),
+		"drain_success_p99_ms":                            nearestRankDurationP99(sample.drainSuccess),
+		"drain_maintenance_overlap_requests":              len(sample.drainOverlapAll),
+		"drain_maintenance_overlap_success_p99_ms":        nearestRankDurationP99(sample.drainOverlapSuccess),
+		"drain_maintenance_overlap_all_completion_p99_ms": nearestRankDurationP99(sample.drainOverlapAll),
+		"all_cohort_errors":                               sample.errors + sample.drainErrors,
+		"all_cohort_timeouts":                             sample.timeouts + sample.drainTimeouts,
+		"all_cohort_commit_unknown":                       sample.commitUnknown + sample.drainCommitUnknown,
+		"all_cohort_completions":                          len(sample.all) + len(sample.drainAll),
 	}
+}
+
+type foregroundAPIWindowGate struct {
+	mu              sync.Mutex
+	deadline        time.Time
+	closed          bool
+	active          int
+	pendingAtCutoff int
+}
+
+func (g *foregroundAPIWindowGate) beginAt(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.beginLocked(now)
+}
+
+func (g *foregroundAPIWindowGate) begin() (time.Time, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	started := time.Now()
+	return started, g.beginLocked(started)
+}
+
+func (g *foregroundAPIWindowGate) beginLocked(now time.Time) bool {
+	if g.closed || !now.Before(g.deadline) {
+		if !g.closed {
+			g.closed = true
+			g.pendingAtCutoff = g.active
+		}
+		return false
+	}
+	g.active++
+	return true
+}
+
+func (g *foregroundAPIWindowGate) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.closed {
+		g.closed = true
+		g.pendingAtCutoff = g.active
+	}
+}
+
+func (g *foregroundAPIWindowGate) finish() {
+	g.mu.Lock()
+	g.active--
+	g.mu.Unlock()
+}
+
+func (g *foregroundAPIWindowGate) snapshot() (pendingAtCutoff, outstanding int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.pendingAtCutoff, g.active
+}
+
+func runForegroundAPICall(parent context.Context, gate *foregroundAPIWindowGate, maxDuration time.Duration, call func(context.Context) error) (started, completed time.Time, err error, admitted bool) {
+	if parent.Err() != nil {
+		return time.Time{}, time.Time{}, nil, false
+	}
+	if started, admitted = gate.begin(); !admitted {
+		return time.Time{}, time.Time{}, nil, false
+	}
+	defer gate.finish()
+	callCtx, cancel := context.WithTimeout(parent, maxDuration)
+	defer cancel()
+	err = call(callCtx)
+	completed = time.Now()
+	return started, completed, err, true
 }
 
 func nearestRankDurationP99(values []time.Duration) float64 {
@@ -634,6 +771,272 @@ func TestForegroundAPIWindowBudgetRequiresBothFixedWindowsAndCleanupReserve(t *t
 	}
 }
 
+func TestForegroundAPIWindowCutoffDrainsAdmittedCalls(t *testing.T) {
+	for _, workers := range []int{1, foregroundAPIWorkers} {
+		t.Run(fmt.Sprintf("workers-%d", workers), func(t *testing.T) {
+			deadline := time.Now().Add(40 * time.Millisecond)
+			gate := &foregroundAPIWindowGate{deadline: deadline}
+			release := make(chan struct{})
+			started := make(chan struct{}, workers)
+			type result struct {
+				start, end time.Time
+				err        error
+				admitted   bool
+			}
+			results := make(chan result, workers)
+			var calls sync.WaitGroup
+			calls.Add(workers)
+			for range workers {
+				go func() {
+					defer calls.Done()
+					start, end, err, admitted := runForegroundAPICall(context.Background(), gate, time.Second, func(ctx context.Context) error {
+						started <- struct{}{}
+						select {
+						case <-release:
+							return nil
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+					})
+					results <- result{start: start, end: end, err: err, admitted: admitted}
+				}()
+			}
+			for range workers {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("call did not start")
+				}
+			}
+			timer := time.NewTimer(time.Until(deadline))
+			<-timer.C
+			gate.close()
+			pending, _ := gate.snapshot()
+			if pending != workers {
+				t.Fatalf("pending at cutoff=%d, want %d", pending, workers)
+			}
+			if gate.beginAt(deadline) {
+				t.Fatal("call admitted at exact cutoff")
+			}
+			close(release)
+			calls.Wait()
+			close(results)
+			stats := &apiLatencyAccumulator{}
+			for result := range results {
+				if !result.admitted || result.err != nil {
+					t.Fatalf("call admitted=%t err=%v, want successful admitted call", result.admitted, result.err)
+				}
+				if !result.start.Before(deadline) || !result.end.After(deadline) {
+					t.Fatalf("call interval start=%s end=%s deadline=%s did not straddle cutoff", result.start, result.end, deadline)
+				}
+				stats.add(result.end.Sub(result.start), result.err, false, !result.end.After(deadline))
+			}
+			sample := stats.snapshot()
+			if sample.started != workers || len(sample.all) != 0 || len(sample.success) != 0 || len(sample.drainAll) != workers || len(sample.drainSuccess) != workers || sample.drainErrors != 0 {
+				t.Fatalf("window/drain accounting=%+v, want %d successful drain completions", sample, workers)
+			}
+		})
+	}
+
+	gate := &foregroundAPIWindowGate{deadline: time.Now().Add(time.Second)}
+	if !gate.beginAt(gate.deadline.Add(-time.Nanosecond)) || gate.beginAt(gate.deadline) {
+		t.Fatal("admission gate did not accept before and reject at the exact cutoff")
+	}
+	gate.finish()
+	gate.close()
+}
+
+func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T) {
+	t.Run("operation timeout before cutoff", func(t *testing.T) {
+		deadline := time.Now().Add(time.Second)
+		gate := &foregroundAPIWindowGate{deadline: deadline}
+		started, completed, err, admitted := runForegroundAPICall(context.Background(), gate, 10*time.Millisecond, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		gate.close()
+		if !admitted || !errors.Is(err, context.DeadlineExceeded) || !completed.Before(deadline) {
+			t.Fatalf("started=%s completed=%s deadline=%s admitted=%t err=%v", started, completed, deadline, admitted, err)
+		}
+		stats := &apiLatencyAccumulator{}
+		stats.add(completed.Sub(started), err, false, true)
+		sample := stats.snapshot()
+		if sample.errors != 1 || sample.timeouts != 1 || sample.drainErrors != 0 {
+			t.Fatalf("in-window timeout accounting=%+v", sample)
+		}
+		if sample.started != 1 || len(sample.all) != 1 || len(sample.drainAll) != 0 {
+			t.Fatalf("in-window completion accounting=%+v", sample)
+		}
+	})
+	t.Run("drain commit-unknown remains explicit", func(t *testing.T) {
+		stats := &apiLatencyAccumulator{}
+		unknown := fmt.Errorf("mutation result: %w: %w", ErrCommitUnknown, context.DeadlineExceeded)
+		stats.add(time.Millisecond, unknown, false, false)
+		sample := stats.snapshot()
+		if sample.started != 1 || sample.errors != 0 || sample.drainErrors != 1 || sample.drainTimeouts != 1 || sample.drainCommitUnknown != 1 {
+			t.Fatalf("drain unknown accounting=%+v", sample)
+		}
+	})
+
+	t.Run("parent cancellation", func(t *testing.T) {
+		parent, cancel := context.WithCancel(context.Background())
+		gate := &foregroundAPIWindowGate{deadline: time.Now().Add(time.Second)}
+		startedCall := make(chan struct{})
+		result := make(chan error, 1)
+		go func() {
+			_, _, err, admitted := runForegroundAPICall(parent, gate, time.Second, func(ctx context.Context) error {
+				close(startedCall)
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			if !admitted && err == nil {
+				result <- errors.New("call was not admitted")
+				return
+			}
+			result <- err
+		}()
+		<-startedCall
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("parent cancellation error=%v", err)
+		}
+		gate.close()
+		if _, outstanding := gate.snapshot(); outstanding != 0 {
+			t.Fatalf("parent cancellation left %d calls outstanding", outstanding)
+		}
+	})
+	t.Run("operation deadline during drain remains error", func(t *testing.T) {
+		deadline := time.Now().Add(10 * time.Millisecond)
+		gate := &foregroundAPIWindowGate{deadline: deadline}
+		startedCall := make(chan struct{})
+		result := make(chan struct {
+			started, completed time.Time
+			err                error
+			admitted           bool
+		}, 1)
+		go func() {
+			started, completed, err, admitted := runForegroundAPICall(context.Background(), gate, 40*time.Millisecond, func(ctx context.Context) error {
+				close(startedCall)
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			result <- struct {
+				started, completed time.Time
+				err                error
+				admitted           bool
+			}{started: started, completed: completed, err: err, admitted: admitted}
+		}()
+		<-startedCall
+		timer := time.NewTimer(time.Until(deadline))
+		<-timer.C
+		gate.close()
+		outcome := <-result
+		if !outcome.admitted || !errors.Is(outcome.err, context.DeadlineExceeded) || !outcome.completed.After(deadline) {
+			t.Fatalf("drain operation result=%+v deadline=%s", outcome, deadline)
+		}
+		stats := &apiLatencyAccumulator{}
+		stats.add(outcome.completed.Sub(outcome.started), outcome.err, false, false)
+		sample := stats.snapshot()
+		if sample.errors != 0 || sample.timeouts != 0 || sample.drainErrors != 1 || sample.drainTimeouts != 1 {
+			t.Fatalf("drain timeout accounting=%+v", sample)
+		}
+	})
+}
+
+func TestForegroundAPIRecordingCostUsesMatchingCompletionCohort(t *testing.T) {
+	stats := &apiLatencyAccumulator{}
+	stats.add(time.Millisecond, nil, false, true)
+	stats.add(2*time.Millisecond, context.DeadlineExceeded, false, false)
+	sample := stats.snapshot()
+	result := apiLatencyJSON(sample, 120)
+
+	if sample.started != 2 || len(sample.all) != 1 || len(sample.drainAll) != 1 {
+		t.Fatalf("cohort counts=%+v, want 2 started, 1 in-window and 1 drain completion", sample)
+	}
+	if got := result["started_requests"]; got != 2 {
+		t.Fatalf("started_requests=%v, want all 2 admitted calls", got)
+	}
+	if got := result["requests"]; got != 1 {
+		t.Fatalf("requests=%v, want 1 in-window completion", got)
+	}
+	if got, want := result["sample_recording_ns_per_operation"], float64(sample.recording)/float64(len(sample.all)); got != want {
+		t.Fatalf("in-window recording cost=%v, want %v", got, want)
+	}
+	if got, want := result["drain_sample_recording_ns_per_operation"], float64(sample.drainRecording)/float64(len(sample.drainAll)); got != want {
+		t.Fatalf("drain recording cost=%v, want %v", got, want)
+	}
+	if sample.recording <= 0 || sample.drainRecording <= 0 {
+		t.Fatalf("recording costs were not split: in-window=%s drain=%s", sample.recording, sample.drainRecording)
+	}
+}
+
+func TestForegroundAPIWindowDrainCompletesRealKVPut(t *testing.T) {
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "db.sqlite"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+
+	const requestID = "foreground-window-drain"
+	unlock, err := server.lockRequest(context.Background(), requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := true
+	releaseLock := func() {
+		if locked {
+			unlock()
+			locked = false
+		}
+	}
+	defer releaseLock()
+	deadline := time.Now().Add(40 * time.Millisecond)
+	gate := &foregroundAPIWindowGate{deadline: deadline}
+	started := make(chan struct{})
+	type callResult struct {
+		response   KVMutationResponse
+		start, end time.Time
+		err        error
+		admitted   bool
+	}
+	result := make(chan callResult, 1)
+	go func() {
+		var response KVMutationResponse
+		start, end, err, admitted := runForegroundAPICall(context.Background(), gate, foregroundAPICallMaxDuration, func(ctx context.Context) error {
+			close(started)
+			response, err = server.KVPut(ctx, KVMutationRequest{RequestID: requestID, Key: "window-drain", Value: []byte("durable")})
+			return err
+		})
+		result <- callResult{response: response, start: start, end: end, err: err, admitted: admitted}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("KVPut did not enter")
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	<-timer.C
+	gate.close()
+	if pending, _ := gate.snapshot(); pending != 1 {
+		t.Fatalf("pending at cutoff=%d, want 1", pending)
+	}
+	releaseLock()
+	completed := <-result
+	if !completed.admitted || completed.err != nil || !completed.end.After(deadline) {
+		t.Fatalf("KVPut result=%+v, want successful completion during bounded drain", completed)
+	}
+	receipt := completed.response.MutationReceipt
+	if receipt.Status != types.MutationCommitted || !receipt.Applied || receipt.Slot == 0 {
+		t.Fatalf("KVPut receipt=%+v, want committed/applied nonzero slot", receipt)
+	}
+	if _, outstanding := gate.snapshot(); outstanding != 0 {
+		t.Fatalf("KVPut drain left %d calls outstanding", outstanding)
+	}
+}
+
 func TestForegroundAPISeedDeadlineReservesWindowsAndHonorsParent(t *testing.T) {
 	runnerDeadline := time.Unix(2000, 0)
 	want := runnerDeadline.Add(-(foregroundAPIWindowTotal + foregroundAPIWindowCleanupReserve))
@@ -833,10 +1236,10 @@ func TestForegroundAPICost(t *testing.T) {
 			}
 		}()
 	}
-	if _, _, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 30*time.Second, &maintenanceActive, &maintenanceEpoch, false); err != nil {
+	if _, _, _, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 30*time.Second, &maintenanceActive, &maintenanceEpoch, false); err != nil {
 		t.Fatal(err)
 	}
-	put, get, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 120*time.Second, &maintenanceActive, &maintenanceEpoch, true)
+	put, get, windowTotals, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 120*time.Second, &maintenanceActive, &maintenanceEpoch, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -853,6 +1256,14 @@ func TestForegroundAPICost(t *testing.T) {
 		"warmup": "30s", "measured_window": "120s", "application_retries": 0,
 		"sample_threshold": 10000, "insufficient_samples": len(putStats.success) < 10000 || len(getStats.success) < 10000,
 		"put": putJSON, "linearizable_get": getJSON,
+		"window_boundary": map[string]any{
+			"starts":                 putStats.started + getStats.started,
+			"completed_in_window":    len(putStats.all) + len(getStats.all),
+			"completed_in_drain":     len(putStats.drainAll) + len(getStats.drainAll),
+			"outstanding_at_cutoff":  windowTotals.pendingAtCutoff,
+			"outstanding_after_join": windowTotals.outstanding,
+			"maximum_call_duration":  foregroundAPICallMaxDuration.String(),
+		},
 		"total_successful_ops_per_second":     float64(len(putStats.success)+len(getStats.success)) / 120,
 		"total_all_completion_ops_per_second": float64(len(putStats.all)+len(getStats.all)) / 120,
 		"maintenance_errors":                  maintenanceErrors.Load(), "maintenance_first_error": firstMaintenanceError,
@@ -1221,50 +1632,76 @@ func TestForegroundAPICheckpointUsesCertifiedLoopbackPublication(t *testing.T) {
 	}
 }
 
-func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, clientID int64, sequence *atomic.Uint64, duration time.Duration, maintenanceActive *atomic.Bool, maintenanceEpoch *atomic.Uint64, collect bool) (*apiLatencyAccumulator, *apiLatencyAccumulator, error) {
+type foregroundAPIWindowTotals struct {
+	pendingAtCutoff int
+	outstanding     int
+}
+
+func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, clientID int64, sequence *atomic.Uint64, duration time.Duration, maintenanceActive *atomic.Bool, maintenanceEpoch *atomic.Uint64, collect bool) (*apiLatencyAccumulator, *apiLatencyAccumulator, foregroundAPIWindowTotals, error) {
 	put, get := &apiLatencyAccumulator{}, &apiLatencyAccumulator{}
 	window, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
+	deadline, _ := window.Deadline()
+	gate := &foregroundAPIWindowGate{deadline: deadline}
 	var workers sync.WaitGroup
 	for worker := range foregroundAPIWorkers {
 		workers.Add(1)
 		go func(worker int) {
 			defer workers.Done()
 			index := worker
-			for window.Err() == nil {
+			for {
 				key := fmt.Sprintf("key-%04d", index%foregroundAPIKeys)
 				id := sequence.Add(1)
 				startedEpoch := maintenanceEpoch.Load()
 				startedDuringMaintenance := maintenanceActive.Load()
-				started := time.Now()
-				_, putErr := server.KVPut(window, KVMutationRequest{RequestID: fmt.Sprintf("foreground-%d-%d", clientID, id), Key: key, Value: value})
-				putElapsed := time.Since(started)
+				started, completed, putErr, admitted := runForegroundAPICall(ctx, gate, foregroundAPICallMaxDuration, func(callCtx context.Context) error {
+					_, err := server.KVPut(callCtx, KVMutationRequest{RequestID: fmt.Sprintf("foreground-%d-%d", clientID, id), Key: key, Value: value})
+					return err
+				})
+				if !admitted {
+					return
+				}
+				putElapsed := completed.Sub(started)
 				putOverlap := startedDuringMaintenance || maintenanceActive.Load() || startedEpoch != maintenanceEpoch.Load()
 				if collect {
-					put.add(putElapsed, putErr, putOverlap)
-				}
-				if window.Err() != nil {
-					return
+					put.add(putElapsed, putErr, putOverlap, !completed.After(deadline))
 				}
 				startedEpoch = maintenanceEpoch.Load()
 				startedDuringMaintenance = maintenanceActive.Load()
-				started = time.Now()
-				response, getErr := server.KVGet(window, KVGetRequest{Key: key, Consistency: "linearizable"})
-				getElapsed := time.Since(started)
-				getOverlap := startedDuringMaintenance || maintenanceActive.Load() || startedEpoch != maintenanceEpoch.Load()
-				if getErr == nil && !response.Found {
-					getErr = fmt.Errorf("linearizable get missing seeded value")
+				started, completed, getErr, admitted := runForegroundAPICall(ctx, gate, foregroundAPICallMaxDuration, func(callCtx context.Context) error {
+					response, err := server.KVGet(callCtx, KVGetRequest{Key: key, Consistency: "linearizable"})
+					if err == nil && !response.Found {
+						return fmt.Errorf("linearizable get missing seeded value")
+					}
+					return err
+				})
+				if !admitted {
+					return
 				}
+				getElapsed := completed.Sub(started)
+				getOverlap := startedDuringMaintenance || maintenanceActive.Load() || startedEpoch != maintenanceEpoch.Load()
 				if collect {
-					get.add(getElapsed, getErr, getOverlap)
+					get.add(getElapsed, getErr, getOverlap, !completed.After(deadline))
 				}
 				index = (index + foregroundAPIWorkers) % foregroundAPIKeys
 			}
 		}(worker)
 	}
+	<-window.Done()
+	gate.close()
 	workers.Wait()
 	if err := ctx.Err(); err != nil {
-		return put, get, err
+		pending, outstanding := gate.snapshot()
+		return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, err
 	}
-	return put, get, nil
+	pending, outstanding := gate.snapshot()
+	if collect {
+		putSample, getSample := put.snapshot(), get.snapshot()
+		completed := len(putSample.all) + len(putSample.drainAll) + len(getSample.all) + len(getSample.drainAll)
+		started := putSample.started + getSample.started
+		if completed != started || outstanding != 0 {
+			return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, fmt.Errorf("foreground API window accounting mismatch: started=%d completed=%d outstanding=%d", started, completed, outstanding)
+		}
+	}
+	return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, nil
 }

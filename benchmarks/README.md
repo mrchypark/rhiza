@@ -120,6 +120,21 @@ The run selects `TestVersityGatewayCostEvidence` and
 certified checkpoint through one node, removes only the local SQLite files,
 then verifies that a second `Node.Open` recovers the value and reaches ready.
 
+For the foreground result, each fixed window is an enrollment cutoff: no new
+API calls start after it. Calls already admitted drain under a parent-bounded
+30-second per-call context, with workers joined before the next phase. The
+seed budget reserves a possible 30-second drain for both the 30-second warm-up
+and 120-second measured window, plus the existing teardown reserve.
+Within `put` and `linearizable_get`, `started_requests` counts all admitted
+calls, including calls that complete during drain; `requests`, success, error,
+timeout, throughput, completion-p99, and
+`sample_recording_ns_per_operation` fields describe completions inside the
+measured window. Their `drain_*` fields retain late completions, errors, timeouts,
+`ErrCommitUnknown` outcomes, and drain latency separately; these outcomes are
+not discarded or treated as failed commits, and do not inflate in-window
+throughput. `window_boundary` reconciles starts, in-window completions, drain
+completions, outstanding calls at cutoff, and outstanding calls after join.
+
 The artifact `issue-185-cost-evidence-<run_id>` includes the exact commands,
 per-command exit codes, environment and binary provenance, Go output, and raw
 Versity access records. Server request records and client transport-attempt
