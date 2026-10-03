@@ -26,14 +26,22 @@ import (
 )
 
 const (
-	nodeForegroundWorkers      = 16
-	nodeForegroundKeys         = 4096
-	nodeForegroundValueBytes   = 1024
-	nodeForegroundWarmup       = 30 * time.Second
-	nodeForegroundMeasure      = 120 * time.Second
-	nodeForegroundCallTimeout  = 30 * time.Second
-	nodeForegroundDrainReserve = 2 * nodeForegroundCallTimeout
-	nodeForegroundCleanup      = 65 * time.Second
+	nodeForegroundWorkers       = 16
+	nodeForegroundKeys          = 4096
+	nodeForegroundValueBytes    = 1024
+	nodeForegroundWarmup        = 30 * time.Second
+	nodeForegroundMeasure       = 120 * time.Second
+	nodeForegroundCallTimeout   = 30 * time.Second
+	nodeForegroundDrainReserve  = 2 * nodeForegroundCallTimeout
+	nodeForegroundPrepareLimit  = 10 * time.Second
+	nodeForegroundShutdownLimit = 10 * time.Second // mirrors Node.Shutdown's archive/checkpoint context
+	nodeForegroundGatewayClose  = 7 * time.Second
+	nodeForegroundCleanupSlack  = 5 * time.Second
+	// Planning reserve for three per-node preparations, their bounded archive/
+	// checkpoint shutdown operations, gateway close, and small accounting slack.
+	// It is not a hard upper bound for Checkpointer/Node worker joins; the outer
+	// test deadline remains the final cap.
+	nodeForegroundCleanup = 3*(nodeForegroundPrepareLimit+nodeForegroundShutdownLimit) + nodeForegroundGatewayClose + nodeForegroundCleanupSlack
 )
 
 func nodeForegroundBudgetAvailable(deadline, now time.Time, required time.Duration) bool {
@@ -46,6 +54,12 @@ func requireNodeForegroundBudget(t testing.TB, deadline time.Time, required time
 	if !nodeForegroundBudgetAvailable(deadline, now, required) {
 		t.Fatalf("insufficient five-minute Node foreground budget at %s: remaining=%s required=%s", phase, deadline.Sub(now), required)
 	}
+}
+
+func withNodeForegroundPrepareContext(parent context.Context, prepare func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, nodeForegroundPrepareLimit)
+	defer cancel()
+	return prepare(ctx)
 }
 
 // TestNodeForegroundAPICostS3 exercises the real Node.Open catch-up lifecycle,
@@ -131,18 +145,18 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		for i, node := range nodes {
 			logNodeCheckpointObservation(t, ids[i], node, ctx)
 		}
-		prepareCtx, stopPrepare := context.WithTimeout(ctx, 10*time.Second)
 		for _, node := range nodes {
 			if node.checkpointer != nil {
 				node.checkpointer.Stop()
 			}
 		}
 		for i, node := range nodes {
-			if err := prepareNodeCheckpointBeforeShutdown(prepareCtx, node, t.TempDir()); err != nil {
+			if err := withNodeForegroundPrepareContext(ctx, func(prepareCtx context.Context) error {
+				return prepareNodeCheckpointBeforeShutdown(prepareCtx, node, t.TempDir())
+			}); err != nil {
 				t.Errorf("prepare node %s durability before sequential shutdown: %v", ids[i], err)
 			}
 		}
-		stopPrepare()
 		for i := len(nodes) - 1; i >= 0; i-- {
 			transportObserver.SetPhase("pre_shutdown_" + string(ids[i]) + "_observation")
 			logNodeCheckpointObservation(t, ids[i], nodes[i], ctx)
@@ -269,6 +283,40 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	measureEndRequests, measureEndErr := nodeVersityRequestCount(gateway)
 	logVersityRequestDelta(t, "measurement", measureStartRequests, measureStartErr, measureEndRequests, measureEndErr)
 	t.Logf("versity_fixture_version=%q versity_binary_sha256=%s endpoint_scope=local-loopback; phase server request counts come from the gateway access log", gateway.Version, gateway.BinarySHA256)
+}
+
+func TestNodeForegroundPreparationUsesFreshCanceledContexts(t *testing.T) {
+	parent := context.Background()
+	var previous context.Context
+	var seen []context.Context
+	for i := 0; i < 3; i++ {
+		if err := withNodeForegroundPrepareContext(parent, func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("preparation %d started with canceled context: %w", i, err)
+			}
+			if previous != nil {
+				if previous == ctx {
+					return fmt.Errorf("preparation %d reused the previous context", i)
+				}
+				if !errors.Is(previous.Err(), context.Canceled) {
+					return fmt.Errorf("preparation %d began before the previous context was canceled: %v", i, previous.Err())
+				}
+			}
+			previous = ctx
+			seen = append(seen, ctx)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("observed %d preparation contexts, want 3", len(seen))
+	}
+	for i, ctx := range seen {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Errorf("preparation context %d after callback = %v, want canceled", i, ctx.Err())
+		}
+	}
 }
 
 type nodeForegroundCostMetrics struct {
@@ -414,6 +462,9 @@ func TestNodeStoreStatsDeltaSeparatesAttemptsAcknowledgmentsAndUnknownRetries(t 
 }
 
 func TestNodeForegroundBudgetBoundariesPreserveWindowsAndCleanupReserve(t *testing.T) {
+	if nodeForegroundCleanup != 72*time.Second {
+		t.Fatalf("cleanup planning reserve=%s, want 72s (3x 10s preparation + 3x 10s shutdown operation + 7s gateway close + 5s slack)", nodeForegroundCleanup)
+	}
 	deadline := time.Date(2026, time.October, 3, 0, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
 		name      string
