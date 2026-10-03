@@ -13,8 +13,11 @@ import (
 
 // Stats exposes object-store operations at both the logical bucket boundary
 // and the provider-neutral HTTP boundary. S3HTTP* remains for compatibility.
-// BytesUploaded counts bytes read for upload attempts; BytesPublished counts
-// bytes from Upload calls acknowledged without error by the provider.
+// BytesUploaded counts source-reader bytes consumed by upload attempts,
+// including SDK re-reads; it is not wire bytes. BytesPublished counts one
+// known object size per successful Upload, falling back to source-reader bytes
+// consumed when the size cannot be determined. HTTPRequestBodyBytes is the
+// separate transport-body byte measure.
 type Stats struct {
 	Uploads         uint64 `json:"uploads"`
 	Gets            uint64 `json:"gets"`
@@ -124,10 +127,15 @@ func (b *MeteredBucket) Stats() Stats {
 func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
 	b.metrics.uploads.Add(1)
 	counted := &countingReader{reader: reader, count: &b.metrics.bytesUploaded}
+	size, sizeErr := counted.ObjectSize()
 	ctx = withExpectedCondition(ctx, opts...)
-	err := b.Bucket.Upload(ctx, name, counted, opts...)
+	err := b.Bucket.Upload(ctx, name, countingReaderWithCapabilities(counted, reader), opts...)
 	if err == nil {
-		b.metrics.bytesPublished.Add(counted.read.Load())
+		if sizeErr == nil {
+			b.metrics.bytesPublished.Add(uint64(size))
+		} else {
+			b.metrics.bytesPublished.Add(counted.read.Load())
+		}
 	}
 	if err != nil && b.Bucket.IsConditionNotMetErr(err) {
 		if strings.Contains(name, "/blocks/") || strings.Contains(name, "/extents/") || strings.Contains(name, "/roots/") {
@@ -312,6 +320,59 @@ func (r *countingReader) ObjectSize() (int64, error) {
 		return reader.Size(), nil
 	}
 	return 0, err
+}
+
+func countingReaderWithCapabilities(counted *countingReader, reader io.Reader) io.Reader {
+	readerAt, hasReaderAt := reader.(io.ReaderAt)
+	seeker, hasSeeker := reader.(io.Seeker)
+	switch {
+	case hasReaderAt && hasSeeker:
+		return &countingReaderAtSeeker{countingReader: counted, readerAt: readerAt, seeker: seeker}
+	case hasReaderAt:
+		return &countingReaderAt{countingReader: counted, readerAt: readerAt}
+	case hasSeeker:
+		return &countingReaderSeeker{countingReader: counted, seeker: seeker}
+	default:
+		return counted
+	}
+}
+
+type countingReaderAt struct {
+	*countingReader
+	readerAt io.ReaderAt
+}
+
+func (r *countingReaderAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	n, err := r.readerAt.ReadAt(buffer, offset)
+	r.count.Add(uint64(n))
+	r.read.Add(uint64(n))
+	return n, err
+}
+
+type countingReaderSeeker struct {
+	*countingReader
+	seeker io.Seeker
+}
+
+func (r *countingReaderSeeker) Seek(offset int64, whence int) (int64, error) {
+	return r.seeker.Seek(offset, whence)
+}
+
+type countingReaderAtSeeker struct {
+	*countingReader
+	readerAt io.ReaderAt
+	seeker   io.Seeker
+}
+
+func (r *countingReaderAtSeeker) ReadAt(buffer []byte, offset int64) (int, error) {
+	n, err := r.readerAt.ReadAt(buffer, offset)
+	r.count.Add(uint64(n))
+	r.read.Add(uint64(n))
+	return n, err
+}
+
+func (r *countingReaderAtSeeker) Seek(offset int64, whence int) (int64, error) {
+	return r.seeker.Seek(offset, whence)
 }
 
 type countingReadCloser struct {

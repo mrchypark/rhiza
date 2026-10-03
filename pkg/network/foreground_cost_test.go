@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/foregroundcosttest"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
@@ -783,76 +784,10 @@ func apiLatencyJSON(sample apiLatencySample, seconds float64) map[string]any {
 	}
 }
 
-type foregroundAPIWindowGate struct {
-	mu              sync.Mutex
-	deadline        time.Time
-	closed          bool
-	active          int
-	pendingAtCutoff int
-}
-
-func (g *foregroundAPIWindowGate) beginAt(now time.Time) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.beginLocked(now)
-}
-
-func (g *foregroundAPIWindowGate) begin() (time.Time, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	started := time.Now()
-	return started, g.beginLocked(started)
-}
-
-func (g *foregroundAPIWindowGate) beginLocked(now time.Time) bool {
-	if g.closed || !now.Before(g.deadline) {
-		if !g.closed {
-			g.closed = true
-			g.pendingAtCutoff = g.active
-		}
-		return false
-	}
-	g.active++
-	return true
-}
-
-func (g *foregroundAPIWindowGate) close() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if !g.closed {
-		g.closed = true
-		g.pendingAtCutoff = g.active
-	}
-}
-
-func (g *foregroundAPIWindowGate) finish() {
-	g.mu.Lock()
-	g.active--
-	g.mu.Unlock()
-}
-
-func (g *foregroundAPIWindowGate) snapshot() (pendingAtCutoff, outstanding int) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.pendingAtCutoff, g.active
-}
+type foregroundAPIWindowGate = foregroundcosttest.Gate
 
 func runForegroundAPICall(parent context.Context, gate *foregroundAPIWindowGate, maxDuration time.Duration, call func(context.Context) error, onError func(context.Context, time.Time, time.Time, error)) (started, completed time.Time, err error, admitted bool) {
-	if parent.Err() != nil {
-		return time.Time{}, time.Time{}, nil, false
-	}
-	if started, admitted = gate.begin(); !admitted {
-		return time.Time{}, time.Time{}, nil, false
-	}
-	defer gate.finish()
-	callCtx, cancel := context.WithTimeout(parent, maxDuration)
-	defer cancel()
-	err = call(callCtx)
-	completed = time.Now()
-	if err != nil && onError != nil {
-		onError(callCtx, started, completed, err)
-	}
-	return started, completed, err, true
+	return foregroundcosttest.Call(parent, gate, maxDuration, call, onError)
 }
 
 func nearestRankDurationP99(values []time.Duration) float64 {
@@ -960,57 +895,12 @@ func seedForegroundAPIKeys(ctx context.Context, put func(context.Context, KVMuta
 	if err := foregroundAPISeedResult(nil, ctx, budgetDeadline, runnerBound); err != nil {
 		return err
 	}
-	seedCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	jobs := make(chan int)
-	var workers sync.WaitGroup
-	var completed atomic.Uint64
-	var errMu sync.Mutex
-	var seedErr error
-	workers.Add(foregroundAPIWorkers)
-	for range foregroundAPIWorkers {
-		go func() {
-			defer workers.Done()
-			for {
-				select {
-				case <-seedCtx.Done():
-					return
-				case index, ok := <-jobs:
-					if !ok {
-						return
-					}
-					requestID := fmt.Sprintf("foreground-seed-%d-%d", clientID, index)
-					key := fmt.Sprintf("key-%04d", index)
-					if err := put(seedCtx, KVMutationRequest{RequestID: requestID, Key: key, Value: value}); err != nil {
-						errMu.Lock()
-						seedErr = errors.Join(seedErr, fmt.Errorf("seed key %d: %w", index, err))
-						errMu.Unlock()
-						cancel()
-						return
-					}
-					count := int(completed.Add(1))
-					if progress != nil && (count%foregroundAPISeedLogEvery == 0 || count == foregroundAPIKeys) {
-						progress(count)
-					}
-				}
-			}
-		}()
-	}
-
-dispatch:
-	for index := range foregroundAPIKeys {
-		select {
-		case jobs <- index:
-		case <-seedCtx.Done():
-			break dispatch
-		}
-	}
-	close(jobs)
-	workers.Wait()
-
-	errMu.Lock()
-	defer errMu.Unlock()
+	seedErr := foregroundcosttest.Seed(ctx, foregroundcosttest.SeedOptions{
+		Workers: foregroundAPIWorkers, Keys: foregroundAPIKeys, ProgressEvery: foregroundAPISeedLogEvery,
+		Value: value, ClientID: clientID,
+	}, func(seedCtx context.Context, requestID, key string, value []byte) error {
+		return put(seedCtx, KVMutationRequest{RequestID: requestID, Key: key, Value: value})
+	}, progress)
 	return foregroundAPISeedResult(seedErr, ctx, budgetDeadline, runnerBound)
 }
 
@@ -1258,7 +1148,7 @@ func TestForegroundPUTFailureDiagnosticIsBoundedAndReadOnly(t *testing.T) {
 	diagnostic := &foregroundPUTFailureDiagnostic{barrier: barrier, materials: material}
 	stats := &apiLatencyAccumulator{}
 	cutoff := time.Now().Add(time.Second)
-	gate := &foregroundAPIWindowGate{deadline: cutoff}
+	gate := foregroundcosttest.NewGate(cutoff)
 	barrierEntered, releaseBarrier := make(chan struct{}), make(chan struct{})
 	barrierDone := make(chan struct{})
 	go func() {
@@ -1400,7 +1290,7 @@ func TestForegroundAPIWindowCutoffDrainsAdmittedCalls(t *testing.T) {
 	for _, workers := range []int{1, foregroundAPIWorkers} {
 		t.Run(fmt.Sprintf("workers-%d", workers), func(t *testing.T) {
 			deadline := time.Now().Add(40 * time.Millisecond)
-			gate := &foregroundAPIWindowGate{deadline: deadline}
+			gate := foregroundcosttest.NewGate(deadline)
 			release := make(chan struct{})
 			started := make(chan struct{}, workers)
 			type result struct {
@@ -1435,12 +1325,12 @@ func TestForegroundAPIWindowCutoffDrainsAdmittedCalls(t *testing.T) {
 			}
 			timer := time.NewTimer(time.Until(deadline))
 			<-timer.C
-			gate.close()
-			pending, _ := gate.snapshot()
+			gate.Close()
+			pending, _ := gate.Snapshot()
 			if pending != workers {
 				t.Fatalf("pending at cutoff=%d, want %d", pending, workers)
 			}
-			if gate.beginAt(deadline) {
+			if gate.BeginAt(deadline) {
 				t.Fatal("call admitted at exact cutoff")
 			}
 			close(release)
@@ -1463,23 +1353,24 @@ func TestForegroundAPIWindowCutoffDrainsAdmittedCalls(t *testing.T) {
 		})
 	}
 
-	gate := &foregroundAPIWindowGate{deadline: time.Now().Add(time.Second)}
-	if !gate.beginAt(gate.deadline.Add(-time.Nanosecond)) || gate.beginAt(gate.deadline) {
+	deadline := time.Now().Add(time.Second)
+	gate := foregroundcosttest.NewGate(deadline)
+	if !gate.BeginAt(deadline.Add(-time.Nanosecond)) || gate.BeginAt(deadline) {
 		t.Fatal("admission gate did not accept before and reject at the exact cutoff")
 	}
-	gate.finish()
-	gate.close()
+	gate.Finish()
+	gate.Close()
 }
 
 func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T) {
 	t.Run("operation timeout before cutoff", func(t *testing.T) {
 		deadline := time.Now().Add(time.Second)
-		gate := &foregroundAPIWindowGate{deadline: deadline}
+		gate := foregroundcosttest.NewGate(deadline)
 		started, completed, err, admitted := runForegroundAPICall(context.Background(), gate, 10*time.Millisecond, func(ctx context.Context) error {
 			<-ctx.Done()
 			return ctx.Err()
 		}, nil)
-		gate.close()
+		gate.Close()
 		if !admitted || !errors.Is(err, context.DeadlineExceeded) || !completed.Before(deadline) {
 			t.Fatalf("started=%s completed=%s deadline=%s admitted=%t err=%v", started, completed, deadline, admitted, err)
 		}
@@ -1505,7 +1396,7 @@ func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T)
 
 	t.Run("parent cancellation", func(t *testing.T) {
 		parent, cancel := context.WithCancel(context.Background())
-		gate := &foregroundAPIWindowGate{deadline: time.Now().Add(time.Second)}
+		gate := foregroundcosttest.NewGate(time.Now().Add(time.Second))
 		startedCall := make(chan struct{})
 		result := make(chan error, 1)
 		go func() {
@@ -1525,14 +1416,14 @@ func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T)
 		if err := <-result; !errors.Is(err, context.Canceled) {
 			t.Fatalf("parent cancellation error=%v", err)
 		}
-		gate.close()
-		if _, outstanding := gate.snapshot(); outstanding != 0 {
+		gate.Close()
+		if _, outstanding := gate.Snapshot(); outstanding != 0 {
 			t.Fatalf("parent cancellation left %d calls outstanding", outstanding)
 		}
 	})
 	t.Run("operation deadline during drain remains error", func(t *testing.T) {
 		deadline := time.Now().Add(10 * time.Millisecond)
-		gate := &foregroundAPIWindowGate{deadline: deadline}
+		gate := foregroundcosttest.NewGate(deadline)
 		startedCall := make(chan struct{})
 		result := make(chan struct {
 			started, completed time.Time
@@ -1554,7 +1445,7 @@ func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T)
 		<-startedCall
 		timer := time.NewTimer(time.Until(deadline))
 		<-timer.C
-		gate.close()
+		gate.Close()
 		outcome := <-result
 		if !outcome.admitted || !errors.Is(outcome.err, context.DeadlineExceeded) || !outcome.completed.After(deadline) {
 			t.Fatalf("drain operation result=%+v deadline=%s", outcome, deadline)
@@ -1619,7 +1510,7 @@ func TestForegroundAPIWindowDrainCompletesRealKVPut(t *testing.T) {
 	}
 	defer releaseLock()
 	deadline := time.Now().Add(40 * time.Millisecond)
-	gate := &foregroundAPIWindowGate{deadline: deadline}
+	gate := foregroundcosttest.NewGate(deadline)
 	started := make(chan struct{})
 	type callResult struct {
 		response   KVMutationResponse
@@ -1644,8 +1535,8 @@ func TestForegroundAPIWindowDrainCompletesRealKVPut(t *testing.T) {
 	}
 	timer := time.NewTimer(time.Until(deadline))
 	<-timer.C
-	gate.close()
-	if pending, _ := gate.snapshot(); pending != 1 {
+	gate.Close()
+	if pending, _ := gate.Snapshot(); pending != 1 {
 		t.Fatalf("pending at cutoff=%d, want 1", pending)
 	}
 	releaseLock()
@@ -1657,7 +1548,7 @@ func TestForegroundAPIWindowDrainCompletesRealKVPut(t *testing.T) {
 	if receipt.Status != types.MutationCommitted || !receipt.Applied || receipt.Slot == 0 {
 		t.Fatalf("KVPut receipt=%+v, want committed/applied nonzero slot", receipt)
 	}
-	if _, outstanding := gate.snapshot(); outstanding != 0 {
+	if _, outstanding := gate.Snapshot(); outstanding != 0 {
 		t.Fatalf("KVPut drain left %d calls outstanding", outstanding)
 	}
 }
@@ -2284,77 +2175,37 @@ func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, c
 	if diagnostic != nil && diagnostic.barrier != nil {
 		diagnostic.barrier.setEnabled(true)
 	}
-	window, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
-	deadline, _ := window.Deadline()
-	gate := &foregroundAPIWindowGate{deadline: deadline}
-	var workers sync.WaitGroup
-	for worker := range foregroundAPIWorkers {
-		workers.Add(1)
-		go func(worker int) {
-			defer workers.Done()
-			index := worker
-			for {
-				key := fmt.Sprintf("key-%04d", index%foregroundAPIKeys)
-				id := sequence.Add(1)
-				startedEpoch := maintenanceEpoch.Load()
-				startedDuringMaintenance := maintenanceActive.Load()
-				requestID := fmt.Sprintf("foreground-%d-%d", clientID, id)
-				started, completed, putErr, admitted := runForegroundAPICall(ctx, gate, foregroundAPICallMaxDuration, func(callCtx context.Context) error {
-					_, err := server.KVPut(callCtx, KVMutationRequest{RequestID: requestID, Key: key, Value: value})
-					return err
-				}, func(callCtx context.Context, callStarted, callCompleted time.Time, err error) {
-					if diagnostic != nil {
-						diagnostic.record(phase, callCtx, requestID, callStarted, callCompleted, deadline, err)
-					}
-				})
-				if !admitted {
-					return
-				}
-				putElapsed := completed.Sub(started)
-				putOverlap := startedDuringMaintenance || maintenanceActive.Load() || startedEpoch != maintenanceEpoch.Load()
-				if collect {
-					put.add(putElapsed, putErr, putOverlap, !completed.After(deadline))
-				}
-				startedEpoch = maintenanceEpoch.Load()
-				startedDuringMaintenance = maintenanceActive.Load()
-				started, completed, getErr, admitted := runForegroundAPICall(ctx, gate, foregroundAPICallMaxDuration, func(callCtx context.Context) error {
-					response, err := server.KVGet(callCtx, KVGetRequest{Key: key, Consistency: "linearizable"})
-					if err == nil && !response.Found {
-						return fmt.Errorf("linearizable get missing seeded value")
-					}
-					return err
-				}, nil)
-				if !admitted {
-					return
-				}
-				getElapsed := completed.Sub(started)
-				getOverlap := startedDuringMaintenance || maintenanceActive.Load() || startedEpoch != maintenanceEpoch.Load()
-				if collect {
-					get.add(getElapsed, getErr, getOverlap, !completed.After(deadline))
-				}
-				index = (index + foregroundAPIWorkers) % foregroundAPIKeys
-			}
-		}(worker)
-	}
-	<-window.Done()
-	gate.close()
-	workers.Wait()
+	result, err := foregroundcosttest.RunWindow(ctx, foregroundcosttest.Options{
+		Workers: foregroundAPIWorkers, Keys: foregroundAPIKeys, Value: value, ClientID: clientID,
+		Sequence: sequence, Duration: duration, CallTimeout: foregroundAPICallMaxDuration,
+		Validate:    collect,
+		Maintenance: func() (bool, uint64) { return maintenanceActive.Load(), maintenanceEpoch.Load() },
+	}, func(callCtx context.Context, requestID, key string, value []byte) error {
+		_, err := server.KVPut(callCtx, KVMutationRequest{RequestID: requestID, Key: key, Value: value})
+		return err
+	}, func(callCtx context.Context, key string) error {
+		response, err := server.KVGet(callCtx, KVGetRequest{Key: key, Consistency: "linearizable"})
+		if err == nil && !response.Found {
+			return fmt.Errorf("linearizable get missing seeded value")
+		}
+		return err
+	}, func(observation foregroundcosttest.Observation) {
+		if !collect {
+			return
+		}
+		elapsed := observation.Completed.Sub(observation.Started)
+		if observation.Operation == foregroundcosttest.Put {
+			put.add(elapsed, observation.Err, observation.Overlap, observation.InWindow)
+		} else {
+			get.add(elapsed, observation.Err, observation.Overlap, observation.InWindow)
+		}
+	}, func(observation foregroundcosttest.Observation) {
+		if diagnostic != nil {
+			diagnostic.record(phase, observation.Context, observation.RequestID, observation.Started, observation.Completed, observation.Cutoff, observation.Err)
+		}
+	})
 	if diagnostic != nil && phase == "measurement" {
 		diagnostic.inspectAfterJoin()
 	}
-	if err := ctx.Err(); err != nil {
-		pending, outstanding := gate.snapshot()
-		return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, err
-	}
-	pending, outstanding := gate.snapshot()
-	if collect {
-		putSample, getSample := put.snapshot(), get.snapshot()
-		completed := len(putSample.all) + len(putSample.drainAll) + len(getSample.all) + len(getSample.drainAll)
-		started := putSample.started + getSample.started
-		if completed != started || outstanding != 0 {
-			return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, fmt.Errorf("foreground API window accounting mismatch: started=%d completed=%d outstanding=%d", started, completed, outstanding)
-		}
-	}
-	return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, nil
+	return put, get, foregroundAPIWindowTotals{pendingAtCutoff: result.PendingAtCutoff, outstanding: result.Outstanding}, err
 }

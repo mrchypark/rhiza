@@ -275,7 +275,7 @@ jobs:
   issue185-cost-evidence:
     if: ${{ inputs.issue185_cost_evidence }}
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
 
@@ -410,9 +410,18 @@ jobs:
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -timeout=5m ./pkg/node \
             -run '^TestCheckpointRestoreCostExercisesNodeRecoveryPathS3$'
+          run_logged node-learn-gap-lifecycle-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=3m ./pkg/node \
+            -run '^TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls$'
+          run_logged node-foreground-cost-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_NODE_FOREGROUND_API_COST=1 \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
+            -run '^TestNodeForegroundAPICostS3$'
           for scenario in baseline checkpoint-active gc-active; do
             for repetition in 1 2 3; do
-              label="foreground-${scenario}-${repetition}"
+              label="network-component-${scenario}-${repetition}"
               run_logged "$label" env \
                 RHIZA_FOREGROUND_API_COST_SCENARIO="$scenario" \
                 RHIZA_FOREGROUND_API_COST_REPETITION="$repetition" \

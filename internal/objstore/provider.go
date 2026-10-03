@@ -68,7 +68,9 @@ func NewBucket(cfg Config) (*MeteredBucket, error) {
 			Bucket: cfg.Bucket, Endpoint: cfg.Endpoint, Region: cfg.Region, Insecure: cfg.Insecure,
 			AWSSDKAuth: cfg.AccessKey == "", AccessKey: cfg.AccessKey, SecretKey: cfg.SecretKey,
 			SessionToken: cfg.SessionToken, MaxRetries: cfg.MaxRetries,
-		}, "rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
+		}, "rhiza", func(next http.RoundTripper) http.RoundTripper {
+			return metrics.transport(wrapTestObserver(cfg.Endpoint, next))
+		})
 	case ProviderGCS:
 		providerConfig := gcs.DefaultConfig
 		providerConfig.Bucket, providerConfig.ServiceAccount, providerConfig.MaxRetries = cfg.Bucket, cfg.ServiceAccount, cfg.MaxRetries

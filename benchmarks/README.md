@@ -113,12 +113,37 @@ credentials or cloud storage.
 The run selects `TestVersityGatewayCostEvidence` and
 `TestVersitySDKRetryEvidence`, followed by `TestCheckpointCost`,
 `TestArchiveGCCost`, and
-`TestCheckpointRestoreCostExercisesNodeRecoveryPathS3`, then runs
-`TestForegroundAPICost` serially for `baseline`, `checkpoint-active`, and
+`TestCheckpointRestoreCostExercisesNodeRecoveryPathS3`. It then runs the
+build-tagged `TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls`
+lifecycle regression and one `TestNodeForegroundAPICostS3` baseline, followed by
+the bare-core `pkg/network` `TestForegroundAPICost` component diagnostic
+serially for `baseline`, `checkpoint-active`, and
 `gc-active`, three repetitions each. Each foreground repetition retains its
 30-second warm-up and 120-second measured window. The restore case publishes a
 certified checkpoint through one node, removes only the local SQLite files,
 then verifies that a second `Node.Open` recovers the value and reaches ready.
+
+The held-gap regression uses async object-store durability to isolate automatic
+Node catch-up and ACK-after-apply behavior; it is mechanism evidence, not a
+foreground cost result. `TestNodeForegroundAPICostS3` uses the production
+Before-ACK API path through three opened Nodes and preserves the same 4096-key,
+16-worker, 30-second warm-up, 120-second measurement, and 30-second call bounds.
+It reports per-phase logical API counters, per-Node object-store counter deltas,
+and independent Versity access-log request counts. These Node-path results are
+separate from the existing checkpoint publication and archive-GC selectors;
+they do not replace their metrics or establish checkpoint/GC maintenance
+performance. Both new Node selectors are opt-in within the explicitly
+dispatched evidence job and require the existing `rhiza_local_testhooks` tag.
+The tagged Node run also retains only per-phase transport-error aggregates and
+the first sanitized failure detail (request method/status family, error class,
+and elapsed time), including checkpoint cleanup preparation and each sequential
+Node shutdown; phase is sampled at request start. It does not log URLs, keys,
+headers, credentials, or bodies. This is diagnostic attribution, not a claim
+that retry metadata is available.
+The nine `pkg/network` repetitions exercise the network component directly;
+they are not Node API foreground measurements and are labeled
+`network-component-*` in the evidence artifact. The three-Node Before-ACK
+baseline is the actual Node API foreground result.
 
 For the foreground result, each fixed window is an enrollment cutoff: no new
 API calls start after it. Calls already admitted drain under a parent-bounded
@@ -147,6 +172,13 @@ attempts, one injected failure, and one GET reaching the Versity backend. The
 proxy counter proves this controlled GET retry; missing MinIO attempt metadata
 remains unknown and is not presented as zero retries. It does not measure PUT
 retries or upload-body replay. Upload-attempt bytes, per-upload acknowledged
-bytes, and winner/root reachable bytes are distinct measures. The local Versity
-results are local S3 compatibility evidence only—not AWS/GCS qualification or
-a release gate.
+bytes, and winner/root reachable bytes are distinct measures. `BytesUploaded`
+is SDK source-reader work: it includes reader re-reads used for hashing or
+retries and is not physical wire bytes. `BytesPublished` adds the known object
+size once after a successful upload; when size is unknown it falls back to
+source-reader bytes consumed, so that fallback is not an exact unique-object
+byte measure. `HTTPRequestBodyBytes` is a separate transport-body count and can
+include S3 framing/signatures. The Node result's legacy
+`attempted_upload_bytes` label refers to `BytesUploaded` with this reader-work
+meaning. The local Versity results are local S3 compatibility evidence only—not
+AWS/GCS qualification or a release gate.
