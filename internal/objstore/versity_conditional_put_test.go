@@ -25,6 +25,21 @@ import (
 // request-body transport error. It is opt-in and uses only a fresh local
 // Versity fixture and task-owned bucket.
 func TestVersityConditionalLargePutEvidence(t *testing.T) {
+	runVersityConditionalLargePutEvidence(t, false)
+}
+
+// TestVersityConditionalLargePutExpectEvidence is a separately selectable
+// local diagnostic of the 100-continue prototype. Set
+// RHIZA_VERSITY_EXPECT_CONTINUE=1 to opt into this second S3 run.
+func TestVersityConditionalLargePutExpectEvidence(t *testing.T) {
+	if os.Getenv("RHIZA_VERSITY_EXPECT_CONTINUE") != "1" {
+		t.Skip("set RHIZA_VERSITY_EXPECT_CONTINUE=1 to run the separate Expect prototype")
+	}
+	runVersityConditionalLargePutEvidence(t, true)
+}
+
+func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
+	t.Helper()
 	bin := os.Getenv("RHIZA_VERSITYGW_BIN")
 	if bin == "" {
 		t.Skip("set RHIZA_VERSITYGW_BIN to a pinned local Versity Gateway binary")
@@ -80,11 +95,11 @@ func TestVersityConditionalLargePutEvidence(t *testing.T) {
 	}
 	seedClientAttempts, seedClientResponses := setupCounts.Snapshot()
 
-	bucket, err = NewBucket(Config{
+	bucket, err = newConditionalExpectVersityBucket(Config{
 		Provider: ProviderS3, Endpoint: strings.TrimPrefix(server.Endpoint, "http://"),
 		Bucket: bucketName, Region: "us-east-1", Insecure: true,
 		AccessKey: server.AccessKey, SecretKey: server.SecretKey,
-	})
+	}, expectContinue)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +144,7 @@ func TestVersityConditionalLargePutEvidence(t *testing.T) {
 	serverCalls := versityfixture.RequestCount(allRecords)
 	setupAttempts, setupResponses := setupCounts.Snapshot()
 	seedHash := sha256.Sum256(seedBody)
-	t.Logf("VERSITY_CONDITIONAL_PUT phase=conditional_put provider=local-versity-s3 qualification=false version=%q binary_sha256=%s payload_size=%d payload_sha256=%x seed_readback_size=%d seed_readback_sha256=%x logical_uploads=%d logical_failures=%d error_type=%T condition_error=%t syscall_epipe=%t context_canceled=%t context_deadline=%t client_attempts=%d HTTP_failures=%d transport_failures=%d request_body_bytes=%d response_body_bytes=%d retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d published_bytes=%d server_put_records=%d status_200=%d status_412=%d other_status=%d server_request_count=%d readback_ok=%t readback_size=%d readback_sha256=%x setup_attempts=%d setup_responses=%d", server.Version, server.BinarySHA256, payloadSize, payloadHash, len(seedBody), seedHash, callStats.Uploads, callStats.Failures, conditionalErr, condition, epipe, canceled, deadline, callStats.HTTPRequests, callStats.HTTPFailures, callStats.TransportFailures, callStats.HTTPRequestBodyBytes, callStats.HTTPResponseBodyBytes, callStats.RetryMetadataRequests, callStats.RetryMetadataUnknownRequests, callStats.SDKRetries, callStats.BytesPublished, putRecords.requests, putRecords.status200, putRecords.status412, putRecords.otherStatus, serverCalls, readbackOK, readbackSize, readbackHash, setupAttempts, setupResponses)
+	t.Logf("VERSITY_CONDITIONAL_PUT phase=conditional_put provider=local-versity-s3 qualification=false expect_continue_prototype=%t version=%q binary_sha256=%s payload_size=%d payload_sha256=%x seed_readback_size=%d seed_readback_sha256=%x logical_uploads=%d logical_failures=%d error_type=%T condition_error=%t syscall_epipe=%t context_canceled=%t context_deadline=%t client_attempts=%d HTTP_failures=%d transport_failures=%d request_body_bytes=%d response_body_bytes=%d retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d published_bytes=%d server_put_records=%d status_200=%d status_412=%d other_status=%d server_request_count=%d readback_ok=%t readback_size=%d readback_sha256=%x setup_attempts=%d setup_responses=%d", expectContinue, server.Version, server.BinarySHA256, payloadSize, payloadHash, len(seedBody), seedHash, callStats.Uploads, callStats.Failures, conditionalErr, condition, epipe, canceled, deadline, callStats.HTTPRequests, callStats.HTTPFailures, callStats.TransportFailures, callStats.HTTPRequestBodyBytes, callStats.HTTPResponseBodyBytes, callStats.RetryMetadataRequests, callStats.RetryMetadataUnknownRequests, callStats.SDKRetries, callStats.BytesPublished, putRecords.requests, putRecords.status200, putRecords.status412, putRecords.otherStatus, serverCalls, readbackOK, readbackSize, readbackHash, setupAttempts, setupResponses)
 	if seedClientAttempts != seedClientResponses {
 		t.Fatalf("seed setup client attempts=%d responses=%d", seedClientAttempts, seedClientResponses)
 	}
@@ -144,6 +159,9 @@ func TestVersityConditionalLargePutEvidence(t *testing.T) {
 	}
 	if putRecords.requests < 2 || putRecords.status200 != 1 || putRecords.status412 == 0 {
 		t.Fatalf("server per-key PUT records=%d seed_status200=%d conditional_status412=%d other_status=%d", putRecords.requests, putRecords.status200, putRecords.status412, putRecords.otherStatus)
+	}
+	if expectContinue && (callStats.HTTPRequests != 1 || callStats.HTTPRequestBodyBytes != 0 || putRecords.requests != 2 || putRecords.status412 != 1) {
+		t.Fatalf("Expect prototype did not reject before body: attempts=%d client_body_bytes=%d per_key_puts=%d status412=%d", callStats.HTTPRequests, callStats.HTTPRequestBodyBytes, putRecords.requests, putRecords.status412)
 	}
 	readbackHTTPRequests := readbackStats.HTTPRequests - callStats.HTTPRequests
 	if !readbackOK || readbackErr != nil || readbackStats.Gets-callStats.Gets != 1 {
