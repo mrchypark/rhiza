@@ -40,6 +40,7 @@ func TestVersityConditionalLargePutExpectEvidence(t *testing.T) {
 
 func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 	t.Helper()
+	traceEnabled := expectContinue && os.Getenv("RHIZA_VERSITY_HTTP_TRACE") == "1"
 	bin := os.Getenv("RHIZA_VERSITYGW_BIN")
 	if bin == "" {
 		t.Skip("set RHIZA_VERSITYGW_BIN to a pinned local Versity Gateway binary")
@@ -95,16 +96,23 @@ func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 	}
 	seedClientAttempts, seedClientResponses := setupCounts.Snapshot()
 
+	var httpTrace *conditionalPutHTTPTrace
+	if traceEnabled {
+		httpTrace = newConditionalPutHTTPTrace()
+	}
 	bucket, err = newConditionalExpectVersityBucket(Config{
 		Provider: ProviderS3, Endpoint: strings.TrimPrefix(server.Endpoint, "http://"),
 		Bucket: bucketName, Region: "us-east-1", Insecure: true,
 		AccessKey: server.AccessKey, SecretKey: server.SecretKey,
-	}, expectContinue)
+	}, expectContinue, httpTrace)
 	if err != nil {
 		t.Fatal(err)
 	}
 	workCtx, cancelWork := context.WithTimeout(ctx, 20*time.Second)
 	conditionalErr := bucket.Upload(workCtx, key, bytes.NewReader(payload), thanosobjstore.WithIfNotExists())
+	if httpTrace != nil {
+		logConditionalPutHTTPTrace(t, httpTrace.closeAndSnapshot())
+	}
 	callStats := bucket.Stats()
 	cancelWork()
 
@@ -144,7 +152,7 @@ func runVersityConditionalLargePutEvidence(t *testing.T, expectContinue bool) {
 	serverCalls := versityfixture.RequestCount(allRecords)
 	setupAttempts, setupResponses := setupCounts.Snapshot()
 	seedHash := sha256.Sum256(seedBody)
-	t.Logf("VERSITY_CONDITIONAL_PUT phase=conditional_put provider=local-versity-s3 qualification=false expect_continue_prototype=%t version=%q binary_sha256=%s payload_size=%d payload_sha256=%x seed_readback_size=%d seed_readback_sha256=%x logical_uploads=%d logical_failures=%d error_type=%T condition_error=%t syscall_epipe=%t context_canceled=%t context_deadline=%t client_attempts=%d HTTP_failures=%d transport_failures=%d request_body_bytes=%d response_body_bytes=%d retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d published_bytes=%d server_put_records=%d status_200=%d status_412=%d other_status=%d server_request_count=%d readback_ok=%t readback_size=%d readback_sha256=%x setup_attempts=%d setup_responses=%d", expectContinue, server.Version, server.BinarySHA256, payloadSize, payloadHash, len(seedBody), seedHash, callStats.Uploads, callStats.Failures, conditionalErr, condition, epipe, canceled, deadline, callStats.HTTPRequests, callStats.HTTPFailures, callStats.TransportFailures, callStats.HTTPRequestBodyBytes, callStats.HTTPResponseBodyBytes, callStats.RetryMetadataRequests, callStats.RetryMetadataUnknownRequests, callStats.SDKRetries, callStats.BytesPublished, putRecords.requests, putRecords.status200, putRecords.status412, putRecords.otherStatus, serverCalls, readbackOK, readbackSize, readbackHash, setupAttempts, setupResponses)
+	t.Logf("VERSITY_CONDITIONAL_PUT phase=conditional_put provider=local-versity-s3 qualification=false expect_continue_prototype=%t http_trace_enabled=%t version=%q binary_sha256=%s payload_size=%d payload_sha256=%x seed_readback_size=%d seed_readback_sha256=%x logical_uploads=%d logical_failures=%d error_type=%T condition_error=%t syscall_epipe=%t context_canceled=%t context_deadline=%t client_attempts=%d HTTP_failures=%d transport_failures=%d request_body_bytes=%d response_body_bytes=%d retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d published_bytes=%d server_put_records=%d status_200=%d status_412=%d other_status=%d server_request_count=%d readback_ok=%t readback_size=%d readback_sha256=%x setup_attempts=%d setup_responses=%d", expectContinue, traceEnabled, server.Version, server.BinarySHA256, payloadSize, payloadHash, len(seedBody), seedHash, callStats.Uploads, callStats.Failures, conditionalErr, condition, epipe, canceled, deadline, callStats.HTTPRequests, callStats.HTTPFailures, callStats.TransportFailures, callStats.HTTPRequestBodyBytes, callStats.HTTPResponseBodyBytes, callStats.RetryMetadataRequests, callStats.RetryMetadataUnknownRequests, callStats.SDKRetries, callStats.BytesPublished, putRecords.requests, putRecords.status200, putRecords.status412, putRecords.otherStatus, serverCalls, readbackOK, readbackSize, readbackHash, setupAttempts, setupResponses)
 	if seedClientAttempts != seedClientResponses {
 		t.Fatalf("seed setup client attempts=%d responses=%d", seedClientAttempts, seedClientResponses)
 	}
