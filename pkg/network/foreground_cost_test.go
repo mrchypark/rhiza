@@ -241,6 +241,395 @@ type apiLatencyAccumulator struct {
 	apiLatencySample
 }
 
+const (
+	foregroundPUTDiagnosticLimit = 16
+	foregroundPUTStackLimit      = 512 << 10
+	foregroundPUTErrorChainLimit = 12
+)
+
+type foregroundPUTErrorNode struct {
+	Depth int    `json:"depth"`
+	Type  string `json:"type"`
+	Error string `json:"error"`
+}
+
+type foregroundPUTUnknown struct {
+	Slot             quepaxa.Slot `json:"slot"`
+	RetryThroughSlot uint64       `json:"retry_through_slot"`
+	RequestID        string       `json:"request_id"`
+	CauseType        string       `json:"cause_type,omitempty"`
+	Cause            string       `json:"cause,omitempty"`
+}
+
+type foregroundPUTFailure struct {
+	Phase                 string                   `json:"phase"`
+	CompletionWindow      string                   `json:"completion_window"`
+	RequestID             string                   `json:"request_id"`
+	ErrorType             string                   `json:"error_type"`
+	Error                 string                   `json:"error"`
+	ErrorChain            []foregroundPUTErrorNode `json:"error_chain"`
+	ErrorChainTruncated   bool                     `json:"error_chain_truncated"`
+	Unknowns              []foregroundPUTUnknown   `json:"commit_unknowns,omitempty"`
+	Elapsed               time.Duration            `json:"elapsed_ns"`
+	StartedAt             time.Time                `json:"started_at"`
+	CompletedAt           time.Time                `json:"completed_at"`
+	CutoffKnown           bool                     `json:"cutoff_known"`
+	CompletionOffset      time.Duration            `json:"completion_offset_ns"`
+	CompletedBeforeCutoff bool                     `json:"completed_before_cutoff"`
+	CallDeadline          time.Time                `json:"call_deadline"`
+	CallContextErr        string                   `json:"call_context_error"`
+	IsDeadline            bool                     `json:"is_deadline"`
+	IsCanceled            bool                     `json:"is_canceled"`
+	IsQuorumUnavailable   bool                     `json:"is_quorum_unavailable"`
+	IsCommitUnknown       bool                     `json:"is_commit_unknown"`
+}
+
+type foregroundPUTReceipt struct {
+	RequestID string               `json:"request_id"`
+	Found     bool                 `json:"found"`
+	Status    types.MutationStatus `json:"status,omitempty"`
+	Applied   bool                 `json:"applied"`
+	Slot      uint64               `json:"slot"`
+	Error     string               `json:"error,omitempty"`
+}
+
+type foregroundPUTBarrierState struct {
+	Active                int                          `json:"active"`
+	MaxActive             int                          `json:"max_active"`
+	Calls                 int                          `json:"calls"`
+	LastSlot              quepaxa.Slot                 `json:"last_slot"`
+	LastDuration          time.Duration                `json:"last_duration_ns"`
+	LastError             string                       `json:"last_error,omitempty"`
+	LastSuccessfulThrough quepaxa.Slot                 `json:"last_successful_through"`
+	FirstFailureSlot      quepaxa.Slot                 `json:"first_failure_slot"`
+	FirstFailure          string                       `json:"first_failure,omitempty"`
+	ActiveSlots           []foregroundPUTActiveBarrier `json:"active_slots,omitempty"`
+	ActiveSlotsTruncated  bool                         `json:"active_slots_truncated"`
+}
+
+type foregroundPUTActiveBarrier struct {
+	Slot quepaxa.Slot  `json:"slot"`
+	Age  time.Duration `json:"age_ns"`
+}
+
+type foregroundPUTBarrierObservation struct {
+	mu                   sync.Mutex
+	enabled              bool
+	nextID               uint64
+	activeSlots          []foregroundPUTActiveBarrierEntry
+	activeSlotsTruncated bool
+	foregroundPUTBarrierState
+}
+
+type foregroundPUTActiveBarrierEntry struct {
+	id      uint64
+	slot    quepaxa.Slot
+	started time.Time
+}
+
+func (o *foregroundPUTBarrierObservation) setEnabled(enabled bool) {
+	o.mu.Lock()
+	o.enabled = enabled
+	o.mu.Unlock()
+}
+
+func (o *foregroundPUTBarrierObservation) run(ctx context.Context, slot quepaxa.Slot, syncThrough func(context.Context, quepaxa.Slot) error) error {
+	started := time.Now()
+	o.mu.Lock()
+	if !o.enabled {
+		o.mu.Unlock()
+		return syncThrough(ctx, slot)
+	}
+	o.Active++
+	o.Calls++
+	o.nextID++
+	id := o.nextID
+	if len(o.activeSlots) < foregroundPUTDiagnosticLimit {
+		o.activeSlots = append(o.activeSlots, foregroundPUTActiveBarrierEntry{id: id, slot: slot, started: started})
+	} else {
+		o.activeSlotsTruncated = true
+	}
+	if o.Active > o.MaxActive {
+		o.MaxActive = o.Active
+	}
+	o.mu.Unlock()
+
+	err := syncThrough(ctx, slot)
+	o.mu.Lock()
+	o.Active--
+	for index, entry := range o.activeSlots {
+		if entry.id == id {
+			o.activeSlots = append(o.activeSlots[:index], o.activeSlots[index+1:]...)
+			break
+		}
+	}
+	o.LastSlot = slot
+	o.LastDuration = time.Since(started)
+	o.LastError = foregroundPUTShortError(err)
+	if err == nil {
+		if slot > o.LastSuccessfulThrough {
+			o.LastSuccessfulThrough = slot
+		}
+	} else if o.FirstFailure == "" {
+		o.FirstFailureSlot = slot
+		o.FirstFailure = foregroundPUTShortError(err)
+	}
+	o.mu.Unlock()
+	return err
+}
+
+func (o *foregroundPUTBarrierObservation) snapshot() foregroundPUTBarrierState {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	state := o.foregroundPUTBarrierState
+	state.ActiveSlotsTruncated = o.activeSlotsTruncated
+	state.ActiveSlots = make([]foregroundPUTActiveBarrier, 0, len(o.activeSlots))
+	for _, entry := range o.activeSlots {
+		state.ActiveSlots = append(state.ActiveSlots, foregroundPUTActiveBarrier{Slot: entry.slot, Age: time.Since(entry.started)})
+	}
+	return state
+}
+
+type foregroundPUTFailureDiagnostic struct {
+	mu                sync.Mutex
+	records           []foregroundPUTFailure
+	stack             string
+	stackBytes        int
+	stackTruncated    bool
+	stackCaptured     bool
+	stackCaptures     int
+	barrierAtFirst    foregroundPUTBarrierState
+	barrierAtFirstAt  time.Time
+	barrier           *foregroundPUTBarrierObservation
+	materials         *materializer.Materializer
+	core              *quepaxa.Core
+	archive           *recovery.Manager
+	receipts          []foregroundPUTReceipt
+	readbackError     string
+	receiptObservedAt time.Time
+	materialTip       uint64
+	coreTip           quepaxa.Slot
+	archiveTip        quepaxa.Slot
+}
+
+func foregroundPUTShortError(err error) string {
+	if err == nil {
+		return ""
+	}
+	const max = 512
+	message := err.Error()
+	if len(message) > max {
+		return message[:max] + "…"
+	}
+	return message
+}
+
+func foregroundPUTErrorChain(err error) ([]foregroundPUTErrorNode, []foregroundPUTUnknown, bool) {
+	type pending struct {
+		err   error
+		depth int
+	}
+	queue := []pending{{err: err}}
+	nodes := make([]foregroundPUTErrorNode, 0, foregroundPUTErrorChainLimit)
+	unknowns := make([]foregroundPUTUnknown, 0, 2)
+	truncated := false
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if current.err == nil {
+			continue
+		}
+		if len(nodes) == foregroundPUTErrorChainLimit {
+			truncated = true
+			break
+		}
+		nodes = append(nodes, foregroundPUTErrorNode{Depth: current.depth, Type: fmt.Sprintf("%T", current.err), Error: foregroundPUTShortError(current.err)})
+		if unknown, ok := current.err.(*CommitUnknownError); ok {
+			item := foregroundPUTUnknown{Slot: unknown.Slot, RetryThroughSlot: unknown.RetryThroughSlot, RequestID: unknown.RequestID}
+			if unknown.Cause != nil {
+				item.CauseType, item.Cause = fmt.Sprintf("%T", unknown.Cause), foregroundPUTShortError(unknown.Cause)
+			}
+			unknowns = append(unknowns, item)
+		}
+		if nested, ok := current.err.(interface{ Unwrap() []error }); ok {
+			children := nested.Unwrap()
+			if current.depth+1 >= foregroundPUTErrorChainLimit && len(children) != 0 {
+				truncated = true
+				continue
+			}
+			for _, child := range children {
+				queue = append(queue, pending{err: child, depth: current.depth + 1})
+			}
+		} else if nested := errors.Unwrap(current.err); nested != nil {
+			if current.depth+1 >= foregroundPUTErrorChainLimit {
+				truncated = true
+				continue
+			}
+			queue = append(queue, pending{err: nested, depth: current.depth + 1})
+		}
+	}
+	return nodes, unknowns, truncated
+}
+
+func (d *foregroundPUTFailureDiagnostic) record(phase string, ctx context.Context, requestID string, started, completed, cutoff time.Time, err error) {
+	d.recordWithStack(phase, ctx, requestID, started, completed, cutoff, err, runtime.Stack)
+}
+
+func (d *foregroundPUTFailureDiagnostic) recordWithStack(phase string, ctx context.Context, requestID string, started, completed, cutoff time.Time, err error, stack func([]byte, bool) int) {
+	if err == nil {
+		return
+	}
+	callDeadline, _ := ctx.Deadline()
+	callContextErr := ctx.Err()
+	errorChain, unknowns, chainTruncated := foregroundPUTErrorChain(err)
+	cutoffKnown := !cutoff.IsZero()
+	completionOffset := time.Duration(0)
+	completedBeforeCutoff := false
+	completionWindow := "outside-window"
+	if cutoffKnown {
+		completionOffset = completed.Sub(cutoff)
+		completedBeforeCutoff = !completed.After(cutoff)
+		completionWindow = "drain"
+		if completedBeforeCutoff {
+			completionWindow = "in-window"
+		}
+	}
+	record := foregroundPUTFailure{
+		Phase: phase, CompletionWindow: completionWindow, RequestID: requestID, ErrorType: fmt.Sprintf("%T", err), Error: foregroundPUTShortError(err),
+		ErrorChain: errorChain, ErrorChainTruncated: chainTruncated, Unknowns: unknowns,
+		Elapsed: completed.Sub(started), StartedAt: started, CompletedAt: completed,
+		CutoffKnown: cutoffKnown, CompletionOffset: completionOffset, CompletedBeforeCutoff: completedBeforeCutoff,
+		CallDeadline: callDeadline, CallContextErr: foregroundPUTShortError(callContextErr),
+		IsDeadline: errors.Is(err, context.DeadlineExceeded), IsCanceled: errors.Is(err, context.Canceled),
+		IsQuorumUnavailable: errors.Is(err, quepaxa.ErrQuorumUnavailable), IsCommitUnknown: errors.Is(err, ErrCommitUnknown),
+	}
+	d.mu.Lock()
+	if len(d.records) < foregroundPUTDiagnosticLimit {
+		d.records = append(d.records, record)
+	}
+	captureStack := !d.stackCaptured
+	if captureStack {
+		d.stackCaptured = true
+		d.stackCaptures++
+	}
+	d.mu.Unlock()
+	if !captureStack {
+		return
+	}
+
+	barrierState := foregroundPUTBarrierState{}
+	if d.barrier != nil {
+		barrierState = d.barrier.snapshot()
+	}
+	barrierObservedAt := time.Now()
+	buf := make([]byte, foregroundPUTStackLimit)
+	n := stack(buf, true)
+	d.mu.Lock()
+	d.stack = string(buf[:n])
+	d.stackBytes = n
+	d.stackTruncated = n == len(buf)
+	d.barrierAtFirst = barrierState
+	d.barrierAtFirstAt = barrierObservedAt
+	d.mu.Unlock()
+}
+
+func (d *foregroundPUTFailureDiagnostic) inspectAfterJoin() {
+	d.mu.Lock()
+	records := append([]foregroundPUTFailure(nil), d.records...)
+	d.mu.Unlock()
+	if d.materials == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	d.mu.Lock()
+	d.receiptObservedAt = time.Now()
+	d.mu.Unlock()
+	for _, record := range records {
+		if ctx.Err() != nil {
+			d.mu.Lock()
+			d.readbackError = ctx.Err().Error()
+			d.mu.Unlock()
+			break
+		}
+		receipt, found, err := d.materials.MutationReceipt(ctx, types.MutationKV, record.RequestID)
+		observation := foregroundPUTReceipt{RequestID: record.RequestID, Found: found}
+		if err != nil {
+			observation.Error = foregroundPUTShortError(err)
+		} else if found {
+			observation.Status, observation.Applied, observation.Slot = receipt.Status, receipt.Applied, receipt.Slot
+		}
+		d.mu.Lock()
+		d.receipts = append(d.receipts, observation)
+		d.mu.Unlock()
+	}
+	if d.materials != nil {
+		d.materialTip = d.materials.Tip()
+	}
+	if d.core != nil {
+		d.coreTip = d.core.Tip()
+	}
+	if d.archive != nil {
+		d.archiveTip = d.archive.Tip()
+	}
+}
+
+func (d *foregroundPUTFailureDiagnostic) json() ([]byte, error) {
+	barrierFinal := foregroundPUTBarrierState{}
+	if d.barrier != nil {
+		barrierFinal = d.barrier.snapshot()
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return json.Marshal(struct {
+		Purpose          string                    `json:"purpose"`
+		TimestampSource  string                    `json:"timestamp_source"`
+		Limit            int                       `json:"record_limit"`
+		Records          []foregroundPUTFailure    `json:"first_failures"`
+		StackCaptured    bool                      `json:"stack_captured"`
+		StackCaptures    int                       `json:"stack_capture_count"`
+		StackBytes       int                       `json:"stack_bytes"`
+		StackTruncated   bool                      `json:"stack_truncated"`
+		Stack            string                    `json:"all_goroutine_stack"`
+		BarrierAtFirst   foregroundPUTBarrierState `json:"barrier_at_first_error"`
+		BarrierAtFirstAt time.Time                 `json:"barrier_at_first_error_observed_at"`
+		BarrierFinal     foregroundPUTBarrierState `json:"barrier_after_join"`
+		Receipts         []foregroundPUTReceipt    `json:"read_only_receipts"`
+		ReceiptObserved  time.Time                 `json:"receipt_observed_at"`
+		ReadbackError    string                    `json:"readback_error,omitempty"`
+		MaterialTip      uint64                    `json:"materializer_tip"`
+		CoreTip          quepaxa.Slot              `json:"core_tip"`
+		ArchiveTip       quepaxa.Slot              `json:"archive_tip"`
+	}{
+		Purpose: "diagnostic-only; not performance or p99 qualification", TimestampSource: "time.Now wall clock at PUT closure; elapsed is monotonic duration",
+		Limit: foregroundPUTDiagnosticLimit, Records: append([]foregroundPUTFailure(nil), d.records...),
+		StackCaptured: d.stackCaptured, StackCaptures: d.stackCaptures, StackBytes: d.stackBytes, StackTruncated: d.stackTruncated, Stack: d.stack,
+		BarrierAtFirst: d.barrierAtFirst, BarrierFinal: barrierFinal, Receipts: append([]foregroundPUTReceipt(nil), d.receipts...),
+		BarrierAtFirstAt: d.barrierAtFirstAt,
+		ReceiptObserved:  d.receiptObservedAt, ReadbackError: d.readbackError,
+		MaterialTip: d.materialTip, CoreTip: d.coreTip, ArchiveTip: d.archiveTip,
+	})
+}
+
+func logForegroundPUTDiagnostic(t testing.TB, diagnostic *foregroundPUTFailureDiagnostic) {
+	t.Helper()
+	if diagnostic == nil {
+		return
+	}
+	diagnostic.mu.Lock()
+	hasFailures := len(diagnostic.records) > 0
+	diagnostic.mu.Unlock()
+	if !hasFailures {
+		return
+	}
+	result, err := diagnostic.json()
+	if err != nil {
+		t.Logf("FOREGROUND_API_PUT_DIAGNOSTIC marshal_error=%q", err.Error())
+		return
+	}
+	t.Logf("FOREGROUND_API_PUT_DIAGNOSTIC %s", result)
+}
+
 func (a *apiLatencyAccumulator) add(elapsed time.Duration, err error, overlap, inWindow bool) {
 	recordingStarted := time.Now()
 	a.mu.Lock()
@@ -416,7 +805,7 @@ func (g *foregroundAPIWindowGate) snapshot() (pendingAtCutoff, outstanding int) 
 	return g.pendingAtCutoff, g.active
 }
 
-func runForegroundAPICall(parent context.Context, gate *foregroundAPIWindowGate, maxDuration time.Duration, call func(context.Context) error) (started, completed time.Time, err error, admitted bool) {
+func runForegroundAPICall(parent context.Context, gate *foregroundAPIWindowGate, maxDuration time.Duration, call func(context.Context) error, onError func(context.Context, time.Time, time.Time, error)) (started, completed time.Time, err error, admitted bool) {
 	if parent.Err() != nil {
 		return time.Time{}, time.Time{}, nil, false
 	}
@@ -428,6 +817,9 @@ func runForegroundAPICall(parent context.Context, gate *foregroundAPIWindowGate,
 	defer cancel()
 	err = call(callCtx)
 	completed = time.Now()
+	if err != nil && onError != nil {
+		onError(callCtx, started, completed, err)
+	}
 	return started, completed, err, true
 }
 
@@ -771,6 +1163,155 @@ func TestForegroundAPIWindowBudgetRequiresBothFixedWindowsAndCleanupReserve(t *t
 	}
 }
 
+func TestForegroundPUTFailureDiagnosticIsBoundedAndReadOnly(t *testing.T) {
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "diagnostic.sqlite"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	barrier := &foregroundPUTBarrierObservation{}
+	barrier.setEnabled(true)
+	diagnostic := &foregroundPUTFailureDiagnostic{barrier: barrier, materials: material}
+	stats := &apiLatencyAccumulator{}
+	cutoff := time.Now().Add(time.Second)
+	gate := &foregroundAPIWindowGate{deadline: cutoff}
+	barrierEntered, releaseBarrier := make(chan struct{}), make(chan struct{})
+	barrierDone := make(chan struct{})
+	go func() {
+		defer close(barrierDone)
+		if err := barrier.run(context.Background(), 7, func(context.Context, quepaxa.Slot) error {
+			close(barrierEntered)
+			<-releaseBarrier
+			return nil
+		}); err != nil {
+			t.Errorf("diagnostic barrier: %v", err)
+		}
+	}()
+	<-barrierEntered
+	want := &CommitUnknownError{RequestID: "first-failure", Cause: context.DeadlineExceeded}
+	var observedContext context.Context
+	started, completed, err, admitted := runForegroundAPICall(context.Background(), gate, time.Second, func(ctx context.Context) error {
+		observedContext = ctx
+		return want
+	}, func(ctx context.Context, start, end time.Time, callErr error) {
+		diagnostic.record("measurement", ctx, "first-failure", start, end, cutoff, callErr)
+		if ctx.Err() != nil {
+			t.Errorf("call context was canceled before diagnostics: %v", ctx.Err())
+		}
+	})
+	if !admitted || !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first call admitted=%t err=%v", admitted, err)
+	}
+	if observedContext.Err() != context.Canceled {
+		t.Fatalf("helper did not cancel call context after diagnostic: %v", observedContext.Err())
+	}
+	close(releaseBarrier)
+	<-barrierDone
+	stats.add(completed.Sub(started), err, false, true)
+
+	const concurrentFailures = foregroundPUTDiagnosticLimit + 5
+	var workers sync.WaitGroup
+	workers.Add(concurrentFailures)
+	for index := range concurrentFailures {
+		go func(index int) {
+			defer workers.Done()
+			requestID := fmt.Sprintf("failure-%d", index)
+			failure := fmt.Errorf("%w: %s", ErrCommitUnknown, requestID)
+			start, end := time.Now(), time.Now()
+			diagnostic.record("drain", context.Background(), requestID, start, end, cutoff, failure)
+			stats.add(end.Sub(start), failure, false, false)
+		}(index)
+	}
+	workers.Wait()
+	if got := material.Tip(); got != 0 {
+		t.Fatalf("diagnostic test materializer tip before readback=%d, want 0", got)
+	}
+	diagnostic.inspectAfterJoin()
+	if got := material.Tip(); got != 0 {
+		t.Fatalf("receipt inspection mutated materializer tip=%d", got)
+	}
+
+	diagnostic.mu.Lock()
+	records := append([]foregroundPUTFailure(nil), diagnostic.records...)
+	stackCaptures, stackBytes, stackTruncated, stack := diagnostic.stackCaptures, diagnostic.stackBytes, diagnostic.stackTruncated, diagnostic.stack
+	barrierAtFirst, receiptObservedAt := diagnostic.barrierAtFirst, diagnostic.receiptObservedAt
+	receipts := append([]foregroundPUTReceipt(nil), diagnostic.receipts...)
+	diagnostic.mu.Unlock()
+	if len(records) != foregroundPUTDiagnosticLimit {
+		t.Fatalf("diagnostic retained %d failures, want cap %d", len(records), foregroundPUTDiagnosticLimit)
+	}
+	if records[0].RequestID != "first-failure" || records[0].CallContextErr != "" || len(records[0].ErrorChain) < 2 || len(records[0].Unknowns) != 1 || records[0].Unknowns[0].Slot != 0 {
+		t.Fatalf("first failure provenance=%+v", records[0])
+	}
+	if records[0].Phase != "measurement" || records[0].CompletionWindow != "in-window" || records[0].CallDeadline.IsZero() || records[0].StartedAt.IsZero() || records[0].CompletedAt.IsZero() {
+		t.Fatalf("first failure time/phase provenance=%+v", records[0])
+	}
+	if stackCaptures != 1 || stackBytes <= 0 || stackBytes > foregroundPUTStackLimit || stack == "" {
+		t.Fatalf("stack captures=%d bytes=%d length=%d", stackCaptures, stackBytes, len(stack))
+	}
+	if stackTruncated != (stackBytes == foregroundPUTStackLimit) {
+		t.Fatalf("stack truncation flag=%t bytes=%d", stackTruncated, stackBytes)
+	}
+	if barrierAtFirst.Active != 1 || len(barrierAtFirst.ActiveSlots) != 1 || barrierAtFirst.ActiveSlots[0].Slot != 7 {
+		t.Fatalf("first-error active barrier snapshot=%+v", barrierAtFirst)
+	}
+	if len(receipts) != foregroundPUTDiagnosticLimit {
+		t.Fatalf("post-join receipt checks=%d, want at most %d", len(receipts), foregroundPUTDiagnosticLimit)
+	}
+	if receiptObservedAt.IsZero() {
+		t.Fatal("read-only receipt checks have no observation timestamp")
+	}
+	for _, receipt := range receipts {
+		if receipt.Found || receipt.Error != "" {
+			t.Fatalf("unexpected read-only receipt observation: %+v", receipt)
+		}
+	}
+	sample := stats.snapshot()
+	if sample.started != concurrentFailures+1 || sample.errors != 1 || sample.commitUnknown != 1 || sample.drainErrors != concurrentFailures || sample.drainCommitUnknown != concurrentFailures {
+		t.Fatalf("diagnostic changed API outcome counters: %+v", sample)
+	}
+}
+
+func TestForegroundPUTBarrierSnapshotPrecedesStackCapture(t *testing.T) {
+	barrier := &foregroundPUTBarrierObservation{}
+	barrier.setEnabled(true)
+	diagnostic := &foregroundPUTFailureDiagnostic{barrier: barrier}
+	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := barrier.run(context.Background(), 19, func(context.Context, quepaxa.Slot) error {
+			close(entered)
+			<-release
+			return nil
+		}); err != nil {
+			t.Errorf("barrier run: %v", err)
+		}
+	}()
+	<-entered
+	started := time.Now()
+	diagnostic.recordWithStack("measurement", context.Background(), "interleave", started, started, time.Time{}, errors.New("trigger"), func(buf []byte, all bool) int {
+		if !all {
+			t.Error("stack capture must include all goroutines")
+		}
+		close(release)
+		<-done
+		return copy(buf, "interleaved stack")
+	})
+	diagnostic.mu.Lock()
+	first, capturedAt := diagnostic.barrierAtFirst, diagnostic.barrierAtFirstAt
+	diagnostic.mu.Unlock()
+	final := barrier.snapshot()
+	if first.Active != 1 || len(first.ActiveSlots) != 1 || first.ActiveSlots[0].Slot != 19 {
+		t.Fatalf("first snapshot lost active barrier during stack capture: %+v", first)
+	}
+	if capturedAt.IsZero() {
+		t.Fatal("first barrier snapshot has no observation timestamp")
+	}
+	if final.Active != 0 || len(final.ActiveSlots) != 0 {
+		t.Fatalf("barrier should be inactive after injected stack interleaving: %+v", final)
+	}
+}
+
 func TestForegroundAPIWindowCutoffDrainsAdmittedCalls(t *testing.T) {
 	for _, workers := range []int{1, foregroundAPIWorkers} {
 		t.Run(fmt.Sprintf("workers-%d", workers), func(t *testing.T) {
@@ -797,7 +1338,7 @@ func TestForegroundAPIWindowCutoffDrainsAdmittedCalls(t *testing.T) {
 						case <-ctx.Done():
 							return ctx.Err()
 						}
-					})
+					}, nil)
 					results <- result{start: start, end: end, err: err, admitted: admitted}
 				}()
 			}
@@ -853,7 +1394,7 @@ func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T)
 		started, completed, err, admitted := runForegroundAPICall(context.Background(), gate, 10*time.Millisecond, func(ctx context.Context) error {
 			<-ctx.Done()
 			return ctx.Err()
-		})
+		}, nil)
 		gate.close()
 		if !admitted || !errors.Is(err, context.DeadlineExceeded) || !completed.Before(deadline) {
 			t.Fatalf("started=%s completed=%s deadline=%s admitted=%t err=%v", started, completed, deadline, admitted, err)
@@ -888,7 +1429,7 @@ func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T)
 				close(startedCall)
 				<-ctx.Done()
 				return ctx.Err()
-			})
+			}, nil)
 			if !admitted && err == nil {
 				result <- errors.New("call was not admitted")
 				return
@@ -919,7 +1460,7 @@ func TestForegroundAPICallTimeoutAndParentCancellationRemainErrors(t *testing.T)
 				close(startedCall)
 				<-ctx.Done()
 				return ctx.Err()
-			})
+			}, nil)
 			result <- struct {
 				started, completed time.Time
 				err                error
@@ -1009,7 +1550,7 @@ func TestForegroundAPIWindowDrainCompletesRealKVPut(t *testing.T) {
 			close(started)
 			response, err = server.KVPut(ctx, KVMutationRequest{RequestID: requestID, Key: "window-drain", Value: []byte("durable")})
 			return err
-		})
+		}, nil)
 		result <- callResult{response: response, start: start, end: end, err: err, admitted: admitted}
 	}()
 	select {
@@ -1122,8 +1663,14 @@ func TestForegroundAPICost(t *testing.T) {
 	if err := archive.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
+	barrierDiagnostic := &foregroundPUTBarrierObservation{}
+	putDiagnostic := &foregroundPUTFailureDiagnostic{
+		barrier: barrierDiagnostic, materials: cluster.materials["n1"], core: cluster.cores["n1"], archive: archive,
+	}
 	server.SetDurabilityBarrier(func(barrierCtx context.Context, slot quepaxa.Slot) error {
-		return archive.SyncThrough(barrierCtx, cluster.cores["n1"], slot)
+		return barrierDiagnostic.run(barrierCtx, slot, func(ctx context.Context, through quepaxa.Slot) error {
+			return archive.SyncThrough(ctx, cluster.cores["n1"], through)
+		})
 	})
 	value := make([]byte, foregroundAPIValue)
 	for i := range value {
@@ -1134,15 +1681,22 @@ func TestForegroundAPICost(t *testing.T) {
 	if hasRunnerDeadline {
 		requireForegroundAPIWindowBudget(t, runnerDeadline, "before key seeding")
 	}
+	barrierDiagnostic.setEnabled(true)
 	seedCtx, cancelSeed, seedDeadline, runnerBound := withForegroundAPISeedBudget(ctx, runnerDeadline)
 	err = seedForegroundAPIKeys(seedCtx, func(putCtx context.Context, request KVMutationRequest) error {
+		started := time.Now()
 		_, err := server.KVPut(putCtx, request)
+		if err != nil {
+			putDiagnostic.record("seed", putCtx, request.RequestID, started, time.Now(), time.Time{}, err)
+		}
 		return err
 	}, value, clientID, seedDeadline, runnerBound, func(count int) {
 		t.Logf("foreground API seed progress %d/%d", count, foregroundAPIKeys)
 	})
 	cancelSeed()
 	if err != nil {
+		putDiagnostic.inspectAfterJoin()
+		logForegroundPUTDiagnostic(t, putDiagnostic)
 		if errors.Is(err, errForegroundAPISeedBudgetExpired) {
 			t.Fatalf("foreground API seed budget expired before completion: %v", err)
 		}
@@ -1236,10 +1790,13 @@ func TestForegroundAPICost(t *testing.T) {
 			}
 		}()
 	}
-	if _, _, _, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 30*time.Second, &maintenanceActive, &maintenanceEpoch, false); err != nil {
+	if _, _, _, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 30*time.Second, &maintenanceActive, &maintenanceEpoch, false, "warmup", putDiagnostic); err != nil {
+		putDiagnostic.inspectAfterJoin()
+		logForegroundPUTDiagnostic(t, putDiagnostic)
 		t.Fatal(err)
 	}
-	put, get, windowTotals, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 120*time.Second, &maintenanceActive, &maintenanceEpoch, true)
+	put, get, windowTotals, err := runForegroundAPIWindow(ctx, server, value, clientID, &requestSequence, 120*time.Second, &maintenanceActive, &maintenanceEpoch, true, "measurement", putDiagnostic)
+	logForegroundPUTDiagnostic(t, putDiagnostic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1637,8 +2194,11 @@ type foregroundAPIWindowTotals struct {
 	outstanding     int
 }
 
-func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, clientID int64, sequence *atomic.Uint64, duration time.Duration, maintenanceActive *atomic.Bool, maintenanceEpoch *atomic.Uint64, collect bool) (*apiLatencyAccumulator, *apiLatencyAccumulator, foregroundAPIWindowTotals, error) {
+func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, clientID int64, sequence *atomic.Uint64, duration time.Duration, maintenanceActive *atomic.Bool, maintenanceEpoch *atomic.Uint64, collect bool, phase string, diagnostic *foregroundPUTFailureDiagnostic) (*apiLatencyAccumulator, *apiLatencyAccumulator, foregroundAPIWindowTotals, error) {
 	put, get := &apiLatencyAccumulator{}, &apiLatencyAccumulator{}
+	if diagnostic != nil && diagnostic.barrier != nil {
+		diagnostic.barrier.setEnabled(true)
+	}
 	window, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 	deadline, _ := window.Deadline()
@@ -1654,9 +2214,14 @@ func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, c
 				id := sequence.Add(1)
 				startedEpoch := maintenanceEpoch.Load()
 				startedDuringMaintenance := maintenanceActive.Load()
+				requestID := fmt.Sprintf("foreground-%d-%d", clientID, id)
 				started, completed, putErr, admitted := runForegroundAPICall(ctx, gate, foregroundAPICallMaxDuration, func(callCtx context.Context) error {
-					_, err := server.KVPut(callCtx, KVMutationRequest{RequestID: fmt.Sprintf("foreground-%d-%d", clientID, id), Key: key, Value: value})
+					_, err := server.KVPut(callCtx, KVMutationRequest{RequestID: requestID, Key: key, Value: value})
 					return err
+				}, func(callCtx context.Context, callStarted, callCompleted time.Time, err error) {
+					if diagnostic != nil {
+						diagnostic.record(phase, callCtx, requestID, callStarted, callCompleted, deadline, err)
+					}
 				})
 				if !admitted {
 					return
@@ -1674,7 +2239,7 @@ func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, c
 						return fmt.Errorf("linearizable get missing seeded value")
 					}
 					return err
-				})
+				}, nil)
 				if !admitted {
 					return
 				}
@@ -1690,6 +2255,9 @@ func runForegroundAPIWindow(ctx context.Context, server *Server, value []byte, c
 	<-window.Done()
 	gate.close()
 	workers.Wait()
+	if diagnostic != nil && phase == "measurement" {
+		diagnostic.inspectAfterJoin()
+	}
 	if err := ctx.Err(); err != nil {
 		pending, outstanding := gate.snapshot()
 		return put, get, foregroundAPIWindowTotals{pendingAtCutoff: pending, outstanding: outstanding}, err
