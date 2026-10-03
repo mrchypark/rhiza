@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
@@ -904,7 +905,16 @@ func (m *Manager) uploadExtent(ctx context.Context, hash [32]byte, data []byte, 
 		options = append(options, objstore.WithIfNotExists())
 	}
 	err := m.bucket.Upload(ctx, m.key(extentObjectKey(hash, generation)), bytes.NewReader(data), options...)
-	if m.cas && m.bucket.IsConditionNotMetErr(err) {
+	if !m.cas || err == nil {
+		return err
+	}
+	if !m.bucket.IsConditionNotMetErr(err) && !errors.Is(err, syscall.EPIPE) {
+		return err
+	}
+	if ctx.Err() != nil {
+		return err
+	}
+	if _, readErr := m.readExtent(ctx, hash, generation); readErr == nil && ctx.Err() == nil {
 		return nil
 	}
 	return err
