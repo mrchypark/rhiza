@@ -284,6 +284,12 @@ type foregroundPUTFailure struct {
 	IsCommitUnknown       bool                     `json:"is_commit_unknown"`
 }
 
+type foregroundPUTNodeIdentity struct {
+	NodeID        string `json:"node_id"`
+	CorePointer   string `json:"core_pointer"`
+	ServerPointer string `json:"server_pointer"`
+}
+
 type foregroundPUTReceipt struct {
 	RequestID string               `json:"request_id"`
 	Found     bool                 `json:"found"`
@@ -410,6 +416,25 @@ type foregroundPUTFailureDiagnostic struct {
 	materialTip       uint64
 	coreTip           quepaxa.Slot
 	archiveTip        quepaxa.Slot
+	configuredNodes   []foregroundPUTNodeIdentity
+	firstErrorNodes   []foregroundPUTNodeIdentity
+	nodeSnapshotAt    time.Time
+}
+
+func foregroundPUTConfiguredNodes(peers *foregroundAPIPeers) []foregroundPUTNodeIdentity {
+	members := append([]quepaxa.Member(nil), peers.config.Members...)
+	sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
+	if len(members) > 3 {
+		members = members[:3]
+	}
+	nodes := make([]foregroundPUTNodeIdentity, 0, len(members))
+	for _, member := range members {
+		nodes = append(nodes, foregroundPUTNodeIdentity{
+			NodeID: string(member.ID), CorePointer: fmt.Sprintf("%p", peers.cores[member.ID]),
+			ServerPointer: fmt.Sprintf("%p", peers.servers[member.ID]),
+		})
+	}
+	return nodes
 }
 
 func foregroundPUTShortError(err error) string {
@@ -511,6 +536,8 @@ func (d *foregroundPUTFailureDiagnostic) recordWithStack(phase string, ctx conte
 	if captureStack {
 		d.stackCaptured = true
 		d.stackCaptures++
+		d.firstErrorNodes = append([]foregroundPUTNodeIdentity(nil), d.configuredNodes...)
+		d.nodeSnapshotAt = time.Now().UTC()
 	}
 	d.mu.Unlock()
 	if !captureStack {
@@ -582,24 +609,27 @@ func (d *foregroundPUTFailureDiagnostic) json() ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return json.Marshal(struct {
-		Purpose          string                    `json:"purpose"`
-		TimestampSource  string                    `json:"timestamp_source"`
-		Limit            int                       `json:"record_limit"`
-		Records          []foregroundPUTFailure    `json:"first_failures"`
-		StackCaptured    bool                      `json:"stack_captured"`
-		StackCaptures    int                       `json:"stack_capture_count"`
-		StackBytes       int                       `json:"stack_bytes"`
-		StackTruncated   bool                      `json:"stack_truncated"`
-		Stack            string                    `json:"all_goroutine_stack"`
-		BarrierAtFirst   foregroundPUTBarrierState `json:"barrier_at_first_error"`
-		BarrierAtFirstAt time.Time                 `json:"barrier_at_first_error_observed_at"`
-		BarrierFinal     foregroundPUTBarrierState `json:"barrier_after_join"`
-		Receipts         []foregroundPUTReceipt    `json:"read_only_receipts"`
-		ReceiptObserved  time.Time                 `json:"receipt_observed_at"`
-		ReadbackError    string                    `json:"readback_error,omitempty"`
-		MaterialTip      uint64                    `json:"materializer_tip"`
-		CoreTip          quepaxa.Slot              `json:"core_tip"`
-		ArchiveTip       quepaxa.Slot              `json:"archive_tip"`
+		Purpose                string                      `json:"purpose"`
+		TimestampSource        string                      `json:"timestamp_source"`
+		Limit                  int                         `json:"record_limit"`
+		Records                []foregroundPUTFailure      `json:"first_failures"`
+		StackCaptured          bool                        `json:"stack_captured"`
+		StackCaptures          int                         `json:"stack_capture_count"`
+		StackBytes             int                         `json:"stack_bytes"`
+		StackTruncated         bool                        `json:"stack_truncated"`
+		Stack                  string                      `json:"all_goroutine_stack"`
+		BarrierAtFirst         foregroundPUTBarrierState   `json:"barrier_at_first_error"`
+		BarrierAtFirstAt       time.Time                   `json:"barrier_at_first_error_observed_at"`
+		BarrierFinal           foregroundPUTBarrierState   `json:"barrier_after_join"`
+		Receipts               []foregroundPUTReceipt      `json:"read_only_receipts"`
+		ReceiptObserved        time.Time                   `json:"receipt_observed_at"`
+		ReadbackError          string                      `json:"readback_error,omitempty"`
+		MaterialTip            uint64                      `json:"materializer_tip"`
+		CoreTip                quepaxa.Slot                `json:"core_tip"`
+		ArchiveTip             quepaxa.Slot                `json:"archive_tip"`
+		NodeIdentityCapturedAt time.Time                   `json:"first_error_node_identity_captured_at"`
+		FirstErrorNodes        []foregroundPUTNodeIdentity `json:"first_error_nodes"`
+		NodeDynamicState       string                      `json:"node_dynamic_state"`
 	}{
 		Purpose: "diagnostic-only; not performance or p99 qualification", TimestampSource: "time.Now wall clock at PUT closure; elapsed is monotonic duration",
 		Limit: foregroundPUTDiagnosticLimit, Records: append([]foregroundPUTFailure(nil), d.records...),
@@ -608,6 +638,8 @@ func (d *foregroundPUTFailureDiagnostic) json() ([]byte, error) {
 		BarrierAtFirstAt: d.barrierAtFirstAt,
 		ReceiptObserved:  d.receiptObservedAt, ReadbackError: d.readbackError,
 		MaterialTip: d.materialTip, CoreTip: d.coreTip, ArchiveTip: d.archiveTip,
+		NodeIdentityCapturedAt: d.nodeSnapshotAt, FirstErrorNodes: append([]foregroundPUTNodeIdentity(nil), d.firstErrorNodes...),
+		NodeDynamicState: "unavailable_no_nonblocking_getter",
 	})
 }
 
@@ -1163,6 +1195,58 @@ func TestForegroundAPIWindowBudgetRequiresBothFixedWindowsAndCleanupReserve(t *t
 	}
 }
 
+func TestForegroundPUTDiagnosticCapturesConfiguredNodeIdentityOnce(t *testing.T) {
+	peers := newForegroundAPIPeers(t, t.TempDir())
+	configured := foregroundPUTConfiguredNodes(peers)
+	diagnostic := &foregroundPUTFailureDiagnostic{configuredNodes: configured}
+	started := time.Now()
+	stackCalls := 0
+	stack := func(buf []byte, all bool) int {
+		stackCalls++
+		if !all {
+			t.Error("stack capture must include all goroutines")
+		}
+		return copy(buf, "first error stack")
+	}
+	diagnostic.recordWithStack("measurement", context.Background(), "no-error", started, started, time.Time{}, nil, stack)
+	if diagnostic.stackCaptured || len(diagnostic.firstErrorNodes) != 0 || diagnostic.nodeSnapshotAt != (time.Time{}) {
+		t.Fatal("nil error captured node identity")
+	}
+	diagnostic.recordWithStack("measurement", context.Background(), "first", started, time.Now(), time.Time{}, errors.New("first PUT failure"), stack)
+	firstCapturedAt := diagnostic.nodeSnapshotAt
+	configured[0].NodeID = "mutated-after-capture"
+	diagnostic.recordWithStack("drain", context.Background(), "second", started, time.Now(), time.Time{}, errors.New("second PUT failure"), stack)
+	if !diagnostic.stackCaptured || diagnostic.stackCaptures != 1 || stackCalls != 1 || diagnostic.nodeSnapshotAt != firstCapturedAt {
+		t.Fatalf("first-error capture changed on subsequent failures: stack=%t captures=%d stack_calls=%d at=%s", diagnostic.stackCaptured, diagnostic.stackCaptures, stackCalls, diagnostic.nodeSnapshotAt)
+	}
+
+	encoded, err := diagnostic.json()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		CapturedAt time.Time                   `json:"first_error_node_identity_captured_at"`
+		Nodes      []foregroundPUTNodeIdentity `json:"first_error_nodes"`
+		State      string                      `json:"node_dynamic_state"`
+	}
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.CapturedAt.IsZero() || len(got.Nodes) != 3 {
+		t.Fatalf("node identity JSON capture time=%s nodes=%+v", got.CapturedAt, got.Nodes)
+	}
+	for i, id := range []quepaxa.NodeID{"n1", "n2", "n3"} {
+		if got.Nodes[i].NodeID != string(id) ||
+			got.Nodes[i].CorePointer != fmt.Sprintf("%p", peers.cores[id]) ||
+			got.Nodes[i].ServerPointer != fmt.Sprintf("%p", peers.servers[id]) {
+			t.Fatalf("node identity %d was not ordered and copied immutably: %+v", i, got.Nodes[i])
+		}
+	}
+	if got.State != "unavailable_no_nonblocking_getter" {
+		t.Fatalf("dynamic node state must remain unavailable: %q", got.State)
+	}
+}
+
 func TestForegroundPUTFailureDiagnosticIsBoundedAndReadOnly(t *testing.T) {
 	material, err := materializer.Open(filepath.Join(t.TempDir(), "diagnostic.sqlite"), 1)
 	if err != nil {
@@ -1666,6 +1750,7 @@ func TestForegroundAPICost(t *testing.T) {
 	barrierDiagnostic := &foregroundPUTBarrierObservation{}
 	putDiagnostic := &foregroundPUTFailureDiagnostic{
 		barrier: barrierDiagnostic, materials: cluster.materials["n1"], core: cluster.cores["n1"], archive: archive,
+		configuredNodes: foregroundPUTConfiguredNodes(cluster),
 	}
 	server.SetDurabilityBarrier(func(barrierCtx context.Context, slot quepaxa.Slot) error {
 		return barrierDiagnostic.run(barrierCtx, slot, func(ctx context.Context, through quepaxa.Slot) error {
