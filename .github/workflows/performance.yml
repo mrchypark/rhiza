@@ -419,16 +419,6 @@ jobs:
             RHIZA_NODE_FOREGROUND_API_COST=1 \
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
-          for scenario in baseline checkpoint-active gc-active; do
-            for repetition in 1 2 3; do
-              label="network-component-${scenario}-${repetition}"
-              run_logged "$label" env \
-                RHIZA_FOREGROUND_API_COST_SCENARIO="$scenario" \
-                RHIZA_FOREGROUND_API_COST_REPETITION="$repetition" \
-                go test -count=1 -v -timeout=5m ./pkg/network \
-                -run '^TestForegroundAPICost$'
-            done
-          done
 
       - name: Upload issue 185 cost evidence
         if: always()

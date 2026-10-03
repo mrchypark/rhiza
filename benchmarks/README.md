@@ -115,13 +115,21 @@ The run selects `TestVersityGatewayCostEvidence` and
 `TestArchiveGCCost`, and
 `TestCheckpointRestoreCostExercisesNodeRecoveryPathS3`. It then runs the
 build-tagged `TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls`
-lifecycle regression and one `TestNodeForegroundAPICostS3` baseline, followed by
-the bare-core `pkg/network` `TestForegroundAPICost` component diagnostic
-serially for `baseline`, `checkpoint-active`, and
-`gc-active`, three repetitions each. Each foreground repetition retains its
-30-second warm-up and 120-second measured window. The restore case publishes a
-certified checkpoint through one node, removes only the local SQLite files,
-then verifies that a second `Node.Open` recovers the value and reaches ready.
+lifecycle regression and one `TestNodeForegroundAPICostS3` baseline. These are
+the seven required provider/checkpoint/GC/restore/Node selectors. The actual
+foreground acceptance result is the three-Node Before-ACK Node test; the
+bare-core `pkg/network` component matrix is not in this job. The Node foreground
+measurement retains its 30-second warm-up and 120-second measured window. The
+restore case publishes a certified checkpoint through one node, removes only
+the local SQLite files, then verifies that a second `Node.Open` recovers the
+value and reaches ready.
+
+The checkpoint cases report `snapshot_scan_hash_ms_by_role` separately from
+end-to-end creation time. This opt-in measurement covers each source's block
+read/hash loop and ends before its block uploads; it is wall time including
+source I/O and scheduling, not hash CPU time. Failed scans do not produce a
+successful zero-duration record. Ordinary `CreateFiles` calls do not enable
+the timing observer.
 
 The held-gap regression uses async object-store durability to isolate automatic
 Node catch-up and ACK-after-apply behavior; it is mechanism evidence, not a
@@ -140,10 +148,22 @@ and elapsed time), including checkpoint cleanup preparation and each sequential
 Node shutdown; phase is sampled at request start. It does not log URLs, keys,
 headers, credentials, or bodies. This is diagnostic attribution, not a claim
 that retry metadata is available.
-The nine `pkg/network` repetitions exercise the network component directly;
-they are not Node API foreground measurements and are labeled
-`network-component-*` in the evidence artifact. The three-Node Before-ACK
-baseline is the actual Node API foreground result.
+Optional `pkg/network` component diagnostics remain available for focused local
+investigation, but they are outside the required Issue #185 evidence job and are
+not Node API foreground measurements. For example, one baseline component run
+can be requested directly with:
+
+```sh
+RHIZA_FOREGROUND_API_COST_SCENARIO=baseline \
+RHIZA_FOREGROUND_API_COST_REPETITION=1 \
+go test -count=1 -v -timeout=5m ./pkg/network -run '^TestForegroundAPICost$'
+```
+
+The `checkpoint-active` and `gc-active` scenario values remain supported; a
+repetition value of `1`, `2`, or `3` selects the labeled repetition. These
+component results must not be substituted for the actual Node API foreground
+p99, nor required to pass as a condition for the provider/Node acceptance
+artifact. The three-Node Before-ACK result is the actual Node API measurement.
 
 For the foreground result, each fixed window is an enrollment cutoff: no new
 API calls start after it. Calls already admitted drain under a parent-bounded

@@ -118,13 +118,21 @@ func TestCheckpointCost(t *testing.T) {
 
 		before, serverBefore := bucket.Stats(), accessRequestCount(t, server)
 		started := time.Now()
-		root, err := manager.CreateFiles(ctx, claim, fixtures[scenario], uint64(index+1))
+		scanHashDurations := make(map[string]time.Duration, len(fixtures[scenario]))
+		scanHashSources := 0
+		root, err := manager.createFilesWithScanObserver(ctx, claim, fixtures[scenario], uint64(index+1), func(role string, elapsed time.Duration) {
+			scanHashDurations[role] += elapsed
+			scanHashSources++
+		})
 		createTime := time.Since(started)
 		createStats := checkpointCostDelta(before, bucket.Stats())
 		createRequests := accessRequestCount(t, server) - serverBefore
 		assertServerRequestDelta(t, "checkpoint_create_"+scenario, createRequests, createStats.HTTPRequests)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if scanHashSources != len(fixtures[scenario]) {
+			t.Fatalf("scenario=%s scan/hash timing callbacks=%d, want one per source (%d)", scenario, scanHashSources, len(fixtures[scenario]))
 		}
 
 		before, serverBefore = bucket.Stats(), accessRequestCount(t, server)
@@ -213,7 +221,9 @@ func TestCheckpointCost(t *testing.T) {
 			"promotion_error": promotionError, "source_bytes": root.Size, "block_count": len(root.Files[1].Blocks),
 			"reachable_bytes": sumReachable(reachable), "newly_reachable_bytes": newlyReachable,
 			"newly_reachable_block_bytes": newlyReachableBlocks, "create_ms": createTime.Milliseconds(),
-			"publish_ms": publishTime.Milliseconds(), "restore_ms": restoreTime.Milliseconds(),
+			"snapshot_scan_hash_ms_by_role": durationMapMilliseconds(scanHashDurations),
+			"snapshot_scan_hash_sources":    scanHashSources,
+			"publish_ms":                    publishTime.Milliseconds(), "restore_ms": restoreTime.Milliseconds(),
 			"claim_stats": claimStats, "create_stats": createStats, "publish_stats": publishStats,
 			"current_readback_stats": readbackStats, "claim_release_stats": releaseStats,
 			"reachability_stats": reachableStats, "restore_stats": restoreStats,
@@ -229,6 +239,94 @@ func TestCheckpointCost(t *testing.T) {
 		manager = readback
 	}
 	measureCheckpointCostCASLoser(t, ctx, bucket, server, prefix, manager, previousObjects)
+}
+
+func durationMapMilliseconds(durations map[string]time.Duration) map[string]float64 {
+	result := make(map[string]float64, len(durations))
+	for role, duration := range durations {
+		result[role] = float64(duration) / float64(time.Millisecond)
+	}
+	return result
+}
+
+type checkpointScanTimingBucket struct {
+	objstore.Bucket
+	uploadStarted chan struct{}
+	releaseUpload chan struct{}
+}
+
+func (b *checkpointScanTimingBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.Contains(name, "checkpoint/blocks/") {
+		select {
+		case b.uploadStarted <- struct{}{}:
+		default:
+		}
+		select {
+		case <-b.releaseUpload:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Bucket.Upload(ctx, name, reader, options...)
+}
+
+func TestCheckpointScanHashTimingEndsBeforeBlockUpload(t *testing.T) {
+	base := objstore.NewInMemBucket()
+	bucket := &checkpointScanTimingBucket{
+		Bucket: base, uploadStarted: make(chan struct{}, 1), releaseUpload: make(chan struct{}),
+	}
+	manager := NewManager(bucket, "checkpoint-scan-timing", "", 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	claim, err := manager.AcquirePublisherClaim(ctx, "scan-timing-test", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := []Source{
+		source(t, RoleSQLite, "scan-timing-sqlite"),
+		checkpointCostGraphSourceVariant(t, 1024, "scan-timing-test"),
+	}
+	scanEvents := make(chan struct {
+		role    string
+		elapsed time.Duration
+	}, 1)
+	createDone := make(chan error, 1)
+	go func() {
+		_, createErr := manager.createFilesWithScanObserver(ctx, claim, sources, 1, func(role string, elapsed time.Duration) {
+			scanEvents <- struct {
+				role    string
+				elapsed time.Duration
+			}{role: role, elapsed: elapsed}
+		})
+		createDone <- createErr
+	}()
+	select {
+	case event := <-scanEvents:
+		if event.role != RoleSQLite || event.elapsed < 0 {
+			t.Fatalf("scan event=%+v, want SQLite role and nonnegative elapsed time", event)
+		}
+	case <-ctx.Done():
+		t.Fatalf("hash scan did not complete before upload gate: %v", ctx.Err())
+	case err := <-createDone:
+		t.Fatalf("checkpoint creation exited before scan callback: %v", err)
+	}
+	select {
+	case <-bucket.uploadStarted:
+		// The upload is now blocked, while the scan event above has already arrived.
+	case <-ctx.Done():
+		t.Fatalf("block upload did not reach gate: %v", ctx.Err())
+	case err := <-createDone:
+		t.Fatalf("checkpoint creation exited before reaching block upload: %v", err)
+	}
+	close(bucket.releaseUpload)
+	select {
+	case err := <-createDone:
+		if err != nil {
+			t.Fatalf("complete checkpoint creation after releasing upload gate: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("checkpoint creation did not complete after releasing upload gate: %v", ctx.Err())
+	}
 }
 
 type checkpointCostRaceRoleKey struct{}

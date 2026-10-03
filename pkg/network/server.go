@@ -878,32 +878,11 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	backoff := [...]time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
 	for s.core.Tip() < through {
 		from := s.core.Tip() + 1
-		var response DecisionsResponse
-		var err error
-		for attempt, delay := range backoff {
-			if delay != 0 {
-				select {
-				case <-time.After(delay):
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-			response, err = s.transport.FetchDecisions(pageCtx, source, from, 128)
-			cancel()
-			if err == nil || attempt == len(backoff)-1 {
-				break
-			}
-		}
+		response, err := fetchDecisionsWithRetry(ctx, s.transport.FetchDecisions, source, from)
 		if err != nil {
-			if errors.Is(err, quepaxa.ErrCompacted) {
-				s.handleCompacted()
-				return ErrNotReady
-			}
-			return err
+			return s.handleCatchUpFetchError(err)
 		}
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
@@ -929,6 +908,41 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		return s.core.EnsureDurableThrough(ctx, through)
 	}
 	return ctx.Err()
+}
+
+func (s *Server) handleCatchUpFetchError(err error) error {
+	if errors.Is(err, quepaxa.ErrCompacted) {
+		s.handleCompacted()
+		return ErrNotReady
+	}
+	return err
+}
+
+func fetchDecisionsWithRetry(
+	ctx context.Context,
+	fetch func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (DecisionsResponse, error),
+	source quepaxa.NodeID,
+	from quepaxa.Slot,
+) (DecisionsResponse, error) {
+	backoff := [...]time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
+	var response DecisionsResponse
+	var err error
+	for attempt, delay := range backoff {
+		if delay != 0 {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return DecisionsResponse{}, ctx.Err()
+			}
+		}
+		pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		response, err = fetch(pageCtx, source, from, 128)
+		cancel()
+		if err == nil || errors.Is(err, quepaxa.ErrCompacted) || attempt == len(backoff)-1 {
+			break
+		}
+	}
+	return response, err
 }
 
 // ServeHTTP implements http.Handler.

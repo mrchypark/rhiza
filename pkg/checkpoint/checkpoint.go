@@ -462,6 +462,12 @@ func (m *Manager) loadAll(ctx context.Context) error {
 }
 
 func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64) (*Checkpoint, error) {
+	return m.createFilesWithScanObserver(ctx, claim, sources, index, nil)
+}
+
+// createFilesWithScanObserver is the opt-in cost-test path. The callback reports
+// the block scan/hash phase only; it does not include block uploads.
+func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64, onScan func(role string, elapsed time.Duration)) (*Checkpoint, error) {
 	for _, source := range sources {
 		if source.Role == RoleSQLite {
 			if err := sqlpolicy.CheckFile(ctx, source.Path); err != nil {
@@ -498,7 +504,7 @@ func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, source
 	}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, claim.Generation, conditional, knownBlocks)
+		file, err := m.uploadFile(ctx, source, claim.Generation, conditional, knownBlocks, onScan)
 		if err != nil {
 			return nil, err
 		}
@@ -694,7 +700,7 @@ func (m *Manager) rememberCertified(root Checkpoint) {
 	m.sortRoots()
 }
 
-func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint64, conditional bool, known map[string]Block) (File, error) {
+func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint64, conditional bool, known map[string]Block, onScan func(role string, elapsed time.Duration)) (File, error) {
 	input, err := os.Open(source.Path)
 	if err != nil {
 		return File{}, err
@@ -714,6 +720,10 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		offset int64
 	}
 	var uploads []uploadBlock
+	var scanStarted time.Time
+	if onScan != nil {
+		scanStarted = time.Now()
+	}
 	for offset := int64(0); offset < file.Size; offset += blockSize {
 		size := min(int64(blockSize), file.Size-offset)
 		hasher := sha256.New()
@@ -732,6 +742,9 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		}
 		file.Blocks = append(file.Blocks, block)
 		uploads = append(uploads, uploadBlock{block: block, hash: hash, offset: offset})
+	}
+	if onScan != nil {
+		onScan(source.Role, time.Since(scanStarted))
 	}
 	generations := make([]uint64, len(uploads))
 	if err := runParallel(ctx, len(uploads), func(ctx context.Context, index int) error {

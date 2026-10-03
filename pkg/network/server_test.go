@@ -604,6 +604,82 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	}
 }
 
+func TestFetchDecisionsWithRetryPreservesTerminalCompaction(t *testing.T) {
+	calls := 0
+	got, err := fetchDecisionsWithRetry(context.Background(), func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (DecisionsResponse, error) {
+		calls++
+		if calls == 1 {
+			return DecisionsResponse{}, quepaxa.ErrCompacted
+		}
+		return DecisionsResponse{}, context.DeadlineExceeded
+	}, "source", 1)
+	if !errors.Is(err, quepaxa.ErrCompacted) {
+		t.Fatalf("fetch error = %v, want terminal %v", err, quepaxa.ErrCompacted)
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 after terminal compaction", calls)
+	}
+	if len(got.Decisions) != 0 {
+		t.Fatalf("unexpected decisions after compaction: %d", len(got.Decisions))
+	}
+}
+
+func TestFetchDecisionsWithRetryRetriesTransientError(t *testing.T) {
+	calls := 0
+	want := DecisionsResponse{Tip: 1}
+	got, err := fetchDecisionsWithRetry(context.Background(), func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (DecisionsResponse, error) {
+		calls++
+		if calls == 1 {
+			return DecisionsResponse{}, errors.New("temporary transport error")
+		}
+		return want, nil
+	}, "source", 1)
+	if err != nil {
+		t.Fatalf("fetch error = %v, want nil", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fetch calls = %d, want 2", calls)
+	}
+	if got.Tip != want.Tip {
+		t.Fatalf("response tip = %d, want %d", got.Tip, want.Tip)
+	}
+}
+
+func TestFetchDecisionsWithRetryHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	_, err := fetchDecisionsWithRetry(ctx, func(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.Slot, _ int) (DecisionsResponse, error) {
+		calls++
+		return DecisionsResponse{}, ctx.Err()
+	}, "source", 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetch error = %v, want %v", err, context.Canceled)
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 after cancellation", calls)
+	}
+}
+
+func TestCatchUpFetchCompactionTriggersHandler(t *testing.T) {
+	server := &Server{}
+	calls := 0
+	server.SetCompactedHandler(func() { calls++ })
+	if err := server.handleCatchUpFetchError(quepaxa.ErrCompacted); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("catch-up error = %v, want %v", err, ErrNotReady)
+	}
+	if calls != 1 {
+		t.Fatalf("compacted handler calls = %d, want 1", calls)
+	}
+
+	if err := server.handleCatchUpFetchError(context.DeadlineExceeded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if calls != 1 {
+		t.Fatalf("compacted handler calls after timeout = %d, want 1", calls)
+	}
+}
+
 func TestAcceptFromPersistsReturnedCertifiedDecision(t *testing.T) {
 	member := quepaxa.Member{ID: "n1"}
 	members := []quepaxa.Member{member}
