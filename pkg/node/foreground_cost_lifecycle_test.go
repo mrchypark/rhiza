@@ -260,10 +260,22 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	transportObserver.SetPhase("seed")
 	seedStoreStart := snapshotNodeStoreStats(nodes)
 	seedServerStart, seedServerStartErr := nodeVersityRequestCount(gateway)
+	seedStart := time.Now()
+	t.Logf("node_foreground_seed_budget test_deadline=%s seed_deadline=%s reserve=%s", testDeadline.UTC().Format(time.RFC3339Nano), seedDeadline.UTC().Format(time.RFC3339Nano), reserve)
+	var seedAPIAcknowledged atomic.Uint64
+	seedPut := func(callCtx context.Context, requestID, key string, payload []byte) error {
+		err := put(callCtx, requestID, key, payload)
+		if err == nil {
+			seedAPIAcknowledged.Add(1)
+		}
+		return err
+	}
 	seedErr := foregroundcosttest.Seed(seedCtx, foregroundcosttest.SeedOptions{
 		Workers: nodeForegroundWorkers, Keys: nodeForegroundKeys, ProgressEvery: 512,
 		Value: value, ClientID: clientID,
-	}, put, func(done int) { t.Logf("node_foreground_seed_completed=%d/%d", done, nodeForegroundKeys) })
+	}, seedPut, func(done int) { t.Logf("node_foreground_seed_completed=%d/%d", done, nodeForegroundKeys) })
+	seedEnd := time.Now()
+	t.Logf("node_foreground_seed_result duration=%s api_acknowledged=%d/%d error=%t", seedEnd.Sub(seedStart), seedAPIAcknowledged.Load(), nodeForegroundKeys, seedErr != nil)
 	seedCancel()
 	if seedErr != nil {
 		t.Fatalf("seed the fixed %d-key Node API workload: %v", nodeForegroundKeys, seedErr)

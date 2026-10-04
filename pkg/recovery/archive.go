@@ -818,7 +818,7 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 			target = tip
 		}
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
-		batch.err = m.syncNow(ctx, core, target)
+		batch.err = m.syncNowBatch(ctx, core, target, batch)
 		cancel()
 	}
 	m.batchMu.Lock()
@@ -830,6 +830,10 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 }
 
 func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot) error {
+	return m.syncNowBatch(ctx, core, through, nil)
+}
+
+func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
 	if m.Tip() >= through {
 		return nil
 	}
@@ -844,6 +848,18 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 		defer m.transitionMu.Unlock()
 		if err := m.Load(ctx); err != nil {
 			return err
+		}
+		if batch != nil {
+			// Callers may join while remote admission is in progress. Include
+			// their certified decisions in this already-fenced publication.
+			m.batchMu.Lock()
+			if batch.target > through {
+				through = batch.target
+			}
+			m.batchMu.Unlock()
+			if tip := core.Tip(); tip > through {
+				through = tip
+			}
 		}
 		return m.syncNowLocked(ctx, core, through)
 	})

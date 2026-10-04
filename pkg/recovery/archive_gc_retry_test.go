@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -188,6 +189,152 @@ func testArchiveIndependentPublisherWaitsForGCPublicationLease(t *testing.T) {
 	if err != nil || tip != wantTip || len(values) != int(wantTip) ||
 		!bytes.Equal(values[len(values)-1].Value, []byte("independent publisher tip")) {
 		t.Fatalf("independent final chain tip=%d want=%d decisions=%d err=%v", tip, wantTip, len(values), err)
+	}
+}
+
+func testArchiveLateSharedBatchTargetUsesOnePublicationAdmission(t *testing.T) {
+	baseCtx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+	defer cancel()
+	releaseRead := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseRead) })
+	probe := &gcPublisherAdmissionBucket{
+		Bucket: base, lockRead: make(chan struct{}, 1),
+		releaseRead: releaseRead, headUpload: make(chan struct{}, 1),
+	}
+	publisher := NewManager(probe, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("early batch decision")); err != nil {
+		t.Fatal(err)
+	}
+	firstTarget := core.Tip()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- publisher.SyncThrough(ctx, core, firstTarget) }()
+	select {
+	case <-probe.lockRead:
+		// This real remote-lease read happens after flushBatch captured its
+		// original target at the end of the group delay.
+	case err := <-firstDone:
+		t.Fatalf("first batch completed before admission was held: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("first batch did not reach publication admission: %v", ctx.Err())
+	}
+	for i := 0; i < 16; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lateTarget := core.Tip()
+	waitTarget := func(want quepaxa.Slot) {
+		t.Helper()
+		for {
+			publisher.batchMu.Lock()
+			batch := publisher.batch
+			joined := batch != nil && batch.target >= want
+			publisher.batchMu.Unlock()
+			if joined {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				t.Fatalf("late waiter did not join existing batch through %d: %v", want, ctx.Err())
+			default:
+				runtime.Gosched()
+			}
+		}
+	}
+	canceledCtx, cancelWaiter := context.WithCancel(ctx)
+	canceledDone := make(chan error, 1)
+	go func() { canceledDone <- publisher.SyncThrough(canceledCtx, core, firstTarget+1) }()
+	waitTarget(firstTarget + 1)
+	cancelWaiter()
+	if err := <-canceledDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter result=%v, want context canceled", err)
+	}
+	lateDone := make(chan error, 1)
+	go func() { lateDone <- publisher.SyncThrough(ctx, core, lateTarget) }()
+	waitTarget(lateTarget)
+	if got := probe.headCount.Load(); got != 0 {
+		t.Fatalf("HEAD uploads before admission release=%d, want 0", got)
+	}
+	select {
+	case err := <-firstDone:
+		t.Fatalf("early waiter acknowledged before admission release: %v", err)
+	case err := <-lateDone:
+		t.Fatalf("late waiter acknowledged before admission release: %v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(releaseRead) })
+	for name, done := range map[string]<-chan error{"early": firstDone, "late": lateDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s shared-batch waiter: %v", name, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s shared-batch waiter after admission release: %v", name, ctx.Err())
+		}
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := final.DecisionsFrom(ctx, 1, int(lateTarget))
+	if err != nil || tip != lateTarget || len(values) != int(lateTarget) {
+		t.Fatalf("independent shared-batch chain tip=%d want=%d values=%d err=%v", tip, lateTarget, len(values), err)
+	}
+	for i, got := range values {
+		want, ok := core.CertifiedValue(quepaxa.Slot(i + 1))
+		if !ok || !bytes.Equal(got.Value, want.Value) {
+			t.Fatalf("independent shared-batch decision %d mismatched", i+1)
+		}
+	}
+	if got := probe.headCount.Load(); got != 1 {
+		t.Fatalf("actual HEAD uploads for late shared-batch target=%d, want exactly one", got)
+	}
+}
+
+func testArchiveDirectSyncKeepsFixedTargetAndNoopFastPath(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	for _, value := range []string{"direct target", "not requested"} {
+		if _, _, err := core.Propose(ctx, []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bucket := &countingBucket{Bucket: base}
+	publisher := NewManager(bucket, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := publisher.syncNow(ctx, core, 2); err != nil {
+		t.Fatal(err)
+	}
+	if tip := publisher.Tip(); tip != 2 {
+		t.Fatalf("direct sync tip=%d, want fixed target 2 despite certified core tip %d", tip, core.Tip())
+	}
+	reads, uploads := bucket.heads.Load()+bucket.gets.Load(), bucket.puts.Load()
+	if err := publisher.syncNow(ctx, core, 2); err != nil {
+		t.Fatal(err)
+	}
+	if gotReads, gotUploads := bucket.heads.Load()+bucket.gets.Load(), bucket.puts.Load(); gotReads != reads || gotUploads != uploads {
+		t.Fatalf("already-durable direct sync issued I/O: reads %d->%d uploads %d->%d", reads, gotReads, uploads, gotUploads)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := independent.DecisionsFrom(ctx, 1, 2)
+	if err != nil || tip != 2 || len(values) != 2 || !bytes.Equal(values[1].Value, []byte("direct target")) {
+		t.Fatalf("fixed-target independent chain tip=%d values=%d err=%v", tip, len(values), err)
 	}
 }
 
@@ -650,6 +797,8 @@ func (b *gcAmbiguousHeadBucket) Upload(ctx context.Context, name string, r io.Re
 
 func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) {
 	t.Run("independent_publisher_waits_for_gc_publication_lease", testArchiveIndependentPublisherWaitsForGCPublicationLease)
+	t.Run("late_shared_batch_target_uses_one_publication_admission", testArchiveLateSharedBatchTargetUsesOnePublicationAdmission)
+	t.Run("direct_sync_keeps_fixed_target_and_noop_fast_path", testArchiveDirectSyncKeepsFixedTargetAndNoopFastPath)
 	t.Run("publisher_during_gc_delete_scan_keeps_chain", testArchivePublisherDuringGCDeleteScanKeepsReachableChain)
 	t.Run("no_compaction_keeps_concurrent_published_extent", testArchiveNoCompactionKeepsConcurrentPublishedExtent)
 	t.Run("publication_lease_cancel_and_stale_owner", testArchivePublicationLeaseCancellationAndStaleOwner)
