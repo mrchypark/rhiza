@@ -205,12 +205,14 @@ jobs:
         run: |
           go test -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
           go test -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
       - name: Terminal decision handshake cancellation (race)
         env:
           CGO_ENABLED: 1
         run: |
           go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
           go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
       - name: Vet
         env:
           CGO_ENABLED: 0

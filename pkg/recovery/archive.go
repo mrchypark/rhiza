@@ -1101,6 +1101,8 @@ func archiveGCTrace(ctx context.Context, phase string, work func() error) (err e
 
 func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 	settled := false
+	var priorHead archiveHead
+	var priorRefs, priorPacked []Extent
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
 		if err := archiveGCTrace(ctx, "load", func() error { return m.Load(ctx) }); err != nil {
 			return err
@@ -1114,7 +1116,11 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		var compacted []Extent
 		err := archiveGCTrace(ctx, "compaction", func() error {
 			var err error
-			compacted, err = m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
+			if canReuseCleanupCompaction(ctx, m.configID, snapshotHead, priorHead, refs, priorRefs, priorPacked) {
+				compacted, err = m.compactExtentsFrom(ctx, refs[len(priorRefs):], snapshotHead.BasePrefix, priorPacked)
+			} else {
+				compacted, err = m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
+			}
 			return err
 		})
 		if err != nil {
@@ -1124,6 +1130,9 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 			settled = true
 			break
 		}
+		// Keep only this invocation's validated packing decision. Publication
+		// changes extent metadata below; the retained slice must stay pristine.
+		priorHead, priorRefs, priorPacked = snapshotHead, refs, slices.Clone(compacted)
 		head := snapshotHead
 		if head.Generation == ^uint64(0) {
 			return fmt.Errorf("archive generation exhausted")
@@ -1593,9 +1602,25 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 	if len(refs) < 2 {
 		return refs, nil
 	}
-	result := make([]Extent, 0, len(refs))
+	return m.compactExtentsFrom(ctx, refs, prefix, nil)
+}
+
+// compactExtentsFrom resumes a validated packing decision at its last group.
+// An appended decision can still change that group, so it is copied and
+// repacked; earlier complete groups remain immutable within this Cleanup call.
+func (m *Manager) compactExtentsFrom(ctx context.Context, refs []Extent, prefix [32]byte, packed []Extent) ([]Extent, error) {
+	result := make([]Extent, 0, len(packed)+len(refs))
 	var current Extent
 	encodedDecisions := 0
+	if len(packed) != 0 {
+		result = append(result, packed[:len(packed)-1]...)
+		current = packed[len(packed)-1]
+		current.Decisions = slices.Clone(current.Decisions)
+		prefix = current.EndPrefix
+		for _, decision := range current.Decisions {
+			encodedDecisions += archiveDecisionSize(decision)
+		}
+	}
 	flush := func() {
 		if len(current.Decisions) != 0 {
 			result = append(result, current)
@@ -1638,6 +1663,27 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 	}
 	flush()
 	return result, nil
+}
+
+func archiveRefPrefixEqual(refs, prefix []Extent) bool {
+	if len(prefix) == 0 || len(refs) < len(prefix) {
+		return false
+	}
+	for i, old := range prefix {
+		ref := refs[i]
+		if ref.ConfigID != old.ConfigID || ref.Start != old.Start || ref.End != old.End ||
+			ref.StartPrefix != old.StartPrefix || ref.EndPrefix != old.EndPrefix ||
+			ref.PreviousHash != old.PreviousHash || ref.PreviousObject != old.PreviousObject ||
+			ref.hash != old.hash || ref.object != old.object {
+			return false
+		}
+	}
+	return true
+}
+
+func canReuseCleanupCompaction(ctx context.Context, configID uint, head, previous archiveHead, refs, previousRefs, packed []Extent) bool {
+	return ctx.Err() == nil && !head.Sealed && head.ConfigID == configID && len(packed) != 0 &&
+		archiveBaseEqual(head, previous) && archiveRefPrefixEqual(refs, previousRefs)
 }
 
 func archiveHeadsEqual(a, b archiveHead) bool {
