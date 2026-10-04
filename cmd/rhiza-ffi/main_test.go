@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,6 +95,17 @@ func responseErrorCode(t *testing.T, response []byte) string {
 		t.Fatalf("expected error: %s", response)
 	}
 	return env.Error.Code
+}
+
+type receiveReadyContext struct {
+	context.Context
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (ctx *receiveReadyContext) Done() <-chan struct{} {
+	ctx.once.Do(func() { close(ctx.ready) })
+	return ctx.Context.Done()
 }
 
 func TestGoEntryBasicPublicAPI(t *testing.T) {
@@ -315,6 +327,10 @@ func TestNotificationFFI(t *testing.T) {
 	}
 	entry.mu.Lock()
 	sub := entry.subscriptions[subscription.ID]
+	ready := make(chan struct{})
+	if sub != nil {
+		sub.ctx = &receiveReadyContext{Context: sub.ctx, ready: ready}
+	}
 	entry.mu.Unlock()
 	release()
 	if sub == nil {
@@ -325,29 +341,39 @@ func TestNotificationFFI(t *testing.T) {
 	go func() {
 		recv <- goCall(h, recvRequest, 30_000)
 	}()
-	deadline := time.Now().Add(time.Second)
-	for {
-		entry.mu.Lock()
-		active := entry.active
-		entry.mu.Unlock()
-		if active > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("receive did not become active")
-		}
-		time.Sleep(time.Millisecond)
+	var readinessFailure string
+	var earlyResult []byte
+	select {
+	case <-ready:
+	case earlyResult = <-recv:
+		readinessFailure = fmt.Sprintf("receive finished before resolving subscription: %s", earlyResult)
+	case <-time.After(time.Second):
+		readinessFailure = "receive did not resolve subscription within one second"
 	}
+	var closeFailure string
 	if response := goClose(h); string(response) != `{"data":null}` {
-		t.Fatalf("close=%s", response)
+		closeFailure = fmt.Sprintf("close=%s", response)
 	}
-	if code := responseErrorCode(t, <-recv); code != "canceled" {
+	if earlyResult == nil {
+		select {
+		case earlyResult = <-recv:
+		case <-time.After(time.Second):
+			t.Fatal("receive did not finish after close")
+		}
+	}
+	if readinessFailure != "" || closeFailure != "" {
+		t.Fatalf("readiness=%q %s", readinessFailure, closeFailure)
+	}
+	if code := responseErrorCode(t, earlyResult); code != "canceled" {
 		t.Fatalf("close receive code=%q", code)
 	}
 	select {
 	case <-sub.ctx.Done():
 	case <-time.After(time.Second):
 		t.Fatal("close did not cancel subscription")
+	}
+	if code := responseErrorCode(t, goCall(h, []byte(`{"operation":"ready","request":{}}`), 0)); code != "invalid_handle" {
+		t.Fatalf("stale code=%q", code)
 	}
 }
 
