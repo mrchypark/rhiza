@@ -57,6 +57,12 @@ child=
 watcher=
 status=0
 forced=0
+child_state() {
+	state=$(ps -o pid=,stat= 2>/dev/null | awk -v target="$child" '$1 == target {print $2; exit}')
+	if [ -z "$state" ] && kill -0 "$child" 2>/dev/null; then
+		state=unknown
+	fi
+}
 cleanup() {
 	status=$?
 	trap - EXIT
@@ -65,13 +71,13 @@ cleanup() {
 		if kill -INT "$child" 2>/dev/null; then
 			i=0
 			while [ "$i" -lt 20 ]; do
-				state=$(ps -p "$child" -o stat= 2>/dev/null) || state=
+				child_state
 				case "$state" in *Z*) break ;; esac
 				[ -n "$state" ] || break
 				sleep 0.1
 				i=$((i + 1))
 			done
-			state=$(ps -p "$child" -o stat= 2>/dev/null) || state=
+			child_state
 			case "$state" in
 				'') ;;
 				*Z*) ;;

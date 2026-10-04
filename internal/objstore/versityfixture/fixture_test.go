@@ -62,10 +62,13 @@ func TestPrepareEvidenceDirRequiresAbsolutePath(t *testing.T) {
 
 func TestChildSupervisorNormalCloseAndForcedExit(t *testing.T) {
 	t.Run("normal close", func(t *testing.T) {
-		assertFakeChildSupervisorStops(t, false)
+		assertFakeChildSupervisorStops(t, false, false)
 	})
 	t.Run("ignores interrupt then forced exit", func(t *testing.T) {
-		assertFakeChildSupervisorStops(t, true)
+		assertFakeChildSupervisorStops(t, true, false)
+	})
+	t.Run("failed state probe cannot treat live child as exited", func(t *testing.T) {
+		assertFakeChildSupervisorStops(t, true, true)
 	})
 }
 
@@ -87,8 +90,10 @@ func TestChildSupervisorParentPipeEOF(t *testing.T) {
 		t.Fatalf("run abrupt-parent helper: %v\n%s", err, output)
 	}
 	waitForFileText(t, completionPath, "gateway_reaped=true")
-	assertRecordedProcessExited(t, childPIDPath)
-	assertRecordedProcessExited(t, wrapperPIDPath)
+	assertRecordedProcessExited(t, childPIDPath, false)
+	// The owner deliberately exited without Wait. In containers without an init
+	// reaper, the orphan wrapper can remain a zombie after it has completed.
+	assertRecordedProcessExited(t, wrapperPIDPath, true)
 }
 
 func TestChildSupervisorEarlyChildExit(t *testing.T) {
@@ -138,7 +143,7 @@ func TestChildSupervisorEarlyChildExit(t *testing.T) {
 	if err != nil || !strings.Contains(string(completion), "child_status=0") {
 		t.Fatalf("completion marker does not record early child status: %s (%v)", completion, err)
 	}
-	assertRecordedProcessExited(t, childPIDPath)
+	assertRecordedProcessExited(t, childPIDPath, false)
 }
 
 func TestChildSupervisorFakeChildHelper(t *testing.T) {
@@ -190,7 +195,7 @@ func TestChildSupervisorAbruptParentHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt bool) {
+func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProbe bool) {
 	t.Helper()
 	tempDir := t.TempDir()
 	outputPath := filepath.Join(tempDir, "server-output.log")
@@ -208,6 +213,19 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt bool) {
 		"RHIZA_SUPERVISOR_CHILD_PID="+childPIDPath,
 		"RHIZA_SUPERVISOR_IGNORE_INT="+ignore,
 	)
+	probePath := filepath.Join(tempDir, "ps-probe.log")
+	if failStateProbe {
+		fakeBin := filepath.Join(tempDir, "bin")
+		if err := os.Mkdir(fakeBin, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		fakePS := "#!/bin/sh\nprintf 'called\\n' >> \"$RHIZA_SUPERVISOR_PS_PROBE_LOG\"\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(fakePS), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env = append(env, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"RHIZA_SUPERVISOR_PS_PROBE_LOG="+probePath)
+	}
 	completionPath := filepath.Join(tempDir, "gateway-complete")
 	cmd, writer, err := startSupervisedChild(outputPath, completionPath, []string{
 		os.Args[0], "-test.run=^TestChildSupervisorFakeChildHelper$",
@@ -224,6 +242,24 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt bool) {
 		server.mu.Unlock()
 		close(server.done)
 	}()
+	t.Cleanup(func() {
+		select {
+		case <-server.done:
+			return
+		default:
+		}
+		if contents, err := os.ReadFile(childPIDPath); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(contents))); err == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+		_ = writer.Close()
+		_ = cmd.Process.Kill()
+		select {
+		case <-server.done:
+		case <-time.After(time.Second):
+		}
+	})
 	waitForFile(t, childPIDPath)
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -248,8 +284,14 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt bool) {
 	if forced != ignoreInterrupt {
 		t.Fatalf("forced cleanup=%t, want %t; output=%s", forced, ignoreInterrupt, contents)
 	}
+	if failStateProbe {
+		probes, err := os.ReadFile(probePath)
+		if err != nil || len(probes) == 0 {
+			t.Fatalf("failed ps probe was not exercised: %q (%v)", probes, err)
+		}
+	}
 	waitForFileText(t, completionPath, "gateway_reaped=true")
-	assertRecordedProcessExited(t, childPIDPath)
+	assertRecordedProcessExited(t, childPIDPath, false)
 }
 
 func waitForFile(t *testing.T, path string) {
@@ -278,7 +320,7 @@ func waitForFileText(t *testing.T, path, text string) {
 	t.Fatalf("timed out waiting for %q in %s: %s", text, path, contents)
 }
 
-func assertRecordedProcessExited(t *testing.T, path string) {
+func assertRecordedProcessExited(t *testing.T, path string, allowOrphanZombie bool) {
 	t.Helper()
 	waitForFile(t, path)
 	contents, err := os.ReadFile(path)
@@ -298,7 +340,20 @@ func assertRecordedProcessExited(t *testing.T, path string) {
 		if signalErr := process.Signal(syscall.Signal(0)); signalErr != nil {
 			return
 		}
+		if allowOrphanZombie {
+			// Linux kill(0) succeeds for an exited, unreaped orphan. Only the
+			// wrapper in the abrupt-owner test may use this exception; child
+			// processes still require the supervisor's actual wait evidence.
+			if procStat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat")); err == nil {
+				if closeParen := strings.LastIndexByte(string(procStat), ')'); closeParen >= 0 {
+					fields := strings.Fields(string(procStat[closeParen+1:]))
+					if len(fields) > 0 && fields[0] == "Z" {
+						return
+					}
+				}
+			}
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("process %d recorded at %s is still alive", pid, path)
+	t.Fatalf("process %d recorded at %s is still running", pid, path)
 }
