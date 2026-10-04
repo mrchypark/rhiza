@@ -43,30 +43,32 @@ func Seal(ctx context.Context, bucket objstore.Bucket, prefix, operationID strin
 		return err
 	}
 
-	m.transitionMu.Lock()
-	defer m.transitionMu.Unlock()
-	var refs []Extent
-	for range maxPublishRetries {
-		if err := m.Load(ctx); err != nil {
-			return err
+	return m.withPublicationLock(ctx, "archive-seal", func(ctx context.Context) error {
+		m.transitionMu.Lock()
+		defer m.transitionMu.Unlock()
+		var refs []Extent
+		for range maxPublishRetries {
+			if err := m.Load(ctx); err != nil {
+				return err
+			}
+			m.mu.Lock()
+			head, refs, version = m.head, append([]Extent(nil), m.extents...), m.headCAS
+			m.mu.Unlock()
+			if head.Sealed {
+				return verifySealIntent(ctx, m, operationID)
+			}
+			if version == nil || head.Generation == 0 {
+				return fmt.Errorf("archive seal requires an authoritative head")
+			}
+			head.Sealed = true
+			if err := m.publishHead(ctx, head, version); err == nil {
+				return m.refreshPublishedHead(ctx, head, version, refs)
+			} else if !m.bucket.IsConditionNotMetErr(err) {
+				return err
+			}
 		}
-		m.mu.Lock()
-		head, refs, version = m.head, append([]Extent(nil), m.extents...), m.headCAS
-		m.mu.Unlock()
-		if head.Sealed {
-			return verifySealIntent(ctx, m, operationID)
-		}
-		if version == nil || head.Generation == 0 {
-			return fmt.Errorf("archive seal requires an authoritative head")
-		}
-		head.Sealed = true
-		if err := m.publishHead(ctx, head, version); err == nil {
-			return m.refreshPublishedHead(ctx, head, version, refs)
-		} else if !m.bucket.IsConditionNotMetErr(err) {
-			return err
-		}
-	}
-	return fmt.Errorf("archive seal conflicted too many times")
+		return fmt.Errorf("archive seal conflicted too many times")
+	})
 }
 
 func (m *Manager) sealIntentKey() string { return m.key("archive/seal.json") }

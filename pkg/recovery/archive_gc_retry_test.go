@@ -11,6 +11,8 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -32,6 +34,464 @@ type gcRetryBucket struct {
 	afterConflict func()
 	uploadPrefix  string
 	prefixUploads int
+}
+
+// gcPublisherAdmissionBucket observes a separate Manager's publication-lease
+// read and real HEAD upload. The paused Cleanup uses the underlying bucket.
+type gcPublisherAdmissionBucket struct {
+	objstore.Bucket
+	lockRead    chan struct{}
+	releaseRead <-chan struct{}
+	headUpload  chan struct{}
+	headCount   atomic.Int32
+}
+
+type cancelPublicationReadBucket struct {
+	objstore.Bucket
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (b *cancelPublicationReadBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
+		b.once.Do(b.cancel)
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *gcPublisherAdmissionBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
+		select {
+		case b.lockRead <- struct{}{}:
+		default:
+		}
+		select {
+		case <-b.releaseRead:
+		case <-ctx.Done():
+			return objstore.ObjectAttributes{}, ctx.Err()
+		}
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *gcPublisherAdmissionBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		b.headCount.Add(1)
+		select {
+		case b.headUpload <- struct{}{}:
+		default:
+		}
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func testArchiveIndependentPublisherWaitsForGCPublicationLease(t *testing.T) {
+	baseCtx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	if _, _, err := core.Propose(baseCtx, []byte("second extent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.SyncThrough(baseCtx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+	defer cancel()
+	gc := NewManager(base, "cluster", 1)
+	defer gc.Close()
+	releaseRead := make(chan struct{})
+	probe := &gcPublisherAdmissionBucket{
+		Bucket: base, lockRead: make(chan struct{}, 1),
+		releaseRead: releaseRead, headUpload: make(chan struct{}, 1),
+	}
+	publisher := NewManager(probe, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("independent publisher tip")); err != nil {
+		t.Fatal(err)
+	}
+	wantTip := core.Tip()
+
+	gcAtPublication := make(chan struct{})
+	releaseGC := make(chan struct{})
+	var publicationOnce, releaseGCOnce, releaseReadOnce sync.Once
+	defer releaseGCOnce.Do(func() { close(releaseGC) })
+	defer releaseReadOnce.Do(func() { close(releaseRead) })
+	gcCtx := localtesthooks.WithArchiveGCPhaseTrace(ctx, func(event string) {
+		if event == "archive-gc:publication:begin" {
+			publicationOnce.Do(func() {
+				close(gcAtPublication)
+				select {
+				case <-releaseGC:
+				case <-ctx.Done():
+				}
+			})
+		}
+	})
+	gcDone := make(chan error, 1)
+	go func() { gcDone <- gc.Cleanup(gcCtx, time.Hour) }()
+	select {
+	case <-gcAtPublication:
+	case err := <-gcDone:
+		t.Fatalf("Cleanup never reached publication while holding GC lease: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("Cleanup publication barrier: %v", ctx.Err())
+	}
+	lock, err := gc.readGCLock(ctx)
+	if err != nil || lock == nil || lock.LeaseUntilMS <= time.Now().UnixMilli() {
+		t.Fatalf("Cleanup remote lease not live: lock=%v err=%v", lock, err)
+	}
+	admission, err := gc.readArchiveLock(ctx, gc.publicationLockKey())
+	if err != nil || admission == nil || admission.OwnerID != "archive-gc-publish" ||
+		admission.Generation == 0 || admission.LeaseUntilMS <= time.Now().UnixMilli() {
+		t.Fatalf("Cleanup publication lease not confirmed live: lock=%v err=%v", admission, err)
+	}
+	publisherDone := make(chan error, 1)
+	go func() { publisherDone <- publisher.SyncThrough(ctx, core, wantTip) }()
+
+	select {
+	case <-probe.headUpload:
+		releaseGCOnce.Do(func() { close(releaseGC) })
+		gcErr := <-gcDone
+		publisherErr := <-publisherDone
+		t.Fatalf("independent publisher attempted real HEAD upload during GC remote lease: publisher=%v cleanup=%v", publisherErr, gcErr)
+	case <-probe.lockRead:
+		select {
+		case err := <-publisherDone:
+			t.Fatalf("publisher acknowledged before Cleanup released admission: %v", err)
+		default:
+		}
+		// Release the actual GC operation before letting the publisher finish
+		// its publication-lease read. No scheduler delay is needed for ordering.
+		releaseGCOnce.Do(func() { close(releaseGC) })
+		if err := <-gcDone; err != nil {
+			t.Fatalf("Cleanup after release: %v", err)
+		}
+		releaseReadOnce.Do(func() { close(releaseRead) })
+		if err := <-publisherDone; err != nil {
+			t.Fatalf("independent publisher after GC release: %v", err)
+		}
+		if got := probe.headCount.Load(); got != 1 {
+			t.Fatalf("publisher HEAD uploads after GC release=%d, want exactly one fresh-head CAS", got)
+		}
+	case <-ctx.Done():
+		t.Fatalf("publisher admission event: %v", ctx.Err())
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := final.DecisionsFrom(ctx, 1, int(wantTip))
+	if err != nil || tip != wantTip || len(values) != int(wantTip) ||
+		!bytes.Equal(values[len(values)-1].Value, []byte("independent publisher tip")) {
+		t.Fatalf("independent final chain tip=%d want=%d decisions=%d err=%v", tip, wantTip, len(values), err)
+	}
+}
+
+func testArchivePublisherDuringGCDeleteScanKeepsReachableChain(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	if _, _, err := core.Propose(ctx, []byte("before compaction")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	publisher := NewManager(base, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("during candidate scan")); err != nil {
+		t.Fatal(err)
+	}
+	wantTip := core.Tip()
+	gc := NewManager(base, "cluster", 1)
+	defer gc.Close()
+	published := false
+	gcCtx := localtesthooks.WithArchiveGCPhaseTrace(ctx, func(event string) {
+		if event != "archive-gc:candidate-scan:begin" || published {
+			return
+		}
+		published = true
+		writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := publisher.SyncThrough(writeCtx, core, wantTip); err != nil {
+			t.Errorf("publisher blocked behind post-publication deletion: %v", err)
+		}
+	})
+	if err := gc.Cleanup(gcCtx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !published {
+		t.Fatal("candidate scan boundary not exercised")
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := final.DecisionsFrom(ctx, 1, int(wantTip))
+	if err != nil || tip != wantTip || len(values) != int(wantTip) ||
+		!bytes.Equal(values[len(values)-1].Value, []byte("during candidate scan")) {
+		t.Fatalf("post-scan chain tip=%d want=%d decisions=%d err=%v", tip, wantTip, len(values), err)
+	}
+	for _, ref := range final.extents {
+		if ok, err := base.Exists(ctx, final.key(extentObjectKey(ref.hash, ref.object))); err != nil || !ok {
+			t.Fatalf("reachable extent lost during scan: exists=%t err=%v", ok, err)
+		}
+	}
+}
+
+func testArchiveNoCompactionKeepsConcurrentPublishedExtent(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	publisher := NewManager(base, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("published during no-op scan")); err != nil {
+		t.Fatal(err)
+	}
+	wantTip := core.Tip()
+	gc := NewManager(base, "cluster", 1)
+	defer gc.Close()
+	published := false
+	publicationBegins := 0
+	gcCtx := localtesthooks.WithArchiveGCPhaseTrace(ctx, func(event string) {
+		if event == "archive-gc:publication:begin" {
+			publicationBegins++
+		}
+		if event != "archive-gc:candidate-scan:begin" || published {
+			return
+		}
+		published = true
+		writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := publisher.SyncThrough(writeCtx, core, wantTip); err != nil {
+			t.Errorf("publisher during no-compaction scan: %v", err)
+		}
+	})
+	if err := gc.Cleanup(gcCtx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !published || publicationBegins != 0 {
+		t.Fatalf("no-compaction scan published=%t GC publication events=%d, want true/0", published, publicationBegins)
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := final.DecisionsFrom(ctx, 1, int(wantTip))
+	if err != nil || tip != wantTip || len(values) != int(wantTip) ||
+		!bytes.Equal(values[len(values)-1].Value, []byte("published during no-op scan")) {
+		t.Fatalf("no-compaction final chain tip=%d want=%d decisions=%d err=%v", tip, wantTip, len(values), err)
+	}
+	for _, ref := range final.extents {
+		if ok, err := base.Exists(ctx, final.key(extentObjectKey(ref.hash, ref.object))); err != nil || !ok {
+			t.Fatalf("reachable no-compaction extent lost: exists=%t err=%v", ok, err)
+		}
+	}
+}
+
+func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	key := holder.publicationLockKey()
+	lease, err := holder.acquireArchiveLock(ctx, key, "test-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.releaseArchiveLock(context.Background(), key, lease) }()
+
+	waiter := NewManager(base, "cluster", 1)
+	defer waiter.Close()
+	entered := false
+	if err := waiter.withPublicationLock(ctx, "test-waiter", func(context.Context) error {
+		entered = true
+		return nil
+	}); !errors.Is(err, ErrArchiveBusy) || entered {
+		t.Fatalf("deadline-less wait error=%v entered=%t, want immediate Busy", err, entered)
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := waiter.withPublicationLock(cancelCtx, "test-waiter", func(context.Context) error {
+		entered = true
+		return nil
+	}); !errors.Is(err, context.Canceled) || entered {
+		t.Fatalf("pre-canceled wait error=%v entered=%t", err, entered)
+	}
+	cancelCtx, cancel = context.WithTimeout(ctx, time.Second)
+	cancelBucket := &cancelPublicationReadBucket{Bucket: base, cancel: cancel}
+	cancelWaiter := NewManager(cancelBucket, "cluster", 1)
+	defer cancelWaiter.Close()
+	if err := cancelWaiter.withPublicationLock(cancelCtx, "test-waiter", func(context.Context) error {
+		entered = true
+		return nil
+	}); !errors.Is(err, context.Canceled) || entered {
+		t.Fatalf("mid-admission cancellation error=%v entered=%t", err, entered)
+	}
+	cancel()
+
+	if err := holder.releaseArchiveLock(ctx, key, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := waiter.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waiter.mu.Lock()
+	head, version := waiter.head, waiter.headCAS
+	waiter.mu.Unlock()
+	var successor *archiveGCLock
+	err = waiter.withPublicationLock(ctx, "old-owner", func(workCtx context.Context) error {
+		current, err := waiter.readArchiveLock(ctx, key)
+		if err != nil {
+			return err
+		}
+		current.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
+		if err := waiter.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
+			return err
+		}
+		successor, err = holder.acquireArchiveLock(ctx, key, "successor", archivePinLease)
+		if err != nil {
+			return err
+		}
+		return waiter.publishHead(workCtx, head, version)
+	})
+	if !errors.Is(err, ErrArchiveBusy) || successor == nil {
+		t.Fatalf("stale owner publication error=%v successor=%v", err, successor)
+	}
+	if err := holder.releaseArchiveLock(ctx, key, successor); err != nil {
+		t.Fatal(err)
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil || final.head.Generation != head.Generation || final.Tip() != head.Tip {
+		t.Fatalf("stale owner changed HEAD: generation=%d tip=%d err=%v", final.head.Generation, final.Tip(), err)
+	}
+}
+
+func testArchiveSharedBatchSurvivesOneCanceledWaiter(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	if _, _, err := core.Propose(ctx, []byte("shared batch tip")); err != nil {
+		t.Fatal(err)
+	}
+	wantTip := core.Tip()
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	key := holder.publicationLockKey()
+	lease, err := holder.acquireArchiveLock(ctx, key, "test-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.releaseArchiveLock(ctx, key, lease) }()
+	releaseRead := make(chan struct{})
+	probe := &gcPublisherAdmissionBucket{
+		Bucket: base, lockRead: make(chan struct{}, 1),
+		releaseRead: releaseRead, headUpload: make(chan struct{}, 1),
+	}
+	publisher := NewManager(probe, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	firstCtx, cancelFirst := context.WithCancel(ctx)
+	secondCtx, cancelSecond := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelSecond()
+	firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+	go func() { firstDone <- publisher.SyncThrough(firstCtx, core, wantTip) }()
+	select {
+	case <-probe.lockRead:
+	case err := <-firstDone:
+		t.Fatalf("first waiter completed before admission: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("publisher did not reach publication admission")
+	}
+	go func() { secondDone <- publisher.SyncThrough(secondCtx, core, wantTip) }()
+	cancelFirst()
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter error=%v", err)
+	}
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second waiter acknowledged before durable publication: %v", err)
+	default:
+	}
+	close(releaseRead)
+	if err := holder.releaseArchiveLock(ctx, key, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("remaining waiter did not complete shared batch: %v", err)
+	}
+	if got := probe.headCount.Load(); got != 1 {
+		t.Fatalf("shared batch HEAD uploads=%d, want one", got)
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil || final.Tip() != wantTip {
+		t.Fatalf("shared batch durable tip=%d want=%d err=%v", final.Tip(), wantTip, err)
+	}
+}
+
+func testArchiveCleanupWaitsForBoundedPublicationAdmission(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	if _, _, err := core.Propose(ctx, []byte("second extent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	key := holder.publicationLockKey()
+	lease, err := holder.acquireArchiveLock(ctx, key, "test-publisher", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.releaseArchiveLock(ctx, key, lease) }()
+	releaseRead := make(chan struct{})
+	probe := &gcPublisherAdmissionBucket{
+		Bucket: base, lockRead: make(chan struct{}, 1),
+		releaseRead: releaseRead, headUpload: make(chan struct{}, 1),
+	}
+	gc := NewManager(probe, "cluster", 1)
+	defer gc.Close()
+	gcCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- gc.Cleanup(gcCtx, time.Hour) }()
+	select {
+	case <-probe.lockRead:
+	case err := <-done:
+		t.Fatalf("Cleanup never reached publication admission: %v", err)
+	case <-gcCtx.Done():
+		t.Fatal(gcCtx.Err())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Cleanup completed before publisher released admission: %v", err)
+	default:
+	}
+	close(releaseRead)
+	if err := holder.releaseArchiveLock(ctx, key, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("bounded Cleanup admission: %v", err)
+	}
+	if got := probe.headCount.Load(); got != 1 {
+		t.Fatalf("Cleanup HEAD attempts after admission=%d, want one", got)
+	}
 }
 
 func (b *gcRetryBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -102,7 +562,7 @@ func testArchiveCleanupReusesAcknowledgedCompleteUploadedPrefixAfterRealConflict
 		Bucket:       base,
 		uploadPrefix: probe.key(fmt.Sprintf("archive/blocks/%x_", firstHash)),
 	}
-	bucket.appendTip = func() error { return writer.SyncThrough(ctx, core, wantTip) }
+	bucket.appendTip = func() error { return publishLegacyArchiveTip(ctx, base, writer, core, wantTip) }
 	gc := NewManager(bucket, "cluster", 1)
 	defer gc.Close()
 	if err := gc.Cleanup(ctx, time.Hour); err != nil {
@@ -189,6 +649,12 @@ func (b *gcAmbiguousHeadBucket) Upload(ctx context.Context, name string, r io.Re
 }
 
 func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) {
+	t.Run("independent_publisher_waits_for_gc_publication_lease", testArchiveIndependentPublisherWaitsForGCPublicationLease)
+	t.Run("publisher_during_gc_delete_scan_keeps_chain", testArchivePublisherDuringGCDeleteScanKeepsReachableChain)
+	t.Run("no_compaction_keeps_concurrent_published_extent", testArchiveNoCompactionKeepsConcurrentPublishedExtent)
+	t.Run("publication_lease_cancel_and_stale_owner", testArchivePublicationLeaseCancellationAndStaleOwner)
+	t.Run("shared_batch_survives_canceled_waiter", testArchiveSharedBatchSurvivesOneCanceledWaiter)
+	t.Run("cleanup_waits_for_bounded_publication_admission", testArchiveCleanupWaitsForBoundedPublicationAdmission)
 	t.Run("acknowledged_uploaded_prefix", testArchiveCleanupReusesAcknowledgedCompleteUploadedPrefixAfterRealConflict)
 	t.Run("upload_identity_fallback", testArchiveCleanupUploadIdentityFallback)
 	t.Run("unacknowledged_upload", testArchiveCleanupUnacknowledgedUploadDoesNotPublish)
@@ -230,7 +696,7 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	}
 
 	bucket := &gcRetryBucket{Bucket: base, oldKeys: oldKeys}
-	bucket.appendTip = func() error { return writer.SyncThrough(ctx, core, wantTip) }
+	bucket.appendTip = func() error { return publishLegacyArchiveTip(ctx, base, writer, core, wantTip) }
 	gc := NewManager(bucket, "cluster", 1)
 	defer gc.Close()
 	events := make(map[string]int)
@@ -250,7 +716,7 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 		t.Fatalf("real conditional race not observed: attempts=%d conflict=%v", bucket.headAttempts, bucket.conflict)
 	}
 	if events["archive-gc:publication-result:typed_condition"] != 1 || events["archive-gc:publication-result:success"] != 1 ||
-		events["archive-gc:compaction-choice:full"] != 1 || events["archive-gc:compaction-choice:reuse"] != 1 {
+		events["archive-gc:compaction-choice:full"] != 1 || events["archive-gc:compaction-choice:reuse"] != 2 {
 		t.Fatalf("actual conflict/reuse classification=%v", events)
 	}
 	for key, gets := range oldKeys {
@@ -472,7 +938,7 @@ func TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead(t *testing.T) {
 	if !bucket.failedOnce || bucket.headUploads != 1 {
 		t.Fatalf("ambiguous publication=%t head uploads=%d, want one committed upload followed by reload", bucket.failedOnce, bucket.headUploads)
 	}
-	if events["archive-gc:publication-result:other"] != 1 || events["archive-gc:compaction-choice:full"] != 2 || events["archive-gc:compaction-choice:reuse"] != 0 {
+	if events["archive-gc:publication-result:other"] != 1 || events["archive-gc:compaction-choice:full"] != 2 || events["archive-gc:compaction-choice:reuse"] != 1 {
 		t.Fatalf("ambiguous committed publication classification=%v", events)
 	}
 	remote := NewManager(base, "cluster", 1)
@@ -503,7 +969,7 @@ func TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish(t *testing.T) {
 	cleanupCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	bucket := &gcRetryBucket{Bucket: base, oldKeys: make(map[string]int)}
-	bucket.appendTip = func() error { return writer.SyncThrough(ctx, core, core.Tip()) }
+	bucket.appendTip = func() error { return publishLegacyArchiveTip(ctx, base, writer, core, core.Tip()) }
 	bucket.afterConflict = cancel
 	gc := NewManager(bucket, "cluster", 1)
 	defer gc.Close()
