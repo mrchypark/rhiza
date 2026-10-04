@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -1072,17 +1073,36 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 	if grace < 0 {
 		return fmt.Errorf("archive GC grace period must not be negative")
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:manager-lock:begin")
 	m.gcMu.Lock()
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:manager-lock:success")
 	defer m.gcMu.Unlock()
 	return m.withGCLock(ctx, "archive-gc", func(ctx context.Context) error {
 		return m.cleanup(ctx, grace)
 	})
 }
 
+// archiveGCTrace marks only a finite cleanup phase and its terminal outcome.
+// Local test hooks compile to no-ops outside rhiza_local_testhooks builds.
+func archiveGCTrace(ctx context.Context, phase string, work func() error) (err error) {
+	if !localtesthooks.Enabled {
+		return work()
+	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:"+phase+":begin")
+	defer func() {
+		if err != nil {
+			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:"+phase+":error")
+		} else {
+			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:"+phase+":success")
+		}
+	}()
+	return work()
+}
+
 func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 	settled := false
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
-		if err := m.Load(ctx); err != nil {
+		if err := archiveGCTrace(ctx, "load", func() error { return m.Load(ctx) }); err != nil {
 			return err
 		}
 		m.mu.Lock()
@@ -1091,7 +1111,12 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		if snapshotHead.Sealed {
 			return ErrArchiveSealed
 		}
-		compacted, err := m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
+		var compacted []Extent
+		err := archiveGCTrace(ctx, "compaction", func() error {
+			var err error
+			compacted, err = m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
+			return err
+		})
 		if err != nil {
 			return err
 		}
@@ -1105,37 +1130,42 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		}
 		nextGeneration := head.Generation + 1
 		previous, previousObject := [32]byte{}, uint64(0)
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:begin")
 		for i := range compacted {
 			extent := &compacted[i]
 			extent.PreviousHash, extent.PreviousObject = previous, previousObject
 			data, err := encodeExtent(*extent)
 			if err != nil {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return fmt.Errorf("encode compacted archive extent: %w", err)
 			}
 			if len(data) > maxExtentSize {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return fmt.Errorf("compacted archive extent exceeds %d bytes", maxExtentSize)
 			}
 			hash := sha256.Sum256(data)
 			extent.hash = hash
 			if err := m.uploadExtent(ctx, hash, data, nextGeneration); err != nil {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return err
 			}
 			extent.object = nextGeneration
 			previous, previousObject = hash, nextGeneration
 		}
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:success")
 		head.TailHash, head.TailObject = previous, previousObject
 		head.Generation = nextGeneration
-		if err := m.publishHead(ctx, head, snapshotCAS); err != nil {
+		if err := archiveGCTrace(ctx, "publication", func() error { return m.publishHead(ctx, head, snapshotCAS) }); err != nil {
 			if m.cas {
 				continue
 			}
 			return err
 		}
-		if err := m.refreshPublishedHead(ctx, head, snapshotCAS, compacted); err != nil {
+		if err := archiveGCTrace(ctx, "readback", func() error { return m.refreshPublishedHead(ctx, head, snapshotCAS, compacted) }); err != nil {
 			return err
 		}
 		verifier := NewManager(m.bucket, m.prefix, m.configID)
-		if err := verifier.Load(ctx); err != nil {
+		if err := archiveGCTrace(ctx, "readback", func() error { return verifier.Load(ctx) }); err != nil {
 			verifier.Close()
 			return fmt.Errorf("verify compacted archive: %w", err)
 		}
@@ -1158,13 +1188,19 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 	}
 	cutoff := time.Now().Add(-grace)
 	m.mu.Unlock()
-	pinnedGeneration, err := m.maxActiveRecoveryGeneration(ctx)
+	var pinnedGeneration uint64
+	err := archiveGCTrace(ctx, "pins", func() error {
+		var err error
+		pinnedGeneration, err = m.maxActiveRecoveryGeneration(ctx)
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	m.waitReaders()
+	_ = archiveGCTrace(ctx, "readers", func() error { m.waitReaders(); return nil })
 	markers := make(map[string]time.Time)
-	if err := m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:begin")
+	err = m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
 		modified, ok := attributes.LastModified()
 		if !ok {
 			objectAttributes, err := m.bucket.Attributes(ctx, attributes.Name)
@@ -1175,15 +1211,19 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		}
 		markers[attributes.Name] = modified
 		return nil
-	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter()); err != nil {
+	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter())
+	if err != nil {
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:error")
 		return err
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:success")
 	deleteCtx, cancelDeletes := context.WithCancel(ctx)
 	defer cancelDeletes()
 	deletes, deleteCtx := errgroup.WithContext(deleteCtx)
 	deletes.SetLimit(4)
 	for _, dir := range []string{"archive/manifests", "archive/blocks"} {
-		if err := m.bucket.Iter(deleteCtx, m.key(dir), func(name string) error {
+		localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:begin")
+		err := m.bucket.Iter(deleteCtx, m.key(dir), func(name string) error {
 			if err := deleteCtx.Err(); err != nil {
 				return err
 			}
@@ -1239,19 +1279,25 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 				return nil
 			})
 			return deleteCtx.Err()
-		}); err != nil {
+		})
+		if err != nil {
+			localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:error")
 			cancelDeletes()
 			return errors.Join(err, deletes.Wait())
 		}
+		localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:success")
 	}
-	if err := deletes.Wait(); err != nil {
+	if err := archiveGCTrace(deleteCtx, "delete-wait", deletes.Wait); err != nil {
 		return err
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:begin")
 	for marker := range markers {
 		if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:error")
 			return err
 		}
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:success")
 	return nil
 }
 
@@ -1268,7 +1314,12 @@ func (m *Manager) recoveryPinKey(owner string) string {
 }
 
 func (m *Manager) withGCLock(ctx context.Context, owner string, work func(context.Context) error) error {
-	lock, err := m.acquireGCLock(ctx, owner, archivePinLease)
+	var lock *archiveGCLock
+	err := archiveGCTrace(ctx, "remote-lock", func() error {
+		var err error
+		lock, err = m.acquireGCLock(ctx, owner, archivePinLease)
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -1311,7 +1362,7 @@ func (m *Manager) withGCLock(ctx context.Context, owner string, work func(contex
 	lock = current
 	lockMu.Unlock()
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	releaseErr := m.releaseGCLock(releaseCtx, lock)
+	releaseErr := archiveGCTrace(ctx, "lock-release", func() error { return m.releaseGCLock(releaseCtx, lock) })
 	releaseCancel()
 	if err == nil && releaseErr != nil && !errors.Is(releaseErr, ErrArchiveBusy) {
 		err = releaseErr

@@ -2,6 +2,13 @@
 
 package localtesthooks
 
+import "context"
+
+// WithArchiveGCPhaseTrace is an allocation-free identity outside local tests.
+func WithArchiveGCPhaseTrace(ctx context.Context, _ func(string)) context.Context { return ctx }
+
+func HitArchiveGCPhase(context.Context, string) {}
+
 // Enabled is false when test boundary callbacks are compiled out.
 const Enabled = false
 

@@ -19,6 +19,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/mrchypark/rhiza/internal/foregroundcosttest"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/objstore/versityfixture"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -301,13 +302,17 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	maintenanceStateDir := t.TempDir()
 	requireNodeForegroundBudget(t, testDeadline, nodeForegroundMeasure+nodeForegroundCallTimeout+nodeForegroundCleanup, "after warmup accounting, before measurement")
 	var maintenance *nodeForegroundMaintenance
+	var archivePhaseTrace *nodeArchiveGCPhaseTrace
 	if scenario != "baseline" {
+		if scenario == "archive-cleanup-active" {
+			archivePhaseTrace = newNodeArchiveGCPhaseTrace()
+		}
 		operation := func(operationCtx context.Context) (nodeForegroundMaintenanceResult, error) {
 			switch scenario {
 			case "checkpoint-active":
 				return runNodeForegroundCheckpoint(operationCtx, nodes[0], maintenanceStateDir)
 			case "archive-cleanup-active":
-				return runNodeForegroundArchiveCleanup(operationCtx, nodes[0], maintenanceStateDir)
+				return runNodeForegroundArchiveCleanup(t, operationCtx, nodes[0], maintenanceStateDir, archivePhaseTrace)
 			default:
 				return nodeForegroundMaintenanceResult{}, fmt.Errorf("unsupported maintenance scenario %q", scenario)
 			}
@@ -327,6 +332,9 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		maintenance.stopAndWait()
 		transportObserver.SetPhase("measurement")
 		maintenance.log(t, nodeForegroundMeasure)
+		if archivePhaseTrace != nil {
+			archivePhaseTrace.log(t)
+		}
 		if firstErr := maintenance.firstError(); firstErr != nil {
 			types, status := nodeForegroundMaintenanceErrorTypeChain(firstErr)
 			t.Logf("node_foreground_maintenance_error_type_chain status=%s types=%v", status, types)
@@ -866,14 +874,148 @@ func runNodeForegroundCheckpoint(ctx context.Context, node *Node, sharedReadDir 
 	return result, nil
 }
 
-func runNodeForegroundArchiveCleanup(ctx context.Context, node *Node, sharedReadDir string) (nodeForegroundMaintenanceResult, error) {
+type nodeArchiveGCPhase struct {
+	name      string
+	started   time.Time
+	elapsed   time.Duration
+	remaining time.Duration
+	count     int
+	errors    int
+	active    bool
+}
+
+type nodeArchiveGCPhaseTrace struct {
+	mu         sync.Mutex
+	deadline   time.Time
+	operations int
+	unknown    bool
+	phases     [14]nodeArchiveGCPhase
+}
+
+func newNodeArchiveGCPhaseTrace() *nodeArchiveGCPhaseTrace {
+	trace := &nodeArchiveGCPhaseTrace{}
+	for i, name := range [...]string{"manager-lock", "remote-lock", "load", "compaction", "extent-upload", "publication", "readback", "pins", "readers", "candidate-scan", "object-scan", "delete-wait", "marker-cleanup", "lock-release"} {
+		trace.phases[i].name = name
+	}
+	return trace
+}
+
+func (trace *nodeArchiveGCPhaseTrace) setDeadline(ctx context.Context) {
+	trace.mu.Lock()
+	trace.deadline, _ = ctx.Deadline()
+	trace.operations++
+	trace.mu.Unlock()
+}
+
+func (trace *nodeArchiveGCPhaseTrace) hit(event string) {
+	if !strings.HasPrefix(event, "archive-gc:") {
+		return
+	}
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	for i := range trace.phases {
+		phase := &trace.phases[i]
+		prefix := "archive-gc:" + phase.name + ":"
+		if !strings.HasPrefix(event, prefix) {
+			continue
+		}
+		switch strings.TrimPrefix(event, prefix) {
+		case "begin":
+			for j := range trace.phases {
+				if trace.phases[j].active {
+					trace.unknown = true
+				}
+			}
+			if phase.active {
+				trace.unknown = true
+			}
+			phase.started, phase.active = time.Now(), true
+		case "success", "error":
+			if !phase.active {
+				trace.unknown = true
+				return
+			}
+			phase.elapsed += time.Since(phase.started)
+			phase.count++
+			if strings.HasSuffix(event, ":error") {
+				phase.errors++
+			}
+			if !trace.deadline.IsZero() {
+				remaining := time.Until(trace.deadline)
+				if phase.count == 1 || remaining < phase.remaining {
+					phase.remaining = remaining
+				}
+			}
+			phase.active = false
+		default:
+			trace.unknown = true
+		}
+		return
+	}
+	trace.unknown = true
+}
+
+func (trace *nodeArchiveGCPhaseTrace) log(t *testing.T) {
+	t.Helper()
+	trace.mu.Lock()
+	defer trace.mu.Unlock()
+	if trace.operations == 0 || trace.phases[0].count != trace.operations {
+		trace.unknown = true
+	}
+	for _, phase := range trace.phases {
+		if phase.active {
+			trace.unknown = true
+		}
+		if phase.count != 0 || phase.active {
+			t.Logf("node_archive_cleanup_phase name=%s count=%d errors=%d elapsed=%s minimum_deadline_remaining_at_terminal=%s active=%t", phase.name, phase.count, phase.errors, phase.elapsed, phase.remaining, phase.active)
+		}
+	}
+	t.Logf("node_archive_cleanup_phase_coverage operations=%d incomplete_or_ambiguous=%t", trace.operations, trace.unknown)
+}
+
+func TestNodeArchiveGCPhaseTraceFiniteTerminals(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	trace := newNodeArchiveGCPhaseTrace()
+	trace.setDeadline(ctx)
+	trace.hit("archive-gc:manager-lock:begin")
+	trace.hit("archive-gc:manager-lock:success")
+	trace.hit("archive-gc:load:begin")
+	trace.hit("archive-gc:load:error")
+	trace.hit("archive-gc:object-scan:begin")
+	trace.hit("archive-gc:object-scan:success")
+	if trace.unknown || trace.phases[2].count != 1 || trace.phases[2].errors != 1 || trace.phases[2].active || trace.phases[2].remaining <= 0 || trace.phases[10].count != 1 {
+		t.Fatalf("finite phase trace lost known terminal: unknown=%t load=%+v object_scan=%+v", trace.unknown, trace.phases[2], trace.phases[10])
+	}
+	trace.log(t)
+	trace.hit("archive-gc:load:begin")
+	trace.hit("archive-gc:compaction:begin")
+	if !trace.unknown {
+		t.Fatal("overlapping phase callbacks must mark attribution ambiguous")
+	}
+}
+
+func runNodeForegroundArchiveCleanup(t *testing.T, ctx context.Context, node *Node, sharedReadDir string, phaseTrace *nodeArchiveGCPhaseTrace) (nodeForegroundMaintenanceResult, error) {
 	if node == nil || node.archive == nil || node.core == nil || node.bucket == nil {
 		return nodeForegroundMaintenanceResult{}, fmt.Errorf("archive cleanup components unavailable")
 	}
 	beforeStore := snapshotNodeStoreStats([]*Node{node})
 	beforeTip := uint64(node.archive.Tip())
-	if err := node.archive.Cleanup(ctx, node.config.ObjStoreGCGracePeriod); err != nil {
-		return nodeForegroundMaintenanceResult{}, fmt.Errorf("archive cleanup with configured %s grace: %w", node.config.ObjStoreGCGracePeriod, err)
+	phaseTrace.setDeadline(ctx)
+	cleanupCtx := localtesthooks.WithArchiveGCPhaseTrace(ctx, phaseTrace.hit)
+	cleanupErr := node.archive.Cleanup(cleanupCtx, node.config.ObjStoreGCGracePeriod)
+	if cleanupErr != nil {
+		afterStore := snapshotNodeStoreStats([]*Node{node})
+		if len(beforeStore) == 1 && len(afterStore) == 1 && beforeStore[0].ok && afterStore[0].ok {
+			if delta, ok := nodeStoreStatsDelta(beforeStore[0].stats, afterStore[0].stats); ok {
+				t.Logf("node_archive_cleanup_failed_interval status=measured attribution=concurrent_with_api_traffic completed_work=false delta=%+v", delta)
+			} else {
+				t.Log("node_archive_cleanup_failed_interval status=counter_decrease attribution=unknown completed_work=false")
+			}
+		} else {
+			t.Log("node_archive_cleanup_failed_interval status=unavailable attribution=unknown completed_work=false")
+		}
+		return nodeForegroundMaintenanceResult{}, fmt.Errorf("archive cleanup with configured %s grace: %w", node.config.ObjStoreGCGracePeriod, cleanupErr)
 	}
 	afterStore := snapshotNodeStoreStats([]*Node{node})
 	if len(beforeStore) != 1 || len(afterStore) != 1 || !beforeStore[0].ok || !afterStore[0].ok {
