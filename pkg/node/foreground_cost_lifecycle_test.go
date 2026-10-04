@@ -885,11 +885,15 @@ type nodeArchiveGCPhase struct {
 }
 
 type nodeArchiveGCPhaseTrace struct {
-	mu         sync.Mutex
-	deadline   time.Time
-	operations int
-	unknown    bool
-	phases     [14]nodeArchiveGCPhase
+	mu                    sync.Mutex
+	deadline              time.Time
+	operations            int
+	unknown               bool
+	phases                [14]nodeArchiveGCPhase
+	compactionChoices     [2]int // full, reuse
+	publicationResults    [4]int // success, typed condition, context done, other
+	compactionClassified  bool
+	publicationClassified bool
 }
 
 func newNodeArchiveGCPhaseTrace() *nodeArchiveGCPhaseTrace {
@@ -913,6 +917,35 @@ func (trace *nodeArchiveGCPhaseTrace) hit(event string) {
 	}
 	trace.mu.Lock()
 	defer trace.mu.Unlock()
+	switch event {
+	case "archive-gc:compaction-choice:full", "archive-gc:compaction-choice:reuse":
+		if !trace.phases[3].active || trace.compactionClassified {
+			trace.unknown = true
+		}
+		trace.compactionClassified = true
+		if event == "archive-gc:compaction-choice:full" {
+			trace.compactionChoices[0]++
+		} else {
+			trace.compactionChoices[1]++
+		}
+		return
+	case "archive-gc:publication-result:success", "archive-gc:publication-result:typed_condition", "archive-gc:publication-result:context_done", "archive-gc:publication-result:other":
+		if !trace.phases[5].active || trace.publicationClassified {
+			trace.unknown = true
+		}
+		trace.publicationClassified = true
+		switch event {
+		case "archive-gc:publication-result:success":
+			trace.publicationResults[0]++
+		case "archive-gc:publication-result:typed_condition":
+			trace.publicationResults[1]++
+		case "archive-gc:publication-result:context_done":
+			trace.publicationResults[2]++
+		case "archive-gc:publication-result:other":
+			trace.publicationResults[3]++
+		}
+		return
+	}
 	for i := range trace.phases {
 		phase := &trace.phases[i]
 		prefix := "archive-gc:" + phase.name + ":"
@@ -930,10 +963,18 @@ func (trace *nodeArchiveGCPhaseTrace) hit(event string) {
 				trace.unknown = true
 			}
 			phase.started, phase.active = time.Now(), true
+			if i == 3 {
+				trace.compactionClassified = false
+			} else if i == 5 {
+				trace.publicationClassified = false
+			}
 		case "success", "error":
 			if !phase.active {
 				trace.unknown = true
 				return
+			}
+			if i == 3 && !trace.compactionClassified || i == 5 && !trace.publicationClassified {
+				trace.unknown = true
 			}
 			phase.elapsed += time.Since(phase.started)
 			phase.count++
@@ -962,6 +1003,11 @@ func (trace *nodeArchiveGCPhaseTrace) log(t *testing.T) {
 	if trace.operations == 0 || trace.phases[0].count != trace.operations {
 		trace.unknown = true
 	}
+	if trace.compactionChoices[0]+trace.compactionChoices[1] != trace.phases[3].count ||
+		trace.publicationResults[0]+trace.publicationResults[1]+trace.publicationResults[2]+trace.publicationResults[3] != trace.phases[5].count ||
+		trace.publicationResults[0] != trace.phases[5].count-trace.phases[5].errors {
+		trace.unknown = true
+	}
 	for _, phase := range trace.phases {
 		if phase.active {
 			trace.unknown = true
@@ -970,7 +1016,11 @@ func (trace *nodeArchiveGCPhaseTrace) log(t *testing.T) {
 			t.Logf("node_archive_cleanup_phase name=%s count=%d errors=%d elapsed=%s minimum_deadline_remaining_at_terminal=%s active=%t", phase.name, phase.count, phase.errors, phase.elapsed, phase.remaining, phase.active)
 		}
 	}
+	t.Logf("node_archive_cleanup_choices full=%d reuse=%d publication_success=%d publication_typed_condition=%d publication_context_done=%d publication_other=%d", trace.compactionChoices[0], trace.compactionChoices[1], trace.publicationResults[0], trace.publicationResults[1], trace.publicationResults[2], trace.publicationResults[3])
 	t.Logf("node_archive_cleanup_phase_coverage operations=%d incomplete_or_ambiguous=%t", trace.operations, trace.unknown)
+	if trace.unknown {
+		t.Error("archive cleanup phase and decision counts are incomplete or ambiguous")
+	}
 }
 
 func TestNodeArchiveGCPhaseTraceFiniteTerminals(t *testing.T) {
@@ -982,9 +1032,16 @@ func TestNodeArchiveGCPhaseTraceFiniteTerminals(t *testing.T) {
 	trace.hit("archive-gc:manager-lock:success")
 	trace.hit("archive-gc:load:begin")
 	trace.hit("archive-gc:load:error")
+	trace.hit("archive-gc:compaction:begin")
+	trace.hit("archive-gc:compaction-choice:full")
+	trace.hit("archive-gc:compaction:success")
+	trace.hit("archive-gc:publication:begin")
+	trace.hit("archive-gc:publication-result:typed_condition")
+	trace.hit("archive-gc:publication:error")
 	trace.hit("archive-gc:object-scan:begin")
 	trace.hit("archive-gc:object-scan:success")
-	if trace.unknown || trace.phases[2].count != 1 || trace.phases[2].errors != 1 || trace.phases[2].active || trace.phases[2].remaining <= 0 || trace.phases[10].count != 1 {
+	if trace.unknown || trace.phases[2].count != 1 || trace.phases[2].errors != 1 || trace.phases[2].active || trace.phases[2].remaining <= 0 || trace.phases[10].count != 1 ||
+		trace.compactionChoices != [2]int{1, 0} || trace.publicationResults != [4]int{0, 1, 0, 0} {
 		t.Fatalf("finite phase trace lost known terminal: unknown=%t load=%+v object_scan=%+v", trace.unknown, trace.phases[2], trace.phases[10])
 	}
 	trace.log(t)
@@ -992,6 +1049,19 @@ func TestNodeArchiveGCPhaseTraceFiniteTerminals(t *testing.T) {
 	trace.hit("archive-gc:compaction:begin")
 	if !trace.unknown {
 		t.Fatal("overlapping phase callbacks must mark attribution ambiguous")
+	}
+	missing := newNodeArchiveGCPhaseTrace()
+	missing.hit("archive-gc:compaction:begin")
+	missing.hit("archive-gc:compaction:success")
+	if !missing.unknown {
+		t.Fatal("compaction without a choice must be incomplete")
+	}
+	duplicate := newNodeArchiveGCPhaseTrace()
+	duplicate.hit("archive-gc:publication:begin")
+	duplicate.hit("archive-gc:publication-result:typed_condition")
+	duplicate.hit("archive-gc:publication-result:other")
+	if !duplicate.unknown {
+		t.Fatal("two classifications for one publication must be ambiguous")
 	}
 }
 

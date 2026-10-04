@@ -1117,8 +1117,10 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		err := archiveGCTrace(ctx, "compaction", func() error {
 			var err error
 			if canReuseCleanupCompaction(ctx, m.configID, snapshotHead, priorHead, refs, priorRefs, priorPacked) {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:compaction-choice:reuse")
 				compacted, err = m.compactExtentsFrom(ctx, refs[len(priorRefs):], snapshotHead.BasePrefix, priorPacked)
 			} else {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:compaction-choice:full")
 				compacted, err = m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
 			}
 			return err
@@ -1164,7 +1166,22 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:success")
 		head.TailHash, head.TailObject = previous, previousObject
 		head.Generation = nextGeneration
-		if err := archiveGCTrace(ctx, "publication", func() error { return m.publishHead(ctx, head, snapshotCAS) }); err != nil {
+		if err := archiveGCTrace(ctx, "publication", func() error {
+			err := m.publishHead(ctx, head, snapshotCAS)
+			if localtesthooks.Enabled {
+				switch {
+				case err == nil:
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:success")
+				case m.bucket.IsConditionNotMetErr(err):
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:typed_condition")
+				case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:context_done")
+				default:
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:other")
+				}
+			}
+			return err
+		}); err != nil {
 			if m.cas {
 				continue
 			}

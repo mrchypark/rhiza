@@ -62,6 +62,21 @@ type gcAmbiguousHeadBucket struct {
 	failedOnce  bool
 }
 
+type gcCanceledHeadBucket struct {
+	objstore.Bucket
+	cancel  context.CancelFunc
+	uploads int
+}
+
+func (b *gcCanceledHeadBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		b.uploads++
+		b.cancel()
+		return ctx.Err()
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
 func (b *gcAmbiguousHeadBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
 	err := b.Bucket.Upload(ctx, name, r, options...)
 	if strings.HasSuffix(name, "/archive/head.bin") {
@@ -116,7 +131,9 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	bucket.appendTip = func() error { return writer.SyncThrough(ctx, core, wantTip) }
 	gc := NewManager(bucket, "cluster", 1)
 	defer gc.Close()
+	events := make(map[string]int)
 	tracedCtx := localtesthooks.WithArchiveGCPhaseTrace(ctx, func(event string) {
+		events[event]++
 		switch event {
 		case "archive-gc:compaction:begin":
 			bucket.compacting = true
@@ -129,6 +146,10 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	}
 	if bucket.headAttempts < 2 || !base.IsConditionNotMetErr(bucket.conflict) {
 		t.Fatalf("real conditional race not observed: attempts=%d conflict=%v", bucket.headAttempts, bucket.conflict)
+	}
+	if events["archive-gc:publication-result:typed_condition"] != 1 || events["archive-gc:publication-result:success"] != 1 ||
+		events["archive-gc:compaction-choice:full"] != 1 || events["archive-gc:compaction-choice:reuse"] != 1 {
+		t.Fatalf("actual conflict/reuse classification=%v", events)
 	}
 	for key, gets := range oldKeys {
 		if gets > 1 {
@@ -283,11 +304,16 @@ func TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead(t *testing.T) {
 	bucket := &gcAmbiguousHeadBucket{Bucket: base}
 	gc := NewManager(bucket, "cluster", 1)
 	defer gc.Close()
-	if err := gc.Cleanup(ctx, time.Hour); err != nil {
+	events := make(map[string]int)
+	tracedCtx := localtesthooks.WithArchiveGCPhaseTrace(ctx, func(event string) { events[event]++ })
+	if err := gc.Cleanup(tracedCtx, time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if !bucket.failedOnce || bucket.headUploads != 1 {
 		t.Fatalf("ambiguous publication=%t head uploads=%d, want one committed upload followed by reload", bucket.failedOnce, bucket.headUploads)
+	}
+	if events["archive-gc:publication-result:other"] != 1 || events["archive-gc:compaction-choice:full"] != 2 || events["archive-gc:compaction-choice:reuse"] != 0 {
+		t.Fatalf("ambiguous committed publication classification=%v", events)
 	}
 	remote := NewManager(base, "cluster", 1)
 	defer remote.Close()
@@ -321,13 +347,47 @@ func TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish(t *testing.T) {
 	bucket.afterConflict = cancel
 	gc := NewManager(bucket, "cluster", 1)
 	defer gc.Close()
-	err := gc.Cleanup(cleanupCtx, time.Hour)
+	events := make(map[string]int)
+	tracedCtx := localtesthooks.WithArchiveGCPhaseTrace(cleanupCtx, func(event string) { events[event]++ })
+	err := gc.Cleanup(tracedCtx, time.Hour)
 	if !errors.Is(err, context.Canceled) || !base.IsConditionNotMetErr(bucket.conflict) || bucket.headAttempts != 1 {
 		t.Fatalf("canceled cleanup error=%v condition=%v head uploads=%d", err, bucket.conflict, bucket.headAttempts)
+	}
+	if events["archive-gc:publication-result:typed_condition"] != 1 || events["archive-gc:publication-result:context_done"] != 0 {
+		t.Fatalf("post-return cancellation reclassified typed condition: %v", events)
 	}
 	remote := NewManager(base, "cluster", 1)
 	defer remote.Close()
 	if err := remote.Load(ctx); err != nil || remote.Tip() != core.Tip() {
 		t.Fatalf("racing writer tip after canceled GC=%d want=%d err=%v", remote.Tip(), core.Tip(), err)
+	}
+	t.Run("returned_context_cause", testArchiveCleanupPublicationReturningContextCauseIsDistinct)
+}
+
+func testArchiveCleanupPublicationReturningContextCauseIsDistinct(t *testing.T) {
+	ctx, base, core, writer := newSealableArchive(t)
+	defer writer.Close()
+	for i := 0; i < 2; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cleanupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	bucket := &gcCanceledHeadBucket{Bucket: base, cancel: cancel}
+	gc := NewManager(bucket, "cluster", 1)
+	defer gc.Close()
+	events := make(map[string]int)
+	tracedCtx := localtesthooks.WithArchiveGCPhaseTrace(cleanupCtx, func(event string) { events[event]++ })
+	err := gc.Cleanup(tracedCtx, time.Hour)
+	if !errors.Is(err, context.Canceled) || bucket.uploads != 1 {
+		t.Fatalf("publication cancellation error=%v head uploads=%d", err, bucket.uploads)
+	}
+	if events["archive-gc:publication-result:context_done"] != 1 || events["archive-gc:publication-result:typed_condition"] != 0 ||
+		events["archive-gc:compaction-choice:full"] != 1 {
+		t.Fatalf("returned context cause classification=%v", events)
 	}
 }
