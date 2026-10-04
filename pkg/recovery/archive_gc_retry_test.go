@@ -11,6 +11,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,6 +30,8 @@ type gcRetryBucket struct {
 	conflict      error
 	compacting    bool
 	afterConflict func()
+	uploadPrefix  string
+	prefixUploads int
 }
 
 func (b *gcRetryBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -39,6 +42,9 @@ func (b *gcRetryBucket) Get(ctx context.Context, name string) (io.ReadCloser, er
 }
 
 func (b *gcRetryBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if b.uploadPrefix != "" && strings.HasPrefix(name, b.uploadPrefix) {
+		b.prefixUploads++
+	}
 	if strings.HasSuffix(name, "/archive/head.bin") {
 		b.headAttempts++
 		if b.headAttempts == 1 {
@@ -56,6 +62,82 @@ func (b *gcRetryBucket) Upload(ctx context.Context, name string, r io.Reader, op
 	return b.Bucket.Upload(ctx, name, r, options...)
 }
 
+func testArchiveCleanupReusesAcknowledgedCompleteUploadedPrefixAfterRealConflict(t *testing.T) {
+	ctx, base, core, writer := newSealableArchive(t)
+	defer writer.Close()
+	if !writer.CASSupported() {
+		t.Fatal("in-memory archive must support conditional HEAD publication")
+	}
+	// More than maxExtentItems decisions force a complete packed output group
+	// before the mutable tail. Periodic publication leaves multiple input refs.
+	for i := 2; i <= maxExtentItems+1; i++ {
+		if _, _, err := core.Propose(ctx, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		if i%256 == 0 || i == maxExtentItems+1 {
+			if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	probe := NewManager(base, "cluster", 1)
+	defer probe.Close()
+	if err := probe.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	packed, err := probe.compactExtents(ctx, probe.extents, probe.head.BasePrefix)
+	if err != nil || len(packed) < 2 {
+		t.Fatalf("complete packed prefix unavailable: groups=%d err=%v", len(packed), err)
+	}
+	firstData, err := encodeExtent(packed[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHash := sha256.Sum256(firstData)
+	if _, _, err := core.Propose(ctx, []byte("racing-tail")); err != nil {
+		t.Fatal(err)
+	}
+	wantTip := core.Tip()
+	bucket := &gcRetryBucket{
+		Bucket:       base,
+		uploadPrefix: probe.key(fmt.Sprintf("archive/blocks/%x_", firstHash)),
+	}
+	bucket.appendTip = func() error { return writer.SyncThrough(ctx, core, wantTip) }
+	gc := NewManager(bucket, "cluster", 1)
+	defer gc.Close()
+	if err := gc.Cleanup(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if bucket.headAttempts != 2 || !base.IsConditionNotMetErr(bucket.conflict) {
+		t.Fatalf("real conditional HEAD conflict absent: attempts=%d conflict=%v", bucket.headAttempts, bucket.conflict)
+	}
+	if bucket.prefixUploads != 1 {
+		t.Fatalf("complete immutable prefix uploaded %d times across one real retry, want once", bucket.prefixUploads)
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(final.extents) < 2 || final.extents[0].hash != firstHash || final.extents[0].object != probe.head.Generation+1 {
+		t.Fatalf("independently loaded complete prefix lost acknowledged identity: refs=%d", len(final.extents))
+	}
+	if final.extents[1].PreviousHash != firstHash || final.extents[1].PreviousObject != final.extents[0].object ||
+		final.extents[1].object != final.head.Generation {
+		t.Fatal("fresh tail does not link to retained (hash, object) with fresh generation")
+	}
+	values, tip, err := final.DecisionsFrom(ctx, 1, int(wantTip))
+	if err != nil || tip != wantTip || len(values) != int(wantTip) || !bytes.Equal(values[len(values)-1].Value, []byte("racing-tail")) {
+		t.Fatalf("final chain tip=%d want=%d decisions=%d err=%v", tip, wantTip, len(values), err)
+	}
+	for _, ref := range probe.extents {
+		name := probe.key(extentObjectKey(ref.hash, ref.object))
+		if exists, err := base.Exists(ctx, name); err != nil || !exists {
+			t.Errorf("preexisting immutable block lost: exists=%t err=%v", exists, err)
+		}
+	}
+}
+
 type gcAmbiguousHeadBucket struct {
 	objstore.Bucket
 	headUploads int
@@ -66,6 +148,23 @@ type gcCanceledHeadBucket struct {
 	objstore.Bucket
 	cancel  context.CancelFunc
 	uploads int
+}
+
+type gcUnacknowledgedBlockBucket struct {
+	objstore.Bucket
+	failed      bool
+	headUploads int
+}
+
+func (b *gcUnacknowledgedBlockBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.Contains(name, "/archive/blocks/") && !b.failed {
+		b.failed = true
+		return syscall.ECONNRESET
+	}
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		b.headUploads++
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
 }
 
 func (b *gcCanceledHeadBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
@@ -90,6 +189,9 @@ func (b *gcAmbiguousHeadBucket) Upload(ctx context.Context, name string, r io.Re
 }
 
 func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) {
+	t.Run("acknowledged_uploaded_prefix", testArchiveCleanupReusesAcknowledgedCompleteUploadedPrefixAfterRealConflict)
+	t.Run("upload_identity_fallback", testArchiveCleanupUploadIdentityFallback)
+	t.Run("unacknowledged_upload", testArchiveCleanupUnacknowledgedUploadDoesNotPublish)
 	ctx, base, core, writer := newSealableArchive(t)
 	defer writer.Close()
 	if !writer.CASSupported() {
@@ -180,6 +282,64 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	}
 	if prefix, ok := core.PrefixHash(quepaxa.Slot(wantTip)); !ok || final.extents[len(final.extents)-1].EndPrefix != prefix {
 		t.Fatalf("final chain prefix differs from source: available=%t", ok)
+	}
+}
+
+func testArchiveCleanupUploadIdentityFallback(t *testing.T) {
+	value := []byte("one")
+	valueHash := sha256.Sum256(value)
+	candidate := Extent{
+		ConfigID: 1, Start: 1, End: 1,
+		EndPrefix: quepaxa.AdvancePrefixHash([32]byte{}, 1, valueHash),
+		Decisions: []quepaxa.DecidedValue{{Slot: 1, Value: value, Hash: valueHash, Certificate: []byte{1}}},
+	}
+	data, err := encodeExtent(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(data)
+	saved := candidate
+	saved.hash, saved.object = hash, 7
+	if !canReuseCleanupUpload(hash, saved, 7) || !canReuseCleanupUpload(hash, saved, 8) {
+		t.Fatal("acknowledged same-byte object was not eligible at its generation or later")
+	}
+	if canReuseCleanupUpload(hash, saved, 6) {
+		t.Fatal("future-generation object reused against older HEAD")
+	}
+	saved.object = 0
+	if canReuseCleanupUpload(hash, saved, 8) {
+		t.Fatal("missing object identity reused")
+	}
+	saved.object = 7
+	candidate.PreviousHash, candidate.PreviousObject = [32]byte{1}, 6
+	data, err = encodeExtent(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canReuseCleanupUpload(sha256.Sum256(data), saved, 8) {
+		t.Fatal("different actual predecessor reused prior encoded object")
+	}
+}
+
+func testArchiveCleanupUnacknowledgedUploadDoesNotPublish(t *testing.T) {
+	ctx, base, core, writer := newSealableArchive(t)
+	defer writer.Close()
+	if _, _, err := core.Propose(ctx, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &gcUnacknowledgedBlockBucket{Bucket: base}
+	gc := NewManager(bucket, "cluster", 1)
+	defer gc.Close()
+	if err := gc.Cleanup(ctx, time.Hour); !errors.Is(err, syscall.ECONNRESET) || !bucket.failed || bucket.headUploads != 0 {
+		t.Fatalf("unacknowledged upload err=%v failed=%t HEAD uploads=%d", err, bucket.failed, bucket.headUploads)
+	}
+	remote := NewManager(base, "cluster", 1)
+	defer remote.Close()
+	if err := remote.Load(ctx); err != nil || remote.Tip() != core.Tip() {
+		t.Fatalf("unacknowledged cleanup changed reachable archive: tip=%d err=%v", remote.Tip(), err)
 	}
 }
 

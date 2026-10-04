@@ -1102,7 +1102,7 @@ func archiveGCTrace(ctx context.Context, phase string, work func() error) (err e
 func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 	settled := false
 	var priorHead archiveHead
-	var priorRefs, priorPacked []Extent
+	var priorRefs, priorPacked, priorUploaded []Extent
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
 		if err := archiveGCTrace(ctx, "load", func() error { return m.Load(ctx) }); err != nil {
 			return err
@@ -1113,10 +1113,11 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		if snapshotHead.Sealed {
 			return ErrArchiveSealed
 		}
+		reusePacking := canReuseCleanupCompaction(ctx, m.configID, snapshotHead, priorHead, refs, priorRefs, priorPacked)
 		var compacted []Extent
 		err := archiveGCTrace(ctx, "compaction", func() error {
 			var err error
-			if canReuseCleanupCompaction(ctx, m.configID, snapshotHead, priorHead, refs, priorRefs, priorPacked) {
+			if reusePacking {
 				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:compaction-choice:reuse")
 				compacted, err = m.compactExtentsFrom(ctx, refs[len(priorRefs):], snapshotHead.BasePrefix, priorPacked)
 			} else {
@@ -1141,6 +1142,7 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		}
 		nextGeneration := head.Generation + 1
 		previous, previousObject := [32]byte{}, uint64(0)
+		reuseUploaded := reusePacking
 		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:begin")
 		for i := range compacted {
 			extent := &compacted[i]
@@ -1156,6 +1158,16 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 			}
 			hash := sha256.Sum256(data)
 			extent.hash = hash
+			// Only complete groups can survive appended decisions. The current
+			// predecessor is part of the encoded hash, and the saved object was
+			// acknowledged or verified earlier in this Cleanup invocation.
+			if reuseUploaded && i < len(compacted)-1 && i < len(priorUploaded) &&
+				canReuseCleanupUpload(hash, priorUploaded[i], snapshotHead.Generation) {
+				extent.object = priorUploaded[i].object
+				previous, previousObject = hash, extent.object
+				continue
+			}
+			reuseUploaded = false
 			if err := m.uploadExtent(ctx, hash, data, nextGeneration); err != nil {
 				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return err
@@ -1163,6 +1175,9 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 			extent.object = nextGeneration
 			previous, previousObject = hash, nextGeneration
 		}
+		// The mutable final group is never retained. An error above leaves no
+		// new eligible upload state for a later attempt.
+		priorUploaded = slices.Clone(compacted[:max(0, len(compacted)-1)])
 		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:success")
 		head.TailHash, head.TailObject = previous, previousObject
 		head.Generation = nextGeneration
@@ -1701,6 +1716,13 @@ func archiveRefPrefixEqual(refs, prefix []Extent) bool {
 func canReuseCleanupCompaction(ctx context.Context, configID uint, head, previous archiveHead, refs, previousRefs, packed []Extent) bool {
 	return ctx.Err() == nil && !head.Sealed && head.ConfigID == configID && len(packed) != 0 &&
 		archiveBaseEqual(head, previous) && archiveRefPrefixEqual(refs, previousRefs)
+}
+
+// The candidate hash is encoded using the current predecessor immediately
+// before this check. Keep the acknowledged object's identity, not a fictitious
+// copy in the new generation.
+func canReuseCleanupUpload(hash [32]byte, saved Extent, currentGeneration uint64) bool {
+	return saved.hash == hash && saved.object != 0 && saved.object <= currentGeneration
 }
 
 func archiveHeadsEqual(a, b archiveHead) bool {
