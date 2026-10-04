@@ -398,6 +398,13 @@ jobs:
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -timeout=2m ./internal/objstore \
             -run '^TestVersitySDKRetryEvidence$'
+          run_logged versity-conditional-large-put env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=2m ./internal/objstore \
+            -run '^TestVersityConditionalLargePutEvidence$'
+          run_logged archive-attribution-regression env \
+            CGO_ENABLED=1 go test -count=1 -v -tags rhiza_local_testhooks -timeout=2m ./pkg/recovery \
+            -run '^TestArchiveExtentAttributionActualGuard$'
           run_logged checkpoint-s3 env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -timeout=5m ./pkg/checkpoint \
@@ -414,9 +421,26 @@ jobs:
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=3m ./pkg/node \
             -run '^TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls$'
+          run_logged node-learn-gap-lifecycle-race-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -race -tags rhiza_local_testhooks -timeout=3m ./pkg/node \
+            -run '^TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls$'
           run_logged node-foreground-cost-s3 env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             RHIZA_NODE_FOREGROUND_API_COST=1 \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=baseline \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
+            -run '^TestNodeForegroundAPICostS3$'
+          run_logged node-foreground-checkpoint-active-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_NODE_FOREGROUND_API_COST=1 \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=checkpoint-active \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
+            -run '^TestNodeForegroundAPICostS3$'
+          run_logged node-foreground-archive-cleanup-active-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_NODE_FOREGROUND_API_COST=1 \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=archive-cleanup-active \
             go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
 

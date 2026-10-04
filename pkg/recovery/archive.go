@@ -900,23 +900,34 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 }
 
 func (m *Manager) uploadExtent(ctx context.Context, hash [32]byte, data []byte, generation uint64) error {
+	ctx, attribution := objmetrics.BeginExtentUploadAttribution(ctx)
 	var options []objstore.ObjectUploadOption
 	if m.cas {
 		options = append(options, objstore.WithIfNotExists())
 	}
 	err := m.bucket.Upload(ctx, m.key(extentObjectKey(hash, generation)), bytes.NewReader(data), options...)
+	typed := m.cas && err != nil && m.bucket.IsConditionNotMetErr(err)
+	guard := "not_attempted"
+	if attribution != nil {
+		defer func() {
+			attribution.Complete(err, typed, guard)
+		}()
+	}
 	if !m.cas || err == nil {
 		return err
 	}
-	if !m.bucket.IsConditionNotMetErr(err) && !errors.Is(err, syscall.EPIPE) {
+	if !typed && !errors.Is(err, syscall.EPIPE) {
 		return err
 	}
 	if ctx.Err() != nil {
+		guard = "context_done"
 		return err
 	}
 	if _, readErr := m.readExtent(ctx, hash, generation); readErr == nil && ctx.Err() == nil {
+		guard = "verified"
 		return nil
 	}
+	guard = "unverified"
 	return err
 }
 

@@ -361,7 +361,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
-		bucket, bucketErr := objectstore.NewBucket(objectstore.Config{
+		bucket, bucketErr := objectstore.NewBucketWithContext(ctx, objectstore.Config{
 			Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
 			Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
 			Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,
@@ -606,8 +606,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	server.SetObjectStoreStats(func() (map[string]uint64, bool) {
 		stats, ok := n.ObjectStoreStats()
+		replayGroupingEnabled := uint64(0)
+		if stats.ReplayGroupingEnabled {
+			replayGroupingEnabled = 1
+		}
 		return map[string]uint64{
-			"uploads": stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
+			"replay_grouping_enabled": replayGroupingEnabled,
+			"uploads":                 stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
 			"deletes": stats.Deletes, "failures": stats.Failures, "bytes_uploaded": stats.BytesUploaded,
 			"bytes_downloaded": stats.BytesDownloaded, "s3_http_requests": stats.S3HTTPRequests,
 			"s3_http_failures": stats.S3HTTPFailures,
@@ -618,6 +623,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			"condition_conflicts": stats.ConditionConflicts, "dedup_hits": stats.DedupHits,
 			"sdk_retries": stats.SDKRetries, "transport_failures": stats.TransportFailures,
 			"http_4xx_unexpected": stats.Unexpected4xx, "http_5xx": stats.HTTP5xx,
+			"observed_request_identities":      stats.ObservedRequestIdentities,
+			"observed_request_repeats":         stats.ObservedRequestRepeats,
+			"request_grouping_unknown":         stats.RequestGroupingUnknown,
+			"replay_tracker_capacity_misses":   stats.ReplayTrackerCapacityMisses,
+			"replay_identity_capacity_misses":  stats.ReplayIdentityCapacityMisses,
+			"replay_incomplete_operations":     stats.ReplayIncompleteOperations,
+			"replay_tracked_operations_active": stats.ReplayTrackedOperationsActive,
+			"replay_open_readers":              stats.ReplayOpenReaders,
 		}, ok
 	})
 	archive := n.archive

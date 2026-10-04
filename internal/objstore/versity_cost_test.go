@@ -63,8 +63,10 @@ func TestVersityGatewayCostEvidence(t *testing.T) {
 		t.Fatalf("create task-owned bucket: %v", err)
 	}
 	setupAttemptsAfter, setupResponsesAfter := setupCounts.Snapshot()
+	workCtx, cancelWork := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelWork()
 
-	bucket, err := NewBucket(Config{
+	bucket, err := NewBucketWithContext(WithReplayObservation(workCtx), Config{
 		Provider: ProviderS3, Endpoint: strings.TrimPrefix(server.Endpoint, "http://"),
 		Bucket: bucketName, Region: "us-east-1", Insecure: true,
 		AccessKey: server.AccessKey, SecretKey: server.SecretKey,
@@ -72,9 +74,10 @@ func TestVersityGatewayCostEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !bucket.Stats().ReplayGroupingEnabled {
+		t.Fatal("Versity cost fixture did not enable request replay grouping")
+	}
 	defer bucket.Close()
-	workCtx, cancelWork := context.WithTimeout(ctx, 30*time.Second)
-	defer cancelWork()
 	key := "issue185/versity/" + token + "/object"
 	payload := []byte("Versity-backed request accounting")
 	if err := bucket.Upload(workCtx, key, bytes.NewReader(payload)); err != nil {
@@ -131,13 +134,16 @@ func TestVersityGatewayCostEvidence(t *testing.T) {
 	if stats.HTTPRequests == 0 || stats.Uploads != 2 || stats.BytesPublished != uint64(len(payload)) || stats.BytesUploaded < uint64(len(payload)+len("loser")) {
 		t.Fatalf("unexpected logical/transport stats: %+v", stats)
 	}
+	if stats.ReplayTrackedOperationsActive != 0 || stats.ReplayOpenReaders != 0 {
+		t.Fatalf("replay tracker still has live workload operations/readers: active=%d open_readers=%d", stats.ReplayTrackedOperationsActive, stats.ReplayOpenReaders)
+	}
 	retryEvidence := fmt.Sprintf("unknown for %d requests (MinIO SDK attempt metadata absent or unrecognized); observed retries=%d", stats.RetryMetadataUnknownRequests, stats.SDKRetries)
 	if stats.RetryMetadataUnknownRequests == 0 {
 		retryEvidence = fmt.Sprintf("%d (recognized attempt headers)", stats.SDKRetries)
 	}
 	t.Logf("methodology=MeteredBucket -> Thanos S3 -> MinIO -> local Versity POSIX; provider_qualification=false; versity_version=%q; versity_binary_sha256=%s; endpoint=%s; bucket=%s", server.Version, server.BinarySHA256, server.Endpoint, bucketName)
 	t.Logf("phase=setup client_attempts=%d responses=%d", setupAttemptsAfter, setupResponsesAfter)
-	t.Logf("phase=workload logical_uploads=%d logical_failures=%d conflicts=%d attempted_upload_bytes=%d acknowledged_upload_bytes=%d transport_attempts=%d GET=%d PUT=%d HEAD=%d DELETE=%d OTHER=%d request_body_bytes=%d response_body_bytes=%d HTTP_failures=%d retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries=%s", stats.Uploads, stats.Failures, stats.ConditionConflicts, stats.BytesUploaded, stats.BytesPublished, stats.HTTPRequests, stats.HTTPGetRequests, stats.HTTPPutRequests, stats.HTTPHeadRequests, stats.HTTPDeleteRequests, stats.HTTPOtherRequests, stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes, stats.HTTPFailures, stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests, retryEvidence)
+	t.Logf("phase=workload replay_grouping_enabled=%t logical_uploads=%d logical_failures=%d conflicts=%d attempted_upload_bytes=%d acknowledged_upload_bytes=%d transport_attempts=%d GET=%d PUT=%d HEAD=%d DELETE=%d OTHER=%d request_body_bytes=%d response_body_bytes=%d HTTP_failures=%d retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries=%s observed_request_identities=%d observed_request_repeats=%d request_grouping_unknown=%d replay_tracker_capacity_misses=%d replay_identity_capacity_misses=%d replay_incomplete_operations=%d active_replay_operations_end=%d open_replay_readers_end=%d", stats.ReplayGroupingEnabled, stats.Uploads, stats.Failures, stats.ConditionConflicts, stats.BytesUploaded, stats.BytesPublished, stats.HTTPRequests, stats.HTTPGetRequests, stats.HTTPPutRequests, stats.HTTPHeadRequests, stats.HTTPDeleteRequests, stats.HTTPOtherRequests, stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes, stats.HTTPFailures, stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests, retryEvidence, stats.ObservedRequestIdentities, stats.ObservedRequestRepeats, stats.RequestGroupingUnknown, stats.ReplayTrackerCapacityMisses, stats.ReplayIdentityCapacityMisses, stats.ReplayIncompleteOperations, stats.ReplayTrackedOperationsActive, stats.ReplayOpenReaders)
 	t.Logf("phase=server independent_requests=%d client_workload_attempts=%d setup_responses=%d reconciliation=exact", serverCalls, stats.HTTPRequests, setupResponsesAfter)
 }
 
@@ -209,13 +215,16 @@ func TestVersitySDKRetryEvidence(t *testing.T) {
 		forwarder.ServeHTTP(w, request)
 	}))
 	defer proxyServer.Close()
-	bucket, err := NewBucket(Config{
+	bucket, err := NewBucketWithContext(WithReplayObservation(ctx), Config{
 		Provider: ProviderS3, Endpoint: strings.TrimPrefix(proxyServer.URL, "http://"),
 		Bucket: bucketName, Region: "us-east-1", Insecure: true,
 		AccessKey: server.AccessKey, SecretKey: server.SecretKey, MaxRetries: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bucket.Stats().ReplayGroupingEnabled {
+		t.Fatal("Versity retry fixture did not enable request replay grouping")
 	}
 	defer bucket.Close()
 	backendBefore := versityfixture.RequestCount(mustAccessRecords(t, server))
@@ -255,7 +264,13 @@ func TestVersitySDKRetryEvidence(t *testing.T) {
 	if stats.RetryMetadataRequests != 0 || stats.RetryMetadataUnknownRequests != 2 || stats.SDKRetries != 0 {
 		t.Fatalf("MinIO attempt metadata=%+v; want both attempts classified unknown (proxy counter is retry evidence)", stats)
 	}
-	t.Logf("VERSITY_RETRY provider=local-versity-s3 qualification=false version=%q binary_sha256=%s setup_attempts=%d setup_responses=%d setup_backend_requests=%d injected_failures=%d proxy_client_attempts=%d actual_backend_get_requests=%d logical_gets=%d downloaded_payload_bytes=%d request_body_bytes=%d response_body_bytes=%d controlled_proxy_proved_retries=1 sdk_retry_metadata=unknown retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d", server.Version, server.BinarySHA256, setupAttempts, setupResponses, setupServerCalls, injectedFailures.Load(), proxyAttempts.Load(), backendGets, stats.Gets, stats.BytesDownloaded, stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes, stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests, stats.SDKRetries)
+	if !stats.ReplayGroupingEnabled || stats.ObservedRequestIdentities != 1 || stats.ObservedRequestRepeats != 1 || stats.RequestGroupingUnknown != 0 {
+		t.Fatalf("controlled GET replay accounting: first=%d repeats=%d unknown=%d; want 1, 1, 0", stats.ObservedRequestIdentities, stats.ObservedRequestRepeats, stats.RequestGroupingUnknown)
+	}
+	if stats.ReplayTrackedOperationsActive != 0 || stats.ReplayOpenReaders != 0 {
+		t.Fatalf("replay tracker leaked after GET reader close: active=%d open_readers=%d", stats.ReplayTrackedOperationsActive, stats.ReplayOpenReaders)
+	}
+	t.Logf("VERSITY_RETRY provider=local-versity-s3 qualification=false version=%q binary_sha256=%s setup_attempts=%d setup_responses=%d setup_backend_requests=%d injected_failures=%d proxy_client_attempts=%d actual_backend_get_requests=%d logical_gets=%d downloaded_payload_bytes=%d request_body_bytes=%d response_body_bytes=%d controlled_proxy_proved_retries=1 observed_request_identities=%d observed_same_identity_repeats=%d request_grouping_unknown=%d sdk_retry_metadata=unknown retry_metadata_known=%d retry_metadata_unknown=%d sdk_retries_metric=%d", server.Version, server.BinarySHA256, setupAttempts, setupResponses, setupServerCalls, injectedFailures.Load(), proxyAttempts.Load(), backendGets, stats.Gets, stats.BytesDownloaded, stats.HTTPRequestBodyBytes, stats.HTTPResponseBodyBytes, stats.ObservedRequestIdentities, stats.ObservedRequestRepeats, stats.RequestGroupingUnknown, stats.RetryMetadataRequests, stats.RetryMetadataUnknownRequests, stats.SDKRetries)
 }
 
 func mustAccessRecords(t *testing.T, server *versityfixture.Server) []string {
@@ -280,17 +295,26 @@ func versityOperationCount(records []string, operation string) uint64 {
 func subtractStats(before, after Stats) Stats {
 	return Stats{
 		Uploads: after.Uploads - before.Uploads, Gets: after.Gets - before.Gets, Failures: after.Failures - before.Failures,
-		BytesUploaded:                after.BytesUploaded - before.BytesUploaded,
-		BytesPublished:               after.BytesPublished - before.BytesPublished,
-		BytesDownloaded:              after.BytesDownloaded - before.BytesDownloaded,
-		HTTPRequests:                 after.HTTPRequests - before.HTTPRequests,
-		HTTPGetRequests:              after.HTTPGetRequests - before.HTTPGetRequests,
-		HTTP5xx:                      after.HTTP5xx - before.HTTP5xx,
-		HTTPFailures:                 after.HTTPFailures - before.HTTPFailures,
-		HTTPRequestBodyBytes:         after.HTTPRequestBodyBytes - before.HTTPRequestBodyBytes,
-		HTTPResponseBodyBytes:        after.HTTPResponseBodyBytes - before.HTTPResponseBodyBytes,
-		SDKRetries:                   after.SDKRetries - before.SDKRetries,
-		RetryMetadataRequests:        after.RetryMetadataRequests - before.RetryMetadataRequests,
-		RetryMetadataUnknownRequests: after.RetryMetadataUnknownRequests - before.RetryMetadataUnknownRequests,
+		BytesUploaded:                 after.BytesUploaded - before.BytesUploaded,
+		BytesPublished:                after.BytesPublished - before.BytesPublished,
+		BytesDownloaded:               after.BytesDownloaded - before.BytesDownloaded,
+		HTTPRequests:                  after.HTTPRequests - before.HTTPRequests,
+		HTTPGetRequests:               after.HTTPGetRequests - before.HTTPGetRequests,
+		HTTP5xx:                       after.HTTP5xx - before.HTTP5xx,
+		HTTPFailures:                  after.HTTPFailures - before.HTTPFailures,
+		HTTPRequestBodyBytes:          after.HTTPRequestBodyBytes - before.HTTPRequestBodyBytes,
+		HTTPResponseBodyBytes:         after.HTTPResponseBodyBytes - before.HTTPResponseBodyBytes,
+		SDKRetries:                    after.SDKRetries - before.SDKRetries,
+		RetryMetadataRequests:         after.RetryMetadataRequests - before.RetryMetadataRequests,
+		RetryMetadataUnknownRequests:  after.RetryMetadataUnknownRequests - before.RetryMetadataUnknownRequests,
+		ReplayGroupingEnabled:         after.ReplayGroupingEnabled,
+		ObservedRequestIdentities:     after.ObservedRequestIdentities - before.ObservedRequestIdentities,
+		ObservedRequestRepeats:        after.ObservedRequestRepeats - before.ObservedRequestRepeats,
+		RequestGroupingUnknown:        after.RequestGroupingUnknown - before.RequestGroupingUnknown,
+		ReplayTrackerCapacityMisses:   after.ReplayTrackerCapacityMisses - before.ReplayTrackerCapacityMisses,
+		ReplayIdentityCapacityMisses:  after.ReplayIdentityCapacityMisses - before.ReplayIdentityCapacityMisses,
+		ReplayIncompleteOperations:    after.ReplayIncompleteOperations - before.ReplayIncompleteOperations,
+		ReplayTrackedOperationsActive: after.ReplayTrackedOperationsActive,
+		ReplayOpenReaders:             after.ReplayOpenReaders,
 	}
 }

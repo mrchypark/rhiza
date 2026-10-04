@@ -2,10 +2,13 @@ package objstore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	thanosobjstore "github.com/thanos-io/objstore"
@@ -49,6 +52,17 @@ type Stats struct {
 	TransportFailures            uint64 `json:"transport_failures"`
 	Unexpected4xx                uint64 `json:"http_4xx_unexpected"`
 	HTTP5xx                      uint64 `json:"http_5xx"`
+	ReplayGroupingEnabled        bool   `json:"replay_grouping_enabled"`
+	// These counters describe same-identity HTTP RoundTrip repeats, not proven
+	// SDK retries. Unknown requests preserve attempts that could not be grouped.
+	ObservedRequestIdentities     uint64 `json:"observed_request_identities"`
+	ObservedRequestRepeats        uint64 `json:"observed_request_repeats"`
+	RequestGroupingUnknown        uint64 `json:"request_grouping_unknown"`
+	ReplayTrackerCapacityMisses   uint64 `json:"replay_tracker_capacity_misses"`
+	ReplayIdentityCapacityMisses  uint64 `json:"replay_identity_capacity_misses"`
+	ReplayIncompleteOperations    uint64 `json:"replay_incomplete_operations"`
+	ReplayTrackedOperationsActive uint64 `json:"replay_tracked_operations_active"`
+	ReplayOpenReaders             uint64 `json:"replay_open_readers"`
 }
 
 type bucketMetrics struct {
@@ -65,6 +79,159 @@ type bucketMetrics struct {
 	sdkRetries, retryMetadataRequests, retryMetadataUnknownRequests atomic.Uint64
 	transportFailures                                               atomic.Uint64
 	unexpected4xx, http5xx                                          atomic.Uint64
+	observedRequestIdentities, observedRequestRepeats               atomic.Uint64
+	requestGroupingUnknown, replayTrackerCapacityMisses             atomic.Uint64
+	replayIdentityCapacityMisses, replayIncompleteOperations        atomic.Uint64
+	replayTrackedOperationsActive, replayOpenReaders                atomic.Uint64
+	replayGroupingEnabled                                           bool
+}
+
+// Replay grouping is deliberately bounded: at most 128 live logical
+// operations, each holding at most 64 request digests (8,192 digests total).
+// Multipart uploads and normal paginated reads fit comfortably; excess is
+// reported as unknown rather than silently treated as no repeat.
+const (
+	maxReplayTrackedOperations = 128
+	maxReplayIdentitiesPerOp   = 64
+)
+
+type replayOperationKey struct{}
+
+type replayOperation struct {
+	metrics          *bucketMetrics
+	mu               sync.Mutex
+	seen             map[[sha256.Size]byte]struct{}
+	active           uint32
+	done             bool
+	released         bool
+	incomplete       bool
+	identityOverflow bool
+}
+
+func (m *bucketMetrics) beginReplayOperation(ctx context.Context) (context.Context, *replayOperation) {
+	if !m.replayGroupingEnabled {
+		return ctx, nil
+	}
+	for {
+		active := m.replayTrackedOperationsActive.Load()
+		if active >= maxReplayTrackedOperations {
+			m.replayTrackerCapacityMisses.Add(1)
+			m.replayIncompleteOperations.Add(1)
+			return ctx, nil
+		}
+		if m.replayTrackedOperationsActive.CompareAndSwap(active, active+1) {
+			break
+		}
+	}
+	operation := &replayOperation{metrics: m}
+	return context.WithValue(ctx, replayOperationKey{}, operation), operation
+}
+
+func replayOperationFromContext(ctx context.Context) *replayOperation {
+	operation, _ := ctx.Value(replayOperationKey{}).(*replayOperation)
+	return operation
+}
+
+func (operation *replayOperation) markIncompleteLocked() {
+	if !operation.incomplete {
+		operation.incomplete = true
+		operation.metrics.replayIncompleteOperations.Add(1)
+	}
+}
+
+// beginRequest accounts one outer RoundTrip. A repeat means only that the
+// same private request digest occurred again inside this bucket operation.
+func (operation *replayOperation) beginRequest(identity [sha256.Size]byte) bool {
+	operation.mu.Lock()
+	defer operation.mu.Unlock()
+	if operation.done || operation.released {
+		operation.markIncompleteLocked()
+		operation.metrics.requestGroupingUnknown.Add(1)
+		return false
+	}
+	operation.active++
+	if _, ok := operation.seen[identity]; ok {
+		operation.metrics.observedRequestRepeats.Add(1)
+		return true
+	}
+	if len(operation.seen) >= maxReplayIdentitiesPerOp {
+		operation.metrics.requestGroupingUnknown.Add(1)
+		if !operation.identityOverflow {
+			operation.identityOverflow = true
+			operation.metrics.replayIdentityCapacityMisses.Add(1)
+			operation.markIncompleteLocked()
+		}
+		return true
+	}
+	if operation.seen == nil {
+		operation.seen = make(map[[sha256.Size]byte]struct{})
+	}
+	operation.seen[identity] = struct{}{}
+	operation.metrics.observedRequestIdentities.Add(1)
+	return true
+}
+
+func (operation *replayOperation) endRequest() {
+	operation.mu.Lock()
+	if operation.active > 0 {
+		operation.active--
+	}
+	release := operation.done && operation.active == 0 && !operation.released
+	if release {
+		operation.released = true
+	}
+	operation.mu.Unlock()
+	if release {
+		operation.metrics.replayTrackedOperationsActive.Add(^uint64(0))
+	}
+}
+
+func (operation *replayOperation) finish() {
+	operation.mu.Lock()
+	operation.done = true
+	if operation.active > 0 {
+		operation.markIncompleteLocked()
+	}
+	release := operation.active == 0 && !operation.released
+	if release {
+		operation.released = true
+	}
+	operation.mu.Unlock()
+	if release {
+		operation.metrics.replayTrackedOperationsActive.Add(^uint64(0))
+	}
+}
+
+func replayIdentity(request *http.Request) [sha256.Size]byte {
+	var encodedStorage [512]byte
+	encoded := encodedStorage[:0]
+	encoded = appendReplayField(encoded, "rhiza-request-identity-v1")
+	if request.URL != nil {
+		encoded = appendReplayField(encoded, request.URL.Scheme)
+		encoded = appendReplayField(encoded, request.URL.Host)
+		encoded = appendReplayField(encoded, request.URL.EscapedPath())
+		encoded = appendReplayField(encoded, request.URL.RawQuery)
+	} else {
+		encoded = appendReplayField(encoded, "")
+		encoded = appendReplayField(encoded, "")
+		encoded = appendReplayField(encoded, "")
+		encoded = appendReplayField(encoded, "")
+	}
+	encoded = appendReplayField(encoded, request.Method)
+	for _, name := range []string{"Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		encoded = appendReplayField(encoded, request.Header.Get(name))
+	}
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(request.ContentLength))
+	encoded = append(encoded, length[:]...)
+	return sha256.Sum256(encoded)
+}
+
+func appendReplayField(encoded []byte, value string) []byte {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	encoded = append(encoded, length[:]...)
+	return append(encoded, value...)
 }
 
 type expectedNotFoundKey struct{}
@@ -121,11 +288,22 @@ func (b *MeteredBucket) Stats() Stats {
 		SDKRetries: b.metrics.sdkRetries.Load(), RetryMetadataRequests: b.metrics.retryMetadataRequests.Load(),
 		RetryMetadataUnknownRequests: b.metrics.retryMetadataUnknownRequests.Load(), TransportFailures: b.metrics.transportFailures.Load(),
 		Unexpected4xx: b.metrics.unexpected4xx.Load(), HTTP5xx: b.metrics.http5xx.Load(),
+		ReplayGroupingEnabled:         b.metrics.replayGroupingEnabled,
+		ObservedRequestIdentities:     b.metrics.observedRequestIdentities.Load(),
+		ObservedRequestRepeats:        b.metrics.observedRequestRepeats.Load(),
+		RequestGroupingUnknown:        b.metrics.requestGroupingUnknown.Load(),
+		ReplayTrackerCapacityMisses:   b.metrics.replayTrackerCapacityMisses.Load(),
+		ReplayIdentityCapacityMisses:  b.metrics.replayIdentityCapacityMisses.Load(),
+		ReplayIncompleteOperations:    b.metrics.replayIncompleteOperations.Load(),
+		ReplayTrackedOperationsActive: b.metrics.replayTrackedOperationsActive.Load(),
+		ReplayOpenReaders:             b.metrics.replayOpenReaders.Load(),
 	}
 }
 
 func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
 	b.metrics.uploads.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
 	counted := &countingReader{reader: reader, count: &b.metrics.bytesUploaded}
 	size, sizeErr := counted.ObjectSize()
 	ctx = withExpectedCondition(ctx, opts...)
@@ -150,32 +328,55 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 
 func (b *MeteredBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	b.metrics.gets.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
 	reader, err := b.Bucket.Get(ctx, name)
 	b.record(err)
 	if err != nil {
+		finishReplayOperation(operation)
 		return nil, err
 	}
-	return b.countingReadCloser(reader), nil
+	return b.countingReadCloser(reader, operation), nil
 }
 
 func (b *MeteredBucket) GetRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
 	b.metrics.gets.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
 	reader, err := b.Bucket.GetRange(ctx, name, off, length)
 	b.record(err)
 	if err != nil {
+		finishReplayOperation(operation)
 		return nil, err
 	}
-	return b.countingReadCloser(reader), nil
+	return b.countingReadCloser(reader, operation), nil
 }
 
-func (b *MeteredBucket) countingReadCloser(reader io.ReadCloser) *countingReadCloser {
-	return &countingReadCloser{ReadCloser: reader, count: &b.metrics.bytesDownloaded, onReadError: func() {
+func finishReplayOperation(operation *replayOperation) {
+	if operation != nil {
+		operation.finish()
+	}
+}
+
+func (b *MeteredBucket) countingReadCloser(reader io.ReadCloser, operation *replayOperation) *countingReadCloser {
+	counted := &countingReadCloser{ReadCloser: reader, count: &b.metrics.bytesDownloaded, onReadError: func() {
 		b.metrics.failures.Add(1)
 	}}
+	if operation != nil {
+		b.metrics.replayOpenReaders.Add(1)
+		var closeOnce sync.Once
+		counted.onClose = func() {
+			closeOnce.Do(func() {
+				b.metrics.replayOpenReaders.Add(^uint64(0))
+				operation.finish()
+			})
+		}
+	}
+	return counted
 }
 
 func (b *MeteredBucket) Iter(ctx context.Context, dir string, f func(string) error, options ...thanosobjstore.IterOption) error {
 	b.metrics.lists.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
 	err := b.Bucket.Iter(ctx, dir, f, options...)
 	b.record(err)
 	return err
@@ -183,6 +384,8 @@ func (b *MeteredBucket) Iter(ctx context.Context, dir string, f func(string) err
 
 func (b *MeteredBucket) IterWithAttributes(ctx context.Context, dir string, f func(thanosobjstore.IterObjectAttributes) error, options ...thanosobjstore.IterOption) error {
 	b.metrics.lists.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
 	err := b.Bucket.IterWithAttributes(ctx, dir, f, options...)
 	b.record(err)
 	return err
@@ -190,6 +393,8 @@ func (b *MeteredBucket) IterWithAttributes(ctx context.Context, dir string, f fu
 
 func (b *MeteredBucket) Exists(ctx context.Context, name string) (bool, error) {
 	b.metrics.heads.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
 	exists, err := b.Bucket.Exists(ctx, name)
 	b.record(err)
 	return exists, err
@@ -197,6 +402,8 @@ func (b *MeteredBucket) Exists(ctx context.Context, name string) (bool, error) {
 
 func (b *MeteredBucket) Attributes(ctx context.Context, name string) (thanosobjstore.ObjectAttributes, error) {
 	b.metrics.heads.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
 	attributes, err := b.Bucket.Attributes(ctx, name)
 	b.record(err)
 	return attributes, err
@@ -204,6 +411,8 @@ func (b *MeteredBucket) Attributes(ctx context.Context, name string) (thanosobjs
 
 func (b *MeteredBucket) Delete(ctx context.Context, name string) error {
 	b.metrics.deletes.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
 	err := b.Bucket.Delete(ctx, name)
 	b.record(err)
 	return err
@@ -218,6 +427,15 @@ func (b *MeteredBucket) record(err error) {
 func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 	return roundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		m.httpRequests.Add(1)
+		if m.replayGroupingEnabled {
+			if operation := replayOperationFromContext(request.Context()); operation != nil {
+				if operation.beginRequest(replayIdentity(request)) {
+					defer operation.endRequest()
+				}
+			} else {
+				m.requestGroupingUnknown.Add(1)
+			}
+		}
 		switch request.Method {
 		case http.MethodGet:
 			m.httpGetRequests.Add(1)
@@ -379,6 +597,7 @@ type countingReadCloser struct {
 	io.ReadCloser
 	count       *atomic.Uint64
 	onReadError func()
+	onClose     func()
 	failed      atomic.Bool
 }
 
@@ -391,4 +610,12 @@ func (r *countingReadCloser) Read(buffer []byte) (int, error) {
 		r.onReadError()
 	}
 	return n, err
+}
+
+func (r *countingReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	if r.onClose != nil {
+		r.onClose()
+	}
+	return err
 }

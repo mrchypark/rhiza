@@ -64,13 +64,16 @@ func TestCheckpointCost(t *testing.T) {
 	if setupServerRequests != setupResponses {
 		t.Fatalf("setup server requests=%d, client responses=%d (attempts=%d)", setupServerRequests, setupResponses, setupAttempts)
 	}
-	bucket, err := objmetrics.NewBucket(objmetrics.Config{
+	bucket, err := objmetrics.NewBucketWithContext(objmetrics.WithReplayObservation(ctx), objmetrics.Config{
 		Provider: objmetrics.ProviderS3, Endpoint: strings.TrimPrefix(server.Endpoint, "http://"),
 		Bucket: bucketName, Region: "us-east-1", Insecure: true,
 		AccessKey: server.AccessKey, SecretKey: server.SecretKey,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !bucket.Stats().ReplayGroupingEnabled {
+		t.Fatal("checkpoint cost fixture did not enable request replay grouping")
 	}
 	defer bucket.Close()
 	prefix := fmt.Sprintf("rhiza-checkpoint-cost/%d", time.Now().UnixNano())
@@ -698,34 +701,46 @@ func sumReachable(objects map[string]int64) int64 {
 }
 
 type checkpointCostStats struct {
-	Uploads              uint64 `json:"uploads"`
-	Gets                 uint64 `json:"gets"`
-	Lists                uint64 `json:"lists"`
-	Heads                uint64 `json:"heads"`
-	Deletes              uint64 `json:"deletes"`
-	Failures             uint64 `json:"failures"`
-	HTTPRequests         uint64 `json:"http_requests"`
-	HTTPFailures         uint64 `json:"http_failures"`
-	ConditionConflicts   uint64 `json:"condition_conflicts"`
-	TransportFailures    uint64 `json:"transport_failures"`
-	HTTP5xx              uint64 `json:"http_5xx"`
-	HTTPGet              uint64 `json:"http_get_requests"`
-	HTTPPut              uint64 `json:"http_put_requests"`
-	HTTPHead             uint64 `json:"http_head_requests"`
-	HTTPDelete           uint64 `json:"http_delete_requests"`
-	AttemptedBytes       uint64 `json:"attempted_bytes"`
-	PublishedBytes       uint64 `json:"published_bytes"`
-	DownloadedBytes      uint64 `json:"downloaded_bytes"`
-	Retries              uint64 `json:"retries"`
-	RetryMetadataKnown   uint64 `json:"retry_metadata_known_requests"`
-	RetryMetadataUnknown uint64 `json:"retry_metadata_unknown_requests"`
-	RequestBodyBytes     uint64 `json:"request_body_bytes_consumed"`
-	ResponseBodyBytes    uint64 `json:"response_body_bytes_consumed"`
+	ReplayGroupingEnabled        bool   `json:"replay_grouping_enabled"`
+	Uploads                      uint64 `json:"uploads"`
+	Gets                         uint64 `json:"gets"`
+	Lists                        uint64 `json:"lists"`
+	Heads                        uint64 `json:"heads"`
+	Deletes                      uint64 `json:"deletes"`
+	Failures                     uint64 `json:"failures"`
+	HTTPRequests                 uint64 `json:"http_requests"`
+	HTTPFailures                 uint64 `json:"http_failures"`
+	ConditionConflicts           uint64 `json:"condition_conflicts"`
+	TransportFailures            uint64 `json:"transport_failures"`
+	HTTP5xx                      uint64 `json:"http_5xx"`
+	HTTPGet                      uint64 `json:"http_get_requests"`
+	HTTPPut                      uint64 `json:"http_put_requests"`
+	HTTPHead                     uint64 `json:"http_head_requests"`
+	HTTPDelete                   uint64 `json:"http_delete_requests"`
+	AttemptedBytes               uint64 `json:"attempted_bytes"`
+	PublishedBytes               uint64 `json:"published_bytes"`
+	DownloadedBytes              uint64 `json:"downloaded_bytes"`
+	Retries                      uint64 `json:"retries"`
+	RetryMetadataKnown           uint64 `json:"retry_metadata_known_requests"`
+	RetryMetadataUnknown         uint64 `json:"retry_metadata_unknown_requests"`
+	RequestBodyBytes             uint64 `json:"request_body_bytes_consumed"`
+	ResponseBodyBytes            uint64 `json:"response_body_bytes_consumed"`
+	ObservedRequestIdentities    uint64 `json:"observed_request_identities"`
+	ObservedRequestRepeats       uint64 `json:"observed_request_repeats"`
+	RequestGroupingUnknown       uint64 `json:"request_grouping_unknown"`
+	ReplayTrackerCapacityMisses  uint64 `json:"replay_tracker_capacity_misses"`
+	ReplayIdentityCapacityMisses uint64 `json:"replay_identity_capacity_misses"`
+	ReplayIncompleteOperations   uint64 `json:"replay_incomplete_operations"`
+	ReplayTrackedOperationsStart uint64 `json:"replay_tracked_operations_start"`
+	ReplayTrackedOperationsEnd   uint64 `json:"replay_tracked_operations_end"`
+	ReplayOpenReadersStart       uint64 `json:"replay_open_readers_start"`
+	ReplayOpenReadersEnd         uint64 `json:"replay_open_readers_end"`
 }
 
 func checkpointCostDelta(before, after objmetrics.Stats) checkpointCostStats {
 	return checkpointCostStats{
-		Uploads: after.Uploads - before.Uploads, Gets: after.Gets - before.Gets,
+		ReplayGroupingEnabled: after.ReplayGroupingEnabled,
+		Uploads:               after.Uploads - before.Uploads, Gets: after.Gets - before.Gets,
 		Lists: after.Lists - before.Lists, Heads: after.Heads - before.Heads,
 		Deletes: after.Deletes - before.Deletes, Failures: after.Failures - before.Failures,
 		HTTPRequests: after.HTTPRequests - before.HTTPRequests, HTTPFailures: after.HTTPFailures - before.HTTPFailures,
@@ -736,10 +751,20 @@ func checkpointCostDelta(before, after objmetrics.Stats) checkpointCostStats {
 		HTTPHead: after.HTTPHeadRequests - before.HTTPHeadRequests, HTTPDelete: after.HTTPDeleteRequests - before.HTTPDeleteRequests,
 		AttemptedBytes: after.BytesUploaded - before.BytesUploaded, PublishedBytes: after.BytesPublished - before.BytesPublished,
 		DownloadedBytes: after.BytesDownloaded - before.BytesDownloaded, Retries: after.SDKRetries - before.SDKRetries,
-		RetryMetadataKnown:   after.RetryMetadataRequests - before.RetryMetadataRequests,
-		RetryMetadataUnknown: after.RetryMetadataUnknownRequests - before.RetryMetadataUnknownRequests,
-		RequestBodyBytes:     after.HTTPRequestBodyBytes - before.HTTPRequestBodyBytes,
-		ResponseBodyBytes:    after.HTTPResponseBodyBytes - before.HTTPResponseBodyBytes,
+		RetryMetadataKnown:           after.RetryMetadataRequests - before.RetryMetadataRequests,
+		RetryMetadataUnknown:         after.RetryMetadataUnknownRequests - before.RetryMetadataUnknownRequests,
+		RequestBodyBytes:             after.HTTPRequestBodyBytes - before.HTTPRequestBodyBytes,
+		ResponseBodyBytes:            after.HTTPResponseBodyBytes - before.HTTPResponseBodyBytes,
+		ObservedRequestIdentities:    after.ObservedRequestIdentities - before.ObservedRequestIdentities,
+		ObservedRequestRepeats:       after.ObservedRequestRepeats - before.ObservedRequestRepeats,
+		RequestGroupingUnknown:       after.RequestGroupingUnknown - before.RequestGroupingUnknown,
+		ReplayTrackerCapacityMisses:  after.ReplayTrackerCapacityMisses - before.ReplayTrackerCapacityMisses,
+		ReplayIdentityCapacityMisses: after.ReplayIdentityCapacityMisses - before.ReplayIdentityCapacityMisses,
+		ReplayIncompleteOperations:   after.ReplayIncompleteOperations - before.ReplayIncompleteOperations,
+		ReplayTrackedOperationsStart: before.ReplayTrackedOperationsActive,
+		ReplayTrackedOperationsEnd:   after.ReplayTrackedOperationsActive,
+		ReplayOpenReadersStart:       before.ReplayOpenReaders,
+		ReplayOpenReadersEnd:         after.ReplayOpenReaders,
 	}
 }
 

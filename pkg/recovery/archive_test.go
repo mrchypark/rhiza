@@ -1073,8 +1073,42 @@ func TestArchiveSyncDoesNotPublishAfterUnverifiedExtentEPIPE(t *testing.T) {
 	}
 }
 
+func TestArchiveSyncDoesNotPublishAfterFinalExtentReset(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &archiveExtentOutcomeBucket{
+		Bucket:           objstore.NewInMemBucket(),
+		uploadErr:        fmt.Errorf("injected lost upload response: %w", syscall.ECONNRESET),
+		persistBeforeErr: true,
+	}
+	bucket.armed.Store(true)
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.SyncThrough(ctx, core, 1); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("SyncThrough() error = %v, want original ECONNRESET", err)
+	}
+	if got := bucket.gets.Load(); got != 0 {
+		t.Fatalf("reset guard readback GETs = %d, want 0", got)
+	}
+	if exists, err := bucket.Exists(ctx, manager.key("archive/head.bin")); err != nil || exists {
+		t.Fatalf("archive HEAD exists=%t err=%v after final reset", exists, err)
+	}
+}
+
 func TestUploadExtentReadbackReconcilesOnlyVerifiedConditionalOrEPIPE(t *testing.T) {
 	epipe := fmt.Errorf("injected lost upload response: %w", syscall.EPIPE)
+	reset := fmt.Errorf("injected lost upload response: %w", syscall.ECONNRESET)
 	accessDenied := errors.New("injected access denied")
 	tests := []struct {
 		name           string
@@ -1097,6 +1131,7 @@ func TestUploadExtentReadbackReconcilesOnlyVerifiedConditionalOrEPIPE(t *testing
 		{name: "EPIPE after exact extent persisted", uploadErr: epipe, persist: true, seed: nil, wantSuccess: true, wantGetCount: 1},
 		{name: "EPIPE with missing extent", uploadErr: epipe, wantGetCount: 1, wantCause: syscall.EPIPE},
 		{name: "EPIPE with corrupt extent", uploadErr: epipe, seed: []byte("corrupt"), wantGetCount: 1, wantCause: syscall.EPIPE},
+		{name: "final reset after exact extent persisted does not reconcile", uploadErr: reset, persist: true, wantCause: syscall.ECONNRESET},
 		{name: "already canceled context does not read back", uploadErr: epipe, cancelBefore: true, wantCause: syscall.EPIPE},
 		{name: "already expired deadline does not read back", uploadErr: epipe, deadlineBefore: true, wantCause: syscall.EPIPE},
 		{name: "cancellation during readback preserves upload error", uploadErr: epipe, cancelOnGet: true, wantGetCount: 1, wantCause: syscall.EPIPE},

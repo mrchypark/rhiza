@@ -110,16 +110,20 @@ starting tests. Each S3 fixture starts its own loopback gateway with a fresh
 temporary POSIX root and generated test credentials; it does not use ambient
 credentials or cloud storage.
 
-The run selects `TestVersityGatewayCostEvidence` and
-`TestVersitySDKRetryEvidence`, followed by `TestCheckpointCost`,
+The run selects `TestVersityGatewayCostEvidence`, `TestVersitySDKRetryEvidence`,
+the focused `TestVersityConditionalLargePutEvidence` and tagged
+`TestArchiveExtentAttributionActualGuard`, followed by `TestCheckpointCost`,
 `TestArchiveGCCost`, and
 `TestCheckpointRestoreCostExercisesNodeRecoveryPathS3`. It then runs the
 build-tagged `TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls`
-lifecycle regression and one `TestNodeForegroundAPICostS3` baseline. These are
-the seven required provider/checkpoint/GC/restore/Node selectors. The actual
-foreground acceptance result is the three-Node Before-ACK Node test; the
-bare-core `pkg/network` component matrix is not in this job. The Node foreground
-measurement retains its 30-second warm-up and 120-second measured window. The
+lifecycle regression (normal and `-race` variants) and three serial
+`TestNodeForegroundAPICostS3` scenarios: baseline, `checkpoint-active`, and
+`archive-cleanup-active`. These are ten core provider/checkpoint/GC/restore/Node
+selectors plus two focused regressions; the focused regressions are not new
+original-#185 gates. The actual foreground
+acceptance result is the three-Node Before-ACK Node test; the bare-core
+`pkg/network` component matrix is not in this job. Each Node foreground
+scenario retains its 30-second warm-up and 120-second measured window. The
 restore case publishes a certified checkpoint through one node, removes only
 the local SQLite files, then verifies that a second `Node.Open` recovers the
 value and reaches ready.
@@ -133,21 +137,36 @@ the timing observer.
 
 The held-gap regression uses async object-store durability to isolate automatic
 Node catch-up and ACK-after-apply behavior; it is mechanism evidence, not a
-foreground cost result. `TestNodeForegroundAPICostS3` uses the production
+foreground cost result. It runs in both normal and `-race` variants; the
+`-race` variant is a supplementary data-race check, not a separate correctness
+claim. `TestNodeForegroundAPICostS3` uses the production
 Before-ACK API path through three opened Nodes and preserves the same 4096-key,
 16-worker, 30-second warm-up, 120-second measurement, and 30-second call bounds.
-It reports per-phase logical API counters, per-Node object-store counter deltas,
-and independent Versity access-log request counts. These Node-path results are
-separate from the existing checkpoint publication and archive-GC selectors;
-they do not replace their metrics or establish checkpoint/GC maintenance
-performance. Both new Node selectors are opt-in within the explicitly
-dispatched evidence job and require the existing `rhiza_local_testhooks` tag.
-The tagged Node run also retains only per-phase transport-error aggregates and
+All three scenarios use that workload. Baseline has no maintenance worker;
+`checkpoint-active` repeatedly exercises archive sync and certified checkpoint
+publication/readback; `archive-cleanup-active` repeatedly invokes the archive
+manager's cleanup path with the explicit 24-hour GC grace configuration. The
+latter is archive-cleanup evidence, not a claim that the full scheduled Node GC
+path ran. Maintenance is serial and bounded to the existing 10-second
+preparation context; it stops scheduling at the measured-window cutoff and
+joins before Node teardown. The report separates maintenance overlap from
+non-overlap API PUT/GET cohorts and reports all-completion and successful p99
+only when each cohort has at least 10,000 samples. Store-counter deltas during
+maintenance overlap include concurrent API traffic, so they are interval totals
+and not attributed exclusively to maintenance. These selectors also report
+per-phase logical API counters, per-Node object-store deltas, and independent
+Versity access-log request counts. The build-tagged Node runs are opt-in within
+the explicitly dispatched evidence job and require `rhiza_local_testhooks`.
+The tagged Node runs also retain only per-phase transport-error aggregates and
 the first sanitized failure detail (request method/status family, error class,
 and elapsed time), including checkpoint cleanup preparation and each sequential
 Node shutdown; phase is sampled at request start. It does not log URLs, keys,
 headers, credentials, or bodies. This is diagnostic attribution, not a claim
 that retry metadata is available.
+The two focused regressions preserve physical errors and unknown retry metadata
+without imposing a universal zero-error or fixed-attempt gate: same-operation
+final result, guard outcome, and exact readback remain mandatory for safe
+attribution. They are focused regressions, not additional original-#185 gates.
 Optional `pkg/network` component diagnostics remain available for focused local
 investigation, but they are outside the required Issue #185 evidence job and are
 not Node API foreground measurements. For example, one baseline component run
@@ -200,5 +219,28 @@ source-reader bytes consumed, so that fallback is not an exact unique-object
 byte measure. `HTTPRequestBodyBytes` is a separate transport-body count and can
 include S3 framing/signatures. The Node result's legacy
 `attempted_upload_bytes` label refers to `BytesUploaded` with this reader-work
-meaning. The local Versity results are local S3 compatibility evidence only—not
-AWS/GCS qualification or a release gate.
+meaning. `observed_request_identities` and `observed_request_repeats` group
+same-identity `RoundTrip` calls only within one metered logical bucket
+operation. This supplemental observer is disabled by default on `NewBucket`;
+the cost fixtures explicitly mark the context passed to `NewBucketWithContext`
+or `Node.Open`. `replay_grouping_enabled` distinguishes disabled counters from
+an observed zero-repeat result. Identity is a private digest of method, URL
+components, declared length, and selected range/conditional headers; request
+bodies are not compared. A repeat is an observed repeat, not proof of an SDK
+retry; changed request identity, absent context, capacity loss, or an open reader at snapshot
+can leave grouping incomplete. `request_grouping_unknown` counts observed
+RoundTrip calls that could not be grouped; capacity/incomplete counters and
+active-operation/open-reader gauges expose tracker limitations. Retries made
+below the wrapped RoundTripper are invisible to these counters and require
+independent server records to observe. These measures do not replace MinIO/AWS
+retry metadata, which remains separately known or unknown. The local Versity
+results are local S3 compatibility evidence only—not AWS/GCS qualification or a
+release gate.
+
+`go test ./internal/objstore -run '^$' -bench '^BenchmarkReplayGroupingOverhead$'`
+compares the metered transport with and without one tracked logical operation
+using a synthetic RoundTrip. On the recorded Apple M1 run, tracking measured
+846.7 ns/op and 984 B/op (10 allocs), versus 175.6 ns/op and 248 B/op
+(5 allocs) for the disabled transport-only case. This microbenchmark isolates
+the added grouping work only approximately; it is not an end-to-end performance
+result.
