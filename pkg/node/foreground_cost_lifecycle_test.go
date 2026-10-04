@@ -311,17 +311,31 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	if acknowledged := seedAPIAcknowledged.Load(); acknowledged != nodeForegroundKeys {
 		t.Fatalf("seed API acknowledgments=%d, want %d", acknowledged, nodeForegroundKeys)
 	}
-	if !nodeForegroundPreparationFinished(preparationCtx, preparationDeadline, seedEnd, stopPreparationBridge) {
-		cancel()
-		t.Fatalf("Node foreground preparation did not finish within its named allowance: end=%s deadline=%s preparation_error=%v", seedEnd.UTC().Format(time.RFC3339Nano), preparationDeadline.UTC().Format(time.RFC3339Nano), preparationCtx.Err())
-	}
-	preparationCompleted = true
-	preparationCancel()
 	seedStoreEnd := snapshotNodeStoreStats(nodes)
 	logNodeStoreDelta(t, "seed", ids, seedStoreStart, seedStoreEnd)
 	seedEndRequests, seedServerEndErr := nodeVersityRequestCount(gateway)
 	logVersityRequestDelta(t, "seed", seedServerStart, seedServerStartErr, seedEndRequests, seedServerEndErr)
 	t.Logf("node_foreground_seed_logical_puts=%d node_foreground_seed_payload_bytes_api_acknowledged=%d", nodeForegroundKeys, nodeForegroundKeys*nodeForegroundValueBytes)
+	if scenario == "archive-cleanup-active" {
+		transportObserver.SetPhase("certified_gc_preparation")
+		certifiedStart := time.Now()
+		certifiedErr := prepareNodeForegroundCertifiedGC(preparationCtx, nodes[0], t.TempDir())
+		preparationEnd = time.Now()
+		logNodeStoreDelta(t, "certified_gc_preparation", ids, seedStoreEnd, snapshotNodeStoreStats(nodes))
+		preparationServerEnd, preparationServerEndErr := nodeVersityRequestCount(gateway)
+		logVersityRequestDelta(t, "certified_gc_preparation", seedEndRequests, seedServerEndErr, preparationServerEnd, preparationServerEndErr)
+		t.Logf("node_foreground_certified_gc_preparation elapsed=%s error=%t", preparationEnd.Sub(certifiedStart), certifiedErr != nil)
+		if certifiedErr != nil {
+			t.Fatalf("prepare certified archive coverage before GC measurement: %v", certifiedErr)
+		}
+	}
+	preparationEnd = time.Now()
+	if !nodeForegroundPreparationFinished(preparationCtx, preparationDeadline, preparationEnd, stopPreparationBridge) {
+		cancel()
+		t.Fatalf("Node foreground preparation did not finish within its named allowance: end=%s deadline=%s preparation_error=%v", preparationEnd.UTC().Format(time.RFC3339Nano), preparationDeadline.UTC().Format(time.RFC3339Nano), preparationCtx.Err())
+	}
+	preparationCompleted = true
+	preparationCancel()
 
 	options := func(duration time.Duration, maintenance *nodeForegroundMaintenance) foregroundcosttest.Options {
 		var maintenanceSnapshot func() (bool, uint64)
@@ -1114,6 +1128,77 @@ func TestNodeArchiveGCPhaseTraceFiniteTerminals(t *testing.T) {
 	}
 }
 
+func prepareNodeForegroundCertifiedGC(ctx context.Context, node *Node, sharedReadDir string) error {
+	if err := prepareNodeCheckpointBeforeShutdown(ctx, node, sharedReadDir); err != nil {
+		return err
+	}
+	seal, sealed, err := node.core.LatestCheckpointSeal()
+	if err != nil {
+		return fmt.Errorf("read prepared GC checkpoint seal: %w", err)
+	}
+	if !sealed || uint64(node.archive.Tip()) < uint64(seal.DecisionSlot) {
+		return fmt.Errorf("prepared GC checkpoint lacks certified archive coverage: sealed=%t archive_tip=%d seal_slot=%d", sealed, node.archive.Tip(), seal.DecisionSlot)
+	}
+	return nil
+}
+
+func TestNodeForegroundCertifiedGCPreparationRequiresRealSealAndCurrent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	n := New(&types.ExecutionConfig{
+		DataDir: t.TempDir(), ClusterID: "certified-gc-preparation", NodeID: "n1",
+		Members: []quepaxa.Member{{ID: "n1"}}, ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(),
+		ObjStoreSyncInterval: time.Hour, ObjStoreDurability: types.ObjectStoreDurabilityBeforeAck,
+	})
+	if err := n.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := n.Shutdown(); err != nil {
+			t.Errorf("shutdown prepared node: %v", err)
+		}
+	}()
+	if seal, sealed, err := n.core.LatestCheckpointSeal(); err != nil || sealed {
+		t.Fatalf("initial checkpoint seal=%+v sealed=%t error=%v, want absent", seal, sealed, err)
+	}
+	initial, err := readNodeForegroundSharedCurrent(ctx, n, t.TempDir())
+	if err != nil || initial != nil {
+		t.Fatalf("initial fresh shared CURRENT=%v error=%v, want absent", initial, err)
+	}
+	api, err := n.API()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.KVPut(ctx, network.KVMutationRequest{RequestID: "certified-gc-preparation", Key: "seed", Value: []byte("value")}); err != nil {
+		t.Fatalf("seed live node: %v", err)
+	}
+	canceled, stop := context.WithCancel(ctx)
+	stop()
+	if err := prepareNodeForegroundCertifiedGC(canceled, n, t.TempDir()); err == nil {
+		t.Fatal("canceled certified preparation was accepted before measurement")
+	}
+	if seal, sealed, err := n.core.LatestCheckpointSeal(); err != nil || sealed {
+		t.Fatalf("canceled preparation published a seal: seal=%+v sealed=%t error=%v", seal, sealed, err)
+	}
+	if err := prepareNodeForegroundCertifiedGC(ctx, n, t.TempDir()); err != nil {
+		t.Fatalf("prepare real certified checkpoint while node is live: %v", err)
+	}
+	seal, sealed, err := n.core.LatestCheckpointSeal()
+	if err != nil || !sealed {
+		t.Fatalf("prepared checkpoint seal=%+v sealed=%t error=%v", seal, sealed, err)
+	}
+	root := n.checkpoints.Latest()
+	shared, err := readNodeForegroundSharedCurrent(ctx, n, t.TempDir())
+	if err != nil || root == nil || shared == nil {
+		t.Fatalf("prepared root=%v fresh CURRENT=%v error=%v", root, shared, err)
+	}
+	if root.Index != uint64(seal.Index) || root.RootHash != seal.RootHash || root.Hash != seal.StateHash ||
+		shared.Index != root.Index || shared.RootHash != root.RootHash || shared.Hash != root.Hash ||
+		uint64(n.archive.Tip()) < uint64(seal.DecisionSlot) {
+		t.Fatalf("prepared seal/root/CURRENT/archive coverage mismatch: root=%d shared=%d seal=%d archive_tip=%d seal_slot=%d", root.Index, shared.Index, seal.Index, n.archive.Tip(), seal.DecisionSlot)
+	}
+}
+
 func runNodeForegroundArchiveCleanup(t *testing.T, ctx context.Context, node *Node, sharedReadDir string, phaseTrace *nodeArchiveGCPhaseTrace) (nodeForegroundMaintenanceResult, error) {
 	if node == nil || node.archive == nil || node.core == nil || node.bucket == nil {
 		return nodeForegroundMaintenanceResult{}, fmt.Errorf("archive cleanup components unavailable")
@@ -1644,7 +1729,7 @@ func nodeArchiveExtentAttributionAllowed(row objmetrics.ExtentUploadAttributionA
 		return false
 	}
 	switch row.Phase {
-	case "setup", "seed", "warmup", "measurement", "cleanup_preparation",
+	case "setup", "seed", "certified_gc_preparation", "warmup", "measurement", "cleanup_preparation",
 		"checkpoint-active_overlap", "archive-cleanup-active_overlap",
 		"pre_shutdown_n1_observation", "pre_shutdown_n2_observation", "pre_shutdown_n3_observation",
 		"shutdown_n1", "shutdown_n2", "shutdown_n3":
@@ -1678,6 +1763,7 @@ func TestNodeArchiveExtentAttributionRowGate(t *testing.T) {
 		want bool
 	}{
 		{name: "typed_condition_verified", want: true},
+		{name: "certified_gc_preparation_verified", edit: func(r *objmetrics.ExtentUploadAttributionAggregate) { r.Phase = "certified_gc_preparation" }, want: true},
 		{name: "epipe_verified", edit: func(r *objmetrics.ExtentUploadAttributionAggregate) { r.FinalSDKClass = "broken_pipe" }, want: true},
 		{name: "success", edit: func(r *objmetrics.ExtentUploadAttributionAggregate) {
 			r.FinalSDKClass, r.GuardOutcome = "success", "not_attempted"

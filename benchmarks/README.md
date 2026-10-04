@@ -129,6 +129,11 @@ two-minute preparation budget, followed by the unchanged post-seed warm-up,
 measurement, drain, and cleanup reserve (4m42s) and an 18-second margin. This
 changes neither the measurement window nor any API, durability, checkpoint,
 teardown, or GC guarantee.
+Only `archive-cleanup-active` establishes a real certified checkpoint, matching
+core seal, and fresh shared CURRENT before warm-up, within that same two-minute
+preparation budget. Its setup I/O is accounted separately; this precondition is
+not GC-work evidence and does not weaken the post-cleanup certified
+seal/shared-CURRENT guard.
 The restore case publishes a certified checkpoint through one node, removes only
 the local SQLite files, then verifies that a second `Node.Open` recovers the
 value and reaches ready.
