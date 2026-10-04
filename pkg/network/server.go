@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -187,6 +188,43 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 		return 0, fmt.Errorf("read barrier control value is required")
 	}
 	return s.propose(ctx, value)
+}
+
+// ProposeCheckpointBarrier is reserved for the checkpoint publisher's internal
+// read barrier. General control proposals retain ProposeControl semantics.
+func (s *Server) ProposeCheckpointBarrier(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	return retryCheckpointBarrier(ctx, value, s.ProposeControl)
+}
+
+func retryCheckpointBarrier(ctx context.Context, value []byte, propose func(context.Context, []byte) (quepaxa.Slot, error)) (quepaxa.Slot, error) {
+	const maxAttempts = 50
+	const retryDelay = 20 * time.Millisecond
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		slot, err := propose(ctx, value)
+		if err == nil {
+			return slot, nil
+		}
+		// This private concrete value is returned only before proposal
+		// registration. A wrapped, joined, or otherwise ambiguous error is
+		// terminal, even when errors.Is also matches ErrOverloaded.
+		if _, preAdmission := err.(proposalAdmissionOverload); !preAdmission || slot != 0 || attempt+1 == maxAttempts {
+			return slot, err
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("network:checkpoint-barrier:typed-pre-admission-refused")
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		}
+	}
+	panic("unreachable checkpoint barrier retry state")
 }
 
 func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {

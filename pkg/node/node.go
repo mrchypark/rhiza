@@ -875,16 +875,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 			return floor
 		}, func(ctx context.Context, reserved uint64) error {
-			for material.Tip() < reserved {
-				var nonce [types.ReadBarrierNonceSize]byte
-				if _, err := rand.Read(nonce[:]); err != nil {
-					return err
-				}
-				if _, err := server.ProposeControl(ctx, types.EncodeReadBarrier(nonce)); err != nil {
-					return err
-				}
-			}
-			return nil
+			return advanceCheckpointReadBarriers(ctx, reserved, material, server)
 		})
 		n.checkpointer.ConfigurePublication(
 			func() bool {
@@ -990,6 +981,19 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				}
 			}
 		}()
+	}
+	return nil
+}
+
+func advanceCheckpointReadBarriers(ctx context.Context, reserved uint64, material *materializer.Materializer, server *network.Server) error {
+	for material.Tip() < reserved {
+		var nonce [types.ReadBarrierNonceSize]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return err
+		}
+		if _, err := server.ProposeCheckpointBarrier(ctx, types.EncodeReadBarrier(nonce)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

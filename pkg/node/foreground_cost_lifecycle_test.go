@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -327,6 +328,8 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		transportObserver.SetPhase("measurement")
 		maintenance.log(t, nodeForegroundMeasure)
 		if firstErr := maintenance.firstError(); firstErr != nil {
+			types, status := nodeForegroundMaintenanceErrorTypeChain(firstErr)
+			t.Logf("node_foreground_maintenance_error_type_chain status=%s types=%v", status, types)
 			t.Errorf("Node foreground %s maintenance failed: %v", scenario, firstErr)
 		}
 		if maintenance.completedWork() == 0 {
@@ -372,6 +375,48 @@ func TestNodeForegroundPreparationUsesFreshCanceledContexts(t *testing.T) {
 		if !errors.Is(ctx.Err(), context.Canceled) {
 			t.Errorf("preparation context %d after callback = %v, want canceled", i, ctx.Err())
 		}
+	}
+}
+
+type nodeForegroundCyclicDiagnosticError struct{}
+
+func (nodeForegroundCyclicDiagnosticError) Error() string { return "cycle" }
+func (nodeForegroundCyclicDiagnosticError) Unwrap() error {
+	return nodeForegroundCyclicDiagnosticError{}
+}
+
+func TestNodeForegroundMaintenanceErrorTypeChain(t *testing.T) {
+	const secret = "private-key-and-url-must-not-appear"
+	tests := []struct {
+		name       string
+		err        error
+		wantTypes  []string
+		wantStatus string
+	}{
+		{"nil", nil, nil, "none"},
+		{"wrapped overload", fmt.Errorf("%s: %w", secret, fmt.Errorf("inner %s: %w", secret, network.ErrOverloaded)), []string{"*fmt.wrapError", "*fmt.wrapError", "*errors.errorString"}, "complete"},
+		{"bare overload remains an error", network.ErrOverloaded, []string{"*errors.errorString"}, "complete"},
+		{"canceled remains an error", fmt.Errorf("canceled %s: %w", secret, context.Canceled), []string{"*fmt.wrapError", "*errors.errorString"}, "complete"},
+		{"joined branches are not a single chain", errors.Join(fmt.Errorf("%s: %w", secret, network.ErrOverloaded), context.Canceled), []string{"*errors.joinError"}, "unknown_branch"},
+		{"cycle is explicitly unknown", nodeForegroundCyclicDiagnosticError{}, []string{"node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError", "node.nodeForegroundCyclicDiagnosticError"}, "unknown_bounded"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotTypes, gotStatus := nodeForegroundMaintenanceErrorTypeChain(tt.err)
+			if gotStatus != tt.wantStatus || !reflect.DeepEqual(gotTypes, tt.wantTypes) {
+				t.Fatalf("type chain=%v status=%s, want %v %s", gotTypes, gotStatus, tt.wantTypes, tt.wantStatus)
+			}
+			if len(gotTypes) > 8 || strings.Contains(strings.Join(gotTypes, " "), secret) {
+				t.Fatalf("type-only diagnostic exceeded bound or leaked payload: %v", gotTypes)
+			}
+			if tt.err != nil {
+				maintenance := &nodeForegroundMaintenance{}
+				maintenance.record(nodeForegroundMaintenanceResult{}, 0, tt.err)
+				if maintenance.firstError() != tt.err || maintenance.failures != 1 || maintenance.completedWork() != 0 {
+					t.Fatalf("diagnostic changed maintenance failure accounting")
+				}
+			}
+		})
 	}
 }
 
@@ -708,6 +753,27 @@ func (m *nodeForegroundMaintenance) firstError() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.firstErr
+}
+
+// nodeForegroundMaintenanceErrorTypeChain emits only concrete Go type names.
+// It follows one-cause Unwrap chains, not joined branches; the bound ends cycles.
+func nodeForegroundMaintenanceErrorTypeChain(err error) ([]string, string) {
+	if err == nil {
+		return nil, "none"
+	}
+	const limit = 8
+	types := make([]string, 0, limit)
+	for err != nil && len(types) < limit {
+		types = append(types, reflect.TypeOf(err).String())
+		if _, branched := err.(interface{ Unwrap() []error }); branched {
+			return types, "unknown_branch"
+		}
+		err = errors.Unwrap(err)
+	}
+	if err != nil {
+		return types, "unknown_bounded"
+	}
+	return types, "complete"
 }
 
 func (m *nodeForegroundMaintenance) completedWork() int {
