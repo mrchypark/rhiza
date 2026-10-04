@@ -197,7 +197,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 	}
 	currentRoot := m.Latest()
 	key := m.key("checkpoint/PUBLISHER")
-	for range 4 {
+	for attempt := 1; attempt <= 4; attempt++ {
 		current, err := m.readPublisherClaim(objmetrics.WithExpectedNotFound(ctx))
 		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			return nil, err
@@ -213,6 +213,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 				return nil, ErrPublisherFenced
 			}
 			if current.LeaseUntilMS > now.UnixMilli() {
+				observePublisherBusy(ctx, activePublisherBusyObservation("generation_claim_active", "generation", attempt, current, now.UnixMilli()))
 				return nil, ErrPublisherBusy
 			}
 			if current.Generation == ^uint64(0) {
@@ -232,6 +233,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 		}
 		return m.confirmPublisherClaim(ctx, *claim)
 	}
+	observePublisherBusy(ctx, exhaustedPublisherBusyObservation("generation_claim_conditional_exhausted", "generation", 4))
 	return nil, ErrPublisherBusy
 }
 
@@ -249,7 +251,7 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 		return nil, fmt.Errorf("checkpoint publisher requires conditional object writes")
 	}
 	key := m.key("checkpoint/PUBLISHER")
-	for range 4 {
+	for attempt := 1; attempt <= 4; attempt++ {
 		// The first publisher claim is created from an absent pointer. This is a
 		// normal conditional-publication probe, not an S3 client failure.
 		current, err := m.readPublisherClaim(objmetrics.WithExpectedNotFound(ctx))
@@ -258,6 +260,7 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 		}
 		now := time.Now()
 		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
+			observePublisherBusy(ctx, activePublisherBusyObservation("publisher_claim_active", purpose, attempt, current, now.UnixMilli()))
 			return nil, ErrPublisherBusy
 		}
 		generation, floor := uint64(1), minExclusive
@@ -287,6 +290,7 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 		}
 		return m.confirmPublisherClaim(ctx, *claim)
 	}
+	observePublisherBusy(ctx, exhaustedPublisherBusyObservation("publisher_claim_conditional_exhausted", purpose, 4))
 	return nil, ErrPublisherBusy
 }
 

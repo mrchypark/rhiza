@@ -366,19 +366,31 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	requireNodeForegroundBudget(t, testDeadline, nodeForegroundMeasure+nodeForegroundCallTimeout+nodeForegroundCleanup, "after warmup accounting, before measurement")
 	var maintenance *nodeForegroundMaintenance
 	var archivePhaseTrace *nodeArchiveGCPhaseTrace
+	var publisherBusyOperationID atomic.Uint64
+	var publisherBusyFailures nodeForegroundPublisherBusyFailures
 	if scenario != "baseline" {
 		if scenario == "archive-cleanup-active" {
 			archivePhaseTrace = newNodeArchiveGCPhaseTrace()
 		}
 		operation := func(operationCtx context.Context) (nodeForegroundMaintenanceResult, error) {
+			operationID := publisherBusyOperationID.Add(1)
+			collector := &nodeForegroundPublisherBusyCollector{}
+			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, collector.observe)
+			var result nodeForegroundMaintenanceResult
+			var err error
 			switch scenario {
 			case "checkpoint-active":
-				return runNodeForegroundCheckpoint(operationCtx, nodes[0], maintenanceStateDir)
+				result, err = runNodeForegroundCheckpoint(operationCtx, nodes[0], maintenanceStateDir)
 			case "archive-cleanup-active":
-				return runNodeForegroundArchiveCleanup(t, operationCtx, nodes[0], maintenanceStateDir, archivePhaseTrace)
+				result, err = runNodeForegroundArchiveCleanup(t, operationCtx, nodes[0], maintenanceStateDir, archivePhaseTrace)
 			default:
-				return nodeForegroundMaintenanceResult{}, fmt.Errorf("unsupported maintenance scenario %q", scenario)
+				err = fmt.Errorf("unsupported maintenance scenario %q", scenario)
 			}
+			if errors.Is(err, checkpoint.ErrPublisherBusy) {
+				events, overflow := collector.snapshot()
+				publisherBusyFailures.record(operationID, events, overflow)
+			}
+			return result, err
 		}
 		maintenance = newNodeForegroundMaintenance(ctx, scenario, transportObserver, operation)
 		t.Cleanup(maintenance.stopAndWait)
@@ -401,6 +413,9 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		if firstErr := maintenance.firstError(); firstErr != nil {
 			types, status := nodeForegroundMaintenanceErrorTypeChain(firstErr)
 			t.Logf("node_foreground_maintenance_error_type_chain status=%s types=%v", status, types)
+			if errors.Is(firstErr, checkpoint.ErrPublisherBusy) {
+				publisherBusyFailures.log(t)
+			}
 			t.Errorf("Node foreground %s maintenance failed: %v", scenario, firstErr)
 		}
 		if maintenance.completedWork() == 0 {
@@ -551,6 +566,30 @@ func TestNodeForegroundMaintenanceStopsSchedulingAndJoinsInflightWork(t *testing
 	}
 }
 
+func TestNodeForegroundPublisherBusyCollectorBoundsConcurrentEvents(t *testing.T) {
+	collector := &nodeForegroundPublisherBusyCollector{}
+	var group sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			collector.observe(checkpoint.PublisherBusyObservation{Source: "test", Attempt: i + 1})
+		}(i)
+	}
+	group.Wait()
+	events, overflow := collector.snapshot()
+	if len(events) != nodeForegroundPublisherBusyEventLimit || overflow != 4 {
+		t.Fatalf("events=%d overflow=%d", len(events), overflow)
+	}
+
+	failures := &nodeForegroundPublisherBusyFailures{}
+	failures.record(2, events, overflow)
+	failures.record(3, []checkpoint.PublisherBusyObservation{{Source: "later"}}, 0)
+	if failures.failure == nil || failures.failure.operationID != 2 || len(failures.failure.events) != nodeForegroundPublisherBusyEventLimit || failures.failure.overflow != 4 {
+		t.Fatalf("failure=%+v", failures.failure)
+	}
+}
+
 func TestNodeForegroundArchiveCleanupCompletionClassification(t *testing.T) {
 	tests := []struct {
 		name, want string
@@ -651,6 +690,67 @@ type nodeForegroundMaintenanceResult struct {
 }
 
 type nodeForegroundMaintenanceOperation func(context.Context) (nodeForegroundMaintenanceResult, error)
+
+const nodeForegroundPublisherBusyEventLimit = 4
+
+type nodeForegroundPublisherBusyCollector struct {
+	mu       sync.Mutex
+	events   []checkpoint.PublisherBusyObservation
+	overflow uint64
+}
+
+func (c *nodeForegroundPublisherBusyCollector) observe(event checkpoint.PublisherBusyObservation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) < nodeForegroundPublisherBusyEventLimit {
+		c.events = append(c.events, event)
+		return
+	}
+	c.overflow++
+}
+
+func (c *nodeForegroundPublisherBusyCollector) snapshot() ([]checkpoint.PublisherBusyObservation, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]checkpoint.PublisherBusyObservation(nil), c.events...), c.overflow
+}
+
+type nodeForegroundPublisherBusyFailure struct {
+	operationID uint64
+	events      []checkpoint.PublisherBusyObservation
+	overflow    uint64
+}
+
+type nodeForegroundPublisherBusyFailures struct {
+	mu      sync.Mutex
+	failure *nodeForegroundPublisherBusyFailure
+}
+
+func (f *nodeForegroundPublisherBusyFailures) record(operationID uint64, events []checkpoint.PublisherBusyObservation, overflow uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failure == nil {
+		f.failure = &nodeForegroundPublisherBusyFailure{operationID: operationID, events: events, overflow: overflow}
+	}
+}
+
+func (f *nodeForegroundPublisherBusyFailures) log(t *testing.T) {
+	f.mu.Lock()
+	failure := f.failure
+	f.mu.Unlock()
+	if failure == nil || len(failure.events) == 0 {
+		var operationID uint64
+		var overflow uint64
+		if failure != nil {
+			operationID, overflow = failure.operationID, failure.overflow
+		}
+		t.Logf("node_foreground_publisher_busy operation_id=%d source=%q events=0 overflow=%d attribution=unattributed", operationID, "unattributed_propagated", overflow)
+		return
+	}
+	for _, event := range failure.events {
+		t.Logf("node_foreground_publisher_busy operation_id=%d source=%q requested_purpose=%q attempt=%d active_claim=%t purpose=%q purpose_truncated=%t owner_id=%q owner_id_truncated=%t generation=%d reserved_index=%d bound_index=%d lease_remaining_ms=%d overflow=%d", failure.operationID, event.Source, event.RequestedPurpose, event.Attempt, event.ActiveClaim, event.Purpose, event.PurposeTruncated, event.OwnerID, event.OwnerIDTruncated, event.Generation, event.ReservedIndex, event.BoundIndex, event.LeaseRemainingMillis, failure.overflow)
+	}
+}
 
 type nodeForegroundMaintenance struct {
 	mode           string
