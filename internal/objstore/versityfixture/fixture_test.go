@@ -2,6 +2,8 @@ package versityfixture
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -62,13 +64,16 @@ func TestPrepareEvidenceDirRequiresAbsolutePath(t *testing.T) {
 
 func TestChildSupervisorNormalCloseAndForcedExit(t *testing.T) {
 	t.Run("normal close", func(t *testing.T) {
-		assertFakeChildSupervisorStops(t, false, false)
+		assertFakeChildSupervisorStops(t, false, false, false)
 	})
 	t.Run("ignores interrupt then forced exit", func(t *testing.T) {
-		assertFakeChildSupervisorStops(t, true, false)
+		assertFakeChildSupervisorStops(t, true, false, false)
 	})
 	t.Run("failed state probe cannot treat live child as exited", func(t *testing.T) {
-		assertFakeChildSupervisorStops(t, true, true)
+		assertFakeChildSupervisorStops(t, true, true, false)
+	})
+	t.Run("deadline before failed probe completes still reaps child", func(t *testing.T) {
+		assertFakeChildSupervisorStops(t, true, true, true)
 	})
 }
 
@@ -158,13 +163,24 @@ func TestChildSupervisorFakeChildHelper(t *testing.T) {
 	}
 	if os.Getenv("RHIZA_SUPERVISOR_IGNORE_INT") == "1" {
 		signal.Ignore(os.Interrupt)
+		writeFakeChildReady(t)
 		for {
 			time.Sleep(time.Hour)
 		}
 	}
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
+	writeFakeChildReady(t)
 	<-interrupt
+}
+
+func writeFakeChildReady(t *testing.T) {
+	t.Helper()
+	if path := os.Getenv("RHIZA_SUPERVISOR_CHILD_READY"); path != "" {
+		if err := os.WriteFile(path, []byte("ready\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestChildSupervisorAbruptParentHelper(t *testing.T) {
@@ -195,11 +211,12 @@ func TestChildSupervisorAbruptParentHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProbe bool) {
+func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProbe, holdProbe bool) {
 	t.Helper()
 	tempDir := t.TempDir()
 	outputPath := filepath.Join(tempDir, "server-output.log")
 	childPIDPath := filepath.Join(tempDir, "child.pid")
+	childReadyPath := filepath.Join(tempDir, "child-ready")
 	output, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -211,20 +228,42 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 	env := append(os.Environ(),
 		"RHIZA_SUPERVISOR_FAKE_CHILD=1",
 		"RHIZA_SUPERVISOR_CHILD_PID="+childPIDPath,
+		"RHIZA_SUPERVISOR_CHILD_READY="+childReadyPath,
 		"RHIZA_SUPERVISOR_IGNORE_INT="+ignore,
 	)
 	probePath := filepath.Join(tempDir, "ps-probe.log")
+	probeEnteredPath := filepath.Join(tempDir, "ps-entered")
+	probeReleasePath := filepath.Join(tempDir, "ps-release")
 	if failStateProbe {
 		fakeBin := filepath.Join(tempDir, "bin")
 		if err := os.Mkdir(fakeBin, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		fakePS := "#!/bin/sh\nprintf 'called\\n' >> \"$RHIZA_SUPERVISOR_PS_PROBE_LOG\"\nexit 1\n"
+		fakePS := "#!/bin/sh\nprintf 'called\\n' >> \"$RHIZA_SUPERVISOR_PS_PROBE_LOG\"\n"
+		if holdProbe {
+			fakePS += "if [ ! -f \"$RHIZA_SUPERVISOR_PS_RELEASE\" ] && [ ! -f \"$RHIZA_SUPERVISOR_PS_ENTERED\" ]; then\n" +
+				"  printf 'entered\\n' > \"$RHIZA_SUPERVISOR_PS_ENTERED\" || exit 1\n" +
+				"  waited=0\n" +
+				"  while [ ! -f \"$RHIZA_SUPERVISOR_PS_RELEASE\" ] && [ \"$waited\" -lt 100 ]; do\n" +
+				"    sleep 0.1\n" +
+				"    waited=$((waited + 1))\n" +
+				"  done\n" +
+				"  if [ ! -f \"$RHIZA_SUPERVISOR_PS_RELEASE\" ]; then\n" +
+				"    printf 'gate_timeout\\n' >> \"$RHIZA_SUPERVISOR_PS_PROBE_LOG\"\n" +
+				"    exit 1\n" +
+				"  fi\n" +
+				"fi\n"
+		}
+		fakePS += "exit 1\n"
 		if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(fakePS), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		env = append(env, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 			"RHIZA_SUPERVISOR_PS_PROBE_LOG="+probePath)
+		if holdProbe {
+			env = append(env, "RHIZA_SUPERVISOR_PS_ENTERED="+probeEnteredPath,
+				"RHIZA_SUPERVISOR_PS_RELEASE="+probeReleasePath)
+		}
 	}
 	completionPath := filepath.Join(tempDir, "gateway-complete")
 	cmd, writer, err := startSupervisedChild(outputPath, completionPath, []string{
@@ -235,6 +274,30 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 		t.Fatal(err)
 	}
 	server := &Server{cmd: cmd, shutdownPipe: writer, done: make(chan struct{})}
+	var closeErr error
+	var deferredReleaseErr error
+	var beforeCleanupState string
+	bounded := func(path string) string {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err.Error()
+		}
+		if len(contents) > 256 {
+			contents = contents[:256]
+		}
+		return string(contents)
+	}
+	snapshot := func() string {
+		done := false
+		select {
+		case <-server.done:
+			done = true
+		default:
+		}
+		return fmt.Sprintf("firstClose=%v done=%t childPID=%q probes=%q release=%q output=%q completion=%q",
+			closeErr, done, bounded(childPIDPath), bounded(probePath),
+			bounded(probeReleasePath), bounded(outputPath), bounded(completionPath))
+	}
 	go func() {
 		waitErr := cmd.Wait()
 		server.mu.Lock()
@@ -243,6 +306,19 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 		close(server.done)
 	}()
 	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("supervisor failure state before cleanup: %s; deferred release error: %v; after cleanup: %s",
+				beforeCleanupState, deferredReleaseErr, snapshot())
+		}
+	})
+	t.Cleanup(func() {
+		beforeCleanupState = snapshot()
+		if holdProbe {
+			deferredReleaseErr = os.WriteFile(probeReleasePath, []byte("release\n"), 0o600)
+			if deferredReleaseErr != nil {
+				t.Errorf("release held ps probe: %v", deferredReleaseErr)
+			}
+		}
 		select {
 		case <-server.done:
 			return
@@ -260,18 +336,55 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 		case <-time.After(time.Second):
 		}
 	})
-	waitForFile(t, childPIDPath)
+	waitForFile(t, childReadyPath)
 	closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	closeErr := server.Close(closeCtx)
-	if ignoreInterrupt && closeErr == nil {
+	if holdProbe {
+		closeResult := make(chan error, 1)
+		go func() { closeResult <- server.Close(closeCtx) }()
+		waitForFile(t, probeEnteredPath)
+		<-closeCtx.Done()
+		select {
+		case closeErr = <-closeResult:
+		case <-time.After(time.Second):
+			t.Fatal("Close did not return after caller deadline")
+		}
+		if !errors.Is(closeErr, context.DeadlineExceeded) {
+			t.Fatalf("Close before probe release = %v, want caller deadline", closeErr)
+		}
+		select {
+		case <-server.done:
+			t.Fatal("supervisor completed before held state probe was released")
+		default:
+		}
+		if contents, err := os.ReadFile(outputPath); err != nil || strings.Contains(string(contents), "VERSITY_CHILD_REAPED") {
+			t.Fatalf("child wait recorded before probe release: %q (%v)", contents, err)
+		}
+		if _, err := os.Stat(completionPath); !os.IsNotExist(err) {
+			t.Fatalf("completion marker existed before probe release: %v", err)
+		}
+		if err := os.WriteFile(probeReleasePath, []byte("release\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		closeErr = server.Close(closeCtx)
+	}
+	select {
+	case <-server.done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("supervisor did not finish: %s", snapshot())
+	}
+	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer terminalCancel()
+	terminalErr := server.Close(terminalCtx)
+	if ignoreInterrupt && terminalErr == nil {
 		t.Fatal("Close succeeded despite force-killing interrupt-ignoring child")
 	}
-	if !ignoreInterrupt && closeErr != nil {
-		t.Fatalf("Close failed after graceful child exit: %v", closeErr)
+	if !ignoreInterrupt && (closeErr != nil || terminalErr != nil) {
+		t.Fatalf("Close failed after graceful child exit: first=%v terminal=%v", closeErr, terminalErr)
 	}
-	if err := server.Close(closeCtx); (err == nil) != (closeErr == nil) {
-		t.Fatalf("repeated Close changed result: first=%v second=%v", closeErr, err)
+	if err := server.Close(terminalCtx); (err == nil) != (terminalErr == nil) || (err != nil && err.Error() != terminalErr.Error()) {
+		t.Fatalf("repeated Close changed terminal result: first=%v terminal=%v repeated=%v", closeErr, terminalErr, err)
 	}
 	contents, err := os.ReadFile(outputPath)
 	if err != nil {
@@ -288,6 +401,9 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 		probes, err := os.ReadFile(probePath)
 		if err != nil || len(probes) == 0 {
 			t.Fatalf("failed ps probe was not exercised: %q (%v)", probes, err)
+		}
+		if strings.Contains(string(probes), "gate_timeout") {
+			t.Fatalf("held ps probe timed out before release: %q", probes)
 		}
 	}
 	waitForFileText(t, completionPath, "gateway_reaped=true")
