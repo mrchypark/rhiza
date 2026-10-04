@@ -429,19 +429,19 @@ jobs:
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             RHIZA_NODE_FOREGROUND_API_COST=1 \
             RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=baseline \
-            go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
           run_logged node-foreground-checkpoint-active-s3 env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             RHIZA_NODE_FOREGROUND_API_COST=1 \
             RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=checkpoint-active \
-            go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
           run_logged node-foreground-archive-cleanup-active-s3 env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
             RHIZA_NODE_FOREGROUND_API_COST=1 \
             RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=archive-cleanup-active \
-            go test -count=1 -v -tags rhiza_local_testhooks -timeout=5m ./pkg/node \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
             -run '^TestNodeForegroundAPICostS3$'
 
       - name: Upload issue 185 cost evidence

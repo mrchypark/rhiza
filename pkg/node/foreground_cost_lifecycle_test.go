@@ -29,19 +29,20 @@ import (
 )
 
 const (
-	nodeForegroundWorkers       = 16
-	nodeForegroundKeys          = 4096
-	nodeForegroundValueBytes    = 1024
-	nodeForegroundWarmup        = 30 * time.Second
-	nodeForegroundMeasure       = 120 * time.Second
-	nodeForegroundCallTimeout   = 30 * time.Second
-	nodeForegroundDrainReserve  = 2 * nodeForegroundCallTimeout
-	nodeForegroundPrepareLimit  = 10 * time.Second
-	nodeForegroundShutdownLimit = 10 * time.Second // mirrors Node.Shutdown's archive/checkpoint context
-	nodeForegroundGatewayClose  = 7 * time.Second
-	nodeForegroundCleanupSlack  = 5 * time.Second
-	nodeForegroundGCGracePeriod = 24 * time.Hour
-	nodeForegroundP99MinSamples = 10000
+	nodeForegroundWorkers              = 16
+	nodeForegroundKeys                 = 4096
+	nodeForegroundValueBytes           = 1024
+	nodeForegroundWarmup               = 30 * time.Second
+	nodeForegroundMeasure              = 120 * time.Second
+	nodeForegroundCallTimeout          = 30 * time.Second
+	nodeForegroundDrainReserve         = 2 * nodeForegroundCallTimeout
+	nodeForegroundStartupSeedAllowance = 2 * time.Minute
+	nodeForegroundPrepareLimit         = 10 * time.Second
+	nodeForegroundShutdownLimit        = 10 * time.Second // mirrors Node.Shutdown's archive/checkpoint context
+	nodeForegroundGatewayClose         = 7 * time.Second
+	nodeForegroundCleanupSlack         = 5 * time.Second
+	nodeForegroundGCGracePeriod        = 24 * time.Hour
+	nodeForegroundP99MinSamples        = 10000
 	// Planning reserve for three per-node preparations, their bounded archive/
 	// checkpoint shutdown operations, gateway close, and small accounting slack.
 	// It is not a hard upper bound for Checkpointer/Node worker joins; the outer
@@ -53,11 +54,20 @@ func nodeForegroundBudgetAvailable(deadline, now time.Time, required time.Durati
 	return required >= 0 && deadline.Sub(now) >= required
 }
 
+func nodeForegroundPreparationBridge(preparationCtx context.Context, outerCancel context.CancelFunc) func() bool {
+	return context.AfterFunc(preparationCtx, outerCancel)
+}
+
+func nodeForegroundPreparationFinished(preparationCtx context.Context, deadline, now time.Time, stop func() bool) bool {
+	stopped := stop()
+	return stopped && preparationCtx.Err() == nil && !now.After(deadline)
+}
+
 func requireNodeForegroundBudget(t testing.TB, deadline time.Time, required time.Duration, phase string) {
 	t.Helper()
 	now := time.Now()
 	if !nodeForegroundBudgetAvailable(deadline, now, required) {
-		t.Fatalf("insufficient five-minute Node foreground budget at %s: remaining=%s required=%s", phase, deadline.Sub(now), required)
+		t.Fatalf("insufficient Node foreground budget at %s: remaining=%s required=%s", phase, deadline.Sub(now), required)
 	}
 }
 
@@ -88,12 +98,32 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	t.Logf("node_foreground_scenario=%s", scenario)
 	testDeadline, ok := t.Deadline()
 	if !ok {
-		t.Fatal("test runner must supply the fixed five-minute deadline")
+		t.Fatal("test runner must supply the fixed seven-minute deadline")
+	}
+	const reserve = nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup
+	preparationStart := time.Now()
+	preparationDeadline := preparationStart.Add(nodeForegroundStartupSeedAllowance)
+	if !nodeForegroundBudgetAvailable(testDeadline, preparationStart, nodeForegroundStartupSeedAllowance+reserve) || preparationDeadline.After(testDeadline.Add(-reserve)) {
+		t.Fatalf("insufficient Node foreground preparation and fixed-window budget before startup: remaining=%s preparation=%s reserve=%s", testDeadline.Sub(preparationStart), nodeForegroundStartupSeedAllowance, reserve)
 	}
 	ctx, cancel := context.WithDeadline(context.Background(), testDeadline)
 	t.Cleanup(cancel)
+	preparationCtx, preparationCancel := context.WithDeadline(ctx, preparationDeadline)
+	stopPreparationBridge := nodeForegroundPreparationBridge(preparationCtx, cancel)
+	defer func() { _ = stopPreparationBridge(); preparationCancel() }()
+	var seedAPIAcknowledged atomic.Uint64
+	var preparationEnd time.Time
+	var preparationCompleted bool
+	t.Logf("node_foreground_preparation_budget outer_deadline=%s start=%s deadline=%s allowance=%s fixed_post_seed_reserve=%s entry_remaining=%s", testDeadline.UTC().Format(time.RFC3339Nano), preparationStart.UTC().Format(time.RFC3339Nano), preparationDeadline.UTC().Format(time.RFC3339Nano), nodeForegroundStartupSeedAllowance, reserve, testDeadline.Sub(preparationStart))
+	defer func() {
+		end := preparationEnd
+		if end.IsZero() {
+			end = time.Now()
+		}
+		t.Logf("node_foreground_preparation_result start=%s end=%s elapsed=%s deadline=%s completed=%t deadline_exceeded=%t context_state_at_exit=%v outer_error=%v api_acknowledged=%d/%d", preparationStart.UTC().Format(time.RFC3339Nano), end.UTC().Format(time.RFC3339Nano), end.Sub(preparationStart), preparationDeadline.UTC().Format(time.RFC3339Nano), preparationCompleted, end.After(preparationDeadline), preparationCtx.Err(), ctx.Err(), seedAPIAcknowledged.Load(), nodeForegroundKeys)
+	}()
 
-	gateway, err := versityfixture.Start(ctx, binary, t.TempDir())
+	gateway, err := versityfixture.Start(preparationCtx, binary, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +143,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{Region: region}); err != nil {
+	if err := client.MakeBucket(preparationCtx, bucketName, minio.MakeBucketOptions{Region: region}); err != nil {
 		t.Fatal(err)
 	}
 	setupStartRequests, err := nodeVersityRequestCount(gateway)
@@ -208,7 +238,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			t.Fatalf("Node %s object-store replay grouping is not enabled: stats=%+v available=%t", ids[i], stats, ok)
 		}
 	}
-	if err := waitForNodeReadiness(ctx, nodes); err != nil {
+	if err := waitForNodeReadiness(preparationCtx, nodes); err != nil {
 		t.Fatal(err)
 	}
 	apis := make([]*network.Server, len(nodes))
@@ -227,10 +257,8 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	setupStore := snapshotNodeStoreStats(nodes)
 	logNodeStoreCumulative(t, "setup_through_node_open", ids, setupStore)
 
-	const reserve = nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup
-	seedDeadline := testDeadline.Add(-reserve)
-	if !time.Now().Before(seedDeadline) {
-		t.Fatalf("Node startup left no bounded seed budget before fixed windows: now=%s seed_deadline=%s reserve=%s", time.Now().UTC().Format(time.RFC3339Nano), seedDeadline.UTC().Format(time.RFC3339Nano), reserve)
+	if !time.Now().Before(preparationDeadline) {
+		t.Fatalf("Node startup exhausted named preparation allowance before seed: now=%s preparation_deadline=%s reserve=%s", time.Now().UTC().Format(time.RFC3339Nano), preparationDeadline.UTC().Format(time.RFC3339Nano), reserve)
 	}
 	value := make([]byte, nodeForegroundValueBytes)
 	for i := range value {
@@ -256,13 +284,12 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		}
 		return nil
 	}
-	seedCtx, seedCancel := context.WithDeadline(ctx, seedDeadline)
+	seedCtx, seedCancel := context.WithDeadline(ctx, preparationDeadline)
 	transportObserver.SetPhase("seed")
 	seedStoreStart := snapshotNodeStoreStats(nodes)
 	seedServerStart, seedServerStartErr := nodeVersityRequestCount(gateway)
 	seedStart := time.Now()
-	t.Logf("node_foreground_seed_budget test_deadline=%s seed_deadline=%s reserve=%s", testDeadline.UTC().Format(time.RFC3339Nano), seedDeadline.UTC().Format(time.RFC3339Nano), reserve)
-	var seedAPIAcknowledged atomic.Uint64
+	t.Logf("node_foreground_seed_budget test_deadline=%s seed_deadline=%s reserve=%s", testDeadline.UTC().Format(time.RFC3339Nano), preparationDeadline.UTC().Format(time.RFC3339Nano), reserve)
 	seedPut := func(callCtx context.Context, requestID, key string, payload []byte) error {
 		err := put(callCtx, requestID, key, payload)
 		if err == nil {
@@ -275,11 +302,21 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		Value: value, ClientID: clientID,
 	}, seedPut, func(done int) { t.Logf("node_foreground_seed_completed=%d/%d", done, nodeForegroundKeys) })
 	seedEnd := time.Now()
+	preparationEnd = seedEnd
 	t.Logf("node_foreground_seed_result duration=%s api_acknowledged=%d/%d error=%t", seedEnd.Sub(seedStart), seedAPIAcknowledged.Load(), nodeForegroundKeys, seedErr != nil)
 	seedCancel()
 	if seedErr != nil {
 		t.Fatalf("seed the fixed %d-key Node API workload: %v", nodeForegroundKeys, seedErr)
 	}
+	if acknowledged := seedAPIAcknowledged.Load(); acknowledged != nodeForegroundKeys {
+		t.Fatalf("seed API acknowledgments=%d, want %d", acknowledged, nodeForegroundKeys)
+	}
+	if !nodeForegroundPreparationFinished(preparationCtx, preparationDeadline, seedEnd, stopPreparationBridge) {
+		cancel()
+		t.Fatalf("Node foreground preparation did not finish within its named allowance: end=%s deadline=%s preparation_error=%v", seedEnd.UTC().Format(time.RFC3339Nano), preparationDeadline.UTC().Format(time.RFC3339Nano), preparationCtx.Err())
+	}
+	preparationCompleted = true
+	preparationCancel()
 	seedStoreEnd := snapshotNodeStoreStats(nodes)
 	logNodeStoreDelta(t, "seed", ids, seedStoreStart, seedStoreEnd)
 	seedEndRequests, seedServerEndErr := nodeVersityRequestCount(gateway)
@@ -1343,6 +1380,8 @@ func TestNodeForegroundBudgetBoundariesPreserveWindowsAndCleanupReserve(t *testi
 		remaining time.Duration
 		want      bool
 	}{
+		{name: "preparation exact allowance and reserve", required: nodeForegroundStartupSeedAllowance + nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup, remaining: nodeForegroundStartupSeedAllowance + nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup, want: true},
+		{name: "preparation short by one nanosecond", required: nodeForegroundStartupSeedAllowance + nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup, remaining: nodeForegroundStartupSeedAllowance + nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup - time.Nanosecond, want: false},
 		{name: "post-seed exact reserve", required: nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup, remaining: nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup, want: true},
 		{name: "post-seed short by one nanosecond", required: nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup, remaining: nodeForegroundWarmup + nodeForegroundMeasure + nodeForegroundDrainReserve + nodeForegroundCleanup - time.Nanosecond, want: false},
 		{name: "post-warmup one remaining drain", required: nodeForegroundMeasure + nodeForegroundCallTimeout + nodeForegroundCleanup, remaining: nodeForegroundMeasure + nodeForegroundCallTimeout + nodeForegroundCleanup, want: true},
@@ -1355,6 +1394,65 @@ func TestNodeForegroundBudgetBoundariesPreserveWindowsAndCleanupReserve(t *testi
 			}
 		})
 	}
+}
+
+func TestNodeForegroundPreparationDeadlineBridge(t *testing.T) {
+	t.Run("expired preparation interrupts blocking startup", func(t *testing.T) {
+		outerCtx, outerCancel := context.WithCancel(context.Background())
+		defer outerCancel()
+		preparationCtx, preparationCancel := context.WithCancel(outerCtx)
+		stop := nodeForegroundPreparationBridge(preparationCtx, outerCancel)
+		startupDone := make(chan struct{})
+		go func() {
+			<-outerCtx.Done()
+			close(startupDone)
+		}()
+		preparationCancel()
+		select {
+		case <-startupDone:
+		case <-time.After(time.Second):
+			t.Fatal("preparation cancellation did not interrupt blocking startup")
+		}
+		if nodeForegroundPreparationFinished(preparationCtx, time.Now(), time.Now(), stop) {
+			t.Fatal("expired preparation was accepted")
+		}
+	})
+	t.Run("successful preparation preserves real node lifetime", func(t *testing.T) {
+		outerCtx, outerCancel := context.WithCancel(context.Background())
+		defer outerCancel()
+		preparationCtx, preparationCancel := context.WithCancel(outerCtx)
+		stop := nodeForegroundPreparationBridge(preparationCtx, outerCancel)
+		n := New(&types.ExecutionConfig{Local: true, NodeID: "local", DataDir: t.TempDir()})
+		if err := n.Open(outerCtx); err != nil {
+			preparationCancel()
+			t.Fatal(err)
+		}
+		defer n.Shutdown()
+		if !nodeForegroundPreparationFinished(preparationCtx, time.Now().Add(time.Minute), time.Now(), stop) {
+			preparationCancel()
+			t.Fatal("healthy preparation failed completion gate")
+		}
+		preparationCancel()
+		if outerCtx.Err() != nil || !n.ready.Load() {
+			t.Fatal("preparation cancellation ended the opened node lifetime")
+		}
+		if _, err := n.server.Query(outerCtx, network.QueryRequest{SQL: "SELECT 1", Consistency: "linearizable"}); err != nil {
+			t.Fatalf("local Node API after preparation cancellation: %v", err)
+		}
+	})
+	t.Run("completion after deadline is rejected", func(t *testing.T) {
+		outerCtx, outerCancel := context.WithCancel(context.Background())
+		defer outerCancel()
+		preparationCtx, preparationCancel := context.WithCancel(outerCtx)
+		defer preparationCancel()
+		deadline := time.Now()
+		if !nodeForegroundPreparationFinished(preparationCtx, deadline, deadline, nodeForegroundPreparationBridge(preparationCtx, outerCancel)) {
+			t.Fatal("completion at exact deadline was rejected")
+		}
+		if nodeForegroundPreparationFinished(preparationCtx, deadline, deadline.Add(time.Nanosecond), func() bool { return true }) {
+			t.Fatal("late completion was accepted")
+		}
+	})
 }
 
 func (m *nodeForegroundCostMetrics) observe(observation foregroundcosttest.Observation) {

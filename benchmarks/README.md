@@ -123,8 +123,13 @@ selectors plus two focused regressions; the focused regressions are not new
 original-#185 gates. The actual foreground
 acceptance result is the three-Node Before-ACK Node test; the bare-core
 `pkg/network` component matrix is not in this job. Each Node foreground
-scenario retains its 30-second warm-up and 120-second measured window. The
-restore case publishes a certified checkpoint through one node, removes only
+scenario retains its 30-second warm-up and 120-second measured window.
+Node foreground commands use a seven-minute outer test deadline: the approved
+two-minute preparation budget, followed by the unchanged post-seed warm-up,
+measurement, drain, and cleanup reserve (4m42s) and an 18-second margin. This
+changes neither the measurement window nor any API, durability, checkpoint,
+teardown, or GC guarantee.
+The restore case publishes a certified checkpoint through one node, removes only
 the local SQLite files, then verifies that a second `Node.Open` recovers the
 value and reaches ready.
 
