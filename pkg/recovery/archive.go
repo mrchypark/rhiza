@@ -420,6 +420,7 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 			return err
 		}
 		if active {
+			m.traceArchiveBusy(ctx, "archive-trim", m.key("archive/recovery-pins"), "active_recovery_pin", "site", true)
 			return ErrArchiveBusy
 		}
 		return m.withPublicationLock(ctx, "archive-trim", func(ctx context.Context) error {
@@ -956,6 +957,7 @@ func (m *Manager) confirmPublicationLease(ctx context.Context) error {
 	}
 	lease, ok := ctx.Value(publicationLeaseContextKey{}).(archiveGCLock)
 	if !ok {
+		m.traceArchiveBusy(ctx, "unknown", m.publicationLockKey(), "missing_lease_context", "site", true)
 		return ErrArchiveBusy
 	}
 	current, err := m.readArchiveLock(ctx, m.publicationLockKey())
@@ -964,6 +966,7 @@ func (m *Manager) confirmPublicationLease(ctx context.Context) error {
 	}
 	if current.OwnerID != lease.OwnerID || current.Generation != lease.Generation ||
 		current.LeaseUntilMS <= time.Now().UnixMilli() {
+		m.traceArchiveBusy(ctx, "unknown", m.publicationLockKey(), "confirm_mismatch_or_expired", "site", true)
 		return ErrArchiveBusy
 	}
 	return nil
@@ -1478,7 +1481,46 @@ func (m *Manager) recoveryPinKey(owner string) string {
 }
 
 func (m *Manager) withGCLock(ctx context.Context, owner string, work func(context.Context) error) error {
-	return m.withArchiveLock(ctx, m.gcLockKey(), owner, true, work)
+	entered := false
+	err := m.withArchiveLock(ctx, m.gcLockKey(), owner, true, func(workCtx context.Context) error {
+		entered = true
+		return work(workCtx)
+	})
+	if errors.Is(err, ErrArchiveBusy) {
+		m.traceArchiveBusy(ctx, owner, m.gcLockKey(), "returned", "terminal", entered)
+	}
+	return err
+}
+
+// traceArchiveBusy emits only allowlisted diagnostic categories. The disabled
+// hook returns before constructing a key or retaining a lock identity.
+func (m *Manager) traceArchiveBusy(ctx context.Context, owner, key, branch, stage string, entered bool) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	operation := "other"
+	switch owner {
+	case "archive-sync":
+		operation = "archive-sync"
+	case "archive-trim":
+		operation = "archive-trim"
+	case "archive-gc", "archive-gc-publish":
+		operation = "archive-gc"
+	case "archive-initialize":
+		operation = "archive-initialize"
+	}
+	resource := "other"
+	switch key {
+	case m.gcLockKey():
+		resource = "gc_lock"
+	case m.publicationLockKey():
+		resource = "publication_lock"
+	case m.key("archive/recovery-pins"):
+		resource = "recovery_pin"
+	}
+	localtesthooks.HitArchiveBusy(ctx, localtesthooks.ArchiveBusyEvent{
+		Operation: operation, Resource: resource, Branch: branch, Stage: stage, Entered: entered,
+	})
 }
 
 // withPublicationLock waits only before work begins. An error after entry may
@@ -1494,9 +1536,13 @@ func (m *Manager) withPublicationLock(ctx context.Context, owner string, work fu
 			return work(workCtx)
 		})
 		if entered || !errors.Is(err, ErrArchiveBusy) {
+			if errors.Is(err, ErrArchiveBusy) {
+				m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", entered)
+			}
 			return err
 		}
 		if _, bounded := ctx.Deadline(); !bounded {
+			m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", false)
 			return err
 		}
 		timer := time.NewTimer(50 * time.Millisecond)
@@ -1572,6 +1618,10 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	lock = current
 	lockMu.Unlock()
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The release keeps its own fresh background deadline and cancellation. It
+	// carries only the archive Busy observer so a release-side Busy return stays
+	// attributable; no other value, deadline, or lock policy crosses over.
+	releaseCtx = localtesthooks.CarryArchiveBusyObserver(releaseCtx, ctx)
 	release := func() error { return m.releaseArchiveLock(releaseCtx, key, lock) }
 	var releaseErr error
 	if gcTrace {
@@ -1582,6 +1632,11 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	releaseCancel()
 	if err == nil && releaseErr != nil && (!gcTrace || !errors.Is(releaseErr, ErrArchiveBusy)) {
 		err = releaseErr
+	} else if gcTrace && errors.Is(releaseErr, ErrArchiveBusy) {
+		m.traceArchiveBusy(ctx, owner, key, "release_mismatch_or_conflict", "suppressed", true)
+	}
+	if errors.Is(releaseErr, ErrArchiveBusy) && !gcTrace {
+		m.traceArchiveBusy(releaseCtx, owner, key, "release_mismatch_or_conflict", "terminal", true)
 	}
 	if err == nil {
 		select {
@@ -1599,6 +1654,7 @@ func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Du
 
 func (m *Manager) acquireArchiveLock(ctx context.Context, key, owner string, lease time.Duration) (*archiveGCLock, error) {
 	if owner == "" || lease <= 0 {
+		m.traceArchiveBusy(ctx, owner, key, "invalid_admission", "site", false)
 		return nil, ErrArchiveBusy
 	}
 	for range maxPublishRetries {
@@ -1608,6 +1664,7 @@ func (m *Manager) acquireArchiveLock(ctx context.Context, key, owner string, lea
 		}
 		now := time.Now()
 		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
+			m.traceArchiveBusy(ctx, owner, key, "active_live_lease", "site", false)
 			return nil, ErrArchiveBusy
 		}
 		lock := archiveGCLock{OwnerID: owner, Generation: 1, LeaseUntilMS: now.Add(lease).UnixMilli()}
@@ -1622,8 +1679,9 @@ func (m *Manager) acquireArchiveLock(ctx context.Context, key, owner string, lea
 			}
 			return nil, err
 		}
-		return m.confirmArchiveLock(ctx, key, lock)
+		return m.confirmArchiveLock(ctx, key, lock, false)
 	}
+	m.traceArchiveBusy(ctx, owner, key, "conditional_exhausted", "site", false)
 	return nil, ErrArchiveBusy
 }
 
@@ -1637,11 +1695,13 @@ func (m *Manager) releaseArchiveLock(ctx context.Context, key string, lock *arch
 		return err
 	}
 	if lock == nil || current.OwnerID != lock.OwnerID || current.Generation != lock.Generation {
+		m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 		return ErrArchiveBusy
 	}
 	current.LeaseUntilMS = time.Now().UnixMilli()
 	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
 		if m.bucket.IsConditionNotMetErr(err) {
+			m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 			return ErrArchiveBusy
 		}
 		return err
@@ -1655,6 +1715,7 @@ func (m *Manager) renewGCLock(ctx context.Context, lock *archiveGCLock, lease ti
 
 func (m *Manager) renewArchiveLock(ctx context.Context, key string, lock *archiveGCLock, lease time.Duration) (*archiveGCLock, error) {
 	if lock == nil || lease <= 0 {
+		m.traceArchiveBusy(ctx, "unknown", key, "renew_invalid", "site", true)
 		return nil, ErrArchiveBusy
 	}
 	current, err := m.readArchiveLock(ctx, key)
@@ -1662,26 +1723,29 @@ func (m *Manager) renewArchiveLock(ctx context.Context, key string, lock *archiv
 		return nil, err
 	}
 	if current.OwnerID != lock.OwnerID || current.Generation != lock.Generation || current.LeaseUntilMS <= time.Now().UnixMilli() {
+		m.traceArchiveBusy(ctx, "unknown", key, "renew_mismatch_or_expired", "site", true)
 		return nil, ErrArchiveBusy
 	}
 	current.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
 	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
 		if m.bucket.IsConditionNotMetErr(err) {
+			m.traceArchiveBusy(ctx, "unknown", key, "renew_mismatch_or_conflict", "site", true)
 			return nil, ErrArchiveBusy
 		}
 		return nil, err
 	}
-	return m.confirmArchiveLock(ctx, key, *current)
+	return m.confirmArchiveLock(ctx, key, *current, true)
 }
 
 func (m *Manager) confirmGCLock(ctx context.Context, expected archiveGCLock) (*archiveGCLock, error) {
-	return m.confirmArchiveLock(ctx, m.gcLockKey(), expected)
+	return m.confirmArchiveLock(ctx, m.gcLockKey(), expected, false)
 }
 
-func (m *Manager) confirmArchiveLock(ctx context.Context, key string, expected archiveGCLock) (*archiveGCLock, error) {
+func (m *Manager) confirmArchiveLock(ctx context.Context, key string, expected archiveGCLock, entered bool) (*archiveGCLock, error) {
 	stored, err := m.readArchiveLock(ctx, key)
 	if err != nil {
 		if m.bucket.IsObjNotFoundErr(err) {
+			m.traceArchiveBusy(ctx, "unknown", key, "confirm_missing", "site", entered)
 			return nil, ErrArchiveBusy
 		}
 		return nil, err
@@ -1689,6 +1753,7 @@ func (m *Manager) confirmArchiveLock(ctx context.Context, key string, expected a
 	observed := *stored
 	observed.version, expected.version = nil, nil
 	if observed != expected || observed.LeaseUntilMS <= time.Now().UnixMilli() {
+		m.traceArchiveBusy(ctx, "unknown", key, "confirm_mismatch_or_expired", "site", entered)
 		return nil, ErrArchiveBusy
 	}
 	return stored, nil
@@ -1786,6 +1851,7 @@ func (m *Manager) maxActiveRecoveryGeneration(ctx context.Context) (uint64, erro
 			pin.LeaseUntilMS = 0
 			if err := m.writeRecoveryPin(ctx, key, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 				if m.bucket.IsConditionNotMetErr(err) {
+					m.traceArchiveBusy(ctx, "unknown", m.key("archive/recovery-pins"), "pin_expiry_conflict", "site", true)
 					return ErrArchiveBusy
 				}
 				return err
@@ -1816,6 +1882,7 @@ func (m *Manager) hasActiveRecoveryPins(ctx context.Context) (bool, error) {
 			pin.LeaseUntilMS = 0
 			if err := m.writeRecoveryPin(ctx, key, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 				if m.bucket.IsConditionNotMetErr(err) {
+					m.traceArchiveBusy(ctx, "unknown", m.key("archive/recovery-pins"), "pin_expiry_conflict", "site", true)
 					return ErrArchiveBusy
 				}
 				return err

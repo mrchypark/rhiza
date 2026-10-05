@@ -26,6 +26,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 const (
@@ -368,6 +369,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	var archivePhaseTrace *nodeArchiveGCPhaseTrace
 	var publisherBusyOperationID atomic.Uint64
 	var publisherBusyFailures nodeForegroundPublisherBusyFailures
+	var archiveBusyFailures nodeForegroundArchiveBusyFailures
 	if scenario != "baseline" {
 		if scenario == "archive-cleanup-active" {
 			archivePhaseTrace = newNodeArchiveGCPhaseTrace()
@@ -376,6 +378,10 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			operationID := publisherBusyOperationID.Add(1)
 			collector := &nodeForegroundPublisherBusyCollector{}
 			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, collector.observe)
+			archiveCollector := &nodeForegroundArchiveBusyCollector{}
+			if scenario == "checkpoint-active" {
+				operationCtx = localtesthooks.WithArchiveBusyTrace(operationCtx, archiveCollector.observe)
+			}
 			var result nodeForegroundMaintenanceResult
 			var err error
 			switch scenario {
@@ -389,6 +395,9 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			if errors.Is(err, checkpoint.ErrPublisherBusy) {
 				events, overflow := collector.snapshot()
 				publisherBusyFailures.record(operationID, events, overflow)
+			}
+			if errors.Is(err, recovery.ErrArchiveBusy) {
+				archiveBusyFailures.record(operationID, archiveCollector.snapshot())
 			}
 			return result, err
 		}
@@ -415,6 +424,9 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			t.Logf("node_foreground_maintenance_error_type_chain status=%s types=%v", status, types)
 			if errors.Is(firstErr, checkpoint.ErrPublisherBusy) {
 				publisherBusyFailures.log(t)
+			}
+			if errors.Is(firstErr, recovery.ErrArchiveBusy) {
+				archiveBusyFailures.log(t)
 			}
 			t.Errorf("Node foreground %s maintenance failed: %v", scenario, firstErr)
 		}
@@ -590,6 +602,247 @@ func TestNodeForegroundPublisherBusyCollectorBoundsConcurrentEvents(t *testing.T
 	}
 }
 
+func TestNodeForegroundArchiveBusyCollectorBoundsConcurrentEvents(t *testing.T) {
+	collector := &nodeForegroundArchiveBusyCollector{}
+	// Deterministic fill-and-stop: sequential over-capacity events overflow by
+	// count only and never overwrite a retained branch.
+	for i := 0; i < nodeForegroundArchiveBusyOrdinaryLimit+4; i++ {
+		collector.observe(localtesthooks.ArchiveBusyEvent{Operation: "archive-trim", Resource: "gc_lock", Branch: "active_live_lease", Stage: "site"})
+	}
+	sequential := collector.snapshot()
+	if len(sequential.events) != nodeForegroundArchiveBusyOrdinaryLimit || sequential.overflow != 4 {
+		t.Fatalf("sequential events=%d overflow=%d, want %d/4", len(sequential.events), sequential.overflow, nodeForegroundArchiveBusyOrdinaryLimit)
+	}
+
+	// Concurrent observations must stay within the fixed capacity and safe to
+	// snapshot while running.
+	concurrent := &nodeForegroundArchiveBusyCollector{}
+	var group sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			concurrent.observe(localtesthooks.ArchiveBusyEvent{Operation: "archive-trim", Resource: "gc_lock", Branch: "active_live_lease", Stage: "site"})
+		}()
+	}
+	group.Wait()
+	snapshot := concurrent.snapshot()
+	if len(snapshot.events) > nodeForegroundArchiveBusyEventLimit {
+		t.Fatalf("concurrent events=%d exceed the fixed capacity %d", len(snapshot.events), nodeForegroundArchiveBusyEventLimit)
+	}
+	// Fill-and-stop keeps the earliest exact branches; a later event must never
+	// overwrite an earlier one.
+	for i, event := range snapshot.events {
+		if event.Branch != "active_live_lease" || event.Stage != "site" {
+			t.Fatalf("event[%d]=%+v, want the retained first branch", i, event)
+		}
+	}
+
+	failures := &nodeForegroundArchiveBusyFailures{}
+	failures.record(2, sequential)
+	failures.record(3, nodeForegroundArchiveBusySnapshot{events: []localtesthooks.ArchiveBusyEvent{{Branch: "later"}}})
+	if !failures.recorded || failures.operationID != 2 || len(failures.snapshot.events) != nodeForegroundArchiveBusyOrdinaryLimit || failures.snapshot.overflow != 4 {
+		t.Fatalf("failure=%+v", failures)
+	}
+	// The first failing operation wins; a later observation cannot rewrite it.
+	if failures.snapshot.events[0].Branch != "active_live_lease" {
+		t.Fatalf("first event overwritten: %+v", failures.snapshot.events[0])
+	}
+}
+
+// The exact post-entry return-path terminal branch must survive a full ordinary
+// budget, so the reported cause is never an early pre-entry retry.
+func TestNodeForegroundArchiveBusyTerminalSurvivesPreEntryRetries(t *testing.T) {
+	collector := &nodeForegroundArchiveBusyCollector{}
+	for i := 0; i < nodeForegroundArchiveBusyEventLimit*2; i++ {
+		collector.observe(localtesthooks.ArchiveBusyEvent{
+			Operation: "archive-trim", Resource: "publication_lock", Branch: "active_live_lease", Stage: "site", Entered: false,
+		})
+	}
+	collector.observe(localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-trim", Resource: "publication_lock", Branch: "returned", Stage: "terminal", Entered: true,
+	})
+	snapshot := collector.snapshot()
+	if !snapshot.hasTerm || snapshot.termMiss {
+		t.Fatalf("terminal not captured: %+v", snapshot)
+	}
+	if snapshot.terminal.Branch != "returned" || snapshot.terminal.Stage != "terminal" || !snapshot.terminal.Entered {
+		t.Fatalf("terminal=%+v, want the exact returned/terminal/entered branch", snapshot.terminal)
+	}
+	if len(snapshot.events) != nodeForegroundArchiveBusyOrdinaryLimit || snapshot.overflow == 0 {
+		t.Fatalf("events=%d overflow=%d, want %d ordinary and a non-zero overflow", len(snapshot.events), snapshot.overflow, nodeForegroundArchiveBusyOrdinaryLimit)
+	}
+	// Every retained ordinary row is a pre-entry retry and must not claim the cause.
+	for i, event := range snapshot.events {
+		if event.Entered || event.Stage == "terminal" {
+			t.Fatalf("retained ordinary row[%d]=%+v is not a pre-entry retry", i, event)
+		}
+	}
+}
+
+// A suppressed GC release branch is not an operation return cause and must not
+// claim the reserved terminal slot.
+
+// The specific return-path branch must survive both orderings against the
+// generic outer "returned" marker.
+func TestNodeForegroundArchiveBusyTerminalPrefersSpecificOverGeneric(t *testing.T) {
+	specific := localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-trim", Resource: "publication_lock", Branch: "release_mismatch_or_conflict", Stage: "terminal", Entered: true,
+	}
+	generic := localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-trim", Resource: "publication_lock", Branch: "returned", Stage: "terminal", Entered: false,
+	}
+
+	// Ordering A: specific first, generic later. The generic event must not erase
+	// the already-known specific cause.
+	specificFirst := &nodeForegroundArchiveBusyCollector{}
+	specificFirst.observe(specific)
+	specificFirst.observe(generic)
+	firstSnapshot := specificFirst.snapshot()
+	if !firstSnapshot.hasTerm || firstSnapshot.terminal.Branch != "release_mismatch_or_conflict" {
+		t.Fatalf("specific-first terminal=%+v, want the specific branch retained", firstSnapshot.terminal)
+	}
+
+	// Ordering B: generic first, specific later. The specific event must upgrade
+	// the earlier generic capture.
+	genericFirst := &nodeForegroundArchiveBusyCollector{}
+	genericFirst.observe(generic)
+	genericFirst.observe(specific)
+	secondSnapshot := genericFirst.snapshot()
+	if !secondSnapshot.hasTerm || secondSnapshot.terminal.Branch != "release_mismatch_or_conflict" {
+		t.Fatalf("generic-first terminal=%+v, want the specific branch to upgrade", secondSnapshot.terminal)
+	}
+
+	// Repeated generic events never displace a specific cause in either direction.
+	genericFirst.observe(generic)
+	if repeat := genericFirst.snapshot(); repeat.terminal.Branch != "release_mismatch_or_conflict" {
+		t.Fatalf("repeated generic erased the specific cause: %+v", repeat.terminal)
+	}
+
+	// With only generic events the generic branch is still reported, so the
+	// reserved slot is never left blank when a cause was actually seen.
+	genericOnly := &nodeForegroundArchiveBusyCollector{}
+	genericOnly.observe(generic)
+	if genericOnly.snapshot().terminal.Branch != "returned" {
+		t.Fatalf("generic-only terminal=%+v, want the generic branch retained", genericOnly.snapshot().terminal)
+	}
+}
+
+// A specific terminal capture does not consume or disturb the ordinary budget.
+func TestNodeForegroundArchiveBusySpecificTerminalKeepsOrdinaryBudget(t *testing.T) {
+	collector := &nodeForegroundArchiveBusyCollector{}
+	for i := 0; i < nodeForegroundArchiveBusyOrdinaryLimit; i++ {
+		collector.observe(localtesthooks.ArchiveBusyEvent{
+			Operation: "archive-trim", Resource: "gc_lock", Branch: "active_live_lease", Stage: "site", Entered: false,
+		})
+	}
+	collector.observe(localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-trim", Resource: "publication_lock", Branch: "release_mismatch_or_conflict", Stage: "terminal", Entered: true,
+	})
+	snapshot := collector.snapshot()
+	if len(snapshot.events) != nodeForegroundArchiveBusyOrdinaryLimit || snapshot.overflow != 0 {
+		t.Fatalf("events=%d overflow=%d, want %d/0", len(snapshot.events), snapshot.overflow, nodeForegroundArchiveBusyOrdinaryLimit)
+	}
+	if snapshot.terminal.Branch != "release_mismatch_or_conflict" {
+		t.Fatalf("terminal=%+v, want the specific branch", snapshot.terminal)
+	}
+}
+func TestNodeForegroundArchiveBusySuppressedDoesNotClaimTerminal(t *testing.T) {
+	collector := &nodeForegroundArchiveBusyCollector{}
+	collector.observe(localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-gc", Resource: "gc_lock", Branch: "release_mismatch_or_conflict", Stage: "suppressed", Entered: true,
+	})
+	snapshot := collector.snapshot()
+	if snapshot.hasTerm {
+		t.Fatalf("suppressed release claimed the terminal slot: %+v", snapshot.terminal)
+	}
+	if len(snapshot.events) != 1 || snapshot.events[0].Stage != "suppressed" {
+		t.Fatalf("events=%+v, want the suppressed row kept as an ordinary event", snapshot.events)
+	}
+
+	// A suppressed release branch arriving after a real terminal cause must not
+	// downgrade or displace it.
+	collector.observe(localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-gc", Resource: "gc_lock", Branch: "returned", Stage: "terminal", Entered: true,
+	})
+	collector.observe(localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-gc", Resource: "gc_lock", Branch: "release_mismatch_or_conflict", Stage: "suppressed", Entered: true,
+	})
+	afterSuppressed := collector.snapshot()
+	if !afterSuppressed.hasTerm || afterSuppressed.terminal.Stage != "terminal" {
+		t.Fatalf("suppressed branch displaced the terminal cause: %+v", afterSuppressed)
+	}
+	if afterSuppressed.terminal.Stage != "terminal" || afterSuppressed.terminal.Branch == "release_mismatch_or_conflict" {
+		t.Fatalf("suppressed branch claimed the terminal slot: %+v", afterSuppressed.terminal)
+	}
+}
+
+// A terminal event dropped under TryLock contention is reported as unknown,
+// never inferred from the retained pre-entry rows.
+func TestNodeForegroundArchiveBusyTerminalMissIsUnknown(t *testing.T) {
+	collector := &nodeForegroundArchiveBusyCollector{}
+	for i := 0; i < nodeForegroundArchiveBusyOrdinaryLimit; i++ {
+		collector.observe(localtesthooks.ArchiveBusyEvent{
+			Operation: "archive-trim", Resource: "publication_lock", Branch: "active_live_lease", Stage: "site", Entered: false,
+		})
+	}
+
+	// Hold the collector lock so the next observation must miss its TryLock.
+	if !collector.mu.TryLock() {
+		t.Fatal("could not hold the collector lock")
+	}
+	observed := make(chan struct{})
+	go func() {
+		collector.observe(localtesthooks.ArchiveBusyEvent{
+			Operation: "archive-trim", Resource: "publication_lock", Branch: "release_mismatch_or_conflict", Stage: "terminal", Entered: true,
+		})
+		close(observed)
+	}()
+	<-observed
+	collector.mu.Unlock()
+
+	snapshot := collector.snapshot()
+	if !snapshot.termMiss {
+		t.Fatalf("dropped terminal was not reported unknown: %+v", snapshot)
+	}
+	if snapshot.hasTerm {
+		t.Fatalf("a missed terminal must not be fabricated: %+v", snapshot.terminal)
+	}
+	if snapshot.overflow == 0 {
+		t.Fatal("a dropped terminal must still count as overflow")
+	}
+	// The retained rows are pre-entry retries only and must not be read as a cause.
+	for i, event := range snapshot.events {
+		if event.Entered || event.Stage == "terminal" {
+			t.Fatalf("retained row[%d]=%+v is not a pre-entry retry", i, event)
+		}
+	}
+}
+
+// The emitted row carries only the fixed allowlisted vocabulary. No lock owner,
+// object key, URL, hash, token, or raw error has any field reaching the log.
+func TestNodeForegroundArchiveBusyRowIsAllowlisted(t *testing.T) {
+	collector := &nodeForegroundArchiveBusyCollector{}
+	collector.observe(localtesthooks.ArchiveBusyEvent{
+		Operation: "archive-trim", Resource: "gc_lock", Branch: "active_live_lease", Stage: "site",
+	})
+	snapshot := collector.snapshot()
+	operations := map[string]bool{"archive-sync": true, "archive-trim": true, "other": true}
+	resources := map[string]bool{"publication_lock": true, "gc_lock": true, "recovery_pin": true, "other": true}
+	var line strings.Builder
+	for _, event := range snapshot.events {
+		fmt.Fprintf(&line, "node_foreground_archive_busy operation_id=1 operation=%q resource=%q branch=%q stage=%q entered=%t overflow=%d\n", event.Operation, event.Resource, event.Branch, event.Stage, event.Entered, snapshot.overflow)
+		if !operations[event.Operation] || !resources[event.Resource] {
+			t.Fatalf("row outside the allowlist: %+v", event)
+		}
+	}
+	for _, forbidden := range []string{"owner", "token", "key=", "url", "hash", "error="} {
+		if strings.Contains(line.String(), forbidden) {
+			t.Fatalf("log line leaked %q: %s", forbidden, line.String())
+		}
+	}
+}
+
 func TestNodeForegroundArchiveCleanupCompletionClassification(t *testing.T) {
 	tests := []struct {
 		name, want string
@@ -692,6 +945,134 @@ type nodeForegroundMaintenanceResult struct {
 type nodeForegroundMaintenanceOperation func(context.Context) (nodeForegroundMaintenanceResult, error)
 
 const nodeForegroundPublisherBusyEventLimit = 4
+
+const nodeForegroundArchiveBusyEventLimit = 8
+
+// nodeForegroundArchiveBusyOrdinaryLimit is the fixed total capacity minus the
+// one reserved terminal slot. Ordinary events never grow it.
+const nodeForegroundArchiveBusyOrdinaryLimit = nodeForegroundArchiveBusyEventLimit - 1
+
+// The callback never waits for a lock or grows a slice. The first
+// nodeForegroundArchiveBusyOrdinaryLimit ordinary branches are kept in order;
+// further ordinary events only increment overflow. An earlier exact branch is
+// never overwritten by a later one.
+//
+// The last slot is reserved for the exact operation return-path terminal event,
+// because that is the branch that actually caused the returned ErrArchiveBusy.
+// Ordinary pre-entry retries can therefore never push it out. A
+// Stage=="terminal" event is reserved exclusively for an operation return
+// path; the GC suppressed release branch is not a return cause and never claims
+// this slot.
+type nodeForegroundArchiveBusyCollector struct {
+	mu       sync.Mutex
+	events   [nodeForegroundArchiveBusyEventLimit]localtesthooks.ArchiveBusyEvent
+	count    int
+	terminal localtesthooks.ArchiveBusyEvent
+	hasTerm  bool
+	termMiss atomic.Bool
+	overflow atomic.Uint64
+}
+
+// isSpecificArchiveBusyTerminal reports whether an event names the exact
+// return-path cause rather than the generic outer "returned" marker that
+// withPublicationLock emits for the same error. A specific branch is retained
+// in preference to the generic one regardless of arrival order.
+func isSpecificArchiveBusyTerminal(event localtesthooks.ArchiveBusyEvent) bool {
+	return event.Stage == "terminal" && event.Branch != "returned"
+}
+
+func (c *nodeForegroundArchiveBusyCollector) observe(event localtesthooks.ArchiveBusyEvent) {
+	if !c.mu.TryLock() {
+		c.overflow.Add(1)
+		// A terminal event we could not capture is explicitly unknown, so a reader
+		// never infers the cause from the retained pre-entry events instead.
+		if event.Stage == "terminal" {
+			c.termMiss.Store(true)
+		}
+		return
+	}
+	if event.Stage == "terminal" {
+		// The return-path terminal branch is the actual cause, so it is never
+		// dropped by a full ordinary budget. Within the reserved slot a specific
+		// terminal branch always beats the generic Branch=="returned" outer marker:
+		// a later generic event cannot erase an earlier specific cause, and a later
+		// specific event may upgrade an earlier generic one. This never overwrites
+		// an ordinary event.
+		if !c.hasTerm || !isSpecificArchiveBusyTerminal(c.terminal) || isSpecificArchiveBusyTerminal(event) {
+			c.terminal = event
+			c.hasTerm = true
+		}
+	} else if c.count < nodeForegroundArchiveBusyOrdinaryLimit {
+		c.events[c.count] = event
+		c.count++
+	} else {
+		c.overflow.Add(1)
+	}
+	c.mu.Unlock()
+}
+
+type nodeForegroundArchiveBusySnapshot struct {
+	events   []localtesthooks.ArchiveBusyEvent
+	terminal localtesthooks.ArchiveBusyEvent
+	hasTerm  bool
+	termMiss bool
+	overflow uint64
+}
+
+func (c *nodeForegroundArchiveBusyCollector) snapshot() nodeForegroundArchiveBusySnapshot {
+	c.mu.Lock()
+	events := append([]localtesthooks.ArchiveBusyEvent(nil), c.events[:c.count]...)
+	terminal, hasTerm := c.terminal, c.hasTerm
+	c.mu.Unlock()
+	return nodeForegroundArchiveBusySnapshot{events: events, terminal: terminal, hasTerm: hasTerm, termMiss: c.termMiss.Load(), overflow: c.overflow.Load()}
+}
+
+type nodeForegroundArchiveBusyFailures struct {
+	mu          sync.Mutex
+	operationID uint64
+	snapshot    nodeForegroundArchiveBusySnapshot
+	recorded    bool
+}
+
+func (f *nodeForegroundArchiveBusyFailures) record(operationID uint64, snapshot nodeForegroundArchiveBusySnapshot) {
+	f.mu.Lock()
+	if !f.recorded {
+		f.operationID, f.snapshot, f.recorded = operationID, snapshot, true
+	}
+	f.mu.Unlock()
+}
+
+func (f *nodeForegroundArchiveBusyFailures) log(t *testing.T) {
+	f.mu.Lock()
+	operationID, snapshot := f.operationID, f.snapshot
+	f.mu.Unlock()
+	if snapshot.hasTerm {
+		// The reserved return-path terminal row carries the exact branch that
+		// produced the returned ErrArchiveBusy. It is printed after the ordinary
+		// rows so a reader cannot mistake an early pre-entry retry for the cause.
+		for _, event := range snapshot.events {
+			t.Logf("node_foreground_archive_busy operation_id=%d operation=%q resource=%q branch=%q stage=%q entered=%t overflow=%d", operationID, event.Operation, event.Resource, event.Branch, event.Stage, event.Entered, snapshot.overflow)
+		}
+		t.Logf("node_foreground_archive_busy operation_id=%d operation=%q resource=%q branch=%q stage=%q entered=%t overflow=%d attribution=terminal", operationID, snapshot.terminal.Operation, snapshot.terminal.Resource, snapshot.terminal.Branch, snapshot.terminal.Stage, snapshot.terminal.Entered, snapshot.overflow)
+		return
+	}
+	if len(snapshot.events) == 0 {
+		t.Logf("node_foreground_archive_busy operation_id=%d events=0 overflow=%d attribution=unknown", operationID, snapshot.overflow)
+		return
+	}
+	if snapshot.termMiss {
+		// A terminal event was dropped under contention or overflow, so the cause
+		// is explicitly undecided; the retained rows are pre-entry retries only.
+		for _, event := range snapshot.events {
+			t.Logf("node_foreground_archive_busy operation_id=%d operation=%q resource=%q branch=%q stage=%q entered=%t overflow=%d", operationID, event.Operation, event.Resource, event.Branch, event.Stage, event.Entered, snapshot.overflow)
+		}
+		t.Logf("node_foreground_archive_busy operation_id=%d events=%d overflow=%d attribution=terminal_missing", operationID, len(snapshot.events), snapshot.overflow)
+		return
+	}
+	for _, event := range snapshot.events {
+		t.Logf("node_foreground_archive_busy operation_id=%d operation=%q resource=%q branch=%q stage=%q entered=%t overflow=%d", operationID, event.Operation, event.Resource, event.Branch, event.Stage, event.Entered, snapshot.overflow)
+	}
+}
 
 type nodeForegroundPublisherBusyCollector struct {
 	mu       sync.Mutex

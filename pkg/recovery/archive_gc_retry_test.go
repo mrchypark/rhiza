@@ -37,6 +37,26 @@ type gcRetryBucket struct {
 	prefixUploads int
 }
 
+// conditionalArchiveLockBucket makes an independent, valid lock generation
+// win each of the caller's conditional writes. The bucket still returns the
+// real conditional error; no Busy error is fabricated by this wrapper.
+type conditionalArchiveLockBucket struct {
+	objstore.Bucket
+	key    string
+	before func(context.Context) error
+	count  int
+}
+
+func (b *conditionalArchiveLockBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if name == b.key {
+		if err := b.before(ctx); err != nil {
+			return err
+		}
+		b.count++
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
 // gcPublisherAdmissionBucket observes a separate Manager's publication-lease
 // read and real HEAD upload. The paused Cleanup uses the underlying bucket.
 type gcPublisherAdmissionBucket struct {
@@ -461,11 +481,18 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 	waiter := NewManager(base, "cluster", 1)
 	defer waiter.Close()
 	entered := false
-	if err := waiter.withPublicationLock(ctx, "test-waiter", func(context.Context) error {
+	var busyEvents []localtesthooks.ArchiveBusyEvent
+	trace := func(event localtesthooks.ArchiveBusyEvent) { busyEvents = append(busyEvents, event) }
+	tracedCtx := localtesthooks.WithArchiveBusyTrace(ctx, trace)
+	if err := waiter.withPublicationLock(tracedCtx, "test-waiter", func(context.Context) error {
 		entered = true
 		return nil
 	}); !errors.Is(err, ErrArchiveBusy) || entered {
 		t.Fatalf("deadline-less wait error=%v entered=%t, want immediate Busy", err, entered)
+	}
+	if len(busyEvents) != 2 || busyEvents[0].Resource != "publication_lock" || busyEvents[0].Branch != "active_live_lease" || busyEvents[0].Entered ||
+		busyEvents[1].Stage != "terminal" || busyEvents[1].Entered {
+		t.Fatalf("deadline-less exact Busy boundaries=%+v", busyEvents)
 	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()
@@ -476,6 +503,8 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 		t.Fatalf("pre-canceled wait error=%v entered=%t", err, entered)
 	}
 	cancelCtx, cancel = context.WithTimeout(ctx, time.Second)
+	busyEvents = nil
+	cancelCtx = localtesthooks.WithArchiveBusyTrace(cancelCtx, trace)
 	cancelBucket := &cancelPublicationReadBucket{Bucket: base, cancel: cancel}
 	cancelWaiter := NewManager(cancelBucket, "cluster", 1)
 	defer cancelWaiter.Close()
@@ -484,6 +513,11 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 		return nil
 	}); !errors.Is(err, context.Canceled) || entered {
 		t.Fatalf("mid-admission cancellation error=%v entered=%t", err, entered)
+	}
+	for _, event := range busyEvents {
+		if event.Stage == "terminal" {
+			t.Fatalf("canceled deadline-bound admission falsely recorded returned Busy: %+v", busyEvents)
+		}
 	}
 	cancel()
 
@@ -497,7 +531,8 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 	head, version := waiter.head, waiter.headCAS
 	waiter.mu.Unlock()
 	var successor *archiveGCLock
-	err = waiter.withPublicationLock(ctx, "old-owner", func(workCtx context.Context) error {
+	busyEvents = nil
+	err = waiter.withPublicationLock(tracedCtx, "old-owner", func(workCtx context.Context) error {
 		current, err := waiter.readArchiveLock(ctx, key)
 		if err != nil {
 			return err
@@ -515,6 +550,18 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 	if !errors.Is(err, ErrArchiveBusy) || successor == nil {
 		t.Fatalf("stale owner publication error=%v successor=%v", err, successor)
 	}
+	var sawPostEntry, sawTerminal bool
+	for _, event := range busyEvents {
+		if event.Branch == "confirm_mismatch_or_expired" && event.Entered {
+			sawPostEntry = true
+		}
+		if event.Stage == "terminal" && event.Entered {
+			sawTerminal = true
+		}
+	}
+	if !sawPostEntry || !sawTerminal {
+		t.Fatalf("post-entry stale-owner Busy boundaries=%+v", busyEvents)
+	}
 	if err := holder.releaseArchiveLock(ctx, key, successor); err != nil {
 		t.Fatal(err)
 	}
@@ -522,6 +569,328 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 	defer final.Close()
 	if err := final.Load(ctx); err != nil || final.head.Generation != head.Generation || final.Tip() != head.Tip {
 		t.Fatalf("stale owner changed HEAD: generation=%d tip=%d err=%v", final.head.Generation, final.Tip(), err)
+	}
+}
+
+func testArchiveBusyTraceRealGCLockAndNonBusy(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireGCLock(ctx, "test-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.releaseGCLock(context.Background(), lease) }()
+	waiter := NewManager(base, "cluster", 1)
+	defer waiter.Close()
+	var events []localtesthooks.ArchiveBusyEvent
+	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
+		events = append(events, event)
+	})
+	if err := waiter.Cleanup(traced, 24*time.Hour); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("real live GC lease: error=%v, want Busy", err)
+	}
+	if len(events) != 2 || events[0].Resource != "gc_lock" || events[0].Branch != "active_live_lease" || events[0].Entered ||
+		events[1].Stage != "terminal" || events[1].Entered {
+		t.Fatalf("real GC-lock boundaries=%+v", events)
+	}
+	if err := holder.releaseGCLock(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	events = nil
+	if err := waiter.Cleanup(traced, 24*time.Hour); err != nil {
+		t.Fatalf("cleanup after confirmed release: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("successful cleanup emitted Busy: %+v", events)
+	}
+	final := NewManager(base, "cluster", 1)
+	defer final.Close()
+	if err := final.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := final.DecisionsFrom(ctx, 1, int(core.Tip()))
+	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()) {
+		t.Fatalf("independent archive read after GC Busy: tip=%d want=%d values=%d err=%v", tip, core.Tip(), len(values), err)
+	}
+	if err := waiter.withPublicationLock(traced, "test-negative", func(context.Context) error {
+		return fmt.Errorf("ordinary negative control")
+	}); err == nil || errors.Is(err, ErrArchiveBusy) || len(events) != 0 {
+		t.Fatalf("non-Busy return rewritten or observed: err=%v events=%+v", err, events)
+	}
+}
+
+func testArchiveBusyTraceRealConditionalExhaustion(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireGCLock(ctx, "initial", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.releaseGCLock(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	key := holder.gcLockKey()
+	bucket := &conditionalArchiveLockBucket{Bucket: base, key: key}
+	bucket.before = func(ctx context.Context) error {
+		current, err := holder.readArchiveLock(ctx, key)
+		if err != nil {
+			return err
+		}
+		current.Generation++
+		current.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
+		return holder.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version))
+	}
+	waiter := NewManager(bucket, "cluster", 1)
+	defer waiter.Close()
+	var events []localtesthooks.ArchiveBusyEvent
+	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
+		events = append(events, event)
+	})
+	if _, err := waiter.acquireGCLock(traced, "loser", archivePinLease); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("actual conditional exhaustion error=%v, want Busy", err)
+	}
+	if bucket.count != maxPublishRetries || len(events) != 1 || events[0].Resource != "gc_lock" ||
+		events[0].Branch != "conditional_exhausted" || events[0].Entered {
+		t.Fatalf("conditional conflicts=%d events=%+v", bucket.count, events)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil || independent.head.Generation != seed.head.Generation {
+		t.Fatalf("independent HEAD after lock conflicts: generation=%d want=%d err=%v", independent.head.Generation, seed.head.Generation, err)
+	}
+}
+
+// realTrimFixture proposes a real certified checkpoint and syncs it so the
+// returned seal and decision drive the real TrimThrough payload validation.
+func realTrimFixture(t *testing.T, ctx context.Context, core *quepaxa.Core, seed *Manager) (quepaxa.SealedCheckpoint, quepaxa.DecidedValue) {
+	t.Helper()
+	for i := 0; i < 2; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i + 2)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix, ok := core.PrefixHash(2)
+	if !ok {
+		t.Fatal("missing checkpoint prefix")
+	}
+	seal := quepaxa.CheckpointSeal{
+		ConfigID: 1, Index: 2, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: prefix,
+		NextLeaderOrder: []quepaxa.NodeID{"n1"},
+	}
+	core.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatal(err)
+	}
+	value, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, err := core.Propose(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := core.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("missing certified checkpoint decision")
+	}
+	if err := seed.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	return quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}, decision
+}
+
+// A real live recovery pin must stop TrimThrough before any archive work and
+// leave HEAD unchanged. Releasing the pin must let the same real trim proceed.
+func testArchiveBusyTraceRealRecoveryPinAndRelease(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	pinOwner := "test-recovery-pin"
+	pinKey := seed.recoveryPinKey(pinOwner)
+	// A pin with Tip past Base must carry a non-zero tail hash/object pair.
+	pin := archiveRecoveryPin{OwnerID: pinOwner, Token: "token", Base: 0, Tip: 1, TailHash: [32]byte{3}, TailObject: 1, LeaseUntilMS: time.Now().Add(time.Hour).UnixMilli()}
+	if err := seed.writeRecoveryPin(ctx, pinKey, pin); err != nil {
+		t.Fatal(err)
+	}
+	sealed, decision := realTrimFixture(t, ctx, core, seed)
+	waiter := NewManager(base, "cluster", 1)
+	defer waiter.Close()
+	var events []localtesthooks.ArchiveBusyEvent
+	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
+		events = append(events, event)
+	})
+	if err := waiter.TrimThrough(traced, sealed, decision); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("live recovery pin: error=%v, want Busy", err)
+	}
+	var sawPin bool
+	for _, event := range events {
+		if event.Resource == "recovery_pin" && event.Branch == "active_recovery_pin" && event.Entered {
+			sawPin = true
+		}
+	}
+	if !sawPin {
+		t.Fatalf("live recovery pin boundaries=%+v", events)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil || independent.head.Generation != seed.head.Generation {
+		t.Fatalf("HEAD changed under live recovery pin: generation=%d want=%d err=%v", independent.head.Generation, seed.head.Generation, err)
+	}
+	events = nil
+	current, err := seed.readRecoveryPin(ctx, pinKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.LeaseUntilMS = 0
+	if err := seed.writeRecoveryPin(ctx, pinKey, *current, objstore.WithIfMatch(current.version)); err != nil {
+		t.Fatal(err)
+	}
+	if err := waiter.TrimThrough(traced, sealed, decision); err != nil {
+		t.Fatalf("trim after confirmed pin release: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("successful trim emitted Busy: %+v", events)
+	}
+}
+
+// A release whose stored owner/generation no longer matches is a terminal
+// post-entry Busy and must be reported, never replayed.
+func testArchiveBusyTraceRealReleaseConflict(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireGCLock(ctx, "test-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := holder.gcLockKey()
+	stolen, err := holder.readArchiveLock(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stolen.OwnerID = "successor"
+	stolen.Generation = lease.Generation + 1
+	if err := holder.writeArchiveLock(ctx, key, *stolen, objstore.WithIfMatch(stolen.version)); err != nil {
+		t.Fatal(err)
+	}
+	var events []localtesthooks.ArchiveBusyEvent
+	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
+		events = append(events, event)
+	})
+	if err := holder.releaseGCLock(traced, lease); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("stale-owner release error=%v, want Busy", err)
+	}
+	var sawTerminal bool
+	for _, event := range events {
+		if event.Resource == "gc_lock" && event.Branch == "release_mismatch_or_conflict" && event.Entered {
+			sawTerminal = true
+		}
+	}
+	if !sawTerminal {
+		t.Fatalf("stale-owner release boundaries=%+v", events)
+	}
+}
+
+// An absent observer must leave behavior identical and record nothing.
+func testArchiveBusyTraceAbsentObserver(t *testing.T) {
+	ctx, _, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	if err := seed.Cleanup(ctx, 24*time.Hour); err != nil {
+		t.Fatalf("cleanup without an observer: %v", err)
+	}
+	if err := seed.withPublicationLock(ctx, "test-absent", func(context.Context) error {
+		return fmt.Errorf("ordinary negative control")
+	}); err == nil || errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("absent-observer publication error=%v", err)
+	}
+}
+
+// The publication (non-GC) release runs on a fresh 5s background context. A
+// real owner/generation steal during work must surface the release-side Busy on
+// that fresh context, reach the caller, never replay work, and leave HEAD intact.
+func testArchiveBusyTracePublicationReleaseConflict(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	waiter := NewManager(base, "cluster", 1)
+	defer waiter.Close()
+	key := waiter.publicationLockKey()
+	var events []localtesthooks.ArchiveBusyEvent
+	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
+		events = append(events, event)
+	})
+	workCalls := 0
+	err := waiter.withArchiveLock(traced, key, "test-publisher", false, func(context.Context) error {
+		workCalls++
+		// A real independent generation replaces the stored lock while the work
+		// runs, so the later release owner/generation check genuinely conflicts.
+		thief := NewManager(base, "cluster", 1)
+		defer thief.Close()
+		stolen, err := thief.readArchiveLock(ctx, key)
+		if err != nil {
+			return err
+		}
+		stolen.OwnerID = "thief"
+		stolen.Generation = stolen.Generation + 1
+		return thief.writeArchiveLock(ctx, key, *stolen, objstore.WithIfMatch(stolen.version))
+	})
+	if !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("publication release conflict error=%v, want Busy", err)
+	}
+	if workCalls != 1 {
+		t.Fatalf("work replayed %d times, want exactly 1", workCalls)
+	}
+	var sawTerminal bool
+	for _, event := range events {
+		if event.Resource == "publication_lock" && event.Branch == "release_mismatch_or_conflict" &&
+			event.Stage == "terminal" && event.Entered {
+			sawTerminal = true
+		}
+	}
+	if !sawTerminal {
+		t.Fatalf("publication release boundaries=%+v", events)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil || independent.head.Generation != seed.head.Generation {
+		t.Fatalf("HEAD changed after release conflict: generation=%d want=%d err=%v", independent.head.Generation, seed.head.Generation, err)
+	}
+	if _, _, err := seed.DecisionsFrom(ctx, 1, int(core.Tip())); err != nil {
+		t.Fatalf("archive unreadable after release conflict: %v", err)
+	}
+}
+
+// Carrying the observer onto a fresh release context must not import the source
+// context's deadline or cancellation.
+func testArchiveBusyTraceObserverCopyKeepsReleaseDeadline(t *testing.T) {
+	src, cancelSrc := context.WithCancel(context.Background())
+	defer cancelSrc()
+	var observed int
+	src = localtesthooks.WithArchiveBusyTrace(src, func(localtesthooks.ArchiveBusyEvent) { observed++ })
+	releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelRelease()
+	carried := localtesthooks.CarryArchiveBusyObserver(releaseCtx, src)
+	if _, ok := carried.Deadline(); !ok {
+		t.Fatal("carried context lost the release deadline")
+	}
+	if deadline, _ := carried.Deadline(); time.Until(deadline) > 5*time.Second {
+		t.Fatalf("carried deadline=%v, want the fresh 5s release deadline", time.Until(deadline))
+	}
+	cancelSrc()
+	if err := carried.Err(); err != nil {
+		t.Fatalf("source cancellation leaked into the release context: %v", err)
+	}
+	localtesthooks.HitArchiveBusy(carried, localtesthooks.ArchiveBusyEvent{Operation: "archive-sync", Resource: "publication_lock"})
+	if observed != 1 {
+		t.Fatalf("observer calls=%d, want 1", observed)
+	}
+	bare := localtesthooks.CarryArchiveBusyObserver(releaseCtx, context.Background())
+	localtesthooks.HitArchiveBusy(bare, localtesthooks.ArchiveBusyEvent{Operation: "archive-sync"})
+	if observed != 1 {
+		t.Fatalf("absent source observer was fabricated: calls=%d", observed)
 	}
 }
 
@@ -796,6 +1165,13 @@ func (b *gcAmbiguousHeadBucket) Upload(ctx context.Context, name string, r io.Re
 }
 
 func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) {
+	t.Run("archive_busy_real_gc_lock_and_non_busy", testArchiveBusyTraceRealGCLockAndNonBusy)
+	t.Run("archive_busy_real_conditional_exhaustion", testArchiveBusyTraceRealConditionalExhaustion)
+	t.Run("archive_busy_real_recovery_pin_and_release", testArchiveBusyTraceRealRecoveryPinAndRelease)
+	t.Run("archive_busy_real_release_conflict", testArchiveBusyTraceRealReleaseConflict)
+	t.Run("archive_busy_absent_observer", testArchiveBusyTraceAbsentObserver)
+	t.Run("archive_busy_publication_release_conflict", testArchiveBusyTracePublicationReleaseConflict)
+	t.Run("archive_busy_observer_copy_keeps_release_deadline", testArchiveBusyTraceObserverCopyKeepsReleaseDeadline)
 	t.Run("independent_publisher_waits_for_gc_publication_lease", testArchiveIndependentPublisherWaitsForGCPublicationLease)
 	t.Run("late_shared_batch_target_uses_one_publication_admission", testArchiveLateSharedBatchTargetUsesOnePublicationAdmission)
 	t.Run("direct_sync_keeps_fixed_target_and_noop_fast_path", testArchiveDirectSyncKeepsFixedTargetAndNoopFastPath)
