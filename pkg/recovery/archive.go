@@ -615,7 +615,7 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 				if err == nil && existing.LeaseUntilMS > time.Now().UnixMilli() {
 					return ErrArchiveBusy
 				}
-				traceRecoveryPinCreateAttempt(ctx, key, existing)
+				m.traceRecoveryPinCreateAttempt(ctx, key, existing)
 				options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
 				if err == nil {
 					options = []objstore.ObjectUploadOption{objstore.WithIfMatch(existing.version)}
@@ -632,7 +632,7 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 				}
 				// confirmRecoveryPin re-reads and compares the stored record, so this
 				// event is a verified readback rather than an upload ACK alone.
-				traceRecoveryPinReadback(ctx, key, localtesthooks.RecoveryPinCreateConfirmed, *stored)
+				m.traceRecoveryPinReadback(ctx, key, localtesthooks.RecoveryPinCreateConfirmed, *stored)
 				snapshot = &RecoverySnapshot{manager: m, head: head, refs: refs, pinKey: key, pin: *stored}
 				return nil
 			}
@@ -733,17 +733,17 @@ func (s *RecoverySnapshot) Renew(ctx context.Context, lease time.Duration) error
 		return ErrArchiveBusy
 	}
 	pin.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
-	traceRecoveryPin(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, *pin)
+	s.manager.traceRecoveryPin(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, *pin)
 	if err := s.manager.writeRecoveryPin(ctx, s.pinKey, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 		if s.manager.bucket.IsConditionNotMetErr(err) {
-			traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, localtesthooks.RecoveryPinWriteCondMet)
+			s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, localtesthooks.RecoveryPinWriteCondMet)
 			return ErrArchiveBusy
 		}
-		traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, localtesthooks.RecoveryPinWriteUnknown)
+		s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, localtesthooks.RecoveryPinWriteUnknown)
 		return err
 	}
 	// A renewal ACK is not a readback: no re-read happens on this path.
-	traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewConfirmed, localtesthooks.RecoveryPinWriteOK)
+	s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewConfirmed, localtesthooks.RecoveryPinWriteOK)
 	if pin.LeaseUntilMS <= time.Now().UnixMilli() {
 		return ErrArchiveBusy
 	}
@@ -757,33 +757,33 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 	pin, err := s.manager.readRecoveryPin(ctx, s.pinKey)
 	if err != nil {
 		if s.manager.bucket.IsObjNotFoundErr(err) {
-			traceRecoveryPinRead(ctx, s.pinKey, localtesthooks.RecoveryPinCloseAttempt, localtesthooks.RecoveryPinReadMissing)
+			s.manager.traceRecoveryPinRead(ctx, s.pinKey, localtesthooks.RecoveryPinCloseAttempt, localtesthooks.RecoveryPinReadMissing)
 			return nil
 		}
 		// One event carries the whole boundary: the read was invalid and no
 		// write was attempted. No error content is retained.
-		traceRecoveryPinReadFailure(ctx, s.pinKey, localtesthooks.RecoveryPinCloseError, localtesthooks.RecoveryPinReadInvalid)
+		s.manager.traceRecoveryPinReadFailure(ctx, s.pinKey, localtesthooks.RecoveryPinCloseError, localtesthooks.RecoveryPinReadInvalid)
 		return err
 	}
 	if pin.OwnerID != s.pin.OwnerID || pin.Token != s.pin.Token || pin.Base != s.pin.Base || pin.Tip != s.pin.Tip || pin.TailHash != s.pin.TailHash || pin.TailObject != s.pin.TailObject {
 		// The stored record was already read and does not match this snapshot, so
 		// no conditional upload is attempted. This is an identity mismatch, not a
 		// storage condition-not-met response.
-		traceRecoveryPinIdentityMismatch(ctx, s.pinKey)
+		s.manager.traceRecoveryPinIdentityMismatch(ctx, s.pinKey)
 		return ErrArchiveBusy
 	}
 	pin.LeaseUntilMS = time.Now().UnixMilli()
-	traceRecoveryPin(ctx, s.pinKey, localtesthooks.RecoveryPinCloseAttempt, *pin)
+	s.manager.traceRecoveryPin(ctx, s.pinKey, localtesthooks.RecoveryPinCloseAttempt, *pin)
 	if err := s.manager.writeRecoveryPin(ctx, s.pinKey, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 		if s.manager.bucket.IsConditionNotMetErr(err) {
-			traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseConflict, localtesthooks.RecoveryPinWriteCondMet)
+			s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseConflict, localtesthooks.RecoveryPinWriteCondMet)
 			return ErrArchiveBusy
 		}
-		traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseError, localtesthooks.RecoveryPinWriteUnknown)
+		s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseError, localtesthooks.RecoveryPinWriteUnknown)
 		return err
 	}
 	// A close ACK is not a readback: no re-read happens on this path.
-	traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseConfirmed, localtesthooks.RecoveryPinWriteOK)
+	s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseConfirmed, localtesthooks.RecoveryPinWriteOK)
 	return nil
 }
 
@@ -1546,17 +1546,37 @@ func (m *Manager) traceArchiveBusy(ctx context.Context, owner, key, branch, stag
 }
 
 // recoveryPinKeyHash returns the bounded hash suffix already used for the pin
-// object key. It never returns the owner string or the full object key.
-func recoveryPinKeyHash(key string) string {
-	const prefix = "archive/recovery-pins/"
+// object key. It accepts only the exact Manager namespace for recovery pins —
+// including the cluster prefix Node adds — and never returns the owner string
+// or the full object key. Any foreign or malformed key stays unknown.
+func (m *Manager) recoveryPinKeyHash(key string) string {
+	const namespace = "archive/recovery-pins/"
+	// The Manager prefix is the authoritative namespace; the unprefixed form is
+	// accepted only because an empty prefix already yields that exact value.
+	prefix := m.key(namespace)
 	if !strings.HasPrefix(key, prefix) {
 		return "unknown"
 	}
 	hash := strings.TrimPrefix(key, prefix)
-	if len(hash) > 16 {
-		hash = hash[:16]
+	// The suffix is always a full lowercase SHA-256 hex digest of the owner.
+	// Requiring that exact shape before truncating keeps arbitrary plaintext from
+	// being emitted as a key hash: a key that is not an owner digest never
+	// contributes any of its own characters.
+	if len(hash) != 64 || !isLowerHex(hash) {
+		return "unknown"
 	}
-	return hash
+	return hash[:16]
+}
+
+// isLowerHex reports whether s is entirely lowercase hexadecimal.
+func isLowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // recoveryPinLeaseState classifies a stored lease without retaining its value.
@@ -1573,14 +1593,14 @@ func recoveryPinLeaseState(leaseUntilMS, nowMS int64) (string, int64) {
 
 // traceRecoveryPin emits one lifecycle event derived only from a pin already
 // read on this path. It performs no additional provider IO.
-func traceRecoveryPin(ctx context.Context, key, phase string, pin archiveRecoveryPin) {
+func (m *Manager) traceRecoveryPin(ctx context.Context, key, phase string, pin archiveRecoveryPin) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	nowMS := time.Now().UnixMilli()
 	state, delta := recoveryPinLeaseState(pin.LeaseUntilMS, nowMS)
 	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
-		Phase: phase, KeyHash: recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
 		LeaseState: state, LeaseDeltaMS: delta, ReadStatus: localtesthooks.RecoveryPinReadOK,
 		WriteStatus: localtesthooks.RecoveryPinWriteUnknown, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
 		VersionPresent: pin.version != nil, ObservedAtMS: nowMS,
@@ -1591,13 +1611,13 @@ func traceRecoveryPin(ctx context.Context, key, phase string, pin archiveRecover
 // traceRecoveryPinCreateAttempt emits the pre-upload create boundary using
 // only the record the caller already read. A missing record is reported as a
 // read miss; no additional provider IO is performed.
-func traceRecoveryPinCreateAttempt(ctx context.Context, key string, existing *archiveRecoveryPin) {
+func (m *Manager) traceRecoveryPinCreateAttempt(ctx context.Context, key string, existing *archiveRecoveryPin) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	nowMS := time.Now().UnixMilli()
 	event := localtesthooks.RecoveryPinEvent{
-		Phase: localtesthooks.RecoveryPinCreateAttempt, KeyHash: recoveryPinKeyHash(key),
+		Phase: localtesthooks.RecoveryPinCreateAttempt, KeyHash: m.recoveryPinKeyHash(key),
 		OwnerCategory: localtesthooks.RecoveryPinCategory(ctx), LeaseState: localtesthooks.RecoveryPinLeaseUnknown,
 		ReadStatus: localtesthooks.RecoveryPinReadMissing, WriteStatus: localtesthooks.RecoveryPinWriteUnknown,
 		ReadbackStatus: localtesthooks.RecoveryPinReadbackNone, ObservedAtMS: nowMS,
@@ -1612,14 +1632,14 @@ func traceRecoveryPinCreateAttempt(ctx context.Context, key string, existing *ar
 
 // traceRecoveryPinReadback emits a create event whose stored record was
 // already re-read and compared by the existing confirm helper.
-func traceRecoveryPinReadback(ctx context.Context, key, phase string, pin archiveRecoveryPin) {
+func (m *Manager) traceRecoveryPinReadback(ctx context.Context, key, phase string, pin archiveRecoveryPin) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	nowMS := time.Now().UnixMilli()
 	state, delta := recoveryPinLeaseState(pin.LeaseUntilMS, nowMS)
 	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
-		Phase: phase, KeyHash: recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
 		LeaseState: state, LeaseDeltaMS: delta, ReadStatus: localtesthooks.RecoveryPinReadOK,
 		WriteStatus: localtesthooks.RecoveryPinWriteOK, ReadbackStatus: localtesthooks.RecoveryPinReadbackDone,
 		VersionPresent: pin.version != nil, ObservedAtMS: nowMS,
@@ -1632,36 +1652,36 @@ func traceRecoveryPinReadback(ctx context.Context, key, phase string, pin archiv
 // write status stays not_attempted and never claims a conditional conflict.
 // traceRecoveryPinReadFailure emits one terminal row for a failed read. The
 // write status stays not_attempted because no upload followed the read.
-func traceRecoveryPinReadFailure(ctx context.Context, key, phase, readStatus string) {
+func (m *Manager) traceRecoveryPinReadFailure(ctx context.Context, key, phase, readStatus string) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
-		Phase: phase, KeyHash: recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
 		LeaseState: localtesthooks.RecoveryPinLeaseUnknown, ReadStatus: readStatus,
 		WriteStatus: localtesthooks.RecoveryPinWriteNotAttempted, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
 		ObservedAtMS: time.Now().UnixMilli(),
 	})
 }
 
-func traceRecoveryPinIdentityMismatch(ctx context.Context, key string) {
+func (m *Manager) traceRecoveryPinIdentityMismatch(ctx context.Context, key string) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
-		Phase: localtesthooks.RecoveryPinCloseConflict, KeyHash: recoveryPinKeyHash(key),
+		Phase: localtesthooks.RecoveryPinCloseConflict, KeyHash: m.recoveryPinKeyHash(key),
 		OwnerCategory: localtesthooks.RecoveryPinCategory(ctx), LeaseState: localtesthooks.RecoveryPinLeaseUnknown,
 		ReadStatus: localtesthooks.RecoveryPinReadIdentityMismatch, WriteStatus: localtesthooks.RecoveryPinWriteNotAttempted,
 		ReadbackStatus: localtesthooks.RecoveryPinReadbackNone, ObservedAtMS: time.Now().UnixMilli(),
 	})
 }
 
-func traceRecoveryPinRead(ctx context.Context, key, phase, status string) {
+func (m *Manager) traceRecoveryPinRead(ctx context.Context, key, phase, status string) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
-		Phase: phase, KeyHash: recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
 		LeaseState: localtesthooks.RecoveryPinLeaseUnknown, ReadStatus: status,
 		WriteStatus: localtesthooks.RecoveryPinWriteUnknown, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
 		ObservedAtMS: time.Now().UnixMilli(),
@@ -1669,12 +1689,12 @@ func traceRecoveryPinRead(ctx context.Context, key, phase, status string) {
 }
 
 // traceRecoveryPinWrite emits a finite write outcome without the pin body.
-func traceRecoveryPinWrite(ctx context.Context, key, phase, status string) {
+func (m *Manager) traceRecoveryPinWrite(ctx context.Context, key, phase, status string) {
 	if !localtesthooks.Enabled {
 		return
 	}
 	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
-		Phase: phase, KeyHash: recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
 		LeaseState: localtesthooks.RecoveryPinLeaseUnknown, ReadStatus: localtesthooks.RecoveryPinReadUnknown,
 		WriteStatus: status, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
 		ObservedAtMS: time.Now().UnixMilli(),
@@ -2009,7 +2029,7 @@ func (m *Manager) maxActiveRecoveryGeneration(ctx context.Context) (uint64, erro
 			// The stored lease is already past its expiry. Report the observed
 			// classification before the tombstone write, using only the record the
 			// guard already read.
-			traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
+			m.traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
 			pin.LeaseUntilMS = 0
 			if err := m.writeRecoveryPin(ctx, key, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 				if m.bucket.IsConditionNotMetErr(err) {
@@ -2044,25 +2064,25 @@ func (m *Manager) hasActiveRecoveryPins(ctx context.Context) (bool, error) {
 			// The stored lease is already past its expiry. Report the observed
 			// classification from the record the guard already read, before the
 			// tombstone write.
-			traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
+			m.traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
 			pin.LeaseUntilMS = 0
 			if err := m.writeRecoveryPin(ctx, key, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 				if m.bucket.IsConditionNotMetErr(err) {
 					m.traceArchiveBusy(ctx, "unknown", m.key("archive/recovery-pins"), "pin_expiry_conflict", "site", true)
-					traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteCondMet)
+					m.traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteCondMet)
 					return ErrArchiveBusy
 				}
-				traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteUnknown)
+				m.traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteUnknown)
 				return err
 			}
-			traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteOK)
+			m.traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteOK)
 			return nil
 		}
 		active = true
 		// This is the exact pin that made the guard report an active recovery
 		// pin. The guard cannot know which caller created it.
-		traceRecoveryPinRead(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinReadOK)
-		traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
+		m.traceRecoveryPinRead(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinReadOK)
+		m.traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
 		return nil
 	})
 	return active, err

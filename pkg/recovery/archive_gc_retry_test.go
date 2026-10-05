@@ -1226,6 +1226,81 @@ func (tr *recoveryPinTrace) phases(phase string) []localtesthooks.RecoveryPinEve
 	return matched
 }
 
+// Node runs the recovery Manager under a non-empty cluster prefix, so the pin
+// object key carries that prefix. The bounded hash suffix must be extracted from
+// the exact Manager namespace; otherwise every natural key collapses to
+// "unknown". A foreign namespace, a malformed suffix, or a key belonging to a
+// different Manager must stay "unknown" rather than leak a bounded value.
+func testRecoveryPinLifecycleKeyHashUsesManagerNamespace(t *testing.T) {
+	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	defer manager.Close()
+
+	first := manager.recoveryPinKey("pin-namespace-a")
+	second := manager.recoveryPinKey("pin-namespace-b")
+	if first == second {
+		t.Fatal("two distinct owners must not share a pin object key")
+	}
+	if !strings.HasPrefix(first, "cluster/archive/recovery-pins/") {
+		t.Fatalf("fixture assumption broken: pin key %q lacks the cluster prefix", first)
+	}
+
+	firstHash := manager.recoveryPinKeyHash(first)
+	if firstHash == "unknown" || firstHash == "" {
+		t.Fatalf("prefixed manager key must yield a bounded hash suffix, got %q", firstHash)
+	}
+	if len(firstHash) > 16 {
+		t.Fatalf("key hash %q exceeds the bounded 16-hex suffix", firstHash)
+	}
+	if !strings.HasPrefix(strings.TrimPrefix(first, manager.key("archive/recovery-pins/")), firstHash) || strings.Contains(firstHash, "/") {
+		t.Fatalf("key hash %q must be only the bounded suffix of the pin key", firstHash)
+	}
+	if secondHash := manager.recoveryPinKeyHash(second); secondHash == firstHash {
+		t.Fatalf("distinct owners must stay distinct under the manager prefix: both %q", firstHash)
+	}
+
+	// An unprefixed Manager accepts the unprefixed namespace exactly, because
+	// that is what m.key produces when the prefix is empty.
+	unprefixed := NewManager(objstore.NewInMemBucket(), "", 1)
+	defer unprefixed.Close()
+	unprefixedKey := unprefixed.recoveryPinKey("pin-unprefixed")
+	if got := unprefixed.recoveryPinKeyHash(unprefixedKey); got == "unknown" || got == "" {
+		t.Fatalf("empty-prefix manager key must yield a bounded hash suffix, got %q", got)
+	}
+
+	for name, key := range map[string]string{
+		"foreign_cluster_prefix":   "other-cluster/archive/recovery-pins/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"foreign_namespace":        "cluster/archive/other/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"nested_suffix":            "cluster/archive/recovery-pins/ab/cd0123456789abcdef",
+		"empty_suffix":             "cluster/archive/recovery-pins/",
+		"unrelated_object":         "cluster/archive/PUBLISH_LOCK",
+		"empty":                    "",
+		"prefix_only_no_slash":     "cluster/archive/recovery-pins",
+		"prefix_without_namespace": "clusterarchive/recovery-pins/0123456789abcdef",
+		// The suffix must be an exact 64-char lowercase owner digest. A key that
+		// is not one must never contribute any of its own plaintext characters.
+		"plaintext_64_chars": "cluster/archive/recovery-pins/this-is-not-a-hash-but-exactly-sixty-four-characters-long-abcdef",
+		"short_suffix":       "cluster/archive/recovery-pins/0123456789abcdef",
+		"long_suffix":        "cluster/archive/recovery-pins/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"uppercase_suffix":   "cluster/archive/recovery-pins/0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+		"non_hex_suffix":     "cluster/archive/recovery-pins/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+	} {
+		if got := manager.recoveryPinKeyHash(key); got != "unknown" {
+			t.Errorf("%s: key hash = %q, want unknown for key %q", name, got, key)
+		}
+	}
+
+	// A valid 64-char digest still yields the bounded 16-hex suffix.
+	const validDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	if got := manager.recoveryPinKeyHash("cluster/archive/recovery-pins/" + validDigest); got != validDigest[:16] {
+		t.Errorf("valid digest key hash = %q, want %q", got, validDigest[:16])
+	}
+
+	// A key from a different Manager namespace is foreign to this one.
+	if got := unprefixed.recoveryPinKeyHash(first); got != "unknown" {
+		t.Fatalf("cluster-prefixed key must stay unknown to an unprefixed manager, got %q", got)
+	}
+}
+
 // A created pin is confirmed by the existing confirm helper, which re-reads and
 // compares the stored record. Renewal and close only receive an upload ACK on
 // their own paths, so neither may claim a verified readback.
@@ -1511,6 +1586,7 @@ func testRecoveryPinLifecycleExpiredTombstoneGuard(t *testing.T) {
 }
 
 func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) {
+	t.Run("recovery_pin_lifecycle_key_hash_uses_manager_namespace", testRecoveryPinLifecycleKeyHashUsesManagerNamespace)
 	t.Run("recovery_pin_lifecycle_backend_read_failure_is_close_error", testRecoveryPinLifecycleBackendReadFailureIsCloseError)
 	t.Run("recovery_pin_lifecycle_conditional_write_conflict", testRecoveryPinLifecycleConditionalWriteConflict)
 	t.Run("recovery_pin_lifecycle_expired_tombstone_guard", testRecoveryPinLifecycleExpiredTombstoneGuard)
