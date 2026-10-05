@@ -454,6 +454,9 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		t.Cleanup(maintenance.stopAndWait)
 	}
 	transportObserver.SetPhase("measurement")
+	overloadSites := &nodeForegroundOverloadSiteCollector{}
+	restoreOverloadSites := localtesthooks.Set(overloadSites.observe)
+	t.Cleanup(restoreOverloadSites)
 	observeMeasured := func(observation foregroundcosttest.Observation) {
 		metrics.observe(observation)
 		if maintenance != nil {
@@ -461,6 +464,8 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		}
 	}
 	measuredResult, err := foregroundcosttest.RunWindow(ctx, options(nodeForegroundMeasure, maintenance), put, get, observeMeasured, nil)
+	restoreOverloadSites()
+	overloadSites.log(t)
 	if maintenance != nil {
 		maintenance.stopAndWait()
 		transportObserver.SetPhase("measurement")
@@ -2771,6 +2776,98 @@ type nodeForegroundCostMetrics struct {
 	overlap              nodeForegroundMetricCohort
 	nonOverlap           nodeForegroundMetricCohort
 	firstError           string
+}
+
+// These names are fixed hook literals, not request identities. A batch-level
+// rejection may fail several API calls, so their counts are never attributed
+// one-for-one to the separately logged foreground API errors.
+var nodeForegroundOverloadSiteNames = [...]string{
+	"network:mutation-admission:rejected",
+	"network:mutation-queue:reservation-rejected",
+	"network:mutation-queue:input-channel-full",
+	"network:mutation-queue:worker-inflight-bytes-rejected",
+	"network:proposal-admission:byte-budget-rejected",
+	"network:proposal-admission:local-cap-rejected",
+	"network:proposal-admission:operation-cap-rejected",
+}
+
+// Atomic fixed-size counters keep the global test-hook callback nonblocking.
+// Unrelated hook names are ignored; an unrecognized overload name is counted
+// as unknown rather than retained as a potentially unbounded string.
+type nodeForegroundOverloadSiteCollector struct {
+	counts  [len(nodeForegroundOverloadSiteNames)]atomic.Uint64
+	unknown atomic.Uint64
+	first   atomic.Uint32 // 1-based site index, or len(names)+1 for unknown.
+}
+
+func (c *nodeForegroundOverloadSiteCollector) observe(name string) {
+	if !strings.HasPrefix(name, "network:mutation-") && !strings.HasPrefix(name, "network:proposal-admission:") {
+		return
+	}
+	for i, site := range nodeForegroundOverloadSiteNames {
+		if name == site {
+			c.counts[i].Add(1)
+			c.first.CompareAndSwap(0, uint32(i+1))
+			return
+		}
+	}
+	c.unknown.Add(1)
+	c.first.CompareAndSwap(0, uint32(len(nodeForegroundOverloadSiteNames)+1))
+}
+
+func (c *nodeForegroundOverloadSiteCollector) log(t *testing.T) {
+	t.Helper()
+	first := "not_observed"
+	if index := c.first.Load(); index > 0 {
+		first = "site_unknown"
+		if index <= uint32(len(nodeForegroundOverloadSiteNames)) {
+			first = nodeForegroundOverloadSiteNames[index-1]
+		}
+	}
+	unknown := c.unknown.Load()
+	total := unknown
+	for i, site := range nodeForegroundOverloadSiteNames {
+		count := c.counts[i].Load()
+		total += count
+		t.Logf("node_foreground_overload_site phase=measurement site=%s events=%d interpretation=aggregate_site_events_not_per_request_attribution", site, count)
+	}
+	t.Logf("node_foreground_overload_site phase=measurement total_events=%d site_unknown=%d first_site=%s interpretation=aggregate_site_events_not_per_request_attribution", total, unknown, first)
+}
+
+func TestNodeForegroundOverloadSiteCollectorCountsFixedNames(t *testing.T) {
+	collector := &nodeForegroundOverloadSiteCollector{}
+	restore := localtesthooks.Set(collector.observe)
+	t.Cleanup(restore)
+	localtesthooks.Hit("network:learned:unrelated")
+	localtesthooks.Hit(nodeForegroundOverloadSiteNames[2])
+	localtesthooks.Hit("network:mutation-queue:unrecognized")
+	const workers = 16
+	var group sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for _, site := range nodeForegroundOverloadSiteNames {
+				localtesthooks.Hit(site)
+			}
+		}()
+	}
+	group.Wait()
+	if got := collector.first.Load(); got != 3 {
+		t.Fatalf("first site index=%d, want input-channel-full index 3", got)
+	}
+	if got := collector.unknown.Load(); got != 1 {
+		t.Fatalf("unknown overload site events=%d, want 1", got)
+	}
+	for i, site := range nodeForegroundOverloadSiteNames {
+		want := uint64(workers)
+		if i == 2 {
+			want++
+		}
+		if got := collector.counts[i].Load(); got != want {
+			t.Fatalf("site %s events=%d, want %d", site, got, want)
+		}
+	}
 }
 
 type nodeStoreSnapshot struct {

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 )
 
@@ -45,6 +46,7 @@ func (s *Server) admitMutation(charge int) (*mutationLease, error) {
 	s.mutationMu.Lock()
 	defer s.mutationMu.Unlock()
 	if s.mutationAdmission.count >= maxAdmittedMutations || charge > maxAdmittedBytes-s.mutationAdmission.bytes {
+		localtesthooks.Hit("network:mutation-admission:rejected")
 		return nil, ErrOverloaded
 	}
 	s.mutationAdmission.count++

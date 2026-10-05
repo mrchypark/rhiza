@@ -574,12 +574,14 @@ func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *muta
 	}
 	if len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB {
 		s.proposeMu.Unlock()
+		localtesthooks.Hit("network:proposal-admission:byte-budget-rejected")
 		return 0, proposalAdmissionOverload{}
 	}
 	select {
 	case s.localCap <- struct{}{}:
 	default:
 		s.proposeMu.Unlock()
+		localtesthooks.Hit("network:proposal-admission:local-cap-rejected")
 		return 0, proposalAdmissionOverload{}
 	}
 	select {
@@ -587,6 +589,7 @@ func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *muta
 	default:
 		<-s.localCap
 		s.proposeMu.Unlock()
+		localtesthooks.Hit("network:proposal-admission:operation-cap-rejected")
 		return 0, proposalAdmissionOverload{}
 	}
 	call := &proposalCall{done: make(chan struct{})}
