@@ -409,12 +409,13 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		operation := func(operationCtx context.Context) (nodeForegroundMaintenanceResult, error) {
 			operationID := publisherBusyOperationID.Add(1)
 			collector := &nodeForegroundPublisherBusyCollector{}
-			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, func(event checkpoint.PublisherBusyObservation) {
+			observePublisher := func(event checkpoint.PublisherBusyObservation) {
 				claimCollector.observe(event)
 				if event.Source == "publisher_claim_active" || event.Source == "publisher_claim_conditional_exhausted" || event.Source == "generation_claim_active" || event.Source == "generation_claim_conditional_exhausted" {
 					collector.observe(event)
 				}
-			})
+			}
+			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, observePublisher)
 			archiveCollector := &nodeForegroundArchiveBusyCollector{}
 			guardCollector := &nodeForegroundRecoveryPinGuardCollector{operationID: operationID}
 			if scenario == "checkpoint-active" {
@@ -434,7 +435,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			var err error
 			switch scenario {
 			case "checkpoint-active":
-				result, err = runNodeForegroundCheckpoint(operationCtx, nodes[0], maintenanceStateDir)
+				result, err = runNodeForegroundCheckpoint(t, operationCtx, nodes[0], maintenanceStateDir, operationID, observePublisher)
 			case "archive-cleanup-active":
 				result, err = runNodeForegroundArchiveCleanup(t, operationCtx, nodes[0], maintenanceStateDir, archivePhaseTrace)
 			default:
@@ -2488,7 +2489,66 @@ func (m *nodeForegroundMaintenance) log(t *testing.T, measurementWindow time.Dur
 	t.Logf("node_foreground_maintenance mode=%s attempts=%d completed=%d work=%d noops=%d failures=%d total_operation_time=%s max_operation_time=%s average_operation_time=%s measured_window=%s candidate_first=%d candidate_last=%d winning_current_first=%d winning_current_last=%d interval_store_totals=%+v interval_store_attribution=concurrent_with_api_traffic first_error=%v", m.mode, m.attempts, m.completed, m.work, m.noops, m.failures, total, maximum, average, measurementWindow, m.candidateFirst, m.candidateLast, m.winnerFirst, m.winnerLast, m.stats, m.firstErr)
 }
 
-func runNodeForegroundCheckpoint(ctx context.Context, node *Node, sharedReadDir string) (nodeForegroundMaintenanceResult, error) {
+type nodeForegroundClaimRetryCounts struct {
+	attempts, refusals, waits, archiveSyncs int
+}
+
+func nodeForegroundLiveClaimRefusal(event checkpoint.PublisherBusyObservation) bool {
+	return event.Source == "publisher_claim_active" && event.RequestedPurpose == "publisher" && event.ActiveClaim && event.VersionPresent && event.LeaseRemainingMillis > 0
+}
+
+// A live claim refusal occurs before this attempt uploads a publisher claim.
+// Recheck archive coverage because the materialized tip can advance while waiting.
+func retryNodeForegroundCheckpointClaim(ctx context.Context, syncArchive, checkpointAttempt func(context.Context) error, forward func(checkpoint.PublisherBusyObservation)) (nodeForegroundClaimRetryCounts, error) {
+	const maxAttempts = 50
+	const retryDelay = 20 * time.Millisecond
+	var counts nodeForegroundClaimRetryCounts
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return counts, err
+		}
+		counts.archiveSyncs++
+		if err := syncArchive(ctx); err != nil {
+			return counts, fmt.Errorf("sync archive through live core tip: %w", err)
+		}
+		var seen atomic.Int32
+		var liveClaim atomic.Bool
+		attemptCtx := checkpoint.WithPublisherBusyObserver(ctx, func(event checkpoint.PublisherBusyObservation) {
+			if forward != nil {
+				forward(event)
+			}
+			seen.Add(1)
+			if nodeForegroundLiveClaimRefusal(event) {
+				liveClaim.Store(true)
+			}
+		})
+		counts.attempts++
+		err := checkpointAttempt(attemptCtx)
+		if err == nil {
+			return counts, nil
+		}
+		// A wrapped or joined Busy, or any positive acquisition/publication
+		// event in this attempt, has an ambiguous commit outcome and is terminal.
+		if err != checkpoint.ErrPublisherBusy || seen.Load() != 1 || !liveClaim.Load() {
+			return counts, fmt.Errorf("checkpoint live materialized state: %w", err)
+		}
+		counts.refusals++
+		if attempt+1 == maxAttempts {
+			return counts, fmt.Errorf("checkpoint live materialized state: %w", err)
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-timer.C:
+			counts.waits++
+		case <-ctx.Done():
+			timer.Stop()
+			return counts, ctx.Err()
+		}
+	}
+	panic("unreachable checkpoint claim retry state")
+}
+
+func runNodeForegroundCheckpoint(t *testing.T, ctx context.Context, node *Node, sharedReadDir string, operationID uint64, forward func(checkpoint.PublisherBusyObservation)) (nodeForegroundMaintenanceResult, error) {
 	if node == nil || node.archive == nil || node.core == nil || node.material == nil || node.checkpointer == nil || node.checkpoints == nil {
 		return nodeForegroundMaintenanceResult{}, fmt.Errorf("checkpoint maintenance components unavailable")
 	}
@@ -2499,12 +2559,18 @@ func runNodeForegroundCheckpoint(ctx context.Context, node *Node, sharedReadDir 
 	}
 	beforeArchiveTip := uint64(node.archive.Tip())
 	beforeStore := snapshotNodeStoreStats([]*Node{node})
-	if err := node.archive.SyncThrough(ctx, node.core, node.core.Tip()); err != nil {
-		return nodeForegroundMaintenanceResult{}, fmt.Errorf("sync archive through live core tip: %w", err)
+	var stateTip uint64
+	counts, err := retryNodeForegroundCheckpointClaim(ctx, func(attemptCtx context.Context) error {
+		return node.archive.SyncThrough(attemptCtx, node.core, node.core.Tip())
+	}, func(attemptCtx context.Context) error {
+		stateTip = node.material.StateTip()
+		return node.checkpointer.CheckpointOnShutdown(attemptCtx, stateTip)
+	}, forward)
+	if counts.refusals > 0 || err != nil {
+		t.Logf("node_foreground_checkpoint_claim_retry operation_id=%d attempts=%d pre_admission_refusals=%d waits=%d archive_sync_checks=%d final_success=%t", operationID, counts.attempts, counts.refusals, counts.waits, counts.archiveSyncs, err == nil)
 	}
-	stateTip := node.material.StateTip()
-	if err := node.checkpointer.CheckpointOnShutdown(ctx, stateTip); err != nil {
-		return nodeForegroundMaintenanceResult{}, fmt.Errorf("checkpoint live materialized state: %w", err)
+	if err != nil {
+		return nodeForegroundMaintenanceResult{}, err
 	}
 	candidate := node.checkpoints.Latest()
 	if candidate == nil || candidate.Index < stateTip {
