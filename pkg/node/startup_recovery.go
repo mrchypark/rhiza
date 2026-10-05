@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
@@ -29,6 +30,7 @@ type startupRecoveryGuard struct {
 }
 
 func newStartupRecoveryGuard(ctx context.Context, archive *recovery.Manager, owner string) (*startupRecoveryGuard, error) {
+	ctx = localtesthooks.WithRecoveryPinCategory(ctx, localtesthooks.RecoveryPinOwnerStartup)
 	workCtx, cancel := context.WithCancel(ctx)
 	g := &startupRecoveryGuard{ctx: workCtx, cancel: cancel, done: make(chan struct{}), owner: owner}
 	// Snapshot even an empty head. BeginRecoverySnapshot reloads under the
@@ -117,6 +119,10 @@ func (g *startupRecoveryGuard) Close() {
 		<-g.done
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// Carry only the recovery pin observer onto the fresh close context. The
+		// background semantics, deadline, cancellation, and discarded error are
+		// unchanged.
+		closeCtx = localtesthooks.CarryRecoveryPinObserver(closeCtx, g.ctx)
 		g.mu.Lock()
 		root, snapshot := g.root, g.snapshot
 		g.mu.Unlock()

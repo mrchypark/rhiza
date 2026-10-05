@@ -43,7 +43,13 @@ const (
 	nodeForegroundGatewayClose         = 7 * time.Second
 	nodeForegroundCleanupSlack         = 5 * time.Second
 	nodeForegroundGCGracePeriod        = 24 * time.Hour
-	nodeForegroundP99MinSamples        = 10000
+	// Bounded recovery-pin lifecycle table. Eight keys, eight ordinary rows per
+	// key, and two reserved close rows per key are fixed; nothing grows.
+	nodeForegroundRecoveryPinKeyLimit      = 8
+	nodeForegroundRecoveryPinEventLimit    = 8
+	nodeForegroundRecoveryPinReservedClose = 2
+	nodeForegroundRecoveryPinTerminalLimit = 16
+	nodeForegroundP99MinSamples            = 10000
 	// Planning reserve for three per-node preparations, their bounded archive/
 	// checkpoint shutdown operations, gateway close, and small accounting slack.
 	// It is not a hard upper bound for Checkpointer/Node worker joins; the outer
@@ -152,6 +158,11 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		t.Fatalf("read Versity setup baseline: %v", err)
 	}
 	ctx = objmetrics.WithReplayObservation(ctx)
+	// The recovery pin observer is installed on the outer context before any
+	// Node.Open, so startup and catch-up pin lifecycles are observable and not
+	// only the maintenance path. It is a fixed-size nonblocking collector.
+	recoveryPinCollector := &nodeForegroundRecoveryPinCollector{}
+	ctx = localtesthooks.WithRecoveryPinTrace(ctx, recoveryPinCollector.observe)
 	transportObserver, unregisterTransportObserver, err := objmetrics.RegisterS3TransportObserver(endpoint, []string{"n1", "n2", "n3"})
 	if err != nil {
 		t.Fatalf("register tagged S3 transport observer: %v", err)
@@ -397,7 +408,13 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 				publisherBusyFailures.record(operationID, events, overflow)
 			}
 			if errors.Is(err, recovery.ErrArchiveBusy) {
-				archiveBusyFailures.record(operationID, archiveCollector.snapshot())
+				// latchFailure captures the pin table at the first Busy before the
+				// pinned guard key is released, so the first-Busy evidence is
+				// immutable while later close/expiry rows stay observable in the
+				// final lifecycle snapshot.
+				snapshot := archiveCollector.snapshot()
+				recoveryPinCollector.latchFailure()
+				archiveBusyFailures.record(operationID, snapshot)
 			}
 			return result, err
 		}
@@ -418,6 +435,16 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		maintenance.log(t, nodeForegroundMeasure)
 		if archivePhaseTrace != nil {
 			archivePhaseTrace.log(t)
+		}
+		// The pin lifecycle table covers the whole run, including pins created
+		// before Node.Open, so it is logged next to the terminal archive Busy
+		// attribution rather than only on failure.
+		recoveryPinCollector.snapshot().log(t)
+		if firstBusy := recoveryPinCollector.firstBusySnapshot(); firstBusy != nil {
+			t.Log("node_foreground_recovery_pin scope=first_busy (immutable copy captured before guard unpin)")
+			firstBusy.log(t)
+		} else {
+			t.Log("node_foreground_recovery_pin scope=first_busy snapshot=absent")
 		}
 		if firstErr := maintenance.firstError(); firstErr != nil {
 			types, status := nodeForegroundMaintenanceErrorTypeChain(firstErr)
@@ -599,6 +626,349 @@ func TestNodeForegroundPublisherBusyCollectorBoundsConcurrentEvents(t *testing.T
 	failures.record(3, []checkpoint.PublisherBusyObservation{{Source: "later"}}, 0)
 	if failures.failure == nil || failures.failure.operationID != 2 || len(failures.failure.events) != nodeForegroundPublisherBusyEventLimit || failures.failure.overflow != 4 {
 		t.Fatalf("failure=%+v", failures.failure)
+	}
+}
+
+// The recovery pin table is fixed and bounded: ordinary rows stop at the
+// per-key limit, close rows keep their own reserved budget, and a key beyond
+// the table is counted as unknown instead of growing.
+func TestNodeForegroundRecoveryPinCollectorBoundsRowsAndKeys(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	for i := 0; i < nodeForegroundRecoveryPinEventLimit+4; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "key-a", Phase: localtesthooks.RecoveryPinCreateAttempt})
+	}
+	snapshot := collector.snapshot()
+	if len(snapshot.hashes) != 1 || snapshot.counts[0] != nodeForegroundRecoveryPinEventLimit {
+		t.Fatalf("ordinary rows: keys=%d count=%d, want 1/%d", len(snapshot.hashes), snapshot.counts[0], nodeForegroundRecoveryPinEventLimit)
+	}
+	if snapshot.eventOverflow != 4 {
+		t.Fatalf("ordinary overflow=%d, want 4", snapshot.eventOverflow)
+	}
+
+	// Close rows use their own reserved budget and are never displaced by the
+	// full ordinary budget.
+	for i := 0; i < nodeForegroundRecoveryPinReservedClose+3; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "key-a", Phase: localtesthooks.RecoveryPinCloseAttempt})
+	}
+	snapshot = collector.snapshot()
+	if snapshot.closeCounts[0] != nodeForegroundRecoveryPinReservedClose || snapshot.closeOverflow != 3 {
+		t.Fatalf("close rows=%d overflow=%d, want %d/3", snapshot.closeCounts[0], snapshot.closeOverflow, nodeForegroundRecoveryPinReservedClose)
+	}
+
+	// A key beyond the fixed table replaces the oldest slot; the table never
+	// grows and the displaced join is reported as unknown.
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+		// Ordinary rows only: a dropped decision row is covered separately so the
+		// terminal_missing contract is not conflated with key-table overflow.
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("key-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	}
+	snapshot = collector.snapshot()
+	if len(snapshot.hashes) > nodeForegroundRecoveryPinKeyLimit {
+		t.Fatalf("tracked keys=%d exceed the fixed limit %d", len(snapshot.hashes), nodeForegroundRecoveryPinKeyLimit)
+	}
+	if snapshot.keyEvicted == 0 || !snapshot.joinUnknown {
+		t.Fatalf("a displaced key must be counted and joined as unknown: %+v", snapshot)
+	}
+	if snapshot.keyMiss != 0 {
+		t.Fatalf("a replaceable key must not be counted as a miss: %d", snapshot.keyMiss)
+	}
+	if snapshot.termMiss {
+		t.Fatalf("terminal missing must not be reported before the fixed terminal budget is exceeded")
+	}
+}
+
+// The fixed table replaces the oldest key rather than freezing the first eight
+// forever: the ninth key displaces the oldest slot, the pinned guard key is
+// retained until a failure is latched, and a displaced join stays explicitly
+// unknown.
+func TestNodeForegroundRecoveryPinCollectorReplacesOldestKey(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("fill-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "ninth", Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	snapshot := collector.snapshot()
+	if len(snapshot.hashes) != nodeForegroundRecoveryPinKeyLimit {
+		t.Fatalf("tracked keys=%d, want %d", len(snapshot.hashes), nodeForegroundRecoveryPinKeyLimit)
+	}
+	if containsRecoveryPinHash(snapshot.hashes, "fill-00") {
+		t.Fatalf("the oldest key must be replaced: %v", snapshot.hashes)
+	}
+	if !containsRecoveryPinHash(snapshot.hashes, "ninth") {
+		t.Fatalf("the newest key must be retained: %v", snapshot.hashes)
+	}
+	if snapshot.keyEvicted != 1 || !snapshot.joinUnknown {
+		t.Fatalf("replacement must count an eviction and an unknown join: %+v", snapshot)
+	}
+	if snapshot.termMiss {
+		t.Fatalf("a replaced ordinary key must not fabricate a missing terminal")
+	}
+}
+
+func containsRecoveryPinHash(hashes []string, want string) bool {
+	for _, hash := range hashes {
+		if hash == want {
+			return true
+		}
+	}
+	return false
+}
+
+// The guard key seen by the first guard read with a live lease is pinned: later
+// keys replace other slots, and the guard identity is never overwritten by a
+// replacement.
+func TestNodeForegroundRecoveryPinCollectorRetainsGuardKey(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit*2; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("other-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	}
+	snapshot := collector.snapshot()
+	if !containsRecoveryPinHash(snapshot.hashes, "guard-key") {
+		t.Fatalf("the pinned guard key must survive replacement: %v", snapshot.hashes)
+	}
+	if snapshot.termMiss {
+		t.Fatalf("the retained guard row must stay attributable: %+v", snapshot)
+	}
+	if snapshot.keyMiss != 0 {
+		t.Fatalf("replacement must keep admitting keys: %d", snapshot.keyMiss)
+	}
+}
+
+// An expired (or zero-delta) guard row describes a healthy released pin, so it
+// must not pin its key; the later guard read on the live lease is the key that
+// gets retained.
+func TestNodeForegroundRecoveryPinCollectorExpiredGuardDoesNotPinKey(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "expired-startup", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseExpired, LeaseDeltaMS: -1000})
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "zero-lease", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseZero, LeaseDeltaMS: 0})
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "active-guard", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 1000})
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("churn-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	}
+	snapshot := collector.snapshot()
+	if !containsRecoveryPinHash(snapshot.hashes, "active-guard") {
+		t.Fatalf("the live-lease guard key must be retained: %v", snapshot.hashes)
+	}
+	if containsRecoveryPinHash(snapshot.hashes, "expired-startup") {
+		t.Fatalf("an expired guard key must not be pinned: %v", snapshot.hashes)
+	}
+}
+
+// After a failure is latched the guard key is no longer pinned, so ordinary
+// replacement ordering resumes.
+func TestNodeForegroundRecoveryPinCollectorGuardPinReleasedAfterFailure(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
+	collector.latchFailure()
+	if collector.latchCount != 1 {
+		t.Fatalf("latchCount=%d, want 1 after the first latch", collector.latchCount)
+	}
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit*2; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("post-failure-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	}
+	if containsRecoveryPinHash(collector.snapshot().hashes, "guard-key") {
+		t.Fatalf("the guard pin must be released once a failure is latched")
+	}
+}
+
+// The first-Busy copy is immutable: post-latch churn beyond the fixed capacity,
+// shutdown rows, and a repeated latch must never mutate or replace it, while the
+// final lifecycle snapshot still shows the later close timeline.
+func TestNodeForegroundRecoveryPinCollectorFirstBusySnapshotImmutable(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "cause-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "cause-key", Phase: localtesthooks.RecoveryPinCreateConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 4000})
+	collector.latchFailure()
+	first := collector.firstBusySnapshot()
+	if first == nil {
+		t.Fatalf("the first Busy must capture a pin snapshot")
+	}
+	if first.scope != "first_busy" {
+		t.Fatalf("scope=%q, want first_busy", first.scope)
+	}
+	if !containsRecoveryPinHash(first.hashes, "cause-key") {
+		t.Fatalf("the first-Busy copy must retain the cause key: %v", first.hashes)
+	}
+	// Post-latch churn plus a shutdown close row for the cause key.
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit*3; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("post-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "cause-key", Phase: localtesthooks.RecoveryPinCloseConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	// A repeated latch must not overwrite the first capture.
+	collector.latchFailure()
+
+	again := collector.firstBusySnapshot()
+	if len(again.hashes) != len(first.hashes) || len(again.hashes) > nodeForegroundRecoveryPinKeyLimit {
+		t.Fatalf("first-Busy copy mutated: %v vs %v", first.hashes, again.hashes)
+	}
+	if !containsRecoveryPinHash(again.hashes, "cause-key") {
+		t.Fatalf("the first-Busy cause key must survive post-latch eviction: %v", again.hashes)
+	}
+	for i := range again.counts {
+		if again.counts[i] != first.counts[i] || again.closeCounts[i] != first.closeCounts[i] {
+			t.Fatalf("first-Busy row counts mutated: before=%v/%v after=%v/%v", first.counts, first.closeCounts, again.counts, again.closeCounts)
+		}
+	}
+	if first.keyEvicted != 0 || first.joinUnknown {
+		t.Fatalf("the first-Busy copy must record no later drops: evicted=%d unknown=%t", first.keyEvicted, first.joinUnknown)
+	}
+	// The final lifecycle snapshot is separate and still shows later activity.
+	final := collector.snapshot()
+	if final.keyEvicted == 0 {
+		t.Fatalf("the final snapshot must record post-latch evictions")
+	}
+}
+
+// A full table no longer rejects a key: the decision row for the replacing key
+// is still retained in both orderings, so a reader never mistakes the displaced
+// ordinary rows for the cause, while the displaced join stays unknown.
+func TestNodeForegroundRecoveryPinCollectorKeyFullRetainsNewDecision(t *testing.T) {
+	for _, ordering := range []struct {
+		name  string
+		order func(*nodeForegroundRecoveryPinCollector)
+	}{
+		{
+			name: "ordinary_before_decision",
+			order: func(c *nodeForegroundRecoveryPinCollector) {
+				c.observe(localtesthooks.RecoveryPinEvent{KeyHash: "replacing-key", Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+				c.observe(localtesthooks.RecoveryPinEvent{KeyHash: "replacing-key", Phase: localtesthooks.RecoveryPinCloseConflict, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown})
+			},
+		},
+		{
+			name: "decision_before_ordinary",
+			order: func(c *nodeForegroundRecoveryPinCollector) {
+				c.observe(localtesthooks.RecoveryPinEvent{KeyHash: "replacing-key", Phase: localtesthooks.RecoveryPinCloseConflict, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown})
+				c.observe(localtesthooks.RecoveryPinEvent{KeyHash: "replacing-key", Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+			},
+		},
+	} {
+		t.Run(ordering.name, func(t *testing.T) {
+			collector := &nodeForegroundRecoveryPinCollector{}
+			for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+				collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: fmt.Sprintf("fill-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+			}
+			ordering.order(collector)
+			snapshot := collector.snapshot()
+			if len(snapshot.hashes) != nodeForegroundRecoveryPinKeyLimit {
+				t.Fatalf("tracked keys=%d, want the fixed limit %d", len(snapshot.hashes), nodeForegroundRecoveryPinKeyLimit)
+			}
+			if !containsRecoveryPinHash(snapshot.hashes, "replacing-key") {
+				t.Fatalf("the replacing key must be admitted: %v", snapshot.hashes)
+			}
+			if snapshot.keyMiss != 0 {
+				t.Fatalf("replacement must not reject a key: key_miss=%d", snapshot.keyMiss)
+			}
+			if snapshot.termMiss {
+				t.Fatalf("a retained decision row must not report terminal_missing: %+v", snapshot)
+			}
+			if snapshot.keyEvicted == 0 || !snapshot.joinUnknown {
+				t.Fatalf("the displaced join must stay explicitly unknown: %+v", snapshot)
+			}
+		})
+	}
+	// A key that stays within the table must not be reported as a missing
+	// terminal, so the flag never becomes a permanent false positive.
+	control := &nodeForegroundRecoveryPinCollector{}
+	control.observe(localtesthooks.RecoveryPinEvent{KeyHash: "single", Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
+	control.observe(localtesthooks.RecoveryPinEvent{KeyHash: "single", Phase: localtesthooks.RecoveryPinCloseConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown})
+	if control.snapshot().termMiss {
+		t.Fatalf("a retained decision row must not report terminal_missing")
+	}
+}
+
+// The fixed decision budget is exhausted in order, and the drop is reported
+// explicitly instead of silently losing the terminal cause.
+func TestNodeForegroundRecoveryPinCollectorDecisionBudgetExhaustion(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	for i := 0; i < nodeForegroundRecoveryPinTerminalLimit; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "key-a", Phase: localtesthooks.RecoveryPinCloseConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown})
+	}
+	if collector.snapshot().termMiss {
+		t.Fatalf("the decision budget must not report a miss before it is exhausted")
+	}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "key-a", Phase: localtesthooks.RecoveryPinCloseError, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown})
+	snapshot := collector.snapshot()
+	if !snapshot.termMiss {
+		t.Fatalf("a decision row beyond the fixed budget must set terminal_missing")
+	}
+	if snapshot.closeOverflow == 0 {
+		t.Fatalf("a dropped close row must be counted as an overflow")
+	}
+	if len(snapshot.terminals) > nodeForegroundRecoveryPinTerminalLimit {
+		t.Fatalf("retained decision rows=%d exceed the fixed budget %d", len(snapshot.terminals), nodeForegroundRecoveryPinTerminalLimit)
+	}
+}
+
+func TestNodeForegroundRecoveryPinCollectorConcurrentObservation(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	var group sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			collector.observe(localtesthooks.RecoveryPinEvent{
+				KeyHash: fmt.Sprintf("key-%d", i%nodeForegroundRecoveryPinKeyLimit),
+				Phase:   localtesthooks.RecoveryPinCloseConfirmed,
+			})
+			_ = collector.snapshot()
+		}(i)
+	}
+	group.Wait()
+	snapshot := collector.snapshot()
+	if len(snapshot.hashes) > nodeForegroundRecoveryPinKeyLimit {
+		t.Fatalf("tracked keys=%d exceed the fixed limit %d", len(snapshot.hashes), nodeForegroundRecoveryPinKeyLimit)
+	}
+	var closes int
+	for _, count := range snapshot.closeCounts {
+		if count > nodeForegroundRecoveryPinReservedClose {
+			t.Fatalf("close rows=%d exceed the reserved budget %d", count, nodeForegroundRecoveryPinReservedClose)
+		}
+		closes += count
+	}
+	if closes == 0 {
+		t.Fatalf("concurrent close events were all dropped")
+	}
+	if snapshot.eventOverflow > 0 && closes == 0 {
+		t.Fatalf("overflow recorded without any retained row")
+	}
+}
+
+// The collector keeps only bounded classifications: never the full object key,
+// owner string, or token.
+func TestNodeForegroundRecoveryPinCollectorRetainsOnlyBoundedFields(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	const secretKey = "archive/recovery-pins/deadbeefdeadbeef-deadbeefdeadbeef"
+	const secretOwner = "sensitive-owner-identity"
+	const secretToken = "sensitive-pin-token"
+	// The production side emits only the bounded hash suffix; the collector
+	// must never be handed or retain the full object key.
+	const boundedHash = "deadbeefdeadbeef"
+	collector.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: boundedHash, Phase: localtesthooks.RecoveryPinCreateConfirmed,
+		OwnerCategory: localtesthooks.RecoveryPinOwnerStartup, LeaseState: localtesthooks.RecoveryPinLeaseActive,
+		LeaseDeltaMS: 1000, ReadStatus: localtesthooks.RecoveryPinReadOK, WriteStatus: localtesthooks.RecoveryPinWriteOK,
+		ReadbackStatus: localtesthooks.RecoveryPinReadbackDone,
+	})
+	// Production always stamps at least guard_unknown, so a captured row never
+	// carries an empty category.
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: boundedHash, Phase: localtesthooks.RecoveryPinCloseAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown})
+	snapshot := collector.snapshot()
+	if len(snapshot.hashes) != 1 {
+		t.Fatalf("keys=%d, want 1", len(snapshot.hashes))
+	}
+	if strings.Contains(snapshot.hashes[0], "recovery-pins") || strings.Contains(snapshot.hashes[0], secretKey) {
+		t.Fatalf("retained key is not bounded: %q", snapshot.hashes[0])
+	}
+	rows := append([]localtesthooks.RecoveryPinEvent(nil), snapshot.events[0][:snapshot.counts[0]]...)
+	rows = append(rows, snapshot.closes[0][:snapshot.closeCounts[0]]...)
+	for _, row := range rows {
+		if row.OwnerCategory != localtesthooks.RecoveryPinOwnerStartup && row.OwnerCategory != localtesthooks.RecoveryPinOwnerGuardUnknown {
+			t.Fatalf("owner category is not a finite classification: %q", row.OwnerCategory)
+		}
+		if strings.Contains(row.OwnerCategory, secretOwner) || strings.Contains(row.KeyHash, secretToken) {
+			t.Fatalf("retained row leaked owner or token material: %+v", row)
+		}
 	}
 }
 
@@ -1071,6 +1441,249 @@ func (f *nodeForegroundArchiveBusyFailures) log(t *testing.T) {
 	}
 	for _, event := range snapshot.events {
 		t.Logf("node_foreground_archive_busy operation_id=%d operation=%q resource=%q branch=%q stage=%q entered=%t overflow=%d", operationID, event.Operation, event.Resource, event.Branch, event.Stage, event.Entered, snapshot.overflow)
+	}
+}
+
+// nodeForegroundRecoveryPinCollector is a fixed-size table: at most
+// nodeForegroundRecoveryPinKeyLimit hashed pin keys, each with
+// nodeForegroundRecoveryPinEventLimit lifecycle rows plus
+// nodeForegroundRecoveryPinReservedClose close rows that are never displaced by
+// ordinary rows. The capacity never grows and there is no blocking. When every
+// slot is taken, the slot with the oldest last-observed sequence is replaced by
+// the new key, which is the approved fixed-array policy rather than an LRU:
+// the replacement is counted and the displaced rows are reported as an
+// explicitly unknown join. The first guard_read key is pinned so a later
+// replacement can never discard the guard identity; it is released only once a
+// failure is latched. No full object key, owner string, token, or credential is
+// retained.
+type nodeForegroundRecoveryPinCollector struct {
+	mu            sync.Mutex
+	hashes        [nodeForegroundRecoveryPinKeyLimit]string
+	seqs          [nodeForegroundRecoveryPinKeyLimit]uint64
+	nextSeq       uint64
+	events        [nodeForegroundRecoveryPinKeyLimit][nodeForegroundRecoveryPinEventLimit]localtesthooks.RecoveryPinEvent
+	counts        [nodeForegroundRecoveryPinKeyLimit]int
+	closes        [nodeForegroundRecoveryPinKeyLimit][nodeForegroundRecoveryPinReservedClose]localtesthooks.RecoveryPinEvent
+	closeCounts   [nodeForegroundRecoveryPinKeyLimit]int
+	guardKey      string
+	failureLatch  bool
+	latchCount    int
+	firstBusy     *nodeForegroundRecoveryPinSnapshot
+	keyMiss       atomic.Uint64
+	keyEvicted    atomic.Uint64
+	joinUnknown   atomic.Bool
+	eventOverflow atomic.Uint64
+	closeOverflow atomic.Uint64
+	termMiss      atomic.Bool
+	// terminalEvents retains the bounded rows that describe the terminal
+	// post-entry outcome, so a later ordinary row can never be mistaken for the
+	// actual cause of a returned Busy.
+	terminals   [nodeForegroundRecoveryPinTerminalLimit]localtesthooks.RecoveryPinEvent
+	terminalSet [nodeForegroundRecoveryPinTerminalLimit]bool
+	terminalN   int
+}
+
+func isRecoveryPinClosePhase(phase string) bool {
+	return phase == localtesthooks.RecoveryPinCloseAttempt || phase == localtesthooks.RecoveryPinCloseConfirmed ||
+		phase == localtesthooks.RecoveryPinCloseConflict || phase == localtesthooks.RecoveryPinCloseError
+}
+
+// isRecoveryPinDecisionPhase reports the rows that can explain a later Busy:
+// the terminal close outcome and the guard's own read. Ordinary create and
+// renew progress must not consume the fixed terminal budget.
+func isRecoveryPinDecisionPhase(phase string) bool {
+	return isRecoveryPinClosePhase(phase) || phase == localtesthooks.RecoveryPinGuardRead
+}
+
+// observe is nonblocking. A contended lock drops the row and records the
+// unknown explicitly rather than stalling a production hot path.
+func (c *nodeForegroundRecoveryPinCollector) observe(event localtesthooks.RecoveryPinEvent) {
+	if !c.mu.TryLock() {
+		c.eventOverflow.Add(1)
+		if isRecoveryPinClosePhase(event.Phase) {
+			c.closeOverflow.Add(1)
+		}
+		// A dropped close or guard decision row is explicitly unknown, so a
+		// reader never treats a retained ordinary row as the terminal cause.
+		if isRecoveryPinDecisionPhase(event.Phase) {
+			c.termMiss.Store(true)
+		}
+		return
+	}
+	defer c.mu.Unlock()
+	index := -1
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+		if c.hashes[i] == event.KeyHash {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		// The key table is full: replace the oldest slot by sequence. The pinned
+		// guard key is never a candidate, so guard identity survives later keys.
+		victim := -1
+		for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+			if c.hashes[i] == "" {
+				victim = i
+				break
+			}
+			if !c.failureLatch && c.guardKey != "" && c.hashes[i] == c.guardKey {
+				continue
+			}
+			if victim < 0 || c.hashes[victim] == "" || c.seqs[i] < c.seqs[victim] {
+				victim = i
+			}
+		}
+		if victim < 0 {
+			// No slot can be replaced; the row stays explicitly unknown.
+			c.keyMiss.Add(1)
+			c.eventOverflow.Add(1)
+			c.joinUnknown.Store(true)
+			if isRecoveryPinDecisionPhase(event.Phase) {
+				c.termMiss.Store(true)
+			}
+			return
+		}
+		if c.hashes[victim] != "" {
+			// The displaced key's retained rows are gone, so its lifecycle join
+			// can no longer be proven end to end.
+			c.keyEvicted.Add(1)
+			c.joinUnknown.Store(true)
+		}
+		c.hashes[victim] = event.KeyHash
+		c.counts[victim] = 0
+		c.closeCounts[victim] = 0
+		index = victim
+	}
+	c.nextSeq++
+	c.seqs[index] = c.nextSeq
+	if event.Phase == localtesthooks.RecoveryPinGuardRead && c.guardKey == "" &&
+		event.LeaseState == localtesthooks.RecoveryPinLeaseActive && event.LeaseDeltaMS > 0 {
+		// Only a guard read that saw a live lease pins its key: an expired or
+		// zero-delta guard row describes a healthy released pin, not the cause
+		// of a later Busy.
+		c.guardKey = event.KeyHash
+	}
+	if isRecoveryPinClosePhase(event.Phase) {
+		if c.closeCounts[index] < nodeForegroundRecoveryPinReservedClose {
+			c.closes[index][c.closeCounts[index]] = event
+			c.closeCounts[index]++
+		} else {
+			c.closeOverflow.Add(1)
+			c.eventOverflow.Add(1)
+		}
+	} else if c.counts[index] < nodeForegroundRecoveryPinEventLimit {
+		c.events[index][c.counts[index]] = event
+		c.counts[index]++
+	} else {
+		c.eventOverflow.Add(1)
+	}
+	if isRecoveryPinDecisionPhase(event.Phase) && c.terminalN < nodeForegroundRecoveryPinTerminalLimit {
+		c.terminals[c.terminalN] = event
+		c.terminalSet[c.terminalN] = true
+		c.terminalN++
+	} else if isRecoveryPinDecisionPhase(event.Phase) {
+		// The terminal budget is fixed. A dropped terminal row is explicitly
+		// unknown; a retained ordinary row never claims the cause.
+		c.termMiss.Store(true)
+		c.eventOverflow.Add(1)
+	}
+}
+
+type nodeForegroundRecoveryPinSnapshot struct {
+	scope         string
+	hashes        []string
+	events        [][nodeForegroundRecoveryPinEventLimit]localtesthooks.RecoveryPinEvent
+	counts        []int
+	closes        [][nodeForegroundRecoveryPinReservedClose]localtesthooks.RecoveryPinEvent
+	closeCounts   []int
+	terminals     []localtesthooks.RecoveryPinEvent
+	terminalSet   []bool
+	keyMiss       uint64
+	keyEvicted    uint64
+	joinUnknown   bool
+	eventOverflow uint64
+	closeOverflow uint64
+	termMiss      bool
+}
+
+func (c *nodeForegroundRecoveryPinCollector) snapshot() nodeForegroundRecoveryPinSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.snapshotLocked()
+}
+
+func (c *nodeForegroundRecoveryPinCollector) snapshotLocked() nodeForegroundRecoveryPinSnapshot {
+	snap := nodeForegroundRecoveryPinSnapshot{
+		terminals:   append([]localtesthooks.RecoveryPinEvent(nil), c.terminals[:c.terminalN]...),
+		terminalSet: append([]bool(nil), c.terminalSet[:c.terminalN]...),
+		keyMiss:     c.keyMiss.Load(), eventOverflow: c.eventOverflow.Load(),
+		closeOverflow: c.closeOverflow.Load(), termMiss: c.termMiss.Load(),
+		keyEvicted: c.keyEvicted.Load(), joinUnknown: c.joinUnknown.Load(),
+	}
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit; i++ {
+		if c.hashes[i] == "" {
+			continue
+		}
+		snap.hashes = append(snap.hashes, c.hashes[i])
+		snap.counts = append(snap.counts, c.counts[i])
+		snap.closeCounts = append(snap.closeCounts, c.closeCounts[i])
+		snap.events = append(snap.events, c.events[i])
+		snap.closes = append(snap.closes, c.closes[i])
+	}
+	return snap
+}
+
+// latchFailure captures an immutable copy of the pin table as it exists at the
+// first Busy and only then releases the pinned guard key, so post-latch
+// replacement and shutdown rows can never mutate the first-Busy evidence. The
+// first capture wins: a repeated latch never overwrites it.
+func (c *nodeForegroundRecoveryPinCollector) latchFailure() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.firstBusy == nil {
+		captured := c.snapshotLocked()
+		captured.scope = "first_busy"
+		c.firstBusy = &captured
+	}
+	c.failureLatch = true
+	c.latchCount++
+}
+
+// firstBusySnapshot returns the immutable first-Busy copy, or nil if no Busy was
+// latched.
+func (c *nodeForegroundRecoveryPinCollector) firstBusySnapshot() *nodeForegroundRecoveryPinSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.firstBusy == nil {
+		return nil
+	}
+	captured := *c.firstBusy
+	return &captured
+}
+
+// log prints the bounded lifecycle rows next to the existing terminal archive
+// Busy attribution. Missing or evicted rows are reported as unknown; the
+// historical Busy cause itself is never asserted here.
+func (snap nodeForegroundRecoveryPinSnapshot) log(t *testing.T) {
+	scope := snap.scope
+	if scope == "" {
+		scope = "final_lifecycle"
+	}
+	for i, hash := range snap.hashes {
+		for j := 0; j < snap.counts[i]; j++ {
+			event := snap.events[i][j]
+			t.Logf("node_foreground_recovery_pin scope=%s key_hash=%s row=%d/%d phase=%q owner_category=%q lease_state=%q lease_delta_ms=%d read=%q write=%q readback=%q version_present=%t observed_at_ms=%d key_miss=%d event_overflow=%d close_overflow=%d",
+				scope, hash, j, nodeForegroundRecoveryPinEventLimit, event.Phase, event.OwnerCategory, event.LeaseState, event.LeaseDeltaMS, event.ReadStatus, event.WriteStatus, event.ReadbackStatus, event.VersionPresent, event.ObservedAtMS, snap.keyMiss, snap.eventOverflow, snap.closeOverflow)
+		}
+		for j := 0; j < snap.closeCounts[i]; j++ {
+			event := snap.closes[i][j]
+			t.Logf("node_foreground_recovery_pin scope=%s key_hash=%s close_row=%d/%d phase=%q owner_category=%q read=%q write=%q readback=%q observed_at_ms=%d key_miss=%d event_overflow=%d close_overflow=%d",
+				scope, hash, j, nodeForegroundRecoveryPinReservedClose, event.Phase, event.OwnerCategory, event.ReadStatus, event.WriteStatus, event.ReadbackStatus, event.ObservedAtMS, snap.keyMiss, snap.eventOverflow, snap.closeOverflow)
+		}
+	}
+	if snap.keyMiss > 0 || snap.keyEvicted > 0 || snap.joinUnknown || snap.eventOverflow > 0 || snap.closeOverflow > 0 || snap.termMiss {
+		t.Logf("node_foreground_recovery_pin scope=%s rows=unknown key_miss=%d key_evicted=%d join_unknown=%t event_overflow=%d close_overflow=%d terminal_missing=%t", scope, snap.keyMiss, snap.keyEvicted, snap.joinUnknown, snap.eventOverflow, snap.closeOverflow, snap.termMiss)
 	}
 }
 

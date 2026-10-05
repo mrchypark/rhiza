@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -1352,6 +1353,7 @@ func archiveRecoveryRequired(localTip, archiveBase quepaxa.Slot) bool {
 }
 
 func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
+	ctx = localtesthooks.WithRecoveryPinCategory(ctx, localtesthooks.RecoveryPinOwnerNodeCatchup)
 	n.recoveryMu.Lock()
 	defer n.recoveryMu.Unlock()
 	// A compacted peer means local history may no longer be sufficient for a
@@ -1372,6 +1374,10 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// Carry only the recovery pin observer onto the fresh close context. The
+		// background semantics, deadline, cancellation, and discarded error are
+		// unchanged.
+		closeCtx = localtesthooks.CarryRecoveryPinObserver(closeCtx, ctx)
 		_ = snapshot.Close(closeCtx)
 	}()
 	seal, baseDecision, ok := snapshot.RecoveryBase()

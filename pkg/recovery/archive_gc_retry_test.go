@@ -1164,7 +1164,360 @@ func (b *gcAmbiguousHeadBucket) Upload(ctx context.Context, name string, r io.Re
 	return err
 }
 
+// recoveryPinBackendFailureBucket fails one recovery-pin read or one
+// conditional pin write with a real backend error. No Busy error is fabricated;
+// the underlying bucket returns its own error value.
+type recoveryPinBackendFailureBucket struct {
+	objstore.Bucket
+	key        string
+	failRead   error
+	failUpload error
+	reads      int
+	uploads    int
+}
+
+func (b *recoveryPinBackendFailureBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if name == b.key && b.failRead != nil {
+		b.reads++
+		return objstore.ObjectAttributes{}, b.failRead
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *recoveryPinBackendFailureBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if name == b.key && b.failRead != nil {
+		b.reads++
+		return nil, b.failRead
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *recoveryPinBackendFailureBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if name == b.key && b.failUpload != nil {
+		b.uploads++
+		return b.failUpload
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+// recoveryPinTrace records only the finite lifecycle classifications that the
+// bounded diagnostic is allowed to expose. It stores no owner string, token,
+// or full object key.
+type recoveryPinTrace struct {
+	mu     sync.Mutex
+	events []localtesthooks.RecoveryPinEvent
+}
+
+func (tr *recoveryPinTrace) observe(event localtesthooks.RecoveryPinEvent) {
+	tr.mu.Lock()
+	tr.events = append(tr.events, event)
+	tr.mu.Unlock()
+}
+
+func (tr *recoveryPinTrace) phases(phase string) []localtesthooks.RecoveryPinEvent {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	var matched []localtesthooks.RecoveryPinEvent
+	for _, event := range tr.events {
+		if event.Phase == phase {
+			matched = append(matched, event)
+		}
+	}
+	return matched
+}
+
+// A created pin is confirmed by the existing confirm helper, which re-reads and
+// compares the stored record. Renewal and close only receive an upload ACK on
+// their own paths, so neither may claim a verified readback.
+func testRecoveryPinLifecycleCreateReadbackAndCloseACK(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	trace := &recoveryPinTrace{}
+	traced := localtesthooks.WithRecoveryPinTrace(ctx, trace.observe)
+	traced = localtesthooks.WithRecoveryPinCategory(traced, localtesthooks.RecoveryPinOwnerStartup)
+
+	snapshot, err := seed.BeginRecoverySnapshot(traced, "pin-lifecycle", time.Minute)
+	if err != nil {
+		t.Fatalf("begin recovery snapshot: %v", err)
+	}
+	created := trace.phases(localtesthooks.RecoveryPinCreateConfirmed)
+	if len(created) != 1 || created[0].ReadbackStatus != localtesthooks.RecoveryPinReadbackDone {
+		t.Fatalf("create_confirmed=%+v, want exactly one verified readback", created)
+	}
+	if attempts := trace.phases(localtesthooks.RecoveryPinCreateAttempt); len(attempts) != 1 {
+		t.Fatalf("create_attempt=%+v, want exactly one pre-upload boundary", attempts)
+	}
+	key := seed.recoveryPinKey("pin-lifecycle")
+	if created[0].KeyHash == key || created[0].KeyHash == "" {
+		t.Fatalf("key hash must stay bounded and never the full object key: hash=%q", created[0].KeyHash)
+	}
+	if created[0].OwnerCategory != localtesthooks.RecoveryPinOwnerStartup {
+		t.Fatalf("owner category=%q, want %q", created[0].OwnerCategory, localtesthooks.RecoveryPinOwnerStartup)
+	}
+
+	if err := snapshot.Renew(traced, 2*time.Minute); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	renewed := trace.phases(localtesthooks.RecoveryPinRenewConfirmed)
+	if len(renewed) != 1 || renewed[0].ReadbackStatus != localtesthooks.RecoveryPinReadbackNone {
+		t.Fatalf("renew_confirmed=%+v, want an upload ACK with no readback", renewed)
+	}
+	if err := snapshot.Close(traced); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	closed := trace.phases(localtesthooks.RecoveryPinCloseConfirmed)
+	if len(closed) != 1 || closed[0].ReadbackStatus != localtesthooks.RecoveryPinReadbackNone {
+		t.Fatalf("close_confirmed=%+v, want an upload ACK with no readback", closed)
+	}
+	// The stored record itself remains the only readback proof.
+	stored, err := seed.readRecoveryPin(ctx, key)
+	if err != nil {
+		t.Fatalf("read stored pin after close: %v", err)
+	}
+	if stored.LeaseUntilMS > time.Now().UnixMilli() {
+		t.Fatalf("close did not expire the stored lease: lease_until_ms=%d", stored.LeaseUntilMS)
+	}
+	_ = base
+}
+
+// The guard reports the exact stored pin that made it busy, and it cannot know
+// which caller created it, so the owner category must stay guard_unknown.
+func testRecoveryPinLifecycleGuardReadsActiveLegitimatePin(t *testing.T) {
+	ctx, _, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	pinOwner := "pin-guard-legitimate"
+	pinKey := seed.recoveryPinKey(pinOwner)
+	pin := archiveRecoveryPin{OwnerID: pinOwner, Token: "token", Base: 0, Tip: 0, TailHash: [32]byte{1}, TailObject: 1, LeaseUntilMS: time.Now().Add(time.Hour).UnixMilli()}
+	if err := seed.writeRecoveryPin(ctx, pinKey, pin); err != nil {
+		t.Fatal(err)
+	}
+	trace := &recoveryPinTrace{}
+	traced := localtesthooks.WithRecoveryPinTrace(ctx, trace.observe)
+	guard := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	guard.bucket = seed.bucket
+	defer guard.Close()
+	active, err := guard.hasActiveRecoveryPins(traced)
+	if err != nil || !active {
+		t.Fatalf("active recovery pin: active=%t err=%v", active, err)
+	}
+	reads := trace.phases(localtesthooks.RecoveryPinGuardRead)
+	if len(reads) == 0 {
+		t.Fatalf("guard emitted no recovery pin read boundary: %+v", trace.events)
+	}
+	var sawActive bool
+	for _, event := range reads {
+		if event.OwnerCategory != localtesthooks.RecoveryPinOwnerGuardUnknown {
+			t.Fatalf("guard category=%q, want %q", event.OwnerCategory, localtesthooks.RecoveryPinOwnerGuardUnknown)
+		}
+		if event.LeaseState == localtesthooks.RecoveryPinLeaseActive && event.LeaseDeltaMS > 0 {
+			sawActive = true
+		}
+	}
+	if !sawActive {
+		t.Fatalf("guard never reported the active stored lease: %+v", reads)
+	}
+}
+
+// A close whose stored record no longer matches the snapshot is a finite
+// conflict, not an unknown. This is the boundary the reachable startup and
+// catch-up callers currently discard, so it must stay observable.
+func testRecoveryPinLifecycleCloseConflictIsFinite(t *testing.T) {
+	ctx, _, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	trace := &recoveryPinTrace{}
+	traced := localtesthooks.WithRecoveryPinTrace(ctx, trace.observe)
+	traced = localtesthooks.WithRecoveryPinCategory(traced, localtesthooks.RecoveryPinOwnerNodeCatchup)
+	snapshot, err := seed.BeginRecoverySnapshot(traced, "pin-close-conflict", time.Minute)
+	if err != nil {
+		t.Fatalf("begin recovery snapshot: %v", err)
+	}
+	// Another generation takes the stored record over behind this snapshot.
+	stored, err := seed.readRecoveryPin(ctx, snapshot.pinKey)
+	if err != nil {
+		t.Fatalf("read stored pin: %v", err)
+	}
+	stored.Token = "other-token"
+	stored.LeaseUntilMS = time.Now().Add(time.Hour).UnixMilli()
+	if err := seed.writeRecoveryPin(ctx, snapshot.pinKey, *stored, objstore.WithIfMatch(stored.version)); err != nil {
+		t.Fatalf("write replaced pin: %v", err)
+	}
+	if err := snapshot.Close(traced); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("close after takeover: err=%v, want ErrArchiveBusy", err)
+	}
+	conflicts := trace.phases(localtesthooks.RecoveryPinCloseConflict)
+	if len(conflicts) != 1 || conflicts[0].WriteStatus != localtesthooks.RecoveryPinWriteNotAttempted {
+		t.Fatalf("close_conflict=%+v, want one not_attempted classification", conflicts)
+	}
+	if conflicts[0].ReadStatus != localtesthooks.RecoveryPinReadIdentityMismatch {
+		t.Fatalf("pre-write mismatch read status=%q, want %q", conflicts[0].ReadStatus, localtesthooks.RecoveryPinReadIdentityMismatch)
+	}
+	if conflicts[0].WriteStatus == localtesthooks.RecoveryPinWriteCondMet {
+		t.Fatalf("a pre-write mismatch must never claim a conditional upload conflict")
+	}
+	if len(trace.phases(localtesthooks.RecoveryPinCloseConfirmed)) != 0 {
+		t.Fatalf("a conflicting close must not report confirmation: %+v", trace.events)
+	}
+	if conflicts[0].OwnerCategory != localtesthooks.RecoveryPinOwnerNodeCatchup {
+		t.Fatalf("owner category=%q, want %q", conflicts[0].OwnerCategory, localtesthooks.RecoveryPinOwnerNodeCatchup)
+	}
+}
+
+// Without a scoped observer the lifecycle paths must behave exactly as before
+// and retain nothing; the diagnostic cannot change behavior when it is absent.
+func testRecoveryPinLifecycleDisabledObserverIsNoop(t *testing.T) {
+	ctx, _, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	snapshot, err := seed.BeginRecoverySnapshot(ctx, "pin-absent-observer", time.Minute)
+	if err != nil {
+		t.Fatalf("begin recovery snapshot: %v", err)
+	}
+	if err := snapshot.Renew(ctx, 2*time.Minute); err != nil {
+		t.Fatalf("renew without observer: %v", err)
+	}
+	if err := snapshot.Close(ctx); err != nil {
+		t.Fatalf("close without observer: %v", err)
+	}
+	if localtesthooks.RecoveryPinCategory(ctx) != localtesthooks.RecoveryPinOwnerGuardUnknown {
+		t.Fatalf("unstamped context must report guard_unknown")
+	}
+	carried := localtesthooks.CarryRecoveryPinObserver(ctx, ctx)
+	if carried != ctx {
+		t.Fatalf("carrying an absent observer must be an identity, not a new context")
+	}
+}
+
+// A real backend read failure during close must be reported as a finite
+// close_error with an invalid read, never as a conditional conflict.
+func testRecoveryPinLifecycleBackendReadFailureIsCloseError(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	snapshot, err := seed.BeginRecoverySnapshot(ctx, "pin-read-failure", time.Minute)
+	if err != nil {
+		t.Fatalf("begin recovery snapshot: %v", err)
+	}
+	trace := &recoveryPinTrace{}
+	traced := localtesthooks.WithRecoveryPinTrace(ctx, trace.observe)
+	// The existing store wrapper fails the pin read with a real backend error;
+	// no Busy error is fabricated by the wrapper.
+	probe := &recoveryPinBackendFailureBucket{Bucket: base, key: snapshot.pinKey, failRead: syscall.ECONNRESET}
+	failing := NewManager(probe, "cluster", 1)
+	defer failing.Close()
+	failingSnapshot := &RecoverySnapshot{manager: failing, pinKey: snapshot.pinKey, pin: snapshot.pin}
+	if err := failingSnapshot.Close(traced); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("close with a failing backend read: err=%v, want the backend error", err)
+	}
+	if probe.reads == 0 {
+		t.Fatalf("backend wrapper never saw the pin read")
+	}
+	errors := trace.phases(localtesthooks.RecoveryPinCloseError)
+	if len(errors) != 1 || errors[0].ReadStatus != localtesthooks.RecoveryPinReadInvalid {
+		t.Fatalf("close_error=%+v, want one invalid-read classification", errors)
+	}
+	if errors[0].WriteStatus != localtesthooks.RecoveryPinWriteNotAttempted {
+		t.Fatalf("a failed read must never claim a write outcome: %+v", errors[0])
+	}
+	if len(trace.phases(localtesthooks.RecoveryPinCloseConflict)) != 0 {
+		t.Fatalf("a backend read failure must not be reported as a conflict: %+v", trace.events)
+	}
+	if err := snapshot.Close(ctx); err != nil {
+		t.Fatalf("the healthy pin must still close: %v", err)
+	}
+}
+
+// A genuine conditional-upload conflict, returned by the store itself on the
+// write, is the only path that may report condition_not_met.
+func testRecoveryPinLifecycleConditionalWriteConflict(t *testing.T) {
+	ctx, base, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	snapshot, err := seed.BeginRecoverySnapshot(ctx, "pin-conditional-conflict", time.Minute)
+	if err != nil {
+		t.Fatalf("begin recovery snapshot: %v", err)
+	}
+	trace := &recoveryPinTrace{}
+	traced := localtesthooks.WithRecoveryPinTrace(ctx, trace.observe)
+	// An independent, valid generation moves the stored record between this
+	// snapshot's read and its conditional write, so the real store answers the
+	// conditional upload with its own condition-not-met error.
+	racing := &conditionalArchiveLockBucket{Bucket: base, key: snapshot.pinKey}
+	racing.before = func(context.Context) error {
+		current, err := seed.readRecoveryPin(ctx, snapshot.pinKey)
+		if err != nil {
+			return err
+		}
+		current.LeaseUntilMS = time.Now().Add(time.Hour).UnixMilli()
+		return seed.writeRecoveryPin(ctx, snapshot.pinKey, *current, objstore.WithIfMatch(current.version))
+	}
+	probe := NewManager(racing, "cluster", 1)
+	defer probe.Close()
+	conflicting := &RecoverySnapshot{manager: probe, pinKey: snapshot.pinKey, pin: snapshot.pin}
+	if err := conflicting.Close(traced); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("conditional close conflict: err=%v, want ErrArchiveBusy", err)
+	}
+	if racing.count == 0 {
+		t.Fatalf("the conditional pin write was never attempted")
+	}
+	conflicts := trace.phases(localtesthooks.RecoveryPinCloseConflict)
+	if len(conflicts) != 1 || conflicts[0].WriteStatus != localtesthooks.RecoveryPinWriteCondMet {
+		t.Fatalf("close_conflict=%+v, want one condition_not_met classification from the real write", conflicts)
+	}
+	if len(trace.phases(localtesthooks.RecoveryPinCloseError)) != 0 {
+		t.Fatalf("a conditional conflict must not be reported as a backend error: %+v", trace.events)
+	}
+	if err := snapshot.Close(ctx); err != nil {
+		t.Fatalf("the original snapshot must still be closable: %v", err)
+	}
+}
+
+// An expired stored pin is reclaimed by the guard's tombstone write. The lease
+// state is forced by writing an already-expired expiry, so no long sleep and no
+// wall-clock wait is required.
+func testRecoveryPinLifecycleExpiredTombstoneGuard(t *testing.T) {
+	ctx, _, _, seed := newSealableArchive(t)
+	defer seed.Close()
+	pinOwner := "pin-expired-tombstone"
+	pinKey := seed.recoveryPinKey(pinOwner)
+	expired := archiveRecoveryPin{OwnerID: pinOwner, Token: "token", Base: 0, Tip: 0, TailHash: [32]byte{2}, TailObject: 1, LeaseUntilMS: time.Now().Add(-time.Minute).UnixMilli()}
+	if err := seed.writeRecoveryPin(ctx, pinKey, expired); err != nil {
+		t.Fatal(err)
+	}
+	trace := &recoveryPinTrace{}
+	traced := localtesthooks.WithRecoveryPinTrace(ctx, trace.observe)
+	guard := NewManager(objstore.NewInMemBucket(), "cluster", 1)
+	guard.bucket = seed.bucket
+	defer guard.Close()
+	active, err := guard.hasActiveRecoveryPins(traced)
+	if err != nil || active {
+		t.Fatalf("expired pin must not report active: active=%t err=%v", active, err)
+	}
+	reads := trace.phases(localtesthooks.RecoveryPinGuardRead)
+	if len(reads) == 0 {
+		t.Fatalf("guard emitted no boundary for an expired pin: %+v", trace.events)
+	}
+	var sawExpiryWrite, sawExpiredLease bool
+	for _, event := range reads {
+		if event.WriteStatus == localtesthooks.RecoveryPinWriteOK {
+			sawExpiryWrite = true
+		}
+		if event.LeaseState == localtesthooks.RecoveryPinLeaseExpired || event.LeaseState == localtesthooks.RecoveryPinLeaseZero {
+			sawExpiredLease = true
+		}
+	}
+	if !sawExpiryWrite {
+		t.Fatalf("guard never reported the tombstone write status: %+v", reads)
+	}
+	if !sawExpiredLease {
+		t.Fatalf("guard never classified the stored lease as expired: %+v", reads)
+	}
+}
+
 func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) {
+	t.Run("recovery_pin_lifecycle_backend_read_failure_is_close_error", testRecoveryPinLifecycleBackendReadFailureIsCloseError)
+	t.Run("recovery_pin_lifecycle_conditional_write_conflict", testRecoveryPinLifecycleConditionalWriteConflict)
+	t.Run("recovery_pin_lifecycle_expired_tombstone_guard", testRecoveryPinLifecycleExpiredTombstoneGuard)
+	t.Run("recovery_pin_lifecycle_create_readback_and_close_ack", testRecoveryPinLifecycleCreateReadbackAndCloseACK)
+	t.Run("recovery_pin_lifecycle_guard_reads_active_legitimate_pin", testRecoveryPinLifecycleGuardReadsActiveLegitimatePin)
+	t.Run("recovery_pin_lifecycle_close_conflict_is_finite", testRecoveryPinLifecycleCloseConflictIsFinite)
+	t.Run("recovery_pin_lifecycle_disabled_observer_is_noop", testRecoveryPinLifecycleDisabledObserverIsNoop)
 	t.Run("archive_busy_real_gc_lock_and_non_busy", testArchiveBusyTraceRealGCLockAndNonBusy)
 	t.Run("archive_busy_real_conditional_exhaustion", testArchiveBusyTraceRealConditionalExhaustion)
 	t.Run("archive_busy_real_recovery_pin_and_release", testArchiveBusyTraceRealRecoveryPinAndRelease)
