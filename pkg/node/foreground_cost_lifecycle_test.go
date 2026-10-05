@@ -855,6 +855,26 @@ func TestNodeForegroundRecoveryPinPostShutdownSnapshotSeesShutdownClose(t *testi
 	}
 }
 
+// An empty table still produces one finite summary marker per scope. The
+// summary stays observational: zero keys/rows means unknown, never "no pin",
+// "leak", or "close acknowledged".
+func TestNodeForegroundRecoveryPinEmptySnapshotLogsFiniteSummary(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	for _, scope := range []string{"final_lifecycle", "post_shutdown"} {
+		snapshot := collector.snapshot()
+		if len(snapshot.hashes) != 0 {
+			t.Fatalf("scope=%s: an unobserved table must stay empty: %v", scope, snapshot.hashes)
+		}
+		if snapshot.keyMiss != 0 || snapshot.keyEvicted != 0 || snapshot.joinUnknown || snapshot.termMiss {
+			t.Fatalf("scope=%s: an unobserved table must not fabricate drops: %+v", scope, snapshot)
+		}
+		snapshot.scope = scope
+		// The unconditional summary line is emitted before any row loop, so an
+		// empty snapshot still logs exactly one marker for this scope.
+		snapshot.log(t)
+	}
+}
+
 // A full table no longer rejects a key: the decision row for the replacing key
 // is still retained in both orderings, so a reader never mistakes the displaced
 // ordinary rows for the cause, while the displaced join stays unknown.
@@ -1705,6 +1725,13 @@ func (snap nodeForegroundRecoveryPinSnapshot) log(t *testing.T) {
 	if scope == "" {
 		scope = "final_lifecycle"
 	}
+	// Always emit one bounded summary line for this scope, so a run whose table
+	// is empty still produces a finite marker for the recorder. The summary
+	// reports only what was observed: an empty table is unknown, never evidence
+	// that no pin existed, that a pin leaked, or that a close was acknowledged.
+	t.Logf("node_foreground_recovery_pin scope=%s summary keys_retained=%d/%d slots_unused=%d join_unknown=%t key_evicted=%d key_miss=%d event_overflow=%d close_overflow=%d terminal_rows=%d terminal_missing=%t interpretation=observed_only_empty_is_unknown_not_cause",
+		scope, len(snap.hashes), nodeForegroundRecoveryPinKeyLimit, nodeForegroundRecoveryPinKeyLimit-len(snap.hashes),
+		snap.joinUnknown, snap.keyEvicted, snap.keyMiss, snap.eventOverflow, snap.closeOverflow, len(snap.terminals), snap.termMiss)
 	for i, hash := range snap.hashes {
 		for j := 0; j < snap.counts[i]; j++ {
 			event := snap.events[i][j]
