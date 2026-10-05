@@ -254,7 +254,9 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 				"  fi\n" +
 				"fi\n"
 		}
-		fakePS += "exit 1\n"
+		fakePS += "sleep 0.5\n" +
+			"printf 'returned\\n' >> \"$RHIZA_SUPERVISOR_PS_PROBE_LOG\" || exit 1\n" +
+			"exit 1\n"
 		if err := os.WriteFile(filepath.Join(fakeBin, "ps"), []byte(fakePS), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -369,10 +371,37 @@ func assertFakeChildSupervisorStops(t *testing.T, ignoreInterrupt, failStateProb
 	} else {
 		closeErr = server.Close(closeCtx)
 	}
-	select {
-	case <-server.done:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("supervisor did not finish: %s", snapshot())
+	if failStateProbe {
+		// The fake ps has completed 20 bounded polls and the trailing state
+		// check only after all 21 returned markers are present. Both that
+		// observation and the supervisor exit share one absolute test budget.
+		observationDeadline := time.Now().Add(60 * time.Second)
+		for {
+			probes, err := os.ReadFile(probePath)
+			if err == nil && strings.Count(string(probes), "returned\n") >= 21 {
+				break
+			}
+			if !time.Now().Before(observationDeadline) {
+				t.Fatalf("failed ps probes did not return 21 times before deadline: returned=%d read=%v; %s",
+					strings.Count(string(probes), "returned\n"), err, snapshot())
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		select {
+		case <-server.done:
+		case <-time.After(time.Until(observationDeadline)):
+			t.Fatalf("supervisor did not finish within failed-probe observation deadline: %s", snapshot())
+		}
+		completion, err := os.ReadFile(completionPath)
+		if err != nil || !strings.Contains(string(completion), "gateway_reaped=true") {
+			t.Fatalf("completion marker missing at failed-probe observation deadline: %q (%v)", completion, err)
+		}
+	} else {
+		select {
+		case <-server.done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("supervisor did not finish: %s", snapshot())
+		}
 	}
 	terminalCtx, terminalCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer terminalCancel()
