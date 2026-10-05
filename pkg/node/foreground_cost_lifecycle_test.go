@@ -221,6 +221,16 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 				t.Errorf("shutdown node %s: %v", ids[i], err)
 			}
 		}
+		// Emit one more bounded pin snapshot after the reverse shutdown loop so
+		// shutdown-time catch-up close ACKs (which carry the observer onto a
+		// fresh context) remain visible for live-vs-leak diagnosis. The
+		// immutable first-Busy copy and the body-level final_lifecycle snapshot
+		// are unchanged; absence of a close row in any earlier scope stays
+		// unknown rather than evidence of a leak. No I/O, capacity, deadline, or
+		// shutdown behavior changes.
+		postShutdown := recoveryPinCollector.snapshot()
+		postShutdown.scope = "post_shutdown"
+		postShutdown.log(t)
 		storeAfterCleanup := snapshotNodeStoreBuckets(storeBuckets)
 		logNodeStoreDelta(t, "cleanup", ids, storeBeforeCleanup, storeAfterCleanup)
 		cleanupEnd, cleanupEndErr := nodeVersityRequestCount(gateway)
@@ -817,6 +827,31 @@ func TestNodeForegroundRecoveryPinCollectorFirstBusySnapshotImmutable(t *testing
 	final := collector.snapshot()
 	if final.keyEvicted == 0 {
 		t.Fatalf("the final snapshot must record post-latch evictions")
+	}
+}
+
+// Cleanup ordering: a body-level snapshot taken before shutdown cannot contain
+// the shutdown-time close ACK, while the post-shutdown snapshot can. This is the
+// deterministic form of the fixture's cleanup ordering (reverse Shutdown loop
+// inside t.Cleanup runs after the body-level log), with no provider involved.
+func TestNodeForegroundRecoveryPinPostShutdownSnapshotSeesShutdownClose(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "catchup-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
+	// The Busy happens before shutdown, so the first-Busy copy is latched here.
+	collector.latchFailure()
+	bodyScope := collector.snapshot()
+	// Simulate the shutdown-time catch-up close that carries the observer onto a
+	// fresh context inside Node.Shutdown.
+	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "catchup-key", Phase: localtesthooks.RecoveryPinCloseConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerNodeCatchup})
+	postScope := collector.snapshot()
+	if postScope.closeCounts[0] != 1 {
+		t.Fatalf("post-shutdown snapshot must contain the shutdown close row: %+v", postScope.closeCounts)
+	}
+	if bodyScope.closeCounts[0] != 0 {
+		t.Fatalf("the earlier body-level snapshot must not retroactively contain the shutdown close row")
+	}
+	if first := collector.firstBusySnapshot(); first == nil || first.closeCounts[0] != 0 {
+		t.Fatalf("first-Busy copy must stay independent of later shutdown rows")
 	}
 }
 
