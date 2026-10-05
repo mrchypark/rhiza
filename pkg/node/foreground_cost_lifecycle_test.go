@@ -49,7 +49,13 @@ const (
 	nodeForegroundRecoveryPinEventLimit    = 8
 	nodeForegroundRecoveryPinReservedClose = 2
 	nodeForegroundRecoveryPinTerminalLimit = 16
-	nodeForegroundP99MinSamples            = 10000
+	// nodeForegroundRecoveryPinGuardLimit bounds the distinct positive active-pin
+	// guard reads retained for one maintenance operation. It is a fixed capacity,
+	// not a history size: repeats of an already-retained hash are deduplicated and
+	// a further distinct hash is recorded as a drop rather than displacing an
+	// already-retained binding.
+	nodeForegroundRecoveryPinGuardLimit = 4
+	nodeForegroundP99MinSamples         = 10000
 	// Planning reserve for three per-node preparations, their bounded archive/
 	// checkpoint shutdown operations, gateway close, and small accounting slack.
 	// It is not a hard upper bound for Checkpointer/Node worker joins; the outer
@@ -400,8 +406,19 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			collector := &nodeForegroundPublisherBusyCollector{}
 			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, collector.observe)
 			archiveCollector := &nodeForegroundArchiveBusyCollector{}
+			guardCollector := &nodeForegroundRecoveryPinGuardCollector{operationID: operationID}
 			if scenario == "checkpoint-active" {
 				operationCtx = localtesthooks.WithArchiveBusyTrace(operationCtx, archiveCollector.observe)
+				// The positive active-pin guard reads are emitted on the same
+				// per-operation context as the archive Busy attribution, so binding
+				// them needs no production field. The fan-out delivers every row to
+				// the existing global lifecycle collector first, so no current
+				// global row, close row, or terminal row is lost or changed.
+				operationCtx = localtesthooks.WithRecoveryPinTrace(operationCtx,
+					func(event localtesthooks.RecoveryPinEvent) {
+						recoveryPinCollector.observe(event)
+						guardCollector.observe(event)
+					})
 			}
 			var result nodeForegroundMaintenanceResult
 			var err error
@@ -423,7 +440,12 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 				// immutable while later close/expiry rows stay observable in the
 				// final lifecycle snapshot.
 				snapshot := archiveCollector.snapshot()
-				recoveryPinCollector.latchFailure()
+				// Capture both snapshots before latching, so the per-operation
+				// guard binding and the archive Busy rows are read while the pinned
+				// guard key is still held, and latchFailure stores plain copies
+				// instead of re-reading live collector state.
+				guard := guardCollector.snapshot()
+				recoveryPinCollector.latchFailure(guard)
 				archiveBusyFailures.record(operationID, snapshot)
 			}
 			return result, err
@@ -770,7 +792,7 @@ func TestNodeForegroundRecoveryPinCollectorExpiredGuardDoesNotPinKey(t *testing.
 func TestNodeForegroundRecoveryPinCollectorGuardPinReleasedAfterFailure(t *testing.T) {
 	collector := &nodeForegroundRecoveryPinCollector{}
 	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
-	collector.latchFailure()
+	collector.latchFailure(nodeForegroundRecoveryPinGuardSnapshot{})
 	if collector.latchCount != 1 {
 		t.Fatalf("latchCount=%d, want 1 after the first latch", collector.latchCount)
 	}
@@ -789,7 +811,7 @@ func TestNodeForegroundRecoveryPinCollectorFirstBusySnapshotImmutable(t *testing
 	collector := &nodeForegroundRecoveryPinCollector{}
 	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "cause-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
 	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "cause-key", Phase: localtesthooks.RecoveryPinCreateConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 4000})
-	collector.latchFailure()
+	collector.latchFailure(nodeForegroundRecoveryPinGuardSnapshot{})
 	first := collector.firstBusySnapshot()
 	if first == nil {
 		t.Fatalf("the first Busy must capture a pin snapshot")
@@ -806,7 +828,7 @@ func TestNodeForegroundRecoveryPinCollectorFirstBusySnapshotImmutable(t *testing
 	}
 	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "cause-key", Phase: localtesthooks.RecoveryPinCloseConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup})
 	// A repeated latch must not overwrite the first capture.
-	collector.latchFailure()
+	collector.latchFailure(nodeForegroundRecoveryPinGuardSnapshot{})
 
 	again := collector.firstBusySnapshot()
 	if len(again.hashes) != len(first.hashes) || len(again.hashes) > nodeForegroundRecoveryPinKeyLimit {
@@ -838,7 +860,7 @@ func TestNodeForegroundRecoveryPinPostShutdownSnapshotSeesShutdownClose(t *testi
 	collector := &nodeForegroundRecoveryPinCollector{}
 	collector.observe(localtesthooks.RecoveryPinEvent{KeyHash: "catchup-key", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000})
 	// The Busy happens before shutdown, so the first-Busy copy is latched here.
-	collector.latchFailure()
+	collector.latchFailure(nodeForegroundRecoveryPinGuardSnapshot{})
 	bodyScope := collector.snapshot()
 	// Simulate the shutdown-time catch-up close that carries the observer onto a
 	// fresh context inside Node.Shutdown.
@@ -991,6 +1013,201 @@ func TestNodeForegroundRecoveryPinCollectorConcurrentObservation(t *testing.T) {
 
 // The collector keeps only bounded classifications: never the full object key,
 // owner string, or token.
+// The per-operation guard collector retains at most the fixed capacity of
+// DISTINCT positive hashes: a duplicate consumes no slot and is not a drop, and
+// a further distinct hash is dropped without displacing a retained binding.
+func TestNodeForegroundRecoveryPinGuardCollectorBoundsDistinctHashes(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinGuardCollector{}
+	positive := func(hash string, observedAt int64) localtesthooks.RecoveryPinEvent {
+		return localtesthooks.RecoveryPinEvent{
+			KeyHash: hash, Phase: localtesthooks.RecoveryPinGuardRead,
+			OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown,
+			LeaseState:    localtesthooks.RecoveryPinLeaseActive,
+			LeaseDeltaMS:  5000, ObservedAtMS: observedAt,
+		}
+	}
+	collector.observe(positive("guard-a", 100))
+	collector.observe(positive("guard-b", 200))
+	collector.observe(positive("guard-c", 300))
+	collector.observe(positive("guard-d", 350))
+	// A duplicate of an already-retained hash must not consume a slot and must
+	// not overwrite the first-retained values for that hash.
+	collector.observe(positive("guard-a", 999))
+	snap := collector.snapshot()
+	if len(snap.records) != nodeForegroundRecoveryPinGuardLimit {
+		t.Fatalf("retained=%d, want %d distinct hashes", len(snap.records), nodeForegroundRecoveryPinGuardLimit)
+	}
+	// A fifth distinct hash is dropped; it never displaces a retained binding.
+	collector.observe(positive("guard-e", 400))
+	snap = collector.snapshot()
+	if len(snap.records) != nodeForegroundRecoveryPinGuardLimit {
+		t.Fatalf("a rejected distinct hash must not evict a retained binding: retained=%d", len(snap.records))
+	}
+	if snap.records[0].keyHash != "guard-a" || snap.records[0].observedAtMS != 100 {
+		t.Fatalf("the first-retained values must win for a deduplicated hash: %+v", snap.records[0])
+	}
+	if snap.records[1].keyHash != "guard-b" {
+		t.Fatalf("second retained hash=%q, want guard-b", snap.records[1].keyHash)
+	}
+	if snap.dropped != 1 || !snap.joinUnknown {
+		t.Fatalf("dropped=%d joinUnknown=%t, want 1/true", snap.dropped, snap.joinUnknown)
+	}
+}
+
+// Only a live-lease guard read is a positive binding; an expired-healthy or
+// zero-delta guard row is not evidence of an active pin.
+func TestNodeForegroundRecoveryPinGuardCollectorOnlyLiveLeaseIsPositive(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinGuardCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "expired-key", Phase: localtesthooks.RecoveryPinGuardRead,
+		LeaseState: localtesthooks.RecoveryPinLeaseExpired, LeaseDeltaMS: -1000,
+	})
+	collector.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "zero-key", Phase: localtesthooks.RecoveryPinGuardRead,
+		LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 0,
+	})
+	collector.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "active-key", Phase: localtesthooks.RecoveryPinGuardRead,
+		LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 5000,
+	})
+	snap := collector.snapshot()
+	if len(snap.records) != 1 || snap.records[0].keyHash != "active-key" {
+		t.Fatalf("only the live-lease guard read may be a positive binding: %+v", snap.records)
+	}
+	if snap.dropped != 0 || snap.joinUnknown {
+		t.Fatalf("non-positive rows must not count as drops: dropped=%d unknown=%t", snap.dropped, snap.joinUnknown)
+	}
+}
+
+// The first-Busy copy keeps the per-operation guard binding field-for-field even
+// when the global table later overflows and later rows arrive. Guard drop state
+// stays independent of the global counters.
+func TestNodeForegroundRecoveryPinGuardBindingSurvivesGlobalOverflow(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	guard := &nodeForegroundRecoveryPinGuardCollector{}
+	collector.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinGuardRead,
+		OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown,
+		LeaseState:    localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 7000, ObservedAtMS: 111,
+	})
+	guard.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinGuardRead,
+		OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown,
+		LeaseState:    localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 7000, ObservedAtMS: 111,
+	})
+	guardSnapshot := guard.snapshot()
+	collector.latchFailure(guardSnapshot)
+	// Drive the global table well past its key capacity after the latch.
+	for i := 0; i < nodeForegroundRecoveryPinKeyLimit*2; i++ {
+		collector.observe(localtesthooks.RecoveryPinEvent{
+			KeyHash: fmt.Sprintf("unrelated-%02d", i), Phase: localtesthooks.RecoveryPinCreateAttempt,
+			OwnerCategory: localtesthooks.RecoveryPinOwnerStartup,
+		})
+	}
+	collector.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinCloseConfirmed,
+		OwnerCategory: localtesthooks.RecoveryPinOwnerNodeCatchup,
+	})
+	first := collector.firstBusySnapshot()
+	if first == nil || len(first.guard.records) != 1 {
+		t.Fatalf("first-Busy copy must retain its guard binding: %+v", first)
+	}
+	want := nodeForegroundRecoveryPinGuardRecord{
+		keyHash: "guard-key", leaseState: localtesthooks.RecoveryPinLeaseActive,
+		leaseDeltaMS: 7000, observedAtMS: 111,
+	}
+	if first.guard.records[0] != want {
+		t.Fatalf("latched guard record=%+v, want %+v", first.guard.records[0], want)
+	}
+	if first.guard.dropped != 0 || first.guard.joinUnknown {
+		t.Fatalf("latched guard drop state must stay independent: %+v", first.guard)
+	}
+	final := collector.snapshot()
+	if final.keyMiss == 0 && final.keyEvicted == 0 && !final.joinUnknown {
+		t.Fatalf("the global table must actually record overflow after the latch")
+	}
+	if final.guard.records != nil {
+		t.Fatalf("a non-latched global snapshot must not fabricate a guard binding")
+	}
+	// A repeated latch must not rewrite the first-Busy evidence.
+	collector.latchFailure(nodeForegroundRecoveryPinGuardSnapshot{
+		records: []nodeForegroundRecoveryPinGuardRecord{{keyHash: "other", leaseState: localtesthooks.RecoveryPinLeaseActive, leaseDeltaMS: 1}},
+		dropped: 3, joinUnknown: true,
+	})
+	again := collector.firstBusySnapshot()
+	if len(again.guard.records) != 1 || again.guard.records[0] != want || again.guard.dropped != 0 {
+		t.Fatalf("a repeated latch overwrote the first-Busy guard binding: %+v", again.guard)
+	}
+}
+
+// The guard binding carries the test-side maintenance operation identity that
+// created it: a nonzero operation ID is retained in the immutable first-Busy
+// snapshot and emitted with every guard line, and a repeated latch can neither
+// change it nor replace it.
+func TestNodeForegroundRecoveryPinGuardBindingCarriesOperationID(t *testing.T) {
+	collector := &nodeForegroundRecoveryPinCollector{}
+	guard := &nodeForegroundRecoveryPinGuardCollector{operationID: 42}
+	guard.observe(localtesthooks.RecoveryPinEvent{
+		KeyHash: "guard-key", Phase: localtesthooks.RecoveryPinGuardRead,
+		OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown,
+		LeaseState:    localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 4000, ObservedAtMS: 77,
+	})
+	first := guard.snapshot()
+	if first.operationID != 42 {
+		t.Fatalf("guard snapshot operation_id=%d, want 42", first.operationID)
+	}
+	collector.latchFailure(first)
+	latched := collector.firstBusySnapshot()
+	if latched == nil || latched.guard.operationID != 42 {
+		t.Fatalf("the first-Busy binding must retain operation_id=42: %+v", latched)
+	}
+	// A repeated latch carrying a different identity must not rewrite the
+	// first cause or its operation identity.
+	collector.latchFailure(nodeForegroundRecoveryPinGuardSnapshot{
+		operationID: 99,
+		records:     []nodeForegroundRecoveryPinGuardRecord{{keyHash: "other-key", leaseState: localtesthooks.RecoveryPinLeaseActive, leaseDeltaMS: 1}},
+		dropped:     2, joinUnknown: true,
+	})
+	again := collector.firstBusySnapshot()
+	if again.guard.operationID != 42 || len(again.guard.records) != 1 || again.guard.records[0].keyHash != "guard-key" || again.guard.dropped != 0 {
+		t.Fatalf("a repeated latch rewrote the first-Busy binding: %+v", again.guard)
+	}
+	// A per-operation collector created without an operation identity stays
+	// explicitly zero rather than borrowing another operation's identity.
+	if got := (&nodeForegroundRecoveryPinGuardCollector{}).snapshot().operationID; got != 0 {
+		t.Fatalf("operation_id=%d, want 0 for a collector without an operation", got)
+	}
+	// Emit the immutable copy through the real logging path. The identity is
+	// asserted above; the emitted operation_id=42 line is verified from the
+	// recorded verbose test output rather than through a log-capture shim.
+	again.log(t)
+}
+
+// The explicit fan-out delivers every row to the existing global collector, so
+// installing the per-operation guard observer loses no global evidence.
+func TestNodeForegroundRecoveryPinFanOutPreservesGlobalCollector(t *testing.T) {
+	global := &nodeForegroundRecoveryPinCollector{}
+	guard := &nodeForegroundRecoveryPinGuardCollector{}
+	for _, event := range []localtesthooks.RecoveryPinEvent{
+		{KeyHash: "shared", Phase: localtesthooks.RecoveryPinCreateAttempt, OwnerCategory: localtesthooks.RecoveryPinOwnerStartup},
+		{KeyHash: "shared", Phase: localtesthooks.RecoveryPinGuardRead, OwnerCategory: localtesthooks.RecoveryPinOwnerGuardUnknown, LeaseState: localtesthooks.RecoveryPinLeaseActive, LeaseDeltaMS: 3000},
+		{KeyHash: "shared", Phase: localtesthooks.RecoveryPinCloseConfirmed, OwnerCategory: localtesthooks.RecoveryPinOwnerNodeCatchup},
+	} {
+		global.observe(event)
+		guard.observe(event)
+	}
+	snap := global.snapshot()
+	if len(snap.hashes) != 1 || snap.hashes[0] != "shared" || snap.counts[0] != 2 || snap.closeCounts[0] != 1 {
+		t.Fatalf("the fan-out must preserve global rows: hashes=%v counts=%v closes=%v", snap.hashes, snap.counts, snap.closeCounts)
+	}
+	if len(snap.terminals) != 2 {
+		t.Fatalf("terminal rows must remain separate: %+v", snap.terminals)
+	}
+	if got := guard.snapshot(); len(got.records) != 1 || got.records[0].keyHash != "shared" {
+		t.Fatalf("the per-operation guard collector must retain the positive row: %+v", got.records)
+	}
+}
+
 func TestNodeForegroundRecoveryPinCollectorRetainsOnlyBoundedFields(t *testing.T) {
 	collector := &nodeForegroundRecoveryPinCollector{}
 	const secretKey = "archive/recovery-pins/deadbeefdeadbeef-deadbeefdeadbeef"
@@ -1550,6 +1767,94 @@ func isRecoveryPinDecisionPhase(phase string) bool {
 	return isRecoveryPinClosePhase(phase) || phase == localtesthooks.RecoveryPinGuardRead
 }
 
+// nodeForegroundRecoveryPinGuardCollector binds the positive active-pin guard
+// reads performed by one maintenance operation to that operation. It retains at
+// most nodeForegroundRecoveryPinGuardLimit DISTINCT key hashes: a repeat of an
+// already-retained hash is deduplicated and consumes no slot, and a further
+// distinct hash is never allowed to displace a retained binding, so the missing
+// binding stays an explicit unknown instead of silently becoming a different
+// key. Each retained record keeps exactly the fields the guard already read, so
+// no extra provider I/O and no new production field is involved.
+type nodeForegroundRecoveryPinGuardCollector struct {
+	mu sync.Mutex
+	// operationID is the already-created test-side maintenance operation
+	// identity. It is carried by value only so the emitted binding names the
+	// operation whose guard reads are recorded; it adds no production or hook
+	// field and is never inferred from a later snapshot.
+	operationID uint64
+	records     [nodeForegroundRecoveryPinGuardLimit]nodeForegroundRecoveryPinGuardRecord
+	count       int
+	dropped     atomic.Uint64
+	joinUnknown atomic.Bool
+}
+
+// nodeForegroundRecoveryPinGuardRecord is a plain copy of the observed guard
+// read. It retains no owner string, full object key, token, or credential.
+type nodeForegroundRecoveryPinGuardRecord struct {
+	keyHash      string
+	leaseState   string
+	leaseDeltaMS int64
+	observedAtMS int64
+}
+
+type nodeForegroundRecoveryPinGuardSnapshot struct {
+	operationID uint64
+	records     []nodeForegroundRecoveryPinGuardRecord
+	dropped     uint64
+	joinUnknown bool
+}
+
+// observe retains a positive guard read. It is nonblocking: a contended lock
+// records an explicit drop and sets the unknown flag rather than stalling the
+// maintenance path.
+func (c *nodeForegroundRecoveryPinGuardCollector) observe(event localtesthooks.RecoveryPinEvent) {
+	// Only a guard read that saw a live lease is a positive binding: an expired or
+	// zero-delta guard row describes a healthy released pin, not an active pin.
+	if event.Phase != localtesthooks.RecoveryPinGuardRead ||
+		event.LeaseState != localtesthooks.RecoveryPinLeaseActive || event.LeaseDeltaMS <= 0 {
+		return
+	}
+	if !c.mu.TryLock() {
+		c.dropped.Add(1)
+		c.joinUnknown.Store(true)
+		return
+	}
+	defer c.mu.Unlock()
+	for i := 0; i < c.count; i++ {
+		if c.records[i].keyHash == event.KeyHash {
+			// A duplicate read of a retained hash is deduplicated: it consumes no
+			// slot, displaces nothing, and is not a drop. The first retained values
+			// stay authoritative for that hash.
+			return
+		}
+	}
+	if c.count >= nodeForegroundRecoveryPinGuardLimit {
+		c.dropped.Add(1)
+		c.joinUnknown.Store(true)
+		return
+	}
+	c.records[c.count] = nodeForegroundRecoveryPinGuardRecord{
+		keyHash:      event.KeyHash,
+		leaseState:   event.LeaseState,
+		leaseDeltaMS: event.LeaseDeltaMS,
+		observedAtMS: event.ObservedAtMS,
+	}
+	c.count++
+}
+
+// snapshot copies the retained records by value under the collector lock, so
+// the returned snapshot never aliases the live arrays.
+func (c *nodeForegroundRecoveryPinGuardCollector) snapshot() nodeForegroundRecoveryPinGuardSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return nodeForegroundRecoveryPinGuardSnapshot{
+		operationID: c.operationID,
+		records:     append([]nodeForegroundRecoveryPinGuardRecord(nil), c.records[:c.count]...),
+		dropped:     c.dropped.Load(),
+		joinUnknown: c.joinUnknown.Load(),
+	}
+}
+
 // observe is nonblocking. A contended lock drops the row and records the
 // unknown explicitly rather than stalling a production hot path.
 func (c *nodeForegroundRecoveryPinCollector) observe(event localtesthooks.RecoveryPinEvent) {
@@ -1660,6 +1965,10 @@ type nodeForegroundRecoveryPinSnapshot struct {
 	eventOverflow uint64
 	closeOverflow uint64
 	termMiss      bool
+	// guard binds the positive active-pin guard reads this same maintenance
+	// operation performed. It is captured by value before the pinned guard key is
+	// released, and it never replaces or is derived from the terminal rows above.
+	guard nodeForegroundRecoveryPinGuardSnapshot
 }
 
 func (c *nodeForegroundRecoveryPinCollector) snapshot() nodeForegroundRecoveryPinSnapshot {
@@ -1693,12 +2002,13 @@ func (c *nodeForegroundRecoveryPinCollector) snapshotLocked() nodeForegroundReco
 // first Busy and only then releases the pinned guard key, so post-latch
 // replacement and shutdown rows can never mutate the first-Busy evidence. The
 // first capture wins: a repeated latch never overwrites it.
-func (c *nodeForegroundRecoveryPinCollector) latchFailure() {
+func (c *nodeForegroundRecoveryPinCollector) latchFailure(guard nodeForegroundRecoveryPinGuardSnapshot) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.firstBusy == nil {
 		captured := c.snapshotLocked()
 		captured.scope = "first_busy"
+		captured.guard = guard
 		c.firstBusy = &captured
 	}
 	c.failureLatch = true
@@ -1746,6 +2056,23 @@ func (snap nodeForegroundRecoveryPinSnapshot) log(t *testing.T) {
 	}
 	if snap.keyMiss > 0 || snap.keyEvicted > 0 || snap.joinUnknown || snap.eventOverflow > 0 || snap.closeOverflow > 0 || snap.termMiss {
 		t.Logf("node_foreground_recovery_pin scope=%s rows=unknown key_miss=%d key_evicted=%d join_unknown=%t event_overflow=%d close_overflow=%d terminal_missing=%t", scope, snap.keyMiss, snap.keyEvicted, snap.joinUnknown, snap.eventOverflow, snap.closeOverflow, snap.termMiss)
+	}
+	// The guard binding is a separate, operation-scoped observation. Its own
+	// drop and unknown flags are reported independently of the global table
+	// counters above, and an absent or dropped binding is never evidence that no
+	// guard read happened.
+	t.Logf("node_foreground_recovery_pin_guard operation_id=%d scope=%s guard_keys=%d/%d guard_dropped=%d guard_join_unknown=%t interpretation=operation_binding_only_not_cause",
+		snap.guard.operationID, scope, len(snap.guard.records), nodeForegroundRecoveryPinGuardLimit, snap.guard.dropped, snap.guard.joinUnknown)
+	for i, record := range snap.guard.records {
+		t.Logf("node_foreground_recovery_pin_guard operation_id=%d scope=%s row=%d/%d key_hash=%s lease_state=%q lease_delta_ms=%d observed_at_ms=%d",
+			snap.guard.operationID, scope, i, nodeForegroundRecoveryPinGuardLimit, record.keyHash, record.leaseState, record.leaseDeltaMS, record.observedAtMS)
+	}
+	if len(snap.guard.records) == 0 {
+		attribution := "guard_unknown"
+		if snap.guard.dropped > 0 || snap.guard.joinUnknown {
+			attribution = "guard_join_unknown"
+		}
+		t.Logf("node_foreground_recovery_pin_guard operation_id=%d scope=%s attribution=%s guard_dropped=%d", snap.guard.operationID, scope, attribution, snap.guard.dropped)
 	}
 }
 
