@@ -2,8 +2,13 @@ package checkpoint
 
 import (
 	"context"
+	"crypto/sha256"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"github.com/thanos-io/objstore"
 )
 
 // PublisherBusyObservation describes one claim-acquisition branch that
@@ -22,9 +27,22 @@ type PublisherBusyObservation struct {
 	ReservedIndex        uint64
 	BoundIndex           uint64
 	LeaseRemainingMillis int64
+	HolderCategory       string
+	NamespaceDigest      [32]byte
+	VersionDigest        [32]byte
+	VersionPresent       bool
+	ObservedAtMillis     int64
 }
 
 type publisherBusyObserverKey struct{}
+type publisherClaimCategoryKey struct{}
+
+const (
+	claimCategoryStartup       = "startup"
+	claimCategoryNodeCatchup   = "node_catchup"
+	claimCategoryGC            = "checkpoint_gc"
+	claimCategorySourceUnknown = "source_context_unknown"
+)
 
 // WithPublisherBusyObserver enables diagnostic observations for claim
 // acquisition in ctx. A nil observer is equivalent to no observer.
@@ -40,6 +58,60 @@ func observePublisherBusy(ctx context.Context, observation PublisherBusyObservat
 	if observe != nil {
 		observe(observation)
 	}
+}
+
+func carryPublisherObserver(dst, src context.Context) context.Context {
+	observe, _ := src.Value(publisherBusyObserverKey{}).(func(PublisherBusyObservation))
+	if observe == nil {
+		return dst
+	}
+	return context.WithValue(dst, publisherBusyObserverKey{}, observe)
+}
+
+func withPublisherClaimCategory(ctx context.Context, category string) context.Context {
+	if ctx.Value(publisherBusyObserverKey{}) == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, publisherClaimCategoryKey{}, category)
+}
+
+func publisherClaimCategory(ctx context.Context) string {
+	category, _ := ctx.Value(publisherClaimCategoryKey{}).(string)
+	switch category {
+	case claimCategoryStartup, claimCategoryNodeCatchup, claimCategoryGC:
+		return category
+	default:
+		return claimCategorySourceUnknown
+	}
+}
+
+// observeClaimLifecycle reuses the existing opt-in publisher observer. It
+// computes identity digests only when a subscriber exists and performs no I/O.
+func observeClaimLifecycle(ctx context.Context, phase, prefix string, claim *PublisherClaim) {
+	observe, _ := ctx.Value(publisherBusyObserverKey{}).(func(PublisherBusyObservation))
+	if observe == nil || claim == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	event := PublisherBusyObservation{
+		Source: phase, Purpose: claim.Purpose, Generation: claim.Generation,
+		HolderCategory: publisherClaimCategory(ctx), ObservedAtMillis: now,
+		LeaseRemainingMillis: claim.LeaseUntilMS - now,
+	}
+	fillClaimIdentity(&event, prefix, claim.version)
+	observe(event)
+}
+
+func fillClaimIdentity(event *PublisherBusyObservation, prefix string, version *objstore.ObjectVersion) {
+	event.NamespaceDigest = sha256.Sum256([]byte(prefix))
+	if version == nil {
+		return
+	}
+	event.VersionPresent = true
+	encoded := strconv.AppendInt(nil, int64(version.Type), 10)
+	encoded = append(encoded, ':')
+	encoded = append(encoded, version.Value...)
+	event.VersionDigest = sha256.Sum256(encoded)
 }
 
 func activePublisherBusyObservation(source, requestedPurpose string, attempt int, claim *PublisherClaim, nowMillis int64) PublisherBusyObservation {

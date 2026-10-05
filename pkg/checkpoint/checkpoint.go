@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"io"
 	"log"
@@ -260,7 +261,12 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 		}
 		now := time.Now()
 		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
-			observePublisherBusy(ctx, activePublisherBusyObservation("publisher_claim_active", purpose, attempt, current, now.UnixMilli()))
+			observation := activePublisherBusyObservation("publisher_claim_active", purpose, attempt, current, now.UnixMilli())
+			if ctx.Value(publisherBusyObserverKey{}) != nil {
+				fillClaimIdentity(&observation, m.prefix, current.version)
+				observation.ObservedAtMillis = now.UnixMilli()
+			}
+			observePublisherBusy(ctx, observation)
 			return nil, ErrPublisherBusy
 		}
 		generation, floor := uint64(1), minExclusive
@@ -288,7 +294,14 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 			}
 			return nil, err
 		}
-		return m.confirmPublisherClaim(ctx, *claim)
+		if purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "acquire_upload_ack", m.prefix, claim)
+		}
+		confirmed, err := m.confirmPublisherClaim(ctx, *claim)
+		if err == nil && purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "acquire_confirmed", m.prefix, confirmed)
+		}
+		return confirmed, err
 	}
 	observePublisherBusy(ctx, exhaustedPublisherBusyObservation("publisher_claim_conditional_exhausted", purpose, 4))
 	return nil, ErrPublisherBusy
@@ -333,7 +346,11 @@ func (m *Manager) RenewPublisherClaim(ctx context.Context, claim *PublisherClaim
 		}
 		return nil, err
 	}
-	return m.confirmPublisherClaim(ctx, *current)
+	confirmed, err := m.confirmPublisherClaim(ctx, *current)
+	if err == nil && confirmed.Purpose == "maintenance" {
+		observeClaimLifecycle(ctx, "renew_confirmed", m.prefix, confirmed)
+	}
+	return confirmed, err
 }
 
 func (m *Manager) confirmPublisherClaim(ctx context.Context, expected PublisherClaim) (*PublisherClaim, error) {
@@ -366,15 +383,31 @@ func (m *Manager) ValidatePublisherClaim(ctx context.Context, owner string, inde
 func (m *Manager) ReleasePublisherClaim(ctx context.Context, claim *PublisherClaim) error {
 	current, err := m.readPublisherClaim(ctx)
 	if err != nil {
+		if claim != nil && claim.Purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "release_error", m.prefix, claim)
+		}
 		return err
 	}
 	if claim == nil || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID {
+		if current.Purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "release_fenced", m.prefix, current)
+		}
 		return ErrPublisherFenced
 	}
 	current.LeaseUntilMS = time.Now().UnixMilli()
 	if err := m.uploadPublisherClaim(ctx, m.key("checkpoint/PUBLISHER"), current, objstore.WithIfMatch(current.version)); err != nil && m.bucket.IsConditionNotMetErr(err) {
+		if current.Purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "release_fenced", m.prefix, current)
+		}
 		return ErrPublisherFenced
 	} else {
+		if current.Purpose == "maintenance" {
+			if err != nil {
+				observeClaimLifecycle(ctx, "release_error", m.prefix, current)
+			} else {
+				observeClaimLifecycle(ctx, "release_upload_ack", m.prefix, current)
+			}
+		}
 		return err
 	}
 }
@@ -1065,7 +1098,8 @@ func (m *Manager) PinRecoveryRoot(ctx context.Context, root *Checkpoint, owner s
 		return nil, err
 	}
 	var pin *RecoveryPin
-	err = m.withMaintenanceClaim(ctx, func(ctx context.Context, _ *PublisherClaim) error {
+	category := localtesthooks.RecoveryPinCategory(ctx)
+	err = m.withMaintenanceClaim(ctx, category, func(ctx context.Context, _ *PublisherClaim) error {
 		// The caller already verified this immutable root. The maintenance claim
 		// excludes GC until the pin is committed, so one Attributes check closes
 		// the deletion race without a second root GET.
@@ -1290,12 +1324,13 @@ func (m *Manager) GarbageCollectFrom(ctx context.Context, retain map[[32]byte]st
 	if keep < 1 || grace < 0 {
 		return fmt.Errorf("invalid checkpoint GC policy")
 	}
-	return m.withMaintenanceClaim(ctx, func(ctx context.Context, claim *PublisherClaim) error {
+	return m.withMaintenanceClaim(ctx, claimCategoryGC, func(ctx context.Context, claim *PublisherClaim) error {
 		return m.garbageCollect(ctx, claim, retain, keep, floor, grace)
 	})
 }
 
-func (m *Manager) withMaintenanceClaim(ctx context.Context, work func(context.Context, *PublisherClaim) error) error {
+func (m *Manager) withMaintenanceClaim(ctx context.Context, category string, work func(context.Context, *PublisherClaim) error) error {
+	ctx = withPublisherClaimCategory(ctx, category)
 	claim, err := m.acquireMaintenanceClaim(ctx, "checkpoint-gc", maintenanceLease)
 	if err != nil {
 		return err
@@ -1339,6 +1374,8 @@ func (m *Manager) withMaintenanceClaim(ctx context.Context, work func(context.Co
 	claim = current
 	claimMu.Unlock()
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	releaseCtx = carryPublisherObserver(releaseCtx, ctx)
+	releaseCtx = withPublisherClaimCategory(releaseCtx, category)
 	releaseErr := m.ReleasePublisherClaim(releaseCtx, claim)
 	releaseCancel()
 	if releaseErr != nil && !errors.Is(releaseErr, ErrPublisherFenced) && err == nil {

@@ -55,6 +55,8 @@ const (
 	// a further distinct hash is recorded as a drop rather than displacing an
 	// already-retained binding.
 	nodeForegroundRecoveryPinGuardLimit = 4
+	nodeForegroundClaimLifecycleLimit   = 64
+	nodeForegroundClaimReleaseLimit     = 4
 	nodeForegroundP99MinSamples         = 10000
 	// Planning reserve for three per-node preparations, their bounded archive/
 	// checkpoint shutdown operations, gateway close, and small accounting slack.
@@ -169,6 +171,8 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	// only the maintenance path. It is a fixed-size nonblocking collector.
 	recoveryPinCollector := &nodeForegroundRecoveryPinCollector{}
 	ctx = localtesthooks.WithRecoveryPinTrace(ctx, recoveryPinCollector.observe)
+	claimCollector := &nodeForegroundClaimLifecycleCollector{}
+	ctx = checkpoint.WithPublisherBusyObserver(ctx, claimCollector.observe)
 	transportObserver, unregisterTransportObserver, err := objmetrics.RegisterS3TransportObserver(endpoint, []string{"n1", "n2", "n3"})
 	if err != nil {
 		t.Fatalf("register tagged S3 transport observer: %v", err)
@@ -237,6 +241,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		postShutdown := recoveryPinCollector.snapshot()
 		postShutdown.scope = "post_shutdown"
 		postShutdown.log(t)
+		claimCollector.log(t, "post_shutdown")
 		storeAfterCleanup := snapshotNodeStoreBuckets(storeBuckets)
 		logNodeStoreDelta(t, "cleanup", ids, storeBeforeCleanup, storeAfterCleanup)
 		cleanupEnd, cleanupEndErr := nodeVersityRequestCount(gateway)
@@ -404,7 +409,12 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		operation := func(operationCtx context.Context) (nodeForegroundMaintenanceResult, error) {
 			operationID := publisherBusyOperationID.Add(1)
 			collector := &nodeForegroundPublisherBusyCollector{}
-			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, collector.observe)
+			operationCtx = checkpoint.WithPublisherBusyObserver(operationCtx, func(event checkpoint.PublisherBusyObservation) {
+				claimCollector.observe(event)
+				if event.Source == "publisher_claim_active" || event.Source == "publisher_claim_conditional_exhausted" || event.Source == "generation_claim_active" || event.Source == "generation_claim_conditional_exhausted" {
+					collector.observe(event)
+				}
+			})
 			archiveCollector := &nodeForegroundArchiveBusyCollector{}
 			guardCollector := &nodeForegroundRecoveryPinGuardCollector{operationID: operationID}
 			if scenario == "checkpoint-active" {
@@ -433,6 +443,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 			if errors.Is(err, checkpoint.ErrPublisherBusy) {
 				events, overflow := collector.snapshot()
 				publisherBusyFailures.record(operationID, events, overflow)
+				claimCollector.latchFailure(operationID, events)
 			}
 			if errors.Is(err, recovery.ErrArchiveBusy) {
 				// latchFailure captures the pin table at the first Busy before the
@@ -470,6 +481,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		maintenance.stopAndWait()
 		transportObserver.SetPhase("measurement")
 		maintenance.log(t, nodeForegroundMeasure)
+		claimCollector.log(t, "measurement_terminal")
 		if archivePhaseTrace != nil {
 			archivePhaseTrace.log(t)
 		}
@@ -663,6 +675,38 @@ func TestNodeForegroundPublisherBusyCollectorBoundsConcurrentEvents(t *testing.T
 	failures.record(3, []checkpoint.PublisherBusyObservation{{Source: "later"}}, 0)
 	if failures.failure == nil || failures.failure.operationID != 2 || len(failures.failure.events) != nodeForegroundPublisherBusyEventLimit || failures.failure.overflow != 4 {
 		t.Fatalf("failure=%+v", failures.failure)
+	}
+}
+
+func TestNodeForegroundClaimLifecycleCollectorJoinsOnlyExactConfirmedVersion(t *testing.T) {
+	collector := &nodeForegroundClaimLifecycleCollector{}
+	var namespace, version [32]byte
+	namespace[0], version[0] = 1, 2
+	holder := checkpoint.PublisherBusyObservation{Source: "acquire_confirmed", Purpose: "maintenance", HolderCategory: "node_catchup", Generation: 7, NamespaceDigest: namespace, VersionDigest: version, VersionPresent: true}
+	collector.observe(holder)
+	guard := checkpoint.PublisherBusyObservation{Source: "publisher_claim_active", ActiveClaim: true, Purpose: "maintenance", Generation: 7, NamespaceDigest: namespace, VersionDigest: version, VersionPresent: true}
+	collector.observe(guard)
+	collector.latchFailure(9, []checkpoint.PublisherBusyObservation{guard})
+	if collector.guard == nil || collector.holder == nil || collector.holder.HolderCategory != "node_catchup" || collector.operationID != 9 {
+		t.Fatalf("confirmed holder was not joined: %+v", collector)
+	}
+	collector.observe(checkpoint.PublisherBusyObservation{Source: "release_upload_ack", Purpose: "maintenance", Generation: 7, NamespaceDigest: namespace})
+	if len(collector.releases) != 1 {
+		t.Fatalf("release rows=%d, want 1", len(collector.releases))
+	}
+	for i := 0; i < nodeForegroundClaimLifecycleLimit+3; i++ {
+		collector.observe(checkpoint.PublisherBusyObservation{Source: "acquire_upload_ack", Generation: uint64(i + 20)})
+	}
+	if collector.dropped != 6 || collector.guard == nil || collector.holder == nil {
+		t.Fatalf("bounded ring lost immutable first failure: dropped=%d guard=%v holder=%v", collector.dropped, collector.guard, collector.holder)
+	}
+	unknown := &nodeForegroundClaimLifecycleCollector{}
+	wrong := holder
+	wrong.VersionDigest[0]++
+	unknown.observe(wrong)
+	unknown.latchFailure(1, []checkpoint.PublisherBusyObservation{guard})
+	if unknown.holder != nil || unknown.guard == nil {
+		t.Fatalf("mismatched version was falsely joined: %+v", unknown)
 	}
 }
 
@@ -2078,6 +2122,88 @@ func (snap nodeForegroundRecoveryPinSnapshot) log(t *testing.T) {
 			attribution = "guard_join_unknown"
 		}
 		t.Logf("node_foreground_recovery_pin_guard operation_id=%d scope=%s attribution=%s guard_dropped=%d", snap.guard.operationID, scope, attribution, snap.guard.dropped)
+	}
+}
+
+// This collector is diagnostic only. The ring is bounded, while the first
+// failed operation's guard and any later matching release rows are reserved.
+type nodeForegroundClaimLifecycleCollector struct {
+	mu             sync.Mutex
+	events         []checkpoint.PublisherBusyObservation
+	dropped        uint64
+	operationID    uint64
+	guard          *checkpoint.PublisherBusyObservation
+	holder         *checkpoint.PublisherBusyObservation
+	releases       []checkpoint.PublisherBusyObservation
+	releaseDropped uint64
+}
+
+func (c *nodeForegroundClaimLifecycleCollector) observe(event checkpoint.PublisherBusyObservation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) == nodeForegroundClaimLifecycleLimit {
+		copy(c.events, c.events[1:])
+		c.events[len(c.events)-1] = event
+		c.dropped++
+	} else {
+		c.events = append(c.events, event)
+	}
+	if c.guard != nil && event.Generation == c.guard.Generation && event.NamespaceDigest == c.guard.NamespaceDigest &&
+		(event.Source == "release_upload_ack" || event.Source == "release_fenced" || event.Source == "release_error") {
+		if len(c.releases) < nodeForegroundClaimReleaseLimit {
+			c.releases = append(c.releases, event)
+		} else {
+			c.releaseDropped++
+		}
+	}
+}
+
+func (c *nodeForegroundClaimLifecycleCollector) latchFailure(operationID uint64, events []checkpoint.PublisherBusyObservation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.guard != nil {
+		return
+	}
+	for _, event := range events {
+		if event.Source != "publisher_claim_active" || !event.ActiveClaim || !event.VersionPresent {
+			continue
+		}
+		guard := event
+		c.guard = &guard
+		c.operationID = operationID
+		for i := len(c.events) - 1; i >= 0; i-- {
+			candidate := c.events[i]
+			if candidate.Source != "acquire_confirmed" && candidate.Source != "renew_confirmed" {
+				continue
+			}
+			if candidate.Generation == guard.Generation && candidate.NamespaceDigest == guard.NamespaceDigest &&
+				candidate.VersionPresent && candidate.VersionDigest == guard.VersionDigest {
+				holder := candidate
+				c.holder = &holder
+				break
+			}
+		}
+		return
+	}
+}
+
+func (c *nodeForegroundClaimLifecycleCollector) log(t *testing.T, scope string) {
+	c.mu.Lock()
+	guard, holder, operationID, dropped := c.guard, c.holder, c.operationID, c.dropped
+	releases := append([]checkpoint.PublisherBusyObservation(nil), c.releases...)
+	releaseDropped := c.releaseDropped
+	c.mu.Unlock()
+	if guard == nil {
+		t.Logf("node_foreground_checkpoint_claim scope=%s guard=absent holder=unknown lifecycle_dropped=%d", scope, dropped)
+		return
+	}
+	category := "unknown"
+	if holder != nil {
+		category = holder.HolderCategory
+	}
+	t.Logf("node_foreground_checkpoint_claim scope=%s operation_id=%d guard=stable_read generation=%d namespace_digest=%x version_digest=%x version_present=%t holder_category=%s holder_join=%t lifecycle_dropped=%d release_rows=%d release_dropped=%d", scope, operationID, guard.Generation, guard.NamespaceDigest, guard.VersionDigest, guard.VersionPresent, category, holder != nil, dropped, len(releases), releaseDropped)
+	for _, event := range releases {
+		t.Logf("node_foreground_checkpoint_claim scope=%s operation_id=%d phase=%s generation=%d namespace_digest=%x version_digest=%x version_present=%t holder_category=%s", scope, operationID, event.Source, event.Generation, event.NamespaceDigest, event.VersionDigest, event.VersionPresent, event.HolderCategory)
 	}
 }
 
