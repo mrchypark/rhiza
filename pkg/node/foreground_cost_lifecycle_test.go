@@ -469,6 +469,11 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 	overloadSites := &nodeForegroundOverloadSiteCollector{}
 	restoreOverloadSites := localtesthooks.Set(overloadSites.observe)
 	t.Cleanup(restoreOverloadSites)
+	batchAdmission := &nodeForegroundBatchAdmissionCollector{}
+	restoreBatchAdmission := localtesthooks.SetBatchAdmission(batchAdmission.observe)
+	var restoreBatchAdmissionOnce sync.Once
+	restoreBatchAdmissionSafely := func() { restoreBatchAdmissionOnce.Do(restoreBatchAdmission) }
+	t.Cleanup(restoreBatchAdmissionSafely)
 	observeMeasured := func(observation foregroundcosttest.Observation) {
 		metrics.observe(observation)
 		if maintenance != nil {
@@ -476,8 +481,13 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		}
 	}
 	measuredResult, err := foregroundcosttest.RunWindow(ctx, options(nodeForegroundMeasure, maintenance), put, get, observeMeasured, nil)
+	// RunWindow closes its gate and joins every admitted worker before returning,
+	// so this restore excludes preparation and warmup while retaining completion
+	// events through the measurement drain.
+	restoreBatchAdmissionSafely()
 	restoreOverloadSites()
 	overloadSites.log(t)
+	batchAdmission.log(t, measuredResult, metrics)
 	if maintenance != nil {
 		maintenance.stopAndWait()
 		transportObserver.SetPhase("measurement")
@@ -3059,6 +3069,130 @@ func TestNodeForegroundOverloadSiteCollectorCountsFixedNames(t *testing.T) {
 		if got := collector.counts[i].Load(); got != want {
 			t.Fatalf("site %s events=%d, want %d", site, got, want)
 		}
+	}
+}
+
+const nodeForegroundBatchAdmissionReasonCount = 6
+
+type nodeForegroundBatchAdmissionCollector struct {
+	reasons            [nodeForegroundBatchAdmissionReasonCount]atomic.Uint64
+	waitedCount        atomic.Uint64
+	waitedNanos        atomic.Uint64
+	waitedMaxNanos     atomic.Uint64
+	durableCount       atomic.Uint64
+	durableNanos       atomic.Uint64
+	durableMaxNanos    atomic.Uint64
+	acceptedNotDurable atomic.Uint64
+	invalid            atomic.Uint64
+}
+
+func nodeForegroundBatchAdmissionReasonIndex(reason string) (int, bool) {
+	switch reason {
+	case localtesthooks.BatchAdmissionAccepted:
+		return 0, true
+	case localtesthooks.BatchAdmissionWaitBudgetExhausted:
+		return 1, true
+	case localtesthooks.BatchAdmissionContextCanceled:
+		return 2, true
+	case localtesthooks.BatchAdmissionServerNotReady:
+		return 3, true
+	case localtesthooks.BatchAdmissionByteRejected:
+		return 4, true
+	case localtesthooks.BatchAdmissionJoinedExisting:
+		return 5, true
+	default:
+		return 0, false
+	}
+}
+
+func nodeForegroundAtomicMax(target *atomic.Uint64, value uint64) {
+	for current := target.Load(); current < value; current = target.Load() {
+		if target.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func (c *nodeForegroundBatchAdmissionCollector) observe(event localtesthooks.BatchAdmissionEvent) {
+	index, known := nodeForegroundBatchAdmissionReasonIndex(event.Reason)
+	if !known || event.WaitNanos < 0 || event.AcceptedToDurableNanos < 0 ||
+		(!event.Waited && event.WaitNanos != 0) ||
+		(event.Reason != localtesthooks.BatchAdmissionAccepted && event.AcceptedToDurableNanos != 0) ||
+		(event.Reason != localtesthooks.BatchAdmissionAccepted && event.Durable) ||
+		(!event.Durable && event.AcceptedToDurableNanos != 0) {
+		c.invalid.Add(1)
+		return
+	}
+	c.reasons[index].Add(1)
+	if event.Waited {
+		waited := uint64(event.WaitNanos)
+		c.waitedCount.Add(1)
+		c.waitedNanos.Add(waited)
+		nodeForegroundAtomicMax(&c.waitedMaxNanos, waited)
+	}
+	if event.Reason != localtesthooks.BatchAdmissionAccepted {
+		return
+	}
+	if !event.Durable {
+		c.acceptedNotDurable.Add(1)
+		return
+	}
+	durable := uint64(event.AcceptedToDurableNanos)
+	c.durableCount.Add(1)
+	c.durableNanos.Add(durable)
+	nodeForegroundAtomicMax(&c.durableMaxNanos, durable)
+}
+
+func (c *nodeForegroundBatchAdmissionCollector) log(t *testing.T, result foregroundcosttest.WindowResult, metrics *nodeForegroundCostMetrics) {
+	t.Helper()
+	metrics.mu.Lock()
+	inWindow, drained := metrics.inWindow, metrics.drained
+	metrics.mu.Unlock()
+	t.Logf("node_foreground_batch_admission phase=measurement completion_cohort=measurement_window_plus_drain event_in_window_attribution=unavailable api_completed_in_window=%d api_completed_during_drain=%d runner_started=%d runner_completed=%d pending_at_cutoff=%d outstanding=%d accepted=%d wait_budget_exhausted=%d context_canceled=%d server_not_ready=%d byte_rejected=%d joined_existing=%d waited_count=%d waited_nanos_sum=%d waited_nanos_max=%d durable_count=%d durable_nanos_sum=%d durable_nanos_max=%d accepted_not_durable=%d invalid_events=%d", inWindow, drained, result.Started, result.Completed, result.PendingAtCutoff, result.Outstanding, c.reasons[0].Load(), c.reasons[1].Load(), c.reasons[2].Load(), c.reasons[3].Load(), c.reasons[4].Load(), c.reasons[5].Load(), c.waitedCount.Load(), c.waitedNanos.Load(), c.waitedMaxNanos.Load(), c.durableCount.Load(), c.durableNanos.Load(), c.durableMaxNanos.Load(), c.acceptedNotDurable.Load(), c.invalid.Load())
+}
+
+func TestNodeForegroundBatchAdmissionCollectorAggregatesConcurrentEvents(t *testing.T) {
+	collector := &nodeForegroundBatchAdmissionCollector{}
+	restore := localtesthooks.SetBatchAdmission(collector.observe)
+	t.Cleanup(restore)
+	const workers = 16
+	var group sync.WaitGroup
+	for range workers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			localtesthooks.HitBatchAdmission(localtesthooks.BatchAdmissionEvent{Reason: localtesthooks.BatchAdmissionAccepted, Waited: true, WaitNanos: 11, AcceptedToDurableNanos: 17, Durable: true})
+			localtesthooks.HitBatchAdmission(localtesthooks.BatchAdmissionEvent{Reason: localtesthooks.BatchAdmissionAccepted})
+			localtesthooks.HitBatchAdmission(localtesthooks.BatchAdmissionEvent{Reason: localtesthooks.BatchAdmissionWaitBudgetExhausted, Waited: true, WaitNanos: 23})
+			localtesthooks.HitBatchAdmission(localtesthooks.BatchAdmissionEvent{Reason: localtesthooks.BatchAdmissionJoinedExisting})
+		}()
+	}
+	group.Wait()
+	localtesthooks.HitBatchAdmission(localtesthooks.BatchAdmissionEvent{Reason: "unknown"})
+	localtesthooks.HitBatchAdmission(localtesthooks.BatchAdmissionEvent{Reason: localtesthooks.BatchAdmissionAccepted, WaitNanos: -1})
+	if got := collector.reasons[0].Load(); got != 2*workers {
+		t.Fatalf("accepted=%d, want %d", got, 2*workers)
+	}
+	if got := collector.reasons[1].Load(); got != workers {
+		t.Fatalf("wait budget exhausted=%d, want %d", got, workers)
+	}
+	if got := collector.reasons[5].Load(); got != workers {
+		t.Fatalf("joined existing=%d, want %d", got, workers)
+	}
+	if got := collector.waitedCount.Load(); got != 2*workers {
+		t.Fatalf("waited count=%d, want %d", got, 2*workers)
+	}
+	if got := collector.waitedNanos.Load(); got != uint64(workers*(11+23)) || collector.waitedMaxNanos.Load() != 23 {
+		t.Fatalf("waited aggregate sum=%d max=%d", got, collector.waitedMaxNanos.Load())
+	}
+	if got := collector.durableCount.Load(); got != workers || collector.durableNanos.Load() != uint64(workers*17) || collector.durableMaxNanos.Load() != 17 {
+		t.Fatalf("durable aggregate count=%d sum=%d max=%d", got, collector.durableNanos.Load(), collector.durableMaxNanos.Load())
+	}
+	if got := collector.acceptedNotDurable.Load(); got != workers {
+		t.Fatalf("accepted not durable=%d, want %d", got, workers)
+	}
+	if got := collector.invalid.Load(); got != 2 {
+		t.Fatalf("invalid=%d, want 2", got)
 	}
 }
 

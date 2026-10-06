@@ -5,6 +5,7 @@ package localtesthooks
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 type archiveGCPhaseKey struct{}
@@ -166,6 +167,82 @@ var state struct {
 	hook func(string)
 }
 
+// BatchAdmissionEvent contains only bounded aggregate fields for an internal
+// mutation batch admission attempt. It retains no request, key, value, slot,
+// or error identity.
+type BatchAdmissionEvent struct {
+	Reason                 string
+	Waited                 bool
+	WaitNanos              int64
+	AcceptedToDurableNanos int64
+	Durable                bool
+}
+
+// BatchAdmissionTrace holds the test-only timestamps for one B batch
+// admission. It is created only by the internal batch path, never by ordinary
+// proposals.
+type BatchAdmissionTrace struct {
+	started   time.Time
+	waited    bool
+	waitAt    time.Time
+	waitNanos int64
+	accepted  time.Time
+}
+
+// NewBatchAdmissionTrace begins one test-only internal batch admission trace.
+func NewBatchAdmissionTrace() BatchAdmissionTrace {
+	return BatchAdmissionTrace{started: time.Now()}
+}
+
+// MarkWait records the first capacity wait for this batch admission.
+func (t *BatchAdmissionTrace) MarkWait() {
+	if !t.waited {
+		t.waited = true
+		t.waitAt = time.Now()
+	}
+}
+
+// MarkAccepted records the instant the batch obtained proposal admission.
+func (t *BatchAdmissionTrace) MarkAccepted() {
+	if t.waited {
+		t.waitNanos = time.Since(t.waitAt).Nanoseconds()
+	}
+	t.accepted = time.Now()
+}
+
+// Event returns the bounded terminal observation for this batch. Accepted
+// traces report accepted-to-durable time only for a durable completion.
+func (t BatchAdmissionTrace) Event(reason string, durable bool) (BatchAdmissionEvent, bool) {
+	if t.started.IsZero() {
+		return BatchAdmissionEvent{}, false
+	}
+	event := BatchAdmissionEvent{Reason: reason, Waited: t.waited, Durable: durable}
+	if t.waited {
+		event.WaitNanos = t.waitNanos
+		if t.accepted.IsZero() {
+			event.WaitNanos = time.Since(t.waitAt).Nanoseconds()
+		}
+	}
+	if reason == BatchAdmissionAccepted && durable && !t.accepted.IsZero() {
+		event.AcceptedToDurableNanos = time.Since(t.accepted).Nanoseconds()
+	}
+	return event, true
+}
+
+const (
+	BatchAdmissionAccepted            = "accepted"
+	BatchAdmissionWaitBudgetExhausted = "wait_budget_exhausted"
+	BatchAdmissionContextCanceled     = "context_canceled"
+	BatchAdmissionServerNotReady      = "server_not_ready"
+	BatchAdmissionByteRejected        = "byte_rejected"
+	BatchAdmissionJoinedExisting      = "joined_existing"
+)
+
+var batchAdmissionState struct {
+	sync.RWMutex
+	hook func(BatchAdmissionEvent)
+}
+
 // Set installs one process-local test callback and returns a restore function.
 func Set(hook func(string)) func() {
 	state.Lock()
@@ -186,5 +263,30 @@ func Hit(name string) {
 	state.RUnlock()
 	if hook != nil {
 		hook(name)
+	}
+}
+
+// SetBatchAdmission installs one process-local batch admission observer and
+// returns a restore function. The callback is copied while locked, then always
+// invoked after the lock is released.
+func SetBatchAdmission(hook func(BatchAdmissionEvent)) func() {
+	batchAdmissionState.Lock()
+	previous := batchAdmissionState.hook
+	batchAdmissionState.hook = hook
+	batchAdmissionState.Unlock()
+	return func() {
+		batchAdmissionState.Lock()
+		batchAdmissionState.hook = previous
+		batchAdmissionState.Unlock()
+	}
+}
+
+// HitBatchAdmission delivers one bounded aggregate admission event.
+func HitBatchAdmission(event BatchAdmissionEvent) {
+	batchAdmissionState.RLock()
+	hook := batchAdmissionState.hook
+	batchAdmissionState.RUnlock()
+	if hook != nil {
+		hook(event)
 	}
 }

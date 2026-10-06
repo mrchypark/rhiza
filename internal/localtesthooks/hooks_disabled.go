@@ -84,6 +84,49 @@ func HitArchiveGCPhase(context.Context, string) {}
 // Enabled is false when test boundary callbacks are compiled out.
 const Enabled = false
 
+// BatchAdmissionEvent matches the tagged test-hook contract. Calls retain no
+// request, key, value, slot, or error identity outside tagged test binaries.
+type BatchAdmissionEvent struct {
+	Reason                 string
+	Waited                 bool
+	WaitNanos              int64
+	AcceptedToDurableNanos int64
+	Durable                bool
+}
+
+// BatchAdmissionTrace is intentionally empty outside tagged test builds, so
+// ordinary proposals carry no timestamp state or time.Now work.
+type BatchAdmissionTrace struct{}
+
+// NewBatchAdmissionTrace preserves the tagged test-hook API without work.
+func NewBatchAdmissionTrace() BatchAdmissionTrace { return BatchAdmissionTrace{} }
+
+// MarkWait is a production no-op.
+func (*BatchAdmissionTrace) MarkWait() {}
+
+// MarkAccepted is a production no-op.
+func (*BatchAdmissionTrace) MarkAccepted() {}
+
+// Event reports no trace outside tagged test builds.
+func (BatchAdmissionTrace) Event(string, bool) (BatchAdmissionEvent, bool) {
+	return BatchAdmissionEvent{}, false
+}
+
+const (
+	BatchAdmissionAccepted            = "accepted"
+	BatchAdmissionWaitBudgetExhausted = "wait_budget_exhausted"
+	BatchAdmissionContextCanceled     = "context_canceled"
+	BatchAdmissionServerNotReady      = "server_not_ready"
+	BatchAdmissionByteRejected        = "byte_rejected"
+	BatchAdmissionJoinedExisting      = "joined_existing"
+)
+
 // Hit is a production no-op. Boundary callbacks are only available in test
 // binaries built with the rhiza_local_testhooks tag.
 func Hit(string) {}
+
+// SetBatchAdmission is a production no-op and preserves the tagged hook API.
+func SetBatchAdmission(func(BatchAdmissionEvent)) func() { return func() {} }
+
+// HitBatchAdmission is a production no-op.
+func HitBatchAdmission(BatchAdmissionEvent) {}
