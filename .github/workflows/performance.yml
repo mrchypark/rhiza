@@ -321,7 +321,6 @@ jobs:
         env:
           CGO_ENABLED: "1"
           RHIZA_VERSITY_EVIDENCE_DIR: ${{ runner.temp }}/issue-185-cost-evidence/versity-raw
-          RHIZA_ISSUE185_CHECKPOINT_DIAGNOSTIC_ONLY: "1"
         run: |
           evidence_dir="$RUNNER_TEMP/issue-185-cost-evidence"
           mkdir -p "$evidence_dir/logs"
@@ -390,24 +389,6 @@ jobs:
               return "$cleanup_status"
             fi
           }
-
-          if [[ "${RHIZA_ISSUE185_CHECKPOINT_DIAGNOSTIC_ONLY:-}" == "1" ]]; then
-            if [[ "$GITHUB_REF_NAME" != "feature/issue185-seal-diagnostic-a0d56aacde34" ]]; then
-              printf 'checkpoint identity diagnostic marker on unexpected ref: %s\n' "$GITHUB_REF_NAME" >&2
-              exit 2
-            fi
-            printf 'mode=checkpoint-identity-diagnostic-only\ncommit=%s\n' "$GITHUB_SHA" > "$evidence_dir/mode.txt"
-            if run_logged node-foreground-checkpoint-active-s3 env \
-              RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
-              RHIZA_NODE_FOREGROUND_API_COST=1 \
-              RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=checkpoint-active \
-              go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
-              -run '^TestNodeForegroundAPICostS3$'; then
-              exit 0
-            else
-              exit $?
-            fi
-          fi
 
           run_logged versity-smoke env \
             RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \

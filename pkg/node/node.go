@@ -594,16 +594,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 	}
 	if n.checkpoints != nil {
-		server.SetCheckpointPrepare(func(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
-			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
-				return err
-			}
-			if err := core.PrepareCheckpoint(ctx, seal); err != nil {
-				return err
-			}
-			log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
-			return nil
-		})
+		server.SetCheckpointPrepare(n.preparePeerCheckpoint)
 	}
 	server.SetObjectStoreStats(func() (map[string]uint64, bool) {
 		stats, ok := n.ObjectStoreStats()
@@ -983,6 +974,29 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 		}()
 	}
+	return nil
+}
+
+func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+	if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
+		return err
+	}
+	waited, err := n.core.WaitCheckpointPrefixIfLagging(ctx, seal)
+	if err != nil {
+		return err
+	}
+	if waited {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
+			return err
+		}
+	}
+	if err := n.core.PrepareCheckpoint(ctx, seal); err != nil {
+		return err
+	}
+	log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
 	return nil
 }
 

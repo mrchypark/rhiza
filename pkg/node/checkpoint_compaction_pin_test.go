@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,44 @@ import (
 type currentUploadCounter struct {
 	objstore.Bucket
 	currentUploads atomic.Int64
+}
+
+// claimReadBarrier returns the already-read second version of a stable lease
+// read only after the replacement claim has been written.
+type claimReadBarrier struct {
+	objstore.Bucket
+	armed   atomic.Bool
+	reads   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+type prefixWaitContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+	armed   atomic.Bool
+}
+
+func (c *prefixWaitContext) Done() <-chan struct{} {
+	if c.armed.Load() {
+		c.once.Do(func() { close(c.entered) })
+	}
+	return c.Context.Done()
+}
+
+func (b *claimReadBarrier) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	attr, err := b.Bucket.Attributes(ctx, name)
+	if b.armed.Load() && strings.HasSuffix(name, "/checkpoint/PUBLISHER") && b.reads.Add(1) == 2 {
+		b.armed.Store(false)
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return objstore.ObjectAttributes{}, ctx.Err()
+		}
+	}
+	return attr, err
 }
 
 // holdGCCandidateScan pauses a real Cleanup only after its publication lease
@@ -54,6 +93,244 @@ func (b *currentUploadCounter) Upload(ctx context.Context, name string, value io
 		b.currentUploads.Add(1)
 	}
 	return nil
+}
+
+func TestPeerCheckpointWaitsForAuthenticatedPrefixBeforePublication(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	bucket := &currentUploadCounter{Bucket: objstore.NewInMemBucket()}
+	checkpoints := checkpoint.NewManager(bucket, "peer-lag", t.TempDir(), 1)
+	archive := recovery.NewManager(bucket, "peer-lag", 1)
+	defer archive.Close()
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	openCore := func() (*quepaxa.Core, *qlog.WAL) {
+		t.Helper()
+		wal, err := qlog.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: cluster, WAL: wal})
+		if err != nil {
+			wal.Close()
+			t.Fatal(err)
+		}
+		return core, wal
+	}
+	source, sourceWAL := openCore()
+	defer sourceWAL.Close()
+	peer, peerWAL := openCore()
+	defer peerWAL.Close()
+	command, err := types.EncodeKVCommand(types.KVCommand{RequestID: "peer-lag", Operation: "put", Key: "key", Value: []byte("value")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, err := source.Propose(ctx, command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certified, ok := source.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("source has no authentic certified value")
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "material.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	if err := material.Apply(ctx, uint64(slot), command); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "sqlite.db")
+	policySnapshot(t, file, "peer-lag")
+	claim, err := checkpoints.AcquirePublisherClaim(ctx, "n1", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := checkpoints.CreateFiles(ctx, claim, []checkpoint.Source{{Role: checkpoint.RoleSQLite, Path: file}}, uint64(slot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err = checkpoints.BindPublisherClaim(ctx, claim, uint64(slot), root.RootHash, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checkpoints.ReleasePublisherClaim(context.Background(), claim)
+	prefix, ok := source.PrefixHash(slot)
+	if !ok {
+		t.Fatal("certified source prefix absent")
+	}
+	next, following, err := source.CheckpointLeaderOrders(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: slot, RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following}
+	peer.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	n := &Node{core: peer, checkpoints: checkpoints, archive: archive, material: material}
+
+	canceled, stop := context.WithCancel(ctx)
+	canceledResult := make(chan error, 1)
+	go func() { canceledResult <- n.preparePeerCheckpoint(canceled, "n1", seal) }()
+	stop()
+	if err := <-canceledResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled prefix wait returned %v", err)
+	}
+	if err := peer.RequirePreparedCheckpoint(seal); err == nil || bucket.currentUploads.Load() != 0 {
+		t.Fatal("canceled wait prepared or published the checkpoint")
+	}
+
+	prepared := make(chan error, 1)
+	go func() { prepared <- n.preparePeerCheckpoint(ctx, "n1", seal) }()
+	if peer.Tip() >= slot {
+		t.Fatal("peer was not behind before catch-up")
+	}
+	if err := peer.AcceptCertifiedValue(certified); err != nil {
+		t.Fatalf("authentic peer catch-up: %v", err)
+	}
+	if err := <-prepared; err != nil {
+		t.Fatalf("Node peer callback after certified catch-up: %v", err)
+	}
+	encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := peer.Propose(ctx, encoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.publishCertifiedCheckpoint(ctx, root); err != nil {
+		t.Fatalf("certified publication: %v", err)
+	}
+	if got := bucket.currentUploads.Load(); got != 1 {
+		t.Fatalf("CURRENT uploads=%d, want one", got)
+	}
+	fresh := checkpoint.NewManager(bucket, "peer-lag", t.TempDir(), 1)
+	if err := fresh.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if latest := fresh.Latest(); latest == nil || latest.Index != uint64(slot) || latest.RootHash != root.RootHash || latest.Hash != root.Hash {
+		t.Fatalf("independent CURRENT differs: %+v", latest)
+	}
+	if err := fresh.Verify(ctx, uint64(slot), root.RootHash, root.Hash); err != nil {
+		t.Fatal(err)
+	}
+	reader := recovery.NewManager(bucket, "peer-lag", 1)
+	defer reader.Close()
+	pin, err := reader.BeginRecoverySnapshot(ctx, "independent-reader", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pin.Close(ctx)
+	decisions, _, err := pin.DecisionsFrom(ctx, slot, 1)
+	if err != nil || len(decisions) != 1 || !bytes.Equal(decisions[0].Value, command) {
+		t.Fatalf("independent archived decision count=%d error=%v", len(decisions), err)
+	}
+}
+
+func TestPeerCheckpointRejectsClaimReplacedDuringPrefixWait(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bucket := &claimReadBarrier{Bucket: objstore.NewInMemBucket(), entered: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-bucket.release:
+		default:
+			close(bucket.release)
+		}
+	}()
+	manager := checkpoint.NewManager(bucket, "replaced-claim", t.TempDir(), 1)
+	cluster := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	newCore := func() (*quepaxa.Core, *qlog.WAL) {
+		t.Helper()
+		wal, err := qlog.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: cluster, WAL: wal})
+		if err != nil {
+			wal.Close()
+			t.Fatal(err)
+		}
+		return core, wal
+	}
+	source, sourceWAL := newCore()
+	defer sourceWAL.Close()
+	peer, peerWAL := newCore()
+	defer peerWAL.Close()
+	slot, _, err := source.Propose(ctx, []byte("certified decision"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	certified, ok := source.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("certified source decision absent")
+	}
+	file := filepath.Join(t.TempDir(), "sqlite.db")
+	policySnapshot(t, file, "replaced-claim")
+	claim, err := manager.AcquirePublisherClaim(ctx, "n1", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := manager.CreateFiles(ctx, claim, []checkpoint.Source{{Role: checkpoint.RoleSQLite, Path: file}}, uint64(slot))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err = manager.BindPublisherClaim(ctx, claim, uint64(slot), root.RootHash, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, _ := source.PrefixHash(slot)
+	next, following, err := source.CheckpointLeaderOrders(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: slot, RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following}
+	peer.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return manager.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	n := &Node{core: peer, checkpoints: manager}
+	bucket.armed.Store(true)
+	callCtx := &prefixWaitContext{Context: ctx, entered: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() { result <- n.preparePeerCheckpoint(callCtx, "n1", seal) }()
+	select {
+	case <-bucket.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := manager.ReleasePublisherClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := manager.AcquirePublisherClaim(ctx, "replacement", 0, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.ReleasePublisherClaim(context.Background(), replacement)
+	callCtx.armed.Store(true)
+	close(bucket.release)
+	select {
+	case <-callCtx.entered:
+	case err := <-result:
+		t.Fatalf("claim replacement returned before prefix wait: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := peer.AcceptCertifiedValue(certified); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, checkpoint.ErrPublisherFenced) {
+		t.Fatalf("replaced claim returned %v, want fenced", err)
+	}
+	if err := peer.RequirePreparedCheckpoint(seal); err == nil {
+		t.Fatal("replaced claim prepared a checkpoint")
+	}
+	fresh := checkpoint.NewManager(bucket, "replaced-claim", t.TempDir(), 1)
+	if err := fresh.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Latest() != nil {
+		t.Fatal("replaced claim published CURRENT")
+	}
 }
 
 func TestCertifiedCheckpointDefersOnlyLivePinCompaction(t *testing.T) {
