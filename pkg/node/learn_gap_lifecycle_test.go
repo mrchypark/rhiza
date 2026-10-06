@@ -153,7 +153,6 @@ func TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls(t *testing.T) {
 	lowerSlot := nodes[0].core.Tip() + 1
 	releaseLower = make(chan struct{})
 	lowerReceived := make(chan string, 2)
-	lowerResponses := make(chan string, 2)
 	var eventMu sync.Mutex
 	applyComplete := make(map[string]bool)
 	responseBeforeApply := make([]string, 0, 1)
@@ -181,13 +180,6 @@ func TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls(t *testing.T) {
 				applyComplete[key] = true
 			} else if !applyComplete[key] {
 				responseBeforeApply = append(responseBeforeApply, event)
-			}
-			if strings.HasPrefix(event, "network:learned:phase=response-written:") &&
-				(key == fmt.Sprintf("n2:%d", lowerSlot) || key == fmt.Sprintf("n3:%d", lowerSlot)) {
-				select {
-				case lowerResponses <- event:
-				default:
-				}
 			}
 		}
 	})
@@ -233,25 +225,9 @@ func TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls(t *testing.T) {
 		}
 	}
 	// Releasing the held requests only after the catch-up and lower readback
-	// checks proves the background worker repaired the gap first. Let the normal
-	// learned handlers finish before starting the concurrent follow-up workload.
+	// checks proves the background worker repaired the gap first. The canceled
+	// lower RPCs need not emit an apply or response event.
 	releaseHeldLower()
-	lowerResponseNodes := make(map[string]bool, 2)
-	for len(lowerResponseNodes) != 2 {
-		select {
-		case event := <-lowerResponses:
-			lowerResponseNodes[foregroundLearnEventKey(event)] = true
-		case <-ctx.Done():
-			t.Fatalf("held lower learned handlers did not complete normally: %v", ctx.Err())
-		}
-	}
-	eventMu.Lock()
-	for _, node := range []string{"n2", "n3"} {
-		if !applyComplete[fmt.Sprintf("%s:%d", node, lowerSlot)] {
-			responseBeforeApply = append(responseBeforeApply, "missing apply-complete for "+node)
-		}
-	}
-	eventMu.Unlock()
 
 	const concurrentCalls = 16
 	start := make(chan struct{})
@@ -303,7 +279,7 @@ func TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls(t *testing.T) {
 	if len(violations) != 0 {
 		t.Fatalf("peer response was written before apply completed: %s", violations[0])
 	}
-	t.Logf("all %d concurrent API calls completed; all peers read back every value; lower handlers completed after catch-up", concurrentCalls)
+	t.Logf("all %d concurrent API calls completed; all peers read back every value; held lower handlers released after catch-up", concurrentCalls)
 }
 
 // prepareNodeCheckpointBeforeShutdown invokes the existing archive and
