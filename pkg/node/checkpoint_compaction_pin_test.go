@@ -25,6 +25,27 @@ type currentUploadCounter struct {
 	currentUploads atomic.Int64
 }
 
+// holdGCCandidateScan pauses a real Cleanup only after its publication lease
+// has been released. Its GC lease remains live while a checkpoint publishes.
+type holdGCCandidateScan struct {
+	objstore.Bucket
+	entered chan struct{}
+	release chan struct{}
+	paused  atomic.Bool
+}
+
+func (b *holdGCCandidateScan) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, opts ...objstore.IterOption) error {
+	if strings.HasSuffix(dir, "/archive/gc-candidates") && b.paused.CompareAndSwap(false, true) {
+		close(b.entered)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return b.Bucket.IterWithAttributes(ctx, dir, f, opts...)
+}
+
 func (b *currentUploadCounter) Upload(ctx context.Context, name string, value io.Reader, options ...objstore.ObjectUploadOption) error {
 	if err := b.Bucket.Upload(ctx, name, value, options...); err != nil {
 		return err
@@ -168,5 +189,150 @@ func TestCertifiedCheckpointDefersOnlyLivePinCompaction(t *testing.T) {
 	}
 	if got := bucket.currentUploads.Load(); got != 1 || publicationCalls != 1 {
 		t.Fatalf("deferred compaction republished CURRENT: uploads=%d callbacks=%d", got, publicationCalls)
+	}
+}
+
+func TestCertifiedCheckpointDefersOnlyHeldGCLockCompaction(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	held := &holdGCCandidateScan{Bucket: objstore.NewInMemBucket(), entered: make(chan struct{}), release: make(chan struct{})}
+	bucket := &currentUploadCounter{Bucket: held}
+	archive := recovery.NewManager(bucket, "cluster", 1)
+	defer archive.Close()
+	checkpoints := checkpoint.NewManager(bucket, "cluster", t.TempDir(), 1)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	material, err := materializer.Open(filepath.Join(t.TempDir(), "material.db"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	command, err := types.EncodeKVCommand(types.KVCommand{RequestID: "gc-lock-compaction", Operation: "put", Key: "key", Value: []byte("value")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := material.Apply(ctx, 1, command); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+
+	holder := recovery.NewManager(bucket, "cluster", 1)
+	defer holder.Close()
+	gcDone := make(chan error, 1)
+	go func() { gcDone <- holder.Cleanup(ctx, 24*time.Hour) }()
+	select {
+	case <-held.entered:
+	case <-ctx.Done():
+		t.Fatalf("Cleanup did not reach post-publication GC boundary: %v", ctx.Err())
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(held.release)
+			<-gcDone
+		}
+	}()
+
+	n := &Node{archive: archive, checkpoints: checkpoints, core: core, material: material}
+	core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
+		return checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
+	})
+	auto := checkpoint.NewAutoCheckpointer(checkpoints, material, 1, 0)
+	auto.ConfigurePublisher("publisher", func() uint64 { return 0 }, nil)
+	var published *checkpoint.Checkpoint
+	publicationCalls := 0
+	auto.ConfigurePublication(nil, func(ctx context.Context, root *checkpoint.Checkpoint) error {
+		publicationCalls++
+		published = root
+		prefix, ok := core.PrefixHash(1)
+		if !ok {
+			return errors.New("missing checkpoint prefix")
+		}
+		next, following, err := core.CheckpointLeaderOrders(1)
+		if err != nil {
+			return err
+		}
+		seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: 1, RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: next, FollowingLeaderOrder: following}
+		if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+			return err
+		}
+		encoded, err := quepaxa.EncodeCheckpointSeal(seal)
+		if err != nil {
+			return err
+		}
+		if _, _, err := core.Propose(ctx, encoded); err != nil {
+			return err
+		}
+		if err := n.publishCertifiedCheckpoint(ctx, root); err != nil {
+			return err
+		}
+		return n.compactCertifiedCheckpoint(ctx)
+	})
+	if err := auto.CheckpointOnShutdown(ctx, 1); err != nil {
+		t.Fatalf("certified publication under live GC lease: %v", err)
+	}
+	if publicationCalls != 1 || published == nil || bucket.currentUploads.Load() != 1 {
+		t.Fatalf("publication calls=%d root=%v CURRENT uploads=%d", publicationCalls, published, bucket.currentUploads.Load())
+	}
+	if core.CompactionFloor() != 0 {
+		t.Fatalf("floor advanced while GC lease held: %d", core.CompactionFloor())
+	}
+	fresh := checkpoint.NewManager(bucket, "cluster", t.TempDir(), 1)
+	if err := fresh.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if latest := fresh.Latest(); latest == nil || latest.Index != published.Index || latest.RootHash != published.RootHash || latest.Hash != published.Hash {
+		t.Fatalf("fresh CURRENT differs under GC lease: %+v", latest)
+	}
+	if err := fresh.Verify(ctx, published.Index, published.RootHash, published.Hash); err != nil {
+		t.Fatal(err)
+	}
+	reader := recovery.NewManager(bucket, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if reader.Tip() < 1 {
+		t.Fatalf("archive tip under GC lease=%d", reader.Tip())
+	}
+	decisions, _, err := reader.DecisionsFrom(ctx, 1, 1)
+	if err != nil || len(decisions) != 1 || !bytes.Equal(decisions[0].Value, command) {
+		t.Fatalf("retained archive decision under GC lease: count=%d err=%v", len(decisions), err)
+	}
+	close(held.release)
+	released = true
+	if err := <-gcDone; err != nil {
+		t.Fatalf("held Cleanup after release: %v", err)
+	}
+	if err := n.compactCertifiedCheckpoint(ctx); err != nil {
+		t.Fatalf("compaction after GC release: %v", err)
+	}
+	if core.CompactionFloor() != 1 {
+		t.Fatalf("floor after GC release=%d", core.CompactionFloor())
+	}
+	freshAfter := checkpoint.NewManager(bucket, "cluster", t.TempDir(), 1)
+	if err := freshAfter.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if latest := freshAfter.Latest(); latest == nil || latest.Index != published.Index || latest.RootHash != published.RootHash || latest.Hash != published.Hash {
+		t.Fatalf("CURRENT changed during deferred compaction: %+v", latest)
+	}
+	if err := freshAfter.Verify(ctx, published.Index, published.RootHash, published.Hash); err != nil {
+		t.Fatalf("fresh checkpoint verification after GC release: %v", err)
+	}
+	if bucket.currentUploads.Load() != 1 || publicationCalls != 1 {
+		t.Fatalf("deferred compaction republished: uploads=%d callbacks=%d", bucket.currentUploads.Load(), publicationCalls)
 	}
 }

@@ -1076,10 +1076,10 @@ func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
 		return fmt.Errorf("checkpoint seal decision %d is unavailable", seal.DecisionSlot)
 	}
 	if err := n.archive.TrimThrough(ctx, seal, decision); err != nil {
-		if err == recovery.ErrActiveRecoveryPin {
+		if err == recovery.ErrActiveRecoveryPin || err == recovery.ErrActiveGCLock {
 			// The checkpoint is already certified and published. Keep the
-			// compaction floor and pinned history intact; the existing archive
-			// ticker will retry this same seal after the reader closes.
+			// compaction floor and protected history intact; the existing archive
+			// ticker will retry this seal after the reader or GC holder releases.
 			return nil
 		}
 		return err

@@ -621,6 +621,38 @@ func testArchiveBusyTraceRealGCLockAndNonBusy(t *testing.T) {
 	}
 }
 
+func testArchiveActiveGCLockSubtypeTrim(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	sealed, decision := realTrimFixture(t, ctx, core, seed)
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireGCLock(ctx, "test-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.releaseGCLock(context.Background(), lease) }()
+	trimmer := NewManager(base, "cluster", 1)
+	defer trimmer.Close()
+	if err := trimmer.TrimThrough(ctx, sealed, decision); err != ErrActiveGCLock || !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("real pre-entry live GC lease: error=%v, want exact subtype and Busy compatibility", err)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil || independent.head.Base != 0 {
+		t.Fatalf("trim changed HEAD while GC lease held: base=%d err=%v", independent.head.Base, err)
+	}
+	if err := holder.releaseGCLock(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := trimmer.TrimThrough(ctx, sealed, decision); err != nil {
+		t.Fatalf("real trim after confirmed GC release: %v", err)
+	}
+	if err := independent.Load(ctx); err != nil || independent.head.Base != sealed.Index {
+		t.Fatalf("trim did not advance after release: base=%d want=%d err=%v", independent.head.Base, sealed.Index, err)
+	}
+}
+
 func testArchiveBusyTraceRealConditionalExhaustion(t *testing.T) {
 	ctx, base, _, seed := newSealableArchive(t)
 	defer seed.Close()
@@ -650,8 +682,8 @@ func testArchiveBusyTraceRealConditionalExhaustion(t *testing.T) {
 	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
 		events = append(events, event)
 	})
-	if _, err := waiter.acquireGCLock(traced, "loser", archivePinLease); !errors.Is(err, ErrArchiveBusy) {
-		t.Fatalf("actual conditional exhaustion error=%v, want Busy", err)
+	if _, err := waiter.acquireGCLock(traced, "loser", archivePinLease); !errors.Is(err, ErrArchiveBusy) || err == ErrActiveGCLock {
+		t.Fatalf("actual conditional exhaustion error=%v, want terminal generic Busy", err)
 	}
 	if bucket.count != maxPublishRetries || len(events) != 1 || events[0].Resource != "gc_lock" ||
 		events[0].Branch != "conditional_exhausted" || events[0].Entered {
@@ -837,8 +869,8 @@ func testArchiveBusyTraceRealReleaseConflict(t *testing.T) {
 	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
 		events = append(events, event)
 	})
-	if err := holder.releaseGCLock(traced, lease); !errors.Is(err, ErrArchiveBusy) {
-		t.Fatalf("stale-owner release error=%v, want Busy", err)
+	if err := holder.releaseGCLock(traced, lease); !errors.Is(err, ErrArchiveBusy) || err == ErrActiveGCLock {
+		t.Fatalf("stale-owner release error=%v, want terminal generic Busy", err)
 	}
 	var sawTerminal bool
 	for _, event := range events {
@@ -1651,6 +1683,7 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	t.Run("recovery_pin_lifecycle_close_conflict_is_finite", testRecoveryPinLifecycleCloseConflictIsFinite)
 	t.Run("recovery_pin_lifecycle_disabled_observer_is_noop", testRecoveryPinLifecycleDisabledObserverIsNoop)
 	t.Run("archive_busy_real_gc_lock_and_non_busy", testArchiveBusyTraceRealGCLockAndNonBusy)
+	t.Run("archive_active_gc_lock_subtype_trim", testArchiveActiveGCLockSubtypeTrim)
 	t.Run("archive_busy_real_conditional_exhaustion", testArchiveBusyTraceRealConditionalExhaustion)
 	t.Run("archive_busy_real_recovery_pin_and_release", testArchiveBusyTraceRealRecoveryPinAndRelease)
 	t.Run("archive_busy_active_pin_release_failure_terminal", testArchiveActivePinWithReleaseFailureIsTerminal)

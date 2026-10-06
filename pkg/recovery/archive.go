@@ -42,6 +42,9 @@ const (
 var (
 	ErrArchiveClosed = errors.New("archive manager is closed")
 	ErrArchiveBusy   = errors.New("archive maintenance is active")
+	// ErrActiveGCLock is only a pre-entry refusal by a live GC lease.
+	// Direct callers still observe ErrArchiveBusy through errors.Is.
+	ErrActiveGCLock error = activeGCLockError{}
 	// ErrActiveRecoveryPin identifies only the trim guard's live-pin refusal.
 	// It retains ErrArchiveBusy compatibility without conflating lock failures.
 	ErrActiveRecoveryPin   error = activeRecoveryPinError{}
@@ -53,6 +56,11 @@ type activeRecoveryPinError struct{}
 
 func (activeRecoveryPinError) Error() string { return ErrArchiveBusy.Error() }
 func (activeRecoveryPinError) Unwrap() error { return ErrArchiveBusy }
+
+type activeGCLockError struct{}
+
+func (activeGCLockError) Error() string { return ErrArchiveBusy.Error() }
+func (activeGCLockError) Unwrap() error { return ErrArchiveBusy }
 
 type Extent struct {
 	ConfigID       uint                   `json:"config_id"`
@@ -1867,6 +1875,9 @@ func (m *Manager) acquireArchiveLock(ctx context.Context, key, owner string, lea
 		now := time.Now()
 		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
 			m.traceArchiveBusy(ctx, owner, key, "active_live_lease", "site", false)
+			if key == m.gcLockKey() {
+				return nil, ErrActiveGCLock
+			}
 			return nil, ErrArchiveBusy
 		}
 		lock := archiveGCLock{OwnerID: owner, Generation: 1, LeaseUntilMS: now.Add(lease).UnixMilli()}
