@@ -1662,8 +1662,25 @@ func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Conte
 			expected, membershipErr = c.membershipHistoryLocked(seal.Index)
 		}
 	}
+	var mismatch [9]bool
+	if localtesthooks.Enabled {
+		mismatch = [9]bool{
+			membershipErr != nil,
+			seal.GenerationAnchorHash != anchor,
+			seal.ConfigID != configID,
+			!prefixOK,
+			prefixOK && prefix != seal.PrefixHash,
+			tip < seal.Index,
+			orderErr != nil,
+			orderErr == nil && !slices.Equal(order, seal.NextLeaderOrder),
+			orderErr == nil && !slices.Equal(following, seal.FollowingLeaderOrder),
+		}
+	}
 	c.mu.RUnlock()
 	if membershipErr != nil || seal.GenerationAnchorHash != anchor || seal.ConfigID != configID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
+		if localtesthooks.Enabled {
+			return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix [membership_error=%t anchor_mismatch=%t config_mismatch=%t prefix_absent=%t prefix_mismatch=%t tip_behind=%t order_unavailable=%t next_order_mismatch=%t following_order_mismatch=%t]", mismatch[0], mismatch[1], mismatch[2], mismatch[3], mismatch[4], mismatch[5], mismatch[6], mismatch[7], mismatch[8])
+		}
 		return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix")
 	}
 	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
