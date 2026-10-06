@@ -722,8 +722,8 @@ func testArchiveBusyTraceRealRecoveryPinAndRelease(t *testing.T) {
 	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
 		events = append(events, event)
 	})
-	if err := waiter.TrimThrough(traced, sealed, decision); !errors.Is(err, ErrArchiveBusy) {
-		t.Fatalf("live recovery pin: error=%v, want Busy", err)
+	if err := waiter.TrimThrough(traced, sealed, decision); !errors.Is(err, ErrArchiveBusy) || err == ErrArchiveBusy {
+		t.Fatalf("live recovery pin: error=%v, want a distinct active-pin Busy preserving ErrArchiveBusy", err)
 	}
 	var sawPin bool
 	for _, event := range events {
@@ -753,6 +753,62 @@ func testArchiveBusyTraceRealRecoveryPinAndRelease(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("successful trim emitted Busy: %+v", events)
+	}
+}
+
+func testArchiveActivePinWithReleaseFailureIsTerminal(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	pinKey := seed.recoveryPinKey("release-conflict-reader")
+	pin := archiveRecoveryPin{OwnerID: "release-conflict-reader", Token: "token", Base: 0, Tip: 1, TailHash: [32]byte{3}, TailObject: 1, LeaseUntilMS: time.Now().Add(time.Hour).UnixMilli()}
+	if err := seed.writeRecoveryPin(ctx, pinKey, pin); err != nil {
+		t.Fatal(err)
+	}
+	sealed, decision := realTrimFixture(t, ctx, core, seed)
+	waiter := NewManager(base, "cluster", 1)
+	defer waiter.Close()
+	var injectionErr error
+	traced := localtesthooks.WithArchiveBusyTrace(ctx, func(event localtesthooks.ArchiveBusyEvent) {
+		if event.Resource != "recovery_pin" || event.Branch != "active_recovery_pin" {
+			return
+		}
+		key := waiter.gcLockKey()
+		lease, err := waiter.readArchiveLock(ctx, key)
+		if err != nil {
+			injectionErr = err
+			return
+		}
+		lease.OwnerID = "successor"
+		lease.Generation++
+		injectionErr = waiter.writeArchiveLock(ctx, key, *lease, objstore.WithIfMatch(lease.version))
+	})
+	err := waiter.TrimThrough(traced, sealed, decision)
+	if injectionErr != nil || err == ErrActiveRecoveryPin || !errors.Is(err, ErrActiveRecoveryPin) || !errors.Is(err, ErrArchiveBusy) {
+		t.Fatalf("active pin plus failed GC release must be terminal: error=%v injection=%v", err, injectionErr)
+	}
+}
+
+func testArchiveActivePinWithCancellationIsTerminal(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	pinKey := seed.recoveryPinKey("canceled-reader")
+	pin := archiveRecoveryPin{OwnerID: "canceled-reader", Token: "token", Base: 0, Tip: 1, TailHash: [32]byte{3}, TailObject: 1, LeaseUntilMS: time.Now().Add(time.Hour).UnixMilli()}
+	if err := seed.writeRecoveryPin(ctx, pinKey, pin); err != nil {
+		t.Fatal(err)
+	}
+	sealed, decision := realTrimFixture(t, ctx, core, seed)
+	waiter := NewManager(base, "cluster", 1)
+	defer waiter.Close()
+	operationCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	traced := localtesthooks.WithArchiveBusyTrace(operationCtx, func(event localtesthooks.ArchiveBusyEvent) {
+		if event.Resource == "recovery_pin" && event.Branch == "active_recovery_pin" {
+			cancel()
+		}
+	})
+	err := waiter.TrimThrough(traced, sealed, decision)
+	if err == ErrActiveRecoveryPin || !errors.Is(err, ErrActiveRecoveryPin) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("active pin plus canceled operation must be terminal: %v", err)
 	}
 }
 
@@ -1597,6 +1653,8 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	t.Run("archive_busy_real_gc_lock_and_non_busy", testArchiveBusyTraceRealGCLockAndNonBusy)
 	t.Run("archive_busy_real_conditional_exhaustion", testArchiveBusyTraceRealConditionalExhaustion)
 	t.Run("archive_busy_real_recovery_pin_and_release", testArchiveBusyTraceRealRecoveryPinAndRelease)
+	t.Run("archive_busy_active_pin_release_failure_terminal", testArchiveActivePinWithReleaseFailureIsTerminal)
+	t.Run("archive_busy_active_pin_cancellation_terminal", testArchiveActivePinWithCancellationIsTerminal)
 	t.Run("archive_busy_real_release_conflict", testArchiveBusyTraceRealReleaseConflict)
 	t.Run("archive_busy_absent_observer", testArchiveBusyTraceAbsentObserver)
 	t.Run("archive_busy_publication_release_conflict", testArchiveBusyTracePublicationReleaseConflict)

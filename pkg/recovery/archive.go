@@ -40,11 +40,19 @@ const (
 )
 
 var (
-	ErrArchiveClosed       = errors.New("archive manager is closed")
-	ErrArchiveBusy         = errors.New("archive maintenance is active")
-	ErrArchiveSealed       = errors.New("archive is sealed for recovery")
-	errArchiveStateChanged = errors.New("archive state changed during I/O")
+	ErrArchiveClosed = errors.New("archive manager is closed")
+	ErrArchiveBusy   = errors.New("archive maintenance is active")
+	// ErrActiveRecoveryPin identifies only the trim guard's live-pin refusal.
+	// It retains ErrArchiveBusy compatibility without conflating lock failures.
+	ErrActiveRecoveryPin   error = activeRecoveryPinError{}
+	ErrArchiveSealed             = errors.New("archive is sealed for recovery")
+	errArchiveStateChanged       = errors.New("archive state changed during I/O")
 )
+
+type activeRecoveryPinError struct{}
+
+func (activeRecoveryPinError) Error() string { return ErrArchiveBusy.Error() }
+func (activeRecoveryPinError) Unwrap() error { return ErrArchiveBusy }
 
 type Extent struct {
 	ConfigID       uint                   `json:"config_id"`
@@ -421,7 +429,7 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 		}
 		if active {
 			m.traceArchiveBusy(ctx, "archive-trim", m.key("archive/recovery-pins"), "active_recovery_pin", "site", true)
-			return ErrArchiveBusy
+			return ErrActiveRecoveryPin
 		}
 		return m.withPublicationLock(ctx, "archive-trim", func(ctx context.Context) error {
 			if err := m.Load(ctx); err != nil {
@@ -1815,6 +1823,22 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	}
 	if errors.Is(releaseErr, ErrArchiveBusy) && !gcTrace {
 		m.traceArchiveBusy(releaseCtx, owner, key, "release_mismatch_or_conflict", "terminal", true)
+	}
+	// Only a cleanly released, live-pin refusal can be deferred by the
+	// certified-checkpoint caller. Preserve any concurrent lease or context
+	// failure as a distinct, terminal outcome.
+	if err == ErrActiveRecoveryPin {
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+		select {
+		case renewFailure := <-renewErr:
+			err = errors.Join(err, renewFailure)
+		default:
+		}
+		if ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
 	}
 	if err == nil {
 		select {
