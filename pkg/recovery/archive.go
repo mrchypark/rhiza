@@ -537,6 +537,10 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead
 	}
 	m.mu.Lock()
 	if !sameNullableObjectVersion(m.headCAS, priorCAS) {
+		if archiveHeadsEqual(m.head, expected) && sameObjectVersion(m.headCAS, attributes.Version) {
+			m.mu.Unlock()
+			return nil
+		}
 		m.mu.Unlock()
 		return errArchiveStateChanged
 	}

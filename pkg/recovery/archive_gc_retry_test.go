@@ -67,6 +67,23 @@ type gcPublisherAdmissionBucket struct {
 	headCount   atomic.Int32
 }
 
+// sameManagerHeadRefreshBucket lets Cleanup install the real HEAD version
+// after SyncThrough's conditional upload succeeds but before its refresh runs.
+type sameManagerHeadRefreshBucket struct {
+	objstore.Bucket
+	armed       atomic.Bool
+	headWritten chan struct{}
+	release     <-chan struct{}
+	heads       atomic.Int32
+}
+
+type archiveHeadAttributesBucket struct {
+	objstore.Bucket
+	headErr      error
+	headVersions []*objstore.ObjectVersion
+	headAttrs    int
+}
+
 type cancelPublicationReadBucket struct {
 	objstore.Bucket
 	cancel context.CancelFunc
@@ -104,6 +121,238 @@ func (b *gcPublisherAdmissionBucket) Upload(ctx context.Context, name string, r 
 		}
 	}
 	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func (b *sameManagerHeadRefreshBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	err := b.Bucket.Upload(ctx, name, r, options...)
+	if err != nil || !b.armed.Load() || !strings.HasSuffix(name, "/archive/head.bin") {
+		return err
+	}
+	b.heads.Add(1)
+	select {
+	case b.headWritten <- struct{}{}:
+	default:
+	}
+	select {
+	case <-b.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *archiveHeadAttributesBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	attributes, err := b.Bucket.Attributes(ctx, name)
+	if err != nil || !strings.HasSuffix(name, "/archive/head.bin") {
+		return attributes, err
+	}
+	if b.headErr != nil {
+		return objstore.ObjectAttributes{}, b.headErr
+	}
+	if b.headVersions != nil {
+		i := b.headAttrs
+		b.headAttrs++
+		if i >= len(b.headVersions) {
+			i = len(b.headVersions) - 1
+		}
+		attributes.Version = b.headVersions[i]
+	}
+	return attributes, nil
+}
+
+func testArchiveGCSameManagerCleanupLoadRefreshMismatch(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	if _, _, err := core.Propose(ctx, []byte("same-manager refresh race")); err != nil {
+		t.Fatal(err)
+	}
+	releaseHead := make(chan struct{})
+	bucket := &sameManagerHeadRefreshBucket{
+		Bucket: base, headWritten: make(chan struct{}, 1), release: releaseHead,
+	}
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupAtLoad := make(chan struct{})
+	releaseCleanupLoad := make(chan struct{})
+	cleanupLoaded := make(chan struct{})
+	var loadBegin, loadDone sync.Once
+	cleanupCtx, cancelCleanup := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelCleanup()
+	cleanupCtx = localtesthooks.WithArchiveGCPhaseTrace(cleanupCtx, func(event string) {
+		switch event {
+		case "archive-gc:load:begin":
+			loadBegin.Do(func() { close(cleanupAtLoad) })
+			select {
+			case <-releaseCleanupLoad:
+			case <-cleanupCtx.Done():
+			}
+		case "archive-gc:load:success":
+			loadDone.Do(func() { close(cleanupLoaded) })
+		}
+	})
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- manager.Cleanup(cleanupCtx, time.Hour) }()
+	select {
+	case <-cleanupAtLoad:
+	case err := <-cleanupDone:
+		t.Fatalf("Cleanup completed before advisory Load gate: %v", err)
+	case <-cleanupCtx.Done():
+		t.Fatal(cleanupCtx.Err())
+	}
+
+	bucket.armed.Store(true)
+	syncCtx, cancelSync := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelSync()
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- manager.SyncThrough(syncCtx, core, core.Tip()) }()
+	select {
+	case <-bucket.headWritten:
+	case err := <-syncDone:
+		t.Fatalf("SyncThrough returned before real HEAD upload: %v", err)
+	case <-cleanupCtx.Done():
+		t.Fatal(cleanupCtx.Err())
+	}
+	close(releaseCleanupLoad)
+	select {
+	case <-cleanupLoaded:
+	case err := <-cleanupDone:
+		t.Fatalf("Cleanup did not install published HEAD: %v", err)
+	case <-cleanupCtx.Done():
+		t.Fatal(cleanupCtx.Err())
+	}
+	cancelCleanup()
+	if err := <-cleanupDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Cleanup after advisory Load=%v, want canceled before a later HEAD write", err)
+	}
+	close(releaseHead)
+	if err := <-syncDone; err != nil {
+		t.Fatalf("same-call SyncThrough after Cleanup installed the same published HEAD: %v", err)
+	}
+	if got := bucket.heads.Load(); got != 1 {
+		t.Fatalf("HEAD writes=%d, want only SyncThrough's one write", got)
+	}
+	reader := NewManager(base, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err := reader.DecisionsFrom(ctx, 1, int(core.Tip()))
+	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()) {
+		t.Fatalf("published decisions tip=%d want=%d values=%d err=%v", tip, core.Tip(), len(values), err)
+	}
+	managerVersion, managerVersionOK := manager.HeadVersion()
+	readerVersion, readerVersionOK := reader.HeadVersion()
+	if !managerVersionOK || !readerVersionOK || managerVersion != readerVersion {
+		t.Fatalf("published HEAD versions manager=%v/%t reader=%v/%t", managerVersion, managerVersionOK, readerVersion, readerVersionOK)
+	}
+	if _, _, err := core.Propose(ctx, []byte("same-manager refresh append")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatalf("append after same-manager refresh: %v", err)
+	}
+	if got := bucket.heads.Load(); got != 2 {
+		t.Fatalf("HEAD writes after later append=%d, want SyncThrough refresh plus one append", got)
+	}
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	values, tip, err = reader.DecisionsFrom(ctx, 1, int(core.Tip()))
+	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()) || !bytes.Equal(values[len(values)-1].Value, []byte("same-manager refresh append")) {
+		t.Fatalf("post-refresh append tip=%d want=%d values=%d err=%v", tip, core.Tip(), len(values), err)
+	}
+}
+
+func testArchiveRefreshRejectsUnsafeSameHeadReconciliation(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	manager := NewManager(base, "cluster", 1)
+	defer manager.Close()
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	oldCAS := *manager.headCAS
+	manager.mu.Unlock()
+	if _, _, err := core.Propose(ctx, []byte("refresh negative controls")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	expected, currentCAS := manager.head, *manager.headCAS
+	refs := append([]Extent(nil), manager.extents...)
+	manager.mu.Unlock()
+
+	setState := func(head archiveHead, version *objstore.ObjectVersion) {
+		t.Helper()
+		manager.mu.Lock()
+		manager.head, manager.headCAS = head, version
+		manager.mu.Unlock()
+	}
+	assertStateChanged := func(name string, head archiveHead, version *objstore.ObjectVersion) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			setState(head, version)
+			err := manager.refreshPublishedHead(ctx, expected, &oldCAS, refs)
+			if !errors.Is(err, errArchiveStateChanged) {
+				t.Fatalf("refresh error=%v, want errArchiveStateChanged", err)
+			}
+		})
+	}
+
+	regressed := expected
+	regressed.Tip--
+	newer := expected
+	newer.Generation++
+	different := expected
+	different.ConfigID++
+	differentVersion := currentCAS
+	differentVersion.Value += "-different"
+	assertStateChanged("local_head_regressed", regressed, &currentCAS)
+	assertStateChanged("local_head_newer", newer, &currentCAS)
+	assertStateChanged("local_head_different", different, &currentCAS)
+	assertStateChanged("local_version_different", expected, &differentVersion)
+	assertStateChanged("local_version_nil", expected, nil)
+
+	attrs := &archiveHeadAttributesBucket{Bucket: base}
+	reader := NewManager(attrs, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reader.mu.Lock()
+	readerHead, readerCAS := reader.head, *reader.headCAS
+	readerRefs := append([]Extent(nil), reader.extents...)
+	reader.mu.Unlock()
+	attrs.headErr = errors.New("injected archive head attributes failure")
+	if err := reader.refreshPublishedHead(ctx, readerHead, &oldCAS, readerRefs); !errors.Is(err, attrs.headErr) {
+		t.Fatalf("refresh after attributes failure=%v, want injected error", err)
+	}
+	attrs.headErr = nil
+	attrs.headVersions, attrs.headAttrs = []*objstore.ObjectVersion{nil, nil}, 0
+	if err := reader.refreshPublishedHead(ctx, readerHead, &oldCAS, readerRefs); err == nil {
+		t.Fatal("refresh accepted nil stable HEAD versions")
+	}
+	unequalVersion := readerCAS
+	unequalVersion.Value += "-other"
+	attrs.headVersions, attrs.headAttrs = []*objstore.ObjectVersion{&readerCAS, &unequalVersion}, 0
+	if err := reader.refreshPublishedHead(ctx, readerHead, &oldCAS, readerRefs); err == nil {
+		t.Fatal("refresh accepted unstable HEAD versions")
+	}
+	attrs.headVersions = nil
+	attrs.headErr = context.Canceled
+	if err := reader.refreshPublishedHead(ctx, readerHead, &oldCAS, readerRefs); !errors.Is(err, context.Canceled) {
+		t.Fatalf("refresh after canceled attributes=%v, want context.Canceled", err)
+	}
 }
 
 func testArchiveIndependentPublisherWaitsForGCPublicationLease(t *testing.T) {
@@ -1700,6 +1949,8 @@ func TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict(t *testing.T) 
 	t.Run("publication_lease_cancel_and_stale_owner", testArchivePublicationLeaseCancellationAndStaleOwner)
 	t.Run("shared_batch_survives_canceled_waiter", testArchiveSharedBatchSurvivesOneCanceledWaiter)
 	t.Run("cleanup_waits_for_bounded_publication_admission", testArchiveCleanupWaitsForBoundedPublicationAdmission)
+	t.Run("same_manager_cleanup_load_refresh_mismatch", testArchiveGCSameManagerCleanupLoadRefreshMismatch)
+	t.Run("unsafe_same_head_reconciliation", testArchiveRefreshRejectsUnsafeSameHeadReconciliation)
 	t.Run("acknowledged_uploaded_prefix", testArchiveCleanupReusesAcknowledgedCompleteUploadedPrefixAfterRealConflict)
 	t.Run("upload_identity_fallback", testArchiveCleanupUploadIdentityFallback)
 	t.Run("unacknowledged_upload", testArchiveCleanupUnacknowledgedUploadDoesNotPublish)
