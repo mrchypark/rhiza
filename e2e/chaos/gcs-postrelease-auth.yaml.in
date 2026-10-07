@@ -53,7 +53,7 @@ spec:
       - apiGroups: ['chaos-mesh.org']
         apiVersions: ['v1alpha1']
         operations: ['CREATE', 'UPDATE']
-        resources: ['podchaos', 'networkchaos']
+        resources: ['podchaos']
         scope: Namespaced
   variables:
     - name: selector
@@ -65,7 +65,7 @@ spec:
         'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
         'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
         'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors && variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] == 'rhiza-voter-0' &&
-        !has(variables.selector.pods) && !has(variables.selector.physicalMachines) &&
+        !has(variables.selector.pods) &&
         !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
         !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
         !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors)
@@ -80,27 +80,10 @@ spec:
         has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
       message: Only voter-0 and a fixed ten-second duration are admitted.
     - expression: >-
-        object.kind != 'PodChaos' ||
-        (object.spec.action == 'container-kill' &&
-        has(object.spec.containerNames) && object.spec.containerNames == ['rhiza'])
+        object.spec.action == 'container-kill' &&
+        has(object.spec.containerNames) && object.spec.containerNames == ['rhiza'] &&
+        !has(object.spec.remoteCluster) && !has(object.spec.gracePeriod)
       message: PodChaos permits only bounded container-kill of the rhiza peer container.
-    - expression: >-
-        object.kind != 'NetworkChaos' ||
-        (object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
-        !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
-        !has(object.spec.loss) && !has(object.spec.duplicate) && !has(object.spec.corrupt) &&
-        !has(object.spec.bandwidth) && !has(object.spec.rate) &&
-        has(object.spec.target) && has(object.spec.target.mode) && object.spec.target.mode == 'all' &&
-        !has(object.spec.target.value) && has(object.spec.target.selector) &&
-        has(object.spec.target.selector.namespaces) && object.spec.target.selector.namespaces == ['@NAMESPACE@'] &&
-        has(object.spec.target.selector.labelSelectors) && size(object.spec.target.selector.labelSelectors) == 2 &&
-        'chaos.rhiza.io/run' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        'app' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
-        !has(object.spec.target.selector.pods) && !has(object.spec.target.selector.physicalMachines) &&
-        !has(object.spec.target.selector.nodes) && !has(object.spec.target.selector.nodeSelectors) &&
-        !has(object.spec.target.selector.annotationSelectors) && !has(object.spec.target.selector.expressionSelectors) &&
-        !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors))
-      message: NetworkChaos permits only voter-0 partition against this run's voters, never external targets.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -110,6 +93,78 @@ metadata:
     rhiza.dev/auth-owner: '@OWNER@'
 spec:
   policyName: @NAMESPACE@-faults
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: @NAMESPACE@
+---
+# A separate match schema prevents PodChaos-only fields from poisoning CEL
+# type checking for NetworkChaos (and vice versa).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: @NAMESPACE@-network-faults
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['chaos-mesh.org']
+        apiVersions: ['v1alpha1']
+        operations: ['CREATE', 'UPDATE']
+        resources: ['networkchaos']
+        scope: Namespaced
+  variables:
+    - name: selector
+      expression: object.spec.selector
+    - name: sourceSafe
+      expression: >-
+        has(variables.selector.namespaces) && variables.selector.namespaces == ['@NAMESPACE@'] &&
+        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 3 &&
+        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
+        'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors && variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] == 'rhiza-voter-0' &&
+        !has(variables.selector.pods) && !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
+        !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
+        !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors)
+  validations:
+    - expression: >-
+        object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
+        'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        variables.sourceSafe
+      message: Fault metadata and source selector must select only this run's peer Pods.
+    - expression: >-
+        has(object.spec.duration) && object.spec.duration == '10s' &&
+        has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
+      message: Only voter-0 and a fixed ten-second duration are admitted.
+    - expression: >-
+        object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
+        !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
+        !has(object.spec.loss) && !has(object.spec.duplicate) && !has(object.spec.corrupt) &&
+        !has(object.spec.bandwidth) && !has(object.spec.rate) &&
+        !has(object.spec.remoteCluster) && !has(object.spec.targetDevice) &&
+        has(object.spec.target) && has(object.spec.target.mode) && object.spec.target.mode == 'all' &&
+        !has(object.spec.target.value) && has(object.spec.target.selector) &&
+        has(object.spec.target.selector.namespaces) && object.spec.target.selector.namespaces == ['@NAMESPACE@'] &&
+        has(object.spec.target.selector.labelSelectors) && size(object.spec.target.selector.labelSelectors) == 2 &&
+        'chaos.rhiza.io/run' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        'app' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
+        !has(object.spec.target.selector.pods) &&
+        !has(object.spec.target.selector.nodes) && !has(object.spec.target.selector.nodeSelectors) &&
+        !has(object.spec.target.selector.annotationSelectors) && !has(object.spec.target.selector.expressionSelectors) &&
+        !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors)
+      message: NetworkChaos permits only voter-0 partition against this run's voters, never external targets.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: @NAMESPACE@-network-faults
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+spec:
+  policyName: @NAMESPACE@-network-faults
   validationActions: [Deny]
   matchResources:
     namespaceSelector:

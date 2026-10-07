@@ -34,6 +34,7 @@ jobs:
       RHIZA_EXECUTION_GO: ${{ vars.RHIZA_EXECUTION_GO }}
       RHIZA_APPROVED_CAP_KRW: ${{ vars.RHIZA_APPROVED_CAP_KRW }}
       RHIZA_BOOTSTRAP_UID: ${{ vars.RHIZA_BOOTSTRAP_UID }}
+      RHIZA_AUTH_CREATION_SHA: ${{ vars.RHIZA_AUTH_CREATION_SHA }}
       RHIZA_NODE_A: ${{ vars.RHIZA_NODE_A }}
       RHIZA_NODE_B: ${{ vars.RHIZA_NODE_B }}
       RHIZA_NODE_C: ${{ vars.RHIZA_NODE_C }}
@@ -47,6 +48,7 @@ jobs:
           set -eu
           [[ "$RHIZA_RUN_ID" =~ ^[a-f0-9]{8}$ ]]
           [[ "$RHIZA_EXECUTION_GO" == "$GITHUB_SHA:$RHIZA_RUN_ID" ]]
+          [[ "$RHIZA_AUTH_CREATION_SHA" =~ ^[a-f0-9]{40}$ ]]
           [[ "$RHIZA_APPROVED_CAP_KRW" == 10000 ]]
           [[ -n "$RHIZA_BOOTSTRAP_UID" && -n "$RHIZA_NODE_A" && -n "$RHIZA_NODE_B" && -n "$RHIZA_NODE_C" ]]
           [[ "$RHIZA_METADATA_IMAGE" =~ ^gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:[a-f0-9]{64}$ ]]

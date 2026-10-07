@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,103 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
+
+func TestCheckpointPrepareConcurrentHandlerReplacement(t *testing.T) {
+	server := &Server{}
+	first, second := errors.New("first handler"), errors.New("second handler")
+	handler := func(result error) func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error {
+		return func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error { return result }
+	}
+	server.SetCheckpointPrepare(handler(first))
+	start := make(chan struct{})
+	unexpected := make(chan error, 3)
+	var workers sync.WaitGroup
+	for range 3 {
+		workers.Go(func() {
+			<-start
+			for range 100 {
+				if err := server.prepareCheckpoint(context.Background(), "n2", quepaxa.CheckpointSeal{}); err != first && err != second {
+					unexpected <- err
+					return
+				}
+			}
+		})
+	}
+	workers.Go(func() {
+		<-start
+		for range 100 {
+			server.SetCheckpointPrepare(handler(second))
+			server.SetCheckpointPrepare(handler(first))
+		}
+	})
+	close(start)
+	workers.Wait()
+	close(unexpected)
+	for err := range unexpected {
+		t.Errorf("unexpected handler result: %v", err)
+	}
+}
+
+func TestCheckpointPrepareReplacementPreservesInflightHandler(t *testing.T) {
+	server := &Server{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	first, second := errors.New("first handler"), errors.New("second handler")
+	server.SetCheckpointPrepare(func(callCtx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+		if callCtx != ctx || sender != "n2" || seal.Index != 7 {
+			return errors.New("checkpoint arguments changed")
+		}
+		close(entered)
+		select {
+		case <-release:
+		case <-callCtx.Done():
+		}
+		return first
+	})
+	done := make(chan error, 1)
+	go func() { done <- server.prepareCheckpoint(ctx, "n2", quepaxa.CheckpointSeal{Index: 7}) }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("first handler did not enter")
+	}
+	replaced := make(chan struct{})
+	go func() {
+		server.SetCheckpointPrepare(func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error {
+			// Callbacks run outside the publication lock and may clear themselves.
+			server.SetCheckpointPrepare(nil)
+			return second
+		})
+		close(replaced)
+	}()
+	select {
+	case <-replaced:
+	case <-ctx.Done():
+		t.Fatal("replacement blocked behind the in-flight handler")
+	}
+	next := make(chan error, 1)
+	go func() { next <- server.prepareCheckpoint(ctx, "n3", quepaxa.CheckpointSeal{}) }()
+	select {
+	case err := <-next:
+		if err != second {
+			t.Fatalf("replacement result=%v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("replacement could not clear itself")
+	}
+	// Canceling releases the old call without changing its captured handler.
+	cancel()
+	select {
+	case err := <-done:
+		if err != first {
+			t.Fatalf("in-flight result=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight handler did not return")
+	}
+}
 
 // A peer can reject an unchanged, locally valid seal while its certified
 // prefix is behind. This characterizes preparation; it does not relax the

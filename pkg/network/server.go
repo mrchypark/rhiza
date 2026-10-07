@@ -156,8 +156,12 @@ type ReplicaStatus struct {
 	LastError   string    `json:"last_error,omitempty"`
 }
 
+// SetCheckpointPrepare replaces the handler for future peer calls. Calls already
+// in progress retain their handler; nil restores the Core preparation path.
 func (s *Server) SetCheckpointPrepare(prepare func(context.Context, quepaxa.NodeID, quepaxa.CheckpointSeal) error) {
+	s.proposeMu.Lock()
 	s.checkpointPrepare = prepare
+	s.proposeMu.Unlock()
 }
 
 // SetCompactedHandler installs the recovery trigger used when a peer has
@@ -178,8 +182,11 @@ func (s *Server) handleCompacted() {
 }
 
 func (s *Server) prepareCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
-	if s.checkpointPrepare != nil {
-		return s.checkpointPrepare(ctx, sender, seal)
+	s.proposeMu.Lock()
+	prepare := s.checkpointPrepare
+	s.proposeMu.Unlock()
+	if prepare != nil {
+		return prepare(ctx, sender, seal)
 	}
 	return s.core.PrepareCheckpoint(ctx, seal)
 }
