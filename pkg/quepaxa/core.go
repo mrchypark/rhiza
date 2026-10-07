@@ -1645,6 +1645,24 @@ func (c *Core) validateCheckpointValue(ctx context.Context, hash ValueHash) erro
 }
 
 func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Context, CheckpointSeal) error, error) {
+	verified, validator, _, err := c.checkpointIdentityWithLag(seal)
+	return verified, validator, err
+}
+
+// WaitCheckpointPrefixIfLagging waits only for a missing certified prefix on
+// an otherwise valid seal. It does not prepare or persist the checkpoint.
+func (c *Core) WaitCheckpointPrefixIfLagging(ctx context.Context, seal CheckpointSeal) (bool, error) {
+	if c.Tip() >= seal.Index {
+		return false, nil
+	}
+	_, _, lagging, _ := c.checkpointIdentityWithLag(seal)
+	if !lagging {
+		return false, nil
+	}
+	return true, c.WaitTip(ctx, seal.Index)
+}
+
+func (c *Core) checkpointIdentityWithLag(seal CheckpointSeal) (bool, func(context.Context, CheckpointSeal) error, bool, error) {
 	c.mu.RLock()
 	prefix, prefixOK := c.prefixes[seal.Index]
 	preparedIndex, preparedRoot, prepared := c.latestPreparedCheckpointLocked()
@@ -1662,26 +1680,57 @@ func (c *Core) checkpointIdentity(seal CheckpointSeal) (bool, func(context.Conte
 			expected, membershipErr = c.membershipHistoryLocked(seal.Index)
 		}
 	}
+	mismatch := [9]bool{
+		membershipErr != nil,
+		seal.GenerationAnchorHash != anchor,
+		seal.ConfigID != configID,
+		!prefixOK,
+		prefixOK && prefix != seal.PrefixHash,
+		tip < seal.Index,
+		orderErr != nil,
+		orderErr == nil && !slices.Equal(order, seal.NextLeaderOrder),
+		orderErr == nil && !slices.Equal(following, seal.FollowingLeaderOrder),
+	}
 	c.mu.RUnlock()
-	if membershipErr != nil || seal.GenerationAnchorHash != anchor || seal.ConfigID != configID || !prefixOK || prefix != seal.PrefixHash || seal.Index > tip || orderErr != nil || !slices.Equal(order, seal.NextLeaderOrder) || !slices.Equal(following, seal.FollowingLeaderOrder) {
-		return false, nil, fmt.Errorf("checkpoint seal does not match local certified prefix")
+	invalid := false
+	for _, field := range mismatch {
+		invalid = invalid || field
+	}
+	if invalid {
+		lagging := mismatch[3] && mismatch[5] && validator != nil && (!prepared || preparedIndex < seal.Index)
+		for i, field := range mismatch {
+			if i != 3 && i != 5 && field {
+				lagging = false
+			}
+		}
+		if lagging && c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
+			lagging = false
+		}
+		if lagging {
+			_, err := c.checkpointMembershipForSeal(seal)
+			lagging = err == nil
+		}
+		if localtesthooks.Enabled {
+			return false, nil, lagging, fmt.Errorf("checkpoint seal does not match local certified prefix [membership_error=%t anchor_mismatch=%t config_mismatch=%t prefix_absent=%t prefix_mismatch=%t tip_behind=%t order_unavailable=%t next_order_mismatch=%t following_order_mismatch=%t]", mismatch[0], mismatch[1], mismatch[2], mismatch[3], mismatch[4], mismatch[5], mismatch[6], mismatch[7], mismatch[8])
+		}
+		return false, nil, lagging, fmt.Errorf("checkpoint seal does not match local certified prefix")
 	}
 	if c.reconfigEnabled && (seal.Membership == nil || !sameMembershipRecord(expected, *seal.Membership)) {
-		return false, nil, fmt.Errorf("checkpoint seal has stale membership history")
+		return false, nil, false, fmt.Errorf("checkpoint seal has stale membership history")
 	}
 	if _, err := c.checkpointMembershipForSeal(seal); err != nil {
-		return false, nil, err
+		return false, nil, false, err
 	}
 	if prepared && seal.Index < preparedIndex {
-		return false, nil, fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
+		return false, nil, false, fmt.Errorf("checkpoint index %d is below prepared fence %d", seal.Index, preparedIndex)
 	}
 	if prepared && seal.Index == preparedIndex {
 		if preparedRoot != seal.RootHash {
-			return false, nil, fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
+			return false, nil, false, fmt.Errorf("checkpoint index %d is already prepared with another root", seal.Index)
 		}
-		return true, validator, nil
+		return true, validator, false, nil
 	}
-	return false, validator, nil
+	return false, validator, false, nil
 }
 
 // RequirePreparedCheckpoint is the bounded Record-path check. Full object

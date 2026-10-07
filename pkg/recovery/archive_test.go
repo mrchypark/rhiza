@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,11 +24,16 @@ import (
 
 type countingBucket struct {
 	objstore.Bucket
-	heads       atomic.Uint64
-	markerHeads atomic.Uint64
-	gets        atomic.Uint64
-	blockGets   atomic.Uint64
-	puts        atomic.Uint64
+	heads               atomic.Uint64
+	archiveHeads        atomic.Uint64
+	markerHeads         atomic.Uint64
+	gets                atomic.Uint64
+	archiveHeadGets     atomic.Uint64
+	blockGets           atomic.Uint64
+	puts                atomic.Uint64
+	blockPuts           atomic.Uint64
+	archiveHeadPuts     atomic.Uint64
+	publicationLockPuts atomic.Uint64
 }
 
 type blockingUploadBucket struct {
@@ -84,6 +90,47 @@ type blockingHeadUploadBucket struct {
 	armed   atomic.Bool
 	started chan struct{}
 	release chan struct{}
+}
+
+var errArchiveTestCondition = errors.New("injected archive conditional conflict")
+
+type archiveExtentOutcomeBucket struct {
+	objstore.Bucket
+	armed            atomic.Bool
+	uploadErr        error
+	persistBeforeErr bool
+	cancelOnGet      context.CancelFunc
+	uploads          atomic.Uint64
+	gets             atomic.Uint64
+}
+
+func (b *archiveExtentOutcomeBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
+	if strings.Contains(name, "/archive/blocks/") && b.armed.CompareAndSwap(true, false) {
+		b.uploads.Add(1)
+		if b.persistBeforeErr {
+			if err := b.Bucket.Upload(ctx, name, r, options...); err != nil {
+				return err
+			}
+		}
+		if b.uploadErr != nil {
+			return b.uploadErr
+		}
+	}
+	return b.Bucket.Upload(ctx, name, r, options...)
+}
+
+func (b *archiveExtentOutcomeBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if strings.Contains(name, "/archive/blocks/") {
+		b.gets.Add(1)
+		if b.cancelOnGet != nil {
+			b.cancelOnGet()
+		}
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
+func (b *archiveExtentOutcomeBucket) IsConditionNotMetErr(err error) bool {
+	return errors.Is(err, errArchiveTestCondition) || b.Bucket.IsConditionNotMetErr(err)
 }
 
 func (b *blockingHeadUploadBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
@@ -164,6 +211,9 @@ func (b *blockingUploadBucket) Upload(ctx context.Context, _ string, _ io.Reader
 
 func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
 	b.heads.Add(1)
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		b.archiveHeads.Add(1)
+	}
 	if strings.Contains(name, "/archive/gc-candidates/") {
 		b.markerHeads.Add(1)
 	}
@@ -172,6 +222,9 @@ func (b *countingBucket) Attributes(ctx context.Context, name string) (objstore.
 
 func (b *countingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	b.gets.Add(1)
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		b.archiveHeadGets.Add(1)
+	}
 	if strings.Contains(name, "/archive/blocks/") {
 		b.blockGets.Add(1)
 	}
@@ -180,6 +233,14 @@ func (b *countingBucket) Get(ctx context.Context, name string) (io.ReadCloser, e
 
 func (b *countingBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
 	b.puts.Add(1)
+	switch {
+	case strings.Contains(name, "/archive/blocks/"):
+		b.blockPuts.Add(1)
+	case strings.HasSuffix(name, "/archive/head.bin"):
+		b.archiveHeadPuts.Add(1)
+	case strings.HasSuffix(name, "/archive/PUBLISH_LOCK"):
+		b.publicationLockPuts.Add(1)
+	}
 	return b.Bucket.Upload(ctx, name, r, options...)
 }
 
@@ -363,8 +424,8 @@ func TestSyncThroughCoalescesAlreadyDecidedSuffix(t *testing.T) {
 	if tip := manager.Tip(); tip != core.Tip() {
 		t.Fatalf("archive tip=%d, want decided tip=%d", tip, core.Tip())
 	}
-	if puts := bucket.puts.Load(); puts != 2 {
-		t.Fatalf("object uploads=%d, want one extent and one head", puts)
+	if puts, blocks, heads, locks := bucket.puts.Load(), bucket.blockPuts.Load(), bucket.archiveHeadPuts.Load(), bucket.publicationLockPuts.Load(); puts != 4 || blocks != 1 || heads != 1 || locks != 2 {
+		t.Fatalf("object uploads=%d (blocks=%d heads=%d publication-lock=%d), want 4 (1/1/2)", puts, blocks, heads, locks)
 	}
 }
 
@@ -966,6 +1027,210 @@ func TestBuildExtentPublishedBytesRecoverExactly(t *testing.T) {
 	}
 }
 
+func TestArchiveSyncReconcilesExtentAfterWriteThenEPIPE(t *testing.T) {
+	ctx := context.Background()
+	config := quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: config, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &archiveExtentOutcomeBucket{
+		Bucket:           objstore.NewInMemBucket(),
+		uploadErr:        fmt.Errorf("injected lost upload response: %w", syscall.EPIPE),
+		persistBeforeErr: true,
+	}
+	bucket.armed.Store(true)
+	writer := NewManager(bucket, "cluster", 1)
+	defer writer.Close()
+	if err := writer.SyncThrough(ctx, core, 1); err != nil {
+		t.Fatalf("sync after the immutable extent was stored: %v", err)
+	}
+	reader := NewManager(bucket, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil {
+		t.Fatalf("load published extent: %v", err)
+	}
+	values, tip, err := reader.DecisionsFrom(ctx, 1, 1)
+	if err != nil || tip != 1 || len(values) != 1 || !bytes.Equal(values[0].Value, []byte("value")) {
+		t.Fatalf("tip=%d values=%#v err=%v", tip, values, err)
+	}
+}
+
+func TestArchiveSyncDoesNotPublishAfterUnverifiedExtentEPIPE(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &archiveExtentOutcomeBucket{
+		Bucket:    objstore.NewInMemBucket(),
+		uploadErr: fmt.Errorf("injected lost upload response: %w", syscall.EPIPE),
+	}
+	bucket.armed.Store(true)
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	err = manager.SyncThrough(ctx, core, 1)
+	if !errors.Is(err, syscall.EPIPE) {
+		t.Fatalf("SyncThrough() error = %v, want original EPIPE", err)
+	}
+	if exists, err := bucket.Exists(ctx, manager.key("archive/head.bin")); err != nil || exists {
+		t.Fatalf("archive HEAD exists=%t err=%v after unverified upload", exists, err)
+	}
+}
+
+func TestArchiveSyncDoesNotPublishAfterFinalExtentReset(t *testing.T) {
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wal.Close()
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &archiveExtentOutcomeBucket{
+		Bucket:           objstore.NewInMemBucket(),
+		uploadErr:        fmt.Errorf("injected lost upload response: %w", syscall.ECONNRESET),
+		persistBeforeErr: true,
+	}
+	bucket.armed.Store(true)
+	manager := NewManager(bucket, "cluster", 1)
+	defer manager.Close()
+	if err := manager.SyncThrough(ctx, core, 1); !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("SyncThrough() error = %v, want original ECONNRESET", err)
+	}
+	if got := bucket.gets.Load(); got != 0 {
+		t.Fatalf("reset guard readback GETs = %d, want 0", got)
+	}
+	if exists, err := bucket.Exists(ctx, manager.key("archive/head.bin")); err != nil || exists {
+		t.Fatalf("archive HEAD exists=%t err=%v after final reset", exists, err)
+	}
+}
+
+func TestUploadExtentReadbackReconcilesOnlyVerifiedConditionalOrEPIPE(t *testing.T) {
+	epipe := fmt.Errorf("injected lost upload response: %w", syscall.EPIPE)
+	reset := fmt.Errorf("injected lost upload response: %w", syscall.ECONNRESET)
+	accessDenied := errors.New("injected access denied")
+	tests := []struct {
+		name           string
+		uploadErr      error
+		seed           []byte
+		seedExact      bool
+		persist        bool
+		cancelBefore   bool
+		deadlineBefore bool
+		cancelOnGet    bool
+		disableCAS     bool
+		wantSuccess    bool
+		wantGetCount   uint64
+		wantCause      error
+		wantCondition  bool
+	}{
+		{name: "conditional conflict with exact existing extent", seedExact: true, wantSuccess: true, wantGetCount: 1},
+		{name: "conditional conflict but missing extent", uploadErr: errArchiveTestCondition, wantGetCount: 1, wantCause: errArchiveTestCondition},
+		{name: "conditional conflict with corrupt extent", seed: []byte("corrupt"), wantGetCount: 1, wantCondition: true},
+		{name: "EPIPE after exact extent persisted", uploadErr: epipe, persist: true, seed: nil, wantSuccess: true, wantGetCount: 1},
+		{name: "EPIPE with missing extent", uploadErr: epipe, wantGetCount: 1, wantCause: syscall.EPIPE},
+		{name: "EPIPE with corrupt extent", uploadErr: epipe, seed: []byte("corrupt"), wantGetCount: 1, wantCause: syscall.EPIPE},
+		{name: "final reset after exact extent persisted does not reconcile", uploadErr: reset, persist: true, wantCause: syscall.ECONNRESET},
+		{name: "already canceled context does not read back", uploadErr: epipe, cancelBefore: true, wantCause: syscall.EPIPE},
+		{name: "already expired deadline does not read back", uploadErr: epipe, deadlineBefore: true, wantCause: syscall.EPIPE},
+		{name: "cancellation during readback preserves upload error", uploadErr: epipe, cancelOnGet: true, wantGetCount: 1, wantCause: syscall.EPIPE},
+		{name: "non-CAS bucket does not reconcile", uploadErr: epipe, disableCAS: true, wantCause: syscall.EPIPE},
+		{name: "unrelated authorization error does not reconcile", uploadErr: accessDenied, wantCause: accessDenied},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := objstore.NewInMemBucket()
+			bucket := &archiveExtentOutcomeBucket{Bucket: base, uploadErr: tt.uploadErr, persistBeforeErr: tt.persist}
+			bucket.armed.Store(true)
+			manager := NewManager(bucket, "cluster", 1)
+			defer manager.Close()
+			if tt.disableCAS {
+				manager.cas = false
+			}
+			hash, data := testArchiveExtentBytes(t, manager)
+			key := manager.key(extentObjectKey(hash, 1))
+			seed := tt.seed
+			if tt.seedExact {
+				seed = data
+			}
+			if seed != nil {
+				if err := base.Upload(context.Background(), key, bytes.NewReader(seed)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := context.Background()
+			var cancel context.CancelFunc
+			if tt.cancelBefore {
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			} else if tt.deadlineBefore {
+				ctx, cancel = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer cancel()
+			} else if tt.cancelOnGet {
+				ctx, cancel = context.WithCancel(ctx)
+				bucket.cancelOnGet = cancel
+				defer cancel()
+			}
+			err := manager.uploadExtent(ctx, hash, data, 1)
+			if tt.wantSuccess {
+				if err != nil {
+					t.Fatalf("uploadExtent() error = %v, want verified readback success", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("uploadExtent() succeeded without a verified extent")
+				}
+				if tt.wantCause != nil && !errors.Is(err, tt.wantCause) {
+					t.Fatalf("uploadExtent() error %v does not preserve cause %v", err, tt.wantCause)
+				}
+				if tt.wantCondition && !bucket.IsConditionNotMetErr(err) {
+					t.Fatalf("uploadExtent() error %v does not preserve conditional conflict", err)
+				}
+			}
+			if got := bucket.gets.Load(); got != tt.wantGetCount {
+				t.Fatalf("readback GETs = %d, want %d", got, tt.wantGetCount)
+			}
+			if got := bucket.uploads.Load(); got != 1 {
+				t.Fatalf("extent upload attempts = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func testArchiveExtentBytes(t *testing.T, manager *Manager) ([32]byte, []byte) {
+	t.Helper()
+	value := []byte("immutable extent")
+	decision := quepaxa.DecidedValue{Slot: 1, Hash: sha256.Sum256(value), Value: value, Certificate: []byte("certificate")}
+	prefixes := [][32]byte{{}, quepaxa.AdvancePrefixHash([32]byte{}, decision.Slot, decision.Hash)}
+	extent, data, _, err := manager.buildExtent(archiveBenchmarkSource{decisions: []quepaxa.DecidedValue{decision}, prefixes: prefixes}, 1, 1, [32]byte{}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return extent.hash, data
+}
+
 type archiveBenchmarkSource struct {
 	decisions []quepaxa.DecidedValue
 	prefixes  [][32]byte
@@ -1189,7 +1454,13 @@ func TestArchiveCleanupIgnoresFutureGenerationBeforeHeadPublish(t *testing.T) {
 	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	bucket := &blockingHeadUploadBucket{Bucket: objstore.NewInMemBucket(), started: make(chan struct{}), release: make(chan struct{})}
+	extentBucket := &archiveExtentOutcomeBucket{
+		Bucket:           objstore.NewInMemBucket(),
+		uploadErr:        fmt.Errorf("injected lost upload response: %w", syscall.EPIPE),
+		persistBeforeErr: true,
+	}
+	extentBucket.armed.Store(true)
+	bucket := &blockingHeadUploadBucket{Bucket: extentBucket, started: make(chan struct{}), release: make(chan struct{})}
 	bucket.armed.Store(true)
 	publisher := NewManager(bucket, "cluster", 1)
 	publishDone := make(chan error, 1)
@@ -1219,6 +1490,87 @@ func TestArchiveCleanupIgnoresFutureGenerationBeforeHeadPublish(t *testing.T) {
 	reader := NewManager(bucket, "cluster", 1)
 	if err := reader.Load(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestArchiveNoCompactionKeepsMarkedCurrentAndInFlightFutureExtent(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	if seed.head.Generation == 0 || len(seed.extents) != 1 {
+		t.Fatalf("seed generation=%d refs=%d, want positive generation and one ref", seed.head.Generation, len(seed.extents))
+	}
+	oldObject := seed.key(extentObjectKey(seed.extents[0].hash, seed.extents[0].object))
+	bucket := &blockingHeadUploadBucket{Bucket: base, started: make(chan struct{}), release: make(chan struct{})}
+	publisher := NewManager(bucket, "cluster", 1)
+	defer publisher.Close()
+	if err := publisher.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, []byte("future generation")); err != nil {
+		t.Fatal(err)
+	}
+	wantTip := core.Tip()
+	bucket.armed.Store(true)
+	publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	publishDone := make(chan error, 1)
+	go func() { publishDone <- publisher.SyncThrough(publishCtx, core, wantTip) }()
+	select {
+	case <-bucket.started:
+	case err := <-publishDone:
+		t.Fatalf("publisher did not pause after future extent upload: %v", err)
+	case <-publishCtx.Done():
+		t.Fatalf("publisher HEAD pause: %v", publishCtx.Err())
+	}
+	var futureObject string
+	if err := base.Iter(ctx, "cluster/archive/blocks", func(name string) error {
+		if name != oldObject {
+			futureObject = name
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if futureObject == "" {
+		t.Fatal("no in-flight future-generation extent before HEAD CAS")
+	}
+	gc := NewManager(bucket, "cluster", 1)
+	defer gc.Close()
+	for _, object := range []string{oldObject, futureObject} {
+		if err := base.Upload(ctx, gc.gcMarkerKey(object), bytes.NewReader([]byte(object)), objstore.WithIfNotExists()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := gc.Cleanup(publishCtx, 0); err != nil {
+		t.Fatalf("no-compaction cleanup while publisher awaits HEAD: %v", err)
+	}
+	if gc.head.Generation != seed.head.Generation {
+		t.Fatalf("GC published HEAD generation=%d, want unchanged %d", gc.head.Generation, seed.head.Generation)
+	}
+	for _, object := range []string{oldObject, futureObject} {
+		if exists, err := base.Exists(ctx, object); err != nil || !exists {
+			t.Fatalf("current/future object %q retained=%t err=%v", object, exists, err)
+		}
+		if exists, err := base.Exists(ctx, gc.gcMarkerKey(object)); err != nil || exists {
+			t.Fatalf("current/future marker %q retained=%t err=%v", object, exists, err)
+		}
+	}
+	close(bucket.release)
+	if err := <-publishDone; err != nil {
+		t.Fatalf("publisher after GC scan: %v", err)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if independent.head.Generation != seed.head.Generation+1 {
+		t.Fatalf("published generation=%d, want %d", independent.head.Generation, seed.head.Generation+1)
+	}
+	values, tip, err := independent.DecisionsFrom(ctx, 1, int(wantTip))
+	if err != nil || tip != wantTip || len(values) != int(wantTip) ||
+		!bytes.Equal(values[len(values)-1].Value, []byte("future generation")) {
+		t.Fatalf("post-GC independent chain tip=%d want=%d values=%d err=%v", tip, wantTip, len(values), err)
 	}
 }
 
@@ -1440,7 +1792,10 @@ func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 			t.Fatal(err)
 		}
 		bucket.heads.Store(0)
+		bucket.archiveHeads.Store(0)
 		bucket.gets.Store(0)
+		bucket.archiveHeadGets.Store(0)
+		bucket.blockGets.Store(0)
 	}
 	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 0 || gets != 0 {
 		t.Fatalf("counter reset failed heads=%d gets=%d", heads, gets)
@@ -1451,8 +1806,8 @@ func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 2 || gets != 1 {
-		t.Fatalf("publish heads=%d gets=%d, want 2/1", heads, gets)
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 13 || gets != 6 {
+		t.Fatalf("publish physical attributes=%d gets=%d, want 13/6 (archive head attributes=%d gets=%d, block gets=%d)", heads, gets, bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load())
 	}
 }
 
@@ -1475,11 +1830,14 @@ func TestArchivePublicationCostDoesNotGrowWithHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 		bucket.puts.Store(0)
+		bucket.blockPuts.Store(0)
+		bucket.archiveHeadPuts.Store(0)
+		bucket.publicationLockPuts.Store(0)
 		if err := manager.syncNow(ctx, core, core.Tip()); err != nil {
 			t.Fatal(err)
 		}
-		if puts := bucket.puts.Load(); puts != 2 {
-			t.Fatalf("publication %d used %d PUTs, want 2", i+1, puts)
+		if puts, blocks, heads, locks := bucket.puts.Load(), bucket.blockPuts.Load(), bucket.archiveHeadPuts.Load(), bucket.publicationLockPuts.Load(); puts != 4 || blocks != 1 || heads != 1 || locks != 2 {
+			t.Fatalf("publication %d used %d PUTs (blocks=%d heads=%d publication-lock=%d), want 4 (1/1/2)", i+1, puts, blocks, heads, locks)
 		}
 	}
 	foundManifest := false
@@ -1491,6 +1849,101 @@ func TestArchivePublicationCostDoesNotGrowWithHistory(t *testing.T) {
 	}
 	if foundManifest {
 		t.Fatal("linked archive wrote a full-history manifest")
+	}
+}
+
+func TestArchiveTrimHoldsGCLeaseWhileWaitingForPublicationAdmission(t *testing.T) {
+	ctx, base, core, seed := newSealableArchive(t)
+	defer seed.Close()
+	for i := 0; i < 3; i++ {
+		if _, _, err := core.Propose(ctx, []byte{byte(i + 2)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix, ok := core.PrefixHash(2)
+	if !ok {
+		t.Fatal("missing checkpoint prefix")
+	}
+	seal := quepaxa.CheckpointSeal{ConfigID: 1, Index: 2, RootHash: [32]byte{1}, StateHash: [32]byte{2}, PrefixHash: prefix, NextLeaderOrder: []quepaxa.NodeID{"n1"}}
+	core.SetCheckpointValidator(func(context.Context, quepaxa.CheckpointSeal) error { return nil })
+	if err := core.PrepareCheckpoint(ctx, seal); err != nil {
+		t.Fatal(err)
+	}
+	value, err := quepaxa.EncodeCheckpointSeal(seal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, _, err := core.Propose(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, ok := core.CertifiedValue(slot)
+	if !ok {
+		t.Fatal("missing certified checkpoint decision")
+	}
+	if err := seed.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	before := seed.head.Generation
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireArchiveLock(ctx, holder.publicationLockKey(), "trim-test-holder", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.releaseArchiveLock(context.Background(), holder.publicationLockKey(), lease) }()
+	probe := &sealAdmissionBucket{Bucket: base, observed: make(chan struct{})}
+	trimmer := NewManager(probe, "cluster", 1)
+	defer trimmer.Close()
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- trimmer.TrimThrough(waitCtx, quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}, decision)
+	}()
+	select {
+	case <-probe.observed:
+	case err := <-done:
+		t.Fatalf("TrimThrough did not reach publication admission: %v", err)
+	case <-waitCtx.Done():
+		t.Fatalf("TrimThrough admission not observed: %v", waitCtx.Err())
+	}
+	gcLease, err := trimmer.readGCLock(ctx)
+	if err != nil || gcLease == nil || gcLease.LeaseUntilMS <= time.Now().UnixMilli() {
+		t.Fatalf("GC lease while TrimThrough waits: lease=%v err=%v", gcLease, err)
+	}
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("TrimThrough waiting for admission = %v, want deadline", err)
+	}
+	if err := holder.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if holder.head.Generation != before || holder.head.Base != 0 {
+		t.Fatalf("timed-out trim mutated HEAD generation=%d base=%d, want %d/0", holder.head.Generation, holder.head.Base, before)
+	}
+	if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
+		t.Fatal(err)
+	}
+	if err := trimmer.TrimThrough(ctx, quepaxa.SealedCheckpoint{CheckpointSeal: seal, DecisionSlot: slot}, decision); err != nil {
+		t.Fatal(err)
+	}
+	independent := NewManager(base, "cluster", 1)
+	defer independent.Close()
+	if err := independent.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if independent.head.Base != 2 || independent.head.Generation != before+1 {
+		t.Fatalf("trimmed HEAD base=%d generation=%d, want 2/%d", independent.head.Base, independent.head.Generation, before+1)
+	}
+	values, tip, err := independent.DecisionsFrom(ctx, 3, int(core.Tip()-2))
+	if err != nil || tip != core.Tip() || len(values) != int(core.Tip()-2) {
+		t.Fatalf("trimmed independent tail tip=%d want=%d values=%d err=%v", tip, core.Tip(), len(values), err)
+	}
+	for i, got := range values {
+		want, ok := core.CertifiedValue(quepaxa.Slot(i + 3))
+		if !ok || !bytes.Equal(got.Value, want.Value) {
+			t.Fatalf("trimmed tail slot=%d bytes mismatch", i+3)
+		}
 	}
 }
 

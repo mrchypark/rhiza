@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
@@ -47,6 +48,7 @@ type Node struct {
 	localStore                *localCheckpointIdentity
 	localRoot                 *localCheckpointDescriptor
 	localRestoreSuffixPending bool
+	recoveryPhases            nodeRecoveryPhases
 	ready                     atomic.Bool
 	membershipMu              sync.Mutex
 	opened                    atomic.Bool
@@ -56,6 +58,20 @@ type Node struct {
 	replayMu                  sync.Mutex
 	compactionMu              sync.Mutex
 	catchUpWake               chan struct{}
+}
+
+// nodeRecoveryPhases records the selected certified checkpoint restore path.
+// It is written synchronously during open and observed after Open returns.
+type nodeRecoveryPhases struct {
+	selectedCheckpoint               bool
+	checkpointIndex                  uint64
+	checkpointRootHash               [32]byte
+	checkpointDownloadVerify         time.Duration
+	checkpointDownloadVerifyStarted  bool
+	checkpointDownloadVerifyComplete bool
+	materializerRestore              time.Duration
+	materializerRestoreStarted       bool
+	materializerRestoreComplete      bool
 }
 
 // New creates a new Node.
@@ -219,6 +235,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if !n.opened.CompareAndSwap(false, true) {
 		return fmt.Errorf("node is already open")
 	}
+	n.recoveryPhases = nodeRecoveryPhases{}
 	defer func() {
 		if err != nil {
 			_ = n.Shutdown()
@@ -345,7 +362,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
-		bucket, bucketErr := objectstore.NewBucket(objectstore.Config{
+		bucket, bucketErr := objectstore.NewBucketWithContext(ctx, objectstore.Config{
 			Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
 			Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
 			Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,
@@ -577,21 +594,17 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}
 	}
 	if n.checkpoints != nil {
-		server.SetCheckpointPrepare(func(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
-			if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
-				return err
-			}
-			if err := core.PrepareCheckpoint(ctx, seal); err != nil {
-				return err
-			}
-			log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
-			return nil
-		})
+		server.SetCheckpointPrepare(n.preparePeerCheckpoint)
 	}
 	server.SetObjectStoreStats(func() (map[string]uint64, bool) {
 		stats, ok := n.ObjectStoreStats()
+		replayGroupingEnabled := uint64(0)
+		if stats.ReplayGroupingEnabled {
+			replayGroupingEnabled = 1
+		}
 		return map[string]uint64{
-			"uploads": stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
+			"replay_grouping_enabled": replayGroupingEnabled,
+			"uploads":                 stats.Uploads, "gets": stats.Gets, "lists": stats.Lists, "heads": stats.Heads,
 			"deletes": stats.Deletes, "failures": stats.Failures, "bytes_uploaded": stats.BytesUploaded,
 			"bytes_downloaded": stats.BytesDownloaded, "s3_http_requests": stats.S3HTTPRequests,
 			"s3_http_failures": stats.S3HTTPFailures,
@@ -602,6 +615,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			"condition_conflicts": stats.ConditionConflicts, "dedup_hits": stats.DedupHits,
 			"sdk_retries": stats.SDKRetries, "transport_failures": stats.TransportFailures,
 			"http_4xx_unexpected": stats.Unexpected4xx, "http_5xx": stats.HTTP5xx,
+			"observed_request_identities":      stats.ObservedRequestIdentities,
+			"observed_request_repeats":         stats.ObservedRequestRepeats,
+			"request_grouping_unknown":         stats.RequestGroupingUnknown,
+			"replay_tracker_capacity_misses":   stats.ReplayTrackerCapacityMisses,
+			"replay_identity_capacity_misses":  stats.ReplayIdentityCapacityMisses,
+			"replay_incomplete_operations":     stats.ReplayIncompleteOperations,
+			"replay_tracked_operations_active": stats.ReplayTrackedOperationsActive,
+			"replay_open_readers":              stats.ReplayOpenReaders,
 		}, ok
 	})
 	archive := n.archive
@@ -715,12 +736,19 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			if quepaxa.Slot(certifiedCheckpoint.Index) > core.Tip() {
 				return fmt.Errorf("checkpoint slot %d is ahead of certified log tip %d", certifiedCheckpoint.Index, core.Tip())
 			}
+			n.recoveryPhases.selectedCheckpoint = true
+			n.recoveryPhases.checkpointIndex = certifiedCheckpoint.Index
+			n.recoveryPhases.checkpointRootHash = certifiedCheckpoint.RootHash
 			dir, fileErr := os.MkdirTemp(n.config.DataDir, ".rhiza-checkpoint-restore-*")
 			if fileErr != nil {
 				return fileErr
 			}
 			defer os.RemoveAll(dir)
+			n.recoveryPhases.checkpointDownloadVerifyStarted = true
+			downloadStarted := time.Now()
 			files, readErr := n.checkpoints.DownloadRootFiles(startupRecovery.Context(), certifiedCheckpoint.Index, certifiedCheckpoint.RootHash, dir)
+			n.recoveryPhases.checkpointDownloadVerify = time.Since(downloadStarted)
+			n.recoveryPhases.checkpointDownloadVerifyComplete = readErr == nil
 			if readErr != nil {
 				return readErr
 			}
@@ -728,9 +756,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			for _, file := range files {
 				materialFiles = append(materialFiles, materializer.CheckpointFile{Role: materializer.CheckpointRole(file.Role), Path: file.Path})
 			}
+			n.recoveryPhases.materializerRestoreStarted = true
+			restoreStarted := time.Now()
 			if restoreErr := material.RestoreCheckpoint(startupRecovery.Context(), materialFiles); restoreErr != nil {
+				n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
 				return fmt.Errorf("restore checkpoint %d: %w", certifiedCheckpoint.Index, restoreErr)
 			}
+			n.recoveryPhases.materializerRestore = time.Since(restoreStarted)
+			n.recoveryPhases.materializerRestoreComplete = true
 		}
 	}
 
@@ -834,16 +867,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 			return floor
 		}, func(ctx context.Context, reserved uint64) error {
-			for material.Tip() < reserved {
-				var nonce [types.ReadBarrierNonceSize]byte
-				if _, err := rand.Read(nonce[:]); err != nil {
-					return err
-				}
-				if _, err := server.ProposeControl(ctx, types.EncodeReadBarrier(nonce)); err != nil {
-					return err
-				}
-			}
-			return nil
+			return advanceCheckpointReadBarriers(ctx, reserved, material, server)
 		})
 		n.checkpointer.ConfigurePublication(
 			func() bool {
@@ -953,6 +977,42 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	return nil
 }
 
+func (n *Node) preparePeerCheckpoint(ctx context.Context, sender quepaxa.NodeID, seal quepaxa.CheckpointSeal) error {
+	if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
+		return err
+	}
+	waited, err := n.core.WaitCheckpointPrefixIfLagging(ctx, seal)
+	if err != nil {
+		return err
+	}
+	if waited {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := n.checkpoints.ValidatePublisherClaim(ctx, string(sender), uint64(seal.Index), seal.RootHash); err != nil {
+			return err
+		}
+	}
+	if err := n.core.PrepareCheckpoint(ctx, seal); err != nil {
+		return err
+	}
+	log.Printf("checkpoint prepared: index=%d root=%x", seal.Index, seal.RootHash)
+	return nil
+}
+
+func advanceCheckpointReadBarriers(ctx context.Context, reserved uint64, material *materializer.Materializer, server *network.Server) error {
+	for material.Tip() < reserved {
+		var nonce [types.ReadBarrierNonceSize]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return err
+		}
+		if _, err := server.ProposeCheckpointBarrier(ctx, types.EncodeReadBarrier(nonce)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validatedArchiveRecoveryBase returns an archive floor only after both the
 // archive chain and its certified checkpoint base have been checked against
 // this Core's checkpoint verifier and local lineage. Archive metadata alone
@@ -1030,6 +1090,12 @@ func (n *Node) compactCertifiedCheckpoint(ctx context.Context) error {
 		return fmt.Errorf("checkpoint seal decision %d is unavailable", seal.DecisionSlot)
 	}
 	if err := n.archive.TrimThrough(ctx, seal, decision); err != nil {
+		if err == recovery.ErrActiveRecoveryPin || err == recovery.ErrActiveGCLock {
+			// The checkpoint is already certified and published. Keep the
+			// compaction floor and protected history intact; the existing archive
+			// ticker will retry this seal after the reader or GC holder releases.
+			return nil
+		}
 		return err
 	}
 	return n.core.CompactThrough(seal.Index, seal.RootHash)
@@ -1307,6 +1373,7 @@ func archiveRecoveryRequired(localTip, archiveBase quepaxa.Slot) bool {
 }
 
 func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
+	ctx = localtesthooks.WithRecoveryPinCategory(ctx, localtesthooks.RecoveryPinOwnerNodeCatchup)
 	n.recoveryMu.Lock()
 	defer n.recoveryMu.Unlock()
 	// A compacted peer means local history may no longer be sufficient for a
@@ -1327,6 +1394,10 @@ func (n *Node) restoreArchiveCatchUp(ctx context.Context) (resultErr error) {
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// Carry only the recovery pin observer onto the fresh close context. The
+		// background semantics, deadline, cancellation, and discarded error are
+		// unchanged.
+		closeCtx = localtesthooks.CarryRecoveryPinObserver(closeCtx, ctx)
 		_ = snapshot.Close(closeCtx)
 	}()
 	seal, baseDecision, ok := snapshot.RecoveryBase()

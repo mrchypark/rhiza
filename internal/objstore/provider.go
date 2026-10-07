@@ -51,13 +51,37 @@ type Config struct {
 	Prefix string `json:"prefix,omitempty"`
 }
 
-// NewBucket creates a metered bucket. S3 HTTP request counts include SDK
-// retries and multipart calls, which is the billable request boundary.
+type replayObservationContextKey struct{}
+
+// WithReplayObservation opts in to same-identity RoundTrip grouping when the
+// context is passed to NewBucketWithContext. The context is only an observer
+// selector; its cancellation and deadline are not used to construct the
+// provider bucket.
+func WithReplayObservation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, replayObservationContextKey{}, true)
+}
+
+// NewBucket creates a metered bucket with supplemental replay grouping
+// disabled. S3 HTTP request and retry-metadata counters are unchanged.
 func NewBucket(cfg Config) (*MeteredBucket, error) {
+	return newBucket(cfg, false)
+}
+
+// NewBucketWithContext uses ctx only to select explicitly requested
+// measurement observers. It does not pass ctx to the underlying provider.
+func NewBucketWithContext(ctx context.Context, cfg Config) (*MeteredBucket, error) {
+	var observeReplay bool
+	if ctx != nil {
+		observeReplay, _ = ctx.Value(replayObservationContextKey{}).(bool)
+	}
+	return newBucket(cfg, observeReplay && cfg.Provider != ProviderFilesystem)
+}
+
+func newBucket(cfg Config, observeReplay bool) (*MeteredBucket, error) {
 	if err := ValidateConfig(cfg); err != nil {
 		return nil, err
 	}
-	metrics := &bucketMetrics{}
+	metrics := &bucketMetrics{replayGroupingEnabled: observeReplay}
 	var bucket objstore.Bucket
 	var err error
 	switch cfg.Provider {
@@ -68,7 +92,9 @@ func NewBucket(cfg Config) (*MeteredBucket, error) {
 			Bucket: cfg.Bucket, Endpoint: cfg.Endpoint, Region: cfg.Region, Insecure: cfg.Insecure,
 			AWSSDKAuth: cfg.AccessKey == "", AccessKey: cfg.AccessKey, SecretKey: cfg.SecretKey,
 			SessionToken: cfg.SessionToken, MaxRetries: cfg.MaxRetries,
-		}, "rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
+		}, "rhiza", func(next http.RoundTripper) http.RoundTripper {
+			return metrics.transport(wrapTestObserver(cfg.Endpoint, next))
+		})
 	case ProviderGCS:
 		providerConfig := gcs.DefaultConfig
 		providerConfig.Bucket, providerConfig.ServiceAccount, providerConfig.MaxRetries = cfg.Bucket, cfg.ServiceAccount, cfg.MaxRetries

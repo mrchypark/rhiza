@@ -1367,6 +1367,11 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep a single-node public read available under the production byte cap;
+	// the full-label integrity scan below is intentionally much larger.
+	if err := m.graph.db.CreateNodePropertyIndex("WorkItem", "id"); err != nil {
+		t.Fatal(err)
+	}
 	seed, err := types.EncodeGraphCommand(types.GraphCommand{RequestID: "seed-work-items", Cypher: `UNWIND range(0, 9999) AS i CREATE (:WorkItem {id: i, value: 0})`})
 	if err != nil {
 		t.Fatal(err)
@@ -1410,9 +1415,27 @@ func TestGraphQueryWorkLimitRollsBackAndBlocksReplay(t *testing.T) {
 	if err := m.Apply(ctx, 2, value); !errors.Is(err, latticedb.ErrResourceLimit) {
 		t.Fatalf("replay after reopen error=%v, want repeatable resource-limit failure", err)
 	}
-	result, err := m.GraphQuery(ctx, `MATCH (n:WorkItem {value: 0}) RETURN count(n)`, nil)
-	if err != nil || result.AppliedSlot != 1 || len(result.Rows) != 1 || result.Rows[0][0] != int64(10_000) {
-		t.Fatalf("graph after failed mutation slot=%d rows=%v err=%v, want unchanged data at slot 1", result.AppliedSlot, result.Rows, err)
+	const unchangedQuery = `MATCH (n:WorkItem {value: 0}) RETURN count(n) AS total`
+	if _, err := m.GraphQuery(ctx, unchangedQuery, nil); !errors.Is(err, latticedb.ErrResourceLimit) {
+		t.Fatalf("production-budget verification query error=%v, want resource limit", err)
+	}
+	boundedResult, err := m.GraphQuery(ctx, `MATCH (n:WorkItem {id: 0}) RETURN n.value`, nil)
+	if err != nil || boundedResult.AppliedSlot != 1 || len(boundedResult.Rows) != 1 || boundedResult.Rows[0][0] != int64(0) {
+		t.Fatalf("bounded public query slot=%d rows=%v err=%v, want original value at slot 1", boundedResult.AppliedSlot, boundedResult.Rows, err)
+	}
+	// A full 10,000-node scan exceeds the public 16 MiB query byte budget
+	// under LatticeDB's source-read accounting. Inspect rollback state in a
+	// separate, bounded test-only read; do not change graphQueryOptions.
+	inspectionCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	inspection, err := m.graph.db.QueryContext(inspectionCtx, unchangedQuery, nil, latticedb.QueryOptions{
+		MaxRows: MaxReturningRows, MaxWork: MaxGraphQueryWork, MaxBytes: 64 << 20,
+	})
+	if err != nil {
+		t.Fatalf("bounded rollback inspection: %v", err)
+	}
+	if m.Tip() != 1 || len(inspection.Rows) != 1 || inspection.Rows[0]["total"] != int64(10_000) {
+		t.Fatalf("graph after failed mutation tip=%d rows=%v, want unchanged data at slot 1", m.Tip(), inspection.Rows)
 	}
 	if _, found, err := m.graph.request(command.RequestID); err != nil || found {
 		t.Fatalf("receipt after reopened failure found=%v err=%v, want none", found, err)

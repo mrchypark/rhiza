@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"io"
 	"log"
@@ -197,7 +198,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 	}
 	currentRoot := m.Latest()
 	key := m.key("checkpoint/PUBLISHER")
-	for range 4 {
+	for attempt := 1; attempt <= 4; attempt++ {
 		current, err := m.readPublisherClaim(objmetrics.WithExpectedNotFound(ctx))
 		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			return nil, err
@@ -213,6 +214,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 				return nil, ErrPublisherFenced
 			}
 			if current.LeaseUntilMS > now.UnixMilli() {
+				observePublisherBusy(ctx, activePublisherBusyObservation("generation_claim_active", "generation", attempt, current, now.UnixMilli()))
 				return nil, ErrPublisherBusy
 			}
 			if current.Generation == ^uint64(0) {
@@ -232,6 +234,7 @@ func (m *Manager) AcquireGenerationClaim(ctx context.Context, owner string, inde
 		}
 		return m.confirmPublisherClaim(ctx, *claim)
 	}
+	observePublisherBusy(ctx, exhaustedPublisherBusyObservation("generation_claim_conditional_exhausted", "generation", 4))
 	return nil, ErrPublisherBusy
 }
 
@@ -249,7 +252,7 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 		return nil, fmt.Errorf("checkpoint publisher requires conditional object writes")
 	}
 	key := m.key("checkpoint/PUBLISHER")
-	for range 4 {
+	for attempt := 1; attempt <= 4; attempt++ {
 		// The first publisher claim is created from an absent pointer. This is a
 		// normal conditional-publication probe, not an S3 client failure.
 		current, err := m.readPublisherClaim(objmetrics.WithExpectedNotFound(ctx))
@@ -258,6 +261,12 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 		}
 		now := time.Now()
 		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
+			observation := activePublisherBusyObservation("publisher_claim_active", purpose, attempt, current, now.UnixMilli())
+			if ctx.Value(publisherBusyObserverKey{}) != nil {
+				fillClaimIdentity(&observation, m.prefix, current.version)
+				observation.ObservedAtMillis = now.UnixMilli()
+			}
+			observePublisherBusy(ctx, observation)
 			return nil, ErrPublisherBusy
 		}
 		generation, floor := uint64(1), minExclusive
@@ -285,8 +294,16 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 			}
 			return nil, err
 		}
-		return m.confirmPublisherClaim(ctx, *claim)
+		if purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "acquire_upload_ack", m.prefix, claim)
+		}
+		confirmed, err := m.confirmPublisherClaim(ctx, *claim)
+		if err == nil && purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "acquire_confirmed", m.prefix, confirmed)
+		}
+		return confirmed, err
 	}
+	observePublisherBusy(ctx, exhaustedPublisherBusyObservation("publisher_claim_conditional_exhausted", purpose, 4))
 	return nil, ErrPublisherBusy
 }
 
@@ -329,7 +346,11 @@ func (m *Manager) RenewPublisherClaim(ctx context.Context, claim *PublisherClaim
 		}
 		return nil, err
 	}
-	return m.confirmPublisherClaim(ctx, *current)
+	confirmed, err := m.confirmPublisherClaim(ctx, *current)
+	if err == nil && confirmed.Purpose == "maintenance" {
+		observeClaimLifecycle(ctx, "renew_confirmed", m.prefix, confirmed)
+	}
+	return confirmed, err
 }
 
 func (m *Manager) confirmPublisherClaim(ctx context.Context, expected PublisherClaim) (*PublisherClaim, error) {
@@ -362,15 +383,31 @@ func (m *Manager) ValidatePublisherClaim(ctx context.Context, owner string, inde
 func (m *Manager) ReleasePublisherClaim(ctx context.Context, claim *PublisherClaim) error {
 	current, err := m.readPublisherClaim(ctx)
 	if err != nil {
+		if claim != nil && claim.Purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "release_error", m.prefix, claim)
+		}
 		return err
 	}
 	if claim == nil || current.Purpose != claim.Purpose || current.Generation != claim.Generation || current.OwnerID != claim.OwnerID {
+		if current.Purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "release_fenced", m.prefix, current)
+		}
 		return ErrPublisherFenced
 	}
 	current.LeaseUntilMS = time.Now().UnixMilli()
 	if err := m.uploadPublisherClaim(ctx, m.key("checkpoint/PUBLISHER"), current, objstore.WithIfMatch(current.version)); err != nil && m.bucket.IsConditionNotMetErr(err) {
+		if current.Purpose == "maintenance" {
+			observeClaimLifecycle(ctx, "release_fenced", m.prefix, current)
+		}
 		return ErrPublisherFenced
 	} else {
+		if current.Purpose == "maintenance" {
+			if err != nil {
+				observeClaimLifecycle(ctx, "release_error", m.prefix, current)
+			} else {
+				observeClaimLifecycle(ctx, "release_upload_ack", m.prefix, current)
+			}
+		}
 		return err
 	}
 }
@@ -462,6 +499,12 @@ func (m *Manager) loadAll(ctx context.Context) error {
 }
 
 func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64) (*Checkpoint, error) {
+	return m.createFilesWithScanObserver(ctx, claim, sources, index, nil)
+}
+
+// createFilesWithScanObserver is the opt-in cost-test path. The callback reports
+// the block scan/hash phase only; it does not include block uploads.
+func (m *Manager) createFilesWithScanObserver(ctx context.Context, claim *PublisherClaim, sources []Source, index uint64, onScan func(role string, elapsed time.Duration)) (*Checkpoint, error) {
 	for _, source := range sources {
 		if source.Role == RoleSQLite {
 			if err := sqlpolicy.CheckFile(ctx, source.Path); err != nil {
@@ -498,7 +541,7 @@ func (m *Manager) CreateFiles(ctx context.Context, claim *PublisherClaim, source
 	}
 	blocks := 0
 	for _, source := range sources {
-		file, err := m.uploadFile(ctx, source, claim.Generation, conditional, knownBlocks)
+		file, err := m.uploadFile(ctx, source, claim.Generation, conditional, knownBlocks, onScan)
 		if err != nil {
 			return nil, err
 		}
@@ -694,7 +737,7 @@ func (m *Manager) rememberCertified(root Checkpoint) {
 	m.sortRoots()
 }
 
-func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint64, conditional bool, known map[string]Block) (File, error) {
+func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint64, conditional bool, known map[string]Block, onScan func(role string, elapsed time.Duration)) (File, error) {
 	input, err := os.Open(source.Path)
 	if err != nil {
 		return File{}, err
@@ -714,6 +757,10 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		offset int64
 	}
 	var uploads []uploadBlock
+	var scanStarted time.Time
+	if onScan != nil {
+		scanStarted = time.Now()
+	}
 	for offset := int64(0); offset < file.Size; offset += blockSize {
 		size := min(int64(blockSize), file.Size-offset)
 		hasher := sha256.New()
@@ -732,6 +779,9 @@ func (m *Manager) uploadFile(ctx context.Context, source Source, generation uint
 		}
 		file.Blocks = append(file.Blocks, block)
 		uploads = append(uploads, uploadBlock{block: block, hash: hash, offset: offset})
+	}
+	if onScan != nil {
+		onScan(source.Role, time.Since(scanStarted))
 	}
 	generations := make([]uint64, len(uploads))
 	if err := runParallel(ctx, len(uploads), func(ctx context.Context, index int) error {
@@ -1048,7 +1098,8 @@ func (m *Manager) PinRecoveryRoot(ctx context.Context, root *Checkpoint, owner s
 		return nil, err
 	}
 	var pin *RecoveryPin
-	err = m.withMaintenanceClaim(ctx, func(ctx context.Context, _ *PublisherClaim) error {
+	category := localtesthooks.RecoveryPinCategory(ctx)
+	err = m.withMaintenanceClaim(ctx, category, func(ctx context.Context, _ *PublisherClaim) error {
 		// The caller already verified this immutable root. The maintenance claim
 		// excludes GC until the pin is committed, so one Attributes check closes
 		// the deletion race without a second root GET.
@@ -1273,12 +1324,13 @@ func (m *Manager) GarbageCollectFrom(ctx context.Context, retain map[[32]byte]st
 	if keep < 1 || grace < 0 {
 		return fmt.Errorf("invalid checkpoint GC policy")
 	}
-	return m.withMaintenanceClaim(ctx, func(ctx context.Context, claim *PublisherClaim) error {
+	return m.withMaintenanceClaim(ctx, claimCategoryGC, func(ctx context.Context, claim *PublisherClaim) error {
 		return m.garbageCollect(ctx, claim, retain, keep, floor, grace)
 	})
 }
 
-func (m *Manager) withMaintenanceClaim(ctx context.Context, work func(context.Context, *PublisherClaim) error) error {
+func (m *Manager) withMaintenanceClaim(ctx context.Context, category string, work func(context.Context, *PublisherClaim) error) error {
+	ctx = withPublisherClaimCategory(ctx, category)
 	claim, err := m.acquireMaintenanceClaim(ctx, "checkpoint-gc", maintenanceLease)
 	if err != nil {
 		return err
@@ -1322,6 +1374,8 @@ func (m *Manager) withMaintenanceClaim(ctx context.Context, work func(context.Co
 	claim = current
 	claimMu.Unlock()
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	releaseCtx = carryPublisherObserver(releaseCtx, ctx)
+	releaseCtx = withPublisherClaimCategory(releaseCtx, category)
 	releaseErr := m.ReleasePublisherClaim(releaseCtx, claim)
 	releaseCancel()
 	if releaseErr != nil && !errors.Is(releaseErr, ErrPublisherFenced) && err == nil {

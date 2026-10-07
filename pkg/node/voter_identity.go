@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 
+	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/recovery"
@@ -196,7 +197,7 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 }
 
 func readVoterRegistration(ctx context.Context, bucket objstore.Bucket, key string) ([]byte, error) {
-	r, err := bucket.Get(ctx, key)
+	r, err := bucket.Get(objmetrics.WithExpectedNotFound(ctx), key)
 	if bucket.IsObjNotFoundErr(err) {
 		return nil, nil
 	}

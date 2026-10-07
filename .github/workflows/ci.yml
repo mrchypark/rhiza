@@ -199,20 +199,36 @@ jobs:
           go test -race -tags rhiza_local_testhooks .
           -run '^(TestLearnerHardKillAtAdoptionWALBoundaries|TestLearnerExpiredPinDuringBuildAllowsSuccessorGCAndRestart|TestLearnerExpiredPinAtManifestAllowsSuccessorGCAndRestart)$'
           -count=1 -timeout=8m
+      - name: Node foreground certified GC preparation and attribution
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -tags rhiza_local_testhooks ./pkg/node ./pkg/checkpoint ./pkg/network
+          -run '^(TestNodeForegroundCertifiedGCPreparationRequiresRealSealAndCurrent|TestNodeForegroundPreparationUsesFreshCanceledContexts|TestNodeForegroundPreparationDeadlineBridge|TestNodeArchiveExtentAttributionRowGate|TestNodeForegroundPublisherBusyCollectorBoundsConcurrentEvents|TestNodeForegroundArchiveBusy.*|TestNodeForegroundRecoveryPin.*|TestNodeForegroundOverloadSiteCollectorCountsFixedNames|TestCheckpointClaimLifecycle.*|TestNodeForegroundClaimLifecycle.*|TestNodeForegroundCheckpointClaimRetry.*|TestNodeForegroundBatchAdmissionCollectorAggregatesConcurrentEvents|TestInternalBatchAdmissionTaggedObserverAndDirectControlIsolation)$'
+          -count=1 -timeout=1m
+      - name: Node foreground certified GC preparation and attribution (race)
+        env:
+          CGO_ENABLED: 1
+        run: >-
+          go test -race -tags rhiza_local_testhooks ./pkg/node ./pkg/checkpoint
+          -run '^(TestNodeForegroundCertifiedGCPreparationRequiresRealSealAndCurrent|TestNodeForegroundPreparationUsesFreshCanceledContexts|TestNodeForegroundPreparationDeadlineBridge|TestNodeArchiveExtentAttributionRowGate|TestNodeForegroundPublisherBusyCollectorBoundsConcurrentEvents|TestNodeForegroundArchiveBusy.*|TestNodeForegroundRecoveryPin.*|TestNodeForegroundOverloadSiteCollectorCountsFixedNames|TestCheckpointClaimLifecycle.*|TestNodeForegroundClaimLifecycle.*|TestNodeForegroundCheckpointClaimRetry.*)$'
+          -count=1 -timeout=1m
       - name: Terminal decision handshake cancellation
         env:
           CGO_ENABLED: 1
-        run: >-
-          go test -tags rhiza_local_testhooks ./pkg/network
-          -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$'
-          -count=1 -timeout=30s
+        run: |
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
+          go test -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
       - name: Terminal decision handshake cancellation (race)
         env:
           CGO_ENABLED: 1
-        run: >-
-          go test -race -tags rhiza_local_testhooks ./pkg/network
-          -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$'
-          -count=1 -timeout=30s
+        run: |
+          go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestTerminalDecisionCancelsUnneededPeerHandshake$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./pkg/network -run '^TestOverload(MutationAdmissionEmitsFixedSite|QueueReservationEmitsFixedSite|InputChannelFullEmitsFixedSite|WorkerInflightBytesEmitsFixedSite|ProposalAdmissionSubtypeEmitsFixedSite)$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./pkg/node -run '^TestAdvanceCheckpointReadBarriersRetriesRealPreAdmissionRefusal$' -count=1 -timeout=30s
+          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run '^(TestArchiveCleanupReusesUnchangedPrefixAfterRealHeadConflict|TestArchiveCleanupReuseRequiresExactBaseAndRefPrefix|TestArchiveCleanupIncrementalPackingMatchesFullAtBoundaries|TestArchiveCleanupAmbiguousPublicationReloadsCommittedHead|TestArchiveCleanupCanceledAfterHeadConflictDoesNotRepublish)$' -count=1 -timeout=2m
       - name: Vet
         env:
           CGO_ENABLED: 0

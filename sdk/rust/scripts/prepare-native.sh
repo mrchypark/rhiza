@@ -43,9 +43,57 @@ hash_files() {
 
 before=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
 (cd "$native_dir" && GOWORK=off go mod vendor)
-# Dependency changelogs are not build inputs; keep the crate below crates.io's
-# 10 MB limit without dropping source or license files.
-find "$native_dir/vendor" -type f -name CHANGELOG.md -delete
+# Markdown is compiler-unread here: this generated native tree has no
+# go:embed directive targeting Markdown. Preserve legal/notice Markdown names;
+# keep any Markdown in a package containing go:embed conservatively rather than
+# attempting to parse embed patterns.
+NATIVE_VENDOR=$native_dir/vendor
+export NATIVE_VENDOR
+find "$native_dir/vendor" -type f -exec sh -eu -c '
+    for source do
+        base=${source##*/}
+        case "$base" in
+            *.[mM][dD]) ;;
+            *) continue ;;
+        esac
+        lower=$(printf "%s" "$base" | tr "[:upper:]" "[:lower:]")
+        case "$lower" in
+            *license*|*notice*|*copying*|*copyright*) continue ;;
+        esac
+        dir=$(dirname "$source")
+        keep=0
+        while [ "$dir" != "$NATIVE_VENDOR" ] && [ "$dir" != "." ]; do
+            for go_source in "$dir"/*.go; do
+                [ -f "$go_source" ] || continue
+                if grep -q "go:embed" "$go_source"; then
+                    keep=1
+                    break 2
+                else
+                    grep_status=$?
+                    case "$grep_status" in
+                        1) ;;
+                        *)
+                            echo "FAIL unable to inspect embed markers in $go_source" >&2
+                            exit "$grep_status"
+                            ;;
+                    esac
+                fi
+            done
+            parent=$(dirname "$dir")
+            [ "$parent" = "$dir" ] && break
+            dir=$parent
+        done
+        if [ "$keep" -eq 0 ]; then
+            if rm -f "$source"; then
+                :
+            else
+                rm_status=$?
+                echo "FAIL unable to remove compiler-unread Markdown $source" >&2
+                exit "$rm_status"
+            fi
+        fi
+    done
+' sh {} +
 after=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
 if [ "$before" != "$after" ]; then
     echo "FAIL go.mod or go.sum changed while vendoring; run go mod tidy on the module and retry" >&2

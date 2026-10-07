@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -35,6 +36,13 @@ var (
 	ErrGraphResourceLimit      = errors.New("graph resource limit exceeded")
 	ErrReadVersionMismatch     = errors.New("read version mismatch")
 )
+
+// proposalAdmissionOverload identifies only a proposal rejected before it was
+// admitted. It preserves the public overload text and errors.Is contract.
+type proposalAdmissionOverload struct{}
+
+func (proposalAdmissionOverload) Error() string { return ErrOverloaded.Error() }
+func (proposalAdmissionOverload) Unwrap() error { return ErrOverloaded }
 
 // CommitUnknownError means a mutation may commit despite the failed call.
 // Retrying the same request ID resolves the outcome without duplicating it.
@@ -79,6 +87,9 @@ type Server struct {
 	mutationAdmission    mutationAdmission
 	durability           func(context.Context, quepaxa.Slot) error
 	proposeMu            sync.Mutex
+	admissionChanged     chan struct{}
+	admissionEpoch       uint64
+	admissionWaiters     int
 	inflight             map[[32]byte]*proposalCall
 	proposalCtx          context.Context
 	proposalStop         context.CancelFunc
@@ -182,6 +193,43 @@ func (s *Server) ProposeControl(ctx context.Context, value []byte) (quepaxa.Slot
 	return s.propose(ctx, value)
 }
 
+// ProposeCheckpointBarrier is reserved for the checkpoint publisher's internal
+// read barrier. General control proposals retain ProposeControl semantics.
+func (s *Server) ProposeCheckpointBarrier(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	return retryCheckpointBarrier(ctx, value, s.ProposeControl)
+}
+
+func retryCheckpointBarrier(ctx context.Context, value []byte, propose func(context.Context, []byte) (quepaxa.Slot, error)) (quepaxa.Slot, error) {
+	const maxAttempts = 50
+	const retryDelay = 20 * time.Millisecond
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		slot, err := propose(ctx, value)
+		if err == nil {
+			return slot, nil
+		}
+		// This private concrete value is returned only before proposal
+		// registration. A wrapped, joined, or otherwise ambiguous error is
+		// terminal, even when errors.Is also matches ErrOverloaded.
+		if _, preAdmission := err.(proposalAdmissionOverload); !preAdmission || slot != 0 || attempt+1 == maxAttempts {
+			return slot, err
+		}
+		if localtesthooks.Enabled {
+			localtesthooks.Hit("network:checkpoint-barrier:typed-pre-admission-refused")
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		}
+	}
+	panic("unreachable checkpoint barrier retry state")
+}
+
 func (s *Server) lockRequest(ctx context.Context, id string) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -226,20 +274,21 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 		localLimit = 1
 	}
 	s := &Server{
-		core:         core,
-		material:     material,
-		cluster:      cluster,
-		mux:          http.NewServeMux(),
-		ready:        func() bool { return true },
-		writable:     writable,
-		transport:    transport,
-		inflight:     make(map[[32]byte]*proposalCall),
-		proposalCtx:  proposalCtx,
-		proposalStop: proposalStop,
-		operationCap: make(chan struct{}, maxProposalOperations),
-		localCap:     make(chan struct{}, localLimit),
-		localMode:    localMode,
-		syncLimit:    make(chan struct{}, 2),
+		core:             core,
+		material:         material,
+		cluster:          cluster,
+		mux:              http.NewServeMux(),
+		ready:            func() bool { return true },
+		writable:         writable,
+		transport:        transport,
+		inflight:         make(map[[32]byte]*proposalCall),
+		admissionChanged: make(chan struct{}),
+		proposalCtx:      proposalCtx,
+		proposalStop:     proposalStop,
+		operationCap:     make(chan struct{}, maxProposalOperations),
+		localCap:         make(chan struct{}, localLimit),
+		localMode:        localMode,
+		syncLimit:        make(chan struct{}, 2),
 	}
 	for i := range s.requestLocks {
 		s.requestLocks[i] = make(chan struct{}, 1)
@@ -252,9 +301,9 @@ func NewServer(core *quepaxa.Core, material *materializer.Materializer, cluster 
 	if len(ready) > 0 {
 		s.ready = ready[0]
 	}
-	s.sqlBatcher = newSQLBatcher(s.propose, nil)
-	s.graphBatcher = newGraphBatcher(s.propose, nil)
-	s.kvBatcher = newKVBatcher(s.propose, nil)
+	s.sqlBatcher = newSQLBatcher(s.proposeInternalBatch, nil)
+	s.graphBatcher = newGraphBatcher(s.proposeInternalBatch, nil)
+	s.kvBatcher = newKVBatcher(s.proposeInternalBatch, nil)
 	s.routes()
 	return s
 }
@@ -288,6 +337,7 @@ func (s *Server) FailLocalLifecycle(err error) {
 	s.proposeMu.Lock()
 	if s.lifecycleFailure == nil {
 		s.lifecycleFailure = err
+		s.signalAdmissionLocked(true)
 		if s.localFailureHandler != nil {
 			s.localFailureHandler(err)
 		}
@@ -360,6 +410,7 @@ func (s *Server) Close() {
 	s.closeOnce.Do(func() {
 		s.proposeMu.Lock()
 		s.closing = true
+		s.signalAdmissionLocked(true)
 		s.proposalStop()
 		s.proposeMu.Unlock()
 		if s.sqlBatcher != nil {
@@ -505,20 +556,206 @@ func (s *Server) propose(ctx context.Context, value []byte) (quepaxa.Slot, error
 }
 
 func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *mutationLease) (quepaxa.Slot, error) {
+	return s.proposeWithAdmission(ctx, value, lease, 0, 0, nil, nil)
+}
+
+// These finite bounds are an uncalibrated internal-batch candidate. Direct
+// proposals and control operations continue to use the fail-fast path.
+const (
+	internalBatchAdmissionBudget  = 2 * time.Second
+	internalBatchExecutionReserve = 5 * time.Second
+)
+
+func (s *Server) proposeInternalBatch(ctx context.Context, value []byte) (quepaxa.Slot, error) {
+	return s.proposeBatch(ctx, value, internalBatchAdmissionBudget, internalBatchExecutionReserve)
+}
+
+// proposeBatch permits same-package tests to use shorter finite bounds.
+func (s *Server) proposeBatch(ctx context.Context, value []byte, admissionBudget, executionReserve time.Duration) (quepaxa.Slot, error) {
+	if !localtesthooks.Enabled {
+		return s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, nil, nil)
+	}
+	trace := localtesthooks.NewBatchAdmissionTrace()
+	result := &batchAdmissionResult{}
+	slot, err := s.proposeWithAdmission(ctx, value, nil, admissionBudget, executionReserve, &trace, result)
+	reason := result.reason
+	if reason == "" {
+		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			reason = localtesthooks.BatchAdmissionContextCanceled
+		case errors.Is(err, ErrNotReady):
+			reason = localtesthooks.BatchAdmissionServerNotReady
+		case result.impossibleBytes:
+			reason = localtesthooks.BatchAdmissionByteRejected
+		case errors.Is(err, ErrOverloaded):
+			reason = localtesthooks.BatchAdmissionWaitBudgetExhausted
+		}
+	}
+	if event, ok := trace.Event(reason, reason == localtesthooks.BatchAdmissionAccepted && err == nil); ok {
+		localtesthooks.HitBatchAdmission(event)
+	}
+	return slot, err
+}
+
+type batchAdmissionResult struct {
+	reason          string
+	impossibleBytes bool
+}
+
+func (s *Server) signalAdmissionLocked(invalidate bool) {
+	if invalidate {
+		s.admissionEpoch++
+	}
+	if s.admissionWaiters == 0 {
+		return
+	}
+	close(s.admissionChanged)
+	s.admissionChanged = make(chan struct{})
+}
+
+func (s *Server) proposeWithAdmission(ctx context.Context, value []byte, lease *mutationLease, admissionBudget, executionReserve time.Duration, trace *localtesthooks.BatchAdmissionTrace, result *batchAdmissionResult) (quepaxa.Slot, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	hash := sha256.Sum256(value)
-	s.proposeMu.Lock()
-	if s.closing || s.quiescing || s.lifecycleFailure != nil {
-		s.proposeMu.Unlock()
-		return 0, ErrNotReady
+	var admissionDeadline time.Time
+	if admissionBudget > 0 {
+		admissionDeadline = time.Now().Add(admissionBudget)
+		if jobDeadline, ok := ctx.Deadline(); ok {
+			latest := jobDeadline.Add(-executionReserve)
+			if latest.Before(admissionDeadline) {
+				admissionDeadline = latest
+			}
+		}
 	}
-	if call := s.inflight[hash]; call != nil {
+	s.proposeMu.Lock()
+	epoch := s.admissionEpoch
+	for {
+		if err := ctx.Err(); err != nil {
+			s.proposeMu.Unlock()
+			return 0, err
+		}
+		if epoch != s.admissionEpoch {
+			s.proposeMu.Unlock()
+			return 0, ErrNotReady
+		}
+		if s.closing || s.quiescing || s.lifecycleFailure != nil {
+			s.proposeMu.Unlock()
+			return 0, ErrNotReady
+		}
+		if call := s.inflight[hash]; call != nil {
+			if !s.retainProposalLease(call, lease) {
+				s.proposeMu.Unlock()
+				return 0, ErrInvalidRequest
+			}
+			s.proposeMu.Unlock()
+			if trace != nil {
+				trace.MarkAccepted()
+				result.reason = localtesthooks.BatchAdmissionJoinedExisting
+			}
+			select {
+			case <-ctx.Done():
+				return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
+			case <-call.done:
+				return call.slot, call.err
+			}
+		}
+		if len(value) > maxInflightEncodedByte || len(value) > maxProposalEncodedByte {
+			s.proposeMu.Unlock()
+			if result != nil {
+				result.impossibleBytes = true
+			}
+			localtesthooks.Hit("network:proposal-admission:byte-budget-rejected")
+			return 0, proposalAdmissionOverload{}
+		}
+		if admissionBudget > 0 && !time.Now().Before(admissionDeadline) {
+			s.proposeMu.Unlock()
+			return 0, proposalAdmissionOverload{}
+		}
+		blocked := ""
+		switch {
+		case len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB:
+			blocked = "network:proposal-admission:byte-budget-rejected"
+		default:
+			select {
+			case s.localCap <- struct{}{}:
+				select {
+				case s.operationCap <- struct{}{}:
+				default:
+					<-s.localCap
+					blocked = "network:proposal-admission:operation-cap-rejected"
+				}
+			default:
+				blocked = "network:proposal-admission:local-cap-rejected"
+			}
+		}
+		if blocked != "" {
+			if admissionBudget <= 0 || !time.Now().Before(admissionDeadline) {
+				s.proposeMu.Unlock()
+				localtesthooks.Hit(blocked)
+				return 0, proposalAdmissionOverload{}
+			}
+			changed := s.admissionChanged
+			s.admissionWaiters++
+			if trace != nil {
+				trace.MarkWait()
+			}
+			s.proposeMu.Unlock()
+			timer := time.NewTimer(time.Until(admissionDeadline))
+			select {
+			case <-changed:
+			case <-ctx.Done():
+			case <-s.proposalCtx.Done():
+			case <-timer.C:
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			s.proposeMu.Lock()
+			s.admissionWaiters--
+			continue
+		}
+		// A permit is tentative until the caller and admission epoch are still
+		// valid. Rollback is under proposeMu, without waking our own waiter.
+		if err := ctx.Err(); err != nil {
+			<-s.operationCap
+			<-s.localCap
+			s.proposeMu.Unlock()
+			return 0, err
+		}
+		if epoch != s.admissionEpoch || s.closing || s.quiescing || s.lifecycleFailure != nil {
+			<-s.operationCap
+			<-s.localCap
+			s.proposeMu.Unlock()
+			return 0, ErrNotReady
+		}
+		if admissionBudget > 0 && !time.Now().Before(admissionDeadline) {
+			<-s.operationCap
+			<-s.localCap
+			s.proposeMu.Unlock()
+			return 0, proposalAdmissionOverload{}
+		}
+		call := &proposalCall{done: make(chan struct{})}
 		if !s.retainProposalLease(call, lease) {
+			<-s.operationCap
+			<-s.localCap
 			s.proposeMu.Unlock()
 			return 0, ErrInvalidRequest
 		}
+		call.deadline, call.hasDeadline = ctx.Deadline()
+		s.inflight[hash] = call
+		if trace != nil {
+			trace.MarkAccepted()
+			result.reason = localtesthooks.BatchAdmissionAccepted
+		}
+		s.operationB += len(value)
+		s.localB += len(value)
+		s.proposalWG.Add(1)
+		s.logicalWG.Add(1)
+		go s.runProposal(hash, call, bytes.Clone(value))
 		s.proposeMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -526,44 +763,6 @@ func (s *Server) proposeWithLease(ctx context.Context, value []byte, lease *muta
 		case <-call.done:
 			return call.slot, call.err
 		}
-	}
-	if len(value) > maxInflightEncodedByte-s.localB || len(value) > maxProposalEncodedByte-s.operationB {
-		s.proposeMu.Unlock()
-		return 0, ErrOverloaded
-	}
-	select {
-	case s.localCap <- struct{}{}:
-	default:
-		s.proposeMu.Unlock()
-		return 0, ErrOverloaded
-	}
-	select {
-	case s.operationCap <- struct{}{}:
-	default:
-		<-s.localCap
-		s.proposeMu.Unlock()
-		return 0, ErrOverloaded
-	}
-	call := &proposalCall{done: make(chan struct{})}
-	if !s.retainProposalLease(call, lease) {
-		<-s.operationCap
-		<-s.localCap
-		s.proposeMu.Unlock()
-		return 0, ErrInvalidRequest
-	}
-	call.deadline, call.hasDeadline = ctx.Deadline()
-	s.inflight[hash] = call
-	s.operationB += len(value)
-	s.localB += len(value)
-	s.proposalWG.Add(1)
-	s.logicalWG.Add(1)
-	go s.runProposal(hash, call, bytes.Clone(value))
-	s.proposeMu.Unlock()
-	select {
-	case <-ctx.Done():
-		return 0, fmt.Errorf("%w: %w", ErrCommitUnknown, ctx.Err())
-	case <-call.done:
-		return call.slot, call.err
 	}
 }
 
@@ -589,6 +788,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 		return nil, ErrNotReady
 	}
 	s.quiescing = true
+	s.signalAdmissionLocked(true)
 	s.proposeMu.Unlock()
 	done := make(chan struct{})
 	go func() {
@@ -602,6 +802,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 			s.proposeMu.Lock()
 			if !s.closing {
 				s.quiescing = false
+				s.signalAdmissionLocked(true)
 			}
 			s.proposeMu.Unlock()
 		}()
@@ -620,6 +821,7 @@ func (s *Server) Quiesce(ctx context.Context) (func(), error) {
 		s.proposeMu.Lock()
 		if !s.closing {
 			s.quiescing = false
+			s.signalAdmissionLocked(true)
 		}
 		s.proposeMu.Unlock()
 	}, nil
@@ -707,6 +909,7 @@ func (s *Server) releaseProposalAttempt() {
 	s.proposeMu.Lock()
 	<-s.operationCap
 	<-s.localCap
+	s.signalAdmissionLocked(false)
 	s.proposeMu.Unlock()
 	s.proposalWG.Done()
 }
@@ -723,9 +926,15 @@ func (s *Server) beginLocalRetry(ctx context.Context) error {
 	case s.operationCap <- struct{}{}:
 	case <-ctx.Done():
 		<-s.localCap
+		s.proposeMu.Lock()
+		s.signalAdmissionLocked(false)
+		s.proposeMu.Unlock()
 		return ctx.Err()
 	case <-s.proposalCtx.Done():
 		<-s.localCap
+		s.proposeMu.Lock()
+		s.signalAdmissionLocked(false)
+		s.proposeMu.Unlock()
 		return ErrNotReady
 	}
 	s.proposeMu.Lock()
@@ -733,6 +942,9 @@ func (s *Server) beginLocalRetry(ctx context.Context) error {
 		s.proposeMu.Unlock()
 		<-s.operationCap
 		<-s.localCap
+		s.proposeMu.Lock()
+		s.signalAdmissionLocked(false)
+		s.proposeMu.Unlock()
 		return ErrNotReady
 	}
 	s.proposalWG.Add(1)
@@ -752,6 +964,7 @@ func (s *Server) finishProposalLogical(hash [32]byte, call *proposalCall, size i
 	}
 	call.leases = nil
 	close(call.done)
+	s.signalAdmissionLocked(false)
 	s.proposeMu.Unlock()
 	s.logicalWG.Done()
 }
@@ -787,6 +1000,7 @@ func (s *Server) finishLocalLifecycle(err error) {
 	}
 	<-s.operationCap
 	<-s.localCap
+	s.signalAdmissionLocked(err != nil)
 	s.proposeMu.Unlock()
 	s.proposalWG.Done()
 }
@@ -871,32 +1085,11 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	backoff := [...]time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
 	for s.core.Tip() < through {
 		from := s.core.Tip() + 1
-		var response DecisionsResponse
-		var err error
-		for attempt, delay := range backoff {
-			if delay != 0 {
-				select {
-				case <-time.After(delay):
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
-			pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
-			response, err = s.transport.FetchDecisions(pageCtx, source, from, 128)
-			cancel()
-			if err == nil || attempt == len(backoff)-1 {
-				break
-			}
-		}
+		response, err := fetchDecisionsWithRetry(ctx, s.transport.FetchDecisions, source, from)
 		if err != nil {
-			if errors.Is(err, quepaxa.ErrCompacted) {
-				s.handleCompacted()
-				return ErrNotReady
-			}
-			return err
+			return s.handleCatchUpFetchError(err)
 		}
 		if len(response.Decisions) == 0 || response.Decisions[0].Slot != from {
 			return fmt.Errorf("peer %s omitted decision slot %d", source, from)
@@ -922,6 +1115,41 @@ func (s *Server) catchUpFrom(ctx context.Context, source quepaxa.NodeID, through
 		return s.core.EnsureDurableThrough(ctx, through)
 	}
 	return ctx.Err()
+}
+
+func (s *Server) handleCatchUpFetchError(err error) error {
+	if errors.Is(err, quepaxa.ErrCompacted) {
+		s.handleCompacted()
+		return ErrNotReady
+	}
+	return err
+}
+
+func fetchDecisionsWithRetry(
+	ctx context.Context,
+	fetch func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (DecisionsResponse, error),
+	source quepaxa.NodeID,
+	from quepaxa.Slot,
+) (DecisionsResponse, error) {
+	backoff := [...]time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
+	var response DecisionsResponse
+	var err error
+	for attempt, delay := range backoff {
+		if delay != 0 {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return DecisionsResponse{}, ctx.Err()
+			}
+		}
+		pageCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		response, err = fetch(pageCtx, source, from, 128)
+		cancel()
+		if err == nil || errors.Is(err, quepaxa.ErrCompacted) || attempt == len(backoff)-1 {
+			break
+		}
+	}
+	return response, err
 }
 
 // ServeHTTP implements http.Handler.

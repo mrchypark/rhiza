@@ -37,6 +37,11 @@ on:
         options: [none, transport, auth, catchup]
         default: none
 
+      issue185_cost_evidence:
+        description: Run serialized local S3 checkpoint, archive-GC, Node.Open restore, and foreground cost evidence
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -46,7 +51,7 @@ concurrency:
 
 jobs:
   paired-go-benchmarks:
-    if: ${{ !inputs.refresh_hiqlite_reference }}
+    if: ${{ !inputs.refresh_hiqlite_reference && !inputs.issue185_cost_evidence }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -264,6 +269,187 @@ jobs:
         with:
           name: paired-performance-${{ github.run_id }}
           path: ${{ runner.temp }}/rhiza-performance
+          if-no-files-found: error
+          retention-days: 30
+
+  issue185-cost-evidence:
+    if: ${{ inputs.issue185_cost_evidence }}
+    runs-on: macos-15
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize evidence directory
+        run: mkdir -p "$RUNNER_TEMP/issue-185-cost-evidence/logs" "$RUNNER_TEMP/issue-185-cost-evidence/versity-raw"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download and verify pinned local Versity Gateway
+        env:
+          VERSITY_ARCHIVE_SHA256: 4953096f65a9c0d62ab184fb6b2ba7c2435229205cf00a56cb62cd4bf6b216ca
+        run: |
+          evidence_dir="$RUNNER_TEMP/issue-185-cost-evidence"
+          mkdir -p "$evidence_dir/versity"
+          archive="$RUNNER_TEMP/versitygw_v1.8.0_Darwin_arm64.tar.gz"
+          curl --fail --location --silent --show-error \
+            https://github.com/versity/versitygw/releases/download/v1.8.0/versitygw_v1.8.0_Darwin_arm64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' "$VERSITY_ARCHIVE_SHA256" "$archive" | shasum -a 256 --check
+          tar -xzf "$archive" -C "$evidence_dir/versity"
+          binary="$evidence_dir/versity/versitygw_v1.8.0_Darwin_arm64/versitygw"
+          test -x "$binary"
+          test "$(uname -m)" = arm64
+          binary_version=$("$binary" --version)
+          printf '%s\n' "$binary_version" | grep -F 'Version  : 1.8.0'
+          binary_sha256=$(shasum -a 256 "$binary" | awk '{print $1}')
+          printf 'RHIZA_VERSITYGW_BIN=%s\n' "$binary" >>"$GITHUB_ENV"
+          {
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'runner_label=macos-15\n'
+            printf 'macos_version=%s\n' "$(sw_vers -productVersion)"
+            printf 'architecture=%s\n' "$(uname -m)"
+            printf 'go=%s\n' "$(go version)"
+            printf 'versity_archive_sha256=%s\n' "$VERSITY_ARCHIVE_SHA256"
+            printf 'versity_binary_sha256=%s\n' "$binary_sha256"
+            printf 'versity_version=%s\n' "$binary_version"
+          } >"$evidence_dir/environment.txt"
+
+      - name: Run local provider and foreground evidence serially
+        env:
+          CGO_ENABLED: "1"
+          RHIZA_VERSITY_EVIDENCE_DIR: ${{ runner.temp }}/issue-185-cost-evidence/versity-raw
+        run: |
+          evidence_dir="$RUNNER_TEMP/issue-185-cost-evidence"
+          mkdir -p "$evidence_dir/logs"
+          : >"$evidence_dir/commands.txt"
+          : >"$evidence_dir/exits.tsv"
+          : >"$evidence_dir/cleanup.tsv"
+          gateway_run_dirs() {
+            base=$RHIZA_VERSITY_EVIDENCE_DIR
+            [ -d "$base" ] || return 0
+            for run_dir in "$base"/versity-*; do
+              [ -d "$run_dir" ] && printf '%s\n' "$run_dir"
+            done
+            return 0
+          }
+          wait_for_gateway_completion() {
+            previous_runs=$1
+            while IFS= read -r run_dir; do
+              [ -d "$run_dir" ] || continue
+              if printf '%s\n' "$previous_runs" | grep -Fqx "$run_dir"; then
+                continue
+              fi
+              marker="$run_dir/gateway-complete"
+              attempt=0
+              while [ ! -f "$marker" ] && [ "$attempt" -lt 100 ]; do
+                sleep 0.1
+                attempt=$((attempt + 1))
+              done
+              if [ ! -f "$marker" ]; then
+                printf '%s\tmissing-after-10s\n' "$run_dir" | tee -a "$evidence_dir/cleanup.tsv"
+                return 1
+              fi
+              if ! grep -Fqx 'gateway_reaped=true' "$marker"; then
+                printf '%s\tinvalid-completion-marker\n' "$run_dir" | tee -a "$evidence_dir/cleanup.tsv"
+                return 1
+              fi
+              printf '%s\tcomplete\t' "$run_dir" | tee -a "$evidence_dir/cleanup.tsv"
+              tr '\n' ' ' <"$marker" | tee -a "$evidence_dir/cleanup.tsv"
+              printf '\n' | tee -a "$evidence_dir/cleanup.tsv"
+            done < <(gateway_run_dirs)
+          }
+          run_logged() {
+            label=$1
+            shift
+            {
+              printf '%s\t' "$label"
+              printf '%q ' "$@"
+              printf '\n'
+            } | tee -a "$evidence_dir/commands.txt"
+            previous_runs=$(gateway_run_dirs)
+            if "$@" >"$evidence_dir/logs/$label.log" 2>&1; then
+              status=0
+            else
+              status=$?
+            fi
+            if wait_for_gateway_completion "$previous_runs"; then
+              cleanup_status=0
+            else
+              cleanup_status=$?
+            fi
+            printf '%s\t%s\n' "$label" "$status" | tee -a "$evidence_dir/exits.tsv"
+            cat "$evidence_dir/logs/$label.log"
+            if [[ $status -ne 0 ]]; then
+              return "$status"
+            fi
+            if [[ $cleanup_status -ne 0 ]]; then
+              return "$cleanup_status"
+            fi
+          }
+
+          run_logged versity-smoke env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=2m ./internal/objstore \
+            -run '^TestVersityGatewayCostEvidence$'
+          run_logged versity-sdk-retry env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=2m ./internal/objstore \
+            -run '^TestVersitySDKRetryEvidence$'
+          run_logged versity-conditional-large-put env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=2m ./internal/objstore \
+            -run '^TestVersityConditionalLargePutEvidence$'
+          run_logged archive-attribution-regression env \
+            CGO_ENABLED=1 go test -count=1 -v -tags rhiza_local_testhooks -timeout=2m ./pkg/recovery \
+            -run '^TestArchiveExtentAttributionActualGuard$'
+          run_logged checkpoint-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=5m ./pkg/checkpoint \
+            -run '^TestCheckpointCost$'
+          run_logged archive-gc-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=5m ./pkg/recovery \
+            -run '^TestArchiveGCCost$'
+          run_logged node-open-restore-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -timeout=5m ./pkg/node \
+            -run '^TestCheckpointRestoreCostExercisesNodeRecoveryPathS3$'
+          run_logged node-learn-gap-lifecycle-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=3m ./pkg/node \
+            -run '^TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls$'
+          run_logged node-learn-gap-lifecycle-race-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            go test -count=1 -v -race -tags rhiza_local_testhooks -timeout=3m ./pkg/node \
+            -run '^TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls$'
+          run_logged node-foreground-cost-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_NODE_FOREGROUND_API_COST=1 \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=baseline \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
+            -run '^TestNodeForegroundAPICostS3$'
+          run_logged node-foreground-checkpoint-active-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_NODE_FOREGROUND_API_COST=1 \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=checkpoint-active \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
+            -run '^TestNodeForegroundAPICostS3$'
+          run_logged node-foreground-archive-cleanup-active-s3 env \
+            RHIZA_VERSITYGW_BIN="$RHIZA_VERSITYGW_BIN" \
+            RHIZA_NODE_FOREGROUND_API_COST=1 \
+            RHIZA_NODE_FOREGROUND_API_COST_SCENARIO=archive-cleanup-active \
+            go test -count=1 -v -tags rhiza_local_testhooks -timeout=7m ./pkg/node \
+            -run '^TestNodeForegroundAPICostS3$'
+
+      - name: Upload issue 185 cost evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-185-cost-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/issue-185-cost-evidence
           if-no-files-found: error
           retention-days: 30
 

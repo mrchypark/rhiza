@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -118,6 +119,7 @@ func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encod
 	}
 	if !b.reserveQueue(item.reserved) {
 		item.releaseLease()
+		localtesthooks.Hit("network:mutation-queue:reservation-rejected")
 		return 0, ErrOverloaded
 	}
 	select {
@@ -133,6 +135,7 @@ func (b *mutationBatcher[T]) submitEncoded(ctx context.Context, command T, encod
 	default:
 		b.releaseQueue(item.reserved)
 		item.releaseLease()
+		localtesthooks.Hit("network:mutation-queue:input-channel-full")
 		return 0, ErrOverloaded
 	}
 	select {
@@ -325,6 +328,7 @@ func (b *mutationBatcher[T]) dispatch(items []*batchItem, encoded [][]byte) {
 	if len(value) > maxInflightEncodedByte-b.inflightB {
 		b.budgetMu.Unlock()
 		<-b.inflight
+		localtesthooks.Hit("network:mutation-queue:worker-inflight-bytes-rejected")
 		b.fail(active, ErrOverloaded)
 		return
 	}

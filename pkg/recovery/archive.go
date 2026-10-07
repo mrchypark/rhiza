@@ -16,8 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
@@ -38,11 +40,27 @@ const (
 )
 
 var (
-	ErrArchiveClosed       = errors.New("archive manager is closed")
-	ErrArchiveBusy         = errors.New("archive maintenance is active")
-	ErrArchiveSealed       = errors.New("archive is sealed for recovery")
-	errArchiveStateChanged = errors.New("archive state changed during I/O")
+	ErrArchiveClosed = errors.New("archive manager is closed")
+	ErrArchiveBusy   = errors.New("archive maintenance is active")
+	// ErrActiveGCLock is only a pre-entry refusal by a live GC lease.
+	// Direct callers still observe ErrArchiveBusy through errors.Is.
+	ErrActiveGCLock error = activeGCLockError{}
+	// ErrActiveRecoveryPin identifies only the trim guard's live-pin refusal.
+	// It retains ErrArchiveBusy compatibility without conflating lock failures.
+	ErrActiveRecoveryPin   error = activeRecoveryPinError{}
+	ErrArchiveSealed             = errors.New("archive is sealed for recovery")
+	errArchiveStateChanged       = errors.New("archive state changed during I/O")
 )
+
+type activeRecoveryPinError struct{}
+
+func (activeRecoveryPinError) Error() string { return ErrArchiveBusy.Error() }
+func (activeRecoveryPinError) Unwrap() error { return ErrArchiveBusy }
+
+type activeGCLockError struct{}
+
+func (activeGCLockError) Error() string { return ErrArchiveBusy.Error() }
+func (activeGCLockError) Unwrap() error { return ErrArchiveBusy }
 
 type Extent struct {
 	ConfigID       uint                   `json:"config_id"`
@@ -382,6 +400,14 @@ func (m *Manager) InitializeFencedGeneration(ctx context.Context, tip quepaxa.Sl
 	if tip == 0 || prefix == ([32]byte{}) || anchorHash == ([32]byte{}) || !m.cas {
 		return fmt.Errorf("invalid fenced generation archive base")
 	}
+	return m.withPublicationLock(ctx, "archive-initialize", func(ctx context.Context) error {
+		m.transitionMu.Lock()
+		defer m.transitionMu.Unlock()
+		return m.initializeFencedGeneration(ctx, tip, prefix, anchorHash)
+	})
+}
+
+func (m *Manager) initializeFencedGeneration(ctx context.Context, tip quepaxa.Slot, prefix, anchorHash [32]byte) error {
 	if err := m.Load(ctx); err != nil {
 		return err
 	}
@@ -410,9 +436,15 @@ func (m *Manager) TrimThrough(ctx context.Context, sealed quepaxa.SealedCheckpoi
 			return err
 		}
 		if active {
-			return ErrArchiveBusy
+			m.traceArchiveBusy(ctx, "archive-trim", m.key("archive/recovery-pins"), "active_recovery_pin", "site", true)
+			return ErrActiveRecoveryPin
 		}
-		return m.trimThrough(ctx, sealed, decision)
+		return m.withPublicationLock(ctx, "archive-trim", func(ctx context.Context) error {
+			if err := m.Load(ctx); err != nil {
+				return err
+			}
+			return m.trimThrough(ctx, sealed, decision)
+		})
 	})
 }
 
@@ -505,6 +537,10 @@ func (m *Manager) refreshPublishedHead(ctx context.Context, expected archiveHead
 	}
 	m.mu.Lock()
 	if !sameNullableObjectVersion(m.headCAS, priorCAS) {
+		if archiveHeadsEqual(m.head, expected) && sameObjectVersion(m.headCAS, attributes.Version) {
+			m.mu.Unlock()
+			return nil
+		}
 		m.mu.Unlock()
 		return errArchiveStateChanged
 	}
@@ -599,6 +635,7 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 				if err == nil && existing.LeaseUntilMS > time.Now().UnixMilli() {
 					return ErrArchiveBusy
 				}
+				m.traceRecoveryPinCreateAttempt(ctx, key, existing)
 				options := []objstore.ObjectUploadOption{objstore.WithIfNotExists()}
 				if err == nil {
 					options = []objstore.ObjectUploadOption{objstore.WithIfMatch(existing.version)}
@@ -613,6 +650,9 @@ func (m *Manager) BeginRecoverySnapshot(ctx context.Context, owner string, lease
 				if err != nil {
 					return err
 				}
+				// confirmRecoveryPin re-reads and compares the stored record, so this
+				// event is a verified readback rather than an upload ACK alone.
+				m.traceRecoveryPinReadback(ctx, key, localtesthooks.RecoveryPinCreateConfirmed, *stored)
 				snapshot = &RecoverySnapshot{manager: m, head: head, refs: refs, pinKey: key, pin: *stored}
 				return nil
 			}
@@ -713,12 +753,17 @@ func (s *RecoverySnapshot) Renew(ctx context.Context, lease time.Duration) error
 		return ErrArchiveBusy
 	}
 	pin.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
+	s.manager.traceRecoveryPin(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, *pin)
 	if err := s.manager.writeRecoveryPin(ctx, s.pinKey, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 		if s.manager.bucket.IsConditionNotMetErr(err) {
+			s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, localtesthooks.RecoveryPinWriteCondMet)
 			return ErrArchiveBusy
 		}
+		s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewAttempt, localtesthooks.RecoveryPinWriteUnknown)
 		return err
 	}
+	// A renewal ACK is not a readback: no re-read happens on this path.
+	s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinRenewConfirmed, localtesthooks.RecoveryPinWriteOK)
 	if pin.LeaseUntilMS <= time.Now().UnixMilli() {
 		return ErrArchiveBusy
 	}
@@ -732,20 +777,33 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 	pin, err := s.manager.readRecoveryPin(ctx, s.pinKey)
 	if err != nil {
 		if s.manager.bucket.IsObjNotFoundErr(err) {
+			s.manager.traceRecoveryPinRead(ctx, s.pinKey, localtesthooks.RecoveryPinCloseAttempt, localtesthooks.RecoveryPinReadMissing)
 			return nil
 		}
+		// One event carries the whole boundary: the read was invalid and no
+		// write was attempted. No error content is retained.
+		s.manager.traceRecoveryPinReadFailure(ctx, s.pinKey, localtesthooks.RecoveryPinCloseError, localtesthooks.RecoveryPinReadInvalid)
 		return err
 	}
 	if pin.OwnerID != s.pin.OwnerID || pin.Token != s.pin.Token || pin.Base != s.pin.Base || pin.Tip != s.pin.Tip || pin.TailHash != s.pin.TailHash || pin.TailObject != s.pin.TailObject {
+		// The stored record was already read and does not match this snapshot, so
+		// no conditional upload is attempted. This is an identity mismatch, not a
+		// storage condition-not-met response.
+		s.manager.traceRecoveryPinIdentityMismatch(ctx, s.pinKey)
 		return ErrArchiveBusy
 	}
 	pin.LeaseUntilMS = time.Now().UnixMilli()
+	s.manager.traceRecoveryPin(ctx, s.pinKey, localtesthooks.RecoveryPinCloseAttempt, *pin)
 	if err := s.manager.writeRecoveryPin(ctx, s.pinKey, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 		if s.manager.bucket.IsConditionNotMetErr(err) {
+			s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseConflict, localtesthooks.RecoveryPinWriteCondMet)
 			return ErrArchiveBusy
 		}
+		s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseError, localtesthooks.RecoveryPinWriteUnknown)
 		return err
 	}
+	// A close ACK is not a readback: no re-read happens on this path.
+	s.manager.traceRecoveryPinWrite(ctx, s.pinKey, localtesthooks.RecoveryPinCloseConfirmed, localtesthooks.RecoveryPinWriteOK)
 	return nil
 }
 
@@ -803,7 +861,7 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 			target = tip
 		}
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
-		batch.err = m.syncNow(ctx, core, target)
+		batch.err = m.syncNowBatch(ctx, core, target, batch)
 		cancel()
 	}
 	m.batchMu.Lock()
@@ -815,8 +873,42 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 }
 
 func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot) error {
-	m.transitionMu.Lock()
-	defer m.transitionMu.Unlock()
+	return m.syncNowBatch(ctx, core, through, nil)
+}
+
+func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
+	if m.Tip() >= through {
+		return nil
+	}
+	m.mu.Lock()
+	exhausted := m.head.Generation == ^uint64(0)
+	m.mu.Unlock()
+	if exhausted {
+		return fmt.Errorf("archive generation exhausted")
+	}
+	return m.withPublicationLock(ctx, "archive-sync", func(ctx context.Context) error {
+		m.transitionMu.Lock()
+		defer m.transitionMu.Unlock()
+		if err := m.Load(ctx); err != nil {
+			return err
+		}
+		if batch != nil {
+			// Callers may join while remote admission is in progress. Include
+			// their certified decisions in this already-fenced publication.
+			m.batchMu.Lock()
+			if batch.target > through {
+				through = batch.target
+			}
+			m.batchMu.Unlock()
+			if tip := core.Tip(); tip > through {
+				through = tip
+			}
+		}
+		return m.syncNowLocked(ctx, core, through)
+	})
+}
+
+func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepaxa.Slot) error {
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
 		m.mu.Lock()
 		tip, head, refs, headCAS := m.tip, m.head, slices.Clone(m.extents), m.headCAS
@@ -880,6 +972,9 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *objstore.ObjectVersion) error {
+	if err := m.confirmPublicationLease(ctx); err != nil {
+		return err
+	}
 	data, err := encodeHead(head)
 	if err != nil {
 		return err
@@ -898,15 +993,56 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 	return m.bucket.Upload(ctx, m.key("archive/head.bin"), bytes.NewReader(data), options...)
 }
 
+func (m *Manager) confirmPublicationLease(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	lease, ok := ctx.Value(publicationLeaseContextKey{}).(archiveGCLock)
+	if !ok {
+		m.traceArchiveBusy(ctx, "unknown", m.publicationLockKey(), "missing_lease_context", "site", true)
+		return ErrArchiveBusy
+	}
+	current, err := m.readArchiveLock(ctx, m.publicationLockKey())
+	if err != nil {
+		return err
+	}
+	if current.OwnerID != lease.OwnerID || current.Generation != lease.Generation ||
+		current.LeaseUntilMS <= time.Now().UnixMilli() {
+		m.traceArchiveBusy(ctx, "unknown", m.publicationLockKey(), "confirm_mismatch_or_expired", "site", true)
+		return ErrArchiveBusy
+	}
+	return nil
+}
+
 func (m *Manager) uploadExtent(ctx context.Context, hash [32]byte, data []byte, generation uint64) error {
+	ctx, attribution := objmetrics.BeginExtentUploadAttribution(ctx)
 	var options []objstore.ObjectUploadOption
 	if m.cas {
 		options = append(options, objstore.WithIfNotExists())
 	}
 	err := m.bucket.Upload(ctx, m.key(extentObjectKey(hash, generation)), bytes.NewReader(data), options...)
-	if m.cas && m.bucket.IsConditionNotMetErr(err) {
+	typed := m.cas && err != nil && m.bucket.IsConditionNotMetErr(err)
+	guard := "not_attempted"
+	if attribution != nil {
+		defer func() {
+			attribution.Complete(err, typed, guard)
+		}()
+	}
+	if !m.cas || err == nil {
+		return err
+	}
+	if !typed && !errors.Is(err, syscall.EPIPE) {
+		return err
+	}
+	if ctx.Err() != nil {
+		guard = "context_done"
+		return err
+	}
+	if _, readErr := m.readExtent(ctx, hash, generation); readErr == nil && ctx.Err() == nil {
+		guard = "verified"
 		return nil
 	}
+	guard = "unverified"
 	return err
 }
 
@@ -1051,17 +1187,90 @@ func (m *Manager) Cleanup(ctx context.Context, grace time.Duration) error {
 	if grace < 0 {
 		return fmt.Errorf("archive GC grace period must not be negative")
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:manager-lock:begin")
 	m.gcMu.Lock()
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:manager-lock:success")
 	defer m.gcMu.Unlock()
 	return m.withGCLock(ctx, "archive-gc", func(ctx context.Context) error {
 		return m.cleanup(ctx, grace)
 	})
 }
 
+// archiveGCTrace marks only a finite cleanup phase and its terminal outcome.
+// Local test hooks compile to no-ops outside rhiza_local_testhooks builds.
+func archiveGCTrace(ctx context.Context, phase string, work func() error) (err error) {
+	if !localtesthooks.Enabled {
+		return work()
+	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:"+phase+":begin")
+	defer func() {
+		if err != nil {
+			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:"+phase+":error")
+		} else {
+			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:"+phase+":success")
+		}
+	}()
+	return work()
+}
+
 func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
+	// Packing is advisory until publication admission. It performs no upload
+	// and leaves ordinary publishers free during the expensive first pass.
+	if err := archiveGCTrace(ctx, "load", func() error { return m.Load(ctx) }); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	priorHead, priorRefs := m.head, slices.Clone(m.extents)
+	m.mu.Unlock()
+	if priorHead.Sealed {
+		return ErrArchiveSealed
+	}
+	var priorPacked []Extent
+	if err := archiveGCTrace(ctx, "compaction", func() error {
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:compaction-choice:full")
+		var err error
+		priorPacked, err = m.compactExtents(ctx, priorRefs, priorHead.BasePrefix)
+		return err
+	}); err != nil {
+		return err
+	}
+	// Without a compaction there is no HEAD publication to admit. Writers may
+	// append after this snapshot, but they must retain these refs and their new
+	// extent object generation is above this snapshot's GC generation.
+	if len(priorPacked) >= len(priorRefs) {
+		keep := make(map[string]struct{}, len(priorRefs))
+		for _, extent := range priorRefs {
+			keep[m.key(extentObjectKey(extent.hash, extent.object))] = struct{}{}
+		}
+		return m.cleanupDeletes(ctx, grace, keep, priorHead.Generation)
+	}
+	var keep map[string]struct{}
+	var gcGeneration uint64
+	if err := m.withPublicationLock(ctx, "archive-gc-publish", func(ctx context.Context) error {
+		if err := m.cleanupPublication(ctx, priorHead, priorRefs, priorPacked); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		keep = make(map[string]struct{}, len(m.extents))
+		gcGeneration = m.head.Generation
+		for _, extent := range m.extents {
+			keep[m.key(extentObjectKey(extent.hash, extent.object))] = struct{}{}
+		}
+		m.mu.Unlock()
+		return nil
+	}); err != nil {
+		return err
+	}
+	return m.cleanupDeletes(ctx, grace, keep, gcGeneration)
+}
+
+// cleanupPublication begins with a fresh remote Load after admission. No
+// optimistic object upload or deletion state is carried across that boundary.
+func (m *Manager) cleanupPublication(ctx context.Context, priorHead archiveHead, priorRefs, priorPacked []Extent) error {
 	settled := false
+	var priorUploaded []Extent
 	for attempt := 0; attempt < maxPublishRetries; attempt++ {
-		if err := m.Load(ctx); err != nil {
+		if err := archiveGCTrace(ctx, "load", func() error { return m.Load(ctx) }); err != nil {
 			return err
 		}
 		m.mu.Lock()
@@ -1070,7 +1279,19 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		if snapshotHead.Sealed {
 			return ErrArchiveSealed
 		}
-		compacted, err := m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
+		reusePacking := canReuseCleanupCompaction(ctx, m.configID, snapshotHead, priorHead, refs, priorRefs, priorPacked)
+		var compacted []Extent
+		err := archiveGCTrace(ctx, "compaction", func() error {
+			var err error
+			if reusePacking {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:compaction-choice:reuse")
+				compacted, err = m.compactExtentsFrom(ctx, refs[len(priorRefs):], snapshotHead.BasePrefix, priorPacked)
+			} else {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:compaction-choice:full")
+				compacted, err = m.compactExtents(ctx, refs, snapshotHead.BasePrefix)
+			}
+			return err
+		})
 		if err != nil {
 			return err
 		}
@@ -1078,43 +1299,80 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 			settled = true
 			break
 		}
+		// Keep only this invocation's validated packing decision. Publication
+		// changes extent metadata below; the retained slice must stay pristine.
+		priorHead, priorRefs, priorPacked = snapshotHead, refs, slices.Clone(compacted)
 		head := snapshotHead
 		if head.Generation == ^uint64(0) {
 			return fmt.Errorf("archive generation exhausted")
 		}
 		nextGeneration := head.Generation + 1
 		previous, previousObject := [32]byte{}, uint64(0)
+		reuseUploaded := reusePacking
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:begin")
 		for i := range compacted {
 			extent := &compacted[i]
 			extent.PreviousHash, extent.PreviousObject = previous, previousObject
 			data, err := encodeExtent(*extent)
 			if err != nil {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return fmt.Errorf("encode compacted archive extent: %w", err)
 			}
 			if len(data) > maxExtentSize {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return fmt.Errorf("compacted archive extent exceeds %d bytes", maxExtentSize)
 			}
 			hash := sha256.Sum256(data)
 			extent.hash = hash
+			// Only complete groups can survive appended decisions. The current
+			// predecessor is part of the encoded hash, and the saved object was
+			// acknowledged or verified earlier in this Cleanup invocation.
+			if reuseUploaded && i < len(compacted)-1 && i < len(priorUploaded) &&
+				canReuseCleanupUpload(hash, priorUploaded[i], snapshotHead.Generation) {
+				extent.object = priorUploaded[i].object
+				previous, previousObject = hash, extent.object
+				continue
+			}
+			reuseUploaded = false
 			if err := m.uploadExtent(ctx, hash, data, nextGeneration); err != nil {
+				localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:error")
 				return err
 			}
 			extent.object = nextGeneration
 			previous, previousObject = hash, nextGeneration
 		}
+		// The mutable final group is never retained. An error above leaves no
+		// new eligible upload state for a later attempt.
+		priorUploaded = slices.Clone(compacted[:max(0, len(compacted)-1)])
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:extent-upload:success")
 		head.TailHash, head.TailObject = previous, previousObject
 		head.Generation = nextGeneration
-		if err := m.publishHead(ctx, head, snapshotCAS); err != nil {
+		if err := archiveGCTrace(ctx, "publication", func() error {
+			err := m.publishHead(ctx, head, snapshotCAS)
+			if localtesthooks.Enabled {
+				switch {
+				case err == nil:
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:success")
+				case m.bucket.IsConditionNotMetErr(err):
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:typed_condition")
+				case ctx.Err() != nil && errors.Is(err, ctx.Err()):
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:context_done")
+				default:
+					localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:publication-result:other")
+				}
+			}
+			return err
+		}); err != nil {
 			if m.cas {
 				continue
 			}
 			return err
 		}
-		if err := m.refreshPublishedHead(ctx, head, snapshotCAS, compacted); err != nil {
+		if err := archiveGCTrace(ctx, "readback", func() error { return m.refreshPublishedHead(ctx, head, snapshotCAS, compacted) }); err != nil {
 			return err
 		}
 		verifier := NewManager(m.bucket, m.prefix, m.configID)
-		if err := verifier.Load(ctx); err != nil {
+		if err := archiveGCTrace(ctx, "readback", func() error { return verifier.Load(ctx) }); err != nil {
 			verifier.Close()
 			return fmt.Errorf("verify compacted archive: %w", err)
 		}
@@ -1129,21 +1387,25 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 	if !settled {
 		return fmt.Errorf("archive cleanup conflicted too many times")
 	}
-	m.mu.Lock()
-	keep := make(map[string]struct{}, len(m.extents))
-	gcGeneration := m.head.Generation
-	for _, extent := range m.extents {
-		keep[m.key(extentObjectKey(extent.hash, extent.object))] = struct{}{}
-	}
+	return nil
+}
+
+// cleanupDeletes runs without publication admission but still under GC_LOCK.
+func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep map[string]struct{}, gcGeneration uint64) error {
 	cutoff := time.Now().Add(-grace)
-	m.mu.Unlock()
-	pinnedGeneration, err := m.maxActiveRecoveryGeneration(ctx)
+	var pinnedGeneration uint64
+	err := archiveGCTrace(ctx, "pins", func() error {
+		var err error
+		pinnedGeneration, err = m.maxActiveRecoveryGeneration(ctx)
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	m.waitReaders()
+	_ = archiveGCTrace(ctx, "readers", func() error { m.waitReaders(); return nil })
 	markers := make(map[string]time.Time)
-	if err := m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:begin")
+	err = m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
 		modified, ok := attributes.LastModified()
 		if !ok {
 			objectAttributes, err := m.bucket.Attributes(ctx, attributes.Name)
@@ -1154,15 +1416,19 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 		}
 		markers[attributes.Name] = modified
 		return nil
-	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter()); err != nil {
+	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter())
+	if err != nil {
+		localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:error")
 		return err
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:success")
 	deleteCtx, cancelDeletes := context.WithCancel(ctx)
 	defer cancelDeletes()
 	deletes, deleteCtx := errgroup.WithContext(deleteCtx)
 	deletes.SetLimit(4)
 	for _, dir := range []string{"archive/manifests", "archive/blocks"} {
-		if err := m.bucket.Iter(deleteCtx, m.key(dir), func(name string) error {
+		localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:begin")
+		err := m.bucket.Iter(deleteCtx, m.key(dir), func(name string) error {
 			if err := deleteCtx.Err(); err != nil {
 				return err
 			}
@@ -1218,19 +1484,25 @@ func (m *Manager) cleanup(ctx context.Context, grace time.Duration) error {
 				return nil
 			})
 			return deleteCtx.Err()
-		}); err != nil {
+		})
+		if err != nil {
+			localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:error")
 			cancelDeletes()
 			return errors.Join(err, deletes.Wait())
 		}
+		localtesthooks.HitArchiveGCPhase(deleteCtx, "archive-gc:object-scan:success")
 	}
-	if err := deletes.Wait(); err != nil {
+	if err := archiveGCTrace(deleteCtx, "delete-wait", deletes.Wait); err != nil {
 		return err
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:begin")
 	for marker := range markers {
 		if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:error")
 			return err
 		}
 	}
+	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:success")
 	return nil
 }
 
@@ -1241,18 +1513,267 @@ func (m *Manager) gcMarkerKey(name string) string {
 
 func (m *Manager) gcLockKey() string { return m.key("archive/GC_LOCK") }
 
+func (m *Manager) publicationLockKey() string { return m.key("archive/PUBLISH_LOCK") }
+
+type publicationLeaseContextKey struct{}
+
 func (m *Manager) recoveryPinKey(owner string) string {
 	hash := sha256.Sum256([]byte(owner))
 	return m.key(fmt.Sprintf("archive/recovery-pins/%x", hash))
 }
 
 func (m *Manager) withGCLock(ctx context.Context, owner string, work func(context.Context) error) error {
-	lock, err := m.acquireGCLock(ctx, owner, archivePinLease)
+	entered := false
+	err := m.withArchiveLock(ctx, m.gcLockKey(), owner, true, func(workCtx context.Context) error {
+		entered = true
+		return work(workCtx)
+	})
+	if errors.Is(err, ErrArchiveBusy) {
+		m.traceArchiveBusy(ctx, owner, m.gcLockKey(), "returned", "terminal", entered)
+	}
+	return err
+}
+
+// traceArchiveBusy emits only allowlisted diagnostic categories. The disabled
+// hook returns before constructing a key or retaining a lock identity.
+func (m *Manager) traceArchiveBusy(ctx context.Context, owner, key, branch, stage string, entered bool) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	operation := "other"
+	switch owner {
+	case "archive-sync":
+		operation = "archive-sync"
+	case "archive-trim":
+		operation = "archive-trim"
+	case "archive-gc", "archive-gc-publish":
+		operation = "archive-gc"
+	case "archive-initialize":
+		operation = "archive-initialize"
+	}
+	resource := "other"
+	switch key {
+	case m.gcLockKey():
+		resource = "gc_lock"
+	case m.publicationLockKey():
+		resource = "publication_lock"
+	case m.key("archive/recovery-pins"):
+		resource = "recovery_pin"
+	}
+	localtesthooks.HitArchiveBusy(ctx, localtesthooks.ArchiveBusyEvent{
+		Operation: operation, Resource: resource, Branch: branch, Stage: stage, Entered: entered,
+	})
+}
+
+// recoveryPinKeyHash returns the bounded hash suffix already used for the pin
+// object key. It accepts only the exact Manager namespace for recovery pins —
+// including the cluster prefix Node adds — and never returns the owner string
+// or the full object key. Any foreign or malformed key stays unknown.
+func (m *Manager) recoveryPinKeyHash(key string) string {
+	const namespace = "archive/recovery-pins/"
+	// The Manager prefix is the authoritative namespace; the unprefixed form is
+	// accepted only because an empty prefix already yields that exact value.
+	prefix := m.key(namespace)
+	if !strings.HasPrefix(key, prefix) {
+		return "unknown"
+	}
+	hash := strings.TrimPrefix(key, prefix)
+	// The suffix is always a full lowercase SHA-256 hex digest of the owner.
+	// Requiring that exact shape before truncating keeps arbitrary plaintext from
+	// being emitted as a key hash: a key that is not an owner digest never
+	// contributes any of its own characters.
+	if len(hash) != 64 || !isLowerHex(hash) {
+		return "unknown"
+	}
+	return hash[:16]
+}
+
+// isLowerHex reports whether s is entirely lowercase hexadecimal.
+func isLowerHex(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// recoveryPinLeaseState classifies a stored lease without retaining its value.
+func recoveryPinLeaseState(leaseUntilMS, nowMS int64) (string, int64) {
+	switch {
+	case leaseUntilMS == 0:
+		return localtesthooks.RecoveryPinLeaseZero, 0
+	case leaseUntilMS <= nowMS:
+		return localtesthooks.RecoveryPinLeaseExpired, leaseUntilMS - nowMS
+	default:
+		return localtesthooks.RecoveryPinLeaseActive, leaseUntilMS - nowMS
+	}
+}
+
+// traceRecoveryPin emits one lifecycle event derived only from a pin already
+// read on this path. It performs no additional provider IO.
+func (m *Manager) traceRecoveryPin(ctx context.Context, key, phase string, pin archiveRecoveryPin) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	nowMS := time.Now().UnixMilli()
+	state, delta := recoveryPinLeaseState(pin.LeaseUntilMS, nowMS)
+	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		LeaseState: state, LeaseDeltaMS: delta, ReadStatus: localtesthooks.RecoveryPinReadOK,
+		WriteStatus: localtesthooks.RecoveryPinWriteUnknown, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
+		VersionPresent: pin.version != nil, ObservedAtMS: nowMS,
+	})
+}
+
+// traceRecoveryPinReadback emits a create event whose stored record was
+// traceRecoveryPinCreateAttempt emits the pre-upload create boundary using
+// only the record the caller already read. A missing record is reported as a
+// read miss; no additional provider IO is performed.
+func (m *Manager) traceRecoveryPinCreateAttempt(ctx context.Context, key string, existing *archiveRecoveryPin) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	nowMS := time.Now().UnixMilli()
+	event := localtesthooks.RecoveryPinEvent{
+		Phase: localtesthooks.RecoveryPinCreateAttempt, KeyHash: m.recoveryPinKeyHash(key),
+		OwnerCategory: localtesthooks.RecoveryPinCategory(ctx), LeaseState: localtesthooks.RecoveryPinLeaseUnknown,
+		ReadStatus: localtesthooks.RecoveryPinReadMissing, WriteStatus: localtesthooks.RecoveryPinWriteUnknown,
+		ReadbackStatus: localtesthooks.RecoveryPinReadbackNone, ObservedAtMS: nowMS,
+	}
+	if existing != nil {
+		state, delta := recoveryPinLeaseState(existing.LeaseUntilMS, nowMS)
+		event.LeaseState, event.LeaseDeltaMS = state, delta
+		event.ReadStatus, event.VersionPresent = localtesthooks.RecoveryPinReadOK, existing.version != nil
+	}
+	localtesthooks.HitRecoveryPin(ctx, event)
+}
+
+// traceRecoveryPinReadback emits a create event whose stored record was
+// already re-read and compared by the existing confirm helper.
+func (m *Manager) traceRecoveryPinReadback(ctx context.Context, key, phase string, pin archiveRecoveryPin) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	nowMS := time.Now().UnixMilli()
+	state, delta := recoveryPinLeaseState(pin.LeaseUntilMS, nowMS)
+	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		LeaseState: state, LeaseDeltaMS: delta, ReadStatus: localtesthooks.RecoveryPinReadOK,
+		WriteStatus: localtesthooks.RecoveryPinWriteOK, ReadbackStatus: localtesthooks.RecoveryPinReadbackDone,
+		VersionPresent: pin.version != nil, ObservedAtMS: nowMS,
+	})
+}
+
+// traceRecoveryPinRead emits a finite read outcome without the pin body.
+// traceRecoveryPinIdentityMismatch emits the pre-upload close boundary where
+// the stored record does not match the snapshot. No write is attempted, so the
+// write status stays not_attempted and never claims a conditional conflict.
+// traceRecoveryPinReadFailure emits one terminal row for a failed read. The
+// write status stays not_attempted because no upload followed the read.
+func (m *Manager) traceRecoveryPinReadFailure(ctx context.Context, key, phase, readStatus string) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		LeaseState: localtesthooks.RecoveryPinLeaseUnknown, ReadStatus: readStatus,
+		WriteStatus: localtesthooks.RecoveryPinWriteNotAttempted, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
+		ObservedAtMS: time.Now().UnixMilli(),
+	})
+}
+
+func (m *Manager) traceRecoveryPinIdentityMismatch(ctx context.Context, key string) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
+		Phase: localtesthooks.RecoveryPinCloseConflict, KeyHash: m.recoveryPinKeyHash(key),
+		OwnerCategory: localtesthooks.RecoveryPinCategory(ctx), LeaseState: localtesthooks.RecoveryPinLeaseUnknown,
+		ReadStatus: localtesthooks.RecoveryPinReadIdentityMismatch, WriteStatus: localtesthooks.RecoveryPinWriteNotAttempted,
+		ReadbackStatus: localtesthooks.RecoveryPinReadbackNone, ObservedAtMS: time.Now().UnixMilli(),
+	})
+}
+
+func (m *Manager) traceRecoveryPinRead(ctx context.Context, key, phase, status string) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		LeaseState: localtesthooks.RecoveryPinLeaseUnknown, ReadStatus: status,
+		WriteStatus: localtesthooks.RecoveryPinWriteUnknown, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
+		ObservedAtMS: time.Now().UnixMilli(),
+	})
+}
+
+// traceRecoveryPinWrite emits a finite write outcome without the pin body.
+func (m *Manager) traceRecoveryPinWrite(ctx context.Context, key, phase, status string) {
+	if !localtesthooks.Enabled {
+		return
+	}
+	localtesthooks.HitRecoveryPin(ctx, localtesthooks.RecoveryPinEvent{
+		Phase: phase, KeyHash: m.recoveryPinKeyHash(key), OwnerCategory: localtesthooks.RecoveryPinCategory(ctx),
+		LeaseState: localtesthooks.RecoveryPinLeaseUnknown, ReadStatus: localtesthooks.RecoveryPinReadUnknown,
+		WriteStatus: status, ReadbackStatus: localtesthooks.RecoveryPinReadbackNone,
+		ObservedAtMS: time.Now().UnixMilli(),
+	})
+}
+
+// withPublicationLock waits only before work begins. An error after entry may
+// follow an ambiguous HEAD write and must never replay the whole operation.
+func (m *Manager) withPublicationLock(ctx context.Context, owner string, work func(context.Context) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for {
+		entered := false
+		err := m.withArchiveLock(ctx, m.publicationLockKey(), owner, false, func(workCtx context.Context) error {
+			entered = true
+			return work(workCtx)
+		})
+		if entered || !errors.Is(err, ErrArchiveBusy) {
+			if errors.Is(err, ErrArchiveBusy) {
+				m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", entered)
+			}
+			return err
+		}
+		if _, bounded := ctx.Deadline(); !bounded {
+			m.traceArchiveBusy(ctx, owner, m.publicationLockKey(), "returned", "terminal", false)
+			return err
+		}
+		timer := time.NewTimer(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrace bool, work func(context.Context) error) error {
+	var lock *archiveGCLock
+	acquire := func() error {
+		var err error
+		lock, err = m.acquireArchiveLock(ctx, key, owner, archivePinLease)
+		return err
+	}
+	var err error
+	if gcTrace {
+		err = archiveGCTrace(ctx, "remote-lock", acquire)
+	} else {
+		err = acquire()
+	}
 	if err != nil {
 		return err
 	}
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if !gcTrace {
+		workCtx = context.WithValue(workCtx, publicationLeaseContextKey{}, *lock)
+	}
 	var lockMu sync.Mutex
 	current := lock
 	renewErr := make(chan error, 1)
@@ -1267,7 +1788,7 @@ func (m *Manager) withGCLock(ctx context.Context, owner string, work func(contex
 				return
 			case <-ticker.C:
 				lockMu.Lock()
-				next, err := m.renewGCLock(workCtx, current, archivePinLease)
+				next, err := m.renewArchiveLock(workCtx, key, current, archivePinLease)
 				if err == nil {
 					current = next
 				}
@@ -1284,16 +1805,52 @@ func (m *Manager) withGCLock(ctx context.Context, owner string, work func(contex
 		}
 	}()
 	err = work(workCtx)
+	if !gcTrace && err == nil {
+		// A lease that expired during an in-flight HEAD write cannot turn an
+		// ambiguous publication into a reported durable success.
+		err = m.confirmPublicationLease(workCtx)
+	}
 	cancel()
 	<-done
 	lockMu.Lock()
 	lock = current
 	lockMu.Unlock()
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	releaseErr := m.releaseGCLock(releaseCtx, lock)
+	// The release keeps its own fresh background deadline and cancellation. It
+	// carries only the archive Busy observer so a release-side Busy return stays
+	// attributable; no other value, deadline, or lock policy crosses over.
+	releaseCtx = localtesthooks.CarryArchiveBusyObserver(releaseCtx, ctx)
+	release := func() error { return m.releaseArchiveLock(releaseCtx, key, lock) }
+	var releaseErr error
+	if gcTrace {
+		releaseErr = archiveGCTrace(ctx, "lock-release", release)
+	} else {
+		releaseErr = release()
+	}
 	releaseCancel()
-	if err == nil && releaseErr != nil && !errors.Is(releaseErr, ErrArchiveBusy) {
+	if err == nil && releaseErr != nil && (!gcTrace || !errors.Is(releaseErr, ErrArchiveBusy)) {
 		err = releaseErr
+	} else if gcTrace && errors.Is(releaseErr, ErrArchiveBusy) {
+		m.traceArchiveBusy(ctx, owner, key, "release_mismatch_or_conflict", "suppressed", true)
+	}
+	if errors.Is(releaseErr, ErrArchiveBusy) && !gcTrace {
+		m.traceArchiveBusy(releaseCtx, owner, key, "release_mismatch_or_conflict", "terminal", true)
+	}
+	// Only a cleanly released, live-pin refusal can be deferred by the
+	// certified-checkpoint caller. Preserve any concurrent lease or context
+	// failure as a distinct, terminal outcome.
+	if err == ErrActiveRecoveryPin {
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+		select {
+		case renewFailure := <-renewErr:
+			err = errors.Join(err, renewFailure)
+		default:
+		}
+		if ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
 	}
 	if err == nil {
 		select {
@@ -1306,16 +1863,25 @@ func (m *Manager) withGCLock(ctx context.Context, owner string, work func(contex
 }
 
 func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Duration) (*archiveGCLock, error) {
+	return m.acquireArchiveLock(ctx, m.gcLockKey(), owner, lease)
+}
+
+func (m *Manager) acquireArchiveLock(ctx context.Context, key, owner string, lease time.Duration) (*archiveGCLock, error) {
 	if owner == "" || lease <= 0 {
+		m.traceArchiveBusy(ctx, owner, key, "invalid_admission", "site", false)
 		return nil, ErrArchiveBusy
 	}
 	for range maxPublishRetries {
-		current, err := m.readGCLock(objmetrics.WithExpectedNotFound(ctx))
+		current, err := m.readArchiveLock(objmetrics.WithExpectedNotFound(ctx), key)
 		if err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			return nil, err
 		}
 		now := time.Now()
 		if err == nil && current.LeaseUntilMS > now.UnixMilli() {
+			m.traceArchiveBusy(ctx, owner, key, "active_live_lease", "site", false)
+			if key == m.gcLockKey() {
+				return nil, ErrActiveGCLock
+			}
 			return nil, ErrArchiveBusy
 		}
 		lock := archiveGCLock{OwnerID: owner, Generation: 1, LeaseUntilMS: now.Add(lease).UnixMilli()}
@@ -1324,28 +1890,35 @@ func (m *Manager) acquireGCLock(ctx context.Context, owner string, lease time.Du
 			lock.Generation = current.Generation + 1
 			options = []objstore.ObjectUploadOption{objstore.WithIfMatch(current.version)}
 		}
-		if err := m.writeGCLock(ctx, lock, options...); err != nil {
+		if err := m.writeArchiveLock(ctx, key, lock, options...); err != nil {
 			if m.bucket.IsConditionNotMetErr(err) {
 				continue
 			}
 			return nil, err
 		}
-		return m.confirmGCLock(ctx, lock)
+		return m.confirmArchiveLock(ctx, key, lock, false)
 	}
+	m.traceArchiveBusy(ctx, owner, key, "conditional_exhausted", "site", false)
 	return nil, ErrArchiveBusy
 }
 
 func (m *Manager) releaseGCLock(ctx context.Context, lock *archiveGCLock) error {
-	current, err := m.readGCLock(ctx)
+	return m.releaseArchiveLock(ctx, m.gcLockKey(), lock)
+}
+
+func (m *Manager) releaseArchiveLock(ctx context.Context, key string, lock *archiveGCLock) error {
+	current, err := m.readArchiveLock(ctx, key)
 	if err != nil {
 		return err
 	}
 	if lock == nil || current.OwnerID != lock.OwnerID || current.Generation != lock.Generation {
+		m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 		return ErrArchiveBusy
 	}
 	current.LeaseUntilMS = time.Now().UnixMilli()
-	if err := m.writeGCLock(ctx, *current, objstore.WithIfMatch(current.version)); err != nil {
+	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
 		if m.bucket.IsConditionNotMetErr(err) {
+			m.traceArchiveBusy(ctx, "unknown", key, "release_mismatch_or_conflict", "site", true)
 			return ErrArchiveBusy
 		}
 		return err
@@ -1354,30 +1927,42 @@ func (m *Manager) releaseGCLock(ctx context.Context, lock *archiveGCLock) error 
 }
 
 func (m *Manager) renewGCLock(ctx context.Context, lock *archiveGCLock, lease time.Duration) (*archiveGCLock, error) {
+	return m.renewArchiveLock(ctx, m.gcLockKey(), lock, lease)
+}
+
+func (m *Manager) renewArchiveLock(ctx context.Context, key string, lock *archiveGCLock, lease time.Duration) (*archiveGCLock, error) {
 	if lock == nil || lease <= 0 {
+		m.traceArchiveBusy(ctx, "unknown", key, "renew_invalid", "site", true)
 		return nil, ErrArchiveBusy
 	}
-	current, err := m.readGCLock(ctx)
+	current, err := m.readArchiveLock(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	if current.OwnerID != lock.OwnerID || current.Generation != lock.Generation || current.LeaseUntilMS <= time.Now().UnixMilli() {
+		m.traceArchiveBusy(ctx, "unknown", key, "renew_mismatch_or_expired", "site", true)
 		return nil, ErrArchiveBusy
 	}
 	current.LeaseUntilMS = time.Now().Add(lease).UnixMilli()
-	if err := m.writeGCLock(ctx, *current, objstore.WithIfMatch(current.version)); err != nil {
+	if err := m.writeArchiveLock(ctx, key, *current, objstore.WithIfMatch(current.version)); err != nil {
 		if m.bucket.IsConditionNotMetErr(err) {
+			m.traceArchiveBusy(ctx, "unknown", key, "renew_mismatch_or_conflict", "site", true)
 			return nil, ErrArchiveBusy
 		}
 		return nil, err
 	}
-	return m.confirmGCLock(ctx, *current)
+	return m.confirmArchiveLock(ctx, key, *current, true)
 }
 
 func (m *Manager) confirmGCLock(ctx context.Context, expected archiveGCLock) (*archiveGCLock, error) {
-	stored, err := m.readGCLock(ctx)
+	return m.confirmArchiveLock(ctx, m.gcLockKey(), expected, false)
+}
+
+func (m *Manager) confirmArchiveLock(ctx context.Context, key string, expected archiveGCLock, entered bool) (*archiveGCLock, error) {
+	stored, err := m.readArchiveLock(ctx, key)
 	if err != nil {
 		if m.bucket.IsObjNotFoundErr(err) {
+			m.traceArchiveBusy(ctx, "unknown", key, "confirm_missing", "site", entered)
 			return nil, ErrArchiveBusy
 		}
 		return nil, err
@@ -1385,13 +1970,17 @@ func (m *Manager) confirmGCLock(ctx context.Context, expected archiveGCLock) (*a
 	observed := *stored
 	observed.version, expected.version = nil, nil
 	if observed != expected || observed.LeaseUntilMS <= time.Now().UnixMilli() {
+		m.traceArchiveBusy(ctx, "unknown", key, "confirm_mismatch_or_expired", "site", entered)
 		return nil, ErrArchiveBusy
 	}
 	return stored, nil
 }
 
 func (m *Manager) readGCLock(ctx context.Context) (*archiveGCLock, error) {
-	key := m.gcLockKey()
+	return m.readArchiveLock(ctx, m.gcLockKey())
+}
+
+func (m *Manager) readArchiveLock(ctx context.Context, key string) (*archiveGCLock, error) {
 	attributes, data, _, err := m.readStableObject(ctx, key, nil, false, maxHeadSize)
 	if err != nil {
 		return nil, err
@@ -1408,12 +1997,16 @@ func (m *Manager) readGCLock(ctx context.Context) (*archiveGCLock, error) {
 }
 
 func (m *Manager) writeGCLock(ctx context.Context, lock archiveGCLock, options ...objstore.ObjectUploadOption) error {
+	return m.writeArchiveLock(ctx, m.gcLockKey(), lock, options...)
+}
+
+func (m *Manager) writeArchiveLock(ctx context.Context, key string, lock archiveGCLock, options ...objstore.ObjectUploadOption) error {
 	lock.version = nil
 	data, err := json.Marshal(lock)
 	if err != nil {
 		return err
 	}
-	return m.bucket.Upload(ctx, m.gcLockKey(), bytes.NewReader(data), options...)
+	return m.bucket.Upload(ctx, key, bytes.NewReader(data), options...)
 }
 
 func (m *Manager) readRecoveryPin(ctx context.Context, key string) (*archiveRecoveryPin, error) {
@@ -1472,9 +2065,14 @@ func (m *Manager) maxActiveRecoveryGeneration(ctx context.Context) (uint64, erro
 			return nil
 		}
 		if pin.LeaseUntilMS <= now {
+			// The stored lease is already past its expiry. Report the observed
+			// classification before the tombstone write, using only the record the
+			// guard already read.
+			m.traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
 			pin.LeaseUntilMS = 0
 			if err := m.writeRecoveryPin(ctx, key, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 				if m.bucket.IsConditionNotMetErr(err) {
+					m.traceArchiveBusy(ctx, "unknown", m.key("archive/recovery-pins"), "pin_expiry_conflict", "site", true)
 					return ErrArchiveBusy
 				}
 				return err
@@ -1502,16 +2100,28 @@ func (m *Manager) hasActiveRecoveryPins(ctx context.Context) (bool, error) {
 			return nil
 		}
 		if pin.LeaseUntilMS <= now {
+			// The stored lease is already past its expiry. Report the observed
+			// classification from the record the guard already read, before the
+			// tombstone write.
+			m.traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
 			pin.LeaseUntilMS = 0
 			if err := m.writeRecoveryPin(ctx, key, *pin, objstore.WithIfMatch(pin.version)); err != nil {
 				if m.bucket.IsConditionNotMetErr(err) {
+					m.traceArchiveBusy(ctx, "unknown", m.key("archive/recovery-pins"), "pin_expiry_conflict", "site", true)
+					m.traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteCondMet)
 					return ErrArchiveBusy
 				}
+				m.traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteUnknown)
 				return err
 			}
+			m.traceRecoveryPinWrite(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinWriteOK)
 			return nil
 		}
 		active = true
+		// This is the exact pin that made the guard report an active recovery
+		// pin. The guard cannot know which caller created it.
+		m.traceRecoveryPinRead(ctx, key, localtesthooks.RecoveryPinGuardRead, localtesthooks.RecoveryPinReadOK)
+		m.traceRecoveryPin(ctx, key, localtesthooks.RecoveryPinGuardRead, *pin)
 		return nil
 	})
 	return active, err
@@ -1521,9 +2131,25 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 	if len(refs) < 2 {
 		return refs, nil
 	}
-	result := make([]Extent, 0, len(refs))
+	return m.compactExtentsFrom(ctx, refs, prefix, nil)
+}
+
+// compactExtentsFrom resumes a validated packing decision at its last group.
+// An appended decision can still change that group, so it is copied and
+// repacked; earlier complete groups remain immutable within this Cleanup call.
+func (m *Manager) compactExtentsFrom(ctx context.Context, refs []Extent, prefix [32]byte, packed []Extent) ([]Extent, error) {
+	result := make([]Extent, 0, len(packed)+len(refs))
 	var current Extent
 	encodedDecisions := 0
+	if len(packed) != 0 {
+		result = append(result, packed[:len(packed)-1]...)
+		current = packed[len(packed)-1]
+		current.Decisions = slices.Clone(current.Decisions)
+		prefix = current.EndPrefix
+		for _, decision := range current.Decisions {
+			encodedDecisions += archiveDecisionSize(decision)
+		}
+	}
 	flush := func() {
 		if len(current.Decisions) != 0 {
 			result = append(result, current)
@@ -1566,6 +2192,34 @@ func (m *Manager) compactExtents(ctx context.Context, refs []Extent, prefix [32]
 	}
 	flush()
 	return result, nil
+}
+
+func archiveRefPrefixEqual(refs, prefix []Extent) bool {
+	if len(prefix) == 0 || len(refs) < len(prefix) {
+		return false
+	}
+	for i, old := range prefix {
+		ref := refs[i]
+		if ref.ConfigID != old.ConfigID || ref.Start != old.Start || ref.End != old.End ||
+			ref.StartPrefix != old.StartPrefix || ref.EndPrefix != old.EndPrefix ||
+			ref.PreviousHash != old.PreviousHash || ref.PreviousObject != old.PreviousObject ||
+			ref.hash != old.hash || ref.object != old.object {
+			return false
+		}
+	}
+	return true
+}
+
+func canReuseCleanupCompaction(ctx context.Context, configID uint, head, previous archiveHead, refs, previousRefs, packed []Extent) bool {
+	return ctx.Err() == nil && !head.Sealed && head.ConfigID == configID && len(packed) != 0 &&
+		archiveBaseEqual(head, previous) && archiveRefPrefixEqual(refs, previousRefs)
+}
+
+// The candidate hash is encoded using the current predecessor immediately
+// before this check. Keep the acknowledged object's identity, not a fictitious
+// copy in the new generation.
+func canReuseCleanupUpload(hash [32]byte, saved Extent, currentGeneration uint64) bool {
+	return saved.hash == hash && saved.object != 0 && saved.object <= currentGeneration
 }
 
 func archiveHeadsEqual(a, b archiveHead) bool {

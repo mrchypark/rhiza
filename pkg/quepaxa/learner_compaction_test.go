@@ -3,7 +3,9 @@ package quepaxa
 import (
 	"context"
 	"crypto/sha256"
+	"slices"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/qlog"
 )
@@ -46,6 +48,31 @@ func TestPromotedLearnerVotesAfterMembershipBaseRestart(t *testing.T) {
 	membership, err := cores["a"].CheckpointMembership(index)
 	if err != nil {
 		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for id, core := range cores {
+		if err := core.WaitTip(ctx, index); err != nil {
+			t.Fatalf("core %s did not reach checkpoint index %d: %v", id, index, err)
+		}
+		gotPrefix, ok := core.PrefixHash(index)
+		if !ok || gotPrefix != prefix {
+			t.Fatalf("core %s checkpoint prefix at %d = %x, present=%v; want %x", id, index, gotPrefix, ok, prefix)
+		}
+		gotNext, gotFollowing, err := core.CheckpointLeaderOrders(index)
+		if err != nil {
+			t.Fatalf("core %s checkpoint leader orders at %d: %v", id, index, err)
+		}
+		if !slices.Equal(gotNext, next) || !slices.Equal(gotFollowing, following) {
+			t.Fatalf("core %s checkpoint leader orders at %d = %v/%v; want %v/%v", id, index, gotNext, gotFollowing, next, following)
+		}
+		gotMembership, err := core.CheckpointMembership(index)
+		if err != nil {
+			t.Fatalf("core %s checkpoint membership at %d: %v", id, index, err)
+		}
+		if !sameMembershipRecord(gotMembership, membership) {
+			t.Fatalf("core %s checkpoint membership at %d does not match seal membership", id, index)
+		}
 	}
 	seal := CheckpointSeal{
 		ConfigID: 2, Index: index,

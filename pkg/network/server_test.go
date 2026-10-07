@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
@@ -604,6 +605,82 @@ func TestCatchUpCompactionTriggersHandler(t *testing.T) {
 	}
 }
 
+func TestFetchDecisionsWithRetryPreservesTerminalCompaction(t *testing.T) {
+	calls := 0
+	got, err := fetchDecisionsWithRetry(context.Background(), func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (DecisionsResponse, error) {
+		calls++
+		if calls == 1 {
+			return DecisionsResponse{}, quepaxa.ErrCompacted
+		}
+		return DecisionsResponse{}, context.DeadlineExceeded
+	}, "source", 1)
+	if !errors.Is(err, quepaxa.ErrCompacted) {
+		t.Fatalf("fetch error = %v, want terminal %v", err, quepaxa.ErrCompacted)
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 after terminal compaction", calls)
+	}
+	if len(got.Decisions) != 0 {
+		t.Fatalf("unexpected decisions after compaction: %d", len(got.Decisions))
+	}
+}
+
+func TestFetchDecisionsWithRetryRetriesTransientError(t *testing.T) {
+	calls := 0
+	want := DecisionsResponse{Tip: 1}
+	got, err := fetchDecisionsWithRetry(context.Background(), func(context.Context, quepaxa.NodeID, quepaxa.Slot, int) (DecisionsResponse, error) {
+		calls++
+		if calls == 1 {
+			return DecisionsResponse{}, errors.New("temporary transport error")
+		}
+		return want, nil
+	}, "source", 1)
+	if err != nil {
+		t.Fatalf("fetch error = %v, want nil", err)
+	}
+	if calls != 2 {
+		t.Fatalf("fetch calls = %d, want 2", calls)
+	}
+	if got.Tip != want.Tip {
+		t.Fatalf("response tip = %d, want %d", got.Tip, want.Tip)
+	}
+}
+
+func TestFetchDecisionsWithRetryHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	_, err := fetchDecisionsWithRetry(ctx, func(ctx context.Context, _ quepaxa.NodeID, _ quepaxa.Slot, _ int) (DecisionsResponse, error) {
+		calls++
+		return DecisionsResponse{}, ctx.Err()
+	}, "source", 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fetch error = %v, want %v", err, context.Canceled)
+	}
+	if calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 after cancellation", calls)
+	}
+}
+
+func TestCatchUpFetchCompactionTriggersHandler(t *testing.T) {
+	server := &Server{}
+	calls := 0
+	server.SetCompactedHandler(func() { calls++ })
+	if err := server.handleCatchUpFetchError(quepaxa.ErrCompacted); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("catch-up error = %v, want %v", err, ErrNotReady)
+	}
+	if calls != 1 {
+		t.Fatalf("compacted handler calls = %d, want 1", calls)
+	}
+
+	if err := server.handleCatchUpFetchError(context.DeadlineExceeded); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if calls != 1 {
+		t.Fatalf("compacted handler calls after timeout = %d, want 1", calls)
+	}
+}
+
 func TestAcceptFromPersistsReturnedCertifiedDecision(t *testing.T) {
 	member := quepaxa.Member{ID: "n1"}
 	members := []quepaxa.Member{member}
@@ -921,6 +998,650 @@ func TestLocalProposalAdmissionRejectsBeyondBackgroundLimit(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestLocalProposalAdmissionSharedWithCheckpointBarrierAndKV(t *testing.T) {
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	openGate := func() { releaseOnce.Do(func() { close(release) }) }
+	defer openGate()
+	entered := make(chan struct{}, maxLocalProposals)
+	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	results := make(chan error, maxLocalProposals)
+	for i := range maxLocalProposals - 1 {
+		go func(i int) {
+			var nonce [types.ReadBarrierNonceSize]byte
+			nonce[0] = byte(i + 1)
+			_, err := server.propose(ctx, types.EncodeReadBarrier(nonce))
+			results <- err
+		}(i)
+	}
+	for range maxLocalProposals - 1 {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatal("read barriers did not reach durability gate:", ctx.Err())
+		}
+	}
+	go func() {
+		var nonce [types.ReadBarrierNonceSize]byte
+		nonce[0] = 8
+		_, err := server.ProposeCheckpointBarrier(ctx, types.EncodeReadBarrier(nonce))
+		results <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("checkpoint barrier did not reach durability gate:", ctx.Err())
+	}
+	if gotLocal, gotOperations := len(server.localCap), len(server.operationCap); gotLocal != maxLocalProposals || gotOperations != maxLocalProposals {
+		t.Fatalf("held permits local=%d operations=%d, want %d each", gotLocal, gotOperations, maxLocalProposals)
+	}
+	req := KVMutationRequest{RequestID: "same-request-after-capacity", Key: "shared-capacity", Value: []byte("durable-value")}
+	commands := []types.KVCommand{
+		{RequestID: req.RequestID, Operation: "put", Key: req.Key, Value: req.Value},
+		{RequestID: "second-rejected-item", Operation: "put", Key: "second-key", Value: []byte("second-value")},
+	}
+	items := make([]*batchItem, len(commands))
+	encoded := make([][]byte, len(commands))
+	var leases []*mutationLease
+	defer func() {
+		for _, lease := range leases {
+			lease.releaseCaller()
+			lease.releaseWorker()
+		}
+	}()
+	for i, command := range commands {
+		charge, err := mutationCharge(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := server.admitMutation(charge)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases = append(leases, lease)
+		encoded[i], err = types.EncodeKVBatchItem(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !lease.transfer() {
+			t.Fatal("KV batch item lease did not transfer")
+		}
+		items[i] = &batchItem{ctx: ctx, requestID: command.RequestID, result: make(chan batchResult, 1), lease: lease}
+	}
+	tipBeforeRejectedBatch := core.Tip()
+	server.kvBatcher.execute(items, types.AssembleKVBatch(encoded))
+	for i, item := range items {
+		result := <-item.result
+		if result.slot != 0 || !errors.Is(result.err, ErrOverloaded) || errors.Is(result.err, ErrCommitUnknown) {
+			t.Fatalf("batch item %d slot=%d error=%v, want typed slot-zero overload", i, result.slot, result.err)
+		}
+		if _, ok := result.err.(proposalAdmissionOverload); !ok {
+			t.Fatalf("batch item %d error=%T, want direct pre-admission type", i, result.err)
+		}
+		if receipt, found, err := material.MutationReceipt(ctx, types.MutationKV, commands[i].RequestID); err != nil || found {
+			t.Fatalf("batch item %d receipt=%+v found=%t err=%v, want absent", i, receipt, found, err)
+		}
+	}
+	if core.Tip() != tipBeforeRejectedBatch {
+		t.Fatalf("rejected batch advanced tip from %d to %d", tipBeforeRejectedBatch, core.Tip())
+	}
+	server.mutationMu.Lock()
+	admittedCount, admittedBytes := server.mutationAdmission.count, server.mutationAdmission.bytes
+	server.mutationMu.Unlock()
+	if admittedCount != 0 || admittedBytes != 0 {
+		t.Fatalf("rejected batch retained mutation leases: count=%d bytes=%d", admittedCount, admittedBytes)
+	}
+	if _, err := server.KVPut(ctx, req); !errors.Is(err, ErrOverloaded) || errors.Is(err, ErrCommitUnknown) {
+		t.Fatalf("pre-admission KVPut error=%v, want overload without unknown commit", err)
+	} else {
+		if _, ok := err.(proposalAdmissionOverload); !ok {
+			t.Fatalf("pre-admission KVPut error=%T %v, want direct typed refusal", err, err)
+		}
+	}
+	if receipt, found, err := material.MutationReceipt(ctx, types.MutationKV, req.RequestID); err != nil || found {
+		t.Fatalf("pre-admission receipt=%+v found=%t err=%v, want absent", receipt, found, err)
+	}
+	if gotLocal, gotOperations := len(server.localCap), len(server.operationCap); gotLocal != maxLocalProposals || gotOperations != maxLocalProposals {
+		t.Fatalf("rejected PUT changed held permits: local=%d operations=%d", gotLocal, gotOperations)
+	}
+	openGate()
+	for range maxLocalProposals {
+		select {
+		case err := <-results:
+			if err != nil {
+				t.Fatal("held proposal:", err)
+			}
+		case <-ctx.Done():
+			t.Fatal("held proposals did not drain:", ctx.Err())
+		}
+	}
+	if gotLocal, gotOperations := len(server.localCap), len(server.operationCap); gotLocal != 0 || gotOperations != 0 {
+		t.Fatalf("drained permits local=%d operations=%d, want zero", gotLocal, gotOperations)
+	}
+	receipt, err := server.KVPut(ctx, req)
+	if err != nil || !receipt.Applied || receipt.Slot == 0 {
+		t.Fatalf("same-ID retry receipt=%+v err=%v, want one durable applied receipt", receipt, err)
+	}
+	stored, found, err := material.MutationReceipt(ctx, types.MutationKV, req.RequestID)
+	if err != nil || !found || stored != receipt.MutationReceipt {
+		t.Fatalf("stored receipt=%+v found=%t err=%v, want %+v", stored, found, err, receipt.MutationReceipt)
+	}
+	got, err := server.KVGet(ctx, KVGetRequest{Key: req.Key})
+	if err != nil || !got.Found || !bytes.Equal(got.Value, req.Value) {
+		t.Fatalf("durable value=%+v err=%v, want %q", got, err, req.Value)
+	}
+	if duplicate, err := server.KVPut(ctx, req); err != nil || duplicate.MutationReceipt != receipt.MutationReceipt || core.Tip() != quepaxa.Slot(receipt.Slot) {
+		t.Fatalf("same-ID receipt=%+v err=%v tip=%d, want stable slot %d", duplicate, err, core.Tip(), receipt.Slot)
+	}
+	server.mutationMu.Lock()
+	admittedCount, admittedBytes = server.mutationAdmission.count, server.mutationAdmission.bytes
+	server.mutationMu.Unlock()
+	if admittedCount != 0 || admittedBytes != 0 {
+		t.Fatalf("completed PUT retained mutation leases: count=%d bytes=%d", admittedCount, admittedBytes)
+	}
+}
+
+func TestInternalBatchAdmissionWaitsForReleaseWithoutChangingDirectRefusal(t *testing.T) {
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	server.proposeMu.Lock()
+	for range cap(server.localCap) {
+		server.localCap <- struct{}{}
+		server.operationCap <- struct{}{}
+	}
+	server.proposalWG.Add(1)
+	server.proposeMu.Unlock()
+	var heldRelease sync.Once
+	releaseHeld := func() { heldRelease.Do(server.releaseProposalAttempt) }
+	defer func() {
+		releaseHeld()
+		server.proposeMu.Lock()
+		for len(server.localCap) > 0 {
+			<-server.localCap
+			<-server.operationCap
+		}
+		server.proposeMu.Unlock()
+	}()
+	value := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{91})
+	if slot, err := server.propose(ctx, value); slot != 0 || !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("direct admission slot=%d err=%v, want immediate overload", slot, err)
+	}
+	type outcome struct {
+		slot quepaxa.Slot
+		err  error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		slot, err := server.kvBatcher.propose(ctx, value)
+		result <- outcome{slot, err}
+	}()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		server.proposeMu.Lock()
+		waiting := server.admissionWaiters
+		server.proposeMu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		select {
+		case got := <-result:
+			t.Fatalf("batch returned before release: %+v", got)
+		case <-tick.C:
+		case <-ctx.Done():
+			t.Fatal("batch did not wait:", ctx.Err())
+		}
+	}
+	releaseHeld()
+	select {
+	case got := <-result:
+		if got.err != nil || got.slot == 0 {
+			t.Fatalf("batch admission after release: %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("batch did not complete:", ctx.Err())
+	}
+	server.proposeMu.Lock()
+	waiting := server.admissionWaiters
+	server.proposeMu.Unlock()
+	if waiting != 0 {
+		t.Fatalf("admission waiters=%d, want zero", waiting)
+	}
+	server.proposeMu.Lock()
+	for len(server.localCap) < cap(server.localCap) {
+		server.localCap <- struct{}{}
+		server.operationCap <- struct{}{}
+	}
+	server.proposeMu.Unlock()
+	if slot, err := server.proposeBatch(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{92}), 20*time.Millisecond, 5*time.Second); slot != 0 {
+		t.Fatalf("expired admission slot=%d err=%v", slot, err)
+	} else if _, ok := err.(proposalAdmissionOverload); !ok {
+		t.Fatalf("expired admission error=%T %v, want direct pre-admission overload", err, err)
+	}
+	cancelCtx, stop := context.WithCancel(ctx)
+	canceled := make(chan outcome, 1)
+	go func() {
+		slot, err := server.proposeBatch(cancelCtx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{93}), 2*time.Second, 5*time.Second)
+		canceled <- outcome{slot, err}
+	}()
+	for {
+		server.proposeMu.Lock()
+		waiting := server.admissionWaiters
+		server.proposeMu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		select {
+		case got := <-canceled:
+			t.Fatalf("cancelable admission returned early: %+v", got)
+		case <-tick.C:
+		case <-ctx.Done():
+			t.Fatal("cancelable admission did not wait:", ctx.Err())
+		}
+	}
+	stop()
+	select {
+	case got := <-canceled:
+		if got.slot != 0 || !errors.Is(got.err, context.Canceled) || errors.Is(got.err, ErrCommitUnknown) {
+			t.Fatalf("canceled admission=%+v, want unaccepted cancellation", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("cancelable admission did not stop:", ctx.Err())
+	}
+	closed := make(chan outcome, 1)
+	go func() {
+		slot, err := server.proposeBatch(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{94}), 2*time.Second, 5*time.Second)
+		closed <- outcome{slot, err}
+	}()
+	for {
+		server.proposeMu.Lock()
+		waiting := server.admissionWaiters
+		server.proposeMu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		select {
+		case got := <-closed:
+			t.Fatalf("closing admission returned early: %+v", got)
+		case <-tick.C:
+		case <-ctx.Done():
+			t.Fatal("closing admission did not wait:", ctx.Err())
+		}
+	}
+	server.Close()
+	select {
+	case got := <-closed:
+		if got.slot != 0 || !errors.Is(got.err, ErrNotReady) {
+			t.Fatalf("closed admission=%+v, want ErrNotReady", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("closed admission did not stop:", ctx.Err())
+	}
+}
+
+func waitForAdmissionWaiters(t *testing.T, ctx context.Context, server *Server, want int) {
+	t.Helper()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		server.proposeMu.Lock()
+		got := server.admissionWaiters
+		server.proposeMu.Unlock()
+		if got == want {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-ctx.Done():
+			t.Fatalf("admission waiters=%d, want %d: %v", got, want, ctx.Err())
+		}
+	}
+}
+
+func TestInternalBatchAdmissionByteReleaseAndQuiesce(t *testing.T) {
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	server.proposeMu.Lock()
+	server.localB = maxInflightEncodedByte
+	server.proposeMu.Unlock()
+	type outcome struct {
+		slot quepaxa.Slot
+		err  error
+	}
+	result := make(chan outcome, 1)
+	go func() {
+		slot, err := server.proposeBatch(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{95}), 2*time.Second, 5*time.Second)
+		result <- outcome{slot, err}
+	}()
+	waitForAdmissionWaiters(t, ctx, server, 1)
+	server.proposeMu.Lock()
+	server.localB = 0
+	server.signalAdmissionLocked(false)
+	server.proposeMu.Unlock()
+	select {
+	case got := <-result:
+		if got.err != nil || got.slot == 0 {
+			t.Fatalf("byte release admission=%+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("byte release did not resume:", ctx.Err())
+	}
+	server.proposeMu.Lock()
+	for range cap(server.localCap) {
+		server.localCap <- struct{}{}
+		server.operationCap <- struct{}{}
+	}
+	server.proposeMu.Unlock()
+	defer func() {
+		server.proposeMu.Lock()
+		for len(server.localCap) > 0 {
+			<-server.localCap
+			<-server.operationCap
+		}
+		server.proposeMu.Unlock()
+	}()
+	go func() {
+		slot, err := server.proposeBatch(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{96}), 2*time.Second, 5*time.Second)
+		result <- outcome{slot, err}
+	}()
+	waitForAdmissionWaiters(t, ctx, server, 1)
+	unquiesce, err := server.Quiesce(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unquiesce()
+	select {
+	case got := <-result:
+		if got.slot != 0 || !errors.Is(got.err, ErrNotReady) {
+			t.Fatalf("quiesce-invalidated admission=%+v, want ErrNotReady", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("quiesce did not invalidate waiter:", ctx.Err())
+	}
+}
+
+func TestInternalBatchAdmissionDoesNotWakeOnRegistrationAndJoinsInflight(t *testing.T) {
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	entered := make(chan struct{}, 2)
+	server.SetDurabilityBarrier(func(ctx context.Context, _ quepaxa.Slot) error {
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	server.proposeMu.Lock()
+	for range cap(server.localCap) {
+		server.localCap <- struct{}{}
+		server.operationCap <- struct{}{}
+	}
+	server.proposeMu.Unlock()
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		server.proposalWG.Wait()
+		server.proposeMu.Lock()
+		for len(server.localCap) > 0 {
+			<-server.localCap
+			<-server.operationCap
+		}
+		server.proposeMu.Unlock()
+	}()
+	type outcome struct {
+		slot quepaxa.Slot
+		err  error
+	}
+	valueA := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{101})
+	valueB := types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{102})
+	waitA, waitB, direct := make(chan outcome, 1), make(chan outcome, 1), make(chan outcome, 1)
+	go func() {
+		slot, err := server.proposeBatch(ctx, valueA, 2*time.Second, 5*time.Second)
+		waitA <- outcome{slot, err}
+	}()
+	go func() {
+		slot, err := server.proposeBatch(ctx, valueB, 2*time.Second, 5*time.Second)
+		waitB <- outcome{slot, err}
+	}()
+	waitForAdmissionWaiters(t, ctx, server, 2)
+	server.proposeMu.Lock()
+	changed := server.admissionChanged
+	<-server.localCap
+	<-server.operationCap
+	server.proposeMu.Unlock()
+	go func() {
+		slot, err := server.propose(ctx, valueA)
+		direct <- outcome{slot, err}
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("direct proposal did not reach durability:", ctx.Err())
+	}
+	server.proposeMu.Lock()
+	waiting := server.admissionWaiters
+	server.proposeMu.Unlock()
+	select {
+	case <-changed:
+		t.Fatal("new registration woke capacity waiters")
+	default:
+	}
+	if waiting != 2 {
+		t.Fatalf("waiters after registration=%d, want 2", waiting)
+	}
+	server.proposeMu.Lock()
+	<-server.localCap
+	<-server.operationCap
+	server.signalAdmissionLocked(false)
+	server.proposeMu.Unlock()
+	waitForAdmissionWaiters(t, ctx, server, 0)
+	releaseOnce.Do(func() { close(release) })
+	var first, joined, second outcome
+	select {
+	case first = <-direct:
+	case <-ctx.Done():
+		t.Fatal("direct proposal did not finish:", ctx.Err())
+	}
+	select {
+	case joined = <-waitA:
+	case <-ctx.Done():
+		t.Fatal("same-hash waiter did not join:", ctx.Err())
+	}
+	select {
+	case second = <-waitB:
+	case <-ctx.Done():
+		t.Fatal("second waiter did not finish:", ctx.Err())
+	}
+	if first.err != nil || joined.err != nil || second.err != nil || first.slot == 0 || joined.slot != first.slot || second.slot == 0 {
+		t.Fatalf("direct=%+v same-hash=%+v other=%+v", first, joined, second)
+	}
+}
+
+func TestInternalBatchAdmissionTaggedObserverAndDirectControlIsolation(t *testing.T) {
+	if !localtesthooks.Enabled {
+		t.Skip("observer is compiled out")
+	}
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var events []localtesthooks.BatchAdmissionEvent
+	restore := localtesthooks.SetBatchAdmission(func(event localtesthooks.BatchAdmissionEvent) {
+		events = append(events, event)
+	})
+	defer restore()
+	if slot, err := server.propose(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{111})); err != nil || slot == 0 {
+		t.Fatalf("direct proposal slot=%d err=%v", slot, err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("direct/control path emitted %d batch events", len(events))
+	}
+	batchCallbacks := []func(context.Context, []byte) (quepaxa.Slot, error){server.kvBatcher.propose, server.sqlBatcher.propose, server.graphBatcher.propose}
+	for i, propose := range batchCallbacks {
+		if slot, err := propose(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{byte(112 + i)})); err != nil || slot == 0 {
+			t.Fatalf("internal batch %d proposal slot=%d err=%v", i, slot, err)
+		}
+	}
+	if len(events) != len(batchCallbacks) {
+		t.Fatalf("accepted event count=%d, want %d", len(events), len(batchCallbacks))
+	}
+	for i, event := range events {
+		if event.Reason != localtesthooks.BatchAdmissionAccepted || !event.Durable || event.AcceptedToDurableNanos < 0 {
+			t.Fatalf("batch %d accepted event=%+v", i, event)
+		}
+	}
+	if slot, err := server.proposeBatch(ctx, make([]byte, maxInflightEncodedByte+1), 2*time.Second, 5*time.Second); slot != 0 {
+		t.Fatalf("static byte rejection slot=%d err=%v", slot, err)
+	} else if _, ok := err.(proposalAdmissionOverload); !ok {
+		t.Fatalf("static byte rejection error=%T %v", err, err)
+	}
+	if len(events) != len(batchCallbacks)+1 || events[len(events)-1].Reason != localtesthooks.BatchAdmissionByteRejected {
+		t.Fatalf("byte rejection aggregate=%+v", events)
+	}
+	server.proposeMu.Lock()
+	for range cap(server.localCap) {
+		server.localCap <- struct{}{}
+		server.operationCap <- struct{}{}
+	}
+	server.proposeMu.Unlock()
+	defer func() {
+		server.proposeMu.Lock()
+		for len(server.localCap) > 0 {
+			<-server.localCap
+			<-server.operationCap
+		}
+		server.proposeMu.Unlock()
+	}()
+	if slot, err := server.proposeBatch(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{113}), 20*time.Millisecond, 5*time.Second); slot != 0 {
+		t.Fatalf("expired internal batch slot=%d err=%v", slot, err)
+	} else if _, ok := err.(proposalAdmissionOverload); !ok {
+		t.Fatalf("expired internal batch error=%T %v", err, err)
+	}
+	last := len(events) - 1
+	if len(events) != len(batchCallbacks)+2 || events[last].Reason != localtesthooks.BatchAdmissionWaitBudgetExhausted || !events[last].Waited || events[last].Durable {
+		t.Fatalf("expired aggregate=%+v", events)
+	}
+	server.proposeMu.Lock()
+	for len(server.localCap) > 0 {
+		<-server.localCap
+		<-server.operationCap
+	}
+	server.proposeMu.Unlock()
+	server.SetDurabilityBarrier(func(context.Context, quepaxa.Slot) error {
+		return errors.New("test durability failure")
+	})
+	if _, err := server.kvBatcher.propose(ctx, types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{114})); err == nil {
+		t.Fatal("non-durable batch unexpectedly succeeded")
+	}
+	server.SetDurabilityBarrier(nil)
+	if len(events) != len(batchCallbacks)+3 || events[len(events)-1].Reason != localtesthooks.BatchAdmissionAccepted || events[len(events)-1].Durable || events[len(events)-1].AcceptedToDurableNanos != 0 {
+		t.Fatalf("non-durable aggregate=%+v", events)
+	}
+}
+
+func TestProposeWithLeaseMarksOnlyPreAdmissionCapacityRejections(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Server)
+	}{
+		{
+			name: "encoded-byte-budget",
+			setup: func(server *Server) {
+				server.proposeMu.Lock()
+				server.localB = maxInflightEncodedByte
+				server.proposeMu.Unlock()
+			},
+		},
+		{
+			name: "local-proposal-permits",
+			setup: func(server *Server) {
+				for range cap(server.localCap) {
+					server.localCap <- struct{}{}
+				}
+			},
+		},
+		{
+			name: "operation-permits",
+			setup: func(server *Server) {
+				for range cap(server.operationCap) {
+					server.operationCap <- struct{}{}
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+			material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer material.Close()
+			server := NewServer(core, material, "cluster", true, nil)
+			defer server.Close()
+			test.setup(server)
+
+			_, err = server.ProposeControl(context.Background(), types.EncodeReadBarrier([types.ReadBarrierNonceSize]byte{1}))
+			var admissionErr proposalAdmissionOverload
+			if !errors.As(err, &admissionErr) || !errors.Is(err, ErrOverloaded) || err.Error() != ErrOverloaded.Error() {
+				t.Fatalf("error=%v; want typed pre-admission overload with public sentinel text", err)
+			}
+		})
 	}
 }
 
