@@ -1,0 +1,225 @@
+# Root bootstraps namespace, rhiza-gcs KSA, opaque rhiza-qualification-auth
+# Secret, quota and server-side Chaos selector admission. No Secret is rendered.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rhiza-config
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__}
+data:
+  RHIZA_CLUSTER_ID: __CLUSTER_ID__
+  RHIZA_BIND_ADDR: 0.0.0.0:8081
+  RHIZA_PEER_ADDR: 0.0.0.0:9090
+  RHIZA_DATA_DIR: /data
+  RHIZA_OBJSTORE_PROVIDER: gcs
+  RHIZA_OBJSTORE_BUCKET: rhiza-v070-chaos-ied-20260811
+  RHIZA_OBJSTORE_PREFIX: postrelease/v0.19.0/__RUN_ID__/
+  RHIZA_OBJSTORE_DURABILITY: before-ack
+  RHIZA_OBJSTORE_MAX_RETRIES: "1"
+  RHIZA_CHECKPOINT_INTERVAL: 10s
+  RHIZA_OBJSTORE_SYNC_INTERVAL: 5s
+  RHIZA_OBJSTORE_GC_INTERVAL: 0s
+  RHIZA_ENABLE_RECONFIGURATION: "true"
+  GOMEMLIMIT: 384MiB
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-peers
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+  ports:
+    - {name: http, port: 8080}
+    - {name: recovery, port: 8081}
+    - {name: quic, port: 9090, protocol: UDP}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rhiza-voter
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__}
+spec:
+  serviceName: rhiza-peers
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy: {type: OnDelete}
+  selector:
+    matchLabels: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+  template:
+    metadata:
+      labels:
+        app: rhiza-voter
+        app.kubernetes.io/part-of: rhiza-chaos
+        chaos.rhiza.io/run: __RUN_ID__
+        chaos.rhiza.io/role: voter
+    spec:
+      serviceAccountName: rhiza-gcs
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: kubernetes.io/hostname, operator: In, values: [__NODE_A__, __NODE_B__, __NODE_C__]}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: rhiza
+          image: __HOST_IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+          envFrom:
+            - configMapRef: {name: rhiza-config}
+            - secretRef: {name: rhiza-qualification-auth}
+          env:
+            - name: RHIZA_NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: RHIZA_LEARNER, value: ""}
+            - {name: RHIZA_PEER_TOKEN, value: ""}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: recovery, containerPort: 8081}
+            - {name: quic, containerPort: 9090, protocol: UDP}
+          readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 2}
+          # No liveness/startup action can recreate a voter or discard its WAL.
+          resources:
+            requests: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}
+            limits: {cpu: 750m, memory: 512Mi, ephemeral-storage: 1Gi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes: [{name: data, emptyDir: {sizeLimit: 1Gi}}]
+---
+# Apply after non-writing probe's positive handshakes, before cold learner Open.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: learner-cold
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__}
+spec:
+  podSelector: {matchLabels: {app: rhiza-learner, chaos.rhiza.io/run: __RUN_ID__}}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports: [{protocol: TCP, port: 8080}, {protocol: TCP, port: 8081}]
+  egress:
+    - ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}, {protocol: TCP, port: 443}]
+    - to: [{ipBlock: {cidr: 169.254.169.254/32}}]
+      ports: [{protocol: TCP, port: 80}, {protocol: TCP, port: 8080}]
+    - to: [{ipBlock: {cidr: 169.254.169.252/32}}]
+      ports: [{protocol: TCP, port: 988}, {protocol: TCP, port: 987}]
+---
+# BEGIN COLD LEARNER
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-learner
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: rhiza-learner, chaos.rhiza.io/run: __RUN_ID__}
+  ports:
+    - {name: http, port: 8080}
+    - {name: recovery, port: 8081}
+    - {name: quic, port: 9090, protocol: UDP}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-learner
+  namespace: __NAMESPACE__
+  labels:
+    app: rhiza-learner
+    app.kubernetes.io/part-of: rhiza-chaos
+    chaos.rhiza.io/run: __RUN_ID__
+    chaos.rhiza.io/role: learner
+spec:
+  serviceAccountName: rhiza-gcs
+  automountServiceAccountToken: false
+  nodeName: __NODE_A__
+  restartPolicy: Never
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: rhiza
+      image: __HOST_IMAGE__
+      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+      envFrom:
+        - configMapRef: {name: rhiza-config}
+        - secretRef: {name: rhiza-qualification-auth}
+      env:
+        - {name: RHIZA_NODE_ID, value: rhiza-learner}
+        - {name: RHIZA_PEER_TOKENS, value: ""}
+        - name: RHIZA_PEER_TOKEN
+          valueFrom: {secretKeyRef: {name: rhiza-qualification-auth, key: learner_token}}
+        - name: RHIZA_LEARNER
+          valueFrom: {secretKeyRef: {name: rhiza-qualification-auth, key: learner_member}}
+      ports:
+        - {name: http, containerPort: 8080}
+        - {name: recovery, containerPort: 8081}
+        - {name: quic, containerPort: 9090, protocol: UDP}
+      resources:
+        requests: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}
+        limits: {cpu: 750m, memory: 512Mi, ephemeral-storage: 1Gi}
+      volumeMounts: [{name: data, mountPath: /data}]
+  volumes: [{name: data, emptyDir: {sizeLimit: 1Gi}}]
+---
+# END COLD LEARNER
+# Metadata-only verifier: Pod identity has folder rights, CI identity has none.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-metadata
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__, app: rhiza-metadata}
+spec:
+  serviceAccountName: rhiza-gcs
+  automountServiceAccountToken: false
+  nodeName: __NODE_A__
+  restartPolicy: Never
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: metadata
+      image: __METADATA_IMAGE__
+      command: [sh, -c, "sleep 1500"]
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      env: [{name: CLOUDSDK_CONFIG, value: /tmp/gcloud}]
+      resources:
+        requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 128Mi}
+        limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 256Mi}
+      volumeMounts: [{name: tmp, mountPath: /tmp}]
+  volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
+---
+# No Open, object-store client, server, or application RPC in this Pod.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-quic-probe
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: __RUN_ID__, app: rhiza-learner, app.kubernetes.io/part-of: rhiza-chaos, chaos.rhiza.io/role: learner}
+spec:
+  serviceAccountName: rhiza-gcs
+  automountServiceAccountToken: false
+  nodeName: __NODE_A__
+  restartPolicy: Never
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: rhiza
+      image: __HOST_IMAGE__
+      args: [qualification-quic-probe, hold]
+      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+      env:
+        - {name: RHIZA_NODE_ID, value: rhiza-learner}
+        - name: RHIZA_CLUSTER_MEMBERS
+          valueFrom: {secretKeyRef: {name: rhiza-qualification-auth, key: RHIZA_CLUSTER_MEMBERS}}
+      resources:
+        requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
+        limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}
