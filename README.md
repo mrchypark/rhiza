@@ -86,7 +86,7 @@ it uses the embedded Go API without a public HTTP server. From this checkout:
 cargo run --manifest-path sdk/rust/Cargo.toml --example embedded
 ```
 
-Use `rhizadb = "0.18.0"` in your Cargo dependencies.
+Use `rhizadb = "0.19.0"` in your Cargo dependencies.
 Native builds support macOS and Linux GNU and require Rust, Go 1.27+, and a C
 compiler. The Rust bridge requires cgo; Go-only applications remain cgo-free.
 Calls are synchronous. By default the embedded engine starts its private peer
