@@ -1,0 +1,263 @@
+# Render only through bootstrap-gcs-postrelease.sh. Admin creates; CI cannot edit.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: @NAMESPACE@
+  labels:
+    chaos.rhiza.io/run: '@RUN_ID@'
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+    chaos-mesh.org/inject: enabled
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-gcs
+  namespace: @NAMESPACE@
+  annotations:
+    iam.gke.io/gcp-service-account: '@POD_GSA@'
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: rhiza-bounded
+  namespace: @NAMESPACE@
+spec:
+  hard:
+    requests.cpu: '2'
+    requests.memory: 8Gi
+    limits.cpu: '4500m'
+    limits.memory: 8Gi
+    requests.ephemeral-storage: 8Gi
+    limits.ephemeral-storage: 8Gi
+    pods: '6'
+    services: '2'
+    services.loadbalancers: '0'
+    services.nodeports: '0'
+    persistentvolumeclaims: '0'
+    count/jobs.batch: '2'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: @NAMESPACE@-faults
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['chaos-mesh.org']
+        apiVersions: ['v1alpha1']
+        operations: ['CREATE', 'UPDATE']
+        resources: ['podchaos', 'networkchaos']
+        scope: Namespaced
+  variables:
+    - name: selector
+      expression: object.spec.selector
+    - name: sourceSafe
+      expression: >-
+        has(variables.selector.namespaces) && variables.selector.namespaces == ['@NAMESPACE@'] &&
+        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 3 &&
+        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
+        'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors && variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] == 'rhiza-voter-0' &&
+        !has(variables.selector.pods) && !has(variables.selector.physicalMachines) &&
+        !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
+        !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
+        !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors)
+  validations:
+    - expression: >-
+        object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
+        'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        variables.sourceSafe
+      message: Fault metadata and source selector must select only this run's peer Pods.
+    - expression: >-
+        has(object.spec.duration) && object.spec.duration == '10s' &&
+        has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
+      message: Only voter-0 and a fixed ten-second duration are admitted.
+    - expression: >-
+        object.kind != 'PodChaos' ||
+        (object.spec.action == 'container-kill' &&
+        has(object.spec.containerNames) && object.spec.containerNames == ['rhiza'])
+      message: PodChaos permits only bounded container-kill of the rhiza peer container.
+    - expression: >-
+        object.kind != 'NetworkChaos' ||
+        (object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
+        !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
+        !has(object.spec.loss) && !has(object.spec.duplicate) && !has(object.spec.corrupt) &&
+        !has(object.spec.bandwidth) && !has(object.spec.rate) &&
+        has(object.spec.target) && has(object.spec.target.mode) && object.spec.target.mode == 'all' &&
+        !has(object.spec.target.value) && has(object.spec.target.selector) &&
+        has(object.spec.target.selector.namespaces) && object.spec.target.selector.namespaces == ['@NAMESPACE@'] &&
+        has(object.spec.target.selector.labelSelectors) && size(object.spec.target.selector.labelSelectors) == 2 &&
+        'chaos.rhiza.io/run' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        'app' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
+        !has(object.spec.target.selector.pods) && !has(object.spec.target.selector.physicalMachines) &&
+        !has(object.spec.target.selector.nodes) && !has(object.spec.target.selector.nodeSelectors) &&
+        !has(object.spec.target.selector.annotationSelectors) && !has(object.spec.target.selector.expressionSelectors) &&
+        !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors))
+      message: NetworkChaos permits only voter-0 partition against this run's voters, never external targets.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: @NAMESPACE@-faults
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+spec:
+  policyName: @NAMESPACE@-faults
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: @NAMESPACE@
+---
+# All runtime Pod creation is constrained, including StatefulSet children.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: @NAMESPACE@-runtime
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ['']
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+        scope: Namespaced
+  validations:
+    - expression: >-
+        object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
+        'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+        object.spec.serviceAccountName == 'rhiza-gcs' && has(object.spec.automountServiceAccountToken) &&
+        object.spec.automountServiceAccountToken == false
+      message: Every Pod must use this run's label and precreated data KSA, without Kubernetes API token mounting.
+    - expression: >-
+        has(object.spec.nodeName) ? object.spec.nodeName in [
+        'gke-ied-cluster-ied-data-nodepool-72484396-ra2i',
+        'gke-ied-cluster-ied-nodepool-7cc3c86f-rjg4',
+        'gke-ied-cluster-ied-nodepool-e70ed3df-9959',
+        'gke-ied-cluster-ied-worker-nodepool-c1fbf207-ec1v'] :
+        (has(object.spec.affinity) && has(object.spec.affinity.nodeAffinity) &&
+        has(object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution) &&
+        size(object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms) == 1 &&
+        object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.all(t,
+          !has(t.matchFields) && has(t.matchExpressions) && size(t.matchExpressions) == 1 &&
+          t.matchExpressions.all(e, e.key == 'kubernetes.io/hostname' && e.operator == 'In' &&
+            has(e.values) && size(e.values) > 0 && e.values.all(n, n in [
+            'gke-ied-cluster-ied-data-nodepool-72484396-ra2i',
+            'gke-ied-cluster-ied-nodepool-7cc3c86f-rjg4',
+            'gke-ied-cluster-ied-nodepool-e70ed3df-9959',
+            'gke-ied-cluster-ied-worker-nodepool-c1fbf207-ec1v']))))
+      message: Only already-existing nodes may host test Pods; unconstrained scheduling is forbidden.
+    - expression: >-
+        !has(object.spec.hostNetwork) || object.spec.hostNetwork == false
+      message: Host networking is forbidden.
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath) && !has(v.persistentVolumeClaim) &&
+        (!has(v.secret) || v.secret.secretName == 'rhiza-qualification-auth') && !has(v.projected))
+      message: No host/PVC/projected-token volumes; only the fresh run's qualification Secret may be mounted.
+    - expression: >-
+        object.spec.containers.all(c,
+          c.image.matches('^ghcr[.]io/mrchypark/rhiza-sql@sha256:[a-f0-9]{64}$') ||
+          c.image.matches('^gcr[.]io/google[.]com/cloudsdktool/google-cloud-cli@sha256:[a-f0-9]{64}$')) &&
+        !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers)
+      message: Only digest-pinned reviewed host/metadata images; no init or ephemeral containers.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: @NAMESPACE@-runtime
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+spec:
+  policyName: @NAMESPACE@-runtime
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: @NAMESPACE@
+---
+# Only the CI GSA, not the Pod GSA/KSA, controls fresh runtime resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rhiza-ci-runtime
+  namespace: @NAMESPACE@
+rules:
+  - apiGroups: ['']
+    resources: [pods, configmaps, services]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: ['']
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: ['']
+    resources: [pods/exec, pods/portforward]
+    verbs: [create]
+  - apiGroups: ['']
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [apps]
+    resources: [statefulsets/scale]
+    verbs: [get, update, patch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [create, get, list, watch, delete]
+  - apiGroups: [chaos-mesh.org]
+    resources: [podchaos, networkchaos]
+    verbs: [create, get, list, watch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rhiza-ci-runtime
+  namespace: @NAMESPACE@
+subjects:
+  - kind: User
+    apiGroup: rbac.authorization.k8s.io
+    name: '@CI_GSA@'
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: rhiza-ci-runtime
+---
+# Cluster-scoped API, but get only the exact fresh namespace's metadata.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: @NAMESPACE@-reader
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+rules:
+  - apiGroups: ['']
+    resources: [namespaces]
+    resourceNames: ['@NAMESPACE@']
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: @NAMESPACE@-reader
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+subjects:
+  - kind: User
+    apiGroup: rbac.authorization.k8s.io
+    name: '@CI_GSA@'
+roleRef:
+  kind: ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+  name: @NAMESPACE@-reader
