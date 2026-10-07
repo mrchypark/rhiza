@@ -6,7 +6,7 @@ set +x
 umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
 mode=${1:-render}
-case "$mode" in render|check-fixture|negative-node-fixture|apply|rollback) ;; *) die 'Usage: sh bootstrap-gcs-postrelease.sh render|check-fixture|negative-node-fixture|apply|rollback' ;; esac
+case "$mode" in render|check-fixture|check-cleanup-uris|negative-node-fixture|apply|rollback) ;; *) die 'Usage: sh bootstrap-gcs-postrelease.sh render|check-fixture|check-cleanup-uris|negative-node-fixture|apply|rollback' ;; esac
 : "${RHIZA_RUN_ID:?8 lowercase hexadecimal characters required}"
 : "${RHIZA_WORKFLOW_SHA:?protected-merge workflow SHA required}"
 : "${RHIZA_AUTH_EXPIRES:?UTC YYYY-MM-DDTHH:MM:SSZ required}"
@@ -36,6 +36,14 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 render() {
     sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@CI_GSA@/$ci/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" "$script_dir/gcs-postrelease-auth.yaml.in"
 }
+admission_uri() {
+    case "$1" in
+        validatingadmissionpolicy) collection=validatingadmissionpolicies ;;
+        validatingadmissionpolicybinding) collection=validatingadmissionpolicybindings ;;
+        *) die 'Unsupported admission cleanup kind' ;;
+    esac
+    printf '/apis/admissionregistration.k8s.io/v1/%s/%s\n' "$collection" "$2"
+}
 validate_fixture() {
     # Input is private stdin; output is only a boolean discarded locally.
     # No payload text is allowed into diagnostics on parse/schema failure.
@@ -64,6 +72,14 @@ validate_fixture() {
 }
 if [ "$mode" = render ]; then
     render
+    exit 0
+fi
+if [ "$mode" = check-cleanup-uris ]; then
+    # Offline fixture exercises the exact URI builder used by guarded rollback.
+    [ "$(admission_uri validatingadmissionpolicy "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/$ns-runtime" ] || die 'Policy cleanup URI regression'
+    [ "$(admission_uri validatingadmissionpolicybinding "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/$ns-runtime" ] || die 'Binding cleanup URI regression'
+    if (admission_uri unsupported "$ns-runtime") >/dev/null 2>&1; then die 'Unknown cleanup kind accepted'; fi
+    printf '%s\n' 'Two exact admission cleanup URIs and unknown-kind refusal verified; no cloud calls.'
     exit 0
 fi
 if [ "$mode" = check-fixture ]; then
@@ -333,7 +349,8 @@ if owned kubernetes; then
     record namespace-gone k wait --for=delete "namespace/$ns" --timeout=180s
     for kind in validatingadmissionpolicybinding validatingadmissionpolicy; do
         for suffix in $policy_suffixes; do
-            delete_kube "$kind-$suffix" "$kind" "$ns-$suffix" "/apis/admissionregistration.k8s.io/v1/${kind}s/$ns-$suffix"
+            uri=$(admission_uri "$kind" "$ns-$suffix")
+            delete_kube "$kind-$suffix" "$kind" "$ns-$suffix" "$uri"
         done
     done
     for kind in clusterrolebinding clusterrole; do
