@@ -8,6 +8,8 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
 : "${RHIZA_RUN_ID:?}" "${RHIZA_NAMESPACE:?}" "${RHIZA_HOST_IMAGE:?}" "${RHIZA_METADATA_IMAGE:?}"
 : "${RHIZA_NODE_A:?}" "${RHIZA_NODE_B:?}" "${RHIZA_NODE_C:?}" "${RHIZA_OUTPUT:?}"
+: "${RHIZA_AUTH_CREATION_SHA:?}"
+printf '%s' "$RHIZA_AUTH_CREATION_SHA" | LC_ALL=C grep -Eq '^[a-f0-9]{40}$' || die 'exact auth creation SHA required'
 safe_name "$RHIZA_RUN_ID" || die 'unsafe run id'
 [ "$RHIZA_NAMESPACE" = "rhiza-v0190-20261008-$RHIZA_RUN_ID" ] || die 'namespace mismatch'
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
@@ -117,7 +119,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 run namespace k get namespace "$ns" -o json
-jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$GITHUB_SHA" '.metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .metadata.annotations["chaos-mesh.org/inject"]=="enabled"' "$out/1-namespace.stdout" >/dev/null || die 'bootstrap namespace/workflow identity mismatch'
+jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA" '.metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .metadata.annotations["chaos-mesh.org/inject"]=="enabled"' "$out/1-namespace.stdout" >/dev/null || die 'bootstrap namespace/workflow identity mismatch'
 run collision k get pods,statefulsets,services,configmaps,networkpolicies,podchaos,networkchaos -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json
 jq -e '.items|length==0' "$out/2-collision.stdout" >/dev/null || die 'run resources already exist'
 owned_created=true
@@ -224,6 +226,11 @@ execute "$RHIZA_RUN_ID-seed" "INSERT INTO qualification VALUES (1,'before')"
 for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"]]'; done
 fault() {
   kind=$1; action=$2; name=$3
+  case "$kind" in
+    NetworkChaos) expected_policy="$ns-network-faults" ;;
+    PodChaos) expected_policy="$ns-faults" ;;
+    *) die 'unsupported qualification fault kind' ;;
+  esac
   jq -n --arg kind "$kind" --arg action "$action" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg name "$name" \
     '{apiVersion:"chaos-mesh.org/v1alpha1",kind:$kind,metadata:{name:$name,namespace:$ns,labels:{"chaos.rhiza.io/run":$run}},spec:{action:$action,mode:"one",duration:"10s",selector:{namespaces:[$ns],labelSelectors:{"app.kubernetes.io/part-of":"rhiza-chaos","chaos.rhiza.io/run":$run,"statefulset.kubernetes.io/pod-name":"rhiza-voter-0"}}}}' > "$out/$name.json"
   if [ "$kind" = NetworkChaos ]; then
@@ -242,7 +249,7 @@ fault() {
   denied_code=$?
   set -e
   printf '%s\n' "$denied_code" > "$out/$seq-selector-denial.exit"
-  [ "$denied_code" != 0 ] && grep -Fq "$ns-faults" "$out/$seq-selector-denial.stderr" || die 'server-side selector confinement not proven'
+  [ "$denied_code" != 0 ] && grep -Fq "ValidatingAdmissionPolicy '$expected_policy' " "$out/$seq-selector-denial.stderr" || die 'server-side selector confinement not proven by the expected policy'
   run fault-validate k create --dry-run=server -f "$out/$name.json"
   # Registration precedes the write: an accepted create with lost response
   # still has one exact run-owned target for safe absent-aware cleanup.

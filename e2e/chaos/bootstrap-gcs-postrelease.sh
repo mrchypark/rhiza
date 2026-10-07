@@ -6,7 +6,7 @@ set +x
 umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
 mode=${1:-render}
-case "$mode" in render|check-fixture|negative-node-fixture|apply|rollback) ;; *) die 'Usage: sh bootstrap-gcs-postrelease.sh render|check-fixture|negative-node-fixture|apply|rollback' ;; esac
+case "$mode" in render|check-fixture|check-cleanup-uris|negative-node-fixture|apply|rollback) ;; *) die 'Usage: sh bootstrap-gcs-postrelease.sh render|check-fixture|check-cleanup-uris|negative-node-fixture|apply|rollback' ;; esac
 : "${RHIZA_RUN_ID:?8 lowercase hexadecimal characters required}"
 : "${RHIZA_WORKFLOW_SHA:?protected-merge workflow SHA required}"
 : "${RHIZA_AUTH_EXPIRES:?UTC YYYY-MM-DDTHH:MM:SSZ required}"
@@ -36,6 +36,14 @@ script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 render() {
     sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@CI_GSA@/$ci/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" "$script_dir/gcs-postrelease-auth.yaml.in"
 }
+admission_uri() {
+    case "$1" in
+        validatingadmissionpolicy) collection=validatingadmissionpolicies ;;
+        validatingadmissionpolicybinding) collection=validatingadmissionpolicybindings ;;
+        *) die 'Unsupported admission cleanup kind' ;;
+    esac
+    printf '/apis/admissionregistration.k8s.io/v1/%s/%s\n' "$collection" "$2"
+}
 validate_fixture() {
     # Input is private stdin; output is only a boolean discarded locally.
     # No payload text is allowed into diagnostics on parse/schema failure.
@@ -64,6 +72,14 @@ validate_fixture() {
 }
 if [ "$mode" = render ]; then
     render
+    exit 0
+fi
+if [ "$mode" = check-cleanup-uris ]; then
+    # Offline fixture exercises the exact URI builder used by guarded rollback.
+    [ "$(admission_uri validatingadmissionpolicy "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/$ns-runtime" ] || die 'Policy cleanup URI regression'
+    [ "$(admission_uri validatingadmissionpolicybinding "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/$ns-runtime" ] || die 'Binding cleanup URI regression'
+    if (admission_uri unsupported "$ns-runtime") >/dev/null 2>&1; then die 'Unknown cleanup kind accepted'; fi
+    printf '%s\n' 'Two exact admission cleanup URIs and unknown-kind refusal verified; no cloud calls.'
     exit 0
 fi
 if [ "$mode" = check-fixture ]; then
@@ -140,6 +156,29 @@ absent() {
 }
 mark() { printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/$1.created"; }
 owned() { [ -f "$RHIZA_AUTH_STATE/$1.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/$1.created")" = "$owner" ]; }
+check_folder_identity() {
+    # API .id is bucket/path, not an incarnation ID. Creation time distinguishes
+    # replacement at the same path. IAM changes may advance metageneration;
+    # require valid current metadata, not a frozen pre-grant version number.
+    jq -e --arg bucket "$bucket" --arg prefix "$prefix" --slurpfile original "$RHIZA_AUTH_STATE/folder-identity.json" '
+      ($original[0]) as $o |
+      $o.bucket==$bucket and $o.name==$prefix and $o.id==($bucket+"/"+$prefix) and
+      ($o.createTime|type)=="string" and ($o.createTime|length)>0 and
+      ($o.metageneration|type)=="string" and ($o.metageneration|test("^[1-9][0-9]*$")) and
+      ($o.updateTime|type)=="string" and ($o.updateTime|length)>0 and
+      .bucket==$o.bucket and .name==$o.name and .id==$o.id and
+      .createTime==$o.createTime and
+      (.metageneration|type)=="string" and (.metageneration|test("^[1-9][0-9]*$")) and
+      (.updateTime|type)=="string" and (.updateTime|length)>0
+    ' "$1" >/dev/null || die 'Managed folder incarnation/metadata changed or missing'
+}
+check_folder_role() {
+    record folder-role-current g iam roles describe "$folder_role" --format=json
+    jq -e --arg owner "$owner" --slurpfile original "$RHIZA_AUTH_STATE/folder-role-create.json" '
+      .description==$owner and .name==$original[0].name and .etag==$original[0].etag and
+      .includedPermissions==$original[0].includedPermissions and .stage==$original[0].stage
+    ' "$RHIZA_AUTH_STATE/folder-role-current.json" >/dev/null || die 'Folder role ownership/metadata changed'
+}
 if [ "$mode" = apply ]; then
     [ "$(g config get-value account 2>/dev/null)" = "$RHIZA_EXPECTED_ADMIN_ACCOUNT" ] || die 'Unexpected administrative account'
     record github-main gh api repos/mrchypark/rhiza/branches/main
@@ -151,8 +190,10 @@ if [ "$mode" = apply ]; then
     record project-before g projects get-iam-policy "$project" --format=json
     record bucket-before g storage buckets get-iam-policy "gs://$bucket" --format=json
     absent namespace k get namespace "$ns" -o json
-    absent fault-policy k get validatingadmissionpolicy "$ns-faults" -o json
-    absent fault-binding k get validatingadmissionpolicybinding "$ns-faults" -o json
+    for suffix in faults network-faults; do
+        absent "$suffix-policy" k get validatingadmissionpolicy "$ns-$suffix" -o json
+        absent "$suffix-binding" k get validatingadmissionpolicybinding "$ns-$suffix" -o json
+    done
     absent runtime-policy k get validatingadmissionpolicy "$ns-runtime" -o json
     absent runtime-binding k get validatingadmissionpolicybinding "$ns-runtime" -o json
     absent ns-reader k get clusterrole "$ns-reader" -o json
@@ -180,7 +221,7 @@ if [ "$mode" = apply ]; then
     record folder-create g storage managed-folders create "$folder" --format=json
     mark folder
     record folder-identity g storage managed-folders describe "$folder" --raw --format=json
-    jq -e '.id != null' "$RHIZA_AUTH_STATE/folder-identity.json" >/dev/null || die 'Managed folder immutable identity missing; stop before grants'
+    check_folder_identity "$RHIZA_AUTH_STATE/folder-identity.json"
     record folder-before g storage managed-folders get-iam-policy "$folder" --format=json
     record ci-wi-before g iam service-accounts get-iam-policy "$ci" --format=json
     record data-wi-before g iam service-accounts get-iam-policy "$data" --format=json
@@ -190,7 +231,7 @@ if [ "$mode" = apply ]; then
     mark kubernetes
     record namespace-identity k get namespace "$ns" -o json
     for kind in validatingadmissionpolicy validatingadmissionpolicybinding; do
-        for suffix in faults runtime; do
+        for suffix in faults network-faults runtime; do
             record "$kind-$suffix-identity" k get "$kind" "$ns-$suffix" -o json
         done
     done
@@ -263,7 +304,12 @@ if owned provider; then
 fi
 if owned folder; then
     record folder-current g storage managed-folders describe "$folder" --raw --format=json
-    [ "$(jq -r .id "$RHIZA_AUTH_STATE/folder-current.json")" = "$(jq -r .id "$RHIZA_AUTH_STATE/folder-identity.json")" ] || die 'Folder identity changed'
+    check_folder_identity "$RHIZA_AUTH_STATE/folder-current.json"
+    check_folder_role
+    record folder-policy-current g storage managed-folders get-iam-policy "$folder" --format=json
+    expected_folder_policy=$RHIZA_AUTH_STATE/folder-before.json
+    if owned folder-grant; then expected_folder_policy=$RHIZA_AUTH_STATE/folder-after.json; fi
+    jq -e --slurpfile expected "$expected_folder_policy" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' "$RHIZA_AUTH_STATE/folder-policy-current.json" >/dev/null || die 'Folder policy changed; preserve concurrent bindings for review'
 fi
 # SDK add/remove binding operations preserve policy etags; never set old policy.
 # Any concurrent-modification error stops for review, not an unconditional retry.
@@ -272,6 +318,20 @@ if owned ci-wi-grant; then record revoke-ci-wi g iam service-accounts remove-iam
 if owned data-wi-grant; then record revoke-data-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
 if owned ci-project-grant; then record revoke-project g projects remove-iam-policy-binding "$project" --member="serviceAccount:$ci" --role="projects/$project/roles/$cluster_role" --condition="$cluster_condition" --format=json; fi
 if owned kubernetes; then
+    # The preserved original bootstrap matched both fault kinds in -faults.
+    # A reviewed transition records the added pair in a separate working
+    # receipt copy. Never invent an identity for an absent/unrecorded pair.
+    policy_suffixes='faults runtime'
+    if [ -f "$RHIZA_AUTH_STATE/validatingadmissionpolicy-network-faults-identity.json" ] ||
+       [ -f "$RHIZA_AUTH_STATE/validatingadmissionpolicybinding-network-faults-identity.json" ] ||
+       grep -Fq "$ns-network-faults" "$RHIZA_AUTH_STATE/auth.yaml"; then
+        policy_suffixes='faults network-faults runtime'
+    fi
+    for kind in validatingadmissionpolicybinding validatingadmissionpolicy; do
+        for suffix in $policy_suffixes; do
+            [ -s "$RHIZA_AUTH_STATE/$kind-$suffix-identity.json" ] || die 'Missing policy identity receipt; stop before namespace teardown'
+        done
+    done
     record namespace-current k get namespace "$ns" -o json
     [ "$(jq -r .metadata.uid "$RHIZA_AUTH_STATE/namespace-current.json")" = "$(jq -r .metadata.uid "$RHIZA_AUTH_STATE/namespace-identity.json")" ] || die 'Namespace identity changed'
     [ "$(jq -r '.metadata.annotations["rhiza.dev/auth-owner"]' "$RHIZA_AUTH_STATE/namespace-current.json")" = "$owner" ] || die 'Namespace ownership changed'
@@ -288,8 +348,9 @@ if owned kubernetes; then
     delete_kube namespace namespace "$ns" "/api/v1/namespaces/$ns"
     record namespace-gone k wait --for=delete "namespace/$ns" --timeout=180s
     for kind in validatingadmissionpolicybinding validatingadmissionpolicy; do
-        for suffix in faults runtime; do
-            delete_kube "$kind-$suffix" "$kind" "$ns-$suffix" "/apis/admissionregistration.k8s.io/v1/${kind}s/$ns-$suffix"
+        for suffix in $policy_suffixes; do
+            uri=$(admission_uri "$kind" "$ns-$suffix")
+            delete_kube "$kind-$suffix" "$kind" "$ns-$suffix" "$uri"
         done
     done
     for kind in clusterrolebinding clusterrole; do
@@ -299,7 +360,12 @@ fi
 # No bucket/object recursive deletion or --all IAM removal is permitted here.
 if owned folder; then
     record folder-predelete g storage managed-folders describe "$folder" --raw --format=json
-    [ "$(jq -r .id "$RHIZA_AUTH_STATE/folder-predelete.json")" = "$(jq -r .id "$RHIZA_AUTH_STATE/folder-identity.json")" ] || die 'Folder identity changed before deletion'
+    check_folder_identity "$RHIZA_AUTH_STATE/folder-predelete.json"
+    check_folder_role
+    record folder-policy-predelete g storage managed-folders get-iam-policy "$folder" --format=json
+    jq -e --slurpfile expected "$RHIZA_AUTH_STATE/folder-before.json" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' "$RHIZA_AUTH_STATE/folder-policy-predelete.json" >/dev/null || die 'Folder policy has unrelated changes; do not delete'
+    # The installed CLI exposes no metageneration precondition. These immediate
+    # metadata/IAM checks are not an atomic compare-and-delete; never claim CAS.
     record folder-delete g storage managed-folders delete "$folder"
 fi
 if owned provider; then record provider-delete g iam workload-identity-pools providers delete github --location=global --workload-identity-pool="$pool"; fi
