@@ -199,8 +199,13 @@ func TestQualificationFixture(t *testing.T) {
 // Exercise the actual shell entry with synthetic files and a non-networking
 // kubectl. No token is minted, no application opens, and no cloud call is made.
 func TestQualificationLocalRuntime(t *testing.T) {
-	if _, err := exec.LookPath("timeout"); err != nil {
+	nativeTimeout, err := exec.LookPath("timeout")
+	if err != nil {
 		t.Fatal("native GNU timeout required for the local runtime tests")
+	}
+	nativeTimeout, err = filepath.Abs(nativeTimeout)
+	if err != nil {
+		t.Fatal(err)
 	}
 	scriptPath := os.Getenv("RHIZA_RUNTIME_TEST_SCRIPT")
 	if scriptPath == "" {
@@ -319,6 +324,29 @@ case "$1 $2" in
  *) exit 95 ;;
 esac
 `, 0700)
+			// Functional cases check parser arguments and auth boundaries, not
+			// process-launch performance. Timing cases keep the native timer.
+			if scenario != "parser-timeout" && scenario != "deadline" && scenario != "watchdog" {
+				write(filepath.Join(bin, "timeout"), `#!/bin/sh
+previous=
+parser=no
+for argument do
+ [ "$previous $argument" != "config view" ] || parser=yes
+ previous=$argument
+done
+if [ "$parser" = yes ]; then
+ [ "$#" = 11 ] && [ "$1" = --kill-after=5s ] && [ "$2" = 5s ] &&
+  [ "$3" = kubectl ] && [ "$4" = "--kubeconfig=$FAKE_KUBECONFIG" ] &&
+  [ "$5" = --context=gke_patch2-the-new-era_asia-northeast3_ied-cluster ] &&
+  [ "$6" = --namespace=rhiza-v0191-20261008-a1b2c3d4 ] &&
+  [ "$7" = config ] && [ "$8" = view ] && [ "$9" = --raw ] &&
+  [ "${10}" = -o ] && [ "${11}" = json ] || exit 98
+ shift 3
+ exec "$FAKE_KUBECTL" "$@"
+fi
+exec "$FAKE_NATIVE_TIMEOUT" "$@"
+`, 0700)
+			}
 			expiry := time.Unix(now+3300, 0).UTC().Format(time.RFC3339)
 			if scenario == "expiry" {
 				expiry = time.Unix(now+14400, 0).UTC().Format(time.RFC3339)
@@ -340,10 +368,23 @@ esac
 				"FAKE_NOW=" + strconv.FormatInt(now, 10), "FAKE_CLOCK=" + filepath.Join(dir, "clock"),
 				"FAKE_SCENARIO=" + scenario, "FAKE_CALLS=" + filepath.Join(dir, "calls"), "FAKE_CHILD=" + filepath.Join(dir, "child"),
 				"FAKE_CONFIG_EVENTS=" + filepath.Join(dir, "config-events"),
+				"FAKE_NATIVE_TIMEOUT=" + nativeTimeout, "FAKE_KUBECTL=" + filepath.Join(bin, "kubectl"), "FAKE_KUBECONFIG=" + kubeconfig,
 				"FAKE_GIT_ROOT=" + filepath.Dir(script) + "/../..", "FAKE_GIT_REVISION=" + mockFixtureRevision,
 				"FAKE_PARENT=" + filepath.Join(dir, "parent"), "FAKE_SIGNAL_READY=" + filepath.Join(dir, "signal-ready")}
 			if scenario == "fake-ci" {
 				cmd.Env = append(cmd.Env, "GITHUB_ACTIONS=true")
+			}
+			if scenario == "embedded-token" {
+				rejected := exec.Command(filepath.Join(bin, "timeout"), "--kill-after=5s", "6s", "kubectl",
+					"--kubeconfig="+kubeconfig, "--context="+contextName, "--namespace="+namespace, "config", "view", "--raw", "-o", "json")
+				rejected.Env = cmd.Env
+				var exited *exec.ExitError
+				if err := rejected.Run(); !errors.As(err, &exited) || exited.ExitCode() != 98 {
+					t.Fatalf("malformed parser budget accepted: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, "config-events")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("malformed parser tuple reached kubectl")
+				}
 			}
 			var captured bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &captured, &captured
