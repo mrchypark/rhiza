@@ -210,11 +210,8 @@ func TestQualificationLocalRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err := exec.Command("git", "-C", filepath.Join(filepath.Dir(script), "../.."), "rev-parse", "HEAD").Output()
-	if err != nil {
-		t.Fatal("runtime source identity unavailable")
-	}
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout"} {
+	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -232,7 +229,10 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			}
 			const run = "a1b2c3d4"
 			const harness = "f4d4cfee6d0928d813e84fe6e7d8c2b01c69f32c"
-			actualHarness := strings.TrimSpace(string(head))
+			mockFixtureRevision := syntheticFixtureRevision
+			if scenario == "head-mismatch" {
+				mockFixtureRevision = strings.Repeat("2", 40)
+			}
 			const contextName = "gke_patch2-the-new-era_asia-northeast3_ied-cluster"
 			namespace := "rhiza-v0191-20261008-" + run
 			token := filepath.Join(dir, "token")
@@ -264,13 +264,21 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			}
 			now := time.Now().Unix()
 			write(filepath.Join(bin, "date"), "#!/bin/sh\nif [ \"$*\" = '+%s' ]; then\n if [ -f \"$FAKE_CLOCK\" ]; then cat \"$FAKE_CLOCK\"; else printf '%s\\n' \"$FAKE_NOW\"; fi\nelse exec /bin/date \"$@\"; fi\n", 0700)
+			write(filepath.Join(bin, "git"), `#!/bin/sh
+[ "$#" = 4 ] && [ "$1" = -C ] && [ "$2" = "$FAKE_GIT_ROOT" ] &&
+ [ "$3" = rev-parse ] && [ "$4" = HEAD ] || exit 91
+printf '%s\n' "$FAKE_GIT_REVISION"
+`, 0700)
 			write(filepath.Join(bin, "kubectl"), `#!/bin/sh
+printf 'mock-entry\n' >> "$FAKE_CONFIG_EVENTS"
+if [ "$FAKE_SCENARIO" = parser-argument-error ]; then set -- --unexpected "$@"; fi
 case "$1" in --kubeconfig=*) config=${1#*=}; shift ;; *) exit 92 ;; esac
 [ "$1" = "--context=gke_patch2-the-new-era_asia-northeast3_ied-cluster" ] || exit 93
 shift
 [ "$1" = "--namespace=rhiza-v0191-20261008-a1b2c3d4" ] || exit 94
 shift
 case "$1" in --request-timeout=*) shift ;; esac
+printf 'args-ok\n' >> "$FAKE_CONFIG_EVENTS"
 printf '%s\n' "$1" >> "$FAKE_CALLS"
 case "$1 $2" in
  "config view")
@@ -321,8 +329,8 @@ esac
 			cmd := exec.CommandContext(ctx, "/bin/sh", script, "run-local")
 			// Do not inherit any live credential/CI/approval variables.
 			cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH"), "RHIZA_RUN_ID=" + run, "RHIZA_NAMESPACE=" + namespace,
-				"RHIZA_AUTH_CREATION_SHA=" + harness, "RHIZA_HARNESS_SHA=" + actualHarness, "RHIZA_APPLICATION_SHA=" + harness,
-				"RHIZA_EXECUTION_GO=" + actualHarness + ":" + run, "RHIZA_APPROVED_CAP_KRW=10000", "RHIZA_BOOTSTRAP_UID=synthetic-uid",
+				"RHIZA_AUTH_CREATION_SHA=" + harness, "RHIZA_HARNESS_SHA=" + syntheticFixtureRevision, "RHIZA_APPLICATION_SHA=" + harness,
+				"RHIZA_EXECUTION_GO=" + syntheticFixtureRevision + ":" + run, "RHIZA_APPROVED_CAP_KRW=10000", "RHIZA_BOOTSTRAP_UID=synthetic-uid",
 				"RHIZA_HOST_IMAGE=ghcr.io/mrchypark/rhiza-sql@sha256:" + strings.Repeat("a", 64),
 				"RHIZA_METADATA_IMAGE=gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:" + strings.Repeat("b", 64),
 				"RHIZA_NODE_A=gke-ied-cluster-fixture-a", "RHIZA_NODE_B=gke-ied-cluster-fixture-b", "RHIZA_NODE_C=gke-ied-cluster-fixture-c",
@@ -332,6 +340,7 @@ esac
 				"FAKE_NOW=" + strconv.FormatInt(now, 10), "FAKE_CLOCK=" + filepath.Join(dir, "clock"),
 				"FAKE_SCENARIO=" + scenario, "FAKE_CALLS=" + filepath.Join(dir, "calls"), "FAKE_CHILD=" + filepath.Join(dir, "child"),
 				"FAKE_CONFIG_EVENTS=" + filepath.Join(dir, "config-events"),
+				"FAKE_GIT_ROOT=" + filepath.Dir(script) + "/../..", "FAKE_GIT_REVISION=" + mockFixtureRevision,
 				"FAKE_PARENT=" + filepath.Join(dir, "parent"), "FAKE_SIGNAL_READY=" + filepath.Join(dir, "signal-ready")}
 			if scenario == "fake-ci" {
 				cmd.Env = append(cmd.Env, "GITHUB_ACTIONS=true")
@@ -361,8 +370,9 @@ esac
 			}
 			err = cmd.Wait()
 			output := captured.Bytes()
-			events, _ := os.ReadFile(filepath.Join(dir, "config-events"))
-			t.Logf("config-view events: %q", events)
+			events, eventErr := os.ReadFile(filepath.Join(dir, "config-events"))
+			calls, callsErr := os.ReadFile(filepath.Join(dir, "calls"))
+			t.Logf("mock events: %q readError=%v; calls: %q readError=%v", events, eventErr, calls, callsErr)
 			var exited *exec.ExitError
 			if !errors.As(err, &exited) || ctx.Err() != nil {
 				t.Fatalf("runtime did not fail within its bounded test: err=%v context=%v", err, ctx.Err())
@@ -383,6 +393,10 @@ esac
 			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" {
 				reason := "local kubeconfig must be one pinned tokenFile-only identity"
 				switch scenario {
+				case "head-mismatch":
+					reason = "local harness HEAD mismatch"
+				case "parser-argument-error":
+					reason = "local kubeconfig parsing failed (exit 92)"
 				case "parser-timeout":
 					reason = "local kubeconfig parsing failed (exit 124)"
 				case "token-permissions":
@@ -397,12 +411,22 @@ esac
 				if !bytes.Contains(output, []byte(reason)) {
 					t.Fatalf("rejected at the wrong boundary: %s", output)
 				}
-				calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
 				if bytes.Contains(calls, []byte("create")) {
 					t.Fatal("rejected local entry attempted a resource write")
 				}
+				if scenario == "fake-ci" || scenario == "head-mismatch" {
+					if !errors.Is(eventErr, os.ErrNotExist) || !errors.Is(callsErr, os.ErrNotExist) {
+						t.Fatal("pre-parser rejection unexpectedly invoked the local mock")
+					}
+				} else if scenario == "parser-argument-error" {
+					if eventErr != nil || string(events) != "mock-entry\n" || !errors.Is(callsErr, os.ErrNotExist) {
+						t.Fatal("argument rejection did not preserve mock-entry without dispatch")
+					}
+				} else if eventErr != nil || callsErr != nil || !bytes.HasPrefix(events, []byte("mock-entry\nargs-ok\nconfig-view-start\n")) {
+					t.Fatal("local mock entry/dispatch evidence absent or unreadable")
+				}
 				if scenario == "parser-timeout" {
-					if string(events) != "config-view-start\n" {
+					if string(events) != "mock-entry\nargs-ok\nconfig-view-start\n" {
 						t.Fatal("timed parser did not preserve its start-only events")
 					}
 					child, err := os.ReadFile(filepath.Join(dir, "child"))
