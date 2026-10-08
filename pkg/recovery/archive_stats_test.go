@@ -279,6 +279,15 @@ func TestArchiveSyncThroughSkipsLeaseForDurableTip(t *testing.T) {
 	if err := writer.SyncThrough(ctx, core, through); err != nil {
 		t.Fatalf("publish durable target: %v", err)
 	}
+	for range 2 {
+		if _, _, err := core.Propose(ctx, []byte("later unpublished suffix")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fullTip := core.Tip()
+	if fullTip <= through {
+		t.Fatalf("test setup core tip=%d must exceed durable target=%d", fullTip, through)
+	}
 	gates := &archiveStatsBucket{
 		Bucket: base, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
 		extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
@@ -296,9 +305,12 @@ func TestArchiveSyncThroughSkipsLeaseForDurableTip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hold publication lease: %v", err)
 	}
+	leaseReleased := false
 	t.Cleanup(func() {
-		if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
-			t.Errorf("release publication lease: %v", err)
+		if !leaseReleased {
+			if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
+				t.Errorf("release publication lease: %v", err)
+			}
 		}
 	})
 
@@ -328,6 +340,17 @@ func TestArchiveSyncThroughSkipsLeaseForDurableTip(t *testing.T) {
 	t.Cleanup(reader.Close)
 	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
 		t.Fatalf("independent durable tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
+	if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
+		t.Fatalf("release held publication lease: %v", err)
+	}
+	leaseReleased = true
+	gates.admission.open()
+	if err := stale.SyncThrough(ctx, core, fullTip); err != nil {
+		t.Fatalf("publish later suffix on explicit higher request: %v", err)
+	}
+	if err := reader.Load(ctx); err != nil || reader.Tip() != fullTip {
+		t.Fatalf("independent suffix tip=%d want=%d err=%v", reader.Tip(), fullTip, err)
 	}
 }
 

@@ -867,9 +867,6 @@ func (m *Manager) flushBatch(batch *syncBatch, core source) {
 		m.batchMu.Lock()
 		target := batch.target
 		m.batchMu.Unlock()
-		if tip := core.Tip(); tip > target {
-			target = tip
-		}
 		ctx, cancel := context.WithTimeout(m.ctx, archiveSyncTimeout)
 		batch.err = m.syncNowBatch(ctx, core, target, batch)
 		cancel()
@@ -910,6 +907,13 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		}
 		if tip >= through {
 			return nil
+		}
+	}
+	if batch != nil {
+		// Preserve suffix coalescing when this requested target is not yet
+		// durable, but don't make a covered lower target wait for newer work.
+		if tip := core.Tip(); tip > through {
+			through = tip
 		}
 	}
 	return m.withPublicationLockRecheck(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
