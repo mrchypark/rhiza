@@ -197,7 +197,7 @@ func probeQUICHandshake(ctx context.Context, address, nodeID string, expected rh
 
 // qualificationFixture is test-host-only: no node opens and no remote calls.
 func qualificationFixture(namespace, run, owner string, entropy io.Reader) (map[string]any, error) {
-	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) || namespace != "rhiza-v0190-20261008-"+run ||
+	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) || namespace != "rhiza-v0191-20261008-"+run ||
 		!regexp.MustCompile(`^rhiza-postrelease-`+run+`-[a-f0-9]{40}$`).MatchString(owner) {
 		return nil, errors.New("invalid fixture identity")
 	}

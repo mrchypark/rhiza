@@ -1,8 +1,12 @@
 #!/bin/sh
 # Exact release engine + reviewed test-host overlay. Never a generation fencer.
 set -eu
+# Never trace credential references or rejected kubeconfig contents.
+set +x
 umask 077
-release=abb87a0336cba8fee3fd1d9e5a0bf797de5b25b8
+mode=${1:-}
+case "$mode" in render|run|run-local) ;; *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local' >&2; exit 1 ;; esac
+release=f4d4cfee6d0928d813e84fe6e7d8c2b01c69f32c
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
 safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
@@ -11,7 +15,7 @@ safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
 : "${RHIZA_AUTH_CREATION_SHA:?}"
 printf '%s' "$RHIZA_AUTH_CREATION_SHA" | LC_ALL=C grep -Eq '^[a-f0-9]{40}$' || die 'exact auth creation SHA required'
 safe_name "$RHIZA_RUN_ID" || die 'unsafe run id'
-[ "$RHIZA_NAMESPACE" = "rhiza-v0190-20261008-$RHIZA_RUN_ID" ] || die 'namespace mismatch'
+[ "$RHIZA_NAMESPACE" = "rhiza-v0191-20261008-$RHIZA_RUN_ID" ] || die 'namespace mismatch'
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
   printf '%s' "$node" | LC_ALL=C grep -Eq '^gke-ied-cluster-[a-z0-9-]+$' || die 'existing-node pin required'
 done
@@ -22,10 +26,40 @@ printf '%s' "$RHIZA_METADATA_IMAGE" | grep -Eq '^gcr.io/google.com/cloudsdktool/
 mkdir -p "$RHIZA_OUTPUT"
 out=$(CDPATH='' cd -- "$RHIZA_OUTPUT" && pwd -P)
 ns=$RHIZA_NAMESPACE
-prefix="postrelease/v0.19.0/$RHIZA_RUN_ID/"
+prefix="postrelease/v0.19.1/$RHIZA_RUN_ID/"
 cluster="gcs-$RHIZA_RUN_ID"
 context=gke_patch2-the-new-era_asia-northeast3_ied-cluster
-k() { kubectl --context="$context" --namespace="$ns" "$@"; }
+remaining() {
+  seconds=$((local_deadline - $(date +%s)))
+  [ "$seconds" -gt 0 ] || return 124
+  printf '%s\n' "$seconds"
+}
+k() {
+  if [ "$mode" = run-local ]; then
+    seconds=$(remaining) || return 124
+    limit=240
+    case "$1" in logs) limit=10 ;; get|auth|scale) limit=30 ;; exec) limit=60 ;; esac
+    [ "$seconds" -le "$limit" ] || seconds=$limit
+    timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=30s "$@"
+  else
+    kubectl --context="$context" --namespace="$ns" "$@"
+  fi
+}
+private_file() {
+  case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
+  [ -f "$1" ] && [ ! -L "$1" ] || die 'regular non-symlink credential file required'
+  parent=$(dirname -- "$1")
+  [ ! -L "$parent" ] || die 'credential directory must not be a symlink'
+  if [ "$(uname -s)" = Darwin ]; then
+    permissions=$(stat -f '%Lp' "$1"); file_owner=$(stat -f '%u' "$1")
+    directory_permissions=$(stat -f '%Lp' "$parent")
+  else
+    permissions=$(stat -c '%a' "$1"); file_owner=$(stat -c '%u' "$1")
+    directory_permissions=$(stat -c '%a' "$parent")
+  fi
+  [ "$permissions" = 600 ] && [ "$file_owner" = "$(id -u)" ] && [ "$directory_permissions" = 700 ] || die 'private credential ownership/permissions required'
+}
 sed -e "s|__NAMESPACE__|$ns|g" -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
   -e "s|__CLUSTER_ID__|$cluster|g" -e "s|__HOST_IMAGE__|$RHIZA_HOST_IMAGE|g" \
   -e "s|__METADATA_IMAGE__|$RHIZA_METADATA_IMAGE|g" \
@@ -38,10 +72,50 @@ awk 'BEGIN{RS="---\n"} /name: rhiza-metadata/{print}' "$out/initial.yaml" > "$ou
 awk 'BEGIN{RS="---\n"} !/name: rhiza-metadata/ && !/name: rhiza-quic-probe/ && !/kind: NetworkPolicy/{print $0 "---"}' "$out/initial.yaml" > "$out/voters.yaml"
 awk 'BEGIN{RS="---\n"} /name: rhiza-quic-probe/{print}' "$out/initial.yaml" > "$out/probe.yaml"
 awk 'BEGIN{RS="---\n"} /kind: NetworkPolicy/{print}' "$out/initial.yaml" > "$out/cold-policy.yaml"
-if [ "${1:-}" = render ]; then exit 0; fi
-[ "${1:-}" = run ] || die 'usage: run-gcs-postrelease.sh render|run'
-[ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
-[ "${RHIZA_EXECUTION_GO:-}" = "$GITHUB_SHA:$RHIZA_RUN_ID" ] || die 'exact harness/run GO required'
+if [ "$mode" = render ]; then exit 0; fi
+if [ "$mode" = run ]; then
+  [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
+  [ "${RHIZA_EXECUTION_GO:-}" = "$GITHUB_SHA:$RHIZA_RUN_ID" ] || die 'exact harness/run GO required'
+else
+  [ -z "${GITHUB_ACTIONS:-}${GITHUB_EVENT_NAME:-}${GITHUB_REF:-}${GITHUB_SHA:-}" ] || die 'local entry must not impersonate CI'
+  : "${RHIZA_HARNESS_SHA:?}" "${RHIZA_LOCAL_RUNTIME_KUBECONFIG:?}"
+  : "${RHIZA_LOCAL_API_SERVER:?}" "${RHIZA_LOCAL_CA_DATA:?}"
+  : "${RHIZA_AUTH_STARTED_EPOCH:?}" "${RHIZA_AUTH_EXPIRES:?}" "${RHIZA_LOCAL_TOKEN_EXPIRES:?}"
+  printf '%s' "$RHIZA_HARNESS_SHA" | grep -Eq '^[a-f0-9]{40}$' || die 'exact local harness SHA required'
+  [ "$(git -C "$script_dir/../.." rev-parse HEAD)" = "$RHIZA_HARNESS_SHA" ] || die 'local harness HEAD mismatch'
+  [ "${RHIZA_EXECUTION_GO:-}" = "$RHIZA_HARNESS_SHA:$RHIZA_RUN_ID" ] || die 'exact local harness/run GO required'
+  command -v timeout >/dev/null || die 'native GNU timeout required'
+  timeout --version | grep -Fq 'GNU coreutils' || die 'native GNU timeout required'
+  private_file "$RHIZA_LOCAL_RUNTIME_KUBECONFIG"
+  # Native parsing stays in memory, never artifacts/logs. A rejected config may
+  # contain credentials, so suppress parser diagnostics and disclose only cause.
+  config=$(timeout --kill-after=5s 5s kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+    --context="$context" --namespace="$ns" config view --raw -o json 2>/dev/null) || die 'local kubeconfig parsing failed'
+  printf '%s' "$config" | jq -e --arg context "$context" --arg ns "$ns" \
+    --arg server "$RHIZA_LOCAL_API_SERVER" --arg ca "$RHIZA_LOCAL_CA_DATA" '
+    .kind=="Config" and .apiVersion=="v1" and .["current-context"]==$context and
+    (.contexts|length)==1 and (.clusters|length)==1 and (.users|length)==1 and
+    .contexts[0].name==$context and .contexts[0].context.namespace==$ns and
+    (.contexts[0].context|keys)==["cluster","namespace","user"] and
+    .contexts[0].context.cluster==.clusters[0].name and .contexts[0].context.user==.users[0].name and
+    (.clusters[0].cluster|keys)==["certificate-authority-data","server"] and
+    (.clusters[0].cluster.server==$server and ($server|startswith("https://"))) and
+    .clusters[0].cluster["certificate-authority-data"]==$ca and ($ca|length)>0 and
+    (.users[0].user|keys)==["tokenFile"] and (.users[0].user.tokenFile|type)=="string"
+  ' >/dev/null || die 'local kubeconfig must be one pinned tokenFile-only identity'
+  token_file=$(printf '%s' "$config" | jq -r '.users[0].user.tokenFile')
+  unset config
+  private_file "$token_file"
+  [ -s "$token_file" ] || die 'local token file is empty'
+  printf '%s' "$RHIZA_AUTH_STARTED_EPOCH" | grep -Eq '^[1-9][0-9]{0,11}$' || die 'fixed auth start required'
+  auth_expiry=$(jq -ner --arg value "$RHIZA_AUTH_EXPIRES" '$value|fromdateiso8601') || die 'fixed auth expiry required'
+  token_expiry=$(jq -ner --arg value "$RHIZA_LOCAL_TOKEN_EXPIRES" '$value|fromdateiso8601') || die 'actual token expiry required'
+  now=$(date +%s)
+  [ "$((auth_expiry - RHIZA_AUTH_STARTED_EPOCH))" -eq 3300 ] && \
+    [ "$now" -ge "$RHIZA_AUTH_STARTED_EPOCH" ] && [ "$((now - RHIZA_AUTH_STARTED_EPOCH))" -le 900 ] && \
+    [ "$token_expiry" -le "$auth_expiry" ] && [ "$((token_expiry - now))" -ge 2400 ] || die 'fixed 55-minute scope/preparation/runtime/cleanup reserve invalid'
+  local_deadline=$((now + 1200))
+fi
 [ "${RHIZA_APPLICATION_SHA:-}" = "$release" ] || die 'application release mismatch'
 : "${RHIZA_APPROVED_CAP_KRW:?}" "${RHIZA_BOOTSTRAP_UID:?}"
 [ "$RHIZA_APPROVED_CAP_KRW" = 10000 ] || die 'this run requires the approved 10000 KRW cap'
@@ -49,19 +123,41 @@ seq=0
 run() {
   seq=$((seq + 1)); label=$1; shift
   set +e
-  "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"
-  code=$?
+  if [ "$mode" = run-local ] && [ "$1" = curl ]; then
+    seconds=$(remaining)
+    code=$?
+    if [ "$code" = 0 ]; then timeout --kill-after=5s "${seconds}s" "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"; code=$?; fi
+  else
+    "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"
+    code=$?
+  fi
   set -e
   printf '%s\n' "$code" > "$out/$seq-$label.exit"
-  [ "$code" = 0 ] || die "first failure: $label exit $code"
+  if [ "$code" != 0 ]; then
+    if [ "$mode" = run-local ]; then printf 'first failure: %s exit %s\n' "$label" "$code" >&2; exit "$code"; fi
+    die "first failure: $label exit $code"
+  fi
 }
 started=${RHIZA_JOB_STARTED:-$(date +%s)}
+[ "$mode" != run-local ] || started=$now
+watchdog=''
+stop_watchdog() {
+  if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; watchdog=''; fi
+}
 pf_pids=''
 active_fault=''
 owned_created=false
 cleanup() {
-  code=$?; trap - EXIT HUP INT TERM
+  code=$?
+  trap '' USR1
+  trap - EXIT HUP INT TERM
   set +e
+  stop_watchdog
+  if [ "$mode" = run-local ]; then
+    local_deadline=$(( $(date +%s) + 1200 ))
+    [ "$local_deadline" -le "$token_expiry" ] || local_deadline=$token_expiry
+    [ "$local_deadline" -le "$auth_expiry" ] || local_deadline=$auth_expiry
+  fi
   clean=true
   # Never replace the first failure with a diagnostics/cleanup result.
   printf '%s\n' "$code" > "$out/workload.exit"
@@ -118,17 +214,51 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
+if [ "$mode" = run-local ]; then
+  trap 'exit 124' USR1
+  runtime_pid=$$
+  watchdog_seconds=$(remaining) || exit 124
+  (
+    sleep_pid=''
+    trap 'if [ -n "$sleep_pid" ]; then kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+    sleep "$watchdog_seconds" & sleep_pid=$!
+    wait "$sleep_pid"
+    kill -USR1 "$runtime_pid"
+  ) & watchdog=$!
+  printf '%s\n' "$watchdog" > "$out/watchdog.pid"
+  run local-identity k auth whoami -o json
+  jq -e --arg user "system:serviceaccount:$ns:rhiza-runtime" --arg group "system:serviceaccounts:$ns" \
+    '.status.userInfo.username==$user and (.status.userInfo.groups|sort)==(["system:authenticated","system:serviceaccounts",$group]|sort)' \
+    "$out/$seq-local-identity.stdout" >/dev/null || die 'local runtime server identity mismatch'
+  for resource in secrets serviceaccounts/token roles validatingadmissionpolicies; do
+    verb='create'
+    [ "$resource" != secrets ] || verb='get'
+    case "$resource" in
+      serviceaccounts/token) set -- create serviceaccounts --subresource=token ;;
+      validatingadmissionpolicies) set -- create validatingadmissionpolicies.admissionregistration.k8s.io --all-namespaces ;;
+      *) set -- "$verb" "$resource" ;;
+    esac
+    seq=$((seq + 1))
+    set +e
+    k auth can-i "$@" > "$out/$seq-permission-denied.stdout" 2> "$out/$seq-permission-denied.stderr"
+    denied_code=$?
+    set -e
+    printf '%s\n' "$denied_code" > "$out/$seq-permission-denied.exit"
+    if [ "$denied_code" = 124 ] || [ "$denied_code" = 137 ]; then exit "$denied_code"; fi
+    [ "$denied_code" = 1 ] && grep -qx no "$out/$seq-permission-denied.stdout" && [ ! -s "$out/$seq-permission-denied.stderr" ] || die 'local runtime forbidden permission/authorization check failed'
+  done
+fi
 run namespace k get namespace "$ns" -o json
-jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA" '.metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .metadata.annotations["chaos-mesh.org/inject"]=="enabled"' "$out/1-namespace.stdout" >/dev/null || die 'bootstrap namespace/workflow identity mismatch'
+jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA" '.metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .metadata.annotations["chaos-mesh.org/inject"]=="enabled"' "$out/$seq-namespace.stdout" >/dev/null || die 'bootstrap namespace/workflow identity mismatch'
 run collision k get pods,statefulsets,services,configmaps,networkpolicies,podchaos,networkchaos -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json
-jq -e '.items|length==0' "$out/2-collision.stdout" >/dev/null || die 'run resources already exist'
+jq -e '.items|length==0' "$out/$seq-collision.stdout" >/dev/null || die 'run resources already exist'
 owned_created=true
 run create-metadata k create -f "$out/metadata.yaml"
 run metadata-ready k wait pod/rhiza-metadata --for=condition=Ready --timeout=180s
 storage="gs://rhiza-v070-chaos-ied-20260811/$prefix"
 seq=$((seq + 1))
 set +e
-k exec rhiza-metadata -- gcloud storage cat "gs://rhiza-v070-chaos-ied-20260811/postrelease/v0.19.0/denied-$RHIZA_RUN_ID/no-object" > "$out/$seq-outside-scope.stdout" 2> "$out/$seq-outside-scope.stderr"
+k exec rhiza-metadata -- gcloud storage cat "gs://rhiza-v070-chaos-ied-20260811/postrelease/v0.19.1/denied-$RHIZA_RUN_ID/no-object" > "$out/$seq-outside-scope.stdout" 2> "$out/$seq-outside-scope.stderr"
 denied_code=$?
 set -e
 printf '%s\n' "$denied_code" > "$out/$seq-outside-scope.exit"
@@ -150,7 +280,13 @@ run create-voters k create -f "$out/voters.yaml"
 run voters-ready k rollout status statefulset/rhiza-voter --timeout=180s
 forward() {
   pod=$1; port=$2
-  k port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+  if [ "$mode" = run-local ]; then
+    seconds=$(remaining) || exit 124
+    timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=30s port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+  else
+    k port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+  fi
   pf_pids="$pf_pids $!"
   tries=0
   until curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; do
