@@ -211,6 +211,10 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	gates.preflightLoad.open()
 	waitArchiveStatsGate(t, ctx, gates.admission)
 	gates.admission.open()
+	// A busy retry now validates the head before attempting the lock again.
+	// This request remains uncovered, so it must continue into fenced work.
+	waitArchiveStatsGate(t, ctx, gates.load)
+	gates.load.open()
 	waitArchiveStatsGate(t, ctx, gates.admissionRetry)
 	releaseHolder.open()
 	select {
@@ -222,21 +226,19 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 		t.Fatal("held publication lease did not release")
 	}
 	gates.admissionRetry.open()
-	waitArchiveStatsGate(t, ctx, gates.load)
+	waitArchiveStatsGate(t, ctx, gates.extent)
 	afterAdmission := manager.ArchiveStats()
 	assertArchiveStageCount(t, afterAdmission.Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission)+1)
 	if got := *afterAdmission.Stages.PublicationAdmission.DurationNSSum - *before.Stages.PublicationAdmission.DurationNSSum; got < uint64(50*time.Millisecond) {
 		t.Fatalf("admission duration=%dns, want at least one bounded retry interval", got)
 	}
-	assertArchiveStageCount(t, afterAdmission.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+1)
+	assertArchiveStageCount(t, afterAdmission.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+3)
 	assertArchiveStageCount(t, afterAdmission.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload))
 	assertArchiveStageCount(t, afterAdmission.Stages.HeadPublish, stageCount(t, before.Stages.HeadPublish))
 	assertArchiveStageCount(t, afterAdmission.Stages.PublicationRelease, stageCount(t, before.Stages.PublicationRelease))
 
-	gates.load.open()
-	waitArchiveStatsGate(t, ctx, gates.extent)
 	afterLoad := manager.ArchiveStats()
-	assertArchiveStageCount(t, afterLoad.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
+	assertArchiveStageCount(t, afterLoad.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+3)
 	assertArchiveStageCount(t, afterLoad.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload))
 
 	gates.extent.open()
@@ -262,7 +264,7 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	}
 	after := manager.ArchiveStats()
 	assertArchiveStageCount(t, after.Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission)+1)
-	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
+	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+3)
 	assertArchiveStageCount(t, after.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload)+1)
 	assertArchiveStageCount(t, after.Stages.HeadPublish, stageCount(t, before.Stages.HeadPublish)+1)
 	assertArchiveStageCount(t, after.Stages.PublicationRelease, stageCount(t, before.Stages.PublicationRelease)+1)
@@ -326,6 +328,114 @@ func TestArchiveSyncThroughSkipsLeaseForDurableTip(t *testing.T) {
 	t.Cleanup(reader.Close)
 	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
 		t.Fatalf("independent durable tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
+}
+
+func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
+	ctx, base, core, waiter, writer := newArchivePreflightManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("published while waiter is blocked")); err != nil {
+		t.Fatal(err)
+	}
+	through := core.Tip()
+
+	waiterGates := &archiveStatsBucket{
+		Bucket: base, lockRead: newArchiveStatsGate(), admission: newArchiveStatsGate(),
+		admissionRetry: newArchiveStatsGate(), extent: newArchiveStatsGate(),
+		head: newArchiveStatsGate(), release: newArchiveStatsGate()}
+	for _, gate := range []*archiveStatsGate{waiterGates.admissionRetry, waiterGates.extent, waiterGates.head, waiterGates.release} {
+		gate.open()
+	}
+	waiter.bucket = waiterGates
+	waiterGates.syncStarted.Store(true)
+
+	writerGates := &archiveStatsBucket{
+		Bucket: base, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
+		extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+	}
+	for _, gate := range []*archiveStatsGate{writerGates.admission, writerGates.admissionRetry, writerGates.extent, writerGates.head} {
+		gate.open()
+	}
+	writer.bucket = writerGates
+	writerGates.syncStarted.Store(true)
+
+	before := waiter.ArchiveStats()
+	waiterDone := make(chan error, 1)
+	waiterFinished := make(chan struct{})
+	go func() {
+		defer close(waiterFinished)
+		waiterDone <- waiter.SyncThrough(ctx, core, through)
+	}()
+	t.Cleanup(func() {
+		waiterGates.lockRead.open()
+		waiterGates.admission.open()
+		waiterGates.admissionRetry.open()
+		select {
+		case <-waiterFinished:
+		case <-time.After(time.Second):
+			t.Error("waiter did not stop during cleanup")
+		}
+	})
+	waitArchiveStatsGate(t, ctx, waiterGates.lockRead)
+
+	writerDone := make(chan error, 1)
+	writerFinished := make(chan struct{})
+	go func() {
+		defer close(writerFinished)
+		writerDone <- writer.SyncThrough(ctx, core, through)
+	}()
+	t.Cleanup(func() {
+		writerGates.release.open()
+		select {
+		case <-writerFinished:
+		case <-time.After(time.Second):
+			t.Error("writer did not release its publication lease during cleanup")
+		}
+	})
+	waitArchiveStatsGate(t, ctx, writerGates.release)
+
+	// The waiter completed its initial uncovered load before the writer began.
+	// It now reads the writer's live lease, then must observe the published tip
+	// without waiting for the writer's gated release.
+	waiterGates.lockRead.open()
+	waitArchiveStatsGate(t, ctx, waiterGates.admission)
+	waiterGates.admission.open()
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("waiter recheck: %v", err)
+		}
+	case <-waiterGates.admissionRetry.entered:
+		t.Fatal("waiter retried publication admission instead of rechecking the durable tip")
+	case <-ctx.Done():
+		t.Fatalf("waiter did not acknowledge the durable target while the lease remained held: %v", ctx.Err())
+	}
+	select {
+	case err := <-writerDone:
+		t.Fatalf("writer released before its release gate opened: %v", err)
+	default:
+	}
+
+	reader := NewManager(base, "cluster", 1)
+	t.Cleanup(reader.Close)
+	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
+		t.Fatalf("independent durable tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
+
+	after := waiter.ArchiveStats()
+	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
+	assertArchiveStageCount(t, after.Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission)+1)
+	assertArchiveStageCount(t, after.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload))
+	assertArchiveStageCount(t, after.Stages.HeadPublish, stageCount(t, before.Stages.HeadPublish))
+	assertArchiveStageCount(t, after.Stages.PublicationRelease, stageCount(t, before.Stages.PublicationRelease))
+
+	writerGates.release.open()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("writer publication: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("writer did not finish: %v", ctx.Err())
 	}
 }
 

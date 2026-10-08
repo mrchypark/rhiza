@@ -912,7 +912,21 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 			return nil
 		}
 	}
-	return m.withPublicationLock(ctx, "archive-sync", func(ctx context.Context) error {
+	return m.withPublicationLockRecheck(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
+		if err := m.loadForSync(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
+			return false, nil
+		}
+		m.mu.Lock()
+		tip, sealed := m.tip, m.head.Sealed
+		m.mu.Unlock()
+		if sealed {
+			return false, ErrArchiveSealed
+		}
+		return tip >= through, nil
+	}, func(ctx context.Context) error {
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
 		if err := m.loadForSync(ctx); err != nil {
@@ -1757,6 +1771,13 @@ func (m *Manager) traceRecoveryPinWrite(ctx context.Context, key, phase, status 
 // withPublicationLock waits only before work begins. An error after entry may
 // follow an ambiguous HEAD write and must never replay the whole operation.
 func (m *Manager) withPublicationLock(ctx context.Context, owner string, work func(context.Context) error) error {
+	return m.withPublicationLockRecheck(ctx, owner, nil, work)
+}
+
+// withPublicationLockRecheck optionally checks for completed work only after
+// an unentered busy admission attempt. Other publication callers use
+// withPublicationLock and retain the existing retry behavior.
+func (m *Manager) withPublicationLockRecheck(ctx context.Context, owner string, recheck func(context.Context) (bool, error), work func(context.Context) error) error {
 	started := time.Now()
 	admissionRecorded := false
 	defer func() {
@@ -1793,6 +1814,18 @@ func (m *Manager) withPublicationLock(ctx context.Context, owner string, work fu
 			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if recheck != nil {
+			covered, err := recheck(ctx)
+			if err != nil {
+				return err
+			}
+			if covered {
+				return nil
+			}
 		}
 	}
 }
