@@ -30,6 +30,15 @@ It flushes and closes Rhiza-owned resources, including the WAL. A close error
 means shutdown was incomplete and must be recorded or surfaced by the host;
 do not discard it with `defer db.Close()` in long-lived applications.
 
+For archive-publishing voting nodes with an object store, successful close
+publishes the final local certified prefix to the archive. Reconfiguration
+non-voters retain their restriction against publishing that prefix. Close does
+not create a new quorum-certified checkpoint:
+checkpoint creation is background maintenance, not a prerequisite for closing
+the last voter. An existing certified checkpoint and its archived suffix, or
+an untrimmed archive without a checkpoint, remain recovery inputs. This does
+not authorize replacing an original voter's WAL or identity with an empty disk.
+
 The standalone `rhiza` server installs `SIGINT` and `SIGTERM` handling because
 it owns its process. An embedded library cannot select a host's signal policy:
 GUI programs, test runners, supervisors, and applications with several

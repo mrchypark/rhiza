@@ -75,6 +75,15 @@ shared CAS archive history and checkpoint files against concurrent trimming/GC u
 replay and installation finish. A lost recovery lease fails recovery instead
 of silently continuing with an unprotected source.
 
+Graceful close drains and joins local work and syncs/closes the WAL. For
+archive-publishing voting nodes, it also publishes the final local certified
+prefix; reconfiguration non-voters retain their publication restriction. Close
+does not force a new
+checkpoint or require quorum to certify one during shutdown. Recovery still
+verifies the retained certified checkpoint base (if any) and replays its
+archived suffix; an untrimmed certified archive can be replayed without a
+checkpoint. Archive publication or local close failures remain close errors.
+
 `before-ack` adds remote publication after quorum certification. Given intact,
 non-rollback remote storage and a valid consensus history, it preserves the
 certified prefix containing successful acknowledgments. It neither replaces
