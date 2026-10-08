@@ -527,6 +527,159 @@ func TestObjectStoreCountersUnavailable(t *testing.T) {
 	}
 }
 
+func TestQualificationVoterReadiness(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nk() {\n")
+	end := strings.Index(string(source), "\nprivate_file() {\n")
+	if start < 0 || end <= start {
+		t.Fatal("actual scoped kubectl/readiness functions missing")
+	}
+	functions := string(source[start:end])
+	for _, caller := range []string{"run voters-ready wait_voters 180", "run voters-ready wait_voters 120"} {
+		if !strings.Contains(string(source), caller) {
+			t.Fatalf("shared readiness caller missing: %s", caller)
+		}
+	}
+	if strings.Contains(string(source), "rollout status") {
+		t.Fatal("OnDelete voters must not use RollingUpdate rollout status")
+	}
+	template, err := os.ReadFile("../gcs-postrelease.yaml.in")
+	if err != nil || !bytes.Contains(template, []byte("updateStrategy: {type: OnDelete}")) {
+		t.Fatal("deliberate OnDelete strategy changed")
+	}
+	for _, scenario := range []struct {
+		name   string
+		mode   string
+		budget int
+		want   int
+	}{
+		{"initial", "run", 180, 0},
+		{"postfault", "run-local", 120, 0},
+		{"absent", "run", 180, 1},
+		{"create-timeout", "run-local", 120, 124},
+		{"ready-timeout", "run", 180, 124},
+		{"deadline", "run-local", 120, 124},
+		{"missing", "run", 180, 1},
+		{"not-ready", "run-local", 120, 1},
+		{"terminating", "run", 180, 1},
+		{"replacement", "run-local", 120, 1},
+		{"get-error", "run", 180, 53},
+		{"empty", "run-local", 120, 1},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			write := func(name, content string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("clock", "100\n")
+			write("date", "#!/bin/sh\ncat \"$FAKE_DIR/clock\"\n")
+			write("timeout", `#!/bin/sh
+[ "$1" = --kill-after=5s ] || exit 91
+seconds=${2%s}
+[ "$seconds" -gt 0 ] && [ "$seconds" -le "$FAKE_BUDGET" ] || exit 92
+printf '%s\n' "$seconds" >> "$FAKE_DIR/timeouts"
+shift 2
+exec "$@"
+`)
+			write("kubectl", `#!/bin/sh
+case "$1" in --kubeconfig=*) [ "$1" = --kubeconfig=/synthetic/config ] || exit 93; shift ;; esac
+[ "$1" = --context=synthetic ] && [ "$2" = --namespace=synthetic ] || exit 94
+shift 2
+case "$1" in --request-timeout=30s) shift ;; esac
+printf '%s\n' "$*" >> "$FAKE_DIR/calls"
+now=$(cat "$FAKE_DIR/clock")
+step=10; [ "$FAKE_SCENARIO" != deadline ] || step=40
+printf '%s\n' "$((now + step))" > "$FAKE_DIR/clock"
+case "$1" in
+ wait)
+  case "$2" in pod/rhiza-voter-[012]) ;; *) exit 95 ;; esac
+  case "$4" in --timeout=*) ;; *) exit 96 ;; esac
+  case "$3" in
+   --for=create)
+    [ "$FAKE_SCENARIO" != absent ] || exit 1
+    [ "$FAKE_SCENARIO" != create-timeout ] || exit 124
+    touch "$FAKE_DIR/${2#pod/}" ;;
+   --for=condition=Ready)
+    [ -f "$FAKE_DIR/${2#pod/}" ] || exit 97
+    [ "$FAKE_SCENARIO" != ready-timeout ] || exit 124 ;;
+   *) exit 98 ;;
+  esac ;;
+ get)
+  [ "$*" = 'get pods rhiza-voter-0 rhiza-voter-1 rhiza-voter-2 -o json' ] || exit 99
+  if [ -e "$FAKE_DIR/got-before" ]; then
+   [ "$FAKE_SCENARIO" != get-error ] || exit 53
+   [ "$FAKE_SCENARIO" != empty ] || exit 0
+   cat "$FAKE_DIR/after.json"
+  else touch "$FAKE_DIR/got-before"; cat "$FAKE_DIR/before.json"; fi ;;
+ *) exit 90 ;;
+esac
+`)
+			pods := make([]map[string]any, 3)
+			for i := range pods {
+				pods[i] = map[string]any{"metadata": map[string]any{"name": fmt.Sprintf("rhiza-voter-%d", i), "uid": fmt.Sprintf("uid-%d", i)},
+					"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "True"}}}}
+			}
+			before, err := json.Marshal(map[string]any{"items": pods})
+			if err != nil {
+				t.Fatal(err)
+			}
+			write("before.json", string(before))
+			switch scenario.name {
+			case "missing":
+				pods = pods[:2]
+			case "not-ready":
+				pods[0]["status"] = map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": "False"}}}
+			case "terminating":
+				pods[0]["metadata"].(map[string]any)["deletionTimestamp"] = "2026-10-09T00:00:00Z"
+			case "replacement":
+				pods[0]["metadata"].(map[string]any)["uid"] = "replacement-uid"
+			}
+			after, err := json.Marshal(map[string]any{"items": pods})
+			if err != nil {
+				t.Fatal(err)
+			}
+			write("after.json", string(after))
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", "mode=$FAKE_MODE; context=synthetic; ns=synthetic; RHIZA_LOCAL_RUNTIME_KUBECONFIG=/synthetic/config; remaining() { printf '300\\n'; }; "+functions+"\nwait_voters \"$FAKE_BUDGET\"; code=$?; [ -z \"${voter_wait_deadline:-}\" ] || exit 89; exit \"$code\"")
+			command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name,
+				"FAKE_MODE="+scenario.mode, "FAKE_BUDGET="+strconv.Itoa(scenario.budget))
+			output, err := command.CombinedOutput()
+			code := 0
+			if err != nil {
+				var exited *exec.ExitError
+				if !errors.As(err, &exited) || ctx.Err() != nil {
+					t.Fatalf("fixture did not terminate normally: %v", err)
+				}
+				code = exited.ExitCode()
+			}
+			if code != scenario.want {
+				t.Fatalf("exit=%d want=%d output=%s", code, scenario.want, output)
+			}
+			if scenario.want == 0 {
+				calls, err := os.ReadFile(filepath.Join(dir, "calls"))
+				if err != nil || strings.Count(string(calls), "--for=create") != 3 || strings.Count(string(calls), "--for=condition=Ready") != 3 {
+					t.Fatalf("named creation/readiness calls missing: %s error=%v", calls, err)
+				}
+				timeouts, err := os.ReadFile(filepath.Join(dir, "timeouts"))
+				lastTimeout := scenario.budget - 70
+				if scenario.mode == "run-local" && lastTimeout > 30 {
+					lastTimeout = 30
+				}
+				if err != nil || !strings.HasPrefix(string(timeouts), strconv.Itoa(scenario.budget)+"\n") || !strings.HasSuffix(string(timeouts), strconv.Itoa(lastTimeout)+"\n") || !strings.Contains(string(calls), "--timeout="+strconv.Itoa(scenario.budget-60)+"s") {
+					t.Fatalf("shared deadline reset: %q error=%v", timeouts, err)
+				}
+			}
+		})
+	}
+}
+
 func TestQualificationHostShutdown(t *testing.T) {
 	identity := shutdownIdentity{"namespace", "a1b2c3d4", "pod-uid", "node", "process"}
 	for _, scenario := range []string{"complete", "close-error", "close-canceled", "close-timeout", "serve-error", "drain-timeout"} {

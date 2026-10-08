@@ -35,17 +35,52 @@ remaining() {
   printf '%s\n' "$seconds"
 }
 k() {
+  if [ -n "${voter_wait_deadline:-}" ]; then
+    k_deadline_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$k_deadline_seconds" -gt 0 ] || return 124
+  fi
   if [ "$mode" = run-local ]; then
     seconds=$(remaining) || return 124
     limit=240
     case "$1" in logs) limit=10 ;; get|auth|scale) limit=30 ;; exec) limit=60 ;; esac
     [ "$seconds" -le "$limit" ] || seconds=$limit
+    if [ -n "${voter_wait_deadline:-}" ] && [ "$seconds" -gt "$k_deadline_seconds" ]; then seconds=$k_deadline_seconds; fi
     timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
       --context="$context" --namespace="$ns" --request-timeout=30s "$@"
   else
-    kubectl --context="$context" --namespace="$ns" "$@"
+    if [ -n "${voter_wait_deadline:-}" ]; then
+      timeout --kill-after=5s "${k_deadline_seconds}s" kubectl --context="$context" --namespace="$ns" "$@"
+    else
+      kubectl --context="$context" --namespace="$ns" "$@"
+    fi
   fi
 }
+wait_voters() (
+  # One deadline covers creation, Ready and identity checks for all three Pods.
+  # Subshell scope prevents this deadline from constraining later cleanup.
+  voter_wait_deadline=$(( $(date +%s) + $1 ))
+  for voter_wait_index in 0 1 2; do
+    voter_wait_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$voter_wait_seconds" -gt 0 ] || exit 124
+    k wait "pod/rhiza-voter-$voter_wait_index" --for=create --timeout="${voter_wait_seconds}s" || exit $?
+  done
+  voter_wait_before=$(k get pods rhiza-voter-0 rhiza-voter-1 rhiza-voter-2 -o json) || exit $?
+  for voter_wait_index in 0 1 2; do
+    voter_wait_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$voter_wait_seconds" -gt 0 ] || exit 124
+    k wait "pod/rhiza-voter-$voter_wait_index" --for=condition=Ready --timeout="${voter_wait_seconds}s" || exit $?
+  done
+  voter_wait_after=$(k get pods rhiza-voter-0 rhiza-voter-1 rhiza-voter-2 -o json) || exit $?
+  jq -n -e --argjson before "$voter_wait_before" --argjson after "$voter_wait_after" '
+      ($after.items|sort_by(.metadata.name)) as $pods |
+      ($pods|map(.metadata.name))==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] and
+      ($pods|map({name:.metadata.name,uid:.metadata.uid}))==($before.items|map({name:.metadata.name,uid:.metadata.uid})|sort_by(.name)) and
+      ($pods|map(.metadata.uid)|unique|length)==3 and
+      all($pods[]; (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+        .metadata.deletionTimestamp==null and any(.status.conditions[]?; .type=="Ready" and .status=="True"))
+    ' || exit 1
+  [ "$(date +%s)" -lt "$voter_wait_deadline" ] || exit 124
+)
 private_file() {
   case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
   [ -f "$1" ] && [ ! -L "$1" ] || die 'regular non-symlink credential file required'
@@ -468,7 +503,7 @@ else
   [ "$list_code" = 1 ] && grep -Fq 'matched no objects' "$out/$seq-prefix-empty.stderr" || die 'prefix/list permission gate failed'
 fi
 run create-voters k create -f "$out/voters.yaml"
-run voters-ready k rollout status statefulset/rhiza-voter --timeout=180s
+run voters-ready wait_voters 180
 forward() {
   pod=$1; port=$2
   if [ "$mode" = run-local ]; then
@@ -598,7 +633,7 @@ execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
 run recovered k wait "$active_fault" --for=condition=AllRecovered=True --timeout=90s
 run fault-delete k delete "$active_fault" --wait=true --timeout=60s
 active_fault=''
-run voters-ready k rollout status statefulset/rhiza-voter --timeout=120s
+run voters-ready wait_voters 120
 # Existing port-forward connection may exit when its container is killed.
 forward rhiza-voter-0 18080
 run after pod_snapshot
