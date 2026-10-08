@@ -20,6 +20,7 @@ import (
 	"github.com/mrchypark/rhiza/pkg/node"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 type Member = quepaxa.Member
@@ -72,6 +73,12 @@ type GraphNodePropertyIndex = types.GraphNodePropertyIndex
 type RequestStatusRequest = network.RequestStatusRequest
 type RequestStatusResponse = network.RequestStatusResponse
 type ObjectStoreStats = objstore.Stats
+type ArchiveStageStats = recovery.ArchiveStageStats
+type ArchiveStages = recovery.ArchiveStages
+type ArchiveStats = recovery.ArchiveStats
+
+const ArchiveStatsSchemaVersion = recovery.ArchiveStatsSchemaVersion
+
 type ObjectStoreDurability = types.ObjectStoreDurability
 
 // Config contains the durable local path, fixed membership, and peer endpoint.
@@ -569,4 +576,9 @@ func (db *DB) RequestStatus(ctx context.Context, req RequestStatusRequest) (Requ
 
 func (db *DB) ObjectStoreStats() (ObjectStoreStats, bool) {
 	return db.node.ObjectStoreStats()
+}
+
+// ArchiveStats returns fixed process-local archive phase aggregates.
+func (db *DB) ArchiveStats() ArchiveStats {
+	return db.node.ArchiveStats()
 }

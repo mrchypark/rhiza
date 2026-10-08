@@ -144,6 +144,7 @@ type Manager struct {
 	bucket       objstore.Bucket
 	prefix       string
 	configID     uint
+	archiveStats archiveDurationStats
 	mu           sync.Mutex
 	transitionMu sync.Mutex
 	extents      []Extent
@@ -176,6 +177,15 @@ func NewManager(bucket objstore.Bucket, prefix string, configID uint) *Manager {
 	m := &Manager{bucket: bucket, prefix: prefix, configID: configID, cas: slices.Contains(options, objstore.IfMatch) && slices.Contains(options, objstore.IfNotExists), cache: make(map[extentObject]Extent), ctx: ctx, cancel: cancel, groupDelay: archiveGroupDelay}
 	m.readCond = sync.NewCond(&m.readMu)
 	return m
+}
+
+// ArchiveStats returns process-local archive phase aggregates. A nil manager
+// reports every fixed stage as unavailable.
+func (m *Manager) ArchiveStats() ArchiveStats {
+	if m == nil {
+		return unavailableArchiveStats()
+	}
+	return m.archiveStats.snapshot()
 }
 
 // SetGroupDelay selects the maximum linger used to coalesce archive writes.
@@ -889,7 +899,7 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 	return m.withPublicationLock(ctx, "archive-sync", func(ctx context.Context) error {
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
-		if err := m.Load(ctx); err != nil {
+		if err := m.loadForSync(ctx); err != nil {
 			return err
 		}
 		if batch != nil {
@@ -930,11 +940,15 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 		previous, previousObject := head.TailHash, head.TailObject
 		from := tip + 1
 		for from <= through {
+			extentStart := time.Now()
 			extent, data, sourceTip, err := m.buildExtent(core, from, through, previous, previousObject)
 			if err != nil {
+				m.archiveStats.record(archiveExtentBuildUpload, time.Since(extentStart))
 				return err
 			}
-			if err := m.uploadExtent(ctx, extent.hash, data, nextGeneration); err != nil {
+			err = m.uploadExtent(ctx, extent.hash, data, nextGeneration)
+			m.archiveStats.record(archiveExtentBuildUpload, time.Since(extentStart))
+			if err != nil {
 				return err
 			}
 			extent.object = nextGeneration
@@ -964,7 +978,7 @@ func (m *Manager) syncNowLocked(ctx context.Context, core source, through quepax
 		} else if !m.cas {
 			return err
 		}
-		if err := m.Load(ctx); err != nil {
+		if err := m.loadForSync(ctx); err != nil {
 			return err
 		}
 	}
@@ -990,7 +1004,10 @@ func (m *Manager) publishHead(ctx context.Context, head archiveHead, headCAS *ob
 			options = append(options, objstore.WithIfMatch(headCAS))
 		}
 	}
-	return m.bucket.Upload(ctx, m.key("archive/head.bin"), bytes.NewReader(data), options...)
+	started := time.Now()
+	err = m.bucket.Upload(ctx, m.key("archive/head.bin"), bytes.NewReader(data), options...)
+	m.archiveStats.record(archiveHeadPublish, time.Since(started))
+	return err
 }
 
 func (m *Manager) confirmPublicationLease(ctx context.Context) error {
@@ -1724,12 +1741,23 @@ func (m *Manager) traceRecoveryPinWrite(ctx context.Context, key, phase, status 
 // withPublicationLock waits only before work begins. An error after entry may
 // follow an ambiguous HEAD write and must never replay the whole operation.
 func (m *Manager) withPublicationLock(ctx context.Context, owner string, work func(context.Context) error) error {
+	started := time.Now()
+	admissionRecorded := false
+	defer func() {
+		if !admissionRecorded {
+			m.archiveStats.record(archivePublicationAdmission, time.Since(started))
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	for {
 		entered := false
 		err := m.withArchiveLock(ctx, m.publicationLockKey(), owner, false, func(workCtx context.Context) error {
+			if !admissionRecorded {
+				m.archiveStats.record(archivePublicationAdmission, time.Since(started))
+				admissionRecorded = true
+			}
 			entered = true
 			return work(workCtx)
 		})
@@ -1820,7 +1848,14 @@ func (m *Manager) withArchiveLock(ctx context.Context, key, owner string, gcTrac
 	// carries only the archive Busy observer so a release-side Busy return stays
 	// attributable; no other value, deadline, or lock policy crosses over.
 	releaseCtx = localtesthooks.CarryArchiveBusyObserver(releaseCtx, ctx)
-	release := func() error { return m.releaseArchiveLock(releaseCtx, key, lock) }
+	release := func() error {
+		started := time.Now()
+		err := m.releaseArchiveLock(releaseCtx, key, lock)
+		if !gcTrace {
+			m.archiveStats.record(archivePublicationRelease, time.Since(started))
+		}
+		return err
+	}
 	var releaseErr error
 	if gcTrace {
 		releaseErr = archiveGCTrace(ctx, "lock-release", release)

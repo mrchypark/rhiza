@@ -1999,6 +1999,10 @@ func (n *Node) ObjectStoreStats() (objectstore.Stats, bool) {
 	return n.bucket.Stats(), true
 }
 
+func (n *Node) ArchiveStats() recovery.ArchiveStats {
+	return n.archive.ArchiveStats()
+}
+
 // loadClusterConfig loads cluster configuration.
 func (n *Node) loadClusterConfig() *quepaxa.Cluster {
 	if len(n.config.Members) > 0 {
