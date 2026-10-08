@@ -356,16 +356,49 @@ func TestArchiveSyncThroughSkipsLeaseForDurableTip(t *testing.T) {
 
 func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 	ctx, base, core, waiter, writer := newArchivePreflightManagers(t)
-	if _, _, err := core.Propose(ctx, []byte("published while waiter is blocked")); err != nil {
+	if _, _, err := core.Propose(ctx, []byte("shared certified prefix")); err != nil {
 		t.Fatal(err)
 	}
 	through := core.Tip()
+	for _, value := range []string{"waiter-only suffix 1", "waiter-only suffix 2"} {
+		if _, _, err := core.Propose(ctx, []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fullTip := core.Tip()
+
+	writerWAL, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writerWAL.Close() })
+	writerCore, err := quepaxa.New(quepaxa.Config{
+		NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: writerWAL,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix, _, err := core.DecisionsFromBounded(through, 1, maxExtentPayload)
+	if err != nil || len(prefix) != 1 {
+		t.Fatalf("read shared certified prefix: decisions=%d err=%v", len(prefix), err)
+	}
+	if err := writerCore.AcceptCertifiedValues(prefix); err != nil {
+		t.Fatalf("install shared certified prefix: %v", err)
+	}
+	if writerCore.Tip() != through {
+		t.Fatalf("writer core tip=%d want=%d", writerCore.Tip(), through)
+	}
+	writerPrefix, ok := writerCore.PrefixHash(through)
+	corePrefix, coreHasPrefix := core.PrefixHash(through)
+	if !ok || !coreHasPrefix || writerPrefix != corePrefix {
+		t.Fatal("writer and waiter cores do not share the certified prefix")
+	}
 
 	waiterGates := &archiveStatsBucket{
 		Bucket: base, lockRead: newArchiveStatsGate(), admission: newArchiveStatsGate(),
 		admissionRetry: newArchiveStatsGate(), extent: newArchiveStatsGate(),
 		head: newArchiveStatsGate(), release: newArchiveStatsGate()}
-	for _, gate := range []*archiveStatsGate{waiterGates.admissionRetry, waiterGates.extent, waiterGates.head, waiterGates.release} {
+	for _, gate := range []*archiveStatsGate{waiterGates.extent, waiterGates.head, waiterGates.release} {
 		gate.open()
 	}
 	waiter.bucket = waiterGates
@@ -404,7 +437,7 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 	writerFinished := make(chan struct{})
 	go func() {
 		defer close(writerFinished)
-		writerDone <- writer.SyncThrough(ctx, core, through)
+		writerDone <- writer.SyncThrough(ctx, writerCore, through)
 	}()
 	t.Cleanup(func() {
 		writerGates.release.open()
@@ -428,9 +461,9 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 			t.Fatalf("waiter recheck: %v", err)
 		}
 	case <-waiterGates.admissionRetry.entered:
-		t.Fatal("waiter retried publication admission instead of rechecking the durable tip")
+		t.Fatal("waiter retried publication admission for an unrequested suffix")
 	case <-ctx.Done():
-		t.Fatalf("waiter did not acknowledge the durable target while the lease remained held: %v", ctx.Err())
+		t.Fatalf("waiter did not acknowledge the requested target while the lease remained held: %v", ctx.Err())
 	}
 	select {
 	case err := <-writerDone:
@@ -442,6 +475,9 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 	t.Cleanup(reader.Close)
 	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
 		t.Fatalf("independent durable tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
+	if reader.Tip() >= fullTip {
+		t.Fatalf("unrequested suffix was published with the lower ACK: durable tip=%d full tip=%d", reader.Tip(), fullTip)
 	}
 
 	after := waiter.ArchiveStats()
@@ -459,6 +495,13 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatalf("writer did not finish: %v", ctx.Err())
+	}
+	waiterGates.admissionRetry.open()
+	if err := waiter.SyncThrough(ctx, core, fullTip); err != nil {
+		t.Fatalf("publish suffix on explicit higher request: %v", err)
+	}
+	if err := reader.Load(ctx); err != nil || reader.Tip() != fullTip {
+		t.Fatalf("independent suffix tip=%d want=%d err=%v", reader.Tip(), fullTip, err)
 	}
 }
 

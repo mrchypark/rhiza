@@ -884,6 +884,7 @@ func (m *Manager) syncNow(ctx context.Context, core source, through quepaxa.Slot
 }
 
 func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa.Slot, batch *syncBatch) error {
+	requestedThrough := through
 	if m.Tip() >= through {
 		return nil
 	}
@@ -929,7 +930,15 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 		if sealed {
 			return false, ErrArchiveSealed
 		}
-		return tip >= through, nil
+		recheckThrough := requestedThrough
+		if batch != nil {
+			m.batchMu.Lock()
+			if batch.target > recheckThrough {
+				recheckThrough = batch.target
+			}
+			m.batchMu.Unlock()
+		}
+		return tip >= recheckThrough, nil
 	}, func(ctx context.Context) error {
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
