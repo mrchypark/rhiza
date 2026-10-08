@@ -910,13 +910,6 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 			return nil
 		}
 	}
-	if batch != nil {
-		// Preserve suffix coalescing when this requested target is not yet
-		// durable, but don't make a covered lower target wait for newer work.
-		if tip := core.Tip(); tip > through {
-			through = tip
-		}
-	}
 	return m.withPublicationLockRecheck(ctx, "archive-sync", func(ctx context.Context) (bool, error) {
 		if err := m.loadForSync(ctx); err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -938,16 +931,13 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 			return err
 		}
 		if batch != nil {
-			// Callers may join while remote admission is in progress. Include
-			// their certified decisions in this already-fenced publication.
+			// Include explicit callers that joined while remote admission was
+			// in progress in this already-fenced publication.
 			m.batchMu.Lock()
 			if batch.target > through {
 				through = batch.target
 			}
 			m.batchMu.Unlock()
-			if tip := core.Tip(); tip > through {
-				through = tip
-			}
 		}
 		return m.syncNowLocked(ctx, core, through)
 	})

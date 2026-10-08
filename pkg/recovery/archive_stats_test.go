@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -77,6 +78,7 @@ type archiveStatsBucket struct {
 	preflightLoad  *archiveStatsGate
 	load           *archiveStatsGate
 	extent         *archiveStatsGate
+	extentAbove    quepaxa.Slot
 	head           *archiveStatsGate
 	release        *archiveStatsGate
 }
@@ -139,7 +141,22 @@ func (b *archiveStatsBucket) Attributes(ctx context.Context, name string) (objst
 func (b *archiveStatsBucket) Upload(ctx context.Context, name string, r io.Reader, options ...objstore.ObjectUploadOption) error {
 	switch {
 	case b.syncStarted.Load() && strings.Contains(name, "/archive/blocks/"):
-		if err := b.extent.wait(ctx); err != nil {
+		if b.extentAbove != 0 {
+			data, err := io.ReadAll(r)
+			if err != nil {
+				return err
+			}
+			extent, err := decodeExtent(data)
+			if err != nil {
+				return err
+			}
+			r = bytes.NewReader(data)
+			if extent.End > b.extentAbove {
+				if err := b.extent.wait(ctx); err != nil {
+					return err
+				}
+			}
+		} else if err := b.extent.wait(ctx); err != nil {
 			return err
 		}
 	case b.syncStarted.Load() && strings.HasSuffix(name, "/archive/head.bin"):
@@ -156,6 +173,89 @@ func (b *archiveStatsBucket) Upload(ctx context.Context, name string, r io.Reade
 		b.headWritten.Store(true)
 	}
 	return err
+}
+
+func TestArchiveSyncThroughBatchDoesNotWaitForUnrequestedCoreSuffix(t *testing.T) {
+	ctx, base, core, manager, _ := newArchivePreflightManagers(t)
+	for _, value := range []string{"requested slot", "unrequested suffix 2", "unrequested suffix 3"} {
+		if _, _, err := core.Propose(ctx, []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if core.Tip() != 3 {
+		t.Fatalf("core tip=%d, want 3", core.Tip())
+	}
+
+	gates := &archiveStatsBucket{
+		Bucket: base, lockRead: newArchiveStatsGate(), admission: newArchiveStatsGate(),
+		admissionRetry: newArchiveStatsGate(), extent: newArchiveStatsGate(), extentAbove: 1,
+		head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+	}
+	for _, gate := range []*archiveStatsGate{gates.lockRead, gates.admission, gates.admissionRetry, gates.head, gates.release} {
+		gate.open()
+	}
+	manager.bucket = gates
+	gates.syncStarted.Store(true)
+	lowDone := make(chan error, 1)
+	lowFinished := make(chan struct{})
+	go func() {
+		defer close(lowFinished)
+		lowDone <- manager.SyncThrough(ctx, core, 1)
+	}()
+	t.Cleanup(func() {
+		gates.extent.open()
+		select {
+		case <-lowFinished:
+		case <-time.After(time.Second):
+			t.Error("low-target publisher did not stop during cleanup")
+		}
+	})
+	select {
+	case err := <-lowDone:
+		if err != nil {
+			t.Fatalf("low requested target: %v", err)
+		}
+	case <-gates.extent.entered:
+		t.Fatal("low requested target entered the unrequested suffix upload gate")
+	case <-ctx.Done():
+		t.Fatalf("low requested target did not complete: %v", ctx.Err())
+	}
+
+	reader := NewManager(base, "cluster", 1)
+	t.Cleanup(reader.Close)
+	if err := reader.Load(ctx); err != nil || reader.Tip() != 1 {
+		t.Fatalf("independent tip after low ACK=%d want=1 err=%v", reader.Tip(), err)
+	}
+
+	highDone := make(chan error, 1)
+	go func() { highDone <- manager.SyncThrough(ctx, core, 3) }()
+	select {
+	case <-gates.extent.entered:
+	case err := <-highDone:
+		t.Fatalf("explicit higher target completed before suffix release: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("higher target did not reach its suffix upload: %v", ctx.Err())
+	}
+	select {
+	case err := <-highDone:
+		t.Fatalf("explicit higher target ACKed while suffix upload was gated: %v", err)
+	default:
+	}
+	if err := reader.Load(ctx); err != nil || reader.Tip() != 1 {
+		t.Fatalf("independent tip while higher suffix is gated=%d want=1 err=%v", reader.Tip(), err)
+	}
+	gates.extent.open()
+	select {
+	case err := <-highDone:
+		if err != nil {
+			t.Fatalf("explicit higher target: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("explicit higher target did not complete after suffix release: %v", ctx.Err())
+	}
+	if err := reader.Load(ctx); err != nil || reader.Tip() != 3 {
+		t.Fatalf("independent tip after higher ACK=%d want=3 err=%v", reader.Tip(), err)
+	}
 }
 
 func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
