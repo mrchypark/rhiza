@@ -455,10 +455,13 @@ esac
 			if err != nil || syscall.Kill(pid, 0) == nil {
 				t.Fatal("owned watchdog not reaped before sealing")
 			}
-			verify := exec.Command("shasum", "-a", "256", "-c", "SHA256SUMS")
+			verify := exec.Command("sha256sum", "-c", "SHA256SUMS")
 			verify.Dir = out
-			if err := verify.Run(); err != nil {
-				t.Fatal("runtime seal does not verify")
+			if verifyOutput, err := verify.CombinedOutput(); err != nil {
+				if len(verifyOutput) > 1024 {
+					verifyOutput = verifyOutput[:1024]
+				}
+				t.Fatalf("runtime seal does not verify: %v; diagnostic=%s", err, verifyOutput)
 			}
 			if scenario == "deadline" {
 				child, err := os.ReadFile(filepath.Join(dir, "child"))
