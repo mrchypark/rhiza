@@ -52,8 +52,8 @@ jobs:
           [[ "$RHIZA_APPROVED_CAP_KRW" == 10000 ]]
           [[ -n "$RHIZA_BOOTSTRAP_UID" && -n "$RHIZA_NODE_A" && -n "$RHIZA_NODE_B" && -n "$RHIZA_NODE_C" ]]
           [[ "$RHIZA_METADATA_IMAGE" =~ ^gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:[a-f0-9]{64}$ ]]
-          [[ "$RHIZA_WIF_PROVIDER" == "projects/602454948273/locations/global/workloadIdentityPools/rhiza-v0190-gcs-1008/providers/github" ]]
-          [[ "$RHIZA_CI_GSA" == "rhiza-v0190-ci-1008@patch2-the-new-era.iam.gserviceaccount.com" ]]
+          [[ "$RHIZA_WIF_PROVIDER" == "projects/602454948273/locations/global/workloadIdentityPools/rhiza-v0190-gcs-$RHIZA_RUN_ID/providers/github" ]] || exit 1
+          [[ "$RHIZA_CI_GSA" == "rhiza-v0190-ci-$RHIZA_RUN_ID@patch2-the-new-era.iam.gserviceaccount.com" ]] || exit 1
           printf 'RHIZA_JOB_STARTED=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

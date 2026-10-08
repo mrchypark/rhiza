@@ -181,8 +181,17 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
-      - name: Bucket fixture retry regression
+      - name: Offline bootstrap and bucket fixture regressions
+        env:
+          RHIZA_RUN_ID: '00000000'
+          RHIZA_WORKFLOW_SHA: ${{ github.sha }}
+          RHIZA_AUTH_EXPIRES: '2000-01-01T00:00:00Z'
         run: |
+          command -v curl
+          command -v jq
+          sh -n e2e/chaos/bootstrap-gcs-postrelease.sh
+          sh e2e/chaos/bootstrap-gcs-postrelease.sh check-folder-iam
+          sh e2e/chaos/bootstrap-gcs-postrelease.sh check-cleanup-uris
           python3 e2e/chaos/operator_fixture_test.py
           python3 e2e/chaos/operator_recovery_test.py
       - name: Learner checkpoint adoption crash and lease boundaries
