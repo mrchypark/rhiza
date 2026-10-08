@@ -432,6 +432,44 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 		}
 	})
 	waitArchiveStatsGate(t, ctx, waiterGates.lockRead)
+	waiter.batchMu.Lock()
+	lowerBatch := waiter.batch
+	waiter.batchMu.Unlock()
+	if lowerBatch == nil {
+		t.Fatal("lower request did not create a batch before reaching admission")
+	}
+
+	// This caller joins after flushBatch has snapshotted target 1. Its target
+	// must be retried after the lower request completes independently.
+	highDone := make(chan error, 1)
+	highFinished := make(chan struct{})
+	go func() {
+		defer close(highFinished)
+		highDone <- waiter.SyncThrough(ctx, core, fullTip)
+	}()
+	t.Cleanup(func() {
+		waiterGates.admissionRetry.open()
+		select {
+		case <-highFinished:
+		case <-time.After(time.Second):
+			t.Error("higher waiter did not stop during cleanup")
+		}
+	})
+	deadline := time.After(5 * time.Second)
+	for {
+		waiter.batchMu.Lock()
+		joined := waiter.batch != nil && waiter.batch.target >= fullTip
+		waiter.batchMu.Unlock()
+		if joined {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("higher target did not join the snapshotted lower batch")
+		default:
+			runtime.Gosched()
+		}
+	}
 
 	writerDone := make(chan error, 1)
 	writerFinished := make(chan struct{})
@@ -455,19 +493,48 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 	waiterGates.lockRead.open()
 	waitArchiveStatsGate(t, ctx, waiterGates.admission)
 	waiterGates.admission.open()
+	lowerReturned := false
 	select {
 	case err := <-waiterDone:
 		if err != nil {
 			t.Fatalf("waiter recheck: %v", err)
 		}
+		lowerReturned = true
 	case <-waiterGates.admissionRetry.entered:
-		t.Fatal("waiter retried publication admission for an unrequested suffix")
+		waiter.batchMu.Lock()
+		stillLowerBatch := waiter.batch == lowerBatch
+		waiter.batchMu.Unlock()
+		if stillLowerBatch {
+			t.Fatal("lower request retried admission for a higher late joiner")
+		}
 	case <-ctx.Done():
 		t.Fatalf("waiter did not acknowledge the requested target while the lease remained held: %v", ctx.Err())
+	}
+	if !lowerReturned {
+		select {
+		case err := <-waiterDone:
+			if err != nil {
+				t.Fatalf("waiter recheck: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiter did not acknowledge the requested target while the lease remained held: %v", ctx.Err())
+		}
 	}
 	select {
 	case err := <-writerDone:
 		t.Fatalf("writer released before its release gate opened: %v", err)
+	default:
+	}
+	select {
+	case <-waiterGates.admissionRetry.entered:
+	case err := <-highDone:
+		t.Fatalf("higher caller acknowledged before its target was published: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("higher caller did not retry while publication lease remained held: %v", ctx.Err())
+	}
+	select {
+	case err := <-highDone:
+		t.Fatalf("higher caller acknowledged before its target was published: %v", err)
 	default:
 	}
 
@@ -481,7 +548,7 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 	}
 
 	after := waiter.ArchiveStats()
-	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
+	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+3)
 	assertArchiveStageCount(t, after.Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission)+1)
 	assertArchiveStageCount(t, after.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload))
 	assertArchiveStageCount(t, after.Stages.HeadPublish, stageCount(t, before.Stages.HeadPublish))
@@ -497,11 +564,128 @@ func TestArchiveSyncThroughRechecksPublishedTargetWhileLeaseHeld(t *testing.T) {
 		t.Fatalf("writer did not finish: %v", ctx.Err())
 	}
 	waiterGates.admissionRetry.open()
-	if err := waiter.SyncThrough(ctx, core, fullTip); err != nil {
-		t.Fatalf("publish suffix on explicit higher request: %v", err)
+	select {
+	case err := <-highDone:
+		if err != nil {
+			t.Fatalf("higher waiter retry: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("higher waiter did not publish its target: %v", ctx.Err())
 	}
 	if err := reader.Load(ctx); err != nil || reader.Tip() != fullTip {
 		t.Fatalf("independent suffix tip=%d want=%d err=%v", reader.Tip(), fullTip, err)
+	}
+}
+
+func TestArchiveSyncThroughBusyRecheckRequiresSnapshottedTarget(t *testing.T) {
+	ctx, base, core, waiter, writer := newArchivePreflightManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("shared certified prefix")); err != nil {
+		t.Fatal(err)
+	}
+	through := core.Tip()
+	for _, value := range []string{"higher target suffix 1", "higher target suffix 2"} {
+		if _, _, err := core.Propose(ctx, []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fullTip := core.Tip()
+
+	waiterGates := &archiveStatsBucket{
+		Bucket: base, lockRead: newArchiveStatsGate(), admission: newArchiveStatsGate(),
+		admissionRetry: newArchiveStatsGate(), extent: newArchiveStatsGate(),
+		head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+	}
+	for _, gate := range []*archiveStatsGate{waiterGates.extent, waiterGates.head, waiterGates.release} {
+		gate.open()
+	}
+	waiter.bucket = waiterGates
+	waiterGates.syncStarted.Store(true)
+
+	writerGates := &archiveStatsBucket{
+		Bucket: base, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
+		extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+	}
+	for _, gate := range []*archiveStatsGate{writerGates.admission, writerGates.admissionRetry, writerGates.extent, writerGates.head} {
+		gate.open()
+	}
+	writer.bucket = writerGates
+	writerGates.syncStarted.Store(true)
+
+	waiterDone := make(chan error, 1)
+	waiterFinished := make(chan struct{})
+	go func() {
+		defer close(waiterFinished)
+		waiterDone <- waiter.SyncThrough(ctx, core, fullTip)
+	}()
+	t.Cleanup(func() {
+		waiterGates.lockRead.open()
+		waiterGates.admission.open()
+		waiterGates.admissionRetry.open()
+		select {
+		case <-waiterFinished:
+		case <-time.After(time.Second):
+			t.Error("snapshotted higher request did not stop during cleanup")
+		}
+	})
+	waitArchiveStatsGate(t, ctx, waiterGates.lockRead)
+
+	writerDone := make(chan error, 1)
+	writerFinished := make(chan struct{})
+	go func() {
+		defer close(writerFinished)
+		writerDone <- writer.syncNow(ctx, core, through)
+	}()
+	t.Cleanup(func() {
+		writerGates.release.open()
+		select {
+		case <-writerFinished:
+		case <-time.After(time.Second):
+			t.Error("lower-target writer did not stop during cleanup")
+		}
+	})
+	waitArchiveStatsGate(t, ctx, writerGates.release)
+
+	waiterGates.lockRead.open()
+	waitArchiveStatsGate(t, ctx, waiterGates.admission)
+	waiterGates.admission.open()
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("snapshotted higher target returned before it was durable: %v", err)
+	case <-waiterGates.admissionRetry.entered:
+	case <-ctx.Done():
+		t.Fatalf("higher target did not recheck the lower publication: %v", ctx.Err())
+	}
+	select {
+	case err := <-waiterDone:
+		t.Fatalf("snapshotted higher target returned before it was durable: %v", err)
+	default:
+	}
+	reader := NewManager(base, "cluster", 1)
+	t.Cleanup(reader.Close)
+	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
+		t.Fatalf("independent lower durable tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
+
+	writerGates.release.open()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("lower-target writer: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("lower-target writer did not finish: %v", ctx.Err())
+	}
+	waiterGates.admissionRetry.open()
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("snapshotted higher target retry: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("snapshotted higher target did not publish: %v", ctx.Err())
+	}
+	if err := reader.Load(ctx); err != nil || reader.Tip() != fullTip {
+		t.Fatalf("independent higher durable tip=%d want=%d err=%v", reader.Tip(), fullTip, err)
 	}
 }
 
