@@ -72,30 +72,74 @@ awk 'BEGIN{RS="---\n"} /name: rhiza-metadata/{print}' "$out/initial.yaml" > "$ou
 awk 'BEGIN{RS="---\n"} !/name: rhiza-metadata/ && !/name: rhiza-quic-probe/ && !/kind: NetworkPolicy/{print $0 "---"}' "$out/initial.yaml" > "$out/voters.yaml"
 awk 'BEGIN{RS="---\n"} /name: rhiza-quic-probe/{print}' "$out/initial.yaml" > "$out/probe.yaml"
 awk 'BEGIN{RS="---\n"} /kind: NetworkPolicy/{print}' "$out/initial.yaml" > "$out/cold-policy.yaml"
+shutdown_events() {
+  jq -s -e --slurpfile before "$1/shutdown-before.json" '
+    . as $events |
+    if any($events[]; .type=="ERROR") then error("watch ERROR event")
+    elif any($before[0][]; . as $pod | any($events[];
+      .object.metadata.name==$pod.name and (.object.metadata.uid!=$pod.uid or
+        any(.object.status.containerStatuses[]?; .name=="rhiza" and
+          (.containerID!=$pod.container_id or .imageID!=$pod.image_id or .restartCount!=$pod.restart_count or
+            (.state.terminated!=null and (.state.terminated.exitCode!=0 or (.state.terminated.signal // 0)!=0)))))))
+      then error("watch writer incarnation/termination changed")
+    elif all($before[0][]; . as $pod | any($events[]; .object.metadata.uid==$pod.uid and
+      any(.object.status.containerStatuses[]?; .name=="rhiza" and .containerID==$pod.container_id and
+        .imageID==$pod.image_id and .restartCount==$pod.restart_count and
+        .state.terminated.exitCode==0 and (.state.terminated.signal // 0)==0)))
+      then $events else empty end
+  ' "$1/shutdown-watch.json"
+}
+wait_shutdown_watch() {
+  # Partial JSON while this stream is still writing is pending, never proof.
+  # Preserve the first parser error; EOF/error/deadline without full events fails.
+  watch_finished=false
+  while :; do
+    shutdown_events "$1" > "$1/shutdown-watch-proof.next.json" 2> "$1/shutdown-watch-parse.stderr"
+    watch_parse_code=$?
+    if [ -s "$1/shutdown-watch-parse.stderr" ] && [ ! -e "$1/shutdown-watch-first-parse.stderr" ]; then
+      cp "$1/shutdown-watch-parse.stderr" "$1/shutdown-watch-first-parse.stderr"
+      printf '%s\n' "$watch_parse_code" > "$1/shutdown-watch-first-parse.exit"
+    fi
+    if [ "$watch_parse_code" = 0 ]; then
+      mv "$1/shutdown-watch-proof.next.json" "$1/shutdown-watch-proof.json"
+      return 0
+    fi
+    case "$watch_parse_code" in
+      4) ;; # Complete JSON, terminal events not yet present.
+      5) grep -q '^jq: parse error:' "$1/shutdown-watch-parse.stderr" || return 1 ;;
+      *) return 1 ;;
+    esac
+    [ ! -s "$1/shutdown-watch.stderr" ] || return 1
+    [ "$watch_finished" = false ] || return 1
+    [ "$(date +%s)" -lt "$3" ] || return 124
+    # A stream can finish between parsing and observing EOF. Re-read ONCE at
+    # EOF so complete final bytes are not discarded; invalid bytes still fail.
+    if [ -n "$2" ]; then
+      if ! kill -0 "$2" 2>/dev/null; then watch_finished=true; continue; fi
+    elif [ -e "$1/shutdown-watch.exit" ]; then watch_finished=true; continue; fi
+    sleep 1
+  done
+}
 verify_shutdown() {
   proof_dir=$1
   case "$(cat "$proof_dir/shutdown-watch.exit")" in 0|143) ;; *) return 1 ;; esac
   jq -e '.items|length==0' "$proof_dir/shutdown-writers-after.json" >/dev/null || return 1
   jq -e '.spec.replicas==0 and (.status.replicas // 0)==0' "$proof_dir/shutdown-controller.json" >/dev/null || return 1
-  jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg image "$RHIZA_HOST_IMAGE" '
+  jq -e --slurpfile expected "$proof_dir/shutdown-expected.json" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg image "$RHIZA_HOST_IMAGE" '
+    ($expected[0]|sort_by(.name)) as $expected |
+    ($expected|map(.name)) as $names |
+    ($names==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] or
+      $names==["rhiza-learner","rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"]) and
+    all($expected[]; .namespace==$ns and .run==$run and (.uid|type)=="string" and (.uid|length)>0) and
+    (map({name,namespace,run,uid})|sort_by(.name))==$expected and
     type=="array" and all(.[]; .namespace==$ns and .run==$run and
       (.uid|type)=="string" and (.uid|length)>0 and (.container_id|type)=="string" and (.container_id|length)>0 and
       .image==$image and (.image_id|endswith($image|split("@")[1])) and
       (.name|test("^rhiza-voter-[012]$|^rhiza-learner$")) and .restart_count>=0) and
     ([.[].uid]|unique|length)==length
   ' "$proof_dir/shutdown-before.json" >/dev/null || return 1
-  jq -s -e --slurpfile before "$proof_dir/shutdown-before.json" '
-    . as $events | all($events[]; .type!="ERROR") and all($before[0][]; . as $pod |
-      all($events[]; if .object.metadata.name==$pod.name then
-        .object.metadata.uid==$pod.uid and all(.object.status.containerStatuses[]?;
-          if .name=="rhiza" then .containerID==$pod.container_id and .imageID==$pod.image_id and
-            .restartCount==$pod.restart_count else true end)
-        else true end) and
-      any($events[]; .object.metadata.uid==$pod.uid and
-        any(.object.status.containerStatuses[]?; .name=="rhiza" and .containerID==$pod.container_id and
-          .imageID==$pod.image_id and .restartCount==$pod.restart_count and
-          .state.terminated.exitCode==0 and (.state.terminated.signal // 0)==0)))
-  ' "$proof_dir/shutdown-watch.json" >/dev/null || return 1
+  # Use the complete parsed stream captured before intentionally stopping it.
+  [ -s "$proof_dir/shutdown-watch-proof.json" ] || return 1
   for proof_pod in $(jq -r '.[].name' "$proof_dir/shutdown-before.json"); do
     [ "$(cat "$proof_dir/$proof_pod-shutdown-log.exit")" = 0 ] || return 1
     jq -R -s -e --arg name "$proof_pod" --slurpfile before "$proof_dir/shutdown-before.json" '
@@ -112,6 +156,14 @@ verify_shutdown() {
 }
 if [ "$mode" = check-shutdown ]; then
   : "${RHIZA_SHUTDOWN_FIXTURE:?offline proof directory required}"
+  if [ "${RHIZA_SHUTDOWN_WAIT:-}" = yes ]; then
+    set +e
+    wait_shutdown_watch "$RHIZA_SHUTDOWN_FIXTURE" '' "$(( $(date +%s) + 5 ))"
+    wait_code=$?
+    [ "$wait_code" = 0 ] || exit "$wait_code"
+  else
+    shutdown_events "$RHIZA_SHUTDOWN_FIXTURE" > "$RHIZA_SHUTDOWN_FIXTURE/shutdown-watch-proof.json"
+  fi
   verify_shutdown "$RHIZA_SHUTDOWN_FIXTURE"
   exit $?
 fi
@@ -190,6 +242,7 @@ stop_watchdog() {
 pf_pids=''
 active_fault=''
 owned_created=false
+learner_attempted=false
 shutdown_watch_pid=''
 shutdown_log_pids=''
 shutdown_capture=false
@@ -205,6 +258,22 @@ shutdown_stream() {
   exec timeout --kill-after=5s 240s kubectl --context="$context" --namespace="$ns" --request-timeout=0 "$@"
 }
 capture_shutdown() {
+  # Original PodUIDs cover all created writers. Planned container-kill history
+  # is not a clean Close: only the current incarnation is pinned below.
+  jq -e '[.[]|select(.name|test("^rhiza-voter-[012]$"))] as $v |
+    ($v|map(.name)|sort)==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] and
+    all($v[]; (.uid|type)=="string" and (.uid|length)>0)
+  ' "$out/voters-before.json" >/dev/null || return 1
+  jq --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '[.[]|select(.name|test("^rhiza-voter-[012]$"))|{name,uid,namespace:$ns,run:$run}]' \
+    "$out/voters-before.json" > "$out/shutdown-expected.json" || return $?
+  if [ "$learner_attempted" = true ]; then
+    jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.metadata.name=="rhiza-learner" and
+      .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
+      (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/learner-created.json" >/dev/null || return 1
+    jq --slurpfile learner "$out/learner-created.json" '.+[$learner[0].metadata|{name,uid,namespace,run:.labels["chaos.rhiza.io/run"]}]' \
+      "$out/shutdown-expected.json" > "$out/shutdown-expected.next.json" || return $?
+    mv "$out/shutdown-expected.next.json" "$out/shutdown-expected.json"
+  fi
   k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-before.json" 2> "$out/shutdown-pods-before.stderr" || return $?
   # Never silently omit a writer whose status/log incarnation is unavailable.
   jq -e 'all(.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner");
@@ -215,6 +284,10 @@ capture_shutdown() {
     {name:$pod.metadata.name,namespace:$pod.metadata.namespace,run:$pod.metadata.labels["chaos.rhiza.io/run"],uid:$pod.metadata.uid,
       image:([ $pod.spec.containers[]|select(.name=="rhiza")|.image ][0]),image_id:.imageID,
       container_id:.containerID,restart_count:.restartCount}]' "$out/shutdown-pods-before.json" > "$out/shutdown-before.json" || return $?
+  jq -e --slurpfile expected "$out/shutdown-expected.json" \
+    '(map({name,uid,namespace,run})|sort_by(.name))==($expected[0]|sort_by(.name))' "$out/shutdown-before.json" >/dev/null || return 1
+  shutdown_watch_deadline=$(( $(date +%s) + 240 ))
+  if [ "$mode" = run-local ] && [ "$shutdown_watch_deadline" -gt "$local_deadline" ]; then shutdown_watch_deadline=$local_deadline; fi
   resource_version=$(jq -r '.metadata.resourceVersion' "$out/shutdown-pods-before.json")
   shutdown_stream get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" --watch-only --output-watch-events \
     --resource-version="$resource_version" -o json > "$out/shutdown-watch.json" 2> "$out/shutdown-watch.stderr" & shutdown_watch_pid=$!
@@ -229,6 +302,9 @@ finish_shutdown_capture() {
     wait "${log_owner#*:}"
     printf '%s\n' "$?" > "$out/${log_owner%:*}-shutdown-log.exit"
   done
+  wait_shutdown_watch "$out" "$shutdown_watch_pid" "$shutdown_watch_deadline"
+  watch_proof_code=$?
+  printf '%s\n' "$watch_proof_code" > "$out/shutdown-watch-proof.exit"
   if [ -n "$shutdown_watch_pid" ]; then
     kill "$shutdown_watch_pid" 2>/dev/null
     wait "$shutdown_watch_pid"
@@ -236,6 +312,7 @@ finish_shutdown_capture() {
     shutdown_watch_pid=''
   fi
   [ ! -s "$out/shutdown-watch.stderr" ] || return 1
+  [ "$watch_proof_code" = 0 ] || return "$watch_proof_code"
   k get statefulset/rhiza-voter -o json > "$out/shutdown-controller.json" 2> "$out/shutdown-controller.stderr" || return $?
   k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-after.json" 2> "$out/shutdown-pods-after.stderr" || return $?
   jq '{items:[.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner")]}' \
@@ -548,7 +625,17 @@ done
 run probe-identity-after k get pod rhiza-quic-probe -o json
 jq -e --slurpfile before "$probe_identity" '.metadata.uid==$before[0].metadata.uid and .status.podIP==$before[0].status.podIP and .spec.nodeName==$before[0].spec.nodeName and .metadata.labels==$before[0].metadata.labels and .status.containerStatuses[0].restartCount==0' "$out/$seq-probe-identity-after.stdout" >/dev/null || die 'probe identity changed across policy verification'
 run probe-delete k delete pod/rhiza-quic-probe --wait=true --timeout=60s
-run cold-create k create -f "$out/learner.yaml"
+learner_attempted=true
+run cold-create k create -f "$out/learner.yaml" -o json
+# This manifest creates a Service and Pod; retain the authentic List ACK and
+# extract exactly one learner Pod, not a later name-only lookup.
+cp "$out/$seq-cold-create.stdout" "$out/learner-create-ack.json"
+jq '[if .kind=="List" then .items[] else . end|select(.kind=="Pod" and .metadata.name=="rhiza-learner")] |
+  if length==1 then .[0] else error("learner create UID unresolved") end' \
+  "$out/learner-create-ack.json" > "$out/learner-created.json" || die 'learner create UID unresolved'
+jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.metadata.name=="rhiza-learner" and
+  .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
+  (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/learner-created.json" >/dev/null || die 'learner create UID unresolved'
 run learner-running k wait pod/rhiza-learner --for=jsonpath='{.status.phase}'=Running --timeout=180s
 forward rhiza-learner 18083
 learner_started=true

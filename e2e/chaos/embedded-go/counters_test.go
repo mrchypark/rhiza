@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
@@ -573,7 +574,7 @@ func TestQualificationHostSIGTERM(t *testing.T) {
 }
 
 func TestQualificationShutdownProof(t *testing.T) {
-	for _, scenario := range []string{"complete", "missing-completion", "close-failure", "wrong-uid", "wrong-process", "forced-kill", "different-container", "different-image", "restarted", "no-terminal-event", "log-failure", "recreation", "replacement-event", "writers-remain", "watch-timeout", "watch-error"} {
+	for _, scenario := range []string{"complete", "missing-completion", "close-failure", "wrong-uid", "wrong-process", "forced-kill", "different-container", "different-image", "restarted", "no-terminal-event", "log-failure", "recreation", "replacement-event", "writers-remain", "watch-timeout", "watch-error", "empty-before", "missing-voter", "replacement-uid", "learner-omitted", "unresolved-learner-uid", "incomplete-startup", "planned-restart-current", "learner-current", "async-terminal", "async-parse-failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			const run = "a1b2c3d4"
@@ -590,9 +591,14 @@ func TestQualificationShutdownProof(t *testing.T) {
 				}
 			}
 			pod := map[string]any{"name": "rhiza-voter-0", "namespace": ns, "run": run, "uid": "owned-uid", "container_id": "containerd://owned", "image": image, "image_id": image, "restart_count": 0}
-			writeJSON("shutdown-before.json", []any{pod})
 			status := map[string]any{"name": "rhiza", "containerID": "containerd://owned", "imageID": image, "restartCount": 0,
 				"state": map[string]any{"terminated": map[string]any{"exitCode": 0, "signal": 0}}}
+			if scenario == "planned-restart-current" {
+				// Original PodUID is unchanged; do not demand graceful Close of
+				// the historical killed container. Only this current one closes0.
+				pod["container_id"], pod["restart_count"] = "containerd://current", 1
+				status["containerID"], status["restartCount"] = "containerd://current", 1
+			}
 			if scenario == "forced-kill" {
 				status["state"] = map[string]any{"terminated": map[string]any{"exitCode": 137, "signal": 9}}
 			}
@@ -673,6 +679,65 @@ func TestQualificationShutdownProof(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, "rhiza-voter-0-shutdown-log.exit"), []byte(logExit), 0600); err != nil {
 				t.Fatal(err)
 			}
+			before := []any{pod}
+			expected := []any{map[string]any{"name": "rhiza-voter-0", "namespace": ns, "run": run, "uid": "owned-uid"}}
+			peers := 2
+			if scenario == "learner-current" {
+				peers = 3
+			}
+			for i := 1; i <= peers; i++ {
+				name, uid := fmt.Sprintf("rhiza-voter-%d", i), fmt.Sprintf("owned-uid-%d", i)
+				if i == 3 {
+					name, uid = "rhiza-learner", "created-learner-uid"
+				}
+				before = append(before, map[string]any{"name": name, "namespace": ns, "run": run, "uid": uid, "container_id": "containerd://owned", "image": image, "image_id": image, "restart_count": 0})
+				expected = append(expected, map[string]any{"name": name, "namespace": ns, "run": run, "uid": uid})
+				encoded, err := json.Marshal(map[string]any{"type": "DELETED", "object": map[string]any{"metadata": map[string]any{"name": name, "uid": uid}, "status": map[string]any{"containerStatuses": []any{map[string]any{"name": "rhiza", "containerID": "containerd://owned", "imageID": image, "restartCount": 0, "state": map[string]any{"terminated": map[string]int{"exitCode": 0, "signal": 0}}}}}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				file, err := os.OpenFile(filepath.Join(dir, "shutdown-watch.json"), os.O_APPEND|os.O_WRONLY, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = file.Write(append(encoded, '\n'))
+				_ = file.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var peerLogs bytes.Buffer
+				peerIdentity := shutdownIdentity{ns, run, uid, name, strings.Repeat("b", 32)}
+				if err := hostMarker(&peerLogs, "qualification-host-start", peerIdentity, false, false); err != nil {
+					t.Fatal(err)
+				}
+				if err := hostMarker(&peerLogs, "qualification-host-shutdown-complete", peerIdentity, true, true); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name+"-shutdown.log"), peerLogs.Bytes(), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name+"-shutdown-log.exit"), []byte("0\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch scenario {
+			case "empty-before":
+				before = []any{}
+			case "missing-voter":
+				before = before[:2]
+			case "replacement-uid":
+				pod["uid"] = "replacement"
+			case "learner-omitted", "unresolved-learner-uid":
+				learnerUID := "created-learner-uid"
+				if scenario == "unresolved-learner-uid" {
+					learnerUID = ""
+				}
+				expected = append(expected, map[string]any{"name": "rhiza-learner", "namespace": ns, "run": run, "uid": learnerUID})
+			case "incomplete-startup":
+				expected, before = expected[:2], before[:2]
+			}
+			writeJSON("shutdown-before.json", before)
+			writeJSON("shutdown-expected.json", expected)
 			script, err := filepath.Abs("../run-gcs-postrelease.sh")
 			if err != nil {
 				t.Fatal(err)
@@ -682,8 +747,43 @@ func TestQualificationShutdownProof(t *testing.T) {
 				"RHIZA_HOST_IMAGE=" + image, "RHIZA_METADATA_IMAGE=gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:" + strings.Repeat("e", 64),
 				"RHIZA_NODE_A=gke-ied-cluster-fixture-a", "RHIZA_NODE_B=gke-ied-cluster-fixture-b", "RHIZA_NODE_C=gke-ied-cluster-fixture-c",
 				"RHIZA_OUTPUT=" + filepath.Join(dir, "render"), "RHIZA_SHUTDOWN_FIXTURE=" + dir}
+			var producer *exec.Cmd
+			if scenario == "async-terminal" || scenario == "async-parse-failure" {
+				// Logs already have EOF; the independent native stream completes
+				// later. Exercise the actual shell waiter, not a completed file.
+				ready, err := os.ReadFile(filepath.Join(dir, "shutdown-watch.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "watch-ready.json"), ready, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(dir, "shutdown-watch.exit")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "shutdown-watch.json"), []byte("{\"type\":"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				producer = exec.Command("sh", "-c", `sleep 1; if [ "$2" = async-terminal ]; then cp "$1/watch-ready.json" "$1/shutdown-watch.json"; fi; printf '0\n' > "$1/shutdown-watch.exit"`, "fixture", dir, scenario)
+				if err := producer.Start(); err != nil {
+					t.Fatal(err)
+				}
+				command.Env = append(command.Env, "RHIZA_SHUTDOWN_WAIT=yes")
+			}
 			output, err := command.CombinedOutput()
-			if (err == nil) != (scenario == "complete") {
+			if producer != nil {
+				if err := producer.Wait(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, "shutdown-watch-first-parse.stderr")); err != nil {
+					t.Fatal("initial incomplete parser evidence not retained")
+				}
+			}
+			if (err == nil) != (scenario == "complete" || scenario == "planned-restart-current" || scenario == "learner-current" || scenario == "async-terminal") {
+				for _, name := range []string{"shutdown-watch.json", "shutdown-watch.exit", "shutdown-watch-proof.json", "shutdown-watch-parse.stderr", "shutdown-watch-first-parse.stderr", "shutdown-watch-first-parse.exit", "shutdown-before.json", "shutdown-expected.json"} {
+					data, readErr := os.ReadFile(filepath.Join(dir, name))
+					t.Logf("synthetic %s: read=%v bytes=%s", name, readErr, data)
+				}
 				t.Fatalf("proof scenario=%s result=%v output=%s", scenario, err, output)
 			}
 		})
