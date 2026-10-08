@@ -931,6 +931,127 @@ func TestArchiveLeaseIfMatchVersity(t *testing.T) {
 	if err := freshManager.releaseArchiveLock(ctx, key, reacquired); err != nil {
 		t.Fatal("reacquired lease release failed")
 	}
+
+	sequentialPrefix := prefix + "/sequential-noop"
+	sequentialManager := NewManager(bucket, sequentialPrefix, 1)
+	t.Cleanup(sequentialManager.Close)
+	noOpCall := func(manager *Manager) (entered, succeeded bool) {
+		err := manager.withPublicationLock(ctx, "archive-sync", func(context.Context) error {
+			entered = true
+			return nil
+		})
+		return entered, err == nil
+	}
+
+	sequentialBefore := bucket.Stats()
+	sequentialStart := time.Now()
+	var sequentialEntries, sequentialSuccesses int
+	for range 6 {
+		entered, succeeded := noOpCall(sequentialManager)
+		if entered {
+			sequentialEntries++
+		}
+		if succeeded {
+			sequentialSuccesses++
+		}
+	}
+	sequentialWallMS := time.Since(sequentialStart).Milliseconds()
+	sequentialAfter := bucket.Stats()
+	sequentialStage := sequentialManager.ArchiveStats().Stages
+
+	parallelPrefix := prefix + "/parallel-noop"
+	parallelManagers := []*Manager{
+		NewManager(bucket, parallelPrefix, 1),
+		NewManager(bucket, parallelPrefix, 1),
+		NewManager(bucket, parallelPrefix, 1),
+	}
+	for _, manager := range parallelManagers {
+		t.Cleanup(manager.Close)
+	}
+	type workerResult struct {
+		operations int
+		entries    int
+		successes  int
+	}
+	start := make(chan struct{})
+	ready := sync.WaitGroup{}
+	results := make(chan workerResult, len(parallelManagers))
+	parallelBefore := bucket.Stats()
+	for _, manager := range parallelManagers {
+		ready.Add(1)
+		go func(manager *Manager) {
+			result := workerResult{}
+			ready.Done()
+			<-start
+			for range 2 {
+				result.operations++
+				entered, succeeded := noOpCall(manager)
+				if entered {
+					result.entries++
+				}
+				if succeeded {
+					result.successes++
+				}
+			}
+			results <- result
+		}(manager)
+	}
+	ready.Wait()
+	parallelStart := time.Now()
+	close(start)
+	var parallelOperations, parallelEntries, parallelSuccesses int
+	for range parallelManagers {
+		result := <-results
+		parallelOperations += result.operations
+		parallelEntries += result.entries
+		parallelSuccesses += result.successes
+	}
+	parallelWallMS := time.Since(parallelStart).Milliseconds()
+	parallelAfter := bucket.Stats()
+
+	var parallelAdmissionCount, parallelAdmissionNSSum uint64
+	var parallelReleaseCount, parallelReleaseNSSum uint64
+	parallelStatsAvailable := true
+	for _, manager := range parallelManagers {
+		stages := manager.ArchiveStats().Stages
+		admission, release := stages.PublicationAdmission, stages.PublicationRelease
+		if !admission.Available || admission.Count == nil || admission.DurationNSSum == nil ||
+			!release.Available || release.Count == nil || release.DurationNSSum == nil {
+			parallelStatsAvailable = false
+			continue
+		}
+		parallelAdmissionCount += *admission.Count
+		parallelAdmissionNSSum += *admission.DurationNSSum
+		parallelReleaseCount += *release.Count
+		parallelReleaseNSSum += *release.DurationNSSum
+	}
+	sequentialAdmission, sequentialRelease := sequentialStage.PublicationAdmission, sequentialStage.PublicationRelease
+	sequentialStatsAvailable := sequentialAdmission.Available && sequentialAdmission.Count != nil && sequentialAdmission.DurationNSSum != nil &&
+		sequentialRelease.Available && sequentialRelease.Count != nil && sequentialRelease.DurationNSSum != nil
+	var sequentialAdmissionCount, sequentialAdmissionNSSum uint64
+	var sequentialReleaseCount, sequentialReleaseNSSum uint64
+	if sequentialStatsAvailable {
+		sequentialAdmissionCount, sequentialAdmissionNSSum = *sequentialAdmission.Count, *sequentialAdmission.DurationNSSum
+		sequentialReleaseCount, sequentialReleaseNSSum = *sequentialRelease.Count, *sequentialRelease.DurationNSSum
+	}
+	t.Logf("ARCHIVE_LOCK_NOOP arm=sequential operations=%d callbacks=%d successes=%d wall_ms=%d stats_available=%t admission_count=%d admission_duration_ns_sum=%d release_count=%d release_duration_ns_sum=%d s3_http_requests=%d condition_conflicts=%d",
+		6, sequentialEntries, sequentialSuccesses, sequentialWallMS, sequentialStatsAvailable,
+		sequentialAdmissionCount, sequentialAdmissionNSSum, sequentialReleaseCount, sequentialReleaseNSSum,
+		sequentialAfter.HTTPRequests-sequentialBefore.HTTPRequests,
+		sequentialAfter.ConditionConflicts-sequentialBefore.ConditionConflicts)
+	t.Logf("ARCHIVE_LOCK_NOOP arm=parallel operations=%d callbacks=%d successes=%d wall_ms=%d stats_available=%t admission_count=%d admission_duration_ns_sum=%d release_count=%d release_duration_ns_sum=%d s3_http_requests=%d condition_conflicts=%d",
+		parallelOperations, parallelEntries, parallelSuccesses, parallelWallMS, parallelStatsAvailable,
+		parallelAdmissionCount, parallelAdmissionNSSum, parallelReleaseCount, parallelReleaseNSSum,
+		parallelAfter.HTTPRequests-parallelBefore.HTTPRequests,
+		parallelAfter.ConditionConflicts-parallelBefore.ConditionConflicts)
+	if !sequentialStatsAvailable || sequentialEntries != 6 || sequentialSuccesses != 6 ||
+		*sequentialAdmission.Count != 6 || *sequentialRelease.Count != 6 {
+		t.Fatal("sequential no-op lease arm did not complete six admitted callbacks")
+	}
+	if !parallelStatsAvailable || parallelOperations != 6 || parallelEntries != 6 || parallelSuccesses != 6 ||
+		parallelAdmissionCount != 6 || parallelReleaseCount != 6 {
+		t.Fatal("parallel no-op lease arm did not complete six admitted callbacks")
+	}
 }
 
 func testArchiveBusyTraceRealGCLockAndNonBusy(t *testing.T) {

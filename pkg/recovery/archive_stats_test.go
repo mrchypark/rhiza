@@ -2,13 +2,17 @@ package recovery
 
 import (
 	"context"
+	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/qlog"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
 
@@ -21,6 +25,29 @@ type archiveStatsGate struct {
 
 func newArchiveStatsGate() *archiveStatsGate {
 	return &archiveStatsGate{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func newArchivePreflightManagers(t *testing.T) (context.Context, objstore.Bucket, *quepaxa.Core, *Manager, *Manager) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := objstore.NewInMemBucket()
+	stale, writer := NewManager(bucket, "cluster", 1), NewManager(bucket, "cluster", 1)
+	t.Cleanup(stale.Close)
+	t.Cleanup(writer.Close)
+	if err := stale.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, bucket, core, stale, writer
 }
 
 func (g *archiveStatsGate) wait(ctx context.Context) error {
@@ -42,8 +69,12 @@ type archiveStatsBucket struct {
 	syncStarted    atomic.Bool
 	headWritten    atomic.Bool
 	lockReads      atomic.Uint32
+	loadReads      atomic.Uint32
+	failPreflight  atomic.Bool
+	lockRead       *archiveStatsGate
 	admission      *archiveStatsGate
 	admissionRetry *archiveStatsGate
+	preflightLoad  *archiveStatsGate
 	load           *archiveStatsGate
 	extent         *archiveStatsGate
 	head           *archiveStatsGate
@@ -52,6 +83,11 @@ type archiveStatsBucket struct {
 
 func (b *archiveStatsBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
 	if b.syncStarted.Load() && strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
+		if b.lockRead != nil {
+			if err := b.lockRead.wait(ctx); err != nil {
+				return nil, err
+			}
+		}
 		switch b.lockReads.Add(1) {
 		case 1:
 			reader, err := b.Bucket.Get(ctx, name)
@@ -73,9 +109,28 @@ func (b *archiveStatsBucket) Get(ctx context.Context, name string) (io.ReadClose
 }
 
 func (b *archiveStatsBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
-	if b.syncStarted.Load() && strings.HasSuffix(name, "/archive/head.bin") {
-		if err := b.load.wait(ctx); err != nil {
+	if b.syncStarted.Load() && strings.HasSuffix(name, "/archive/PUBLISH_LOCK") && b.lockRead != nil {
+		if err := b.lockRead.wait(ctx); err != nil {
 			return objstore.ObjectAttributes{}, err
+		}
+	}
+	if b.syncStarted.Load() && strings.HasSuffix(name, "/archive/head.bin") {
+		switch b.loadReads.Add(1) {
+		case 1:
+			if b.preflightLoad != nil {
+				if err := b.preflightLoad.wait(ctx); err != nil {
+					return objstore.ObjectAttributes{}, err
+				}
+			}
+			if b.failPreflight.CompareAndSwap(true, false) {
+				return objstore.ObjectAttributes{}, errors.New("injected preflight head read failure")
+			}
+		case 2:
+			if b.load != nil {
+				if err := b.load.wait(ctx); err != nil {
+					return objstore.ObjectAttributes{}, err
+				}
+			}
 		}
 	}
 	return b.Bucket.Attributes(ctx, name)
@@ -109,13 +164,15 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	_, bucket, core, manager := newSealableArchive(t)
 	defer manager.Close()
 	gates := &archiveStatsBucket{
-		Bucket: bucket, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(), load: newArchiveStatsGate(),
+		Bucket: bucket, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
+		preflightLoad: newArchiveStatsGate(), load: newArchiveStatsGate(),
 		extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
 	}
 	manager.bucket = gates
 	t.Cleanup(func() {
 		gates.admission.open()
 		gates.admissionRetry.open()
+		gates.preflightLoad.open()
 		gates.load.open()
 		gates.extent.open()
 		gates.head.open()
@@ -149,6 +206,9 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	gates.syncStarted.Store(true)
 	go func() { syncDone <- manager.SyncThrough(ctx, core, core.Tip()) }()
 
+	waitArchiveStatsGate(t, ctx, gates.preflightLoad)
+	assertArchiveStageCount(t, manager.ArchiveStats().Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission))
+	gates.preflightLoad.open()
 	waitArchiveStatsGate(t, ctx, gates.admission)
 	gates.admission.open()
 	waitArchiveStatsGate(t, ctx, gates.admissionRetry)
@@ -168,7 +228,7 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	if got := *afterAdmission.Stages.PublicationAdmission.DurationNSSum - *before.Stages.PublicationAdmission.DurationNSSum; got < uint64(50*time.Millisecond) {
 		t.Fatalf("admission duration=%dns, want at least one bounded retry interval", got)
 	}
-	assertArchiveStageCount(t, afterAdmission.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad))
+	assertArchiveStageCount(t, afterAdmission.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+1)
 	assertArchiveStageCount(t, afterAdmission.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload))
 	assertArchiveStageCount(t, afterAdmission.Stages.HeadPublish, stageCount(t, before.Stages.HeadPublish))
 	assertArchiveStageCount(t, afterAdmission.Stages.PublicationRelease, stageCount(t, before.Stages.PublicationRelease))
@@ -176,7 +236,7 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	gates.load.open()
 	waitArchiveStatsGate(t, ctx, gates.extent)
 	afterLoad := manager.ArchiveStats()
-	assertArchiveStageCount(t, afterLoad.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+1)
+	assertArchiveStageCount(t, afterLoad.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
 	assertArchiveStageCount(t, afterLoad.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload))
 
 	gates.extent.open()
@@ -202,10 +262,221 @@ func TestArchiveStatsMeasureSyncThroughBoundaries(t *testing.T) {
 	}
 	after := manager.ArchiveStats()
 	assertArchiveStageCount(t, after.Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission)+1)
-	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+1)
+	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
 	assertArchiveStageCount(t, after.Stages.ExtentBuildUpload, stageCount(t, before.Stages.ExtentBuildUpload)+1)
 	assertArchiveStageCount(t, after.Stages.HeadPublish, stageCount(t, before.Stages.HeadPublish)+1)
 	assertArchiveStageCount(t, after.Stages.PublicationRelease, stageCount(t, before.Stages.PublicationRelease)+1)
+}
+
+func TestArchiveSyncThroughSkipsLeaseForDurableTip(t *testing.T) {
+	ctx, base, core, stale, writer := newArchivePreflightManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("durable before stale sync")); err != nil {
+		t.Fatal(err)
+	}
+	through := core.Tip()
+	if err := writer.SyncThrough(ctx, core, through); err != nil {
+		t.Fatalf("publish durable target: %v", err)
+	}
+	gates := &archiveStatsBucket{
+		Bucket: base, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
+		extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+	}
+	for _, gate := range []*archiveStatsGate{gates.admissionRetry, gates.extent, gates.head, gates.release} {
+		gate.open()
+	}
+	stale.bucket = gates
+	gates.syncStarted.Store(true)
+	t.Cleanup(gates.admission.open)
+
+	holder := NewManager(base, "cluster", 1)
+	t.Cleanup(holder.Close)
+	lease, err := holder.acquireArchiveLock(ctx, holder.publicationLockKey(), "preflight-test-holder", archivePinLease)
+	if err != nil {
+		t.Fatalf("hold publication lease: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
+			t.Errorf("release publication lease: %v", err)
+		}
+	})
+
+	before := stale.ArchiveStats()
+	done := make(chan error, 1)
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() { done <- stale.SyncThrough(callCtx, core, through) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("already durable target: %v", err)
+		}
+	case <-gates.admission.entered:
+		cancel()
+		<-done
+		t.Fatal("already durable target attempted remote publication admission")
+	case <-time.After(5 * time.Second):
+		t.Fatal("already durable target did not return")
+	}
+	assertArchiveStageCount(t, stale.ArchiveStats().Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission))
+	assertArchiveStageCount(t, stale.ArchiveStats().Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+1)
+	if stale.Tip() != through {
+		t.Fatalf("loaded durable tip=%d, want %d", stale.Tip(), through)
+	}
+	reader := NewManager(base, "cluster", 1)
+	t.Cleanup(reader.Close)
+	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
+		t.Fatalf("independent durable tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
+}
+
+func TestArchiveSyncThroughPreflightPreservesSealedAndLateTargets(t *testing.T) {
+	t.Run("covered sealed tip remains an error", func(t *testing.T) {
+		ctx, base, core, stale, writer := newArchivePreflightManagers(t)
+		if _, _, err := core.Propose(ctx, []byte("covered before seal")); err != nil {
+			t.Fatal(err)
+		}
+		through := core.Tip()
+		if err := writer.SyncThrough(ctx, core, through); err != nil {
+			t.Fatal(err)
+		}
+		if err := Seal(ctx, base, "cluster", "preflight-sealed-tip"); err != nil {
+			t.Fatal(err)
+		}
+		if err := stale.SyncThrough(ctx, core, through); !errors.Is(err, ErrArchiveSealed) {
+			t.Fatalf("covered sealed target error=%v, want ErrArchiveSealed", err)
+		}
+	})
+
+	t.Run("higher late waiter retries after covered lower batch", func(t *testing.T) {
+		ctx, base, core, stale, writer := newArchivePreflightManagers(t)
+		if _, _, err := core.Propose(ctx, []byte("already published lower target")); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+			t.Fatal(err)
+		}
+		gates := &archiveStatsBucket{
+			Bucket: base, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
+			preflightLoad: newArchiveStatsGate(), load: newArchiveStatsGate(),
+			extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+		}
+		stale.bucket = gates
+		gates.syncStarted.Store(true)
+		for _, gate := range []*archiveStatsGate{gates.admission, gates.admissionRetry, gates.preflightLoad, gates.load, gates.extent, gates.head, gates.release} {
+			t.Cleanup(gate.open)
+		}
+		gates.admission.open()
+		gates.admissionRetry.open()
+
+		lowDone := make(chan error, 1)
+		go func() { lowDone <- stale.SyncThrough(ctx, core, 1) }()
+		waitArchiveStatsGate(t, ctx, gates.preflightLoad)
+		if _, _, err := core.Propose(ctx, []byte("late higher target")); err != nil {
+			t.Fatal(err)
+		}
+		highTarget := core.Tip()
+		highDone := make(chan error, 1)
+		go func() { highDone <- stale.SyncThrough(ctx, core, highTarget) }()
+		deadline := time.After(5 * time.Second)
+		for {
+			stale.batchMu.Lock()
+			joined := stale.batch != nil && stale.batch.target >= highTarget
+			stale.batchMu.Unlock()
+			if joined {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatal("higher target did not join the in-flight batch")
+			default:
+				runtime.Gosched()
+			}
+		}
+		// The lower target is already durable, so releasing preflight completes
+		// that batch without admission. Install a gate for the higher waiter's
+		// recursive retry before allowing the lower batch to finish.
+		gates.lockRead = newArchiveStatsGate()
+		t.Cleanup(gates.lockRead.open)
+		gates.preflightLoad.open()
+		gates.load.open()
+		select {
+		case err := <-lowDone:
+			if err != nil {
+				t.Fatalf("covered lower target: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("covered lower batch did not finish: %v", ctx.Err())
+		}
+
+		// Observe the recursive SyncThrough admission. If a successful lower
+		// batch is returned directly to its late waiter, highDone wins instead.
+		select {
+		case <-gates.lockRead.entered:
+		case err := <-highDone:
+			t.Fatalf("higher waiter completed before retry publication: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("higher waiter did not retry publication: %v", ctx.Err())
+		}
+		select {
+		case err := <-highDone:
+			t.Fatalf("higher target acknowledged before its own publication: %v", err)
+		default:
+		}
+		gates.lockRead.open()
+		waitArchiveStatsGate(t, ctx, gates.extent)
+		gates.extent.open()
+		waitArchiveStatsGate(t, ctx, gates.head)
+		gates.head.open()
+		waitArchiveStatsGate(t, ctx, gates.release)
+		gates.release.open()
+		select {
+		case err := <-highDone:
+			if err != nil {
+				t.Fatalf("higher target: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("higher target did not complete: %v", ctx.Err())
+		}
+		reader := NewManager(base, "cluster", 1)
+		t.Cleanup(reader.Close)
+		if err := reader.Load(ctx); err != nil || reader.Tip() != highTarget {
+			t.Fatalf("independent tip=%d want=%d err=%v", reader.Tip(), highTarget, err)
+		}
+	})
+}
+
+func TestArchiveStatsPreflightLoadFailureFallsBackToFencedLoad(t *testing.T) {
+	ctx, bucket, core, manager := newSealableArchive(t)
+	defer manager.Close()
+	gates := &archiveStatsBucket{
+		Bucket: bucket, admission: newArchiveStatsGate(), admissionRetry: newArchiveStatsGate(),
+		extent: newArchiveStatsGate(), head: newArchiveStatsGate(), release: newArchiveStatsGate(),
+	}
+	for _, gate := range []*archiveStatsGate{gates.admission, gates.admissionRetry, gates.extent, gates.head, gates.release} {
+		gate.open()
+	}
+	manager.bucket = gates
+	if _, _, err := core.Propose(ctx, []byte("preflight fallback target")); err != nil {
+		t.Fatal(err)
+	}
+	before := manager.ArchiveStats()
+	gates.failPreflight.Store(true)
+	gates.syncStarted.Store(true)
+	through := core.Tip()
+	if err := manager.SyncThrough(ctx, core, through); err != nil {
+		t.Fatalf("SyncThrough after failed preflight: %v", err)
+	}
+	if manager.Tip() != through {
+		t.Fatalf("published tip=%d want=%d", manager.Tip(), through)
+	}
+	after := manager.ArchiveStats()
+	assertArchiveStageCount(t, after.Stages.ArchiveLoad, stageCount(t, before.Stages.ArchiveLoad)+2)
+	assertArchiveStageCount(t, after.Stages.PublicationAdmission, stageCount(t, before.Stages.PublicationAdmission)+1)
+	reader := NewManager(bucket, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil || reader.Tip() != through {
+		t.Fatalf("independent tip=%d want=%d err=%v", reader.Tip(), through, err)
+	}
 }
 
 func TestArchiveStatsCheckedExactIntegerBounds(t *testing.T) {

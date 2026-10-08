@@ -896,6 +896,22 @@ func (m *Manager) syncNowBatch(ctx context.Context, core source, through quepaxa
 	if exhausted {
 		return fmt.Errorf("archive generation exhausted")
 	}
+	// A different Manager may have durably published this target since our
+	// local tip was loaded. A validated stable load is sufficient for that
+	// no-op ACK, so avoid taking the shared publication lease in this case.
+	// On load failure or an uncovered tip, keep the fenced load below as the
+	// authoritative publication path.
+	if err := m.loadForSync(ctx); err == nil {
+		m.mu.Lock()
+		tip, sealed := m.tip, m.head.Sealed
+		m.mu.Unlock()
+		if sealed {
+			return ErrArchiveSealed
+		}
+		if tip >= through {
+			return nil
+		}
+	}
 	return m.withPublicationLock(ctx, "archive-sync", func(ctx context.Context) error {
 		m.transitionMu.Lock()
 		defer m.transitionMu.Unlock()
