@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 	"runtime"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
@@ -818,6 +820,116 @@ func testArchivePublicationLeaseCancellationAndStaleOwner(t *testing.T) {
 	defer final.Close()
 	if err := final.Load(ctx); err != nil || final.head.Generation != head.Generation || final.Tip() != head.Tip {
 		t.Fatalf("stale owner changed HEAD: generation=%d tip=%d err=%v", final.head.Generation, final.Tip(), err)
+	}
+}
+
+func TestArchiveLeaseIfMatchVersity(t *testing.T) {
+	endpoint := strings.TrimPrefix(os.Getenv("RHIZA_E2E_S3_ENDPOINT"), "http://")
+	bucketName := os.Getenv("RHIZA_E2E_S3_BUCKET")
+	accessKey := os.Getenv("RHIZA_E2E_S3_ACCESS_KEY")
+	secretKey := os.Getenv("RHIZA_E2E_S3_SECRET_KEY")
+	if endpoint == "" || bucketName == "" || accessKey == "" || secretKey == "" {
+		t.Skip("RHIZA_E2E_S3_ENDPOINT, BUCKET, ACCESS_KEY, and SECRET_KEY are required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	prefix := fmt.Sprintf("rhiza-lease-ifmatch/%d-%d", os.Getpid(), time.Now().UnixNano())
+	bucket, err := objmetrics.NewBucket(objmetrics.Config{
+		Provider: objmetrics.ProviderS3, Endpoint: endpoint, Bucket: bucketName,
+		Region: "us-east-1", Insecure: true, AccessKey: accessKey, SecretKey: secretKey,
+	})
+	if err != nil {
+		t.Fatal("could not open the configured S3 bucket")
+	}
+	t.Cleanup(func() {
+		if err := bucket.Close(); err != nil {
+			t.Error("could not close the S3 bucket")
+		}
+	})
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		var ownedKeys []string
+		if err := bucket.Iter(cleanupCtx, prefix+"/", func(key string) error {
+			ownedKeys = append(ownedKeys, key)
+			return nil
+		}, objstore.WithRecursiveIter()); err != nil {
+			t.Error("could not list test-owned S3 keys for cleanup")
+			return
+		}
+		for _, key := range ownedKeys {
+			if err := bucket.Delete(cleanupCtx, key); err != nil {
+				t.Error("could not delete a test-owned S3 key")
+			}
+		}
+	})
+
+	owner := NewManager(bucket, prefix, 1)
+	successorManager := NewManager(bucket, prefix, 1)
+	freshManager := NewManager(bucket, prefix, 1)
+	t.Cleanup(owner.Close)
+	t.Cleanup(successorManager.Close)
+	t.Cleanup(freshManager.Close)
+
+	key := owner.publicationLockKey()
+	initial, err := owner.acquireArchiveLock(ctx, key, "versity-owner-a", archivePinLease)
+	if err != nil {
+		t.Fatal("initial archive lease acquisition failed")
+	}
+	if initial.Generation == 0 || initial.version == nil {
+		t.Fatal("initial archive lease lacked a generation or object version")
+	}
+
+	expired := *initial
+	expired.LeaseUntilMS = time.Now().Add(-time.Second).UnixMilli()
+	if err := owner.writeArchiveLock(ctx, key, expired, objstore.WithIfMatch(initial.version)); err != nil {
+		t.Fatal("could not conditionally expire the test-owned lease")
+	}
+	expiredVersion, err := owner.readArchiveLock(ctx, key)
+	if err != nil || expiredVersion.LeaseUntilMS > time.Now().UnixMilli() || expiredVersion.version == nil {
+		t.Fatal("expired test lease could not be verified")
+	}
+
+	successor, err := successorManager.acquireArchiveLock(ctx, key, "versity-owner-b", archivePinLease)
+	if err != nil {
+		t.Fatal("successor archive lease acquisition failed")
+	}
+	if successor.Generation != initial.Generation+1 || successor.version == nil {
+		t.Fatal("expired lease takeover did not advance generation")
+	}
+
+	staleErr := owner.writeArchiveLock(ctx, key, expired, objstore.WithIfMatch(expiredVersion.version))
+	if staleErr == nil || !bucket.IsConditionNotMetErr(staleErr) {
+		t.Fatal("stale lease ETag was not rejected as a conditional conflict")
+	}
+	current, err := successorManager.readArchiveLock(ctx, key)
+	if err != nil || current.OwnerID != successor.OwnerID || current.Generation != successor.Generation ||
+		current.LeaseUntilMS != successor.LeaseUntilMS || !sameObjectVersion(current.version, successor.version) {
+		t.Fatal("stale ETag write changed the successor lease")
+	}
+
+	if err := owner.releaseArchiveLock(ctx, key, initial); !errors.Is(err, ErrArchiveBusy) {
+		t.Fatal("stale owner release was not rejected as busy")
+	}
+	current, err = successorManager.readArchiveLock(ctx, key)
+	if err != nil || current.OwnerID != successor.OwnerID || current.Generation != successor.Generation ||
+		current.LeaseUntilMS != successor.LeaseUntilMS || !sameObjectVersion(current.version, successor.version) {
+		t.Fatal("stale owner release changed the successor lease")
+	}
+	if err := successorManager.releaseArchiveLock(ctx, key, successor); err != nil {
+		t.Fatal("current lease release failed")
+	}
+
+	reacquired, err := freshManager.acquireArchiveLock(ctx, key, "versity-owner-c", archivePinLease)
+	if err != nil {
+		t.Fatal("fresh manager could not reacquire the released lease")
+	}
+	if reacquired.Generation != successor.Generation+1 || reacquired.OwnerID != "versity-owner-c" {
+		t.Fatal("reacquisition did not advance the released lease generation")
+	}
+	if err := freshManager.releaseArchiveLock(ctx, key, reacquired); err != nil {
+		t.Fatal("reacquired lease release failed")
 	}
 }
 
