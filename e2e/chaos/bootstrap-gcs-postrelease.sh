@@ -6,7 +6,16 @@ set +x
 umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
 mode=${1:-render}
-case "$mode" in render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback) ;; *) die 'Usage: sh bootstrap-gcs-postrelease.sh render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback' ;; esac
+auth_mode=ci
+case "$mode" in
+    render-local|apply-local|mint-local|rollback-local|check-local-auth)
+        auth_mode=local
+        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; rollback-local) mode=rollback ;; esac
+        : "${RHIZA_HARNESS_SHA:?reviewed local harness SHA required}"
+        RHIZA_WORKFLOW_SHA=$RHIZA_HARNESS_SHA ;;
+    render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback) ;;
+    *) die 'Usage: bootstrap-gcs-postrelease.sh render[-local]|apply[-local]|mint-local|rollback[-local]|check-local-auth|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture' ;;
+esac
 : "${RHIZA_RUN_ID:?8 lowercase hexadecimal characters required}"
 : "${RHIZA_WORKFLOW_SHA:?protected-merge workflow SHA required}"
 : "${RHIZA_AUTH_EXPIRES:?UTC YYYY-MM-DDTHH:MM:SSZ required}"
@@ -17,12 +26,12 @@ project=patch2-the-new-era
 number=602454948273
 context=gke_patch2-the-new-era_asia-northeast3_ied-cluster
 bucket=rhiza-v070-chaos-ied-20260811
-ns=rhiza-v0190-20261008-$RHIZA_RUN_ID
-prefix=postrelease/v0.19.0/$RHIZA_RUN_ID/
+ns=rhiza-v0191-20261008-$RHIZA_RUN_ID
+prefix=postrelease/v0.19.1/$RHIZA_RUN_ID/
 folder=gs://$bucket/$prefix
-pool=rhiza-v0190-gcs-$RHIZA_RUN_ID
-ci_id=rhiza-v0190-ci-$RHIZA_RUN_ID
-data_id=rhiza-v0190-gcs-$RHIZA_RUN_ID
+pool=rhiza-v0191-gcs-$RHIZA_RUN_ID
+ci_id=rhiza-v0191-ci-$RHIZA_RUN_ID
+data_id=rhiza-v0191-gcs-$RHIZA_RUN_ID
 ci=$ci_id@$project.iam.gserviceaccount.com
 data=$data_id@$project.iam.gserviceaccount.com
 cluster_role=rhiza19_${RHIZA_RUN_ID}_cluster
@@ -36,8 +45,73 @@ oidc="assertion.repository_id == '1295475703' && assertion.repository_owner_id =
 mapping='google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref,attribute.event_name=assertion.event_name,attribute.workflow_ref=assertion.workflow_ref,attribute.workflow_sha=assertion.workflow_sha,attribute.environment=assertion.environment'
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 render() {
-    sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@CI_GSA@/$ci/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" "$script_dir/gcs-postrelease-auth.yaml.in"
+    runtime_kind=User; runtime_name=$ci
+    runtime_api_group='    apiGroup: rbac.authorization.k8s.io'; runtime_namespace=
+    if [ "$auth_mode" = local ]; then
+        runtime_kind=ServiceAccount; runtime_name=rhiza-runtime
+        runtime_api_group=; runtime_namespace="    namespace: $ns"
+    fi
+    sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" \
+      -e "s/@RUNTIME_KIND@/$runtime_kind/g" -e "s/@RUNTIME_NAME@/$runtime_name/g" \
+      -e "s/@RUNTIME_API_GROUP@/$runtime_api_group/g" -e "s/@RUNTIME_NAMESPACE@/$runtime_namespace/g" \
+      "$script_dir/gcs-postrelease-auth.yaml.in" | awk -v mode="$auth_mode" '
+        /^# BEGIN LOCAL RUNTIME ACCOUNT/ {skip=(mode!="local"); next}
+        /^# END LOCAL RUNTIME ACCOUNT/ {skip=0; next}
+        !skip {print}'
 }
+utc_epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null || date -u -d "$1" '+%s'; }
+local_token_files() {
+    # This consumes the native TokenRequest response without printing credentials.
+    jq -e '.apiVersion=="authentication.k8s.io/v1" and .kind=="TokenRequest" and
+      (.status.token|type)=="string" and (.status.token|test("^[A-Za-z0-9_-]+[.][A-Za-z0-9_-]+[.][A-Za-z0-9_-]+$")) and
+      (.status.expirationTimestamp|type)=="string"' "$1" >/dev/null 2>/dev/null || die 'TokenRequest response rejected (payload omitted)'
+    token_expiry=$(jq -r .status.expirationTimestamp "$1")
+    token_expires=$(utc_epoch "$token_expiry") || die 'TokenRequest expiry rejected'
+    scope_expires=$(utc_epoch "$RHIZA_AUTH_EXPIRES") || die 'Scope expiry rejected'
+    token_now=$(date -u '+%s')
+    [ "$token_expires" -le "$scope_expires" ] && [ "$token_expires" -ge "$((token_now + 2400))" ] || die 'Token expiry exceeds scope or leaves insufficient runtime/cleanup time'
+    jq -e '.name=="ied-cluster" and .location=="asia-northeast3" and
+      (.endpoint|type)=="string" and (.endpoint|test("^[a-zA-Z0-9.-]+$")) and
+      (.masterAuth.clusterCaCertificate|type)=="string" and (.masterAuth.clusterCaCertificate|length)>0' "$2" >/dev/null || die 'Pinned cluster endpoint/CA metadata rejected'
+    jq -r .status.token "$1" > "$RHIZA_AUTH_STATE/runtime.token"
+    chmod 600 "$RHIZA_AUTH_STATE/runtime.token"
+    jq -n --arg context "$context" --arg ns "$ns" --arg file "$RHIZA_AUTH_STATE/runtime.token" --slurpfile cluster "$2" '
+      {apiVersion:"v1",kind:"Config",clusters:[{name:$context,cluster:{server:("https://"+$cluster[0].endpoint),"certificate-authority-data":$cluster[0].masterAuth.clusterCaCertificate}}],
+       users:[{name:"rhiza-runtime",user:{tokenFile:$file}}],contexts:[{name:$context,context:{cluster:$context,user:"rhiza-runtime",namespace:$ns}}],"current-context":$context}
+    ' > "$RHIZA_AUTH_STATE/runtime.kubeconfig"
+    chmod 600 "$RHIZA_AUTH_STATE/runtime.kubeconfig"
+    jq -n --arg expiry "$token_expiry" --arg subject "system:serviceaccount:$ns:rhiza-runtime" '{expirationTimestamp:$expiry,subject:$subject}' > "$RHIZA_AUTH_STATE/runtime-token-ack.json"
+}
+mint_local() (
+    [ ! -e "$RHIZA_AUTH_STATE/runtime-token-request.attempted" ] || die 'TokenRequest already attempted; no renewal/retry'
+    [ ! -e "$RHIZA_AUTH_STATE/runtime.token" ] && [ ! -L "$RHIZA_AUTH_STATE/runtime.token" ] &&
+      [ ! -e "$RHIZA_AUTH_STATE/runtime.kubeconfig" ] && [ ! -L "$RHIZA_AUTH_STATE/runtime.kubeconfig" ] || die 'Runtime credential collision'
+    mint_expires=$(utc_epoch "$RHIZA_AUTH_EXPIRES")
+    mint_now=$(date -u '+%s')
+    mint_remaining=$((mint_expires - mint_now))
+    [ "$mint_remaining" -ge 2430 ] && [ "$mint_remaining" -le 3300 ] || die 'Local preparation window exhausted or scope exceeds 55 minutes'
+    # Native API responses containing tokens never enter record() artifacts.
+    # shellcheck disable=SC2329
+    clear_local_mint() {
+        mint_exit=$?
+        rm -f "$RHIZA_AUTH_STATE/runtime-token-response.private" "$RHIZA_AUTH_STATE/runtime-token-request.private"
+        if [ "$mint_exit" != 0 ]; then rm -f "$RHIZA_AUTH_STATE/runtime.token" "$RHIZA_AUTH_STATE/runtime.kubeconfig"; fi
+        printf '%s\n' "$mint_exit" > "$RHIZA_AUTH_STATE/mint-local.exit"
+    }
+    trap clear_local_mint 0
+    trap 'exit 130' HUP INT TERM
+    record mint-cluster g container clusters describe ied-cluster --region=asia-northeast3 --format=json
+    jq -n --argjson duration "$((mint_remaining - 30))" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",spec:{expirationSeconds:$duration}}' > "$RHIZA_AUTH_STATE/runtime-token-request.private"
+    printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/runtime-token-request.attempted"
+    printf '%s\n' runtime-token-request > "$RHIZA_AUTH_STATE/inflight"
+    mint_code=0
+    k create --raw "/api/v1/namespaces/$ns/serviceaccounts/rhiza-runtime/token" -f "$RHIZA_AUTH_STATE/runtime-token-request.private" > "$RHIZA_AUTH_STATE/runtime-token-response.private" 2>/dev/null || mint_code=$?
+    printf '%s\n' "$mint_code" > "$RHIZA_AUTH_STATE/runtime-token-request.exit"
+    [ "$mint_code" = 0 ] || die 'TokenRequest failed; native exit retained, payload/diagnostics omitted; no retry'
+    local_token_files "$RHIZA_AUTH_STATE/runtime-token-response.private" "$RHIZA_AUTH_STATE/mint-cluster.json"
+    printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/runtime-token.created"
+    printf '%s\n' 'Single local TokenRequest accepted; private tokenFile kubeconfig ready. Scoped actor checks remain required.'
+)
 admission_uri() {
     case "$1" in
         validatingadmissionpolicy) collection=validatingadmissionpolicies ;;
@@ -200,6 +274,82 @@ if [ "$mode" = render ]; then
     render
     exit 0
 fi
+if [ "$mode" = check-local-auth ]; then
+    # Offline boundary exercises the real render/mint functions, not cloud APIs.
+    local_fixture=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-local-auth.XXXXXXXX")
+    RHIZA_AUTH_STATE=$local_fixture
+    # shellcheck disable=SC2329
+    clear_local_fixture() { rm -f "$local_fixture"/*; rmdir "$local_fixture"; }
+    trap clear_local_fixture 0
+    trap 'exit 130' HUP INT TERM
+    fixture_now=$(date -u '+%s')
+    stamp() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'; }
+    RHIZA_AUTH_EXPIRES=$(stamp "$((fixture_now + 3300))")
+    render > "$local_fixture/local.yaml"
+    auth_mode=ci; render > "$local_fixture/ci.yaml"; auth_mode=local
+    subjects() {
+        awk '/^---/ {binding=0;subject=0} /^kind: (RoleBinding|ClusterRoleBinding)$/ {binding=1}
+          binding && /^subjects:/ {subject=1} /^roleRef:/ {subject=0} subject {print}' "$1"
+    }
+    subjects "$local_fixture/local.yaml" > "$local_fixture/local-subjects"
+    [ "$(grep -c 'kind: ServiceAccount' "$local_fixture/local-subjects")" = 2 ] || die 'Local bindings must select two KSA subjects'
+    [ "$(grep -c "namespace: $ns" "$local_fixture/local-subjects")" = 2 ] || die 'Local binding namespace missing'
+    if grep -Eq 'apiGroup:|kind: User' "$local_fixture/local-subjects"; then die 'Local subject has User/apiGroup'; fi
+    grep -q 'name: rhiza-runtime' "$local_fixture/local.yaml" || die 'Local runtime KSA missing'
+    subjects "$local_fixture/ci.yaml" > "$local_fixture/ci-subjects"
+    [ "$(grep -c 'kind: User' "$local_fixture/ci-subjects")" = 2 ] || die 'CI User bindings changed'
+    if grep -q 'name: rhiza-runtime' "$local_fixture/ci.yaml"; then die 'Unused local KSA created in CI'; fi
+    jq -n '{name:"ied-cluster",location:"asia-northeast3",endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"}}' > "$local_fixture/cluster.json"
+    jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
+    # Invoked indirectly through the synthetic record() wrapper.
+    # shellcheck disable=SC2329
+    g() { [ "$*" = 'container clusters describe ied-cluster --region=asia-northeast3 --format=json' ] || die 'Unexpected offline metadata command'; cat "$local_fixture/cluster.json"; }
+    k() {
+        [ "$*" = "create --raw /api/v1/namespaces/$ns/serviceaccounts/rhiza-runtime/token -f $RHIZA_AUTH_STATE/runtime-token-request.private" ] || die 'Unexpected offline token command'
+        printf 'request\n' >> "$local_fixture/api-calls"
+        [ "$fixture_case" != native-failure ] || return 56
+        cat "$local_fixture/response.json"
+    }
+    record() { fixture_receipt=$1; shift; "$@" > "$local_fixture/$fixture_receipt.json"; }
+    fixture_case=positive
+    mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"
+    jq -e --arg context "$context" --arg ns "$ns" --arg token "$local_fixture/runtime.token" '
+      .apiVersion=="v1" and .kind=="Config" and ."current-context"==$context and
+      (.users|length)==1 and .users[0].user=={tokenFile:$token} and
+      (.clusters|length)==1 and (.contexts|length)==1 and .contexts[0].context.namespace==$ns
+    ' "$local_fixture/runtime.kubeconfig" >/dev/null || die 'Static private kubeconfig mismatch'
+    [ "$(find "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" -type f -user "$(id -u)" -perm 0600 -print | wc -l | tr -d ' ')" = 2 ] || die 'Credential file mode regression'
+    if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die 'Token renewal accepted'; fi
+    [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'TokenRequest repeated'
+    for fixture_case in overlong short missing-token wrong-cluster native-failure; do
+        rm -f "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls"
+        jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
+        jq -n '{name:"ied-cluster",location:"asia-northeast3",endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"}}' > "$local_fixture/cluster.json"
+        case "$fixture_case" in
+            overlong) jq --arg expiry "$(stamp "$((fixture_now + 3600))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
+            short) jq --arg expiry "$(stamp "$((fixture_now + 1800))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
+            missing-token) jq 'del(.status.token)' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
+            wrong-cluster) jq '.name="other-cluster"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
+        esac
+        if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die "Local negative accepted: $fixture_case"; fi
+        [ ! -e "$local_fixture/runtime.token" ] && [ ! -e "$local_fixture/runtime.kubeconfig" ] && [ ! -e "$local_fixture/runtime-token-response.private" ] && [ ! -e "$local_fixture/runtime-token-request.private" ] || die 'Failure retained credential bytes'
+        [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'Negative request count regression'
+        [ "$fixture_case" != native-failure ] || [ "$(cat "$local_fixture/runtime-token-request.exit")" = 56 ] || die 'Native failure lost'
+        printf 'Local auth boundary %s refused; one request, no credentials retained.\n' "$fixture_case"
+    done
+    # One symlink regression fixture checks each output before any TokenRequest.
+    rm -f "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls"
+    for credential in runtime.token runtime.kubeconfig; do
+        ln -s "$local_fixture/missing-target" "$local_fixture/$credential"
+        if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die 'Dangling credential symlink accepted'; fi
+        [ ! -e "$local_fixture/api-calls" ] && [ ! -e "$local_fixture/runtime-token-request.attempted" ] &&
+          [ -L "$local_fixture/$credential" ] && [ ! -e "$local_fixture/missing-target" ] || die 'Symlink fixture issued a request or followed the link'
+        rm -f "$local_fixture/$credential"
+    done
+    printf '%s\n' 'Both dangling credential symlinks refused before TokenRequest; no target writes.'
+    printf '%s\n' 'Local/CI render, bounded token, static kubeconfig and no-renewal checks passed; no cloud calls.'
+    exit 0
+fi
 if [ "$mode" = check-cleanup-uris ]; then
     # Offline fixture exercises the exact URI builder used by guarded rollback.
     [ "$(admission_uri validatingadmissionpolicy "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/$ns-runtime" ] || die 'Policy cleanup URI regression'
@@ -234,13 +384,13 @@ if [ "$mode" = check-folder-iam ]; then
             *) die 'Unexpected synthetic gcloud command' ;;
         esac
     }
-    [ "$pool" = "rhiza-v0190-gcs-$RHIZA_RUN_ID" ] && [ "$ci" = "rhiza-v0190-ci-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] && [ "$data" = "rhiza-v0190-gcs-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] || die 'Fresh identity derivation regression'
+    [ "$pool" = "rhiza-v0191-gcs-$RHIZA_RUN_ID" ] && [ "$ci" = "rhiza-v0191-ci-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] && [ "$data" = "rhiza-v0191-gcs-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] || die 'Fresh identity derivation regression'
     create_account "$ci_id" | jq -e --arg id "$ci_id" '.fixture_created==$id' >/dev/null
     create_account "$data_id" | jq -e --arg id "$data_id" '.fixture_created==$id' >/dev/null
     if (create_account rhiza-v0190-ci-1008) >/dev/null 2>&1; then die 'Old account accepted'; fi
     other_run=ffffffff
     [ "$RHIZA_RUN_ID" != "$other_run" ] || other_run=00000000
-    if (create_account "rhiza-v0190-gcs-$other_run") >/dev/null 2>&1; then die 'Cross-run account accepted'; fi
+    if (create_account "rhiza-v0191-gcs-$other_run") >/dev/null 2>&1; then die 'Cross-run account accepted'; fi
     printf 'Fresh run %s: exact pool, two GSA create arguments, old/cross-run refusal verified.\n' "$RHIZA_RUN_ID"
     curl() {
         fixture_method=GET; fixture_output=; fixture_body=; fixture_header=; fixture_url=
@@ -399,15 +549,19 @@ case "${RHIZA_COST_CAP_KRW:-}" in 10000) ;; *) die 'Explicit approved monetary c
 : "${RHIZA_EXPECTED_ADMIN_ACCOUNT:?explicit nonempty administrative account required}"
 : "${RHIZA_AUTH_STATE:?absolute private receipt directory required}"
 case "$RHIZA_AUTH_STATE" in /*) ;; *) die 'State directory must be absolute' ;; esac
-for cmd in gcloud kubectl jq gh shasum curl; do command -v "$cmd" >/dev/null || die "Missing $cmd"; done
+for cmd in gcloud kubectl jq shasum curl; do command -v "$cmd" >/dev/null || die "Missing $cmd"; done
+[ "$auth_mode" = local ] || command -v gh >/dev/null || die 'Missing gh'
 k() { kubectl --context="$context" "$@"; }
 g() { gcloud --project="$project" --quiet "$@"; }
 identity=$(jq -nc --arg run "$RHIZA_RUN_ID" --arg sha "$RHIZA_WORKFLOW_SHA" --arg expiry "$RHIZA_AUTH_EXPIRES" --arg cap "$RHIZA_COST_CAP_KRW" --arg owner "$owner" '{run:$run,workflow_sha:$sha,expiry:$expiry,cost_cap_krw:$cap,owner:$owner}')
+if [ "$auth_mode" = local ]; then identity=$(printf '%s\n' "$identity" | jq -c '.auth_mode="local"'); fi
 if [ "$mode" = apply ]; then
     # Refuse stale/long-lived grants before the first remote call.
-    expires=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$RHIZA_AUTH_EXPIRES" '+%s' 2>/dev/null || date -u -d "$RHIZA_AUTH_EXPIRES" '+%s')
+    expires=$(utc_epoch "$RHIZA_AUTH_EXPIRES")
     now=$(date -u '+%s')
-    [ "$expires" -gt "$now" ] && [ "$expires" -le "$((now + 14400))" ] || die 'Expiry must be future and at most four hours away'
+    horizon=14400
+    [ "$auth_mode" != local ] || horizon=3300
+    [ "$expires" -gt "$now" ] && [ "$expires" -le "$((now + horizon))" ] || die 'Expiry exceeds the selected bounded scope'
     : "${RHIZA_FIXTURE_GENERATOR:?reviewed local embedded-host binary required}"
     : "${RHIZA_FIXTURE_GENERATOR_SHA256:?reviewed binary SHA256 required}"
     case "$RHIZA_FIXTURE_GENERATOR" in /*) ;; *) die 'Generator must be an absolute binary path' ;; esac
@@ -423,6 +577,9 @@ else
     [ -f "$RHIZA_AUTH_STATE/identity.json" ] || die 'Missing positive ownership receipt'
     [ "$(jq -cS . "$RHIZA_AUTH_STATE/identity.json")" = "$(printf '%s\n' "$identity" | jq -cS .)" ] || die 'Receipt identity mismatch'
 fi
+[ ! -L "$RHIZA_AUTH_STATE" ] && [ "$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)" = "$RHIZA_AUTH_STATE" ] || die 'State path must be a private physical directory'
+[ -n "$(find "$RHIZA_AUTH_STATE" -prune -type d -user "$(id -u)" -perm 0700 -print)" ] || die 'State directory owner/mode rejected'
+[ "$(g config get-value account 2>/dev/null)" = "$RHIZA_EXPECTED_ADMIN_ACCOUNT" ] || die 'Unexpected administrative account'
 # Receipts are local and private, not public artifacts. No shell tracing/tokens.
 record() {
     receipt=$1; shift
@@ -453,14 +610,39 @@ check_folder_role() {
       .includedPermissions==$original[0].includedPermissions and .stage==$original[0].stage
     ' "$RHIZA_AUTH_STATE/folder-role-current.json" >/dev/null || die 'Folder role ownership/metadata changed'
 }
+if [ "$mode" = mint-local ]; then
+    [ "$auth_mode" = local ] || die 'Local mode required'
+    for required in local-prepared kubernetes data-wi-grant folder-grant fixture-secret; do
+        owned "$required" || die 'Local bootstrap did not complete; no mint from partial/failed apply'
+    done
+    if [ -f "$RHIZA_AUTH_STATE/inflight" ]; then
+        last=$(cat "$RHIZA_AUTH_STATE/inflight")
+        [ -f "$RHIZA_AUTH_STATE/$last.exit" ] && [ "$(cat "$RHIZA_AUTH_STATE/$last.exit")" = 0 ] || die 'Unresolved operation outcome; no token mint'
+    fi
+    [ -s "$RHIZA_AUTH_STATE/runtime-ksa-identity.json" ] && [ -s "$RHIZA_AUTH_STATE/runtime-binding-identity.json" ] || die 'Runtime KSA/binding receipts missing'
+    record mint-namespace k get namespace "$ns" -o json
+    jq -e --arg owner "$owner" --slurpfile original "$RHIZA_AUTH_STATE/namespace-identity.json" '.metadata.uid==$original[0].metadata.uid and .metadata.annotations["rhiza.dev/auth-owner"]==$owner' "$RHIZA_AUTH_STATE/mint-namespace.json" >/dev/null || die 'Namespace identity changed'
+    record mint-runtime-ksa k get serviceaccount rhiza-runtime --namespace="$ns" -o json
+    jq -e --arg owner "$owner" --slurpfile original "$RHIZA_AUTH_STATE/runtime-ksa-identity.json" '.metadata.uid==$original[0].metadata.uid and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .automountServiceAccountToken==false' "$RHIZA_AUTH_STATE/mint-runtime-ksa.json" >/dev/null || die 'Runtime KSA identity changed'
+    record mint-runtime-binding k get rolebinding rhiza-ci-runtime --namespace="$ns" -o json
+    record mint-reader-binding k get clusterrolebinding "$ns-reader" -o json
+    check_runtime_binding() {
+        jq -e --slurpfile original "$RHIZA_AUTH_STATE/$2.json" '.metadata.uid==$original[0].metadata.uid and .subjects==$original[0].subjects and .roleRef==$original[0].roleRef' "$RHIZA_AUTH_STATE/$1.json" >/dev/null || die 'Runtime binding identity/spec changed'
+    }
+    check_runtime_binding mint-runtime-binding runtime-binding-identity
+    check_runtime_binding mint-reader-binding clusterrolebinding-reader-identity
+    mint_local
+    exit 0
+fi
 if [ "$mode" = apply ]; then
-    [ "$(g config get-value account 2>/dev/null)" = "$RHIZA_EXPECTED_ADMIN_ACCOUNT" ] || die 'Unexpected administrative account'
+    if [ "$auth_mode" = ci ]; then
     record github-main gh api repos/mrchypark/rhiza/branches/main
     jq -e --arg sha "$RHIZA_WORKFLOW_SHA" '.protected == true and .commit.sha == $sha' "$RHIZA_AUTH_STATE/github-main.json" >/dev/null || die 'Workflow SHA is not the current protected main SHA'
     record github-workflow gh api "repos/mrchypark/rhiza/contents/.github/workflows/gcs-postrelease.yml?ref=$RHIZA_WORKFLOW_SHA"
     jq -e '.type == "file" and .sha != null' "$RHIZA_AUTH_STATE/github-workflow.json" >/dev/null || die 'Canonical workflow absent at frozen protected merge'
     record github-environment gh api repos/mrchypark/rhiza/environments/rhiza-gcs-postrelease
     jq -e '.deployment_branch_policy.protected_branches == true and any(.protection_rules[]; .type == "required_reviewers" and (.reviewers|length)>0)' "$RHIZA_AUTH_STATE/github-environment.json" >/dev/null || die 'Protected-branch environment with required reviewers must exist before bootstrap'
+    fi
     record project-before g projects get-iam-policy "$project" --format=json
     record bucket-before g storage buckets get-iam-policy "gs://$bucket" --format=json
     absent namespace k get namespace "$ns" -o json
@@ -472,32 +654,37 @@ if [ "$mode" = apply ]; then
     absent runtime-binding k get validatingadmissionpolicybinding "$ns-runtime" -o json
     absent ns-reader k get clusterrole "$ns-reader" -o json
     absent ns-reader-binding k get clusterrolebinding "$ns-reader" -o json
-    absent pool g iam workload-identity-pools describe "$pool" --location=global --format=json
-    absent ci g iam service-accounts describe "$ci" --format=json
     absent data g iam service-accounts describe "$data" --format=json
-    absent cluster-role g iam roles describe "$cluster_role" --format=json
+    if [ "$auth_mode" = ci ]; then
+        absent pool g iam workload-identity-pools describe "$pool" --location=global --format=json
+        absent ci g iam service-accounts describe "$ci" --format=json
+        absent cluster-role g iam roles describe "$cluster_role" --format=json
+    fi
     absent folder-role g iam roles describe "$folder_role" --format=json
     absent folder g storage managed-folders describe "$folder" --raw --format=json
     # Exact new prefix only; authentication errors cannot masquerade as empty.
     absent prefix g storage ls "$folder**"
-    record ci-create create_account "$ci_id"
-    mark ci
+    if [ "$auth_mode" = ci ]; then record ci-create create_account "$ci_id"; mark ci; fi
     record data-create create_account "$data_id"
     mark data
-    record cluster-role-create g iam roles create "$cluster_role" --title='Rhiza temporary cluster metadata' --description="$owner" --permissions=container.clusters.get --stage=GA --format=json
-    mark cluster-role
+    if [ "$auth_mode" = ci ]; then
+        record cluster-role-create g iam roles create "$cluster_role" --title='Rhiza temporary cluster metadata' --description="$owner" --permissions=container.clusters.get --stage=GA --format=json
+        mark cluster-role
+    fi
     record folder-role-create g iam roles create "$folder_role" --title='Rhiza temporary folder objects' --description="$owner" --permissions=storage.objects.get,storage.objects.list,storage.objects.create,storage.objects.update,storage.objects.delete --stage=GA --format=json
     mark folder-role
+    if [ "$auth_mode" = ci ]; then
     record pool-create g iam workload-identity-pools create "$pool" --location=global --description="$owner" --format=json
     mark pool
     record provider-create g iam workload-identity-pools providers create-oidc github --location=global --workload-identity-pool="$pool" --issuer-uri=https://token.actions.githubusercontent.com --attribute-mapping="$mapping" --attribute-condition="$oidc" --description="$owner" --format=json
     mark provider
+    fi
     record folder-create g storage managed-folders create "$folder" --format=json
     mark folder
     record folder-identity g storage managed-folders describe "$folder" --raw --format=json
     check_folder_identity "$RHIZA_AUTH_STATE/folder-identity.json"
     record folder-before folder_iam get
-    record ci-wi-before g iam service-accounts get-iam-policy "$ci" --format=json
+    if [ "$auth_mode" = ci ]; then record ci-wi-before g iam service-accounts get-iam-policy "$ci" --format=json; fi
     record data-wi-before g iam service-accounts get-iam-policy "$data" --format=json
     # Bootstrap namespace and admission BEFORE any CI runtime access.
     # No apply/adoption: a collision fails. Partial kubectl creation needs audit.
@@ -512,6 +699,10 @@ if [ "$mode" = apply ]; then
     for kind in clusterrole clusterrolebinding; do
         record "$kind-reader-identity" k get "$kind" "$ns-reader" -o json
     done
+    if [ "$auth_mode" = local ]; then
+        record runtime-ksa-identity k get serviceaccount rhiza-runtime --namespace="$ns" -o json
+        record runtime-binding-identity k get rolebinding rhiza-ci-runtime --namespace="$ns" -o json
+    fi
     # Existing host's fixture mode uses crypto/rand and rhiza.PeerPublicKey.
     # Only public namespace/run/owner are argv; no token bytes in CLI arguments.
     fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-fixture.XXXXXXXX")
@@ -538,10 +729,12 @@ if [ "$mode" = apply ]; then
     mark fixture-secret
     clear_fixture
     trap - 0 HUP INT TERM
+    if [ "$auth_mode" = ci ]; then
     record ci-project-grant g projects add-iam-policy-binding "$project" --member="serviceAccount:$ci" --role="projects/$project/roles/$cluster_role" --condition="$cluster_condition" --format=json
     mark ci-project-grant
     record ci-wi-grant g iam service-accounts add-iam-policy-binding "$ci" --member="$ci_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
     mark ci-wi-grant
+    fi
     record data-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
     mark data-wi-grant
     record folder-grant folder_iam add
@@ -549,7 +742,8 @@ if [ "$mode" = apply ]; then
     record project-after g projects get-iam-policy "$project" --format=json
     record bucket-after g storage buckets get-iam-policy "gs://$bucket" --format=json
     record folder-after folder_iam get
-    printf '%s\n' "Prepared $ns; CI/GCS negative authorization and admission checks still required before faults."
+    if [ "$auth_mode" = local ]; then mark local-prepared; fi
+    printf '%s\n' "Prepared $ns ($auth_mode); scoped actor/GCS/admission checks still required before faults."
     exit 0
 fi
 # Rollback never deletes GCS objects. Executor must first prove fault/workload
@@ -558,6 +752,12 @@ fi
 if [ -f "$RHIZA_AUTH_STATE/inflight" ]; then
     last=$(cat "$RHIZA_AUTH_STATE/inflight")
     [ -f "$RHIZA_AUTH_STATE/$last.exit" ] && [ "$(cat "$RHIZA_AUTH_STATE/$last.exit")" = 0 ] || die 'Unresolved operation outcome; manual exact-target audit required'
+fi
+if [ "$auth_mode" = local ]; then
+    for credential in runtime.token runtime.kubeconfig; do
+        [ ! -L "$RHIZA_AUTH_STATE/$credential" ] || die 'Local credential path replaced by symlink'
+        rm -f "$RHIZA_AUTH_STATE/$credential"
+    done
 fi
 check_sa() {
     which=$1; account=$2
