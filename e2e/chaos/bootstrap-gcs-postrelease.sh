@@ -121,9 +121,11 @@ folder_iam() (
     validate_policy() {
         policy_exit=0
         jq -e --arg resource "projects/_/buckets/$bucket/managedFolders/$prefix" '
-          .kind=="storage#policy" and .resourceId==$resource and
+          type=="object" and .kind=="storage#policy" and .resourceId==$resource and
           (.etag|type)=="string" and (.etag|length)>0 and
-          (.version==1 or .version==3) and ((.bindings//[])|type)=="array" and
+          ((has("bindings")|not) or (.bindings|type)=="array") and
+          (.version==1 or .version==3 or
+            (((has("version")|not) or .version==0) and ((.bindings//[])|length)==0)) and
           all((.bindings//[])[];
             (.role|type)=="string" and (.role|contains("_withcond_")|not) and
             (.members|type)=="array" and all(.members[]; type=="string") and
@@ -272,12 +274,13 @@ if [ "$mode" = check-folder-iam ]; then
             if [ -s "$fixture_dir/put.log" ]; then
                 [ "$fixture_case" != readback-404 ] || { printf '{"error":"readback404"}' > "$fixture_output"; printf '404'; return 22; }
                 if [ "$fixture_case" = readback-mismatch ]; then jq '.bindings[1].members=["user:unexpected.invalid"]' "$fixture_dir/applied.json" > "$fixture_output"
+                elif [ "$fixture_case" = remove-empty-readback ]; then jq 'del(.version,.bindings)' "$fixture_dir/applied.json" > "$fixture_output"
                 else cp "$fixture_dir/applied.json" "$fixture_output"; fi
             else cp "$fixture_dir/policy.json" "$fixture_output"; fi
         else
             [ "$fixture_method" = PUT ] && [ "$fixture_url" = "$fixture_base" ] || die 'PUT URL regression'
             printf 'PUT\n' >> "$fixture_dir/put.log"
-            jq -e '.version==3 and .etag=="fresh-current-etag" and .extra=="preserve-root"' "$fixture_body" >/dev/null || die 'Fresh etag/full policy missing'
+            jq -e --slurpfile original "$fixture_dir/policy.json" '.version==3 and .etag=="fresh-current-etag" and has("extra")==($original[0]|has("extra")) and .extra==$original[0].extra' "$fixture_body" >/dev/null || die 'Fresh etag/full policy missing'
             case "$fixture_case" in
                 put-409|put-412|put-404) printf '{"error":"%s"}' "$fixture_case" > "$fixture_output"; printf '%s' "${fixture_case#put-}"; return 22 ;;
                 unknown-put) printf '{"partial":"PUTunknown"}' > "$fixture_output"; printf '000'; return 56 ;;
@@ -287,27 +290,42 @@ if [ "$mode" = check-folder-iam ]; then
         fi
         printf '200'
     }
-    for fixture_case in get-empty get-unconditional add remove remove-single changed-condition duplicate-target hashed-role missing-target missing-etag version1-condition replaced-folder get-404 unknown-get put-409 put-412 put-404 unknown-put readback-404 readback-mismatch; do
+    for fixture_case in get-empty get-empty-omitted get-empty-array-omitted get-empty-zero-omitted get-empty-zero-array get-unconditional add add-empty-omitted add-empty-zero remove remove-single remove-empty-readback changed-condition duplicate-target hashed-role missing-target missing-etag version1-condition version-omitted-populated version-zero-populated version-null version-string bindings-null bindings-object bindings-false policy-null wrong-resource malformed-json replaced-folder get-404 unknown-get put-409 put-412 put-404 unknown-put readback-404 readback-mismatch; do
         : > "$fixture_dir/get.log"; : > "$fixture_dir/put.log"
         jq -n --arg resource "projects/_/buckets/$bucket/managedFolders/$prefix" --arg role "projects/$project/roles/$folder_role" --arg member "serviceAccount:$data" --arg title "rhiza-$RHIZA_RUN_ID-expiry" --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{kind:"storage#policy",resourceId:$resource,version:3,etag:"fresh-current-etag",extra:"preserve-root",bindings:[{role:$role,members:[$member,"user:co-member.invalid"],condition:{title:$title,expression:$expression}},{role:"roles/storage.objectViewer",members:[],extra:"preserve-empty"},{role:"roles/storage.objectViewer",members:["user:unrelated.invalid"]}]}' > "$fixture_dir/policy.json"
         fixture_action=remove; expected_code=1; expected_gets=1; expected_puts=0
         case "$fixture_case" in
             get-empty|add) jq '.version=1 | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            get-empty-omitted|add-empty-omitted) jq 'del(.version,.bindings,.extra)' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            get-empty-array-omitted) jq 'del(.version) | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            get-empty-zero-omitted) jq '.version=0 | del(.bindings)' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            get-empty-zero-array|add-empty-zero) jq '.version=0 | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             get-unconditional) jq '.version=1 | .bindings=.bindings[1:]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             changed-condition) jq '.bindings[0].condition.description="different-whole-condition"' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             duplicate-target) jq '.bindings += [.bindings[0]]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             hashed-role) jq '.bindings[0].role += "_withcond_hidden"' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             missing-target) jq '.bindings[0].members=["user:co-member.invalid"]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             remove-single) jq '.bindings[0].members=[.bindings[0].members[0]]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            remove-empty-readback) jq '.bindings=[.bindings[0]] | .bindings[0].members=[.bindings[0].members[0]]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             missing-etag) jq 'del(.etag)' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             version1-condition) jq '.version=1' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            version-omitted-populated) jq 'del(.version) | .bindings=.bindings[1:]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            version-zero-populated) jq '.version=0 | .bindings=.bindings[1:]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            version-null) jq '.version=null | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            version-string) jq '.version="0" | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            bindings-null) jq '.bindings=null' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            bindings-object) jq '.bindings={}' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            bindings-false) jq '.bindings=false' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            policy-null) printf 'null\n' > "$fixture_dir/applied.json" ;;
+            wrong-resource) jq '.resourceId="projects/_/buckets/wrong/managedFolders/wrong/"' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            malformed-json) printf '{\n' > "$fixture_dir/applied.json" ;;
             *) cp "$fixture_dir/policy.json" "$fixture_dir/applied.json" ;;
         esac
         cp "$fixture_dir/applied.json" "$fixture_dir/policy.json"
         case "$fixture_case" in
-            get-empty|get-unconditional) fixture_action='get'; expected_code=0 ;;
-            add) fixture_action=add; expected_code=0; expected_gets=2; expected_puts=1 ;;
-            remove|remove-single) expected_code=0; expected_gets=2; expected_puts=1 ;;
+            get-empty|get-empty-omitted|get-empty-array-omitted|get-empty-zero-omitted|get-empty-zero-array|get-unconditional) fixture_action='get'; expected_code=0 ;;
+            add|add-empty-omitted|add-empty-zero) fixture_action=add; expected_code=0; expected_gets=2; expected_puts=1 ;;
+            remove|remove-single|remove-empty-readback) expected_code=0; expected_gets=2; expected_puts=1 ;;
             replaced-folder) expected_gets=0 ;;
             get-404) expected_code=22 ;;
             unknown-get) expected_code=56 ;;
