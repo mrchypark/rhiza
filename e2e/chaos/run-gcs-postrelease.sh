@@ -5,7 +5,7 @@ set -eu
 set +x
 umask 077
 mode=${1:-}
-case "$mode" in render|run|run-local) ;; *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local' >&2; exit 1 ;; esac
+case "$mode" in render|run|run-local|check-shutdown) ;; *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;; esac
 release=f4d4cfee6d0928d813e84fe6e7d8c2b01c69f32c
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -72,6 +72,49 @@ awk 'BEGIN{RS="---\n"} /name: rhiza-metadata/{print}' "$out/initial.yaml" > "$ou
 awk 'BEGIN{RS="---\n"} !/name: rhiza-metadata/ && !/name: rhiza-quic-probe/ && !/kind: NetworkPolicy/{print $0 "---"}' "$out/initial.yaml" > "$out/voters.yaml"
 awk 'BEGIN{RS="---\n"} /name: rhiza-quic-probe/{print}' "$out/initial.yaml" > "$out/probe.yaml"
 awk 'BEGIN{RS="---\n"} /kind: NetworkPolicy/{print}' "$out/initial.yaml" > "$out/cold-policy.yaml"
+verify_shutdown() {
+  proof_dir=$1
+  case "$(cat "$proof_dir/shutdown-watch.exit")" in 0|143) ;; *) return 1 ;; esac
+  jq -e '.items|length==0' "$proof_dir/shutdown-writers-after.json" >/dev/null || return 1
+  jq -e '.spec.replicas==0 and (.status.replicas // 0)==0' "$proof_dir/shutdown-controller.json" >/dev/null || return 1
+  jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg image "$RHIZA_HOST_IMAGE" '
+    type=="array" and all(.[]; .namespace==$ns and .run==$run and
+      (.uid|type)=="string" and (.uid|length)>0 and (.container_id|type)=="string" and (.container_id|length)>0 and
+      .image==$image and (.image_id|endswith($image|split("@")[1])) and
+      (.name|test("^rhiza-voter-[012]$|^rhiza-learner$")) and .restart_count>=0) and
+    ([.[].uid]|unique|length)==length
+  ' "$proof_dir/shutdown-before.json" >/dev/null || return 1
+  jq -s -e --slurpfile before "$proof_dir/shutdown-before.json" '
+    . as $events | all($events[]; .type!="ERROR") and all($before[0][]; . as $pod |
+      all($events[]; if .object.metadata.name==$pod.name then
+        .object.metadata.uid==$pod.uid and all(.object.status.containerStatuses[]?;
+          if .name=="rhiza" then .containerID==$pod.container_id and .imageID==$pod.image_id and
+            .restartCount==$pod.restart_count else true end)
+        else true end) and
+      any($events[]; .object.metadata.uid==$pod.uid and
+        any(.object.status.containerStatuses[]?; .name=="rhiza" and .containerID==$pod.container_id and
+          .imageID==$pod.image_id and .restartCount==$pod.restart_count and
+          .state.terminated.exitCode==0 and (.state.terminated.signal // 0)==0)))
+  ' "$proof_dir/shutdown-watch.json" >/dev/null || return 1
+  for proof_pod in $(jq -r '.[].name' "$proof_dir/shutdown-before.json"); do
+    [ "$(cat "$proof_dir/$proof_pod-shutdown-log.exit")" = 0 ] || return 1
+    jq -R -s -e --arg name "$proof_pod" --slurpfile before "$proof_dir/shutdown-before.json" '
+      ($before[0][]|select(.name==$name)) as $pod |
+      [split("\n")[]|fromjson?|select(.namespace==$pod.namespace and .run==$pod.run and
+        .pod_uid==$pod.uid and .node_id==$pod.name)] as $markers |
+      [$markers[]|select(.event=="qualification-host-start" and (.process|test("^[a-f0-9]{32}$")))] as $starts |
+      ($starts|length)==1 and
+      ([$markers[]|select(.event=="qualification-host-shutdown-failed")]|length)==0 and
+      ([$markers[]|select(.event=="qualification-host-shutdown-complete" and .process==$starts[0].process and
+        .http_drained==true and .db_closed==true)]|length)==1
+    ' "$proof_dir/$proof_pod-shutdown.log" >/dev/null || return 1
+  done
+}
+if [ "$mode" = check-shutdown ]; then
+  : "${RHIZA_SHUTDOWN_FIXTURE:?offline proof directory required}"
+  verify_shutdown "$RHIZA_SHUTDOWN_FIXTURE"
+  exit $?
+fi
 if [ "$mode" = render ]; then exit 0; fi
 if [ "$mode" = run ]; then
   [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
@@ -147,6 +190,58 @@ stop_watchdog() {
 pf_pids=''
 active_fault=''
 owned_created=false
+shutdown_watch_pid=''
+shutdown_log_pids=''
+shutdown_capture=false
+# A watch started from the pre-stop list version replays termination events even
+# if the request connects after scale0. No privileged node/container API is used.
+shutdown_stream() {
+  if [ "$mode" = run-local ]; then
+    stream_limit=$(remaining) || return 124
+    [ "$stream_limit" -le 240 ] || stream_limit=240
+    exec timeout --kill-after=5s "${stream_limit}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=0 "$@"
+  fi
+  exec timeout --kill-after=5s 240s kubectl --context="$context" --namespace="$ns" --request-timeout=0 "$@"
+}
+capture_shutdown() {
+  k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-before.json" 2> "$out/shutdown-pods-before.stderr" || return $?
+  # Never silently omit a writer whose status/log incarnation is unavailable.
+  jq -e 'all(.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner");
+    [.status.containerStatuses[]?|select(.name=="rhiza" and (.containerID|type)=="string" and (.containerID|length)>0)]|length==1)
+  ' "$out/shutdown-pods-before.json" >/dev/null || return 1
+  jq '[.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner")|
+    . as $pod | .status.containerStatuses[]?|select(.name=="rhiza")|
+    {name:$pod.metadata.name,namespace:$pod.metadata.namespace,run:$pod.metadata.labels["chaos.rhiza.io/run"],uid:$pod.metadata.uid,
+      image:([ $pod.spec.containers[]|select(.name=="rhiza")|.image ][0]),image_id:.imageID,
+      container_id:.containerID,restart_count:.restartCount}]' "$out/shutdown-pods-before.json" > "$out/shutdown-before.json" || return $?
+  resource_version=$(jq -r '.metadata.resourceVersion' "$out/shutdown-pods-before.json")
+  shutdown_stream get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" --watch-only --output-watch-events \
+    --resource-version="$resource_version" -o json > "$out/shutdown-watch.json" 2> "$out/shutdown-watch.stderr" & shutdown_watch_pid=$!
+  for shutdown_pod in $(jq -r '.[].name' "$out/shutdown-before.json"); do
+    shutdown_stream logs "$shutdown_pod" --container=rhiza --follow > "$out/$shutdown_pod-shutdown.log" 2> "$out/$shutdown_pod-shutdown.stderr" &
+    shutdown_log_pids="$shutdown_log_pids $shutdown_pod:$!"
+  done
+  shutdown_capture=true
+}
+finish_shutdown_capture() {
+  for log_owner in $shutdown_log_pids; do
+    wait "${log_owner#*:}"
+    printf '%s\n' "$?" > "$out/${log_owner%:*}-shutdown-log.exit"
+  done
+  if [ -n "$shutdown_watch_pid" ]; then
+    kill "$shutdown_watch_pid" 2>/dev/null
+    wait "$shutdown_watch_pid"
+    printf '%s\n' "$?" > "$out/shutdown-watch.exit"
+    shutdown_watch_pid=''
+  fi
+  [ ! -s "$out/shutdown-watch.stderr" ] || return 1
+  k get statefulset/rhiza-voter -o json > "$out/shutdown-controller.json" 2> "$out/shutdown-controller.stderr" || return $?
+  k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-after.json" 2> "$out/shutdown-pods-after.stderr" || return $?
+  jq '{items:[.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner")]}' \
+    "$out/shutdown-pods-after.json" > "$out/shutdown-writers-after.json" || return $?
+  verify_shutdown "$out"
+}
 cleanup() {
   code=$?
   trap '' USR1
@@ -172,6 +267,11 @@ cleanup() {
     [ "$cleanup_code" = 0 ] || clean=false
     if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
   fi
+  capture_shutdown
+  capture_code=$?
+  printf '%s\n' "$capture_code" > "$out/shutdown-capture.exit"
+  [ "$capture_code" = 0 ] || clean=false
+  if [ "$code" = 0 ] && [ "$capture_code" != 0 ]; then code=$capture_code; fi
   # Run-owned writers stop normally; this is NOT fencing evidence.
   k scale statefulset/rhiza-voter --replicas=0 > "$out/stop-voters.stdout" 2> "$out/stop-voters.stderr"
   cleanup_code=$?
@@ -199,9 +299,18 @@ cleanup() {
   printf '%s\n' "$cleanup_code" > "$out/stop-probe.exit"
   [ "$cleanup_code" = 0 ] || clean=false
   if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+  if [ "$shutdown_capture" = true ]; then
+    finish_shutdown_capture
+    proof_code=$?
+    printf '%s\n' "$proof_code" > "$out/owned-close-proof.exit"
+    [ "$proof_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$proof_code" != 0 ]; then code=$proof_code; fi
   fi
-  if [ "$clean" = true ]; then
-    printf '%s\n' 'Run-owned fault/writers stopped; Root storage/IAM cleanup still pending.' > "$out/cleanup-status.txt"
+  fi
+  if [ "$owned_created" = false ]; then
+    printf '%s\n' 'No owned runtime resources created; Root auth cleanup still pending.' > "$out/cleanup-status.txt"
+  elif [ "$clean" = true ]; then
+    printf '%s\n' 'Owned HTTP/DB close and pinned container termination verified; NOT universal remote-request quiescence. Root storage/IAM reconciliation still pending.' > "$out/cleanup-status.txt"
   else
     printf '%s\n' 'NOT CLEAN: bounded run-owned shutdown failed; Root must reconcile before storage/IAM cleanup.' > "$out/cleanup-status.txt"
     printf '%s\n' 'NOT CLEAN (see workload.exit for the preserved original result).' >> "$out/result.txt"

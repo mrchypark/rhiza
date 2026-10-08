@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -15,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -423,5 +425,267 @@ func TestObjectStoreCountersUnavailable(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/qualification/object-store", nil))
 	if response.Code != http.StatusServiceUnavailable || response.Body.String() != "object store unavailable\n" {
 		t.Fatalf("unexpected unavailable response: %d %q", response.Code, response.Body.String())
+	}
+}
+
+func TestQualificationHostShutdown(t *testing.T) {
+	identity := shutdownIdentity{"namespace", "a1b2c3d4", "pod-uid", "node", "process"}
+	for _, scenario := range []string{"complete", "close-error", "close-canceled", "close-timeout", "serve-error", "drain-timeout"} {
+		t.Run(scenario, func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(entered)
+				<-release
+				_, _ = w.Write([]byte("done"))
+			}))
+			defer server.Close()
+			requestDone := make(chan struct{})
+			go func() {
+				defer close(requestDone)
+				response, err := http.Get(server.URL)
+				if err == nil {
+					_ = response.Body.Close()
+				}
+			}()
+			<-entered
+			closeStarted, closeReleased := make(chan struct{}), make(chan struct{})
+			defer close(closeReleased)
+			closeDB := func() error {
+				close(closeStarted)
+				if scenario == "close-timeout" {
+					<-closeReleased
+				}
+				if scenario == "close-error" {
+					return errors.New("synthetic close failure")
+				}
+				if scenario == "close-canceled" {
+					return context.Canceled
+				}
+				return nil
+			}
+			var cause error
+			if scenario == "serve-error" {
+				cause = errors.New("synthetic serve failure")
+			}
+			var receipt bytes.Buffer
+			done := make(chan error, 1)
+			drainLimit, closeLimit := 5*time.Second, 5*time.Second
+			if scenario == "drain-timeout" {
+				drainLimit = 10 * time.Millisecond
+			}
+			if scenario == "close-timeout" {
+				closeLimit = 10 * time.Millisecond
+			}
+			go func() {
+				done <- shutdownHost([]*http.Server{server.Config}, closeDB, identity, &receipt, cause, drainLimit, closeLimit)
+			}()
+			// An entered request must finish before DB.Close. Release it only
+			// after the drain-timeout case has actually returned.
+			var err error
+			if scenario == "drain-timeout" {
+				err = <-done
+				select {
+				case <-closeStarted:
+					t.Fatal("Close raced an undrained HTTP handler")
+				default:
+				}
+				close(release)
+			} else {
+				select {
+				case <-closeStarted:
+					t.Fatal("Close preceded HTTP handler completion")
+				default:
+				}
+				close(release)
+				err = <-done
+			}
+			<-requestDone
+			var marker map[string]any
+			if json.Unmarshal(receipt.Bytes(), &marker) != nil {
+				t.Fatal("shutdown receipt missing")
+			}
+			complete := scenario == "complete"
+			if (err == nil) != complete || (marker["event"] == "qualification-host-shutdown-complete") != complete {
+				t.Fatalf("incorrect outcome: scenario=%s err=%v marker=%v", scenario, err, marker)
+			}
+			if marker["pod_uid"] != identity.PodUID || marker["process"] != identity.Process {
+				t.Fatal("shutdown identity lost")
+			}
+		})
+	}
+}
+
+func TestQualificationHostSIGTERM(t *testing.T) {
+	const child = "RHIZA_OFFLINE_SIGTERM_CHILD"
+	if os.Getenv(child) == "yes" {
+		db, err := rhiza.Open(context.Background(), rhiza.Config{Local: true, ClusterID: "shutdown", NodeID: "child", DataDir: os.Getenv("RHIZA_OFFLINE_DIR")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+		defer stop()
+		identity := shutdownIdentity{"namespace", "a1b2c3d4", "pod-uid", "child", "child-process"}
+		servers := []*http.Server{{Addr: "127.0.0.1:0", Handler: http.NewServeMux()}, {Addr: "127.0.0.1:0", Handler: http.NewServeMux()}}
+		err = serveHost(ctx, servers, identity, os.Stdout)
+		if err := shutdownHost(servers, db.Close, identity, os.Stdout, err, time.Second, 5*time.Second); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable, "-test.run=^TestQualificationHostSIGTERM$")
+	command.Env = append(os.Environ(), child+"=yes", "RHIZA_OFFLINE_DIR="+t.TempDir())
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var captured bytes.Buffer
+	scanner := bufio.NewScanner(stdout)
+	signaled := false
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		captured.Write(line)
+		captured.WriteByte('\n')
+		var marker map[string]any
+		if json.Unmarshal(line, &marker) == nil && marker["event"] == "qualification-host-start" && !signaled {
+			signaled = true
+			if err := command.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := command.Wait(); err != nil || ctx.Err() != nil || scanner.Err() != nil {
+		t.Fatalf("actual SIGTERM child failed: %v %v stderr=%s stdout=%s", err, ctx.Err(), stderr.String(), captured.String())
+	}
+	if !signaled || !bytes.Contains(captured.Bytes(), []byte(`"event":"qualification-host-shutdown-complete"`)) || !bytes.Contains(captured.Bytes(), []byte(`"db_closed":true`)) {
+		t.Fatalf("actual owned DB Close completion absent: %s", captured.String())
+	}
+}
+
+func TestQualificationShutdownProof(t *testing.T) {
+	for _, scenario := range []string{"complete", "missing-completion", "close-failure", "wrong-uid", "wrong-process", "forced-kill", "different-container", "different-image", "restarted", "no-terminal-event", "log-failure", "recreation", "replacement-event", "writers-remain", "watch-timeout", "watch-error"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			const run = "a1b2c3d4"
+			ns := "rhiza-v0191-20261008-" + run
+			image := "ghcr.io/mrchypark/rhiza-sql@sha256:" + strings.Repeat("a", 64)
+			writeJSON := func(name string, value any) {
+				t.Helper()
+				encoded, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name), append(encoded, '\n'), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pod := map[string]any{"name": "rhiza-voter-0", "namespace": ns, "run": run, "uid": "owned-uid", "container_id": "containerd://owned", "image": image, "image_id": image, "restart_count": 0}
+			writeJSON("shutdown-before.json", []any{pod})
+			status := map[string]any{"name": "rhiza", "containerID": "containerd://owned", "imageID": image, "restartCount": 0,
+				"state": map[string]any{"terminated": map[string]any{"exitCode": 0, "signal": 0}}}
+			if scenario == "forced-kill" {
+				status["state"] = map[string]any{"terminated": map[string]any{"exitCode": 137, "signal": 9}}
+			}
+			if scenario == "different-container" {
+				status["containerID"] = "containerd://replacement"
+			}
+			if scenario == "different-image" {
+				status["imageID"] = "other-image"
+			}
+			if scenario == "restarted" {
+				status["restartCount"] = 1
+			}
+			event := map[string]any{"type": "DELETED", "object": map[string]any{"metadata": map[string]any{"uid": "owned-uid", "name": "rhiza-voter-0"}, "status": map[string]any{"containerStatuses": []any{status}}}}
+			writeJSON("shutdown-watch.json", event)
+			if scenario == "replacement-event" || scenario == "watch-error" {
+				second := map[string]any{"type": "ADDED", "object": map[string]any{"metadata": map[string]any{"uid": "replacement", "name": "rhiza-voter-0"}}}
+				if scenario == "watch-error" {
+					second = map[string]any{"type": "ERROR", "object": map[string]any{"code": 410}}
+				}
+				encoded, _ := json.Marshal(second)
+				file, err := os.OpenFile(filepath.Join(dir, "shutdown-watch.json"), os.O_APPEND|os.O_WRONLY, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = file.Write(append(encoded, '\n'))
+				_ = file.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			watchExit := "143\n"
+			if scenario == "watch-timeout" {
+				watchExit = "124\n"
+			}
+			if err := os.WriteFile(filepath.Join(dir, "shutdown-watch.exit"), []byte(watchExit), 0600); err != nil {
+				t.Fatal(err)
+			}
+			after := []any{}
+			if scenario == "writers-remain" {
+				after = append(after, pod)
+			}
+			writeJSON("shutdown-writers-after.json", map[string]any{"items": after})
+			if scenario == "no-terminal-event" {
+				writeJSON("shutdown-watch.json", map[string]any{"type": "MODIFIED", "object": map[string]any{"metadata": map[string]any{"uid": "owned-uid"}}})
+			}
+			replicas := 0
+			if scenario == "recreation" {
+				replicas = 1
+			}
+			writeJSON("shutdown-controller.json", map[string]any{"spec": map[string]any{"replicas": replicas}, "status": map[string]any{"replicas": replicas}})
+			identity := shutdownIdentity{ns, run, "owned-uid", "rhiza-voter-0", strings.Repeat("b", 32)}
+			var logs bytes.Buffer
+			if err := hostMarker(&logs, "qualification-host-start", identity, false, false); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "wrong-uid" {
+				identity.PodUID = "replacement"
+			}
+			if scenario == "wrong-process" {
+				identity.Process = strings.Repeat("c", 32)
+			}
+			completion := "qualification-host-shutdown-complete"
+			if scenario == "close-failure" {
+				completion = "qualification-host-shutdown-failed"
+			}
+			if scenario != "missing-completion" {
+				if err := hostMarker(&logs, completion, identity, true, scenario != "close-failure"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(dir, "rhiza-voter-0-shutdown.log"), logs.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			logExit := "0\n"
+			if scenario == "log-failure" {
+				logExit = "1\n"
+			}
+			if err := os.WriteFile(filepath.Join(dir, "rhiza-voter-0-shutdown-log.exit"), []byte(logExit), 0600); err != nil {
+				t.Fatal(err)
+			}
+			script, err := filepath.Abs("../run-gcs-postrelease.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("sh", script, "check-shutdown")
+			command.Env = []string{"PATH=" + os.Getenv("PATH"), "RHIZA_RUN_ID=" + run, "RHIZA_NAMESPACE=" + ns, "RHIZA_AUTH_CREATION_SHA=" + strings.Repeat("d", 40),
+				"RHIZA_HOST_IMAGE=" + image, "RHIZA_METADATA_IMAGE=gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:" + strings.Repeat("e", 64),
+				"RHIZA_NODE_A=gke-ied-cluster-fixture-a", "RHIZA_NODE_B=gke-ied-cluster-fixture-b", "RHIZA_NODE_C=gke-ied-cluster-fixture-c",
+				"RHIZA_OUTPUT=" + filepath.Join(dir, "render"), "RHIZA_SHUTDOWN_FIXTURE=" + dir}
+			output, err := command.CombinedOutput()
+			if (err == nil) != (scenario == "complete") {
+				t.Fatalf("proof scenario=%s result=%v output=%s", scenario, err, output)
+			}
+		})
 	}
 }
