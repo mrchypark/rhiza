@@ -214,7 +214,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal("runtime source identity unavailable")
 	}
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "expiry", "command-failure", "deadline", "watchdog"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -273,7 +273,18 @@ shift
 case "$1" in --request-timeout=*) shift ;; esac
 printf '%s\n' "$1" >> "$FAKE_CALLS"
 case "$1 $2" in
- "config view") cat "$config" ;;
+ "config view")
+  printf 'config-view-start\n' >> "$FAKE_CONFIG_EVENTS"
+  if [ "$FAKE_SCENARIO" = parser-timeout ]; then
+   /bin/sleep 30 & child=$!
+   printf '%s\n' "$child" > "$FAKE_CHILD"
+   trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 143' TERM
+   wait "$child"
+  fi
+  cat "$config"
+  code=$?
+  printf 'config-view-end exit=%s\n' "$code" >> "$FAKE_CONFIG_EVENTS"
+  exit "$code" ;;
  "auth whoami")
   if [ "$FAKE_SCENARIO" = watchdog ]; then touch "$FAKE_SIGNAL_READY"; /bin/sleep 1; fi
   if [ "$FAKE_SCENARIO" = wrong-identity ]; then printf '%s\n' '{"status":{"userInfo":{"username":"admin","groups":[]}}}'
@@ -320,6 +331,7 @@ esac
 				"RHIZA_AUTH_STARTED_EPOCH=" + strconv.FormatInt(now, 10), "RHIZA_AUTH_EXPIRES=" + expiry, "RHIZA_LOCAL_TOKEN_EXPIRES=" + expiry,
 				"FAKE_NOW=" + strconv.FormatInt(now, 10), "FAKE_CLOCK=" + filepath.Join(dir, "clock"),
 				"FAKE_SCENARIO=" + scenario, "FAKE_CALLS=" + filepath.Join(dir, "calls"), "FAKE_CHILD=" + filepath.Join(dir, "child"),
+				"FAKE_CONFIG_EVENTS=" + filepath.Join(dir, "config-events"),
 				"FAKE_PARENT=" + filepath.Join(dir, "parent"), "FAKE_SIGNAL_READY=" + filepath.Join(dir, "signal-ready")}
 			if scenario == "fake-ci" {
 				cmd.Env = append(cmd.Env, "GITHUB_ACTIONS=true")
@@ -349,6 +361,8 @@ esac
 			}
 			err = cmd.Wait()
 			output := captured.Bytes()
+			events, _ := os.ReadFile(filepath.Join(dir, "config-events"))
+			t.Logf("config-view events: %q", events)
 			var exited *exec.ExitError
 			if !errors.As(err, &exited) || ctx.Err() != nil {
 				t.Fatalf("runtime did not fail within its bounded test: err=%v context=%v", err, ctx.Err())
@@ -369,6 +383,8 @@ esac
 			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" {
 				reason := "local kubeconfig must be one pinned tokenFile-only identity"
 				switch scenario {
+				case "parser-timeout":
+					reason = "local kubeconfig parsing failed (exit 124)"
 				case "token-permissions":
 					reason = "private credential ownership/permissions required"
 				case "wrong-identity":
@@ -384,6 +400,20 @@ esac
 				calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
 				if bytes.Contains(calls, []byte("create")) {
 					t.Fatal("rejected local entry attempted a resource write")
+				}
+				if scenario == "parser-timeout" {
+					if string(events) != "config-view-start\n" {
+						t.Fatal("timed parser did not preserve its start-only events")
+					}
+					child, err := os.ReadFile(filepath.Join(dir, "child"))
+					if err != nil {
+						t.Fatal("timed parser's owned child was not recorded")
+					}
+					pid, err := strconv.Atoi(strings.TrimSpace(string(child)))
+					if err != nil || syscall.Kill(pid, 0) == nil {
+						t.Fatal("timed parser's owned child was not reaped")
+					}
+					t.Log("native parser exit124 preserved; owned child reaped")
 				}
 				return
 			}

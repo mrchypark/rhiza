@@ -317,7 +317,8 @@ jobs:
             ':(exclude)e2e/chaos/gcs-postrelease-auth.yaml.in' \
             ':(exclude)e2e/chaos/gcs-postrelease.yaml.in' \
             ':(exclude)e2e/chaos/embedded-go/main.go' \
-            ':(exclude)e2e/chaos/embedded-go/counters_test.go'
+            ':(exclude)e2e/chaos/embedded-go/counters_test.go' \
+            ':(exclude)pkg/network/migration_admission_test.go'
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod

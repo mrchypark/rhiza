@@ -184,8 +184,13 @@ else
   private_file "$RHIZA_LOCAL_RUNTIME_KUBECONFIG"
   # Native parsing stays in memory, never artifacts/logs. A rejected config may
   # contain credentials, so suppress parser diagnostics and disclose only cause.
-  config=$(timeout --kill-after=5s 5s kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
-    --context="$context" --namespace="$ns" config view --raw -o json 2>/dev/null) || die 'local kubeconfig parsing failed'
+  if config=$(timeout --kill-after=5s 5s kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+    --context="$context" --namespace="$ns" config view --raw -o json 2>/dev/null); then
+    :
+  else
+    parser_exit=$?
+    die "local kubeconfig parsing failed (exit $parser_exit)"
+  fi
   printf '%s' "$config" | jq -e --arg context "$context" --arg ns "$ns" \
     --arg server "$RHIZA_LOCAL_API_SERVER" --arg ca "$RHIZA_LOCAL_CA_DATA" '
     .kind=="Config" and .apiVersion=="v1" and .["current-context"]==$context and
