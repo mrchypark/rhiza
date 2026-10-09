@@ -21,6 +21,7 @@ type publisherBusyProbeBucket struct {
 	objstore.Bucket
 	mu          sync.Mutex
 	forceCAS    bool
+	liveOnCAS   bool
 	publisherIO []string
 	currentPut  int
 }
@@ -64,6 +65,12 @@ func (b *publisherBusyProbeBucket) Upload(ctx context.Context, name string, read
 		return err
 	}
 	stale.LeaseUntilMS = 1
+	if b.liveOnCAS {
+		stale.LeaseUntilMS = time.Now().Add(time.Minute).UnixMilli()
+		stale.OwnerID, stale.Purpose = "foreign-live-publisher", "publisher"
+		stale.ReservedIndex = 1
+		stale.Generation++
+	}
 	stale.version = nil
 	staleData, err := json.Marshal(stale)
 	if err != nil {
@@ -115,6 +122,16 @@ func TestPublisherBusyObservationActiveClaimsAreExactAndReadOnly(t *testing.T) {
 			},
 		},
 		{
+			name: "recovery-admission", requestedPurpose: "maintenance", heldPurpose: "publisher", source: "publisher_claim_active",
+			hold: func(m *Manager, ctx context.Context) (*PublisherClaim, error) {
+				return m.AcquirePublisherClaim(ctx, "holder", 0, time.Minute)
+			},
+			attempt: func(m *Manager, ctx context.Context) error {
+				_, err := m.acquireMaintenanceClaim(ctx, "contender", time.Minute)
+				return err
+			},
+		},
+		{
 			name: "generation", requestedPurpose: "generation", heldPurpose: "generation", source: "generation_claim_active",
 			hold: func(m *Manager, ctx context.Context) (*PublisherClaim, error) {
 				return m.AcquireGenerationClaim(ctx, "holder", 1, time.Minute)
@@ -136,7 +153,7 @@ func TestPublisherBusyObservationActiveClaimsAreExactAndReadOnly(t *testing.T) {
 			bucket.reset()
 			var observations []PublisherBusyObservation
 			ctx := WithPublisherBusyObserver(context.Background(), func(observation PublisherBusyObservation) { observations = append(observations, observation) })
-			if err := tc.attempt(manager, ctx); !errors.Is(err, ErrPublisherBusy) {
+			if err := tc.attempt(manager, ctx); !errors.Is(err, ErrPublisherBusy) || errors.Is(err, ErrRecoveryAdmissionBusy) != (tc.requestedPurpose == "maintenance") {
 				t.Fatalf("attempt error=%v", err)
 			}
 			ioWithObserver, currentWrites := bucket.snapshot()
@@ -200,13 +217,17 @@ func TestPublisherBusyObservationConditionalExhaustionHasNoClaim(t *testing.T) {
 			_, err := m.AcquireGenerationClaim(ctx, "owner", 1, time.Minute)
 			return err
 		}},
+		{name: "maintenance", source: "publisher_claim_conditional_exhausted", purpose: "maintenance", attempt: func(m *Manager, ctx context.Context) error {
+			_, err := m.acquireMaintenanceClaim(ctx, "owner", time.Minute)
+			return err
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bucket := &publisherBusyProbeBucket{Bucket: objstore.NewInMemBucket(), forceCAS: true}
 			manager := NewManager(bucket, tc.name, t.TempDir(), 1)
 			var observations []PublisherBusyObservation
 			ctx := WithPublisherBusyObserver(context.Background(), func(observation PublisherBusyObservation) { observations = append(observations, observation) })
-			if err := tc.attempt(manager, ctx); !errors.Is(err, ErrPublisherBusy) {
+			if err := tc.attempt(manager, ctx); !errors.Is(err, ErrPublisherBusy) || errors.Is(err, ErrRecoveryAdmissionBusy) {
 				t.Fatalf("attempt error=%v", err)
 			}
 			if len(observations) != 1 {
@@ -221,6 +242,20 @@ func TestPublisherBusyObservationConditionalExhaustionHasNoClaim(t *testing.T) {
 				t.Fatalf("CURRENT writes=%d, want 0", currentWrites)
 			}
 		})
+	}
+}
+
+func TestRecoveryAdmissionDoesNotClassifyLiveClaimAfterLostCAS(t *testing.T) {
+	bucket := &publisherBusyProbeBucket{Bucket: objstore.NewInMemBucket(), forceCAS: true, liveOnCAS: true}
+	manager := NewManager(bucket, "lost-cas", t.TempDir(), 1)
+	var observations []PublisherBusyObservation
+	ctx := WithPublisherBusyObserver(context.Background(), func(event PublisherBusyObservation) { observations = append(observations, event) })
+	_, err := manager.acquireMaintenanceClaim(ctx, "contender", time.Minute)
+	if !errors.Is(err, ErrPublisherBusy) || errors.Is(err, ErrRecoveryAdmissionBusy) {
+		t.Fatalf("post-CAS refusal incorrectly classified: %v", err)
+	}
+	if len(observations) != 1 || observations[0].Attempt != 2 || observations[0].Source != "publisher_claim_active" || observations[0].OwnerID != "foreign-live-publisher" {
+		t.Fatalf("wrong lost-CAS branch: %+v", observations)
 	}
 }
 

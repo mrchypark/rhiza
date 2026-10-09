@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -68,13 +69,42 @@ func (g *startupRecoveryGuard) Snapshot() *recovery.RecoverySnapshot {
 }
 
 func (g *startupRecoveryGuard) PinRoot(ctx context.Context, manager *checkpoint.Manager, root *checkpoint.Checkpoint, owner string) (*checkpoint.Checkpoint, error) {
-	pin, err := manager.PinRecoveryRoot(ctx, root, owner, startupRecoveryLease)
-	if err != nil {
-		return nil, err
+	admissionCtx, cancel := context.WithTimeout(ctx, startupRecoveryLease)
+	defer cancel()
+	stop := context.AfterFunc(g.ctx, cancel)
+	defer stop()
+	var pin *checkpoint.RecoveryPin
+	for {
+		if err := g.Check(admissionCtx.Err()); err != nil {
+			return nil, err
+		}
+		var err error
+		pin, err = manager.PinRecoveryRoot(admissionCtx, root, owner, startupRecoveryLease)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, checkpoint.ErrRecoveryAdmissionBusy) {
+			return nil, g.Check(err)
+		}
+		if err := g.Check(nil); err != nil {
+			return nil, err
+		}
+		// Only a verified pre-write refusal may wait; every admitted pin error
+		// remains immediate and foreign ownership is never changed here.
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-admissionCtx.Done():
+			timer.Stop()
+			return nil, g.Check(fmt.Errorf("checkpoint recovery admission: %w", errors.Join(err, admissionCtx.Err())))
+		case <-timer.C:
+		}
 	}
 	g.mu.Lock()
 	g.root = pin
 	g.mu.Unlock()
+	if err := g.Check(nil); err != nil {
+		return nil, err
+	}
 	return pin.Root()
 }
 
