@@ -196,6 +196,47 @@ func TestQualificationFixture(t *testing.T) {
 	}
 }
 
+func TestQualificationCurlHelper(t *testing.T) {
+	if os.Getenv("RHIZA_CURL_HELPER") != "1" {
+		t.Skip("subprocess helper")
+	}
+	if os.Getenv("FAKE_SCENARIO") != "bind-conflict" {
+		if _, err := os.Stat(filepath.Join(os.Getenv("FAKE_DIR"), "listening")); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	marker := filepath.Join(os.Getenv("FAKE_DIR"), "bind-exited")
+	for attempt := 0; attempt < 100; attempt++ {
+		if _, err := os.Stat(marker); err == nil {
+			time.Sleep(time.Second)
+			for _, arg := range os.Args {
+				if !strings.HasPrefix(arg, "http://") {
+					continue
+				}
+				client := &http.Client{Timeout: 2 * time.Second}
+				response, err := client.Get(arg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				response.Body.Close()
+				if response.StatusCode != http.StatusOK {
+					t.Fatalf("health status=%d", response.StatusCode)
+				}
+				if err := os.WriteFile(filepath.Join(os.Getenv("FAKE_DIR"), "health-ok"), []byte("ok\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			t.Fatal("health URL missing")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("bind failure did not complete")
+}
+
 func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
 	if err != nil {
@@ -280,6 +321,24 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 	}{{"complete", 0}, {"uid-change", 1}, {"container-change", 1}, {"image-change", 1}, {"wrong-stable-image", 1}, {"extra-sidecar", 1}, {"forward-death", 1}, {"bind-conflict", 1}, {"stubborn-child", 0}} {
 		t.Run("forward-"+scenario.name, func(t *testing.T) {
 			dir := t.TempDir()
+			selectedPort := 0
+			var occupied net.Listener
+			for _, candidate := range []int{18080, 18081, 18082, 18083} {
+				listener, listenErr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", candidate))
+				if listenErr != nil {
+					continue
+				}
+				selectedPort = candidate
+				if scenario.name == "bind-conflict" {
+					occupied = listener
+				} else {
+					listener.Close()
+				}
+				break
+			}
+			if selectedPort == 0 {
+				t.Fatal("no supported production port available")
+			}
 			bin := filepath.Join(dir, "bin")
 			if err := os.Mkdir(bin, 0700); err != nil {
 				t.Fatal(err)
@@ -290,21 +349,13 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			realCurl, err := exec.LookPath("curl")
+			testBinary, err := os.Executable()
 			if err != nil {
 				t.Fatal(err)
 			}
-			write("curl", `#!/bin/sh
-if [ "$FAKE_SCENARIO" = bind-conflict ]; then
-  tries=0
-  while [ ! -f "$FAKE_DIR/bind-exited" ]; do tries=$((tries + 1)); [ "$tries" -lt 100 ] || exit 99; sleep 0.01; done
-  sleep 1
-  exec "$FAKE_REAL_CURL" "$@"
-fi
-[ -f "$FAKE_DIR/listening" ]
-`)
+			write("curl", "#!/bin/sh\nexec \"$FAKE_TEST_BINARY\" -test.run '^TestQualificationCurlHelper$' -- \"$@\"\n")
 			write("kubectl", `#!/bin/sh
-case "$*" in *" port-forward pod/rhiza-voter-0 "*) ;; *) exit 97 ;; esac
+case "$*" in *" port-forward pod/rhiza-voter-0 $FAKE_PORT:8080 "*) ;; *) exit 97 ;; esac
 [ "$FAKE_SCENARIO" != forward-death ] || exit 53
 if [ -e "$FAKE_DIR/listening" ]; then
   owner=$(cat "$FAKE_DIR/listening")
@@ -319,6 +370,7 @@ while :; do sleep 1; done
 set -eu
 mode=run; out=$FAKE_DIR; pf_pids=''; context=synthetic; ns=synthetic; started=$(date +%s); pf_generation=0
 RHIZA_HOST_IMAGE=ghcr.io/mrchypark/rhiza-sql@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+port=$FAKE_PORT
 die() { printf '%s\n' "$*" >&2; exit 1; }
 k() {
   [ "$1" = get ] || return 97
@@ -332,11 +384,11 @@ k() {
 ` + functions + `
 trap 'for pid in $pf_pids; do stop_forward "$pid" || true; done' EXIT
 [ "$FAKE_SCENARIO" != bind-conflict ] || printf 'forced\n' > "$FAKE_DIR/listening"
-forward rhiza-voter-0 18080
-first=$pf_18080
+forward rhiza-voter-0 "$port"
+case "$port" in 18080) first=$pf_18080;; 18081) first=$pf_18081;; 18082) first=$pf_18082;; 18083) first=$pf_18083;; esac
 [ "$FAKE_SCENARIO" != complete ] && [ "$FAKE_SCENARIO" != stubborn-child ] && exit 0
-forward rhiza-voter-0 18080
-second=$pf_18080
+forward rhiza-voter-0 "$port"
+case "$port" in 18080) second=$pf_18080;; 18081) second=$pf_18081;; 18082) second=$pf_18082;; 18083) second=$pf_18083;; esac
 [ "$first" != "$second" ]
 ! kill -0 "$first" 2>/dev/null
 [ "$(printf '%s\n' $pf_pids | wc -l | tr -d ' ')" = 1 ]
@@ -344,13 +396,8 @@ stop_forward "$second"
 [ "$(grep -c '^start$' "$FAKE_DIR/events")" = 2 ]
 [ ! -e "$FAKE_DIR/address-in-use" ]
 `
-			var occupied net.Listener
 			var occupiedServer *http.Server
 			if scenario.name == "bind-conflict" {
-				occupied, err = net.Listen("tcp", "127.0.0.1:18080")
-				if err != nil {
-					t.Fatalf("bind-conflict fixture did not prove occupied port: %v", err)
-				}
 				occupiedServer = &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 					if request.URL.Path != "/healthz" {
 						http.NotFound(response, request)
@@ -364,7 +411,8 @@ stop_forward "$second"
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture)
-			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name, "FAKE_REAL_CURL="+realCurl)
+			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name,
+				"FAKE_TEST_BINARY="+testBinary, "RHIZA_CURL_HELPER=1", "FAKE_PORT="+strconv.Itoa(selectedPort))
 			output, err := command.CombinedOutput()
 			code := 0
 			if err != nil {
@@ -376,6 +424,12 @@ stop_forward "$second"
 			}
 			if (code == 0) != (scenario.want == 0) {
 				t.Fatalf("exit=%d want=%d output=%s", code, scenario.want, output)
+			}
+			if scenario.name == "bind-conflict" {
+				health, healthErr := os.ReadFile(filepath.Join(dir, "health-ok"))
+				if healthErr != nil || string(health) != "ok\n" {
+					t.Fatalf("occupied listener health was not proven before PID failure: %q %v", health, healthErr)
+				}
 			}
 		})
 	}
