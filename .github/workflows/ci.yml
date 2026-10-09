@@ -136,7 +136,7 @@ jobs:
           docker run --rm --network host \
             -e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
             -e AWS_DEFAULT_REGION=us-east-1 \
-            amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
+            public.ecr.aws/aws-cli/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
             --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
@@ -322,9 +322,26 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$APPLICATION_SHA"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          approved_mirror_diff="$RUNNER_TEMP/approved-mirror.diff"
+          LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
+            --no-color --no-indent-heuristic --diff-algorithm=myers --unified=3 \
+            --src-prefix=a/ --dst-prefix=b/ "$APPLICATION_SHA" "$GITHUB_SHA" -- \
+            .github/workflows/operator-release.yml \
+            Dockerfile \
+            Dockerfile.operator \
+            e2e/chaos/Dockerfile \
+            e2e/chaos/Dockerfile.rust > "$approved_mirror_diff"
+          printf '%s  %s\n' \
+            f54cd3b6f4f3f43c68b07e727f23b9a60954bef033731247296046f3dc35a58d \
+            "$approved_mirror_diff" | sha256sum --check --strict
           git diff --exit-code "$APPLICATION_SHA" "$GITHUB_SHA" -- . \
             ':(exclude).github/workflows/ci.yml' \
             ':(exclude).github/workflows/gcs-postrelease.yml' \
+            ':(exclude).github/workflows/operator-release.yml' \
+            ':(exclude)Dockerfile' \
+            ':(exclude)Dockerfile.operator' \
+            ':(exclude)e2e/chaos/Dockerfile' \
+            ':(exclude)e2e/chaos/Dockerfile.rust' \
             ':(exclude)e2e/chaos/bootstrap-gcs-postrelease.sh' \
             ':(exclude)e2e/chaos/run-gcs-postrelease.sh' \
             ':(exclude)e2e/chaos/gcs-postrelease-auth.yaml.in' \
