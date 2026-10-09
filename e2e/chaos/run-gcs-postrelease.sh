@@ -9,6 +9,19 @@ case "$mode" in render|run|run-local|check-shutdown) ;; *) printf '%s\n' 'usage:
 release=315a5ee6bc6635b4ff4f85b9534afa4abe537c79
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256_output=$(sha256sum "$1") || return
+  elif command -v shasum >/dev/null 2>&1; then
+    sha256_output=$(shasum -a 256 "$1") || return
+  else
+    die 'Missing SHA-256 utility (sha256sum or shasum)'
+  fi
+  set -- $sha256_output
+  [ "$#" -ge 1 ] && [ "${#1}" -eq 64 ] || return 1
+  case "$1" in *[!a-f0-9]*) return 1 ;; esac
+  printf '%s\n' "$1"
+}
 safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
 : "${RHIZA_RUN_ID:?}" "${RHIZA_NAMESPACE:?}" "${RHIZA_HOST_IMAGE:?}" "${RHIZA_METADATA_IMAGE:?}"
 : "${RHIZA_NODE_A:?}" "${RHIZA_NODE_B:?}" "${RHIZA_NODE_C:?}" "${RHIZA_OUTPUT:?}"
@@ -171,7 +184,7 @@ prepare_cluster_metadata() {
     RHIZA_CLUSTER_METADATA="$out/cluster-metadata-validation.json"
     jq '{name,location,nodePools:[.nodePools[]|{name,config:{workloadMetadataConfig:{mode:.config.workloadMetadataConfig.mode}}}]}' \
       "$cluster_metadata_raw" > "$RHIZA_CLUSTER_METADATA" || return 1
-    shasum -a 256 "$RHIZA_CLUSTER_METADATA" | awk '{print $1}' > "$out/cluster-metadata-validation.sha256"
+    sha256_file "$RHIZA_CLUSTER_METADATA" > "$out/cluster-metadata-validation.sha256"
     cleanup_cluster_metadata_tmp
     trap - 0 HUP INT TERM
   fi
@@ -180,7 +193,7 @@ prepare_cluster_metadata() {
   private_file "$cluster_metadata_checksum"
   expected_cluster_metadata_checksum=$(cat "$cluster_metadata_checksum")
   printf '%s' "$expected_cluster_metadata_checksum" | grep -Eq '^[a-f0-9]{64}$' || return 1
-  [ "$(shasum -a 256 "$RHIZA_CLUSTER_METADATA" | awk '{print $1}')" = "$expected_cluster_metadata_checksum" ] || return 1
+  [ "$(sha256_file "$RHIZA_CLUSTER_METADATA")" = "$expected_cluster_metadata_checksum" ] || return 1
   validate_node_pool_metadata "$RHIZA_CLUSTER_METADATA"
 }
 wait_voters() (
@@ -667,7 +680,23 @@ cleanup() {
   fi
   printf '%s\n' 'Managed-folder objects, soft-delete retention and namespace/IAM teardown remain Root-owned; no recursive cleanup here.' > "$out/cleanup-owner.txt"
   printf '%s\n' "$code" > "$out/root.exit"
-  (cd "$out" && find . -type f ! -name SHA256SUMS -exec sha256sum {} \;) > "$out/SHA256SUMS"
+  seal_code=0
+  manifest_files=$(mktemp "$out/.SHA256SUMS.files.XXXXXXXX") || seal_code=$?
+  if [ "$seal_code" = 0 ]; then
+    (cd "$out" && find . -type f ! -name SHA256SUMS ! -name '.SHA256SUMS.files.*' -print) > "$manifest_files" || seal_code=$?
+  fi
+  if [ "$seal_code" = 0 ]; then
+    (cd "$out" && while IFS= read -r file; do
+      digest=$(sha256_file "$file") || exit $?
+      printf '%s  %s\n' "$digest" "$file" || exit $?
+    done < "$manifest_files") > "$out/SHA256SUMS" || seal_code=$?
+  fi
+  [ -z "${manifest_files:-}" ] || rm -f "$manifest_files"
+  if [ "$seal_code" != 0 ]; then
+    rm -f "$out/SHA256SUMS"
+    if [ "$code" = 0 ]; then code=$seal_code; fi
+    printf '%s\n' "$code" > "$out/root.exit"
+  fi
   exit "$code"
 }
 trap cleanup EXIT

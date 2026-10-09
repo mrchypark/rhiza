@@ -298,6 +298,49 @@ gcloud() {
 	}
 }
 
+func TestPostreleaseSHA256ToolFallback(t *testing.T) {
+	for _, script := range []string{"../bootstrap-gcs-postrelease.sh", "../run-gcs-postrelease.sh"} {
+		source, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := strings.Index(string(source), "\nsha256_file() {\n")
+		end := strings.Index(string(source)[start+1:], "\n}\n")
+		if start < 0 || end < 0 {
+			t.Fatalf("%s: SHA-256 helper missing", script)
+		}
+		helper := string(source)[start+1 : start+1+end+3]
+		for _, scenario := range []string{"sha256sum-only", "shasum-only", "neither", "malformed"} {
+			t.Run(filepath.Base(script)+"/"+scenario, func(t *testing.T) {
+				dir := t.TempDir()
+				tool := "sha256sum"
+				body := "printf '%064d  %s\\n' 0 \"$1\"\n"
+				if scenario == "shasum-only" {
+					tool = "shasum"
+					body = "[ \"$1 $2\" = '-a 256' ] || exit 9\nprintf '%064d  %s\\n' 0 \"$3\"\n"
+				} else if scenario == "malformed" {
+					body = "printf 'not-a-digest  %s\\n' \"$1\"\n"
+				}
+				if scenario != "neither" {
+					if err := os.WriteFile(filepath.Join(dir, tool), []byte("#!/bin/sh\n"+body), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				command := exec.Command("/bin/sh", "-c", helper+"\nsha256_file fixture")
+				command.Env = []string{"PATH=" + dir}
+				output, err := command.CombinedOutput()
+				wantSuccess := scenario == "sha256sum-only" || scenario == "shasum-only"
+				if (err == nil) != wantSuccess {
+					t.Fatalf("success=%v output=%q", err == nil, output)
+				}
+				if wantSuccess && string(output) != strings.Repeat("0", 64)+"\n" {
+					t.Fatalf("unexpected digest %q", output)
+				}
+			})
+		}
+	}
+}
+
 func TestQualificationCurlHelper(t *testing.T) {
 	if os.Getenv("RHIZA_CURL_HELPER") != "1" {
 		t.Skip("subprocess helper")
@@ -1725,7 +1768,9 @@ func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
 	end := strings.Index(string(source), "\nwait_voters() (\n")
 	privateStart := strings.Index(string(source), "\nprivate_file() {\n")
 	privateEnd := strings.Index(string(source), "\nsed -e \"s|__NAMESPACE__|")
-	if start < 0 || end <= start || privateStart < 0 || privateEnd <= privateStart {
+	helperStart := strings.Index(string(source), "\nsha256_file() {\n")
+	helperEnd := strings.Index(string(source)[helperStart+1:], "\n}\n") + helperStart + 4
+	if start < 0 || end <= start || privateStart < 0 || privateEnd <= privateStart || helperStart < 0 || helperEnd <= helperStart {
 		t.Fatal("cluster metadata preparation functions missing")
 	}
 	for _, scenario := range []string{"caller-ignored", "describe-failure"} {
@@ -1762,7 +1807,7 @@ prepare_cluster_metadata || exit $?
 [ "$RHIZA_CLUSTER_METADATA" = "$FAKE_DIR/cluster-metadata-validation.json" ] || exit 96
 touch "$FAKE_DIR/metadata-pod-created"
 `
-			command := exec.Command("/bin/sh", "-c", string(source[privateStart:privateEnd])+string(source[start:end])+fixture)
+			command := exec.Command("/bin/sh", "-c", string(source[helperStart:helperEnd])+string(source[privateStart:privateEnd])+string(source[start:end])+fixture)
 			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario,
 				"FAKE_CLUSTER="+clusterPath, "FAKE_CALLER="+callerPath, "TMPDIR="+dir)
 			output, runErr := command.CombinedOutput()
@@ -1804,7 +1849,9 @@ func TestQualificationMetadataOnlyCleanup(t *testing.T) {
 	captureEnd := strings.Index(string(source), "\nfinish_shutdown_capture() {\n")
 	stopStart := strings.Index(string(source), "\nstop_forward() {\n")
 	stopEnd := strings.Index(string(source), "\npf_pids=''\n")
-	if start < 0 || end <= start || captureStart < 0 || captureEnd <= captureStart || stopStart < 0 || stopEnd <= stopStart {
+	helperStart := strings.Index(string(source), "\nsha256_file() {\n")
+	helperEnd := strings.Index(string(source)[helperStart+1:], "\n}\n") + helperStart + 4
+	if start < 0 || end <= start || captureStart < 0 || captureEnd <= captureStart || stopStart < 0 || stopEnd <= stopStart || helperStart < 0 || helperEnd <= helperStart {
 		t.Fatal("actual cleanup functions missing")
 	}
 	if !strings.Contains(string(source), "voters_attempted=false\n") || !strings.Contains(string(source), "voters_attempted=true\nrun create-voters") ||
@@ -1824,7 +1871,11 @@ func TestQualificationMetadataOnlyCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, scenario := range []string{"metadata", "no-owned", "unknown-create", "partial-voters", "namespace-owner", "namespace-uid", "pod-uid", "run", "ksa", "image", "node", "rv", "owner-reference", "controller", "replicaset", "daemonset", "statefulset", "cronjob", "writer", "job", "fault", "list-error", "delete-error", "wait-timeout", "replacement", "delayed-child"} {
+	nativeFind, err := exec.LookPath("find")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"metadata", "no-owned", "unknown-create", "partial-voters", "namespace-owner", "namespace-uid", "pod-uid", "run", "ksa", "image", "node", "rv", "owner-reference", "controller", "replicaset", "daemonset", "statefulset", "cronjob", "writer", "job", "fault", "list-error", "delete-error", "wait-timeout", "replacement", "delayed-child", "manifest-failure", "manifest-failure-existing", "manifest-malformed", "manifest-find-failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			out := filepath.Join(dir, "out")
@@ -1842,7 +1893,18 @@ if [ "$FAKE_SCENARIO" = delayed-child ]; then
  printf 'begin\ncomplete\n' | cmp - "$FAKE_OUT/child-final.txt" || exit 98
  printf 'reaped-before-checksum\n' > "$FAKE_DIR/reap-at-seal"
 fi
+case "$FAKE_SCENARIO" in manifest-failure|manifest-failure-existing) exit 86 ;; esac
+[ "$FAKE_SCENARIO" != manifest-malformed ] || { printf 'not-a-digest  %s\n' "$1"; exit 0; }
 exec "$FAKE_NATIVE_CHECKSUM" "$@"
+`), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bin, "find"), []byte(`#!/bin/sh
+if [ "$FAKE_SCENARIO" = manifest-find-failure ]; then
+ printf './cleanup-owner.txt\n'
+ exit 87
+fi
+exec "$FAKE_NATIVE_FIND" "$@"
 `), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -1950,20 +2012,42 @@ k() {
 `
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[stopStart:stopEnd])+string(source[captureStart:captureEnd])+string(source[start:end])+"\n(exit 53); cleanup")
-			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_OUT="+out, "FAKE_SCENARIO="+scenario, "FAKE_NATIVE_CHECKSUM="+nativeChecksum)
+			initialCode := 53
+			if scenario == "manifest-failure" || scenario == "manifest-malformed" || scenario == "manifest-find-failure" {
+				initialCode = 0
+			}
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[helperStart:helperEnd])+string(source[stopStart:stopEnd])+string(source[captureStart:captureEnd])+string(source[start:end])+fmt.Sprintf("\n(exit %d); cleanup", initialCode))
+			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_OUT="+out, "FAKE_SCENARIO="+scenario, "FAKE_NATIVE_CHECKSUM="+nativeChecksum, "FAKE_NATIVE_FIND="+nativeFind)
 			output, runErr := command.CombinedOutput()
 			var exited *exec.ExitError
-			if !errors.As(runErr, &exited) || exited.ExitCode() != 53 || ctx.Err() != nil {
+			wantCode := initialCode
+			if scenario == "manifest-failure" {
+				wantCode = 86
+			} else if scenario == "manifest-malformed" {
+				wantCode = 1
+			} else if scenario == "manifest-find-failure" {
+				wantCode = 87
+			}
+			if !errors.As(runErr, &exited) || exited.ExitCode() != wantCode || ctx.Err() != nil {
 				t.Fatalf("original exit lost: %v output=%s", runErr, output)
 			}
 			status, err := os.ReadFile(filepath.Join(out, "cleanup-status.txt"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			clean := scenario == "metadata" || scenario == "no-owned"
+			clean := scenario == "metadata" || scenario == "no-owned" || strings.HasPrefix(scenario, "manifest-")
 			if bytes.Contains(status, []byte("NOT CLEAN")) == clean || bytes.Contains(status, []byte("HTTP/DB close and pinned")) {
 				t.Fatalf("wrong cleanup claim: %s", status)
+			}
+			if strings.HasPrefix(scenario, "manifest-") {
+				rootExit, err := os.ReadFile(filepath.Join(out, "root.exit"))
+				if err != nil || strings.TrimSpace(string(rootExit)) != strconv.Itoa(wantCode) {
+					t.Fatalf("manifest failure root exit=%q error=%v", rootExit, err)
+				}
+				if _, err := os.Stat(filepath.Join(out, "SHA256SUMS")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("failed manifest retained: %v", err)
+				}
+				return
 			}
 			_, deleteErr := os.Stat(filepath.Join(out, "metadata-delete-options.json"))
 			shouldDelete := scenario == "metadata" || scenario == "delete-error" || scenario == "wait-timeout" || scenario == "replacement"

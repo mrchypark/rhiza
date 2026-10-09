@@ -5,6 +5,19 @@ set -eu
 set +x
 umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256_output=$(sha256sum "$1") || return
+    elif command -v shasum >/dev/null 2>&1; then
+        sha256_output=$(shasum -a 256 "$1") || return
+    else
+        die 'Missing SHA-256 utility (sha256sum or shasum)'
+    fi
+    set -- $sha256_output
+    [ "$#" -ge 1 ] && [ "${#1}" -eq 64 ] || return 1
+    case "$1" in *[!a-f0-9]*) return 1 ;; esac
+    printf '%s\n' "$1"
+}
 mode=${1:-render}
 auth_mode=ci
 case "$mode" in
@@ -149,7 +162,7 @@ mint_local() (
     trap 'exit 130' HUP INT TERM
     record mint-cluster g container clusters describe ied-cluster --region=asia-northeast3 --format=json
     validate_cluster_metadata "$RHIZA_AUTH_STATE/mint-cluster.json"
-    shasum -a 256 "$RHIZA_AUTH_STATE/mint-cluster.json" | awk '{print $1}' > "$RHIZA_AUTH_STATE/mint-cluster.sha256"
+    sha256_file "$RHIZA_AUTH_STATE/mint-cluster.json" > "$RHIZA_AUTH_STATE/mint-cluster.sha256"
     jq -n --argjson duration "$((mint_remaining - 30))" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",spec:{expirationSeconds:$duration}}' > "$RHIZA_AUTH_STATE/runtime-token-request.private"
     printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/runtime-token-request.attempted"
     printf '%s\n' runtime-token-request > "$RHIZA_AUTH_STATE/inflight"
@@ -432,7 +445,7 @@ if [ "$mode" = check-local-auth ]; then
       (.users|length)==1 and .users[0].user=={tokenFile:$token} and
       (.clusters|length)==1 and (.contexts|length)==1 and .contexts[0].context.namespace==$ns
     ' "$local_fixture/runtime.kubeconfig" >/dev/null || die 'Static private kubeconfig mismatch'
-    [ "$(shasum -a 256 "$local_fixture/mint-cluster.json" | awk '{print $1}')" = "$(cat "$local_fixture/mint-cluster.sha256")" ] || die 'Cluster metadata handoff checksum mismatch'
+    [ "$(sha256_file "$local_fixture/mint-cluster.json")" = "$(cat "$local_fixture/mint-cluster.sha256")" ] || die 'Cluster metadata handoff checksum mismatch'
     [ "$(find "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" -type f -user "$(id -u)" -perm 0600 -print | wc -l | tr -d ' ')" = 2 ] || die 'Credential file mode regression'
     if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die 'Token renewal accepted'; fi
     [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'TokenRequest repeated'
@@ -728,7 +741,8 @@ case "${RHIZA_COST_CAP_KRW:-}" in 10000) ;; *) die 'Explicit approved monetary c
 : "${RHIZA_EXPECTED_ADMIN_ACCOUNT:?explicit nonempty administrative account required}"
 : "${RHIZA_AUTH_STATE:?absolute private receipt directory required}"
 case "$RHIZA_AUTH_STATE" in /*) ;; *) die 'State directory must be absolute' ;; esac
-for cmd in gcloud kubectl jq shasum curl timeout; do command -v "$cmd" >/dev/null || die "Missing $cmd"; done
+for cmd in gcloud kubectl jq curl timeout; do command -v "$cmd" >/dev/null || die "Missing $cmd"; done
+command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || die 'Missing SHA-256 utility (sha256sum or shasum)'
 [ "$auth_mode" = local ] || command -v gh >/dev/null || die 'Missing gh'
 k() { kubectl --context="$context" "$@"; }
 g() { gcloud --project="$project" --quiet "$@"; }
@@ -746,7 +760,7 @@ if [ "$mode" = apply ]; then
     case "$RHIZA_FIXTURE_GENERATOR" in /*) ;; *) die 'Generator must be an absolute binary path' ;; esac
     [ -f "$RHIZA_FIXTURE_GENERATOR" ] && [ -x "$RHIZA_FIXTURE_GENERATOR" ] || die 'Generator binary unavailable'
     printf '%s\n' "$RHIZA_FIXTURE_GENERATOR_SHA256" | LC_ALL=C grep -Eq '^[a-f0-9]{64}$' || die 'Invalid generator hash'
-    hash=$(shasum -a 256 "$RHIZA_FIXTURE_GENERATOR" | awk '{print $1}')
+    hash=$(sha256_file "$RHIZA_FIXTURE_GENERATOR")
     [ "$hash" = "$RHIZA_FIXTURE_GENERATOR_SHA256" ] || die 'Generator binary differs from reviewed hash'
     [ ! -e "$RHIZA_AUTH_STATE" ] || die 'Receipt directory exists; no resume or adoption'
     mkdir -m 700 "$RHIZA_AUTH_STATE"
