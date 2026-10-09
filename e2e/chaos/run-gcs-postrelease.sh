@@ -6,7 +6,7 @@ set +x
 umask 077
 mode=${1:-}
 case "$mode" in render|run|run-local|check-shutdown) ;; *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;; esac
-release=d575e686d2ec349c07de70679f5c6b22c1718e17
+release=315a5ee6bc6635b4ff4f85b9534afa4abe537c79
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
 safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }

@@ -233,7 +233,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 				}
 			}
 			const run = "a1b2c3d4"
-			const harness = "d575e686d2ec349c07de70679f5c6b22c1718e17"
+			const harness = "315a5ee6bc6635b4ff4f85b9534afa4abe537c79"
 			mockFixtureRevision := syntheticFixtureRevision
 			if scenario == "head-mismatch" {
 				mockFixtureRevision = strings.Repeat("2", 40)
@@ -309,7 +309,7 @@ case "$1 $2" in
   esac ;;
  "get namespace")
   if [ "$FAKE_SCENARIO" = command-failure ]; then exit 53; fi
-  printf '%s\n' '{"metadata":{"uid":"synthetic-uid","labels":{"chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-d575e686d2ec349c07de70679f5c6b22c1718e17","chaos-mesh.org/inject":"enabled"}}}' ;;
+  printf '%s\n' '{"metadata":{"uid":"synthetic-uid","labels":{"chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-315a5ee6bc6635b4ff4f85b9534afa4abe537c79","chaos-mesh.org/inject":"enabled"}}}' ;;
  "get pods,statefulsets,services,configmaps,networkpolicies,podchaos,networkchaos")
   if [ "$FAKE_SCENARIO" = deadline ]; then printf '%s\n' "$((FAKE_NOW + 1199))" > "$FAKE_CLOCK"; fi
   printf '%s\n' '{"items":[]}' ;;
