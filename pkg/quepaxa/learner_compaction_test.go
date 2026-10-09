@@ -55,6 +55,9 @@ func TestPromotedLearnerVotesAfterMembershipBaseRestart(t *testing.T) {
 		if err := core.WaitTip(ctx, index); err != nil {
 			t.Fatalf("core %s did not reach checkpoint index %d: %v", id, index, err)
 		}
+		if err := core.EnsureDurableThrough(ctx, index); err != nil {
+			t.Fatalf("core %s did not persist checkpoint index %d: %v", id, index, err)
+		}
 		gotPrefix, ok := core.PrefixHash(index)
 		if !ok || gotPrefix != prefix {
 			t.Fatalf("core %s checkpoint prefix at %d = %x, present=%v; want %x", id, index, gotPrefix, ok, prefix)
