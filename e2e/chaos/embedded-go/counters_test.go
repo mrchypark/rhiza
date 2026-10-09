@@ -216,7 +216,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "metadata-credential-failure", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -240,6 +240,14 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			}
 			const contextName = "gke_patch2-the-new-era_asia-northeast3_ied-cluster"
 			namespace := "rhiza-v0191-20261008-" + run
+			metadata, err := json.Marshal(map[string]any{"kind": "Pod", "metadata": map[string]any{"name": "rhiza-metadata", "namespace": namespace,
+				"uid": "metadata-uid", "resourceVersion": "7", "labels": map[string]string{"chaos.rhiza.io/run": run}},
+				"spec": map[string]any{"serviceAccountName": "rhiza-gcs", "nodeName": "gke-ied-cluster-fixture-a",
+					"containers": []any{map[string]string{"name": "metadata", "image": "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:" + strings.Repeat("b", 64)}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			write(filepath.Join(dir, "metadata.json"), string(metadata), 0600)
 			token := filepath.Join(dir, "token")
 			write(token, "synthetic-offline-token", 0600)
 			user := map[string]any{"tokenFile": token}
@@ -284,7 +292,7 @@ shift
 shift
 case "$1" in --request-timeout=*) shift ;; esac
 printf 'args-ok\n' >> "$FAKE_CONFIG_EVENTS"
-printf '%s\n' "$1" >> "$FAKE_CALLS"
+printf '%s\n' "$*" >> "$FAKE_CALLS"
 case "$1 $2" in
  "config view")
   printf 'config-view-start\n' >> "$FAKE_CONFIG_EVENTS"
@@ -314,11 +322,49 @@ case "$1 $2" in
   if [ "$FAKE_SCENARIO" = deadline ]; then printf '%s\n' "$((FAKE_NOW + 1199))" > "$FAKE_CLOCK"; fi
   printf '%s\n' '{"items":[]}' ;;
  "create -f")
+  case "$FAKE_SCENARIO" in
+   metadata-credential-failure|outside-prefix-auth-failure|outside-prefix-accessible|inside-prefix-auth-failure|voter-create-failure|voter-create-unknown)
+    case "$3" in
+     */metadata.yaml) [ "$4 $5" = '-o json' ] || exit 97; cat "$FAKE_METADATA"; exit 0 ;;
+     */voters.yaml)
+      if [ "$FAKE_SCENARIO" = voter-create-unknown ]; then touch "$FAKE_VOTER_ATTEMPT"; printf '{"kind":"StatefulSet"}'; exit 55; fi
+      exit 53 ;;
+     *) exit 97 ;;
+    esac ;;
+  esac
   /bin/sleep 30 & child=$!
   printf '%s\n' "$child" > "$FAKE_CHILD"
   trap 'kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 143' TERM
   wait "$child" ;;
+ "exec rhiza-metadata")
+  case "$4" in
+   curl)
+    [ "$*" = 'exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 16384 --noproxy * -H Metadata-Flavor: Google --write-out \n%{http_code} http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' ] || exit 98
+    if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n403'
+    else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
+   gcloud)
+    case "$5 $6" in
+     'storage cat')
+      [ "$FAKE_SCENARIO" != outside-prefix-accessible ] || exit 0
+      if [ "$FAKE_SCENARIO" = outside-prefix-auth-failure ]; then printf 'MetadataServerException authentication unavailable\n' >&2
+      else printf '403\n' >&2; fi
+      exit 1 ;;
+     'storage ls')
+      if [ "$FAKE_SCENARIO" = inside-prefix-auth-failure ]; then printf '401 UNAUTHENTICATED\n' >&2
+      else printf 'matched no objects\n' >&2; fi
+      exit 1 ;;
+     *) exit 99 ;;
+    esac ;;
+   *) exit 99 ;;
+  esac ;;
+ "get pods,statefulsets,deployments,replicasets,daemonsets,jobs,cronjobs,podchaos,networkchaos")
+  if [ -f "$FAKE_METADATA_DELETED" ]; then printf '{"items":[]}'
+  else jq '{items:[.]}' "$FAKE_METADATA"; fi ;;
  "get pods") printf '%s\n' '{"items":[]}' ;;
+ "delete --raw")
+  [ "$3" = /api/v1/namespaces/rhiza-v0191-20261008-a1b2c3d4/pods/rhiza-metadata ] && [ "$4" = -f ] || exit 99
+  jq -e '.preconditions=={uid:"metadata-uid",resourceVersion:"7"}' "$5" >/dev/null || exit 99
+  touch "$FAKE_METADATA_DELETED" ;;
  "logs "*) kill -USR1 "$(cat "$FAKE_PARENT")"; exit 0 ;;
  "scale "*|"wait "*|"delete "*) exit 0 ;;
  *) exit 95 ;;
@@ -367,6 +413,8 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				"RHIZA_AUTH_STARTED_EPOCH=" + strconv.FormatInt(now, 10), "RHIZA_AUTH_EXPIRES=" + expiry, "RHIZA_LOCAL_TOKEN_EXPIRES=" + expiry,
 				"FAKE_NOW=" + strconv.FormatInt(now, 10), "FAKE_CLOCK=" + filepath.Join(dir, "clock"),
 				"FAKE_SCENARIO=" + scenario, "FAKE_CALLS=" + filepath.Join(dir, "calls"), "FAKE_CHILD=" + filepath.Join(dir, "child"),
+				"FAKE_METADATA=" + filepath.Join(dir, "metadata.json"), "FAKE_METADATA_DELETED=" + filepath.Join(dir, "metadata-deleted"),
+				"FAKE_VOTER_ATTEMPT=" + filepath.Join(dir, "voter-attempt"),
 				"FAKE_CONFIG_EVENTS=" + filepath.Join(dir, "config-events"),
 				"FAKE_NATIVE_TIMEOUT=" + nativeTimeout, "FAKE_KUBECTL=" + filepath.Join(bin, "kubectl"), "FAKE_KUBECONFIG=" + kubeconfig,
 				"FAKE_GIT_ROOT=" + filepath.Dir(script) + "/../..", "FAKE_GIT_REVISION=" + mockFixtureRevision,
@@ -418,12 +466,15 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			if !errors.As(err, &exited) || ctx.Err() != nil {
 				t.Fatalf("runtime did not fail within its bounded test: err=%v context=%v", err, ctx.Err())
 			}
-			if bytes.Contains(output, []byte("synthetic-offline-token")) || bytes.Contains(output, []byte("synthetic-rejected-token")) {
+			if bytes.Contains(output, []byte("synthetic-offline-token")) || bytes.Contains(output, []byte("synthetic-rejected-token")) || bytes.Contains(output, []byte("synthetic-metadata-token")) {
 				t.Fatal("rejected credential content disclosed")
 			}
 			want := 1
-			if scenario == "command-failure" {
+			if scenario == "command-failure" || scenario == "voter-create-failure" {
 				want = 53
+			}
+			if scenario == "voter-create-unknown" {
+				want = 55
 			}
 			if scenario == "deadline" || scenario == "watchdog" {
 				want = 124
@@ -431,7 +482,84 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			if exited.ExitCode() != want {
 				t.Fatalf("runtime exit=%d want=%d diagnostic=%s", exited.ExitCode(), want, output)
 			}
-			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" {
+			if scenario == "metadata-credential-failure" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" || scenario == "voter-create-failure" || scenario == "voter-create-unknown" {
+				ready := bytes.Index(calls, []byte("wait pod/rhiza-metadata --for=condition=Ready"))
+				credential := bytes.Index(calls, []byte("exec rhiza-metadata -- curl"))
+				voters := bytes.Index(calls, []byte(out+"/voters.yaml"))
+				outside := bytes.Index(calls, []byte("exec rhiza-metadata -- gcloud storage cat"))
+				inside := bytes.Index(calls, []byte("exec rhiza-metadata -- gcloud storage ls"))
+				if ready < 0 || credential <= ready {
+					t.Fatalf("actual metadata Ready/readiness order missing: %s", calls)
+				}
+				status, err := os.ReadFile(filepath.Join(out, "cleanup-status.txt"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "metadata-credential-failure" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" {
+					if voters >= 0 || !bytes.Contains(status, []byte("Metadata-only Pod cleanup verified")) {
+						t.Fatalf("credential failure bypassed EXIT cleanup or created voters: %s %s", calls, status)
+					}
+					if _, err := os.Stat(filepath.Join(out, "shutdown-capture.exit")); !errors.Is(err, os.ErrNotExist) {
+						t.Fatal("metadata-only invoked voter Close capture")
+					}
+					switch scenario {
+					case "metadata-credential-failure":
+						if bytes.Contains(calls, []byte("gcloud")) || bytes.Contains(calls, []byte("storage")) {
+							t.Fatal("failed credential readiness reached a storage probe")
+						}
+					case "outside-prefix-auth-failure", "outside-prefix-accessible":
+						if outside <= credential || inside >= 0 || !bytes.Contains(output, []byte("outside-folder access did not fail closed")) {
+							t.Fatalf("outside authentication failure was mistaken for expected denial: %s %s", calls, output)
+						}
+						if scenario == "outside-prefix-accessible" {
+							paths, err := filepath.Glob(filepath.Join(out, "*-outside-scope.exit"))
+							if err != nil || len(paths) != 1 {
+								t.Fatalf("actual outside probe exit missing: %v %v", paths, err)
+							}
+							code, err := os.ReadFile(paths[0])
+							if err != nil || strings.TrimSpace(string(code)) != "0" {
+								t.Fatalf("outside probe did not actually succeed: %s %v", code, err)
+							}
+						}
+					case "inside-prefix-auth-failure":
+						if outside <= credential || inside <= outside || !bytes.Contains(output, []byte("prefix/list permission gate failed")) {
+							t.Fatalf("inside authentication failure bypassed its distinct gate: %s %s", calls, output)
+						}
+					}
+				} else {
+					if outside <= credential || inside <= outside || voters <= inside || !bytes.Contains(status, []byte("NOT CLEAN")) {
+						t.Fatalf("voter attempt bypassed strict cleanup: %s %s", calls, status)
+					}
+					capture, err := os.ReadFile(filepath.Join(out, "shutdown-capture.exit"))
+					if err != nil || strings.TrimSpace(string(capture)) != "1" {
+						t.Fatalf("voter attempt did not require actual Close capture: %s %v", capture, err)
+					}
+					if scenario == "voter-create-unknown" {
+						if _, err := os.Stat(filepath.Join(dir, "voter-attempt")); err != nil {
+							t.Fatal("ambiguous create did not record its possible side effect")
+						}
+					}
+				}
+				if err := filepath.WalkDir(out, func(path string, entry os.DirEntry, walkErr error) error {
+					if walkErr != nil {
+						return walkErr
+					}
+					if entry.IsDir() {
+						return nil
+					}
+					data, err := os.ReadFile(path)
+					if err != nil {
+						return err
+					}
+					if bytes.Contains(data, []byte("synthetic-metadata-token")) {
+						return fmt.Errorf("metadata token persisted in %s", entry.Name())
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" && scenario != "metadata-credential-failure" && scenario != "outside-prefix-auth-failure" && scenario != "outside-prefix-accessible" && scenario != "inside-prefix-auth-failure" && scenario != "voter-create-failure" && scenario != "voter-create-unknown" {
 				reason := "local kubeconfig must be one pinned tokenFile-only identity"
 				switch scenario {
 				case "head-mismatch":
@@ -1087,6 +1215,331 @@ esac
 				if err != nil || !strings.HasPrefix(string(timeouts), strconv.Itoa(scenario.budget)+"\n") || !strings.HasSuffix(string(timeouts), strconv.Itoa(lastTimeout)+"\n") || !strings.Contains(string(calls), "--timeout="+strconv.Itoa(scenario.budget-60)+"s") {
 					t.Fatalf("shared deadline reset: %q error=%v", timeouts, err)
 				}
+			}
+		})
+	}
+}
+
+func TestQualificationMetadataCredentialReadiness(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nmetadata_credentials_ready() (\n")
+	end := strings.Index(string(source), "\nwait_voters() (\n")
+	if start < 0 || end <= start {
+		t.Fatal("actual metadata readiness function missing")
+	}
+	invalidResponses := map[string]string{
+		"missing-token":   `{"token_type":"Bearer","expires_in":100}`,
+		"empty-token":     `{"access_token":"","token_type":"Bearer","expires_in":100}`,
+		"token-type":      `{"access_token":123,"token_type":"Bearer","expires_in":100}`,
+		"bearer-type":     `{"access_token":"synthetic-token-never-public","token_type":123,"expires_in":100}`,
+		"expiry-type":     `{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":"100"}`,
+		"expiry-zero":     `{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":0}`,
+		"expiry-negative": `{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":-1}`,
+	}
+	for _, scenario := range []struct {
+		name           string
+		want, attempts int
+	}{
+		{"ready", 0, 1}, {"connection", 0, 2}, {"server", 0, 2},
+		{"exhausted", 1, 6}, {"unknown-native", 1, 1}, {"unknown-http", 1, 1},
+		{"forbidden", 1, 1}, {"forbidden-timeout", 1, 1}, {"unknown-http-timeout", 1, 1},
+		{"invalid", 1, 1}, {"multiple", 1, 1}, {"deadline", 124, 1},
+		{"missing-token", 1, 1}, {"empty-token", 1, 1}, {"token-type", 1, 1}, {"bearer-type", 1, 1},
+		{"expiry-type", 1, 1}, {"expiry-zero", 1, 1}, {"expiry-negative", 1, 1},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, content := range map[string]string{"clock": "1000\n", "attempts": "0\n"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			invalid, malformed := invalidResponses[scenario.name]
+			if malformed {
+				if err := os.WriteFile(filepath.Join(dir, "response"), []byte(invalid), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fixture := `
+mode=run-local; local_deadline=1010
+date() { cat "$FAKE_DIR/clock"; }
+sleep() { now=$(date); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
+k() {
+ [ "$*" = 'exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 16384 --noproxy * -H Metadata-Flavor: Google --write-out \n%{http_code} http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' ] || return 95
+ [ "$metadata_wait_deadline" = 1010 ] || return 96
+ attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
+ printf 'synthetic-token-never-public\n' >&2
+ case "$FAKE_SCENARIO" in
+  connection) [ "$attempt" != 1 ] || return 7 ;;
+  server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
+  exhausted) return 7 ;;
+  unknown-native) return 53 ;;
+  unknown-http) printf 'synthetic-token-never-public\n401'; return 0 ;;
+  forbidden) printf 'synthetic-token-never-public\n403'; return 0 ;;
+  forbidden-timeout) printf 'synthetic-token-never-public\n403'; return 28 ;;
+  unknown-http-timeout) printf 'synthetic-token-never-public\n401'; return 28 ;;
+  invalid) printf '{"access_token":"synthetic-token-never-public","token_type":"Other","expires_in":100}\n200'; return 0 ;;
+  missing-token|empty-token|token-type|bearer-type|expiry-type|expiry-zero|expiry-negative) cat "$FAKE_RESPONSE"; printf '\n200'; return 0 ;;
+  multiple) printf '{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":100}\n';;
+  deadline) printf '1010\n' > "$FAKE_DIR/clock" ;;
+ esac
+ printf '{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":100}\n200'
+}
+`
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+"\nmetadata_credentials_ready")
+			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name, "FAKE_RESPONSE="+filepath.Join(dir, "response"))
+			output, runErr := command.CombinedOutput()
+			code := 0
+			if runErr != nil {
+				var exited *exec.ExitError
+				if !errors.As(runErr, &exited) || ctx.Err() != nil {
+					t.Fatalf("fixture did not terminate: %v", runErr)
+				}
+				code = exited.ExitCode()
+			}
+			attempts, err := os.ReadFile(filepath.Join(dir, "attempts"))
+			if err != nil || code != scenario.want || strings.TrimSpace(string(attempts)) != strconv.Itoa(scenario.attempts) {
+				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
+			}
+			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("access_token")) {
+				t.Fatal("credential response leaked into public output")
+			}
+			for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) != 6 || fields[0] != "stage=metadata-credential-readiness" || !strings.HasPrefix(fields[5], "category=") {
+					t.Fatalf("unexpected public evidence: %q", line)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			wantEntries := 2
+			if malformed {
+				wantEntries++
+			}
+			if err != nil || len(entries) != wantEntries {
+				t.Fatalf("response persisted: entries=%v error=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestQualificationMetadataOnlyCleanup(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\ncleanup_metadata_only() (\n")
+	end := strings.Index(string(source), "\ntrap cleanup EXIT\n")
+	captureStart := strings.Index(string(source), "\ncapture_shutdown() {\n")
+	captureEnd := strings.Index(string(source), "\nfinish_shutdown_capture() {\n")
+	if start < 0 || end <= start || captureStart < 0 || captureEnd <= captureStart {
+		t.Fatal("actual cleanup functions missing")
+	}
+	if !strings.Contains(string(source), "voters_attempted=false\n") || !strings.Contains(string(source), "voters_attempted=true\nrun create-voters") ||
+		!strings.Contains(string(source), "run create-metadata k create -f \"$out/metadata.yaml\" -o json\ncp \"$out/$seq-create-metadata.stdout\" \"$out/metadata-created.json\"") {
+		t.Fatal("create attempt/ACK ordering changed")
+	}
+	auth, err := os.ReadFile("../gcs-postrelease-auth.yaml.in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range []string{"resources: [deployments, replicasets, daemonsets]\n    verbs: [list]", "resources: [cronjobs]\n    verbs: [list]"} {
+		if !bytes.Contains(auth, []byte(rule)) {
+			t.Fatalf("required list-only controller rule missing: %s", rule)
+		}
+	}
+	nativeChecksum, err := exec.LookPath("sha256sum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"metadata", "no-owned", "unknown-create", "partial-voters", "namespace-owner", "namespace-uid", "pod-uid", "run", "ksa", "image", "node", "rv", "owner-reference", "controller", "replicaset", "daemonset", "statefulset", "cronjob", "writer", "job", "fault", "list-error", "delete-error", "wait-timeout", "replacement", "delayed-child"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out")
+			if err := os.Mkdir(out, 0700); err != nil {
+				t.Fatal(err)
+			}
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bin, "sha256sum"), []byte(`#!/bin/sh
+if [ "$FAKE_SCENARIO" = delayed-child ]; then
+ child=$(cat "$FAKE_DIR/child") || exit 98
+ kill -0 "$child" 2>/dev/null && exit 98
+ printf 'begin\ncomplete\n' | cmp - "$FAKE_OUT/child-final.txt" || exit 98
+ printf 'reaped-before-checksum\n' > "$FAKE_DIR/reap-at-seal"
+fi
+exec "$FAKE_NATIVE_CHECKSUM" "$@"
+`), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bin, "delayed-child"), []byte(`#!/bin/sh
+finish() {
+ trap - TERM
+ kill "$sleep_pid" 2>/dev/null || true
+ wait "$sleep_pid" 2>/dev/null || true
+ printf 'begin\n' > "$FAKE_OUT/child-final.txt"
+ printf 'complete\n' >> "$FAKE_OUT/child-final.txt"
+ exit 0
+}
+trap finish TERM
+/bin/sleep 30 & sleep_pid=$!
+printf 'armed\n' > "$FAKE_DIR/child-ready"
+wait "$sleep_pid"
+finish
+`), 0700); err != nil {
+				t.Fatal(err)
+			}
+			writeJSON := func(path string, value any) {
+				t.Helper()
+				data, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pod := map[string]any{"kind": "Pod", "metadata": map[string]any{"name": "rhiza-metadata", "namespace": "synthetic", "uid": "metadata-uid", "resourceVersion": "7", "labels": map[string]any{"chaos.rhiza.io/run": "a1b2c3d4"}},
+				"spec": map[string]any{"serviceAccountName": "rhiza-gcs", "nodeName": "node-a", "containers": []any{map[string]any{"name": "metadata", "image": "metadata-digest"}}}}
+			if scenario != "unknown-create" {
+				writeJSON(filepath.Join(out, "metadata-created.json"), pod)
+			}
+			meta := pod["metadata"].(map[string]any)
+			spec := pod["spec"].(map[string]any)
+			namespace := map[string]any{"metadata": map[string]any{"uid": "namespace-uid", "labels": map[string]any{"chaos.rhiza.io/run": "a1b2c3d4"}, "annotations": map[string]any{"rhiza.dev/auth-owner": "rhiza-postrelease-a1b2c3d4-owner"}}}
+			switch scenario {
+			case "namespace-owner":
+				namespace["metadata"].(map[string]any)["annotations"] = map[string]any{}
+			case "namespace-uid":
+				namespace["metadata"].(map[string]any)["uid"] = "other"
+			case "pod-uid":
+				meta["uid"] = "other"
+			case "run":
+				meta["labels"] = map[string]any{"chaos.rhiza.io/run": "other"}
+			case "ksa":
+				spec["serviceAccountName"] = "other"
+			case "image":
+				spec["containers"].([]any)[0].(map[string]any)["image"] = "other"
+			case "node":
+				spec["nodeName"] = "other"
+			case "rv":
+				delete(meta, "resourceVersion")
+			case "owner-reference":
+				meta["ownerReferences"] = []any{map[string]any{"uid": "unexpected-controller"}}
+			}
+			items := []any{pod}
+			switch scenario {
+			case "writer", "job", "fault", "controller", "replicaset", "daemonset", "statefulset", "cronjob":
+				kind := map[string]string{"writer": "Pod", "job": "Job", "fault": "NetworkChaos", "controller": "Deployment", "replicaset": "ReplicaSet", "daemonset": "DaemonSet", "statefulset": "StatefulSet", "cronjob": "CronJob"}[scenario]
+				items = append(items, map[string]any{"kind": kind, "metadata": map[string]any{"name": "unexpected"}})
+			}
+			writeJSON(filepath.Join(dir, "namespace.json"), namespace)
+			writeJSON(filepath.Join(dir, "actors.json"), map[string]any{"items": items})
+			fixture := `
+set +e
+out=$FAKE_OUT; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; RHIZA_AUTH_CREATION_SHA=owner
+RHIZA_BOOTSTRAP_UID=namespace-uid; RHIZA_METADATA_IMAGE=metadata-digest; RHIZA_NODE_A=node-a
+mode=run; pf_pids=''; active_fault=''; learner_attempted=false; shutdown_capture=false
+shutdown_watch_pid=''; shutdown_log_pids=''; owned_created=true; voters_attempted=false
+[ "$FAKE_SCENARIO" != no-owned ] || owned_created=false
+[ "$FAKE_SCENARIO" != partial-voters ] || voters_attempted=true
+if [ "$FAKE_SCENARIO" = delayed-child ]; then
+ voters_attempted=true
+ mkfifo "$FAKE_DIR/child-ready" || exit 98
+ /bin/sh "$FAKE_DIR/bin/delayed-child" & pf_pids=$!
+ printf '%s\n' "$pf_pids" > "$FAKE_DIR/child"
+ IFS= read -r child_ready < "$FAKE_DIR/child-ready"
+ [ "$child_ready" = armed ] || exit 98
+ kill -0 "$pf_pids" || exit 98
+fi
+stop_watchdog() { :; }
+k() {
+ printf '%s\n' "$1" >> "$FAKE_DIR/calls"
+ case "$*" in
+  'get namespace synthetic -o json') cat "$FAKE_DIR/namespace.json" ;;
+  'get pods,statefulsets,deployments,replicasets,daemonsets,jobs,cronjobs,podchaos,networkchaos -o json')
+   [ "$FAKE_SCENARIO" != list-error ] || return 53
+   if [ -f "$FAKE_DIR/deleted" ]; then
+    if [ "$FAKE_SCENARIO" = replacement ]; then cat "$FAKE_DIR/actors.json"; else printf '{"items":[]}'; fi
+   else cat "$FAKE_DIR/actors.json"; fi ;;
+  'delete --raw /api/v1/namespaces/synthetic/pods/rhiza-metadata -f '*)
+   [ "$voter_wait_deadline" -gt "$(date +%s)" ] || return 124
+   jq -e '.kind=="DeleteOptions" and .preconditions.uid=="metadata-uid" and .preconditions.resourceVersion=="7"' "$5" >/dev/null || return 95
+   [ "$FAKE_SCENARIO" != delete-error ] || return 53
+   touch "$FAKE_DIR/deleted" ;;
+  'wait pod/rhiza-metadata --for=delete --timeout=90s') [ "$FAKE_SCENARIO" != wait-timeout ] || return 124 ;;
+  'get pods --selector='*) printf '{"items":[]}' ;;
+  logs\ *|scale\ *|wait\ *|delete\ *) [ "$voters_attempted" = true ] || return 96 ;;
+  *) return 97 ;;
+ esac
+}
+`
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[captureStart:captureEnd])+string(source[start:end])+"\n(exit 53); cleanup")
+			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_OUT="+out, "FAKE_SCENARIO="+scenario, "FAKE_NATIVE_CHECKSUM="+nativeChecksum)
+			output, runErr := command.CombinedOutput()
+			var exited *exec.ExitError
+			if !errors.As(runErr, &exited) || exited.ExitCode() != 53 || ctx.Err() != nil {
+				t.Fatalf("original exit lost: %v output=%s", runErr, output)
+			}
+			status, err := os.ReadFile(filepath.Join(out, "cleanup-status.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			clean := scenario == "metadata" || scenario == "no-owned"
+			if bytes.Contains(status, []byte("NOT CLEAN")) == clean || bytes.Contains(status, []byte("HTTP/DB close and pinned")) {
+				t.Fatalf("wrong cleanup claim: %s", status)
+			}
+			_, deleteErr := os.Stat(filepath.Join(out, "metadata-delete-options.json"))
+			shouldDelete := scenario == "metadata" || scenario == "delete-error" || scenario == "wait-timeout" || scenario == "replacement"
+			if (deleteErr == nil) != shouldDelete {
+				t.Fatalf("unsafe/missing delete: %v output=%s", deleteErr, output)
+			}
+			if scenario == "partial-voters" || scenario == "delayed-child" {
+				capture, err := os.ReadFile(filepath.Join(out, "shutdown-capture.exit"))
+				if err != nil || strings.TrimSpace(string(capture)) != "1" {
+					t.Fatalf("partial voter bypassed Close capture: %s %v", capture, err)
+				}
+			}
+			if scenario == "delayed-child" {
+				marker, err := os.ReadFile(filepath.Join(dir, "reap-at-seal"))
+				if err != nil || string(marker) != "reaped-before-checksum\n" {
+					t.Fatalf("child not reaped when checksum ran: %s %v", marker, err)
+				}
+				child, err := os.ReadFile(filepath.Join(dir, "child"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				pid, err := strconv.Atoi(strings.TrimSpace(string(child)))
+				if err != nil || syscall.Kill(pid, 0) == nil {
+					t.Fatal("delayed cleanup child escaped reaping")
+				}
+				artifact, err := os.ReadFile(filepath.Join(out, "child-final.txt"))
+				if err != nil || string(artifact) != "begin\ncomplete\n" {
+					t.Fatalf("child final artifact incomplete: %q %v", artifact, err)
+				}
+				seal, err := os.ReadFile(filepath.Join(out, "SHA256SUMS"))
+				if err != nil || !bytes.Contains(seal, []byte("  ./child-final.txt\n")) {
+					t.Fatalf("child final artifact omitted from seal: %s %v", seal, err)
+				}
+			}
+			for _, name := range []string{"workload.exit", "root.exit"} {
+				code, err := os.ReadFile(filepath.Join(out, name))
+				if err != nil || strings.TrimSpace(string(code)) != "53" {
+					t.Fatalf("%s changed original exit: %s %v", name, code, err)
+				}
+			}
+			verify := exec.Command("sha256sum", "-c", "SHA256SUMS")
+			verify.Dir = out
+			if output, err := verify.CombinedOutput(); err != nil {
+				t.Fatalf("cleanup seal: %v %s", err, output)
 			}
 		})
 	}

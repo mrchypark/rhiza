@@ -35,6 +35,10 @@ remaining() {
   printf '%s\n' "$seconds"
 }
 k() {
+  if [ -n "${metadata_wait_deadline:-}" ]; then
+    metadata_seconds=$((metadata_wait_deadline - $(date +%s)))
+    [ "$metadata_seconds" -gt 0 ] || return 124
+  fi
   if [ -n "${voter_wait_deadline:-}" ]; then
     k_deadline_seconds=$((voter_wait_deadline - $(date +%s)))
     [ "$k_deadline_seconds" -gt 0 ] || return 124
@@ -44,17 +48,73 @@ k() {
     limit=240
     case "$1" in logs) limit=10 ;; get|auth|scale) limit=30 ;; exec) limit=60 ;; esac
     [ "$seconds" -le "$limit" ] || seconds=$limit
+    if [ -n "${metadata_wait_deadline:-}" ] && [ "$seconds" -gt "$metadata_seconds" ]; then seconds=$metadata_seconds; fi
     if [ -n "${voter_wait_deadline:-}" ] && [ "$seconds" -gt "$k_deadline_seconds" ]; then seconds=$k_deadline_seconds; fi
     timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
       --context="$context" --namespace="$ns" --request-timeout=30s "$@"
   else
-    if [ -n "${voter_wait_deadline:-}" ]; then
+    if [ -n "${metadata_wait_deadline:-}" ]; then
+      timeout --kill-after=5s "${metadata_seconds}s" kubectl --context="$context" --namespace="$ns" "$@"
+    elif [ -n "${voter_wait_deadline:-}" ]; then
       timeout --kill-after=5s "${k_deadline_seconds}s" kubectl --context="$context" --namespace="$ns" "$@"
     else
       kubectl --context="$context" --namespace="$ns" "$@"
     fi
   fi
 }
+metadata_credentials_ready() (
+  # 55 seconds of work plus the existing five-second timeout reap reserve.
+  metadata_started=$(date +%s)
+  metadata_wait_deadline=$((metadata_started + 55))
+  if [ "$mode" = run-local ] && [ "$metadata_wait_deadline" -gt "$local_deadline" ]; then metadata_wait_deadline=$local_deadline; fi
+  metadata_attempt=0
+  while [ "$metadata_attempt" -lt 6 ]; do
+    [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
+    metadata_attempt=$((metadata_attempt + 1))
+    metadata_code=0
+    # Keep the token response in memory only; neither curl nor kubectl stderr
+    # is public evidence. Never pass the response as an argument to a process.
+    metadata_response=$(k exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 16384 \
+      --noproxy '*' -H 'Metadata-Flavor: Google' --write-out '\n%{http_code}' \
+      http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token 2>/dev/null) || metadata_code=$?
+    metadata_http=$(printf '%s\n' "$metadata_response" | tail -n 1)
+    case "$metadata_http" in [1-5][0-9][0-9]) ;; *) metadata_http=000 ;; esac
+    metadata_category=unknown
+    if [ "$metadata_code" = 0 ]; then
+      case "$metadata_http" in
+        200)
+          if printf '%s\n' "$metadata_response" | sed '$d' | jq -s -e '
+            length==1 and (.[0] | type=="object" and (.access_token|type)=="string" and (.access_token|length)>0 and
+            .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
+          ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
+        403) metadata_category=forbidden ;;
+        5[0-9][0-9]) metadata_category=transient-server ;;
+      esac
+    else
+      case "$metadata_code" in
+        6|7|28|52|56) metadata_category=transient-connection ;;
+        124|137) metadata_category=deadline ;;
+      esac
+    fi
+    # A known denial must not become retryable because its body read timed out.
+    case "$metadata_http" in
+      403) metadata_category=forbidden ;;
+      [1-4][0-9][0-9]) [ "$metadata_http" = 200 ] || metadata_category=unknown ;;
+    esac
+    unset metadata_response
+    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s category=%s\n' \
+      "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" "$metadata_category"
+    case "$metadata_category" in
+      ready) [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124; return 0 ;;
+      transient-connection|transient-server) ;;
+      deadline) return "$metadata_code" ;;
+      *) return 1 ;;
+    esac
+    [ "$metadata_attempt" -lt 6 ] || return 1
+    [ "$((metadata_wait_deadline - $(date +%s)))" -gt 1 ] || return 124
+    sleep 1
+  done
+)
 wait_voters() (
   # One deadline covers creation, Ready and identity checks for all three Pods.
   # Subshell scope prevents this deadline from constraining later cleanup.
@@ -282,6 +342,7 @@ stop_watchdog() {
 pf_pids=''
 active_fault=''
 owned_created=false
+voters_attempted=false
 learner_attempted=false
 shutdown_watch_pid=''
 shutdown_log_pids=''
@@ -375,6 +436,41 @@ finish_shutdown_capture() {
     "$out/shutdown-pods-after.json" > "$out/shutdown-writers-after.json" || return $?
   verify_shutdown "$out"
 }
+cleanup_metadata_only() (
+  # Reuse the scoped transport deadline for all reads, delete and wait together.
+  voter_wait_deadline=$(( $(date +%s) + 180 ))
+  [ "$learner_attempted" = false ] && [ -z "$active_fault$pf_pids" ] && [ "$shutdown_capture" = false ] || return 1
+  # An absent or ambiguous create ACK cannot authorize a name-only delete.
+  jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.kind=="Pod" and .metadata.name=="rhiza-metadata" and
+    .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
+    (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/metadata-created.json" >/dev/null || return 1
+  k get namespace "$ns" -o json > "$out/metadata-cleanup-namespace.json" 2> "$out/metadata-cleanup-namespace.stderr" || return $?
+  jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" \
+    --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA" '
+    .metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and
+    .metadata.annotations["rhiza.dev/auth-owner"]==$owner
+  ' "$out/metadata-cleanup-namespace.json" >/dev/null || return 1
+  # Do not filter by a label: an unexpected namespace actor must fail closed.
+  k get pods,statefulsets,deployments,replicasets,daemonsets,jobs,cronjobs,podchaos,networkchaos -o json > "$out/metadata-cleanup-before.json" 2> "$out/metadata-cleanup-before.stderr" || return $?
+  jq -e --slurpfile ack "$out/metadata-created.json" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" \
+    --arg image "$RHIZA_METADATA_IMAGE" --arg node "$RHIZA_NODE_A" '
+    (.items|type)=="array" and (.items|length)==1 and (.metadata.continue==null or .metadata.continue=="") and
+    (.items[0] | .kind=="Pod" and .metadata.name=="rhiza-metadata" and .metadata.namespace==$ns and
+      .metadata.uid==$ack[0].metadata.uid and .metadata.labels["chaos.rhiza.io/run"]==$run and
+      (.metadata.resourceVersion|type)=="string" and (.metadata.resourceVersion|length)>0 and
+      (.metadata.ownerReferences // []|length)==0 and .spec.serviceAccountName=="rhiza-gcs" and
+      .spec.nodeName==$node and (.spec.containers|length)==1 and
+      .spec.containers[0].name=="metadata" and .spec.containers[0].image==$image)
+  ' "$out/metadata-cleanup-before.json" >/dev/null || return 1
+  jq '.items[0] | {apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:.metadata.uid,resourceVersion:.metadata.resourceVersion}}' \
+    "$out/metadata-cleanup-before.json" > "$out/metadata-delete-options.json" || return $?
+  k delete --raw "/api/v1/namespaces/$ns/pods/rhiza-metadata" -f "$out/metadata-delete-options.json" \
+    > "$out/metadata-delete.stdout" 2> "$out/metadata-delete.stderr" || return $?
+  k wait pod/rhiza-metadata --for=delete --timeout=90s > "$out/metadata-gone.stdout" 2> "$out/metadata-gone.stderr" || return $?
+  k get pods,statefulsets,deployments,replicasets,daemonsets,jobs,cronjobs,podchaos,networkchaos -o json > "$out/metadata-cleanup-after.json" 2> "$out/metadata-cleanup-after.stderr" || return $?
+  jq -e '(.items|type)=="array" and (.items|length)==0 and (.metadata.continue==null or .metadata.continue=="")' \
+    "$out/metadata-cleanup-after.json" >/dev/null
+)
 cleanup() {
   code=$?
   trap '' USR1
@@ -389,7 +485,13 @@ cleanup() {
   clean=true
   # Never replace the first failure with a diagnostics/cleanup result.
   printf '%s\n' "$code" > "$out/workload.exit"
-  if [ "$owned_created" = true ]; then
+  if [ "$owned_created" = true ] && [ "$voters_attempted" = false ]; then
+    cleanup_metadata_only
+    cleanup_code=$?
+    printf '%s\n' "$cleanup_code" > "$out/metadata-cleanup.exit"
+    [ "$cleanup_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+  elif [ "$owned_created" = true ]; then
   for pod in rhiza-voter-0 rhiza-voter-1 rhiza-voter-2 rhiza-learner; do
     k logs "$pod" --tail=2000 > "$out/$pod.log" 2> "$out/$pod-log.stderr" || true
   done
@@ -442,6 +544,8 @@ cleanup() {
   fi
   if [ "$owned_created" = false ]; then
     printf '%s\n' 'No owned runtime resources created; Root auth cleanup still pending.' > "$out/cleanup-status.txt"
+  elif [ "$clean" = true ] && [ "$voters_attempted" = false ]; then
+    printf '%s\n' 'Metadata-only Pod cleanup verified; database writer creation was not attempted. No HTTP/DB Close proof. Root storage/IAM reconciliation still pending.' > "$out/cleanup-status.txt"
   elif [ "$clean" = true ]; then
     printf '%s\n' 'Owned HTTP/DB close and pinned container termination verified; NOT universal remote-request quiescence. Root storage/IAM reconciliation still pending.' > "$out/cleanup-status.txt"
   else
@@ -495,8 +599,10 @@ jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rh
 run collision k get pods,statefulsets,services,configmaps,networkpolicies,podchaos,networkchaos -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json
 jq -e '.items|length==0' "$out/$seq-collision.stdout" >/dev/null || die 'run resources already exist'
 owned_created=true
-run create-metadata k create -f "$out/metadata.yaml"
+run create-metadata k create -f "$out/metadata.yaml" -o json
+cp "$out/$seq-create-metadata.stdout" "$out/metadata-created.json"
 run metadata-ready k wait pod/rhiza-metadata --for=condition=Ready --timeout=180s
+run metadata-credentials metadata_credentials_ready
 storage="gs://rhiza-v070-chaos-ied-20260811/$prefix"
 seq=$((seq + 1))
 set +e
@@ -518,6 +624,7 @@ if [ "$list_code" = 0 ]; then
 else
   [ "$list_code" = 1 ] && grep -Fq 'matched no objects' "$out/$seq-prefix-empty.stderr" || die 'prefix/list permission gate failed'
 fi
+voters_attempted=true
 run create-voters k create -f "$out/voters.yaml"
 run voters-ready wait_voters 180
 forward() {
