@@ -458,46 +458,69 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      HIQLITE_COMMIT: cc0c64c9e2369ad9bd8ee5aea8e6825e3d481249
+      HIQLITE_VERSION: v0.15.2
+      HIQLITE_COMMIT: 18e3e71be1b40465f82e1f26f17b7d1bfcc6995d
+      HIQLITE_RUST_TOOLCHAIN: 1.97.1
+      HIQLITE_REQUESTS: 100000
+      HIQLITE_CONCURRENCY: 16
     steps:
       - uses: actions/checkout@v4
-      - name: Measure Hiqlite v0.15.0
+      - name: Measure pinned Hiqlite reference
         run: |
           export CARGO_TARGET_DIR="$RUNNER_TEMP/hiqlite-target"
-          rustup toolchain install 1.97.1 --profile minimal
+          rustup toolchain install "$HIQLITE_RUST_TOOLCHAIN" --profile minimal
+          [[ $(git ls-remote --tags --refs https://github.com/sebadob/hiqlite.git "refs/tags/$HIQLITE_VERSION" | cut -f1) == "$HIQLITE_COMMIT" ]]
           git clone --filter=blob:none https://github.com/sebadob/hiqlite.git "$RUNNER_TEMP/hiqlite"
           git -C "$RUNNER_TEMP/hiqlite" checkout --detach "$HIQLITE_COMMIT"
           git -C "$RUNNER_TEMP/hiqlite" apply --unidiff-zero --whitespace=nowarn "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch"
-          cargo +1.97.1 build --release --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
+          cargo +"$HIQLITE_RUST_TOOLCHAIN" build --release --manifest-path "$RUNNER_TEMP/hiqlite/examples/bench/Cargo.toml"
           mkdir -p "$RUNNER_TEMP/hiqlite-reference"
           cd "$RUNNER_TEMP/hiqlite/examples/bench"
           printf 'Measuring interval_200_local\n'
-          HQL_LOG_SYNC=interval_200 timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/interval_200_local.txt" 2>&1
+          HQL_LOG_SYNC=interval_200 timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c "$HIQLITE_CONCURRENCY" -r "$HIQLITE_REQUESTS" >"$RUNNER_TEMP/hiqlite-reference/interval_200_local.txt" 2>&1
           printf 'Measuring immediate_local\n'
-          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_local.txt" 2>&1
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --sql-only -c "$HIQLITE_CONCURRENCY" -r "$HIQLITE_REQUESTS" >"$RUNNER_TEMP/hiqlite-reference/immediate_local.txt" 2>&1
           printf 'Measuring immediate_remote\n'
-          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_remote.txt" 2>&1
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only -c "$HIQLITE_CONCURRENCY" -r "$HIQLITE_REQUESTS" >"$RUNNER_TEMP/hiqlite-reference/immediate_remote.txt" 2>&1
           printf 'Measuring immediate_follower_stopped\n'
-          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_follower_stopped.txt" 2>&1
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer non-leader -c "$HIQLITE_CONCURRENCY" -r "$HIQLITE_REQUESTS" >"$RUNNER_TEMP/hiqlite-reference/immediate_follower_stopped.txt" 2>&1
           printf 'Measuring immediate_leader_stopped\n'
-          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c 16 -r 100000 >"$RUNNER_TEMP/hiqlite-reference/immediate_leader_stopped.txt" 2>&1
+          HQL_LOG_SYNC=immediate timeout 10m "$CARGO_TARGET_DIR/release/bench" cluster --remote-client --sql-only --fail-peer leader -c "$HIQLITE_CONCURRENCY" -r "$HIQLITE_REQUESTS" >"$RUNNER_TEMP/hiqlite-reference/immediate_leader_stopped.txt" 2>&1
           for scenario in interval_200_local immediate_local immediate_remote immediate_follower_stopped immediate_leader_stopped; do
             file="$RUNNER_TEMP/hiqlite-reference/$scenario.txt"
             ops=$(awk '/single INSERTs/{getline; print $4; exit}' "$file")
             [[ $ops =~ ^[0-9]+$ ]]
             printf '%s=%s\n' "$scenario" "$ops" >>"$RUNNER_TEMP/hiqlite-reference/ops.txt"
           done
+          evidence="$RUNNER_TEMP/hiqlite-reference/evidence"
+          mkdir -p "$evidence"
+          runner_image="$ImageOS-$ImageVersion"
+          rust_version=$(rustc +"$HIQLITE_RUST_TOOLCHAIN" --version)
+          printf 'runner_image=%s\nrust=%s\n' "$runner_image" "$rust_version" >"$evidence/environment.txt"
+          for scenario in interval_200_local immediate_local immediate_remote immediate_follower_stopped immediate_leader_stopped; do
+            gzip -n -c "$RUNNER_TEMP/hiqlite-reference/$scenario.txt" >"$evidence/$scenario.txt.gz"
+          done
+          evidence_sha256=$(for file in "$evidence"/*; do
+            jq -n --arg file "$(basename "$file")" --arg sha "$(sha256sum "$file" | cut -d' ' -f1)" '{($file):$sha}'
+          done | jq -s add)
           jq -n \
-            --arg version v0.15.0 \
+            --arg version "$HIQLITE_VERSION" \
             --arg commit "$HIQLITE_COMMIT" \
             --arg patch "$(sha256sum "$GITHUB_WORKSPACE/benchmarks/hiqlite-one-peer.patch" | cut -d' ' -f1)" \
             --arg measured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg source_run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg source_head_sha "$GITHUB_SHA" \
+            --arg runner_image "$runner_image" \
+            --arg rust_version "$rust_version" \
+            --argjson requests "$HIQLITE_REQUESTS" \
+            --argjson concurrency "$HIQLITE_CONCURRENCY" \
+            --argjson evidence_sha256 "$evidence_sha256" \
             --rawfile ops "$RUNNER_TEMP/hiqlite-reference/ops.txt" \
-            '{version:$version,commit:$commit,patch_sha256:$patch,measured_at:$measured_at,source_run:$source_run,requests:100000,concurrency:16,ops_per_sec:($ops|split("\n")|map(select(length>0)|split("="))|map({(.[0]):(.[1]|tonumber)})|add)}' \
+            '{version:$version,commit:$commit,patch_sha256:$patch,measured_at:$measured_at,source_run:$source_run,source_head_sha:$source_head_sha,runner_image:$runner_image,rust_version:$rust_version,requests:$requests,concurrency:$concurrency,evidence_sha256:$evidence_sha256,ops_per_sec:($ops|split("\n")|map(select(length>0)|split("="))|map({(.[0]):(.[1]|tonumber)})|add)}' \
             >"$RUNNER_TEMP/hiqlite-reference/hiqlite-reference.json"
           cat "$RUNNER_TEMP/hiqlite-reference/hiqlite-reference.json"
-          printf 'runner_image=%s\nrust=%s\n' "$ImageOS-$ImageVersion" "$(rustc +1.97.1 --version)" >"$RUNNER_TEMP/hiqlite-reference/environment.txt"
+          bash "$GITHUB_WORKSPACE/benchmarks/verify-hiqlite-reference-artifact.sh" \
+            "$RUNNER_TEMP/hiqlite-reference/hiqlite-reference.json" "$evidence"
       - name: Upload reference evidence
         if: always()
         uses: actions/upload-artifact@v4
