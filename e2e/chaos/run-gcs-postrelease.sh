@@ -67,6 +67,28 @@ metadata_credentials_ready() (
   metadata_started=$(date +%s)
   metadata_wait_deadline=$((metadata_started + 55))
   if [ "$mode" = run-local ] && [ "$metadata_wait_deadline" -gt "$local_deadline" ]; then metadata_wait_deadline=$local_deadline; fi
+  jq -e --arg a "$RHIZA_NODE_A" --arg b "$RHIZA_NODE_B" --arg c "$RHIZA_NODE_C" '
+    . as $cluster | [$a,$b,$c] as $nodes | ($nodes|unique|length)==3 and
+    all($nodes[]; . as $node |
+      [$cluster.nodePools[]? | . as $pool | select($node | startswith("gke-ied-cluster-" + $pool.name + "-"))] as $selected |
+      ($selected|length)==1 and $selected[0].config.workloadMetadataConfig.mode=="GKE_METADATA")
+  ' "$RHIZA_CLUSTER_METADATA" >/dev/null || return 1
+  printf '%s\n' 'stage=metadata-credential-readiness category=node-pool-gke-metadata'
+  metadata_identity_code=0
+  metadata_identity=$(k exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 1024 \
+    --noproxy '*' -H 'Metadata-Flavor: Google' --write-out '\n%{http_code}' \
+    http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null) || metadata_identity_code=$?
+  metadata_identity_http=$(printf '%s\n' "$metadata_identity" | tail -n 1)
+  metadata_identity_value=$(printf '%s\n' "$metadata_identity" | sed '$d')
+  if [ "$metadata_identity_code" = 0 ] && [ "$metadata_identity_http" = 200 ] && [ "$metadata_identity_value" = rhiza-gcs.svc.id.goog ]; then
+    metadata_identity_category=ksa-rhiza-gcs
+  else
+    metadata_identity_category=rejected
+  fi
+  unset metadata_identity metadata_identity_value
+  printf 'stage=metadata-credential-readiness native=%s http=%s category=%s\n' \
+    "$metadata_identity_code" "$metadata_identity_http" "$metadata_identity_category"
+  [ "$metadata_identity_category" = ksa-rhiza-gcs ] || return 1
   metadata_attempt=0
   while [ "$metadata_attempt" -lt 6 ]; do
     [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
@@ -87,7 +109,7 @@ metadata_credentials_ready() (
             length==1 and (.[0] | type=="object" and (.access_token|type)=="string" and (.access_token|length)>0 and
             .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
           ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
-        403) metadata_category=forbidden ;;
+        403) metadata_category=propagation-pending ;;
         5[0-9][0-9]) metadata_category=transient-server ;;
       esac
     else
@@ -98,7 +120,7 @@ metadata_credentials_ready() (
     fi
     # A known denial must not become retryable because its body read timed out.
     case "$metadata_http" in
-      403) metadata_category=forbidden ;;
+      403) metadata_category=propagation-pending ;;
       [1-4][0-9][0-9]) [ "$metadata_http" = 200 ] || metadata_category=unknown ;;
     esac
     unset metadata_response
@@ -106,7 +128,7 @@ metadata_credentials_ready() (
       "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" "$metadata_category"
     case "$metadata_category" in
       ready) [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124; return 0 ;;
-      transient-connection|transient-server) ;;
+      propagation-pending|transient-connection|transient-server) ;;
       deadline) return "$metadata_code" ;;
       *) return 1 ;;
     esac
@@ -115,6 +137,52 @@ metadata_credentials_ready() (
     sleep 1
   done
 )
+validate_cluster_metadata() {
+  jq -e '.name=="ied-cluster" and .location=="asia-northeast3" and
+    (.endpoint|type)=="string" and (.endpoint|test("^[a-zA-Z0-9.-]+$")) and
+    (.masterAuth.clusterCaCertificate|type)=="string" and (.masterAuth.clusterCaCertificate|length)>0' "$1" >/dev/null &&
+    validate_node_pool_metadata "$1"
+}
+validate_node_pool_metadata() {
+  jq -e --arg a "$RHIZA_NODE_A" --arg b "$RHIZA_NODE_B" --arg c "$RHIZA_NODE_C" '
+    . as $cluster |
+    ([$a,$b,$c] as $nodes | ($nodes|unique|length)==3 and
+      all($nodes[]; . as $node |
+        [$cluster.nodePools[]? | . as $pool | select($node | startswith("gke-ied-cluster-" + $pool.name + "-"))] as $selected |
+        ($selected|length)==1 and $selected[0].config.workloadMetadataConfig.mode=="GKE_METADATA"))
+  ' "$1" >/dev/null
+}
+prepare_cluster_metadata() {
+  if [ "$mode" = run ]; then
+    command -v gcloud >/dev/null || return 1
+    cluster_metadata_tmp=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-cluster-metadata.XXXXXXXX") || return 1
+    chmod 700 "$cluster_metadata_tmp"
+    cluster_metadata_raw="$cluster_metadata_tmp/cluster.json"
+    cluster_metadata_stderr="$cluster_metadata_tmp/gcloud.stderr"
+    cleanup_cluster_metadata_tmp() {
+      rm -f "$cluster_metadata_raw" "$cluster_metadata_stderr"
+      rmdir "$cluster_metadata_tmp"
+    }
+    trap cleanup_cluster_metadata_tmp 0 HUP INT TERM
+    gcloud --project=patch2-the-new-era --quiet container clusters describe ied-cluster \
+      --region=asia-northeast3 --format=json > "$cluster_metadata_raw" 2> "$cluster_metadata_stderr" || return $?
+    chmod 600 "$cluster_metadata_raw" "$cluster_metadata_stderr"
+    validate_cluster_metadata "$cluster_metadata_raw" || return 1
+    RHIZA_CLUSTER_METADATA="$out/cluster-metadata-validation.json"
+    jq '{name,location,nodePools:[.nodePools[]|{name,config:{workloadMetadataConfig:{mode:.config.workloadMetadataConfig.mode}}}]}' \
+      "$cluster_metadata_raw" > "$RHIZA_CLUSTER_METADATA" || return 1
+    shasum -a 256 "$RHIZA_CLUSTER_METADATA" | awk '{print $1}' > "$out/cluster-metadata-validation.sha256"
+    cleanup_cluster_metadata_tmp
+    trap - 0 HUP INT TERM
+  fi
+  private_file "$RHIZA_CLUSTER_METADATA"
+  cluster_metadata_checksum=${RHIZA_CLUSTER_METADATA%.json}.sha256
+  private_file "$cluster_metadata_checksum"
+  expected_cluster_metadata_checksum=$(cat "$cluster_metadata_checksum")
+  printf '%s' "$expected_cluster_metadata_checksum" | grep -Eq '^[a-f0-9]{64}$' || return 1
+  [ "$(shasum -a 256 "$RHIZA_CLUSTER_METADATA" | awk '{print $1}')" = "$expected_cluster_metadata_checksum" ] || return 1
+  validate_node_pool_metadata "$RHIZA_CLUSTER_METADATA"
+}
 wait_voters() (
   # One deadline covers creation, Ready and identity checks for all three Pods.
   # Subshell scope prevents this deadline from constraining later cleanup.
@@ -279,7 +347,7 @@ if [ "$mode" = run ]; then
   [ "${RHIZA_EXECUTION_GO:-}" = "$GITHUB_SHA:$RHIZA_RUN_ID" ] || die 'exact harness/run GO required'
 else
   [ -z "${GITHUB_ACTIONS:-}${GITHUB_EVENT_NAME:-}${GITHUB_REF:-}${GITHUB_SHA:-}" ] || die 'local entry must not impersonate CI'
-  : "${RHIZA_HARNESS_SHA:?}" "${RHIZA_LOCAL_RUNTIME_KUBECONFIG:?}"
+  : "${RHIZA_HARNESS_SHA:?}" "${RHIZA_AUTH_STATE:?}" "${RHIZA_LOCAL_RUNTIME_KUBECONFIG:?}"
   : "${RHIZA_LOCAL_API_SERVER:?}" "${RHIZA_LOCAL_CA_DATA:?}"
   : "${RHIZA_AUTH_STARTED_EPOCH:?}" "${RHIZA_AUTH_EXPIRES:?}" "${RHIZA_LOCAL_TOKEN_EXPIRES:?}"
   printf '%s' "$RHIZA_HARNESS_SHA" | grep -Eq '^[a-f0-9]{40}$' || die 'exact local harness SHA required'
@@ -287,7 +355,14 @@ else
   [ "${RHIZA_EXECUTION_GO:-}" = "$RHIZA_HARNESS_SHA:$RHIZA_RUN_ID" ] || die 'exact local harness/run GO required'
   command -v timeout >/dev/null || die 'native GNU timeout required'
   timeout --version | grep -Fq 'GNU coreutils' || die 'native GNU timeout required'
+  case "$RHIZA_AUTH_STATE" in /*) ;; *) die 'private absolute auth state required' ;; esac
+  [ -d "$RHIZA_AUTH_STATE" ] && [ ! -L "$RHIZA_AUTH_STATE" ] || die 'private auth state directory required'
+  runtime_receipt_dir=$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)
+  supplied_kubeconfig=$(CDPATH='' cd -- "$(dirname -- "$RHIZA_LOCAL_RUNTIME_KUBECONFIG")" && pwd -P)/$(basename -- "$RHIZA_LOCAL_RUNTIME_KUBECONFIG")
+  [ "$supplied_kubeconfig" = "$runtime_receipt_dir/runtime.kubeconfig" ] || die 'runtime kubeconfig must be the mint-local receipt'
+  RHIZA_LOCAL_RUNTIME_KUBECONFIG=$supplied_kubeconfig
   private_file "$RHIZA_LOCAL_RUNTIME_KUBECONFIG"
+  RHIZA_CLUSTER_METADATA="$runtime_receipt_dir/mint-cluster.json"
   # Native parsing stays in memory, never artifacts/logs. A rejected config may
   # contain credentials, so suppress parser diagnostics and disclose only cause.
   if config=$(timeout --kill-after=5s 5s kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
@@ -324,6 +399,8 @@ else
 fi
 [ "${RHIZA_APPLICATION_SHA:-}" = "$release" ] || die 'application release mismatch'
 : "${RHIZA_APPROVED_CAP_KRW:?}" "${RHIZA_BOOTSTRAP_UID:?}"
+[ "$mode" = run ] || : "${RHIZA_CLUSTER_METADATA:?cluster metadata receipt required}"
+prepare_cluster_metadata || die 'trusted cluster metadata preparation failed'
 [ "$RHIZA_APPROVED_CAP_KRW" = 10000 ] || die 'this run requires the approved 10000 KRW cap'
 seq=0
 run() {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -556,7 +557,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "metadata-credential-failure", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -588,6 +589,17 @@ func TestQualificationLocalRuntime(t *testing.T) {
 				t.Fatal(err)
 			}
 			write(filepath.Join(dir, "metadata.json"), string(metadata), 0600)
+			clusterMetadata := `{"name":"ied-cluster","location":"asia-northeast3","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
+			if scenario == "metadata-gce-mode" {
+				clusterMetadata = `{"name":"ied-cluster","location":"asia-northeast3","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GCE_METADATA"}}}]}`
+			}
+			clusterMetadataPath := filepath.Join(dir, "mint-cluster.json")
+			write(clusterMetadataPath, clusterMetadata, 0600)
+			clusterMetadataSum := sha256.Sum256([]byte(clusterMetadata))
+			write(filepath.Join(dir, "mint-cluster.sha256"), fmt.Sprintf("%x\n", clusterMetadataSum), 0600)
+			if scenario == "cluster-receipt-changed" {
+				write(clusterMetadataPath, clusterMetadata+"\n", 0600)
+			}
 			token := filepath.Join(dir, "token")
 			write(token, "synthetic-offline-token", 0600)
 			user := map[string]any{"tokenFile": token}
@@ -608,8 +620,18 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			kubeconfig := filepath.Join(dir, "config")
+			kubeconfig := filepath.Join(dir, "runtime.kubeconfig")
 			write(kubeconfig, string(encoded), 0600)
+			runtimeKubeconfig := kubeconfig
+			if scenario == "runtime-kubeconfig-path" {
+				runtimeKubeconfig = filepath.Join(dir, "other.kubeconfig")
+				write(runtimeKubeconfig, string(encoded), 0600)
+			}
+			physicalDir, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			physicalKubeconfig := filepath.Join(physicalDir, "runtime.kubeconfig")
 			if scenario == "token-permissions" {
 				if err := os.Chmod(token, 0644); err != nil {
 					t.Fatal(err)
@@ -663,7 +685,7 @@ case "$1 $2" in
   printf '%s\n' '{"items":[]}' ;;
  "create -f")
   case "$FAKE_SCENARIO" in
-   metadata-credential-failure|outside-prefix-auth-failure|outside-prefix-accessible|inside-prefix-auth-failure|voter-create-failure|voter-create-unknown)
+   metadata-credential-failure|metadata-wrong-service-account|metadata-gce-mode|outside-prefix-auth-failure|outside-prefix-accessible|inside-prefix-auth-failure|voter-create-failure|voter-create-unknown)
     case "$3" in
      */metadata.yaml) [ "$4 $5" = '-o json' ] || exit 97; cat "$FAKE_METADATA"; exit 0 ;;
      */voters.yaml)
@@ -679,9 +701,15 @@ case "$1 $2" in
  "exec rhiza-metadata")
   case "$4" in
    curl)
-    [ "$*" = 'exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 16384 --noproxy * -H Metadata-Flavor: Google --write-out \n%{http_code} http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' ] || exit 98
-    if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n403'
-    else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
+    case "$*" in
+     *'/instance/service-accounts/default/email')
+      if [ "$FAKE_SCENARIO" = metadata-wrong-service-account ]; then printf 'node@project.iam.gserviceaccount.com\n200'
+      else printf 'rhiza-gcs.svc.id.goog\n200'; fi ;;
+     *'/instance/service-accounts/default/token')
+      if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n403'
+      else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
+     *) exit 98 ;;
+    esac ;;
    gcloud)
     case "$5 $6" in
      'storage cat')
@@ -748,7 +776,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				"RHIZA_HOST_IMAGE=ghcr.io/mrchypark/rhiza-sql@sha256:" + strings.Repeat("a", 64),
 				"RHIZA_METADATA_IMAGE=gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:" + strings.Repeat("b", 64),
 				"RHIZA_NODE_A=gke-ied-cluster-fixture-a", "RHIZA_NODE_B=gke-ied-cluster-fixture-b", "RHIZA_NODE_C=gke-ied-cluster-fixture-c",
-				"RHIZA_OUTPUT=" + out, "RHIZA_LOCAL_RUNTIME_KUBECONFIG=" + kubeconfig,
+				"RHIZA_OUTPUT=" + out, "RHIZA_AUTH_STATE=" + dir, "RHIZA_LOCAL_RUNTIME_KUBECONFIG=" + runtimeKubeconfig,
 				"RHIZA_LOCAL_API_SERVER=https://127.0.0.1", "RHIZA_LOCAL_CA_DATA=synthetic-pinned-ca",
 				"RHIZA_AUTH_STARTED_EPOCH=" + strconv.FormatInt(now, 10), "RHIZA_AUTH_EXPIRES=" + expiry, "RHIZA_LOCAL_TOKEN_EXPIRES=" + expiry,
 				"FAKE_NOW=" + strconv.FormatInt(now, 10), "FAKE_CLOCK=" + filepath.Join(dir, "clock"),
@@ -756,7 +784,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				"FAKE_METADATA=" + filepath.Join(dir, "metadata.json"), "FAKE_METADATA_DELETED=" + filepath.Join(dir, "metadata-deleted"),
 				"FAKE_VOTER_ATTEMPT=" + filepath.Join(dir, "voter-attempt"),
 				"FAKE_CONFIG_EVENTS=" + filepath.Join(dir, "config-events"),
-				"FAKE_NATIVE_TIMEOUT=" + nativeTimeout, "FAKE_KUBECTL=" + filepath.Join(bin, "kubectl"), "FAKE_KUBECONFIG=" + kubeconfig,
+				"FAKE_NATIVE_TIMEOUT=" + nativeTimeout, "FAKE_KUBECTL=" + filepath.Join(bin, "kubectl"), "FAKE_KUBECONFIG=" + physicalKubeconfig,
 				"FAKE_GIT_ROOT=" + filepath.Dir(script) + "/../..", "FAKE_GIT_REVISION=" + mockFixtureRevision,
 				"FAKE_PARENT=" + filepath.Join(dir, "parent"), "FAKE_SIGNAL_READY=" + filepath.Join(dir, "signal-ready")}
 			if scenario == "fake-ci" {
@@ -809,6 +837,9 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			if bytes.Contains(output, []byte("synthetic-offline-token")) || bytes.Contains(output, []byte("synthetic-rejected-token")) || bytes.Contains(output, []byte("synthetic-metadata-token")) {
 				t.Fatal("rejected credential content disclosed")
 			}
+			if bytes.Contains(output, []byte("node@project.iam.gserviceaccount.com")) {
+				t.Fatal("rejected metadata identity body disclosed")
+			}
 			want := 1
 			if scenario == "command-failure" || scenario == "voter-create-failure" {
 				want = 53
@@ -822,20 +853,20 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			if exited.ExitCode() != want {
 				t.Fatalf("runtime exit=%d want=%d diagnostic=%s", exited.ExitCode(), want, output)
 			}
-			if scenario == "metadata-credential-failure" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" || scenario == "voter-create-failure" || scenario == "voter-create-unknown" {
+			if scenario == "metadata-credential-failure" || scenario == "metadata-wrong-service-account" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" || scenario == "voter-create-failure" || scenario == "voter-create-unknown" {
 				ready := bytes.Index(calls, []byte("wait pod/rhiza-metadata --for=condition=Ready"))
 				credential := bytes.Index(calls, []byte("exec rhiza-metadata -- curl"))
 				voters := bytes.Index(calls, []byte(out+"/voters.yaml"))
 				outside := bytes.Index(calls, []byte("exec rhiza-metadata -- gcloud storage cat"))
 				inside := bytes.Index(calls, []byte("exec rhiza-metadata -- gcloud storage ls"))
-				if ready < 0 || credential <= ready {
+				if ready < 0 || (scenario != "metadata-gce-mode" && credential <= ready) {
 					t.Fatalf("actual metadata Ready/readiness order missing: %s", calls)
 				}
 				status, err := os.ReadFile(filepath.Join(out, "cleanup-status.txt"))
 				if err != nil {
 					t.Fatal(err)
 				}
-				if scenario == "metadata-credential-failure" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" {
+				if scenario == "metadata-credential-failure" || scenario == "metadata-wrong-service-account" || scenario == "metadata-gce-mode" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" {
 					if voters >= 0 || !bytes.Contains(status, []byte("Metadata-only Pod cleanup verified")) {
 						t.Fatalf("credential failure bypassed EXIT cleanup or created voters: %s %s", calls, status)
 					}
@@ -846,6 +877,10 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					case "metadata-credential-failure":
 						if bytes.Contains(calls, []byte("gcloud")) || bytes.Contains(calls, []byte("storage")) {
 							t.Fatal("failed credential readiness reached a storage probe")
+						}
+					case "metadata-wrong-service-account", "metadata-gce-mode":
+						if bytes.Contains(calls, []byte("/token")) || bytes.Contains(calls, []byte("gcloud")) || bytes.Contains(calls, []byte("storage")) {
+							t.Fatal("metadata identity/mode rejection reached token or storage")
 						}
 					case "outside-prefix-auth-failure", "outside-prefix-accessible":
 						if outside <= credential || inside >= 0 || !bytes.Contains(output, []byte("outside-folder access did not fail closed")) {
@@ -891,15 +926,15 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					if err != nil {
 						return err
 					}
-					if bytes.Contains(data, []byte("synthetic-metadata-token")) {
-						return fmt.Errorf("metadata token persisted in %s", entry.Name())
+					if bytes.Contains(data, []byte("synthetic-metadata-token")) || bytes.Contains(data, []byte("node@project.iam.gserviceaccount.com")) {
+						return fmt.Errorf("metadata response persisted in %s", entry.Name())
 					}
 					return nil
 				}); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" && scenario != "metadata-credential-failure" && scenario != "outside-prefix-auth-failure" && scenario != "outside-prefix-accessible" && scenario != "inside-prefix-auth-failure" && scenario != "voter-create-failure" && scenario != "voter-create-unknown" {
+			if scenario != "deadline" && scenario != "command-failure" && scenario != "watchdog" && scenario != "metadata-credential-failure" && scenario != "metadata-wrong-service-account" && scenario != "outside-prefix-auth-failure" && scenario != "outside-prefix-accessible" && scenario != "inside-prefix-auth-failure" && scenario != "voter-create-failure" && scenario != "voter-create-unknown" {
 				reason := "local kubeconfig must be one pinned tokenFile-only identity"
 				switch scenario {
 				case "head-mismatch":
@@ -916,6 +951,12 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					reason = "local entry must not impersonate CI"
 				case "expiry":
 					reason = "fixed 55-minute scope/preparation/runtime/cleanup reserve invalid"
+				case "runtime-kubeconfig-path":
+					reason = "runtime kubeconfig must be the mint-local receipt"
+				case "cluster-receipt-changed":
+					reason = "trusted cluster metadata preparation failed"
+				case "metadata-gce-mode":
+					reason = "trusted cluster metadata preparation failed"
 				}
 				if !bytes.Contains(output, []byte(reason)) {
 					t.Fatalf("rejected at the wrong boundary: %s", output)
@@ -923,7 +964,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				if bytes.Contains(calls, []byte("create")) {
 					t.Fatal("rejected local entry attempted a resource write")
 				}
-				if scenario == "fake-ci" || scenario == "head-mismatch" {
+				if scenario == "fake-ci" || scenario == "head-mismatch" || scenario == "runtime-kubeconfig-path" {
 					if !errors.Is(eventErr, os.ErrNotExist) || !errors.Is(callsErr, os.ErrNotExist) {
 						t.Fatal("pre-parser rejection unexpectedly invoked the local mock")
 					}
@@ -1583,9 +1624,9 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		name           string
 		want, attempts int
 	}{
-		{"ready", 0, 1}, {"connection", 0, 2}, {"server", 0, 2},
+		{"ready", 0, 1}, {"forbidden-then-ready", 0, 2}, {"connection", 0, 2}, {"server", 0, 2},
 		{"exhausted", 1, 6}, {"unknown-native", 1, 1}, {"unknown-http", 1, 1},
-		{"forbidden", 1, 1}, {"forbidden-timeout", 1, 1}, {"unknown-http-timeout", 1, 1},
+		{"forbidden", 1, 6}, {"forbidden-timeout", 1, 6}, {"unknown-http-timeout", 1, 1},
 		{"invalid", 1, 1}, {"multiple", 1, 1}, {"deadline", 124, 1},
 		{"missing-token", 1, 1}, {"empty-token", 1, 1}, {"token-type", 1, 1}, {"bearer-type", 1, 1},
 		{"expiry-type", 1, 1}, {"expiry-zero", 1, 1}, {"expiry-negative", 1, 1},
@@ -1597,6 +1638,9 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if err := os.WriteFile(filepath.Join(dir, "cluster.json"), []byte(`{"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
 			invalid, malformed := invalidResponses[scenario.name]
 			if malformed {
 				if err := os.WriteFile(filepath.Join(dir, "response"), []byte(invalid), 0600); err != nil {
@@ -1604,12 +1648,16 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 				}
 			}
 			fixture := `
-mode=run-local; local_deadline=1010
+mode=run-local; local_deadline=1010; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
 date() { cat "$FAKE_DIR/clock"; }
 sleep() { now=$(date); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
 k() {
- [ "$*" = 'exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 16384 --noproxy * -H Metadata-Flavor: Google --write-out \n%{http_code} http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' ] || return 95
  [ "$metadata_wait_deadline" = 1010 ] || return 96
+ case "$*" in
+  *'/instance/service-accounts/default/email') printf 'rhiza-gcs.svc.id.goog\n200'; return 0 ;;
+  *'/instance/service-accounts/default/token') ;;
+  *) return 95 ;;
+ esac
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
  printf 'synthetic-token-never-public\n' >&2
  case "$FAKE_SCENARIO" in
@@ -1618,6 +1666,7 @@ k() {
   exhausted) return 7 ;;
   unknown-native) return 53 ;;
   unknown-http) printf 'synthetic-token-never-public\n401'; return 0 ;;
+  forbidden-then-ready) [ "$attempt" != 1 ] || { printf 'synthetic-token-never-public\n403'; return 0; } ;;
   forbidden) printf 'synthetic-token-never-public\n403'; return 0 ;;
   forbidden-timeout) printf 'synthetic-token-never-public\n403'; return 28 ;;
   unknown-http-timeout) printf 'synthetic-token-never-public\n401'; return 28 ;;
@@ -1651,17 +1700,94 @@ k() {
 			}
 			for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
 				fields := strings.Fields(line)
-				if len(fields) != 6 || fields[0] != "stage=metadata-credential-readiness" || !strings.HasPrefix(fields[5], "category=") {
+				if fields[0] != "stage=metadata-credential-readiness" || !strings.HasPrefix(fields[len(fields)-1], "category=") {
 					t.Fatalf("unexpected public evidence: %q", line)
 				}
 			}
 			entries, err := os.ReadDir(dir)
-			wantEntries := 2
+			wantEntries := 3
 			if malformed {
 				wantEntries++
 			}
 			if err != nil || len(entries) != wantEntries {
 				t.Fatalf("response persisted: entries=%v error=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nvalidate_cluster_metadata() {\n")
+	end := strings.Index(string(source), "\nwait_voters() (\n")
+	privateStart := strings.Index(string(source), "\nprivate_file() {\n")
+	privateEnd := strings.Index(string(source), "\nsed -e \"s|__NAMESPACE__|")
+	if start < 0 || end <= start || privateStart < 0 || privateEnd <= privateStart {
+		t.Fatal("cluster metadata preparation functions missing")
+	}
+	for _, scenario := range []string{"caller-ignored", "describe-failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0700); err != nil {
+				t.Fatal(err)
+			}
+			gcloud := `#!/bin/sh
+[ "$*" = '--project=patch2-the-new-era --quiet container clusters describe ied-cluster --region=asia-northeast3 --format=json' ] || exit 97
+[ "$FAKE_SCENARIO" != describe-failure ] || exit 53
+cat "$FAKE_CLUSTER"
+`
+			if err := os.WriteFile(filepath.Join(bin, "gcloud"), []byte(gcloud), 0700); err != nil {
+				t.Fatal(err)
+			}
+			cluster := `{"name":"ied-cluster","location":"asia-northeast3","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
+			clusterPath := filepath.Join(dir, "fresh.json")
+			if err := os.WriteFile(clusterPath, []byte(cluster), 0600); err != nil {
+				t.Fatal(err)
+			}
+			callerPath := filepath.Join(dir, "caller.json")
+			if err := os.WriteFile(callerPath, []byte(`{"nodePools":[]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			fixture := `
+mode=run; out="$FAKE_DIR"; RHIZA_CLUSTER_METADATA="$FAKE_CALLER"
+RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c
+prepare_cluster_metadata || exit $?
+[ "$RHIZA_CLUSTER_METADATA" = "$FAKE_DIR/cluster-metadata-validation.json" ] || exit 96
+touch "$FAKE_DIR/metadata-pod-created"
+`
+			command := exec.Command("/bin/sh", "-c", string(source[privateStart:privateEnd])+string(source[start:end])+fixture)
+			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario,
+				"FAKE_CLUSTER="+clusterPath, "FAKE_CALLER="+callerPath, "TMPDIR="+dir)
+			output, runErr := command.CombinedOutput()
+			if scenario == "caller-ignored" {
+				if runErr != nil {
+					t.Fatalf("fresh CI metadata rejected: %v %s", runErr, output)
+				}
+				data, err := os.ReadFile(filepath.Join(dir, "cluster-metadata-validation.json"))
+				if err != nil || bytes.Contains(data, []byte("endpoint")) || bytes.Contains(data, []byte("masterAuth")) || !bytes.Contains(data, []byte("GKE_METADATA")) {
+					t.Fatalf("sanitized validation receipt invalid: %v %q", err, data)
+				}
+				if matches, _ := filepath.Glob(filepath.Join(dir, "rhiza-cluster-metadata.*")); len(matches) != 0 {
+					t.Fatalf("raw CI metadata survived success: %v", matches)
+				}
+				return
+			}
+			var exited *exec.ExitError
+			if !errors.As(runErr, &exited) || exited.ExitCode() != 53 {
+				t.Fatalf("describe failure exit=%v output=%s", runErr, output)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "metadata-pod-created")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("describe failure reached metadata pod creation")
+			}
+			if matches, _ := filepath.Glob(filepath.Join(dir, "rhiza-cluster-metadata.*")); len(matches) != 0 {
+				t.Fatalf("raw CI metadata/stderr survived failure: %v", matches)
 			}
 		})
 	}

@@ -117,7 +117,19 @@ local_token_files() {
     chmod 600 "$RHIZA_AUTH_STATE/runtime.kubeconfig"
     jq -n --arg expiry "$token_expiry" --arg subject "system:serviceaccount:$ns:rhiza-runtime" '{expirationTimestamp:$expiry,subject:$subject}' > "$RHIZA_AUTH_STATE/runtime-token-ack.json"
 }
+validate_cluster_metadata() {
+    [ "$1" = "$RHIZA_AUTH_STATE/mint-cluster.json" ] && [ -f "$1" ] && [ ! -L "$1" ] &&
+      [ -n "$(find "$1" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Fresh private cluster metadata receipt required'
+    jq -e --arg a "$RHIZA_NODE_A" --arg b "$RHIZA_NODE_B" --arg c "$RHIZA_NODE_C" '
+      . as $cluster | (.name=="ied-cluster" and .location=="asia-northeast3") and
+      ([$a,$b,$c] as $nodes | ($nodes|unique|length)==3 and
+        all($nodes[]; . as $node |
+          [$cluster.nodePools[]? | . as $pool | select($node | startswith("gke-ied-cluster-" + $pool.name + "-"))] as $selected |
+          ($selected|length)==1 and $selected[0].config.workloadMetadataConfig.mode=="GKE_METADATA"))
+    ' "$1" >/dev/null || die 'Selected node pool metadata rejected'
+}
 mint_local() (
+    : "${RHIZA_NODE_A:?}" "${RHIZA_NODE_B:?}" "${RHIZA_NODE_C:?}"
     [ ! -e "$RHIZA_AUTH_STATE/runtime-token-request.attempted" ] || die 'TokenRequest already attempted; no renewal/retry'
     [ ! -e "$RHIZA_AUTH_STATE/runtime.token" ] && [ ! -L "$RHIZA_AUTH_STATE/runtime.token" ] &&
       [ ! -e "$RHIZA_AUTH_STATE/runtime.kubeconfig" ] && [ ! -L "$RHIZA_AUTH_STATE/runtime.kubeconfig" ] || die 'Runtime credential collision'
@@ -136,6 +148,8 @@ mint_local() (
     trap clear_local_mint 0
     trap 'exit 130' HUP INT TERM
     record mint-cluster g container clusters describe ied-cluster --region=asia-northeast3 --format=json
+    validate_cluster_metadata "$RHIZA_AUTH_STATE/mint-cluster.json"
+    shasum -a 256 "$RHIZA_AUTH_STATE/mint-cluster.json" | awk '{print $1}' > "$RHIZA_AUTH_STATE/mint-cluster.sha256"
     jq -n --argjson duration "$((mint_remaining - 30))" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",spec:{expirationSeconds:$duration}}' > "$RHIZA_AUTH_STATE/runtime-token-request.private"
     printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/runtime-token-request.attempted"
     printf '%s\n' runtime-token-request > "$RHIZA_AUTH_STATE/inflight"
@@ -372,6 +386,9 @@ if [ "$mode" = check-local-auth ]; then
     trap clear_local_fixture 0
     trap 'exit 130' HUP INT TERM
     fixture_now=$(date -u '+%s')
+    RHIZA_NODE_A=gke-ied-cluster-pool-a-node-a
+    RHIZA_NODE_B=gke-ied-cluster-pool-b-node-b
+    RHIZA_NODE_C=gke-ied-cluster-pool-c-node-c
     stamp() { date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'; }
     RHIZA_AUTH_EXPIRES=$(stamp "$((fixture_now + 3300))")
     render > "$local_fixture/local.yaml"
@@ -388,7 +405,7 @@ if [ "$mode" = check-local-auth ]; then
     subjects "$local_fixture/ci.yaml" > "$local_fixture/ci-subjects"
     [ "$(grep -c 'kind: User' "$local_fixture/ci-subjects")" = 2 ] || die 'CI User bindings changed'
     if grep -q 'name: rhiza-runtime' "$local_fixture/ci.yaml"; then die 'Unused local KSA created in CI'; fi
-    jq -n '{name:"ied-cluster",location:"asia-northeast3",endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"}}' > "$local_fixture/cluster.json"
+    jq -n '{name:"ied-cluster",location:"asia-northeast3",endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"},nodePools:["pool-a","pool-b","pool-c"]|map({name:.,config:{workloadMetadataConfig:{mode:"GKE_METADATA"}}})}' > "$local_fixture/cluster.json"
     jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
     # Invoked indirectly through the synthetic record() wrapper.
     # shellcheck disable=SC2329
@@ -399,7 +416,15 @@ if [ "$mode" = check-local-auth ]; then
         [ "$fixture_case" != native-failure ] || return 56
         cat "$local_fixture/response.json"
     }
-    record() { fixture_receipt=$1; shift; "$@" > "$local_fixture/$fixture_receipt.json"; }
+    record() {
+        fixture_receipt=$1; shift
+        if [ "${fixture_case:-}" = symlink-cluster ] && [ "$fixture_receipt" = mint-cluster ]; then
+            ln -s "$local_fixture/mint-cluster-target.json" "$local_fixture/mint-cluster.json"
+            "$@" > "$local_fixture/mint-cluster-target.json"
+        else
+            "$@" > "$local_fixture/$fixture_receipt.json"
+        fi
+    }
     fixture_case=positive
     mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"
     jq -e --arg context "$context" --arg ns "$ns" --arg token "$local_fixture/runtime.token" '
@@ -407,24 +432,34 @@ if [ "$mode" = check-local-auth ]; then
       (.users|length)==1 and .users[0].user=={tokenFile:$token} and
       (.clusters|length)==1 and (.contexts|length)==1 and .contexts[0].context.namespace==$ns
     ' "$local_fixture/runtime.kubeconfig" >/dev/null || die 'Static private kubeconfig mismatch'
+    [ "$(shasum -a 256 "$local_fixture/mint-cluster.json" | awk '{print $1}')" = "$(cat "$local_fixture/mint-cluster.sha256")" ] || die 'Cluster metadata handoff checksum mismatch'
     [ "$(find "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" -type f -user "$(id -u)" -perm 0600 -print | wc -l | tr -d ' ')" = 2 ] || die 'Credential file mode regression'
     if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die 'Token renewal accepted'; fi
     [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'TokenRequest repeated'
-    for fixture_case in overlong short missing-token wrong-cluster native-failure; do
-        rm -f "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls"
+    for fixture_case in overlong short missing-token wrong-cluster missing-pool gce-mode ambiguous-pool symlink-cluster native-failure; do
+        rm -f "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls" "$local_fixture/mint-cluster.sha256"
         jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
-        jq -n '{name:"ied-cluster",location:"asia-northeast3",endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"}}' > "$local_fixture/cluster.json"
+        rm -f "$local_fixture/cluster.json"
+        jq -n '{name:"ied-cluster",location:"asia-northeast3",endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"},nodePools:["pool-a","pool-b","pool-c"]|map({name:.,config:{workloadMetadataConfig:{mode:"GKE_METADATA"}}})}' > "$local_fixture/cluster.json"
         case "$fixture_case" in
             overlong) jq --arg expiry "$(stamp "$((fixture_now + 3600))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             short) jq --arg expiry "$(stamp "$((fixture_now + 1800))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             missing-token) jq 'del(.status.token)' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             wrong-cluster) jq '.name="other-cluster"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
+            missing-pool) jq '.nodePools=[.nodePools[1],.nodePools[2]]' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
+            gce-mode) jq '.nodePools[1].config.workloadMetadataConfig.mode="GCE_METADATA"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
+            ambiguous-pool) jq '.nodePools += [{name:"pool-a-node",config:{workloadMetadataConfig:{mode:"GKE_METADATA"}}}]' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
+            symlink-cluster) ;;
         esac
         if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die "Local negative accepted: $fixture_case"; fi
         [ ! -e "$local_fixture/runtime.token" ] && [ ! -e "$local_fixture/runtime.kubeconfig" ] && [ ! -e "$local_fixture/runtime-token-response.private" ] && [ ! -e "$local_fixture/runtime-token-request.private" ] || die 'Failure retained credential bytes'
-        [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'Negative request count regression'
+        expected_requests=1
+        case "$fixture_case" in wrong-cluster|missing-pool|gce-mode|ambiguous-pool|symlink-cluster) expected_requests=0 ;; esac
+        actual_requests=0; [ ! -e "$local_fixture/api-calls" ] || actual_requests=$(wc -l < "$local_fixture/api-calls" | tr -d ' ')
+        [ "$actual_requests" = "$expected_requests" ] || die 'Negative request count regression'
         [ "$fixture_case" != native-failure ] || [ "$(cat "$local_fixture/runtime-token-request.exit")" = 56 ] || die 'Native failure lost'
-        printf 'Local auth boundary %s refused; one request, no credentials retained.\n' "$fixture_case"
+        rm -f "$local_fixture/cluster.json" "$local_fixture/mint-cluster.json" "$local_fixture/mint-cluster-target.json"
+        printf 'Local auth boundary %s refused; %s requests, no credentials retained.\n' "$fixture_case" "$expected_requests"
     done
     # One symlink regression fixture checks each output before any TokenRequest.
     rm -f "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls"
