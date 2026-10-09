@@ -312,7 +312,7 @@ jobs:
     timeout-minutes: 30
     env:
       PUBLISH_CHAOS_IMAGE: ${{ github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image }}
-      APPLICATION_SHA: d575e686d2ec349c07de70679f5c6b22c1718e17
+      APPLICATION_SHA: 315a5ee6bc6635b4ff4f85b9534afa4abe537c79
     steps:
       - uses: actions/checkout@v4
       - name: Require released production source for image export

@@ -323,7 +323,15 @@ capture_shutdown() {
       "$out/shutdown-expected.json" > "$out/shutdown-expected.next.json" || return $?
     mv "$out/shutdown-expected.next.json" "$out/shutdown-expected.json"
   fi
-  k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-before.json" 2> "$out/shutdown-pods-before.stderr" || return $?
+  snapshot_selector=$(jq -nr --arg run "$RHIZA_RUN_ID" '"chaos.rhiza.io/run="+$run|@uri') || return 1
+  # Generic get output rebuilds a client-side List with an empty ListMeta.
+  # Keep the server's opaque collection RV, using exactly the watch selector.
+  k get --raw="/api/v1/namespaces/$ns/pods?labelSelector=$snapshot_selector" > "$out/shutdown-pods-before.json" 2> "$out/shutdown-pods-before.stderr" || return $?
+  jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.apiVersion=="v1" and .kind=="PodList" and
+    (.metadata.resourceVersion|type)=="string" and (.metadata.resourceVersion|length)>0 and
+    (.metadata.continue==null or .metadata.continue=="") and (.items|type)=="array" and
+    all(.items[]; .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run)
+  ' "$out/shutdown-pods-before.json" >/dev/null || return 1
   # Never silently omit a writer whose status/log incarnation is unavailable.
   jq -e 'all(.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner");
     [.status.containerStatuses[]?|select(.name=="rhiza" and (.containerID|type)=="string" and (.containerID|length)>0)]|length==1)
@@ -530,7 +538,7 @@ forward() {
 forward rhiza-voter-0 18080
 forward rhiza-voter-1 18081
 forward rhiza-voter-2 18082
-pod_snapshot() { k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json | jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,node:.spec.nodeName,volumes:.spec.volumes,containers:.status.containerStatuses}]'; }
+pod_snapshot() { k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json | jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,node:.spec.nodeName,volumes:.spec.volumes,containers:.status.containerStatuses,deleting:.metadata.deletionTimestamp,ready:any(.status.conditions[]?;.type=="Ready" and .status=="True")}]'; }
 run before pod_snapshot
 cp "$out/$seq-before.stdout" "$out/voters-before.json"
 jq -e 'all(.[]|select(.name|startswith("rhiza-voter-"));all(.containers[]; .restartCount==0))' "$out/voters-before.json" >/dev/null || die 'unexpected startup restart; unseen incarnation not budgeted'
@@ -630,6 +638,62 @@ fault() {
   run injected k wait "$active_fault" --for=condition=AllInjected=True --timeout=60s
   run injection k get "$active_fault" -o json
 }
+container_kill() {
+  run process-before pod_snapshot
+  cp "$out/$seq-process-before.stdout" "$out/process-before.json"
+  jq -e --slurpfile original "$out/voters-before.json" '
+    def voters: [.[]|select(.name|test("^rhiza-voter-[012]$"))]|sort_by(.name);
+    voters as $b | ($original[0]|voters) as $o |
+    ($b|map(.name))==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] and
+    ($b|map({name,uid,node,volumes,containers}))==($o|map({name,uid,node,volumes,containers})) and
+    all($b[]; (.uid|type)=="string" and (.uid|length)>0 and .deleting==null and .ready==true and
+      (.volumes|type)=="array" and any(.volumes[]; .name=="data" and (.emptyDir|type)=="object") and
+      ([.containers[]?|select(.name=="rhiza" and .restartCount==0 and
+        (.containerID|type)=="string" and (.containerID|length)>0)]|length)==1)
+  ' "$out/process-before.json" >/dev/null || die 'original intact-WAL voters not present before container-kill'
+  voter0_restarts=1
+  fault PodChaos container-kill process-one
+  jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.kind=="PodChaos" and
+    .metadata.name=="process-one" and .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
+    .spec.action=="container-kill" and .spec.mode=="one" and .spec.duration=="10s" and .spec.containerNames==["rhiza"] and
+    .spec.selector.namespaces==[$ns] and .spec.selector.labelSelectors["chaos.rhiza.io/run"]==$run and
+    .spec.selector.labelSelectors["statefulset.kubernetes.io/pod-name"]=="rhiza-voter-0" and
+    ([.status.conditions[]?|select(.type=="AllInjected" and .status=="True")]|length)==1 and
+    (.status.experiment.containerRecords|length)==1 and
+    (.status.experiment.containerRecords[0] | .id==($ns+"/rhiza-voter-0/rhiza") and
+      .phase=="Injected" and .injectedCount==1 and .recoveredCount==0 and
+      ([.events[]?|select(.operation=="Apply" and .type=="Succeeded")]|length)==1)
+  ' "$out/$seq-injection.stdout" >/dev/null || die 'exact single container-kill injection not proven'
+  execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
+  # ContainerKill is one-shot: duration does not recover it. Delete the exact
+  # fault and wait for its finalizer before proving application recovery.
+  run fault-delete k delete "$active_fault" --wait=true --timeout=60s
+  active_fault=''
+  run voters-ready wait_voters 120
+  forward rhiza-voter-0 18080
+  run after pod_snapshot
+  jq -e --slurpfile before "$out/process-before.json" --slurpfile original "$out/voters-before.json" '
+    def voters: [.[]|select(.name|test("^rhiza-voter-[012]$"))]|sort_by(.name);
+    def container: [.containers[]?|select(.name=="rhiza")];
+    voters as $a | ($before[0]|voters) as $b | ($original[0]|voters) as $o |
+    ($a|map(.name))==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] and
+    ($b|map(.name))==($a|map(.name)) and ($o|map(.name))==($a|map(.name)) and
+    all(range(0;3); . as $i | $a[$i] as $new | $b[$i] as $old |
+      ($new|container[0]) as $nc | ($old|container[0]) as $oc |
+      $new.name==$old.name and $new.uid==$old.uid and $new.uid==$o[$i].uid and
+      ($new.uid|type)=="string" and ($new.uid|length)>0 and
+      $new.node==$old.node and $new.volumes==$old.volumes and $new.volumes==$o[$i].volumes and
+      $new.deleting==null and $new.ready==true and
+      ($new|container|length)==1 and ($old|container|length)==1 and
+      ($nc.containerID|type)=="string" and ($nc.containerID|length)>0 and
+      ($oc.containerID|type)=="string" and ($oc.containerID|length)>0 and
+      ($nc.imageID|type)=="string" and ($nc.imageID|length)>0 and $nc.imageID==$oc.imageID and
+      if $i==0 then $oc.restartCount==0 and $nc.restartCount==1 and $nc.containerID!=$oc.containerID
+      else $nc.restartCount==0 and $oc.restartCount==0 and $nc.containerID==$oc.containerID end)
+  ' "$out/$seq-after.stdout" >/dev/null || die 'voter UID/WAL identity changed or exact container restart not proven'
+  metrics
+  for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"],[2,"network"],[3,"process"]]'; done
+}
 fault NetworkChaos partition network-one
 execute "$RHIZA_RUN_ID-network" "INSERT INTO qualification VALUES (2,'network')"
 run recovered k wait "$active_fault" --for=condition=AllRecovered=True --timeout=90s
@@ -637,19 +701,7 @@ run fault-delete k delete "$active_fault" --wait=true --timeout=60s
 active_fault=''
 for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"],[2,"network"]]'; done
 metrics
-voter0_restarts=1
-fault PodChaos container-kill process-one
-execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
-run recovered k wait "$active_fault" --for=condition=AllRecovered=True --timeout=90s
-run fault-delete k delete "$active_fault" --wait=true --timeout=60s
-active_fault=''
-run voters-ready wait_voters 120
-# Existing port-forward connection may exit when its container is killed.
-forward rhiza-voter-0 18080
-run after pod_snapshot
-jq -e --slurpfile before "$out/voters-before.json" '[.[]|select(.name|startswith("rhiza-voter-"))] as $a|[$before[0][]|select(.name|startswith("rhiza-voter-"))] as $b|all($b[];. as $old|any($a[];.name==$old.name and .uid==$old.uid and .volumes==$old.volumes)) and any($a[];.name=="rhiza-voter-0" and .containers[0].restartCount>0)' "$out/$seq-after.stdout" >/dev/null || die 'voter UID/WAL identity changed or no container restart'
-metrics
-for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"],[2,"network"],[3,"process"]]'; done
+container_kill
 sleep 15
 run current k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/checkpoint/CURRENT"
 cp "$out/$seq-current.stdout" "$out/CURRENT.json"

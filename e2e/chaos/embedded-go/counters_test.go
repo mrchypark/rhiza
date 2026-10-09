@@ -605,6 +605,258 @@ execute synthetic-schema 'CREATE TABLE qualification (id INTEGER PRIMARY KEY,val
 	}
 }
 
+func TestQualificationContainerKillRecovery(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\ncontainer_kill() {\n")
+	end := strings.Index(string(source), "\nfault NetworkChaos partition network-one\n")
+	if start < 0 || end <= start {
+		t.Fatal("actual container-kill branch missing")
+	}
+	for _, scenario := range []string{"success", "before-replaced", "two-injections", "wrong-target", "empty-records", "apply-failed", "delete-failed", "not-ready", "pod-replaced", "wal-replaced", "no-restart", "two-restarts", "same-container", "other-restarted", "image-changed", "barrier-failed"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			writeJSON := func(name string, value any) {
+				t.Helper()
+				data, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pods := func(after bool) []any {
+				var result []any
+				for i := range 3 {
+					uid, volume, containerID, image, restarts, ready := fmt.Sprintf("uid-%d", i), "data", fmt.Sprintf("containerd://old-%d", i), "sha256:fixed", 0, true
+					if after && i == 0 {
+						containerID, restarts = "containerd://new-0", 1
+						switch scenario {
+						case "not-ready":
+							ready = false
+						case "pod-replaced":
+							uid = "replacement"
+						case "wal-replaced":
+							volume = "new-wal"
+						case "no-restart":
+							restarts = 0
+						case "two-restarts":
+							restarts = 2
+						case "same-container":
+							containerID = "containerd://old-0"
+						case "image-changed":
+							image = "sha256:other"
+						}
+					}
+					if after && i == 1 && scenario == "other-restarted" {
+						restarts = 1
+					}
+					result = append(result, map[string]any{"name": fmt.Sprintf("rhiza-voter-%d", i), "uid": uid, "node": fmt.Sprintf("node-%d", i), "volumes": []any{map[string]any{"name": volume, "emptyDir": map[string]any{}}}, "ready": ready, "deleting": nil,
+						"containers": []any{map[string]any{"name": "rhiza", "containerID": containerID, "imageID": image, "restartCount": restarts}}})
+				}
+				return result
+			}
+			writeJSON("voters-before.json", pods(false))
+			before := pods(false)
+			if scenario == "before-replaced" {
+				before[0].(map[string]any)["uid"] = "replacement"
+			}
+			writeJSON("before.json", before)
+			writeJSON("after.json", pods(true))
+			count, target, eventType := 1, "synthetic/rhiza-voter-0/rhiza", "Succeeded"
+			if scenario == "two-injections" {
+				count = 2
+			}
+			if scenario == "wrong-target" {
+				target = "synthetic/rhiza-voter-1/rhiza"
+			}
+			if scenario == "apply-failed" {
+				eventType = "Failed"
+			}
+			records := []any{map[string]any{"id": target, "phase": "Injected", "injectedCount": count, "recoveredCount": 0, "events": []any{map[string]any{"operation": "Apply", "type": eventType}}}}
+			if scenario == "empty-records" {
+				records = nil
+			}
+			// Same shape as the saved 620769db one-shot response, including the
+			// deliberately false AllRecovered condition; never claim recovery from it.
+			writeJSON("injection.json", map[string]any{"kind": "PodChaos", "metadata": map[string]any{"name": "process-one", "namespace": "synthetic", "labels": map[string]any{"chaos.rhiza.io/run": "a1b2c3d4"}},
+				"spec":   map[string]any{"action": "container-kill", "mode": "one", "duration": "10s", "containerNames": []string{"rhiza"}, "selector": map[string]any{"namespaces": []string{"synthetic"}, "labelSelectors": map[string]any{"chaos.rhiza.io/run": "a1b2c3d4", "statefulset.kubernetes.io/pod-name": "rhiza-voter-0"}}},
+				"status": map[string]any{"conditions": []any{map[string]any{"type": "AllInjected", "status": "True"}, map[string]any{"type": "AllRecovered", "status": "False"}}, "experiment": map[string]any{"containerRecords": records}}})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
+out=$1; seq=0; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; active_fault=''
+die() { printf '%s\n' "$*" >&2; exit 1; }
+run() { name=$1; shift; seq=$((seq+1)); printf '%s\n' "$name" >> "$out/order"; "$@" > "$out/$seq-$name.stdout"; }
+pod_snapshot() { if [ "$seq" = 1 ]; then cat "$out/before.json"; else [ -f "$out/deleted" ] || exit 91; cat "$out/after.json"; fi; }
+fault() { [ "$*" = 'PodChaos container-kill process-one' ] || exit 92; active_fault=PodChaos/process-one; seq=$((seq+1)); cp "$out/injection.json" "$out/$seq-injection.stdout"; printf 'injected\n' >> "$out/order"; }
+execute() { printf 'ack\n' >> "$out/order"; }
+k() { [ "$*" = 'delete PodChaos/process-one --wait=true --timeout=60s' ] || exit 93; [ "$FAKE_SCENARIO" != delete-failed ] || exit 53; touch "$out/deleted"; }
+wait_voters() { [ "$1" = 120 ] && [ -f "$out/deleted" ] || exit 94; }
+forward() { [ -f "$out/deleted" ] || exit 95; }
+metrics() { printf 'metrics\n' >> "$out/order"; }
+readback() { [ "$2" = linearizable ] && [ "$3" = '[[1,"before"],[2,"network"],[3,"process"]]' ] || exit 96; printf 'barrier-%s\n' "$1" >> "$out/order"; [ "$FAKE_SCENARIO" != barrier-failed ] || exit 54; }
+`+string(source[start:end])+`
+container_kill
+[ -z "$active_fault" ] && [ "$voter0_restarts" = 1 ]`, "fixture", dir)
+			command.Env = append(os.Environ(), "FAKE_SCENARIO="+scenario)
+			output, err := command.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("fixture timeout: %v", ctx.Err())
+			}
+			if scenario == "success" {
+				if err != nil {
+					t.Fatalf("actual branch: %v: %s", err, output)
+				}
+				order, err := os.ReadFile(filepath.Join(dir, "order"))
+				if err != nil || string(order) != "process-before\ninjected\nack\nfault-delete\nvoters-ready\nafter\nmetrics\nbarrier-18080\nbarrier-18081\nbarrier-18082\n" {
+					t.Fatalf("wrong one-shot recovery order: %s (%v)", order, err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("unsafe recovery accepted")
+				}
+				order, readErr := os.ReadFile(filepath.Join(dir, "order"))
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if scenario == "before-replaced" && string(order) != "process-before\n" {
+					t.Fatalf("fault injected into a replacement Pod: %s", order)
+				}
+				switch scenario {
+				case "two-injections", "wrong-target", "empty-records", "apply-failed":
+					if string(order) != "process-before\ninjected\n" {
+						t.Fatalf("unproven injection reached mutation: %s", order)
+					}
+				case "delete-failed":
+					if bytes.Contains(order, []byte("voters-ready")) {
+						t.Fatalf("finalizer failure reached recovery: %s", order)
+					}
+				}
+				if scenario != "barrier-failed" && bytes.Contains(order, []byte("barrier-")) {
+					t.Fatalf("unsafe incarnation reached SQL recovery: %s", order)
+				}
+			}
+		})
+	}
+}
+
+func TestQualificationShutdownSnapshotWatch(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nshutdown_watch() {\n")
+	end := strings.Index(string(source), "\nfinish_shutdown_capture() {\n")
+	if start < 0 || end <= start {
+		t.Fatal("actual capture/watch functions missing")
+	}
+	for _, scenario := range []string{"success", "learner", "generic-list", "empty-rv", "continued", "wrong-uid", "wrong-namespace", "wrong-run", "missing-writer", "duplicate-writer", "missing-learner", "list-error"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			writeJSON := func(name string, value any) {
+				t.Helper()
+				data, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var before, items []any
+			for i := range 3 {
+				name, uid := fmt.Sprintf("rhiza-voter-%d", i), fmt.Sprintf("uid-%d", i)
+				before = append(before, map[string]any{"name": name, "uid": uid})
+				if i == 0 && scenario == "wrong-uid" {
+					uid = "replacement"
+				}
+				if i == 0 && scenario == "missing-writer" {
+					continue
+				}
+				ns, run := "synthetic", "a1b2c3d4"
+				if scenario == "wrong-namespace" {
+					ns = "foreign"
+				}
+				if scenario == "wrong-run" {
+					run = "other"
+				}
+				items = append(items, map[string]any{"metadata": map[string]any{"name": name, "uid": uid, "namespace": ns, "labels": map[string]any{"app": "rhiza-voter", "chaos.rhiza.io/run": run}}, "spec": map[string]any{"containers": []any{map[string]any{"name": "rhiza", "image": "pinned"}}}, "status": map[string]any{"containerStatuses": []any{map[string]any{"name": "rhiza", "containerID": "containerd://" + name, "imageID": "pinned", "restartCount": 0}}}})
+			}
+			learner := map[string]any{"metadata": map[string]any{"name": "rhiza-learner", "uid": "learner-uid", "namespace": "synthetic", "labels": map[string]any{"chaos.rhiza.io/run": "a1b2c3d4"}}, "spec": map[string]any{"containers": []any{map[string]any{"name": "rhiza", "image": "pinned"}}}, "status": map[string]any{"containerStatuses": []any{map[string]any{"name": "rhiza", "containerID": "containerd://learner", "imageID": "pinned", "restartCount": 0}}}}
+			if scenario == "learner" {
+				items = append(items, learner)
+			}
+			if scenario == "duplicate-writer" {
+				items = append(items, items[0])
+			}
+			kind, rv, continuation := "PodList", "opaque/&?=rv", ""
+			if scenario == "generic-list" {
+				kind = "List"
+			}
+			if scenario == "empty-rv" {
+				rv = ""
+			}
+			if scenario == "continued" {
+				continuation = "next-page"
+			}
+			writeJSON("voters-before.json", before)
+			writeJSON("learner-created.json", learner)
+			writeJSON("list.json", map[string]any{"apiVersion": "v1", "kind": kind, "metadata": map[string]any{"resourceVersion": rv, "continue": continuation}, "items": items})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
+out=$1; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; mode=run-local; local_deadline=9999999999
+learner_attempted=false; case "$FAKE_SCENARIO" in learner|missing-learner) learner_attempted=true;; esac
+shutdown_log_pids=''; shutdown_watch_pid=''; shutdown_capture=false
+k() {
+ [ "$#" = 2 ] && [ "$1" = get ] && [ "$2" = '--raw=/api/v1/namespaces/synthetic/pods?labelSelector=chaos.rhiza.io%2Frun%3Da1b2c3d4' ] || return 91
+ printf 'snapshot\n' > "$out/transport-order"
+ [ "$FAKE_SCENARIO" != list-error ] || return 53
+ cat "$out/list.json"
+}
+shutdown_stream() {
+ if [ "$1" = get ]; then
+  case "$2" in '--raw=/api/v1/namespaces/synthetic/pods?watch=true&resourceVersion=opaque%2F%26%3F%3Drv&labelSelector=chaos.rhiza.io%2Frun%3Da1b2c3d4&timeoutSeconds='*) ;; *) return 92;; esac
+  [ "$(cat "$out/transport-order")" = snapshot ] || return 93
+  printf '%s\n' "$2" > "$out/watch-command"
+  printf '{"type":"ERROR","object":{"code":410}}\n'
+ else
+  [ "$1" = logs ] && [ "$3" = --container=rhiza ] && [ "$4" = --follow ] || return 94
+  printf 'fixture log\n'
+ fi
+}
+`+string(source[start:end])+`
+capture_shutdown
+[ "$shutdown_capture" = true ]
+wait "$shutdown_watch_pid"
+for log_owner in $shutdown_log_pids; do wait "${log_owner#*:}"; done`, "fixture", dir)
+			command.Env = append(os.Environ(), "FAKE_SCENARIO="+scenario)
+			output, err := command.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("snapshot fixture timeout: %v", ctx.Err())
+			}
+			_, watchErr := os.Stat(filepath.Join(dir, "watch-command"))
+			if scenario == "success" || scenario == "learner" {
+				if err != nil || watchErr != nil {
+					t.Fatalf("snapshot/watch: %v (%v): %s", err, watchErr, output)
+				}
+				stream, err := os.ReadFile(filepath.Join(dir, "shutdown-watch.json"))
+				if err != nil || !bytes.Contains(stream, []byte(`"code":410`)) {
+					t.Fatal("native watch error stream was not retained")
+				}
+				// Capture is not a proof of Close: the existing proof parser must
+				// still reject this ERROR event; this fixture only checks transport.
+			} else if err == nil || !errors.Is(watchErr, os.ErrNotExist) {
+				t.Fatalf("invalid snapshot reached watch: %v (%v): %s", err, watchErr, output)
+			}
+		})
+	}
+}
+
 func TestQualificationShutdownWatchCommand(t *testing.T) {
 	source, err := os.ReadFile("../run-gcs-postrelease.sh")
 	if err != nil {
