@@ -84,7 +84,7 @@ wait_custom_role() {
         if [ "$role_exit" = 0 ]; then
             jq -e --arg name "projects/$project/roles/$role_id" --arg owner "$owner" --arg permissions "$role_permissions" '
               .name==$name and (.etag|type)=="string" and (.etag|length)>0 and
-              .description==$owner and .stage=="GA" and .deleted==false and
+              .description==$owner and .stage=="GA" and ((has("deleted")|not) or .deleted==false) and
               (.includedPermissions|sort)==($permissions|split(",")|sort)
             ' "$role_base.json" >/dev/null || die "Custom role readiness metadata rejected: $role_tag"
             return 0

@@ -216,8 +216,11 @@ func TestPostreleaseCustomRoleReadiness(t *testing.T) {
 		attempts       int
 	}{
 		{"transient", 1420, 0, 2},
+		{"deleted-omitted", 1420, 0, 1},
 		{"forbidden", 1420, 1, 1},
 		{"deleted", 1420, 1, 1},
+		{"deleted-null", 1420, 1, 1},
+		{"deleted-string", 1420, 1, 1},
 		{"wrong-name", 1420, 1, 1},
 		{"missing-etag", 1420, 1, 1},
 		{"wrong-description", 1420, 1, 1},
@@ -251,7 +254,9 @@ gcloud() {
  case "$FAKE_SCENARIO:$attempt" in transient:1|deadline:1) printf 'NOT_FOUND\n' >&2; return 1;; forbidden:1) printf 'PERMISSION_DENIED\n' >&2; return 1;; esac
  name=projects/fixture-project/roles/fixture-role; etag=etag; description=fixture-owner; stage=GA; deleted=false; permissions='["p.one","p.two"]'
  case "$FAKE_SCENARIO" in deleted) deleted=true;; wrong-name) name=projects/fixture-project/roles/other;; missing-etag) etag=;; wrong-description) description=other;; wrong-stage) stage=BETA;; wrong-permissions) permissions='["p.one"]';; esac
- jq -n --arg name "$name" --arg etag "$etag" --arg description "$description" --arg stage "$stage" --argjson deleted "$deleted" --argjson permissions "$permissions" '{name:$name,etag:$etag,description:$description,stage:$stage,deleted:$deleted,includedPermissions:$permissions}'
+ jq -n --arg scenario "$FAKE_SCENARIO" --arg name "$name" --arg etag "$etag" --arg description "$description" --arg stage "$stage" --argjson deleted "$deleted" --argjson permissions "$permissions" '
+   {name:$name,etag:$etag,description:$description,stage:$stage,deleted:$deleted,includedPermissions:$permissions} |
+   if $scenario=="deleted-omitted" then del(.deleted) elif $scenario=="deleted-null" then .deleted=null elif $scenario=="deleted-string" then .deleted="false" else . end'
 }
 `
 			command := exec.Command("/bin/sh", "-c", helpers+fixture+"\nwait_custom_role fixture fixture-role p.two,p.one "+strconv.Itoa(scenario.deadline))
