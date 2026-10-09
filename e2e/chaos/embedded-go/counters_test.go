@@ -290,13 +290,25 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			write("curl", "#!/bin/sh\n[ -f \"$FAKE_DIR/listening\" ]\n")
+			realCurl, err := exec.LookPath("curl")
+			if err != nil {
+				t.Fatal(err)
+			}
+			write("curl", `#!/bin/sh
+if [ "$FAKE_SCENARIO" = bind-conflict ]; then
+  tries=0
+  while [ ! -f "$FAKE_DIR/bind-exited" ]; do tries=$((tries + 1)); [ "$tries" -lt 100 ] || exit 99; sleep 0.01; done
+  sleep 1
+  exec "$FAKE_REAL_CURL" "$@"
+fi
+[ -f "$FAKE_DIR/listening" ]
+`)
 			write("kubectl", `#!/bin/sh
 case "$*" in *" port-forward pod/rhiza-voter-0 "*) ;; *) exit 97 ;; esac
 [ "$FAKE_SCENARIO" != forward-death ] || exit 53
 if [ -e "$FAKE_DIR/listening" ]; then
   owner=$(cat "$FAKE_DIR/listening")
-  if [ "$owner" = forced ] || kill -0 "$owner" 2>/dev/null; then touch "$FAKE_DIR/address-in-use"; exit 98; fi
+  if [ "$owner" = forced ] || kill -0 "$owner" 2>/dev/null; then touch "$FAKE_DIR/address-in-use"; touch "$FAKE_DIR/bind-exited"; exit 98; fi
   rm -f "$FAKE_DIR/listening"
 fi
 printf '%s\n' "$$" > "$FAKE_DIR/listening"; printf 'start\n' >> "$FAKE_DIR/events"
@@ -332,10 +344,27 @@ stop_forward "$second"
 [ "$(grep -c '^start$' "$FAKE_DIR/events")" = 2 ]
 [ ! -e "$FAKE_DIR/address-in-use" ]
 `
+			var occupied net.Listener
+			var occupiedServer *http.Server
+			if scenario.name == "bind-conflict" {
+				occupied, err = net.Listen("tcp", "127.0.0.1:18080")
+				if err != nil {
+					t.Fatalf("bind-conflict fixture did not prove occupied port: %v", err)
+				}
+				occupiedServer = &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+					if request.URL.Path != "/healthz" {
+						http.NotFound(response, request)
+						return
+					}
+					response.WriteHeader(http.StatusOK)
+				})}
+				go func() { _ = occupiedServer.Serve(occupied) }()
+				defer occupiedServer.Close()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture)
-			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name)
+			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name, "FAKE_REAL_CURL="+realCurl)
 			output, err := command.CombinedOutput()
 			code := 0
 			if err != nil {
