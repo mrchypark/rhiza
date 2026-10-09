@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +36,28 @@ func (r testClusterResolver) ClusterForSlot(slot quepaxa.Slot) quepaxa.Cluster {
 		return config
 	}
 	return r.current
+}
+
+func TestPeerRPCPhaseErrorPreservesCause(t *testing.T) {
+	for _, phase := range []string{"connection-gate", "peer-identity", "dial", "handshake", "stream-open", "request-write", "request-close", "response-read", "response-decode"} {
+		t.Run(phase, func(t *testing.T) {
+			for _, cause := range []error{context.DeadlineExceeded, context.Canceled, &quic.StreamError{ErrorCode: 1}} {
+				err := peerRPCPhaseError(phase, time.Now(), cause)
+				if !errors.Is(err, cause) || !strings.Contains(err.Error(), "phase="+phase+" ") {
+					t.Fatalf("phase or cause lost: %v", err)
+				}
+				if _, ok := cause.(*quic.StreamError); ok {
+					var streamErr *quic.StreamError
+					if !errors.As(err, &streamErr) || streamErr != cause {
+						t.Fatalf("typed stream error lost: %v", err)
+					}
+				}
+			}
+			if err := peerRPCPhaseError(phase, time.Now(), nil); err != nil {
+				t.Fatalf("successful phase became an error: %v", err)
+			}
+		})
+	}
 }
 
 func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
@@ -72,8 +96,60 @@ func TestQUICFlatBuffersRecordRoundTrip(t *testing.T) {
 	request := quepaxa.RecordRequest{Slot: 1, Step: 4, Proposal: quepaxa.Proposal{ProposerID: "n1", Value: policySQL(t, "SELECT 1")}}
 	request.Proposal.Priority[31] = 1
 	request.Proposal.Hash = sha256.Sum256(request.Proposal.Value)
-	if err := transport.StageValue(callCtx, member.ID, request.Proposal.Hash, request.Proposal.Value); err != nil {
-		t.Fatal(err)
+	started := time.Now()
+	var phasesMu sync.Mutex
+	var phases []string
+	observe := func(phase string, err error) {
+		phasesMu.Lock()
+		defer phasesMu.Unlock()
+		if len(phases) < 16 {
+			phases = append(phases, fmt.Sprintf("server phase=%s elapsed=%s error_type=%T deadline=%t canceled=%t", phase, time.Since(started), err, errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled)))
+		}
+	}
+	peer.diagnostic.Store(&observe)
+	stageErr := transport.StageValue(callCtx, member.ID, request.Proposal.Hash, request.Proposal.Value)
+	if stageErr == nil {
+		peer.diagnostic.Store(nil)
+	} else {
+		// Keep observing through the existing handler join: timeout does not
+		// prove that the server never executed the request.
+		defer func() {
+			closeErr := peer.Close()
+			peer.diagnostic.Store(nil)
+			phasesMu.Lock()
+			joined := append([]string(nil), phases...)
+			phasesMu.Unlock()
+			for _, phase := range joined {
+				t.Log("joined " + phase)
+			}
+			t.Logf("server joined close_error_type=%T", closeErr)
+		}()
+	}
+	phasesMu.Lock()
+	captured := append([]string(nil), phases...)
+	phasesMu.Unlock()
+	for _, phase := range captured {
+		t.Log(phase)
+	}
+	if stageErr != nil {
+		pool := transport.peers[member.ID]
+		pool.mu.Lock()
+		cached, handshake := pool.conn != nil, false
+		var connectionCause error
+		if cached {
+			handshake = pool.conn.ConnectionState().TLS.HandshakeComplete
+			connectionCause = context.Cause(pool.conn.Context())
+		}
+		pool.mu.Unlock()
+		t.Fatalf("StageValue error=%v parent_error_type=%T parent_cause_type=%T cached=%t handshake_complete=%t connection_cause_type=%T", stageErr, callCtx.Err(), context.Cause(callCtx), cached, handshake, connectionCause)
+	}
+	stageEntered, stageReturned := false, false
+	for _, phase := range captured {
+		stageEntered = stageEntered || strings.Contains(phase, "phase=stage-value-enter ")
+		stageReturned = stageReturned || strings.Contains(phase, "phase=stage-value-return ") && strings.Contains(phase, "error_type=<nil>")
+	}
+	if !stageEntered || !stageReturned {
+		t.Fatalf("successful StageValue lacks server execution evidence: %v", captured)
 	}
 	summary, err := transport.SendRecord(callCtx, member.ID, request)
 	if err != nil {

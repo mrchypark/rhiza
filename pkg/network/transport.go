@@ -226,7 +226,16 @@ func memberQUICAddr(member quepaxa.Member) (string, error) {
 	return endpoint.Host, nil
 }
 
-func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (*quic.Conn, error) {
+func peerRPCPhaseError(phase string, started time.Time, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("peer RPC phase=%s elapsed=%s cause_type=%T: %w", phase, time.Since(started), err, err)
+}
+
+func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (conn *quic.Conn, err error) {
+	started, phase := time.Now(), "connection-gate"
+	defer func() { err = peerRPCPhaseError(phase, started, err) }()
 	member, ok := t.members[to]
 	if !ok {
 		return nil, fmt.Errorf("unknown node: %s", to)
@@ -241,6 +250,7 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (*quic.Co
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 	if peer.conn == nil || peer.conn.Context().Err() != nil {
+		phase = "peer-identity"
 		addr, err := memberQUICAddr(member)
 		if err != nil {
 			return nil, err
@@ -274,18 +284,20 @@ func (t *Transport) connection(ctx context.Context, to quepaxa.NodeID) (*quic.Co
 			}
 			return nil
 		}
+		phase = "dial"
 		peer.conn, err = quic.DialAddrEarly(ctx, addr, tlsConfig, t.quic)
 		if err != nil {
 			peer.conn = nil
 			return nil, err
 		}
 	}
+	phase = "handshake"
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-peer.conn.HandshakeComplete():
 	}
-	conn := peer.conn
+	conn = peer.conn
 	peer.active[conn]++
 	return conn, nil
 }
@@ -339,6 +351,8 @@ func (t *Transport) callContext(ctx context.Context, to quepaxa.NodeID, request 
 }
 
 func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request *peerfb.RequestT) (response *peerfb.ResponseT, err error) {
+	started, phase := time.Now(), "stream-open"
+	defer func() { err = peerRPCPhaseError(phase, started, err) }()
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
@@ -357,20 +371,24 @@ func (t *Transport) callConnection(ctx context.Context, conn *quic.Conn, request
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = stream.SetDeadline(deadline)
 	}
+	phase = "request-write"
 	if err := writePeerFrame(stream, encodePeerRequest(request)); err != nil {
 		stream.CancelWrite(1)
 		return nil, err
 	}
+	phase = "request-close"
 	if err := stream.Close(); err != nil {
 		var streamErr *quic.StreamError
 		if !errors.As(context.Cause(stream.Context()), &streamErr) || !streamErr.Remote || streamErr.ErrorCode != 0 {
 			return nil, err
 		}
 	}
+	phase = "response-read"
 	data, err := readPeerFrame(stream)
 	if err != nil {
 		return nil, err
 	}
+	phase = "response-decode"
 	return decodePeerResponse(data)
 }
 
