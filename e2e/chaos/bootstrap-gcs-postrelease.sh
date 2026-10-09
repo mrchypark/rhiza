@@ -60,6 +60,41 @@ render() {
         !skip {print}'
 }
 utc_epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" '+%s' 2>/dev/null || date -u -d "$1" '+%s'; }
+now_epoch() { date -u '+%s'; }
+deadline_remaining() {
+    deadline_left=$(($1 - $(now_epoch)))
+    [ "$deadline_left" -gt 0 ] || return 124
+    printf '%s\n' "$deadline_left"
+}
+retry_pause() {
+    retry_deadline=$1; retry_delay=$2
+    retry_left=$((retry_deadline - $(now_epoch)))
+    [ "$retry_left" -gt "$retry_delay" ] || return 124
+    sleep "$retry_delay"
+}
+wait_custom_role() {
+    role_tag=$1; role_id=$2; role_permissions=$3; role_deadline=$4
+    role_attempt=1; role_delay=5
+    while :; do
+        role_base="$RHIZA_AUTH_STATE/$role_tag-readiness-$role_attempt"
+        role_seconds=$(deadline_remaining "$role_deadline") || die "Custom role readiness deadline exhausted: $role_tag"
+        role_exit=0
+        timeout --signal=KILL "${role_seconds}s" gcloud --project="$project" --quiet iam roles describe "$role_id" --format=json > "$role_base.json" 2> "$role_base.stderr" || role_exit=$?
+        printf '%s\n' "$role_exit" > "$role_base.exit"
+        if [ "$role_exit" = 0 ]; then
+            jq -e --arg name "projects/$project/roles/$role_id" --arg owner "$owner" --arg permissions "$role_permissions" '
+              .name==$name and (.etag|type)=="string" and (.etag|length)>0 and
+              .description==$owner and .stage=="GA" and .deleted==false and
+              (.includedPermissions|sort)==($permissions|split(",")|sort)
+            ' "$role_base.json" >/dev/null || die "Custom role readiness metadata rejected: $role_tag"
+            return 0
+        fi
+        grep -Eq '(^|[^A-Z_])(NOT_FOUND|UNAVAILABLE|DEADLINE_EXCEEDED)([^A-Z_]|$)|(HTTP|http|status|code)[^0-9]{0,16}(429|5[0-9][0-9])' "$role_base.stderr" || die "Custom role readiness failed permanently: $role_tag"
+        retry_pause "$role_deadline" "$role_delay" || die "Custom role readiness deadline exhausted: $role_tag"
+        role_attempt=$((role_attempt + 1))
+        [ "$role_delay" = 20 ] || role_delay=$((role_delay * 2))
+    done
+}
 local_token_files() {
     # This consumes the native TokenRequest response without printing credentials.
     jq -e '.apiVersion=="authentication.k8s.io/v1" and .kind=="TokenRequest" and
@@ -140,7 +175,8 @@ check_folder_identity() {
 }
 folder_iam() (
     # Subshell keeps private credential traps separate from fixture-secret traps.
-    # No SDK policy projection, automatic folder creation, retries or old-policy restore.
+    # No SDK policy projection, automatic folder creation or old-policy restore.
+    # Only the exact fresh-role propagation error gets a bounded retry below.
     action=$1
     case "$action" in get|add|remove) ;; *) die 'Unknown folder IAM action' ;; esac
     iam_dir=$(mktemp -d "$RHIZA_AUTH_STATE/.folder-iam.XXXXXXXX") || exit 1
@@ -150,29 +186,48 @@ folder_iam() (
     clear_iam() {
         iam_exit=$?
         rm -f "$iam_dir/token" "$iam_dir/header"
-        if [ "$iam_exit" = 0 ]; then
-            rm -f "$iam_dir"/metadata-before-get.* "$iam_dir"/metadata-before-put.* "$iam_dir"/current.* "$iam_dir"/desired.* "$iam_dir"/put-ack.* "$iam_dir"/readback.* "$iam_dir"/readback-match.* "$iam_dir/auth.exit"
+        if [ "$iam_exit" = 0 ] && [ "${put_attempt:-0}" -le 1 ]; then
+            rm -f "$iam_dir"/account.* "$iam_dir"/metadata-before-get.* "$iam_dir"/metadata-before-put.* "$iam_dir"/current* "$iam_dir"/desired* "$iam_dir"/put-ack* "$iam_dir"/readback.* "$iam_dir"/readback-match.* "$iam_dir/auth.exit"
             rmdir "$iam_dir"
         else
-            # Private noncredential bodies/statuses are first-outcome evidence;
-            # keep separate current/desired/PUT ACK/readback, never overwrite.
+            # Noncredential bodies/statuses are attempt evidence; keep separate
+            # current/desired/PUT ACK/readback files, never overwrite.
             printf '%s\n' "$iam_exit" > "$iam_dir/terminal.exit"
-            printf 'Folder IAM stopped; private phase receipts retained at %s\n' "$iam_dir" >&2
+            printf 'Folder IAM attempt receipts retained at %s\n' "$iam_dir" >&2
         fi
     }
     trap clear_iam 0
     trap 'exit 130' HUP INT TERM
-    [ "$(gcloud --project="$project" --quiet config get-value account 2>/dev/null)" = "$RHIZA_EXPECTED_ADMIN_ACCOUNT" ] || die 'Unexpected IAM administrative account'
+    account_exit=0
+    if [ "$action" = add ]; then
+        account_seconds=$(deadline_remaining "${custom_role_deadline:?custom role deadline missing}") || account_exit=$?
+        if [ "$account_exit" = 0 ]; then timeout --signal=KILL "${account_seconds}s" gcloud --project="$project" --quiet config get-value account > "$iam_dir/account.stdout" 2> "$iam_dir/account.stderr" || account_exit=$?; fi
+    else
+        gcloud --project="$project" --quiet config get-value account > "$iam_dir/account.stdout" 2> "$iam_dir/account.stderr" || account_exit=$?
+    fi
+    printf '%s\n' "$account_exit" > "$iam_dir/account.exit"
+    [ "$account_exit" = 0 ] || return "$account_exit"
+    [ "$(cat "$iam_dir/account.stdout")" = "$RHIZA_EXPECTED_ADMIN_ACCOUNT" ] || die 'Unexpected IAM administrative account'
     folder_metadata() {
         metadata_phase=$1; metadata_exit=0
-        gcloud --project="$project" --quiet storage managed-folders describe "$folder" --raw --format=json > "$iam_dir/$metadata_phase.json" 2> "$iam_dir/$metadata_phase.stderr" || metadata_exit=$?
+        if [ "$action" = add ]; then
+            metadata_seconds=$(deadline_remaining "${custom_role_deadline:?custom role deadline missing}") || return 124
+            timeout --signal=KILL "${metadata_seconds}s" gcloud --project="$project" --quiet storage managed-folders describe "$folder" --raw --format=json > "$iam_dir/$metadata_phase.json" 2> "$iam_dir/$metadata_phase.stderr" || metadata_exit=$?
+        else
+            gcloud --project="$project" --quiet storage managed-folders describe "$folder" --raw --format=json > "$iam_dir/$metadata_phase.json" 2> "$iam_dir/$metadata_phase.stderr" || metadata_exit=$?
+        fi
         printf '%s\n' "$metadata_exit" > "$iam_dir/$metadata_phase.exit"
         if [ "$metadata_exit" != 0 ]; then cat "$iam_dir/$metadata_phase.stderr" >&2; return "$metadata_exit"; fi
         check_folder_identity "$iam_dir/$metadata_phase.json"
     }
     folder_metadata metadata-before-get || exit $?
     auth_exit=0
-    gcloud --project="$project" --quiet auth print-access-token > "$iam_dir/token" 2>/dev/null || auth_exit=$?
+    if [ "$action" = add ]; then
+        auth_seconds=$(deadline_remaining "${custom_role_deadline:?custom role deadline missing}") || auth_exit=$?
+        if [ "$auth_exit" = 0 ]; then timeout --signal=KILL "${auth_seconds}s" gcloud --project="$project" --quiet auth print-access-token > "$iam_dir/token" 2>/dev/null || auth_exit=$?; fi
+    else
+        gcloud --project="$project" --quiet auth print-access-token > "$iam_dir/token" 2>/dev/null || auth_exit=$?
+    fi
     printf '%s\n' "$auth_exit" > "$iam_dir/auth.exit"
     [ "$auth_exit" = 0 ] || die 'Folder IAM token acquisition failed (diagnostics omitted)'
     chmod 600 "$iam_dir/token" || exit 1
@@ -182,11 +237,16 @@ folder_iam() (
     encoded_prefix=$(printf '%s' "$prefix" | jq -sRr @uri) || exit 1
     iam_url="https://storage.googleapis.com/storage/v1/b/$bucket/managedFolders/$encoded_prefix/iam"
     folder_request() {
-        method=$1; request_phase=$2; request_exit=0
+        method=$1; request_phase=$2; request_body=${3:-$iam_dir/desired.json}; request_exit=0
+        request_timeout=30
+        if [ "$action" = add ]; then
+            request_left=$(deadline_remaining "${custom_role_deadline:?custom role deadline missing}") || return 124
+            [ "$request_left" -ge "$request_timeout" ] || request_timeout=$request_left
+        fi
         if [ "$method" = GET ]; then
-            curl --silent --show-error --fail-with-body --max-time 30 --header "@$iam_dir/header" --output "$iam_dir/$request_phase.json" --write-out '%{http_code}' "$iam_url?optionsRequestedPolicyVersion=3" > "$iam_dir/$request_phase.http-status" 2> "$iam_dir/$request_phase.stderr" || request_exit=$?
+            curl --silent --show-error --fail-with-body --max-time "$request_timeout" --header "@$iam_dir/header" --output "$iam_dir/$request_phase.json" --write-out '%{http_code}' "$iam_url?optionsRequestedPolicyVersion=3" > "$iam_dir/$request_phase.http-status" 2> "$iam_dir/$request_phase.stderr" || request_exit=$?
         else
-            curl --silent --show-error --fail-with-body --max-time 30 --request PUT --header "@$iam_dir/header" --header 'Content-Type: application/json' --data-binary "@$iam_dir/desired.json" --output "$iam_dir/$request_phase.json" --write-out '%{http_code}' "$iam_url" > "$iam_dir/$request_phase.http-status" 2> "$iam_dir/$request_phase.stderr" || request_exit=$?
+            curl --silent --show-error --fail-with-body --max-time "$request_timeout" --request PUT --header "@$iam_dir/header" --header 'Content-Type: application/json' --data-binary "@$request_body" --output "$iam_dir/$request_phase.json" --write-out '%{http_code}' "$iam_url" > "$iam_dir/$request_phase.http-status" 2> "$iam_dir/$request_phase.stderr" || request_exit=$?
         fi
         printf '%s\n' "$request_exit" > "$iam_dir/$request_phase.exit"
         if [ "$request_exit" != 0 ]; then cat "$iam_dir/$request_phase.stderr" >&2; return "$request_exit"; fi
@@ -213,8 +273,9 @@ folder_iam() (
     folder_request GET current || exit $?
     validate_policy "$iam_dir/current.json"
     if [ "$action" = get ]; then cat "$iam_dir/current.json"; exit 0; fi
-    desired_exit=0
-    jq --arg action "$action" --arg role "projects/$project/roles/$folder_role" --arg member "serviceAccount:$data" \
+    build_desired() {
+      desired_input=$1; desired_output=$2; desired_error=$3
+      jq --arg action "$action" --arg role "projects/$project/roles/$folder_role" --arg member "serviceAccount:$data" \
       --arg title "rhiza-$RHIZA_RUN_ID-expiry" --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
       {title:$title,expression:$expression} as $condition |
       (.bindings//[]) as $bindings |
@@ -230,12 +291,40 @@ folder_iam() (
         else .bindings |= map(if .role==$role and .condition==$condition and (.members|index($member))!=null
           then .members-=[$member] | select((.members|length)>0) else . end) end
       end
-    ' "$iam_dir/current.json" > "$iam_dir/desired.json" 2> "$iam_dir/desired.stderr" || desired_exit=$?
+      ' "$desired_input" > "$desired_output" 2> "$desired_error"
+    }
+    desired_exit=0
+    build_desired "$iam_dir/current.json" "$iam_dir/desired.json" "$iam_dir/desired.stderr" || desired_exit=$?
     printf '%s\n' "$desired_exit" > "$iam_dir/desired.exit"
     if [ "$desired_exit" != 0 ]; then cat "$iam_dir/desired.stderr" >&2; die 'Folder IAM target refused; no SET'; fi
-    # Fresh incarnation check immediately before the sole etag-protected PUT.
+    # Fresh incarnation check immediately before the first etag-protected PUT.
     folder_metadata metadata-before-put || exit $?
-    folder_request PUT put-ack || exit $?
+    put_attempt=1; put_delay=5; put_body=$iam_dir/desired.json
+    while :; do
+        put_phase=put-ack-$put_attempt
+        if [ "$put_attempt" -gt 1 ]; then folder_metadata "metadata-before-put-$put_attempt" || return $?; fi
+        if folder_request PUT "$put_phase" "$put_body"; then break; else put_exit=$?; fi
+        [ "$action" = add ] && [ "$(cat "$iam_dir/$put_phase.http-status")" = 400 ] &&
+          jq -e --arg role "projects/$project/roles/$folder_role" '
+            .error.code==400 and (.error.errors|type)=="array" and (.error.errors|length)==1 and
+            .error.errors[0].reason=="invalid" and
+            (.error.message|type)=="string" and (.error.message|contains($role)) and
+            ([.error.message|scan("projects/[-a-z0-9]+/roles/[A-Za-z0-9_]+")]==[$role]) and
+            (.error.message|contains("does not exist in the resource\u0027s hierarchy"))
+          ' "$iam_dir/$put_phase.json" >/dev/null 2>&1 || return "$put_exit"
+        retry_pause "${custom_role_deadline:?custom role deadline missing}" "$put_delay" || return 124
+        put_attempt=$((put_attempt + 1))
+        retry_current="$iam_dir/current-$put_attempt.json"
+        folder_request GET "current-$put_attempt" || return $?
+        validate_policy "$retry_current"
+        jq -e --slurpfile original "$iam_dir/current.json" '.etag==$original[0].etag and .==$original[0]' "$retry_current" >/dev/null || die 'Folder IAM policy drifted during role propagation retry'
+        put_body="$iam_dir/desired-$put_attempt.json"
+        build_desired "$retry_current" "$put_body" "$iam_dir/desired-$put_attempt.stderr" || die 'Folder IAM retry policy rebuild failed'
+        [ "$put_delay" = 20 ] || put_delay=$((put_delay * 2))
+    done
+    cp "$iam_dir/$put_phase.json" "$iam_dir/put-ack.json"
+    cp "$iam_dir/$put_phase.exit" "$iam_dir/put-ack.exit"
+    cp "$iam_dir/$put_phase.http-status" "$iam_dir/put-ack.http-status"
     folder_request GET readback || exit $?
     validate_policy "$iam_dir/readback.json"
     match_exit=0
@@ -363,10 +452,30 @@ if [ "$mode" = check-folder-iam ]; then
     fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-folder-iam.XXXXXXXX")
     RHIZA_AUTH_STATE=$fixture_dir
     RHIZA_EXPECTED_ADMIN_ACCOUNT=fixture-account.invalid
+    custom_role_deadline=1420
+    now_epoch() { cat "$fixture_dir/clock"; }
+    sleep() { sleep_now=$(now_epoch); printf '%s\n' "$((sleep_now + $1))" > "$fixture_dir/clock"; }
+    retry_pause() {
+        retry_left=$(($1 - $(now_epoch)))
+        [ "$retry_left" -gt "$2" ] || return 124
+        printf '%s\n' "$2" >> "$fixture_dir/retry.log"
+        sleep "$2"
+    }
+    timeout() {
+        [ "$1" = --signal=KILL ] || die 'Synthetic timeout kill bound changed'
+        timeout_seconds=${2%s}; shift 2
+        [ "$timeout_seconds" -gt 0 ] && [ "$timeout_seconds" -le 420 ] || die 'Synthetic timeout deadline bound invalid'
+        printf '%s\n' "$timeout_seconds" >> "$fixture_dir/timeout.log"
+        timeout_command=$*
+        if [ "$fixture_case" = token-timeout ] && [ "$timeout_command" = "gcloud --project=$project --quiet auth print-access-token" ]; then return 124; fi
+        timeout_code=0; "$@" || timeout_code=$?
+        if [ "$fixture_case" = account-deadline ] && [ "$timeout_command" = "gcloud --project=$project --quiet config get-value account" ]; then printf '1420\n' > "$fixture_dir/clock"; fi
+        return "$timeout_code"
+    }
     # Invoked by the EXIT/signal trap.
     # shellcheck disable=SC2329
     clear_fixture_iam() {
-        rm -f "$fixture_dir/folder-identity.json" "$fixture_dir/policy.json" "$fixture_dir/applied.json" "$fixture_dir/result.json" "$fixture_dir/stderr" "$fixture_dir/get.log" "$fixture_dir/put.log"
+        rm -f "$fixture_dir/folder-identity.json" "$fixture_dir/policy.json" "$fixture_dir/applied.json" "$fixture_dir/result.json" "$fixture_dir/stderr" "$fixture_dir/get.log" "$fixture_dir/put.log" "$fixture_dir/retry.log" "$fixture_dir/successful-put" "$fixture_dir/clock" "$fixture_dir/timeout.log" "$fixture_dir/metadata.log" "$fixture_dir/curl-timeout.log"
         rmdir "$fixture_dir"
     }
     trap clear_fixture_iam 0
@@ -379,7 +488,9 @@ if [ "$mode" = check-folder-iam ]; then
             "--project=$project --quiet iam service-accounts create $ci_id --description=$owner --format=json") printf '{"fixture_created":"%s"}\n' "$ci_id" ;;
             "--project=$project --quiet iam service-accounts create $data_id --description=$owner --format=json") printf '{"fixture_created":"%s"}\n' "$data_id" ;;
             "--project=$project --quiet storage managed-folders describe $folder --raw --format=json")
-                if [ "$fixture_case" = replaced-folder ]; then jq '.createTime="replacement"' "$fixture_dir/folder-identity.json"
+                printf 'metadata\n' >> "$fixture_dir/metadata.log"
+                metadata_attempt=$(wc -l < "$fixture_dir/metadata.log" | tr -d ' ')
+                if [ "$fixture_case" = replaced-folder ] || { [ "$fixture_case" = put-role-folder-replaced ] && [ "$metadata_attempt" -ge 3 ]; }; then jq '.createTime="replacement"' "$fixture_dir/folder-identity.json"
                 else cat "$fixture_dir/folder-identity.json"; fi ;;
             *) die 'Unexpected synthetic gcloud command' ;;
         esac
@@ -400,7 +511,8 @@ if [ "$mode" = check-folder-iam ]; then
                 --output) fixture_output=$2; shift ;;
                 --data-binary) fixture_body=${2#@}; shift ;;
                 --header) case "$2" in @*) fixture_header=${2#@} ;; 'Content-Type: application/json') ;; *) die 'Synthetic header rejected' ;; esac; shift ;;
-                --max-time|--write-out) shift ;;
+                --max-time) fixture_max_time=$2; shift ;;
+                --write-out) shift ;;
                 --silent|--show-error|--fail-with-body) ;;
                 https://*) fixture_url=$1 ;;
                 *) die 'Unexpected synthetic curl argument' ;;
@@ -408,6 +520,8 @@ if [ "$mode" = check-folder-iam ]; then
             shift
         done
         [ -f "$fixture_header" ] && [ -s "$fixture_header" ] || die 'Private header absent'
+        [ "$fixture_max_time" -gt 0 ] && [ "$fixture_max_time" -le 30 ] || die 'Curl timeout not deadline bounded'
+        printf '%s\n' "$fixture_max_time" >> "$fixture_dir/curl-timeout.log"
         # Failed stat stdout must not contaminate the other platform's result.
         if fixture_permissions=$(stat -c '%a' "$fixture_header" 2>/dev/null); then :
         else fixture_permissions=$(stat -f '%Lp' "$fixture_header"); fi
@@ -421,31 +535,41 @@ if [ "$mode" = check-folder-iam ]; then
                 get-404) printf '{"error":"GET404"}' > "$fixture_output"; printf '404'; return 22 ;;
                 unknown-get) printf '{"partial":"GETunknown"}' > "$fixture_output"; printf '000'; return 56 ;;
             esac
-            if [ -s "$fixture_dir/put.log" ]; then
+            if [ -e "$fixture_dir/successful-put" ]; then
                 [ "$fixture_case" != readback-404 ] || { printf '{"error":"readback404"}' > "$fixture_output"; printf '404'; return 22; }
                 if [ "$fixture_case" = readback-mismatch ]; then jq '.bindings[1].members=["user:unexpected.invalid"]' "$fixture_dir/applied.json" > "$fixture_output"
                 elif [ "$fixture_case" = remove-empty-readback ]; then jq 'del(.version,.bindings)' "$fixture_dir/applied.json" > "$fixture_output"
                 else cp "$fixture_dir/applied.json" "$fixture_output"; fi
+            elif [ "$fixture_case" = put-role-drift ] && [ -s "$fixture_dir/put.log" ]; then jq '.etag="drifted-etag"' "$fixture_dir/policy.json" > "$fixture_output"
             else cp "$fixture_dir/policy.json" "$fixture_output"; fi
         else
             [ "$fixture_method" = PUT ] && [ "$fixture_url" = "$fixture_base" ] || die 'PUT URL regression'
             printf 'PUT\n' >> "$fixture_dir/put.log"
             jq -e --slurpfile original "$fixture_dir/policy.json" '.version==3 and .etag=="fresh-current-etag" and has("extra")==($original[0]|has("extra")) and .extra==$original[0].extra' "$fixture_body" >/dev/null || die 'Fresh etag/full policy missing'
             case "$fixture_case" in
+                put-role-transient|put-role-wrong-message|put-role-drift|put-role-folder-replaced|put-role-near-deadline)
+                    [ "$(wc -l < "$fixture_dir/put.log" | tr -d ' ')" != 1 ] || {
+                        message="projects/$project/roles/$folder_role does not exist in the resource's hierarchy"
+                        [ "$fixture_case" != put-role-wrong-message ] || message="projects/$project/roles/other does not exist in the resource's hierarchy"
+                        jq -n --arg message "$message" '{error:{code:400,message:$message,errors:[{reason:"invalid"}]}}' > "$fixture_output"
+                        printf '400'; return 22
+                    }
+                    ;;
                 put-409|put-412|put-404) printf '{"error":"%s"}' "$fixture_case" > "$fixture_output"; printf '%s' "${fixture_case#put-}"; return 22 ;;
                 unknown-put) printf '{"partial":"PUTunknown"}' > "$fixture_output"; printf '000'; return 56 ;;
             esac
             cp "$fixture_body" "$fixture_dir/applied.json"
+            : > "$fixture_dir/successful-put"
             jq '.synthetic_ack="PUT-ACK-not-readback"' "$fixture_body" > "$fixture_output"
         fi
         printf '200'
     }
-    for fixture_case in get-empty get-empty-omitted get-empty-array-omitted get-empty-zero-omitted get-empty-zero-array get-unconditional add add-empty-omitted add-empty-zero remove remove-single remove-empty-readback changed-condition duplicate-target hashed-role missing-target missing-etag version1-condition version-omitted-populated version-zero-populated version-null version-string bindings-null bindings-object bindings-false policy-null wrong-resource malformed-json replaced-folder get-404 unknown-get put-409 put-412 put-404 unknown-put readback-404 readback-mismatch; do
-        : > "$fixture_dir/get.log"; : > "$fixture_dir/put.log"
+    for fixture_case in get-empty get-empty-omitted get-empty-array-omitted get-empty-zero-omitted get-empty-zero-array get-unconditional add add-empty-omitted add-empty-zero account-deadline token-timeout remove remove-single remove-empty-readback changed-condition duplicate-target hashed-role missing-target missing-etag version1-condition version-omitted-populated version-zero-populated version-null version-string bindings-null bindings-object bindings-false policy-null wrong-resource malformed-json replaced-folder get-404 unknown-get put-role-transient put-role-wrong-message put-role-drift put-role-folder-replaced put-role-near-deadline put-409 put-412 put-404 unknown-put readback-404 readback-mismatch; do
+        : > "$fixture_dir/get.log"; : > "$fixture_dir/put.log"; : > "$fixture_dir/retry.log"; : > "$fixture_dir/timeout.log"; : > "$fixture_dir/metadata.log"; : > "$fixture_dir/curl-timeout.log"; printf '1000\n' > "$fixture_dir/clock"; rm -f "$fixture_dir/successful-put"
         jq -n --arg resource "projects/_/buckets/$bucket/managedFolders/$prefix" --arg role "projects/$project/roles/$folder_role" --arg member "serviceAccount:$data" --arg title "rhiza-$RHIZA_RUN_ID-expiry" --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{kind:"storage#policy",resourceId:$resource,version:3,etag:"fresh-current-etag",extra:"preserve-root",bindings:[{role:$role,members:[$member,"user:co-member.invalid"],condition:{title:$title,expression:$expression}},{role:"roles/storage.objectViewer",members:[],extra:"preserve-empty"},{role:"roles/storage.objectViewer",members:["user:unrelated.invalid"]}]}' > "$fixture_dir/policy.json"
         fixture_action=remove; expected_code=1; expected_gets=1; expected_puts=0
         case "$fixture_case" in
-            get-empty|add) jq '.version=1 | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
+            get-empty|add|account-deadline|token-timeout|put-role-transient|put-role-wrong-message|put-role-drift|put-role-folder-replaced|put-role-near-deadline) jq '.version=1 | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             get-empty-omitted|add-empty-omitted) jq 'del(.version,.bindings,.extra)' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             get-empty-array-omitted) jq 'del(.version) | .bindings=[]' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
             get-empty-zero-omitted) jq '.version=0 | del(.bindings)' "$fixture_dir/policy.json" > "$fixture_dir/applied.json" ;;
@@ -479,6 +603,13 @@ if [ "$mode" = check-folder-iam ]; then
             replaced-folder) expected_gets=0 ;;
             get-404) expected_code=22 ;;
             unknown-get) expected_code=56 ;;
+            account-deadline) fixture_action=add; expected_code=124; expected_gets=0; expected_puts=0 ;;
+            token-timeout) fixture_action=add; expected_code=1; expected_gets=0; expected_puts=0 ;;
+            put-role-transient) fixture_action=add; expected_code=0; expected_gets=3; expected_puts=2 ;;
+            put-role-wrong-message) fixture_action=add; expected_code=22; expected_puts=1 ;;
+            put-role-drift) fixture_action=add; expected_code=1; expected_gets=2; expected_puts=1 ;;
+            put-role-folder-replaced) fixture_action=add; expected_code=1; expected_gets=2; expected_puts=1 ;;
+            put-role-near-deadline) fixture_action=add; expected_code=124; expected_gets=1; expected_puts=1; printf '1419\n' > "$fixture_dir/clock" ;;
             put-409|put-412|put-404) expected_code=22; expected_puts=1 ;;
             unknown-put) expected_code=56; expected_puts=1 ;;
             readback-404) expected_code=22; expected_gets=2; expected_puts=1 ;;
@@ -492,14 +623,20 @@ if [ "$mode" = check-folder-iam ]; then
         for leftover in "$fixture_dir"/.folder-iam.*; do
             [ -e "$leftover" ] || continue
             [ ! -e "$leftover/token" ] && [ ! -e "$leftover/header" ] || die 'Private IAM credentials leaked'
-            [ "$actual_code" != 0 ] || die 'Successful private IAM artifacts leaked'
+            [ "$actual_code" != 0 ] || [ "$fixture_case" = put-role-transient ] || die 'Unexpected successful IAM artifacts retained'
             retained=$((retained+1))
             [ "$(cat "$leftover/terminal.exit")" = "$actual_code" ] || die 'Original terminal failure lost'
             if [ "$expected_gets" -ge 1 ]; then [ -s "$leftover/current.json" ] && [ -s "$leftover/current.exit" ] && [ -s "$leftover/current.http-status" ] || die 'First GET evidence lost'; fi
-            if [ "$expected_puts" = 1 ]; then
-                [ -s "$leftover/desired.json" ] && [ -s "$leftover/put-ack.json" ] && [ -s "$leftover/put-ack.exit" ] && [ -s "$leftover/put-ack.http-status" ] || die 'PUT outcome evidence lost'
+            if [ "$expected_puts" -ge 1 ]; then
+                [ -s "$leftover/desired.json" ] && [ -s "$leftover/put-ack-1.json" ] && [ -s "$leftover/put-ack-1.exit" ] && [ -s "$leftover/put-ack-1.http-status" ] || die 'PUT outcome evidence lost'
             fi
             case "$fixture_case" in
+                account-deadline)
+                    [ "$(cat "$leftover/account.exit")" = 0 ] && [ ! -e "$leftover/auth.exit" ] || die 'Account deadline evidence mismatch'
+                    ;;
+                token-timeout)
+                    [ "$(cat "$leftover/account.exit")" = 0 ] && [ "$(cat "$leftover/auth.exit")" = 124 ] || die 'Token timeout evidence mismatch'
+                    ;;
                 readback-404|readback-mismatch)
                     [ "$(cat "$leftover/put-ack.exit")" = 0 ] && [ "$(cat "$leftover/put-ack.http-status")" = 200 ] || die 'PUT ACK overwritten'
                     jq -e '.synthetic_ack=="PUT-ACK-not-readback"' "$leftover/put-ack.json" >/dev/null || die 'Original PUT body overwritten'
@@ -510,7 +647,8 @@ if [ "$mode" = check-folder-iam ]; then
             rm -f "$leftover"/*
             rmdir "$leftover"
         done
-        if [ "$actual_code" = 0 ]; then [ "$retained" = 0 ] || die 'Unexpected retained success'
+        if [ "$fixture_case" = put-role-transient ]; then [ "$retained" = 1 ] || die 'Successful retry evidence missing'
+        elif [ "$actual_code" = 0 ]; then [ "$retained" = 0 ] || die 'Unexpected retained success'
         else [ "$retained" = 1 ] || die 'Private first failure receipt missing'; fi
         if [ "$fixture_case" = remove ]; then
             jq -e --slurpfile original "$fixture_dir/policy.json" '.bindings[1:]==$original[0].bindings[1:] and .bindings[0].members==["user:co-member.invalid"] and .bindings[0].condition==$original[0].bindings[0].condition' "$fixture_dir/result.json" >/dev/null || die 'Non-target/condition preservation regression'
@@ -518,6 +656,12 @@ if [ "$mode" = check-folder-iam ]; then
         if [ "$fixture_case" = remove-single ]; then
             jq -e --slurpfile original "$fixture_dir/policy.json" '.bindings==$original[0].bindings[1:]' "$fixture_dir/result.json" >/dev/null || die 'Only emptied target must be removed'
         fi
+        case "$fixture_case" in
+            put-role-transient|put-role-drift|put-role-folder-replaced) [ "$(cat "$fixture_dir/retry.log")" = 5 ] || die 'Role propagation backoff regression' ;;
+            *) [ ! -s "$fixture_dir/retry.log" ] || die 'Unexpected retry' ;;
+        esac
+        if [ "$fixture_case" = put-role-folder-replaced ]; then [ "$(wc -l < "$fixture_dir/metadata.log" | tr -d ' ')" = 3 ] && [ "$expected_puts" = 1 ] || die 'Replacement folder reached retry PUT'; fi
+        if [ "$fixture_case" = put-role-near-deadline ]; then [ "$(sort -u "$fixture_dir/curl-timeout.log")" = 1 ] || die 'Near-deadline curl was not capped to one second'; fi
         printf 'Folder IAM boundary %s: expected exit %s, GET %s, PUT %s; first-outcome evidence checked, credentials removed.\n' "$fixture_case" "$actual_code" "$expected_gets" "$expected_puts"
     done
     exit 0
@@ -549,7 +693,7 @@ case "${RHIZA_COST_CAP_KRW:-}" in 10000) ;; *) die 'Explicit approved monetary c
 : "${RHIZA_EXPECTED_ADMIN_ACCOUNT:?explicit nonempty administrative account required}"
 : "${RHIZA_AUTH_STATE:?absolute private receipt directory required}"
 case "$RHIZA_AUTH_STATE" in /*) ;; *) die 'State directory must be absolute' ;; esac
-for cmd in gcloud kubectl jq shasum curl; do command -v "$cmd" >/dev/null || die "Missing $cmd"; done
+for cmd in gcloud kubectl jq shasum curl timeout; do command -v "$cmd" >/dev/null || die "Missing $cmd"; done
 [ "$auth_mode" = local ] || command -v gh >/dev/null || die 'Missing gh'
 k() { kubectl --context="$context" "$@"; }
 g() { gcloud --project="$project" --quiet "$@"; }
@@ -729,6 +873,9 @@ if [ "$mode" = apply ]; then
     mark fixture-secret
     clear_fixture
     trap - 0 HUP INT TERM
+    custom_role_deadline=$(($(now_epoch) + 420))
+    if [ "$auth_mode" = ci ]; then wait_custom_role cluster-role "$cluster_role" container.clusters.get "$custom_role_deadline"; fi
+    wait_custom_role folder-role "$folder_role" storage.objects.get,storage.objects.list,storage.objects.create,storage.objects.update,storage.objects.delete "$custom_role_deadline"
     if [ "$auth_mode" = ci ]; then
     record ci-project-grant g projects add-iam-policy-binding "$project" --member="serviceAccount:$ci" --role="projects/$project/roles/$cluster_role" --condition="$cluster_condition" --format=json
     mark ci-project-grant

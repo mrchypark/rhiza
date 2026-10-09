@@ -196,6 +196,102 @@ func TestQualificationFixture(t *testing.T) {
 	}
 }
 
+func TestPostreleaseCustomRoleReadiness(t *testing.T) {
+	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nnow_epoch() {")
+	end := strings.Index(string(source), "\nlocal_token_files() {")
+	if start < 0 || end <= start {
+		t.Fatal("custom role readiness helpers missing")
+	}
+	if strings.Count(string(source), "custom_role_deadline=$(($(now_epoch) + 420))") != 1 {
+		t.Fatal("single exact 420-second custom role deadline missing")
+	}
+	helpers := string(source[start:end])
+	for _, scenario := range []struct {
+		name           string
+		deadline, want int
+		attempts       int
+	}{
+		{"transient", 1420, 0, 2},
+		{"forbidden", 1420, 1, 1},
+		{"deleted", 1420, 1, 1},
+		{"wrong-name", 1420, 1, 1},
+		{"missing-etag", 1420, 1, 1},
+		{"wrong-description", 1420, 1, 1},
+		{"wrong-stage", 1420, 1, 1},
+		{"wrong-permissions", 1420, 1, 1},
+		{"deadline", 1004, 1, 1},
+		{"inflight-timeout", 1420, 1, 0},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, value := range map[string]string{"clock": "1000\n", "attempts": "0\n"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fixture := `
+set -eu
+project=fixture-project; owner=fixture-owner; RHIZA_AUTH_STATE=$FAKE_DIR
+now_epoch() { cat "$FAKE_DIR/clock"; }
+sleep() { now=$(now_epoch); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; printf '%s\n' "$1" >> "$FAKE_DIR/sleeps"; }
+die() { printf '%s\n' "$*" >&2; return 1; }
+timeout() {
+ [ "$1" = --signal=KILL ] || return 98
+ seconds=${2%s}; shift 2; printf '%s\n' "$seconds" >> "$FAKE_DIR/timeouts"
+ [ "$FAKE_SCENARIO" != inflight-timeout ] || return 124
+ "$@"
+}
+gcloud() {
+ [ "$1" = --project=fixture-project ] && [ "$2" = --quiet ] && [ "$3 $4 $5 $6 $7" = 'iam roles describe fixture-role --format=json' ] || return 97
+ attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
+ case "$FAKE_SCENARIO:$attempt" in transient:1|deadline:1) printf 'NOT_FOUND\n' >&2; return 1;; forbidden:1) printf 'PERMISSION_DENIED\n' >&2; return 1;; esac
+ name=projects/fixture-project/roles/fixture-role; etag=etag; description=fixture-owner; stage=GA; deleted=false; permissions='["p.one","p.two"]'
+ case "$FAKE_SCENARIO" in deleted) deleted=true;; wrong-name) name=projects/fixture-project/roles/other;; missing-etag) etag=;; wrong-description) description=other;; wrong-stage) stage=BETA;; wrong-permissions) permissions='["p.one"]';; esac
+ jq -n --arg name "$name" --arg etag "$etag" --arg description "$description" --arg stage "$stage" --argjson deleted "$deleted" --argjson permissions "$permissions" '{name:$name,etag:$etag,description:$description,stage:$stage,deleted:$deleted,includedPermissions:$permissions}'
+}
+`
+			command := exec.Command("/bin/sh", "-c", helpers+fixture+"\nwait_custom_role fixture fixture-role p.two,p.one "+strconv.Itoa(scenario.deadline))
+			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name)
+			output, runErr := command.CombinedOutput()
+			code := 0
+			if runErr != nil {
+				var exited *exec.ExitError
+				if !errors.As(runErr, &exited) {
+					t.Fatal(runErr)
+				}
+				code = exited.ExitCode()
+			}
+			attempts, readErr := os.ReadFile(filepath.Join(dir, "attempts"))
+			if readErr != nil || code != scenario.want || strings.TrimSpace(string(attempts)) != strconv.Itoa(scenario.attempts) {
+				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, readErr)
+			}
+			timeouts, timeoutErr := os.ReadFile(filepath.Join(dir, "timeouts"))
+			if timeoutErr != nil {
+				t.Fatal(timeoutErr)
+			}
+			firstTimeout := strings.Split(strings.TrimSpace(string(timeouts)), "\n")[0]
+			wantTimeout := "420"
+			if scenario.name == "deadline" {
+				wantTimeout = "4"
+			}
+			if firstTimeout != wantTimeout {
+				t.Fatalf("bounded timeout=%s want=%s", firstTimeout, wantTimeout)
+			}
+			for attempt := 1; attempt <= scenario.attempts; attempt++ {
+				for _, suffix := range []string{"json", "stderr", "exit"} {
+					if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("fixture-readiness-%d.%s", attempt, suffix))); err != nil {
+						t.Fatalf("attempt evidence missing: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestQualificationCurlHelper(t *testing.T) {
 	if os.Getenv("RHIZA_CURL_HELPER") != "1" {
 		t.Skip("subprocess helper")
