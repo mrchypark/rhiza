@@ -141,6 +141,17 @@ wait_voters() (
     ' || exit 1
   [ "$(date +%s)" -lt "$voter_wait_deadline" ] || exit 124
 )
+validate_archive_head_metadata() {
+  jq -e --arg bucket rhiza-v070-chaos-ied-20260811 --arg name "${prefix}${cluster}/archive/head.bin" '
+    keys==["bucket","generation","name","size"] and .bucket==$bucket and .name==$name and
+    (.generation|type)=="string" and (.generation|test("^[1-9][0-9]*$")) and
+    (.size|type)=="string" and (.size|test("^(0|[1-9][0-9]*)$")) and
+    ((.size|tonumber)>=132) and ((.size|tonumber)<=8388632)
+  ' "$1" >/dev/null
+}
+same_archive_head_metadata() {
+  jq -e --slurpfile before "$1" '.generation==$before[0].generation and .size==$before[0].size' "$2" >/dev/null
+}
 private_file() {
   case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
   [ -f "$1" ] && [ ! -L "$1" ] || die 'regular non-symlink credential file required'
@@ -338,6 +349,26 @@ started=${RHIZA_JOB_STARTED:-$(date +%s)}
 watchdog=''
 stop_watchdog() {
   if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; watchdog=''; fi
+}
+stop_forward() {
+  forward_stop_pid=$1
+  kill -TERM "-$forward_stop_pid" 2>/dev/null || kill -TERM "$forward_stop_pid" 2>/dev/null || true
+  forward_stop_tries=0
+  while kill -0 "-$forward_stop_pid" 2>/dev/null; do
+    forward_stop_tries=$((forward_stop_tries + 1))
+    [ "$forward_stop_tries" -lt 5 ] || break
+    sleep 1
+  done
+  if kill -0 "-$forward_stop_pid" 2>/dev/null; then
+    kill -KILL "-$forward_stop_pid" 2>/dev/null || kill -KILL "$forward_stop_pid" 2>/dev/null || true
+    forward_stop_tries=0
+    while kill -0 "-$forward_stop_pid" 2>/dev/null; do
+      forward_stop_tries=$((forward_stop_tries + 1))
+      [ "$forward_stop_tries" -lt 5 ] || return 1
+      sleep 1
+    done
+  fi
+  wait "$forward_stop_pid" 2>/dev/null || true
 }
 pf_pids=''
 active_fault=''
@@ -542,6 +573,11 @@ cleanup() {
     if [ "$code" = 0 ] && [ "$proof_code" != 0 ]; then code=$proof_code; fi
   fi
   fi
+  forward_cleanup_code=0
+  for pid in $pf_pids; do stop_forward "$pid" || forward_cleanup_code=1; done
+  printf '%s\n' "$forward_cleanup_code" > "$out/port-forward-cleanup.exit"
+  [ "$forward_cleanup_code" = 0 ] || clean=false
+  if [ "$code" = 0 ] && [ "$forward_cleanup_code" != 0 ]; then code=$forward_cleanup_code; fi
   if [ "$owned_created" = false ]; then
     printf '%s\n' 'No owned runtime resources created; Root auth cleanup still pending.' > "$out/cleanup-status.txt"
   elif [ "$clean" = true ] && [ "$voters_attempted" = false ]; then
@@ -552,7 +588,6 @@ cleanup() {
     printf '%s\n' 'NOT CLEAN: bounded run-owned shutdown failed; Root must reconcile before storage/IAM cleanup.' > "$out/cleanup-status.txt"
     printf '%s\n' 'NOT CLEAN (see workload.exit for the preserved original result).' >> "$out/result.txt"
   fi
-  for pid in $pf_pids; do kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
   printf '%s\n' 'Managed-folder objects, soft-delete retention and namespace/IAM teardown remain Root-owned; no recursive cleanup here.' > "$out/cleanup-owner.txt"
   printf '%s\n' "$code" > "$out/root.exit"
   (cd "$out" && find . -type f ! -name SHA256SUMS -exec sha256sum {} \;) > "$out/SHA256SUMS"
@@ -629,18 +664,78 @@ run create-voters k create -f "$out/voters.yaml"
 run voters-ready wait_voters 180
 forward() {
   pod=$1; port=$2
+  case "$port" in
+    18080) old_pid=${pf_18080:-} ;;
+    18081) old_pid=${pf_18081:-} ;;
+    18082) old_pid=${pf_18082:-} ;;
+    18083) old_pid=${pf_18083:-} ;;
+    *) die 'unsupported port-forward port' ;;
+  esac
+  if [ -n "$old_pid" ]; then
+    stop_forward "$old_pid" || die 'old port-forward process group did not stop'
+    current_pids=''
+    for pid in $pf_pids; do [ "$pid" = "$old_pid" ] || current_pids="$current_pids $pid"; done
+    pf_pids=$current_pids
+  fi
+  pf_generation=$(( ${pf_generation:-0} + 1 ))
+  pf_before="$out/port-forward-$port-generation-$pf_generation-before.json"
+  host_digest=${RHIZA_HOST_IMAGE#*@}
+  k get pod "$pod" -o json | jq --argjson pid 0 --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" '
+    (.status.containerStatuses|length) as $status_count | (.spec.containers|length) as $spec_count |
+    [.status.containerStatuses[]?|select(.name=="rhiza")] as $status |
+    [.spec.containers[]?|select(.name=="rhiza")] as $spec |
+    {pid:$pid,pod:.metadata.name,uid:.metadata.uid,deleting:.metadata.deletionTimestamp,
+      ready:any(.status.conditions[]?;.type=="Ready" and .status=="True"),
+      container_id:$status[0].containerID,image:$spec[0].image,image_id:$status[0].imageID} |
+    select($status_count==1 and $spec_count==1 and
+      ($status|length)==1 and ($spec|length)==1 and .image==$image and (.image_id|endswith($digest)) and
+      (.uid|type)=="string" and (.uid|length)>0 and
+      .deleting==null and .ready==true and (.container_id|type)=="string" and (.container_id|length)>0 and
+      (.image|type)=="string" and (.image|length)>0 and (.image_id|type)=="string" and (.image_id|length)>0)
+  ' > "$pf_before" || die 'port-forward target identity invalid'
+  forward_deadline=$((started + 1200))
+  if [ "$mode" = run-local ] && [ "$local_deadline" -lt "$forward_deadline" ]; then forward_deadline=$local_deadline; fi
+  forward_seconds=$((forward_deadline - $(date +%s)))
+  [ "$forward_seconds" -gt 0 ] || exit 124
   if [ "$mode" = run-local ]; then
-    seconds=$(remaining) || exit 124
-    timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+    timeout --kill-after=5s "${forward_seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
       --context="$context" --namespace="$ns" --request-timeout=30s port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
   else
-    k port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+    timeout --kill-after=5s "${forward_seconds}s" kubectl --context="$context" --namespace="$ns" \
+      port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
   fi
-  pf_pids="$pf_pids $!"
+  forward_pid=$!
+  case "$port" in
+    18080) pf_18080=$forward_pid ;;
+    18081) pf_18081=$forward_pid ;;
+    18082) pf_18082=$forward_pid ;;
+    18083) pf_18083=$forward_pid ;;
+  esac
+  pf_pids="$pf_pids $forward_pid"
+  jq --argjson pid "$forward_pid" '.pid=$pid' "$pf_before" > "$pf_before.next"
+  mv "$pf_before.next" "$pf_before"
   tries=0
   until curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; do
+    kill -0 "$forward_pid" 2>/dev/null || die 'port-forward exited before readiness'
+    [ "$(date +%s)" -lt "$forward_deadline" ] || exit 124
     tries=$((tries + 1)); [ "$tries" -lt 30 ] || die 'port-forward timeout'; sleep 1
   done
+  kill -0 "$forward_pid" 2>/dev/null || die 'port-forward exited after readiness'
+  pf_after="$out/port-forward-$port-generation-$pf_generation-after.json"
+  k get pod "$pod" -o json | jq --argjson pid "$forward_pid" --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" '
+    (.status.containerStatuses|length) as $status_count | (.spec.containers|length) as $spec_count |
+    [.status.containerStatuses[]?|select(.name=="rhiza")] as $status |
+    [.spec.containers[]?|select(.name=="rhiza")] as $spec |
+    {pid:$pid,pod:.metadata.name,uid:.metadata.uid,deleting:.metadata.deletionTimestamp,
+      ready:any(.status.conditions[]?;.type=="Ready" and .status=="True"),
+      container_id:$status[0].containerID,image:$spec[0].image,image_id:$status[0].imageID} |
+    select($status_count==1 and $spec_count==1 and
+      ($status|length)==1 and ($spec|length)==1 and .image==$image and (.image_id|endswith($digest)) and
+      (.uid|type)=="string" and (.uid|length)>0 and
+      .deleting==null and .ready==true and (.container_id|type)=="string" and (.container_id|length)>0 and
+      (.image|type)=="string" and (.image|length)>0 and (.image_id|type)=="string" and (.image_id|length)>0)
+  ' > "$pf_after" || die 'port-forward target identity invalid after readiness'
+  jq -e --slurpfile before "$pf_before" '.==$before[0]' "$pf_after" >/dev/null || die 'port-forward target changed during startup'
 }
 forward rhiza-voter-0 18080
 forward rhiza-voter-1 18081
@@ -812,9 +907,9 @@ container_kill
 sleep 15
 run current k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/checkpoint/CURRENT"
 cp "$out/$seq-current.stdout" "$out/CURRENT.json"
-run head k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/archive/HEAD"
-cp "$out/$seq-head.stdout" "$out/HEAD.json"
-jq -e --slurpfile current "$out/CURRENT.json" 'def hex: "0123456789abcdef" as $h|map(. as $n|$h[($n/16|floor):($n/16|floor)+1]+$h[($n%16):($n%16)+1])|join(""); .base>0 and .base_seal!=null and .base_decision!=null and .base==$current[0].index and (.base_seal.root_hash|hex)==$current[0].root_hash' "$out/HEAD.json" >/dev/null || die 'certified cold checkpoint base absent'
+run head-metadata-before k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'
+cp "$out/$seq-head-metadata-before.stdout" "$out/archive-head-metadata-before.json"
+validate_archive_head_metadata "$out/archive-head-metadata-before.json" || die 'published archive head metadata invalid'
 run probe-create k create -f "$out/probe.yaml"
 run probe-ready k wait pod/rhiza-quic-probe --for=condition=Ready --timeout=120s
 run probe-identity k get pod rhiza-quic-probe -o json
@@ -874,6 +969,11 @@ while :; do
 done
 run learner-topology pod_snapshot
 jq -e 'any(.[];.name=="rhiza-learner" and (.volumes|length)==1 and .volumes[0].emptyDir!=null)' "$out/$seq-learner-topology.stdout" >/dev/null || die 'fresh learner volume proof missing'
+run head-metadata-after k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'
+cp "$out/$seq-head-metadata-after.stdout" "$out/archive-head-metadata-after.json"
+validate_archive_head_metadata "$out/archive-head-metadata-after.json" || die 'published archive head metadata changed to invalid'
+same_archive_head_metadata "$out/archive-head-metadata-before.json" "$out/archive-head-metadata-after.json" || \
+  die 'archive head generation or size changed during fresh learner proof'
 metrics
 printf '%s\n' 'Sampled UID/container high-water totals exclude unseen startup/kill/shutdown tails and metadata SDK calls; 10k attempts/384MiB are planned reserves, NOT hard billing guarantees. Root must reconcile actual object generations/transfer and cleanup.' > "$out/budget-limitations.txt"
 printf '%s\n' 'PASS selected GCS/process/network/fresh-learner layer; no whole-generation, promotion, fencing, IO/power-loss or published Rust package claim.' > "$out/result.txt"

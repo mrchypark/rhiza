@@ -196,6 +196,162 @@ func TestQualificationFixture(t *testing.T) {
 	}
 }
 
+func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	for _, forbidden := range []string{"archive/HEAD", "HEAD.json", "jq -e --slurpfile current"} {
+		if strings.Contains(source, forbidden) {
+			t.Fatalf("binary archive head regressed to JSON/uppercase lookup: %s", forbidden)
+		}
+	}
+	metadata := `gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'`
+	metadataAt, learnerAt := strings.Index(source, metadata), strings.Index(source, "run cold-create")
+	readbackAt, metadataAfterAt := strings.Index(source, "readback 18083 local"), strings.Index(source, "run head-metadata-after")
+	if metadataAt < 0 || learnerAt <= metadataAt || readbackAt <= learnerAt || metadataAfterAt <= readbackAt {
+		t.Fatal("head.bin metadata proof or required fresh-learner semantic proof missing")
+	}
+	validationStart := strings.Index(source, "\nvalidate_archive_head_metadata() {\n")
+	validationEnd := strings.Index(source, "\nprivate_file() {\n")
+	if validationStart < 0 || validationEnd <= validationStart {
+		t.Fatal("archive head metadata validators missing")
+	}
+	validators := source[validationStart:validationEnd]
+	metadataDir := t.TempDir()
+	valid := `{"bucket":"rhiza-v070-chaos-ied-20260811","generation":"1","name":"prefix/cluster/archive/head.bin","size":"132"}`
+	metadataCases := []struct {
+		name, value string
+		valid       bool
+	}{
+		{"valid", valid, true},
+		{"wrong-bucket", strings.Replace(valid, "rhiza-v070-chaos-ied-20260811", "other", 1), false},
+		{"wrong-name", strings.Replace(valid, "prefix/cluster/archive/head.bin", "prefix/cluster/archive/HEAD", 1), false},
+		{"numeric-generation", strings.Replace(valid, `"generation":"1"`, `"generation":1`, 1), false},
+		{"leading-zero-generation", strings.Replace(valid, `"generation":"1"`, `"generation":"01"`, 1), false},
+		{"numeric-size", strings.Replace(valid, `"size":"132"`, `"size":132`, 1), false},
+		{"leading-zero-size", strings.Replace(valid, `"size":"132"`, `"size":"0132"`, 1), false},
+		{"small", strings.Replace(valid, `"size":"132"`, `"size":"131"`, 1), false},
+		{"large", strings.Replace(valid, `"size":"132"`, `"size":"8388633"`, 1), false},
+		{"extra-field", strings.TrimSuffix(valid, "}") + `,"etag":"secret"}`, false},
+	}
+	for _, tc := range metadataCases {
+		t.Run("metadata-"+tc.name, func(t *testing.T) {
+			path := filepath.Join(metadataDir, tc.name+".json")
+			if err := os.WriteFile(path, []byte(tc.value), 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "-c", "prefix=prefix/; cluster=cluster; "+validators+"\nvalidate_archive_head_metadata \"$1\"", "fixture", path)
+			err := command.Run()
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%t error=%v", tc.valid, err)
+			}
+		})
+	}
+	before, after := filepath.Join(metadataDir, "before.json"), filepath.Join(metadataDir, "after.json")
+	if err := os.WriteFile(before, []byte(valid), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, value string
+		valid       bool
+	}{{"same", valid, true}, {"generation-change", strings.Replace(valid, `"generation":"1"`, `"generation":"2"`, 1), false}, {"size-change", strings.Replace(valid, `"size":"132"`, `"size":"133"`, 1), false}} {
+		if err := os.WriteFile(after, []byte(tc.value), 0600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("/bin/sh", "-c", validators+"\nsame_archive_head_metadata \"$1\" \"$2\"", "fixture", before, after)
+		if err := command.Run(); (err == nil) != tc.valid {
+			t.Fatalf("metadata comparison %s valid=%t error=%v", tc.name, tc.valid, err)
+		}
+	}
+
+	stopStart := strings.Index(source, "\nstop_forward() {\n")
+	stopEnd := strings.Index(source, "\npf_pids=''\n")
+	start := strings.Index(source, "\nforward() {\n")
+	end := strings.Index(source[start+1:], "\nforward rhiza-voter-0")
+	if stopStart < 0 || stopEnd <= stopStart || start < 0 || end < 0 {
+		t.Fatal("port-forward helper missing")
+	}
+	functions := source[stopStart:stopEnd] + source[start:start+1+end]
+	for _, scenario := range []struct {
+		name string
+		want int
+	}{{"complete", 0}, {"uid-change", 1}, {"container-change", 1}, {"image-change", 1}, {"wrong-stable-image", 1}, {"extra-sidecar", 1}, {"forward-death", 1}, {"bind-conflict", 1}, {"stubborn-child", 0}} {
+		t.Run("forward-"+scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0700); err != nil {
+				t.Fatal(err)
+			}
+			write := func(name, content string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(content), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write("curl", "#!/bin/sh\n[ -f \"$FAKE_DIR/listening\" ]\n")
+			write("kubectl", `#!/bin/sh
+case "$*" in *" port-forward pod/rhiza-voter-0 "*) ;; *) exit 97 ;; esac
+[ "$FAKE_SCENARIO" != forward-death ] || exit 53
+if [ -e "$FAKE_DIR/listening" ]; then
+  owner=$(cat "$FAKE_DIR/listening")
+  if [ "$owner" = forced ] || kill -0 "$owner" 2>/dev/null; then touch "$FAKE_DIR/address-in-use"; exit 98; fi
+  rm -f "$FAKE_DIR/listening"
+fi
+printf '%s\n' "$$" > "$FAKE_DIR/listening"; printf 'start\n' >> "$FAKE_DIR/events"
+trap '[ "$FAKE_SCENARIO" = stubborn-child ] || { rm -f "$FAKE_DIR/listening"; printf "reaped\n" >> "$FAKE_DIR/events"; exit 0; }' TERM INT
+while :; do sleep 1; done
+`)
+			fixture := `
+set -eu
+mode=run; out=$FAKE_DIR; pf_pids=''; context=synthetic; ns=synthetic; started=$(date +%s); pf_generation=0
+RHIZA_HOST_IMAGE=ghcr.io/mrchypark/rhiza-sql@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+die() { printf '%s\n' "$*" >&2; exit 1; }
+k() {
+  [ "$1" = get ] || return 97
+  count=0; [ ! -f "$FAKE_DIR/gets" ] || count=$(cat "$FAKE_DIR/gets"); count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_DIR/gets"
+  uid=uid-a; container=container-a; image=$RHIZA_HOST_IMAGE; spec_extra=''; status_extra=''
+  [ "$FAKE_SCENARIO" != wrong-stable-image ] || image=ghcr.io/mrchypark/rhiza-sql@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  if [ "$FAKE_SCENARIO" = extra-sidecar ]; then spec_extra=',{"name":"sidecar","image":"sidecar"}'; status_extra=',{"name":"sidecar","containerID":"sidecar","imageID":"sidecar"}'; fi
+  [ "$count" = 1 ] || case "$FAKE_SCENARIO" in uid-change) uid=uid-b;; container-change) container=container-b;; image-change) image=image-b;; esac
+  printf '{"metadata":{"name":"rhiza-voter-0","uid":"%s"},"spec":{"containers":[{"name":"rhiza","image":"%s"}%s]},"status":{"conditions":[{"type":"Ready","status":"True"}],"containerStatuses":[{"name":"rhiza","containerID":"%s","imageID":"host@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}%s]}}\n' "$uid" "$image" "$spec_extra" "$container" "$status_extra"
+}
+` + functions + `
+trap 'for pid in $pf_pids; do stop_forward "$pid" || true; done' EXIT
+[ "$FAKE_SCENARIO" != bind-conflict ] || printf 'forced\n' > "$FAKE_DIR/listening"
+forward rhiza-voter-0 18080
+first=$pf_18080
+[ "$FAKE_SCENARIO" != complete ] && [ "$FAKE_SCENARIO" != stubborn-child ] && exit 0
+forward rhiza-voter-0 18080
+second=$pf_18080
+[ "$first" != "$second" ]
+! kill -0 "$first" 2>/dev/null
+[ "$(printf '%s\n' $pf_pids | wc -l | tr -d ' ')" = 1 ]
+stop_forward "$second"
+[ "$(grep -c '^start$' "$FAKE_DIR/events")" = 2 ]
+[ ! -e "$FAKE_DIR/address-in-use" ]
+`
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture)
+			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name)
+			output, err := command.CombinedOutput()
+			code := 0
+			if err != nil {
+				var exited *exec.ExitError
+				if !errors.As(err, &exited) || ctx.Err() != nil {
+					t.Fatalf("fixture did not terminate: %v output=%s", err, output)
+				}
+				code = exited.ExitCode()
+			}
+			if (code == 0) != (scenario.want == 0) {
+				t.Fatalf("exit=%d want=%d output=%s", code, scenario.want, output)
+			}
+		})
+	}
+}
+
 // Exercise the actual shell entry with synthetic files and a non-networking
 // kubectl. No token is minted, no application opens, and no cloud call is made.
 func TestQualificationLocalRuntime(t *testing.T) {
@@ -1336,7 +1492,9 @@ func TestQualificationMetadataOnlyCleanup(t *testing.T) {
 	end := strings.Index(string(source), "\ntrap cleanup EXIT\n")
 	captureStart := strings.Index(string(source), "\ncapture_shutdown() {\n")
 	captureEnd := strings.Index(string(source), "\nfinish_shutdown_capture() {\n")
-	if start < 0 || end <= start || captureStart < 0 || captureEnd <= captureStart {
+	stopStart := strings.Index(string(source), "\nstop_forward() {\n")
+	stopEnd := strings.Index(string(source), "\npf_pids=''\n")
+	if start < 0 || end <= start || captureStart < 0 || captureEnd <= captureStart || stopStart < 0 || stopEnd <= stopStart {
 		t.Fatal("actual cleanup functions missing")
 	}
 	if !strings.Contains(string(source), "voters_attempted=false\n") || !strings.Contains(string(source), "voters_attempted=true\nrun create-voters") ||
@@ -1482,7 +1640,7 @@ k() {
 `
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[captureStart:captureEnd])+string(source[start:end])+"\n(exit 53); cleanup")
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[stopStart:stopEnd])+string(source[captureStart:captureEnd])+string(source[start:end])+"\n(exit 53); cleanup")
 			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_OUT="+out, "FAKE_SCENARIO="+scenario, "FAKE_NATIVE_CHECKSUM="+nativeChecksum)
 			output, runErr := command.CombinedOutput()
 			var exited *exec.ExitError
