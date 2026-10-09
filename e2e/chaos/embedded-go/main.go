@@ -20,7 +20,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mrchypark/rhiza"
@@ -89,22 +92,40 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	db, err := rhiza.Open(context.Background(), config)
-	if err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if err := runApplication(ctx, config); err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+}
+
+func runApplication(ctx context.Context, config rhiza.Config) (result error) {
+	db, err := rhiza.Open(context.Background(), config)
+	if err != nil {
+		return err
+	}
+	var servers []*http.Server
+	identity := shutdownIdentity{Namespace: os.Getenv("RHIZA_NAMESPACE"), Run: os.Getenv("RHIZA_QUALIFICATION_RUN_ID"),
+		PodUID: os.Getenv("RHIZA_POD_UID"), NodeID: string(config.NodeID)}
+	defer func() {
+		result = shutdownHost(servers, db.Close, identity, os.Stdout, result, 10*time.Second, 45*time.Second)
+	}()
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	identity.Process = hex.EncodeToString(nonce[:])
 
 	anchorID := os.Getenv("RHIZA_RECOVERY_ANCHOR_ID")
 	var guard *anchorGuard
 	if anchorID != "" {
 		ns := os.Getenv("RHIZA_NAMESPACE")
 		if ns == "" {
-			log.Fatal("RHIZA_NAMESPACE required with RHIZA_RECOVERY_ANCHOR_ID")
+			return errors.New("RHIZA_NAMESPACE required with RHIZA_RECOVERY_ANCHOR_ID")
 		}
 		kube, err := operator.NewInCluster(ns)
 		if err != nil {
-			log.Fatalf("kubernetes client: %v", err)
+			return fmt.Errorf("kubernetes client: %w", err)
 		}
 		backend := &operator.KubernetesAnchorBackend{Kube: kube}
 		guard = newAnchorGuard(backend, anchorID, config.ClusterID)
@@ -112,7 +133,6 @@ func main() {
 	}
 
 	management := &http.Server{Addr: config.BindAddr, Handler: db.OperatorHandler(), ReadHeaderTimeout: 5 * time.Second}
-	go func() { log.Fatal(management.ListenAndServe()) }()
 
 	app := http.NewServeMux()
 	// Test-harness telemetry only; never expose Config or credentials.
@@ -169,7 +189,107 @@ func main() {
 		respond(w, result, err)
 	})
 	server := &http.Server{Addr: ":8080", Handler: app, ReadHeaderTimeout: 5 * time.Second}
-	log.Fatal(server.ListenAndServe())
+	servers = []*http.Server{server, management}
+	return serveHost(ctx, servers, identity, os.Stdout)
+}
+
+// These markers prove this owned process completed HTTP/DB Close, not that an
+// earlier canceled/ambiguous provider request cannot still commit remotely.
+type shutdownIdentity struct {
+	Namespace string `json:"namespace"`
+	Run       string `json:"run"`
+	PodUID    string `json:"pod_uid"`
+	NodeID    string `json:"node_id"`
+	Process   string `json:"process"`
+}
+
+func hostMarker(out io.Writer, event string, identity shutdownIdentity, httpDrained, dbClosed bool) error {
+	return json.NewEncoder(out).Encode(struct {
+		Event string `json:"event"`
+		shutdownIdentity
+		HTTPDrained bool `json:"http_drained"`
+		DBClosed    bool `json:"db_closed"`
+	}{event, identity, httpDrained, dbClosed})
+}
+
+func serveHost(ctx context.Context, servers []*http.Server, identity shutdownIdentity, out io.Writer) error {
+	listeners := make([]net.Listener, 0, len(servers))
+	for _, server := range servers {
+		listener, err := net.Listen("tcp", server.Addr)
+		if err != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			return fmt.Errorf("listen: %w", err)
+		}
+		listeners = append(listeners, listener)
+	}
+	errorsFromServe := make(chan error, len(servers))
+	var serving sync.WaitGroup
+	for i, server := range servers {
+		serving.Add(1)
+		go func() {
+			defer serving.Done()
+			errorsFromServe <- server.Serve(listeners[i])
+		}()
+	}
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+		serving.Wait()
+	}()
+	if err := hostMarker(out, "qualification-host-start", identity, false, false); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errorsFromServe:
+		return fmt.Errorf("HTTP server stopped before shutdown: %w", err)
+	}
+}
+
+func closeDatabase(closeDB func() error, limit time.Duration) error {
+	done := make(chan error, 1)
+	go func() { done <- closeDB() }()
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return errors.New("owned database Close timed out; outcome unresolved")
+	}
+}
+
+func shutdownHost(servers []*http.Server, closeDB func() error, identity shutdownIdentity, out io.Writer, cause error, drainLimit, closeLimit time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), drainLimit)
+	defer cancel()
+	drained := make(chan error, len(servers))
+	for _, server := range servers {
+		go func() { drained <- server.Shutdown(ctx) }()
+	}
+	var drainErr error
+	for range servers {
+		drainErr = errors.Join(drainErr, <-drained)
+	}
+	if drainErr != nil {
+		for _, server := range servers {
+			_ = server.Close()
+		}
+		// Shutdown timeout does not join handlers. Never race DB.Close against
+		// such a handler or emit an owned-close success marker.
+		markerErr := hostMarker(out, "qualification-host-shutdown-failed", identity, false, false)
+		return errors.Join(cause, fmt.Errorf("HTTP drain failed: %w", drainErr), markerErr)
+	}
+	closeErr := closeDatabase(closeDB, closeLimit)
+	event := "qualification-host-shutdown-complete"
+	if cause != nil || closeErr != nil {
+		event = "qualification-host-shutdown-failed"
+	}
+	markerErr := hostMarker(out, event, identity, true, closeErr == nil)
+	return errors.Join(cause, closeErr, markerErr)
 }
 
 // Same TLS13/ALPN/public-key pin as network.Transport. No client credential,
@@ -197,7 +317,7 @@ func probeQUICHandshake(ctx context.Context, address, nodeID string, expected rh
 
 // qualificationFixture is test-host-only: no node opens and no remote calls.
 func qualificationFixture(namespace, run, owner string, entropy io.Reader) (map[string]any, error) {
-	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) || namespace != "rhiza-v0190-20261008-"+run ||
+	if !regexp.MustCompile(`^[a-f0-9]{8}$`).MatchString(run) || namespace != "rhiza-v0191-20261008-"+run ||
 		!regexp.MustCompile(`^rhiza-postrelease-`+run+`-[a-f0-9]{40}$`).MatchString(owner) {
 		return nil, errors.New("invalid fixture identity")
 	}

@@ -99,8 +99,13 @@ func TestMigrationAdmissionIsSingleUseDuringConcurrentSubmission(t *testing.T) {
 	if _, err := server.MigrateAdmitted(context.Background(), req, admission); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("completed reservation reuse error=%v", err)
 	}
-	if got := server.admittedMutationCount(); got != 0 {
-		t.Fatalf("completed reservation leaked: count=%d", got)
+	// The result precedes worker lease release; join before checking cleanup.
+	server.sqlBatcher.Close()
+	server.mutationMu.Lock()
+	count, bytes := server.mutationAdmission.count, server.mutationAdmission.bytes
+	server.mutationMu.Unlock()
+	if count != 0 || bytes != 0 {
+		t.Fatalf("completed reservation leaked: count=%d bytes=%d", count, bytes)
 	}
 }
 

@@ -1,8 +1,12 @@
 #!/bin/sh
 # Exact release engine + reviewed test-host overlay. Never a generation fencer.
 set -eu
+# Never trace credential references or rejected kubeconfig contents.
+set +x
 umask 077
-release=abb87a0336cba8fee3fd1d9e5a0bf797de5b25b8
+mode=${1:-}
+case "$mode" in render|run|run-local|check-shutdown) ;; *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;; esac
+release=d575e686d2ec349c07de70679f5c6b22c1718e17
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
 safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
@@ -11,7 +15,7 @@ safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
 : "${RHIZA_AUTH_CREATION_SHA:?}"
 printf '%s' "$RHIZA_AUTH_CREATION_SHA" | LC_ALL=C grep -Eq '^[a-f0-9]{40}$' || die 'exact auth creation SHA required'
 safe_name "$RHIZA_RUN_ID" || die 'unsafe run id'
-[ "$RHIZA_NAMESPACE" = "rhiza-v0190-20261008-$RHIZA_RUN_ID" ] || die 'namespace mismatch'
+[ "$RHIZA_NAMESPACE" = "rhiza-v0191-20261008-$RHIZA_RUN_ID" ] || die 'namespace mismatch'
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
   printf '%s' "$node" | LC_ALL=C grep -Eq '^gke-ied-cluster-[a-z0-9-]+$' || die 'existing-node pin required'
 done
@@ -22,10 +26,75 @@ printf '%s' "$RHIZA_METADATA_IMAGE" | grep -Eq '^gcr.io/google.com/cloudsdktool/
 mkdir -p "$RHIZA_OUTPUT"
 out=$(CDPATH='' cd -- "$RHIZA_OUTPUT" && pwd -P)
 ns=$RHIZA_NAMESPACE
-prefix="postrelease/v0.19.0/$RHIZA_RUN_ID/"
+prefix="postrelease/v0.19.1/$RHIZA_RUN_ID/"
 cluster="gcs-$RHIZA_RUN_ID"
 context=gke_patch2-the-new-era_asia-northeast3_ied-cluster
-k() { kubectl --context="$context" --namespace="$ns" "$@"; }
+remaining() {
+  seconds=$((local_deadline - $(date +%s)))
+  [ "$seconds" -gt 0 ] || return 124
+  printf '%s\n' "$seconds"
+}
+k() {
+  if [ -n "${voter_wait_deadline:-}" ]; then
+    k_deadline_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$k_deadline_seconds" -gt 0 ] || return 124
+  fi
+  if [ "$mode" = run-local ]; then
+    seconds=$(remaining) || return 124
+    limit=240
+    case "$1" in logs) limit=10 ;; get|auth|scale) limit=30 ;; exec) limit=60 ;; esac
+    [ "$seconds" -le "$limit" ] || seconds=$limit
+    if [ -n "${voter_wait_deadline:-}" ] && [ "$seconds" -gt "$k_deadline_seconds" ]; then seconds=$k_deadline_seconds; fi
+    timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=30s "$@"
+  else
+    if [ -n "${voter_wait_deadline:-}" ]; then
+      timeout --kill-after=5s "${k_deadline_seconds}s" kubectl --context="$context" --namespace="$ns" "$@"
+    else
+      kubectl --context="$context" --namespace="$ns" "$@"
+    fi
+  fi
+}
+wait_voters() (
+  # One deadline covers creation, Ready and identity checks for all three Pods.
+  # Subshell scope prevents this deadline from constraining later cleanup.
+  voter_wait_deadline=$(( $(date +%s) + $1 ))
+  for voter_wait_index in 0 1 2; do
+    voter_wait_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$voter_wait_seconds" -gt 0 ] || exit 124
+    k wait "pod/rhiza-voter-$voter_wait_index" --for=create --timeout="${voter_wait_seconds}s" || exit $?
+  done
+  voter_wait_before=$(k get pods rhiza-voter-0 rhiza-voter-1 rhiza-voter-2 -o json) || exit $?
+  for voter_wait_index in 0 1 2; do
+    voter_wait_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$voter_wait_seconds" -gt 0 ] || exit 124
+    k wait "pod/rhiza-voter-$voter_wait_index" --for=condition=Ready --timeout="${voter_wait_seconds}s" || exit $?
+  done
+  voter_wait_after=$(k get pods rhiza-voter-0 rhiza-voter-1 rhiza-voter-2 -o json) || exit $?
+  jq -n -e --argjson before "$voter_wait_before" --argjson after "$voter_wait_after" '
+      ($after.items|sort_by(.metadata.name)) as $pods |
+      ($pods|map(.metadata.name))==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] and
+      ($pods|map({name:.metadata.name,uid:.metadata.uid}))==($before.items|map({name:.metadata.name,uid:.metadata.uid})|sort_by(.name)) and
+      ($pods|map(.metadata.uid)|unique|length)==3 and
+      all($pods[]; (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+        .metadata.deletionTimestamp==null and any(.status.conditions[]?; .type=="Ready" and .status=="True"))
+    ' || exit 1
+  [ "$(date +%s)" -lt "$voter_wait_deadline" ] || exit 124
+)
+private_file() {
+  case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
+  [ -f "$1" ] && [ ! -L "$1" ] || die 'regular non-symlink credential file required'
+  parent=$(dirname -- "$1")
+  [ ! -L "$parent" ] || die 'credential directory must not be a symlink'
+  if [ "$(uname -s)" = Darwin ]; then
+    permissions=$(stat -f '%Lp' "$1"); file_owner=$(stat -f '%u' "$1")
+    directory_permissions=$(stat -f '%Lp' "$parent")
+  else
+    permissions=$(stat -c '%a' "$1"); file_owner=$(stat -c '%u' "$1")
+    directory_permissions=$(stat -c '%a' "$parent")
+  fi
+  [ "$permissions" = 600 ] && [ "$file_owner" = "$(id -u)" ] && [ "$directory_permissions" = 700 ] || die 'private credential ownership/permissions required'
+}
 sed -e "s|__NAMESPACE__|$ns|g" -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
   -e "s|__CLUSTER_ID__|$cluster|g" -e "s|__HOST_IMAGE__|$RHIZA_HOST_IMAGE|g" \
   -e "s|__METADATA_IMAGE__|$RHIZA_METADATA_IMAGE|g" \
@@ -38,10 +107,150 @@ awk 'BEGIN{RS="---\n"} /name: rhiza-metadata/{print}' "$out/initial.yaml" > "$ou
 awk 'BEGIN{RS="---\n"} !/name: rhiza-metadata/ && !/name: rhiza-quic-probe/ && !/kind: NetworkPolicy/{print $0 "---"}' "$out/initial.yaml" > "$out/voters.yaml"
 awk 'BEGIN{RS="---\n"} /name: rhiza-quic-probe/{print}' "$out/initial.yaml" > "$out/probe.yaml"
 awk 'BEGIN{RS="---\n"} /kind: NetworkPolicy/{print}' "$out/initial.yaml" > "$out/cold-policy.yaml"
-if [ "${1:-}" = render ]; then exit 0; fi
-[ "${1:-}" = run ] || die 'usage: run-gcs-postrelease.sh render|run'
-[ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
-[ "${RHIZA_EXECUTION_GO:-}" = "$GITHUB_SHA:$RHIZA_RUN_ID" ] || die 'exact harness/run GO required'
+shutdown_events() {
+  jq -s -e --slurpfile before "$1/shutdown-before.json" '
+    . as $events |
+    if any($events[]; .type=="ERROR") then error("watch ERROR event")
+    elif any($before[0][]; . as $pod | any($events[];
+      .object.metadata.name==$pod.name and (.object.metadata.uid!=$pod.uid or
+        any(.object.status.containerStatuses[]?; .name=="rhiza" and
+          (.containerID!=$pod.container_id or .imageID!=$pod.image_id or .restartCount!=$pod.restart_count or
+            (.state.terminated!=null and (.state.terminated.exitCode!=0 or (.state.terminated.signal // 0)!=0)))))))
+      then error("watch writer incarnation/termination changed")
+    elif all($before[0][]; . as $pod | any($events[]; .object.metadata.uid==$pod.uid and
+      any(.object.status.containerStatuses[]?; .name=="rhiza" and .containerID==$pod.container_id and
+        .imageID==$pod.image_id and .restartCount==$pod.restart_count and
+        .state.terminated.exitCode==0 and (.state.terminated.signal // 0)==0)))
+      then $events else empty end
+  ' "$1/shutdown-watch.json"
+}
+wait_shutdown_watch() {
+  # Partial JSON while this stream is still writing is pending, never proof.
+  # Preserve the first parser error; EOF/error/deadline without full events fails.
+  watch_finished=false
+  while :; do
+    shutdown_events "$1" > "$1/shutdown-watch-proof.next.json" 2> "$1/shutdown-watch-parse.stderr"
+    watch_parse_code=$?
+    if [ -s "$1/shutdown-watch-parse.stderr" ] && [ ! -e "$1/shutdown-watch-first-parse.stderr" ]; then
+      cp "$1/shutdown-watch-parse.stderr" "$1/shutdown-watch-first-parse.stderr"
+      printf '%s\n' "$watch_parse_code" > "$1/shutdown-watch-first-parse.exit"
+    fi
+    if [ "$watch_parse_code" = 0 ]; then
+      mv "$1/shutdown-watch-proof.next.json" "$1/shutdown-watch-proof.json"
+      return 0
+    fi
+    case "$watch_parse_code" in
+      4) ;; # Complete JSON, terminal events not yet present.
+      5) grep -q '^jq: parse error:' "$1/shutdown-watch-parse.stderr" || return 1 ;;
+      *) return 1 ;;
+    esac
+    [ ! -s "$1/shutdown-watch.stderr" ] || return 1
+    [ "$watch_finished" = false ] || return 1
+    [ "$(date +%s)" -lt "$3" ] || return 124
+    # A stream can finish between parsing and observing EOF. Re-read ONCE at
+    # EOF so complete final bytes are not discarded; invalid bytes still fail.
+    if [ -n "$2" ]; then
+      if ! kill -0 "$2" 2>/dev/null; then watch_finished=true; continue; fi
+    elif [ -e "$1/shutdown-watch.exit" ]; then watch_finished=true; continue; fi
+    sleep 1
+  done
+}
+verify_shutdown() {
+  proof_dir=$1
+  case "$(cat "$proof_dir/shutdown-watch.exit")" in 0|143) ;; *) return 1 ;; esac
+  jq -e '.items|length==0' "$proof_dir/shutdown-writers-after.json" >/dev/null || return 1
+  jq -e '.spec.replicas==0 and (.status.replicas // 0)==0' "$proof_dir/shutdown-controller.json" >/dev/null || return 1
+  jq -e --slurpfile expected "$proof_dir/shutdown-expected.json" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg image "$RHIZA_HOST_IMAGE" '
+    ($expected[0]|sort_by(.name)) as $expected |
+    ($expected|map(.name)) as $names |
+    ($names==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] or
+      $names==["rhiza-learner","rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"]) and
+    all($expected[]; .namespace==$ns and .run==$run and (.uid|type)=="string" and (.uid|length)>0) and
+    (map({name,namespace,run,uid})|sort_by(.name))==$expected and
+    type=="array" and all(.[]; .namespace==$ns and .run==$run and
+      (.uid|type)=="string" and (.uid|length)>0 and (.container_id|type)=="string" and (.container_id|length)>0 and
+      .image==$image and (.image_id|endswith($image|split("@")[1])) and
+      (.name|test("^rhiza-voter-[012]$|^rhiza-learner$")) and .restart_count>=0) and
+    ([.[].uid]|unique|length)==length
+  ' "$proof_dir/shutdown-before.json" >/dev/null || return 1
+  # Use the complete parsed stream captured before intentionally stopping it.
+  [ -s "$proof_dir/shutdown-watch-proof.json" ] || return 1
+  for proof_pod in $(jq -r '.[].name' "$proof_dir/shutdown-before.json"); do
+    [ "$(cat "$proof_dir/$proof_pod-shutdown-log.exit")" = 0 ] || return 1
+    jq -R -s -e --arg name "$proof_pod" --slurpfile before "$proof_dir/shutdown-before.json" '
+      ($before[0][]|select(.name==$name)) as $pod |
+      [split("\n")[]|fromjson?|select(.namespace==$pod.namespace and .run==$pod.run and
+        .pod_uid==$pod.uid and .node_id==$pod.name)] as $markers |
+      [$markers[]|select(.event=="qualification-host-start" and (.process|test("^[a-f0-9]{32}$")))] as $starts |
+      ($starts|length)==1 and
+      ([$markers[]|select(.event=="qualification-host-shutdown-failed")]|length)==0 and
+      ([$markers[]|select(.event=="qualification-host-shutdown-complete" and .process==$starts[0].process and
+        .http_drained==true and .db_closed==true)]|length)==1
+    ' "$proof_dir/$proof_pod-shutdown.log" >/dev/null || return 1
+  done
+}
+if [ "$mode" = check-shutdown ]; then
+  : "${RHIZA_SHUTDOWN_FIXTURE:?offline proof directory required}"
+  if [ "${RHIZA_SHUTDOWN_WAIT:-}" = yes ]; then
+    set +e
+    wait_shutdown_watch "$RHIZA_SHUTDOWN_FIXTURE" '' "$(( $(date +%s) + 5 ))"
+    wait_code=$?
+    [ "$wait_code" = 0 ] || exit "$wait_code"
+  else
+    shutdown_events "$RHIZA_SHUTDOWN_FIXTURE" > "$RHIZA_SHUTDOWN_FIXTURE/shutdown-watch-proof.json"
+  fi
+  verify_shutdown "$RHIZA_SHUTDOWN_FIXTURE"
+  exit $?
+fi
+if [ "$mode" = render ]; then exit 0; fi
+if [ "$mode" = run ]; then
+  [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
+  [ "${RHIZA_EXECUTION_GO:-}" = "$GITHUB_SHA:$RHIZA_RUN_ID" ] || die 'exact harness/run GO required'
+else
+  [ -z "${GITHUB_ACTIONS:-}${GITHUB_EVENT_NAME:-}${GITHUB_REF:-}${GITHUB_SHA:-}" ] || die 'local entry must not impersonate CI'
+  : "${RHIZA_HARNESS_SHA:?}" "${RHIZA_LOCAL_RUNTIME_KUBECONFIG:?}"
+  : "${RHIZA_LOCAL_API_SERVER:?}" "${RHIZA_LOCAL_CA_DATA:?}"
+  : "${RHIZA_AUTH_STARTED_EPOCH:?}" "${RHIZA_AUTH_EXPIRES:?}" "${RHIZA_LOCAL_TOKEN_EXPIRES:?}"
+  printf '%s' "$RHIZA_HARNESS_SHA" | grep -Eq '^[a-f0-9]{40}$' || die 'exact local harness SHA required'
+  [ "$(git -C "$script_dir/../.." rev-parse HEAD)" = "$RHIZA_HARNESS_SHA" ] || die 'local harness HEAD mismatch'
+  [ "${RHIZA_EXECUTION_GO:-}" = "$RHIZA_HARNESS_SHA:$RHIZA_RUN_ID" ] || die 'exact local harness/run GO required'
+  command -v timeout >/dev/null || die 'native GNU timeout required'
+  timeout --version | grep -Fq 'GNU coreutils' || die 'native GNU timeout required'
+  private_file "$RHIZA_LOCAL_RUNTIME_KUBECONFIG"
+  # Native parsing stays in memory, never artifacts/logs. A rejected config may
+  # contain credentials, so suppress parser diagnostics and disclose only cause.
+  if config=$(timeout --kill-after=5s 5s kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+    --context="$context" --namespace="$ns" config view --raw -o json 2>/dev/null); then
+    :
+  else
+    parser_exit=$?
+    die "local kubeconfig parsing failed (exit $parser_exit)"
+  fi
+  printf '%s' "$config" | jq -e --arg context "$context" --arg ns "$ns" \
+    --arg server "$RHIZA_LOCAL_API_SERVER" --arg ca "$RHIZA_LOCAL_CA_DATA" '
+    .kind=="Config" and .apiVersion=="v1" and .["current-context"]==$context and
+    (.contexts|length)==1 and (.clusters|length)==1 and (.users|length)==1 and
+    .contexts[0].name==$context and .contexts[0].context.namespace==$ns and
+    (.contexts[0].context|keys)==["cluster","namespace","user"] and
+    .contexts[0].context.cluster==.clusters[0].name and .contexts[0].context.user==.users[0].name and
+    (.clusters[0].cluster|keys)==["certificate-authority-data","server"] and
+    (.clusters[0].cluster.server==$server and ($server|startswith("https://"))) and
+    .clusters[0].cluster["certificate-authority-data"]==$ca and ($ca|length)>0 and
+    (.users[0].user|keys)==["tokenFile"] and (.users[0].user.tokenFile|type)=="string"
+  ' >/dev/null || die 'local kubeconfig must be one pinned tokenFile-only identity'
+  token_file=$(printf '%s' "$config" | jq -r '.users[0].user.tokenFile')
+  unset config
+  private_file "$token_file"
+  [ -s "$token_file" ] || die 'local token file is empty'
+  printf '%s' "$RHIZA_AUTH_STARTED_EPOCH" | grep -Eq '^[1-9][0-9]{0,11}$' || die 'fixed auth start required'
+  auth_expiry=$(jq -ner --arg value "$RHIZA_AUTH_EXPIRES" '$value|fromdateiso8601') || die 'fixed auth expiry required'
+  token_expiry=$(jq -ner --arg value "$RHIZA_LOCAL_TOKEN_EXPIRES" '$value|fromdateiso8601') || die 'actual token expiry required'
+  now=$(date +%s)
+  [ "$((auth_expiry - RHIZA_AUTH_STARTED_EPOCH))" -eq 3300 ] && \
+    [ "$now" -ge "$RHIZA_AUTH_STARTED_EPOCH" ] && [ "$((now - RHIZA_AUTH_STARTED_EPOCH))" -le 900 ] && \
+    [ "$token_expiry" -le "$auth_expiry" ] && [ "$((token_expiry - now))" -ge 2400 ] || die 'fixed 55-minute scope/preparation/runtime/cleanup reserve invalid'
+  local_deadline=$((now + 1200))
+fi
 [ "${RHIZA_APPLICATION_SHA:-}" = "$release" ] || die 'application release mismatch'
 : "${RHIZA_APPROVED_CAP_KRW:?}" "${RHIZA_BOOTSTRAP_UID:?}"
 [ "$RHIZA_APPROVED_CAP_KRW" = 10000 ] || die 'this run requires the approved 10000 KRW cap'
@@ -49,19 +258,126 @@ seq=0
 run() {
   seq=$((seq + 1)); label=$1; shift
   set +e
-  "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"
-  code=$?
+  if [ "$mode" = run-local ] && [ "$1" = curl ]; then
+    seconds=$(remaining)
+    code=$?
+    if [ "$code" = 0 ]; then timeout --kill-after=5s "${seconds}s" "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"; code=$?; fi
+  else
+    "$@" > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"
+    code=$?
+  fi
   set -e
   printf '%s\n' "$code" > "$out/$seq-$label.exit"
-  [ "$code" = 0 ] || die "first failure: $label exit $code"
+  if [ "$code" != 0 ]; then
+    if [ "$mode" = run-local ]; then printf 'first failure: %s exit %s\n' "$label" "$code" >&2; exit "$code"; fi
+    die "first failure: $label exit $code"
+  fi
 }
 started=${RHIZA_JOB_STARTED:-$(date +%s)}
+[ "$mode" != run-local ] || started=$now
+watchdog=''
+stop_watchdog() {
+  if [ -n "$watchdog" ]; then kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; watchdog=''; fi
+}
 pf_pids=''
 active_fault=''
 owned_created=false
+learner_attempted=false
+shutdown_watch_pid=''
+shutdown_log_pids=''
+shutdown_capture=false
+# A watch started from the pre-stop list version replays termination events even
+# if the request connects after scale0. No privileged node/container API is used.
+shutdown_stream() {
+  if [ "$mode" = run-local ]; then
+    stream_limit=$(remaining) || return 124
+    [ "$stream_limit" -le 240 ] || stream_limit=240
+    exec timeout --kill-after=5s "${stream_limit}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=0 "$@"
+  fi
+  exec timeout --kill-after=5s 240s kubectl --context="$context" --namespace="$ns" --request-timeout=0 "$@"
+}
+shutdown_watch() {
+  # get has no --resource-version flag. The raw namespace URI retains the
+  # authentic list version and selector, using the same scoped transport.
+  watch_version=$(jq -ner --arg version "$1" '$version|select(length>0)|@uri') || return 1
+  watch_selector=$(jq -nr --arg run "$RHIZA_RUN_ID" '"chaos.rhiza.io/run="+$run|@uri') || return 1
+  watch_seconds=$(( $2 - $(date +%s) ))
+  [ "$watch_seconds" -gt 0 ] || return 124
+  shutdown_stream get --raw="/api/v1/namespaces/$ns/pods?watch=true&resourceVersion=$watch_version&labelSelector=$watch_selector&timeoutSeconds=$watch_seconds"
+}
+capture_shutdown() {
+  # Original PodUIDs cover all created writers. Planned container-kill history
+  # is not a clean Close: only the current incarnation is pinned below.
+  jq -e '[.[]|select(.name|test("^rhiza-voter-[012]$"))] as $v |
+    ($v|map(.name)|sort)==["rhiza-voter-0","rhiza-voter-1","rhiza-voter-2"] and
+    all($v[]; (.uid|type)=="string" and (.uid|length)>0)
+  ' "$out/voters-before.json" >/dev/null || return 1
+  jq --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '[.[]|select(.name|test("^rhiza-voter-[012]$"))|{name,uid,namespace:$ns,run:$run}]' \
+    "$out/voters-before.json" > "$out/shutdown-expected.json" || return $?
+  if [ "$learner_attempted" = true ]; then
+    jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.metadata.name=="rhiza-learner" and
+      .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
+      (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/learner-created.json" >/dev/null || return 1
+    jq --slurpfile learner "$out/learner-created.json" '.+[$learner[0].metadata|{name,uid,namespace,run:.labels["chaos.rhiza.io/run"]}]' \
+      "$out/shutdown-expected.json" > "$out/shutdown-expected.next.json" || return $?
+    mv "$out/shutdown-expected.next.json" "$out/shutdown-expected.json"
+  fi
+  k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-before.json" 2> "$out/shutdown-pods-before.stderr" || return $?
+  # Never silently omit a writer whose status/log incarnation is unavailable.
+  jq -e 'all(.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner");
+    [.status.containerStatuses[]?|select(.name=="rhiza" and (.containerID|type)=="string" and (.containerID|length)>0)]|length==1)
+  ' "$out/shutdown-pods-before.json" >/dev/null || return 1
+  jq '[.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner")|
+    . as $pod | .status.containerStatuses[]?|select(.name=="rhiza")|
+    {name:$pod.metadata.name,namespace:$pod.metadata.namespace,run:$pod.metadata.labels["chaos.rhiza.io/run"],uid:$pod.metadata.uid,
+      image:([ $pod.spec.containers[]|select(.name=="rhiza")|.image ][0]),image_id:.imageID,
+      container_id:.containerID,restart_count:.restartCount}]' "$out/shutdown-pods-before.json" > "$out/shutdown-before.json" || return $?
+  jq -e --slurpfile expected "$out/shutdown-expected.json" \
+    '(map({name,uid,namespace,run})|sort_by(.name))==($expected[0]|sort_by(.name))' "$out/shutdown-before.json" >/dev/null || return 1
+  shutdown_watch_deadline=$(( $(date +%s) + 240 ))
+  if [ "$mode" = run-local ] && [ "$shutdown_watch_deadline" -gt "$local_deadline" ]; then shutdown_watch_deadline=$local_deadline; fi
+  resource_version=$(jq -er '.metadata.resourceVersion|select(type=="string" and length>0)' "$out/shutdown-pods-before.json") || return 1
+  shutdown_watch "$resource_version" "$shutdown_watch_deadline" > "$out/shutdown-watch.json" 2> "$out/shutdown-watch.stderr" & shutdown_watch_pid=$!
+  for shutdown_pod in $(jq -r '.[].name' "$out/shutdown-before.json"); do
+    shutdown_stream logs "$shutdown_pod" --container=rhiza --follow > "$out/$shutdown_pod-shutdown.log" 2> "$out/$shutdown_pod-shutdown.stderr" &
+    shutdown_log_pids="$shutdown_log_pids $shutdown_pod:$!"
+  done
+  shutdown_capture=true
+}
+finish_shutdown_capture() {
+  for log_owner in $shutdown_log_pids; do
+    wait "${log_owner#*:}"
+    printf '%s\n' "$?" > "$out/${log_owner%:*}-shutdown-log.exit"
+  done
+  wait_shutdown_watch "$out" "$shutdown_watch_pid" "$shutdown_watch_deadline"
+  watch_proof_code=$?
+  printf '%s\n' "$watch_proof_code" > "$out/shutdown-watch-proof.exit"
+  if [ -n "$shutdown_watch_pid" ]; then
+    kill "$shutdown_watch_pid" 2>/dev/null
+    wait "$shutdown_watch_pid"
+    printf '%s\n' "$?" > "$out/shutdown-watch.exit"
+    shutdown_watch_pid=''
+  fi
+  [ ! -s "$out/shutdown-watch.stderr" ] || return 1
+  [ "$watch_proof_code" = 0 ] || return "$watch_proof_code"
+  k get statefulset/rhiza-voter -o json > "$out/shutdown-controller.json" 2> "$out/shutdown-controller.stderr" || return $?
+  k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/shutdown-pods-after.json" 2> "$out/shutdown-pods-after.stderr" || return $?
+  jq '{items:[.items[]|select(.metadata.labels.app=="rhiza-voter" or .metadata.name=="rhiza-learner")]}' \
+    "$out/shutdown-pods-after.json" > "$out/shutdown-writers-after.json" || return $?
+  verify_shutdown "$out"
+}
 cleanup() {
-  code=$?; trap - EXIT HUP INT TERM
+  code=$?
+  trap '' USR1
+  trap - EXIT HUP INT TERM
   set +e
+  stop_watchdog
+  if [ "$mode" = run-local ]; then
+    local_deadline=$(( $(date +%s) + 1200 ))
+    [ "$local_deadline" -le "$token_expiry" ] || local_deadline=$token_expiry
+    [ "$local_deadline" -le "$auth_expiry" ] || local_deadline=$auth_expiry
+  fi
   clean=true
   # Never replace the first failure with a diagnostics/cleanup result.
   printf '%s\n' "$code" > "$out/workload.exit"
@@ -76,6 +392,11 @@ cleanup() {
     [ "$cleanup_code" = 0 ] || clean=false
     if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
   fi
+  capture_shutdown
+  capture_code=$?
+  printf '%s\n' "$capture_code" > "$out/shutdown-capture.exit"
+  [ "$capture_code" = 0 ] || clean=false
+  if [ "$code" = 0 ] && [ "$capture_code" != 0 ]; then code=$capture_code; fi
   # Run-owned writers stop normally; this is NOT fencing evidence.
   k scale statefulset/rhiza-voter --replicas=0 > "$out/stop-voters.stdout" 2> "$out/stop-voters.stderr"
   cleanup_code=$?
@@ -103,9 +424,18 @@ cleanup() {
   printf '%s\n' "$cleanup_code" > "$out/stop-probe.exit"
   [ "$cleanup_code" = 0 ] || clean=false
   if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+  if [ "$shutdown_capture" = true ]; then
+    finish_shutdown_capture
+    proof_code=$?
+    printf '%s\n' "$proof_code" > "$out/owned-close-proof.exit"
+    [ "$proof_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$proof_code" != 0 ]; then code=$proof_code; fi
   fi
-  if [ "$clean" = true ]; then
-    printf '%s\n' 'Run-owned fault/writers stopped; Root storage/IAM cleanup still pending.' > "$out/cleanup-status.txt"
+  fi
+  if [ "$owned_created" = false ]; then
+    printf '%s\n' 'No owned runtime resources created; Root auth cleanup still pending.' > "$out/cleanup-status.txt"
+  elif [ "$clean" = true ]; then
+    printf '%s\n' 'Owned HTTP/DB close and pinned container termination verified; NOT universal remote-request quiescence. Root storage/IAM reconciliation still pending.' > "$out/cleanup-status.txt"
   else
     printf '%s\n' 'NOT CLEAN: bounded run-owned shutdown failed; Root must reconcile before storage/IAM cleanup.' > "$out/cleanup-status.txt"
     printf '%s\n' 'NOT CLEAN (see workload.exit for the preserved original result).' >> "$out/result.txt"
@@ -118,17 +448,51 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
+if [ "$mode" = run-local ]; then
+  trap 'exit 124' USR1
+  runtime_pid=$$
+  watchdog_seconds=$(remaining) || exit 124
+  (
+    sleep_pid=''
+    trap 'if [ -n "$sleep_pid" ]; then kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+    sleep "$watchdog_seconds" & sleep_pid=$!
+    wait "$sleep_pid"
+    kill -USR1 "$runtime_pid"
+  ) & watchdog=$!
+  printf '%s\n' "$watchdog" > "$out/watchdog.pid"
+  run local-identity k auth whoami -o json
+  jq -e --arg user "system:serviceaccount:$ns:rhiza-runtime" --arg group "system:serviceaccounts:$ns" \
+    '.status.userInfo.username==$user and (.status.userInfo.groups|sort)==(["system:authenticated","system:serviceaccounts",$group]|sort)' \
+    "$out/$seq-local-identity.stdout" >/dev/null || die 'local runtime server identity mismatch'
+  for resource in secrets serviceaccounts/token roles validatingadmissionpolicies; do
+    verb='create'
+    [ "$resource" != secrets ] || verb='get'
+    case "$resource" in
+      serviceaccounts/token) set -- create serviceaccounts --subresource=token ;;
+      validatingadmissionpolicies) set -- create validatingadmissionpolicies.admissionregistration.k8s.io --all-namespaces ;;
+      *) set -- "$verb" "$resource" ;;
+    esac
+    seq=$((seq + 1))
+    set +e
+    k auth can-i "$@" > "$out/$seq-permission-denied.stdout" 2> "$out/$seq-permission-denied.stderr"
+    denied_code=$?
+    set -e
+    printf '%s\n' "$denied_code" > "$out/$seq-permission-denied.exit"
+    if [ "$denied_code" = 124 ] || [ "$denied_code" = 137 ]; then exit "$denied_code"; fi
+    [ "$denied_code" = 1 ] && grep -qx no "$out/$seq-permission-denied.stdout" && [ ! -s "$out/$seq-permission-denied.stderr" ] || die 'local runtime forbidden permission/authorization check failed'
+  done
+fi
 run namespace k get namespace "$ns" -o json
-jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA" '.metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .metadata.annotations["chaos-mesh.org/inject"]=="enabled"' "$out/1-namespace.stdout" >/dev/null || die 'bootstrap namespace/workflow identity mismatch'
+jq -e --arg uid "$RHIZA_BOOTSTRAP_UID" --arg run "$RHIZA_RUN_ID" --arg owner "rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA" '.metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.annotations["rhiza.dev/auth-owner"]==$owner and .metadata.annotations["chaos-mesh.org/inject"]=="enabled"' "$out/$seq-namespace.stdout" >/dev/null || die 'bootstrap namespace/workflow identity mismatch'
 run collision k get pods,statefulsets,services,configmaps,networkpolicies,podchaos,networkchaos -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json
-jq -e '.items|length==0' "$out/2-collision.stdout" >/dev/null || die 'run resources already exist'
+jq -e '.items|length==0' "$out/$seq-collision.stdout" >/dev/null || die 'run resources already exist'
 owned_created=true
 run create-metadata k create -f "$out/metadata.yaml"
 run metadata-ready k wait pod/rhiza-metadata --for=condition=Ready --timeout=180s
 storage="gs://rhiza-v070-chaos-ied-20260811/$prefix"
 seq=$((seq + 1))
 set +e
-k exec rhiza-metadata -- gcloud storage cat "gs://rhiza-v070-chaos-ied-20260811/postrelease/v0.19.0/denied-$RHIZA_RUN_ID/no-object" > "$out/$seq-outside-scope.stdout" 2> "$out/$seq-outside-scope.stderr"
+k exec rhiza-metadata -- gcloud storage cat "gs://rhiza-v070-chaos-ied-20260811/postrelease/v0.19.1/denied-$RHIZA_RUN_ID/no-object" > "$out/$seq-outside-scope.stdout" 2> "$out/$seq-outside-scope.stderr"
 denied_code=$?
 set -e
 printf '%s\n' "$denied_code" > "$out/$seq-outside-scope.exit"
@@ -147,10 +511,16 @@ else
   [ "$list_code" = 1 ] && grep -Fq 'matched no objects' "$out/$seq-prefix-empty.stderr" || die 'prefix/list permission gate failed'
 fi
 run create-voters k create -f "$out/voters.yaml"
-run voters-ready k rollout status statefulset/rhiza-voter --timeout=180s
+run voters-ready wait_voters 180
 forward() {
   pod=$1; port=$2
-  k port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+  if [ "$mode" = run-local ]; then
+    seconds=$(remaining) || exit 124
+    timeout --kill-after=5s "${seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=30s port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+  else
+    k port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+  fi
   pf_pids="$pf_pids $!"
   tries=0
   until curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; do
@@ -211,7 +581,9 @@ execute() {
   id=$1; sql=$2
   payload=$(jq -nc --arg id "$id" --arg sql "$sql" '{request_id:$id,sql:$sql}')
   run ack curl -fsS --max-time 30 -H 'Content-Type: application/json' -d "$payload" http://127.0.0.1:18081/sql/execute
-  jq -e '.slot>0 and .status=="committed" and .applied==true and (.error_code==null or .error_code=="")' "$out/$seq-ack.stdout" >/dev/null || die 'not a durable successful ACK'
+  # SQL receipts omit Applied; committed plus no execution error is their
+  # success contract. The configured before-ack barrier remains engine-owned.
+  jq -e '(.slot|type)=="number" and .slot>0 and (.slot|floor)==.slot and .status=="committed" and (.error_code==null or .error_code=="")' "$out/$seq-ack.stdout" >/dev/null || die 'not a durable successful ACK'
   printf '%s\n' "$id" >> "$out/ack-ids.txt"
   metrics
 }
@@ -271,7 +643,7 @@ execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
 run recovered k wait "$active_fault" --for=condition=AllRecovered=True --timeout=90s
 run fault-delete k delete "$active_fault" --wait=true --timeout=60s
 active_fault=''
-run voters-ready k rollout status statefulset/rhiza-voter --timeout=120s
+run voters-ready wait_voters 120
 # Existing port-forward connection may exit when its container is killed.
 forward rhiza-voter-0 18080
 run after pod_snapshot
@@ -303,7 +675,17 @@ done
 run probe-identity-after k get pod rhiza-quic-probe -o json
 jq -e --slurpfile before "$probe_identity" '.metadata.uid==$before[0].metadata.uid and .status.podIP==$before[0].status.podIP and .spec.nodeName==$before[0].spec.nodeName and .metadata.labels==$before[0].metadata.labels and .status.containerStatuses[0].restartCount==0' "$out/$seq-probe-identity-after.stdout" >/dev/null || die 'probe identity changed across policy verification'
 run probe-delete k delete pod/rhiza-quic-probe --wait=true --timeout=60s
-run cold-create k create -f "$out/learner.yaml"
+learner_attempted=true
+run cold-create k create -f "$out/learner.yaml" -o json
+# This manifest creates a Service and Pod; retain the authentic List ACK and
+# extract exactly one learner Pod, not a later name-only lookup.
+cp "$out/$seq-cold-create.stdout" "$out/learner-create-ack.json"
+jq '[if .kind=="List" then .items[] else . end|select(.kind=="Pod" and .metadata.name=="rhiza-learner")] |
+  if length==1 then .[0] else error("learner create UID unresolved") end' \
+  "$out/learner-create-ack.json" > "$out/learner-created.json" || die 'learner create UID unresolved'
+jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.metadata.name=="rhiza-learner" and
+  .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
+  (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/learner-created.json" >/dev/null || die 'learner create UID unresolved'
 run learner-running k wait pod/rhiza-learner --for=jsonpath='{.status.phase}'=Running --timeout=180s
 forward rhiza-learner 18083
 learner_started=true

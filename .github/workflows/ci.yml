@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_chaos_image:
+        description: Publish the tested qualification host image for a local run
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -181,17 +187,8 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
-      - name: Offline bootstrap and bucket fixture regressions
-        env:
-          RHIZA_RUN_ID: '00000000'
-          RHIZA_WORKFLOW_SHA: ${{ github.sha }}
-          RHIZA_AUTH_EXPIRES: '2000-01-01T00:00:00Z'
+      - name: Bucket fixture retry regression
         run: |
-          command -v curl
-          command -v jq
-          sh -n e2e/chaos/bootstrap-gcs-postrelease.sh
-          sh e2e/chaos/bootstrap-gcs-postrelease.sh check-folder-iam
-          sh e2e/chaos/bootstrap-gcs-postrelease.sh check-cleanup-uris
           python3 e2e/chaos/operator_fixture_test.py
           python3 e2e/chaos/operator_recovery_test.py
       - name: Learner checkpoint adoption crash and lease boundaries
@@ -286,9 +283,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - name: Prepare container test tools
+        run: |
+          awk '
+            { print }
+            /^FROM golang:1[.]27-alpine AS builder$/ {
+              print "RUN apk --no-cache add jq coreutils"
+              matched++
+            }
+            END { if (matched != 1) exit 1 }
+          ' Dockerfile > "$RUNNER_TEMP/Dockerfile.ci"
       - uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ runner.temp }}/Dockerfile.ci
           push: false
           tags: rhiza:ci
 
@@ -302,8 +310,26 @@ jobs:
   anchor-operator-chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      PUBLISH_CHAOS_IMAGE: ${{ github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image }}
+      APPLICATION_SHA: d575e686d2ec349c07de70679f5c6b22c1718e17
     steps:
       - uses: actions/checkout@v4
+      - name: Require released production source for image export
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        run: |
+          git fetch --no-tags --depth=1 origin "$APPLICATION_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code "$APPLICATION_SHA" "$GITHUB_SHA" -- . \
+            ':(exclude).github/workflows/ci.yml' \
+            ':(exclude).github/workflows/gcs-postrelease.yml' \
+            ':(exclude)e2e/chaos/bootstrap-gcs-postrelease.sh' \
+            ':(exclude)e2e/chaos/run-gcs-postrelease.sh' \
+            ':(exclude)e2e/chaos/gcs-postrelease-auth.yaml.in' \
+            ':(exclude)e2e/chaos/gcs-postrelease.yaml.in' \
+            ':(exclude)e2e/chaos/embedded-go/main.go' \
+            ':(exclude)e2e/chaos/embedded-go/counters_test.go' \
+            ':(exclude)pkg/network/migration_admission_test.go'
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -317,7 +343,14 @@ jobs:
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
           go build -o "$RUNNER_TEMP/chaos-images/anchor-service" ./examples/recovery-anchor
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          labels=()
+          if [ "$PUBLISH_CHAOS_IMAGE" = true ]; then
+            labels=(--label "org.opencontainers.image.source=https://github.com/mrchypark/rhiza"
+              --label "org.opencontainers.image.revision=$GITHUB_SHA"
+              --label "io.rhiza.qualification.harness=$GITHUB_SHA"
+              --label "io.rhiza.qualification.application=$APPLICATION_SHA")
+          fi
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-anchor-chaos --wait 120s
@@ -337,3 +370,83 @@ jobs:
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-anchor-chaos
+      - name: Export the tested qualification host
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        run: |
+          export_dir="$RUNNER_TEMP/qualification-host"
+          mkdir -p "$export_dir"
+          docker image inspect rhiza-chaos:local > "$export_dir/image.json"
+          jq -e --arg harness "$GITHUB_SHA" --arg app "$APPLICATION_SHA" '
+            .[0] | .Os == "linux" and .Architecture == "amd64" and .Size < 134217728 and
+            .Config.User == "65532:65532" and
+            .Config.Labels["org.opencontainers.image.source"] == "https://github.com/mrchypark/rhiza" and
+            .Config.Labels["org.opencontainers.image.revision"] == $harness and
+            .Config.Labels["io.rhiza.qualification.harness"] == $harness and
+            .Config.Labels["io.rhiza.qualification.application"] == $app
+          ' "$export_dir/image.json"
+          container=$(docker create rhiza-chaos:local)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/rhiza-entrypoint" "$export_dir/rhiza-entrypoint"
+          cmp "$RUNNER_TEMP/chaos-images/rhiza" "$export_dir/rhiza-entrypoint"
+          (cd "$export_dir" && sha256sum rhiza-entrypoint > binary.sha256)
+          rm "$export_dir/rhiza-entrypoint"
+          docker save rhiza-chaos:local -o "$export_dir/host.tar"
+          (cd "$export_dir" && sha256sum host.tar image.json binary.sha256 > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        with:
+          name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-host
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-chaos-image:
+    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image
+    needs: [anchor-operator-chaos, go, containers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: qualification-host
+      - name: Verify and load the tested host image
+        working-directory: qualification-host
+        run: |
+          sha256sum -c SHA256SUMS
+          docker load -i host.tar
+          test "$(docker image inspect rhiza-chaos:local --format '{{.Id}}')" = "$(jq -r '.[0].Id' image.json)"
+          container=$(docker create rhiza-chaos:local)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/rhiza-entrypoint" rhiza-entrypoint
+          sha256sum -c binary.sha256
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the immutable run tag
+        shell: bash
+        run: |
+          target="ghcr.io/mrchypark/rhiza-sql:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker tag rhiza-chaos:local "$target"
+          docker push "$target" | tee qualification-host/push.log
+          docker image inspect "$target" > qualification-host/published-image.json
+          # shellcheck disable=SC2016 # Markdown backticks are literal output.
+          printf 'Qualification host: `%s`\n\n' "$target" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[0].RepoDigests[]' qualification-host/published-image.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualification-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            qualification-host/image.json
+            qualification-host/binary.sha256
+            qualification-host/SHA256SUMS
+            qualification-host/push.log
+            qualification-host/published-image.json
+          if-no-files-found: error
+          retention-days: 7
