@@ -334,12 +334,31 @@ jobs:
           printf '%s  %s\n' \
             f54cd3b6f4f3f43c68b07e727f23b9a60954bef033731247296046f3dc35a58d \
             "$approved_mirror_diff" | sha256sum --check --strict
+          approved_benchmark_diff="$RUNNER_TEMP/approved-benchmark.diff"
+          LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
+            --no-color --no-indent-heuristic --diff-algorithm=myers --unified=3 \
+            --src-prefix=a/ --dst-prefix=b/ "$APPLICATION_SHA" "$GITHUB_SHA" -- \
+            .github/workflows/performance.yml \
+            benchmarks/hiqlite-reference.json \
+            benchmarks/verify-hiqlite-reference-artifact.sh \
+            benchmarks/verify-hiqlite-reference.sh \
+            benchmarks/verify-hiqlite-reference_test.sh \
+            benchmarks/results/2026-10-10-hiqlite-v0.15.2 > "$approved_benchmark_diff"
+          printf '%s  %s\n' \
+            dcc808143dc7601735a2ef78be439ce87150213635a234f44e2fba1151331a1f \
+            "$approved_benchmark_diff" | sha256sum --check --strict
           git diff --exit-code "$APPLICATION_SHA" "$GITHUB_SHA" -- . \
             ':(exclude).github/workflows/ci.yml' \
             ':(exclude).github/workflows/gcs-postrelease.yml' \
             ':(exclude).github/workflows/operator-release.yml' \
+            ':(exclude).github/workflows/performance.yml' \
             ':(exclude)Dockerfile' \
             ':(exclude)Dockerfile.operator' \
+            ':(exclude)benchmarks/hiqlite-reference.json' \
+            ':(exclude)benchmarks/verify-hiqlite-reference-artifact.sh' \
+            ':(exclude)benchmarks/verify-hiqlite-reference.sh' \
+            ':(exclude)benchmarks/verify-hiqlite-reference_test.sh' \
+            ':(exclude)benchmarks/results/2026-10-10-hiqlite-v0.15.2/**' \
             ':(exclude)e2e/chaos/Dockerfile' \
             ':(exclude)e2e/chaos/Dockerfile.rust' \
             ':(exclude)e2e/chaos/bootstrap-gcs-postrelease.sh' \

@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 reference=$repo_root/benchmarks/hiqlite-reference.json
-evidence=$repo_root/benchmarks/results/2026-09-26-hiqlite-v0.15.0/evidence
+evidence=$repo_root/benchmarks/results/2026-10-10-hiqlite-v0.15.2/evidence
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/rhiza-hiqlite-verifier.XXXXXX")
 trap 'rm -rf -- "$fixture"' EXIT
 
