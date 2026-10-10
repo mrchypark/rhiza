@@ -1555,6 +1555,55 @@ container_kill
 	}
 }
 
+func TestQualificationNetworkRecoveryWaitsForVoters(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nfault NetworkChaos partition network-one\n")
+	end := strings.Index(string(source), "\ncontainer_kill\n")
+	if start < 0 || end <= start {
+		t.Fatal("actual network recovery branch missing")
+	}
+	for _, scenario := range []string{"success", "readiness-failed"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
+out=$1; seq=0; RHIZA_RUN_ID=a1b2c3d4; active_fault='NetworkChaos/network-one'
+run() { name=$1; shift; printf '%s\n' "$name" >> "$out/order"; "$@"; }
+fault() { [ "$*" = 'NetworkChaos partition network-one' ] || exit 91; printf '%s\n' fault >> "$out/order"; }
+execute() { printf '%s\n' execute >> "$out/order"; }
+k() { :; }
+wait_voters() { [ "$1" = 120 ] || exit 92; [ "$FAKE_SCENARIO" != readiness-failed ] || exit 53; }
+readback() { [ "$2" = linearizable ] && [ "$3" = '[[1,"before"],[2,"network"]]' ] || exit 93; printf 'readback-%s\n' "$1" >> "$out/order"; }
+metrics() { printf '%s\n' metrics >> "$out/order"; }
+`+string(source[start:end]), "fixture", dir)
+			command.Env = append(os.Environ(), "FAKE_SCENARIO="+scenario)
+			output, err := command.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("fixture timeout: %v", ctx.Err())
+			}
+			order, readErr := os.ReadFile(filepath.Join(dir, "order"))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if scenario == "success" {
+				if err != nil {
+					t.Fatalf("actual branch: %v: %s", err, output)
+				}
+				want := "fault\nexecute\nrecovered\nfault-delete\nvoters-ready\nreadback-18080\nreadback-18081\nreadback-18082\nmetrics\n"
+				if string(order) != want {
+					t.Fatalf("wrong network recovery order: %s", order)
+				}
+			} else if err == nil || bytes.Contains(order, []byte("readback-")) {
+				t.Fatalf("failed readiness reached readback: %s", order)
+			}
+		})
+	}
+}
+
 func TestQualificationShutdownSnapshotWatch(t *testing.T) {
 	source, err := os.ReadFile("../run-gcs-postrelease.sh")
 	if err != nil {

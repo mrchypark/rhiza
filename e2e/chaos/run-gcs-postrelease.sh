@@ -1125,6 +1125,7 @@ execute "$RHIZA_RUN_ID-network" "INSERT INTO qualification VALUES (2,'network')"
 run recovered k wait "$active_fault" --for=condition=AllRecovered=True --timeout=90s
 run fault-delete k delete "$active_fault" --wait=true --timeout=60s
 active_fault=''
+run voters-ready wait_voters 120
 for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"],[2,"network"]]'; done
 metrics
 container_kill
