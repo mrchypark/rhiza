@@ -109,8 +109,10 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte("#!/bin/sh\nexit 99\n"), 0700); err != nil {
-			t.Fatal(err)
+		for _, name := range []string{"kubectl", "curl", "timeout", "sha256sum", "gh"} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 99\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	for _, scenario := range []struct {
