@@ -1094,33 +1094,61 @@ container_kill() {
       ([.events[]?|select(.operation=="Apply" and .type=="Succeeded")]|length)==1)
   ' "$out/$seq-injection.stdout" >/dev/null || die 'exact single container-kill injection not proven'
   wait_process_restart() (
-    voter_wait_deadline=$(( $(date +%s) + 120 ))
+    voter_wait_deadline=$(( $(date +%s) + 30 ))
+    restart_current="$out/process-restart-current.json"
+    restart_next="$restart_current.next"
+    trap 'rm -f "$restart_next"' 0 HUP INT TERM
     while :; do
-      k get pod rhiza-voter-0 -o json > "$out/process-restart-current.json" || true
+      if k get pod rhiza-voter-0 -o json > "$restart_next"; then
+        mv "$restart_next" "$restart_current"
+      else
+        restart_code=$?
+        rm -f "$restart_next"
+        case "$restart_code" in 124|137) printf '%s\n' 'phase=restart-identity category=deadline' >&2; exit "$restart_code" ;; esac
+      fi
       if jq -e --slurpfile before "$out/process-before.json" '
         [.status.containerStatuses[]?|select(.name=="rhiza")] as $current |
         [($before[0][]|select(.name=="rhiza-voter-0")|.containers[]?)|select(.name=="rhiza")] as $sealed |
         .metadata.name=="rhiza-voter-0" and .metadata.uid==($before[0][]|select(.name=="rhiza-voter-0")|.uid) and
-        .metadata.deletionTimestamp==null and any(.status.conditions[]?;.type=="Ready" and .status=="True") and
+        .metadata.deletionTimestamp==null and
         ($current|length)==1 and ($sealed|length)==1 and
         $current[0].restartCount==$sealed[0].restartCount+1 and
         ($current[0].containerID|type)=="string" and ($current[0].containerID|length)>0 and
         $current[0].containerID!=$sealed[0].containerID
-      ' "$out/process-restart-current.json"; then
-        cat "$out/process-restart-current.json"
+      ' "$restart_current"; then
+        cat "$restart_current"
         exit 0
       fi
-      [ "$(date +%s)" -lt "$voter_wait_deadline" ] || exit 124
+      [ "$(date +%s)" -lt "$voter_wait_deadline" ] || { printf '%s\n' 'phase=restart-identity category=deadline' >&2; exit 124; }
       sleep 1
     done
   )
   run restart-evidence wait_process_restart
-  execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
   # ContainerKill is one-shot: duration does not recover it. Delete the exact
   # fault and wait for its finalizer before proving application recovery.
   run fault-delete k delete "$active_fault" --wait=true --timeout=60s
   active_fault=''
-  run voters-ready wait_voters 120
+  wait_process_ready() (
+    voter_wait_deadline=$(( $(date +%s) + 180 ))
+    voter_wait_seconds=$((voter_wait_deadline - $(date +%s)))
+    [ "$voter_wait_seconds" -gt 0 ] || exit 124
+    wait_voters "$voter_wait_seconds" || { ready_code=$?; printf 'phase=application-readiness category=wait-failed exit=%s\n' "$ready_code" >&2; exit "$ready_code"; }
+    ready_current="$out/process-ready-current.json"
+    ready_next="$ready_current.next"
+    trap 'rm -f "$ready_next"' 0 HUP INT TERM
+    k get pod rhiza-voter-0 -o json > "$ready_next" || { ready_code=$?; printf 'phase=application-readiness category=read-failed exit=%s\n' "$ready_code" >&2; exit "$ready_code"; }
+    mv "$ready_next" "$ready_current"
+    jq -e --slurpfile before "$out/process-before.json" '
+      [.status.containerStatuses[]?|select(.name=="rhiza")] as $current |
+      .metadata.uid==($before[0][]|select(.name=="rhiza-voter-0")|.uid) and
+      .metadata.deletionTimestamp==null and any(.status.conditions[]?;.type=="Ready" and .status=="True") and
+      ($current|length)==1 and $current[0].restartCount==1 and
+      ($current[0].containerID|type)=="string" and ($current[0].containerID|length)>0
+    ' "$ready_current" || { printf '%s\n' 'phase=application-readiness category=identity-invalid' >&2; exit 1; }
+    cat "$ready_current"
+  )
+  run voters-ready wait_process_ready
+  execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
   forward rhiza-voter-0 18080
   run after pod_snapshot
   jq -e --slurpfile before "$out/process-before.json" --slurpfile original "$out/voters-before.json" '

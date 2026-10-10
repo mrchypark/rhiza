@@ -1435,7 +1435,7 @@ func TestQualificationContainerKillRecovery(t *testing.T) {
 	if start < 0 || end <= start {
 		t.Fatal("actual container-kill branch missing")
 	}
-	for _, scenario := range []string{"success", "before-replaced", "two-injections", "wrong-target", "empty-records", "apply-failed", "delete-failed", "not-ready", "pod-replaced", "wal-replaced", "no-restart", "two-restarts", "same-container", "other-restarted", "image-changed", "barrier-failed", "restart-timeout", "hung-get"} {
+	for _, scenario := range []string{"success", "delayed-ready", "before-replaced", "two-injections", "wrong-target", "empty-records", "apply-failed", "delete-failed", "not-ready", "readiness-timeout", "ready-uid-drift", "pod-replaced", "wal-replaced", "no-restart", "two-restarts", "same-container", "other-restarted", "image-changed", "barrier-failed", "restart-timeout", "hung-get"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			writeJSON := func(name string, value any) {
@@ -1487,8 +1487,17 @@ func TestQualificationContainerKillRecovery(t *testing.T) {
 			writeJSON("before.json", before)
 			writeJSON("after.json", pods(true))
 			restart := pods(true)[0].(map[string]any)
+			if scenario == "delayed-ready" {
+				restart["ready"] = false
+			}
 			writeJSON("restart.json", map[string]any{"metadata": map[string]any{"name": restart["name"], "uid": restart["uid"], "deletionTimestamp": restart["deleting"]},
 				"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": map[bool]string{true: "True", false: "False"}[restart["ready"].(bool)]}}, "containerStatuses": restart["containers"]}})
+			ready := pods(true)[0].(map[string]any)
+			if scenario == "ready-uid-drift" {
+				ready["uid"] = "replacement"
+			}
+			writeJSON("ready.json", map[string]any{"metadata": map[string]any{"name": ready["name"], "uid": ready["uid"], "deletionTimestamp": ready["deleting"]},
+				"status": map[string]any{"conditions": []any{map[string]any{"type": "Ready", "status": map[bool]string{true: "True", false: "False"}[ready["ready"].(bool)]}}, "containerStatuses": ready["containers"]}})
 			count, target, eventType := 1, "synthetic/rhiza-voter-0/rhiza", "Succeeded"
 			if scenario == "two-injections" {
 				count = 2
@@ -1514,7 +1523,7 @@ func TestQualificationContainerKillRecovery(t *testing.T) {
 out=$1; seq=0; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; active_fault=''
 die() { printf '%s\n' "$*" >&2; exit 1; }
 run() { name=$1; shift; seq=$((seq+1)); printf '%s\n' "$name" >> "$out/order"; "$@" > "$out/$seq-$name.stdout"; }
-date() { fake_time=$(cat "$out/time" 2>/dev/null || printf 0); fake_time=$((fake_time+121)); printf '%s\n' "$fake_time" | tee "$out/time"; }
+date() { fake_time=$(cat "$out/time" 2>/dev/null || printf 0); fake_time=$((fake_time+16)); printf '%s\n' "$fake_time" | tee "$out/time"; }
 sleep() { :; }
 pod_snapshot() { if [ "$seq" = 1 ]; then cat "$out/before.json"; else [ -f "$out/deleted" ] || exit 91; cat "$out/after.json"; fi; }
 fault() { [ "$*" = 'PodChaos container-kill process-one' ] || exit 92; active_fault=PodChaos/process-one; seq=$((seq+1)); cp "$out/injection.json" "$out/$seq-injection.stdout"; printf 'injected\n' >> "$out/order"; }
@@ -1526,14 +1535,23 @@ k() {
       printf '%s\n' "$voter_wait_deadline" > "$out/hung-get-deadline"
       return 124
     fi
-    if [ "$FAKE_SCENARIO" = restart-timeout ]; then cat "$out/before.json"; else cat "$out/restart.json"; fi
+    if [ -f "$out/deleted" ]; then cat "$out/ready.json"; return; fi
+    if [ "$FAKE_SCENARIO" = restart-timeout ]; then
+      restart_reads=$(cat "$out/restart-reads" 2>/dev/null || printf 0); restart_reads=$((restart_reads+1)); printf '%s\n' "$restart_reads" > "$out/restart-reads"
+      [ "$restart_reads" = 1 ] && cat "$out/before.json" || return 124
+    else
+      cat "$out/restart.json"
+    fi
   else
     [ "$*" = 'delete PodChaos/process-one --wait=true --timeout=60s' ] || exit 93
     [ "$FAKE_SCENARIO" != delete-failed ] || exit 53
     touch "$out/deleted"
   fi
 }
-wait_voters() { [ "$1" = 120 ] && [ -f "$out/deleted" ] || exit 94; }
+wait_voters() {
+  [ "$1" -le 180 ] && [ "$1" -gt 0 ] && [ -f "$out/deleted" ] || exit 94
+  [ "$FAKE_SCENARIO" != readiness-timeout ] || return 124
+}
 forward() { [ -f "$out/deleted" ] || exit 95; }
 metrics() { printf 'metrics\n' >> "$out/order"; }
 readback() { [ "$2" = linearizable ] && [ "$3" = '[[1,"before"],[2,"network"],[3,"process"]]' ] || exit 96; printf 'barrier-%s\n' "$1" >> "$out/order"; [ "$FAKE_SCENARIO" != barrier-failed ] || exit 54; }
@@ -1545,12 +1563,12 @@ container_kill
 			if ctx.Err() != nil {
 				t.Fatalf("fixture timeout: %v", ctx.Err())
 			}
-			if scenario == "success" {
+			if scenario == "success" || scenario == "delayed-ready" {
 				if err != nil {
 					t.Fatalf("actual branch: %v: %s", err, output)
 				}
 				order, err := os.ReadFile(filepath.Join(dir, "order"))
-				if err != nil || string(order) != "process-before\ninjected\nrestart-evidence\nack\nfault-delete\nvoters-ready\nafter\nmetrics\nbarrier-18080\nbarrier-18081\nbarrier-18082\n" {
+				if err != nil || string(order) != "process-before\ninjected\nrestart-evidence\nfault-delete\nvoters-ready\nack\nafter\nmetrics\nbarrier-18080\nbarrier-18081\nbarrier-18082\n" {
 					t.Fatalf("wrong one-shot recovery order: %s (%v)", order, err)
 				}
 			} else {
@@ -1564,6 +1582,13 @@ container_kill
 					}
 					if _, statErr := os.Stat(filepath.Join(dir, "hung-get-deadline")); statErr != nil {
 						t.Fatalf("hung get lacked scoped deadline: %v", statErr)
+					}
+				}
+				if scenario == "restart-timeout" {
+					evidence, evidenceErr := os.ReadFile(filepath.Join(dir, "process-restart-current.json"))
+					beforeEvidence, beforeErr := os.ReadFile(filepath.Join(dir, "before.json"))
+					if evidenceErr != nil || beforeErr != nil || !bytes.Equal(evidence, beforeEvidence) {
+						t.Fatalf("restart timeout did not preserve last successful evidence: %v %v", evidenceErr, beforeErr)
 					}
 				}
 				order, readErr := os.ReadFile(filepath.Join(dir, "order"))
@@ -1584,7 +1609,7 @@ container_kill
 					}
 				}
 				switch scenario {
-				case "not-ready", "pod-replaced", "no-restart", "two-restarts", "same-container", "restart-timeout", "hung-get":
+				case "not-ready", "readiness-timeout", "ready-uid-drift", "pod-replaced", "no-restart", "two-restarts", "same-container", "restart-timeout", "hung-get":
 					if bytes.Contains(order, []byte("ack")) {
 						t.Fatalf("unproven restart reached ACK: %s", order)
 					}
