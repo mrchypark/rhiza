@@ -1724,18 +1724,20 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		"expiry-negative": `{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":-1}`,
 	}
 	for _, scenario := range []struct {
-		name           string
-		want, attempts int
+		name             string
+		want, attempts   int
+		metadataCategory string
 	}{
-		{"ready", 0, 1}, {"principal-uri-identity", 1, 0}, {"legacy-alias-identity", 1, 0},
-		{"wrong-run-gsa-email", 1, 0}, {"wrong-project-gsa-email", 1, 0}, {"wrong-gsa-email", 1, 0},
-		{"node-default-identity", 1, 0}, {"wrong-identity", 1, 0}, {"identity-http", 1, 0}, {"identity-native", 1, 0},
-		{"forbidden-then-ready", 0, 2}, {"connection", 0, 2}, {"server", 0, 2},
-		{"exhausted", 1, 6}, {"unknown-native", 1, 1}, {"unknown-http", 1, 1},
-		{"forbidden", 1, 6}, {"forbidden-timeout", 1, 6}, {"unknown-http-timeout", 1, 1},
-		{"invalid", 1, 1}, {"multiple", 1, 1}, {"deadline", 124, 1},
-		{"missing-token", 1, 1}, {"empty-token", 1, 1}, {"token-type", 1, 1}, {"bearer-type", 1, 1},
-		{"expiry-type", 1, 1}, {"expiry-zero", 1, 1}, {"expiry-negative", 1, 1},
+		{"ready", 0, 1, "ready"}, {"principal-uri-identity", 1, 0, ""}, {"legacy-alias-identity", 1, 0, ""},
+		{"wrong-run-gsa-email", 1, 0, ""}, {"wrong-project-gsa-email", 1, 0, ""}, {"wrong-gsa-email", 1, 0, ""},
+		{"node-default-identity", 1, 0, ""}, {"wrong-identity", 1, 0, ""}, {"identity-http", 1, 0, ""}, {"identity-native", 1, 0, ""},
+		{"propagation-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
+		{"nonretryable-403", 1, 1, "unrecognized-forbidden"}, {"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"},
+		{"unknown-native", 1, 1, "native-error"}, {"unknown-http", 1, 1, "unknown"}, {"context-deadline", 124, 1, "deadline"},
+		{"invalid", 1, 1, "invalid-response"}, {"multiple", 1, 1, "invalid-response"}, {"deadline", 124, 1, "ready"},
+		{"budget-reserve", 124, 0, ""}, {"missing-token", 1, 1, "invalid-response"}, {"empty-token", 1, 1, "invalid-response"},
+		{"token-type", 1, 1, "invalid-response"}, {"bearer-type", 1, 1, "invalid-response"},
+		{"expiry-type", 1, 1, "invalid-response"}, {"expiry-zero", 1, 1, "invalid-response"}, {"expiry-negative", 1, 1, "invalid-response"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -1753,12 +1755,16 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			localDeadline, authExpiry, expectedDeadline := 1420, 3000, 1420
+			if scenario.name == "budget-reserve" {
+				authExpiry, expectedDeadline = 2200, 1000
+			}
 			fixture := `
-mode=run-local; local_deadline=1010; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; data_gsa_email=rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
+mode=run-local; local_deadline=$FAKE_LOCAL_DEADLINE; auth_expiry=$FAKE_AUTH_EXPIRY; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; data_gsa_email=rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
 date() { cat "$FAKE_DIR/clock"; }
 sleep() { now=$(date); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
 k() {
- [ "$metadata_wait_deadline" = 1010 ] || return 96
+ [ "$metadata_wait_deadline" = "$FAKE_EXPECTED_DEADLINE" ] || return 96
  case "$*" in
   *'/instance/service-accounts/default/email')
    case "$FAKE_SCENARIO" in
@@ -1780,19 +1786,18 @@ k() {
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
  printf 'synthetic-token-never-public\n' >&2
  case "$FAKE_SCENARIO" in
+  propagation-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
+  propagation-exhausted) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
+  nonretryable-403) printf 'Permission denied for an unrelated reason\n403'; return 0 ;;
   connection) [ "$attempt" != 1 ] || return 7 ;;
   server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
-  exhausted) return 7 ;;
   unknown-native) return 53 ;;
   unknown-http) printf 'synthetic-token-never-public\n401'; return 0 ;;
-  forbidden-then-ready) [ "$attempt" != 1 ] || { printf 'synthetic-token-never-public\n403'; return 0; } ;;
-  forbidden) printf 'synthetic-token-never-public\n403'; return 0 ;;
-  forbidden-timeout) printf 'synthetic-token-never-public\n403'; return 28 ;;
-  unknown-http-timeout) printf 'synthetic-token-never-public\n401'; return 28 ;;
+  context-deadline) return 124 ;;
   invalid) printf '{"access_token":"synthetic-token-never-public","token_type":"Other","expires_in":100}\n200'; return 0 ;;
   missing-token|empty-token|token-type|bearer-type|expiry-type|expiry-zero|expiry-negative) cat "$FAKE_RESPONSE"; printf '\n200'; return 0 ;;
   multiple) printf '{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":100}\n';;
-  deadline) printf '1010\n' > "$FAKE_DIR/clock" ;;
+  deadline) printf '%s\n' "$FAKE_EXPECTED_DEADLINE" > "$FAKE_DIR/clock" ;;
  esac
  printf '{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":100}\n200'
 }
@@ -1800,7 +1805,8 @@ k() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+"\nmetadata_credentials_ready")
-			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name, "FAKE_RESPONSE="+filepath.Join(dir, "response"))
+			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name, "FAKE_RESPONSE="+filepath.Join(dir, "response"),
+				"FAKE_LOCAL_DEADLINE="+strconv.Itoa(localDeadline), "FAKE_AUTH_EXPIRY="+strconv.Itoa(authExpiry), "FAKE_EXPECTED_DEADLINE="+strconv.Itoa(expectedDeadline))
 			output, runErr := command.CombinedOutput()
 			code := 0
 			if runErr != nil {
@@ -1816,6 +1822,9 @@ k() {
 			}
 			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("access_token")) {
 				t.Fatal("credential response leaked into public output")
+			}
+			if scenario.metadataCategory != "" && !bytes.Contains(output, []byte("category="+scenario.metadataCategory)) {
+				t.Fatalf("metadata category=%s missing from %s", scenario.metadataCategory, output)
 			}
 			identityCategory := "linked-gsa-email"
 			switch scenario.name {
@@ -1833,6 +1842,8 @@ k() {
 				identityCategory = "http-error"
 			case "identity-native":
 				identityCategory = "native-error"
+			case "budget-reserve":
+				identityCategory = "budget-exhausted"
 			}
 			if !bytes.Contains(output, []byte("category="+identityCategory)) {
 				t.Fatalf("metadata identity category=%s missing from %s", identityCategory, output)
@@ -1846,6 +1857,8 @@ k() {
 				"other@patch2-the-new-era.iam.gserviceaccount.com",
 				"602454948273-compute@developer.gserviceaccount.com",
 				"unrelated.svc.id.goog",
+				"iam.serviceAccounts.getAccessToken",
+				"Permission denied for an unrelated reason",
 			} {
 				if bytes.Contains(output, []byte(identity)) {
 					t.Fatal("raw metadata identity leaked into public output")

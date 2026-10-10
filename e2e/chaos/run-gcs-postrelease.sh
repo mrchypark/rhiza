@@ -77,10 +77,20 @@ k() {
   fi
 }
 metadata_credentials_ready() (
-  # 55 seconds of work plus the existing five-second timeout reap reserve.
+  # IAM policy grants normally propagate in about two minutes, but can take
+  # seven minutes or longer. Bound readiness to that documented seven-minute
+  # window and never consume the existing 20-minute auth cleanup reserve.
   metadata_started=$(date +%s)
-  metadata_wait_deadline=$((metadata_started + 55))
-  if [ "$mode" = run-local ] && [ "$metadata_wait_deadline" -gt "$local_deadline" ]; then metadata_wait_deadline=$local_deadline; fi
+  metadata_wait_deadline=$((metadata_started + 420))
+  if [ "$mode" = run-local ]; then
+    metadata_scope_deadline=$((auth_expiry - 1200))
+    [ "$metadata_wait_deadline" -le "$local_deadline" ] || metadata_wait_deadline=$local_deadline
+    [ "$metadata_wait_deadline" -le "$metadata_scope_deadline" ] || metadata_wait_deadline=$metadata_scope_deadline
+  fi
+  if [ "$metadata_wait_deadline" -le "$metadata_started" ]; then
+    printf '%s\n' 'stage=metadata-credential-readiness category=budget-exhausted'
+    return 124
+  fi
   jq -e --arg a "$RHIZA_NODE_A" --arg b "$RHIZA_NODE_B" --arg c "$RHIZA_NODE_C" '
     . as $cluster | [$a,$b,$c] as $nodes | ($nodes|unique|length)==3 and
     all($nodes[]; . as $node |
@@ -117,7 +127,9 @@ metadata_credentials_ready() (
     "$metadata_identity_code" "$metadata_identity_http" "$metadata_identity_category"
   [ "$metadata_identity_category" = linked-gsa-email ] || return 1
   metadata_attempt=0
-  while [ "$metadata_attempt" -lt 6 ]; do
+  metadata_delay=5
+  metadata_propagation_body="HTTP/403: generic::permission_denied: loading: GenerateAccessToken(\"$data_gsa_email\", \"\"): googleapi: Error 403: Permission 'iam.serviceAccounts.getAccessToken' denied on resource (or it may not exist)."
+  while :; do
     [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
     metadata_attempt=$((metadata_attempt + 1))
     metadata_code=0
@@ -127,6 +139,7 @@ metadata_credentials_ready() (
       --noproxy '*' -H 'Metadata-Flavor: Google' --write-out '\n%{http_code}' \
       http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token 2>/dev/null) || metadata_code=$?
     metadata_http=$(printf '%s\n' "$metadata_response" | tail -n 1)
+    metadata_body=$(printf '%s\n' "$metadata_response" | sed '$d')
     case "$metadata_http" in [1-5][0-9][0-9]) ;; *) metadata_http=000 ;; esac
     metadata_category=unknown
     if [ "$metadata_code" = 0 ]; then
@@ -136,32 +149,31 @@ metadata_credentials_ready() (
             length==1 and (.[0] | type=="object" and (.access_token|type)=="string" and (.access_token|length)>0 and
             .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
           ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
-        403) metadata_category=propagation-pending ;;
-        5[0-9][0-9]) metadata_category=transient-server ;;
+        403)
+          if [ "$metadata_body" = "$metadata_propagation_body" ]; then
+            metadata_category=propagation-pending
+          else
+            metadata_category=unrecognized-forbidden
+          fi ;;
       esac
     else
       case "$metadata_code" in
-        6|7|28|52|56) metadata_category=transient-connection ;;
         124|137) metadata_category=deadline ;;
+        *) metadata_category=native-error ;;
       esac
     fi
-    # A known denial must not become retryable because its body read timed out.
-    case "$metadata_http" in
-      403) metadata_category=propagation-pending ;;
-      [1-4][0-9][0-9]) [ "$metadata_http" = 200 ] || metadata_category=unknown ;;
-    esac
-    unset metadata_response
+    unset metadata_response metadata_body
     printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s category=%s\n' \
       "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" "$metadata_category"
     case "$metadata_category" in
       ready) [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124; return 0 ;;
-      propagation-pending|transient-connection|transient-server) ;;
+      propagation-pending) ;;
       deadline) return "$metadata_code" ;;
       *) return 1 ;;
     esac
-    [ "$metadata_attempt" -lt 6 ] || return 1
-    [ "$((metadata_wait_deadline - $(date +%s)))" -gt 1 ] || return 124
-    sleep 1
+    [ "$((metadata_wait_deadline - $(date +%s)))" -gt "$metadata_delay" ] || return 124
+    sleep "$metadata_delay"
+    [ "$metadata_delay" = 20 ] || metadata_delay=$((metadata_delay * 2))
   done
 )
 validate_cluster_metadata() {
