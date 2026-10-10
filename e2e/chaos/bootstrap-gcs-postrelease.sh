@@ -1015,6 +1015,34 @@ check_sa() {
     [ "$(jq -r .uniqueId "$RHIZA_AUTH_STATE/$which-current.json")" = "$(jq -r .uniqueId "$RHIZA_AUTH_STATE/$which-create.json")" ] || die 'GSA identity changed'
     [ "$(jq -r .description "$RHIZA_AUTH_STATE/$which-current.json")" = "$owner" ] || die 'GSA ownership changed'
 }
+wait_deleted_sa() {
+    deleted_tag=$1; deleted_account=$2; deleted_uid=$3
+    deleted_deadline=$(( $(now_epoch) + 420 )); deleted_attempt=1; deleted_delay=5
+    while :; do
+        deleted_base="$RHIZA_AUTH_STATE/$deleted_tag-absence-$deleted_attempt"
+        deleted_seconds=$(deadline_remaining "$deleted_deadline") || die "GSA deletion deadline exhausted: $deleted_tag"
+        deleted_exit=0
+        timeout --signal=KILL "${deleted_seconds}s" gcloud --project="$project" --quiet iam service-accounts describe "$deleted_account" --format=json > "$deleted_base.json" 2> "$deleted_base.stderr" || deleted_exit=$?
+        printf '%s\n' "$deleted_exit" > "$deleted_base.exit"
+        if [ "$deleted_exit" = 0 ]; then
+            jq -e --arg email "$deleted_account" --arg uid "$deleted_uid" --arg owner "$owner" '
+              type=="object" and .email==$email and .uniqueId==$uid and .description==$owner
+            ' "$deleted_base.json" >/dev/null || die "GSA deletion identity drift: $deleted_tag"
+        else
+            deleted_error=$(sed -E \
+              -e 's/ This command is authenticated as [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+ which is the active account specified by the \[core\/account\] property\.?$//' \
+              -e '/^[[:space:]]*$/d' "$deleted_base.stderr") || die "GSA deletion receipt unreadable: $deleted_tag"
+            if [ "$deleted_error" = 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account.' ] ||
+               [ "$deleted_error" = 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account' ]; then
+                return 0
+            fi
+            die "GSA deletion describe failed permanently: $deleted_tag"
+        fi
+        retry_pause "$deleted_deadline" "$deleted_delay" || die "GSA deletion deadline exhausted: $deleted_tag"
+        deleted_attempt=$((deleted_attempt + 1))
+        [ "$deleted_delay" = 20 ] || deleted_delay=$((deleted_delay * 2))
+    done
+}
 owned ci && check_sa ci "$ci"
 owned data && check_sa data "$data"
 if owned pool; then
@@ -1093,8 +1121,16 @@ if owned folder; then
 fi
 if owned provider; then record provider-delete g iam workload-identity-pools providers delete github --location=global --workload-identity-pool="$pool"; fi
 if owned pool; then record pool-delete g iam workload-identity-pools delete "$pool" --location=global; fi
-if owned ci; then record ci-delete g iam service-accounts delete "$(jq -r .uniqueId "$RHIZA_AUTH_STATE/ci-create.json")"; fi
-if owned data; then record data-delete g iam service-accounts delete "$(jq -r .uniqueId "$RHIZA_AUTH_STATE/data-create.json")"; fi
+if owned ci; then
+    ci_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/ci-create.json")
+    record ci-delete g iam service-accounts delete "$ci_uid"
+    wait_deleted_sa ci "$ci" "$ci_uid"
+fi
+if owned data; then
+    data_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/data-create.json")
+    record data-delete g iam service-accounts delete "$data_uid"
+    wait_deleted_sa data "$data" "$data_uid"
+fi
 for role in "$cluster_role" "$folder_role"; do
     case "$role" in "$cluster_role") tag='cluster-role' ;; *) tag='folder-role' ;; esac
     if owned "$tag"; then

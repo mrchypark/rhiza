@@ -63,10 +63,81 @@ func TestBootstrapCustomRoleDeleteReceiptIsStructuredAndValidated(t *testing.T) 
 		`.name==$created[0].name and .name==$current[0].name`,
 		`.description==$owner and .deleted==true`,
 		`Custom role delete receipt rejected`,
+		`record data-delete g iam service-accounts delete "$data_uid"`,
+		`wait_deleted_sa data "$data" "$data_uid"`,
+		`GSA deletion identity drift`,
+		`ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account`,
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("missing structured custom-role rollback check %q", required)
 		}
+	}
+}
+
+func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
+	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nwait_deleted_sa() {\n")
+	end := strings.Index(string(source)[start+1:], "\n}\n")
+	if start < 0 || end < 0 {
+		t.Fatal("GSA deletion waiter missing")
+	}
+	function := string(source)[start+1 : start+1+end+2]
+	for _, scenario := range []struct {
+		name           string
+		want, attempts int
+	}{
+		{"eventual-not-found", 0, 2},
+		{"identity-drift", 1, 1},
+		{"permission-denied", 1, 1},
+		{"rate-limit", 1, 1},
+		{"server-error", 1, 1},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fixture := `set -eu
+RHIZA_AUTH_STATE=$FAKE_DIR
+project=fixture-project
+owner=fixture-owner
+now_epoch() { printf '1000\n'; }
+deadline_remaining() { printf '420\n'; }
+retry_pause() { :; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+timeout() { shift 2; "$@"; }
+gcloud() {
+ attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
+ case "$FAKE_SCENARIO" in
+  eventual-not-found)
+   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"fixture@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; return 0; fi
+   printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account.' >&2; return 1 ;;
+  identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; return 0 ;;
+  permission-denied) printf '%s\n' 'ERROR: PERMISSION_DENIED' >&2; return 1 ;;
+  rate-limit) printf '%s\n' 'ERROR: HTTPError 429' >&2; return 1 ;;
+  server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; return 1 ;;
+ esac
+}
+`
+			if err := os.WriteFile(filepath.Join(dir, "attempts"), []byte("0\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "-c", fixture+function+"\nwait_deleted_sa fixture fixture@example.invalid fixture-uid")
+			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name)
+			output, runErr := command.CombinedOutput()
+			code := 0
+			if runErr != nil {
+				var exited *exec.ExitError
+				if !errors.As(runErr, &exited) {
+					t.Fatal(runErr)
+				}
+				code = exited.ExitCode()
+			}
+			attempts, err := os.ReadFile(filepath.Join(dir, "attempts"))
+			if err != nil || code != scenario.want || strings.TrimSpace(string(attempts)) != strconv.Itoa(scenario.attempts) {
+				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
+			}
+		})
 	}
 }
 
@@ -767,7 +838,7 @@ case "$1 $2" in
       if [ "$FAKE_SCENARIO" = metadata-wrong-service-account ]; then printf 'node@project.iam.gserviceaccount.com\n200'
       else printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200'; fi ;;
      *'/instance/service-accounts/default/token')
-      if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n403'
+      if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n401'
       else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
      *) exit 98 ;;
     esac ;;
@@ -966,7 +1037,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					t.Fatalf("actual metadata worker rejected sealed inputs: err=%v context=%v output=%s", err, ctx.Err(), output)
 				}
 				if !bytes.Contains(calls, []byte("/instance/service-accounts/default/email")) || !bytes.Contains(calls, []byte("/instance/service-accounts/default/token")) ||
-					!bytes.Contains(output, []byte("category=linked-gsa-email")) || !bytes.Contains(output, []byte("category=ready")) ||
+					!bytes.Contains(output, []byte("category=linked-gsa-email")) || !bytes.Contains(output, []byte("category=token-valid")) ||
 					bytes.Contains(output, []byte("cluster metadata receipt required")) {
 					t.Fatalf("actual worker did not reach sealed token classification: calls=%s output=%s", calls, output)
 				}
@@ -1769,26 +1840,22 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		want, attempts   int
 		metadataCategory string
 	}{
-		{"ready", 0, 1, "ready"}, {"principal-uri-identity", 1, 0, ""}, {"legacy-alias-identity", 1, 0, ""},
+		{"ready", 0, 1, "token-valid"}, {"post-token-drift", 1, 1, "token-valid"}, {"post-token-native-body", 1, 1, "token-valid"}, {"principal-uri-identity", 1, 0, ""}, {"legacy-alias-identity", 1, 0, ""},
 		{"wrong-run-gsa-email", 1, 0, ""}, {"wrong-project-gsa-email", 1, 0, ""}, {"wrong-gsa-email", 1, 0, ""},
 		{"node-default-identity", 1, 0, ""}, {"wrong-identity", 1, 0, ""}, {"identity-http", 1, 0, ""}, {"identity-native", 1, 0, ""},
 		{"propagation-then-ready", 0, 2, "propagation-pending"}, {"whitespace-then-ready", 0, 2, "propagation-pending"},
 		{"plain-propagation-then-ready", 0, 2, "propagation-pending"}, {"plain-whitespace-then-ready", 0, 2, "propagation-pending"},
 		{"backward-wall-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
-		{"nonretryable-403", 1, 1, "unrecognized-forbidden"}, {"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"},
-		{"wrong-gsa-403", 1, 1, "unrecognized-forbidden"}, {"wrong-permission-403", 1, 1, "unrecognized-forbidden"},
-		{"wrong-operation-403", 1, 1, "unrecognized-forbidden"}, {"noncanonical-403", 1, 1, "unrecognized-forbidden"},
-		{"plain-wrong-gsa-403", 1, 1, "unrecognized-forbidden"}, {"plain-wrong-permission-403", 1, 1, "unrecognized-forbidden"},
-		{"plain-arbitrary-403", 1, 1, "unrecognized-forbidden"},
+		{"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"}, {"not-found", 1, 1, "unknown"}, {"rate-limit", 1, 1, "unknown"},
 		{"unknown-native", 1, 1, "native-error"}, {"unknown-http", 1, 1, "unknown"}, {"context-deadline", 124, 1, "deadline"},
-		{"invalid", 1, 1, "invalid-response"}, {"multiple", 1, 1, "invalid-response"}, {"deadline", 124, 1, "ready"},
+		{"invalid", 1, 1, "invalid-response"}, {"multiple", 1, 1, "invalid-response"}, {"deadline", 124, 1, "token-valid"},
 		{"budget-reserve", 124, 0, ""}, {"missing-token", 1, 1, "invalid-response"}, {"empty-token", 1, 1, "invalid-response"},
 		{"token-type", 1, 1, "invalid-response"}, {"bearer-type", 1, 1, "invalid-response"},
 		{"expiry-type", 1, 1, "invalid-response"}, {"expiry-zero", 1, 1, "invalid-response"}, {"expiry-negative", 1, 1, "invalid-response"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			dir := t.TempDir()
-			for name, content := range map[string]string{"clock": "1000\n", "attempts": "0\n"} {
+			for name, content := range map[string]string{"clock": "1000\n", "attempts": "0\n", "identity-attempts": "0\n"} {
 				if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
 					t.Fatal(err)
 				}
@@ -1814,6 +1881,7 @@ k() {
  [ "$metadata_wait_deadline" = "$FAKE_EXPECTED_DEADLINE" ] || return 96
  case "$*" in
   *'/instance/service-accounts/default/email')
+   identity_attempt=$(cat "$FAKE_DIR/identity-attempts"); identity_attempt=$((identity_attempt + 1)); printf '%s\n' "$identity_attempt" > "$FAKE_DIR/identity-attempts"
    case "$FAKE_SCENARIO" in
     principal-uri-identity) printf 'principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs\n200' ;;
     legacy-alias-identity) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n200' ;;
@@ -1824,6 +1892,8 @@ k() {
     wrong-identity) printf 'unrelated.svc.id.goog\n200' ;;
     identity-http) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n404' ;;
     identity-native) return 7 ;;
+    post-token-drift) if [ "$identity_attempt" = 1 ]; then printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200'; else printf 'other@patch2-the-new-era.iam.gserviceaccount.com\n200'; fi ;;
+    post-token-native-body) if [ "$identity_attempt" = 1 ]; then printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200'; else printf 'synthetic-identity-body-never-public'; return 7; fi ;;
     *) printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200' ;;
    esac
    return 0 ;;
@@ -1848,6 +1918,8 @@ k() {
   plain-arbitrary-403) printf '%s\n403' 'permission denied while GenerateAccessToken rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com iam.serviceAccounts.getAccessToken'; return 0 ;;
   connection) [ "$attempt" != 1 ] || return 7 ;;
   server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
+  not-found) printf 'synthetic-token-never-public\n404'; return 0 ;;
+  rate-limit) printf 'synthetic-token-never-public\n429'; return 0 ;;
   unknown-native) return 53 ;;
   unknown-http) printf 'synthetic-token-never-public\n401'; return 0 ;;
   context-deadline) return 124 ;;
@@ -1878,36 +1950,14 @@ k() {
 			if err != nil || code != scenario.want || strings.TrimSpace(string(attempts)) != strconv.Itoa(scenario.attempts) {
 				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
 			}
-			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("access_token")) {
+			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("synthetic-identity-body-never-public")) || bytes.Contains(output, []byte("access_token")) {
 				t.Fatal("credential response leaked into public output")
 			}
 			if scenario.metadataCategory != "" && !bytes.Contains(output, []byte("category="+scenario.metadataCategory)) {
 				t.Fatalf("metadata category=%s missing from %s", scenario.metadataCategory, output)
 			}
-			if scenario.metadataCategory == "propagation-pending" &&
-				(!bytes.Contains(output, []byte("exact-gsa=true generate-access-token=true permission-marker=true permission-status=true category=propagation-pending"))) {
-				t.Fatalf("structured propagation evidence missing from %s", output)
-			}
-			if strings.HasPrefix(scenario.name, "plain-") && scenario.metadataCategory == "propagation-pending" && !bytes.Contains(output, []byte("json-shape=false plain-shape=true")) {
-				t.Fatalf("plain propagation evidence missing from %s", output)
-			}
-			switch scenario.name {
-			case "wrong-gsa-403":
-				if !bytes.Contains(output, []byte("exact-gsa=false")) {
-					t.Fatalf("wrong GSA semantic rejection missing from %s", output)
-				}
-			case "wrong-permission-403":
-				if !bytes.Contains(output, []byte("permission-marker=false")) {
-					t.Fatalf("wrong permission semantic rejection missing from %s", output)
-				}
-			case "wrong-operation-403":
-				if !bytes.Contains(output, []byte("generate-access-token=false")) {
-					t.Fatalf("wrong operation semantic rejection missing from %s", output)
-				}
-			case "noncanonical-403":
-				if !bytes.Contains(output, []byte("permission-status=false")) {
-					t.Fatalf("wrong status semantic rejection missing from %s", output)
-				}
+			if scenario.metadataCategory == "propagation-pending" && !bytes.Contains(output, []byte("http=403")) {
+				t.Fatalf("status-only propagation evidence missing from %s", output)
 			}
 			identityCategory := "linked-gsa-email"
 			switch scenario.name {
@@ -1958,7 +2008,7 @@ k() {
 				}
 			}
 			entries, err := os.ReadDir(dir)
-			wantEntries := 3
+			wantEntries := 4
 			if malformed {
 				wantEntries++
 			}

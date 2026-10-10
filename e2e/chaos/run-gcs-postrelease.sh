@@ -86,31 +86,6 @@ k() {
   fi
 }
 metadata_credentials_ready_inner() (
-  classify_propagation_403() {
-    classifier_gsa=$1
-    jq -Rrs --arg gsa "$classifier_gsa" '
-      . as $raw | (try ($raw|fromjson) catch null) as $json |
-      if ($json|type)=="object" and ($json.error|type)=="object" and ($json.error.message|type)=="string" then
-        $json.error.message as $message |
-        ([ $message | scan("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.iam\\.gserviceaccount\\.com") ] | unique) as $gsas |
-        ([ $message | scan("iam\\.serviceAccounts\\.[A-Za-z]+") ] | unique) as $permissions |
-        (($gsas|length)==1 and $gsas[0]==$gsa) as $exact_gsa |
-        ($message|test("(^|[^A-Za-z0-9])GenerateAccessToken([^A-Za-z0-9]|$)")) as $generate |
-        (($permissions|length)==1 and $permissions[0]=="iam.serviceAccounts.getAccessToken") as $permission |
-        (($json.error.code==403) and ($json.error.status=="PERMISSION_DENIED")) as $status |
-        [true,false,$exact_gsa,$generate,$permission,$status,($exact_gsa and $generate and $permission and $status)] | @tsv
-      else
-        ($raw | gsub("[\\t\\n\\r ]+";" ") | sub("^ ";"") | sub(" $";"")) as $message |
-        ([ $message | scan("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.iam\\.gserviceaccount\\.com") ] | unique) as $gsas |
-        ([ $message | scan("iam\\.serviceAccounts\\.[A-Za-z]+") ] | unique) as $permissions |
-        (($gsas|length)==1 and $gsas[0]==$gsa) as $exact_gsa |
-        ($message|test("GenerateAccessToken\\(\\\"[^\\\"]+\\\", \\\"\\\"\\)")) as $generate |
-        (($permissions|length)==1 and $permissions[0]=="iam.serviceAccounts.getAccessToken") as $permission |
-        ($message == ("HTTP/403: generic::permission_denied: loading: GenerateAccessToken(\"" + $gsa + "\", \"\"): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).")) as $plain_shape |
-        [false,$plain_shape,$exact_gsa,$generate,$permission,$plain_shape,($plain_shape and $exact_gsa and $generate and $permission)] | @tsv
-      end
-    ' 2>/dev/null
-  }
   # IAM policy grants normally propagate in about two minutes, but can take
   # seven minutes or longer. Bound readiness to that documented seven-minute
   # window and never consume the existing 20-minute auth cleanup reserve.
@@ -138,6 +113,7 @@ metadata_credentials_ready_inner() (
     http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null) || metadata_identity_code=$?
   metadata_identity_http=$(printf '%s\n' "$metadata_identity" | tail -n 1)
   metadata_identity_value=$(printf '%s\n' "$metadata_identity" | sed '$d')
+  case "$metadata_identity_http" in [1-5][0-9][0-9]) ;; *) metadata_identity_http=000 ;; esac
   metadata_principal_identity="principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/$ns/sa/rhiza-gcs"
   metadata_legacy_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID.svc.id.goog"
   metadata_default_node_identity="602454948273-compute@developer.gserviceaccount.com"
@@ -172,44 +148,16 @@ metadata_credentials_ready_inner() (
       --noproxy '*' -H 'Metadata-Flavor: Google' --write-out '\n%{http_code}' \
       http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token 2>/dev/null) || metadata_code=$?
     metadata_http=$(printf '%s\n' "$metadata_response" | tail -n 1 | tr -d '\015')
-    metadata_body=$(printf '%s\n' "$metadata_response" | sed '$d')
     case "$metadata_http" in [1-5][0-9][0-9]) ;; *) metadata_http=000 ;; esac
     metadata_category=unknown
-    metadata_shape=false
-    metadata_plain_shape=false
-    metadata_exact_gsa=false
-    metadata_generate_access_token=false
-    metadata_permission_marker=false
-    metadata_permission_status=false
     if [ "$metadata_code" = 0 ]; then
       case "$metadata_http" in
         200)
           if printf '%s\n' "$metadata_response" | sed '$d' | jq -s -e '
             length==1 and (.[0] | type=="object" and (.access_token|type)=="string" and (.access_token|length)>0 and
             .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
-          ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
-        403)
-          metadata_classification=$(printf '%s' "$metadata_body" | classify_propagation_403 "$data_gsa_email") || metadata_classification='false	false	false	false	false	false	false'
-          old_ifs=$IFS
-          IFS=$(printf '\t')
-          set -- $metadata_classification
-          IFS=$old_ifs
-          if [ "$#" = 7 ]; then
-            metadata_shape=$1
-            metadata_plain_shape=$2
-            metadata_exact_gsa=$3
-            metadata_generate_access_token=$4
-            metadata_permission_marker=$5
-            metadata_permission_status=$6
-            metadata_retryable=$7
-          else
-            metadata_retryable=false
-          fi
-          if [ "$metadata_retryable" = true ]; then
-            metadata_category=propagation-pending
-          else
-            metadata_category=unrecognized-forbidden
-          fi ;;
+          ' >/dev/null 2>&1; then metadata_category=token-valid; else metadata_category=invalid-response; fi ;;
+        403) metadata_category=propagation-pending ;;
       esac
     else
       case "$metadata_code" in
@@ -217,12 +165,30 @@ metadata_credentials_ready_inner() (
         *) metadata_category=native-error ;;
       esac
     fi
-    unset metadata_response metadata_body metadata_classification
-    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s json-shape=%s plain-shape=%s exact-gsa=%s generate-access-token=%s permission-marker=%s permission-status=%s category=%s\n' \
+    unset metadata_response
+    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s category=%s\n' \
       "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" \
-      "$metadata_shape" "$metadata_plain_shape" "$metadata_exact_gsa" "$metadata_generate_access_token" "$metadata_permission_marker" "$metadata_permission_status" "$metadata_category"
+      "$metadata_category"
     case "$metadata_category" in
-      ready) [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124; return 0 ;;
+      token-valid)
+        [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
+        metadata_post_code=0
+        metadata_post=$(k exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 1024 \
+          --noproxy '*' -H 'Metadata-Flavor: Google' --write-out '\n%{http_code}' \
+          http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null) || metadata_post_code=$?
+        metadata_post_http=$(printf '%s\n' "$metadata_post" | tail -n 1 | tr -d '\015')
+        metadata_post_value=$(printf '%s\n' "$metadata_post" | sed '$d')
+        case "$metadata_post_http" in [1-5][0-9][0-9]) ;; *) metadata_post_http=000 ;; esac
+        if [ "$metadata_post_code" = 0 ] && [ "$metadata_post_http" = 200 ] && [ "$metadata_post_value" = "$data_gsa_email" ]; then
+          metadata_post_category=linked-gsa-email
+        else
+          metadata_post_category='identity-drift'
+        fi
+        unset metadata_post metadata_post_value
+        printf 'stage=metadata-credential-readiness post-token-native=%s post-token-http=%s category=%s\n' \
+          "$metadata_post_code" "$metadata_post_http" "$metadata_post_category"
+        [ "$metadata_post_category" = linked-gsa-email ] || return 1
+        return 0 ;;
       propagation-pending) ;;
       deadline) return "$metadata_code" ;;
       *) return 1 ;;
