@@ -314,6 +314,15 @@ same_archive_head_metadata() {
 same_object_evidence() {
   same_archive_head_metadata "$1" "$2" && [ "$(cat "$3")" = "$(cat "$4")" ]
 }
+validate_learner_pod() {
+  jq -e --slurpfile created "$out/learner-created.json" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '
+    .metadata.name=="rhiza-learner" and .metadata.namespace==$ns and
+    .metadata.labels["chaos.rhiza.io/run"]==$run and .metadata.uid==$created[0].metadata.uid and
+    (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+    (.spec.volumes|length)==1 and .spec.volumes[0].name=="data" and
+    (.spec.volumes[0]|keys)==["emptyDir","name"] and (.spec.volumes[0].emptyDir|type)=="object"
+  ' "$1" >/dev/null
+}
 private_file() {
   case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
   [ -f "$1" ] && [ ! -L "$1" ] || die 'regular non-symlink credential file required'
@@ -924,7 +933,7 @@ voters_attempted=true
 run create-voters k create -f "$out/voters.yaml"
 run voters-ready wait_voters 180
 forward() {
-  pod=$1; port=$2
+  pod=$1; port=$2; expected_uid=${3:-}
   case "$port" in
     18080) old_pid=${pf_18080:-} ;;
     18081) old_pid=${pf_18081:-} ;;
@@ -941,7 +950,7 @@ forward() {
   pf_generation=$(( ${pf_generation:-0} + 1 ))
   pf_before="$out/port-forward-$port-generation-$pf_generation-before.json"
   host_digest=${RHIZA_HOST_IMAGE#*@}
-  k get pod "$pod" -o json | jq --argjson pid 0 --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" '
+  k get pod "$pod" -o json | jq --argjson pid 0 --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" --arg expected_uid "$expected_uid" '
     (.status.containerStatuses|length) as $status_count | (.spec.containers|length) as $spec_count |
     [.status.containerStatuses[]?|select(.name=="rhiza")] as $status |
     [.spec.containers[]?|select(.name=="rhiza")] as $spec |
@@ -950,7 +959,7 @@ forward() {
       container_id:$status[0].containerID,image:$spec[0].image,image_id:$status[0].imageID} |
     select($status_count==1 and $spec_count==1 and
       ($status|length)==1 and ($spec|length)==1 and .image==$image and (.image_id|endswith($digest)) and
-      (.uid|type)=="string" and (.uid|length)>0 and
+      (.uid|type)=="string" and (.uid|length)>0 and ($expected_uid=="" or .uid==$expected_uid) and
       .deleting==null and .ready==true and (.container_id|type)=="string" and (.container_id|length)>0 and
       (.image|type)=="string" and (.image|length)>0 and (.image_id|type)=="string" and (.image_id|length)>0)
   ' > "$pf_before" || die 'port-forward target identity invalid'
@@ -983,7 +992,7 @@ forward() {
   done
   kill -0 "$forward_pid" 2>/dev/null || die 'port-forward exited after readiness'
   pf_after="$out/port-forward-$port-generation-$pf_generation-after.json"
-  k get pod "$pod" -o json | jq --argjson pid "$forward_pid" --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" '
+  k get pod "$pod" -o json | jq --argjson pid "$forward_pid" --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" --arg expected_uid "$expected_uid" '
     (.status.containerStatuses|length) as $status_count | (.spec.containers|length) as $spec_count |
     [.status.containerStatuses[]?|select(.name=="rhiza")] as $status |
     [.spec.containers[]?|select(.name=="rhiza")] as $spec |
@@ -992,7 +1001,7 @@ forward() {
       container_id:$status[0].containerID,image:$spec[0].image,image_id:$status[0].imageID} |
     select($status_count==1 and $spec_count==1 and
       ($status|length)==1 and ($spec|length)==1 and .image==$image and (.image_id|endswith($digest)) and
-      (.uid|type)=="string" and (.uid|length)>0 and
+      (.uid|type)=="string" and (.uid|length)>0 and ($expected_uid=="" or .uid==$expected_uid) and
       .deleting==null and .ready==true and (.container_id|type)=="string" and (.container_id|length)>0 and
       (.image|type)=="string" and (.image|length)>0 and (.image_id|type)=="string" and (.image_id|length)>0)
   ' > "$pf_after" || die 'port-forward target identity invalid after readiness'
@@ -1034,6 +1043,8 @@ metrics() {
     jq -e --argjson expected "$expected" '.status.containerStatuses|length==1 and .[0].restartCount==$expected and (.[0].containerID|length)>0' "$identity" >/dev/null || die 'unexpected incarnation/restart; budget cannot be reconstructed'
     if [ "$pod" != rhiza-learner ]; then
       jq -e --slurpfile before "$out/voters-before.json" '. as $p|any($before[0][];.name==$p.metadata.name and .uid==$p.metadata.uid)' "$identity" >/dev/null || die 'unplanned voter Pod replacement'
+    else
+      jq -e --arg uid "$learner_uid" '.metadata.uid==$uid' "$identity" >/dev/null || die 'learner UID changed before metrics/readback'
     fi
     run counters curl -fsS --max-time 5 "http://127.0.0.1:$port/qualification/object-store"
     counters="$out/$seq-counters.stdout"
@@ -1253,8 +1264,11 @@ jq '[if .kind=="List" then .items[] else . end|select(.kind=="Pod" and .metadata
 jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.metadata.name=="rhiza-learner" and
   .metadata.namespace==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run and
   (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/learner-created.json" >/dev/null || die 'learner create UID unresolved'
+run learner-identity k get pod rhiza-learner -o json
+validate_learner_pod "$out/$seq-learner-identity.stdout" || die 'learner create identity or emptyDir contract mismatch'
 run learner-running k wait pod/rhiza-learner --for=jsonpath='{.status.phase}'=Running --timeout=180s
-forward rhiza-learner 18083
+learner_uid=$(jq -r '.metadata.uid' "$out/learner-created.json")
+forward rhiza-learner 18083 "$learner_uid"
 learner_started=true
 metrics
 jq -e '.bytes_downloaded>0' "$counters" >/dev/null || die 'fresh learner GCS download evidence absent'
@@ -1271,8 +1285,8 @@ while :; do
       '.rows==[[1,"before"],[2,"network"],[3,"process"],[4,$sentinel]] and .applied_slot==$status[0].applied_tip and .consensus_tip==$status[0].certified_tip' "$learner_read" >/dev/null; then break; fi
   tries=$((tries + 1)); [ "$tries" -lt 30 ] || die 'cold learner tips/readback did not match sealed source'; sleep 1
 done
-run learner-topology pod_snapshot
-jq -e 'any(.[];.name=="rhiza-learner" and (.volumes|length)==1 and .volumes[0].emptyDir!=null)' "$out/$seq-learner-topology.stdout" >/dev/null || die 'fresh learner volume proof missing'
+run learner-topology k get pod rhiza-learner -o json
+validate_learner_pod "$out/$seq-learner-topology.stdout" || die 'final learner identity or emptyDir contract mismatch'
 run head-metadata-after k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'
 cp "$out/$seq-head-metadata-after.stdout" "$out/archive-head-metadata-after.json"
 validate_archive_head_metadata "$out/archive-head-metadata-after.json" || die 'published archive head metadata changed to invalid'

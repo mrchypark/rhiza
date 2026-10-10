@@ -68,7 +68,7 @@ func TestQualificationColdRestoreContract(t *testing.T) {
 		}
 	}
 	last := -1
-	for _, step := range []string{`execute "$RHIZA_RUN_ID-cold-sentinel"`, "run checkpoint-metadata-before", "run head-metadata-before", "capture_shutdown ||", "run stop-voters k scale statefulset/rhiza-voter --current-replicas=3 --replicas=0", "finish_shutdown_capture ||", "verify_voter_absence ||", "run cold-create", "run learner-local", "run learner-status", "run head-metadata-after", "run checkpoint-metadata-after"} {
+	for _, step := range []string{`execute "$RHIZA_RUN_ID-cold-sentinel"`, "run checkpoint-metadata-before", "run head-metadata-before", "capture_shutdown ||", "run stop-voters k scale statefulset/rhiza-voter --current-replicas=3 --replicas=0", "finish_shutdown_capture ||", "verify_voter_absence ||", "run cold-create", "run learner-identity", `forward rhiza-learner 18083 "$learner_uid"`, "run learner-local", "run learner-status", "run learner-topology", "run head-metadata-after", "run checkpoint-metadata-after"} {
 		at := strings.Index(source, step)
 		if at <= last {
 			t.Fatalf("cold restore step missing or out of order: %q", step)
@@ -85,6 +85,9 @@ func TestQualificationColdRestoreContract(t *testing.T) {
 		`same_object_evidence "$out/archive-head-metadata-before.json"`,
 		`same_object_evidence "$out/checkpoint-CURRENT-metadata-before.json"`,
 		`if [ "$source_quiesced" = true ]; then ports=18083`,
+		`validate_learner_pod "$out/$seq-learner-identity.stdout"`,
+		`validate_learner_pod "$out/$seq-learner-topology.stdout"`,
+		`jq -e --arg uid "$learner_uid" '.metadata.uid==$uid' "$identity"`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("cold restore contract missing %q", required)
@@ -94,6 +97,47 @@ func TestQualificationColdRestoreContract(t *testing.T) {
 	cleanup := source[cleanupAt:cleanupEnd]
 	if learner, capture := strings.Index(cleanup, "k delete pod/rhiza-learner"), strings.Index(cleanup, "capture_shutdown"); learner < 0 || capture <= learner || !strings.Contains(cleanup, `if [ "${source_quiesced:-false}" = false ]; then`) {
 		t.Fatal("failure cleanup does not remove learner first and preserve source quiescence")
+	}
+}
+
+func TestQualificationLearnerIdentityAndVolumeContract(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	start := strings.Index(source, "\nvalidate_learner_pod() {\n")
+	end := strings.Index(source[start+1:], "\nprivate_file() {\n")
+	if start < 0 || end < 0 {
+		t.Fatal("learner validator missing")
+	}
+	validator := source[start : start+1+end]
+	for _, tc := range []struct {
+		name, uid, volumes string
+		ok                 bool
+	}{
+		{"valid", "created", `[{"name":"data","emptyDir":{"sizeLimit":"1Gi"}}]`, true},
+		{"uid-replacement-create", "replacement", `[{"name":"data","emptyDir":{}}]`, false},
+		{"uid-replacement-final", "replacement", `[{"name":"data","emptyDir":{}}]`, false},
+		{"persistent-volume", "created", `[{"name":"data","persistentVolumeClaim":{"claimName":"data"}}]`, false},
+		{"additional-volume", "created", `[{"name":"data","emptyDir":{}},{"name":"extra","emptyDir":{}}]`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			created := `{"metadata":{"uid":"created"}}`
+			pod := fmt.Sprintf(`{"metadata":{"name":"rhiza-learner","namespace":"synthetic","uid":%q,"labels":{"chaos.rhiza.io/run":"a1b2c3d4"}},"spec":{"volumes":%s}}`, tc.uid, tc.volumes)
+			if err := os.WriteFile(filepath.Join(dir, "learner-created.json"), []byte(created), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "pod.json"), []byte(pod), 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "-c", "set -eu; out=$1; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; "+validator+"\nvalidate_learner_pod \"$out/pod.json\"", "fixture", dir)
+			err := command.Run()
+			if (err == nil) != tc.ok {
+				t.Fatalf("accepted=%t want=%t error=%v", err == nil, tc.ok, err)
+			}
+		})
 	}
 }
 
@@ -769,7 +813,7 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 	for _, scenario := range []struct {
 		name string
 		want int
-	}{{"complete", 0}, {"uid-change", 1}, {"container-change", 1}, {"image-change", 1}, {"wrong-stable-image", 1}, {"extra-sidecar", 1}, {"forward-death", 1}, {"bind-conflict", 1}, {"stubborn-child", 0}} {
+	}{{"complete", 0}, {"initial-uid-mismatch", 1}, {"uid-change", 1}, {"container-change", 1}, {"image-change", 1}, {"wrong-stable-image", 1}, {"extra-sidecar", 1}, {"forward-death", 1}, {"bind-conflict", 1}, {"stubborn-child", 0}} {
 		t.Run("forward-"+scenario.name, func(t *testing.T) {
 			dir := t.TempDir()
 			selectedPort := 0
@@ -827,6 +871,7 @@ k() {
   [ "$1" = get ] || return 97
   count=0; [ ! -f "$FAKE_DIR/gets" ] || count=$(cat "$FAKE_DIR/gets"); count=$((count + 1)); printf '%s\n' "$count" > "$FAKE_DIR/gets"
   uid=uid-a; container=container-a; image=$RHIZA_HOST_IMAGE; spec_extra=''; status_extra=''
+  [ "$FAKE_SCENARIO" != initial-uid-mismatch ] || uid=uid-b
   [ "$FAKE_SCENARIO" != wrong-stable-image ] || image=ghcr.io/mrchypark/rhiza-sql@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
   if [ "$FAKE_SCENARIO" = extra-sidecar ]; then spec_extra=',{"name":"sidecar","image":"sidecar"}'; status_extra=',{"name":"sidecar","containerID":"sidecar","imageID":"sidecar"}'; fi
   [ "$count" = 1 ] || case "$FAKE_SCENARIO" in uid-change) uid=uid-b;; container-change) container=container-b;; image-change) image=image-b;; esac
@@ -835,10 +880,10 @@ k() {
 ` + functions + `
 trap 'for pid in $pf_pids; do stop_forward "$pid" || true; done' EXIT
 [ "$FAKE_SCENARIO" != bind-conflict ] || printf 'forced\n' > "$FAKE_DIR/listening"
-forward rhiza-voter-0 "$port"
+forward rhiza-voter-0 "$port" uid-a
 case "$port" in 18080) first=$pf_18080;; 18081) first=$pf_18081;; 18082) first=$pf_18082;; 18083) first=$pf_18083;; esac
 [ "$FAKE_SCENARIO" != complete ] && [ "$FAKE_SCENARIO" != stubborn-child ] && exit 0
-forward rhiza-voter-0 "$port"
+forward rhiza-voter-0 "$port" uid-a
 case "$port" in 18080) second=$pf_18080;; 18081) second=$pf_18081;; 18082) second=$pf_18082;; 18083) second=$pf_18083;; esac
 [ "$first" != "$second" ]
 ! kill -0 "$first" 2>/dev/null
