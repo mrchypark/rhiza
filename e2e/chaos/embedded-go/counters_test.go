@@ -600,7 +600,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -747,7 +747,7 @@ case "$1 $2" in
     case "$*" in
      *'/instance/service-accounts/default/email')
       if [ "$FAKE_SCENARIO" = metadata-wrong-service-account ]; then printf 'node@project.iam.gserviceaccount.com\n200'
-      else printf 'rhiza-gcs.svc.id.goog\n200'; fi ;;
+      else printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n200'; fi ;;
      *'/instance/service-accounts/default/token')
       if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n403'
       else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
@@ -807,6 +807,51 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			expiry := time.Unix(now+3300, 0).UTC().Format(time.RFC3339)
 			if scenario == "expiry" {
 				expiry = time.Unix(now+14400, 0).UTC().Format(time.RFC3339)
+			}
+			dataEmail := "rhiza-v0191-gcs-" + run + "@patch2-the-new-era.iam.gserviceaccount.com"
+			owner := "rhiza-postrelease-" + run + "-" + harness
+			member := "serviceAccount:patch2-the-new-era.svc.id.goog[" + namespace + "/rhiza-gcs]"
+			condition := map[string]string{"title": "rhiza-" + run + "-expiry", "expression": "request.time < timestamp('" + expiry + "')"}
+			dataCreate, _ := json.Marshal(map[string]string{"email": dataEmail, "name": "projects/patch2-the-new-era/serviceAccounts/" + dataEmail, "description": owner, "uniqueId": "synthetic-gsa-unique-id"})
+			dataPolicy, _ := json.Marshal(map[string]any{"bindings": []any{map[string]any{"role": "roles/iam.workloadIdentityUser", "members": []string{member}, "condition": condition}}})
+			write(filepath.Join(dir, "data-create.json"), string(dataCreate), 0600)
+			write(filepath.Join(dir, "data-wi-before.json"), `{"bindings":[]}`, 0600)
+			write(filepath.Join(dir, "data-wi-grant.json"), string(dataPolicy), 0600)
+			workloadIdentity := fmt.Sprintf(`{"run":"%s","namespace":"%s","ksa":{"name":"rhiza-gcs","uid":"synthetic-data-ksa-uid","gcp_service_account":"%s","return_principal_id_as_email":false},"gsa":{"email":"%s","unique_id":"synthetic-gsa-unique-id","owner":"%s","member":"%s","role":"roles/iam.workloadIdentityUser","condition":{"title":"rhiza-%s-expiry","expression":"request.time < timestamp('%s')"}}}`,
+				run, namespace, dataEmail, dataEmail, owner, member, run, expiry)
+			workloadIdentityPath := filepath.Join(dir, "workload-identity.json")
+			write(workloadIdentityPath, workloadIdentity, 0600)
+			workloadIdentitySum := sha256.Sum256([]byte(workloadIdentity))
+			write(filepath.Join(dir, "workload-identity.sha256"), fmt.Sprintf("%x\n", workloadIdentitySum), 0600)
+			if scenario == "workload-identity-receipt-changed" {
+				write(workloadIdentityPath, workloadIdentity+"\n", 0600)
+			}
+			if scenario == "workload-identity-wrong-binding" {
+				workloadIdentity = strings.Replace(workloadIdentity, namespace+"/rhiza-gcs]", namespace+"/other]", 1)
+				write(workloadIdentityPath, workloadIdentity, 0600)
+				workloadIdentitySum = sha256.Sum256([]byte(workloadIdentity))
+				write(filepath.Join(dir, "workload-identity.sha256"), fmt.Sprintf("%x\n", workloadIdentitySum), 0600)
+			}
+			if scenario == "workload-identity-extra-member" {
+				write(filepath.Join(dir, "data-wi-grant.json"), strings.Replace(string(dataPolicy), `"members":["`+member+`"]`, `"members":["`+member+`","user:extra@example.invalid"]`, 1), 0600)
+			}
+			if scenario == "workload-identity-extra-binding" {
+				write(filepath.Join(dir, "data-wi-grant.json"), strings.Replace(string(dataPolicy), `]}`, `,{"role":"roles/viewer","members":["user:extra@example.invalid"]}]}`, 1), 0600)
+			}
+			if scenario == "workload-identity-preexisting-binding" {
+				write(filepath.Join(dir, "data-wi-before.json"), string(dataPolicy), 0600)
+			}
+			if scenario == "workload-identity-recreated-gsa" {
+				workloadIdentity = strings.Replace(workloadIdentity, "synthetic-gsa-unique-id", "replacement-gsa-unique-id", 1)
+				write(workloadIdentityPath, workloadIdentity, 0600)
+				workloadIdentitySum = sha256.Sum256([]byte(workloadIdentity))
+				write(filepath.Join(dir, "workload-identity.sha256"), fmt.Sprintf("%x\n", workloadIdentitySum), 0600)
+			}
+			for _, name := range []string{"data-create.json", "data-wi-before.json", "data-wi-grant.json", "workload-identity.json"} {
+				content, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil || !json.Valid(content) {
+					t.Fatalf("invalid synthetic trust receipt %s: %v", name, err)
+				}
 			}
 			out := filepath.Join(dir, "evidence")
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -998,6 +1043,8 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 					reason = "runtime kubeconfig must be the mint-local receipt"
 				case "cluster-receipt-changed":
 					reason = "trusted cluster metadata preparation failed"
+				case "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa":
+					reason = "trusted workload identity binding receipt rejected"
 				case "metadata-gce-mode":
 					reason = "trusted cluster metadata preparation failed"
 				}
@@ -1007,7 +1054,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				if bytes.Contains(calls, []byte("create")) {
 					t.Fatal("rejected local entry attempted a resource write")
 				}
-				if scenario == "fake-ci" || scenario == "head-mismatch" || scenario == "runtime-kubeconfig-path" {
+				if scenario == "fake-ci" || scenario == "head-mismatch" || scenario == "runtime-kubeconfig-path" || strings.HasPrefix(scenario, "workload-identity-") {
 					if !errors.Is(eventErr, os.ErrNotExist) || !errors.Is(callsErr, os.ErrNotExist) {
 						t.Fatal("pre-parser rejection unexpectedly invoked the local mock")
 					}
@@ -1667,7 +1714,8 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		name           string
 		want, attempts int
 	}{
-		{"ready", 0, 1}, {"forbidden-then-ready", 0, 2}, {"connection", 0, 2}, {"server", 0, 2},
+		{"ready", 0, 1}, {"principal-identity", 1, 0}, {"gsa-email-identity", 1, 0}, {"wrong-identity", 1, 0}, {"identity-http", 1, 0}, {"identity-native", 1, 0},
+		{"forbidden-then-ready", 0, 2}, {"connection", 0, 2}, {"server", 0, 2},
 		{"exhausted", 1, 6}, {"unknown-native", 1, 1}, {"unknown-http", 1, 1},
 		{"forbidden", 1, 6}, {"forbidden-timeout", 1, 6}, {"unknown-http-timeout", 1, 1},
 		{"invalid", 1, 1}, {"multiple", 1, 1}, {"deadline", 124, 1},
@@ -1691,13 +1739,22 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 				}
 			}
 			fixture := `
-mode=run-local; local_deadline=1010; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
+mode=run-local; local_deadline=1010; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
 date() { cat "$FAKE_DIR/clock"; }
 sleep() { now=$(date); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
 k() {
  [ "$metadata_wait_deadline" = 1010 ] || return 96
  case "$*" in
-  *'/instance/service-accounts/default/email') printf 'rhiza-gcs.svc.id.goog\n200'; return 0 ;;
+  *'/instance/service-accounts/default/email')
+   case "$FAKE_SCENARIO" in
+    principal-identity) printf 'principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs\n200' ;;
+    gsa-email-identity) printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200' ;;
+    wrong-identity) printf 'unrelated.svc.id.goog\n200' ;;
+    identity-http) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n404' ;;
+    identity-native) return 7 ;;
+    *) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n200' ;;
+   esac
+   return 0 ;;
   *'/instance/service-accounts/default/token') ;;
   *) return 95 ;;
  esac

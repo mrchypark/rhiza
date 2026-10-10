@@ -141,6 +141,57 @@ validate_cluster_metadata() {
           ($selected|length)==1 and $selected[0].config.workloadMetadataConfig.mode=="GKE_METADATA"))
     ' "$1" >/dev/null || die 'Selected node pool metadata rejected'
 }
+seal_workload_identity() {
+    create_receipt=$RHIZA_AUTH_STATE/data-create.json
+    ksa_receipt=$RHIZA_AUTH_STATE/data-ksa-identity.json
+    pre_policy_receipt=$RHIZA_AUTH_STATE/data-wi-before.json
+    policy_receipt=$RHIZA_AUTH_STATE/data-wi-grant.json
+    current_receipt=$RHIZA_AUTH_STATE/data-post-grant-identity.json
+    wi_receipt=$RHIZA_AUTH_STATE/workload-identity.json
+    wi_checksum=$RHIZA_AUTH_STATE/workload-identity.sha256
+    for live_receipt in "$create_receipt" "$ksa_receipt" "$pre_policy_receipt" "$policy_receipt" "$current_receipt"; do
+        [ -f "$live_receipt" ] && [ ! -L "$live_receipt" ] || die 'Live workload identity receipts missing'
+    done
+    [ ! -e "$wi_receipt" ] && [ ! -e "$wi_checksum" ] || die 'Workload identity receipt collision'
+    jq -e --arg data "$data" --arg owner "$owner" --arg name "projects/$project/serviceAccounts/$data" '
+      .email==$data and .name==$name and .description==$owner and
+      (.uniqueId|type)=="string" and (.uniqueId|length)>0
+    ' "$create_receipt" >/dev/null || die 'Created data GSA identity/ownership rejected'
+    jq -e '((has("bindings")|not) or .bindings==[])' "$pre_policy_receipt" >/dev/null || die 'Fresh data GSA had preexisting IAM bindings'
+    jq -e --arg ns "$ns" --arg data "$data" '
+      .kind=="ServiceAccount" and .apiVersion=="v1" and
+      .metadata.name=="rhiza-gcs" and .metadata.namespace==$ns and
+      (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+      .metadata.annotations["iam.gke.io/gcp-service-account"]==$data and
+      (.metadata.annotations|has("iam.gke.io/return-principal-id-as-email")|not) and
+      .automountServiceAccountToken==false
+    ' "$ksa_receipt" >/dev/null || die 'Live data KSA identity/mode rejected'
+    jq -e --arg member "$data_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
+      (.bindings|type)=="array" and (.bindings|length)==1 and
+      (.bindings[0]|keys)==["condition","members","role"] and
+      .bindings[0].role=="roles/iam.workloadIdentityUser" and
+      .bindings[0].members==[$member] and
+      (.bindings[0].condition|keys)==["expression","title"] and
+      .bindings[0].condition=={title:$title,expression:$expression}
+    ' "$policy_receipt" >/dev/null || die 'Live data GSA workloadIdentityUser binding rejected'
+    jq -e --arg data "$data" --arg owner "$owner" --arg name "projects/$project/serviceAccounts/$data" --slurpfile created "$create_receipt" '
+      .email==$data and .name==$name and .description==$owner and .uniqueId==$created[0].uniqueId
+    ' "$current_receipt" >/dev/null || die 'Data GSA identity changed before workload identity seal'
+    ksa_uid=$(jq -r '.metadata.uid' "$ksa_receipt")
+    gsa_uid=$(jq -r '.uniqueId' "$create_receipt")
+    jq -n --arg run "$RHIZA_RUN_ID" --arg ns "$ns" --arg uid "$ksa_uid" --arg data "$data" \
+      --arg gsa_uid "$gsa_uid" --arg owner "$owner" \
+      --arg member "$data_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{
+        run:$run, namespace:$ns,
+        ksa:{name:"rhiza-gcs",uid:$uid,gcp_service_account:$data,return_principal_id_as_email:false},
+        gsa:{email:$data,unique_id:$gsa_uid,owner:$owner,member:$member,role:"roles/iam.workloadIdentityUser",condition:{title:$title,expression:$expression}}
+      }' > "$wi_receipt"
+    chmod 600 "$wi_receipt"
+    sha256_file "$wi_receipt" > "$wi_checksum"
+    chmod 600 "$wi_checksum"
+}
 mint_local() (
     : "${RHIZA_NODE_A:?}" "${RHIZA_NODE_B:?}" "${RHIZA_NODE_C:?}"
     [ ! -e "$RHIZA_AUTH_STATE/runtime-token-request.attempted" ] || die 'TokenRequest already attempted; no renewal/retry'
@@ -884,6 +935,7 @@ if [ "$mode" = apply ]; then
     record kubernetes-create k create -f "$RHIZA_AUTH_STATE/auth.yaml" -o json
     mark kubernetes
     record namespace-identity k get namespace "$ns" -o json
+    record data-ksa-identity k get serviceaccount rhiza-gcs --namespace="$ns" -o json
     for kind in validatingadmissionpolicy validatingadmissionpolicybinding; do
         for suffix in faults network-faults runtime; do
             record "$kind-$suffix-identity" k get "$kind" "$ns-$suffix" -o json
@@ -933,6 +985,8 @@ if [ "$mode" = apply ]; then
     fi
     record data-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
     mark data-wi-grant
+    record data-post-grant-identity g iam service-accounts describe "$data" --format=json
+    seal_workload_identity
     record folder-grant folder_iam add
     mark folder-grant
     record project-after g projects get-iam-policy "$project" --format=json

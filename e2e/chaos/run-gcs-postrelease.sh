@@ -93,15 +93,17 @@ metadata_credentials_ready() (
     http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null) || metadata_identity_code=$?
   metadata_identity_http=$(printf '%s\n' "$metadata_identity" | tail -n 1)
   metadata_identity_value=$(printf '%s\n' "$metadata_identity" | sed '$d')
-  if [ "$metadata_identity_code" = 0 ] && [ "$metadata_identity_http" = 200 ] && [ "$metadata_identity_value" = rhiza-gcs.svc.id.goog ]; then
-    metadata_identity_category=ksa-rhiza-gcs
-  else
-    metadata_identity_category=rejected
+  metadata_impersonation_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID.svc.id.goog"
+  metadata_identity_category=rejected
+  if [ "$metadata_identity_code" = 0 ] && [ "$metadata_identity_http" = 200 ]; then
+    if [ "$metadata_identity_value" = "$metadata_impersonation_identity" ]; then
+      metadata_identity_category=iam-sa-impersonation
+    fi
   fi
-  unset metadata_identity metadata_identity_value
+  unset metadata_identity metadata_identity_value metadata_impersonation_identity
   printf 'stage=metadata-credential-readiness native=%s http=%s category=%s\n' \
     "$metadata_identity_code" "$metadata_identity_http" "$metadata_identity_category"
-  [ "$metadata_identity_category" = ksa-rhiza-gcs ] || return 1
+  [ "$metadata_identity_category" = iam-sa-impersonation ] || return 1
   metadata_attempt=0
   while [ "$metadata_attempt" -lt 6 ]; do
     [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
@@ -247,6 +249,51 @@ private_file() {
   fi
   [ "$permissions" = 600 ] && [ "$file_owner" = "$(id -u)" ] && [ "$directory_permissions" = 700 ] || die 'private credential ownership/permissions required'
 }
+prepare_workload_identity_receipt() {
+  wi_receipt=$runtime_receipt_dir/workload-identity.json
+  wi_checksum=$runtime_receipt_dir/workload-identity.sha256
+  data_create_receipt=$runtime_receipt_dir/data-create.json
+  data_pre_policy_receipt=$runtime_receipt_dir/data-wi-before.json
+  data_policy_receipt=$runtime_receipt_dir/data-wi-grant.json
+  private_file "$wi_receipt"
+  private_file "$wi_checksum"
+  private_file "$data_create_receipt"
+  private_file "$data_pre_policy_receipt"
+  private_file "$data_policy_receipt"
+  expected_wi_checksum=$(cat "$wi_checksum")
+  printf '%s' "$expected_wi_checksum" | grep -Eq '^[a-f0-9]{64}$' || return 1
+  [ "$(sha256_file "$wi_receipt")" = "$expected_wi_checksum" ] || return 1
+  wi_data="rhiza-v0191-gcs-$RHIZA_RUN_ID@patch2-the-new-era.iam.gserviceaccount.com"
+  wi_owner="rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA"
+  wi_member="serviceAccount:patch2-the-new-era.svc.id.goog[$ns/rhiza-gcs]"
+  wi_title="rhiza-$RHIZA_RUN_ID-expiry"
+  wi_expression="request.time < timestamp('$RHIZA_AUTH_EXPIRES')"
+  jq -e --arg data "$wi_data" --arg owner "$wi_owner" --arg name "projects/patch2-the-new-era/serviceAccounts/$wi_data" '
+    .email==$data and .name==$name and .description==$owner and
+    (.uniqueId|type)=="string" and (.uniqueId|length)>0
+  ' "$data_create_receipt" >/dev/null || return 1
+  jq -e '((has("bindings")|not) or .bindings==[])' "$data_pre_policy_receipt" >/dev/null || return 1
+  jq -e --arg member "$wi_member" --arg title "$wi_title" --arg expression "$wi_expression" '
+    (.bindings|type)=="array" and (.bindings|length)==1 and
+    (.bindings[0]|keys)==["condition","members","role"] and
+    .bindings[0].role=="roles/iam.workloadIdentityUser" and .bindings[0].members==[$member] and
+    (.bindings[0].condition|keys)==["expression","title"] and
+    .bindings[0].condition=={title:$title,expression:$expression}
+  ' "$data_policy_receipt" >/dev/null || return 1
+  jq -e --arg run "$RHIZA_RUN_ID" --arg ns "$ns" \
+    --arg data "$wi_data" --arg owner "$wi_owner" --arg member "$wi_member" \
+    --arg title "$wi_title" --arg expression "$wi_expression" --slurpfile created "$data_create_receipt" '
+    keys==["gsa","ksa","namespace","run"] and .run==$run and .namespace==$ns and
+    (.ksa|keys)==["gcp_service_account","name","return_principal_id_as_email","uid"] and
+    .ksa.name=="rhiza-gcs" and (.ksa.uid|type)=="string" and (.ksa.uid|length)>0 and
+    .ksa.gcp_service_account==$data and .ksa.return_principal_id_as_email==false and
+    (.gsa|keys)==["condition","email","member","owner","role","unique_id"] and .gsa.email==$data and
+    .gsa.unique_id==$created[0].uniqueId and .gsa.owner==$owner and
+    .gsa.member==$member and .gsa.role=="roles/iam.workloadIdentityUser" and
+    (.gsa.condition|keys)==["expression","title"] and
+    .gsa.condition.title==$title and .gsa.condition.expression==$expression
+  ' "$wi_receipt" >/dev/null
+}
 sed -e "s|__NAMESPACE__|$ns|g" -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
   -e "s|__CLUSTER_ID__|$cluster|g" -e "s|__HOST_IMAGE__|$RHIZA_HOST_IMAGE|g" \
   -e "s|__METADATA_IMAGE__|$RHIZA_METADATA_IMAGE|g" \
@@ -371,6 +418,7 @@ else
   case "$RHIZA_AUTH_STATE" in /*) ;; *) die 'private absolute auth state required' ;; esac
   [ -d "$RHIZA_AUTH_STATE" ] && [ ! -L "$RHIZA_AUTH_STATE" ] || die 'private auth state directory required'
   runtime_receipt_dir=$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)
+  prepare_workload_identity_receipt || die 'trusted workload identity binding receipt rejected'
   supplied_kubeconfig=$(CDPATH='' cd -- "$(dirname -- "$RHIZA_LOCAL_RUNTIME_KUBECONFIG")" && pwd -P)/$(basename -- "$RHIZA_LOCAL_RUNTIME_KUBECONFIG")
   [ "$supplied_kubeconfig" = "$runtime_receipt_dir/runtime.kubeconfig" ] || die 'runtime kubeconfig must be the mint-local receipt'
   RHIZA_LOCAL_RUNTIME_KUBECONFIG=$supplied_kubeconfig
