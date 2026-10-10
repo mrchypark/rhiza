@@ -52,6 +52,24 @@ func TestObjectStoreCountersAllowlist(t *testing.T) {
 	}
 }
 
+func TestBootstrapCustomRoleDeleteReceiptIsStructuredAndValidated(t *testing.T) {
+	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, required := range []string{
+		`record "$tag-delete" g iam roles delete "$role" --format=json`,
+		`.name==$created[0].name and .name==$current[0].name`,
+		`.description==$owner and .deleted==true`,
+		`Custom role delete receipt rejected`,
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("missing structured custom-role rollback check %q", required)
+		}
+	}
+}
+
 func TestQualificationQUICHandshake(t *testing.T) {
 	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -1755,10 +1773,13 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		{"wrong-run-gsa-email", 1, 0, ""}, {"wrong-project-gsa-email", 1, 0, ""}, {"wrong-gsa-email", 1, 0, ""},
 		{"node-default-identity", 1, 0, ""}, {"wrong-identity", 1, 0, ""}, {"identity-http", 1, 0, ""}, {"identity-native", 1, 0, ""},
 		{"propagation-then-ready", 0, 2, "propagation-pending"}, {"whitespace-then-ready", 0, 2, "propagation-pending"},
+		{"plain-propagation-then-ready", 0, 2, "propagation-pending"}, {"plain-whitespace-then-ready", 0, 2, "propagation-pending"},
 		{"backward-wall-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
 		{"nonretryable-403", 1, 1, "unrecognized-forbidden"}, {"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"},
 		{"wrong-gsa-403", 1, 1, "unrecognized-forbidden"}, {"wrong-permission-403", 1, 1, "unrecognized-forbidden"},
 		{"wrong-operation-403", 1, 1, "unrecognized-forbidden"}, {"noncanonical-403", 1, 1, "unrecognized-forbidden"},
+		{"plain-wrong-gsa-403", 1, 1, "unrecognized-forbidden"}, {"plain-wrong-permission-403", 1, 1, "unrecognized-forbidden"},
+		{"plain-arbitrary-403", 1, 1, "unrecognized-forbidden"},
 		{"unknown-native", 1, 1, "native-error"}, {"unknown-http", 1, 1, "unknown"}, {"context-deadline", 124, 1, "deadline"},
 		{"invalid", 1, 1, "invalid-response"}, {"multiple", 1, 1, "invalid-response"}, {"deadline", 124, 1, "ready"},
 		{"budget-reserve", 124, 0, ""}, {"missing-token", 1, 1, "invalid-response"}, {"empty-token", 1, 1, "invalid-response"},
@@ -1814,12 +1835,17 @@ k() {
  case "$FAKE_SCENARIO" in
   propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' '{"error":{"code":403,"message":"loading GenerateAccessToken(\"rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\"): Permission iam.serviceAccounts.getAccessToken denied on resource","status":"PERMISSION_DENIED"}}'; return 0; } ;;
   whitespace-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403\r' '{ "error" : { "status" : "PERMISSION_DENIED", "message" : "Permission  iam.serviceAccounts.getAccessToken denied.\nGenerateAccessToken ( rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com )", "code" : 403 } }'; return 0; } ;;
+  plain-propagation-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).'; return 0; } ;;
+  plain-whitespace-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403:\tgeneric::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""):\r\ngoogleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
   propagation-exhausted) printf '%s\n403' '{"error":{"status":"PERMISSION_DENIED","message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com failed: iam.serviceAccounts.getAccessToken permission denied","code":403}}'; return 0 ;;
   nonretryable-403) printf 'Permission denied for an unrelated reason\n403'; return 0 ;;
   wrong-gsa-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-deadbeef@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
   wrong-permission-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.actAs denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
   wrong-operation-403) printf '%s\n403' '{"error":{"code":403,"message":"SignBlob for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
   noncanonical-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"FORBIDDEN"}}'; return 0 ;;
+  plain-wrong-gsa-403) printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("wrong@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).'; return 0 ;;
+  plain-wrong-permission-403) printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.actAs'\'' denied on resource (or it may not exist).'; return 0 ;;
+  plain-arbitrary-403) printf '%s\n403' 'permission denied while GenerateAccessToken rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com iam.serviceAccounts.getAccessToken'; return 0 ;;
   connection) [ "$attempt" != 1 ] || return 7 ;;
   server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
   unknown-native) return 53 ;;
@@ -1832,6 +1858,7 @@ k() {
  esac
  printf '{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":100}\n200'
 }
+
 `
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -1858,8 +1885,11 @@ k() {
 				t.Fatalf("metadata category=%s missing from %s", scenario.metadataCategory, output)
 			}
 			if scenario.metadataCategory == "propagation-pending" &&
-				(!bytes.Contains(output, []byte("shape=true exact-gsa=true generate-access-token=true permission-marker=true permission-status=true category=propagation-pending"))) {
+				(!bytes.Contains(output, []byte("exact-gsa=true generate-access-token=true permission-marker=true permission-status=true category=propagation-pending"))) {
 				t.Fatalf("structured propagation evidence missing from %s", output)
+			}
+			if strings.HasPrefix(scenario.name, "plain-") && scenario.metadataCategory == "propagation-pending" && !bytes.Contains(output, []byte("json-shape=false plain-shape=true")) {
+				t.Fatalf("plain propagation evidence missing from %s", output)
 			}
 			switch scenario.name {
 			case "wrong-gsa-403":

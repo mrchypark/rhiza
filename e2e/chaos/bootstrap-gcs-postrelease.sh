@@ -1101,7 +1101,13 @@ for role in "$cluster_role" "$folder_role"; do
         record "$tag-current" g iam roles describe "$role" --format=json
         [ "$(jq -r .description "$RHIZA_AUTH_STATE/$tag-current.json")" = "$owner" ] || die 'Role ownership changed'
         jq -e --slurpfile original "$RHIZA_AUTH_STATE/$tag-create.json" '.name == $original[0].name and .etag == $original[0].etag and .includedPermissions == $original[0].includedPermissions and .stage == $original[0].stage' "$RHIZA_AUTH_STATE/$tag-current.json" >/dev/null || die 'Custom role changed since creation; preserve and request exact rollback review'
-        record "$tag-delete" g iam roles delete "$role"
+        record "$tag-delete" g iam roles delete "$role" --format=json
+        jq -e --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$tag-create.json" --slurpfile current "$RHIZA_AUTH_STATE/$tag-current.json" '
+          type=="object" and ($created|length)==1 and ($current|length)==1 and
+          .name==$created[0].name and .name==$current[0].name and
+          .description==$owner and .deleted==true and
+          .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
+        ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
     fi
 done
 record project-rollback g projects get-iam-policy "$project" --format=json

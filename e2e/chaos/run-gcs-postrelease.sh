@@ -88,17 +88,27 @@ k() {
 metadata_credentials_ready_inner() (
   classify_propagation_403() {
     classifier_gsa=$1
-    jq -r --arg gsa "$classifier_gsa" '
-      if type=="object" and (.error|type)=="object" and (.error.message|type)=="string" then
-        .error.message as $message |
+    jq -Rrs --arg gsa "$classifier_gsa" '
+      . as $raw | (try ($raw|fromjson) catch null) as $json |
+      if ($json|type)=="object" and ($json.error|type)=="object" and ($json.error.message|type)=="string" then
+        $json.error.message as $message |
         ([ $message | scan("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.iam\\.gserviceaccount\\.com") ] | unique) as $gsas |
         ([ $message | scan("iam\\.serviceAccounts\\.[A-Za-z]+") ] | unique) as $permissions |
         (($gsas|length)==1 and $gsas[0]==$gsa) as $exact_gsa |
         ($message|test("(^|[^A-Za-z0-9])GenerateAccessToken([^A-Za-z0-9]|$)")) as $generate |
         (($permissions|length)==1 and $permissions[0]=="iam.serviceAccounts.getAccessToken") as $permission |
-        ((.error.code==403) and (.error.status=="PERMISSION_DENIED")) as $status |
-        [true,$exact_gsa,$generate,$permission,$status,($exact_gsa and $generate and $permission and $status)] | @tsv
-      else [false,false,false,false,false,false] | @tsv end
+        (($json.error.code==403) and ($json.error.status=="PERMISSION_DENIED")) as $status |
+        [true,false,$exact_gsa,$generate,$permission,$status,($exact_gsa and $generate and $permission and $status)] | @tsv
+      else
+        ($raw | gsub("[\\t\\n\\r ]+";" ") | sub("^ ";"") | sub(" $";"")) as $message |
+        ([ $message | scan("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.iam\\.gserviceaccount\\.com") ] | unique) as $gsas |
+        ([ $message | scan("iam\\.serviceAccounts\\.[A-Za-z]+") ] | unique) as $permissions |
+        (($gsas|length)==1 and $gsas[0]==$gsa) as $exact_gsa |
+        ($message|test("GenerateAccessToken\\(\\\"[^\\\"]+\\\", \\\"\\\"\\)")) as $generate |
+        (($permissions|length)==1 and $permissions[0]=="iam.serviceAccounts.getAccessToken") as $permission |
+        ($message == ("HTTP/403: generic::permission_denied: loading: GenerateAccessToken(\"" + $gsa + "\", \"\"): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).")) as $plain_shape |
+        [false,$plain_shape,$exact_gsa,$generate,$permission,$plain_shape,($plain_shape and $exact_gsa and $generate and $permission)] | @tsv
+      end
     ' 2>/dev/null
   }
   # IAM policy grants normally propagate in about two minutes, but can take
@@ -166,6 +176,7 @@ metadata_credentials_ready_inner() (
     case "$metadata_http" in [1-5][0-9][0-9]) ;; *) metadata_http=000 ;; esac
     metadata_category=unknown
     metadata_shape=false
+    metadata_plain_shape=false
     metadata_exact_gsa=false
     metadata_generate_access_token=false
     metadata_permission_marker=false
@@ -178,18 +189,19 @@ metadata_credentials_ready_inner() (
             .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
           ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
         403)
-          metadata_classification=$(printf '%s' "$metadata_body" | classify_propagation_403 "$data_gsa_email") || metadata_classification='false	false	false	false	false	false'
+          metadata_classification=$(printf '%s' "$metadata_body" | classify_propagation_403 "$data_gsa_email") || metadata_classification='false	false	false	false	false	false	false'
           old_ifs=$IFS
           IFS=$(printf '\t')
           set -- $metadata_classification
           IFS=$old_ifs
-          if [ "$#" = 6 ]; then
+          if [ "$#" = 7 ]; then
             metadata_shape=$1
-            metadata_exact_gsa=$2
-            metadata_generate_access_token=$3
-            metadata_permission_marker=$4
-            metadata_permission_status=$5
-            metadata_retryable=$6
+            metadata_plain_shape=$2
+            metadata_exact_gsa=$3
+            metadata_generate_access_token=$4
+            metadata_permission_marker=$5
+            metadata_permission_status=$6
+            metadata_retryable=$7
           else
             metadata_retryable=false
           fi
@@ -206,9 +218,9 @@ metadata_credentials_ready_inner() (
       esac
     fi
     unset metadata_response metadata_body metadata_classification
-    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s shape=%s exact-gsa=%s generate-access-token=%s permission-marker=%s permission-status=%s category=%s\n' \
+    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s json-shape=%s plain-shape=%s exact-gsa=%s generate-access-token=%s permission-marker=%s permission-status=%s category=%s\n' \
       "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" \
-      "$metadata_shape" "$metadata_exact_gsa" "$metadata_generate_access_token" "$metadata_permission_marker" "$metadata_permission_status" "$metadata_category"
+      "$metadata_shape" "$metadata_plain_shape" "$metadata_exact_gsa" "$metadata_generate_access_token" "$metadata_permission_marker" "$metadata_permission_status" "$metadata_category"
     case "$metadata_category" in
       ready) [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124; return 0 ;;
       propagation-pending) ;;
