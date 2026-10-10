@@ -342,7 +342,7 @@ jobs:
         run: |
           awk '
             { print }
-            $0 == "FROM public.ecr.aws/docker/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
+            $0 == "FROM mirror.gcr.io/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
               print "RUN apk --no-cache add jq coreutils"
               matched++
             }
@@ -385,7 +385,7 @@ jobs:
             e2e/chaos/Dockerfile \
             e2e/chaos/Dockerfile.rust > "$approved_mirror_diff"
           printf '%s  %s\n' \
-            f54cd3b6f4f3f43c68b07e727f23b9a60954bef033731247296046f3dc35a58d \
+            4910dece3c307b461132d417d24b6cb13920608659110da872b2a3b188ede77d \
             "$approved_mirror_diff" | sha256sum --check --strict
           approved_benchmark_diff="$RUNNER_TEMP/approved-benchmark.diff"
           LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
