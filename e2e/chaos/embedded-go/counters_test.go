@@ -79,12 +79,9 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := strings.Index(string(source), "\nwait_deleted_sa() {\n")
-	end := strings.Index(string(source)[start+1:], "\n}\n")
-	if start < 0 || end < 0 {
-		t.Fatal("GSA deletion waiter missing")
+	if !bytes.Contains(source, []byte(`timeout --kill-after=5s 415s /bin/sh "$script_dir/bootstrap-gcs-postrelease.sh" gsa-delete-wait-worker`)) {
+		t.Fatal("GSA deletion wait lacks the 415-second worker plus five-second monotonic kill bound")
 	}
-	function := string(source)[start+1 : start+1+end+2]
 	for _, scenario := range []struct {
 		name           string
 		want, attempts int
@@ -97,33 +94,33 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			dir := t.TempDir()
-			fixture := `set -eu
-RHIZA_AUTH_STATE=$FAKE_DIR
-project=fixture-project
-owner=fixture-owner
-now_epoch() { printf '1000\n'; }
-deadline_remaining() { printf '420\n'; }
-retry_pause() { :; }
-die() { printf '%s\n' "$*" >&2; exit 1; }
-timeout() { shift 2; "$@"; }
-gcloud() {
+			gcloud := `#!/bin/sh
+set -eu
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
+ printf '%s\n' "$*" >> "$FAKE_DIR/calls"
  case "$FAKE_SCENARIO" in
   eventual-not-found)
-   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"fixture@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; return 0; fi
-   printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account.' >&2; return 1 ;;
-  identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; return 0 ;;
-  permission-denied) printf '%s\n' 'ERROR: PERMISSION_DENIED' >&2; return 1 ;;
-  rate-limit) printf '%s\n' 'ERROR: HTTPError 429' >&2; return 1 ;;
-  server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; return 1 ;;
+   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"fixture@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; exit 0; fi
+   printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account. This command is authenticated as [fixture@example.invalid] which is the active account specified by the [core/account] property' >&2; exit 1 ;;
+  identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; exit 0 ;;
+  permission-denied) printf '%s\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;
+  rate-limit) printf '%s\n' 'ERROR: HTTPError 429' >&2; exit 1 ;;
+  server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; exit 1 ;;
  esac
-}
 `
 			if err := os.WriteFile(filepath.Join(dir, "attempts"), []byte("0\n"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			command := exec.Command("/bin/sh", "-c", fixture+function+"\nwait_deleted_sa fixture fixture@example.invalid fixture-uid")
-			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name)
+			if err := os.WriteFile(filepath.Join(dir, "gcloud"), []byte(gcloud), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "sleep"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "gsa-delete-wait-worker")
+			command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name,
+				"RHIZA_GSA_DELETE_STATE="+dir, "RHIZA_GSA_DELETE_TAG=fixture", "RHIZA_GSA_DELETE_ACCOUNT=fixture@example.invalid",
+				"RHIZA_GSA_DELETE_UID=fixture-uid", "RHIZA_GSA_DELETE_OWNER=fixture-owner")
 			output, runErr := command.CombinedOutput()
 			code := 0
 			if runErr != nil {
@@ -137,8 +134,39 @@ gcloud() {
 			if err != nil || code != scenario.want || strings.TrimSpace(string(attempts)) != strconv.Itoa(scenario.attempts) {
 				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
 			}
+			calls, err := os.ReadFile(filepath.Join(dir, "calls"))
+			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe fixture@example.invalid --format=json")) {
+				t.Fatalf("worker issued a non-describe operation: %q error=%v", calls, err)
+			}
 		})
 	}
+	t.Run("persistent-exists-frozen-backward-clock", func(t *testing.T) {
+		dir := t.TempDir()
+		gcloud := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_DIR/calls\"\nprintf '%s\\n' '{\"email\":\"fixture@example.invalid\",\"uniqueId\":\"fixture-uid\",\"description\":\"fixture-owner\"}'\n"
+		date := "#!/bin/sh\nvalue=$(cat \"$FAKE_DIR/clock\")\nprintf '%s\\n' \"$value\"\nprintf '%s\\n' \"$((value - 100))\" > \"$FAKE_DIR/clock\"\n"
+		for name, content := range map[string]string{"gcloud": gcloud, "date": date} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dir, "clock"), []byte("1000\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		command := exec.Command("timeout", "--kill-after=1s", "1s", "/bin/sh", "../bootstrap-gcs-postrelease.sh", "gsa-delete-wait-worker")
+		command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir,
+			"RHIZA_GSA_DELETE_STATE="+dir, "RHIZA_GSA_DELETE_TAG=fixture", "RHIZA_GSA_DELETE_ACCOUNT=fixture@example.invalid",
+			"RHIZA_GSA_DELETE_UID=fixture-uid", "RHIZA_GSA_DELETE_OWNER=fixture-owner")
+		runErr := command.Run()
+		var exited *exec.ExitError
+		if !errors.As(runErr, &exited) || exited.ExitCode() != 124 || time.Since(started) > 3*time.Second {
+			t.Fatalf("outer watchdog failed: error=%v elapsed=%s", runErr, time.Since(started))
+		}
+		calls, err := os.ReadFile(filepath.Join(dir, "calls"))
+		if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe")) {
+			t.Fatalf("bounded worker issued a non-describe operation: %q error=%v", calls, err)
+		}
+	})
 }
 
 func TestQualificationQUICHandshake(t *testing.T) {
@@ -1844,6 +1872,7 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		{"wrong-run-gsa-email", 1, 0, ""}, {"wrong-project-gsa-email", 1, 0, ""}, {"wrong-gsa-email", 1, 0, ""},
 		{"node-default-identity", 1, 0, ""}, {"wrong-identity", 1, 0, ""}, {"identity-http", 1, 0, ""}, {"identity-native", 1, 0, ""},
 		{"propagation-then-ready", 0, 2, "propagation-pending"}, {"whitespace-then-ready", 0, 2, "propagation-pending"},
+		{"arbitrary-403-then-ready", 0, 2, "propagation-pending"},
 		{"plain-propagation-then-ready", 0, 2, "propagation-pending"}, {"plain-whitespace-then-ready", 0, 2, "propagation-pending"},
 		{"backward-wall-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
 		{"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"}, {"not-found", 1, 1, "unknown"}, {"rate-limit", 1, 1, "unknown"},
@@ -1904,6 +1933,7 @@ k() {
  printf 'synthetic-token-never-public\n' >&2
  case "$FAKE_SCENARIO" in
   propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' '{"error":{"code":403,"message":"loading GenerateAccessToken(\"rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\"): Permission iam.serviceAccounts.getAccessToken denied on resource","status":"PERMISSION_DENIED"}}'; return 0; } ;;
+  arbitrary-403-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' 'synthetic-arbitrary-forbidden-body-never-public'; return 0; } ;;
   whitespace-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403\r' '{ "error" : { "status" : "PERMISSION_DENIED", "message" : "Permission  iam.serviceAccounts.getAccessToken denied.\nGenerateAccessToken ( rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com )", "code" : 403 } }'; return 0; } ;;
   plain-propagation-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).'; return 0; } ;;
   plain-whitespace-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403:\tgeneric::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""):\r\ngoogleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
@@ -1950,7 +1980,7 @@ k() {
 			if err != nil || code != scenario.want || strings.TrimSpace(string(attempts)) != strconv.Itoa(scenario.attempts) {
 				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
 			}
-			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("synthetic-identity-body-never-public")) || bytes.Contains(output, []byte("access_token")) {
+			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("synthetic-identity-body-never-public")) || bytes.Contains(output, []byte("synthetic-arbitrary-forbidden-body-never-public")) || bytes.Contains(output, []byte("access_token")) {
 				t.Fatal("credential response leaked into public output")
 			}
 			if scenario.metadataCategory != "" && !bytes.Contains(output, []byte("category="+scenario.metadataCategory)) {
