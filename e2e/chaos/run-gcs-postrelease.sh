@@ -294,12 +294,14 @@ validate_archive_head_metadata() {
   jq -e --arg bucket rhiza-v070-chaos-ied-20260811 --arg name "${prefix}${cluster}/archive/head.bin" '
     keys==["bucket","generation","name","size"] and .bucket==$bucket and .name==$name and
     (.generation|type)=="string" and (.generation|test("^[1-9][0-9]*$")) and
-    (.size|type)=="string" and (.size|test("^(0|[1-9][0-9]*)$")) and
-    ((.size|tonumber)>=132) and ((.size|tonumber)<=8388632)
+    (.size as $size |
+      ((($size|type)=="string" and ($size|test("^(0|[1-9][0-9]*)$"))) or
+       (($size|type)=="number" and $size == ($size|floor))) and
+      (($size|tonumber)>=132) and (($size|tonumber)<=8388632))
   ' "$1" >/dev/null
 }
 same_archive_head_metadata() {
-  jq -e --slurpfile before "$1" '.generation==$before[0].generation and .size==$before[0].size' "$2" >/dev/null
+  jq -e --slurpfile before "$1" '.generation==$before[0].generation and (.size|tonumber)==($before[0].size|tonumber)' "$2" >/dev/null
 }
 private_file() {
   case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
