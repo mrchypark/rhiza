@@ -747,7 +747,7 @@ case "$1 $2" in
     case "$*" in
      *'/instance/service-accounts/default/email')
       if [ "$FAKE_SCENARIO" = metadata-wrong-service-account ]; then printf 'node@project.iam.gserviceaccount.com\n200'
-      else printf 'principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs\n200'; fi ;;
+      else printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200'; fi ;;
      *'/instance/service-accounts/default/token')
       if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n403'
       else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
@@ -1727,7 +1727,9 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		name           string
 		want, attempts int
 	}{
-		{"ready", 0, 1}, {"legacy-alias-identity", 1, 0}, {"gsa-email-identity", 1, 0}, {"node-default-identity", 1, 0}, {"wrong-identity", 1, 0}, {"identity-http", 1, 0}, {"identity-native", 1, 0},
+		{"ready", 0, 1}, {"principal-uri-identity", 1, 0}, {"legacy-alias-identity", 1, 0},
+		{"wrong-run-gsa-email", 1, 0}, {"wrong-project-gsa-email", 1, 0}, {"wrong-gsa-email", 1, 0},
+		{"node-default-identity", 1, 0}, {"wrong-identity", 1, 0}, {"identity-http", 1, 0}, {"identity-native", 1, 0},
 		{"forbidden-then-ready", 0, 2}, {"connection", 0, 2}, {"server", 0, 2},
 		{"exhausted", 1, 6}, {"unknown-native", 1, 1}, {"unknown-http", 1, 1},
 		{"forbidden", 1, 6}, {"forbidden-timeout", 1, 6}, {"unknown-http-timeout", 1, 1},
@@ -1752,7 +1754,7 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 				}
 			}
 			fixture := `
-mode=run-local; local_deadline=1010; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
+mode=run-local; local_deadline=1010; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; data_gsa_email=rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
 date() { cat "$FAKE_DIR/clock"; }
 sleep() { now=$(date); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
 k() {
@@ -1760,13 +1762,16 @@ k() {
  case "$*" in
   *'/instance/service-accounts/default/email')
    case "$FAKE_SCENARIO" in
+    principal-uri-identity) printf 'principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs\n200' ;;
     legacy-alias-identity) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n200' ;;
-    gsa-email-identity) printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200' ;;
+    wrong-run-gsa-email) printf 'rhiza-v0191-gcs-deadbeef@patch2-the-new-era.iam.gserviceaccount.com\n200' ;;
+    wrong-project-gsa-email) printf 'rhiza-v0191-gcs-a1b2c3d4@other-project.iam.gserviceaccount.com\n200' ;;
+    wrong-gsa-email) printf 'other@patch2-the-new-era.iam.gserviceaccount.com\n200' ;;
     node-default-identity) printf '602454948273-compute@developer.gserviceaccount.com\n200' ;;
     wrong-identity) printf 'unrelated.svc.id.goog\n200' ;;
     identity-http) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n404' ;;
     identity-native) return 7 ;;
-    *) printf 'principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs\n200' ;;
+    *) printf 'rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\n200' ;;
    esac
    return 0 ;;
   *'/instance/service-accounts/default/token') ;;
@@ -1812,12 +1817,14 @@ k() {
 			if bytes.Contains(output, []byte("synthetic-token-never-public")) || bytes.Contains(output, []byte("access_token")) {
 				t.Fatal("credential response leaked into public output")
 			}
-			identityCategory := "expected-principal"
+			identityCategory := "linked-gsa-email"
 			switch scenario.name {
+			case "principal-uri-identity":
+				identityCategory = "principal-uri"
 			case "legacy-alias-identity":
 				identityCategory = "legacy-ksa-alias"
-			case "gsa-email-identity":
-				identityCategory = "run-gsa-email"
+			case "wrong-run-gsa-email", "wrong-project-gsa-email", "wrong-gsa-email":
+				identityCategory = "other-gsa-email"
 			case "node-default-identity":
 				identityCategory = "node-default"
 			case "wrong-identity":
@@ -1834,6 +1841,9 @@ k() {
 				"principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs",
 				"rhiza-v0191-gcs-a1b2c3d4.svc.id.goog",
 				"rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com",
+				"rhiza-v0191-gcs-deadbeef@patch2-the-new-era.iam.gserviceaccount.com",
+				"rhiza-v0191-gcs-a1b2c3d4@other-project.iam.gserviceaccount.com",
+				"other@patch2-the-new-era.iam.gserviceaccount.com",
 				"602454948273-compute@developer.gserviceaccount.com",
 				"unrelated.svc.id.goog",
 			} {

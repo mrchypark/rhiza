@@ -29,6 +29,7 @@ safe_name() { printf '%s' "$1" | LC_ALL=C grep -Eq '^[a-f0-9]{8}$'; }
 printf '%s' "$RHIZA_AUTH_CREATION_SHA" | LC_ALL=C grep -Eq '^[a-f0-9]{40}$' || die 'exact auth creation SHA required'
 safe_name "$RHIZA_RUN_ID" || die 'unsafe run id'
 [ "$RHIZA_NAMESPACE" = "rhiza-v0191-20261008-$RHIZA_RUN_ID" ] || die 'namespace mismatch'
+data_gsa_email="rhiza-v0191-gcs-$RHIZA_RUN_ID@patch2-the-new-era.iam.gserviceaccount.com"
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
   printf '%s' "$node" | LC_ALL=C grep -Eq '^gke-ied-cluster-[a-z0-9-]+$' || die 'existing-node pin required'
 done
@@ -93,9 +94,8 @@ metadata_credentials_ready() (
     http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null) || metadata_identity_code=$?
   metadata_identity_http=$(printf '%s\n' "$metadata_identity" | tail -n 1)
   metadata_identity_value=$(printf '%s\n' "$metadata_identity" | sed '$d')
-  metadata_expected_identity="principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/$ns/sa/rhiza-gcs"
+  metadata_principal_identity="principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/$ns/sa/rhiza-gcs"
   metadata_legacy_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID.svc.id.goog"
-  metadata_gsa_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID@patch2-the-new-era.iam.gserviceaccount.com"
   metadata_default_node_identity="602454948273-compute@developer.gserviceaccount.com"
   metadata_identity_category=unknown
   if [ "$metadata_identity_code" != 0 ]; then
@@ -104,17 +104,18 @@ metadata_credentials_ready() (
     metadata_identity_category='http-error'
   else
     case "$metadata_identity_value" in
-      "$metadata_expected_identity") metadata_identity_category='expected-principal' ;;
+      "$data_gsa_email") metadata_identity_category='linked-gsa-email' ;;
+      "$metadata_principal_identity") metadata_identity_category='principal-uri' ;;
       "$metadata_legacy_identity") metadata_identity_category='legacy-ksa-alias' ;;
-      "$metadata_gsa_identity") metadata_identity_category='run-gsa-email' ;;
       "$metadata_default_node_identity") metadata_identity_category='node-default' ;;
+      *@*.iam.gserviceaccount.com) metadata_identity_category='other-gsa-email' ;;
       '') metadata_identity_category=empty ;;
     esac
   fi
-  unset metadata_identity metadata_identity_value metadata_expected_identity metadata_legacy_identity metadata_gsa_identity metadata_default_node_identity
+  unset metadata_identity metadata_identity_value metadata_principal_identity metadata_legacy_identity metadata_default_node_identity
   printf 'stage=metadata-credential-readiness native=%s http=%s category=%s\n' \
     "$metadata_identity_code" "$metadata_identity_http" "$metadata_identity_category"
-  [ "$metadata_identity_category" = expected-principal ] || return 1
+  [ "$metadata_identity_category" = linked-gsa-email ] || return 1
   metadata_attempt=0
   while [ "$metadata_attempt" -lt 6 ]; do
     [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
@@ -274,7 +275,7 @@ prepare_workload_identity_receipt() {
   expected_wi_checksum=$(cat "$wi_checksum")
   printf '%s' "$expected_wi_checksum" | grep -Eq '^[a-f0-9]{64}$' || return 1
   [ "$(sha256_file "$wi_receipt")" = "$expected_wi_checksum" ] || return 1
-  wi_data="rhiza-v0191-gcs-$RHIZA_RUN_ID@patch2-the-new-era.iam.gserviceaccount.com"
+  wi_data=$data_gsa_email
   wi_owner="rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA"
   wi_member="serviceAccount:patch2-the-new-era.svc.id.goog[$ns/rhiza-gcs]"
   wi_title="rhiza-$RHIZA_RUN_ID-expiry"
