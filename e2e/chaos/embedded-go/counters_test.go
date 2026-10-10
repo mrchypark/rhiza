@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/quic-go/quic-go"
+	"gopkg.in/yaml.v3"
 )
 
 func TestObjectStoreCountersAllowlist(t *testing.T) {
@@ -221,6 +223,80 @@ func TestQualificationRuntimeEndpointSliceRBAC(t *testing.T) {
 	}
 }
 
+func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
+	const runID = "63602191"
+	auth := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render-local")
+	auth.Env = append(os.Environ(),
+		"RHIZA_RUN_ID="+runID,
+		"RHIZA_HARNESS_SHA=315a5ee6bc6635b4ff4f85b9534afa4abe537c79",
+		"RHIZA_AUTH_EXPIRES=2099-01-01T00:00:00Z",
+	)
+	authRendered, err := auth.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := os.ReadFile("../gcs-postrelease.yaml.in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workloadRendered := strings.NewReplacer(
+		"__NAMESPACE__", "rhiza-v0191-20261008-"+runID,
+		"__RUN_ID__", runID,
+		"__CLUSTER_ID__", "cluster-"+runID,
+		"__HOST_IMAGE__", "example.invalid/rhiza@sha256:"+strings.Repeat("0", 64),
+		"__METADATA_IMAGE__", "example.invalid/gcloud@sha256:"+strings.Repeat("1", 64),
+		"__NODE_A__", "node-a", "__NODE_B__", "node-b", "__NODE_C__", "node-c",
+	).Replace(string(template))
+
+	for name, rendered := range map[string][]byte{"auth": authRendered, "workload": []byte(workloadRendered)} {
+		t.Run(name, func(t *testing.T) {
+			decoder := yaml.NewDecoder(bytes.NewReader(rendered))
+			for document := 1; ; document++ {
+				var value any
+				if err := decoder.Decode(&value); errors.Is(err, io.EOF) {
+					break
+				} else if err != nil {
+					t.Fatalf("document %d YAML: %v", document, err)
+				}
+				if value == nil {
+					continue
+				}
+				if _, err := json.Marshal(value); err != nil {
+					t.Fatalf("document %d is not Kubernetes JSON-compatible: %v", document, err)
+				}
+				assertStringMaps(t, value, fmt.Sprintf("document %d", document))
+			}
+		})
+	}
+}
+
+func assertStringMaps(t *testing.T, value any, path string) {
+	t.Helper()
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			childPath := path + "." + key
+			switch key {
+			case "labels", "annotations", "matchLabels", "labelSelectors":
+				entries, ok := child.(map[string]any)
+				if !ok {
+					t.Fatalf("%s is %T, want string map", childPath, child)
+				}
+				for label, labelValue := range entries {
+					if _, ok := labelValue.(string); !ok {
+						t.Fatalf("%s.%s is %T (%v), want string", childPath, label, labelValue, labelValue)
+					}
+				}
+			}
+			assertStringMaps(t, child, childPath)
+		}
+	case []any:
+		for index, child := range value {
+			assertStringMaps(t, child, fmt.Sprintf("%s[%d]", path, index))
+		}
+	}
+}
+
 func TestBootstrapCustomRoleDeleteReceiptIsStructuredAndValidated(t *testing.T) {
 	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
 	if err != nil {
@@ -240,6 +316,67 @@ func TestBootstrapCustomRoleDeleteReceiptIsStructuredAndValidated(t *testing.T) 
 		if !strings.Contains(text, required) {
 			t.Fatalf("missing structured custom-role rollback check %q", required)
 		}
+	}
+}
+
+func TestBootstrapRollbackKeepsAuthorityThroughCloudVerification(t *testing.T) {
+	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	last := -1
+	for _, step := range []string{
+		`verify_absent folder g storage managed-folders describe`,
+		`verify_absent provider g iam workload-identity-pools providers describe`,
+		`verify_absent pool g iam workload-identity-pools describe`,
+		`verify_absent ci g iam service-accounts describe`,
+		`verify_absent data g iam service-accounts describe`,
+		`verify_absent "$tag" g iam roles describe "$role" --format=json`,
+		`record project-rollback g projects get-iam-policy`,
+		`record revoke-project g projects remove-iam-policy-binding`,
+		`tag='cluster-role'; role=$cluster_role`,
+		`Custom role delete receipt rejected`,
+		`> "$RHIZA_AUTH_STATE/rollback-terminal.json"`,
+	} {
+		at := strings.Index(text[last+1:], step)
+		if at < 0 {
+			t.Fatalf("rollback step missing or out of order: %q", step)
+		}
+		last += at + 1
+	}
+}
+
+func TestBootstrapRollbackAbsenceStopsOnFirstUnprovenResult(t *testing.T) {
+	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nverify_absent() {\n")
+	end := strings.Index(string(source)[start+1:], "\nmark() {")
+	if start < 0 || end < 0 {
+		t.Fatal("rollback absence helper missing")
+	}
+	helper := string(source)[start+1 : start+1+end]
+	dir := t.TempDir()
+	command := exec.Command("/bin/sh", "-c", `set -eu
+die() { printf '%s\n' "$*" >&2; exit 1; }
+`+helper+`
+denied() { printf '%s\n' 'PERMISSION_DENIED' >&2; return 7; }
+verify_absent data denied
+: > "$RHIZA_AUTH_STATE/after-first-failure"
+`)
+	command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
+	output, runErr := command.CombinedOutput()
+	var exited *exec.ExitError
+	if !errors.As(runErr, &exited) || exited.ExitCode() != 1 || !bytes.Contains(output, []byte("Cannot prove rollback absence for data")) {
+		t.Fatalf("permission loss did not fail closed: error=%v output=%s", runErr, output)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "after-first-failure")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rollback continued after first failure: %v", err)
+	}
+	if exit, err := os.ReadFile(filepath.Join(dir, "rollback-absence-data.exit")); err != nil || string(exit) != "7\n" {
+		t.Fatalf("first failure receipt missing: exit=%q error=%v", exit, err)
 	}
 }
 

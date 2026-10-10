@@ -13,6 +13,7 @@ require (
 	github.com/quic-go/quic-go v0.61.0
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
 	golang.org/x/sync v0.23.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

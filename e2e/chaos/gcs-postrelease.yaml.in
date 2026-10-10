@@ -5,7 +5,7 @@ kind: ConfigMap
 metadata:
   name: rhiza-config
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 data:
   RHIZA_CLUSTER_ID: __CLUSTER_ID__
   RHIZA_BIND_ADDR: 0.0.0.0:8081
@@ -27,11 +27,11 @@ kind: Service
 metadata:
   name: rhiza-peers
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+  selector: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
   ports:
     - {name: http, port: 8080}
     - {name: recovery, port: 8081}
@@ -42,21 +42,21 @@ kind: StatefulSet
 metadata:
   name: rhiza-voter
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 spec:
   serviceName: rhiza-peers
   replicas: 3
   podManagementPolicy: Parallel
   updateStrategy: {type: OnDelete}
   selector:
-    matchLabels: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+    matchLabels: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
   template:
     metadata:
       labels:
-        app: rhiza-voter
-        app.kubernetes.io/part-of: rhiza-chaos
-        chaos.rhiza.io/run: __RUN_ID__
-        chaos.rhiza.io/role: voter
+        app: 'rhiza-voter'
+        app.kubernetes.io/part-of: 'rhiza-chaos'
+        chaos.rhiza.io/run: '__RUN_ID__'
+        chaos.rhiza.io/role: 'voter'
     spec:
       serviceAccountName: rhiza-gcs
       automountServiceAccountToken: false
@@ -71,7 +71,7 @@ spec:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
-                matchLabels: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+                matchLabels: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
               topologyKey: kubernetes.io/hostname
       containers:
         - name: rhiza
@@ -110,11 +110,11 @@ kind: Service
 metadata:
   name: rhiza-learner
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: {app: rhiza-learner, chaos.rhiza.io/run: __RUN_ID__}
+  selector: {app: 'rhiza-learner', chaos.rhiza.io/run: '__RUN_ID__'}
   ports:
     - {name: http, port: 8080}
     - {name: recovery, port: 8081}
@@ -126,10 +126,10 @@ metadata:
   name: rhiza-learner
   namespace: __NAMESPACE__
   labels:
-    app: rhiza-learner
-    app.kubernetes.io/part-of: rhiza-chaos
-    chaos.rhiza.io/run: __RUN_ID__
-    chaos.rhiza.io/role: learner
+    app: 'rhiza-learner'
+    app.kubernetes.io/part-of: 'rhiza-chaos'
+    chaos.rhiza.io/run: '__RUN_ID__'
+    chaos.rhiza.io/role: 'learner'
 spec:
   serviceAccountName: rhiza-gcs
   automountServiceAccountToken: false
@@ -174,7 +174,7 @@ kind: Pod
 metadata:
   name: rhiza-metadata
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__, app: rhiza-metadata}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__', app: 'rhiza-metadata'}
 spec:
   serviceAccountName: rhiza-gcs
   automountServiceAccountToken: false

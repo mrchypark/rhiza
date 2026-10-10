@@ -892,6 +892,16 @@ absent() {
         grep -Eq 'NOT_FOUND|NotFound|not found|does not exist|notFound|One or more URLs matched no objects' "$RHIZA_AUTH_STATE/absent-$item.stderr" || die "Cannot prove $item absent; preserve diagnostic"
     fi
 }
+verify_absent() {
+    item=$1; shift
+    if "$@" > "$RHIZA_AUTH_STATE/rollback-absence-$item.json" 2> "$RHIZA_AUTH_STATE/rollback-absence-$item.stderr"; then
+        die "Rollback residual: $item still exists"
+    else
+        rc=$?
+        printf '%s\n' "$rc" > "$RHIZA_AUTH_STATE/rollback-absence-$item.exit"
+        grep -Eq 'NOT_FOUND|NotFound|not found|does not exist|notFound|One or more URLs matched no objects' "$RHIZA_AUTH_STATE/rollback-absence-$item.stderr" || die "Cannot prove rollback absence for $item"
+    fi
+}
 mark() { printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/$1.created"; }
 owned() { [ -f "$RHIZA_AUTH_STATE/$1.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/$1.created")" = "$owner" ]; }
 if [ "$mode" = gsa-delete-wait-worker ]; then gsa_delete_wait_worker "$worker_tag"; exit 0; fi
@@ -1094,7 +1104,6 @@ fi
 if owned folder-grant; then record revoke-folder folder_iam remove; fi
 if owned ci-wi-grant; then record revoke-ci-wi g iam service-accounts remove-iam-policy-binding "$ci" --member="$ci_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
 if owned data-wi-grant; then record revoke-data-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
-if owned ci-project-grant; then record revoke-project g projects remove-iam-policy-binding "$project" --member="serviceAccount:$ci" --role="projects/$project/roles/$cluster_role" --condition="$cluster_condition" --format=json; fi
 if owned kubernetes; then
     # The preserved original bootstrap matched both fault kinds in -faults.
     # A reviewed transition records the added pair in a separate working
@@ -1145,34 +1154,60 @@ if owned folder; then
     # The installed CLI exposes no metageneration precondition. These immediate
     # metadata/IAM checks are not an atomic compare-and-delete; never claim CAS.
     record folder-delete g storage managed-folders delete "$folder"
+    verify_absent folder g storage managed-folders describe "$folder" --raw --format=json
 fi
-if owned provider; then record provider-delete g iam workload-identity-pools providers delete github --location=global --workload-identity-pool="$pool"; fi
-if owned pool; then record pool-delete g iam workload-identity-pools delete "$pool" --location=global; fi
+if owned provider; then
+    record provider-delete g iam workload-identity-pools providers delete github --location=global --workload-identity-pool="$pool"
+    verify_absent provider g iam workload-identity-pools providers describe github --location=global --workload-identity-pool="$pool" --format=json
+fi
+if owned pool; then
+    record pool-delete g iam workload-identity-pools delete "$pool" --location=global
+    verify_absent pool g iam workload-identity-pools describe "$pool" --location=global --format=json
+fi
 if owned ci; then
     ci_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/ci-create.json")
     record ci-delete g iam service-accounts delete "$ci_uid"
     wait_deleted_sa ci
+    verify_absent ci g iam service-accounts describe "$ci" --format=json
 fi
 if owned data; then
     data_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/data-create.json")
     record data-delete g iam service-accounts delete "$data_uid"
     wait_deleted_sa data
+    verify_absent data g iam service-accounts describe "$data" --format=json
 fi
-for role in "$cluster_role" "$folder_role"; do
-    case "$role" in "$cluster_role") tag='cluster-role' ;; *) tag='folder-role' ;; esac
-    if owned "$tag"; then
-        record "$tag-current" g iam roles describe "$role" --format=json
-        [ "$(jq -r .description "$RHIZA_AUTH_STATE/$tag-current.json")" = "$owner" ] || die 'Role ownership changed'
-        jq -e --slurpfile original "$RHIZA_AUTH_STATE/$tag-create.json" '.name == $original[0].name and .etag == $original[0].etag and .includedPermissions == $original[0].includedPermissions and .stage == $original[0].stage' "$RHIZA_AUTH_STATE/$tag-current.json" >/dev/null || die 'Custom role changed since creation; preserve and request exact rollback review'
-        record "$tag-delete" g iam roles delete "$role" --format=json
-        jq -e --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$tag-create.json" --slurpfile current "$RHIZA_AUTH_STATE/$tag-current.json" '
-          type=="object" and ($created|length)==1 and ($current|length)==1 and
-          .name==$created[0].name and .name==$current[0].name and
-          .description==$owner and .deleted==true and
-          .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
-        ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
-    fi
-done
+tag='folder-role'; role=$folder_role
+if owned "$tag"; then
+    record "$tag-current" g iam roles describe "$role" --format=json
+    [ "$(jq -r .description "$RHIZA_AUTH_STATE/$tag-current.json")" = "$owner" ] || die 'Role ownership changed'
+    jq -e --slurpfile original "$RHIZA_AUTH_STATE/$tag-create.json" '.name == $original[0].name and .etag == $original[0].etag and .includedPermissions == $original[0].includedPermissions and .stage == $original[0].stage' "$RHIZA_AUTH_STATE/$tag-current.json" >/dev/null || die 'Custom role changed since creation; preserve and request exact rollback review'
+    record "$tag-delete" g iam roles delete "$role" --format=json
+    jq -e --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$tag-create.json" --slurpfile current "$RHIZA_AUTH_STATE/$tag-current.json" '
+      type=="object" and ($created|length)==1 and ($current|length)==1 and
+      .name==$created[0].name and .name==$current[0].name and
+      .description==$owner and .deleted==true and
+      .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
+    ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
+    verify_absent "$tag" g iam roles describe "$role" --format=json
+fi
+# Keep the project binding and its custom role until every other cloud object
+# has a terminal absence receipt; removing either earlier can strand cleanup.
 record project-rollback g projects get-iam-policy "$project" --format=json
 record bucket-rollback g storage buckets get-iam-policy "gs://$bucket" --format=json
+if owned ci-project-grant; then record revoke-project g projects remove-iam-policy-binding "$project" --member="serviceAccount:$ci" --role="projects/$project/roles/$cluster_role" --condition="$cluster_condition" --format=json; fi
+if owned cluster-role; then
+    tag='cluster-role'; role=$cluster_role
+    record "$tag-current" g iam roles describe "$role" --format=json
+    [ "$(jq -r .description "$RHIZA_AUTH_STATE/$tag-current.json")" = "$owner" ] || die 'Role ownership changed'
+    jq -e --slurpfile original "$RHIZA_AUTH_STATE/$tag-create.json" '.name == $original[0].name and .etag == $original[0].etag and .includedPermissions == $original[0].includedPermissions and .stage == $original[0].stage' "$RHIZA_AUTH_STATE/$tag-current.json" >/dev/null || die 'Custom role changed since creation; preserve and request exact rollback review'
+    record "$tag-delete" g iam roles delete "$role" --format=json
+    jq -e --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$tag-create.json" --slurpfile current "$RHIZA_AUTH_STATE/$tag-current.json" '
+      type=="object" and ($created|length)==1 and ($current|length)==1 and
+      .name==$created[0].name and .name==$current[0].name and
+      .description==$owner and .deleted==true and
+      .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
+    ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
+fi
+jq -n --arg run "$RHIZA_RUN_ID" --arg owner "$owner" '{status:"complete",run:$run,owner:$owner}' > "$RHIZA_AUTH_STATE/rollback-terminal.json"
+chmod 600 "$RHIZA_AUTH_STATE/rollback-terminal.json"
 printf '%s\n' 'Rollback completed; soft-deleted storage remains billable for retention period.'
