@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
@@ -45,6 +46,8 @@ type PeerServer struct {
 	closeOnce      sync.Once
 	closeErr       error
 	closeTransport func() error
+	// Installed only by package tests; nil leaves ordinary serving unchanged.
+	diagnostic atomic.Pointer[func(string, error)]
 }
 
 func StartPeerServer(ctx context.Context, addr string, server *Server, members []quepaxa.Member, peerToken, adminToken string) (*PeerServer, error) {
@@ -181,9 +184,16 @@ func (s *PeerServer) Close() error {
 
 func (s *PeerServer) Addr() string { return s.listener.Addr().String() }
 
+func (s *PeerServer) diagnosticPhase(phase string, err error) {
+	if observe := s.diagnostic.Load(); observe != nil {
+		(*observe)(phase, err)
+	}
+}
+
 func (s *PeerServer) serve(ctx context.Context) {
 	for {
 		conn, err := s.listener.Accept(ctx)
+		s.diagnosticPhase("connection-accept", err)
 		if err != nil {
 			return
 		}
@@ -204,6 +214,7 @@ func (s *PeerServer) serveConnection(ctx context.Context, conn *quic.Conn) {
 	defer conn.CloseWithError(0, "shutdown")
 	for {
 		stream, err := conn.AcceptStream(ctx)
+		s.diagnosticPhase("stream-accept", err)
 		if err != nil {
 			return
 		}
@@ -229,6 +240,7 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 	var learnedSender quepaxa.NodeID
 	learned := false
 	data, err := readPeerFrame(stream)
+	s.diagnosticPhase("request-read", err)
 	if err == nil {
 		// Voter authorization is bound to the handshake certificate, so a
 		// request is never accepted as replayable early data. Checked before
@@ -236,10 +248,12 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 		if !conn.ConnectionState().TLS.HandshakeComplete {
 			err = fmt.Errorf("peer authentication requires a completed TLS handshake")
 		}
+		s.diagnosticPhase("request-handshake-check", err)
 	}
 	if err == nil {
 		var request *peerfb.RequestT
 		request, err = decodePeerRequest(data)
+		s.diagnosticPhase("request-decode", err)
 		if err == nil {
 			if request.Operation == peerfb.OperationLearned && request.Decision != nil {
 				learned = true
@@ -273,14 +287,17 @@ func (s *PeerServer) serveStream(conn *quic.Conn, stream *quic.Stream) {
 			response.ErrorCode = peerErrorRetryable
 		}
 	}
-	if writeErr := writePeerFrame(stream, encodePeerResponse(response)); writeErr != nil {
+	writeErr := writePeerFrame(stream, encodePeerResponse(response))
+	s.diagnosticPhase("response-write", writeErr)
+	if writeErr != nil {
 		stream.CancelWrite(1)
 		return
 	}
 	if learned && localtesthooks.Enabled {
 		localtesthooks.Hit(fmt.Sprintf("network:learned:phase=response-written:node=%s:sender=%s:slot=%d", s.server.core.NodeID(), learnedSender, learnedSlot))
 	}
-	_ = stream.Close()
+	closeErr := stream.Close()
+	s.diagnosticPhase("response-close", closeErr)
 }
 
 func peerMember(config quepaxa.Cluster, id quepaxa.NodeID) (quepaxa.Member, bool) {
@@ -488,7 +505,10 @@ func (s *PeerServer) handle(ctx context.Context, certificateKey ed25519.PublicKe
 		}
 		var hash quepaxa.ValueHash
 		copy(hash[:], request.Hash)
-		if err := s.server.core.StageValue(hash, request.Value); err != nil {
+		s.diagnosticPhase("stage-value-enter", nil)
+		err := s.server.core.StageValue(hash, request.Value)
+		s.diagnosticPhase("stage-value-return", err)
+		if err != nil {
 			return nil, err
 		}
 		return &peerfb.ResponseT{}, nil

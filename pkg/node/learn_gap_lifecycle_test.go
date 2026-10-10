@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -18,12 +19,226 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
+	objmetrics "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/objstore/versityfixture"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	objstore "github.com/thanos-io/objstore"
 )
+
+// Adapted from the preserved prepared/unprepared comparison blob
+// b7f1bd2eb4991ac0c3c85a58b1facd405d55768a. Ordinary Shutdown must now
+// succeed without arranging its old private checkpoint-cache precondition.
+func TestNodeOrdinaryParallelShutdownRetainsCertifiedArchive(t *testing.T) {
+	binary := os.Getenv("RHIZA_VERSITYGW_BIN")
+	if binary == "" {
+		t.Skip("set RHIZA_VERSITYGW_BIN to a pinned local Versity Gateway binary")
+	}
+	for _, withBase := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checkpoint_base=%t", withBase), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			gateway, err := versityfixture.Start(ctx, binary, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				closeCtx, stop := context.WithTimeout(context.Background(), 7*time.Second)
+				defer stop()
+				if err := gateway.Close(closeCtx); err != nil {
+					t.Errorf("stop local gateway: %v", err)
+				}
+			}()
+			endpoint := strings.TrimPrefix(gateway.Endpoint, "http://")
+			const region = "us-east-1"
+			bucketName := fmt.Sprintf("rhiza-shutdown-%d", time.Now().UnixNano())
+			client, err := minio.New(endpoint, &minio.Options{
+				Creds: credentials.NewStaticV4(gateway.AccessKey, gateway.SecretKey, ""), Secure: false, Region: region,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := client.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{Region: region}); err != nil {
+				t.Fatal(err)
+			}
+			const clusterID = "ordinary-parallel-shutdown"
+			ids := []quepaxa.NodeID{"n1", "n2", "n3"}
+			tokens := []string{"shutdown-peer-n1", "shutdown-peer-n2", "shutdown-peer-n3"}
+			members := make([]quepaxa.Member, len(ids))
+			addresses := make([]string, len(ids))
+			for i, id := range ids {
+				conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				addresses[i] = conn.LocalAddr().String()
+				if err := conn.Close(); err != nil {
+					t.Fatal(err)
+				}
+				members[i] = peerMember(clusterID, id, tokens[i])
+				members[i].PeerURL = "quic://" + addresses[i]
+			}
+			nodes := make([]*Node, 0, 3)
+			defer func() {
+				for _, node := range nodes {
+					if err := node.Shutdown(); err != nil {
+						t.Errorf("failure-path shutdown: %v", err)
+					}
+				}
+			}()
+			prefix := fmt.Sprintf("rhiza-parallel-shutdown/%d", time.Now().UnixNano())
+			for i, id := range ids {
+				node := New(&types.ExecutionConfig{
+					DataDir: t.TempDir(), ClusterID: clusterID, NodeID: types.NodeID(id),
+					PeerAddr: addresses[i], PeerToken: tokens[i], Members: members,
+					ObjStoreProvider: "s3", ObjStoreEndpoint: endpoint, ObjStoreBucket: bucketName,
+					ObjStorePrefix: prefix, ObjStoreRegion: region, ObjStoreInsecure: true,
+					ObjStoreAccessKey: gateway.AccessKey, ObjStoreSecretKey: gateway.SecretKey,
+					ObjStoreSyncInterval: time.Hour, CheckpointInterval: time.Hour,
+					ObjStoreDurability: types.ObjectStoreDurabilityAsync,
+				})
+				nodes = append(nodes, node)
+				if err := node.Open(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := waitForNodeReadiness(ctx, nodes); err != nil {
+				t.Fatal(err)
+			}
+			put := func(request, value string) {
+				t.Helper()
+				if _, err := nodes[0].server.KVPut(ctx, network.KVMutationRequest{RequestID: request, Key: "key", Value: []byte(value)}); err != nil {
+					t.Fatal(err)
+				}
+				if err := waitForNodeTip(ctx, nodes, nodes[0].core.Tip()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			put("base-value", "base")
+			if withBase {
+				// Establish an older certified base while peers are alive. The
+				// subsequent mutation must still be recovered from the suffix;
+				// this is not pre-shutdown preparation of the final state.
+				if err := nodes[0].checkpointer.CheckpointOnShutdown(ctx, nodes[0].material.StateTip()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			put("suffix-value", "suffix")
+			through := nodes[0].core.Tip()
+			start := make(chan struct{})
+			results := make(chan error, len(nodes))
+			for _, node := range nodes {
+				go func() { <-start; results <- node.Shutdown() }()
+			}
+			close(start)
+			// Join every Close before testing its result, including failure.
+			var closeErr error
+			for range nodes {
+				closeErr = errors.Join(closeErr, <-results)
+			}
+			if closeErr != nil {
+				t.Fatalf("ordinary parallel shutdown: %v", closeErr)
+			}
+			bucket, err := objmetrics.NewBucket(objmetrics.Config{
+				Provider: objmetrics.ProviderS3, Endpoint: endpoint, Bucket: bucketName,
+				Region: region, Insecure: true, AccessKey: gateway.AccessKey, SecretKey: gateway.SecretKey,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer bucket.Close()
+			archive := recovery.NewManager(bucket, path.Join(prefix, clusterID), 1)
+			defer archive.Close()
+			if err := archive.Load(ctx); err != nil {
+				t.Fatal(err)
+			}
+			seal, _, hasBase := archive.RecoveryBase()
+			if hasBase != withBase || archive.Tip() < through || hasBase && archive.Tip() <= seal.Index {
+				t.Fatalf("archive base=%t tip=%d seal=%d required=%d", hasBase, archive.Tip(), seal.Index, through)
+			}
+			if withBase {
+				manager := checkpoint.NewManager(bucket, path.Join(prefix, clusterID), t.TempDir(), 1)
+				if err := manager.Load(ctx); err != nil {
+					t.Fatal(err)
+				}
+				current := manager.Latest()
+				if current == nil || current.Index != uint64(seal.Index) || current.RootHash != seal.RootHash || current.Hash != seal.StateHash {
+					t.Fatal("fresh CURRENT does not match the retained certified archive base")
+				}
+				if err := manager.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash); err != nil {
+					t.Fatalf("retained certified root: %v", err)
+				}
+			}
+			for _, node := range nodes {
+				if node.peer != nil || node.archive != nil || node.wal != nil || node.material != nil || node.cancel != nil || node.Ready() {
+					t.Fatal("shutdown left owned resources or readiness active")
+				}
+			}
+		})
+	}
+}
+
+type shutdownArchiveFailureBucket struct {
+	objstore.Bucket
+	headOnly bool
+	failure  error
+}
+
+func (b shutdownArchiveFailureBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...objstore.ObjectUploadOption) error {
+	if strings.Contains(name, "/archive/") && (!b.headOnly || strings.HasSuffix(name, "/archive/head.bin")) {
+		return b.failure
+	}
+	return b.Bucket.Upload(ctx, name, reader, opts...)
+}
+
+func TestNodeShutdownRetainsArchivePublicationFailure(t *testing.T) {
+	for _, headOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("HEAD=%t", headOnly), func(t *testing.T) {
+			ctx := context.Background()
+			wal, err := qlog.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer wal.Close()
+			core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+			if err != nil {
+				_ = wal.Close()
+				t.Fatal(err)
+			}
+			value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "shutdown-failure", SQL: "CREATE TABLE durable (id INTEGER)"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := core.Propose(ctx, value); err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New("injected archive publication failure")
+			archive := recovery.NewManager(shutdownArchiveFailureBucket{Bucket: objstore.NewInMemBucket(), headOnly: headOnly, failure: failure}, "shutdown", 1)
+			node := &Node{config: &types.ExecutionConfig{}, core: core, wal: wal, archive: archive}
+			closeErr := node.Shutdown()
+			if headOnly {
+				// The existing CAS manager maps failed HEAD writes to its own
+				// retry-exhaustion error. Close must retain that actual error,
+				// not pretend it still exposes the underlying upload sentinel.
+				if closeErr == nil || closeErr.Error() != "shared archive publication conflicted too many times" {
+					t.Fatalf("shutdown HEAD failure=%v", closeErr)
+				}
+			} else if !errors.Is(closeErr, failure) {
+				t.Fatalf("shutdown error=%v, want original extent publication failure", closeErr)
+			}
+			if node.archive != nil || node.wal != nil || node.Ready() {
+				t.Fatal("failure bypassed resource teardown")
+			}
+			if err := archive.SyncThrough(ctx, core, core.Tip()); !errors.Is(err, recovery.ErrArchiveClosed) {
+				t.Fatalf("archive worker not closed/joined: %v", err)
+			}
+		})
+	}
+}
 
 func TestNodeOpenCatchUpRepairsHeldLearnGapForConcurrentKVCalls(t *testing.T) {
 	binary := os.Getenv("RHIZA_VERSITYGW_BIN")

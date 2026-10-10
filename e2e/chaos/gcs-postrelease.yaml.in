@@ -5,7 +5,7 @@ kind: ConfigMap
 metadata:
   name: rhiza-config
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 data:
   RHIZA_CLUSTER_ID: __CLUSTER_ID__
   RHIZA_BIND_ADDR: 0.0.0.0:8081
@@ -13,7 +13,7 @@ data:
   RHIZA_DATA_DIR: /data
   RHIZA_OBJSTORE_PROVIDER: gcs
   RHIZA_OBJSTORE_BUCKET: rhiza-v070-chaos-ied-20260811
-  RHIZA_OBJSTORE_PREFIX: postrelease/v0.19.0/__RUN_ID__/
+  RHIZA_OBJSTORE_PREFIX: postrelease/v0.19.1/__RUN_ID__/
   RHIZA_OBJSTORE_DURABILITY: before-ack
   RHIZA_OBJSTORE_MAX_RETRIES: "1"
   RHIZA_CHECKPOINT_INTERVAL: 10s
@@ -27,11 +27,11 @@ kind: Service
 metadata:
   name: rhiza-peers
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+  selector: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
   ports:
     - {name: http, port: 8080}
     - {name: recovery, port: 8081}
@@ -42,24 +42,25 @@ kind: StatefulSet
 metadata:
   name: rhiza-voter
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 spec:
   serviceName: rhiza-peers
   replicas: 3
   podManagementPolicy: Parallel
   updateStrategy: {type: OnDelete}
   selector:
-    matchLabels: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+    matchLabels: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
   template:
     metadata:
       labels:
-        app: rhiza-voter
-        app.kubernetes.io/part-of: rhiza-chaos
-        chaos.rhiza.io/run: __RUN_ID__
-        chaos.rhiza.io/role: voter
+        app: 'rhiza-voter'
+        app.kubernetes.io/part-of: 'rhiza-chaos'
+        chaos.rhiza.io/run: '__RUN_ID__'
+        chaos.rhiza.io/role: 'voter'
     spec:
       serviceAccountName: rhiza-gcs
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 75
       securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       affinity:
         nodeAffinity:
@@ -70,7 +71,7 @@ spec:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
-                matchLabels: {app: rhiza-voter, chaos.rhiza.io/run: __RUN_ID__}
+                matchLabels: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
               topologyKey: kubernetes.io/hostname
       containers:
         - name: rhiza
@@ -81,6 +82,12 @@ spec:
             - configMapRef: {name: rhiza-config}
             - secretRef: {name: rhiza-qualification-auth}
           env:
+            - name: RHIZA_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: RHIZA_QUALIFICATION_RUN_ID
+              valueFrom: {fieldRef: {fieldPath: "metadata.labels['chaos.rhiza.io/run']"}}
+            - name: RHIZA_POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
             - name: RHIZA_NODE_ID
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - {name: RHIZA_LEARNER, value: ""}
@@ -97,36 +104,17 @@ spec:
           volumeMounts: [{name: data, mountPath: /data}]
       volumes: [{name: data, emptyDir: {sizeLimit: 1Gi}}]
 ---
-# Apply after non-writing probe's positive handshakes, before cold learner Open.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: learner-cold
-  namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
-spec:
-  podSelector: {matchLabels: {app: rhiza-learner, chaos.rhiza.io/run: __RUN_ID__}}
-  policyTypes: [Ingress, Egress]
-  ingress:
-    - ports: [{protocol: TCP, port: 8080}, {protocol: TCP, port: 8081}]
-  egress:
-    - ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}, {protocol: TCP, port: 443}]
-    - to: [{ipBlock: {cidr: 169.254.169.254/32}}]
-      ports: [{protocol: TCP, port: 80}, {protocol: TCP, port: 8080}]
-    - to: [{ipBlock: {cidr: 169.254.169.252/32}}]
-      ports: [{protocol: TCP, port: 988}, {protocol: TCP, port: 987}]
----
 # BEGIN COLD LEARNER
 apiVersion: v1
 kind: Service
 metadata:
   name: rhiza-learner
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: {app: rhiza-learner, chaos.rhiza.io/run: __RUN_ID__}
+  selector: {app: 'rhiza-learner', chaos.rhiza.io/run: '__RUN_ID__'}
   ports:
     - {name: http, port: 8080}
     - {name: recovery, port: 8081}
@@ -138,13 +126,14 @@ metadata:
   name: rhiza-learner
   namespace: __NAMESPACE__
   labels:
-    app: rhiza-learner
-    app.kubernetes.io/part-of: rhiza-chaos
-    chaos.rhiza.io/run: __RUN_ID__
-    chaos.rhiza.io/role: learner
+    app: 'rhiza-learner'
+    app.kubernetes.io/part-of: 'rhiza-chaos'
+    chaos.rhiza.io/run: '__RUN_ID__'
+    chaos.rhiza.io/role: 'learner'
 spec:
   serviceAccountName: rhiza-gcs
   automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 75
   nodeName: __NODE_A__
   restartPolicy: Never
   securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
@@ -156,6 +145,12 @@ spec:
         - configMapRef: {name: rhiza-config}
         - secretRef: {name: rhiza-qualification-auth}
       env:
+        - name: RHIZA_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        - name: RHIZA_QUALIFICATION_RUN_ID
+          valueFrom: {fieldRef: {fieldPath: "metadata.labels['chaos.rhiza.io/run']"}}
+        - name: RHIZA_POD_UID
+          valueFrom: {fieldRef: {fieldPath: metadata.uid}}
         - {name: RHIZA_NODE_ID, value: rhiza-learner}
         - {name: RHIZA_PEER_TOKENS, value: ""}
         - name: RHIZA_PEER_TOKEN
@@ -179,7 +174,7 @@ kind: Pod
 metadata:
   name: rhiza-metadata
   namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__, app: rhiza-metadata}
+  labels: {chaos.rhiza.io/run: '__RUN_ID__', app: 'rhiza-metadata'}
 spec:
   serviceAccountName: rhiza-gcs
   automountServiceAccountToken: false
@@ -197,29 +192,3 @@ spec:
         limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 256Mi}
       volumeMounts: [{name: tmp, mountPath: /tmp}]
   volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
----
-# No Open, object-store client, server, or application RPC in this Pod.
-apiVersion: v1
-kind: Pod
-metadata:
-  name: rhiza-quic-probe
-  namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__, app: rhiza-learner, app.kubernetes.io/part-of: rhiza-chaos, chaos.rhiza.io/role: learner}
-spec:
-  serviceAccountName: rhiza-gcs
-  automountServiceAccountToken: false
-  nodeName: __NODE_A__
-  restartPolicy: Never
-  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
-  containers:
-    - name: rhiza
-      image: __HOST_IMAGE__
-      args: [qualification-quic-probe, hold]
-      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
-      env:
-        - {name: RHIZA_NODE_ID, value: rhiza-learner}
-        - name: RHIZA_CLUSTER_MEMBERS
-          valueFrom: {secretKeyRef: {name: rhiza-qualification-auth, key: RHIZA_CLUSTER_MEMBERS}}
-      resources:
-        requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
-        limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}

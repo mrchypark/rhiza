@@ -32,7 +32,7 @@ type learnerCheckpointSource struct {
 	bucket      *objstore.MeteredBucket
 }
 
-func newLearnerCheckpointSource(t *testing.T, bucketDir string) *learnerCheckpointSource {
+func newLearnerCheckpointSource(t testing.TB, bucketDir string) *learnerCheckpointSource {
 	t.Helper()
 	ctx := context.Background()
 	bucket, err := objstore.NewBucket(objstore.Config{Provider: objstore.ProviderFilesystem, FilesystemDir: bucketDir})
@@ -73,7 +73,7 @@ func newLearnerCheckpointSource(t *testing.T, bucketDir string) *learnerCheckpoi
 	return &learnerCheckpointSource{core: core, material: material, wal: wal, checkpoints: checkpoints, archive: archive, bucket: bucket}
 }
 
-func (s *learnerCheckpointSource) execute(t *testing.T, sql string) {
+func (s *learnerCheckpointSource) execute(t testing.TB, sql string) {
 	t.Helper()
 	ctx := context.Background()
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprintf("source-%d", s.core.Tip()+1), SQL: sql}})
@@ -92,7 +92,7 @@ func (s *learnerCheckpointSource) execute(t *testing.T, sql string) {
 	}
 }
 
-func (s *learnerCheckpointSource) publishCheckpoint(t *testing.T, trimArchive bool) (*checkpoint.Checkpoint, quepaxa.SealedCheckpoint) {
+func (s *learnerCheckpointSource) publishCheckpoint(t testing.TB, trimArchive bool) (*checkpoint.Checkpoint, quepaxa.SealedCheckpoint) {
 	t.Helper()
 	ctx := context.Background()
 	files, index, cleanup, err := s.material.CheckpointFilesAt(ctx)

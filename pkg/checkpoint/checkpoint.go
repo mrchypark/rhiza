@@ -41,7 +41,10 @@ var ErrStaleCheckpoint = errors.New("stale checkpoint candidate")
 var (
 	ErrAuthoritativeRecoveryBaseRequired = errors.New("checkpoint GC requires an authoritative recovery base")
 	ErrPublisherBusy                     = errors.New("checkpoint publisher is active")
-	ErrPublisherFenced                   = errors.New("checkpoint publisher was fenced")
+	// ErrRecoveryAdmissionBusy is a verified live shared claim refusal before
+	// maintenance admission writes. Pin/CAS/readback failures never use it.
+	ErrRecoveryAdmissionBusy = fmt.Errorf("%w: before recovery maintenance admission", ErrPublisherBusy)
+	ErrPublisherFenced       = errors.New("checkpoint publisher was fenced")
 )
 
 type Block struct {
@@ -267,6 +270,9 @@ func (m *Manager) acquireClaim(ctx context.Context, owner string, minExclusive u
 				observation.ObservedAtMillis = now.UnixMilli()
 			}
 			observePublisherBusy(ctx, observation)
+			if purpose == "maintenance" && attempt == 1 {
+				return nil, ErrRecoveryAdmissionBusy
+			}
 			return nil, ErrPublisherBusy
 		}
 		generation, floor := uint64(1), minExclusive

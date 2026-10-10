@@ -14,40 +14,27 @@ import (
 	thanosobjstore "github.com/thanos-io/objstore"
 )
 
-func checkpointReplicaFixture(t testing.TB) (*ReadReplica, Config, ReplicaConfig) {
+func checkpointReplicaFixture(t testing.TB) (*ReadReplica, *learnerCheckpointSource, ReplicaConfig) {
 	t.Helper()
 	ctx := context.Background()
-	voterConfig := Config{
-		ClusterID: "idle-replica", NodeID: "n1", DataDir: t.TempDir(),
-		ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir(),
-		ObjStoreDurability: ObjectStoreDurabilityBeforeAck,
-	}
-	voter, err := Open(ctx, voterConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := voter.Execute(ctx, ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE items (id INTEGER PRIMARY KEY)"}); err != nil {
-		_ = voter.Close()
-		t.Fatal(err)
-	}
-	if err := voter.Close(); err != nil {
-		t.Fatal(err)
-	}
-	config := ReplicaConfig{
-		ClusterID: voterConfig.ClusterID, ReplicaID: "r1", DataDir: t.TempDir(),
-		Members: []ReplicaMember{{ID: "n1"}}, ObjStoreProvider: "filesystem", ObjStoreDir: voterConfig.ObjStoreDir,
-		SyncInterval: time.Hour,
-	}
+	bucketDir := t.TempDir()
+	source := newLearnerCheckpointSource(t, bucketDir)
+	source.execute(t, "CREATE TABLE items (id INTEGER PRIMARY KEY)")
+	_, sealed := source.publishCheckpoint(t, true)
+	config := learnerReplicaConfig(t.TempDir(), bucketDir, "r1")
 	replica, err := OpenReadReplica(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = replica.Close() })
-	return replica, voterConfig, config
+	if sealed.Index == 0 || replica.core.CompactionFloor() != sealed.Index {
+		t.Fatalf("initial certified checkpoint floor=%d required=%d", replica.core.CompactionFloor(), sealed.Index)
+	}
+	return replica, source, config
 }
 
 func TestReadReplicaIdleSyncAndChangedCheckpoint(t *testing.T) {
-	r, voterConfig, config := checkpointReplicaFixture(t)
+	r, source, config := checkpointReplicaFixture(t)
 	ctx := context.Background()
 	owner := r.pinOwner
 	if owner == "" || r.syncedHead == nil {
@@ -71,40 +58,36 @@ func TestReadReplicaIdleSyncAndChangedCheckpoint(t *testing.T) {
 	}
 	r.bucket.Bucket = bucket
 
-	voter, err := Open(ctx, voterConfig)
-	if err != nil {
+	source.execute(t, "INSERT INTO items VALUES (1)")
+	if err := source.archive.SyncThrough(ctx, source.core, source.core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := voter.Execute(ctx, ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1)"}); err != nil {
-		_ = voter.Close()
-		t.Fatal(err)
-	}
-	// Before the voter closes, only the certified suffix changed; the base did not.
+	// Publish only the certified suffix here, leaving the base unchanged.
 	floor := r.core.CompactionFloor()
 	if err := r.Sync(ctx); err != nil {
-		_ = voter.Close()
 		t.Fatal(err)
 	}
 	rows, err := r.Query(ctx, QueryRequest{SQL: "SELECT id FROM items"})
 	if err != nil || len(rows.Rows) != 1 || r.core.CompactionFloor() != floor {
-		_ = voter.Close()
 		t.Fatalf("suffix not applied: rows=%v err=%v floor=%d", rows.Rows, err, r.core.CompactionFloor())
 	}
 	suffixStats := r.ObjectStoreStats()
 	if err := r.Sync(ctx); err != nil {
-		_ = voter.Close()
 		t.Fatal(err)
 	}
 	idleStats := r.ObjectStoreStats()
 	if idleStats.Heads-suffixStats.Heads != 1 || idleStats.Gets != suffixStats.Gets || idleStats.Uploads != suffixStats.Uploads {
-		_ = voter.Close()
 		t.Fatalf("caught-up suffix should use one HEAD: before=%+v after=%+v", suffixStats, idleStats)
 	}
-	if err := voter.Close(); err != nil {
-		t.Fatal(err)
+	_, changed := source.publishCheckpoint(t, true)
+	if changed.Index <= floor {
+		t.Fatalf("changed checkpoint index=%d must exceed old base=%d", changed.Index, floor)
 	}
 	if err := r.Sync(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if r.core.CompactionFloor() != changed.Index {
+		t.Fatalf("changed checkpoint not adopted: floor=%d required=%d", r.core.CompactionFloor(), changed.Index)
 	}
 	if r.pinOwner != owner {
 		t.Fatal("successful recovery should reuse the process pin owner")
@@ -132,19 +115,14 @@ func TestReadReplicaIdleSyncAndChangedCheckpoint(t *testing.T) {
 func TestReadReplicaPinCloseFailureInvalidatesIdleState(t *testing.T) {
 	for _, prefix := range []string{"archive/recovery-pins/", "checkpoint/recovery-pins/"} {
 		t.Run(prefix, func(t *testing.T) {
-			r, voterConfig, _ := checkpointReplicaFixture(t)
+			r, source, _ := checkpointReplicaFixture(t)
 			ctx := context.Background()
 			owner := r.pinOwner
-			voter, err := Open(ctx, voterConfig)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := voter.Execute(ctx, ExecuteRequest{RequestID: "insert", SQL: "INSERT INTO items VALUES (1)"}); err != nil {
-				_ = voter.Close()
-				t.Fatal(err)
-			}
-			if err := voter.Close(); err != nil {
-				t.Fatal(err)
+			floor := r.core.CompactionFloor()
+			source.execute(t, "INSERT INTO items VALUES (1)")
+			_, changed := source.publishCheckpoint(t, true)
+			if changed.Index <= floor || changed.Index <= r.core.Tip() {
+				t.Fatalf("pin-failure fixture needs a newer base: index=%d old_base=%d reader_tip=%d", changed.Index, floor, r.core.Tip())
 			}
 			bucket := r.bucket.Bucket
 			fault := &failingReplicaPinClose{Bucket: bucket, prefix: prefix}

@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish_chaos_image:
+        description: Publish the tested qualification host image for a local run
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -99,7 +105,7 @@ jobs:
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
   membership-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -114,7 +120,24 @@ jobs:
           RHIZA_E2E_S3_BUCKET: rhiza
           RHIZA_E2E_S3_ACCESS_KEY: rhiza-e2e
           RHIZA_E2E_S3_SECRET_KEY: rhiza-e2e-secret
+          AWS_ACCESS_KEY_ID: rhiza-e2e
+          AWS_SECRET_ACCESS_KEY: rhiza-e2e-secret
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
         run: |
+          aws_path=$(command -v aws)
+          aws_version=$(aws --version 2>&1)
+          runner_arch=$(uname -m)
+          test "$runner_arch" = x86_64
+          case "$aws_version" in
+            aws-cli/2.*Linux*exe/x86_64.*) ;;
+            *) echo "unsupported runner AWS CLI: $aws_version" >&2; exit 1 ;;
+          esac
+          printf 'command=%s\nversion=%s\narchitecture=%s\n' \
+            "$aws_path" "$aws_version" "$runner_arch" \
+            | tee "$RUNNER_TEMP/rhiza-membership-aws-cli-receipt.txt"
           mkdir -p "$RUNNER_TEMP/rhiza-s3-data"
           docker run --rm -d --name rhiza-membership-s3 -p 19000:9000 \
             -v "$RUNNER_TEMP/rhiza-s3-data:/data" \
@@ -127,11 +150,47 @@ jobs:
             sleep 0.1
           done
           curl -fsS http://127.0.0.1:19000/_/health >/dev/null
-          docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
-            -e AWS_DEFAULT_REGION=us-east-1 \
-            amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
-            --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
+          (
+            set +x
+            ambient_auth_vars=(
+              AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+              AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
+              AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI
+              AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+              AWS_CREDENTIAL_PROCESS AWS_SDK_LOAD_CONFIG
+            )
+            unset "${ambient_auth_vars[@]}"
+            for auth_var in "${ambient_auth_vars[@]}"; do
+              if test -n "${!auth_var+x}"; then
+                printf 'failed to isolate ambient AWS auth selector: %s\n' "$auth_var" >&2
+                exit 1
+              fi
+            done
+
+            auth_dir=$(mktemp -d "$RUNNER_TEMP/rhiza-membership-aws-auth.XXXXXX")
+            config_file="$auth_dir/config"
+            credentials_file="$auth_dir/credentials"
+            # Invoked indirectly by the EXIT trap below.
+            # shellcheck disable=SC2329
+            cleanup_aws_auth() {
+              status=$?
+              trap - EXIT
+              rm -f -- "$config_file" "$credentials_file" || :
+              rmdir -- "$auth_dir" || :
+              exit "$status"
+            }
+            trap cleanup_aws_auth EXIT
+            export AWS_CONFIG_FILE="$config_file"
+            export AWS_SHARED_CREDENTIALS_FILE="$credentials_file"
+            umask 077
+            : >"$AWS_SHARED_CREDENTIALS_FILE"
+            chmod 600 "$AWS_SHARED_CREDENTIALS_FILE"
+            printf '[default]\ns3 =\n  addressing_style = path\n' >"$AWS_CONFIG_FILE"
+            chmod 600 "$AWS_CONFIG_FILE"
+            test ! -s "$AWS_SHARED_CREDENTIALS_FILE"
+
+            aws --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
+          )
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
   rust-sdk:
@@ -181,17 +240,8 @@ jobs:
         env:
           CGO_ENABLED: 0
         run: go test ./...
-      - name: Offline bootstrap and bucket fixture regressions
-        env:
-          RHIZA_RUN_ID: '00000000'
-          RHIZA_WORKFLOW_SHA: ${{ github.sha }}
-          RHIZA_AUTH_EXPIRES: '2000-01-01T00:00:00Z'
+      - name: Bucket fixture retry regression
         run: |
-          command -v curl
-          command -v jq
-          sh -n e2e/chaos/bootstrap-gcs-postrelease.sh
-          sh e2e/chaos/bootstrap-gcs-postrelease.sh check-folder-iam
-          sh e2e/chaos/bootstrap-gcs-postrelease.sh check-cleanup-uris
           python3 e2e/chaos/operator_fixture_test.py
           python3 e2e/chaos/operator_recovery_test.py
       - name: Learner checkpoint adoption crash and lease boundaries
@@ -286,9 +336,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - name: Prepare container test tools
+        run: |
+          awk '
+            { print }
+            $0 == "FROM mirror.gcr.io/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
+              print "RUN apk --no-cache add jq coreutils"
+              matched++
+            }
+            END { if (matched != 1) exit 1 }
+          ' Dockerfile > "$RUNNER_TEMP/Dockerfile.ci"
       - uses: docker/build-push-action@v6
         with:
           context: .
+          file: ${{ runner.temp }}/Dockerfile.ci
           push: false
           tags: rhiza:ci
 
@@ -302,8 +365,63 @@ jobs:
   anchor-operator-chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      PUBLISH_CHAOS_IMAGE: ${{ github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image }}
+      APPLICATION_SHA: 315a5ee6bc6635b4ff4f85b9534afa4abe537c79
     steps:
       - uses: actions/checkout@v4
+      - name: Require released production source for image export
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        run: |
+          git fetch --no-tags --depth=1 origin "$APPLICATION_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          approved_mirror_diff="$RUNNER_TEMP/approved-mirror.diff"
+          LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
+            --no-color --no-indent-heuristic --diff-algorithm=myers --unified=3 \
+            --src-prefix=a/ --dst-prefix=b/ "$APPLICATION_SHA" "$GITHUB_SHA" -- \
+            .github/workflows/operator-release.yml \
+            Dockerfile \
+            Dockerfile.operator \
+            e2e/chaos/Dockerfile \
+            e2e/chaos/Dockerfile.rust > "$approved_mirror_diff"
+          printf '%s  %s\n' \
+            4910dece3c307b461132d417d24b6cb13920608659110da872b2a3b188ede77d \
+            "$approved_mirror_diff" | sha256sum --check --strict
+          approved_benchmark_diff="$RUNNER_TEMP/approved-benchmark.diff"
+          LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
+            --no-color --no-indent-heuristic --diff-algorithm=myers --unified=3 \
+            --src-prefix=a/ --dst-prefix=b/ "$APPLICATION_SHA" "$GITHUB_SHA" -- \
+            .github/workflows/performance.yml \
+            benchmarks/hiqlite-reference.json \
+            benchmarks/verify-hiqlite-reference-artifact.sh \
+            benchmarks/verify-hiqlite-reference.sh \
+            benchmarks/verify-hiqlite-reference_test.sh \
+            benchmarks/results/2026-10-10-hiqlite-v0.15.2 > "$approved_benchmark_diff"
+          printf '%s  %s\n' \
+            dcc808143dc7601735a2ef78be439ce87150213635a234f44e2fba1151331a1f \
+            "$approved_benchmark_diff" | sha256sum --check --strict
+          git diff --exit-code "$APPLICATION_SHA" "$GITHUB_SHA" -- . \
+            ':(exclude).github/workflows/ci.yml' \
+            ':(exclude).github/workflows/gcs-postrelease.yml' \
+            ':(exclude).github/workflows/operator-release.yml' \
+            ':(exclude).github/workflows/performance.yml' \
+            ':(exclude)Dockerfile' \
+            ':(exclude)Dockerfile.operator' \
+            ':(exclude)benchmarks/hiqlite-reference.json' \
+            ':(exclude)benchmarks/verify-hiqlite-reference-artifact.sh' \
+            ':(exclude)benchmarks/verify-hiqlite-reference.sh' \
+            ':(exclude)benchmarks/verify-hiqlite-reference_test.sh' \
+            ':(exclude)benchmarks/results/2026-10-10-hiqlite-v0.15.2/**' \
+            ':(exclude)e2e/chaos/Dockerfile' \
+            ':(exclude)e2e/chaos/Dockerfile.rust' \
+            ':(exclude)e2e/chaos/bootstrap-gcs-postrelease.sh' \
+            ':(exclude)e2e/chaos/run-gcs-postrelease.sh' \
+            ':(exclude)e2e/chaos/gcs-postrelease-auth.yaml.in' \
+            ':(exclude)e2e/chaos/gcs-postrelease.yaml.in' \
+            ':(exclude)e2e/chaos/embedded-go/main.go' \
+            ':(exclude)e2e/chaos/embedded-go/counters_test.go' \
+            ':(exclude)pkg/network/migration_admission_test.go' \
+            ':(exclude)pkg/quepaxa/learner_compaction_test.go'
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -317,7 +435,14 @@ jobs:
           go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go
           go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
           go build -o "$RUNNER_TEMP/chaos-images/anchor-service" ./examples/recovery-anchor
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          labels=()
+          if [ "$PUBLISH_CHAOS_IMAGE" = true ]; then
+            labels=(--label "org.opencontainers.image.source=https://github.com/mrchypark/rhiza"
+              --label "org.opencontainers.image.revision=$GITHUB_SHA"
+              --label "io.rhiza.qualification.harness=$GITHUB_SHA"
+              --label "io.rhiza.qualification.application=$APPLICATION_SHA")
+          fi
+          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=anchor-service -t rhiza-anchor-service:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-anchor-chaos --wait 120s
@@ -337,3 +462,83 @@ jobs:
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-anchor-chaos
+      - name: Export the tested qualification host
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        run: |
+          export_dir="$RUNNER_TEMP/qualification-host"
+          mkdir -p "$export_dir"
+          docker image inspect rhiza-chaos:local > "$export_dir/image.json"
+          jq -e --arg harness "$GITHUB_SHA" --arg app "$APPLICATION_SHA" '
+            .[0] | .Os == "linux" and .Architecture == "amd64" and .Size < 134217728 and
+            .Config.User == "65532:65532" and
+            .Config.Labels["org.opencontainers.image.source"] == "https://github.com/mrchypark/rhiza" and
+            .Config.Labels["org.opencontainers.image.revision"] == $harness and
+            .Config.Labels["io.rhiza.qualification.harness"] == $harness and
+            .Config.Labels["io.rhiza.qualification.application"] == $app
+          ' "$export_dir/image.json"
+          container=$(docker create rhiza-chaos:local)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/rhiza-entrypoint" "$export_dir/rhiza-entrypoint"
+          cmp "$RUNNER_TEMP/chaos-images/rhiza" "$export_dir/rhiza-entrypoint"
+          (cd "$export_dir" && sha256sum rhiza-entrypoint > binary.sha256)
+          rm "$export_dir/rhiza-entrypoint"
+          docker save rhiza-chaos:local -o "$export_dir/host.tar"
+          (cd "$export_dir" && sha256sum host.tar image.json binary.sha256 > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH_CHAOS_IMAGE == 'true'
+        with:
+          name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-host
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-chaos-image:
+    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image
+    needs: [anchor-operator-chaos, go, containers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: qualification-host
+      - name: Verify and load the tested host image
+        working-directory: qualification-host
+        run: |
+          sha256sum -c SHA256SUMS
+          docker load -i host.tar
+          test "$(docker image inspect rhiza-chaos:local --format '{{.Id}}')" = "$(jq -r '.[0].Id' image.json)"
+          container=$(docker create rhiza-chaos:local)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/bin/rhiza-entrypoint" rhiza-entrypoint
+          sha256sum -c binary.sha256
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish only the immutable run tag
+        shell: bash
+        run: |
+          target="ghcr.io/mrchypark/rhiza-sql:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker tag rhiza-chaos:local "$target"
+          docker push "$target" | tee qualification-host/push.log
+          docker image inspect "$target" > qualification-host/published-image.json
+          # shellcheck disable=SC2016 # Markdown backticks are literal output.
+          printf 'Qualification host: `%s`\n\n' "$target" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[0].RepoDigests[]' qualification-host/published-image.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualification-publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            qualification-host/image.json
+            qualification-host/binary.sha256
+            qualification-host/SHA256SUMS
+            qualification-host/push.log
+            qualification-host/published-image.json
+          if-no-files-found: error
+          retention-days: 7

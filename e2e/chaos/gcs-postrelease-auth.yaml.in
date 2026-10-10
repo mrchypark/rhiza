@@ -5,11 +5,11 @@ metadata:
   name: @NAMESPACE@
   labels:
     chaos.rhiza.io/run: '@RUN_ID@'
-    pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/enforce: 'restricted'
+    pod-security.kubernetes.io/enforce-version: 'latest'
   annotations:
     rhiza.dev/auth-owner: '@OWNER@'
-    chaos-mesh.org/inject: enabled
+    chaos-mesh.org/inject: 'enabled'
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -18,8 +18,20 @@ metadata:
   namespace: @NAMESPACE@
   annotations:
     iam.gke.io/gcp-service-account: '@POD_GSA@'
+    iam.gke.io/return-principal-id-as-email: "true"
 automountServiceAccountToken: false
 ---
+# BEGIN LOCAL RUNTIME ACCOUNT
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-runtime
+  namespace: @NAMESPACE@
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+automountServiceAccountToken: false
+---
+# END LOCAL RUNTIME ACCOUNT
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -240,7 +252,7 @@ spec:
       matchLabels:
         kubernetes.io/metadata.name: @NAMESPACE@
 ---
-# Only the CI GSA, not the Pod GSA/KSA, controls fresh runtime resources.
+# Only the selected runtime identity, not the Pod GSA/KSA, controls this scope.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -259,18 +271,30 @@ rules:
   - apiGroups: ['']
     resources: [events]
     verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [endpoints]
+    verbs: [get, list, watch]
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [create, get, list, watch, delete]
+  - apiGroups: [batch]
+    resources: [cronjobs]
+    verbs: [list]
   - apiGroups: [apps]
     resources: [statefulsets]
     verbs: [create, get, list, watch, delete]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, daemonsets]
+    verbs: [list]
   - apiGroups: [apps]
     resources: [statefulsets/scale]
     verbs: [get, update, patch]
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
     verbs: [create, get, list, watch, delete]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
   - apiGroups: [chaos-mesh.org]
     resources: [podchaos, networkchaos]
     verbs: [create, get, list, watch, delete]
@@ -281,9 +305,10 @@ metadata:
   name: rhiza-ci-runtime
   namespace: @NAMESPACE@
 subjects:
-  - kind: User
-    apiGroup: rbac.authorization.k8s.io
-    name: '@CI_GSA@'
+  - kind: @RUNTIME_KIND@
+@RUNTIME_API_GROUP@
+    name: '@RUNTIME_NAME@'
+@RUNTIME_NAMESPACE@
 roleRef:
   kind: Role
   apiGroup: rbac.authorization.k8s.io
@@ -309,9 +334,10 @@ metadata:
   annotations:
     rhiza.dev/auth-owner: '@OWNER@'
 subjects:
-  - kind: User
-    apiGroup: rbac.authorization.k8s.io
-    name: '@CI_GSA@'
+  - kind: @RUNTIME_KIND@
+@RUNTIME_API_GROUP@
+    name: '@RUNTIME_NAME@'
+@RUNTIME_NAMESPACE@
 roleRef:
   kind: ClusterRole
   apiGroup: rbac.authorization.k8s.io
