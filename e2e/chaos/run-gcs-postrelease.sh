@@ -704,7 +704,7 @@ verify_voter_absence() {
   ' "$out/cold-controller.json" >/dev/null || return 1
   k get pods -o json > "$out/cold-pods.json" || return $?
   k get endpointslices.discovery.k8s.io -l kubernetes.io/service-name=rhiza-peers -o json > "$out/cold-endpointslices.json" || return $?
-  k get endpoints -o json > "$out/cold-endpoints.json" || return $?
+  k get endpoints rhiza-peers -o json > "$out/cold-endpoints.json" || return $?
   jq -n -e --slurpfile expected "$out/shutdown-before.json" --slurpfile pods "$out/cold-pods.json" \
     --slurpfile slices "$out/cold-endpointslices.json" --slurpfile endpoints "$out/cold-endpoints.json" \
     --slurpfile before "$out/shutdown-pods-before.json" --arg sts_uid "$(jq -r '.metadata.uid' "$out/shutdown-controller-before.json")" '
@@ -716,11 +716,12 @@ verify_voter_absence() {
       all(.endpoints[]?; ((.targetRef.uid // "") as $uid|$uids|index($uid)|not) and
         ((.targetRef.name // "") as $name|$names|index($name)|not) and
         all(.addresses[]?; . as $ip|$ips|index($ip)|not))) and
-    all($endpoints[0].items[]|select(.metadata.name=="rhiza-peers");
-      all(.subsets[]?; all(((.addresses // [])+(.notReadyAddresses // []))[]?;
+    $endpoints[0].metadata.name=="rhiza-peers" and
+    all($endpoints[0].subsets[]?;
+      all(((.addresses // [])+(.notReadyAddresses // []))[]?;
         ((.targetRef.uid // "") as $uid|$uids|index($uid)|not) and
         ((.targetRef.name // "") as $name|$names|index($name)|not) and
-        (.ip as $ip|$ips|index($ip)|not))))
+        (.ip as $ip|$ips|index($ip)|not)))
   ' >/dev/null
 }
 cleanup_metadata_only() (
