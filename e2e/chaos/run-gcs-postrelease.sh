@@ -202,6 +202,8 @@ metadata_credentials_ready() {
     return 124
   fi
   RHIZA_METADATA_PARENT_MODE=$mode \
+    RHIZA_CLUSTER_METADATA=$RHIZA_CLUSTER_METADATA \
+    RHIZA_LOCAL_RUNTIME_KUBECONFIG=${RHIZA_LOCAL_RUNTIME_KUBECONFIG:-} \
     timeout --kill-after="${metadata_kill_grace}s" "${metadata_budget}s" /bin/sh "$script_dir/run-gcs-postrelease.sh" metadata-readiness-worker
 }
 validate_cluster_metadata() {

@@ -600,7 +600,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "workload-identity-mode-false", "workload-identity-mode-absent", "workload-identity-mode-other", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "workload-identity-mode-false", "workload-identity-mode-absent", "workload-identity-mode-other", "metadata-worker-entrypoint", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -867,9 +867,18 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				}
 			}
 			out := filepath.Join(dir, "evidence")
+			if scenario == "metadata-worker-entrypoint" {
+				if err := os.Mkdir(out, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, "/bin/sh", script, "run-local")
+			entrypoint := "run-local"
+			if scenario == "metadata-worker-entrypoint" {
+				entrypoint = "metadata-readiness-worker"
+			}
+			cmd := exec.CommandContext(ctx, "/bin/sh", script, entrypoint)
 			// Do not inherit any live credential/CI/approval variables.
 			cmd.Env = []string{"PATH=" + bin + ":" + os.Getenv("PATH"), "RHIZA_RUN_ID=" + run, "RHIZA_NAMESPACE=" + namespace,
 				"RHIZA_AUTH_CREATION_SHA=" + harness, "RHIZA_HARNESS_SHA=" + syntheticFixtureRevision, "RHIZA_APPLICATION_SHA=" + harness,
@@ -888,6 +897,9 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				"FAKE_NATIVE_TIMEOUT=" + nativeTimeout, "FAKE_KUBECTL=" + filepath.Join(bin, "kubectl"), "FAKE_KUBECONFIG=" + physicalKubeconfig,
 				"FAKE_GIT_ROOT=" + filepath.Dir(script) + "/../..", "FAKE_GIT_REVISION=" + mockFixtureRevision,
 				"FAKE_PARENT=" + filepath.Join(dir, "parent"), "FAKE_SIGNAL_READY=" + filepath.Join(dir, "signal-ready")}
+			if scenario == "metadata-worker-entrypoint" {
+				cmd.Env = append(cmd.Env, "RHIZA_METADATA_PARENT_MODE=run-local", "RHIZA_CLUSTER_METADATA="+clusterMetadataPath)
+			}
 			if scenario == "fake-ci" {
 				cmd.Env = append(cmd.Env, "GITHUB_ACTIONS=true")
 			}
@@ -931,6 +943,17 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			events, eventErr := os.ReadFile(filepath.Join(dir, "config-events"))
 			calls, callsErr := os.ReadFile(filepath.Join(dir, "calls"))
 			t.Logf("mock events: %q readError=%v; calls: %q readError=%v", events, eventErr, calls, callsErr)
+			if scenario == "metadata-worker-entrypoint" {
+				if err != nil || ctx.Err() != nil {
+					t.Fatalf("actual metadata worker rejected sealed inputs: err=%v context=%v output=%s", err, ctx.Err(), output)
+				}
+				if !bytes.Contains(calls, []byte("/instance/service-accounts/default/email")) || !bytes.Contains(calls, []byte("/instance/service-accounts/default/token")) ||
+					!bytes.Contains(output, []byte("category=linked-gsa-email")) || !bytes.Contains(output, []byte("category=ready")) ||
+					bytes.Contains(output, []byte("cluster metadata receipt required")) {
+					t.Fatalf("actual worker did not reach sealed token classification: calls=%s output=%s", calls, output)
+				}
+				return
+			}
 			var exited *exec.ExitError
 			if !errors.As(err, &exited) || ctx.Err() != nil {
 				t.Fatalf("runtime did not fail within its bounded test: err=%v context=%v", err, ctx.Err())
