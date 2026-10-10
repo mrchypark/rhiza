@@ -301,8 +301,18 @@ validate_archive_head_metadata() {
       (($size|tonumber)>=132) and (($size|tonumber)<=8388632))
   ' "$1" >/dev/null
 }
+validate_checkpoint_current_metadata() {
+  jq -e --arg bucket rhiza-v070-chaos-ied-20260811 --arg name "${prefix}${cluster}/checkpoint/CURRENT" '
+    keys==["bucket","generation","name","size"] and .bucket==$bucket and .name==$name and
+    (.generation|type)=="string" and (.generation|test("^[1-9][0-9]*$")) and
+    (.size|tonumber)>0 and (.size|tonumber)==(.size|tonumber|floor)
+  ' "$1" >/dev/null
+}
 same_archive_head_metadata() {
   jq -e --slurpfile before "$1" '.generation==$before[0].generation and (.size|tonumber)==($before[0].size|tonumber)' "$2" >/dev/null
+}
+same_object_evidence() {
+  same_archive_head_metadata "$1" "$2" && [ "$(cat "$3")" = "$(cat "$4")" ]
 }
 private_file() {
   case "$1" in /*) ;; *) die 'private absolute credential path required' ;; esac
@@ -372,9 +382,7 @@ sed -e "s|__NAMESPACE__|$ns|g" -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
 awk '/^# BEGIN COLD LEARNER/{cold=1;next} /^# END COLD LEARNER/{cold=0;next} !cold' "$out/rendered.yaml" > "$out/initial.yaml"
 awk '/^# BEGIN COLD LEARNER/{cold=1;next} /^# END COLD LEARNER/{cold=0;next} cold' "$out/rendered.yaml" > "$out/learner.yaml"
 awk 'BEGIN{RS="---\n"} /name: rhiza-metadata/{print}' "$out/initial.yaml" > "$out/metadata.yaml"
-awk 'BEGIN{RS="---\n"} !/name: rhiza-metadata/ && !/name: rhiza-quic-probe/ && !/kind: NetworkPolicy/{print $0 "---"}' "$out/initial.yaml" > "$out/voters.yaml"
-awk 'BEGIN{RS="---\n"} /name: rhiza-quic-probe/{print}' "$out/initial.yaml" > "$out/probe.yaml"
-awk 'BEGIN{RS="---\n"} /kind: NetworkPolicy/{print}' "$out/initial.yaml" > "$out/cold-policy.yaml"
+awk 'BEGIN{RS="---\n"} !/name: rhiza-metadata/{print $0 "---"}' "$out/initial.yaml" > "$out/voters.yaml"
 shutdown_events() {
   jq -s -e --slurpfile before "$1/shutdown-before.json" '
     . as $events |
@@ -589,6 +597,7 @@ learner_attempted=false
 shutdown_watch_pid=''
 shutdown_log_pids=''
 shutdown_capture=false
+source_quiesced=false
 # A watch started from the pre-stop list version replays termination events even
 # if the request connects after scale0. No privileged node/container API is used.
 shutdown_stream() {
@@ -678,6 +687,33 @@ finish_shutdown_capture() {
     "$out/shutdown-pods-after.json" > "$out/shutdown-writers-after.json" || return $?
   verify_shutdown "$out"
 }
+verify_voter_absence() {
+  k get statefulset/rhiza-voter -o json > "$out/cold-controller.json" || return $?
+  jq -e --slurpfile before "$out/shutdown-controller-before.json" '
+    .metadata.uid==$before[0].metadata.uid and .spec.replicas==0 and
+    (.status.replicas // 0)==0 and (.status.readyReplicas // 0)==0 and (.status.currentReplicas // 0)==0
+  ' "$out/cold-controller.json" >/dev/null || return 1
+  k get pods -o json > "$out/cold-pods.json" || return $?
+  k get endpointslices.discovery.k8s.io -o json > "$out/cold-endpointslices.json" || return $?
+  k get endpoints -o json > "$out/cold-endpoints.json" || return $?
+  jq -n -e --slurpfile expected "$out/shutdown-before.json" --slurpfile pods "$out/cold-pods.json" \
+    --slurpfile slices "$out/cold-endpointslices.json" --slurpfile endpoints "$out/cold-endpoints.json" \
+    --slurpfile before "$out/shutdown-pods-before.json" --arg sts_uid "$(jq -r '.metadata.uid' "$out/shutdown-controller-before.json")" '
+    [$expected[0][]|select(.name|test("^rhiza-voter-[012]$"))] as $voters |
+    [$voters[].uid] as $uids | [$voters[].name] as $names |
+    [$before[0].items[]|select(.metadata.uid as $uid|$uids|index($uid))|.status.podIP] as $ips |
+    all($pods[0].items[]; all(.metadata.ownerReferences[]?; .uid!=$sts_uid)) and
+    all($slices[0].items[]|select(.metadata.labels["kubernetes.io/service-name"]=="rhiza-peers");
+      all(.endpoints[]?; ((.targetRef.uid // "") as $uid|$uids|index($uid)|not) and
+        ((.targetRef.name // "") as $name|$names|index($name)|not) and
+        all(.addresses[]?; . as $ip|$ips|index($ip)|not))) and
+    all($endpoints[0].items[]|select(.metadata.name=="rhiza-peers");
+      all(.subsets[]?; all(((.addresses // [])+(.notReadyAddresses // []))[]?;
+        ((.targetRef.uid // "") as $uid|$uids|index($uid)|not) and
+        ((.targetRef.name // "") as $name|$names|index($name)|not) and
+        (.ip as $ip|$ips|index($ip)|not))))
+  ' >/dev/null
+}
 cleanup_metadata_only() (
   # Reuse the scoped transport deadline for all reads, delete and wait together.
   voter_wait_deadline=$(( $(date +%s) + 180 ))
@@ -744,44 +780,42 @@ cleanup() {
     [ "$cleanup_code" = 0 ] || clean=false
     if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
   fi
-  capture_shutdown
-  capture_code=$?
-  printf '%s\n' "$capture_code" > "$out/shutdown-capture.exit"
-  [ "$capture_code" = 0 ] || clean=false
-  if [ "$code" = 0 ] && [ "$capture_code" != 0 ]; then code=$capture_code; fi
-  # Run-owned writers stop normally; this is NOT fencing evidence.
-  k scale statefulset/rhiza-voter --replicas=0 > "$out/stop-voters.stdout" 2> "$out/stop-voters.stderr"
-  cleanup_code=$?
-  printf '%s\n' "$cleanup_code" > "$out/stop-voters.exit"
-  [ "$cleanup_code" = 0 ] || clean=false
-  if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
-  k wait pod --selector="app=rhiza-voter,chaos.rhiza.io/run=$RHIZA_RUN_ID" --for=delete --timeout=90s > "$out/voters-gone.stdout" 2> "$out/voters-gone.stderr"
-  cleanup_code=$?
-  printf '%s\n' "$cleanup_code" > "$out/voters-gone.exit"
-  [ "$cleanup_code" = 0 ] || clean=false
-  if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
-  k get pods --selector="app=rhiza-voter,chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/voters-absent.json" 2> "$out/voters-absent.stderr"
-  cleanup_code=$?
-  if [ "$cleanup_code" = 0 ]; then jq -e '.items|length==0' "$out/voters-absent.json" >/dev/null; cleanup_code=$?; fi
-  printf '%s\n' "$cleanup_code" > "$out/voters-absent.exit"
-  [ "$cleanup_code" = 0 ] || clean=false
-  if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+  # On failure, remove the recovery process before touching the sealed source.
   k delete pod/rhiza-learner --ignore-not-found --wait=true --timeout=60s > "$out/stop-learner.stdout" 2> "$out/stop-learner.stderr"
   cleanup_code=$?
   printf '%s\n' "$cleanup_code" > "$out/stop-learner.exit"
   [ "$cleanup_code" = 0 ] || clean=false
   if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
-  k delete pod/rhiza-quic-probe --ignore-not-found --wait=true --timeout=60s > "$out/stop-probe.stdout" 2> "$out/stop-probe.stderr"
-  cleanup_code=$?
-  printf '%s\n' "$cleanup_code" > "$out/stop-probe.exit"
-  [ "$cleanup_code" = 0 ] || clean=false
-  if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
-  if [ "$shutdown_capture" = true ]; then
-    finish_shutdown_capture
-    proof_code=$?
-    printf '%s\n' "$proof_code" > "$out/owned-close-proof.exit"
-    [ "$proof_code" = 0 ] || clean=false
-    if [ "$code" = 0 ] && [ "$proof_code" != 0 ]; then code=$proof_code; fi
+  if [ "${source_quiesced:-false}" = false ]; then
+    capture_shutdown
+    capture_code=$?
+    printf '%s\n' "$capture_code" > "$out/shutdown-capture.exit"
+    [ "$capture_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$capture_code" != 0 ]; then code=$capture_code; fi
+    # Run-owned writers stop normally; this is NOT fencing evidence.
+    k scale statefulset/rhiza-voter --replicas=0 > "$out/stop-voters.stdout" 2> "$out/stop-voters.stderr"
+    cleanup_code=$?
+    printf '%s\n' "$cleanup_code" > "$out/stop-voters.exit"
+    [ "$cleanup_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+    k wait pod --selector="app=rhiza-voter,chaos.rhiza.io/run=$RHIZA_RUN_ID" --for=delete --timeout=90s > "$out/voters-gone.stdout" 2> "$out/voters-gone.stderr"
+    cleanup_code=$?
+    printf '%s\n' "$cleanup_code" > "$out/voters-gone.exit"
+    [ "$cleanup_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+    k get pods --selector="app=rhiza-voter,chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json > "$out/voters-absent.json" 2> "$out/voters-absent.stderr"
+    cleanup_code=$?
+    if [ "$cleanup_code" = 0 ]; then jq -e '.items|length==0' "$out/voters-absent.json" >/dev/null; cleanup_code=$?; fi
+    printf '%s\n' "$cleanup_code" > "$out/voters-absent.exit"
+    [ "$cleanup_code" = 0 ] || clean=false
+    if [ "$code" = 0 ] && [ "$cleanup_code" != 0 ]; then code=$cleanup_code; fi
+    if [ "$shutdown_capture" = true ]; then
+      finish_shutdown_capture
+      proof_code=$?
+      printf '%s\n' "$proof_code" > "$out/owned-close-proof.exit"
+      [ "$proof_code" = 0 ] || clean=false
+      if [ "$code" = 0 ] && [ "$proof_code" != 0 ]; then code=$proof_code; fi
+    fi
   fi
   fi
   forward_cleanup_code=0
@@ -982,7 +1016,9 @@ learner_started=false
 metrics() {
   [ "$(( $(date +%s) - started ))" -lt 1200 ] || die '20-minute workload ceiling; cleanup reserved'
   ports='18080 18081 18082'
-  [ "$learner_started" = false ] || ports="$ports 18083"
+  if [ "$source_quiesced" = true ]; then ports=18083
+  elif [ "$learner_started" = true ]; then ports="$ports 18083"
+  fi
   for port in $ports; do
     # Preserve the pre-kill sample; SIGKILL tail is a disclosed reserve, not
     # falsely reconstructed from the restarted process's zeroed counters.
@@ -1182,31 +1218,30 @@ run voters-ready wait_voters 120
 for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"],[2,"network"]]'; done
 metrics
 container_kill
+execute "$RHIZA_RUN_ID-cold-sentinel" "INSERT INTO qualification VALUES (4,'$RHIZA_RUN_ID-cold-sentinel')"
+readback 18081 linearizable "[[1,\"before\"],[2,\"network\"],[3,\"process\"],[4,\"$RHIZA_RUN_ID-cold-sentinel\"]]"
+source_barrier=$(jq -r '.applied_slot' "$out/$seq-readback.stdout")
 sleep 15
-run current k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/checkpoint/CURRENT"
-cp "$out/$seq-current.stdout" "$out/CURRENT.json"
+run checkpoint-current-before k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/checkpoint/CURRENT"
+cp "$out/$seq-checkpoint-current-before.stdout" "$out/checkpoint-CURRENT-before.bin"
+sha256_file "$out/checkpoint-CURRENT-before.bin" > "$out/checkpoint-CURRENT-before.sha256"
+run checkpoint-metadata-before k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/checkpoint/CURRENT" '--format=json(bucket,name,generation,size)'
+cp "$out/$seq-checkpoint-metadata-before.stdout" "$out/checkpoint-CURRENT-metadata-before.json"
+validate_checkpoint_current_metadata "$out/checkpoint-CURRENT-metadata-before.json" || die 'published checkpoint CURRENT metadata invalid'
 run head-metadata-before k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'
 cp "$out/$seq-head-metadata-before.stdout" "$out/archive-head-metadata-before.json"
 validate_archive_head_metadata "$out/archive-head-metadata-before.json" || die 'published archive head metadata invalid'
-run probe-create k create -f "$out/probe.yaml"
-run probe-ready k wait pod/rhiza-quic-probe --for=condition=Ready --timeout=120s
-run probe-identity k get pod rhiza-quic-probe -o json
-probe_identity="$out/$seq-probe-identity.stdout"
-for voter in 0 1 2; do
-  run probe-target k get pod "rhiza-voter-$voter" -o json
-  jq -r '.status.podIP' "$out/$seq-probe-target.stdout" > "$out/probe-voter-$voter.ip"
-  target=$(cat "$out/probe-voter-$voter.ip")
-  run probe-connected k exec rhiza-quic-probe -- /usr/local/bin/rhiza-entrypoint qualification-quic-probe connected "rhiza-voter-$voter" "$target:9090"
-done
-run cold-policy-create k create -f "$out/cold-policy.yaml"
-sleep 5
-for voter in 0 1 2; do
-  target=$(cat "$out/probe-voter-$voter.ip")
-  run probe-blocked k exec rhiza-quic-probe -- /usr/local/bin/rhiza-entrypoint qualification-quic-probe blocked "rhiza-voter-$voter" "$target:9090"
-done
-run probe-identity-after k get pod rhiza-quic-probe -o json
-jq -e --slurpfile before "$probe_identity" '.metadata.uid==$before[0].metadata.uid and .status.podIP==$before[0].status.podIP and .spec.nodeName==$before[0].spec.nodeName and .metadata.labels==$before[0].metadata.labels and .status.containerStatuses[0].restartCount==0' "$out/$seq-probe-identity-after.stdout" >/dev/null || die 'probe identity changed across policy verification'
-run probe-delete k delete pod/rhiza-quic-probe --wait=true --timeout=60s
+run head-before k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/archive/head.bin"
+sha256_file "$out/$seq-head-before.stdout" > "$out/archive-head-before.sha256"
+capture_shutdown || die 'source shutdown capture failed'
+run controller-before k get statefulset/rhiza-voter -o json
+cp "$out/$seq-controller-before.stdout" "$out/shutdown-controller-before.json"
+jq -e '.spec.replicas==3 and (.metadata.uid|type)=="string" and (.metadata.uid|length)>0' "$out/shutdown-controller-before.json" >/dev/null || die 'voter StatefulSet identity invalid'
+run stop-voters k scale statefulset/rhiza-voter --current-replicas=3 --replicas=0
+run voters-gone k wait pod --selector="app=rhiza-voter,chaos.rhiza.io/run=$RHIZA_RUN_ID" --for=delete --timeout=90s
+finish_shutdown_capture || die 'authentic voter shutdown proof failed'
+verify_voter_absence || die 'voter or endpoint identity remains after scale zero'
+source_quiesced=true
 learner_attempted=true
 run cold-create k create -f "$out/learner.yaml" -o json
 # This manifest creates a Service and Pod; retain the authentic List ACK and
@@ -1223,35 +1258,33 @@ forward rhiza-learner 18083
 learner_started=true
 metrics
 jq -e '.bytes_downloaded>0' "$counters" >/dev/null || die 'fresh learner GCS download evidence absent'
-readback 18083 local '[[1,"before"],[2,"network"],[3,"process"]]'
-run blocked-quorum curl -fsS --max-time 10 http://127.0.0.1:18183/recovery/status
-jq -e '.ready==false and .quorum==false' "$out/$seq-blocked-quorum.stdout" >/dev/null || die 'learner completed peer catch-up despite deny policy'
-run unblock k delete networkpolicy/learner-cold --wait=true
-tries=0
-until curl -fsS --max-time 2 http://127.0.0.1:18083/ready >/dev/null 2>&1; do
-  tries=$((tries + 1)); [ "$tries" -lt 30 ] || die 'learner catch-up did not resume'; sleep 1
-done
-run learner-quorum curl -fsS --max-time 10 http://127.0.0.1:18183/recovery/status
-jq -e '.ready==true and .quorum==false' "$out/$seq-learner-quorum.stdout" >/dev/null || die 'unpromoted learner contract mismatch'
-execute "$RHIZA_RUN_ID-after-cold" "INSERT INTO qualification VALUES (4,'after-cold')"
-readback 18081 linearizable '[[1,"before"],[2,"network"],[3,"process"],[4,"after-cold"]]'
-barrier=$(jq -r '.applied_slot' "$out/$seq-readback.stdout")
-# Unpromoted learners cannot originate ReadIndex. Observe their certified
-# catch-up against the real surviving-voter barrier, not an invented quorum.
 tries=0
 payload='{"sql":"SELECT id,value FROM qualification ORDER BY id","consistency":"local"}'
 while :; do
   run learner-local curl -fsS --max-time 5 -H 'Content-Type: application/json' -d "$payload" http://127.0.0.1:18083/sql/query
-  if jq -e --argjson barrier "$barrier" '.rows==[[1,"before"],[2,"network"],[3,"process"],[4,"after-cold"]] and .applied_slot>=$barrier' "$out/$seq-learner-local.stdout" >/dev/null; then break; fi
-  tries=$((tries + 1)); [ "$tries" -lt 30 ] || die 'learner did not reach voter read barrier'; sleep 1
+  learner_read="$out/$seq-learner-local.stdout"
+  run learner-status curl -fsS --max-time 5 http://127.0.0.1:18183/recovery/status
+  learner_status="$out/$seq-learner-status.stdout"
+  if jq -e --argjson barrier "$source_barrier" \
+      '.ready==false and .quorum==false and .certified_tip==.applied_tip and .applied_tip==.archive_tip and .applied_tip>=$barrier' "$learner_status" >/dev/null &&
+    jq -e --slurpfile status "$learner_status" --arg sentinel "$RHIZA_RUN_ID-cold-sentinel" \
+      '.rows==[[1,"before"],[2,"network"],[3,"process"],[4,$sentinel]] and .applied_slot==$status[0].applied_tip and .consensus_tip==$status[0].certified_tip' "$learner_read" >/dev/null; then break; fi
+  tries=$((tries + 1)); [ "$tries" -lt 30 ] || die 'cold learner tips/readback did not match sealed source'; sleep 1
 done
 run learner-topology pod_snapshot
 jq -e 'any(.[];.name=="rhiza-learner" and (.volumes|length)==1 and .volumes[0].emptyDir!=null)' "$out/$seq-learner-topology.stdout" >/dev/null || die 'fresh learner volume proof missing'
 run head-metadata-after k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'
 cp "$out/$seq-head-metadata-after.stdout" "$out/archive-head-metadata-after.json"
 validate_archive_head_metadata "$out/archive-head-metadata-after.json" || die 'published archive head metadata changed to invalid'
-same_archive_head_metadata "$out/archive-head-metadata-before.json" "$out/archive-head-metadata-after.json" || \
-  die 'archive head generation or size changed during fresh learner proof'
+run head-after k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/archive/head.bin"
+sha256_file "$out/$seq-head-after.stdout" > "$out/archive-head-after.sha256"
+run checkpoint-current-after k exec rhiza-metadata -- gcloud storage cat "${storage}${cluster}/checkpoint/CURRENT"
+sha256_file "$out/$seq-checkpoint-current-after.stdout" > "$out/checkpoint-CURRENT-after.sha256"
+run checkpoint-metadata-after k exec rhiza-metadata -- gcloud storage objects describe "${storage}${cluster}/checkpoint/CURRENT" '--format=json(bucket,name,generation,size)'
+cp "$out/$seq-checkpoint-metadata-after.stdout" "$out/checkpoint-CURRENT-metadata-after.json"
+validate_checkpoint_current_metadata "$out/checkpoint-CURRENT-metadata-after.json" || die 'published checkpoint CURRENT metadata changed to invalid'
+same_object_evidence "$out/archive-head-metadata-before.json" "$out/archive-head-metadata-after.json" "$out/archive-head-before.sha256" "$out/archive-head-after.sha256" || die 'archive head changed during cold restore proof'
+same_object_evidence "$out/checkpoint-CURRENT-metadata-before.json" "$out/checkpoint-CURRENT-metadata-after.json" "$out/checkpoint-CURRENT-before.sha256" "$out/checkpoint-CURRENT-after.sha256" || die 'checkpoint CURRENT changed during cold restore proof'
 metrics
 printf '%s\n' 'Sampled UID/container high-water totals exclude unseen startup/kill/shutdown tails and metadata SDK calls; 10k attempts/384MiB are planned reserves, NOT hard billing guarantees. Root must reconcile actual object generations/transfer and cleanup.' > "$out/budget-limitations.txt"
 printf '%s\n' 'PASS selected GCS/process/network/fresh-learner layer; no whole-generation, promotion, fencing, IO/power-loss or published Rust package claim.' > "$out/result.txt"

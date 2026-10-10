@@ -104,25 +104,6 @@ spec:
           volumeMounts: [{name: data, mountPath: /data}]
       volumes: [{name: data, emptyDir: {sizeLimit: 1Gi}}]
 ---
-# Apply after non-writing probe's positive handshakes, before cold learner Open.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: learner-cold
-  namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__}
-spec:
-  podSelector: {matchLabels: {app: rhiza-learner, chaos.rhiza.io/run: __RUN_ID__}}
-  policyTypes: [Ingress, Egress]
-  ingress:
-    - ports: [{protocol: TCP, port: 8080}, {protocol: TCP, port: 8081}]
-  egress:
-    - ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}, {protocol: TCP, port: 443}]
-    - to: [{ipBlock: {cidr: 169.254.169.254/32}}]
-      ports: [{protocol: TCP, port: 80}, {protocol: TCP, port: 8080}]
-    - to: [{ipBlock: {cidr: 169.254.169.252/32}}]
-      ports: [{protocol: TCP, port: 988}, {protocol: TCP, port: 987}]
----
 # BEGIN COLD LEARNER
 apiVersion: v1
 kind: Service
@@ -211,29 +192,3 @@ spec:
         limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 256Mi}
       volumeMounts: [{name: tmp, mountPath: /tmp}]
   volumes: [{name: tmp, emptyDir: {sizeLimit: 64Mi}}]
----
-# No Open, object-store client, server, or application RPC in this Pod.
-apiVersion: v1
-kind: Pod
-metadata:
-  name: rhiza-quic-probe
-  namespace: __NAMESPACE__
-  labels: {chaos.rhiza.io/run: __RUN_ID__, app: rhiza-learner, app.kubernetes.io/part-of: rhiza-chaos, chaos.rhiza.io/role: learner}
-spec:
-  serviceAccountName: rhiza-gcs
-  automountServiceAccountToken: false
-  nodeName: __NODE_A__
-  restartPolicy: Never
-  securityContext: {runAsNonRoot: true, runAsUser: 65532, seccompProfile: {type: RuntimeDefault}}
-  containers:
-    - name: rhiza
-      image: __HOST_IMAGE__
-      args: [qualification-quic-probe, hold]
-      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
-      env:
-        - {name: RHIZA_NODE_ID, value: rhiza-learner}
-        - name: RHIZA_CLUSTER_MEMBERS
-          valueFrom: {secretKeyRef: {name: rhiza-qualification-auth, key: RHIZA_CLUSTER_MEMBERS}}
-      resources:
-        requests: {cpu: 100m, memory: 128Mi, ephemeral-storage: 64Mi}
-        limits: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}

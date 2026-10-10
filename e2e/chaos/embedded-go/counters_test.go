@@ -52,6 +52,104 @@ func TestObjectStoreCountersAllowlist(t *testing.T) {
 	}
 }
 
+func TestQualificationColdRestoreContract(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := os.ReadFile("../gcs-postrelease.yaml.in")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	for _, forbidden := range []string{"learner-cold", "rhiza-quic-probe", "cold-policy", "probe-connected", "probe-blocked"} {
+		if strings.Contains(source, forbidden) || bytes.Contains(template, []byte(forbidden)) {
+			t.Fatalf("unsupported cold gate remains: %s", forbidden)
+		}
+	}
+	last := -1
+	for _, step := range []string{`execute "$RHIZA_RUN_ID-cold-sentinel"`, "run checkpoint-metadata-before", "run head-metadata-before", "capture_shutdown ||", "run stop-voters k scale statefulset/rhiza-voter --current-replicas=3 --replicas=0", "finish_shutdown_capture ||", "verify_voter_absence ||", "run cold-create", "run learner-local", "run learner-status", "run head-metadata-after", "run checkpoint-metadata-after"} {
+		at := strings.Index(source, step)
+		if at <= last {
+			t.Fatalf("cold restore step missing or out of order: %q", step)
+		}
+		last = at
+	}
+	for _, required := range []string{
+		`.status.readyReplicas // 0)==0 and (.status.currentReplicas // 0)==0`,
+		`all($pods[0].items[]; all(.metadata.ownerReferences[]?; .uid!=$sts_uid))`,
+		`(.targetRef.uid // "") as $uid|$uids|index($uid)|not`,
+		`(.ip as $ip|$ips|index($ip)|not)`,
+		`.ready==false and .quorum==false and .certified_tip==.applied_tip and .applied_tip==.archive_tip and .applied_tip>=$barrier`,
+		`.rows==[[1,"before"],[2,"network"],[3,"process"],[4,$sentinel]] and .applied_slot==$status[0].applied_tip and .consensus_tip==$status[0].certified_tip`,
+		`same_object_evidence "$out/archive-head-metadata-before.json"`,
+		`same_object_evidence "$out/checkpoint-CURRENT-metadata-before.json"`,
+		`if [ "$source_quiesced" = true ]; then ports=18083`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("cold restore contract missing %q", required)
+		}
+	}
+	cleanupAt, cleanupEnd := strings.Index(source, "\ncleanup() {"), strings.Index(source, "\ntrap cleanup EXIT")
+	cleanup := source[cleanupAt:cleanupEnd]
+	if learner, capture := strings.Index(cleanup, "k delete pod/rhiza-learner"), strings.Index(cleanup, "capture_shutdown"); learner < 0 || capture <= learner || !strings.Contains(cleanup, `if [ "${source_quiesced:-false}" = false ]; then`) {
+		t.Fatal("failure cleanup does not remove learner first and preserve source quiescence")
+	}
+}
+
+func TestQualificationColdRestoreAbsencePredicate(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	start := strings.Index(source, "\nverify_voter_absence() {\n")
+	end := strings.Index(source[start+1:], "\ncleanup_metadata_only() (\n")
+	if start < 0 || end < 0 {
+		t.Fatal("voter absence predicate missing")
+	}
+	function := source[start : start+1+end]
+	for _, tc := range []struct {
+		name, pods, slices, endpoints string
+		ok                            bool
+	}{
+		{"clean", `{"items":[]}`, `{"items":[]}`, `{"items":[]}`, true},
+		{"terminating-owned", `{"items":[{"metadata":{"deletionTimestamp":"now","ownerReferences":[{"uid":"sts"}]}}]}`, `{"items":[]}`, `{"items":[]}`, false},
+		{"slice-target", `{"items":[]}`, `{"items":[{"metadata":{"labels":{"kubernetes.io/service-name":"rhiza-peers"}},"endpoints":[{"targetRef":{"uid":"v0"},"addresses":["10.0.0.1"]}]}]}`, `{"items":[]}`, false},
+		{"slice-ip", `{"items":[]}`, `{"items":[{"metadata":{"labels":{"kubernetes.io/service-name":"rhiza-peers"}},"endpoints":[{"addresses":["10.0.0.1"]}]}]}`, `{"items":[]}`, false},
+		{"legacy", `{"items":[]}`, `{"items":[]}`, `{"items":[{"metadata":{"name":"rhiza-peers"},"subsets":[{"notReadyAddresses":[{"ip":"10.0.0.1"}]}]}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, value := range map[string]string{
+				"shutdown-controller-before.json": `{"metadata":{"uid":"sts"}}`,
+				"shutdown-before.json":            `[{"name":"rhiza-voter-0","uid":"v0"},{"name":"rhiza-voter-1","uid":"v1"},{"name":"rhiza-voter-2","uid":"v2"}]`,
+				"shutdown-pods-before.json":       `{"items":[{"metadata":{"uid":"v0"},"status":{"podIP":"10.0.0.1"}}]}`,
+				"controller":                      `{"metadata":{"uid":"sts"},"spec":{"replicas":0},"status":{"replicas":0,"readyReplicas":0,"currentReplicas":0}}`,
+				"pods":                            tc.pods, "slices": tc.slices, "endpoints": tc.endpoints,
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fixture := `set -eu
+out=$1
+k() { case "$*" in
+ 'get statefulset/rhiza-voter -o json') cat "$out/controller";;
+ 'get pods -o json') cat "$out/pods";;
+ 'get endpointslices.discovery.k8s.io -o json') cat "$out/slices";;
+ 'get endpoints -o json') cat "$out/endpoints";;
+ *) return 91;; esac; }
+` + function + `
+verify_voter_absence`
+			err := exec.Command("/bin/sh", "-c", fixture, "fixture", dir).Run()
+			if (err == nil) != tc.ok {
+				t.Fatalf("accepted=%t want=%t error=%v", err == nil, tc.ok, err)
+			}
+		})
+	}
+}
+
 func TestBootstrapCustomRoleDeleteReceiptIsStructuredAndValidated(t *testing.T) {
 	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
 	if err != nil {
@@ -571,7 +669,7 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 	}
 	metadata := `gcloud storage objects describe "${storage}${cluster}/archive/head.bin" '--format=json(bucket,name,generation,size)'`
 	metadataAt, learnerAt := strings.Index(source, metadata), strings.Index(source, "run cold-create")
-	readbackAt, metadataAfterAt := strings.Index(source, "readback 18083 local"), strings.Index(source, "run head-metadata-after")
+	readbackAt, metadataAfterAt := strings.Index(source, "run learner-local"), strings.Index(source, "run head-metadata-after")
 	if metadataAt < 0 || learnerAt <= metadataAt || readbackAt <= learnerAt || metadataAfterAt <= readbackAt {
 		t.Fatal("head.bin metadata proof or required fresh-learner semantic proof missing")
 	}
@@ -634,6 +732,29 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 		command := exec.Command("/bin/sh", "-c", validators+"\nsame_archive_head_metadata \"$1\" \"$2\"", "fixture", before, after)
 		if err := command.Run(); (err == nil) != tc.valid {
 			t.Fatalf("metadata comparison %s valid=%t error=%v", tc.name, tc.valid, err)
+		}
+	}
+	checkpoint := strings.Replace(valid, "archive/head.bin", "checkpoint/CURRENT", 1)
+	if err := os.WriteFile(after, []byte(checkpoint), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("/bin/sh", "-c", "prefix=prefix/; cluster=cluster; "+validators+"\nvalidate_checkpoint_current_metadata \"$1\"", "fixture", after).Run(); err != nil {
+		t.Fatalf("valid checkpoint metadata rejected: %v", err)
+	}
+	digestBefore, digestAfter := filepath.Join(metadataDir, "before.sha256"), filepath.Join(metadataDir, "after.sha256")
+	if err := os.WriteFile(digestBefore, []byte("same\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, digest string
+		valid        bool
+	}{{"same", "same\n", true}, {"digest-change", "changed\n", false}} {
+		if err := os.WriteFile(digestAfter, []byte(tc.digest), 0600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("/bin/sh", "-c", validators+"\nsame_object_evidence \"$1\" \"$2\" \"$3\" \"$4\"", "fixture", before, before, digestBefore, digestAfter)
+		if err := command.Run(); (err == nil) != tc.valid {
+			t.Fatalf("object evidence %s valid=%t error=%v", tc.name, tc.valid, err)
 		}
 	}
 
