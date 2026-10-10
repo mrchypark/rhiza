@@ -105,7 +105,7 @@ jobs:
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
   membership-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +120,24 @@ jobs:
           RHIZA_E2E_S3_BUCKET: rhiza
           RHIZA_E2E_S3_ACCESS_KEY: rhiza-e2e
           RHIZA_E2E_S3_SECRET_KEY: rhiza-e2e-secret
+          AWS_ACCESS_KEY_ID: rhiza-e2e
+          AWS_SECRET_ACCESS_KEY: rhiza-e2e-secret
+          AWS_REGION: us-east-1
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
         run: |
+          aws_path=$(command -v aws)
+          aws_version=$(aws --version 2>&1)
+          runner_arch=$(uname -m)
+          test "$runner_arch" = x86_64
+          case "$aws_version" in
+            aws-cli/2.*Linux*exe/x86_64.*) ;;
+            *) echo "unsupported runner AWS CLI: $aws_version" >&2; exit 1 ;;
+          esac
+          printf 'command=%s\nversion=%s\narchitecture=%s\n' \
+            "$aws_path" "$aws_version" "$runner_arch" \
+            | tee "$RUNNER_TEMP/rhiza-membership-aws-cli-receipt.txt"
           mkdir -p "$RUNNER_TEMP/rhiza-s3-data"
           docker run --rm -d --name rhiza-membership-s3 -p 19000:9000 \
             -v "$RUNNER_TEMP/rhiza-s3-data:/data" \
@@ -133,11 +150,47 @@ jobs:
             sleep 0.1
           done
           curl -fsS http://127.0.0.1:19000/_/health >/dev/null
-          docker run --rm --network host \
-            -e AWS_ACCESS_KEY_ID=rhiza-e2e -e AWS_SECRET_ACCESS_KEY=rhiza-e2e-secret \
-            -e AWS_DEFAULT_REGION=us-east-1 \
-            public.ecr.aws/aws-cli/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5 \
-            --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
+          (
+            set +x
+            ambient_auth_vars=(
+              AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+              AWS_WEB_IDENTITY_TOKEN_FILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME
+              AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI
+              AWS_CONTAINER_AUTHORIZATION_TOKEN AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+              AWS_CREDENTIAL_PROCESS AWS_SDK_LOAD_CONFIG
+            )
+            unset "${ambient_auth_vars[@]}"
+            for auth_var in "${ambient_auth_vars[@]}"; do
+              if test -n "${!auth_var+x}"; then
+                printf 'failed to isolate ambient AWS auth selector: %s\n' "$auth_var" >&2
+                exit 1
+              fi
+            done
+
+            auth_dir=$(mktemp -d "$RUNNER_TEMP/rhiza-membership-aws-auth.XXXXXX")
+            config_file="$auth_dir/config"
+            credentials_file="$auth_dir/credentials"
+            # Invoked indirectly by the EXIT trap below.
+            # shellcheck disable=SC2329
+            cleanup_aws_auth() {
+              status=$?
+              trap - EXIT
+              rm -f -- "$config_file" "$credentials_file" || :
+              rmdir -- "$auth_dir" || :
+              exit "$status"
+            }
+            trap cleanup_aws_auth EXIT
+            export AWS_CONFIG_FILE="$config_file"
+            export AWS_SHARED_CREDENTIALS_FILE="$credentials_file"
+            umask 077
+            : >"$AWS_SHARED_CREDENTIALS_FILE"
+            chmod 600 "$AWS_SHARED_CREDENTIALS_FILE"
+            printf '[default]\ns3 =\n  addressing_style = path\n' >"$AWS_CONFIG_FILE"
+            chmod 600 "$AWS_CONFIG_FILE"
+            test ! -s "$AWS_SHARED_CREDENTIALS_FILE"
+
+            aws --endpoint-url http://127.0.0.1:19000 s3 mb s3://rhiza
+          )
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
   rust-sdk:
