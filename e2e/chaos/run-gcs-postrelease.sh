@@ -4,8 +4,13 @@ set -eu
 # Never trace credential references or rejected kubeconfig contents.
 set +x
 umask 077
-mode=${1:-}
-case "$mode" in render|run|run-local|check-shutdown) ;; *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;; esac
+requested_mode=${1:-}
+case "$requested_mode" in render|run|run-local|check-shutdown) mode=$requested_mode ;;
+  metadata-readiness-worker)
+    mode=${RHIZA_METADATA_PARENT_MODE:-}
+    case "$mode" in run|run-local) ;; *) printf '%s\n' 'trusted metadata readiness parent mode required' >&2; exit 1 ;; esac ;;
+  *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;;
+esac
 release=315a5ee6bc6635b4ff4f85b9534afa4abe537c79
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
@@ -36,8 +41,12 @@ done
 [ "$RHIZA_NODE_A" != "$RHIZA_NODE_B" ] && [ "$RHIZA_NODE_A" != "$RHIZA_NODE_C" ] && [ "$RHIZA_NODE_B" != "$RHIZA_NODE_C" ] || die 'three distinct nodes required'
 printf '%s' "$RHIZA_HOST_IMAGE" | grep -Eq '^ghcr.io/mrchypark/rhiza-sql@sha256:[a-f0-9]{64}$' || die 'host digest required'
 printf '%s' "$RHIZA_METADATA_IMAGE" | grep -Eq '^gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:[a-f0-9]{64}$' || die 'reviewed metadata image digest required'
-[ ! -e "$RHIZA_OUTPUT" ] || die 'output already exists; no rerun'
-mkdir -p "$RHIZA_OUTPUT"
+if [ "$requested_mode" = metadata-readiness-worker ]; then
+  [ -d "$RHIZA_OUTPUT" ] && [ ! -L "$RHIZA_OUTPUT" ] || die 'worker output directory required'
+else
+  [ ! -e "$RHIZA_OUTPUT" ] || die 'output already exists; no rerun'
+  mkdir -p "$RHIZA_OUTPUT"
+fi
 out=$(CDPATH='' cd -- "$RHIZA_OUTPUT" && pwd -P)
 ns=$RHIZA_NAMESPACE
 prefix="postrelease/v0.19.1/$RHIZA_RUN_ID/"
@@ -76,7 +85,7 @@ k() {
     fi
   fi
 }
-metadata_credentials_ready() (
+metadata_credentials_ready_inner() (
   # IAM policy grants normally propagate in about two minutes, but can take
   # seven minutes or longer. Bound readiness to that documented seven-minute
   # window and never consume the existing 20-minute auth cleanup reserve.
@@ -138,8 +147,9 @@ metadata_credentials_ready() (
     metadata_response=$(k exec rhiza-metadata -- curl --silent --max-time 5 --max-filesize 16384 \
       --noproxy '*' -H 'Metadata-Flavor: Google' --write-out '\n%{http_code}' \
       http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token 2>/dev/null) || metadata_code=$?
-    metadata_http=$(printf '%s\n' "$metadata_response" | tail -n 1)
+    metadata_http=$(printf '%s\n' "$metadata_response" | tail -n 1 | tr -d '\015')
     metadata_body=$(printf '%s\n' "$metadata_response" | sed '$d')
+    metadata_body_normalized=$(printf '%s' "$metadata_body" | LC_ALL=C tr '\011\012\013\014\015' '     ' | sed 's/  */ /g; s/^ //; s/ $//')
     case "$metadata_http" in [1-5][0-9][0-9]) ;; *) metadata_http=000 ;; esac
     metadata_category=unknown
     if [ "$metadata_code" = 0 ]; then
@@ -150,7 +160,7 @@ metadata_credentials_ready() (
             .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
           ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
         403)
-          if [ "$metadata_body" = "$metadata_propagation_body" ]; then
+          if [ "$metadata_body_normalized" = "$metadata_propagation_body" ]; then
             metadata_category=propagation-pending
           else
             metadata_category=unrecognized-forbidden
@@ -162,7 +172,7 @@ metadata_credentials_ready() (
         *) metadata_category=native-error ;;
       esac
     fi
-    unset metadata_response metadata_body
+    unset metadata_response metadata_body metadata_body_normalized
     printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s category=%s\n' \
       "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" "$metadata_category"
     case "$metadata_category" in
@@ -176,6 +186,24 @@ metadata_credentials_ready() (
     [ "$metadata_delay" = 20 ] || metadata_delay=$((metadata_delay * 2))
   done
 )
+metadata_credentials_ready() {
+  metadata_total_budget=420
+  metadata_kill_grace=5
+  metadata_budget=$((metadata_total_budget - metadata_kill_grace))
+  if [ "$mode" = run-local ]; then
+    metadata_budget_now=$(date +%s)
+    metadata_runtime_budget=$((local_deadline - metadata_budget_now - metadata_kill_grace))
+    metadata_auth_budget=$((auth_expiry - 1200 - metadata_budget_now - metadata_kill_grace))
+    [ "$metadata_budget" -le "$metadata_runtime_budget" ] || metadata_budget=$metadata_runtime_budget
+    [ "$metadata_budget" -le "$metadata_auth_budget" ] || metadata_budget=$metadata_auth_budget
+  fi
+  if [ "$metadata_budget" -le 0 ]; then
+    printf '%s\n' 'stage=metadata-credential-readiness category=budget-exhausted'
+    return 124
+  fi
+  RHIZA_METADATA_PARENT_MODE=$mode \
+    timeout --kill-after="${metadata_kill_grace}s" "${metadata_budget}s" /bin/sh "$script_dir/run-gcs-postrelease.sh" metadata-readiness-worker
+}
 validate_cluster_metadata() {
   jq -e '.name=="ied-cluster" and .location=="asia-northeast3" and
     (.endpoint|type)=="string" and (.endpoint|test("^[a-zA-Z0-9.-]+$")) and
@@ -487,6 +515,10 @@ fi
 [ "$mode" = run ] || : "${RHIZA_CLUSTER_METADATA:?cluster metadata receipt required}"
 prepare_cluster_metadata || die 'trusted cluster metadata preparation failed'
 [ "$RHIZA_APPROVED_CAP_KRW" = 10000 ] || die 'this run requires the approved 10000 KRW cap'
+if [ "$requested_mode" = metadata-readiness-worker ]; then
+  metadata_credentials_ready_inner
+  exit $?
+fi
 seq=0
 run() {
   seq=$((seq + 1)); label=$1; shift

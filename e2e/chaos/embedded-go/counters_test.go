@@ -1709,7 +1709,7 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := strings.Index(string(source), "\nmetadata_credentials_ready() (\n")
+	start := strings.Index(string(source), "\nmetadata_credentials_ready_inner() (\n")
 	end := strings.Index(string(source), "\nwait_voters() (\n")
 	if start < 0 || end <= start {
 		t.Fatal("actual metadata readiness function missing")
@@ -1731,8 +1731,11 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		{"ready", 0, 1, "ready"}, {"principal-uri-identity", 1, 0, ""}, {"legacy-alias-identity", 1, 0, ""},
 		{"wrong-run-gsa-email", 1, 0, ""}, {"wrong-project-gsa-email", 1, 0, ""}, {"wrong-gsa-email", 1, 0, ""},
 		{"node-default-identity", 1, 0, ""}, {"wrong-identity", 1, 0, ""}, {"identity-http", 1, 0, ""}, {"identity-native", 1, 0, ""},
-		{"propagation-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
+		{"propagation-then-ready", 0, 2, "propagation-pending"}, {"whitespace-then-ready", 0, 2, "propagation-pending"},
+		{"backward-wall-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
 		{"nonretryable-403", 1, 1, "unrecognized-forbidden"}, {"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"},
+		{"wrong-gsa-403", 1, 1, "unrecognized-forbidden"}, {"wrong-permission-403", 1, 1, "unrecognized-forbidden"},
+		{"noncanonical-403", 1, 1, "unrecognized-forbidden"},
 		{"unknown-native", 1, 1, "native-error"}, {"unknown-http", 1, 1, "unknown"}, {"context-deadline", 124, 1, "deadline"},
 		{"invalid", 1, 1, "invalid-response"}, {"multiple", 1, 1, "invalid-response"}, {"deadline", 124, 1, "ready"},
 		{"budget-reserve", 124, 0, ""}, {"missing-token", 1, 1, "invalid-response"}, {"empty-token", 1, 1, "invalid-response"},
@@ -1762,7 +1765,7 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 			fixture := `
 mode=run-local; local_deadline=$FAKE_LOCAL_DEADLINE; auth_expiry=$FAKE_AUTH_EXPIRY; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; data_gsa_email=rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com; RHIZA_NODE_A=gke-ied-cluster-fixture-a; RHIZA_NODE_B=gke-ied-cluster-fixture-b; RHIZA_NODE_C=gke-ied-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
 date() { cat "$FAKE_DIR/clock"; }
-sleep() { now=$(date); printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
+sleep() { now=$(date); case "$FAKE_SCENARIO" in backward-wall-then-ready) now=$((now - 100));; esac; printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
 k() {
  [ "$metadata_wait_deadline" = "$FAKE_EXPECTED_DEADLINE" ] || return 96
  case "$*" in
@@ -1786,9 +1789,13 @@ k() {
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
  printf 'synthetic-token-never-public\n' >&2
  case "$FAKE_SCENARIO" in
-  propagation-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
+  propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
+  whitespace-then-ready) [ "$attempt" != 1 ] || { printf '  HTTP/403:\tgeneric::permission_denied:\r\n loading:  GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist). \r\n403\r'; return 0; } ;;
   propagation-exhausted) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
   nonretryable-403) printf 'Permission denied for an unrelated reason\n403'; return 0 ;;
+  wrong-gsa-403) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-deadbeef@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
+  wrong-permission-403) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.actAs'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
+  noncanonical-403) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on some resource (or it may not exist).\n403'; return 0 ;;
   connection) [ "$attempt" != 1 ] || return 7 ;;
   server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
   unknown-native) return 53 ;;
@@ -1804,7 +1811,7 @@ k() {
 `
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+"\nmetadata_credentials_ready")
+			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+"\nmetadata_credentials_ready_inner")
 			command.Env = append(os.Environ(), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name, "FAKE_RESPONSE="+filepath.Join(dir, "response"),
 				"FAKE_LOCAL_DEADLINE="+strconv.Itoa(localDeadline), "FAKE_AUTH_EXPIRY="+strconv.Itoa(authExpiry), "FAKE_EXPECTED_DEADLINE="+strconv.Itoa(expectedDeadline))
 			output, runErr := command.CombinedOutput()
@@ -1858,7 +1865,9 @@ k() {
 				"602454948273-compute@developer.gserviceaccount.com",
 				"unrelated.svc.id.goog",
 				"iam.serviceAccounts.getAccessToken",
+				"iam.serviceAccounts.actAs",
 				"Permission denied for an unrelated reason",
+				"denied on some resource",
 			} {
 				if bytes.Contains(output, []byte(identity)) {
 					t.Fatal("raw metadata identity leaked into public output")
@@ -1879,6 +1888,51 @@ k() {
 				t.Fatalf("response persisted: entries=%v error=%v", entries, err)
 			}
 		})
+	}
+}
+
+func TestQualificationMetadataReadinessOuterWatchdog(t *testing.T) {
+	source, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(source), "\nmetadata_credentials_ready() {\n")
+	end := strings.Index(string(source), "\nvalidate_cluster_metadata() {\n")
+	if start < 0 || end <= start {
+		t.Fatal("actual metadata readiness watchdog missing")
+	}
+	if !bytes.Contains(source[start:end], []byte("auth_expiry - 1200 - metadata_budget_now - metadata_kill_grace")) {
+		t.Fatal("watchdog does not reserve kill grace before the full auth cleanup reserve")
+	}
+	if output, err := exec.Command("timeout", "--version").CombinedOutput(); err != nil || !bytes.Contains(output, []byte("GNU coreutils")) {
+		t.Fatalf("GNU timeout required for monotonic watchdog regression: %v %s", err, output)
+	}
+	dir := t.TempDir()
+	worker := filepath.Join(dir, "run-gcs-postrelease.sh")
+	if err := os.WriteFile(worker, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	fixture := `
+mode=run-local
+script_dir=$FAKE_SCRIPT_DIR
+local_deadline=1006
+auth_expiry=2206
+# A frozen/backward wall clock cannot extend GNU timeout's monotonic budget.
+date() { printf '%s\n' 1000; }
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 9*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+"\nmetadata_credentials_ready")
+	command.Env = append(os.Environ(), "FAKE_SCRIPT_DIR="+dir)
+	started := time.Now()
+	output, runErr := command.CombinedOutput()
+	elapsed := time.Since(started)
+	var exited *exec.ExitError
+	if !errors.As(runErr, &exited) || exited.ExitCode() != 137 || ctx.Err() != nil {
+		t.Fatalf("uncooperative worker escaped watchdog: error=%v output=%s", runErr, output)
+	}
+	if elapsed < 5*time.Second || elapsed > 8*time.Second {
+		t.Fatalf("watchdog elapsed outside one-second budget plus five-second kill grace: %s", elapsed)
 	}
 }
 
