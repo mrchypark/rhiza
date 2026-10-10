@@ -1435,7 +1435,7 @@ func TestQualificationContainerKillRecovery(t *testing.T) {
 	if start < 0 || end <= start {
 		t.Fatal("actual container-kill branch missing")
 	}
-	for _, scenario := range []string{"success", "before-replaced", "two-injections", "wrong-target", "empty-records", "apply-failed", "delete-failed", "not-ready", "pod-replaced", "wal-replaced", "no-restart", "two-restarts", "same-container", "other-restarted", "image-changed", "barrier-failed", "restart-timeout"} {
+	for _, scenario := range []string{"success", "before-replaced", "two-injections", "wrong-target", "empty-records", "apply-failed", "delete-failed", "not-ready", "pod-replaced", "wal-replaced", "no-restart", "two-restarts", "same-container", "other-restarted", "image-changed", "barrier-failed", "restart-timeout", "hung-get"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			writeJSON := func(name string, value any) {
@@ -1521,6 +1521,11 @@ fault() { [ "$*" = 'PodChaos container-kill process-one' ] || exit 92; active_fa
 execute() { printf 'ack\n' >> "$out/order"; }
 k() {
   if [ "$*" = 'get pod rhiza-voter-0 -o json' ]; then
+    if [ "$FAKE_SCENARIO" = hung-get ]; then
+      [ -n "${voter_wait_deadline:-}" ] || exit 97
+      printf '%s\n' "$voter_wait_deadline" > "$out/hung-get-deadline"
+      return 124
+    fi
     if [ "$FAKE_SCENARIO" = restart-timeout ]; then cat "$out/before.json"; else cat "$out/restart.json"; fi
   else
     [ "$*" = 'delete PodChaos/process-one --wait=true --timeout=60s' ] || exit 93
@@ -1534,7 +1539,7 @@ metrics() { printf 'metrics\n' >> "$out/order"; }
 readback() { [ "$2" = linearizable ] && [ "$3" = '[[1,"before"],[2,"network"],[3,"process"]]' ] || exit 96; printf 'barrier-%s\n' "$1" >> "$out/order"; [ "$FAKE_SCENARIO" != barrier-failed ] || exit 54; }
 `+string(source[start:end])+`
 container_kill
-[ -z "$active_fault" ] && [ "$voter0_restarts" = 1 ]`, "fixture", dir)
+[ -z "$active_fault" ] && [ "$voter0_restarts" = 1 ] && [ -z "${voter_wait_deadline:-}" ]`, "fixture", dir)
 			command.Env = append(os.Environ(), "FAKE_SCENARIO="+scenario)
 			output, err := command.CombinedOutput()
 			if ctx.Err() != nil {
@@ -1551,6 +1556,15 @@ container_kill
 			} else {
 				if err == nil {
 					t.Fatal("unsafe recovery accepted")
+				}
+				if scenario == "hung-get" {
+					var exited *exec.ExitError
+					if !errors.As(err, &exited) || exited.ExitCode() != 124 {
+						t.Fatalf("hung get exit=%v want=124 output=%s", err, output)
+					}
+					if _, statErr := os.Stat(filepath.Join(dir, "hung-get-deadline")); statErr != nil {
+						t.Fatalf("hung get lacked scoped deadline: %v", statErr)
+					}
 				}
 				order, readErr := os.ReadFile(filepath.Join(dir, "order"))
 				if readErr != nil {
@@ -1570,7 +1584,7 @@ container_kill
 					}
 				}
 				switch scenario {
-				case "not-ready", "pod-replaced", "no-restart", "two-restarts", "same-container", "restart-timeout":
+				case "not-ready", "pod-replaced", "no-restart", "two-restarts", "same-container", "restart-timeout", "hung-get":
 					if bytes.Contains(order, []byte("ack")) {
 						t.Fatalf("unproven restart reached ACK: %s", order)
 					}

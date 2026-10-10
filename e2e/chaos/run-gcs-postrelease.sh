@@ -1093,8 +1093,8 @@ container_kill() {
       .phase=="Injected" and .injectedCount==1 and .recoveredCount==0 and
       ([.events[]?|select(.operation=="Apply" and .type=="Succeeded")]|length)==1)
   ' "$out/$seq-injection.stdout" >/dev/null || die 'exact single container-kill injection not proven'
-  process_restart_deadline=$(( $(date +%s) + 120 ))
-  wait_process_restart() {
+  wait_process_restart() (
+    voter_wait_deadline=$(( $(date +%s) + 120 ))
     while :; do
       k get pod rhiza-voter-0 -o json > "$out/process-restart-current.json" || true
       if jq -e --slurpfile before "$out/process-before.json" '
@@ -1108,12 +1108,12 @@ container_kill() {
         $current[0].containerID!=$sealed[0].containerID
       ' "$out/process-restart-current.json"; then
         cat "$out/process-restart-current.json"
-        return 0
+        exit 0
       fi
-      [ "$(date +%s)" -lt "$process_restart_deadline" ] || return 124
+      [ "$(date +%s)" -lt "$voter_wait_deadline" ] || exit 124
       sleep 1
     done
-  }
+  )
   run restart-evidence wait_process_restart
   execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
   # ContainerKill is one-shot: duration does not recover it. Delete the exact
