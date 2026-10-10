@@ -1758,7 +1758,7 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 		{"backward-wall-then-ready", 0, 2, "propagation-pending"}, {"propagation-exhausted", 124, 23, "propagation-pending"},
 		{"nonretryable-403", 1, 1, "unrecognized-forbidden"}, {"connection", 1, 1, "native-error"}, {"server", 1, 1, "unknown"},
 		{"wrong-gsa-403", 1, 1, "unrecognized-forbidden"}, {"wrong-permission-403", 1, 1, "unrecognized-forbidden"},
-		{"noncanonical-403", 1, 1, "unrecognized-forbidden"},
+		{"wrong-operation-403", 1, 1, "unrecognized-forbidden"}, {"noncanonical-403", 1, 1, "unrecognized-forbidden"},
 		{"unknown-native", 1, 1, "native-error"}, {"unknown-http", 1, 1, "unknown"}, {"context-deadline", 124, 1, "deadline"},
 		{"invalid", 1, 1, "invalid-response"}, {"multiple", 1, 1, "invalid-response"}, {"deadline", 124, 1, "ready"},
 		{"budget-reserve", 124, 0, ""}, {"missing-token", 1, 1, "invalid-response"}, {"empty-token", 1, 1, "invalid-response"},
@@ -1812,13 +1812,14 @@ k() {
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
  printf 'synthetic-token-never-public\n' >&2
  case "$FAKE_SCENARIO" in
-  propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
-  whitespace-then-ready) [ "$attempt" != 1 ] || { printf '  HTTP/403:\tgeneric::permission_denied:\r\n loading:  GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist). \r\n403\r'; return 0; } ;;
-  propagation-exhausted) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
+  propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' '{"error":{"code":403,"message":"loading GenerateAccessToken(\"rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\"): Permission iam.serviceAccounts.getAccessToken denied on resource","status":"PERMISSION_DENIED"}}'; return 0; } ;;
+  whitespace-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403\r' '{ "error" : { "status" : "PERMISSION_DENIED", "message" : "Permission  iam.serviceAccounts.getAccessToken denied.\nGenerateAccessToken ( rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com )", "code" : 403 } }'; return 0; } ;;
+  propagation-exhausted) printf '%s\n403' '{"error":{"status":"PERMISSION_DENIED","message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com failed: iam.serviceAccounts.getAccessToken permission denied","code":403}}'; return 0 ;;
   nonretryable-403) printf 'Permission denied for an unrelated reason\n403'; return 0 ;;
-  wrong-gsa-403) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-deadbeef@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
-  wrong-permission-403) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.actAs'\'' denied on resource (or it may not exist).\n403'; return 0 ;;
-  noncanonical-403) printf 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on some resource (or it may not exist).\n403'; return 0 ;;
+  wrong-gsa-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-deadbeef@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
+  wrong-permission-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.actAs denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
+  wrong-operation-403) printf '%s\n403' '{"error":{"code":403,"message":"SignBlob for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
+  noncanonical-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"FORBIDDEN"}}'; return 0 ;;
   connection) [ "$attempt" != 1 ] || return 7 ;;
   server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
   unknown-native) return 53 ;;
@@ -1856,6 +1857,28 @@ k() {
 			if scenario.metadataCategory != "" && !bytes.Contains(output, []byte("category="+scenario.metadataCategory)) {
 				t.Fatalf("metadata category=%s missing from %s", scenario.metadataCategory, output)
 			}
+			if scenario.metadataCategory == "propagation-pending" &&
+				(!bytes.Contains(output, []byte("shape=true exact-gsa=true generate-access-token=true permission-marker=true permission-status=true category=propagation-pending"))) {
+				t.Fatalf("structured propagation evidence missing from %s", output)
+			}
+			switch scenario.name {
+			case "wrong-gsa-403":
+				if !bytes.Contains(output, []byte("exact-gsa=false")) {
+					t.Fatalf("wrong GSA semantic rejection missing from %s", output)
+				}
+			case "wrong-permission-403":
+				if !bytes.Contains(output, []byte("permission-marker=false")) {
+					t.Fatalf("wrong permission semantic rejection missing from %s", output)
+				}
+			case "wrong-operation-403":
+				if !bytes.Contains(output, []byte("generate-access-token=false")) {
+					t.Fatalf("wrong operation semantic rejection missing from %s", output)
+				}
+			case "noncanonical-403":
+				if !bytes.Contains(output, []byte("permission-status=false")) {
+					t.Fatalf("wrong status semantic rejection missing from %s", output)
+				}
+			}
 			identityCategory := "linked-gsa-email"
 			switch scenario.name {
 			case "principal-uri-identity":
@@ -1891,6 +1914,8 @@ k() {
 				"iam.serviceAccounts.actAs",
 				"Permission denied for an unrelated reason",
 				"denied on some resource",
+				"GenerateAccessToken",
+				"PERMISSION_DENIED",
 			} {
 				if bytes.Contains(output, []byte(identity)) {
 					t.Fatal("raw metadata identity leaked into public output")

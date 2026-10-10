@@ -86,6 +86,21 @@ k() {
   fi
 }
 metadata_credentials_ready_inner() (
+  classify_propagation_403() {
+    classifier_gsa=$1
+    jq -r --arg gsa "$classifier_gsa" '
+      if type=="object" and (.error|type)=="object" and (.error.message|type)=="string" then
+        .error.message as $message |
+        ([ $message | scan("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.iam\\.gserviceaccount\\.com") ] | unique) as $gsas |
+        ([ $message | scan("iam\\.serviceAccounts\\.[A-Za-z]+") ] | unique) as $permissions |
+        (($gsas|length)==1 and $gsas[0]==$gsa) as $exact_gsa |
+        ($message|test("(^|[^A-Za-z0-9])GenerateAccessToken([^A-Za-z0-9]|$)")) as $generate |
+        (($permissions|length)==1 and $permissions[0]=="iam.serviceAccounts.getAccessToken") as $permission |
+        ((.error.code==403) and (.error.status=="PERMISSION_DENIED")) as $status |
+        [true,$exact_gsa,$generate,$permission,$status,($exact_gsa and $generate and $permission and $status)] | @tsv
+      else [false,false,false,false,false,false] | @tsv end
+    ' 2>/dev/null
+  }
   # IAM policy grants normally propagate in about two minutes, but can take
   # seven minutes or longer. Bound readiness to that documented seven-minute
   # window and never consume the existing 20-minute auth cleanup reserve.
@@ -137,7 +152,6 @@ metadata_credentials_ready_inner() (
   [ "$metadata_identity_category" = linked-gsa-email ] || return 1
   metadata_attempt=0
   metadata_delay=5
-  metadata_propagation_body="HTTP/403: generic::permission_denied: loading: GenerateAccessToken(\"$data_gsa_email\", \"\"): googleapi: Error 403: Permission 'iam.serviceAccounts.getAccessToken' denied on resource (or it may not exist)."
   while :; do
     [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
     metadata_attempt=$((metadata_attempt + 1))
@@ -149,9 +163,13 @@ metadata_credentials_ready_inner() (
       http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token 2>/dev/null) || metadata_code=$?
     metadata_http=$(printf '%s\n' "$metadata_response" | tail -n 1 | tr -d '\015')
     metadata_body=$(printf '%s\n' "$metadata_response" | sed '$d')
-    metadata_body_normalized=$(printf '%s' "$metadata_body" | LC_ALL=C tr '\011\012\013\014\015' '     ' | sed 's/  */ /g; s/^ //; s/ $//')
     case "$metadata_http" in [1-5][0-9][0-9]) ;; *) metadata_http=000 ;; esac
     metadata_category=unknown
+    metadata_shape=false
+    metadata_exact_gsa=false
+    metadata_generate_access_token=false
+    metadata_permission_marker=false
+    metadata_permission_status=false
     if [ "$metadata_code" = 0 ]; then
       case "$metadata_http" in
         200)
@@ -160,7 +178,22 @@ metadata_credentials_ready_inner() (
             .token_type=="Bearer" and (.expires_in|type)=="number" and .expires_in>0)
           ' >/dev/null 2>&1; then metadata_category=ready; else metadata_category=invalid-response; fi ;;
         403)
-          if [ "$metadata_body_normalized" = "$metadata_propagation_body" ]; then
+          metadata_classification=$(printf '%s' "$metadata_body" | classify_propagation_403 "$data_gsa_email") || metadata_classification='false	false	false	false	false	false'
+          old_ifs=$IFS
+          IFS=$(printf '\t')
+          set -- $metadata_classification
+          IFS=$old_ifs
+          if [ "$#" = 6 ]; then
+            metadata_shape=$1
+            metadata_exact_gsa=$2
+            metadata_generate_access_token=$3
+            metadata_permission_marker=$4
+            metadata_permission_status=$5
+            metadata_retryable=$6
+          else
+            metadata_retryable=false
+          fi
+          if [ "$metadata_retryable" = true ]; then
             metadata_category=propagation-pending
           else
             metadata_category=unrecognized-forbidden
@@ -172,9 +205,10 @@ metadata_credentials_ready_inner() (
         *) metadata_category=native-error ;;
       esac
     fi
-    unset metadata_response metadata_body metadata_body_normalized
-    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s category=%s\n' \
-      "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" "$metadata_category"
+    unset metadata_response metadata_body metadata_classification
+    printf 'stage=metadata-credential-readiness attempt=%s native=%s http=%s elapsed=%s shape=%s exact-gsa=%s generate-access-token=%s permission-marker=%s permission-status=%s category=%s\n' \
+      "$metadata_attempt" "$metadata_code" "$metadata_http" "$(( $(date +%s) - metadata_started ))" \
+      "$metadata_shape" "$metadata_exact_gsa" "$metadata_generate_access_token" "$metadata_permission_marker" "$metadata_permission_status" "$metadata_category"
     case "$metadata_category" in
       ready) [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124; return 0 ;;
       propagation-pending) ;;
