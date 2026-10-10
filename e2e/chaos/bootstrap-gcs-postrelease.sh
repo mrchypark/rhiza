@@ -19,33 +19,41 @@ sha256_file() {
     printf '%s\n' "$1"
 }
 gsa_delete_wait_worker() {
-    : "${RHIZA_GSA_DELETE_STATE:?GSA delete state required}"
-    : "${RHIZA_GSA_DELETE_TAG:?GSA delete tag required}"
-    : "${RHIZA_GSA_DELETE_ACCOUNT:?GSA delete account required}"
-    : "${RHIZA_GSA_DELETE_UID:?GSA delete unique ID required}"
-    : "${RHIZA_GSA_DELETE_OWNER:?GSA delete owner required}"
+    deleted_tag=$1
+    case "$deleted_tag" in ci) deleted_account=$ci ;; data) deleted_account=$data ;; *) die 'GSA delete tag rejected' ;; esac
+    deleted_create="$RHIZA_AUTH_STATE/$deleted_tag-create.json"
+    deleted_marker="$RHIZA_AUTH_STATE/$deleted_tag.created"
+    [ -f "$deleted_create" ] && [ ! -L "$deleted_create" ] &&
+      [ -n "$(find "$deleted_create" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Private GSA create receipt required'
+    [ -f "$deleted_marker" ] && [ ! -L "$deleted_marker" ] &&
+      [ -n "$(find "$deleted_marker" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Private GSA ownership marker required'
+    owned "$deleted_tag" || die 'GSA ownership marker rejected'
+    jq -e --arg email "$deleted_account" --arg owner "$owner" '
+      type=="object" and .email==$email and (.uniqueId|type)=="string" and (.uniqueId|length)>0 and .description==$owner
+    ' "$deleted_create" >/dev/null || die 'GSA create receipt identity rejected'
+    deleted_uid=$(jq -r .uniqueId "$deleted_create")
     deleted_attempt=1; deleted_delay=5
     while :; do
-        deleted_base="$RHIZA_GSA_DELETE_STATE/$RHIZA_GSA_DELETE_TAG-absence-$deleted_attempt"
+        deleted_base="$RHIZA_AUTH_STATE/$deleted_tag-absence-$deleted_attempt"
         deleted_exit=0
-        gcloud --project=patch2-the-new-era --quiet iam service-accounts describe "$RHIZA_GSA_DELETE_ACCOUNT" --format=json > "$deleted_base.json" 2> "$deleted_base.stderr" || deleted_exit=$?
+        gcloud --project="$project" --quiet iam service-accounts describe "$deleted_account" --format=json > "$deleted_base.json" 2> "$deleted_base.stderr" || deleted_exit=$?
         printf '%s\n' "$deleted_exit" > "$deleted_base.exit"
         if [ "$deleted_exit" = 0 ]; then
-            jq -e --arg email "$RHIZA_GSA_DELETE_ACCOUNT" --arg uid "$RHIZA_GSA_DELETE_UID" --arg owner "$RHIZA_GSA_DELETE_OWNER" '
+            jq -e --arg email "$deleted_account" --arg uid "$deleted_uid" --arg owner "$owner" '
               type=="object" and .email==$email and .uniqueId==$uid and .description==$owner
-            ' "$deleted_base.json" >/dev/null || die "GSA deletion identity drift: $RHIZA_GSA_DELETE_TAG"
+            ' "$deleted_base.json" >/dev/null || die "GSA deletion identity drift: $deleted_tag"
         else
             deleted_error=$(sed -E \
               -e 's/ This command is authenticated as \[[^][]+\] which is the active account specified by the \[core\/account\] property\.?$//' \
               -e 's/ This command is authenticated as [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+ which is the active account specified by the \[core\/account\] property\.?$//' \
               -e '/^This command is authenticated as \[[^][]+\] which is the active account specified by the \[core\/account\] property\.?$/d' \
               -e '/^This command is authenticated as [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+ which is the active account specified by the \[core\/account\] property\.?$/d' \
-              -e '/^[[:space:]]*$/d' "$deleted_base.stderr") || die "GSA deletion receipt unreadable: $RHIZA_GSA_DELETE_TAG"
+              -e '/^[[:space:]]*$/d' "$deleted_base.stderr") || die "GSA deletion receipt unreadable: $deleted_tag"
             if [ "$deleted_error" = 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account.' ] ||
                [ "$deleted_error" = 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account' ]; then
                 return 0
             fi
-            die "GSA deletion describe failed permanently: $RHIZA_GSA_DELETE_TAG"
+            die "GSA deletion describe failed permanently: $deleted_tag"
         fi
         sleep "$deleted_delay"
         deleted_attempt=$((deleted_attempt + 1))
@@ -53,17 +61,20 @@ gsa_delete_wait_worker() {
     done
 }
 mode=${1:-render}
-if [ "$mode" = gsa-delete-wait-worker ]; then gsa_delete_wait_worker; exit 0; fi
 auth_mode=ci
 case "$mode" in
-    render-local|apply-local|mint-local|rollback-local|check-local-auth)
+    render-local|apply-local|mint-local|rollback-local|check-local-auth|gsa-delete-wait-worker-local)
         auth_mode=local
-        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; rollback-local) mode=rollback ;; esac
+        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; rollback-local) mode=rollback ;; gsa-delete-wait-worker-local) mode=gsa-delete-wait-worker ;; esac
         : "${RHIZA_HARNESS_SHA:?reviewed local harness SHA required}"
         RHIZA_WORKFLOW_SHA=$RHIZA_HARNESS_SHA ;;
-    render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback) ;;
+    render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback|gsa-delete-wait-worker) ;;
     *) die 'Usage: bootstrap-gcs-postrelease.sh render[-local]|apply[-local]|mint-local|rollback[-local]|check-local-auth|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture' ;;
 esac
+if [ "$mode" = gsa-delete-wait-worker ]; then
+    [ "$#" = 2 ] || die 'GSA delete worker arguments rejected'
+    case "$2" in ci|data) worker_tag=$2 ;; *) die 'GSA delete tag rejected' ;; esac
+fi
 : "${RHIZA_RUN_ID:?8 lowercase hexadecimal characters required}"
 : "${RHIZA_WORKFLOW_SHA:?protected-merge workflow SHA required}"
 : "${RHIZA_AUTH_EXPIRES:?UTC YYYY-MM-DDTHH:MM:SSZ required}"
@@ -853,7 +864,8 @@ if [ "$mode" = apply ]; then
     printf '%s\n' "$identity" > "$RHIZA_AUTH_STATE/identity.json"
     render > "$RHIZA_AUTH_STATE/auth.yaml"
 else
-    [ -f "$RHIZA_AUTH_STATE/identity.json" ] || die 'Missing positive ownership receipt'
+    [ -f "$RHIZA_AUTH_STATE/identity.json" ] && [ ! -L "$RHIZA_AUTH_STATE/identity.json" ] &&
+      [ -n "$(find "$RHIZA_AUTH_STATE/identity.json" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Private ownership identity receipt required'
     [ "$(jq -cS . "$RHIZA_AUTH_STATE/identity.json")" = "$(printf '%s\n' "$identity" | jq -cS .)" ] || die 'Receipt identity mismatch'
 fi
 [ ! -L "$RHIZA_AUTH_STATE" ] && [ "$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)" = "$RHIZA_AUTH_STATE" ] || die 'State path must be a private physical directory'
@@ -882,6 +894,7 @@ absent() {
 }
 mark() { printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/$1.created"; }
 owned() { [ -f "$RHIZA_AUTH_STATE/$1.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/$1.created")" = "$owner" ]; }
+if [ "$mode" = gsa-delete-wait-worker ]; then gsa_delete_wait_worker "$worker_tag"; exit 0; fi
 check_folder_role() {
     record folder-role-current g iam roles describe "$folder_role" --format=json
     jq -e --arg owner "$owner" --slurpfile original "$RHIZA_AUTH_STATE/folder-role-create.json" '
@@ -1051,11 +1064,10 @@ check_sa() {
     [ "$(jq -r .description "$RHIZA_AUTH_STATE/$which-current.json")" = "$owner" ] || die 'GSA ownership changed'
 }
 wait_deleted_sa() {
-    deleted_tag=$1; deleted_account=$2; deleted_uid=$3
+    deleted_tag=$1
     deleted_exit=0
-    RHIZA_GSA_DELETE_STATE=$RHIZA_AUTH_STATE RHIZA_GSA_DELETE_TAG=$deleted_tag \
-      RHIZA_GSA_DELETE_ACCOUNT=$deleted_account RHIZA_GSA_DELETE_UID=$deleted_uid RHIZA_GSA_DELETE_OWNER=$owner \
-      timeout --kill-after=5s 415s /bin/sh "$script_dir/bootstrap-gcs-postrelease.sh" gsa-delete-wait-worker || deleted_exit=$?
+    deleted_worker=gsa-delete-wait-worker; [ "$auth_mode" != local ] || deleted_worker=gsa-delete-wait-worker-local
+    timeout --kill-after=5s 415s /bin/sh "$script_dir/bootstrap-gcs-postrelease.sh" "$deleted_worker" "$deleted_tag" || deleted_exit=$?
     case "$deleted_exit" in 0) return 0 ;; 124|137) die "GSA deletion deadline exhausted: $deleted_tag" ;; *) die "GSA deletion wait failed: $deleted_tag" ;; esac
 }
 owned ci && check_sa ci "$ci"
@@ -1139,12 +1151,12 @@ if owned pool; then record pool-delete g iam workload-identity-pools delete "$po
 if owned ci; then
     ci_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/ci-create.json")
     record ci-delete g iam service-accounts delete "$ci_uid"
-    wait_deleted_sa ci "$ci" "$ci_uid"
+    wait_deleted_sa ci
 fi
 if owned data; then
     data_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/data-create.json")
     record data-delete g iam service-accounts delete "$data_uid"
-    wait_deleted_sa data "$data" "$data_uid"
+    wait_deleted_sa data
 fi
 for role in "$cluster_role" "$folder_role"; do
     case "$role" in "$cluster_role") tag='cluster-role' ;; *) tag='folder-role' ;; esac

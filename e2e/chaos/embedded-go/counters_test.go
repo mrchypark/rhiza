@@ -64,7 +64,7 @@ func TestBootstrapCustomRoleDeleteReceiptIsStructuredAndValidated(t *testing.T) 
 		`.description==$owner and .deleted==true`,
 		`Custom role delete receipt rejected`,
 		`record data-delete g iam service-accounts delete "$data_uid"`,
-		`wait_deleted_sa data "$data" "$data_uid"`,
+		`wait_deleted_sa data`,
 		`GSA deletion identity drift`,
 		`ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account`,
 	} {
@@ -79,8 +79,36 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(source, []byte(`timeout --kill-after=5s 415s /bin/sh "$script_dir/bootstrap-gcs-postrelease.sh" gsa-delete-wait-worker`)) {
+	if !bytes.Contains(source, []byte(`timeout --kill-after=5s 415s /bin/sh "$script_dir/bootstrap-gcs-postrelease.sh"`)) {
 		t.Fatal("GSA deletion wait lacks the 415-second worker plus five-second monotonic kill bound")
+	}
+	const runID, workflowSHA, expiry, admin = "a1b2c3d4", "0123456789abcdef0123456789abcdef01234567", "2099-01-01T00:00:00Z", "fixture-admin@example.invalid"
+	owner := "rhiza-postrelease-" + runID + "-" + workflowSHA
+	workerEnv := func(dir, scenario string) []string {
+		state, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario,
+			"RHIZA_BOOTSTRAP_GO=I_APPROVE_NEW_SCOPE", "RHIZA_COST_CAP_KRW=10000", "RHIZA_EXPECTED_ADMIN_ACCOUNT="+admin,
+			"RHIZA_AUTH_STATE="+state, "RHIZA_RUN_ID="+runID, "RHIZA_WORKFLOW_SHA="+workflowSHA, "RHIZA_AUTH_EXPIRES="+expiry)
+	}
+	seedState := func(t *testing.T, dir string) {
+		t.Helper()
+		if err := os.Chmod(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		files := map[string]string{
+			"attempts":         "0\n",
+			"identity.json":    `{"run":"` + runID + `","workflow_sha":"` + workflowSHA + `","expiry":"` + expiry + `","cost_cap_krw":"10000","owner":"` + owner + `"}`,
+			"data-create.json": `{"email":"rhiza-v0191-gcs-` + runID + `@patch2-the-new-era.iam.gserviceaccount.com","uniqueId":"fixture-uid","description":"` + owner + `"}`,
+			"data.created":     owner + "\n",
+		}
+		for name, content := range files {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	for _, scenario := range []struct {
 		name           string
@@ -96,31 +124,30 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 			dir := t.TempDir()
 			gcloud := `#!/bin/sh
 set -eu
+case "$*" in
+ *'config get-value account') printf '%s\n' 'fixture-admin@example.invalid'; exit 0 ;;
+esac
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
  printf '%s\n' "$*" >> "$FAKE_DIR/calls"
  case "$FAKE_SCENARIO" in
   eventual-not-found)
-   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"fixture@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; exit 0; fi
+   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0; fi
    printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account. This command is authenticated as [fixture@example.invalid] which is the active account specified by the [core/account] property' >&2; exit 1 ;;
-  identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"fixture-owner"}'; exit 0 ;;
+  identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0 ;;
   permission-denied) printf '%s\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;
   rate-limit) printf '%s\n' 'ERROR: HTTPError 429' >&2; exit 1 ;;
   server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; exit 1 ;;
  esac
 `
-			if err := os.WriteFile(filepath.Join(dir, "attempts"), []byte("0\n"), 0600); err != nil {
-				t.Fatal(err)
-			}
+			seedState(t, dir)
 			if err := os.WriteFile(filepath.Join(dir, "gcloud"), []byte(gcloud), 0700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(dir, "sleep"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			command := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "gsa-delete-wait-worker")
-			command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name,
-				"RHIZA_GSA_DELETE_STATE="+dir, "RHIZA_GSA_DELETE_TAG=fixture", "RHIZA_GSA_DELETE_ACCOUNT=fixture@example.invalid",
-				"RHIZA_GSA_DELETE_UID=fixture-uid", "RHIZA_GSA_DELETE_OWNER=fixture-owner")
+			command := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "gsa-delete-wait-worker", "data")
+			command.Env = workerEnv(dir, scenario.name)
 			output, runErr := command.CombinedOutput()
 			code := 0
 			if runErr != nil {
@@ -135,28 +162,27 @@ set -eu
 				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
 			}
 			calls, err := os.ReadFile(filepath.Join(dir, "calls"))
-			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe fixture@example.invalid --format=json")) {
+			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com --format=json")) {
 				t.Fatalf("worker issued a non-describe operation: %q error=%v", calls, err)
 			}
 		})
 	}
 	t.Run("persistent-exists-frozen-backward-clock", func(t *testing.T) {
 		dir := t.TempDir()
-		gcloud := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_DIR/calls\"\nprintf '%s\\n' '{\"email\":\"fixture@example.invalid\",\"uniqueId\":\"fixture-uid\",\"description\":\"fixture-owner\"}'\n"
+		gcloud := "#!/bin/sh\ncase \"$*\" in *'config get-value account') printf '%s\\n' 'fixture-admin@example.invalid'; exit 0;; esac\nprintf '%s\\n' \"$*\" >> \"$FAKE_DIR/calls\"\nprintf '%s\\n' '{\"email\":\"rhiza-v0191-gcs-a1b2c3d4@patch2-the-new-era.iam.gserviceaccount.com\",\"uniqueId\":\"fixture-uid\",\"description\":\"" + owner + "\"}'\n"
 		date := "#!/bin/sh\nvalue=$(cat \"$FAKE_DIR/clock\")\nprintf '%s\\n' \"$value\"\nprintf '%s\\n' \"$((value - 100))\" > \"$FAKE_DIR/clock\"\n"
 		for name, content := range map[string]string{"gcloud": gcloud, "date": date} {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0700); err != nil {
 				t.Fatal(err)
 			}
 		}
+		seedState(t, dir)
 		if err := os.WriteFile(filepath.Join(dir, "clock"), []byte("1000\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		started := time.Now()
-		command := exec.Command("timeout", "--kill-after=1s", "1s", "/bin/sh", "../bootstrap-gcs-postrelease.sh", "gsa-delete-wait-worker")
-		command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir,
-			"RHIZA_GSA_DELETE_STATE="+dir, "RHIZA_GSA_DELETE_TAG=fixture", "RHIZA_GSA_DELETE_ACCOUNT=fixture@example.invalid",
-			"RHIZA_GSA_DELETE_UID=fixture-uid", "RHIZA_GSA_DELETE_OWNER=fixture-owner")
+		command := exec.Command("timeout", "--kill-after=1s", "1s", "/bin/sh", "../bootstrap-gcs-postrelease.sh", "gsa-delete-wait-worker", "data")
+		command.Env = workerEnv(dir, "persistent")
 		runErr := command.Run()
 		var exited *exec.ExitError
 		if !errors.As(runErr, &exited) || exited.ExitCode() != 124 || time.Since(started) > 3*time.Second {
@@ -167,6 +193,34 @@ set -eu
 			t.Fatalf("bounded worker issued a non-describe operation: %q error=%v", calls, err)
 		}
 	})
+	for _, unsafe := range []struct {
+		name string
+		args []string
+	}{
+		{"path-tag", []string{"gsa-delete-wait-worker", "../outside"}},
+		{"arbitrary-account", []string{"gsa-delete-wait-worker", "data", "attacker@example.invalid"}},
+	} {
+		t.Run("reject-"+unsafe.name, func(t *testing.T) {
+			dir := t.TempDir()
+			outside := filepath.Join(filepath.Dir(dir), "outside-write")
+			gcloud := "#!/bin/sh\nprintf '%s\\n' called >> \"$FAKE_DIR/calls\"\nexit 99\n"
+			if err := os.WriteFile(filepath.Join(dir, "gcloud"), []byte(gcloud), 0700); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", append([]string{"../bootstrap-gcs-postrelease.sh"}, unsafe.args...)...)
+			command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "RHIZA_AUTH_STATE="+outside,
+				"RHIZA_GSA_DELETE_ACCOUNT=attacker@example.invalid")
+			if err := command.Run(); err == nil {
+				t.Fatal("unsafe direct worker invocation passed")
+			}
+			if _, err := os.Stat(filepath.Join(dir, "calls")); !os.IsNotExist(err) {
+				t.Fatalf("unsafe invocation reached cloud command: %v", err)
+			}
+			if _, err := os.Stat(outside); !os.IsNotExist(err) {
+				t.Fatalf("unsafe invocation wrote outside validated state: %v", err)
+			}
+		})
+	}
 }
 
 func TestQualificationQUICHandshake(t *testing.T) {
