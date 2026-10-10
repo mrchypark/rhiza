@@ -163,7 +163,7 @@ seal_workload_identity() {
       .metadata.name=="rhiza-gcs" and .metadata.namespace==$ns and
       (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
       .metadata.annotations["iam.gke.io/gcp-service-account"]==$data and
-      (.metadata.annotations|has("iam.gke.io/return-principal-id-as-email")|not) and
+      .metadata.annotations["iam.gke.io/return-principal-id-as-email"]=="true" and
       .automountServiceAccountToken==false
     ' "$ksa_receipt" >/dev/null || die 'Live data KSA identity/mode rejected'
     jq -e --arg member "$data_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
@@ -185,7 +185,7 @@ seal_workload_identity() {
       --arg member "$data_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
       --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{
         run:$run, namespace:$ns,
-        ksa:{name:"rhiza-gcs",uid:$uid,gcp_service_account:$data,return_principal_id_as_email:false},
+        ksa:{name:"rhiza-gcs",uid:$uid,gcp_service_account:$data,return_principal_id_as_email:true},
         gsa:{email:$data,unique_id:$gsa_uid,owner:$owner,member:$member,role:"roles/iam.workloadIdentityUser",condition:{title:$title,expression:$expression}}
       }' > "$wi_receipt"
     chmod 600 "$wi_receipt"

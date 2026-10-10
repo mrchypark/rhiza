@@ -18,6 +18,7 @@ metadata:
   namespace: @NAMESPACE@
   annotations:
     iam.gke.io/gcp-service-account: '@POD_GSA@'
+    iam.gke.io/return-principal-id-as-email: "true"
 automountServiceAccountToken: false
 ---
 # BEGIN LOCAL RUNTIME ACCOUNT

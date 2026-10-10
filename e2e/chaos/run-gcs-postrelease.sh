@@ -93,17 +93,28 @@ metadata_credentials_ready() (
     http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email 2>/dev/null) || metadata_identity_code=$?
   metadata_identity_http=$(printf '%s\n' "$metadata_identity" | tail -n 1)
   metadata_identity_value=$(printf '%s\n' "$metadata_identity" | sed '$d')
-  metadata_impersonation_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID.svc.id.goog"
-  metadata_identity_category=rejected
-  if [ "$metadata_identity_code" = 0 ] && [ "$metadata_identity_http" = 200 ]; then
-    if [ "$metadata_identity_value" = "$metadata_impersonation_identity" ]; then
-      metadata_identity_category=iam-sa-impersonation
-    fi
+  metadata_expected_identity="principal://iam.googleapis.com/projects/602454948273/locations/global/workloadIdentityPools/patch2-the-new-era.svc.id.goog/subject/ns/$ns/sa/rhiza-gcs"
+  metadata_legacy_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID.svc.id.goog"
+  metadata_gsa_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID@patch2-the-new-era.iam.gserviceaccount.com"
+  metadata_default_node_identity="602454948273-compute@developer.gserviceaccount.com"
+  metadata_identity_category=unknown
+  if [ "$metadata_identity_code" != 0 ]; then
+    metadata_identity_category='native-error'
+  elif [ "$metadata_identity_http" != 200 ]; then
+    metadata_identity_category='http-error'
+  else
+    case "$metadata_identity_value" in
+      "$metadata_expected_identity") metadata_identity_category='expected-principal' ;;
+      "$metadata_legacy_identity") metadata_identity_category='legacy-ksa-alias' ;;
+      "$metadata_gsa_identity") metadata_identity_category='run-gsa-email' ;;
+      "$metadata_default_node_identity") metadata_identity_category='node-default' ;;
+      '') metadata_identity_category=empty ;;
+    esac
   fi
-  unset metadata_identity metadata_identity_value metadata_impersonation_identity
+  unset metadata_identity metadata_identity_value metadata_expected_identity metadata_legacy_identity metadata_gsa_identity metadata_default_node_identity
   printf 'stage=metadata-credential-readiness native=%s http=%s category=%s\n' \
     "$metadata_identity_code" "$metadata_identity_http" "$metadata_identity_category"
-  [ "$metadata_identity_category" = iam-sa-impersonation ] || return 1
+  [ "$metadata_identity_category" = expected-principal ] || return 1
   metadata_attempt=0
   while [ "$metadata_attempt" -lt 6 ]; do
     [ "$(date +%s)" -lt "$metadata_wait_deadline" ] || return 124
@@ -286,7 +297,7 @@ prepare_workload_identity_receipt() {
     keys==["gsa","ksa","namespace","run"] and .run==$run and .namespace==$ns and
     (.ksa|keys)==["gcp_service_account","name","return_principal_id_as_email","uid"] and
     .ksa.name=="rhiza-gcs" and (.ksa.uid|type)=="string" and (.ksa.uid|length)>0 and
-    .ksa.gcp_service_account==$data and .ksa.return_principal_id_as_email==false and
+    .ksa.gcp_service_account==$data and .ksa.return_principal_id_as_email==true and
     (.gsa|keys)==["condition","email","member","owner","role","unique_id"] and .gsa.email==$data and
     .gsa.unique_id==$created[0].uniqueId and .gsa.owner==$owner and
     .gsa.member==$member and .gsa.role=="roles/iam.workloadIdentityUser" and
