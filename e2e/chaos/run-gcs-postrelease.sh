@@ -291,6 +291,7 @@ wait_voters() (
   [ "$(date +%s)" -lt "$voter_wait_deadline" ] || exit 124
 )
 validate_archive_head_metadata() {
+  # gcloud may emit size as a number; jq preserves its decoded value, not its JSON lexeme.
   jq -e --arg bucket rhiza-v070-chaos-ied-20260811 --arg name "${prefix}${cluster}/archive/head.bin" '
     keys==["bucket","generation","name","size"] and .bucket==$bucket and .name==$name and
     (.generation|type)=="string" and (.generation|test("^[1-9][0-9]*$")) and

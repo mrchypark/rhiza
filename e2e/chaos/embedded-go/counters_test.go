@@ -593,13 +593,18 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 		{"numeric-generation", strings.Replace(valid, `"generation":"1"`, `"generation":1`, 1), false},
 		{"leading-zero-generation", strings.Replace(valid, `"generation":"1"`, `"generation":"01"`, 1), false},
 		{"valid-numeric-size", strings.Replace(valid, `"size":"132"`, `"size":132`, 1), true},
+		{"valid-decimal-numeric-size", strings.Replace(valid, `"size":"132"`, `"size":132.0`, 1), true},
+		{"valid-exponent-numeric-size", strings.Replace(valid, `"size":"132"`, `"size":132e0`, 1), true},
+		{"valid-fractional-exponent-numeric-size", strings.Replace(valid, `"size":"132"`, `"size":1.32e2`, 1), true},
 		{"leading-zero-size", strings.Replace(valid, `"size":"132"`, `"size":"0132"`, 1), false},
-		{"float-size", strings.Replace(valid, `"size":"132"`, `"size":132.5`, 1), false},
+		{"fractional-size", strings.Replace(valid, `"size":"132"`, `"size":132.5`, 1), false},
 		{"negative-size", strings.Replace(valid, `"size":"132"`, `"size":-132`, 1), false},
 		{"null-size", strings.Replace(valid, `"size":"132"`, `"size":null`, 1), false},
 		{"overflow-size", strings.Replace(valid, `"size":"132"`, `"size":1e100`, 1), false},
 		{"small", strings.Replace(valid, `"size":"132"`, `"size":"131"`, 1), false},
+		{"small-numeric", strings.Replace(valid, `"size":"132"`, `"size":131`, 1), false},
 		{"large", strings.Replace(valid, `"size":"132"`, `"size":"8388633"`, 1), false},
+		{"large-numeric", strings.Replace(valid, `"size":"132"`, `"size":8388633`, 1), false},
 		{"extra-field", strings.TrimSuffix(valid, "}") + `,"etag":"secret"}`, false},
 	}
 	for _, tc := range metadataCases {
@@ -622,7 +627,7 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 	for _, tc := range []struct {
 		name, value string
 		valid       bool
-	}{{"same", valid, true}, {"same-numeric-size", strings.Replace(valid, `"size":"132"`, `"size":132`, 1), true}, {"generation-change", strings.Replace(valid, `"generation":"1"`, `"generation":"2"`, 1), false}, {"size-change", strings.Replace(valid, `"size":"132"`, `"size":"133"`, 1), false}} {
+	}{{"same", valid, true}, {"same-numeric-size", strings.Replace(valid, `"size":"132"`, `"size":1.32e2`, 1), true}, {"generation-change", strings.Replace(valid, `"generation":"1"`, `"generation":"2"`, 1), false}, {"size-change", strings.Replace(valid, `"size":"132"`, `"size":"133"`, 1), false}} {
 		if err := os.WriteFile(after, []byte(tc.value), 0600); err != nil {
 			t.Fatal(err)
 		}
