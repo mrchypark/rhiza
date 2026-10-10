@@ -181,7 +181,7 @@ out=$1
 k() { case "$*" in
  'get statefulset/rhiza-voter -o json') cat "$out/controller";;
  'get pods -o json') cat "$out/pods";;
- 'get endpointslices.discovery.k8s.io -o json') cat "$out/slices";;
+ 'get endpointslices.discovery.k8s.io -l kubernetes.io/service-name=rhiza-peers -o json') cat "$out/slices";;
  'get endpoints -o json') cat "$out/endpoints";;
  *) return 91;; esac; }
 ` + function + `
@@ -191,6 +191,33 @@ verify_voter_absence`
 				t.Fatalf("accepted=%t want=%t error=%v", err == nil, tc.ok, err)
 			}
 		})
+	}
+}
+
+func TestQualificationRuntimeEndpointSliceRBAC(t *testing.T) {
+	command := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render-local")
+	command.Env = append(os.Environ(),
+		"RHIZA_RUN_ID=a1b2c3d4",
+		"RHIZA_HARNESS_SHA=315a5ee6bc6635b4ff4f85b9534afa4abe537c79",
+		"RHIZA_AUTH_EXPIRES=2026-10-11T00:00:00Z",
+	)
+	rendered, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const rule = "  - apiGroups: [discovery.k8s.io]\n    resources: [endpointslices]\n    verbs: [get, list, watch]\n"
+	var runtimeRole string
+	for _, document := range strings.Split(string(rendered), "\n---\n") {
+		if strings.Contains(document, "\nkind: Role\n") && strings.Contains(document, "  name: rhiza-ci-runtime\n") {
+			runtimeRole = document
+		}
+		if strings.Contains(document, "\nkind: ClusterRole\n") && strings.Contains(document, "discovery.k8s.io") {
+			t.Fatal("EndpointSlice access escaped the namespaced runtime role")
+		}
+	}
+	if strings.Count(runtimeRole, rule) != 1 || strings.Count(runtimeRole, "discovery.k8s.io") != 1 || !strings.Contains(runtimeRole, "  namespace: rhiza-v0191-20261008-a1b2c3d4\n") {
+		t.Fatalf("rendered runtime EndpointSlice role is not exact:\n%s", runtimeRole)
 	}
 }
 

@@ -703,7 +703,7 @@ verify_voter_absence() {
     (.status.replicas // 0)==0 and (.status.readyReplicas // 0)==0 and (.status.currentReplicas // 0)==0
   ' "$out/cold-controller.json" >/dev/null || return 1
   k get pods -o json > "$out/cold-pods.json" || return $?
-  k get endpointslices.discovery.k8s.io -o json > "$out/cold-endpointslices.json" || return $?
+  k get endpointslices.discovery.k8s.io -l kubernetes.io/service-name=rhiza-peers -o json > "$out/cold-endpointslices.json" || return $?
   k get endpoints -o json > "$out/cold-endpoints.json" || return $?
   jq -n -e --slurpfile expected "$out/shutdown-before.json" --slurpfile pods "$out/cold-pods.json" \
     --slurpfile slices "$out/cold-endpointslices.json" --slurpfile endpoints "$out/cold-endpoints.json" \
