@@ -251,6 +251,7 @@ func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
 	for name, rendered := range map[string][]byte{"auth": authRendered, "workload": []byte(workloadRendered)} {
 		t.Run(name, func(t *testing.T) {
 			decoder := yaml.NewDecoder(bytes.NewReader(rendered))
+			serviceSelectors := 0
 			for document := 1; ; document++ {
 				var value any
 				if err := decoder.Decode(&value); errors.Is(err, io.EOF) {
@@ -265,6 +266,19 @@ func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
 					t.Fatalf("document %d is not Kubernetes JSON-compatible: %v", document, err)
 				}
 				assertStringMaps(t, value, fmt.Sprintf("document %d", document))
+				object := value.(map[string]any)
+				if object["kind"] == "Service" {
+					selector := object["spec"].(map[string]any)["selector"].(map[string]any)
+					for key, selectorValue := range selector {
+						if _, ok := selectorValue.(string); !ok {
+							t.Fatalf("document %d Service spec.selector.%s is %T, want string", document, key, selectorValue)
+						}
+					}
+					serviceSelectors++
+				}
+			}
+			if name == "workload" && serviceSelectors != 2 {
+				t.Fatalf("checked %d Service selectors, want 2", serviceSelectors)
 			}
 		})
 	}
@@ -337,6 +351,7 @@ func TestBootstrapRollbackKeepsAuthorityThroughCloudVerification(t *testing.T) {
 		`record revoke-project g projects remove-iam-policy-binding`,
 		`tag='cluster-role'; role=$cluster_role`,
 		`Custom role delete receipt rejected`,
+		`verify_deleted_role "$tag" "$role"`,
 		`> "$RHIZA_AUTH_STATE/rollback-terminal.json"`,
 	} {
 		at := strings.Index(text[last+1:], step)
@@ -352,31 +367,110 @@ func TestBootstrapRollbackAbsenceStopsOnFirstUnprovenResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	start := strings.Index(string(source), "\nverify_absent() {\n")
+	start := strings.Index(string(source), "\nprecise_not_found() {\n")
 	end := strings.Index(string(source)[start+1:], "\nmark() {")
 	if start < 0 || end < 0 {
 		t.Fatal("rollback absence helper missing")
 	}
 	helper := string(source)[start+1 : start+1+end]
-	dir := t.TempDir()
-	command := exec.Command("/bin/sh", "-c", `set -eu
+	for _, tc := range []struct {
+		name, probe string
+		want        int
+	}{
+		{"exact-not-found", `printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account.' >&2; return 7`, 0},
+		{"not-found-with-auth-note", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent. This command is authenticated as [admin@example.invalid] which is the active account specified by the [core/account] property.' >&2; return 7`, 0},
+		{"conflicting-success", `printf '%s\n' '{"name":"still-present"}'; return 0`, 1},
+		{"mixed-conflict", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent; HTTP 409 conflict' >&2; return 7`, 1},
+		{"mixed-permission", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent.' 'ERROR: PERMISSION_DENIED' >&2; return 7`, 1},
+		{"mixed-server", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent; HTTP 503 backend unavailable' >&2; return 7`, 1},
+		{"unknown", `printf '%s\n' 'ERROR: unknown transport failure' >&2; return 7`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			command := exec.Command("/bin/sh", "-c", `set -eu
 die() { printf '%s\n' "$*" >&2; exit 1; }
 `+helper+`
-denied() { printf '%s\n' 'PERMISSION_DENIED' >&2; return 7; }
-verify_absent data denied
+probe() { `+tc.probe+`; }
+verify_absent data probe
 : > "$RHIZA_AUTH_STATE/after-first-failure"
 `)
-	command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
-	output, runErr := command.CombinedOutput()
-	var exited *exec.ExitError
-	if !errors.As(runErr, &exited) || exited.ExitCode() != 1 || !bytes.Contains(output, []byte("Cannot prove rollback absence for data")) {
-		t.Fatalf("permission loss did not fail closed: error=%v output=%s", runErr, output)
+			command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
+			output, runErr := command.CombinedOutput()
+			code := 0
+			if runErr != nil {
+				var exited *exec.ExitError
+				if !errors.As(runErr, &exited) {
+					t.Fatal(runErr)
+				}
+				code = exited.ExitCode()
+			}
+			if code != tc.want {
+				t.Fatalf("exit=%d want=%d output=%s", code, tc.want, output)
+			}
+			_, markerErr := os.Stat(filepath.Join(dir, "after-first-failure"))
+			if (markerErr == nil) != (tc.want == 0) {
+				t.Fatalf("continued=%t want=%t error=%v", markerErr == nil, tc.want == 0, markerErr)
+			}
+			if tc.name == "mixed-permission" {
+				if exit, err := os.ReadFile(filepath.Join(dir, "rollback-absence-data.exit")); err != nil || string(exit) != "7\n" {
+					t.Fatalf("first failure receipt missing: exit=%q error=%v", exit, err)
+				}
+			}
+		})
 	}
-	if _, err := os.Stat(filepath.Join(dir, "after-first-failure")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("rollback continued after first failure: %v", err)
+}
+
+func TestBootstrapClusterRoleTerminalVerification(t *testing.T) {
+	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if exit, err := os.ReadFile(filepath.Join(dir, "rollback-absence-data.exit")); err != nil || string(exit) != "7\n" {
-		t.Fatalf("first failure receipt missing: exit=%q error=%v", exit, err)
+	start := strings.Index(string(source), "\nprecise_not_found() {\n")
+	end := strings.Index(string(source)[start+1:], "\nmark() {")
+	if start < 0 || end < 0 {
+		t.Fatal("rollback terminal role helpers missing")
+	}
+	helper := string(source)[start+1 : start+1+end]
+	for _, tc := range []struct {
+		name, response string
+		want           int
+	}{
+		{"soft-deleted", `printf '%s\n' '{"name":"projects/p/roles/r","description":"owner","deleted":true,"includedPermissions":["p.one"],"stage":"GA"}'`, 0},
+		{"exact-not-found", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent.' >&2; return 7`, 0},
+		{"not-deleted", `printf '%s\n' '{"name":"projects/p/roles/r","description":"owner","deleted":false,"includedPermissions":["p.one"],"stage":"GA"}'`, 1},
+		{"mixed-permission", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent. PERMISSION_DENIED' >&2; return 7`, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "cluster-role-create.json"), []byte(`{"name":"projects/p/roles/r","includedPermissions":["p.one"],"stage":"GA"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "-c", `set -eu
+die() { printf '%s\n' "$*" >&2; exit 1; }
+owner=owner
+`+helper+`
+g() { `+tc.response+`; }
+verify_deleted_role cluster-role r
+: > "$RHIZA_AUTH_STATE/after-terminal-check"
+`)
+			command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
+			output, runErr := command.CombinedOutput()
+			code := 0
+			if runErr != nil {
+				var exited *exec.ExitError
+				if !errors.As(runErr, &exited) {
+					t.Fatal(runErr)
+				}
+				code = exited.ExitCode()
+			}
+			if code != tc.want {
+				t.Fatalf("exit=%d want=%d output=%s", code, tc.want, output)
+			}
+			_, markerErr := os.Stat(filepath.Join(dir, "after-terminal-check"))
+			if (markerErr == nil) != (tc.want == 0) {
+				t.Fatalf("continued=%t want=%t error=%v", markerErr == nil, tc.want == 0, markerErr)
+			}
+		})
 	}
 }
 

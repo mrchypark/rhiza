@@ -892,6 +892,23 @@ absent() {
         grep -Eq 'NOT_FOUND|NotFound|not found|does not exist|notFound|One or more URLs matched no objects' "$RHIZA_AUTH_STATE/absent-$item.stderr" || die "Cannot prove $item absent; preserve diagnostic"
     fi
 }
+precise_not_found() {
+    item=$1; error_file=$2
+    absence_error=$(sed -E \
+          -e 's/ This command is authenticated as \[[^][]+\] which is the active account specified by the \[core\/account\] property\.?$//' \
+          -e 's/ This command is authenticated as [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+ which is the active account specified by the \[core\/account\] property\.?$//' \
+          -e '/^This command is authenticated as \[[^][]+\] which is the active account specified by the \[core\/account\] property\.?$/d' \
+          -e '/^This command is authenticated as [A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+ which is the active account specified by the \[core\/account\] property\.?$/d' \
+          -e '/^[[:space:]]*$/d' "$error_file") || die "Cannot read rollback absence for $item"
+    [ "$(printf '%s\n' "$absence_error" | wc -l | tr -d ' ')" = 1 ] || die "Cannot prove rollback absence for $item"
+    if printf '%s\n' "$absence_error" | grep -Eiq 'PERMISSION_DENIED|FORBIDDEN|UNAUTHENTICATED|UNAUTHORIZED|ALREADY_EXISTS|CONFLICT|(^|[^0-9])(401|403|409|429|5[0-9][0-9])([^0-9]|$)|UNAVAILABLE|DEADLINE_EXCEEDED|timed?[ -]?out|connection|network|TLS|DNS'; then
+        die "Cannot prove rollback absence for $item"
+    fi
+    case "$absence_error" in
+      'ERROR: (gcloud.'*') NOT_FOUND: '*|'ERROR: (gcloud.'*') HTTPError 404: '*|'ERROR: One or more URLs matched no objects.') ;;
+      *) die "Cannot prove rollback absence for $item" ;;
+    esac
+}
 verify_absent() {
     item=$1; shift
     if "$@" > "$RHIZA_AUTH_STATE/rollback-absence-$item.json" 2> "$RHIZA_AUTH_STATE/rollback-absence-$item.stderr"; then
@@ -899,7 +916,26 @@ verify_absent() {
     else
         rc=$?
         printf '%s\n' "$rc" > "$RHIZA_AUTH_STATE/rollback-absence-$item.exit"
-        grep -Eq 'NOT_FOUND|NotFound|not found|does not exist|notFound|One or more URLs matched no objects' "$RHIZA_AUTH_STATE/rollback-absence-$item.stderr" || die "Cannot prove rollback absence for $item"
+        precise_not_found "$item" "$RHIZA_AUTH_STATE/rollback-absence-$item.stderr"
+    fi
+}
+verify_deleted_role() {
+    tag=$1; role=$2
+    role_exit=0
+    g iam roles describe "$role" --show-deleted --format=json > "$RHIZA_AUTH_STATE/$tag-terminal.json" 2> "$RHIZA_AUTH_STATE/$tag-terminal.stderr" || role_exit=$?
+    printf '%s\n' "$role_exit" > "$RHIZA_AUTH_STATE/$tag-terminal.exit"
+    if [ "$role_exit" = 0 ]; then
+        jq -e --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$tag-create.json" '
+          type=="object" and ($created|length)==1 and .name==$created[0].name and
+          .description==$owner and .deleted==true and
+          .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
+        ' "$RHIZA_AUTH_STATE/$tag-terminal.json" >/dev/null || die 'Custom role terminal state rejected'
+    else
+        not_found_state=$RHIZA_AUTH_STATE/rollback-absence-$tag
+        cp "$RHIZA_AUTH_STATE/$tag-terminal.json" "$not_found_state.json"
+        cp "$RHIZA_AUTH_STATE/$tag-terminal.stderr" "$not_found_state.stderr"
+        cp "$RHIZA_AUTH_STATE/$tag-terminal.exit" "$not_found_state.exit"
+        precise_not_found "$tag" "$RHIZA_AUTH_STATE/$tag-terminal.stderr"
     fi
 }
 mark() { printf '%s\n' "$owner" > "$RHIZA_AUTH_STATE/$1.created"; }
@@ -1207,6 +1243,7 @@ if owned cluster-role; then
       .description==$owner and .deleted==true and
       .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
     ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
+    verify_deleted_role "$tag" "$role"
 fi
 jq -n --arg run "$RHIZA_RUN_ID" --arg owner "$owner" '{status:"complete",run:$run,owner:$owner}' > "$RHIZA_AUTH_STATE/rollback-terminal.json"
 chmod 600 "$RHIZA_AUTH_STATE/rollback-terminal.json"
