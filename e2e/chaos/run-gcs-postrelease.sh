@@ -1093,6 +1093,28 @@ container_kill() {
       .phase=="Injected" and .injectedCount==1 and .recoveredCount==0 and
       ([.events[]?|select(.operation=="Apply" and .type=="Succeeded")]|length)==1)
   ' "$out/$seq-injection.stdout" >/dev/null || die 'exact single container-kill injection not proven'
+  process_restart_deadline=$(( $(date +%s) + 120 ))
+  wait_process_restart() {
+    while :; do
+      k get pod rhiza-voter-0 -o json > "$out/process-restart-current.json" || true
+      if jq -e --slurpfile before "$out/process-before.json" '
+        [.status.containerStatuses[]?|select(.name=="rhiza")] as $current |
+        [($before[0][]|select(.name=="rhiza-voter-0")|.containers[]?)|select(.name=="rhiza")] as $sealed |
+        .metadata.name=="rhiza-voter-0" and .metadata.uid==($before[0][]|select(.name=="rhiza-voter-0")|.uid) and
+        .metadata.deletionTimestamp==null and any(.status.conditions[]?;.type=="Ready" and .status=="True") and
+        ($current|length)==1 and ($sealed|length)==1 and
+        $current[0].restartCount==$sealed[0].restartCount+1 and
+        ($current[0].containerID|type)=="string" and ($current[0].containerID|length)>0 and
+        $current[0].containerID!=$sealed[0].containerID
+      ' "$out/process-restart-current.json"; then
+        cat "$out/process-restart-current.json"
+        return 0
+      fi
+      [ "$(date +%s)" -lt "$process_restart_deadline" ] || return 124
+      sleep 1
+    done
+  }
+  run restart-evidence wait_process_restart
   execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
   # ContainerKill is one-shot: duration does not recover it. Delete the exact
   # fault and wait for its finalizer before proving application recovery.
