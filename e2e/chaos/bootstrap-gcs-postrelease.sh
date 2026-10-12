@@ -1635,7 +1635,6 @@ if owned data; then
     data_uid=$(jq -r .uniqueId "$RHIZA_AUTH_STATE/data-create.json")
     record data-delete g iam service-accounts delete "$data_uid"
     wait_deleted_sa data
-    verify_absent data g iam service-accounts describe "$data" --format=json
 fi
 tag='folder-role'; role=$folder_role
 if owned "$tag"; then

@@ -1699,7 +1699,8 @@ func TestBootstrapRollbackKeepsAuthorityThroughCloudVerification(t *testing.T) {
 		`verify_absent provider g iam workload-identity-pools providers describe`,
 		`verify_absent pool g iam workload-identity-pools describe`,
 		`verify_absent ci g iam service-accounts describe`,
-		`verify_absent data g iam service-accounts describe`,
+		`record data-delete g iam service-accounts delete "$data_uid"`,
+		`wait_deleted_sa data`,
 		`verify_absent "$tag" g iam roles describe "$role" --format=json`,
 		`record project-rollback g projects get-iam-policy`,
 		`record revoke-project g projects remove-iam-policy-binding`,
@@ -1713,6 +1714,9 @@ func TestBootstrapRollbackKeepsAuthorityThroughCloudVerification(t *testing.T) {
 			t.Fatalf("rollback step missing or out of order: %q", step)
 		}
 		last += at + 1
+	}
+	if strings.Contains(text, `verify_absent data g iam service-accounts describe`) {
+		t.Fatal("redundant data GSA absence describe remains after authoritative worker")
 	}
 }
 
@@ -2064,7 +2068,7 @@ func TestQualificationQUICHandshake(t *testing.T) {
 
 func TestQualificationFixture(t *testing.T) {
 	run := "a1b2c3d4"
-	namespace := "rhiza-v0191-20261008-" + run
+	namespace := "rhiza-v0191-" + run
 	owner := "rhiza-postrelease-" + run + "-" + strings.Repeat("a", 40)
 	// Synthetic deterministic entropy only; no generated live credentials/logs.
 	entropy := make([]byte, 160)
@@ -2122,7 +2126,14 @@ func TestQualificationFixture(t *testing.T) {
 	if err != nil || config.PeerToken != data["learner_token"] || config.Learner == nil || config.Learner.PublicKey != learner.PublicKey {
 		t.Fatal("learner fixture rejected by released config API")
 	}
-	for _, args := range [][3]string{{"wrong", run, owner}, {"rhiza-v0190-20261008-" + run, run, owner}, {namespace, "BAD", owner}, {namespace, run, "wrong"}} {
+	for _, args := range [][3]string{
+		{"wrong", run, owner},
+		{"rhiza-v0190-" + run, run, owner},
+		{"rhiza-v0191-20261008-" + run, run, owner},
+		{"rhiza-v0191-b1c2d3e4", run, owner},
+		{namespace, "BAD", owner},
+		{namespace, run, "wrong"},
+	} {
 		if _, err := qualificationFixture(args[0], args[1], args[2], bytes.NewReader(entropy)); err == nil {
 			t.Fatal("invalid identity accepted")
 		}
