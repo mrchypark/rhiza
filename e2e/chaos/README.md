@@ -98,6 +98,13 @@ uses `apply-local`, `mint-local`, and `run-local`; federation uses `apply` and
 `run`. These are one-shot operations: do not reuse an output or receipt
 directory, adopt colliding resources, or rerun after an unknown outcome.
 
+Local direct execution uses IPv4 loopback port forwards. `RHIZA_LOCAL_PORT_BASE`
+is optional and defaults to `18080`; when set it must be a canonical decimal
+integer from `1024` through `65432`. The launcher verifies that the four HTTP
+ports `base..base+3` and their Raft ports `base+100..base+103` are free on
+`127.0.0.1` before minting credentials. It rejects an occupied listener rather
+than using a healthy response from an unrelated local process.
+
 Always preserve evidence before cleanup. Run `rollback-local` for direct mode or
 `rollback` for federation mode with the exact original variables and receipt
 directory. Rollback verifies ownership and exact absence; a partial or ambiguous

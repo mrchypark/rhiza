@@ -71,6 +71,19 @@ ns=$RHIZA_NAMESPACE
 prefix=$RHIZA_GCS_PREFIX
 cluster="gcs-$RHIZA_RUN_ID"
 context=$RHIZA_KUBE_CONTEXT
+local_port_base=${RHIZA_LOCAL_PORT_BASE:-18080}
+case "$local_port_base" in ''|*[!0-9]*|0[0-9]*) die 'local port base must be a canonical decimal integer' ;; esac
+[ "$local_port_base" -ge 1024 ] && [ "$local_port_base" -le 65432 ] || die 'local port base must leave four HTTP and Raft ports in range'
+port_voter0=$local_port_base
+port_voter1=$((local_port_base + 1))
+port_voter2=$((local_port_base + 2))
+port_learner=$((local_port_base + 3))
+port_raft_voter0=$((port_voter0 + 100))
+port_raft_voter1=$((port_voter1 + 100))
+port_raft_voter2=$((port_voter2 + 100))
+port_raft_learner=$((port_learner + 100))
+command -v lsof >/dev/null || die 'native lsof required'
+command -v setsid >/dev/null || die 'native setsid required'
 remaining() {
   seconds=$((local_deadline - $(date +%s)))
   [ "$seconds" -gt 0 ] || return 124
@@ -956,6 +969,25 @@ stop_forward() {
   fi
   wait "$forward_stop_pid" 2>/dev/null || true
 }
+port_listener_pids() {
+  lsof -nP -iTCP@127.0.0.1:"$1" -sTCP:LISTEN -t 2>/dev/null | LC_ALL=C sort -u
+}
+assert_port_free() {
+  for port_candidate in "$@"; do
+    [ -z "$(port_listener_pids "$port_candidate")" ] || die "local IPv4 port already in use: $port_candidate"
+  done
+}
+forward_owns_listeners() {
+  forward_group=$1
+  shift
+  [ "$(ps -o pgid= -p "$forward_group" | tr -d ' ')" = "$forward_group" ] || return 1
+  for port_candidate in "$@"; do
+    listener_pids=$(port_listener_pids "$port_candidate")
+    [ "$(printf '%s\n' "$listener_pids" | sed '/^$/d' | wc -l | tr -d ' ')" = 1 ] || return 1
+    listener_pid=$(printf '%s\n' "$listener_pids" | sed -n '1p')
+    [ "$(ps -o pgid= -p "$listener_pid" | tr -d ' ')" = "$forward_group" ] || return 1
+  done
+}
 pf_pids=''
 active_fault=''
 owned_created=false
@@ -1469,10 +1501,10 @@ run voters-ready wait_voters 180
 forward() {
   pod=$1; port=$2; expected_uid=${3:-}
   case "$port" in
-    18080) old_pid=${pf_18080:-} ;;
-    18081) old_pid=${pf_18081:-} ;;
-    18082) old_pid=${pf_18082:-} ;;
-    18083) old_pid=${pf_18083:-} ;;
+    "$port_voter0") old_pid=${pf_voter0:-}; raft_port=$port_raft_voter0 ;;
+    "$port_voter1") old_pid=${pf_voter1:-}; raft_port=$port_raft_voter1 ;;
+    "$port_voter2") old_pid=${pf_voter2:-}; raft_port=$port_raft_voter2 ;;
+    "$port_learner") old_pid=${pf_learner:-}; raft_port=$port_raft_learner ;;
     *) die 'unsupported port-forward port' ;;
   esac
   if [ -n "$old_pid" ]; then
@@ -1501,30 +1533,32 @@ forward() {
   if [ "$mode" = run-local ] && [ "$local_deadline" -lt "$forward_deadline" ]; then forward_deadline=$local_deadline; fi
   forward_seconds=$((forward_deadline - $(date +%s)))
   [ "$forward_seconds" -gt 0 ] || exit 124
+  assert_port_free "$port" "$raft_port"
   if [ "$mode" = run-local ]; then
-    timeout --kill-after=5s "${forward_seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
-      --context="$context" --namespace="$ns" --request-timeout=30s port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+    setsid timeout --kill-after=5s "${forward_seconds}s" kubectl --kubeconfig="$RHIZA_LOCAL_RUNTIME_KUBECONFIG" \
+      --context="$context" --namespace="$ns" --request-timeout=30s port-forward --address=127.0.0.1 "pod/$pod" "$port:8080" "$raft_port:8081" > "$out/$pod-portforward.log" 2>&1 &
   else
-    timeout --kill-after=5s "${forward_seconds}s" kubectl --context="$context" --namespace="$ns" \
-      port-forward "pod/$pod" "$port:8080" "$((port + 100)):8081" > "$out/$pod-portforward.log" 2>&1 &
+    setsid timeout --kill-after=5s "${forward_seconds}s" kubectl --context="$context" --namespace="$ns" \
+      port-forward --address=127.0.0.1 "pod/$pod" "$port:8080" "$raft_port:8081" > "$out/$pod-portforward.log" 2>&1 &
   fi
   forward_pid=$!
   case "$port" in
-    18080) pf_18080=$forward_pid ;;
-    18081) pf_18081=$forward_pid ;;
-    18082) pf_18082=$forward_pid ;;
-    18083) pf_18083=$forward_pid ;;
+    "$port_voter0") pf_voter0=$forward_pid ;;
+    "$port_voter1") pf_voter1=$forward_pid ;;
+    "$port_voter2") pf_voter2=$forward_pid ;;
+    "$port_learner") pf_learner=$forward_pid ;;
   esac
   pf_pids="$pf_pids $forward_pid"
   jq --argjson pid "$forward_pid" '.pid=$pid' "$pf_before" > "$pf_before.next"
   mv "$pf_before.next" "$pf_before"
   tries=0
-  until curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; do
+  until forward_owns_listeners "$forward_pid" "$port" "$raft_port" && curl -fsS --max-time 2 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; do
     kill -0 "$forward_pid" 2>/dev/null || die 'port-forward exited before readiness'
     [ "$(date +%s)" -lt "$forward_deadline" ] || exit 124
     tries=$((tries + 1)); [ "$tries" -lt 30 ] || die 'port-forward timeout'; sleep 1
   done
   kill -0 "$forward_pid" 2>/dev/null || die 'port-forward exited after readiness'
+  forward_owns_listeners "$forward_pid" "$port" "$raft_port" || die 'port-forward listener ownership changed after readiness'
   pf_after="$out/port-forward-$port-generation-$pf_generation-after.json"
   k get pod "$pod" -o json | jq --argjson pid "$forward_pid" --arg image "$RHIZA_HOST_IMAGE" --arg digest "$host_digest" --arg expected_uid "$expected_uid" '
     (.status.containerStatuses|length) as $status_count | (.spec.containers|length) as $spec_count |
@@ -1541,9 +1575,9 @@ forward() {
   ' > "$pf_after" || die 'port-forward target identity invalid after readiness'
   jq -e --slurpfile before "$pf_before" '.==$before[0]' "$pf_after" >/dev/null || die 'port-forward target changed during startup'
 }
-forward rhiza-voter-0 18080
-forward rhiza-voter-1 18081
-forward rhiza-voter-2 18082
+forward rhiza-voter-0 "$port_voter0"
+forward rhiza-voter-1 "$port_voter1"
+forward rhiza-voter-2 "$port_voter2"
 pod_snapshot() { k get pods -l "chaos.rhiza.io/run=$RHIZA_RUN_ID" -o json | jq '[.items[]|{name:.metadata.name,uid:.metadata.uid,node:.spec.nodeName,volumes:.spec.volumes,containers:.status.containerStatuses,deleting:.metadata.deletionTimestamp,ready:any(.status.conditions[]?;.type=="Ready" and .status=="True")}]'; }
 run before pod_snapshot
 cp "$out/$seq-before.stdout" "$out/voters-before.json"
@@ -1558,19 +1592,19 @@ learner_started=false
 # reserves are conservative planning allowances, not measured upper bounds.
 metrics() {
   [ "$(( $(date +%s) - started ))" -lt 1200 ] || die '20-minute workload ceiling; cleanup reserved'
-  ports='18080 18081 18082'
-  if [ "$source_quiesced" = true ]; then ports=18083
-  elif [ "$learner_started" = true ]; then ports="$ports 18083"
+  ports="$port_voter0 $port_voter1 $port_voter2"
+  if [ "$source_quiesced" = true ]; then ports=$port_learner
+  elif [ "$learner_started" = true ]; then ports="$ports $port_learner"
   fi
   for port in $ports; do
     # Preserve the pre-kill sample; SIGKILL tail is a disclosed reserve, not
     # falsely reconstructed from the restarted process's zeroed counters.
-    if [ "$active_fault" = PodChaos/process-one ] && [ "$port" = 18080 ]; then continue; fi
+    if [ "$active_fault" = PodChaos/process-one ] && [ "$port" = "$port_voter0" ]; then continue; fi
     case "$port" in
-      18080) pod=rhiza-voter-0; expected=$voter0_restarts;;
-      18081) pod=rhiza-voter-1; expected=0;;
-      18082) pod=rhiza-voter-2; expected=0;;
-      18083) pod=rhiza-learner; expected=0;;
+      "$port_voter0") pod=rhiza-voter-0; expected=$voter0_restarts;;
+      "$port_voter1") pod=rhiza-voter-1; expected=0;;
+      "$port_voter2") pod=rhiza-voter-2; expected=0;;
+      "$port_learner") pod=rhiza-learner; expected=0;;
     esac
     run counter-identity k get pod "$pod" -o json
     identity="$out/$seq-counter-identity.stdout"
@@ -1608,7 +1642,7 @@ execute() {
     set +e
     curl --silent --show-error --max-time 5 --output "$out/$seq-$label.stdout" \
       --write-out '%{http_code}\n%{time_total}\n' -H 'Content-Type: application/json' -d "$payload" \
-      http://127.0.0.1:18081/sql/execute > "$out/$seq-$label.http-timing" 2> "$out/$seq-$label.stderr"
+      "http://127.0.0.1:$port_voter1/sql/execute" > "$out/$seq-$label.http-timing" 2> "$out/$seq-$label.stderr"
     code=$?
     set -e
     printf '%s\n' "$code" > "$out/$seq-$label.exit"
@@ -1623,7 +1657,7 @@ execute() {
     fi
     network_ack=true
   else
-  run ack curl -fsS --max-time 30 -H 'Content-Type: application/json' -d "$payload" http://127.0.0.1:18081/sql/execute
+  run ack curl -fsS --max-time 30 -H 'Content-Type: application/json' -d "$payload" "http://127.0.0.1:$port_voter1/sql/execute"
   fi
   # SQL receipts omit Applied; committed plus no execution error is their
   # success contract. The configured before-ack barrier remains engine-owned.
@@ -1648,7 +1682,7 @@ capture_network_failure() {
   status_payload=$(jq -nc --arg id "$failed_id" '{kind:"sql",request_id:$id}')
   query_payload=$(jq -nc '{sql:"SELECT id,value FROM qualification ORDER BY id",consistency:"linearizable"}')
   diagnostic_pids=''
-  for diagnostic_port in 18080 18081 18082; do
+  for diagnostic_port in "$port_voter0" "$port_voter1" "$port_voter2"; do
     for diagnostic_name in request-status recovery-status ready; do
       case "$diagnostic_name" in
         request-status) diagnostic_url="http://127.0.0.1:$diagnostic_port/qualification/request-status"; diagnostic_method=POST; diagnostic_payload=$status_payload ;;
@@ -1746,7 +1780,7 @@ post_network_readback() {
 }
 execute "$RHIZA_RUN_ID-schema" 'CREATE TABLE qualification (id INTEGER PRIMARY KEY,value TEXT NOT NULL)'
 execute "$RHIZA_RUN_ID-seed" "INSERT INTO qualification VALUES (1,'before')"
-for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"]]'; done
+for port in "$port_voter0" "$port_voter1" "$port_voter2"; do readback "$port" linearizable '[[1,"before"]]'; done
 validate_network_injection() {
   jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '
     def applied: ([.events[]?|select(.operation=="Apply")]|length)>0 and ([.events[]?|select(.operation=="Apply")]|last.type)=="Succeeded";
@@ -1886,7 +1920,7 @@ container_kill() {
   )
   run voters-ready wait_process_ready
   execute "$RHIZA_RUN_ID-process" "INSERT INTO qualification VALUES (3,'process')"
-  forward rhiza-voter-0 18080
+  forward rhiza-voter-0 "$port_voter0"
   run after pod_snapshot
   jq -e --slurpfile before "$out/process-before.json" --slurpfile original "$out/voters-before.json" '
     def voters: [.[]|select(.name|test("^rhiza-voter-[012]$"))]|sort_by(.name);
@@ -1908,7 +1942,7 @@ container_kill() {
       else $nc.restartCount==0 and $oc.restartCount==0 and $nc.containerID==$oc.containerID end)
   ' "$out/$seq-after.stdout" >/dev/null || die 'voter UID/WAL identity changed or exact container restart not proven'
   metrics
-  for port in 18080 18081 18082; do readback "$port" linearizable '[[1,"before"],[2,"network"],[3,"process"]]'; done
+  for port in "$port_voter0" "$port_voter1" "$port_voter2"; do readback "$port" linearizable '[[1,"before"],[2,"network"],[3,"process"]]'; done
 }
 fault NetworkChaos partition network-one
 execute "$RHIZA_RUN_ID-network" "INSERT INTO qualification VALUES (2,'network')"
@@ -1926,11 +1960,11 @@ if [ -n "${forward_deadline:-}" ] && [ "$post_network_deadline" -gt "$forward_de
   printf '%s\n' 'phase=post-network-convergence category=budget-exhausted' >&2
   exit 124
 }
-for port in 18080 18081 18082; do post_network_readback "$port" '[[1,"before"],[2,"network"]]'; done
+for port in "$port_voter0" "$port_voter1" "$port_voter2"; do post_network_readback "$port" '[[1,"before"],[2,"network"]]'; done
 metrics
 container_kill
 execute "$RHIZA_RUN_ID-cold-sentinel" "INSERT INTO qualification VALUES (4,'$RHIZA_RUN_ID-cold-sentinel')"
-readback 18081 linearizable "[[1,\"before\"],[2,\"network\"],[3,\"process\"],[4,\"$RHIZA_RUN_ID-cold-sentinel\"]]"
+readback "$port_voter1" linearizable "[[1,\"before\"],[2,\"network\"],[3,\"process\"],[4,\"$RHIZA_RUN_ID-cold-sentinel\"]]"
 source_barrier=$(jq -r '.applied_slot' "$out/$seq-readback.stdout")
 sleep 15
 capture_shutdown || die 'source shutdown capture failed'
@@ -2069,7 +2103,7 @@ run learner-identity k get pod rhiza-learner -o json
 validate_learner_pod "$out/$seq-learner-identity.stdout" || die 'learner create identity or emptyDir contract mismatch'
 run learner-ready k wait pod/rhiza-learner --for=condition=Ready --timeout=180s
 learner_uid=$(jq -r '.metadata.uid' "$out/learner-created.json")
-forward rhiza-learner 18083 "$learner_uid"
+forward rhiza-learner "$port_learner" "$learner_uid"
 learner_started=true
 metrics
 jq -e '.bytes_downloaded>0' "$counters" >/dev/null || die 'fresh learner GCS download evidence absent'
@@ -2077,9 +2111,9 @@ cp "$counters" "$out/learner-counters-after-open.json"
 tries=0
 payload='{"sql":"SELECT id,value FROM qualification ORDER BY id","consistency":"local"}'
 while :; do
-  run learner-local curl -fsS --max-time 5 -H 'Content-Type: application/json' -d "$payload" http://127.0.0.1:18083/sql/query
+  run learner-local curl -fsS --max-time 5 -H 'Content-Type: application/json' -d "$payload" "http://127.0.0.1:$port_learner/sql/query"
   learner_read="$out/$seq-learner-local.stdout"
-  run learner-status curl -fsS --max-time 5 http://127.0.0.1:18083/replica/status
+  run learner-status curl -fsS --max-time 5 "http://127.0.0.1:$port_learner/replica/status"
   learner_status="$out/$seq-learner-status.stdout"
   if jq -e --argjson barrier "$source_barrier" \
       '.mode=="object-store" and .source=="object-store" and .lag_slots==0 and
@@ -2093,12 +2127,12 @@ validate_cold_restore_status "$learner_status" "$out/archive-head-before.decoded
   "$out/archive-head-metadata-before.json" "$out/learner-counters-after-open.json" || die 'cold replica did not prove certified checkpoint plus archive restore'
 mutation_payload=$(jq -nc --arg id "$RHIZA_RUN_ID-cold-rejected" '{request_id:$id,sql:"INSERT INTO qualification VALUES (5,\"rejected\")"}')
 run learner-mutation-rejected curl -sS --max-time 5 --output "$out/learner-mutation-rejected.json" \
-  --write-out '%{http_code}\n' -H 'Content-Type: application/json' -d "$mutation_payload" http://127.0.0.1:18083/sql/execute
+  --write-out '%{http_code}\n' -H 'Content-Type: application/json' -d "$mutation_payload" "http://127.0.0.1:$port_learner/sql/execute"
 [ "$(cat "$out/$seq-learner-mutation-rejected.stdout")" = 503 ] &&
   jq -e '.code=="not_ready"' "$out/learner-mutation-rejected.json" >/dev/null || die 'cold object-store replica accepted mutation'
 linearizable_payload='{"sql":"SELECT id,value FROM qualification ORDER BY id","consistency":"linearizable"}'
 run learner-linearizable-rejected curl -sS --max-time 5 --output "$out/learner-linearizable-rejected.json" \
-  --write-out '%{http_code}\n' -H 'Content-Type: application/json' -d "$linearizable_payload" http://127.0.0.1:18083/sql/query
+  --write-out '%{http_code}\n' -H 'Content-Type: application/json' -d "$linearizable_payload" "http://127.0.0.1:$port_learner/sql/query"
 [ "$(cat "$out/$seq-learner-linearizable-rejected.stdout")" = 503 ] &&
   jq -e '.code=="quorum_unavailable"' "$out/learner-linearizable-rejected.json" >/dev/null || die 'cold object-store replica served linearizable read'
 run learner-topology k get pod rhiza-learner -o json

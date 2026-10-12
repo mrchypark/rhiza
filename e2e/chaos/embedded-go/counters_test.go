@@ -449,7 +449,7 @@ func TestQualificationColdRestoreContract(t *testing.T) {
 		}
 	}
 	last := -1
-	for _, step := range []string{`execute "$RHIZA_RUN_ID-cold-sentinel"`, "capture_shutdown ||", "run stop-voters k scale statefulset/rhiza-voter --current-replicas=3 --replicas=0", "finish_shutdown_capture ||", "verify_voter_absence ||", "run inspector-create", "run inspector-identity", "run head-metadata-freeze-1", "run head-freeze", "run head-metadata-freeze-2", "run archive-head-decoded", "run archive-root-freeze", "run checkpoint-metadata-freeze-1", "run checkpoint-current-freeze", "run checkpoint-metadata-freeze-2", "run checkpoint-root-before", "delete_inspector_owned ||", "run inventory-before", "run head-metadata-prelearner-1", "run head-prelearner", "run head-metadata-prelearner-2", "run checkpoint-metadata-prelearner-1", "run checkpoint-current-prelearner", "run checkpoint-metadata-prelearner-2", "run cold-create", "run learner-identity", "run learner-ready", `forward rhiza-learner 18083 "$learner_uid"`, "run learner-local", "run learner-status", `validate_cold_restore_status "$learner_status"`, "run learner-mutation-rejected", "run learner-linearizable-rejected", "run learner-topology", "run head-metadata-after", "run checkpoint-metadata-after", "run learner-clock", "run archive-gc-lock-terminal", "run checkpoint-publisher-terminal", "run archive-recovery-pin-terminal", "run checkpoint-recovery-pin-terminal", "run inventory-after", `validate_cold_inventory "$out/object-inventory-before.json"`} {
+	for _, step := range []string{`execute "$RHIZA_RUN_ID-cold-sentinel"`, "capture_shutdown ||", "run stop-voters k scale statefulset/rhiza-voter --current-replicas=3 --replicas=0", "finish_shutdown_capture ||", "verify_voter_absence ||", "run inspector-create", "run inspector-identity", "run head-metadata-freeze-1", "run head-freeze", "run head-metadata-freeze-2", "run archive-head-decoded", "run archive-root-freeze", "run checkpoint-metadata-freeze-1", "run checkpoint-current-freeze", "run checkpoint-metadata-freeze-2", "run checkpoint-root-before", "delete_inspector_owned ||", "run inventory-before", "run head-metadata-prelearner-1", "run head-prelearner", "run head-metadata-prelearner-2", "run checkpoint-metadata-prelearner-1", "run checkpoint-current-prelearner", "run checkpoint-metadata-prelearner-2", "run cold-create", "run learner-identity", "run learner-ready", `forward rhiza-learner "$port_learner" "$learner_uid"`, "run learner-local", "run learner-status", `validate_cold_restore_status "$learner_status"`, "run learner-mutation-rejected", "run learner-linearizable-rejected", "run learner-topology", "run head-metadata-after", "run checkpoint-metadata-after", "run learner-clock", "run archive-gc-lock-terminal", "run checkpoint-publisher-terminal", "run archive-recovery-pin-terminal", "run checkpoint-recovery-pin-terminal", "run inventory-after", `validate_cold_inventory "$out/object-inventory-before.json"`} {
 		at := strings.Index(source, step)
 		if at <= last {
 			t.Fatalf("cold restore step missing or out of order: %q", step)
@@ -481,7 +481,7 @@ func TestQualificationColdRestoreContract(t *testing.T) {
 		`rhiza qualification-unix-milli`,
 		`"$out/archive-base-root-before.json"`,
 		`validate_cold_inventory "$out/object-inventory-before.json"`,
-		`if [ "$source_quiesced" = true ]; then ports=18083`,
+		`if [ "$source_quiesced" = true ]; then ports=$port_learner`,
 		`validate_learner_pod "$out/$seq-learner-identity.stdout"`,
 		`validate_learner_pod "$out/$seq-learner-topology.stdout"`,
 		`jq -e --arg uid "$learner_uid" '.metadata.uid==$uid' "$identity"`,
@@ -2258,41 +2258,31 @@ func TestQualificationCurlHelper(t *testing.T) {
 	if os.Getenv("RHIZA_CURL_HELPER") != "1" {
 		t.Skip("subprocess helper")
 	}
-	if os.Getenv("FAKE_SCENARIO") != "bind-conflict" {
+	if os.Getenv("FAKE_SCENARIO") != "foreign-healthy-listener" {
 		if _, err := os.Stat(filepath.Join(os.Getenv("FAKE_DIR"), "listening")); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
-	marker := filepath.Join(os.Getenv("FAKE_DIR"), "bind-exited")
-	for attempt := 0; attempt < 100; attempt++ {
-		if _, err := os.Stat(marker); err == nil {
-			time.Sleep(time.Second)
-			for _, arg := range os.Args {
-				if !strings.HasPrefix(arg, "http://") {
-					continue
-				}
-				client := &http.Client{Timeout: 2 * time.Second}
-				response, err := client.Get(arg)
-				if err != nil {
-					t.Fatal(err)
-				}
-				response.Body.Close()
-				if response.StatusCode != http.StatusOK {
-					t.Fatalf("health status=%d", response.StatusCode)
-				}
-				if err := os.WriteFile(filepath.Join(os.Getenv("FAKE_DIR"), "health-ok"), []byte("ok\n"), 0600); err != nil {
-					t.Fatal(err)
-				}
-				return
-			}
-			t.Fatal("health URL missing")
-		} else if !errors.Is(err, os.ErrNotExist) {
+	for _, arg := range os.Args {
+		if !strings.HasPrefix(arg, "http://") {
+			continue
+		}
+		client := &http.Client{Timeout: 2 * time.Second}
+		response, err := client.Get(arg)
+		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("health status=%d", response.StatusCode)
+		}
+		if err := os.WriteFile(filepath.Join(os.Getenv("FAKE_DIR"), "health-ok"), []byte("ok\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
 	}
-	t.Fatal("bind failure did not complete")
+	t.Fatal("health URL missing")
 }
 
 func TestQualificationArchiveHeadEvidence(t *testing.T) {
@@ -2676,18 +2666,18 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 	for _, scenario := range []struct {
 		name string
 		want int
-	}{{"complete", 0}, {"initial-uid-mismatch", 1}, {"uid-change", 1}, {"container-change", 1}, {"image-change", 1}, {"wrong-stable-image", 1}, {"extra-sidecar", 1}, {"forward-death", 1}, {"bind-conflict", 1}, {"stubborn-child", 0}} {
+	}{{"complete", 0}, {"initial-uid-mismatch", 1}, {"uid-change", 1}, {"container-change", 1}, {"image-change", 1}, {"wrong-stable-image", 1}, {"extra-sidecar", 1}, {"forward-death", 1}, {"foreign-healthy-listener", 1}, {"stubborn-child", 0}} {
 		t.Run("forward-"+scenario.name, func(t *testing.T) {
 			dir := t.TempDir()
 			selectedPort := 0
 			var occupied net.Listener
-			for _, candidate := range []int{18080, 18081, 18082, 18083} {
+			for _, candidate := range []int{28080, 28081, 28082, 28083} {
 				listener, listenErr := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", candidate))
 				if listenErr != nil {
 					continue
 				}
 				selectedPort = candidate
-				if scenario.name == "bind-conflict" {
+				if scenario.name == "foreign-healthy-listener" {
 					occupied = listener
 				} else {
 					listener.Close()
@@ -2713,7 +2703,7 @@ func TestQualificationArchiveHeadAndPortForwardLifecycle(t *testing.T) {
 			}
 			write("curl", "#!/bin/sh\nexec \"$FAKE_TEST_BINARY\" -test.run '^TestQualificationCurlHelper$' -- \"$@\"\n")
 			write("kubectl", `#!/bin/sh
-case "$*" in *" port-forward pod/rhiza-voter-0 $FAKE_PORT:8080 "*) ;; *) exit 97 ;; esac
+case "$*" in *"port-forward --address=127.0.0.1 pod/rhiza-voter-0 $FAKE_PORT:8080 $FAKE_RAFT_PORT:8081"*) ;; *) exit 97 ;; esac
 [ "$FAKE_SCENARIO" != forward-death ] || exit 53
 if [ -e "$FAKE_DIR/listening" ]; then
   owner=$(cat "$FAKE_DIR/listening")
@@ -2724,11 +2714,50 @@ printf '%s\n' "$$" > "$FAKE_DIR/listening"; printf 'start\n' >> "$FAKE_DIR/event
 trap '[ "$FAKE_SCENARIO" = stubborn-child ] || { rm -f "$FAKE_DIR/listening"; printf "reaped\n" >> "$FAKE_DIR/events"; exit 0; }' TERM INT
 while :; do sleep 1; done
 `)
+			write("lsof", `#!/bin/sh
+case "$*" in
+  *"-iTCP@127.0.0.1:$FAKE_PORT"*|*"-iTCP@127.0.0.1:$FAKE_RAFT_PORT"*)
+    [ -e "$FAKE_DIR/listening" ] || exit 1
+    owner=$(cat "$FAKE_DIR/listening")
+    [ "$owner" = forced ] && owner=999
+    if [ "$owner" != 999 ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$FAKE_DIR/listening"
+      exit 1
+    fi
+    printf '%s\n' "$owner"
+    exit 0
+    ;;
+esac
+exit 1
+`)
+			write("ps", `#!/bin/sh
+for value in "$@"; do pid=$value; done
+group=$(cat "$FAKE_DIR/forward-pgid" 2>/dev/null || true)
+listener=$(cat "$FAKE_DIR/listening" 2>/dev/null || true)
+if [ "$pid" = "$group" ] || { [ "$pid" = "$listener" ] && [ "$listener" != forced ]; }; then
+  printf ' %s\n' "$group"
+else
+  printf ' %s\n' "$pid"
+fi
+`)
+			write("setsid", `#!/bin/sh
+printf '%s\n' "$$" > "$FAKE_DIR/forward-pgid"
+exec "$@"
+`)
 			fixture := `
 set -eu
 mode=run; out=$FAKE_DIR; pf_pids=''; context=synthetic; ns=synthetic; started=$(date +%s); pf_generation=0
 RHIZA_HOST_IMAGE=ghcr.io/mrchypark/rhiza-sql@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-port=$FAKE_PORT
+local_port_base=$FAKE_PORT
+port_voter0=$local_port_base
+port_voter1=$((local_port_base + 1))
+port_voter2=$((local_port_base + 2))
+port_learner=$((local_port_base + 3))
+port_raft_voter0=$((port_voter0 + 100))
+port_raft_voter1=$((port_voter1 + 100))
+port_raft_voter2=$((port_voter2 + 100))
+port_raft_learner=$((port_learner + 100))
+port=$port_voter0
 die() { printf '%s\n' "$*" >&2; exit 1; }
 k() {
   [ "$1" = get ] || return 97
@@ -2742,13 +2771,14 @@ k() {
 }
 ` + functions + `
 trap 'for pid in $pf_pids; do stop_forward "$pid" || true; done' EXIT
-[ "$FAKE_SCENARIO" != bind-conflict ] || printf 'forced\n' > "$FAKE_DIR/listening"
+[ "$FAKE_SCENARIO" != foreign-healthy-listener ] || printf 'forced\n' > "$FAKE_DIR/listening"
 forward rhiza-voter-0 "$port" uid-a
-case "$port" in 18080) first=$pf_18080;; 18081) first=$pf_18081;; 18082) first=$pf_18082;; 18083) first=$pf_18083;; esac
+case "$port" in "$port_voter0") first=$pf_voter0;; "$port_voter1") first=$pf_voter1;; "$port_voter2") first=$pf_voter2;; "$port_learner") first=$pf_learner;; esac
 [ "$FAKE_SCENARIO" != complete ] && [ "$FAKE_SCENARIO" != stubborn-child ] && exit 0
 forward rhiza-voter-0 "$port" uid-a
-case "$port" in 18080) second=$pf_18080;; 18081) second=$pf_18081;; 18082) second=$pf_18082;; 18083) second=$pf_18083;; esac
+case "$port" in "$port_voter0") second=$pf_voter0;; "$port_voter1") second=$pf_voter1;; "$port_voter2") second=$pf_voter2;; "$port_learner") second=$pf_learner;; esac
 [ "$first" != "$second" ]
+[ "$(cat "$FAKE_DIR/forward-pgid")" = "$second" ]
 ! kill -0 "$first" 2>/dev/null
 [ "$(printf '%s\n' $pf_pids | wc -l | tr -d ' ')" = 1 ]
 stop_forward "$second"
@@ -2756,7 +2786,7 @@ stop_forward "$second"
 [ ! -e "$FAKE_DIR/address-in-use" ]
 `
 			var occupiedServer *http.Server
-			if scenario.name == "bind-conflict" {
+			if scenario.name == "foreign-healthy-listener" {
 				occupiedServer = &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 					if request.URL.Path != "/healthz" {
 						http.NotFound(response, request)
@@ -2771,7 +2801,7 @@ stop_forward "$second"
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture)
 			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario.name,
-				"FAKE_TEST_BINARY="+testBinary, "RHIZA_CURL_HELPER=1", "FAKE_PORT="+strconv.Itoa(selectedPort))
+				"FAKE_TEST_BINARY="+testBinary, "RHIZA_CURL_HELPER=1", "FAKE_PORT="+strconv.Itoa(selectedPort), "FAKE_RAFT_PORT="+strconv.Itoa(selectedPort+100))
 			output, err := command.CombinedOutput()
 			code := 0
 			if err != nil {
@@ -2784,10 +2814,9 @@ stop_forward "$second"
 			if (code == 0) != (scenario.want == 0) {
 				t.Fatalf("exit=%d want=%d output=%s", code, scenario.want, output)
 			}
-			if scenario.name == "bind-conflict" {
-				health, healthErr := os.ReadFile(filepath.Join(dir, "health-ok"))
-				if healthErr != nil || string(health) != "ok\n" {
-					t.Fatalf("occupied listener health was not proven before PID failure: %q %v", health, healthErr)
+			if scenario.name == "foreign-healthy-listener" {
+				if _, healthErr := os.Stat(filepath.Join(dir, "health-ok")); !errors.Is(healthErr, os.ErrNotExist) {
+					t.Fatalf("foreign listener was used as port-forward readiness: %v", healthErr)
 				}
 			}
 		})
@@ -3440,7 +3469,7 @@ func TestQualificationSQLReceipt(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
-out=$1; seq=0
+out=$1; seq=0; port_voter0=28080; port_voter1=28081; port_voter2=28082; port_learner=28083
 die() { printf '%s\n' "$*" >&2; exit 1; }
 run() { [ "$1" = ack ] && [ "$2" = curl ] || exit 91; seq=1; [ "$3" = -fsS ] || exit 92; [ "$FAKE_CURL_EXIT" = 0 ] || exit "$FAKE_CURL_EXIT"; cp "$out/receipt.json" "$out/1-ack.stdout"; }
 metrics() { touch "$out/metrics"; }
@@ -3516,7 +3545,7 @@ esac
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
-out=$1; seq=0; active_fault=NetworkChaos/network-one
+out=$1; seq=0; active_fault=NetworkChaos/network-one; port_voter0=28080; port_voter1=28081; port_voter2=28082; port_learner=28083
 die() { printf '%s\n' "$*" >&2; exit 1; }
 metrics() { exit 97; }
 mode=run; context=synthetic; ns=synthetic
@@ -3540,8 +3569,8 @@ execute a1b2c3d4-network "INSERT INTO qualification VALUES (2,'network')"`, "fix
 	}
 	for _, name := range []string{
 		"1-ack.stdout", "1-ack.http-status", "1-ack.time-total", "1-ack.exit",
-		"network-failure-18080-request-status.stdout", "network-failure-18081-recovery-status.stdout",
-		"network-failure-18082-linearizable-read.stdout", "network-failure-fault.stdout",
+		"network-failure-28080-request-status.stdout", "network-failure-28081-recovery-status.stdout",
+		"network-failure-28082-linearizable-read.stdout", "network-failure-fault.stdout",
 		"network-failure-pods.stdout", "network-failure-endpoints.stdout", "network-failure-endpointslices.stdout",
 	} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
@@ -3620,7 +3649,7 @@ func TestQualificationCommittedResponseRequiresLiveInjectedFault(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := exec.Command("/bin/sh", "-c", `set -eu
-out=$1; seq=0; active_fault=NetworkChaos/network-one; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4
+out=$1; seq=0; active_fault=NetworkChaos/network-one; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; port_voter0=28080; port_voter1=28081; port_voter2=28082; port_learner=28083
 die() { printf '%s\n' "$*" >&2; exit 1; }
 curl() { output=''; while [ "$#" -gt 0 ]; do case "$1" in --output) output=$2; shift 2;; --write-out|--max-time|-H|-d) shift 2;; *) shift;; esac; done; printf '%s\n' '{"slot":2,"status":"committed"}' > "$output"; printf '200\n0.010\n'; }
 k() { cat "$out/fault.json"; }
@@ -3735,7 +3764,7 @@ func TestQualificationContainerKillRecovery(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
-out=$1; seq=0; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; active_fault=''
+out=$1; seq=0; ns=synthetic; RHIZA_RUN_ID=a1b2c3d4; active_fault=''; port_voter0=28080; port_voter1=28081; port_voter2=28082; port_learner=28083
 die() { printf '%s\n' "$*" >&2; exit 1; }
 run() { name=$1; shift; seq=$((seq+1)); printf '%s\n' "$name" >> "$out/order"; "$@" > "$out/$seq-$name.stdout"; }
 date() { fake_time=$(cat "$out/time" 2>/dev/null || printf 0); fake_time=$((fake_time+16)); printf '%s\n' "$fake_time" | tee "$out/time"; }
@@ -3783,7 +3812,7 @@ container_kill
 					t.Fatalf("actual branch: %v: %s", err, output)
 				}
 				order, err := os.ReadFile(filepath.Join(dir, "order"))
-				if err != nil || string(order) != "process-before\ninjected\nrestart-evidence\nfault-delete\nvoters-ready\nack\nafter\nmetrics\nbarrier-18080\nbarrier-18081\nbarrier-18082\n" {
+				if err != nil || string(order) != "process-before\ninjected\nrestart-evidence\nfault-delete\nvoters-ready\nack\nafter\nmetrics\nbarrier-28080\nbarrier-28081\nbarrier-28082\n" {
 					t.Fatalf("wrong one-shot recovery order: %s (%v)", order, err)
 				}
 			} else {
@@ -3853,7 +3882,7 @@ func TestQualificationNetworkRecoveryWaitsForVoters(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
-out=$1; seq=0; RHIZA_RUN_ID=a1b2c3d4; active_fault='NetworkChaos/network-one'; started=900; mode=run
+out=$1; seq=0; RHIZA_RUN_ID=a1b2c3d4; active_fault='NetworkChaos/network-one'; started=900; mode=run; port_voter0=28080; port_voter1=28081; port_voter2=28082; port_learner=28083
 [ "$FAKE_SCENARIO" != budget-exhausted ] || forward_deadline=999
 run() { name=$1; shift; printf '%s\n' "$name" >> "$out/order"; "$@"; }
 fault() { [ "$*" = 'NetworkChaos partition network-one' ] || exit 91; printf '%s\n' fault >> "$out/order"; }
@@ -3877,7 +3906,7 @@ metrics() { printf '%s\n' metrics >> "$out/order"; }
 				if err != nil {
 					t.Fatalf("actual branch: %v: %s", err, output)
 				}
-				want := "fault\nexecute\nrecovered\nfault-delete\nvoters-ready\nreadback-18080\nreadback-18081\nreadback-18082\nmetrics\n"
+				want := "fault\nexecute\nrecovered\nfault-delete\nvoters-ready\nreadback-28080\nreadback-28081\nreadback-28082\nmetrics\n"
 				if string(order) != want {
 					t.Fatalf("wrong network recovery order: %s", order)
 				}
@@ -4036,7 +4065,7 @@ curl() {
   esac
 }
 `+string(source[start:end])+`
-post_network_readback 18080 '[[1,"before"],[2,"network"]]'`, "fixture", dir)
+post_network_readback 28080 '[[1,"before"],[2,"network"]]'`, "fixture", dir)
 			command.Env = append(os.Environ(), "FAKE_SCENARIO="+scenario.name)
 			output, err := command.CombinedOutput()
 			if ctx.Err() != nil {
@@ -4061,7 +4090,7 @@ post_network_readback 18080 '[[1,"before"],[2,"network"]]'`, "fixture", dir)
 				if string(attempts) != "2\n" {
 					t.Fatalf("transient 503 attempts=%s", attempts)
 				}
-				for _, name := range []string{"1-post-network-readback-18080-attempt-1.stdout", "1-post-network-readback-18080-attempt-1.http-status", "1-post-network-readback-18080-attempt-1.exit"} {
+				for _, name := range []string{"1-post-network-readback-28080-attempt-1.stdout", "1-post-network-readback-28080-attempt-1.http-status", "1-post-network-readback-28080-attempt-1.exit"} {
 					if _, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil {
 						t.Fatalf("first 503 evidence missing: %s: %v", name, statErr)
 					}
