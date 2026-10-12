@@ -154,6 +154,7 @@ data_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-gcs]
 oidc="assertion.repository_id == '${RHIZA_GITHUB_REPOSITORY_ID:-0}' && assertion.repository_owner_id == '${RHIZA_GITHUB_OWNER_ID:-0}' && assertion.ref == 'refs/heads/main' && assertion.event_name == 'workflow_dispatch' && assertion.workflow_ref == '${RHIZA_GITHUB_WORKFLOW_REF:-unused}' && assertion.workflow_sha == '$RHIZA_WORKFLOW_SHA' && assertion.environment == '${RHIZA_GITHUB_ENVIRONMENT:-unused}'"
 mapping='google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref,attribute.event_name=assertion.event_name,attribute.workflow_ref=assertion.workflow_ref,attribute.workflow_sha=assertion.workflow_sha,attribute.environment=assertion.environment'
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+. "$script_dir/cluster-metadata-projection.sh"
 render() {
     runtime_kind=User; runtime_name=$ci
     runtime_api_group='    apiGroup: rbac.authorization.k8s.io'; runtime_namespace=
@@ -182,7 +183,6 @@ validate_github_repository_identity() {
       type=="object" and .id==$repository_id and (.owner|type)=="object" and .owner.id==$owner_id
     ' "$1" >/dev/null
 }
-cluster_format='json(name,location,endpoint,masterAuth.clusterCaCertificate,nodePools.name,nodePools.config.workloadMetadataConfig.mode)'
 sanitize_cluster_identity() (
     projected=$1; output=$2
     ca_file=$projected.ca; safe_tmp=$output.tmp
@@ -225,8 +225,14 @@ capture_cluster_identity() (
     clear_projected_cluster() { rm -f "$private_prefix.json"; }
     trap clear_projected_cluster 0
     trap 'exit 130' HUP INT TERM
-    g container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" --format="$cluster_format" > "$private_prefix.json" 2>/dev/null || return 1
-    sanitize_cluster_identity "$private_prefix.json" "$RHIZA_AUTH_STATE/cluster-identity.json"
+    capture_cluster_metadata_projection "$private_prefix.json" "$RHIZA_AUTH_STATE/cluster-identity-projection-failure.json" \
+      g container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" || return $?
+    sanitizer_exit=0
+    sanitize_cluster_identity "$private_prefix.json" "$RHIZA_AUTH_STATE/cluster-identity.json" || sanitizer_exit=$?
+    if [ "$sanitizer_exit" != 0 ]; then
+        write_cluster_metadata_failure "$RHIZA_AUTH_STATE/cluster-identity-projection-failure.json" sanitizer "$sanitizer_exit" || return 1
+        return "$sanitizer_exit"
+    fi
 )
 project_kube_context() {
     jq -e --arg context "$RHIZA_KUBE_CONTEXT" '
@@ -421,9 +427,14 @@ mint_local() (
     }
     trap clear_local_mint 0
     trap 'exit 130' HUP INT TERM
-    g container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" --format="$cluster_format" \
-      > "$RHIZA_AUTH_STATE/.mint-cluster-private.json" 2>/dev/null || die 'Cluster metadata projection failed (payload omitted)'
-    sanitize_cluster_identity "$RHIZA_AUTH_STATE/.mint-cluster-private.json" "$RHIZA_AUTH_STATE/mint-cluster.json" || die 'Cluster metadata projection rejected'
+    capture_cluster_metadata_projection "$RHIZA_AUTH_STATE/.mint-cluster-private.json" "$RHIZA_AUTH_STATE/mint-cluster-projection-failure.json" \
+      g container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" || die 'Cluster metadata projection failed (payload and diagnostics omitted)'
+    sanitizer_exit=0
+    sanitize_cluster_identity "$RHIZA_AUTH_STATE/.mint-cluster-private.json" "$RHIZA_AUTH_STATE/mint-cluster.json" || sanitizer_exit=$?
+    if [ "$sanitizer_exit" != 0 ]; then
+        write_cluster_metadata_failure "$RHIZA_AUTH_STATE/mint-cluster-projection-failure.json" sanitizer "$sanitizer_exit" || die 'Cluster metadata failure receipt rejected'
+        die 'Cluster metadata sanitizer failed (payload and diagnostics omitted)'
+    fi
     validate_cluster_metadata "$RHIZA_AUTH_STATE/mint-cluster.json"
     sha256_file "$RHIZA_AUTH_STATE/mint-cluster.json" > "$RHIZA_AUTH_STATE/mint-cluster.sha256"
     jq -n --argjson duration "$((mint_remaining - 30))" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",spec:{expirationSeconds:$duration}}' > "$RHIZA_AUTH_STATE/runtime-token-request.private"
@@ -715,7 +726,12 @@ if [ "$mode" = check-local-auth ]; then
     jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
     # Invoked indirectly through the synthetic record() wrapper.
     # shellcheck disable=SC2329
-    g() { [ "$*" = "container clusters describe $RHIZA_GKE_CLUSTER --location=$RHIZA_GKE_LOCATION --format=$cluster_format" ] || die 'Unexpected offline metadata command'; cat "$local_fixture/cluster.json"; }
+    g() {
+        [ "$*" = "container clusters describe $RHIZA_GKE_CLUSTER --location=$RHIZA_GKE_LOCATION --format=json" ] || return 97
+        [ "$fixture_case" != projection-gcloud ] || exit 51
+        [ "$fixture_case" != projection-jq ] || { printf '%s\n' 'not-json'; return 0; }
+        cat "$local_fixture/cluster.json"
+    }
     k() {
         [ "$*" = "create --raw /api/v1/namespaces/$ns/serviceaccounts/rhiza-runtime/token -f $RHIZA_AUTH_STATE/runtime-token-request.private" ] || die 'Unexpected offline token command'
         printf 'request\n' >> "$local_fixture/api-calls"
@@ -734,8 +750,8 @@ if [ "$mode" = check-local-auth ]; then
     [ "$(find "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" -type f -user "$(id -u)" -perm 0600 -print | wc -l | tr -d ' ')" = 2 ] || die 'Credential file mode regression'
     if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die 'Token renewal accepted'; fi
     [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'TokenRequest repeated'
-    for fixture_case in overlong short missing-token wrong-cluster missing-pool gce-mode ambiguous-pool symlink-cluster native-failure; do
-        rm -f "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls" "$local_fixture/mint-cluster.sha256" "$local_fixture/mint-cluster.json"
+    for fixture_case in overlong short missing-token projection-gcloud projection-jq projection-secret wrong-cluster missing-pool gce-mode ambiguous-pool symlink-cluster native-failure; do
+        rm -f "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls" "$local_fixture/mint-cluster.sha256" "$local_fixture/mint-cluster.json" "$local_fixture/mint-cluster-projection-failure.json"
         jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
         rm -f "$local_fixture/cluster.json"
         jq -n --arg name "$RHIZA_GKE_CLUSTER" --arg location "$RHIZA_GKE_LOCATION" '{name:$name,location:$location,endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"},nodePools:["pool-a","pool-b","pool-c"]|map({name:.,config:{workloadMetadataConfig:{mode:"GKE_METADATA"}}})}' > "$local_fixture/cluster.json"
@@ -743,6 +759,7 @@ if [ "$mode" = check-local-auth ]; then
             overlong) jq --arg expiry "$(stamp "$((fixture_now + 3600))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             short) jq --arg expiry "$(stamp "$((fixture_now + 1800))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             missing-token) jq 'del(.status.token)' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
+            projection-secret) jq '.masterAuth.clientKey="DO_NOT_RECORD_GKE_KEY" | .masterAuth.clientCertificate="DO_NOT_RECORD_GKE_CERT" | .masterAuth.token="DO_NOT_RECORD_GKE_TOKEN" | .masterAuth.exec={command:"DO_NOT_RECORD_GKE_EXEC"} | .masterAuth.authProvider={name:"DO_NOT_RECORD_GKE_AUTH_PROVIDER"}' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
             wrong-cluster) jq '.name="other-cluster"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
             missing-pool) jq '.nodePools=[.nodePools[1],.nodePools[2]]' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
             gce-mode) jq '.nodePools[1].config.workloadMetadataConfig.mode="GCE_METADATA"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
@@ -750,9 +767,30 @@ if [ "$mode" = check-local-auth ]; then
             symlink-cluster) ln -s "$local_fixture/mint-cluster-target.json" "$local_fixture/mint-cluster.json" ;;
         esac
         if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die "Local negative accepted: $fixture_case"; fi
+        if [ -f "$local_fixture/mint-cluster-projection-failure.json" ]; then
+            if grep -Eq 'DO_NOT_RECORD|FAKE-OFFLINE-CA|not-json' "$local_fixture/mint-cluster-projection-failure.json"; then die 'Cluster projection failure leaked payload'; fi
+            case "$fixture_case" in
+                projection-gcloud) expected_stage=gcloud; expected_exit=51 ;;
+                projection-jq|projection-secret) expected_stage=jq; expected_exit= ;;
+                wrong-cluster|missing-pool|gce-mode|ambiguous-pool) expected_stage=sanitizer; expected_exit=1 ;;
+                symlink-cluster) expected_stage=; expected_exit= ;;
+                *) expected_stage=; expected_exit= ;;
+            esac
+            if [ -n "$expected_stage" ]; then
+                if [ -n "$expected_exit" ]; then
+                    jq -e --arg stage "$expected_stage" --argjson exit "$expected_exit" \
+                      '.stage==$stage and .exit==$exit and .reason=="cluster metadata projection failed; payload and diagnostics omitted"' \
+                      "$local_fixture/mint-cluster-projection-failure.json" >/dev/null || die 'Cluster projection failure stage lost'
+                else
+                    jq -e --arg stage "$expected_stage" \
+                      '.stage==$stage and (.exit|type)=="number" and .exit>0 and .reason=="cluster metadata projection failed; payload and diagnostics omitted"' \
+                      "$local_fixture/mint-cluster-projection-failure.json" >/dev/null || die 'Cluster projection failure stage lost'
+                fi
+            fi
+        fi
         [ ! -e "$local_fixture/runtime.token" ] && [ ! -e "$local_fixture/runtime.kubeconfig" ] && [ ! -e "$local_fixture/runtime-token-response.private" ] && [ ! -e "$local_fixture/runtime-token-request.private" ] || die 'Failure retained credential bytes'
         expected_requests=1
-        case "$fixture_case" in wrong-cluster|missing-pool|gce-mode|ambiguous-pool|symlink-cluster) expected_requests=0 ;; esac
+        case "$fixture_case" in projection-gcloud|projection-jq|projection-secret|wrong-cluster|missing-pool|gce-mode|ambiguous-pool|symlink-cluster) expected_requests=0 ;; esac
         actual_requests=0; [ ! -e "$local_fixture/api-calls" ] || actual_requests=$(wc -l < "$local_fixture/api-calls" | tr -d ' ')
         [ "$actual_requests" = "$expected_requests" ] || die 'Negative request count regression'
         [ "$fixture_case" != native-failure ] || [ "$(cat "$local_fixture/runtime-token-request.exit")" = 56 ] || die 'Native failure lost'

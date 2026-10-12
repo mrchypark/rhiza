@@ -72,6 +72,12 @@ environment, and a fresh CI service-account ID. The bootstrap verifies the GCP
 project ID/number and, in federation mode, the repository/owner IDs and workflow
 file before creating cloud resources.
 
+Cluster discovery requests portable full JSON and streams it directly through a
+strict field projection. Raw cluster metadata, CA bodies, client credentials,
+tokens, and command-based auth fields are never written to receipts or logs;
+receipts contain only the selected endpoint, CA hash, cluster/location, node-pool
+metadata, or a generic failed stage and native exit code.
+
 With those variables exported, including fresh `RHIZA_OUTPUT` and the planned
 exact SHA inputs, review the offline render first:
 

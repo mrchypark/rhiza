@@ -12,6 +12,7 @@ case "$requested_mode" in render|run|run-local|check-shutdown) mode=$requested_m
   *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;;
 esac
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+. "$script_dir/cluster-metadata-projection.sh"
 die() { printf '%s\n' "$*" >&2; exit 1; }
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -253,7 +254,6 @@ validate_node_pool_metadata() {
           ($selected|length)==1 and $selected[0].workloadMetadataMode=="GKE_METADATA"))
   ' "$1" >/dev/null
 }
-cluster_metadata_format='json(name,location,endpoint,masterAuth.clusterCaCertificate,nodePools.name,nodePools.config.workloadMetadataConfig.mode)'
 sanitize_cluster_metadata() (
   projected=$1; output=$2
   ca_file=$projected.ca; safe_tmp=$output.tmp
@@ -292,11 +292,16 @@ prepare_cluster_metadata() {
       rmdir "$cluster_metadata_tmp"
     }
     trap cleanup_cluster_metadata_tmp 0 HUP INT TERM
-    gcloud --project="$RHIZA_GCP_PROJECT_ID" --quiet container clusters describe "$RHIZA_GKE_CLUSTER" \
-      --location="$RHIZA_GKE_LOCATION" --format="$cluster_metadata_format" > "$cluster_metadata_projected" 2>/dev/null || return $?
-    chmod 600 "$cluster_metadata_projected"
+    capture_cluster_metadata_projection "$cluster_metadata_projected" "$out/cluster-metadata-projection-failure.json" \
+      gcloud --project="$RHIZA_GCP_PROJECT_ID" --quiet container clusters describe "$RHIZA_GKE_CLUSTER" \
+      --location="$RHIZA_GKE_LOCATION" || return $?
     RHIZA_CLUSTER_METADATA="$out/cluster-metadata-validation.json"
-    sanitize_cluster_metadata "$cluster_metadata_projected" "$RHIZA_CLUSTER_METADATA" || return 1
+    sanitizer_exit=0
+    sanitize_cluster_metadata "$cluster_metadata_projected" "$RHIZA_CLUSTER_METADATA" || sanitizer_exit=$?
+    if [ "$sanitizer_exit" != 0 ]; then
+      write_cluster_metadata_failure "$out/cluster-metadata-projection-failure.json" sanitizer "$sanitizer_exit" || return 1
+      return "$sanitizer_exit"
+    fi
     validate_cluster_metadata "$RHIZA_CLUSTER_METADATA" || return 1
     sha256_file "$RHIZA_CLUSTER_METADATA" > "$out/cluster-metadata-validation.sha256"
     cleanup_cluster_metadata_tmp

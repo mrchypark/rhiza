@@ -4588,6 +4588,10 @@ func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	projection, err := os.ReadFile("../cluster-metadata-projection.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
 	start := strings.Index(string(source), "\nvalidate_cluster_metadata() {\n")
 	end := strings.Index(string(source), "\nwait_voters() (\n")
 	privateStart := strings.Index(string(source), "\nprivate_file() {\n")
@@ -4597,7 +4601,7 @@ func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
 	if start < 0 || end <= start || privateStart < 0 || privateEnd <= privateStart || helperStart < 0 || helperEnd <= helperStart {
 		t.Fatal("cluster metadata preparation functions missing")
 	}
-	for _, scenario := range []string{"caller-ignored", "credential-fields", "describe-failure"} {
+	for _, scenario := range []string{"full-json-compatible", "credential-fields", "describe-failure", "jq-failure", "sanitizer-failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -4608,16 +4612,20 @@ func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
 				t.Fatal(err)
 			}
 			gcloud := `#!/bin/sh
-[ "$*" = '--project=example-project --quiet container clusters describe test-cluster --location=test-region1 --format=json(name,location,endpoint,masterAuth.clusterCaCertificate,nodePools.name,nodePools.config.workloadMetadataConfig.mode)' ] || exit 97
+[ "$*" = '--project=example-project --quiet container clusters describe test-cluster --location=test-region1 --format=json' ] || exit 97
 [ "$FAKE_SCENARIO" != describe-failure ] || exit 53
+[ "$FAKE_SCENARIO" != jq-failure ] || { printf '%s\n' 'not-json'; exit 0; }
 cat "$FAKE_CLUSTER"
 `
 			if err := os.WriteFile(filepath.Join(bin, "gcloud"), []byte(gcloud), 0700); err != nil {
 				t.Fatal(err)
 			}
-			cluster := `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
+			cluster := `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca","clientKey":"","clientCertificate":""},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
 			if scenario == "credential-fields" {
-				cluster = `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca","clientKey":"DO_NOT_RECORD_GKE_KEY","clientCertificate":"DO_NOT_RECORD_GKE_CERT"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
+				cluster = `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca","clientKey":"DO_NOT_RECORD_GKE_KEY","clientCertificate":"DO_NOT_RECORD_GKE_CERT","token":"DO_NOT_RECORD_GKE_TOKEN","exec":{"command":"DO_NOT_RECORD_GKE_EXEC"},"authProvider":{"name":"DO_NOT_RECORD_GKE_AUTH_PROVIDER"}},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
+			}
+			if scenario == "sanitizer-failure" {
+				cluster = `{"name":"wrong-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"DO_NOT_RECORD_GKE_CA"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
 			}
 			clusterPath := filepath.Join(dir, "fresh.json")
 			if err := os.WriteFile(clusterPath, []byte(cluster), 0600); err != nil {
@@ -4627,6 +4635,14 @@ cat "$FAKE_CLUSTER"
 			if err := os.WriteFile(callerPath, []byte(`{"nodePools":[]}`), 0600); err != nil {
 				t.Fatal(err)
 			}
+			if scenario == "full-json-compatible" {
+				limited := exec.Command(filepath.Join(bin, "gcloud"), "--project=example-project", "--quiet", "container", "clusters", "describe", "test-cluster", "--location=test-region1", "--format=json(name,location,endpoint,masterAuth.clusterCaCertificate,nodePools.name,nodePools.config.workloadMetadataConfig.mode)")
+				limited.Env = append(os.Environ(), "FAKE_SCENARIO="+scenario, "FAKE_CLUSTER="+clusterPath)
+				var exited *exec.ExitError
+				if err := limited.Run(); !errors.As(err, &exited) || exited.ExitCode() != 97 {
+					t.Fatalf("limited gcloud projection incompatibility not reproduced: %v", err)
+				}
+			}
 			fixture := `
 mode=run; out="$FAKE_DIR"; RHIZA_CLUSTER_METADATA="$FAKE_CALLER"
 RHIZA_NODE_A=gke-test-cluster-fixture-a; RHIZA_NODE_B=gke-test-cluster-fixture-b; RHIZA_NODE_C=gke-test-cluster-fixture-c
@@ -4634,11 +4650,11 @@ prepare_cluster_metadata || exit $?
 [ "$RHIZA_CLUSTER_METADATA" = "$FAKE_DIR/cluster-metadata-validation.json" ] || exit 96
 touch "$FAKE_DIR/metadata-pod-created"
 `
-			command := exec.Command("/bin/sh", "-c", string(source[helperStart:helperEnd])+string(source[privateStart:privateEnd])+string(source[start:end])+fixture)
+			command := exec.Command("/bin/sh", "-c", string(projection)+string(source[helperStart:helperEnd])+string(source[privateStart:privateEnd])+string(source[start:end])+fixture)
 			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario,
 				"FAKE_CLUSTER="+clusterPath, "FAKE_CALLER="+callerPath, "TMPDIR="+dir)
 			output, runErr := command.CombinedOutput()
-			if scenario == "caller-ignored" {
+			if scenario == "full-json-compatible" {
 				if runErr != nil {
 					t.Fatalf("fresh CI metadata rejected: %v %s", runErr, output)
 				}
@@ -4651,17 +4667,36 @@ touch "$FAKE_DIR/metadata-pod-created"
 				}
 				return
 			}
-			if scenario == "credential-fields" {
+			if scenario == "credential-fields" || scenario == "jq-failure" || scenario == "sanitizer-failure" {
 				if runErr == nil {
-					t.Fatal("cluster credential fields reached a permanent receipt")
+					t.Fatalf("cluster projection failure accepted: %s", scenario)
 				}
 				if _, err := os.Stat(filepath.Join(dir, "metadata-pod-created")); !errors.Is(err, os.ErrNotExist) {
 					t.Fatal("credential-bearing metadata reached metadata pod creation")
 				}
-				for _, name := range []string{"cluster-metadata-validation.json", "cluster-metadata-validation.sha256"} {
-					if data, err := os.ReadFile(filepath.Join(dir, name)); err == nil && (bytes.Contains(data, []byte("DO_NOT_RECORD_GKE_KEY")) || bytes.Contains(data, []byte("DO_NOT_RECORD_GKE_CERT"))) {
+				for _, name := range []string{"cluster-metadata-validation.json", "cluster-metadata-validation.sha256", "cluster-metadata-projection-failure.json"} {
+					if data, err := os.ReadFile(filepath.Join(dir, name)); err == nil && bytes.Contains(data, []byte("DO_NOT_RECORD_GKE")) {
 						t.Fatalf("credential sentinel persisted in %s", name)
 					}
+				}
+				failure, err := os.ReadFile(filepath.Join(dir, "cluster-metadata-projection-failure.json"))
+				if err != nil || bytes.Contains(failure, []byte("synthetic-ca")) || bytes.Contains(failure, []byte("not-json")) {
+					t.Fatalf("sanitized failure receipt invalid: %v %q", err, failure)
+				}
+				var expectedStage string
+				switch scenario {
+				case "credential-fields", "jq-failure":
+					expectedStage = "jq"
+				case "sanitizer-failure":
+					expectedStage = "sanitizer"
+				}
+				var receipt struct {
+					Stage  string `json:"stage"`
+					Exit   int    `json:"exit"`
+					Reason string `json:"reason"`
+				}
+				if err := json.Unmarshal(failure, &receipt); err != nil || receipt.Stage != expectedStage || receipt.Exit == 0 || receipt.Reason == "" {
+					t.Fatalf("failure stage receipt mismatch: %v %+v", err, receipt)
 				}
 				if matches, _ := filepath.Glob(filepath.Join(dir, "rhiza-cluster-metadata.*")); len(matches) != 0 {
 					t.Fatalf("projected CI metadata/stderr survived rejection: %v", matches)
@@ -4677,6 +4712,14 @@ touch "$FAKE_DIR/metadata-pod-created"
 			}
 			if matches, _ := filepath.Glob(filepath.Join(dir, "rhiza-cluster-metadata.*")); len(matches) != 0 {
 				t.Fatalf("raw CI metadata/stderr survived failure: %v", matches)
+			}
+			failure, err := os.ReadFile(filepath.Join(dir, "cluster-metadata-projection-failure.json"))
+			var receipt struct {
+				Stage string `json:"stage"`
+				Exit  int    `json:"exit"`
+			}
+			if err != nil || json.Unmarshal(failure, &receipt) != nil || receipt.Stage != "gcloud" || receipt.Exit != 53 {
+				t.Fatalf("gcloud failure stage receipt invalid: %v %q", err, failure)
 			}
 		})
 	}
