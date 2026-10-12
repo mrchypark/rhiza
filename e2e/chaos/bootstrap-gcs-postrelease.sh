@@ -1648,7 +1648,7 @@ if owned "$tag"; then
       .description==$owner and .deleted==true and
       .includedPermissions==$created[0].includedPermissions and .stage==$created[0].stage
     ' "$RHIZA_AUTH_STATE/$tag-delete.json" >/dev/null || die 'Custom role delete receipt rejected'
-    verify_absent "$tag" g iam roles describe "$role" --format=json
+    verify_deleted_role "$tag" "$role"
 fi
 # Keep the project binding and its custom role until every other cloud object
 # has a terminal absence receipt; removing either earlier can strand cleanup.

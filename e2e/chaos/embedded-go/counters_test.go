@@ -1701,7 +1701,7 @@ func TestBootstrapRollbackKeepsAuthorityThroughCloudVerification(t *testing.T) {
 		`verify_absent ci g iam service-accounts describe`,
 		`record data-delete g iam service-accounts delete "$data_uid"`,
 		`wait_deleted_sa data`,
-		`verify_absent "$tag" g iam roles describe "$role" --format=json`,
+		`verify_deleted_role "$tag" "$role"`,
 		`record project-rollback g projects get-iam-policy`,
 		`record revoke-project g projects remove-iam-policy-binding`,
 		`tag='cluster-role'; role=$cluster_role`,
@@ -1795,40 +1795,46 @@ func TestBootstrapClusterRoleTerminalVerification(t *testing.T) {
 	}{
 		{"soft-deleted", `printf '%s\n' '{"name":"projects/p/roles/r","description":"owner","deleted":true,"includedPermissions":["p.one"],"stage":"GA"}'`, 0},
 		{"exact-not-found", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent.' >&2; return 7`, 0},
+		{"wrong-owner", `printf '%s\n' '{"name":"projects/p/roles/r","description":"other","deleted":true,"includedPermissions":["p.one"],"stage":"GA"}'`, 1},
+		{"wrong-name", `printf '%s\n' '{"name":"projects/p/roles/other","description":"owner","deleted":true,"includedPermissions":["p.one"],"stage":"GA"}'`, 1},
+		{"wrong-permissions", `printf '%s\n' '{"name":"projects/p/roles/r","description":"owner","deleted":true,"includedPermissions":["p.two"],"stage":"GA"}'`, 1},
 		{"not-deleted", `printf '%s\n' '{"name":"projects/p/roles/r","description":"owner","deleted":false,"includedPermissions":["p.one"],"stage":"GA"}'`, 1},
 		{"mixed-permission", `printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) NOT_FOUND: Role absent. PERMISSION_DENIED' >&2; return 7`, 1},
+		{"malformed", `printf '%s\n' '{'`, 1},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "cluster-role-create.json"), []byte(`{"name":"projects/p/roles/r","includedPermissions":["p.one"],"stage":"GA"}`), 0600); err != nil {
-				t.Fatal(err)
-			}
-			command := exec.Command("/bin/sh", "-c", `set -eu
+		for _, tag := range []string{"folder-role", "cluster-role"} {
+			t.Run(tag+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, tag+"-create.json"), []byte(`{"name":"projects/p/roles/r","includedPermissions":["p.one"],"stage":"GA"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				command := exec.Command("/bin/sh", "-c", `set -eu
 die() { printf '%s\n' "$*" >&2; exit 1; }
 owner=owner
 `+helper+`
 g() { `+tc.response+`; }
-verify_deleted_role cluster-role r
+verify_deleted_role `+tag+` r
 : > "$RHIZA_AUTH_STATE/after-terminal-check"
 `)
-			command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
-			output, runErr := command.CombinedOutput()
-			code := 0
-			if runErr != nil {
-				var exited *exec.ExitError
-				if !errors.As(runErr, &exited) {
-					t.Fatal(runErr)
+				command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
+				output, runErr := command.CombinedOutput()
+				code := 0
+				if runErr != nil {
+					var exited *exec.ExitError
+					if !errors.As(runErr, &exited) {
+						t.Fatal(runErr)
+					}
+					code = exited.ExitCode()
 				}
-				code = exited.ExitCode()
-			}
-			if code != tc.want {
-				t.Fatalf("exit=%d want=%d output=%s", code, tc.want, output)
-			}
-			_, markerErr := os.Stat(filepath.Join(dir, "after-terminal-check"))
-			if (markerErr == nil) != (tc.want == 0) {
-				t.Fatalf("continued=%t want=%t error=%v", markerErr == nil, tc.want == 0, markerErr)
-			}
-		})
+				if code != tc.want {
+					t.Fatalf("exit=%d want=%d output=%s", code, tc.want, output)
+				}
+				_, markerErr := os.Stat(filepath.Join(dir, "after-terminal-check"))
+				if (markerErr == nil) != (tc.want == 0) {
+					t.Fatalf("continued=%t want=%t error=%v", markerErr == nil, tc.want == 0, markerErr)
+				}
+			})
+		}
 	}
 }
 
