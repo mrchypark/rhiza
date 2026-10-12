@@ -534,32 +534,201 @@ func TestPipelineCompletesConcurrentSlots(t *testing.T) {
 	defer cancel()
 
 	type result struct {
-		slot Slot
-		err  error
+		slot     Slot
+		value    string
+		receipts []Receipt
+		err      error
 	}
 	results := make(chan result, 2)
 	start := make(chan struct{})
 	for _, value := range [][]byte{[]byte("first"), []byte("second")} {
 		go func(value []byte) {
 			<-start
-			slot, _, err := cores["n2"].Propose(ctx, value)
-			results <- result{slot: slot, err: err}
+			slot, receipts, err := cores["n2"].Propose(ctx, value)
+			results <- result{slot: slot, value: string(value), receipts: receipts, err: err}
 		}(value)
 	}
 	close(start)
-	seen := make(map[Slot]bool, 2)
+	returned := make(map[string]result, 2)
 	for range 2 {
 		result := <-results
 		if result.err != nil {
 			t.Fatalf("proposal slot %d failed: %v", result.slot, result.err)
 		}
-		seen[result.slot] = true
+		if _, duplicate := returned[result.value]; duplicate {
+			t.Fatalf("duplicate returned value %q", result.value)
+		}
+		returned[result.value] = result
 	}
-	if !seen[1] || !seen[2] {
-		t.Fatalf("completed slots=%v, want 1 and 2", seen)
+	if len(returned) != 2 || returned["first"].slot == returned["second"].slot || returned["first"].slot == 0 || returned["second"].slot == 0 {
+		t.Fatalf("returned slots first=%d second=%d, want distinct successful slots", returned["first"].slot, returned["second"].slot)
+	}
+	maxSlot := returned["first"].slot
+	if returned["second"].slot > maxSlot {
+		maxSlot = returned["second"].slot
+	}
+	for value, result := range returned {
+		certified, ok := cores["n2"].CertifiedValue(result.slot)
+		if !ok || string(certified.Value) != value || certified.Hash != sha256.Sum256([]byte(value)) {
+			t.Fatalf("returned value %q is not certified at slot %d: %+v", value, result.slot, certified)
+		}
+		if len(result.receipts) != 2 || !cores["n2"].IsQuorum(result.receipts) {
+			t.Fatalf("returned value %q receipts=%+v, want accepted quorum", value, result.receipts)
+		}
+		for _, receipt := range result.receipts {
+			if receipt.Slot != result.slot || !receipt.Accepted {
+				t.Fatalf("returned value %q receipt=%+v slot=%d", value, receipt, result.slot)
+			}
+		}
+	}
+	if err := cores["n2"].WaitTip(ctx, maxSlot); err != nil {
+		t.Fatal(err)
+	}
+	decisions, tip, err := cores["n2"].DecisionsFrom(1, int(maxSlot))
+	if err != nil || tip != maxSlot || Slot(len(decisions)) != maxSlot {
+		t.Fatalf("contiguous prefix tip=%d decisions=%d err=%v", tip, len(decisions), err)
+	}
+	seen := make(map[string]struct{}, len(decisions))
+	for _, decision := range decisions {
+		if _, duplicate := seen[string(decision.Value)]; duplicate {
+			t.Fatalf("duplicate certified prefix value %q", decision.Value)
+		}
+		seen[string(decision.Value)] = struct{}{}
+		if sha256.Sum256(decision.Value) != decision.Hash {
+			t.Fatalf("certified prefix hash mismatch at slot %d", decision.Slot)
+		}
+	}
+	for value := range returned {
+		if _, ok := seen[value]; !ok {
+			t.Fatalf("returned value %q missing from certified prefix", value)
+		}
+	}
+}
+
+func TestPipelineCompletesConcurrentSlotsDeterministicGapRecovery(t *testing.T) {
+	cores, _ := newTestCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var firstPaused atomic.Bool
+	var releaseFirstOnce sync.Once
+	cleanupFirst := func() { releaseFirstOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(cleanupFirst)
+	firstCore := cores["n2"]
+	originalPriority := firstCore.priority
+	firstCore.priority = func() (Priority, error) {
+		if firstPaused.CompareAndSwap(false, true) {
+			close(firstEntered)
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return Priority{}, ctx.Err()
+			}
+		}
+		return originalPriority()
+	}
+
+	type result struct {
+		value    string
+		slot     Slot
+		receipts []Receipt
+		err      error
+	}
+	results := make(chan result, 2)
+	secondStart := make(chan struct{})
+	go func() {
+		slot, receipts, err := firstCore.Propose(ctx, []byte("first"))
+		results <- result{value: "first", slot: slot, receipts: receipts, err: err}
+	}()
+	go func() {
+		select {
+		case <-secondStart:
+		case <-ctx.Done():
+			return
+		}
+		slot, receipts, err := firstCore.Propose(ctx, []byte("second"))
+		results <- result{value: "second", slot: slot, receipts: receipts, err: err}
+	}()
+
+	// The first proposal has entered its local record path. Let slot 2 run
+	// while the original slot-1 recorder calls remain blocked.
+	select {
+	case <-firstEntered:
+	case <-ctx.Done():
+		t.Fatal("first proposal did not enter priority hook")
+	}
+	close(secondStart)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := cores["n2"].CertifiedValue(2); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("slot 2 did not certify while slot 1 was blocked")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if err := cores["n2"].WaitTip(ctx, 2); err != nil {
-		t.Fatal(err)
+		t.Fatalf("gap recovery did not advance through slot 2: %v", err)
+	}
+	firstDecision, ok := cores["n2"].CertifiedValue(1)
+	if !ok {
+		t.Fatal("slot 1 gap recovery decision missing")
+	}
+	barrier, err := DecodeReadBarrier(firstDecision.Value)
+	if err != nil || !barrier {
+		t.Fatalf("slot 1 recovery value is not a read barrier: value=%x err=%v", firstDecision.Value, err)
+	}
+	cleanupFirst()
+
+	byValue := make(map[string]result, 2)
+	for range 2 {
+		var result result
+		select {
+		case result = <-results:
+		case <-ctx.Done():
+			t.Fatal("proposal result wait exceeded context")
+		}
+		if result.err != nil {
+			t.Fatalf("proposal %s failed: %v", result.value, result.err)
+		}
+		byValue[result.value] = result
+	}
+	if byValue["first"].slot != 3 || byValue["second"].slot != 2 {
+		t.Fatalf("deterministic returned slots first=%d second=%d, want 3 and 2", byValue["first"].slot, byValue["second"].slot)
+	}
+	for _, result := range []result{byValue["first"], byValue["second"]} {
+		if len(result.receipts) != 2 {
+			t.Fatalf("%s receipts=%d, want quorum receipt count 2", result.value, len(result.receipts))
+		}
+		for _, receipt := range result.receipts {
+			if receipt.Slot != result.slot || !receipt.Accepted {
+				t.Fatalf("%s receipt=%+v slot=%d", result.value, receipt, result.slot)
+			}
+		}
+	}
+	decisions, tip, err := cores["n2"].DecisionsFrom(1, 3)
+	if err != nil || tip != 3 || len(decisions) != 3 {
+		t.Fatalf("contiguous prefix tip=%d decisions=%+v err=%v", tip, decisions, err)
+	}
+	if !slices.Equal(decisions[0].Value, firstDecision.Value) || string(decisions[1].Value) != "second" || string(decisions[2].Value) != "first" {
+		t.Fatalf("gap prefix values=%q,%q,%q", decisions[0].Value, decisions[1].Value, decisions[2].Value)
+	}
+	seen := make(map[string]struct{}, len(decisions))
+	for _, decision := range decisions {
+		if _, duplicate := seen[string(decision.Value)]; duplicate {
+			t.Fatalf("duplicate certified value %q", decision.Value)
+		}
+		seen[string(decision.Value)] = struct{}{}
+		if sha256.Sum256(decision.Value) != decision.Hash {
+			t.Fatalf("certified value hash mismatch at slot %d", decision.Slot)
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("unique certified values=%d, want 3", len(seen))
 	}
 }
 
