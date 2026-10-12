@@ -242,6 +242,10 @@ func TestQualificationIdentityChecksPrecedeMutation(t *testing.T) {
 		strings.Contains(string(source), `record cluster-identity g container clusters describe`) {
 		t.Fatal("full cluster metadata must not enter the receipt recorder")
 	}
+	if !strings.Contains(string(source), `describe_cluster_metadata() { exec gcloud --project="$project" --quiet "$@"; }`) ||
+		strings.Count(string(source), `describe_cluster_metadata container clusters describe`) != 2 {
+		t.Fatal("bootstrap cluster metadata producer must exec gcloud at both real call sites")
+	}
 }
 
 func TestQualificationLocalAuthSanitizesKubeEvidence(t *testing.T) {
@@ -4755,7 +4759,8 @@ exec sleep 30
 	script := `
 set -eu
 . "$HELPER"
-capture_cluster_metadata_projection "$OUT" "$FAILURE" "$PRODUCER"
+producer_wrapper() { exec "$PRODUCER" "$@"; }
+capture_cluster_metadata_projection "$OUT" "$FAILURE" producer_wrapper
 `
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()

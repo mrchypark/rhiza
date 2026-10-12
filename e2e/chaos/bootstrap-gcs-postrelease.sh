@@ -155,6 +155,7 @@ oidc="assertion.repository_id == '${RHIZA_GITHUB_REPOSITORY_ID:-0}' && assertion
 mapping='google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref,attribute.event_name=assertion.event_name,attribute.workflow_ref=assertion.workflow_ref,attribute.workflow_sha=assertion.workflow_sha,attribute.environment=assertion.environment'
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/cluster-metadata-projection.sh"
+describe_cluster_metadata() { exec gcloud --project="$project" --quiet "$@"; }
 render() {
     runtime_kind=User; runtime_name=$ci
     runtime_api_group='    apiGroup: rbac.authorization.k8s.io'; runtime_namespace=
@@ -226,7 +227,7 @@ capture_cluster_identity() (
     trap clear_projected_cluster 0
     trap 'exit 130' HUP INT TERM
     capture_cluster_metadata_projection "$private_prefix.json" "$RHIZA_AUTH_STATE/cluster-identity-projection-failure.json" \
-      g container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" || return $?
+      describe_cluster_metadata container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" || return $?
     sanitizer_exit=0
     sanitize_cluster_identity "$private_prefix.json" "$RHIZA_AUTH_STATE/cluster-identity.json" || sanitizer_exit=$?
     if [ "$sanitizer_exit" != 0 ]; then
@@ -428,7 +429,7 @@ mint_local() (
     trap clear_local_mint 0
     trap 'exit 130' HUP INT TERM
     capture_cluster_metadata_projection "$RHIZA_AUTH_STATE/.mint-cluster-private.json" "$RHIZA_AUTH_STATE/mint-cluster-projection-failure.json" \
-      g container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" || die 'Cluster metadata projection failed (payload and diagnostics omitted)'
+      describe_cluster_metadata container clusters describe "$RHIZA_GKE_CLUSTER" --location="$RHIZA_GKE_LOCATION" || die 'Cluster metadata projection failed (payload and diagnostics omitted)'
     sanitizer_exit=0
     sanitize_cluster_identity "$RHIZA_AUTH_STATE/.mint-cluster-private.json" "$RHIZA_AUTH_STATE/mint-cluster.json" || sanitizer_exit=$?
     if [ "$sanitizer_exit" != 0 ]; then
@@ -724,9 +725,9 @@ if [ "$mode" = check-local-auth ]; then
     if grep -q 'name: rhiza-runtime' "$local_fixture/ci.yaml"; then die 'Unused local KSA created in CI'; fi
     jq -n --arg name "$RHIZA_GKE_CLUSTER" --arg location "$RHIZA_GKE_LOCATION" '{name:$name,location:$location,endpoint:"127.0.0.1",masterAuth:{clusterCaCertificate:"FAKE-OFFLINE-CA"},nodePools:["pool-a","pool-b","pool-c"]|map({name:.,config:{workloadMetadataConfig:{mode:"GKE_METADATA"}}})}' > "$local_fixture/cluster.json"
     jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
-    # Invoked indirectly through the synthetic record() wrapper.
+    # Invoked indirectly by the projection capture fixture.
     # shellcheck disable=SC2329
-    g() {
+    describe_cluster_metadata() {
         [ "$*" = "container clusters describe $RHIZA_GKE_CLUSTER --location=$RHIZA_GKE_LOCATION --format=json" ] || return 97
         [ "$fixture_case" != projection-gcloud ] || exit 51
         [ "$fixture_case" != projection-jq ] || { printf '%s\n' 'not-json'; return 0; }
