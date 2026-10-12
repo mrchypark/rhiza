@@ -1231,30 +1231,46 @@ func TestQualificationRuntimeNetworkPolicyMutationDenied(t *testing.T) {
 	if start < 0 || end < 0 {
 		t.Fatal("runtime NetworkPolicy denial helper missing")
 	}
+	for _, invocation := range []string{
+		`reject_runtime_networkpolicy_mutation runtime-networkpolicy-delete-denied delete --dry-run=server -f "$out/inspector-networkpolicy-bootstrap.json" -o name`,
+		`reject_runtime_networkpolicy_mutation runtime-networkpolicy-replace-denied replace --dry-run=server -f "$out/inspector-networkpolicy-replacement.json" -o json`,
+		`reject_runtime_networkpolicy_mutation runtime-networkpolicy-additive-denied create --dry-run=server -f "$out/inspector-networkpolicy-additive.json" -o json`,
+	} {
+		if !strings.Contains(source, invocation) {
+			t.Fatalf("runtime NetworkPolicy mutation invocation missing %q", invocation)
+		}
+	}
 	helper := source[start : start+1+end]
 	for _, tc := range []struct {
-		name, outcome string
-		ok            bool
+		name, verb, output, expectedOutput, outcome string
+		ok                                          bool
 	}{
-		{"forbidden", "forbidden", true},
-		{"admitted", "admitted", false},
-		{"transport-failure", "transport", false},
+		{"delete-forbidden", "delete", "name", "name", "forbidden", true},
+		{"replace-forbidden", "replace", "json", "json", "forbidden", true},
+		{"create-forbidden", "create", "json", "json", "forbidden", true},
+		{"delete-unsupported-output", "delete", "json", "name", "forbidden", false},
+		{"delete-admitted", "delete", "name", "name", "admitted", false},
+		{"replace-transport-failure", "replace", "json", "json", "transport", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			fixture := `set -eu
-out=$1; seq=0; outcome=$2
+out=$1; seq=0; outcome=$2; expected_verb=$3; expected_output=$4
 die() { exit 97; }
 k() {
+	  [ "$1" = "$expected_verb" ] && [ "$2" = --dry-run=server ] && [ "$3" = -f ] &&
+	    [ "$4" = manifest ] && [ "$5" = -o ] && [ "$6" = "$expected_output" ] || {
+	    printf '%s\n' 'unexpected NetworkPolicy mutation argv' >&2; return 96
+	  }
   case "$outcome" in
-    forbidden) printf '%s\n' 'Error from server (Forbidden): networkpolicies is forbidden' >&2; return 1 ;;
+    forbidden) printf 'Error from server (Forbidden): cannot %s networkpolicies\n' "$expected_verb" >&2; return 1 ;;
     admitted) printf '%s\n' '{"kind":"NetworkPolicy"}'; return 0 ;;
     transport) printf '%s\n' 'connection reset by peer' >&2; return 1 ;;
   esac
 }
 ` + helper + `
-reject_runtime_networkpolicy_mutation mutation create --dry-run=server -f manifest -o json`
-			command := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, tc.outcome)
+reject_runtime_networkpolicy_mutation mutation ` + tc.verb + ` --dry-run=server -f manifest -o ` + tc.output
+			command := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, tc.outcome, tc.verb, tc.expectedOutput)
 			err := command.Run()
 			if (err == nil) != tc.ok {
 				t.Fatalf("outcome=%s success=%t want=%t error=%v", tc.outcome, err == nil, tc.ok, err)

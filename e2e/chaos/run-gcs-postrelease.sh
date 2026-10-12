@@ -1440,7 +1440,7 @@ jq -e --slurpfile canonical "$out/inspector-networkpolicy-bootstrap.json" '
 # credential incapable of replacing, deleting, or overlaying the isolation.
 jq '.spec.egress=[{}]' "$out/inspector-networkpolicy-bootstrap.json" > "$out/inspector-networkpolicy-replacement.json"
 jq -nc --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '{apiVersion:"networking.k8s.io/v1",kind:"NetworkPolicy",metadata:{name:"rhiza-inspector-additive-allow",namespace:$ns,labels:{"chaos.rhiza.io/run":$run}},spec:{podSelector:{matchLabels:{app:"rhiza-inspector","chaos.rhiza.io/run":$run}},policyTypes:["Egress"],egress:[{}]}}' > "$out/inspector-networkpolicy-additive.json"
-reject_runtime_networkpolicy_mutation runtime-networkpolicy-delete-denied delete --dry-run=server -f "$out/inspector-networkpolicy-bootstrap.json" -o json
+reject_runtime_networkpolicy_mutation runtime-networkpolicy-delete-denied delete --dry-run=server -f "$out/inspector-networkpolicy-bootstrap.json" -o name
 reject_runtime_networkpolicy_mutation runtime-networkpolicy-replace-denied replace --dry-run=server -f "$out/inspector-networkpolicy-replacement.json" -o json
 reject_runtime_networkpolicy_mutation runtime-networkpolicy-additive-denied create --dry-run=server -f "$out/inspector-networkpolicy-additive.json" -o json
 # Compile/admit the exact rendered runtime manifests without persistence.
