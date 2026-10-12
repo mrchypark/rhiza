@@ -539,8 +539,10 @@ validate_inspector_policy() {
     .metadata.uid==$created[0].metadata.uid and .metadata.labels=={"app":"rhiza-inspector","chaos.rhiza.io/run":$run} and
     .metadata.annotations=={"rhiza.dev/auth-owner":$owner} and
     (.metadata.ownerReferences // [])==[] and
-    .spec.podSelector.matchLabels=={"app":"rhiza-inspector","chaos.rhiza.io/run":$run} and
-    (.spec.policyTypes|sort)==["Egress","Ingress"] and .spec.ingress==[] and .spec.egress==[]
+    .spec.podSelector=={"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":$run}} and
+    (.spec.policyTypes|sort)==["Egress","Ingress"] and
+    ((.spec|has("ingress")|not) or .spec.ingress==null or .spec.ingress==[]) and
+    ((.spec|has("egress")|not) or .spec.egress==null or .spec.egress==[])
   ' "$policy" >/dev/null
 }
 validate_inspector_access() {

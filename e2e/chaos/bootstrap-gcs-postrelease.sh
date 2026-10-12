@@ -1293,7 +1293,7 @@ extract_created_identity() {
 verify_deleted_role() {
     tag=$1; role=$2
     role_exit=0
-    g iam roles describe "$role" --show-deleted --format=json > "$RHIZA_AUTH_STATE/$tag-terminal.json" 2> "$RHIZA_AUTH_STATE/$tag-terminal.stderr" || role_exit=$?
+    g iam roles describe "$role" --format=json > "$RHIZA_AUTH_STATE/$tag-terminal.json" 2> "$RHIZA_AUTH_STATE/$tag-terminal.stderr" || role_exit=$?
     printf '%s\n' "$role_exit" > "$RHIZA_AUTH_STATE/$tag-terminal.exit"
     if [ "$role_exit" = 0 ]; then
         jq -e --arg owner "$owner" --slurpfile created "$RHIZA_AUTH_STATE/$tag-create.json" '

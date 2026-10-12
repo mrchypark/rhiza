@@ -814,6 +814,8 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 		valid                      bool
 	}{
 		{"exact", ksa, bindings, bindings, policyJSON, true},
+		{"omitted-rules", ksa, bindings, bindings, strings.Replace(strings.Replace(policyJSON, `,"ingress":[]`, ``, 1), `,"egress":[]`, ``, 1), true},
+		{"null-rules", ksa, bindings, bindings, strings.Replace(strings.Replace(policyJSON, `"ingress":[]`, `"ingress":null`, 1), `"egress":[]`, `"egress":null`, 1), true},
 		{"ksa-annotation", strings.Replace(ksa, `"namespace":"ns"`, `"namespace":"ns","annotations":{"iam.gke.io/gcp-service-account":"x"}`, 1), bindings, bindings, policyJSON, false},
 		{"ksa-secret", strings.Replace(ksa, `,"automount`, `,"secrets":[{"name":"token"}],"automount`, 1), bindings, bindings, policyJSON, false},
 		{"rolebinding", ksa, `{"items":[{"subjects":[{"kind":"ServiceAccount","name":"rhiza-inspector","namespace":"ns"}]}]}`, bindings, policyJSON, false},
@@ -823,6 +825,13 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 		{"all-serviceaccounts", ksa, bindings, `{"items":[{"subjects":[{"kind":"Group","name":"system:serviceaccounts"}]}]}`, policyJSON, false},
 		{"authenticated", ksa, bindings, `{"items":[{"subjects":[{"kind":"Group","name":"system:authenticated"}]}]}`, policyJSON, false},
 		{"egress-open", ksa, bindings, bindings, strings.Replace(policyJSON, `"egress":[]`, `"egress":[{}]`, 1), false},
+		{"ingress-false", ksa, bindings, bindings, strings.Replace(policyJSON, `"ingress":[]`, `"ingress":false`, 1), false},
+		{"egress-object", ksa, bindings, bindings, strings.Replace(policyJSON, `"egress":[]`, `"egress":{}`, 1), false},
+		{"ingress-string", ksa, bindings, bindings, strings.Replace(policyJSON, `"ingress":[]`, `"ingress":"none"`, 1), false},
+		{"missing-policy-types", ksa, bindings, bindings, strings.Replace(policyJSON, `,"policyTypes":["Ingress","Egress"]`, ``, 1), false},
+		{"selector-expression", ksa, bindings, bindings, strings.Replace(policyJSON, `"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}`, `"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"},"matchExpressions":[]`, 1), false},
+		{"wrong-owner", ksa, bindings, bindings, strings.Replace(policyJSON, `rhiza-postrelease-a1b2c3d4-`, `wrong-a1b2c3d4-`, 1), false},
+		{"wrong-uid", ksa, bindings, bindings, strings.Replace(policyJSON, `"uid":"policy-created"`, `"uid":"other"`, 1), false},
 		{"selector-spoof", ksa, bindings, bindings, strings.Replace(policyJSON, `"app":"rhiza-inspector"`, `"app":"other"`, 1), false},
 	} {
 		paths := []string{"ksa", "rb", "crb", "policy"}
@@ -1812,7 +1821,15 @@ func TestBootstrapClusterRoleTerminalVerification(t *testing.T) {
 die() { printf '%s\n' "$*" >&2; exit 1; }
 owner=owner
 `+helper+`
-g() { `+tc.response+`; }
+g() {
+	case "$*" in
+		*--show-deleted*)
+			printf '%s\n' 'ERROR: (gcloud.iam.roles.describe) unrecognized arguments: --show-deleted' >&2
+			return 2
+			;;
+	esac
+	`+tc.response+`
+}
 verify_deleted_role `+tag+` r
 : > "$RHIZA_AUTH_STATE/after-terminal-check"
 `)
