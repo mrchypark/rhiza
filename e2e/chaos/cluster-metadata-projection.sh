@@ -1,7 +1,7 @@
 # shellcheck shell=sh
 # Sourced by the bootstrap and runtime harnesses; callers provide jq and a private output directory.
 project_cluster_metadata() {
-  jq -e '
+  exec jq -e '
     . as $cluster |
     select(([.. | objects | to_entries[] |
       select(
@@ -13,6 +13,35 @@ project_cluster_metadata() {
      masterAuth:{clusterCaCertificate:$cluster.masterAuth.clusterCaCertificate},
      nodePools:[$cluster.nodePools[]? | {name,config:{workloadMetadataConfig:{mode:.config.workloadMetadataConfig.mode}}}]}
   '
+}
+consume_cluster_metadata_projection() {
+  projected=$1; projection_status=$2
+  projector_pid=
+  # shellcheck disable=SC2329 # Invoked by trap.
+  cleanup_cluster_metadata_projector() {
+    [ -n "${projector_pid:-}" ] || return 0
+    kill -TERM "$projector_pid" 2>/dev/null || :
+    cleanup_wait=0
+    while kill -0 "$projector_pid" 2>/dev/null && [ "$cleanup_wait" -lt 2 ]; do
+      sleep 1
+      cleanup_wait=$((cleanup_wait + 1))
+    done
+    kill -KILL "$projector_pid" 2>/dev/null || :
+    wait "$projector_pid" 2>/dev/null || :
+  }
+  trap cleanup_cluster_metadata_projector 0
+  trap 'exit 130' HUP INT TERM
+  exec 3<&0
+  projection_exit=0
+  project_cluster_metadata <&3 3<&- > "$projected" 2>/dev/null &
+  projector_pid=$!
+  wait "$projector_pid" || projection_exit=$?
+  projector_pid=
+  # Keep the producer's pipe open through EOF so a projection error cannot
+  # turn its real exit into a misleading SIGPIPE 141.
+  cat <&3 >/dev/null
+  exec 3<&-
+  printf '%s\n' "$projection_exit" > "$projection_status"
 }
 write_cluster_metadata_failure() {
   failure=$1; stage=$2; code=$3
@@ -53,14 +82,7 @@ capture_cluster_metadata_projection() (
   mkfifo -m 600 "$fifo" || return 1
   "$@" --format=json > "$fifo" 2>/dev/null &
   producer_pid=$!
-  {
-    projection_exit=0
-    project_cluster_metadata > "$projected" 2>/dev/null || projection_exit=$?
-    # Keep the producer's pipe open through EOF so a projection error cannot
-    # turn its real exit into a misleading SIGPIPE 141.
-    cat >/dev/null
-    printf '%s\n' "$projection_exit" > "$projection_status"
-  } < "$fifo" &
+  consume_cluster_metadata_projection "$projected" "$projection_status" < "$fifo" &
   consumer_pid=$!
   consumer_exit=0
   wait "$consumer_pid" || consumer_exit=$?

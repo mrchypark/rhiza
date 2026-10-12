@@ -4744,12 +4744,14 @@ func TestQualificationClusterProjectionSignalCleanupIsBounded(t *testing.T) {
 	producerScript := `#!/bin/sh
 trap '' TERM
 printf '%s\n' "$PPID" > "$CAPTURE_PID_FILE"
-while :; do sleep 1; done
+printf '%s\n' "$$" > "$PRODUCER_PID_FILE"
+exec sleep 30
 `
 	if err := os.WriteFile(producer, []byte(producerScript), 0700); err != nil {
 		t.Fatal(err)
 	}
 	capturePIDFile := filepath.Join(dir, "capture.pid")
+	producerPIDFile := filepath.Join(dir, "producer.pid")
 	script := `
 set -eu
 . "$HELPER"
@@ -4758,7 +4760,7 @@ capture_cluster_metadata_projection "$OUT" "$FAILURE" "$PRODUCER"
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "/bin/sh", "-c", script)
-	command.Env = append(os.Environ(), "HELPER="+helper, "OUT="+filepath.Join(dir, "projected.json"), "FAILURE="+filepath.Join(dir, "failure.json"), "PRODUCER="+producer, "CAPTURE_PID_FILE="+capturePIDFile)
+	command.Env = append(os.Environ(), "HELPER="+helper, "OUT="+filepath.Join(dir, "projected.json"), "FAILURE="+filepath.Join(dir, "failure.json"), "PRODUCER="+producer, "CAPTURE_PID_FILE="+capturePIDFile, "PRODUCER_PID_FILE="+producerPIDFile)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	started := time.Now()
 	if err := command.Start(); err != nil {
@@ -4792,13 +4794,96 @@ capture_cluster_metadata_projection "$OUT" "$FAILURE" "$PRODUCER"
 	if !errors.As(runErr, &exited) || exited.ExitCode() != 130 {
 		t.Fatalf("signal cleanup exit mismatch: elapsed=%s err=%v", elapsed, runErr)
 	}
+	assertProcessExited(t, producerPIDFile, "producer")
 	for _, name := range []string{"projected.json", "failure.json"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("signal cleanup retained private projection artifact %s: %v", name, err)
 		}
 	}
 	if matches, _ := filepath.Glob(filepath.Join(dir, ".cluster-projection.*")); len(matches) != 0 {
+		entries, _ := os.ReadDir(matches[0])
+		t.Fatalf("signal cleanup retained private projection directory: %v entries=%v", matches, entries)
+	}
+}
+
+func TestQualificationClusterProjectionReapsTermIgnoringProjector(t *testing.T) {
+	helper, err := filepath.Abs("../cluster-metadata-projection.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	projector := filepath.Join(dir, "projector")
+	projectorScript := `#!/bin/sh
+trap '' TERM
+printf '%s\n' "$$" > "$PROJECTOR_PID_FILE"
+printf '%s\n' "$PPID" > "$CONSUMER_PID_FILE"
+exec sleep 30
+`
+	if err := os.WriteFile(projector, []byte(projectorScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	producer := filepath.Join(dir, "producer")
+	if err := os.WriteFile(producer, []byte("#!/bin/sh\nprintf '%s\\n' '{}'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	projectorPIDFile := filepath.Join(dir, "projector.pid")
+	consumerPIDFile := filepath.Join(dir, "consumer.pid")
+	script := `
+set -eu
+. "$HELPER"
+project_cluster_metadata() { exec "$PROJECTOR"; }
+capture_cluster_metadata_projection "$OUT" "$FAILURE" "$PRODUCER"
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+	command.Env = append(os.Environ(), "HELPER="+helper, "OUT="+filepath.Join(dir, "projected.json"), "FAILURE="+filepath.Join(dir, "failure.json"), "PROJECTOR="+projector, "PRODUCER="+producer, "PROJECTOR_PID_FILE="+projectorPIDFile, "CONSUMER_PID_FILE="+consumerPIDFile)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	started := time.Now()
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }()
+	consumerPID := waitForProcessPID(t, consumerPIDFile, "consumer")
+	if err := syscall.Kill(consumerPID, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	runErr := command.Wait()
+	elapsed := time.Since(started)
+	if ctx.Err() != nil || elapsed > 5*time.Second {
+		t.Fatalf("TERM-ignoring projector cleanup was not bounded: elapsed=%s err=%v", elapsed, runErr)
+	}
+	var exited *exec.ExitError
+	if !errors.As(runErr, &exited) || exited.ExitCode() != 130 {
+		t.Fatalf("projector signal cleanup exit mismatch: elapsed=%s err=%v", elapsed, runErr)
+	}
+	assertProcessExited(t, projectorPIDFile, "projector")
+	if matches, _ := filepath.Glob(filepath.Join(dir, ".cluster-projection.*")); len(matches) != 0 {
 		t.Fatalf("signal cleanup retained private projection directory: %v", matches)
+	}
+}
+
+func waitForProcessPID(t *testing.T, path, label string) int {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		output, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(output)))
+		if err == nil && pid > 0 {
+			return pid
+		}
+	}
+	t.Fatalf("%s PID was not observed", label)
+	return 0
+}
+
+func assertProcessExited(t *testing.T, path, label string) {
+	t.Helper()
+	pid := waitForProcessPID(t, path, label)
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("%s process %d remains after cleanup: %v", label, pid, err)
 	}
 }
 
