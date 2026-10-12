@@ -40,6 +40,57 @@ The CI workflow contains the exact image and cluster setup commands. The harness
 creates namespace `rhiza-chaos`; delete the disposable cluster after collecting
 results. Do not run it against a shared cluster.
 
+## GCS post-release qualification
+
+The GCS/Chaos harness has no cloud defaults. Keep project, cluster, bucket,
+service-account, node, context, local path, and object-prefix values outside the
+repository. Never commit private execution receipts or a populated environment
+file.
+
+Every run requires explicit values for `RHIZA_GCP_PROJECT_ID`,
+`RHIZA_GCP_PROJECT_NUMBER`, `RHIZA_GKE_CLUSTER`, `RHIZA_GKE_LOCATION`,
+`RHIZA_KUBE_CONTEXT`, `RHIZA_GCS_BUCKET`, `RHIZA_GCS_PREFIX`,
+`RHIZA_NAMESPACE`, `RHIZA_DATA_GSA_ID`, `RHIZA_NODE_A`, `RHIZA_NODE_B`,
+`RHIZA_NODE_C`, `RHIZA_HOST_IMAGE`, and `RHIZA_METADATA_IMAGE`. The prefix,
+namespace, and data service-account ID must contain the fresh eight-hex-digit
+`RHIZA_RUN_ID`; images must be immutable digests. Administrative execution also
+requires the reviewed generator path and digest, a fresh private absolute
+`RHIZA_AUTH_STATE`, the expected active account, explicit `I_APPROVE_NEW_SCOPE`,
+and the fixed KRW 10,000 safety ceiling. The ceiling is a limit, not a spending
+target. Use a fresh namespace and prefix and grant only the temporary
+project/cluster metadata and exact-prefix object permissions checked by the
+harness. Local bootstrap also requires `RHIZA_HARNESS_SHA`, set to the exact
+reviewed commit planned for this run. Federation uses the exact protected
+`RHIZA_WORKFLOW_SHA` instead. Runtime render and execution require a fresh
+absolute `RHIZA_OUTPUT` and `RHIZA_AUTH_CREATION_SHA`, the exact commit that
+created the reviewed authorization contract.
+
+Local-direct execution does not require GitHub credentials. Optional CI
+federation additionally requires `RHIZA_GITHUB_REPOSITORY`, its numeric
+repository and owner IDs, an exact workflow ref at the protected SHA, a protected
+environment, and a fresh CI service-account ID. The bootstrap verifies the GCP
+project ID/number and, in federation mode, the repository/owner IDs and workflow
+file before creating cloud resources.
+
+With those variables exported, including fresh `RHIZA_OUTPUT` and the planned
+exact SHA inputs, review the offline render first:
+
+```sh
+sh e2e/chaos/bootstrap-gcs-postrelease.sh render-local > /tmp/rhiza-auth-review.yaml
+sh e2e/chaos/run-gcs-postrelease.sh render
+```
+
+After reviewing scope, receipts, digests, expiry, and cost cap, direct execution
+uses `apply-local`, `mint-local`, and `run-local`; federation uses `apply` and
+`run`. These are one-shot operations: do not reuse an output or receipt
+directory, adopt colliding resources, or rerun after an unknown outcome.
+
+Always preserve evidence before cleanup. Run `rollback-local` for direct mode or
+`rollback` for federation mode with the exact original variables and receipt
+directory. Rollback verifies ownership and exact absence; a partial or ambiguous
+cleanup is a failure requiring manual investigation, not permission to delete a
+broader bucket, prefix, namespace, or account.
+
 ## Unattended Kubernetes backend qualification
 
 `automatic-operator-chaos` runs `automatic_recovery.py` in a separate disposable

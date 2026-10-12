@@ -34,6 +34,7 @@ func TestEmbeddedLifecycle(t *testing.T) {
 	_ = rhiza.Config{NodeID: "n1", DataDir: "data", Members: []rhiza.Member{{ID: "n1"}}, ObjStoreProvider: rhiza.ObjectStoreProviderFilesystem}
 	_ = rhiza.NodeID("n1")
 	_ = rhiza.ReplicaConfig{ReplicaID: "r1", DataDir: "replica", Members: []rhiza.ReplicaMember{{ID: "n1"}}, ObjStoreProvider: rhiza.ObjectStoreProviderS3}
+	_ = rhiza.ReplicaConfig{"", "", "", "", nil, 0, 0, 0, "", "", "", "", "", "", false, 0, "", "", "", "", "", "", "", "", "", "", ""}
 	_ = rhiza.Migration{Version: 1, Name: "schema", Statements: []rhiza.SQLStatement{{SQL: "CREATE TABLE t (id INTEGER)"}}}
 	_ = rhiza.SQLStatement{SQL: "UPDATE t SET id = id", ExpectedRowsAffected: &expectedOne}
 	_ = rhiza.RequestStatusRequest{Kind: rhiza.RequestKindSQL, RequestID: "request"}

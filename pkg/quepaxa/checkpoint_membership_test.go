@@ -3,6 +3,7 @@ package quepaxa
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -130,6 +131,9 @@ func TestCheckpointMembershipColdObserverRestoreAndRejectsTampering(t *testing.T
 	if observer.IsVoter() || observer.ConfigID() != 3 {
 		t.Fatalf("observer voter=%v config=%d", observer.IsVoter(), observer.ConfigID())
 	}
+	if prefix, ok := observer.PrefixHash(seal.Index); !ok || prefix != seal.PrefixHash || observer.Tip() != seal.Index {
+		t.Fatalf("restored observer prefix=%x ok=%v tip=%d", prefix, ok, observer.Tip())
+	}
 	if _, retired := observer.retiredIDs["c"]; !retired {
 		t.Fatal("restore lost retired member")
 	}
@@ -140,8 +144,39 @@ func TestCheckpointMembershipColdObserverRestoreAndRejectsTampering(t *testing.T
 	if err := observer.ValidateCheckpointBase(context.Background(), tampered, decision); err == nil {
 		t.Fatal("accepted tampered membership history")
 	}
+	membership = cloneMembershipRecord(*seal.Membership)
+	membership.Genesis.Members[0].PeerURL = "quic://tampered"
+	tampered.Membership = &membership
+	if err := observer.ValidateCheckpointBase(context.Background(), tampered, decision); err == nil {
+		t.Fatal("accepted tampered bootstrap peer URL")
+	}
 	if source.ConfigID() != 3 {
 		t.Fatal("source changed during observer restore")
+	}
+}
+
+func TestCheckpointMembershipModeMismatchFailsClosed(t *testing.T) {
+	_, _, initial, seal, decision := checkpointMembershipSource(t)
+	for _, enabled := range []bool{false, true} {
+		wal, err := qlog.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		observer, err := NewObserver(Config{NodeID: NodeID(fmt.Sprintf("observer-%t", enabled)), Cluster: initial, WAL: wal, EnableReconfiguration: enabled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observer.SetCheckpointValidator(func(context.Context, CheckpointSeal) error { return nil })
+		candidate := seal
+		if enabled {
+			candidate.Membership = nil
+		}
+		if err := observer.ValidateCheckpointBase(context.Background(), candidate, decision); err == nil {
+			t.Fatalf("mode enabled=%t accepted incompatible checkpoint", enabled)
+		}
+		if err := wal.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

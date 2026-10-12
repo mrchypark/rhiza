@@ -92,6 +92,70 @@ type blockingHeadUploadBucket struct {
 	release chan struct{}
 }
 
+type archiveSyncAdmissionBucket struct {
+	objstore.Bucket
+	headReads        atomic.Uint64
+	lockReads        atomic.Uint64
+	failHeadReads    atomic.Int64
+	invalidHeadGets  atomic.Int64
+	firstHead        chan struct{}
+	releaseFirstHead chan struct{}
+	recheckAt        uint64
+	recheckObserved  chan struct{}
+	failuresObserved chan struct{}
+	busyObserved     chan struct{}
+	firstHeadOnce    sync.Once
+	recheckOnce      sync.Once
+	failuresOnce     sync.Once
+	busyOnce         sync.Once
+}
+
+func (b *archiveSyncAdmissionBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		read := b.headReads.Add(1)
+		if read == 1 && b.firstHead != nil {
+			b.firstHeadOnce.Do(func() { close(b.firstHead) })
+			select {
+			case <-ctx.Done():
+				return objstore.ObjectAttributes{}, ctx.Err()
+			case <-b.releaseFirstHead:
+			}
+		}
+		if read == b.recheckAt && b.recheckObserved != nil {
+			b.recheckOnce.Do(func() { close(b.recheckObserved) })
+		}
+		for failures := b.failHeadReads.Load(); failures > 0; failures = b.failHeadReads.Load() {
+			if b.failHeadReads.CompareAndSwap(failures, failures-1) {
+				if failures == 1 && b.failuresObserved != nil {
+					b.failuresOnce.Do(func() { close(b.failuresObserved) })
+				}
+				return objstore.ObjectAttributes{}, errors.New("injected archive head read failure")
+			}
+		}
+	}
+	return b.Bucket.Attributes(ctx, name)
+}
+
+func (b *archiveSyncAdmissionBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	if strings.HasSuffix(name, "/archive/head.bin") {
+		for failures := b.invalidHeadGets.Load(); failures > 0; failures = b.invalidHeadGets.Load() {
+			if b.invalidHeadGets.CompareAndSwap(failures, failures-1) {
+				if failures == 1 && b.failuresObserved != nil {
+					b.failuresOnce.Do(func() { close(b.failuresObserved) })
+				}
+				return io.NopCloser(strings.NewReader("invalid archive head")), nil
+			}
+		}
+	}
+	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
+		b.lockReads.Add(1)
+		if b.busyObserved != nil {
+			b.busyOnce.Do(func() { close(b.busyObserved) })
+		}
+	}
+	return b.Bucket.Get(ctx, name)
+}
+
 var errArchiveTestCondition = errors.New("injected archive conditional conflict")
 
 type archiveExtentOutcomeBucket struct {
@@ -426,6 +490,326 @@ func TestSyncThroughCoalescesAlreadyDecidedSuffix(t *testing.T) {
 	}
 	if puts, blocks, heads, locks := bucket.puts.Load(), bucket.blockPuts.Load(), bucket.archiveHeadPuts.Load(), bucket.publicationLockPuts.Load(); puts != 4 || blocks != 1 || heads != 1 || locks != 2 {
 		t.Fatalf("object uploads=%d (blocks=%d heads=%d publication-lock=%d), want 4 (1/1/2)", puts, blocks, heads, locks)
+	}
+}
+
+func newArchiveSyncAdmissionManagers(t *testing.T) (context.Context, objstore.Bucket, *quepaxa.Core, *Manager, *Manager) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{
+		NodeID:  "n1",
+		Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}},
+		WAL:     wal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket := objstore.NewInMemBucket()
+	stale, writer := NewManager(bucket, "cluster", 1), NewManager(bucket, "cluster", 1)
+	t.Cleanup(stale.Close)
+	t.Cleanup(writer.Close)
+	if err := stale.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, bucket, core, stale, writer
+}
+
+func TestArchiveSyncThroughSkipsAdmissionForDurableTarget(t *testing.T) {
+	ctx, base, core, stale, writer := newArchiveSyncAdmissionManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("durable target")); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Tip()
+	if err := writer.SyncThrough(ctx, core, target); err != nil {
+		t.Fatal(err)
+	}
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	lease, err := holder.acquireArchiveLock(ctx, holder.publicationLockKey(), "durable-target-holder", archivePinLease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := holder.releaseArchiveLock(ctx, holder.publicationLockKey(), lease); err != nil {
+			t.Errorf("release publication lock: %v", err)
+		}
+	}()
+	observed := &archiveSyncAdmissionBucket{Bucket: base}
+	stale.bucket = observed
+	if err := stale.SyncThrough(ctx, core, target); err != nil {
+		t.Fatalf("covered target: %v", err)
+	}
+	if got := observed.lockReads.Load(); got != 0 {
+		t.Fatalf("publication lock reads=%d, want 0", got)
+	}
+}
+
+func TestArchiveSyncThroughBusyRecheckAcceptsOtherPublisher(t *testing.T) {
+	ctx, base, core, waiter, writer := newArchiveSyncAdmissionManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("published by lock holder")); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Tip()
+	holder := NewManager(base, "cluster", 1)
+	defer holder.Close()
+	held, publish, published, release := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	holderDone := make(chan error, 1)
+	var publishOnce, releaseOnce sync.Once
+	holderFinished := false
+	go func() {
+		holderDone <- holder.withPublicationLock(ctx, "busy-recheck-holder", func(workCtx context.Context) error {
+			close(held)
+			select {
+			case <-workCtx.Done():
+				return workCtx.Err()
+			case <-publish:
+			}
+			if err := writer.Load(workCtx); err != nil {
+				return err
+			}
+			if err := writer.syncNowLocked(workCtx, core, target); err != nil {
+				return err
+			}
+			close(published)
+			select {
+			case <-workCtx.Done():
+				return workCtx.Err()
+			case <-release:
+				return nil
+			}
+		})
+	}()
+	defer func() {
+		publishOnce.Do(func() { close(publish) })
+		releaseOnce.Do(func() { close(release) })
+		if !holderFinished {
+			<-holderDone
+		}
+	}()
+	select {
+	case <-held:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	observed := &archiveSyncAdmissionBucket{Bucket: base, busyObserved: make(chan struct{})}
+	waiter.bucket = observed
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- waiter.SyncThrough(ctx, core, target) }()
+	select {
+	case <-observed.busyObserved:
+		publishOnce.Do(func() { close(publish) })
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case <-published:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("busy recheck: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("waiter did not accept durable target while lock remained held: %v", ctx.Err())
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-holderDone; err != nil {
+		t.Fatal(err)
+	}
+	holderFinished = true
+}
+
+func TestArchiveSyncThroughBusyRecheckDoesNotFalseSucceed(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		seedLower       bool
+		failHeadReads   int64
+		invalidHeadGets int64
+	}{
+		{name: "head below target", seedLower: true},
+		{name: "head read failure", failHeadReads: 2},
+		{name: "head validation failure", seedLower: true, invalidHeadGets: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, base, core, waiter, writer := newArchiveSyncAdmissionManagers(t)
+			if _, _, err := core.Propose(ctx, []byte("lower")); err != nil {
+				t.Fatal(err)
+			}
+			if test.seedLower {
+				if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, _, err := core.Propose(ctx, []byte("required target")); err != nil {
+				t.Fatal(err)
+			}
+			target := core.Tip()
+			holder := NewManager(base, "cluster", 1)
+			defer holder.Close()
+			held, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			holderDone := make(chan error, 1)
+			holderFinished := false
+			go func() {
+				holderDone <- holder.withPublicationLock(ctx, "false-success-holder", func(workCtx context.Context) error {
+					close(held)
+					select {
+					case <-workCtx.Done():
+						return workCtx.Err()
+					case <-release:
+						return nil
+					}
+				})
+			}()
+			defer func() {
+				releaseOnce.Do(func() { close(release) })
+				if !holderFinished {
+					<-holderDone
+				}
+			}()
+			select {
+			case <-held:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			observed := &archiveSyncAdmissionBucket{
+				Bucket:           base,
+				failHeadReads:    atomic.Int64{},
+				invalidHeadGets:  atomic.Int64{},
+				recheckAt:        2,
+				recheckObserved:  make(chan struct{}),
+				failuresObserved: make(chan struct{}),
+			}
+			observed.failHeadReads.Store(test.failHeadReads)
+			observed.invalidHeadGets.Store(test.invalidHeadGets)
+			waiter.bucket = observed
+			waiterDone := make(chan error, 1)
+			go func() { waiterDone <- waiter.SyncThrough(ctx, core, target) }()
+			if test.failHeadReads > 0 || test.invalidHeadGets > 0 {
+				select {
+				case <-observed.failuresObserved:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			} else {
+				select {
+				case <-observed.recheckObserved:
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+			select {
+			case err := <-waiterDone:
+				t.Fatalf("uncovered target falsely succeeded before fencing: %v", err)
+			default:
+			}
+			releaseOnce.Do(func() { close(release) })
+			if err := <-holderDone; err != nil {
+				t.Fatal(err)
+			}
+			holderFinished = true
+			select {
+			case err := <-waiterDone:
+				if err != nil {
+					t.Fatalf("fenced publication: %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			reader := NewManager(base, "cluster", 1)
+			defer reader.Close()
+			if err := reader.Load(ctx); err != nil || reader.Tip() < target {
+				t.Fatalf("durable tip=%d want at least %d err=%v", reader.Tip(), target, err)
+			}
+		})
+	}
+}
+
+func TestArchiveSyncThroughCoveredBatchRetriesLateHigherWaiter(t *testing.T) {
+	ctx, base, core, stale, writer := newArchiveSyncAdmissionManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("covered lower target")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	observed := &archiveSyncAdmissionBucket{
+		Bucket:           base,
+		firstHead:        make(chan struct{}),
+		releaseFirstHead: make(chan struct{}),
+	}
+	var releaseFirstHeadOnce sync.Once
+	defer releaseFirstHeadOnce.Do(func() { close(observed.releaseFirstHead) })
+	stale.bucket = observed
+	lowDone := make(chan error, 1)
+	go func() { lowDone <- stale.SyncThrough(ctx, core, 1) }()
+	select {
+	case <-observed.firstHead:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if _, _, err := core.Propose(ctx, []byte("late higher target")); err != nil {
+		t.Fatal(err)
+	}
+	highTarget := core.Tip()
+	highDone := make(chan error, 1)
+	go func() { highDone <- stale.SyncThrough(ctx, core, highTarget) }()
+	deadline := time.After(5 * time.Second)
+	for {
+		stale.batchMu.Lock()
+		joined := stale.batch != nil && stale.batch.target >= highTarget
+		stale.batchMu.Unlock()
+		if joined {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("higher target did not join covered lower batch")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	releaseFirstHeadOnce.Do(func() { close(observed.releaseFirstHead) })
+	if err := <-lowDone; err != nil {
+		t.Fatalf("covered lower target: %v", err)
+	}
+	select {
+	case err := <-highDone:
+		if err != nil {
+			t.Fatalf("higher target: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	reader := NewManager(base, "cluster", 1)
+	defer reader.Close()
+	if err := reader.Load(ctx); err != nil || reader.Tip() < highTarget {
+		t.Fatalf("durable tip=%d want at least %d err=%v", reader.Tip(), highTarget, err)
+	}
+}
+
+func TestArchiveSyncThroughCoveredSealedTargetIsError(t *testing.T) {
+	ctx, base, core, stale, writer := newArchiveSyncAdmissionManagers(t)
+	if _, _, err := core.Propose(ctx, []byte("sealed target")); err != nil {
+		t.Fatal(err)
+	}
+	target := core.Tip()
+	if err := writer.SyncThrough(ctx, core, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := Seal(ctx, base, "cluster", "sealed-sync-test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.SyncThrough(ctx, core, target); !errors.Is(err, ErrArchiveSealed) {
+		t.Fatalf("sealed covered target error=%v, want ErrArchiveSealed", err)
 	}
 }
 
@@ -1806,8 +2190,8 @@ func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 13 || gets != 6 {
-		t.Fatalf("publish physical attributes=%d gets=%d, want 13/6 (archive head attributes=%d gets=%d, block gets=%d)", heads, gets, bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load())
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 14 || gets != 6 {
+		t.Fatalf("publish physical attributes=%d gets=%d, want 14/6 (archive head attributes=%d gets=%d, block gets=%d)", heads, gets, bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load())
 	}
 }
 

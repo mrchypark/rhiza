@@ -3,10 +3,11 @@ package rhiza
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"net/http"
 	"os"
 	"path"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/mrchypark/rhiza/internal/localtesthooks"
 	"github.com/mrchypark/rhiza/internal/objstore"
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/materializer"
@@ -70,27 +72,49 @@ type ReplicaConfig struct {
 	ObjStoreAzureUserAssignedID    string
 }
 
+// ReplicaHistoryVerificationConfig opts a replica observer into verification
+// of certified reconfiguration history using the exact public genesis identity.
+type ReplicaHistoryVerificationConfig struct {
+	BootstrapMembers []Member
+}
+
+type replicaHistoryVerification struct {
+	enabled          bool
+	bootstrapMembers []Member
+}
+
 type ReplicaStatus struct {
-	Mode        ReplicaMode
-	AppliedSlot uint64
-	SourceTip   uint64
-	LagSlots    uint64
-	Source      string
-	LastSync    time.Time
-	LastError   string
+	Mode                   ReplicaMode
+	AppliedSlot            uint64
+	SourceTip              uint64
+	LagSlots               uint64
+	Source                 string
+	LastSync               time.Time
+	LastError              string
+	CheckpointBaseSlot     uint64
+	CheckpointRootHash     string
+	CheckpointStateHash    string
+	CheckpointPrefixHash   string
+	ArchiveHeadVersionType string
+	ArchiveHeadVersion     string
+	RecoveryPinID          string
+	RecoveryPinsCreated    uint64
+	RecoveryPinsReleased   uint64
 }
 
 type replicaIdentity struct {
-	ClusterID string   `json:"cluster_id"`
-	ConfigID  uint     `json:"config_id"`
-	ReplicaID string   `json:"replica_id"`
-	Voters    []string `json:"voters"`
-	Provider  string   `json:"provider"`
-	Endpoint  string   `json:"endpoint"`
-	Bucket    string   `json:"bucket"`
-	Directory string   `json:"directory"`
-	Prefix    string   `json:"prefix"`
-	Account   string   `json:"account,omitempty"`
+	ClusterID                    string   `json:"cluster_id"`
+	ConfigID                     uint     `json:"config_id"`
+	ReplicaID                    string   `json:"replica_id"`
+	Voters                       []string `json:"voters"`
+	VerifyReconfigurationHistory bool     `json:"verify_reconfiguration_history,omitempty"`
+	BootstrapMembers             []Member `json:"bootstrap_members,omitempty"`
+	Provider                     string   `json:"provider"`
+	Endpoint                     string   `json:"endpoint"`
+	Bucket                       string   `json:"bucket"`
+	Directory                    string   `json:"directory"`
+	Prefix                       string   `json:"prefix"`
+	Account                      string   `json:"account,omitempty"`
 }
 
 var (
@@ -173,16 +197,32 @@ type ReadReplica struct {
 
 // OpenReadReplica follows certified checkpoint/archive state only.
 func OpenReadReplica(ctx context.Context, config ReplicaConfig) (*ReadReplica, error) {
-	return openReplica(ctx, config, ReplicaModeObjectStore)
+	return openReplica(ctx, config, ReplicaModeObjectStore, replicaHistoryVerification{})
+}
+
+// OpenReadReplicaWithHistory opens the same non-voting, read-only observer as
+// OpenReadReplica and additionally verifies certified reconfiguration history.
+func OpenReadReplicaWithHistory(ctx context.Context, config ReplicaConfig, verification ReplicaHistoryVerificationConfig) (*ReadReplica, error) {
+	return openReplica(ctx, config, ReplicaModeObjectStore, newReplicaHistoryVerification(verification))
 }
 
 // OpenLearner follows voter peer logs first and falls back to certified object
 // storage after compaction or peer unavailability. It is not cluster membership.
 func OpenLearner(ctx context.Context, config ReplicaConfig) (*ReadReplica, error) {
-	return openReplica(ctx, config, ReplicaModeLearner)
+	return openReplica(ctx, config, ReplicaModeLearner, replicaHistoryVerification{})
 }
 
-func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_ *ReadReplica, resultErr error) {
+// OpenLearnerWithHistory opens the same non-voting learner as OpenLearner and
+// additionally verifies certified reconfiguration history.
+func OpenLearnerWithHistory(ctx context.Context, config ReplicaConfig, verification ReplicaHistoryVerificationConfig) (*ReadReplica, error) {
+	return openReplica(ctx, config, ReplicaModeLearner, newReplicaHistoryVerification(verification))
+}
+
+func newReplicaHistoryVerification(config ReplicaHistoryVerificationConfig) replicaHistoryVerification {
+	return replicaHistoryVerification{enabled: true, bootstrapMembers: append([]Member(nil), config.BootstrapMembers...)}
+}
+
+func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, verification replicaHistoryVerification) (_ *ReadReplica, resultErr error) {
 	if config.MaxConcurrentReads < 0 || config.MaxLongPollReads < 0 || config.MaxLongPollReads > config.MaxConcurrentReads {
 		return nil, fmt.Errorf("read admission requires 0 <= max long-poll reads <= max concurrent reads")
 	}
@@ -212,6 +252,37 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 		}
 		if mode == ReplicaModeLearner && (member.PeerURL == "" || member.PublicKey == ([32]byte{})) {
 			return nil, fmt.Errorf("learner voter %q requires a peer URL and pinned public key", member.ID)
+		}
+	}
+	if verification.enabled {
+		if len(verification.bootstrapMembers) == 0 {
+			return nil, fmt.Errorf("reconfiguration history verification requires public bootstrap membership")
+		}
+		if len(verification.bootstrapMembers) != len(config.Members) {
+			return nil, fmt.Errorf("public bootstrap membership does not match replica voters")
+		}
+		bootstrap := make(map[NodeID]Member, len(verification.bootstrapMembers))
+		for _, member := range verification.bootstrapMembers {
+			if member.ID == "" {
+				return nil, fmt.Errorf("public bootstrap member ID is required")
+			}
+			if _, duplicate := bootstrap[member.ID]; duplicate {
+				return nil, fmt.Errorf("duplicate public bootstrap member %q", member.ID)
+			}
+			bootstrap[member.ID] = member
+		}
+		for _, peer := range config.Members {
+			member, ok := bootstrap[peer.ID]
+			if !ok {
+				return nil, fmt.Errorf("public bootstrap membership does not match replica voters")
+			}
+			peerURL := member.PeerURL
+			if peerURL == "" {
+				peerURL = member.URL
+			}
+			if peerURL != peer.PeerURL || [32]byte(member.PublicKey) != peer.PublicKey || peerURL == "" || member.PublicKey == (PublicKey{}) {
+				return nil, fmt.Errorf("public bootstrap member %q does not match replica voter identity", peer.ID)
+			}
 		}
 	}
 	if config.ObjStoreProvider == "" {
@@ -251,7 +322,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 		return nil, fmt.Errorf("acquire replica lock: %w", err)
 	}
 	r.lock = lock
-	if err := ensureReplicaIdentity(config); err != nil {
+	if err := ensureReplicaIdentity(config, verification); err != nil {
 		return nil, err
 	}
 	r.wal, err = qlog.Open(path.Join(config.DataDir, "qlog"))
@@ -276,11 +347,15 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 		return nil, fmt.Errorf("load replica archive: %w", err)
 	}
 	voters := make([]quepaxa.Member, 0, len(config.Members))
-	for _, member := range config.Members {
-		voters = append(voters, quepaxa.Member{ID: member.ID, PeerURL: member.PeerURL})
+	if verification.enabled {
+		voters = append(voters, verification.bootstrapMembers...)
+	} else {
+		for _, member := range config.Members {
+			voters = append(voters, quepaxa.Member{ID: member.ID, PeerURL: member.PeerURL})
+		}
 	}
 	cluster := quepaxa.Cluster{ConfigID: 1, Members: voters}
-	r.core, err = quepaxa.NewObserver(quepaxa.Config{NodeID: quepaxa.NodeID(config.ReplicaID), Cluster: cluster, WAL: r.wal})
+	r.core, err = quepaxa.NewObserver(quepaxa.Config{NodeID: quepaxa.NodeID(config.ReplicaID), Cluster: cluster, WAL: r.wal, EnableReconfiguration: verification.enabled})
 	if err != nil {
 		return nil, fmt.Errorf("open replica verifier: %w", err)
 	}
@@ -328,7 +403,12 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 			lag = status.SourceTip - status.AppliedSlot
 		}
 		return network.ReplicaStatus{Mode: string(status.Mode), AppliedSlot: status.AppliedSlot, SourceTip: status.SourceTip,
-			LagSlots: lag, Source: status.Source, LastSync: status.LastSync, LastError: status.LastError}
+			LagSlots: lag, Source: status.Source, LastSync: status.LastSync, LastError: status.LastError,
+			CheckpointBaseSlot: status.CheckpointBaseSlot, CheckpointRootHash: status.CheckpointRootHash,
+			CheckpointStateHash: status.CheckpointStateHash, CheckpointPrefixHash: status.CheckpointPrefixHash,
+			ArchiveHeadVersionType: status.ArchiveHeadVersionType, ArchiveHeadVersion: status.ArchiveHeadVersion,
+			RecoveryPinID: status.RecoveryPinID, RecoveryPinsCreated: status.RecoveryPinsCreated,
+			RecoveryPinsReleased: status.RecoveryPinsReleased}
 	})
 	r.core.StartPeriodicSync(childCtx, time.Second)
 	interval := config.SyncInterval
@@ -344,7 +424,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode) (_
 	return r, nil
 }
 
-func ensureReplicaIdentity(config ReplicaConfig) error {
+func ensureReplicaIdentity(config ReplicaConfig, verification replicaHistoryVerification) error {
 	voters := make([]string, 0, len(config.Members))
 	for _, member := range config.Members {
 		voters = append(voters, fmt.Sprintf("%s:%x", member.ID, member.PublicKey))
@@ -359,6 +439,7 @@ func ensureReplicaIdentity(config ReplicaConfig) error {
 		}
 	}
 	want := replicaIdentity{ClusterID: config.ClusterID, ConfigID: 1, ReplicaID: config.ReplicaID, Voters: voters,
+		VerifyReconfigurationHistory: verification.enabled, BootstrapMembers: append([]Member(nil), verification.bootstrapMembers...),
 		Provider: config.ObjStoreProvider, Endpoint: config.ObjStoreEndpoint, Bucket: config.ObjStoreBucket,
 		Directory: directory, Prefix: path.Clean(config.ObjStorePrefix), Account: config.ObjStoreAzureStorageAccount}
 	manifest := filepath.Join(config.DataDir, "replica-identity.json")
@@ -369,6 +450,7 @@ func ensureReplicaIdentity(config ReplicaConfig) error {
 			return fmt.Errorf("decode replica identity: %w", err)
 		}
 		if !slices.Equal(got.Voters, want.Voters) || got.ClusterID != want.ClusterID || got.ConfigID != want.ConfigID ||
+			got.VerifyReconfigurationHistory != want.VerifyReconfigurationHistory || !slices.Equal(got.BootstrapMembers, want.BootstrapMembers) ||
 			got.ReplicaID != want.ReplicaID || got.Provider != want.Provider || got.Endpoint != want.Endpoint ||
 			got.Bucket != want.Bucket || got.Directory != want.Directory || got.Prefix != want.Prefix || got.Account != want.Account {
 			return fmt.Errorf("replica data directory identity mismatch")
@@ -936,6 +1018,7 @@ func (r *ReadReplica) syncObjectStore(ctx context.Context) (resultErr error) {
 	}
 	seal, baseDecision, hasBase := r.archive.RecoveryBase()
 	if !hasBase {
+		r.clearCheckpointEvidence()
 		if r.archive.Tip() < r.core.Tip() {
 			return fmt.Errorf("object-store archive tip %d is behind replica tip %d", r.archive.Tip(), r.core.Tip())
 		}
@@ -966,6 +1049,13 @@ func (r *ReadReplica) syncObjectStore(ctx context.Context) (resultErr error) {
 		}
 	}
 	owner := r.pinOwner
+	pinID := sha256.Sum256([]byte(owner))
+	var checkpointPinCreated, complete bool
+	defer func() {
+		if resultErr == nil && complete {
+			r.setCheckpointEvidence(seal, version, versioned, hex.EncodeToString(pinID[:]), checkpointPinCreated)
+		}
+	}()
 	// Run after pin cleanup and renewal have completed. A failed release must
 	// not allow reuse of an owner whose previous lease may still be active.
 	defer func() {
@@ -1003,6 +1093,7 @@ func (r *ReadReplica) syncObjectStore(ctx context.Context) (resultErr error) {
 		if err != nil {
 			return err
 		}
+		checkpointPinCreated = true
 		defer func() { resultErr = errors.Join(resultErr, closeCheckpointPin(checkpointPin)) }()
 	}
 	renewDone := make(chan error, 1)
@@ -1059,6 +1150,7 @@ func (r *ReadReplica) syncObjectStore(ctx context.Context) (resultErr error) {
 		}
 	}
 	r.setSource("object-store", uint64(snapshot.Tip()))
+	complete = true
 	return nil
 }
 
@@ -1150,6 +1242,47 @@ func (r *ReadReplica) setSource(source string, tip uint64) {
 	r.statusMu.Lock()
 	r.status.Source, r.status.SourceTip = source, tip
 	r.statusMu.Unlock()
+}
+
+func (r *ReadReplica) clearCheckpointEvidence() {
+	r.statusMu.Lock()
+	r.status.CheckpointBaseSlot = 0
+	r.status.CheckpointRootHash = ""
+	r.status.CheckpointStateHash = ""
+	r.status.CheckpointPrefixHash = ""
+	r.status.ArchiveHeadVersionType = ""
+	r.status.ArchiveHeadVersion = ""
+	r.status.RecoveryPinID = ""
+	r.status.RecoveryPinsCreated = 0
+	r.status.RecoveryPinsReleased = 0
+	r.statusMu.Unlock()
+}
+
+func (r *ReadReplica) setCheckpointEvidence(seal quepaxa.CheckpointSeal, version thanosobjstore.ObjectVersion, versioned bool, pinID string, checkpointPin bool) {
+	r.statusMu.Lock()
+	defer r.statusMu.Unlock()
+	r.status.CheckpointBaseSlot = uint64(seal.Index)
+	r.status.CheckpointRootHash = hex.EncodeToString(seal.RootHash[:])
+	r.status.CheckpointStateHash = hex.EncodeToString(seal.StateHash[:])
+	r.status.CheckpointPrefixHash = hex.EncodeToString(seal.PrefixHash[:])
+	if versioned {
+		r.status.ArchiveHeadVersion = version.Value
+		switch version.Type {
+		case thanosobjstore.Generation:
+			r.status.ArchiveHeadVersionType = "generation"
+		case thanosobjstore.ETag:
+			r.status.ArchiveHeadVersionType = "etag"
+		default:
+			r.status.ArchiveHeadVersionType = "unknown"
+		}
+	}
+	r.status.RecoveryPinID = pinID
+	r.status.RecoveryPinsCreated = 1
+	r.status.RecoveryPinsReleased = 1
+	if checkpointPin {
+		r.status.RecoveryPinsCreated++
+		r.status.RecoveryPinsReleased++
+	}
 }
 
 func objectStatsMap(stats objstore.Stats) map[string]uint64 {

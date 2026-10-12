@@ -262,3 +262,91 @@ func TestRelativeDataDirReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHistoryAwareReplicaRequiresExactPublicBootstrapIdentity(t *testing.T) {
+	member := Member{ID: "n1", URL: "http://n1", PeerURL: "quic://n1:9090", LogURL: "http://n1/log", PublicKey: PublicKey{1}}
+	peer, err := NewReplicaMember("history", member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := ReplicaConfig{ClusterID: "history", ReplicaID: "reader", DataDir: t.TempDir(), Members: []ReplicaMember{peer},
+		ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir()}
+	verification := newReplicaHistoryVerification(ReplicaHistoryVerificationConfig{BootstrapMembers: []Member{member}})
+	if err := ensureReplicaIdentity(base, verification); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*replicaHistoryVerification){
+		"mode":        func(config *replicaHistoryVerification) { config.enabled = false },
+		"peer URL":    func(config *replicaHistoryVerification) { config.bootstrapMembers[0].PeerURL = "quic://other:9090" },
+		"public key":  func(config *replicaHistoryVerification) { config.bootstrapMembers[0].PublicKey = PublicKey{2} },
+		"genesis URL": func(config *replicaHistoryVerification) { config.bootstrapMembers[0].URL = "http://other" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := verification
+			changed.bootstrapMembers = append([]Member(nil), verification.bootstrapMembers...)
+			mutate(&changed)
+			if err := ensureReplicaIdentity(base, changed); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+				t.Fatalf("identity drift error=%v", err)
+			}
+		})
+	}
+}
+
+func TestHistoryAwareReplicaRejectsMissingOrMismatchedBootstrap(t *testing.T) {
+	member := Member{ID: "n1", PeerURL: "quic://n1:9090", PublicKey: PublicKey{1}}
+	peer, err := NewReplicaMember("history", member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := ReplicaConfig{ClusterID: "history", ReplicaID: "reader", DataDir: t.TempDir(), Members: []ReplicaMember{peer},
+		ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir()}
+	if replica, err := OpenReadReplicaWithHistory(context.Background(), base, ReplicaHistoryVerificationConfig{}); replica != nil || err == nil || !strings.Contains(err.Error(), "requires public bootstrap") {
+		t.Fatalf("missing bootstrap replica=%v error=%v", replica, err)
+	}
+	verification := ReplicaHistoryVerificationConfig{BootstrapMembers: []Member{{ID: "n1", PeerURL: "quic://other:9090", PublicKey: member.PublicKey}}}
+	if replica, err := OpenReadReplicaWithHistory(context.Background(), base, verification); replica != nil || err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched bootstrap replica=%v error=%v", replica, err)
+	}
+}
+
+func TestHistoryVerificationMatchesTransportPinsByID(t *testing.T) {
+	members := []Member{
+		{ID: "a", PeerURL: "quic://a:9090", PublicKey: PublicKey{1}},
+		{ID: "b", PeerURL: "quic://b:9090", PublicKey: PublicKey{2}},
+	}
+	peers := make([]ReplicaMember, len(members))
+	for i, member := range members {
+		peer, err := NewReplicaMember("history-order", member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peers[len(members)-1-i] = peer
+	}
+	config := ReplicaConfig{ClusterID: "history-order", ReplicaID: "reader", DataDir: t.TempDir(), Members: peers,
+		ObjStoreProvider: "filesystem", ObjStoreDir: t.TempDir()}
+	open := func(t *testing.T, bootstrap []Member) error {
+		t.Helper()
+		candidate := config
+		candidate.DataDir = t.TempDir()
+		replica, err := OpenReadReplicaWithHistory(context.Background(), candidate, ReplicaHistoryVerificationConfig{BootstrapMembers: bootstrap})
+		if replica != nil {
+			_ = replica.Close()
+		}
+		return err
+	}
+	if err := open(t, members); err != nil {
+		t.Fatalf("reordered identical pins were rejected: %v", err)
+	}
+	for name, bootstrap := range map[string][]Member{
+		"changed key": {{ID: "a", PeerURL: "quic://a:9090", PublicKey: PublicKey{9}}, members[1]},
+		"changed URL": {{ID: "a", PeerURL: "quic://other:9090", PublicKey: PublicKey{1}}, members[1]},
+		"missing ID":  {members[0]},
+		"extra ID":    {members[0], {ID: "c", PeerURL: "quic://c:9090", PublicKey: PublicKey{3}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := open(t, bootstrap); err == nil || !strings.Contains(err.Error(), "bootstrap") {
+				t.Fatalf("invalid bootstrap error=%v", err)
+			}
+		})
+	}
+}

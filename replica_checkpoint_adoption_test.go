@@ -32,7 +32,11 @@ type learnerCheckpointSource struct {
 	bucket      *objstore.MeteredBucket
 }
 
-func newLearnerCheckpointSource(t *testing.T, bucketDir string) *learnerCheckpointSource {
+func newLearnerCheckpointSource(t testing.TB, bucketDir string) *learnerCheckpointSource {
+	return newLearnerCheckpointSourceWithHistory(t, bucketDir, false)
+}
+
+func newLearnerCheckpointSourceWithHistory(t testing.TB, bucketDir string, history bool) *learnerCheckpointSource {
 	t.Helper()
 	ctx := context.Background()
 	bucket, err := objstore.NewBucket(objstore.Config{Provider: objstore.ProviderFilesystem, FilesystemDir: bucketDir})
@@ -44,7 +48,12 @@ func newLearnerCheckpointSource(t *testing.T, bucketDir string) *learnerCheckpoi
 		bucket.Close()
 		t.Fatal(err)
 	}
-	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	member := quepaxa.Member{ID: "n1"}
+	if history {
+		member.PeerURL = "quic://127.0.0.1:1"
+		member.PublicKey = quepaxa.PublicKey(network.PeerPublicKey("learner-adoption", "n1", "voter"))
+	}
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: 1, Members: []quepaxa.Member{member}}, WAL: wal, EnableReconfiguration: history})
 	if err != nil {
 		wal.Close()
 		bucket.Close()
@@ -73,7 +82,7 @@ func newLearnerCheckpointSource(t *testing.T, bucketDir string) *learnerCheckpoi
 	return &learnerCheckpointSource{core: core, material: material, wal: wal, checkpoints: checkpoints, archive: archive, bucket: bucket}
 }
 
-func (s *learnerCheckpointSource) execute(t *testing.T, sql string) {
+func (s *learnerCheckpointSource) execute(t testing.TB, sql string) {
 	t.Helper()
 	ctx := context.Background()
 	value, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: fmt.Sprintf("source-%d", s.core.Tip()+1), SQL: sql}})
@@ -92,7 +101,7 @@ func (s *learnerCheckpointSource) execute(t *testing.T, sql string) {
 	}
 }
 
-func (s *learnerCheckpointSource) publishCheckpoint(t *testing.T, trimArchive bool) (*checkpoint.Checkpoint, quepaxa.SealedCheckpoint) {
+func (s *learnerCheckpointSource) publishCheckpoint(t testing.TB, trimArchive bool) (*checkpoint.Checkpoint, quepaxa.SealedCheckpoint) {
 	t.Helper()
 	ctx := context.Background()
 	files, index, cleanup, err := s.material.CheckpointFilesAt(ctx)
@@ -126,6 +135,13 @@ func (s *learnerCheckpointSource) publishCheckpoint(t *testing.T, trimArchive bo
 	seal := quepaxa.CheckpointSeal{ConfigID: s.core.ConfigIDForSlot(quepaxa.Slot(index)), Index: quepaxa.Slot(index),
 		RootHash: root.RootHash, StateHash: root.Hash, PrefixHash: prefix, NextLeaderOrder: next,
 		FollowingLeaderOrder: following, GenerationAnchorHash: s.core.GenerationAnchorHash()}
+	if s.core.ReconfigurationEnabled() {
+		membership, err := s.core.CheckpointMembership(quepaxa.Slot(index))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seal.Membership = &membership
+	}
 	s.core.SetCheckpointValidator(func(ctx context.Context, seal quepaxa.CheckpointSeal) error {
 		return s.checkpoints.Verify(ctx, uint64(seal.Index), seal.RootHash, seal.StateHash)
 	})
@@ -611,5 +627,43 @@ func removeReplicaMaterializedFiles(t *testing.T, dataDir string) {
 	}
 	if err := os.RemoveAll(filepath.Join(dataDir, "latticedb")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHistoryAwareLearnerRestoresReconfigurationCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	bucketDir := t.TempDir()
+	source := newLearnerCheckpointSourceWithHistory(t, bucketDir, true)
+	source.execute(t, "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+	source.execute(t, "INSERT INTO items VALUES (1, 7)")
+	source.publishCheckpoint(t, true)
+
+	bootstrap := Member{ID: "n1", PeerURL: "quic://127.0.0.1:1", PublicKey: PublicKey(network.PeerPublicKey("learner-adoption", "n1", "voter"))}
+	verification := ReplicaHistoryVerificationConfig{BootstrapMembers: []Member{bootstrap}}
+	if fixed, err := OpenLearner(ctx, learnerReplicaConfig(t.TempDir(), bucketDir, "fixed-reader")); fixed != nil || err == nil || !strings.Contains(err.Error(), "fixed-membership checkpoint includes membership history") {
+		t.Fatalf("fixed learner accepted history checkpoint: replica=%v error=%v", fixed, err)
+	}
+	bad := bootstrap
+	bad.PublicKey = PublicKey{9}
+	if replica, err := OpenLearnerWithHistory(ctx, learnerReplicaConfig(t.TempDir(), bucketDir, "bad-reader"), ReplicaHistoryVerificationConfig{BootstrapMembers: []Member{bad}}); replica != nil || err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("learner accepted mismatched bootstrap: replica=%v error=%v", replica, err)
+	}
+	replica, err := OpenLearnerWithHistory(ctx, learnerReplicaConfig(t.TempDir(), bucketDir, "history-reader"), verification)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	rows, err := replica.Query(ctx, QueryRequest{SQL: "SELECT value FROM items WHERE id=1"})
+	if err != nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(7) {
+		t.Fatalf("history learner rows=%#v error=%v", rows.Rows, err)
+	}
+	if replica.core.IsVoter() {
+		t.Fatal("history-aware learner gained voting authority")
+	}
+	if _, err := replica.api.Execute(ctx, ExecuteRequest{RequestID: "blocked", SQL: "INSERT INTO items VALUES (2, 9)"}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("history learner mutation error=%v", err)
+	}
+	if _, err := replica.Query(ctx, QueryRequest{SQL: "SELECT 1", Consistency: ConsistencyLinearizable}); !errors.Is(err, ErrQuorumUnavailable) {
+		t.Fatalf("history learner linearizable read error=%v", err)
 	}
 }
