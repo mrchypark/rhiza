@@ -2859,6 +2859,8 @@ func TestQualificationLocalRuntime(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			write(filepath.Join(bin, "setsid"), "#!/bin/sh\nexec \"$@\"\n", 0700)
+			write(filepath.Join(bin, "lsof"), "#!/bin/sh\nexit 1\n", 0700)
 			const run = "a1b2c3d4"
 			const harness = "9b53158b38352ae78446e70a298616a31dc44a69"
 			application := syntheticFixtureRevision
@@ -3614,7 +3616,8 @@ printf '200\n0.001\n'
 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
-out=$1; mode=run; context=synthetic; ns=synthetic; active_fault=NetworkChaos/network-one
+	out=$1; mode=run; context=synthetic; ns=synthetic; active_fault=NetworkChaos/network-one
+	port_voter0=28080; port_voter1=28081; port_voter2=28082
 jq() { command jq "$@"; }
 `+string(source[start:end])+`
 original=22

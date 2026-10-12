@@ -82,8 +82,6 @@ port_raft_voter0=$((port_voter0 + 100))
 port_raft_voter1=$((port_voter1 + 100))
 port_raft_voter2=$((port_voter2 + 100))
 port_raft_learner=$((port_learner + 100))
-command -v lsof >/dev/null || die 'native lsof required'
-command -v setsid >/dev/null || die 'native setsid required'
 remaining() {
   seconds=$((local_deadline - $(date +%s)))
   [ "$seconds" -gt 0 ] || return 124
@@ -796,6 +794,8 @@ if [ "$mode" = check-shutdown ]; then
   exit $?
 fi
 if [ "$mode" = render ]; then exit 0; fi
+command -v lsof >/dev/null || die 'native lsof required'
+command -v setsid >/dev/null || die 'native setsid required'
 if [ "$mode" = run ]; then
   [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
   printf '%s' "$GITHUB_SHA" | grep -Eq '^[a-f0-9]{40}$' || die 'exact CI source SHA required'
