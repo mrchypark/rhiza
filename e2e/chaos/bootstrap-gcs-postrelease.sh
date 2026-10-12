@@ -53,6 +53,22 @@ gsa_delete_wait_worker() {
                [ "$deleted_error" = 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account' ]; then
                 return 0
             fi
+            if printf '%s\n' "$deleted_error" | grep -Fq 'PERMISSION_DENIED' &&
+               printf '%s\n' "$deleted_error" | grep -Fq '(or it may not exist)'; then
+                deleted_list="$deleted_base.list.json"
+                deleted_list_stderr="$deleted_base.list.stderr"
+                deleted_list_exit=0
+                gcloud --project="$project" --quiet iam service-accounts list --format=json \
+                  > "$deleted_list" 2> "$deleted_list_stderr" || deleted_list_exit=$?
+                printf '%s\n' "$deleted_list_exit" > "$deleted_base.list.exit"
+                [ "$deleted_list_exit" = 0 ] || die "GSA absence list failed: $deleted_tag"
+                jq -e --arg email "$deleted_account" --arg uid "$deleted_uid" '
+                  type=="array" and
+                  all(.[]; (.email|type)=="string" and (.uniqueId|type)=="string") and
+                  ([.[] | select(.email==$email or .uniqueId==$uid)] | length)==0
+                ' "$deleted_list" >/dev/null || die "GSA absence list rejected: $deleted_tag"
+                return 0
+            fi
             die "GSA deletion describe failed permanently: $deleted_tag"
         fi
         sleep "$deleted_delay"
@@ -1195,6 +1211,85 @@ verify_absent() {
         precise_not_found "$item" "$RHIZA_AUTH_STATE/rollback-absence-$item.stderr"
     fi
 }
+validate_inspector_clusterrolebindings() {
+    jq -e --arg ns "$3" --slurpfile roles "$2" '
+      def forbidden:
+        (.kind=="ServiceAccount" and .name=="rhiza-inspector" and ((.namespace // $ns)==$ns)) or
+        (.kind=="User" and .name==("system:serviceaccount:"+$ns+":rhiza-inspector")) or
+        (.kind=="User" and .name=="system:authenticated") or
+        (.kind=="Group" and .name==("system:serviceaccounts:"+$ns)) or
+        (.kind=="Group" and (.name=="system:serviceaccounts" or .name=="system:authenticated" or .name=="system:unauthenticated"));
+      def baseline_role($role; $name):
+        ($role.metadata.labels == {"kubernetes.io/bootstrapping":"rbac-defaults"}) and
+        ($role.aggregationRule == null) and
+        if $name == "system:basic-user" then
+          $role.rules == [
+            {"apiGroups":["authorization.k8s.io"],"resources":["selfsubjectaccessreviews","selfsubjectrulesreviews"],"verbs":["create"]},
+            {"apiGroups":["authentication.k8s.io"],"resources":["selfsubjectreviews"],"verbs":["create"]}
+          ]
+        elif $name == "system:discovery" then
+          $role.rules == [
+            {"nonResourceURLs":["/api","/api/*","/apis","/apis/*","/healthz","/livez","/openapi","/openapi/*","/readyz","/version","/version/"],"verbs":["get"]}
+          ]
+        elif $name == "system:public-info-viewer" then
+          $role.rules == [
+            {"nonResourceURLs":["/healthz","/livez","/readyz","/version","/version/"],"verbs":["get"]}
+          ]
+        elif $name == "system:service-account-issuer-discovery" then
+          $role.rules == [
+            {"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"verbs":["get"]}
+          ]
+        else
+          false
+        end;
+      def baseline_binding($binding; $roles):
+        ($binding.roleRef // {}) as $ref |
+        ($binding.metadata // {}) as $meta |
+        ($roles[0].items | map(select(.metadata.name == $ref.name)) |
+          if length == 1 then .[0] else null end) as $role |
+        $ref.kind == "ClusterRole" and $ref.apiGroup == "rbac.authorization.k8s.io" and
+        $ref.name == $meta.name and
+        if $meta.name == "system:basic-user" then
+          $binding.subjects == [{"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:authenticated"}]
+        elif $meta.name == "system:discovery" then
+          $binding.subjects == [{"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:authenticated"}]
+        elif $meta.name == "system:public-info-viewer" then
+          $binding.subjects == [
+            {"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:authenticated"},
+            {"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:unauthenticated"}
+          ]
+        elif $meta.name == "system:service-account-issuer-discovery" then
+          $binding.subjects == [{"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:serviceaccounts"}]
+        else
+          false
+        end and baseline_role($role; $meta.name);
+      all(.items[]; ((.subjects // [] | map(select(forbidden)) | length) == 0) or baseline_binding(.; $roles))
+    ' "$1"
+}
+extract_created_identity() {
+    created_kind=$1
+    created_name=$2
+    created_output=$3
+    created_owner=${4:-}
+    case "$created_kind" in
+        namespace) created_kind=Namespace ;;
+        validatingadmissionpolicy) created_kind=ValidatingAdmissionPolicy ;;
+        validatingadmissionpolicybinding) created_kind=ValidatingAdmissionPolicyBinding ;;
+        clusterrole) created_kind=ClusterRole ;;
+        clusterrolebinding) created_kind=ClusterRoleBinding ;;
+    esac
+    jq -c --arg kind "$created_kind" --arg name "$created_name" --arg owner "$created_owner" '
+      select(.kind==$kind and .metadata.name==$name and
+        ($owner=="" or .metadata.annotations["rhiza.dev/auth-owner"]==$owner))
+    ' "$RHIZA_AUTH_STATE/kubernetes-create.json" > "$created_output" || return 1
+    [ "$(wc -l < "$created_output" | tr -d ' ')" = 1 ] || return 1
+    jq -e --arg kind "$created_kind" --arg name "$created_name" --arg owner "$created_owner" '
+      .kind==$kind and .metadata.name==$name and
+      (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
+      (.metadata.resourceVersion|type)=="string" and (.metadata.resourceVersion|length)>0 and
+      ($owner=="" or .metadata.annotations["rhiza.dev/auth-owner"]==$owner)
+    ' "$created_output" >/dev/null
+}
 verify_deleted_role() {
     tag=$1; role=$2
     role_exit=0
@@ -1314,6 +1409,15 @@ if [ "$mode" = apply ]; then
     # No apply/adoption: a collision fails. Partial kubectl creation needs audit.
     record kubernetes-create k create -f "$RHIZA_AUTH_STATE/auth.yaml" -o json
     mark kubernetes
+    extract_created_identity namespace "$ns" "$RHIZA_AUTH_STATE/namespace-identity.json" "$owner"
+    extract_created_identity ServiceAccount rhiza-inspector "$RHIZA_AUTH_STATE/inspector-ksa-identity.json" ""
+    for kind in validatingadmissionpolicy validatingadmissionpolicybinding; do
+        for suffix in faults network-faults runtime; do
+            extract_created_identity "$kind" "$ns-$suffix" "$RHIZA_AUTH_STATE/$kind-$suffix-identity.json" "$owner"
+        done
+    done
+    extract_created_identity clusterrole "$ns-reader" "$RHIZA_AUTH_STATE/clusterrole-reader-identity.json" "$owner"
+    extract_created_identity clusterrolebinding "$ns-reader" "$RHIZA_AUTH_STATE/clusterrolebinding-reader-identity.json" "$owner"
     record namespace-identity k get namespace "$ns" -o json
     record data-ksa-identity k get serviceaccount rhiza-gcs --namespace="$ns" -o json
     record inspector-ksa-identity k get serviceaccount rhiza-inspector --namespace="$ns" -o json
@@ -1324,6 +1428,7 @@ if [ "$mode" = apply ]; then
       (.metadata.uid|type)=="string" and (.metadata.uid|length)>0
     ' "$RHIZA_AUTH_STATE/inspector-ksa-identity.json" >/dev/null || die 'Inspector KSA privilege/isolation contract mismatch'
     record inspector-rolebindings k get rolebindings.rbac.authorization.k8s.io --namespace="$ns" -o json
+    record inspector-clusterroles k get clusterroles -o json
     record inspector-clusterrolebindings k get clusterrolebindings.rbac.authorization.k8s.io -o json
     jq -e --arg ns "$ns" '
       def forbidden:
@@ -1332,13 +1437,10 @@ if [ "$mode" = apply ]; then
         (.kind=="Group" and (.name==("system:serviceaccounts:"+$ns) or .name=="system:serviceaccounts" or .name=="system:authenticated"));
       all(.items[]; all(.subjects[]?; forbidden|not))' \
       "$RHIZA_AUTH_STATE/inspector-rolebindings.json" >/dev/null || die 'Inspector KSA unexpectedly has a RoleBinding'
-    jq -e --arg ns "$ns" '
-      def forbidden:
-        (.kind=="ServiceAccount" and .name=="rhiza-inspector" and .namespace==$ns) or
-        (.kind=="User" and .name==("system:serviceaccount:"+$ns+":rhiza-inspector")) or
-        (.kind=="Group" and (.name==("system:serviceaccounts:"+$ns) or .name=="system:serviceaccounts" or .name=="system:authenticated"));
-      all(.items[]; all(.subjects[]?; forbidden|not))' \
-      "$RHIZA_AUTH_STATE/inspector-clusterrolebindings.json" >/dev/null || die 'Inspector KSA unexpectedly has a ClusterRoleBinding'
+    validate_inspector_clusterrolebindings \
+      "$RHIZA_AUTH_STATE/inspector-clusterrolebindings.json" \
+      "$RHIZA_AUTH_STATE/inspector-clusterroles.json" "$ns" ||
+      die 'Inspector KSA unexpectedly has a ClusterRoleBinding'
     for kind in validatingadmissionpolicy validatingadmissionpolicybinding; do
         for suffix in faults network-faults runtime; do
             record "$kind-$suffix-identity" k get "$kind" "$ns-$suffix" -o json

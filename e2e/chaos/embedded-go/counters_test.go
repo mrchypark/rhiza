@@ -840,6 +840,261 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 	}
 }
 
+func TestQualificationInspectorBaselineClusterRoleGuard(t *testing.T) {
+	bootstrap, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(bootstrap)
+	start := strings.Index(source, "\nvalidate_inspector_clusterrolebindings() {\n")
+	end := strings.Index(source[start+1:], "\nextract_created_identity() {\n")
+	if start < 0 || end < 0 {
+		t.Fatal("inspector ClusterRoleBinding guard missing")
+	}
+	guard := source[start : start+1+end]
+
+	group := func(name string) map[string]any {
+		return map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": name}
+	}
+	roleRef := func(name string) map[string]any {
+		return map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name}
+	}
+	binding := func(name string, role string, subjects ...map[string]any) map[string]any {
+		return map[string]any{"metadata": map[string]any{"name": name}, "roleRef": roleRef(role), "subjects": subjects}
+	}
+	labels := map[string]any{"kubernetes.io/bootstrapping": "rbac-defaults"}
+	roles := map[string]any{"items": []any{
+		map[string]any{"metadata": map[string]any{"name": "system:basic-user", "labels": labels}, "rules": []any{
+			map[string]any{"apiGroups": []string{"authorization.k8s.io"}, "resources": []string{"selfsubjectaccessreviews", "selfsubjectrulesreviews"}, "verbs": []string{"create"}},
+			map[string]any{"apiGroups": []string{"authentication.k8s.io"}, "resources": []string{"selfsubjectreviews"}, "verbs": []string{"create"}},
+		}},
+		map[string]any{"metadata": map[string]any{"name": "system:discovery", "labels": labels}, "rules": []any{
+			map[string]any{"nonResourceURLs": []string{"/api", "/api/*", "/apis", "/apis/*", "/healthz", "/livez", "/openapi", "/openapi/*", "/readyz", "/version", "/version/"}, "verbs": []string{"get"}},
+		}},
+		map[string]any{"metadata": map[string]any{"name": "system:public-info-viewer", "labels": labels}, "rules": []any{
+			map[string]any{"nonResourceURLs": []string{"/healthz", "/livez", "/readyz", "/version", "/version/"}, "verbs": []string{"get"}},
+		}},
+		map[string]any{"metadata": map[string]any{"name": "system:service-account-issuer-discovery", "labels": labels}, "rules": []any{
+			map[string]any{"nonResourceURLs": []string{"/.well-known/openid-configuration", "/.well-known/openid-configuration/", "/openid/v1/jwks", "/openid/v1/jwks/"}, "verbs": []string{"get"}},
+		}},
+	}}
+	bindings := map[string]any{"items": []any{
+		binding("system:basic-user", "system:basic-user", group("system:authenticated")),
+		binding("system:discovery", "system:discovery", group("system:authenticated")),
+		binding("system:public-info-viewer", "system:public-info-viewer", group("system:authenticated"), group("system:unauthenticated")),
+		binding("system:service-account-issuer-discovery", "system:service-account-issuer-discovery", group("system:serviceaccounts")),
+	}}
+	runGuard := func(t *testing.T, bindings, roles map[string]any) error {
+		t.Helper()
+		dir := t.TempDir()
+		bindingsPath := filepath.Join(dir, "bindings.json")
+		rolesPath := filepath.Join(dir, "roles.json")
+		for path, value := range map[string]map[string]any{bindingsPath: bindings, rolesPath: roles} {
+			raw, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		command := exec.Command("/bin/sh", "-c", guard+"\nvalidate_inspector_clusterrolebindings \"$1\" \"$2\" ns", "fixture", bindingsPath, rolesPath)
+		return command.Run()
+	}
+	if err := runGuard(t, bindings, roles); err != nil {
+		t.Fatalf("reviewed baseline ClusterRoleBindings rejected: %v", err)
+	}
+	clone := func(value map[string]any) map[string]any {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var copied map[string]any
+		if err := json.Unmarshal(raw, &copied); err != nil {
+			t.Fatal(err)
+		}
+		return copied
+	}
+	unrelated := clone(bindings)
+	unrelated["items"] = append(unrelated["items"].([]any), binding("other-inspector", "system:basic-user",
+		map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ServiceAccount", "name": "rhiza-inspector", "namespace": "other"}))
+	if err := runGuard(t, unrelated, roles); err != nil {
+		t.Fatalf("unrelated-namespace inspector subject was rejected: %v", err)
+	}
+	mutations := map[string]func(map[string]any, map[string]any){
+		"extra-subject": func(bindings, roles map[string]any) {
+			first := bindings["items"].([]any)[0].(map[string]any)
+			first["subjects"] = append(first["subjects"].([]any), group("system:unauthenticated"))
+		},
+		"extra-role-rule": func(bindings, roles map[string]any) {
+			second := roles["items"].([]any)[1].(map[string]any)
+			second["rules"] = append(second["rules"].([]any), map[string]any{"apiGroups": []string{""}, "resources": []string{"secrets"}, "verbs": []string{"get"}})
+		},
+		"name-spoof": func(bindings, roles map[string]any) {
+			first := bindings["items"].([]any)[0].(map[string]any)
+			first["metadata"].(map[string]any)["name"] = "spoofed-baseline"
+		},
+		"direct-inspector": func(bindings, roles map[string]any) {
+			bindings["items"] = append(bindings["items"].([]any), binding("inspector-alias", "system:basic-user", map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ServiceAccount", "name": "rhiza-inspector", "namespace": "ns"}))
+		},
+		"target-group": func(bindings, roles map[string]any) {
+			bindings["items"] = append(bindings["items"].([]any), binding("inspector-group", "system:basic-user", group("system:serviceaccounts:ns")))
+		},
+		"target-user": func(bindings, roles map[string]any) {
+			bindings["items"] = append(bindings["items"].([]any), binding("inspector-user", "system:basic-user", map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "User", "name": "system:serviceaccount:ns:rhiza-inspector"}))
+		},
+		"aggregation": func(bindings, roles map[string]any) {
+			third := roles["items"].([]any)[2].(map[string]any)
+			third["aggregationRule"] = map[string]any{"clusterRoleSelectors": []any{}}
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			badBindings := clone(bindings)
+			badRoles := clone(roles)
+			mutate(badBindings, badRoles)
+			if err := runGuard(t, badBindings, badRoles); err == nil {
+				t.Fatalf("mutated baseline guard %s was accepted", name)
+			}
+		})
+	}
+}
+
+func TestQualificationCreateReceiptsPrecedeInspectorGuard(t *testing.T) {
+	bootstrap, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(bootstrap)
+	create := strings.Index(source, "record kubernetes-create k create -f")
+	mark := strings.Index(source, "mark kubernetes")
+	extractNamespace := strings.Index(source, "extract_created_identity namespace")
+	extractInspector := strings.Index(source, "extract_created_identity ServiceAccount rhiza-inspector")
+	extractPolicies := strings.Index(source, "extract_created_identity \"$kind\"")
+	extractReader := strings.Index(source, "extract_created_identity clusterrole")
+	guard := create + strings.Index(source[create:], "validate_inspector_clusterrolebindings")
+	if create < 0 || mark < create || extractNamespace <= mark || extractInspector <= extractNamespace ||
+		extractPolicies <= extractInspector || extractReader <= extractPolicies || guard <= extractReader {
+		t.Fatalf("create receipt extraction ordering changed: create=%d mark=%d namespace=%d inspector=%d policies=%d reader=%d guard=%d",
+			create, mark, extractNamespace, extractInspector, extractPolicies, extractReader, guard)
+	}
+	for _, required := range []string{"validatingadmissionpolicy", "validatingadmissionpolicybinding", "clusterrole-reader-identity.json", "clusterrolebinding-reader-identity.json"} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("cleanup identity extraction missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"namespace) created_kind=Namespace",
+		"validatingadmissionpolicy) created_kind=ValidatingAdmissionPolicy",
+		"validatingadmissionpolicybinding) created_kind=ValidatingAdmissionPolicyBinding",
+		"clusterrole) created_kind=ClusterRole",
+		"clusterrolebinding) created_kind=ClusterRoleBinding",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("native create receipt kind normalization missing %q", required)
+		}
+	}
+}
+
+func TestQualificationExtractCreatedIdentitiesSurviveGuardFailure(t *testing.T) {
+	bootstrap, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(bootstrap)
+	start := strings.Index(source, "\nextract_created_identity() {\n")
+	end := strings.Index(source[start+1:], "\nverify_deleted_role() {\n")
+	if start < 0 || end < 0 {
+		t.Fatal("create receipt extraction helper missing")
+	}
+	extraction := source[start : start+1+end]
+	ns := "rhiza-v0191-fixture"
+	owner := "rhiza-postrelease-fixture-owner"
+	object := func(kind, name string, owned bool) map[string]any {
+		metadata := map[string]any{"name": name, "uid": "uid-" + name, "resourceVersion": "rv-" + name}
+		if owned {
+			metadata["annotations"] = map[string]any{"rhiza.dev/auth-owner": owner}
+		}
+		return map[string]any{"kind": kind, "apiVersion": "fixture/v1", "metadata": metadata}
+	}
+	base := []map[string]any{
+		object("Namespace", ns, true),
+		object("ServiceAccount", "rhiza-inspector", false),
+	}
+	for _, suffix := range []string{"faults", "network-faults", "runtime"} {
+		base = append(base,
+			object("ValidatingAdmissionPolicy", ns+"-"+suffix, true),
+			object("ValidatingAdmissionPolicyBinding", ns+"-"+suffix, true),
+		)
+	}
+	base = append(base, object("ClusterRole", ns+"-reader", true), object("ClusterRoleBinding", ns+"-reader", true))
+	expected := []string{
+		"namespace-identity.json", "inspector-ksa-identity.json",
+		"validatingadmissionpolicy-faults-identity.json", "validatingadmissionpolicybinding-faults-identity.json",
+		"validatingadmissionpolicy-network-faults-identity.json", "validatingadmissionpolicybinding-network-faults-identity.json",
+		"validatingadmissionpolicy-runtime-identity.json", "validatingadmissionpolicybinding-runtime-identity.json",
+		"clusterrole-reader-identity.json", "clusterrolebinding-reader-identity.json",
+	}
+	runExtraction := func(t *testing.T, docs []map[string]any, forceGuardFailure bool) error {
+		t.Helper()
+		dir := t.TempDir()
+		raw := make([][]byte, len(docs))
+		for i, doc := range docs {
+			raw[i], err = json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dir, "kubernetes-create.json"), bytes.Join(raw, []byte("\n")), 0600); err != nil {
+			t.Fatal(err)
+		}
+		script := "set -eu\n" + extraction +
+			"\nextract_created_identity namespace \"" + ns + "\" \"$RHIZA_AUTH_STATE/namespace-identity.json\" \"" + owner + "\" || exit $?" +
+			"\nextract_created_identity ServiceAccount rhiza-inspector \"$RHIZA_AUTH_STATE/inspector-ksa-identity.json\" \"\" || exit $?"
+		for _, kind := range []string{"validatingadmissionpolicy", "validatingadmissionpolicybinding"} {
+			for _, suffix := range []string{"faults", "network-faults", "runtime"} {
+				script += "\nextract_created_identity " + kind + " \"" + ns + "-" + suffix + "\" \"$RHIZA_AUTH_STATE/" + kind + "-" + suffix + "-identity.json\" \"" + owner + "\" || exit $?"
+			}
+		}
+		script += "\nextract_created_identity clusterrole \"" + ns + "-reader\" \"$RHIZA_AUTH_STATE/clusterrole-reader-identity.json\" \"" + owner + "\" || exit $?"
+		script += "\nextract_created_identity clusterrolebinding \"" + ns + "-reader\" \"$RHIZA_AUTH_STATE/clusterrolebinding-reader-identity.json\" \"" + owner + "\" || exit $?"
+		if forceGuardFailure {
+			script += "\nfalse"
+		}
+		command := exec.Command("/bin/sh", "-c", script)
+		command.Env = append(os.Environ(), "RHIZA_AUTH_STATE="+dir)
+		err = command.Run()
+		if forceGuardFailure {
+			for _, name := range expected {
+				if _, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil {
+					t.Fatalf("identity receipt %s missing after forced guard failure: %v", name, statErr)
+				}
+			}
+		}
+		return err
+	}
+	if err := runExtraction(t, base, true); err == nil {
+		t.Fatal("forced post-create guard failure unexpectedly succeeded")
+	}
+	missing := append([]map[string]any(nil), base...)
+	missing = append(missing[:4], missing[5:]...)
+	if err := runExtraction(t, missing, false); err == nil {
+		t.Fatal("missing create identity unexpectedly accepted")
+	}
+	duplicate := append([]map[string]any(nil), base...)
+	duplicate = append(duplicate, object("Namespace", ns, true))
+	if err := runExtraction(t, duplicate, false); err == nil {
+		t.Fatal("duplicate create identity unexpectedly accepted")
+	}
+	wrongOwner := append([]map[string]any(nil), base...)
+	wrongNamespace := object("Namespace", ns, true)
+	wrongNamespace["metadata"].(map[string]any)["annotations"] = map[string]any{"rhiza.dev/auth-owner": "wrong"}
+	wrongOwner[0] = wrongNamespace
+	if err := runExtraction(t, wrongOwner, false); err == nil {
+		t.Fatal("wrong-owner create identity unexpectedly accepted")
+	}
+}
+
 func TestQualificationInspectorPartialCleanup(t *testing.T) {
 	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
 	if err != nil {
@@ -1623,6 +1878,9 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 		{"eventual-not-found", 0, 2},
 		{"identity-drift", 1, 1},
 		{"permission-denied", 1, 1},
+		{"permission-denied-or-missing", 0, 2},
+		{"list-present", 1, 2},
+		{"list-failure", 1, 2},
 		{"rate-limit", 1, 1},
 		{"server-error", 1, 1},
 	} {
@@ -1645,6 +1903,9 @@ esac
   server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; exit 1 ;;
  esac
 `
+			listFallback := "\n case \"$*\" in\n  *'iam service-accounts list'*)\n   case \"$FAKE_SCENARIO\" in\n    permission-denied-or-missing) printf '[]\\n'; exit 0 ;;\n    list-present) printf '[{\"email\":\"rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\",\"uniqueId\":\"fixture-uid\"}]\\n'; exit 0 ;;\n    list-failure) printf 'ERROR: PERMISSION_DENIED\\n' >&2; exit 1 ;;\n   esac\n  ;;\n esac\n"
+			gcloud = strings.Replace(gcloud, "\n case \"$FAKE_SCENARIO\" in", listFallback+"\n case \"$FAKE_SCENARIO\" in", 1)
+			gcloud = strings.Replace(gcloud, "  permission-denied) printf '%s\\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;", "  permission-denied) printf '%s\\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;\n  permission-denied-or-missing|list-present|list-failure) printf '%s\\n' 'ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission denied on resource (or it may not exist).' >&2; exit 1 ;;", 1)
 			seedState(t, dir)
 			if err := os.WriteFile(filepath.Join(dir, "gcloud"), []byte(gcloud), 0700); err != nil {
 				t.Fatal(err)
