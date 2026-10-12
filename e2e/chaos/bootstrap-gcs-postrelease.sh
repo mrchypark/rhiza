@@ -730,6 +730,12 @@ if [ "$mode" = check-local-auth ]; then
         [ "$*" = "container clusters describe $RHIZA_GKE_CLUSTER --location=$RHIZA_GKE_LOCATION --format=json" ] || return 97
         [ "$fixture_case" != projection-gcloud ] || exit 51
         [ "$fixture_case" != projection-jq ] || { printf '%s\n' 'not-json'; return 0; }
+        if [ "$fixture_case" = projection-jq-large ]; then
+            printf '%s\n' '{bad-json'
+            fixture_large=0
+            while [ "$fixture_large" -lt 8192 ]; do printf '%s\n' 'DO_NOT_RECORD_LARGE_RAW_PAYLOAD'; fixture_large=$((fixture_large + 1)); done
+            return 0
+        fi
         cat "$local_fixture/cluster.json"
     }
     k() {
@@ -750,7 +756,7 @@ if [ "$mode" = check-local-auth ]; then
     [ "$(find "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" -type f -user "$(id -u)" -perm 0600 -print | wc -l | tr -d ' ')" = 2 ] || die 'Credential file mode regression'
     if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die 'Token renewal accepted'; fi
     [ "$(wc -l < "$local_fixture/api-calls" | tr -d ' ')" = 1 ] || die 'TokenRequest repeated'
-    for fixture_case in overlong short missing-token projection-gcloud projection-jq projection-secret wrong-cluster missing-pool gce-mode ambiguous-pool symlink-cluster native-failure; do
+    for fixture_case in overlong short missing-token projection-gcloud projection-jq projection-jq-large projection-secret wrong-cluster missing-pool gce-mode ambiguous-pool symlink-cluster native-failure; do
         rm -f "$local_fixture/runtime.token" "$local_fixture/runtime.kubeconfig" "$local_fixture/runtime-token-request.attempted" "$local_fixture/api-calls" "$local_fixture/mint-cluster.sha256" "$local_fixture/mint-cluster.json" "$local_fixture/mint-cluster-projection-failure.json"
         jq -n --arg expiry "$(stamp "$((fixture_now + 2700))")" '{apiVersion:"authentication.k8s.io/v1",kind:"TokenRequest",status:{token:"FAKE.OFFLINE.TOKEN",expirationTimestamp:$expiry}}' > "$local_fixture/response.json"
         rm -f "$local_fixture/cluster.json"
@@ -759,7 +765,7 @@ if [ "$mode" = check-local-auth ]; then
             overlong) jq --arg expiry "$(stamp "$((fixture_now + 3600))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             short) jq --arg expiry "$(stamp "$((fixture_now + 1800))")" '.status.expirationTimestamp=$expiry' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
             missing-token) jq 'del(.status.token)' "$local_fixture/response.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/response.json" ;;
-            projection-secret) jq '.masterAuth.clientKey="DO_NOT_RECORD_GKE_KEY" | .masterAuth.clientCertificate="DO_NOT_RECORD_GKE_CERT" | .masterAuth.token="DO_NOT_RECORD_GKE_TOKEN" | .masterAuth.exec={command:"DO_NOT_RECORD_GKE_EXEC"} | .masterAuth.authProvider={name:"DO_NOT_RECORD_GKE_AUTH_PROVIDER"}' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
+            projection-secret) jq '.masterAuth.clientKey="DO_NOT_RECORD_GKE_KEY" | .masterAuth.clientCertificate="DO_NOT_RECORD_GKE_CERT" | .masterAuth.token="DO_NOT_RECORD_GKE_TOKEN" | .masterAuth.username="DO_NOT_RECORD_GKE_USERNAME" | .masterAuth.password="DO_NOT_RECORD_GKE_PASSWORD" | .masterAuth.exec={command:"DO_NOT_RECORD_GKE_EXEC"} | .masterAuth.authProvider={name:"DO_NOT_RECORD_GKE_AUTH_PROVIDER"}' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
             wrong-cluster) jq '.name="other-cluster"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
             missing-pool) jq '.nodePools=[.nodePools[1],.nodePools[2]]' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
             gce-mode) jq '.nodePools[1].config.workloadMetadataConfig.mode="GCE_METADATA"' "$local_fixture/cluster.json" > "$local_fixture/change.json"; mv "$local_fixture/change.json" "$local_fixture/cluster.json" ;;
@@ -768,10 +774,10 @@ if [ "$mode" = check-local-auth ]; then
         esac
         if mint_local > "$local_fixture/result" 2> "$local_fixture/stderr"; then die "Local negative accepted: $fixture_case"; fi
         if [ -f "$local_fixture/mint-cluster-projection-failure.json" ]; then
-            if grep -Eq 'DO_NOT_RECORD|FAKE-OFFLINE-CA|not-json' "$local_fixture/mint-cluster-projection-failure.json"; then die 'Cluster projection failure leaked payload'; fi
+            if grep -Eq 'DO_NOT_RECORD|FAKE-OFFLINE-CA|not-json|bad-json' "$local_fixture/mint-cluster-projection-failure.json"; then die 'Cluster projection failure leaked payload'; fi
             case "$fixture_case" in
                 projection-gcloud) expected_stage=gcloud; expected_exit=51 ;;
-                projection-jq|projection-secret) expected_stage=jq; expected_exit= ;;
+                projection-jq|projection-jq-large|projection-secret) expected_stage=jq; expected_exit= ;;
                 wrong-cluster|missing-pool|gce-mode|ambiguous-pool) expected_stage=sanitizer; expected_exit=1 ;;
                 symlink-cluster) expected_stage=; expected_exit= ;;
                 *) expected_stage=; expected_exit= ;;
@@ -790,7 +796,7 @@ if [ "$mode" = check-local-auth ]; then
         fi
         [ ! -e "$local_fixture/runtime.token" ] && [ ! -e "$local_fixture/runtime.kubeconfig" ] && [ ! -e "$local_fixture/runtime-token-response.private" ] && [ ! -e "$local_fixture/runtime-token-request.private" ] || die 'Failure retained credential bytes'
         expected_requests=1
-        case "$fixture_case" in projection-gcloud|projection-jq|projection-secret|wrong-cluster|missing-pool|gce-mode|ambiguous-pool|symlink-cluster) expected_requests=0 ;; esac
+        case "$fixture_case" in projection-gcloud|projection-jq|projection-jq-large|projection-secret|wrong-cluster|missing-pool|gce-mode|ambiguous-pool|symlink-cluster) expected_requests=0 ;; esac
         actual_requests=0; [ ! -e "$local_fixture/api-calls" ] || actual_requests=$(wc -l < "$local_fixture/api-calls" | tr -d ' ')
         [ "$actual_requests" = "$expected_requests" ] || die 'Negative request count regression'
         [ "$fixture_case" != native-failure ] || [ "$(cat "$local_fixture/runtime-token-request.exit")" = 56 ] || die 'Native failure lost'

@@ -4601,7 +4601,7 @@ func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
 	if start < 0 || end <= start || privateStart < 0 || privateEnd <= privateStart || helperStart < 0 || helperEnd <= helperStart {
 		t.Fatal("cluster metadata preparation functions missing")
 	}
-	for _, scenario := range []string{"full-json-compatible", "credential-fields", "describe-failure", "jq-failure", "sanitizer-failure"} {
+	for _, scenario := range []string{"full-json-compatible", "credential-fields", "describe-failure", "jq-failure", "jq-large-failure", "sanitizer-failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -4615,6 +4615,12 @@ func TestQualificationCIClusterMetadataReceipt(t *testing.T) {
 [ "$*" = '--project=example-project --quiet container clusters describe test-cluster --location=test-region1 --format=json' ] || exit 97
 [ "$FAKE_SCENARIO" != describe-failure ] || exit 53
 [ "$FAKE_SCENARIO" != jq-failure ] || { printf '%s\n' 'not-json'; exit 0; }
+if [ "$FAKE_SCENARIO" = jq-large-failure ]; then
+  printf '%s\n' '{bad-json'
+  n=0
+  while [ "$n" -lt 8192 ]; do printf '%s\n' 'DO_NOT_RECORD_LARGE_RAW_PAYLOAD'; n=$((n + 1)); done
+  exit 0
+fi
 cat "$FAKE_CLUSTER"
 `
 			if err := os.WriteFile(filepath.Join(bin, "gcloud"), []byte(gcloud), 0700); err != nil {
@@ -4622,7 +4628,7 @@ cat "$FAKE_CLUSTER"
 			}
 			cluster := `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca","clientKey":"","clientCertificate":""},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
 			if scenario == "credential-fields" {
-				cluster = `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca","clientKey":"DO_NOT_RECORD_GKE_KEY","clientCertificate":"DO_NOT_RECORD_GKE_CERT","token":"DO_NOT_RECORD_GKE_TOKEN","exec":{"command":"DO_NOT_RECORD_GKE_EXEC"},"authProvider":{"name":"DO_NOT_RECORD_GKE_AUTH_PROVIDER"}},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
+				cluster = `{"name":"test-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"synthetic-ca","clientKey":"DO_NOT_RECORD_GKE_KEY","clientCertificate":"DO_NOT_RECORD_GKE_CERT","token":"DO_NOT_RECORD_GKE_TOKEN","username":"DO_NOT_RECORD_GKE_USERNAME","password":"DO_NOT_RECORD_GKE_PASSWORD","exec":{"command":"DO_NOT_RECORD_GKE_EXEC"},"authProvider":{"name":"DO_NOT_RECORD_GKE_AUTH_PROVIDER"}},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
 			}
 			if scenario == "sanitizer-failure" {
 				cluster = `{"name":"wrong-cluster","location":"test-region1","endpoint":"example.invalid","masterAuth":{"clusterCaCertificate":"DO_NOT_RECORD_GKE_CA"},"nodePools":[{"name":"fixture","config":{"workloadMetadataConfig":{"mode":"GKE_METADATA"}}}]}`
@@ -4654,6 +4660,9 @@ touch "$FAKE_DIR/metadata-pod-created"
 			command.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_SCENARIO="+scenario,
 				"FAKE_CLUSTER="+clusterPath, "FAKE_CALLER="+callerPath, "TMPDIR="+dir)
 			output, runErr := command.CombinedOutput()
+			if bytes.Contains(output, []byte("DO_NOT_RECORD")) || bytes.Contains(output, []byte("synthetic-ca")) || bytes.Contains(output, []byte("bad-json")) {
+				t.Fatalf("raw cluster metadata leaked to diagnostics: %q", output)
+			}
 			if scenario == "full-json-compatible" {
 				if runErr != nil {
 					t.Fatalf("fresh CI metadata rejected: %v %s", runErr, output)
@@ -4667,7 +4676,7 @@ touch "$FAKE_DIR/metadata-pod-created"
 				}
 				return
 			}
-			if scenario == "credential-fields" || scenario == "jq-failure" || scenario == "sanitizer-failure" {
+			if scenario == "credential-fields" || scenario == "jq-failure" || scenario == "jq-large-failure" || scenario == "sanitizer-failure" {
 				if runErr == nil {
 					t.Fatalf("cluster projection failure accepted: %s", scenario)
 				}
@@ -4685,7 +4694,7 @@ touch "$FAKE_DIR/metadata-pod-created"
 				}
 				var expectedStage string
 				switch scenario {
-				case "credential-fields", "jq-failure":
+				case "credential-fields", "jq-failure", "jq-large-failure":
 					expectedStage = "jq"
 				case "sanitizer-failure":
 					expectedStage = "sanitizer"
@@ -4722,6 +4731,74 @@ touch "$FAKE_DIR/metadata-pod-created"
 				t.Fatalf("gcloud failure stage receipt invalid: %v %q", err, failure)
 			}
 		})
+	}
+}
+
+func TestQualificationClusterProjectionSignalCleanupIsBounded(t *testing.T) {
+	helper, err := filepath.Abs("../cluster-metadata-projection.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	producer := filepath.Join(dir, "producer")
+	producerScript := `#!/bin/sh
+trap '' TERM
+printf '%s\n' "$PPID" > "$CAPTURE_PID_FILE"
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(producer, []byte(producerScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	capturePIDFile := filepath.Join(dir, "capture.pid")
+	script := `
+set -eu
+. "$HELPER"
+capture_cluster_metadata_projection "$OUT" "$FAILURE" "$PRODUCER"
+`
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+	command.Env = append(os.Environ(), "HELPER="+helper, "OUT="+filepath.Join(dir, "projected.json"), "FAILURE="+filepath.Join(dir, "failure.json"), "PRODUCER="+producer, "CAPTURE_PID_FILE="+capturePIDFile)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	started := time.Now()
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }()
+	var capturePID int
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		output, err := os.ReadFile(capturePIDFile)
+		if err != nil {
+			continue
+		}
+		capturePID, err = strconv.Atoi(strings.TrimSpace(string(output)))
+		if err == nil {
+			break
+		}
+	}
+	if capturePID == 0 {
+		_ = command.Process.Kill()
+		t.Fatal("capture subshell was not observed")
+	}
+	if err := syscall.Kill(capturePID, syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	runErr := command.Wait()
+	elapsed := time.Since(started)
+	if ctx.Err() != nil || elapsed > 6*time.Second {
+		t.Fatalf("TERM-ignoring producer cleanup was not bounded: elapsed=%s err=%v", elapsed, runErr)
+	}
+	var exited *exec.ExitError
+	if !errors.As(runErr, &exited) || exited.ExitCode() != 130 {
+		t.Fatalf("signal cleanup exit mismatch: elapsed=%s err=%v", elapsed, runErr)
+	}
+	for _, name := range []string{"projected.json", "failure.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("signal cleanup retained private projection artifact %s: %v", name, err)
+		}
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, ".cluster-projection.*")); len(matches) != 0 {
+		t.Fatalf("signal cleanup retained private projection directory: %v", matches)
 	}
 }
 

@@ -5,7 +5,7 @@ project_cluster_metadata() {
     . as $cluster |
     select(([.. | objects | to_entries[] |
       select(
-        ((.key=="clientKey" or .key=="clientCertificate" or .key=="token") and
+        ((.key=="clientKey" or .key=="clientCertificate" or .key=="token" or .key=="username" or .key=="password") and
          ((.value|type)!="string" or (.value|length)>0)) or
         .key=="exec" or .key=="authProvider")
     ] | length)==0) |
@@ -27,10 +27,23 @@ capture_cluster_metadata_projection() (
   private_dir=${output%/*}/.cluster-projection.$$
   fifo=$private_dir/full-json.pipe
   projected=$private_dir/projected.json
+  projection_status=$private_dir/projection.exit
   # shellcheck disable=SC2329 # Invoked by trap.
   cleanup_cluster_metadata_capture() {
-    if [ -n "${producer_pid:-}" ]; then kill "$producer_pid" 2>/dev/null || :; wait "$producer_pid" 2>/dev/null || :; fi
-    rm -f "$fifo" "$projected"
+    for cleanup_pid in ${producer_pid:-} ${consumer_pid:-}; do kill -TERM "$cleanup_pid" 2>/dev/null || :; done
+    cleanup_wait=0
+    while [ "$cleanup_wait" -lt 3 ]; do
+      cleanup_running=false
+      for cleanup_pid in ${producer_pid:-} ${consumer_pid:-}; do
+        if kill -0 "$cleanup_pid" 2>/dev/null; then cleanup_running=true; fi
+      done
+      [ "$cleanup_running" = true ] || break
+      sleep 1
+      cleanup_wait=$((cleanup_wait + 1))
+    done
+    for cleanup_pid in ${producer_pid:-} ${consumer_pid:-}; do kill -KILL "$cleanup_pid" 2>/dev/null || :; done
+    for cleanup_pid in ${producer_pid:-} ${consumer_pid:-}; do wait "$cleanup_pid" 2>/dev/null || :; done
+    rm -f "$fifo" "$projected" "$projection_status"
     rmdir "$private_dir" 2>/dev/null || :
   }
   trap cleanup_cluster_metadata_capture 0
@@ -40,8 +53,20 @@ capture_cluster_metadata_projection() (
   mkfifo -m 600 "$fifo" || return 1
   "$@" --format=json > "$fifo" 2>/dev/null &
   producer_pid=$!
-  projection_exit=0
-  project_cluster_metadata < "$fifo" > "$projected" 2>/dev/null || projection_exit=$?
+  {
+    projection_exit=0
+    project_cluster_metadata > "$projected" 2>/dev/null || projection_exit=$?
+    # Keep the producer's pipe open through EOF so a projection error cannot
+    # turn its real exit into a misleading SIGPIPE 141.
+    cat >/dev/null
+    printf '%s\n' "$projection_exit" > "$projection_status"
+  } < "$fifo" &
+  consumer_pid=$!
+  consumer_exit=0
+  wait "$consumer_pid" || consumer_exit=$?
+  consumer_pid=
+  projection_exit=$consumer_exit
+  if [ -f "$projection_status" ]; then projection_exit=$(cat "$projection_status"); fi
   producer_exit=0
   wait "$producer_pid" || producer_exit=$?
   producer_pid=
