@@ -233,25 +233,29 @@ spec:
           object.spec.containers[0].name == 'inspector') ||
          (object.metadata.name == 'rhiza-inspector-control' && object.metadata.labels['app'] == 'rhiza-inspector-control' &&
           object.spec.containers[0].name == 'control')) &&
-        has(object.spec.hostNetwork) && object.spec.hostNetwork == false &&
-        has(object.spec.hostPID) && object.spec.hostPID == false &&
-        has(object.spec.hostIPC) && object.spec.hostIPC == false &&
+        (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
+        (!has(object.spec.hostPID) || object.spec.hostPID == false) &&
+        (!has(object.spec.hostIPC) || object.spec.hostIPC == false) &&
         object.spec.restartPolicy == 'Never' && !has(object.spec.volumes) &&
         object.spec.securityContext.runAsNonRoot == true && object.spec.securityContext.runAsUser == 65532 &&
         object.spec.securityContext.runAsGroup == 65532 && object.spec.securityContext.fsGroup == 65532 &&
         object.spec.securityContext.seccompProfile.type == 'RuntimeDefault' &&
         !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers) &&
-        object.spec.containers[0].keys().all(k, k in ['name','image','imagePullPolicy','command','resources',
-          'securityContext','terminationMessagePath','terminationMessagePolicy']) &&
+        !has(object.spec.containers[0].args) && !has(object.spec.containers[0].workingDir) &&
+        !has(object.spec.containers[0].ports) && !has(object.spec.containers[0].envFrom) &&
+        !has(object.spec.containers[0].env) && !has(object.spec.containers[0].volumeMounts) &&
+        !has(object.spec.containers[0].volumeDevices) && !has(object.spec.containers[0].livenessProbe) &&
+        !has(object.spec.containers[0].readinessProbe) && !has(object.spec.containers[0].startupProbe) &&
+        !has(object.spec.containers[0].lifecycle) && !has(object.spec.containers[0].stdin) &&
+        !has(object.spec.containers[0].stdinOnce) && !has(object.spec.containers[0].tty) &&
+        @RESIZE_POLICY_GUARD@ && @RESTART_POLICY_GUARD@ && @RESTART_POLICY_RULES_GUARD@ &&
         object.spec.containers[0].image == '@HOST_IMAGE@' &&
         object.spec.containers[0].command == ['sh','-c','sleep 1500'] &&
-        !has(object.spec.containers[0].args) && !has(object.spec.containers[0].env) &&
-        !has(object.spec.containers[0].envFrom) && !has(object.spec.containers[0].ports) &&
-        !has(object.spec.containers[0].volumeMounts) && !has(object.spec.containers[0].readinessProbe) &&
-        !has(object.spec.containers[0].livenessProbe) && !has(object.spec.containers[0].startupProbe) &&
-        !has(object.spec.containers[0].lifecycle) && !has(object.spec.containers[0].workingDir) &&
-        !has(object.spec.containers[0].stdin) && !has(object.spec.containers[0].stdinOnce) &&
-        !has(object.spec.containers[0].tty) && has(object.spec.containers[0].securityContext) &&
+        object.spec.containers[0].terminationMessagePath == '/dev/termination-log' &&
+        object.spec.containers[0].terminationMessagePolicy == 'File' &&
+        has(object.spec.containers[0].securityContext) &&
+        (!has(object.spec.containers[0].securityContext.privileged) ||
+          object.spec.containers[0].securityContext.privileged == false) &&
         object.spec.containers[0].securityContext.allowPrivilegeEscalation == false &&
         object.spec.containers[0].securityContext.readOnlyRootFilesystem == true &&
         object.spec.containers[0].securityContext.runAsNonRoot == true &&

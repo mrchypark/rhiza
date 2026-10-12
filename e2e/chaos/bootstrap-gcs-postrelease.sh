@@ -156,6 +156,30 @@ mapping='google.subject=assertion.sub,attribute.repository_id=assertion.reposito
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/cluster-metadata-projection.sh"
 describe_cluster_metadata() { exec gcloud --project="$project" --quiet "$@"; }
+container_schema_variant=25
+review_container_schema() {
+    container_schema_fields=$(jq -ce '
+      if type=="object" and (.definitions|type)=="object" and
+        (.definitions["io.k8s.api.core.v1.Container"]|type)=="object" and
+        .definitions["io.k8s.api.core.v1.Container"].type=="object" and
+        (.definitions["io.k8s.api.core.v1.Container"].properties|type)=="object"
+      then (.definitions["io.k8s.api.core.v1.Container"].properties|keys)
+      else error("invalid Container OpenAPI v2 schema") end
+    ' "$1") || return 1
+    case "$container_schema_fields" in
+        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resources","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
+            container_schema_variant=22 ;;
+        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resizePolicy","resources","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
+            container_schema_variant=23 ;;
+        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resizePolicy","resources","restartPolicy","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
+            container_schema_variant=24 ;;
+        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resizePolicy","resources","restartPolicy","restartPolicyRules","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
+            container_schema_variant=25 ;;
+        *) return 1 ;;
+    esac
+    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
+    printf '%s\n' "$container_schema_fields" > "$2"
+}
 render() {
     runtime_kind=User; runtime_name=$ci
     runtime_api_group='    apiGroup: rbac.authorization.k8s.io'; runtime_namespace=
@@ -163,10 +187,19 @@ render() {
         runtime_kind=ServiceAccount; runtime_name=rhiza-runtime
         runtime_api_group=; runtime_namespace="    namespace: $ns"
     fi
+    case "$container_schema_variant" in
+        22) resize_guard=true; restart_guard=true; restart_rules_guard=true ;;
+        23) resize_guard='!has(object.spec.containers[0].resizePolicy)'; restart_guard=true; restart_rules_guard=true ;;
+        24) resize_guard='!has(object.spec.containers[0].resizePolicy)'; restart_guard='!has(object.spec.containers[0].restartPolicy)'; restart_rules_guard=true ;;
+        25) resize_guard='!has(object.spec.containers[0].resizePolicy)'; restart_guard='!has(object.spec.containers[0].restartPolicy)'; restart_rules_guard='!has(object.spec.containers[0].restartPolicyRules)' ;;
+        *) die "Unexpected reviewed Container schema variant: $container_schema_variant" ;;
+    esac
     sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" \
       -e "s/@NODE_A@/$RHIZA_NODE_A/g" -e "s/@NODE_B@/$RHIZA_NODE_B/g" -e "s/@NODE_C@/$RHIZA_NODE_C/g" \
       -e "s|@HOST_IMAGE@|$RHIZA_HOST_IMAGE|g" \
       -e "s|@METADATA_IMAGE@|$RHIZA_METADATA_IMAGE|g" \
+      -e "s|@RESIZE_POLICY_GUARD@|$resize_guard|g" -e "s|@RESTART_POLICY_GUARD@|$restart_guard|g" \
+      -e "s|@RESTART_POLICY_RULES_GUARD@|$restart_rules_guard|g" \
       -e "s/@RUNTIME_KIND@/$runtime_kind/g" -e "s/@RUNTIME_NAME@/$runtime_name/g" \
       -e "s/@RUNTIME_API_GROUP@/$runtime_api_group/g" -e "s/@RUNTIME_NAMESPACE@/$runtime_namespace/g" \
       "$script_dir/gcs-postrelease-auth.yaml.in" | awk -v mode="$auth_mode" '
@@ -1078,6 +1111,17 @@ k() { kubectl --context="$context" "$@"; }
 g() { gcloud --project="$project" --quiet "$@"; }
 identity=$(jq -nc --arg run "$RHIZA_RUN_ID" --arg sha "$RHIZA_WORKFLOW_SHA" --arg expiry "$RHIZA_AUTH_EXPIRES" --arg cap "$RHIZA_COST_CAP_KRW" --arg owner "$owner" --arg host_image "$RHIZA_HOST_IMAGE" '{run:$run,workflow_sha:$sha,expiry:$expiry,cost_cap_krw:$cap,owner:$owner,host_image:$host_image}')
 if [ "$auth_mode" = local ]; then identity=$(printf '%s\n' "$identity" | jq -c '.auth_mode="local"'); fi
+# Receipts are local and private, not public artifacts. No shell tracing/tokens.
+record() {
+    receipt=$1; shift
+    printf '%s\n' "$receipt" > "$RHIZA_AUTH_STATE/inflight"
+    if "$@" > "$RHIZA_AUTH_STATE/$receipt.json" 2> "$RHIZA_AUTH_STATE/$receipt.stderr"; then
+        printf '0\n' > "$RHIZA_AUTH_STATE/$receipt.exit"
+    else
+        rc=$?; printf '%s\n' "$rc" > "$RHIZA_AUTH_STATE/$receipt.exit"
+        die "Stopped at $receipt (exit $rc); preserve receipts, resolve unknown outcome before rollback"
+    fi
+}
 if [ "$mode" = apply ]; then
     # Refuse stale/long-lived grants before the first remote call.
     expires=$(utc_epoch "$RHIZA_AUTH_EXPIRES")
@@ -1095,6 +1139,10 @@ if [ "$mode" = apply ]; then
     [ ! -e "$RHIZA_AUTH_STATE" ] || die 'Receipt directory exists; no resume or adoption'
     mkdir -m 700 "$RHIZA_AUTH_STATE"
     printf '%s\n' "$identity" > "$RHIZA_AUTH_STATE/identity.json"
+    record kubernetes-container-schema k get --raw=/openapi/v2
+    review_container_schema "$RHIZA_AUTH_STATE/kubernetes-container-schema.json" \
+      "$RHIZA_AUTH_STATE/kubernetes-container-schema-fields.json" ||
+        die "Unsupported Container OpenAPI schema; preserve $RHIZA_AUTH_STATE/kubernetes-container-schema.json"
     render > "$RHIZA_AUTH_STATE/auth.yaml"
     # Admission policies are cluster-scoped, so the API server can compile the
     # exact rendered CEL before the namespace or any other resource exists.
@@ -1110,17 +1158,6 @@ fi
 [ ! -L "$RHIZA_AUTH_STATE" ] && [ "$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)" = "$RHIZA_AUTH_STATE" ] || die 'State path must be a private physical directory'
 [ -n "$(find "$RHIZA_AUTH_STATE" -prune -type d -user "$(id -u)" -perm 0700 -print)" ] || die 'State directory owner/mode rejected'
 [ "$(g config get-value account 2>/dev/null)" = "$RHIZA_EXPECTED_ADMIN_ACCOUNT" ] || die 'Unexpected administrative account'
-# Receipts are local and private, not public artifacts. No shell tracing/tokens.
-record() {
-    receipt=$1; shift
-    printf '%s\n' "$receipt" > "$RHIZA_AUTH_STATE/inflight"
-    if "$@" > "$RHIZA_AUTH_STATE/$receipt.json" 2> "$RHIZA_AUTH_STATE/$receipt.stderr"; then
-        printf '0\n' > "$RHIZA_AUTH_STATE/$receipt.exit"
-    else
-        rc=$?; printf '%s\n' "$rc" > "$RHIZA_AUTH_STATE/$receipt.exit"
-        die "Stopped at $receipt (exit $rc); preserve receipts, resolve unknown outcome before rollback"
-    fi
-}
 absent() {
     item=$1; shift
     if "$@" > "$RHIZA_AUTH_STATE/absent-$item.json" 2> "$RHIZA_AUTH_STATE/absent-$item.stderr"; then
