@@ -23,7 +23,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -132,20 +131,11 @@ func TestQualificationHarnessUsesExplicitAssetContract(t *testing.T) {
 			t.Fatalf("cloud asset %s is not an explicit required input in both harness stages", variable)
 		}
 	}
-	authTemplate, err := os.ReadFile("../gcs-postrelease-auth.yaml.in")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, placeholder := range []string{"@NODE_A@", "@NODE_B@", "@NODE_C@", "@HOST_IMAGE@", "@METADATA_IMAGE@"} {
-		if !bytes.Contains(authTemplate, []byte(placeholder)) {
-			t.Fatalf("admission template lacks explicit placeholder %s", placeholder)
-		}
-	}
 	workloadTemplate, err := os.ReadFile("../gcs-postrelease.yaml.in")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, placeholder := range []string{"__GCS_BUCKET__", "__GCS_PREFIX__"} {
+	for _, placeholder := range []string{"__GCS_BUCKET__", "__GCS_PREFIX__", "__NODE_A__", "__NODE_B__", "__NODE_C__", "__HOST_IMAGE__", "__METADATA_IMAGE__"} {
 		if !bytes.Contains(workloadTemplate, []byte(placeholder)) {
 			t.Fatalf("workload template lacks explicit placeholder %s", placeholder)
 		}
@@ -632,41 +622,6 @@ func TestQualificationLearnerIdentityAndVolumeContract(t *testing.T) {
 }
 
 func TestQualificationInspectorIsolationContract(t *testing.T) {
-	auth, err := os.ReadFile("../gcs-postrelease-auth.yaml.in")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, required := range []string{
-		"name: rhiza-inspector", "automountServiceAccountToken: false",
-		"object.metadata.name == 'rhiza-inspector-control'", "object.metadata.labels['app'] == 'rhiza-inspector-control'",
-		"object.spec.serviceAccountName != 'rhiza-inspector'", "object.metadata.name == 'rhiza-inspector'",
-		"size(object.metadata.labels) == 2", "object.spec.hostNetwork == false",
-		"(!has(object.spec.hostNetwork) || object.spec.hostNetwork == false)",
-		"(!has(object.spec.hostPID) || object.spec.hostPID == false)",
-		"(!has(object.spec.hostIPC) || object.spec.hostIPC == false)",
-		"!has(object.spec.volumes)", "size(object.spec.containers) == 1",
-		"object.spec.containers[0].image == '@HOST_IMAGE@'", "!has(object.spec.containers[0].lifecycle)",
-		"object.spec.securityContext.runAsUser == 65532",
-		"object.spec.containers[0].securityContext.readOnlyRootFilesystem == true",
-		"object.spec.containers[0].terminationMessagePath == '/dev/termination-log'",
-		"object.spec.containers[0].terminationMessagePolicy == 'File'",
-		"!has(object.spec.containers[0].args)", "!has(object.spec.containers[0].env)",
-		"!has(object.spec.containers[0].envFrom)", "!has(object.spec.containers[0].ports)",
-		"!has(object.spec.containers[0].volumeMounts)", "!has(object.spec.containers[0].volumeDevices)",
-		"!has(object.spec.containers[0].readinessProbe)", "!has(object.spec.containers[0].livenessProbe)",
-		"!has(object.spec.containers[0].startupProbe)", "!has(object.spec.containers[0].workingDir)",
-		"!has(object.spec.containers[0].stdin)", "!has(object.spec.containers[0].stdinOnce)",
-		"!has(object.spec.containers[0].tty)",
-		"!has(object.spec.containers[0].securityContext.privileged)",
-		"@RESIZE_POLICY_GUARD@", "@RESTART_POLICY_GUARD@", "@RESTART_POLICY_RULES_GUARD@",
-	} {
-		if !bytes.Contains(auth, []byte(required)) {
-			t.Fatalf("inspector admission contract missing %q", required)
-		}
-	}
-	if bytes.Contains(auth, []byte("name: rhiza-inspector\n  annotations:")) {
-		t.Fatal("inspector KSA unexpectedly has annotations")
-	}
 	bootstrap, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -731,14 +686,13 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{`run inspector-networkpolicy-bootstrap`, `run runtime-inspector-preflight`, `run runtime-inspector-control-preflight`, `validate_inspector_pod`, `validate_inspector_control_pod`, `validate_inspector_access`, `delete_inspector_owned`, `inspector-terminal-pods.json`, `inspector-terminal-networkpolicy.json`, `inspector-manual-cleanup-required`, `run inspector-control-before-reachable probe_inspector_control_egress`, `run inspector-egress-denied probe_inspector_egress`, `run inspector-control-after-reachable probe_inspector_control_egress`, `paired-network-policy-proof=control-reachable`, `paired-network-policy-proof=inspector-denied`, `reject_server_dry_run "inspector-control-negative-$negative"`, `busybox nc -w 3`, `reject_runtime_networkpolicy_mutation runtime-networkpolicy-delete-denied`, `reject_runtime_networkpolicy_mutation runtime-networkpolicy-replace-denied`, `reject_runtime_networkpolicy_mutation runtime-networkpolicy-additive-denied`} {
+	for _, required := range []string{`run inspector-networkpolicy-bootstrap`, `validate_inspector_pod`, `validate_inspector_control_pod`, `validate_inspector_access`, `delete_inspector_owned`, `inspector-terminal-pods.json`, `inspector-terminal-networkpolicy.json`, `inspector-manual-cleanup-required`, `run inspector-control-before-reachable probe_inspector_control_egress`, `run inspector-egress-denied probe_inspector_egress`, `run inspector-control-after-reachable probe_inspector_control_egress`, `paired-network-policy-proof=control-reachable`, `paired-network-policy-proof=inspector-denied`, `busybox nc -w 3`, `reject_runtime_networkpolicy_mutation runtime-networkpolicy-delete-denied`, `reject_runtime_networkpolicy_mutation runtime-networkpolicy-replace-denied`, `reject_runtime_networkpolicy_mutation runtime-networkpolicy-additive-denied`, `"topology.kubernetes.io/region","topology.kubernetes.io/zone"`} {
 		if !bytes.Contains(script, []byte(required)) {
 			t.Fatalf("inspector lifecycle contract missing %q", required)
 		}
 	}
 	source := string(script)
 	policyVerify := strings.Index(source, "run inspector-networkpolicy-bootstrap")
-	negativeDryRun := strings.Index(source, `reject_server_dry_run "inspector-negative-$negative"`)
 	podCreate := strings.Index(source, "run inspector-create k create")
 	controlCreate := strings.Index(source, "run inspector-control-create k create")
 	controlProbeBefore := strings.Index(source, "run inspector-control-before-reachable")
@@ -746,8 +700,8 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 	controlProbeAfter := strings.Index(source, "run inspector-control-after-reachable")
 	networkVerify := strings.LastIndex(source, `verify_inspector_network_isolation "$api_server"`)
 	decode := strings.Index(source, "run archive-head-decoded")
-	if policyVerify < 0 || negativeDryRun <= policyVerify || podCreate <= negativeDryRun || controlCreate <= podCreate || controlProbeBefore < 0 || probe <= controlProbeBefore || controlProbeAfter <= probe || networkVerify <= controlCreate || decode <= networkVerify {
-		t.Fatal("inspector ordering must be bootstrap policy verification, admission probes, inspector/control creation, paired reachability/denial, then decode")
+	if policyVerify < 0 || podCreate <= policyVerify || controlCreate <= podCreate || controlProbeBefore < 0 || probe <= controlProbeBefore || controlProbeAfter <= probe || networkVerify <= controlCreate || decode <= networkVerify {
+		t.Fatal("inspector ordering must be bootstrap policy verification, inspector/control creation, paired reachability/denial, then decode")
 	}
 	start := strings.Index(source, "\nvalidate_probe_pod() {\n")
 	end := strings.Index(source[start+1:], "\nvalidate_learner_pod() {\n")
@@ -761,11 +715,19 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 	}
 	digest := "sha256:" + strings.Repeat("a", 64)
 	validPod := fmt.Sprintf(`{"metadata":{"name":"rhiza-inspector","namespace":"ns","uid":"created","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}},"spec":{"serviceAccountName":"rhiza-inspector","automountServiceAccountToken":false,"hostNetwork":false,"hostPID":false,"hostIPC":false,"nodeName":"node-a","restartPolicy":"Never","securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"fsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"inspector","image":"candidate@%s","command":["sh","-c","sleep 1500"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"runAsNonRoot":true,"capabilities":{"drop":["ALL"]}}}]},"status":{"phase":"Running","containerStatuses":[{"name":"inspector","ready":true,"restartCount":0,"state":{"running":{"startedAt":"2026-01-01T00:00:00Z"}},"imageID":"candidate@%s"}]}}`, digest, digest)
+	defaultedTopologyPod := strings.Replace(validPod,
+		`"labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}`,
+		`"labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4","topology.kubernetes.io/region":"region","topology.kubernetes.io/zone":"zone"}`, 1)
 	for _, tc := range []struct {
 		name, pod string
 		valid     bool
 	}{
 		{"exact", validPod, true},
+		{"defaulted-topology-labels", defaultedTopologyPod, true},
+		{"wrong-run-label", strings.Replace(validPod, `"chaos.rhiza.io/run":"a1b2c3d4"`, `"chaos.rhiza.io/run":"wrong"`, 1), false},
+		{"wrong-app-label", strings.Replace(validPod, `"app":"rhiza-inspector"`, `"app":"other"`, 1), false},
+		{"unexpected-label", strings.Replace(validPod, `"labels":{`, `"labels":{"unexpected":"value",`, 1), false},
+		{"partial-topology-labels", strings.Replace(validPod, `"labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}`, `"labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4","topology.kubernetes.io/region":"region"}`, 1), false},
 		{"credential-env", strings.Replace(validPod, `"command":[`, `"env":[{"name":"GOOGLE_APPLICATION_CREDENTIALS","value":"/secret"}],"command":[`, 1), false},
 		{"service-account-token", strings.Replace(validPod, `"automountServiceAccountToken":false`, `"automountServiceAccountToken":true`, 1), false},
 		{"wrong-service-account", strings.Replace(validPod, `"serviceAccountName":"rhiza-inspector"`, `"serviceAccountName":"rhiza-gcs"`, 1), false},
@@ -1030,7 +992,7 @@ func TestQualificationExtractCreatedIdentitiesSurviveGuardFailure(t *testing.T) 
 		object("Namespace", ns, true),
 		object("ServiceAccount", "rhiza-inspector", false),
 	}
-	for _, suffix := range []string{"faults", "network-faults", "runtime"} {
+	for _, suffix := range []string{"faults", "network-faults"} {
 		base = append(base,
 			object("ValidatingAdmissionPolicy", ns+"-"+suffix, true),
 			object("ValidatingAdmissionPolicyBinding", ns+"-"+suffix, true),
@@ -1041,7 +1003,6 @@ func TestQualificationExtractCreatedIdentitiesSurviveGuardFailure(t *testing.T) 
 		"namespace-identity.json", "inspector-ksa-identity.json",
 		"validatingadmissionpolicy-faults-identity.json", "validatingadmissionpolicybinding-faults-identity.json",
 		"validatingadmissionpolicy-network-faults-identity.json", "validatingadmissionpolicybinding-network-faults-identity.json",
-		"validatingadmissionpolicy-runtime-identity.json", "validatingadmissionpolicybinding-runtime-identity.json",
 		"clusterrole-reader-identity.json", "clusterrolebinding-reader-identity.json",
 	}
 	runExtraction := func(t *testing.T, docs []map[string]any, forceGuardFailure bool) error {
@@ -1061,7 +1022,7 @@ func TestQualificationExtractCreatedIdentitiesSurviveGuardFailure(t *testing.T) 
 			"\nextract_created_identity namespace \"" + ns + "\" \"$RHIZA_AUTH_STATE/namespace-identity.json\" \"" + owner + "\" || exit $?" +
 			"\nextract_created_identity ServiceAccount rhiza-inspector \"$RHIZA_AUTH_STATE/inspector-ksa-identity.json\" \"\" || exit $?"
 		for _, kind := range []string{"validatingadmissionpolicy", "validatingadmissionpolicybinding"} {
-			for _, suffix := range []string{"faults", "network-faults", "runtime"} {
+			for _, suffix := range []string{"faults", "network-faults"} {
 				script += "\nextract_created_identity " + kind + " \"" + ns + "-" + suffix + "\" \"$RHIZA_AUTH_STATE/" + kind + "-" + suffix + "-identity.json\" \"" + owner + "\" || exit $?"
 			}
 		}
@@ -1151,8 +1112,8 @@ k() {
   case "$*" in
     "get pods -o json")
       printf '{"items":['; comma=
-      if [ "$pod_exists" = true ] && [ ! -f "$out/pod.deleted" ]; then printf '%s' '{"metadata":{"name":"rhiza-inspector","namespace":"ns","uid":"pod-uid","resourceVersion":"11","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}}}'; comma=,; fi
-      if [ "$control_exists" = true ] && [ ! -f "$out/control.deleted" ]; then printf '%s' "$comma"'{"metadata":{"name":"rhiza-inspector-control","namespace":"ns","uid":"control-uid","resourceVersion":"12","labels":{"app":"rhiza-inspector-control","chaos.rhiza.io/run":"a1b2c3d4"}}}'; fi
+      if [ "$pod_exists" = true ] && [ ! -f "$out/pod.deleted" ]; then printf '%s' '{"metadata":{"name":"rhiza-inspector","namespace":"ns","uid":"pod-uid","resourceVersion":"11","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4","topology.kubernetes.io/region":"region","topology.kubernetes.io/zone":"zone"}}}'; comma=,; fi
+      if [ "$control_exists" = true ] && [ ! -f "$out/control.deleted" ]; then printf '%s' "$comma"'{"metadata":{"name":"rhiza-inspector-control","namespace":"ns","uid":"control-uid","resourceVersion":"12","labels":{"app":"rhiza-inspector-control","chaos.rhiza.io/run":"a1b2c3d4","topology.kubernetes.io/region":"region","topology.kubernetes.io/zone":"zone"}}}'; fi
       printf ']}\n' ;;
     "get networkpolicy.networking.k8s.io rhiza-inspector-deny-all -o json") printf '%s\n' '{"metadata":{"name":"rhiza-inspector-deny-all"}}' ;;
     "get networkpolicies.networking.k8s.io -o json") printf '%s\n' '{"items":[{"metadata":{"uid":"policy-uid"}}]}' ;;
@@ -1181,42 +1142,6 @@ delete_inspector_owned`
 				}
 			}
 		})
-	}
-}
-
-func TestQualificationInspectorNegativeServerDryRun(t *testing.T) {
-	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(sourceBytes)
-	start := strings.Index(source, "\nreject_server_dry_run() {\n")
-	end := strings.Index(source[start+1:], "\nstarted=")
-	if start < 0 || end < 0 {
-		t.Fatal("negative server dry-run helper missing")
-	}
-	helper := source[start : start+1+end]
-	for _, admitted := range []bool{false, true} {
-		dir := t.TempDir()
-		manifest := filepath.Join(dir, "negative.yaml")
-		if err := os.WriteFile(manifest, []byte("kind: Pod\n"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		fixture := `set -eu
-out=$1; ns=synthetic; seq=0; admitted=$3; expected_manifest=$2
-die() { exit 97; }
-k() {
-  [ "$1 $2" = "create --dry-run=server" ] && [ "$3" = -f ] && [ "$4" = "$expected_manifest" ] && [ "$5 $6" = "-o json" ] || return 96
-  if [ "$admitted" = true ]; then printf '%s\n' '{"kind":"Pod"}'; return 0; fi
-  printf '%s\n' 'ValidatingAdmissionPolicy synthetic-runtime denied request' >&2; return 1
-}
-` + helper + `
-label=negative; manifest=$2; reject_server_dry_run "$label" "$manifest"`
-		command := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, manifest, strconv.FormatBool(admitted))
-		err := command.Run()
-		if (err == nil) == admitted {
-			t.Fatalf("admitted=%t error=%v", admitted, err)
-		}
 	}
 }
 
@@ -1599,13 +1524,13 @@ func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v: %s", err, authRendered)
 	}
-	for _, placeholder := range []string{"@HOST_IMAGE@", "@METADATA_IMAGE@", "@NODE_A@", "@NODE_B@", "@NODE_C@"} {
-		if bytes.Contains(authRendered, []byte(placeholder)) {
-			t.Fatalf("rendered admission policy retained placeholder %s", placeholder)
-		}
+	if bytes.Contains(authRendered, []byte("kind: ValidatingAdmissionPolicy\nmetadata:\n  name: rhiza-qualification-"+runID+"-runtime")) {
+		t.Fatal("rendered auth contract retained the excluded runtime admission policy")
 	}
-	if !bytes.Contains(authRendered, []byte("object.spec.containers[0].image == 'ghcr.io/mrchypark/rhiza-sql@sha256:"+strings.Repeat("a", 64)+"'")) {
-		t.Fatal("rendered admission policy did not seal the exact candidate digest")
+	for _, policy := range []string{"faults", "network-faults"} {
+		if !bytes.Contains(authRendered, []byte("kind: ValidatingAdmissionPolicy\nmetadata:\n  name: rhiza-qualification-"+runID+"-"+policy)) {
+			t.Fatalf("rendered auth contract lost %s admission policy", policy)
+		}
 	}
 	template, err := os.ReadFile("../gcs-postrelease.yaml.in")
 	if err != nil {
@@ -5228,239 +5153,18 @@ func TestQualificationServerDryRunPrecedesEveryPersistentCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	bootstrapText := string(bootstrap)
-	schemaQuery := strings.Index(bootstrapText, "record kubernetes-container-schema k get --raw=/openapi/v2")
-	schemaReview := strings.Index(bootstrapText, "review_container_schema \"$RHIZA_AUTH_STATE/kubernetes-container-schema.json\"")
 	renderCall := strings.Index(bootstrapText, "render > \"$RHIZA_AUTH_STATE/auth.yaml\"")
 	policyRender := strings.Index(bootstrapText, `"$RHIZA_AUTH_STATE/auth.yaml" > "$RHIZA_AUTH_STATE/auth-admission-policies.yaml"`)
 	policyPreflight := strings.Index(bootstrapText, `record kubernetes-auth-preflight k create --dry-run=server`)
 	firstCloudCreate := strings.Index(bootstrapText, `record data-create create_account`)
 	kubernetesCreate := strings.Index(bootstrapText, `record kubernetes-create k create -f "$RHIZA_AUTH_STATE/auth.yaml"`)
-	if schemaQuery < 0 || schemaReview <= schemaQuery || renderCall <= schemaReview ||
-		policyRender < renderCall || policyPreflight <= policyRender ||
-		firstCloudCreate <= schemaQuery || firstCloudCreate <= renderCall ||
+	if renderCall < 0 || policyRender < renderCall || policyPreflight <= policyRender ||
+		firstCloudCreate <= renderCall ||
 		firstCloudCreate <= policyPreflight || kubernetesCreate <= policyPreflight {
 		t.Fatal("exact admission-policy server dry-run must precede persistent bootstrap creates")
 	}
 	if strings.Contains(bootstrapText[policyPreflight:kubernetesCreate], `mark kubernetes`) {
 		t.Fatal("auth dry-run must not create an ownership marker")
-	}
-
-	runtime, err := os.ReadFile("../run-gcs-postrelease.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	runtimeText := string(runtime)
-	initialPreflight := strings.Index(runtimeText, `run runtime-initial-preflight k create --dry-run=server -f "$out/initial.yaml"`)
-	learnerPreflight := strings.Index(runtimeText, `run runtime-learner-preflight k create --dry-run=server -f "$out/learner.yaml"`)
-	inspectorPreflight := strings.Index(runtimeText, `run runtime-inspector-preflight k create --dry-run=server -f "$out/inspector-pod.yaml"`)
-	controlPreflight := strings.Index(runtimeText, `run runtime-inspector-control-preflight k create --dry-run=server -f "$out/inspector-control-pod.yaml"`)
-	owned := strings.Index(runtimeText, "\nowned_created=true\n")
-	createMetadata := strings.Index(runtimeText, `run create-metadata k create -f "$out/metadata.yaml"`)
-	if initialPreflight < 0 || learnerPreflight <= initialPreflight || inspectorPreflight <= learnerPreflight || controlPreflight <= inspectorPreflight || owned <= controlPreflight || createMetadata <= owned {
-		t.Fatal("exact runtime server dry-runs must precede ownership and persistent creation")
-	}
-	if strings.Contains(runtimeText[initialPreflight:owned], `owned_created=true`) {
-		t.Fatal("runtime dry-run must not count as apply")
-	}
-}
-
-func TestQualificationContainerOpenAPIContract(t *testing.T) {
-	bootstrap, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := string(bootstrap)
-	start := strings.Index(source, "\nreview_container_schema() {\n")
-	end := strings.Index(source[start+1:], "\nrender() {\n")
-	if start < 0 || end < 0 {
-		t.Fatal("Container OpenAPI schema reviewer missing")
-	}
-	reviewer := source[start : start+1+end]
-	baseFields := []string{
-		"args", "command", "env", "envFrom", "image", "imagePullPolicy", "lifecycle", "livenessProbe",
-		"name", "ports", "readinessProbe", "resources", "securityContext", "startupProbe", "stdin",
-		"stdinOnce", "terminationMessagePath", "terminationMessagePolicy", "tty", "volumeDevices",
-		"volumeMounts", "workingDir",
-	}
-	variants := map[int][]string{
-		22: baseFields,
-		23: append(append([]string(nil), baseFields...), "resizePolicy"),
-		24: append(append([]string(nil), baseFields...), "resizePolicy", "restartPolicy"),
-		25: append(append([]string(nil), baseFields...), "resizePolicy", "restartPolicy", "restartPolicyRules"),
-	}
-	for _, fields := range variants {
-		sort.Strings(fields)
-	}
-	schemaFixture := func(fields []string, mutate func(map[string]any)) []byte {
-		properties := make(map[string]any, len(fields))
-		for _, field := range fields {
-			properties[field] = map[string]any{"type": "string"}
-		}
-		container := map[string]any{"type": "object", "properties": properties}
-		document := map[string]any{"definitions": map[string]any{"io.k8s.api.core.v1.Container": container}}
-		if mutate != nil {
-			mutate(document)
-		}
-		raw, err := json.Marshal(document)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return raw
-	}
-	runCase := func(name string, raw []byte, inputMissing, wantOK bool, wantVariant int) {
-		t.Helper()
-		dir := t.TempDir()
-		input := filepath.Join(dir, "openapi-v2.json")
-		output := filepath.Join(dir, "fields.json")
-		if !inputMissing {
-			if err := os.WriteFile(input, raw, 0600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		command := exec.Command("/bin/sh", "-c", "container_schema_variant=\n"+reviewer+
-			"\nreview_container_schema \"$1\" \"$2\" || exit $?\nprintf '%s\\n' \"$container_schema_variant\"",
-			"fixture", input, output)
-		result, err := command.CombinedOutput()
-		if (err == nil) != wantOK {
-			t.Fatalf("%s accepted=%t want=%t output=%s", name, err == nil, wantOK, result)
-		}
-		if !wantOK {
-			if _, statErr := os.Stat(output); !os.IsNotExist(statErr) {
-				t.Fatalf("%s left a partial schema fields receipt", name)
-			}
-			return
-		}
-		if got := strings.TrimSpace(string(result)); got != strconv.Itoa(wantVariant) {
-			t.Fatalf("%s variant=%q want=%d", name, got, wantVariant)
-		}
-		fields := variants[wantVariant]
-		want, err := json.Marshal(fields)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, err := os.ReadFile(output)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.TrimSpace(string(got)) != string(want) {
-			t.Fatalf("%s extracted fields=%s want=%s", name, got, want)
-		}
-	}
-	for variant, fields := range variants {
-		runCase("variant-"+strconv.Itoa(variant), schemaFixture(fields, nil), false, true, variant)
-	}
-	runCase("missing-field", schemaFixture(baseFields[1:], nil), false, false, 0)
-	runCase("extra-field", schemaFixture(append(append([]string(nil), baseFields...), "futureField"), nil), false, false, 0)
-	runCase("malformed-definition", schemaFixture(baseFields, func(document map[string]any) {
-		container := document["definitions"].(map[string]any)["io.k8s.api.core.v1.Container"].(map[string]any)
-		container["type"] = "not-object"
-	}), false, false, 0)
-	runCase("missing-definition", schemaFixture(baseFields, func(document map[string]any) {
-		document["definitions"] = map[string]any{}
-	}), false, false, 0)
-	runCase("failed-query", nil, true, false, 0)
-	if !strings.Contains(source, "record kubernetes-container-schema k get --raw=/openapi/v2") ||
-		!strings.Contains(source, ".definitions[\"io.k8s.api.core.v1.Container\"].properties|keys") {
-		t.Fatal("actual OpenAPI v2 endpoint or Container definition shape is not pinned")
-	}
-}
-
-func TestQualificationBootstrapApplySchemaGatePrecedesCreate(t *testing.T) {
-	generator := []byte("#!/bin/sh\nexit 0\n")
-	generatorHash := fmt.Sprintf("%x", sha256.Sum256(generator))
-	properties := map[string]any{"args": map[string]any{"type": "string"}}
-	badSchema, err := json.Marshal(map[string]any{"definitions": map[string]any{
-		"io.k8s.api.core.v1.Container": map[string]any{"type": "object", "properties": properties},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, scenario := range []struct {
-		name            string
-		queryFails      bool
-		wantReceiptExit string
-		wantOutput      string
-	}{
-		{"failed-query", true, "53\n", "Stopped at kubernetes-container-schema (exit 53)"},
-		{"bad-schema", false, "0\n", "Unsupported Container OpenAPI schema"},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			run := "a1b2c3d4"
-			dir := t.TempDir()
-			bin := filepath.Join(dir, "bin")
-			state := filepath.Join(dir, "auth-state")
-			calls := filepath.Join(dir, "calls")
-			openAPI := filepath.Join(dir, "openapi-v2.json")
-			generatorPath := filepath.Join(bin, "fixture-generator")
-			if err := os.Mkdir(bin, 0700); err != nil {
-				t.Fatal(err)
-			}
-			files := map[string]string{
-				"fixture-generator": string(generator),
-				"gcloud":            "#!/bin/sh\nprintf '%s\\n' \"gcloud $*\" >> \"$FAKE_CALLS\"\nexit 98\n",
-				"curl":              "#!/bin/sh\nprintf '%s\\n' \"curl $*\" >> \"$FAKE_CALLS\"\nexit 98\n",
-				"timeout":           "#!/bin/sh\nprintf '%s\\n' \"timeout $*\" >> \"$FAKE_CALLS\"\nexit 98\n",
-				"kubectl": "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_CALLS\"\n" +
-					"[ \"$*\" = '--context=context-test get --raw=/openapi/v2' ] || exit 97\n" +
-					"[ \"$FAKE_SCENARIO\" != failed-query ] || { printf '%s\\n' synthetic-query-failure >&2; exit 53; }\n" +
-					"cat \"$FAKE_OPENAPI\"\n",
-			}
-			for name, content := range files {
-				if err := os.WriteFile(filepath.Join(bin, name), []byte(content), 0700); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := os.WriteFile(openAPI, badSchema, 0600); err != nil {
-				t.Fatal(err)
-			}
-			expiry := time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339)
-			command := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "apply-local")
-			command.Env = append(qualificationAssetEnv(run),
-				"PATH="+bin+":"+os.Getenv("PATH"), "FAKE_CALLS="+calls, "FAKE_OPENAPI="+openAPI,
-				"FAKE_SCENARIO="+scenario.name, "RHIZA_RUN_ID="+run,
-				"RHIZA_HARNESS_SHA="+strings.Repeat("a", 40),
-				"RHIZA_AUTH_EXPIRES="+expiry,
-				"RHIZA_HOST_IMAGE=registry.example/rhiza@sha256:"+strings.Repeat("a", 64),
-				"RHIZA_METADATA_IMAGE=registry.example/cloud-cli@sha256:"+strings.Repeat("b", 64),
-				"RHIZA_GKE_CLUSTER=test-cluster", "RHIZA_GKE_LOCATION=region-test1",
-				"RHIZA_KUBE_CONTEXT=context-test",
-				"RHIZA_NAMESPACE=rhiza-qualification-"+run,
-				"RHIZA_DATA_GSA_ID=rhiza-data-"+run,
-				"RHIZA_NODE_A=node-a", "RHIZA_NODE_B=node-b", "RHIZA_NODE_C=node-c",
-				"RHIZA_BOOTSTRAP_GO=I_APPROVE_NEW_SCOPE", "RHIZA_COST_CAP_KRW=10000",
-				"RHIZA_EXPECTED_ADMIN_ACCOUNT=admin@example.invalid", "RHIZA_AUTH_STATE="+state,
-				"RHIZA_FIXTURE_GENERATOR="+generatorPath,
-				"RHIZA_FIXTURE_GENERATOR_SHA256="+generatorHash)
-			output, runErr := command.CombinedOutput()
-			var exited *exec.ExitError
-			if !errors.As(runErr, &exited) || exited.ExitCode() != 1 {
-				t.Fatalf("apply exit=%v want=1 output=%s", runErr, output)
-			}
-			if !bytes.Contains(output, []byte(scenario.wantOutput)) {
-				t.Fatalf("apply did not stop at the schema boundary: %s", output)
-			}
-			recorded, err := os.ReadFile(calls)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(recorded) != "--context=context-test get --raw=/openapi/v2\n" {
-				t.Fatalf("apply issued non-schema or repeated commands: %q", recorded)
-			}
-			for _, receipt := range []string{"kubernetes-container-schema.json", "kubernetes-container-schema.stderr", "kubernetes-container-schema.exit"} {
-				if _, err := os.Stat(filepath.Join(state, receipt)); err != nil {
-					t.Fatalf("schema receipt %s missing: %v", receipt, err)
-				}
-			}
-			receiptExit, err := os.ReadFile(filepath.Join(state, "kubernetes-container-schema.exit"))
-			if err != nil || string(receiptExit) != scenario.wantReceiptExit {
-				t.Fatalf("schema receipt exit=%q err=%v want=%q", receiptExit, err, scenario.wantReceiptExit)
-			}
-			for _, absent := range []string{"kubernetes-container-schema-fields.json", "auth.yaml", "auth-admission-policies.yaml", "data-create.json", "kubernetes-create.json"} {
-				if _, err := os.Stat(filepath.Join(state, absent)); !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("schema failure created %s: %v", absent, err)
-				}
-			}
-		})
 	}
 }
 

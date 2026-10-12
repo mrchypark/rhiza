@@ -5,6 +5,13 @@ runs them with MinIO in an ephemeral kind Kubernetes cluster. It applies the
 repository CRD and namespace-scoped RBAC and drives the running Operator through
 `RhizaRecovery` resources.
 
+The GCS post-release qualification installs admission policies only for its
+scoped Chaos Mesh fault resources. It intentionally excludes a runtime Pod
+admission policy and therefore makes no claim that it prevents an otherwise
+authorized actor from creating Pods. Runtime qualification instead retains
+exact workload identity, image, node, security-shape, RBAC, and default-deny
+NetworkPolicy checks.
+
 The workload retries stable request IDs during faults. The test checks:
 
 - SIGKILL with the same Pod and WAL preserves voter identity.

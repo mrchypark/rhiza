@@ -172,30 +172,6 @@ mapping='google.subject=assertion.sub,attribute.repository_id=assertion.reposito
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/cluster-metadata-projection.sh"
 describe_cluster_metadata() { exec gcloud --project="$project" --quiet "$@"; }
-container_schema_variant=25
-review_container_schema() {
-    container_schema_fields=$(jq -ce '
-      if type=="object" and (.definitions|type)=="object" and
-        (.definitions["io.k8s.api.core.v1.Container"]|type)=="object" and
-        .definitions["io.k8s.api.core.v1.Container"].type=="object" and
-        (.definitions["io.k8s.api.core.v1.Container"].properties|type)=="object"
-      then (.definitions["io.k8s.api.core.v1.Container"].properties|keys)
-      else error("invalid Container OpenAPI v2 schema") end
-    ' "$1") || return 1
-    case "$container_schema_fields" in
-        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resources","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
-            container_schema_variant=22 ;;
-        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resizePolicy","resources","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
-            container_schema_variant=23 ;;
-        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resizePolicy","resources","restartPolicy","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
-            container_schema_variant=24 ;;
-        '["args","command","env","envFrom","image","imagePullPolicy","lifecycle","livenessProbe","name","ports","readinessProbe","resizePolicy","resources","restartPolicy","restartPolicyRules","securityContext","startupProbe","stdin","stdinOnce","terminationMessagePath","terminationMessagePolicy","tty","volumeDevices","volumeMounts","workingDir"]')
-            container_schema_variant=25 ;;
-        *) return 1 ;;
-    esac
-    [ ! -e "$2" ] && [ ! -L "$2" ] || return 1
-    printf '%s\n' "$container_schema_fields" > "$2"
-}
 render() {
     runtime_kind=User; runtime_name=$ci
     runtime_api_group='    apiGroup: rbac.authorization.k8s.io'; runtime_namespace=
@@ -203,19 +179,7 @@ render() {
         runtime_kind=ServiceAccount; runtime_name=rhiza-runtime
         runtime_api_group=; runtime_namespace="    namespace: $ns"
     fi
-    case "$container_schema_variant" in
-        22) resize_guard=true; restart_guard=true; restart_rules_guard=true ;;
-        23) resize_guard='!has(object.spec.containers[0].resizePolicy)'; restart_guard=true; restart_rules_guard=true ;;
-        24) resize_guard='!has(object.spec.containers[0].resizePolicy)'; restart_guard='!has(object.spec.containers[0].restartPolicy)'; restart_rules_guard=true ;;
-        25) resize_guard='!has(object.spec.containers[0].resizePolicy)'; restart_guard='!has(object.spec.containers[0].restartPolicy)'; restart_rules_guard='!has(object.spec.containers[0].restartPolicyRules)' ;;
-        *) die "Unexpected reviewed Container schema variant: $container_schema_variant" ;;
-    esac
     sed -e "s/@NAMESPACE@/$ns/g" -e "s/@RUN_ID@/$RHIZA_RUN_ID/g" -e "s/@POD_GSA@/$data/g" -e "s/@OWNER@/$owner/g" \
-      -e "s/@NODE_A@/$RHIZA_NODE_A/g" -e "s/@NODE_B@/$RHIZA_NODE_B/g" -e "s/@NODE_C@/$RHIZA_NODE_C/g" \
-      -e "s|@HOST_IMAGE@|$RHIZA_HOST_IMAGE|g" \
-      -e "s|@METADATA_IMAGE@|$RHIZA_METADATA_IMAGE|g" \
-      -e "s|@RESIZE_POLICY_GUARD@|$resize_guard|g" -e "s|@RESTART_POLICY_GUARD@|$restart_guard|g" \
-      -e "s|@RESTART_POLICY_RULES_GUARD@|$restart_rules_guard|g" \
       -e "s/@RUNTIME_KIND@/$runtime_kind/g" -e "s/@RUNTIME_NAME@/$runtime_name/g" \
       -e "s/@RUNTIME_API_GROUP@/$runtime_api_group/g" -e "s/@RUNTIME_NAMESPACE@/$runtime_namespace/g" \
       "$script_dir/gcs-postrelease-auth.yaml.in" | awk -v mode="$auth_mode" '
@@ -868,9 +832,9 @@ if [ "$mode" = check-local-auth ]; then
 fi
 if [ "$mode" = check-cleanup-uris ]; then
     # Offline fixture exercises the exact URI builder used by guarded rollback.
-    [ "$(admission_uri validatingadmissionpolicy "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/$ns-runtime" ] || die 'Policy cleanup URI regression'
-    [ "$(admission_uri validatingadmissionpolicybinding "$ns-runtime")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/$ns-runtime" ] || die 'Binding cleanup URI regression'
-    if (admission_uri unsupported "$ns-runtime") >/dev/null 2>&1; then die 'Unknown cleanup kind accepted'; fi
+    [ "$(admission_uri validatingadmissionpolicy "$ns-faults")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/$ns-faults" ] || die 'Policy cleanup URI regression'
+    [ "$(admission_uri validatingadmissionpolicybinding "$ns-faults")" = "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/$ns-faults" ] || die 'Binding cleanup URI regression'
+    if (admission_uri unsupported "$ns-faults") >/dev/null 2>&1; then die 'Unknown cleanup kind accepted'; fi
     printf '%s\n' 'Two exact admission cleanup URIs and unknown-kind refusal verified; no cloud calls.'
     exit 0
 fi
@@ -1155,10 +1119,6 @@ if [ "$mode" = apply ]; then
     [ ! -e "$RHIZA_AUTH_STATE" ] || die 'Receipt directory exists; no resume or adoption'
     mkdir -m 700 "$RHIZA_AUTH_STATE"
     printf '%s\n' "$identity" > "$RHIZA_AUTH_STATE/identity.json"
-    record kubernetes-container-schema k get --raw=/openapi/v2
-    review_container_schema "$RHIZA_AUTH_STATE/kubernetes-container-schema.json" \
-      "$RHIZA_AUTH_STATE/kubernetes-container-schema-fields.json" ||
-        die "Unsupported Container OpenAPI schema; preserve $RHIZA_AUTH_STATE/kubernetes-container-schema.json"
     render > "$RHIZA_AUTH_STATE/auth.yaml"
     # Admission policies are cluster-scoped, so the API server can compile the
     # exact rendered CEL before the namespace or any other resource exists.
@@ -1368,8 +1328,6 @@ if [ "$mode" = apply ]; then
         absent "$suffix-policy" k get validatingadmissionpolicy "$ns-$suffix" -o json
         absent "$suffix-binding" k get validatingadmissionpolicybinding "$ns-$suffix" -o json
     done
-    absent runtime-policy k get validatingadmissionpolicy "$ns-runtime" -o json
-    absent runtime-binding k get validatingadmissionpolicybinding "$ns-runtime" -o json
     absent ns-reader k get clusterrole "$ns-reader" -o json
     absent ns-reader-binding k get clusterrolebinding "$ns-reader" -o json
     absent data g iam service-accounts describe "$data" --format=json
@@ -1412,7 +1370,7 @@ if [ "$mode" = apply ]; then
     extract_created_identity namespace "$ns" "$RHIZA_AUTH_STATE/namespace-identity.json" "$owner"
     extract_created_identity ServiceAccount rhiza-inspector "$RHIZA_AUTH_STATE/inspector-ksa-identity.json" ""
     for kind in validatingadmissionpolicy validatingadmissionpolicybinding; do
-        for suffix in faults network-faults runtime; do
+        for suffix in faults network-faults; do
             extract_created_identity "$kind" "$ns-$suffix" "$RHIZA_AUTH_STATE/$kind-$suffix-identity.json" "$owner"
         done
     done
@@ -1442,7 +1400,7 @@ if [ "$mode" = apply ]; then
       "$RHIZA_AUTH_STATE/inspector-clusterroles.json" "$ns" ||
       die 'Inspector KSA unexpectedly has a ClusterRoleBinding'
     for kind in validatingadmissionpolicy validatingadmissionpolicybinding; do
-        for suffix in faults network-faults runtime; do
+        for suffix in faults network-faults; do
             record "$kind-$suffix-identity" k get "$kind" "$ns-$suffix" -o json
         done
     done
@@ -1555,11 +1513,11 @@ if owned kubernetes; then
     # The preserved original bootstrap matched both fault kinds in -faults.
     # A reviewed transition records the added pair in a separate working
     # receipt copy. Never invent an identity for an absent/unrecorded pair.
-    policy_suffixes='faults runtime'
+    policy_suffixes='faults'
     if [ -f "$RHIZA_AUTH_STATE/validatingadmissionpolicy-network-faults-identity.json" ] ||
        [ -f "$RHIZA_AUTH_STATE/validatingadmissionpolicybinding-network-faults-identity.json" ] ||
        grep -Fq "$ns-network-faults" "$RHIZA_AUTH_STATE/auth.yaml"; then
-        policy_suffixes='faults network-faults runtime'
+        policy_suffixes='faults network-faults'
     fi
     for kind in validatingadmissionpolicybinding validatingadmissionpolicy; do
         for suffix in $policy_suffixes; do

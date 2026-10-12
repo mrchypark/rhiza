@@ -505,7 +505,10 @@ validate_probe_pod() {
   probe_file=$1; probe_receipt=$2; probe_name=$3; probe_app=$4; probe_container=$5
   jq -e --slurpfile created "$probe_receipt" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg image "$RHIZA_HOST_IMAGE" --arg digest "${RHIZA_HOST_IMAGE##*@}" --arg node "$RHIZA_NODE_A" --arg name "$probe_name" --arg app "$probe_app" --arg container "$probe_container" '
     .metadata.name==$name and .metadata.namespace==$ns and .metadata.uid==$created[0].metadata.uid and
-    .metadata.labels=={"app":$app,"chaos.rhiza.io/run":$run} and
+    (.metadata.labels as $labels |
+      $labels.app==$app and $labels["chaos.rhiza.io/run"]==$run and
+      (($labels|keys|sort)==["app","chaos.rhiza.io/run"] or
+       (($labels|keys|sort)==["app","chaos.rhiza.io/run","topology.kubernetes.io/region","topology.kubernetes.io/zone"]))) and
     (.metadata.ownerReferences // [])==[] and .spec.serviceAccountName=="rhiza-inspector" and
     .spec.automountServiceAccountToken==false and .spec.hostNetwork==false and .spec.hostPID==false and .spec.hostIPC==false and
     .spec.nodeName==$node and .spec.restartPolicy=="Never" and (.spec.volumes // [])==[] and
@@ -868,18 +871,6 @@ run() {
     die "first failure: $label exit $code"
   fi
 }
-reject_server_dry_run() {
-  label=$1; manifest=$2
-  seq=$((seq + 1))
-  set +e
-  k create --dry-run=server -f "$manifest" -o json > "$out/$seq-$label.stdout" 2> "$out/$seq-$label.stderr"
-  code=$?
-  set -e
-  printf '%s\n' "$code" > "$out/$seq-$label.exit"
-  [ "$code" != 0 ] && [ ! -s "$out/$seq-$label.stdout" ] &&
-    grep -Fq "$ns-runtime" "$out/$seq-$label.stderr" ||
-    die "negative server dry-run unexpectedly admitted: $label"
-}
 reject_runtime_networkpolicy_mutation() {
   label=$1; shift
   seq=$((seq + 1))
@@ -1191,7 +1182,10 @@ delete_inspector_owned() {
         jq -e --arg name "$probe_name" '.items[]|select(.metadata.name==$name)' "$out/inspector-cleanup-pods-before.json" > "$out/$probe_label-delete-before.json" || probe_cleanup_ok=false
         jq -e --slurpfile created "$out/$probe_label-created.json" --arg ns "$ns" --arg run "$RHIZA_RUN_ID" --arg app "$probe_app" '
           .metadata.namespace==$ns and .metadata.uid==$created[0].metadata.uid and
-          .metadata.labels=={"app":$app,"chaos.rhiza.io/run":$run} and
+          (.metadata.labels as $labels |
+            $labels.app==$app and $labels["chaos.rhiza.io/run"]==$run and
+            (($labels|keys|sort)==["app","chaos.rhiza.io/run"] or
+             (($labels|keys|sort)==["app","chaos.rhiza.io/run","topology.kubernetes.io/region","topology.kubernetes.io/zone"]))) and
           (.metadata.resourceVersion|type)=="string" and (.metadata.resourceVersion|length)>0
         ' "$out/$probe_label-delete-before.json" >/dev/null || probe_cleanup_ok=false
       fi
@@ -1443,13 +1437,6 @@ jq -nc --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '{apiVersion:"networking.k8s.io/
 reject_runtime_networkpolicy_mutation runtime-networkpolicy-delete-denied delete --dry-run=server -f "$out/inspector-networkpolicy-bootstrap.json" -o name
 reject_runtime_networkpolicy_mutation runtime-networkpolicy-replace-denied replace --dry-run=server -f "$out/inspector-networkpolicy-replacement.json" -o json
 reject_runtime_networkpolicy_mutation runtime-networkpolicy-additive-denied create --dry-run=server -f "$out/inspector-networkpolicy-additive.json" -o json
-# Compile/admit the exact rendered runtime manifests without persistence.
-# These receipts are deliberately recorded before owned_created: a dry-run is
-# neither an apply nor evidence that cleanup owns any resource.
-run runtime-initial-preflight k create --dry-run=server -f "$out/initial.yaml" -o json
-run runtime-learner-preflight k create --dry-run=server -f "$out/learner.yaml" -o json
-run runtime-inspector-preflight k create --dry-run=server -f "$out/inspector-pod.yaml" -o json
-run runtime-inspector-control-preflight k create --dry-run=server -f "$out/inspector-control-pod.yaml" -o json
 owned_created=true
 run create-metadata k create -f "$out/metadata.yaml" -o json
 cp "$out/$seq-create-metadata.stdout" "$out/metadata-created.json"
@@ -1956,29 +1943,6 @@ finish_shutdown_capture || die 'authentic voter shutdown proof failed'
 verify_voter_absence || die 'voter or endpoint identity remains after scale zero'
 source_quiesced=true
 
-# Exercise the installed admission policy before creating any persistent
-# inspector resource. A schema or transport failure is not accepted as a VAP
-# rejection by reject_server_dry_run.
-alternate_digest=$(printf '%064d' 0)
-alternate_image="${RHIZA_HOST_IMAGE%@*}@sha256:$alternate_digest"
-[ "$RHIZA_HOST_IMAGE" != "$alternate_image" ] || alternate_digest=$(printf '%064d' 1)
-sed "s|$RHIZA_HOST_IMAGE|${RHIZA_HOST_IMAGE%@*}@sha256:$alternate_digest|" "$out/inspector-pod.yaml" > "$out/inspector-negative-digest.yaml"
-awk '/command:/{print; print "      lifecycle: {postStart: {exec: {command: [sh, -c, \"true\"]}}}"; next} {print}' "$out/inspector-pod.yaml" > "$out/inspector-negative-lifecycle.yaml"
-sed 's/serviceAccountName: rhiza-inspector/serviceAccountName: rhiza-gcs/' "$out/inspector-pod.yaml" > "$out/inspector-negative-ksa.yaml"
-sed 's/name: rhiza-inspector$/name: rhiza-inspector-spoof/' "$out/inspector-pod.yaml" > "$out/inspector-negative-spoof.yaml"
-awk '/command:/{print; print "      env: [{name: FORBIDDEN, value: \"true\"}]"; next} {print}' "$out/inspector-pod.yaml" > "$out/inspector-negative-env.yaml"
-awk '/restartPolicy:/{print; print "  volumes: [{name: forbidden, emptyDir: {}}]"; next} {print}' "$out/inspector-pod.yaml" > "$out/inspector-negative-volume.yaml"
-sed 's/hostPID: false/hostPID: true/' "$out/inspector-pod.yaml" > "$out/inspector-negative-host.yaml"
-for negative in digest lifecycle ksa spoof env volume host; do
-  reject_server_dry_run "inspector-negative-$negative" "$out/inspector-negative-$negative.yaml"
-done
-sed "s/app: 'rhiza-inspector-control'/app: 'rhiza-inspector'/" "$out/inspector-control-pod.yaml" > "$out/inspector-control-negative-app.yaml"
-sed 's/^  name: rhiza-inspector-control$/  name: rhiza-inspector-control-spoof/' "$out/inspector-control-pod.yaml" > "$out/inspector-control-negative-name.yaml"
-sed 's/^    - name: control$/    - name: inspector/' "$out/inspector-control-pod.yaml" > "$out/inspector-control-negative-container.yaml"
-for negative in app name container; do
-  reject_server_dry_run "inspector-control-negative-$negative" "$out/inspector-control-negative-$negative.yaml"
-done
-
 inspector_attempted=true
 printf '%s\n' 'inspector resources may require exact cleanup' > "$out/inspector-manual-cleanup-required"
 run inspector-ksa k get serviceaccount rhiza-inspector -o json
@@ -1992,7 +1956,10 @@ validate_inspector_access "$out/$seq-inspector-ksa.stdout" "$out/$seq-inspector-
 run inspector-create k create -f "$out/inspector-pod.yaml" -o json
 cp "$out/$seq-inspector-create.stdout" "$out/inspector-created.json"
 jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.kind=="Pod" and .metadata.name=="rhiza-inspector" and
-  .metadata.namespace==$ns and .metadata.labels=={"app":"rhiza-inspector","chaos.rhiza.io/run":$run} and
+  .metadata.namespace==$ns and (.metadata.labels as $labels |
+  $labels.app=="rhiza-inspector" and $labels["chaos.rhiza.io/run"]==$run and
+  (($labels|keys|sort)==["app","chaos.rhiza.io/run"] or
+   (($labels|keys|sort)==["app","chaos.rhiza.io/run","topology.kubernetes.io/region","topology.kubernetes.io/zone"]))) and
   (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
   (.metadata.resourceVersion|type)=="string" and (.metadata.resourceVersion|length)>0' \
   "$out/inspector-created.json" >/dev/null || die 'inspector Pod create identity unresolved'
@@ -2002,7 +1969,10 @@ validate_inspector_pod "$out/$seq-inspector-identity.stdout" || die 'inspector i
 run inspector-control-create k create -f "$out/inspector-control-pod.yaml" -o json
 cp "$out/$seq-inspector-control-create.stdout" "$out/inspector-control-created.json"
 jq -e --arg ns "$ns" --arg run "$RHIZA_RUN_ID" '.kind=="Pod" and .metadata.name=="rhiza-inspector-control" and
-  .metadata.namespace==$ns and .metadata.labels=={"app":"rhiza-inspector-control","chaos.rhiza.io/run":$run} and
+  .metadata.namespace==$ns and (.metadata.labels as $labels |
+  $labels.app=="rhiza-inspector-control" and $labels["chaos.rhiza.io/run"]==$run and
+  (($labels|keys|sort)==["app","chaos.rhiza.io/run"] or
+   (($labels|keys|sort)==["app","chaos.rhiza.io/run","topology.kubernetes.io/region","topology.kubernetes.io/zone"]))) and
   (.metadata.uid|type)=="string" and (.metadata.uid|length)>0 and
   (.metadata.resourceVersion|type)=="string" and (.metadata.resourceVersion|length)>0' \
   "$out/inspector-control-created.json" >/dev/null || die 'inspector control Pod create identity unresolved'
