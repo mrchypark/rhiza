@@ -11,7 +11,6 @@ case "$requested_mode" in render|run|run-local|check-shutdown) mode=$requested_m
     case "$mode" in run|run-local) ;; *) printf '%s\n' 'trusted metadata readiness parent mode required' >&2; exit 1 ;; esac ;;
   *) printf '%s\n' 'usage: run-gcs-postrelease.sh render|run|run-local|check-shutdown' >&2; exit 1 ;;
 esac
-application_sha=19a326b64e30c841c3dac731a2bcef0633e30afb
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 1; }
 sha256_file() {
@@ -776,7 +775,10 @@ fi
 if [ "$mode" = render ]; then exit 0; fi
 if [ "$mode" = run ]; then
   [ "${GITHUB_ACTIONS:-}" = true ] && [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ] && [ "${GITHUB_REF:-}" = refs/heads/main ] || die 'qualification must run in approved CI'
+  printf '%s' "$GITHUB_SHA" | grep -Eq '^[a-f0-9]{40}$' || die 'exact CI source SHA required'
   [ "${RHIZA_EXECUTION_GO:-}" = "$GITHUB_SHA:$RHIZA_RUN_ID" ] || die 'exact harness/run GO required'
+  source_sha=$GITHUB_SHA
+  [ "${RHIZA_APPLICATION_SHA:-}" = "$source_sha" ] || die 'candidate application mismatch'
 else
   [ -z "${GITHUB_ACTIONS:-}${GITHUB_EVENT_NAME:-}${GITHUB_REF:-}${GITHUB_SHA:-}" ] || die 'local entry must not impersonate CI'
   : "${RHIZA_HARNESS_SHA:?}" "${RHIZA_AUTH_STATE:?}" "${RHIZA_LOCAL_RUNTIME_KUBECONFIG:?}"
@@ -785,6 +787,8 @@ else
   printf '%s' "$RHIZA_HARNESS_SHA" | grep -Eq '^[a-f0-9]{40}$' || die 'exact local harness SHA required'
   [ "$(git -C "$script_dir/../.." rev-parse HEAD)" = "$RHIZA_HARNESS_SHA" ] || die 'local harness HEAD mismatch'
   [ "${RHIZA_EXECUTION_GO:-}" = "$RHIZA_HARNESS_SHA:$RHIZA_RUN_ID" ] || die 'exact local harness/run GO required'
+  source_sha=$RHIZA_HARNESS_SHA
+  [ "${RHIZA_APPLICATION_SHA:-}" = "$source_sha" ] || die 'candidate application mismatch'
   command -v timeout >/dev/null || die 'native GNU timeout required'
   timeout --version | grep -Fq 'GNU coreutils' || die 'native GNU timeout required'
   case "$RHIZA_AUTH_STATE" in /*) ;; *) die 'private absolute auth state required' ;; esac
@@ -830,7 +834,6 @@ else
     [ "$token_expiry" -le "$auth_expiry" ] && [ "$((token_expiry - now))" -ge 2400 ] || die 'fixed 55-minute scope/preparation/runtime/cleanup reserve invalid'
   local_deadline=$((now + 1200))
 fi
-[ "${RHIZA_APPLICATION_SHA:-}" = "$application_sha" ] || die 'candidate application mismatch'
 : "${RHIZA_APPROVED_CAP_KRW:?}" "${RHIZA_BOOTSTRAP_UID:?}"
 [ "$mode" = run ] || : "${RHIZA_CLUSTER_METADATA:?cluster metadata receipt required}"
 prepare_cluster_metadata || die 'trusted cluster metadata preparation failed'

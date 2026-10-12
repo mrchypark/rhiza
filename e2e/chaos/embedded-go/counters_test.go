@@ -78,8 +78,6 @@ func qualificationAssetEnv(run string) []string {
 	}
 }
 
-const qualificationApplicationSHA = "19a326b64e30c841c3dac731a2bcef0633e30afb"
-
 func TestQualificationCloudInputsFailBeforeMutation(t *testing.T) {
 	run := "a1b2c3d4"
 	host := "registry.example/rhiza@sha256:" + strings.Repeat("a", 64)
@@ -273,10 +271,17 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	script, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, forbidden := range []string{"APPLICATION_SHA:", "$APPLICATION_SHA", `test "$APPLICATION_SHA" != "$GITHUB_SHA"`} {
 		if bytes.Contains(workflow, []byte(forbidden)) {
 			t.Fatalf("qualification image provenance must not pin a split application source: %s", forbidden)
 		}
+	}
+	if bytes.Contains(script, []byte("application_sha=")) {
+		t.Fatal("qualification runtime must not pin a split application source")
 	}
 	for _, required := range []string{
 		`git fetch --no-tags --depth=1 origin "$GITHUB_REF"`,
@@ -292,6 +297,15 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	} {
 		if !bytes.Contains(workflow, []byte(required)) {
 			t.Fatalf("qualification image must bind checkout and all provenance labels to GITHUB_SHA: %s", required)
+		}
+	}
+	for _, required := range []string{
+		`source_sha=$GITHUB_SHA`,
+		`source_sha=$RHIZA_HARNESS_SHA`,
+		`[ "${RHIZA_APPLICATION_SHA:-}" = "$source_sha" ] || die 'candidate application mismatch'`,
+	} {
+		if !bytes.Contains(script, []byte(required)) {
+			t.Fatalf("qualification runtime must derive application provenance from verified source: %s", required)
 		}
 	}
 }
@@ -2545,7 +2559,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const syntheticFixtureRevision = "1111111111111111111111111111111111111111"
-	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "workload-identity-mode-false", "workload-identity-mode-absent", "workload-identity-mode-other", "metadata-worker-entrypoint", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
+	for _, scenario := range []string{"embedded-token", "exec", "alternate-context", "token-permissions", "wrong-identity", "fake-ci", "head-mismatch", "application-mismatch", "expiry", "command-failure", "deadline", "watchdog", "parser-timeout", "parser-argument-error", "runtime-kubeconfig-path", "cluster-receipt-changed", "workload-identity-receipt-changed", "workload-identity-wrong-binding", "workload-identity-extra-member", "workload-identity-extra-binding", "workload-identity-preexisting-binding", "workload-identity-recreated-gsa", "workload-identity-mode-false", "workload-identity-mode-absent", "workload-identity-mode-other", "metadata-worker-entrypoint", "metadata-credential-failure", "metadata-wrong-service-account", "metadata-gce-mode", "outside-prefix-auth-failure", "outside-prefix-accessible", "inside-prefix-auth-failure", "voter-create-failure", "voter-create-unknown"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			if err := os.Chmod(dir, 0700); err != nil {
@@ -2563,7 +2577,10 @@ func TestQualificationLocalRuntime(t *testing.T) {
 			}
 			const run = "a1b2c3d4"
 			const harness = "9b53158b38352ae78446e70a298616a31dc44a69"
-			const application = qualificationApplicationSHA
+			application := syntheticFixtureRevision
+			if scenario == "application-mismatch" {
+				application = strings.Repeat("3", 40)
+			}
 			mockFixtureRevision := syntheticFixtureRevision
 			if scenario == "head-mismatch" {
 				mockFixtureRevision = strings.Repeat("2", 40)
@@ -2932,6 +2949,9 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			if exited.ExitCode() != want {
 				t.Fatalf("runtime exit=%d want=%d diagnostic=%s", exited.ExitCode(), want, output)
 			}
+			if scenario == "application-mismatch" && !bytes.Contains(output, []byte("candidate application mismatch")) {
+				t.Fatalf("runtime accepted mismatched application provenance: %s", output)
+			}
 			if scenario == "metadata-credential-failure" || scenario == "metadata-wrong-service-account" || scenario == "outside-prefix-auth-failure" || scenario == "outside-prefix-accessible" || scenario == "inside-prefix-auth-failure" || scenario == "voter-create-failure" || scenario == "voter-create-unknown" {
 				ready := bytes.Index(calls, []byte("wait pod/rhiza-metadata --for=condition=Ready"))
 				credential := bytes.Index(calls, []byte("exec rhiza-metadata -- curl"))
@@ -3018,6 +3038,8 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				switch scenario {
 				case "head-mismatch":
 					reason = "local harness HEAD mismatch"
+				case "application-mismatch":
+					reason = "candidate application mismatch"
 				case "parser-argument-error":
 					reason = "local kubeconfig parsing failed (exit 92)"
 				case "parser-timeout":
@@ -3045,7 +3067,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				if bytes.Contains(calls, []byte("create")) {
 					t.Fatal("rejected local entry attempted a resource write")
 				}
-				if scenario == "fake-ci" || scenario == "head-mismatch" || scenario == "runtime-kubeconfig-path" || strings.HasPrefix(scenario, "workload-identity-") {
+				if scenario == "fake-ci" || scenario == "head-mismatch" || scenario == "application-mismatch" || scenario == "runtime-kubeconfig-path" || strings.HasPrefix(scenario, "workload-identity-") {
 					if !errors.Is(eventErr, os.ErrNotExist) || !errors.Is(callsErr, os.ErrNotExist) {
 						t.Fatal("pre-parser rejection unexpectedly invoked the local mock")
 					}
