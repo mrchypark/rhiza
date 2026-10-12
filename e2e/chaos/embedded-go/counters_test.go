@@ -273,23 +273,26 @@ func TestQualificationApplicationProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script, err := os.ReadFile("../run-gcs-postrelease.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(workflow, []byte("APPLICATION_SHA: "+qualificationApplicationSHA)) ||
-		!bytes.Contains(script, []byte("application_sha="+qualificationApplicationSHA)) {
-		t.Fatal("workflow, runtime script, and fixture application provenance differ")
-	}
-	const allowed = "':(exclude)pkg/node/learn_gap_lifecycle_test.go'"
-	var nodeExclusions []string
-	for _, line := range strings.Split(string(workflow), "\n") {
-		if strings.Contains(line, "':(exclude)pkg/node/") {
-			nodeExclusions = append(nodeExclusions, strings.TrimSpace(strings.TrimSuffix(line, " \\")))
+	for _, forbidden := range []string{"APPLICATION_SHA:", "$APPLICATION_SHA", `test "$APPLICATION_SHA" != "$GITHUB_SHA"`} {
+		if bytes.Contains(workflow, []byte(forbidden)) {
+			t.Fatalf("qualification image provenance must not pin a split application source: %s", forbidden)
 		}
 	}
-	if len(nodeExclusions) != 1 || nodeExclusions[0] != allowed {
-		t.Fatal("source-integrity allowlist must accept only the exact lifecycle test path")
+	for _, required := range []string{
+		`git fetch --no-tags --depth=1 origin "$GITHUB_REF"`,
+		`test "$(git rev-parse HEAD)" = "$GITHUB_SHA"`,
+		`test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"`,
+		`test -z "$(git status --porcelain --untracked-files=all)"`,
+		`--label "org.opencontainers.image.revision=$GITHUB_SHA"`,
+		`--label "io.rhiza.qualification.harness=$GITHUB_SHA"`,
+		`--label "io.rhiza.qualification.application=$GITHUB_SHA"`,
+		`.Config.Labels["org.opencontainers.image.revision"] == $revision`,
+		`.Config.Labels["io.rhiza.qualification.harness"] == $revision`,
+		`.Config.Labels["io.rhiza.qualification.application"] == $revision`,
+	} {
+		if !bytes.Contains(workflow, []byte(required)) {
+			t.Fatalf("qualification image must bind checkout and all provenance labels to GITHUB_SHA: %s", required)
+		}
 	}
 }
 

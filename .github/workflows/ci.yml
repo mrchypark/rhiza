@@ -367,62 +367,15 @@ jobs:
     timeout-minutes: 30
     env:
       PUBLISH_CHAOS_IMAGE: ${{ github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image }}
-      APPLICATION_SHA: 19a326b64e30c841c3dac731a2bcef0633e30afb
     steps:
       - uses: actions/checkout@v4
-      - name: Require pinned candidate application source for image export
+      - name: Require exact candidate source for image export
         if: env.PUBLISH_CHAOS_IMAGE == 'true'
         run: |
-          git fetch --no-tags --depth=1 origin "$APPLICATION_SHA"
+          git fetch --no-tags --depth=1 origin "$GITHUB_REF"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$APPLICATION_SHA" != "$GITHUB_SHA"
-          approved_mirror_diff="$RUNNER_TEMP/approved-mirror.diff"
-          LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
-            --no-color --no-indent-heuristic --diff-algorithm=myers --unified=3 \
-            --src-prefix=a/ --dst-prefix=b/ "$APPLICATION_SHA" "$GITHUB_SHA" -- \
-            .github/workflows/operator-release.yml \
-            Dockerfile \
-            Dockerfile.operator \
-            e2e/chaos/Dockerfile \
-            e2e/chaos/Dockerfile.rust > "$approved_mirror_diff"
-          printf '%s  %s\n' \
-            e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 \
-            "$approved_mirror_diff" | sha256sum --check --strict
-          approved_benchmark_diff="$RUNNER_TEMP/approved-benchmark.diff"
-          LC_ALL=C git diff --no-ext-diff --no-textconv --no-renames --full-index --binary \
-            --no-color --no-indent-heuristic --diff-algorithm=myers --unified=3 \
-            --src-prefix=a/ --dst-prefix=b/ "$APPLICATION_SHA" "$GITHUB_SHA" -- \
-            .github/workflows/performance.yml \
-            benchmarks/hiqlite-reference.json \
-            benchmarks/verify-hiqlite-reference-artifact.sh \
-            benchmarks/verify-hiqlite-reference.sh \
-            benchmarks/verify-hiqlite-reference_test.sh \
-            benchmarks/results/2026-10-10-hiqlite-v0.15.2 > "$approved_benchmark_diff"
-          printf '%s  %s\n' \
-            e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 \
-            "$approved_benchmark_diff" | sha256sum --check --strict
-          git diff --exit-code "$APPLICATION_SHA" "$GITHUB_SHA" -- . \
-            ':(exclude).github/workflows/ci.yml' \
-            ':(exclude).github/workflows/operator-release.yml' \
-            ':(exclude).github/workflows/performance.yml' \
-            ':(exclude)Dockerfile' \
-            ':(exclude)Dockerfile.operator' \
-            ':(exclude)benchmarks/hiqlite-reference.json' \
-            ':(exclude)benchmarks/verify-hiqlite-reference-artifact.sh' \
-            ':(exclude)benchmarks/verify-hiqlite-reference.sh' \
-            ':(exclude)benchmarks/verify-hiqlite-reference_test.sh' \
-            ':(exclude)benchmarks/results/2026-10-10-hiqlite-v0.15.2/**' \
-            ':(exclude)e2e/chaos/Dockerfile' \
-            ':(exclude)e2e/chaos/Dockerfile.rust' \
-            ':(exclude)e2e/chaos/bootstrap-gcs-postrelease.sh' \
-            ':(exclude)e2e/chaos/run-gcs-postrelease.sh' \
-            ':(exclude)e2e/chaos/gcs-postrelease-auth.yaml.in' \
-            ':(exclude)e2e/chaos/gcs-postrelease.yaml.in' \
-            ':(exclude)e2e/chaos/embedded-go/main.go' \
-            ':(exclude)e2e/chaos/embedded-go/counters_test.go' \
-            ':(exclude)pkg/network/migration_admission_test.go' \
-            ':(exclude)pkg/node/learn_gap_lifecycle_test.go' \
-            ':(exclude)pkg/quepaxa/learner_compaction_test.go'
+          test "$(git rev-parse FETCH_HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -441,7 +394,7 @@ jobs:
             labels=(--label "org.opencontainers.image.source=https://github.com/mrchypark/rhiza"
               --label "org.opencontainers.image.revision=$GITHUB_SHA"
               --label "io.rhiza.qualification.harness=$GITHUB_SHA"
-              --label "io.rhiza.qualification.application=$APPLICATION_SHA")
+              --label "io.rhiza.qualification.application=$GITHUB_SHA")
           fi
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza "${labels[@]}" -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
           docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
@@ -469,13 +422,13 @@ jobs:
           export_dir="$RUNNER_TEMP/qualification-host"
           mkdir -p "$export_dir"
           docker image inspect rhiza-chaos:local > "$export_dir/image.json"
-          jq -e --arg harness "$GITHUB_SHA" --arg app "$APPLICATION_SHA" '
+          jq -e --arg revision "$GITHUB_SHA" '
             .[0] | .Os == "linux" and .Architecture == "amd64" and .Size < 134217728 and
             .Config.User == "65532:65532" and
             .Config.Labels["org.opencontainers.image.source"] == "https://github.com/mrchypark/rhiza" and
-            .Config.Labels["org.opencontainers.image.revision"] == $harness and
-            .Config.Labels["io.rhiza.qualification.harness"] == $harness and
-            .Config.Labels["io.rhiza.qualification.application"] == $app
+            .Config.Labels["org.opencontainers.image.revision"] == $revision and
+            .Config.Labels["io.rhiza.qualification.harness"] == $revision and
+            .Config.Labels["io.rhiza.qualification.application"] == $revision
           ' "$export_dir/image.json"
           container=$(docker create rhiza-chaos:local)
           trap 'docker rm "$container" >/dev/null' EXIT
