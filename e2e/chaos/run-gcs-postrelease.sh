@@ -559,8 +559,52 @@ validate_inspector_policy() {
     ((.spec|has("egress")|not) or .spec.egress==null or .spec.egress==[])
   ' "$policy" >/dev/null
 }
+validate_inspector_clusterrolebindings() {
+  jq -e --arg ns "$3" --slurpfile roles "$2" '
+    def forbidden:
+      (.kind=="ServiceAccount" and .name=="rhiza-inspector" and ((.namespace // $ns)==$ns)) or
+      (.kind=="User" and .name==("system:serviceaccount:"+$ns+":rhiza-inspector")) or
+      (.kind=="User" and .name=="system:authenticated") or
+      (.kind=="Group" and .name==("system:serviceaccounts:"+$ns)) or
+      (.kind=="Group" and (.name=="system:serviceaccounts" or .name=="system:authenticated" or .name=="system:unauthenticated"));
+    def baseline_role($role; $name):
+      ($role.metadata.labels == {"kubernetes.io/bootstrapping":"rbac-defaults"}) and
+      ($role.aggregationRule == null) and
+      if $name == "system:basic-user" then
+        $role.rules == [
+          {"apiGroups":["authorization.k8s.io"],"resources":["selfsubjectaccessreviews","selfsubjectrulesreviews"],"verbs":["create"]},
+          {"apiGroups":["authentication.k8s.io"],"resources":["selfsubjectreviews"],"verbs":["create"]}
+        ]
+      elif $name == "system:discovery" then
+        $role.rules == [{"nonResourceURLs":["/api","/api/*","/apis","/apis/*","/healthz","/livez","/openapi","/openapi/*","/readyz","/version","/version/"],"verbs":["get"]}]
+      elif $name == "system:public-info-viewer" then
+        $role.rules == [{"nonResourceURLs":["/healthz","/livez","/readyz","/version","/version/"],"verbs":["get"]}]
+      elif $name == "system:service-account-issuer-discovery" then
+        $role.rules == [{"nonResourceURLs":["/.well-known/openid-configuration","/.well-known/openid-configuration/","/openid/v1/jwks","/openid/v1/jwks/"],"verbs":["get"]}]
+      else false end;
+    def baseline_binding($binding; $roles):
+      ($binding.roleRef // {}) as $ref |
+      ($binding.metadata // {}) as $meta |
+      ($roles[0].items | map(select(.metadata.name == $ref.name)) |
+        if length == 1 then .[0] else null end) as $role |
+      $ref.kind == "ClusterRole" and $ref.apiGroup == "rbac.authorization.k8s.io" and $ref.name == $meta.name and
+      if $meta.name == "system:basic-user" or $meta.name == "system:discovery" then
+        $binding.subjects == [{"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:authenticated"}]
+      elif $meta.name == "system:public-info-viewer" then
+        $binding.subjects == [
+          {"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:authenticated"},
+          {"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:unauthenticated"}
+        ]
+      elif $meta.name == "system:service-account-issuer-discovery" then
+        $binding.subjects == [{"apiGroup":"rbac.authorization.k8s.io","kind":"Group","name":"system:serviceaccounts"}]
+      else false end and baseline_role($role; $meta.name);
+    ($roles|length)==1 and ($roles[0].items|type)=="array" and (.items|type)=="array" and
+    all(.items[]; ((.subjects // [] | map(select(forbidden)) | length) == 0) or baseline_binding(.; $roles))
+  ' "$1" >/dev/null
+}
 validate_inspector_access() {
-  ksa=$1; rolebindings=$2; clusterrolebindings=$3; policy=$4
+  [ "$#" = 5 ] || return 1
+  ksa=$1; rolebindings=$2; clusterrolebindings=$3; policy=$4; clusterroles=$5
   jq -e --arg ns "$ns" '
     .metadata.name=="rhiza-inspector" and .metadata.namespace==$ns and
     ((.metadata.annotations // {})|length)==0 and (.metadata.ownerReferences // [])==[] and
@@ -573,13 +617,7 @@ validate_inspector_access() {
       (.kind=="Group" and (.name==("system:serviceaccounts:"+$ns) or .name=="system:serviceaccounts" or .name=="system:authenticated"));
     all(.items[]; all(.subjects[]?; forbidden|not))
   ' "$rolebindings" >/dev/null || return 1
-  jq -e --arg ns "$ns" '
-    def forbidden:
-      (.kind=="ServiceAccount" and .name=="rhiza-inspector" and .namespace==$ns) or
-      (.kind=="User" and .name==("system:serviceaccount:"+$ns+":rhiza-inspector")) or
-      (.kind=="Group" and (.name==("system:serviceaccounts:"+$ns) or .name=="system:serviceaccounts" or .name=="system:authenticated"));
-    all(.items[]; all(.subjects[]?; forbidden|not))
-  ' "$clusterrolebindings" >/dev/null || return 1
+  validate_inspector_clusterrolebindings "$clusterrolebindings" "$clusterroles" "$ns" || return 1
   validate_inspector_policy "$policy"
 }
 validate_learner_pod() {
@@ -1980,11 +2018,18 @@ source_quiesced=true
 inspector_attempted=true
 printf '%s\n' 'inspector resources may require exact cleanup' > "$out/inspector-manual-cleanup-required"
 run inspector-ksa k get serviceaccount rhiza-inspector -o json
+inspector_ksa_receipt="$out/$seq-inspector-ksa.stdout"
 run inspector-rolebindings k get rolebindings.rbac.authorization.k8s.io -o json
+inspector_rolebindings_receipt="$out/$seq-inspector-rolebindings.stdout"
 run inspector-clusterrolebindings k get clusterrolebindings.rbac.authorization.k8s.io -o json
+inspector_clusterrolebindings_receipt="$out/$seq-inspector-clusterrolebindings.stdout"
+run inspector-clusterroles k get clusterroles.rbac.authorization.k8s.io \
+  system:basic-user system:discovery system:public-info-viewer system:service-account-issuer-discovery -o json
+inspector_clusterroles_receipt="$out/$seq-inspector-clusterroles.stdout"
 run inspector-networkpolicy k get networkpolicy.networking.k8s.io rhiza-inspector-deny-all -o json
-validate_inspector_access "$out/$seq-inspector-ksa.stdout" "$out/$seq-inspector-rolebindings.stdout" \
-  "$out/$seq-inspector-clusterrolebindings.stdout" "$out/$seq-inspector-networkpolicy.stdout" || \
+inspector_networkpolicy_receipt="$out/$seq-inspector-networkpolicy.stdout"
+validate_inspector_access "$inspector_ksa_receipt" "$inspector_rolebindings_receipt" \
+  "$inspector_clusterrolebindings_receipt" "$inspector_networkpolicy_receipt" "$inspector_clusterroles_receipt" || \
   die 'inspector service account, RBAC, or default-deny network policy contract mismatch'
 
 run inspector-create k create -f "$out/inspector-pod.yaml" -o json

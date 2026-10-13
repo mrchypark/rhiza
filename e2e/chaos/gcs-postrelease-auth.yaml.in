@@ -282,7 +282,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   name: rhiza-ci-runtime
 ---
-# Cluster-scoped API, but get only the exact fresh namespace's metadata.
+# Cluster-scoped reads: exact fresh namespace and four safe default RBAC roles.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -297,6 +297,10 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterrolebindings]
     verbs: [list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [system:basic-user, system:discovery, system:public-info-viewer, system:service-account-issuer-discovery]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

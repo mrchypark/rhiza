@@ -770,6 +770,10 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 	}
 	ksa := `{"metadata":{"name":"rhiza-inspector","namespace":"ns"},"automountServiceAccountToken":false}`
 	bindings := `{"items":[]}`
+	rolesPath := filepath.Join(dir, "inspector-clusterroles.json")
+	if err := os.WriteFile(rolesPath, []byte(bindings), 0600); err != nil {
+		t.Fatal(err)
+	}
 	policyJSON := `{"metadata":{"name":"rhiza-inspector-deny-all","namespace":"ns","uid":"policy-created","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-` + strings.Repeat("a", 40) + `"}},"spec":{"podSelector":{"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}},"policyTypes":["Ingress","Egress"],"ingress":[],"egress":[]}}`
 	for _, tc := range []struct {
 		name, ksa, rb, crb, policy string
@@ -803,11 +807,66 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		command := exec.Command("/bin/sh", "-c", "out=$1; ns=ns; RHIZA_RUN_ID=a1b2c3d4; RHIZA_AUTH_CREATION_SHA="+strings.Repeat("a", 40)+"; "+validator+"\nvalidate_inspector_access \"$2\" \"$3\" \"$4\" \"$5\"", "fixture", dir,
-			filepath.Join(dir, tc.name+"-ksa.json"), filepath.Join(dir, tc.name+"-rb.json"), filepath.Join(dir, tc.name+"-crb.json"), filepath.Join(dir, tc.name+"-policy.json"))
+		command := exec.Command("/bin/sh", "-c", "out=$1; ns=ns; RHIZA_RUN_ID=a1b2c3d4; RHIZA_AUTH_CREATION_SHA="+strings.Repeat("a", 40)+"; "+validator+"\nvalidate_inspector_access \"$2\" \"$3\" \"$4\" \"$5\" \"$6\"", "fixture", dir,
+			filepath.Join(dir, tc.name+"-ksa.json"), filepath.Join(dir, tc.name+"-rb.json"), filepath.Join(dir, tc.name+"-crb.json"), filepath.Join(dir, tc.name+"-policy.json"), rolesPath)
 		if err := command.Run(); (err == nil) != tc.valid {
 			t.Fatalf("inspector access %s valid=%t error=%v", tc.name, tc.valid, err)
 		}
+	}
+}
+
+func TestQualificationInspectorReceiptPaths(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	runStart := strings.Index(source, "\nrun() {\n")
+	runEnd := strings.Index(source, "\nreject_runtime_networkpolicy_mutation() {\n")
+	blockStart := strings.Index(source, "\nrun inspector-ksa k get ")
+	blockEnd := strings.Index(source, "\nrun inspector-create k create ")
+	if runStart < 0 || runEnd <= runStart || blockStart < 0 || blockEnd <= blockStart {
+		t.Fatal("run function or inspector receipt block missing")
+	}
+	fixture := `set -eu
+out=$1; seq=$2; mode=run-local; fail_resource=$3
+die() { printf '%s\n' "$*" >&2; exit 1; }
+k() {
+  printf '%s\n' "$*"
+  [ "$2" != "$fail_resource" ] || return 73
+}
+validate_inspector_access() {
+  [ "$(cat "$1")" = 'get serviceaccount rhiza-inspector -o json' ] &&
+  [ "$(cat "$2")" = 'get rolebindings.rbac.authorization.k8s.io -o json' ] &&
+  [ "$(cat "$3")" = 'get clusterrolebindings.rbac.authorization.k8s.io -o json' ] &&
+  [ "$(cat "$4")" = 'get networkpolicy.networking.k8s.io rhiza-inspector-deny-all -o json' ] &&
+  [ "$(cat "$5")" = 'get clusterroles.rbac.authorization.k8s.io system:basic-user system:discovery system:public-info-viewer system:service-account-issuer-discovery -o json' ]
+}
+` + source[runStart:runEnd] + source[blockStart:blockEnd]
+	for _, initialSeq := range []int{7, 124, 901} {
+		t.Run(fmt.Sprintf("sequence-%d", initialSeq), func(t *testing.T) {
+			dir := t.TempDir()
+			command := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, strconv.Itoa(initialSeq), "none")
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("inspector receipt handoff failed: %v\n%s", err, output)
+			}
+			for i, label := range []string{"inspector-ksa", "inspector-rolebindings", "inspector-clusterrolebindings", "inspector-clusterroles", "inspector-networkpolicy"} {
+				receipt := filepath.Join(dir, fmt.Sprintf("%d-%s.exit", initialSeq+i+1, label))
+				if raw, err := os.ReadFile(receipt); err != nil || string(raw) != "0\n" {
+					t.Fatalf("native receipt %s: %q, %v", receipt, raw, err)
+				}
+			}
+		})
+	}
+	dir := t.TempDir()
+	command := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, "124", "rolebindings.rbac.authorization.k8s.io")
+	output, err := command.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 73 {
+		t.Fatalf("native inspector lookup failure not preserved: %v\n%s", err, output)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, "126-inspector-rolebindings.exit")); err != nil || string(raw) != "73\n" {
+		t.Fatalf("failed native receipt: %q, %v", raw, err)
 	}
 }
 
@@ -823,6 +882,17 @@ func TestQualificationInspectorBaselineClusterRoleGuard(t *testing.T) {
 		t.Fatal("inspector ClusterRoleBinding guard missing")
 	}
 	guard := source[start : start+1+end]
+	runtimeBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeSource := string(runtimeBytes)
+	runtimeStart := strings.Index(runtimeSource, "\nvalidate_inspector_policy() {\n")
+	runtimeEnd := strings.Index(runtimeSource, "\nvalidate_learner_pod() {\n")
+	if runtimeStart < 0 || runtimeEnd <= runtimeStart {
+		t.Fatal("runtime inspector access guard missing")
+	}
+	runtimeGuard := runtimeSource[runtimeStart:runtimeEnd]
 
 	group := func(name string) map[string]any {
 		return map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "Group", "name": name}
@@ -860,6 +930,14 @@ func TestQualificationInspectorBaselineClusterRoleGuard(t *testing.T) {
 		dir := t.TempDir()
 		bindingsPath := filepath.Join(dir, "bindings.json")
 		rolesPath := filepath.Join(dir, "roles.json")
+		ksaPath := filepath.Join(dir, "ksa.json")
+		if err := os.WriteFile(ksaPath, []byte(`{"metadata":{"name":"rhiza-inspector","namespace":"ns"},"automountServiceAccountToken":false}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		emptyBindingsPath := filepath.Join(dir, "empty-rolebindings.json")
+		if err := os.WriteFile(emptyBindingsPath, []byte(`{"items":[]}`), 0600); err != nil {
+			t.Fatal(err)
+		}
 		for path, value := range map[string]map[string]any{bindingsPath: bindings, rolesPath: roles} {
 			raw, err := json.Marshal(value)
 			if err != nil {
@@ -870,7 +948,13 @@ func TestQualificationInspectorBaselineClusterRoleGuard(t *testing.T) {
 			}
 		}
 		command := exec.Command("/bin/sh", "-c", guard+"\nvalidate_inspector_clusterrolebindings \"$1\" \"$2\" ns", "fixture", bindingsPath, rolesPath)
-		return command.Run()
+		bootstrapErr := command.Run()
+		command = exec.Command("/bin/sh", "-c", "ns=ns; "+runtimeGuard+"\nvalidate_inspector_policy() { :; }\nvalidate_inspector_access \"$3\" \"$4\" \"$1\" ignored-policy \"$2\"", "fixture", bindingsPath, rolesPath, ksaPath, emptyBindingsPath)
+		output, runtimeErr := command.CombinedOutput()
+		if (bootstrapErr == nil) != (runtimeErr == nil) {
+			t.Fatalf("bootstrap/runtime RBAC guard disagreement: bootstrap=%v runtime=%v\n%s", bootstrapErr, runtimeErr, output)
+		}
+		return runtimeErr
 	}
 	if err := runGuard(t, bindings, roles); err != nil {
 		t.Fatalf("reviewed baseline ClusterRoleBindings rejected: %v", err)
@@ -893,6 +977,24 @@ func TestQualificationInspectorBaselineClusterRoleGuard(t *testing.T) {
 		t.Fatalf("unrelated-namespace inspector subject was rejected: %v", err)
 	}
 	mutations := map[string]func(map[string]any, map[string]any){
+		"nonbaseline-global-grant": func(bindings, roles map[string]any) {
+			bindings["items"] = append(bindings["items"].([]any), binding("extra-global-reader", "system:discovery", group("system:authenticated")))
+		},
+		"nonbaseline-serviceaccounts-grant": func(bindings, roles map[string]any) {
+			bindings["items"] = append(bindings["items"].([]any), binding("extra-serviceaccounts-reader", "system:discovery", group("system:serviceaccounts")))
+		},
+		"changed-role-reference": func(bindings, roles map[string]any) {
+			bindings["items"].([]any)[0].(map[string]any)["roleRef"] = roleRef("cluster-admin")
+		},
+		"missing-role": func(bindings, roles map[string]any) {
+			roles["items"] = roles["items"].([]any)[1:]
+		},
+		"duplicate-role": func(bindings, roles map[string]any) {
+			roles["items"] = append(roles["items"].([]any), roles["items"].([]any)[0])
+		},
+		"changed-default-label": func(bindings, roles map[string]any) {
+			roles["items"].([]any)[0].(map[string]any)["metadata"].(map[string]any)["labels"] = map[string]any{"untrusted": "role"}
+		},
 		"extra-subject": func(bindings, roles map[string]any) {
 			first := bindings["items"].([]any)[0].(map[string]any)
 			first["subjects"] = append(first["subjects"].([]any), group("system:unauthenticated"))
@@ -1474,7 +1576,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 		"  - apiGroups: ['']\n    resources: [endpoints]\n    verbs: [get, list, watch]\n",
 		"  - apiGroups: [discovery.k8s.io]\n    resources: [endpointslices]\n    verbs: [get, list, watch]\n",
 	}
-	var runtimeRole string
+	var runtimeRole, readerRole string
 	for _, document := range strings.Split(string(rendered), "\n---\n") {
 		if strings.Contains(document, "\nkind: Role\n") && strings.Contains(document, "  name: rhiza-ci-runtime\n") {
 			runtimeRole = document
@@ -1482,6 +1584,45 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 		if strings.Contains(document, "\nkind: ClusterRole\n") && (strings.Contains(document, "resources: [endpoints]") || strings.Contains(document, "discovery.k8s.io")) {
 			t.Fatal("endpoint access escaped the namespaced runtime role")
 		}
+		if strings.Contains(document, "\nkind: ClusterRole\n") && strings.Contains(document, "  name: rhiza-v0191-20261008-a1b2c3d4-reader\n") {
+			if readerRole != "" {
+				t.Fatal("duplicate runtime reader ClusterRole")
+			}
+			readerRole = document
+		}
+	}
+	var reader struct {
+		Rules []map[string]any `yaml:"rules"`
+	}
+	if readerRole == "" {
+		t.Fatal("runtime reader ClusterRole missing")
+	}
+	if err := yaml.Unmarshal([]byte(readerRole), &reader); err != nil {
+		t.Fatal(err)
+	}
+	defaultRoles := []string{"system:basic-user", "system:discovery", "system:public-info-viewer", "system:service-account-issuer-discovery"}
+	expectedReaderRules := []map[string]any{
+		{"apiGroups": []string{""}, "resources": []string{"namespaces"}, "resourceNames": []string{"rhiza-v0191-20261008-a1b2c3d4"}, "verbs": []string{"get"}},
+		{"apiGroups": []string{"rbac.authorization.k8s.io"}, "resources": []string{"clusterrolebindings"}, "verbs": []string{"list"}},
+		{"apiGroups": []string{"rbac.authorization.k8s.io"}, "resources": []string{"clusterroles"}, "resourceNames": defaultRoles, "verbs": []string{"get"}},
+	}
+	actualRules, err := json.Marshal(reader.Rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedRules, err := json.Marshal(expectedReaderRules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actualRules, expectedRules) {
+		t.Fatalf("runtime reader permissions are not exact named GET plus original namespace/binding rules:\n%s", actualRules)
+	}
+	runtimeSource, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(runtimeSource, []byte("run inspector-clusterroles k get clusterroles.rbac.authorization.k8s.io \\\n  "+strings.Join(defaultRoles, " ")+" -o json")) {
+		t.Fatal("runtime default-role lookup is not the exact named GET allowed by the reader role")
 	}
 	for _, rule := range rules {
 		if strings.Count(runtimeRole, rule) != 1 {
