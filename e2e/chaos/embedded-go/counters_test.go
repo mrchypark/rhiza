@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
+	"github.com/mrchypark/rhiza/pkg/checkpoint"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/quic-go/quic-go"
 	"gopkg.in/yaml.v3"
@@ -338,6 +340,89 @@ func TestQualificationApplicationRole(t *testing.T) {
 	}
 }
 
+func qualificationCheckpointPublicationComplete(currentData, publisherData []byte, seedSlot uint64, now time.Time) (bool, error) {
+	var current struct {
+		Index    uint64 `json:"index"`
+		RootHash string `json:"root_hash"`
+	}
+	if err := json.Unmarshal(currentData, &current); err != nil {
+		return false, fmt.Errorf("decode checkpoint CURRENT: %w", err)
+	}
+	var publisher checkpoint.PublisherClaim
+	if err := json.Unmarshal(publisherData, &publisher); err != nil {
+		return false, fmt.Errorf("decode checkpoint PUBLISHER: %w", err)
+	}
+	root, err := hex.DecodeString(current.RootHash)
+	if err != nil || len(root) != sha256.Size || bytes.Equal(root, make([]byte, sha256.Size)) {
+		return false, fmt.Errorf("invalid checkpoint CURRENT root hash")
+	}
+	return seedSlot != 0 && current.Index >= seedSlot && publisher.ConfigID == 1 &&
+		publisher.Generation != 0 && publisher.OwnerID == "voter" && publisher.Purpose == "publisher" &&
+		publisher.ReservedIndex != 0 && publisher.ReservedIndex <= publisher.BoundIndex &&
+		publisher.BoundIndex == current.Index && publisher.RootHash == current.RootHash &&
+		publisher.LeaseUntilMS > 0 && publisher.LeaseUntilMS <= now.UnixMilli(), nil
+}
+
+func TestQualificationCheckpointPublicationCompletion(t *testing.T) {
+	const seedSlot = 3
+	now := time.UnixMilli(1000)
+	root := strings.Repeat("a", 64)
+	current := []byte(fmt.Sprintf(`{"index":3,"root_hash":%q}`, root))
+	publisher := checkpoint.PublisherClaim{ConfigID: 1, Generation: 1, OwnerID: "voter", Purpose: "publisher",
+		ReservedIndex: 3, BoundIndex: 3, RootHash: root, LeaseUntilMS: now.UnixMilli()}
+	for _, tc := range []struct {
+		name    string
+		change  func(*checkpoint.PublisherClaim)
+		current []byte
+		seed    uint64
+		want    bool
+		wantErr bool
+	}{
+		{name: "released", want: true},
+		{name: "current-behind-seed", seed: 4},
+		{name: "zero-seed", seed: 0},
+		{name: "live", change: func(p *checkpoint.PublisherClaim) { p.LeaseUntilMS++ }},
+		{name: "zero-lease", change: func(p *checkpoint.PublisherClaim) { p.LeaseUntilMS = 0 }},
+		{name: "wrong-root", change: func(p *checkpoint.PublisherClaim) { p.RootHash = strings.Repeat("b", 64) }},
+		{name: "wrong-index", change: func(p *checkpoint.PublisherClaim) { p.BoundIndex++ }},
+		{name: "wrong-owner", change: func(p *checkpoint.PublisherClaim) { p.OwnerID = "other" }},
+		{name: "wrong-purpose", change: func(p *checkpoint.PublisherClaim) { p.Purpose = "maintenance" }},
+		{name: "wrong-config", change: func(p *checkpoint.PublisherClaim) { p.ConfigID++ }},
+		{name: "zero-generation", change: func(p *checkpoint.PublisherClaim) { p.Generation = 0 }},
+		{name: "unbound", change: func(p *checkpoint.PublisherClaim) { p.BoundIndex = 0 }},
+		{name: "zero-reservation", change: func(p *checkpoint.PublisherClaim) { p.ReservedIndex = 0 }},
+		{name: "reservation-ahead", change: func(p *checkpoint.PublisherClaim) { p.ReservedIndex++ }},
+		{name: "malformed-current", current: []byte(`{`), wantErr: true},
+		{name: "invalid-current-root", current: []byte(`{"index":3,"root_hash":"bad"}`), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claim := publisher
+			if tc.change != nil {
+				tc.change(&claim)
+			}
+			claimData, err := json.Marshal(claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentData := current
+			if tc.current != nil {
+				currentData = tc.current
+			}
+			seed := uint64(seedSlot)
+			if tc.seed != 0 || tc.name == "zero-seed" {
+				seed = tc.seed
+			}
+			got, err := qualificationCheckpointPublicationComplete(currentData, claimData, seed, now)
+			if got != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("complete=%t err=%v; want complete=%t error=%t", got, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+	if done, err := qualificationCheckpointPublicationComplete(current, []byte(`{`), seedSlot, now); done || err == nil {
+		t.Fatalf("malformed publisher: complete=%t err=%v", done, err)
+	}
+}
+
 func TestQualificationObjectStoreReplicaHandler(t *testing.T) {
 	ctx := context.Background()
 	store := t.TempDir()
@@ -347,30 +432,64 @@ func TestQualificationObjectStoreReplicaHandler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if err := voter.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if _, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "schema", SQL: "CREATE TABLE qualification (id INTEGER PRIMARY KEY, value TEXT)"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "seed", SQL: "INSERT INTO qualification VALUES (1, 'sentinel')"}); err != nil {
+	seed, err := voter.Execute(ctx, rhiza.ExecuteRequest{RequestID: "seed", SQL: "INSERT INTO qualification VALUES (1, 'sentinel')"})
+	if err != nil {
 		t.Fatal(err)
 	}
+	if seed.Slot == 0 {
+		t.Fatal("seed has no certified slot")
+	}
+	readPublication := func() ([]byte, []byte, bool) {
+		t.Helper()
+		current, err := os.ReadFile(filepath.Join(store, "qualification-replica", "checkpoint", "CURRENT"))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		publisher, err := os.ReadFile(filepath.Join(store, "qualification-replica", "checkpoint", "PUBLISHER"))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, false
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		complete, err := qualificationCheckpointPublicationComplete(current, publisher, seed.Slot, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return current, publisher, complete
+	}
+	var completedCurrent, completedPublisher []byte
 	checkpointDeadline := time.Now().Add(3 * time.Second)
 	for {
-		_, currentErr := os.Stat(filepath.Join(store, "qualification-replica", "checkpoint", "CURRENT"))
-		if currentErr == nil {
+		current, publisher, complete := readPublication()
+		if complete {
+			completedCurrent, completedPublisher = current, publisher
 			break
-		} else if currentErr != nil && !errors.Is(currentErr, os.ErrNotExist) {
-			t.Fatal(currentErr)
 		}
 		if time.Now().After(checkpointDeadline) {
-			t.Fatal("certified checkpoint was not published")
+			t.Fatalf("checkpoint covering seed slot %d did not finish publication and release its claim", seed.Slot)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// CURRENT is published before the certified archive base and maintenance
-	// claim are finalized. Give that same publication operation time to finish.
-	time.Sleep(500 * time.Millisecond)
+	// With no writes after seed, StateTip cannot advance beyond this completed
+	// checkpoint; the serial automatic loop cannot start another publication.
 	if err := voter.Close(); err != nil {
 		t.Fatal(err)
+	}
+	current, publisher, complete := readPublication()
+	if !complete || !bytes.Equal(current, completedCurrent) || !bytes.Equal(publisher, completedPublisher) {
+		t.Fatal("completed checkpoint publication changed across voter shutdown")
 	}
 	config := objectStoreReplicaConfig(rhiza.Config{ClusterID: "qualification-replica", NodeID: "cold-reader",
 		DataDir: t.TempDir(), Members: []rhiza.Member{{ID: "voter", PeerURL: "quic://forbidden", PublicKey: rhiza.PublicKey{1}}},
