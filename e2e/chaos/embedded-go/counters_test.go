@@ -837,10 +837,11 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 	defaultedTopologyPod := strings.Replace(validPod,
 		`"labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}`,
 		`"labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4","topology.kubernetes.io/region":"region","topology.kubernetes.io/zone":"zone"}`, 1)
-	for _, tc := range []struct {
+	type podCase struct {
 		name, pod string
 		valid     bool
-	}{
+	}
+	podCases := []podCase{
 		{"exact", validPod, true},
 		{"defaulted-topology-labels", defaultedTopologyPod, true},
 		{"wrong-run-label", strings.Replace(validPod, `"chaos.rhiza.io/run":"a1b2c3d4"`, `"chaos.rhiza.io/run":"wrong"`, 1), false},
@@ -860,29 +861,37 @@ func TestQualificationInspectorIsolationContract(t *testing.T) {
 		{"working-dir", strings.Replace(validPod, `"command":[`, `"workingDir":"/tmp","command":[`, 1), false},
 		{"stdin", strings.Replace(validPod, `"command":[`, `"stdin":true,"command":[`, 1), false},
 		{"tty", strings.Replace(validPod, `"command":[`, `"tty":true,"command":[`, 1), false},
-	} {
-		podPath := filepath.Join(dir, tc.name+".json")
-		if err := os.WriteFile(podPath, []byte(tc.pod), 0600); err != nil {
-			t.Fatal(err)
-		}
-		command := exec.Command("/bin/sh", "-c", "out=$1; ns=ns; RHIZA_RUN_ID=a1b2c3d4; RHIZA_HOST_IMAGE=candidate@sha256:"+strings.Repeat("a", 64)+"; RHIZA_NODE_A=node-a; "+validator+"\nvalidate_inspector_pod \"$2\"", "fixture", dir, podPath)
-		if err := command.Run(); (err == nil) != tc.valid {
-			t.Fatalf("inspector validator %s valid=%t error=%v", tc.name, tc.valid, err)
+	}
+	for _, field := range []string{"hostNetwork", "hostPID", "hostIPC"} {
+		key := fmt.Sprintf(`"%s":false`, field)
+		podCases = append(podCases,
+			podCase{field + "-omitted", strings.Replace(defaultedTopologyPod, key+",", "", 1), true},
+			podCase{field + "-null", strings.Replace(defaultedTopologyPod, key, fmt.Sprintf(`"%s":null`, field), 1), true})
+		for i, value := range []string{"true", `"false"`, "0", "[]", "{}"} {
+			podCases = append(podCases, podCase{fmt.Sprintf("%s-invalid-%d", field, i), strings.Replace(defaultedTopologyPod, key, fmt.Sprintf(`"%s":%s`, field, value), 1), false})
 		}
 	}
+	podCases = append(podCases, podCase{"host-flags-omitted", strings.NewReplacer(`"hostNetwork":false,`, "", `"hostPID":false,`, "", `"hostIPC":false,`, "").Replace(defaultedTopologyPod), true})
 	if err := os.WriteFile(filepath.Join(dir, "inspector-control-created.json"), []byte(`{"metadata":{"uid":"control-created"}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	validControl := strings.NewReplacer(`"name":"rhiza-inspector"`, `"name":"rhiza-inspector-control"`,
+	controlPod := strings.NewReplacer(`"name":"rhiza-inspector"`, `"name":"rhiza-inspector-control"`,
 		`"uid":"created"`, `"uid":"control-created"`, `"app":"rhiza-inspector"`, `"app":"rhiza-inspector-control"`,
-		`"name":"inspector"`, `"name":"control"`).Replace(validPod)
-	controlPath := filepath.Join(dir, "control.json")
-	if err := os.WriteFile(controlPath, []byte(validControl), 0600); err != nil {
-		t.Fatal(err)
-	}
-	controlCommand := exec.Command("/bin/sh", "-c", "out=$1; ns=ns; RHIZA_RUN_ID=a1b2c3d4; RHIZA_HOST_IMAGE=candidate@sha256:"+strings.Repeat("a", 64)+"; RHIZA_NODE_A=node-a; "+validator+"\nvalidate_inspector_control_pod \"$2\"", "fixture", dir, controlPath)
-	if err := controlCommand.Run(); err != nil {
-		t.Fatalf("exact control Pod rejected: %v", err)
+		`"name":"inspector"`, `"name":"control"`)
+	for _, tc := range podCases {
+		for _, probe := range []struct{ name, pod, validate string }{
+			{"inspector", tc.pod, "validate_inspector_pod"},
+			{"control", controlPod.Replace(tc.pod), "validate_inspector_control_pod"},
+		} {
+			podPath := filepath.Join(dir, probe.name+"-"+tc.name+".json")
+			if err := os.WriteFile(podPath, []byte(probe.pod), 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "-c", "out=$1; ns=ns; RHIZA_RUN_ID=a1b2c3d4; RHIZA_HOST_IMAGE=candidate@sha256:"+strings.Repeat("a", 64)+"; RHIZA_NODE_A=node-a; "+validator+"\n"+probe.validate+" \"$2\"", "fixture", dir, podPath)
+			if err := command.Run(); (err == nil) != tc.valid {
+				t.Fatalf("%s validator %s valid=%t error=%v", probe.name, tc.name, tc.valid, err)
+			}
+		}
 	}
 	if err := os.WriteFile(filepath.Join(dir, "inspector-networkpolicy-bootstrap.json"), []byte(`{"metadata":{"uid":"policy-created"}}`), 0600); err != nil {
 		t.Fatal(err)

@@ -521,7 +521,11 @@ validate_probe_pod() {
       (($labels|keys|sort)==["app","chaos.rhiza.io/run"] or
        (($labels|keys|sort)==["app","chaos.rhiza.io/run","topology.kubernetes.io/region","topology.kubernetes.io/zone"]))) and
     (.metadata.ownerReferences // [])==[] and .spec.serviceAccountName=="rhiza-inspector" and
-    .spec.automountServiceAccountToken==false and .spec.hostNetwork==false and .spec.hostPID==false and .spec.hostIPC==false and
+    .spec.automountServiceAccountToken==false and
+    # API receipts may omit these default-false PodSpec booleans.
+    (.spec.hostNetwork==null or .spec.hostNetwork==false) and
+    (.spec.hostPID==null or .spec.hostPID==false) and
+    (.spec.hostIPC==null or .spec.hostIPC==false) and
     .spec.nodeName==$node and .spec.restartPolicy=="Never" and (.spec.volumes // [])==[] and
     .spec.securityContext.runAsNonRoot==true and .spec.securityContext.runAsUser==65532 and
     .spec.securityContext.runAsGroup==65532 and .spec.securityContext.fsGroup==65532 and
