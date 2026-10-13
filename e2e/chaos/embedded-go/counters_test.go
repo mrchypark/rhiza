@@ -2674,6 +2674,11 @@ func TestQualificationCurlHelper(t *testing.T) {
 }
 
 func TestQualificationArchiveHeadEvidence(t *testing.T) {
+	if os.Getenv("RHIZA_ARCHIVE_DECODER_CHILD") == "1" {
+		os.Args = os.Args[len(os.Args)-2:]
+		main()
+		os.Exit(0)
+	}
 	const headerSize = 128
 	rootHash := sha256.Sum256([]byte("root"))
 	stateHash := sha256.Sum256([]byte("state"))
@@ -2714,6 +2719,72 @@ func TestQualificationArchiveHeadEvidence(t *testing.T) {
 		head.Tip != 14 || head.TailObject != 1 || head.TailHash != [32]byte(bytes.Repeat([]byte{0x22}, sha256.Size)) {
 		t.Fatalf("unexpected archive head evidence: %+v", head)
 	}
+	t.Run("image-command-contract", func(t *testing.T) {
+		dockerfile, err := os.ReadFile("../Dockerfile")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entrypoint []string
+		for _, line := range strings.Split(string(dockerfile), "\n") {
+			if strings.HasPrefix(line, "ENTRYPOINT ") {
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "ENTRYPOINT ")), &entrypoint); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if len(entrypoint) != 1 || !strings.Contains(string(dockerfile), "COPY --chmod=0755 ${BINARY} "+entrypoint[0]+"\n") {
+			t.Fatal("image must install its single executable entrypoint")
+		}
+		source, err := os.ReadFile("../run-gcs-postrelease.sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(source), "run learner-clock k exec rhiza-learner -- "+entrypoint[0]+" qualification-unix-milli\n") {
+			t.Fatal("learner clock must use the image executable too")
+		}
+		_, helper, found := strings.Cut(string(source), "decode_archive_head() {\n")
+		if !found {
+			t.Fatal("archive decoder helper missing")
+		}
+		helper, _, found = strings.Cut(helper, "\n}\n")
+		if !found {
+			t.Fatal("archive decoder helper unterminated")
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := filepath.Join(t.TempDir(), "archive head.bin")
+		for _, valid := range []bool{true, false} {
+			payload := data
+			if !valid {
+				payload = []byte("invalid archive head")
+			}
+			if err := os.WriteFile(input, payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command("/bin/sh", "-c", `k() {
+  [ "$#" = 6 ] && [ "$1" = exec ] && [ "$2" = -i ] && [ "$3" = rhiza-inspector ] &&
+    [ "$4" = -- ] && [ "$5" = "$IMAGE_ENTRYPOINT" ] && [ "$6" = qualification-archive-head ] || return 127
+  "$TEST_EXECUTABLE" -test.run '^TestQualificationArchiveHeadEvidence$' -- "$5" "$6"
+}
+decode_archive_head() {
+`+helper+"\n}\ndecode_archive_head \"$1\"", "fixture", input)
+			command.Env = append(os.Environ(), "RHIZA_ARCHIVE_DECODER_CHILD=1", "IMAGE_ENTRYPOINT="+entrypoint[0], "TEST_EXECUTABLE="+executable)
+			output, err := command.CombinedOutput()
+			if !valid {
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != 1 || !bytes.Contains(output, []byte("invalid archive head evidence")) {
+					t.Fatalf("decoder failure not propagated: %v output=%s", err, output)
+				}
+				continue
+			}
+			var decoded qualificationArchiveHeadEvidence
+			if err != nil || json.Unmarshal(output, &decoded) != nil || decoded != head {
+				t.Fatalf("image command did not decode stdin: %v output=%s", err, output)
+			}
+		}
+	})
 	for _, tc := range []struct {
 		name string
 		data []byte

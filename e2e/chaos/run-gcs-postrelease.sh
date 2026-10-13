@@ -429,7 +429,7 @@ redacted_storage_json() {
   k exec rhiza-metadata -- gcloud storage cat "$1" | jq -e 'if type=="object" then del(.token) else error("stored coordination record is not an object") end'
 }
 decode_archive_head() {
-  k exec -i rhiza-inspector -- rhiza qualification-archive-head < "$1"
+  k exec -i rhiza-inspector -- /usr/local/bin/rhiza-entrypoint qualification-archive-head < "$1"
 }
 preserve_run_output() {
   [ -f "$out/$seq-$1.stdout" ] || die "missing run output for $1"
@@ -2218,7 +2218,7 @@ run checkpoint-metadata-after k exec rhiza-metadata -- gcloud storage objects de
 preserve_run_output checkpoint-metadata-after "$out/checkpoint-CURRENT-metadata-after.json"
 validate_checkpoint_current_metadata "$out/checkpoint-CURRENT-metadata-after.json" || die 'published checkpoint CURRENT metadata changed to invalid'
 recovery_pin_id=$(jq -r '.recovery_pin_id' "$learner_status")
-run learner-clock k exec rhiza-learner -- rhiza qualification-unix-milli
+run learner-clock k exec rhiza-learner -- /usr/local/bin/rhiza-entrypoint qualification-unix-milli
 preserve_run_output learner-clock "$out/learner-clock-before-terminal.txt"
 learner_clock_ms=$(cat "$out/learner-clock-before-terminal.txt")
 printf '%s' "$learner_clock_ms" | grep -Eq '^[1-9][0-9]{0,15}$' || die 'learner container clock invalid'
