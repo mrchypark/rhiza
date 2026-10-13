@@ -1547,7 +1547,7 @@ exit 92
 		t.Fatal(err)
 	}
 	fixture := `set -eu
-bin=$1; trace=$2
+bin=$1; trace=$2; out=$1; inspector_network_isolation=required
 die() { exit 97; }
 run() { label=$1; shift; printf '%s\n' "$label" >> "$trace"; "$@"; }
 k() {
@@ -1570,6 +1570,125 @@ inspector-control-after-reachable" ]`
 	trace := filepath.Join(dir, "trace")
 	if output, err := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, trace).CombinedOutput(); err != nil {
 		t.Fatalf("implicit-443 end-to-end isolation path failed: %v\n%s", err, output)
+	}
+}
+
+func TestQualificationInspectorNetworkIsolationScope(t *testing.T) {
+	sourceBytes, err := os.ReadFile("../run-gcs-postrelease.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(sourceBytes)
+	settingStart := strings.Index(source, "\ninspector_network_isolation=${RHIZA_INSPECTOR_NETWORK_ISOLATION-required}\n")
+	settingEnd := strings.Index(source, "\nsha256_file() {\n")
+	helperStart := strings.Index(source, "\nparse_https_443() {\n")
+	helperEnd := strings.Index(source, "\nstarted=")
+	if settingStart < 0 || settingEnd <= settingStart || helperStart < 0 || helperEnd <= helperStart ||
+		!strings.HasSuffix(strings.TrimSpace(source), "write_qualification_result") {
+		t.Fatal("actual isolation setting, probe or final-result path missing")
+	}
+	for _, tc := range []struct {
+		name, setting, outcome, receipt string
+		set                             bool
+		wantExit                        int
+		excluded                        bool
+	}{
+		{name: "unset-strict-default", outcome: "drop"},
+		{name: "explicit-strict", setting: "required", set: true, outcome: "drop"},
+		{name: "strict-connected-rejected", outcome: "connect", wantExit: 41},
+		{name: "approved-exclusion", setting: "exclude-user-approved", set: true, excluded: true},
+		{name: "exclusion-missing-receipt", setting: "exclude-user-approved", set: true, excluded: true, receipt: "missing", wantExit: 97},
+		{name: "exclusion-contradictory-receipt", setting: "exclude-user-approved", set: true, excluded: true, receipt: "strict", wantExit: 97},
+		{name: "empty-rejected", set: true, wantExit: 97},
+		{name: "boolean-rejected", setting: "true", set: true, wantExit: 97},
+		{name: "unknown-rejected", setting: "skip", set: true, wantExit: 97},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			busybox := `#!/bin/sh
+[ "$1 $2 $3" = "nc -w 3" ] || exit 91
+case "$OUTCOME" in drop) sleep 2; exit 1 ;; connect) exit 0 ;; esac
+exit 92
+`
+			if err := os.WriteFile(filepath.Join(dir, "busybox"), []byte(busybox), 0700); err != nil {
+				t.Fatal(err)
+			}
+			fixture := `set -eu
+out=$1; trace=$out/trace
+unset RHIZA_INSPECTOR_NETWORK_ISOLATION
+if [ "$2" = true ]; then export RHIZA_INSPECTOR_NETWORK_ISOLATION=$3; fi
+INSPECTOR_OUTCOME=$4; RECEIPT_CHANGE=$5
+die() { printf '%s\n' "$*" >&2; exit 97; }
+run() { label=$1; shift; printf '%s\n' "$label" >> "$trace"; "$@"; }
+k() {
+  case "$1 $2" in
+    "exec rhiza-inspector-control") OUTCOME=connect ;;
+    "exec rhiza-inspector") OUTCOME=$INSPECTOR_OUTCOME ;;
+    *) return 90 ;;
+  esac
+  export OUTCOME
+  [ "$3 $4 $5" = "-- sh -c" ] || return 90
+  shift 5
+  script=$1; shift
+  PATH="$out:$PATH" sh -c "$script" "$@"
+}
+` + source[settingStart:settingEnd] + source[helperStart:helperEnd] + `
+verify_inspector_network_isolation https://192.0.2.10
+case "$RECEIPT_CHANGE" in
+  missing) rm "$out/inspector-network-isolation.txt" ;;
+  strict) printf '%s\n' 'PASS inspector-network-isolation' > "$out/inspector-network-isolation.txt" ;;
+esac
+write_qualification_result
+`
+			command := exec.Command("/bin/sh", "-c", fixture, "fixture", dir, strconv.FormatBool(tc.set), tc.setting, tc.outcome, tc.receipt)
+			output, runErr := command.CombinedOutput()
+			code := 0
+			if runErr != nil {
+				var exited *exec.ExitError
+				if !errors.As(runErr, &exited) {
+					t.Fatalf("fixture did not return a native exit: %v", runErr)
+				}
+				code = exited.ExitCode()
+			}
+			if code != tc.wantExit {
+				t.Fatalf("native exit=%d want=%d: %s", code, tc.wantExit, output)
+			}
+			trace, traceErr := os.ReadFile(filepath.Join(dir, "trace"))
+			if tc.excluded || tc.wantExit == 97 {
+				if !errors.Is(traceErr, os.ErrNotExist) {
+					t.Fatalf("excluded/invalid setting invoked a probe: %q error=%v", trace, traceErr)
+				}
+			} else {
+				want := "inspector-control-before-reachable\ninspector-egress-denied\n"
+				if tc.wantExit == 0 {
+					want += "inspector-control-after-reachable\n"
+				}
+				if traceErr != nil || string(trace) != want {
+					t.Fatalf("strict probe order=%q want=%q error=%v", trace, want, traceErr)
+				}
+			}
+			result, resultErr := os.ReadFile(filepath.Join(dir, "result.txt"))
+			if tc.wantExit != 0 {
+				if !errors.Is(resultErr, os.ErrNotExist) {
+					t.Fatalf("failed scope produced a final result: %q error=%v", result, resultErr)
+				}
+				return
+			}
+			receipt, receiptErr := os.ReadFile(filepath.Join(dir, "inspector-network-isolation.txt"))
+			if resultErr != nil || receiptErr != nil {
+				t.Fatalf("scope evidence missing: result=%v receipt=%v", resultErr, receiptErr)
+			}
+			if tc.excluded {
+				if string(receipt) != "EXCLUDED inspector-network-isolation: user-approved\n" ||
+					!bytes.HasPrefix(result, []byte("SCOPED PASS ")) ||
+					!bytes.Contains(result, []byte("EXCLUDED inspector-network-isolation (user-approved); NOT full qualification PASS")) ||
+					bytes.Contains(receipt, []byte("PASS")) {
+					t.Fatalf("exclusion overstated qualification: receipt=%q result=%q", receipt, result)
+				}
+			} else if string(receipt) != "PASS inspector-network-isolation\n" || !bytes.HasPrefix(result, []byte("PASS selected ")) || bytes.Contains(result, []byte("EXCLUDED")) {
+				t.Fatalf("strict qualification scope changed: receipt=%q result=%q", receipt, result)
+			}
+		})
 	}
 }
 

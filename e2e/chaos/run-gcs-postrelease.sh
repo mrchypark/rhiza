@@ -14,6 +14,11 @@ esac
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 . "$script_dir/cluster-metadata-projection.sh"
 die() { printf '%s\n' "$*" >&2; exit 1; }
+inspector_network_isolation=${RHIZA_INSPECTOR_NETWORK_ISOLATION-required}
+case "$inspector_network_isolation" in
+  required|exclude-user-approved) ;;
+  *) die 'RHIZA_INSPECTOR_NETWORK_ISOLATION must be required or exclude-user-approved' ;;
+esac
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256_output=$(sha256sum "$1") || return
@@ -980,10 +985,24 @@ probe_inspector_egress() {
   ' sh "$probe_host" "$probe_port"
 }
 verify_inspector_network_isolation() {
+  if [ "$inspector_network_isolation" = exclude-user-approved ]; then
+    printf '%s\n' 'EXCLUDED inspector-network-isolation: user-approved' > "$out/inspector-network-isolation.txt"
+    return 0
+  fi
   parse_https_443 "$1" || die 'exact HTTPS Kubernetes API endpoint on port 443 required for isolation probe'
   run inspector-control-before-reachable probe_inspector_control_egress "$api_host" "$api_port" before
   run inspector-egress-denied probe_inspector_egress "$api_host" "$api_port"
   run inspector-control-after-reachable probe_inspector_control_egress "$api_host" "$api_port" after
+  printf '%s\n' 'PASS inspector-network-isolation' > "$out/inspector-network-isolation.txt"
+}
+write_qualification_result() {
+  if [ "$inspector_network_isolation" = exclude-user-approved ]; then
+    [ "$(cat "$out/inspector-network-isolation.txt")" = 'EXCLUDED inspector-network-isolation: user-approved' ] || die 'inspector exclusion receipt mismatch'
+    printf '%s\n' 'SCOPED PASS selected GCS/process/network/fresh-object-store-read-replica layer; EXCLUDED inspector-network-isolation (user-approved); NOT full qualification PASS; no writable whole-generation DR, promotion, fencing, IO/power-loss or published Rust package claim.' > "$out/result.txt"
+  else
+    [ "$(cat "$out/inspector-network-isolation.txt")" = 'PASS inspector-network-isolation' ] || die 'inspector isolation receipt missing or invalid'
+    printf '%s\n' 'PASS selected GCS/process/network/fresh-object-store-read-replica layer; no writable whole-generation DR, promotion, fencing, IO/power-loss or published Rust package claim.' > "$out/result.txt"
+  fi
 }
 started=${RHIZA_JOB_STARTED:-$(date +%s)}
 [ "$mode" != run-local ] || started=$now
@@ -2223,4 +2242,4 @@ same_object_evidence "$out/archive-head-metadata-before.json" "$out/archive-head
 same_object_evidence "$out/checkpoint-CURRENT-metadata-before.json" "$out/checkpoint-CURRENT-metadata-after.json" "$out/checkpoint-CURRENT-before.sha256" "$out/checkpoint-CURRENT-after.sha256" || die 'checkpoint CURRENT changed during cold restore proof'
 metrics
 printf '%s\n' 'Sampled UID/container high-water totals exclude unseen startup/kill/shutdown tails and metadata SDK calls; 10k attempts/384MiB are planned reserves, NOT hard billing guarantees. Root must reconcile actual object generations/transfer and cleanup.' > "$out/budget-limitations.txt"
-printf '%s\n' 'PASS selected GCS/process/network/fresh-object-store-read-replica layer; no writable whole-generation DR, promotion, fencing, IO/power-loss or published Rust package claim.' > "$out/result.txt"
+write_qualification_result

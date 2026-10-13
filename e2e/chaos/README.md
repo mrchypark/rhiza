@@ -12,6 +12,22 @@ authorized actor from creating Pods. Runtime qualification instead retains
 exact workload identity, image, node, security-shape, RBAC, and default-deny
 NetworkPolicy checks.
 
+Inspector TCP network-isolation proof is required by default. Only an explicitly
+user-approved scope exclusion may set
+`RHIZA_INSPECTOR_NETWORK_ISOLATION=exclude-user-approved` for that execution;
+`required` is the other valid value. Empty or unknown values fail before execution.
+The opt-in does not change cluster settings, remove the deny-all policy, or relax
+Inspector identity, RBAC, token, credential, image, or policy-shape checks. GCS
+scope, HEAD/CURRENT freeze, cold object-store recovery, read barriers, and Chaos
+fault/readback checks remain required.
+
+An excluded execution records `EXCLUDED` in `inspector-network-isolation.txt`.
+Only after the remaining checks succeed does `result.txt` report `SCOPED PASS`
+with the explicit exclusion; it is not network-isolation or full qualification
+PASS. Result consumers must preserve that scope and must not turn native exit 0
+alone into an unconditional qualification PASS. Without the opt-in, the existing
+paired reachable-control/denied-Inspector/reachable-control proof is unchanged.
+
 The workload retries stable request IDs during faults. The test checks:
 
 - SIGKILL with the same Pod and WAL preserves voter identity.
