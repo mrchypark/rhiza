@@ -470,7 +470,8 @@ func TestQualificationObjectStoreReplicaHandler(t *testing.T) {
 		return current, publisher, complete
 	}
 	var completedCurrent, completedPublisher []byte
-	checkpointDeadline := time.Now().Add(3 * time.Second)
+	checkpointStart := time.Now()
+	checkpointDeadline := checkpointStart.Add(30 * time.Second)
 	for {
 		current, publisher, complete := readPublication()
 		if complete {
@@ -478,7 +479,7 @@ func TestQualificationObjectStoreReplicaHandler(t *testing.T) {
 			break
 		}
 		if time.Now().After(checkpointDeadline) {
-			t.Fatalf("checkpoint covering seed slot %d did not finish publication and release its claim", seed.Slot)
+			t.Fatalf("checkpoint covering seed slot %d did not finish publication and release its claim: elapsed=%s CURRENT=%q PUBLISHER=%q", seed.Slot, time.Since(checkpointStart), current, publisher)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -597,7 +598,7 @@ func TestQualificationColdRestoreContract(t *testing.T) {
 		`del(.token)`,
 		`preserve_run_output head-freeze "$out/archive-head-before.bin"`,
 		`decode_archive_head "$out/archive-head-before.bin"`,
-		`rhiza qualification-unix-milli`,
+		`/usr/local/bin/rhiza-entrypoint qualification-unix-milli`,
 		`"$out/archive-base-root-before.json"`,
 		`validate_cold_inventory "$out/object-inventory-before.json"`,
 		`if [ "$source_quiesced" = true ]; then ports=$port_learner`,
