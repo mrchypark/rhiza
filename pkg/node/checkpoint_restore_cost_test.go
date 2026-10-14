@@ -126,8 +126,14 @@ func TestCheckpointRestoreCostExercisesNodeRecoveryPathS3(t *testing.T) {
 		t.Fatalf("write state before checkpoint publication: %v", err)
 	}
 	firstBucket := first.bucket
+	// This is a checkpoint-restore measurement, not an assumption that Close
+	// creates a new quorum-certified checkpoint as a shutdown side effect.
+	first.checkpointer.Stop()
+	if err := first.checkpointer.CheckpointOnShutdown(ctx, first.material.StateTip()); err != nil {
+		t.Fatalf("publish checkpoint for restoration measurement: %v", err)
+	}
 	if err := first.Shutdown(); err != nil {
-		t.Fatalf("shutdown and publish certified checkpoint: %v", err)
+		t.Fatalf("shutdown after checkpoint publication: %v", err)
 	}
 	firstStats := firstBucket.Stats()
 	requestsAfterInitialPublication := requestCount()

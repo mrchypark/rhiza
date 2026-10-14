@@ -5,11 +5,11 @@ metadata:
   name: @NAMESPACE@
   labels:
     chaos.rhiza.io/run: '@RUN_ID@'
-    pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/enforce: 'restricted'
+    pod-security.kubernetes.io/enforce-version: 'latest'
   annotations:
     rhiza.dev/auth-owner: '@OWNER@'
-    chaos-mesh.org/inject: enabled
+    chaos-mesh.org/inject: 'enabled'
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -18,8 +18,27 @@ metadata:
   namespace: @NAMESPACE@
   annotations:
     iam.gke.io/gcp-service-account: '@POD_GSA@'
+    iam.gke.io/return-principal-id-as-email: "true"
 automountServiceAccountToken: false
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-inspector
+  namespace: @NAMESPACE@
+automountServiceAccountToken: false
+---
+# BEGIN LOCAL RUNTIME ACCOUNT
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-runtime
+  namespace: @NAMESPACE@
+  annotations:
+    rhiza.dev/auth-owner: '@OWNER@'
+automountServiceAccountToken: false
+---
+# END LOCAL RUNTIME ACCOUNT
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -136,9 +155,9 @@ spec:
         variables.sourceSafe
       message: Fault metadata and source selector must select only this run's peer Pods.
     - expression: >-
-        has(object.spec.duration) && object.spec.duration == '10s' &&
+        has(object.spec.duration) && object.spec.duration == '45s' &&
         has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
-      message: Only voter-0 and a fixed ten-second duration are admitted.
+      message: Only voter-0 and a fixed diagnostic-safe duration are admitted.
     - expression: >-
         object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
         !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
@@ -153,7 +172,13 @@ spec:
         'app' in object.spec.target.selector.labelSelectors && object.spec.target.selector.labelSelectors['app'] == 'rhiza-voter' &&
         !has(object.spec.target.selector.pods) &&
         !has(object.spec.target.selector.nodes) && !has(object.spec.target.selector.nodeSelectors) &&
-        !has(object.spec.target.selector.annotationSelectors) && !has(object.spec.target.selector.expressionSelectors) &&
+        !has(object.spec.target.selector.annotationSelectors) &&
+        has(object.spec.target.selector.expressionSelectors) && size(object.spec.target.selector.expressionSelectors) == 1 &&
+        object.spec.target.selector.expressionSelectors[0].key == 'statefulset.kubernetes.io/pod-name' &&
+        object.spec.target.selector.expressionSelectors[0].operator == 'In' &&
+        size(object.spec.target.selector.expressionSelectors[0].values) == 2 &&
+        'rhiza-voter-1' in object.spec.target.selector.expressionSelectors[0].values &&
+        'rhiza-voter-2' in object.spec.target.selector.expressionSelectors[0].values &&
         !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors)
       message: NetworkChaos permits only voter-0 partition against this run's voters, never external targets.
 ---
@@ -171,76 +196,24 @@ spec:
       matchLabels:
         kubernetes.io/metadata.name: @NAMESPACE@
 ---
-# All runtime Pod creation is constrained, including StatefulSet children.
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
+# Bootstrap-owned isolation is installed before the runtime credential exists.
+# The runtime identity may observe this exact policy but cannot mutate any
+# NetworkPolicy or add an overlapping allow policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
 metadata:
-  name: @NAMESPACE@-runtime
-  annotations:
-    rhiza.dev/auth-owner: '@OWNER@'
+  name: rhiza-inspector-deny-all
+  namespace: @NAMESPACE@
+  labels: {chaos.rhiza.io/run: '@RUN_ID@', app: 'rhiza-inspector'}
+  annotations: {rhiza.dev/auth-owner: '@OWNER@'}
 spec:
-  failurePolicy: Fail
-  matchConstraints:
-    resourceRules:
-      - apiGroups: ['']
-        apiVersions: [v1]
-        operations: [CREATE, UPDATE]
-        resources: [pods]
-        scope: Namespaced
-  validations:
-    - expression: >-
-        object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
-        'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        object.spec.serviceAccountName == 'rhiza-gcs' && has(object.spec.automountServiceAccountToken) &&
-        object.spec.automountServiceAccountToken == false
-      message: Every Pod must use this run's label and precreated data KSA, without Kubernetes API token mounting.
-    - expression: >-
-        has(object.spec.nodeName) ? object.spec.nodeName in [
-        'gke-ied-cluster-ied-data-nodepool-72484396-ra2i',
-        'gke-ied-cluster-ied-nodepool-7cc3c86f-rjg4',
-        'gke-ied-cluster-ied-nodepool-e70ed3df-9959',
-        'gke-ied-cluster-ied-worker-nodepool-c1fbf207-ec1v'] :
-        (has(object.spec.affinity) && has(object.spec.affinity.nodeAffinity) &&
-        has(object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution) &&
-        size(object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms) == 1 &&
-        object.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.all(t,
-          !has(t.matchFields) && has(t.matchExpressions) && size(t.matchExpressions) == 1 &&
-          t.matchExpressions.all(e, e.key == 'kubernetes.io/hostname' && e.operator == 'In' &&
-            has(e.values) && size(e.values) > 0 && e.values.all(n, n in [
-            'gke-ied-cluster-ied-data-nodepool-72484396-ra2i',
-            'gke-ied-cluster-ied-nodepool-7cc3c86f-rjg4',
-            'gke-ied-cluster-ied-nodepool-e70ed3df-9959',
-            'gke-ied-cluster-ied-worker-nodepool-c1fbf207-ec1v']))))
-      message: Only already-existing nodes may host test Pods; unconstrained scheduling is forbidden.
-    - expression: >-
-        !has(object.spec.hostNetwork) || object.spec.hostNetwork == false
-      message: Host networking is forbidden.
-    - expression: >-
-        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath) && !has(v.persistentVolumeClaim) &&
-        (!has(v.secret) || v.secret.secretName == 'rhiza-qualification-auth') && !has(v.projected))
-      message: No host/PVC/projected-token volumes; only the fresh run's qualification Secret may be mounted.
-    - expression: >-
-        object.spec.containers.all(c,
-          c.image.matches('^ghcr[.]io/mrchypark/rhiza-sql@sha256:[a-f0-9]{64}$') ||
-          c.image.matches('^gcr[.]io/google[.]com/cloudsdktool/google-cloud-cli@sha256:[a-f0-9]{64}$')) &&
-        !has(object.spec.initContainers) && !has(object.spec.ephemeralContainers)
-      message: Only digest-pinned reviewed host/metadata images; no init or ephemeral containers.
+  podSelector:
+    matchLabels: {chaos.rhiza.io/run: '@RUN_ID@', app: 'rhiza-inspector'}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
 ---
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: @NAMESPACE@-runtime
-  annotations:
-    rhiza.dev/auth-owner: '@OWNER@'
-spec:
-  policyName: @NAMESPACE@-runtime
-  validationActions: [Deny]
-  matchResources:
-    namespaceSelector:
-      matchLabels:
-        kubernetes.io/metadata.name: @NAMESPACE@
----
-# Only the CI GSA, not the Pod GSA/KSA, controls fresh runtime resources.
+# Only the selected runtime identity, not the Pod GSA/KSA, controls this scope.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -251,6 +224,13 @@ rules:
     resources: [pods, configmaps, services]
     verbs: [create, get, list, watch, delete]
   - apiGroups: ['']
+    resources: [serviceaccounts]
+    resourceNames: [rhiza-inspector]
+    verbs: [get]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [rolebindings]
+    verbs: [list]
+  - apiGroups: ['']
     resources: [pods/log]
     verbs: [get]
   - apiGroups: ['']
@@ -259,18 +239,30 @@ rules:
   - apiGroups: ['']
     resources: [events]
     verbs: [get, list, watch]
+  - apiGroups: ['']
+    resources: [endpoints]
+    verbs: [get, list, watch]
   - apiGroups: [batch]
     resources: [jobs]
     verbs: [create, get, list, watch, delete]
+  - apiGroups: [batch]
+    resources: [cronjobs]
+    verbs: [list]
   - apiGroups: [apps]
     resources: [statefulsets]
     verbs: [create, get, list, watch, delete]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, daemonsets]
+    verbs: [list]
   - apiGroups: [apps]
     resources: [statefulsets/scale]
     verbs: [get, update, patch]
   - apiGroups: [networking.k8s.io]
     resources: [networkpolicies]
-    verbs: [create, get, list, watch, delete]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
   - apiGroups: [chaos-mesh.org]
     resources: [podchaos, networkchaos]
     verbs: [create, get, list, watch, delete]
@@ -281,15 +273,16 @@ metadata:
   name: rhiza-ci-runtime
   namespace: @NAMESPACE@
 subjects:
-  - kind: User
-    apiGroup: rbac.authorization.k8s.io
-    name: '@CI_GSA@'
+  - kind: @RUNTIME_KIND@
+@RUNTIME_API_GROUP@
+    name: '@RUNTIME_NAME@'
+@RUNTIME_NAMESPACE@
 roleRef:
   kind: Role
   apiGroup: rbac.authorization.k8s.io
   name: rhiza-ci-runtime
 ---
-# Cluster-scoped API, but get only the exact fresh namespace's metadata.
+# Cluster-scoped reads: exact fresh namespace and four safe default RBAC roles.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -301,6 +294,13 @@ rules:
     resources: [namespaces]
     resourceNames: ['@NAMESPACE@']
     verbs: [get]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterrolebindings]
+    verbs: [list]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles]
+    resourceNames: [system:basic-user, system:discovery, system:public-info-viewer, system:service-account-issuer-discovery]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -309,9 +309,10 @@ metadata:
   annotations:
     rhiza.dev/auth-owner: '@OWNER@'
 subjects:
-  - kind: User
-    apiGroup: rbac.authorization.k8s.io
-    name: '@CI_GSA@'
+  - kind: @RUNTIME_KIND@
+@RUNTIME_API_GROUP@
+    name: '@RUNTIME_NAME@'
+@RUNTIME_NAMESPACE@
 roleRef:
   kind: ClusterRole
   apiGroup: rbac.authorization.k8s.io

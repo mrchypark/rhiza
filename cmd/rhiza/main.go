@@ -59,7 +59,7 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 		}
 		handler, closeService = db.Handler(), db.Close
 	case "object-store", "learner":
-		replicaMembers, err := objectReplicaMembers(members)
+		replicaMembers, err := objectReplicaMembers(config.ClusterID, members, role == "object-store" && config.EnableReconfiguration)
 		if role == "learner" {
 			replicaMembers, err = learnerReplicaMembers(os.Getenv("RHIZA_REPLICA_MEMBERS"))
 		}
@@ -71,7 +71,7 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 			return errors.New("invalid RHIZA_REPLICA_SYNC_INTERVAL")
 		}
 		replicaConfig := rhiza.ReplicaConfig{
-			ClusterID: config.ClusterID, ReplicaID: config.NodeID, DataDir: config.DataDir, AdminToken: config.AdminToken,
+			ClusterID: config.ClusterID, ReplicaID: config.NodeID, DataDir: config.DataDir,
 			Members: replicaMembers, SyncInterval: syncInterval, ObjStoreEndpoint: config.ObjStoreEndpoint,
 			ObjStoreBucket: config.ObjStoreBucket, ObjStoreProvider: config.ObjStoreProvider, ObjStoreDir: config.ObjStoreDir,
 			ObjStorePrefix: config.ObjStorePrefix, ObjStoreRegion: config.ObjStoreRegion, ObjStoreInsecure: config.ObjStoreInsecure,
@@ -83,9 +83,17 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 			ObjStoreAzureConnectionString: config.ObjStoreAzureConnectionString, ObjStoreAzureUserAssignedID: config.ObjStoreAzureUserAssignedID,
 			MaxConcurrentReads: config.MaxConcurrentReads, MaxLongPollReads: config.MaxLongPollReads,
 		}
-		var replica *rhiza.ReadReplica
 		if role == "learner" {
+			replicaConfig.AdminToken = config.AdminToken
+		}
+		var replica *rhiza.ReadReplica
+		history := rhiza.ReplicaHistoryVerificationConfig{BootstrapMembers: append([]rhiza.Member(nil), members...)}
+		if role == "learner" && config.EnableReconfiguration {
+			replica, err = rhiza.OpenLearnerWithHistory(ctx, replicaConfig, history)
+		} else if role == "learner" {
 			replica, err = rhiza.OpenLearner(ctx, replicaConfig)
+		} else if config.EnableReconfiguration {
+			replica, err = rhiza.OpenReadReplicaWithHistory(ctx, replicaConfig, history)
 		} else {
 			replica, err = rhiza.OpenReadReplica(ctx, replicaConfig)
 		}
@@ -133,13 +141,21 @@ func runCommand(ctx context.Context, enroll bool) (resultErr error) {
 	return nil
 }
 
-func objectReplicaMembers(members []rhiza.Member) ([]rhiza.ReplicaMember, error) {
+func objectReplicaMembers(clusterID string, members []rhiza.Member, preservePublicIdentity bool) ([]rhiza.ReplicaMember, error) {
 	result := make([]rhiza.ReplicaMember, 0, len(members))
 	for _, member := range members {
-		if member.ID == "" {
-			return nil, errors.New("voter ID is required")
+		if !preservePublicIdentity {
+			if member.ID == "" {
+				return nil, errors.New("voter ID is required")
+			}
+			result = append(result, rhiza.ReplicaMember{ID: member.ID})
+			continue
 		}
-		result = append(result, rhiza.ReplicaMember{ID: member.ID})
+		identity, err := rhiza.NewReplicaMember(clusterID, member)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, identity)
 	}
 	return result, nil
 }

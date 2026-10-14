@@ -25,9 +25,10 @@ const (
 )
 
 type localOverwriteRequest struct {
-	DataDir   string
-	Cycle     int
-	ReadyFile string
+	DataDir      string
+	Cycle        int
+	ReadyFile    string
+	ProgressFile string
 }
 
 type localOverwriteReceipt struct {
@@ -61,14 +62,15 @@ func TestLocalReclamationPreservesFixedCardinalityOverwritesAcrossHardKills(t *t
 
 	for cycle := 0; cycle < localOverwriteCycles; cycle++ {
 		readyFile := filepath.Join(t.TempDir(), "acknowledged-overwrites.json")
-		request, err := json.Marshal(localOverwriteRequest{DataDir: dataDir, Cycle: cycle, ReadyFile: readyFile})
+		progressFile := filepath.Join(filepath.Dir(readyFile), "child-progress")
+		request, err := json.Marshal(localOverwriteRequest{DataDir: dataDir, Cycle: cycle, ReadyFile: readyFile, ProgressFile: progressFile})
 		if err != nil {
 			t.Fatal(err)
 		}
 		cmd := exec.Command(os.Args[0], "-test.run=^TestLocalReclamationOverwriteHelper$")
 		cmd.Env = append(os.Environ(), "RHIZA_LOCAL_RECLAMATION_OVERWRITE="+string(request))
 		startLocalNodeCrashChild(t, cmd, readyFile)
-		waitForLocalNodeCrashBoundary(t, cmd, readyFile)
+		waitForLocalNodeCrashBoundary(t, cmd, readyFile, progressFile)
 
 		markerBytes, err := os.ReadFile(readyFile)
 		if err != nil {
@@ -176,6 +178,7 @@ func TestLocalReclamationPreservesFixedCardinalityOverwritesAcrossHardKills(t *t
 }
 
 func TestLocalReclamationOverwriteHelper(t *testing.T) {
+	started := time.Now()
 	data := os.Getenv("RHIZA_LOCAL_RECLAMATION_OVERWRITE")
 	if data == "" {
 		return
@@ -184,23 +187,42 @@ func TestLocalReclamationOverwriteHelper(t *testing.T) {
 	if err := json.Unmarshal([]byte(data), &request); err != nil {
 		t.Fatal(err)
 	}
+	operations := 0
+	progress := func(phase string) {
+		writeLocalOverwriteProgress(t, request, phase, time.Since(started), operations)
+	}
+	progress("started")
+	localNodeCheckpointCrashBoundary = func(name string) {
+		progress("reclamation-" + name)
+	}
 	config := types.ExecutionConfig{Local: true, NodeID: "local", DataDir: request.DataDir, MaxWALBytes: localOverwriteWALLimit}
 	n := New(&config)
+	progress("opening")
 	if err := n.Open(context.Background()); err != nil {
 		t.Fatalf("open overwrite phase %d: %v", request.Cycle, err)
 	}
+	progress("opened")
 	if request.Cycle == 0 {
+		progress("schema-starting")
 		if _, err := n.server.Execute(context.Background(), network.ExecuteRequest{RequestID: "overwrite-schema", SQL: "CREATE TABLE overwrite_rows (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"}); err != nil {
 			t.Fatalf("create overwrite table: %v", err)
 		}
+		operations++
+		progress("schema-completed")
 		for item := 0; item < localOverwriteItems; item++ {
 			payload := strings.Repeat("s", localOverwritePayload)
+			progress(fmt.Sprintf("seed-%d-sql-starting", item))
 			if _, err := n.server.Execute(context.Background(), network.ExecuteRequest{RequestID: fmt.Sprintf("overwrite-seed-sql-%d", item), SQL: "INSERT INTO overwrite_rows(id, payload) VALUES(?, ?)", Args: []any{item, payload}}); err != nil {
 				t.Fatalf("seed SQL row %d: %v", item, err)
 			}
+			operations++
+			progress(fmt.Sprintf("seed-%d-sql-completed", item))
+			progress(fmt.Sprintf("seed-%d-graph-starting", item))
 			if _, err := n.server.GraphExecute(context.Background(), types.GraphCommand{RequestID: fmt.Sprintf("overwrite-seed-graph-%d", item), Cypher: "CREATE (:LocalReclaimOverwrite {id: $id, payload: $payload})", Args: map[string]any{"id": int64(item), "payload": payload}, Events: []types.GraphStreamEvent{{Stream: "local-reclaim-overwrite", Kind: "created", Payload: fmt.Sprintf("seed-%d", item)}}}); err != nil {
 				t.Fatalf("seed graph node %d: %v", item, err)
 			}
+			operations++
+			progress(fmt.Sprintf("seed-%d-graph-completed", item))
 		}
 	}
 	floorStart := n.core.CompactionFloor()
@@ -209,38 +231,71 @@ func TestLocalReclamationOverwriteHelper(t *testing.T) {
 		item := pair % localOverwriteItems
 		payload := localOverwriteValue(request.Cycle, pair, item)
 		sqlWrite := localOverwriteReceipt{Kind: "sql", RequestID: fmt.Sprintf("overwrite-sql-%d-%d-%d", request.Cycle, pair, item), Item: item, Payload: payload}
+		progress(fmt.Sprintf("overwrite-%d-sql-starting", pair))
 		sqlReceipt, err := n.server.Execute(context.Background(), localOverwriteSQLRequest(sqlWrite))
 		if err != nil || sqlReceipt.Status != types.MutationCommitted || sqlReceipt.Slot == 0 {
 			t.Fatalf("cycle %d SQL overwrite pair %d receipt=%+v err=%v", request.Cycle, pair, sqlReceipt.MutationReceipt, err)
 		}
+		operations++
+		progress(fmt.Sprintf("overwrite-%d-sql-completed", pair))
 		sqlWrite.Slot = sqlReceipt.Slot
 		marker.Writes = append(marker.Writes, sqlWrite)
 
 		graphWrite := localOverwriteReceipt{Kind: "graph", RequestID: fmt.Sprintf("overwrite-graph-%d-%d-%d", request.Cycle, pair, item), Item: item, Payload: payload}
+		progress(fmt.Sprintf("overwrite-%d-graph-starting", pair))
 		graphReceipt, err := n.server.GraphExecute(context.Background(), localOverwriteGraphRequest(graphWrite))
 		if err != nil || graphReceipt.Status != types.MutationCommitted || graphReceipt.Slot == 0 {
 			t.Fatalf("cycle %d graph overwrite pair %d receipt=%+v err=%v", request.Cycle, pair, graphReceipt.MutationReceipt, err)
 		}
+		operations++
+		progress(fmt.Sprintf("overwrite-%d-graph-completed", pair))
 		graphWrite.Slot = graphReceipt.Slot
 		marker.Writes = append(marker.Writes, graphWrite)
 		marker.Pairs++
 	}
+	progress("checking-floor")
 	marker.FloorEnd = n.core.CompactionFloor()
 	if marker.FloorEnd <= floorStart {
 		t.Fatalf("cycle %d acknowledged %d overwrite pairs without floor progress: %d=>%d WAL=%d/%d", request.Cycle, marker.Pairs, floorStart, marker.FloorEnd, n.wal.Bytes(), n.wal.Capacity().Limit)
 	}
+	progress("marker-marshalling")
 	markerBytes, err := json.Marshal(marker)
 	if err != nil {
 		t.Fatal(err)
 	}
 	markerTemp := request.ReadyFile + ".tmp"
+	progress("marker-writing")
 	if err := os.WriteFile(markerTemp, markerBytes, 0o600); err != nil {
 		t.Fatalf("write acknowledged overwrite marker: %v", err)
 	}
+	progress("marker-publishing")
 	if err := os.Rename(markerTemp, request.ReadyFile); err != nil {
 		t.Fatalf("publish acknowledged overwrite marker: %v", err)
 	}
 	select {}
+}
+
+func writeLocalOverwriteProgress(t *testing.T, request localOverwriteRequest, phase string, elapsed time.Duration, operations int) {
+	t.Helper()
+	writeLocalCrashProgress(t, request.ProgressFile, fmt.Sprintf("cycle=%d phase=%s elapsed=%s operations=%d", request.Cycle, phase, elapsed, operations))
+}
+
+func TestLocalOverwriteProgressIncludedInCrashDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	request := localOverwriteRequest{Cycle: 0, ReadyFile: filepath.Join(dir, "never-ready"), ProgressFile: filepath.Join(dir, "child-progress")}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var childRequest localOverwriteRequest
+	if err := json.Unmarshal(payload, &childRequest); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalOverwriteProgress(t, childRequest, "overwrite-0-sql-starting", time.Second, 9)
+	diagnostics := localCrashChildDiagnostics(childRequest.ReadyFile, childRequest.ProgressFile)
+	if !strings.Contains(diagnostics, `progress="cycle=0 phase=overwrite-0-sql-starting elapsed=1s operations=9"`) {
+		t.Fatalf("crash diagnostics=%s, want child phase, elapsed time and completed operations", diagnostics)
+	}
 }
 
 func localOverwriteValue(cycle, pair, item int) string {

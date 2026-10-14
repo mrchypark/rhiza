@@ -1926,46 +1926,48 @@ func (n *Node) Shutdown() error {
 	n.opened.Store(false)
 	n.ready.Store(false)
 	var shutdownErr error
+	// End admission and join foreground work before choosing the durable tip.
+	// Keep the server reachable until the peer handlers that reference it join.
+	if n.server != nil {
+		n.server.Close()
+	}
 	if n.checkpointer != nil {
 		n.checkpointer.Stop()
 	}
-	if n.archive != nil && n.material != nil && n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()); err != nil {
-			shutdownErr = errors.Join(shutdownErr, err)
-		} else if n.checkpointer != nil {
-			shutdownErr = errors.Join(shutdownErr, n.checkpointer.CheckpointOnShutdown(shutdownCtx, n.material.StateTip()))
-		}
-		cancel()
-	}
 	n.checkpointer = nil
-	if n.server != nil {
-		n.server.Close()
-		n.server = nil
-	}
 	if n.cancel != nil {
 		n.cancel()
 		n.cancel = nil
 	}
 	n.wg.Wait()
-	if n.archive != nil {
-		n.archive.Close()
-		n.archive = nil
-	}
 	if n.peer != nil {
-		n.peer.Close()
+		shutdownErr = errors.Join(shutdownErr, n.peer.Close())
 		n.peer = nil
 	}
 	if n.transport != nil {
-		n.transport.Close()
+		shutdownErr = errors.Join(shutdownErr, n.transport.Close())
 		n.transport = nil
 	}
 	if n.catchUp != nil {
-		n.catchUp.Close()
+		shutdownErr = errors.Join(shutdownErr, n.catchUp.Close())
 		n.catchUp = nil
 	}
+	n.server = nil
+	n.ready.Store(false)
 	if n.core != nil {
 		n.core.StopPeriodicSync()
+	}
+	// Existing certified decisions can be archived without a live quorum.
+	// Creating a new checkpoint here would instead require new consensus and
+	// make simultaneous or last-voter shutdown depend on peers staying alive.
+	if n.archive != nil {
+		if n.core != nil && (!n.config.EnableReconfiguration || n.core.IsVoter()) {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			shutdownErr = errors.Join(shutdownErr, n.archive.SyncThrough(shutdownCtx, n.core, n.core.Tip()))
+			cancel()
+		}
+		n.archive.Close()
+		n.archive = nil
 	}
 	// Close WAL
 	if n.wal != nil {

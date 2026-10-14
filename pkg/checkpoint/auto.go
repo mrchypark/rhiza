@@ -23,6 +23,8 @@ type AutoCheckpointer struct {
 	duration   time.Duration
 	stopCh     chan struct{}
 	stopOnce   sync.Once
+	loopMu     sync.Mutex
+	loopCancel context.CancelFunc
 	wg         sync.WaitGroup
 	eligible   func() bool
 	publish    func(context.Context, *Checkpoint) error
@@ -62,9 +64,22 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 	if a.duration <= 0 || a.interval <= 0 {
 		return
 	}
+	a.loopMu.Lock()
+	defer a.loopMu.Unlock()
+	select {
+	case <-a.stopCh:
+		return
+	default:
+	}
+	if a.loopCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	a.loopCancel = cancel
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer cancel()
 		period := a.duration
 		if period > time.Minute {
 			period = time.Minute
@@ -85,6 +100,9 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 			case <-a.stopCh:
 				return
 			case <-ticker.C:
+				if ctx.Err() != nil {
+					return
+				}
 				timeDue := time.Since(lastCheckpointAt) >= a.duration
 				tailDue := a.tailBytes != nil && a.tailBudget > 0 && a.tailBytes() >= a.tailBudget
 				if !timeDue && !tailDue {
@@ -123,9 +141,16 @@ func (a *AutoCheckpointer) Start(ctx context.Context, tipFunc func() uint64, bef
 	}()
 }
 
-// Stop stops the automatic checkpoint loop.
+// Stop cancels and joins automatic checkpoint work, including active callbacks.
 func (a *AutoCheckpointer) Stop() {
-	a.stopOnce.Do(func() { close(a.stopCh) })
+	a.stopOnce.Do(func() {
+		a.loopMu.Lock()
+		defer a.loopMu.Unlock()
+		close(a.stopCh)
+		if a.loopCancel != nil {
+			a.loopCancel()
+		}
+	})
 	a.wg.Wait()
 }
 

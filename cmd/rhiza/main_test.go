@@ -16,7 +16,7 @@ import (
 
 func TestReplicaMembersRequirePinnedIdentityOnlyForLearner(t *testing.T) {
 	members := []rhiza.Member{{ID: "n1"}, {ID: "n2"}}
-	objectMembers, err := objectReplicaMembers(members)
+	objectMembers, err := objectReplicaMembers("cluster", members, false)
 	if err != nil || len(objectMembers) != 2 || objectMembers[1].ID != "n2" {
 		t.Fatalf("object-store members=%+v err=%v", objectMembers, err)
 	}
@@ -37,6 +37,10 @@ func TestReplicaMembersRequirePinnedIdentityOnlyForLearner(t *testing.T) {
 	}
 	if _, err := learnerReplicaMembers(`[{"node_id":"n1","peer_url":"quic://n1:9090","public_key":"` + key + `"}] trailing`); err == nil {
 		t.Fatal("learner accepted trailing replica member input")
+	}
+	historyMembers, err := objectReplicaMembers("cluster", []rhiza.Member{{ID: "n1", URL: "http://n1", PeerURL: "quic://n1:9090", PublicKey: rhiza.PublicKey{1}}}, true)
+	if err != nil || len(historyMembers) != 1 || historyMembers[0].PeerURL != "quic://n1:9090" || historyMembers[0].PublicKey != ([32]byte{1}) {
+		t.Fatalf("history-aware members=%+v err=%v", historyMembers, err)
 	}
 }
 

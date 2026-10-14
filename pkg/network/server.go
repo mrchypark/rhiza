@@ -147,13 +147,22 @@ func newReadAdmission(limits ReadAdmissionLimits) (*readAdmission, error) {
 
 // ReplicaStatus is the observable catch-up state of a non-voting replica.
 type ReplicaStatus struct {
-	Mode        string    `json:"mode"`
-	AppliedSlot uint64    `json:"applied_slot"`
-	SourceTip   uint64    `json:"source_tip"`
-	LagSlots    uint64    `json:"lag_slots"`
-	Source      string    `json:"source"`
-	LastSync    time.Time `json:"last_sync"`
-	LastError   string    `json:"last_error,omitempty"`
+	Mode                   string    `json:"mode"`
+	AppliedSlot            uint64    `json:"applied_slot"`
+	SourceTip              uint64    `json:"source_tip"`
+	LagSlots               uint64    `json:"lag_slots"`
+	Source                 string    `json:"source"`
+	LastSync               time.Time `json:"last_sync"`
+	LastError              string    `json:"last_error,omitempty"`
+	CheckpointBaseSlot     uint64    `json:"checkpoint_base_slot,omitempty"`
+	CheckpointRootHash     string    `json:"checkpoint_root_hash,omitempty"`
+	CheckpointStateHash    string    `json:"checkpoint_state_hash,omitempty"`
+	CheckpointPrefixHash   string    `json:"checkpoint_prefix_hash,omitempty"`
+	ArchiveHeadVersionType string    `json:"archive_head_version_type,omitempty"`
+	ArchiveHeadVersion     string    `json:"archive_head_version,omitempty"`
+	RecoveryPinID          string    `json:"recovery_pin_id,omitempty"`
+	RecoveryPinsCreated    uint64    `json:"recovery_pins_created,omitempty"`
+	RecoveryPinsReleased   uint64    `json:"recovery_pins_released,omitempty"`
 }
 
 // SetCheckpointPrepare replaces the handler for future peer calls. Calls already
