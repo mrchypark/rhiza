@@ -1,27 +1,27 @@
 {
-  "version": "v0.15.2",
-  "commit": "18e3e71be1b40465f82e1f26f17b7d1bfcc6995d",
+  "version": "v0.15.3",
+  "commit": "493f980562766f0ce5645e015557bc39501f9a5b",
   "patch_sha256": "e056c066efc27a96a7c7372ede87bbd794fdc65c0f41fa4daf958b3f68c2b07e",
-  "measured_at": "2026-10-09T23:13:33Z",
-  "source_run": "https://github.com/mrchypark/rhiza/actions/runs/38002472835",
-  "source_head_sha": "7a9ef8ab26080eaa4d540a00cedd0c79d657ebd0",
+  "measured_at": "2026-10-14T03:34:40Z",
+  "source_run": "https://github.com/mrchypark/rhiza/actions/runs/38506102319",
+  "source_head_sha": "55a65cd7c878e64151cee606628f0e30e635a211",
   "runner_image": "ubuntu24-20261004.327.1",
   "rust_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
   "requests": 100000,
   "concurrency": 16,
   "evidence_sha256": {
     "environment.txt": "7d9f312b856cb1e9e66c943222d188d901f28317b736ff5d73773d7a0a0c5de8",
-    "immediate_follower_stopped.txt.gz": "d409e7ab11e2a855034ac16522fb198570f20ab2ebc0a1dcae40fbaf3bd87e50",
-    "immediate_leader_stopped.txt.gz": "8b2d064d81f8c3c2fef54e6ddaca6dbd65ee6bb46d31de75752b9d9d5f5d9327",
-    "immediate_local.txt.gz": "c64d5a6f3d3f3151a603bd6073997d13fb1b475a3f2eeb8d0ac9c5df0462384b",
-    "immediate_remote.txt.gz": "c3c3d00cc52efc931f59463c71c4ecbfbb6b5e5e31ae5e2221f6cd66d6a7ecff",
-    "interval_200_local.txt.gz": "cdef858a61976cdd3d7a55a67c97bc8244731b89a4d0dc6a8619a5a119f68f84"
+    "immediate_follower_stopped.txt.gz": "bf956d64b77e36b95d713bfd738e1f22fc3120d6697dc2b834d8d473dbac80d5",
+    "immediate_leader_stopped.txt.gz": "fba42b5ad689988e5ca9993f561e8348a6d059dbd37d975f977afda6d2cf9c6b",
+    "immediate_local.txt.gz": "ef857b49ca7ad79423f1e4f2137d8394cec7cfed1c9a321d2c89bafc0c0ea6cb",
+    "immediate_remote.txt.gz": "0987957911a5c279404b9485c041adeed748a0afed8803b13143455053431f18",
+    "interval_200_local.txt.gz": "900131f53fae9059b0459ec02ff9d583cfb9973f50980660f6a4764a76214dcc"
   },
   "ops_per_sec": {
-    "interval_200_local": 7845,
-    "immediate_local": 2359,
-    "immediate_remote": 2317,
-    "immediate_follower_stopped": 2490,
-    "immediate_leader_stopped": 2506
+    "interval_200_local": 12042,
+    "immediate_local": 2385,
+    "immediate_remote": 2332,
+    "immediate_follower_stopped": 2668,
+    "immediate_leader_stopped": 2670
   }
 }
