@@ -51,8 +51,11 @@ func main() {
 			log.Fatal("invalid archive head arguments")
 		}
 		head, err := qualificationArchiveHead(os.Stdin)
-		if err != nil || json.NewEncoder(os.Stdout).Encode(head) != nil {
-			log.Fatal("invalid archive head evidence")
+		if err != nil {
+			log.Fatalf("invalid archive head evidence: %v", err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(head); err != nil {
+			log.Fatalf("archive head output failed: %v", err)
 		}
 		return
 	}
@@ -139,7 +142,8 @@ func qualificationArchiveHead(input io.Reader) (qualificationArchiveHeadEvidence
 	}
 	flags := binary.BigEndian.Uint32(data[12:16])
 	config, generation := binary.BigEndian.Uint64(data[16:24]), binary.BigEndian.Uint64(data[24:32])
-	if flags&^uint32(1|2|4) != 0 || flags&2 == 0 || config == 0 || config != uint64(uint(config)) || generation == 0 {
+	// The sealed bit fences publication; it is not checkpoint certification.
+	if flags&^uint32(1|2|4) != 0 || config == 0 || config != uint64(uint(config)) || generation == 0 {
 		return qualificationArchiveHeadEvidence{}, errors.New("invalid sealed archive head identity")
 	}
 	stored := binary.BigEndian.Uint32(data[len(data)-crcSize:])
@@ -182,7 +186,7 @@ func qualificationArchiveHead(input io.Reader) (qualificationArchiveHeadEvidence
 		}
 		decisionSlot := binary.BigEndian.Uint64(payload[:8])
 		decoded, checkpoint, err := quepaxa.DecodeCheckpointSeal(payload[16 : 16+valueLen])
-		if err != nil || !checkpoint || decisionSlot != base || uint64(decoded.ConfigID) != config ||
+		if err != nil || !checkpoint || decisionSlot <= base || decisionSlot > tip || uint64(decoded.ConfigID) != config ||
 			uint64(decoded.Index) != base || decoded.PrefixHash != prefix {
 			return qualificationArchiveHeadEvidence{}, errors.New("sealed archive base does not match head")
 		}

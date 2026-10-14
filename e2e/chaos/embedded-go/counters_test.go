@@ -2691,7 +2691,7 @@ func TestQualificationArchiveHeadEvidence(t *testing.T) {
 	}
 	certificate := []byte(`{"proof":"fixture"}`)
 	payload := make([]byte, 16+len(value)+len(certificate))
-	binary.BigEndian.PutUint64(payload[:8], 7)
+	binary.BigEndian.PutUint64(payload[:8], 8)
 	binary.BigEndian.PutUint32(payload[8:12], uint32(len(value)))
 	binary.BigEndian.PutUint32(payload[12:16], uint32(len(certificate)))
 	copy(payload[16:], value)
@@ -2699,7 +2699,7 @@ func TestQualificationArchiveHeadEvidence(t *testing.T) {
 	data := make([]byte, headerSize+len(payload)+4)
 	copy(data[:8], "RHZAHD2!")
 	binary.BigEndian.PutUint32(data[8:12], uint32(len(data)))
-	binary.BigEndian.PutUint32(data[12:16], 1|2) // regular sealed checkpoint head
+	binary.BigEndian.PutUint32(data[12:16], 1) // regular checkpoint, publication not permanently fenced
 	binary.BigEndian.PutUint64(data[16:24], 1)
 	binary.BigEndian.PutUint64(data[24:32], 2)
 	binary.BigEndian.PutUint64(data[32:40], 7)
@@ -2720,6 +2720,15 @@ func TestQualificationArchiveHeadEvidence(t *testing.T) {
 		head.Tip != 14 || head.TailObject != 1 || head.TailHash != [32]byte(bytes.Repeat([]byte{0x22}, sha256.Size)) {
 		t.Fatalf("unexpected archive head evidence: %+v", head)
 	}
+	t.Run("sealed-regular", func(t *testing.T) {
+		sealed := append([]byte(nil), data...)
+		binary.BigEndian.PutUint32(sealed[12:16], 1|2)
+		binary.BigEndian.PutUint32(sealed[len(sealed)-4:], crc32.Checksum(sealed[:len(sealed)-4], crc32.MakeTable(crc32.Castagnoli)))
+		got, err := qualificationArchiveHead(bytes.NewReader(sealed))
+		if err != nil || got != head {
+			t.Fatalf("sealed regular checkpoint: got=%+v err=%v", got, err)
+		}
+	})
 	t.Run("image-command-contract", func(t *testing.T) {
 		dockerfile, err := os.ReadFile("../Dockerfile")
 		if err != nil {
@@ -2775,7 +2784,7 @@ decode_archive_head() {
 			output, err := command.CombinedOutput()
 			if !valid {
 				var exit *exec.ExitError
-				if !errors.As(err, &exit) || exit.ExitCode() != 1 || !bytes.Contains(output, []byte("invalid archive head evidence")) {
+				if !errors.As(err, &exit) || exit.ExitCode() != 1 || !bytes.Contains(output, []byte("invalid archive head evidence: invalid archive head header")) {
 					t.Fatalf("decoder failure not propagated: %v output=%s", err, output)
 				}
 				continue
@@ -2793,7 +2802,7 @@ decode_archive_head() {
 		{"malformed", []byte("not-a-head")},
 		{"truncated", data[:len(data)-1]},
 		{"checksum", append(append([]byte(nil), data[:128]...), append([]byte{0x5b}, data[129:]...)...)},
-		{"unsealed", func() []byte {
+		{"missing-regular-base", func() []byte {
 			bad := append([]byte(nil), data...)
 			binary.BigEndian.PutUint32(bad[12:16], 4)
 			binary.BigEndian.PutUint32(bad[len(bad)-4:], crc32.Checksum(bad[:len(bad)-4], crc32.MakeTable(crc32.Castagnoli)))
@@ -2812,13 +2821,19 @@ decode_archive_head() {
 		}()},
 		{"decision-slot-mismatch", func() []byte {
 			bad := append([]byte(nil), data...)
-			binary.BigEndian.PutUint64(bad[128:136], 8)
+			binary.BigEndian.PutUint64(bad[128:136], 7)
 			binary.BigEndian.PutUint32(bad[len(bad)-4:], crc32.Checksum(bad[:len(bad)-4], crc32.MakeTable(crc32.Castagnoli)))
 			return bad
 		}()},
 		{"config-mismatch", func() []byte {
 			bad := append([]byte(nil), data...)
 			binary.BigEndian.PutUint64(bad[16:24], 2)
+			binary.BigEndian.PutUint32(bad[len(bad)-4:], crc32.Checksum(bad[:len(bad)-4], crc32.MakeTable(crc32.Castagnoli)))
+			return bad
+		}()},
+		{"decision-beyond-tip", func() []byte {
+			bad := append([]byte(nil), data...)
+			binary.BigEndian.PutUint64(bad[128:136], 15)
 			binary.BigEndian.PutUint32(bad[len(bad)-4:], crc32.Checksum(bad[:len(bad)-4], crc32.MakeTable(crc32.Castagnoli)))
 			return bad
 		}()},
