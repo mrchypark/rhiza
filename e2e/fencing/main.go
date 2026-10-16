@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -551,6 +552,76 @@ func digest(value string) string {
 	return value
 }
 
+func immutableDigest(value string) (string, error) {
+	d := digest(value)
+	if !strings.HasPrefix(d, "sha256:") || len(d) != len("sha256:")+64 {
+		return "", fmt.Errorf("image reference has no immutable SHA256 digest: %q", value)
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(d, "sha256:")); err != nil {
+		return "", err
+	}
+	return d, nil
+}
+
+// Kind can discard the archive's import repository name while retaining its
+// immutable content. Follow only hash-verified descriptors, never a mutable tag.
+func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
+	d, err := immutableDigest(reference)
+	if err != nil {
+		return nil, nil, err
+	}
+	var chain []obj
+	for range 4 {
+		data, lookupErr := command(ctx, "docker", "exec", kindNode, "crictl", "inspecti", "-o", "json", d)
+		if lookupErr == nil {
+			var cri obj
+			if err := json.Unmarshal(data, &cri); err != nil {
+				return nil, chain, err
+			}
+			if _, err := immutableDigest(text(nested(cri, "status", "id"))); err != nil {
+				return nil, chain, err
+			}
+			chain = append(chain, obj{"digest": d, "cri": cri})
+			return cri, chain, nil
+		}
+		content, err := command(ctx, "docker", "exec", kindNode, "ctr", "-n", "k8s.io", "content", "get", d)
+		if err != nil {
+			return nil, chain, fmt.Errorf("resolve immutable image %s: CRI: %v; content: %w", d, lookupErr, err)
+		}
+		next, err := imageDescriptor(d, content)
+		chain = append(chain, obj{"digest": d, "criLookupError": lookupErr.Error(), "content": string(content)})
+		if err != nil {
+			return nil, chain, err
+		}
+		d = next
+	}
+	return nil, chain, fmt.Errorf("image descriptor chain exceeds qualification bound")
+}
+
+func imageDescriptor(d string, content []byte) (string, error) {
+	if "sha256:"+fmt.Sprintf("%x", sha256.Sum256(content)) != d {
+		return "", fmt.Errorf("image content digest differs from %s", d)
+	}
+	var descriptor struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+		Manifests []struct {
+			Digest string `json:"digest"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(content, &descriptor); err != nil {
+		return "", err
+	}
+	if descriptor.Config.Digest != "" && len(descriptor.Manifests) == 0 {
+		return immutableDigest(descriptor.Config.Digest)
+	}
+	if descriptor.Config.Digest == "" && len(descriptor.Manifests) == 1 {
+		return immutableDigest(descriptor.Manifests[0].Digest)
+	}
+	return "", fmt.Errorf("ambiguous or unsupported immutable image descriptor %s", d)
+}
+
 func incarnationSnapshot(pod obj) string {
 	statuses, _ := nested(pod, "status", "containerStatuses").([]any)
 	var processes []obj
@@ -598,31 +669,31 @@ func verifyImages(ctx context.Context, out, phase string) error {
 		if err = json.Unmarshal(local, &built); err != nil || len(built) != 1 {
 			return fmt.Errorf("invalid built image inspection")
 		}
-		lookup := strings.TrimPrefix(strings.TrimPrefix(podImage, "docker-pullable://"), "containerd://")
-		criData, err := command(ctx, "docker", "exec", kindNode, "crictl", "inspecti", "-o", "json", lookup)
+		containerID := strings.TrimPrefix(text(nested(statuses[0], "containerID")), "containerd://")
+		runtimeData, err := command(ctx, "docker", "exec", kindNode, "crictl", "inspect", "-o", "json", containerID)
 		if err != nil {
 			return err
 		}
-		var cri obj
-		if err = json.Unmarshal(criData, &cri); err != nil {
+		var runtime obj
+		if err := json.Unmarshal(runtimeData, &runtime); err != nil {
 			return err
 		}
+		if text(nested(runtime, "status", "id")) != containerID || nested(runtime, "status", "labels", "io.kubernetes.pod.uid") != nested(pod, "metadata", "uid") || digest(text(nested(runtime, "status", "imageRef"))) != digest(podImage) {
+			return fmt.Errorf("%s runtime image does not bind the observed Pod incarnation", role)
+		}
+		cri, chain, resolveErr := imageConfig(ctx, podImage)
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
 		repos, _ := nested(cri, "status", "repoDigests").([]any)
-		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
+		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": runtime, "resolution": chain, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
 		if err := os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600); err != nil {
 			return err
 		}
+		if resolveErr != nil {
+			return resolveErr
+		}
 		if configID == "" || digest(configID) != digest(builtID) {
 			return fmt.Errorf("%s running image configuration differs from built image", role)
-		}
-		matched := digest(podImage) == digest(configID)
-		for _, repo := range repos {
-			matched = matched || digest(podImage) == digest(text(repo))
-		}
-		if !matched {
-			return fmt.Errorf("%s Pod image digest does not resolve to inspected configuration", role)
 		}
 		counts[role]++
 	}

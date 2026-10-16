@@ -4,10 +4,45 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
+
+func TestImmutableImageResolutionDescriptors(t *testing.T) {
+	config := "sha256:" + strings.Repeat("a", 64)
+	for _, reference := range []string{config, "containerd://" + config, "docker.io/library/import-date@" + config} {
+		if got, err := immutableDigest(reference); err != nil || got != config {
+			t.Fatalf("immutable reference %q: %q, %v", reference, got, err)
+		}
+	}
+	for _, reference := range []string{"image:local", "sha256:abc", "sha256:" + strings.Repeat("z", 64)} {
+		if _, err := immutableDigest(reference); err == nil {
+			t.Fatalf("accepted mutable or invalid reference %q", reference)
+		}
+	}
+	for _, tc := range []struct {
+		body  string
+		valid bool
+	}{
+		{`{"config":{"digest":"` + config + `"}}`, true},
+		{`{"manifests":[{"digest":"` + config + `"}]}`, true},
+		{`{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, false},
+		{`{"config":{"digest":"image:local"}}`, false},
+		{`{}`, false},
+	} {
+		body := []byte(tc.body)
+		d := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
+		got, err := imageDescriptor(d, body)
+		if tc.valid && (err != nil || got != config) || !tc.valid && err == nil {
+			t.Fatalf("descriptor %s: %q, %v", tc.body, got, err)
+		}
+		if _, err := imageDescriptor(config, body); err == nil {
+			t.Fatal("accepted content that did not hash to the requested digest")
+		}
+	}
+}
 
 func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 	items := manifests()["items"].([]obj)

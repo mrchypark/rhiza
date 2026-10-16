@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"errors"
+	minio "github.com/minio/minio-go/v7"
 	"io"
 	"net/http"
 	"strings"
@@ -49,6 +50,26 @@ func TestTerminalDrainJoinsLateMutationsAndRejectsAdmission(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestConditionalS3ConflictRequiresTypedConditionalRejection(t *testing.T) {
+	rejection := minio.ErrorResponse{Code: "ConditionalRequestConflict", StatusCode: http.StatusConflict}
+	conditional := withExpectedCondition(context.Background(), thanosobjstore.WithIfNotExists())
+	for _, tc := range []struct {
+		ctx   context.Context
+		err   error
+		known bool
+	}{
+		{conditional, rejection, true},
+		{context.Background(), rejection, false},
+		{conditional, errors.New("ConditionalRequestConflict: HTTP 409"), false},
+		{conditional, minio.ErrorResponse{Code: "OtherConflict", StatusCode: http.StatusConflict}, false},
+		{conditional, minio.ErrorResponse{Code: "ConditionalRequestConflict", StatusCode: http.StatusBadRequest}, false},
+	} {
+		if got := conditionalS3Conflict(tc.ctx, tc.err); got != tc.known {
+			t.Fatalf("error=%v known=%t want=%t", tc.err, got, tc.known)
+		}
 	}
 }
 

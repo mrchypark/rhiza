@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	minio "github.com/minio/minio-go/v7"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
 
@@ -314,7 +316,7 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 	size, sizeErr := counted.ObjectSize()
 	ctx = withExpectedCondition(ctx, opts...)
 	err := b.Bucket.Upload(ctx, name, countingReaderWithCapabilities(counted, reader), opts...)
-	known = err == nil || b.Bucket.IsConditionNotMetErr(err)
+	known = err == nil || b.Bucket.IsConditionNotMetErr(err) || conditionalS3Conflict(ctx, err)
 	if err == nil {
 		if sizeErr == nil {
 			b.metrics.bytesPublished.Add(uint64(size))
@@ -331,6 +333,14 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 	}
 	b.record(err)
 	return err
+}
+
+func conditionalS3Conflict(ctx context.Context, err error) bool {
+	if !expectsCondition(ctx) {
+		return false
+	}
+	var response minio.ErrorResponse
+	return errors.As(err, &response) && response.StatusCode == http.StatusConflict && response.Code == "ConditionalRequestConflict"
 }
 
 func (b *MeteredBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
