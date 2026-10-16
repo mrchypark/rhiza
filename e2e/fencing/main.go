@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -309,7 +310,7 @@ func call(ctx context.Context, f *forward, path string, body any, token string) 
 	return value, err
 }
 
-func qualify(ctx context.Context) error {
+func qualify(ctx context.Context) (resultErr error) {
 	out := os.Getenv("FENCING_E2E_OUT")
 	if out == "" {
 		out = "generic-fencing-results"
@@ -327,6 +328,16 @@ func qualify(ctx context.Context) error {
 		data["time"] = time.Now().UTC()
 		_ = json.NewEncoder(events).Encode(data)
 	}
+	var observationFaults []*observationFault
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, fault := range observationFaults {
+			cleanupErr := fault.remove(cleanupCtx)
+			resultErr = errors.Join(resultErr, cleanupErr)
+			event("operator_observation_fault_cleanup", obj{"fault": fault, "error": fmt.Sprint(cleanupErr)})
+		}
+	}()
 	defer func() {
 		collectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -419,7 +430,7 @@ func qualify(ctx context.Context) error {
 		return err
 	}
 	onlineCtx, onlineCancel := context.WithTimeout(ctx, 6*time.Minute)
-	current, err := qualifyOnline(onlineCtx, f, stsUID, bindingUID, out, event)
+	current, err := qualifyOnline(onlineCtx, f, stsUID, bindingUID, out, event, &observationFaults)
 	onlineCancel()
 	if err != nil {
 		return fmt.Errorf("online voter qualification: %w", err)
@@ -431,6 +442,14 @@ func qualify(ctx context.Context) error {
 			return err
 		}
 		event("generation_peer_partition", partition)
+		fault, err := blockOperatorObservation(ctx, target)
+		if fault != nil {
+			observationFaults = append(observationFaults, fault)
+		}
+		if err != nil {
+			return err
+		}
+		event("generation_operator_observation_fault", obj{"fault": fault})
 	}
 	if err := wait(ctx, "generic generation fence proof", func() (bool, error) {
 		list, err := get(ctx, "rhizafences", "")
@@ -610,7 +629,112 @@ func partitionPeer(ctx context.Context, target operator.FenceTarget) (obj, error
 	return obj{"target": target, "containerID": cid, "imageID": nested(statuses[0], "imageID"), "pid": pid}, nil
 }
 
-func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, out string, event func(string, obj)) ([]operator.FenceTarget, error) {
+type observationFault struct {
+	OperatorPod string               `json:"operatorPod"`
+	OperatorUID string               `json:"operatorUID"`
+	OperatorIP  string               `json:"operatorIP"`
+	ContainerID string               `json:"containerID"`
+	PID         string               `json:"pid"`
+	Target      operator.FenceTarget `json:"target"`
+	TargetIP    string               `json:"targetIP"`
+	Rule        []string             `json:"rule"`
+	Removed     bool                 `json:"removed"`
+}
+
+func observationRule(source, destination, uid string) ([]string, error) {
+	src, dst := net.ParseIP(source), net.ParseIP(destination)
+	if src == nil || dst == nil || src.To4() == nil || dst.To4() == nil || !src.IsGlobalUnicast() || !dst.IsGlobalUnicast() || src.Equal(dst) || uid == "" || strings.ContainsAny(uid, " \t\n") {
+		return nil, fmt.Errorf("observation fault requires distinct exact IPv4 Pod addresses and target UID")
+	}
+	return []string{"OUTPUT", "-s", src.String(), "-d", dst.String(), "-p", "tcp", "--dport", "8080", "-m", "comment", "--comment", "rhiza-fencing-e2e-" + uid, "-j", "DROP"}, nil
+}
+
+func blockOperatorObservation(ctx context.Context, target operator.FenceTarget) (*observationFault, error) {
+	targetPod, err := get(ctx, "pod", target.Pod)
+	if err != nil {
+		return nil, err
+	}
+	if nested(targetPod, "metadata", "uid") != target.PodUID {
+		return nil, fmt.Errorf("observation target Pod incarnation changed")
+	}
+	list, err := get(ctx, "pods", "")
+	if err != nil {
+		return nil, err
+	}
+	items, _ := list["items"].([]any)
+	var operatorPod any
+	for _, pod := range items {
+		if nested(pod, "metadata", "labels", "app.kubernetes.io/name") == "rhiza-operator" && nested(pod, "metadata", "deletionTimestamp") == nil && nested(pod, "status", "phase") == "Running" {
+			if operatorPod != nil {
+				return nil, fmt.Errorf("observation fault requires one exact operator Pod")
+			}
+			operatorPod = pod
+		}
+	}
+	statuses, _ := nested(operatorPod, "status", "containerStatuses").([]any)
+	if len(statuses) != 1 {
+		return nil, fmt.Errorf("observation fault requires dedicated operator container")
+	}
+	fault := &observationFault{OperatorPod: text(nested(operatorPod, "metadata", "name")), OperatorUID: text(nested(operatorPod, "metadata", "uid")), OperatorIP: text(nested(operatorPod, "status", "podIP")), ContainerID: strings.TrimPrefix(text(nested(statuses[0], "containerID")), "containerd://"), Target: target, TargetIP: text(nested(targetPod, "status", "podIP"))}
+	fault.Rule, err = observationRule(fault.OperatorIP, fault.TargetIP, target.PodUID)
+	if err != nil {
+		return nil, err
+	}
+	fault.PID, err = fault.runtimePID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, err = command(ctx, "docker", fault.args("-I")...)
+	if err != nil {
+		return fault, err // A lost command result may still have installed the rule.
+	}
+	if _, err := command(ctx, "docker", fault.args("-C")...); err != nil {
+		return fault, fmt.Errorf("owned observation rule installation unconfirmed: %w", err)
+	}
+	return fault, nil
+}
+
+func (f *observationFault) args(operation string) []string {
+	return append([]string{"exec", kindNode, "nsenter", "-t", f.PID, "-n", "iptables", operation}, f.Rule...)
+}
+
+func (f *observationFault) runtimePID(ctx context.Context) (string, error) {
+	data, err := command(ctx, "docker", "exec", kindNode, "crictl", "inspect", "-o", "json", f.ContainerID)
+	if err != nil {
+		return "", err
+	}
+	var runtime obj
+	if err := json.Unmarshal(data, &runtime); err != nil {
+		return "", err
+	}
+	pid := fmt.Sprint(nested(runtime, "info", "pid"))
+	if pid == "<nil>" || pid == "0" || nested(runtime, "status", "id") != f.ContainerID || nested(runtime, "status", "labels", "io.kubernetes.pod.uid") != f.OperatorUID || nested(runtime, "status", "state") != "CONTAINER_RUNNING" {
+		return "", fmt.Errorf("operator observation-fault runtime identity changed")
+	}
+	return pid, nil
+}
+
+func (f *observationFault) remove(ctx context.Context) error {
+	if f.Removed {
+		return nil
+	}
+	pid, err := f.runtimePID(ctx)
+	if err != nil || pid != f.PID {
+		return fmt.Errorf("cannot safely remove owned observation rule: %v", err)
+	}
+	if _, err := command(ctx, "docker", f.args("-D")...); err != nil {
+		return err
+	}
+	data, err := exec.CommandContext(ctx, "docker", f.args("-C")...).CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		return fmt.Errorf("owned observation rule absence unconfirmed: %v: %s", err, data)
+	}
+	f.Removed = true
+	return nil
+}
+
+func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, out string, event func(string, obj), faults *[]*observationFault) ([]operator.FenceTarget, error) {
 	failedPod, err := get(ctx, "pod", "rhiza-2")
 	if err != nil {
 		return nil, err
@@ -630,6 +754,14 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 		return nil, err
 	}
 	event("online_peer_partition", partition)
+	fault, err := blockOperatorObservation(ctx, failed)
+	if fault != nil {
+		*faults = append(*faults, fault)
+	}
+	if err != nil {
+		return nil, err
+	}
+	event("online_operator_observation_fault", obj{"fault": fault})
 	if _, err := call(ctx, survivor, "/sql/execute", obj{"request_id": "fencing-surviving-quorum", "sql": "INSERT INTO fencing_items VALUES (2, 'quorum-survived')"}, admin); err != nil {
 		return nil, err
 	}
@@ -749,6 +881,10 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 		return nil, err
 	}
 	event("online_replacement_linearizable_readback", obj{"targets": targets, "rows": 3, "configID": configID})
+	if err := fault.remove(ctx); err != nil {
+		return nil, err
+	}
+	event("online_operator_observation_fault_removed", obj{"fault": fault})
 	return targets, os.WriteFile(filepath.Join(out, "online-completed-membership.json"), encoded(obj{"recovery": child, "targets": targets, "observations": observations}), 0600)
 }
 

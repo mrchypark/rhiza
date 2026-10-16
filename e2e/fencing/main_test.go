@@ -149,6 +149,30 @@ func TestScratchAcceptsAPIOmittedFalsePIDOptionsOnly(t *testing.T) {
 	}
 }
 
+func TestObservationFaultMatchesOnlyOperatorToSelectedVoterHTTP(t *testing.T) {
+	rule, err := observationRule("10.244.0.8", "10.244.0.9", "target-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"OUTPUT", "-s", "10.244.0.8", "-d", "10.244.0.9", "-p", "tcp", "--dport", "8080", "-m", "comment", "--comment", "rhiza-fencing-e2e-target-uid", "-j", "DROP"}
+	if string(encoded(rule)) != string(encoded(want)) {
+		t.Fatalf("observation fault escaped exact operator/target HTTP tuple: %v", rule)
+	}
+	for _, pair := range [][2]string{{"", "10.244.0.9"}, {"10.244.0.8", "0.0.0.0/0"}, {"10.244.0.8", "10.244.0.8"}, {"127.0.0.1", "10.244.0.9"}, {"::1", "10.244.0.9"}} {
+		if _, err := observationRule(pair[0], pair[1], "target-uid"); err == nil {
+			t.Fatalf("accepted unsafe observation tuple %v", pair)
+		}
+	}
+	if _, err := observationRule("10.244.0.8", "10.244.0.9", ""); err == nil {
+		t.Fatal("accepted rule without owned target UID marker")
+	}
+	fault := observationFault{PID: "42", Rule: rule}
+	insert, remove, check := fault.args("-I"), fault.args("-D"), fault.args("-C")
+	if string(encoded(insert[8:])) != string(encoded(remove[8:])) || string(encoded(remove[8:])) != string(encoded(check[8:])) {
+		t.Fatal("cleanup/check did not preserve the exact owned rule")
+	}
+}
+
 func TestGenerationProofRejectsUnrelatedAuthorityBeforeReadingLedger(t *testing.T) {
 	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "chaos-source", OperationID: "operation", Scope: operator.ScopeGeneration}
 	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(request))), ProofID: "cooperative-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
