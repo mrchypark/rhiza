@@ -51,6 +51,7 @@ func TestLedgerUnknownHistoryCannotBecomeClean(t *testing.T) {
 	}
 	next := id
 	next.RunID = "restart"
+	next.PodUID = "different-pod"
 	if err := l.Register(next); err == nil {
 		t.Fatal("restart erased unresolved run")
 	}
@@ -122,6 +123,52 @@ func TestLedgerVoterFenceThenGenerationPreservesReceipts(t *testing.T) {
 				t.Fatal("prior clean stop not reused")
 			}
 		})
+	}
+}
+
+func TestLedgerIntactWALRestartDoesNotEraseOldUncertainty(t *testing.T) {
+	l := Ledger{SourceClusterID: "source"}
+	first := testIdentity()
+	if err := l.Register(first); err != nil {
+		t.Fatal(err)
+	}
+	first.WALIdentity = "wal"
+	if err := l.Bind(first); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.RunID = "restart"
+	second.WALIdentity = ""
+	if err := l.Register(second); err != nil {
+		t.Fatalf("same Pod intact WAL restart registration: %v", err)
+	}
+	wrong := second
+	wrong.WALIdentity = "new-wal"
+	if err := l.Bind(wrong); err == nil {
+		t.Fatal("replacement WAL accepted")
+	}
+	second.WALIdentity = "wal"
+	if err := l.Bind(second); err != nil {
+		t.Fatalf("intact WAL bind: %v", err)
+	}
+	if len(l.Runs) != 2 || l.Runs[first.RunID].Exited || l.Runs[first.RunID].Drain != nil {
+		t.Fatal("old uncertainty was erased")
+	}
+	if err := l.Close("op", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	request := *l.Runs[second.RunID].Stop
+	if err := l.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordExit(request); err != nil {
+		t.Fatal(err)
+	}
+	if l.Complete("op", "hash", []string{first.PodUID}) {
+		t.Fatal("new run proved an old uncertain run")
+	}
+	if l.Runs[first.RunID].Drain != nil || l.Runs[first.RunID].Exited {
+		t.Fatal("receipt flowed backward")
 	}
 }
 

@@ -1185,7 +1185,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handlerMu.Lock()
 		if s.handlerClosing {
 			s.handlerMu.Unlock()
-			writeHTTPError(w, http.StatusServiceUnavailable, "node_closed", "node is closing")
+			writeAPIError(w, ErrNotReady)
 			return
 		}
 		s.handlerWG.Add(1)

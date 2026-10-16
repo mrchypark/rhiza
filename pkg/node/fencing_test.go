@@ -3,13 +3,14 @@ package node
 import (
 	"context"
 	"errors"
+	"testing"
+	"time"
+
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
-	"testing"
-	"time"
 )
 
 func TestTerminalDrainDoesNotInventReceiptForClosedIncarnation(t *testing.T) {

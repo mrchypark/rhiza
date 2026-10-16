@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
@@ -54,10 +55,13 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 	}
 	// Never forward a projected token to a redirect destination.
 	client := *a.Client
+	if client.Timeout <= 0 || client.Timeout > 30*time.Second {
+		client.Timeout = 30 * time.Second
+	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusAccepted {
@@ -75,7 +79,14 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 	if result == nil {
 		return nil
 	}
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, 65537))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	if len(data) > 65536 {
+		return fmt.Errorf("fencing: authority response too large")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(result); err != nil {
 		return err

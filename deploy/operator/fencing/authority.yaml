@@ -11,8 +11,11 @@ metadata:
   namespace: rhiza
 rules:
   - apiGroups: [""]
-    resources: [pods, secrets]
+    resources: [pods]
     verbs: [get, list]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, create, update]

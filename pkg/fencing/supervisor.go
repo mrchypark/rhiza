@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -62,7 +63,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.Authority.Register(ctx, s.Identity); err != nil {
 		return err
 	}
-	listener, err := net.Listen("unix", s.SocketPath)
+	listener, err := listenSupervisor(s.SocketPath)
 	if err != nil {
 		return err
 	}
@@ -140,6 +141,31 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// A retained emptyDir can contain a stale socket after a container restart.
+// This check never proves old processes safe: their ledger runs remain.
+func listenSupervisor(path string) (net.Listener, error) {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("fencing: socket path contains a non-socket")
+		}
+		connection, dialErr := net.DialTimeout("unix", path, time.Second)
+		if dialErr == nil {
+			connection.Close()
+			return nil, fmt.Errorf("fencing: existing supervisor listener is active")
+		}
+		if !errors.Is(dialErr, syscall.ECONNREFUSED) && !os.IsNotExist(dialErr) {
+			return nil, fmt.Errorf("fencing: prior socket state is uncertain: %w", dialErr)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return net.Listen("unix", path)
 }
 
 func (s *Supervisor) handler() http.Handler {

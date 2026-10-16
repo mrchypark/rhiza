@@ -51,8 +51,11 @@ closed recreation admission, and the complete registered inventory permit a
 This is a useful **reachable, cooperative** fencing path, not power fencing.
 A hard crash, unreachable supervisor, unresolved old registration, unknown
 storage mutation, missing historical registration, or unsupported Pod stays
-pending. A supervisor restart with an empty local tracker does not prove its
-previous run safe. Such incidents need independent stronger fencing evidence
+pending. A container restart within the same Pod UID may reserve a fresh run
+while admission is open, but must bind its exact historical WAL before writers
+start. A different Pod UID cannot bypass an unresolved prior voter. Restarting
+does not prove an old run safe: every old record remains, and a later fence stays
+pending without its evidence. Such fencing incidents need independent stronger evidence
 from an optional external adapter or a carefully verified manual recovery;
 never delete the ledger or restart the object store to manufacture a pass.
 

@@ -2,10 +2,15 @@ package fencing
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -13,6 +18,84 @@ type sessionAuthority struct {
 	mu   sync.Mutex
 	id   Identity
 	stop *StopRequest
+}
+
+func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *testing.T) {
+	var unavailable atomic.Bool
+	id := testIdentity()
+	socket := filepath.Join(t.TempDir(), "session.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if unavailable.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(id)
+	})}
+	defer server.Close()
+	defer listener.Close()
+	go func() { _ = server.Serve(listener) }()
+	session, err := Connect(t.Context(), socket, "ticket", id.SourceClusterID, id.NodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailable.Store(true)
+	if _, err := session.WaitStop(t.Context()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("503 lost transient classification: %v", err)
+	}
+	server.Close()
+	if _, err := session.WaitStop(t.Context()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("connection failure lost transient classification: %v", err)
+	}
+	if session.Identity() != id {
+		t.Fatal("transient outage changed identity")
+	}
+}
+
+type sessionRoundTrip func(*http.Request) (*http.Response, error)
+
+func (f sessionRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type interruptedSessionBody struct{}
+
+func (interruptedSessionBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (interruptedSessionBody) Close() error             { return nil }
+
+func TestSessionInterruptedSuccessfulBodyIsTransient(t *testing.T) {
+	s := &Session{ticket: "ticket", identity: testIdentity(), client: &http.Client{Transport: sessionRoundTrip(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: interruptedSessionBody{}}, nil
+	})}}
+	if _, err := s.WaitStop(t.Context()); !errors.Is(err, ErrUnavailable) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("body interruption lost cause: %v", err)
+	}
+}
+
+func TestSupervisorSocketRestartKeepsLiveListenerAndOtherFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.sock")
+	live, err := listenSupervisor(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other, err := listenSupervisor(path); err == nil {
+		other.Close()
+		t.Fatal("replaced a live supervisor")
+	}
+	if err := live.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("owned unrelated file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if other, err := listenSupervisor(path); err == nil {
+		other.Close()
+		t.Fatal("removed a non-socket file")
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "owned unrelated file" {
+		t.Fatal("non-socket file changed")
+	}
 }
 
 func (a *sessionAuthority) Register(context.Context, Identity) error { return nil }

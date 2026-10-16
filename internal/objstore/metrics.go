@@ -492,10 +492,10 @@ func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 		// when the SDK retries the logical operation successfully.
 		known := response.StatusCode < 500 && response.StatusCode != http.StatusRequestTimeout && response.StatusCode != http.StatusAccepted
 		if mutating {
-			if response.Body == nil || response.Body == http.NoBody || response.ContentLength == 0 || response.StatusCode >= 400 {
+			if response.Body == nil || response.Body == http.NoBody || response.StatusCode >= 400 {
 				m.mutations.end(known)
 			} else {
-				response.Body = &mutationResponse{ReadCloser: response.Body, drain: &m.mutations, known: known}
+				response.Body = &mutationResponse{ReadCloser: response.Body, drain: &m.mutations, known: known, expected: response.ContentLength}
 			}
 		}
 		statusFailure := false

@@ -84,7 +84,7 @@ func (n *Node) startFenceWatcher(ctx context.Context) {
 }
 
 func retryFenceSession(err error) bool {
-	if errors.Is(err, fencing.ErrPending) {
+	if errors.Is(err, fencing.ErrPending) || errors.Is(err, fencing.ErrUnavailable) {
 		return true
 	}
 	var transport net.Error

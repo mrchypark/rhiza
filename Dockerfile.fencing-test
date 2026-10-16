@@ -1,0 +1,6 @@
+# Disposable CI image; never pushed or used as a release image.
+FROM mirror.gcr.io/library/alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1
+RUN apk --no-cache add ca-certificates && adduser -D -u 65532 rhiza
+COPY rhiza rhiza-operator rhiza-fencer /usr/local/bin/
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/rhiza-operator"]

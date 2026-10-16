@@ -41,9 +41,9 @@ func (l *Ledger) Register(identity Identity) error {
 		}
 		return fmt.Errorf("fencing: run ID already registered")
 	}
-	// A supervisor restart does not erase uncertainty about the old child.
+	// Same-Pod container restart can continue its intact WAL, not erase history.
 	for _, old := range l.Runs {
-		if old.Identity.NodeID == identity.NodeID && (!old.Exited || old.Drain == nil || !old.Drain.Clean()) {
+		if old.Identity.NodeID == identity.NodeID && old.Identity.PodUID != identity.PodUID && (!old.Exited || old.Drain == nil || !old.Drain.Clean()) {
 			return fmt.Errorf("fencing: earlier incarnation has no clean termination proof")
 		}
 	}
@@ -63,6 +63,11 @@ func (l *Ledger) Bind(identity Identity) error {
 	}
 	if l.ClosedBy != "" || run.Stop != nil {
 		return ErrClosed
+	}
+	for _, old := range l.Runs {
+		if old.Identity.RunID != identity.RunID && old.Identity.NodeID == identity.NodeID && old.Identity.WALIdentity != "" && old.Identity.WALIdentity != identity.WALIdentity {
+			return fmt.Errorf("fencing: restarted voter must retain its historical WAL")
+		}
 	}
 	run.Identity = identity
 	l.Runs[identity.RunID] = run

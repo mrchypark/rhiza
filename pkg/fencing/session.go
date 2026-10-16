@@ -100,7 +100,7 @@ func (s *Session) call(ctx context.Context, path string, value, out any) error {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
@@ -120,7 +120,7 @@ func (s *Session) call(ctx context.Context, path string, value, out any) error {
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	if len(data) > 65536 {
 		return fmt.Errorf("fencing: supervisor response too large")

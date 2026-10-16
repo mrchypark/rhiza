@@ -2,6 +2,8 @@ package objstore
 
 import (
 	"context"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"io"
 	"net/http"
@@ -20,7 +22,7 @@ func TestTerminalDrainJoinsLateMutationsAndRejectsAdmission(t *testing.T) {
 			transport := metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
 				close(started)
 				<-release
-				return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 			}))
 			go func() {
 				req, _ := http.NewRequest(method, "http://store.test/object", nil)
@@ -50,6 +52,64 @@ func TestTerminalDrainJoinsLateMutationsAndRejectsAdmission(t *testing.T) {
 	}
 }
 
+func TestTerminalDrainRecognizesCompleteFramingBeforeDecoderClose(t *testing.T) {
+	for _, format := range []string{"json", "xml"} {
+		t.Run(format, func(t *testing.T) {
+			metrics := &bucketMetrics{}
+			bucket := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics)
+			body := `{"name":"object"}`
+			if format == "xml" {
+				body = `<Result><Name>object</Name></Result>`
+			}
+			transport := metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body))}, nil
+			}))
+			req, _ := http.NewRequest(http.MethodPut, "http://store.test/object", nil)
+			response, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if format == "json" {
+				var value map[string]any
+				err = json.NewDecoder(response.Body).Decode(&value)
+			} else {
+				var value struct{ Name string }
+				err = xml.NewDecoder(response.Body).Decode(&value)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = response.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = bucket.DrainMutations(context.Background()); err != nil {
+				t.Fatalf("fully framed %s was unknown: %v", format, err)
+			}
+		})
+	}
+}
+
+func TestTerminalDrainRejectsTruncatedAndUnknownFraming(t *testing.T) {
+	for _, length := range []int64{10, -1, 0} {
+		metrics := &bucketMetrics{}
+		bucket := newMeteredBucket(thanosobjstore.NewInMemBucket(), metrics)
+		transport := metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, ContentLength: length, Body: io.NopCloser(strings.NewReader("body"))}, nil
+		}))
+		req, _ := http.NewRequest(http.MethodPut, "http://store.test/object", nil)
+		response, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := make([]byte, 4)
+		_, _ = response.Body.Read(p)
+		_ = response.Body.Close()
+		if err = bucket.DrainMutations(context.Background()); !errors.Is(err, ErrMutationOutcomeUnknown) {
+			t.Fatalf("length=%d drain=%v", length, err)
+		}
+	}
+}
+
 func TestTerminalDrainRetainsUnknownAttemptAcrossSuccessfulRetry(t *testing.T) {
 	for _, method := range []string{http.MethodPut, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
@@ -61,7 +121,7 @@ func TestTerminalDrainRetainsUnknownAttemptAcrossSuccessfulRetry(t *testing.T) {
 				if attempt == 1 {
 					return nil, context.DeadlineExceeded
 				}
-				return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 			}))
 			for range 2 {
 				req, _ := http.NewRequest(method, "http://store.test/object", nil)

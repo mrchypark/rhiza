@@ -11,39 +11,54 @@ import (
 // mutationResponse waits for the terminal response body, not just its headers.
 type mutationResponse struct {
 	io.ReadCloser
-	drain *mutationDrain
-	once  sync.Once
-	known bool
-	body  []byte
+	drain    *mutationDrain
+	once     sync.Once
+	known    bool
+	body     []byte
+	expected int64
+	received int64
 }
 
 func (r *mutationResponse) finish(known bool) {
+	if !known {
+		r.drain.mu.Lock()
+		r.drain.unknown = true
+		r.drain.mu.Unlock()
+	}
 	r.once.Do(func() { r.drain.end(known) })
 }
 
 func (r *mutationResponse) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
+	r.received += int64(n)
+	if r.expected > 0 && r.received > r.expected {
+		r.known = false
+	}
 	if len(r.body)+n <= 64<<10 {
 		r.body = append(r.body, p[:n]...)
 	} else {
 		r.known = false
 	}
-	if err == io.EOF {
+	if err != nil && err != io.EOF {
+		r.finish(false)
+	} else if err == io.EOF || r.expected > 0 && r.received == r.expected {
+		if r.expected > 0 && r.received != r.expected {
+			r.known = false
+		}
 		// Some stores report a failed mutation inside a successful HTTP status.
 		if bytes.Contains(r.body, []byte("<Error")) || bytes.Contains(r.body, []byte(`"error"`)) {
 			r.known = false
 		}
 		r.finish(r.known)
-	} else if err != nil {
-		r.finish(false)
 	}
 	return n, err
 }
 
 func (r *mutationResponse) Close() error {
 	err := r.ReadCloser.Close()
-	// Closing without EOF cannot establish the final remote outcome.
-	r.finish(false)
+	// A fully consumed Content-Length is terminal even if a decoder did not
+	// request EOF. Unknown-length bodies still require EOF.
+	r.once.Do(func() { r.drain.end(false) })
 	if err != nil {
 		r.drain.mu.Lock()
 		r.drain.unknown = true
