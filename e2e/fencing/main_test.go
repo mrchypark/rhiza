@@ -3,11 +3,17 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"gopkg.in/yaml.v3"
 )
 
 func TestImmutableImageResolutionDescriptors(t *testing.T) {
@@ -88,29 +94,21 @@ func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 }
 
 func TestFixtureRestoreHasWritableTmpWithReadOnlyRoot(t *testing.T) {
-	for _, item := range manifests()["items"].([]obj) {
-		if item["kind"] != "StatefulSet" {
-			continue
-		}
-		spec := nested(item, "spec", "template", "spec").(obj)
-		container := spec["containers"].([]obj)[0]
-		if nested(container, "securityContext", "readOnlyRootFilesystem") != true || nested(container, "securityContext", "allowPrivilegeEscalation") != false || spec["hostPID"] != false || spec["shareProcessNamespace"] != false {
-			t.Fatal("restore scratch space weakened the supervised security boundary")
-		}
-		mountName := ""
-		for _, mount := range container["volumeMounts"].([]obj) {
-			if mount["mountPath"] == "/tmp" && mount["readOnly"] != true {
-				mountName = text(mount["name"])
-			}
-		}
-		for _, volume := range spec["volumes"].([]obj) {
-			if mountName != "" && volume["name"] == mountName && volume["emptyDir"] != nil {
-				return
-			}
-		}
-		t.Fatal("checkpoint restore requires a dedicated writable /tmp emptyDir")
+	data, err := os.ReadFile("../../deploy/operator/fencing/supervised-statefulset.patch.yaml")
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal("missing supervised StatefulSet")
+	var patch obj
+	if err := yaml.NewDecoder(strings.NewReader(string(data))).Decode(&patch); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyScratch(patch); err != nil {
+		t.Fatal(err)
+	}
+	nested(patch, "spec", "template", "spec").(obj)["volumes"] = []any{}
+	if verifyScratch(patch) == nil {
+		t.Fatal("accepted read-only root without writable scratch storage")
+	}
 }
 
 func TestGenerationProofRejectsUnrelatedAuthorityBeforeReadingLedger(t *testing.T) {
@@ -128,6 +126,114 @@ func TestGenerationProofRejectsUnrelatedAuthorityBeforeReadingLedger(t *testing.
 		change(&r, &p)
 		if err := verifyGenerationProof(context.Background(), obj{"spec": r, "status": obj{"proof": p}}, "sts", "binding", []string{"old"}, t.TempDir()); err == nil {
 			t.Fatal("unrelated/incomplete proof accepted")
+		}
+	}
+}
+
+func TestOnlineMembershipMappingAndExactIncarnations(t *testing.T) {
+	refs := []operator.VoterPod{{NodeID: "rhiza-0", Pod: "rhiza-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1"}, {NodeID: "learner", Pod: "learner"}}
+	if err := validateReplacementRefs(refs, "rhiza-2", "learner"); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range [][]operator.VoterPod{refs[:2], {refs[0], refs[1], {NodeID: "rhiza-2", Pod: "rhiza-2"}}, {refs[0], refs[0], refs[2]}, {refs[0], refs[1], {NodeID: "learner", Pod: "rhiza-1"}}} {
+		if validateReplacementRefs(bad, "rhiza-2", "learner") == nil {
+			t.Fatal("accepted missing, retired, duplicated or incorrectly mapped learner")
+		}
+	}
+	status := network.MembershipStatus{NodeID: "learner", ClusterID: "chaos-source", ConfigID: 3, WALIdentity: "wal", Voting: true, Voters: []quepaxa.NodeID{"rhiza-1", "learner", "rhiza-0"}}
+	if !membershipMatches(status, refs, "learner") {
+		t.Fatal("reordered exact current membership rejected")
+	}
+	for _, change := range []func(*network.MembershipStatus){
+		func(s *network.MembershipStatus) { s.Pending = true },
+		func(s *network.MembershipStatus) { s.Voting = false },
+		func(s *network.MembershipStatus) { s.WALIdentity = "" },
+		func(s *network.MembershipStatus) { s.Voters = []quepaxa.NodeID{"rhiza-0", "rhiza-1", "rhiza-2"} },
+		func(s *network.MembershipStatus) { s.Voters = []quepaxa.NodeID{"rhiza-0", "rhiza-0", "learner"} },
+	} {
+		bad := status
+		change(&bad)
+		if membershipMatches(bad, refs, "learner") {
+			t.Fatal("accepted uncertified or wrong current membership")
+		}
+	}
+	targets := []operator.FenceTarget{{NodeID: "n", Pod: "p", PodUID: "uid", WALIdentity: "wal"}, {NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}}
+	if !sameTargets([]operator.FenceTarget{targets[1], targets[0]}, targets) {
+		t.Fatal("exact reordered targets rejected")
+	}
+	stale := append([]operator.FenceTarget(nil), targets...)
+	stale[1].PodUID = "stale"
+	if sameTargets(stale, targets) || sameTargets(targets[:1], targets) {
+		t.Fatal("accepted missing learner or stale Pod UID")
+	}
+}
+
+func TestGenerationRetainsImmutableEarlierVoterStop(t *testing.T) {
+	identity := fencing.Identity{SourceClusterID: "chaos-source", NodeID: "rhiza-2", PodUID: "old", RunID: "run", WALIdentity: "wal"}
+	stop := fencing.StopRequest{OperationID: "online", RequestHash: "online-hash", Identity: identity}
+	run := fencing.Run{Identity: identity, Stop: &stop, Drain: &fencing.DrainReceipt{Request: stop, WritersJoined: true}, Exited: true}
+	prior := fenceLedgerState{StatefulSetUID: "sts", Ledger: fencing.Ledger{SourceClusterID: "chaos-source", Runs: map[string]fencing.Run{"run": run}}}
+	out := t.TempDir()
+	if err := os.WriteFile(out+"/validated-voter-proof.json", encoded(obj{"request": operator.FenceRequest{OperationID: "online"}, "ledger": prior}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	current := prior.Ledger
+	current.ClosedBy, current.ClosedHash = "generation", "generation-hash"
+	if err := verifyPriorVoterStops(out, current); err != nil {
+		t.Fatal(err)
+	}
+	changed := run
+	changed.Exited = false
+	current.Runs["run"] = changed
+	if verifyPriorVoterStops(out, current) == nil {
+		t.Fatal("generation accepted altered earlier voter-stop evidence")
+	}
+}
+
+func TestVoterProofRejectsWrongIncarnationBeforeLedgerRead(t *testing.T) {
+	target := operator.FenceTarget{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "live-uid", WALIdentity: "live-wal"}
+	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "chaos-source", OperationID: "online", Scope: operator.ScopeVoter, Targets: []operator.FenceTarget{target}}
+	request.Targets[0].PodUID = "stale-uid"
+	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(request))), ProofID: "cooperative-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	if verifyScopedProof(context.Background(), obj{"spec": request, "status": obj{"proof": proof}}, "sts", "binding", []string{target.PodUID}, operator.ScopeVoter, []operator.FenceTarget{target}, t.TempDir()) == nil {
+		t.Fatal("voter proof accepted stale target UID")
+	}
+}
+
+func TestHistoricalVoterProofAllowsLaterLearnerButRejectsTargetTampering(t *testing.T) {
+	target := operator.FenceTarget{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "old-uid", WALIdentity: "old-wal"}
+	request := operator.FenceRequest{StatefulSetUID: "sts", SourceClusterID: "chaos-source", BindingUID: "binding", OperationID: "online", Scope: operator.ScopeVoter, Targets: []operator.FenceTarget{target}}
+	hash := fmt.Sprintf("%x", sha256.Sum256(encoded(request)))
+	identity := fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: target.NodeID, PodUID: target.PodUID, RunID: "old-run", WALIdentity: target.WALIdentity}
+	stop := fencing.StopRequest{OperationID: request.OperationID, RequestHash: hash, Identity: identity}
+	run := fencing.Run{Identity: identity, Stop: &stop, Drain: &fencing.DrainReceipt{Request: stop, WritersJoined: true}, Exited: true}
+	state := fenceLedgerState{StatefulSetUID: "sts", Ledger: fencing.Ledger{SourceClusterID: request.SourceClusterID, ClosedNodes: map[string]fencing.StopRequest{target.NodeID: {OperationID: request.OperationID, RequestHash: hash}}, Runs: map[string]fencing.Run{"old-run": run}}}
+	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "cooperative-" + fmt.Sprintf("%x", sha256.Sum256(encoded(state))), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	state.Ledger.Runs["learner-run"] = fencing.Run{Identity: fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: "learner", PodUID: "learner-uid", RunID: "learner-run", WALIdentity: "learner-wal"}}
+	if proof.ProofID == "cooperative-"+fmt.Sprintf("%x", sha256.Sum256(encoded(state))) {
+		t.Fatal("test did not advance the current ledger past proof issuance")
+	}
+	if err := verifyLedgerProof(state, request, proof); err != nil {
+		t.Fatalf("unrelated later learner invalidated historical voter proof: %v", err)
+	}
+	for _, change := range []func(*fencing.Run){
+		func(r *fencing.Run) { r.Identity.PodUID = "different-uid" },
+		func(r *fencing.Run) { r.Identity.WALIdentity = "different-wal" },
+		func(r *fencing.Run) { r.Stop.OperationID = "different-operation" },
+		func(r *fencing.Run) { r.Stop.RequestHash = "different-hash" },
+		func(r *fencing.Run) { r.Drain.UnknownMutations = 1 },
+		func(r *fencing.Run) { r.Drain.PendingMutations = 1 },
+		func(r *fencing.Run) { r.Drain.WritersJoined = false },
+		func(r *fencing.Run) { r.Exited = false },
+	} {
+		var bad fencing.Run
+		if err := json.Unmarshal(encoded(run), &bad); err != nil {
+			t.Fatal(err)
+		}
+		change(&bad)
+		state.Ledger.Runs["old-run"] = bad
+		if verifyLedgerProof(state, request, proof) == nil {
+			t.Fatal("historical proof accepted tampered terminal target evidence")
 		}
 	}
 }

@@ -27,7 +27,7 @@ jobs:
           cache: true
       - name: Check cooperative protocol and engine regression tests
         run: |
-          go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore -count=1 -timeout=5m
+          go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
       - name: Qualify actual cooperative executor in disposable Kubernetes
         env:
           CGO_ENABLED: 0

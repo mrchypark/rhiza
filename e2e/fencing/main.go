@@ -22,7 +22,9 @@ import (
 
 	"github.com/mrchypark/rhiza"
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 const namespace = "rhiza-fencing-e2e"
@@ -176,8 +178,6 @@ func manifests() obj {
 	workload["hostPID"], workload["shareProcessNamespace"] = false, false
 	application := workload["containers"].([]obj)[0]
 	application["securityContext"] = obj{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": obj{"drop": []string{"ALL"}}}
-	application["volumeMounts"] = append(application["volumeMounts"].([]obj), obj{"name": "temporary", "mountPath": "/tmp"})
-	workload["volumes"] = append(workload["volumes"].([]obj), obj{"name": "temporary", "emptyDir": obj{}})
 	opEnv := []obj{field("POD_NAMESPACE", "metadata.namespace"), value("RHIZA_AUTOMATIC_RECOVERY", "true"), value("RHIZA_FENCER_BACKEND", "kubernetes")}
 	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0], envFrom[2]}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}}}}})
 	binding := resource("rhiza.mrchypark.dev/v1alpha1", "RhizaCluster", "rhiza", obj{"logicalID": "fencing-e2e", "statefulSet": "rhiza", "container": "rhiza", "adoptClusterID": "chaos-source", "automatic": true, "voterPods": voters, "policy": obj{"failureGraceSeconds": 15, "cooldownSeconds": 3, "maxRecoveriesPerDay": 3, "allowDataLoss": false}})
@@ -357,6 +357,9 @@ func qualify(ctx context.Context) error {
 	if stsUID == "" || bindingUID == "" {
 		return fmt.Errorf("missing source workload/binding UID")
 	}
+	if err := verifyScratch(sts); err != nil {
+		return err
+	}
 	if err := verifyImages(ctx, out, "source"); err != nil {
 		return err
 	}
@@ -374,6 +377,7 @@ func qualify(ctx context.Context) error {
 	}
 	event("source_acknowledged", obj{"rows": 1})
 	incarnations := map[string]string{}
+	var initialUIDs []string
 	for i := 0; i < 3; i++ {
 		pod := fmt.Sprintf("rhiza-%d", i)
 		p, err := get(ctx, "pod", pod)
@@ -381,6 +385,7 @@ func qualify(ctx context.Context) error {
 			return err
 		}
 		incarnations[pod] = incarnationSnapshot(p)
+		initialUIDs = append(initialUIDs, text(nested(p, "metadata", "uid")))
 	}
 	if _, err = kubectl(ctx, "scale", "deployment", "rhiza-fencer", "--replicas=0"); err != nil {
 		return err
@@ -413,34 +418,19 @@ func qualify(ctx context.Context) error {
 	if err := verifyImages(ctx, out, "authority-restarted"); err != nil {
 		return err
 	}
-	for i := 0; i < 3; i++ {
-		pod := fmt.Sprintf("rhiza-%d", i)
-		p, err := get(ctx, "pod", pod)
+	onlineCtx, onlineCancel := context.WithTimeout(ctx, 6*time.Minute)
+	current, err := qualifyOnline(onlineCtx, f, stsUID, bindingUID, out, event)
+	onlineCancel()
+	if err != nil {
+		return fmt.Errorf("online voter qualification: %w", err)
+	}
+	for _, target := range current {
+		oldUIDs = append(oldUIDs, target.PodUID)
+		partition, err := partitionPeer(ctx, target)
 		if err != nil {
 			return err
 		}
-		oldUIDs = append(oldUIDs, text(nested(p, "metadata", "uid")))
-		statuses, _ := nested(p, "status", "containerStatuses").([]any)
-		if len(statuses) != 1 {
-			return fmt.Errorf("expected dedicated single container")
-		}
-		cid := strings.TrimPrefix(text(nested(statuses[0], "containerID")), "containerd://")
-		data, err := command(ctx, "docker", "exec", kindNode, "crictl", "inspect", cid)
-		if err != nil {
-			return err
-		}
-		var inspect obj
-		if err = json.Unmarshal(data, &inspect); err != nil {
-			return err
-		}
-		pid := fmt.Sprint(nested(inspect, "info", "pid"))
-		if pid == "<nil>" || pid == "0" {
-			return fmt.Errorf("missing runtime PID")
-		}
-		if _, err = command(ctx, "docker", "exec", kindNode, "nsenter", "-t", pid, "-n", "iptables", "-I", "INPUT", "-p", "udp", "--dport", "9090", "-j", "DROP"); err != nil {
-			return err
-		}
-		event("peer_partition", obj{"pod": pod, "uid": oldUIDs[len(oldUIDs)-1], "container": cid})
+		event("generation_peer_partition", partition)
 	}
 	if err := wait(ctx, "generic generation fence proof", func() (bool, error) {
 		list, err := get(ctx, "rhizafences", "")
@@ -452,7 +442,7 @@ func qualify(ctx context.Context) error {
 			if nested(item, "spec", "scope") != "Generation" || nested(item, "status", "proof") == nil {
 				continue
 			}
-			return true, verifyGenerationProof(ctx, item, stsUID, bindingUID, oldUIDs, out)
+			return true, verifyGenerationProof(ctx, item, stsUID, bindingUID, oldUIDs, out, current...)
 		}
 		return false, nil
 	}); err != nil {
@@ -508,21 +498,20 @@ func qualify(ctx context.Context) error {
 		return err
 	}
 	values, _ := rows["rows"].([]any)
-	if len(values) != 1 {
+	if len(values) != 3 {
 		return fmt.Errorf("ACK row count differs")
 	}
-	row, _ := values[0].([]any)
-	if len(row) != 2 || row[0] != float64(1) || row[1] != "acknowledged" {
+	if string(encoded(values)) != `[[1,"acknowledged"],[2,"quorum-survived"],[3,"learner-promoted"]]` {
 		return fmt.Errorf("ACK row differs")
 	}
-	if _, err = call(ctx, newForward, "/sql/execute", obj{"request_id": "fencing-new-generation-write", "sql": "INSERT INTO fencing_items VALUES (2, 'recovered')"}, targetAdmin); err != nil {
+	if _, err = call(ctx, newForward, "/sql/execute", obj{"request_id": "fencing-new-generation-write", "sql": "INSERT INTO fencing_items VALUES (4, 'recovered')"}, targetAdmin); err != nil {
 		return err
 	}
 	readback, err := call(ctx, newForward, "/sql/query", obj{"sql": "SELECT id,value FROM fencing_items ORDER BY id", "consistency": "linearizable"}, targetAdmin)
 	if err != nil {
 		return err
 	}
-	if string(encoded(readback["rows"])) != `[[1,"acknowledged"],[2,"recovered"]]` {
+	if string(encoded(readback["rows"])) != `[[1,"acknowledged"],[2,"quorum-survived"],[3,"learner-promoted"],[4,"recovered"]]` {
 		return fmt.Errorf("new-generation linearizable readback differs")
 	}
 	event("new_generation_linearizable_readback", obj{"rows": readback["rows"], "appliedSlot": readback["applied_slot"], "consensusTip": readback["consensus_tip"]})
@@ -540,14 +529,358 @@ func qualify(ctx context.Context) error {
 			continue
 		}
 		uid := text(nested(container, "labels", "io.kubernetes.pod.uid"))
-		for _, old := range oldUIDs {
+		for _, old := range append(append([]string(nil), oldUIDs...), initialUIDs...) {
 			if uid == old {
 				return fmt.Errorf("old runtime remains live after proof")
 			}
 		}
 	}
-	event("PASS", obj{"sourceACKRows": 1, "newGenerationWrite": true, "oldRuntimesGone": true, "executor": "generic-cooperative"})
+	event("PASS", obj{"sourceACKRows": 3, "onlineVoterReplacement": true, "newGenerationWrite": true, "oldRuntimesGone": true, "executor": "generic-cooperative"})
 	return nil
+}
+
+func verifyScratch(sts obj) error {
+	spec := nested(sts, "spec", "template", "spec")
+	containers, _ := nested(spec, "containers").([]any)
+	if len(containers) != 1 || nested(containers[0], "securityContext", "readOnlyRootFilesystem") != true || nested(containers[0], "securityContext", "allowPrivilegeEscalation") != false || nested(spec, "hostPID") != false || nested(spec, "shareProcessNamespace") != false {
+		return fmt.Errorf("applied supervised workload security differs")
+	}
+	mounts, _ := nested(containers[0], "volumeMounts").([]any)
+	volumes, _ := nested(spec, "volumes").([]any)
+	for _, mount := range mounts {
+		if nested(mount, "mountPath") != "/tmp" || nested(mount, "readOnly") == true {
+			continue
+		}
+		for _, volume := range volumes {
+			if nested(volume, "name") == nested(mount, "name") && nested(volume, "emptyDir") != nil {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("applied checkpoint restore lacks writable /tmp emptyDir")
+}
+
+func readMembership(ctx context.Context, f *forward) (network.MembershipStatus, error) {
+	data, err := call(ctx, f, "/membership/status", nil, admin)
+	var status network.MembershipStatus
+	if err == nil {
+		err = json.Unmarshal(encoded(data), &status)
+	}
+	return status, err
+}
+
+func partitionPeer(ctx context.Context, target operator.FenceTarget) (obj, error) {
+	pod, err := get(ctx, "pod", target.Pod)
+	if err != nil {
+		return nil, err
+	}
+	if text(nested(pod, "metadata", "uid")) != target.PodUID || target.PodUID == "" || target.NodeID == "" || target.WALIdentity == "" {
+		return nil, fmt.Errorf("partition target incarnation changed")
+	}
+	statuses, _ := nested(pod, "status", "containerStatuses").([]any)
+	if len(statuses) != 1 {
+		return nil, fmt.Errorf("partition requires dedicated single container")
+	}
+	cid := strings.TrimPrefix(text(nested(statuses[0], "containerID")), "containerd://")
+	data, err := command(ctx, "docker", "exec", kindNode, "crictl", "inspect", "-o", "json", cid)
+	if err != nil {
+		return nil, err
+	}
+	var runtime obj
+	if err := json.Unmarshal(data, &runtime); err != nil {
+		return nil, err
+	}
+	pid := fmt.Sprint(nested(runtime, "info", "pid"))
+	if pid == "<nil>" || pid == "0" || nested(runtime, "status", "labels", "io.kubernetes.pod.uid") != target.PodUID || nested(runtime, "status", "id") != cid || nested(runtime, "status", "state") != "CONTAINER_RUNNING" {
+		return nil, fmt.Errorf("partition runtime does not bind live target")
+	}
+	if _, err := command(ctx, "docker", "exec", kindNode, "nsenter", "-t", pid, "-n", "iptables", "-I", "INPUT", "-p", "udp", "--dport", "9090", "-j", "DROP"); err != nil {
+		return nil, err
+	}
+	return obj{"target": target, "containerID": cid, "imageID": nested(statuses[0], "imageID"), "pid": pid}, nil
+}
+
+func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, out string, event func(string, obj)) ([]operator.FenceTarget, error) {
+	failedPod, err := get(ctx, "pod", "rhiza-2")
+	if err != nil {
+		return nil, err
+	}
+	failedForward, err := startForward(ctx, "rhiza-2", out)
+	if err != nil {
+		return nil, err
+	}
+	failedStatus, err := readMembership(ctx, failedForward)
+	failedForward.close()
+	if err != nil || failedStatus.NodeID != "rhiza-2" || failedStatus.ClusterID != "chaos-source" || !failedStatus.Voting || failedStatus.Pending || failedStatus.WALIdentity == "" {
+		return nil, fmt.Errorf("failed voter identity unavailable: %v", err)
+	}
+	failed := operator.FenceTarget{NodeID: string(failedStatus.NodeID), Pod: "rhiza-2", PodUID: text(nested(failedPod, "metadata", "uid")), WALIdentity: failedStatus.WALIdentity}
+	partition, err := partitionPeer(ctx, failed)
+	if err != nil {
+		return nil, err
+	}
+	event("online_peer_partition", partition)
+	if _, err := call(ctx, survivor, "/sql/execute", obj{"request_id": "fencing-surviving-quorum", "sql": "INSERT INTO fencing_items VALUES (2, 'quorum-survived')"}, admin); err != nil {
+		return nil, err
+	}
+	if err := checkRows(ctx, survivor, admin, `[[1,"acknowledged"],[2,"quorum-survived"]]`); err != nil {
+		return nil, err
+	}
+	event("surviving_quorum_ack_readback", obj{"rows": 2})
+	var voterRequest operator.FenceRequest
+	var voterProof operator.FenceProof
+	if err := wait(ctx, "exact online voter drain/exit proof", func() (bool, error) {
+		list, err := get(ctx, "rhizafences", "")
+		if err != nil {
+			return false, err
+		}
+		items, _ := list["items"].([]any)
+		for _, item := range items {
+			if nested(item, "spec", "scope") != "Voter" || nested(item, "status", "proof") == nil {
+				continue
+			}
+			if err := verifyScopedProof(ctx, item, stsUID, bindingUID, []string{failed.PodUID}, operator.ScopeVoter, []operator.FenceTarget{failed}, out); err != nil {
+				return false, err
+			}
+			if err := json.Unmarshal(encoded(nested(item, "spec")), &voterRequest); err != nil {
+				return false, err
+			}
+			return true, json.Unmarshal(encoded(nested(item, "status", "proof")), &voterProof)
+		}
+		return false, nil
+	}); err != nil {
+		return nil, err
+	}
+	event("generic_voter_proof", obj{"request": voterRequest, "proof": voterProof})
+	var child operator.Resource
+	if err := wait(ctx, "online membership promotion and healthy parent", func() (bool, error) {
+		resources, err := get(ctx, "rhizarecoveries", "")
+		if err != nil {
+			return false, err
+		}
+		items, _ := resources["items"].([]any)
+		var resource any
+		for _, item := range items {
+			if nested(item, "metadata", "name") == voterRequest.OperationID {
+				resource = item
+			}
+		}
+		if resource == nil {
+			return false, nil
+		}
+		if err := json.Unmarshal(encoded(resource), &child); err != nil {
+			return false, err
+		}
+		if child.Status.Phase != "Complete" || child.Status.Membership == nil || child.Status.Membership.Phase != "Complete" {
+			return false, nil
+		}
+		root, err := get(ctx, "rhizacluster", "rhiza")
+		if err != nil {
+			return false, err
+		}
+		return nested(root, "status", "phase") == "Healthy" && nested(root, "status", "activeClusterID") == "chaos-source", nil
+	}); err != nil {
+		return nil, err
+	}
+	m := child.Spec.Membership
+	if m == nil || m.Remove != "rhiza-2" || m.RemovedPod != failed.Pod || m.Fence.WorkloadUID != failed.PodUID || m.Fence.WALIdentity != failed.WALIdentity || m.Fence.Evidence != voterProof.ProofID || !m.Fence.Confirmed || m.ReplacementPod == "" || child.Status.Membership.Add == nil || child.Status.Membership.RemoveRequest == nil || text(nested(child.Metadata, "uid")) == "" || text(nested(child.Metadata, "annotations", "rhiza.mrchypark.dev/automatic-owner")) != bindingUID || text(nested(child.Metadata, "annotations", "rhiza.mrchypark.dev/automatic-logical")) != "fencing-e2e" {
+		return nil, fmt.Errorf("completed membership differs from exact voter fence")
+	}
+	remove := child.Status.Membership.RemoveRequest
+	operationPrefix := text(child.Metadata["uid"]) + ":" + m.OperationID + ":"
+	if m.OperationID != voterRequest.OperationID || remove.OperationID != operationPrefix+"remove" || remove.ClusterID != "chaos-source" || string(remove.Remove) != failed.NodeID || remove.Fence == nil || remove.Fence.Evidence != voterProof.ProofID || remove.Fence.WALIdentity != failed.WALIdentity || remove.Fence.WorkloadUID != failed.PodUID || child.Status.Membership.Add.OperationID != operationPrefix+"add" {
+		return nil, fmt.Errorf("membership remove/add journals differ from fenced operation")
+	}
+	refs := append(append([]operator.VoterPod(nil), m.VoterPods...), operator.VoterPod{NodeID: child.Status.Membership.Add.MemberID, Pod: m.ReplacementPod})
+	if err := validateReplacementRefs(refs, failed.NodeID, m.ReplacementPod); err != nil {
+		return nil, err
+	}
+	var targets []operator.FenceTarget
+	var observations []obj
+	var configID uint
+	for _, ref := range refs {
+		pod, err := get(ctx, "pod", ref.Pod)
+		if err != nil {
+			return nil, err
+		}
+		f, err := startForward(ctx, ref.Pod, out)
+		if err != nil {
+			return nil, err
+		}
+		status, statusErr := readMembership(ctx, f)
+		f.close()
+		if statusErr != nil || !membershipMatches(status, refs, string(ref.NodeID)) || configID != 0 && status.ConfigID != configID {
+			return nil, fmt.Errorf("promoted voter %s membership differs: %v", ref.NodeID, statusErr)
+		}
+		configID = status.ConfigID
+		targets = append(targets, operator.FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: text(nested(pod, "metadata", "uid")), WALIdentity: status.WALIdentity})
+		observations = append(observations, obj{"podUID": nested(pod, "metadata", "uid"), "pod": ref.Pod, "membership": status})
+		if ref.Pod == m.ReplacementPod {
+			if err := verifyLearnerBinding(ctx, pod, child, status, stsUID, bindingUID, voterRequest.OperationID, out); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := verifyRegisteredTargets(ctx, targets, stsUID, out); err != nil {
+		return nil, err
+	}
+	if err := verifyImages(ctx, out, "learner-promoted", targets...); err != nil {
+		return nil, err
+	}
+	learnerForward, err := startForward(ctx, m.ReplacementPod, out)
+	if err != nil {
+		return nil, err
+	}
+	defer learnerForward.close()
+	if _, err := call(ctx, learnerForward, "/sql/execute", obj{"request_id": "fencing-learner-promoted", "sql": "INSERT INTO fencing_items VALUES (3, 'learner-promoted')"}, admin); err != nil {
+		return nil, err
+	}
+	if err := checkRows(ctx, learnerForward, admin, `[[1,"acknowledged"],[2,"quorum-survived"],[3,"learner-promoted"]]`); err != nil {
+		return nil, err
+	}
+	event("online_replacement_linearizable_readback", obj{"targets": targets, "rows": 3, "configID": configID})
+	return targets, os.WriteFile(filepath.Join(out, "online-completed-membership.json"), encoded(obj{"recovery": child, "targets": targets, "observations": observations}), 0600)
+}
+
+func checkRows(ctx context.Context, f *forward, token, expected string) error {
+	response, err := call(ctx, f, "/sql/query", obj{"sql": "SELECT id,value FROM fencing_items ORDER BY id", "consistency": "linearizable"}, token)
+	if err != nil {
+		return err
+	}
+	if string(encoded(response["rows"])) != expected {
+		return fmt.Errorf("linearizable acknowledged values differ")
+	}
+	return nil
+}
+
+func validateReplacementRefs(refs []operator.VoterPod, removed, learner string) error {
+	seen, pods := map[string]bool{}, map[string]bool{}
+	for _, ref := range refs {
+		id := string(ref.NodeID)
+		if id == "" || ref.Pod == "" || id == removed || seen[id] || pods[ref.Pod] {
+			return fmt.Errorf("replacement membership mapping is invalid")
+		}
+		seen[id], pods[ref.Pod] = true, true
+	}
+	if len(refs) != 3 || !seen[learner] || !pods[learner] || !seen["rhiza-0"] || !seen["rhiza-1"] {
+		return fmt.Errorf("replacement must retain both survivors and promote the authenticated learner")
+	}
+	return nil
+}
+
+func sameTargets(actual, expected []operator.FenceTarget) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	seen := map[string]operator.FenceTarget{}
+	for _, target := range actual {
+		if _, duplicate := seen[target.NodeID]; duplicate || target.NodeID == "" || target.Pod == "" || target.PodUID == "" || target.WALIdentity == "" {
+			return false
+		}
+		seen[target.NodeID] = target
+	}
+	for _, target := range expected {
+		if seen[target.NodeID] != target {
+			return false
+		}
+		delete(seen, target.NodeID)
+	}
+	return true
+}
+
+func membershipMatches(status network.MembershipStatus, refs []operator.VoterPod, nodeID string) bool {
+	if string(status.NodeID) != nodeID || status.ClusterID != "chaos-source" || status.WALIdentity == "" || !status.Voting || status.Pending || status.ConfigID == 0 || len(status.Voters) != len(refs) {
+		return false
+	}
+	seen := map[quepaxa.NodeID]bool{}
+	for _, id := range status.Voters {
+		if seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	for _, ref := range refs {
+		if !seen[ref.NodeID] {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyLearnerBinding(ctx context.Context, pod obj, child operator.Resource, status network.MembershipStatus, stsUID, bindingUID, operation, out string) error {
+	m, add := child.Spec.Membership, child.Status.Membership.Add
+	name := text(nested(pod, "metadata", "name"))
+	if name != m.ReplacementPod || string(add.MemberID) != name || status.WALIdentity != add.WALIdentity || text(nested(pod, "metadata", "uid")) == "" || nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner") != name || nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/fencing-root-uid") != bindingUID || nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner") != operation {
+		return fmt.Errorf("promoted learner Pod/WAL/root identity differs")
+	}
+	owners, _ := nested(pod, "metadata", "ownerReferences").([]any)
+	owned := false
+	for _, owner := range owners {
+		owned = owned || nested(owner, "kind") == "StatefulSet" && nested(owner, "uid") == stsUID
+	}
+	if !owned {
+		return fmt.Errorf("promoted learner lacks exact StatefulSet owner")
+	}
+	secret, err := get(ctx, "secret", m.ReplacementSecret)
+	if err != nil {
+		return err
+	}
+	if secret["immutable"] != true || nested(secret, "metadata", "uid") != add.SecretUID || nested(secret, "metadata", "resourceVersion") != add.SecretResourceVer || nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/fencing-credential-uid") != add.SecretUID || nested(secret, "metadata", "annotations", "rhiza.mrchypark.dev/recovery-owner") != operation {
+		return fmt.Errorf("promoted learner immutable credential binding differs")
+	}
+	raw, err := base64.StdEncoding.DecodeString(text(nested(secret, "data", "member")))
+	if err != nil {
+		return err
+	}
+	var member quepaxa.Member
+	if err := json.Unmarshal(raw, &member); err != nil {
+		return err
+	}
+	member.WALIdentity = status.WALIdentity
+	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: "chaos-source", ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}
+	if member.ID != status.NodeID || member.PublicKey == (quepaxa.PublicKey{}) || fmt.Sprintf("%x", sha256.Sum256(encoded(request))) != add.RequestHash {
+		return fmt.Errorf("promoted learner member differs from committed addition")
+	}
+	return os.WriteFile(filepath.Join(out, "learner-authenticated-binding.json"), encoded(obj{"podUID": nested(pod, "metadata", "uid"), "nodeID": status.NodeID, "walIdentity": status.WALIdentity, "rootUID": bindingUID, "statefulSetUID": stsUID, "credentialUID": add.SecretUID, "member": member, "addition": add}), 0600)
+}
+
+type fenceLedgerState struct {
+	StatefulSetUID string         `json:"statefulSetUID"`
+	Ledger         fencing.Ledger `json:"ledger"`
+}
+
+func verifyRegisteredTargets(ctx context.Context, targets []operator.FenceTarget, stsUID, out string) error {
+	maps, err := get(ctx, "configmaps", "")
+	if err != nil {
+		return err
+	}
+	items, _ := maps["items"].([]any)
+	for _, item := range items {
+		data := text(nested(item, "data", "ledger.json"))
+		if data == "" {
+			continue
+		}
+		var state fenceLedgerState
+		if err := json.Unmarshal([]byte(data), &state); err != nil {
+			return err
+		}
+		if state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != "chaos-source" {
+			continue
+		}
+		for _, target := range targets {
+			found := false
+			for _, run := range state.Ledger.Runs {
+				if run.Identity.NodeID == target.NodeID && run.Identity.PodUID == target.PodUID && run.Identity.WALIdentity == target.WALIdentity && run.Stop == nil && !run.Exited {
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("promoted current voter lacks active WAL-bound startup registration: %s", target.NodeID)
+			}
+		}
+		return os.WriteFile(filepath.Join(out, "online-active-ledger.json"), encoded(state), 0600)
+	}
+	return fmt.Errorf("active source ledger unavailable")
 }
 
 func digest(value string) string {
@@ -653,19 +986,35 @@ func incarnationSnapshot(pod obj) string {
 	return string(encoded(obj{"uid": nested(pod, "metadata", "uid"), "processes": processes}))
 }
 
-func verifyImages(ctx context.Context, out, phase string) error {
+func verifyImages(ctx context.Context, out, phase string, current ...operator.FenceTarget) error {
 	pods, err := get(ctx, "pods", "")
 	if err != nil {
 		return err
 	}
 	items, _ := pods["items"].([]any)
 	counts := map[string]int{}
+	wanted := map[string]string{}
+	for _, target := range current {
+		if target.Pod == "" || target.PodUID == "" || wanted[target.Pod] != "" {
+			return fmt.Errorf("invalid current image inventory")
+		}
+		wanted[target.Pod] = target.PodUID
+	}
 	var evidence []obj
 	for _, pod := range items {
 		if nested(pod, "metadata", "deletionTimestamp") != nil || nested(pod, "status", "phase") != "Running" {
 			continue
 		}
 		role := text(nested(pod, "metadata", "labels", "app.kubernetes.io/name"))
+		name := text(nested(pod, "metadata", "name"))
+		if uid := wanted[name]; uid != "" {
+			if nested(pod, "metadata", "uid") != uid {
+				return fmt.Errorf("qualified voter image incarnation changed")
+			}
+			role = "rhiza"
+		} else if len(wanted) > 0 && role == "rhiza" {
+			continue // Retired source slots are not current voting engines.
+		}
 		image := ""
 		switch role {
 		case "rhiza":
@@ -725,7 +1074,11 @@ func verifyImages(ctx context.Context, out, phase string) error {
 	return os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600)
 }
 
-func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, out string) error {
+func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, out string, targets ...operator.FenceTarget) error {
+	return verifyScopedProof(ctx, item, stsUID, bindingUID, oldUIDs, operator.ScopeGeneration, targets, out)
+}
+
+func verifyScopedProof(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, scope operator.Scope, targets []operator.FenceTarget, out string) error {
 	var request operator.FenceRequest
 	var proof operator.FenceProof
 	if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
@@ -734,8 +1087,17 @@ func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID str
 	if err := json.Unmarshal(encoded(nested(item, "status", "proof")), &proof); err != nil {
 		return err
 	}
-	if request.SourceClusterID != "chaos-source" || request.StatefulSet != "rhiza" || request.StatefulSetUID != stsUID || request.BindingUID != bindingUID || request.Namespace != namespace || request.LogicalID != "fencing-e2e" || request.OperationID == "" || request.Scope != operator.ScopeGeneration {
+	if request.SourceClusterID != "chaos-source" || request.StatefulSet != "rhiza" || request.StatefulSetUID != stsUID || request.BindingUID != bindingUID || request.Namespace != namespace || request.LogicalID != "fencing-e2e" || request.OperationID == "" || request.Scope != scope {
 		return fmt.Errorf("generation fence request identity differs")
+	}
+	var nodes []string
+	if scope == operator.ScopeVoter {
+		if len(targets) != 1 || string(encoded(request.Targets)) != string(encoded(targets)) {
+			return fmt.Errorf("voter fence target differs from observed exact incarnation")
+		}
+		nodes = []string{targets[0].NodeID}
+	} else if len(targets) > 0 && !sameTargets(request.Targets, targets) {
+		return fmt.Errorf("generation fence does not bind all current voters including the learner")
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(encoded(request)))
 	if proof.OperationID != request.OperationID || proof.SourceClusterID != request.SourceClusterID || proof.BindingUID != request.BindingUID || proof.RequestHash != hash || proof.ProofID == "" || !proof.ProcessesTerminated || !proof.RecreationBlocked || !proof.StorageQuiesced {
@@ -751,17 +1113,14 @@ func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID str
 		if data == "" {
 			continue
 		}
-		var state struct {
-			StatefulSetUID string         `json:"statefulSetUID"`
-			Ledger         fencing.Ledger `json:"ledger"`
-		}
+		var state fenceLedgerState
 		if err := json.Unmarshal([]byte(data), &state); err != nil {
 			return err
 		}
 		if state.StatefulSetUID != stsUID || state.Ledger.SourceClusterID != request.SourceClusterID {
 			continue
 		}
-		if !state.Ledger.Complete(request.OperationID, hash, oldUIDs) {
+		if !state.Ledger.CompleteNodes(request.OperationID, hash, nodes, oldUIDs) {
 			return fmt.Errorf("generation ledger has no clean drain/exit for all source incarnations")
 		}
 		for _, run := range state.Ledger.Runs {
@@ -771,10 +1130,93 @@ func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID str
 				}
 			}
 		}
-		if proof.ProofID != "cooperative-"+fmt.Sprintf("%x", sha256.Sum256(encoded(state))) {
-			return fmt.Errorf("proof ID does not bind observed durable ledger")
+		if err := verifyLedgerProof(state, request, proof); err != nil {
+			return err
 		}
-		return os.WriteFile(filepath.Join(out, "validated-generation-proof.json"), encoded(obj{"request": request, "proof": proof, "ledger": state, "oldUIDs": oldUIDs}), 0600)
+		filename := "validated-voter-proof.json"
+		if scope == operator.ScopeGeneration {
+			filename = "validated-generation-proof.json"
+			if err := verifyPriorVoterStops(out, state.Ledger); err != nil {
+				return err
+			}
+		}
+		provenance := "exact-current-ledger-hash"
+		if scope == operator.ScopeVoter {
+			provenance = "historical-issuer-proof-id; current-ledger-exact-terminal-targets; issuance-snapshot-not-reconstructed"
+		}
+		return os.WriteFile(filepath.Join(out, filename), encoded(obj{"request": request, "proof": proof, "ledger": state, "oldUIDs": oldUIDs, "ledgerVerification": provenance}), 0600)
 	}
 	return fmt.Errorf("generation proof has no matching durable ledger")
+}
+
+func verifyLedgerProof(state fenceLedgerState, request operator.FenceRequest, proof operator.FenceProof) error {
+	hash := fmt.Sprintf("%x", sha256.Sum256(encoded(request)))
+	if state.StatefulSetUID != request.StatefulSetUID || state.Ledger.SourceClusterID != request.SourceClusterID || proof.OperationID != request.OperationID || proof.SourceClusterID != request.SourceClusterID || proof.BindingUID != request.BindingUID || proof.RequestHash != hash || !proof.ProcessesTerminated || !proof.RecreationBlocked || !proof.StorageQuiesced {
+		return fmt.Errorf("ledger proof identity/request binding differs")
+	}
+	if request.Scope == operator.ScopeGeneration {
+		if proof.ProofID != "cooperative-"+fmt.Sprintf("%x", sha256.Sum256(encoded(state))) {
+			return fmt.Errorf("generation proof does not bind observed closed ledger")
+		}
+		return nil
+	}
+	// This is an issuer-produced historical proof, not a hash of today's ledger:
+	// learner registration advances unrelated runs after the one-time issuance.
+	if request.Scope != operator.ScopeVoter || !strings.HasPrefix(proof.ProofID, "cooperative-") {
+		return fmt.Errorf("unsupported historical voter proof")
+	}
+	if _, err := immutableDigest("sha256:" + strings.TrimPrefix(proof.ProofID, "cooperative-")); err != nil {
+		return err
+	}
+	if len(request.Targets) != 1 {
+		return fmt.Errorf("online voter proof requires one exact target")
+	}
+	target := request.Targets[0]
+	if target.NodeID == "" || target.PodUID == "" || target.WALIdentity == "" || !state.Ledger.CompleteNodes(request.OperationID, hash, []string{target.NodeID}, []string{target.PodUID}) {
+		return fmt.Errorf("historical voter proof lacks clean completed target authority")
+	}
+	found := false
+	for _, run := range state.Ledger.Runs {
+		if run.Identity.NodeID != target.NodeID {
+			continue
+		}
+		if run.Stop == nil || run.Stop.OperationID != request.OperationID || run.Stop.RequestHash != hash {
+			return fmt.Errorf("terminal voter run belongs to a different operation")
+		}
+		if run.Identity.PodUID == target.PodUID && run.Identity.WALIdentity == target.WALIdentity && run.Drain != nil && run.Drain.Request == *run.Stop && run.Drain.Clean() && run.Exited {
+			found = true
+		}
+	}
+	if !found {
+		return fmt.Errorf("historical voter proof target UID/WAL receipt differs")
+	}
+	return nil
+}
+
+func verifyPriorVoterStops(out string, current fencing.Ledger) error {
+	data, err := os.ReadFile(filepath.Join(out, "validated-voter-proof.json"))
+	if err != nil {
+		return fmt.Errorf("generation has no preserved online voter proof: %w", err)
+	}
+	var prior struct {
+		Request operator.FenceRequest `json:"request"`
+		Ledger  fenceLedgerState      `json:"ledger"`
+	}
+	if err := json.Unmarshal(data, &prior); err != nil {
+		return err
+	}
+	matched := false
+	for id, old := range prior.Ledger.Ledger.Runs {
+		if old.Stop == nil || old.Stop.OperationID != prior.Request.OperationID {
+			continue
+		}
+		if !bytes.Equal(encoded(old), encoded(current.Runs[id])) {
+			return fmt.Errorf("prior terminal voter evidence changed during generation fencing")
+		}
+		matched = true
+	}
+	if !matched {
+		return fmt.Errorf("preserved online proof has no immutable stopped voter")
+	}
+	return nil
 }
