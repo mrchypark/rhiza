@@ -89,6 +89,28 @@ namespaced Pod role therefore includes `delete`; it does not force-delete nodes
 or treat a deletion response as fencing proof. All source inventory must still
 disappear before the new generation can start.
 
+### Pod deletion scope
+
+`--delete-namespaces` (environment default `RHIZA_OPERATOR_DELETE_NAMESPACES`)
+limits post-fence Pod deletion independently of the watched `--namespace`:
+
+- Unset or empty: only the operator's actual namespace from its mounted service
+  account namespace file. If `POD_NAMESPACE` is supplied, it must match that file.
+  Missing or inconsistent self-namespace evidence stops startup; the watched
+  namespace is never substituted as deletion authority.
+- `team-a,team-b`: an explicit namespace allowlist. Whitespace is trimmed and
+  duplicates are harmless. Empty items and invalid namespace names are errors.
+- `*`: explicit all-namespace deletion eligibility; it must be the only value.
+
+This is an upper bound, not a multi-namespace watcher or an RBAC grant. The
+operator still watches one namespace, fencing remains bound to exact workloads,
+and Kubernetes RBAC must independently permit the request. The default manifest
+keeps a namespaced Role; neither CSV nor `*` creates broader Roles/Bindings.
+Only named Pod deletion with an exact UID precondition is available; collection,
+node, namespace, and arbitrary resource deletion are not supported. To operate
+on a watched namespace different from the operator's own namespace, explicitly
+allow that namespace and grant only the corresponding namespace RoleBinding.
+
 ## Installation
 
 Use the same versioned/digest-pinned images for server, supervisor, and authority.

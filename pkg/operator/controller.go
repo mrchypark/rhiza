@@ -649,7 +649,7 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 			return err
 		}
 		// Deletion is cleanup after fencing, never evidence of termination.
-		if err := c.Kube.Delete(ctx, c.corePath("pods", name), uid); err != nil && !apiNotFound(err) {
+		if err := c.Kube.DeletePod(ctx, c.Kube.Namespace, name, uid); err != nil && !apiNotFound(err) {
 			return err
 		}
 	}

@@ -24,6 +24,7 @@ import (
 
 func main() {
 	namespace := flag.String("namespace", os.Getenv("POD_NAMESPACE"), "namespace containing RhizaRecovery resources")
+	deleteNamespaces := flag.String("delete-namespaces", os.Getenv("RHIZA_OPERATOR_DELETE_NAMESPACES"), "Pod deletion namespaces: empty uses operator Pod namespace, CSV allowlist, or * for all")
 	poll := flag.Duration("poll-interval", 10*time.Second, "Kubernetes reconciliation poll interval")
 	flag.Parse()
 	if *poll <= 0 {
@@ -31,15 +32,18 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := run(ctx, *namespace, *poll); err != nil && !errors.Is(err, context.Canceled) {
+	if err := run(ctx, *namespace, *poll, *deleteNamespaces); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, namespace string, poll time.Duration) error {
+func run(ctx context.Context, namespace string, poll time.Duration, deleteNamespaces string) error {
 	kube, err := operator.NewInCluster(namespace)
 	if err != nil {
 		return fmt.Errorf("configure Kubernetes client: %w", err)
+	}
+	if err := configureDeletion(kube, deleteNamespaces, "/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err != nil {
+		return fmt.Errorf("configure Pod deletion scope: %w", err)
 	}
 	bucketConfig, err := operatorBucketConfig()
 	if err != nil {
@@ -130,6 +134,21 @@ func run(ctx context.Context, namespace string, poll time.Duration) error {
 		}
 	}
 	return controller.Run(ctx, poll)
+}
+
+func configureDeletion(kube *operator.Kubernetes, raw, namespaceFile string) error {
+	if strings.TrimSpace(raw) != "" {
+		return kube.ConfigureDeletion(raw, "")
+	}
+	data, err := os.ReadFile(namespaceFile)
+	if err != nil {
+		return fmt.Errorf("operator Pod namespace is unavailable: %w", err)
+	}
+	own := strings.TrimSpace(string(data))
+	if supplied := strings.TrimSpace(os.Getenv("POD_NAMESPACE")); supplied != "" && supplied != own {
+		return fmt.Errorf("POD_NAMESPACE differs from mounted service account namespace")
+	}
+	return kube.ConfigureDeletion(raw, own)
 }
 
 // Preserve the previous implicit HTTP configuration while making Kubernetes

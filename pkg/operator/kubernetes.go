@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -28,10 +29,46 @@ const (
 // the operator. Callers construct rooted API paths and retain resourceVersion
 // in values passed to Put.
 type Kubernetes struct {
-	BaseURL   string
-	Namespace string
-	TokenFile string
-	Client    *http.Client
+	BaseURL             string
+	Namespace           string
+	TokenFile           string
+	Client              *http.Client
+	deleteNamespaces    map[string]bool
+	deleteAllNamespaces bool
+}
+
+var namespaceLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+func validNamespace(name string) bool {
+	return len(name) > 0 && len(name) <= 63 && namespaceLabel.MatchString(name)
+}
+
+// ConfigureDeletion is independent of the namespace watched by this client.
+// An unconfigured client denies all deletion, even if its credentials permit it.
+func (k *Kubernetes) ConfigureDeletion(raw, ownNamespace string) error {
+	k.deleteNamespaces, k.deleteAllNamespaces = nil, false
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if !validNamespace(ownNamespace) {
+			return fmt.Errorf("operator Pod namespace is unavailable or invalid")
+		}
+		k.deleteNamespaces = map[string]bool{ownNamespace: true}
+		return nil
+	}
+	if raw == "*" {
+		k.deleteAllNamespaces = true
+		return nil
+	}
+	names := map[string]bool{}
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if !validNamespace(name) {
+			return fmt.Errorf("delete namespaces must be DNS-1123 namespace names or an exclusive *")
+		}
+		names[name] = true
+	}
+	k.deleteNamespaces = names
+	return nil
 }
 
 // APIError identifies a non-success Kubernetes response without copying the
@@ -93,10 +130,22 @@ func (k *Kubernetes) Post(ctx context.Context, apiPath string, value any, out an
 	return k.request(ctx, http.MethodPost, apiPath, value, out)
 }
 
-func (k *Kubernetes) Delete(ctx context.Context, apiPath, uid string) error {
+func (k *Kubernetes) DeletePod(ctx context.Context, namespace, name, uid string) error {
 	if uid == "" {
 		return fmt.Errorf("Kubernetes deletion requires an exact UID")
 	}
+	if !validNamespace(namespace) || len(name) == 0 || len(name) > 253 {
+		return fmt.Errorf("Pod deletion requires valid namespace and name")
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !validNamespace(label) {
+			return fmt.Errorf("invalid Pod deletion name")
+		}
+	}
+	if !k.deleteAllNamespaces && !k.deleteNamespaces[namespace] {
+		return fmt.Errorf("Pod deletion namespace is not allowed")
+	}
+	apiPath := "/api/v1/namespaces/" + namespace + "/pods/" + name
 	return k.request(ctx, http.MethodDelete, apiPath, object{"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": object{"uid": uid}}, nil)
 }
 

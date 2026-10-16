@@ -107,6 +107,9 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 			}))
 			defer server.Close()
 			c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
+			if err := c.Kube.ConfigureDeletion("", "default"); err != nil {
+				t.Fatal(err)
+			}
 			if err := c.advance(ctx, r, sourceState{stateful: api.sts}); err != nil {
 				t.Fatal(err)
 			}
@@ -138,9 +141,9 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 	}
 }
 
-func TestKubernetesDeleteRequiresUID(t *testing.T) {
+func TestKubernetesDeletePodRequiresUID(t *testing.T) {
 	client := &Kubernetes{}
-	if err := client.Delete(t.Context(), "/api/v1/namespaces/test/pods/learner", ""); err == nil || err.Error() != "Kubernetes deletion requires an exact UID" {
+	if err := client.DeletePod(t.Context(), "test", "learner", ""); err == nil || err.Error() != "Kubernetes deletion requires an exact UID" {
 		t.Fatalf("empty UID deletion error=%v", err)
 	}
 }

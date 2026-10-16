@@ -33,6 +33,13 @@ selected by `--namespace`. The Deployment supplies that flag from
 `POD_NAMESPACE`; if it is omitted, the command reads the mounted service
 account namespace. `--poll-interval` defaults to `10s` and must be positive.
 
+Post-fence standalone learner cleanup uses `--delete-namespaces`, defaulted from
+`RHIZA_OPERATOR_DELETE_NAMESPACES`. Empty means the actual operator Pod namespace
+(verified from the mounted service-account namespace, independently of the watch
+flag); a CSV allowlist or exclusive `*` opts into broader eligibility. This does
+not expand the watcher or grant RBAC. Default RBAC stays namespace-scoped. See
+[Pod deletion scope](../../docs/kubernetes-fencing.md#pod-deletion-scope).
+
 The operator reads the same `RHIZA_OBJSTORE_*` settings as Rhiza itself from
 `rhiza-config` and `rhiza-object-store`. The object-store secret must provide
 the bucket endpoint and credentials appropriate for the selected provider.
