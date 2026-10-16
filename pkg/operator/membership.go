@@ -90,15 +90,15 @@ func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error
 		if m.AbortAddition {
 			return nil
 		}
-		if journal.Add == nil || expected.ConfigID != journal.Add.ExpectedConfigID || expected.AbortSlot <= journal.Add.ExpectedAbortSlot {
-			return blocked("journaled addition abort is not confirmed by the current membership status")
+		if journal.Add != nil && (expected.ConfigID != journal.Add.ExpectedConfigID || expected.AbortSlot <= journal.Add.ExpectedAbortSlot) {
+			return c.recordMembership(ctx, r, "Aborted", "waiting for the journaled addition abort revision to reach surviving voters")
 		}
 		journal.Add, journal.Phase = nil, "Adding"
 		return c.recordMembership(ctx, r, "Adding", "aborted addition reset before replacement dispatch")
 	}
 	if m.AbortAddition {
 		if journal.Add == nil {
-			return blocked("addition is not journaled; abort is unavailable")
+			return c.recordMembership(ctx, r, "Aborted", "retirement acknowledged before any addition was journaled")
 		}
 		return c.abortMembership(ctx, r, pods, statuses, admin, expected)
 	}
@@ -186,11 +186,29 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 
 func (c *Controller) abortMembership(ctx context.Context, r *Resource, pods map[quepaxa.NodeID]object, statuses map[quepaxa.NodeID]network.MembershipStatus, admin string, current network.MembershipStatus) error {
 	add := r.Status.Membership.Add
+	if current.ConfigID == add.ExpectedConfigID+1 {
+		if err := c.confirmRetiredMembershipCommit(ctx, r, statuses, current); err != nil {
+			return c.recordMembership(ctx, r, "Blocked", err.Error())
+		}
+		return c.recordMembership(ctx, r, "Complete", "journaled addition already committed; failed voter identity retained for the next recovery")
+	}
 	if current.ConfigID != add.ExpectedConfigID || current.AbortSlot < add.ExpectedAbortSlot {
 		return c.recordMembership(ctx, r, "Blocked", "live membership does not match the journaled addition for abort")
 	}
 	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: r.Spec.SourceClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot}
 	if err := c.membershipMutation(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, "/membership/abort", request); err != nil {
+		// A journal can survive a crash before dispatch. Replaying its exact
+		// request establishes the round that the next abort must resolve.
+		if !current.Pending && current.AbortSlot == add.ExpectedAbortSlot {
+			frozen, bindErr := c.retiringMembershipRequest(ctx, r)
+			if bindErr != nil {
+				return c.recordMembership(ctx, r, "Blocked", bindErr.Error())
+			}
+			if dispatchErr := c.changeMembership(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, frozen); dispatchErr != nil {
+				return c.recordMembership(ctx, r, "Aborting", "retiring addition remains unresolved: "+dispatchErr.Error())
+			}
+			return c.recordMembership(ctx, r, "Aborting", "journaled addition replayed; waiting to resolve commit or abort")
+		}
 		return c.recordMembership(ctx, r, "Aborting", "abort request remains pending: "+err.Error())
 	}
 	return c.recordMembership(ctx, r, "Aborted", "journaled addition aborted by surviving quorum")

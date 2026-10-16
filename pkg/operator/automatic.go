@@ -58,7 +58,20 @@ type autoControl struct {
 	Completions     []time.Time                    `json:"completions,omitempty"`
 	Sequence        uint64                         `json:"sequence"`
 
-	Intent *autoIntent `json:"intent,omitempty"`
+	Intent    *autoIntent     `json:"intent,omitempty"`
+	Completed *autoCompletion `json:"completed,omitempty"`
+}
+
+// autoCompletion records an installed outcome, independently of later health.
+type autoCompletion struct {
+	RecoveryName     string     `json:"recoveryName"`
+	RecoveryUID      string     `json:"recoveryUID"`
+	SpecHash         string     `json:"specHash"`
+	FenceProofID     string     `json:"fenceProofID"`
+	FenceRequestHash string     `json:"fenceRequestHash"`
+	ClusterID        string     `json:"clusterID"`
+	Voters           []VoterPod `json:"voters"`
+	At               time.Time  `json:"at"`
 }
 type autoIntent struct {
 	Supersedes          string    `json:"supersedes,omitempty"`
@@ -67,6 +80,7 @@ type autoIntent struct {
 	LearnerMissingSince time.Time `json:"learnerMissingSince"`
 	LearnerAttempt      int       `json:"learnerAttempt"`
 	Aborting            bool      `json:"aborting"`
+	RetirementSince     time.Time `json:"retirementSince,omitempty"`
 
 	PreviousSpecHash string         `json:"previousSpecHash,omitempty"`
 	NoQuorumSince    time.Time      `json:"noQuorumSince"`
@@ -281,6 +295,14 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		single.QuorumVerified = false
 		single.Durability = "before-ack"
 		decision, message = DecideAutoRecovery(r.Spec.Policy, single, now, state.SuspectedSince, state.Completions)
+	}
+	if decision == AutoRecover && failed != "" && (state.Identities[failed].WALIdentity == "" || state.Identities[failed].PodUID == "") {
+		// An unknown incarnation cannot authorize online removal. The existing
+		// generation fence covers all authority, including unobserved processes.
+		whole := obs
+		whole.QuorumVerified = false
+		decision, message = DecideAutoRecovery(r.Spec.Policy, whole, now, state.SuspectedSince, state.Completions)
+		failed = ""
 	}
 	if decision == AutoRecover {
 		if c.Fencer == nil {

@@ -28,8 +28,15 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 	}
 	block := func(message string) (bool, error) { return true, c.autoStatus(ctx, r, state, "Blocked", message) }
 	if intent.Aborting {
-		if child.Status.Membership == nil || child.Status.Membership.Phase != "Aborted" {
+		if child.Spec.Membership == nil || !child.Spec.Membership.AbortAddition || child.Spec.Membership.ReplacementPod != intent.LearnerName || hashJSON(child.Spec) != intent.SpecHash || child.Status.Membership == nil || child.Status.Membership.Phase != "Aborted" {
 			return false, nil
+		}
+		request := intent.Request
+		request.Scope = ScopeVoter
+		request.OperationID = fmt.Sprintf("%s-learner-fence-%d", intent.RecoveryName, intent.LearnerAttempt)
+		request.Targets = []FenceTarget{{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}}
+		if _, err := c.fence(ctx, request); err != nil {
+			return block("waiting for failed learner fencing proof")
 		}
 		intent.Aborting = false
 		intent.LearnerAttempt++
@@ -103,23 +110,11 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 	if time.Since(intent.LearnerMissingSince) < time.Duration(intent.Policy.FailureGraceSeconds)*time.Second {
 		return block("replacement remains within retry grace period")
 	}
-	request := intent.Request
-	request.Scope = ScopeVoter
-	request.OperationID = fmt.Sprintf("%s-learner-fence-%d", intent.RecoveryName, intent.LearnerAttempt)
-	request.Targets = []FenceTarget{{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}}
-	// Request fields derive entirely from the persisted failed incarnation. Both
-	// concurrent and delayed calls refer to that same scope, never the next Pod.
-	if _, err := c.fence(ctx, request); err != nil {
-		return block("waiting for failed learner fencing proof")
+	// The child snapshot can precede an in-flight journal reservation. Revoke
+	// its round before physical fencing, which must still precede identity rotation.
+	intent.Aborting = true
+	if intent.RetirementSince.IsZero() {
+		intent.RetirementSince = time.Now().UTC()
 	}
-	if child.Status.Membership != nil && child.Status.Membership.Add != nil {
-		intent.Aborting = true
-		return save("failed learner fenced; reserving explicit addition abort")
-	}
-	intent.LearnerAttempt++
-	intent.LearnerUID = ""
-	intent.LearnerWAL = ""
-	intent.LearnerMissingSince = time.Time{}
-	intent.LearnerName = fmt.Sprintf("%s-learner-%d", intent.RecoveryName, intent.LearnerAttempt)
-	return save("unadmitted failed learner fenced; reserving fresh incarnation")
+	return save("failed learner addition retirement reserved before fencing")
 }

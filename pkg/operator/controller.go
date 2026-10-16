@@ -512,6 +512,13 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if len(ready) < 2 {
 		return c.record(ctx, r, "WaitingReady", "waiting for a matching recovered quorum")
 	}
+	if str(nested(r.Metadata, "annotations", automaticOwner)) != "" {
+		identities, err := c.captureAutomaticTargetIdentities(ctx, r, sts, members, env["RHIZA_ADMIN_TOKEN"])
+		if err != nil {
+			return c.record(ctx, r, "WaitingReady", "automatic target identities are not verified: "+err.Error())
+		}
+		r.Status.TargetIdentities = identities
+	}
 	// Commit completion before releasing ownership. A stale reconciler cannot
 	// mutate a future generation after its annotation changes.
 	r.Status.Stage = "Complete"

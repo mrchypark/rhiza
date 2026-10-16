@@ -55,13 +55,27 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		return block("journaled recovery resource was deleted or recreated")
 	}
 	if intent.Failed != "" && existing.Status.Phase != "Complete" {
-		handled, err := c.maybeEscalateAutomatic(ctx, r, state, version, sts)
-		if handled || err != nil {
+		handled := false
+		if intent.LearnerUID != "" {
+			before := hashJSON(state)
+			var err error
+			handled, err = c.handleAutomaticLearner(ctx, r, state, version, sts, &existing)
+			if err != nil || hashJSON(state) != before {
+				return err
+			}
+		}
+		disposition, err := c.assessAutomaticEscalation(ctx, r, state, version, sts)
+		if err != nil || disposition == automaticEscalationStop || handled {
 			return err
 		}
-		handled, err = c.handleAutomaticLearner(ctx, r, state, version, sts, &existing)
-		if handled || err != nil {
-			return err
+		if disposition == automaticEscalationWait && !intent.Aborting {
+			return nil
+		}
+		if intent.LearnerUID == "" {
+			handled, err = c.handleAutomaticLearner(ctx, r, state, version, sts, &existing)
+			if handled || err != nil {
+				return err
+			}
 		}
 	}
 	desired := Spec{StatefulSet: r.Spec.StatefulSet, Container: r.Spec.Container, SourceClusterID: state.ActiveClusterID, Durability: intent.Durability, RecoveryID: intent.RecoveryName, AllowDataLoss: intent.Policy.AllowDataLoss, AnchorID: r.Spec.AnchorID, Fence: Fence{RecoveryID: intent.RecoveryName, ClusterID: state.ActiveClusterID, StatefulSetUID: state.StatefulSetUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
@@ -135,6 +149,9 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	if child.Status.Phase != "Complete" {
 		return c.autoStatus(ctx, r, state, "Recovering", child.Status.Phase+": "+child.Status.Message)
 	}
+	if err := c.verifyAutomaticCompletion(ctx, r, state, &child, sts); err != nil {
+		return block("completed recovery outcome is invalid: " + err.Error())
+	}
 	if intent.Failed != "" {
 		state.Voters = nil
 		for _, ref := range intent.Voters {
@@ -144,6 +161,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
 		delete(state.Identities, intent.Failed)
+		state.Identities[quepaxa.NodeID(intent.LearnerName)] = FenceTarget{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
 	} else {
 		if child.Status.Target == "" || child.Status.Stage != "Complete" {
 			return block("target generation is not confirmed complete")
@@ -154,10 +172,10 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		state.ActiveClusterID = child.Status.Target
 		state.Voters = append([]VoterPod(nil), r.Spec.VoterPods...)
 		state.Identities = map[quepaxa.NodeID]FenceTarget{}
-	}
-	obs, _, err := c.observeAutomatic(ctx, r, state, sts)
-	if err != nil || !obs.QuorumVerified || obs.Reachable < 2 {
-		return block("authenticated target quorum is not verified")
+		for _, identity := range child.Status.TargetIdentities {
+			id := quepaxa.NodeID(identity.NodeID)
+			state.Identities[id] = identity
+		}
 	}
 	now := time.Now().UTC()
 	recent := []time.Time{now}
@@ -167,6 +185,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 	}
 	state.Completions = recent
+	state.Completed = &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
 	state.SuspectedSince = time.Time{}
 	state.Intent = nil
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
