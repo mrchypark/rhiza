@@ -67,9 +67,9 @@ func run(ctx context.Context, namespace string, poll time.Duration) error {
 
 	if os.Getenv("RHIZA_AUTOMATIC_RECOVERY") == "true" {
 		backend := os.Getenv("RHIZA_FENCER_BACKEND")
-		if backend == "kubernetes" {
+		if backend == "" || backend == "kubernetes" {
 			controller.Fencer = &operator.KubernetesFencer{Kube: kube}
-		} else if backend == "" || backend == "http" {
+		} else if backend == "http" {
 			endpoint, tokenFile := os.Getenv("RHIZA_FENCER_URL"), os.Getenv("RHIZA_FENCER_TOKEN_FILE")
 			if endpoint == "" || tokenFile == "" {
 				return fmt.Errorf("automatic recovery requires RHIZA_FENCER_URL and RHIZA_FENCER_TOKEN_FILE")

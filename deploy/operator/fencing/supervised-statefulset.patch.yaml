@@ -1,0 +1,65 @@
+# Strategic-merge patch for a NEW generation, never an in-place enrollment of
+# an already running/unregistered generation. Supply the normal no-PVC base.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rhiza
+  namespace: rhiza
+spec:
+  template:
+    metadata:
+      annotations:
+        rhiza.mrchypark.dev/cooperative-fencing: "1"
+    spec:
+      serviceAccountName: rhiza-supervised
+      automountServiceAccountToken: false
+      hostPID: false
+      shareProcessNamespace: false
+      containers:
+        - name: rhiza
+          command: [/usr/local/bin/rhiza-fencer]
+          args: [supervise, --, /usr/local/bin/rhiza]
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: FENCER_AUTHORITY_URL
+              value: https://rhiza-fencer:9444/v1/supervisor
+            - name: FENCER_CA_FILE
+              value: /fencer-ca/ca.crt
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: fence-socket
+              mountPath: /run/rhiza-fencer
+            - name: fence-token
+              mountPath: /var/run/secrets/rhiza-fencer
+              readOnly: true
+            - name: fence-ca
+              mountPath: /fencer-ca
+              readOnly: true
+      volumes:
+        - name: fence-socket
+          emptyDir: {}
+        - name: fence-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: rhiza-fencer
+                  expirationSeconds: 600
+        - name: fence-ca
+          configMap:
+            name: rhiza-fencer-ca
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-supervised
+  namespace: rhiza
+automountServiceAccountToken: false
+# No RoleBinding: application identities cannot mutate ledgers or fence status.

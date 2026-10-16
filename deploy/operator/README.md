@@ -3,6 +3,11 @@
 For Go or Rust applications embedding Rhiza, see the dedicated
 [embedded application integration guide](../../docs/embedded-operator.md).
 
+For the default provider-neutral cooperative executor, its startup contract,
+installation, and hard-crash limitations, see
+[Kubernetes fencing](../../docs/kubernetes-fencing.md). Installing the operator
+alone still does not install a runtime fencing authority.
+
 These manifests deploy a namespace-scoped controller for `RhizaRecovery`
 and opt-in automatic recovery through `RhizaCluster`.
 It monitors an **existing three-voter StatefulSet**. It does not create a
