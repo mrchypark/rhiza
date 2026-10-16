@@ -542,7 +542,7 @@ func qualify(ctx context.Context) error {
 func verifyScratch(sts obj) error {
 	spec := nested(sts, "spec", "template", "spec")
 	containers, _ := nested(spec, "containers").([]any)
-	if len(containers) != 1 || nested(containers[0], "securityContext", "readOnlyRootFilesystem") != true || nested(containers[0], "securityContext", "allowPrivilegeEscalation") != false || nested(spec, "hostPID") != false || nested(spec, "shareProcessNamespace") != false {
+	if len(containers) != 1 || nested(containers[0], "securityContext", "readOnlyRootFilesystem") != true || nested(containers[0], "securityContext", "allowPrivilegeEscalation") != false || !disabledPodOption(spec, "hostPID") || !disabledPodOption(spec, "shareProcessNamespace") {
 		return fmt.Errorf("applied supervised workload security differs")
 	}
 	mounts, _ := nested(containers[0], "volumeMounts").([]any)
@@ -558,6 +558,16 @@ func verifyScratch(sts obj) error {
 		}
 	}
 	return fmt.Errorf("applied checkpoint restore lacks writable /tmp emptyDir")
+}
+
+func disabledPodOption(spec any, key string) bool {
+	fields, ok := spec.(map[string]any)
+	if !ok {
+		return false
+	}
+	value, present := fields[key]
+	// Kubernetes omits default-false Pod fields when serializing API objects.
+	return !present || value == false
 }
 
 func readMembership(ctx context.Context, f *forward) (network.MembershipStatus, error) {

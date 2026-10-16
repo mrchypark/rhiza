@@ -111,6 +111,44 @@ func TestFixtureRestoreHasWritableTmpWithReadOnlyRoot(t *testing.T) {
 	}
 }
 
+func TestScratchAcceptsAPIOmittedFalsePIDOptionsOnly(t *testing.T) {
+	// Matches API serialization: default-false hostPID is omitted, not emitted
+	// as false; all nondefault security and scratch-volume fields are retained.
+	apiJSON := `{"spec":{"template":{"spec":{"containers":[{"securityContext":{"readOnlyRootFilesystem":true,"allowPrivilegeEscalation":false},"volumeMounts":[{"name":"temporary","mountPath":"/tmp"}]}],"volumes":[{"name":"temporary","emptyDir":{}}]}}}}`
+	var sts obj
+	if err := json.Unmarshal([]byte(apiJSON), &sts); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyScratch(sts); err != nil {
+		t.Fatalf("API-omitted false PID options rejected: %v", err)
+	}
+	spec := nested(sts, "spec", "template", "spec").(obj)
+	for _, key := range []string{"hostPID", "shareProcessNamespace"} {
+		spec[key] = false
+		if err := verifyScratch(sts); err != nil {
+			t.Fatalf("explicit false %s rejected: %v", key, err)
+		}
+		for _, malformed := range []any{true, "false", float64(0), nil, []any{}} {
+			spec[key] = malformed
+			if verifyScratch(sts) == nil {
+				t.Fatalf("accepted enabled/malformed %s=%#v", key, malformed)
+			}
+		}
+		delete(spec, key)
+	}
+	containers := spec["containers"].([]any)
+	security := nested(containers[0], "securityContext").(obj)
+	security["readOnlyRootFilesystem"] = false
+	if verifyScratch(sts) == nil {
+		t.Fatal("accepted writable root while tolerating omitted PID defaults")
+	}
+	security["readOnlyRootFilesystem"] = true
+	delete(security, "allowPrivilegeEscalation")
+	if verifyScratch(sts) == nil {
+		t.Fatal("accepted missing explicit privilege-escalation guard")
+	}
+}
+
 func TestGenerationProofRejectsUnrelatedAuthorityBeforeReadingLedger(t *testing.T) {
 	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "chaos-source", OperationID: "operation", Scope: operator.ScopeGeneration}
 	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(request))), ProofID: "cooperative-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
