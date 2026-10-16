@@ -38,6 +38,18 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		if _, err := c.fence(ctx, request); err != nil {
 			return block("waiting for failed learner fencing proof")
 		}
+		entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: intent.Request.OperationID, Target: request.Targets[0]}
+		for _, old := range state.Learners {
+			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
+				entry.CredentialUID = old.CredentialUID
+			}
+		}
+		if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" && entry.CredentialUID == "" {
+			return block("supervised learner retirement lacks durable creation history")
+		}
+		if err := rememberLearner(state, entry); err != nil {
+			return block(err.Error())
+		}
 		intent.Aborting = false
 		intent.LearnerAttempt++
 		intent.LearnerUID = ""
@@ -60,6 +72,13 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		intent.LearnerUID = str(nested(pod, "metadata", "uid"))
 		if intent.LearnerUID == "" {
 			return block("replacement Pod UID is unavailable")
+		}
+		entry, err := c.learnerInventoryEntry(ctx, state, sts, pod)
+		if err != nil {
+			return block(err.Error())
+		}
+		if err := rememberLearner(state, entry); err != nil {
+			return block(err.Error())
 		}
 		return save("replacement Pod identity persisted before membership dispatch")
 	}
@@ -90,6 +109,13 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 				}
 				if intent.LearnerWAL == "" {
 					intent.LearnerWAL = status.WALIdentity
+					entry, err := c.learnerInventoryEntry(ctx, state, sts, pod)
+					if err != nil {
+						return block(err.Error())
+					}
+					if err := rememberLearner(state, entry); err != nil {
+						return block(err.Error())
+					}
 					return save("replacement WAL identity authenticated")
 				}
 				available = true

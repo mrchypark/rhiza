@@ -164,6 +164,27 @@ not evidence silently supplied by this cooperative default.
 
 ## Verification scope
 
+### Learner cleanup evidence
+
+The automatic control journal retains each learner's source generation, creation
+operation, immutable credential UID, Pod UID and authenticated WAL identity,
+including retired learners and learners promoted during earlier incidents.
+Generation requests freeze this inventory before fencing. A Pod created before
+the journal CAS completes is strictly rediscovered and journaled in a separate
+reconcile before escalation; conflicting ownership blocks recovery.
+
+Cleanup follows a validated full-generation proof, never a Pod deletion as proof.
+An empty WAL is not a wildcard: only an exact cooperative ledger snapshot whose
+hash matches the proof, whose generation closure is complete, and whose every
+run for that Pod is a verified never-bound exit permits this case. External HTTPS
+proofs retain their existing bound-incarnation contract; they do not implicitly
+authorize never-bound cleanup. Operator RBAC already includes ConfigMap `get`.
+History is discarded only after full cleanup and verified target installation,
+not after an online replacement within the same generation. Preexisting journals
+that discarded a retired learner's identity cannot reconstruct that authority
+from Pod absence or mutate an already issued fence request; they remain blocked
+and require independently verified recovery.
+
 Package tests cover identity, receipt ordering, CAS races, immutable evidence,
 restart uncertainty, and voter-to-generation escalation. Linux Kubernetes
 qualification must exercise the real supervisor/authority and physical storage

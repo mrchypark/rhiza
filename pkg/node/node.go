@@ -380,7 +380,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
-		bucket, bucketErr := objectstore.NewBucketWithContext(ctx, objectstore.Config{
+		newBucket := objectstore.NewBucketWithContext
+		if n.fenceSession != nil {
+			newBucket = objectstore.NewBucketForSupervisedStartup
+		}
+		bucket, bucketErr := newBucket(ctx, objectstore.Config{
 			Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
 			Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
 			Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,

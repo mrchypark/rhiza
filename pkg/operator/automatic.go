@@ -58,8 +58,17 @@ type autoControl struct {
 	Completions     []time.Time                    `json:"completions,omitempty"`
 	Sequence        uint64                         `json:"sequence"`
 
-	Intent    *autoIntent     `json:"intent,omitempty"`
-	Completed *autoCompletion `json:"completed,omitempty"`
+	Intent    *autoIntent          `json:"intent,omitempty"`
+	Completed *autoCompletion      `json:"completed,omitempty"`
+	Learners  []learnerIncarnation `json:"learners,omitempty"`
+}
+
+// Keep retired learners until their source generation is fully replaced.
+type learnerIncarnation struct {
+	SourceClusterID string      `json:"sourceClusterID"`
+	OperationID     string      `json:"operationID"`
+	CredentialUID   string      `json:"credentialUID"`
+	Target          FenceTarget `json:"target"`
 }
 
 // autoCompletion records an installed outcome, independently of later health.
@@ -336,6 +345,8 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		}
 		if failed != "" {
 			request.Scope = "Voter"
+		} else if err := includeLearnerHistory(state, &request); err != nil {
+			return block(state, err.Error())
 		}
 		state.Intent = &autoIntent{Request: request, Policy: r.Spec.Policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), Failed: failed, RecoveryName: name, LearnerName: name + "-learner"}
 	}

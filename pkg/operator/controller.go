@@ -631,16 +631,43 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 	if err := validateFenceProof(intent.Request, intent.Proof); err != nil {
 		return err
 	}
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		return err
+	}
 	for _, pod := range candidates {
 		name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
 		bound := false
+		var fencedTarget FenceTarget
 		for _, target := range intent.Request.Targets {
-			if target.Pod == name && target.NodeID == name && target.PodUID == uid && uid != "" && target.WALIdentity != "" {
-				bound = true
+			if target.Pod == name && target.NodeID == name && target.PodUID == uid && uid != "" {
+				if fencedTarget.Pod != "" {
+					return fmt.Errorf("duplicate learner fence target")
+				}
+				fencedTarget = target
+				bound = target.WALIdentity != ""
+				if !bound {
+					if err := c.verifyNeverBoundCleanup(ctx, intent.Request, intent.Proof, target); err != nil {
+						return err
+					}
+					bound = true
+				}
 			}
 		}
 		if !bound {
 			return fmt.Errorf("standalone learner is outside the fenced incarnation inventory")
+		}
+		seen := false
+		for _, entry := range state.Learners {
+			if entry.SourceClusterID != r.Spec.SourceClusterID || entry.Target.Pod != name {
+				continue
+			}
+			if seen || entry.Target != fencedTarget || entry.OperationID != nested(pod, "metadata", "annotations", ownerAnnotation) || entry.CredentialUID != nested(pod, "metadata", "annotations", fencingCredentialAnnotation) {
+				return fmt.Errorf("learner cleanup creation history differs")
+			}
+			seen = true
+		}
+		if fencedTarget.WALIdentity == "" && !seen {
+			return fmt.Errorf("never-bound learner lacks durable creation history")
 		}
 		if err := validateSupervisedPod(pod); err != nil {
 			return err
