@@ -64,20 +64,30 @@ func WithReplayObservation(ctx context.Context) context.Context {
 // NewBucket creates a metered bucket with supplemental replay grouping
 // disabled. S3 HTTP request and retry-metadata counters are unchanged.
 func NewBucket(cfg Config) (*MeteredBucket, error) {
-	return newBucket(cfg, false)
+	return newBucket(cfg, false, false)
 }
 
 // NewBucketWithContext uses ctx only to select explicitly requested
 // measurement observers. It does not pass ctx to the underlying provider.
 func NewBucketWithContext(ctx context.Context, cfg Config) (*MeteredBucket, error) {
+	return newBucketWithContext(ctx, cfg, false)
+}
+
+// NewBucketForSupervisedStartup forbids remote provisioning before WAL admission.
+// Azure containers must already exist; ordinary startup retains auto-creation.
+func NewBucketForSupervisedStartup(ctx context.Context, cfg Config) (*MeteredBucket, error) {
+	return newBucketWithContext(ctx, cfg, true)
+}
+
+func newBucketWithContext(ctx context.Context, cfg Config, supervised bool) (*MeteredBucket, error) {
 	var observeReplay bool
 	if ctx != nil {
 		observeReplay, _ = ctx.Value(replayObservationContextKey{}).(bool)
 	}
-	return newBucket(cfg, observeReplay && cfg.Provider != ProviderFilesystem)
+	return newBucket(cfg, observeReplay && cfg.Provider != ProviderFilesystem, supervised)
 }
 
-func newBucket(cfg Config, observeReplay bool) (*MeteredBucket, error) {
+func newBucket(cfg Config, observeReplay, supervised bool) (*MeteredBucket, error) {
 	if err := ValidateConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -102,6 +112,9 @@ func newBucket(cfg Config, observeReplay bool) (*MeteredBucket, error) {
 			"rhiza", func(next http.RoundTripper) http.RoundTripper { return metrics.transport(next) })
 	case ProviderAzure:
 		providerConfig := azure.DefaultConfig
+		if supervised {
+			providerConfig.StorageCreateContainer = false
+		}
 		providerConfig.AzTenantID, providerConfig.ClientID, providerConfig.ClientSecret = cfg.AzureTenantID, cfg.AzureClientID, cfg.AzureClientSecret
 		providerConfig.StorageAccountName, providerConfig.StorageAccountKey = cfg.AzureStorageAccount, cfg.AzureStorageAccountKey
 		providerConfig.StorageConnectionString, providerConfig.ContainerName = cfg.AzureConnectionString, cfg.Bucket

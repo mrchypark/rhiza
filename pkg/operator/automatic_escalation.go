@@ -141,6 +141,9 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "certified archive unavailable for escalation")
 	}
 	state.Sequence++
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		return automaticEscalationStop, err
+	}
 	name := "auto-" + shortID(state.BindingUID+":"+fmt.Sprint(state.Sequence))
 	request := intent.Request
 	request.OperationID = name
@@ -154,6 +157,9 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	}
 	if intent.LearnerUID != "" {
 		request.Targets = append(request.Targets, FenceTarget{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL})
+	}
+	if err := includeLearnerHistory(state, &request); err != nil {
+		return automaticEscalationStop, err
 	}
 	superseded := intent.RecoveryName + "-" + hashJSON(intent)
 	if err := c.immutable(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, r.Spec.LogicalID, "superseded", superseded+".json"), jsonBytes(intent)); err != nil {

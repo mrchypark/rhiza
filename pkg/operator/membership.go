@@ -134,8 +134,8 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 	if err := c.Kube.Get(ctx, c.corePath("pods", m.ReplacementPod), &replacement); err != nil {
 		return c.recordMembership(ctx, r, "Blocked", "replacement learner workload is unavailable")
 	}
-	if ownedBy(replacement, str(nested(sts, "metadata", "uid"))) || str(nested(replacement, "metadata", "uid")) == "" || nested(replacement, "metadata", "deletionTimestamp") != nil {
-		return c.recordMembership(ctx, r, "Blocked", "replacement learner workload is unavailable")
+	if err := c.validateMembershipReplacement(ctx, r, sts, replacement); err != nil {
+		return c.recordMembership(ctx, r, "Blocked", err.Error())
 	}
 	endpoint, err := podEndpoint(replacement, r.Spec.Container, "/membership/status")
 	if err != nil {
@@ -233,6 +233,30 @@ func (c *Controller) membershipPods(ctx context.Context, refs []VoterPod) (map[q
 	}
 	return pods, nil
 }
+func (c *Controller) validateMembershipReplacement(ctx context.Context, r *Resource, sts, pod object) error {
+	if str(nested(pod, "metadata", "uid")) == "" || nested(pod, "metadata", "deletionTimestamp") != nil {
+		return fmt.Errorf("replacement learner workload is unavailable")
+	}
+	uid := str(nested(sts, "metadata", "uid"))
+	if !ownedBy(pod, uid) && str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) == "" {
+		return nil
+	}
+	// Inventory ownership is not controller ownership, but only a bound supervised learner may use it.
+	refs := list(nested(pod, "metadata", "ownerReferences"))
+	if len(refs) != 1 {
+		return fmt.Errorf("replacement learner inventory owner differs")
+	}
+	owner := asObject(refs[0])
+	root := str(nested(r.Metadata, "annotations", automaticOwner))
+	if uid == "" || owner["apiVersion"] != "apps/v1" || owner["kind"] != "StatefulSet" || owner["name"] != r.Spec.StatefulSet || owner["uid"] != uid || owner["controller"] != false || str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" || root == "" || nested(pod, "metadata", "annotations", fencingRootAnnotation) != root || nested(pod, "metadata", "annotations", ownerAnnotation) != r.Spec.Membership.OperationID || r.Spec.Membership.ReplacementSecret != r.Spec.Membership.ReplacementPod+"-credentials" {
+		return fmt.Errorf("replacement learner inventory binding differs")
+	}
+	if err := validateSupervisedPod(pod); err != nil {
+		return err
+	}
+	return (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, r.Spec.StatefulSet)
+}
+
 func ownedBy(pod object, uid string) bool {
 	for _, ref := range list(nested(pod, "metadata", "ownerReferences")) {
 		if str(asObject(ref)["uid"]) == uid {

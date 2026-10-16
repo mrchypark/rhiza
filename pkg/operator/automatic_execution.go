@@ -55,6 +55,9 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		return block("journaled recovery resource was deleted or recreated")
 	}
 	if intent.Failed != "" && existing.Status.Phase != "Complete" {
+		if handled, err := c.recoverLearnerInventory(ctx, r, state, version, sts); handled || err != nil {
+			return err
+		}
 		handled := false
 		if intent.LearnerUID != "" {
 			before := hashJSON(state)
@@ -170,6 +173,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			return err
 		}
 		state.ActiveClusterID = child.Status.Target
+		state.Learners = nil // Verified full cleanup and installed target retire the old generation.
 		state.Voters = append([]VoterPod(nil), r.Spec.VoterPods...)
 		state.Identities = map[quepaxa.NodeID]FenceTarget{}
 		for _, identity := range child.Status.TargetIdentities {

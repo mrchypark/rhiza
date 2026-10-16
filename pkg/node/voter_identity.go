@@ -89,7 +89,7 @@ func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 
 // ensureVoterIdentity runs before any archive replay or peer listener. An
 // archive contains decided values, not the lost voter's outstanding promises.
-func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool) error {
+func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite ...func(context.Context, string) error) error {
 	want := voterIdentityFor(config)
 	bound, hasBinding := wal.Identity()
 	if local.identity != nil {
@@ -170,6 +170,15 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 		want.Nonce = hex.EncodeToString(nonce[:])
 		local.identity = &want
 		if err := writeVoterIdentity(config.DataDir, want); err != nil {
+			return err
+		}
+	}
+	if len(beforeWrite) != 0 {
+		nonce, _ := hex.DecodeString(local.identity.Nonce)
+		if err := wal.BindIdentity(nonce); err != nil {
+			return err
+		}
+		if err := beforeWrite[0](ctx, local.identity.Nonce); err != nil {
 			return err
 		}
 	}
