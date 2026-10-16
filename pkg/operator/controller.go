@@ -273,6 +273,9 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			return err
 		}
 		if len(pods) > 0 {
+			if err := c.deleteFencedLearners(ctx, r, s.stateful, pods); err != nil {
+				return c.record(ctx, r, "Blocked", "fenced standalone learner cleanup: "+err.Error())
+			}
 			return c.record(ctx, r, "Recovering", "waiting for source StatefulSet Pods to terminate after external fence")
 		}
 		r.Status.Stage = "Starting"
@@ -591,6 +594,68 @@ func (c *Controller) ownedPods(ctx context.Context, uid string) ([]object, error
 	}
 	return owned, nil
 }
+
+func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts object, pods []object) error {
+	root := str(nested(r.Metadata, "annotations", automaticOwner))
+	logical := str(nested(r.Metadata, "annotations", automaticLogical))
+	if root == "" || !identifier.MatchString(logical) {
+		return nil
+	}
+	var candidates []object
+	for _, pod := range pods {
+		name := str(nested(pod, "metadata", "name"))
+		refs := list(nested(pod, "metadata", "ownerReferences"))
+		if len(refs) != 1 || nested(pod, "metadata", "deletionTimestamp") != nil || nested(pod, "metadata", "annotations", fencingRootAnnotation) != root || nested(pod, "metadata", "labels", "rhiza.mrchypark.dev/automatic-learner") != name {
+			continue
+		}
+		owner := asObject(refs[0])
+		if !identifier.MatchString(name) || owner["controller"] != false || owner["apiVersion"] != "apps/v1" || owner["kind"] != "StatefulSet" || owner["name"] != r.Spec.StatefulSet || owner["uid"] != r.Status.StatefulSetUID || nested(sts, "metadata", "uid") != r.Status.StatefulSetUID {
+			continue
+		}
+		candidates = append(candidates, pod)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	state, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+	if err != nil {
+		return err
+	}
+	intent := state.Intent
+	if state.BindingUID != root || state.StatefulSetUID != r.Status.StatefulSetUID || state.ActiveClusterID != r.Spec.SourceClusterID || intent == nil || intent.RecoveryUID != str(r.Metadata["uid"]) || intent.RecoveryName != resourceName(r) || intent.SpecHash != hashJSON(r.Spec) || intent.Request.Scope != ScopeGeneration || intent.Request.BindingUID != root || intent.Request.Namespace != c.Kube.Namespace || intent.Request.StatefulSet != r.Spec.StatefulSet || intent.Request.StatefulSetUID != r.Status.StatefulSetUID || intent.Request.SourceClusterID != r.Spec.SourceClusterID || intent.Request.OperationID != r.Spec.RecoveryID || intent.Proof == nil || intent.Proof.ProofID != r.Spec.Fence.Evidence {
+		return fmt.Errorf("generation cleanup differs from authorized fencing intent")
+	}
+	if err := validateFence(r.Spec.Fence, r.Spec.RecoveryID, r.Spec.SourceClusterID, r.Status.StatefulSetUID); err != nil {
+		return err
+	}
+	if err := validateFenceProof(intent.Request, intent.Proof); err != nil {
+		return err
+	}
+	for _, pod := range candidates {
+		name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
+		bound := false
+		for _, target := range intent.Request.Targets {
+			if target.Pod == name && target.NodeID == name && target.PodUID == uid && uid != "" && target.WALIdentity != "" {
+				bound = true
+			}
+		}
+		if !bound {
+			return fmt.Errorf("standalone learner is outside the fenced incarnation inventory")
+		}
+		if err := validateSupervisedPod(pod); err != nil {
+			return err
+		}
+		if err := (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, r.Spec.StatefulSet); err != nil {
+			return err
+		}
+		// Deletion is cleanup after fencing, never evidence of termination.
+		if err := c.Kube.Delete(ctx, c.corePath("pods", name), uid); err != nil && !apiNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func podEndpoint(pod object, containerName, endpoint string) (string, error) {
 	ip := str(nested(pod, "status", "podIP"))
 	if net.ParseIP(ip) == nil {

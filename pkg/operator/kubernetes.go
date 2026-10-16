@@ -93,6 +93,13 @@ func (k *Kubernetes) Post(ctx context.Context, apiPath string, value any, out an
 	return k.request(ctx, http.MethodPost, apiPath, value, out)
 }
 
+func (k *Kubernetes) Delete(ctx context.Context, apiPath, uid string) error {
+	if uid == "" {
+		return fmt.Errorf("Kubernetes deletion requires an exact UID")
+	}
+	return k.request(ctx, http.MethodDelete, apiPath, object{"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": object{"uid": uid}}, nil)
+}
+
 func (k *Kubernetes) request(ctx context.Context, method, apiPath string, value any, out any) error {
 	target, err := k.targetURL(apiPath)
 	if err != nil {

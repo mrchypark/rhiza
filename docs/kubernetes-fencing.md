@@ -82,6 +82,13 @@ does not stop surviving voters. A later generation fence preserves immutable
 prior stop receipts and may reuse completed proof. A prior pending stop still
 has to finish; escalation does not replace its evidence with a fresh tracker.
 
+After a verified whole-generation fence, the operator scales the StatefulSet
+to zero and cleans up supervised standalone learners from the exact fenced
+incarnation inventory using UID-preconditioned Pod deletion. The operator's
+namespaced Pod role therefore includes `delete`; it does not force-delete nodes
+or treat a deletion response as fencing proof. All source inventory must still
+disappear before the new generation can start.
+
 ## Installation
 
 Use the same versioned/digest-pinned images for server, supervisor, and authority.
