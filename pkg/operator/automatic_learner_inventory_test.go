@@ -231,6 +231,20 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			absent := false
 			deleted := map[string]string{}
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+				if q.URL.Path == c.resourcePath(resourceName(recovery))+"/status" {
+					if q.Method != http.MethodPut {
+						t.Errorf("unexpected status method %s", q.Method)
+						w.WriteHeader(http.StatusMethodNotAllowed)
+						return
+					}
+					if err := json.NewDecoder(q.Body).Decode(recovery); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(recovery)
+					return
+				}
 				if q.URL.Path == (&FencingExecutor{Kube: c.Kube}).ledgerPath(request.StatefulSetUID, request.SourceClusterID) {
 					_ = json.NewEncoder(w).Encode(object{"data": object{"ledger.json": string(jsonBytes(ledger))}})
 					return

@@ -15,10 +15,12 @@ func TestAzureSupervisedConstructorDoesNotProvisionBeforeWALBind(t *testing.T) {
 	var properties, creates atomic.Int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodHead:
+		case http.MethodGet, http.MethodHead:
 			properties.Add(1)
 			w.Header().Set("x-ms-error-code", "ContainerNotFound")
+			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`<Error><Code>ContainerNotFound</Code><Message>not found</Message></Error>`))
 		case http.MethodPut:
 			creates.Add(1)
 			// The real SDK sent the mutation; lose its response rather than
