@@ -217,7 +217,8 @@ peer의 Ready/Quorum과 상태 메시지를 확인한다.
 
 자동 복구는 [Operator 배포 안내](../deploy/operator/README.md#automatic-recovery-with-kubernetes-fencing)의
 `RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`로 켜며 모든 voter의
-opt-in이 필요하다. executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
+opt-in이 필요하다. 각 voter 프로세스에 `RHIZA_ENABLE_RECONFIGURATION=true`를 명시적으로 설정한다.
+executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
 command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
 
 ## 5. 두 개 또는 전체 Pod 유실 후 복구

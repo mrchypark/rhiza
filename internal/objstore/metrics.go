@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	minio "github.com/minio/minio-go/v7"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
 
@@ -66,6 +68,7 @@ type Stats struct {
 }
 
 type bucketMetrics struct {
+	mutations                                                       mutationDrain
 	uploads, gets, lists, heads, deletes                            atomic.Uint64
 	failures                                                        atomic.Uint64
 	bytesUploaded, bytesDownloaded                                  atomic.Uint64
@@ -301,6 +304,11 @@ func (b *MeteredBucket) Stats() Stats {
 }
 
 func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
+	if err := b.metrics.mutations.begin(); err != nil {
+		return err
+	}
+	known := false
+	defer func() { b.metrics.mutations.end(known) }()
 	b.metrics.uploads.Add(1)
 	ctx, operation := b.metrics.beginReplayOperation(ctx)
 	defer finishReplayOperation(operation)
@@ -308,6 +316,7 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 	size, sizeErr := counted.ObjectSize()
 	ctx = withExpectedCondition(ctx, opts...)
 	err := b.Bucket.Upload(ctx, name, countingReaderWithCapabilities(counted, reader), opts...)
+	known = err == nil || b.Bucket.IsConditionNotMetErr(err) || conditionalS3Conflict(ctx, err)
 	if err == nil {
 		if sizeErr == nil {
 			b.metrics.bytesPublished.Add(uint64(size))
@@ -324,6 +333,14 @@ func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reade
 	}
 	b.record(err)
 	return err
+}
+
+func conditionalS3Conflict(ctx context.Context, err error) bool {
+	if !expectsCondition(ctx) {
+		return false
+	}
+	var response minio.ErrorResponse
+	return errors.As(err, &response) && response.StatusCode == http.StatusConflict && response.Code == "ConditionalRequestConflict"
 }
 
 func (b *MeteredBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -410,10 +427,16 @@ func (b *MeteredBucket) Attributes(ctx context.Context, name string) (thanosobjs
 }
 
 func (b *MeteredBucket) Delete(ctx context.Context, name string) error {
+	if err := b.metrics.mutations.begin(); err != nil {
+		return err
+	}
+	known := false
+	defer func() { b.metrics.mutations.end(known) }()
 	b.metrics.deletes.Add(1)
 	ctx, operation := b.metrics.beginReplayOperation(ctx)
 	defer finishReplayOperation(operation)
 	err := b.Bucket.Delete(ctx, name)
+	known = err == nil || b.Bucket.IsObjNotFoundErr(err) || b.Bucket.IsConditionNotMetErr(err)
 	b.record(err)
 	return err
 }
@@ -426,6 +449,12 @@ func (b *MeteredBucket) record(err error) {
 
 func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 	return roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		mutating := request.Method != http.MethodGet && request.Method != http.MethodHead && request.Method != http.MethodOptions
+		if mutating {
+			if err := m.mutations.begin(); err != nil {
+				return nil, err
+			}
+		}
 		m.httpRequests.Add(1)
 		if m.replayGroupingEnabled {
 			if operation := replayOperationFromContext(request.Context()); operation != nil {
@@ -462,9 +491,22 @@ func (m *bucketMetrics) transport(next http.RoundTripper) http.RoundTripper {
 		}
 		response, err := next.RoundTrip(request)
 		if err != nil {
+			if mutating {
+				m.mutations.end(false)
+			}
 			m.transportFailures.Add(1)
 			m.httpFailures.Add(1)
 			return response, err
+		}
+		// A server error can follow acceptance. Keep this attempt unresolved even
+		// when the SDK retries the logical operation successfully.
+		known := response.StatusCode < 500 && response.StatusCode != http.StatusRequestTimeout && response.StatusCode != http.StatusAccepted
+		if mutating {
+			if response.Body == nil || response.Body == http.NoBody || response.StatusCode >= 400 {
+				m.mutations.end(known)
+			} else {
+				response.Body = &mutationResponse{ReadCloser: response.Body, drain: &m.mutations, known: known, expected: response.ContentLength}
+			}
 		}
 		statusFailure := false
 		switch {

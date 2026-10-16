@@ -90,15 +90,15 @@ func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error
 		if m.AbortAddition {
 			return nil
 		}
-		if journal.Add == nil || expected.ConfigID != journal.Add.ExpectedConfigID || expected.AbortSlot <= journal.Add.ExpectedAbortSlot {
-			return blocked("journaled addition abort is not confirmed by the current membership status")
+		if journal.Add != nil && (expected.ConfigID != journal.Add.ExpectedConfigID || expected.AbortSlot <= journal.Add.ExpectedAbortSlot) {
+			return c.recordMembership(ctx, r, "Aborted", "waiting for the journaled addition abort revision to reach surviving voters")
 		}
 		journal.Add, journal.Phase = nil, "Adding"
 		return c.recordMembership(ctx, r, "Adding", "aborted addition reset before replacement dispatch")
 	}
 	if m.AbortAddition {
 		if journal.Add == nil {
-			return blocked("addition is not journaled; abort is unavailable")
+			return c.recordMembership(ctx, r, "Aborted", "retirement acknowledged before any addition was journaled")
 		}
 		return c.abortMembership(ctx, r, pods, statuses, admin, expected)
 	}
@@ -134,8 +134,8 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 	if err := c.Kube.Get(ctx, c.corePath("pods", m.ReplacementPod), &replacement); err != nil {
 		return c.recordMembership(ctx, r, "Blocked", "replacement learner workload is unavailable")
 	}
-	if ownedBy(replacement, str(nested(sts, "metadata", "uid"))) || str(nested(replacement, "metadata", "uid")) == "" || nested(replacement, "metadata", "deletionTimestamp") != nil {
-		return c.recordMembership(ctx, r, "Blocked", "replacement learner workload is unavailable")
+	if err := c.validateMembershipReplacement(ctx, r, sts, replacement); err != nil {
+		return c.recordMembership(ctx, r, "Blocked", err.Error())
 	}
 	endpoint, err := podEndpoint(replacement, r.Spec.Container, "/membership/status")
 	if err != nil {
@@ -186,11 +186,29 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 
 func (c *Controller) abortMembership(ctx context.Context, r *Resource, pods map[quepaxa.NodeID]object, statuses map[quepaxa.NodeID]network.MembershipStatus, admin string, current network.MembershipStatus) error {
 	add := r.Status.Membership.Add
+	if current.ConfigID == add.ExpectedConfigID+1 {
+		if err := c.confirmRetiredMembershipCommit(ctx, r, statuses, current); err != nil {
+			return c.recordMembership(ctx, r, "Blocked", err.Error())
+		}
+		return c.recordMembership(ctx, r, "Complete", "journaled addition already committed; failed voter identity retained for the next recovery")
+	}
 	if current.ConfigID != add.ExpectedConfigID || current.AbortSlot < add.ExpectedAbortSlot {
 		return c.recordMembership(ctx, r, "Blocked", "live membership does not match the journaled addition for abort")
 	}
 	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: r.Spec.SourceClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot}
 	if err := c.membershipMutation(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, "/membership/abort", request); err != nil {
+		// A journal can survive a crash before dispatch. Replaying its exact
+		// request establishes the round that the next abort must resolve.
+		if !current.Pending && current.AbortSlot == add.ExpectedAbortSlot {
+			frozen, bindErr := c.retiringMembershipRequest(ctx, r)
+			if bindErr != nil {
+				return c.recordMembership(ctx, r, "Blocked", bindErr.Error())
+			}
+			if dispatchErr := c.changeMembership(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, frozen); dispatchErr != nil {
+				return c.recordMembership(ctx, r, "Aborting", "retiring addition remains unresolved: "+dispatchErr.Error())
+			}
+			return c.recordMembership(ctx, r, "Aborting", "journaled addition replayed; waiting to resolve commit or abort")
+		}
 		return c.recordMembership(ctx, r, "Aborting", "abort request remains pending: "+err.Error())
 	}
 	return c.recordMembership(ctx, r, "Aborted", "journaled addition aborted by surviving quorum")
@@ -215,6 +233,30 @@ func (c *Controller) membershipPods(ctx context.Context, refs []VoterPod) (map[q
 	}
 	return pods, nil
 }
+func (c *Controller) validateMembershipReplacement(ctx context.Context, r *Resource, sts, pod object) error {
+	if str(nested(pod, "metadata", "uid")) == "" || nested(pod, "metadata", "deletionTimestamp") != nil {
+		return fmt.Errorf("replacement learner workload is unavailable")
+	}
+	uid := str(nested(sts, "metadata", "uid"))
+	if !ownedBy(pod, uid) && str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) == "" {
+		return nil
+	}
+	// Inventory ownership is not controller ownership, but only a bound supervised learner may use it.
+	refs := list(nested(pod, "metadata", "ownerReferences"))
+	if len(refs) != 1 {
+		return fmt.Errorf("replacement learner inventory owner differs")
+	}
+	owner := asObject(refs[0])
+	root := str(nested(r.Metadata, "annotations", automaticOwner))
+	if uid == "" || owner["apiVersion"] != "apps/v1" || owner["kind"] != "StatefulSet" || owner["name"] != r.Spec.StatefulSet || owner["uid"] != uid || owner["controller"] != false || str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) != "1" || root == "" || nested(pod, "metadata", "annotations", fencingRootAnnotation) != root || nested(pod, "metadata", "annotations", ownerAnnotation) != r.Spec.Membership.OperationID || r.Spec.Membership.ReplacementSecret != r.Spec.Membership.ReplacementPod+"-credentials" {
+		return fmt.Errorf("replacement learner inventory binding differs")
+	}
+	if err := validateSupervisedPod(pod); err != nil {
+		return err
+	}
+	return (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, r.Spec.StatefulSet)
+}
+
 func ownedBy(pod object, uid string) bool {
 	for _, ref := range list(nested(pod, "metadata", "ownerReferences")) {
 		if str(asObject(ref)["uid"]) == uid {

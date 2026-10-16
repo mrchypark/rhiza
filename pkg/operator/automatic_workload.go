@@ -19,7 +19,7 @@ import (
 // Pod cloned from the source STS template). It is idempotent: an existing Pod
 // or Service with a matching ownerAnnotation is accepted as-is without deletion
 // or recreation, preserving WAL identity across controller restarts.
-func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, containerName, operationID, clusterID, learnerName string) (quepaxa.Member, error) {
+func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, containerName, operationID, clusterID, learnerName string, fencingBinding ...string) (quepaxa.Member, error) {
 	if !identifier.MatchString(learnerName) {
 		return quepaxa.Member{}, fmt.Errorf("invalid learner name")
 	}
@@ -171,6 +171,25 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 	if str(podSpec["restartPolicy"]) == "" {
 		podSpec["restartPolicy"] = "Always"
 	}
+	annotations := object{ownerAnnotation: operationID}
+	var owners []any
+	if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" {
+		if len(fencingBinding) == 0 || fencingBinding[0] == "" {
+			return quepaxa.Member{}, fmt.Errorf("supervised learner requires root recovery binding")
+		}
+		var credential object
+		if err := c.Kube.Get(ctx, c.corePath("secrets", secretName), &credential); err != nil {
+			return quepaxa.Member{}, err
+		}
+		secretUID := str(nested(credential, "metadata", "uid"))
+		if secretUID == "" || credential["immutable"] != true || str(nested(credential, "metadata", "annotations", ownerAnnotation)) != operationID {
+			return quepaxa.Member{}, fmt.Errorf("supervised learner credential identity unavailable")
+		}
+		annotations[fencingProtocolAnnotation] = "1"
+		annotations[fencingRootAnnotation] = fencingBinding[0]
+		annotations[fencingCredentialAnnotation] = secretUID
+		owners = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": str(nested(sts, "metadata", "name")), "uid": str(nested(sts, "metadata", "uid")), "controller": false}}
+	}
 
 	// Create or validate Pod.
 	var existingPod object
@@ -179,9 +198,10 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 		pod := object{
 			"apiVersion": "v1", "kind": "Pod",
 			"metadata": object{
-				"name":        learnerName,
-				"annotations": object{ownerAnnotation: operationID},
-				"labels":      object{"rhiza.mrchypark.dev/automatic-learner": learnerName},
+				"name":            learnerName,
+				"annotations":     annotations,
+				"labels":          object{"rhiza.mrchypark.dev/automatic-learner": learnerName},
+				"ownerReferences": owners,
 			},
 			"spec": podSpec,
 		}
@@ -196,6 +216,13 @@ func (c *Controller) ensureAutomaticLearner(ctx context.Context, sts object, con
 		}
 		if nested(existingPod, "metadata", "deletionTimestamp") != nil {
 			return quepaxa.Member{}, fmt.Errorf("existing pod is being deleted")
+		}
+		if annotations[fencingProtocolAnnotation] == "1" {
+			for key, value := range annotations {
+				if nested(existingPod, "metadata", "annotations", key) != value {
+					return quepaxa.Member{}, fmt.Errorf("supervised learner binding changed")
+				}
+			}
 		}
 	}
 

@@ -114,6 +114,10 @@ type Server struct {
 	membershipChange     func(context.Context, MembershipChange) error
 	membershipAbort      func(context.Context, MembershipChange) error
 	recoveryArchive      func(context.Context) error
+	terminalDrain        func(context.Context, TerminalDrainRequest) (any, error)
+	handlerMu            sync.Mutex
+	handlerWG            sync.WaitGroup
+	handlerClosing       bool
 	syncLimit            chan struct{}
 	syncMu               sync.Mutex
 	syncSources          map[quepaxa.NodeID]chan struct{}
@@ -424,6 +428,9 @@ func (s *Server) acquireRead(ctx context.Context, longPoll bool) (func(), error)
 // Close stops background request batching.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		s.handlerMu.Lock()
+		s.handlerClosing = true
+		s.handlerMu.Unlock()
 		s.proposeMu.Lock()
 		s.closing = true
 		s.signalAdmissionLocked(true)
@@ -438,6 +445,7 @@ func (s *Server) Close() {
 		s.kvBatcher.Close()
 		s.proposalWG.Wait()
 		s.logicalWG.Wait()
+		s.handlerWG.Wait()
 	})
 }
 
@@ -513,6 +521,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/membership/change", s.handleMembershipChange)
 	s.mux.HandleFunc("/membership/abort", s.handleMembershipAbort)
 	s.mux.HandleFunc("/recovery/archive", s.handleRecoveryArchive)
+	s.mux.HandleFunc("/recovery/drain", s.handleTerminalDrain)
 
 	// Health
 	s.mux.HandleFunc("/ready", s.handleReady)
@@ -1170,6 +1179,19 @@ func fetchDecisionsWithRetry(
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Drain calls cannot join themselves; their handler validates identity and
+	// invokes the same idempotent terminal operation after other work stops.
+	if r.URL.Path != "/recovery/drain" {
+		s.handlerMu.Lock()
+		if s.handlerClosing {
+			s.handlerMu.Unlock()
+			writeAPIError(w, ErrNotReady)
+			return
+		}
+		s.handlerWG.Add(1)
+		s.handlerMu.Unlock()
+		defer s.handlerWG.Done()
+	}
 	s.mux.ServeHTTP(w, r)
 }
 

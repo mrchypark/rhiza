@@ -16,6 +16,60 @@ permissions:
   contents: read
 
 jobs:
+  cooperative-fencing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check cooperative protocol and engine regression tests
+        run: |
+          go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+      - name: Qualify actual cooperative executor in disposable Kubernetes
+        env:
+          CGO_ENABLED: 0
+          FENCING_E2E_OUT: cooperative-fencing-results
+        run: |
+          go install sigs.k8s.io/kind@v0.32.0
+          mkdir -p "$RUNNER_TEMP/fencing-images" cooperative-fencing-results
+          go build -o "$RUNNER_TEMP/fencing-images/rhiza" ./cmd/rhiza
+          go build -o "$RUNNER_TEMP/fencing-images/rhiza-operator" ./cmd/rhiza-operator
+          go build -o "$RUNNER_TEMP/fencing-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/fencing-e2e" ./e2e/fencing
+          docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
+          if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
+          printf '%s\n' rhiza-generic-fencing > cooperative-fencing-results/owned-cluster.txt
+          FENCING_E2E_BIN="$RUNNER_TEMP/fencing-e2e" sh e2e/fencing/run.sh
+      - name: Collect owned runtime diagnostics
+        if: always()
+        run: |
+          mkdir -p cooperative-fencing-results
+          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e get pods,events,configmaps,rhizafences -o yaml > cooperative-fencing-results/resources.yaml 2>&1 || true
+          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e logs -l app.kubernetes.io/name=rhiza-fencer --all-containers --prefix > cooperative-fencing-results/post-cleanup-authority.log 2>&1 || true
+          kind export logs cooperative-fencing-results/post-step-kind --name rhiza-generic-fencing || true
+      - name: Prepare allowlisted public fencing evidence
+        id: fencing_public
+        if: always()
+        run: |
+          test -x "$RUNNER_TEMP/fencing-e2e"
+          FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
+          find cooperative-fencing-results/public -type f ! -name SHA256SUMS -exec sha256sum {} + > cooperative-fencing-results/public/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.fencing_public.outcome == 'success'
+        with:
+          name: cooperative-fencing-${{ github.run_id }}
+          path: cooperative-fencing-results/public
+      - name: Remove only this job's test cluster
+        if: always()
+        run: |
+          if test -f cooperative-fencing-results/owned-cluster.txt && command -v kind >/dev/null 2>&1; then
+            kind delete cluster --name rhiza-generic-fencing
+            if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
+          fi
+
   operator-chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -46,7 +100,9 @@ jobs:
         if: always()
         with:
           name: operator-chaos-${{ github.run_id }}
-          path: operator-chaos-results
+          path: |
+            operator-chaos-results
+            !operator-chaos-results/kind/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
@@ -100,7 +156,9 @@ jobs:
         if: always()
         with:
           name: automatic-operator-chaos-${{ matrix.host }}-${{ github.run_id }}
-          path: automatic-chaos-results
+          path: |
+            automatic-chaos-results
+            !automatic-chaos-results/kind/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
@@ -412,7 +470,9 @@ jobs:
         if: always()
         with:
           name: anchor-operator-chaos-${{ github.run_id }}
-          path: anchor-chaos-results
+          path: |
+            anchor-chaos-results
+            !anchor-chaos-results/kind/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-anchor-chaos

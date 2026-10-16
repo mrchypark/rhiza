@@ -878,12 +878,14 @@ func TestMeteredUploadReaderPreservesS3RetryBody(t *testing.T) {
 func TestMeteredS3ConditionalUploadStatusAttemptsAndPublishedBytes(t *testing.T) {
 	payload := []byte("conditional-upload-payload")
 	for _, test := range []struct {
-		name   string
-		status int
-		code   string
-		option thanosobjstore.ObjectUploadOption
+		name         string
+		status       int
+		code         string
+		option       thanosobjstore.ObjectUploadOption
+		priorTimeout bool
 	}{
 		{name: "conditional_conflict", status: http.StatusConflict, code: "ConditionalRequestConflict", option: thanosobjstore.WithIfNotExists()},
+		{name: "conditional_conflict_after_timeout", status: http.StatusConflict, code: "ConditionalRequestConflict", option: thanosobjstore.WithIfNotExists(), priorTimeout: true},
 		{name: "precondition_failed", status: http.StatusPreconditionFailed, code: "PreconditionFailed", option: thanosobjstore.WithIfMatch(&thanosobjstore.ObjectVersion{Type: thanosobjstore.ETag, Value: "etag"})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -906,20 +908,39 @@ func TestMeteredS3ConditionalUploadStatusAttemptsAndPublishedBytes(t *testing.T)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
+			if test.priorTimeout {
+				transport := bucket.metrics.transport(roundTripperFunc(func(*http.Request) (*http.Response, error) { return nil, context.DeadlineExceeded }))
+				req, _ := http.NewRequestWithContext(ctx, http.MethodPut, server.URL+"/condition-test/earlier", nil)
+				if _, err := transport.RoundTrip(req); !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("prior timeout=%v", err)
+				}
+			}
 			err = bucket.Upload(ctx, "conditional", bytes.NewReader(payload), test.option)
 			if err == nil {
 				t.Fatal("conditional upload succeeded after S3 rejection")
 			}
 			actualRequests := requestCount.Load()
 			stats := bucket.Stats()
-			if actualRequests != 1 || stats.HTTPRequests != 1 {
-				t.Fatalf("conditional response attempts: client=%d server=%d, want exactly 1 each", stats.HTTPRequests, actualRequests)
+			wantClient := uint64(1)
+			if test.priorTimeout {
+				wantClient++
+			}
+			if actualRequests != 1 || stats.HTTPRequests != wantClient {
+				t.Fatalf("conditional response attempts: client=%d server=%d, want %d and 1", stats.HTTPRequests, actualRequests, wantClient)
 			}
 			if stats.BytesPublished != 0 {
 				t.Fatalf("rejected conditional upload published %d bytes", stats.BytesPublished)
 			}
 			if test.status == http.StatusPreconditionFailed && !bucket.Bucket.IsConditionNotMetErr(err) {
 				t.Fatalf("S3 %s error was not recognized as a condition conflict: %v", test.code, err)
+			}
+			drainErr := bucket.DrainMutations(ctx)
+			if test.priorTimeout {
+				if !errors.Is(drainErr, ErrMutationOutcomeUnknown) {
+					t.Fatalf("prior timeout erased by conditional rejection: %v", drainErr)
+				}
+			} else if drainErr != nil {
+				t.Fatalf("known conditional rejection blocked drain: %v", drainErr)
 			}
 			t.Logf("conditional S3 response: status=%d code=%s client_http_attempts=%d condition_error=%t published_bytes=%d", test.status, test.code, actualRequests, bucket.Bucket.IsConditionNotMetErr(err), stats.BytesPublished)
 		})
