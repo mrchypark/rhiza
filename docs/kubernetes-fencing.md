@@ -115,6 +115,18 @@ generation could still have authority. Ledgers deliberately fail closed at a
 bounded size instead of evicting unresolved history. Ordinary graceful shutdown
 without the exact terminal request is not a fencing receipt.
 
+### Planned restarts and upgrades
+
+A successful application `Close` or exit code zero without an operation-bound
+terminal drain leaves unresolved fencing history; it is not retroactively a
+clean receipt. Same-Pod container restarts can continue the intact WAL while
+admission is open, but a different Pod UID cannot replace an unresolved voter.
+This does not support arbitrary rolling image updates. Keep `OnDelete` and use
+the explicit terminal-fencing/new-generation procedure for planned replacement.
+Old unknown history still needs independent evidence for a later fence, even
+if a newer run exits cleanly. Cloud adapters are optional stronger alternatives,
+not evidence silently supplied by this cooperative default.
+
 ## Verification scope
 
 Package tests cover identity, receipt ordering, CAS races, immutable evidence,
