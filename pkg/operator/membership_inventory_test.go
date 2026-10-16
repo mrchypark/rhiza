@@ -50,7 +50,7 @@ func TestMembershipSupervisedInventoryOwnership(t *testing.T) {
 			case "unwrapped":
 				ctr["command"] = []any{"/usr/local/bin/rhiza"}
 			}
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 				if req.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters" {
 					roots := []ClusterResource{{Metadata: object{"uid": "root-uid"}, Spec: ClusterSpec{StatefulSet: "rhiza"}}}
 					if scenario == "missing-root" {
