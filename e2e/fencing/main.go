@@ -607,7 +607,10 @@ func imageDescriptor(d string, content []byte) (string, error) {
 			Digest string `json:"digest"`
 		} `json:"config"`
 		Manifests []struct {
-			Digest string `json:"digest"`
+			Digest    string `json:"digest"`
+			Size      int64  `json:"size"`
+			MediaType string `json:"mediaType"`
+			Platform  obj    `json:"platform"`
 		} `json:"manifests"`
 	}
 	if err := json.Unmarshal(content, &descriptor); err != nil {
@@ -616,8 +619,21 @@ func imageDescriptor(d string, content []byte) (string, error) {
 	if descriptor.Config.Digest != "" && len(descriptor.Manifests) == 0 {
 		return immutableDigest(descriptor.Config.Digest)
 	}
-	if descriptor.Config.Digest == "" && len(descriptor.Manifests) == 1 {
-		return immutableDigest(descriptor.Manifests[0].Digest)
+	if descriptor.Config.Digest == "" && len(descriptor.Manifests) > 0 {
+		first := descriptor.Manifests[0]
+		resolved, err := immutableDigest(first.Digest)
+		if err != nil {
+			return "", err
+		}
+		knownMediaType := first.MediaType == "application/vnd.oci.image.manifest.v1+json" || first.MediaType == "application/vnd.oci.image.index.v1+json" || first.MediaType == "application/vnd.docker.distribution.manifest.v2+json" || first.MediaType == "application/vnd.docker.distribution.manifest.list.v2+json"
+		for _, alias := range descriptor.Manifests[1:] {
+			// Docker archives may index two tag aliases of the same manifest.
+			// Ignore only annotations, not conflicting content or platform metadata.
+			if first.Size <= 0 || !knownMediaType || alias.Digest != resolved || alias.Size != first.Size || alias.MediaType != first.MediaType || !bytes.Equal(encoded(alias.Platform), encoded(first.Platform)) {
+				return "", fmt.Errorf("ambiguous immutable image index %s", d)
+			}
+		}
+		return resolved, nil
 	}
 	return "", fmt.Errorf("ambiguous or unsupported immutable image descriptor %s", d)
 }

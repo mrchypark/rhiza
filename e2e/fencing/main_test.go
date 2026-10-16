@@ -22,6 +22,9 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 			t.Fatalf("accepted mutable or invalid reference %q", reference)
 		}
 	}
+	manifest := `{"digest":"` + config + `","size":708,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"tag":"host"}}`
+	alias := strings.Replace(manifest, `"host"`, `"operator"`, 1)
+	index := func(second string) string { return `{"manifests":[` + manifest + `,` + second + `]}` }
 	for _, tc := range []struct {
 		body  string
 		valid bool
@@ -29,6 +32,11 @@ func TestImmutableImageResolutionDescriptors(t *testing.T) {
 		{`{"config":{"digest":"` + config + `"}}`, true},
 		{`{"manifests":[{"digest":"` + config + `"}]}`, true},
 		{`{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, false},
+		{index(alias), true},
+		{index(strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
+		{index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), false},
+		{index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), false},
+		{index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), false},
 		{`{"config":{"digest":"image:local"}}`, false},
 		{`{}`, false},
 	} {
