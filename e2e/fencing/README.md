@@ -17,9 +17,15 @@ The script uses the canonical authority manifest and supervised StatefulSet
 patch. Writers start only after the authority, projected token, TLS trust and
 dedicated Versity bucket are ready. No external cloud or existing bucket is used.
 
-The Go driver acknowledges one SQL write, partitions all three live voters'
+The Go driver verifies each running voter/authority/operator image against the
+built image configuration through the CRI manifest/configuration digest mapping,
+preserves healthy incarnations across an authority outage, acknowledges one SQL
+write, then partitions all three live voters'
 QUIC input, waits for the real generic executor proof, and verifies automatic
-generation recovery with a linearizable ACK read and a new write. The executor
+generation recovery with a linearizable ACK read and readback of a new write.
+Proof identity/hash and clean drain/exit receipts are checked against the durable
+generation ledger. This scenario qualifies generation recovery, not learner
+replacement or runtime injection of an ambiguous storage mutation. The executor
 gets no Docker, CRI, node or host privileges. The separate test driver uses CRI
 only to target the injected packet loss and independently check old runtime
 absence. No storage restart or manually supplied successful proof is used.

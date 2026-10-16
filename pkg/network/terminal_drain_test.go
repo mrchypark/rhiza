@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -39,5 +40,20 @@ func TestTerminalDrainRequiresAuthorizationAndKnownOutcome(t *testing.T) {
 				t.Fatalf("status=%d called=%t", response.Code, called)
 			}
 		})
+	}
+}
+
+func TestTerminalDrainClosedHTTPPreservesNotReadyErrorCode(t *testing.T) {
+	s := &Server{handlerClosing: true, mux: http.NewServeMux()}
+	for _, route := range []string{"/membership/change", "/membership/abort", "/membership/status", "/sql/execute", "/sql/query", "/recovery/archive", "/recovery/probe", "/recovery/status", "/healthz", "/ready"} {
+		recorder := httptest.NewRecorder()
+		s.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, route, nil))
+		var response ErrorResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if recorder.Code != http.StatusServiceUnavailable || response.Code != "not_ready" {
+			t.Fatalf("%s status=%d code=%s", route, recorder.Code, response.Code)
+		}
 	}
 }

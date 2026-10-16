@@ -114,3 +114,7 @@ func (a *AuthorityClient) Drain(ctx context.Context, r DrainReceipt) error {
 func (a *AuthorityClient) Exit(ctx context.Context, r StopRequest) error {
 	return a.call(ctx, AuthorityMessage{Action: "exit", Identity: r.Identity, Request: &r}, nil)
 }
+
+func (a *AuthorityClient) NeverBoundExit(ctx context.Context, r StopRequest) error {
+	return a.call(ctx, AuthorityMessage{Action: "never-bound-exit", Identity: r.Identity, Request: &r}, nil)
+}

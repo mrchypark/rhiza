@@ -19,6 +19,9 @@ func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 		switch item["kind"] {
 		case "StatefulSet":
 			sts = true
+			if nested(item, "spec", "updateStrategy", "type") != "OnDelete" {
+				t.Fatal("qualification changed the recovery OnDelete strategy")
+			}
 			if nested(item, "spec", "replicas") != 0 {
 				t.Fatal("writer launched before canonical supervised patch")
 			}

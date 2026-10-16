@@ -14,10 +14,11 @@ type Ledger struct {
 }
 
 type Run struct {
-	Identity Identity      `json:"identity"`
-	Stop     *StopRequest  `json:"stop,omitempty"`
-	Drain    *DrainReceipt `json:"drain,omitempty"`
-	Exited   bool          `json:"exited,omitempty"`
+	Identity       Identity      `json:"identity"`
+	Stop           *StopRequest  `json:"stop,omitempty"`
+	Drain          *DrainReceipt `json:"drain,omitempty"`
+	Exited         bool          `json:"exited,omitempty"`
+	NeverBoundExit *StopRequest  `json:"neverBoundExit,omitempty"`
 }
 
 func (l *Ledger) Register(identity Identity) error {
@@ -155,6 +156,9 @@ func (l *Ledger) RecordDrain(receipt DrainReceipt) error {
 	if !exists || run.Stop == nil || *run.Stop != receipt.Request {
 		return fmt.Errorf("fencing: unmatched drain")
 	}
+	if run.NeverBoundExit != nil {
+		return fmt.Errorf("fencing: never-bound exit cannot become a drain")
+	}
 	if run.Drain != nil && *run.Drain != receipt {
 		return fmt.Errorf("fencing: drain receipt cannot change")
 	}
@@ -168,10 +172,30 @@ func (l *Ledger) RecordDrain(receipt DrainReceipt) error {
 // must never call this method.
 func (l *Ledger) RecordExit(request StopRequest) error {
 	run, exists := l.Runs[request.Identity.RunID]
-	if !exists || run.Stop == nil || *run.Stop != request || run.Drain == nil || !run.Drain.Clean() {
+	if !exists || run.Identity.WALIdentity == "" || run.Stop == nil || *run.Stop != request || run.Drain == nil || !run.Drain.Clean() {
 		return ErrPending
 	}
 	run.Exited = true
+	l.Runs[request.Identity.RunID] = run
+	return nil
+}
+
+// RecordNeverBoundExit requires a durable closed, never-authorized run and
+// separately verified process termination. A lost successful WAL bind response
+// cannot use this exception because the WAL identity is already persisted.
+func (l *Ledger) RecordNeverBoundExit(request StopRequest) error {
+	run, exists := l.Runs[request.Identity.RunID]
+	if !exists || run.Identity.WALIdentity != "" || run.Drain != nil || request.Identity != run.Identity || run.Stop == nil || *run.Stop != request {
+		return fmt.Errorf("fencing: never-bound exit is not proven")
+	}
+	if l.ClosedBy == "" {
+		if _, closed := l.ClosedNodes[run.Identity.NodeID]; !closed {
+			return ErrPending
+		}
+	}
+	run.Exited = true
+	copy := request
+	run.NeverBoundExit = &copy
 	l.Runs[request.Identity.RunID] = run
 	return nil
 }
@@ -205,7 +229,14 @@ func (l *Ledger) CompleteNodes(operationID, requestHash string, nodeIDs, current
 		}
 		observed[run.Identity.NodeID] = true
 		registered[run.Identity.PodUID] = true
-		if run.Identity.WALIdentity == "" || run.Stop == nil || run.Stop.Identity != run.Identity || run.Stop.OperationID == "" || run.Stop.RequestHash == "" || !run.Exited || run.Drain == nil || run.Drain.Request != *run.Stop || !run.Drain.Clean() {
+		if run.Stop == nil || run.Stop.Identity != run.Identity || run.Stop.OperationID == "" || run.Stop.RequestHash == "" || !run.Exited {
+			return false
+		}
+		if run.NeverBoundExit != nil {
+			if run.Identity.WALIdentity != "" || run.Drain != nil || *run.NeverBoundExit != *run.Stop {
+				return false
+			}
+		} else if run.Identity.WALIdentity == "" || run.Drain == nil || run.Drain.Request != *run.Stop || !run.Drain.Clean() {
 			return false
 		}
 	}

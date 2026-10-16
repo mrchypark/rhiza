@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -133,6 +135,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		log.Printf("fencing supervisor authentication rejected: action=%s podUID=%s error=%v", message.Action, message.Identity.PodUID, err)
 		http.Error(w, "supervisor identity rejected", http.StatusForbidden)
 		return
 	}
@@ -167,6 +170,11 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("fencing: exit binding differs")
 				}
 				return l.RecordExit(*message.Request)
+			case "never-bound-exit":
+				if message.Request == nil || message.Request.Identity != message.Identity {
+					return fmt.Errorf("fencing: never-bound exit binding differs")
+				}
+				return l.RecordNeverBoundExit(*message.Request)
 			default:
 				return fmt.Errorf("fencing: unknown action")
 			}
@@ -185,6 +193,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		log.Printf("fencing supervisor transition rejected: action=%s podUID=%s error=%v", message.Action, message.Identity.PodUID, err)
 		http.Error(w, "fencing transition rejected", http.StatusConflict)
 		return
 	}
@@ -341,12 +350,29 @@ func validateSupervisedPod(pod object) error {
 		return fmt.Errorf("fencing: dedicated private PID namespace required")
 	}
 	ctr := asObject(list(spec["containers"])[0])
+	if ctr["lifecycle"] != nil {
+		return fmt.Errorf("fencing: untracked lifecycle processes are unsupported")
+	}
+	for _, probe := range []string{"readinessProbe", "livenessProbe", "startupProbe"} {
+		if nested(ctr, probe, "exec") != nil {
+			return fmt.Errorf("fencing: exec probes may create untracked processes")
+		}
+	}
+	for _, mount := range list(ctr["volumeMounts"]) {
+		p := path.Clean(str(asObject(mount)["mountPath"]))
+		if p == "/" || p == "/proc" || strings.HasPrefix(p, "/proc/") {
+			return fmt.Errorf("fencing: procfs must remain kernel-provided")
+		}
+	}
 	command := list(ctr["command"])
 	args := list(ctr["args"])
 	if len(command) != 1 || filepath.Base(str(command[0])) != "rhiza-fencer" || len(args) < 2 || str(args[0]) != "supervise" {
 		return fmt.Errorf("fencing: supervised launch required")
 	}
 	security := asObject(ctr["securityContext"])
+	if mode := str(security["procMount"]); mode != "" && mode != "Default" {
+		return fmt.Errorf("fencing: default procfs required")
+	}
 	if security["allowPrivilegeEscalation"] != false || security["privileged"] == true {
 		return fmt.Errorf("fencing: unprivileged supervisor required")
 	}

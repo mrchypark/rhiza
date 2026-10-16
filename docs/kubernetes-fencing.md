@@ -23,6 +23,11 @@ an isolation boundary against a compromised application sharing the supervisor's
 service-account token. Administrators who replace images, edit protected
 ledgers, inject processes, or bypass the wrapper can invalidate the contract.
 
+Exec probes and lifecycle process hooks are unsupported because they could
+start work after the namespace was inspected. The container must retain normal
+kernel procfs at `/proc`; the supervisor verifies its filesystem and PID-1
+view before collecting termination evidence.
+
 The authority verifies the projected token's audience and Pod UID using
 TokenReview, the current Pod's owner UID and source configuration, and the
 single-container wrapper contract. Automatic learners additionally bind the
@@ -38,6 +43,13 @@ The same ConfigMap CAS closes a voter slot or the entire source generation.
 The child passes the local startup gate before `Node.Open` and binds its WAL
 once before any writer starts. A concurrent fence either includes that run or
 rejects its startup/bind. Every old incarnation remains in the ledger.
+
+If closure wins before WAL bind is authorized, the authority can record a
+separate **never-bound exit** only after the supervisor waits for the child and
+reaps its namespace. The closed CAS history proves this run never obtained
+writer authorization. This is not a fabricated clean drain or invented WAL.
+If a bind committed but its response was lost, its persisted WAL makes this
+exception ineligible; normal drain or independent fencing evidence is required.
 
 For a stop request, the engine closes admission, joins foreground, peer and
 maintenance writers, and drains its lifetime storage-mutation tracker. Unknown
@@ -87,8 +99,10 @@ integration; unwrapped or unsupported hosts cannot produce this proof.
    no Kubernetes RoleBinding. The token is audience-bound and rotates every ten
    minutes; the client rereads the token file for each request.
 5. Set `RHIZA_AUTOMATIC_RECOVERY=true` on the operator. Leave
-   `RHIZA_FENCER_BACKEND` empty (default) or use `kubernetes`. The external HTTPS
-   adapter requires the explicit `http` backend and its existing URL/token/CA.
+   `RHIZA_FENCER_BACKEND` empty (default) or use `kubernetes`. For compatibility,
+   an empty backend with existing HTTP URL/token/CA configuration still selects
+   HTTP and rejects incomplete configuration. An explicit backend selection
+   wins. New external HTTPS adapter installations should set `http` explicitly.
 
 The supervisor injects `RHIZA_FENCE_SOCKET` and `RHIZA_FENCE_TICKET` into its child.
 Neither is a substitute for Kubernetes authentication. Missing half of this

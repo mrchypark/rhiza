@@ -66,8 +66,14 @@ func run(ctx context.Context, namespace string, poll time.Duration) error {
 	}
 
 	if os.Getenv("RHIZA_AUTOMATIC_RECOVERY") == "true" {
-		backend := os.Getenv("RHIZA_FENCER_BACKEND")
-		if backend == "" || backend == "kubernetes" {
+		backend, err := fencerBackend(os.Getenv("RHIZA_FENCER_BACKEND"), os.Getenv("RHIZA_FENCER_URL"), os.Getenv("RHIZA_FENCER_TOKEN_FILE"), os.Getenv("RHIZA_FENCER_CA_FILE"))
+		if err != nil {
+			return err
+		}
+		if os.Getenv("RHIZA_FENCER_BACKEND") == "" && backend == "http" {
+			log.Print("automatic recovery uses legacy implicit HTTP fencing configuration; set RHIZA_FENCER_BACKEND=http explicitly")
+		}
+		if backend == "kubernetes" {
 			controller.Fencer = &operator.KubernetesFencer{Kube: kube}
 		} else if backend == "http" {
 			endpoint, tokenFile := os.Getenv("RHIZA_FENCER_URL"), os.Getenv("RHIZA_FENCER_TOKEN_FILE")
@@ -124,6 +130,28 @@ func run(ctx context.Context, namespace string, poll time.Duration) error {
 		}
 	}
 	return controller.Run(ctx, poll)
+}
+
+// Preserve the previous implicit HTTP configuration while making Kubernetes
+// the default for genuinely unconfigured installations. Explicit selection wins.
+func fencerBackend(backend, endpoint, tokenFile, caFile string) (string, error) {
+	if backend == "" {
+		if endpoint != "" || tokenFile != "" || caFile != "" {
+			backend = "http"
+		} else {
+			return "kubernetes", nil
+		}
+	}
+	if backend == "http" {
+		if endpoint == "" || tokenFile == "" {
+			return "", fmt.Errorf("HTTP fencing requires RHIZA_FENCER_URL and RHIZA_FENCER_TOKEN_FILE; set RHIZA_FENCER_BACKEND=kubernetes explicitly to ignore legacy HTTP configuration")
+		}
+		return backend, nil
+	}
+	if backend != "kubernetes" {
+		return "", fmt.Errorf("unsupported RHIZA_FENCER_BACKEND")
+	}
+	return backend, nil
 }
 
 func validateAnchorEndpoint(raw string) error {

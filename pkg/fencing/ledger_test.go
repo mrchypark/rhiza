@@ -172,6 +172,77 @@ func TestLedgerIntactWALRestartDoesNotEraseOldUncertainty(t *testing.T) {
 	}
 }
 
+func TestLedgerClosureBeforeWALBindNeedsSeparateNeverBoundExit(t *testing.T) {
+	l := Ledger{SourceClusterID: "source"}
+	id := testIdentity()
+	if err := l.Register(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close("op", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	want := *l.Runs[id.RunID].Stop
+	attempt := id
+	attempt.WALIdentity = "wal"
+	if err := l.Bind(attempt); err != ErrClosed {
+		t.Fatalf("bind after close: %v", err)
+	}
+	if l.Complete("op", "hash", []string{id.PodUID}) {
+		t.Fatal("reservation alone became a proof")
+	}
+	wrong := want
+	wrong.Identity.RunID = "unverified"
+	if err := l.RecordNeverBoundExit(wrong); err == nil {
+		t.Fatal("unverified exit accepted")
+	}
+	if err := l.RecordNeverBoundExit(want); err != nil {
+		t.Fatal(err)
+	}
+	if !l.Complete("op", "hash", []string{id.PodUID}) {
+		t.Fatal("verified never-bound termination rejected")
+	}
+	run := l.Runs[id.RunID]
+	if run.Drain != nil || run.Identity.WALIdentity != "" || run.NeverBoundExit == nil {
+		t.Fatal("fabricated WAL/drain instead of distinct exit evidence")
+	}
+}
+
+func TestLedgerSuccessfulOrLostWALBindCannotUseNeverBoundExit(t *testing.T) {
+	l := Ledger{SourceClusterID: "source"}
+	id := testIdentity()
+	if err := l.Register(id); err != nil {
+		t.Fatal(err)
+	}
+	id.WALIdentity = "wal"
+	if err := l.Bind(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close("op", "hash"); err != nil {
+		t.Fatal(err)
+	}
+	request := *l.Runs[id.RunID].Stop
+	if err := l.RecordNeverBoundExit(request); err == nil {
+		t.Fatal("bound run used no-write exception")
+	}
+	lostResponse := request
+	lostResponse.Identity.WALIdentity = ""
+	if err := l.RecordNeverBoundExit(lostResponse); err == nil {
+		t.Fatal("lost successful bind response became never-bound evidence")
+	}
+	if l.Complete("op", "hash", []string{id.PodUID}) {
+		t.Fatal("bound run completed without normal drain")
+	}
+	if err := l.RecordDrain(DrainReceipt{Request: request, WritersJoined: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RecordExit(request); err != nil {
+		t.Fatal(err)
+	}
+	if !l.Complete("op", "hash", []string{id.PodUID}) {
+		t.Fatal("normal bound drain/exit rejected")
+	}
+}
+
 func TestLedgerBindingAndOperationImmutable(t *testing.T) {
 	l := Ledger{SourceClusterID: "source"}
 	id := testIdentity()

@@ -27,6 +27,7 @@ type Authority interface {
 	Stop(context.Context, Identity) (StopRequest, error)
 	Drain(context.Context, DrainReceipt) error
 	Exit(context.Context, StopRequest) error
+	NeverBoundExit(context.Context, StopRequest) error
 }
 
 // Supervisor supports only a dedicated, private Linux process namespace in
@@ -101,8 +102,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		select {
 		case err := <-waited:
 			childWaited = true
-			// Unexpected exit is not clean drain, even if no process remains.
-			return fmt.Errorf("fencing: child exited without a terminal receipt: %v", err)
+			// Closure may win before WAL bind. This is never a fake drain.
+			neverErr := s.recordNeverBoundExit(ctx)
+			if neverErr == nil {
+				return nil
+			}
+			return fmt.Errorf("fencing: child exited without a terminal receipt: %w", errors.Join(err, neverErr))
 		case <-ctx.Done():
 			_ = child.Process.Kill()
 			<-waited
@@ -166,6 +171,48 @@ func listenSupervisor(path string) (net.Listener, error) {
 		return nil, err
 	}
 	return net.Listen("unix", path)
+}
+
+func (s *Supervisor) recordNeverBoundExit(ctx context.Context) error {
+	s.mu.Lock()
+	identity := s.bound
+	s.mu.Unlock()
+	if identity.WALIdentity != "" {
+		return ErrPending
+	}
+	var request StopRequest
+	for {
+		var err error
+		request, err = s.Authority.Stop(ctx, identity)
+		if !errors.Is(err, ErrUnavailable) {
+			if err != nil {
+				return err
+			}
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if request.Identity != identity || request.Identity.WALIdentity != "" || request.OperationID == "" || request.RequestHash == "" {
+		return fmt.Errorf("fencing: unbound closure identity differs")
+	}
+	if err := terminatePrivateNamespace(ctx); err != nil {
+		return err
+	}
+	for {
+		err := s.Authority.NeverBoundExit(ctx, request)
+		if !errors.Is(err, ErrUnavailable) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Supervisor) handler() http.Handler {

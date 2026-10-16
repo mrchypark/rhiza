@@ -14,7 +14,7 @@ export FENCING_E2E_OUT
 mkdir -p "$FENCING_E2E_OUT"
 git rev-parse HEAD >"$FENCING_E2E_OUT/source-head.txt"
 docker image inspect rhiza-fencing-host:local rhiza-fencing-operator:local --format '{{.Id}}' >"$FENCING_E2E_OUT/image-ids.txt"
-if kind get clusters | rg -x "$fencing_cluster" >/dev/null; then
+if kind get clusters | grep -Fx "$fencing_cluster" >/dev/null; then
   echo 'Refusing to replace an existing qualification cluster' >&2
   exit 2
 fi
@@ -30,7 +30,7 @@ cleanup() {
     k logs deployment/rhiza-operator >"$FENCING_E2E_OUT/operator.log" 2>&1 || true
     k get pods,rhizafences,rhizarecoveries,rhizaclusters,configmaps -o json >"$FENCING_E2E_OUT/terminal.json" 2>"$FENCING_E2E_OUT/terminal.err" || true
     if ! kind delete cluster --name "$fencing_cluster" >"$FENCING_E2E_OUT/cleanup.log" 2>&1; then fencing_exit=1; fi
-    if kind get clusters | rg -x "$fencing_cluster" >/dev/null; then
+    if kind get clusters | grep -Fx "$fencing_cluster" >/dev/null; then
       echo 'Owned qualification cluster remains' >&2
       fencing_exit=1
     fi
@@ -69,7 +69,7 @@ k patch job rhiza-create-bucket --type=merge -p '{"spec":{"suspend":false}}'
 k wait --for=condition=Complete job/rhiza-create-bucket --timeout=180s
 k rollout status deployment/rhiza-fencer --timeout=180s
 k scale statefulset rhiza --replicas=3
-k rollout status statefulset/rhiza --timeout=240s
+"$FENCING_E2E_BIN" wait-source
 k scale deployment rhiza-operator --replicas=1
 k rollout status deployment/rhiza-operator --timeout=120s
 "$FENCING_E2E_BIN" run

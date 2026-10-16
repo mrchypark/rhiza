@@ -95,7 +95,7 @@ func supervisedTestPod() object {
 }
 
 func TestCooperativeRejectsUnsupportedProcessBoundaries(t *testing.T) {
-	for _, scenario := range []string{"unwrapped", "shared", "host", "sidecar", "init", "ephemeral", "privileged", "hostpath", "capability"} {
+	for _, scenario := range []string{"unwrapped", "shared", "host", "sidecar", "init", "ephemeral", "privileged", "hostpath", "capability", "lifecycle", "execprobe", "procmount", "procpath"} {
 		t.Run(scenario, func(t *testing.T) {
 			pod := supervisedTestPod()
 			spec := asObject(pod["spec"])
@@ -119,6 +119,14 @@ func TestCooperativeRejectsUnsupportedProcessBoundaries(t *testing.T) {
 				spec["volumes"] = []any{object{"hostPath": object{"path": "/"}}}
 			case "capability":
 				asObject(nested(ctr, "securityContext", "capabilities"))["add"] = []any{"SYS_ADMIN"}
+			case "lifecycle":
+				ctr["lifecycle"] = object{"postStart": object{"exec": object{"command": []any{"writer"}}}}
+			case "execprobe":
+				ctr["readinessProbe"] = object{"exec": object{"command": []any{"writer"}}}
+			case "procmount":
+				asObject(ctr["securityContext"])["procMount"] = "Unmasked"
+			case "procpath":
+				ctr["volumeMounts"] = []any{object{"mountPath": "/proc", "name": "hidden"}}
 			}
 			if err := validateSupervisedPod(pod); err == nil {
 				t.Fatal("unsupported process boundary accepted")

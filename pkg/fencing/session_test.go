@@ -116,8 +116,9 @@ func (a *sessionAuthority) Stop(_ context.Context, id Identity) (StopRequest, er
 	}
 	return *a.stop, nil
 }
-func (a *sessionAuthority) Drain(context.Context, DrainReceipt) error { return nil }
-func (a *sessionAuthority) Exit(context.Context, StopRequest) error   { return nil }
+func (a *sessionAuthority) Drain(context.Context, DrainReceipt) error         { return nil }
+func (a *sessionAuthority) Exit(context.Context, StopRequest) error           { return nil }
+func (a *sessionAuthority) NeverBoundExit(context.Context, StopRequest) error { return nil }
 
 func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	id := testIdentity()

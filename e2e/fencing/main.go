@@ -33,10 +33,16 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|run"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|wait-source|run"))
 	}
 	if os.Args[1] == "manifests" {
 		fatal(json.NewEncoder(os.Stdout).Encode(manifests()))
+		return
+	}
+	if os.Args[1] == "wait-source" {
+		ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+		defer cancel()
+		fatal(waitSource(ctx))
 		return
 	}
 	if os.Args[1] != "run" {
@@ -45,6 +51,81 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	fatal(qualify(ctx))
+}
+
+func waitSource(ctx context.Context) error {
+	return wait(ctx, "three source-generation voters Ready", func() (bool, error) {
+		config, err := get(ctx, "configmap", "rhiza-config")
+		if err != nil {
+			return false, err
+		}
+		if nested(config, "data", "RHIZA_CLUSTER_ID") != "chaos-source" {
+			return false, fmt.Errorf("source generation config differs")
+		}
+		sts, err := get(ctx, "statefulset", "rhiza")
+		if err != nil {
+			return false, err
+		}
+		uid := text(nested(sts, "metadata", "uid"))
+		if uid == "" {
+			return false, fmt.Errorf("source StatefulSet UID missing")
+		}
+		if nested(sts, "spec", "replicas") != float64(3) || nested(sts, "status", "readyReplicas") != float64(3) {
+			return false, nil
+		}
+		pods, err := get(ctx, "pods", "")
+		if err != nil {
+			return false, err
+		}
+		items, _ := pods["items"].([]any)
+		ready := map[string]bool{}
+		for _, pod := range items {
+			if nested(pod, "metadata", "deletionTimestamp") != nil || nested(pod, "metadata", "labels", "app.kubernetes.io/name") != "rhiza" {
+				continue
+			}
+			owners, _ := nested(pod, "metadata", "ownerReferences").([]any)
+			owned := false
+			for _, owner := range owners {
+				if nested(owner, "kind") == "StatefulSet" && nested(owner, "uid") == uid && nested(owner, "controller") == true {
+					owned = true
+				}
+			}
+			if !owned {
+				continue
+			}
+			containers, _ := nested(pod, "spec", "containers").([]any)
+			if len(containers) != 1 {
+				return false, fmt.Errorf("source voter is not a dedicated container")
+			}
+			from, _ := nested(containers[0], "envFrom").([]any)
+			sourceConfig := false
+			for _, entry := range from {
+				if nested(entry, "configMapRef", "name") == "rhiza-config" {
+					sourceConfig = true
+				}
+			}
+			if !sourceConfig {
+				return false, fmt.Errorf("source voter generation config missing")
+			}
+			env, _ := nested(containers[0], "env").([]any)
+			for _, entry := range env {
+				if nested(entry, "name") == "RHIZA_CLUSTER_ID" && nested(entry, "value") != "chaos-source" {
+					return false, fmt.Errorf("source voter generation overridden")
+				}
+			}
+			name := text(nested(pod, "metadata", "name"))
+			if name != "rhiza-0" && name != "rhiza-1" && name != "rhiza-2" {
+				return false, fmt.Errorf("unexpected source voter Pod")
+			}
+			conditions, _ := nested(pod, "status", "conditions").([]any)
+			for _, condition := range conditions {
+				if nested(condition, "type") == "Ready" && nested(condition, "status") == "True" {
+					ready[name] = true
+				}
+			}
+		}
+		return len(ready) == 3, nil
+	})
 }
 
 func fatal(err error) {
@@ -528,11 +609,15 @@ func verifyImages(ctx context.Context, out, phase string) error {
 		}
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
+		repos, _ := nested(cri, "status", "repoDigests").([]any)
+		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
+		if err := os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600); err != nil {
+			return err
+		}
 		if configID == "" || digest(configID) != digest(builtID) {
 			return fmt.Errorf("%s running image configuration differs from built image", role)
 		}
 		matched := digest(podImage) == digest(configID)
-		repos, _ := nested(cri, "status", "repoDigests").([]any)
 		for _, repo := range repos {
 			matched = matched || digest(podImage) == digest(text(repo))
 		}
@@ -540,7 +625,6 @@ func verifyImages(ctx context.Context, out, phase string) error {
 			return fmt.Errorf("%s Pod image digest does not resolve to inspected configuration", role)
 		}
 		counts[role]++
-		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
 	}
 	if counts["rhiza"] != 3 || counts["rhiza-operator"] != 1 || counts["rhiza-fencer"] != 1 {
 		return fmt.Errorf("qualification image inventory incomplete: %v", counts)
