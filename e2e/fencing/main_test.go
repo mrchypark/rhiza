@@ -16,6 +16,37 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string `yaml:"uses"`
+				With struct {
+					Path string `yaml:"path"`
+				} `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for job, root := range map[string]string{"operator-chaos": "operator-chaos-results", "automatic-operator-chaos": "automatic-chaos-results", "anchor-operator-chaos": "anchor-chaos-results"} {
+		found := false
+		for _, step := range workflow.Jobs[job].Steps {
+			if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && strings.TrimSpace(step.With.Path) == root+"\n!"+root+"/kind/**" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s upload must exclude the entire raw Kind subtree", job)
+		}
+	}
+}
+
 func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	config := "sha256:" + strings.Repeat("a", 64)
 	for _, reference := range []string{config, "containerd://" + config, "docker.io/library/import-date@" + config} {

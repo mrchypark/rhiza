@@ -1,5 +1,15 @@
 # Generic cooperative fencing runtime qualification
 
+Only `cooperative-fencing-results/public` is uploaded. The driver's
+`safe-artifacts` command projects explicit image/identity/proof/readback fields,
+resource identity summaries, and a cleanup boolean. Raw CRI/containerd/Kind logs,
+Pod specs, Secret data, environment, and last-applied annotations remain on the
+disposable runner and are never uploaded. A failed projection blocks upload;
+there is no raw fallback. Descriptor evidence retains verified content SHA256
+and allowlisted descriptor links, not raw image configuration or annotations.
+Package tests inject credential canaries to guard this boundary. This packet
+format change does not weaken the runtime fencing or readback checks.
+
 GitHub Actions builds the server, operator and supervisor from the same source
 and includes them in the disposable `Dockerfile.fencing-test` image, tagged
 `rhiza-fencing-host:local` and `rhiza-fencing-operator:local`. The repository's

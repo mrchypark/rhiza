@@ -50,12 +50,18 @@ jobs:
           kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e get pods,events,configmaps,rhizafences -o yaml > cooperative-fencing-results/resources.yaml 2>&1 || true
           kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e logs -l app.kubernetes.io/name=rhiza-fencer --all-containers --prefix > cooperative-fencing-results/post-cleanup-authority.log 2>&1 || true
           kind export logs cooperative-fencing-results/post-step-kind --name rhiza-generic-fencing || true
-          find cooperative-fencing-results -type f ! -name SHA256SUMS -exec sha256sum {} + > cooperative-fencing-results/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - name: Prepare allowlisted public fencing evidence
+        id: fencing_public
         if: always()
+        run: |
+          test -x "$RUNNER_TEMP/fencing-e2e"
+          FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
+          find cooperative-fencing-results/public -type f ! -name SHA256SUMS -exec sha256sum {} + > cooperative-fencing-results/public/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.fencing_public.outcome == 'success'
         with:
           name: cooperative-fencing-${{ github.run_id }}
-          path: cooperative-fencing-results
+          path: cooperative-fencing-results/public
       - name: Remove only this job's test cluster
         if: always()
         run: |
@@ -94,7 +100,9 @@ jobs:
         if: always()
         with:
           name: operator-chaos-${{ github.run_id }}
-          path: operator-chaos-results
+          path: |
+            operator-chaos-results
+            !operator-chaos-results/kind/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
@@ -148,7 +156,9 @@ jobs:
         if: always()
         with:
           name: automatic-operator-chaos-${{ matrix.host }}-${{ github.run_id }}
-          path: automatic-chaos-results
+          path: |
+            automatic-chaos-results
+            !automatic-chaos-results/kind/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
@@ -460,7 +470,9 @@ jobs:
         if: always()
         with:
           name: anchor-operator-chaos-${{ github.run_id }}
-          path: anchor-chaos-results
+          path: |
+            anchor-chaos-results
+            !anchor-chaos-results/kind/**
       - name: Remove test cluster
         if: always()
         run: kind delete cluster --name rhiza-anchor-chaos

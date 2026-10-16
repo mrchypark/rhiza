@@ -49,6 +49,10 @@ func main() {
 		fatal(waitSource(ctx))
 		return
 	}
+	if os.Args[1] == "safe-artifacts" {
+		fatal(safeArtifacts(os.Getenv("FENCING_E2E_OUT")))
+		return
+	}
 	if os.Args[1] != "run" {
 		fatal(fmt.Errorf("unknown command"))
 	}
@@ -1066,7 +1070,7 @@ func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
 			if _, err := immutableDigest(text(nested(cri, "status", "id"))); err != nil {
 				return nil, chain, err
 			}
-			chain = append(chain, obj{"digest": d, "cri": cri})
+			chain = append(chain, obj{"digest": d, "cri": publicCRIImage(cri)})
 			return cri, chain, nil
 		}
 		content, err := command(ctx, "docker", "exec", kindNode, "ctr", "-n", "k8s.io", "content", "get", d)
@@ -1074,7 +1078,7 @@ func imageConfig(ctx context.Context, reference string) (obj, []obj, error) {
 			return nil, chain, fmt.Errorf("resolve immutable image %s: CRI: %v; content: %w", d, lookupErr, err)
 		}
 		next, err := imageDescriptor(d, content)
-		chain = append(chain, obj{"digest": d, "criLookupError": lookupErr.Error(), "content": string(content)})
+		chain = append(chain, obj{"digest": d, "criLookupFailed": true, "contentSHA256": fmt.Sprintf("%x", sha256.Sum256(content)), "descriptor": publicDescriptor(content)})
 		if err != nil {
 			return nil, chain, err
 		}
@@ -1202,7 +1206,7 @@ func verifyImages(ctx context.Context, out, phase string, current ...operator.Fe
 		configID := text(nested(cri, "status", "id"))
 		builtID := text(built[0]["Id"])
 		repos, _ := nested(cri, "status", "repoDigests").([]any)
-		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": runtime, "resolution": chain, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
+		evidence = append(evidence, obj{"pod": nested(pod, "metadata", "name"), "uid": nested(pod, "metadata", "uid"), "role": role, "podImageID": podImage, "container": publicRuntime(runtime), "resolution": chain, "builtConfigID": builtID, "criConfigID": configID, "criRepoDigests": repos})
 		if err := os.WriteFile(filepath.Join(out, phase+"-image-evidence.json"), encoded(evidence), 0600); err != nil {
 			return err
 		}
