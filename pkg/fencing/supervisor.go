@@ -102,12 +102,11 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		select {
 		case err := <-waited:
 			childWaited = true
-			// Closure may win before WAL bind. This is never a fake drain.
-			neverErr := s.recordNeverBoundExit(ctx)
-			if neverErr == nil {
+			completionErr := s.finishExitedChild(ctx, terminatePrivateNamespace)
+			if completionErr == nil {
 				return nil
 			}
-			return fmt.Errorf("fencing: child exited without a terminal receipt: %w", errors.Join(err, neverErr))
+			return fmt.Errorf("fencing: child exited without a terminal receipt: %w", errors.Join(err, completionErr))
 		case <-ctx.Done():
 			_ = child.Process.Kill()
 			<-waited
@@ -120,32 +119,72 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			if receipt == nil || !receipt.Clean() {
 				continue
 			}
-			// Persist engine evidence before stopping the actual process.
-			if err := s.Authority.Drain(ctx, *receipt); err != nil {
-				if errors.Is(err, ErrUnavailable) {
-					continue
-				}
-				return err
-			}
-			_ = child.Process.Kill()
-			<-waited
-			childWaited = true
-			if err := terminatePrivateNamespace(ctx); err != nil {
-				return err
-			}
-			for {
-				err := s.Authority.Exit(ctx, receipt.Request)
-				if !errors.Is(err, ErrUnavailable) {
+			return s.finishDrain(ctx, *receipt, func() error {
+				if err := child.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					return err
 				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-tick.C:
-				}
-			}
+				<-waited
+				childWaited = true
+				return nil
+			}, terminatePrivateNamespace)
 		}
 	}
+}
+
+// finishExitedChild is called only after the direct child's Wait completed.
+// An accepted clean receipt remains valid if the application exits before the
+// polling tick. There is no second Kill/Wait in this branch.
+func (s *Supervisor) finishExitedChild(ctx context.Context, namespace func(context.Context) error) error {
+	s.mu.Lock()
+	receipt := s.drain
+	s.mu.Unlock()
+	if receipt != nil {
+		return s.finishDrain(ctx, *receipt, func() error { return nil }, namespace)
+	}
+	return s.recordNeverBoundExit(ctx, namespace)
+}
+
+func retryAuthorityTransition(ctx context.Context, transition func() error) error {
+	for {
+		err := transition()
+		if !errors.Is(err, ErrUnavailable) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// Both natural exit and supervisor-initiated termination use this exact
+// evidence order. Callbacks permit deterministic ordering tests without ever
+// inspecting or killing the test runner's process namespace.
+func (s *Supervisor) finishDrain(ctx context.Context, receipt DrainReceipt, waitChild func() error, namespace func(context.Context) error) error {
+	s.mu.Lock()
+	identity := s.bound
+	s.mu.Unlock()
+	if !receipt.Clean() || receipt.Request.Identity != identity || identity.WALIdentity == "" || receipt.Request.OperationID == "" || receipt.Request.RequestHash == "" {
+		return fmt.Errorf("fencing: clean bound drain required")
+	}
+	var request StopRequest
+	if err := retryAuthorityTransition(ctx, func() error { var err error; request, err = s.Authority.Stop(ctx, identity); return err }); err != nil {
+		return err
+	}
+	if request != receipt.Request {
+		return fmt.Errorf("fencing: accepted drain differs from immutable stop")
+	}
+	if err := retryAuthorityTransition(ctx, func() error { return s.Authority.Drain(ctx, receipt) }); err != nil {
+		return err
+	}
+	if err := waitChild(); err != nil {
+		return err
+	}
+	if err := namespace(ctx); err != nil {
+		return err
+	}
+	return retryAuthorityTransition(ctx, func() error { return s.Authority.Exit(ctx, receipt.Request) })
 }
 
 // A retained emptyDir can contain a stale socket after a container restart.
@@ -173,7 +212,7 @@ func listenSupervisor(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }
 
-func (s *Supervisor) recordNeverBoundExit(ctx context.Context) error {
+func (s *Supervisor) recordNeverBoundExit(ctx context.Context, namespace func(context.Context) error) error {
 	s.mu.Lock()
 	identity := s.bound
 	s.mu.Unlock()
@@ -199,7 +238,7 @@ func (s *Supervisor) recordNeverBoundExit(ctx context.Context) error {
 	if request.Identity != identity || request.Identity.WALIdentity != "" || request.OperationID == "" || request.RequestHash == "" {
 		return fmt.Errorf("fencing: unbound closure identity differs")
 	}
-	if err := terminatePrivateNamespace(ctx); err != nil {
+	if err := namespace(ctx); err != nil {
 		return err
 	}
 	for {

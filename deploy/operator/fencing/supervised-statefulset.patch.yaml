@@ -34,6 +34,8 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
+            - name: temporary
+              mountPath: /tmp
             - name: fence-socket
               mountPath: /run/rhiza-fencer
             - name: fence-token
@@ -43,6 +45,8 @@ spec:
               mountPath: /fencer-ca
               readOnly: true
       volumes:
+        - name: temporary
+          emptyDir: {}
         - name: fence-socket
           emptyDir: {}
         - name: fence-token

@@ -87,6 +87,32 @@ func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 	}
 }
 
+func TestFixtureRestoreHasWritableTmpWithReadOnlyRoot(t *testing.T) {
+	for _, item := range manifests()["items"].([]obj) {
+		if item["kind"] != "StatefulSet" {
+			continue
+		}
+		spec := nested(item, "spec", "template", "spec").(obj)
+		container := spec["containers"].([]obj)[0]
+		if nested(container, "securityContext", "readOnlyRootFilesystem") != true || nested(container, "securityContext", "allowPrivilegeEscalation") != false || spec["hostPID"] != false || spec["shareProcessNamespace"] != false {
+			t.Fatal("restore scratch space weakened the supervised security boundary")
+		}
+		mountName := ""
+		for _, mount := range container["volumeMounts"].([]obj) {
+			if mount["mountPath"] == "/tmp" && mount["readOnly"] != true {
+				mountName = text(mount["name"])
+			}
+		}
+		for _, volume := range spec["volumes"].([]obj) {
+			if mountName != "" && volume["name"] == mountName && volume["emptyDir"] != nil {
+				return
+			}
+		}
+		t.Fatal("checkpoint restore requires a dedicated writable /tmp emptyDir")
+	}
+	t.Fatal("missing supervised StatefulSet")
+}
+
 func TestGenerationProofRejectsUnrelatedAuthorityBeforeReadingLedger(t *testing.T) {
 	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "chaos-source", OperationID: "operation", Scope: operator.ScopeGeneration}
 	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(request))), ProofID: "cooperative-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}

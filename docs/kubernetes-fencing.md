@@ -28,6 +28,12 @@ start work after the namespace was inspected. The container must retain normal
 kernel procfs at `/proc`; the supervisor verifies its filesystem and PID-1
 view before collecting termination evidence.
 
+Keep the root filesystem read-only, but provide a writable `emptyDir` at `/tmp`
+as the supervised patch does. LatticeDB checkpoint restore creates temporary
+read-only graph materializations there; without this mount a recovered engine
+cannot open its snapshot. This directory is scratch space, not persistent data
+or fencing evidence.
+
 The authority verifies the projected token's audience and Pod UID using
 TokenReview, the current Pod's owner UID and source configuration, and the
 single-container wrapper contract. Automatic learners additionally bind the
