@@ -85,7 +85,11 @@ type Status struct {
 	Stage              string                        `json:"stage,omitempty"`
 	ArchiveCapture     string                        `json:"archiveCapture,omitempty"`
 	Peers              []network.VoterRecoveryStatus `json:"peers,omitempty"`
-	Membership         *MembershipStatus             `json:"membership,omitempty"`
+	// Automatic installation retains authenticated identities for a new incident
+	// even when a target voter fails before the parent adopts this generation.
+	// Missing observations never authorize single-voter fencing or invented WALs.
+	TargetIdentities []FenceTarget     `json:"targetIdentities,omitempty"`
+	Membership       *MembershipStatus `json:"membership,omitempty"`
 	// Anchor request and receipt are the exact persisted contract. Only these
 	// fields expose anchor evidence; no application-sensitive data.
 	AnchorRequest *recoveryanchor.Request `json:"anchorRequest,omitempty"`

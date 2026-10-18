@@ -23,6 +23,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/checkpoint"
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/qlog"
@@ -58,6 +59,14 @@ type Node struct {
 	replayMu                  sync.Mutex
 	compactionMu              sync.Mutex
 	catchUpWake               chan struct{}
+	shutdownMu                sync.Mutex
+	terminalMu                sync.Mutex
+	terminalIdentity          network.TerminalDrainRequest
+	terminalRequested         atomic.Bool
+	terminalDone              chan struct{}
+	terminalResult            TerminalDrainResult
+	terminalErr               error
+	fenceSession              *fencing.Session
 }
 
 // nodeRecoveryPhases records the selected certified checkpoint restore path.
@@ -165,10 +174,19 @@ func (n *Node) EnrollExistingVoter(ctx context.Context) error {
 }
 
 func (n *Node) open(ctx context.Context, enroll bool) (err error) {
+	if n.terminalRequested.Load() {
+		return fmt.Errorf("terminally drained node cannot reopen")
+	}
 	var localRestoreAuthority *materializer.LocalRestoreAuthority
 	var localRestoreFiles []materializer.CheckpointFile
 	if n.config == nil || n.config.NodeID == "" {
 		return fmt.Errorf("node ID is required")
+	}
+	if n.opened.Load() {
+		return fmt.Errorf("node is already open")
+	}
+	if err := n.connectFenceSession(ctx); err != nil {
+		return err
 	}
 	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
 		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "" ||
@@ -362,7 +380,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
-		bucket, bucketErr := objectstore.NewBucketWithContext(ctx, objectstore.Config{
+		newBucket := objectstore.NewBucketWithContext
+		if n.fenceSession != nil {
+			newBucket = objectstore.NewBucketForSupervisedStartup
+		}
+		bucket, bucketErr := newBucket(ctx, objectstore.Config{
 			Provider: provider, FilesystemDir: n.config.ObjStoreDir, Prefix: n.config.ObjStorePrefix,
 			Endpoint: n.config.ObjStoreEndpoint, Bucket: n.config.ObjStoreBucket, Region: n.config.ObjStoreRegion,
 			Insecure: n.config.ObjStoreInsecure, MaxRetries: n.config.ObjStoreRetries,
@@ -376,8 +398,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return fmt.Errorf("open object store: %w", bucketErr)
 		}
 		n.bucket = bucket
-		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll); err != nil {
+		var beforeWrite []func(context.Context, string) error
+		if n.fenceSession != nil {
+			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
+		}
+		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
 			return err
+		}
+		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
+			return fmt.Errorf("supervised fencing requires registered voter WAL identity")
 		}
 		if enroll {
 			return n.Shutdown()
@@ -581,6 +610,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	// Record RPCs must be available while every replica is recovering. Public
 	// proposals and learned decisions remain gated by ready=false.
 	server := network.NewServer(core, material, n.config.ClusterID, true, transport, n.ready.Load)
+	server.SetTerminalDrain(func(ctx context.Context, expected network.TerminalDrainRequest) (any, error) {
+		return n.TerminalDrain(ctx, expected)
+	})
 	if n.config.Local {
 		server.SetLocalFailureHandler(func(error) { n.ready.Store(false) })
 		server.SetLocalReclaimHandler(n.reclaimLocalCheckpoint)
@@ -974,6 +1006,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			}
 		}()
 	}
+	n.startFenceWatcher(ctx)
 	return nil
 }
 
@@ -1923,6 +1956,16 @@ func (n *Node) catchUpPeer(ctx context.Context, transport *network.Transport, so
 
 // Shutdown gracefully shuts down the node.
 func (n *Node) Shutdown() error {
+	n.shutdownMu.Lock()
+	defer n.shutdownMu.Unlock()
+	return n.shutdown()
+}
+
+func (n *Node) shutdown() error {
+	return n.shutdownEngine(true)
+}
+
+func (n *Node) shutdownEngine(closeBucket bool) error {
 	n.opened.Store(false)
 	n.ready.Store(false)
 	var shutdownErr error
@@ -1987,7 +2030,7 @@ func (n *Node) Shutdown() error {
 		n.lock = nil
 	}
 
-	if n.bucket != nil {
+	if n.bucket != nil && closeBucket {
 		shutdownErr = errors.Join(shutdownErr, n.bucket.Close())
 		n.bucket = nil
 	}

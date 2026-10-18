@@ -1,0 +1,332 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"gopkg.in/yaml.v3"
+)
+
+func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string `yaml:"uses"`
+				With struct {
+					Path string `yaml:"path"`
+				} `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for job, root := range map[string]string{"operator-chaos": "operator-chaos-results", "automatic-operator-chaos": "automatic-chaos-results", "anchor-operator-chaos": "anchor-chaos-results"} {
+		found := false
+		for _, step := range workflow.Jobs[job].Steps {
+			if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && strings.TrimSpace(step.With.Path) == root+"\n!"+root+"/kind/**" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s upload must exclude the entire raw Kind subtree", job)
+		}
+	}
+}
+
+func TestImmutableImageResolutionDescriptors(t *testing.T) {
+	config := "sha256:" + strings.Repeat("a", 64)
+	for _, reference := range []string{config, "containerd://" + config, "docker.io/library/import-date@" + config} {
+		if got, err := immutableDigest(reference); err != nil || got != config {
+			t.Fatalf("immutable reference %q: %q, %v", reference, got, err)
+		}
+	}
+	for _, reference := range []string{"image:local", "sha256:abc", "sha256:" + strings.Repeat("z", 64)} {
+		if _, err := immutableDigest(reference); err == nil {
+			t.Fatalf("accepted mutable or invalid reference %q", reference)
+		}
+	}
+	manifest := `{"digest":"` + config + `","size":708,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"tag":"host"}}`
+	alias := strings.Replace(manifest, `"host"`, `"operator"`, 1)
+	index := func(second string) string { return `{"manifests":[` + manifest + `,` + second + `]}` }
+	for _, tc := range []struct {
+		body  string
+		valid bool
+	}{
+		{`{"config":{"digest":"` + config + `"}}`, true},
+		{`{"manifests":[{"digest":"` + config + `"}]}`, true},
+		{`{"manifests":[{"digest":"` + config + `"},{"digest":"` + config + `"}]}`, false},
+		{index(alias), true},
+		{index(strings.Replace(alias, config, "sha256:"+strings.Repeat("b", 64), 1)), false},
+		{index(strings.Replace(alias, `"size":708`, `"size":709`, 1)), false},
+		{index(strings.Replace(alias, "application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json", 1)), false},
+		{index(strings.Replace(alias, `"size":708`, `"size":708,"platform":{"architecture":"arm64","os":"linux"}`, 1)), false},
+		{`{"config":{"digest":"image:local"}}`, false},
+		{`{}`, false},
+	} {
+		body := []byte(tc.body)
+		d := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
+		got, err := imageDescriptor(d, body)
+		if tc.valid && (err != nil || got != config) || !tc.valid && err == nil {
+			t.Fatalf("descriptor %s: %q, %v", tc.body, got, err)
+		}
+		if _, err := imageDescriptor(config, body); err == nil {
+			t.Fatal("accepted content that did not hash to the requested digest")
+		}
+	}
+}
+
+func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
+	items := manifests()["items"].([]obj)
+	var sts, job, operator bool
+	for _, item := range items {
+		if nested(item, "metadata", "namespace") != namespace {
+			t.Fatal("fixture escaped owned namespace")
+		}
+		switch item["kind"] {
+		case "StatefulSet":
+			sts = true
+			if nested(item, "spec", "updateStrategy", "type") != "OnDelete" {
+				t.Fatal("qualification changed the recovery OnDelete strategy")
+			}
+			if nested(item, "spec", "replicas") != 0 {
+				t.Fatal("writer launched before canonical supervised patch")
+			}
+		case "Job":
+			job = true
+			if nested(item, "spec", "suspend") != true {
+				t.Fatal("bucket setup races store readiness")
+			}
+		case "Deployment":
+			if nested(item, "metadata", "name") == "rhiza-operator" {
+				operator = true
+				if nested(item, "spec", "replicas") != 0 {
+					t.Fatal("operator launched before voters")
+				}
+			}
+		}
+	}
+	if !sts || !job || !operator {
+		t.Fatal("fixture omitted lifecycle resource")
+	}
+}
+
+func TestFixtureRestoreHasWritableTmpWithReadOnlyRoot(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/operator/fencing/supervised-statefulset.patch.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var patch obj
+	if err := yaml.NewDecoder(strings.NewReader(string(data))).Decode(&patch); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyScratch(patch); err != nil {
+		t.Fatal(err)
+	}
+	nested(patch, "spec", "template", "spec").(obj)["volumes"] = []any{}
+	if verifyScratch(patch) == nil {
+		t.Fatal("accepted read-only root without writable scratch storage")
+	}
+}
+
+func TestScratchAcceptsAPIOmittedFalsePIDOptionsOnly(t *testing.T) {
+	// Matches API serialization: default-false hostPID is omitted, not emitted
+	// as false; all nondefault security and scratch-volume fields are retained.
+	apiJSON := `{"spec":{"template":{"spec":{"containers":[{"securityContext":{"readOnlyRootFilesystem":true,"allowPrivilegeEscalation":false},"volumeMounts":[{"name":"temporary","mountPath":"/tmp"}]}],"volumes":[{"name":"temporary","emptyDir":{}}]}}}}`
+	var sts obj
+	if err := json.Unmarshal([]byte(apiJSON), &sts); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyScratch(sts); err != nil {
+		t.Fatalf("API-omitted false PID options rejected: %v", err)
+	}
+	spec := nested(sts, "spec", "template", "spec").(obj)
+	for _, key := range []string{"hostPID", "shareProcessNamespace"} {
+		spec[key] = false
+		if err := verifyScratch(sts); err != nil {
+			t.Fatalf("explicit false %s rejected: %v", key, err)
+		}
+		for _, malformed := range []any{true, "false", float64(0), nil, []any{}} {
+			spec[key] = malformed
+			if verifyScratch(sts) == nil {
+				t.Fatalf("accepted enabled/malformed %s=%#v", key, malformed)
+			}
+		}
+		delete(spec, key)
+	}
+	containers := spec["containers"].([]any)
+	security := nested(containers[0], "securityContext").(obj)
+	security["readOnlyRootFilesystem"] = false
+	if verifyScratch(sts) == nil {
+		t.Fatal("accepted writable root while tolerating omitted PID defaults")
+	}
+	security["readOnlyRootFilesystem"] = true
+	delete(security, "allowPrivilegeEscalation")
+	if verifyScratch(sts) == nil {
+		t.Fatal("accepted missing explicit privilege-escalation guard")
+	}
+}
+
+func TestObservationFaultMatchesOnlyOperatorToSelectedVoterHTTP(t *testing.T) {
+	rule, err := observationRule("10.244.0.8", "10.244.0.9", "target-uid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"OUTPUT", "-s", "10.244.0.8", "-d", "10.244.0.9", "-p", "tcp", "--dport", "8080", "-m", "comment", "--comment", "rhiza-fencing-e2e-target-uid", "-j", "DROP"}
+	if string(encoded(rule)) != string(encoded(want)) {
+		t.Fatalf("observation fault escaped exact operator/target HTTP tuple: %v", rule)
+	}
+	for _, pair := range [][2]string{{"", "10.244.0.9"}, {"10.244.0.8", "0.0.0.0/0"}, {"10.244.0.8", "10.244.0.8"}, {"127.0.0.1", "10.244.0.9"}, {"::1", "10.244.0.9"}} {
+		if _, err := observationRule(pair[0], pair[1], "target-uid"); err == nil {
+			t.Fatalf("accepted unsafe observation tuple %v", pair)
+		}
+	}
+	if _, err := observationRule("10.244.0.8", "10.244.0.9", ""); err == nil {
+		t.Fatal("accepted rule without owned target UID marker")
+	}
+	fault := observationFault{PID: "42", Rule: rule}
+	insert, remove, check := fault.args("-I"), fault.args("-D"), fault.args("-C")
+	if string(encoded(insert[8:])) != string(encoded(remove[8:])) || string(encoded(remove[8:])) != string(encoded(check[8:])) {
+		t.Fatal("cleanup/check did not preserve the exact owned rule")
+	}
+}
+
+func TestGenerationProofRejectsUnrelatedAuthorityBeforeReadingLedger(t *testing.T) {
+	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "chaos-source", OperationID: "operation", Scope: operator.ScopeGeneration}
+	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(request))), ProofID: "cooperative-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	for _, change := range []func(*operator.FenceRequest, *operator.FenceProof){
+		func(r *operator.FenceRequest, _ *operator.FenceProof) { r.SourceClusterID = "other" },
+		func(r *operator.FenceRequest, _ *operator.FenceProof) { r.StatefulSetUID = "other" },
+		func(r *operator.FenceRequest, _ *operator.FenceProof) { r.BindingUID = "other" },
+		func(_ *operator.FenceRequest, p *operator.FenceProof) { p.OperationID = "other" },
+		func(_ *operator.FenceRequest, p *operator.FenceProof) { p.RequestHash = "other" },
+		func(_ *operator.FenceRequest, p *operator.FenceProof) { p.StorageQuiesced = false },
+	} {
+		r, p := request, proof
+		change(&r, &p)
+		if err := verifyGenerationProof(context.Background(), obj{"spec": r, "status": obj{"proof": p}}, "sts", "binding", []string{"old"}, t.TempDir()); err == nil {
+			t.Fatal("unrelated/incomplete proof accepted")
+		}
+	}
+}
+
+func TestOnlineMembershipMappingAndExactIncarnations(t *testing.T) {
+	refs := []operator.VoterPod{{NodeID: "rhiza-0", Pod: "rhiza-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1"}, {NodeID: "learner", Pod: "learner"}}
+	if err := validateReplacementRefs(refs, "rhiza-2", "learner"); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range [][]operator.VoterPod{refs[:2], {refs[0], refs[1], {NodeID: "rhiza-2", Pod: "rhiza-2"}}, {refs[0], refs[0], refs[2]}, {refs[0], refs[1], {NodeID: "learner", Pod: "rhiza-1"}}} {
+		if validateReplacementRefs(bad, "rhiza-2", "learner") == nil {
+			t.Fatal("accepted missing, retired, duplicated or incorrectly mapped learner")
+		}
+	}
+	status := network.MembershipStatus{NodeID: "learner", ClusterID: "chaos-source", ConfigID: 3, WALIdentity: "wal", Voting: true, Voters: []quepaxa.NodeID{"rhiza-1", "learner", "rhiza-0"}}
+	if !membershipMatches(status, refs, "learner") {
+		t.Fatal("reordered exact current membership rejected")
+	}
+	for _, change := range []func(*network.MembershipStatus){
+		func(s *network.MembershipStatus) { s.Pending = true },
+		func(s *network.MembershipStatus) { s.Voting = false },
+		func(s *network.MembershipStatus) { s.WALIdentity = "" },
+		func(s *network.MembershipStatus) { s.Voters = []quepaxa.NodeID{"rhiza-0", "rhiza-1", "rhiza-2"} },
+		func(s *network.MembershipStatus) { s.Voters = []quepaxa.NodeID{"rhiza-0", "rhiza-0", "learner"} },
+	} {
+		bad := status
+		change(&bad)
+		if membershipMatches(bad, refs, "learner") {
+			t.Fatal("accepted uncertified or wrong current membership")
+		}
+	}
+	targets := []operator.FenceTarget{{NodeID: "n", Pod: "p", PodUID: "uid", WALIdentity: "wal"}, {NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}}
+	if !sameTargets([]operator.FenceTarget{targets[1], targets[0]}, targets) {
+		t.Fatal("exact reordered targets rejected")
+	}
+	stale := append([]operator.FenceTarget(nil), targets...)
+	stale[1].PodUID = "stale"
+	if sameTargets(stale, targets) || sameTargets(targets[:1], targets) {
+		t.Fatal("accepted missing learner or stale Pod UID")
+	}
+}
+
+func TestGenerationRetainsImmutableEarlierVoterStop(t *testing.T) {
+	identity := fencing.Identity{SourceClusterID: "chaos-source", NodeID: "rhiza-2", PodUID: "old", RunID: "run", WALIdentity: "wal"}
+	stop := fencing.StopRequest{OperationID: "online", RequestHash: "online-hash", Identity: identity}
+	run := fencing.Run{Identity: identity, Stop: &stop, Drain: &fencing.DrainReceipt{Request: stop, WritersJoined: true}, Exited: true}
+	prior := fenceLedgerState{StatefulSetUID: "sts", Ledger: fencing.Ledger{SourceClusterID: "chaos-source", Runs: map[string]fencing.Run{"run": run}}}
+	out := t.TempDir()
+	if err := os.WriteFile(out+"/validated-voter-proof.json", encoded(obj{"request": operator.FenceRequest{OperationID: "online"}, "ledger": prior}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	current := prior.Ledger
+	current.ClosedBy, current.ClosedHash = "generation", "generation-hash"
+	if err := verifyPriorVoterStops(out, current); err != nil {
+		t.Fatal(err)
+	}
+	changed := run
+	changed.Exited = false
+	current.Runs["run"] = changed
+	if verifyPriorVoterStops(out, current) == nil {
+		t.Fatal("generation accepted altered earlier voter-stop evidence")
+	}
+}
+
+func TestVoterProofRejectsWrongIncarnationBeforeLedgerRead(t *testing.T) {
+	target := operator.FenceTarget{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "live-uid", WALIdentity: "live-wal"}
+	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "chaos-source", OperationID: "online", Scope: operator.ScopeVoter, Targets: []operator.FenceTarget{target}}
+	request.Targets[0].PodUID = "stale-uid"
+	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: fmt.Sprintf("%x", sha256.Sum256(encoded(request))), ProofID: "cooperative-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	if verifyScopedProof(context.Background(), obj{"spec": request, "status": obj{"proof": proof}}, "sts", "binding", []string{target.PodUID}, operator.ScopeVoter, []operator.FenceTarget{target}, t.TempDir()) == nil {
+		t.Fatal("voter proof accepted stale target UID")
+	}
+}
+
+func TestHistoricalVoterProofAllowsLaterLearnerButRejectsTargetTampering(t *testing.T) {
+	target := operator.FenceTarget{NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "old-uid", WALIdentity: "old-wal"}
+	request := operator.FenceRequest{StatefulSetUID: "sts", SourceClusterID: "chaos-source", BindingUID: "binding", OperationID: "online", Scope: operator.ScopeVoter, Targets: []operator.FenceTarget{target}}
+	hash := fmt.Sprintf("%x", sha256.Sum256(encoded(request)))
+	identity := fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: target.NodeID, PodUID: target.PodUID, RunID: "old-run", WALIdentity: target.WALIdentity}
+	stop := fencing.StopRequest{OperationID: request.OperationID, RequestHash: hash, Identity: identity}
+	run := fencing.Run{Identity: identity, Stop: &stop, Drain: &fencing.DrainReceipt{Request: stop, WritersJoined: true}, Exited: true}
+	state := fenceLedgerState{StatefulSetUID: "sts", Ledger: fencing.Ledger{SourceClusterID: request.SourceClusterID, ClosedNodes: map[string]fencing.StopRequest{target.NodeID: {OperationID: request.OperationID, RequestHash: hash}}, Runs: map[string]fencing.Run{"old-run": run}}}
+	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "cooperative-" + fmt.Sprintf("%x", sha256.Sum256(encoded(state))), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	state.Ledger.Runs["learner-run"] = fencing.Run{Identity: fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: "learner", PodUID: "learner-uid", RunID: "learner-run", WALIdentity: "learner-wal"}}
+	if proof.ProofID == "cooperative-"+fmt.Sprintf("%x", sha256.Sum256(encoded(state))) {
+		t.Fatal("test did not advance the current ledger past proof issuance")
+	}
+	if err := verifyLedgerProof(state, request, proof); err != nil {
+		t.Fatalf("unrelated later learner invalidated historical voter proof: %v", err)
+	}
+	for _, change := range []func(*fencing.Run){
+		func(r *fencing.Run) { r.Identity.PodUID = "different-uid" },
+		func(r *fencing.Run) { r.Identity.WALIdentity = "different-wal" },
+		func(r *fencing.Run) { r.Stop.OperationID = "different-operation" },
+		func(r *fencing.Run) { r.Stop.RequestHash = "different-hash" },
+		func(r *fencing.Run) { r.Drain.UnknownMutations = 1 },
+		func(r *fencing.Run) { r.Drain.PendingMutations = 1 },
+		func(r *fencing.Run) { r.Drain.WritersJoined = false },
+		func(r *fencing.Run) { r.Exited = false },
+	} {
+		var bad fencing.Run
+		if err := json.Unmarshal(encoded(run), &bad); err != nil {
+			t.Fatal(err)
+		}
+		change(&bad)
+		state.Ledger.Runs["old-run"] = bad
+		if verifyLedgerProof(state, request, proof) == nil {
+			t.Fatal("historical proof accepted tampered terminal target evidence")
+		}
+	}
+}

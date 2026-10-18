@@ -3,6 +3,11 @@
 For Go or Rust applications embedding Rhiza, see the dedicated
 [embedded application integration guide](../../docs/embedded-operator.md).
 
+For the default provider-neutral cooperative executor, its startup contract,
+installation, and hard-crash limitations, see
+[Kubernetes fencing](../../docs/kubernetes-fencing.md). Installing the operator
+alone still does not install a runtime fencing authority.
+
 These manifests deploy a namespace-scoped controller for `RhizaRecovery`
 and opt-in automatic recovery through `RhizaCluster`.
 It monitors an **existing three-voter StatefulSet**. It does not create a
@@ -27,6 +32,13 @@ uses its service account and the Kubernetes JSON API; it polls the namespace
 selected by `--namespace`. The Deployment supplies that flag from
 `POD_NAMESPACE`; if it is omitted, the command reads the mounted service
 account namespace. `--poll-interval` defaults to `10s` and must be positive.
+
+Post-fence standalone learner cleanup uses `--delete-namespaces`, defaulted from
+`RHIZA_OPERATOR_DELETE_NAMESPACES`. Empty means the actual operator Pod namespace
+(verified from the mounted service-account namespace, independently of the watch
+flag); a CSV allowlist or exclusive `*` opts into broader eligibility. This does
+not expand the watcher or grant RBAC. Default RBAC stays namespace-scoped. See
+[Pod deletion scope](../../docs/kubernetes-fencing.md#pod-deletion-scope).
 
 The operator reads the same `RHIZA_OBJSTORE_*` settings as Rhiza itself from
 `rhiza-config` and `rhiza-object-store`. The object-store secret must provide
