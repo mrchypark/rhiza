@@ -132,9 +132,10 @@ func TestAdvanceAutomaticPropagatesAnchorID(t *testing.T) {
 func TestAutoBindingHashStable(t *testing.T) {
 	type bindingWithoutAnchor struct {
 		LogicalID, StatefulSet, Container, AdoptClusterID string
+		ClusterDomain                                     string
 		VoterCount, HTTPPort, PeerPort                    int
 	}
-	legacy := hashJSON(bindingWithoutAnchor{"l1", "s1", "c1", "a1", 3, 8080, 9090})
+	legacy := hashJSON(bindingWithoutAnchor{"l1", "s1", "c1", "a1", "cluster.local", 3, 8080, 9090})
 
 	r := autoClusterResource("c1", "uid-1", "l1")
 	r.Spec.StatefulSet = "s1"
@@ -161,6 +162,11 @@ func TestAutoBindingHashStable(t *testing.T) {
 	r.Spec.HTTPPort++
 	if autoBinding(r) == empty {
 		t.Fatal("changed HTTP port did not change the immutable binding hash")
+	}
+	r.Spec.HTTPPort--
+	r.Spec.ClusterDomain = "corp.internal"
+	if autoBinding(r) == empty {
+		t.Fatal("changed clusterDomain did not change the immutable binding hash")
 	}
 }
 

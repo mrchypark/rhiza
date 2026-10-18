@@ -85,7 +85,7 @@ class AutomaticChaos(Chaos):
                     "metadata":{"name":"rhiza","namespace":self.ns}, "spec":{
                     "logicalID":"chaos", "statefulSet":"rhiza", "container":"rhiza",
                     "adoptClusterID":"chaos-source", "automatic":True,
-                    "voterPods":[{"nodeID":f"rhiza-{i}","pod":f"rhiza-{i}"} for i in range(3)],
+                    "voterCount":3,
                     "policy":{"failureGraceSeconds":15,"cooldownSeconds":3,"maxRecoveriesPerDay":10,"allowDataLoss":False}}})
         self.wait("automatic cluster healthy", self.healthy, 180)
         before = self.status("rhiza-1")

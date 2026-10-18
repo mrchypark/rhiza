@@ -327,6 +327,7 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 		ledgerOK     bool
 		activeVoter  bool
 		inFlight     bool
+		intentTarget bool
 		replaced     bool
 		wantRetained bool
 	}{
@@ -334,7 +335,8 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 		{name: "pod still present", ledgerOK: true, podFound: true, wantRetained: true},
 		{name: "credential still reusable", ledgerOK: true, secretUID: "credential-uid", wantRetained: true},
 		{name: "active generation voter", ledgerOK: true, activeVoter: true, wantRetained: true},
-		{name: "in-flight intent", ledgerOK: true, inFlight: true, wantRetained: true},
+		{name: "unrelated in-flight intent", ledgerOK: true, inFlight: true},
+		{name: "intent-owned incarnation", ledgerOK: true, inFlight: true, intentTarget: true, wantRetained: true},
 		{name: "never-bound proof missing", neverBound: true, wantRetained: true},
 		{name: "never-bound proof verified", neverBound: true, ledgerOK: true},
 		{name: "replacement supersedes same secret", ledgerOK: true, secretUID: "credential-uid", replaced: true},
@@ -365,6 +367,9 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 			}
 			if tc.inFlight {
 				state.Intent = &autoIntent{}
+				if tc.intentTarget {
+					state.Intent.Request.Targets = []FenceTarget{entry.Target}
+				}
 			}
 			changed, err := f.c.compactLearnerHistory(t.Context(), state)
 			if err != nil {
@@ -488,11 +493,45 @@ func TestCompactionBlocksOversizedUnreducibleHistory(t *testing.T) {
 	}
 }
 
+func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
+	ctx := t.Context()
+	f := newCompactionFixture(t)
+	r := autoClusterResource("root", "binding", "logical")
+	state := validAutoControl()
+	state.BindingUID, state.StatefulSetUID = "binding", "sts-uid"
+	state.Intent = &autoIntent{LearnerName: "replacement", Request: FenceRequest{OperationID: "op"}, Policy: AutoPolicy{FailureGraceSeconds: 1}}
+	for i := range maxLearnerHistory {
+		state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("op-%d", i), CredentialUID: fmt.Sprintf("credential-%d", i), Target: FenceTarget{NodeID: fmt.Sprintf("learner-%d", i), Pod: fmt.Sprintf("learner-%d", i), PodUID: fmt.Sprintf("learner-uid-%d", i), WALIdentity: strings.Repeat("a", 64)}})
+	}
+	if err := f.c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded, version, err := f.c.loadAuto(ctx, f.c.autoKey(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
+		t.Fatalf("full journal provisioning handled=%t err=%v", handled, err)
+	}
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "learner history is full") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory {
+		t.Fatalf("full journal mutated Kubernetes: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
+	}
+
+	f.ledger = terminatedLedger(t, []learnerIncarnation{loaded.Learners[0]})
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
+		t.Fatalf("compaction recovery handled=%t err=%v", handled, err)
+	}
+	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory-1 {
+		t.Fatalf("compaction did not free capacity before mutation: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
+	}
+}
+
 type compactionFixture struct {
 	c          *Controller
 	ledger     *fenceLedger
 	podUIDs    map[string]string
 	secretUIDs map[string]string
+	mutations  int
 }
 
 func newCompactionFixture(t *testing.T) *compactionFixture {
@@ -505,6 +544,13 @@ func newCompactionFixture(t *testing.T) *compactionFixture {
 	f.c.Kube = &Kubernetes{Namespace: "default", TokenFile: token}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		switch {
+		case q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters/root/status" && q.Method == http.MethodPut:
+			var next ClusterResource
+			_ = json.NewDecoder(q.Body).Decode(&next)
+			_ = json.NewEncoder(w).Encode(next)
+		case (q.Method == http.MethodPost || q.Method == http.MethodPut) && (strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/secrets") || strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/pods") || strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/services")):
+			f.mutations++
+			_ = json.NewEncoder(w).Encode(object{})
 		case strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/pods/"):
 			name := strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/pods/")
 			if uid := f.podUIDs[name]; uid != "" {

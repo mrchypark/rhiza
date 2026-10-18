@@ -69,12 +69,9 @@ func includeLearnerHistory(state *autoControl, request *FenceRequest) error {
 }
 
 // compactLearnerHistory retries every retained incarnation on each reconcile.
-// It never runs while an intent is in flight and proves termination from the
-// durable fencing ledger, not from the current source-generation filter.
+// An in-flight intent only protects its own targets, active voters, and current
+// learner; unrelated entries remain eligible for ledger-backed compaction.
 func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoControl) (bool, error) {
-	if state.Intent != nil {
-		return false, nil
-	}
 	if err := validateLearnerHistory(state.Learners); err != nil {
 		return false, err
 	}
@@ -82,6 +79,17 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 	for _, voter := range state.Voters {
 		protected[string(voter.NodeID)] = true
 		protected[voter.Pod] = true
+	}
+	if intent := state.Intent; intent != nil {
+		for _, voter := range intent.Voters {
+			protected[string(voter.NodeID)] = true
+			protected[voter.Pod] = true
+		}
+		for _, target := range intent.Request.Targets {
+			protected[target.NodeID] = true
+			protected[target.Pod] = true
+		}
+		protected[intent.LearnerName] = true
 	}
 	retained := make([]learnerIncarnation, 0, len(state.Learners))
 	for _, entry := range state.Learners {
@@ -161,6 +169,28 @@ func (c *Controller) verifyTerminatedCleanup(ctx context.Context, stsUID string,
 		return nil
 	}
 	return fmt.Errorf("learner run is absent from the fencing ledger")
+}
+
+func (c *Controller) prepareLearnerProvisioning(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion) (bool, error) {
+	changed, err := c.compactLearnerHistory(ctx, state)
+	if err != nil {
+		return true, c.autoStatus(ctx, r, state, "Blocked", err.Error())
+	}
+	if changed {
+		if err := c.saveAuto(ctx, r, state, version); err != nil {
+			return true, err
+		}
+		return true, c.autoStatus(ctx, r, state, "Recovering", "learner history compacted before replacement provisioning")
+	}
+	for _, old := range state.Learners {
+		if old.SourceClusterID == state.ActiveClusterID && old.Target.Pod == state.Intent.LearnerName {
+			return false, nil
+		}
+	}
+	if len(state.Learners) >= maxLearnerHistory {
+		return true, c.autoStatus(ctx, r, state, "Blocked", fmt.Sprintf("learner history is full (%d) and no ledger proof can compact it; restore the fencing ledger or remove verified completed-generation learners", maxLearnerHistory))
+	}
+	return false, nil
 }
 
 func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoControl, sts object, pod object) (learnerIncarnation, error) {

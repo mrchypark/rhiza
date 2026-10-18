@@ -136,11 +136,16 @@ func autoBinding(r *ClusterResource) string {
 	if peerPort == 0 {
 		peerPort = 9090
 	}
+	clusterDomain := r.Spec.ClusterDomain
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
 	return hashJSON(struct {
 		LogicalID, StatefulSet, Container, AdoptClusterID string
 		AnchorID                                          string `json:"anchorID,omitempty"`
+		ClusterDomain                                     string
 		VoterCount, HTTPPort, PeerPort                    int
-	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, r.Spec.VoterCount, httpPort, peerPort})
+	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, clusterDomain, r.Spec.VoterCount, httpPort, peerPort})
 }
 
 func legacyAutoBinding(r *ClusterResource, voters []VoterPod) string {
@@ -166,12 +171,33 @@ func (c *Controller) migrateLegacyBinding(ctx context.Context, r *ClusterResourc
 	if !adopted || len(members) != r.Spec.VoterCount {
 		return false, fmt.Errorf("legacy automatic binding migration requires voterCount %d to equal exported RHIZA_CLUSTER_MEMBERS count %d", r.Spec.VoterCount, len(members))
 	}
+	if err := legacyVoterIdentityDrift(state.Voters, members); err != nil {
+		return false, err
+	}
 	state.BindingVersion = autoBindingVersion
 	state.BindingHash = autoBinding(r)
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func legacyVoterIdentityDrift(voters []VoterPod, members []quepaxa.Member) error {
+	if len(voters) != len(members) {
+		return fmt.Errorf("legacy automatic binding voter inventory drifts from the exported membership: frozen=%d exported=%d", len(voters), len(members))
+	}
+	exported := make(map[quepaxa.NodeID]bool, len(members))
+	for _, member := range members {
+		exported[member.ID] = true
+	}
+	seen := make(map[quepaxa.NodeID]bool, len(voters))
+	for _, voter := range voters {
+		if string(voter.NodeID) != voter.Pod || !exported[voter.NodeID] || seen[voter.NodeID] {
+			return fmt.Errorf("legacy automatic binding voter inventory drifts from the exported membership: frozen entries must match exported node IDs and Pod names one-for-one")
+		}
+		seen[voter.NodeID] = true
+	}
+	return nil
 }
 
 func (c *Controller) claimAutoBinding(ctx context.Context, r *ClusterResource, state *autoControl, uid string) error {
@@ -427,6 +453,58 @@ func clusterMemberSources(r *ClusterResource, sts object, namespace string) ([]q
 	return members, nil
 }
 
+func (c *Controller) validateBootstrappedMembers(ctx context.Context, r *ClusterResource, sts object, adopted bool, members []quepaxa.Member) error {
+	if !adopted {
+		return nil
+	}
+	var secret object
+	err := c.Kube.Get(ctx, c.corePath("secrets", bootstrapSecretName(r)), &secret)
+	if apiNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	service := str(nested(sts, "spec", "serviceName"))
+	if service == "" {
+		return fmt.Errorf("StatefulSet %s spec.serviceName is required for voter DNS names", r.Spec.StatefulSet)
+	}
+	expected := make(map[string]bool, r.Spec.VoterCount)
+	for i := range r.Spec.VoterCount {
+		expected[fmt.Sprintf("%s-%d", r.Spec.StatefulSet, i)] = true
+	}
+	for _, member := range members {
+		pod := string(member.ID)
+		if !expected[pod] {
+			return fmt.Errorf("adopted member node ID %q is not a derived Pod name", pod)
+		}
+		for _, endpoint := range []struct {
+			raw    string
+			scheme string
+			port   int
+		}{{member.URL, "http", r.Spec.HTTPPort}, {member.PeerURL, "quic", r.Spec.PeerPort}} {
+			parsed, err := url.Parse(endpoint.raw)
+			if err != nil || parsed.Scheme != endpoint.scheme || parsed.Port() == "" {
+				return fmt.Errorf("adopted member %s endpoint %q must use %s with an explicit port", pod, endpoint.raw, endpoint.scheme)
+			}
+			if fmt.Sprint(endpoint.port) != parsed.Port() {
+				return fmt.Errorf("adopted member %s endpoint %q port does not match declared %d", pod, endpoint.raw, endpoint.port)
+			}
+			host := strings.TrimSuffix(parsed.Hostname(), ".")
+			allowed := map[string]bool{
+				pod + "." + service:                                                           true,
+				pod + "." + service + "." + c.Kube.Namespace:                                  true,
+				pod + "." + service + "." + c.Kube.Namespace + ".svc":                         true,
+				pod + "." + service + "." + c.Kube.Namespace + ".svc." + r.Spec.ClusterDomain: true,
+			}
+			if !allowed[host] {
+				return fmt.Errorf("adopted member %s endpoint %q host does not name Service %s", pod, endpoint.raw, service)
+			}
+		}
+	}
+	return nil
+}
+
 func (c *Controller) rejectRegisteredCluster(ctx context.Context, clusterID string) error {
 	prefix := path.Join(c.Prefix, clusterID)
 	commitment := path.Join(prefix, "voters/membership.json")
@@ -448,13 +526,12 @@ func (c *Controller) bootstrapCluster(ctx context.Context, r *ClusterResource, s
 	if err != nil {
 		return err
 	}
-	operation := &Resource{
+	secretName := bootstrapSecretName(r)
+	members, err := c.targetCredentials(ctx, &Resource{
 		Metadata: object{"uid": str(r.Metadata["uid"])},
 		Spec:     Spec{RecoveryID: r.Spec.LogicalID},
 		Status:   Status{Target: r.Spec.AdoptClusterID},
-	}
-	secretName := "rhiza-cluster-" + shortID(c.operationID(operation))
-	members, err := c.targetCredentials(ctx, operation, secretName, sources)
+	}, secretName, sources)
 	if err != nil {
 		return err
 	}
@@ -464,6 +541,15 @@ func (c *Controller) bootstrapCluster(ctx context.Context, r *ClusterResource, s
 	applyTargetCredentials(ctr, secretName)
 	asObject(sts["spec"])["replicas"] = float64(r.Spec.VoterCount)
 	return c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts)
+}
+
+func bootstrapSecretName(r *ClusterResource) string {
+	operation := &Resource{
+		Metadata: object{"uid": str(r.Metadata["uid"])},
+		Spec:     Spec{RecoveryID: r.Spec.LogicalID},
+		Status:   Status{Target: r.Spec.AdoptClusterID},
+	}
+	return "rhiza-cluster-" + shortID(str(operation.Metadata["uid"])+":"+r.Spec.LogicalID)
 }
 
 func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) error {
@@ -526,6 +612,9 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		}
 	}
 	if err := voterCountContract(r, sts, members, adopted, checkIDs); err != nil {
+		return block(nil, err.Error())
+	}
+	if err := c.validateBootstrappedMembers(ctx, r, sts, adopted, members); err != nil {
 		return block(nil, err.Error())
 	}
 	if state == nil {

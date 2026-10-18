@@ -1202,6 +1202,99 @@ func TestLegacyBindingMigrationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestLegacyBindingMigrationRejectsIdentityDrift(t *testing.T) {
+	ctx := t.Context()
+	api := &clusterAPI{sts: fakeSTS("before-ack", voterMembers(3))}
+	c := clusterController(t, api)
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.VoterCount, r.Spec.Container = 3, "rhiza"
+	normalizeClusterSpec(r)
+	state := validAutoControl()
+	state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
+	state.BindingVersion = 0
+	state.Voters = []VoterPod{{NodeID: "x1", Pod: "x1"}, {NodeID: "x2", Pod: "x2"}, {NodeID: "x3", Pod: "x3"}}
+	state.BindingHash = legacyAutoBinding(r, state.Voters)
+	if err := c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "drifts from the exported membership") {
+		t.Fatalf("status=%+v", r.Status)
+	}
+}
+
+func TestBootstrappedAdoptedMemberURLForms(t *testing.T) {
+	for _, suffix := range []string{"", ".default", ".default.svc", ".default.svc.cluster.local"} {
+		t.Run("host="+suffix, func(t *testing.T) {
+			api := &clusterAPI{sts: freshClusterSTS(3)}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount = 3
+			normalizeClusterSpec(r)
+			api.secrets = map[string]object{bootstrapSecretName(r): {"immutable": true}}
+			members := make([]quepaxa.Member, 0, 3)
+			for i := range 3 {
+				pod := fmt.Sprintf("rhiza-%d", i)
+				host := pod + ".rhiza-headless" + suffix
+				members = append(members, quepaxa.Member{ID: quepaxa.NodeID(pod), URL: "http://" + host + ":8080", PeerURL: "quic://" + host + ":9090"})
+			}
+			if err := c.validateBootstrappedMembers(t.Context(), r, api.sts, true, members); err != nil {
+				t.Fatalf("valid equivalent host rejected: %v", err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		url  string
+		want string
+	}{{"wrong host", "http://rhiza-9.rhiza-headless:8080", "host does not name Service"}, {"wrong port", "http://rhiza-0.rhiza-headless:8081", "port does not match declared"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &clusterAPI{sts: freshClusterSTS(3)}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount = 3
+			normalizeClusterSpec(r)
+			api.secrets = map[string]object{bootstrapSecretName(r): {"immutable": true}}
+			members := make([]quepaxa.Member, 0, 3)
+			for i := range 3 {
+				pod := fmt.Sprintf("rhiza-%d", i)
+				members = append(members, quepaxa.Member{ID: quepaxa.NodeID(pod), URL: "http://" + pod + ".rhiza-headless:8080", PeerURL: "quic://" + pod + ".rhiza-headless:9090"})
+			}
+			members[0].URL = tc.url
+			if err := c.validateBootstrappedMembers(t.Context(), r, api.sts, true, members); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v want=%q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBootstrapPortChangeBlocksBeforeBinding(t *testing.T) {
+	ctx := t.Context()
+	api := &clusterAPI{sts: freshClusterSTS(3)}
+	c := clusterController(t, api)
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.VoterCount, r.Spec.Bootstrap = 3, true
+	normalizeClusterSpec(r)
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if api.secretCreates != 1 {
+		t.Fatalf("bootstrap creates=%d", api.secretCreates)
+	}
+	r.Spec.HTTPPort = 8081
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "port does not match declared 8081") {
+		t.Fatalf("status=%+v", r.Status)
+	}
+	if _, _, err := c.loadAuto(ctx, c.autoKey(r)); !c.Bucket.IsObjNotFoundErr(err) {
+		t.Fatalf("port change persisted a binding: %v", err)
+	}
+}
+
 type clusterAPI struct {
 	sts           object
 	service       object
