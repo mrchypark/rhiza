@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -514,6 +515,122 @@ func TestControllerRejectsUnknownTargetDurability(t *testing.T) {
 	}
 }
 
+// The voter count, the target replica count, and the frozen credential set must
+// stay one number, and completion must require a strict majority of it.
+func TestControllerVoterCountContract(t *testing.T) {
+	for _, tc := range []struct{ voters, ready int }{
+		{voters: 3, ready: 1},
+		{voters: 3, ready: 2},
+		{voters: 4, ready: 2},
+		{voters: 4, ready: 3},
+		{voters: 5, ready: 2},
+		{voters: 5, ready: 3},
+	} {
+		t.Run(fmt.Sprintf("voters=%d ready=%d", tc.voters, tc.ready), func(t *testing.T) {
+			voters := voterMembers(tc.voters)
+			ctx, bucket, r, api, c := controllerFixtureVoters(t, "before-ack", "before-ack", voters)
+			r.Spec.RecoveryID = "recovery-1"
+			r.Spec.Fence = fence(r)
+			api.unready = map[string]bool{}
+			for i := tc.ready; i < tc.voters; i++ {
+				api.unready[string(voters[i].ID)] = true
+			}
+			for range 8 {
+				c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity}
+				if err := c.reconcileAll(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if r.Status.Stage == "Restarted" {
+					break
+				}
+			}
+			if r.Status.Stage != "Restarted" {
+				t.Fatalf("target did not start: %+v", r.Status)
+			}
+			if replicas := int(number(nested(api.sts, "spec", "replicas"))); replicas != tc.voters {
+				t.Fatalf("target replicas=%d want=%d", replicas, tc.voters)
+			}
+			members, _, tokens := decodedCredentials(t, api.secret)
+			if len(members) != tc.voters || len(tokens) != tc.voters {
+				t.Fatalf("target credentials: members=%d tokens=%d want=%d", len(members), len(tokens), tc.voters)
+			}
+			for _, member := range members {
+				if tokens[string(member.ID)] == "" {
+					t.Fatalf("target peer token missing for %s", member.ID)
+				}
+			}
+			if err := c.reconcileAll(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if len(r.Status.Peers) != tc.voters {
+				t.Fatalf("probed peers=%d want=%d", len(r.Status.Peers), tc.voters)
+			}
+			if tc.ready < tc.voters/2+1 {
+				if r.Status.Phase != "WaitingReady" || r.Status.Stage != "Restarted" {
+					t.Fatalf("below-majority target was not held: %+v", r.Status)
+				}
+				return
+			}
+			if r.Status.Phase != "Complete" {
+				t.Fatalf("majority target did not complete: %+v", r.Status)
+			}
+		})
+	}
+}
+
+func decodedCredentials(t *testing.T, secret object) ([]quepaxa.Member, string, map[string]string) {
+	t.Helper()
+	memberData, err := base64.StdEncoding.DecodeString(str(nested(secret, "data", "members")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var members []quepaxa.Member
+	if err := json.Unmarshal(memberData, &members); err != nil {
+		t.Fatal(err)
+	}
+	tokenData, err := base64.StdEncoding.DecodeString(str(nested(secret, "data", "peer_tokens")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tokens map[string]string
+	if err := json.Unmarshal(tokenData, &tokens); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := base64.StdEncoding.DecodeString(str(nested(secret, "data", "admin")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return members, string(admin), tokens
+}
+
+func TestControllerRejectsVoterCountMismatch(t *testing.T) {
+	ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+	r.Spec.RecoveryID = "recovery-1"
+	r.Spec.Fence = fence(r)
+	asObject(api.sts["spec"])["replicas"] = float64(5)
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if want := "source StatefulSet has 5 desired replicas but RHIZA_CLUSTER_MEMBERS lists 3 voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want message=%q", r.Status, want)
+	}
+	if api.stsPuts != 0 {
+		t.Fatalf("mismatched recovery mutated the StatefulSet: %d puts", api.stsPuts)
+	}
+}
+
+func TestControllerRejectsFewerThanThreeVoters(t *testing.T) {
+	ctx, _, r, _, c := controllerFixtureVoters(t, "before-ack", "before-ack", voterMembers(2))
+	r.Spec.RecoveryID = "recovery-1"
+	r.Spec.Fence = fence(r)
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Blocked" || r.Status.Message != "recovery requires at least three voters" {
+		t.Fatalf("status=%+v", r.Status)
+	}
+}
+
 func fence(r *Resource) Fence {
 	return Fence{RecoveryID: r.Spec.RecoveryID, ClusterID: r.Spec.SourceClusterID, StatefulSetUID: "sts-uid", Confirmed: true, Evidence: "incident-42"}
 }
@@ -526,12 +643,18 @@ func voterMember(clusterID, name, token string) quepaxa.Member {
 
 func controllerFixture(t *testing.T, sourceMode, targetMode string) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
 	t.Helper()
+	return controllerFixtureVoters(t, sourceMode, targetMode, members())
+}
+
+// controllerFixtureVoters builds the same recovery fixture for any supported
+// voter count.
+func controllerFixtureVoters(t *testing.T, sourceMode, targetMode string, voters []quepaxa.Member) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
+	t.Helper()
 	ctx := context.Background()
 	bucket := objstore.NewInMemBucket()
-	members := members()
-	seedArchive(t, ctx, bucket, "root/source", members, sourceMode)
+	seedArchive(t, ctx, bucket, "root/source", voters, sourceMode)
 	r := &Resource{Metadata: map[string]any{"name": "recover", "uid": "resource-uid", "generation": float64(1), "resourceVersion": "1"}, Spec: Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: targetMode}}
-	api := newOperatorAPI(t, r, sourceMode)
+	api := newOperatorAPIVoters(t, r, sourceMode, voters)
 	t.Cleanup(api.Close)
 	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity()}
 }
@@ -554,11 +677,13 @@ type operatorAPI struct {
 	aborts                        []network.MembershipChange
 	changeStatus                  int
 	learnerID                     string
+	voters                        []quepaxa.Member
+	unready                       map[string]bool
 }
 
-func newOperatorAPI(t *testing.T, r *Resource, mode string) *operatorAPI {
-	a := &operatorAPI{r: r, sts: fakeSTS(mode)}
-	for _, member := range members() {
+func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepaxa.Member) *operatorAPI {
+	a := &operatorAPI{r: r, sts: fakeSTS(mode, voters), voters: voters}
+	for _, member := range voters {
 		member := member
 		a.peers = append(a.peers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 			a.mu.Lock()
@@ -600,7 +725,7 @@ func newOperatorAPI(t *testing.T, r *Resource, mode string) *operatorAPI {
 				http.NotFound(w, q)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(network.VoterRecoveryStatus{NodeID: string(member.ID), ClusterID: "rhiza-r-" + shortID("resource-uid:recovery-1"), Durability: "before-ack", Ready: true, Quorum: true, CertifiedTip: 1, AppliedTip: 1})
+			_ = json.NewEncoder(w).Encode(network.VoterRecoveryStatus{NodeID: string(member.ID), ClusterID: "rhiza-r-" + shortID("resource-uid:recovery-1"), Durability: "before-ack", Ready: !a.unready[string(member.ID)], Quorum: true, CertifiedTip: 1, AppliedTip: 1})
 		})))
 	}
 	a.learner = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
@@ -739,7 +864,7 @@ func (a *operatorAPI) pods() []object {
 			continue
 		}
 		result = append(result, object{
-			"metadata": object{"name": string(members()[i].ID), "uid": "pod-" + string(members()[i].ID), "ownerReferences": []any{object{"uid": "sts-uid", "kind": "StatefulSet"}}},
+			"metadata": object{"name": string(a.voters[i].ID), "uid": "pod-" + string(a.voters[i].ID), "ownerReferences": []any{object{"uid": "sts-uid", "kind": "StatefulSet"}}},
 			"status":   object{"podIP": "127.0.0.1"},
 			"spec":     object{"containers": []any{object{"name": "rhiza", "ports": []any{object{"name": "http", "containerPort": float64(p)}}}}},
 		})
@@ -747,12 +872,12 @@ func (a *operatorAPI) pods() []object {
 	return result
 }
 
-func fakeSTS(mode string) object {
-	raw, _ := json.Marshal(members())
+func fakeSTS(mode string, voters []quepaxa.Member) object {
+	raw, _ := json.Marshal(voters)
 	return object{
 		"metadata": object{"name": "rhiza", "uid": "sts-uid", "generation": float64(1), "annotations": object{}},
 		"spec": object{
-			"replicas": float64(3), "volumeClaimTemplates": []any{},
+			"replicas": float64(len(voters)), "volumeClaimTemplates": []any{},
 			"template": object{"spec": object{
 				"containers": []any{object{
 					"name":         "rhiza",
@@ -781,7 +906,15 @@ func apiserverNormalize(sts object) {
 }
 
 func members() []quepaxa.Member {
-	return []quepaxa.Member{voterMember("source", "n1", "old1"), voterMember("source", "n2", "old2"), voterMember("source", "n3", "old3")}
+	return voterMembers(3)
+}
+
+func voterMembers(count int) []quepaxa.Member {
+	voters := make([]quepaxa.Member, 0, count)
+	for i := 1; i <= count; i++ {
+		voters = append(voters, voterMember("source", fmt.Sprintf("n%d", i), fmt.Sprintf("old%d", i)))
+	}
+	return voters
 }
 func storeIdentity() map[string]string {
 	return map[string]string{"RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "https://store.example", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_PREFIX": "root", "RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT": ""}

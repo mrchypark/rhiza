@@ -5,9 +5,16 @@
 
 ## 목표와 한계
 
-3-voter no-PVC StatefulSet의 장애 감지부터 구세대 차단, 데이터 복구, 새 3-voter
-세대의 활성화까지 사고마다 사람의 승인을 요구하지 않는다. 운영자는 배포 시
-자동 전환·async 유실·계획 중단·fencing 범위를 사전 승인한다.
+3개 이상 voter로 구성한 no-PVC StatefulSet에서 장애 감지부터 구세대 차단, 데이터
+복구, 같은 voter 수의 새 세대 활성화까지 사고마다 사람의 승인을 요구하지 않는다.
+운영자는 배포 시 자동 전환·async 유실·계획 중단·fencing 범위를 사전 승인한다.
+
+voter 수는 `spec.voterPods` 항목 수로 정하고, StatefulSet replica 수와
+`RHIZA_CLUSTER_MEMBERS` 항목 수를 같은 값으로 유지한다. 어긋난 값은 복구를
+시작하지 않고 막는다. 최소 voter 수는 3이며 짝수도 허용한다. 세대가 살아 있는
+동안 voter 수는 제자리에서 바꿀 수 없고, 새 세대를 만들거나 재구성으로 voter를
+하나씩 교체한다. 전체 세대 fencing은 보존된 learner 이력을 포함해 최대 16개
+대상을 담으므로 voter 수를 그보다 넉넉히 낮게 유지한다.
 
 완전 자동은 모든 외부 장애 중에도 무조건 복구한다는 뜻이 아니다. Kubernetes,
 공유 저장소, fencing authority, 새 Pod 실행 용량이 사용 가능하고 증거가 유효할
@@ -125,9 +132,9 @@ cluster/membership/version 식별과 운영 API 인증을 사용하여 stale/잘
 | --- | --- |
 | 컨테이너 재시작, 동일 emptyDir/WAL 유지 | 원래 세대로 재시도. Pod 삭제를 유도하지 않음 |
 | 1 voter 일시 불가용, quorum 정상 | Degraded 관찰, 정상 quorum 유지 |
-| 1 voter WAL 유실, 나머지 2개 정상 | 사전 RotateGeneration 정책이면 유예 후 계획된 전체 세대 전환 |
-| 2개 불가용, 1개 응답하지만 quorum 없음 | 유예 동안 원본 복귀 우선. 이후 fencing 가능한 경우 전체 DR |
-| 3개 모두 불가용 | 같은 DR. 살아 있는 voter의 추가 자료를 수집할 수 없다는 차이 |
+| 1 voter WAL 유실, 나머지가 과반 유지 | 사전 RotateGeneration 정책이면 유예 후 계획된 전체 세대 전환 |
+| quorum을 잃을 만큼 불가용, 일부만 응답 | 유예 동안 원본 복귀 우선. 이후 fencing 가능한 경우 전체 DR |
+| 모든 voter 불가용 | 같은 DR. 살아 있는 voter의 추가 자료를 수집할 수 없다는 차이 |
 | Operator에만 안 보이는 기존 majority | 죽었다고 가정하지 않음. 자동 takeover 정책에 따라 그 majority까지 fencing해야 전환 가능 |
 | quorum 정상, before-ack 저장소만 불가용 | 저장소 복원을 기다림. 세대 교체로 해결하려 하지 않음 |
 | 제어면/저장소/fencer 불가용 또는 증거 충돌 | Blocked/대기, 임의 강등·초기화 없음 |
@@ -142,7 +149,7 @@ Automatic takeover는 감시 경로만 끊어진 정상 majority도 의도적으
 첫 구현은 cloud instance 종료/전원 차단, 또는 검증 가능한 bare-metal 전원 제어를
 사용한다. 구체적 provider가 다음을 보장해야 한다.
 
-1. 모든 이전 실행 identity를 포괄한다. voter 3개뿐 아니라 이전 읽기 replica,
+1. 모든 이전 실행 identity를 포괄한다. voter 전체뿐 아니라 이전 읽기 replica,
    archive publisher/GC와 관리되는 임베딩 프로세스가 범위에 들어간다.
 2. 옛 workload의 재스케줄·컨테이너 재시작·VM 복원으로 새 구세대 프로세스가
    생기는 경합을 차단한다. 한번 조회한 Pod UID 목록만 종료하는 것으로 끝내지 않는다.
@@ -188,7 +195,7 @@ quorum으로 정리한 뒤 확정 prefix를 원격 저장한다. Service 트래�
 동일한 gate를 걸고, background proposal도 포함한다. 확인할 수 없는 노드가 있으면
 ACK 무손실 계획 전환이라고 주장하지 않고 DR의 소스 mode 정책을 적용하거나 대기한다.
 
-2~3 voter DR에서는 존재하지 않는 원래 quorum의 drain을 기다리지 않는다.
+quorum을 잃은 DR에서는 존재하지 않는 원래 quorum의 drain을 기다리지 않는다.
 접근 가능한 인증 suffix를 best-effort 보존하고, 강제 fencing 뒤 봉인된 archive를
 기준으로 복구한다. before-ack는 저장소가 보존한 성공 ACK prefix를 복원한다.
 async는 마지막 검증 가능 prefix 이후 성공 쓰기가 유실될 수 있다. 낮은 tip을
@@ -197,7 +204,7 @@ async는 마지막 검증 가능 prefix 이후 성공 쓰기가 유실될 수 �
 
 Fork는 기존 구현처럼 소스 Pod의 emptyDir를 없애기 전에 완료·검증한다.
 전체 세대 전환에는 같은 이름/DNS와 새 ClusterID/namespace/peer/admin 토큰을 쓴다.
-새 voter 둘의 matching quorum과 recovered tip 적용은 최소 검증이고, 여기에
+새 세대에서 과반 voter의 matching quorum과 recovered tip 적용은 최소 검증이고, 여기에
 활성화 전 쓰기 admission gate가 필요하다. 새 세대가 remote Active CAS 이전에
 사용자 쓰기를 받지 않도록 관리 대상 엔진이 Prepared/Active 상태를 이해해야 한다.
 기존 ReadIndex/합의 초기화용 peer traffic과 사용자 쓰기 준비 상태를 혼동하지 않는다.
@@ -213,7 +220,7 @@ cooldown과 단위시간 최대 자동 전환 횟수를 원격 저널에서 계�
 리셋되지 않게 한다. 횟수 초과는 새로운 전환만 막고 진행 중 복구의 재개를 막지 않는다.
 오래된 controller의 fence 명령은 epoch/instance가 다르면 거부한다.
 
-대상 2개 quorum을 얻은 뒤 3개 전체 복원/안정화도 관찰한다. 새 세대 Pod가 다시 WAL을
+대상에서 과반 quorum을 얻은 뒤 voter 전체의 복원/안정화도 관찰한다. 새 세대 Pod가 다시 WAL을
 잃었다면 같은 bootstrap을 반복해 투표 상태를 초기화하지 않는다. 새 사고로 취급하되
 루프 제한과 Degraded 정책을 적용한다.
 
@@ -227,7 +234,7 @@ cooldown과 단위시간 최대 자동 전환 횟수를 원격 저널에서 계�
 2. 논리 root 원격 저널 + RhizaCluster 정책 + 기존 RhizaRecovery idempotent 재사용.
 3. 인증된 진단, 자동 사고 판정, 재시작해도 유지되는 grace/cooldown.
 4. 관리 대상 엔진의 quiesce/활성화 gate와 자동 DR 연동. Go/Rust 임베딩 경로 포함.
-5. 정상 quorum이 있는 단일 voter 유실의 계획 rotation 및 2~3 voter 유실 검증.
+5. 정상 quorum이 있는 단일 voter 유실의 계획 rotation 및 quorum 상실 규모의 voter 유실 검증.
 
 필수 테스트:
 - 구 B/C는 서로·클라이언트와 통신하지만 Operator에서는 안 보임: 확인된 fence 전

@@ -43,9 +43,15 @@ spec:
                     resources. When set, every generated RhizaRecovery inherits this
                     anchorID and the workload must export RHIZA_RECOVERY_ANCHOR_ID.
                 voterPods:
+                  description: >-
+                    Authoritative voter list for the source and the replacement
+                    generation. Its length is the voter count: the StatefulSet
+                    must declare the same number of desired replicas and export
+                    the same number of RHIZA_CLUSTER_MEMBERS entries. The
+                    minimum is three, even counts are supported, and the count
+                    cannot be changed in place.
                   type: array
                   minItems: 3
-                  maxItems: 3
                   items:
                     type: object
                     required: [nodeID, pod]

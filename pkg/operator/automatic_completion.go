@@ -120,7 +120,7 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 			ready[peer.NodeID] = true
 		}
 	}
-	if len(ready) < 2 {
+	if len(ready) < len(members)/2+1 {
 		return fmt.Errorf("executor did not record the recovered target quorum")
 	}
 	inventory, podNames := map[string]string{}, map[string]bool{}

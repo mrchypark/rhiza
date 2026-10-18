@@ -197,8 +197,8 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 			return block(nil, "invalid cluster binding")
 		}
 	}
-	if str(r.Metadata["uid"]) == "" || len(r.Spec.VoterPods) != 3 {
-		return block(nil, "cluster UID and exactly three bootstrap voter mappings are required")
+	if str(r.Metadata["uid"]) == "" || len(r.Spec.VoterPods) < 3 {
+		return block(nil, "cluster UID and at least three bootstrap voter mappings are required")
 	}
 	if r.Spec.Container == "" {
 		r.Spec.Container = "rhiza"
@@ -279,6 +279,19 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	}
 	if !r.Spec.Automatic || r.Metadata["deletionTimestamp"] != nil {
 		return c.autoStatus(ctx, r, state, "Manual", "new automatic recovery is suspended")
+	}
+	// The voter list, the workload environment, and the replica count are one
+	// contract; reconciling a mismatch as an outage would fence a live majority.
+	replicas := int(number(nested(sts, "spec", "replicas")))
+	if replicas != len(r.Spec.VoterPods) {
+		return block(state, fmt.Sprintf("StatefulSet has %d desired replicas but voterPods lists %d voters", replicas, len(r.Spec.VoterPods)))
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil {
+		return block(state, err.Error())
+	}
+	if len(members) != len(r.Spec.VoterPods) {
+		return block(state, fmt.Sprintf("RHIZA_CLUSTER_MEMBERS lists %d voters but voterPods lists %d", len(members), len(r.Spec.VoterPods)))
 	}
 	obs, statuses, err := c.observeAutomatic(ctx, r, state, sts)
 	if err != nil {

@@ -2,11 +2,13 @@ package operator
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/thanos-io/objstore"
 )
 
 // The child really completed before all target membership endpoints disappear.
@@ -104,15 +107,11 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	}
 }
 
-func testAutomaticCompletionOutcome(t *testing.T, mode string) {
-	legacy := strings.HasPrefix(mode, "legacy completed child")
-	partial := strings.HasPrefix(mode, "failure before identity capture") || legacy
-	twoFailures := mode == "two target failures after adoption"
-	targetMode := "before-ack"
-	if strings.HasSuffix(mode, " async") {
-		targetMode = "async"
-	}
-	ctx, bucket, child, api, c := controllerFixture(t, "before-ack", targetMode)
+// automaticTargetFixture drives the shared recovery fixture to a restarted
+// target that already carries the annotations an automatic child has.
+func automaticTargetFixture(t *testing.T, targetMode string, voters []quepaxa.Member) (context.Context, objstore.Bucket, *Resource, *operatorAPI, *Controller) {
+	t.Helper()
+	ctx, bucket, child, api, c := controllerFixtureVoters(t, "before-ack", targetMode, voters)
 	if targetMode == "async" {
 		// The shared fixture's recovery HTTP responder is fixed to before-ack;
 		// serve this candidate's actual configured target mode instead.
@@ -142,6 +141,121 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		}
 	}
 	child.Metadata["annotations"] = object{automaticOwner: "binding-uid-1", automaticLogical: "logical-1"}
+	return ctx, bucket, child, api, c
+}
+
+// Automatic observation and completion must follow the configured voter count,
+// not the two-ready-peer threshold of a three-voter cluster.
+func TestAutomaticVoterMajorityCompletion(t *testing.T) {
+	for _, tc := range []struct{ voters, ready int }{
+		{voters: 3, ready: 1},
+		{voters: 3, ready: 2},
+		{voters: 4, ready: 2},
+		{voters: 4, ready: 3},
+		{voters: 5, ready: 2},
+		{voters: 5, ready: 3},
+	} {
+		t.Run(fmt.Sprintf("voters=%d ready=%d", tc.voters, tc.ready), func(t *testing.T) {
+			voters := voterMembers(tc.voters)
+			ctx, bucket, child, api, c := automaticTargetFixture(t, "before-ack", voters)
+			ids := make([]string, 0, tc.voters)
+			for _, member := range voters {
+				ids = append(ids, string(member.ID))
+			}
+			api.membership = map[string]network.MembershipStatus{}
+			for _, id := range ids {
+				status := membershipStatus(id, 1, ids...)
+				status.ClusterID, status.WALIdentity = child.Status.Target, "target-wal-"+id
+				api.membership[id] = status
+			}
+			if err := c.startAndObserve(ctx, child, api.sts); err != nil {
+				t.Fatal(err)
+			}
+			if child.Status.Phase != "Complete" || len(child.Status.TargetIdentities) != tc.voters {
+				t.Fatalf("target did not complete: %+v", child.Status)
+			}
+			r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
+			state := validAutoControl()
+			state.StatefulSetUID, state.Voters = "sts-uid", nil
+			for _, id := range ids {
+				state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(id), Pod: id})
+			}
+			r.Spec.VoterPods = state.Voters
+			observed := *state
+			observed.ActiveClusterID, observed.Identities = child.Status.Target, map[quepaxa.NodeID]FenceTarget{}
+			if obs, _, err := c.observeAutomatic(ctx, r, &observed, api.sts); err != nil || !obs.Known || obs.Voters != tc.voters || obs.Reachable != tc.voters {
+				t.Fatalf("observation of %d voters: %+v err=%v", tc.voters, obs, err)
+			}
+			targets := make([]FenceTarget, 0, tc.voters)
+			for _, id := range ids {
+				targets = append(targets, FenceTarget{NodeID: id, Pod: id})
+			}
+			request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: r.Spec.StatefulSet, StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recovery-1", Scope: ScopeGeneration, Targets: targets}
+			hash, err := requestHash(&request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+			child.Metadata["name"] = "recovery-1"
+			child.Spec.Container = "rhiza"
+			child.Spec.Fence.Evidence = state.Intent.Proof.ProofID
+			child.Status.SpecHash = immutableSpecHash(child.Spec)
+			state.Intent.SpecHash = hashJSON(child.Spec)
+			if err := bucket.Upload(ctx, "root/source/recovery/successor.json", bytes.NewReader(jsonBytes(c.reservation(child)))); err != nil {
+				t.Fatal(err)
+			}
+			c.Fencer = &countingFencer{count: new(int)}
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+				if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recovery-1") {
+					json.NewEncoder(w).Encode(child)
+					return
+				}
+				if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {
+					json.NewEncoder(w).Encode(r)
+					return
+				}
+				api.serve(w, q)
+			}))
+			t.Cleanup(server.Close)
+			c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
+			if err := c.saveAuto(ctx, r, state, nil); err != nil {
+				t.Fatal(err)
+			}
+			loaded, version, err := c.loadAuto(ctx, c.autoKey(r))
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.membership = nil
+			child.Status.Peers = child.Status.Peers[:tc.ready]
+			if err := c.advanceAutomatic(ctx, r, loaded, version, api.sts); err != nil {
+				t.Fatal(err)
+			}
+			next, _, err := c.loadAuto(ctx, c.autoKey(r))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.ready < tc.voters/2+1 {
+				if next.Intent == nil || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "did not record the recovered target quorum") {
+					t.Fatalf("below-majority target was accepted: %+v status=%+v", next, r.Status)
+				}
+				return
+			}
+			if next.Intent != nil || len(next.Voters) != tc.voters || next.ActiveClusterID != child.Status.Target || r.Status.Phase != "Stabilizing" {
+				t.Fatalf("majority target was not installed: active=%s pending=%t voters=%d status=%+v", next.ActiveClusterID, next.Intent != nil, len(next.Voters), r.Status)
+			}
+		})
+	}
+}
+
+func testAutomaticCompletionOutcome(t *testing.T, mode string) {
+	legacy := strings.HasPrefix(mode, "legacy completed child")
+	partial := strings.HasPrefix(mode, "failure before identity capture") || legacy
+	twoFailures := mode == "two target failures after adoption"
+	targetMode := "before-ack"
+	if strings.HasSuffix(mode, " async") {
+		targetMode = "async"
+	}
+	ctx, bucket, child, api, c := automaticTargetFixture(t, targetMode, members())
 	api.membership = map[string]network.MembershipStatus{}
 	for _, id := range []string{"n1", "n2", "n3"} {
 		if partial && (id == "n3" || strings.HasSuffix(mode, " empty")) {

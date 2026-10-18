@@ -1,5 +1,8 @@
 # Apply only after configuring a trusted fencing executor/backend and installing
 # cluster-crd.yaml (and fence-crd.yaml for the Kubernetes backend). Durations are explicit deployment choices, not inferred defaults.
+# voterPods lists every voter and its length is the voter count: set the
+# StatefulSet replicas to the same number, and keep it below the 16-target
+# generation-fencing bound.
 apiVersion: rhiza.mrchypark.dev/v1alpha1
 kind: RhizaCluster
 metadata:

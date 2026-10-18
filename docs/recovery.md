@@ -12,8 +12,8 @@ process permission to forget an existing voter's recorded proposals.
 | Restart with the original intact WAL | Restore recorder state and replay certified decisions. |
 | Detected SQLite/Graph open failure | Quarantine materializers and rebuild from retained certified history. |
 | Voter falls behind | Fetch certified peer/archive history; restore a pinned checkpoint when needed. |
-| One of three voters unavailable | The remaining majority continues quorum operations. |
-| Two of three voters temporarily unavailable | Restore the original nodes/disks/network. Quorum operations remain unavailable; local reads on running nodes remain possible. |
+| One voter unavailable | The remaining majority continues quorum operations. |
+| Fewer voters than a majority temporarily unavailable | Restore the original nodes/disks/network. Quorum operations remain unavailable; local reads on running nodes remain possible. |
 | Voter WAL permanently lost | Never reuse its registered identity with an empty WAL. With a surviving quorum, fence the lost voter and replace it through a fresh learner; otherwise use explicitly fenced whole-generation recovery. |
 | Membership change or learner promotion | Supported through opt-in authenticated reconfiguration with a surviving quorum, fencing, and durable learner admission. Editing the bootstrap member list is not reconfiguration. |
 
@@ -95,8 +95,11 @@ guaranteed maximum loss window.
 ## No-PVC recovery operator
 
 The namespace-scoped [recovery operator](../deploy/operator/README.md) supports
-both `async` and `before-ack` for an existing three-voter, `emptyDir` StatefulSet.
-Two or three lost WALs use the same full-generation disaster-recovery path.
+both `async` and `before-ack` for an existing `emptyDir` StatefulSet of at least
+three voters. The voter count comes from `RhizaCluster.spec.voterPods` and must
+equal the StatefulSet replica count; the operator rejects a mismatch. Quorum and
+completion need only the strict majority of that membership. Lost WALs that
+leave less than a majority use the same full-generation disaster-recovery path.
 Preserved WALs should first regain their original quorum; missing pods and
 failed probes alone never authorize a generation change.
 

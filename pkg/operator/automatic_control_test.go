@@ -4,6 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -772,5 +777,69 @@ func TestAuthorizeAutomaticChildRejectsIncompleteProof(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("should not authorize child with incomplete proof")
+	}
+}
+
+// The voter list length, the workload environment, and the replica count are one
+// contract; a mismatch must be rejected instead of reconciled as an outage.
+func TestReconcileClusterRequiresMatchingVoterCount(t *testing.T) {
+	ctx := context.Background()
+	sts := fakeSTS("before-ack", voterMembers(3))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/statefulsets/") {
+			json.NewEncoder(w).Encode(sts)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{})
+	})
+	server := httptest.NewTLSServer(handler)
+	defer server.Close()
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := autoController(autoBucket(t))
+	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.Container, r.Spec.Automatic = "rhiza", true
+	state := validAutoControl()
+	state.BindingUID, state.BindingHash, state.StatefulSetUID = "uid-1", autoBinding(r), "sts-uid"
+	state.Voters = r.Spec.VoterPods
+	if err := c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	asObject(sts["spec"])["replicas"] = float64(4)
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "StatefulSet has 4 desired replicas but voterPods lists 3 voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+
+	asObject(sts["spec"])["replicas"] = float64(3)
+	ctr, err := container(sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(voterMembers(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(raw)})
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "RHIZA_CLUSTER_MEMBERS lists 4 voters but voterPods lists 3"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+
+	r.Spec.VoterPods = r.Spec.VoterPods[:2]
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "cluster UID and at least three bootstrap voter mappings are required"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
 	}
 }
