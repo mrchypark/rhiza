@@ -10,7 +10,7 @@ alone still does not install a runtime fencing authority.
 
 These manifests deploy a namespace-scoped controller for `RhizaRecovery`
 and opt-in automatic recovery through `RhizaCluster`.
-It monitors an **existing three-voter StatefulSet**. It does not create a
+It monitors an **existing StatefulSet of at least three voters**. It does not create a
 database, PVCs, or a new membership from scratch.
 
 `no-pvc/` is a separate, render-only Kustomize input for the recovery
@@ -114,15 +114,36 @@ alone: a partitioned old voter can still retain voting authority.
 The controller accepts only the no-PVC contract: database state is on an
 `emptyDir` volume at `RHIZA_DATA_DIR` (default `/data`) without `subPath`.
 This makes the replacement generation explicit. It is not a rolling upgrade:
-after a valid fence and source capture, the old three-voter generation is
+after a valid fence and source capture, the old generation is
 replaced as a whole. Never roll one new voter at a time into the old fixed
 membership and do not reuse old PVCs.
 
 The operator container has a read-only root filesystem and mounts an
 `emptyDir` at `/tmp` for the recovery worker's temporary WAL files.
 
-Local qualification used an isolated kind cluster and MinIO: two lost Pods
-reported a missing quorum without automatic replacement; after runtime-confirmed
+## Voter count
+
+`spec.voterPods` is the authoritative voter list, and its length is the voter
+count for the source generation and for the replacement generation. The
+StatefulSet must declare exactly that many desired replicas and export the same
+number of `RHIZA_CLUSTER_MEMBERS` entries; the controller rejects a mismatch with
+a message naming both numbers instead of recovering. The minimum is three. Even
+counts are supported, because QuePaxa requires only a strict majority of the
+configured membership for quorum and completion. The count cannot be changed in
+place: use a new generation or change one voter at a time through
+reconfiguration. Generation fencing must name every voter plus the retained
+learner history, and `RhizaFence.spec.targets` admits 16 of them. Automatic
+recovery refuses to bind a `voterPods` list longer than that and blocks before
+reserving or starting a fence whose scope exceeds the bound, naming both numbers
+in either case, so keep the voter count comfortably below sixteen.
+A recovery is declared `Complete` only when the target StatefulSet declares
+exactly that many desired replicas and every configured voter's identity was
+authenticated first; a scaled-down target stays `Blocked` or `WaitingReady`
+instead of becoming the next generation.
+
+Local qualification used an isolated kind cluster and MinIO: in the three-voter
+deployment, two lost Pods reported a missing quorum without automatic
+replacement; after runtime-confirmed
 termination of the original voters, both async → before-ack and before-ack →
 async recovery reached Complete, preserved archived SQL rows, and accepted new
 writes. Unit tests cover interrupted status writes and credential reuse. This

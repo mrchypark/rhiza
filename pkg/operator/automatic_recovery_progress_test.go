@@ -373,3 +373,84 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 		t.Fatalf("next committed inventory retained failed identity: %+v", state)
 	}
 }
+
+// The Kubernetes fencing backend admits a fixed number of targets, so
+// automatic recovery must never reserve a scope the outage cannot execute.
+func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		voters   int
+		learners int
+		blocked  bool
+		want     string
+	}{
+		{name: "voters at capacity", voters: 16},
+		{name: "voters plus history at capacity", voters: 15, learners: 1},
+		{name: "voter list over capacity", voters: 17, blocked: true, want: "voterPods lists 17 voters but one fencing request admits 16"},
+		{name: "voters plus history over capacity", voters: 16, learners: 1, blocked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			voters := voterMembers(tc.voters)
+			_, _, _, api, c := controllerFixtureVoters(t, "before-ack", "before-ack", voters)
+			ctr, err := container(api.sts, "rhiza")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"})
+			r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
+			r.Spec.Container, r.Spec.Automatic = "rhiza", true
+			r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+			voterPods := make([]VoterPod, 0, tc.voters)
+			for _, member := range voters {
+				voterPods = append(voterPods, VoterPod{NodeID: member.ID, Pod: string(member.ID)})
+			}
+			r.Spec.VoterPods = voterPods
+			state := validAutoControl()
+			state.BindingUID, state.StatefulSetUID = "binding-uid-1", "sts-uid"
+			state.BindingHash = autoBinding(r)
+			state.Voters, state.SuspectedSince = voterPods, time.Now().Add(-time.Hour)
+			for _, member := range voters {
+				state.Identities[member.ID] = FenceTarget{NodeID: string(member.ID), Pod: string(member.ID), PodUID: "pod-" + string(member.ID), WALIdentity: "wal-" + string(member.ID)}
+			}
+			for i := range tc.learners {
+				pod := "learner-" + strconv.Itoa(i)
+				state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: "retire-1", CredentialUID: "cred-1", Target: FenceTarget{NodeID: pod, Pod: pod, PodUID: "pod-" + pod, WALIdentity: "wal-" + pod}})
+			}
+			c.Fencer = &countingFencer{count: new(int)}
+			api.membership = nil
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+				if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {
+					json.NewEncoder(w).Encode(r)
+					return
+				}
+				api.serve(w, q)
+			}))
+			t.Cleanup(server.Close)
+			c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
+			if err := c.saveAuto(ctx, r, state, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.reconcileCluster(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+			loaded, _, err := c.loadAuto(ctx, c.autoKey(r))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.blocked {
+				if loaded.Intent == nil || loaded.Intent.Request.Scope != ScopeGeneration || len(loaded.Intent.Request.Targets) != fenceTargetCapacity || r.Status.Phase != string(AutoRecover) {
+					t.Fatalf("capacity boundary did not reserve fencing: %+v status=%+v", loaded.Intent, r.Status)
+				}
+				return
+			}
+			want := tc.want
+			if want == "" {
+				want = strconv.Itoa(tc.voters+tc.learners) + " targets exceed the fence capacity of " + strconv.Itoa(fenceTargetCapacity)
+			}
+			if loaded.Intent != nil || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, want) {
+				t.Fatalf("unfenceable scope was reserved: %+v status=%+v want=%q", loaded.Intent, r.Status, want)
+			}
+		})
+	}
+}

@@ -168,11 +168,13 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if err != nil {
 		return reject(err.Error())
 	}
-	if len(members) != 3 {
-		return reject("recovery requires exactly three voters")
+	if len(members) < 3 {
+		return reject("recovery requires at least three voters")
 	}
-	if r.Status.Stage == "" && number(nested(sts, "spec", "replicas")) != 3 {
-		return reject("source StatefulSet must have three desired replicas")
+	// Before the source is stopped, the declared membership and the replica count
+	// are one contract; a mismatch would recover a different generation.
+	if replicas := int(number(nested(sts, "spec", "replicas"))); r.Status.Stage == "" && replicas != len(members) {
+		return reject(fmt.Sprintf("source StatefulSet has %d desired replicas but RHIZA_CLUSTER_MEMBERS lists %d voters", replicas, len(members)))
 	}
 	mode := env["RHIZA_OBJSTORE_DURABILITY"]
 	if mode == "" {
@@ -483,7 +485,7 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			// cannot clear.
 			values = replaceEnv(values, "RHIZA_PEER_TOKEN", object{"value": ""})
 			ctr["env"] = values
-			asObject(sts["spec"])["replicas"] = float64(3)
+			asObject(sts["spec"])["replicas"] = float64(len(members))
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
 				return err
 			}
@@ -496,6 +498,11 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	actual, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
 	if err != nil || env["RHIZA_CLUSTER_ID"] != r.Status.Target || env["RHIZA_OBJSTORE_DURABILITY"] != r.Spec.Durability || sourceFingerprint(r.Status.Target, r.Spec.Durability, actual, c.Prefix) != sourceFingerprint(r.Status.Target, r.Spec.Durability, members, c.Prefix) {
 		return c.record(ctx, r, "Blocked", "active target configuration changed")
+	}
+	// A target that lost desired replicas never completes: the frozen membership
+	// and the installed workload must stay one-for-one.
+	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(members) {
+		return c.record(ctx, r, "Blocked", fmt.Sprintf("target StatefulSet has %d desired replicas but %d target voters are frozen", replicas, len(members)))
 	}
 	peers, err := c.probe(ctx, r, sts)
 	if err != nil {
@@ -512,7 +519,7 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			ready[peer.NodeID] = true
 		}
 	}
-	if len(ready) < 2 {
+	if len(ready) < len(members)/2+1 {
 		return c.record(ctx, r, "WaitingReady", "waiting for a matching recovered quorum")
 	}
 	if str(nested(r.Metadata, "annotations", automaticOwner)) != "" {
@@ -821,7 +828,7 @@ func (c *Controller) targetCredentials(ctx context.Context, r *Resource, name st
 		return nil, fmt.Errorf("invalid target credentials")
 	}
 	members, err := recoveryMembers(string(data))
-	if err != nil || len(members) != 3 {
+	if err != nil || len(members) < 3 {
 		return nil, fmt.Errorf("invalid target membership")
 	}
 	admin, err := base64.StdEncoding.DecodeString(str(nested(secret, "data", "admin")))
@@ -841,6 +848,11 @@ func (c *Controller) targetCredentials(ctx context.Context, r *Resource, name st
 		}
 	}
 	if source != nil {
+		// A reused immutable Secret must name exactly the voters being replaced;
+		// a subset would fork a smaller generation than the one it succeeds.
+		if len(members) != len(source) {
+			return nil, fmt.Errorf("target credentials preserve %d of %d source voters", len(members), len(source))
+		}
 		old := map[quepaxa.NodeID]quepaxa.Member{}
 		for _, m := range source {
 			old[m.ID] = m

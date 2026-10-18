@@ -4,6 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -773,4 +779,166 @@ func TestAuthorizeAutomaticChildRejectsIncompleteProof(t *testing.T) {
 	if ok {
 		t.Fatal("should not authorize child with incomplete proof")
 	}
+}
+
+// The voter list length, the workload environment, and the replica count are one
+// contract; a mismatch must be rejected instead of reconciled as an outage.
+func TestReconcileClusterRequiresMatchingVoterCount(t *testing.T) {
+	ctx := context.Background()
+	sts := fakeSTS("before-ack", voterMembers(3))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/statefulsets/") {
+			json.NewEncoder(w).Encode(sts)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{})
+	})
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := autoController(autoBucket(t))
+	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.Container, r.Spec.Automatic = "rhiza", true
+	state := validAutoControl()
+	state.BindingUID, state.BindingHash, state.StatefulSetUID = "uid-1", autoBinding(r), "sts-uid"
+	state.Voters = r.Spec.VoterPods
+	if err := c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	asObject(sts["spec"])["replicas"] = float64(4)
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "StatefulSet has 4 desired replicas but voterPods lists 3 voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+
+	asObject(sts["spec"])["replicas"] = float64(3)
+	ctr, err := container(sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(voterMembers(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(raw)})
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "RHIZA_CLUSTER_MEMBERS lists 4 voters but voterPods lists 3"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+
+	r.Spec.VoterPods = r.Spec.VoterPods[:2]
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "cluster UID and at least three bootstrap voter mappings are required"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+}
+
+// The count contract must hold before an initial binding freezes the voter list;
+// otherwise a typo could only be answered by editing the workload.
+func TestReconcileClusterValidatesVoterCountBeforeBinding(t *testing.T) {
+	ctx := context.Background()
+	c, r, _ := boundClusterFixture(t, voterMembers(3))
+	r.Spec.VoterPods = append(append([]VoterPod(nil), r.Spec.VoterPods...), VoterPod{NodeID: "n4", Pod: "rhiza-3"})
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "StatefulSet has 3 desired replicas but voterPods lists 4 voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+	if _, _, err := c.loadAuto(ctx, c.autoKey(r)); !c.Bucket.IsObjNotFoundErr(err) {
+		t.Fatalf("mismatched voter list froze a control record: %v", err)
+	}
+	if exists, err := c.Bucket.Exists(ctx, bindingPath(c)); err != nil || exists {
+		t.Fatalf("mismatched voter list froze the workload binding: exists=%t err=%v", exists, err)
+	}
+
+	r.Spec.VoterPods = r.Spec.VoterPods[:3]
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Observing" || r.Status.Message != "durable cluster binding created" {
+		t.Fatalf("corrected voter list was not accepted: %+v", r.Status)
+	}
+	state, _, err := c.loadAuto(ctx, c.autoKey(r))
+	if err != nil || len(state.Voters) != 3 || state.BindingHash != autoBinding(r) {
+		t.Fatalf("corrected voter list was not bound: %+v err=%v", state, err)
+	}
+}
+
+// A voter list longer than one fencing request admits must be refused before it
+// is frozen; binding it would block the first generation-wide incident forever.
+func TestReconcileClusterRejectsUnfenceableVoterList(t *testing.T) {
+	ctx := context.Background()
+	c, r, _ := boundClusterFixture(t, voterMembers(fenceTargetCapacity+1))
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if want := "voterPods lists 17 voters but one fencing request admits 16"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+	if _, _, err := c.loadAuto(ctx, c.autoKey(r)); !c.Bucket.IsObjNotFoundErr(err) {
+		t.Fatalf("unfenceable voter list froze a control record: %v", err)
+	}
+	if exists, err := c.Bucket.Exists(ctx, bindingPath(c)); err != nil || exists {
+		t.Fatalf("unfenceable voter list froze the workload binding: exists=%t err=%v", exists, err)
+	}
+}
+
+func bindingPath(c *Controller) string {
+	return path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, "sts-uid", "binding.json")
+}
+
+// boundClusterFixture builds a bootstrap-ready controller and cluster resource
+// whose StatefulSet declares one replica and one member per voter.
+func boundClusterFixture(t *testing.T, voters []quepaxa.Member) (*Controller, *ClusterResource, object) {
+	t.Helper()
+	sts := fakeSTS("before-ack", voters)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/statefulsets/") {
+			json.NewEncoder(w).Encode(sts)
+			return
+		}
+		if q.Method == http.MethodPut && strings.HasSuffix(q.URL.Path, "/status") {
+			var body map[string]any
+			json.NewDecoder(q.Body).Decode(&body)
+			json.NewEncoder(w).Encode(body)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{})
+	})
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := autoController(autoBucket(t))
+	c.StoreIdentity = storeIdentity()
+	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
+	ctr, err := container(sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.Container, r.Spec.Automatic = "rhiza", true
+	pods := make([]VoterPod, 0, len(voters))
+	for _, member := range voters {
+		pods = append(pods, VoterPod{NodeID: member.ID, Pod: string(member.ID)})
+	}
+	r.Spec.VoterPods = pods
+	return c, r, sts
 }

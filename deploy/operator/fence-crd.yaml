@@ -36,6 +36,9 @@ spec:
                 operationID: {type: string, maxLength: 256, minLength: 1}
                 scope: {type: string, enum: [Voter, Generation]}
                 targets:
+                  description: >-
+                    Every voter of the fenced generation plus retained learner
+                    history. Keep the voter count comfortably below this bound.
                   type: array
                   maxItems: 16
                   items:

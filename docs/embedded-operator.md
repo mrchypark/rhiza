@@ -6,8 +6,14 @@ Operator가 복구할 수 있다. 별도의 Rhiza 서버 프로세스나 데이�
 
 외부 앵커 검증 서비스를 구축하는 방법은 [Recovery Anchor](recovery-anchor.md)를 참고한다.
 
-이 기능은 기존 **3-voter StatefulSet + emptyDir(no-PVC) + 공유 오브젝트 저장소**를
-대상으로 한다. 소스 세대의 복구 자료를 검증하고 새 세대로 복사한 다음,
+이 기능은 기존 **3개 이상의 voter로 구성한 StatefulSet + emptyDir(no-PVC) +
+공유 오브젝트 저장소**를 대상으로 한다. voter 수는 `RhizaCluster.spec.voterPods`
+항목 수로 정한다. StatefulSet은 같은 수의 replica를 선언하고, 같은 수의
+`RHIZA_CLUSTER_MEMBERS` 항목을 내보내야 한다. 두 값이 어긋나면 Operator는 복구를
+시작하지 않고 두 값을 함께 알려 주는 오류를 남긴다. 최소 voter 수는 3이며 홀수
+제약이 없으므로 짝수도 지원한다. 세대가 살아 있는 동안 voter 수는 제자리에서 바꿀
+수 없고, 새 세대를 만들거나 재구성으로 voter를 하나씩 교체해야 한다.
+소스 세대의 복구 자료를 검증하고 새 세대로 복사한 다음,
 애플리케이션 Pod 전체를 재시작한다. Pod 이름·peer 주소는 유지하지만
 ClusterID와 peer/admin 토큰은 바뀐다. 애플리케이션의 다른 emptyDir 상태도
 사라지므로, 필요한 업무 상태는 Rhiza 또는 별도 영속 저장소에 두어야 한다.
@@ -78,7 +84,7 @@ Operator는 컨테이너의 `RHIZA_*` 환경 설정을 읽고 다음 항목을 �
 | 환경 변수 | 의미 |
 | --- | --- |
 | `RHIZA_CLUSTER_ID` | 세대별 클러스터 ID |
-| `RHIZA_CLUSTER_MEMBERS` | 3개 member의 JSON. 각 항목은 `node_id`, `url`, `peer_url`, base64 Ed25519 `public_key`를 포함 |
+| `RHIZA_CLUSTER_MEMBERS` | member 목록의 JSON. 항목 수가 voter 수이며 StatefulSet replica 수와 `RhizaCluster.spec.voterPods` 항목 수에 맞춘다. 각 항목은 `node_id`, `url`, `peer_url`, base64 Ed25519 `public_key`를 포함한다 |
 | `RHIZA_PEER_TOKENS` | 노드별 비공개 peer 토큰의 JSON map. StatefulSet은 Pod 템플릿 하나로 replica별 Secret을 마운트할 수 없어 각 Pod가 자기 `RHIZA_NODE_ID` 항목을 선택한다. `RHIZA_PEER_TOKEN`(단일 값)과 동시에 설정할 수 없다 |
 | `RHIZA_ADMIN_TOKEN` | 복구 archive 발행 인증 토큰 |
 | `RHIZA_OBJSTORE_DURABILITY` | `async` 또는 `before-ack` |
@@ -101,6 +107,7 @@ fallback하거나 peer 상태를 지우고 기존 세대로 재가입하면 안 
 
 ```yaml
 spec:
+  # voter 수와 같게 맞춘다(최소 3, 짝수 허용).
   replicas: 3
   podManagementPolicy: Parallel
   updateStrategy:
@@ -156,8 +163,9 @@ spec:
 이미 no-PVC로 준비된 배포의 복구용이다.
 
 headless Service에는 `publishNotReadyAddresses: true`와 peer UDP 포트를 설정한다.
-멤버 ID는 `myapp-0`부터 `myapp-2`, peer URL은 예를 들어
-`quic://myapp-0.myapp-peers.NAMESPACE.svc.cluster.local:9090` 형태다.
+멤버 ID는 `myapp-0`부터 `myapp-N-1`까지 차례로 붙이며, 여기서 N은 voter 수다.
+peer URL은 예를 들어 `quic://myapp-0.myapp-peers.NAMESPACE.svc.cluster.local:9090`
+형태다.
 초기 `rhiza-peer-credentials`는 admin 토큰과 노드별 peer 토큰 map을 담은 Secret으로
 별도 생성한다. 공개 멤버십에는 각 노드의 `public_key`만 실리므로 복제되는
 membership, checkpoint, archive에는 비공개 토큰이 남지 않는다. 실제 자격 증명을
@@ -218,10 +226,13 @@ peer의 Ready/Quorum과 상태 메시지를 확인한다.
 자동 복구는 [Operator 배포 안내](../deploy/operator/README.md#automatic-recovery-with-kubernetes-fencing)의
 `RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`로 켜며 모든 voter의
 opt-in이 필요하다. 각 voter 프로세스에 `RHIZA_ENABLE_RECONFIGURATION=true`를 명시적으로 설정한다.
+`RhizaCluster.spec.voterPods`에 모든 voter를 `nodeID`·`pod`로 나열하며, 항목 수가 voter 수다.
+전체 세대 fencing은 voter와 보존된 learner 이력을 합쳐 16개 대상까지만 예약할 수 있으므로
+voter 수를 그보다 넉넉히 낮게 유지한다.
 executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
 command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
 
-## 5. 두 개 또는 전체 Pod 유실 후 복구
+## 5. quorum을 잃을 만큼 Pod를 유실한 뒤 복구
 
 1. 기존 노드·네트워크를 복원할 수 있으면 먼저 복원한다. quorum이 없다는
    사실만으로 새 세대를 시작하지 않는다.
@@ -236,11 +247,12 @@ command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
    certified archive가 필요하며, archive가 없다고 데이터 유실 동의로 우회할 수 없다.
    `spec.durability`는 **복구 후 대상 세대**의 모드이며 소스의 보장을 바꾸지 않는다.
 5. Operator는 가능한 소스 suffix 수집, 유일한 successor 예약, archive seal,
-   대상 복사·검증을 거쳐 3개 Pod를 새 세대로 재시작한다. 중단되면 같은 CR로
+   대상 복사·검증을 거쳐 voter 수만큼의 Pod를 새 세대로 재시작한다. 새 세대의
+   voter 수는 소스와 같으며, 복구로 voter 수를 바꿀 수 없다. 중단되면 같은 CR로
    재개한다. 예약 후 CR을 삭제하거나 source/recoveryID를 바꾸지 않는다.
-6. `Complete`와 두 개 이상의 일치하는 target quorum을 확인하고 애플리케이션의
-   업무 읽기/쓰기를 검증한다. 다음 복구에는 완료된 대상 ClusterID를 소스로
-   별도 CR을 생성한다.
+6. `Complete`와 구성된 voter 수의 과반(`n/2+1`)에 해당하는 일치하는 target
+   quorum을 확인하고 애플리케이션의 업무 읽기/쓰기를 검증한다. 다음 복구에는
+   완료된 대상 ClusterID를 소스로 별도 CR을 생성한다.
 
 before-ack는 성공 응답한 쓰기의 내구성 계약이다. 장애 직전 읽기로 관찰한
 모든 미응답 쓰기까지 보존한다는 뜻은 아니다. 애플리케이션의 업무 토큰·외부

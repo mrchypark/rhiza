@@ -190,6 +190,29 @@ func (c *Controller) reconcileClusters(ctx context.Context) error {
 	}
 	return errors.Join(failures...)
 }
+
+// voterCountContract ties the declared voter list to the workload that must run
+// it. It runs before an initial binding freezes the list and again before every
+// observation, so a mismatched list is reported instead of becoming immutable.
+func voterCountContract(r *ClusterResource, sts object, env map[string]string) error {
+	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(r.Spec.VoterPods) {
+		return fmt.Errorf("StatefulSet has %d desired replicas but voterPods lists %d voters", replicas, len(r.Spec.VoterPods))
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil {
+		return err
+	}
+	if len(members) != len(r.Spec.VoterPods) {
+		return fmt.Errorf("RHIZA_CLUSTER_MEMBERS lists %d voters but voterPods lists %d", len(members), len(r.Spec.VoterPods))
+	}
+	// A list longer than one fence admits can never be fenced as a generation, so
+	// it is refused before any binding freezes it.
+	if len(r.Spec.VoterPods) > fenceTargetCapacity {
+		return fmt.Errorf("voterPods lists %d voters but one fencing request admits %d", len(r.Spec.VoterPods), fenceTargetCapacity)
+	}
+	return nil
+}
+
 func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) error {
 	block := func(state *autoControl, message string) error { return c.autoStatus(ctx, r, state, "Blocked", message) }
 	for _, id := range []string{str(r.Metadata["name"]), r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.AdoptClusterID} {
@@ -197,8 +220,8 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 			return block(nil, "invalid cluster binding")
 		}
 	}
-	if str(r.Metadata["uid"]) == "" || len(r.Spec.VoterPods) != 3 {
-		return block(nil, "cluster UID and exactly three bootstrap voter mappings are required")
+	if str(r.Metadata["uid"]) == "" || len(r.Spec.VoterPods) < 3 {
+		return block(nil, "cluster UID and at least three bootstrap voter mappings are required")
 	}
 	if r.Spec.Container == "" {
 		r.Spec.Container = "rhiza"
@@ -257,6 +280,9 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		if err := c.storeConfigMatches(env); err != nil {
 			return block(nil, err.Error())
 		}
+		if err := voterCountContract(r, sts, env); err != nil {
+			return block(nil, err.Error())
+		}
 		state = &autoControl{Version: 1, BindingUID: str(r.Metadata["uid"]), BindingHash: autoBinding(r), StatefulSetUID: uid, ActiveClusterID: r.Spec.AdoptClusterID, Voters: r.Spec.VoterPods, Identities: map[quepaxa.NodeID]FenceTarget{}}
 		if err := c.saveAuto(ctx, r, state, nil); err != nil {
 			return err
@@ -279,6 +305,11 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	}
 	if !r.Spec.Automatic || r.Metadata["deletionTimestamp"] != nil {
 		return c.autoStatus(ctx, r, state, "Manual", "new automatic recovery is suspended")
+	}
+	// The voter list, the workload environment, and the replica count are one
+	// contract; reconciling a mismatch as an outage would fence a live majority.
+	if err := voterCountContract(r, sts, env); err != nil {
+		return block(state, err.Error())
 	}
 	obs, statuses, err := c.observeAutomatic(ctx, r, state, sts)
 	if err != nil {
@@ -346,6 +377,10 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		if failed != "" {
 			request.Scope = "Voter"
 		} else if err := includeLearnerHistory(state, &request); err != nil {
+			return block(state, err.Error())
+		}
+		// The scope is final only after the retained learner history is added.
+		if err := fenceCapacityError(len(request.Targets)); err != nil {
 			return block(state, err.Error())
 		}
 		state.Intent = &autoIntent{Request: request, Policy: r.Spec.Policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), Failed: failed, RecoveryName: name, LearnerName: name + "-learner"}

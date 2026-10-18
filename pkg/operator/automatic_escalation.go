@@ -161,6 +161,10 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	if err := includeLearnerHistory(state, &request); err != nil {
 		return automaticEscalationStop, err
 	}
+	// Reserve nothing the fencing backend cannot execute during the outage.
+	if err := fenceCapacityError(len(request.Targets)); err != nil {
+		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", err.Error())
+	}
 	superseded := intent.RecoveryName + "-" + hashJSON(intent)
 	if err := c.immutable(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, r.Spec.LogicalID, "superseded", superseded+".json"), jsonBytes(intent)); err != nil {
 		return automaticEscalationStop, err

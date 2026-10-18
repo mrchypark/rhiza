@@ -98,7 +98,8 @@ metadata:
   name: rhiza
   namespace: rhiza
 spec:
-  minAvailable: 2
+  # Keeps quorum for any supported voter count.
+  maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: rhiza

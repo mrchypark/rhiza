@@ -36,6 +36,11 @@ const (
 	ScopeVoter      Scope = "Voter"
 )
 
+// fenceTargetCapacity mirrors RhizaFence.spec.targets.maxItems in
+// deploy/operator/fence-crd.yaml. One fence must name every voter plus the
+// retained learner history, so a larger scope cannot be executed at all.
+const fenceTargetCapacity = 16
+
 type FenceRequest struct {
 	LogicalID       string        `json:"logicalID"`
 	BindingUID      string        `json:"bindingUID"`
@@ -137,7 +142,15 @@ func validateRequest(req *FenceRequest) error {
 	if req.Scope != ScopeGeneration && req.Scope != ScopeVoter {
 		return fmt.Errorf("fencing: invalid scope %q", req.Scope)
 	}
-	return nil
+	return fenceCapacityError(len(req.Targets))
+}
+
+// fenceCapacityError rejects a scope the Kubernetes fencing backend must refuse.
+func fenceCapacityError(targets int) error {
+	if targets <= fenceTargetCapacity {
+		return nil
+	}
+	return fmt.Errorf("fencing: %d targets exceed the fence capacity of %d", targets, fenceTargetCapacity)
 }
 
 func readToken(path string) (string, error) {

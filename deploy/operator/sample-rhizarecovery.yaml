@@ -4,7 +4,7 @@ metadata:
   name: rhiza-recovery-20260909
   namespace: rhiza
 spec:
-  # An existing three-voter StatefulSet. This resource never creates a new
+  # An existing StatefulSet of at least three voters. This resource never creates a new
   # database or PVCs.
   statefulSet: rhiza
   sourceClusterID: production-rhiza

@@ -111,6 +111,9 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if err != nil || env["RHIZA_CLUSTER_ID"] != child.Status.Target || env["RHIZA_OBJSTORE_DURABILITY"] != child.Spec.Durability || recovery.NewMembershipRecord(child.Status.Target, actual, child.Spec.Durability) != registered {
 		return fmt.Errorf("installed workload differs from completed generation")
 	}
+	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(members) {
+		return fmt.Errorf("installed target StatefulSet has %d desired replicas but the recovered generation has %d voters", replicas, len(members))
+	}
 	allowed, ready := map[string]bool{}, map[string]bool{}
 	for _, member := range members {
 		allowed[string(member.ID)] = true
@@ -120,7 +123,7 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 			ready[peer.NodeID] = true
 		}
 	}
-	if len(ready) < 2 {
+	if len(ready) < len(members)/2+1 {
 		return fmt.Errorf("executor did not record the recovered target quorum")
 	}
 	inventory, podNames := map[string]string{}, map[string]bool{}
@@ -141,6 +144,10 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 		}
 		seen[identity.NodeID], pods[identity.Pod], uids[identity.PodUID] = true, true, true
 	}
+	// A durable record written before capture required every voter may name only
+	// the identities it authenticated. Such a deficit is accepted here and
+	// answered by the escalation rule: an unauthenticated voter can never be
+	// removed one-for-one, so the next incident must fence the whole generation.
 	return nil
 }
 
@@ -192,6 +199,11 @@ func (c *Controller) captureAutomaticTargetIdentities(ctx context.Context, child
 		if identity, ok := identities[member.ID]; ok {
 			result = append(result, identity)
 		}
+	}
+	// A partial inventory would become the next generation's fencing scope and
+	// could never name the missing configured voters again.
+	if len(result) != len(members) {
+		return nil, fmt.Errorf("target identity inventory covers %d of %d configured voters", len(result), len(members))
 	}
 	return result, nil
 }
