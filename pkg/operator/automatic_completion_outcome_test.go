@@ -187,7 +187,9 @@ func TestAutomaticCompletionAcceptsPromotedLearnerVoter(t *testing.T) {
 	learner := "auto-promoted-learner-1"
 	s := completedAutomaticTarget(t, voters)
 	s.state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
-	s.state.Intent.Voters[2] = VoterPod{NodeID: quepaxa.NodeID(learner), Pod: learner}
+	s.state.Intent.Voters = []VoterPod{{NodeID: "rhiza-0", Pod: "rhiza-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1"}, {NodeID: "rhiza-2", Pod: "rhiza-2"}}
+	s.child.Status.TargetIdentities[0] = FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-rhiza-0", WALIdentity: strings.Repeat("a", 64)}
+	s.child.Status.TargetIdentities[1] = FenceTarget{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-rhiza-1", WALIdentity: strings.Repeat("a", 64)}
 	s.child.Status.TargetIdentities[2] = FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}
 	if err := s.c.saveAuto(ctx, s.r, s.state, s.version); err != nil {
 		t.Fatal(err)
@@ -211,7 +213,9 @@ func TestAutomaticCompletionRejectsUnknownVoterIdentity(t *testing.T) {
 	learner := "auto-promoted-learner-1"
 	s := completedAutomaticTarget(t, voters)
 	s.state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
-	s.state.Intent.Voters[2] = VoterPod{NodeID: "unknown-voter", Pod: "unknown-voter"}
+	s.state.Intent.Voters = []VoterPod{{NodeID: "rhiza-0", Pod: "rhiza-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1"}, {NodeID: "rhiza-2", Pod: "rhiza-2"}}
+	s.child.Status.TargetIdentities[0] = FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-rhiza-0", WALIdentity: strings.Repeat("a", 64)}
+	s.child.Status.TargetIdentities[1] = FenceTarget{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-rhiza-1", WALIdentity: strings.Repeat("a", 64)}
 	s.child.Status.TargetIdentities[2] = FenceTarget{NodeID: "unknown-voter", Pod: "unknown-voter", PodUID: "pod-unknown-voter", WALIdentity: strings.Repeat("a", 64)}
 	if err := s.c.saveAuto(ctx, s.r, s.state, s.version); err != nil {
 		t.Fatal(err)
@@ -223,7 +227,7 @@ func TestAutomaticCompletionRejectsUnknownVoterIdentity(t *testing.T) {
 	if err := s.c.advanceAutomatic(ctx, s.r, state, version, s.api.sts); err != nil {
 		t.Fatal(err)
 	}
-	if s.r.Status.Phase != "Blocked" || !strings.Contains(s.r.Status.Message, "installed target voter inventory differs") {
+	if s.r.Status.Phase != "Blocked" || !strings.Contains(s.r.Status.Message, "installed target identity inventory is incomplete or conflicting") {
 		t.Fatalf("unknown voter was not rejected: %+v", s.r.Status)
 	}
 }

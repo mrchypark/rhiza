@@ -114,15 +114,48 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(members) {
 		return fmt.Errorf("installed target StatefulSet has %d desired replicas but the recovered generation has %d voters", replicas, len(members))
 	}
-	allowed, ready := map[string]bool{}, map[string]bool{}
+	allowed, inventory, podNames := map[string]bool{}, map[string]string{}, map[string]bool{}
+	add := func(id, pod string, allow bool) error {
+		if id == "" || pod == "" {
+			return fmt.Errorf("installed target voter inventory differs from frozen binding")
+		}
+		if existing := inventory[id]; existing != "" && existing != pod {
+			return fmt.Errorf("installed target voter inventory differs from frozen binding")
+		}
+		if podNames[pod] && inventory[id] != pod {
+			return fmt.Errorf("installed target voter inventory differs from frozen binding")
+		}
+		inventory[id], podNames[pod] = pod, true
+		if allow {
+			allowed[id] = true
+		}
+		return nil
+	}
+	if derived, err := derivedVoters(r, sts); err == nil {
+		for _, voter := range derived {
+			if err := add(string(voter.NodeID), voter.Pod, true); err != nil {
+				return err
+			}
+		}
+	}
 	for _, member := range members {
-		allowed[string(member.ID)] = true
+		if err := add(string(member.ID), string(member.ID), true); err != nil {
+			return err
+		}
+	}
+	for _, ref := range i.Voters {
+		if err := add(string(ref.NodeID), ref.Pod, false); err != nil {
+			return err
+		}
 	}
 	for _, entry := range state.Learners {
 		if entry.SourceClusterID == state.ActiveClusterID {
-			allowed[string(entry.Target.NodeID)] = true
+			if err := add(string(entry.Target.NodeID), entry.Target.Pod, true); err != nil {
+				return err
+			}
 		}
 	}
+	ready := map[string]bool{}
 	for _, peer := range child.Status.Peers {
 		if allowed[peer.NodeID] && peer.ClusterID == child.Status.Target && peer.Durability == child.Spec.Durability && peer.Ready && peer.Quorum && peer.CertifiedTip >= child.Status.RecoveredTip && peer.AppliedTip >= child.Status.RecoveredTip {
 			ready[peer.NodeID] = true
@@ -131,15 +164,7 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if len(ready) < len(members)/2+1 {
 		return fmt.Errorf("executor did not record the recovered target quorum")
 	}
-	inventory, podNames := map[string]string{}, map[string]bool{}
-	for _, ref := range i.Voters {
-		id := string(ref.NodeID)
-		if !allowed[id] || inventory[id] != "" || !identifier.MatchString(ref.Pod) || podNames[ref.Pod] {
-			return fmt.Errorf("installed target voter inventory differs from frozen binding")
-		}
-		inventory[id], podNames[ref.Pod] = ref.Pod, true
-	}
-	if len(inventory) != len(members) {
+	if len(i.Voters) != len(members) {
 		return fmt.Errorf("installed target voter inventory is incomplete")
 	}
 	seen, pods, uids := map[string]bool{}, map[string]bool{}, map[string]bool{}
