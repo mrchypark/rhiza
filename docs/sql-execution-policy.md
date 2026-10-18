@@ -95,6 +95,13 @@ For an existing installation:
 5. Compare imported application data and validate reads/writes before switching
    traffic. Retain the old installation to resolve outstanding old outcomes.
 
+Multi-voter `emptyDir`/no-PVC installations must resolve their recovery
+configuration before step 5 switches traffic: a replaced Pod cannot reopen the
+same voter identity, so passing read/write checks alone is not enough. See
+[recovery and voter registration](recovery.md) for the supported enrollment and
+replacement contract and the [Operator integration guide](embedded-operator.md)
+for the automated emptyDir/no-PVC recovery path.
+
 No migration or deployment is performed automatically by this change.
 
 ## Graph engine upgrade
