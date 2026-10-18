@@ -174,7 +174,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 		state.ActiveClusterID = child.Status.Target
 		state.Learners = nil // Verified full cleanup and installed target retire the old generation.
-		state.Voters = append([]VoterPod(nil), r.Spec.VoterPods...)
+		state.Voters = append([]VoterPod(nil), intent.Voters...)
 		state.Identities = map[quepaxa.NodeID]FenceTarget{}
 		for _, identity := range child.Status.TargetIdentities {
 			id := quepaxa.NodeID(identity.NodeID)

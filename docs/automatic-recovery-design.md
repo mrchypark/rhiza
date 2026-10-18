@@ -9,14 +9,18 @@
 복구, 같은 voter 수의 새 세대 활성화까지 사고마다 사람의 승인을 요구하지 않는다.
 운영자는 배포 시 자동 전환·async 유실·계획 중단·fencing 범위를 사전 승인한다.
 
-voter 수는 `spec.voterPods` 항목 수로 정하고, StatefulSet replica 수와
-`RHIZA_CLUSTER_MEMBERS` 항목 수를 같은 값으로 유지한다. 어긋난 값은 복구를
-시작하지 않고 막는다. 최소 voter 수는 3이며 짝수도 허용한다. 세대가 살아 있는
-동안 voter 수는 제자리에서 바꿀 수 없고, 새 세대를 만들거나 재구성으로 voter를
-하나씩 교체한다. 전체 세대 fencing은 보존된 learner 이력을 포함해 최대 16개
-대상까지만 담을 수 있다. voter와 보존된 learner 이력을 합친 대상이 16개를 넘으면
-자동 복구는 fencing을 예약하기 전에 두 수를 함께 알려 주는 오류로 막는다. 따라서
-voter 수를 그보다 넉넉히 낮게 유지한다.
+voter 수는 `spec.voterCount`에 3에서 64 사이의 정수로 선언하고, StatefulSet
+replica 수와 `RHIZA_CLUSTER_MEMBERS` 항목 수를 같은 값으로 유지한다. 어긋난 값은
+복구를 시작하지 않고 두 수를 함께 알려 주는 오류로 막는다. StatefulSet이
+`RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 그대로 채택하며, node ID가
+`<statefulSet>-<ordinal>` 규칙과 일치하는지 확인한다. 내보내지 않으면 voter 수만큼
+node ID, Pod 이름, URL, token, 공개키를 한 번만 생성해 불변 Secret에 보관하고,
+workload가 그 Secret을 읽도록 전환한다. `httpPort`와 `peerPort`는 선택 항목이며 기본값은 각각
+8080과 9090이다. 세대가 살아 있는 동안 voter 수는 제자리에서 바꿀 수 없고, 새
+세대를 만들거나 재구성으로 voter를 하나씩 교체한다. 전체 세대 fencing은 보존된
+learner 이력을 포함해 최대 64개 대상까지만 담을 수 있다. voter와 보존된 learner
+이력을 합친 대상이 64개를 넘으면 자동 복구는 fencing을 예약하기 전에 두 수를
+함께 알려 주는 오류로 막는다.
 
 완전 자동은 모든 외부 장애 중에도 무조건 복구한다는 뜻이 아니다. Kubernetes,
 공유 저장소, fencing authority, 새 Pod 실행 용량이 사용 가능하고 증거가 유효할

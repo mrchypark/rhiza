@@ -160,14 +160,13 @@ func value(name, val string) obj { return obj{"name": name, "value": val} }
 func selector(name string) obj   { return obj{"app.kubernetes.io/name": name} }
 
 func manifests() obj {
-	var members, voters []obj
+	var members []obj
 	tokens := map[string]string{}
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("rhiza-%d", i)
 		token := "fencing-peer-" + id
 		tokens[id] = token
 		members = append(members, obj{"node_id": id, "url": "http://" + id + ".rhiza-headless:8080", "peer_url": "quic://" + id + ".rhiza-headless:9090", "public_key": rhiza.PeerPublicKey("chaos-source", id, token)})
-		voters = append(voters, obj{"nodeID": id, "pod": id})
 	}
 	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_PREFIX": "rhiza", "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": string(encoded(members))}
 	configMap := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata("rhiza-config"), "data": config}
@@ -185,7 +184,7 @@ func manifests() obj {
 	application["securityContext"] = obj{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": obj{"drop": []string{"ALL"}}}
 	opEnv := []obj{field("POD_NAMESPACE", "metadata.namespace"), value("RHIZA_AUTOMATIC_RECOVERY", "true"), value("RHIZA_FENCER_BACKEND", "kubernetes")}
 	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0], envFrom[2]}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}}}}})
-	binding := resource("rhiza.mrchypark.dev/v1alpha1", "RhizaCluster", "rhiza", obj{"logicalID": "fencing-e2e", "statefulSet": "rhiza", "container": "rhiza", "adoptClusterID": "chaos-source", "automatic": true, "voterPods": voters, "policy": obj{"failureGraceSeconds": 15, "cooldownSeconds": 3, "maxRecoveriesPerDay": 3, "allowDataLoss": false}})
+	binding := resource("rhiza.mrchypark.dev/v1alpha1", "RhizaCluster", "rhiza", obj{"logicalID": "fencing-e2e", "statefulSet": "rhiza", "container": "rhiza", "adoptClusterID": "chaos-source", "automatic": true, "voterCount": len(members), "policy": obj{"failureGraceSeconds": 15, "cooldownSeconds": 3, "maxRecoveriesPerDay": 3, "allowDataLoss": false}})
 	bucketJob["spec"].(obj)["suspend"] = true
 	return obj{"apiVersion": "v1", "kind": "List", "items": []obj{configMap, credentials, storeCredentials, store, storeService, bucketJob, headless, sts, op, binding}}
 }

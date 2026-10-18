@@ -54,7 +54,7 @@ func newRetirementEscalationFixture(t *testing.T) *retirementEscalationFixture {
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = child.Spec.Membership.VoterPods
 	state.Voters = append(state.Voters, VoterPod{NodeID: "n3", Pod: "n3"})
-	r.Spec.VoterPods = state.Voters
+	r.Spec.VoterCount = len(state.Voters)
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recover", Scope: ScopeVoter, Targets: []FenceTarget{{NodeID: "n3", Pod: "n3", PodUID: "pod-n3", WALIdentity: strings.Repeat("b", 64)}}}
 	count := 0
 	proof, err := (&countingFencer{count: &count}).Fence(ctx, request)

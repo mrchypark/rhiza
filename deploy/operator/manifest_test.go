@@ -1,7 +1,6 @@
 package operator_test
 
 import (
-	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -21,9 +20,9 @@ func TestNoPVCBootstrapRetainsPeerCredentials(t *testing.T) {
 	}
 }
 
-// The voter count is the length of spec.voterPods, so the CRD schema accepts
-// three or more voters and caps the list at the most a single fence can name.
-func TestClusterCRDAcceptsVoterListsAboveThree(t *testing.T) {
+// The CRD schema accepts the supported voterCount range and no longer exposes
+// the removed authoritative voter list.
+func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {
 	data, err := os.ReadFile("cluster-crd.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -37,37 +36,18 @@ func TestClusterCRDAcceptsVoterListsAboveThree(t *testing.T) {
 		t.Fatalf("expected one served version, got %d", len(versions))
 	}
 	spec, _ := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)["spec"].(map[string]any)["properties"].(map[string]any)
-	schema, ok := spec["voterPods"].(map[string]any)
+	schema, ok := spec["voterCount"].(map[string]any)
 	if !ok {
-		t.Fatal("voterPods is missing from the RhizaCluster schema")
+		t.Fatal("voterCount is missing from the RhizaCluster schema")
 	}
-	if min, _ := schema["minItems"].(int); min != 3 {
-		t.Fatalf("voterPods minItems=%v, want 3", schema["minItems"])
+	if min, _ := schema["minimum"].(int); min != 3 {
+		t.Fatalf("voterCount minimum=%v, want 3", schema["minimum"])
 	}
-	if capped, _ := schema["maxItems"].(int); capped != 16 {
-		t.Fatalf("voterPods maxItems=%v, want the 16-target fence bound", schema["maxItems"])
+	if capped, _ := schema["maximum"].(int); capped != 64 {
+		t.Fatalf("voterCount maximum=%v, want the 64-target fence bound", schema["maximum"])
 	}
-	items, _ := schema["items"].(map[string]any)
-	required, _ := items["required"].([]any)
-	list := "voterPods:\n"
-	for i := range 5 {
-		list += fmt.Sprintf("  - {nodeID: rhiza-%d, pod: rhiza-%d}\n", i, i)
-	}
-	var manifest map[string]any
-	if err := yaml.Unmarshal([]byte(list), &manifest); err != nil {
-		t.Fatal(err)
-	}
-	voters, _ := manifest["voterPods"].([]any)
-	if len(voters) != 5 {
-		t.Fatalf("five-entry voter list was not parsed: %s", list)
-	}
-	for _, entry := range voters {
-		item, _ := entry.(map[string]any)
-		for _, key := range required {
-			if item[key.(string)] == nil {
-				t.Fatalf("voterPods entry %v omits required %v", item, key)
-			}
-		}
+	if _, ok := spec["voterPods"]; ok {
+		t.Fatal("voterPods must be removed from the RhizaCluster schema")
 	}
 }
 
@@ -99,7 +79,7 @@ func TestNoPVCPDBToleratesOneVoterAtATTime(t *testing.T) {
 }
 
 // Generation fencing still covers every voter plus learner history, so the
-// documented 16-target bound must stay in the fence CRD.
+// documented 64-target bound must stay in the fence CRD.
 func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 	data, err := os.ReadFile("fence-crd.yaml")
 	if err != nil {
@@ -112,7 +92,7 @@ func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 	versions, _ := crd["spec"].(map[string]any)["versions"].([]any)
 	spec, _ := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)["spec"].(map[string]any)["properties"].(map[string]any)
 	targets, _ := spec["targets"].(map[string]any)
-	if targets["maxItems"] != 16 {
-		t.Fatalf("fence targets maxItems=%v, want 16", targets["maxItems"])
+	if targets["maxItems"] != 64 {
+		t.Fatalf("fence targets maxItems=%v, want 64", targets["maxItems"])
 	}
 }

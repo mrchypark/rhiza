@@ -40,7 +40,7 @@ spec:
                     Every voter of the fenced generation plus retained learner
                     history. Keep the voter count comfortably below this bound.
                   type: array
-                  maxItems: 16
+                  maxItems: 64
                   items:
                     type: object
                     required: [nodeID, pod, podUID, walIdentity]

@@ -127,7 +127,7 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 		return fmt.Errorf("executor did not record the recovered target quorum")
 	}
 	inventory, podNames := map[string]string{}, map[string]bool{}
-	for _, ref := range r.Spec.VoterPods {
+	for _, ref := range i.Voters {
 		id := string(ref.NodeID)
 		if !allowed[id] || inventory[id] != "" || !identifier.MatchString(ref.Pod) || podNames[ref.Pod] {
 			return fmt.Errorf("installed target voter inventory differs from frozen binding")

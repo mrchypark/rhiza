@@ -474,17 +474,8 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			values := list(ctr["env"])
 			values = replaceEnv(values, "RHIZA_CLUSTER_ID", object{"value": r.Status.Target})
 			values = replaceEnv(values, "RHIZA_OBJSTORE_DURABILITY", object{"value": r.Spec.Durability})
-			values = replaceEnv(values, "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "members"}}})
-			values = replaceEnv(values, "RHIZA_ADMIN_TOKEN", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "admin"}}})
-			// Each target Pod receives the whole token map and selects its own
-			// entry by node ID; a StatefulSet cannot mount a per-Pod Secret.
-			values = replaceEnv(values, "RHIZA_PEER_TOKENS", object{"valueFrom": object{"secretKeyRef": object{"name": r.Status.SecretName, "key": "peer_tokens"}}})
-			// An inherited scalar RHIZA_PEER_TOKEN conflicts with the map above
-			// and fails startup. An explicit empty value supersedes it for both
-			// an env entry and an envFrom-provided scalar, which a deletion
-			// cannot clear.
-			values = replaceEnv(values, "RHIZA_PEER_TOKEN", object{"value": ""})
 			ctr["env"] = values
+			applyTargetCredentials(ctr, r.Status.SecretName)
 			asObject(sts["spec"])["replicas"] = float64(len(members))
 			if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
 				return err
@@ -929,6 +920,19 @@ func replaceEnv(env []any, name string, value object) []any {
 		entry[k] = v
 	}
 	return append(removeEnv(env, name), entry)
+}
+
+func applyTargetCredentials(ctr object, secretName string) {
+	values := list(ctr["env"])
+	values = replaceEnv(values, "RHIZA_CLUSTER_MEMBERS", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "members"}}})
+	values = replaceEnv(values, "RHIZA_ADMIN_TOKEN", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "admin"}}})
+	// Each target Pod receives the whole token map and selects its own entry by
+	// node ID; a StatefulSet cannot mount a per-Pod Secret.
+	values = replaceEnv(values, "RHIZA_PEER_TOKENS", object{"valueFrom": object{"secretKeyRef": object{"name": secretName, "key": "peer_tokens"}}})
+	// An inherited scalar conflicts with the map and cannot be cleared by deleting
+	// an envFrom entry, so an explicit empty override must supersede it.
+	values = replaceEnv(values, "RHIZA_PEER_TOKEN", object{"value": ""})
+	ctr["env"] = values
 }
 func removeEnv(env []any, name string) []any {
 	var result []any

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/network"
@@ -29,12 +30,14 @@ type ClusterResource struct {
 	Status     ClusterStatus  `json:"status,omitempty"`
 }
 type ClusterSpec struct {
-	LogicalID      string     `json:"logicalID"`
-	StatefulSet    string     `json:"statefulSet"`
-	Container      string     `json:"container"`
-	AdoptClusterID string     `json:"adoptClusterID"`
-	VoterPods      []VoterPod `json:"voterPods"`
-	AnchorID       string     `json:"anchorID,omitempty"`
+	LogicalID      string `json:"logicalID"`
+	StatefulSet    string `json:"statefulSet"`
+	Container      string `json:"container"`
+	AdoptClusterID string `json:"adoptClusterID"`
+	VoterCount     int    `json:"voterCount"`
+	HTTPPort       int    `json:"httpPort,omitempty"`
+	PeerPort       int    `json:"peerPort,omitempty"`
+	AnchorID       string `json:"anchorID,omitempty"`
 
 	Automatic bool       `json:"automatic"`
 	Policy    AutoPolicy `json:"policy"`
@@ -116,11 +119,18 @@ func (c *Controller) autoKey(r *ClusterResource) string {
 	return path.Join(c.Prefix, "automatic", c.Kube.Namespace, r.Spec.LogicalID, "control.json")
 }
 func autoBinding(r *ClusterResource) string {
+	httpPort, peerPort := r.Spec.HTTPPort, r.Spec.PeerPort
+	if httpPort == 0 {
+		httpPort = 8080
+	}
+	if peerPort == 0 {
+		peerPort = 9090
+	}
 	return hashJSON(struct {
 		LogicalID, StatefulSet, Container, AdoptClusterID string
 		AnchorID                                          string `json:"anchorID,omitempty"`
-		Voters                                            []VoterPod
-	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, r.Spec.VoterPods})
+		VoterCount, HTTPPort, PeerPort                    int
+	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, r.Spec.VoterCount, httpPort, peerPort})
 }
 func (c *Controller) autoStatus(ctx context.Context, r *ClusterResource, state *autoControl, phase, message string) error {
 	r.Status = ClusterStatus{Phase: phase, Message: message, ObservedGeneration: number(r.Metadata["generation"])}
@@ -191,40 +201,120 @@ func (c *Controller) reconcileClusters(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
-// voterCountContract ties the declared voter list to the workload that must run
-// it. It runs before an initial binding freezes the list and again before every
-// observation, so a mismatched list is reported instead of becoming immutable.
-func voterCountContract(r *ClusterResource, sts object, env map[string]string) error {
-	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(r.Spec.VoterPods) {
-		return fmt.Errorf("StatefulSet has %d desired replicas but voterPods lists %d voters", replicas, len(r.Spec.VoterPods))
+// voterCountContract runs before any binding is persisted and on every later
+// observation. Derived node IDs are checked for a new binding and for an
+// established binding whose frozen inventory already follows the derived shape.
+func voterCountContract(r *ClusterResource, sts object, members []quepaxa.Member, adopted, checkIDs bool) error {
+	count := r.Spec.VoterCount
+	if count < 3 || count > fenceTargetCapacity {
+		return fmt.Errorf("voterCount is %d, want 3 through %d voters", count, fenceTargetCapacity)
 	}
-	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != count {
+		return fmt.Errorf("StatefulSet has %d desired replicas but voterCount is %d", replicas, count)
+	}
+	expected, err := derivedVoters(r, sts)
 	if err != nil {
 		return err
 	}
-	if len(members) != len(r.Spec.VoterPods) {
-		return fmt.Errorf("RHIZA_CLUSTER_MEMBERS lists %d voters but voterPods lists %d", len(members), len(r.Spec.VoterPods))
+	if adopted && len(members) != count {
+		return fmt.Errorf("RHIZA_CLUSTER_MEMBERS lists %d voters but voterCount is %d", len(members), count)
 	}
-	// A list longer than one fence admits can never be fenced as a generation, so
-	// it is refused before any binding freezes it.
-	if len(r.Spec.VoterPods) > fenceTargetCapacity {
-		return fmt.Errorf("voterPods lists %d voters but one fencing request admits %d", len(r.Spec.VoterPods), fenceTargetCapacity)
+	if adopted && checkIDs {
+		seen := make(map[quepaxa.NodeID]bool, len(members))
+		for _, member := range members {
+			seen[member.ID] = true
+		}
+		for _, voter := range expected {
+			if !seen[voter.NodeID] {
+				return fmt.Errorf("RHIZA_CLUSTER_MEMBERS node IDs must be %s-0 through %s-%d", r.Spec.StatefulSet, r.Spec.StatefulSet, count-1)
+			}
+		}
 	}
 	return nil
 }
 
+func clusterMembers(raw string) ([]quepaxa.Member, bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, false, nil
+	}
+	members, err := recoveryMembers(raw)
+	return members, true, err
+}
+
+func normalizeClusterSpec(r *ClusterResource) {
+	if r.Spec.Container == "" {
+		r.Spec.Container = "rhiza"
+	}
+	if r.Spec.HTTPPort == 0 {
+		r.Spec.HTTPPort = 8080
+	}
+	if r.Spec.PeerPort == 0 {
+		r.Spec.PeerPort = 9090
+	}
+}
+
+func derivedVoters(r *ClusterResource, sts object) ([]VoterPod, error) {
+	service := str(nested(sts, "spec", "serviceName"))
+	if service == "" {
+		return nil, fmt.Errorf("StatefulSet %s spec.serviceName is required for voter DNS names", r.Spec.StatefulSet)
+	}
+	voters := make([]VoterPod, 0, r.Spec.VoterCount)
+	for i := range r.Spec.VoterCount {
+		pod := fmt.Sprintf("%s-%d", r.Spec.StatefulSet, i)
+		voters = append(voters, VoterPod{NodeID: quepaxa.NodeID(pod), Pod: pod})
+	}
+	return voters, nil
+}
+
+func clusterMemberSources(r *ClusterResource, sts object, namespace string) ([]quepaxa.Member, error) {
+	voters, err := derivedVoters(r, sts)
+	if err != nil {
+		return nil, err
+	}
+	service := str(nested(sts, "spec", "serviceName"))
+	host := func(pod string) string {
+		return fmt.Sprintf("%s.%s.%s.svc.cluster.local", pod, service, namespace)
+	}
+	members := make([]quepaxa.Member, 0, len(voters))
+	for _, voter := range voters {
+		members = append(members, quepaxa.Member{ID: voter.NodeID, URL: "http://" + host(voter.Pod) + ":" + fmt.Sprint(r.Spec.HTTPPort), PeerURL: "quic://" + host(voter.Pod) + ":" + fmt.Sprint(r.Spec.PeerPort)})
+	}
+	return members, nil
+}
+
+func (c *Controller) bootstrapCluster(ctx context.Context, r *ClusterResource, sts, ctr object) error {
+	sources, err := clusterMemberSources(r, sts, c.Kube.Namespace)
+	if err != nil {
+		return err
+	}
+	operation := &Resource{
+		Metadata: object{"uid": str(r.Metadata["uid"])},
+		Spec:     Spec{RecoveryID: r.Spec.LogicalID},
+		Status:   Status{Target: r.Spec.AdoptClusterID},
+	}
+	secretName := "rhiza-cluster-" + shortID(c.operationID(operation))
+	members, err := c.targetCredentials(ctx, operation, secretName, sources)
+	if err != nil {
+		return err
+	}
+	if len(members) != r.Spec.VoterCount {
+		return fmt.Errorf("bootstrap generated %d voters but voterCount is %d", len(members), r.Spec.VoterCount)
+	}
+	applyTargetCredentials(ctr, secretName)
+	asObject(sts["spec"])["replicas"] = float64(r.Spec.VoterCount)
+	return c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts)
+}
+
 func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) error {
 	block := func(state *autoControl, message string) error { return c.autoStatus(ctx, r, state, "Blocked", message) }
+	normalizeClusterSpec(r)
 	for _, id := range []string{str(r.Metadata["name"]), r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.AdoptClusterID} {
 		if !identifier.MatchString(id) {
 			return block(nil, "invalid cluster binding")
 		}
 	}
-	if str(r.Metadata["uid"]) == "" || len(r.Spec.VoterPods) < 3 {
-		return block(nil, "cluster UID and at least three bootstrap voter mappings are required")
-	}
-	if r.Spec.Container == "" {
-		r.Spec.Container = "rhiza"
+	if str(r.Metadata["uid"]) == "" {
+		return block(nil, "cluster UID is required")
 	}
 	var sts object
 	if err := c.Kube.Get(ctx, c.stsPath(r.Spec.StatefulSet), &sts); err != nil {
@@ -248,6 +338,28 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	state, version, err := c.loadAuto(ctx, c.autoKey(r))
 	if err != nil && !c.Bucket.IsObjNotFoundErr(err) {
 		return block(nil, "durable automatic control record is unavailable")
+	}
+	members, adopted, err := clusterMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil {
+		return block(nil, err.Error())
+	}
+	// A binding created by this schema already has the derived inventory. Keep
+	// enforcing its node IDs, while an older frozen inventory is not invalidated
+	// by ID shape changes alone.
+	checkIDs := state == nil
+	if !checkIDs {
+		if expected, err := derivedVoters(r, sts); err == nil && len(state.Voters) == len(expected) {
+			checkIDs = true
+			for i := range expected {
+				if state.Voters[i].NodeID != expected[i].NodeID {
+					checkIDs = false
+					break
+				}
+			}
+		}
+	}
+	if err := voterCountContract(r, sts, members, adopted, checkIDs); err != nil {
+		return block(nil, err.Error())
 	}
 	if state == nil {
 		// A separate immutable binding prevents a missing control record or another
@@ -280,10 +392,17 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		if err := c.storeConfigMatches(env); err != nil {
 			return block(nil, err.Error())
 		}
-		if err := voterCountContract(r, sts, env); err != nil {
+		if !adopted {
+			if err := c.bootstrapCluster(ctx, r, sts, ctr); err != nil {
+				return block(nil, err.Error())
+			}
+			return c.autoStatus(ctx, r, nil, "Observing", "fresh voter credentials created; waiting for workload")
+		}
+		voters, err := derivedVoters(r, sts)
+		if err != nil {
 			return block(nil, err.Error())
 		}
-		state = &autoControl{Version: 1, BindingUID: str(r.Metadata["uid"]), BindingHash: autoBinding(r), StatefulSetUID: uid, ActiveClusterID: r.Spec.AdoptClusterID, Voters: r.Spec.VoterPods, Identities: map[quepaxa.NodeID]FenceTarget{}}
+		state = &autoControl{Version: 1, BindingUID: str(r.Metadata["uid"]), BindingHash: autoBinding(r), StatefulSetUID: uid, ActiveClusterID: r.Spec.AdoptClusterID, Voters: voters, Identities: map[quepaxa.NodeID]FenceTarget{}}
 		if err := c.saveAuto(ctx, r, state, nil); err != nil {
 			return err
 		}
@@ -306,11 +425,8 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if !r.Spec.Automatic || r.Metadata["deletionTimestamp"] != nil {
 		return c.autoStatus(ctx, r, state, "Manual", "new automatic recovery is suspended")
 	}
-	// The voter list, the workload environment, and the replica count are one
+	// The declared count, the workload environment, and the replica count are one
 	// contract; reconciling a mismatch as an outage would fence a live majority.
-	if err := voterCountContract(r, sts, env); err != nil {
-		return block(state, err.Error())
-	}
 	obs, statuses, err := c.observeAutomatic(ctx, r, state, sts)
 	if err != nil {
 		return block(state, err.Error())

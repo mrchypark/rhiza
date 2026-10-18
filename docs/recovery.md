@@ -96,8 +96,10 @@ guaranteed maximum loss window.
 
 The namespace-scoped [recovery operator](../deploy/operator/README.md) supports
 both `async` and `before-ack` for an existing `emptyDir` StatefulSet of at least
-three voters. The voter count comes from `RhizaCluster.spec.voterPods` and must
-equal the StatefulSet replica count; the operator rejects a mismatch. Quorum and
+three voters. The voter count comes from `RhizaCluster.spec.voterCount` and must
+equal the StatefulSet replica count; the operator rejects a mismatch. Existing
+exported membership is adopted as-is, while a workload with no exported
+membership receives one immutable, Operator-generated bootstrap Secret. Quorum and
 completion need only the strict majority of that membership. Lost WALs that
 leave less than a majority use the same full-generation disaster-recovery path.
 Preserved WALs should first regain their original quorum; missing pods and

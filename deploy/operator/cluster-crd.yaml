@@ -22,7 +22,7 @@ spec:
           properties:
             spec:
               type: object
-              required: [logicalID, statefulSet, container, adoptClusterID, voterPods, automatic, policy]
+              required: [logicalID, statefulSet, container, adoptClusterID, voterCount, automatic, policy]
               properties:
                 logicalID:
                   type: string
@@ -42,30 +42,33 @@ spec:
                     External recovery anchor identifier for automatic child recovery
                     resources. When set, every generated RhizaRecovery inherits this
                     anchorID and the workload must export RHIZA_RECOVERY_ANCHOR_ID.
-                voterPods:
+                voterCount:
                   description: >-
-                    Authoritative voter list for the source and the replacement
-                    generation. Its length is the voter count: the StatefulSet
-                    must declare the same number of desired replicas and export
-                    the same number of RHIZA_CLUSTER_MEMBERS entries. The
-                    minimum is three, even counts are supported, and the count
-                    cannot be changed in place. Generation fencing must name
-                    every voter plus the retained learner history within the 16
-                    targets RhizaFence.spec.targets admits, so keep the voter
-                    count comfortably below that bound. The schema caps the list
-                    at 16, the most a single fence can name, and the controller
-                    additionally refuses a list whose voters plus retained
-                    learner history exceed that bound before any binding is
-                    created.
-                  type: array
-                  minItems: 3
-                  maxItems: 16
-                  items:
-                    type: object
-                    required: [nodeID, pod]
-                    properties:
-                      nodeID: {type: string, minLength: 1}
-                      pod: {type: string, minLength: 1}
+                    Voter count for the source and replacement generation. The
+                    StatefulSet must declare the same number of desired replicas.
+                    When it exports RHIZA_CLUSTER_MEMBERS, that list must contain
+                    the same count and use the Pod names <statefulSet>-<ordinal>.
+                    The controller derives those names, the headless-service
+                    DNS names, and fresh credentials. The count cannot be changed
+                    in place. Generation fencing names every voter plus retained
+                    learner history within RhizaFence.spec.targets.maxItems (64).
+                  type: integer
+                  minimum: 3
+                  maximum: 64
+                httpPort:
+                  description: >-
+                    HTTP port used in generated voter URLs. Defaults to 8080.
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  default: 8080
+                peerPort:
+                  description: >-
+                    QUIC peer port used in generated voter URLs. Defaults to 9090.
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  default: 9090
                 automatic:
                   type: boolean
                   description: Explicit consent to fence an unreachable generation even when an observer-only partition might hide a healthy majority. False suspends new incidents, not an already reserved recovery.

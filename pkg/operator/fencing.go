@@ -39,7 +39,7 @@ const (
 // fenceTargetCapacity mirrors RhizaFence.spec.targets.maxItems in
 // deploy/operator/fence-crd.yaml. One fence must name every voter plus the
 // retained learner history, so a larger scope cannot be executed at all.
-const fenceTargetCapacity = 16
+const fenceTargetCapacity = 64
 
 type FenceRequest struct {
 	LogicalID       string        `json:"logicalID"`

@@ -99,8 +99,9 @@ bounded by the 128 KiB replicated-value limit and fails closed when too large.
 
 The Operator requires an explicit external fence for a removed voter and only
 coordinates existing workloads. It does not kill the old process, revoke object
-store credentials, provision learners, or discover Pods. `voterPods` must name
-each reachable voter (`nodeID`, `pod`); `removedPod` may name the fenced workload
+store credentials, provision learners, or discover Pods. On
+`RhizaRecovery.spec.membership`, `voterPods` must name each reachable voter
+(`nodeID`, `pod`); `removedPod` may name the fenced workload
 and otherwise defaults to `remove`. The replacement Secret must be immutable and
 contain a strict `data.member` JSON `quepaxa.Member`; status retains its UID,
 resource version, and request hash, never the token.

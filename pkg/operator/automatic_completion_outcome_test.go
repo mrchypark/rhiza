@@ -61,7 +61,7 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
-	r.Spec.VoterPods = state.Voters
+	r.Spec.VoterCount = len(state.Voters)
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recover", Scope: ScopeVoter, Targets: []FenceTarget{{NodeID: "n3", Pod: "n3", PodUID: "pod-n3", WALIdentity: strings.Repeat("b", 64)}}}
 	hash, err := requestHash(&request)
 	if err != nil {
@@ -218,7 +218,7 @@ func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticC
 	for _, id := range ids {
 		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(id), Pod: id})
 	}
-	r.Spec.VoterPods = state.Voters
+	r.Spec.VoterCount = len(state.Voters)
 	observed := *state
 	observed.ActiveClusterID, observed.Identities = child.Status.Target, map[quepaxa.NodeID]FenceTarget{}
 	if obs, _, err := c.observeAutomatic(ctx, r, &observed, api.sts); err != nil || !obs.Known || obs.Voters != len(voters) || obs.Reachable != len(voters) {
@@ -233,7 +233,7 @@ func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticC
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+	state.Intent = &autoIntent{Request: request, Voters: append([]VoterPod(nil), state.Voters...), RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
 	child.Metadata["name"] = "recovery-1"
 	child.Spec.Container = "rhiza"
 	child.Spec.Fence.Evidence = state.Intent.Proof.ProofID
@@ -385,16 +385,16 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		t.Fatalf("child did not complete: %+v", child.Status)
 	}
 	r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
-	r.Spec.VoterPods = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
+	r.Spec.VoterCount = 3
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
-	state.Voters = r.Spec.VoterPods
+	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recovery-1", Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}}
 	hash, err := requestHash(&request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: targetMode, Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+	state.Intent = &autoIntent{Request: request, Voters: append([]VoterPod(nil), state.Voters...), RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: targetMode, Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
 	child.Metadata["name"] = "recovery-1"
 	child.Metadata["annotations"] = object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}
 	child.Spec.Container = "rhiza"

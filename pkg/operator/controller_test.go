@@ -951,7 +951,7 @@ func fakeSTS(mode string, voters []quepaxa.Member) object {
 	return object{
 		"metadata": object{"name": "rhiza", "uid": "sts-uid", "generation": float64(1), "annotations": object{}},
 		"spec": object{
-			"replicas": float64(len(voters)), "volumeClaimTemplates": []any{},
+			"serviceName": "rhiza-headless", "replicas": float64(len(voters)), "volumeClaimTemplates": []any{},
 			"template": object{"spec": object{
 				"containers": []any{object{
 					"name":         "rhiza",

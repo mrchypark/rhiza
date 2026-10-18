@@ -123,19 +123,27 @@ The operator container has a read-only root filesystem and mounts an
 
 ## Voter count
 
-`spec.voterPods` is the authoritative voter list, and its length is the voter
-count for the source generation and for the replacement generation. The
-StatefulSet must declare exactly that many desired replicas and export the same
-number of `RHIZA_CLUSTER_MEMBERS` entries; the controller rejects a mismatch with
-a message naming both numbers instead of recovering. The minimum is three. Even
-counts are supported, because QuePaxa requires only a strict majority of the
+`spec.voterCount` is the numeric voter count for the source generation and for
+the replacement generation; it must be between 3 and 64. The StatefulSet must
+declare exactly that many desired replicas and use Pod names
+`<statefulSet>-<ordinal>`. The controller derives those node IDs and Pod names,
+the headless-service DNS names from `spec.serviceName` and the operator
+namespace, and fresh voter credentials when needed. Optional `httpPort` and
+`peerPort` default to 8080 and 9090. When the watched StatefulSet already exports
+`RHIZA_CLUSTER_MEMBERS`, the controller adopts it without regeneration and
+requires its count and node IDs to match the derived inventory. When the workload
+exports no membership, the controller generates the bootstrap identities once,
+stores them in one immutable operation-owned Secret, points the workload at that
+Secret, and sets `spec.replicas` to the count. The controller rejects a count that
+disagrees with replicas or with an exported member list, naming both numbers.
+Even counts are supported, because QuePaxa requires only a strict majority of the
 configured membership for quorum and completion. The count cannot be changed in
 place: use a new generation or change one voter at a time through
 reconfiguration. Generation fencing must name every voter plus the retained
-learner history, and `RhizaFence.spec.targets` admits 16 of them. Automatic
-recovery refuses to bind a `voterPods` list longer than that and blocks before
-reserving or starting a fence whose scope exceeds the bound, naming both numbers
-in either case, so keep the voter count comfortably below sixteen.
+learner history, and `RhizaFence.spec.targets` admits 64 of them. Automatic
+recovery refuses to bind a count longer than that and blocks before reserving or
+starting a fence whose scope exceeds the bound, naming both numbers in either
+case.
 A recovery is declared `Complete` only when the target StatefulSet declares
 exactly that many desired replicas and every configured voter's identity was
 authenticated first; a scaled-down target stays `Blocked` or `WaitingReady`
