@@ -12,8 +12,8 @@ process permission to forget an existing voter's recorded proposals.
 | Restart with the original intact WAL | Restore recorder state and replay certified decisions. |
 | Detected SQLite/Graph open failure | Quarantine materializers and rebuild from retained certified history. |
 | Voter falls behind | Fetch certified peer/archive history; restore a pinned checkpoint when needed. |
-| One voter unavailable | The remaining majority continues quorum operations. |
-| Fewer voters than a majority temporarily unavailable | Restore the original nodes/disks/network. Quorum operations remain unavailable; local reads on running nodes remain possible. |
+| One voter unavailable | The remaining voters still hold a strict majority, so quorum operations continue. |
+| Unavailable voters leave fewer than a strict majority (two of three, three of five) | Restore the original nodes/disks/network. Quorum operations remain unavailable; local reads on running nodes remain possible. |
 | Voter WAL permanently lost | Never reuse its registered identity with an empty WAL. With a surviving quorum, fence the lost voter and replace it through a fresh learner; otherwise use explicitly fenced whole-generation recovery. |
 | Membership change or learner promotion | Supported through opt-in authenticated reconfiguration with a surviving quorum, fencing, and durable learner admission. Editing the bootstrap member list is not reconfiguration. |
 

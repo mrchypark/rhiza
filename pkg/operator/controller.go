@@ -848,6 +848,11 @@ func (c *Controller) targetCredentials(ctx context.Context, r *Resource, name st
 		}
 	}
 	if source != nil {
+		// A reused immutable Secret must name exactly the voters being replaced;
+		// a subset would fork a smaller generation than the one it succeeds.
+		if len(members) != len(source) {
+			return nil, fmt.Errorf("target credentials preserve %d of %d source voters", len(members), len(source))
+		}
 		old := map[quepaxa.NodeID]quepaxa.Member{}
 		for _, m := range source {
 			old[m.ID] = m

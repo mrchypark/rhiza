@@ -382,10 +382,11 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 		voters   int
 		learners int
 		blocked  bool
+		want     string
 	}{
 		{name: "voters at capacity", voters: 16},
 		{name: "voters plus history at capacity", voters: 15, learners: 1},
-		{name: "one voter over capacity", voters: 17, blocked: true},
+		{name: "voter list over capacity", voters: 17, blocked: true, want: "voterPods lists 17 voters but one fencing request admits 16"},
 		{name: "voters plus history over capacity", voters: 16, learners: 1, blocked: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -443,7 +444,10 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 				}
 				return
 			}
-			want := strconv.Itoa(tc.voters+tc.learners) + " targets exceed the fence capacity of " + strconv.Itoa(fenceTargetCapacity)
+			want := tc.want
+			if want == "" {
+				want = strconv.Itoa(tc.voters+tc.learners) + " targets exceed the fence capacity of " + strconv.Itoa(fenceTargetCapacity)
+			}
 			if loaded.Intent != nil || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, want) {
 				t.Fatalf("unfenceable scope was reserved: %+v status=%+v want=%q", loaded.Intent, r.Status, want)
 			}

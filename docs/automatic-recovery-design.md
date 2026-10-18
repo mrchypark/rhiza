@@ -170,7 +170,7 @@ fencer 결과에는 logicalID/sourceEpoch/operationID, workload UID, 대상 inst
 
 공유 노드를 끄면 다른 앱도 중단된다. 최초 지원 환경은 전용 노드 풀 또는 동등한
 격리 범위가 적절하다. Operator·fencing authority·오브젝트 저장소와 새 Pod용 용량이
-문제의 3개 노드와 함께 사라지지 않도록 분리한다.
+문제가 된 voter 노드와 함께 사라지지 않도록 분리한다.
 
 인프라에 독립적인 data-plane fencing은 별도 후속 설계다. 주기적 epoch 조회만으로는
 조회 직후 process pause/in-flight 작업을 막지 못한다. 지원하려면 모든 읽기·쓰기·

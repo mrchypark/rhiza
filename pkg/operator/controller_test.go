@@ -657,6 +657,49 @@ func TestControllerRejectsTargetReplicaShortfall(t *testing.T) {
 	}
 }
 
+// A reused immutable operation-owned Secret may not shrink the generation: it
+// must name every source voter before the recovery forks or scales anything.
+func TestControllerRejectsSubsetTargetCredentials(t *testing.T) {
+	ctx, bucket, r, api, c := controllerFixtureVoters(t, "before-ack", "before-ack", voterMembers(5))
+	r.Spec.RecoveryID = "recovery-1"
+	r.Spec.Fence = fence(r)
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	subset := []quepaxa.Member{voterMember("source", "n1", "new1"), voterMember("source", "n2", "new2"), voterMember("source", "n3", "new3")}
+	tokens := map[string]string{}
+	for _, member := range subset {
+		tokens[string(member.ID)] = "token-" + string(member.ID)
+	}
+	api.secret = object{"immutable": true, "metadata": object{"name": "rhiza-recovery-" + shortID(c.operationID(r)), "annotations": object{ownerAnnotation: c.operationID(r)}}, "data": object{
+		"members":     base64.StdEncoding.EncodeToString(jsonBytes(subset)),
+		"admin":       base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("a"), 32)),
+		"peer_tokens": base64.StdEncoding.EncodeToString(jsonBytes(tokens)),
+	}}
+	for range 4 {
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Phase == "Blocked" {
+			break
+		}
+	}
+	if want := "target credentials preserve 3 of 5 source voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+	if replicas := int(number(nested(api.sts, "spec", "replicas"))); replicas != 5 || api.zeroPuts != 0 {
+		t.Fatalf("subset target credentials scaled the workload: replicas=%d zeroPuts=%d", replicas, api.zeroPuts)
+	}
+	if r.Status.Target == "" {
+		t.Fatal("recovery reserved no target generation")
+	}
+	if _, err := bucket.Get(ctx, "root/"+r.Status.Target+"/voters/membership.json"); !bucket.IsObjNotFoundErr(err) {
+		t.Fatalf("subset target credentials forked a generation: %v", err)
+	}
+}
+
 func fence(r *Resource) Fence {
 	return Fence{RecoveryID: r.Spec.RecoveryID, ClusterID: r.Spec.SourceClusterID, StatefulSetUID: "sts-uid", Confirmed: true, Evidence: "incident-42"}
 }

@@ -133,15 +133,17 @@ configured membership for quorum and completion. The count cannot be changed in
 place: use a new generation or change one voter at a time through
 reconfiguration. Generation fencing must name every voter plus the retained
 learner history, and `RhizaFence.spec.targets` admits 16 of them. Automatic
-recovery blocks before reserving or starting a fence whose scope exceeds that
-bound, naming both numbers, so keep the voter count comfortably below sixteen.
+recovery refuses to bind a `voterPods` list longer than that and blocks before
+reserving or starting a fence whose scope exceeds the bound, naming both numbers
+in either case, so keep the voter count comfortably below sixteen.
 A recovery is declared `Complete` only when the target StatefulSet declares
 exactly that many desired replicas and every configured voter's identity was
 authenticated first; a scaled-down target stays `Blocked` or `WaitingReady`
 instead of becoming the next generation.
 
-Local qualification used an isolated kind cluster and MinIO: two lost Pods
-reported a missing quorum without automatic replacement; after runtime-confirmed
+Local qualification used an isolated kind cluster and MinIO: in the three-voter
+deployment, two lost Pods reported a missing quorum without automatic
+replacement; after runtime-confirmed
 termination of the original voters, both async → before-ack and before-ack →
 async recovery reached Complete, preserved archived SQL rows, and accepted new
 writes. Unit tests cover interrupted status writes and credential reuse. This
