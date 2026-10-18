@@ -14,9 +14,15 @@ import (
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
+type installedGeneration struct {
+	ClusterID  string
+	Voters     []VoterPod
+	Identities map[quepaxa.NodeID]FenceTarget
+}
+
 // Completion authenticates the executor's durable result, not current health.
 // A later outage must be evaluated against the installed generation/inventory.
-func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterResource, state *autoControl, child *Resource, sts object) error {
+func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterResource, state *autoControl, child *Resource, sts object, installed *installedGeneration) error {
 	i := state.Intent
 	if i.RecoveryUID == "" || resourceName(child) != i.RecoveryName || str(child.Metadata["uid"]) != i.RecoveryUID || hashJSON(child.Spec) != i.SpecHash || str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
 		return fmt.Errorf("child identity or authorized specification differs")
@@ -178,7 +184,25 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	// the identities it authenticated. Such a deficit is accepted here and
 	// answered by the escalation rule: an unauthenticated voter can never be
 	// removed one-for-one, so the next incident must fence the whole generation.
+	*installed = installedGenerationFromCompletion(child.Status.Target, members, child.Status.TargetIdentities)
 	return nil
+}
+
+func installedGenerationFromCompletion(target string, members []quepaxa.Member, captured []FenceTarget) installedGeneration {
+	identityByID := make(map[quepaxa.NodeID]FenceTarget, len(captured))
+	for _, identity := range captured {
+		identityByID[quepaxa.NodeID(identity.NodeID)] = identity
+	}
+	installed := installedGeneration{ClusterID: target, Voters: make([]VoterPod, 0, len(members)), Identities: make(map[quepaxa.NodeID]FenceTarget)}
+	for _, member := range members {
+		pod := string(member.ID)
+		if identity, ok := identityByID[member.ID]; ok {
+			pod = identity.Pod
+			installed.Identities[member.ID] = identity
+		}
+		installed.Voters = append(installed.Voters, VoterPod{NodeID: member.ID, Pod: pod})
+	}
+	return installed
 }
 
 func (c *Controller) captureAutomaticTargetIdentities(ctx context.Context, child *Resource, sts object, members []quepaxa.Member, admin string) ([]FenceTarget, error) {

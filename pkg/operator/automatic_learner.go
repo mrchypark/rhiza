@@ -41,10 +41,12 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		request.Scope = ScopeVoter
 		request.OperationID = fmt.Sprintf("%s-learner-fence-%d", intent.RecoveryName, intent.LearnerAttempt)
 		request.Targets = []FenceTarget{{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}}
-		if _, err := c.fence(ctx, request); err != nil {
+		proof, err := c.fence(ctx, request)
+		if err != nil {
 			return block("waiting for failed learner fencing proof")
 		}
 		entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: intent.Request.OperationID, Target: request.Targets[0]}
+		entry.Retirement = &learnerRetirement{Request: request, Proof: *proof}
 		for _, old := range state.Learners {
 			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
 				entry.CredentialUID = old.CredentialUID

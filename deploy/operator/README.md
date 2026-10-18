@@ -135,9 +135,11 @@ requires its count and node IDs to match the derived inventory. When the workloa
 exports no membership, fresh bootstrap is disabled unless `spec.bootstrap: true`
 is set explicitly. A bootstrap also refuses to run when the adopted cluster ID
 already has a `voters/membership.json` commitment in object storage. When allowed,
-the controller generates the bootstrap identities once, stores them in one
-immutable operation-owned Secret, points the workload at that Secret, and sets
-`spec.replicas` to the count. `spec.clusterDomain` controls the DNS suffix used in
+the controller reserves one operation-owned candidate while `replicas: 0`, stores
+the bootstrap identities in one immutable Secret, installs the Secret references
+in the template, and only then scales to the declared count. Existing Pods block
+writer-free bootstrap; a template update alone is not treated as success.
+`spec.clusterDomain` controls the DNS suffix used in
 generated URLs and defaults to `cluster.local`. Before patching, the controller
 also verifies that the workload exports `RHIZA_NODE_ID` through the downward API,
 that `RHIZA_BIND_ADDR` uses `httpPort`, and that `RHIZA_PEER_ADDR` uses `peerPort`.

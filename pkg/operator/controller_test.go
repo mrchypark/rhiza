@@ -884,7 +884,7 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 		}
 	case "/api/v1/namespaces/default/services/rhiza-headless":
 		if q.Method == "GET" {
-			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None"}})
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None", "selector": object{"app.kubernetes.io/name": "rhiza"}}})
 			return
 		}
 	}
@@ -957,7 +957,7 @@ func fakeSTS(mode string, voters []quepaxa.Member) object {
 		"metadata": object{"name": "rhiza", "uid": "sts-uid", "generation": float64(1), "annotations": object{}},
 		"spec": object{
 			"serviceName": "rhiza-headless", "replicas": float64(len(voters)), "volumeClaimTemplates": []any{},
-			"template": object{"spec": object{
+			"template": object{"metadata": object{"labels": object{"app.kubernetes.io/name": "rhiza"}}, "spec": object{
 				"containers": []any{object{
 					"name":         "rhiza",
 					"env":          []any{object{"name": "RHIZA_CLUSTER_ID", "value": "source"}, object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(raw)}, object{"name": "RHIZA_OBJSTORE_DURABILITY", "value": mode}, object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"}, object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "s3"}, object{"name": "RHIZA_OBJSTORE_ENDPOINT", "value": "https://store.example"}, object{"name": "RHIZA_OBJSTORE_BUCKET", "value": "rhiza"}},

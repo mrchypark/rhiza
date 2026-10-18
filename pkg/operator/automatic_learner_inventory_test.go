@@ -493,6 +493,64 @@ func TestCompactionBlocksOversizedUnreducibleHistory(t *testing.T) {
 	}
 }
 
+func TestCompactionRequiresEveryRunForPodUID(t *testing.T) {
+	ctx := t.Context()
+	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}}
+	ledger := &fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
+	clean := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "pod-uid", RunID: "clean"}
+	unknown := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "pod-uid", RunID: "unknown"}
+	if err := ledger.Ledger.Register(clean); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Ledger.Register(unknown); err != nil {
+		t.Fatal(err)
+	}
+	clean.WALIdentity = entry.Target.WALIdentity
+	if err := ledger.Ledger.Bind(clean); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Ledger.CloseNodes("op", "hash", nil); err != nil {
+		t.Fatal(err)
+	}
+	cleanRun := ledger.Ledger.Runs["clean"]
+	if err := ledger.Ledger.RecordDrain(fencing.DrainReceipt{Request: *cleanRun.Stop, WritersJoined: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Ledger.RecordExit(*cleanRun.Stop); err != nil {
+		t.Fatal(err)
+	}
+	f := newCompactionFixture(t)
+	f.ledger = ledger
+	if err := f.c.verifyTerminatedCleanup(ctx, "sts-uid", entry); err == nil {
+		t.Fatal("clean run hid an unresolved run for the same Pod UID")
+	}
+	cleanLedger := &fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
+	for _, runID := range []string{"first", "second"} {
+		id := fencing.Identity{SourceClusterID: "source", NodeID: "learner", PodUID: "pod-uid", RunID: runID, WALIdentity: entry.Target.WALIdentity}
+		if err := cleanLedger.Ledger.Register(fencing.Identity{SourceClusterID: id.SourceClusterID, NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID}); err != nil {
+			t.Fatal(err)
+		}
+		if err := cleanLedger.Ledger.Bind(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cleanLedger.Ledger.CloseNodes("op", "hash", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range cleanLedger.Ledger.Runs {
+		if err := cleanLedger.Ledger.RecordDrain(fencing.DrainReceipt{Request: *run.Stop, WritersJoined: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := cleanLedger.Ledger.RecordExit(*run.Stop); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.ledger = cleanLedger
+	if err := f.c.verifyTerminatedCleanup(ctx, "sts-uid", entry); err != nil {
+		t.Fatalf("all proven runs rejected: %v", err)
+	}
+}
+
 func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 	ctx := t.Context()
 	f := newCompactionFixture(t)
@@ -513,16 +571,102 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
 		t.Fatalf("full journal provisioning handled=%t err=%v", handled, err)
 	}
-	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "learner history is full") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory {
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "cannot reserve its fallback generation fence") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory {
 		t.Fatalf("full journal mutated Kubernetes: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
 	}
 
-	f.ledger = terminatedLedger(t, []learnerIncarnation{loaded.Learners[0]})
+	f.ledger = terminatedLedger(t, append([]learnerIncarnation(nil), loaded.Learners[:4]...))
 	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
 		t.Fatalf("compaction recovery handled=%t err=%v", handled, err)
 	}
-	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory-1 {
+	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory-4 {
 		t.Fatalf("compaction did not free capacity before mutation: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
+	}
+}
+
+func TestLearnerProvisioningReservesWorstCaseGenerationScope(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		voters  int
+		history int
+	}{
+		{name: "64 voters", voters: 64},
+		{name: "63 voters plus two retained", voters: 63, history: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCompactionFixture(t)
+			r := autoClusterResource("root", "binding", "logical")
+			state := validAutoControl()
+			state.BindingUID, state.StatefulSetUID = "binding", "sts-uid"
+			state.Voters = nil
+			for i := range tc.voters {
+				state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(fmt.Sprintf("rhiza-%d", i)), Pod: fmt.Sprintf("rhiza-%d", i)})
+			}
+			for i := range tc.history {
+				state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("history-%d", i), CredentialUID: fmt.Sprintf("cred-%d", i), Target: FenceTarget{NodeID: fmt.Sprintf("history-%d", i), Pod: fmt.Sprintf("history-%d", i), PodUID: fmt.Sprintf("uid-%d", i), WALIdentity: strings.Repeat("a", 64)}})
+			}
+			state.Intent = &autoIntent{LearnerName: "candidate"}
+			if handled, err := f.c.prepareLearnerProvisioning(t.Context(), r, state, nil); err != nil || !handled || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "fallback generation fence") || f.mutations != 0 {
+				t.Fatalf("handled=%t err=%v status=%+v mutations=%d", handled, err, r.Status, f.mutations)
+			}
+		})
+	}
+}
+
+func TestLearnerRetirementReceiptCompactsWithoutCooperativeLedger(t *testing.T) {
+	ctx := t.Context()
+	f := newCompactionFixture(t)
+	root := autoClusterResource("root", "binding", "logical")
+	state := validAutoControl()
+	state.StatefulSetUID = "sts-uid"
+	if err := f.c.saveAuto(ctx, root, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 70 {
+		loaded, version, err := f.c.loadAuto(ctx, f.c.autoKey(root))
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := FenceTarget{NodeID: fmt.Sprintf("learner-%d", i), Pod: fmt.Sprintf("learner-%d", i), PodUID: fmt.Sprintf("uid-%d", i), WALIdentity: strings.Repeat("a", 64)}
+		request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: fmt.Sprintf("retire-%d", i), Scope: ScopeVoter, Targets: []FenceTarget{target}}
+		hash, err := requestHash(&request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := learnerIncarnation{SourceClusterID: "source", OperationID: request.OperationID, CredentialUID: fmt.Sprintf("cred-%d", i), Target: target, Retirement: &learnerRetirement{Request: request, Proof: FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: "binding", RequestHash: hash, ProofID: "external-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}}
+		loaded.Learners = append(loaded.Learners, entry)
+		changed, err := f.c.compactLearnerHistory(ctx, loaded)
+		if err != nil || !changed || len(loaded.Learners) != 0 {
+			t.Fatalf("cycle %d did not compact with external proof: changed=%t err=%v learners=%d", i, changed, err, len(loaded.Learners))
+		}
+		if err := f.c.saveAuto(ctx, root, loaded, version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unresolved := learnerIncarnation{SourceClusterID: "source", OperationID: "unresolved", CredentialUID: "cred-unresolved", Target: FenceTarget{NodeID: "unresolved", Pod: "unresolved", PodUID: "uid-unresolved", WALIdentity: strings.Repeat("a", 64)}}
+	loaded, _, err := f.c.loadAuto(ctx, f.c.autoKey(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Learners = append(loaded.Learners, unresolved)
+	changed, err := f.c.compactLearnerHistory(ctx, loaded)
+	if err != nil || changed || len(loaded.Learners) != 1 {
+		t.Fatalf("unresolved learner was removed: changed=%t err=%v learners=%d", changed, err, len(loaded.Learners))
+	}
+}
+
+func TestNonSupervisedLearnerInventoryCapturesCredentialUID(t *testing.T) {
+	ctx, api, c := learnerFixture(t)
+	sts := learnerSTS(t)
+	if _, err := c.ensureAutomaticLearner(ctx, sts, "rhiza", "op-1", "source", "l-a"); err != nil {
+		t.Fatal(err)
+	}
+	state := validAutoControl()
+	state.ActiveClusterID, state.StatefulSetUID = "source", "sts-uid"
+	state.Intent = &autoIntent{LearnerName: "l-a", LearnerUID: str(nested(api.pod, "metadata", "uid")), Request: FenceRequest{OperationID: "op-1"}}
+	entry, err := c.learnerInventoryEntry(ctx, state, sts, api.pod)
+	if err != nil || entry.CredentialUID != "learner-secret-uid" {
+		t.Fatalf("entry=%+v err=%v", entry, err)
 	}
 }
 

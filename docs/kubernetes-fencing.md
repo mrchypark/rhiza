@@ -185,7 +185,10 @@ The controller retries every retained incarnation on later reconciles, including
 entries from generations that are no longer active, so a temporary proof failure
 does not permanently consume the journal. An incarnation missing any part of that
 proof stays in the journal and remains fenced; a Pod deletion alone is never
-proof. Pruning does not mutate an already issued fence request. Pruned identities
+proof. A completed external fence request with its exact proof is also retained as
+a retirement receipt, so compaction does not require a cooperative ledger from
+non-cooperative backends. Every retained run for the same Pod UID must be proven;
+one clean run cannot hide an unknown run. Pruning does not mutate an already issued fence request. Pruned identities
 are not retained as tombstones: a learner that reappears without a matching
 journal entry is rejected by the existing unlisted-learner cleanup guard and
 blocks recovery. Preexisting journals that discarded a retired learner's identity

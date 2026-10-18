@@ -232,6 +232,31 @@ func TestAutomaticCompletionRejectsUnknownVoterIdentity(t *testing.T) {
 	}
 }
 
+func TestInstalledGenerationUsesTargetAuthority(t *testing.T) {
+	members := []quepaxa.Member{{ID: "rhiza-0"}, {ID: "rhiza-1"}, {ID: "rhiza-2"}}
+	identities := []FenceTarget{{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "uid-0", WALIdentity: "wal-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "uid-1", WALIdentity: "wal-1"}, {NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "uid-2", WALIdentity: "wal-2"}}
+	installed := installedGenerationFromCompletion("target-generation", members, identities)
+	state := validAutoControl()
+	state.ActiveClusterID, state.Voters, state.Identities = installed.ClusterID, installed.Voters, installed.Identities
+	state.Completed = &autoCompletion{ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...)}
+	if len(state.Voters) != 3 || state.Voters[2].NodeID != "rhiza-2" || state.Completed.ClusterID != "target-generation" || len(state.Completed.Voters) != 3 {
+		t.Fatalf("target authority was not installed: %+v", state)
+	}
+	var missing, wrong bool
+	for _, voter := range state.Voters {
+		identity := state.Identities[voter.NodeID]
+		if identity.PodUID == "" || identity.WALIdentity == "" {
+			missing = true
+		}
+		if identity.NodeID != string(voter.NodeID) || identity.Pod != voter.Pod {
+			wrong = true
+		}
+	}
+	if missing || wrong {
+		t.Fatalf("next generation fence lost exact identity: voters=%+v identities=%+v", state.Voters, state.Identities)
+	}
+}
+
 // automaticCompletion holds one installed automatic target generation, its
 // durable intent, and the fixtures advanceAutomatic authenticates against.
 type automaticCompletion struct {

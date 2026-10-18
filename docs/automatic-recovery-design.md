@@ -29,10 +29,13 @@ voter와 남아 있는 learner 이력을 합친 대상이 64개를 넘으면 자
 
 기존 `RhizaCluster`에는 `spec.voterCount`가 없고 기존 automatic control record에는
 `voterPods` 기준 binding hash가 남아 있다. 운영자는 기존 오브젝트에 StatefulSet
-replica 수와 일치하는 `spec.voterCount`를 추가한다. Controller는 legacy binding
-hash와 관측 가능한 replica·membership count가 모두 맞을 때 control record를 현재
-binding version과 hash로 한 번만 다시 쓰고, 그중 하나라도 어긋나면 어느 검사가
-실패했는지 알려 주며 막는다.
+replica 수와 일치하는 `spec.voterCount`를 추가한다. Controller는 기존 immutable
+binding record에 저장된 opaque legacy hash를 그대로 migration 증거로 사용하며,
+현재 voter 목록으로 과거 hash를 다시 계산하지 않는다. 검증된 old→new 연결 증거와
+관측 가능한 replica·membership count가 모두 맞을 때 control record를 현재 binding
+version과 hash로 한 번만 다시 쓰고, 그중 하나라도 어긋나면 어느 검사가 실패했는지
+알려 주며 막는다. Fresh bootstrap은 `replicas: 0` 예약 단계, 고정 credential/template
+설치 단계, writer 없는 workload의 scale-up 단계를 차례로 거친다.
 
 완전 자동은 모든 외부 장애 중에도 무조건 복구한다는 뜻이 아니다. Kubernetes,
 공유 저장소, fencing authority, 새 Pod 실행 용량이 사용 가능하고 증거가 유효할

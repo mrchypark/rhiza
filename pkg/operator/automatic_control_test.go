@@ -809,7 +809,7 @@ func TestReconcileClusterRequiresMatchingVoterCount(t *testing.T) {
 			return
 		}
 		if q.Method == http.MethodGet && q.URL.Path == "/api/v1/namespaces/default/services/rhiza-headless" {
-			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None"}})
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None", "selector": object{"app.kubernetes.io/name": "rhiza"}}})
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{})
@@ -936,7 +936,7 @@ func boundClusterFixture(t *testing.T, voters []quepaxa.Member) (*Controller, *C
 			return
 		}
 		if q.Method == http.MethodGet && q.URL.Path == "/api/v1/namespaces/default/services/rhiza-headless" {
-			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None"}})
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None", "selector": object{"app.kubernetes.io/name": "rhiza"}}})
 			return
 		}
 		if q.Method == http.MethodPut && strings.HasSuffix(q.URL.Path, "/status") {
@@ -1006,7 +1006,7 @@ func TestClusterBootstrapRequiresOptInAndUnregisteredStore(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
-			api := &clusterAPI{sts: freshClusterSTS(3)}
+			api := &clusterAPI{sts: freshBootstrapSTS(3)}
 			c := clusterController(t, api)
 			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 			r.Spec.VoterCount, r.Spec.Bootstrap = 3, tc.bootstrap
@@ -1061,7 +1061,7 @@ func TestClusterFreshBootstrapValidatesRuntimeIdentity(t *testing.T) {
 		}, want: "RHIZA_BIND_ADDR port is 8081 but expected 8080"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			api := &clusterAPI{sts: freshClusterSTS(3)}
+			api := &clusterAPI{sts: freshBootstrapSTS(3)}
 			c := clusterController(t, api)
 			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 			r.Spec.VoterCount, r.Spec.Bootstrap = 3, true
@@ -1091,7 +1091,7 @@ func TestClusterServiceAndDomainValidation(t *testing.T) {
 		{name: "invalid domain", domain: "Bad_Domain", want: "is not a DNS name"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			api := &clusterAPI{sts: freshClusterSTS(3), service: tc.service, omitService: tc.omit}
+			api := &clusterAPI{sts: freshBootstrapSTS(3), service: tc.service, omitService: tc.omit}
 			c := clusterController(t, api)
 			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 			r.Spec.VoterCount, r.Spec.ClusterDomain = 3, tc.domain
@@ -1106,7 +1106,7 @@ func TestClusterServiceAndDomainValidation(t *testing.T) {
 	}
 
 	t.Run("custom cluster domain", func(t *testing.T) {
-		api := &clusterAPI{sts: freshClusterSTS(3)}
+		api := &clusterAPI{sts: freshBootstrapSTS(3)}
 		c := clusterController(t, api)
 		r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 		r.Spec.VoterCount, r.Spec.Bootstrap, r.Spec.ClusterDomain = 3, true, "corp.internal"
@@ -1141,7 +1141,8 @@ func TestLegacyBindingMigration(t *testing.T) {
 	state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
 	state.BindingVersion = 0
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
-	state.BindingHash = legacyAutoBinding(r, state.Voters)
+	state.BindingHash = "legacy-hash"
+	seedLegacyBinding(t, c, r, "legacy-hash")
 	if err := c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1151,9 +1152,13 @@ func TestLegacyBindingMigration(t *testing.T) {
 	if r.Status.Phase != "Observing" || !strings.Contains(r.Status.Message, "legacy automatic binding migrated") {
 		t.Fatalf("migration status=%+v", r.Status)
 	}
-	loaded, _, err := c.loadAuto(ctx, c.autoKey(r))
+	loaded, version, err := c.loadAuto(ctx, c.autoKey(r))
 	if err != nil || loaded.BindingVersion != autoBindingVersion || loaded.BindingHash != autoBinding(r) {
 		t.Fatalf("migrated record=%+v err=%v", loaded, err)
+	}
+	loaded.Voters[2] = VoterPod{NodeID: "replacement-voter", Pod: "replacement-voter"}
+	if err := c.saveAuto(ctx, r, loaded, version); err != nil {
+		t.Fatal(err)
 	}
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
@@ -1173,7 +1178,7 @@ func TestLegacyBindingMigrationFailsClosed(t *testing.T) {
 	}{
 		{name: "missing voter count", count: 0, want: "spec.voterCount is required"},
 		{name: "wrong replicas", count: 4, want: "StatefulSet has 3 desired replicas but voterCount is 4"},
-		{name: "hash changed", count: 3, hash: "wrong", want: "legacy automatic binding hash no longer matches"},
+		{name: "hash changed", count: 3, hash: "wrong", want: "legacy automatic binding record differs from the stored binding"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			api := &clusterAPI{sts: fakeSTS("before-ack", voterMembers(3))}
@@ -1185,7 +1190,8 @@ func TestLegacyBindingMigrationFailsClosed(t *testing.T) {
 			state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
 			state.BindingVersion = 0
 			state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
-			state.BindingHash = legacyAutoBinding(r, state.Voters)
+			state.BindingHash = "legacy-hash"
+			seedLegacyBinding(t, c, r, "legacy-hash")
 			if tc.hash != "" {
 				state.BindingHash = tc.hash
 			}
@@ -1213,7 +1219,8 @@ func TestLegacyBindingMigrationRejectsIdentityDrift(t *testing.T) {
 	state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
 	state.BindingVersion = 0
 	state.Voters = []VoterPod{{NodeID: "x1", Pod: "x1"}, {NodeID: "x2", Pod: "x2"}, {NodeID: "x3", Pod: "x3"}}
-	state.BindingHash = legacyAutoBinding(r, state.Voters)
+	state.BindingHash = "legacy-hash"
+	seedLegacyBinding(t, c, r, "legacy-hash")
 	if err := c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1222,6 +1229,49 @@ func TestLegacyBindingMigrationRejectsIdentityDrift(t *testing.T) {
 	}
 	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "drifts from the exported membership") {
 		t.Fatalf("status=%+v", r.Status)
+	}
+}
+
+func TestLegacyBindingMigrationResumesAfterCASConflict(t *testing.T) {
+	ctx := t.Context()
+	api := &clusterAPI{sts: fakeSTS("before-ack", voterMembers(3))}
+	c := clusterController(t, api)
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.VoterCount, r.Spec.Container = 3, "rhiza"
+	normalizeClusterSpec(r)
+	state := validAutoControl()
+	state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
+	state.BindingVersion = 0
+	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
+	state.BindingHash = "legacy-hash"
+	seedLegacyBinding(t, c, r, "legacy-hash")
+	if err := c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded, version, err := c.loadAuto(ctx, c.autoKey(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated, err := c.migrateLegacyBinding(ctx, r, loaded, version, voterMembers(3), true, api.sts); err != nil || !migrated {
+		t.Fatalf("first migration migrated=%t err=%v", migrated, err)
+	}
+	stale := *loaded
+	stale.BindingVersion = 0
+	stale.BindingHash = "legacy-hash"
+	if _, err := c.migrateLegacyBinding(ctx, r, &stale, version, voterMembers(3), true, api.sts); !c.Bucket.IsConditionNotMetErr(err) {
+		t.Fatalf("stale migration err=%v", err)
+	}
+	final, _, err := c.loadAuto(ctx, c.autoKey(r))
+	if err != nil || final.BindingVersion != autoBindingVersion || final.BindingHash != autoBinding(r) {
+		t.Fatalf("migration did not resume: %+v err=%v", final, err)
+	}
+}
+
+func seedLegacyBinding(t *testing.T, c *Controller, r *ClusterResource, hash string) {
+	t.Helper()
+	key := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, "sts-uid", "binding.json")
+	if err := c.immutable(t.Context(), key, jsonBytes(object{"logicalID": r.Spec.LogicalID, "bindingUID": str(r.Metadata["uid"]), "bindingHash": hash})); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1274,7 +1324,7 @@ func TestBootstrappedAdoptedMemberURLForms(t *testing.T) {
 
 func TestBootstrapPortChangeBlocksBeforeBinding(t *testing.T) {
 	ctx := t.Context()
-	api := &clusterAPI{sts: freshClusterSTS(3)}
+	api := &clusterAPI{sts: freshBootstrapSTS(3)}
 	c := clusterController(t, api)
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.VoterCount, r.Spec.Bootstrap = 3, true
@@ -1289,11 +1339,44 @@ func TestBootstrapPortChangeBlocksBeforeBinding(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "port does not match declared 8081") {
+	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "expected 8081") {
 		t.Fatalf("status=%+v", r.Status)
 	}
 	if _, _, err := c.loadAuto(ctx, c.autoKey(r)); !c.Bucket.IsObjNotFoundErr(err) {
 		t.Fatalf("port change persisted a binding: %v", err)
+	}
+}
+
+func TestBootstrapRequiresWriterFreeZeroStageAndServiceContract(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sts     object
+		service object
+		pods    []object
+		want    string
+	}{
+		{name: "existing writers", sts: freshBootstrapSTS(3), pods: []object{{"metadata": object{"uid": "old-pod", "ownerReferences": []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "uid": "sts-uid"}}}}}, want: "writer Pods already exist"},
+		{name: "already scaled without reservation", sts: freshClusterSTS(3), want: "requires replicas=0"},
+		{name: "nonzero ordinals", sts: func() object {
+			s := freshBootstrapSTS(3)
+			asObject(s["spec"])["ordinals"] = object{"start": float64(1)}
+			return s
+		}(), want: "ordinals.start=0"},
+		{name: "selector mismatch", sts: freshBootstrapSTS(3), service: object{"spec": object{"clusterIP": "None", "selector": object{"app": "other"}}}, want: "selector"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &clusterAPI{sts: tc.sts, service: tc.service, pods: tc.pods}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount, r.Spec.Bootstrap = 3, true
+			normalizeClusterSpec(r)
+			if err := c.reconcileCluster(t.Context(), r); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, tc.want) || api.secretCreates != 0 {
+				t.Fatalf("status=%+v creates=%d want=%q", r.Status, api.secretCreates, tc.want)
+			}
+		})
 	}
 }
 
@@ -1327,6 +1410,7 @@ type clusterAPI struct {
 	sts           object
 	service       object
 	omitService   bool
+	pods          []object
 	secrets       map[string]object
 	secretCreates int
 }
@@ -1354,6 +1438,8 @@ func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
 		if json.NewDecoder(q.Body).Decode(&next) == nil {
 			_ = json.NewEncoder(w).Encode(next)
 		}
+	case q.URL.Path == "/api/v1/namespaces/default/pods" && q.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode(podList{Items: a.pods})
 	case q.URL.Path == "/api/v1/namespaces/default/secrets" && q.Method == http.MethodPost:
 		var next object
 		if json.NewDecoder(q.Body).Decode(&next) == nil {
@@ -1391,7 +1477,7 @@ func clusterController(t *testing.T, api *clusterAPI) *Controller {
 	c.StoreIdentity = storeIdentity()
 	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
 	if api.service == nil {
-		api.service = object{"spec": object{"clusterIP": "None"}}
+		api.service = object{"spec": object{"clusterIP": "None", "selector": object{"app.kubernetes.io/name": "rhiza"}}}
 	}
 	return c
 }
@@ -1402,6 +1488,12 @@ func freshClusterSTS(count int) object {
 	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": ""})
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}}, object{"name": "RHIZA_PEER_ADDR", "value": "0.0.0.0:9090"}, object{"name": "RHIZA_BIND_ADDR", "value": "0.0.0.0:8080"})
+	return sts
+}
+
+func freshBootstrapSTS(count int) object {
+	sts := freshClusterSTS(count)
+	asObject(sts["spec"])["replicas"] = float64(0)
 	return sts
 }
 
@@ -1440,7 +1532,7 @@ func TestClusterVoterCountAdoptsDerivedInventory(t *testing.T) {
 func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	ctx := context.Background()
 	const count = 5
-	api := &clusterAPI{sts: freshClusterSTS(count)}
+	api := &clusterAPI{sts: freshBootstrapSTS(count)}
 	c := clusterController(t, api)
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.VoterCount, r.Spec.Automatic, r.Spec.Bootstrap = count, true, true
@@ -1449,14 +1541,14 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Message != "fresh voter credentials created; waiting for workload" || api.secretCreates != 1 {
+	if r.Status.Message != "bootstrap credentials installed; waiting for writer-free scale up" || api.secretCreates != 1 {
 		t.Fatalf("bootstrap status=%+v creates=%d", r.Status, api.secretCreates)
 	}
 	if exists, err := c.Bucket.Exists(ctx, bindingPath(c)); err != nil || exists {
 		t.Fatalf("fresh bootstrap froze a binding before adoption: exists=%t err=%v", exists, err)
 	}
-	if replicas := int(number(nested(api.sts, "spec", "replicas"))); replicas != count {
-		t.Fatalf("bootstrap replicas=%d want=%d", replicas, count)
+	if replicas := int(number(nested(api.sts, "spec", "replicas"))); replicas != 0 {
+		t.Fatalf("bootstrap installed credentials before zero-writer stage: replicas=%d", replicas)
 	}
 	secretName := ""
 	var secret object
@@ -1491,6 +1583,12 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 		t.Fatalf("inherited scalar token was not cleared: %+v", token)
 	}
 
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Message != "bootstrap membership installed; starting voters" || int(number(nested(api.sts, "spec", "replicas"))) != count {
+		t.Fatalf("bootstrap scale-up status=%+v replicas=%v", r.Status, nested(api.sts, "spec", "replicas"))
+	}
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
@@ -1555,6 +1653,7 @@ func TestClusterVoterCountRejectsAdoptionMismatch(t *testing.T) {
 	r.Spec.VoterCount = 3
 	normalizeClusterSpec(r)
 	ctr, _ := container(api.sts, "rhiza")
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(jsonBytes(adoptedClusterMembers(t, r, api.sts)))})
 
 	asObject(api.sts["spec"])["replicas"] = float64(4)
 	if err := c.reconcileCluster(ctx, r); err != nil {

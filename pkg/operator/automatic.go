@@ -55,17 +55,18 @@ type ClusterStatus struct {
 	ObservedGeneration int64  `json:"observedGeneration"`
 }
 type autoControl struct {
-	Version         int                            `json:"version"`
-	BindingUID      string                         `json:"bindingUID"`
-	BindingHash     string                         `json:"bindingHash"`
-	BindingVersion  int                            `json:"bindingVersion,omitempty"`
-	StatefulSetUID  string                         `json:"statefulSetUID"`
-	ActiveClusterID string                         `json:"activeClusterID"`
-	Voters          []VoterPod                     `json:"voters"`
-	Identities      map[quepaxa.NodeID]FenceTarget `json:"identities"`
-	SuspectedSince  time.Time                      `json:"suspectedSince"`
-	Completions     []time.Time                    `json:"completions,omitempty"`
-	Sequence        uint64                         `json:"sequence"`
+	Version           int                            `json:"version"`
+	BindingUID        string                         `json:"bindingUID"`
+	BindingHash       string                         `json:"bindingHash"`
+	BindingVersion    int                            `json:"bindingVersion,omitempty"`
+	LegacyBindingHash string                         `json:"legacyBindingHash,omitempty"`
+	StatefulSetUID    string                         `json:"statefulSetUID"`
+	ActiveClusterID   string                         `json:"activeClusterID"`
+	Voters            []VoterPod                     `json:"voters"`
+	Identities        map[quepaxa.NodeID]FenceTarget `json:"identities"`
+	SuspectedSince    time.Time                      `json:"suspectedSince"`
+	Completions       []time.Time                    `json:"completions,omitempty"`
+	Sequence          uint64                         `json:"sequence"`
 
 	Intent    *autoIntent          `json:"intent,omitempty"`
 	Completed *autoCompletion      `json:"completed,omitempty"`
@@ -78,10 +79,23 @@ var clusterDomainRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0
 
 // Keep retired learners until their source generation is fully replaced.
 type learnerIncarnation struct {
-	SourceClusterID string      `json:"sourceClusterID"`
-	OperationID     string      `json:"operationID"`
-	CredentialUID   string      `json:"credentialUID"`
-	Target          FenceTarget `json:"target"`
+	SourceClusterID string             `json:"sourceClusterID"`
+	OperationID     string             `json:"operationID"`
+	CredentialUID   string             `json:"credentialUID"`
+	Target          FenceTarget        `json:"target"`
+	Retirement      *learnerRetirement `json:"retirement,omitempty"`
+}
+
+type learnerRetirement struct {
+	Request FenceRequest `json:"request"`
+	Proof   FenceProof   `json:"proof"`
+}
+
+type bootstrapCandidate struct {
+	Version, VoterCount, HTTPPort, PeerPort  int
+	LogicalID, StatefulSet, StatefulSetUID   string
+	AdoptClusterID, Container, ClusterDomain string
+	ServiceName                              string
 }
 
 // autoCompletion records an installed outcome, independently of later health.
@@ -148,21 +162,18 @@ func autoBinding(r *ClusterResource) string {
 	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, clusterDomain, r.Spec.VoterCount, httpPort, peerPort})
 }
 
-func legacyAutoBinding(r *ClusterResource, voters []VoterPod) string {
-	return hashJSON(struct {
-		LogicalID, StatefulSet, Container, AdoptClusterID string
-		AnchorID                                          string `json:"anchorID,omitempty"`
-		Voters                                            []VoterPod
-	}{r.Spec.LogicalID, r.Spec.StatefulSet, r.Spec.Container, r.Spec.AdoptClusterID, r.Spec.AnchorID, voters})
-}
-
 func (c *Controller) migrateLegacyBinding(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion, members []quepaxa.Member, adopted bool, sts object) (bool, error) {
 	if state.BindingVersion != 0 {
 		return false, nil
 	}
-	legacy := legacyAutoBinding(r, state.Voters)
-	if state.BindingHash != legacy && state.BindingHash != autoBinding(r) {
-		return false, fmt.Errorf("legacy automatic binding hash no longer matches logicalID, statefulSet, adoptClusterID, or voter inventory")
+	if state.BindingHash == "" {
+		return false, fmt.Errorf("legacy automatic binding hash is missing")
+	}
+	if err := c.verifyLegacyBindingRecord(ctx, r, state, str(nested(sts, "metadata", "uid"))); err != nil {
+		return false, err
+	}
+	if state.ActiveClusterID != r.Spec.AdoptClusterID {
+		return false, fmt.Errorf("legacy automatic binding adoptClusterID changed: stored=%s current=%s", state.ActiveClusterID, r.Spec.AdoptClusterID)
 	}
 	replicas := int(number(nested(sts, "spec", "replicas")))
 	if r.Spec.VoterCount != replicas {
@@ -174,12 +185,40 @@ func (c *Controller) migrateLegacyBinding(ctx context.Context, r *ClusterResourc
 	if err := legacyVoterIdentityDrift(state.Voters, members); err != nil {
 		return false, err
 	}
+	oldHash := state.BindingHash
+	newHash := autoBinding(r)
+	proof := object{
+		"version": 1, "logicalID": r.Spec.LogicalID, "bindingUID": state.BindingUID,
+		"statefulSetUID": str(nested(sts, "metadata", "uid")), "adoptClusterID": r.Spec.AdoptClusterID,
+		"voterCount": r.Spec.VoterCount, "legacyBindingHash": oldHash, "bindingHash": newHash,
+		"members": members,
+	}
+	proofKey := path.Join(c.Prefix, "automatic", c.Kube.Namespace, r.Spec.LogicalID, "binding-migrations", shortID(oldHash+":"+newHash)+".json")
+	if err := c.immutable(ctx, proofKey, jsonBytes(proof)); err != nil {
+		return false, fmt.Errorf("legacy binding migration proof is unavailable or inconsistent")
+	}
+	state.LegacyBindingHash = oldHash
 	state.BindingVersion = autoBindingVersion
-	state.BindingHash = autoBinding(r)
+	state.BindingHash = newHash
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func (c *Controller) verifyLegacyBindingRecord(ctx context.Context, r *ClusterResource, state *autoControl, uid string) error {
+	key := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, uid, "binding.json")
+	reader, err := c.Bucket.Get(ctx, key)
+	if err != nil {
+		return fmt.Errorf("legacy automatic binding record is unavailable")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, 1<<20))
+	closeErr := reader.Close()
+	var binding object
+	if readErr != nil || closeErr != nil || len(data) >= 1<<20 || json.Unmarshal(data, &binding) != nil || str(binding["logicalID"]) != r.Spec.LogicalID || str(binding["bindingUID"]) != state.BindingUID || str(binding["bindingHash"]) != state.BindingHash {
+		return fmt.Errorf("legacy automatic binding record differs from the stored binding")
+	}
+	return nil
 }
 
 func legacyVoterIdentityDrift(voters []VoterPod, members []quepaxa.Member) error {
@@ -223,7 +262,7 @@ func (c *Controller) claimAutoBinding(ctx context.Context, r *ClusterResource, s
 		return fmt.Errorf("workload is owned by another automatic binding")
 	}
 	hash := str(binding["bindingHash"])
-	if hash != state.BindingHash && hash != legacyAutoBinding(r, state.Voters) {
+	if hash != state.BindingHash && (state.LegacyBindingHash == "" || hash != state.LegacyBindingHash) {
 		return fmt.Errorf("workload binding hash changed")
 	}
 	return nil
@@ -366,6 +405,16 @@ func (c *Controller) validateClusterService(ctx context.Context, r *ClusterResou
 	}
 	if clusterIP := str(nested(record, "spec", "clusterIP")); clusterIP != "None" {
 		return fmt.Errorf("Service %q must be headless: clusterIP=%q, want None", service, clusterIP)
+	}
+	selector := asObject(nested(record, "spec", "selector"))
+	labels := asObject(nested(sts, "spec", "template", "metadata", "labels"))
+	if len(selector) == 0 {
+		return fmt.Errorf("Service %q must select the StatefulSet Pods", service)
+	}
+	for key, value := range selector {
+		if labels[key] != value {
+			return fmt.Errorf("Service %q selector %s=%q does not match StatefulSet Pod labels", service, key, value)
+		}
 	}
 	return nil
 }
@@ -528,17 +577,37 @@ func (c *Controller) rejectRegisteredCluster(ctx context.Context, clusterID stri
 	return fmt.Errorf("cluster %s is already registered in object storage; refusing bootstrap", clusterID)
 }
 
-func (c *Controller) bootstrapCluster(ctx context.Context, r *ClusterResource, sts, ctr object) error {
+func bootstrapCandidateKey(r *ClusterResource) string {
+	return path.Join("automatic-bootstrap", str(r.Metadata["uid"]), r.Spec.LogicalID+".json")
+}
+
+func expectedBootstrapCandidate(r *ClusterResource, sts object) bootstrapCandidate {
+	return bootstrapCandidate{Version: 1, VoterCount: r.Spec.VoterCount, HTTPPort: r.Spec.HTTPPort, PeerPort: r.Spec.PeerPort, LogicalID: r.Spec.LogicalID, StatefulSet: r.Spec.StatefulSet, StatefulSetUID: str(nested(sts, "metadata", "uid")), AdoptClusterID: r.Spec.AdoptClusterID, Container: r.Spec.Container, ClusterDomain: r.Spec.ClusterDomain, ServiceName: str(nested(sts, "spec", "serviceName"))}
+}
+
+func bootstrapTemplateInstalled(ctr object, r *ClusterResource) bool {
+	secretName := bootstrapSecretName(r)
+	found := false
+	peersCleared := false
+	for _, raw := range list(ctr["env"]) {
+		entry := asObject(raw)
+		switch str(entry["name"]) {
+		case "RHIZA_CLUSTER_MEMBERS":
+			found = str(nested(entry, "valueFrom", "secretKeyRef", "name")) == secretName
+		case "RHIZA_PEER_TOKEN":
+			peersCleared = str(entry["value"]) == ""
+		}
+	}
+	return found && peersCleared
+}
+
+func (c *Controller) installBootstrapCredentials(ctx context.Context, r *ClusterResource, sts, ctr object) error {
 	sources, err := clusterMemberSources(r, sts, c.Kube.Namespace)
 	if err != nil {
 		return err
 	}
 	secretName := bootstrapSecretName(r)
-	members, err := c.targetCredentials(ctx, &Resource{
-		Metadata: object{"uid": str(r.Metadata["uid"])},
-		Spec:     Spec{RecoveryID: r.Spec.LogicalID},
-		Status:   Status{Target: r.Spec.AdoptClusterID},
-	}, secretName, sources)
+	members, err := c.targetCredentials(ctx, &Resource{Metadata: object{"uid": str(r.Metadata["uid"])}, Spec: Spec{RecoveryID: r.Spec.LogicalID}, Status: Status{Target: r.Spec.AdoptClusterID}}, secretName, sources)
 	if err != nil {
 		return err
 	}
@@ -546,8 +615,70 @@ func (c *Controller) bootstrapCluster(ctx context.Context, r *ClusterResource, s
 		return fmt.Errorf("bootstrap generated %d voters but voterCount is %d", len(members), r.Spec.VoterCount)
 	}
 	applyTargetCredentials(ctr, secretName)
-	asObject(sts["spec"])["replicas"] = float64(r.Spec.VoterCount)
+	asObject(sts["spec"])["replicas"] = float64(0)
 	return c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts)
+}
+
+func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource, sts, ctr object, adopted bool) (bool, string, error) {
+	uid := str(nested(sts, "metadata", "uid"))
+	if number(nested(sts, "spec", "ordinals", "start")) != 0 {
+		return false, "", fmt.Errorf("fresh bootstrap requires spec.ordinals.start=0")
+	}
+	pods, err := c.ownedPods(ctx, uid)
+	if err != nil {
+		return false, "", err
+	}
+	if len(pods) != 0 {
+		return false, "", fmt.Errorf("fresh bootstrap refuses to start while writer Pods already exist")
+	}
+	key := bootstrapCandidateKey(r)
+	exists, err := c.Bucket.Exists(ctx, key)
+	if err != nil {
+		return false, "", fmt.Errorf("object store unavailable while checking bootstrap reservation: %w", err)
+	}
+	expected := expectedBootstrapCandidate(r, sts)
+	if !exists {
+		if err := c.rejectRegisteredCluster(ctx, r.Spec.AdoptClusterID); err != nil {
+			return false, "", err
+		}
+		if int(number(nested(sts, "spec", "replicas"))) != 0 {
+			return false, "", fmt.Errorf("fresh bootstrap requires replicas=0 before writer activation; observed %d", number(nested(sts, "spec", "replicas")))
+		}
+		if err := c.immutable(ctx, key, jsonBytes(expected)); err != nil {
+			return false, "", fmt.Errorf("fresh bootstrap reservation is unavailable or inconsistent")
+		}
+	} else {
+		var stored bootstrapCandidate
+		reader, err := c.Bucket.Get(ctx, key)
+		if err != nil {
+			return false, "", fmt.Errorf("fresh bootstrap reservation is unreadable")
+		}
+		data, readErr := io.ReadAll(io.LimitReader(reader, 64<<10))
+		closeErr := reader.Close()
+		if readErr != nil || closeErr != nil || len(data) == 64<<10 || json.Unmarshal(data, &stored) != nil {
+			return false, "", fmt.Errorf("fresh bootstrap reservation is invalid")
+		}
+		if stored != expected {
+			return false, "", fmt.Errorf("fresh bootstrap reservation differs from the current workload contract")
+		}
+	}
+	if !bootstrapTemplateInstalled(ctr, r) {
+		if err := c.installBootstrapCredentials(ctx, r, sts, ctr); err != nil {
+			return false, "", err
+		}
+		return true, "bootstrap credentials installed; waiting for writer-free scale up", nil
+	}
+	if int(number(nested(sts, "spec", "replicas"))) == 0 {
+		asObject(sts["spec"])["replicas"] = float64(r.Spec.VoterCount)
+		if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
+			return false, "", err
+		}
+		return true, "bootstrap membership installed; starting voters", nil
+	}
+	if adopted {
+		return false, "", nil
+	}
+	return true, "bootstrap installed credentials but the workload is not exporting its bootstrap membership", nil
 }
 
 func bootstrapSecretName(r *ClusterResource) string {
@@ -603,6 +734,26 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if err != nil {
 		return block(nil, err.Error())
 	}
+	if state == nil {
+		candidateExists, err := c.Bucket.Exists(ctx, bootstrapCandidateKey(r))
+		if err != nil {
+			return block(nil, "object store unavailable while checking bootstrap reservation: "+err.Error())
+		}
+		if candidateExists || (!adopted && r.Spec.Bootstrap) {
+			if err := validateClusterRuntime(r, ctr, env); err != nil {
+				return block(nil, err.Error())
+			}
+			handled, message, err := c.reconcileBootstrap(ctx, r, sts, ctr, adopted)
+			if err != nil {
+				return block(nil, err.Error())
+			}
+			if handled {
+				return c.autoStatus(ctx, r, nil, "Observing", message)
+			}
+		} else if !adopted {
+			return block(nil, "RHIZA_CLUSTER_MEMBERS is empty; set spec.bootstrap: true for a fresh workload or export RHIZA_CLUSTER_MEMBERS")
+		}
+	}
 	allowed, err := allowedGenerationVoterIDs(r, sts, state)
 	if err != nil {
 		return block(nil, err.Error())
@@ -656,21 +807,6 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		}
 		if err := c.storeConfigMatches(env); err != nil {
 			return block(nil, err.Error())
-		}
-		if !adopted {
-			if !r.Spec.Bootstrap {
-				return block(nil, "RHIZA_CLUSTER_MEMBERS is empty; set spec.bootstrap: true for a fresh workload or export RHIZA_CLUSTER_MEMBERS")
-			}
-			if err := validateClusterRuntime(r, ctr, env); err != nil {
-				return block(nil, err.Error())
-			}
-			if err := c.rejectRegisteredCluster(ctx, r.Spec.AdoptClusterID); err != nil {
-				return block(nil, err.Error())
-			}
-			if err := c.bootstrapCluster(ctx, r, sts, ctr); err != nil {
-				return block(nil, err.Error())
-			}
-			return c.autoStatus(ctx, r, nil, "Observing", "fresh voter credentials created; waiting for workload")
 		}
 		voters, err := derivedVoters(r, sts)
 		if err != nil {
