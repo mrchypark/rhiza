@@ -19,11 +19,20 @@ workload가 그 Secret을 읽도록 전환한다. `httpPort`와 `peerPort`는 �
 8080과 9090이다. 세대가 살아 있는 동안 voter 수는 제자리에서 바꿀 수 없고, 새
 세대를 만들거나 재구성으로 voter를 하나씩 교체한다. Operator는 learner의 정확한
 종료 증거를 확인하고 Pod UID가 사라졌으며 credential이 삭제되거나 대체되었다는
-사실까지 검증한 뒤에만 이력을 버린다. 증거가 일부라도 빠지면 해당 항목은 계속
-journal에 남아 fencing 대상이 된다. 전체 세대 fencing은 남아 있는 learner 이력을
-포함해 최대 64개 대상까지만 담을 수 있다. voter와 남아 있는 learner 이력을 합친
-대상이 64개를 넘으면 자동 복구는 fencing을 예약하기 전에 두 수를 함께 알려 주는
-오류로 막는다.
+사실까지 검증한 뒤에만 이력을 버린다. 증거가 일부라도 빠진 항목은 다음 reconcile
+때 다시 검증하며, 현재 활성 세대가 아니더라도 ledger 증거가 갖춰지면 정리한다.
+learner 이력은 64개 상한을 두고 관리하며, 상한 아래로 줄일 수 없으면 control record
+read limit을 넘기기 전에 정확한 복구 방법을 알려 주는 오류로 막는다. 전체 세대
+fencing은 남아 있는 learner 이력을 포함해 최대 64개 대상까지만 담을 수 있다.
+voter와 남아 있는 learner 이력을 합친 대상이 64개를 넘으면 자동 복구는 fencing을
+예약하기 전에 두 수를 함께 알려 주는 오류로 막는다.
+
+기존 `RhizaCluster`에는 `spec.voterCount`가 없고 기존 automatic control record에는
+`voterPods` 기준 binding hash가 남아 있다. 운영자는 기존 오브젝트에 StatefulSet
+replica 수와 일치하는 `spec.voterCount`를 추가한다. Controller는 legacy binding
+hash와 관측 가능한 replica·membership count가 모두 맞을 때 control record를 현재
+binding version과 hash로 한 번만 다시 쓰고, 그중 하나라도 어긋나면 어느 검사가
+실패했는지 알려 주며 막는다.
 
 완전 자동은 모든 외부 장애 중에도 무조건 복구한다는 뜻이 아니다. Kubernetes,
 공유 저장소, fencing authority, 새 Pod 실행 용량이 사용 가능하고 증거가 유효할

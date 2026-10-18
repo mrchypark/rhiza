@@ -69,6 +69,21 @@ spec:
                   minimum: 1
                   maximum: 65535
                   default: 9090
+                clusterDomain:
+                  description: >-
+                    Kubernetes cluster DNS domain used in generated voter URLs.
+                    Defaults to cluster.local.
+                  type: string
+                  pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+                  default: cluster.local
+                bootstrap:
+                  description: >-
+                    Generate the initial membership for a workload that exports
+                    no RHIZA_CLUSTER_MEMBERS. Defaults to false. The controller
+                    refuses bootstrap when the adopted cluster ID already has a
+                    membership commitment in object storage.
+                  type: boolean
+                  default: false
                 automatic:
                   type: boolean
                   description: Explicit consent to fence an unreachable generation even when an observer-only partition might hide a healthy majority. False suspends new incidents, not an already reserved recovery.

@@ -28,14 +28,7 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 	}
 	block := func(message string) (bool, error) { return true, c.autoStatus(ctx, r, state, "Blocked", message) }
 	remember := func(entry learnerIncarnation) (bool, error) {
-		err := rememberLearner(state, entry)
-		if errors.Is(err, errPrunedLearnerReappeared) {
-			if saveErr := c.saveAuto(ctx, r, state, version); saveErr != nil {
-				return true, saveErr
-			}
-			return block(err.Error())
-		}
-		if err != nil {
+		if err := rememberLearner(state, entry); err != nil {
 			return block(err.Error())
 		}
 		return false, nil
@@ -53,11 +46,6 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		}
 		entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: intent.Request.OperationID, Target: request.Targets[0]}
 		for _, old := range state.Learners {
-			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
-				entry.CredentialUID = old.CredentialUID
-			}
-		}
-		for _, old := range state.PrunedLearners {
 			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
 				entry.CredentialUID = old.CredentialUID
 			}

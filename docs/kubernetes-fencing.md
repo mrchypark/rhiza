@@ -181,13 +181,18 @@ proofs retain their existing bound-incarnation contract; they do not implicitly
 authorize never-bound cleanup. Operator RBAC already includes ConfigMap `get`.
 History is discarded as soon as the operator verifies the exact terminal proof,
 the Pod UID is gone, and the incarnation's credential is deleted or superseded.
-An incarnation missing any part of that proof stays in the journal and remains
-fenced; a Pod deletion alone is never proof. Pruning does not mutate an already
-issued fence request. The journal instead records a compact tombstone, so an
-incarnation reappearing with the same credential UID or Pod UID is re-journaled
-and blocks recovery. Preexisting journals that discarded a retired learner's
-identity cannot reconstruct that authority from Pod absence; they remain blocked
-and require independently verified recovery.
+The controller retries every retained incarnation on later reconciles, including
+entries from generations that are no longer active, so a temporary proof failure
+does not permanently consume the journal. An incarnation missing any part of that
+proof stays in the journal and remains fenced; a Pod deletion alone is never
+proof. Pruning does not mutate an already issued fence request. Pruned identities
+are not retained as tombstones: a learner that reappears without a matching
+journal entry is rejected by the existing unlisted-learner cleanup guard and
+blocks recovery. Preexisting journals that discarded a retired learner's identity
+cannot reconstruct that authority from Pod absence; they remain blocked and
+require independently verified recovery. Learner history is capped at 64 entries,
+and a record that cannot be compacted below the cap blocks with a precise remedy instead of
+exceeding the control-record read limit.
 
 Package tests cover identity, receipt ordering, CAS races, immutable evidence,
 restart uncertainty, and voter-to-generation escalation. Linux Kubernetes

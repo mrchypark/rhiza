@@ -882,6 +882,11 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 			json.NewEncoder(w).Encode(podList{Items: a.pods()})
 			return
 		}
+	case "/api/v1/namespaces/default/services/rhiza-headless":
+		if q.Method == "GET" {
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None"}})
+			return
+		}
 	}
 	if q.Method == "GET" && strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/pods/") {
 		name := strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/pods/")

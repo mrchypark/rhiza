@@ -386,7 +386,7 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 	}{
 		{name: "voters at capacity", voters: 64},
 		{name: "voters plus history at capacity", voters: 63, learners: 1},
-		{name: "voter count over capacity", voters: 65, blocked: true, want: "voterCount is 65, want 3 through 64 voters"},
+		{name: "voter count over capacity", voters: 65, blocked: true, want: "spec.voterCount=65 exceeds the maximum 64"},
 		{name: "voters plus history over capacity", voters: 64, learners: 1, blocked: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

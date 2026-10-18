@@ -132,9 +132,16 @@ namespace, and fresh voter credentials when needed. Optional `httpPort` and
 `peerPort` default to 8080 and 9090. When the watched StatefulSet already exports
 `RHIZA_CLUSTER_MEMBERS`, the controller adopts it without regeneration and
 requires its count and node IDs to match the derived inventory. When the workload
-exports no membership, the controller generates the bootstrap identities once,
-stores them in one immutable operation-owned Secret, points the workload at that
-Secret, and sets `spec.replicas` to the count. The controller rejects a count that
+exports no membership, fresh bootstrap is disabled unless `spec.bootstrap: true`
+is set explicitly. A bootstrap also refuses to run when the adopted cluster ID
+already has a `voters/membership.json` commitment in object storage. When allowed,
+the controller generates the bootstrap identities once, stores them in one
+immutable operation-owned Secret, points the workload at that Secret, and sets
+`spec.replicas` to the count. `spec.clusterDomain` controls the DNS suffix used in
+generated URLs and defaults to `cluster.local`. Before patching, the controller
+also verifies that the workload exports `RHIZA_NODE_ID` through the downward API,
+that `RHIZA_BIND_ADDR` uses `httpPort`, and that `RHIZA_PEER_ADDR` uses `peerPort`.
+The Service named by `spec.serviceName` must exist and be headless. The controller rejects a count that
 disagrees with replicas or with an exported member list, naming both numbers.
 Even counts are supported, because QuePaxa requires only a strict majority of the
 configured membership for quorum and completion. The count cannot be changed in
@@ -148,6 +155,19 @@ A recovery is declared `Complete` only when the target StatefulSet declares
 exactly that many desired replicas and every configured voter's identity was
 authenticated first; a scaled-down target stays `Blocked` or `WaitingReady`
 instead of becoming the next generation.
+
+## Upgrading an existing automatic binding
+
+Existing `RhizaCluster` objects need `spec.voterCount` added and set to the
+StatefulSet's desired replicas and the exported `RHIZA_CLUSTER_MEMBERS` count. The
+control record then migrates on the next reconcile, once the legacy binding hash
+and those observable counts all match. If any check fails, the controller blocks
+and names the failing condition instead of accepting a different workload.
+
+The release note for this change must disclose both the CRD field change
+(`voterPods` is replaced by the required numeric `voterCount`) and the automatic
+control-record migration that rewrites a legacy binding hash to the current
+binding version.
 
 Local qualification used an isolated kind cluster and MinIO: in the three-voter
 deployment, two lost Pods reported a missing quorum without automatic

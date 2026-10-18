@@ -49,6 +49,12 @@ func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {
 	if _, ok := spec["voterPods"]; ok {
 		t.Fatal("voterPods must be removed from the RhizaCluster schema")
 	}
+	if bootstrap, _ := spec["bootstrap"].(map[string]any); bootstrap["default"] != false {
+		t.Fatalf("bootstrap default=%v, want false", bootstrap["default"])
+	}
+	if domain, _ := spec["clusterDomain"].(map[string]any); domain["default"] != "cluster.local" {
+		t.Fatalf("clusterDomain default=%v, want cluster.local", domain["default"])
+	}
 }
 
 // The PDB must leave quorum intact for every supported voter count.

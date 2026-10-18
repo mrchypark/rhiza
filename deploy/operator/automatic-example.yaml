@@ -18,6 +18,9 @@ spec:
   # Optional and shown with their defaults:
   httpPort: 8080
   peerPort: 9090
+  clusterDomain: cluster.local
+  # Set true only for a fresh workload that exports no RHIZA_CLUSTER_MEMBERS.
+  bootstrap: false
   automatic: false
   policy:
     failureGraceSeconds: 120

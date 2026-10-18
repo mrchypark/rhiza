@@ -3,6 +3,7 @@ package operator
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -317,61 +318,44 @@ func TestLearnerCleanupLedgerReadIsInOperatorRBAC(t *testing.T) {
 	}
 }
 
-func TestPruneTerminatedLearnersRequiresExactProof(t *testing.T) {
-	wal := strings.Repeat("a", 64)
-	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "recover", Scope: ScopeGeneration}
-	target := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: wal}
-	request.Targets = []FenceTarget{target}
-	hash, err := requestHash(&request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	proof := &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+func TestCompactionRequiresLedgerProof(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		podFound     bool
-		secretFound  bool
 		secretUID    string
 		neverBound   bool
-		neverBoundOK bool
-		uncovered    bool
+		ledgerOK     bool
 		activeVoter  bool
 		inFlight     bool
 		replaced     bool
 		wantRetained bool
 	}{
-		{name: "proven terminated"},
-		{name: "pod still present", podFound: true, wantRetained: true},
-		{name: "credential still reusable", secretFound: true, secretUID: "credential-uid", wantRetained: true},
-		{name: "incarnation not covered by completed request", uncovered: true, wantRetained: true},
-		{name: "active generation voter", activeVoter: true, wantRetained: true},
-		{name: "in-flight intent", inFlight: true, wantRetained: true},
+		{name: "proven terminated", ledgerOK: true},
+		{name: "pod still present", ledgerOK: true, podFound: true, wantRetained: true},
+		{name: "credential still reusable", ledgerOK: true, secretUID: "credential-uid", wantRetained: true},
+		{name: "active generation voter", ledgerOK: true, activeVoter: true, wantRetained: true},
+		{name: "in-flight intent", ledgerOK: true, inFlight: true, wantRetained: true},
 		{name: "never-bound proof missing", neverBound: true, wantRetained: true},
-		{name: "never-bound proof verified", neverBound: true, neverBoundOK: true},
-		{name: "replacement supersedes same secret", secretFound: true, secretUID: "credential-uid", replaced: true},
+		{name: "never-bound proof verified", neverBound: true, ledgerOK: true},
+		{name: "replacement supersedes same secret", ledgerOK: true, secretUID: "credential-uid", replaced: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			entry := learnerIncarnation{SourceClusterID: "source", OperationID: "original-online-op", CredentialUID: "credential-uid", Target: target}
-			request := request
-			proof := *proof
+			entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}
 			if tc.neverBound {
 				entry.Target.WALIdentity = ""
-				request.Targets = []FenceTarget{entry.Target}
 			}
-			if tc.uncovered {
-				request.Targets = nil
+			f := newCompactionFixture(t)
+			if tc.podFound {
+				f.podUIDs[entry.Target.Pod] = entry.Target.PodUID
 			}
-			hash, err := requestHash(&request)
-			if err != nil {
-				t.Fatal(err)
+			if tc.secretUID != "" {
+				f.secretUIDs[entry.Target.Pod] = tc.secretUID
 			}
-			proof.RequestHash = hash
-			if tc.neverBound && tc.neverBoundOK {
-				ledger := neverBoundLedger(t, request)
-				proof.ProofID = "cooperative-" + hashJSON(ledger)
+			if tc.ledgerOK {
+				f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
 			}
 			state := validAutoControl()
-			state.ActiveClusterID = "source"
+			state.StatefulSetUID, state.ActiveClusterID = "sts-uid", "source"
 			if tc.replaced {
 				state.ActiveClusterID = "target"
 			}
@@ -379,162 +363,208 @@ func TestPruneTerminatedLearnersRequiresExactProof(t *testing.T) {
 			if tc.activeVoter {
 				state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(entry.Target.NodeID), Pod: entry.Target.Pod})
 			}
-			completed := &autoIntent{Request: request, Proof: &proof}
 			if tc.inFlight {
-				state.Intent = completed
+				state.Intent = &autoIntent{}
 			}
-			c := pruneTestController(t, tc.podFound, tc.secretFound, tc.secretUID, entry.Target, request, tc.neverBound, tc.neverBoundOK)
-			if err := c.pruneTerminatedLearners(t.Context(), state, completed); err != nil {
+			changed, err := f.c.compactLearnerHistory(t.Context(), state)
+			if err != nil {
 				t.Fatal(err)
 			}
 			if tc.wantRetained {
-				if len(state.Learners) != 1 || len(state.PrunedLearners) != 0 {
-					t.Fatalf("incomplete proof pruned history: %+v", state)
+				if changed || len(state.Learners) != 1 {
+					t.Fatalf("incomplete proof pruned history: changed=%t state=%+v", changed, state)
 				}
-				retained := FenceRequest{SourceClusterID: entry.SourceClusterID, Scope: ScopeGeneration}
-				if err := includeLearnerHistory(state, &retained); err != nil || len(retained.Targets) != 1 || retained.Targets[0] != entry.Target {
-					t.Fatalf("retained incarnation was not fenced: %+v err=%v", retained, err)
+				request := FenceRequest{SourceClusterID: entry.SourceClusterID, Scope: ScopeGeneration}
+				if err := includeLearnerHistory(state, &request); err != nil || len(request.Targets) != 1 {
+					t.Fatalf("retained incarnation was not fenced: %+v err=%v", request, err)
 				}
 				return
 			}
-			if len(state.Learners) != 0 || len(state.PrunedLearners) != 1 {
-				t.Fatalf("proven incarnation was not pruned: %+v", state)
+			if !changed || len(state.Learners) != 0 {
+				t.Fatalf("proven incarnation was not compacted: changed=%t state=%+v", changed, state)
 			}
-			next := FenceRequest{SourceClusterID: request.SourceClusterID, Scope: ScopeGeneration}
-			if err := includeLearnerHistory(state, &next); err != nil || len(next.Targets) != 0 {
-				t.Fatalf("next fence retained pruned history: %+v err=%v", next, err)
-			}
-		})
-	}
-}
-
-func TestPrunedLearnerReappearanceIsRejournaledAndBlocked(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		entry learnerIncarnation
-	}{
-		{name: "same credential uid", entry: learnerIncarnation{SourceClusterID: "source", OperationID: "new", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "new-uid"}}},
-		{name: "same pod uid", entry: learnerIncarnation{SourceClusterID: "source", OperationID: "new", CredentialUID: "new-credential", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid"}}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			state := validAutoControl()
-			state.PrunedLearners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "old", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid"}}}
-			if err := rememberLearner(state, tc.entry); err != errPrunedLearnerReappeared {
-				t.Fatalf("reappearance error=%v", err)
-			}
-			if len(state.Learners) != 1 || state.Learners[0] != tc.entry {
-				t.Fatalf("reappearing incarnation was not re-journaled: %+v", state)
+			request := FenceRequest{SourceClusterID: entry.SourceClusterID, Scope: ScopeGeneration}
+			if err := includeLearnerHistory(state, &request); err != nil || len(request.Targets) != 0 {
+				t.Fatalf("next fence retained compacted history: %+v err=%v", request, err)
 			}
 		})
 	}
 }
 
-func TestLearnerPruningIsIdempotentAndCASOrdered(t *testing.T) {
+func TestCompactionRetriesUntilProofIsAvailable(t *testing.T) {
 	ctx := t.Context()
 	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}
-	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "recover", Scope: ScopeGeneration, Targets: []FenceTarget{entry.Target}}
-	hash, err := requestHash(&request)
-	if err != nil {
-		t.Fatal(err)
+	f := newCompactionFixture(t)
+	state := validAutoControl()
+	state.StatefulSetUID, state.ActiveClusterID, state.Learners = "sts-uid", "source", []learnerIncarnation{entry}
+	changed, err := f.c.compactLearnerHistory(ctx, state)
+	if err != nil || changed || len(state.Learners) != 1 {
+		t.Fatalf("missing proof compacted history: changed=%t err=%v state=%+v", changed, err, state)
 	}
-	proof := &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
-	completed := &autoIntent{Request: request, Proof: proof}
-	c := pruneTestController(t, false, false, "", entry.Target, request, false, false)
+	f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
+	changed, err = f.c.compactLearnerHistory(ctx, state)
+	if err != nil || !changed || len(state.Learners) != 0 {
+		t.Fatalf("late proof did not compact history: changed=%t err=%v state=%+v", changed, err, state)
+	}
+}
+
+func TestCompactionIsIdempotentAndCASOrdered(t *testing.T) {
+	ctx := t.Context()
+	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}
+	f := newCompactionFixture(t)
+	f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
 	root := autoClusterResource("root", "binding", "logical")
 	state := validAutoControl()
-	state.BindingUID, state.StatefulSetUID = "binding", "sts-uid"
-	state.Learners = []learnerIncarnation{entry}
-	if err := c.saveAuto(ctx, root, state, nil); err != nil {
+	state.StatefulSetUID, state.Learners = "sts-uid", []learnerIncarnation{entry}
+	if err := f.c.saveAuto(ctx, root, state, nil); err != nil {
 		t.Fatal(err)
 	}
-	loaded, version, err := c.loadAuto(ctx, c.autoKey(root))
+	loaded, version, err := f.c.loadAuto(ctx, f.c.autoKey(root))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.pruneTerminatedLearners(ctx, loaded, completed); err != nil {
-		t.Fatal(err)
+	if changed, err := f.c.compactLearnerHistory(ctx, loaded); err != nil || !changed {
+		t.Fatalf("first compaction: changed=%t err=%v", changed, err)
 	}
-	if err := c.pruneTerminatedLearners(ctx, loaded, completed); err != nil {
-		t.Fatal(err)
+	if changed, err := f.c.compactLearnerHistory(ctx, loaded); err != nil || changed {
+		t.Fatalf("second compaction was not idempotent: changed=%t err=%v", changed, err)
 	}
-	if len(loaded.Learners) != 0 || len(loaded.PrunedLearners) != 1 {
-		t.Fatalf("pruning was not idempotent: %+v", loaded)
-	}
-	if err := c.saveAuto(ctx, root, loaded, version); err != nil {
+	if err := f.c.saveAuto(ctx, root, loaded, version); err != nil {
 		t.Fatal(err)
 	}
 	stale := *loaded
 	stale.Learners = []learnerIncarnation{entry}
-	stale.PrunedLearners = nil
-	if err := c.saveAuto(ctx, root, &stale, version); !c.Bucket.IsConditionNotMetErr(err) {
-		t.Fatalf("stale snapshot overwrote prune: %v", err)
+	if err := f.c.saveAuto(ctx, root, &stale, version); !f.c.Bucket.IsConditionNotMetErr(err) {
+		t.Fatalf("stale snapshot overwrote compaction: %v", err)
 	}
-	final, _, err := c.loadAuto(ctx, c.autoKey(root))
-	if err != nil || len(final.Learners) != 0 || len(final.PrunedLearners) != 1 {
+	final, _, err := f.c.loadAuto(ctx, f.c.autoKey(root))
+	if err != nil || len(final.Learners) != 0 {
 		t.Fatalf("stale snapshot resurrected learner history: %+v err=%v", final, err)
 	}
 }
 
-func pruneTestController(t *testing.T, podFound, secretFound bool, secretUID string, target FenceTarget, request FenceRequest, neverBound, neverBoundOK bool) *Controller {
-	t.Helper()
-	c := autoController(autoBucket(t))
-	pod := supervisedTestPod()
-	pod["metadata"] = object{"name": target.Pod, "uid": target.PodUID}
-	secret := object{"immutable": true, "metadata": object{"uid": secretUID}}
-	var ledger *fenceLedger
-	if neverBound {
-		if neverBoundOK {
-			ledger = neverBoundLedger(t, request)
-		} else {
-			ledger = &fenceLedger{StatefulSetUID: request.StatefulSetUID, Ledger: fencing.Ledger{SourceClusterID: request.SourceClusterID, Runs: map[string]fencing.Run{}}}
+func TestLearnerHistoryStaysBoundedAcrossManyReplacements(t *testing.T) {
+	ctx := t.Context()
+	f := newCompactionFixture(t)
+	root := autoClusterResource("root", "binding", "logical")
+	state := validAutoControl()
+	state.StatefulSetUID, state.Learners = "sts-uid", nil
+	if err := f.c.saveAuto(ctx, root, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 200 {
+		loaded, version, err := f.c.loadAuto(ctx, f.c.autoKey(root))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry := learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("op-%d", i), CredentialUID: fmt.Sprintf("credential-%d", i), Target: FenceTarget{NodeID: fmt.Sprintf("learner-%d", i), Pod: fmt.Sprintf("learner-%d", i), PodUID: fmt.Sprintf("learner-uid-%d", i), WALIdentity: strings.Repeat("a", 64)}}
+		if err := rememberLearner(loaded, entry); err != nil {
+			t.Fatal(err)
+		}
+		f.ledger = terminatedLedger(t, []learnerIncarnation{entry})
+		changed, err := f.c.compactLearnerHistory(ctx, loaded)
+		if err != nil || !changed || len(loaded.Learners) != 0 {
+			t.Fatalf("cycle %d did not compact: changed=%t err=%v learners=%d", i, changed, err, len(loaded.Learners))
+		}
+		if err := f.c.saveAuto(ctx, root, loaded, version); err != nil {
+			t.Fatal(err)
 		}
 	}
+	final, _, err := f.c.loadAuto(ctx, f.c.autoKey(root))
+	if err != nil || len(final.Learners) != 0 {
+		t.Fatalf("bounded record is not readable and empty: %+v err=%v", final, err)
+	}
+}
+
+func TestCompactionBlocksOversizedUnreducibleHistory(t *testing.T) {
+	f := newCompactionFixture(t)
+	state := validAutoControl()
+	state.StatefulSetUID = "sts-uid"
+	for i := range maxLearnerHistory + 1 {
+		state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: fmt.Sprintf("op-%d", i), CredentialUID: fmt.Sprintf("credential-%d", i), Target: FenceTarget{NodeID: fmt.Sprintf("learner-%d", i), Pod: fmt.Sprintf("learner-%d", i), PodUID: fmt.Sprintf("learner-uid-%d", i), WALIdentity: strings.Repeat("a", 64)}})
+	}
+	if _, err := f.c.compactLearnerHistory(t.Context(), state); err == nil || !strings.Contains(err.Error(), "cannot be compacted") {
+		t.Fatalf("unreducible history error=%v", err)
+	}
+}
+
+type compactionFixture struct {
+	c          *Controller
+	ledger     *fenceLedger
+	podUIDs    map[string]string
+	secretUIDs map[string]string
+}
+
+func newCompactionFixture(t *testing.T) *compactionFixture {
+	t.Helper()
+	f := &compactionFixture{c: autoController(autoBucket(t)), podUIDs: map[string]string{}, secretUIDs: map[string]string{}}
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.c.Kube = &Kubernetes{Namespace: "default", TokenFile: token}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-		switch q.URL.Path {
-		case c.corePath("pods", target.Pod):
-			if !podFound {
+		switch {
+		case strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/pods/"):
+			name := strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/pods/")
+			if uid := f.podUIDs[name]; uid != "" {
+				_ = json.NewEncoder(w).Encode(object{"metadata": object{"name": name, "uid": uid}})
+				return
+			}
+			http.NotFound(w, q)
+		case strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/secrets/"):
+			name := strings.TrimSuffix(strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/secrets/"), "-credentials")
+			if uid := f.secretUIDs[name]; uid != "" {
+				_ = json.NewEncoder(w).Encode(object{"immutable": true, "metadata": object{"uid": uid}})
+				return
+			}
+			http.NotFound(w, q)
+		case q.URL.Path == (&FencingExecutor{Kube: f.c.Kube}).ledgerPath("sts-uid", "source"):
+			if f.ledger == nil {
 				http.NotFound(w, q)
 				return
 			}
-			_ = json.NewEncoder(w).Encode(pod)
-		case c.corePath("secrets", target.Pod+"-credentials"):
-			if !secretFound {
-				http.NotFound(w, q)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(secret)
-		case (&FencingExecutor{Kube: c.Kube}).ledgerPath(request.StatefulSetUID, request.SourceClusterID):
-			_ = json.NewEncoder(w).Encode(object{"data": object{"ledger.json": string(jsonBytes(ledger))}})
+			_ = json.NewEncoder(w).Encode(object{"data": object{"ledger.json": string(jsonBytes(f.ledger))}})
 		default:
 			http.NotFound(w, q)
 		}
 	}))
 	t.Cleanup(server.Close)
-	token := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(token, []byte("token"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
-	return c
+	f.c.Kube.BaseURL, f.c.Kube.Client = server.URL, server.Client()
+	return f
 }
 
-func neverBoundLedger(t *testing.T, request FenceRequest) *fenceLedger {
+func terminatedLedger(t *testing.T, entries []learnerIncarnation) *fenceLedger {
 	t.Helper()
-	hash, err := requestHash(&request)
-	if err != nil {
+	ledger := &fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
+	for i, entry := range entries {
+		id := fencing.Identity{SourceClusterID: entry.SourceClusterID, NodeID: entry.Target.NodeID, PodUID: entry.Target.PodUID, RunID: fmt.Sprintf("run-%d", i)}
+		if err := ledger.Ledger.Register(id); err != nil {
+			t.Fatal(err)
+		}
+		if entry.Target.WALIdentity != "" {
+			id.WALIdentity = entry.Target.WALIdentity
+			if err := ledger.Ledger.Bind(id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := ledger.Ledger.CloseNodes("op", "hash", nil); err != nil {
 		t.Fatal(err)
 	}
-	ledger := &fenceLedger{StatefulSetUID: request.StatefulSetUID, Ledger: fencing.Ledger{SourceClusterID: request.SourceClusterID}}
-	id := fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: request.Targets[0].NodeID, PodUID: request.Targets[0].PodUID, RunID: "run"}
-	if err := ledger.Ledger.Register(id); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.Ledger.CloseNodes(request.OperationID, hash, nil); err != nil {
-		t.Fatal(err)
-	}
-	stop := *ledger.Ledger.Runs["run"].Stop
-	if err := ledger.Ledger.RecordNeverBoundExit(stop); err != nil {
-		t.Fatal(err)
+	for _, run := range ledger.Ledger.Runs {
+		if run.Identity.WALIdentity == "" {
+			if err := ledger.Ledger.RecordNeverBoundExit(*run.Stop); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := ledger.Ledger.RecordDrain(fencing.DrainReceipt{Request: *run.Stop, WritersJoined: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.Ledger.RecordExit(*run.Stop); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return ledger
 }

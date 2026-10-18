@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -52,6 +54,7 @@ func validAutoControl() *autoControl {
 		Version:         1,
 		BindingUID:      "binding-uid-1",
 		BindingHash:     "hash-1",
+		BindingVersion:  autoBindingVersion,
 		StatefulSetUID:  "sts-uid-1",
 		ActiveClusterID: "source",
 		Voters:          []VoterPod{{NodeID: "n1", Pod: "rhiza-0"}, {NodeID: "n2", Pod: "rhiza-1"}, {NodeID: "n3", Pod: "rhiza-2"}},
@@ -805,6 +808,10 @@ func TestReconcileClusterRequiresMatchingVoterCount(t *testing.T) {
 			json.NewEncoder(w).Encode(sts)
 			return
 		}
+		if q.Method == http.MethodGet && q.URL.Path == "/api/v1/namespaces/default/services/rhiza-headless" {
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None"}})
+			return
+		}
 		json.NewEncoder(w).Encode(map[string]any{})
 	})
 	server := httptest.NewTLSServer(handler)
@@ -847,7 +854,7 @@ func TestReconcileClusterRequiresMatchingVoterCount(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if want := "voterCount is 2, want 3 through 64 voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+	if want := "spec.voterCount=2 is below the minimum 3; set it to the StatefulSet desired replicas and exported RHIZA_CLUSTER_MEMBERS count (3)"; r.Status.Phase != "Blocked" || r.Status.Message != want {
 		t.Fatalf("status=%+v want=%q", r.Status, want)
 	}
 }
@@ -892,7 +899,7 @@ func TestReconcileClusterRejectsUnfenceableVoterCount(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if want := "voterCount is 65, want 3 through 64 voters"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+	if want := "spec.voterCount=65 exceeds the maximum 64"; r.Status.Phase != "Blocked" || r.Status.Message != want {
 		t.Fatalf("status=%+v want=%q", r.Status, want)
 	}
 	if _, _, err := c.loadAuto(ctx, c.autoKey(r)); !c.Bucket.IsObjNotFoundErr(err) {
@@ -926,6 +933,10 @@ func boundClusterFixture(t *testing.T, voters []quepaxa.Member) (*Controller, *C
 		w.Header().Set("Content-Type", "application/json")
 		if q.Method == http.MethodGet && strings.Contains(q.URL.Path, "/statefulsets/") {
 			json.NewEncoder(w).Encode(sts)
+			return
+		}
+		if q.Method == http.MethodGet && q.URL.Path == "/api/v1/namespaces/default/services/rhiza-headless" {
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None"}})
 			return
 		}
 		if q.Method == http.MethodPut && strings.HasSuffix(q.URL.Path, "/status") {
@@ -971,8 +982,230 @@ func clusterVoterMembers(count int) []quepaxa.Member {
 	return voters
 }
 
+type failingBucket struct{ objstore.Bucket }
+
+func (f failingBucket) Exists(context.Context, string) (bool, error) {
+	return false, errors.New("object store offline")
+}
+
+func TestClusterBootstrapRequiresOptInAndUnregisteredStore(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		bootstrap  bool
+		members    string
+		commitment []byte
+		bucket     bool
+		want       string
+	}{
+		{name: "empty without opt-in", want: "set spec.bootstrap: true for a fresh workload or export RHIZA_CLUSTER_MEMBERS"},
+		{name: "whitespace without opt-in", members: " \n\t", want: "set spec.bootstrap: true for a fresh workload or export RHIZA_CLUSTER_MEMBERS"},
+		{name: "whitespace with opt-in", bootstrap: true, members: " \n\t"},
+		{name: "registered commitment", bootstrap: true, commitment: []byte("registered"), want: "already registered in object storage"},
+		{name: "unreadable commitment", bootstrap: true, commitment: []byte("{"), want: "registered cluster membership is unreadable"},
+		{name: "unreachable store", bootstrap: true, bucket: true, want: "object store unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			api := &clusterAPI{sts: freshClusterSTS(3)}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount, r.Spec.Bootstrap = 3, tc.bootstrap
+			normalizeClusterSpec(r)
+			ctr, _ := container(api.sts, "rhiza")
+			if tc.members != "" {
+				ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": tc.members})
+			}
+			if tc.commitment != nil {
+				if bytes.Equal(tc.commitment, []byte("registered")) {
+					members := voterMembers(3)
+					tc.commitment = jsonBytes(recovery.NewMembershipRecord(r.Spec.AdoptClusterID, members, "before-ack"))
+				}
+				if err := c.Bucket.Upload(ctx, path.Join(c.Prefix, r.Spec.AdoptClusterID, "voters/membership.json"), bytes.NewReader(tc.commitment)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.bucket {
+				c.Bucket = failingBucket{Bucket: c.Bucket}
+			}
+			if err := c.reconcileCluster(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+			if tc.want != "" {
+				if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, tc.want) || api.secretCreates != 0 {
+					t.Fatalf("status=%+v creates=%d want=%q", r.Status, api.secretCreates, tc.want)
+				}
+				return
+			}
+			if r.Status.Phase != "Observing" || api.secretCreates != 1 {
+				t.Fatalf("fresh bootstrap failed: status=%+v creates=%d", r.Status, api.secretCreates)
+			}
+		})
+	}
+}
+
+func TestClusterFreshBootstrapValidatesRuntimeIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fix  func(object)
+		want string
+	}{
+		{name: "missing node id", fix: func(ctr object) { ctr["env"] = removeEnv(list(ctr["env"]), "RHIZA_NODE_ID") }, want: "RHIZA_NODE_ID must use fieldRef metadata.name; observed missing"},
+		{name: "constant node id", fix: func(ctr object) {
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_NODE_ID", object{"value": "rhiza-0"})
+		}, want: "observed rhiza-0"},
+		{name: "peer port mismatch", fix: func(ctr object) {
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_PEER_ADDR", object{"value": "0.0.0.0:9091"})
+		}, want: "RHIZA_PEER_ADDR port is 9091 but expected 9090"},
+		{name: "http bind mismatch", fix: func(ctr object) {
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_BIND_ADDR", object{"value": "0.0.0.0:8081"})
+		}, want: "RHIZA_BIND_ADDR port is 8081 but expected 8080"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &clusterAPI{sts: freshClusterSTS(3)}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount, r.Spec.Bootstrap = 3, true
+			normalizeClusterSpec(r)
+			ctr, _ := container(api.sts, "rhiza")
+			tc.fix(ctr)
+			if err := c.reconcileCluster(t.Context(), r); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, tc.want) || api.secretCreates != 0 {
+				t.Fatalf("status=%+v creates=%d want=%q", r.Status, api.secretCreates, tc.want)
+			}
+		})
+	}
+}
+
+func TestClusterServiceAndDomainValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		service object
+		omit    bool
+		domain  string
+		want    string
+	}{
+		{name: "missing service", omit: true, want: "does not name an existing Service"},
+		{name: "non-headless service", service: object{"spec": object{"clusterIP": "10.0.0.1"}}, want: "must be headless"},
+		{name: "invalid domain", domain: "Bad_Domain", want: "is not a DNS name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &clusterAPI{sts: freshClusterSTS(3), service: tc.service, omitService: tc.omit}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount, r.Spec.ClusterDomain = 3, tc.domain
+			normalizeClusterSpec(r)
+			if err := c.reconcileCluster(t.Context(), r); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, tc.want) {
+				t.Fatalf("status=%+v want=%q", r.Status, tc.want)
+			}
+		})
+	}
+
+	t.Run("custom cluster domain", func(t *testing.T) {
+		api := &clusterAPI{sts: freshClusterSTS(3)}
+		c := clusterController(t, api)
+		r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+		r.Spec.VoterCount, r.Spec.Bootstrap, r.Spec.ClusterDomain = 3, true, "corp.internal"
+		normalizeClusterSpec(r)
+		if err := c.reconcileCluster(t.Context(), r); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Phase != "Observing" || api.secretCreates != 1 {
+			t.Fatalf("status=%+v creates=%d", r.Status, api.secretCreates)
+		}
+		var secret object
+		for _, candidate := range api.secrets {
+			secret = candidate
+		}
+		members, _ := decodedClusterSecret(t, secret)
+		for _, member := range members {
+			if !strings.Contains(member.URL, ".svc.corp.internal:") || !strings.Contains(member.PeerURL, ".svc.corp.internal:") {
+				t.Fatalf("custom domain missing from member URLs: %+v", member)
+			}
+		}
+	})
+}
+
+func TestLegacyBindingMigration(t *testing.T) {
+	ctx := t.Context()
+	api := &clusterAPI{sts: fakeSTS("before-ack", voterMembers(3))}
+	c := clusterController(t, api)
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.VoterCount, r.Spec.Container = 3, "rhiza"
+	normalizeClusterSpec(r)
+	state := validAutoControl()
+	state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
+	state.BindingVersion = 0
+	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
+	state.BindingHash = legacyAutoBinding(r, state.Voters)
+	if err := c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase != "Observing" || !strings.Contains(r.Status.Message, "legacy automatic binding migrated") {
+		t.Fatalf("migration status=%+v", r.Status)
+	}
+	loaded, _, err := c.loadAuto(ctx, c.autoKey(r))
+	if err != nil || loaded.BindingVersion != autoBindingVersion || loaded.BindingHash != autoBinding(r) {
+		t.Fatalf("migrated record=%+v err=%v", loaded, err)
+	}
+	if err := c.reconcileCluster(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Status.Phase == "Blocked" {
+		t.Fatalf("migrated binding blocked on the next reconcile: %+v", r.Status)
+	}
+}
+
+func TestLegacyBindingMigrationFailsClosed(t *testing.T) {
+	ctx := t.Context()
+	for _, tc := range []struct {
+		name  string
+		count int
+		hash  string
+		want  string
+	}{
+		{name: "missing voter count", count: 0, want: "spec.voterCount is required"},
+		{name: "wrong replicas", count: 4, want: "StatefulSet has 3 desired replicas but voterCount is 4"},
+		{name: "hash changed", count: 3, hash: "wrong", want: "legacy automatic binding hash no longer matches"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &clusterAPI{sts: fakeSTS("before-ack", voterMembers(3))}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount, r.Spec.Container = tc.count, "rhiza"
+			normalizeClusterSpec(r)
+			state := validAutoControl()
+			state.BindingUID, state.StatefulSetUID = "uid-1", "sts-uid"
+			state.BindingVersion = 0
+			state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
+			state.BindingHash = legacyAutoBinding(r, state.Voters)
+			if tc.hash != "" {
+				state.BindingHash = tc.hash
+			}
+			if err := c.saveAuto(ctx, r, state, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.reconcileCluster(ctx, r); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, tc.want) {
+				t.Fatalf("status=%+v want=%q", r.Status, tc.want)
+			}
+		})
+	}
+}
+
 type clusterAPI struct {
 	sts           object
+	service       object
+	omitService   bool
 	secrets       map[string]object
 	secretCreates int
 }
@@ -989,6 +1222,12 @@ func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
 			apiserverNormalize(a.sts)
 			_ = json.NewEncoder(w).Encode(a.sts)
 		}
+	case q.URL.Path == "/api/v1/namespaces/default/services/rhiza-headless" && q.Method == http.MethodGet:
+		if a.omitService {
+			http.NotFound(w, q)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(a.service)
 	case q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters/cluster-1/status" && q.Method == http.MethodPut:
 		var next ClusterResource
 		if json.NewDecoder(q.Body).Decode(&next) == nil {
@@ -1030,6 +1269,9 @@ func clusterController(t *testing.T, api *clusterAPI) *Controller {
 	c := autoController(autoBucket(t))
 	c.StoreIdentity = storeIdentity()
 	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
+	if api.service == nil {
+		api.service = object{"spec": object{"clusterIP": "None"}}
+	}
 	return c
 }
 
@@ -1038,6 +1280,7 @@ func freshClusterSTS(count int) object {
 	ctr, _ := container(sts, "rhiza")
 	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": ""})
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_NODE_ID", "valueFrom": object{"fieldRef": object{"fieldPath": "metadata.name"}}}, object{"name": "RHIZA_PEER_ADDR", "value": "0.0.0.0:9090"}, object{"name": "RHIZA_BIND_ADDR", "value": "0.0.0.0:8080"})
 	return sts
 }
 
@@ -1058,7 +1301,7 @@ func TestClusterVoterCountAdoptsDerivedInventory(t *testing.T) {
 				t.Fatal(err)
 			}
 			state, _, err := c.loadAuto(ctx, c.autoKey(r))
-			if err != nil || state.BindingHash != autoBinding(r) || len(state.Voters) != count {
+			if err != nil || state.BindingHash != autoBinding(r) || state.BindingVersion != autoBindingVersion || len(state.Voters) != count {
 				t.Fatalf("count=%d state=%+v err=%v", count, state, err)
 			}
 			for i, voter := range state.Voters {
@@ -1079,7 +1322,7 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	api := &clusterAPI{sts: freshClusterSTS(count)}
 	c := clusterController(t, api)
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
-	r.Spec.VoterCount, r.Spec.Automatic = count, true
+	r.Spec.VoterCount, r.Spec.Automatic, r.Spec.Bootstrap = count, true, true
 	normalizeClusterSpec(r)
 
 	if err := c.reconcileCluster(ctx, r); err != nil {

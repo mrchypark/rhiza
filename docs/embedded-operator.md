@@ -11,8 +11,11 @@ Operator가 복구할 수 있다. 별도의 Rhiza 서버 프로세스나 데이�
 3 이상 64 이하의 정수로 선언한다. StatefulSet은 같은 수의 replica를 선언하고,
 Pod 이름은 `<statefulSet>-<ordinal>` 규칙을 따라야 한다. StatefulSet이
 `RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 재생성하지 않고 채택하며,
-내보내지 않으면 voter 수만큼 node ID, Pod 이름, headless service DNS URL, peer
-token, admin token, 공개키를 생성해 불변 Secret에 보관한다. 내보낸 목록의 수나
+내보내지 않으면 `spec.bootstrap: true`를 명시한 경우에만 voter 수만큼 node ID,
+Pod 이름, headless service DNS URL, peer token, admin token, 공개키를 생성해 불변
+Secret에 보관한다. 이때 object storage에 해당 cluster ID의 membership commitment가
+이미 있으면 Operator는 bootstrap을 거부한다. `spec.clusterDomain`은 생성 URL의 DNS
+suffix이며 기본값은 `cluster.local`이다. 내보낸 목록의 수나
 node ID가 선언한 값과 어긋나면 Operator는 복구를 시작하지 않고 두 값을 함께 알려
 주는 오류를 남긴다. 최소 voter 수는 3이며 홀수 제약이 없으므로 짝수도 지원한다.
 `httpPort`와 `peerPort`는 선택 항목이고 기본값은 각각 8080과 9090이다. 세대가
