@@ -17,10 +17,13 @@ replica 수와 `RHIZA_CLUSTER_MEMBERS` 항목 수를 같은 값으로 유지한�
 node ID, Pod 이름, URL, token, 공개키를 한 번만 생성해 불변 Secret에 보관하고,
 workload가 그 Secret을 읽도록 전환한다. `httpPort`와 `peerPort`는 선택 항목이며 기본값은 각각
 8080과 9090이다. 세대가 살아 있는 동안 voter 수는 제자리에서 바꿀 수 없고, 새
-세대를 만들거나 재구성으로 voter를 하나씩 교체한다. 전체 세대 fencing은 보존된
-learner 이력을 포함해 최대 64개 대상까지만 담을 수 있다. voter와 보존된 learner
-이력을 합친 대상이 64개를 넘으면 자동 복구는 fencing을 예약하기 전에 두 수를
-함께 알려 주는 오류로 막는다.
+세대를 만들거나 재구성으로 voter를 하나씩 교체한다. Operator는 learner의 정확한
+종료 증거를 확인하고 Pod UID가 사라졌으며 credential이 삭제되거나 대체되었다는
+사실까지 검증한 뒤에만 이력을 버린다. 증거가 일부라도 빠지면 해당 항목은 계속
+journal에 남아 fencing 대상이 된다. 전체 세대 fencing은 남아 있는 learner 이력을
+포함해 최대 64개 대상까지만 담을 수 있다. voter와 남아 있는 learner 이력을 합친
+대상이 64개를 넘으면 자동 복구는 fencing을 예약하기 전에 두 수를 함께 알려 주는
+오류로 막는다.
 
 완전 자동은 모든 외부 장애 중에도 무조건 복구한다는 뜻이 아니다. Kubernetes,
 공유 저장소, fencing authority, 새 Pod 실행 용량이 사용 가능하고 증거가 유효할

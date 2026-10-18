@@ -27,6 +27,19 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		return true, c.autoStatus(ctx, r, state, "Recovering", message)
 	}
 	block := func(message string) (bool, error) { return true, c.autoStatus(ctx, r, state, "Blocked", message) }
+	remember := func(entry learnerIncarnation) (bool, error) {
+		err := rememberLearner(state, entry)
+		if errors.Is(err, errPrunedLearnerReappeared) {
+			if saveErr := c.saveAuto(ctx, r, state, version); saveErr != nil {
+				return true, saveErr
+			}
+			return block(err.Error())
+		}
+		if err != nil {
+			return block(err.Error())
+		}
+		return false, nil
+	}
 	if intent.Aborting {
 		if child.Spec.Membership == nil || !child.Spec.Membership.AbortAddition || child.Spec.Membership.ReplacementPod != intent.LearnerName || hashJSON(child.Spec) != intent.SpecHash || child.Status.Membership == nil || child.Status.Membership.Phase != "Aborted" {
 			return false, nil
@@ -44,11 +57,16 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 				entry.CredentialUID = old.CredentialUID
 			}
 		}
+		for _, old := range state.PrunedLearners {
+			if old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod {
+				entry.CredentialUID = old.CredentialUID
+			}
+		}
 		if str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1" && entry.CredentialUID == "" {
 			return block("supervised learner retirement lacks durable creation history")
 		}
-		if err := rememberLearner(state, entry); err != nil {
-			return block(err.Error())
+		if handled, err := remember(entry); handled || err != nil {
+			return handled, err
 		}
 		intent.Aborting = false
 		intent.LearnerAttempt++
@@ -77,8 +95,8 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		if err != nil {
 			return block(err.Error())
 		}
-		if err := rememberLearner(state, entry); err != nil {
-			return block(err.Error())
+		if handled, err := remember(entry); handled || err != nil {
+			return handled, err
 		}
 		return save("replacement Pod identity persisted before membership dispatch")
 	}
@@ -113,8 +131,8 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 					if err != nil {
 						return block(err.Error())
 					}
-					if err := rememberLearner(state, entry); err != nil {
-						return block(err.Error())
+					if handled, err := remember(entry); handled || err != nil {
+						return handled, err
 					}
 					return save("replacement WAL identity authenticated")
 				}

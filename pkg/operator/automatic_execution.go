@@ -173,7 +173,6 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 			return err
 		}
 		state.ActiveClusterID = child.Status.Target
-		state.Learners = nil // Verified full cleanup and installed target retire the old generation.
 		state.Voters = append([]VoterPod(nil), intent.Voters...)
 		state.Identities = map[quepaxa.NodeID]FenceTarget{}
 		for _, identity := range child.Status.TargetIdentities {
@@ -192,6 +191,9 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	state.Completed = &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
 	state.SuspectedSince = time.Time{}
 	state.Intent = nil
+	if err := c.pruneTerminatedLearners(ctx, state, intent); err != nil {
+		return block("learner history pruning failed: " + err.Error())
+	}
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		return err
 	}

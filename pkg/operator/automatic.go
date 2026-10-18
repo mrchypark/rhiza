@@ -64,6 +64,9 @@ type autoControl struct {
 	Intent    *autoIntent          `json:"intent,omitempty"`
 	Completed *autoCompletion      `json:"completed,omitempty"`
 	Learners  []learnerIncarnation `json:"learners,omitempty"`
+	// PrunedLearners are compact tombstones. They are never fenced, but a later
+	// incarnation reusing either identity must be re-journaled and blocked.
+	PrunedLearners []learnerIncarnation `json:"prunedLearners,omitempty"`
 }
 
 // Keep retired learners until their source generation is fully replaced.

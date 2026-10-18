@@ -235,8 +235,10 @@ opt-in이 필요하다. 각 voter 프로세스에 `RHIZA_ENABLE_RECONFIGURATION=
 `<statefulSet>-<ordinal>` 규칙으로 node ID와 Pod 이름을 유도하고, headless
 service와 namespace로 DNS URL을 만든다. StatefulSet이 이미
 `RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 채택하고, 내보내지 않으면
-불변 Secret에 bootstrap identity를 한 번만 생성한다. 전체 세대 fencing은 voter와
-보존된 learner 이력을 합쳐 64개 대상까지만 예약할 수 있다.
+불변 Secret에 bootstrap identity를 한 번만 생성한다. Operator는 learner의 종료
+증거, Pod UID 소멸, credential 삭제 또는 대체를 모두 확인한 뒤에만 이력을 버리고,
+확인되지 않은 항목은 계속 fencing한다. 전체 세대 fencing은 voter와 남아 있는
+learner 이력을 합쳐 64개 대상까지만 예약할 수 있다.
 executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
 command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
 

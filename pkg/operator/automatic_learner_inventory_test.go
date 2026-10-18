@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
 func TestLearnerCreatedBeforeControlCASIsRecoveredBeforeEscalation(t *testing.T) {
@@ -313,4 +315,226 @@ func TestLearnerCleanupLedgerReadIsInOperatorRBAC(t *testing.T) {
 	if !strings.Contains(string(data), "resources: [configmaps]\n    verbs: [get]") {
 		t.Fatal("operator lacks read-only fencing ledger permission")
 	}
+}
+
+func TestPruneTerminatedLearnersRequiresExactProof(t *testing.T) {
+	wal := strings.Repeat("a", 64)
+	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "recover", Scope: ScopeGeneration}
+	target := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: wal}
+	request.Targets = []FenceTarget{target}
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	for _, tc := range []struct {
+		name         string
+		podFound     bool
+		secretFound  bool
+		secretUID    string
+		neverBound   bool
+		neverBoundOK bool
+		uncovered    bool
+		activeVoter  bool
+		inFlight     bool
+		replaced     bool
+		wantRetained bool
+	}{
+		{name: "proven terminated"},
+		{name: "pod still present", podFound: true, wantRetained: true},
+		{name: "credential still reusable", secretFound: true, secretUID: "credential-uid", wantRetained: true},
+		{name: "incarnation not covered by completed request", uncovered: true, wantRetained: true},
+		{name: "active generation voter", activeVoter: true, wantRetained: true},
+		{name: "in-flight intent", inFlight: true, wantRetained: true},
+		{name: "never-bound proof missing", neverBound: true, wantRetained: true},
+		{name: "never-bound proof verified", neverBound: true, neverBoundOK: true},
+		{name: "replacement supersedes same secret", secretFound: true, secretUID: "credential-uid", replaced: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := learnerIncarnation{SourceClusterID: "source", OperationID: "original-online-op", CredentialUID: "credential-uid", Target: target}
+			request := request
+			proof := *proof
+			if tc.neverBound {
+				entry.Target.WALIdentity = ""
+				request.Targets = []FenceTarget{entry.Target}
+			}
+			if tc.uncovered {
+				request.Targets = nil
+			}
+			hash, err := requestHash(&request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof.RequestHash = hash
+			if tc.neverBound && tc.neverBoundOK {
+				ledger := neverBoundLedger(t, request)
+				proof.ProofID = "cooperative-" + hashJSON(ledger)
+			}
+			state := validAutoControl()
+			state.ActiveClusterID = "source"
+			if tc.replaced {
+				state.ActiveClusterID = "target"
+			}
+			state.Learners = []learnerIncarnation{entry}
+			if tc.activeVoter {
+				state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(entry.Target.NodeID), Pod: entry.Target.Pod})
+			}
+			completed := &autoIntent{Request: request, Proof: &proof}
+			if tc.inFlight {
+				state.Intent = completed
+			}
+			c := pruneTestController(t, tc.podFound, tc.secretFound, tc.secretUID, entry.Target, request, tc.neverBound, tc.neverBoundOK)
+			if err := c.pruneTerminatedLearners(t.Context(), state, completed); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantRetained {
+				if len(state.Learners) != 1 || len(state.PrunedLearners) != 0 {
+					t.Fatalf("incomplete proof pruned history: %+v", state)
+				}
+				retained := FenceRequest{SourceClusterID: entry.SourceClusterID, Scope: ScopeGeneration}
+				if err := includeLearnerHistory(state, &retained); err != nil || len(retained.Targets) != 1 || retained.Targets[0] != entry.Target {
+					t.Fatalf("retained incarnation was not fenced: %+v err=%v", retained, err)
+				}
+				return
+			}
+			if len(state.Learners) != 0 || len(state.PrunedLearners) != 1 {
+				t.Fatalf("proven incarnation was not pruned: %+v", state)
+			}
+			next := FenceRequest{SourceClusterID: request.SourceClusterID, Scope: ScopeGeneration}
+			if err := includeLearnerHistory(state, &next); err != nil || len(next.Targets) != 0 {
+				t.Fatalf("next fence retained pruned history: %+v err=%v", next, err)
+			}
+		})
+	}
+}
+
+func TestPrunedLearnerReappearanceIsRejournaledAndBlocked(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry learnerIncarnation
+	}{
+		{name: "same credential uid", entry: learnerIncarnation{SourceClusterID: "source", OperationID: "new", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "new-uid"}}},
+		{name: "same pod uid", entry: learnerIncarnation{SourceClusterID: "source", OperationID: "new", CredentialUID: "new-credential", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := validAutoControl()
+			state.PrunedLearners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "old", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid"}}}
+			if err := rememberLearner(state, tc.entry); err != errPrunedLearnerReappeared {
+				t.Fatalf("reappearance error=%v", err)
+			}
+			if len(state.Learners) != 1 || state.Learners[0] != tc.entry {
+				t.Fatalf("reappearing incarnation was not re-journaled: %+v", state)
+			}
+		})
+	}
+}
+
+func TestLearnerPruningIsIdempotentAndCASOrdered(t *testing.T) {
+	ctx := t.Context()
+	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "credential-uid", Target: FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: strings.Repeat("a", 64)}}
+	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "recover", Scope: ScopeGeneration, Targets: []FenceTarget{entry.Target}}
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	completed := &autoIntent{Request: request, Proof: proof}
+	c := pruneTestController(t, false, false, "", entry.Target, request, false, false)
+	root := autoClusterResource("root", "binding", "logical")
+	state := validAutoControl()
+	state.BindingUID, state.StatefulSetUID = "binding", "sts-uid"
+	state.Learners = []learnerIncarnation{entry}
+	if err := c.saveAuto(ctx, root, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded, version, err := c.loadAuto(ctx, c.autoKey(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.pruneTerminatedLearners(ctx, loaded, completed); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.pruneTerminatedLearners(ctx, loaded, completed); err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Learners) != 0 || len(loaded.PrunedLearners) != 1 {
+		t.Fatalf("pruning was not idempotent: %+v", loaded)
+	}
+	if err := c.saveAuto(ctx, root, loaded, version); err != nil {
+		t.Fatal(err)
+	}
+	stale := *loaded
+	stale.Learners = []learnerIncarnation{entry}
+	stale.PrunedLearners = nil
+	if err := c.saveAuto(ctx, root, &stale, version); !c.Bucket.IsConditionNotMetErr(err) {
+		t.Fatalf("stale snapshot overwrote prune: %v", err)
+	}
+	final, _, err := c.loadAuto(ctx, c.autoKey(root))
+	if err != nil || len(final.Learners) != 0 || len(final.PrunedLearners) != 1 {
+		t.Fatalf("stale snapshot resurrected learner history: %+v err=%v", final, err)
+	}
+}
+
+func pruneTestController(t *testing.T, podFound, secretFound bool, secretUID string, target FenceTarget, request FenceRequest, neverBound, neverBoundOK bool) *Controller {
+	t.Helper()
+	c := autoController(autoBucket(t))
+	pod := supervisedTestPod()
+	pod["metadata"] = object{"name": target.Pod, "uid": target.PodUID}
+	secret := object{"immutable": true, "metadata": object{"uid": secretUID}}
+	var ledger *fenceLedger
+	if neverBound {
+		if neverBoundOK {
+			ledger = neverBoundLedger(t, request)
+		} else {
+			ledger = &fenceLedger{StatefulSetUID: request.StatefulSetUID, Ledger: fencing.Ledger{SourceClusterID: request.SourceClusterID, Runs: map[string]fencing.Run{}}}
+		}
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		switch q.URL.Path {
+		case c.corePath("pods", target.Pod):
+			if !podFound {
+				http.NotFound(w, q)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(pod)
+		case c.corePath("secrets", target.Pod+"-credentials"):
+			if !secretFound {
+				http.NotFound(w, q)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(secret)
+		case (&FencingExecutor{Kube: c.Kube}).ledgerPath(request.StatefulSetUID, request.SourceClusterID):
+			_ = json.NewEncoder(w).Encode(object{"data": object{"ledger.json": string(jsonBytes(ledger))}})
+		default:
+			http.NotFound(w, q)
+		}
+	}))
+	t.Cleanup(server.Close)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.Kube = &Kubernetes{BaseURL: server.URL, Namespace: "default", TokenFile: token, Client: server.Client()}
+	return c
+}
+
+func neverBoundLedger(t *testing.T, request FenceRequest) *fenceLedger {
+	t.Helper()
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &fenceLedger{StatefulSetUID: request.StatefulSetUID, Ledger: fencing.Ledger{SourceClusterID: request.SourceClusterID}}
+	id := fencing.Identity{SourceClusterID: request.SourceClusterID, NodeID: request.Targets[0].NodeID, PodUID: request.Targets[0].PodUID, RunID: "run"}
+	if err := ledger.Ledger.Register(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Ledger.CloseNodes(request.OperationID, hash, nil); err != nil {
+		t.Fatal(err)
+	}
+	stop := *ledger.Ledger.Runs["run"].Stop
+	if err := ledger.Ledger.RecordNeverBoundExit(stop); err != nil {
+		t.Fatal(err)
+	}
+	return ledger
 }

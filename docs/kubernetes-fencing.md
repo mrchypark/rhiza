@@ -167,10 +167,10 @@ not evidence silently supplied by this cooperative default.
 ### Learner cleanup evidence
 
 The automatic control journal retains each learner's source generation, creation
-operation, immutable credential UID, Pod UID and authenticated WAL identity,
-including retired learners and learners promoted during earlier incidents.
-Generation requests freeze this inventory before fencing. A Pod created before
-the journal CAS completes is strictly rediscovered and journaled in a separate
+operation, immutable credential UID, Pod UID and authenticated WAL identity until
+the operator can prove that the incarnation can no longer return. Generation
+requests freeze that retained inventory before fencing. A Pod created before the
+journal CAS completes is strictly rediscovered and journaled in a separate
 reconcile before escalation; conflicting ownership blocks recovery.
 
 Cleanup follows a validated full-generation proof, never a Pod deletion as proof.
@@ -179,10 +179,14 @@ hash matches the proof, whose generation closure is complete, and whose every
 run for that Pod is a verified never-bound exit permits this case. External HTTPS
 proofs retain their existing bound-incarnation contract; they do not implicitly
 authorize never-bound cleanup. Operator RBAC already includes ConfigMap `get`.
-History is discarded only after full cleanup and verified target installation,
-not after an online replacement within the same generation. Preexisting journals
-that discarded a retired learner's identity cannot reconstruct that authority
-from Pod absence or mutate an already issued fence request; they remain blocked
+History is discarded as soon as the operator verifies the exact terminal proof,
+the Pod UID is gone, and the incarnation's credential is deleted or superseded.
+An incarnation missing any part of that proof stays in the journal and remains
+fenced; a Pod deletion alone is never proof. Pruning does not mutate an already
+issued fence request. The journal instead records a compact tombstone, so an
+incarnation reappearing with the same credential UID or Pod UID is re-journaled
+and blocks recovery. Preexisting journals that discarded a retired learner's
+identity cannot reconstruct that authority from Pod absence; they remain blocked
 and require independently verified recovery.
 
 Package tests cover identity, receipt ordering, CAS races, immutable evidence,

@@ -2,15 +2,19 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thanos-io/objstore"
 )
 
+var errPrunedLearnerReappeared = errors.New("terminated learner identity reappeared")
+
 func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 	if err := validateLearnerHistory(state.Learners); err != nil {
 		return err
 	}
+	current := false
 	for i, old := range state.Learners {
 		if old.SourceClusterID != entry.SourceClusterID || old.Target.Pod != entry.Target.Pod {
 			continue
@@ -19,10 +23,28 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 			return fmt.Errorf("learner incarnation history conflicts")
 		}
 		state.Learners[i] = entry
+		current = true
+		break
+	}
+	for _, old := range state.PrunedLearners {
+		if learnerIdentityMatches(old, entry) {
+			if !current {
+				state.Learners = append(state.Learners, entry)
+			}
+			return errPrunedLearnerReappeared
+		}
+	}
+	if current {
 		return nil
 	}
 	state.Learners = append(state.Learners, entry)
 	return nil
+}
+
+func learnerIdentityMatches(old, entry learnerIncarnation) bool {
+	return (old.CredentialUID != "" && old.CredentialUID == entry.CredentialUID) ||
+		(old.Target.PodUID != "" && old.Target.PodUID == entry.Target.PodUID) ||
+		(old.SourceClusterID == entry.SourceClusterID && old.Target.Pod == entry.Target.Pod)
 }
 
 func validateLearnerHistory(entries []learnerIncarnation) error {
@@ -61,6 +83,105 @@ func includeLearnerHistory(state *autoControl, request *FenceRequest) error {
 		}
 	}
 	return nil
+}
+
+// pruneTerminatedLearners mutates the completed control record only. The caller
+// persists it with the same CAS version as the completion, so a stale snapshot
+// cannot resurrect a pruned incarnation. Only an already-completed request is
+// used as proof; an in-flight intent leaves every entry untouched.
+func (c *Controller) pruneTerminatedLearners(ctx context.Context, state *autoControl, completed *autoIntent) error {
+	if state.Intent != nil || completed == nil || completed.Proof == nil {
+		return nil
+	}
+	if err := validateFenceProof(completed.Request, completed.Proof); err != nil {
+		return nil
+	}
+	if err := validateLearnerHistory(state.Learners); err != nil {
+		return err
+	}
+	if err := validateLearnerHistory(state.PrunedLearners); err != nil {
+		return err
+	}
+	protected := make(map[string]bool)
+	for _, voters := range [][]VoterPod{state.Voters, completed.Voters} {
+		for _, voter := range voters {
+			protected[string(voter.NodeID)] = true
+			protected[voter.Pod] = true
+		}
+	}
+	var retained, pruned []learnerIncarnation
+	for _, entry := range state.Learners {
+		if protected[string(entry.Target.NodeID)] || protected[entry.Target.Pod] || !learnerCoveredByRequest(entry.Target, completed.Request.Targets) {
+			retained = append(retained, entry)
+			continue
+		}
+		if !c.learnerPodUIDGone(ctx, entry.Target.Pod, entry.Target.PodUID) || !c.learnerCredentialUnreusable(ctx, state.ActiveClusterID, completed.Proof, entry) {
+			retained = append(retained, entry)
+			continue
+		}
+		if entry.Target.WALIdentity == "" {
+			if err := c.verifyNeverBoundCleanup(ctx, completed.Request, completed.Proof, entry.Target); err != nil {
+				retained = append(retained, entry)
+				continue
+			}
+		}
+		pruned = append(pruned, entry)
+	}
+	state.Learners = retained
+	for _, entry := range pruned {
+		rememberPrunedLearner(state, entry)
+	}
+	return nil
+}
+
+func rememberPrunedLearner(state *autoControl, entry learnerIncarnation) {
+	for _, old := range state.PrunedLearners {
+		if old == entry {
+			return
+		}
+	}
+	state.PrunedLearners = append(state.PrunedLearners, entry)
+}
+
+func learnerCoveredByRequest(target FenceTarget, targets []FenceTarget) bool {
+	for _, covered := range targets {
+		if covered == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) learnerPodUIDGone(ctx context.Context, name, uid string) bool {
+	if name == "" || uid == "" {
+		return false
+	}
+	var pod object
+	err := c.Kube.Get(ctx, c.corePath("pods", name), &pod)
+	if apiNotFound(err) {
+		return true
+	}
+	return err == nil && str(nested(pod, "metadata", "uid")) != uid
+}
+
+func (c *Controller) learnerCredentialUnreusable(ctx context.Context, activeCluster string, proof *FenceProof, entry learnerIncarnation) bool {
+	if entry.CredentialUID == "" {
+		return false
+	}
+	var secret object
+	err := c.Kube.Get(ctx, c.corePath("secrets", entry.Target.Pod+"-credentials"), &secret)
+	if apiNotFound(err) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	if str(nested(secret, "metadata", "uid")) != entry.CredentialUID {
+		return true
+	}
+	// A completed generation replacement supersedes credentials from the prior
+	// cluster while its recreation barrier remains in force.
+	return activeCluster != entry.SourceClusterID && proof.ProcessesTerminated && proof.RecreationBlocked
 }
 
 func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoControl, sts object, pod object) (learnerIncarnation, error) {
@@ -126,6 +247,12 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 		return true, c.autoStatus(ctx, r, state, "Blocked", err.Error())
 	}
 	if err := rememberLearner(state, entry); err != nil {
+		if errors.Is(err, errPrunedLearnerReappeared) {
+			if saveErr := c.saveAuto(ctx, r, state, version); saveErr != nil {
+				return true, saveErr
+			}
+			return true, c.autoStatus(ctx, r, state, "Blocked", err.Error())
+		}
 		return true, err
 	}
 	i.LearnerUID = entry.Target.PodUID

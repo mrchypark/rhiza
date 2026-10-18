@@ -615,7 +615,7 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 	if len(candidates) == 0 {
 		return nil
 	}
-	state, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+	state, version, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
 	if err != nil {
 		return err
 	}
@@ -666,6 +666,18 @@ func (c *Controller) deleteFencedLearners(ctx context.Context, r *Resource, sts 
 		}
 		if fencedTarget.WALIdentity == "" && !seen {
 			return fmt.Errorf("never-bound learner lacks durable creation history")
+		}
+		entry := learnerIncarnation{SourceClusterID: r.Spec.SourceClusterID, OperationID: str(nested(pod, "metadata", "annotations", ownerAnnotation)), CredentialUID: str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)), Target: fencedTarget}
+		for _, old := range state.PrunedLearners {
+			if learnerIdentityMatches(old, entry) {
+				if err := rememberLearner(state, entry); err != nil && err != errPrunedLearnerReappeared {
+					return err
+				}
+				if err := c.saveAuto(ctx, &ClusterResource{Spec: ClusterSpec{LogicalID: logical}}, state, version); err != nil {
+					return err
+				}
+				return fmt.Errorf("terminated learner identity reappeared")
+			}
 		}
 		if err := validateSupervisedPod(pod); err != nil {
 			return err
