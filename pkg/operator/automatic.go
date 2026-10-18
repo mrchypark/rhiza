@@ -185,6 +185,8 @@ func (c *Controller) migrateLegacyBinding(ctx context.Context, r *ClusterResourc
 	if err := legacyVoterIdentityDrift(state.Voters, members); err != nil {
 		return false, err
 	}
+	// The old hash is covered by the immutable workload binding below. Do not
+	// derive it from Voters, which a completed single-voter repair can rewrite.
 	oldHash := state.BindingHash
 	newHash := autoBinding(r)
 	proof := object{
@@ -406,6 +408,9 @@ func (c *Controller) validateClusterService(ctx context.Context, r *ClusterResou
 	if clusterIP := str(nested(record, "spec", "clusterIP")); clusterIP != "None" {
 		return fmt.Errorf("Service %q must be headless: clusterIP=%q, want None", service, clusterIP)
 	}
+	if nested(record, "spec", "publishNotReadyAddresses") != true {
+		return fmt.Errorf("Service %q must set publishNotReadyAddresses: true for voter DNS", service)
+	}
 	selector := asObject(nested(record, "spec", "selector"))
 	labels := asObject(nested(sts, "spec", "template", "metadata", "labels"))
 	if len(selector) == 0 {
@@ -439,20 +444,25 @@ func validateClusterRuntime(r *ClusterResource, ctr object, env map[string]strin
 		return fmt.Errorf("RHIZA_NODE_ID must use fieldRef metadata.name; observed %s", observed)
 	}
 	for _, check := range []struct {
-		key         string
-		defaultAddr string
-		expected    int
+		key      string
+		expected int
 	}{
-		{"RHIZA_BIND_ADDR", "127.0.0.1:8080", r.Spec.HTTPPort},
-		{"RHIZA_PEER_ADDR", "127.0.0.1:9090", r.Spec.PeerPort},
+		{"RHIZA_BIND_ADDR", r.Spec.HTTPPort},
+		{"RHIZA_PEER_ADDR", r.Spec.PeerPort},
 	} {
 		addr := env[check.key]
 		if addr == "" {
-			addr = check.defaultAddr
+			return fmt.Errorf("%s must be set to a reachable host:port", check.key)
 		}
-		_, portText, err := net.SplitHostPort(addr)
+		host, portText, err := net.SplitHostPort(addr)
 		if err != nil {
 			return fmt.Errorf("%s must be host:port; observed %q", check.key, env[check.key])
+		}
+		if host == "localhost" {
+			return fmt.Errorf("%s must not bind a loopback host; observed %q", check.key, host)
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return fmt.Errorf("%s must not bind a loopback host; observed %q", check.key, host)
 		}
 		port, err := strconv.Atoi(portText)
 		if err != nil {
@@ -577,8 +587,8 @@ func (c *Controller) rejectRegisteredCluster(ctx context.Context, clusterID stri
 	return fmt.Errorf("cluster %s is already registered in object storage; refusing bootstrap", clusterID)
 }
 
-func bootstrapCandidateKey(r *ClusterResource) string {
-	return path.Join("automatic-bootstrap", str(r.Metadata["uid"]), r.Spec.LogicalID+".json")
+func (c *Controller) bootstrapCandidateKey(r *ClusterResource) string {
+	return path.Join(c.Prefix, "automatic-bootstrap", c.Kube.Namespace, r.Spec.StatefulSet+".json")
 }
 
 func expectedBootstrapCandidate(r *ClusterResource, sts object) bootstrapCandidate {
@@ -622,7 +632,13 @@ func (c *Controller) installBootstrapCredentials(ctx context.Context, r *Cluster
 func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource, sts, ctr object, adopted bool) (bool, string, error) {
 	uid := str(nested(sts, "metadata", "uid"))
 	if number(nested(sts, "spec", "ordinals", "start")) != 0 {
-		return false, "", fmt.Errorf("fresh bootstrap requires spec.ordinals.start=0")
+		return false, "", fmt.Errorf("fresh bootstrap requires StatefulSet spec.ordinals.start=0")
+	}
+	if r.Spec.VoterCount < 3 {
+		return false, "", fmt.Errorf("spec.voterCount is required and must be at least 3")
+	}
+	if r.Spec.VoterCount > fenceTargetCapacity {
+		return false, "", fmt.Errorf("spec.voterCount=%d exceeds the maximum %d", r.Spec.VoterCount, fenceTargetCapacity)
 	}
 	pods, err := c.ownedPods(ctx, uid)
 	if err != nil {
@@ -635,7 +651,7 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 	if !templateInstalled && int(number(nested(sts, "spec", "replicas"))) != 0 {
 		return false, "", fmt.Errorf("fresh bootstrap requires replicas=0 until credentials and template are installed; observed %d", number(nested(sts, "spec", "replicas")))
 	}
-	key := bootstrapCandidateKey(r)
+	key := c.bootstrapCandidateKey(r)
 	exists, err := c.Bucket.Exists(ctx, key)
 	if err != nil {
 		return false, "", fmt.Errorf("object store unavailable while checking bootstrap reservation: %w", err)
@@ -731,7 +747,7 @@ func bootstrapSecretName(r *ClusterResource) string {
 		Spec:     Spec{RecoveryID: r.Spec.LogicalID},
 		Status:   Status{Target: r.Spec.AdoptClusterID},
 	}
-	return "rhiza-cluster-" + shortID(str(operation.Metadata["uid"])+":"+r.Spec.LogicalID)
+	return "rhiza-cluster-" + shortID(str(operation.Metadata["uid"])+":"+r.Spec.LogicalID+":"+r.Spec.AdoptClusterID)
 }
 
 func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) error {
@@ -752,6 +768,9 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	uid := str(nested(sts, "metadata", "uid"))
 	if uid == "" {
 		return block(nil, "workload UID is unavailable")
+	}
+	if number(nested(sts, "spec", "ordinals", "start")) != 0 {
+		return block(nil, "StatefulSet spec.ordinals.start=0 is required; nonzero starting ordinals are not supported")
 	}
 	ctr, err := container(sts, r.Spec.Container)
 	if err != nil {
@@ -779,7 +798,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		return block(nil, err.Error())
 	}
 	if state == nil {
-		candidateExists, err := c.Bucket.Exists(ctx, bootstrapCandidateKey(r))
+		candidateExists, err := c.Bucket.Exists(ctx, c.bootstrapCandidateKey(r))
 		if err != nil {
 			return block(nil, "object store unavailable while checking bootstrap reservation: "+err.Error())
 		}

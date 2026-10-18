@@ -333,7 +333,7 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 	}{
 		{name: "proven terminated", ledgerOK: true},
 		{name: "pod still present", ledgerOK: true, podFound: true, wantRetained: true},
-		{name: "credential still reusable", ledgerOK: true, secretUID: "credential-uid", wantRetained: true},
+		{name: "credential retired", ledgerOK: true, secretUID: "credential-uid"},
 		{name: "active generation voter", ledgerOK: true, activeVoter: true, wantRetained: true},
 		{name: "unrelated in-flight intent", ledgerOK: true, inFlight: true},
 		{name: "intent-owned incarnation", ledgerOK: true, inFlight: true, intentTarget: true, wantRetained: true},
@@ -387,6 +387,9 @@ func TestCompactionRequiresLedgerProof(t *testing.T) {
 			}
 			if !changed || len(state.Learners) != 0 {
 				t.Fatalf("proven incarnation was not compacted: changed=%t state=%+v", changed, state)
+			}
+			if tc.secretUID != "" && f.secretUIDs[entry.Target.Pod] != "" {
+				t.Fatal("proven learner credential was not deleted before compaction")
 			}
 			request := FenceRequest{SourceClusterID: entry.SourceClusterID, Scope: ScopeGeneration}
 			if err := includeLearnerHistory(state, &request); err != nil || len(request.Targets) != 0 {
@@ -670,6 +673,42 @@ func TestNonSupervisedLearnerInventoryCapturesCredentialUID(t *testing.T) {
 	}
 }
 
+func TestCompactionRetiresLearnerCredential(t *testing.T) {
+	f := newCompactionFixture(t)
+	target := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}
+	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "retire", Scope: ScopeVoter, Targets: []FenceTarget{target}}
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "credential-uid", Target: target, Retirement: &learnerRetirement{Request: request, Proof: FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: "binding", RequestHash: hash, ProofID: "proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}}
+	f.secretUIDs[target.Pod] = entry.CredentialUID
+	state := validAutoControl()
+	state.StatefulSetUID, state.Learners = "sts-uid", []learnerIncarnation{entry}
+	changed, err := f.c.compactLearnerHistory(t.Context(), state)
+	if err != nil || !changed || len(state.Learners) != 0 || f.secretUIDs[target.Pod] != "" {
+		t.Fatalf("credential retirement failed: changed=%t err=%v learners=%+v secretUID=%q", changed, err, state.Learners, f.secretUIDs[target.Pod])
+	}
+}
+
+func TestCompactionKeepsReplacementCredentialWithDifferentUID(t *testing.T) {
+	f := newCompactionFixture(t)
+	target := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "pod-uid", WALIdentity: strings.Repeat("a", 64)}
+	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "retire", Scope: ScopeVoter, Targets: []FenceTarget{target}}
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := learnerIncarnation{SourceClusterID: "source", OperationID: "op", CredentialUID: "old-credential", Target: target, Retirement: &learnerRetirement{Request: request, Proof: FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: "binding", RequestHash: hash, ProofID: "proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}}
+	f.secretUIDs[target.Pod] = "replacement-credential"
+	state := validAutoControl()
+	state.StatefulSetUID, state.Learners = "sts-uid", []learnerIncarnation{entry}
+	changed, err := f.c.compactLearnerHistory(t.Context(), state)
+	if err != nil || !changed || len(state.Learners) != 0 || f.secretUIDs[target.Pod] != "replacement-credential" {
+		t.Fatalf("replacement credential was removed: changed=%t err=%v learners=%+v secretUID=%q", changed, err, state.Learners, f.secretUIDs[target.Pod])
+	}
+}
+
 type compactionFixture struct {
 	c          *Controller
 	ledger     *fenceLedger
@@ -686,6 +725,9 @@ func newCompactionFixture(t *testing.T) *compactionFixture {
 		t.Fatal(err)
 	}
 	f.c.Kube = &Kubernetes{Namespace: "default", TokenFile: token}
+	if err := f.c.Kube.ConfigureDeletion("", "default"); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		switch {
 		case q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters/root/status" && q.Method == http.MethodPut:
@@ -704,6 +746,22 @@ func newCompactionFixture(t *testing.T) *compactionFixture {
 			http.NotFound(w, q)
 		case strings.HasPrefix(q.URL.Path, "/api/v1/namespaces/default/secrets/"):
 			name := strings.TrimSuffix(strings.TrimPrefix(q.URL.Path, "/api/v1/namespaces/default/secrets/"), "-credentials")
+			if q.Method == http.MethodDelete {
+				uid := f.secretUIDs[name]
+				if uid == "" {
+					http.NotFound(w, q)
+					return
+				}
+				var options object
+				_ = json.NewDecoder(q.Body).Decode(&options)
+				if str(nested(options, "preconditions", "uid")) != uid {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				delete(f.secretUIDs, name)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			if uid := f.secretUIDs[name]; uid != "" {
 				_ = json.NewEncoder(w).Encode(object{"immutable": true, "metadata": object{"uid": uid}})
 				return

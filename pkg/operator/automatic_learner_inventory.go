@@ -106,7 +106,7 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 			retained = append(retained, entry)
 			continue
 		}
-		if !c.learnerPodUIDGone(ctx, entry.Target.Pod, entry.Target.PodUID) || !c.learnerCredentialUnreusable(ctx, state.ActiveClusterID, entry) {
+		if !c.learnerPodUIDGone(ctx, entry.Target.Pod, entry.Target.PodUID) {
 			retained = append(retained, entry)
 			continue
 		}
@@ -115,6 +115,10 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 			proven = true
 		}
 		if !proven && c.verifyTerminatedCleanup(ctx, state.StatefulSetUID, entry) != nil {
+			retained = append(retained, entry)
+			continue
+		}
+		if !c.retireLearnerCredential(ctx, entry) {
 			retained = append(retained, entry)
 			continue
 		}
@@ -139,7 +143,7 @@ func (c *Controller) learnerPodUIDGone(ctx context.Context, name, uid string) bo
 	return err == nil && str(nested(pod, "metadata", "uid")) != uid
 }
 
-func (c *Controller) learnerCredentialUnreusable(ctx context.Context, activeCluster string, entry learnerIncarnation) bool {
+func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerIncarnation) bool {
 	if entry.CredentialUID == "" {
 		return false
 	}
@@ -154,8 +158,10 @@ func (c *Controller) learnerCredentialUnreusable(ctx context.Context, activeClus
 	if str(nested(secret, "metadata", "uid")) != entry.CredentialUID {
 		return true
 	}
-	// A completed generation replacement supersedes credentials from the prior cluster.
-	return activeCluster != entry.SourceClusterID
+	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, entry.Target.Pod+"-credentials", entry.CredentialUID); err != nil {
+		return apiNotFound(err)
+	}
+	return true
 }
 
 func (c *Controller) verifyTerminatedCleanup(ctx context.Context, stsUID string, entry learnerIncarnation) error {

@@ -149,6 +149,20 @@ func (k *Kubernetes) DeletePod(ctx context.Context, namespace, name, uid string)
 	return k.request(ctx, http.MethodDelete, apiPath, object{"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": object{"uid": uid}}, nil)
 }
 
+func (k *Kubernetes) DeleteSecret(ctx context.Context, namespace, name, uid string) error {
+	if uid == "" {
+		return fmt.Errorf("Kubernetes deletion requires an exact UID")
+	}
+	if !validNamespace(namespace) || len(name) == 0 || len(name) > 253 {
+		return fmt.Errorf("Secret deletion requires valid namespace and name")
+	}
+	if !k.deleteAllNamespaces && !k.deleteNamespaces[namespace] {
+		return fmt.Errorf("Secret deletion namespace is not allowed")
+	}
+	apiPath := "/api/v1/namespaces/" + namespace + "/secrets/" + name
+	return k.request(ctx, http.MethodDelete, apiPath, object{"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": object{"uid": uid}}, nil)
+}
+
 func (k *Kubernetes) request(ctx context.Context, method, apiPath string, value any, out any) error {
 	target, err := k.targetURL(apiPath)
 	if err != nil {

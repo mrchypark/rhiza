@@ -884,7 +884,7 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 		}
 	case "/api/v1/namespaces/default/services/rhiza-headless":
 		if q.Method == "GET" {
-			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None", "selector": object{"app.kubernetes.io/name": "rhiza"}}})
+			json.NewEncoder(w).Encode(object{"spec": object{"clusterIP": "None", "publishNotReadyAddresses": true, "selector": object{"app.kubernetes.io/name": "rhiza"}}})
 			return
 		}
 	}
