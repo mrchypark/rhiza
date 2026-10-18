@@ -1240,7 +1240,8 @@ func TestBootstrappedAdoptedMemberURLForms(t *testing.T) {
 				host := pod + ".rhiza-headless" + suffix
 				members = append(members, quepaxa.Member{ID: quepaxa.NodeID(pod), URL: "http://" + host + ":8080", PeerURL: "quic://" + host + ":9090"})
 			}
-			if err := c.validateBootstrappedMembers(t.Context(), r, api.sts, true, members); err != nil {
+			allowed, _ := allowedGenerationVoterIDs(r, api.sts, nil)
+			if err := c.validateBootstrappedMembers(t.Context(), r, api.sts, true, members, allowed); err != nil {
 				t.Fatalf("valid equivalent host rejected: %v", err)
 			}
 		})
@@ -1263,7 +1264,8 @@ func TestBootstrappedAdoptedMemberURLForms(t *testing.T) {
 				members = append(members, quepaxa.Member{ID: quepaxa.NodeID(pod), URL: "http://" + pod + ".rhiza-headless:8080", PeerURL: "quic://" + pod + ".rhiza-headless:9090"})
 			}
 			members[0].URL = tc.url
-			if err := c.validateBootstrappedMembers(t.Context(), r, api.sts, true, members); err == nil || !strings.Contains(err.Error(), tc.want) {
+			allowed, _ := allowedGenerationVoterIDs(r, api.sts, nil)
+			if err := c.validateBootstrappedMembers(t.Context(), r, api.sts, true, members, allowed); err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error=%v want=%q", err, tc.want)
 			}
 		})
@@ -1292,6 +1294,32 @@ func TestBootstrapPortChangeBlocksBeforeBinding(t *testing.T) {
 	}
 	if _, _, err := c.loadAuto(ctx, c.autoKey(r)); !c.Bucket.IsObjNotFoundErr(err) {
 		t.Fatalf("port change persisted a binding: %v", err)
+	}
+}
+
+func TestVoterIdentityContractAcceptsJournaledLearner(t *testing.T) {
+	api := &clusterAPI{sts: freshClusterSTS(3)}
+	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+	r.Spec.VoterCount = 3
+	normalizeClusterSpec(r)
+	learner := "auto-promoted-learner-1"
+	state := validAutoControl()
+	state.ActiveClusterID = "source"
+	state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
+	allowed, err := allowedGenerationVoterIDs(r, api.sts, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members := []quepaxa.Member{{ID: "rhiza-0"}, {ID: "rhiza-1"}, {ID: quepaxa.NodeID(learner)}}
+	if err := voterCountContract(r, api.sts, members, true, true, allowed); err != nil {
+		t.Fatalf("journaled promoted learner rejected: %v", err)
+	}
+	members[2].ID = "unknown-voter"
+	if err := voterCountContract(r, api.sts, members, true, true, allowed); err == nil || !strings.Contains(err.Error(), "neither a derived voter nor a journaled learner") {
+		t.Fatalf("unknown voter accepted: %v", err)
+	}
+	if err := voterCountContract(r, api.sts, members[:2], true, true, allowed); err == nil || !strings.Contains(err.Error(), "lists 2 voters") {
+		t.Fatalf("wrong count accepted: %v", err)
 	}
 }
 
@@ -1483,7 +1511,7 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if want := "RHIZA_CLUSTER_MEMBERS node IDs must be rhiza-0 through rhiza-4"; r.Status.Message != want {
+	if want := "RHIZA_CLUSTER_MEMBERS node ID \"wrong-0\" is neither a derived voter nor a journaled learner"; r.Status.Message != want {
 		t.Fatalf("bound workload accepted changed node IDs: %+v want=%q", r.Status, want)
 	}
 }
@@ -1553,7 +1581,7 @@ func TestClusterVoterCountRejectsAdoptionMismatch(t *testing.T) {
 	if err := c.reconcileCluster(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	if want := "RHIZA_CLUSTER_MEMBERS node IDs must be rhiza-0 through rhiza-2"; r.Status.Message != want {
+	if want := "RHIZA_CLUSTER_MEMBERS node ID \"wrong-0\" is neither a derived voter nor a journaled learner"; r.Status.Message != want {
 		t.Fatalf("status=%+v want=%q", r.Status, want)
 	}
 }

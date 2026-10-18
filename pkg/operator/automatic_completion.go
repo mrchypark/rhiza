@@ -118,6 +118,11 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	for _, member := range members {
 		allowed[string(member.ID)] = true
 	}
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID == state.ActiveClusterID {
+			allowed[string(entry.Target.NodeID)] = true
+		}
+	}
 	for _, peer := range child.Status.Peers {
 		if allowed[peer.NodeID] && peer.ClusterID == child.Status.Target && peer.Durability == child.Spec.Durability && peer.Ready && peer.Quorum && peer.CertifiedTip >= child.Status.RecoveredTip && peer.AppliedTip >= child.Status.RecoveredTip {
 			ready[peer.NodeID] = true

@@ -179,6 +179,55 @@ func TestAutomaticVoterMajorityCompletion(t *testing.T) {
 	}
 }
 
+// A learner promoted into the generation is a legitimate voter even though its
+// Pod name is not a derived StatefulSet ordinal.
+func TestAutomaticCompletionAcceptsPromotedLearnerVoter(t *testing.T) {
+	ctx := t.Context()
+	voters := voterMembers(3)
+	learner := "auto-promoted-learner-1"
+	s := completedAutomaticTarget(t, voters)
+	s.state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
+	s.state.Intent.Voters[2] = VoterPod{NodeID: quepaxa.NodeID(learner), Pod: learner}
+	s.child.Status.TargetIdentities[2] = FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}
+	if err := s.c.saveAuto(ctx, s.r, s.state, s.version); err != nil {
+		t.Fatal(err)
+	}
+	state, version, err := s.c.loadAuto(ctx, s.c.autoKey(s.r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.c.advanceAutomatic(ctx, s.r, state, version, s.api.sts); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := s.c.loadAuto(ctx, s.c.autoKey(s.r))
+	if err != nil || loaded.Intent != nil || s.r.Status.Phase != "Stabilizing" {
+		t.Fatalf("promoted learner was not accepted: state=%+v status=%+v err=%v", loaded, s.r.Status, err)
+	}
+}
+
+func TestAutomaticCompletionRejectsUnknownVoterIdentity(t *testing.T) {
+	ctx := t.Context()
+	voters := voterMembers(3)
+	learner := "auto-promoted-learner-1"
+	s := completedAutomaticTarget(t, voters)
+	s.state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
+	s.state.Intent.Voters[2] = VoterPod{NodeID: "unknown-voter", Pod: "unknown-voter"}
+	s.child.Status.TargetIdentities[2] = FenceTarget{NodeID: "unknown-voter", Pod: "unknown-voter", PodUID: "pod-unknown-voter", WALIdentity: strings.Repeat("a", 64)}
+	if err := s.c.saveAuto(ctx, s.r, s.state, s.version); err != nil {
+		t.Fatal(err)
+	}
+	state, version, err := s.c.loadAuto(ctx, s.c.autoKey(s.r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.c.advanceAutomatic(ctx, s.r, state, version, s.api.sts); err != nil {
+		t.Fatal(err)
+	}
+	if s.r.Status.Phase != "Blocked" || !strings.Contains(s.r.Status.Message, "installed target voter inventory differs") {
+		t.Fatalf("unknown voter was not rejected: %+v", s.r.Status)
+	}
+}
+
 // automaticCompletion holds one installed automatic target generation, its
 // durable intent, and the fixtures advanceAutomatic authenticates against.
 type automaticCompletion struct {

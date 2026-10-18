@@ -300,7 +300,7 @@ func (c *Controller) reconcileClusters(ctx context.Context) error {
 // voterCountContract runs before any binding is persisted and on every later
 // observation. Derived node IDs are checked for a new binding and for an
 // established binding whose frozen inventory already follows the derived shape.
-func voterCountContract(r *ClusterResource, sts object, members []quepaxa.Member, adopted, checkIDs bool) error {
+func voterCountContract(r *ClusterResource, sts object, members []quepaxa.Member, adopted, checkIDs bool, allowed map[string]bool) error {
 	count := r.Spec.VoterCount
 	replicas := int(number(nested(sts, "spec", "replicas")))
 	if count < 3 {
@@ -315,21 +315,13 @@ func voterCountContract(r *ClusterResource, sts object, members []quepaxa.Member
 	if replicas != count {
 		return fmt.Errorf("StatefulSet has %d desired replicas but voterCount is %d", replicas, count)
 	}
-	expected, err := derivedVoters(r, sts)
-	if err != nil {
-		return err
-	}
 	if adopted && len(members) != count {
 		return fmt.Errorf("RHIZA_CLUSTER_MEMBERS lists %d voters but voterCount is %d", len(members), count)
 	}
 	if adopted && checkIDs {
-		seen := make(map[quepaxa.NodeID]bool, len(members))
 		for _, member := range members {
-			seen[member.ID] = true
-		}
-		for _, voter := range expected {
-			if !seen[voter.NodeID] {
-				return fmt.Errorf("RHIZA_CLUSTER_MEMBERS node IDs must be %s-0 through %s-%d", r.Spec.StatefulSet, r.Spec.StatefulSet, count-1)
+			if !allowed[string(member.ID)] {
+				return fmt.Errorf("RHIZA_CLUSTER_MEMBERS node ID %q is neither a derived voter nor a journaled learner", member.ID)
 			}
 		}
 	}
@@ -437,6 +429,25 @@ func derivedVoters(r *ClusterResource, sts object) ([]VoterPod, error) {
 	return voters, nil
 }
 
+func allowedGenerationVoterIDs(r *ClusterResource, sts object, state *autoControl) (map[string]bool, error) {
+	voters, err := derivedVoters(r, sts)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(voters))
+	for _, voter := range voters {
+		allowed[string(voter.NodeID)] = true
+	}
+	if state != nil {
+		for _, entry := range state.Learners {
+			if entry.SourceClusterID == state.ActiveClusterID {
+				allowed[string(entry.Target.NodeID)] = true
+			}
+		}
+	}
+	return allowed, nil
+}
+
 func clusterMemberSources(r *ClusterResource, sts object, namespace string) ([]quepaxa.Member, error) {
 	voters, err := derivedVoters(r, sts)
 	if err != nil {
@@ -453,7 +464,7 @@ func clusterMemberSources(r *ClusterResource, sts object, namespace string) ([]q
 	return members, nil
 }
 
-func (c *Controller) validateBootstrappedMembers(ctx context.Context, r *ClusterResource, sts object, adopted bool, members []quepaxa.Member) error {
+func (c *Controller) validateBootstrappedMembers(ctx context.Context, r *ClusterResource, sts object, adopted bool, members []quepaxa.Member, allowed map[string]bool) error {
 	if !adopted {
 		return nil
 	}
@@ -469,14 +480,10 @@ func (c *Controller) validateBootstrappedMembers(ctx context.Context, r *Cluster
 	if service == "" {
 		return fmt.Errorf("StatefulSet %s spec.serviceName is required for voter DNS names", r.Spec.StatefulSet)
 	}
-	expected := make(map[string]bool, r.Spec.VoterCount)
-	for i := range r.Spec.VoterCount {
-		expected[fmt.Sprintf("%s-%d", r.Spec.StatefulSet, i)] = true
-	}
 	for _, member := range members {
 		pod := string(member.ID)
-		if !expected[pod] {
-			return fmt.Errorf("adopted member node ID %q is not a derived Pod name", pod)
+		if !allowed[pod] {
+			return fmt.Errorf("adopted member node ID %q is neither a derived voter nor a journaled learner", pod)
 		}
 		for _, endpoint := range []struct {
 			raw    string
@@ -596,25 +603,27 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if err != nil {
 		return block(nil, err.Error())
 	}
-	// A binding created by this schema already has the derived inventory. Keep
+	allowed, err := allowedGenerationVoterIDs(r, sts, state)
+	if err != nil {
+		return block(nil, err.Error())
+	}
+	// A binding created by this schema already has the allowed inventory. Keep
 	// enforcing its node IDs, while an older frozen inventory is not invalidated
 	// by ID shape changes alone.
 	checkIDs := state == nil
 	if !checkIDs {
-		if expected, err := derivedVoters(r, sts); err == nil && len(state.Voters) == len(expected) {
-			checkIDs = true
-			for i := range expected {
-				if state.Voters[i].NodeID != expected[i].NodeID {
-					checkIDs = false
-					break
-				}
+		checkIDs = len(state.Voters) == r.Spec.VoterCount
+		for _, voter := range state.Voters {
+			if !allowed[string(voter.NodeID)] {
+				checkIDs = false
+				break
 			}
 		}
 	}
-	if err := voterCountContract(r, sts, members, adopted, checkIDs); err != nil {
+	if err := voterCountContract(r, sts, members, adopted, checkIDs, allowed); err != nil {
 		return block(nil, err.Error())
 	}
-	if err := c.validateBootstrappedMembers(ctx, r, sts, adopted, members); err != nil {
+	if err := c.validateBootstrappedMembers(ctx, r, sts, adopted, members, allowed); err != nil {
 		return block(nil, err.Error())
 	}
 	if state == nil {
