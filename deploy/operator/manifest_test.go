@@ -21,8 +21,8 @@ func TestNoPVCBootstrapRetainsPeerCredentials(t *testing.T) {
 	}
 }
 
-// The voter count is the length of spec.voterPods, so the CRD schema must
-// accept any list of three or more voters.
+// The voter count is the length of spec.voterPods, so the CRD schema accepts
+// three or more voters and caps the list at the most a single fence can name.
 func TestClusterCRDAcceptsVoterListsAboveThree(t *testing.T) {
 	data, err := os.ReadFile("cluster-crd.yaml")
 	if err != nil {
@@ -44,8 +44,8 @@ func TestClusterCRDAcceptsVoterListsAboveThree(t *testing.T) {
 	if min, _ := schema["minItems"].(int); min != 3 {
 		t.Fatalf("voterPods minItems=%v, want 3", schema["minItems"])
 	}
-	if capped, present := schema["maxItems"]; present {
-		t.Fatalf("voterPods maxItems=%v caps the authoritative voter list", capped)
+	if capped, _ := schema["maxItems"].(int); capped != 16 {
+		t.Fatalf("voterPods maxItems=%v, want the 16-target fence bound", schema["maxItems"])
 	}
 	items, _ := schema["items"].(map[string]any)
 	required, _ := items["required"].([]any)

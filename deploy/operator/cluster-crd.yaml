@@ -52,10 +52,14 @@ spec:
                     cannot be changed in place. Generation fencing must name
                     every voter plus the retained learner history within the 16
                     targets RhizaFence.spec.targets admits, so keep the voter
-                    count comfortably below that bound: a longer voterPods list
-                    is refused before any binding is created.
+                    count comfortably below that bound. The schema caps the list
+                    at 16, the most a single fence can name, and the controller
+                    additionally refuses a list whose voters plus retained
+                    learner history exceed that bound before any binding is
+                    created.
                   type: array
                   minItems: 3
+                  maxItems: 16
                   items:
                     type: object
                     required: [nodeID, pod]
