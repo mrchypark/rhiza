@@ -1380,6 +1380,43 @@ func TestBootstrapRequiresWriterFreeZeroStageAndServiceContract(t *testing.T) {
 	}
 }
 
+func TestBootstrapReservationRechecksWriterFreeStage(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		prescaled       bool
+		podAppearOnList int
+		want            string
+	}{
+		{name: "crash then scale", prescaled: true, want: "requires replicas=0 until credentials and template are installed"},
+		{name: "pod after first inventory", podAppearOnList: 3, want: "writer Pod appeared during validation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &clusterAPI{sts: freshBootstrapSTS(3), podAppearOnList: tc.podAppearOnList}
+			c := clusterController(t, api)
+			r := autoClusterResource("cluster-1", "uid-1", "logical-1")
+			r.Spec.VoterCount, r.Spec.Bootstrap = 3, true
+			normalizeClusterSpec(r)
+			candidate := expectedBootstrapCandidate(r, api.sts)
+			if err := c.immutable(t.Context(), bootstrapCandidateKey(r), jsonBytes(candidate)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.prescaled {
+				asObject(api.sts["spec"])["replicas"] = float64(3)
+			}
+			if err := c.reconcileCluster(t.Context(), r); err != nil {
+				t.Fatal(err)
+			}
+			if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, tc.want) || api.secretCreates != 0 {
+				t.Fatalf("status=%+v creates=%d want=%q", r.Status, api.secretCreates, tc.want)
+			}
+			ctr, _ := container(api.sts, "rhiza")
+			if entry := envEntry(ctr, "RHIZA_CLUSTER_MEMBERS"); entry != nil && entry["valueFrom"] != nil {
+				t.Fatalf("bootstrap rewrote template before writer-free proof: %+v", entry)
+			}
+		})
+	}
+}
+
 func TestVoterIdentityContractAcceptsJournaledLearner(t *testing.T) {
 	api := &clusterAPI{sts: freshClusterSTS(3)}
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
@@ -1407,12 +1444,14 @@ func TestVoterIdentityContractAcceptsJournaledLearner(t *testing.T) {
 }
 
 type clusterAPI struct {
-	sts           object
-	service       object
-	omitService   bool
-	pods          []object
-	secrets       map[string]object
-	secretCreates int
+	sts             object
+	service         object
+	omitService     bool
+	pods            []object
+	podListCalls    int
+	podAppearOnList int
+	secrets         map[string]object
+	secretCreates   int
 }
 
 func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
@@ -1439,7 +1478,12 @@ func (a *clusterAPI) serve(w http.ResponseWriter, q *http.Request) {
 			_ = json.NewEncoder(w).Encode(next)
 		}
 	case q.URL.Path == "/api/v1/namespaces/default/pods" && q.Method == http.MethodGet:
-		_ = json.NewEncoder(w).Encode(podList{Items: a.pods})
+		a.podListCalls++
+		items := a.pods
+		if a.podAppearOnList > 0 && a.podListCalls == a.podAppearOnList {
+			items = []object{{"metadata": object{"uid": "late-writer", "ownerReferences": []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "uid": "sts-uid"}}}}}
+		}
+		_ = json.NewEncoder(w).Encode(podList{Items: items})
 	case q.URL.Path == "/api/v1/namespaces/default/secrets" && q.Method == http.MethodPost:
 		var next object
 		if json.NewDecoder(q.Body).Decode(&next) == nil {

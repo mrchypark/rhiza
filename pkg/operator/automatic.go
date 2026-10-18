@@ -631,6 +631,10 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 	if len(pods) != 0 {
 		return false, "", fmt.Errorf("fresh bootstrap refuses to start while writer Pods already exist")
 	}
+	templateInstalled := bootstrapTemplateInstalled(ctr, r)
+	if !templateInstalled && int(number(nested(sts, "spec", "replicas"))) != 0 {
+		return false, "", fmt.Errorf("fresh bootstrap requires replicas=0 until credentials and template are installed; observed %d", number(nested(sts, "spec", "replicas")))
+	}
 	key := bootstrapCandidateKey(r)
 	exists, err := c.Bucket.Exists(ctx, key)
 	if err != nil {
@@ -640,9 +644,6 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 	if !exists {
 		if err := c.rejectRegisteredCluster(ctx, r.Spec.AdoptClusterID); err != nil {
 			return false, "", err
-		}
-		if int(number(nested(sts, "spec", "replicas"))) != 0 {
-			return false, "", fmt.Errorf("fresh bootstrap requires replicas=0 before writer activation; observed %d", number(nested(sts, "spec", "replicas")))
 		}
 		if err := c.immutable(ctx, key, jsonBytes(expected)); err != nil {
 			return false, "", fmt.Errorf("fresh bootstrap reservation is unavailable or inconsistent")
@@ -662,15 +663,28 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 			return false, "", fmt.Errorf("fresh bootstrap reservation differs from the current workload contract")
 		}
 	}
-	if !bootstrapTemplateInstalled(ctr, r) {
-		if err := c.installBootstrapCredentials(ctx, r, sts, ctr); err != nil {
+	if !templateInstalled {
+		current, currentCtr, err := c.writerFreeBootstrapTarget(ctx, r, sts)
+		if err != nil {
+			return false, "", err
+		}
+		// Reservation commits before any write. The replica count and Pod list are
+		// checked again immediately before the write; the fresh resourceVersion on
+		// the StatefulSet PUT makes a concurrent scale conflict. A Pod appearing in
+		// the final window cannot start writers while replicas remains zero, and the
+		// next reconcile blocks before scale-up.
+		if err := c.installBootstrapCredentials(ctx, r, current, currentCtr); err != nil {
 			return false, "", err
 		}
 		return true, "bootstrap credentials installed; waiting for writer-free scale up", nil
 	}
 	if int(number(nested(sts, "spec", "replicas"))) == 0 {
-		asObject(sts["spec"])["replicas"] = float64(r.Spec.VoterCount)
-		if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), sts, &sts); err != nil {
+		current, _, err := c.writerFreeBootstrapTarget(ctx, r, sts)
+		if err != nil {
+			return false, "", err
+		}
+		asObject(current["spec"])["replicas"] = float64(r.Spec.VoterCount)
+		if err := c.Kube.Put(ctx, c.stsPath(r.Spec.StatefulSet), current, &current); err != nil {
 			return false, "", err
 		}
 		return true, "bootstrap membership installed; starting voters", nil
@@ -679,6 +693,36 @@ func (c *Controller) reconcileBootstrap(ctx context.Context, r *ClusterResource,
 		return false, "", nil
 	}
 	return true, "bootstrap installed credentials but the workload is not exporting its bootstrap membership", nil
+}
+
+func (c *Controller) writerFreeBootstrapTarget(ctx context.Context, r *ClusterResource, sts object) (object, object, error) {
+	uid := str(nested(sts, "metadata", "uid"))
+	before, err := c.ownedPods(ctx, uid)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(before) != 0 {
+		return nil, nil, fmt.Errorf("fresh bootstrap refuses to write while writer Pods already exist")
+	}
+	var current object
+	if err := c.Kube.Get(ctx, c.stsPath(r.Spec.StatefulSet), &current); err != nil {
+		return nil, nil, err
+	}
+	if str(nested(current, "metadata", "uid")) != uid || int(number(nested(current, "spec", "replicas"))) != 0 {
+		return nil, nil, fmt.Errorf("fresh bootstrap write precondition changed: StatefulSet replicas=%v", nested(current, "spec", "replicas"))
+	}
+	ctr, err := container(current, r.Spec.Container)
+	if err != nil {
+		return nil, nil, err
+	}
+	after, err := c.ownedPods(ctx, uid)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(after) != 0 {
+		return nil, nil, fmt.Errorf("fresh bootstrap refuses to write because a writer Pod appeared during validation")
+	}
+	return current, ctr, nil
 }
 
 func bootstrapSecretName(r *ClusterResource) string {
