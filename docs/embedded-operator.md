@@ -7,12 +7,20 @@ Operator가 복구할 수 있다. 별도의 Rhiza 서버 프로세스나 데이�
 외부 앵커 검증 서비스를 구축하는 방법은 [Recovery Anchor](recovery-anchor.md)를 참고한다.
 
 이 기능은 기존 **3개 이상의 voter로 구성한 StatefulSet + emptyDir(no-PVC) +
-공유 오브젝트 저장소**를 대상으로 한다. voter 수는 `RhizaCluster.spec.voterPods`
-항목 수로 정한다. StatefulSet은 같은 수의 replica를 선언하고, 같은 수의
-`RHIZA_CLUSTER_MEMBERS` 항목을 내보내야 한다. 두 값이 어긋나면 Operator는 복구를
-시작하지 않고 두 값을 함께 알려 주는 오류를 남긴다. 최소 voter 수는 3이며 홀수
-제약이 없으므로 짝수도 지원한다. 세대가 살아 있는 동안 voter 수는 제자리에서 바꿀
-수 없고, 새 세대를 만들거나 재구성으로 voter를 하나씩 교체해야 한다.
+공유 오브젝트 저장소**를 대상으로 한다. voter 수는 `RhizaCluster.spec.voterCount`에
+3 이상 64 이하의 정수로 선언한다. StatefulSet은 같은 수의 replica를 선언하고,
+Pod 이름은 `<statefulSet>-<ordinal>` 규칙을 따라야 한다. StatefulSet이
+`RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 재생성하지 않고 채택하며,
+내보내지 않으면 `spec.bootstrap: true`를 명시한 경우에만 voter 수만큼 node ID,
+Pod 이름, headless service DNS URL, peer token, admin token, 공개키를 생성해 불변
+Secret에 보관한다. 이때 object storage에 해당 cluster ID의 membership commitment가
+이미 있으면 Operator는 bootstrap을 거부한다. `spec.clusterDomain`은 생성 URL의 DNS
+suffix이며 기본값은 `cluster.local`이다. 내보낸 목록의 수나
+node ID가 선언한 값과 어긋나면 Operator는 복구를 시작하지 않고 두 값을 함께 알려
+주는 오류를 남긴다. 최소 voter 수는 3이며 홀수 제약이 없으므로 짝수도 지원한다.
+`httpPort`와 `peerPort`는 선택 항목이고 기본값은 각각 8080과 9090이다. 세대가
+살아 있는 동안 voter 수는 제자리에서 바꿀 수 없고, 새 세대를 만들거나 재구성으로
+voter를 하나씩 교체해야 한다.
 소스 세대의 복구 자료를 검증하고 새 세대로 복사한 다음,
 애플리케이션 Pod 전체를 재시작한다. Pod 이름·peer 주소는 유지하지만
 ClusterID와 peer/admin 토큰은 바뀐다. 애플리케이션의 다른 emptyDir 상태도
@@ -84,7 +92,7 @@ Operator는 컨테이너의 `RHIZA_*` 환경 설정을 읽고 다음 항목을 �
 | 환경 변수 | 의미 |
 | --- | --- |
 | `RHIZA_CLUSTER_ID` | 세대별 클러스터 ID |
-| `RHIZA_CLUSTER_MEMBERS` | member 목록의 JSON. 항목 수가 voter 수이며 StatefulSet replica 수와 `RhizaCluster.spec.voterPods` 항목 수에 맞춘다. 각 항목은 `node_id`, `url`, `peer_url`, base64 Ed25519 `public_key`를 포함한다 |
+| `RHIZA_CLUSTER_MEMBERS` | member 목록의 JSON. 항목 수가 voter 수이며 StatefulSet replica 수와 `RhizaCluster.spec.voterCount`에 맞춘다. 각 항목은 `node_id`, `url`, `peer_url`, base64 Ed25519 `public_key`를 포함한다. StatefulSet이 이 값을 내보내면 Operator가 채택하고, 내보내지 않으면 Operator가 생성해 불변 Secret으로 주입한다 |
 | `RHIZA_PEER_TOKENS` | 노드별 비공개 peer 토큰의 JSON map. StatefulSet은 Pod 템플릿 하나로 replica별 Secret을 마운트할 수 없어 각 Pod가 자기 `RHIZA_NODE_ID` 항목을 선택한다. `RHIZA_PEER_TOKEN`(단일 값)과 동시에 설정할 수 없다 |
 | `RHIZA_ADMIN_TOKEN` | 복구 archive 발행 인증 토큰 |
 | `RHIZA_OBJSTORE_DURABILITY` | `async` 또는 `before-ack` |
@@ -226,9 +234,14 @@ peer의 Ready/Quorum과 상태 메시지를 확인한다.
 자동 복구는 [Operator 배포 안내](../deploy/operator/README.md#automatic-recovery-with-kubernetes-fencing)의
 `RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`로 켜며 모든 voter의
 opt-in이 필요하다. 각 voter 프로세스에 `RHIZA_ENABLE_RECONFIGURATION=true`를 명시적으로 설정한다.
-`RhizaCluster.spec.voterPods`에 모든 voter를 `nodeID`·`pod`로 나열하며, 항목 수가 voter 수다.
-전체 세대 fencing은 voter와 보존된 learner 이력을 합쳐 16개 대상까지만 예약할 수 있으므로
-voter 수를 그보다 넉넉히 낮게 유지한다.
+`RhizaCluster.spec.voterCount`에 voter 수를 정수로 선언한다. Operator는
+`<statefulSet>-<ordinal>` 규칙으로 node ID와 Pod 이름을 유도하고, headless
+service와 namespace로 DNS URL을 만든다. StatefulSet이 이미
+`RHIZA_CLUSTER_MEMBERS`를 내보내면 Operator는 그 목록을 채택하고, 내보내지 않으면
+불변 Secret에 bootstrap identity를 한 번만 생성한다. Operator는 learner의 종료
+증거, Pod UID 소멸, credential 삭제 또는 대체를 모두 확인한 뒤에만 이력을 버리고,
+확인되지 않은 항목은 계속 fencing한다. 전체 세대 fencing은 voter와 남아 있는
+learner 이력을 합쳐 64개 대상까지만 예약할 수 있다.
 executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
 command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
 

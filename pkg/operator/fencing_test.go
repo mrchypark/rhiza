@@ -50,10 +50,10 @@ func TestFenceCapacityBoundary(t *testing.T) {
 		over            bool
 	}{
 		{voters: 3},
-		{voters: 16},
-		{voters: 15, history: 1},
-		{voters: 17, over: true},
-		{voters: 16, history: 1, over: true},
+		{voters: 64},
+		{voters: 63, history: 1},
+		{voters: 65, over: true},
+		{voters: 64, history: 1, over: true},
 	} {
 		state := validAutoControl()
 		for i := range tc.history {

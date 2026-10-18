@@ -208,7 +208,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
-	r.Spec.VoterPods = append([]VoterPod(nil), state.Voters...)
+	r.Spec.VoterCount = len(state.Voters)
 	state.BindingHash = autoBinding(r)
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recover", Scope: ScopeVoter, Targets: []FenceTarget{{NodeID: "n3", Pod: "n3", PodUID: "pod-n3", WALIdentity: strings.Repeat("b", 64)}}}
 	hash, err := requestHash(&request)
@@ -384,14 +384,14 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 		blocked  bool
 		want     string
 	}{
-		{name: "voters at capacity", voters: 16},
-		{name: "voters plus history at capacity", voters: 15, learners: 1},
-		{name: "voter list over capacity", voters: 17, blocked: true, want: "voterPods lists 17 voters but one fencing request admits 16"},
-		{name: "voters plus history over capacity", voters: 16, learners: 1, blocked: true},
+		{name: "voters at capacity", voters: 64},
+		{name: "voters plus history at capacity", voters: 63, learners: 1},
+		{name: "voter count over capacity", voters: 65, blocked: true, want: "spec.voterCount=65 exceeds the maximum 64"},
+		{name: "voters plus history over capacity", voters: 64, learners: 1, blocked: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
-			voters := voterMembers(tc.voters)
+			voters := clusterVoterMembers(tc.voters)
 			_, _, _, api, c := controllerFixtureVoters(t, "before-ack", "before-ack", voters)
 			ctr, err := container(api.sts, "rhiza")
 			if err != nil {
@@ -405,7 +405,7 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 			for _, member := range voters {
 				voterPods = append(voterPods, VoterPod{NodeID: member.ID, Pod: string(member.ID)})
 			}
-			r.Spec.VoterPods = voterPods
+			r.Spec.VoterCount = tc.voters
 			state := validAutoControl()
 			state.BindingUID, state.StatefulSetUID = "binding-uid-1", "sts-uid"
 			state.BindingHash = autoBinding(r)

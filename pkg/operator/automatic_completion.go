@@ -14,9 +14,15 @@ import (
 	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
+type installedGeneration struct {
+	ClusterID  string
+	Voters     []VoterPod
+	Identities map[quepaxa.NodeID]FenceTarget
+}
+
 // Completion authenticates the executor's durable result, not current health.
 // A later outage must be evaluated against the installed generation/inventory.
-func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterResource, state *autoControl, child *Resource, sts object) error {
+func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterResource, state *autoControl, child *Resource, sts object, installed *installedGeneration) error {
 	i := state.Intent
 	if i.RecoveryUID == "" || resourceName(child) != i.RecoveryName || str(child.Metadata["uid"]) != i.RecoveryUID || hashJSON(child.Spec) != i.SpecHash || str(nested(child.Metadata, "annotations", automaticOwner)) != state.BindingUID || str(nested(child.Metadata, "annotations", automaticLogical)) != r.Spec.LogicalID {
 		return fmt.Errorf("child identity or authorized specification differs")
@@ -114,10 +120,48 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(members) {
 		return fmt.Errorf("installed target StatefulSet has %d desired replicas but the recovered generation has %d voters", replicas, len(members))
 	}
-	allowed, ready := map[string]bool{}, map[string]bool{}
-	for _, member := range members {
-		allowed[string(member.ID)] = true
+	allowed, inventory, podNames := map[string]bool{}, map[string]string{}, map[string]bool{}
+	add := func(id, pod string, allow bool) error {
+		if id == "" || pod == "" {
+			return fmt.Errorf("installed target voter inventory differs from frozen binding")
+		}
+		if existing := inventory[id]; existing != "" && existing != pod {
+			return fmt.Errorf("installed target voter inventory differs from frozen binding")
+		}
+		if podNames[pod] && inventory[id] != pod {
+			return fmt.Errorf("installed target voter inventory differs from frozen binding")
+		}
+		inventory[id], podNames[pod] = pod, true
+		if allow {
+			allowed[id] = true
+		}
+		return nil
 	}
+	if derived, err := derivedVoters(r, sts); err == nil {
+		for _, voter := range derived {
+			if err := add(string(voter.NodeID), voter.Pod, true); err != nil {
+				return err
+			}
+		}
+	}
+	for _, member := range members {
+		if err := add(string(member.ID), string(member.ID), true); err != nil {
+			return err
+		}
+	}
+	for _, ref := range i.Voters {
+		if err := add(string(ref.NodeID), ref.Pod, false); err != nil {
+			return err
+		}
+	}
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID == state.ActiveClusterID {
+			if err := add(string(entry.Target.NodeID), entry.Target.Pod, true); err != nil {
+				return err
+			}
+		}
+	}
+	ready := map[string]bool{}
 	for _, peer := range child.Status.Peers {
 		if allowed[peer.NodeID] && peer.ClusterID == child.Status.Target && peer.Durability == child.Spec.Durability && peer.Ready && peer.Quorum && peer.CertifiedTip >= child.Status.RecoveredTip && peer.AppliedTip >= child.Status.RecoveredTip {
 			ready[peer.NodeID] = true
@@ -126,15 +170,7 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if len(ready) < len(members)/2+1 {
 		return fmt.Errorf("executor did not record the recovered target quorum")
 	}
-	inventory, podNames := map[string]string{}, map[string]bool{}
-	for _, ref := range r.Spec.VoterPods {
-		id := string(ref.NodeID)
-		if !allowed[id] || inventory[id] != "" || !identifier.MatchString(ref.Pod) || podNames[ref.Pod] {
-			return fmt.Errorf("installed target voter inventory differs from frozen binding")
-		}
-		inventory[id], podNames[ref.Pod] = ref.Pod, true
-	}
-	if len(inventory) != len(members) {
+	if len(i.Voters) != len(members) {
 		return fmt.Errorf("installed target voter inventory is incomplete")
 	}
 	seen, pods, uids := map[string]bool{}, map[string]bool{}, map[string]bool{}
@@ -148,7 +184,25 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	// the identities it authenticated. Such a deficit is accepted here and
 	// answered by the escalation rule: an unauthenticated voter can never be
 	// removed one-for-one, so the next incident must fence the whole generation.
+	*installed = installedGenerationFromCompletion(child.Status.Target, members, child.Status.TargetIdentities)
 	return nil
+}
+
+func installedGenerationFromCompletion(target string, members []quepaxa.Member, captured []FenceTarget) installedGeneration {
+	identityByID := make(map[quepaxa.NodeID]FenceTarget, len(captured))
+	for _, identity := range captured {
+		identityByID[quepaxa.NodeID(identity.NodeID)] = identity
+	}
+	installed := installedGeneration{ClusterID: target, Voters: make([]VoterPod, 0, len(members)), Identities: make(map[quepaxa.NodeID]FenceTarget)}
+	for _, member := range members {
+		pod := string(member.ID)
+		if identity, ok := identityByID[member.ID]; ok {
+			pod = identity.Pod
+			installed.Identities[member.ID] = identity
+		}
+		installed.Voters = append(installed.Voters, VoterPod{NodeID: member.ID, Pod: pod})
+	}
+	return installed
 }
 
 func (c *Controller) captureAutomaticTargetIdentities(ctx context.Context, child *Resource, sts object, members []quepaxa.Member, admin string) ([]FenceTarget, error) {

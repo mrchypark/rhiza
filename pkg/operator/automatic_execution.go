@@ -152,7 +152,8 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	if child.Status.Phase != "Complete" {
 		return c.autoStatus(ctx, r, state, "Recovering", child.Status.Phase+": "+child.Status.Message)
 	}
-	if err := c.verifyAutomaticCompletion(ctx, r, state, &child, sts); err != nil {
+	var installed installedGeneration
+	if err := c.verifyAutomaticCompletion(ctx, r, state, &child, sts, &installed); err != nil {
 		return block("completed recovery outcome is invalid: " + err.Error())
 	}
 	if intent.Failed != "" {
@@ -172,13 +173,16 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		if err := c.releaseCompleted(ctx, &child); err != nil {
 			return err
 		}
-		state.ActiveClusterID = child.Status.Target
-		state.Learners = nil // Verified full cleanup and installed target retire the old generation.
-		state.Voters = append([]VoterPod(nil), r.Spec.VoterPods...)
-		state.Identities = map[quepaxa.NodeID]FenceTarget{}
-		for _, identity := range child.Status.TargetIdentities {
-			id := quepaxa.NodeID(identity.NodeID)
-			state.Identities[id] = identity
+		state.ActiveClusterID = installed.ClusterID
+		state.Voters = append([]VoterPod(nil), installed.Voters...)
+		state.Identities = installed.Identities
+	}
+	if intent.Proof != nil {
+		for idx := range state.Learners {
+			entry := &state.Learners[idx]
+			if entry.SourceClusterID == intent.Request.SourceClusterID && learnerTargetCovered(entry.Target, intent.Request.Targets) {
+				entry.Retirement = &learnerRetirement{Request: intent.Request, Proof: *intent.Proof}
+			}
 		}
 	}
 	now := time.Now().UTC()

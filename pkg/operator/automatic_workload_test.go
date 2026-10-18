@@ -103,6 +103,7 @@ func (a *learnerAPI) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" && r.URL.Path == "/api/v1/namespaces/default/secrets" {
 		var next object
 		if json.NewDecoder(r.Body).Decode(&next) == nil {
+			asObject(next["metadata"])["uid"] = "learner-secret-uid"
 			a.secret = next
 			a.secretExists = true
 			a.createCount++
@@ -154,6 +155,7 @@ func (a *learnerAPI) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" && r.URL.Path == "/api/v1/namespaces/default/pods" {
 		var next object
 		if json.NewDecoder(r.Body).Decode(&next) == nil {
+			asObject(next["metadata"])["uid"] = "learner-pod-uid"
 			a.pod = next
 			a.podExists = true
 			a.createCount++

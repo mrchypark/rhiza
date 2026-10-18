@@ -61,7 +61,7 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
-	r.Spec.VoterPods = state.Voters
+	r.Spec.VoterCount = len(state.Voters)
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recover", Scope: ScopeVoter, Targets: []FenceTarget{{NodeID: "n3", Pod: "n3", PodUID: "pod-n3", WALIdentity: strings.Repeat("b", 64)}}}
 	hash, err := requestHash(&request)
 	if err != nil {
@@ -179,6 +179,84 @@ func TestAutomaticVoterMajorityCompletion(t *testing.T) {
 	}
 }
 
+// A learner promoted into the generation is a legitimate voter even though its
+// Pod name is not a derived StatefulSet ordinal.
+func TestAutomaticCompletionAcceptsPromotedLearnerVoter(t *testing.T) {
+	ctx := t.Context()
+	voters := voterMembers(3)
+	learner := "auto-promoted-learner-1"
+	s := completedAutomaticTarget(t, voters)
+	s.state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
+	s.state.Intent.Voters = []VoterPod{{NodeID: "rhiza-0", Pod: "rhiza-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1"}, {NodeID: "rhiza-2", Pod: "rhiza-2"}}
+	s.child.Status.TargetIdentities[0] = FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-rhiza-0", WALIdentity: strings.Repeat("a", 64)}
+	s.child.Status.TargetIdentities[1] = FenceTarget{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-rhiza-1", WALIdentity: strings.Repeat("a", 64)}
+	s.child.Status.TargetIdentities[2] = FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}
+	if err := s.c.saveAuto(ctx, s.r, s.state, s.version); err != nil {
+		t.Fatal(err)
+	}
+	state, version, err := s.c.loadAuto(ctx, s.c.autoKey(s.r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.c.advanceAutomatic(ctx, s.r, state, version, s.api.sts); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := s.c.loadAuto(ctx, s.c.autoKey(s.r))
+	if err != nil || loaded.Intent != nil || s.r.Status.Phase != "Stabilizing" {
+		t.Fatalf("promoted learner was not accepted: state=%+v status=%+v err=%v", loaded, s.r.Status, err)
+	}
+}
+
+func TestAutomaticCompletionRejectsUnknownVoterIdentity(t *testing.T) {
+	ctx := t.Context()
+	voters := voterMembers(3)
+	learner := "auto-promoted-learner-1"
+	s := completedAutomaticTarget(t, voters)
+	s.state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op", CredentialUID: "cred", Target: FenceTarget{NodeID: learner, Pod: learner, PodUID: "pod-" + learner, WALIdentity: strings.Repeat("a", 64)}}}
+	s.state.Intent.Voters = []VoterPod{{NodeID: "rhiza-0", Pod: "rhiza-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1"}, {NodeID: "rhiza-2", Pod: "rhiza-2"}}
+	s.child.Status.TargetIdentities[0] = FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-rhiza-0", WALIdentity: strings.Repeat("a", 64)}
+	s.child.Status.TargetIdentities[1] = FenceTarget{NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "pod-rhiza-1", WALIdentity: strings.Repeat("a", 64)}
+	s.child.Status.TargetIdentities[2] = FenceTarget{NodeID: "unknown-voter", Pod: "unknown-voter", PodUID: "pod-unknown-voter", WALIdentity: strings.Repeat("a", 64)}
+	if err := s.c.saveAuto(ctx, s.r, s.state, s.version); err != nil {
+		t.Fatal(err)
+	}
+	state, version, err := s.c.loadAuto(ctx, s.c.autoKey(s.r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.c.advanceAutomatic(ctx, s.r, state, version, s.api.sts); err != nil {
+		t.Fatal(err)
+	}
+	if s.r.Status.Phase != "Blocked" || !strings.Contains(s.r.Status.Message, "installed target identity inventory is incomplete or conflicting") {
+		t.Fatalf("unknown voter was not rejected: %+v", s.r.Status)
+	}
+}
+
+func TestInstalledGenerationUsesTargetAuthority(t *testing.T) {
+	members := []quepaxa.Member{{ID: "rhiza-0"}, {ID: "rhiza-1"}, {ID: "rhiza-2"}}
+	identities := []FenceTarget{{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "uid-0", WALIdentity: "wal-0"}, {NodeID: "rhiza-1", Pod: "rhiza-1", PodUID: "uid-1", WALIdentity: "wal-1"}, {NodeID: "rhiza-2", Pod: "rhiza-2", PodUID: "uid-2", WALIdentity: "wal-2"}}
+	installed := installedGenerationFromCompletion("target-generation", members, identities)
+	state := validAutoControl()
+	state.ActiveClusterID, state.Voters, state.Identities = installed.ClusterID, installed.Voters, installed.Identities
+	state.Completed = &autoCompletion{ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...)}
+	if len(state.Voters) != 3 || state.Voters[2].NodeID != "rhiza-2" || state.Completed.ClusterID != "target-generation" || len(state.Completed.Voters) != 3 {
+		t.Fatalf("target authority was not installed: %+v", state)
+	}
+	var missing, wrong bool
+	for _, voter := range state.Voters {
+		identity := state.Identities[voter.NodeID]
+		if identity.PodUID == "" || identity.WALIdentity == "" {
+			missing = true
+		}
+		if identity.NodeID != string(voter.NodeID) || identity.Pod != voter.Pod {
+			wrong = true
+		}
+	}
+	if missing || wrong {
+		t.Fatalf("next generation fence lost exact identity: voters=%+v identities=%+v", state.Voters, state.Identities)
+	}
+}
+
 // automaticCompletion holds one installed automatic target generation, its
 // durable intent, and the fixtures advanceAutomatic authenticates against.
 type automaticCompletion struct {
@@ -218,7 +296,7 @@ func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticC
 	for _, id := range ids {
 		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(id), Pod: id})
 	}
-	r.Spec.VoterPods = state.Voters
+	r.Spec.VoterCount = len(state.Voters)
 	observed := *state
 	observed.ActiveClusterID, observed.Identities = child.Status.Target, map[quepaxa.NodeID]FenceTarget{}
 	if obs, _, err := c.observeAutomatic(ctx, r, &observed, api.sts); err != nil || !obs.Known || obs.Voters != len(voters) || obs.Reachable != len(voters) {
@@ -233,7 +311,7 @@ func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticC
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+	state.Intent = &autoIntent{Request: request, Voters: append([]VoterPod(nil), state.Voters...), RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
 	child.Metadata["name"] = "recovery-1"
 	child.Spec.Container = "rhiza"
 	child.Spec.Fence.Evidence = state.Intent.Proof.ProofID
@@ -385,16 +463,16 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		t.Fatalf("child did not complete: %+v", child.Status)
 	}
 	r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
-	r.Spec.VoterPods = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
+	r.Spec.VoterCount = 3
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
-	state.Voters = r.Spec.VoterPods
+	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
 	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recovery-1", Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}}
 	hash, err := requestHash(&request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: targetMode, Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+	state.Intent = &autoIntent{Request: request, Voters: append([]VoterPod(nil), state.Voters...), RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: targetMode, Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
 	child.Metadata["name"] = "recovery-1"
 	child.Metadata["annotations"] = object{automaticOwner: state.BindingUID, automaticLogical: r.Spec.LogicalID}
 	child.Spec.Container = "rhiza"
