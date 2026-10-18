@@ -17,10 +17,62 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+// The Go guard and the CRD schema must describe the same capacity: the
+// Kubernetes backend refuses a larger RhizaFence.spec.targets list.
+func TestFenceCapacityMatchesCRD(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/operator/fence-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _ := crd["spec"].(map[string]any)["versions"].([]any)
+	targets, _ := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)["spec"].(map[string]any)["properties"].(map[string]any)["targets"].(map[string]any)
+	if targets["maxItems"] != fenceTargetCapacity {
+		t.Fatalf("RhizaFence.spec.targets maxItems=%v but the operator admits %d", targets["maxItems"], fenceTargetCapacity)
+	}
+}
+
+// One fence must carry every voter plus the retained learner history.
+func TestFenceCapacityBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		voters, history int
+		over            bool
+	}{
+		{voters: 3},
+		{voters: 16},
+		{voters: 15, history: 1},
+		{voters: 17, over: true},
+		{voters: 16, history: 1, over: true},
+	} {
+		state := validAutoControl()
+		for i := range tc.history {
+			pod := "learner-" + strconv.Itoa(i)
+			state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: "retire-1", CredentialUID: "cred-1", Target: FenceTarget{NodeID: pod, Pod: pod, PodUID: "pod-" + pod, WALIdentity: "wal-" + pod}})
+		}
+		request := FenceRequest{SourceClusterID: "source", Scope: ScopeGeneration, Targets: make([]FenceTarget, tc.voters)}
+		if err := includeLearnerHistory(state, &request); err != nil {
+			t.Fatal(err)
+		}
+		err := fenceCapacityError(len(request.Targets))
+		if (err != nil) != tc.over {
+			t.Fatalf("voters=%d history=%d targets=%d err=%v", tc.voters, tc.history, len(request.Targets), err)
+		}
+		if err != nil && !strings.Contains(err.Error(), strconv.Itoa(len(request.Targets))+" targets exceed the fence capacity of "+strconv.Itoa(fenceTargetCapacity)) {
+			t.Fatalf("capacity error must name both numbers: %q", err)
+		}
+	}
+}
 
 func testCert(t *testing.T) (caCert *x509.Certificate, certFile, keyFile string) {
 	t.Helper()

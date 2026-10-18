@@ -14,7 +14,9 @@ voter 수는 `spec.voterPods` 항목 수로 정하고, StatefulSet replica 수�
 시작하지 않고 막는다. 최소 voter 수는 3이며 짝수도 허용한다. 세대가 살아 있는
 동안 voter 수는 제자리에서 바꿀 수 없고, 새 세대를 만들거나 재구성으로 voter를
 하나씩 교체한다. 전체 세대 fencing은 보존된 learner 이력을 포함해 최대 16개
-대상을 담으므로 voter 수를 그보다 넉넉히 낮게 유지한다.
+대상까지만 담을 수 있다. voter와 보존된 learner 이력을 합친 대상이 16개를 넘으면
+자동 복구는 fencing을 예약하기 전에 두 수를 함께 알려 주는 오류로 막는다. 따라서
+voter 수를 그보다 넉넉히 낮게 유지한다.
 
 완전 자동은 모든 외부 장애 중에도 무조건 복구한다는 뜻이 아니다. Kubernetes,
 공유 저장소, fencing authority, 새 Pod 실행 용량이 사용 가능하고 증거가 유효할

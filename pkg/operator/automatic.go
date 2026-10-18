@@ -361,6 +361,10 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		} else if err := includeLearnerHistory(state, &request); err != nil {
 			return block(state, err.Error())
 		}
+		// The scope is final only after the retained learner history is added.
+		if err := fenceCapacityError(len(request.Targets)); err != nil {
+			return block(state, err.Error())
+		}
 		state.Intent = &autoIntent{Request: request, Policy: r.Spec.Policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), Failed: failed, RecoveryName: name, LearnerName: name + "-learner"}
 	}
 	if err := c.saveAuto(ctx, r, state, version); err != nil {

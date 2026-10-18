@@ -631,6 +631,32 @@ func TestControllerRejectsFewerThanThreeVoters(t *testing.T) {
 	}
 }
 
+// Three ready peers of a five-voter target are its quorum, but a scaled-down
+// workload must not become the next generation.
+func TestControllerRejectsTargetReplicaShortfall(t *testing.T) {
+	ctx, _, r, api, c := controllerFixtureVoters(t, "before-ack", "before-ack", voterMembers(5))
+	r.Spec.RecoveryID = "recovery-1"
+	r.Spec.Fence = fence(r)
+	for range 8 {
+		if err := c.reconcileAll(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r.Status.Stage == "Restarted" {
+			break
+		}
+	}
+	if r.Status.Stage != "Restarted" {
+		t.Fatalf("target did not start: %+v", r.Status)
+	}
+	asObject(api.sts["spec"])["replicas"] = float64(3)
+	if err := c.reconcileAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if want := "target StatefulSet has 3 desired replicas but 5 target voters are frozen"; r.Status.Phase != "Blocked" || r.Status.Message != want {
+		t.Fatalf("status=%+v want=%q", r.Status, want)
+	}
+}
+
 func fence(r *Resource) Fence {
 	return Fence{RecoveryID: r.Spec.RecoveryID, ClusterID: r.Spec.SourceClusterID, StatefulSetUID: "sts-uid", Confirmed: true, Evidence: "incident-42"}
 }
@@ -850,11 +876,16 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 }
 
 func (a *operatorAPI) pods() []object {
-	if number(nested(a.sts, "spec", "replicas")) == 0 {
+	// A scale-down removes Pods; the fixture must not keep reporting them.
+	replicas := int(number(nested(a.sts, "spec", "replicas")))
+	if replicas <= 0 {
 		return nil
 	}
-	result := make([]object, 0, len(a.peers))
+	result := make([]object, 0, replicas)
 	for i, peer := range a.peers {
+		if i >= replicas {
+			break
+		}
 		_, port, err := net.SplitHostPort(peer.Listener.Addr().String())
 		if err != nil {
 			continue

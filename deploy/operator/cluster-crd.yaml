@@ -49,7 +49,10 @@ spec:
                     must declare the same number of desired replicas and export
                     the same number of RHIZA_CLUSTER_MEMBERS entries. The
                     minimum is three, even counts are supported, and the count
-                    cannot be changed in place.
+                    cannot be changed in place. Generation fencing must name
+                    every voter plus the retained learner history within the 16
+                    targets RhizaFence.spec.targets admits, so keep the voter
+                    count comfortably below that bound.
                   type: array
                   minItems: 3
                   items:

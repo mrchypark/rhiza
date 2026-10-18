@@ -24,7 +24,7 @@ import (
 // The child really completed before all target membership endpoints disappear.
 // Losing the final health check must not make its source active again.
 func TestAutomaticCompletionSurvivesTargetFailure(t *testing.T) {
-	for _, mode := range []string{"target failure", "single target failure", "two target failures after adoption", "failure before identity capture", "failure before identity capture async", "failure before identity capture empty", "legacy completed child", "legacy completed child async", "capture unauthorized", "capture wrong cluster", "stale CAS", "bare complete", "changed reservation", "changed lineage", "duplicate quorum", "changed UID", "duplicate installed identity"} {
+	for _, mode := range []string{"target failure", "single target failure", "two target failures after adoption", "failure before identity capture", "failure before identity capture async", "failure before identity capture empty", "legacy completed child", "legacy completed child async", "partial installed inventory", "capture unauthorized", "capture wrong cluster", "stale CAS", "bare complete", "changed reservation", "changed lineage", "duplicate quorum", "changed UID", "duplicate installed identity"} {
 		t.Run(mode, func(t *testing.T) { testAutomaticCompletionOutcome(t, mode) })
 	}
 }
@@ -156,92 +156,175 @@ func TestAutomaticVoterMajorityCompletion(t *testing.T) {
 		{voters: 5, ready: 3},
 	} {
 		t.Run(fmt.Sprintf("voters=%d ready=%d", tc.voters, tc.ready), func(t *testing.T) {
-			voters := voterMembers(tc.voters)
-			ctx, bucket, child, api, c := automaticTargetFixture(t, "before-ack", voters)
-			ids := make([]string, 0, tc.voters)
-			for _, member := range voters {
-				ids = append(ids, string(member.ID))
-			}
-			api.membership = map[string]network.MembershipStatus{}
-			for _, id := range ids {
-				status := membershipStatus(id, 1, ids...)
-				status.ClusterID, status.WALIdentity = child.Status.Target, "target-wal-"+id
-				api.membership[id] = status
-			}
-			if err := c.startAndObserve(ctx, child, api.sts); err != nil {
+			s := completedAutomaticTarget(t, voterMembers(tc.voters))
+			s.api.membership = nil
+			s.child.Status.Peers = s.child.Status.Peers[:tc.ready]
+			if err := s.c.advanceAutomatic(s.ctx, s.r, s.state, s.version, s.api.sts); err != nil {
 				t.Fatal(err)
 			}
-			if child.Status.Phase != "Complete" || len(child.Status.TargetIdentities) != tc.voters {
-				t.Fatalf("target did not complete: %+v", child.Status)
-			}
-			r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
-			state := validAutoControl()
-			state.StatefulSetUID, state.Voters = "sts-uid", nil
-			for _, id := range ids {
-				state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(id), Pod: id})
-			}
-			r.Spec.VoterPods = state.Voters
-			observed := *state
-			observed.ActiveClusterID, observed.Identities = child.Status.Target, map[quepaxa.NodeID]FenceTarget{}
-			if obs, _, err := c.observeAutomatic(ctx, r, &observed, api.sts); err != nil || !obs.Known || obs.Voters != tc.voters || obs.Reachable != tc.voters {
-				t.Fatalf("observation of %d voters: %+v err=%v", tc.voters, obs, err)
-			}
-			targets := make([]FenceTarget, 0, tc.voters)
-			for _, id := range ids {
-				targets = append(targets, FenceTarget{NodeID: id, Pod: id})
-			}
-			request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: r.Spec.StatefulSet, StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recovery-1", Scope: ScopeGeneration, Targets: targets}
-			hash, err := requestHash(&request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
-			child.Metadata["name"] = "recovery-1"
-			child.Spec.Container = "rhiza"
-			child.Spec.Fence.Evidence = state.Intent.Proof.ProofID
-			child.Status.SpecHash = immutableSpecHash(child.Spec)
-			state.Intent.SpecHash = hashJSON(child.Spec)
-			if err := bucket.Upload(ctx, "root/source/recovery/successor.json", bytes.NewReader(jsonBytes(c.reservation(child)))); err != nil {
-				t.Fatal(err)
-			}
-			c.Fencer = &countingFencer{count: new(int)}
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
-				if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recovery-1") {
-					json.NewEncoder(w).Encode(child)
-					return
-				}
-				if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {
-					json.NewEncoder(w).Encode(r)
-					return
-				}
-				api.serve(w, q)
-			}))
-			t.Cleanup(server.Close)
-			c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
-			if err := c.saveAuto(ctx, r, state, nil); err != nil {
-				t.Fatal(err)
-			}
-			loaded, version, err := c.loadAuto(ctx, c.autoKey(r))
-			if err != nil {
-				t.Fatal(err)
-			}
-			api.membership = nil
-			child.Status.Peers = child.Status.Peers[:tc.ready]
-			if err := c.advanceAutomatic(ctx, r, loaded, version, api.sts); err != nil {
-				t.Fatal(err)
-			}
-			next, _, err := c.loadAuto(ctx, c.autoKey(r))
+			next, _, err := s.c.loadAuto(s.ctx, s.c.autoKey(s.r))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if tc.ready < tc.voters/2+1 {
-				if next.Intent == nil || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "did not record the recovered target quorum") {
-					t.Fatalf("below-majority target was accepted: %+v status=%+v", next, r.Status)
+				if next.Intent == nil || s.r.Status.Phase != "Blocked" || !strings.Contains(s.r.Status.Message, "did not record the recovered target quorum") {
+					t.Fatalf("below-majority target was accepted: %+v status=%+v", next, s.r.Status)
 				}
 				return
 			}
-			if next.Intent != nil || len(next.Voters) != tc.voters || next.ActiveClusterID != child.Status.Target || r.Status.Phase != "Stabilizing" {
-				t.Fatalf("majority target was not installed: active=%s pending=%t voters=%d status=%+v", next.ActiveClusterID, next.Intent != nil, len(next.Voters), r.Status)
+			if next.Intent != nil || len(next.Voters) != tc.voters || next.ActiveClusterID != s.child.Status.Target || s.r.Status.Phase != "Stabilizing" {
+				t.Fatalf("majority target was not installed: active=%s pending=%t voters=%d status=%+v", next.ActiveClusterID, next.Intent != nil, len(next.Voters), s.r.Status)
+			}
+		})
+	}
+}
+
+// automaticCompletion holds one installed automatic target generation, its
+// durable intent, and the fixtures advanceAutomatic authenticates against.
+type automaticCompletion struct {
+	ctx     context.Context
+	child   *Resource
+	api     *operatorAPI
+	c       *Controller
+	r       *ClusterResource
+	state   *autoControl
+	version *objstore.ObjectVersion
+}
+
+// completedAutomaticTarget installs an automatic target for every configured
+// voter and stages the durable intent that advanceAutomatic later verifies.
+func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticCompletion {
+	t.Helper()
+	ctx, bucket, child, api, c := automaticTargetFixture(t, "before-ack", voters)
+	ids := make([]string, 0, len(voters))
+	for _, member := range voters {
+		ids = append(ids, string(member.ID))
+	}
+	api.membership = map[string]network.MembershipStatus{}
+	for _, id := range ids {
+		status := membershipStatus(id, 1, ids...)
+		status.ClusterID, status.WALIdentity = child.Status.Target, "target-wal-"+id
+		api.membership[id] = status
+	}
+	if err := c.startAndObserve(ctx, child, api.sts); err != nil {
+		t.Fatal(err)
+	}
+	if child.Status.Phase != "Complete" || len(child.Status.TargetIdentities) != len(voters) {
+		t.Fatalf("target did not complete: %+v", child.Status)
+	}
+	r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
+	state := validAutoControl()
+	state.StatefulSetUID, state.Voters = "sts-uid", nil
+	for _, id := range ids {
+		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(id), Pod: id})
+	}
+	r.Spec.VoterPods = state.Voters
+	observed := *state
+	observed.ActiveClusterID, observed.Identities = child.Status.Target, map[quepaxa.NodeID]FenceTarget{}
+	if obs, _, err := c.observeAutomatic(ctx, r, &observed, api.sts); err != nil || !obs.Known || obs.Voters != len(voters) || obs.Reachable != len(voters) {
+		t.Fatalf("observation of %d voters: %+v err=%v", len(voters), obs, err)
+	}
+	targets := make([]FenceTarget, 0, len(voters))
+	for _, id := range ids {
+		targets = append(targets, FenceTarget{NodeID: id, Pod: id})
+	}
+	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: "default", StatefulSet: r.Spec.StatefulSet, StatefulSetUID: state.StatefulSetUID, SourceClusterID: "source", OperationID: "recovery-1", Scope: ScopeGeneration, Targets: targets}
+	hash, err := requestHash(&request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Intent = &autoIntent{Request: request, RecoveryName: "recovery-1", RecoveryUID: "resource-uid", Durability: "before-ack", Proof: &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "proof-1", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+	child.Metadata["name"] = "recovery-1"
+	child.Spec.Container = "rhiza"
+	child.Spec.Fence.Evidence = state.Intent.Proof.ProofID
+	child.Status.SpecHash = immutableSpecHash(child.Spec)
+	state.Intent.SpecHash = hashJSON(child.Spec)
+	if err := bucket.Upload(ctx, "root/source/recovery/successor.json", bytes.NewReader(jsonBytes(c.reservation(child)))); err != nil {
+		t.Fatal(err)
+	}
+	c.Fencer = &countingFencer{count: new(int)}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recovery-1") {
+			json.NewEncoder(w).Encode(child)
+			return
+		}
+		if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {
+			json.NewEncoder(w).Encode(r)
+			return
+		}
+		api.serve(w, q)
+	}))
+	t.Cleanup(server.Close)
+	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
+	if err := c.saveAuto(ctx, r, state, nil); err != nil {
+		t.Fatal(err)
+	}
+	loaded, version, err := c.loadAuto(ctx, c.autoKey(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &automaticCompletion{ctx: ctx, child: child, api: api, c: c, r: r, state: loaded, version: version}
+}
+
+// A five-voter target that lost desired replicas is its own majority as soon as
+// three peers answer, but it must never be installed as the next generation.
+func TestAutomaticCompletionRejectsTargetReplicaShortfall(t *testing.T) {
+	s := completedAutomaticTarget(t, voterMembers(5))
+	asObject(s.api.sts["spec"])["replicas"] = float64(3)
+	s.api.membership = nil
+	if err := s.c.advanceAutomatic(s.ctx, s.r, s.state, s.version, s.api.sts); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := s.c.loadAuto(s.ctx, s.c.autoKey(s.r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "installed target StatefulSet has 3 desired replicas but the recovered generation has 5 voters"; next.Intent == nil || s.r.Status.Phase != "Blocked" || !strings.Contains(s.r.Status.Message, want) {
+		t.Fatalf("scaled-down target was installed: %+v status=%+v want=%q", next.Intent, s.r.Status, want)
+	}
+	if next.ActiveClusterID != "source" {
+		t.Fatalf("scaled-down target advanced the active generation: %s", next.ActiveClusterID)
+	}
+}
+
+// The automatic path must refuse a scaled-down target and an identity capture
+// that misses a configured voter.
+func TestAutomaticTargetRejectsIncompleteInventory(t *testing.T) {
+	voters := voterMembers(5)
+	ids := make([]string, 0, len(voters))
+	for _, member := range voters {
+		ids = append(ids, string(member.ID))
+	}
+	for _, tc := range []struct {
+		name    string
+		phase   string
+		scaled  bool
+		partial bool
+		want    string
+	}{
+		{name: "replica shortfall", phase: "Blocked", scaled: true, want: "target StatefulSet has 3 desired replicas but 5 target voters are frozen"},
+		{name: "identity capture shortfall", phase: "WaitingReady", partial: true, want: "target identity inventory covers 3 of 5 configured voters"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, child, api, c := automaticTargetFixture(t, "before-ack", voters)
+			authenticated := ids
+			if tc.partial {
+				authenticated = ids[:3]
+			}
+			api.membership = map[string]network.MembershipStatus{}
+			for _, id := range authenticated {
+				status := membershipStatus(id, 1, ids...)
+				status.ClusterID, status.WALIdentity = child.Status.Target, "target-wal-"+id
+				api.membership[id] = status
+			}
+			if tc.scaled {
+				asObject(api.sts["spec"])["replicas"] = float64(3)
+			}
+			if err := c.startAndObserve(ctx, child, api.sts); err != nil {
+				t.Fatal(err)
+			}
+			if child.Status.Phase != tc.phase || !strings.Contains(child.Status.Message, tc.want) {
+				t.Fatalf("status=%+v want %s containing %q", child.Status, tc.phase, tc.want)
 			}
 		})
 	}
@@ -249,7 +332,10 @@ func TestAutomaticVoterMajorityCompletion(t *testing.T) {
 
 func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	legacy := strings.HasPrefix(mode, "legacy completed child")
-	partial := strings.HasPrefix(mode, "failure before identity capture") || legacy
+	heldCapture := strings.HasPrefix(mode, "failure before identity capture")
+	// A durable record without every identity stays verifiable; the next incident
+	// must then fence the whole generation instead of one voter.
+	partialInventory := mode == "partial installed inventory" || legacy
 	twoFailures := mode == "two target failures after adoption"
 	targetMode := "before-ack"
 	if strings.HasSuffix(mode, " async") {
@@ -258,7 +344,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	ctx, bucket, child, api, c := automaticTargetFixture(t, targetMode, members())
 	api.membership = map[string]network.MembershipStatus{}
 	for _, id := range []string{"n1", "n2", "n3"} {
-		if partial && (id == "n3" || strings.HasSuffix(mode, " empty")) {
+		if heldCapture && (id == "n3" || strings.HasSuffix(mode, " empty")) {
 			continue
 		}
 		status := membershipStatus(id, 1, "n1", "n2", "n3")
@@ -280,6 +366,14 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	}
 	if err := c.startAndObserve(ctx, child, api.sts); err != nil {
 		t.Fatal(err)
+	}
+	if heldCapture {
+		// A capture that misses a configured voter must not install an incomplete
+		// identity inventory as the next generation's fencing authority.
+		if child.Status.Phase != "WaitingReady" || !strings.HasPrefix(child.Status.Message, "automatic target identities are not verified") {
+			t.Fatalf("incomplete identity capture installed a target: %+v", child.Status)
+		}
+		return
 	}
 	if strings.HasPrefix(mode, "capture ") {
 		if child.Status.Phase != "WaitingReady" || child.Status.TargetIdentities != nil {
@@ -352,6 +446,8 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		child.Metadata["uid"] = "recreated-child"
 	case "legacy completed child", "legacy completed child async":
 		child.Status.TargetIdentities = nil
+	case "partial installed inventory":
+		child.Status.TargetIdentities = child.Status.TargetIdentities[:2]
 	case "duplicate installed identity":
 		child.Status.TargetIdentities[2] = child.Status.TargetIdentities[0]
 	case "stale CAS":
@@ -377,7 +473,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mode != "target failure" && mode != "single target failure" && !twoFailures && !partial && mode != "stale CAS" {
+	if mode != "target failure" && mode != "single target failure" && !twoFailures && !partialInventory && mode != "stale CAS" {
 		if loaded.Intent == nil || loaded.ActiveClusterID != "source" || len(loaded.Completions) != 0 || r.Status.Phase != "Blocked" {
 			t.Fatalf("invalid completion changed durable authority: %+v status=%+v", loaded, r.Status)
 		}
@@ -393,16 +489,16 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		t.Fatal("installed outcome was not preserved independently of health")
 	}
 	wantKnown := 3
-	if partial {
+	if partialInventory && !legacy {
 		wantKnown = 2
 	}
-	if legacy || strings.HasSuffix(mode, " empty") {
+	if legacy {
 		wantKnown = 0
 	}
-	if len(loaded.Identities) != wantKnown || (!partial && (loaded.Identities["n3"].PodUID != "pod-n3" || loaded.Identities["n3"].WALIdentity != "target-wal-n3")) {
+	if len(loaded.Identities) != wantKnown || (!partialInventory && (loaded.Identities["n3"].PodUID != "pod-n3" || loaded.Identities["n3"].WALIdentity != "target-wal-n3")) {
 		t.Fatalf("installed target identities lost before next incident: %+v", loaded.Identities)
 	}
-	if mode == "single target failure" || twoFailures || partial {
+	if mode == "single target failure" || twoFailures || partialInventory {
 		r.Spec.Automatic = true
 		r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 		loaded.BindingHash = autoBinding(r)
@@ -453,15 +549,15 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if partial && targetMode == "async" {
+		if partialInventory && targetMode == "async" {
 			if next.Intent != nil || next.ActiveClusterID != child.Status.Target || r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "async source requires allowDataLoss") || fenced != 0 {
 				t.Fatalf("unknown incarnation bypassed async generation loss approval: %+v status=%+v", next, r.Status)
 			}
 			return
 		}
-		if partial || twoFailures {
+		if partialInventory || twoFailures {
 			wantIdentities := 3
-			if partial {
+			if partialInventory {
 				wantIdentities = 2
 			}
 			if next.Intent == nil || next.Intent.Failed != "" || next.Intent.Request.Scope != ScopeGeneration || next.Intent.Request.SourceClusterID != child.Status.Target || next.Intent.RecoveryName == "recovery-1" || len(next.Intent.Request.Targets) != 3 || next.Intent.Proof != nil || fenced != 0 || len(next.Identities) != wantIdentities {

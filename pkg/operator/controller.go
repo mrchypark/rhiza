@@ -499,6 +499,11 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if err != nil || env["RHIZA_CLUSTER_ID"] != r.Status.Target || env["RHIZA_OBJSTORE_DURABILITY"] != r.Spec.Durability || sourceFingerprint(r.Status.Target, r.Spec.Durability, actual, c.Prefix) != sourceFingerprint(r.Status.Target, r.Spec.Durability, members, c.Prefix) {
 		return c.record(ctx, r, "Blocked", "active target configuration changed")
 	}
+	// A target that lost desired replicas never completes: the frozen membership
+	// and the installed workload must stay one-for-one.
+	if replicas := int(number(nested(sts, "spec", "replicas"))); replicas != len(members) {
+		return c.record(ctx, r, "Blocked", fmt.Sprintf("target StatefulSet has %d desired replicas but %d target voters are frozen", replicas, len(members)))
+	}
 	peers, err := c.probe(ctx, r, sts)
 	if err != nil {
 		return err

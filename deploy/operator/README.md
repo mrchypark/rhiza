@@ -131,8 +131,14 @@ a message naming both numbers instead of recovering. The minimum is three. Even
 counts are supported, because QuePaxa requires only a strict majority of the
 configured membership for quorum and completion. The count cannot be changed in
 place: use a new generation or change one voter at a time through
-reconfiguration. Generation fencing carries at most 16 targets including
-retained learner history, so keep the voter count comfortably below that bound.
+reconfiguration. Generation fencing must name every voter plus the retained
+learner history, and `RhizaFence.spec.targets` admits 16 of them. Automatic
+recovery blocks before reserving or starting a fence whose scope exceeds that
+bound, naming both numbers, so keep the voter count comfortably below sixteen.
+A recovery is declared `Complete` only when the target StatefulSet declares
+exactly that many desired replicas and every configured voter's identity was
+authenticated first; a scaled-down target stays `Blocked` or `WaitingReady`
+instead of becoming the next generation.
 
 Local qualification used an isolated kind cluster and MinIO: two lost Pods
 reported a missing quorum without automatic replacement; after runtime-confirmed

@@ -227,6 +227,8 @@ peer의 Ready/Quorum과 상태 메시지를 확인한다.
 `RHIZA_AUTOMATIC_RECOVERY=true`, `RHIZA_FENCER_BACKEND=kubernetes`로 켜며 모든 voter의
 opt-in이 필요하다. 각 voter 프로세스에 `RHIZA_ENABLE_RECONFIGURATION=true`를 명시적으로 설정한다.
 `RhizaCluster.spec.voterPods`에 모든 voter를 `nodeID`·`pod`로 나열하며, 항목 수가 voter 수다.
+전체 세대 fencing은 voter와 보존된 learner 이력을 합쳐 16개 대상까지만 예약할 수 있으므로
+voter 수를 그보다 넉넉히 낮게 유지한다.
 executor는 외부의 신뢰된 주체이고, learner는 애플리케이션 image와
 command를 복제하며, 새 `RHIZA_*` 환경은 재시작 때 읽힌다.
 
