@@ -1,9 +1,11 @@
 name: Application image
 
 # Publishes a digest-pinned release application image from the repository
-# Dockerfile, which contains both /usr/local/bin/rhiza and
-# /usr/local/bin/rhiza-fencer. Only an immutable tag is pushed: sha-<commit>.
-# Dispatch this workflow against the exact release commit.
+# Dockerfile, which installs /usr/local/bin/rhiza and /usr/local/bin/rhiza-fencer.
+# This is the supervised workload for the voterCount GCS/Chaos harness; it is not
+# the e2e/chaos qualification host, which serves the older rhiza-entrypoint flow.
+# Only the immutable tag sha-<commit> is pushed, and an existing tag is never
+# retargeted. Dispatch this workflow against the exact release commit.
 on:
   workflow_dispatch:
     inputs:
@@ -28,9 +30,15 @@ jobs:
         with:
           ref: ${{ inputs.source_sha || github.sha }}
           fetch-depth: 0
-      - name: Resolve the immutable source commit
+      - name: Resolve the immutable commit and tag
         id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          {
+            sha=$(git rev-parse HEAD)
+            echo "sha=$sha"
+            echo "tag=sha-$sha"
+            echo "image=ghcr.io/$GITHUB_REPOSITORY_OWNER/rhiza:sha-$sha"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
         with:
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
@@ -39,6 +47,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to retarget an existing immutable tag
+        run: |
+          if docker manifest inspect "${{ steps.source.outputs.image }}" >/dev/null 2>&1; then
+            echo "::error::${{ steps.source.outputs.image }} already exists; immutable tags are never retargeted" >&2
+            exit 1
+          fi
       - uses: docker/build-push-action@v6
         id: build
         with:
@@ -46,15 +60,26 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/rhiza:sha-${{ steps.source.outputs.sha }}
+          tags: ${{ steps.source.outputs.image }}
           provenance: true
           sbom: true
+      - name: Require anonymous pull access for the harness cluster
+        run: |
+          # The GCS/Chaos harness sets no imagePullSecrets, so the package must be
+          # publicly pullable. GHCR can create a package private on first publish;
+          # this makes that provisioning step explicit and enforced.
+          owner="${{ github.repository_owner }}"
+          token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:$owner/rhiza:pull" | jq -r .token)
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$owner/rhiza/manifests/${{ steps.source.outputs.tag }}")
+          if [ "$code" != "200" ]; then
+            echo "::error::ghcr.io/$owner/rhiza is not anonymously pullable (HTTP $code). Set the package visibility to public once, then re-run." >&2
+            exit 1
+          fi
       - name: Record the immutable digest
         run: |
           {
             # shellcheck disable=SC2016 # Markdown backticks are literal output.
-            printf 'Application image: `ghcr.io/%s/rhiza:sha-%s`\n\n' "$GITHUB_REPOSITORY_OWNER" "${{ steps.source.outputs.sha }}"
+            printf 'Application image: `%s`\n\n' "${{ steps.source.outputs.image }}"
             # shellcheck disable=SC2016 # Markdown backticks are literal output.
             printf 'Digest: `%s`\n' "${{ steps.build.outputs.digest }}"
           } >> "$GITHUB_STEP_SUMMARY"
-
