@@ -1,6 +1,7 @@
 package operator_test
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
@@ -100,5 +101,62 @@ func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 	targets, _ := spec["targets"].(map[string]any)
 	if targets["maxItems"] != 64 {
 		t.Fatalf("fence targets maxItems=%v, want 64", targets["maxItems"])
+	}
+}
+
+// The controller deletes the learner-credential Secrets it created
+// (retireLearnerCredential) and the Pods it created. A Role that omits either
+// verb makes learner retirement fail with HTTP 403 at runtime, so the release
+// Role must cover every write the operator actually issues.
+func TestOperatorRoleCoversControllerWrites(t *testing.T) {
+	required := map[string][]string{
+		"pods":                   {"get", "list", "create", "delete"},
+		"secrets":                {"get", "create", "delete"},
+		"configmaps":             {"get"},
+		"services":               {"get", "create"},
+		"statefulsets":           {"get", "update"},
+		"rhizaclusters":          {"get", "list"},
+		"rhizaclusters/status":   {"get", "update"},
+		"rhizafences":            {"get", "create"},
+		"rhizarecoveries":        {"get", "list", "create", "update"},
+		"rhizarecoveries/status": {"get", "update"},
+	}
+	data, err := os.ReadFile("rbac.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants := map[string]map[string]bool{}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "Role" {
+			continue
+		}
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta["name"] != "rhiza-operator" {
+			continue
+		}
+		for _, raw := range doc["rules"].([]any) {
+			rule, _ := raw.(map[string]any)
+			for _, res := range rule["resources"].([]any) {
+				name, _ := res.(string)
+				if grants[name] == nil {
+					grants[name] = map[string]bool{}
+				}
+				for _, verb := range rule["verbs"].([]any) {
+					grants[name][verb.(string)] = true
+				}
+			}
+		}
+	}
+	for resource, verbs := range required {
+		for _, verb := range verbs {
+			if !grants[resource][verb] {
+				t.Errorf("operator Role must grant %q on %q", verb, resource)
+			}
+		}
 	}
 }
