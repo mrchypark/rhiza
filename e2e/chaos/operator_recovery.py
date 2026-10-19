@@ -15,6 +15,18 @@ import urllib.request
 from operator_fixture import resources, learner_resources
 
 
+def parse_json_documents(raw):
+    """Parse kubectl's consecutive JSON document output."""
+    documents = []
+    decoder = json.JSONDecoder()
+    while raw.strip():
+        raw = raw.lstrip()
+        document, end = decoder.raw_decode(raw)
+        documents.append(document)
+        raw = raw[end:]
+    return documents
+
+
 class Chaos:
     def __init__(self, args):
         self.args = args
@@ -226,11 +238,7 @@ class Chaos:
         self.k("wait", "--for=condition=Established", "crd/rhizarecoveries.rhiza.mrchypark.dev", "--timeout=60s")
         self.apply({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": self.ns}})
         raw = self.command(["kubectl", "--context", self.context, "create", "--dry-run=client", "-f", str(root / "deploy/operator/rbac.yaml"), "-o", "json"])
-        rbac = []
-        while raw.strip():
-            obj, end = json.JSONDecoder().raw_decode(raw.lstrip())
-            rbac.append(obj)
-            raw = raw.lstrip()[end:]
+        rbac = parse_json_documents(raw)
         for obj in rbac:
             obj["metadata"]["namespace"] = self.ns
             for subject in obj.get("subjects", []):

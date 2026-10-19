@@ -19,6 +19,7 @@ from pathlib import Path
 import yaml
 
 import votercount_gcs_chaos as harness
+from operator_recovery import parse_json_documents
 
 HERE = Path(__file__).resolve().parent
 NS = "rhiza-chaos-abc12345"
@@ -406,6 +407,39 @@ class InspectorIsolationTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             chaos.isolation_mode()
 
+    def test_capture_probe_pods_keeps_each_multi_document_receipt(self):
+        chaos = stub()
+        chaos.args = harness.build_parser().parse_args(ScenarioSplitTest.ARGV)
+        chaos.context = "kind-test"
+        probe = """\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-inspector
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-inspector-control
+"""
+        documents = list(yaml.safe_load_all(probe))
+        for document, uid in zip(documents, ("inspector-uid", "control-uid")):
+            document["metadata"]["uid"] = uid
+        with tempfile.TemporaryDirectory() as output:
+            chaos.out = Path(output)
+            chaos.command = mock.Mock(return_value="\n".join(json.dumps(document) for document in documents))
+            chaos.wait = mock.Mock(return_value=True)
+
+            receipts = chaos.capture_probe_pods()
+
+            self.assertEqual(receipts, {document["metadata"]["name"]: document for document in documents})
+            self.assertEqual(chaos.command.call_args.args[0][-5:],
+                             ["create", "-f", chaos.args.inspector_probe, "-o", "json"])
+            self.assertEqual(chaos.wait.call_count, 2)
+            for document in documents:
+                name = document["metadata"]["name"]
+                self.assertEqual(json.loads((chaos.out / (name + "-created.json")).read_text()), document)
+
     def test_exclusion_records_a_scoped_receipt_without_probing(self):
         chaos = self.stub()
         chaos.args.inspector_network_isolation = "exclude-user-approved"
@@ -525,6 +559,12 @@ class InspectorIsolationTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     harness.parse_https_443(bad)
+
+
+class JsonDocumentParsingTest(unittest.TestCase):
+    def test_parse_json_documents_splits_kubectl_multi_document_output(self):
+        documents = [{"metadata": {"name": "first"}}, {"metadata": {"name": "second"}}]
+        self.assertEqual(parse_json_documents("\n".join(json.dumps(document) for document in documents)), documents)
 
 
 class LauncherDigestTest(unittest.TestCase):
