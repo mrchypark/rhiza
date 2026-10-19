@@ -15,7 +15,7 @@ rules:
     verbs: [get, list, create, delete]
   - apiGroups: [""]
     resources: [secrets]
-    verbs: [get, create]
+    verbs: [get, create, delete]
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get]
