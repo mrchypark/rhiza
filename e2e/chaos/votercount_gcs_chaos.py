@@ -6,9 +6,12 @@ events) and adds Chaos Mesh CRs, fence matching bound to the fault operation,
 completed-recovery waits, a real writer and admission proof.
 
 Claims stay separate and are never merged:
-  (i)  positive: cooperative online replacement, generation recovery and the
-       approved paired NetworkPolicy isolation (the deny-all inspector is
-       denied, its derived control Pod is reachable);
+  (i)  positive: cooperative online replacement, generation recovery and a
+       same-node paired isolation probe (the canonical deny-all keeps its shape
+       and UID, is the sole namespace NetworkPolicy at both recorded boundaries,
+       and denied the inspector's API egress while the derived control stayed
+       reachable before and after) - a single-node observation, never a claim
+       that the policy is the exclusive cause;
   (ii) fail-safe: dead-Pod execution blocking while termination evidence is
        unresolved (unqualified observations, never PASS).
 
@@ -504,8 +507,11 @@ class VoterCountChaos(Chaos):
             self.cleanup_errors.append("inspector probe release: %s" % exc)
 
     def verify_inspector_network_isolation(self):
-        """Positive-claim gate: the deny-all policy, not the Pod shape, denies the
-        inspector. Reachable control, denied inspector, reachable control again."""
+        """Positive-claim gate: reachable control, denied inspector, reachable control
+        again, on one shared node, with the canonical deny-all the sole namespace
+        NetworkPolicy at both recorded boundaries. A node-local, label-specific or
+        Pod-IP-specific CNI or host dataplane rule could also explain the denial and
+        is not excluded; the inventories are boundary snapshots, not a lock."""
         if self.isolation_mode() == "exclude-user-approved":
             receipt = "EXCLUDED inspector-network-isolation: user-approved"
             (self.out / "inspector-network-isolation.txt").write_text(receipt + "\n")
@@ -702,8 +708,15 @@ class VoterCountChaos(Chaos):
     def run(self):
         scenarios = self.args.scenarios
         self.event("start", run_id=self.run_id, scenarios=scenarios,
-                   claim_positive="cooperative online replacement, generation recovery "
-                                  "and approved NetworkPolicy isolation",
+                   claim_positive="cooperative online replacement, generation recovery and a "
+                                  "same-node paired isolation probe: the canonical deny-all keeps "
+                                  "its shape and UID, is the sole namespace NetworkPolicy at both "
+                                  "recorded boundaries, and denied the inspector's API egress "
+                                  "while the derived control stayed reachable before and after. "
+                                  "Single-node observation only; no physical-host, multi-node-"
+                                  "partition or performance claim, enforcement outside namespaced "
+                                  "NetworkPolicy unobserved, and the policy is not asserted as the "
+                                  "exclusive cause.",
                    claim_failsafe=("dead-Pod execution blocked while termination evidence is unresolved"
                                    if scenarios in ("dead-pod", "all") else "not_run"))
         self.prove_admission()

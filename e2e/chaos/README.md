@@ -128,13 +128,26 @@ restart, online replacement, generation recovery). The driver deletes the
 run-owned cluster-scoped objects during cleanup and fails the run if any remain.
 
 The positive set also gates on the bootstrap-owned `rhiza-inspector-deny-all`
-NetworkPolicy: the driver creates the paired `rhiza-inspector` and
-`rhiza-inspector-control` Pods just-in-time, requires both to share one node,
-requires the deny-all to be the namespace's only NetworkPolicy before and after
-probing, requires the control to reach the Kubernetes API, requires the
-inspector to be denied, and requires a failing probe to fail the run. The
-namespace quota therefore has to admit seven Pods (three voters, operator,
-authority, and the two probe Pods) while the probe runs.
+NetworkPolicy. The driver creates the paired `rhiza-inspector` and
+`rhiza-inspector-control` Pods just-in-time, pins both to one shared node,
+releases them again, and fails the run on a failing or inconclusive probe. What
+it records is bounded: a same-node paired probe in which the canonical deny-all
+has the expected shape and UID, is the sole NetworkPolicy in the namespace at
+both recorded boundaries (before and after probing), and in which the
+inspector's Kubernetes API egress was denied while the derived control stayed
+reachable before and after. The namespace quota therefore has to admit seven
+Pods (three voters, operator, authority, and the two probe Pods) while the probe
+runs.
+
+What that does not claim: the deny-all is not asserted to be the exclusive
+possible cause of the denial, since a node-local, label-specific or
+Pod-IP-specific CNI or host dataplane rule could also explain it, and the two
+policy inventories are boundary snapshots rather than a lock over the probe
+interval. This is single-node qualification only: no physical-host,
+multi-node-partition or performance claim follows from it, cluster-level or
+node-local enforcement outside namespaced `NetworkPolicy` remains unobserved,
+and the dead-Pod failure modes stay unqualified until Part 2 runs after the
+production fencing executor lands.
 
 The harness is split behind `--scenarios` (launcher: `RHIZA_SCENARIOS`):
 
