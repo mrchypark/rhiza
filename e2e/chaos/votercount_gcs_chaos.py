@@ -86,7 +86,8 @@ class VoterCountChaos(Chaos):
         self.writer = None
         self.row_seq = 0
         self.cleanup_errors = []
-        self.admin = args.admin_token or os.environ.get("RHIZA_QUALIFICATION_ADMIN_TOKEN", "")
+        self.admin = Path(args.admin_token_file).read_text().strip()
+        assert len(self.admin) >= 32, "admin credential file is empty or invalid"
         self.cluster_scoped = [("%s-fencer-tokenreview" % args.namespace, "clusterrolebinding"),
                                ("%s-fencer-tokenreview" % args.namespace, "clusterrole")]
         self.declared = {"namespace": args.namespace, "run_id": args.run_id,
@@ -564,9 +565,11 @@ class VoterCountChaos(Chaos):
             "selector": self.voter_selector(VOTERS[0])})
         self.chaos_injected("PodChaos", "vc-intact-wal", 1)
         self.wait_chaos("PodChaos", "vc-intact-wal", "AllRecovered", 150)
-        after = self.wait("voter ready again", lambda: self.pod_identity(VOTERS[0]), 240)
+        after = self.wait("voter ready again", lambda: self.pod_identity(VOTERS[0])
+                          if self.ready(VOTERS[0]) else None, 240)
         assert after["pod_uid"] == ident["pod_uid"], "container-kill replaced the Pod"
-        assert after["wal_identity"] == ident["wal_identity"], "WAL identity drifted"
+        assert (after["wal_identity"], after["config_id"]) == (ident["wal_identity"], ident["config_id"]), \
+            "WAL or configuration identity drifted"
         self.assert_no_new_child(before)
         assert not self.fence_for(ident), "container-kill must not request a fence"
         self.delete_chaos("PodChaos", "vc-intact-wal")
@@ -785,7 +788,7 @@ def build_parser():
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--app-image", required=True)
     parser.add_argument("--operator-image", required=True)
-    parser.add_argument("--admin-token", default="")
+    parser.add_argument("--admin-token-file", required=True)
     parser.add_argument("--output", default="votercount-gcs-chaos-results")
     parser.add_argument("--scenarios", default="positive", choices=("positive", "dead-pod", "all"))
     parser.add_argument("--inspector-probe", required=True,

@@ -8,6 +8,7 @@ VoterCountChaos.prove_admission(): a token search over policy text cannot
 evaluate CEL.
 """
 import json
+import io
 import os
 import subprocess
 import tempfile
@@ -32,6 +33,7 @@ def render(path, **values):
 
 RUN = dict(NAMESPACE=NS, RUN_ID="abc12345", CLUSTER_ID="abc12345-cluster",
            GCS_BUCKET="bucket", GCS_PREFIX="rhiza/abc12345/",
+           POD_GSA="data@example.iam.gserviceaccount.com",
            OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:aa",
            HOST_IMAGE="ghcr.io/mrchypark/rhiza-application@sha256:bb")
 
@@ -56,6 +58,20 @@ class RunManifestTest(unittest.TestCase):
         env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
         self.assertEqual((env["RHIZA_AUTOMATIC_RECOVERY"], env["RHIZA_FENCER_BACKEND"]),
                          ("true", "kubernetes"))
+
+    def test_operator_uses_the_bootstrap_workload_identity(self):
+        docs = self.docs()
+        dep = next(d for d in docs if d["kind"] == "Deployment"
+                   and d["metadata"]["name"] == "rhiza-operator")
+        pod = dep["spec"]["template"]["spec"]
+        self.assertEqual(pod["serviceAccountName"], "rhiza-operator")
+        binding = next(d for d in docs if d["kind"] == "RoleBinding"
+                       and d["metadata"]["name"] == "rhiza-operator")
+        self.assertEqual(binding["subjects"], [{"kind": "ServiceAccount", "name": "rhiza-operator",
+                                                "namespace": NS}])
+        ksa = next(d for d in docs if d["kind"] == "ServiceAccount"
+                   and d["metadata"]["name"] == "rhiza-operator")
+        self.assertEqual(ksa["metadata"]["annotations"]["iam.gke.io/gcp-service-account"], RUN["POD_GSA"])
 
     def test_tokenreview_binding_is_run_named(self):
         crb = next(d for d in self.docs() if d["kind"] == "ClusterRoleBinding"
@@ -146,6 +162,18 @@ class AdmissionPolicyTest(unittest.TestCase):
         self.assertEqual(len(correlated), 1)
         self.assertIn("rhiza-voter-0", correlated[0])
 
+    def test_runtime_role_can_observe_the_qualification_resources(self):
+        text = (HERE / "gcs-postrelease-auth.yaml.in").read_text()
+        for token, value in (("@NAMESPACE@", NS), ("@RUN_ID@", "abc12345"),
+                             ("@RUNTIME_KIND@", "ServiceAccount"), ("@RUNTIME_NAME@", "runtime"),
+                             ("@RUNTIME_API_GROUP@", ""), ("@RUNTIME_NAMESPACE@", "    namespace: " + NS)):
+            text = text.replace(token, value)
+        role = next(d for d in yaml.safe_load_all(text)
+                    if d and d.get("kind") == "Role" and d["metadata"]["name"] == "rhiza-ci-runtime")
+        self.assertIn({"apiGroups": ["rhiza.mrchypark.dev"],
+                       "resources": ["rhizaclusters", "rhizafences", "rhizarecoveries"],
+                       "verbs": ["get", "list", "watch"]}, role["rules"])
+
 
 def stub():
     chaos = object.__new__(harness.VoterCountChaos)
@@ -167,6 +195,24 @@ TARGET = {"nodeID": "rhiza-voter-2", "pod": "rhiza-voter-2", "podUID": "uid-2", 
 
 
 class FailSafeTest(unittest.TestCase):
+    def test_intact_wal_waits_ready_and_preserves_config(self):
+        chaos = stub()
+        ident = {"node_id": "rhiza-voter-0", "pod_uid": "u0", "wal_identity": "w0", "config_id": "c0"}
+        identities = iter([ident, dict(ident, config_id="c1")])
+        chaos.recovery_uids = lambda: set()
+        chaos.pod_identity = lambda name: next(identities)
+        chaos.ready = lambda name: True
+        chaos.create_chaos = lambda *a, **k: None
+        chaos.chaos_injected = lambda *a, **k: True
+        chaos.wait_chaos = lambda *a, **k: True
+        chaos.wait = lambda label, pred, timeout=0: pred()
+        chaos.assert_no_new_child = lambda before: True
+        chaos.fence_for = lambda ident: []
+        chaos.delete_chaos = lambda *a, **k: None
+        chaos.readback = lambda *a, **k: None
+        with self.assertRaisesRegex(AssertionError, "configuration identity drifted"):
+            chaos.scenario_intact_wal_restart()
+
     def test_fence_for_requires_all_four_identity_fields(self):
         chaos = stub()
         chaos._fences = [
@@ -251,10 +297,18 @@ def dead_pod_stub(same_uid=False):
 class ScenarioSplitTest(unittest.TestCase):
     ARGV = ["--context", "c", "--namespace", "n", "--run-id", "r",
             "--app-image", "a@sha256:" + "a" * 64, "--operator-image", "o@sha256:" + "b" * 64,
-            "--inspector-probe", "inspector-probe.yaml"]
+            "--admin-token-file", "admin-token", "--inspector-probe", "inspector-probe.yaml"]
 
     def test_default_arguments_are_positive(self):
         self.assertEqual(harness.build_parser().parse_args(self.ARGV).scenarios, "positive")
+
+    def test_admin_credential_file_is_mandatory(self):
+        args = self.ARGV.copy()
+        index = args.index("--admin-token-file")
+        del args[index:index + 2]
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                harness.build_parser().parse_args(args)
 
     def test_default_run_neither_validates_nor_clears_part2_state(self):
         chaos = object.__new__(harness.VoterCountChaos)
@@ -478,6 +532,7 @@ class LauncherDigestTest(unittest.TestCase):
 
     BASE = dict(RHIZA_RUN_ID="abc12345", RHIZA_NAMESPACE="ns", RHIZA_KUBE_CONTEXT="ctx",
                 RHIZA_GCS_BUCKET="b", RHIZA_GCS_PREFIX="p/", RHIZA_CLUSTER_ID="cid",
+                RHIZA_GCP_PROJECT_ID="project", RHIZA_DATA_GSA_ID="data-gsa",
                 RHIZA_OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:" + "f" * 64)
 
     def run_launcher(self, app_image):
@@ -496,6 +551,20 @@ class LauncherDigestTest(unittest.TestCase):
     def test_non_hex_digest_is_rejected(self):
         result = self.run_launcher("repo@sha256:" + "g" * 64)
         self.assertEqual(result.returncode, 2, result.stderr[-200:])
+
+    def test_launcher_has_strict_shell_syntax(self):
+        result = subprocess.run(["sh", "-n", str(HERE / "run-votercount-gcs-chaos.sh")],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_runtime_phase_requires_the_privileged_install_credential(self):
+        output = tempfile.mkdtemp()
+        env = dict(os.environ, **self.BASE, RHIZA_OUT=output,
+                   RHIZA_APP_IMAGE="repo@sha256:" + "a" * 64)
+        result = subprocess.run(["sh", str(HERE / "run-votercount-gcs-chaos.sh"), "run"],
+                                env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing privileged-install credential", result.stderr)
 
 
 if __name__ == "__main__":

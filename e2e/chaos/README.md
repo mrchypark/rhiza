@@ -119,13 +119,26 @@ directory, adopt colliding resources, or rerun after an unknown outcome.
 `run-votercount-gcs-chaos.sh` is the launcher for the v0.19.5 voterCount operator
 path. It is a second, run-owned path that shares the bootstrap above: run
 `bootstrap-gcs-postrelease.sh apply-local` first so the namespace, the `rhiza-gcs`
-workload-identity KSA, the quota and the admission policies exist, then run the
-launcher. It renders and applies `votercount_gcs_chaos.yaml.in` (supervised
-bootstrap StatefulSet, operator, cooperative authority, run-named TokenReview
-ClusterRole/Binding), then runs `votercount_gcs_chaos.py`, which proves the
-admission shapes by server-side dry-run, runs the positive scenarios (intact-WAL
-restart, online replacement, generation recovery). The driver deletes the
-run-owned cluster-scoped objects during cleanup and fails the run if any remain.
+and `rhiza-operator` workload-identity bindings, the quota and the admission
+policies exist. Then use the launcher's two phases with one fresh `RHIZA_OUT`
+directory:
+
+- `install` with the administrator kubeconfig. It applies the repository CRDs,
+  generates a one-day self-signed `rhiza-fencer-tls` Secret and matching
+  `rhiza-fencer-ca` ConfigMap, applies `votercount_gcs_chaos.yaml.in`, and
+  captures the operator-generated bootstrap admin credential as a mode-0600
+  `admin-token` file for the runtime phase.
+- `run` with the scoped runtime kubeconfig. It runs
+  `votercount_gcs_chaos.py`, which proves the admission shapes by server-side
+  dry-run and runs the positive scenarios (intact-WAL restart, online
+  replacement, generation recovery). It removes the admin-token file after the
+  driver exits.
+
+The privileged objects (CRDs, ServiceAccounts, Roles, RoleBindings,
+Deployments, ClusterRole/ClusterRoleBinding and `RhizaCluster`) belong to the
+administrator phase; the bootstrap runtime Role is intentionally not widened to
+create them. The driver deletes the run-owned cluster-scoped objects during
+cleanup and fails the run if any remain.
 
 The positive set also gates on the bootstrap-owned `rhiza-inspector-deny-all`
 NetworkPolicy. The driver creates the paired `rhiza-inspector` and
@@ -160,9 +173,8 @@ The harness is split behind `--scenarios` (launcher: `RHIZA_SCENARIOS`):
 - `all`: both sets.
 
 Both images must be digest-pinned (`name@sha256:<digest>`); the launcher rejects a
-tag-only reference. `rhiza-fencer-tls` and `rhiza-fencer-ca` must exist in the
-namespace before the run; the launcher only applies the manifest set and waits for
-the authority rollout.
+tag-only reference. The `install` phase creates `rhiza-fencer-tls` and
+`rhiza-fencer-ca` in the run namespace before the authority and voters start.
 
 Local direct execution uses IPv4 loopback port forwards. `RHIZA_LOCAL_PORT_BASE`
 is optional and defaults to `18080`; when set it must be a canonical decimal

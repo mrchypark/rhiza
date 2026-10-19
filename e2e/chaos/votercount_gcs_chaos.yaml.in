@@ -1,6 +1,6 @@
 # Rendered only after e2e/chaos/bootstrap-gcs-postrelease.sh has applied the
-# namespace, rhiza-gcs KSA, quota and the four admission policies. This set adds
-# the voterCount operator path: one HTTP bind (RHIZA_BIND_ADDR port must equal
+# namespace, rhiza-gcs KSA, operator GSA binding, quota and the four admission
+# policies. This set adds the voterCount operator path: one HTTP bind (RHIZA_BIND_ADDR port must equal
 # spec.httpPort), a supervised bootstrap StatefulSet that exports no
 # RHIZA_CLUSTER_MEMBERS, the operator, and the real cooperative fencing authority.
 apiVersion: v1
@@ -141,10 +141,6 @@ spec:
   automatic: true
   policy: {failureGraceSeconds: 30, cooldownSeconds: 60, maxRecoveriesPerDay: 10, allowDataLoss: false}
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata: {name: rhiza-operator, namespace: __NAMESPACE__}
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata: {name: rhiza-operator, namespace: __NAMESPACE__}
@@ -159,6 +155,15 @@ rules:
   - {apiGroups: [apps], resources: [statefulsets], verbs: [get, update]}
   - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizarecoveries], verbs: [get, list, create, update]}
   - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizarecoveries/status], verbs: [get, update]}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-operator
+  namespace: __NAMESPACE__
+  annotations:
+    iam.gke.io/gcp-service-account: __POD_GSA__
+    iam.gke.io/return-principal-id-as-email: "true"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
