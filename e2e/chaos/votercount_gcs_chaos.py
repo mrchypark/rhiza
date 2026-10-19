@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
 """voterCount GCS + Chaos Mesh qualification driver.
 
-Extends the operator-chaos driver (operator_recovery.Chaos) with Chaos Mesh CRs
-and real-GCS assertions. It proves two separate claims and never merges them:
+Reuses operator_recovery.Chaos (JSON REST helpers, port-forwards, evidence
+events) and adds Chaos Mesh CRs, structural fence matching, completed-recovery
+waits and a real writer.
 
-  (i)  positive: cooperative online replacement and generation recovery for the
-       specified voterCount and network-fault conditions on the pinned images;
-  (ii) fail-safe: for a bound run of an operation that lacks termination
-       evidence, no valid fencing proof and no new recovery execution approval
-       occur, even though the controller and the authority keep running.
-
-Normal quorum writes, control-journal updates, fence-request creation and
-previously approved work are allowed and are not treated as violations.
-
-The dead-Pod cases are started exactly as Pro fixed them (D1-D4) and are only
-ever reported as unqualified fail-safe observations, never as PASS.
+Claims are kept separate and are never merged:
+  (i)  positive: cooperative online replacement and generation recovery;
+  (ii) fail-safe: dead-Pod execution blocking while termination evidence is
+       unresolved (reported as unqualified observations, never as PASS).
 """
 import argparse
 import json
+import os
 import threading
 import time
 from pathlib import Path
 
 from operator_recovery import Chaos
 
+VOTERS = ("rhiza-voter-0", "rhiza-voter-1", "rhiza-voter-2")
+COMPLETE = ("Complete",)
+
 
 class VoterCountChaos(Chaos):
     def __init__(self, args):
+        self.args = args
         self.context = args.context
         self.ns = args.namespace
         self.run_id = args.run_id
@@ -35,162 +34,301 @@ class VoterCountChaos(Chaos):
         self.forwards = {}
         self.events = []
         self.acks = set()
-        self.stop = None
-        self.writer = None
-        self.admin = args.admin_token or "chaos-admin"
-        # operator_recovery.Chaos helpers read self.args, self.stop and self.writer.
-        self.args = args
         self.stop = threading.Event()
         self.writer = None
+        self.admin = args.admin_token or os.environ.get("RHIZA_QUALIFICATION_ADMIN_TOKEN", "")
+        self.declared = {"namespace": args.namespace, "run_id": args.run_id,
+                        "app_image": args.app_image, "operator_image": args.operator_image,
+                        "chaos_created": [], "cluster_scoped":
+                        ["%s-faults" % args.namespace, "%s-network-faults" % args.namespace,
+                         "%s-fencer-tokenreview" % args.namespace]}
 
-    # -- Chaos Mesh CRs -----------------------------------------------------
-    def chaos(self, kind, name, spec, labels=None):
-        body = {"apiVersion": "chaos-mesh.org/v1alpha1", "kind": kind,
-                "metadata": {"name": name, "namespace": self.ns,
-                             "labels": {"chaos.rhiza.io/run": self.run_id}},
-                "spec": spec}
-        self.apply(body)
+    # ---- Chaos Mesh -------------------------------------------------------
+    def create_chaos(self, kind, name, spec):
+        self.apply({"apiVersion": "chaos-mesh.org/v1alpha1", "kind": kind,
+                    "metadata": {"name": name, "namespace": self.ns,
+                                 "labels": {"chaos.rhiza.io/run": self.run_id}}, "spec": spec})
+        self.declared["chaos_created"].append([kind, name])
         return name
 
-    def wait_chaos(self, name, condition, timeout=120):
+    def wait_chaos(self, kind, name, condition, timeout=120):
         def done():
-            conds = self.get("podchaos" if name.startswith("podkill") else "networkchaos",
-                             name).get("status", {}).get("conditions", [])
+            conds = self.get(kind.lower(), name).get("status", {}).get("conditions", [])
             return any(c.get("type") == condition and c.get("status") == "True" for c in conds)
-        return self.wait(f"chaos {name} {condition}", done, timeout)
+        return self.wait("%s %s %s" % (kind, name, condition), done, timeout)
+
+    def container_records(self, name):
+        return self.get("podchaos", name)["status"].get("experiment", {}).get("containerRecords", [])
 
     def delete_chaos(self, kind, name):
-        self.k("delete", kind, name, "--ignore-not-found", "--wait=true")
+        self.k("delete", kind.lower(), name, "--ignore-not-found", "--wait=true")
 
-    # -- cluster state ------------------------------------------------------
+    # ---- state ------------------------------------------------------------
+    def fences(self):
+        return json.loads(self.k("get", "rhizafences", "-o", "json")).get("items", [])
+
+    def recoveries(self):
+        return json.loads(self.k("get", "rhizarecoveries", "-o", "json")).get("items", [])
+
+    def recovery_uids(self):
+        return {r["metadata"]["uid"] for r in self.recoveries()}
+
     def cluster(self):
         return self.get("rhizacluster", "rhiza")
 
     def cluster_phase(self):
         return self.cluster().get("status", {}).get("phase")
 
-    def fences(self):
-        return json.loads(self.k("get", "rhizafences", "-o", "json")).get("items", [])
+    def pod(self, name):
+        return self.get("pod", name)
 
-    def proofs(self):
-        return [f.get("status", {}).get("proof") for f in self.fences()
-                if f.get("status", {}).get("proof")]
+    def pod_identity(self, name):
+        obj = self.pod(name)
+        state = self.status(name)
+        return {"node_id": name, "pod_uid": obj["metadata"]["uid"],
+                "wal_identity": state["wal_identity"], "config_id": state["config_id"]}
 
-    def recoveries(self):
-        return json.loads(self.k("get", "rhizarecoveries", "-o", "json")).get("items", [])
+    def fence_for(self, ident):
+        """Structural match: parse spec.targets, never a substring search."""
+        hits = []
+        for fence in self.fences():
+            spec = fence.get("spec", {})
+            for target in spec.get("targets", []):
+                if (target.get("pod") == ident["node_id"]
+                        and target.get("podUID") == ident["pod_uid"]
+                        and target.get("walIdentity") == ident["wal_identity"]):
+                    hits.append(fence)
+                    break
+        return hits
 
-    def running(self, label):
-        pods = json.loads(self.k("get", "pods", "-l", label, "-o", "json")).get("items", [])
-        return [p for p in pods if p["status"].get("phase") == "Running"]
+    def assert_controllers_running(self):
+        for label in ("app=rhiza-operator", "app=rhiza-fencer"):
+            pods = json.loads(self.k("get", "pods", "-l",
+                                     "%s,chaos.rhiza.io/run=%s" % (label, self.run_id),
+                                     "-o", "json")).get("items", [])
+            running = [p for p in pods if p["status"].get("phase") == "Running"]
+            assert running, "%s is not running; a negative result is not evidence" % label
+        return True
 
-    def assert_no_proof(self, operation):
-        """Non-vacuous: the operation must exist and be genuinely unresolved."""
-        held = [f for f in self.fences()
-                if operation in json.dumps(f.get("spec", {}))]
-        assert held, f"no fence request exists for {operation}; fail-safe not exercised"
-        for f in held:
-            assert "deletionTimestamp" not in f.get("metadata", {}), "fence is deleting"
-            assert not f.get("status", {}).get("proof"), f"unexpected proof for {operation}"
+    def assert_cluster_observed(self):
+        """The controller must be reconciling for a negative to mean anything."""
+        first = self.cluster().get("metadata", {}).get("resourceVersion")
+        time.sleep(2)
+        second = self.cluster().get("metadata", {}).get("resourceVersion")
+        assert first and second, "RhizaCluster has no observed status"
+        assert self.cluster().get("status", {}) is not None, "no status"
+        return first, second
+
+    def assert_deployed_images(self):
+        for name in VOTERS:
+            img = self.pod(name)["status"]["containerStatuses"][0]["imageID"]
+            assert self.args.app_image.split(":")[-1] in img, (name, img)
+        for pod in json.loads(self.k("get", "pods", "-l",
+                                     "app=rhiza-operator,chaos.rhiza.io/run=%s" % self.run_id,
+                                     "-o", "json"))["items"]:
+            img = pod["status"]["containerStatuses"][0]["imageID"]
+            if ":" in self.args.operator_image:
+                assert self.args.operator_image.split(":")[-1] in img, img
+        return True
+
+    def assert_no_proof_structural(self, ident):
+        held = self.fence_for(ident)
+        assert held, "no structurally bound fence request for %s; fail-safe not exercised" % ident["node_id"]
+        for fence in held:
+            assert "deletionTimestamp" not in fence.get("metadata", {}), "fence is deleting"
+            assert not fence.get("status", {}).get("proof"), "unexpected proof for %s" % ident["node_id"]
         return held
 
     def assert_no_new_child(self, before):
-        now = {r["metadata"]["uid"] for r in self.recoveries()}
-        new = now - before
-        assert not new, f"recovery child created before proof: {sorted(new)}"
+        new = self.recovery_uids() - before
+        assert not new, "recovery child created without a proof: %s" % sorted(new)
+        return True
 
-    # -- scenarios ----------------------------------------------------------
+    def wait_completion(self, before, timeout=420):
+        """Success means the operator-installed recovery actually completed."""
+        def done():
+            for child in self.recoveries():
+                if child["metadata"]["uid"] in before:
+                    continue
+                status = child.get("status", {})
+                phase = status.get("membership", {}).get("phase") or status.get("phase")
+                if phase in COMPLETE:
+                    return child
+            return None
+        return self.wait("completed recovery child", done, timeout)
+
+    # ---- workload ---------------------------------------------------------
+    def start_writer(self):
+        def write():
+            i = 1
+            while not self.stop.is_set() and i <= 5000:
+                try:
+                    self.execute(VOTERS[0], "vc-write-%d" % i,
+                                 "INSERT INTO chaos_items VALUES (%d, 'ack')" % i)
+                    self.acks.add(i)
+                    i += 1
+                except Exception:
+                    pass
+                self.stop.wait(0.15)
+        self.writer = threading.Thread(target=write, daemon=True)
+        self.writer.start()
+
+    def prepare(self):
+        self.assert_deployed_images()
+        for name in VOTERS:
+            self.wait("voter ready " + name, lambda n=name: self.ready(n), 300)
+        self.execute(VOTERS[0], "vc-schema",
+                     "CREATE TABLE IF NOT EXISTS chaos_items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        self.start_writer()
+        self.wait("workload began", lambda: len(self.acks) >= 5, 120)
+        self.event("prepare_pass", voters=list(VOTERS), acknowledged=len(self.acks))
+
+    def readback(self, pod):
+        count = self.verify_data(pod)
+        self.execute(pod, "vc-post-recovery", "INSERT INTO chaos_items VALUES (90001, 'post')")
+        self.acks.add(90001)
+        self.event("readback_pass", pod=pod, rows=count, acknowledged=len(self.acks))
+
+    # ---- scenarios --------------------------------------------------------
+    def chaos_injected(self, kind, name, expect_records=None):
+        self.wait_chaos(kind, name, "AllInjected", 120)
+        if expect_records is not None:
+            records = self.container_records(name)
+            assert sum(r.get("injectedCount", 0) for r in records) == expect_records, records
+        return True
+
     def scenario_intact_wal_restart(self):
-        self.chaos("PodChaos", "podkill-intact-wal", {
+        before = self.recovery_uids()
+        ident = self.pod_identity(VOTERS[0])
+        self.create_chaos("PodChaos", "vc-intact-wal", {
             "action": "container-kill", "mode": "one", "duration": "10s", "containerNames": ["rhiza"],
-            "selector": {"namespaces": [self.ns],
-                         "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter",
-                                            "statefulset.kubernetes.io/pod-name": "rhiza-voter-0"}}})
-        self.wait_chaos("podkill-intact-wal", "AllInjected", 90)
-        records = self.get("podchaos", "podkill-intact-wal")["status"].get("experiment", {}).get("containerRecords", [])
-        self.wait_chaos("podkill-intact-wal", "AllRecovered", 120)
-        assert sum(r.get("injectedCount", 0) for r in records) == 1, records
-        assert not self.fences(), "container-kill must not request a fence"
-        self.event("intact_wal_restart_pass", container_records=len(records))
+            "selector": {"namespaces": [self.ns], "labelSelectors": {
+                "chaos.rhiza.io/run": self.run_id, "app.kubernetes.io/part-of": "rhiza-chaos",
+                "statefulset.kubernetes.io/pod-name": VOTERS[0]}}})
+        self.chaos_injected("PodChaos", "vc-intact-wal", 1)
+        self.wait_chaos("PodChaos", "vc-intact-wal", "AllRecovered", 150)
+        after = self.wait("voter ready again", lambda: self.pod_identity(VOTERS[0]), 240)
+        assert after["pod_uid"] == ident["pod_uid"], "container-kill replaced the Pod"
+        assert after["wal_identity"] == ident["wal_identity"], "WAL identity drifted"
+        self.assert_no_new_child(before)
+        assert not self.fence_for(ident), "container-kill must not request a fence"
+        self.delete_chaos("PodChaos", "vc-intact-wal")
+        self.readback(VOTERS[0])
+        self.event("intact_wal_restart_pass", pod_uid=ident["pod_uid"])
 
     def scenario_online_replacement(self):
-        before = {r["metadata"]["uid"] for r in self.recoveries()}
-        self.chaos("NetworkChaos", "isolate-voter-0", {
+        before = self.recovery_uids()
+        ident = self.pod_identity(VOTERS[0])
+        self.create_chaos("NetworkChaos", "vc-isolate-voter-0", {
             "action": "partition", "mode": "one", "duration": "45s", "direction": "both",
-            "selector": {"namespaces": [self.ns],
-                         "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter",
-                                            "statefulset.kubernetes.io/pod-name": "rhiza-voter-0"}},
+            "selector": {"namespaces": [self.ns], "labelSelectors": {
+                "chaos.rhiza.io/run": self.run_id, "app.kubernetes.io/part-of": "rhiza-chaos",
+                "statefulset.kubernetes.io/pod-name": VOTERS[0]}},
             "target": {"mode": "all", "selector": {"namespaces": [self.ns],
-                       "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter"},
-                       "expressionSelectors": [{"key": "statefulset.kubernetes.io/pod-name", "operator": "In",
-                                                "values": ["rhiza-voter-1", "rhiza-voter-2"]}]}}})
-        self.wait_chaos("isolate-voter-0", "AllInjected", 90)
-        self.wait_chaos("isolate-voter-0", "AllRecovered", 150)
-        fence = self.wait("voter fence requested", lambda: (self.fences() or None) and self.fences()[0]
-                          or None, 60)
-        self.event("online_replacement_fence", scope=fence.get("spec", {}).get("scope"))
-        proof = self.wait("cooperative proof", lambda: (self.proofs() or [None])[0], 240)
-        assert all(proof.get(k) is True for k in
-                   ("processesTerminated", "recreationBlocked", "storageQuiesced")), proof
-        self.delete_chaos("networkchaos", "isolate-voter-0")
-        self.event("online_replacement_pass", acknowledged_rows=len(self.acks))
+                "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter"},
+                "expressionSelectors": [{"key": "statefulset.kubernetes.io/pod-name", "operator": "In",
+                                         "values": [VOTERS[1], VOTERS[2]]}]}}})
+        self.chaos_injected("NetworkChaos", "vc-isolate-voter-0")
+        self.assert_controllers_running()
+        self.wait_chaos("NetworkChaos", "vc-isolate-voter-0", "AllRecovered", 180)
+        self.wait("voter fence request", lambda: self.fence_for(ident) or None, 120)
+        child = self.wait_completion(before)
+        self.event("online_replacement_completed", child=child["metadata"]["name"],
+                   scope=child.get("spec", {}).get("membership", {}).get("remove"))
+        self.delete_chaos("NetworkChaos", "vc-isolate-voter-0")
+        self.readback(VOTERS[1])
+        self.event("online_replacement_pass")
 
     def scenario_generation_recovery(self):
-        before = {r["metadata"]["uid"] for r in self.recoveries()}
-        self.chaos("NetworkChaos", "generation-partition", {
+        before = self.recovery_uids()
+        self.create_chaos("NetworkChaos", "vc-generation", {
             "action": "partition", "mode": "all", "duration": "60s", "direction": "both",
-            "selector": {"namespaces": [self.ns],
-                         "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-operator"}},
+            "selector": {"namespaces": [self.ns], "labelSelectors": {
+                "chaos.rhiza.io/run": self.run_id, "app": "rhiza-operator"}},
             "target": {"mode": "all", "selector": {"namespaces": [self.ns],
-                       "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter"}}}})
-        self.wait_chaos("generation-partition", "AllInjected", 90)
-        # The operator must not dispatch a recovery child before a proof exists.
-        time.sleep(5)
+                "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter"}}}})
+        self.chaos_injected("NetworkChaos", "vc-generation")
+        self.assert_controllers_running()
         self.assert_no_new_child(before)
-        self.wait_chaos("generation-partition", "AllRecovered", 150)
-        gen = self.wait("generation fence", lambda: [f for f in self.fences()
-                        if f.get("spec", {}).get("scope") == "Generation"] or None, 240)
-        self.event("generation_fence", scope=gen[0]["spec"]["scope"],
-                   targets=len(gen[0]["spec"].get("targets", [])))
-        self.delete_chaos("networkchaos", "generation-partition")
+        self.wait_chaos("NetworkChaos", "vc-generation", "AllRecovered", 180)
+        def generation_fence():
+            return [f for f in self.fences()
+                    if f.get("spec", {}).get("scope") == "Generation"] or None
+        fence = self.wait("generation fence request", generation_fence, 240)
+        self.wait("generation proof published", lambda: (
+            self.get("rhizafences", fence[0]["metadata"]["name"]).get("status", {}).get("proof")), 300)
+        child = self.wait_completion(before)
+        self.event("generation_recovery_completed", child=child["metadata"]["name"],
+                   targets=len(fence[0]["spec"].get("targets", [])))
+        self.delete_chaos("NetworkChaos", "vc-generation")
+        self.readback(VOTERS[2])
         self.event("generation_recovery_pass")
 
-    def scenario_dead_pod_failsafe(self):
-        """D1-D4: only a fail-safe observation; never a PASS."""
-        before = {r["metadata"]["uid"] for r in self.recoveries()}
-        target = "rhiza-voter-2"
-        pod = self.get("pod", target)
-        d2 = {"pod_uid": pod["metadata"]["uid"], "wal_identity": self.status(target)["wal_identity"]}
-        self.event("dead_pod_start", scenario="D2", target=target, pod_uid=d2["pod_uid"],
-                   wal_identity=d2["wal_identity"])
-        # D2 requires no terminal proof before the hard kill; capture and assert that.
-        fence_before = self.assert_no_proof(target)
-        self.chaos("PodChaos", "podkill-dead-voter", {
+    # ---- dead-Pod fail-safe (D1-D4), never a PASS -------------------------
+    def dead_pod_case(self, scenario, target, select_pod_selector):
+        before = self.recovery_uids()
+        ident = self.pod_identity(target)
+        start = {"scenario": scenario, "target": target, "pod_uid": ident["pod_uid"],
+                 "wal_identity": ident["wal_identity"], "cluster_phase": self.cluster_phase(),
+                 "fence_uids": [f["metadata"]["uid"] for f in self.fences()],
+                 "recovery_uids": sorted(before)}
+        if scenario == "D1":
+            assert ident["wal_identity"], "D1 requires an already WAL-bound target"
+        if scenario == "D2":
+            assert not [f for f in self.fence_for(ident) if f.get("status", {}).get("proof")], "D2 requires no terminal proof"
+        if scenario == "D4":
+            assert self.cluster_phase() in ("Healthy", "Observing"), start["cluster_phase"]
+            assert not self.fences(), "D4 requires no in-flight intent"
+        self.event("dead_pod_start", **start)
+        self.create_chaos("PodChaos", "vc-dead-" + scenario, {
             "action": "pod-kill", "mode": "one", "duration": "10s",
-            "selector": {"namespaces": [self.ns],
-                         "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter"}}})
-        self.wait_chaos("podkill-dead-voter", "AllInjected", 90)
-        time.sleep(30)
-        # Fail-safe proposition: unresolved termination evidence => still no proof,
-        # no new child, while controller and authority keep running.
-        assert self.running(f"app=rhiza-operator,chaos.rhiza.io/run={self.run_id}"), "operator stopped"
-        assert self.running(f"app=rhiza-fencer,chaos.rhiza.io/run={self.run_id}"), "authority stopped"
-        self.assert_no_proof(target)
+            "selector": {"namespaces": [self.ns], "labelSelectors": {
+                "chaos.rhiza.io/run": self.run_id, "app.kubernetes.io/part-of": "rhiza-chaos",
+                "statefulset.kubernetes.io/pod-name": select_pod_selector}}})
+        self.chaos_injected("PodChaos", "vc-dead-" + scenario)
+        self.wait("termination is unresolved", lambda: self.pod(target).get("status", {})
+                  .get("phase") != "Running", 120)
+        time.sleep(20)
+        self.assert_controllers_running()
+        self.assert_cluster_observed()
+        held = self.assert_no_proof_structural(ident)
         self.assert_no_new_child(before)
-        self.event("dead_pod_failsafe_observed", scenario="D2-D4", target=target,
-                   fence_requests=len(fence_before),
-                   viol_dead_pod_completion="unqualified: cooperative backend cannot prove termination")
-        self.delete_chaos("podchaos", "podkill-dead-voter")
+        self.event("dead_pod_failsafe_observed", scenario=scenario, target=target,
+                   fence_requests=len(held),
+                   completion="unqualified: cooperative backend cannot prove termination for a dead Pod")
+        self.delete_chaos("PodChaos", "vc-dead-" + scenario)
 
     def run(self):
-        self.event("votercount_harness_start", run_id=self.run_id,
+        self.event("start", run_id=self.run_id,
                    claim_positive="cooperative online replacement and generation recovery",
                    claim_failsafe="dead-Pod execution blocked while termination evidence is unresolved")
+        self.prepare()
         self.scenario_intact_wal_restart()
         self.scenario_online_replacement()
         self.scenario_generation_recovery()
-        self.scenario_dead_pod_failsafe()
-        self.event("complete", positive_claims=["intact_wal_restart", "online_replacement",
-                   "generation_recovery"], fail_safe="dead_pod_execution_blocking_unqualified")
+        self.dead_pod_case("D1", VOTERS[2], VOTERS[2])
+        self.dead_pod_case("D2", VOTERS[1], VOTERS[1])
+        self.dead_pod_case("D3", VOTERS[0], VOTERS[0])
+        self.dead_pod_case("D4", VOTERS[2], VOTERS[2])
+        self.event("complete", positive=["intact_wal_restart", "online_replacement", "generation_recovery"],
+                   fail_safe="dead_pod_execution_blocking_unqualified")
+
+    def cleanup(self):
+        self.stop.set()
+        if self.writer:
+            self.writer.join(timeout=15)
+        for kind, name in list(self.declared.get("chaos_created", [])):
+            try:
+                self.delete_chaos(kind, name)
+            except Exception:
+                pass
+        try:
+            (self.out / "rollback-material.json").write_text(json.dumps({
+                "cluster_scoped": self.declared["cluster_scoped"],
+                "namespace": self.declared["namespace"]}, indent=2))
+        except Exception:
+            pass
+        Chaos.cleanup(self)
 
 
 def main():

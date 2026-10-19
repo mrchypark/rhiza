@@ -83,7 +83,8 @@ spec:
         has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 3 &&
         'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
         'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
-        'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors && variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] == 'rhiza-voter-0' &&
+        'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors &&
+        variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] in ['rhiza-voter-0', 'rhiza-voter-1', 'rhiza-voter-2'] &&
         !has(variables.selector.pods) &&
         !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
         !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
@@ -98,11 +99,14 @@ spec:
         has(object.spec.duration) && object.spec.duration == '10s' &&
         has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
       message: Only voter-0 and a fixed ten-second duration are admitted.
+    # Both admitted shapes: the intact-WAL container-kill and the dead-Pod
+    # fail-safe pod-kill. Neither may name a remote cluster or a grace period.
     - expression: >-
-        object.spec.action == 'container-kill' &&
-        has(object.spec.containerNames) && object.spec.containerNames == ['rhiza'] &&
-        !has(object.spec.remoteCluster) && !has(object.spec.gracePeriod)
-      message: PodChaos permits only bounded container-kill of the rhiza peer container.
+        !has(object.spec.remoteCluster) && !has(object.spec.gracePeriod) && (
+          (object.spec.action == 'container-kill' &&
+           has(object.spec.containerNames) && object.spec.containerNames == ['rhiza']) ||
+          (object.spec.action == 'pod-kill' && !has(object.spec.containerNames)))
+      message: PodChaos permits only bounded container-kill or pod-kill of this run's voters.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -138,16 +142,25 @@ spec:
   variables:
     - name: selector
       expression: object.spec.selector
+    # Either the single isolated voter or the run's operator Pod, never a
+    # Pod-name/expression selector, never a node or cluster external target.
     - name: sourceSafe
       expression: >-
         has(variables.selector.namespaces) && variables.selector.namespaces == ['@NAMESPACE@'] &&
-        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 3 &&
-        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
-        'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors && variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] == 'rhiza-voter-0' &&
         !has(variables.selector.pods) && !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
         !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
-        !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors)
+        !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors) &&
+        has(variables.selector.labelSelectors) &&
+        ((
+          size(variables.selector.labelSelectors) == 3 &&
+          'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+          'app.kubernetes.io/part-of' in variables.selector.labelSelectors && variables.selector.labelSelectors['app.kubernetes.io/part-of'] == 'rhiza-chaos' &&
+          'statefulset.kubernetes.io/pod-name' in variables.selector.labelSelectors && variables.selector.labelSelectors['statefulset.kubernetes.io/pod-name'] == 'rhiza-voter-0'
+        ) || (
+          size(variables.selector.labelSelectors) == 2 &&
+          'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
+          'app' in variables.selector.labelSelectors && variables.selector.labelSelectors['app'] == 'rhiza-operator'
+        ))
   validations:
     - expression: >-
         object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
@@ -155,9 +168,9 @@ spec:
         variables.sourceSafe
       message: Fault metadata and source selector must select only this run's peer Pods.
     - expression: >-
-        has(object.spec.duration) && object.spec.duration == '45s' &&
-        has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
-      message: Only voter-0 and a fixed diagnostic-safe duration are admitted.
+        has(object.spec.duration) && object.spec.duration in ['45s', '60s'] &&
+        has(object.spec.mode) && object.spec.mode in ['one', 'all'] && !has(object.spec.value)
+      message: Only the bounded voter-isolation and whole-generation windows are admitted.
     - expression: >-
         object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
         !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
@@ -173,13 +186,14 @@ spec:
         !has(object.spec.target.selector.pods) &&
         !has(object.spec.target.selector.nodes) && !has(object.spec.target.selector.nodeSelectors) &&
         !has(object.spec.target.selector.annotationSelectors) &&
-        has(object.spec.target.selector.expressionSelectors) && size(object.spec.target.selector.expressionSelectors) == 1 &&
-        object.spec.target.selector.expressionSelectors[0].key == 'statefulset.kubernetes.io/pod-name' &&
-        object.spec.target.selector.expressionSelectors[0].operator == 'In' &&
-        size(object.spec.target.selector.expressionSelectors[0].values) == 2 &&
-        'rhiza-voter-1' in object.spec.target.selector.expressionSelectors[0].values &&
-        'rhiza-voter-2' in object.spec.target.selector.expressionSelectors[0].values &&
-        !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors)
+        !has(object.spec.target.selector.fieldSelectors) && !has(object.spec.target.selector.podPhaseSelectors) &&
+        (!has(object.spec.target.selector.expressionSelectors) ||
+         (has(object.spec.target.selector.expressionSelectors) && size(object.spec.target.selector.expressionSelectors) == 1 &&
+          object.spec.target.selector.expressionSelectors[0].key == 'statefulset.kubernetes.io/pod-name' &&
+          object.spec.target.selector.expressionSelectors[0].operator == 'In' &&
+          size(object.spec.target.selector.expressionSelectors[0].values) == 2 &&
+          'rhiza-voter-1' in object.spec.target.selector.expressionSelectors[0].values &&
+          'rhiza-voter-2' in object.spec.target.selector.expressionSelectors[0].values))
       message: NetworkChaos permits only voter-0 partition against this run's voters, never external targets.
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -317,127 +331,3 @@ roleRef:
   kind: ClusterRole
   apiGroup: rbac.authorization.k8s.io
   name: @NAMESPACE@-reader
----
-# Whole-generation DR: the operator loses contact with every voter while the
-# voters keep their own quorum, so a Generation-scope fence is requested after
-# the failure grace. The source is pinned to this run's operator Pod and the
-# target to this run's voters; no Pod name or external target is admitted.
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
-metadata:
-  name: @NAMESPACE@-generation-faults
-  annotations:
-    rhiza.dev/auth-owner: '@OWNER@'
-spec:
-  failurePolicy: Fail
-  matchConstraints:
-    resourceRules:
-      - apiGroups: ['chaos-mesh.org']
-        apiVersions: ['v1alpha1']
-        operations: ['CREATE', 'UPDATE']
-        resources: ['networkchaos']
-        scope: Namespaced
-  variables:
-    - name: selector
-      expression: object.spec.selector
-    - name: target
-      expression: object.spec.target.selector
-  validations:
-    - expression: >-
-        object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
-        'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        has(variables.selector.namespaces) && variables.selector.namespaces == ['@NAMESPACE@'] &&
-        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 2 &&
-        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        'app' in variables.selector.labelSelectors && variables.selector.labelSelectors['app'] == 'rhiza-operator' &&
-        !has(variables.selector.pods) && !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
-        !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
-        !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors)
-      message: Generation fault source must be this run's operator Pod only.
-    - expression: >-
-        has(object.spec.duration) && object.spec.duration == '60s' &&
-        has(object.spec.mode) && object.spec.mode == 'all' && !has(object.spec.value)
-      message: Whole-generation partition is bounded to sixty seconds.
-    - expression: >-
-        object.spec.action == 'partition' && has(object.spec.direction) && object.spec.direction == 'both' &&
-        !has(object.spec.externalTargets) && !has(object.spec.device) && !has(object.spec.delay) &&
-        !has(object.spec.loss) && !has(object.spec.duplicate) && !has(object.spec.corrupt) &&
-        !has(object.spec.bandwidth) && !has(object.spec.rate) && !has(object.spec.remoteCluster) &&
-        !has(object.spec.targetDevice) && has(object.spec.target.mode) && object.spec.target.mode == 'all' &&
-        !has(object.spec.target.value) && has(variables.target.namespaces) && variables.target.namespaces == ['@NAMESPACE@'] &&
-        has(variables.target.labelSelectors) && size(variables.target.labelSelectors) == 2 &&
-        'chaos.rhiza.io/run' in variables.target.labelSelectors && variables.target.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        'app' in variables.target.labelSelectors && variables.target.labelSelectors['app'] == 'rhiza-voter' &&
-        !has(variables.target.pods) && !has(variables.target.nodes) && !has(variables.target.nodeSelectors) &&
-        !has(variables.target.annotationSelectors) && !has(variables.target.expressionSelectors) &&
-        !has(variables.target.fieldSelectors) && !has(variables.target.podPhaseSelectors)
-      message: Generation fault targets only this run's voters, never external targets.
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: @NAMESPACE@-generation-faults
-  annotations:
-    rhiza.dev/auth-owner: '@OWNER@'
-spec:
-  policyName: @NAMESPACE@-generation-faults
-  validationActions: [Deny]
-  matchResources:
-    namespaceSelector:
-      matchLabels:
-        kubernetes.io/metadata.name: @NAMESPACE@
----
-# Dead-Pod fail-safe: a pod-kill of a voter is admitted only as a bounded
-# negative test. v0.19.5 must keep the fence pending and never fabricate a
-# proof, so this shape is never a PASS.
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
-metadata:
-  name: @NAMESPACE@-podkill-faults
-  annotations:
-    rhiza.dev/auth-owner: '@OWNER@'
-spec:
-  failurePolicy: Fail
-  matchConstraints:
-    resourceRules:
-      - apiGroups: ['chaos-mesh.org']
-        apiVersions: ['v1alpha1']
-        operations: ['CREATE', 'UPDATE']
-        resources: ['podchaos']
-        scope: Namespaced
-  variables:
-    - name: selector
-      expression: object.spec.selector
-  validations:
-    - expression: >-
-        object.metadata.namespace == '@NAMESPACE@' && has(object.metadata.labels) &&
-        'chaos.rhiza.io/run' in object.metadata.labels && object.metadata.labels['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        has(variables.selector.namespaces) && variables.selector.namespaces == ['@NAMESPACE@'] &&
-        has(variables.selector.labelSelectors) && size(variables.selector.labelSelectors) == 2 &&
-        'chaos.rhiza.io/run' in variables.selector.labelSelectors && variables.selector.labelSelectors['chaos.rhiza.io/run'] == '@RUN_ID@' &&
-        'app' in variables.selector.labelSelectors && variables.selector.labelSelectors['app'] == 'rhiza-voter' &&
-        !has(variables.selector.pods) && !has(variables.selector.nodes) && !has(variables.selector.nodeSelectors) &&
-        !has(variables.selector.annotationSelectors) && !has(variables.selector.expressionSelectors) &&
-        !has(variables.selector.fieldSelectors) && !has(variables.selector.podPhaseSelectors)
-      message: Pod-kill negative test may only select this run's voters.
-    - expression: >-
-        has(object.spec.duration) && object.spec.duration == '10s' &&
-        has(object.spec.mode) && object.spec.mode == 'one' && !has(object.spec.value)
-      message: Pod-kill negative test is bounded to one Pod and ten seconds.
-    - expression: >-
-        object.spec.action == 'pod-kill' && !has(object.spec.remoteCluster) && !has(object.spec.gracePeriod)
-      message: PodChaos permits only bounded pod-kill.
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata:
-  name: @NAMESPACE@-podkill-faults
-  annotations:
-    rhiza.dev/auth-owner: '@OWNER@'
-spec:
-  policyName: @NAMESPACE@-podkill-faults
-  validationActions: [Deny]
-  matchResources:
-    namespaceSelector:
-      matchLabels:
-        kubernetes.io/metadata.name: @NAMESPACE@

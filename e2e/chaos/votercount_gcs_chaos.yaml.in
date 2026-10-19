@@ -63,6 +63,7 @@ spec:
     metadata:
       labels:
         app: 'rhiza-voter'
+        app.kubernetes.io/part-of: 'rhiza-chaos'
         chaos.rhiza.io/run: '__RUN_ID__'
       annotations:
         rhiza.mrchypark.dev/cooperative-fencing: "1"
