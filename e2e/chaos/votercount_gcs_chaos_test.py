@@ -197,6 +197,36 @@ def dead_pod_stub(same_uid=False):
     return chaos
 
 
+class ScenarioSplitTest(unittest.TestCase):
+    def test_default_is_positive_and_dead_pod_is_deferred(self):
+        parser = harness.main.__globals__["argparse"]
+        import sys as _sys
+        old = _sys.argv
+        _sys.argv = ["votercount_gcs_chaos.py", "--context", "c", "--namespace", "n", "--run-id", "r",
+                     "--app-image", "a@sha256:x", "--operator-image", "o@sha256:y"]
+        try:
+            args = None
+            for action in []:
+                pass
+            chaos = object.__new__(harness.VoterCountChaos)
+            chaos.args = type("A", (), {"scenarios": "positive"})()
+            chaos.run_id = "r"
+            chaos.events = []
+            chaos.event = lambda name, **f: chaos.events.append({"event": name, **f})
+            chaos.prove_admission = lambda: True
+            chaos.prepare = lambda: True
+            chaos.run_positive = lambda: chaos.events.append({"event": "positive"})
+            chaos.run_dead_pod = lambda: chaos.events.append({"event": "dead-pod"})
+            chaos.run()
+            names = [e["event"] for e in chaos.events]
+            self.assertIn("positive", names)
+            self.assertNotIn("dead-pod", names)
+            complete = next(e for e in chaos.events if e["event"] == "complete")
+            self.assertEqual(complete["fail_safe"], "not_run")
+        finally:
+            _sys.argv = old
+
+
 class DeadPodTest(unittest.TestCase):
     def test_dead_pod_case_never_reports_pass(self):
         chaos = dead_pod_stub()

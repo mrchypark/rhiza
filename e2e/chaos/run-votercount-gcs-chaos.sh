@@ -72,5 +72,6 @@ step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \
   --run-id "$RHIZA_RUN_ID" \
   --app-image "$RHIZA_APP_IMAGE" \
   --operator-image "$RHIZA_OPERATOR_IMAGE" \
+  --scenarios "${RHIZA_SCENARIOS:-positive}" \
   --output "$out"
 echo "voterCount GCS/Chaos qualification launcher completed"

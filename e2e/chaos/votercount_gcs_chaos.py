@@ -372,7 +372,10 @@ class VoterCountChaos(Chaos):
         self.readback(VOTERS[2], "generation")
         self.event("generation_recovery_pass")
 
-    # ---- dead-Pod fail-safe (D1-D4), never a PASS -------------------------
+    # ---- Part 2 (DEFERRED): dead-Pod fail-safe D1-D4, never a PASS --------
+    # Deferred until the production fencing executor project lands: the
+    # cooperative backend cannot prove termination for a dead Pod, so these are
+    # unqualified observations and are not part of the default positive run.
     def dead_pod_case(self, scenario, target):
         before = self.recovery_uids()
         pre = self.fence_uids()
@@ -434,7 +437,19 @@ class VoterCountChaos(Chaos):
                    completion="unqualified: cooperative backend cannot prove termination for a dead Pod")
         self.delete_chaos("PodChaos", "vc-dead-" + scenario)
 
+    def assert_bootstrap(self):
+        """Part 1: the bootstrap opt-in must have derived the voterCount voters."""
+        cluster = self.cluster()["spec"]
+        sts = self.get("statefulset", "rhiza-voter")["spec"]
+        assert sts["replicas"] == cluster["voterCount"] == 3, (sts["replicas"], cluster["voterCount"])
+        env = sts["template"]["spec"]["containers"][0].get("env", [])
+        members = [e for e in env if e.get("name") == "RHIZA_CLUSTER_MEMBERS"]
+        assert members and "secretKeyRef" in members[0].get("valueFrom", {}), \
+            "operator did not install the derived membership on the bootstrap path"
+        self.event("bootstrap_opt_in_pass", replicas=sts["replicas"], voter_count=cluster["voterCount"])
+
     def run_positive(self):
+        self.assert_bootstrap()
         self.scenario_intact_wal_restart()
         self.scenario_online_replacement()
         self.scenario_generation_recovery()
@@ -447,15 +462,24 @@ class VoterCountChaos(Chaos):
             self.dead_pod_case(scenario, target)
 
     def run(self):
-        self.event("start", run_id=self.run_id,
+        scenarios = self.args.scenarios
+        self.event("start", run_id=self.run_id, scenarios=scenarios,
                    claim_positive="cooperative online replacement and generation recovery",
                    claim_failsafe="dead-Pod execution blocked while termination evidence is unresolved")
         self.prove_admission()
         self.prepare()
-        self.run_positive()
-        self.run_dead_pod()
-        self.event("complete", positive=["intact_wal_restart", "online_replacement", "generation_recovery"],
-                   fail_safe="dead_pod_execution_blocking_unqualified")
+        if scenarios in ("positive", "all"):
+            self.run_positive()
+        if scenarios in ("dead-pod", "all"):
+            # DEFERRED: Part 2 runs only after the production fencing executor
+            # lands (separate implementation project). Until then the dead-Pod
+            # claim is unqualified and this set is never executed by default.
+            self.run_dead_pod()
+        self.event("complete", scenarios=scenarios,
+                   positive=["intact_wal_restart", "online_replacement", "generation_recovery"]
+                   if scenarios in ("positive", "all") else [],
+                   fail_safe=("dead_pod_execution_blocking_unqualified"
+                              if scenarios in ("dead-pod", "all") else "not_run"))
 
     # ---- cleanup ----------------------------------------------------------
     def delete_cluster_scoped(self):
@@ -509,6 +533,7 @@ def main():
     parser.add_argument("--operator-image", required=True)
     parser.add_argument("--admin-token", default="")
     parser.add_argument("--output", default="votercount-gcs-chaos-results")
+    parser.add_argument("--scenarios", default="positive", choices=("positive", "dead-pod", "all"))
     chaos = VoterCountChaos(parser.parse_args())
     status = 0
     try:

@@ -124,9 +124,18 @@ launcher. It renders and applies `votercount_gcs_chaos.yaml.in` (supervised
 bootstrap StatefulSet, operator, cooperative authority, run-named TokenReview
 ClusterRole/Binding), then runs `votercount_gcs_chaos.py`, which proves the
 admission shapes by server-side dry-run, runs the positive scenarios (intact-WAL
-restart, online replacement, generation recovery) and then the dead-Pod fail-safe
-cases D1-D4. The driver deletes the run-owned cluster-scoped objects during
-cleanup and fails the run if any remain.
+restart, online replacement, generation recovery). The driver deletes the
+run-owned cluster-scoped objects during cleanup and fails the run if any remain.
+
+The harness is split behind `--scenarios` (launcher: `RHIZA_SCENARIOS`):
+
+- `positive` (default): bootstrap opt-in and adoption, `voterCount == replicas`,
+  intact-WAL restart, online replacement and generation recovery. This is the set
+  that supports the "cooperative recovery on real GCS" claim.
+- `dead-pod` (DEFERRED): D1-D4. Not executed by default; they run only after the
+  production fencing executor lands (separate implementation project), so the
+  dead-Pod claim is unqualified until then.
+- `all`: both sets.
 
 Both images must be digest-pinned (`name@sha256:<digest>`); the launcher rejects a
 tag-only reference. `rhiza-fencer-tls` and `rhiza-fencer-ca` must exist in the
