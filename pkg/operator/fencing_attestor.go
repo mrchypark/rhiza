@@ -136,20 +136,25 @@ type independentScope struct {
 	storage        AttestationStoreScope
 }
 
-// buildIndependentScope refuses to describe an incarnation that was never
-// captured. Missing container, image, WAL or run coverage stays pending instead
-// of being guessed from a Pod name.
-func buildIndependentScope(state fenceLedger, request FenceRequest, requestHash, ledgerHash string, current []string, storage AttestationStoreScope) (independentScope, error) {
+// buildIndependentScope bounds the exact runs this operation closed: the named
+// voter slots for a voter fence, every run for a generation fence. It refuses to
+// describe an incarnation that was never captured, so missing container, image
+// or run coverage stays pending instead of being guessed from a Pod name.
+func buildIndependentScope(state fenceLedger, request FenceRequest, nodes []string, requestHash, ledgerHash string, current []string, storage AttestationStoreScope) (independentScope, error) {
 	scope := independentScope{request: request, requestHash: requestHash, ledgerHash: ledgerHash, currentPodUIDs: append([]string(nil), current...), targets: append([]FenceTarget(nil), request.Targets...), storage: storage}
-	if len(state.Ledger.Runs) == 0 {
-		return scope, fmt.Errorf("fencing: closed ledger has no runs")
-	}
 	for _, target := range scope.targets {
 		if target.NodeName == "" || target.ContainerID == "" || target.ImageID == "" || target.PodUID == "" {
 			return scope, fmt.Errorf("fencing: target %q has no captured runtime identity", target.NodeID)
 		}
 	}
+	wanted := map[string]bool{}
+	for _, node := range nodes {
+		wanted[node] = true
+	}
 	for runID, run := range state.Ledger.Runs {
+		if len(wanted) > 0 && !wanted[run.Identity.NodeID] {
+			continue
+		}
 		covered := false
 		for _, target := range scope.targets {
 			if target.NodeID == run.Identity.NodeID && target.PodUID == run.Identity.PodUID && target.WALIdentity == run.Identity.WALIdentity {
@@ -160,6 +165,9 @@ func buildIndependentScope(state fenceLedger, request FenceRequest, requestHash,
 			return scope, fmt.Errorf("fencing: closed ledger run %q is outside the captured target scope", runID)
 		}
 		scope.runs = append(scope.runs, AttestationRun{RunID: runID, NodeID: run.Identity.NodeID, PodUID: run.Identity.PodUID, WALIdentity: run.Identity.WALIdentity})
+	}
+	if len(scope.runs) == 0 {
+		return scope, fmt.Errorf("fencing: closed ledger has no runs in scope")
 	}
 	sort.Slice(scope.runs, func(i, j int) bool { return scope.runs[i].RunID < scope.runs[j].RunID })
 	sort.Strings(scope.currentPodUIDs)

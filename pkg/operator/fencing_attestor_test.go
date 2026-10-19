@@ -92,7 +92,7 @@ func independentFixture(t *testing.T) (FenceRequest, independentScope) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, err := buildIndependentScope(state, request, hash, "ledger-hash", []string{"pod-1", "pod-0"}, AttestationStoreScope{Provider: "gcs", Bucket: "rhiza-archive", Prefix: "root/source"})
+	scope, err := buildIndependentScope(state, request, nil, hash, "ledger-hash", []string{"pod-1", "pod-0"}, AttestationStoreScope{Provider: "gcs", Bucket: "rhiza-archive", Prefix: "root/source"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 	captured := FenceTarget{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0", NodeName: "node-a", ContainerID: "containerd://c0", ImageID: "sha256:img-0"}
 	request := FenceRequest{LogicalID: "logical", BindingUID: "binding", Namespace: "default", StatefulSet: "rhiza", StatefulSetUID: "sts-uid", SourceClusterID: "source", OperationID: "op", Scope: ScopeVoter, Targets: []FenceTarget{captured}}
 	storage := AttestationStoreScope{Provider: "gcs", Bucket: "rhiza-archive", Prefix: "root/source"}
-	if _, err := buildIndependentScope(state, request, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
+	if _, err := buildIndependentScope(state, request, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
 		t.Fatalf("captured identity rejected: %v", err)
 	}
 	for name, mutate := range map[string]func(*FenceTarget){
@@ -209,21 +209,35 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 			target := captured
 			mutate(&target)
 			candidate.Targets = []FenceTarget{target}
-			if _, err := buildIndependentScope(state, candidate, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
+			if _, err := buildIndependentScope(state, candidate, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
 				t.Fatal("accepted a fence without captured runtime identity")
 			}
 		})
 	}
-	t.Run("run outside the captured scope", func(t *testing.T) {
-		extra := state
-		extra.Ledger.Runs["run-1"] = fencing.Run{Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-1", PodUID: "pod-1", RunID: "run-1", WALIdentity: "wal-1"}}
-		if _, err := buildIndependentScope(extra, request, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
-			t.Fatal("accepted a closed run that the request never named")
+	t.Run("voter scope ignores another voter's runs", func(t *testing.T) {
+		other := state
+		other.Ledger.Runs["run-1"] = fencing.Run{Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-1", PodUID: "pod-1", RunID: "run-1", WALIdentity: "wal-1"}}
+		if _, err := buildIndependentScope(other, request, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
+			t.Fatalf("voter fence did not stay inside its own slot: %v", err)
+		}
+	})
+	t.Run("in-scope run without a captured target", func(t *testing.T) {
+		historical := state
+		historical.Ledger.Runs["run-9"] = fencing.Run{Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "pod-old", RunID: "run-9", WALIdentity: "wal-old"}}
+		if _, err := buildIndependentScope(historical, request, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
+			t.Fatal("accepted a fenced run that was never captured")
+		}
+	})
+	t.Run("generation scope covers every run", func(t *testing.T) {
+		whole := state
+		whole.Ledger.Runs["run-1"] = fencing.Run{Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-1", PodUID: "pod-1", RunID: "run-1", WALIdentity: "wal-1"}}
+		if _, err := buildIndependentScope(whole, request, nil, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
+			t.Fatal("generation fence ignored a closed run it never named")
 		}
 	})
 	t.Run("empty closed ledger", func(t *testing.T) {
 		empty := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
-		if _, err := buildIndependentScope(empty, request, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
+		if _, err := buildIndependentScope(empty, request, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err == nil {
 			t.Fatal("accepted a ledger without runs")
 		}
 	})
@@ -235,7 +249,7 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 		unboundTarget.WALIdentity = ""
 		unboundRequest := request
 		unboundRequest.Targets = []FenceTarget{unboundTarget}
-		if _, err := buildIndependentScope(unbound, unboundRequest, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
+		if _, err := buildIndependentScope(unbound, unboundRequest, []string{"rhiza-0"}, "hash", "ledger", []string{"pod-0"}, storage); err != nil {
 			t.Fatalf("never-bound incarnation rejected: %v", err)
 		}
 	})

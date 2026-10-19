@@ -543,7 +543,7 @@ func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string,
 	if err != nil {
 		return err
 	}
-	scope, err := buildIndependentScope(state, r, hash, e.ledgerHash(state), current, storage)
+	scope, err := buildIndependentScope(state, r, nodes, hash, e.ledgerHash(state), current, storage)
 	if err != nil {
 		return ErrFencePending
 	}

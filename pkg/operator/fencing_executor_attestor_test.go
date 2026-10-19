@@ -51,10 +51,13 @@ func independentStatefulSet(provider string) object {
 	}
 }
 
-// independentLedger is a durable ledger with one registered run that no
-// supervisor ever reported terminal. Closing it cannot complete cooperatively.
-func independentLedger(run fencing.Run) object {
-	state := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source", Runs: map[string]fencing.Run{run.Identity.RunID: run}}}
+// independentLedger is a durable ledger whose runs no supervisor ever reported
+// terminal. Closing it cannot complete cooperatively.
+func independentLedger(runs ...fencing.Run) object {
+	state := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source", Runs: map[string]fencing.Run{}}}
+	for _, run := range runs {
+		state.Ledger.Runs[run.Identity.RunID] = run
+	}
 	return object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": "ledger", "namespace": "default", "resourceVersion": "1"}, "data": object{"ledger.json": string(jsonBytes(state))}}
 }
 
@@ -180,7 +183,12 @@ func TestAttestedFenceNeverReplacesTheCooperativeLedger(t *testing.T) {
 func TestAttestedFenceWritesBoundIndependentProof(t *testing.T) {
 	attestor := &stubAttestor{fn: func(req AttestationRequest) (*AttestationResponse, error) { return independentEvidenceFor(req), nil }}
 	executor, api, record := newAttestedExecutor(t, attestor)
-	api.ledger = independentLedger(fencing.Run{Identity: independentIdentity()})
+	// Another voter's unresolved run is outside a voter fence and must not block
+	// evidence for the exact slot this operation closed.
+	api.ledger = independentLedger(
+		fencing.Run{Identity: independentIdentity()},
+		fencing.Run{Identity: fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-1", PodUID: "pod-1", RunID: "run-1", WALIdentity: "wal-1"}},
+	)
 	hash, err := requestHash(&record.Spec)
 	if err != nil {
 		t.Fatal(err)
