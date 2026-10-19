@@ -110,13 +110,16 @@ func TestFenceCRDKeepsGenerationTargetBound(t *testing.T) {
 // Role must cover every write the operator actually issues.
 func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 	required := map[string][]string{
-		"pods":            {"get", "list", "create", "delete"},
-		"secrets":         {"get", "create", "delete"},
-		"services":        {"get", "create"},
-		"statefulsets":    {"get", "update"},
-		"rhizafences":     {"get", "create"},
-		"rhizarecoveries": {"get", "list", "create", "update"},
-		"rhizaclusters":   {"get", "list"},
+		"pods":                   {"get", "list", "create", "delete"},
+		"secrets":                {"get", "create", "delete"},
+		"configmaps":             {"get"},
+		"services":               {"get", "create"},
+		"statefulsets":           {"get", "update"},
+		"rhizaclusters":          {"get", "list"},
+		"rhizaclusters/status":   {"get", "update"},
+		"rhizafences":            {"get", "create"},
+		"rhizarecoveries":        {"get", "list", "create", "update"},
+		"rhizarecoveries/status": {"get", "update"},
 	}
 	data, err := os.ReadFile("rbac.yaml")
 	if err != nil {
