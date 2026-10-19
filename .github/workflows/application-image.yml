@@ -37,7 +37,7 @@ jobs:
             sha=$(git rev-parse HEAD)
             echo "sha=$sha"
             echo "tag=sha-$sha"
-            echo "image=ghcr.io/$GITHUB_REPOSITORY_OWNER/rhiza:sha-$sha"
+            echo "image=ghcr.io/$GITHUB_REPOSITORY_OWNER/rhiza-application:sha-$sha"
           } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
         with:
@@ -82,10 +82,10 @@ jobs:
           # publicly pullable. GHCR can create a package private on first publish;
           # this makes that provisioning step explicit and enforced.
           owner="${{ github.repository_owner }}"
-          token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:$owner/rhiza:pull" | jq -r .token)
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$owner/rhiza/manifests/${{ steps.source.outputs.tag }}")
+          token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:$owner/rhiza-application:pull" | jq -r .token)
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$owner/rhiza-application/manifests/${{ steps.source.outputs.tag }}")
           if [ "$code" != "200" ]; then
-            echo "::error::ghcr.io/$owner/rhiza is not anonymously pullable (HTTP $code). Set the package visibility to public once, then re-run." >&2
+            echo "::error::ghcr.io/$owner/rhiza-application is not anonymously pullable (HTTP $code). Set the package visibility to public once, then re-run." >&2
             exit 1
           fi
       - name: Record the immutable digest
