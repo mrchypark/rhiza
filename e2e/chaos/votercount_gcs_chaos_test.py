@@ -8,6 +8,8 @@ VoterCountChaos.prove_admission(): a token search over policy text cannot
 evaluate CEL.
 """
 import json
+import os
+import subprocess
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -247,6 +249,31 @@ class DeadPodTest(unittest.TestCase):
         chaos = dead_pod_stub(same_uid=True)
         with mock.patch("time.sleep"), self.assertRaises(AssertionError):
             chaos.dead_pod_case("D2", "rhiza-voter-2")
+
+
+class LauncherDigestTest(unittest.TestCase):
+    """The launcher must reject anything that is not name@sha256:<64 hex>."""
+
+    BASE = dict(RHIZA_RUN_ID="abc12345", RHIZA_NAMESPACE="ns", RHIZA_KUBE_CONTEXT="ctx",
+                RHIZA_GCS_BUCKET="b", RHIZA_GCS_PREFIX="p/", RHIZA_CLUSTER_ID="cid",
+                RHIZA_OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:" + "f" * 64)
+
+    def run_launcher(self, app_image):
+        env = dict(os.environ, **self.BASE)
+        env["RHIZA_APP_IMAGE"] = app_image
+        return subprocess.run(["sh", str(HERE / "run-votercount-gcs-chaos.sh")],
+                              env=env, capture_output=True, text=True, timeout=60)
+
+    def test_malformed_digests_are_rejected(self):
+        for bad in ("repo@sha256:", "repo@sha256:not-a-digest", "repo@sha256:zz",
+                    "repo:v0.19.5", "repo@sha256:" + "a" * 63):
+            with self.subTest(bad=bad):
+                result = self.run_launcher(bad)
+                self.assertEqual(result.returncode, 2, result.stderr[-200:])
+
+    def test_non_hex_digest_is_rejected(self):
+        result = self.run_launcher("repo@sha256:" + "g" * 64)
+        self.assertEqual(result.returncode, 2, result.stderr[-200:])
 
 
 if __name__ == "__main__":

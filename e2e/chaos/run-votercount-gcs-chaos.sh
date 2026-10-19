@@ -22,10 +22,15 @@ set -eu
 : "${RHIZA_OPERATOR_IMAGE:?digest-pinned operator image}"
 
 require_digest() {
-  case "$2" in
-    *@sha256:*) ;;
-    *) echo "$1 must be digest-pinned as name@sha256:<digest>, got: $2" >&2; exit 2 ;;
+  value=$2
+  case "$value" in
+    *@sha256:*) digest=${value##*@sha256:} ;;
+    *) echo "$1 must be digest-pinned as name@sha256:<digest>, got: $value" >&2; exit 2 ;;
   esac
+  case "$digest" in
+    *[!0-9a-f]*) echo "$1 sha256 digest must be lowercase hex, got: $value" >&2; exit 2 ;;
+  esac
+  [ "${#digest}" -eq 64 ] || { echo "$1 sha256 digest must be 64 hex characters, got: $value" >&2; exit 2; }
 }
 require_digest RHIZA_APP_IMAGE "$RHIZA_APP_IMAGE"
 require_digest RHIZA_OPERATOR_IMAGE "$RHIZA_OPERATOR_IMAGE"
