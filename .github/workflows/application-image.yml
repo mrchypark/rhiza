@@ -21,7 +21,7 @@ jobs:
   publish:
     if: github.repository == 'mrchypark/rhiza'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -53,11 +53,24 @@ jobs:
             echo "::error::${{ steps.source.outputs.image }} already exists; immutable tags are never retargeted" >&2
             exit 1
           fi
+      - name: Prepare container build tools
+        run: |
+          # The Dockerfile runs the qualification tests, which need jq and
+          # coreutils; the minimal golang:alpine builder lacks them. Mirror the
+          # ci.yml containers job so this build matches CI.
+          awk '
+            { print }
+            $0 == "FROM mirror.gcr.io/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
+              print "RUN apk --no-cache add jq coreutils"
+              matched++
+            }
+            END { if (matched != 1) exit 1 }
+          ' Dockerfile > "$RUNNER_TEMP/Dockerfile.ci"
       - uses: docker/build-push-action@v6
         id: build
         with:
           context: .
-          file: Dockerfile
+          file: ${{ runner.temp }}/Dockerfile.ci
           platforms: linux/amd64
           push: true
           tags: ${{ steps.source.outputs.image }}
