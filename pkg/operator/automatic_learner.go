@@ -40,15 +40,7 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		request := intent.Request
 		request.Scope = ScopeVoter
 		request.OperationID = fmt.Sprintf("%s-learner-fence-%d", intent.RecoveryName, intent.LearnerAttempt)
-		target := FenceTarget{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
-		// The incarnation was captured when it was provisioned. A dead learner is
-		// never re-identified from its Pod name.
-		for _, old := range state.Learners {
-			if old.SourceClusterID == state.ActiveClusterID && old.Target.Pod == intent.LearnerName && old.Target.PodUID == intent.LearnerUID {
-				target.NodeName, target.NodeUID, target.ContainerID, target.ImageID = old.Target.NodeName, old.Target.NodeUID, old.Target.ContainerID, old.Target.ImageID
-			}
-		}
-		request.Targets = []FenceTarget{target}
+		request.Targets = []FenceTarget{learnerFenceTarget(state, intent.LearnerName, intent.LearnerUID, intent.LearnerWAL)}
 		proof, err := c.fence(ctx, request)
 		if err != nil {
 			return block("waiting for failed learner fencing proof")

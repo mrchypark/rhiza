@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 )
@@ -24,6 +25,7 @@ func independentEvidenceFor(req AttestationRequest) *AttestationResponse {
 	for _, run := range req.Runs {
 		byPod[run.PodUID] = append(byPod[run.PodUID], run)
 	}
+	now := time.Now().UTC()
 	evidence := IndependentEvidence{
 		Version:     independentEvidenceVersion,
 		Provider:    "fake-power-provider",
@@ -40,16 +42,16 @@ func independentEvidenceFor(req AttestationRequest) *AttestationResponse {
 			DeniedAt:          "2026-10-19T00:00:30Z",
 		},
 		Storage: EvidenceStorage{
-			Provider:           req.StorageScope.Provider,
-			Bucket:             req.StorageScope.Bucket,
-			Prefix:             req.StorageScope.Prefix,
-			QuietWindowSeconds: 60,
-			HeadGeneration:     "100",
-			CurrentGeneration:  "100",
-			InventoryDigest:    "sha256:inventory",
-			Stable:             true,
-			ObservedFrom:       "2026-10-19T00:00:00Z",
-			ObservedTo:         "2026-10-19T00:01:00Z",
+			Provider:               req.StorageScope.Provider,
+			Endpoint:               req.StorageScope.Endpoint,
+			Bucket:                 req.StorageScope.Bucket,
+			Prefix:                 req.StorageScope.Prefix,
+			Account:                req.StorageScope.Account,
+			ConnectionStringDigest: req.StorageScope.ConnectionStringDigest,
+			QuietWindowSeconds:     60,
+			Before:                 StorageSnapshot{ObservedAt: now.Add(-90 * time.Second).Format(time.RFC3339), HeadGeneration: "100", HeadMetageneration: "1", CurrentGeneration: "40", CurrentMetageneration: "2", InventoryDigest: "sha256:inventory"},
+			After:                  StorageSnapshot{ObservedAt: now.Add(-30 * time.Second).Format(time.RFC3339), HeadGeneration: "100", HeadMetageneration: "1", CurrentGeneration: "40", CurrentMetageneration: "2", InventoryDigest: "sha256:inventory"},
+			Stable:                 true,
 		},
 	}
 	for _, target := range req.Request.Targets {
@@ -145,16 +147,46 @@ func TestIndependentEvidenceMustBindTheClosedScope(t *testing.T) {
 		},
 		"duplicate incarnation":  func(r *AttestationResponse) { r.Independent.Runtimes[1] = r.Independent.Runtimes[0] },
 		"other storage provider": func(r *AttestationResponse) { r.Independent.Storage.Provider = "azure" },
+		"other storage endpoint": func(r *AttestationResponse) { r.Independent.Storage.Endpoint = "https://other.example" },
 		"other bucket":           func(r *AttestationResponse) { r.Independent.Storage.Bucket = "other" },
 		"other prefix":           func(r *AttestationResponse) { r.Independent.Storage.Prefix = "root/other" },
-		"unstable storage":       func(r *AttestationResponse) { r.Independent.Storage.Stable = false },
+		"other storage account":  func(r *AttestationResponse) { r.Independent.Storage.Account = "other" },
+		"other connection digest": func(r *AttestationResponse) {
+			r.Independent.Storage.ConnectionStringDigest = strings.Repeat("a", 64)
+		},
+		"unstable storage": func(r *AttestationResponse) { r.Independent.Storage.Stable = false },
 		"short quiet window": func(r *AttestationResponse) {
 			r.Independent.Storage.QuietWindowSeconds = minIndependentQuietWindowSeconds - 1
 		},
-		"window not observed":      func(r *AttestationResponse) { r.Independent.Storage.ObservedTo = r.Independent.Storage.ObservedFrom },
-		"unparsable observation":   func(r *AttestationResponse) { r.Independent.Storage.ObservedFrom = "yesterday" },
-		"missing head generation":  func(r *AttestationResponse) { r.Independent.Storage.HeadGeneration = "" },
-		"missing inventory digest": func(r *AttestationResponse) { r.Independent.Storage.InventoryDigest = "" },
+		"window not spanned": func(r *AttestationResponse) {
+			r.Independent.Storage.After.ObservedAt = r.Independent.Storage.Before.ObservedAt
+		},
+		"unparsable observation": func(r *AttestationResponse) { r.Independent.Storage.Before.ObservedAt = "yesterday" },
+		"future quiet window": func(r *AttestationResponse) {
+			shift := 2 * time.Hour
+			r.Independent.Storage.Before.ObservedAt = time.Now().UTC().Add(shift - 90*time.Second).Format(time.RFC3339)
+			r.Independent.Storage.After.ObservedAt = time.Now().UTC().Add(shift - 30*time.Second).Format(time.RFC3339)
+		},
+		"changed head generation":     func(r *AttestationResponse) { r.Independent.Storage.After.HeadGeneration = "101" },
+		"changed head metageneration": func(r *AttestationResponse) { r.Independent.Storage.After.HeadMetageneration = "9" },
+		"changed checkpoint generation": func(r *AttestationResponse) {
+			r.Independent.Storage.After.CurrentGeneration = "41"
+		},
+		"changed checkpoint metageneration": func(r *AttestationResponse) {
+			r.Independent.Storage.After.CurrentMetageneration = "7"
+		},
+		"changed inventory digest": func(r *AttestationResponse) {
+			r.Independent.Storage.After.InventoryDigest = "sha256:other"
+		},
+		"missing head generation": func(r *AttestationResponse) { r.Independent.Storage.Before.HeadGeneration = "" },
+		"missing head metageneration": func(r *AttestationResponse) {
+			r.Independent.Storage.Before.HeadMetageneration = ""
+		},
+		"missing checkpoint metageneration": func(r *AttestationResponse) {
+			r.Independent.Storage.After.CurrentMetageneration = ""
+		},
+		"missing inventory digest": func(r *AttestationResponse) { r.Independent.Storage.Before.InventoryDigest = "" },
+		"missing observation time": func(r *AttestationResponse) { r.Independent.Storage.After.ObservedAt = "" },
 		"foreign operation":        func(r *AttestationResponse) { r.Proof.OperationID = "other" },
 		"foreign binding":          func(r *AttestationResponse) { r.Proof.BindingUID = "other" },
 		"foreign source cluster":   func(r *AttestationResponse) { r.Proof.SourceClusterID = "other" },
@@ -255,6 +287,56 @@ func TestIndependentScopeRequiresCapturedIdentity(t *testing.T) {
 	})
 }
 
+// Idempotency must cover the exact attested snapshot: a ledger or inventory that
+// moved is a new question, not a retry of the old one.
+func TestAttestationKeyScopesIdempotencyToTheSnapshot(t *testing.T) {
+	_, scope := independentFixture(t)
+	base := scope.attestationRequest()
+	if attestationKey(base) != attestationKey(scope.attestationRequest()) {
+		t.Fatal("the same snapshot produced a different idempotency key")
+	}
+	if !strings.HasPrefix(attestationKey(base), base.Request.OperationID) {
+		t.Fatal("the idempotency key does not name its operation")
+	}
+	for name, change := range map[string]func(*AttestationRequest){
+		"changed ledger hash": func(r *AttestationRequest) { r.LedgerHash = strings.Repeat("a", 64) },
+		"changed pod inventory": func(r *AttestationRequest) {
+			r.CurrentPodUIDs = []string{"pod-0"}
+		},
+		"changed run inventory": func(r *AttestationRequest) { r.Runs = r.Runs[:1] },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			change(&candidate)
+			if attestationKey(candidate) == attestationKey(base) {
+				t.Fatal("a changed snapshot reused the previous idempotency key")
+			}
+		})
+	}
+	t.Run("changed snapshot reaches the attestor as a new key", func(t *testing.T) {
+		var keys []string
+		url, caFile := attestorTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			keys = append(keys, r.Header.Get("Idempotency-Key"))
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		attestor, err := NewHTTPSAttestor(url, writeToken(t), caFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := attestor.Attest(t.Context(), base); !errors.Is(err, ErrFencePending) {
+			t.Fatalf("want pending: %v", err)
+		}
+		changed := base
+		changed.LedgerHash = strings.Repeat("b", 64)
+		if _, err := attestor.Attest(t.Context(), changed); !errors.Is(err, ErrFencePending) {
+			t.Fatalf("want pending: %v", err)
+		}
+		if len(keys) != 2 || keys[0] == keys[1] || keys[1] != attestationKey(changed) {
+			t.Fatalf("attestor saw keys %q", keys)
+		}
+	})
+}
+
 func TestHTTPSAttestorRoundTripAndFailClosedResponses(t *testing.T) {
 	_, scope := independentFixture(t)
 	request := scope.attestationRequest()
@@ -278,7 +360,7 @@ func TestHTTPSAttestorRoundTripAndFailClosedResponses(t *testing.T) {
 	if seen.RequestHash != request.RequestHash || seen.LedgerHash != request.LedgerHash || seen.StorageScope != request.StorageScope || len(seen.Runs) != len(request.Runs) {
 		t.Fatalf("attestor received a different scope: %+v", seen)
 	}
-	if idempotency != request.Request.OperationID || authorization != "Bearer test-bearer-token" {
+	if idempotency != attestationKey(request) || !strings.HasPrefix(idempotency, request.Request.OperationID) || authorization != "Bearer test-bearer-token" {
 		t.Fatalf("attestation headers differ: %q %q", idempotency, authorization)
 	}
 	if _, err := validateIndependent(scope, response); err != nil {
@@ -352,6 +434,7 @@ func TestHTTPSAttestorConfigurationFailsClosed(t *testing.T) {
 		"no endpoint":      {url: "", token: token, want: "invalid endpoint"},
 		"plaintext":        {url: "http://attestor.example/v1/attest", token: token, want: "https"},
 		"no token file":    {url: "https://attestor.example/v1/attest", want: "token file is required"},
+		"no ca file":       {url: "https://attestor.example/v1/attest", token: token, want: "CA file is required"},
 		"unusable ca file": {url: "https://attestor.example/v1/attest", token: token, ca: caFile, want: "CA contains no certificate"},
 	} {
 		t.Run(name, func(t *testing.T) {

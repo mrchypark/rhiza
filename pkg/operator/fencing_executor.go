@@ -523,7 +523,16 @@ func (e *FencingExecutor) storageScope(ctx context.Context, sts object, source s
 		return AttestationStoreScope{}, err
 	}
 	identity := StoreIdentity(env)
-	scope := AttestationStoreScope{Provider: identity["RHIZA_OBJSTORE_PROVIDER"], Bucket: identity["RHIZA_OBJSTORE_BUCKET"], Prefix: path.Join(identity["RHIZA_OBJSTORE_PREFIX"], source)}
+	// Carry every non-secret field StoreIdentity compares, so evidence for a
+	// different store that merely shares a bucket and prefix cannot bind.
+	scope := AttestationStoreScope{
+		Provider:               identity["RHIZA_OBJSTORE_PROVIDER"],
+		Endpoint:               identity["RHIZA_OBJSTORE_ENDPOINT"],
+		Bucket:                 identity["RHIZA_OBJSTORE_BUCKET"],
+		Prefix:                 path.Join(identity["RHIZA_OBJSTORE_PREFIX"], source),
+		Account:                identity["RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT"],
+		ConnectionStringDigest: identity["azure_connection_string_digest"],
+	}
 	if scope.Provider == "" || scope.Bucket == "" || scope.Provider == "filesystem" {
 		return scope, fmt.Errorf("fencing: workload object store is not a shared store")
 	}

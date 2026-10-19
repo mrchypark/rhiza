@@ -9,6 +9,20 @@ import (
 
 const maxLearnerHistory = 64
 
+// learnerFenceTarget is the journaled incarnation of one learner. Identity that
+// was captured when the learner was provisioned is never re-derived from its Pod
+// name, and a caller that rebuilt the target without it would make an unequal
+// FenceTarget that blocks generation-wide fencing during an outage.
+func learnerFenceTarget(state *autoControl, name, uid, wal string) FenceTarget {
+	target := FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: wal}
+	for _, entry := range state.Learners {
+		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.Pod == name && entry.Target.PodUID == uid {
+			target.NodeName, target.NodeUID, target.ContainerID, target.ImageID = entry.Target.NodeName, entry.Target.NodeUID, entry.Target.ContainerID, entry.Target.ImageID
+		}
+	}
+	return target
+}
+
 func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 	if err := validateLearnerHistory(state.Learners); err != nil {
 		return err

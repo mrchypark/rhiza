@@ -156,7 +156,7 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 		request.Targets = append(request.Targets, target)
 	}
 	if intent.LearnerUID != "" {
-		request.Targets = append(request.Targets, FenceTarget{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL})
+		request.Targets = append(request.Targets, learnerFenceTarget(state, intent.LearnerName, intent.LearnerUID, intent.LearnerWAL))
 	}
 	if err := includeLearnerHistory(state, &request); err != nil {
 		return automaticEscalationStop, err

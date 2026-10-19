@@ -145,19 +145,47 @@ type EvidenceRuntime struct {
 }
 
 // EvidenceStorage is an explicitly labelled stability observation, not a clean
-// engine drain: it states that no writer from the closed scope remains and that
-// the final object state did not change across the quiet window.
+// engine drain: it binds the exact object-store location and two observations of
+// the same two named objects. archive/head.bin and checkpoint/CURRENT are
+// separate objects with independent per-object generation counters, so the
+// invariant is that both of their generations, both metagenerations and the
+// inventory digest are unchanged across the quiet window.
 type EvidenceStorage struct {
-	Provider           string `json:"provider"`
-	Bucket             string `json:"bucket"`
-	Prefix             string `json:"prefix"`
-	QuietWindowSeconds int    `json:"quietWindowSeconds"`
-	HeadGeneration     string `json:"headGeneration"`
-	CurrentGeneration  string `json:"currentGeneration"`
-	InventoryDigest    string `json:"inventoryDigest"`
-	Stable             bool   `json:"stable"`
-	ObservedFrom       string `json:"observedFrom"`
-	ObservedTo         string `json:"observedTo"`
+	Provider               string          `json:"provider"`
+	Endpoint               string          `json:"endpoint,omitempty"`
+	Bucket                 string          `json:"bucket"`
+	Prefix                 string          `json:"prefix"`
+	Account                string          `json:"account,omitempty"`
+	ConnectionStringDigest string          `json:"connectionStringDigest,omitempty"`
+	QuietWindowSeconds     int             `json:"quietWindowSeconds"`
+	Before                 StorageSnapshot `json:"before"`
+	After                  StorageSnapshot `json:"after"`
+	Stable                 bool            `json:"stable"`
+}
+
+// StorageSnapshot is one observation of the exact storage state. ObservedAt is
+// the instant the provider read it, never a value the authority assumed.
+type StorageSnapshot struct {
+	ObservedAt            string `json:"observedAt"`
+	HeadGeneration        string `json:"headGeneration"`
+	HeadMetageneration    string `json:"headMetageneration"`
+	CurrentGeneration     string `json:"currentGeneration"`
+	CurrentMetageneration string `json:"currentMetageneration"`
+	InventoryDigest       string `json:"inventoryDigest"`
+}
+
+// scope is the exact location identity this observation claims. It is compared
+// against the workload's own scope, so a different store that merely shares a
+// provider, bucket and prefix cannot satisfy the binding.
+func (s EvidenceStorage) scope() AttestationStoreScope {
+	return AttestationStoreScope{Provider: s.Provider, Endpoint: s.Endpoint, Bucket: s.Bucket, Prefix: s.Prefix, Account: s.Account, ConnectionStringDigest: s.ConnectionStringDigest}
+}
+
+// state is the same snapshot without its clock. Only the observed storage state
+// has to be identical across the window; the clock is what measures the window.
+func (s StorageSnapshot) state() StorageSnapshot {
+	s.ObservedAt = ""
+	return s
 }
 
 // AttestationRequest is the exact scope the authority sends after it has durably
@@ -182,10 +210,16 @@ type AttestationRun struct {
 
 // AttestationStoreScope is the exact object-store location of the fenced source
 // generation, derived from the workload configuration rather than a global guess.
+// It carries every non-secret field StoreIdentity compares, because the same
+// provider, bucket and prefix can name different archives behind a custom
+// endpoint or a different account.
 type AttestationStoreScope struct {
-	Provider string `json:"provider"`
-	Bucket   string `json:"bucket"`
-	Prefix   string `json:"prefix"`
+	Provider               string `json:"provider"`
+	Endpoint               string `json:"endpoint,omitempty"`
+	Bucket                 string `json:"bucket"`
+	Prefix                 string `json:"prefix"`
+	Account                string `json:"account,omitempty"`
+	ConnectionStringDigest string `json:"connectionStringDigest,omitempty"`
 }
 
 // AttestationResponse is the attestor's proof identity fields plus the

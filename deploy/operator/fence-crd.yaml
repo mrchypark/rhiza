@@ -113,38 +113,49 @@ spec:
                               containerIDs:
                                 type: array
                                 minItems: 1
-                                maxItems: 16
+                                maxItems: 2
                                 items: {type: string, maxLength: 256, minLength: 1}
                               imageIDs:
                                 type: array
                                 minItems: 1
-                                maxItems: 16
+                                maxItems: 2
                                 items: {type: string, maxLength: 256, minLength: 1}
                               runIDs:
                                 type: array
                                 minItems: 1
-                                maxItems: 64
-                                items: {type: string, maxLength: 256, minLength: 1}
+                                maxItems: 4
+                                items: {type: string, maxLength: 128, minLength: 1}
                               walIdentities:
                                 type: array
-                                maxItems: 64
-                                items: {type: string, maxLength: 256}
+                                maxItems: 4
+                                items: {type: string, maxLength: 128}
                               state: {type: string, enum: [exited, terminated]}
-                              runtimeEvidence: {type: string, maxLength: 4096, minLength: 1}
+                              runtimeEvidence: {type: string, maxLength: 1024, minLength: 1}
                         storage:
                           description: >-
                             Writer absence and object stability across a quiet
-                            window. It is not a clean engine drain.
+                            window: two observations of archive/head.bin and
+                            checkpoint/CURRENT that must agree. It is not a clean
+                            engine drain.
                           type: object
-                          required: [provider, bucket, prefix, quietWindowSeconds, headGeneration, currentGeneration, inventoryDigest, stable, observedFrom, observedTo]
+                          required: [provider, bucket, prefix, quietWindowSeconds, before, after, stable]
                           properties:
                             provider: {type: string, maxLength: 256, minLength: 1}
+                            endpoint: {type: string, maxLength: 512}
                             bucket: {type: string, maxLength: 256, minLength: 1}
                             prefix: {type: string, maxLength: 1024}
+                            account: {type: string, maxLength: 256}
+                            connectionStringDigest: {type: string, maxLength: 64}
                             quietWindowSeconds: {type: integer, minimum: 30}
-                            headGeneration: {type: string, maxLength: 256, minLength: 1}
-                            currentGeneration: {type: string, maxLength: 256, minLength: 1}
-                            inventoryDigest: {type: string, maxLength: 256, minLength: 1}
+                            before: &storageSnapshot
+                              type: object
+                              required: [observedAt, headGeneration, headMetageneration, currentGeneration, currentMetageneration, inventoryDigest]
+                              properties:
+                                observedAt: {type: string, maxLength: 32, minLength: 1}
+                                headGeneration: {type: string, maxLength: 64, minLength: 1}
+                                headMetageneration: {type: string, maxLength: 64, minLength: 1}
+                                currentGeneration: {type: string, maxLength: 64, minLength: 1}
+                                currentMetageneration: {type: string, maxLength: 64, minLength: 1}
+                                inventoryDigest: {type: string, maxLength: 128, minLength: 1}
+                            after: *storageSnapshot
                             stable: {type: boolean}
-                            observedFrom: {type: string, maxLength: 64, minLength: 1}
-                            observedTo: {type: string, maxLength: 64, minLength: 1}

@@ -16,6 +16,29 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
+// A journaled learner keeps the identity captured when it was provisioned, so a
+// later generation fence (escalation or retirement) cannot rebuild an unequal
+// target and block recovery during an outage.
+func TestLearnerFenceTargetCarriesTheJournaledIdentity(t *testing.T) {
+	state := validAutoControl()
+	captured := FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal", NodeName: "node-a", NodeUID: "node-uid-a", ContainerID: "containerd://c0", ImageID: "sha256:img"}
+	state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "op-1", CredentialUID: "cred-1", Target: captured}}
+	if got := learnerFenceTarget(state, "learner", "learner-uid", "learner-wal"); got != captured {
+		t.Fatalf("journaled identity lost: %+v", got)
+	}
+	request := FenceRequest{SourceClusterID: "source", Scope: ScopeGeneration, Targets: []FenceTarget{{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0"}}}
+	request.Targets = append(request.Targets, learnerFenceTarget(state, "learner", "learner-uid", "learner-wal"))
+	if err := includeLearnerHistory(state, &request); err != nil {
+		t.Fatalf("journaled learner blocked the generation fence: %v", err)
+	}
+	// A target rebuilt without the captured identity is still a conflict, so the
+	// fail-closed check is unchanged.
+	request.Targets[len(request.Targets)-1] = FenceTarget{NodeID: "learner", Pod: "learner", PodUID: "learner-uid", WALIdentity: "learner-wal"}
+	if err := includeLearnerHistory(state, &request); err == nil {
+		t.Fatal("accepted a rebuilt learner incarnation")
+	}
+}
+
 func TestLearnerCreatedBeforeControlCASIsRecoveredBeforeEscalation(t *testing.T) {
 	for _, scenario := range []string{"recover", "wrong-root", "wrong-operation", "wrong-credential", "wrong-owner"} {
 		t.Run(scenario, func(t *testing.T) {

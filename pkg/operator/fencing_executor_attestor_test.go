@@ -353,3 +353,61 @@ func TestFenceCRDCarriesTheIndependentContract(t *testing.T) {
 		}
 	}
 }
+
+// The published schema may not describe evidence the transport refuses: every
+// object the CRD accepts has to fit the response the authority actually reads.
+func TestFenceCRDSchemaFitsTheAttestationTransport(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/operator/fence-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _ := crd["spec"].(map[string]any)["versions"].([]any)
+	schema, _ := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)
+	proof, _ := schema["status"].(map[string]any)["properties"].(map[string]any)["proof"].(map[string]any)
+	independent, _ := proof["properties"].(map[string]any)["independent"].(map[string]any)
+	worst := schemaWorstBytes(independent)
+	if worst == 0 {
+		t.Fatal("the independent evidence schema describes no payload")
+	}
+	if worst >= maxAttestationBytes {
+		t.Fatalf("the schema allows %d bytes of evidence but the transport reads %d", worst, maxAttestationBytes)
+	}
+}
+
+// schemaWorstBytes is the largest string capacity one schema node can describe.
+// It ignores object and array punctuation, so the comparison keeps a margin.
+func schemaWorstBytes(node map[string]any) int {
+	switch node["type"] {
+	case "string":
+		return schemaInt(node["maxLength"])
+	case "array":
+		count := schemaInt(node["maxItems"])
+		if count == 0 {
+			count = 1
+		}
+		return count * schemaWorstBytes(asObject(node["items"]))
+	case "object":
+		total := 0
+		for _, property := range asObject(node["properties"]) {
+			total += schemaWorstBytes(asObject(property))
+		}
+		return total
+	}
+	return 0
+}
+
+func schemaInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	}
+	return 0
+}

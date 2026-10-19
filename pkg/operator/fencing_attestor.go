@@ -20,6 +20,16 @@ import (
 // buffered. The attestor, not this floor, owns the real window.
 const minIndependentQuietWindowSeconds = 30
 
+// attestationClockSkew is the only tolerance allowed on the snapshot clock, so
+// a future-dated quiet window cannot authorize recovery before it elapsed.
+const attestationClockSkew = 2 * time.Minute
+
+// maxAttestationBytes bounds one attestation response. It stays above the
+// largest evidence the published CRD schema permits (asserted by
+// TestFenceCRDSchemaFitsTheAttestationTransport) and below the Kubernetes object
+// limit, so a proof the schema allows is never rejected by the transport alone.
+const maxAttestationBytes = 512 * 1024
+
 // FenceAttestor returns independent evidence for one durably closed fencing
 // operation. It is an external trust boundary: the authority keeps the fence
 // pending unless the returned evidence binds the exact request, ledger, runtime
@@ -48,21 +58,29 @@ func NewHTTPSAttestor(rawURL, tokenFile, caFile string) (*HTTPSAttestor, error) 
 	if tokenFile == "" {
 		return nil, fmt.Errorf("fencing: attestor token file is required")
 	}
-	roots, err := x509.SystemCertPool()
-	if err != nil {
-		return nil, err
+	// The attestor CA is required and replaces the system pool: an unpinned
+	// system root would silently accept any host instead of the reviewed one.
+	if caFile == "" {
+		return nil, fmt.Errorf("fencing: attestor CA file is required")
 	}
-	if caFile != "" {
-		data, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("fencing: read attestor CA")
-		}
-		if !roots.AppendCertsFromPEM(data) {
-			return nil, fmt.Errorf("fencing: attestor CA contains no certificate")
-		}
+	roots := x509.NewCertPool()
+	data, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("fencing: read attestor CA")
+	}
+	if !roots.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("fencing: attestor CA contains no certificate")
 	}
 	client := &http.Client{Timeout: maxFenceTimeout, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}}}
 	return &HTTPSAttestor{URL: rawURL, TokenFile: tokenFile, Client: client}, nil
+}
+
+// attestationKey scopes idempotency to one exact attested snapshot. A ledger or
+// Pod inventory that changed since the previous call is a different attestation,
+// so it must not replay a cached response or collide with a changed payload.
+func attestationKey(req AttestationRequest) string {
+	sum := hashJSON(req)
+	return fmt.Sprintf("%s-%s", req.Request.OperationID, sum[:32])
 }
 
 // Attest posts one bound request. The attestor must answer 202 until its quiet
@@ -87,7 +105,7 @@ func (a *HTTPSAttestor) Attest(ctx context.Context, req AttestationRequest) (*At
 		return nil, fmt.Errorf("fencing: build attestation request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Idempotency-Key", req.Request.OperationID)
+	httpReq.Header.Set("Idempotency-Key", attestationKey(req))
 	token, err := readToken(a.TokenFile)
 	if err != nil {
 		return nil, err
@@ -98,12 +116,12 @@ func (a *HTTPSAttestor) Attest(ctx context.Context, req AttestationRequest) (*At
 		return nil, fmt.Errorf("fencing: attestation request failed")
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAttestationBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("fencing: read attestation response: %w", err)
 	}
-	if len(respBody) > maxResponseBytes {
-		return nil, fmt.Errorf("fencing: attestation response exceeds %d bytes", maxResponseBytes)
+	if len(respBody) > maxAttestationBytes {
+		return nil, fmt.Errorf("fencing: attestation response exceeds %d bytes", maxAttestationBytes)
 	}
 	if resp.StatusCode == http.StatusAccepted {
 		return nil, ErrFencePending
@@ -285,19 +303,27 @@ func validateEvidenceStorage(want AttestationStoreScope, got *EvidenceStorage) e
 	if want.Provider == "" || want.Bucket == "" || want.Prefix == "" {
 		return fmt.Errorf("fencing: workload object-store scope is unknown")
 	}
-	if got.Provider != want.Provider || got.Bucket != want.Bucket || got.Prefix != want.Prefix {
+	if got.scope() != want {
 		return fmt.Errorf("fencing: storage evidence is bound to another location")
 	}
 	if got.QuietWindowSeconds < minIndependentQuietWindowSeconds {
 		return fmt.Errorf("fencing: storage quiet window is too short")
 	}
-	if !got.Stable || got.HeadGeneration == "" || got.CurrentGeneration == "" || got.InventoryDigest == "" {
-		return fmt.Errorf("fencing: storage evidence is not stable")
+	for _, snapshot := range []StorageSnapshot{got.Before, got.After} {
+		if snapshot.ObservedAt == "" || snapshot.HeadGeneration == "" || snapshot.HeadMetageneration == "" || snapshot.CurrentGeneration == "" || snapshot.CurrentMetageneration == "" || snapshot.InventoryDigest == "" {
+			return fmt.Errorf("fencing: storage snapshot is incomplete")
+		}
 	}
-	from, fromErr := time.Parse(time.RFC3339, got.ObservedFrom)
-	to, toErr := time.Parse(time.RFC3339, got.ObservedTo)
+	if !got.Stable || got.After.state() != got.Before.state() {
+		return fmt.Errorf("fencing: storage state changed across the quiet window")
+	}
+	from, fromErr := time.Parse(time.RFC3339, got.Before.ObservedAt)
+	to, toErr := time.Parse(time.RFC3339, got.After.ObservedAt)
 	if fromErr != nil || toErr != nil || to.Sub(from) < time.Duration(got.QuietWindowSeconds)*time.Second {
 		return fmt.Errorf("fencing: storage evidence does not span its quiet window")
+	}
+	if to.After(time.Now().Add(attestationClockSkew)) {
+		return fmt.Errorf("fencing: storage evidence observes a future window")
 	}
 	return nil
 }

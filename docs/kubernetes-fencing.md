@@ -104,8 +104,9 @@ incarnation is terminally gone. No node, CRI, or cloud credential is added to
 the operator, and the service must not hold write access to `RhizaFence`
 status. Configure it with `RHIZA_FENCE_ATTESTOR_URL`,
 `RHIZA_FENCE_ATTESTOR_TOKEN_FILE`, and `RHIZA_FENCE_ATTESTOR_CA_FILE`. All
-three values are required together; a partial configuration fails startup instead
-of silently disabling independent evidence.
+three values are required together, the CA bundle replaces the system root pool
+rather than adding to it, and a partial configuration fails startup instead of
+silently disabling independent evidence or leaving the attestor unpinned.
 
 The authority keeps closing the durable ledger first and keeps writing the status
 itself. It consults the attestor only after that closure is persisted and only
@@ -119,9 +120,12 @@ returned evidence must bind all of:
 - one terminal runtime per fenced Pod incarnation, restating the Pod UID, node
   name, node UID, compute instance, container ID, image ID, run IDs, and WAL
   identities the operator captured before the fault;
-- the exact object-store provider, bucket, and source-cluster prefix of the
-  workload, with identical head and checkpoint generations and one inventory
-  digest across a quiet window of at least 30 seconds.
+- the exact object-store location of the workload, including the endpoint and
+  account identity that make a provider, bucket, and prefix unambiguous;
+- two observations of `archive/head.bin` and `checkpoint/CURRENT` whose
+  generation, metageneration, and inventory digest are identical, taken at the
+  start and end of a quiet window of at least 30 seconds, whose later
+  observation is no more than two minutes ahead of the authority's own clock.
 
 An incarnation stays pending when its immutable identity was never captured. The
 authority never resolves a dead request by Pod name, never re-derives identity
