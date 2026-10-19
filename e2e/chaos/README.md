@@ -114,6 +114,68 @@ uses `apply-local`, `mint-local`, and `run-local`; federation uses `apply` and
 `run`. These are one-shot operations: do not reuse an output or receipt
 directory, adopt colliding resources, or rerun after an unknown outcome.
 
+## voterCount operator path (GCS + Chaos Mesh)
+
+`run-votercount-gcs-chaos.sh` is the launcher for the v0.19.5 voterCount operator
+path. It is a second, run-owned path that shares the bootstrap above: run
+`bootstrap-gcs-postrelease.sh apply-local` first so the namespace, the `rhiza-gcs`
+and `rhiza-operator` workload-identity bindings, the quota and the admission
+policies exist. Then use the launcher's two phases with one fresh `RHIZA_OUT`
+directory:
+
+- `install` with the administrator kubeconfig. It applies the repository CRDs,
+  generates a one-day self-signed `rhiza-fencer-tls` Secret and matching
+  `rhiza-fencer-ca` ConfigMap, applies `votercount_gcs_chaos.yaml.in`, and
+  captures the operator-generated bootstrap admin credential as a mode-0600
+  `admin-token` file for the runtime phase.
+- `run` with the scoped runtime kubeconfig. It runs
+  `votercount_gcs_chaos.py`, which proves the admission shapes by server-side
+  dry-run and runs the positive scenarios (intact-WAL restart, online
+  replacement, generation recovery). It removes the admin-token file after the
+  driver exits.
+
+The privileged objects (CRDs, ServiceAccounts, Roles, RoleBindings,
+Deployments, ClusterRole/ClusterRoleBinding and `RhizaCluster`) belong to the
+administrator phase; the bootstrap runtime Role is intentionally not widened to
+create them. The driver deletes the run-owned cluster-scoped objects during
+cleanup and fails the run if any remain.
+
+The positive set also gates on the bootstrap-owned `rhiza-inspector-deny-all`
+NetworkPolicy. The driver creates the paired `rhiza-inspector` and
+`rhiza-inspector-control` Pods just-in-time, pins both to one shared node,
+releases them again, and fails the run on a failing or inconclusive probe. What
+it records is bounded: a same-node paired probe in which the canonical deny-all
+has the expected shape and UID, is the sole NetworkPolicy in the namespace at
+both recorded boundaries (before and after probing), and in which the
+inspector's Kubernetes API egress was denied while the derived control stayed
+reachable before and after. The namespace quota therefore has to admit seven
+Pods (three voters, operator, authority, and the two probe Pods) while the probe
+runs.
+
+What that does not claim: the deny-all is not asserted to be the exclusive
+possible cause of the denial, since a node-local, label-specific or
+Pod-IP-specific CNI or host dataplane rule could also explain it, and the two
+policy inventories are boundary snapshots rather than a lock over the probe
+interval. This is single-node qualification only: no physical-host,
+multi-node-partition or performance claim follows from it, cluster-level or
+node-local enforcement outside namespaced `NetworkPolicy` remains unobserved,
+and the dead-Pod failure modes stay unqualified until Part 2 runs after the
+production fencing executor lands.
+
+The harness is split behind `--scenarios` (launcher: `RHIZA_SCENARIOS`):
+
+- `positive` (default): bootstrap opt-in and adoption, `voterCount == replicas`,
+  intact-WAL restart, online replacement and generation recovery. This is the set
+  that supports the "cooperative recovery on real GCS" claim.
+- `dead-pod` (DEFERRED): D1-D4. Not executed by default; they run only after the
+  production fencing executor lands (separate implementation project), so the
+  dead-Pod claim is unqualified until then.
+- `all`: both sets.
+
+Both images must be digest-pinned (`name@sha256:<digest>`); the launcher rejects a
+tag-only reference. The `install` phase creates `rhiza-fencer-tls` and
+`rhiza-fencer-ca` in the run namespace before the authority and voters start.
+
 Local direct execution uses IPv4 loopback port forwards. `RHIZA_LOCAL_PORT_BASE`
 is optional and defaults to `18080`; when set it must be a canonical decimal
 integer from `1024` through `65432`. The launcher verifies that the four HTTP

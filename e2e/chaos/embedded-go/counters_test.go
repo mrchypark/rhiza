@@ -3543,14 +3543,16 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 			dataEmail := "rhiza-v0191-gcs-" + run + "@example-project.iam.gserviceaccount.com"
 			owner := "rhiza-postrelease-" + run + "-" + harness
 			member := "serviceAccount:example-project.svc.id.goog[" + namespace + "/rhiza-gcs]"
+			operatorMember := "serviceAccount:example-project.svc.id.goog[" + namespace + "/rhiza-operator]"
 			condition := map[string]string{"title": "rhiza-" + run + "-expiry", "expression": "request.time < timestamp('" + expiry + "')"}
 			dataCreate, _ := json.Marshal(map[string]string{"email": dataEmail, "name": "projects/example-project/serviceAccounts/" + dataEmail, "description": owner, "uniqueId": "synthetic-gsa-unique-id"})
-			dataPolicy, _ := json.Marshal(map[string]any{"bindings": []any{map[string]any{"role": "roles/iam.workloadIdentityUser", "members": []string{member}, "condition": condition}}})
+			dataPolicy, _ := json.Marshal(map[string]any{"bindings": []any{map[string]any{"role": "roles/iam.workloadIdentityUser", "members": []string{member, operatorMember}, "condition": condition}}})
 			write(filepath.Join(dir, "data-create.json"), string(dataCreate), 0600)
 			write(filepath.Join(dir, "data-wi-before.json"), `{"bindings":[]}`, 0600)
 			write(filepath.Join(dir, "data-wi-grant.json"), string(dataPolicy), 0600)
-			workloadIdentity := fmt.Sprintf(`{"run":"%s","namespace":"%s","ksa":{"name":"rhiza-gcs","uid":"synthetic-data-ksa-uid","gcp_service_account":"%s","return_principal_id_as_email":true},"gsa":{"email":"%s","unique_id":"synthetic-gsa-unique-id","owner":"%s","member":"%s","role":"roles/iam.workloadIdentityUser","condition":{"title":"rhiza-%s-expiry","expression":"request.time < timestamp('%s')"}}}`,
-				run, namespace, dataEmail, dataEmail, owner, member, run, expiry)
+			write(filepath.Join(dir, "operator-wi-grant.json"), string(dataPolicy), 0600)
+			workloadIdentity := fmt.Sprintf(`{"run":"%s","namespace":"%s","ksa":{"name":"rhiza-gcs","uid":"synthetic-data-ksa-uid","gcp_service_account":"%s","return_principal_id_as_email":true},"gsa":{"email":"%s","unique_id":"synthetic-gsa-unique-id","owner":"%s","members":["%s","%s"],"role":"roles/iam.workloadIdentityUser","condition":{"title":"rhiza-%s-expiry","expression":"request.time < timestamp('%s')"}}}`,
+				run, namespace, dataEmail, dataEmail, owner, member, operatorMember, run, expiry)
 			workloadIdentityPath := filepath.Join(dir, "workload-identity.json")
 			write(workloadIdentityPath, workloadIdentity, 0600)
 			workloadIdentitySum := sha256.Sum256([]byte(workloadIdentity))
@@ -3565,10 +3567,10 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				write(filepath.Join(dir, "workload-identity.sha256"), fmt.Sprintf("%x\n", workloadIdentitySum), 0600)
 			}
 			if scenario == "workload-identity-extra-member" {
-				write(filepath.Join(dir, "data-wi-grant.json"), strings.Replace(string(dataPolicy), `"members":["`+member+`"]`, `"members":["`+member+`","user:extra@example.invalid"]`, 1), 0600)
+				write(filepath.Join(dir, "operator-wi-grant.json"), strings.Replace(string(dataPolicy), `"members":["`+member+`","`+operatorMember+`"]`, `"members":["`+member+`","`+operatorMember+`","user:extra@example.invalid"]`, 1), 0600)
 			}
 			if scenario == "workload-identity-extra-binding" {
-				write(filepath.Join(dir, "data-wi-grant.json"), strings.Replace(string(dataPolicy), `]}`, `,{"role":"roles/viewer","members":["user:extra@example.invalid"]}]}`, 1), 0600)
+				write(filepath.Join(dir, "operator-wi-grant.json"), strings.Replace(string(dataPolicy), `]}`, `,{"role":"roles/viewer","members":["user:extra@example.invalid"]}]}`, 1), 0600)
 			}
 			if scenario == "workload-identity-preexisting-binding" {
 				write(filepath.Join(dir, "data-wi-before.json"), string(dataPolicy), 0600)
@@ -3592,7 +3594,7 @@ exec "$FAKE_NATIVE_TIMEOUT" "$@"
 				workloadIdentitySum = sha256.Sum256([]byte(workloadIdentity))
 				write(filepath.Join(dir, "workload-identity.sha256"), fmt.Sprintf("%x\n", workloadIdentitySum), 0600)
 			}
-			for _, name := range []string{"data-create.json", "data-wi-before.json", "data-wi-grant.json", "workload-identity.json"} {
+			for _, name := range []string{"data-create.json", "data-wi-before.json", "data-wi-grant.json", "operator-wi-grant.json", "workload-identity.json"} {
 				content, err := os.ReadFile(filepath.Join(dir, name))
 				if err != nil || !json.Valid(content) {
 					t.Fatalf("invalid synthetic trust receipt %s: %v", name, err)

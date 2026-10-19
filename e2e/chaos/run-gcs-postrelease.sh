@@ -682,7 +682,7 @@ prepare_workload_identity_receipt() {
   wi_checksum=$runtime_receipt_dir/workload-identity.sha256
   data_create_receipt=$runtime_receipt_dir/data-create.json
   data_pre_policy_receipt=$runtime_receipt_dir/data-wi-before.json
-  data_policy_receipt=$runtime_receipt_dir/data-wi-grant.json
+  data_policy_receipt=$runtime_receipt_dir/operator-wi-grant.json
   private_file "$wi_receipt"
   private_file "$wi_checksum"
   private_file "$data_create_receipt"
@@ -694,6 +694,7 @@ prepare_workload_identity_receipt() {
   wi_data=$data_gsa_email
   wi_owner="rhiza-postrelease-$RHIZA_RUN_ID-$RHIZA_AUTH_CREATION_SHA"
   wi_member="serviceAccount:$RHIZA_GCP_PROJECT_ID.svc.id.goog[$ns/rhiza-gcs]"
+  wi_operator_member="serviceAccount:$RHIZA_GCP_PROJECT_ID.svc.id.goog[$ns/rhiza-operator]"
   wi_title="rhiza-$RHIZA_RUN_ID-expiry"
   wi_expression="request.time < timestamp('$RHIZA_AUTH_EXPIRES')"
   jq -e --arg data "$wi_data" --arg owner "$wi_owner" --arg name "projects/$RHIZA_GCP_PROJECT_ID/serviceAccounts/$wi_data" '
@@ -701,23 +702,26 @@ prepare_workload_identity_receipt() {
     (.uniqueId|type)=="string" and (.uniqueId|length)>0
   ' "$data_create_receipt" >/dev/null || return 1
   jq -e '((has("bindings")|not) or .bindings==[])' "$data_pre_policy_receipt" >/dev/null || return 1
-  jq -e --arg member "$wi_member" --arg title "$wi_title" --arg expression "$wi_expression" '
+  jq -e --arg data_member "$wi_member" --arg operator_member "$wi_operator_member" \
+    --arg title "$wi_title" --arg expression "$wi_expression" '
     (.bindings|type)=="array" and (.bindings|length)==1 and
     (.bindings[0]|keys)==["condition","members","role"] and
-    .bindings[0].role=="roles/iam.workloadIdentityUser" and .bindings[0].members==[$member] and
+    .bindings[0].role=="roles/iam.workloadIdentityUser" and
+    (.bindings[0].members|sort)==([$data_member,$operator_member]|sort) and
     (.bindings[0].condition|keys)==["expression","title"] and
     .bindings[0].condition=={title:$title,expression:$expression}
   ' "$data_policy_receipt" >/dev/null || return 1
   jq -e --arg run "$RHIZA_RUN_ID" --arg ns "$ns" \
-    --arg data "$wi_data" --arg owner "$wi_owner" --arg member "$wi_member" \
+    --arg data "$wi_data" --arg owner "$wi_owner" \
+    --arg data_member "$wi_member" --arg operator_member "$wi_operator_member" \
     --arg title "$wi_title" --arg expression "$wi_expression" --slurpfile created "$data_create_receipt" '
     keys==["gsa","ksa","namespace","run"] and .run==$run and .namespace==$ns and
     (.ksa|keys)==["gcp_service_account","name","return_principal_id_as_email","uid"] and
     .ksa.name=="rhiza-gcs" and (.ksa.uid|type)=="string" and (.ksa.uid|length)>0 and
     .ksa.gcp_service_account==$data and .ksa.return_principal_id_as_email==true and
-    (.gsa|keys)==["condition","email","member","owner","role","unique_id"] and .gsa.email==$data and
+    (.gsa|keys)==["condition","email","members","owner","role","unique_id"] and .gsa.email==$data and
     .gsa.unique_id==$created[0].uniqueId and .gsa.owner==$owner and
-    .gsa.member==$member and .gsa.role=="roles/iam.workloadIdentityUser" and
+    (.gsa.members|sort)==([$data_member,$operator_member]|sort) and .gsa.role=="roles/iam.workloadIdentityUser" and
     (.gsa.condition|keys)==["expression","title"] and
     .gsa.condition.title==$title and .gsa.condition.expression==$expression
   ' "$wi_receipt" >/dev/null
