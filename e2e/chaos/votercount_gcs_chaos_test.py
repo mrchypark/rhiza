@@ -82,10 +82,20 @@ class RunManifestTest(unittest.TestCase):
             shape["metadata"]["name"] = "<name>"
             shape["metadata"]["labels"]["app"] = "<app>"
             shape["spec"]["containers"][0]["name"] = container
+            shape["spec"].pop("affinity", None)
             return shape
 
         self.assertEqual(derived(pods["rhiza-inspector"], "<container>"),
                          derived(pods["rhiza-inspector-control"], "<container>"))
+
+    def test_probe_pair_is_pinned_to_one_node(self):
+        pods = {d["metadata"]["name"]: d for d in self.docs() if d["kind"] == "Pod"}
+        self.assertNotIn("affinity", pods["rhiza-inspector"]["spec"])
+        self.assertEqual(pods["rhiza-inspector-control"]["spec"]["affinity"], {
+            "podAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
+                {"labelSelector": {"matchLabels": {"chaos.rhiza.io/run": RUN["RUN_ID"],
+                                                     "app": "rhiza-inspector"}},
+                 "topologyKey": "kubernetes.io/hostname"}]}})
 
     def test_the_deny_all_policy_stays_bootstrap_owned(self):
         # Re-applying the bootstrap policy from this manifest would strip its
@@ -322,10 +332,11 @@ class InspectorIsolationTest(unittest.TestCase):
     def probing(self):
         chaos = self.stub()
         chaos.api_endpoint = lambda: ("10.0.0.1", "443")
-        chaos.validate_deny_all_policy = lambda: None
+        chaos.validate_deny_all_policy = lambda canonical=None, receipt="": {"metadata": {"uid": "p1"}}
+        chaos.validate_policy_inventory = lambda canonical, receipt: None
         chaos.capture_probe_pods = lambda: {harness.INSPECTOR: {"metadata": {"uid": "u1"}},
                                             harness.INSPECTOR_CONTROL: {"metadata": {"uid": "u2"}}}
-        chaos.validate_probe_pair = lambda receipts: ("u1", "u2")
+        chaos.validate_probe_pair = lambda receipts: ("u1", "u2", "n1")
         chaos.probe_egress = lambda pod, script, *args: "paired-network-policy-proof=%s\n" % pod
         chaos.get = lambda kind, name: {"metadata": {
             "uid": "u1" if name == harness.INSPECTOR else "u2"}}
@@ -358,6 +369,8 @@ class InspectorIsolationTest(unittest.TestCase):
         names = [e["event"] for e in chaos.events]
         self.assertIn("inspector_network_isolation_pass", names)
         self.assertNotIn("inspector_network_isolation_fail", names)
+        passed = next(e for e in chaos.events if e["event"] == "inspector_network_isolation_pass")
+        self.assertEqual(passed["node"], "n1")
 
     def test_a_reachable_inspector_fails_the_run_and_is_evidence(self):
         chaos = self.probing()
@@ -399,14 +412,56 @@ class InspectorIsolationTest(unittest.TestCase):
         control = json.loads(json.dumps(inspector))
         control["metadata"]["name"] = harness.INSPECTOR_CONTROL
         control["metadata"]["labels"]["app"] = harness.INSPECTOR_CONTROL
-        control["spec"]["nodeName"] = "n2"
         control["spec"]["containers"][0]["name"] = "control"
         chaos.get = lambda kind, name: inspector if name == harness.INSPECTOR else control
         receipts = {harness.INSPECTOR: {}, harness.INSPECTOR_CONTROL: {}}
-        chaos.validate_probe_pair(receipts)
+        self.assertEqual(chaos.validate_probe_pair(receipts)[2], "n1")
         control["spec"]["containers"][0]["image"] = "drifted"
         with self.assertRaises(AssertionError):
             chaos.validate_probe_pair(receipts)
+
+    def test_a_pair_split_across_nodes_fails_the_gate(self):
+        chaos = self.stub()
+        chaos.validate_probe_pod = lambda pod, receipt, name, app, container: pod["metadata"]["name"]
+        inspector = {"metadata": {"name": harness.INSPECTOR, "labels": {"app": harness.INSPECTOR}},
+                     "spec": {"nodeName": "n1", "containers": [{"name": "inspector", "image": "a"}]}}
+        control = json.loads(json.dumps(inspector))
+        control["metadata"]["name"] = harness.INSPECTOR_CONTROL
+        control["metadata"]["labels"]["app"] = harness.INSPECTOR_CONTROL
+        control["spec"]["containers"][0]["name"] = "control"
+        control["spec"]["nodeName"] = "n2"
+        chaos.get = lambda kind, name: inspector if name == harness.INSPECTOR else control
+        with self.assertRaises(AssertionError):
+            chaos.validate_probe_pair({harness.INSPECTOR: {}, harness.INSPECTOR_CONTROL: {}})
+
+    def test_the_deny_all_must_be_the_only_networkpolicy(self):
+        chaos = self.stub()
+        canonical = {"metadata": {"name": harness.INSPECTOR_POLICY, "uid": "p1"}}
+        chaos.k = lambda *argv: json.dumps({"items": [{"metadata": {"name": harness.INSPECTOR_POLICY,
+                                                                      "uid": "p1"}}]})
+        chaos.validate_policy_inventory(canonical, "inventory.json")
+        receipt = json.loads((chaos.out / "inventory.json").read_text())
+        self.assertEqual(receipt["items"][0]["metadata"]["uid"], "p1")
+        for items in ([],
+                      [{"metadata": {"name": harness.INSPECTOR_POLICY, "uid": "p9"}}],
+                      [{"metadata": {"name": harness.INSPECTOR_POLICY, "uid": "p1"}},
+                       {"metadata": {"name": "rhiza-inspector-additive-allow", "uid": "p2"}}]):
+            with self.subTest(items=items):
+                chaos.k = lambda *argv, items=items: json.dumps({"items": items})
+                with self.assertRaises(AssertionError):
+                    chaos.validate_policy_inventory(canonical, "inventory.json")
+
+    def test_an_additive_policy_after_probing_fails_the_gate(self):
+        chaos = self.probing()
+        inventories = iter([
+            {"items": [{"metadata": {"name": harness.INSPECTOR_POLICY, "uid": "p1"}}]},
+            {"items": [{"metadata": {"name": harness.INSPECTOR_POLICY, "uid": "p1"}},
+                        {"metadata": {"name": "rhiza-inspector-additive-allow", "uid": "p2"}}]}])
+        chaos.validate_policy_inventory = harness.VoterCountChaos.validate_policy_inventory.__get__(chaos)
+        chaos.k = lambda *argv: json.dumps(next(inventories))
+        with self.assertRaises(AssertionError):
+            chaos.verify_inspector_network_isolation()
+        self.assertIn("inspector_network_isolation_fail", [e["event"] for e in chaos.events])
 
     def test_api_endpoint_must_be_exact_https_443(self):
         self.assertEqual(harness.parse_https_443("https://34.64.0.1"), ("34.64.0.1", "443"))

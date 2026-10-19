@@ -431,17 +431,25 @@ class VoterCountChaos(Chaos):
 
     def validate_probe_pair(self, receipts):
         """Control-pod derivation contract (~lines 737-741): the control is the
-        inspector with only the name, app label and container name renamed."""
+        inspector with the name, app label and container name renamed, plus the
+        placement constraint that pins both to one scheduler-selected node so no
+        node-specific route or CNI fault can explain the denied probe."""
         inspector = self.get("pod", INSPECTOR)
         control = self.get("pod", INSPECTOR_CONTROL)
         inspector_uid = self.validate_probe_pod(inspector, receipts[INSPECTOR], INSPECTOR, INSPECTOR,
                                                 "inspector")
         control_uid = self.validate_probe_pod(control, receipts[INSPECTOR_CONTROL], INSPECTOR_CONTROL,
                                               INSPECTOR_CONTROL, "control")
+        node = inspector["spec"]["nodeName"]
+        assert node == control["spec"]["nodeName"], \
+            "inspector and control must share one node: %s != %s" % (node, control["spec"]["nodeName"])
 
         def shape(pod, container):
             spec = json.loads(json.dumps(pod["spec"]))
-            spec.pop("nodeName", None)  # placement is the scheduler's, not the derivation's
+            # Placement is asserted equal above, so it is not a shape difference:
+            # the control's co-location constraint is what makes it equal.
+            for placement in ("nodeName", "affinity"):
+                spec.pop(placement, None)
             spec["containers"][0]["name"] = container
             return spec
 
@@ -452,21 +460,33 @@ class VoterCountChaos(Chaos):
         assert inspector_labels.pop("app") == INSPECTOR, inspector_labels
         assert control_labels.pop("app") == INSPECTOR_CONTROL, control_labels
         assert inspector_labels == control_labels, control_labels
-        return inspector_uid, control_uid
+        return inspector_uid, control_uid, node
 
-    def validate_deny_all_policy(self):
+    def validate_deny_all_policy(self, canonical=None, receipt="inspector-networkpolicy-bootstrap.json"):
         """The bootstrap owns rhiza-inspector-deny-all; this run only observes it,
         because re-applying it would strip the bootstrap's auth-owner annotation."""
         policy = self.get("networkpolicy.networking.k8s.io", INSPECTOR_POLICY)
         metadata, spec = policy["metadata"], policy["spec"]
         selector = {"chaos.rhiza.io/run": self.run_id, "app": INSPECTOR}
         assert metadata["namespace"] == self.ns and (metadata.get("ownerReferences") or []) == []
+        if canonical is not None:
+            assert metadata["uid"] == canonical["metadata"]["uid"], "deny-all policy was replaced"
         assert metadata["labels"] == {"chaos.rhiza.io/run": self.run_id, "app": INSPECTOR}, metadata["labels"]
         assert spec["podSelector"] == {"matchLabels": selector}, spec["podSelector"]
         assert sorted(spec.get("policyTypes") or []) == ["Egress", "Ingress"], spec.get("policyTypes")
         assert not spec.get("ingress") and not spec.get("egress"), "deny-all must carry no rules"
-        (self.out / "inspector-networkpolicy-bootstrap.json").write_text(json.dumps(policy, indent=2))
+        (self.out / receipt).write_text(json.dumps(policy, indent=2))
         return policy
+
+    def validate_policy_inventory(self, canonical, receipt):
+        """Source singleton receipt (~lines 1518-1524): the canonical deny-all must be
+        the only NetworkPolicy, so no additive policy can explain the denial."""
+        inventory = json.loads(self.k("get", "networkpolicies.networking.k8s.io", "-o", "json"))
+        items = inventory.get("items") or []
+        (self.out / receipt).write_text(json.dumps(inventory, indent=2))
+        assert len(items) == 1 and items[0]["metadata"]["uid"] == canonical["metadata"]["uid"], \
+            "unexpected additive NetworkPolicy present: %s" % sorted(i["metadata"]["name"] for i in items)
+        return inventory
 
     def probe_egress(self, pod, script, *args):
         return self.command(["kubectl", "--context", self.context, "-n", self.ns, "exec", pod,
@@ -493,15 +513,18 @@ class VoterCountChaos(Chaos):
             return receipt
         try:
             host, port = self.api_endpoint()
-            self.validate_deny_all_policy()
+            policy = self.validate_deny_all_policy()
+            self.validate_policy_inventory(policy, "inspector-networkpolicies-bootstrap.json")
             receipts = self.capture_probe_pods()
-            inspector_uid, control_uid = self.validate_probe_pair(receipts)
+            inspector_uid, control_uid, node = self.validate_probe_pair(receipts)
             control_before = self.probe_egress(INSPECTOR_CONTROL, CONTROL_EGRESS_PROBE, host, port, "before")
             denied = self.probe_egress(INSPECTOR, INSPECTOR_EGRESS_PROBE, host, port)
             control_after = self.probe_egress(INSPECTOR_CONTROL, CONTROL_EGRESS_PROBE, host, port, "after")
             for name, receipt in receipts.items():
                 assert self.get("pod", name)["metadata"]["uid"] == receipt["metadata"]["uid"], \
                     "probe Pod %s was replaced during the isolation check" % name
+            self.validate_deny_all_policy(policy, "inspector-terminal-networkpolicy.json")
+            self.validate_policy_inventory(policy, "inspector-networkpolicies-terminal.json")
             receipt = "PASS inspector-network-isolation"
             (self.out / "inspector-network-isolation.txt").write_text(receipt + "\n")
             for label, output in (("control-before-reachable", control_before),
@@ -509,7 +532,7 @@ class VoterCountChaos(Chaos):
                                   ("control-after-reachable", control_after)):
                 (self.out / ("inspector-%s.txt" % label)).write_text(output)
             self.event("inspector_network_isolation_pass", target_host=host, target_port=port,
-                       inspector_uid=inspector_uid, control_uid=control_uid,
+                       node=node, inspector_uid=inspector_uid, control_uid=control_uid,
                        control_before=control_before.strip(), inspector_denied=denied.strip(),
                        control_after=control_after.strip())
         except Exception as exc:

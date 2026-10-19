@@ -129,10 +129,12 @@ run-owned cluster-scoped objects during cleanup and fails the run if any remain.
 
 The positive set also gates on the bootstrap-owned `rhiza-inspector-deny-all`
 NetworkPolicy: the driver creates the paired `rhiza-inspector` and
-`rhiza-inspector-control` Pods just-in-time, requires the control to reach the
-Kubernetes API, requires the inspector to be denied, and requires a failing
-probe to fail the run. The namespace quota therefore has to admit seven Pods
-(three voters, operator, authority, and the two probe Pods) while the probe runs.
+`rhiza-inspector-control` Pods just-in-time, requires both to share one node,
+requires the deny-all to be the namespace's only NetworkPolicy before and after
+probing, requires the control to reach the Kubernetes API, requires the
+inspector to be denied, and requires a failing probe to fail the run. The
+namespace quota therefore has to admit seven Pods (three voters, operator,
+authority, and the two probe Pods) while the probe runs.
 
 The harness is split behind `--scenarios` (launcher: `RHIZA_SCENARIOS`):
 
