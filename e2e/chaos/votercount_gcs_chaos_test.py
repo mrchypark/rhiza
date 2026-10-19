@@ -425,20 +425,23 @@ metadata:
         documents = list(yaml.safe_load_all(probe))
         for document, uid in zip(documents, ("inspector-uid", "control-uid")):
             document["metadata"]["uid"] = uid
-        with tempfile.TemporaryDirectory() as output:
-            chaos.out = Path(output)
-            chaos.command = mock.Mock(return_value="\n".join(json.dumps(document) for document in documents))
-            chaos.wait = mock.Mock(return_value=True)
+        # kubectl concatenates its documents with no separator, so the zero
+        # separator shape is the one that actually failed.
+        for separator in ("\n", ""):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as output:
+                chaos.out = Path(output)
+                chaos.command = mock.Mock(return_value=separator.join(json.dumps(document) for document in documents))
+                chaos.wait = mock.Mock(return_value=True)
 
-            receipts = chaos.capture_probe_pods()
+                receipts = chaos.capture_probe_pods()
 
-            self.assertEqual(receipts, {document["metadata"]["name"]: document for document in documents})
-            self.assertEqual(chaos.command.call_args.args[0][-5:],
-                             ["create", "-f", chaos.args.inspector_probe, "-o", "json"])
-            self.assertEqual(chaos.wait.call_count, 2)
-            for document in documents:
-                name = document["metadata"]["name"]
-                self.assertEqual(json.loads((chaos.out / (name + "-created.json")).read_text()), document)
+                self.assertEqual(receipts, {document["metadata"]["name"]: document for document in documents})
+                self.assertEqual(chaos.command.call_args.args[0][-5:],
+                                 ["create", "-f", chaos.args.inspector_probe, "-o", "json"])
+                self.assertEqual(chaos.wait.call_count, 2)
+                for document in documents:
+                    name = document["metadata"]["name"]
+                    self.assertEqual(json.loads((chaos.out / (name + "-created.json")).read_text()), document)
 
     def test_exclusion_records_a_scoped_receipt_without_probing(self):
         chaos = self.stub()
@@ -564,7 +567,10 @@ metadata:
 class JsonDocumentParsingTest(unittest.TestCase):
     def test_parse_json_documents_splits_kubectl_multi_document_output(self):
         documents = [{"metadata": {"name": "first"}}, {"metadata": {"name": "second"}}]
-        self.assertEqual(parse_json_documents("\n".join(json.dumps(document) for document in documents)), documents)
+        for separator in ("\n", ""):
+            with self.subTest(separator=separator):
+                self.assertEqual(parse_json_documents(separator.join(json.dumps(document) for document in documents)),
+                                 documents)
 
 
 class LauncherDigestTest(unittest.TestCase):

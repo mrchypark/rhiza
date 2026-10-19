@@ -1,6 +1,12 @@
 name: Operator image
 
 on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Commit SHA to build (defaults to the dispatched ref)
+        required: false
+        type: string
   pull_request:
   release:
     types: [published]
@@ -10,6 +16,7 @@ permissions:
 
 jobs:
   image:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -43,3 +50,70 @@ jobs:
           push: ${{ github.event_name == 'release' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'mrchypark/rhiza'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 0
+      - name: Resolve the immutable commit and tag
+        id: source
+        run: |
+          {
+            sha=$(git rev-parse HEAD)
+            echo "sha=$sha"
+            echo "tag=sha-$sha"
+            echo "image=ghcr.io/$GITHUB_REPOSITORY_OWNER/rhiza-operator:sha-$sha"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to retarget an existing immutable tag
+        run: |
+          if docker manifest inspect "${{ steps.source.outputs.image }}" >/dev/null 2>&1; then
+            echo "::error::${{ steps.source.outputs.image }} already exists; immutable tags are never retargeted" >&2
+            exit 1
+          fi
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: Dockerfile.operator
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.source.outputs.image }}
+      - name: Verify anonymous pull access for the harness cluster
+        run: |
+          # The GCS/Chaos harness sets no imagePullSecrets, so the package must be
+          # publicly pullable. GHCR may create a fresh package private, and the
+          # immutable tag guard blocks a rerun, so record the real state instead
+          # of failing: the digest is still published either way.
+          owner="${{ github.repository_owner }}"
+          token=$(curl -fsS "https://ghcr.io/token?service=ghcr.io&scope=repository:$owner/rhiza-operator:pull" | jq -r .token)
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "https://ghcr.io/v2/$owner/rhiza-operator/manifests/${{ steps.source.outputs.tag }}")
+          if [ "$code" = "200" ]; then
+            echo 'anonymous_pull=public' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::ghcr.io/$owner/rhiza-operator is not anonymously pullable (HTTP $code); set the package visibility to public before the harness pulls it" >&2
+            echo "anonymous_pull=private (HTTP $code)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Record the immutable digest
+        run: |
+          {
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Operator image: `%s`\n\n' "${{ steps.source.outputs.image }}"
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Digest: `%s`\n' "${{ steps.build.outputs.digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
