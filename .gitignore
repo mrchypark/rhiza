@@ -12,6 +12,10 @@
 # Output of go coverage
 *.out
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Go workspace
 go.work
 go.work.sum

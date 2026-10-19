@@ -302,6 +302,10 @@ jobs:
         run: |
           python3 e2e/chaos/operator_fixture_test.py
           python3 e2e/chaos/operator_recovery_test.py
+      - name: voterCount GCS/Chaos harness contract
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check 'PyYAML==6.0.3'
+          python3 e2e/chaos/votercount_gcs_chaos_test.py
       - name: Learner checkpoint adoption crash and lease boundaries
         env:
           CGO_ENABLED: 1

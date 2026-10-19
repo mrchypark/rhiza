@@ -167,6 +167,7 @@ expiry="title=rhiza-$RHIZA_RUN_ID-expiry,expression=request.time < timestamp('$R
 cluster_condition="title=rhiza-$RHIZA_RUN_ID-cluster,expression=resource.type == 'container.googleapis.com/Cluster' && resource.name == 'projects/$project/locations/$RHIZA_GKE_LOCATION/clusters/$RHIZA_GKE_CLUSTER' && request.time < timestamp('$RHIZA_AUTH_EXPIRES')"
 ci_member=principalSet://iam.googleapis.com/projects/$number/locations/global/workloadIdentityPools/$pool/attribute.repository_id/${RHIZA_GITHUB_REPOSITORY_ID:-0}
 data_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-gcs]
+operator_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-operator]
 oidc="assertion.repository_id == '${RHIZA_GITHUB_REPOSITORY_ID:-0}' && assertion.repository_owner_id == '${RHIZA_GITHUB_OWNER_ID:-0}' && assertion.ref == 'refs/heads/main' && assertion.event_name == 'workflow_dispatch' && assertion.workflow_ref == '${RHIZA_GITHUB_WORKFLOW_REF:-unused}' && assertion.workflow_sha == '$RHIZA_WORKFLOW_SHA' && assertion.environment == '${RHIZA_GITHUB_ENVIRONMENT:-unused}'"
 mapping='google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref,attribute.event_name=assertion.event_name,attribute.workflow_ref=assertion.workflow_ref,attribute.workflow_sha=assertion.workflow_sha,attribute.environment=assertion.environment'
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
@@ -374,7 +375,7 @@ seal_workload_identity() {
     create_receipt=$RHIZA_AUTH_STATE/data-create.json
     ksa_receipt=$RHIZA_AUTH_STATE/data-ksa-identity.json
     pre_policy_receipt=$RHIZA_AUTH_STATE/data-wi-before.json
-    policy_receipt=$RHIZA_AUTH_STATE/data-wi-grant.json
+    policy_receipt=$RHIZA_AUTH_STATE/operator-wi-grant.json
     current_receipt=$RHIZA_AUTH_STATE/data-post-grant-identity.json
     wi_receipt=$RHIZA_AUTH_STATE/workload-identity.json
     wi_checksum=$RHIZA_AUTH_STATE/workload-identity.sha256
@@ -395,12 +396,13 @@ seal_workload_identity() {
       .metadata.annotations["iam.gke.io/return-principal-id-as-email"]=="true" and
       .automountServiceAccountToken==false
     ' "$ksa_receipt" >/dev/null || die 'Live data KSA identity/mode rejected'
-    jq -e --arg member "$data_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+    jq -e --arg data_member "$data_member" --arg operator_member "$operator_member" \
+      --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
       --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
       (.bindings|type)=="array" and (.bindings|length)==1 and
       (.bindings[0]|keys)==["condition","members","role"] and
       .bindings[0].role=="roles/iam.workloadIdentityUser" and
-      .bindings[0].members==[$member] and
+      (.bindings[0].members|sort)==([$data_member,$operator_member]|sort) and
       (.bindings[0].condition|keys)==["expression","title"] and
       .bindings[0].condition=={title:$title,expression:$expression}
     ' "$policy_receipt" >/dev/null || die 'Live data GSA workloadIdentityUser binding rejected'
@@ -411,11 +413,12 @@ seal_workload_identity() {
     gsa_uid=$(jq -r '.uniqueId' "$create_receipt")
     jq -n --arg run "$RHIZA_RUN_ID" --arg ns "$ns" --arg uid "$ksa_uid" --arg data "$data" \
       --arg gsa_uid "$gsa_uid" --arg owner "$owner" \
-      --arg member "$data_member" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg data_member "$data_member" --arg operator_member "$operator_member" \
+      --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
       --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{
         run:$run, namespace:$ns,
         ksa:{name:"rhiza-gcs",uid:$uid,gcp_service_account:$data,return_principal_id_as_email:true},
-        gsa:{email:$data,unique_id:$gsa_uid,owner:$owner,member:$member,role:"roles/iam.workloadIdentityUser",condition:{title:$title,expression:$expression}}
+        gsa:{email:$data,unique_id:$gsa_uid,owner:$owner,members:[$data_member,$operator_member],role:"roles/iam.workloadIdentityUser",condition:{title:$title,expression:$expression}}
       }' > "$wi_receipt"
     chmod 600 "$wi_receipt"
     sha256_file "$wi_receipt" > "$wi_checksum"
@@ -1281,7 +1284,7 @@ check_folder_role() {
 }
 if [ "$mode" = mint-local ]; then
     [ "$auth_mode" = local ] || die 'Local mode required'
-    for required in local-prepared kubernetes data-wi-grant folder-grant fixture-secret; do
+    for required in local-prepared kubernetes data-wi-grant operator-wi-grant folder-grant fixture-secret; do
         owned "$required" || die 'Local bootstrap did not complete; no mint from partial/failed apply'
     done
     if [ -f "$RHIZA_AUTH_STATE/inflight" ]; then
@@ -1448,6 +1451,8 @@ if [ "$mode" = apply ]; then
     fi
     record data-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
     mark data-wi-grant
+    record operator-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$operator_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
+    mark operator-wi-grant
     record data-post-grant-identity g iam service-accounts describe "$data" --format=json
     seal_workload_identity
     record folder-grant folder_iam add
@@ -1509,6 +1514,7 @@ fi
 if owned folder-grant; then record revoke-folder folder_iam remove; fi
 if owned ci-wi-grant; then record revoke-ci-wi g iam service-accounts remove-iam-policy-binding "$ci" --member="$ci_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
 if owned data-wi-grant; then record revoke-data-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
+if owned operator-wi-grant; then record revoke-operator-wi g iam service-accounts remove-iam-policy-binding "$data" --member="$operator_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
 if owned kubernetes; then
     # The preserved original bootstrap matched both fault kinds in -faults.
     # A reviewed transition records the added pair in a separate working
