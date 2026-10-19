@@ -202,3 +202,12 @@ quorum is lost. The StatefulSet remains the deployment basis. The kind executor
 in `e2e/chaos/` is CI-only; production runtime/storage isolation still requires an
 environment-specific executor. See the
 [execution contract and CI evidence](../../docs/automatic-recovery-design.md#kubernetes-backend-실행-계약).
+
+Dead-Pod incidents, where no supervisor can ever report an exit, can use the
+optional external attestor of `rhiza-fencer` instead. It is off unless every one
+of `RHIZA_FENCE_ATTESTOR_URL`, `RHIZA_FENCE_ATTESTOR_TOKEN_FILE` and
+`RHIZA_FENCE_ATTESTOR_CA_FILE` is set on the authority Deployment, and it grants
+the operator no node, CRI, or cloud credential. `deploy/operator/fencing/authority.yaml`
+ships the commented wiring. Without it this backend behaves exactly as before: an
+incarnation without a cooperative exit receipt stays pending. See
+[Independent evidence](../../docs/kubernetes-fencing.md#independent-evidence-for-an-unreachable-incarnation).

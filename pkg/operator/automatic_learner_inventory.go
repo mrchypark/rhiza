@@ -237,7 +237,7 @@ func worstCaseGenerationTargets(state *autoControl) int {
 func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoControl, sts object, pod object) (learnerIncarnation, error) {
 	i := state.Intent
 	name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
-	entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID, Target: FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: i.LearnerWAL}}
+	entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID, Target: capturedFenceIdentity(FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: i.LearnerWAL}, pod)}
 	if uid == "" || name != i.LearnerName || (i.LearnerUID != "" && uid != i.LearnerUID) {
 		return entry, fmt.Errorf("learner Pod identity differs")
 	}

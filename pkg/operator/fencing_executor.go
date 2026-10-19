@@ -26,7 +26,14 @@ const fencingCredentialAnnotation = "rhiza.mrchypark.dev/fencing-credential-uid"
 // FencingExecutor is a namespaced cooperative authority. Its credentials are
 // separate from the operator and application accounts. Applications may request
 // only transitions for their TokenReview-authenticated Pod incarnation.
-type FencingExecutor struct{ Kube *Kubernetes }
+//
+// Attestor is optional external evidence for an incarnation no supervisor can
+// report on. It is consulted only after the cooperative ledger is durably closed
+// and only when the cooperative proof is still incomplete.
+type FencingExecutor struct {
+	Kube     *Kubernetes
+	Attestor FenceAttestor
+}
 
 type fenceLedger struct {
 	StatefulSetUID string         `json:"statefulSetUID"`
@@ -447,24 +454,9 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 	if err != nil {
 		return err
 	}
-	pods, err := e.controller().ownedPods(ctx, r.StatefulSetUID)
+	current, err := e.currentInventory(ctx, r.StatefulSetUID, nodes)
 	if err != nil {
 		return err
-	}
-	var current []string
-	wanted := map[string]bool{}
-	for _, node := range nodes {
-		wanted[node] = true
-	}
-	for _, pod := range pods {
-		name := str(nested(pod, "metadata", "name"))
-		if len(wanted) > 0 && !wanted[name] {
-			continue
-		}
-		if err := validateSupervisedPod(pod); err != nil {
-			return ErrFencePending
-		}
-		current = append(current, str(nested(pod, "metadata", "uid")))
 	}
 	for _, target := range r.Targets {
 		found := false
@@ -478,9 +470,104 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 		}
 	}
 	if !state.Ledger.CompleteNodes(r.OperationID, hash, nodes, current) {
-		return ErrFencePending
+		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
 	}
 	proof := &FenceProof{OperationID: r.OperationID, SourceClusterID: r.SourceClusterID, BindingUID: r.BindingUID, RequestHash: hash, ProofID: "cooperative-" + hashJSON(state), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+	record.Status.Proof = proof
+	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
+}
+
+// currentInventory lists the Pod UIDs in the fenced scope. An unsupported Pod
+// shape blocks independently of which backend would report termination.
+func (e *FencingExecutor) currentInventory(ctx context.Context, uid string, nodes []string) ([]string, error) {
+	pods, err := e.controller().ownedPods(ctx, uid)
+	if err != nil {
+		return nil, err
+	}
+	wanted := map[string]bool{}
+	for _, node := range nodes {
+		wanted[node] = true
+	}
+	var current []string
+	for _, pod := range pods {
+		name := str(nested(pod, "metadata", "name"))
+		if len(wanted) > 0 && !wanted[name] {
+			continue
+		}
+		if err := validateSupervisedPod(pod); err != nil {
+			return nil, ErrFencePending
+		}
+		current = append(current, str(nested(pod, "metadata", "uid")))
+	}
+	return current, nil
+}
+
+// ledgerHash binds the exact durable closed ledger, including the namespace that
+// owns it, so evidence bound to one closed scope cannot authorize another.
+func (e *FencingExecutor) ledgerHash(state fenceLedger) string {
+	return hashJSON([]any{e.Kube.Namespace, state})
+}
+
+// storageScope binds the exact object-store location of the fenced generation.
+// It comes from the supervised workload configuration, never from a global
+// bucket guess or from the attestor's own claim.
+func (e *FencingExecutor) storageScope(ctx context.Context, sts object, source string) (AttestationStoreScope, error) {
+	containers := list(nested(sts, "spec", "template", "spec", "containers"))
+	if len(containers) == 0 {
+		return AttestationStoreScope{}, fmt.Errorf("fencing: workload container is unavailable")
+	}
+	// shortcut: the supervised contract is one application container; a
+	// multi-container template would have to name its object-store container.
+	env, err := e.controller().environment(ctx, asObject(containers[0]))
+	if err != nil {
+		return AttestationStoreScope{}, err
+	}
+	identity := StoreIdentity(env)
+	scope := AttestationStoreScope{Provider: identity["RHIZA_OBJSTORE_PROVIDER"], Bucket: identity["RHIZA_OBJSTORE_BUCKET"], Prefix: path.Join(identity["RHIZA_OBJSTORE_PREFIX"], source)}
+	if scope.Provider == "" || scope.Bucket == "" || scope.Provider == "filesystem" {
+		return scope, fmt.Errorf("fencing: workload object store is not a shared store")
+	}
+	return scope, nil
+}
+
+// independentFence asks the configured attestor to prove that the exact closed
+// incarnation is terminally gone. Every other outcome leaves the fence pending:
+// no attestor, an unverifiable response, a ledger that moved during attestation,
+// or a Pod inventory that changed. Pod absence, a DELETE response and a failed
+// probe are never accepted as termination proof.
+func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string, record *fenceResource, r FenceRequest, sts object, state fenceLedger, hash string, nodes, current []string) error {
+	if e.Attestor == nil {
+		return ErrFencePending
+	}
+	storage, err := e.storageScope(ctx, sts, r.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	scope, err := buildIndependentScope(state, r, hash, e.ledgerHash(state), current, storage)
+	if err != nil {
+		return ErrFencePending
+	}
+	response, err := e.Attestor.Attest(ctx, scope.attestationRequest())
+	if err != nil {
+		return err
+	}
+	proof, err := validateIndependent(scope, response)
+	if err != nil {
+		return ErrFencePending
+	}
+	// Evidence is only valid for the ledger and Pod inventory it was issued
+	// against. Never persist a proof that went stale while the attestor worked.
+	rechecked, err := e.read(ctx, state.StatefulSetUID, state.Ledger.SourceClusterID)
+	if err != nil {
+		return err
+	}
+	again, err := e.currentInventory(ctx, r.StatefulSetUID, nodes)
+	if err != nil {
+		return err
+	}
+	if e.ledgerHash(rechecked) != scope.ledgerHash || !sameStrings(again, current) {
+		return ErrFencePending
+	}
 	record.Status.Proof = proof
 	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
 }

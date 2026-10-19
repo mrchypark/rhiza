@@ -49,6 +49,10 @@ spec:
                       pod: {type: string, maxLength: 256, minLength: 1}
                       podUID: {type: string, maxLength: 256}
                       walIdentity: {type: string, maxLength: 256}
+                      nodeName: {type: string, maxLength: 256}
+                      nodeUID: {type: string, maxLength: 256}
+                      containerID: {type: string, maxLength: 256}
+                      imageID: {type: string, maxLength: 256}
             status:
               type: object
               properties:
@@ -64,3 +68,83 @@ spec:
                     processesTerminated: {type: boolean}
                     recreationBlocked: {type: boolean}
                     storageQuiesced: {type: boolean}
+                    independent:
+                      description: >-
+                        Structured external evidence for this closed operation. It
+                        is additive to the durable cooperative ledger, never a
+                        replacement for it, and never a Pod-deletion claim.
+                      type: object
+                      required: [version, provider, mode, observedAt, requestHash, ledgerHash, barrierID, barrier, runtimes, storage]
+                      properties:
+                        version: {type: integer, enum: [1]}
+                        provider: {type: string, maxLength: 256, minLength: 1}
+                        mode: {type: string, maxLength: 256, minLength: 1}
+                        observedAt: {type: string, maxLength: 64, minLength: 1}
+                        requestHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                        ledgerHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                        barrierID: {type: string, maxLength: 256, minLength: 1}
+                        barrier:
+                          type: object
+                          required: [kind, closedOperationID, closedRequestHash, currentPodUIDs, deniedAt]
+                          properties:
+                            kind: {type: string, maxLength: 256, minLength: 1}
+                            closedOperationID: {type: string, maxLength: 256, minLength: 1}
+                            closedRequestHash: {type: string, pattern: '^[a-f0-9]{64}$'}
+                            currentPodUIDs:
+                              type: array
+                              maxItems: 64
+                              items: {type: string, maxLength: 256, minLength: 1}
+                            deniedAt: {type: string, maxLength: 64, minLength: 1}
+                        runtimes:
+                          description: >-
+                            Exactly one terminal entry per fenced Pod incarnation,
+                            restating the identity captured before the fault.
+                          type: array
+                          maxItems: 64
+                          items:
+                            type: object
+                            required: [nodeName, nodeUID, instanceID, podName, podUID, containerIDs, imageIDs, runIDs, walIdentities, state, runtimeEvidence]
+                            properties:
+                              nodeName: {type: string, maxLength: 256, minLength: 1}
+                              nodeUID: {type: string, maxLength: 256, minLength: 1}
+                              instanceID: {type: string, maxLength: 256, minLength: 1}
+                              podName: {type: string, maxLength: 256, minLength: 1}
+                              podUID: {type: string, maxLength: 256, minLength: 1}
+                              containerIDs:
+                                type: array
+                                minItems: 1
+                                maxItems: 16
+                                items: {type: string, maxLength: 256, minLength: 1}
+                              imageIDs:
+                                type: array
+                                minItems: 1
+                                maxItems: 16
+                                items: {type: string, maxLength: 256, minLength: 1}
+                              runIDs:
+                                type: array
+                                minItems: 1
+                                maxItems: 64
+                                items: {type: string, maxLength: 256, minLength: 1}
+                              walIdentities:
+                                type: array
+                                maxItems: 64
+                                items: {type: string, maxLength: 256}
+                              state: {type: string, enum: [exited, terminated]}
+                              runtimeEvidence: {type: string, maxLength: 4096, minLength: 1}
+                        storage:
+                          description: >-
+                            Writer absence and object stability across a quiet
+                            window. It is not a clean engine drain.
+                          type: object
+                          required: [provider, bucket, prefix, quietWindowSeconds, headGeneration, currentGeneration, inventoryDigest, stable, observedFrom, observedTo]
+                          properties:
+                            provider: {type: string, maxLength: 256, minLength: 1}
+                            bucket: {type: string, maxLength: 256, minLength: 1}
+                            prefix: {type: string, maxLength: 1024}
+                            quietWindowSeconds: {type: integer, minimum: 30}
+                            headGeneration: {type: string, maxLength: 256, minLength: 1}
+                            currentGeneration: {type: string, maxLength: 256, minLength: 1}
+                            inventoryDigest: {type: string, maxLength: 256, minLength: 1}
+                            stable: {type: boolean}
+                            observedFrom: {type: string, maxLength: 64, minLength: 1}
+                            observedTo: {type: string, maxLength: 64, minLength: 1}

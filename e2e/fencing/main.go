@@ -751,7 +751,7 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 	if err != nil || failedStatus.NodeID != "rhiza-2" || failedStatus.ClusterID != "chaos-source" || !failedStatus.Voting || failedStatus.Pending || failedStatus.WALIdentity == "" {
 		return nil, fmt.Errorf("failed voter identity unavailable: %v", err)
 	}
-	failed := operator.FenceTarget{NodeID: string(failedStatus.NodeID), Pod: "rhiza-2", PodUID: text(nested(failedPod, "metadata", "uid")), WALIdentity: failedStatus.WALIdentity}
+	failed := capturedTarget(operator.FenceTarget{NodeID: string(failedStatus.NodeID), Pod: "rhiza-2", PodUID: text(nested(failedPod, "metadata", "uid")), WALIdentity: failedStatus.WALIdentity}, failedPod)
 	partition, err := partitionPeer(ctx, failed)
 	if err != nil {
 		return nil, err
@@ -858,7 +858,7 @@ func qualifyOnline(ctx context.Context, survivor *forward, stsUID, bindingUID, o
 			return nil, fmt.Errorf("promoted voter %s membership differs: %v", ref.NodeID, statusErr)
 		}
 		configID = status.ConfigID
-		targets = append(targets, operator.FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: text(nested(pod, "metadata", "uid")), WALIdentity: status.WALIdentity})
+		targets = append(targets, capturedTarget(operator.FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: text(nested(pod, "metadata", "uid")), WALIdentity: status.WALIdentity}, pod))
 		observations = append(observations, obj{"podUID": nested(pod, "metadata", "uid"), "pod": ref.Pod, "membership": status})
 		if ref.Pod == m.ReplacementPod {
 			if err := verifyLearnerBinding(ctx, pod, child, status, stsUID, bindingUID, voterRequest.OperationID, out); err != nil {
@@ -935,6 +935,18 @@ func sameTargets(actual, expected []operator.FenceTarget) bool {
 		delete(seen, target.NodeID)
 	}
 	return true
+}
+
+// capturedTarget mirrors the operator's immutable identity capture, so the
+// expected fence target can be compared with the published one exactly.
+func capturedTarget(target operator.FenceTarget, pod obj) operator.FenceTarget {
+	target.NodeName = text(nested(pod, "spec", "nodeName"))
+	if statuses, ok := nested(pod, "status", "containerStatuses").([]any); ok && len(statuses) == 1 {
+		status, _ := statuses[0].(map[string]any)
+		target.ContainerID = text(status["containerID"])
+		target.ImageID = text(status["imageID"])
+	}
+	return target
 }
 
 func membershipMatches(status network.MembershipStatus, refs []operator.VoterPod, nodeID string) bool {
