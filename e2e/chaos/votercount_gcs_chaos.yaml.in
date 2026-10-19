@@ -1,0 +1,257 @@
+# Rendered only after e2e/chaos/bootstrap-gcs-postrelease.sh has applied the
+# namespace, rhiza-gcs KSA, quota and the four admission policies. This set adds
+# the voterCount operator path: one HTTP bind (RHIZA_BIND_ADDR port must equal
+# spec.httpPort), a supervised bootstrap StatefulSet that exports no
+# RHIZA_CLUSTER_MEMBERS, the operator, and the real cooperative fencing authority.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rhiza-config
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+data:
+  RHIZA_CLUSTER_ID: __CLUSTER_ID__
+  RHIZA_BIND_ADDR: 0.0.0.0:8080
+  RHIZA_PEER_ADDR: 0.0.0.0:9090
+  RHIZA_DATA_DIR: /data
+  RHIZA_OBJSTORE_PROVIDER: gcs
+  RHIZA_OBJSTORE_BUCKET: __GCS_BUCKET__
+  RHIZA_OBJSTORE_PREFIX: __GCS_PREFIX__
+  RHIZA_OBJSTORE_DURABILITY: before-ack
+  RHIZA_OBJSTORE_MAX_RETRIES: "1"
+  RHIZA_CHECKPOINT_INTERVAL: 10s
+  RHIZA_OBJSTORE_SYNC_INTERVAL: 5s
+  RHIZA_OBJSTORE_GC_INTERVAL: 0s
+  RHIZA_ENABLE_RECONFIGURATION: "true"
+  GOMEMLIMIT: 384MiB
+---
+# Spec.serviceName must name this headless Service; publishNotReadyAddresses keeps
+# DNS stable for membership probes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhiza-headless
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
+  ports:
+    - {name: http, port: 8080}
+    - {name: quic, port: 9090, protocol: UDP}
+---
+# Bootstrap opt-in: replicas start at 0, ordinals.start is explicit 0, and no
+# RHIZA_CLUSTER_MEMBERS is exported. The operator writes the reservation object,
+# installs the immutable bootstrap Secret, patches env and scales to voterCount.
+# Container runs the supervised writer so the cooperative authority owns the fence.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rhiza-voter
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+spec:
+  serviceName: rhiza-headless
+  replicas: 0
+  podManagementPolicy: Parallel
+  updateStrategy: {type: OnDelete}
+  ordinals: {start: 0}
+  selector:
+    matchLabels: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
+  template:
+    metadata:
+      labels:
+        app: 'rhiza-voter'
+        chaos.rhiza.io/run: '__RUN_ID__'
+      annotations:
+        rhiza.mrchypark.dev/cooperative-fencing: "1"
+    spec:
+      serviceAccountName: rhiza-gcs
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: 'rhiza-voter', chaos.rhiza.io/run: '__RUN_ID__'}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: rhiza
+          image: __HOST_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: [/usr/local/bin/rhiza-fencer]
+          args: [supervise, --, /usr/local/bin/rhiza]
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          envFrom:
+            - configMapRef: {name: rhiza-config}
+          env:
+            - name: RHIZA_NODE_ID
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_UID
+              valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+            - name: FENCER_AUTHORITY_URL
+              value: https://rhiza-fencer:9444/v1/supervisor
+            - name: FENCER_CA_FILE
+              value: /fencer-ca/ca.crt
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: quic, containerPort: 9090, protocol: UDP}
+          readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 2}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi, ephemeral-storage: 128Mi}
+            limits: {cpu: 750m, memory: 512Mi, ephemeral-storage: 1Gi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: temporary, mountPath: /tmp}
+            - {name: fence-socket, mountPath: /run/rhiza-fencer}
+            - {name: fence-token, mountPath: /var/run/secrets/rhiza-fencer, readOnly: true}
+            - {name: fence-ca, mountPath: /fencer-ca, readOnly: true}
+      volumes:
+        - {name: data, emptyDir: {sizeLimit: 2Gi}}
+        - {name: temporary, emptyDir: {}}
+        - {name: fence-socket, emptyDir: {}}
+        - name: fence-token
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, audience: rhiza-fencer, expirationSeconds: 600}
+        - name: fence-ca
+          configMap: {name: rhiza-fencer-ca}
+---
+# The controller derives voterCount identities; automatic recovery dispatches no
+# recovery child before the authority publishes a matching proof.
+apiVersion: rhiza.mrchypark.dev/v1alpha1
+kind: RhizaCluster
+metadata:
+  name: rhiza
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+spec:
+  logicalID: __CLUSTER_ID__
+  statefulSet: rhiza-voter
+  container: rhiza
+  adoptClusterID: __CLUSTER_ID__
+  voterCount: 3
+  httpPort: 8080
+  peerPort: 9090
+  clusterDomain: cluster.local
+  bootstrap: true
+  automatic: true
+  policy: {failureGraceSeconds: 30, cooldownSeconds: 60, maxRecoveriesPerDay: 10, allowDataLoss: false}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: rhiza-operator, namespace: __NAMESPACE__}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: rhiza-operator, namespace: __NAMESPACE__}
+rules:
+  - {apiGroups: [''], resources: [pods], verbs: [get, list, create, delete]}
+  - {apiGroups: [''], resources: [secrets], verbs: [get, create, delete]}
+  - {apiGroups: [''], resources: [configmaps], verbs: [get]}
+  - {apiGroups: [''], resources: [services], verbs: [get, create]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizaclusters], verbs: [get, list]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizaclusters/status], verbs: [get, update]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizafences], verbs: [get, create]}
+  - {apiGroups: [apps], resources: [statefulsets], verbs: [get, update]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizarecoveries], verbs: [get, list, create, update]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizarecoveries/status], verbs: [get, update]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: rhiza-operator, namespace: __NAMESPACE__}
+subjects: [{kind: ServiceAccount, name: rhiza-operator, namespace: __NAMESPACE__}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: rhiza-operator}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: rhiza-operator, namespace: __NAMESPACE__, labels: {app: 'rhiza-operator', chaos.rhiza.io/run: '__RUN_ID__'}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: 'rhiza-operator', chaos.rhiza.io/run: '__RUN_ID__'}}
+  template:
+    metadata: {labels: {app: 'rhiza-operator', chaos.rhiza.io/run: '__RUN_ID__'}}
+    spec:
+      serviceAccountName: rhiza-operator
+      securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: operator
+          image: __OPERATOR_IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["--namespace=$(POD_NAMESPACE)", "--poll-interval=2s"]
+          env:
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: RHIZA_AUTOMATIC_RECOVERY, value: "true"}
+            - {name: RHIZA_FENCER_BACKEND, value: kubernetes}
+          envFrom:
+            - {configMapRef: {name: rhiza-config}}
+          securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
+          volumeMounts: [{name: tmp, mountPath: /tmp}]
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 256Mi}}
+      volumes: [{name: tmp, emptyDir: {}}]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: rhiza-fencer, namespace: __NAMESPACE__}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: rhiza-fencer, namespace: __NAMESPACE__}
+rules:
+  - {apiGroups: [''], resources: [pods], verbs: [get, list]}
+  - {apiGroups: [''], resources: [secrets], verbs: [get]}
+  - {apiGroups: [''], resources: [configmaps], verbs: [get, create, update]}
+  - {apiGroups: [apps], resources: [statefulsets], verbs: [get]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizafences, rhizaclusters], verbs: [get, list]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizafences/status], verbs: [get, update]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: rhiza-fencer, namespace: __NAMESPACE__}
+subjects: [{kind: ServiceAccount, name: rhiza-fencer, namespace: __NAMESPACE__}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: rhiza-fencer}
+---
+# Cluster-scoped, name made run-unique so parallel runs never collide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: '__NAMESPACE__-fencer-tokenreview', labels: {chaos.rhiza.io/run: '__RUN_ID__'}}
+rules:
+  - {apiGroups: [authentication.k8s.io], resources: [tokenreviews], verbs: [create]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: '__NAMESPACE__-fencer-tokenreview', labels: {chaos.rhiza.io/run: '__RUN_ID__'}}
+subjects: [{kind: ServiceAccount, name: rhiza-fencer, namespace: __NAMESPACE__}]
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: '__NAMESPACE__-fencer-tokenreview'}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: rhiza-fencer, namespace: __NAMESPACE__, labels: {chaos.rhiza.io/run: '__RUN_ID__'}}
+spec:
+  selector: {app: 'rhiza-fencer', chaos.rhiza.io/run: '__RUN_ID__'}
+  ports: [{name: https, port: 9444, targetPort: https}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: rhiza-fencer, namespace: __NAMESPACE__, labels: {app: 'rhiza-fencer', chaos.rhiza.io/run: '__RUN_ID__'}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: 'rhiza-fencer', chaos.rhiza.io/run: '__RUN_ID__'}}
+  template:
+    metadata: {labels: {app: 'rhiza-fencer', chaos.rhiza.io/run: '__RUN_ID__'}}
+    spec:
+      serviceAccountName: rhiza-fencer
+      securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: authority
+          image: __OPERATOR_IMAGE__
+          command: [/usr/local/bin/rhiza-fencer]
+          args: [serve, --tls-cert=/tls/tls.crt, --tls-key=/tls/tls.key]
+          env: [{name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}]
+          ports: [{name: https, containerPort: 9444}]
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
+          resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {memory: 256Mi}}
+      volumes: [{name: tls, secret: {secretName: rhiza-fencer-tls}}]
