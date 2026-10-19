@@ -1072,7 +1072,7 @@ func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, s
 		if uid == "" || uid != str(nested(current, "metadata", "uid")) || nested(pod, "status", "podIP") != nested(current, "status", "podIP") {
 			return obs, nil, fmt.Errorf("voter Pod changed during authentication")
 		}
-		state.Identities[ref.NodeID] = FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: uid, WALIdentity: status.WALIdentity}
+		state.Identities[ref.NodeID] = capturedFenceIdentity(FenceTarget{NodeID: string(ref.NodeID), Pod: ref.Pod, PodUID: uid, WALIdentity: status.WALIdentity}, current)
 		statuses[ref.NodeID] = status
 		endpoint, err = podEndpoint(pod, r.Spec.Container, "/recovery/probe")
 		if err != nil {

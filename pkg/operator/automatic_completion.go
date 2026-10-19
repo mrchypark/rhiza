@@ -246,7 +246,7 @@ func (c *Controller) captureAutomaticTargetIdentities(ctx context.Context, child
 		if !identifier.MatchString(name) || uid == "" || uid != str(nested(current, "metadata", "uid")) || nested(pod, "status", "podIP") != nested(current, "status", "podIP") || nested(current, "metadata", "deletionTimestamp") != nil || !ownedBy(current, child.Status.StatefulSetUID) {
 			return nil, fmt.Errorf("target Pod changed during identity authentication")
 		}
-		identities[status.NodeID] = FenceTarget{NodeID: string(status.NodeID), Pod: name, PodUID: uid, WALIdentity: status.WALIdentity}
+		identities[status.NodeID] = capturedFenceIdentity(FenceTarget{NodeID: string(status.NodeID), Pod: name, PodUID: uid, WALIdentity: status.WALIdentity}, current)
 	}
 	result := make([]FenceTarget, 0, len(members))
 	for _, member := range members {

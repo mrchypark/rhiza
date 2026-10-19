@@ -21,11 +21,33 @@ var ErrFencePending = errors.New("fencing: operation pending")
 
 // FenceTarget records an observed incarnation. Backends must fence the requested
 // voter or generation authority, including recreation, not just this Pod UID.
+//
+// NodeName, NodeUID, ContainerID and ImageID are the immutable runtime identity
+// observed before the fault. They stay optional for the cooperative path and are
+// required by independent evidence: a Pod name, or a lookup performed after the
+// fault, is never substituted for the incarnation the operator captured.
 type FenceTarget struct {
 	NodeID      string `json:"nodeID"`
 	Pod         string `json:"pod"`
 	PodUID      string `json:"podUID"`
 	WALIdentity string `json:"walIdentity"`
+	NodeName    string `json:"nodeName,omitempty"`
+	NodeUID     string `json:"nodeUID,omitempty"`
+	ContainerID string `json:"containerID,omitempty"`
+	ImageID     string `json:"imageID,omitempty"`
+}
+
+// capturedFenceIdentity adds the immutable runtime identity observed in a Pod to
+// an already authenticated target. A Pod that never reported its container
+// identity keeps empty fields and stays ineligible for independent evidence.
+func capturedFenceIdentity(target FenceTarget, pod object) FenceTarget {
+	target.NodeName = str(nested(pod, "spec", "nodeName"))
+	if statuses := list(nested(pod, "status", "containerStatuses")); len(statuses) == 1 {
+		status := asObject(statuses[0])
+		target.ContainerID = str(status["containerID"])
+		target.ImageID = str(status["imageID"])
+	}
+	return target
 }
 
 // Scope is "Generation" or "Voter".
@@ -62,6 +84,150 @@ type FenceProof struct {
 	ProcessesTerminated bool   `json:"processesTerminated"`
 	RecreationBlocked   bool   `json:"recreationBlocked"`
 	StorageQuiesced     bool   `json:"storageQuiesced"`
+	// Independent is the structured evidence an external attestor produced for
+	// this exact closed operation. It is additive: it never replaces the
+	// cooperative ledger, and the authority attaches it only after validating
+	// every binding against that ledger.
+	Independent *IndependentEvidence `json:"independent,omitempty"`
+}
+
+// independentEvidenceVersion is the only supported evidence schema.
+const independentEvidenceVersion = 1
+
+// Independent runtime states. API absence, a DELETE response and an unreachable
+// runtime are deliberately not representable: none of them is termination proof.
+const (
+	RuntimeStateExited     = "exited"
+	RuntimeStateTerminated = "terminated"
+)
+
+// IndependentEvidence is one external attestor's structured proof for a closed
+// fencing operation. Every field binds the exact request, durable ledger,
+// immutable runtime incarnation, recreation barrier and storage scope the
+// authority observed; anything else must stay pending.
+type IndependentEvidence struct {
+	Version     int               `json:"version"`
+	Provider    string            `json:"provider"`
+	Mode        string            `json:"mode"`
+	ObservedAt  string            `json:"observedAt"`
+	RequestHash string            `json:"requestHash"`
+	LedgerHash  string            `json:"ledgerHash"`
+	BarrierID   string            `json:"barrierID"`
+	Barrier     EvidenceBarrier   `json:"barrier"`
+	Runtimes    []EvidenceRuntime `json:"runtimes"`
+	Storage     EvidenceStorage   `json:"storage"`
+}
+
+// EvidenceBarrier proves the durable recreation barrier was still refusing the
+// closed incarnation after termination, together with the exact Pod inventory
+// that existed while it refused.
+type EvidenceBarrier struct {
+	Kind              string   `json:"kind"`
+	ClosedOperationID string   `json:"closedOperationID"`
+	ClosedRequestHash string   `json:"closedRequestHash"`
+	CurrentPodUIDs    []string `json:"currentPodUIDs"`
+	DeniedAt          string   `json:"deniedAt"`
+}
+
+// EvidenceRuntime is the terminal state of exactly one fenced Pod incarnation.
+type EvidenceRuntime struct {
+	NodeName        string   `json:"nodeName"`
+	NodeUID         string   `json:"nodeUID"`
+	InstanceID      string   `json:"instanceID"`
+	PodName         string   `json:"podName"`
+	PodUID          string   `json:"podUID"`
+	ContainerIDs    []string `json:"containerIDs"`
+	ImageIDs        []string `json:"imageIDs"`
+	RunIDs          []string `json:"runIDs"`
+	WALIdentities   []string `json:"walIdentities"`
+	State           string   `json:"state"`
+	RuntimeEvidence string   `json:"runtimeEvidence"`
+}
+
+// EvidenceStorage is an explicitly labelled stability observation, not a clean
+// engine drain: it binds the exact object-store location and two observations of
+// the same two named objects. archive/head.bin and checkpoint/CURRENT are
+// separate objects with independent per-object generation counters, so the
+// invariant is that both of their generations, both metagenerations and the
+// inventory digest are unchanged across the quiet window.
+type EvidenceStorage struct {
+	Provider               string          `json:"provider"`
+	Endpoint               string          `json:"endpoint,omitempty"`
+	Bucket                 string          `json:"bucket"`
+	Prefix                 string          `json:"prefix"`
+	Account                string          `json:"account,omitempty"`
+	ConnectionStringDigest string          `json:"connectionStringDigest,omitempty"`
+	QuietWindowSeconds     int             `json:"quietWindowSeconds"`
+	Before                 StorageSnapshot `json:"before"`
+	After                  StorageSnapshot `json:"after"`
+	Stable                 bool            `json:"stable"`
+}
+
+// StorageSnapshot is one observation of the exact storage state. ObservedAt is
+// the instant the provider read it, never a value the authority assumed.
+type StorageSnapshot struct {
+	ObservedAt            string `json:"observedAt"`
+	HeadGeneration        string `json:"headGeneration"`
+	HeadMetageneration    string `json:"headMetageneration"`
+	CurrentGeneration     string `json:"currentGeneration"`
+	CurrentMetageneration string `json:"currentMetageneration"`
+	InventoryDigest       string `json:"inventoryDigest"`
+}
+
+// scope is the exact location identity this observation claims. It is compared
+// against the workload's own scope, so a different store that merely shares a
+// provider, bucket and prefix cannot satisfy the binding.
+func (s EvidenceStorage) scope() AttestationStoreScope {
+	return AttestationStoreScope{Provider: s.Provider, Endpoint: s.Endpoint, Bucket: s.Bucket, Prefix: s.Prefix, Account: s.Account, ConnectionStringDigest: s.ConnectionStringDigest}
+}
+
+// state is the same snapshot without its clock. Only the observed storage state
+// has to be identical across the window; the clock is what measures the window.
+func (s StorageSnapshot) state() StorageSnapshot {
+	s.ObservedAt = ""
+	return s
+}
+
+// AttestationRequest is the exact scope the authority sends after it has durably
+// closed the ledger. It carries no credentials and no free-form authority.
+type AttestationRequest struct {
+	Request        FenceRequest          `json:"request"`
+	RequestHash    string                `json:"requestHash"`
+	LedgerHash     string                `json:"ledgerHash"`
+	StatefulSetUID string                `json:"statefulSetUID"`
+	Runs           []AttestationRun      `json:"runs"`
+	CurrentPodUIDs []string              `json:"currentPodUIDs"`
+	StorageScope   AttestationStoreScope `json:"storageScope"`
+}
+
+// AttestationRun is one closed ledger run the attestor must account for.
+type AttestationRun struct {
+	RunID       string `json:"runID"`
+	NodeID      string `json:"nodeID"`
+	PodUID      string `json:"podUID"`
+	WALIdentity string `json:"walIdentity"`
+}
+
+// AttestationStoreScope is the exact object-store location of the fenced source
+// generation, derived from the workload configuration rather than a global guess.
+// It carries every non-secret field StoreIdentity compares, because the same
+// provider, bucket and prefix can name different archives behind a custom
+// endpoint or a different account.
+type AttestationStoreScope struct {
+	Provider               string `json:"provider"`
+	Endpoint               string `json:"endpoint,omitempty"`
+	Bucket                 string `json:"bucket"`
+	Prefix                 string `json:"prefix"`
+	Account                string `json:"account,omitempty"`
+	ConnectionStringDigest string `json:"connectionStringDigest,omitempty"`
+}
+
+// AttestationResponse is the attestor's proof identity fields plus the
+// independent evidence they are bound to. The authority, never the attestor,
+// writes the resulting RhizaFence status.
+type AttestationResponse struct {
+	Proof       FenceProof          `json:"proof"`
+	Independent IndependentEvidence `json:"independent"`
 }
 
 // Fencer executes an immutable operation owned by the Operator. A pending or

@@ -81,6 +81,9 @@ func serve(ctx context.Context, args []string) error {
 	listen := f.String("listen", ":9444", "TLS listener")
 	cert := f.String("tls-cert", os.Getenv("FENCER_TLS_CERT"), "TLS certificate file")
 	key := f.String("tls-key", os.Getenv("FENCER_TLS_KEY"), "TLS private key file")
+	attestorURL := f.String("attestor-url", os.Getenv("RHIZA_FENCE_ATTESTOR_URL"), "optional external independent-evidence endpoint")
+	attestorToken := f.String("attestor-token-file", os.Getenv("RHIZA_FENCE_ATTESTOR_TOKEN_FILE"), "attestor audience-bound projected token")
+	attestorCA := f.String("attestor-ca-file", os.Getenv("RHIZA_FENCE_ATTESTOR_CA_FILE"), "attestor TLS CA bundle")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -92,6 +95,15 @@ func serve(ctx context.Context, args []string) error {
 		return err
 	}
 	executor := &operator.FencingExecutor{Kube: kube}
+	// Independent evidence is optional and off unless the administrator configures
+	// the whole trust relationship. A partial configuration fails startup.
+	if *attestorURL != "" || *attestorToken != "" || *attestorCA != "" {
+		attestor, err := operator.NewHTTPSAttestor(*attestorURL, *attestorToken, *attestorCA)
+		if err != nil {
+			return err
+		}
+		executor.Attestor = attestor
+	}
 	server := &http.Server{Addr: *listen, Handler: executor.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 35 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	defer server.Close()
 	serving := make(chan error, 1)

@@ -73,9 +73,10 @@ pending. A container restart within the same Pod UID may reserve a fresh run
 while admission is open, but must bind its exact historical WAL before writers
 start. A different Pod UID cannot bypass an unresolved prior voter. Restarting
 does not prove an old run safe: every old record remains, and a later fence stays
-pending without its evidence. Such fencing incidents need independent stronger evidence
-from an optional external adapter or a carefully verified manual recovery;
-never delete the ledger or restart the object store to manufacture a pass.
+pending without its evidence. Such fencing incidents need independent stronger
+evidence from the optional external attestor described below or a carefully
+verified manual recovery; never delete the ledger or restart the object store to
+manufacture a pass.
 
 Voter fencing permanently closes that stable slot in the source generation but
 does not stop surviving voters. A later generation fence preserves immutable
@@ -88,6 +89,61 @@ incarnation inventory using UID-preconditioned Pod deletion. The operator's
 namespaced Pod role therefore includes `delete`; it does not force-delete nodes
 or treat a deletion response as fencing proof. All source inventory must still
 disappear before the new generation can start.
+
+### Independent evidence for an unreachable incarnation
+
+A hard-killed or deleted voter leaves no exit receipt, so the cooperative ledger
+can never complete on its own. `rhiza-fencer serve` accepts one **optional**
+external attestation service for exactly that case. Without it, the fence stays
+pending exactly as before.
+
+The trust boundary is explicit. The operator keeps only its namespaced
+Kubernetes credentials and asks a separately operated service, over HTTPS with a
+pinned CA and an audience-bound projected token, to prove that the exact dead
+incarnation is terminally gone. No node, CRI, or cloud credential is added to
+the operator, and the service must not hold write access to `RhizaFence`
+status. Configure it with `RHIZA_FENCE_ATTESTOR_URL`,
+`RHIZA_FENCE_ATTESTOR_TOKEN_FILE`, and `RHIZA_FENCE_ATTESTOR_CA_FILE`. All
+three values are required together, the CA bundle replaces the system root pool
+rather than adding to it, and a partial configuration fails startup instead of
+silently disabling independent evidence or leaving the attestor unpinned.
+
+The authority keeps closing the durable ledger first and keeps writing the status
+itself. It consults the attestor only after that closure is persisted and only
+while the cooperative proof is still incomplete. Before it issues a proof, the
+returned evidence must bind all of:
+
+- the exact request hash and the canonical hash of the closed ledger;
+- the closing operation ID and that same request hash in the barrier evidence;
+- the exact current supervised Pod UID inventory, which is re-read after the
+  attestation and must be unchanged;
+- one terminal runtime per fenced Pod incarnation, restating the Pod UID, node
+  name, node UID, compute instance, container ID, image ID, run IDs, and WAL
+  identities the operator captured before the fault;
+- the exact object-store location of the workload, including the endpoint and
+  account identity that make a provider, bucket, and prefix unambiguous;
+- two observations of `archive/head.bin` and `checkpoint/CURRENT` whose
+  generation, metageneration, and inventory digest are identical, taken at the
+  start and end of a quiet window of at least 30 seconds, whose later
+  observation is no more than two minutes ahead of the authority's own clock.
+
+An incarnation stays pending when its immutable identity was never captured. The
+authority never resolves a dead request by Pod name, never re-derives identity
+after the fault, and never accepts a weaker signal: Pod absence from the
+Kubernetes API, a successful DELETE, an unreachable runtime, an unfinished quiet
+window, and a Pod inventory that changed during attestation all leave the fence
+pending. The storage observation is explicitly labelled independent evidence of
+writer absence and object stability. It is not a clean engine drain, and it never
+authorizes cooperative cleanup that requires one.
+
+The evidence is additive. It is recorded on the existing `RhizaFence` status
+beside the unchanged cooperative proof fields, and the operator still validates
+the persisted proof before it dispatches any recovery. The recommended provider
+behind the service is a GCP VM/power provider for a dedicated
+one-voter-per-node pool that stops the exact instance and detaches its disks.
+That provider, its least-privilege credentials, its deployment, and its
+disposable-cluster qualification are a separate deliverable; nothing in this
+repository contacts a cloud API.
 
 ### Pod deletion scope
 

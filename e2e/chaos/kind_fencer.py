@@ -79,6 +79,18 @@ class BarrierStore:
 # ── Request hash (Go json.Marshal field order, compact) ─────────────────────
 
 
+# The Go FenceTarget tags: the first four are always present, the immutable
+# runtime identity is optional and omitted while empty (omitempty).
+_TARGET_FIELDS = ("nodeID", "pod", "podUID", "walIdentity",
+                  "nodeName", "nodeUID", "containerID", "imageID")
+_REQUIRED_TARGET_FIELDS = ("nodeID", "pod", "podUID", "walIdentity")
+
+
+def _target_spec(target):
+    return {k: target[k] for k in _TARGET_FIELDS
+            if k in _REQUIRED_TARGET_FIELDS or target.get(k)}
+
+
 def _compute_request_hash(spec):
     ordered = {
         "logicalID": spec["logicalID"],
@@ -89,10 +101,7 @@ def _compute_request_hash(spec):
         "sourceClusterID": spec["sourceClusterID"],
         "operationID": spec["operationID"],
         "scope": spec["scope"],
-        "targets": [
-            {k: t[k] for k in ("nodeID", "pod", "podUID", "walIdentity")}
-            for t in spec["targets"]
-        ],
+        "targets": [_target_spec(t) for t in spec["targets"]],
     }
     return hashlib.sha256(
         json.dumps(ordered, separators=(",", ":"), ensure_ascii=False).encode()

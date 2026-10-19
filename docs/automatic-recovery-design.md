@@ -339,6 +339,27 @@ CI의 `kind_fencer.py`는 이 계약을 실제 kind 런타임과 admission webho
 테스트 전용 구현이다. 단일 폐기형 노드와 독점 MinIO를 사용하며 공유 운영 클러스터에
 배포하는 node agent가 아니다. 운영 환경의 종료/저장소 격리 수단은 별도 연동이 필요하다.
 
+### 독립 증거 attestor 계약
+
+hard-kill되었거나 삭제된 incarnation은 supervisor가 종료 영수증을 남길 수 없으므로,
+`rhiza-fencer`는 선택적으로 외부 attestation 서비스를 호출하여 독립 증거를 요청한다.
+이 서비스는 operator가 기존에 가지지 않았던 node 권한이나 cloud 자격 증명을 operator에
+추가하지 않으며, 별도의 운영 주체가 관리하고 감사하는 HTTPS 신뢰 경계로 취급한다.
+
+실행기는 cooperative ledger를 영속적으로 닫은 뒤에만 attestor를 호출한다. 실행기는
+attestor가 반환한 요청 해시, ledger 해시, 실행 신원, 재생성 차단 상태와 저장소 접두사가
+자신이 관찰한 값과 모두 일치할 때에만 완료 증거를 기록한다. 신원을 확보하지 못했거나
+증거가 부족하면 fence는 대기 상태로 남는다. Pod의 부재, DELETE 응답과 실패한 probe는
+종료 증거로 사용하지 않는다.
+
+첫 번째 provider는 전용 one-voter-per-node 풀을 대상으로 동작하는 GCP VM/power
+provider이며, GCS 읽기 전용 안정성 확인을 함께 수행한다. provider가 실제로 종료를
+증명하는지 확인하는 자격 조건은 별도의 폐기형 환경에서 수행해야 한다.
+
+설정은 `RHIZA_FENCE_ATTESTOR_URL`, `RHIZA_FENCE_ATTESTOR_TOKEN_FILE`,
+`RHIZA_FENCE_ATTESTOR_CA_FILE` 세 값으로 구성한다. 세 값이 모두 비어 있으면 기존
+cooperative 경로만 동작하고, 일부만 설정하면 기동에 실패한다.
+
 ### 확인된 무인 CI 근거
 
 2026-09-11, candidate `ef65375`, CI run `34554367214`, job `103123753569`에서

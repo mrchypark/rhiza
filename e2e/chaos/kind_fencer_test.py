@@ -9,8 +9,32 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(__file__))
 from kind_fencer import (
     BarrierStore, _barrier_matches_pod, _FenceHandler, KindFencer,
-    _resolve_rhiza_identity, CR_PLURAL, WEBHOOK_PATH, WEBHOOK_PORT,
+    _resolve_rhiza_identity, _target_spec, CR_PLURAL, WEBHOOK_PATH,
+    WEBHOOK_PORT,
 )
+
+
+class TestRequestHashEncoding(unittest.TestCase):
+    """The replay hash must reproduce the Go FenceRequest encoding exactly."""
+
+    def test_captured_identity_is_encoded_in_go_field_order(self):
+        target = {"nodeID": "rhiza-0", "pod": "rhiza-0", "podUID": "u0",
+                  "walIdentity": "w0", "nodeName": "node-a",
+                  "containerID": "containerd://c0", "imageID": "sha256:img"}
+        self.assertEqual(
+            json.dumps(_target_spec(target), separators=(",", ":")),
+            '{"nodeID":"rhiza-0","pod":"rhiza-0","podUID":"u0",'
+            '"walIdentity":"w0","nodeName":"node-a",'
+            '"containerID":"containerd://c0","imageID":"sha256:img"}')
+
+    def test_empty_identity_stays_omitted(self):
+        target = {"nodeID": "rhiza-0", "pod": "rhiza-0", "podUID": "u0",
+                  "walIdentity": "w0", "nodeName": "", "nodeUID": "",
+                  "containerID": "", "imageID": ""}
+        self.assertEqual(
+            json.dumps(_target_spec(target), separators=(",", ":")),
+            '{"nodeID":"rhiza-0","pod":"rhiza-0","podUID":"u0",'
+            '"walIdentity":"w0"}')
 
 
 def _make_barrier(scope, source="cluster-a", targets=None, proof=None):
