@@ -49,7 +49,16 @@ render() {
       -e "s|__GCS_PREFIX__|$RHIZA_GCS_PREFIX|g" \
       -e "s|__HOST_IMAGE__|$RHIZA_APP_IMAGE|g" \
       -e "s|__OPERATOR_IMAGE__|$RHIZA_OPERATOR_IMAGE|g" \
-      "$here/votercount_gcs_chaos.yaml.in" > "$out/manifests.yaml"
+      "$here/votercount_gcs_chaos.yaml.in" > "$out/rendered.yaml"
+  # The paired isolation probe Pods are created just-in-time by the driver: they
+  # must not hold namespace quota while the scenarios run. Marker drift fails here.
+  awk '/^# BEGIN INSPECTOR PROBE$/{probe=1;next} /^# END INSPECTOR PROBE$/{probe=0;next} !probe' \
+    "$out/rendered.yaml" > "$out/manifests.yaml"
+  awk '/^# BEGIN INSPECTOR PROBE$/{probe=1;next} /^# END INSPECTOR PROBE$/{probe=0;next} probe' \
+    "$out/rendered.yaml" > "$out/inspector-probe.yaml"
+  grep -q '^  name: rhiza-inspector$' "$out/inspector-probe.yaml" &&
+    grep -q '^  name: rhiza-inspector-control$' "$out/inspector-probe.yaml" &&
+    ! grep -q '^  name: rhiza-inspector' "$out/manifests.yaml"
 }
 
 # Run a step, stream its log and fail the launcher on its real exit status.
@@ -78,5 +87,6 @@ step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \
   --app-image "$RHIZA_APP_IMAGE" \
   --operator-image "$RHIZA_OPERATOR_IMAGE" \
   --scenarios "${RHIZA_SCENARIOS:-positive}" \
+  --inspector-probe "$out/inspector-probe.yaml" \
   --output "$out"
 echo "voterCount GCS/Chaos qualification launcher completed"

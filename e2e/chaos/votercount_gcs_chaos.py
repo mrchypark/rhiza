@@ -6,7 +6,9 @@ events) and adds Chaos Mesh CRs, fence matching bound to the fault operation,
 completed-recovery waits, a real writer and admission proof.
 
 Claims stay separate and are never merged:
-  (i)  positive: cooperative online replacement and generation recovery;
+  (i)  positive: cooperative online replacement, generation recovery and the
+       approved paired NetworkPolicy isolation (the deny-all inspector is
+       denied, its derived control Pod is reachable);
   (ii) fail-safe: dead-Pod execution blocking while termination evidence is
        unresolved (unqualified observations, never PASS).
 
@@ -28,6 +30,42 @@ from operator_recovery import Chaos
 VOTERS = ("rhiza-voter-0", "rhiza-voter-1", "rhiza-voter-2")
 COMPLETE = ("Complete",)
 HEALTHY = ("Healthy", "Observing")
+INSPECTOR = "rhiza-inspector"
+INSPECTOR_CONTROL = "rhiza-inspector-control"
+INSPECTOR_POLICY = "rhiza-inspector-deny-all"
+# Receipts kept identical to run-gcs-postrelease.sh: an unselected Pod reaches
+# the API, the selected inspector is denied (never a fast refusal), and the
+# control still reaches it afterwards.
+CONTROL_EGRESS_PROBE = """\
+busybox nc -w 3 "$1" "$2" </dev/null >/dev/null 2>&1 || exit 43
+printf "paired-network-policy-proof=control-reachable phase=%s target=kubernetes-api host=%s port=%s\n" "$3" "$1" "$2"
+"""
+INSPECTOR_EGRESS_PROBE = """\
+started=$(date +%s)
+if busybox nc -w 3 "$1" "$2" </dev/null >/dev/null 2>&1; then exit 41; fi
+elapsed=$(($(date +%s)-started))
+[ "$elapsed" -ge 2 ] || exit 42
+printf "paired-network-policy-proof=inspector-denied elapsed_seconds=%s target=kubernetes-api host=%s port=%s\n" "$elapsed" "$1" "$2"
+"""
+
+
+def parse_https_443(server_url):
+    """Exact HTTPS Kubernetes API endpoint on port 443, or reject."""
+    error = "exact HTTPS Kubernetes API endpoint on port 443 required for isolation probe"
+    if not server_url.startswith("https://"):
+        raise ValueError(error)
+    authority = server_url[len("https://"):].rstrip("/")
+    if authority.startswith("["):
+        host, _, tail = authority[1:].partition("]")
+        if not host or tail not in ("", ":443"):
+            raise ValueError(error)
+        return host, "443"
+    host, _, port = authority.rpartition(":")
+    if not host:  # no port at all: the whole authority is the host
+        host, port = authority, "443"
+    if not host or port != "443" or any(char in host for char in "[]:/"):
+        raise ValueError(error)
+    return host, "443"
 
 
 class VoterCountChaos(Chaos):
@@ -309,6 +347,178 @@ class VoterCountChaos(Chaos):
         assert after >= before + 1, "scenario write was not readable afterwards: %s" % tag
         self.event("readback_pass", pod=pod, tag=tag, row=row, before=before, after=after)
 
+    # ---- paired network isolation ----------------------------------------
+    def isolation_mode(self):
+        """Visibility contract: isolation is required unless the user approved an exclusion."""
+        mode = getattr(self.args, "inspector_network_isolation", "required")
+        assert mode in ("required", "exclude-user-approved"), \
+            "RHIZA_INSPECTOR_NETWORK_ISOLATION must be required or exclude-user-approved"
+        return mode
+
+    def api_endpoint(self):
+        server = os.environ.get("RHIZA_LOCAL_API_SERVER") or self.command(
+            ["kubectl", "--context", self.context, "config", "view", "--minify",
+             "-o", "jsonpath={.clusters[0].cluster.server}"])
+        return parse_https_443(server.strip())
+
+    def running_probe_pod(self, name):
+        try:
+            pod = self.get("pod", name)
+        except RuntimeError:
+            return None
+        if pod.get("status", {}).get("phase") != "Running":
+            return None
+        statuses = pod["status"].get("containerStatuses") or []
+        return pod if statuses and statuses[0].get("ready") else None
+
+    def capture_probe_pods(self):
+        """Create the run-owned probe pair just-in-time and keep its receipts."""
+        created = json.loads(self.command(["kubectl", "--context", self.context, "-n", self.ns,
+                                           "create", "-f", self.args.inspector_probe, "-o", "json"]))
+        items = created["items"] if created.get("kind") == "List" else [created]
+        receipts = {item["metadata"]["name"]: item for item in items}
+        assert sorted(receipts) == sorted((INSPECTOR, INSPECTOR_CONTROL)), sorted(receipts)
+        for name, pod in receipts.items():
+            (self.out / ("%s-created.json" % name)).write_text(json.dumps(pod, indent=2))
+        for name in (INSPECTOR, INSPECTOR_CONTROL):
+            self.wait("probe Pod %s running" % name, lambda n=name: self.running_probe_pod(n), 240)
+        return receipts
+
+    def validate_probe_pod(self, probe, receipt, name, app, container):
+        """Port of run-gcs-postrelease.sh validate_probe_pod: the denied inspector and
+        the reachable control must keep the one prescribed shape."""
+        metadata, spec, status = probe["metadata"], probe["spec"], probe["status"]
+        labels = metadata["labels"]
+        assert metadata["name"] == name and metadata["namespace"] == self.ns, metadata["name"]
+        assert metadata["uid"] == receipt["metadata"]["uid"], "probe Pod identity changed"
+        assert (metadata.get("ownerReferences") or []) == [], metadata.get("ownerReferences")
+        assert labels["app"] == app and labels["chaos.rhiza.io/run"] == self.run_id, labels
+        # A bound Pod may carry the node's topology labels on top of its own.
+        assert sorted(labels) in (["app", "chaos.rhiza.io/run"],
+                                  ["app", "chaos.rhiza.io/run",
+                                   "topology.kubernetes.io/region", "topology.kubernetes.io/zone"]), labels
+        assert spec["serviceAccountName"] == INSPECTOR, spec["serviceAccountName"]
+        assert spec.get("automountServiceAccountToken") is False, "probe token automount"
+        assert not any(spec.get(key) for key in ("hostNetwork", "hostPID", "hostIPC")), "host namespaces"
+        assert spec.get("nodeName"), "probe Pod must be bound to a node"
+        assert spec["restartPolicy"] == "Never" and (spec.get("volumes") or []) == [], "probe Pod spec"
+        sandbox = spec["securityContext"]
+        assert (sandbox["runAsNonRoot"], sandbox["runAsUser"], sandbox["runAsGroup"], sandbox["fsGroup"]) \
+            == (True, 65532, 65532, 65532), sandbox
+        assert sandbox["seccompProfile"] == {"type": "RuntimeDefault"}, sandbox
+        assert (spec.get("initContainers") or []) == [] and (spec.get("ephemeralContainers") or []) == []
+        containers = spec["containers"]
+        assert len(containers) == 1, [c["name"] for c in containers]
+        live = containers[0]
+        assert live["name"] == container and live["image"] == self.args.app_image, live["image"]
+        assert live["command"] == ["sh", "-c", "sleep 1500"], live["command"]
+        for empty in ("args", "env", "envFrom", "ports", "volumeMounts"):
+            assert (live.get(empty) or []) == [], (empty, live.get(empty))
+        for absent in ("readinessProbe", "livenessProbe", "startupProbe", "lifecycle"):
+            assert live.get(absent) is None, absent
+        assert not live.get("workingDir") and not any(live.get(k) for k in ("stdin", "stdinOnce", "tty"))
+        runtime = live["securityContext"]
+        assert runtime["allowPrivilegeEscalation"] is False and runtime["readOnlyRootFilesystem"] is True
+        assert runtime["runAsNonRoot"] is True and runtime["capabilities"]["drop"] == ["ALL"], runtime
+        assert status["phase"] == "Running", status["phase"]
+        states = status["containerStatuses"]
+        assert len(states) == 1, [s["name"] for s in states]
+        state = states[0]
+        assert (state["name"], state["ready"], state["restartCount"]) == (container, True, 0), state
+        assert isinstance(state["state"].get("running"), dict), state["state"]
+        assert state["imageID"].endswith(self.args.app_image.split("@")[-1]), state["imageID"]
+        return metadata["uid"]
+
+    def validate_probe_pair(self, receipts):
+        """Control-pod derivation contract (~lines 737-741): the control is the
+        inspector with only the name, app label and container name renamed."""
+        inspector = self.get("pod", INSPECTOR)
+        control = self.get("pod", INSPECTOR_CONTROL)
+        inspector_uid = self.validate_probe_pod(inspector, receipts[INSPECTOR], INSPECTOR, INSPECTOR,
+                                                "inspector")
+        control_uid = self.validate_probe_pod(control, receipts[INSPECTOR_CONTROL], INSPECTOR_CONTROL,
+                                              INSPECTOR_CONTROL, "control")
+
+        def shape(pod, container):
+            spec = json.loads(json.dumps(pod["spec"]))
+            spec.pop("nodeName", None)  # placement is the scheduler's, not the derivation's
+            spec["containers"][0]["name"] = container
+            return spec
+
+        assert shape(inspector, "<container>") == shape(control, "<container>"), \
+            "control Pod is not the inspector Pod with only the derivation's deltas"
+        inspector_labels = dict(inspector["metadata"]["labels"])
+        control_labels = dict(control["metadata"]["labels"])
+        assert inspector_labels.pop("app") == INSPECTOR, inspector_labels
+        assert control_labels.pop("app") == INSPECTOR_CONTROL, control_labels
+        assert inspector_labels == control_labels, control_labels
+        return inspector_uid, control_uid
+
+    def validate_deny_all_policy(self):
+        """The bootstrap owns rhiza-inspector-deny-all; this run only observes it,
+        because re-applying it would strip the bootstrap's auth-owner annotation."""
+        policy = self.get("networkpolicy.networking.k8s.io", INSPECTOR_POLICY)
+        metadata, spec = policy["metadata"], policy["spec"]
+        selector = {"chaos.rhiza.io/run": self.run_id, "app": INSPECTOR}
+        assert metadata["namespace"] == self.ns and (metadata.get("ownerReferences") or []) == []
+        assert metadata["labels"] == {"chaos.rhiza.io/run": self.run_id, "app": INSPECTOR}, metadata["labels"]
+        assert spec["podSelector"] == {"matchLabels": selector}, spec["podSelector"]
+        assert sorted(spec.get("policyTypes") or []) == ["Egress", "Ingress"], spec.get("policyTypes")
+        assert not spec.get("ingress") and not spec.get("egress"), "deny-all must carry no rules"
+        (self.out / "inspector-networkpolicy-bootstrap.json").write_text(json.dumps(policy, indent=2))
+        return policy
+
+    def probe_egress(self, pod, script, *args):
+        return self.command(["kubectl", "--context", self.context, "-n", self.ns, "exec", pod,
+                             "--", "sh", "-c", script, "sh", *args])
+
+    def release_probe_pods(self):
+        """Terminal absence of the run-owned probe Pods; lingering Pods fail the run."""
+        try:
+            self.k("delete", "pod", INSPECTOR, INSPECTOR_CONTROL, "--ignore-not-found", "--wait=true")
+            remaining = [item["metadata"]["name"] for item in
+                         json.loads(self.k("get", "pods", "-o", "json"))["items"]
+                         if item["metadata"]["name"] in (INSPECTOR, INSPECTOR_CONTROL)]
+            assert not remaining, "probe Pods remain: %s" % remaining
+        except Exception as exc:
+            self.cleanup_errors.append("inspector probe release: %s" % exc)
+
+    def verify_inspector_network_isolation(self):
+        """Positive-claim gate: the deny-all policy, not the Pod shape, denies the
+        inspector. Reachable control, denied inspector, reachable control again."""
+        if self.isolation_mode() == "exclude-user-approved":
+            receipt = "EXCLUDED inspector-network-isolation: user-approved"
+            (self.out / "inspector-network-isolation.txt").write_text(receipt + "\n")
+            self.event("inspector_network_isolation_excluded", receipt=receipt)
+            return receipt
+        try:
+            host, port = self.api_endpoint()
+            self.validate_deny_all_policy()
+            receipts = self.capture_probe_pods()
+            inspector_uid, control_uid = self.validate_probe_pair(receipts)
+            control_before = self.probe_egress(INSPECTOR_CONTROL, CONTROL_EGRESS_PROBE, host, port, "before")
+            denied = self.probe_egress(INSPECTOR, INSPECTOR_EGRESS_PROBE, host, port)
+            control_after = self.probe_egress(INSPECTOR_CONTROL, CONTROL_EGRESS_PROBE, host, port, "after")
+            for name, receipt in receipts.items():
+                assert self.get("pod", name)["metadata"]["uid"] == receipt["metadata"]["uid"], \
+                    "probe Pod %s was replaced during the isolation check" % name
+            receipt = "PASS inspector-network-isolation"
+            (self.out / "inspector-network-isolation.txt").write_text(receipt + "\n")
+            for label, output in (("control-before-reachable", control_before),
+                                  ("egress-denied", denied),
+                                  ("control-after-reachable", control_after)):
+                (self.out / ("inspector-%s.txt" % label)).write_text(output)
+            self.event("inspector_network_isolation_pass", target_host=host, target_port=port,
+                       inspector_uid=inspector_uid, control_uid=control_uid,
+                       control_before=control_before.strip(), inspector_denied=denied.strip(),
+                       control_after=control_after.strip())
+        except Exception as exc:
+            self.event("inspector_network_isolation_fail", error=str(exc)[-300:])
+            raise
+        finally:
+            self.release_probe_pods()
+        return receipt
+
     # ---- scenarios --------------------------------------------------------
     def chaos_injected(self, kind, name, expect_records=None):
         self.wait_chaos(kind, name, "AllInjected", 120)
@@ -452,10 +662,14 @@ class VoterCountChaos(Chaos):
 
     def run_positive(self):
         self.assert_bootstrap()
+        self.verify_inspector_network_isolation()
         self.scenario_intact_wal_restart()
         self.scenario_online_replacement()
         self.scenario_generation_recovery()
-        self.event("positive_set_pass", acknowledged=len(self.acks))
+        receipt = (self.out / "inspector-network-isolation.txt").read_text().strip()
+        assert receipt in ("PASS inspector-network-isolation",
+                           "EXCLUDED inspector-network-isolation: user-approved"), receipt
+        self.event("positive_set_pass", acknowledged=len(self.acks), inspector_network_isolation=receipt)
 
     def run_dead_pod(self):
         for scenario, target in (("D1", VOTERS[2]), ("D2", VOTERS[1]),
@@ -465,7 +679,8 @@ class VoterCountChaos(Chaos):
     def run(self):
         scenarios = self.args.scenarios
         self.event("start", run_id=self.run_id, scenarios=scenarios,
-                   claim_positive="cooperative online replacement and generation recovery",
+                   claim_positive="cooperative online replacement, generation recovery "
+                                  "and approved NetworkPolicy isolation",
                    claim_failsafe=("dead-Pod execution blocked while termination evidence is unresolved"
                                    if scenarios in ("dead-pod", "all") else "not_run"))
         self.prove_admission()
@@ -537,6 +752,10 @@ def build_parser():
     parser.add_argument("--admin-token", default="")
     parser.add_argument("--output", default="votercount-gcs-chaos-results")
     parser.add_argument("--scenarios", default="positive", choices=("positive", "dead-pod", "all"))
+    parser.add_argument("--inspector-probe", required=True,
+                        help="rendered paired isolation probe Pods from the launcher")
+    parser.add_argument("--inspector-network-isolation",
+                        default=os.environ.get("RHIZA_INSPECTOR_NETWORK_ISOLATION", "required"))
     return parser
 
 

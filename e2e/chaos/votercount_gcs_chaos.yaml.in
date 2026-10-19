@@ -256,3 +256,58 @@ spec:
           volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
           resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {memory: 256Mi}}
       volumes: [{name: tls, secret: {secretName: rhiza-fencer-tls}}]
+---
+# BEGIN INSPECTOR PROBE
+# Paired NetworkPolicy isolation probe for the positive claim. The bootstrap owns
+# rhiza-inspector-deny-all, so this run applies nothing but the two Pods: the
+# inspector is selected by the policy and must be denied, while the control is
+# the same Pod with only its name, app label and container name changed, so the
+# policy alone can explain the difference. Both are created just-in-time by the
+# driver and released again: the namespace quota must stay free for the
+# scenarios, and the driver validates the live pair against its own receipts.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-inspector
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__', app: 'rhiza-inspector'}
+spec:
+  serviceAccountName: rhiza-inspector
+  automountServiceAccountToken: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  restartPolicy: Never
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: inspector
+      image: __HOST_IMAGE__
+      command: [sh, -c, "sleep 1500"]
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: [ALL]}}
+      resources:
+        requests: {cpu: 50m, memory: 64Mi, ephemeral-storage: 32Mi}
+        limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 128Mi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-inspector-control
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__', app: 'rhiza-inspector-control'}
+spec:
+  serviceAccountName: rhiza-inspector
+  automountServiceAccountToken: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  restartPolicy: Never
+  securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+  containers:
+    - name: control
+      image: __HOST_IMAGE__
+      command: [sh, -c, "sleep 1500"]
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: {drop: [ALL]}}
+      resources:
+        requests: {cpu: 50m, memory: 64Mi, ephemeral-storage: 32Mi}
+        limits: {cpu: 250m, memory: 128Mi, ephemeral-storage: 128Mi}
+# END INSPECTOR PROBE

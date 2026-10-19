@@ -10,6 +10,7 @@ evaluate CEL.
 import json
 import os
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -60,6 +61,44 @@ class RunManifestTest(unittest.TestCase):
         crb = next(d for d in self.docs() if d["kind"] == "ClusterRoleBinding"
                    and "tokenreview" in d["metadata"]["name"])
         self.assertEqual(crb["metadata"]["name"], NS + "-fencer-tokenreview")
+
+    def test_probe_pair_is_rendered_with_only_the_derivation_deltas(self):
+        pods = {d["metadata"]["name"]: d for d in self.docs() if d["kind"] == "Pod"}
+        self.assertEqual(set(pods), {"rhiza-inspector", "rhiza-inspector-control"})
+        for pod, app, container in ((pods["rhiza-inspector"], "rhiza-inspector", "inspector"),
+                                    (pods["rhiza-inspector-control"], "rhiza-inspector-control", "control")):
+            self.assertEqual(pod["metadata"]["labels"],
+                             {"chaos.rhiza.io/run": RUN["RUN_ID"], "app": app})
+            self.assertEqual(pod["spec"]["serviceAccountName"], "rhiza-inspector")
+            self.assertIs(pod["spec"]["automountServiceAccountToken"], False)
+            self.assertNotIn("volumes", pod["spec"])
+            self.assertEqual(pod["spec"]["restartPolicy"], "Never")
+            self.assertEqual(pod["spec"]["containers"][0]["name"], container)
+            self.assertEqual(pod["spec"]["containers"][0]["image"], RUN["HOST_IMAGE"])
+            self.assertEqual(pod["spec"]["containers"][0]["command"], ["sh", "-c", "sleep 1500"])
+
+        def derived(pod, container):
+            shape = json.loads(json.dumps(pod))
+            shape["metadata"]["name"] = "<name>"
+            shape["metadata"]["labels"]["app"] = "<app>"
+            shape["spec"]["containers"][0]["name"] = container
+            return shape
+
+        self.assertEqual(derived(pods["rhiza-inspector"], "<container>"),
+                         derived(pods["rhiza-inspector-control"], "<container>"))
+
+    def test_the_deny_all_policy_stays_bootstrap_owned(self):
+        # Re-applying the bootstrap policy from this manifest would strip its
+        # rhiza.dev/auth-owner annotation, so the run must only observe it.
+        self.assertNotIn("rhiza-inspector-deny-all", json.dumps(self.docs()))
+
+    def test_probe_block_is_marked_for_the_launcher_split(self):
+        text = render("votercount_gcs_chaos.yaml.in", **RUN)
+        start = text.index("# BEGIN INSPECTOR PROBE")
+        block = text[start:text.index("# END INSPECTOR PROBE")]
+        self.assertIn("name: rhiza-inspector\n", block)
+        self.assertIn("name: rhiza-inspector-control\n", block)
+        self.assertNotIn("name: rhiza-inspector", text[:start])
 
 
 class AdmissionPolicyTest(unittest.TestCase):
@@ -201,7 +240,8 @@ def dead_pod_stub(same_uid=False):
 
 class ScenarioSplitTest(unittest.TestCase):
     ARGV = ["--context", "c", "--namespace", "n", "--run-id", "r",
-            "--app-image", "a@sha256:" + "a" * 64, "--operator-image", "o@sha256:" + "b" * 64]
+            "--app-image", "a@sha256:" + "a" * 64, "--operator-image", "o@sha256:" + "b" * 64,
+            "--inspector-probe", "inspector-probe.yaml"]
 
     def test_default_arguments_are_positive(self):
         self.assertEqual(harness.build_parser().parse_args(self.ARGV).scenarios, "positive")
@@ -268,6 +308,114 @@ class DeadPodTest(unittest.TestCase):
         chaos = dead_pod_stub(same_uid=True)
         with mock.patch("time.sleep"), self.assertRaises(AssertionError):
             chaos.dead_pod_case("D2", "rhiza-voter-2")
+
+
+class InspectorIsolationTest(unittest.TestCase):
+    """The paired NetworkPolicy isolation gate must not pass vacuously."""
+
+    def stub(self):
+        chaos = stub()
+        chaos.args = harness.build_parser().parse_args(ScenarioSplitTest.ARGV)
+        chaos.out = Path(tempfile.mkdtemp())
+        return chaos
+
+    def probing(self):
+        chaos = self.stub()
+        chaos.api_endpoint = lambda: ("10.0.0.1", "443")
+        chaos.validate_deny_all_policy = lambda: None
+        chaos.capture_probe_pods = lambda: {harness.INSPECTOR: {"metadata": {"uid": "u1"}},
+                                            harness.INSPECTOR_CONTROL: {"metadata": {"uid": "u2"}}}
+        chaos.validate_probe_pair = lambda receipts: ("u1", "u2")
+        chaos.probe_egress = lambda pod, script, *args: "paired-network-policy-proof=%s\n" % pod
+        chaos.get = lambda kind, name: {"metadata": {
+            "uid": "u1" if name == harness.INSPECTOR else "u2"}}
+        chaos.release_probe_pods = lambda: None
+        return chaos
+
+    def test_default_mode_is_required_and_bad_modes_are_rejected(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("RHIZA_INSPECTOR_NETWORK_ISOLATION", None)
+            chaos = self.stub()
+            self.assertEqual(chaos.isolation_mode(), "required")
+        chaos.args.inspector_network_isolation = "skipped-because-i-say-so"
+        with self.assertRaises(AssertionError):
+            chaos.isolation_mode()
+
+    def test_exclusion_records_a_scoped_receipt_without_probing(self):
+        chaos = self.stub()
+        chaos.args.inspector_network_isolation = "exclude-user-approved"
+        chaos.capture_probe_pods = lambda: (_ for _ in ()).throw(AssertionError("must not probe"))
+        self.assertEqual(chaos.verify_inspector_network_isolation(),
+                         "EXCLUDED inspector-network-isolation: user-approved")
+        self.assertEqual((chaos.out / "inspector-network-isolation.txt").read_text().strip(),
+                         "EXCLUDED inspector-network-isolation: user-approved")
+
+    def test_pass_writes_the_receipt_and_the_three_proofs(self):
+        chaos = self.probing()
+        self.assertEqual(chaos.verify_inspector_network_isolation(), "PASS inspector-network-isolation")
+        self.assertEqual((chaos.out / "inspector-network-isolation.txt").read_text().strip(),
+                         "PASS inspector-network-isolation")
+        names = [e["event"] for e in chaos.events]
+        self.assertIn("inspector_network_isolation_pass", names)
+        self.assertNotIn("inspector_network_isolation_fail", names)
+
+    def test_a_reachable_inspector_fails_the_run_and_is_evidence(self):
+        chaos = self.probing()
+        chaos.probe_egress = lambda pod, script, *args: (_ for _ in ()).throw(
+            AssertionError("first failure: inspector-egress-denied exit 41"))
+        with self.assertRaises(AssertionError):
+            chaos.verify_inspector_network_isolation()
+        failure = next(e for e in chaos.events if e["event"] == "inspector_network_isolation_fail")
+        self.assertIn("exit 41", failure["error"])
+        self.assertFalse((chaos.out / "inspector-network-isolation.txt").exists())
+
+    def test_release_failure_is_a_cleanup_error(self):
+        chaos = self.stub()
+        chaos.k = lambda *argv: json.dumps({"items": [{"metadata": {"name": harness.INSPECTOR}}]})
+        chaos.release_probe_pods()
+        self.assertEqual(len(chaos.cleanup_errors), 1)
+        self.assertIn(harness.INSPECTOR, chaos.cleanup_errors[0])
+
+    def test_the_positive_pass_requires_the_isolation_receipt(self):
+        chaos = self.stub()
+        chaos.assert_bootstrap = lambda: None
+        chaos.verify_inspector_network_isolation = lambda: "FAIL"
+        for scenario in ("scenario_intact_wal_restart", "scenario_online_replacement",
+                         "scenario_generation_recovery"):
+            setattr(chaos, scenario, lambda: None)
+        (chaos.out / "inspector-network-isolation.txt").write_text("FAIL\n")
+        with self.assertRaises(AssertionError):
+            chaos.run_positive()
+        (chaos.out / "inspector-network-isolation.txt").write_text("PASS inspector-network-isolation\n")
+        chaos.run_positive()
+        passed = next(e for e in chaos.events if e["event"] == "positive_set_pass")
+        self.assertEqual(passed["inspector_network_isolation"], "PASS inspector-network-isolation")
+
+    def test_control_derivation_rejects_drift(self):
+        chaos = self.stub()
+        chaos.validate_probe_pod = lambda pod, receipt, name, app, container: pod["metadata"]["name"]
+        inspector = {"metadata": {"name": harness.INSPECTOR, "labels": {"app": harness.INSPECTOR}},
+                     "spec": {"nodeName": "n1", "containers": [{"name": "inspector", "image": "a"}]}}
+        control = json.loads(json.dumps(inspector))
+        control["metadata"]["name"] = harness.INSPECTOR_CONTROL
+        control["metadata"]["labels"]["app"] = harness.INSPECTOR_CONTROL
+        control["spec"]["nodeName"] = "n2"
+        control["spec"]["containers"][0]["name"] = "control"
+        chaos.get = lambda kind, name: inspector if name == harness.INSPECTOR else control
+        receipts = {harness.INSPECTOR: {}, harness.INSPECTOR_CONTROL: {}}
+        chaos.validate_probe_pair(receipts)
+        control["spec"]["containers"][0]["image"] = "drifted"
+        with self.assertRaises(AssertionError):
+            chaos.validate_probe_pair(receipts)
+
+    def test_api_endpoint_must_be_exact_https_443(self):
+        self.assertEqual(harness.parse_https_443("https://34.64.0.1"), ("34.64.0.1", "443"))
+        self.assertEqual(harness.parse_https_443("https://34.64.0.1:443/"), ("34.64.0.1", "443"))
+        self.assertEqual(harness.parse_https_443("https://[fe80::1]:443"), ("fe80::1", "443"))
+        for bad in ("http://34.64.0.1", "https://34.64.0.1:8443", "34.64.0.1", "https:///x"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    harness.parse_https_443(bad)
 
 
 class LauncherDigestTest(unittest.TestCase):
