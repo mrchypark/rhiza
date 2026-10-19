@@ -2,18 +2,23 @@
 """voterCount GCS + Chaos Mesh qualification driver.
 
 Reuses operator_recovery.Chaos (JSON REST helpers, port-forwards, evidence
-events) and adds Chaos Mesh CRs, structural fence matching bound to the fault
-operation, completed-recovery waits, a real writer and admission proof.
+events) and adds Chaos Mesh CRs, fence matching bound to the fault operation,
+completed-recovery waits, a real writer and admission proof.
 
 Claims stay separate and are never merged:
   (i)  positive: cooperative online replacement and generation recovery;
   (ii) fail-safe: dead-Pod execution blocking while termination evidence is
        unresolved (unqualified observations, never PASS).
+
+The positive set and the dead-Pod set run as separate passes: the fences the
+positive set proves are removed (run-owned namespace) so D1-D4 each start from
+their own precondition.
 """
 import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -38,6 +43,8 @@ class VoterCountChaos(Chaos):
         self.acks = set()
         self.stop = threading.Event()
         self.writer = None
+        self.row_seq = 0
+        self.cleanup_errors = []
         self.admin = args.admin_token or os.environ.get("RHIZA_QUALIFICATION_ADMIN_TOKEN", "")
         self.cluster_scoped = [("%s-fencer-tokenreview" % args.namespace, "clusterrolebinding"),
                                ("%s-fencer-tokenreview" % args.namespace, "clusterrole")]
@@ -146,6 +153,9 @@ class VoterCountChaos(Chaos):
     def cluster_phase(self):
         return self.cluster().get("status", {}).get("phase")
 
+    def cluster_revision(self):
+        return self.cluster().get("metadata", {}).get("resourceVersion")
+
     def pod(self, name):
         return self.get("pod", name)
 
@@ -153,6 +163,12 @@ class VoterCountChaos(Chaos):
         state = self.status(name)
         return {"node_id": name, "pod_uid": self.pod(name)["metadata"]["uid"],
                 "wal_identity": state["wal_identity"], "config_id": state["config_id"]}
+
+    def reset_fences(self):
+        """Run-owned namespace: clear the positive pass so D1-D4 start clean."""
+        self.k("delete", "rhizafences", "--all", "--ignore-not-found", "--wait=true")
+        self.wait("fences cleared", lambda: not self.fences(), 120)
+        return True
 
     def fence_for(self, ident, operation=None, new_since=None):
         """Structural match on all four identity fields, never a substring scan."""
@@ -174,47 +190,44 @@ class VoterCountChaos(Chaos):
     # ---- assertions -------------------------------------------------------
     def assert_controllers_running(self):
         for label in ("app=rhiza-operator", "app=rhiza-fencer"):
-            pods = json.loads(self.k("get", "pods", "-l",
-                                     "%s,chaos.rhiza.io/run=%s" % (label, self.run_id),
-                                     "-o", "json")).get("items", [])
-            assert [p for p in pods if p["status"].get("phase") == "Running"], \
-                "%s is not running; a negative result is not evidence" % label
+            assert self.pods_with(label), "%s is not running; a negative result is not evidence" % label
         return True
 
-    def assert_cluster_observed(self, window=30):
-        """The controller must be current, not stalled on a stale static status."""
-        first = self.cluster()
-        meta, status = first.get("metadata", {}), first.get("status", {})
+    def pods_with(self, selector):
+        pods = json.loads(self.k("get", "pods", "-l",
+                                 "%s,chaos.rhiza.io/run=%s" % (selector, self.run_id),
+                                 "-o", "json")).get("items", [])
+        return [p for p in pods if p["status"].get("phase") == "Running"]
+
+    def assert_cluster_observed(self, baseline=None, window=45):
+        """Require observation of the CURRENT generation, or a post-baseline change."""
+        current = self.cluster()
+        meta, status = current.get("metadata", {}), current.get("status", {})
         generation, observed = meta.get("generation"), status.get("observedGeneration")
-        if generation is not None and observed is not None:
+        if generation is not None and observed is not None and baseline is None:
             assert observed == generation, "controller has not observed generation %s" % generation
-            return "observedGeneration", observed
-        revision = meta.get("resourceVersion")
+            return observed
         deadline = time.time() + window
         while time.time() < deadline:
+            if self.cluster_revision() != baseline:
+                return self.cluster_revision()
             time.sleep(2)
-            if self.cluster().get("metadata", {}).get("resourceVersion") != revision:
-                return "resourceVersion", revision
-        raise AssertionError("cluster status is not advancing; a negative result is not evidence")
+        raise AssertionError("no post-baseline observation change; a negative result is not evidence")
 
     def assert_deployed_images(self):
-        pinned = {"app": self.args.app_image, "operator": self.args.operator_image,
+        pinned = {"voter": self.args.app_image, "operator": self.args.operator_image,
                   "fencer": self.args.operator_image}
-        pods = {"app": [self.pod(name) for name in VOTERS],
+        pods = {"voter": [self.pod(name) for name in VOTERS],
                 "operator": self.pods_with("app=rhiza-operator"),
                 "fencer": self.pods_with("app=rhiza-fencer")}
         for role, items in pods.items():
             assert items, "no %s Pods to verify" % role
+            digest = pinned[role].split("@")[-1] if "@" in pinned[role] else ""
+            assert digest, "%s image must be digest-pinned" % role
             for item in items:
                 image_id = item["status"]["containerStatuses"][0]["imageID"]
-                want = pinned[role].split("@")[-1] if "@" in pinned[role] else pinned[role].split(":")[-1]
-                assert want in image_id, "%s image differs: %s !~ %s" % (role, image_id, want)
+                assert digest in image_id, "%s image differs: %s !~ %s" % (role, image_id, digest)
         return True
-
-    def pods_with(self, selector):
-        return json.loads(self.k("get", "pods", "-l",
-                                 "%s,chaos.rhiza.io/run=%s" % (selector, self.run_id),
-                                 "-o", "json")).get("items", [])
 
     def assert_no_proof_structural(self, ident, new_since=None):
         held = self.fence_for(ident, new_since=new_since)
@@ -229,11 +242,16 @@ class VoterCountChaos(Chaos):
         assert not new, "recovery child created without a proof: %s" % sorted(new)
         return True
 
+    @staticmethod
+    def child_operation(child):
+        """The child binds to the fence operation in an exact spec field."""
+        spec = child.get("spec", {})
+        membership = spec.get("membership") or {}
+        return [v for v in (spec.get("operationID"), spec.get("recoveryID"),
+                            membership.get("operationID")) if v]
+
     def wait_completion(self, before, fence=None, timeout=420):
-        keys = []
-        if fence:
-            keys = [k for k in (fence.get("spec", {}).get("operationID"),
-                                fence.get("spec", {}).get("bindingUID")) if k]
+        operation = (fence or {}).get("spec", {}).get("operationID")
         def done():
             for child in self.recoveries():
                 if child["metadata"]["uid"] in before:
@@ -242,13 +260,19 @@ class VoterCountChaos(Chaos):
                 phase = status.get("membership", {}).get("phase") or status.get("phase")
                 if phase not in COMPLETE:
                     continue
-                if keys and not any(k in json.dumps(child.get("spec", {})) for k in keys):
+                if operation and operation not in self.child_operation(child):
+                    continue
+                if fence and not operation:
                     continue
                 return child
             return None
         return self.wait("completed recovery child bound to the fence operation", done, timeout)
 
     # ---- workload ---------------------------------------------------------
+    def next_row(self):
+        self.row_seq += 1
+        return 100000 + self.row_seq
+
     def start_writer(self):
         def write():
             i = 1
@@ -275,12 +299,13 @@ class VoterCountChaos(Chaos):
         self.event("prepare_pass", voters=list(VOTERS), acknowledged=len(self.acks))
 
     def readback(self, pod, tag):
-        count = self.verify_data(pod)
-        row = 90000 + (abs(hash(tag)) % 9000)
-        request_id = "vc-post-%s" % tag
-        self.execute(pod, request_id, "INSERT INTO chaos_items VALUES (%d, 'post')" % row)
+        before = self.verify_data(pod)
+        row = self.next_row()
         self.acks.add(row)
-        self.event("readback_pass", pod=pod, tag=tag, request_id=request_id, row=row, rows=count)
+        self.execute(pod, "vc-post-%s" % tag, "INSERT INTO chaos_items VALUES (%d, 'post')" % row)
+        after = self.verify_data(pod)
+        assert after >= before + 1, "scenario write was not readable afterwards: %s" % tag
+        self.event("readback_pass", pod=pod, tag=tag, row=row, before=before, after=after)
 
     # ---- scenarios --------------------------------------------------------
     def chaos_injected(self, kind, name, expect_records=None):
@@ -327,17 +352,21 @@ class VoterCountChaos(Chaos):
 
     def scenario_generation_recovery(self):
         before = self.recovery_uids()
+        pre = self.fence_uids()
         self.create_chaos("NetworkChaos", "vc-generation", self.generation_spec())
         self.chaos_injected("NetworkChaos", "vc-generation")
         self.assert_controllers_running()
         self.assert_no_new_child(before)
         self.wait_chaos("NetworkChaos", "vc-generation", "AllRecovered", 180)
-        fence = self.wait("generation fence", lambda: [f for f in self.fences()
-                          if f.get("spec", {}).get("scope") == "Generation"] or None, 240)[0]
+        def new_generation_fence():
+            return [f for f in self.fences() if f["metadata"]["uid"] not in pre
+                    and f.get("spec", {}).get("scope") == "Generation"] or None
+        fence = self.wait("new generation fence", new_generation_fence, 240)[0]
         self.wait("generation proof", lambda: self.get("rhizafences", fence["metadata"]["name"])
                   .get("status", {}).get("proof"), 300)
         child = self.wait_completion(before, fence)
         self.event("generation_recovery_completed", child=child["metadata"]["name"],
+                   operation=fence["spec"].get("operationID"),
                    targets=len(fence["spec"].get("targets", [])))
         self.delete_chaos("NetworkChaos", "vc-generation")
         self.readback(VOTERS[2], "generation")
@@ -348,17 +377,24 @@ class VoterCountChaos(Chaos):
         before = self.recovery_uids()
         pre = self.fence_uids()
         ident = self.pod_identity(target)
+        baseline = self.cluster_revision()
         start = {"scenario": scenario, "target": target, "pod_uid": ident["pod_uid"],
                  "wal_identity": ident["wal_identity"], "cluster_phase": self.cluster_phase(),
                  "fence_uids": sorted(pre), "recovery_uids": sorted(before)}
         if scenario == "D1":
             assert ident["wal_identity"], "D1 requires an already WAL-bound target"
-            start["clean_exit"] = "none observed over two samples"
-            self.assert_cluster_observed()
+            first = self.status(target)
+            time.sleep(5)
+            second = self.status(target)
+            assert first["wal_identity"] == second["wal_identity"] == ident["wal_identity"], \
+                "D1 requires no clean drain/exit before the kill"
+            start["drain_samples"] = [first["wal_identity"], second["wal_identity"]]
         if scenario == "D2":
-            assert not [f for f in self.fences() if f.get("status", {}).get("proof")], "D2 requires no terminal proof"
+            assert not [f for f in self.fences() if f.get("status", {}).get("proof")], \
+                "D2 requires no terminal proof"
             assert ident["pod_uid"], "D2 requires a captured Pod UID"
         if scenario == "D3":
+            assert ident["pod_uid"] and ident["wal_identity"], "D3 requires the full identity"
             start["child_authorization"] = sorted(before)
             start["learner_binding"] = [p["metadata"]["name"] for p in self.pods_with("app=rhiza-voter")
                                         if "learner" in p["metadata"]["name"]]
@@ -375,10 +411,16 @@ class VoterCountChaos(Chaos):
                   .get("phase") != "Running", 120)
         time.sleep(20)
         self.assert_controllers_running()
-        self.assert_cluster_observed()
+        self.assert_cluster_observed(baseline=baseline)
         records = self.experiment("PodChaos", "vc-dead-" + scenario).get("podRecords", [])
-        assert records, "Chaos Mesh recorded no pod-kill target"
-        assert target in json.dumps(records), "Chaos Mesh killed a different Pod: %s" % records
+        assert records and target in json.dumps(records), \
+            "Chaos Mesh killed a different Pod: %s" % records
+        current_uid = self.pod(target).get("metadata", {}).get("uid")
+        assert current_uid != ident["pod_uid"], \
+            "the captured incarnation %s survived: a replacement was killed instead" % ident["pod_uid"]
+        if scenario == "D3":
+            assert sorted(self.recovery_uids()) == start["recovery_uids"], \
+                "D3: child authorization changed during the fault"
         held = self.fence_for(ident, new_since=pre)
         assert held, "no new fence tied to the killed incarnation %s" % target
         for fence in held:
@@ -392,22 +434,30 @@ class VoterCountChaos(Chaos):
                    completion="unqualified: cooperative backend cannot prove termination for a dead Pod")
         self.delete_chaos("PodChaos", "vc-dead-" + scenario)
 
+    def run_positive(self):
+        self.scenario_intact_wal_restart()
+        self.scenario_online_replacement()
+        self.scenario_generation_recovery()
+        self.reset_fences()
+        self.event("positive_set_pass", acknowledged=len(self.acks))
+
+    def run_dead_pod(self):
+        for scenario, target in (("D1", VOTERS[2]), ("D2", VOTERS[1]),
+                                 ("D3", VOTERS[0]), ("D4", VOTERS[2])):
+            self.dead_pod_case(scenario, target)
+
     def run(self):
         self.event("start", run_id=self.run_id,
                    claim_positive="cooperative online replacement and generation recovery",
                    claim_failsafe="dead-Pod execution blocked while termination evidence is unresolved")
         self.prove_admission()
         self.prepare()
-        self.scenario_intact_wal_restart()
-        self.scenario_online_replacement()
-        self.scenario_generation_recovery()
-        self.dead_pod_case("D1", VOTERS[2])
-        self.dead_pod_case("D2", VOTERS[1])
-        self.dead_pod_case("D3", VOTERS[0])
-        self.dead_pod_case("D4", VOTERS[2])
+        self.run_positive()
+        self.run_dead_pod()
         self.event("complete", positive=["intact_wal_restart", "online_replacement", "generation_recovery"],
                    fail_safe="dead_pod_execution_blocking_unqualified")
 
+    # ---- cleanup ----------------------------------------------------------
     def delete_cluster_scoped(self):
         for name, kind in self.cluster_scoped:
             self.command(["kubectl", "--context", self.context, "delete", kind, name,
@@ -420,7 +470,8 @@ class VoterCountChaos(Chaos):
                                 "--ignore-not-found", "-o", "name"])
             if out.strip():
                 remaining.append("%s/%s" % (kind, name))
-        assert not remaining, "run-owned cluster-scoped objects remain: %s" % remaining
+        if remaining:
+            raise AssertionError("run-owned cluster-scoped objects remain: %s" % remaining)
         return True
 
     def cleanup(self):
@@ -430,22 +481,23 @@ class VoterCountChaos(Chaos):
         for kind, name in list(self.declared.get("chaos_created", [])):
             try:
                 self.delete_chaos(kind, name)
-            except Exception:
-                pass
-        absent = None
+            except Exception as exc:
+                self.cleanup_errors.append("chaos %s/%s: %s" % (kind, name, exc))
         try:
             self.delete_cluster_scoped()
-            absent = self.verify_absence()
+            self.verify_absence()
         except Exception as exc:
-            absent = "cleanup failed: %s" % exc
+            self.cleanup_errors.append(str(exc))
         try:
             (self.out / "rollback-material.json").write_text(json.dumps({
                 "namespace": self.declared["namespace"], "run_id": self.declared["run_id"],
                 "cluster_scoped": [list(x) for x in self.cluster_scoped],
-                "absence_verified": absent}, indent=2))
+                "cleanup_errors": self.cleanup_errors}, indent=2))
         except Exception:
             pass
         Chaos.cleanup(self)
+        if self.cleanup_errors:
+            raise AssertionError("cleanup incomplete: %s" % self.cleanup_errors)
 
 
 def main():
@@ -458,10 +510,19 @@ def main():
     parser.add_argument("--admin-token", default="")
     parser.add_argument("--output", default="votercount-gcs-chaos-results")
     chaos = VoterCountChaos(parser.parse_args())
+    status = 0
     try:
         chaos.run()
+    except Exception as exc:
+        print("RUN FAILED: %s" % exc, file=sys.stderr)
+        status = 1
     finally:
-        chaos.cleanup()
+        try:
+            chaos.cleanup()
+        except Exception as exc:
+            print("CLEANUP FAILED: %s" % exc, file=sys.stderr)
+            status = 1
+    sys.exit(status)
 
 
 if __name__ == "__main__":

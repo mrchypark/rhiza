@@ -1,15 +1,15 @@
 #!/bin/sh
-# Launcher for the voterCount GCS/Chaos qualification.
+# Launcher for the voterCount GCS/Chaos qualification (see README.md).
 #
 # Run e2e/chaos/bootstrap-gcs-postrelease.sh first: it owns the namespace, the
-# rhiza-gcs workload-identity KSA, the quota and the admission policies that this
-# run set relies on. This script renders and applies the voterCount manifests,
-# runs the driver with the pinned digests, and leaves cleanup to the driver,
-# which deletes the Chaos resources and the run-owned cluster-scoped objects and
-# verifies their absence.
+# rhiza-gcs workload-identity KSA, the quota and the admission policies this run
+# set relies on. This script renders and applies the voterCount manifests and
+# runs the driver with digest-pinned images. Every step is checked: a failing
+# admission proof, scenario assertion or cleanup makes this launcher exit non-zero.
 #
-# Required: RHIZA_RUN_ID, RHIZA_NAMESPACE, RHIZA_KUBE_CONTEXT, RHIZA_GCS_BUCKET,
-# RHIZA_GCS_PREFIX, RHIZA_CLUSTER_ID, RHIZA_APP_IMAGE, RHIZA_OPERATOR_IMAGE.
+# Required (images must be digest-pinned): RHIZA_RUN_ID, RHIZA_NAMESPACE,
+# RHIZA_KUBE_CONTEXT, RHIZA_GCS_BUCKET, RHIZA_GCS_PREFIX, RHIZA_CLUSTER_ID,
+# RHIZA_APP_IMAGE, RHIZA_OPERATOR_IMAGE.
 set -eu
 
 : "${RHIZA_RUN_ID:?8 lowercase hex run id}"
@@ -20,6 +20,15 @@ set -eu
 : "${RHIZA_CLUSTER_ID:?cluster id}"
 : "${RHIZA_APP_IMAGE:?digest-pinned application image}"
 : "${RHIZA_OPERATOR_IMAGE:?digest-pinned operator image}"
+
+require_digest() {
+  case "$2" in
+    *@sha256:*) ;;
+    *) echo "$1 must be digest-pinned as name@sha256:<digest>, got: $2" >&2; exit 2 ;;
+  esac
+}
+require_digest RHIZA_APP_IMAGE "$RHIZA_APP_IMAGE"
+require_digest RHIZA_OPERATOR_IMAGE "$RHIZA_OPERATOR_IMAGE"
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 out=${RHIZA_OUT:-$PWD/votercount-gcs-chaos-results}
@@ -38,18 +47,30 @@ render() {
       "$here/votercount_gcs_chaos.yaml.in" > "$out/manifests.yaml"
 }
 
+# Run a step, stream its log and fail the launcher on its real exit status.
+step() {
+  name=$1; shift
+  log="$out/$name.log"
+  status=0
+  "$@" > "$log" 2>&1 || status=$?
+  cat "$log"
+  if [ "$status" -ne 0 ]; then
+    echo "step $name failed with status $status" >&2
+    exit "$status"
+  fi
+}
+
 render
-kubectl --context "$RHIZA_KUBE_CONTEXT" apply -f "$out/manifests.yaml" | tee "$out/apply.log"
-
-# rhiza-fencer-tls and rhiza-fencer-ca are supplied out of band before this run;
-# the authority and the supervised voters mount them.
-kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" rollout status \
-  deployment/rhiza-fencer --timeout=180s | tee "$out/fencer.log"
-
-python3 -u "$here/votercount_gcs_chaos.py" \
+step 10-apply kubectl --context "$RHIZA_KUBE_CONTEXT" apply -f "$out/manifests.yaml"
+# rhiza-fencer-tls and rhiza-fencer-ca are supplied out of band; the authority
+# and the supervised voters mount them.
+step 20-fencer kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" rollout status \
+  deployment/rhiza-fencer --timeout=180s
+step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \
   --context "$RHIZA_KUBE_CONTEXT" \
   --namespace "$RHIZA_NAMESPACE" \
   --run-id "$RHIZA_RUN_ID" \
   --app-image "$RHIZA_APP_IMAGE" \
   --operator-image "$RHIZA_OPERATOR_IMAGE" \
-  --output "$out" 2>&1 | tee "$out/driver.log"
+  --output "$out"
+echo "voterCount GCS/Chaos qualification launcher completed"

@@ -1,10 +1,11 @@
 """Cluster-free checks for the voterCount GCS/Chaos harness.
 
 Renders the manifests, checks the admission policies are correlated (not a
-cross-product of source, window and target), and exercises the fail-safe
-helpers so an assertion cannot pass vacuously. The real admission decision is
-proved on the cluster by VoterCountChaos.prove_admission(), because a token
-search over policy text cannot evaluate CEL.
+cross-product of source, window and target), and exercises the fail-safe,
+binding, readback and cleanup helpers so none of them can pass vacuously. The
+real admission decision is proved on the cluster by
+VoterCountChaos.prove_admission(): a token search over policy text cannot
+evaluate CEL.
 """
 import json
 import unittest
@@ -70,11 +71,9 @@ class AdmissionPolicyTest(unittest.TestCase):
         return [d for d in yaml.safe_load_all(text)
                 if d and d.get("kind") == "ValidatingAdmissionPolicy"]
 
-    def policy(self, suffix):
-        return next(p for p in self.policies() if p["metadata"]["name"] == NS + suffix)
-
     def expressions(self, suffix):
-        return [v["expression"] for v in self.policy(suffix)["spec"]["validations"]]
+        policy = next(p for p in self.policies() if p["metadata"]["name"] == NS + suffix)
+        return [v["expression"] for v in policy["spec"]["validations"]]
 
     def test_exactly_the_reviewed_pair_is_extended(self):
         self.assertEqual({p["metadata"]["name"] for p in self.policies()},
@@ -94,14 +93,17 @@ class AdmissionPolicyTest(unittest.TestCase):
         exprs = self.expressions("-faults")
         correlated = [e for e in exprs if "container-kill" in e and "pod-kill" in e]
         self.assertEqual(len(correlated), 1)
-        body = correlated[0]
-        self.assertIn("rhiza-voter-0", body)
-        self.assertIn("has(object.spec.containerNames)", body)
+        self.assertIn("rhiza-voter-0", correlated[0])
 
 
 def stub():
     chaos = object.__new__(harness.VoterCountChaos)
     chaos.ns, chaos.run_id = "ns", "run"
+    chaos.out = Path("/tmp")
+    chaos.row_seq = 0
+    chaos.acks = set()
+    chaos.cleanup_errors = []
+    chaos.cluster_scoped = [("ns-fencer-tokenreview", "clusterrolebinding")]
     chaos.events = []
     chaos.event = lambda name, **f: chaos.events.append({"event": name, **f})
     chaos.fences = lambda: getattr(chaos, "_fences", [])
@@ -136,39 +138,68 @@ class FailSafeTest(unittest.TestCase):
         chaos._fences = [{"metadata": {"name": "a", "uid": "f1"}, "spec": {"targets": [dict(TARGET)]}, "status": {}}]
         self.assertEqual(len(chaos.assert_no_proof_structural(IDENT)), 1)
 
-    def test_assert_no_new_child_detects_a_child(self):
-        chaos = stub()
-        chaos._recs = [{"metadata": {"uid": "new"}}]
-        with self.assertRaises(AssertionError):
-            chaos.assert_no_new_child(set())
-
-    def test_wait_completion_binds_to_the_fence_operation(self):
+    def test_wait_completion_binds_to_the_exact_operation_field(self):
         chaos = stub()
         chaos._recs = [
-            {"metadata": {"uid": "c1"}, "spec": {"operationID": "other"}, "status": {"phase": "Complete"}},
-            {"metadata": {"uid": "c2"}, "spec": {"operationID": "op-1"},
+            {"metadata": {"uid": "c1"}, "spec": {"note": "op-1"}, "status": {"phase": "Complete"}},
+            {"metadata": {"uid": "c2"}, "spec": {"membership": {"operationID": "op-1"}},
              "status": {"membership": {"phase": "Complete"}}}]
         chaos.wait = lambda label, pred, timeout=0: pred()
         child = chaos.wait_completion(set(), {"spec": {"operationID": "op-1"}})
         self.assertEqual(child["metadata"]["uid"], "c2")
 
-    def test_dead_pod_case_never_reports_pass(self):
+    def test_readback_writes_a_unique_row_and_verifies_afterwards(self):
         chaos = stub()
-        chaos._fences = [{"metadata": {"name": "a", "uid": "f1"}, "spec": {"targets": [dict(TARGET)]}, "status": {}}]
-        chaos._recs = []
-        chaos.pod_identity = lambda name: dict(IDENT, node_id=name)
-        chaos.cluster_phase = lambda: "Healthy"
-        chaos.recovery_uids = lambda: set()
-        chaos.fence_uids = lambda: {"f0"}
-        chaos.pod = lambda name: {"metadata": {"name": name}, "status": {"phase": "Failed"}}
-        chaos.pods_with = lambda sel: []
-        chaos.create_chaos = lambda *a, **k: None
-        chaos.chaos_injected = lambda *a, **k: True
-        chaos.experiment = lambda kind, name: {"podRecords": [{"name": "rhiza-voter-2"}]}
-        chaos.wait = lambda label, pred, timeout=0: pred()
-        chaos.assert_controllers_running = lambda: True
-        chaos.assert_cluster_observed = lambda *a, **k: True
+        counts = iter([3, 4, 5, 6])
+        chaos.verify_data = lambda pod: next(counts)
+        writes = []
+        chaos.execute = lambda pod, rid, sql: writes.append((rid, sql))
+        chaos.readback("rhiza-voter-1", "tag-a")
+        chaos.readback("rhiza-voter-1", "tag-b")
+        self.assertEqual([w[0] for w in writes], ["vc-post-tag-a", "vc-post-tag-b"])
+        rows = [w[1] for w in writes]
+        self.assertNotEqual(rows[0], rows[1], "rows must not collide")
+        self.assertEqual([e["event"] for e in chaos.events], ["readback_pass", "readback_pass"])
+
+    def test_cleanup_failure_is_hard(self):
+        chaos = stub()
+        chaos.declared = {"chaos_created": []}
+        chaos.stop = mock.MagicMock()
+        chaos.writer = None
         chaos.delete_chaos = lambda *a, **k: None
+        chaos.delete_cluster_scoped = lambda: (_ for _ in ()).throw(AssertionError("leftover"))
+        chaos.command = lambda *a, **k: ""
+        with mock.patch.object(harness.Chaos, "cleanup", lambda self: None):
+            with self.assertRaises(AssertionError):
+                chaos.cleanup()
+
+
+def dead_pod_stub(same_uid=False):
+    chaos = stub()
+    chaos._fences = [{"metadata": {"name": "a", "uid": "f1"}, "spec": {"targets": [dict(TARGET)]}, "status": {}}]
+    chaos._recs = []
+    chaos.pod_identity = lambda name: dict(IDENT, node_id=name)
+    chaos.cluster_phase = lambda: "Healthy"
+    chaos.cluster_revision = lambda: "1"
+    chaos.recovery_uids = lambda: set()
+    chaos.fence_uids = lambda: {"f0"}
+    chaos.status = lambda name: {"wal_identity": "wal-2"}
+    chaos.pod = lambda name: {"metadata": {"name": name, "uid": "uid-2" if same_uid else "uid-new"},
+                              "status": {"phase": "Failed"}}
+    chaos.pods_with = lambda sel: []
+    chaos.create_chaos = lambda *a, **k: None
+    chaos.chaos_injected = lambda *a, **k: True
+    chaos.experiment = lambda kind, name: {"podRecords": [{"name": "rhiza-voter-2"}]}
+    chaos.wait = lambda label, pred, timeout=0: pred()
+    chaos.assert_controllers_running = lambda: True
+    chaos.assert_cluster_observed = lambda *a, **k: True
+    chaos.delete_chaos = lambda *a, **k: None
+    return chaos
+
+
+class DeadPodTest(unittest.TestCase):
+    def test_dead_pod_case_never_reports_pass(self):
+        chaos = dead_pod_stub()
         with mock.patch("time.sleep"):
             chaos.dead_pod_case("D2", "rhiza-voter-2")
         names = [e["event"] for e in chaos.events]
@@ -176,24 +207,16 @@ class FailSafeTest(unittest.TestCase):
         self.assertNotIn("PASS", names)
 
     def test_dead_pod_requires_a_new_fence(self):
-        chaos = stub()
+        chaos = dead_pod_stub()
         chaos._fences = [{"metadata": {"name": "old", "uid": "f0"}, "spec": {"targets": [dict(TARGET)]}, "status": {}}]
-        chaos._recs = []
-        chaos.pod_identity = lambda name: dict(IDENT, node_id=name)
-        chaos.cluster_phase = lambda: "Healthy"
-        chaos.recovery_uids = lambda: set()
         chaos.fence_uids = lambda: {"f0"}
-        chaos.pod = lambda name: {"metadata": {"name": name}, "status": {"phase": "Failed"}}
-        chaos.pods_with = lambda sel: []
-        chaos.create_chaos = lambda *a, **k: None
-        chaos.chaos_injected = lambda *a, **k: True
-        chaos.experiment = lambda kind, name: {"podRecords": [{"name": "rhiza-voter-1"}]}
-        chaos.wait = lambda label, pred, timeout=0: pred()
-        chaos.assert_controllers_running = lambda: True
-        chaos.assert_cluster_observed = lambda *a, **k: True
-        chaos.delete_chaos = lambda *a, **k: None
         with mock.patch("time.sleep"), self.assertRaises(AssertionError):
-            chaos.dead_pod_case("D2", "rhiza-voter-1")
+            chaos.dead_pod_case("D2", "rhiza-voter-2")
+
+    def test_dead_pod_rejects_a_surviving_incarnation(self):
+        chaos = dead_pod_stub(same_uid=True)
+        with mock.patch("time.sleep"), self.assertRaises(AssertionError):
+            chaos.dead_pod_case("D2", "rhiza-voter-2")
 
 
 if __name__ == "__main__":

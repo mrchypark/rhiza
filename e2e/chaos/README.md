@@ -114,6 +114,25 @@ uses `apply-local`, `mint-local`, and `run-local`; federation uses `apply` and
 `run`. These are one-shot operations: do not reuse an output or receipt
 directory, adopt colliding resources, or rerun after an unknown outcome.
 
+## voterCount operator path (GCS + Chaos Mesh)
+
+`run-votercount-gcs-chaos.sh` is the launcher for the v0.19.5 voterCount operator
+path. It is a second, run-owned path that shares the bootstrap above: run
+`bootstrap-gcs-postrelease.sh apply-local` first so the namespace, the `rhiza-gcs`
+workload-identity KSA, the quota and the admission policies exist, then run the
+launcher. It renders and applies `votercount_gcs_chaos.yaml.in` (supervised
+bootstrap StatefulSet, operator, cooperative authority, run-named TokenReview
+ClusterRole/Binding), then runs `votercount_gcs_chaos.py`, which proves the
+admission shapes by server-side dry-run, runs the positive scenarios (intact-WAL
+restart, online replacement, generation recovery) and then the dead-Pod fail-safe
+cases D1-D4. The driver deletes the run-owned cluster-scoped objects during
+cleanup and fails the run if any remain.
+
+Both images must be digest-pinned (`name@sha256:<digest>`); the launcher rejects a
+tag-only reference. `rhiza-fencer-tls` and `rhiza-fencer-ca` must exist in the
+namespace before the run; the launcher only applies the manifest set and waits for
+the authority rollout.
+
 Local direct execution uses IPv4 loopback port forwards. `RHIZA_LOCAL_PORT_BASE`
 is optional and defaults to `18080`; when set it must be a canonical decimal
 integer from `1024` through `65432`. The launcher verifies that the four HTTP
