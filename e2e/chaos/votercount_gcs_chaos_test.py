@@ -200,33 +200,52 @@ def dead_pod_stub(same_uid=False):
 
 
 class ScenarioSplitTest(unittest.TestCase):
-    def test_default_is_positive_and_dead_pod_is_deferred(self):
-        parser = harness.main.__globals__["argparse"]
-        import sys as _sys
-        old = _sys.argv
-        _sys.argv = ["votercount_gcs_chaos.py", "--context", "c", "--namespace", "n", "--run-id", "r",
-                     "--app-image", "a@sha256:x", "--operator-image", "o@sha256:y"]
-        try:
-            args = None
-            for action in []:
-                pass
-            chaos = object.__new__(harness.VoterCountChaos)
-            chaos.args = type("A", (), {"scenarios": "positive"})()
-            chaos.run_id = "r"
-            chaos.events = []
-            chaos.event = lambda name, **f: chaos.events.append({"event": name, **f})
-            chaos.prove_admission = lambda: True
-            chaos.prepare = lambda: True
-            chaos.run_positive = lambda: chaos.events.append({"event": "positive"})
-            chaos.run_dead_pod = lambda: chaos.events.append({"event": "dead-pod"})
-            chaos.run()
-            names = [e["event"] for e in chaos.events]
-            self.assertIn("positive", names)
-            self.assertNotIn("dead-pod", names)
-            complete = next(e for e in chaos.events if e["event"] == "complete")
-            self.assertEqual(complete["fail_safe"], "not_run")
-        finally:
-            _sys.argv = old
+    ARGV = ["--context", "c", "--namespace", "n", "--run-id", "r",
+            "--app-image", "a@sha256:" + "a" * 64, "--operator-image", "o@sha256:" + "b" * 64]
+
+    def test_default_arguments_are_positive(self):
+        self.assertEqual(harness.build_parser().parse_args(self.ARGV).scenarios, "positive")
+
+    def test_default_run_neither_validates_nor_clears_part2_state(self):
+        chaos = object.__new__(harness.VoterCountChaos)
+        chaos.args = harness.build_parser().parse_args(self.ARGV)
+        chaos.run_id = "r"
+        chaos.events = []
+        chaos.event = lambda name, **f: chaos.events.append({"event": name, **f})
+        chaos.prove_admission = lambda: chaos.events.append({"event": "admission"}) or True
+        chaos.prepare = lambda: True
+        chaos.run_positive = lambda: chaos.events.append({"event": "positive"})
+        chaos.run_dead_pod = lambda: chaos.events.append({"event": "dead-pod"})
+        chaos.reset_fences = lambda: chaos.events.append({"event": "reset"})
+        chaos.run()
+        names = [e["event"] for e in chaos.events]
+        self.assertIn("positive", names)
+        self.assertNotIn("dead-pod", names)
+        self.assertNotIn("reset", names)
+        start = next(e for e in chaos.events if e["event"] == "start")
+        self.assertEqual(start["claim_failsafe"], "not_run")
+        complete = next(e for e in chaos.events if e["event"] == "complete")
+        self.assertEqual(complete["fail_safe"], "not_run")
+
+    def test_positive_admission_proof_omits_the_part2_shape(self):
+        chaos = object.__new__(harness.VoterCountChaos)
+        chaos.args = harness.build_parser().parse_args(self.ARGV)
+        chaos.ns, chaos.run_id = "n", "r"
+        actions = []
+
+        def apply_json(body, extra=None):
+            actions.append(body["spec"]["action"])
+            denied = "forbidden" in body["metadata"]["name"]
+            return type("R", (), {"returncode": 1 if denied else 0, "stderr": ""})()
+
+        chaos.apply_json = apply_json
+        chaos.voter_selector = lambda pod: {"namespaces": ["n"]}
+        chaos.isolate_spec = lambda: {"action": "partition", "target": {"selector": {}}}
+        chaos.generation_spec = lambda: {"action": "partition", "target": {"selector": {}}}
+        chaos.event = lambda *a, **k: None
+        chaos.prove_admission()
+        self.assertIn("container-kill", actions)
+        self.assertNotIn("pod-kill", actions)
 
 
 class DeadPodTest(unittest.TestCase):

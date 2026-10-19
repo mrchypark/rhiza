@@ -87,8 +87,6 @@ class VoterCountChaos(Chaos):
         allowed = [
             ("PodChaos", "vc-prove-container-kill", {"action": "container-kill", "mode": "one",
              "duration": "10s", "containerNames": ["rhiza"], "selector": self.voter_selector(VOTERS[0])}),
-            ("PodChaos", "vc-prove-pod-kill", {"action": "pod-kill", "mode": "one", "duration": "10s",
-             "selector": self.voter_selector(VOTERS[2])}),
             ("NetworkChaos", "vc-prove-isolate", self.isolate_spec()),
             ("NetworkChaos", "vc-prove-generation", self.generation_spec()),
         ]
@@ -97,10 +95,14 @@ class VoterCountChaos(Chaos):
              "direction": "both", "selector": self.voter_selector(VOTERS[0]),
              "target": {"mode": "all", "selector": {"namespaces": [self.ns],
                         "labelSelectors": {"chaos.rhiza.io/run": self.run_id, "app": "rhiza-voter"}}}}),
-            ("PodChaos", "vc-prove-forbidden", {"action": "pod-kill", "mode": "all", "duration": "10s",
-             "selector": {"namespaces": [self.ns],
-                          "labelSelectors": {"chaos.rhiza.io/run": "other-run", "app": "rhiza-voter"}}}),
         ]
+        if self.args.scenarios in ("dead-pod", "all"):
+            rejected.append(("PodChaos", "vc-prove-forbidden", {"action": "pod-kill", "mode": "all", "duration": "10s",
+                             "selector": {"namespaces": [self.ns],
+                                          "labelSelectors": {"chaos.rhiza.io/run": "other-run", "app": "rhiza-voter"}}}))
+        if self.args.scenarios in ("dead-pod", "all"):
+            allowed.append(("PodChaos", "vc-prove-pod-kill", {"action": "pod-kill", "mode": "one",
+                           "duration": "10s", "selector": self.voter_selector(VOTERS[2])}))
         evidence = {"accepted": [], "rejected": []}
         for kind, name, spec in allowed:
             result = self.apply_json(self.chaos_body(kind, name, spec), ["--dry-run=server"])
@@ -453,7 +455,6 @@ class VoterCountChaos(Chaos):
         self.scenario_intact_wal_restart()
         self.scenario_online_replacement()
         self.scenario_generation_recovery()
-        self.reset_fences()
         self.event("positive_set_pass", acknowledged=len(self.acks))
 
     def run_dead_pod(self):
@@ -465,12 +466,14 @@ class VoterCountChaos(Chaos):
         scenarios = self.args.scenarios
         self.event("start", run_id=self.run_id, scenarios=scenarios,
                    claim_positive="cooperative online replacement and generation recovery",
-                   claim_failsafe="dead-Pod execution blocked while termination evidence is unresolved")
+                   claim_failsafe=("dead-Pod execution blocked while termination evidence is unresolved"
+                                   if scenarios in ("dead-pod", "all") else "not_run"))
         self.prove_admission()
         self.prepare()
         if scenarios in ("positive", "all"):
             self.run_positive()
         if scenarios in ("dead-pod", "all"):
+            self.reset_fences()
             # DEFERRED: Part 2 runs only after the production fencing executor
             # lands (separate implementation project). Until then the dead-Pod
             # claim is unqualified and this set is never executed by default.
@@ -524,7 +527,7 @@ class VoterCountChaos(Chaos):
             raise AssertionError("cleanup incomplete: %s" % self.cleanup_errors)
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", required=True)
     parser.add_argument("--namespace", required=True)
@@ -534,7 +537,11 @@ def main():
     parser.add_argument("--admin-token", default="")
     parser.add_argument("--output", default="votercount-gcs-chaos-results")
     parser.add_argument("--scenarios", default="positive", choices=("positive", "dead-pod", "all"))
-    chaos = VoterCountChaos(parser.parse_args())
+    return parser
+
+
+def main():
+    chaos = VoterCountChaos(build_parser().parse_args())
     status = 0
     try:
         chaos.run()
