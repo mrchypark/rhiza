@@ -46,7 +46,7 @@ func TestOpenSupervisedAzureDoesNotCreateContainerBeforeRejectedBind(t *testing.
 	previous := azure.DefaultConfig
 	azure.DefaultConfig.HTTPConfig.Transport = store.Client().Transport
 	t.Cleanup(func() { azure.DefaultConfig = previous })
-	socket := filepath.Join(t.TempDir(), "startup.sock")
+	socket := filepath.Join(fenceSocketDir(t), "startup.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)

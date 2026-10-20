@@ -124,7 +124,8 @@ policies exist. Then use the launcher's two phases with one fresh `RHIZA_OUT`
 directory:
 
 - `install` with the administrator kubeconfig. It applies the repository CRDs,
-  generates a one-day self-signed `rhiza-fencer-tls` Secret and matching
+  generates a self-signed `rhiza-fencer-tls` Secret (30 days by default,
+  configurable with `RHIZA_FENCE_CERT_DAYS`) and matching
   `rhiza-fencer-ca` ConfigMap, applies `votercount_gcs_chaos.yaml.in`, and
   captures the operator-generated bootstrap admin credential as a mode-0600
   `admin-token` file for the runtime phase.

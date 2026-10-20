@@ -5,6 +5,19 @@ set -eu
 set +x
 umask 077
 die() { printf '%s\n' "$*" >&2; exit 1; }
+# The release source of truth is the Rust SDK manifest version. The harness
+# identity family (pool, GSA names, namespace prefix) is derived from it so a
+# release bump cannot leave a stale family behind. Same capture idiom as
+# scripts/check-release-sync.sh.
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+# BEGIN VERSION PREFIX DERIVATION
+manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/sdk/rust/Cargo.toml" | head -n 1)
+[ -n "$manifest_version" ] || die 'Cannot read the SDK version from sdk/rust/Cargo.toml'
+version_prefix=v$(printf '%s' "$manifest_version" | tr -d '.')
+printf '%s\n' "$version_prefix" | LC_ALL=C grep -Eq '^v[0-9]+$' || die 'Malformed SDK version prefix'
+printf '%s\n' "$manifest_version" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die 'Malformed SDK version'
+# END VERSION PREFIX DERIVATION
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256_output=$(sha256sum "$1") || return
@@ -79,13 +92,13 @@ gsa_delete_wait_worker() {
 mode=${1:-render}
 auth_mode=ci
 case "$mode" in
-    render-local|apply-local|mint-local|rollback-local|check-local-auth|gsa-delete-wait-worker-local)
+    render-local|apply-local|preflight-local|mint-local|rollback-local|check-local-auth|gsa-delete-wait-worker-local)
         auth_mode=local
-        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; rollback-local) mode=rollback ;; gsa-delete-wait-worker-local) mode=gsa-delete-wait-worker ;; esac
+        case "$mode" in render-local) mode=render ;; apply-local) mode=apply ;; preflight-local) mode=preflight ;; rollback-local) mode=rollback ;; gsa-delete-wait-worker-local) mode=gsa-delete-wait-worker ;; esac
         : "${RHIZA_HARNESS_SHA:?reviewed local harness SHA required}"
         RHIZA_WORKFLOW_SHA=$RHIZA_HARNESS_SHA ;;
-    render|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback|gsa-delete-wait-worker) ;;
-    *) die 'Usage: bootstrap-gcs-postrelease.sh render[-local]|apply[-local]|mint-local|rollback[-local]|check-local-auth|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture' ;;
+    render|preflight|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture|apply|rollback|gsa-delete-wait-worker) ;;
+    *) die 'Usage: bootstrap-gcs-postrelease.sh render[-local]|preflight[-local]|apply[-local]|mint-local|rollback[-local]|check-local-auth|check-fixture|check-folder-iam|check-cleanup-uris|negative-node-fixture' ;;
 esac
 if [ "$mode" = gsa-delete-wait-worker ]; then
     [ "$#" = 2 ] || die 'GSA delete worker arguments rejected'
@@ -120,11 +133,8 @@ printf '%s\n' "$RHIZA_GKE_LOCATION" | LC_ALL=C grep -Eq '^[a-z0-9]+(-[a-z0-9]+)+
 printf '%s\n' "$RHIZA_KUBE_CONTEXT" | LC_ALL=C grep -Eq '^[A-Za-z0-9_.:@/-]+$' || die 'Invalid kube context'
 printf '%s\n' "$RHIZA_GCS_BUCKET" | LC_ALL=C grep -Eq '^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$' || die 'Invalid GCS bucket'
 printf '%s\n' "$RHIZA_GCS_PREFIX" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*/$' || die 'Invalid GCS prefix'
-case "$RHIZA_GCS_PREFIX" in *"/$RHIZA_RUN_ID/") ;; *) die 'GCS prefix must end in the fresh run ID' ;; esac
 printf '%s\n' "$RHIZA_NAMESPACE" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || die 'Invalid Kubernetes namespace'
 printf '%s\n' "$RHIZA_DATA_GSA_ID" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || die 'Invalid data GSA account ID'
-case "$RHIZA_NAMESPACE" in *"$RHIZA_RUN_ID"*) ;; *) die 'Namespace must contain the fresh run ID' ;; esac
-case "$RHIZA_DATA_GSA_ID" in *"$RHIZA_RUN_ID"*) ;; *) die 'Data GSA account ID must contain the fresh run ID' ;; esac
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
     printf '%s\n' "$node" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$' || die 'Invalid existing node name'
 done
@@ -148,6 +158,27 @@ if [ "$auth_mode" = ci ]; then
     printf '%s\n' "$RHIZA_GITHUB_ENVIRONMENT" | LC_ALL=C grep -Eq '^[A-Za-z0-9_.-]+$' || die 'Invalid GitHub environment'
     printf '%s\n' "$RHIZA_CI_GSA_ID" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || die 'Invalid CI GSA account ID'
 fi
+validate_identity_family() {
+    # Provisioning and rendering must use the current release family. Cleanup
+    # deliberately does not call this: its targets are proven by receipts.
+    expected_prefix="postrelease/v$manifest_version/$RHIZA_RUN_ID/"
+    [ "$RHIZA_GCS_PREFIX" = "$expected_prefix" ] || die "GCS prefix identity mismatch: expected $expected_prefix, got $RHIZA_GCS_PREFIX"
+    expected_namespace="rhiza-$version_prefix-$RHIZA_RUN_ID"
+    expected_data_gsa="rhiza-$version_prefix-gcs-$RHIZA_RUN_ID"
+    [ "$RHIZA_NAMESPACE" = "$expected_namespace" ] || die "Namespace identity mismatch: expected $expected_namespace, got $RHIZA_NAMESPACE"
+    [ "$RHIZA_DATA_GSA_ID" = "$expected_data_gsa" ] || die "Data GSA identity mismatch: expected $expected_data_gsa, got $RHIZA_DATA_GSA_ID"
+    if [ "$auth_mode" = ci ]; then
+        expected_ci_gsa="rhiza-$version_prefix-ci-$RHIZA_RUN_ID"
+        [ "$RHIZA_CI_GSA_ID" = "$expected_ci_gsa" ] || die "CI GSA identity mismatch: expected $expected_ci_gsa, got $RHIZA_CI_GSA_ID"
+    fi
+}
+if [ "$mode" = preflight ]; then
+    validate_identity_family
+    exit 0
+fi
+if [ "$mode" = mint-local ]; then
+    validate_identity_family
+fi
 project=$RHIZA_GCP_PROJECT_ID
 number=$RHIZA_GCP_PROJECT_NUMBER
 context=$RHIZA_KUBE_CONTEXT
@@ -155,7 +186,8 @@ bucket=$RHIZA_GCS_BUCKET
 ns=$RHIZA_NAMESPACE
 prefix=$RHIZA_GCS_PREFIX
 folder=gs://$bucket/$prefix
-pool=rhiza-v0191-gcs-$RHIZA_RUN_ID
+pool=rhiza-$version_prefix-gcs-$RHIZA_RUN_ID
+provider=github
 ci_id=${RHIZA_CI_GSA_ID:-unused-local-ci-account}
 data_id=$RHIZA_DATA_GSA_ID
 ci=$ci_id@$project.iam.gserviceaccount.com
@@ -170,7 +202,6 @@ data_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-gcs]
 operator_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-operator]
 oidc="assertion.repository_id == '${RHIZA_GITHUB_REPOSITORY_ID:-0}' && assertion.repository_owner_id == '${RHIZA_GITHUB_OWNER_ID:-0}' && assertion.ref == 'refs/heads/main' && assertion.event_name == 'workflow_dispatch' && assertion.workflow_ref == '${RHIZA_GITHUB_WORKFLOW_REF:-unused}' && assertion.workflow_sha == '$RHIZA_WORKFLOW_SHA' && assertion.environment == '${RHIZA_GITHUB_ENVIRONMENT:-unused}'"
 mapping='google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref,attribute.event_name=assertion.event_name,attribute.workflow_ref=assertion.workflow_ref,attribute.workflow_sha=assertion.workflow_sha,attribute.environment=assertion.environment'
-script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$script_dir/cluster-metadata-projection.sh"
 describe_cluster_metadata() { exec gcloud --project="$project" --quiet "$@"; }
 render() {
@@ -678,6 +709,7 @@ validate_fixture() {
     ' >/dev/null 2>/dev/null
 }
 if [ "$mode" = render ]; then
+    validate_identity_family
     render
     exit 0
 fi
@@ -889,13 +921,13 @@ if [ "$mode" = check-folder-iam ]; then
             *) die 'Unexpected synthetic gcloud command' ;;
         esac
     }
-    [ "$pool" = "rhiza-v0191-gcs-$RHIZA_RUN_ID" ] && [ "$ci" = "rhiza-v0191-ci-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] && [ "$data" = "rhiza-v0191-gcs-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] || die 'Fresh identity derivation regression'
+    [ "$pool" = "rhiza-$version_prefix-gcs-$RHIZA_RUN_ID" ] && [ "$ci" = "rhiza-$version_prefix-ci-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] && [ "$data" = "rhiza-$version_prefix-gcs-$RHIZA_RUN_ID@$project.iam.gserviceaccount.com" ] || die 'Fresh identity derivation regression'
     create_account "$ci_id" | jq -e --arg id "$ci_id" '.fixture_created==$id' >/dev/null
     create_account "$data_id" | jq -e --arg id "$data_id" '.fixture_created==$id' >/dev/null
     if (create_account rhiza-v0190-ci-1008) >/dev/null 2>&1; then die 'Old account accepted'; fi
     other_run=ffffffff
     [ "$RHIZA_RUN_ID" != "$other_run" ] || other_run=00000000
-    if (create_account "rhiza-v0191-gcs-$other_run") >/dev/null 2>&1; then die 'Cross-run account accepted'; fi
+    if (create_account "rhiza-$version_prefix-gcs-$other_run") >/dev/null 2>&1; then die 'Cross-run account accepted'; fi
     printf 'Fresh run %s: exact pool, two GSA create arguments, old/cross-run refusal verified.\n' "$RHIZA_RUN_ID"
     curl() {
         fixture_method=GET; fixture_output=; fixture_body=; fixture_header=; fixture_url=
@@ -1092,7 +1124,7 @@ command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || die
 [ "$auth_mode" = local ] || command -v gh >/dev/null || die 'Missing gh'
 k() { kubectl --context="$context" "$@"; }
 g() { gcloud --project="$project" --quiet "$@"; }
-identity=$(jq -nc --arg run "$RHIZA_RUN_ID" --arg sha "$RHIZA_WORKFLOW_SHA" --arg expiry "$RHIZA_AUTH_EXPIRES" --arg cap "$RHIZA_COST_CAP_KRW" --arg owner "$owner" --arg host_image "$RHIZA_HOST_IMAGE" '{run:$run,workflow_sha:$sha,expiry:$expiry,cost_cap_krw:$cap,owner:$owner,host_image:$host_image}')
+identity=$(jq -nc --arg run "$RHIZA_RUN_ID" --arg sha "$RHIZA_WORKFLOW_SHA" --arg expiry "$RHIZA_AUTH_EXPIRES" --arg cap "$RHIZA_COST_CAP_KRW" --arg owner "$owner" --arg host_image "$RHIZA_HOST_IMAGE" --arg namespace "$ns" --arg data_gsa_id "$data_id" --arg ci_gsa_id "$ci_id" --arg gcs_prefix "$prefix" --arg pool "$pool" --arg provider "$provider" '{run:$run,workflow_sha:$sha,expiry:$expiry,cost_cap_krw:$cap,owner:$owner,host_image:$host_image,namespace:$namespace,data_gsa_id:$data_gsa_id,ci_gsa_id:$ci_gsa_id,gcs_prefix:$gcs_prefix,pool:$pool,provider:$provider}')
 if [ "$auth_mode" = local ]; then identity=$(printf '%s\n' "$identity" | jq -c '.auth_mode="local"'); fi
 # Receipts are local and private, not public artifacts. No shell tracing/tokens.
 record() {
@@ -1106,6 +1138,7 @@ record() {
     fi
 }
 if [ "$mode" = apply ]; then
+    validate_identity_family
     # Refuse stale/long-lived grants before the first remote call.
     expires=$(utc_epoch "$RHIZA_AUTH_EXPIRES")
     now=$(date -u '+%s')
@@ -1133,6 +1166,35 @@ else
     [ -f "$RHIZA_AUTH_STATE/identity.json" ] && [ ! -L "$RHIZA_AUTH_STATE/identity.json" ] &&
       [ -n "$(find "$RHIZA_AUTH_STATE/identity.json" -type f -user "$(id -u)" -perm 0600 -print)" ] || die 'Private ownership identity receipt required'
     [ "$(jq -cS . "$RHIZA_AUTH_STATE/identity.json")" = "$(printf '%s\n' "$identity" | jq -cS .)" ] || die 'Receipt identity mismatch'
+    # A rollback is bound to the receipt's release family before its first
+    # remote call. Rebuild every release-scoped target from that proof, not
+    # from names derived from a potentially newer manifest/environment.
+    ns=$(jq -r .namespace "$RHIZA_AUTH_STATE/identity.json")
+    data_id=$(jq -r .data_gsa_id "$RHIZA_AUTH_STATE/identity.json")
+    ci_id=$(jq -r .ci_gsa_id "$RHIZA_AUTH_STATE/identity.json")
+    prefix=$(jq -r .gcs_prefix "$RHIZA_AUTH_STATE/identity.json")
+    pool=$(jq -r .pool "$RHIZA_AUTH_STATE/identity.json")
+    provider=$(jq -r .provider "$RHIZA_AUTH_STATE/identity.json")
+    folder=gs://$bucket/$prefix
+    ci=$ci_id@$project.iam.gserviceaccount.com
+    data=$data_id@$project.iam.gserviceaccount.com
+    ci_member=principalSet://iam.googleapis.com/projects/$number/locations/global/workloadIdentityPools/$pool/attribute.repository_id/${RHIZA_GITHUB_REPOSITORY_ID:-0}
+    data_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-gcs]
+    operator_member=serviceAccount:$project.svc.id.goog[$ns/rhiza-operator]
+    if [ -f "$RHIZA_AUTH_STATE/pool.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/pool.created")" = "$owner" ]; then
+        jq -e --arg name "projects/$number/locations/global/workloadIdentityPools/$pool" '
+          type=="object" and .name==$name
+        ' "$RHIZA_AUTH_STATE/pool-create.json" >/dev/null || die 'Pool create receipt identity rejected'
+        pool=$(jq -r .name "$RHIZA_AUTH_STATE/pool-create.json")
+        pool=${pool##*/}
+    fi
+    if [ -f "$RHIZA_AUTH_STATE/provider.created" ] && [ "$(cat "$RHIZA_AUTH_STATE/provider.created")" = "$owner" ]; then
+        jq -e --arg name "projects/$number/locations/global/workloadIdentityPools/$pool/providers/$provider" '
+          type=="object" and .name==$name
+        ' "$RHIZA_AUTH_STATE/provider-create.json" >/dev/null || die 'Provider create receipt identity rejected'
+        provider=$(jq -r .name "$RHIZA_AUTH_STATE/provider-create.json")
+        provider=${provider##*/}
+    fi
 fi
 [ ! -L "$RHIZA_AUTH_STATE" ] && [ "$(CDPATH='' cd -- "$RHIZA_AUTH_STATE" && pwd -P)" = "$RHIZA_AUTH_STATE" ] || die 'State path must be a private physical directory'
 [ -n "$(find "$RHIZA_AUTH_STATE" -prune -type d -user "$(id -u)" -perm 0700 -print)" ] || die 'State directory owner/mode rejected'
@@ -1424,7 +1486,7 @@ if [ "$mode" = apply ]; then
     }
     trap clear_fixture 0
     trap 'exit 130' HUP INT TERM
-    if ! "$RHIZA_FIXTURE_GENERATOR" qualification-fixture "$ns" "$RHIZA_RUN_ID" "$owner" > "$fixture_dir/secret.json" 2>/dev/null; then
+    if ! "$RHIZA_FIXTURE_GENERATOR" qualification-fixture "$ns" "$RHIZA_RUN_ID" "$owner" "$version_prefix" > "$fixture_dir/secret.json" 2>/dev/null; then
         die 'Trusted fixture generator failed (payload/diagnostics omitted)'
     fi
     chmod 600 "$fixture_dir/secret.json"
@@ -1494,12 +1556,16 @@ owned ci && check_sa ci "$ci"
 owned data && check_sa data "$data"
 if owned pool; then
     record pool-current g iam workload-identity-pools describe "$pool" --location=global --format=json
-    [ "$(jq -r .description "$RHIZA_AUTH_STATE/pool-current.json")" = "$owner" ] || die 'Pool ownership changed'
+    jq -e --slurpfile created "$RHIZA_AUTH_STATE/pool-create.json" '
+      type=="object" and ($created|length)==1 and .name==$created[0].name
+    ' "$RHIZA_AUTH_STATE/pool-current.json" >/dev/null || die 'Pool identity changed'
 fi
 if owned provider; then
-    record provider-current g iam workload-identity-pools providers describe github --location=global --workload-identity-pool="$pool" --format=json
-    [ "$(jq -r .description "$RHIZA_AUTH_STATE/provider-current.json")" = "$owner" ] || die 'Provider ownership changed'
-    record provider-disable g iam workload-identity-pools providers update-oidc github --location=global --workload-identity-pool="$pool" --disabled --format=json
+    record provider-current g iam workload-identity-pools providers describe "$provider" --location=global --workload-identity-pool="$pool" --format=json
+    jq -e --slurpfile created "$RHIZA_AUTH_STATE/provider-create.json" '
+      type=="object" and ($created|length)==1 and .name==$created[0].name
+    ' "$RHIZA_AUTH_STATE/provider-current.json" >/dev/null || die 'Provider identity changed'
+    record provider-disable g iam workload-identity-pools providers update-oidc "$provider" --location=global --workload-identity-pool="$pool" --disabled --format=json
 fi
 if owned folder; then
     record folder-current g storage managed-folders describe "$folder" --raw --format=json
@@ -1582,8 +1648,8 @@ if owned folder; then
     verify_absent folder g storage managed-folders describe "$folder" --raw --format=json
 fi
 if owned provider; then
-    record provider-delete g iam workload-identity-pools providers delete github --location=global --workload-identity-pool="$pool"
-    verify_absent provider g iam workload-identity-pools providers describe github --location=global --workload-identity-pool="$pool" --format=json
+    record provider-delete g iam workload-identity-pools providers delete "$provider" --location=global --workload-identity-pool="$pool"
+    verify_absent provider g iam workload-identity-pools providers describe "$provider" --location=global --workload-identity-pool="$pool" --format=json
 fi
 if owned pool; then
     record pool-delete g iam workload-identity-pools delete "$pool" --location=global

@@ -10,18 +10,74 @@ evaluate CEL.
 import json
 import io
 import os
+import hashlib
+import re
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from pathlib import Path
 
 import yaml
 
 import votercount_gcs_chaos as harness
+from operator_recovery import parse_json_documents
 
 HERE = Path(__file__).resolve().parent
 NS = "rhiza-chaos-abc12345"
+
+
+def load_release_version():
+    """Derive the current release identity forms from the SDK manifest.
+
+    sdk/rust/Cargo.toml is the single source of truth for the release version
+    family. The path is resolved from this test file's own directory so the
+    derived values never depend on the caller's working directory. A missing
+    or malformed version raises instead of silently defaulting.
+    """
+    manifest = HERE / "../../sdk/rust/Cargo.toml"
+    try:
+        source = manifest.read_text()
+    except OSError as error:
+        raise RuntimeError("cannot read the release manifest %s: %s" % (manifest, error)) from error
+    match = re.search(r'^version = "([^"]+)"', source, re.M)
+    if match is None:
+        raise RuntimeError("%s declares no package version" % manifest)
+    version = match.group(1)
+    if not re.match(r"^[0-9]+\.[0-9]+\.[0-9]+$", version):
+        raise RuntimeError("%s declares a malformed package version %r" % (manifest, version))
+    return {
+        "version": version,
+        "compact": version.replace(".", ""),
+        "prefix": "v" + version.replace(".", ""),
+        "dotted": "v" + version,
+    }
+
+
+RELEASE = load_release_version()
+RELEASE_VERSION = RELEASE["version"]
+RELEASE_COMPACT = RELEASE["compact"]
+RELEASE_PREFIX = RELEASE["prefix"]
+RELEASE_DOTTED = RELEASE["dotted"]
+
+
+def stale_release_prefix():
+    """Return a release-family prefix that is guaranteed not to be the current one.
+
+    The negative fixtures feed the harness a family that must be rejected, so
+    the stale value may never equal the current family. Deriving it keeps the
+    fixture a rejection case even when the SDK version moves onto the family
+    that used to be hardcoded here.
+    """
+    for candidate in ("v0191", "v0190", "v0180"):
+        if candidate != RELEASE_PREFIX:
+            return candidate
+    digits = RELEASE_COMPACT
+    return "v" + digits[:-1] + ("0" if digits[-1] != "0" else "1")
+
+
+STALE_RELEASE_PREFIX = stale_release_prefix()
 
 
 def render(path, **values):
@@ -32,7 +88,7 @@ def render(path, **values):
 
 
 RUN = dict(NAMESPACE=NS, RUN_ID="abc12345", CLUSTER_ID="abc12345-cluster",
-           GCS_BUCKET="bucket", GCS_PREFIX="rhiza/abc12345/",
+           GCS_BUCKET="bucket", GCS_PREFIX="postrelease/v%s/abc12345/" % RELEASE_VERSION,
            POD_GSA="data@example.iam.gserviceaccount.com",
            OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:aa",
            HOST_IMAGE="ghcr.io/mrchypark/rhiza-application@sha256:bb")
@@ -125,6 +181,289 @@ class RunManifestTest(unittest.TestCase):
         self.assertIn("name: rhiza-inspector\n", block)
         self.assertIn("name: rhiza-inspector-control\n", block)
         self.assertNotIn("name: rhiza-inspector", text[:start])
+
+    def test_workload_cpu_stays_inside_the_namespace_quota(self):
+        # The namespace quota tracks limits.cpu, so every container must declare
+        # it: a missing limit is rejected by the API server at admission.
+        quota_text = (HERE / "gcs-postrelease-auth.yaml.in").read_text()
+        for token, value in (("@NAMESPACE@", NS), ("@OWNER@", "owner"), ("@RUN_ID@", "abc12345"),
+                             ("@POD_GSA@", "data@example.iam.gserviceaccount.com"),
+                             ("@RUNTIME_KIND@", "ServiceAccount"), ("@RUNTIME_API_GROUP@", ""),
+                             ("@RUNTIME_NAME@", "runtime"),
+                             ("@RUNTIME_NAMESPACE@", "    namespace: " + NS)):
+            quota_text = quota_text.replace(token, value)
+        quota = next(d for d in yaml.safe_load_all(quota_text)
+                     if d and d.get("kind") == "ResourceQuota")
+        hard = quota["spec"]["hard"]
+
+        def millis(value):
+            value = str(value)
+            return int(value[:-1]) if value.endswith("m") else int(float(value) * 1000)
+
+        docs = self.docs()
+        voter_count = next(d for d in docs if d["kind"] == "RhizaCluster")["spec"]["voterCount"]
+        limit_sum = request_sum = 0
+        workload_kinds = {"Pod", "StatefulSet", "Deployment", "DaemonSet", "Job", "CronJob"}
+        for doc in docs:
+            if doc["kind"] not in workload_kinds:
+                continue
+            spec = doc.get("spec", {})
+            if doc["kind"] == "Pod":
+                pod_spec, copies = spec, 1
+            elif doc["kind"] == "CronJob":
+                pod_spec, copies = doc["jobTemplate"]["spec"]["template"]["spec"], 1
+            else:
+                pod_spec = spec["template"]["spec"]
+                copies = (voter_count if doc["kind"] == "StatefulSet"
+                          else spec.get("replicas", 1))
+            for container in pod_spec.get("containers", []) + pod_spec.get("initContainers", []):
+                resources = container.get("resources", {})
+                where = "%s/%s container %s" % (doc["kind"], doc["metadata"]["name"], container["name"])
+                for key in ("limits", "requests"):
+                    self.assertIn("cpu", resources.get(key, {}),
+                                  "%s declares no %s.cpu" % (where, key))
+                limit_sum += millis(resources["limits"]["cpu"]) * copies
+                request_sum += millis(resources["requests"]["cpu"]) * copies
+        self.assertLessEqual(limit_sum, millis(hard["limits.cpu"]),
+                             "workload limits.cpu exceeds the namespace quota")
+        self.assertLessEqual(request_sum, millis(hard["requests.cpu"]),
+                             "workload requests.cpu exceeds the namespace quota")
+
+    def test_service_quota_covers_static_services_and_learner_retries(self):
+        quota_text = (HERE / "gcs-postrelease-auth.yaml.in").read_text()
+        for token, value in (("@NAMESPACE@", NS), ("@OWNER@", "owner"), ("@RUN_ID@", "abc12345"),
+                             ("@POD_GSA@", "data@example.iam.gserviceaccount.com"),
+                             ("@RUNTIME_KIND@", "ServiceAccount"), ("@RUNTIME_API_GROUP@", ""),
+                             ("@RUNTIME_NAME@", "runtime"),
+                             ("@RUNTIME_NAMESPACE@", "    namespace: " + NS)):
+            quota_text = quota_text.replace(token, value)
+        quota = next(d for d in yaml.safe_load_all(quota_text)
+                     if d and d.get("kind") == "ResourceQuota")
+        hard = quota["spec"]["hard"]
+        static_services = [d for d in self.docs() if d["kind"] == "Service"]
+        learner_service_incarnations = 3
+        declared_services = int(hard["services"])
+        self.assertEqual({service["metadata"]["name"] for service in static_services},
+                         {"rhiza-headless", "rhiza-fencer"})
+        self.assertGreaterEqual(declared_services,
+                                len(static_services) + learner_service_incarnations,
+                                "service quota must leave room for three retained learner retry Services")
+
+
+class BootstrapIdentityPreflightTest(unittest.TestCase):
+    def preflight(self, mode, **overrides):
+        env = dict(os.environ,
+                   RHIZA_RUN_ID="abc12345",
+                   RHIZA_HARNESS_SHA="a" * 40,
+                   RHIZA_AUTH_EXPIRES="2099-01-01T00:00:00Z",
+                   RHIZA_HOST_IMAGE="registry.example/rhiza@sha256:" + "a" * 64,
+                   RHIZA_METADATA_IMAGE="registry.example/cloud-cli@sha256:" + "b" * 64,
+                   RHIZA_GCP_PROJECT_ID="project-12345",
+                   RHIZA_GCP_PROJECT_NUMBER="123456",
+                   RHIZA_GKE_CLUSTER="cluster-1",
+                   RHIZA_GKE_LOCATION="asia-northeast3",
+                   RHIZA_KUBE_CONTEXT="ctx",
+                   RHIZA_GCS_BUCKET="bucket-1",
+                   RHIZA_GCS_PREFIX="postrelease/v%s/abc12345/" % RELEASE_VERSION,
+                   RHIZA_NAMESPACE="rhiza-%s-abc12345" % RELEASE_PREFIX,
+                   RHIZA_DATA_GSA_ID="rhiza-%s-gcs-abc12345" % RELEASE_PREFIX,
+                   RHIZA_NODE_A="node-a", RHIZA_NODE_B="node-b", RHIZA_NODE_C="node-c")
+        env.update(overrides)
+        return subprocess.run(["sh", str(HERE / "bootstrap-gcs-postrelease.sh"), mode],
+                              env=env, capture_output=True, text=True, timeout=30)
+
+    def test_preflight_local_rejects_stale_namespace_before_cloud_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "gcloud-called"
+            fake_gcloud = Path(directory) / "gcloud"
+            fake_gcloud.write_text("#!/bin/sh\ntouch \"$RHIZA_TEST_GCLOUD_MARKER\"\nexit 99\n")
+            fake_gcloud.chmod(0o755)
+            result = self.preflight("preflight-local",
+                                    RHIZA_NAMESPACE="rhiza-%s-abc12345" % STALE_RELEASE_PREFIX,
+                                    RHIZA_DATA_GSA_ID="rhiza-%s-gcs-abc12345" % STALE_RELEASE_PREFIX,
+                                    RHIZA_TEST_GCLOUD_MARKER=str(marker),
+                                    PATH=directory + os.pathsep + os.environ["PATH"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Namespace identity mismatch: expected rhiza-%s-abc12345, got rhiza-%s-abc12345"
+                          % (RELEASE_PREFIX, STALE_RELEASE_PREFIX), result.stderr)
+            self.assertFalse(marker.exists(), "stale identity reached gcloud before preflight rejection")
+
+    def test_preflight_rejects_stale_ci_gsa_before_cloud_access(self):
+        result = self.preflight("preflight",
+                                RHIZA_WORKFLOW_SHA="a" * 40,
+                                RHIZA_GITHUB_REPOSITORY="example/project",
+                                RHIZA_GITHUB_REPOSITORY_ID="12345",
+                                RHIZA_GITHUB_OWNER_ID="67890",
+                                RHIZA_GITHUB_WORKFLOW_REF="example/project/.github/workflows/qualification.yml@refs/heads/main",
+                                RHIZA_GITHUB_ENVIRONMENT="qualification",
+                                RHIZA_CI_GSA_ID="rhiza-%s-ci-abc12345" % STALE_RELEASE_PREFIX)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CI GSA identity mismatch: expected rhiza-%s-ci-abc12345, got rhiza-%s-ci-abc12345"
+                      % (RELEASE_PREFIX, STALE_RELEASE_PREFIX), result.stderr)
+
+
+class BootstrapIdentityApplyTest(unittest.TestCase):
+    def apply_local(self, **overrides):
+        env = dict(os.environ,
+                   RHIZA_RUN_ID="abc12345",
+                   RHIZA_HARNESS_SHA="a" * 40,
+                   RHIZA_AUTH_EXPIRES=(datetime.now(timezone.utc) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   RHIZA_HOST_IMAGE="registry.example/rhiza@sha256:" + "a" * 64,
+                   RHIZA_METADATA_IMAGE="registry.example/cloud-cli@sha256:" + "b" * 64,
+                   RHIZA_GCP_PROJECT_ID="project-12345",
+                   RHIZA_GCP_PROJECT_NUMBER="123456",
+                   RHIZA_GKE_CLUSTER="cluster-1",
+                   RHIZA_GKE_LOCATION="asia-northeast3",
+                   RHIZA_KUBE_CONTEXT="ctx",
+                   RHIZA_GCS_BUCKET="bucket-1",
+                   RHIZA_GCS_PREFIX="postrelease/v%s/abc12345/" % RELEASE_VERSION,
+                   RHIZA_NAMESPACE="rhiza-%s-abc12345" % RELEASE_PREFIX,
+                   RHIZA_DATA_GSA_ID="rhiza-%s-gcs-abc12345" % RELEASE_PREFIX,
+                   RHIZA_NODE_A="node-a", RHIZA_NODE_B="node-b", RHIZA_NODE_C="node-c")
+        env.update(overrides)
+        return subprocess.run(["sh", str(HERE / "bootstrap-gcs-postrelease.sh"), "apply-local"],
+                              env=env, capture_output=True, text=True, timeout=30)
+
+    def remote_tools(self, directory, marker):
+        script = """#!/bin/sh
+tool=${0##*/}
+printf '%s %s\\n' "$tool" "$*" >> "$RHIZA_TEST_REMOTE_SENTINEL"
+if [ "$tool" = gcloud ] && [ "$*" = "--project=project-12345 --quiet config get-value account" ]; then
+    printf '%s\\n' "$RHIZA_EXPECTED_ADMIN_ACCOUNT"
+    exit 0
+fi
+exit 97
+"""
+        for name in ("gcloud", "gh", "kubectl"):
+            command = Path(directory) / name
+            command.write_text(script)
+            command.chmod(0o755)
+        marker.write_text("")
+
+    def test_apply_local_rejects_stale_namespace_before_any_remote_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "remote-calls"
+            generator = Path(directory) / "fixture-generator"
+            generator.write_text("#!/bin/sh\nexit 0\n")
+            generator.chmod(0o755)
+            self.remote_tools(directory, marker)
+            result = self.apply_local(
+                RHIZA_NAMESPACE="rhiza-%s-abc12345" % STALE_RELEASE_PREFIX,
+                RHIZA_DATA_GSA_ID="rhiza-%s-gcs-abc12345" % STALE_RELEASE_PREFIX,
+                RHIZA_BOOTSTRAP_GO="I_APPROVE_NEW_SCOPE",
+                RHIZA_COST_CAP_KRW="10000",
+                RHIZA_EXPECTED_ADMIN_ACCOUNT="admin@example.com",
+                RHIZA_AUTH_STATE=str((Path(directory) / "auth-state").resolve()),
+                RHIZA_FIXTURE_GENERATOR=str(generator),
+                RHIZA_FIXTURE_GENERATOR_SHA256=hashlib.sha256(generator.read_bytes()).hexdigest(),
+                RHIZA_TEST_REMOTE_SENTINEL=str(marker),
+                PATH=directory + os.pathsep + os.environ["PATH"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Namespace identity mismatch: expected rhiza-%s-abc12345, got rhiza-%s-abc12345"
+                          % (RELEASE_PREFIX, STALE_RELEASE_PREFIX), result.stderr)
+            self.assertEqual(marker.read_text(), "",
+                             "stale identity reached a remote client before apply rejection")
+
+    def test_apply_local_valid_identity_reaches_a_remote_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "remote-calls"
+            generator = Path(directory) / "fixture-generator"
+            generator.write_text("#!/bin/sh\nexit 0\n")
+            generator.chmod(0o755)
+            self.remote_tools(directory, marker)
+            result = self.apply_local(
+                RHIZA_BOOTSTRAP_GO="I_APPROVE_NEW_SCOPE",
+                RHIZA_COST_CAP_KRW="10000",
+                RHIZA_EXPECTED_ADMIN_ACCOUNT="admin@example.com",
+                RHIZA_AUTH_STATE=str((Path(directory) / "auth-state").resolve()),
+                RHIZA_FIXTURE_GENERATOR=str(generator),
+                RHIZA_FIXTURE_GENERATOR_SHA256=hashlib.sha256(generator.read_bytes()).hexdigest(),
+                RHIZA_TEST_REMOTE_SENTINEL=str(marker),
+                PATH=directory + os.pathsep + os.environ["PATH"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Stopped at project-identity (exit 97)", result.stderr)
+            calls = marker.read_text()
+            self.assertNotEqual(calls, "", "valid identity control did not reach any remote client")
+            self.assertIn("gcloud --project=project-12345 --quiet config get-value account", calls)
+            self.assertIn("gcloud --project=project-12345 --quiet projects describe project-12345 --format=json", calls)
+
+
+class BootstrapReceiptRollbackTest(unittest.TestCase):
+    def rollback_local(self, receipt_mutation=None, pool_receipt=None):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            state = directory / "auth-state"
+            state.mkdir(mode=0o700)
+            marker = directory / "remote-calls"
+            marker.write_text("")
+            for name in ("gcloud", "kubectl"):
+                tool = directory / name
+                tool.write_text("#!/bin/sh\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$RHIZA_TEST_REMOTE_SENTINEL\"\nexit 97\n")
+                tool.chmod(0o755)
+            expiry = (datetime.now(timezone.utc) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            owner = "rhiza-postrelease-abc12345-" + "a" * 40
+            identity = {
+                "run": "abc12345", "workflow_sha": "a" * 40, "expiry": expiry,
+                "cost_cap_krw": "10000", "owner": owner,
+                "host_image": "registry.example/rhiza@sha256:" + "a" * 64,
+                "namespace": "rhiza-%s-abc12345" % RELEASE_PREFIX,
+                "data_gsa_id": "rhiza-%s-gcs-abc12345" % RELEASE_PREFIX,
+                "ci_gsa_id": "unused-local-ci-account",
+                "gcs_prefix": "postrelease/v%s/abc12345/" % RELEASE_VERSION,
+                "pool": "rhiza-%s-gcs-abc12345" % RELEASE_PREFIX, "provider": "github",
+                "auth_mode": "local",
+            }
+            if receipt_mutation:
+                receipt_mutation(identity)
+            identity_path = state / "identity.json"
+            identity_path.write_text(json.dumps(identity))
+            identity_path.chmod(0o600)
+            if pool_receipt is not None:
+                (state / "pool.created").write_text(owner + "\n")
+                (state / "pool.created").chmod(0o600)
+                pool_path = state / "pool-create.json"
+                pool_path.write_text(json.dumps(pool_receipt))
+                pool_path.chmod(0o600)
+            env = dict(os.environ,
+                       RHIZA_RUN_ID="abc12345", RHIZA_HARNESS_SHA="a" * 40,
+                       RHIZA_AUTH_EXPIRES=expiry,
+                       RHIZA_HOST_IMAGE="registry.example/rhiza@sha256:" + "a" * 64,
+                       RHIZA_METADATA_IMAGE="registry.example/cloud-cli@sha256:" + "b" * 64,
+                       RHIZA_GCP_PROJECT_ID="project-12345", RHIZA_GCP_PROJECT_NUMBER="123456",
+                       RHIZA_GKE_CLUSTER="cluster-1", RHIZA_GKE_LOCATION="asia-northeast3",
+                       RHIZA_KUBE_CONTEXT="ctx", RHIZA_GCS_BUCKET="bucket-1",
+                       RHIZA_GCS_PREFIX="postrelease/v%s/abc12345/" % RELEASE_VERSION,
+                       RHIZA_NAMESPACE="rhiza-%s-abc12345" % RELEASE_PREFIX,
+                       RHIZA_DATA_GSA_ID="rhiza-%s-gcs-abc12345" % RELEASE_PREFIX,
+                       RHIZA_NODE_A="node-a", RHIZA_NODE_B="node-b", RHIZA_NODE_C="node-c",
+                       RHIZA_BOOTSTRAP_GO="I_APPROVE_NEW_SCOPE", RHIZA_COST_CAP_KRW="10000",
+                       RHIZA_EXPECTED_ADMIN_ACCOUNT="admin@example.com", RHIZA_AUTH_STATE=str(state),
+                       RHIZA_ROLLBACK_QUIESCENT="YES_VERIFIED", RHIZA_TEST_REMOTE_SENTINEL=str(marker),
+                       PATH=str(directory) + os.pathsep + os.environ["PATH"])
+            result = subprocess.run(["sh", str(HERE / "bootstrap-gcs-postrelease.sh"), "rollback-local"],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            return result, marker.read_text()
+
+    def test_rollback_rejects_stale_receipt_before_remote_call(self):
+        result, calls = self.rollback_local(
+            lambda identity: identity.update(namespace="rhiza-%s-abc12345" % STALE_RELEASE_PREFIX))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Receipt identity mismatch", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_rollback_rejects_release_family_change_before_remote_call(self):
+        result, calls = self.rollback_local(
+            lambda identity: identity.update(gcs_prefix="postrelease/v0.0.0/abc12345/"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Receipt identity mismatch", result.stderr)
+        self.assertEqual(calls, "")
+
+    def test_rollback_rejects_tampered_pool_receipt_before_remote_call(self):
+        result, calls = self.rollback_local(pool_receipt={
+            "name": "projects/123456/locations/global/workloadIdentityPools/tampered-pool"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Pool create receipt identity rejected", result.stderr)
+        self.assertEqual(calls, "")
 
 
 class AdmissionPolicyTest(unittest.TestCase):
@@ -406,6 +745,42 @@ class InspectorIsolationTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             chaos.isolation_mode()
 
+    def test_capture_probe_pods_keeps_each_multi_document_receipt(self):
+        chaos = stub()
+        chaos.args = harness.build_parser().parse_args(ScenarioSplitTest.ARGV)
+        chaos.context = "kind-test"
+        probe = """\
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-inspector
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rhiza-inspector-control
+"""
+        documents = list(yaml.safe_load_all(probe))
+        for document, uid in zip(documents, ("inspector-uid", "control-uid")):
+            document["metadata"]["uid"] = uid
+        # kubectl concatenates its documents with no separator, so the zero
+        # separator shape is the one that actually failed.
+        for separator in ("\n", ""):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as output:
+                chaos.out = Path(output)
+                chaos.command = mock.Mock(return_value=separator.join(json.dumps(document) for document in documents))
+                chaos.wait = mock.Mock(return_value=True)
+
+                receipts = chaos.capture_probe_pods()
+
+                self.assertEqual(receipts, {document["metadata"]["name"]: document for document in documents})
+                self.assertEqual(chaos.command.call_args.args[0][-5:],
+                                 ["create", "-f", chaos.args.inspector_probe, "-o", "json"])
+                self.assertEqual(chaos.wait.call_count, 2)
+                for document in documents:
+                    name = document["metadata"]["name"]
+                    self.assertEqual(json.loads((chaos.out / (name + "-created.json")).read_text()), document)
+
     def test_exclusion_records_a_scoped_receipt_without_probing(self):
         chaos = self.stub()
         chaos.args.inspector_network_isolation = "exclude-user-approved"
@@ -527,12 +902,27 @@ class InspectorIsolationTest(unittest.TestCase):
                     harness.parse_https_443(bad)
 
 
+class JsonDocumentParsingTest(unittest.TestCase):
+    def test_parse_json_documents_splits_kubectl_multi_document_output(self):
+        documents = [{"metadata": {"name": "first"}}, {"metadata": {"name": "second"}}]
+        for separator in ("\n", ""):
+            with self.subTest(separator=separator):
+                self.assertEqual(parse_json_documents(separator.join(json.dumps(document) for document in documents)),
+                                 documents)
+
+
 class LauncherDigestTest(unittest.TestCase):
     """The launcher must reject anything that is not name@sha256:<64 hex>."""
 
-    BASE = dict(RHIZA_RUN_ID="abc12345", RHIZA_NAMESPACE="ns", RHIZA_KUBE_CONTEXT="ctx",
-                RHIZA_GCS_BUCKET="b", RHIZA_GCS_PREFIX="p/", RHIZA_CLUSTER_ID="cid",
-                RHIZA_GCP_PROJECT_ID="project", RHIZA_DATA_GSA_ID="data-gsa",
+    SDK_VERSION = RELEASE_VERSION
+    BASE = dict(RHIZA_RUN_ID="abc12345",
+                RHIZA_NAMESPACE="rhiza-v%s-abc12345" % RELEASE_COMPACT,
+                RHIZA_KUBE_CONTEXT="ctx",
+                RHIZA_GCS_BUCKET="b",
+                RHIZA_GCS_PREFIX="postrelease/v%s/abc12345/" % SDK_VERSION,
+                RHIZA_CLUSTER_ID="cid",
+                RHIZA_GCP_PROJECT_ID="project",
+                RHIZA_DATA_GSA_ID="rhiza-v%s-gcs-abc12345" % RELEASE_COMPACT,
                 RHIZA_OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:" + "f" * 64)
 
     def run_launcher(self, app_image):
@@ -543,7 +933,7 @@ class LauncherDigestTest(unittest.TestCase):
 
     def test_malformed_digests_are_rejected(self):
         for bad in ("repo@sha256:", "repo@sha256:not-a-digest", "repo@sha256:zz",
-                    "repo:v0.19.5", "repo@sha256:" + "a" * 63):
+                    "repo:" + RELEASE_DOTTED, "repo@sha256:" + "a" * 63):
             with self.subTest(bad=bad):
                 result = self.run_launcher(bad)
                 self.assertEqual(result.returncode, 2, result.stderr[-200:])

@@ -55,7 +55,9 @@ spec:
     # Three voters, operator and authority are resident, plus the two transient
     # isolation probe Pods: the positive run needs 7, leaving one Pod of headroom.
     pods: '8'
-    services: '2'
+    # Two static Services plus up to three learner incarnations. The operator
+    # does not clean up Services, so retries retain each incarnation Service.
+    services: '5'
     services.loadbalancers: '0'
     services.nodeports: '0'
     persistentvolumeclaims: '0'

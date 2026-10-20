@@ -28,7 +28,7 @@ import threading
 import time
 from pathlib import Path
 
-from operator_recovery import Chaos
+from operator_recovery import Chaos, parse_json_documents
 
 VOTERS = ("rhiza-voter-0", "rhiza-voter-1", "rhiza-voter-2")
 COMPLETE = ("Complete",)
@@ -377,9 +377,11 @@ class VoterCountChaos(Chaos):
 
     def capture_probe_pods(self):
         """Create the run-owned probe pair just-in-time and keep its receipts."""
-        created = json.loads(self.command(["kubectl", "--context", self.context, "-n", self.ns,
-                                           "create", "-f", self.args.inspector_probe, "-o", "json"]))
-        items = created["items"] if created.get("kind") == "List" else [created]
+        created = parse_json_documents(self.command([
+            "kubectl", "--context", self.context, "-n", self.ns,
+            "create", "-f", self.args.inspector_probe, "-o", "json"]))
+        items = [item for document in created
+                 for item in (document["items"] if document.get("kind") == "List" else [document])]
         receipts = {item["metadata"]["name"]: item for item in items}
         assert sorted(receipts) == sorted((INSPECTOR, INSPECTOR_CONTROL)), sorted(receipts)
         for name, pod in receipts.items():
