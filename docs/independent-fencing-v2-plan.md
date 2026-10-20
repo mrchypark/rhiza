@@ -50,13 +50,16 @@ database-Pod failure domain. Staging location and journal storage must survive
 an authority-Pod restart and have finite admission limits. Never acknowledge a
 before-ack request merely because it was staged or journaled.
 
-For the first GCS profile, serialize operations per source key and record its
-generation precondition once. An authority retry must preserve the original
-operation identity, exact payload and original generation condition. If one
-identical conditional attempt commits, its new generation must exclude any
-later effect from other attempts with the old condition. Conditional deletion
-targets an exact observed generation; it must never become an unconditional
-delete or change to a newer generation on retry.
+For the first GCS profile, serialize operations per source key across all
+producers and record the generation precondition once. An authority retry must
+preserve the original operation identity, exact payload and original generation
+condition. Verified commitment excludes later copies with the same **nonzero**
+generation condition. This does not hold for generation zero after physical
+deletion: a delayed create-only copy can recreate the object. Keep a live guard
+or logical tombstone while any zero-conditioned attempt/session is unresolved,
+or prove every copy terminal before physical deletion, including lifecycle rules.
+Conditional deletion targets an exact observed generation; it must never become
+an unconditional delete or change to a newer generation on retry.
 
 Unknown outcomes remain recorded. Resolution must prove terminal completion or
 future-effect exclusion through the provider's actual semantics. An unrelated
@@ -64,14 +67,29 @@ later successful request is not resolution. Multipart/resumable sessions need
 explicit operation/session tracking or must fail the profile's capability gate.
 
 An authority restart can replay only an existing immutable operation. It cannot
-invent a replacement operation with new preconditions. Old and new workers may
-overlap only if every physical effect is rendered safe by those fixed provider
-preconditions; a leadership lease alone is insufficient.
+invent a replacement operation with new preconditions. Prepare the per-key
+descriptor durably, then CAS-bind that exact descriptor to the still-nonterminal
+producer entry before dispatch. Missing execution records remain unresolved;
+they are not proof that a delayed scheduler will never dispatch. Preserve terminal
+sequence watermarks after compaction so stale preparations cannot reopen work.
 
-These choices, especially the provider-resolution proof and staging durability,
-need focused Pro review before the service is implemented. Other storage
-providers require their own verified settlement/exclusion capabilities; an
-opaque ETag alone is not assumed to be a non-reusable version.
+Generation closure freezes the immutable enrolled producer cohort, not a list
+of producer objects observed at one instant. Enrollment must bind deterministic
+producer identities; every identity, even one whose producer creation is pending,
+is included in the closure. Missing producer state cannot initialize as open.
+
+Record COMMITTED, terminal rejection and FUTURE_EFFECT_EXCLUDED separately.
+Exclusion alone never authorizes a successful before-ack client response. Retain
+original unknown-attempt records and their resolution evidence.
+
+The focused Pro follow-up approves the CloseProducer/Prepare/Resolve contract,
+with the additional guards above; it rejects the earlier blanket exclusion claim.
+Native metadata PATCH requires generation plus metageneration. Resumable uploads
+bind preconditions at initiation and persist the exact session descriptor before
+payload dispatch; a late initiation response cannot bypass producer preparation.
+Unsupported session modes fail closed. Other storage providers require their own
+verified settlement/exclusion capabilities; an opaque ETag alone is not assumed
+to be a non-reusable version.
 
 ## Test and deployment boundaries
 
