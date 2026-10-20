@@ -12,7 +12,12 @@ Integrity: raw response normalized to one final newline is 30,188 UTF-8 bytes;
 POSIX cksum 1988313602 independently matches the browser clipboard bytes;
 SHA-256 95001fa52618f00ec5df780b3adbfe4fde1c7f31946352c2699894a20bef11dc.
 The following is the reviewer's original text, not a locally validated conclusion.
-Issue links: pending local reproduction and issue creation; none created yet.
+Issue mapping: [#246](https://github.com/mrchypark/rhiza/issues/246).
+F1 maps to the P0 storage-quiet-window paragraph; F2 maps to the first P1
+per-run runtime-binding paragraph; F3 maps to the second P1 retired-voter
+composition paragraph below. All three have local failing reproductions at
+89def5e7bb8485925381ca22fdeb20408e49692b. The review recommendations remain
+distinct from implemented behavior and from any future infrastructure approval.
 
 <!-- BEGIN ORIGINAL RESPONSE -->
 ## Recommendation
