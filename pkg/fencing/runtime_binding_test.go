@@ -1,0 +1,130 @@
+package fencing
+
+import (
+	"encoding/json"
+	"errors"
+	"reflect"
+	"testing"
+)
+
+func enrolledRuntime(id Identity, container string) RuntimeBinding {
+	return RuntimeBinding{
+		AuthorityID: "authority", NamespaceUID: "namespace", BindingUID: "root",
+		StatefulSetUID: "statefulset", SourceClusterID: id.SourceClusterID,
+		NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID,
+		NodeName: "node", NodeUID: "node-uid", MachineID: "machine", BootID: "boot",
+		RuntimeID: "containerd", SandboxID: "sandbox", ContainerID: container, ImageID: "image",
+	}
+}
+
+func TestRuntimeEnrollmentPrecedesRequiredWALBinding(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = ""
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+	if err := l.Register(id); err != nil {
+		t.Fatal(err)
+	}
+	bound := id
+	bound.WALIdentity = "wal"
+	if err := l.Bind(bound); err == nil {
+		t.Fatal("writer authorized before runtime enrollment")
+	}
+	if l.Runs[id.RunID].Identity.WALIdentity != "" {
+		t.Fatal("rejected binding changed the durable WAL identity")
+	}
+	runtime := enrolledRuntime(id, "first-container")
+	if err := l.RegisterEnrolled(id, runtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RegisterEnrolled(id, runtime); err != nil {
+		t.Fatalf("lost registration response is not recoverable: %v", err)
+	}
+	if err := l.Bind(bound); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeEnrollmentRequiresEveryIdentityFieldBeforeMutation(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = ""
+	complete := enrolledRuntime(id, "container")
+	for field := 0; field < reflect.TypeOf(complete).NumField(); field++ {
+		t.Run(reflect.TypeOf(complete).Field(field).Name, func(t *testing.T) {
+			missing := complete
+			reflect.ValueOf(&missing).Elem().Field(field).SetString("")
+			l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+			if err := l.RegisterEnrolled(id, missing); err == nil || len(l.Runs) != 0 {
+				t.Fatalf("incomplete runtime was registered: error=%v runs=%d", err, len(l.Runs))
+			}
+		})
+	}
+}
+
+func TestRuntimeEnrollmentRetainsDistinctContainerAttemptsAfterReload(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = ""
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+	for _, container := range []string{"first", "second"} {
+		id.RunID = container
+		if err := l.RegisterEnrolled(id, enrolledRuntime(id, container)); err != nil {
+			t.Fatal(err)
+		}
+		id.WALIdentity = "wal"
+		if err := l.Bind(id); err != nil {
+			t.Fatal(err)
+		}
+		id.WALIdentity = ""
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored Ledger
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RequireRuntimeBinding || len(restored.Runs) != 2 {
+		t.Fatal("runtime admission policy/history was lost after reload")
+	}
+	for _, container := range []string{"first", "second"} {
+		run := restored.Runs[container]
+		if run.Runtime == nil || run.Runtime.ContainerID != container || run.Identity.WALIdentity != "wal" {
+			t.Fatalf("container attempt was replaced by the latest one: %+v", run)
+		}
+	}
+}
+
+func TestRuntimeEnrollmentRejectsRebindingAndClosureWithoutChangingHistory(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = ""
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+	runtime := enrolledRuntime(id, "container")
+	if err := l.RegisterEnrolled(id, runtime); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*RuntimeBinding){
+		func(b *RuntimeBinding) { b.ContainerID = "replacement" },
+		func(b *RuntimeBinding) { b.NodeUID = "replacement" },
+		func(b *RuntimeBinding) { b.BootID = "replacement" },
+	} {
+		changed := runtime
+		mutate(&changed)
+		if err := l.RegisterEnrolled(id, changed); err == nil {
+			t.Fatal("same run accepted a different runtime incarnation")
+		}
+		if *l.Runs[id.RunID].Runtime != runtime {
+			t.Fatal("rejected enrollment changed history")
+		}
+	}
+	if err := l.Close("close-operation", "request-hash"); err != nil {
+		t.Fatal(err)
+	}
+	next := id
+	next.RunID = "late-run"
+	if err := l.RegisterEnrolled(next, enrolledRuntime(next, "late-container")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("enrollment crossed permanent closure: %v", err)
+	}
+	if len(l.Runs) != 1 {
+		t.Fatal("closed ledger gained another runtime")
+	}
+}

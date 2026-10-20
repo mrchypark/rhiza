@@ -6,19 +6,21 @@ import "fmt"
 // persisted with the resourceVersion read alongside this value. Never replace a
 // ledger after a conflict or discard an older incarnation when a Pod disappears.
 type Ledger struct {
-	SourceClusterID string                 `json:"sourceClusterID"`
-	ClosedBy        string                 `json:"closedBy,omitempty"`
-	ClosedHash      string                 `json:"closedHash,omitempty"`
-	ClosedNodes     map[string]StopRequest `json:"closedNodes,omitempty"`
-	Runs            map[string]Run         `json:"runs"`
+	SourceClusterID       string                 `json:"sourceClusterID"`
+	ClosedBy              string                 `json:"closedBy,omitempty"`
+	ClosedHash            string                 `json:"closedHash,omitempty"`
+	ClosedNodes           map[string]StopRequest `json:"closedNodes,omitempty"`
+	Runs                  map[string]Run         `json:"runs"`
+	RequireRuntimeBinding bool                   `json:"requireRuntimeBinding,omitempty"`
 }
 
 type Run struct {
-	Identity       Identity      `json:"identity"`
-	Stop           *StopRequest  `json:"stop,omitempty"`
-	Drain          *DrainReceipt `json:"drain,omitempty"`
-	Exited         bool          `json:"exited,omitempty"`
-	NeverBoundExit *StopRequest  `json:"neverBoundExit,omitempty"`
+	Identity       Identity        `json:"identity"`
+	Stop           *StopRequest    `json:"stop,omitempty"`
+	Drain          *DrainReceipt   `json:"drain,omitempty"`
+	Exited         bool            `json:"exited,omitempty"`
+	NeverBoundExit *StopRequest    `json:"neverBoundExit,omitempty"`
+	Runtime        *RuntimeBinding `json:"runtime,omitempty"`
 }
 
 func (l *Ledger) Register(identity Identity) error {
@@ -64,6 +66,14 @@ func (l *Ledger) Bind(identity Identity) error {
 	}
 	if l.ClosedBy != "" || run.Stop != nil {
 		return ErrClosed
+	}
+	if l.RequireRuntimeBinding {
+		if run.Runtime == nil {
+			return fmt.Errorf("fencing: runtime enrollment required before WAL binding")
+		}
+		if err := run.Runtime.Validate(identity); err != nil {
+			return err
+		}
 	}
 	for _, old := range l.Runs {
 		if old.Identity.RunID != identity.RunID && old.Identity.NodeID == identity.NodeID && old.Identity.WALIdentity != "" && old.Identity.WALIdentity != identity.WALIdentity {
