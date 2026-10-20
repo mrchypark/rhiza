@@ -20,10 +20,25 @@ type sessionAuthority struct {
 	stop *StopRequest
 }
 
+func sessionSocketDir(t *testing.T) string {
+	t.Helper()
+	// Test names in t.TempDir paths can exceed the Unix socket path limit.
+	dir, err := os.MkdirTemp("/tmp", "rhiza-fence-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	return dir
+}
+
 func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *testing.T) {
 	var unavailable atomic.Bool
 	id := testIdentity()
-	socket := filepath.Join(t.TempDir(), "session.sock")
+	socket := filepath.Join(sessionSocketDir(t), "session.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +89,7 @@ func TestSessionInterruptedSuccessfulBodyIsTransient(t *testing.T) {
 }
 
 func TestSupervisorSocketRestartKeepsLiveListenerAndOtherFiles(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "control.sock")
+	path := filepath.Join(sessionSocketDir(t), "control.sock")
 	live, err := listenSupervisor(path)
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +139,7 @@ func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	id := testIdentity()
 	authority := &sessionAuthority{id: id}
 	s := &Supervisor{Authority: authority, Identity: id, bound: id, ticket: "private-ticket"}
-	socket := filepath.Join(t.TempDir(), "control.sock")
+	socket := filepath.Join(sessionSocketDir(t), "control.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)

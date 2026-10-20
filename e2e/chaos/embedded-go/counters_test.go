@@ -24,6 +24,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -38,7 +40,89 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// releaseVersion carries the current release identity forms derived from the
+// SDK manifest, which is the single source of truth for the harness identity
+// family. Version is the manifest version, Prefix is its compact form and
+// Dotted is its dotted, v-prefixed form.
+type releaseVersion struct {
+	Version string
+	Prefix  string
+	Dotted  string
+}
+
+// cargoManifestPath resolves sdk/rust/Cargo.toml from this test file's own
+// location so the derived release version never depends on the caller's
+// working directory.
+func cargoManifestPath() (string, error) {
+	var candidates []string
+	if _, file, _, ok := runtime.Caller(0); ok {
+		candidates = append(candidates, filepath.Join(filepath.Dir(file), "..", "..", "..", "sdk", "rust", "Cargo.toml"))
+	}
+	candidates = append(candidates, filepath.Join("..", "..", "..", "sdk", "rust", "Cargo.toml"))
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("cannot locate sdk/rust/Cargo.toml; tried %s", strings.Join(candidates, ", "))
+}
+
+// releaseVersionFromManifest derives the release identity forms from a Cargo
+// manifest. It never defaults silently: a missing or malformed version is an
+// error the caller must surface.
+func releaseVersionFromManifest(path string) (releaseVersion, error) {
+	source, err := os.ReadFile(path)
+	if err != nil {
+		return releaseVersion{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	match := regexp.MustCompile(`(?m)^version = "([^"]+)"`).FindStringSubmatch(string(source))
+	if match == nil {
+		return releaseVersion{}, fmt.Errorf("%s declares no package version", path)
+	}
+	version := match[1]
+	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(version) {
+		return releaseVersion{}, fmt.Errorf("%s declares a malformed package version %q", path, version)
+	}
+	return releaseVersion{
+		Version: version,
+		Prefix:  "v" + strings.ReplaceAll(version, ".", ""),
+		Dotted:  "v" + version,
+	}, nil
+}
+
+// loadReleaseVersion derives the current release identity forms from the SDK
+// manifest, the single source of truth for the harness version family.
+func loadReleaseVersion() (releaseVersion, error) {
+	path, err := cargoManifestPath()
+	if err != nil {
+		return releaseVersion{}, err
+	}
+	return releaseVersionFromManifest(path)
+}
+
+// mustReleaseVersion fails the test when the release version cannot be derived
+// from the SDK manifest.
+func mustReleaseVersion(t *testing.T) releaseVersion {
+	t.Helper()
+	release, err := loadReleaseVersion()
+	if err != nil {
+		t.Fatalf("cannot derive the current release version from sdk/rust/Cargo.toml: %v", err)
+	}
+	return release
+}
+
+// releaseFixtureTemplate substitutes the current release prefix into a test
+// fixture template. Fixture templates use the __RELEASE_PREFIX__ placeholder
+// instead of a hardcoded version family so they track the SDK manifest.
+func releaseFixtureTemplate(template string, release releaseVersion) string {
+	return strings.ReplaceAll(template, "__RELEASE_PREFIX__", release.Prefix)
+}
+
 func TestMain(m *testing.M) {
+	release, err := loadReleaseVersion()
+	if err != nil {
+		panic(fmt.Sprintf("cannot derive the current release version from sdk/rust/Cargo.toml: %v", err))
+	}
 	for key, value := range map[string]string{
 		"RHIZA_GCP_PROJECT_ID":       "example-project",
 		"RHIZA_GCP_PROJECT_NUMBER":   "123456789012",
@@ -46,9 +130,9 @@ func TestMain(m *testing.M) {
 		"RHIZA_GKE_LOCATION":         "test-region1",
 		"RHIZA_KUBE_CONTEXT":         "gke_example-project_test-region1_test-cluster",
 		"RHIZA_GCS_BUCKET":           "rhiza-qualification-fixture",
-		"RHIZA_GCS_PREFIX":           "qualification/a1b2c3d4/",
-		"RHIZA_NAMESPACE":            "rhiza-v0191-20261008-a1b2c3d4",
-		"RHIZA_DATA_GSA_ID":          "rhiza-v0191-gcs-a1b2c3d4",
+		"RHIZA_GCS_PREFIX":           "postrelease/" + release.Dotted + "/a1b2c3d4/",
+		"RHIZA_NAMESPACE":            "rhiza-" + release.Prefix + "-a1b2c3d4",
+		"RHIZA_DATA_GSA_ID":          "rhiza-" + release.Prefix + "-gcs-a1b2c3d4",
 		"RHIZA_NODE_A":               "gke-test-cluster-fixture-a",
 		"RHIZA_NODE_B":               "gke-test-cluster-fixture-b",
 		"RHIZA_NODE_C":               "gke-test-cluster-fixture-c",
@@ -58,7 +142,7 @@ func TestMain(m *testing.M) {
 		"RHIZA_GITHUB_OWNER_ID":      "67890",
 		"RHIZA_GITHUB_WORKFLOW_REF":  "example/example/.github/workflows/qualification.yml@refs/heads/main",
 		"RHIZA_GITHUB_ENVIRONMENT":   "qualification",
-		"RHIZA_CI_GSA_ID":            "rhiza-v0191-ci-a1b2c3d4",
+		"RHIZA_CI_GSA_ID":            "rhiza-" + release.Prefix + "-ci-a1b2c3d4",
 	} {
 		if err := os.Setenv(key, value); err != nil {
 			panic(err)
@@ -68,6 +152,10 @@ func TestMain(m *testing.M) {
 }
 
 func qualificationAssetEnv(run string) []string {
+	release, err := loadReleaseVersion()
+	if err != nil {
+		panic(fmt.Sprintf("cannot derive the current release version from sdk/rust/Cargo.toml: %v", err))
+	}
 	return []string{
 		"RHIZA_GCP_PROJECT_ID=example-project",
 		"RHIZA_GCP_PROJECT_NUMBER=123456789012",
@@ -75,16 +163,17 @@ func qualificationAssetEnv(run string) []string {
 		"RHIZA_GKE_LOCATION=test-region1",
 		"RHIZA_KUBE_CONTEXT=gke_example-project_test-region1_test-cluster",
 		"RHIZA_GCS_BUCKET=rhiza-qualification-fixture",
-		"RHIZA_GCS_PREFIX=qualification/" + run + "/",
-		"RHIZA_DATA_GSA_ID=rhiza-v0191-gcs-" + run,
+		"RHIZA_GCS_PREFIX=postrelease/" + release.Dotted + "/" + run + "/",
+		"RHIZA_DATA_GSA_ID=rhiza-" + release.Prefix + "-gcs-" + run,
 	}
 }
 
 func TestQualificationCloudInputsFailBeforeMutation(t *testing.T) {
+	release := mustReleaseVersion(t)
 	run := "a1b2c3d4"
 	host := "registry.example/rhiza@sha256:" + strings.Repeat("a", 64)
 	base := []string{"PATH=" + os.Getenv("PATH"), "RHIZA_RUN_ID=" + run,
-		"RHIZA_NAMESPACE=rhiza-qualification-" + run,
+		"RHIZA_NAMESPACE=rhiza-" + release.Prefix + "-" + run,
 		"RHIZA_HOST_IMAGE=" + host, "RHIZA_METADATA_IMAGE=registry.example/cloud-cli@sha256:" + strings.Repeat("b", 64),
 		"RHIZA_NODE_A=node-a", "RHIZA_NODE_B=node-b", "RHIZA_NODE_C=node-c",
 		"RHIZA_AUTH_CREATION_SHA=" + strings.Repeat("c", 40)}
@@ -145,6 +234,7 @@ func TestQualificationHarnessUsesExplicitAssetContract(t *testing.T) {
 }
 
 func TestQualificationLocalRenderDoesNotRequireFederationInputs(t *testing.T) {
+	release := mustReleaseVersion(t)
 	run := "a1b2c3d4"
 	cmd := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render-local")
 	for _, entry := range os.Environ() {
@@ -155,7 +245,7 @@ func TestQualificationLocalRenderDoesNotRequireFederationInputs(t *testing.T) {
 	cmd.Env = append(cmd.Env, qualificationAssetEnv(run)...)
 	cmd.Env = append(cmd.Env,
 		"RHIZA_RUN_ID="+run,
-		"RHIZA_NAMESPACE=rhiza-qualification-"+run,
+		"RHIZA_NAMESPACE=rhiza-"+release.Prefix+"-"+run,
 		"RHIZA_HARNESS_SHA="+strings.Repeat("a", 40),
 		"RHIZA_AUTH_EXPIRES=2099-01-01T00:00:00Z",
 		"RHIZA_HOST_IMAGE=registry.example/rhiza@sha256:"+strings.Repeat("a", 64),
@@ -168,12 +258,13 @@ func TestQualificationLocalRenderDoesNotRequireFederationInputs(t *testing.T) {
 }
 
 func TestQualificationFederationWorkflowMustBelongToRepository(t *testing.T) {
+	release := mustReleaseVersion(t)
 	run := "a1b2c3d4"
 	cmd := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render")
 	cmd.Env = append(os.Environ(), qualificationAssetEnv(run)...)
 	cmd.Env = append(cmd.Env,
 		"RHIZA_RUN_ID="+run,
-		"RHIZA_NAMESPACE=rhiza-qualification-"+run,
+		"RHIZA_NAMESPACE=rhiza-"+release.Prefix+"-"+run,
 		"RHIZA_WORKFLOW_SHA="+strings.Repeat("a", 40),
 		"RHIZA_AUTH_EXPIRES=2099-01-01T00:00:00Z",
 		"RHIZA_HOST_IMAGE=registry.example/rhiza@sha256:"+strings.Repeat("a", 64),
@@ -182,7 +273,7 @@ func TestQualificationFederationWorkflowMustBelongToRepository(t *testing.T) {
 		"RHIZA_GITHUB_REPOSITORY=example/project",
 		"RHIZA_GITHUB_REPOSITORY_ID=12345", "RHIZA_GITHUB_OWNER_ID=67890",
 		"RHIZA_GITHUB_WORKFLOW_REF=other/project/.github/workflows/qualification.yml@refs/heads/main",
-		"RHIZA_GITHUB_ENVIRONMENT=qualification", "RHIZA_CI_GSA_ID=rhiza-ci-"+run,
+		"RHIZA_GITHUB_ENVIRONMENT=qualification", "RHIZA_CI_GSA_ID=rhiza-"+release.Prefix+"-ci-"+run,
 	)
 	output, err := cmd.CombinedOutput()
 	if err == nil || !bytes.Contains(output, []byte("workflow ref must belong to the exact repository")) {
@@ -196,11 +287,12 @@ func TestQualificationIdentityChecksPrecedeMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	applyStart := strings.Index(text, "if [ \"$mode\" = apply ]; then\n    record project-identity")
+	applyStart := strings.Index(text, "if [ \"$mode\" = apply ]; then\n    validate_identity_family")
 	if applyStart < 0 {
 		t.Fatal("apply identity preflight block missing")
 	}
 	text = text[applyStart:]
+	identityFamily := strings.Index(text, `validate_identity_family`)
 	project := strings.Index(text, `record project-identity g projects describe "$project" --format=json`)
 	cluster := strings.Index(text, `capture_cluster_identity || die`)
 	kubeContext := strings.Index(text, `capture_kube_context_identity || die`)
@@ -208,10 +300,11 @@ func TestQualificationIdentityChecksPrecedeMutation(t *testing.T) {
 	workflow := strings.Index(text, `record github-workflow gh api`)
 	firstMutation := strings.Index(text, `record data-create create_account "$data_id"`)
 	firstKubernetesMutation := strings.Index(text, `record kubernetes-create k create -f`)
-	if project < 0 || cluster < 0 || kubeContext < 0 || repository < 0 || workflow < 0 || firstMutation < 0 || firstKubernetesMutation < 0 ||
+	if identityFamily < 0 || project < 0 || cluster < 0 || kubeContext < 0 || repository < 0 || workflow < 0 || firstMutation < 0 || firstKubernetesMutation < 0 ||
+		identityFamily >= project ||
 		project >= cluster || cluster >= kubeContext || kubeContext >= repository || repository >= workflow ||
 		workflow >= firstMutation || kubeContext >= firstKubernetesMutation {
-		t.Fatalf("identity preflight ordering changed: project=%d cluster=%d kube=%d repository=%d workflow=%d cloud-mutation=%d kube-mutation=%d", project, cluster, kubeContext, repository, workflow, firstMutation, firstKubernetesMutation)
+		t.Fatalf("identity preflight ordering changed: family=%d project=%d cluster=%d kube=%d repository=%d workflow=%d cloud-mutation=%d kube-mutation=%d", identityFamily, project, cluster, kubeContext, repository, workflow, firstMutation, firstKubernetesMutation)
 	}
 	for _, validation := range []string{
 		`validate_project_identity "$RHIZA_AUTH_STATE/project-identity.json"`,
@@ -242,12 +335,13 @@ func TestQualificationIdentityChecksPrecedeMutation(t *testing.T) {
 }
 
 func TestQualificationLocalAuthSanitizesKubeEvidence(t *testing.T) {
+	release := mustReleaseVersion(t)
 	run := "a1b2c3d4"
 	cmd := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "check-local-auth")
 	cmd.Env = append(os.Environ(), qualificationAssetEnv(run)...)
 	cmd.Env = append(cmd.Env,
 		"RHIZA_RUN_ID="+run,
-		"RHIZA_NAMESPACE=rhiza-qualification-"+run,
+		"RHIZA_NAMESPACE=rhiza-"+release.Prefix+"-"+run,
 		"RHIZA_HARNESS_SHA="+strings.Repeat("a", 40),
 		"RHIZA_AUTH_EXPIRES=2099-01-01T00:00:00Z",
 		"RHIZA_HOST_IMAGE=registry.example/rhiza@sha256:"+strings.Repeat("a", 64),
@@ -1808,6 +1902,8 @@ verify_voter_absence`
 }
 
 func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
+	release := mustReleaseVersion(t)
+	namespace := "rhiza-" + release.Prefix + "-a1b2c3d4"
 	command := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render-local")
 	command.Env = append(os.Environ(),
 		"RHIZA_RUN_ID=a1b2c3d4",
@@ -1832,7 +1928,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 		if strings.Contains(document, "\nkind: ClusterRole\n") && (strings.Contains(document, "resources: [endpoints]") || strings.Contains(document, "discovery.k8s.io")) {
 			t.Fatal("endpoint access escaped the namespaced runtime role")
 		}
-		if strings.Contains(document, "\nkind: ClusterRole\n") && strings.Contains(document, "  name: rhiza-v0191-20261008-a1b2c3d4-reader\n") {
+		if strings.Contains(document, "\nkind: ClusterRole\n") && strings.Contains(document, "  name: "+namespace+"-reader\n") {
 			if readerRole != "" {
 				t.Fatal("duplicate runtime reader ClusterRole")
 			}
@@ -1850,7 +1946,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 	}
 	defaultRoles := []string{"system:basic-user", "system:discovery", "system:public-info-viewer", "system:service-account-issuer-discovery"}
 	expectedReaderRules := []map[string]any{
-		{"apiGroups": []string{""}, "resources": []string{"namespaces"}, "resourceNames": []string{"rhiza-v0191-20261008-a1b2c3d4"}, "verbs": []string{"get"}},
+		{"apiGroups": []string{""}, "resources": []string{"namespaces"}, "resourceNames": []string{namespace}, "verbs": []string{"get"}},
 		{"apiGroups": []string{"rbac.authorization.k8s.io"}, "resources": []string{"clusterrolebindings"}, "verbs": []string{"list"}},
 		{"apiGroups": []string{"rbac.authorization.k8s.io"}, "resources": []string{"clusterroles"}, "resourceNames": defaultRoles, "verbs": []string{"get"}},
 	}
@@ -1877,7 +1973,7 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 			t.Fatalf("rendered runtime endpoint role is not exact:\n%s", runtimeRole)
 		}
 	}
-	if strings.Count(runtimeRole, "resources: [endpoints]") != 1 || strings.Count(runtimeRole, "discovery.k8s.io") != 1 || !strings.Contains(runtimeRole, "  namespace: rhiza-v0191-20261008-a1b2c3d4\n") {
+	if strings.Count(runtimeRole, "resources: [endpoints]") != 1 || strings.Count(runtimeRole, "discovery.k8s.io") != 1 || !strings.Contains(runtimeRole, "  namespace: "+namespace+"\n") {
 		t.Fatalf("rendered runtime endpoint role is not exact:\n%s", runtimeRole)
 	}
 	networkRule := strings.Index(runtimeRole, "resources: [networkpolicies]")
@@ -1899,7 +1995,9 @@ func TestQualificationRuntimeEndpointRBAC(t *testing.T) {
 }
 
 func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
+	release := mustReleaseVersion(t)
 	const runID = "63602191"
+	namespace := "rhiza-" + release.Prefix + "-" + runID
 	auth := exec.Command("/bin/sh", "../bootstrap-gcs-postrelease.sh", "render-local")
 	auth.Env = append(os.Environ(),
 		"RHIZA_RUN_ID="+runID,
@@ -1908,16 +2006,18 @@ func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
 		"RHIZA_AUTH_EXPIRES=2099-01-01T00:00:00Z",
 	)
 	auth.Env = append(auth.Env, qualificationAssetEnv(runID)...)
-	auth.Env = append(auth.Env, "RHIZA_NAMESPACE=rhiza-qualification-"+runID)
+	auth.Env = append(auth.Env, "RHIZA_NAMESPACE="+namespace)
 	authRendered, err := auth.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v: %s", err, authRendered)
 	}
-	if bytes.Contains(authRendered, []byte("kind: ValidatingAdmissionPolicy\nmetadata:\n  name: rhiza-qualification-"+runID+"-runtime")) {
+	// The template renders the admission policies under the release-scoped
+	// namespace, and it never emits a runtime admission policy.
+	if bytes.Contains(authRendered, []byte("kind: ValidatingAdmissionPolicy\nmetadata:\n  name: "+namespace+"-runtime")) {
 		t.Fatal("rendered auth contract retained the excluded runtime admission policy")
 	}
 	for _, policy := range []string{"faults", "network-faults"} {
-		if !bytes.Contains(authRendered, []byte("kind: ValidatingAdmissionPolicy\nmetadata:\n  name: rhiza-qualification-"+runID+"-"+policy)) {
+		if !bytes.Contains(authRendered, []byte("kind: ValidatingAdmissionPolicy\nmetadata:\n  name: "+namespace+"-"+policy)) {
 			t.Fatalf("rendered auth contract lost %s admission policy", policy)
 		}
 	}
@@ -1926,13 +2026,13 @@ func TestQualificationRenderedMetadataValuesAreStrings(t *testing.T) {
 		t.Fatal(err)
 	}
 	workloadRendered := strings.NewReplacer(
-		"__NAMESPACE__", "rhiza-v0191-20261008-"+runID,
+		"__NAMESPACE__", namespace,
 		"__RUN_ID__", runID,
 		"__CLUSTER_ID__", "cluster-"+runID,
 		"__HOST_IMAGE__", "example.invalid/rhiza@sha256:"+strings.Repeat("0", 64),
 		"__METADATA_IMAGE__", "example.invalid/gcloud@sha256:"+strings.Repeat("1", 64),
 		"__GCS_BUCKET__", "rhiza-qualification-fixture",
-		"__GCS_PREFIX__", "qualification/"+runID+"/",
+		"__GCS_PREFIX__", "postrelease/"+release.Dotted+"/"+runID+"/",
 		"__NODE_A__", "node-a", "__NODE_B__", "node-b", "__NODE_C__", "node-c",
 	).Replace(string(template))
 	for _, placeholder := range []string{"__GCS_BUCKET__", "__GCS_PREFIX__"} {
@@ -2186,6 +2286,7 @@ verify_deleted_role `+tag+` r
 }
 
 func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
+	release := mustReleaseVersion(t)
 	source, err := os.ReadFile("../bootstrap-gcs-postrelease.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -2194,6 +2295,7 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 		t.Fatal("GSA deletion wait lacks the 415-second worker plus five-second monotonic kill bound")
 	}
 	const runID, workflowSHA, expiry, admin = "a1b2c3d4", "0123456789abcdef0123456789abcdef01234567", "2099-01-01T00:00:00Z", "fixture-admin@example.invalid"
+	dataGSAEmail := "rhiza-" + release.Prefix + "-gcs-" + runID + "@example-project.iam.gserviceaccount.com"
 	hostImage := "ghcr.io/mrchypark/rhiza-sql@sha256:" + strings.Repeat("a", 64)
 	owner := "rhiza-postrelease-" + runID + "-" + workflowSHA
 	workerEnv := func(dir, scenario string) []string {
@@ -2211,10 +2313,22 @@ func TestBootstrapGSADeleteWaitIsBoundedAndFailClosed(t *testing.T) {
 		if err := os.Chmod(dir, 0700); err != nil {
 			t.Fatal(err)
 		}
+		identity, err := json.Marshal(map[string]string{
+			"run": runID, "workflow_sha": workflowSHA, "expiry": expiry,
+			"cost_cap_krw": "10000", "owner": owner, "host_image": hostImage,
+			"namespace":   "rhiza-" + release.Prefix + "-" + runID,
+			"data_gsa_id": "rhiza-" + release.Prefix + "-gcs-" + runID,
+			"ci_gsa_id":   "rhiza-" + release.Prefix + "-ci-" + runID,
+			"gcs_prefix":  "postrelease/" + release.Dotted + "/" + runID + "/",
+			"pool":        "rhiza-" + release.Prefix + "-gcs-" + runID, "provider": "github",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		files := map[string]string{
 			"attempts":         "0\n",
-			"identity.json":    `{"run":"` + runID + `","workflow_sha":"` + workflowSHA + `","expiry":"` + expiry + `","cost_cap_krw":"10000","owner":"` + owner + `","host_image":"` + hostImage + `"}`,
-			"data-create.json": `{"email":"rhiza-v0191-gcs-` + runID + `@example-project.iam.gserviceaccount.com","uniqueId":"fixture-uid","description":"` + owner + `"}`,
+			"identity.json":    string(identity),
+			"data-create.json": `{"email":"` + dataGSAEmail + `","uniqueId":"fixture-uid","description":"` + owner + `"}`,
 			"data.created":     owner + "\n",
 		}
 		for name, content := range files {
@@ -2252,7 +2366,7 @@ esac
  printf '%s\n' "$*" >> "$FAKE_DIR/calls"
  case "$FAKE_SCENARIO" in
   eventual-not-found)
-   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0; fi
+   if [ "$attempt" = 1 ]; then printf '%s\n' '{"email":"` + dataGSAEmail + `","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0; fi
    printf '%s\n' 'ERROR: (gcloud.iam.service-accounts.describe) NOT_FOUND: Unknown service account. This command is authenticated as [fixture@example.invalid] which is the active account specified by the [core/account] property' >&2; exit 1 ;;
   identity-drift) printf '%s\n' '{"email":"other@example.invalid","uniqueId":"fixture-uid","description":"rhiza-postrelease-a1b2c3d4-0123456789abcdef0123456789abcdef01234567"}'; exit 0 ;;
   permission-denied) printf '%s\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;
@@ -2260,7 +2374,7 @@ esac
   server-error) printf '%s\n' 'ERROR: HTTPError 503' >&2; exit 1 ;;
  esac
 `
-			listFallback := "\n case \"$*\" in\n  *'iam service-accounts list'*)\n   case \"$FAKE_SCENARIO\" in\n    permission-denied-or-missing) printf '[]\\n'; exit 0 ;;\n    list-present) printf '[{\"email\":\"rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\",\"uniqueId\":\"fixture-uid\"}]\\n'; exit 0 ;;\n    list-failure) printf 'ERROR: PERMISSION_DENIED\\n' >&2; exit 1 ;;\n   esac\n  ;;\n esac\n"
+			listFallback := "\n case \"$*\" in\n  *'iam service-accounts list'*)\n   case \"$FAKE_SCENARIO\" in\n    permission-denied-or-missing) printf '[]\\n'; exit 0 ;;\n    list-present) printf '[{\"email\":\"" + dataGSAEmail + "\",\"uniqueId\":\"fixture-uid\"}]\\n'; exit 0 ;;\n    list-failure) printf 'ERROR: PERMISSION_DENIED\\n' >&2; exit 1 ;;\n   esac\n  ;;\n esac\n"
 			gcloud = strings.Replace(gcloud, "\n case \"$FAKE_SCENARIO\" in", listFallback+"\n case \"$FAKE_SCENARIO\" in", 1)
 			gcloud = strings.Replace(gcloud, "  permission-denied) printf '%s\\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;", "  permission-denied) printf '%s\\n' 'ERROR: PERMISSION_DENIED' >&2; exit 1 ;;\n  permission-denied-or-missing|list-present|list-failure) printf '%s\\n' 'ERROR: (gcloud.iam.service-accounts.describe) PERMISSION_DENIED: Permission denied on resource (or it may not exist).' >&2; exit 1 ;;", 1)
 			seedState(t, dir)
@@ -2286,14 +2400,14 @@ esac
 				t.Fatalf("exit=%d want=%d attempts=%s want=%d output=%s error=%v", code, scenario.want, attempts, scenario.attempts, output, err)
 			}
 			calls, err := os.ReadFile(filepath.Join(dir, "calls"))
-			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com --format=json")) {
+			if err != nil || bytes.Contains(calls, []byte(" delete ")) || !bytes.Contains(calls, []byte("iam service-accounts describe "+dataGSAEmail+" --format=json")) {
 				t.Fatalf("worker issued a non-describe operation: %q error=%v", calls, err)
 			}
 		})
 	}
 	t.Run("persistent-exists-frozen-backward-clock", func(t *testing.T) {
 		dir := t.TempDir()
-		gcloud := "#!/bin/sh\ncase \"$*\" in *'config get-value account') printf '%s\\n' 'fixture-admin@example.invalid'; exit 0;; esac\nprintf '%s\\n' \"$*\" >> \"$FAKE_DIR/calls\"\nprintf '%s\\n' '{\"email\":\"rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\",\"uniqueId\":\"fixture-uid\",\"description\":\"" + owner + "\"}'\n"
+		gcloud := "#!/bin/sh\ncase \"$*\" in *'config get-value account') printf '%s\\n' 'fixture-admin@example.invalid'; exit 0;; esac\nprintf '%s\\n' \"$*\" >> \"$FAKE_DIR/calls\"\nprintf '%s\\n' '{\"email\":\"" + dataGSAEmail + "\",\"uniqueId\":\"fixture-uid\",\"description\":\"" + owner + "\"}'\n"
 		date := "#!/bin/sh\nvalue=$(cat \"$FAKE_DIR/clock\")\nprintf '%s\\n' \"$value\"\nprintf '%s\\n' \"$((value - 100))\" > \"$FAKE_DIR/clock\"\n"
 		for name, content := range map[string]string{"gcloud": gcloud, "date": date} {
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0700); err != nil {
@@ -2420,15 +2534,16 @@ func TestQualificationQUICHandshake(t *testing.T) {
 }
 
 func TestQualificationFixture(t *testing.T) {
+	release := mustReleaseVersion(t)
 	run := "a1b2c3d4"
-	namespace := "rhiza-v0191-" + run
+	namespace := "rhiza-" + release.Prefix + "-" + run
 	owner := "rhiza-postrelease-" + run + "-" + strings.Repeat("a", 40)
 	// Synthetic deterministic entropy only; no generated live credentials/logs.
 	entropy := make([]byte, 160)
 	for i := range entropy {
 		entropy[i] = byte(i)
 	}
-	fixture, err := qualificationFixture(namespace, run, owner, bytes.NewReader(entropy))
+	fixture, err := qualificationFixture(namespace, run, owner, release.Prefix, bytes.NewReader(entropy))
 	if err != nil {
 		t.Fatal("valid fixture failed")
 	}
@@ -2481,21 +2596,127 @@ func TestQualificationFixture(t *testing.T) {
 	}
 	for _, args := range [][3]string{
 		{"wrong", run, owner},
+		// A stale release family is rejected: it must stay hardcoded so it
+		// never tracks the current manifest version.
 		{"rhiza-v0190-" + run, run, owner},
-		{"rhiza-v0191-20261008-" + run, run, owner},
-		{"rhiza-v0191-b1c2d3e4", run, owner},
+		{"rhiza-" + release.Prefix + "-20261008-" + run, run, owner},
+		{"rhiza-" + release.Prefix + "-b1c2d3e4", run, owner},
 		{namespace, "BAD", owner},
 		{namespace, run, "wrong"},
 	} {
-		if _, err := qualificationFixture(args[0], args[1], args[2], bytes.NewReader(entropy)); err == nil {
+		if _, err := qualificationFixture(args[0], args[1], args[2], release.Prefix, bytes.NewReader(entropy)); err == nil {
 			t.Fatal("invalid identity accepted")
 		}
 	}
-	if _, err := qualificationFixture(namespace, run, owner, bytes.NewReader(nil)); err == nil {
+	// A prefix that does not match the namespace family must be refused by
+	// exact equality, never by a loose prefix match. The stale prefix stays
+	// hardcoded so it never tracks the current manifest version.
+	if _, err := qualificationFixture(namespace, run, owner, "v0191", bytes.NewReader(entropy)); err == nil {
+		t.Fatal("mismatched version prefix accepted")
+	}
+	if _, err := qualificationFixture(namespace, run, owner, "", bytes.NewReader(entropy)); err == nil {
+		t.Fatal("empty version prefix accepted")
+	}
+	if _, err := qualificationFixture(namespace, run, owner, release.Version, bytes.NewReader(entropy)); err == nil {
+		t.Fatal("dotted version prefix accepted")
+	}
+	if _, err := qualificationFixture(namespace, run, owner, release.Dotted, bytes.NewReader(entropy)); err == nil {
+		t.Fatal("v-prefixed dotted version prefix accepted")
+	}
+	if _, err := qualificationFixture(namespace, run, owner, release.Prefix, bytes.NewReader(nil)); err == nil {
 		t.Fatal("missing entropy accepted")
 	}
-	if _, err := qualificationFixture(namespace, run, owner, bytes.NewReader(make([]byte, 160))); err == nil {
+	if _, err := qualificationFixture(namespace, run, owner, release.Prefix, bytes.NewReader(make([]byte, 160))); err == nil {
 		t.Fatal("repeated entropy accepted")
+	}
+}
+
+// TestQualificationVersionPrefixTracksSDKManifest fails when the harness
+// identity family drifts away from the released SDK version. It reads the real
+// sdk/rust/Cargo.toml and asserts that the compact prefix each harness stage
+// actually derives equals the manifest-derived prefix.
+func TestQualificationVersionPrefixTracksSDKManifest(t *testing.T) {
+	release := mustReleaseVersion(t)
+	manifest, err := os.ReadFile("../../../sdk/rust/Cargo.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same capture idiom as scripts/check-release-sync.sh.
+	var manifestVersion string
+	for _, line := range strings.Split(string(manifest), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "version = ") {
+			continue
+		}
+		manifestVersion = strings.Trim(strings.TrimPrefix(trimmed, "version = "), `"`)
+		break
+	}
+	if manifestVersion == "" {
+		t.Fatal("sdk/rust/Cargo.toml declares no package version")
+	}
+	wantPrefix := "v" + strings.ReplaceAll(manifestVersion, ".", "")
+	if !regexp.MustCompile(`^v[0-9]+$`).MatchString(wantPrefix) {
+		t.Fatalf("manifest version %q does not yield a compact prefix", manifestVersion)
+	}
+	if release.Version != manifestVersion || release.Prefix != wantPrefix {
+		t.Fatalf("derived release %+v does not match manifest version %q", release, manifestVersion)
+	}
+	t.Logf("sdk/rust/Cargo.toml version=%q derived prefix=%q dotted=%q", release.Version, release.Prefix, release.Dotted)
+
+	for _, script := range []string{"../bootstrap-gcs-postrelease.sh", "../run-gcs-postrelease.sh"} {
+		source, err := os.ReadFile(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := strings.Index(string(source), "# BEGIN VERSION PREFIX DERIVATION")
+		end := strings.Index(string(source), "# END VERSION PREFIX DERIVATION")
+		if start < 0 || end <= start {
+			t.Fatalf("%s does not derive the version prefix from the SDK manifest", script)
+		}
+		derivation := string(source[start:end])
+		if !strings.Contains(derivation, `sed -n 's/^version = "\(.*\)"/\1/p'`) {
+			t.Fatalf("%s does not use the release manifest capture idiom", script)
+		}
+		if !strings.Contains(derivation, "sdk/rust/Cargo.toml") {
+			t.Fatalf("%s does not read the release manifest", script)
+		}
+		if !strings.Contains(derivation, "tr -d") {
+			t.Fatalf("%s does not compact the manifest version into the prefix", script)
+		}
+		if strings.Contains(derivation, "rhiza-v0191") || strings.Contains(derivation, "rhiza-v0190") {
+			t.Fatalf("%s hardcodes a version family instead of deriving it", script)
+		}
+
+		// Execute the script's own derivation block so a diverging derivation
+		// is caught even when it keeps the capture idiom.
+		command := exec.Command("/bin/sh", "-c", `
+set -eu
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$1")" && pwd)
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+die() { printf '%s\n' "$*" >&2; exit 1; }
+`+derivation+`
+printf '%s\n' "$version_prefix"
+`, "sh", script)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s could not derive the version prefix: %v: %s", script, err, output)
+		}
+		if got := strings.TrimSpace(string(output)); got != wantPrefix {
+			t.Fatalf("%s derives prefix %q but the manifest declares %q (prefix %q)", script, got, manifestVersion, wantPrefix)
+		}
+	}
+
+	// The exact-equality namespace check in the Go generator must keep using the
+	// derived prefix rather than a hardcoded family.
+	mainSource, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(mainSource), `namespace != "rhiza-"+versionPrefix+"-"+run`) {
+		t.Fatal("qualification fixture namespace check no longer uses exact equality on the derived prefix")
+	}
+	if strings.Contains(string(mainSource), "rhiza-"+release.Prefix+"-") {
+		t.Fatal("qualification fixture generator still hardcodes a version family")
 	}
 }
 
@@ -3301,6 +3522,7 @@ stop_forward "$second"
 // Exercise the actual shell entry with synthetic files and a non-networking
 // kubectl. No token is minted, no application opens, and no cloud call is made.
 func TestQualificationLocalRuntime(t *testing.T) {
+	release := mustReleaseVersion(t)
 	nativeTimeout, err := exec.LookPath("timeout")
 	if err != nil {
 		t.Fatal("native GNU timeout required for the local runtime tests")
@@ -3347,7 +3569,7 @@ func TestQualificationLocalRuntime(t *testing.T) {
 				mockFixtureRevision = strings.Repeat("2", 40)
 			}
 			const contextName = "gke_example-project_test-region1_test-cluster"
-			namespace := "rhiza-v0191-20261008-" + run
+			namespace := "rhiza-" + release.Prefix + "-" + run
 			metadata, err := json.Marshal(map[string]any{"kind": "Pod", "metadata": map[string]any{"name": "rhiza-metadata", "namespace": namespace,
 				"uid": "metadata-uid", "resourceVersion": "7", "labels": map[string]string{"chaos.rhiza.io/run": run}},
 				"spec": map[string]any{"serviceAccountName": "rhiza-gcs", "nodeName": "gke-test-cluster-fixture-a",
@@ -3411,13 +3633,13 @@ func TestQualificationLocalRuntime(t *testing.T) {
  [ "$3" = rev-parse ] && [ "$4" = HEAD ] || exit 91
 printf '%s\n' "$FAKE_GIT_REVISION"
 `, 0700)
-			write(filepath.Join(bin, "kubectl"), `#!/bin/sh
+			write(filepath.Join(bin, "kubectl"), releaseFixtureTemplate(`#!/bin/sh
 printf 'mock-entry\n' >> "$FAKE_CONFIG_EVENTS"
 if [ "$FAKE_SCENARIO" = parser-argument-error ]; then set -- --unexpected "$@"; fi
 case "$1" in --kubeconfig=*) config=${1#*=}; shift ;; *) exit 92 ;; esac
 [ "$1" = "--context=gke_example-project_test-region1_test-cluster" ] || exit 93
 shift
-[ "$1" = "--namespace=rhiza-v0191-20261008-a1b2c3d4" ] || exit 94
+[ "$1" = "--namespace=rhiza-__RELEASE_PREFIX__-a1b2c3d4" ] || exit 94
 shift
 case "$1" in --request-timeout=*) shift ;; esac
 printf 'args-ok\n' >> "$FAKE_CONFIG_EVENTS"
@@ -3438,7 +3660,7 @@ case "$1 $2" in
  "auth whoami")
   if [ "$FAKE_SCENARIO" = watchdog ]; then touch "$FAKE_SIGNAL_READY"; /bin/sleep 1; fi
   if [ "$FAKE_SCENARIO" = wrong-identity ]; then printf '%s\n' '{"status":{"userInfo":{"username":"admin","groups":[]}}}'
-  else printf '%s\n' '{"status":{"userInfo":{"username":"system:serviceaccount:rhiza-v0191-20261008-a1b2c3d4:rhiza-runtime","groups":["system:authenticated","system:serviceaccounts","system:serviceaccounts:rhiza-v0191-20261008-a1b2c3d4"]}}}'; fi ;;
+  else printf '%s\n' '{"status":{"userInfo":{"username":"system:serviceaccount:rhiza-__RELEASE_PREFIX__-a1b2c3d4:rhiza-runtime","groups":["system:authenticated","system:serviceaccounts","system:serviceaccounts:rhiza-__RELEASE_PREFIX__-a1b2c3d4"]}}}'; fi ;;
  "auth can-i")
   case "$*" in
    "auth can-i get secrets"|"auth can-i create serviceaccounts --subresource=token"|"auth can-i create roles"|"auth can-i create validatingadmissionpolicies.admissionregistration.k8s.io --all-namespaces") printf 'no\n'; exit 1 ;;
@@ -3452,7 +3674,7 @@ case "$1 $2" in
   if [ "$FAKE_SCENARIO" = deadline ]; then printf '%s\n' "$((FAKE_NOW + 1199))" > "$FAKE_CLOCK"; fi
   printf '%s\n' '{"items":[]}' ;;
  "get networkpolicy.networking.k8s.io")
-  printf '%s\n' '{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"rhiza-inspector-deny-all","namespace":"rhiza-v0191-20261008-a1b2c3d4","uid":"policy-uid","resourceVersion":"12","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-9b53158b38352ae78446e70a298616a31dc44a69"}},"spec":{"podSelector":{"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}},"policyTypes":["Ingress","Egress"],"ingress":[],"egress":[]}}' ;;
+  printf '%s\n' '{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"rhiza-inspector-deny-all","namespace":"rhiza-__RELEASE_PREFIX__-a1b2c3d4","uid":"policy-uid","resourceVersion":"12","labels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"},"annotations":{"rhiza.dev/auth-owner":"rhiza-postrelease-a1b2c3d4-9b53158b38352ae78446e70a298616a31dc44a69"}},"spec":{"podSelector":{"matchLabels":{"app":"rhiza-inspector","chaos.rhiza.io/run":"a1b2c3d4"}},"policyTypes":["Ingress","Egress"],"ingress":[],"egress":[]}}' ;;
  "get networkpolicies.networking.k8s.io") printf '%s\n' '{"items":[{"metadata":{"uid":"policy-uid"}}]}' ;;
  "delete --dry-run=server"|"replace --dry-run=server") printf '%s\n' 'Error from server (Forbidden): networkpolicies is forbidden' >&2; exit 1 ;;
  "create --dry-run=server")
@@ -3479,7 +3701,7 @@ case "$1 $2" in
     case "$*" in
      *'/instance/service-accounts/default/email')
       if [ "$FAKE_SCENARIO" = metadata-wrong-service-account ]; then printf 'node@project.iam.gserviceaccount.com\n200'
-      else printf 'rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; fi ;;
+      else printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; fi ;;
      *'/instance/service-accounts/default/token')
       if [ "$FAKE_SCENARIO" = metadata-credential-failure ]; then printf 'synthetic-metadata-token\n401'
       else printf '{"access_token":"synthetic-metadata-token","token_type":"Bearer","expires_in":100}\n200'; fi ;;
@@ -3505,18 +3727,18 @@ case "$1 $2" in
   else jq '{items:[.]}' "$FAKE_METADATA"; fi ;;
  "get pods") printf '%s\n' '{"items":[]}' ;;
  "delete --raw")
-  [ "$3" = /api/v1/namespaces/rhiza-v0191-20261008-a1b2c3d4/pods/rhiza-metadata ] && [ "$4" = -f ] || exit 99
+  [ "$3" = /api/v1/namespaces/rhiza-__RELEASE_PREFIX__-a1b2c3d4/pods/rhiza-metadata ] && [ "$4" = -f ] || exit 99
   jq -e '.preconditions=={uid:"metadata-uid",resourceVersion:"7"}' "$5" >/dev/null || exit 99
   touch "$FAKE_METADATA_DELETED" ;;
  "logs "*) kill -USR1 "$(cat "$FAKE_PARENT")"; exit 0 ;;
  "scale "*|"wait "*|"delete "*) exit 0 ;;
  *) exit 95 ;;
 esac
-`, 0700)
+`, release), 0700)
 			// Functional cases check parser arguments and auth boundaries, not
 			// process-launch performance. Timing cases keep the native timer.
 			if scenario != "parser-timeout" && scenario != "deadline" && scenario != "watchdog" {
-				write(filepath.Join(bin, "timeout"), `#!/bin/sh
+				write(filepath.Join(bin, "timeout"), releaseFixtureTemplate(`#!/bin/sh
 previous=
 parser=no
 for argument do
@@ -3527,20 +3749,20 @@ if [ "$parser" = yes ]; then
  [ "$#" = 11 ] && [ "$1" = --kill-after=5s ] && [ "$2" = 5s ] &&
   [ "$3" = kubectl ] && [ "$4" = "--kubeconfig=$FAKE_KUBECONFIG" ] &&
   [ "$5" = --context=gke_example-project_test-region1_test-cluster ] &&
-  [ "$6" = --namespace=rhiza-v0191-20261008-a1b2c3d4 ] &&
+  [ "$6" = --namespace=rhiza-__RELEASE_PREFIX__-a1b2c3d4 ] &&
   [ "$7" = config ] && [ "$8" = view ] && [ "$9" = --raw ] &&
   [ "${10}" = -o ] && [ "${11}" = json ] || exit 98
  shift 3
  exec "$FAKE_KUBECTL" "$@"
 fi
 exec "$FAKE_NATIVE_TIMEOUT" "$@"
-`, 0700)
+`, release), 0700)
 			}
 			expiry := time.Unix(now+3300, 0).UTC().Format(time.RFC3339)
 			if scenario == "expiry" {
 				expiry = time.Unix(now+14400, 0).UTC().Format(time.RFC3339)
 			}
-			dataEmail := "rhiza-v0191-gcs-" + run + "@example-project.iam.gserviceaccount.com"
+			dataEmail := "rhiza-" + release.Prefix + "-gcs-" + run + "@example-project.iam.gserviceaccount.com"
 			owner := "rhiza-postrelease-" + run + "-" + harness
 			member := "serviceAccount:example-project.svc.id.goog[" + namespace + "/rhiza-gcs]"
 			operatorMember := "serviceAccount:example-project.svc.id.goog[" + namespace + "/rhiza-operator]"
@@ -4841,6 +5063,7 @@ exit 94
 }
 
 func TestQualificationShutdownWatchCommand(t *testing.T) {
+	release := mustReleaseVersion(t)
 	source, err := os.ReadFile("../run-gcs-postrelease.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -4866,15 +5089,15 @@ func TestQualificationShutdownWatchCommand(t *testing.T) {
 			for name, content := range map[string]string{
 				"date":    "#!/bin/sh\nprintf '100\\n'\n",
 				"timeout": "#!/bin/sh\n[ \"$1\" = --kill-after=5s ] && [ \"$2\" = \"$FAKE_LIMIT\" ] || exit 91\nshift 2\nexec \"$@\"\n",
-				"kubectl": `#!/bin/sh
+				"kubectl": releaseFixtureTemplate(`#!/bin/sh
 if [ "$FAKE_MODE" = run-local ]; then [ "$1" = --kubeconfig=/synthetic/private/config ] || exit 92; shift; fi
-[ "$1" = --context=synthetic ] && [ "$2" = --namespace=rhiza-v0191-20261008-a1b2c3d4 ] && [ "$3" = --request-timeout=0 ] || exit 93
+[ "$1" = --context=synthetic ] && [ "$2" = --namespace=rhiza-__RELEASE_PREFIX__-a1b2c3d4 ] && [ "$3" = --request-timeout=0 ] || exit 93
 shift 3
 [ "$#" = 2 ] && [ "$1" = get ] && [ "$2" = "$FAKE_RAW" ] || exit 94
 touch "$FAKE_DIR/called"
 [ "$FAKE_SCENARIO" != client-error ] || exit 53
 printf '{"type":"ERROR","object":{"code":410}}\n'
-`,
+`, release),
 			} {
 				if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0700); err != nil {
 					t.Fatal(err)
@@ -4891,13 +5114,13 @@ printf '{"type":"ERROR","object":{"code":410}}\n'
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", `set -eu
-mode=$FAKE_MODE; context=synthetic; ns=rhiza-v0191-20261008-a1b2c3d4
+mode=$FAKE_MODE; context=synthetic; ns=rhiza-`+release.Prefix+`-a1b2c3d4
 RHIZA_RUN_ID=a1b2c3d4; RHIZA_LOCAL_RUNTIME_KUBECONFIG=/synthetic/private/config
 remaining() { printf '7\n'; }
 `+string(source[start:end])+`
 shutdown_watch "$1" "$2"`, "fixture", scenario.version, strconv.Itoa(scenario.deadline))
 			command.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "FAKE_DIR="+dir, "FAKE_MODE="+scenario.mode, "FAKE_SCENARIO="+scenario.name, "FAKE_LIMIT="+limit,
-				"FAKE_RAW=--raw=/api/v1/namespaces/rhiza-v0191-20261008-a1b2c3d4/pods?watch=true&resourceVersion="+version+"&labelSelector=chaos.rhiza.io%2Frun%3Da1b2c3d4&timeoutSeconds=240")
+				"FAKE_RAW=--raw=/api/v1/namespaces/rhiza-"+release.Prefix+"-a1b2c3d4/pods?watch=true&resourceVersion="+version+"&labelSelector=chaos.rhiza.io%2Frun%3Da1b2c3d4&timeoutSeconds=240")
 			output, err := command.CombinedOutput()
 			code := 0
 			if err != nil {
@@ -5076,6 +5299,7 @@ esac
 }
 
 func TestQualificationMetadataCredentialReadiness(t *testing.T) {
+	release := mustReleaseVersion(t)
 	source, err := os.ReadFile("../run-gcs-postrelease.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -5133,8 +5357,8 @@ func TestQualificationMetadataCredentialReadiness(t *testing.T) {
 			if scenario.name == "budget-reserve" {
 				authExpiry, expectedDeadline = 2200, 1000
 			}
-			fixture := `
-mode=run-local; local_deadline=$FAKE_LOCAL_DEADLINE; auth_expiry=$FAKE_AUTH_EXPIRY; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-v0191-20261008-a1b2c3d4; data_gsa_email=rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com; RHIZA_NODE_A=gke-test-cluster-fixture-a; RHIZA_NODE_B=gke-test-cluster-fixture-b; RHIZA_NODE_C=gke-test-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
+			fixture := releaseFixtureTemplate(`
+version_prefix=__RELEASE_PREFIX__; mode=run-local; local_deadline=$FAKE_LOCAL_DEADLINE; auth_expiry=$FAKE_AUTH_EXPIRY; RHIZA_RUN_ID=a1b2c3d4; ns=rhiza-__RELEASE_PREFIX__-a1b2c3d4; data_gsa_email=rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com; RHIZA_NODE_A=gke-test-cluster-fixture-a; RHIZA_NODE_B=gke-test-cluster-fixture-b; RHIZA_NODE_C=gke-test-cluster-fixture-c; RHIZA_CLUSTER_METADATA="$FAKE_DIR/cluster.json"
 date() { cat "$FAKE_DIR/clock"; }
 sleep() { now=$(date); case "$FAKE_SCENARIO" in backward-wall-then-ready) now=$((now - 100));; esac; printf '%s\n' "$((now + $1))" > "$FAKE_DIR/clock"; }
 k() {
@@ -5143,18 +5367,18 @@ k() {
   *'/instance/service-accounts/default/email')
    identity_attempt=$(cat "$FAKE_DIR/identity-attempts"); identity_attempt=$((identity_attempt + 1)); printf '%s\n' "$identity_attempt" > "$FAKE_DIR/identity-attempts"
    case "$FAKE_SCENARIO" in
-    principal-uri-identity) printf 'principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/example-project.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs\n200' ;;
-    legacy-alias-identity) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n200' ;;
-    wrong-run-gsa-email) printf 'rhiza-v0191-gcs-deadbeef@example-project.iam.gserviceaccount.com\n200' ;;
-    wrong-project-gsa-email) printf 'rhiza-v0191-gcs-a1b2c3d4@other-project.iam.gserviceaccount.com\n200' ;;
+    principal-uri-identity) printf 'principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/example-project.svc.id.goog/subject/ns/rhiza-__RELEASE_PREFIX__-a1b2c3d4/sa/rhiza-gcs\n200' ;;
+    legacy-alias-identity) printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4.svc.id.goog\n200' ;;
+    wrong-run-gsa-email) printf 'rhiza-__RELEASE_PREFIX__-gcs-deadbeef@example-project.iam.gserviceaccount.com\n200' ;;
+    wrong-project-gsa-email) printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@other-project.iam.gserviceaccount.com\n200' ;;
     wrong-gsa-email) printf 'other@example-project.iam.gserviceaccount.com\n200' ;;
     node-default-identity) printf '123456789012-compute@developer.gserviceaccount.com\n200' ;;
     wrong-identity) printf 'unrelated.svc.id.goog\n200' ;;
-    identity-http) printf 'rhiza-v0191-gcs-a1b2c3d4.svc.id.goog\n404' ;;
+    identity-http) printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4.svc.id.goog\n404' ;;
     identity-native) return 7 ;;
-    post-token-drift) if [ "$identity_attempt" = 1 ]; then printf 'rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; else printf 'other@example-project.iam.gserviceaccount.com\n200'; fi ;;
-    post-token-native-body) if [ "$identity_attempt" = 1 ]; then printf 'rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; else printf 'synthetic-identity-body-never-public'; return 7; fi ;;
-    *) printf 'rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200' ;;
+    post-token-drift) if [ "$identity_attempt" = 1 ]; then printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; else printf 'other@example-project.iam.gserviceaccount.com\n200'; fi ;;
+    post-token-native-body) if [ "$identity_attempt" = 1 ]; then printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200'; else printf 'synthetic-identity-body-never-public'; return 7; fi ;;
+    *) printf 'rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\n200' ;;
    esac
    return 0 ;;
   *'/instance/service-accounts/default/token') ;;
@@ -5163,20 +5387,20 @@ k() {
  attempt=$(cat "$FAKE_DIR/attempts"); attempt=$((attempt + 1)); printf '%s\n' "$attempt" > "$FAKE_DIR/attempts"
  printf 'synthetic-token-never-public\n' >&2
  case "$FAKE_SCENARIO" in
-  propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' '{"error":{"code":403,"message":"loading GenerateAccessToken(\"rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\"): Permission iam.serviceAccounts.getAccessToken denied on resource","status":"PERMISSION_DENIED"}}'; return 0; } ;;
+  propagation-then-ready|backward-wall-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' '{"error":{"code":403,"message":"loading GenerateAccessToken(\"rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com\"): Permission iam.serviceAccounts.getAccessToken denied on resource","status":"PERMISSION_DENIED"}}'; return 0; } ;;
   arbitrary-403-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' 'synthetic-arbitrary-forbidden-body-never-public'; return 0; } ;;
-  whitespace-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403\r' '{ "error" : { "status" : "PERMISSION_DENIED", "message" : "Permission  iam.serviceAccounts.getAccessToken denied.\nGenerateAccessToken ( rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com )", "code" : 403 } }'; return 0; } ;;
-  plain-propagation-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).'; return 0; } ;;
-  plain-whitespace-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403:\tgeneric::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", ""):\r\ngoogleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
-  propagation-exhausted) printf '%s\n403' '{"error":{"status":"PERMISSION_DENIED","message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com failed: iam.serviceAccounts.getAccessToken permission denied","code":403}}'; return 0 ;;
+  whitespace-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403\r' '{ "error" : { "status" : "PERMISSION_DENIED", "message" : "Permission  iam.serviceAccounts.getAccessToken denied.\nGenerateAccessToken ( rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com )", "code" : 403 } }'; return 0; } ;;
+  plain-propagation-then-ready) [ "$attempt" != 1 ] || { printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).'; return 0; } ;;
+  plain-whitespace-then-ready) [ "$attempt" != 1 ] || { printf 'HTTP/403:\tgeneric::permission_denied: loading: GenerateAccessToken("rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", ""):\r\ngoogleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).\n403'; return 0; } ;;
+  propagation-exhausted) printf '%s\n403' '{"error":{"status":"PERMISSION_DENIED","message":"GenerateAccessToken for rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com failed: iam.serviceAccounts.getAccessToken permission denied","code":403}}'; return 0 ;;
   nonretryable-403) printf 'Permission denied for an unrelated reason\n403'; return 0 ;;
-  wrong-gsa-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-deadbeef@example-project.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
-  wrong-permission-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com: iam.serviceAccounts.actAs denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
-  wrong-operation-403) printf '%s\n403' '{"error":{"code":403,"message":"SignBlob for rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
-  noncanonical-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"FORBIDDEN"}}'; return 0 ;;
+  wrong-gsa-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-__RELEASE_PREFIX__-gcs-deadbeef@example-project.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
+  wrong-permission-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com: iam.serviceAccounts.actAs denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
+  wrong-operation-403) printf '%s\n403' '{"error":{"code":403,"message":"SignBlob for rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"PERMISSION_DENIED"}}'; return 0 ;;
+  noncanonical-403) printf '%s\n403' '{"error":{"code":403,"message":"GenerateAccessToken for rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com: iam.serviceAccounts.getAccessToken denied","status":"FORBIDDEN"}}'; return 0 ;;
   plain-wrong-gsa-403) printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("wrong@example-project.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.getAccessToken'\'' denied on resource (or it may not exist).'; return 0 ;;
-  plain-wrong-permission-403) printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.actAs'\'' denied on resource (or it may not exist).'; return 0 ;;
-  plain-arbitrary-403) printf '%s\n403' 'permission denied while GenerateAccessToken rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com iam.serviceAccounts.getAccessToken'; return 0 ;;
+  plain-wrong-permission-403) printf '%s\n403' 'HTTP/403: generic::permission_denied: loading: GenerateAccessToken("rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com", ""): googleapi: Error 403: Permission '\''iam.serviceAccounts.actAs'\'' denied on resource (or it may not exist).'; return 0 ;;
+  plain-arbitrary-403) printf '%s\n403' 'permission denied while GenerateAccessToken rhiza-__RELEASE_PREFIX__-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com iam.serviceAccounts.getAccessToken'; return 0 ;;
   connection) [ "$attempt" != 1 ] || return 7 ;;
   server) if [ "$attempt" = 1 ]; then printf 'synthetic-token-never-public\n503'; return 0; fi ;;
   not-found) printf 'synthetic-token-never-public\n404'; return 0 ;;
@@ -5192,7 +5416,7 @@ k() {
  printf '{"access_token":"synthetic-token-never-public","token_type":"Bearer","expires_in":100}\n200'
 }
 
-`
+`, release)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			command := exec.CommandContext(ctx, "/bin/sh", "-c", fixture+string(source[start:end])+`
@@ -5269,11 +5493,11 @@ metadata_credentials_ready_inner`)
 				t.Fatalf("metadata identity category=%s missing from %s", identityCategory, output)
 			}
 			for _, identity := range []string{
-				"principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/example-project.svc.id.goog/subject/ns/rhiza-v0191-20261008-a1b2c3d4/sa/rhiza-gcs",
-				"rhiza-v0191-gcs-a1b2c3d4.svc.id.goog",
-				"rhiza-v0191-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com",
-				"rhiza-v0191-gcs-deadbeef@example-project.iam.gserviceaccount.com",
-				"rhiza-v0191-gcs-a1b2c3d4@other-project.iam.gserviceaccount.com",
+				"principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/example-project.svc.id.goog/subject/ns/rhiza-" + release.Prefix + "-a1b2c3d4/sa/rhiza-gcs",
+				"rhiza-" + release.Prefix + "-gcs-a1b2c3d4.svc.id.goog",
+				"rhiza-" + release.Prefix + "-gcs-a1b2c3d4@example-project.iam.gserviceaccount.com",
+				"rhiza-" + release.Prefix + "-gcs-deadbeef@example-project.iam.gserviceaccount.com",
+				"rhiza-" + release.Prefix + "-gcs-a1b2c3d4@other-project.iam.gserviceaccount.com",
 				"other@example-project.iam.gserviceaccount.com",
 				"123456789012-compute@developer.gserviceaccount.com",
 				"unrelated.svc.id.goog",
@@ -6081,11 +6305,12 @@ func TestQualificationHostSIGTERM(t *testing.T) {
 }
 
 func TestQualificationShutdownProof(t *testing.T) {
+	release := mustReleaseVersion(t)
 	for _, scenario := range []string{"complete", "missing-completion", "close-failure", "wrong-uid", "wrong-process", "forced-kill", "different-container", "different-image", "restarted", "no-terminal-event", "log-failure", "recreation", "replacement-event", "writers-remain", "watch-timeout", "watch-error", "empty-before", "missing-voter", "replacement-uid", "learner-omitted", "unresolved-learner-uid", "incomplete-startup", "planned-restart-current", "learner-current", "async-terminal", "async-parse-failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir := t.TempDir()
 			const run = "a1b2c3d4"
-			ns := "rhiza-v0191-20261008-" + run
+			ns := "rhiza-" + release.Prefix + "-" + run
 			image := "ghcr.io/mrchypark/rhiza-sql@sha256:" + strings.Repeat("a", 64)
 			writeJSON := func(name string, value any) {
 				t.Helper()

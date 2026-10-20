@@ -14,6 +14,19 @@ esac
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 . "$script_dir/cluster-metadata-projection.sh"
 die() { printf '%s\n' "$*" >&2; exit 1; }
+# The release source of truth is the Rust SDK manifest version. The harness
+# identity family (pool, GSA names, namespace prefix, legacy KSA alias) is
+# derived from it so a release bump cannot leave a stale family behind. Same
+# capture idiom as scripts/check-release-sync.sh.
+repo_root=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+# BEGIN VERSION PREFIX DERIVATION
+manifest=$repo_root/sdk/rust/Cargo.toml
+manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -n 1)
+[ -n "$manifest_version" ] || die 'Cannot read the SDK version from sdk/rust/Cargo.toml'
+version_prefix=v$(printf '%s' "$manifest_version" | tr -d '.')
+printf '%s\n' "$version_prefix" | LC_ALL=C grep -Eq '^v[0-9]+$' || die 'Malformed SDK version prefix'
+printf '%s\n' "$manifest_version" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die 'Malformed SDK version'
+# END VERSION PREFIX DERIVATION
 inspector_network_isolation=${RHIZA_INSPECTOR_NETWORK_ISOLATION-required}
 case "$inspector_network_isolation" in
   required|exclude-user-approved) ;;
@@ -56,8 +69,27 @@ printf '%s\n' "$RHIZA_GCS_PREFIX" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/
 case "$RHIZA_GCS_PREFIX" in *"/$RHIZA_RUN_ID/") ;; *) die 'GCS prefix must end in the fresh run ID' ;; esac
 printf '%s\n' "$RHIZA_NAMESPACE" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || die 'invalid namespace'
 printf '%s\n' "$RHIZA_DATA_GSA_ID" | LC_ALL=C grep -Eq '^[a-z][a-z0-9-]{4,28}[a-z0-9]$' || die 'invalid data GSA account ID'
-case "$RHIZA_NAMESPACE" in *"$RHIZA_RUN_ID"*) ;; *) die 'namespace must contain the fresh run ID' ;; esac
-case "$RHIZA_DATA_GSA_ID" in *"$RHIZA_RUN_ID"*) ;; *) die 'data GSA account ID must contain the fresh run ID' ;; esac
+# Exact identity-family gate. Containment of the run ID is not enough: a stale
+# release family (for example rhiza-v0191-<runid>) would still satisfy a
+# containment check and could reach cloud or Kubernetes mutation before being
+# rejected. The namespace, the data GSA and the GCS prefix must be exactly the
+# family derived from the current SDK version. Same rule as
+# bootstrap-gcs-postrelease.sh and run-votercount-gcs-chaos.sh.
+#
+# The prefix is compared against the release-scoped form
+# postrelease/v<manifest version>/<run id>/ that run-votercount-gcs-chaos.sh
+# produces, so a stale release prefix such as postrelease/v0.19.1/<run id>/ is
+# rejected instead of merely ending in the fresh run ID. This gate runs before
+# the output directory is created and before any kubectl or gcloud call.
+validate_identity_family() {
+  expected_namespace="rhiza-$version_prefix-$RHIZA_RUN_ID"
+  expected_data_gsa="rhiza-$version_prefix-gcs-$RHIZA_RUN_ID"
+  expected_prefix="postrelease/v$manifest_version/$RHIZA_RUN_ID/"
+  [ "$RHIZA_NAMESPACE" = "$expected_namespace" ] || die "Namespace identity mismatch: expected $expected_namespace, got $RHIZA_NAMESPACE"
+  [ "$RHIZA_DATA_GSA_ID" = "$expected_data_gsa" ] || die "Data GSA identity mismatch: expected $expected_data_gsa, got $RHIZA_DATA_GSA_ID"
+  [ "$RHIZA_GCS_PREFIX" = "$expected_prefix" ] || die "GCS prefix identity mismatch: expected $expected_prefix, got $RHIZA_GCS_PREFIX"
+}
+validate_identity_family
 data_gsa_email="$RHIZA_DATA_GSA_ID@$RHIZA_GCP_PROJECT_ID.iam.gserviceaccount.com"
 for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
   printf '%s' "$node" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$' || die 'existing-node pin required'
@@ -150,7 +182,7 @@ metadata_credentials_ready_inner() (
   metadata_identity_value=$(printf '%s\n' "$metadata_identity" | sed '$d')
   case "$metadata_identity_http" in [1-5][0-9][0-9]) ;; *) metadata_identity_http=000 ;; esac
   metadata_principal_identity="principal://iam.googleapis.com/projects/$RHIZA_GCP_PROJECT_NUMBER/locations/global/workloadIdentityPools/$RHIZA_GCP_PROJECT_ID.svc.id.goog/subject/ns/$ns/sa/rhiza-gcs"
-  metadata_legacy_identity="rhiza-v0191-gcs-$RHIZA_RUN_ID.svc.id.goog"
+  metadata_legacy_identity="rhiza-$version_prefix-gcs-$RHIZA_RUN_ID.svc.id.goog"
   metadata_default_node_identity="$RHIZA_GCP_PROJECT_NUMBER-compute@developer.gserviceaccount.com"
   metadata_identity_category=unknown
   if [ "$metadata_identity_code" != 0 ]; then

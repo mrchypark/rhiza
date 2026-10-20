@@ -17,6 +17,21 @@ import (
 	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
+func fenceSocketDir(t *testing.T) string {
+	t.Helper()
+	// Test names in t.TempDir paths can exceed the Unix socket path limit.
+	dir, err := os.MkdirTemp("/tmp", "rhiza-fence-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	return dir
+}
+
 func TestFenceStartupPartialConfigurationRejectsBeforeCreatingState(t *testing.T) {
 	for _, field := range []string{"socket", "ticket"} {
 		t.Run(field, func(t *testing.T) {
@@ -64,7 +79,7 @@ func TestFenceWatcherKeepsEngineAliveAcrossActualSessionOutage(t *testing.T) {
 		t.Run(fault, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			socket := filepath.Join(t.TempDir(), "session.sock")
+			socket := filepath.Join(fenceSocketDir(t), "session.sock")
 			identity := fencing.Identity{SourceClusterID: "cluster", NodeID: "node", PodUID: "pod", RunID: "run"}
 			var stopCalls atomic.Int32
 			var unavailable atomic.Bool

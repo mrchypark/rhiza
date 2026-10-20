@@ -195,7 +195,7 @@ spec:
             - {configMapRef: {name: rhiza-config}}
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
           volumeMounts: [{name: tmp, mountPath: /tmp}]
-          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 256Mi}}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 250m, memory: 256Mi}}
       volumes: [{name: tmp, emptyDir: {}}]
 ---
 apiVersion: v1
@@ -259,7 +259,7 @@ spec:
           ports: [{name: https, containerPort: 9444}]
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
           volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
-          resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {memory: 256Mi}}
+          resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {cpu: 250m, memory: 256Mi}}
       volumes: [{name: tls, secret: {secretName: rhiza-fencer-tls}}]
 ---
 # BEGIN INSPECTOR PROBE

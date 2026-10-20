@@ -15,6 +15,23 @@ set -eu
 mode=${1:-install}
 case "$mode" in install|run) ;; *) echo "usage: $0 install|run" >&2; exit 2 ;; esac
 
+die() { printf '%s\n' "$*" >&2; exit 2; }
+
+here=$(cd -- "$(dirname -- "$0")" && pwd)
+
+# The release source of truth is the Rust SDK manifest version. The launcher
+# identity family (namespace, data GSA, GCS prefix) is derived from it so a
+# release bump cannot leave a stale family behind. Same capture idiom and same
+# naming rules as run-gcs-postrelease.sh and bootstrap-gcs-postrelease.sh.
+repo_root=$(CDPATH='' cd -- "$here/../.." && pwd)
+# BEGIN VERSION PREFIX DERIVATION
+manifest_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_root/sdk/rust/Cargo.toml" | head -n 1)
+[ -n "$manifest_version" ] || die 'Cannot read the SDK version from sdk/rust/Cargo.toml'
+version_prefix=v$(printf '%s' "$manifest_version" | tr -d '.')
+printf '%s\n' "$version_prefix" | LC_ALL=C grep -Eq '^v[0-9]+$' || die 'Malformed SDK version prefix'
+printf '%s\n' "$manifest_version" | LC_ALL=C grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || die 'Malformed SDK version'
+# END VERSION PREFIX DERIVATION
+
 : "${RHIZA_RUN_ID:?8 lowercase hex run id}"
 : "${RHIZA_NAMESPACE:?run namespace containing the run id}"
 : "${RHIZA_KUBE_CONTEXT:?kube context}"
@@ -40,12 +57,67 @@ require_digest() {
 require_digest RHIZA_APP_IMAGE "$RHIZA_APP_IMAGE"
 require_digest RHIZA_OPERATOR_IMAGE "$RHIZA_OPERATOR_IMAGE"
 
-here=$(cd -- "$(dirname -- "$0")" && pwd)
+# Fencer TLS certificate lifetime.
+#
+# The install phase and the run phase are separate invocations, so the
+# self-signed fencer certificate must not expire because of the gap between
+# them. A one-day certificate made every namespace unusable one day after it
+# was installed (the voter then crashloops on an x509 expiry error), which is
+# a structural defect: the lifetime was tied to the install-to-run interval
+# instead of to the qualification run. The default is 30 days, and the value
+# is validated so a typo cannot silently produce a short-lived certificate.
+: "${RHIZA_FENCE_CERT_DAYS:=30}"
+case "$RHIZA_FENCE_CERT_DAYS" in
+  ''|*[!0-9]*) die "RHIZA_FENCE_CERT_DAYS must be a positive integer, got: $RHIZA_FENCE_CERT_DAYS" ;;
+esac
+[ "$RHIZA_FENCE_CERT_DAYS" -ge 1 ] ||
+  die "RHIZA_FENCE_CERT_DAYS must be at least 1 day, got: $RHIZA_FENCE_CERT_DAYS"
+[ "$RHIZA_FENCE_CERT_DAYS" -le 3650 ] ||
+  die "RHIZA_FENCE_CERT_DAYS must be at most 3650 days, got: $RHIZA_FENCE_CERT_DAYS"
+
+# Exact identity-family gate. Containment of the run ID is not enough: a stale
+# release family (for example rhiza-v0191-<runid>) would still satisfy a
+# containment check and could reach Kubernetes or GCS mutation before being
+# rejected. The namespace, the data GSA and the GCS prefix must be exactly the
+# family derived from the current SDK version. Same rule as
+# run-gcs-postrelease.sh and bootstrap-gcs-postrelease.sh.
+#
+# This gate runs before any mutating or remote action: before the output
+# directory is created, before any kubectl/gcloud/gh call, and before any
+# manifest is rendered or applied. It applies to both the install and the run
+# mode, so neither entry point can be pointed at a stale release family.
+validate_identity_family() {
+  expected_namespace="rhiza-$version_prefix-$RHIZA_RUN_ID"
+  expected_data_gsa="rhiza-$version_prefix-gcs-$RHIZA_RUN_ID"
+  expected_prefix="postrelease/v$manifest_version/$RHIZA_RUN_ID/"
+  [ "$RHIZA_NAMESPACE" = "$expected_namespace" ] ||
+    die "Namespace identity mismatch: expected $expected_namespace, got $RHIZA_NAMESPACE"
+  [ "$RHIZA_DATA_GSA_ID" = "$expected_data_gsa" ] ||
+    die "Data GSA identity mismatch: expected $expected_data_gsa, got $RHIZA_DATA_GSA_ID"
+  [ "$RHIZA_GCS_PREFIX" = "$expected_prefix" ] ||
+    die "GCS prefix identity mismatch: expected $expected_prefix, got $RHIZA_GCS_PREFIX"
+}
+
 out=${RHIZA_OUT:-$PWD/votercount-gcs-chaos-results}
 gcs_service_account=$RHIZA_DATA_GSA_ID@$RHIZA_GCP_PROJECT_ID.iam.gserviceaccount.com
+admin_token_file=$out/admin-token
+
+# The runtime phase first checks its own local prerequisite: the privileged
+# install credential produced by the install phase. That check is purely local
+# (a file test) and performs no remote call, so it cannot leak a stale family
+# to Kubernetes, GCS or GitHub. The identity gate below still runs before the
+# driver reaches the cluster.
+if [ "$mode" = run ]; then
+  [ -f "$admin_token_file" ] && [ ! -L "$admin_token_file" ] && [ -s "$admin_token_file" ] || {
+    echo "missing privileged-install credential: $admin_token_file" >&2
+    exit 2
+  }
+fi
+
+validate_identity_family
+
 umask 077
 mkdir -p "$out"
-admin_token_file=$out/admin-token
 tls_tmp=
 remove_admin_token=false
 cleanup() {
@@ -89,12 +161,59 @@ provision_tls() {
     'extendedKeyUsage=serverAuth' \
     "subjectAltName=DNS:rhiza-fencer,DNS:rhiza-fencer.$RHIZA_NAMESPACE.svc" \
     >"$tls_tmp/openssl.cnf"
-  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$tls_tmp/openssl.cnf" \
+  # The certificate lifetime must not depend on the interval between the
+  # install phase and the run phase. A one-day certificate made the fencer
+  # and every voter fail with an x509 expiry error once the namespace had been
+  # installed for more than a day. The lifetime is now a validated parameter
+  # (default 30 days), and the issued window is recorded so the receipt shows
+  # how long the qualification is allowed to run.
+  openssl req -x509 -newkey rsa:2048 -nodes -days "$RHIZA_FENCE_CERT_DAYS" -config "$tls_tmp/openssl.cnf" \
     -keyout "$tls_tmp/tls.key" -out "$tls_tmp/tls.crt" 2>"$out/00-tls-generation.log"
+  # Verify the issued window instead of trusting the requested day count.
+  openssl x509 -in "$tls_tmp/tls.crt" -noout -dates >"$out/00-tls-dates.log" 2>&1 ||
+    { echo 'cannot read the issued fencer certificate window' >&2; exit 1; }
+  openssl x509 -in "$tls_tmp/tls.crt" -noout -checkend 0 >/dev/null 2>&1 ||
+    { echo 'the issued fencer certificate is already expired' >&2; exit 1; }
+  # Assert the issued window really covers the requested lifetime. `-checkend 0`
+  # only proves the certificate is valid *now*; a short-lived certificate would
+  # pass it while still reproducing the install-to-run expiry defect. One day
+  # of slack absorbs the clock skew between issuance and this check.
+  minimum_remaining=$(( (RHIZA_FENCE_CERT_DAYS - 1) * 86400 ))
+  openssl x509 -in "$tls_tmp/tls.crt" -noout -checkend "$minimum_remaining" >/dev/null 2>&1 ||
+    { echo "the issued fencer certificate does not cover the requested ${RHIZA_FENCE_CERT_DAYS} day window" >&2; exit 1; }
+  cat "$out/00-tls-dates.log"
+  printf 'fencer TLS certificate issued with %s day(s) validity; install-to-run delay must stay below that window\n' \
+    "$RHIZA_FENCE_CERT_DAYS"
+  # Reissue path: an already installed namespace still holds the previous
+  # Secret/ConfigMap. The install phase owns both objects, so replacing them
+  # is safe and lets an expired certificate be renewed without recreating the
+  # namespace. Deleting first keeps `kubectl create` idempotent for a re-run.
+  kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+    delete secret rhiza-fencer-tls --ignore-not-found=true >"$out/00-fencer-tls-reissue.log" 2>&1
+  kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+    delete configmap rhiza-fencer-ca --ignore-not-found=true >>"$out/00-fencer-tls-reissue.log" 2>&1
   step 00-fencer-tls kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
     create secret tls rhiza-fencer-tls --cert="$tls_tmp/tls.crt" --key="$tls_tmp/tls.key"
   step 00-fencer-ca kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
     create configmap rhiza-fencer-ca --from-file="ca.crt=$tls_tmp/tls.crt"
+  printf '%s\n' "fencer TLS reissue complete: rhiza-fencer-tls Secret and rhiza-fencer-ca ConfigMap replaced with a ${RHIZA_FENCE_CERT_DAYS} day certificate" \
+    >>"$out/00-fencer-tls-reissue.log"
+  # A running fencer keeps the certificate it loaded at start-up in memory, so
+  # replacing the Secret alone would leave the old (possibly expired) material
+  # in use. Restart the Deployment when it already exists; on a fresh install
+  # it is created later by the manifest apply and picks the new Secret up.
+  if kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+    get deployment rhiza-fencer >/dev/null 2>&1; then
+    step 00-fencer-restart kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+      rollout restart deployment/rhiza-fencer
+    step 00-fencer-restart-status kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+      rollout status deployment/rhiza-fencer --timeout=180s
+    printf '%s\n' 'fencer Deployment restarted so the reissued certificate is loaded' \
+      >>"$out/00-fencer-tls-reissue.log"
+  else
+    printf '%s\n' 'fencer Deployment not present yet; the manifest apply will start it with the new certificate' \
+      >>"$out/00-fencer-tls-reissue.log"
+  fi
 }
 
 # Run a step, stream its log and fail the launcher on its real exit status.
@@ -149,10 +268,6 @@ if [ "$mode" = install ]; then
   exit 0
 fi
 
-[ -f "$admin_token_file" ] && [ ! -L "$admin_token_file" ] && [ -s "$admin_token_file" ] || {
-  echo "missing privileged-install credential: $admin_token_file" >&2
-  exit 2
-}
 remove_admin_token=true
 step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \
   --context "$RHIZA_KUBE_CONTEXT" \
