@@ -27,11 +27,15 @@ func (e *FencingExecutor) enrolledMutationRun(ctx context.Context, runtime fenci
 		return fencing.Run{}, err
 	}
 	run, ok := state.Ledger.Runs[runtime.RunID]
-	if !ok || !state.Ledger.RequireRuntimeBinding || run.Runtime == nil || *run.Runtime != runtime {
+	if !ok || (!state.Ledger.RequireRuntimeBinding && !state.Ledger.RequireMutationJournal) || run.Runtime == nil || *run.Runtime != runtime {
 		return fencing.Run{}, fmt.Errorf("fencing: mutation producer lacks trusted root enrollment")
 	}
 	if err := runtime.Validate(run.Identity); err != nil {
 		return fencing.Run{}, err
+	}
+	_, voterClosed := state.Ledger.ClosedNodes[run.Identity.NodeID]
+	if (state.Ledger.ClosedBy != "" || voterClosed) && run.Stop == nil {
+		return fencing.Run{}, fmt.Errorf("fencing: closed producer cohort lacks its stop binding")
 	}
 	return run, nil
 }
@@ -65,7 +69,7 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 		}
 		var producer fencing.MutationProducer
 		if creating {
-			if run.Identity.WALIdentity != "" {
+			if run.Identity.WALIdentity != "" || run.MutationProducerUID != "" {
 				return producer, fmt.Errorf("fencing: missing bound producer cannot be recreated")
 			}
 			initial, err := fencing.NewMutationProducer(run.Identity, runtime)
@@ -87,6 +91,21 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 			}
 			if producer.Runtime != runtime || producer.Validate() != nil {
 				return producer, fmt.Errorf("fencing: stored mutation producer identity/state differs")
+			}
+			uid := str(nested(resource, "metadata", "uid"))
+			if run.MutationProducerUID == "" {
+				if !allowCreate || run.Identity.WALIdentity != "" || producer.LastAdmitted != 0 || (producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
+					return producer, fmt.Errorf("fencing: producer UID must be pinned before activation")
+				}
+				_, err := e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error { return l.BindMutationProducer(run.Identity, runtime, uid) })
+				if err != nil {
+					return producer, err
+				}
+				// Reload both objects: closure may have raced this initialization.
+				continue
+			}
+			if run.MutationProducerUID != uid {
+				return producer, fmt.Errorf("fencing: producer object was replaced")
 			}
 		}
 		// Every bound WAL is immutable in the root; producer transitions cannot
@@ -124,6 +143,11 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 			err = e.Kube.Put(ctx, endpoint, resource, nil)
 		}
 		if err == nil {
+			if creating {
+				// Creation is not enrollment. Bind the server-assigned UID in
+				// the root before returning any authorization.
+				continue
+			}
 			return producer, nil
 		}
 		var api *APIError

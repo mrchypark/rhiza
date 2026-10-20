@@ -58,3 +58,34 @@ func (l *Ledger) RegisterEnrolled(id Identity, runtime RuntimeBinding) error {
 	l.Runs[id.RunID] = run
 	return nil
 }
+
+// BindMutationProducer pins the Kubernetes object's immutable UID before writer
+// admission. A trusted authority calls this only after creating/verifying the
+// deterministic Reserved producer. Finishing that initialization after closure
+// is allowed for an unbound run: it cannot reopen WAL or mutation admission.
+func (l *Ledger) BindMutationProducer(id Identity, runtime RuntimeBinding, producerUID string) error {
+	run, exists := l.Runs[id.RunID]
+	if !exists || producerUID == "" || run.Runtime == nil || *run.Runtime != runtime {
+		return fmt.Errorf("fencing: mutation producer has no matching runtime enrollment")
+	}
+	if err := runtime.Validate(id); err != nil {
+		return err
+	}
+	registered := id
+	registered.WALIdentity = run.Identity.WALIdentity
+	if registered != run.Identity || (id.WALIdentity != "" && id.WALIdentity != run.Identity.WALIdentity) {
+		return fmt.Errorf("fencing: mutation producer identity differs")
+	}
+	if run.MutationProducerUID != "" {
+		if run.MutationProducerUID == producerUID {
+			return nil
+		}
+		return fmt.Errorf("fencing: mutation producer UID is immutable")
+	}
+	if run.Identity.WALIdentity != "" {
+		return fmt.Errorf("fencing: cannot enroll a mutation producer after WAL admission")
+	}
+	run.MutationProducerUID = producerUID
+	l.Runs[id.RunID] = run
+	return nil
+}

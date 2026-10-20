@@ -31,9 +31,11 @@ at activation; it was corrected without relaxing the production WAL requirement.
 This initial journal retains at most 64 entries and applies backpressure; it does
 not compact terminal entries or yet provide a sustained-write deployment profile.
 Before production integration, implement reviewed archive/watermark compaction
-or independently enrolled bounded shard rotation. Also pin the producer object's
-Kubernetes UID in root enrollment before writer admission; checking a nonempty UID
-on load is not sufficient for cross-request delete/recreate detection. Wire the
+or independently enrolled bounded shard rotation. The producer object's Kubernetes
+UID is now pinned in root enrollment before WAL admission when the new
+RequireMutationJournal policy is selected; the backend refuses a replaced object,
+including across executor restart. The policy is not yet selected in production.
+Wire the
 trusted provider worker, durable staged payloads, globally serialized per-key
 dispatch and verified all-copy evidence. No storage bypass, terminal-reference,
 CRI-runtime termination, or positive dead-Pod recovery claim is made here.
