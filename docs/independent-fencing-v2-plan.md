@@ -2,8 +2,41 @@
 
 Tracking: [issue #246](https://github.com/mrchypark/rhiza/issues/246).
 Review: [complete Pro response](reviews/2026-10-21-dead-pod-autohealing-pro.md).
-Status: implementation proposal; three regressions reproduce the existing gaps.
-This document is not implementation or qualification evidence.
+Status: partial implementation; three end-to-end regressions still reproduce
+the existing gaps. This document is not qualification evidence.
+
+## Implemented foundation (not yet wired to writer admission)
+
+`pkg/fencing/runtime_binding.go` retains each runtime incarnation independently.
+`pkg/fencing/mutation_journal.go` implements bounded producer admission, closure,
+immutable preparation, separate commitment/rejection/exclusion, and additive
+all-copy completion receipts. Every receipt hash binds runtime, WAL, sequence
+and the fixed prepared descriptor. Create-only commitment alone cannot complete
+the barrier while copies may remain. No native metadata PATCH profile is accepted.
+
+`pkg/operator/mutation_journal_store.go` persists pure producer transitions using
+ConfigMap resourceVersion CAS and the enrolled root cohort, rather than a list
+of currently existing producer objects. A missing bound producer cannot be
+recreated as an empty journal. Delayed admission conflicts with durable closure;
+response-loss retry resolves the same sequence/operation, not a replacement.
+These are private backend methods, not unprotected application endpoints.
+
+Focused normal/race tests cover JSON restart, closure/admission interleavings,
+unscheduled obligations, late session/preparation rejection, receipt attribution,
+create-zero ambiguity, corrupt/missing state, response loss and bounded conflicts.
+The fake API tests do not constitute Kubernetes/GCS qualification or validate
+provider receipt authenticity. A fixture-only initial failure used an empty WAL
+at activation; it was corrected without relaxing the production WAL requirement.
+
+This initial journal retains at most 64 entries and applies backpressure; it does
+not compact terminal entries or yet provide a sustained-write deployment profile.
+Before production integration, implement reviewed archive/watermark compaction
+or independently enrolled bounded shard rotation. Also pin the producer object's
+Kubernetes UID in root enrollment before writer admission; checking a nonempty UID
+on load is not sufficient for cross-request delete/recreate detection. Wire the
+trusted provider worker, durable staged payloads, globally serialized per-key
+dispatch and verified all-copy evidence. No storage bypass, terminal-reference,
+CRI-runtime termination, or positive dead-Pod recovery claim is made here.
 
 ## Acceptance contract
 

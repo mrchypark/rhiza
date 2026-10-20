@@ -5,10 +5,10 @@ Reviewer: ChatGPT Pro, visibly verified. Retrieved 2026-10-21 KST.
 Reviewed proposal: 03306dc59144342ba9f53924d7d2160c4c4843cd.
 Issue: https://github.com/mrchypark/rhiza/issues/246.
 Capture format: complete rendered response text, not a summary. The Copy button
-This public display normalizes trailing whitespace only; exact text integrity
-refers to the preserved raw task evidence.
 returned the previous response even after re-observation, so the original Markdown
 is unavailable; the latest response was read from its visible DOM container.
+This public display normalizes trailing whitespace only; exact text integrity
+refers to the preserved raw task evidence.
 Visible citation URLs are preserved after the response. Additional URLs represented
 by +1/+2/+3 groups were not expanded. These are reviewer claims, not test results.
 Integrity: complete rendered text plus one newline is 6,608 UTF-8 bytes;
