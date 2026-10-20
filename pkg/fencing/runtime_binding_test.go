@@ -128,3 +128,65 @@ func TestRuntimeEnrollmentRejectsRebindingAndClosureWithoutChangingHistory(t *te
 		t.Fatal("closed ledger gained another runtime")
 	}
 }
+
+func TestRuntimeEnrollmentPinsProducerUIDBeforeWALAdmission(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = ""
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireMutationJournal: true}
+	runtime := enrolledRuntime(id, "container")
+	if err := l.RegisterEnrolled(id, runtime); err != nil {
+		t.Fatal(err)
+	}
+	bound := id
+	bound.WALIdentity = "wal"
+	if err := l.Bind(bound); err == nil {
+		t.Fatal("writer bound before producer UID enrollment")
+	}
+	if err := l.BindMutationProducer(id, runtime, "producer-uid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Bind(bound); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.BindMutationProducer(id, runtime, "producer-uid"); err != nil {
+		t.Fatal("lost enrollment response not resolvable:", err)
+	}
+	if err := l.BindMutationProducer(id, runtime, "replacement-uid"); err == nil {
+		t.Fatal("producer replacement changed immutable enrollment")
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored Ledger
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RequireMutationJournal || restored.Runs[id.RunID].MutationProducerUID != "producer-uid" {
+		t.Fatal("producer gate or identity lost after authority restart")
+	}
+	if err := restored.Bind(bound); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeEnrollmentCannotRetrofitJournalAfterWALBinding(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = ""
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+	runtime := enrolledRuntime(id, "container")
+	if err := l.RegisterEnrolled(id, runtime); err != nil {
+		t.Fatal(err)
+	}
+	bound := id
+	bound.WALIdentity = "legacy-wal"
+	if err := l.Bind(bound); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.BindMutationProducer(id, runtime, "late-uid"); err == nil {
+		t.Fatal("already authorized writer acquired fictitious empty journal history")
+	}
+	if l.Runs[id.RunID].MutationProducerUID != "" {
+		t.Fatal("rejected retrofit mutated history")
+	}
+}

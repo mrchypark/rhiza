@@ -92,7 +92,11 @@ func newMutationStoreFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixt
 		SourceClusterID: id.SourceClusterID, NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID,
 		NodeName: "node", NodeUID: "node-uid", MachineID: "machine", BootID: "boot", RuntimeID: "containerd", SandboxID: "sandbox", ContainerID: "container", ImageID: "image",
 	}
-	_, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { l.RequireRuntimeBinding = true; return l.RegisterEnrolled(id, runtime) })
+	_, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
+		l.RequireRuntimeBinding = true
+		l.RequireMutationJournal = true
+		return l.RegisterEnrolled(id, runtime)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +231,7 @@ func TestMutationJournalStoreLostResponseRetainsSameOperation(t *testing.T) {
 }
 
 func TestMutationJournalStoreRejectsCorruptionAndBoundsConflicts(t *testing.T) {
-	for _, scenario := range []string{"runtime", "deleting", "unknown-field", "missing-uid", "conflicts", "unenrolled"} {
+	for _, scenario := range []string{"runtime", "deleting", "unknown-field", "missing-uid", "replaced-uid", "conflicts", "unenrolled", "closed-without-stop"} {
 		t.Run(scenario, func(t *testing.T) {
 			e, f, id, runtime := newMutationStoreFixture(t)
 			activateStoredProducer(t, e, id, runtime)
@@ -247,10 +251,19 @@ func TestMutationJournalStoreRejectsCorruptionAndBoundsConflicts(t *testing.T) {
 				asObject(resource["data"])["producer.json"] = strings.TrimSuffix(data, "}") + `,"compactedThrough":100}`
 			case "missing-uid":
 				delete(asObject(resource["metadata"]), "uid")
+			case "replaced-uid":
+				asObject(resource["metadata"])["uid"] = "replacement-object-uid"
 			case "conflicts":
 				f.conflicts = 8
 			case "unenrolled":
 				runtime.RunID = "unregistered"
+			case "closed-without-stop":
+				root := f.objects[e.ledgerPath(runtime.StatefulSetUID, runtime.SourceClusterID)]
+				var state fenceLedger
+				_ = json.Unmarshal([]byte(str(nested(root, "data", "ledger.json"))), &state)
+				state.Ledger.ClosedBy, state.Ledger.ClosedHash = "fence", strings.Repeat("a", 64)
+				data, _ := json.Marshal(state)
+				asObject(root["data"])["ledger.json"] = string(data)
 			}
 			f.mu.Unlock()
 			_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
