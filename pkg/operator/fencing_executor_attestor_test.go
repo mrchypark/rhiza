@@ -180,7 +180,7 @@ func TestAttestedFenceNeverReplacesTheCooperativeLedger(t *testing.T) {
 	}
 }
 
-func TestAttestedFenceWritesBoundIndependentProof(t *testing.T) {
+func TestLegacyAttestedFenceCannotReplaceMissingV2Enrollment(t *testing.T) {
 	attestor := &stubAttestor{fn: func(req AttestationRequest) (*AttestationResponse, error) { return independentEvidenceFor(req), nil }}
 	executor, api, record := newAttestedExecutor(t, attestor)
 	// Another voter's unresolved run is outside a voter fence and must not block
@@ -193,27 +193,20 @@ func TestAttestedFenceWritesBoundIndependentProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.reconcileFence(t.Context(), fenceEndpoint, record); err != nil {
-		t.Fatalf("independent fence failed: %v", err)
+	if err := executor.reconcileFence(t.Context(), fenceEndpoint, record); !errors.Is(err, ErrFencePending) {
+		t.Fatalf("legacy unenrolled fence did not stay pending: %v", err)
 	}
-	if attestor.count() != 1 || api.statusPuts != 1 {
+	if attestor.count() != 0 || api.statusPuts != 0 {
 		t.Fatalf("attestor calls=%d status writes=%d", attestor.count(), api.statusPuts)
 	}
-	proof := record.Status.Proof
-	if proof == nil || proof.Independent == nil || proof.ProofID != "attested-proof" || !proof.ProcessesTerminated || !proof.RecreationBlocked || !proof.StorageQuiesced {
-		t.Fatalf("independent proof is incomplete: %+v", proof)
-	}
-	if proof.Independent.LedgerHash == "" || proof.Independent.RequestHash != hash || proof.Independent.Storage.Prefix != "root/source" {
-		t.Fatalf("independent proof lost its bindings: %+v", proof.Independent)
-	}
-	if len(proof.Independent.Runtimes) != 1 || proof.Independent.Runtimes[0].PodUID != "pod-0" || proof.Independent.Runtimes[0].ContainerIDs[0] != "containerd://c0" {
-		t.Fatalf("independent proof lost the captured incarnation: %+v", proof.Independent.Runtimes)
+	if record.Status.Proof != nil {
+		t.Fatal("legacy quiet-window response wrote a recovery proof")
 	}
 	if closed := api.closedState(t).Ledger.ClosedNodes["rhiza-0"]; closed.OperationID != record.Spec.OperationID || closed.RequestHash != hash {
 		t.Fatalf("closed voter slot does not bind the operation: %+v", closed)
 	}
-	if api.payload == nil || api.payload.ProofID != proof.ProofID {
-		t.Fatal("the persisted status differs from the validated proof")
+	if api.payload != nil {
+		t.Fatal("legacy proof was persisted")
 	}
 }
 
@@ -383,7 +376,13 @@ func TestFenceCRDSchemaFitsTheAttestationTransport(t *testing.T) {
 func schemaWorstBytes(node map[string]any) int {
 	switch node["type"] {
 	case "string":
-		return schemaInt(node["maxLength"])
+		if bound := schemaInt(node["maxLength"]); bound != 0 {
+			return bound
+		}
+		if node["pattern"] == "^[a-f0-9]{64}$" {
+			return 64
+		}
+		return 0
 	case "array":
 		count := schemaInt(node["maxItems"])
 		if count == 0 {
@@ -410,4 +409,53 @@ func schemaInt(value any) int {
 		return int(typed)
 	}
 	return 0
+}
+
+func TestFenceCRDCarriesVerifiedIndependentV2References(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/operator/fence-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions := crd["spec"].(map[string]any)["versions"].([]any)
+	properties := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)
+	proof := properties["status"].(map[string]any)["properties"].(map[string]any)["proof"].(map[string]any)
+	schema := proof["properties"].(map[string]any)["independentV2"].(map[string]any)
+	fields := schema["properties"].(map[string]any)
+	for _, key := range []string{"version", "requestHash", "ledgerHash", "storageScope", "currentPodUIDs", "terminals"} {
+		if fields[key] == nil {
+			t.Fatalf("v2 evidence schema is missing %s", key)
+		}
+	}
+	terminals := fields["terminals"].(map[string]any)
+	if terminals["maxItems"] != fenceTargetCapacity || terminals["minItems"] != 1 {
+		t.Fatal("terminal coverage is not bounded and nonempty")
+	}
+	refs := terminals["items"].(map[string]any)["properties"].(map[string]any)
+	for _, key := range []string{"evidenceVersion", "request", "runtimeHash", "producerUID", "proofName", "proofUID", "proofDigest", "runtimeReceiptDigest", "mutationReceiptDigest", "storageScopeDigest"} {
+		if refs[key] == nil {
+			t.Fatalf("v2 terminal reference schema is missing %s", key)
+		}
+	}
+	if schemaWorstBytes(schema) >= maxResponseBytes {
+		t.Fatal("v2 reference schema exceeds the evidence transport bound")
+	}
+	// Inspect an actual authority-produced proof, not merely a fabricated JSON
+	// specimen, so wire fields cannot silently disappear through schema pruning.
+	e, _, record, _ := newIndependentV2Fixture(t)
+	if err := e.reconcileFence(t.Context(), v2FenceEndpoint(), record); err != nil {
+		t.Fatal(err)
+	}
+	var encoded map[string]any
+	if err := json.Unmarshal(jsonBytes(record.Status.Proof.IndependentV2), &encoded); err != nil {
+		t.Fatal(err)
+	}
+	for key := range encoded {
+		if fields[key] == nil {
+			t.Fatalf("actual v2 field %s would be pruned", key)
+		}
+	}
 }

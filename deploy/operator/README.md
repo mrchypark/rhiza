@@ -203,11 +203,12 @@ in `e2e/chaos/` is CI-only; production runtime/storage isolation still requires 
 environment-specific executor. See the
 [execution contract and CI evidence](../../docs/automatic-recovery-design.md#kubernetes-backend-실행-계약).
 
-Dead-Pod incidents, where no supervisor can ever report an exit, can use the
-optional external attestor of `rhiza-fencer` instead. It is off unless every one
-of `RHIZA_FENCE_ATTESTOR_URL`, `RHIZA_FENCE_ATTESTOR_TOKEN_FILE` and
-`RHIZA_FENCE_ATTESTOR_CA_FILE` is set on the authority Deployment, and it grants
-the operator no node, CRI, or cloud credential. `deploy/operator/fencing/authority.yaml`
-ships the commented wiring. Without it this backend behaves exactly as before: an
-incarnation without a cooperative exit receipt stays pending. See
+Dead-Pod completion requires enrolled runtime and mutation evidence v2. Legacy
+quiet-window-only attestations are rejected by both authority and recovery
+controller; setting any `RHIZA_FENCE_ATTESTOR_*` value now fails command startup
+instead of advertising unsupported healing. The v2 reconciliation and retained
+history path has deterministic fake-provider coverage, but `rhiza-fencer serve`
+does not yet configure real runtime/mutation providers. It must not be advertised
+as production dead-Pod healing. No node, CRI or cloud credential is added to the
+operator by this change. See
 [Independent evidence](../../docs/kubernetes-fencing.md#independent-evidence-for-an-unreachable-incarnation).

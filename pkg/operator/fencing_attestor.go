@@ -201,21 +201,7 @@ func (s independentScope) attestationRequest() AttestationRequest {
 // validateIndependent accepts a proof only when its identity fields and every
 // evidence binding match the closed scope the authority itself observed.
 func validateIndependent(scope independentScope, resp *AttestationResponse) (*FenceProof, error) {
-	if resp == nil {
-		return nil, fmt.Errorf("fencing: missing attestation")
-	}
-	proof := resp.Proof
-	if proof.Independent != nil {
-		return nil, fmt.Errorf("fencing: attestor must not attach evidence")
-	}
-	if err := validateFenceProof(scope.request, &proof); err != nil {
-		return nil, err
-	}
-	if err := validateIndependentEvidence(scope, &resp.Independent); err != nil {
-		return nil, err
-	}
-	proof.Independent = &resp.Independent
-	return &proof, nil
+	return nil, fmt.Errorf("fencing: legacy quiet-window attestation cannot authorize recovery; verified per-run v2 evidence is required")
 }
 
 func validateIndependentEvidence(scope independentScope, ev *IndependentEvidence) error {

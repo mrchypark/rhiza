@@ -101,9 +101,26 @@ func independentFixture(t *testing.T) (FenceRequest, independentScope) {
 	return request, scope
 }
 
-func TestIndependentEvidenceMustBindTheClosedScope(t *testing.T) {
+// Legacy diagnostic formatting is still checked, but it is not a recovery
+// authorization, even when every v1 identity and quiet-window field matches.
+func validateLegacyDiagnostic(scope independentScope, response *AttestationResponse) (*FenceProof, error) {
+	if response == nil || response.Proof.Independent != nil {
+		return nil, errors.New("invalid diagnostic response")
+	}
+	proof := response.Proof
+	if err := validateFenceProof(scope.request, &proof); err != nil {
+		return nil, err
+	}
+	if err := validateIndependentEvidence(scope, &response.Independent); err != nil {
+		return nil, err
+	}
+	proof.Independent = &response.Independent
+	return &proof, nil
+}
+
+func TestLegacyDiagnosticEvidenceMustBindTheClosedScope(t *testing.T) {
 	_, scope := independentFixture(t)
-	proof, err := validateIndependent(scope, independentEvidenceFor(scope.attestationRequest()))
+	proof, err := validateLegacyDiagnostic(scope, independentEvidenceFor(scope.attestationRequest()))
 	if err != nil {
 		t.Fatalf("exactly bound evidence rejected: %v", err)
 	}
@@ -203,7 +220,7 @@ func TestIndependentEvidenceMustBindTheClosedScope(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			candidate := independentEvidenceFor(scope.attestationRequest())
 			change(candidate)
-			if _, err := validateIndependent(scope, candidate); err == nil {
+			if _, err := validateLegacyDiagnostic(scope, candidate); err == nil {
 				t.Fatalf("accepted evidence that does not bind the closed scope: %s", name)
 			}
 		})
@@ -363,8 +380,8 @@ func TestHTTPSAttestorRoundTripAndFailClosedResponses(t *testing.T) {
 	if idempotency != attestationKey(request) || !strings.HasPrefix(idempotency, request.Request.OperationID) || authorization != "Bearer test-bearer-token" {
 		t.Fatalf("attestation headers differ: %q %q", idempotency, authorization)
 	}
-	if _, err := validateIndependent(scope, response); err != nil {
-		t.Fatalf("round-tripped evidence rejected: %v", err)
+	if _, err := validateIndependent(scope, response); err == nil {
+		t.Fatal("round-tripped v1 diagnostics authorized recovery without terminal evidence")
 	}
 }
 
