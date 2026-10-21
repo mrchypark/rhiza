@@ -156,7 +156,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stop fencing.StopRequest
-	if message.Action == "stop" {
+	var binding fencing.BindReceipt
+	if message.Action == "bind" {
+		binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
+	} else if message.Action == "stop" {
 		var state fenceLedger
 		state, err = e.read(r.Context(), uid, message.Identity.SourceClusterID)
 		if err == nil {
@@ -174,8 +177,6 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			switch message.Action {
 			case "register":
 				return l.Register(message.Identity)
-			case "bind":
-				return l.Bind(message.Identity)
 			case "drain":
 				if message.Drain == nil || message.Drain.Request.Identity != message.Identity {
 					return fmt.Errorf("fencing: drain binding differs")
@@ -216,6 +217,8 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if message.Action == "stop" {
 		_ = json.NewEncoder(w).Encode(stop)
+	} else if message.Action == "bind" {
+		_ = json.NewEncoder(w).Encode(binding)
 	} else {
 		_, _ = w.Write([]byte("{}\n"))
 	}

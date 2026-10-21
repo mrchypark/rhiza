@@ -23,7 +23,7 @@ import (
 // termination or storage proof from Pod status or API absence.
 type Authority interface {
 	Register(context.Context, Identity) error
-	Bind(context.Context, Identity) error
+	Bind(context.Context, Identity) (BindReceipt, error)
 	Stop(context.Context, Identity) (StopRequest, error)
 	Drain(context.Context, DrainReceipt) error
 	Exit(context.Context, StopRequest) error
@@ -40,6 +40,7 @@ type Supervisor struct {
 	Command    []string
 	mu         sync.Mutex
 	bound      Identity
+	binding    *BindReceipt
 	drain      *DrainReceipt
 	ticket     string
 }
@@ -58,6 +59,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	s.Identity.RunID = hex.EncodeToString(nonce[:16])
 	s.Identity.WALIdentity = ""
 	s.bound = s.Identity
+	s.binding = nil
 	s.ticket = hex.EncodeToString(nonce[16:])
 	// Must precede listener readiness and exec. The authority can close this
 	// reservation concurrently; the child must also pass Connect and BindWAL.
@@ -341,11 +343,20 @@ func (s *Supervisor) identityRequest(ctx context.Context, path string, identity 
 		if before != s.bound || (s.bound.WALIdentity != "" && s.bound.WALIdentity != identity.WALIdentity) {
 			return nil, fmt.Errorf("fencing: binding differs")
 		}
-		if err := s.Authority.Bind(ctx, identity); err != nil {
+		receipt, err := s.Authority.Bind(ctx, identity)
+		if err != nil {
 			return nil, err
 		}
+		if err := receipt.Validate(identity); err != nil {
+			return nil, err
+		}
+		if s.binding != nil && !s.binding.SameBinding(receipt) {
+			return nil, fmt.Errorf("fencing: supervisor producer binding changed")
+		}
+		copy := receipt.clone()
+		s.binding = &copy
 		s.bound = identity
-		return nil, nil
+		return receipt, nil
 	case "/v1/stop":
 		if identity != s.bound {
 			return nil, fmt.Errorf("fencing: incarnation differs")
