@@ -99,11 +99,11 @@ func TestSupervisorSocketRestartKeepsLiveListenerAndOtherFiles(t *testing.T) {
 }
 
 func (a *sessionAuthority) Register(context.Context, Identity) error { return nil }
-func (a *sessionAuthority) Bind(_ context.Context, id Identity) error {
+func (a *sessionAuthority) Bind(_ context.Context, id Identity) (BindReceipt, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.id = id
-	return nil
+	return BindReceipt{Identity: id}, nil
 }
 func (a *sessionAuthority) Stop(_ context.Context, id Identity) (StopRequest, error) {
 	a.mu.Lock()
@@ -142,6 +142,9 @@ func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	}
 	if err := session.BindWAL(t.Context(), "wal"); err != nil {
 		t.Fatal(err)
+	}
+	if _, enabled := session.MutationBinding(); enabled {
+		t.Fatal("cooperative-only receipt enabled mutation client")
 	}
 	if err := session.BindWAL(t.Context(), "other"); err == nil {
 		t.Fatal("changed WAL accepted")

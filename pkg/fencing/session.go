@@ -19,6 +19,7 @@ type Session struct {
 	ticket   string
 	mu       sync.Mutex
 	identity Identity
+	binding  *BindReceipt
 }
 
 // Connect must complete before opening a node or performing storage mutations.
@@ -59,11 +60,31 @@ func (s *Session) BindWAL(ctx context.Context, walIdentity string) error {
 	}
 	bound := s.identity
 	bound.WALIdentity = walIdentity
-	if err := s.call(ctx, "/v1/bind", bound, nil); err != nil {
+	var receipt BindReceipt
+	if err := s.call(ctx, "/v1/bind", bound, &receipt); err != nil {
 		return err
 	}
+	if err := receipt.Validate(bound); err != nil {
+		return err
+	}
+	if s.binding != nil && !s.binding.SameBinding(receipt) {
+		return fmt.Errorf("fencing: source producer binding changed")
+	}
+	copy := receipt.clone()
+	s.binding = &copy
 	s.identity = bound
 	return nil
+}
+
+// MutationBinding returns an immutable copy of the validated journal binding.
+// Presence is not a dispatch right or proof that a source retry file is durable.
+func (s *Session) MutationBinding() (ProducerBinding, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.binding == nil || s.binding.Producer == nil {
+		return ProducerBinding{}, false
+	}
+	return *s.binding.Producer, true
 }
 
 // WaitStop waits for an immutable terminal request. A pending response is not

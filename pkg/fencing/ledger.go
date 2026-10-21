@@ -23,6 +23,8 @@ type Run struct {
 	NeverBoundExit      *StopRequest       `json:"neverBoundExit,omitempty"`
 	Runtime             *RuntimeBinding    `json:"runtime,omitempty"`
 	MutationProducerUID string             `json:"mutationProducerUID,omitempty"`
+	MutationScopeHash   string             `json:"mutationScopeHash,omitempty"`
+	MutationProfile     string             `json:"mutationProfile,omitempty"`
 	IndependentTerminal *TerminalReference `json:"independentTerminal,omitempty"`
 }
 

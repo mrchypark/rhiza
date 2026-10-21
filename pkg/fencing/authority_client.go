@@ -100,8 +100,12 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 func (a *AuthorityClient) Register(ctx context.Context, id Identity) error {
 	return a.call(ctx, AuthorityMessage{Action: "register", Identity: id}, nil)
 }
-func (a *AuthorityClient) Bind(ctx context.Context, id Identity) error {
-	return a.call(ctx, AuthorityMessage{Action: "bind", Identity: id}, nil)
+func (a *AuthorityClient) Bind(ctx context.Context, id Identity) (BindReceipt, error) {
+	var receipt BindReceipt
+	if err := a.call(ctx, AuthorityMessage{Action: "bind", Identity: id}, &receipt); err != nil {
+		return BindReceipt{}, err
+	}
+	return receipt, receipt.Validate(id)
 }
 func (a *AuthorityClient) Stop(ctx context.Context, id Identity) (StopRequest, error) {
 	var request StopRequest
