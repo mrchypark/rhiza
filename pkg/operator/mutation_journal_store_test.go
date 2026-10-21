@@ -16,15 +16,17 @@ import (
 )
 
 type mutationStoreFixture struct {
-	mu                  sync.Mutex
-	objects             map[string]object
-	version             int
-	conflicts           int
-	lostResponse        bool
-	lostArchiveResponse bool
-	archiveReads        int
-	archivePosts        int
-	archiveReadError    string
+	mu                   sync.Mutex
+	objects              map[string]object
+	version              int
+	conflicts            int
+	lostResponse         bool
+	lostArchiveResponse  bool
+	lostTerminalResponse bool
+	lostLedgerResponse   bool
+	archiveReads         int
+	archivePosts         int
+	archiveReadError     string
 }
 
 func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +89,16 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		metadata["uid"] = nested(current, "metadata", "uid")
 	}
 	f.objects[endpoint] = next
+	if strings.Contains(endpoint, "/rhiza-terminal-") && f.lostTerminalResponse {
+		f.lostTerminalResponse = false
+		w.WriteHeader(500)
+		return
+	}
+	if strings.Contains(endpoint, "/rhiza-fence-ledger-") && f.lostLedgerResponse {
+		f.lostLedgerResponse = false
+		w.WriteHeader(500)
+		return
+	}
 	if archive && f.lostArchiveResponse {
 		f.lostArchiveResponse = false
 		w.WriteHeader(500)
