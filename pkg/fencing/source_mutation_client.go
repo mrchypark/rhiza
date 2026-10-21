@@ -6,12 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 var (
-	ErrMutationExcluded = errors.New("fencing: original mutation was excluded")
-	ErrMutationRejected = errors.New("fencing: original mutation was rejected")
+	errMutationExcluded = errors.New("fencing: original mutation was excluded")
+	errMutationRejected = errors.New("fencing: original mutation was rejected")
 )
 
 // sourceMutationAuthority is deliberately narrow and internal. Implementations
@@ -43,17 +42,29 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 		return fmt.Errorf("fencing: bootstrap upload exceeds staging payload limit")
 	}
 	draft = uploadStageDraft(draft)
-	if err := validateSourceStage(sourceRetryStage{Ticket: strings.Repeat("0", 64), Draft: draft}, c.state.data.Binding.Producer.StoreScopeHash); err != nil {
-		return err
-	}
-	stage, err := c.state.reserveUpload(draft)
+	stage, step, hasStep, err := c.state.owner(draft)
 	if err != nil {
 		return err
 	}
-	if err := c.authority.ReserveUpload(ctx, stage.Ticket, stage.Draft); err != nil {
-		return err
+	if hasStep {
+		if !sameSourcePayload(step.Entry.Intent, payload) {
+			return fmt.Errorf("fencing: retry changed original upload bytes")
+		}
+		if step.Entry.Resolution != nil {
+			return c.finish(step)
+		}
+		return c.settle(ctx, step)
+	}
+	if stage.Ticket == "" {
+		stage, err = c.state.reserveUpload(draft)
+		if err != nil {
+			return err
+		}
 	}
 	if stage.Payload == nil {
+		if err := c.authority.ReserveUpload(ctx, stage.Ticket, stage.Draft); err != nil {
+			return err
+		}
 		sealed, err := c.authority.SealUpload(ctx, stage.Ticket, append([]byte(nil), payload...))
 		if err != nil {
 			return err
@@ -67,8 +78,7 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 		}
 		stage.Payload = &sealed
 	} else {
-		digest := sha256.Sum256(payload)
-		if stage.Payload.Size != int64(len(payload)) || stage.Payload.Digest != hex.EncodeToString(digest[:]) {
+		if !sameSourcePayload(MutationIntent{PayloadDigest: stage.Payload.Digest, PayloadSize: stage.Payload.Size}, payload) {
 			return fmt.Errorf("fencing: retry changed original upload bytes")
 		}
 	}
@@ -79,6 +89,11 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 		return err
 	}
 	return c.settle(ctx, step)
+}
+
+func sameSourcePayload(intent MutationIntent, payload []byte) bool {
+	digest := sha256.Sum256(payload)
+	return intent.PayloadSize == int64(len(payload)) && intent.PayloadDigest == hex.EncodeToString(digest[:])
 }
 
 func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep) error {
@@ -98,7 +113,15 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 		if archived {
 			return fmt.Errorf("fencing: archived mutation lookup omitted its result")
 		}
+		if step.Admitted {
+			return ErrPending
+		}
 		if err := c.authority.Admit(ctx, sequence, intent); err != nil {
+			if errors.Is(err, ErrMutationArchived) {
+				if persistErr := c.state.admitted(sequence, intent); persistErr != nil {
+					return persistErr
+				}
+			}
 			return err
 		}
 		if err := c.state.admitted(sequence, intent); err != nil {
@@ -112,7 +135,6 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 			return ErrPending
 		}
 	}
-	_ = archived // Found archived entries are lookup-only and never re-admitted.
 	if entry.Intent != intent {
 		return fmt.Errorf("fencing: authority result changed original intent")
 	}
@@ -122,17 +144,57 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 	if err := c.state.resolved(sequence, entry); err != nil {
 		return err
 	}
-	if err := c.state.advance(sequence, intent); err != nil {
-		return err
+	return c.finish(sourceRetryStep{Sequence: sequence, Entry: entry})
+}
+
+func (c *sourceMutationClient) finish(step sourceRetryStep) error {
+	if !step.Advanced {
+		if err := c.state.advance(step.Sequence, step.Entry.Intent); err != nil {
+			return err
+		}
 	}
-	switch entry.Resolution.Outcome {
+	switch step.Entry.Resolution.Outcome {
 	case MutationCommitted:
 		return nil
 	case MutationExcluded:
-		return ErrMutationExcluded
+		return errMutationExcluded
 	case MutationRejected:
-		return ErrMutationRejected
+		return errMutationRejected
 	default:
 		return fmt.Errorf("fencing: authority returned unknown mutation outcome")
 	}
+}
+
+// owner snapshots existing stage/step state under its mutex so callers never
+// inspect mutable retry data outside the durable-state lock.
+func (s *sourceRetryState) owner(draft MutationIntent) (sourceRetryStage, sourceRetryStep, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return sourceRetryStage{}, sourceRetryStep{}, false, err
+	}
+	var stage sourceRetryStage
+	for _, saved := range s.data.Stages {
+		if saved.Draft.OwnerStep != draft.OwnerStep {
+			continue
+		}
+		if saved.Draft != draft {
+			return sourceRetryStage{}, sourceRetryStep{}, false, fmt.Errorf("fencing: staging retry changed original target")
+		}
+		stage = cloneSourceStage(saved)
+		break
+	}
+	for _, saved := range s.data.Steps {
+		if saved.Entry.Intent.OwnerStep != draft.OwnerStep {
+			continue
+		}
+		if uploadStageDraft(saved.Entry.Intent) != draft {
+			return sourceRetryStage{}, sourceRetryStep{}, false, fmt.Errorf("fencing: retry changed original owner intent")
+		}
+		if stage.Ticket == "" {
+			return sourceRetryStage{}, sourceRetryStep{}, false, fmt.Errorf("fencing: original source staging ticket missing")
+		}
+		return stage, cloneSourceRetryStep(saved), true, nil
+	}
+	return stage, sourceRetryStep{}, false, nil
 }
