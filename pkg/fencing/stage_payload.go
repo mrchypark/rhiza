@@ -40,6 +40,15 @@ func openStagePayloadFiles(dir string) (*stagePayloadFiles, error) {
 // durable. An uncertain finalization leaves a discoverable final file; it never
 // overwrites it or silently initializes a replacement. Descriptor persistence
 // and admission remain subsequent, separate authority transactions.
+//
+// The byte budget here bounds stored bytes only. It is not a liveness bound:
+// seal imposes no deadline on input, and both the copy and the trailing EOF
+// probe can block indefinitely on a reader whose Read blocks or never returns.
+// The caller transport must bound that time itself, so the supplied reader is
+// deadline- and cancellation-aware and its reads are actually unblocked when
+// that bound expires. Cancelling a surrounding context does not by itself
+// revoke a provider operation that has already been issued; that revocation
+// remains a separate deployment contract under the pending Pro consultation.
 func (s *stagePayloadFiles) seal(ticket, digest string, size int64, input io.Reader) (sourceSealedPayload, error) {
 	if !mutationDigestValid(ticket) || !mutationDigestValid(digest) || size < 0 || size > maxStagePayloadBytes || input == nil {
 		return sourceSealedPayload{}, fmt.Errorf("fencing: invalid or oversized staging payload")
