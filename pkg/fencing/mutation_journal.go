@@ -10,6 +10,7 @@ import (
 const (
 	MaxMutationJournalEntries = 64
 	MaxMutationDispatches     = 16
+	MutationIntentVersion     = 1
 )
 
 type MutationPhase string
@@ -28,12 +29,41 @@ const (
 	MutationExcluded  MutationOutcome = "FutureEffectExcluded"
 )
 
+type MutationConditionMode string
+
+const (
+	MutationUnconditional   MutationConditionMode = "Unconditional"
+	MutationCreateOnly      MutationConditionMode = "CreateOnly"
+	MutationMatchGeneration MutationConditionMode = "MatchGeneration"
+)
+
+// MutationCondition is the caller's original selection, not a condition chosen
+// later by an executor while resolving an uncertain request.
+type MutationCondition struct {
+	Mode       MutationConditionMode `json:"mode"`
+	Generation int64                 `json:"generation,omitempty"`
+}
+
+// MutationOwnerStep correlates accepted work with a durable caller workflow.
+// It does not replace the structural producer-UID/sequence request identity.
+type MutationOwnerStep struct {
+	Owner    string `json:"owner"`
+	Workflow string `json:"workflow"`
+	Step     string `json:"step"`
+	Attempt  uint64 `json:"attempt"`
+}
+
 type MutationIntent struct {
-	OperationID   string `json:"operationID"`
-	Kind          string `json:"kind"`
-	Key           string `json:"key"`
-	PayloadRef    string `json:"payloadRef,omitempty"`
-	PayloadDigest string `json:"payloadDigest,omitempty"`
+	ContractVersion int               `json:"contractVersion"`
+	StoreScopeHash  string            `json:"storeScopeHash"`
+	OwnerStep       MutationOwnerStep `json:"ownerStep"`
+	Condition       MutationCondition `json:"condition"`
+	OperationID     string            `json:"operationID"`
+	Kind            string            `json:"kind"`
+	Key             string            `json:"key"`
+	PayloadRef      string            `json:"payloadRef,omitempty"`
+	PayloadDigest   string            `json:"payloadDigest,omitempty"`
+	PayloadSize     int64             `json:"payloadSize"`
 }
 
 // MutationPreparation is the one immutable descriptor authorized to execute.
@@ -259,13 +289,29 @@ func (p *MutationProducer) Admit(sequence uint64, intent MutationIntent) error {
 }
 
 func validateMutationIntent(intent MutationIntent) error {
-	if intent.OperationID == "" || intent.Key == "" || (intent.Kind != "upload" && intent.Kind != "delete") {
+	if intent.ContractVersion != MutationIntentVersion || !mutationDigestValid(intent.StoreScopeHash) || intent.OperationID == "" || len(intent.OperationID) > 256 || intent.Key == "" || len(intent.Key) > 1024 || (intent.Kind != "upload" && intent.Kind != "delete") {
 		return fmt.Errorf("fencing: mutation intent is incomplete")
 	}
-	if intent.Kind == "upload" && (intent.PayloadRef == "" || !mutationDigestValid(intent.PayloadDigest)) {
+	owner := intent.OwnerStep
+	if owner.Owner == "" || len(owner.Owner) > 128 || owner.Workflow == "" || len(owner.Workflow) > 128 || owner.Step == "" || len(owner.Step) > 128 || owner.Attempt == 0 {
+		return fmt.Errorf("fencing: bounded durable owner step is required")
+	}
+	switch intent.Condition.Mode {
+	case MutationUnconditional, MutationCreateOnly:
+		if intent.Condition.Generation != 0 || intent.Kind == "delete" {
+			return fmt.Errorf("fencing: deletion requires its selected generation")
+		}
+	case MutationMatchGeneration:
+		if intent.Condition.Generation <= 0 {
+			return fmt.Errorf("fencing: exact selected generation is required")
+		}
+	default:
+		return fmt.Errorf("fencing: original mutation condition is required")
+	}
+	if intent.Kind == "upload" && (intent.PayloadRef == "" || len(intent.PayloadRef) > 1024 || !mutationDigestValid(intent.PayloadDigest) || intent.PayloadSize < 0) {
 		return fmt.Errorf("fencing: immutable staged payload is required")
 	}
-	if intent.Kind == "delete" && (intent.PayloadRef != "" || intent.PayloadDigest != "") {
+	if intent.Kind == "delete" && (intent.PayloadRef != "" || intent.PayloadDigest != "" || intent.PayloadSize != 0) {
 		return fmt.Errorf("fencing: deletion cannot carry a payload")
 	}
 	return nil
@@ -314,6 +360,12 @@ func (p *MutationProducer) Prepare(sequence uint64, prepared MutationPreparation
 func validateMutationPreparation(intent MutationIntent, prepared MutationPreparation) error {
 	if !prepared.GenerationSet || prepared.Generation < 0 || !mutationDigestValid(prepared.StoreScopeHash) {
 		return fmt.Errorf("fencing: fixed storage preconditions are required")
+	}
+	if prepared.StoreScopeHash != intent.StoreScopeHash {
+		return fmt.Errorf("fencing: preparation changed the caller storage scope")
+	}
+	if intent.Condition.Mode == MutationCreateOnly && prepared.Generation != 0 || intent.Condition.Mode == MutationMatchGeneration && prepared.Generation != intent.Condition.Generation {
+		return fmt.Errorf("fencing: preparation changed the original mutation condition")
 	}
 	if prepared.Profile != "gcs-json-v1" && prepared.Profile != "gcs-resumable-v1" {
 		return fmt.Errorf("fencing: unsupported mutation profile")

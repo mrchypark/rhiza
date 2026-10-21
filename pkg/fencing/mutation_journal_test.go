@@ -26,7 +26,10 @@ func newJournalProducer(t *testing.T, run string) *MutationProducer {
 }
 
 func journalUpload(operation string) MutationIntent {
-	return MutationIntent{OperationID: operation, Kind: "upload", Key: "source/object", PayloadRef: "staged/" + operation, PayloadDigest: journalTestDigest}
+	return MutationIntent{ContractVersion: MutationIntentVersion, StoreScopeHash: journalTestDigest,
+		OwnerStep: MutationOwnerStep{Owner: "test", Workflow: "publication", Step: operation, Attempt: 1},
+		Condition: MutationCondition{Mode: MutationUnconditional}, OperationID: operation,
+		Kind: "upload", Key: "source/object", PayloadRef: "staged/" + operation, PayloadDigest: journalTestDigest, PayloadSize: 1}
 }
 
 func journalPreparation(generation int64) MutationPreparation {
