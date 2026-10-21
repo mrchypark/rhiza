@@ -16,13 +16,13 @@ func mutationLookupFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixtur
 		t.Fatal(err)
 	}
 	scope := strings.Repeat("a", 64)
+	id.WALIdentity = "wal"
 	if _, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
 		return l.BindMutationScope(id, scope, fencing.MutationExecutionProfile)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	activateStoredProducer(t, e, id, runtime)
-	id.WALIdentity = "wal"
 	run, err := e.enrolledMutationRun(t.Context(), runtime)
 	if err != nil {
 		t.Fatal(err)
