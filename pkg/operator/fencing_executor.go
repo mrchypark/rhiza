@@ -27,9 +27,9 @@ const fencingCredentialAnnotation = "rhiza.mrchypark.dev/fencing-credential-uid"
 // separate from the operator and application accounts. Applications may request
 // only transitions for their TokenReview-authenticated Pod incarnation.
 //
-// Attestor is optional external evidence for an incarnation no supervisor can
-// report on. It is consulted only after the cooperative ledger is durably closed
-// and only when the cooperative proof is still incomplete.
+// Independent completion uses enrolled runtime/mutation evidence v2 after the
+// cooperative ledger is durably closed. The legacy Attestor transport is retained
+// for diagnostics, never as an alternative recovery authorization.
 type FencingExecutor struct {
 	Kube     *Kubernetes
 	Attestor FenceAttestor
@@ -39,6 +39,9 @@ type FencingExecutor struct {
 	// The trusted runtime provider must verify the complete enrolled incarnation
 	// and original closure, including descendants and prevention of its return.
 	VerifyRuntimeEvidence func(context.Context, fencing.RuntimeBinding, fencing.StopRequest, []byte) error
+	// Only a trusted runtime/power provider can collect a terminal receipt. A
+	// missing or unreachable provider leaves the operation pending.
+	CollectRuntimeEvidence func(context.Context, fencing.RuntimeBinding, fencing.StopRequest) ([]byte, error)
 }
 
 type fenceLedger struct {
@@ -478,6 +481,18 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 	if !state.Ledger.CompleteNodes(r.OperationID, hash, nodes, current) {
 		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
 	}
+	// A clean source-process drain does not settle work already admitted to the
+	// survivor-held mutation authority. The v2 profile cannot bypass that barrier
+	// by completing through the cooperative branch instead.
+	if state.Ledger.RequireMutationJournal {
+		settled, err := e.closeMutationProducers(ctx, state, nodes)
+		if err != nil {
+			return err
+		}
+		if !settled {
+			return ErrFencePending
+		}
+	}
 	proof := &FenceProof{OperationID: r.OperationID, SourceClusterID: r.SourceClusterID, BindingUID: r.BindingUID, RequestHash: hash, ProofID: "cooperative-" + hashJSON(state), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
 	record.Status.Proof = proof
 	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
@@ -543,46 +558,4 @@ func (e *FencingExecutor) storageScope(ctx context.Context, sts object, source s
 		return scope, fmt.Errorf("fencing: workload object store is not a shared store")
 	}
 	return scope, nil
-}
-
-// independentFence asks the configured attestor to prove that the exact closed
-// incarnation is terminally gone. Every other outcome leaves the fence pending:
-// no attestor, an unverifiable response, a ledger that moved during attestation,
-// or a Pod inventory that changed. Pod absence, a DELETE response and a failed
-// probe are never accepted as termination proof.
-func (e *FencingExecutor) independentFence(ctx context.Context, endpoint string, record *fenceResource, r FenceRequest, sts object, state fenceLedger, hash string, nodes, current []string) error {
-	if e.Attestor == nil {
-		return ErrFencePending
-	}
-	storage, err := e.storageScope(ctx, sts, r.SourceClusterID)
-	if err != nil {
-		return err
-	}
-	scope, err := buildIndependentScope(state, r, nodes, hash, e.ledgerHash(state), current, storage)
-	if err != nil {
-		return ErrFencePending
-	}
-	response, err := e.Attestor.Attest(ctx, scope.attestationRequest())
-	if err != nil {
-		return err
-	}
-	proof, err := validateIndependent(scope, response)
-	if err != nil {
-		return ErrFencePending
-	}
-	// Evidence is only valid for the ledger and Pod inventory it was issued
-	// against. Never persist a proof that went stale while the attestor worked.
-	rechecked, err := e.read(ctx, state.StatefulSetUID, state.Ledger.SourceClusterID)
-	if err != nil {
-		return err
-	}
-	again, err := e.currentInventory(ctx, r.StatefulSetUID, nodes)
-	if err != nil {
-		return err
-	}
-	if e.ledgerHash(rechecked) != scope.ledgerHash || !sameStrings(again, current) {
-		return ErrFencePending
-	}
-	record.Status.Proof = proof
-	return e.Kube.Put(ctx, endpoint+"/"+url.PathEscape(str(record.Metadata["name"]))+"/status", record, nil)
 }

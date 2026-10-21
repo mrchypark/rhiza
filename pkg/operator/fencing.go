@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
 // ErrFencePending is returned when the fencing service accepts
@@ -88,7 +90,19 @@ type FenceProof struct {
 	// this exact closed operation. It is additive: it never replaces the
 	// cooperative ledger, and the authority attaches it only after validating
 	// every binding against that ledger.
-	Independent *IndependentEvidence `json:"independent,omitempty"`
+	Independent   *IndependentEvidence   `json:"independent,omitempty"`
+	IndependentV2 *IndependentEvidenceV2 `json:"independentV2,omitempty"`
+}
+
+// IndependentEvidenceV2 refers to evidence verified and retained by the authority,
+// not stability observations supplied by a workload or external HTTP response.
+type IndependentEvidenceV2 struct {
+	Version        int                         `json:"version"`
+	RequestHash    string                      `json:"requestHash"`
+	LedgerHash     string                      `json:"ledgerHash"`
+	StorageScope   AttestationStoreScope       `json:"storageScope"`
+	CurrentPodUIDs []string                    `json:"currentPodUIDs"`
+	Terminals      []fencing.TerminalReference `json:"terminals"`
 }
 
 // independentEvidenceVersion is the only supported evidence schema.
@@ -243,7 +257,9 @@ type FencingClient struct {
 	Client    *http.Client
 }
 
-const maxResponseBytes = 64 * 1024
+// A 64-run v2 proof carries immutable references, not just three booleans.
+// Keep the bound finite while accommodating the complete supported cohort.
+const maxResponseBytes = 512 * 1024
 
 const maxFenceTimeout = 10 * time.Second
 
@@ -414,6 +430,20 @@ func validateFenceProof(req FenceRequest, proof *FenceProof) error {
 	}
 	if !proof.ProcessesTerminated || !proof.RecreationBlocked || !proof.StorageQuiesced {
 		return fmt.Errorf("fencing: proof booleans incomplete")
+	}
+	if proof.Independent != nil {
+		return fmt.Errorf("fencing: quiet-window independent evidence v1 cannot authorize recovery")
+	}
+	if strings.HasPrefix(proof.ProofID, "independent-v2-") && proof.IndependentV2 == nil {
+		return fmt.Errorf("fencing: independent v2 evidence was omitted or pruned")
+	}
+	if proof.IndependentV2 != nil {
+		if proof.ProofID != "independent-v2-"+hashJSON(proof.IndependentV2) {
+			return fmt.Errorf("fencing: independent v2 proof identity differs from its evidence")
+		}
+		if err := validateIndependentV2(req, proof.IndependentV2); err != nil {
+			return err
+		}
 	}
 	return nil
 }

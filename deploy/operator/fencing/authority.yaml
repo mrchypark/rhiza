@@ -111,16 +111,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            # Independent evidence for a dead incarnation is opt-in. Uncomment all
-            # three values, the matching projected token and CA volumes below, and
-            # point the URL at the attestor service. All three values are required
-            # together; a partial configuration fails startup.
-            # - name: RHIZA_FENCE_ATTESTOR_URL
-            #   value: https://rhiza-fence-attestor.rhiza.svc:9443/v1/attest
-            # - name: RHIZA_FENCE_ATTESTOR_TOKEN_FILE
-            #   value: /var/run/secrets/rhiza-fence-attestor/token
-            # - name: RHIZA_FENCE_ATTESTOR_CA_FILE
-            #   value: /var/run/secrets/rhiza-fence-attestor-ca/ca.crt
+            # Legacy RHIZA_FENCE_ATTESTOR_* settings are rejected at startup.
+            # Independent healing needs reviewed v2 runtime/mutation providers;
+            # this cooperative-only Deployment does not configure them yet.
           ports:
             - name: https
               containerPort: 9444
@@ -133,12 +126,6 @@ spec:
             - name: tls
               mountPath: /tls
               readOnly: true
-            # - name: attestor-token
-            #   mountPath: /var/run/secrets/rhiza-fence-attestor
-            #   readOnly: true
-            # - name: attestor-ca
-            #   mountPath: /var/run/secrets/rhiza-fence-attestor-ca
-            #   readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -149,15 +136,3 @@ spec:
         - name: tls
           secret:
             secretName: rhiza-fencer-tls
-        # The attestor token must be audience-bound and short-lived, like the
-        # supervisor token; the CA bundle pins the attestor identity.
-        # - name: attestor-token
-        #   projected:
-        #     sources:
-        #       - serviceAccountToken:
-        #           path: token
-        #           audience: rhiza-fence-attestor
-        #           expirationSeconds: 600
-        # - name: attestor-ca
-        #   configMap:
-        #     name: rhiza-fence-attestor-ca

@@ -2,8 +2,10 @@
 
 Tracking: [issue #246](https://github.com/mrchypark/rhiza/issues/246).
 Review: [complete Pro response](reviews/2026-10-21-dead-pod-autohealing-pro.md).
-Status: partial implementation; three end-to-end regressions still reproduce
-the existing gaps. This document is not qualification evidence.
+Status: partial implementation. Original red receipts are preserved; the three
+authority-level regressions now pass after v2 rejection and actual retained-history
+composition were connected to reconciliation using test providers. This document
+is not Kubernetes/GCS/Chaos qualification evidence.
 
 ## Implemented foundation (not yet wired to writer admission)
 
@@ -65,14 +67,30 @@ including across executor restart. The policy is not yet selected in production.
 Wire the
 trusted provider worker, durable staged payloads, globally serialized per-key
 dispatch and verified all-copy evidence. No storage bypass, terminal-reference,
-CRI-runtime termination, or positive dead-Pod recovery claim is made here.
+CRI-runtime termination, or positive dead-Pod recovery qualification claim is made here.
 
 `pkg/fencing/terminal_reference.go` separately preserves immutable per-run terminal
 references for the verified evidence-v2 path. References remain bound to the original
 voter closure, runtime, producer UID, object UID/digest and storage scope across a
 later generation closure. They cannot manufacture a cooperative drain/exit record.
-The v2 verifier, immutable artifact loader and history composition are not wired yet;
-the original retired-voter end-to-end regression is therefore still unresolved.
+`pkg/operator/terminal_evidence_store.go` now persists and verifies the immutable
+artifacts. `pkg/operator/fencing_independent_v2.go` connects retained history and
+trusted runtime collection to the actual reconciliation path. It derives every
+run from the frozen ledger, including historical runs absent from current targets.
+The CRD carries bounded v2 references. The authority and recovery controller reject
+v1 authorization; a normal cooperative drain under the new journal profile also
+requires settlement of authority-held work. Legacy attestor command settings fail
+startup instead of implying a working v2 provider.
+
+The original historical-voter regression now exercises a real fake-API voter proof,
+executor restart, continued survivor admission and later generation proof containing
+both original references. The collector for the retired runtime deliberately becomes
+unreachable; its original immutable receipt is reused and reverified, not recollected
+or silently dropped. Same-Pod multi-runtime and stale-inventory regressions are also
+covered. All these tests inject test runtime verifiers; the shipped command still
+does not configure real CRI/mutation providers. Enforced source routing, runtime
+service deployment, bounded history beyond one 64-reference proof, independent
+review and live positive qualification remain unfinished.
 
 ## Acceptance contract
 
@@ -90,7 +108,7 @@ unsupported capabilities; their Pending state is not a completion pass.
 
 1. Reproduce the three findings without cloud credentials. Preserve original
    failures. The parent owns current integration while the requested MiniMax
-   provider is not returning its pending review.
+   route is unavailable; no live implementation/review worker is claimed.
 2. Define evidence v2 and the mutation-barrier API. Reject quiet-only independent
    authorization. Do not present the version change alone as healed workloads.
 3. Enroll immutable runtime identities before admitting any writers; preserve

@@ -2,9 +2,10 @@
 
 This implements the retention boundary required by the [original Pro review](reviews/2026-10-21-dead-pod-autohealing-pro.md)
 for [issue #246](https://github.com/mrchypark/rhiza/issues/246). It is **not**
-production dead-Pod healing qualification. The v2 attestation consumer, real
-runtime provider, authenticated mutation routing, and live qualification remain
-unfinished. No application-facing endpoint or default authorization is added.
+production dead-Pod healing qualification. The v2 reconciliation consumer is now
+connected through `pkg/operator/fencing_independent_v2.go`; real runtime providers,
+authenticated mutation routing, and live qualification remain unfinished. No
+application-facing endpoint or default production runtime provider is added.
 
 `pkg/operator/terminal_evidence_store.go` retains one closed run's original stop
 request, complete runtime enrollment, pinned mutation producer UID, exact store
@@ -37,8 +38,8 @@ completed cursor. The cursor is additionally bound to the exact terminal artifac
 
 The original voter stop binding survives later generation closure. Retention does
 not set `Run.Exited`, synthesize a cooperative drain, clear the run, or make the
-cooperative `Ledger.Complete` predicate true. A future v2 consumer must include
-and verify every historical run, not skip runs lacking current Pod targets.
+cooperative `Ledger.Complete` predicate true. The v2 consumer includes and verifies
+every historical run, not merely those matching current Pod targets.
 
 ## Deterministic coverage
 

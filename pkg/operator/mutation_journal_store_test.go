@@ -27,6 +27,7 @@ type mutationStoreFixture struct {
 	archiveReads         int
 	archivePosts         int
 	archiveReadError     string
+	statusWrites         int
 }
 
 func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +56,12 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 	var next object
 	if json.NewDecoder(r.Body).Decode(&next) != nil {
 		w.WriteHeader(400)
+		return
+	}
+	if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/status") {
+		f.objects[r.URL.Path] = next
+		f.statusWrites++
+		w.WriteHeader(200)
 		return
 	}
 	endpoint := r.URL.Path
