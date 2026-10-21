@@ -18,6 +18,21 @@ type MutationArchiveReference struct {
 	Digest string `json:"digest"`
 }
 
+// MutationArchiveScan is a trusted backend's resumable verification position,
+// bound to one exact archive head and fencing operation. A completed cursor is
+// not authority to trust a new head or a new operation's history automatically.
+type MutationArchiveScan struct {
+	VerificationID string                    `json:"verificationID"`
+	Head           MutationArchiveReference  `json:"head"`
+	Next           *MutationArchiveReference `json:"next,omitempty"`
+	Through        uint64                    `json:"through"`
+	Links          uint64                    `json:"links"`
+	Sought         *MutationArchiveReference `json:"sought,omitempty"`
+	Found          bool                      `json:"found,omitempty"`
+	Sequence       uint64                    `json:"sequence,omitempty"`
+	ResultArchive  *MutationArchiveReference `json:"resultArchive,omitempty"`
+}
+
 func MutationArchiveName(digest string) string {
 	return "rhiza-mutation-archive-" + digest[:min(len(digest), 40)]
 }
@@ -79,6 +94,9 @@ func (p *MutationProducer) PlanMutationCompaction(producerUID string, through ui
 	if err := p.Validate(); err != nil {
 		return MutationCompactionPlan{}, err
 	}
+	if p.EvidenceFault != "" {
+		return MutationCompactionPlan{}, ErrUnavailable
+	}
 	if through <= p.CompactedThrough || through > p.LastAdmitted {
 		return MutationCompactionPlan{}, fmt.Errorf("fencing: archive range is outside live journal")
 	}
@@ -107,6 +125,9 @@ func (p *MutationProducer) CommitMutationCompaction(producerUID string, plan Mut
 	if err := p.Validate(); err != nil {
 		return err
 	}
+	if p.EvidenceFault != "" {
+		return ErrUnavailable
+	}
 	if err := plan.Validate(); err != nil {
 		return err
 	}
@@ -133,6 +154,7 @@ func (p *MutationProducer) CommitMutationCompaction(producerUID string, plan Mut
 	p.CompactedThrough = plan.Through
 	copy := reference
 	p.ArchiveHead = &copy
+	p.ArchiveScan = nil
 	return nil
 }
 

@@ -44,17 +44,17 @@ func (e *FencingExecutor) enrolledMutationRun(ctx context.Context, runtime fenci
 // state from absence. If root closure already happened, create the deterministic
 // missing producer directly Closed so a delayed initializer cannot reopen it.
 func (e *FencingExecutor) reserveMutationProducer(ctx context.Context, runtime fencing.RuntimeBinding) (fencing.MutationProducer, error) {
-	return e.mutateProducer(ctx, runtime, true, func(*fencing.MutationProducer) error { return nil })
+	return e.mutateProducer(ctx, runtime, true, false, func(*fencing.MutationProducer) error { return nil })
 }
 
 // changeMutationProducer never recreates missing state. The transition is pure;
 // storage/execution side effects cannot be performed inside this CAS callback.
 // On uncertain response loss, callers retry the same operation identity.
 func (e *FencingExecutor) changeMutationProducer(ctx context.Context, runtime fencing.RuntimeBinding, transition func(*fencing.MutationProducer) error) (fencing.MutationProducer, error) {
-	return e.mutateProducer(ctx, runtime, false, transition)
+	return e.mutateProducer(ctx, runtime, false, false, transition)
 }
 
-func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.RuntimeBinding, allowCreate bool, transition func(*fencing.MutationProducer) error) (fencing.MutationProducer, error) {
+func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.RuntimeBinding, allowCreate, latchingEvidenceFault bool, transition func(*fencing.MutationProducer) error) (fencing.MutationProducer, error) {
 	endpoint := e.mutationProducerPath(runtime)
 	for range 8 {
 		run, err := e.enrolledMutationRun(ctx, runtime)
@@ -113,6 +113,15 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 		if producer.Runtime != runtime || (producer.WALIdentity != "" && producer.WALIdentity != run.Identity.WALIdentity) {
 			return producer, fmt.Errorf("fencing: stored mutation producer WAL differs from root")
 		}
+		previousHead := hashJSON(producer.ArchiveHead)
+		if !latchingEvidenceFault {
+			if producer.EvidenceFault != "" {
+				return producer, fencing.ErrUnavailable
+			}
+			if err := e.checkMutationArchiveHead(ctx, runtime, run.MutationProducerUID, producer); err != nil {
+				return producer, err
+			}
+		}
 		if run.Stop != nil && producer.Phase != fencing.MutationClosed {
 			if err := producer.Close(run.Stop.OperationID, run.Stop.RequestHash); err != nil {
 				return producer, err
@@ -126,6 +135,11 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 		}
 		if err := producer.Validate(); err != nil {
 			return producer, err
+		}
+		if !latchingEvidenceFault && previousHead != hashJSON(producer.ArchiveHead) {
+			if err := e.validateMutationArchiveHead(ctx, runtime, run.MutationProducerUID, producer); err != nil {
+				return producer, err
+			}
 		}
 		data, err := json.Marshal(producer)
 		if err != nil {
@@ -184,9 +198,17 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 		}
 		if producer.Phase != fencing.MutationClosed || !producer.BarrierComplete() {
 			complete = false
+		} else if err := e.verifyMutationArchiveReceipts(ctx, fencing.MutationCompactionPlan{Runtime: *run.Runtime, Entries: producer.Entries}); err != nil {
+			return false, e.mutationArchiveFailure(ctx, *run.Runtime, err)
 		}
 		if producer.CompactedThrough != 0 {
-			return false, fmt.Errorf("fencing: compacted barrier requires storage-backed archive verification")
+			verified, err := e.verifyMutationArchiveHistory(ctx, *run.Runtime, hashJSON([]any{state.StatefulSetUID, state.Ledger.ClosedBy, state.Ledger.ClosedHash, state.Ledger.ClosedNodes, nodes}), 32)
+			if err != nil {
+				return false, err
+			}
+			if !verified {
+				complete = false
+			}
 		}
 	}
 	return complete, nil

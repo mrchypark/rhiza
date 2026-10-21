@@ -33,6 +33,9 @@ const fencingCredentialAnnotation = "rhiza.mrchypark.dev/fencing-credential-uid"
 type FencingExecutor struct {
 	Kube     *Kubernetes
 	Attestor FenceAttestor
+	// Prepared work needs trusted receipt/session verification, not just valid
+	// digest strings. A missing provider verifier cannot qualify archived work.
+	VerifyMutationEvidence func(context.Context, fencing.RuntimeBinding, uint64, fencing.MutationEntry) error
 }
 
 type fenceLedger struct {

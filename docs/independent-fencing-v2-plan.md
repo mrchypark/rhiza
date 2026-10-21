@@ -34,9 +34,25 @@ references and producer UID/sequence request identities. Commit rejects overlapp
 stale plans, preserves unrelated tail/closure state, and rejects all executable
 operations at or below the watermark. A 1,024-cycle JSON reload regression retains
 4,096 operations' archive coverage while keeping the live value bounded.
-The archive persistence/verified-chain backend is not yet implemented; the existing
-backend explicitly refuses compacted-barrier authorization instead of trusting a
-watermark alone. Therefore this is not a sustained-write deployment profile yet.
+The backend now persists immutable ConfigMap archives, verifies content-addressed
+data plus server-assigned UID, and checks the pinned head on ordinary updates.
+Full history verification advances in bounded batches with a producer-CAS cursor;
+executor restart resumes it, while a new head or fencing operation resets it.
+Confirmed archive loss/replacement/corruption is latched; transient API failure is
+not automatically permanent corruption. Head-only admission does not detect
+arbitrary ancestor loss: each new fence verifies the full retained chain, and
+archives must not be deleted outside this protocol.
+
+Compaction response loss is resolved only by finding the exact archive UID/digest
+in the committed chain, not merely a larger watermark. Archived-result lookup
+requires the original producer UID/sequence and full immutable intent; it preserves
+Committed/Rejected/Excluded outcomes and grants no executable admission.
+Prepared entries require the trusted provider receipt/session verifier at archive
+creation, history verification and final live-entry authorization. Missing verifier
+configuration refuses qualification; digest syntax alone is not evidence. The real
+provider verifier, payload staging and source-routing integration remain missing,
+so this is not yet a sustained-write deployment profile. Retention bounds the live
+value, not total archive storage; no automatic evidence deletion was introduced.
 
 Dispatch rights are registered before workers may send requests. All-copy completion
 requires sealed permission admission and terminal evidence for every granted right,
