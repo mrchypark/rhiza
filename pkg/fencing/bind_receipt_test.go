@@ -87,6 +87,27 @@ func TestSessionBindingLostResponseAndChangedProducer(t *testing.T) {
 	}
 }
 
+func TestSessionBindRejectsLegacyEmptyResponse(t *testing.T) {
+	start := testProducerReceipt().Identity
+	start.WALIdentity = ""
+	for _, body := range []string{"", "{}"} {
+		t.Run(body, func(t *testing.T) {
+			s := &Session{identity: start, client: &http.Client{Transport: sessionRoundTrip(func(*http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}}
+			if err := s.BindWAL(t.Context(), "wal"); err == nil {
+				t.Fatal("empty legacy response enabled WAL binding")
+			}
+			if s.Identity() != start {
+				t.Fatal("rejected response changed identity")
+			}
+			if _, enabled := s.MutationBinding(); enabled {
+				t.Fatal("rejected response enabled mutation client")
+			}
+		})
+	}
+}
+
 func TestProducerScopeCannotBeRefreshedAfterBinding(t *testing.T) {
 	id := testIdentity()
 	id.WALIdentity = ""
