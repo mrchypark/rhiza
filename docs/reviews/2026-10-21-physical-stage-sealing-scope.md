@@ -18,6 +18,15 @@ links a final ticket-specific name without replacement, and syncs the directory
 before returning a descriptor. A concurrent finalizer must verify the winner's
 actual bytes; read-only file permissions alone are not a fencing mechanism.
 
+That byte bound is a bound on stored bytes only, not a liveness bound. `seal`
+sets no deadline on the supplied reader, and both the copy and the trailing
+EOF probe can block indefinitely when a read blocks or never returns. The caller
+transport must bound that time itself: the reader passed in has to be
+deadline- and cancellation-aware, and its reads have to be actually unblocked
+when that bound expires. Cancelling a surrounding context does not by itself
+revoke a provider operation that has already been issued; that revocation is a
+separate deployment contract and stays under the pending Pro consultation.
+
 An uncertain directory sync can leave a final file with no returned descriptor.
 Lookup-only recovery verifies the exact length/hash and re-establishes both sync
 barriers. It does not receive replacement bytes. A previously sealed ticket must
