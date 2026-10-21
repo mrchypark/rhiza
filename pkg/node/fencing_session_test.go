@@ -73,7 +73,18 @@ func TestFenceWatcherKeepsEngineAliveAcrossActualSessionOutage(t *testing.T) {
 				case "/v1/startup":
 					_ = json.NewEncoder(w).Encode(identity)
 				case "/v1/bind":
-					w.WriteHeader(http.StatusOK)
+					var bound fencing.Identity
+					if err := json.NewDecoder(r.Body).Decode(&bound); err != nil {
+						http.Error(w, "invalid identity", http.StatusBadRequest)
+						return
+					}
+					want := identity
+					want.WALIdentity = "wal"
+					if bound != want {
+						http.Error(w, "binding differs", http.StatusForbidden)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(fencing.BindReceipt{Identity: bound})
 				case "/v1/stop":
 					stopCalls.Add(1)
 					if unavailable.Load() {
@@ -102,6 +113,9 @@ func TestFenceWatcherKeepsEngineAliveAcrossActualSessionOutage(t *testing.T) {
 			}
 			if err = session.BindWAL(ctx, "wal"); err != nil {
 				t.Fatal(err)
+			}
+			if _, enabled := session.MutationBinding(); enabled {
+				t.Fatal("cooperative fixture enabled mutation client")
 			}
 			if fault == "503" {
 				unavailable.Store(true)
