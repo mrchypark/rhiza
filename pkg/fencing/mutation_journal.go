@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 )
 
 const (
@@ -461,6 +462,24 @@ func (p *MutationProducer) validateResolution(sequence uint64, entry MutationEnt
 	default:
 		return fmt.Errorf("fencing: mutation outcome is unresolved")
 	}
+	return nil
+}
+
+// AdmitAndCancel consumes an allocated sequence without granting execution. The
+// authority must persist this composed transition in one producer CAS.
+func (p *MutationProducer) AdmitAndCancel(sequence uint64, intent MutationIntent, receiptDigest string) error {
+	if p == nil {
+		return fmt.Errorf("fencing: missing mutation producer")
+	}
+	next := *p
+	next.Entries = maps.Clone(p.Entries)
+	if err := next.Admit(sequence, intent); err != nil {
+		return err
+	}
+	if err := next.CancelUnprepared(sequence, receiptDigest); err != nil {
+		return err
+	}
+	*p = next
 	return nil
 }
 
