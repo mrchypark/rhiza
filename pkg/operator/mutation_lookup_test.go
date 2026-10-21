@@ -47,6 +47,7 @@ func TestMutationLookupAuthenticatedHTTPReturnsLiveEntryWithoutWrite(t *testing.
 	asObject(pod["metadata"])["name"] = id.NodeID
 	asObject(pod["metadata"])["uid"] = id.PodUID
 	asObject(pod["metadata"])["ownerReferences"] = []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": "sts", "controller": true}}
+	asObject(list(nested(pod, "spec", "containers"))[0])["env"] = []any{object{"name": "RHIZA_CLUSTER_ID", "value": "source"}}
 	sts := object{"metadata": object{"uid": "sts"}, "spec": object{"template": object{"spec": object{"containers": []any{object{"name": "rhiza", "env": []any{object{"name": "RHIZA_CLUSTER_ID", "value": "source"}}}}}}}}
 	f.mu.Lock()
 	f.authPod, f.authStatefulSet = pod, sts
