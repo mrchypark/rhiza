@@ -16,11 +16,15 @@ import (
 )
 
 type mutationStoreFixture struct {
-	mu           sync.Mutex
-	objects      map[string]object
-	version      int
-	conflicts    int
-	lostResponse bool
+	mu                  sync.Mutex
+	objects             map[string]object
+	version             int
+	conflicts           int
+	lostResponse        bool
+	lostArchiveResponse bool
+	archiveReads        int
+	archivePosts        int
+	archiveReadError    string
 }
 
 func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
@@ -28,6 +32,13 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	current := f.objects[r.URL.Path]
 	if r.Method == http.MethodGet {
+		if strings.Contains(r.URL.Path, "/rhiza-mutation-archive-") {
+			f.archiveReads++
+			if f.archiveReadError == r.URL.Path {
+				w.WriteHeader(503)
+				return
+			}
+		}
 		if current == nil {
 			w.WriteHeader(404)
 			return
@@ -50,13 +61,21 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		current = f.objects[endpoint]
 	}
 	producer := strings.Contains(endpoint, "/rhiza-mutations-")
+	archive := strings.Contains(endpoint, "/rhiza-mutation-archive-")
+	if archive && r.Method == http.MethodPost {
+		f.archivePosts++
+	}
 	if producer && f.conflicts > 0 {
 		f.conflicts--
 		w.WriteHeader(409)
 		return
 	}
-	if (r.Method == http.MethodPost && current != nil) || (r.Method == http.MethodPut && (current == nil || str(nested(next, "metadata", "resourceVersion")) != str(nested(current, "metadata", "resourceVersion")))) {
+	if (r.Method == http.MethodPost && current != nil) || (r.Method == http.MethodPut && (current == nil || str(nested(next, "metadata", "resourceVersion")) != str(nested(current, "metadata", "resourceVersion")) || str(nested(next, "metadata", "uid")) != str(nested(current, "metadata", "uid")))) {
 		w.WriteHeader(409)
+		return
+	}
+	if current != nil && current["immutable"] == true && (next["immutable"] != true || hashJSON(next["data"]) != hashJSON(current["data"]) || hashJSON(next["binaryData"]) != hashJSON(current["binaryData"])) {
+		w.WriteHeader(422)
 		return
 	}
 	f.version++
@@ -68,6 +87,11 @@ func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 		metadata["uid"] = nested(current, "metadata", "uid")
 	}
 	f.objects[endpoint] = next
+	if archive && f.lostArchiveResponse {
+		f.lostArchiveResponse = false
+		w.WriteHeader(500)
+		return
+	}
 	if producer && f.lostResponse {
 		f.lostResponse = false
 		w.WriteHeader(500)

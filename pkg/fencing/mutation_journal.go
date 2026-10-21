@@ -99,6 +99,8 @@ type MutationProducer struct {
 	CloseRequestHash string                    `json:"closeRequestHash,omitempty"`
 	CompactedThrough uint64                    `json:"compactedThrough,omitempty"`
 	ArchiveHead      *MutationArchiveReference `json:"archiveHead,omitempty"`
+	ArchiveScan      *MutationArchiveScan      `json:"archiveScan,omitempty"`
+	EvidenceFault    string                    `json:"evidenceFault,omitempty"`
 	Entries          map[uint64]MutationEntry  `json:"entries"`
 }
 
@@ -119,6 +121,21 @@ func (p *MutationProducer) Validate() error {
 	}
 	if (p.CompactedThrough == 0) != (p.ArchiveHead == nil) || (p.ArchiveHead != nil && !p.ArchiveHead.Valid()) {
 		return fmt.Errorf("fencing: mutation archive watermark lacks its exact head")
+	}
+	if p.EvidenceFault != "" && !mutationDigestValid(p.EvidenceFault) {
+		return fmt.Errorf("fencing: malformed evidence fault")
+	}
+	if scan := p.ArchiveScan; scan != nil {
+		if p.ArchiveHead == nil || scan.Head != *p.ArchiveHead || !mutationDigestValid(scan.VerificationID) || scan.Through > p.CompactedThrough || (scan.Next == nil) != (scan.Through == 0) || (scan.Next != nil && !scan.Next.Valid()) || scan.Links > p.CompactedThrough {
+			return fmt.Errorf("fencing: archive verification cursor differs from retained history")
+		}
+		if (scan.Sought != nil && (!scan.Sought.Valid() || scan.Sequence != 0)) || (scan.Found && scan.Sought == nil && scan.Sequence == 0) || scan.Sequence > p.CompactedThrough || (scan.ResultArchive != nil && (!scan.ResultArchive.Valid() || scan.Sequence == 0 || !scan.Found)) {
+			return fmt.Errorf("fencing: invalid archive lookup binding")
+		}
+		covered := p.CompactedThrough - scan.Through
+		if scan.Links > covered || (covered == 0 && (scan.Links != 0 || scan.Next == nil || *scan.Next != scan.Head)) || (covered > 0 && (scan.Links == 0 || (covered-1)/MaxMutationJournalEntries+1 > scan.Links)) {
+			return fmt.Errorf("fencing: archive cursor claims impossible range coverage")
+		}
 	}
 	switch p.Phase {
 	case MutationReserved:
@@ -187,6 +204,9 @@ func (p *MutationProducer) Activate(id Identity) error {
 	if err := p.Validate(); err != nil {
 		return err
 	}
+	if p.EvidenceFault != "" {
+		return ErrUnavailable
+	}
 	if p.Phase != MutationReserved && p.Phase != MutationOpen {
 		return ErrClosed
 	}
@@ -203,6 +223,9 @@ func (p *MutationProducer) Activate(id Identity) error {
 func (p *MutationProducer) Admit(sequence uint64, intent MutationIntent) error {
 	if err := p.Validate(); err != nil {
 		return err
+	}
+	if p.EvidenceFault != "" {
+		return ErrUnavailable
 	}
 	if sequence == 0 {
 		return fmt.Errorf("fencing: mutation sequence is terminal or invalid")
@@ -269,6 +292,9 @@ func (p *MutationProducer) Close(operationID, requestHash string) error {
 func (p *MutationProducer) Prepare(sequence uint64, prepared MutationPreparation) error {
 	if err := p.Validate(); err != nil {
 		return err
+	}
+	if p.EvidenceFault != "" {
+		return ErrUnavailable
 	}
 	entry, exists := p.Entries[sequence]
 	if !exists || entry.Resolution != nil {
@@ -432,6 +458,9 @@ func (p *MutationProducer) GrantDispatch(sequence uint64, dispatchID string) err
 	if err := p.Validate(); err != nil {
 		return err
 	}
+	if p.EvidenceFault != "" {
+		return ErrUnavailable
+	}
 	entry, exists := p.Entries[sequence]
 	if !exists || entry.Preparation == nil || entry.Resolution != nil || entry.DispatchClosed || dispatchID == "" || len(dispatchID) > 128 {
 		return fmt.Errorf("fencing: dispatch admission is closed or unprepared")
@@ -504,7 +533,7 @@ func allDispatchesTerminal(entry MutationEntry) bool {
 }
 
 func (p *MutationProducer) BarrierComplete() bool {
-	if p.Validate() != nil || p.Phase != MutationClosed {
+	if p.Validate() != nil || p.Phase != MutationClosed || p.EvidenceFault != "" {
 		return false
 	}
 	for seq := p.CompactedThrough; seq < p.ClosedThrough; {
