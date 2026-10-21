@@ -427,7 +427,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		n.bucket = bucket
 		var beforeWrite []func(context.Context, string) error
 		if n.fenceSession != nil {
-			beforeWrite = append(beforeWrite, n.fenceSession.BindWAL)
+			beforeWrite = append(beforeWrite, n.bindFenceWAL)
 		}
 		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
 			return err
