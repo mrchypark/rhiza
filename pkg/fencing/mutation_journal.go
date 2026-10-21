@@ -191,32 +191,42 @@ func (p *MutationProducer) Validate() error {
 	for sequence := p.CompactedThrough; sequence < p.LastAdmitted; {
 		sequence++
 		entry, exists := p.Entries[sequence]
-		if !exists || validateMutationIntent(entry.Intent) != nil || seen[entry.Intent.OperationID] {
+		if !exists || seen[entry.Intent.OperationID] {
 			return fmt.Errorf("fencing: mutation journal sequence or identity is invalid")
 		}
 		seen[entry.Intent.OperationID] = true
-		if len(entry.Dispatches) > MaxMutationDispatches || (len(entry.Dispatches) != 0 && entry.Preparation == nil) {
-			return fmt.Errorf("fencing: dispatch permission set is invalid")
+		if err := p.validateEntry(sequence, entry); err != nil {
+			return err
 		}
-		for id, dispatch := range entry.Dispatches {
-			if id == "" || len(id) > 128 || (dispatch.ReceiptDigest != "" && !mutationDigestValid(dispatch.ReceiptDigest)) {
-				return fmt.Errorf("fencing: dispatch permission evidence is invalid")
-			}
+	}
+	return nil
+}
+
+func (p *MutationProducer) validateEntry(sequence uint64, entry MutationEntry) error {
+	if err := validateMutationIntent(entry.Intent); err != nil {
+		return err
+	}
+	if len(entry.Dispatches) > MaxMutationDispatches || (len(entry.Dispatches) != 0 && entry.Preparation == nil) {
+		return fmt.Errorf("fencing: dispatch permission set is invalid")
+	}
+	for id, dispatch := range entry.Dispatches {
+		if id == "" || len(id) > 128 || (dispatch.ReceiptDigest != "" && !mutationDigestValid(dispatch.ReceiptDigest)) {
+			return fmt.Errorf("fencing: dispatch permission evidence is invalid")
 		}
-		if entry.Preparation != nil {
-			if err := validateMutationPreparation(entry.Intent, *entry.Preparation); err != nil {
-				return err
-			}
+	}
+	if entry.Preparation != nil {
+		if err := validateMutationPreparation(entry.Intent, *entry.Preparation); err != nil {
+			return err
 		}
-		if entry.Resolution != nil {
-			if err := p.validateResolution(sequence, entry, *entry.Resolution); err != nil {
-				return err
-			}
+	}
+	if entry.Resolution != nil {
+		if err := p.validateResolution(sequence, entry, *entry.Resolution); err != nil {
+			return err
 		}
-		if entry.CopyCompletion != nil {
-			if entry.Preparation == nil || entry.Resolution == nil || entry.CopyCompletion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry) {
-				return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
-			}
+	}
+	if entry.CopyCompletion != nil {
+		if entry.Preparation == nil || entry.Resolution == nil || entry.CopyCompletion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry) {
+			return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
 		}
 	}
 	return nil
