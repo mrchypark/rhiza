@@ -32,6 +32,18 @@ func (n *Node) connectFenceSession(ctx context.Context) error {
 	return nil
 }
 
+func (n *Node) bindFenceWAL(ctx context.Context, walIdentity string) error {
+	if err := n.fenceSession.BindWAL(ctx, walIdentity); err != nil {
+		return err
+	}
+	// A validated binding alone must not enable the legacy direct-write bucket.
+	// Replace this refusal only with the durable, authority-only mutation client.
+	if _, enabled := n.fenceSession.MutationBinding(); enabled {
+		return fmt.Errorf("independent fencing requires the durable authority-only mutation client; direct provider writes are disabled")
+	}
+	return nil
+}
+
 func (n *Node) startFenceWatcher(ctx context.Context) {
 	session := n.fenceSession
 	if session == nil {
