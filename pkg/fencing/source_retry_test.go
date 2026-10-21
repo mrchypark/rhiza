@@ -25,6 +25,13 @@ func sourceRetryIntent(step string) MutationIntent {
 	return intent
 }
 
+func stageSourceRetryTest(t *testing.T, s *sourceRetryState, intent MutationIntent) {
+	t.Helper()
+	stage, err := s.reserveUpload(uploadStageDraft(intent))
+	mustJournal(t, err)
+	mustJournal(t, s.sealedUpload(stage.Ticket, sourceSealedPayload{Ref: intent.PayloadRef, Digest: intent.PayloadDigest, Size: intent.PayloadSize}))
+}
+
 func reopenSourceRetryTest(t *testing.T, s *sourceRetryState, r BindReceipt, dir string) *sourceRetryState {
 	t.Helper()
 	mustJournal(t, s.Close())
@@ -37,6 +44,7 @@ func reopenSourceRetryTest(t *testing.T, s *sourceRetryState, r BindReceipt, dir
 func TestSourceRetryLostAdmissionResponseRetainsOriginalTuple(t *testing.T) {
 	s, r, dir := newSourceRetryTest(t)
 	intent := sourceRetryIntent("first")
+	stageSourceRetryTest(t, s, intent)
 	first, err := s.allocate(intent)
 	mustJournal(t, err)
 	p, err := NewMutationProducer(r.Identity, r.Producer.Runtime)
@@ -55,6 +63,7 @@ func TestSourceRetryLostAdmissionResponseRetainsOriginalTuple(t *testing.T) {
 	}
 	mustJournal(t, p.Admit(retry.Sequence, retry.Entry.Intent))
 	mustJournal(t, s.admitted(retry.Sequence, retry.Entry.Intent))
+	stageSourceRetryTest(t, s, sourceRetryIntent("second"))
 	second, err := s.allocate(sourceRetryIntent("second"))
 	mustJournal(t, err)
 	if second.Sequence != 2 || p.Entries[1].Resolution != nil || first.Entry.Intent.OperationID == second.Entry.Intent.OperationID {
@@ -68,6 +77,7 @@ func TestSourceRetryLostAdmissionResponseRetainsOriginalTuple(t *testing.T) {
 func TestSourceRetryPreservesEveryOriginalIntentField(t *testing.T) {
 	s, _, _ := newSourceRetryTest(t)
 	original := sourceRetryIntent("original")
+	stageSourceRetryTest(t, s, original)
 	step, err := s.allocate(original)
 	mustJournal(t, err)
 	for name, change := range map[string]func(*MutationIntent){
@@ -104,6 +114,7 @@ func TestSourceRetryMissingStageReferenceConsumesNoSequence(t *testing.T) {
 	if _, err := s.allocate(intent); err == nil {
 		t.Fatal("missing stage reference consumed a sequence")
 	}
+	stageSourceRetryTest(t, s, sourceRetryIntent("first"))
 	step, err := s.allocate(sourceRetryIntent("first"))
 	mustJournal(t, err)
 	if step.Sequence != 1 {
@@ -113,6 +124,7 @@ func TestSourceRetryMissingStageReferenceConsumesNoSequence(t *testing.T) {
 
 func TestSourceRetryRejectsInvalidOrReplacedOriginalResult(t *testing.T) {
 	s, r, _ := newSourceRetryTest(t)
+	stageSourceRetryTest(t, s, sourceRetryIntent("first"))
 	step, err := s.allocate(sourceRetryIntent("first"))
 	mustJournal(t, err)
 	p, err := NewMutationProducer(r.Identity, r.Producer.Runtime)
@@ -154,13 +166,14 @@ func TestSourceRetryPersistenceUncertaintyPoisonsUntilReopen(t *testing.T) {
 	for _, boundary := range []string{"file", "directory"} {
 		t.Run(boundary, func(t *testing.T) {
 			s, r, dir := newSourceRetryTest(t)
+			original := sourceRetryIntent("first")
+			stageSourceRetryTest(t, s, original)
 			fault := errors.New("injected sync failure")
 			if boundary == "file" {
 				s.syncFile = func(*os.File) error { return fault }
 			} else {
 				s.syncDir = func(string) error { return fault }
 			}
-			original := sourceRetryIntent("first")
 			returned, err := s.allocate(original)
 			if !errors.Is(err, fault) || returned.Sequence != 0 {
 				t.Fatalf("uncertain persistence exposed an admissible tuple: %+v %v", returned, err)
@@ -223,6 +236,7 @@ func TestSourceRetryExclusiveOwnerAndBoundedPressure(t *testing.T) {
 	for i := range MaxMutationJournalEntries {
 		intent := sourceRetryIntent("same-bytes")
 		intent.OwnerStep.Attempt = uint64(i) + 1
+		stageSourceRetryTest(t, s, intent)
 		step, err := s.allocate(intent)
 		mustJournal(t, err)
 		mustJournal(t, s.admitted(step.Sequence, step.Entry.Intent))
@@ -259,6 +273,7 @@ func TestSourceRetryResultDurableBeforeOwnerAdvancement(t *testing.T) {
 			s, r, dir := newSourceRetryTest(t)
 			intent := sourceRetryIntent("original")
 			intent.Condition = MutationCondition{Mode: MutationMatchGeneration, Generation: 12}
+			stageSourceRetryTest(t, s, intent)
 			step, err := s.allocate(intent)
 			mustJournal(t, err)
 			if !errors.Is(s.advance(step.Sequence, step.Entry.Intent), ErrPending) {
