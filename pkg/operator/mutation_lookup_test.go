@@ -54,7 +54,7 @@ func TestMutationLookupAuthenticatedHTTPReturnsLiveEntryWithoutWrite(t *testing.
 	f.mu.Unlock()
 	authority := httptest.NewTLSServer(e.Handler())
 	t.Cleanup(authority.Close)
-	client := fencing.AuthorityClient{URL: authority.URL, TokenFile: e.Kube.TokenFile, Client: authority.Client()}
+	client := fencing.AuthorityClient{URL: authority.URL + "/v1/supervisor", TokenFile: e.Kube.TokenFile, Client: authority.Client()}
 	result, err := client.LookupMutation(t.Context(), id, run.MutationProducerUID, 1, intent)
 	if err != nil || !result.Found || result.Archived || result.Entry == nil || result.Entry.Intent != intent {
 		t.Fatalf("authenticated live lookup failed: %+v %v", result, err)
