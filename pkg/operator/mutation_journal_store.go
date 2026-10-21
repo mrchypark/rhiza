@@ -185,6 +185,9 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 		if producer.Phase != fencing.MutationClosed || !producer.BarrierComplete() {
 			complete = false
 		}
+		if producer.CompactedThrough != 0 {
+			return false, fmt.Errorf("fencing: compacted barrier requires storage-backed archive verification")
+		}
 	}
 	return complete, nil
 }

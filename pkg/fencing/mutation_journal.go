@@ -7,7 +7,10 @@ import (
 	"fmt"
 )
 
-const MaxMutationJournalEntries = 64
+const (
+	MaxMutationJournalEntries = 64
+	MaxMutationDispatches     = 16
+)
 
 type MutationPhase string
 
@@ -54,14 +57,26 @@ type MutationResolution struct {
 	// AllCopiesTerminal is a trusted provider-worker assertion backed by the
 	// receipt. In particular a successful create-if-absent response alone does
 	// not establish this: a delayed copy can succeed after a later deletion.
+	// Sealed dispatch admission and every granted permission's terminal receipt
+	// are required; counting requests already observed on the wire is insufficient.
 	AllCopiesTerminal bool `json:"allCopiesTerminal,omitempty"`
 }
 
 type MutationEntry struct {
-	Intent         MutationIntent          `json:"intent"`
-	Preparation    *MutationPreparation    `json:"preparation,omitempty"`
-	Resolution     *MutationResolution     `json:"resolution,omitempty"`
-	CopyCompletion *MutationCopyCompletion `json:"copyCompletion,omitempty"`
+	Intent         MutationIntent              `json:"intent"`
+	Preparation    *MutationPreparation        `json:"preparation,omitempty"`
+	Resolution     *MutationResolution         `json:"resolution,omitempty"`
+	CopyCompletion *MutationCopyCompletion     `json:"copyCompletion,omitempty"`
+	DispatchClosed bool                        `json:"dispatchClosed,omitempty"`
+	Dispatches     map[string]MutationDispatch `json:"dispatches,omitempty"`
+}
+
+// MutationDispatch is a durable executable permission, including a worker that
+// paused before sending any bytes. Empty ReceiptDigest means unresolved. The
+// trusted executor must settle the permission itself, not just observed HTTP
+// attempts, and never reuse a settled permission for another physical dispatch.
+type MutationDispatch struct {
+	ReceiptDigest string `json:"receiptDigest,omitempty"`
 }
 
 // MutationCopyCompletion adds terminal-attempt evidence without overwriting
@@ -75,20 +90,22 @@ type MutationCopyCompletion struct {
 // each transition before dispatch or ACK; this type does not provide persistence.
 // Missing state is Reserved/unknown, never an implicitly open producer.
 type MutationProducer struct {
-	Runtime          RuntimeBinding           `json:"runtime"`
-	WALIdentity      string                   `json:"walIdentity,omitempty"`
-	Phase            MutationPhase            `json:"phase"`
-	LastAdmitted     uint64                   `json:"lastAdmitted"`
-	ClosedThrough    uint64                   `json:"closedThrough,omitempty"`
-	CloseOperationID string                   `json:"closeOperationID,omitempty"`
-	CloseRequestHash string                   `json:"closeRequestHash,omitempty"`
-	Entries          map[uint64]MutationEntry `json:"entries"`
+	Runtime          RuntimeBinding            `json:"runtime"`
+	WALIdentity      string                    `json:"walIdentity,omitempty"`
+	Phase            MutationPhase             `json:"phase"`
+	LastAdmitted     uint64                    `json:"lastAdmitted"`
+	ClosedThrough    uint64                    `json:"closedThrough,omitempty"`
+	CloseOperationID string                    `json:"closeOperationID,omitempty"`
+	CloseRequestHash string                    `json:"closeRequestHash,omitempty"`
+	CompactedThrough uint64                    `json:"compactedThrough,omitempty"`
+	ArchiveHead      *MutationArchiveReference `json:"archiveHead,omitempty"`
+	Entries          map[uint64]MutationEntry  `json:"entries"`
 }
 
 // Validate rejects incomplete or damaged state after loading it. This is not
 // authentication of provider receipts: the persistence/executor boundary must
-// authenticate those separately. This initial bounded profile retains terminal
-// entries and does not compact them; capacity exhaustion applies backpressure.
+// authenticate those separately. Only the bounded live interval is validated;
+// archive contents and chain coverage require the storage-backed verifier.
 func (p *MutationProducer) Validate() error {
 	if p == nil {
 		return fmt.Errorf("fencing: missing mutation producer")
@@ -97,8 +114,11 @@ func (p *MutationProducer) Validate() error {
 	if err := p.Runtime.Validate(id); err != nil {
 		return err
 	}
-	if p.Entries == nil || p.LastAdmitted > MaxMutationJournalEntries || uint64(len(p.Entries)) != p.LastAdmitted {
+	if p.CompactedThrough > p.LastAdmitted || p.Entries == nil || p.LastAdmitted-p.CompactedThrough > MaxMutationJournalEntries || uint64(len(p.Entries)) != p.LastAdmitted-p.CompactedThrough {
 		return fmt.Errorf("fencing: mutation journal is incomplete or exceeds capacity")
+	}
+	if (p.CompactedThrough == 0) != (p.ArchiveHead == nil) || (p.ArchiveHead != nil && !p.ArchiveHead.Valid()) {
+		return fmt.Errorf("fencing: mutation archive watermark lacks its exact head")
 	}
 	switch p.Phase {
 	case MutationReserved:
@@ -120,12 +140,21 @@ func (p *MutationProducer) Validate() error {
 		return fmt.Errorf("fencing: open mutation producer retains closure metadata")
 	}
 	seen := make(map[string]bool, len(p.Entries))
-	for sequence := uint64(1); sequence <= p.LastAdmitted; sequence++ {
+	for sequence := p.CompactedThrough; sequence < p.LastAdmitted; {
+		sequence++
 		entry, exists := p.Entries[sequence]
 		if !exists || validateMutationIntent(entry.Intent) != nil || seen[entry.Intent.OperationID] {
 			return fmt.Errorf("fencing: mutation journal sequence or identity is invalid")
 		}
 		seen[entry.Intent.OperationID] = true
+		if len(entry.Dispatches) > MaxMutationDispatches || (len(entry.Dispatches) != 0 && entry.Preparation == nil) {
+			return fmt.Errorf("fencing: dispatch permission set is invalid")
+		}
+		for id, dispatch := range entry.Dispatches {
+			if id == "" || len(id) > 128 || (dispatch.ReceiptDigest != "" && !mutationDigestValid(dispatch.ReceiptDigest)) {
+				return fmt.Errorf("fencing: dispatch permission evidence is invalid")
+			}
+		}
 		if entry.Preparation != nil {
 			if err := validateMutationPreparation(entry.Intent, *entry.Preparation); err != nil {
 				return err
@@ -137,7 +166,7 @@ func (p *MutationProducer) Validate() error {
 			}
 		}
 		if entry.CopyCompletion != nil {
-			if entry.Preparation == nil || entry.Resolution == nil || entry.CopyCompletion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) {
+			if entry.Preparation == nil || entry.Resolution == nil || entry.CopyCompletion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry) {
 				return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
 			}
 		}
@@ -177,6 +206,9 @@ func (p *MutationProducer) Admit(sequence uint64, intent MutationIntent) error {
 	}
 	if sequence == 0 {
 		return fmt.Errorf("fencing: mutation sequence is terminal or invalid")
+	}
+	if sequence <= p.CompactedThrough {
+		return ErrMutationArchived
 	}
 	if old, exists := p.Entries[sequence]; exists {
 		if old.Intent == intent {
@@ -320,6 +352,9 @@ func (p *MutationProducer) validateResolution(sequence uint64, entry MutationEnt
 	if !mutationDigestValid(resolution.ReceiptDigest) {
 		return fmt.Errorf("fencing: resolution requires durable evidence")
 	}
+	if resolution.AllCopiesTerminal && !allDispatchesTerminal(entry) {
+		return fmt.Errorf("fencing: executable dispatch permissions remain unsealed or unresolved")
+	}
 	if entry.Preparation == nil {
 		if resolution.Outcome != MutationRejected || resolution.PreparationHash != "" || resolution.PayloadDigest != "" || !resolution.AllCopiesTerminal {
 			return fmt.Errorf("fencing: unprepared work can only be terminally cancelled")
@@ -361,6 +396,7 @@ func (p *MutationProducer) CancelUnprepared(sequence uint64, receiptDigest strin
 	if !exists || entry.Preparation != nil || !mutationDigestValid(receiptDigest) {
 		return fmt.Errorf("fencing: mutation may already be executable")
 	}
+	entry.DispatchClosed = true
 	resolution := MutationResolution{Outcome: MutationRejected, ReceiptDigest: receiptDigest, AllCopiesTerminal: true}
 	if entry.Resolution != nil && *entry.Resolution != resolution {
 		return fmt.Errorf("fencing: mutation terminal result is immutable")
@@ -371,14 +407,15 @@ func (p *MutationProducer) CancelUnprepared(sequence uint64, receiptDigest strin
 }
 
 // ConfirmCopiesTerminal is called only after the trusted executor verifies all
-// issued copies/sessions are terminal. A timeout, a single response, or absence
+// copies/sessions AND every outstanding executable permission are terminal,
+// with dispatch admission sealed. A timeout, a single response, or absence
 // from a recent object listing cannot produce this evidence.
 func (p *MutationProducer) ConfirmCopiesTerminal(sequence uint64, completion MutationCopyCompletion) error {
 	if err := p.Validate(); err != nil {
 		return err
 	}
 	entry, exists := p.Entries[sequence]
-	if !exists || entry.Preparation == nil || entry.Resolution == nil || completion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(completion.ReceiptDigest) {
+	if !exists || entry.Preparation == nil || entry.Resolution == nil || completion.PreparationHash != p.preparationHash(sequence, entry) || !mutationDigestValid(completion.ReceiptDigest) || !allDispatchesTerminal(entry) {
 		return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
 	}
 	if entry.CopyCompletion != nil && *entry.CopyCompletion != completion {
@@ -389,20 +426,102 @@ func (p *MutationProducer) ConfirmCopiesTerminal(sequence uint64, completion Mut
 	return nil
 }
 
-func (p *MutationProducer) BarrierComplete() bool {
-	if p.Validate() != nil || p.Phase != MutationClosed {
+// GrantDispatch must be persisted before handing executable permission to any
+// worker. Reading a prepared descriptor alone grants no right to send a request.
+func (p *MutationProducer) GrantDispatch(sequence uint64, dispatchID string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || entry.Preparation == nil || entry.Resolution != nil || entry.DispatchClosed || dispatchID == "" || len(dispatchID) > 128 {
+		return fmt.Errorf("fencing: dispatch admission is closed or unprepared")
+	}
+	if old, exists := entry.Dispatches[dispatchID]; exists {
+		if old.ReceiptDigest == "" {
+			return nil
+		}
+		return fmt.Errorf("fencing: settled dispatch cannot execute again")
+	}
+	if len(entry.Dispatches) >= MaxMutationDispatches {
+		return fmt.Errorf("fencing: dispatch capacity exhausted")
+	}
+	if entry.Dispatches == nil {
+		entry.Dispatches = make(map[string]MutationDispatch)
+	}
+	entry.Dispatches[dispatchID] = MutationDispatch{}
+	p.Entries[sequence] = entry
+	return nil
+}
+
+// SealDispatch permanently stops new permissions, not just new HTTP requests.
+func (p *MutationProducer) SealDispatch(sequence uint64) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || entry.Preparation == nil {
+		return fmt.Errorf("fencing: dispatch has no prepared admission")
+	}
+	entry.DispatchClosed = true
+	p.Entries[sequence] = entry
+	return nil
+}
+
+// RecordDispatchTerminal records a receipt only after a trusted executor verifies
+// its producer/sequence/permission attribution and the end of executable rights.
+// The digest's shape is not authentication of that underlying receipt.
+func (p *MutationProducer) RecordDispatchTerminal(sequence uint64, dispatchID, receiptDigest string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists || !mutationDigestValid(receiptDigest) {
+		return fmt.Errorf("fencing: dispatch terminal evidence is incomplete")
+	}
+	dispatch, exists := entry.Dispatches[dispatchID]
+	if !exists {
+		return fmt.Errorf("fencing: unknown dispatch permission")
+	}
+	if dispatch.ReceiptDigest != "" && dispatch.ReceiptDigest != receiptDigest {
+		return fmt.Errorf("fencing: dispatch receipt is immutable")
+	}
+	dispatch.ReceiptDigest = receiptDigest
+	entry.Dispatches[dispatchID] = dispatch
+	p.Entries[sequence] = entry
+	return nil
+}
+
+func allDispatchesTerminal(entry MutationEntry) bool {
+	if !entry.DispatchClosed {
 		return false
 	}
-	for seq := uint64(1); seq <= p.ClosedThrough; seq++ {
-		entry, exists := p.Entries[seq]
-		if !exists || entry.Resolution == nil {
-			return false
-		}
-		if entry.Preparation != nil && entry.Preparation.Generation == 0 && !entry.Resolution.AllCopiesTerminal && entry.CopyCompletion == nil {
+	for _, dispatch := range entry.Dispatches {
+		if !mutationDigestValid(dispatch.ReceiptDigest) {
 			return false
 		}
 	}
 	return true
+}
+
+func (p *MutationProducer) BarrierComplete() bool {
+	if p.Validate() != nil || p.Phase != MutationClosed {
+		return false
+	}
+	for seq := p.CompactedThrough; seq < p.ClosedThrough; {
+		seq++
+		entry, exists := p.Entries[seq]
+		if !exists || !mutationEntryTerminal(entry) {
+			return false
+		}
+	}
+	return true
+}
+
+func mutationEntryTerminal(entry MutationEntry) bool {
+	if entry.Resolution == nil {
+		return false
+	}
+	return entry.Preparation == nil || entry.Preparation.Generation != 0 || entry.Resolution.AllCopiesTerminal || entry.CopyCompletion != nil
 }
 
 func mutationDigestValid(value string) bool {
