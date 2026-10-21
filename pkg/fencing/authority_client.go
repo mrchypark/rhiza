@@ -16,10 +16,27 @@ import (
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
-	Action   string        `json:"action"`
-	Identity Identity      `json:"identity"`
-	Drain    *DrainReceipt `json:"drain,omitempty"`
-	Request  *StopRequest  `json:"request,omitempty"`
+	Action         string                 `json:"action"`
+	Identity       Identity               `json:"identity"`
+	Drain          *DrainReceipt          `json:"drain,omitempty"`
+	Request        *StopRequest           `json:"request,omitempty"`
+	MutationLookup *MutationLookupRequest `json:"mutationLookup,omitempty"`
+}
+
+// MutationLookupRequest asks the authority for one original producer tuple.
+// It is read-only: the server must never interpret absence as admission.
+type MutationLookupRequest struct {
+	ProducerUID string         `json:"producerUID"`
+	Sequence    uint64         `json:"sequence"`
+	Intent      MutationIntent `json:"intent"`
+}
+
+// MutationLookupResult preserves the exact durable entry, including an
+// unresolved result. Found=false means only that this tuple was never admitted.
+type MutationLookupResult struct {
+	Found    bool           `json:"found"`
+	Archived bool           `json:"archived,omitempty"`
+	Entry    *MutationEntry `json:"entry,omitempty"`
 }
 
 type AuthorityClient struct {
@@ -121,4 +138,84 @@ func (a *AuthorityClient) Exit(ctx context.Context, r StopRequest) error {
 
 func (a *AuthorityClient) NeverBoundExit(ctx context.Context, r StopRequest) error {
 	return a.call(ctx, AuthorityMessage{Action: "never-bound-exit", Identity: r.Identity, Request: &r}, nil)
+}
+
+func (a *AuthorityClient) LookupMutation(ctx context.Context, id Identity, producerUID string, sequence uint64, intent MutationIntent) (MutationLookupResult, error) {
+	if id.WALIdentity == "" || producerUID == "" || sequence == 0 || intent.OperationID != MutationRequestID(producerUID, sequence) {
+		return MutationLookupResult{}, fmt.Errorf("fencing: mutation lookup identity differs")
+	}
+	if err := validateMutationIntent(intent); err != nil {
+		return MutationLookupResult{}, err
+	}
+	request := MutationLookupRequest{ProducerUID: producerUID, Sequence: sequence, Intent: intent}
+	var result MutationLookupResult
+	if err := a.call(ctx, AuthorityMessage{Action: "mutation-lookup", Identity: id, MutationLookup: &request}, &result); err != nil {
+		return MutationLookupResult{}, err
+	}
+	if (result.Found && result.Entry == nil) || (!result.Found && (result.Entry != nil || result.Archived)) || (result.Archived && !result.Found) {
+		return MutationLookupResult{}, fmt.Errorf("fencing: malformed mutation lookup result")
+	}
+	if result.Entry != nil && result.Entry.Intent != intent {
+		return MutationLookupResult{}, fmt.Errorf("fencing: mutation lookup tuple differs")
+	}
+	if result.Entry != nil {
+		if err := validateMutationLookupEntry(*result.Entry); err != nil {
+			return MutationLookupResult{}, err
+		}
+	}
+	return result, nil
+}
+
+func validateMutationLookupEntry(entry MutationEntry) error {
+	if err := validateMutationIntent(entry.Intent); err != nil {
+		return err
+	}
+	if len(entry.Dispatches) > MaxMutationDispatches || (len(entry.Dispatches) != 0 && entry.Preparation == nil) {
+		return fmt.Errorf("fencing: malformed mutation lookup dispatch state")
+	}
+	for id, dispatch := range entry.Dispatches {
+		if id == "" || len(id) > 128 || (dispatch.ReceiptDigest != "" && !mutationDigestValid(dispatch.ReceiptDigest)) {
+			return fmt.Errorf("fencing: malformed mutation lookup dispatch receipt")
+		}
+	}
+	if entry.Preparation != nil {
+		if err := validateMutationPreparation(entry.Intent, *entry.Preparation); err != nil {
+			return err
+		}
+	}
+	if entry.Resolution != nil {
+		r := entry.Resolution
+		if !mutationDigestValid(r.ReceiptDigest) || (r.AllCopiesTerminal && !allDispatchesTerminal(entry)) {
+			return fmt.Errorf("fencing: malformed mutation lookup resolution")
+		}
+		if entry.Preparation == nil {
+			if r.Outcome != MutationRejected || r.PreparationHash != "" || r.PayloadDigest != "" || !r.AllCopiesTerminal {
+				return fmt.Errorf("fencing: malformed cancelled mutation lookup resolution")
+			}
+		} else {
+			if !mutationDigestValid(r.PreparationHash) {
+				return fmt.Errorf("fencing: malformed mutation lookup preparation binding")
+			}
+			switch r.Outcome {
+			case MutationCommitted:
+				if r.PayloadDigest != entry.Intent.PayloadDigest {
+					return fmt.Errorf("fencing: malformed committed mutation lookup")
+				}
+			case MutationRejected:
+				if !r.AllCopiesTerminal || r.PayloadDigest != "" {
+					return fmt.Errorf("fencing: malformed rejected mutation lookup")
+				}
+			case MutationExcluded:
+				if entry.Preparation.Generation == 0 || r.PayloadDigest != "" {
+					return fmt.Errorf("fencing: malformed excluded mutation lookup")
+				}
+			default:
+				return fmt.Errorf("fencing: unknown mutation lookup outcome")
+			}
+		}
+	}
+	if entry.CopyCompletion != nil && (entry.Preparation == nil || entry.Resolution == nil || !mutationDigestValid(entry.CopyCompletion.PreparationHash) || !mutationDigestValid(entry.CopyCompletion.ReceiptDigest) || !allDispatchesTerminal(entry)) {
+		return fmt.Errorf("fencing: malformed mutation lookup copy completion")
+	}
+	return nil
 }

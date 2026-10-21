@@ -157,7 +157,16 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	var stop fencing.StopRequest
 	var binding fencing.BindReceipt
-	if message.Action == "bind" {
+	var mutationLookup fencing.MutationLookupResult
+	if message.Action == "mutation-lookup" {
+		if message.MutationLookup == nil || message.Drain != nil || message.Request != nil {
+			err = fmt.Errorf("fencing: malformed mutation lookup request")
+		} else {
+			mutationLookup, err = e.lookupMutation(r.Context(), uid, message.Identity, *message.MutationLookup)
+		}
+	} else if message.MutationLookup != nil {
+		err = fmt.Errorf("fencing: unexpected mutation lookup request")
+	} else if message.Action == "bind" {
 		binding, err = e.bindSupervisorWAL(r.Context(), uid, message.Identity)
 	} else if message.Action == "stop" {
 		var state fenceLedger
@@ -197,7 +206,7 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		})
 	}
-	if errors.Is(err, fencing.ErrPending) {
+	if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -219,6 +228,8 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(stop)
 	} else if message.Action == "bind" {
 		_ = json.NewEncoder(w).Encode(binding)
+	} else if message.Action == "mutation-lookup" {
+		_ = json.NewEncoder(w).Encode(mutationLookup)
 	} else {
 		_, _ = w.Write([]byte("{}\n"))
 	}

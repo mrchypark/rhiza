@@ -43,11 +43,32 @@ type mutationStoreFixture struct {
 	archivePosts         int
 	archiveReadError     string
 	statusWrites         int
+	// Optional Kubernetes auth fixtures for testing the bound-token HTTP route.
+	authPod         object
+	authStatefulSet object
 }
 
 func (f *mutationStoreFixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if r.URL.Path == "/apis/authentication.k8s.io/v1/tokenreviews" && r.Method == http.MethodPost {
+		_ = json.NewEncoder(w).Encode(object{"status": object{
+			"authenticated": true, "audiences": []any{"rhiza-fencer"},
+			"user": object{"username": "system:serviceaccount:test:default", "extra": object{
+				"authentication.kubernetes.io/pod-uid":  []any{"pod-0"},
+				"authentication.kubernetes.io/pod-name": []any{"n0"},
+			}},
+		}})
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/test/pods/n0" && f.authPod != nil {
+		_ = json.NewEncoder(w).Encode(f.authPod)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/apis/apps/v1/namespaces/test/statefulsets/rhiza" && f.authStatefulSet != nil {
+		_ = json.NewEncoder(w).Encode(f.authStatefulSet)
+		return
+	}
 	current := f.objects[r.URL.Path]
 	if r.Method == http.MethodGet {
 		if strings.Contains(r.URL.Path, "/rhiza-mutation-archive-") {
