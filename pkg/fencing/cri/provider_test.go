@@ -1,0 +1,410 @@
+package cri
+
+import (
+	"context"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/mrchypark/rhiza/pkg/fencing"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+)
+
+type fakeRuntime struct {
+	runtimeapi.UnimplementedRuntimeServiceServer
+	mu                  sync.Mutex
+	version             *runtimeapi.VersionResponse
+	sandbox             *runtimeapi.PodSandboxStatus
+	container           *runtimeapi.ContainerStatus
+	containers          []*runtimeapi.Container
+	host                HostIdentity
+	stopContainers      int
+	stopSandboxes       int
+	versionCalls        int
+	statusError         codes.Code
+	stopError           codes.Code
+	sandboxError        codes.Code
+	stillRunning        bool
+	descendantRunning   bool
+	metadataGone        bool
+	blockStop           bool
+	changeHostAfterStop bool
+	directory           string
+	stopEntered         chan struct{}
+	stopEnteredOnce     sync.Once
+}
+
+func (f *fakeRuntime) Version(context.Context, *runtimeapi.VersionRequest) (*runtimeapi.VersionResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.versionCalls++
+	return proto.Clone(f.version).(*runtimeapi.VersionResponse), nil
+}
+
+func (f *fakeRuntime) PodSandboxStatus(_ context.Context, request *runtimeapi.PodSandboxStatusRequest) (*runtimeapi.PodSandboxStatusResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.statusError != codes.OK {
+		return nil, status.Error(f.statusError, "test sandbox unavailable")
+	}
+	if f.metadataGone && f.stopSandboxes != 0 {
+		return nil, status.Error(codes.NotFound, "test metadata removed")
+	}
+	if request.PodSandboxId != "sandbox-0" {
+		return nil, status.Error(codes.NotFound, "wrong sandbox ID")
+	}
+	return &runtimeapi.PodSandboxStatusResponse{Status: proto.Clone(f.sandbox).(*runtimeapi.PodSandboxStatus)}, nil
+}
+
+func (f *fakeRuntime) ContainerStatus(_ context.Context, request *runtimeapi.ContainerStatusRequest) (*runtimeapi.ContainerStatusResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if request.ContainerId != "container-0" {
+		return nil, status.Error(codes.NotFound, "wrong container ID")
+	}
+	return &runtimeapi.ContainerStatusResponse{Status: proto.Clone(f.container).(*runtimeapi.ContainerStatus)}, nil
+}
+
+func (f *fakeRuntime) ListContainers(_ context.Context, request *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if request.Filter == nil || request.Filter.PodSandboxId != "sandbox-0" {
+		return nil, status.Error(codes.InvalidArgument, "unscoped list is forbidden")
+	}
+	result := &runtimeapi.ListContainersResponse{}
+	for _, container := range f.containers {
+		result.Containers = append(result.Containers, proto.Clone(container).(*runtimeapi.Container))
+	}
+	return result, nil
+}
+
+func (f *fakeRuntime) StopContainer(ctx context.Context, request *runtimeapi.StopContainerRequest) (*runtimeapi.StopContainerResponse, error) {
+	f.mu.Lock()
+	f.stopContainers++
+	if request.ContainerId != "container-0" || request.Timeout != 3 {
+		f.mu.Unlock()
+		return nil, status.Error(codes.InvalidArgument, "wrong stop target or grace")
+	}
+	if f.blockStop {
+		f.stopEnteredOnce.Do(func() { close(f.stopEntered) })
+		f.mu.Unlock()
+		<-ctx.Done()
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+	defer f.mu.Unlock()
+	if !f.stillRunning {
+		f.container.State, f.container.FinishedAt = runtimeapi.ContainerState_CONTAINER_EXITED, 20
+	}
+	if f.stopError != codes.OK {
+		return nil, status.Error(f.stopError, "test stop result unknown")
+	}
+	return &runtimeapi.StopContainerResponse{}, nil
+}
+
+func (f *fakeRuntime) StopPodSandbox(_ context.Context, request *runtimeapi.StopPodSandboxRequest) (*runtimeapi.StopPodSandboxResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopSandboxes++
+	if request.PodSandboxId != "sandbox-0" {
+		return nil, status.Error(codes.InvalidArgument, "wrong stop sandbox")
+	}
+	if f.sandboxError != codes.OK {
+		return nil, status.Error(f.sandboxError, "test sandbox result unknown")
+	}
+	f.sandbox.State = runtimeapi.PodSandboxState_SANDBOX_NOTREADY
+	for i, entry := range f.containers {
+		if !f.stillRunning && !(f.descendantRunning && i != 0) {
+			entry.State = runtimeapi.ContainerState_CONTAINER_EXITED
+		}
+	}
+	return &runtimeapi.StopPodSandboxResponse{}, nil
+}
+
+func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBinding, fencing.StopRequest) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("local CRI profile requires a Unix socket")
+	}
+	f := &fakeRuntime{
+		stopEntered: make(chan struct{}),
+		version:     &runtimeapi.VersionResponse{RuntimeName: "containerd", RuntimeVersion: "test-version", RuntimeApiVersion: "v1"},
+		host:        HostIdentity{NodeName: "node-0", NodeUID: "node-uid", MachineID: "machine", BootID: "boot", KernelRelease: "test-kernel"},
+		sandbox: &runtimeapi.PodSandboxStatus{Id: "sandbox-0", CreatedAt: 1, State: runtimeapi.PodSandboxState_SANDBOX_READY,
+			Metadata: &runtimeapi.PodSandboxMetadata{Name: "database", Namespace: "test", Uid: "pod-uid"},
+			Linux:    &runtimeapi.LinuxPodSandboxStatus{Namespaces: &runtimeapi.Namespace{Options: &runtimeapi.NamespaceOption{Pid: runtimeapi.NamespaceMode_CONTAINER}}}},
+		container:  &runtimeapi.ContainerStatus{Id: "container-0", CreatedAt: 2, State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: "image-digest", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}},
+		containers: []*runtimeapi.Container{{Id: "container-0", PodSandboxId: "sandbox-0", State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: "image-digest", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}}},
+	}
+	// Keep Unix paths short on macOS; cleanup owns this exact new directory.
+	directory, err := os.MkdirTemp("/tmp", "rhiza-cri-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.directory = directory
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Error(err)
+		}
+	})
+	socket := filepath.Join(directory, "runtime.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	runtimeapi.RegisterRuntimeServiceServer(server, f)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = server.Serve(listener) }()
+	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-done })
+	profile := Profile{Namespace: "test", ContainerName: "database", RuntimeName: "containerd", RuntimeVersion: "test-version", RuntimeAPIVersion: "v1", KernelRelease: "test-kernel", GraceSeconds: 3}
+	p, err := Open(socket, profile, func(context.Context) (HostIdentity, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		host := f.host
+		if f.changeHostAfterStop && f.stopContainers != 0 {
+			host.BootID = "new-boot"
+		}
+		return host, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	binding := fencing.RuntimeBinding{AuthorityID: "authority", NamespaceUID: "namespace-uid", BindingUID: "binding-uid", StatefulSetUID: "sts-uid",
+		SourceClusterID: "source", NodeID: "voter-0", PodUID: "pod-uid", RunID: "run-0", NodeName: f.host.NodeName, NodeUID: f.host.NodeUID,
+		MachineID: f.host.MachineID, BootID: f.host.BootID, RuntimeID: RuntimeIdentity(profile.RuntimeName, profile.RuntimeVersion, profile.RuntimeAPIVersion),
+		SandboxID: "sandbox-0", ContainerID: "containerd://container-0", ImageID: "image-digest"}
+	request := fencing.StopRequest{OperationID: "closed-operation", RequestHash: strings.Repeat("a", 64), Identity: fencing.Identity{
+		SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, WALIdentity: "wal"}}
+	return p, f, binding, request
+}
+
+func TestCRIExactStopUsesRealUnixGRPCAndVerifiesScope(t *testing.T) {
+	p, f, binding, request := newRuntimeFixture(t)
+	observation, err := p.Stop(t.Context(), binding, request)
+	if err != nil || !observation.ContainerStopAcknowledged || !observation.SandboxStopAcknowledged || !observation.ContainerExited || !observation.SandboxNotReady || observation.ObservedAt == "" {
+		t.Fatalf("exact stop observation incomplete: %+v %v", observation, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 1 || f.stopSandboxes != 1 || f.versionCalls != 2 {
+		t.Fatalf("unexpected execution scope: container=%d sandbox=%d versions=%d", f.stopContainers, f.stopSandboxes, f.versionCalls)
+	}
+}
+
+func TestCRIIdentityMismatchesIssueZeroStopCommands(t *testing.T) {
+	for _, change := range []string{"node UID", "machine", "boot", "kernel", "runtime", "runtime version", "sandbox", "pod", "namespace", "image", "container", "host PID", "unknown namespace mode", "unknown container state", "other application", "wrong membership", "bad request"} {
+		t.Run(change, func(t *testing.T) {
+			p, f, binding, request := newRuntimeFixture(t)
+			f.mu.Lock()
+			switch change {
+			case "node UID":
+				binding.NodeUID = "new-node"
+			case "machine":
+				binding.MachineID = "new-machine"
+			case "boot":
+				binding.BootID = "new-boot"
+			case "kernel":
+				f.host.KernelRelease = "new-kernel"
+			case "runtime":
+				binding.RuntimeID = "other-runtime"
+			case "runtime version":
+				f.version.RuntimeVersion = "unqualified-version"
+			case "sandbox":
+				f.sandbox.Id = "other-sandbox"
+			case "pod":
+				f.sandbox.Metadata.Uid = "other-pod"
+			case "namespace":
+				f.sandbox.Metadata.Namespace = "other"
+			case "image":
+				f.container.ImageRef = "other-image"
+			case "container":
+				f.container.Id = "other-container"
+			case "host PID":
+				f.sandbox.Linux.Namespaces.Options.Pid = runtimeapi.NamespaceMode_NODE
+			case "unknown namespace mode":
+				f.sandbox.Linux.Namespaces.Options.Network = runtimeapi.NamespaceMode(99)
+			case "unknown container state":
+				f.container.State = runtimeapi.ContainerState(99)
+			case "other application":
+				f.containers = append(f.containers, &runtimeapi.Container{Id: "unrelated", PodSandboxId: "sandbox-0", Metadata: &runtimeapi.ContainerMetadata{Name: "other"}})
+			case "wrong membership":
+				f.containers[0].PodSandboxId = "other-sandbox"
+			case "bad request":
+				request.RequestHash = "not-a-digest"
+			}
+			f.mu.Unlock()
+			observation, err := p.Stop(t.Context(), binding, request)
+			if !errors.Is(err, ErrUnverified) || observation.ContainerStopAcknowledged || observation.SandboxStopAcknowledged || observation.ObservedAt != "" {
+				t.Fatalf("identity mismatch was not rejected: %+v %v", observation, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.stopContainers != 0 || f.stopSandboxes != 0 {
+				t.Fatal("mismatched incarnation received a termination command")
+			}
+		})
+	}
+}
+
+func TestCRIAcknowledgementAloneIsNotTerminalEvidence(t *testing.T) {
+	for _, condition := range []string{"container alive", "another container alive", "metadata disappeared", "container timeout", "sandbox timeout", "boot changed"} {
+		t.Run(condition, func(t *testing.T) {
+			p, f, binding, request := newRuntimeFixture(t)
+			f.mu.Lock()
+			switch condition {
+			case "container alive":
+				f.stillRunning = true
+			case "another container alive":
+				f.descendantRunning = true
+				f.containers = append(f.containers, &runtimeapi.Container{Id: "another-runtime", PodSandboxId: "sandbox-0", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}, State: runtimeapi.ContainerState_CONTAINER_RUNNING})
+			case "metadata disappeared":
+				f.metadataGone = true
+			case "container timeout":
+				f.stopError = codes.DeadlineExceeded
+			case "sandbox timeout":
+				f.sandboxError = codes.DeadlineExceeded
+			case "boot changed":
+				f.changeHostAfterStop = true
+			}
+			f.mu.Unlock()
+			observation, err := p.Stop(t.Context(), binding, request)
+			if !errors.Is(err, ErrUnverified) || observation.ContainerExited || observation.SandboxNotReady || observation.ObservedAt != "" {
+				t.Fatalf("incomplete stop became terminal evidence: %+v %v", observation, err)
+			}
+			if condition != "container timeout" && !observation.ContainerStopAcknowledged {
+				t.Fatal("partial container stop acknowledgement was discarded")
+			}
+		})
+	}
+}
+
+func TestCRINotFoundBeforeCaptureIsUncertainty(t *testing.T) {
+	p, f, binding, request := newRuntimeFixture(t)
+	f.mu.Lock()
+	f.statusError = codes.NotFound
+	f.mu.Unlock()
+	observation, err := p.Stop(t.Context(), binding, request)
+	if !errors.Is(err, ErrUnverified) || observation.ObservedAt != "" {
+		t.Fatal("NotFound was interpreted as process termination")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 0 || f.stopSandboxes != 0 {
+		t.Fatal("unknown runtime received stop commands")
+	}
+}
+
+func TestCRICancellationDoesNotTriggerAnotherAttempt(t *testing.T) {
+	p, f, binding, request := newRuntimeFixture(t)
+	f.mu.Lock()
+	f.blockStop = true
+	f.mu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	type result struct {
+		observation StopObservation
+		err         error
+	}
+	completed := make(chan result, 1)
+	go func() { observation, err := p.Stop(ctx, binding, request); completed <- result{observation, err} }()
+	select {
+	case <-f.stopEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop RPC was not reached before cancellation")
+	}
+	cancel()
+	var outcome result
+	select {
+	case outcome = <-completed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled stop did not return")
+	}
+	observation, err := outcome.observation, outcome.err
+	if !errors.Is(err, ErrUnverified) || observation.ContainerStopAcknowledged || observation.ObservedAt != "" {
+		t.Fatalf("deadline was reported as acknowledged termination: %+v %v", observation, err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 1 || f.stopSandboxes != 0 {
+		t.Fatalf("deadline retried/expanded scope: containers=%d sandboxes=%d", f.stopContainers, f.stopSandboxes)
+	}
+}
+
+func TestCRIRejectsUnsupportedConfigurationWithoutConnecting(t *testing.T) {
+	for _, kind := range []string{"TCP socket", "relative socket", "namespace", "kernel", "API", "negative grace", "excessive grace", "host reader"} {
+		t.Run(kind, func(t *testing.T) {
+			profile := Profile{Namespace: "test", ContainerName: "database", RuntimeName: "containerd", RuntimeVersion: "test-version", RuntimeAPIVersion: "v1", KernelRelease: "kernel", GraceSeconds: 3}
+			socket := "/not-opened/runtime.sock"
+			host := func(context.Context) (HostIdentity, error) {
+				t.Fatal("invalid configuration read the host")
+				return HostIdentity{}, nil
+			}
+			switch kind {
+			case "TCP socket":
+				socket = "https://runtime.example.invalid"
+			case "relative socket":
+				socket = "runtime.sock"
+			case "namespace":
+				profile.Namespace = ""
+			case "kernel":
+				profile.KernelRelease = ""
+			case "API":
+				profile.RuntimeAPIVersion = "unknown"
+			case "negative grace":
+				profile.GraceSeconds = -1
+			case "excessive grace":
+				profile.GraceSeconds = 11
+			case "host reader":
+				host = nil
+			}
+			p, err := Open(socket, profile, host)
+			if err == nil {
+				_ = p.Close()
+				t.Fatal("unsupported configuration accepted")
+			}
+		})
+	}
+	var zero Provider
+	if _, err := zero.Stop(t.Context(), fencing.RuntimeBinding{}, fencing.StopRequest{}); !errors.Is(err, ErrUnverified) {
+		t.Fatal("zero provider did not fail closed")
+	}
+}
+
+func TestCRIRuntimeIdentityBindsEveryTupleField(t *testing.T) {
+	want := RuntimeIdentity("containerd", "v1", "v1")
+	if want != RuntimeIdentity("containerd", "v1", "v1") || want == RuntimeIdentity("containerd", "v2", "v1") || want == RuntimeIdentity("containerd", "v1", "v2") || RuntimeIdentity("a/b", "c", "d") == RuntimeIdentity("a", "b/c", "d") {
+		t.Fatal("runtime identity is unstable or aliases another version tuple")
+	}
+}
+
+func TestCRIOwnedSocketServerAndDirectoryAreCleaned(t *testing.T) {
+	var directory string
+	t.Run("owned runtime", func(t *testing.T) {
+		p, f, binding, request := newRuntimeFixture(t)
+		directory = f.directory
+		if _, err := p.Stop(t.Context(), binding, request); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if directory == "" {
+		t.Skip("Unix runtime fixture is unavailable")
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned runtime directory remains after cleanup: %v", err)
+	}
+}

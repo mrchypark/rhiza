@@ -27,7 +27,7 @@ jobs:
           cache: true
       - name: Check cooperative protocol and engine regression tests
         run: |
-          go test -race ./pkg/fencing ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
+          go test -race ./pkg/fencing ./pkg/fencing/cri ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
       - name: Qualify actual cooperative executor in disposable Kubernetes
         env:
           CGO_ENABLED: 0
@@ -404,7 +404,7 @@ jobs:
         run: |
           awk '
             { print }
-            $0 == "FROM mirror.gcr.io/library/golang:1.27-alpine@sha256:738d1cf061836894ff6bb8c33881080ac66de8cf0586615012a0c8f592649cfa AS builder" {
+            $0 == "FROM mirror.gcr.io/library/golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS builder" {
               print "RUN apk --no-cache add jq coreutils"
               matched++
             }

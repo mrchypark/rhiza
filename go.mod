@@ -1,6 +1,6 @@
 module github.com/mrchypark/rhiza
 
-go 1.27.2
+go 1.27.3
 
 // v0.9.0 was cached by module proxies from the wrong commit.
 retract v0.9.0
@@ -8,12 +8,16 @@ retract v0.9.0
 require (
 	github.com/go-kit/log v0.2.1
 	github.com/google/flatbuffers v25.12.19+incompatible
+	github.com/minio/minio-go/v7 v7.0.95
 	github.com/mrchypark/latticedb-go v0.11.3
 	github.com/ncruces/go-sqlite3 v0.35.3
 	github.com/quic-go/quic-go v0.61.0
 	github.com/thanos-io/objstore v0.0.0-20260817070452-e42d91c337ee
 	golang.org/x/sync v0.23.0
+	google.golang.org/grpc v1.83.2
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
+	k8s.io/cri-api v0.35.2
 )
 
 require (
@@ -73,7 +77,6 @@ require (
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/minio/crc64nvme v1.0.2 // indirect
 	github.com/minio/md5-simd v1.1.2 // indirect
-	github.com/minio/minio-go/v7 v7.0.95 // indirect
 	github.com/ncruces/go-sqlite3-wasm/v3 v3.2.35304 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
@@ -108,7 +111,5 @@ require (
 	google.golang.org/genproto v0.0.0-20260128011058-8636f8732409 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/grpc v1.83.2 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
