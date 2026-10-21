@@ -152,7 +152,7 @@ func (a *AuthorityClient) LookupMutation(ctx context.Context, id Identity, produ
 	if err := a.call(ctx, AuthorityMessage{Action: "mutation-lookup", Identity: id, MutationLookup: &request}, &result); err != nil {
 		return MutationLookupResult{}, err
 	}
-	if (result.Found && result.Entry == nil) || (!result.Found && (result.Entry != nil || result.Archived)) || (result.Archived && !result.Found) {
+	if (result.Found && result.Entry == nil) || (!result.Found && (result.Entry != nil || result.Archived)) {
 		return MutationLookupResult{}, fmt.Errorf("fencing: malformed mutation lookup result")
 	}
 	if result.Entry != nil && result.Entry.Intent != intent {

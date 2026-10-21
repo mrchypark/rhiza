@@ -19,6 +19,9 @@ func TestAuthorityClientMutationLookupPreservesExactTuple(t *testing.T) {
 		Kind: "upload", Key: "key", PayloadRef: "private/object", PayloadDigest: strings.Repeat("b", 64), PayloadSize: 3,
 	}
 	entry := MutationEntry{Intent: intent}
+	changed := intent
+	changed.PayloadDigest = strings.Repeat("c", 64)
+	requestCount := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer token" {
 			t.Errorf("request auth/method mismatch: %s %q", r.Method, r.Header.Get("Authorization"))
@@ -27,8 +30,17 @@ func TestAuthorityClientMutationLookupPreservesExactTuple(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
 			t.Fatal(err)
 		}
-		if message.Action != "mutation-lookup" || message.Identity.WALIdentity != "wal" || message.MutationLookup == nil || message.MutationLookup.ProducerUID != "producer" || message.MutationLookup.Sequence != 1 || message.MutationLookup.Intent != intent {
-			t.Errorf("lookup request changed: %+v", message)
+		requestCount++
+		if message.MutationLookup == nil {
+			t.Errorf("lookup request omitted tuple: action=%q identity=%+v", message.Action, message.Identity)
+		} else {
+			want := intent
+			if requestCount == 2 {
+				want = changed
+			}
+			if message.Action != "mutation-lookup" || message.Identity.WALIdentity != "wal" || message.MutationLookup.ProducerUID != "producer" || message.MutationLookup.Sequence != 1 || message.MutationLookup.Intent != want {
+				t.Errorf("lookup request %d changed: action=%q identity=%+v tuple=%+v want tuple=%+v", requestCount, message.Action, message.Identity, *message.MutationLookup, MutationLookupRequest{ProducerUID: "producer", Sequence: 1, Intent: want})
+			}
 		}
 		_ = json.NewEncoder(w).Encode(MutationLookupResult{Found: true, Entry: &entry})
 	}))
@@ -44,10 +56,8 @@ func TestAuthorityClientMutationLookupPreservesExactTuple(t *testing.T) {
 	if err != nil || !got.Found || got.Entry == nil || got.Entry.Intent != intent {
 		t.Fatalf("lookup lost original entry: %+v %v", got, err)
 	}
-	changed := intent
-	changed.PayloadDigest = strings.Repeat("c", 64)
 	if _, err := client.LookupMutation(context.Background(), id, "producer", 1, changed); err == nil {
-		t.Fatal("changed operation identity accepted locally")
+		t.Fatal("changed caller intent accepted the authority's original response")
 	}
 }
 
