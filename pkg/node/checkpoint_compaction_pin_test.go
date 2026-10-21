@@ -55,13 +55,56 @@ func (b *claimReadBarrier) Attributes(ctx context.Context, name string) (objstor
 	if b.armed.Load() && strings.HasSuffix(name, "/checkpoint/PUBLISHER") && b.reads.Add(1) == 2 {
 		b.armed.Store(false)
 		close(b.entered)
-		select {
-		case <-b.release:
-		case <-ctx.Done():
-			return objstore.ObjectAttributes{}, ctx.Err()
-		}
+		// Only WaitTip may trigger the test's Context.Done entry signal.
+		// The test's deferred cleanup releases this barrier even on failure.
+		<-b.release
 	}
 	return attr, err
+}
+
+func TestClaimReadBarrierDoesNotSignalPrefixWait(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	bucket := &claimReadBarrier{Bucket: objstore.NewInMemBucket(), entered: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-bucket.release:
+		default:
+			close(bucket.release)
+		}
+	}()
+	const key = "test/checkpoint/PUBLISHER"
+	if err := bucket.Upload(ctx, key, strings.NewReader("claim")); err != nil {
+		t.Fatal(err)
+	}
+	callCtx := &prefixWaitContext{Context: ctx, entered: make(chan struct{})}
+	callCtx.armed.Store(true)
+	bucket.reads.Store(1)
+	bucket.armed.Store(true)
+	result := make(chan error, 1)
+	go func() {
+		_, err := bucket.Attributes(callCtx, key)
+		result <- err
+	}()
+	select {
+	case <-bucket.entered:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	close(bucket.release)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case <-callCtx.entered:
+		t.Fatal("storage barrier falsely signaled prefix wait")
+	default:
+	}
 }
 
 // holdGCCandidateScan pauses a real Cleanup only after its publication lease
