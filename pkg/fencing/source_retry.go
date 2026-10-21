@@ -30,8 +30,9 @@ type sourceRetryState struct {
 }
 
 type sourceRetryData struct {
-	Binding BindReceipt       `json:"binding"`
-	Steps   []sourceRetryStep `json:"steps"`
+	Binding BindReceipt        `json:"binding"`
+	Steps   []sourceRetryStep  `json:"steps"`
+	Stages  []sourceRetryStage `json:"stages,omitempty"`
 }
 
 type sourceRetryStep struct {
@@ -150,6 +151,9 @@ func (d sourceRetryData) validate() error {
 	if d.Binding.Producer == nil || len(d.Steps) > MaxMutationJournalEntries {
 		return fmt.Errorf("fencing: source retry binding or capacity invalid")
 	}
+	if err := d.validateStages(); err != nil {
+		return err
+	}
 	owners := make(map[MutationOwnerStep]bool, len(d.Steps))
 	for i, step := range d.Steps {
 		intent := step.Entry.Intent
@@ -160,6 +164,9 @@ func (d sourceRetryData) validate() error {
 		p := MutationProducer{Runtime: d.Binding.Producer.Runtime, WALIdentity: d.Binding.Identity.WALIdentity}
 		if err := p.validateEntry(step.Sequence, step.Entry); err != nil {
 			return err
+		}
+		if intent.Kind == "upload" && !d.hasSealedStage(intent) {
+			return fmt.Errorf("fencing: source upload lacks its retained sealed stage")
 		}
 		if (!step.Admitted && (i != len(d.Steps)-1 || step.Entry.Resolution != nil)) || (step.Advanced && step.Entry.Resolution == nil) {
 			return fmt.Errorf("fencing: source advanced past uncertain admission or result")
