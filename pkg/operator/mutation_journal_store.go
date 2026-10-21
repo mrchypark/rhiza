@@ -40,6 +40,59 @@ func (e *FencingExecutor) enrolledMutationRun(ctx context.Context, runtime fenci
 	return run, nil
 }
 
+// lookupMutation returns only the original entry for a root-enrolled producer
+// tuple. This path never admits or executes work; live reads use GET only.
+func (e *FencingExecutor) lookupMutation(ctx context.Context, statefulSetUID string, id fencing.Identity, request fencing.MutationLookupRequest) (fencing.MutationLookupResult, error) {
+	state, err := e.read(ctx, statefulSetUID, id.SourceClusterID)
+	if err != nil {
+		return fencing.MutationLookupResult{}, err
+	}
+	run, ok := state.Ledger.Runs[id.RunID]
+	if !ok || run.Identity != id || run.Runtime == nil || run.Runtime.StatefulSetUID != statefulSetUID || run.MutationProducerUID == "" ||
+		request.ProducerUID != run.MutationProducerUID || request.Sequence == 0 ||
+		request.Intent.OperationID != fencing.MutationRequestID(request.ProducerUID, request.Sequence) ||
+		run.MutationScopeHash == "" || request.Intent.StoreScopeHash != run.MutationScopeHash {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: mutation lookup is outside the enrolled producer scope")
+	}
+	if err := run.Runtime.Validate(id); err != nil {
+		return fencing.MutationLookupResult{}, err
+	}
+	var resource object
+	if err := e.Kube.Get(ctx, e.mutationProducerPath(*run.Runtime), &resource); err != nil {
+		return fencing.MutationLookupResult{}, err
+	}
+	if nested(resource, "metadata", "deletionTimestamp") != nil || str(nested(resource, "metadata", "uid")) != run.MutationProducerUID || str(nested(resource, "metadata", "resourceVersion")) == "" {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: bound mutation producer storage identity differs")
+	}
+	var producer fencing.MutationProducer
+	decoder := json.NewDecoder(strings.NewReader(str(nested(resource, "data", "producer.json"))))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&producer); err != nil {
+		return fencing.MutationLookupResult{}, err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: trailing producer state")
+	}
+	if producer.Runtime != *run.Runtime || producer.WALIdentity != id.WALIdentity || producer.EvidenceFault != "" || producer.Validate() != nil {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: stored mutation producer identity or state differs")
+	}
+	if request.Sequence <= producer.CompactedThrough {
+		entry, err := e.lookupArchivedMutation(ctx, *run.Runtime, request.ProducerUID, request.Sequence, request.Intent)
+		if err != nil {
+			return fencing.MutationLookupResult{}, err
+		}
+		return fencing.MutationLookupResult{Found: true, Archived: true, Entry: &entry}, nil
+	}
+	if request.Sequence > producer.LastAdmitted {
+		return fencing.MutationLookupResult{}, nil
+	}
+	entry, exists := producer.Entries[request.Sequence]
+	if !exists || entry.Intent != request.Intent {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: live mutation lookup differs from original tuple")
+	}
+	return fencing.MutationLookupResult{Found: true, Entry: &entry}, nil
+}
+
 // reserveMutationProducer may create only Reserved state. It never creates Open
 // state from absence. If root closure already happened, create the deterministic
 // missing producer directly Closed so a delayed initializer cannot reopen it.
