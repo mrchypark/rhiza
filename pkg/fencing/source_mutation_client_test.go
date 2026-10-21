@@ -22,6 +22,7 @@ type sourceMutationFake struct {
 	result          *MutationResolution
 	archivedEntries map[uint64]MutationEntry
 	generation      int64
+	pendingDispatch bool
 	lookupErr       error
 	beforeAdmit     func() error
 }
@@ -88,50 +89,62 @@ func (f *sourceMutationFake) Lookup(ctx context.Context, sequence uint64, intent
 	if entry.Intent != intent {
 		return MutationEntry{}, false, false, errors.New("tuple mismatch")
 	}
-	if f.result != nil && entry.Resolution == nil {
-		if err := f.producer.Prepare(sequence, journalPreparation(f.generation)); err != nil {
-			return MutationEntry{}, false, false, err
-		}
-		hash, err := f.producer.PreparationHash(sequence)
-		if err != nil {
-			return MutationEntry{}, false, false, err
-		}
-		resolution := *f.result
-		resolution.PreparationHash = hash
-		if resolution.Outcome == MutationCommitted {
-			resolution.PayloadDigest = intent.PayloadDigest
-		} else {
-			resolution.PayloadDigest = ""
-		}
-		if err := f.producer.Resolve(sequence, resolution); err != nil {
-			return MutationEntry{}, false, false, err
-		}
-		entry = f.producer.Entries[sequence]
+	entry, err := f.resolve(sequence)
+	if err != nil {
+		return MutationEntry{}, false, false, err
 	}
 	return entry, true, false, nil
 }
 
-func (f *sourceMutationFake) saveArchived(sequence uint64) error {
+func (f *sourceMutationFake) resolve(sequence uint64) (MutationEntry, error) {
 	entry := f.producer.Entries[sequence]
-	if f.result != nil && entry.Resolution == nil {
+	if f.result == nil || entry.Resolution != nil {
+		return entry, nil
+	}
+	if entry.Preparation == nil {
 		if err := f.producer.Prepare(sequence, journalPreparation(f.generation)); err != nil {
-			return err
+			return MutationEntry{}, err
 		}
-		hash, err := f.producer.PreparationHash(sequence)
-		if err != nil {
-			return err
+	}
+	if f.pendingDispatch {
+		if err := f.producer.GrantDispatch(sequence, "copy-1"); err != nil {
+			return MutationEntry{}, err
 		}
-		resolution := *f.result
-		resolution.PreparationHash = hash
-		if resolution.Outcome == MutationCommitted {
-			resolution.PayloadDigest = entry.Intent.PayloadDigest
-		} else {
-			resolution.PayloadDigest = ""
-		}
-		if err := f.producer.Resolve(sequence, resolution); err != nil {
-			return err
+	}
+	resolution := *f.result
+	if resolution.AllCopiesTerminal {
+		if err := f.producer.SealDispatch(sequence); err != nil {
+			return MutationEntry{}, err
 		}
 		entry = f.producer.Entries[sequence]
+		for dispatchID, dispatch := range entry.Dispatches {
+			if dispatch.ReceiptDigest == "" {
+				if err := f.producer.RecordDispatchTerminal(sequence, dispatchID, journalTestDigest); err != nil {
+					return MutationEntry{}, err
+				}
+			}
+		}
+	}
+	hash, err := f.producer.PreparationHash(sequence)
+	if err != nil {
+		return MutationEntry{}, err
+	}
+	resolution.PreparationHash = hash
+	if resolution.Outcome == MutationCommitted {
+		resolution.PayloadDigest = entry.Intent.PayloadDigest
+	} else {
+		resolution.PayloadDigest = ""
+	}
+	if err := f.producer.Resolve(sequence, resolution); err != nil {
+		return MutationEntry{}, err
+	}
+	return f.producer.Entries[sequence], nil
+}
+
+func (f *sourceMutationFake) saveArchived(sequence uint64) error {
+	entry, err := f.resolve(sequence)
+	if err != nil {
+		return err
 	}
 	if f.archivedEntries == nil {
 		f.archivedEntries = make(map[uint64]MutationEntry)
@@ -342,6 +355,19 @@ func TestSourceMutationClientReopensDurableResultWithoutStagingOrLookup(t *testi
 	}
 	if fake.admits != 1 || fake.reserves != 1 {
 		t.Fatal("reopened durable result initiated new remote work")
+	}
+}
+
+func TestSourceMutationClientCommitCanRetainUnresolvedCopies(t *testing.T) {
+	client, fake, _, _ := newSourceMutationClientTest(t)
+	fake.pendingDispatch = true
+	fake.result = &MutationResolution{Outcome: MutationCommitted, ReceiptDigest: journalTestDigest}
+	if err := client.Upload(context.Background(), bootstrapDraft("run", "registration"), []byte("{}")); err != nil {
+		t.Fatalf("committed result with pending copy: %v", err)
+	}
+	entry := fake.producer.Entries[1]
+	if entry.Resolution == nil || entry.Resolution.AllCopiesTerminal || entry.DispatchClosed || entry.Dispatches["copy-1"].ReceiptDigest != "" {
+		t.Fatal("fixture forced outstanding copy work to terminal before commitment")
 	}
 }
 
