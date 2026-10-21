@@ -78,7 +78,7 @@ func exerciseIndependentVoterThenGeneration(t *testing.T) {
 	}
 	activateStoredProducer(t, e, id, other)
 	if _, err := e.changeMutationProducer(t.Context(), other, func(p *fencing.MutationProducer) error {
-		return p.Admit(1, fencing.MutationIntent{OperationID: "survivor-inflight", Kind: "delete", Key: "survivor"})
+		return p.Admit(1, completeStoreIntent(fencing.MutationIntent{OperationID: "survivor-inflight", Kind: "delete", Key: "survivor"}))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func exerciseIndependentVoterThenGeneration(t *testing.T) {
 	// Admission on the survivor remains open after the other voter is fenced;
 	// no generation-wide storage silence was required for the first proof.
 	if _, err := e.changeMutationProducer(t.Context(), other, func(p *fencing.MutationProducer) error {
-		if err := p.Admit(2, fencing.MutationIntent{OperationID: "survivor-after-fence", Kind: "delete", Key: "another"}); err != nil {
+		if err := p.Admit(2, completeStoreIntent(fencing.MutationIntent{OperationID: "survivor-after-fence", Kind: "delete", Key: "another"})); err != nil {
 			return err
 		}
 		for _, sequence := range []uint64{1, 2} {
@@ -260,7 +260,7 @@ func TestIndependentV2InventoryChangeDuringCollectionDoesNotPublish(t *testing.T
 func TestIndependentV2CannotPublishWithUnresolvedMutation(t *testing.T) {
 	e, f, record, runtime := newIndependentV2Fixture(t)
 	if _, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-		return p.Admit(2, fencing.MutationIntent{OperationID: "unknown", Kind: "delete", Key: "pending"})
+		return p.Admit(2, completeStoreIntent(fencing.MutationIntent{OperationID: "unknown", Kind: "delete", Key: "pending"}))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestIndependentV2CannotPublishWithUnresolvedMutation(t *testing.T) {
 func TestIndependentV2CooperativeDrainCannotBypassAuthorityMutations(t *testing.T) {
 	e, f, record, runtime := newIndependentV2Fixture(t)
 	if _, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-		return p.Admit(2, fencing.MutationIntent{OperationID: "authority-still-pending", Kind: "delete", Key: "pending"})
+		return p.Admit(2, completeStoreIntent(fencing.MutationIntent{OperationID: "authority-still-pending", Kind: "delete", Key: "pending"}))
 	}); err != nil {
 		t.Fatal(err)
 	}

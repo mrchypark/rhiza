@@ -104,7 +104,7 @@ func TestTerminalStoreRejectsIncompleteOrUntrustedTermination(t *testing.T) {
 			e, f, runtime := terminalStoreFixture(t)
 			if kind == "unresolved mutation" {
 				_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-					return p.Admit(2, fencing.MutationIntent{OperationID: "unresolved", Kind: "delete", Key: "key"})
+					return p.Admit(2, completeStoreIntent(fencing.MutationIntent{OperationID: "unresolved", Kind: "delete", Key: "key"}))
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -239,7 +239,7 @@ func TestTerminalStoreRequiresPreparedMutationReceiptVerification(t *testing.T) 
 	e, _, id, runtime := newMutationStoreFixture(t)
 	activateStoredProducer(t, e, id, runtime)
 	_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-		if err := p.Admit(1, fencing.MutationIntent{OperationID: "prepared-delete", Kind: "delete", Key: "key"}); err != nil {
+		if err := p.Admit(1, completeStoreIntent(fencing.MutationIntent{StoreScopeHash: hashJSON(terminalTestStorage), OperationID: "prepared-delete", Kind: "delete", Key: "key"})); err != nil {
 			return err
 		}
 		if err := p.Prepare(1, fencing.MutationPreparation{Profile: "gcs-json-v1", StoreScopeHash: hashJSON(terminalTestStorage), GenerationSet: true, Generation: 12}); err != nil {
@@ -292,7 +292,7 @@ func TestTerminalStoreRejectsOtherStorePreparedLiveOrArchived(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err = e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-				if err := p.Admit(1, fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, 1), Kind: "delete", Key: "key"}); err != nil {
+				if err := p.Admit(1, completeStoreIntent(fencing.MutationIntent{StoreScopeHash: strings.Repeat("f", 64), OperationID: fencing.MutationRequestID(run.MutationProducerUID, 1), Kind: "delete", Key: "key"})); err != nil {
 					return err
 				}
 				if err := p.Prepare(1, fencing.MutationPreparation{Profile: "gcs-json-v1", StoreScopeHash: strings.Repeat("f", 64), GenerationSet: true, Generation: 12}); err != nil {

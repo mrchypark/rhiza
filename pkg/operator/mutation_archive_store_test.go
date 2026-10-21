@@ -18,7 +18,7 @@ func appendSettledStoreMutation(t *testing.T, e *FencingExecutor, runtime fencin
 		t.Fatal(err)
 	}
 	_, err = e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-		if err := p.Admit(sequence, fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, sequence), Kind: "delete", Key: fmt.Sprint("key-", sequence)}); err != nil {
+		if err := p.Admit(sequence, completeStoreIntent(fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, sequence), Kind: "delete", Key: fmt.Sprint("key-", sequence)})); err != nil {
 			return err
 		}
 		return p.CancelUnprepared(sequence, strings.Repeat("a", 64))
@@ -260,7 +260,7 @@ func TestMutationArchiveStoreArchivedLookupPreservesIdentityAndOutcome(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	intent := fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, 1), Kind: "upload", Key: "key", PayloadRef: "private/staged-object", PayloadDigest: strings.Repeat("a", 64)}
+	intent := completeStoreIntent(fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, 1), Kind: "upload", Key: "key", PayloadRef: "private/staged-object", PayloadDigest: strings.Repeat("a", 64)})
 	_, err = e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
 		if err := p.Admit(1, intent); err != nil {
 			return err
@@ -326,7 +326,7 @@ func TestMutationArchiveStoreLiveBarrierRequiresPreparedReceiptVerifier(t *testi
 		t.Fatal(err)
 	}
 	_, err = e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-		intent := fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, 1), Kind: "delete", Key: "key"}
+		intent := completeStoreIntent(fencing.MutationIntent{OperationID: fencing.MutationRequestID(run.MutationProducerUID, 1), Kind: "delete", Key: "key"})
 		if err := p.Admit(1, intent); err != nil {
 			return err
 		}

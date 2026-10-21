@@ -15,6 +15,21 @@ import (
 	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
+func completeStoreIntent(intent fencing.MutationIntent) fencing.MutationIntent {
+	intent.ContractVersion = fencing.MutationIntentVersion
+	if intent.StoreScopeHash == "" {
+		intent.StoreScopeHash = strings.Repeat("a", 64)
+	}
+	intent.OwnerStep = fencing.MutationOwnerStep{Owner: "fixture", Workflow: "publication", Step: intent.OperationID, Attempt: 1}
+	if intent.Kind == "delete" {
+		intent.Condition = fencing.MutationCondition{Mode: fencing.MutationMatchGeneration, Generation: 12}
+	} else {
+		intent.Condition = fencing.MutationCondition{Mode: fencing.MutationUnconditional}
+		intent.PayloadSize = 1
+	}
+	return intent
+}
+
 type mutationStoreFixture struct {
 	mu                   sync.Mutex
 	objects              map[string]object
@@ -179,7 +194,7 @@ func TestMutationJournalStoreClosureIncludesMissingReservedProducer(t *testing.T
 		t.Fatalf("closure not durable: %+v %v", p, err)
 	}
 	_, err = restarted.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-		return p.Admit(1, fencing.MutationIntent{OperationID: "late", Kind: "delete", Key: "key"})
+		return p.Admit(1, completeStoreIntent(fencing.MutationIntent{OperationID: "late", Kind: "delete", Key: "key"}))
 	})
 	if !errors.Is(err, fencing.ErrClosed) {
 		t.Fatalf("late admission crossed closure: %v", err)
@@ -216,7 +231,7 @@ func TestMutationJournalStoreCASRejectsDelayedAdmission(t *testing.T) {
 	go func() {
 		first := true
 		_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-			if err := p.Admit(1, fencing.MutationIntent{OperationID: "delayed", Kind: "delete", Key: "key"}); err != nil {
+			if err := p.Admit(1, completeStoreIntent(fencing.MutationIntent{OperationID: "delayed", Kind: "delete", Key: "key"})); err != nil {
 				return err
 			}
 			if first {
@@ -245,7 +260,7 @@ func TestMutationJournalStoreCASRejectsDelayedAdmission(t *testing.T) {
 func TestMutationJournalStoreLostResponseRetainsSameOperation(t *testing.T) {
 	e, f, id, runtime := newMutationStoreFixture(t)
 	activateStoredProducer(t, e, id, runtime)
-	intent := fencing.MutationIntent{OperationID: "same-op", Kind: "delete", Key: "key"}
+	intent := completeStoreIntent(fencing.MutationIntent{OperationID: "same-op", Kind: "delete", Key: "key"})
 	f.mu.Lock()
 	f.lostResponse = true
 	f.mu.Unlock()
@@ -310,7 +325,7 @@ func TestMutationJournalStoreRejectsCorruptionAndBoundsConflicts(t *testing.T) {
 			}
 			f.mu.Unlock()
 			_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
-				return p.Admit(1, fencing.MutationIntent{OperationID: "op", Kind: "delete", Key: "key"})
+				return p.Admit(1, completeStoreIntent(fencing.MutationIntent{OperationID: "op", Kind: "delete", Key: "key"}))
 			})
 			if err == nil {
 				t.Fatal("unsafe producer accepted")
