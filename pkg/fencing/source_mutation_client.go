@@ -84,7 +84,7 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 	}
 	intent := draft
 	intent.PayloadRef, intent.PayloadDigest, intent.PayloadSize = stage.Payload.Ref, stage.Payload.Digest, stage.Payload.Size
-	step, err := c.state.allocate(intent)
+	step, err = c.state.allocate(intent)
 	if err != nil {
 		return err
 	}
