@@ -36,6 +36,9 @@ type FencingExecutor struct {
 	// Prepared work needs trusted receipt/session verification, not just valid
 	// digest strings. A missing provider verifier cannot qualify archived work.
 	VerifyMutationEvidence func(context.Context, fencing.RuntimeBinding, uint64, fencing.MutationEntry) error
+	// The trusted runtime provider must verify the complete enrolled incarnation
+	// and original closure, including descendants and prevention of its return.
+	VerifyRuntimeEvidence func(context.Context, fencing.RuntimeBinding, fencing.StopRequest, []byte) error
 }
 
 type fenceLedger struct {
