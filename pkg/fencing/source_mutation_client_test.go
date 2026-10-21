@@ -190,7 +190,6 @@ func TestSourceMutationClientLostAdmissionResponseReopensSameTuple(t *testing.T)
 		t.Fatalf("admit count = %d", fake.admits)
 	}
 	client.state = reopenSourceRetryTest(t, client.state, binding, dir)
-	fake.state = client.state
 	fake.loseAdmit = false
 	fake.result = &MutationResolution{Outcome: MutationCommitted, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true}
 	if err := client.Upload(context.Background(), draft, body); err != nil {
