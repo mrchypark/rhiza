@@ -28,10 +28,21 @@ The fake API tests do not constitute Kubernetes/GCS qualification or validate
 provider receipt authenticity. A fixture-only initial failure used an empty WAL
 at activation; it was corrected without relaxing the production WAL requirement.
 
-This initial journal retains at most 64 entries and applies backpressure; it does
-not compact terminal entries or yet provide a sustained-write deployment profile.
-Before production integration, implement reviewed archive/watermark compaction
-or independently enrolled bounded shard rotation. The producer object's Kubernetes
+The live journal retains at most 64 entries and applies backpressure. The pure
+compaction contract now snapshots exact terminal prefixes with immutable prior-head
+references and producer UID/sequence request identities. Commit rejects overlapping
+stale plans, preserves unrelated tail/closure state, and rejects all executable
+operations at or below the watermark. A 1,024-cycle JSON reload regression retains
+4,096 operations' archive coverage while keeping the live value bounded.
+The archive persistence/verified-chain backend is not yet implemented; the existing
+backend explicitly refuses compacted-barrier authorization instead of trusting a
+watermark alone. Therefore this is not a sustained-write deployment profile yet.
+
+Dispatch rights are registered before workers may send requests. All-copy completion
+requires sealed permission admission and terminal evidence for every granted right,
+including workers paused before sending. This follows the additional counterexample
+in [Pro's complete compaction review](reviews/2026-10-21-compaction-pro-followup.md).
+The producer object's Kubernetes
 UID is now pinned in root enrollment before WAL admission when the new
 RequireMutationJournal policy is selected; the backend refuses a replaced object,
 including across executor restart. The policy is not yet selected in production.
@@ -39,6 +50,13 @@ Wire the
 trusted provider worker, durable staged payloads, globally serialized per-key
 dispatch and verified all-copy evidence. No storage bypass, terminal-reference,
 CRI-runtime termination, or positive dead-Pod recovery claim is made here.
+
+`pkg/fencing/terminal_reference.go` separately preserves immutable per-run terminal
+references for the verified evidence-v2 path. References remain bound to the original
+voter closure, runtime, producer UID, object UID/digest and storage scope across a
+later generation closure. They cannot manufacture a cooperative drain/exit record.
+The v2 verifier, immutable artifact loader and history composition are not wired yet;
+the original retired-voter end-to-end regression is therefore still unresolved.
 
 ## Acceptance contract
 

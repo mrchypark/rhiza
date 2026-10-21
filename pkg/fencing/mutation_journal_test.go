@@ -134,6 +134,8 @@ func TestMutationJournalCreateZeroCannotHideDelayedCopy(t *testing.T) {
 			// Preserve the original uncertain-copies receipt, then append distinct
 			// evidence only after the trusted executor settles all copies/sessions.
 			completion := MutationCopyCompletion{PreparationHash: hash, ReceiptDigest: strings.Repeat("b", 64)}
+			rejectJournalUnchanged(t, p, func() error { return p.ConfirmCopiesTerminal(1, completion) })
+			mustJournal(t, p.SealDispatch(1))
 			mustJournal(t, p.ConfirmCopiesTerminal(1, completion))
 			mustJournal(t, p.ConfirmCopiesTerminal(1, completion))
 			p = reloadProducer(t, p)
@@ -198,6 +200,7 @@ func TestMutationJournalPreparationAndReceiptsBindExactProducer(t *testing.T) {
 	receipt.Outcome, receipt.PayloadDigest = MutationRejected, ""
 	rejectJournalUnchanged(t, p, func() error { return p.Resolve(1, receipt) })
 	receipt.AllCopiesTerminal = true
+	mustJournal(t, p.SealDispatch(1))
 	mustJournal(t, p.Resolve(1, receipt))
 }
 
@@ -211,6 +214,7 @@ func TestMutationJournalLateResumableSessionCannotChangePreparation(t *testing.T
 	rejectJournalUnchanged(t, p, func() error { return p.Prepare(1, prepared) })
 	hash, err := p.PreparationHash(1)
 	mustJournal(t, err)
+	mustJournal(t, p.SealDispatch(1))
 	mustJournal(t, p.Resolve(1, MutationResolution{Outcome: MutationRejected, PreparationHash: hash, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true}))
 	rejectJournalUnchanged(t, p, func() error { return p.Prepare(1, prepared) })
 	// Creating B externally is not an executable authorization. The executor
