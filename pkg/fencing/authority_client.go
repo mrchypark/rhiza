@@ -34,9 +34,11 @@ type MutationLookupRequest struct {
 // MutationLookupResult preserves the exact durable entry, including an
 // unresolved result. Found=false means only that this tuple was never admitted.
 type MutationLookupResult struct {
-	Found    bool           `json:"found"`
-	Archived bool           `json:"archived,omitempty"`
-	Entry    *MutationEntry `json:"entry,omitempty"`
+	Found            bool                      `json:"found"`
+	Archived         bool                      `json:"archived,omitempty"`
+	CompactedThrough uint64                    `json:"compactedThrough,omitempty"`
+	ArchiveHead      *MutationArchiveReference `json:"archiveHead,omitempty"`
+	Entry            *MutationEntry            `json:"entry,omitempty"`
 }
 
 type AuthorityClient struct {
@@ -152,7 +154,10 @@ func (a *AuthorityClient) LookupMutation(ctx context.Context, id Identity, produ
 	if err := a.call(ctx, AuthorityMessage{Action: "mutation-lookup", Identity: id, MutationLookup: &request}, &result); err != nil {
 		return MutationLookupResult{}, err
 	}
-	if (result.Found && result.Entry == nil) || (!result.Found && (result.Entry != nil || result.Archived)) {
+	if (result.Found && result.Entry == nil) || (!result.Found && result.Entry != nil) ||
+		(result.Archived && (!result.Found || sequence > result.CompactedThrough)) ||
+		((result.CompactedThrough == 0) != (result.ArchiveHead == nil)) || (result.ArchiveHead != nil && !result.ArchiveHead.Valid()) ||
+		(!result.Archived && result.Found && sequence <= result.CompactedThrough) {
 		return MutationLookupResult{}, fmt.Errorf("fencing: malformed mutation lookup result")
 	}
 	if result.Entry != nil && result.Entry.Intent != intent {

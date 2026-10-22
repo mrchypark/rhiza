@@ -51,16 +51,31 @@ func (e *FencingExecutor) bindSupervisorWAL(ctx context.Context, uid string, id 
 		}
 		scopeHash = hashJSON(scope)
 	}
-	return e.bindWALAtScope(ctx, uid, id, scopeHash)
+	stageIncarnation := ""
+	if e.SourceStages != nil {
+		stageIncarnation = e.SourceStages.incarnation
+	}
+	return e.bindWALAtScopeWithStage(ctx, uid, id, scopeHash, stageIncarnation)
 }
 
 // scopeHash is derived only by the authenticated server from the owned workload,
 // never accepted from the supervisor's request body. Tests use synthetic scopes.
 func (e *FencingExecutor) bindWALAtScope(ctx context.Context, uid string, id fencing.Identity, scopeHash string) (fencing.BindReceipt, error) {
+	return e.bindWALAtScopeWithStage(ctx, uid, id, scopeHash, "")
+}
+
+func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid string, id fencing.Identity, scopeHash, stageIncarnation string) (fencing.BindReceipt, error) {
 	state, err := e.change(ctx, uid, id.SourceClusterID, func(l *fencing.Ledger) error {
 		if l.RequireMutationJournal {
 			if err := l.BindMutationScope(id, scopeHash, fencing.MutationExecutionProfile); err != nil {
 				return err
+			}
+			if stageIncarnation != "" {
+				if err := l.BindMutationStage(id, stageIncarnation); err != nil {
+					return err
+				}
+			} else if l.Runs[id.RunID].MutationStageIncarnation != "" {
+				return fmt.Errorf("fencing: bound mutation stage store is unavailable")
 			}
 		} else if scopeHash != "" {
 			return fmt.Errorf("fencing: mutation binding profile changed")
@@ -97,12 +112,13 @@ func (e *FencingExecutor) bindWALAtScope(ctx context.Context, uid string, id fen
 	}
 	receipt := fencing.BindReceipt{Identity: id}
 	if confirmed.Ledger.RequireMutationJournal {
-		if current.Runtime == nil || run.Runtime == nil || *current.Runtime != *run.Runtime || current.MutationProducerUID != run.MutationProducerUID || current.MutationScopeHash != scopeHash || current.MutationProfile != fencing.MutationExecutionProfile {
+		if current.Runtime == nil || run.Runtime == nil || *current.Runtime != *run.Runtime || current.MutationProducerUID != run.MutationProducerUID || current.MutationScopeHash != scopeHash || current.MutationProfile != fencing.MutationExecutionProfile || current.MutationStageIncarnation != stageIncarnation {
 			return fencing.BindReceipt{}, fmt.Errorf("fencing: producer binding changed during activation")
 		}
 		receipt.Producer = &fencing.ProducerBinding{ContractVersion: fencing.MutationIntentVersion,
 			Runtime: *current.Runtime, ProducerUID: current.MutationProducerUID,
-			StoreScopeHash: current.MutationScopeHash, ExecutionProfile: current.MutationProfile}
+			StoreScopeHash: current.MutationScopeHash, ExecutionProfile: current.MutationProfile,
+			StageIncarnation: current.MutationStageIncarnation}
 	}
 	return receipt, receipt.Validate(id)
 }

@@ -16,16 +16,17 @@ type Ledger struct {
 }
 
 type Run struct {
-	Identity            Identity           `json:"identity"`
-	Stop                *StopRequest       `json:"stop,omitempty"`
-	Drain               *DrainReceipt      `json:"drain,omitempty"`
-	Exited              bool               `json:"exited,omitempty"`
-	NeverBoundExit      *StopRequest       `json:"neverBoundExit,omitempty"`
-	Runtime             *RuntimeBinding    `json:"runtime,omitempty"`
-	MutationProducerUID string             `json:"mutationProducerUID,omitempty"`
-	MutationScopeHash   string             `json:"mutationScopeHash,omitempty"`
-	MutationProfile     string             `json:"mutationProfile,omitempty"`
-	IndependentTerminal *TerminalReference `json:"independentTerminal,omitempty"`
+	Identity                 Identity           `json:"identity"`
+	Stop                     *StopRequest       `json:"stop,omitempty"`
+	Drain                    *DrainReceipt      `json:"drain,omitempty"`
+	Exited                   bool               `json:"exited,omitempty"`
+	NeverBoundExit           *StopRequest       `json:"neverBoundExit,omitempty"`
+	Runtime                  *RuntimeBinding    `json:"runtime,omitempty"`
+	MutationProducerUID      string             `json:"mutationProducerUID,omitempty"`
+	MutationScopeHash        string             `json:"mutationScopeHash,omitempty"`
+	MutationProfile          string             `json:"mutationProfile,omitempty"`
+	MutationStageIncarnation string             `json:"mutationStageIncarnation,omitempty"`
+	IndependentTerminal      *TerminalReference `json:"independentTerminal,omitempty"`
 }
 
 func (l *Ledger) Register(identity Identity) error {

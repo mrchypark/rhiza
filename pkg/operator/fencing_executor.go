@@ -45,6 +45,9 @@ type FencingExecutor struct {
 	// Only a trusted runtime/power provider can collect a terminal receipt. A
 	// missing or unreachable provider leaves the operation pending.
 	CollectRuntimeEvidence func(context.Context, fencing.RuntimeBinding, fencing.StopRequest) ([]byte, error)
+	// RuntimeAgent captures the exact containerd/cgroup incarnation before
+	// RegisterEnrolled is durably persisted and before supervisor child startup.
+	RuntimeAgent *RuntimeAgentClient
 }
 
 type fenceLedger struct {
@@ -162,6 +165,26 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "supervisor identity rejected", http.StatusForbidden)
 		return
 	}
+	var enrolled *fencing.RuntimeBinding
+	if message.Action == "register" && e.RuntimeAgent != nil {
+		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil {
+			http.Error(w, "malformed runtime registration", http.StatusBadRequest)
+			return
+		}
+		base, enrollErr := e.RuntimeAgent.enrollmentBase(r.Context(), e.Kube.Namespace, uid, message.Identity)
+		if enrollErr == nil {
+			var binding fencing.RuntimeBinding
+			binding, enrollErr = e.RuntimeAgent.Enroll(r.Context(), base)
+			if enrollErr == nil {
+				enrolled = &binding
+			}
+		}
+		if enrollErr != nil {
+			log.Printf("runtime enrollment pending: podUID=%s runID=%s error=%v", message.Identity.PodUID, message.Identity.RunID, enrollErr)
+			http.Error(w, "runtime enrollment unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	var stop fencing.StopRequest
 	var binding fencing.BindReceipt
 	var mutationLookup fencing.MutationLookupResult
@@ -192,6 +215,13 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		_, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
 			switch message.Action {
 			case "register":
+				if enrolled != nil {
+					l.RequireRuntimeBinding = true
+					return l.RegisterEnrolled(message.Identity, *enrolled)
+				}
+				if l.RequireRuntimeBinding {
+					return fmt.Errorf("fencing: runtime agent is required")
+				}
 				return l.Register(message.Identity)
 			case "drain":
 				if message.Drain == nil || message.Drain.Request.Identity != message.Identity {

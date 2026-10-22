@@ -15,7 +15,8 @@ func testProducerReceipt() BindReceipt {
 	id.WALIdentity = "wal"
 	return BindReceipt{Identity: id, Producer: &ProducerBinding{ContractVersion: MutationIntentVersion,
 		Runtime: enrolledRuntime(id, "container"), ProducerUID: "pinned-producer",
-		StoreScopeHash: journalTestDigest, ExecutionProfile: MutationExecutionProfile}}
+		StoreScopeHash: journalTestDigest, ExecutionProfile: MutationExecutionProfile,
+		StageIncarnation: journalTestDigest}}
 }
 
 func TestProducerBindReceiptRejectsIncompleteOrDifferentIdentity(t *testing.T) {
@@ -27,6 +28,7 @@ func TestProducerBindReceiptRejectsIncompleteOrDifferentIdentity(t *testing.T) {
 		"version":  func(r *BindReceipt) { r.Producer.ContractVersion = 0 },
 		"scope":    func(r *BindReceipt) { r.Producer.StoreScopeHash = "" },
 		"profile":  func(r *BindReceipt) { r.Producer.ExecutionProfile = "unsupported" },
+		"stage":    func(r *BindReceipt) { r.Producer.StageIncarnation = "invalid" },
 	}
 	for name, change := range mutations {
 		t.Run(name, func(t *testing.T) {

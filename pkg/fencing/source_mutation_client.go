@@ -20,7 +20,7 @@ type sourceMutationAuthority interface {
 	ReserveUpload(context.Context, string, MutationIntent) error
 	SealUpload(context.Context, string, []byte) (sourceSealedPayload, error)
 	Admit(context.Context, uint64, MutationIntent) error
-	Lookup(context.Context, uint64, MutationIntent) (entry MutationEntry, found bool, archived bool, err error)
+	Lookup(context.Context, uint64, MutationIntent) (MutationLookupResult, error)
 }
 
 // sourceMutationClient owns only the source-side orchestration. Its retry state
@@ -46,6 +46,15 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 	if err != nil {
 		return err
 	}
+	if !hasStep && c.state.atCapacity() {
+		if err := c.refreshArchivedOwners(ctx); err != nil {
+			return err
+		}
+		stage, step, hasStep, err = c.state.owner(draft)
+		if err != nil {
+			return err
+		}
+	}
 	if hasStep {
 		if !sameSourcePayload(step.Entry.Intent, payload) {
 			return fmt.Errorf("fencing: retry changed original upload bytes")
@@ -55,13 +64,14 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 		}
 		return c.settle(ctx, step)
 	}
-	if stage.Ticket == "" {
-		stage, err = c.state.reserveUpload(draft)
-		if err != nil {
-			return err
-		}
+	stage, err = c.state.reserveUploadWithPayload(draft, payload)
+	if err != nil {
+		return err
 	}
 	if stage.Payload == nil {
+		if err := c.state.markStageRemoteStarted(stage.Ticket); err != nil {
+			return err
+		}
 		if err := c.authority.ReserveUpload(ctx, stage.Ticket, stage.Draft); err != nil {
 			return err
 		}
@@ -91,6 +101,26 @@ func (c *sourceMutationClient) Upload(ctx context.Context, draft MutationIntent,
 	return c.settle(ctx, step)
 }
 
+// refreshArchivedOwners is used only at the bounded local capacity edge. It
+// resolves retained exact tuples and retires only the authority-authenticated
+// contiguous archive prefix; it never infers a sequence from LastAdmitted.
+func (c *sourceMutationClient) refreshArchivedOwners(ctx context.Context) error {
+	for {
+		step, ok := c.state.firstStep()
+		if !ok {
+			return nil
+		}
+		before := c.state.retiredThrough()
+		err := c.settle(ctx, step)
+		if err != nil && !errors.Is(err, errMutationExcluded) && !errors.Is(err, errMutationRejected) {
+			return err
+		}
+		if c.state.retiredThrough() == before {
+			return fmt.Errorf("fencing: source retry capacity remains full until the exact terminal prefix is archived")
+		}
+	}
+}
+
 func sameSourcePayload(intent MutationIntent, payload []byte) bool {
 	digest := sha256.Sum256(payload)
 	return intent.PayloadSize == int64(len(payload)) && intent.PayloadDigest == hex.EncodeToString(digest[:])
@@ -98,19 +128,19 @@ func sameSourcePayload(intent MutationIntent, payload []byte) bool {
 
 func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep) error {
 	intent, sequence := step.Entry.Intent, step.Sequence
-	entry, found, archived, err := c.authority.Lookup(ctx, sequence, intent)
+	result, err := c.authority.Lookup(ctx, sequence, intent)
 	if err != nil {
 		return err
 	}
-	if found {
-		if entry.Intent != intent {
+	if result.Found {
+		if result.Entry == nil || result.Entry.Intent != intent {
 			return fmt.Errorf("fencing: authority lookup changed original intent")
 		}
 		if err := c.state.admitted(sequence, intent); err != nil {
 			return err
 		}
 	} else {
-		if archived {
+		if result.Archived {
 			return fmt.Errorf("fencing: archived mutation lookup omitted its result")
 		}
 		if step.Admitted {
@@ -127,14 +157,15 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 		if err := c.state.admitted(sequence, intent); err != nil {
 			return err
 		}
-		entry, found, archived, err = c.authority.Lookup(ctx, sequence, intent)
+		result, err = c.authority.Lookup(ctx, sequence, intent)
 		if err != nil {
 			return err
 		}
-		if !found {
+		if !result.Found || result.Entry == nil {
 			return ErrPending
 		}
 	}
+	entry := *result.Entry
 	if entry.Intent != intent {
 		return fmt.Errorf("fencing: authority result changed original intent")
 	}
@@ -144,7 +175,13 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 	if err := c.state.resolved(sequence, entry); err != nil {
 		return err
 	}
-	return c.finish(sourceRetryStep{Sequence: sequence, Entry: entry})
+	finishErr := c.finish(sourceRetryStep{Sequence: sequence, Entry: entry})
+	if result.CompactedThrough > 0 {
+		if err := c.state.retireArchived(result.CompactedThrough, result.ArchiveHead); err != nil {
+			return err
+		}
+	}
+	return finishErr
 }
 
 func (c *sourceMutationClient) finish(step sourceRetryStep) error {
@@ -172,6 +209,11 @@ func (s *sourceRetryState) owner(draft MutationIntent) (sourceRetryStage, source
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return sourceRetryStage{}, sourceRetryStep{}, false, err
+	}
+	for _, owner := range s.data.RetiredOwners {
+		if owner == draft.OwnerStep {
+			return sourceRetryStage{}, sourceRetryStep{}, false, fmt.Errorf("fencing: source owner was already retired; owner identities are never reusable")
+		}
 	}
 	var stage sourceRetryStage
 	for _, saved := range s.data.Stages {

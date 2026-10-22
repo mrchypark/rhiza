@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -30,9 +31,14 @@ type sourceRetryState struct {
 }
 
 type sourceRetryData struct {
-	Binding BindReceipt        `json:"binding"`
-	Steps   []sourceRetryStep  `json:"steps"`
-	Stages  []sourceRetryStage `json:"stages,omitempty"`
+	Binding          BindReceipt               `json:"binding"`
+	NextSequence     uint64                    `json:"nextSequence"`
+	RetiredThrough   uint64                    `json:"retiredThrough,omitempty"`
+	ArchiveHead      *MutationArchiveReference `json:"archiveHead,omitempty"`
+	PendingPayloadGC []string                  `json:"pendingPayloadGC,omitempty"`
+	RetiredOwners    []MutationOwnerStep       `json:"retiredOwners,omitempty"`
+	Steps            []sourceRetryStep         `json:"steps"`
+	Stages           []sourceRetryStage        `json:"stages,omitempty"`
 }
 
 type sourceRetryStep struct {
@@ -61,8 +67,8 @@ func loadSourceRetryState(dir string, binding BindReceipt, create bool) (*source
 	if err := binding.Validate(binding.Identity); err != nil {
 		return nil, err
 	}
-	if binding.Producer == nil {
-		return nil, fmt.Errorf("fencing: source retry requires a mutation binding")
+	if binding.Producer == nil || !mutationDigestValid(binding.Producer.StageIncarnation) {
+		return nil, fmt.Errorf("fencing: source retry requires a root-pinned mutation stage binding")
 	}
 	if create {
 		if err := os.Mkdir(dir, 0700); err != nil {
@@ -92,7 +98,7 @@ func loadSourceRetryState(dir string, binding BindReceipt, create bool) (*source
 		}
 	}()
 	if create {
-		if err := s.persist(sourceRetryData{Binding: binding.clone()}); err != nil {
+		if err := s.persist(sourceRetryData{Binding: binding.clone(), NextSequence: 1}); err != nil {
 			return nil, err
 		}
 	} else {
@@ -134,6 +140,9 @@ func loadSourceRetryState(dir string, binding BindReceipt, create bool) (*source
 			return nil, err
 		}
 		s.data = saved.Data
+		if err := s.recoverPayloadFiles(); err != nil {
+			return nil, err
+		}
 	}
 	for _, directory := range []string{dir, filepath.Dir(dir)} {
 		if err := s.syncDir(directory); err != nil {
@@ -148,16 +157,37 @@ func (d sourceRetryData) validate() error {
 	if err := d.Binding.Validate(d.Binding.Identity); err != nil {
 		return err
 	}
-	if d.Binding.Producer == nil || len(d.Steps) > MaxMutationJournalEntries {
+	if d.Binding.Producer == nil || d.NextSequence == 0 || d.RetiredThrough >= d.NextSequence || uint64(len(d.Steps)) != d.NextSequence-d.RetiredThrough-1 || len(d.Steps) > MaxMutationJournalEntries || len(d.PendingPayloadGC) > MaxMutationJournalEntries ||
+		(d.RetiredThrough == 0) != (d.ArchiveHead == nil) || (d.ArchiveHead != nil && !d.ArchiveHead.Valid()) {
 		return fmt.Errorf("fencing: source retry binding or capacity invalid")
 	}
 	if err := d.validateStages(); err != nil {
 		return err
 	}
+	gc := make(map[string]bool, len(d.PendingPayloadGC))
+	for _, ref := range d.PendingPayloadGC {
+		if len(ref) != 72 || !strings.HasPrefix(ref, "payload-") || !mutationDigestValid(ref[len("payload-"):]) || gc[ref] {
+			return fmt.Errorf("fencing: invalid retired source payload reference")
+		}
+		for _, stage := range d.Stages {
+			if stage.LocalPayload != nil && stage.LocalPayload.Ref == ref {
+				return fmt.Errorf("fencing: source payload is both live and retired")
+			}
+		}
+		gc[ref] = true
+	}
 	owners := make(map[MutationOwnerStep]bool, len(d.Steps))
+	retiredOwners := make(map[MutationOwnerStep]bool, len(d.RetiredOwners))
+	for _, owner := range d.RetiredOwners {
+		if owner.Owner == "" || owner.Workflow == "" || owner.Step == "" || owner.Attempt == 0 || owners[owner] {
+			return fmt.Errorf("fencing: invalid or duplicate retired source owner")
+		}
+		owners[owner] = true
+		retiredOwners[owner] = true
+	}
 	for i, step := range d.Steps {
 		intent := step.Entry.Intent
-		if step.Sequence != uint64(i)+1 || intent.OperationID != MutationRequestID(d.Binding.Producer.ProducerUID, step.Sequence) || intent.StoreScopeHash != d.Binding.Producer.StoreScopeHash || owners[intent.OwnerStep] {
+		if step.Sequence != d.RetiredThrough+uint64(i)+1 || intent.OperationID != MutationRequestID(d.Binding.Producer.ProducerUID, step.Sequence) || intent.StoreScopeHash != d.Binding.Producer.StoreScopeHash || owners[intent.OwnerStep] {
 			return fmt.Errorf("fencing: source retry original tuple/owner differs")
 		}
 		owners[intent.OwnerStep] = true
@@ -170,6 +200,11 @@ func (d sourceRetryData) validate() error {
 		}
 		if (!step.Admitted && (i != len(d.Steps)-1 || step.Entry.Resolution != nil)) || (step.Advanced && step.Entry.Resolution == nil) {
 			return fmt.Errorf("fencing: source advanced past uncertain admission or result")
+		}
+	}
+	for _, stage := range d.Stages {
+		if retiredOwners[stage.Draft.OwnerStep] {
+			return fmt.Errorf("fencing: source staging owner was already retired")
 		}
 	}
 	return nil
@@ -195,15 +230,21 @@ func (s *sourceRetryState) allocate(intent MutationIntent) (sourceRetryStep, err
 			return cloneSourceRetryStep(step), nil
 		}
 	}
-	// shortcut: retain 64 owner tombstones; reclaim only after a separately
-	// specified durable owner-retirement contract, never on a TTL or snapshot.
+	for _, owner := range s.data.RetiredOwners {
+		if owner == intent.OwnerStep {
+			return sourceRetryStep{}, fmt.Errorf("fencing: source owner was already retired; owner identities are never reusable")
+		}
+	}
+	// The authority's CAS-persisted archive watermark is the only permitted
+	// retirement barrier. Until a caller supplies that verified result, retain
+	// every owner and fail closed at the live-journal bound.
 	if len(s.data.Steps) == MaxMutationJournalEntries {
 		return sourceRetryStep{}, fmt.Errorf("fencing: source retry capacity exhausted; retain original owner history")
 	}
 	if len(s.data.Steps) > 0 && !s.data.Steps[len(s.data.Steps)-1].Admitted {
 		return sourceRetryStep{}, ErrPending
 	}
-	sequence := uint64(len(s.data.Steps)) + 1
+	sequence := s.data.NextSequence
 	if intent.OperationID != "" {
 		return sourceRetryStep{}, fmt.Errorf("fencing: new owner cannot supply a different request identity")
 	}
@@ -211,6 +252,7 @@ func (s *sourceRetryState) allocate(intent MutationIntent) (sourceRetryStep, err
 	step := sourceRetryStep{Sequence: sequence, Entry: MutationEntry{Intent: intent}}
 	next := s.data
 	next.Steps = append(append([]sourceRetryStep(nil), s.data.Steps...), step)
+	next.NextSequence++
 	if err := s.persist(next); err != nil {
 		return sourceRetryStep{}, err
 	}
@@ -253,18 +295,144 @@ func (s *sourceRetryState) advance(sequence uint64, intent MutationIntent) error
 	})
 }
 
+// retireArchived drops only a locally advanced contiguous prefix covered by
+// the authority's immutable archive head and monotonic CAS watermark.
+func (s *sourceRetryState) retireArchived(through uint64, head *MutationArchiveReference) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.usable(); err != nil {
+		return err
+	}
+	if through < s.data.RetiredThrough || (through > 0 && (head == nil || !head.Valid())) || ((through == 0) != (head == nil)) {
+		return fmt.Errorf("fencing: source retry archive watermark invalid or regressed")
+	}
+	if through == s.data.RetiredThrough {
+		if !sameMutationArchiveReference(s.data.ArchiveHead, head) {
+			return fmt.Errorf("fencing: source retry archive head changed at the same watermark")
+		}
+		return nil
+	}
+	count := through - s.data.RetiredThrough
+	if count > uint64(len(s.data.Steps)) {
+		return fmt.Errorf("fencing: source archive watermark exceeds retained owner history")
+	}
+	retiredOwners := make(map[MutationOwnerStep]bool, count)
+	for i := uint64(0); i < count; i++ {
+		step := s.data.Steps[i]
+		if step.Sequence != s.data.RetiredThrough+i+1 || !step.Advanced || !mutationEntryTerminal(step.Entry) {
+			return fmt.Errorf("fencing: source retry cannot retire an unresolved owner")
+		}
+		retiredOwners[step.Entry.Intent.OwnerStep] = true
+	}
+	next := s.data
+	next.RetiredThrough = through
+	next.RetiredOwners = append([]MutationOwnerStep(nil), s.data.RetiredOwners...)
+	for i := uint64(0); i < count; i++ {
+		next.RetiredOwners = append(next.RetiredOwners, s.data.Steps[i].Entry.Intent.OwnerStep)
+	}
+	copyHead := *head
+	next.ArchiveHead = &copyHead
+	next.Steps = append([]sourceRetryStep(nil), s.data.Steps[count:]...)
+	remaining := make([]sourceRetryStage, 0, len(s.data.Stages))
+	for _, stage := range s.data.Stages {
+		if !retiredOwners[stage.Draft.OwnerStep] {
+			remaining = append(remaining, stage)
+			continue
+		}
+		if stage.LocalPayload != nil {
+			next.PendingPayloadGC = append(next.PendingPayloadGC, stage.LocalPayload.Ref)
+		}
+	}
+	next.Stages = remaining
+	if err := s.persist(next); err != nil {
+		return err
+	}
+	return s.cleanupRetiredPayloads()
+}
+
+func (s *sourceRetryState) canRetireArchived(through uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if through <= s.data.RetiredThrough || through-s.data.RetiredThrough > uint64(len(s.data.Steps)) {
+		return false
+	}
+	for i := uint64(0); i < through-s.data.RetiredThrough; i++ {
+		step := s.data.Steps[i]
+		if step.Sequence != s.data.RetiredThrough+i+1 || !step.Advanced || !mutationEntryTerminal(step.Entry) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *sourceRetryState) atCapacity() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.data.Steps) >= MaxMutationJournalEntries || len(s.data.Stages) >= MaxMutationJournalEntries
+}
+
+func (s *sourceRetryState) firstStep() (sourceRetryStep, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.data.Steps) == 0 {
+		return sourceRetryStep{}, false
+	}
+	return cloneSourceRetryStep(s.data.Steps[0]), true
+}
+
+func (s *sourceRetryState) retiredThrough() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data.RetiredThrough
+}
+
+func (s *sourceRetryState) cleanupRetiredPayloads() error {
+	if len(s.data.PendingPayloadGC) == 0 {
+		return nil
+	}
+	for _, ref := range s.data.PendingPayloadGC {
+		path := filepath.Join(s.dir, ref)
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("fencing: unsafe retired source payload")
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	if err := s.syncDir(s.dir); err != nil {
+		return err
+	}
+	next := s.data
+	next.PendingPayloadGC = nil
+	return s.persist(next)
+}
+
 func (s *sourceRetryState) changeStep(sequence uint64, intent MutationIntent, change func(*sourceRetryStep) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.usable(); err != nil {
 		return err
 	}
-	if sequence == 0 || sequence > uint64(len(s.data.Steps)) || s.data.Steps[sequence-1].Entry.Intent != intent {
+	index := -1
+	for i, step := range s.data.Steps {
+		if step.Sequence == sequence {
+			index = i
+			break
+		}
+	}
+	if index < 0 || s.data.Steps[index].Entry.Intent != intent {
 		return fmt.Errorf("fencing: source retry original tuple differs")
 	}
 	next := s.data
 	next.Steps = append([]sourceRetryStep(nil), s.data.Steps...)
-	if err := change(&next.Steps[sequence-1]); err != nil {
+	if err := change(&next.Steps[index]); err != nil {
 		return err
 	}
 	return s.persist(next)

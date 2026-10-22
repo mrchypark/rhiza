@@ -12,6 +12,7 @@ type ProducerBinding struct {
 	ProducerUID      string         `json:"producerUID"`
 	StoreScopeHash   string         `json:"storeScopeHash"`
 	ExecutionProfile string         `json:"executionProfile"`
+	StageIncarnation string         `json:"stageIncarnation,omitempty"`
 }
 
 // BindReceipt keeps cooperative identity binding separate from mutation support.
@@ -26,13 +27,48 @@ func (r BindReceipt) Validate(expected Identity) error {
 		return fmt.Errorf("fencing: bind receipt identity differs")
 	}
 	if p := r.Producer; p != nil {
-		if p.ContractVersion != MutationIntentVersion || p.ProducerUID == "" || len(p.ProducerUID) > 128 || !mutationDigestValid(p.StoreScopeHash) || p.ExecutionProfile != MutationExecutionProfile {
+		if p.ContractVersion != MutationIntentVersion || p.ProducerUID == "" || len(p.ProducerUID) > 128 || !mutationDigestValid(p.StoreScopeHash) || p.ExecutionProfile != MutationExecutionProfile || (p.StageIncarnation != "" && !mutationDigestValid(p.StageIncarnation)) {
 			return fmt.Errorf("fencing: incomplete mutation producer binding")
 		}
 		if err := p.Runtime.Validate(expected); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// BindMutationStage pins an explicitly provisioned source spool before WAL
+// activation. The value is immutable for the producer's lifetime; an absent
+// stage store is not a bootstrap signal and cannot clear a prior pin.
+func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
+	run, ok := l.Runs[id.RunID]
+	before := id
+	if ok {
+		before.WALIdentity = run.Identity.WALIdentity
+	}
+	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || !mutationDigestValid(incarnation) || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || run.MutationScopeHash == "" || run.MutationProfile != MutationExecutionProfile {
+		return fmt.Errorf("fencing: invalid mutation stage enrollment")
+	}
+	if l.ClosedBy != "" || run.Stop != nil {
+		return ErrClosed
+	}
+	if _, closed := l.ClosedNodes[id.NodeID]; closed {
+		return ErrClosed
+	}
+	if err := run.Runtime.Validate(id); err != nil {
+		return err
+	}
+	if run.MutationStageIncarnation != "" {
+		if run.MutationStageIncarnation != incarnation {
+			return fmt.Errorf("fencing: mutation stage incarnation changed")
+		}
+		return nil
+	}
+	if run.Identity.WALIdentity != "" {
+		return fmt.Errorf("fencing: mutation stage pin must precede WAL activation")
+	}
+	run.MutationStageIncarnation = incarnation
+	l.Runs[id.RunID] = run
 	return nil
 }
 

@@ -81,16 +81,16 @@ func (e *FencingExecutor) lookupMutation(ctx context.Context, statefulSetUID str
 		if err != nil {
 			return fencing.MutationLookupResult{}, err
 		}
-		return fencing.MutationLookupResult{Found: true, Archived: true, Entry: &entry}, nil
+		return fencing.MutationLookupResult{Found: true, Archived: true, CompactedThrough: producer.CompactedThrough, ArchiveHead: producer.ArchiveHead, Entry: &entry}, nil
 	}
 	if request.Sequence > producer.LastAdmitted {
-		return fencing.MutationLookupResult{}, nil
+		return fencing.MutationLookupResult{CompactedThrough: producer.CompactedThrough, ArchiveHead: producer.ArchiveHead}, nil
 	}
 	entry, exists := producer.Entries[request.Sequence]
 	if !exists || entry.Intent != request.Intent {
 		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: live mutation lookup differs from original tuple")
 	}
-	return fencing.MutationLookupResult{Found: true, Entry: &entry}, nil
+	return fencing.MutationLookupResult{Found: true, CompactedThrough: producer.CompactedThrough, ArchiveHead: producer.ArchiveHead, Entry: &entry}, nil
 }
 
 // reserveMutationProducer may create only Reserved state. It never creates Open

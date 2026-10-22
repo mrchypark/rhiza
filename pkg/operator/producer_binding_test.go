@@ -38,6 +38,33 @@ func TestProducerBindingRecoversLostRootOrActivationResponse(t *testing.T) {
 	}
 }
 
+func TestProducerBindingPinsImmutableSourceStageIncarnation(t *testing.T) {
+	e, _, id, runtime := newMutationStoreFixture(t)
+	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
+		t.Fatal(err)
+	}
+	id.WALIdentity = "wal"
+	incarnation := strings.Repeat("4", 64)
+	receipt, err := e.bindWALAtScopeWithStage(t.Context(), "sts", id, strings.Repeat("a", 64), incarnation)
+	if err != nil || receipt.Validate(id) != nil || receipt.Producer == nil || receipt.Producer.StageIncarnation != incarnation {
+		t.Fatalf("stage incarnation was not returned in the binding: %+v %v", receipt, err)
+	}
+	state, err := e.read(t.Context(), "sts", "source")
+	if err != nil || state.Ledger.Runs[id.RunID].MutationStageIncarnation != incarnation {
+		t.Fatalf("stage incarnation was not pinned in the root ledger: %+v %v", state.Ledger.Runs[id.RunID], err)
+	}
+	restarted := &FencingExecutor{Kube: e.Kube}
+	if retry, err := restarted.bindWALAtScopeWithStage(t.Context(), "sts", id, strings.Repeat("a", 64), incarnation); err != nil || !receipt.SameBinding(retry) {
+		t.Fatalf("same incarnation did not recover the original binding: %+v %v", retry, err)
+	}
+	if retry, err := restarted.bindWALAtScopeWithStage(t.Context(), "sts", id, strings.Repeat("a", 64), strings.Repeat("5", 64)); err == nil || retry.Producer != nil {
+		t.Fatal("replacement source stage incarnation returned a producer binding")
+	}
+	if retry, err := restarted.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64)); err == nil || retry.Producer != nil {
+		t.Fatal("missing original source stage was treated as a fresh binding")
+	}
+}
+
 func TestProducerBindingRejectsClosureScopeAndReplacedStorage(t *testing.T) {
 	for _, fault := range []string{"closure", "scope", "missing", "replaced"} {
 		t.Run(fault, func(t *testing.T) {

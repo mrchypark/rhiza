@@ -18,7 +18,10 @@ func mutationLookupFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixtur
 	scope := strings.Repeat("a", 64)
 	id.WALIdentity = "wal"
 	if _, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
-		return l.BindMutationScope(id, scope, fencing.MutationExecutionProfile)
+		if err := l.BindMutationScope(id, scope, fencing.MutationExecutionProfile); err != nil {
+			return err
+		}
+		return l.BindMutationStage(id, strings.Repeat("4", 64))
 	}); err != nil {
 		t.Fatal(err)
 	}
