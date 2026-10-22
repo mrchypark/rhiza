@@ -333,8 +333,8 @@ func TestHeldProfileUnknownCreateClosesThroughGuardAndPinsKeyAcrossCompaction(t 
 	if err := f.e.ExecuteSourceMutation(ctx, f.runtime, f.producer, 2, update, f.scope, provider, f.receipts); !errors.Is(err, ErrFencePending) {
 		t.Fatalf("same-key update crossed the unresolved-create key guard: %v", err)
 	}
-	delete := f.admitDelete(t, 3, create.Key, gcs.objects[pathJoin(f.scope.Prefix, create.Key)].generation)
-	if err := f.e.ExecuteSourceMutation(ctx, f.runtime, f.producer, 3, delete, f.scope, provider, f.receipts); !errors.Is(err, ErrFencePending) {
+	deleteIntent := f.admitDelete(t, 3, create.Key, gcs.objects[pathJoin(f.scope.Prefix, create.Key)].generation)
+	if err := f.e.ExecuteSourceMutation(ctx, f.runtime, f.producer, 3, deleteIntent, f.scope, provider, f.receipts); !errors.Is(err, ErrFencePending) {
 		t.Fatalf("same-key delete crossed the unresolved-create key guard: %v", err)
 	}
 	if _, err := f.e.changeMutationProducer(ctx, f.runtime, func(p *fencing.MutationProducer) error {
@@ -362,8 +362,8 @@ func TestHeldProfileUnknownCreateClosesThroughGuardAndPinsKeyAcrossCompaction(t 
 		t.Fatalf("nonzero unconditional upload did not preserve its original intent and observed fixed CAS: %+v", casEntry)
 	}
 	gcs.objects[pathJoin(f.scope.Prefix, "objects/delete")] = heldGCSObject{name: pathJoin(f.scope.Prefix, "objects/delete"), generation: 9, metageneration: 1, payload: []byte("old"), metadata: map[string]string{}}
-	deleteIntent := f.admitDelete(t, 5, "objects/delete", 9)
-	if err := f.e.ExecuteSourceMutation(ctx, f.runtime, f.producer, 5, deleteIntent, f.scope, provider, f.receipts); err != nil {
+	deleteOtherIntent := f.admitDelete(t, 5, "objects/delete", 9)
+	if err := f.e.ExecuteSourceMutation(ctx, f.runtime, f.producer, 5, deleteOtherIntent, f.scope, provider, f.receipts); err != nil {
 		t.Fatalf("held profile rejected ordinary exact-generation delete: %v", err)
 	}
 	if _, exists := gcs.objects[pathJoin(f.scope.Prefix, "objects/delete")]; exists || gcs.deletes != 1 {
@@ -411,6 +411,26 @@ func TestHeldProfileUnknownCreateClosesThroughGuardAndPinsKeyAcrossCompaction(t 
 	if err != nil || !archived.Archived || archived.Entry == nil || archived.Entry.GuardedLogicalResolution == nil {
 		t.Fatalf("compaction or stage retirement lost guarded proof: %+v err=%v", archived, err)
 	}
+	key := pathJoin(f.scope.Prefix, create.Key)
+	gcs.mu.Lock()
+	if !gcs.objects[key].temporaryHold {
+		gcs.mu.Unlock()
+		t.Fatal("guarded logical settlement released the permanent late-effect hold")
+	}
+	delete(gcs.objects, key)
+	postsBeforeRetry := gcs.posts
+	gcs.mu.Unlock()
+	if err := f.e.ExecuteSourceMutation(ctx, f.runtime, f.producer, 1, create, f.scope, provider, f.receipts); !errors.Is(err, ErrFencePending) {
+		t.Fatalf("retry recreated an object after its guarded commit disappeared: %v", err)
+	}
+	gcs.mu.Lock()
+	_, recreated := gcs.objects[key]
+	postsAfterRetry := gcs.posts
+	gcs.mu.Unlock()
+	if recreated || postsAfterRetry != postsBeforeRetry {
+		t.Fatalf("guarded retry resurrected the missing object: recreated=%v posts=%d->%d", recreated, postsBeforeRetry, postsAfterRetry)
+	}
+
 	restarted := &FencingExecutor{AuthorityState: f.e.AuthorityState}
 	owner := hashJSON([]any{f.runtime, "wal-held-profile", f.producer, uint64(1), create.OperationID})
 	if err := restarted.acquireMutationKey(ctx, create.StoreScopeHash, create.Key, owner, false); err != nil {
@@ -419,8 +439,33 @@ func TestHeldProfileUnknownCreateClosesThroughGuardAndPinsKeyAcrossCompaction(t 
 	if err := restarted.acquireMutationKey(ctx, create.StoreScopeHash, create.Key, owner+"replacement", false); !errors.Is(err, ErrFencePending) {
 		t.Fatalf("same-key mutation owner crossed the post-compaction guard after restart: %v", err)
 	}
-	if gcs.patches != 0 || !gcs.objects[pathJoin(f.scope.Prefix, create.Key)].temporaryHold {
-		t.Fatal("guarded logical settlement released the permanent late-effect hold")
+	restarted.Kube = f.e.Kube
+	restarted.SourceMutationStorage = f.e.SourceMutationStorage
+	restartedReceipts, err := restarted.receiptsForRuntime(f.runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcs.mu.Lock()
+	postsBeforeStaleMutations, deletesBeforeStaleMutations := gcs.posts, gcs.deletes
+	gcs.mu.Unlock()
+	for _, mutation := range []struct {
+		name   string
+		seq    uint64
+		intent fencing.MutationIntent
+	}{{name: "update", seq: 2, intent: update}, {name: "delete", seq: 3, intent: deleteIntent}} {
+		if err := restarted.ExecuteSourceMutation(ctx, f.runtime, f.producer, mutation.seq, mutation.intent, f.scope, provider, restartedReceipts); !errors.Is(err, ErrFencePending) {
+			t.Errorf("post-compaction same-key %s crossed the held guard: %v", mutation.name, err)
+		}
+	}
+	gcs.mu.Lock()
+	postsAfterStaleMutations, deletesAfterStaleMutations := gcs.posts, gcs.deletes
+	gcs.mu.Unlock()
+	if postsAfterStaleMutations != postsBeforeStaleMutations || deletesAfterStaleMutations != deletesBeforeStaleMutations {
+		t.Fatalf("post-compaction stale mutations reached GCS: posts=%d->%d deletes=%d->%d",
+			postsBeforeStaleMutations, postsAfterStaleMutations, deletesBeforeStaleMutations, deletesAfterStaleMutations)
+	}
+	if gcs.patches != 0 {
+		t.Fatalf("unknown guarded commit incorrectly released a hold: patches=%d", gcs.patches)
 	}
 }
 
