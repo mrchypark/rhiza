@@ -169,7 +169,7 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		return false
 	}
 	wantEmbeddedSelector := "embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'"
-	wantOperatorSelector := "operator_tests='^(TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot|TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead|TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound|TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault|TestTerminalStoreRejectsIncompleteOrUntrustedTermination)$'"
+	wantOperatorSelector := "operator_tests='^(TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot|TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead|TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound|TestAutomaticArchiveAllowsEmptyAsyncOnlyWithExplicitLossAndHEAD|TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault|TestTerminalStoreRejectsIncompleteOrUntrustedTermination)$'"
 	if !hasLine(wantEmbeddedSelector) || !hasLine(wantOperatorSelector) {
 		t.Fatal("fixture-only job must assign the fixed rollback/IAM/manifest and recovery/terminal selector literals")
 	}
