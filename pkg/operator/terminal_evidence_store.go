@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/thanos-io/objstore"
 )
 
 // Retain the actual evidence, not a replacement cooperative drain receipt.
@@ -36,12 +38,12 @@ func terminalProducer(producer fencing.MutationProducer) fencing.MutationProduce
 	return producer
 }
 
-func (e terminalEvidence) reference(uid string) fencing.TerminalReference {
+func (e terminalEvidence) reference(objectVersionID string) fencing.TerminalReference {
 	digest := hashJSON(e)
 	return fencing.TerminalReference{
 		EvidenceVersion: 2, Request: e.Request,
 		RuntimeHash: fencing.RuntimeBindingDigest(e.Runtime), ProducerUID: e.ProducerUID,
-		ProofName: "rhiza-terminal-" + digest[:40], ProofUID: uid, ProofDigest: digest,
+		ProofName: "rhiza-terminal-" + digest[:40], ProofUID: objectVersionID, ProofDigest: digest,
 		RuntimeReceiptDigest:  receiptDigest(e.RuntimeReceipt),
 		MutationReceiptDigest: hashJSON(e.Producer), StorageScopeDigest: hashJSON(e.Storage),
 	}
@@ -59,27 +61,56 @@ func (e terminalEvidence) validate() error {
 	return nil
 }
 
-func (e *FencingExecutor) terminalEvidencePath(name string) string {
-	return e.controller().corePath("configmaps", name)
+func terminalArtifactKey(name string) (string, error) {
+	if len(name) != len("rhiza-terminal-")+40 || !strings.HasPrefix(name, "rhiza-terminal-") {
+		return "", fmt.Errorf("fencing: invalid terminal evidence object name")
+	}
+	return "terminal/" + name, nil
 }
 
-func (e *FencingExecutor) decodeTerminalEvidence(resource object, ref fencing.TerminalReference) (terminalEvidence, error) {
-	var evidence terminalEvidence
-	if str(nested(resource, "metadata", "name")) != ref.ProofName || str(nested(resource, "metadata", "namespace")) != e.Kube.Namespace ||
-		str(nested(resource, "metadata", "uid")) != ref.ProofUID || ref.ProofUID == "" ||
-		nested(resource, "metadata", "deletionTimestamp") != nil || resource["immutable"] != true {
-		return evidence, fmt.Errorf("fencing: retained terminal evidence object differs")
+func terminalObjectVersionID(version *objstore.ObjectVersion) (string, error) {
+	if !validAuthorityObjectVersion(version) {
+		return "", fmt.Errorf("fencing: terminal evidence object version is unavailable")
 	}
-	raw := str(nested(resource, "data", "terminal.json"))
-	if len(raw) > 700000 {
+	return hashJSON([]string{"rhiza-terminal-object-version-v1", string(version.Type), version.Value}), nil
+}
+
+func decodeTerminalEvidence(data []byte, ref fencing.TerminalReference, version *objstore.ObjectVersion) (terminalEvidence, error) {
+	var evidence terminalEvidence
+	versionID, err := terminalObjectVersionID(version)
+	if err != nil || ref.ProofUID == "" || versionID != ref.ProofUID {
+		return evidence, errors.Join(err, fmt.Errorf("fencing: retained terminal evidence object version differs"))
+	}
+	if len(data) > 700000 {
 		return evidence, fmt.Errorf("fencing: terminal evidence exceeds capacity")
 	}
-	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&evidence) != nil || decoder.Decode(new(any)) != io.EOF || evidence.validate() != nil || evidence.reference(ref.ProofUID) != ref {
+	if decoder.Decode(&evidence) != nil || decoder.Decode(new(any)) != io.EOF || evidence.validate() != nil || evidence.reference(versionID) != ref {
 		return terminalEvidence{}, fmt.Errorf("fencing: retained terminal evidence contents differ")
 	}
+	canonical, err := json.Marshal(evidence)
+	if err != nil || !bytes.Equal(canonical, data) {
+		return terminalEvidence{}, errors.Join(err, fmt.Errorf("fencing: retained terminal evidence bytes are not canonical"))
+	}
 	return evidence, nil
+}
+
+func readTerminalEvidence(ctx context.Context, store *AuthorityEvidenceStore, ref fencing.TerminalReference) (terminalEvidence, error) {
+	key, err := terminalArtifactKey(ref.ProofName)
+	if err != nil {
+		return terminalEvidence{}, err
+	}
+	raw, version, err := store.Read(ctx, key)
+	if err != nil {
+		return terminalEvidence{}, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(raw, 700001))
+	closeErr := raw.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return terminalEvidence{}, err
+	}
+	return decodeTerminalEvidence(data, ref, version)
 }
 
 // A stored digest is not evidence of termination. Recheck trusted runtime and
@@ -156,11 +187,11 @@ func (e *FencingExecutor) readIndependentTerminal(ctx context.Context, runtime f
 	if err != nil {
 		return terminalEvidence{}, ref, err
 	}
-	var resource object
-	if err := e.Kube.Get(ctx, e.terminalEvidencePath(ref.ProofName), &resource); err != nil {
+	store, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
 		return terminalEvidence{}, ref, err
 	}
-	evidence, err := e.decodeTerminalEvidence(resource, ref)
+	evidence, err := readTerminalEvidence(ctx, store, ref)
 	if err == nil && (evidence.Runtime != runtime || evidence.Storage != storage) {
 		err = fmt.Errorf("fencing: retained terminal evidence names another requested incarnation or store")
 	}
@@ -202,16 +233,25 @@ func (e *FencingExecutor) retainIndependentTerminal(ctx context.Context, runtime
 	if err != nil || len(data) > 700000 {
 		return fencing.TerminalReference{}, errors.Join(err, fmt.Errorf("fencing: terminal evidence exceeds capacity"))
 	}
-	ref := evidence.reference("")
-	resource := object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": ref.ProofName, "namespace": e.Kube.Namespace}, "immutable": true, "data": object{"terminal.json": string(data)}}
-	postErr := e.Kube.Post(ctx, e.controller().corePath("configmaps", ""), resource, nil)
-	var stored object
-	if err := e.Kube.Get(ctx, e.terminalEvidencePath(ref.ProofName), &stored); err != nil {
-		return ref, errors.Join(postErr, err)
+	store, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		return fencing.TerminalReference{}, err
 	}
-	ref.ProofUID = str(nested(stored, "metadata", "uid"))
-	if _, err := e.decodeTerminalEvidence(stored, ref); err != nil {
-		return ref, err
+	key, err := terminalArtifactKey(evidence.reference("pending").ProofName)
+	if err != nil {
+		return fencing.TerminalReference{}, err
+	}
+	version, err := store.CreateImmutable(ctx, key, data)
+	if err != nil {
+		return fencing.TerminalReference{}, err
+	}
+	versionID, err := terminalObjectVersionID(version)
+	if err != nil {
+		return fencing.TerminalReference{}, err
+	}
+	ref := evidence.reference(versionID)
+	if _, err := readTerminalEvidence(ctx, store, ref); err != nil {
+		return ref, errors.Join(err, fmt.Errorf("fencing: terminal evidence object readback differs"))
 	}
 	_, commitErr := e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error { return l.RecordIndependentTerminal(ref) })
 	_, persisted, readErr := e.readIndependentTerminal(ctx, runtime, storage, verificationID)

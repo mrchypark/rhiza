@@ -810,7 +810,23 @@ func (s *RecoverySnapshot) Close(ctx context.Context) error {
 // SyncThrough publishes all decisions through the requested slot. Concurrent
 // callers share a bounded delay and one immutable block/head publication.
 func (m *Manager) SyncThrough(ctx context.Context, core source, through quepaxa.Slot) error {
-	if through == 0 || m.Tip() >= through {
+	if through == 0 {
+		return nil
+	}
+	// Refresh even when the local tip already covers the slot: a different
+	// recovery manager may have permanently sealed the source archive since
+	// this manager last loaded HEAD. A cached tip cannot authorize an ACK after
+	// that revocation.
+	if err := m.Load(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	tip, sealed := m.tip, m.head.Sealed
+	m.mu.Unlock()
+	if sealed {
+		return ErrArchiveSealed
+	}
+	if tip >= through {
 		return nil
 	}
 	m.batchMu.Lock()

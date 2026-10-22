@@ -132,6 +132,24 @@ func TestSealStopsPublicationAndKeepsSnapshotReadable(t *testing.T) {
 	}
 }
 
+func TestSealRejectsSyncThroughFromWarmCachedTip(t *testing.T) {
+	ctx, bucket, core, cached := newSealableArchive(t)
+	t.Cleanup(func() {
+		_ = cached.Close()
+		_ = bucket.Close()
+	})
+	covered := cached.Tip()
+	if covered == 0 {
+		t.Fatal("fixture archive has no cached tip")
+	}
+	if err := Seal(ctx, bucket, "cluster", "recovery-warm-cache"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cached.SyncThrough(ctx, core, covered); !errors.Is(err, ErrArchiveSealed) {
+		t.Fatalf("warm-cache sync error=%v, want ErrArchiveSealed", err)
+	}
+}
+
 func TestSealFencesStalePublisherHeadCAS(t *testing.T) {
 	ctx, base, core, _ := newSealableArchive(t)
 	wrapped := &blockingHeadUploadBucket{Bucket: base, started: make(chan struct{}), release: make(chan struct{})}
