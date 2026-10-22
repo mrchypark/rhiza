@@ -306,8 +306,23 @@ func TestIndependentV2CooperativeDrainCannotBypassAuthorityMutations(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.reconcileFence(t.Context(), v2FenceEndpoint(), record); err != nil || record.Status.Proof == nil || !strings.HasPrefix(record.Status.Proof.ProofID, "cooperative-") {
-		t.Fatalf("actually settled cooperative exit did not complete: %v", err)
+	// CompleteNodes is now true, but it is not independent termination evidence.
+	// Without the trusted verifier, the required profile must remain pending.
+	e.VerifyRuntimeEvidence = nil
+	if err := e.reconcileFence(t.Context(), v2FenceEndpoint(), record); !errors.Is(err, ErrFencePending) {
+		t.Fatalf("protected profile completed without verified v2 evidence: %v", err)
+	}
+	if record.Status.Proof != nil || f.statusWrites != 0 {
+		t.Fatal("cooperative process exit published a protected-profile proof")
+	}
+	e.VerifyRuntimeEvidence = func(_ context.Context, got fencing.RuntimeBinding, request fencing.StopRequest, receipt []byte) error {
+		if got != runtime || request.Identity.RunID != runtime.RunID || string(receipt) != "test-provider-terminal" {
+			return errors.New("test runtime verifier rejected evidence")
+		}
+		return nil
+	}
+	if err := e.reconcileFence(t.Context(), v2FenceEndpoint(), record); err != nil || record.Status.Proof == nil || record.Status.Proof.IndependentV2 == nil || !strings.HasPrefix(record.Status.Proof.ProofID, "independent-v2-") {
+		t.Fatalf("verified v2 evidence did not complete protected profile: %v", err)
 	}
 }
 

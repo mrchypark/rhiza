@@ -947,7 +947,10 @@ mod tests {
         let mut subscription = db.notify_subscribe("revision").unwrap();
         assert_eq!(snapshot(), 0);
         let drops = db.notification_drops().unwrap();
-        for version in 1..=2 {
+        // The server-side subscription bridge can hold one event while the
+        // materializer queue holds another. A third unread hint is needed to
+        // exercise the bounded-queue drop path end to end.
+        for version in 1..=3 {
             db.execute(
                 &format!("update-{version}"),
                 "UPDATE revision SET value = ?",
@@ -961,16 +964,17 @@ mod tests {
                 .require_committed()
                 .unwrap();
             // Confirm each hint reached the node-local dispatcher before
-            // publishing the next one. The unread subscriber queue has depth
-            // one, so the second delivery must be counted as a drop.
+            // publishing the next one. The server bridge and materializer
+            // queue together can retain two unread deliveries.
             wait_for_dispatch(&format!("after-hint-{version}"));
         }
-        // The live queue retains one hint; the other is deliberately lost.
+        // The live path retains its bounded pending hints; excess events are
+        // deliberately lost, so consumers must reconcile from durable state.
         assert!(db.notification_drops().unwrap() > drops);
         assert_eq!(subscription.recv_timeout(1_000).unwrap(), b"changed");
-        assert_eq!(snapshot(), 2);
+        assert_eq!(snapshot(), 3);
         drop(subscription);
-        db.execute("offline-update", "UPDATE revision SET value = 3", json!([]))
+        db.execute("offline-update", "UPDATE revision SET value = 4", json!([]))
             .unwrap()
             .require_committed()
             .unwrap();
@@ -980,7 +984,7 @@ mod tests {
             .unwrap();
         wait_for_dispatch("after-offline-hint");
         let mut reconnected = db.notify_subscribe("revision").unwrap();
-        assert_eq!(snapshot(), 3);
+        assert_eq!(snapshot(), 4);
         assert_eq!(reconnected.recv_timeout(1).unwrap_err().code, "timeout");
     }
 }

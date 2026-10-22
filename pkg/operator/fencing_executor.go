@@ -306,6 +306,10 @@ func (e *FencingExecutor) readLegacyCooperative(ctx context.Context, uid, source
 func (e *FencingExecutor) Handler() http.Handler { return http.HandlerFunc(e.handle) }
 
 func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == httpFenceRequestPath {
+		e.handleHTTPFenceRequest(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v1/archive-genesis/") {
 		e.handleArchiveForkGenesis(w, r)
 		return
@@ -733,12 +737,9 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 			return ErrFencePending
 		}
 	}
-	if !state.Ledger.CompleteNodes(r.OperationID, hash, nodes, current) {
-		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
-	}
-	// A clean source-process drain does not settle work already admitted to the
-	// survivor-held mutation authority. The v2 profile cannot bypass that barrier
-	// by completing through the cooperative branch instead.
+	// A clean source-process drain is not independent termination evidence. The
+	// required mutation-journal profile must always complete through verified v2
+	// evidence, even when the cooperative ledger also reports every process exited.
 	if state.Ledger.RequireMutationJournal {
 		settled, err := e.closeMutationProducers(ctx, state, nodes)
 		if err != nil {
@@ -747,6 +748,10 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 		if !settled {
 			return ErrFencePending
 		}
+		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
+	}
+	if !state.Ledger.CompleteNodes(r.OperationID, hash, nodes, current) {
+		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
 	}
 	proof := &FenceProof{OperationID: r.OperationID, SourceClusterID: r.SourceClusterID, BindingUID: r.BindingUID, RequestHash: hash, ProofID: "cooperative-" + hashJSON(state), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
 	record.Status.Proof = proof

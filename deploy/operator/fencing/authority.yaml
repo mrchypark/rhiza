@@ -23,8 +23,13 @@ rules:
     resources: [statefulsets]
     verbs: [get, list]
   - apiGroups: [rhiza.mrchypark.dev]
-    resources: [rhizafences, rhizaclusters]
+    resources: [rhizaclusters]
     verbs: [get, list]
+  - apiGroups: [rhiza.mrchypark.dev]
+    resources: [rhizafences]
+    # The authenticated HTTP adapter creates the same immutable RhizaFence
+    # record used by the Kubernetes backend; this remains the sole request journal.
+    verbs: [get, list, create]
   - apiGroups: [rhiza.mrchypark.dev]
     resources: [rhizafences/status]
     verbs: [get, update]
