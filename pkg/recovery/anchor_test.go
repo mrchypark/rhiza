@@ -309,6 +309,9 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	}
 	// A missing HEAD with an anchor but no result is ambiguous (it may have
 	// been deleted after publication), so do not repair it from source replay.
+	if err := bucket.Delete(ctx, forkResultKey("third-generation")); err != nil {
+		t.Fatal(err)
+	}
 	if err := bucket.Delete(ctx, forkKey("third-generation", "archive/head.bin")); err != nil {
 		t.Fatal(err)
 	}

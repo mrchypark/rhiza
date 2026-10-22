@@ -266,6 +266,30 @@ func decodeHead(data []byte) (archiveHead, error) {
 	return head, nil
 }
 
+// EmptyArchiveHeadBytes encodes the initial empty persisted HEAD for the
+// immutable archive lineage. Generation 1 is reserved for this initial state.
+func EmptyArchiveHeadBytes() ([]byte, error) {
+	return encodeHead(archiveHead{ConfigID: ArchiveConfigID, Generation: 1})
+}
+
+// ValidateEmptyArchiveHead accepts only the canonical empty HEAD for the
+// immutable archive lineage. It is not valid for a live or forked archive.
+func ValidateEmptyArchiveHead(data []byte, expectedConfigID uint) error {
+	if expectedConfigID == 0 {
+		return fmt.Errorf("invalid expected archive config ID")
+	}
+	head, err := decodeHead(data)
+	if err != nil {
+		return err
+	}
+	if head.ConfigID != expectedConfigID || head.Generation != 1 || head.Base != 0 || head.BasePrefix != ([32]byte{}) ||
+		head.BaseSeal != nil || head.BaseDecision != nil || head.BaseAnchor != nil || head.LineageAnchor != nil ||
+		head.Tip != 0 || head.TailHash != ([32]byte{}) || head.TailObject != 0 || head.Sealed {
+		return fmt.Errorf("archive head is not the canonical empty genesis")
+	}
+	return nil
+}
+
 func encodeBaseDecision(decision quepaxa.DecidedValue) ([]byte, error) {
 	if validateArchivePayload(decision.Value, decision.Certificate) != nil || sha256.Sum256(decision.Value) != decision.Hash {
 		return nil, fmt.Errorf("invalid archive base decision")

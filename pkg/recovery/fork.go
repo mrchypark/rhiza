@@ -95,7 +95,7 @@ func Fork(ctx context.Context, bucket objstore.Bucket, options ForkOptions) (For
 		return ForkResult{}, err
 	}
 
-	source := NewManager(bucket, sourcePrefix, 1)
+	source := NewManager(bucket, sourcePrefix, ArchiveConfigID)
 	defer source.Close()
 	if err := source.Load(ctx); err != nil {
 		return ForkResult{}, fmt.Errorf("load source archive: %w", err)
@@ -226,7 +226,7 @@ func forkAnchoredGeneration(ctx context.Context, bucket objstore.Bucket, options
 			if err != nil {
 				return ForkResult{}, err
 			}
-			target := NewManager(bucket, targetPrefix, 1)
+			target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 			if err := target.Load(ctx); err != nil {
 				target.Close()
 				return ForkResult{}, err
@@ -245,7 +245,7 @@ func forkAnchoredGeneration(ctx context.Context, bucket objstore.Bucket, options
 	} else if err := ensureForkTargetEmpty(ctx, bucket, targetPrefix); err != nil {
 		return ForkResult{}, err
 	}
-	source := NewManager(bucket, sourcePrefix, 1)
+	source := NewManager(bucket, sourcePrefix, ArchiveConfigID)
 	defer source.Close()
 	if err := source.Load(ctx); err != nil {
 		return ForkResult{}, fmt.Errorf("load source archive: %w", err)
@@ -393,7 +393,7 @@ func verifyForkSnapshotWithMode(ctx context.Context, snapshot *RecoverySnapshot,
 }
 
 func verifyCachedForkResult(ctx context.Context, bucket objstore.Bucket, targetPrefix, operationID string, members []quepaxa.Member, result ForkResult) error {
-	target := NewManager(bucket, targetPrefix, 1)
+	target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 	defer target.Close()
 	if err := target.Load(ctx); err != nil {
 		return err

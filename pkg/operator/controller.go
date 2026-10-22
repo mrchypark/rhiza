@@ -220,7 +220,7 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 		return c.record(ctx, r, "AwaitingFence", err.Error())
 	}
 	if r.Status.Stage == "" {
-		archive := recovery.NewManager(c.Bucket, prefix, 1)
+		archive := recovery.NewManager(c.Bucket, prefix, recovery.ArchiveConfigID)
 		defer archive.Close()
 		if err := archive.Load(ctx); err != nil || archive.Tip() == 0 {
 			return reject("source archive has no available certified history")

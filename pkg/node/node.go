@@ -444,7 +444,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
-		n.archive = recovery.NewManager(runtimeBucket, clusterPrefix, 1)
+		n.archive = recovery.NewManager(runtimeBucket, clusterPrefix, recovery.ArchiveConfigID)
 		n.archive.SetGroupDelay(n.config.ObjStoreBatchDelay)
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")

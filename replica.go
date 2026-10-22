@@ -342,7 +342,7 @@ func openReplica(ctx context.Context, config ReplicaConfig, mode ReplicaMode, ve
 	if err := r.checkpoints.Load(childCtx); err != nil {
 		return nil, fmt.Errorf("load replica checkpoints: %w", err)
 	}
-	r.archive = recovery.NewManager(r.bucket, prefix, 1)
+	r.archive = recovery.NewManager(r.bucket, prefix, recovery.ArchiveConfigID)
 	if err := r.archive.Load(childCtx); err != nil {
 		return nil, fmt.Errorf("load replica archive: %w", err)
 	}
