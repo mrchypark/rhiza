@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -112,7 +113,11 @@ func newForkAuthorityRegistrarFixture(t *testing.T) forkAuthorityRegistrarFixtur
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := core.Propose(t.Context(), []byte("fork registrar source decision")); err != nil {
+	decision, err := types.EncodeSQLBatch([]types.SQLCommand{{RequestID: "fork-registrar-fixture", SQL: "CREATE TABLE fork_registrar_fixture (id INTEGER PRIMARY KEY)"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(t.Context(), decision); err != nil {
 		t.Fatal(err)
 	}
 	archive := recovery.NewManager(bucket, sourcePrefix, recovery.ArchiveConfigID)

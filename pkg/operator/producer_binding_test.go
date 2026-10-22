@@ -10,6 +10,7 @@ import (
 
 func preparePendingArchiveGenesis(t *testing.T, e *FencingExecutor, fixture *mutationStoreFixture, id fencing.Identity, runtime fencing.RuntimeBinding) string {
 	t.Helper()
+	e.RequireMutationJournal = true
 	e.ArchiveBucket = objstore.NewInMemBucket()
 	bucket := e.ArchiveBucket
 	t.Cleanup(func() { _ = bucket.Close() })

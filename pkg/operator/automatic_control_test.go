@@ -1665,6 +1665,7 @@ func TestClusterFreshBootstrapGeneratesImmutableIdentitiesOnce(t *testing.T) {
 	c := clusterController(t, api)
 	r := autoClusterResource("cluster-1", "uid-1", "logical-1")
 	r.Spec.VoterCount, r.Spec.Automatic, r.Spec.Bootstrap = count, true, true
+	r.Spec.Policy = &goodPolicy
 	normalizeClusterSpec(r)
 
 	if err := c.reconcileCluster(ctx, r); err != nil {

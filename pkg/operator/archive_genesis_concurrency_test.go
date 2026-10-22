@@ -108,8 +108,8 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 
 	first := f.intent
 	second := first
-	second.OperationID = fencing.MutationRequestID(f.producer, 2)
 	second.OwnerStep.Step = "genesis-candidate-two"
+	second.OperationID = ""
 	second.PayloadRef, second.PayloadDigest, second.PayloadSize = "", "", 0
 	secondTicket := strings.Repeat("8", 64)
 	if err := f.stages.Reserve(f.producer, secondTicket, second); err != nil {
@@ -120,6 +120,7 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 		t.Fatal(err)
 	}
 	second.PayloadRef, second.PayloadDigest, second.PayloadSize = sealed.Ref, sealed.Digest, sealed.Size
+	second.OperationID = fencing.MutationRequestID(f.producer, 2)
 	f.admit(t, 1, first)
 	f.admit(t, 2, second)
 	if _, err := f.e.changeMutationProducer(t.Context(), f.runtime, func(p *fencing.MutationProducer) error {
@@ -279,8 +280,8 @@ func TestArchiveGenesisStatusCancelsLostLoserAfterClaimRootCASGapAndClosure(t *t
 
 	first := f.intent
 	second := first
-	second.OperationID = fencing.MutationRequestID(f.producer, 2)
 	second.OwnerStep.Step = "genesis-candidate-two"
+	second.OperationID = ""
 	second.PayloadRef, second.PayloadDigest, second.PayloadSize = "", "", 0
 	secondTicket := strings.Repeat("9", 64)
 	if err := f.stages.Reserve(f.producer, secondTicket, second); err != nil {
@@ -291,6 +292,7 @@ func TestArchiveGenesisStatusCancelsLostLoserAfterClaimRootCASGapAndClosure(t *t
 		t.Fatal(err)
 	}
 	second.PayloadRef, second.PayloadDigest, second.PayloadSize = sealed.Ref, sealed.Digest, sealed.Size
+	second.OperationID = fencing.MutationRequestID(f.producer, 2)
 	f.admit(t, 1, first)
 	f.admit(t, 2, second)
 

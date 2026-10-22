@@ -38,8 +38,18 @@ func TestSourceWriterConfigValidationIsPureAndFailClosed(t *testing.T) {
 				RuntimeAgentCA: "/runtime-agent-ca", CredentialsFile: "/writer/credentials.json"},
 		},
 		{
+			name: "independent profile rejects storage emulator",
+			config: sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS,
+				RuntimeAgentCA: "/runtime-agent-ca", UseADC: true, StorageEmulatorHost: "http://127.0.0.1:9999"},
+			wantErr: "rejects STORAGE_EMULATOR_HOST",
+		},
+		{
 			name:   "cooperative profile stays valid without source mutation",
 			config: sourceWriterConfig{},
+		},
+		{
+			name:   "cooperative profile does not configure a GCS mutation provider",
+			config: sourceWriterConfig{StorageEmulatorHost: "http://127.0.0.1:9999"},
 		},
 		{
 			name:    "ADC is not an implicit cooperative mode",

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"strings"
@@ -1599,7 +1600,9 @@ func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	if err != nil {
 		return QueryResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	durabilityStarted := time.Now()
 	if err := s.waitReadDurable(ctx, appliedSlot); err != nil {
+		s.logReadFailure("read-durability", durabilityStarted, quepaxa.Slot(appliedSlot), "", err)
 		return QueryResponse{}, err
 	}
 	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
@@ -1956,15 +1959,21 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 	case "", "local":
 		return nil
 	case "linearizable":
+		started := time.Now()
 		index, source, err := s.core.ReadIndex(ctx)
 		if err != nil {
+			s.logReadFailure("read-index", started, 0, "", err)
 			return err
 		}
 		if index > s.core.Tip() {
 			if s.transport == nil || source == s.core.NodeID() {
-				return fmt.Errorf("read-index source cannot supply slot %d", index)
+				err := fmt.Errorf("read-index source cannot supply slot %d", index)
+				s.logReadFailure("read-index-catch-up", time.Now(), index, source, err)
+				return err
 			}
+			started = time.Now()
 			if err := s.catchUpFrom(ctx, source, index, true); err != nil {
+				s.logReadFailure("read-index-catch-up", started, index, source, err)
 				return err
 			}
 		}
@@ -1973,9 +1982,11 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 				return nil
 			}
 			if err := s.beginLocalLifecycle(); err != nil {
+				s.logReadFailure("read-index-apply", time.Now(), index, source, err)
 				return err
 			}
 			done := make(chan error, 1)
+			started = time.Now()
 			go func() {
 				applyCtx, cancel := context.WithTimeout(s.proposalCtx, 30*time.Second)
 				err := s.applyDecisions(applyCtx, index)
@@ -1985,15 +1996,43 @@ func (s *Server) readBarrier(ctx context.Context, consistency string) error {
 			}()
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				err := ctx.Err()
+				s.logReadFailure("read-index-apply", started, index, source, err)
+				return err
 			case err := <-done:
+				if err != nil {
+					s.logReadFailure("read-index-apply", started, index, source, err)
+				}
 				return err
 			}
 		}
-		return s.applyDecisions(ctx, index)
+		started = time.Now()
+		err = s.applyDecisions(ctx, index)
+		if err != nil {
+			s.logReadFailure("read-index-apply", started, index, source, err)
+		}
+		return err
 	default:
 		return errConsistency
 	}
+}
+
+func (s *Server) logReadFailure(phase string, started time.Time, index quepaxa.Slot, source quepaxa.NodeID, err error) {
+	errorClass := "backend"
+	switch {
+	case errors.Is(err, context.Canceled):
+		errorClass = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		errorClass = "deadline"
+	case errors.Is(err, quepaxa.ErrQuorumUnavailable):
+		errorClass = "quorum-unavailable"
+	case errors.Is(err, ErrNotReady):
+		errorClass = "not-ready"
+	case errors.Is(err, ErrDurabilityUnavailable):
+		errorClass = "durability-unavailable"
+	}
+	log.Printf("read failed: phase=%s node=%s read_index=%d source=%s core_tip=%d applied_tip=%d elapsed=%s error_class=%s",
+		phase, s.core.NodeID(), index, source, s.core.Tip(), s.material.Tip(), time.Since(started), errorClass)
 }
 
 func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
