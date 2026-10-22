@@ -262,7 +262,7 @@ func TestSourceMutationClientRecoversLostSealResponseFromDurableBytes(t *testing
 	fileSyncs := 0
 	client.state.syncFile = func(file *os.File) error {
 		fileSyncs++
-		if fileSyncs == 3 { // ticket, local payload, then post-seal descriptor
+		if fileSyncs == 4 { // ticket, local payload, remote-start marker, then post-seal descriptor
 			return errors.New("simulated descriptor fsync failure")
 		}
 		return file.Sync()
@@ -290,6 +290,7 @@ func TestSourceRetryReopenRejectsMissingOrCorruptOriginalPayload(t *testing.T) {
 			if stage.LocalPayload == nil {
 				t.Fatal("local source payload descriptor missing")
 			}
+			mustJournal(t, state.markStageRemoteStarted(stage.Ticket))
 			mustJournal(t, state.Close())
 			path := filepath.Join(dir, stage.LocalPayload.Ref)
 			if corrupt {

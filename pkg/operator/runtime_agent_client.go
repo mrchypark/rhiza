@@ -68,7 +68,7 @@ func (a *RuntimeAgentClient) Enroll(ctx context.Context, binding fencing.Runtime
 	return client.Enroll(ctx, binding)
 }
 
-func (a *RuntimeAgentClient) Stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest) (json.RawMessage, error) {
+func (a *RuntimeAgentClient) Stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest) ([]byte, error) {
 	client, err := a.agent(ctx, binding.NodeName)
 	if err != nil {
 		return nil, err

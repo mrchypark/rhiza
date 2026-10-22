@@ -263,6 +263,12 @@ func (p *Provider) containerdPID(ctx context.Context, binding fencing.RuntimeBin
 }
 
 func (p *Provider) inspect(ctx context.Context, binding fencing.RuntimeBinding, containerID string, stopped bool) error {
+	return p.inspectState(ctx, binding, containerID, stopped, 0)
+}
+
+// inspectState can distinguish the crash window after the exact container has
+// exited but before its captured sandbox has been stopped.
+func (p *Provider) inspectState(ctx context.Context, binding fencing.RuntimeBinding, containerID string, stopped bool, sandboxState runtimeapi.PodSandboxState) error {
 	sandbox, err := p.client.PodSandboxStatus(ctx, &runtimeapi.PodSandboxStatusRequest{PodSandboxId: binding.SandboxID})
 	if err != nil {
 		return fmt.Errorf("%w: sandbox status: %w", ErrUnverified, err)
@@ -312,8 +318,12 @@ func (p *Provider) inspect(ctx context.Context, binding fencing.RuntimeBinding, 
 	if !found {
 		return fmt.Errorf("%w: target container is outside the captured sandbox", ErrUnverified)
 	}
-	if stopped && (container.Status.State != runtimeapi.ContainerState_CONTAINER_EXITED || container.Status.FinishedAt <= 0 || sandbox.Status.State != runtimeapi.PodSandboxState_SANDBOX_NOTREADY) {
+	if stopped && (container.Status.State != runtimeapi.ContainerState_CONTAINER_EXITED || container.Status.FinishedAt <= 0 ||
+		(sandboxState == 0 && sandbox.Status.State != runtimeapi.PodSandboxState_SANDBOX_NOTREADY)) {
 		return fmt.Errorf("%w: runtime has not reached the terminal state", ErrUnverified)
+	}
+	if sandboxState != 0 && sandbox.Status.State != sandboxState {
+		return fmt.Errorf("%w: sandbox is not in the expected partial-stop state", ErrUnverified)
 	}
 	return nil
 }
@@ -327,6 +337,12 @@ func knownContainerState(state runtimeapi.ContainerState) bool {
 // descendant containment and return prevention before it can authorize fencing.
 // A partial observation on error preserves acknowledged boundaries, not success.
 func (p *Provider) Stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest) (StopObservation, error) {
+	return p.stop(ctx, binding, request, nil)
+}
+
+// stop leaves a container-stopped/sandbox-ready scope pending unless its exact
+// CRI inventory is terminal before the sandbox stop is attempted.
+func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, beforeSandboxStop func() error) (StopObservation, error) {
 	observation := StopObservation{Runtime: binding, Request: request}
 	if p == nil || p.client == nil || p.host == nil {
 		return observation, fmt.Errorf("%w: local runtime provider is not configured", ErrUnverified)
@@ -361,6 +377,17 @@ func (p *Provider) Stop(ctx context.Context, binding fencing.RuntimeBinding, req
 		return observation, fmt.Errorf("%w: container stop acknowledgement is missing", ErrUnverified)
 	}
 	observation.ContainerStopAcknowledged = true
+	if err := p.inspectState(ctx, binding, containerID, true, runtimeapi.PodSandboxState_SANDBOX_READY); err != nil {
+		return observation, err
+	}
+	if beforeSandboxStop != nil {
+		if err := beforeSandboxStop(); err != nil {
+			return observation, err
+		}
+	}
+	if err := p.verifyVersion(ctx, binding); err != nil {
+		return observation, err
+	}
 	if err := p.verifyHost(ctx, binding); err != nil {
 		return observation, err
 	}
@@ -398,7 +425,7 @@ func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBind
 	if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
 		return observation, err
 	}
-	observation, err := p.Stop(ctx, binding, request)
+	observation, err := p.stop(ctx, binding, request, func() error { return scope.VerifyEmpty(cgroupRoot) })
 	if err != nil {
 		return observation, err
 	}
@@ -439,6 +466,37 @@ func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.Runti
 			return observation, err
 		}
 		if err := p.verifyVersion(ctx, binding); err != nil {
+			return observation, err
+		}
+		observation.ContainerExited, observation.SandboxNotReady = true, true
+		observation.CgroupEmpty, observation.RecoveredTerminalState = true, true
+		observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return observation, nil
+	}
+	// A durable exact intent may have stopped this container before a crash
+	// interrupted the second CRI effect. Finish only that enrolled sandbox after
+	// rechecking its UID, container inventory, runtime and captured empty cgroup.
+	if p.inspectState(ctx, binding, containerID, true, runtimeapi.PodSandboxState_SANDBOX_READY) == nil && scope.VerifyEmpty(cgroupRoot) == nil {
+		if err := p.verifyVersion(ctx, binding); err != nil {
+			return observation, err
+		}
+		if err := p.verifyHost(ctx, binding); err != nil {
+			return observation, err
+		}
+		ack, err := p.client.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: binding.SandboxID})
+		if err != nil || ack == nil {
+			return observation, fmt.Errorf("%w: resumed sandbox stop is unconfirmed: %v", ErrUnverified, err)
+		}
+		if err := p.inspect(ctx, binding, containerID, true); err != nil {
+			return observation, err
+		}
+		if err := scope.VerifyEmpty(cgroupRoot); err != nil {
+			return observation, err
+		}
+		if err := p.verifyVersion(ctx, binding); err != nil {
+			return observation, err
+		}
+		if err := p.verifyHost(ctx, binding); err != nil {
 			return observation, err
 		}
 		observation.ContainerExited, observation.SandboxNotReady = true, true
