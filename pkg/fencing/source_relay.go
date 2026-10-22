@@ -33,6 +33,12 @@ type sourceRelayRequest struct {
 	Intent      MutationIntent `json:"intent,omitempty"`
 }
 
+const sourceStageIdentityHeader = "X-Rhiza-Fencing-Identity"
+
+func validStageTicket(value string) bool {
+	return len(value) == sha256.Size*2 && mutationDigestValid(value) && strings.ToLower(value) == value
+}
+
 func sourceRelayPath(path string) bool {
 	return strings.HasPrefix(path, "/v1/source-stages/") || strings.HasPrefix(path, "/v1/source-mutations/")
 }

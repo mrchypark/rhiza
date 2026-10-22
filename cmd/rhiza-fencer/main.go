@@ -91,6 +91,7 @@ func serve(ctx context.Context, args []string) error {
 	stageIncarnation := f.String("source-stage-incarnation", os.Getenv("FENCER_SOURCE_STAGE_INCARNATION"), "pinned source staging incarnation digest")
 	sourceReceiptDir := f.String("source-mutation-receipt-dir", os.Getenv("FENCER_SOURCE_MUTATION_RECEIPT_DIR"), "pre-provisioned durable source mutation receipt directory")
 	sourceWriterCredentials := f.String("source-writer-credentials-file", os.Getenv("FENCER_SOURCE_WRITER_CREDENTIALS_FILE"), "separate GCS source-writer credentials file")
+	sourceWriterUseADC := f.Bool("source-writer-use-adc", os.Getenv("FENCER_SOURCE_WRITER_USE_ADC") == "true", "use this authority Pod's Application Default Credentials for GCS source mutations")
 	runtimeAgentCA := f.String("runtime-agent-ca-file", os.Getenv("FENCER_RUNTIME_AGENT_CA_FILE"), "dedicated node runtime-agent TLS CA; enables runtime enrollment and terminal evidence")
 	runtimeAgentToken := f.String("runtime-agent-token-file", "/var/run/secrets/rhiza-fencer/runtime-agent-token", "TokenReview-audience-bound runtime-agent credential")
 	runtimeAgentServer := f.String("runtime-agent-server-name", "runtime-agent", "TLS DNS identity on node runtime-agent certificates")
@@ -106,11 +107,18 @@ func serve(ctx context.Context, args []string) error {
 	if *cert == "" || *key == "" {
 		return fmt.Errorf("fencing authority requires TLS certificate and key")
 	}
+	stateConfig := objectstore.LoadConfig()
+	if err := validateSourceWriterConfig(sourceWriterConfig{
+		Independent: *independentMutation, HasCanonicalGCSState: stateConfig.Provider == objectstore.ProviderGCS && stateConfig.Bucket != "",
+		RuntimeAgentCA: *runtimeAgentCA, StageDir: *stageDir, StageIncarnation: *stageIncarnation,
+		ReceiptDir: *sourceReceiptDir, CredentialsFile: *sourceWriterCredentials, UseADC: *sourceWriterUseADC,
+	}); err != nil {
+		return err
+	}
 	kube, err := operator.NewInCluster(*namespace)
 	if err != nil {
 		return err
 	}
-	stateConfig := objectstore.LoadConfig()
 	var authorityState *operator.AuthorityStateStore
 	if stateConfig.Provider == objectstore.ProviderGCS && stateConfig.Bucket != "" {
 		stateBucket, err := objectstore.NewBucket(stateConfig)
@@ -128,14 +136,11 @@ func serve(ctx context.Context, args []string) error {
 		}
 	}
 	if *independentMutation {
+		// Static profile validation above runs before Kubernetes access. This
+		// check confirms the configured remote authority store opened correctly.
 		if authorityState == nil {
-			return fmt.Errorf("independent mutation profile requires RHIZA_OBJSTORE_PROVIDER=gcs and a bucket; cooperative-only mode may use legacy control state but is not NoPVC-qualified")
+			return fmt.Errorf("independent mutation profile requires canonical GCS authority state")
 		}
-		if *runtimeAgentCA == "" || *sourceWriterCredentials == "" || *stageDir != "" || *stageIncarnation != "" || *sourceReceiptDir != "" {
-			return fmt.Errorf("independent mutation profile requires runtime-agent CA, separate source writer credentials, and remote source staging and receipts (no local stage or receipt directory)")
-		}
-	} else if (*sourceReceiptDir != "" || *sourceWriterCredentials != "") && authorityState == nil {
-		return fmt.Errorf("source mutation execution requires canonical GCS authority state; configure the independent mutation profile or disable source-mutation providers")
 	}
 	executor := &operator.FencingExecutor{Kube: kube, AuthorityState: authorityState}
 	if *runtimeAgentCA != "" {
@@ -161,9 +166,6 @@ func serve(ctx context.Context, args []string) error {
 		defer store.Close()
 		executor.SourceStages = store
 	}
-	if !*independentMutation && (*sourceReceiptDir == "") != (*sourceWriterCredentials == "") {
-		return fmt.Errorf("source mutation execution requires both a receipt directory and separate writer credentials")
-	}
 	if *sourceWriterCredentials != "" {
 		credentialInfo, err := os.Lstat(*sourceWriterCredentials)
 		if err != nil || !credentialInfo.Mode().IsRegular() || credentialInfo.Mode()&os.ModeSymlink != 0 || credentialInfo.Mode().Perm()&0077 != 0 {
@@ -180,6 +182,13 @@ func serve(ctx context.Context, args []string) error {
 		writer, err := storage.NewClient(ctx, option.WithCredentialsFile(*sourceWriterCredentials))
 		if err != nil {
 			return fmt.Errorf("configure source writer: %w", err)
+		}
+		defer writer.Close()
+		executor.SourceMutationStorage = writer
+	} else if *sourceWriterUseADC {
+		writer, err := storage.NewClient(ctx)
+		if err != nil {
+			return fmt.Errorf("configure source writer from Application Default Credentials: %w", err)
 		}
 		defer writer.Close()
 		executor.SourceMutationStorage = writer
@@ -202,4 +211,42 @@ func serve(ctx context.Context, args []string) error {
 			}
 		}
 	}
+}
+
+type sourceWriterConfig struct {
+	Independent          bool
+	HasCanonicalGCSState bool
+	RuntimeAgentCA       string
+	StageDir             string
+	StageIncarnation     string
+	ReceiptDir           string
+	CredentialsFile      string
+	UseADC               bool
+}
+
+// validateSourceWriterConfig checks the selected credential/profile mode
+// without opening credentials, clients, Kubernetes, or object storage.
+func validateSourceWriterConfig(c sourceWriterConfig) error {
+	if c.CredentialsFile != "" && c.UseADC {
+		return fmt.Errorf("source writer credentials file and Application Default Credentials are mutually exclusive")
+	}
+	if c.UseADC && !c.Independent {
+		return fmt.Errorf("source writer Application Default Credentials require the independent mutation profile")
+	}
+	if c.Independent {
+		if !c.HasCanonicalGCSState {
+			return fmt.Errorf("independent mutation profile requires RHIZA_OBJSTORE_PROVIDER=gcs and a bucket; cooperative-only mode may use legacy control state but is not NoPVC-qualified")
+		}
+		if c.RuntimeAgentCA == "" || (c.CredentialsFile == "" && !c.UseADC) || c.StageDir != "" || c.StageIncarnation != "" || c.ReceiptDir != "" {
+			return fmt.Errorf("independent mutation profile requires runtime-agent CA, exactly one separate source writer credential mode, and remote source staging and receipts (no local stage or receipt directory)")
+		}
+		return nil
+	}
+	if (c.ReceiptDir == "") != (c.CredentialsFile == "") {
+		return fmt.Errorf("source mutation execution requires both a receipt directory and separate writer credentials")
+	}
+	if (c.ReceiptDir != "" || c.CredentialsFile != "") && !c.HasCanonicalGCSState {
+		return fmt.Errorf("source mutation execution requires canonical GCS authority state; configure the independent mutation profile or disable source-mutation providers")
+	}
+	return nil
 }
