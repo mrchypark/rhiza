@@ -35,6 +35,7 @@ import (
 type nodeObjectBucket interface {
 	thanosobjstore.Bucket
 	Stats() objectstore.Stats
+	DrainMutations(context.Context) error
 	Close() error
 }
 

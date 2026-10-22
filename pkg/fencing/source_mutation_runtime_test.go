@@ -159,6 +159,21 @@ func TestSourceMutationRuntimeSettlesSavedTupleBeforeNewBucketInvocation(t *test
 	}
 }
 
+func TestSourceMutationRuntimeDrainRejectsUnresolvedAdmission(t *testing.T) {
+	inner, fake, _, _ := newSourceMutationClientTest(t)
+	runtime := &SourceMutationClient{state: inner.state, client: inner}
+	fake.loseAdmit = true
+	if err := runtime.Upload(context.Background(), "target", MutationCondition{Mode: MutationCreateOnly}, []byte("uncertain")); err == nil {
+		t.Fatal("lost admission response was treated as a successful mutation")
+	}
+	if err := runtime.DrainMutations(context.Background()); !errors.Is(err, ErrPending) {
+		t.Fatalf("unresolved admitted mutation received a clean drain: %v", err)
+	}
+	if err := runtime.Upload(context.Background(), "target", MutationCondition{Mode: MutationCreateOnly}, []byte("later")); err == nil || fake.admits != 1 {
+		t.Fatalf("drained mutation client accepted further work: err=%v admits=%d", err, fake.admits)
+	}
+}
+
 func TestSourceMutationRuntimeAllowsReplanAfterConditionalRejection(t *testing.T) {
 	inner, fake, _, _ := newSourceMutationClientTest(t)
 	runtime := &SourceMutationClient{state: inner.state, client: inner}

@@ -131,7 +131,7 @@ func TestAuthorityProducerCASCannotReopenClosedProducer(t *testing.T) {
 		t.Fatal(err)
 	}
 	openSnapshot := *producer
-	_, oldVersion, err := store.ReadProducer(context.Background(), runtime)
+	_, _, oldVersion, err := store.ReadProducer(context.Background(), runtime)
 	if err != nil {
 		t.Fatal(err)
 	}

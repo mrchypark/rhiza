@@ -13,11 +13,13 @@ import (
 )
 
 type recordingSourceMutator struct {
-	key       string
-	payload   []byte
-	condition fencing.MutationCondition
-	deleted   int64
-	err       error
+	key        string
+	payload    []byte
+	condition  fencing.MutationCondition
+	deleted    int64
+	err        error
+	drainErr   error
+	drainCalls int
 }
 
 func (m *recordingSourceMutator) Upload(_ context.Context, key string, condition fencing.MutationCondition, payload []byte) error {
@@ -43,6 +45,27 @@ func (m *recordingSourceMutator) Delete(_ context.Context, key string, generatio
 	return nil
 }
 func (*recordingSourceMutator) Close() error { return nil }
+
+func (m *recordingSourceMutator) DrainMutations(context.Context) error {
+	m.drainCalls++
+	return m.drainErr
+}
+
+func TestFencedBucketDrainJoinsProtectedAndMeteredMutations(t *testing.T) {
+	base, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	mutator := &recordingSourceMutator{drainErr: fencing.ErrPending}
+	bucket := &fencedBucket{MeteredBucket: base, source: mutator, prefix: "cluster"}
+	if err := bucket.DrainMutations(context.Background()); !errors.Is(err, fencing.ErrPending) || mutator.drainCalls != 1 {
+		t.Fatalf("protected mutation drain was not joined: err=%v calls=%d", err, mutator.drainCalls)
+	}
+	if err := base.Upload(context.Background(), "after-drain", strings.NewReader("blocked")); !errors.Is(err, objectstore.ErrMutationsStopped) {
+		t.Fatalf("metered bucket accepted a mutation after drain: %v", err)
+	}
+}
 
 func TestFencedBucketMapsOnlyRepresentableMutationConditions(t *testing.T) {
 	base, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
