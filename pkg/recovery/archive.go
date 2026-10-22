@@ -220,12 +220,19 @@ func (m *Manager) loadLocked(ctx context.Context, verified map[extentObject]Exte
 		if !m.bucket.IsObjNotFoundErr(err) {
 			return err
 		}
-		unsupported := false
-		if err := m.bucket.Iter(ctx, m.key("archive/extents"), func(string) error { unsupported = true; return nil }); err != nil {
+		legacyExtents := false
+		if err := m.bucket.Iter(ctx, m.key("archive/extents"), func(string) error { legacyExtents = true; return nil }); err != nil {
 			return err
 		}
-		if unsupported {
+		if legacyExtents {
 			return fmt.Errorf("unsupported shared archive layout")
+		}
+		orphanedBlocks := false
+		if err := m.bucket.Iter(ctx, m.key("archive/blocks"), func(string) error { orphanedBlocks = true; return nil }); err != nil {
+			return err
+		}
+		if orphanedBlocks {
+			return fmt.Errorf("shared archive head is missing but immutable blocks remain")
 		}
 		if oldHead.Tip != 0 {
 			return fmt.Errorf("shared archive head disappeared")
