@@ -1,6 +1,6 @@
-// Command fencing-e2e drives a disposable Kind qualification of the real
-// cooperative executor. Runtime inspection below is a fault-injector oracle;
-// it is never supplied to the executor as a fencing proof.
+// Command fencing-e2e drives the cooperative executor and a separate
+// runtime-agent component probe in disposable Kind. Runtime inspection in the
+// cooperative scenario is a fault-injector oracle, never executor proof.
 package main
 
 import (
@@ -37,7 +37,19 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|wait-source|run"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|wait-source|run|runtime-probe|runtime-agent-request"))
+	}
+	if os.Args[1] == "runtime-agent-request" {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		fatal(runtimeAgentRequest(ctx))
+		return
+	}
+	if os.Args[1] == "runtime-probe" {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		fatal(runtimeComponentProbe(ctx))
+		return
 	}
 	if os.Args[1] == "manifests" {
 		fatal(json.NewEncoder(os.Stdout).Encode(manifests()))

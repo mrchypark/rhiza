@@ -165,7 +165,7 @@ metadata:
   namespace: rhiza
 data:
   containerd-version: QUALIFIED_CONTAINERD_VERSION
-  containerd-runtime-type: io.containerd.runc.v2
+  containerd-runtime-type: QUALIFIED_CONTAINERD_RUNTIME_TYPE
   cgroup-profile-id: QUALIFIED_PRIVATE_CGROUP_V2_PROFILE_ID
   kernel-release: QUALIFIED_LINUX_KERNEL_RELEASE
   authority-deployment-uid: PINNED_RHIZA_FENCER_DEPLOYMENT_UID
