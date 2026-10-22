@@ -614,6 +614,50 @@ func newArchiveSyncAdmissionManagers(t *testing.T) (context.Context, objstore.Bu
 	return ctx, bucket, core, stale, writer
 }
 
+func TestMissingArchiveHeadRejectsOrphanedArchiveObjects(t *testing.T) {
+	t.Run("empty store remains empty", func(t *testing.T) {
+		bucket := objstore.NewInMemBucket()
+		manager := NewManager(bucket, "cluster", 1)
+		defer manager.Close()
+		if err := manager.Load(context.Background()); err != nil {
+			t.Fatalf("load empty archive: %v", err)
+		}
+	})
+
+	t.Run("current immutable block", func(t *testing.T) {
+		ctx, bucket, _, writer := newSealableArchive(t)
+		defer writer.Close()
+		blocks := 0
+		if err := bucket.Iter(ctx, writer.key("archive/blocks"), func(string) error { blocks++; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if blocks == 0 {
+			t.Fatal("fixture did not write a current immutable archive block")
+		}
+		if err := bucket.Delete(ctx, writer.key("archive/head.bin")); err != nil {
+			t.Fatal(err)
+		}
+
+		reader := NewManager(bucket, "cluster", 1)
+		defer reader.Close()
+		if err := reader.Load(ctx); err == nil || !strings.Contains(err.Error(), "immutable blocks remain") {
+			t.Fatalf("load with orphaned current block: %v", err)
+		}
+	})
+
+	t.Run("legacy extent", func(t *testing.T) {
+		bucket := objstore.NewInMemBucket()
+		if err := bucket.Upload(context.Background(), "cluster/archive/extents/00000000000000000001_00000000000000000001_legacy.json", bytes.NewReader([]byte("legacy extent"))); err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(bucket, "cluster", 1)
+		defer manager.Close()
+		if err := manager.Load(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported shared archive layout") {
+			t.Fatalf("load with orphaned legacy extent: %v", err)
+		}
+	})
+}
+
 func TestArchiveSyncThroughSkipsAdmissionForDurableTarget(t *testing.T) {
 	ctx, base, core, stale, writer := newArchiveSyncAdmissionManagers(t)
 	if _, _, err := core.Propose(ctx, []byte("durable target")); err != nil {
