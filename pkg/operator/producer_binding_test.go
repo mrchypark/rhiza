@@ -53,13 +53,14 @@ func TestMutationJournalBindingRejectsCooperativeRootAndPreservesCooperativeBind
 	t.Run("required executor rejects stale cooperative root without mutation", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
 		cooperative := &FencingExecutor{AuthorityState: store}
-		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run", WALIdentity: "wal"}
+		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run"}
 		if err := cooperative.initializeRoot(t.Context(), "sts", "source"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := cooperative.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { return l.Register(id) }); err != nil {
 			t.Fatal(err)
 		}
+		id.WALIdentity = "wal"
 		_, beforeVersion, err := store.ReadRoot(t.Context(), "sts", "source")
 		if err != nil {
 			t.Fatal(err)
@@ -77,13 +78,14 @@ func TestMutationJournalBindingRejectsCooperativeRootAndPreservesCooperativeBind
 	t.Run("explicit cooperative root may bind without producer", func(t *testing.T) {
 		store, _ := newAuthorityStateStoreForTest(t)
 		executor := &FencingExecutor{AuthorityState: store}
-		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run", WALIdentity: "wal"}
+		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run"}
 		if err := executor.initializeRoot(t.Context(), "sts", "source"); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := executor.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { return l.Register(id) }); err != nil {
 			t.Fatal(err)
 		}
+		id.WALIdentity = "wal"
 		receipt, err := executor.bindWALAtScope(t.Context(), "sts", id, "")
 		if err != nil || receipt.Producer != nil || receipt.Validate(id) != nil {
 			t.Fatalf("cooperative bind did not retain nil-producer contract: %+v %v", receipt, err)
