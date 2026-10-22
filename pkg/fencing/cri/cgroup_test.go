@@ -63,14 +63,14 @@ func TestCgroupScopePinsAndVerifiesDescendantEmptiness(t *testing.T) {
 	if err := scope.VerifyEmpty(cgroups); err == nil {
 		t.Fatal("populated cgroup was accepted as empty")
 	}
+	if err := scope.VerifyProcess(proc, cgroups); err != nil {
+		t.Fatalf("same process identity rejected before exit: %v", err)
+	}
 	if err := os.WriteFile(events, []byte("populated 0\nfrozen 0\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := scope.VerifyEmpty(cgroups); err != nil {
 		t.Fatalf("empty enrolled cgroup rejected: %v", err)
-	}
-	if err := scope.VerifyProcess(proc, cgroups); err != nil {
-		t.Fatalf("same process identity rejected: %v", err)
 	}
 	writeProcIdentity(t, proc, 123, 790, "kubepods/pod-a")
 	if err := scope.VerifyProcess(proc, cgroups); err == nil {
