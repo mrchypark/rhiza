@@ -33,7 +33,12 @@ def render(path, **values):
 
 RUN = dict(NAMESPACE=NS, RUN_ID="abc12345", CLUSTER_ID="abc12345-cluster",
            GCS_BUCKET="bucket", GCS_PREFIX="rhiza/abc12345/",
-           POD_GSA="data@example.iam.gserviceaccount.com",
+           WORKLOAD_PREFIX="rhiza/abc12345/data/",
+           AUTHORITY_PREFIX="rhiza/abc12345/control",
+           CONTROLPLANE_GSA="control@example.iam.gserviceaccount.com",
+           READONLY_WORKLOAD_GSA="reader@example.iam.gserviceaccount.com",
+           RUNTIME_AGENT_CA_SECRET="runtime-agent-ca",
+           RUNTIME_AGENT_TLS_SECRET="runtime-agent-tls",
            OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:aa",
            HOST_IMAGE="ghcr.io/mrchypark/rhiza-application@sha256:bb")
 
@@ -57,7 +62,7 @@ class RunManifestTest(unittest.TestCase):
                    if d["kind"] == "Deployment" and d["metadata"]["name"] == "rhiza-operator")
         env = {e["name"]: e.get("value") for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
         self.assertEqual((env["RHIZA_AUTOMATIC_RECOVERY"], env["RHIZA_FENCER_BACKEND"]),
-                         ("true", "kubernetes"))
+                         ("true", "http"))
 
     def test_operator_uses_the_bootstrap_workload_identity(self):
         docs = self.docs()
@@ -71,7 +76,12 @@ class RunManifestTest(unittest.TestCase):
                                                 "namespace": NS}])
         ksa = next(d for d in docs if d["kind"] == "ServiceAccount"
                    and d["metadata"]["name"] == "rhiza-operator")
-        self.assertEqual(ksa["metadata"]["annotations"]["iam.gke.io/gcp-service-account"], RUN["POD_GSA"])
+        self.assertEqual(ksa["metadata"]["annotations"]["iam.gke.io/gcp-service-account"],
+                         RUN["CONTROLPLANE_GSA"])
+        workload = next(d for d in docs if d["kind"] == "ServiceAccount"
+                        and d["metadata"]["name"] == "rhiza-workload")
+        self.assertEqual(workload["metadata"]["annotations"]["iam.gke.io/gcp-service-account"],
+                         RUN["READONLY_WORKLOAD_GSA"])
 
     def test_tokenreview_binding_is_run_named(self):
         crb = next(d for d in self.docs() if d["kind"] == "ClusterRoleBinding"
@@ -531,8 +541,13 @@ class LauncherDigestTest(unittest.TestCase):
     """The launcher must reject anything that is not name@sha256:<64 hex>."""
 
     BASE = dict(RHIZA_RUN_ID="abc12345", RHIZA_NAMESPACE="ns", RHIZA_KUBE_CONTEXT="ctx",
-                RHIZA_GCS_BUCKET="b", RHIZA_GCS_PREFIX="p/", RHIZA_CLUSTER_ID="cid",
+                RHIZA_GCS_BUCKET="test-bucket", RHIZA_GCS_PREFIX="p/abc12345/", RHIZA_CLUSTER_ID="cid",
                 RHIZA_GCP_PROJECT_ID="project", RHIZA_DATA_GSA_ID="data-gsa",
+                RHIZA_READONLY_WORKLOAD_GSA_ID="reader-gsa",
+                RHIZA_GCS_INDEPENDENT_LAYOUT="yes", RHIZA_AUTH_STATE="/tmp/no-bootstrap-state",
+                RHIZA_RUNTIME_AGENT_CA_SECRET="agent-ca", RHIZA_RUNTIME_AGENT_TLS_SECRET="agent-tls",
+                RHIZA_CONTAINERD_VERSION="containerd-1.7.1", RHIZA_CONTAINERD_RUNTIME_TYPE="io.containerd.runc.v2",
+                RHIZA_CGROUP_PROFILE_ID="cgroup-v2-default", RHIZA_KERNEL_RELEASE="6.1.0",
                 RHIZA_OPERATOR_IMAGE="ghcr.io/mrchypark/rhiza-operator@sha256:" + "f" * 64)
 
     def run_launcher(self, app_image):

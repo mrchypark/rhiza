@@ -59,6 +59,15 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "qualification-gcs-iam-probe" {
+		if len(os.Args) != 3 {
+			log.Fatal("invalid GCS IAM probe arguments")
+		}
+		if err := runGCSIAMProbeCommand(os.Args[2]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "qualification-quic-probe" {
 		if len(os.Args) == 3 && os.Args[2] == "hold" {
 			time.Sleep(20 * time.Minute)

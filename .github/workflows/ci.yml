@@ -112,7 +112,7 @@ jobs:
         run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
       - name: Check cooperative protocol and engine regression tests
         run: |
-          go test -race ./cmd/rhiza-fencer ./cmd/rhiza-runtime-agent ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/node ./pkg/network ./pkg/recovery ./pkg/materializer ./internal/objstore ./e2e/fencing ./deploy/operator -count=1 -timeout=5m
+          go test -race ./cmd/rhiza-fencer ./cmd/rhiza-runtime-agent ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/node ./pkg/network ./pkg/recovery ./pkg/materializer ./internal/objstore ./e2e/fencing ./deploy/operator ./e2e/chaos/embedded-go -count=1 -timeout=5m
       - name: Qualify shipped runtime agent and cooperative executor in disposable Kubernetes
         env:
           CGO_ENABLED: 0

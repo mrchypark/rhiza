@@ -14,6 +14,13 @@ esac
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 . "$script_dir/cluster-metadata-projection.sh"
 die() { printf '%s\n' "$*" >&2; exit 1; }
+if [ "$mode" = run ] || [ "$mode" = run-local ]; then
+  if [ -n "${RHIZA_AUTH_STATE:-}" ] && [ -f "$RHIZA_AUTH_STATE/identity.json" ] && [ ! -L "$RHIZA_AUTH_STATE/identity.json" ]; then
+    if jq -e 'type=="object" and .gcs_layout=="independent"' "$RHIZA_AUTH_STATE/identity.json" >/dev/null 2>&1; then
+      die 'Legacy workload runner cannot consume independent GCS identity receipts; use the v2 runner'
+    fi
+  fi
+fi
 inspector_network_isolation=${RHIZA_INSPECTOR_NETWORK_ISOLATION-required}
 case "$inspector_network_isolation" in
   required|exclude-user-approved) ;;
