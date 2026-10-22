@@ -127,7 +127,11 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 			}
 		}
 	}
-	provider, err := newGCSMutationProvider(e.SourceMutationStorage, scope)
+	run, err := e.enrolledMutationRun(ctx, runtime)
+	if err != nil {
+		return err
+	}
+	provider, err := newGCSMutationProviderForRun(e.SourceMutationStorage, scope, run)
 	if err != nil {
 		return err
 	}
@@ -157,7 +161,7 @@ func (e *FencingExecutor) sourceMutationProducer(ctx context.Context, uid string
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
 	if !ok || run.Identity != id || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" ||
-		run.MutationScopeHash == "" || run.MutationProfile != fencing.MutationExecutionProfile || run.MutationStageIncarnation == "" {
+		run.MutationScopeHash == "" || !fencing.MutationProfileSupported(run.MutationProfile) || run.MutationStageIncarnation == "" {
 		return fencing.RuntimeBinding{}, "", fmt.Errorf("fencing: source mutation is outside enrolled producer")
 	}
 	if err := run.Runtime.Validate(id); err != nil {

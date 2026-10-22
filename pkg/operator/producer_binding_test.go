@@ -164,6 +164,74 @@ func TestProducerBindingPinsImmutableSourceStageIncarnation(t *testing.T) {
 	}
 }
 
+func TestHeldProfileCannotRebindLegacyProducerWithPendingGrant(t *testing.T) {
+	e, fixture, id, runtime := newMutationStoreFixture(t)
+	scopeHash := preparePendingArchiveGenesis(t, e, fixture, id, runtime)
+	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
+		t.Fatal(err)
+	}
+	stages, err := e.sourceStagesFor(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id.WALIdentity = "wal-legacy"
+	legacyReceipt, err := e.bindWALAtScopeWithStage(t.Context(), "sts", id, scopeHash, stages.incarnation)
+	if err != nil || legacyReceipt.Producer == nil || legacyReceipt.Producer.ExecutionProfile != fencing.MutationExecutionProfile {
+		t.Fatalf("legacy profile setup failed: %+v %v", legacyReceipt, err)
+	}
+	intent := fencing.MutationIntent{
+		ContractVersion: fencing.MutationIntentVersion,
+		StoreScopeHash:  scopeHash,
+		OwnerStep:       fencing.MutationOwnerStep{Owner: "test", Workflow: "legacy-profile", Step: "delete", Attempt: 1},
+		Condition:       fencing.MutationCondition{Mode: fencing.MutationMatchGeneration, Generation: 7},
+		OperationID:     fencing.MutationRequestID(legacyReceipt.Producer.ProducerUID, 1),
+		Kind:            "delete",
+		Key:             "legacy/object",
+	}
+	if _, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
+		if err := p.Admit(1, intent); err != nil {
+			return err
+		}
+		if err := p.Prepare(1, fencing.MutationPreparation{Profile: fencing.MutationExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true, Generation: 7}); err != nil {
+			return err
+		}
+		if err := p.GrantDispatch(1, "legacy-dispatch"); err != nil {
+			return err
+		}
+		return p.SealDispatch(1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rootBefore, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producerBefore, _, _, err := e.AuthorityState.ReadProducer(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	held := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, RequireMutationJournal: true, MutationProfile: fencing.MutationHeldExecutionProfile}
+	receipt, err := held.bindWALAtScopeWithStage(t.Context(), "sts", id, scopeHash, stages.incarnation)
+	if err == nil || receipt.Producer != nil {
+		t.Fatalf("held-v2 executor attached to the existing legacy grant: %+v %v", receipt, err)
+	}
+	rootAfter, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producerAfter, _, _, err := e.AuthorityState.ReadProducer(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hashJSON(rootBefore.Ledger) != hashJSON(rootAfter.Ledger) || hashJSON(producerBefore) != hashJSON(producerAfter) {
+		t.Fatal("rejected held-v2 attachment mutated the legacy root or executable grant")
+	}
+	if rootAfter.Ledger.Runs[id.RunID].MutationProfile != fencing.MutationExecutionProfile || producerAfter.Entries[1].Dispatches["legacy-dispatch"].ReceiptDigest != "" {
+		t.Fatal("legacy profile or pending grant changed during rejected held-v2 attachment")
+	}
+}
+
 func TestProducerBindingRejectsClosureScopeAndReplacedStorage(t *testing.T) {
 	for _, fault := range []string{"closure", "scope", "missing", "replaced"} {
 		t.Run(fault, func(t *testing.T) {

@@ -151,6 +151,153 @@ func TestMutationJournalCreateZeroCannotHideDelayedCopy(t *testing.T) {
 	}
 }
 
+func guardedCreateProducer(t *testing.T, profile string) (*MutationProducer, MutationGuardedLogicalResolution) {
+	t.Helper()
+	p := newJournalProducer(t, "guarded-create")
+	intent := journalUpload("guarded-create")
+	intent.Condition = MutationCondition{Mode: MutationCreateOnly}
+	mustJournal(t, p.Admit(1, intent))
+	prepared := journalPreparation(0)
+	prepared.Profile = profile
+	mustJournal(t, p.Prepare(1, prepared))
+	mustJournal(t, p.GrantDispatch(1, "original-grant"))
+	mustJournal(t, p.SealDispatch(1))
+	hash, err := p.PreparationHash(1)
+	mustJournal(t, err)
+	mustJournal(t, p.Resolve(1, MutationResolution{Outcome: MutationCommitted, PreparationHash: hash,
+		ReceiptDigest: journalTestDigest, PayloadDigest: intent.PayloadDigest}))
+	mustJournal(t, p.Close("guarded-fence", journalTestDigest))
+	evidence := MutationGuardedLogicalResolution{Version: MutationGuardedLogicalResolutionVersion,
+		Runtime: p.Runtime, WALIdentity: p.WALIdentity, ProducerUID: "producer-uid", Sequence: 1,
+		Intent: intent, Preparation: prepared, PreparationHash: hash, DispatchID: "original-grant",
+		Profile: MutationHeldExecutionProfile, GuardRootIdentity: journalTestDigest, GuardVersion: MutationGuardedLogicalResolutionVersion,
+		GuardRef: "mutation-guards/create-only.json", GuardDigest: journalTestDigest,
+		ObjectGeneration: 42, ObjectMetageneration: 1, ObjectSize: intent.PayloadSize, PayloadDigest: intent.PayloadDigest}
+	return p, evidence
+}
+
+func TestMutationJournalGuardedLogicalResolutionPreservesPhysicalUncertainty(t *testing.T) {
+	p, evidence := guardedCreateProducer(t, MutationHeldExecutionProfile)
+	mustJournal(t, p.ResolveGuardedLogical(evidence.ProducerUID, 1, evidence))
+	mustJournal(t, p.ResolveGuardedLogical(evidence.ProducerUID, 1, evidence))
+	entry := reloadProducer(t, p).Entries[1]
+	if !p.BarrierComplete() || entry.GuardedLogicalResolution == nil || entry.Resolution == nil || entry.Resolution.AllCopiesTerminal {
+		t.Fatal("guarded logical resolution failed to settle only the logical barrier")
+	}
+	if dispatch := entry.Dispatches[evidence.DispatchID]; dispatch.ReceiptDigest != "" || !entry.DispatchClosed {
+		t.Fatalf("guarded resolution rewrote original physical permission: %+v", dispatch)
+	}
+	if entry.Resolution.ReceiptDigest != journalTestDigest || entry.Resolution.PayloadDigest != evidence.PayloadDigest {
+		t.Fatal("guarded resolution replaced the original committed receipt")
+	}
+	q := reloadProducer(t, p)
+	rejectJournalUnchanged(t, q, func() error { return q.ResolveGuardedLogical("another-producer", 1, evidence) })
+}
+
+func TestMutationJournalGuardedLogicalResolutionSettlesUnknownOriginalWithoutTerminalizingGrant(t *testing.T) {
+	p, evidence := guardedCreateProducer(t, MutationHeldExecutionProfile)
+	entry := p.Entries[1]
+	entry.Resolution = nil // the original provider response and receipt are unknown
+	p.Entries[1] = entry
+	mustJournal(t, p.ResolveGuardedLogical(evidence.ProducerUID, 1, evidence))
+	resolved := reloadProducer(t, p).Entries[1]
+	if !p.BarrierComplete() || resolved.Resolution == nil || resolved.Resolution.Outcome != MutationCommitted || resolved.Resolution.AllCopiesTerminal {
+		t.Fatal("guarded evidence did not resolve only the unknown logical result")
+	}
+	if resolved.Dispatches[evidence.DispatchID].ReceiptDigest != "" {
+		t.Fatal("logical resolution forged a terminal receipt for the original dispatch")
+	}
+}
+
+func TestMutationCompactionRetainsGuardedLogicalEvidence(t *testing.T) {
+	p := newJournalProducer(t, "guarded-compaction")
+	producerUID := compactionProducerUID
+	intent := journalUpload(MutationRequestID(producerUID, 1))
+	intent.OperationID = MutationRequestID(producerUID, 1)
+	intent.Condition = MutationCondition{Mode: MutationCreateOnly}
+	mustJournal(t, p.Admit(1, intent))
+	prepared := journalPreparation(0)
+	prepared.Profile = MutationHeldExecutionProfile
+	mustJournal(t, p.Prepare(1, prepared))
+	mustJournal(t, p.GrantDispatch(1, "original-grant"))
+	mustJournal(t, p.SealDispatch(1))
+	hash, err := p.PreparationHash(1)
+	mustJournal(t, err)
+	mustJournal(t, p.Resolve(1, MutationResolution{Outcome: MutationCommitted, PreparationHash: hash,
+		ReceiptDigest: journalTestDigest, PayloadDigest: intent.PayloadDigest}))
+	mustJournal(t, p.Close("guarded-fence", journalTestDigest))
+	evidence := MutationGuardedLogicalResolution{Version: MutationGuardedLogicalResolutionVersion,
+		Runtime: p.Runtime, WALIdentity: p.WALIdentity, ProducerUID: producerUID, Sequence: 1, Intent: intent, Preparation: prepared,
+		PreparationHash: hash, DispatchID: "original-grant", Profile: MutationHeldExecutionProfile,
+		GuardRootIdentity: journalTestDigest, GuardVersion: MutationGuardedLogicalResolutionVersion,
+		GuardRef: "mutation-guards/create-only.json", GuardDigest: journalTestDigest,
+		ObjectGeneration: 42, ObjectMetageneration: 1, ObjectSize: intent.PayloadSize, PayloadDigest: intent.PayloadDigest}
+	mustJournal(t, p.ResolveGuardedLogical(producerUID, 1, evidence))
+	plan, err := p.PlanMutationCompaction(producerUID, 1)
+	mustJournal(t, err)
+	archived := plan.Entries[1]
+	if archived.GuardedLogicalResolution == nil || *archived.GuardedLogicalResolution != evidence || archived.Dispatches["original-grant"].ReceiptDigest != "" {
+		t.Fatal("compaction did not preserve the canonical guard and unresolved original permission")
+	}
+	mustJournal(t, p.CommitMutationCompaction(producerUID, plan, archiveReference(plan)))
+	if p.CompactedThrough != 1 || len(p.Entries) != 0 {
+		t.Fatal("guarded mutation was not compacted as a terminal logical entry")
+	}
+}
+
+func TestMutationJournalGuardedLogicalResolutionRejectsMismatchedEvidence(t *testing.T) {
+	mutations := map[string]func(*MutationGuardedLogicalResolution){
+		"wrong runtime":          func(v *MutationGuardedLogicalResolution) { v.Runtime.BootID = "other" },
+		"wrong WAL":              func(v *MutationGuardedLogicalResolution) { v.WALIdentity = "other" },
+		"wrong producer":         func(v *MutationGuardedLogicalResolution) { v.ProducerUID = "" },
+		"wrong sequence":         func(v *MutationGuardedLogicalResolution) { v.Sequence++ },
+		"wrong intent":           func(v *MutationGuardedLogicalResolution) { v.Intent.Key = "other" },
+		"wrong preparation":      func(v *MutationGuardedLogicalResolution) { v.Preparation.Generation = 1 },
+		"wrong dispatch":         func(v *MutationGuardedLogicalResolution) { v.DispatchID = "other" },
+		"wrong profile":          func(v *MutationGuardedLogicalResolution) { v.Profile = MutationExecutionProfile },
+		"wrong root identity":    func(v *MutationGuardedLogicalResolution) { v.GuardRootIdentity = "invalid" },
+		"wrong guard version":    func(v *MutationGuardedLogicalResolution) { v.GuardVersion++ },
+		"wrong guard reference":  func(v *MutationGuardedLogicalResolution) { v.GuardRef = "../outside" },
+		"wrong guard digest":     func(v *MutationGuardedLogicalResolution) { v.GuardDigest = "invalid" },
+		"missing generation":     func(v *MutationGuardedLogicalResolution) { v.ObjectGeneration = 0 },
+		"missing metageneration": func(v *MutationGuardedLogicalResolution) { v.ObjectMetageneration = 0 },
+		"wrong size":             func(v *MutationGuardedLogicalResolution) { v.ObjectSize++ },
+		"wrong bytes":            func(v *MutationGuardedLogicalResolution) { v.PayloadDigest = strings.Repeat("b", 64) },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			p, evidence := guardedCreateProducer(t, MutationHeldExecutionProfile)
+			mutate(&evidence)
+			rejectJournalUnchanged(t, p, func() error { return p.ResolveGuardedLogical(evidence.ProducerUID, 1, evidence) })
+		})
+	}
+	t.Run("legacy unheld grant", func(t *testing.T) {
+		p, evidence := guardedCreateProducer(t, MutationExecutionProfile)
+		evidence.Profile = MutationHeldExecutionProfile
+		rejectJournalUnchanged(t, p, func() error { return p.ResolveGuardedLogical(evidence.ProducerUID, 1, evidence) })
+	})
+}
+
+func TestHeldProfileRetainsOrdinaryGenerationCASAndDeleteOperations(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		intent MutationIntent
+		gen    int64
+	}{
+		{name: "nonzero upload", intent: journalUpload("cas-upload"), gen: 17},
+		{name: "exact delete", intent: MutationIntent{ContractVersion: MutationIntentVersion, StoreScopeHash: journalTestDigest,
+			OwnerStep: MutationOwnerStep{Owner: "test", Workflow: "gc", Step: "delete", Attempt: 1},
+			Condition: MutationCondition{Mode: MutationMatchGeneration, Generation: 17}, OperationID: "cas-delete", Kind: "delete", Key: "source/object"}, gen: 17},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prepared := MutationPreparation{Profile: MutationHeldExecutionProfile, StoreScopeHash: journalTestDigest, GenerationSet: true, Generation: test.gen}
+			if err := validateMutationPreparation(test.intent, prepared); err != nil {
+				t.Fatalf("held profile rejected ordinary source mutation: %v", err)
+			}
+		})
+	}
+}
+
 func TestMutationJournalExclusionIsNotCommitment(t *testing.T) {
 	for _, generation := range []int64{0, 42} {
 		t.Run(fmt.Sprint(generation), func(t *testing.T) {
@@ -339,5 +486,36 @@ func TestMutationJournalStaleCASCannotAdmitAcrossClosure(t *testing.T) {
 	mustJournal(t, current.Close("fence", journalTestDigest))
 	if !commit(current, currentRevision) || current.BarrierComplete() || current.ClosedThrough != 1 {
 		t.Fatal("retried closure did not retain admitted unscheduled obligation")
+	}
+}
+
+func TestHeldCreateEligibilityPinsOnlyHeldZeroGenerationUploads(t *testing.T) {
+	scopeHash := strings.Repeat("a", 64)
+	intent := MutationIntent{Kind: "upload", StoreScopeHash: scopeHash, Condition: MutationCondition{Mode: MutationCreateOnly}}
+	preparation := MutationPreparation{Profile: MutationHeldExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true}
+	tests := []struct {
+		name        string
+		intent      MutationIntent
+		preparation MutationPreparation
+		eligible    bool
+		valid       bool
+	}{
+		{name: "create only", intent: intent, preparation: preparation, eligible: true, valid: true},
+		{name: "unconditional observed absent", intent: MutationIntent{Kind: "upload", StoreScopeHash: scopeHash, Condition: MutationCondition{Mode: MutationUnconditional}}, preparation: preparation, eligible: true, valid: true},
+		{name: "unconditional fixed CAS", intent: MutationIntent{Kind: "upload", StoreScopeHash: scopeHash, Condition: MutationCondition{Mode: MutationUnconditional}}, preparation: MutationPreparation{Profile: MutationHeldExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true, Generation: 9}, valid: true},
+		{name: "create only cannot target existing generation", intent: intent, preparation: MutationPreparation{Profile: MutationHeldExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true, Generation: 9}},
+		{name: "legacy profile", intent: MutationIntent{Kind: "upload", StoreScopeHash: scopeHash, Condition: MutationCondition{Mode: MutationUnconditional}}, preparation: MutationPreparation{Profile: MutationExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true}, valid: true},
+		{name: "delete", intent: MutationIntent{Kind: "delete", StoreScopeHash: scopeHash, Condition: MutationCondition{Mode: MutationMatchGeneration, Generation: 9}}, preparation: MutationPreparation{Profile: MutationHeldExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true}},
+		{name: "generation not pinned", intent: MutationIntent{Kind: "upload", StoreScopeHash: scopeHash, Condition: MutationCondition{Mode: MutationUnconditional}}, preparation: MutationPreparation{Profile: MutationHeldExecutionProfile, StoreScopeHash: scopeHash}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsHeldCreateEligible(tt.intent, tt.preparation); got != tt.eligible {
+				t.Fatalf("IsHeldCreateEligible() = %v, want %v", got, tt.eligible)
+			}
+			if err := validateMutationPreparation(tt.intent, tt.preparation); (err == nil) != tt.valid {
+				t.Fatalf("validateMutationPreparation() error = %v, valid = %v", err, tt.valid)
+			}
+		})
 	}
 }

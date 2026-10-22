@@ -246,9 +246,14 @@ func legacyCooperativeControlState(independent bool, receiptDir, credentialsFile
 }
 
 func newFencingExecutor(kube *operator.Kubernetes, authorityState *operator.AuthorityStateStore, independent bool, receiptDir, credentialsFile string, useADC bool) *operator.FencingExecutor {
+	profile := fencing.MutationExecutionProfile
+	if independent {
+		profile = fencing.MutationHeldExecutionProfile
+	}
 	return &operator.FencingExecutor{
 		Kube: kube, AuthorityState: authorityState,
 		RequireMutationJournal:        independent,
+		MutationProfile:               profile,
 		LegacyCooperativeControlState: legacyCooperativeControlState(independent, receiptDir, credentialsFile, useADC),
 	}
 }

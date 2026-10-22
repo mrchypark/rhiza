@@ -319,7 +319,7 @@ func (e *FencingExecutor) verifyEmptyRecoverySource(ctx context.Context, request
 	if err != nil {
 		return fenceResource{}, objstore.ObjectVersion{}, nil, err
 	}
-	provider, err := newGCSMutationProvider(e.SourceMutationStorage, store)
+	provider, err := newGCSMutationProviderForProfile(e.SourceMutationStorage, store, run.MutationProfile)
 	if err != nil {
 		return fenceResource{}, objstore.ObjectVersion{}, nil, err
 	}
@@ -519,7 +519,7 @@ func (e *FencingExecutor) emptyRecoveryResponse(ctx context.Context, uid, target
 	if err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
-	provider, err := newGCSMutationProvider(e.SourceMutationStorage, store)
+	provider, err := newGCSMutationProviderForProfile(e.SourceMutationStorage, store, run.MutationProfile)
 	if err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	}

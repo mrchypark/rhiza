@@ -225,6 +225,24 @@ func (e *FencingExecutor) VerifySourceMutationEvidence(ctx context.Context, runt
 	if err != nil {
 		return err
 	}
+	if entry.GuardedLogicalResolution != nil {
+		if run.MutationProfile != fencing.MutationHeldExecutionProfile || e.SourceMutationStorage == nil || e.Kube == nil {
+			return fmt.Errorf("fencing: guarded mutation evidence is outside the held GCS profile")
+		}
+		producer := fencing.MutationProducer{Runtime: runtime, WALIdentity: run.Identity.WALIdentity, Phase: fencing.MutationClosed, ClosedThrough: sequence}
+		if err := producer.ValidateGuardedLogicalResolution(run.MutationProducerUID, sequence, entry); err != nil {
+			return err
+		}
+		scope, err := e.sourceMutationStorageScope(ctx, runtime)
+		if err != nil || hashJSON(scope) != entry.Intent.StoreScopeHash {
+			return errors.Join(err, fmt.Errorf("fencing: guarded mutation storage scope differs"))
+		}
+		provider, err := newGCSMutationProviderForProfile(e.SourceMutationStorage, scope, run.MutationProfile)
+		if err != nil {
+			return err
+		}
+		return e.verifyGuardedLogicalResolution(ctx, runtime, run, run.MutationProducerUID, sequence, entry, provider)
+	}
 	receipts, err := e.receiptsForRuntime(runtime)
 	if err != nil {
 		return err

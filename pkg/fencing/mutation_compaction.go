@@ -76,7 +76,25 @@ func (plan MutationCompactionPlan) Validate() error {
 	if plan.ProducerUID == "" || len(plan.ProducerUID) > 128 || plan.PreviousThrough >= plan.Through || plan.Through-plan.PreviousThrough > MaxMutationJournalEntries || plan.WALIdentity == "" {
 		return fmt.Errorf("fencing: invalid archive range or producer identity")
 	}
-	p := MutationProducer{Runtime: plan.Runtime, WALIdentity: plan.WALIdentity, Phase: MutationOpen, LastAdmitted: plan.Through, CompactedThrough: plan.PreviousThrough, ArchiveHead: plan.Previous, Entries: plan.Entries}
+	phase := MutationOpen
+	var closedThrough uint64
+	closeOperationID := ""
+	closeRequestHash := ""
+	for _, entry := range plan.Entries {
+		if entry.GuardedLogicalResolution != nil {
+			// Guarded logical evidence can only be produced after closure. Build
+			// the archive validator as a closed prefix so its normal entry validator
+			// rechecks that invariant; this synthetic close tuple is not persisted.
+			phase = MutationClosed
+			closedThrough = plan.Through
+			closeOperationID = "archive-validation"
+			closeRequestHash = plan.Digest()
+			break
+		}
+	}
+	p := MutationProducer{Runtime: plan.Runtime, WALIdentity: plan.WALIdentity, Phase: phase, ClosedThrough: closedThrough,
+		CloseOperationID: closeOperationID, CloseRequestHash: closeRequestHash, LastAdmitted: plan.Through,
+		CompactedThrough: plan.PreviousThrough, ArchiveHead: plan.Previous, Entries: plan.Entries}
 	if err := p.Validate(); err != nil {
 		return err
 	}

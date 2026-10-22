@@ -220,6 +220,10 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 		if err != nil {
 			return false, err
 		}
+		producer, err = e.settleClosedHeldCreates(ctx, *run.Runtime, run, producer)
+		if err != nil {
+			return false, err
+		}
 		if producer.Phase != fencing.MutationClosed || !producer.BarrierComplete() {
 			complete = false
 		} else if err := e.verifyMutationArchiveReceipts(ctx, fencing.MutationCompactionPlan{Runtime: *run.Runtime, Entries: producer.Entries}); err != nil {
@@ -236,4 +240,52 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 		}
 	}
 	return complete, nil
+}
+
+// settleClosedHeldCreates runs the narrowly scoped guarded replay before the
+// producer barrier. Legacy grants and non-create mutations retain their existing
+// settlement rules and cannot be upgraded by this path.
+func (e *FencingExecutor) settleClosedHeldCreates(ctx context.Context, runtime fencing.RuntimeBinding, run fencing.Run, producer fencing.MutationProducer) (fencing.MutationProducer, error) {
+	if run.MutationProfile != fencing.MutationHeldExecutionProfile || producer.Phase != fencing.MutationClosed || e.SourceMutationStorage == nil || e.Kube == nil {
+		return producer, nil
+	}
+	scope, err := e.sourceMutationStorageScope(ctx, runtime)
+	if err != nil {
+		return producer, err
+	}
+	if hashJSON(scope) != run.MutationScopeHash {
+		return producer, fmt.Errorf("fencing: closed held-create storage scope changed")
+	}
+	provider, err := newGCSMutationProviderForProfile(e.SourceMutationStorage, scope, run.MutationProfile)
+	if err != nil {
+		return producer, err
+	}
+	receipts, err := e.receiptsForRuntime(runtime)
+	if err != nil {
+		return producer, err
+	}
+	if _, err := e.sourceStagesFor(ctx, runtime); err != nil {
+		return producer, err
+	}
+	for sequence := producer.CompactedThrough; sequence < producer.ClosedThrough; {
+		sequence++
+		entry, exists := producer.Entries[sequence]
+		if !exists || entry.Preparation == nil || !fencing.IsHeldCreateEligible(entry.Intent, *entry.Preparation) ||
+			len(entry.Dispatches) != 1 || !entry.DispatchClosed {
+			continue
+		}
+		if entry.GuardedLogicalResolution == nil && entry.Resolution != nil {
+			if entry.Resolution.Outcome != fencing.MutationCommitted {
+				continue
+			}
+		}
+		if err := e.ExecuteSourceMutation(ctx, runtime, run.MutationProducerUID, sequence, entry.Intent, scope, provider, receipts); err != nil && !errors.Is(err, ErrFencePending) {
+			return producer, err
+		}
+		producer, err = e.reserveMutationProducer(ctx, runtime)
+		if err != nil {
+			return producer, err
+		}
+	}
+	return producer, nil
 }
