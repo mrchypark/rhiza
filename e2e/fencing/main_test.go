@@ -124,6 +124,89 @@ func TestFixtureHoldsWritersUntilSupervisorAndStoreReady(t *testing.T) {
 	}
 }
 
+func TestFixtureKeepsStoreCoordinatesPublicAndWriterKeysLocalOnly(t *testing.T) {
+	items := manifests()["items"].([]obj)
+	var configMap, statefulSet, operator bool
+	for _, item := range items {
+		name := nested(item, "metadata", "name")
+		if item["kind"] == "ConfigMap" && name == "rhiza-config" {
+			configMap = true
+			data := item["data"].(obj)
+			for key, want := range map[string]string{
+				"RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000",
+				"RHIZA_OBJSTORE_BUCKET":   "rhiza",
+				"RHIZA_OBJSTORE_REGION":   "us-east-1",
+				"RHIZA_OBJSTORE_INSECURE": "true",
+			} {
+				if data[key] != want {
+					t.Errorf("public store coordinate %s=%v, want %q", key, data[key], want)
+				}
+			}
+			for _, key := range []string{"RHIZA_OBJSTORE_ACCESS_KEY", "RHIZA_OBJSTORE_SECRET_KEY"} {
+				if _, ok := data[key]; ok {
+					t.Errorf("writer credential %s leaked into public ConfigMap", key)
+				}
+			}
+		}
+		if item["kind"] == "Secret" && name == "rhiza-object-store" {
+			t.Fatal("base fixture manifests include the local writer Secret")
+		}
+		if item["kind"] == "StatefulSet" && name == "rhiza" {
+			statefulSet = true
+			if referencesStoreWriterSecret(nested(item, "spec", "template", "spec", "containers").([]obj)[0]) {
+				t.Fatal("base StatefulSet references the local writer Secret")
+			}
+		}
+		if item["kind"] == "Deployment" && name == "rhiza-operator" {
+			operator = true
+			if referencesStoreWriterSecret(nested(item, "spec", "template", "spec", "containers").([]obj)[0]) {
+				t.Fatal("base operator references the local writer Secret")
+			}
+		}
+	}
+	if !configMap || !statefulSet || !operator {
+		t.Fatal("base fixture omitted ConfigMap, source StatefulSet, or Operator")
+	}
+
+	secret := localCooperativeStoreSecret()
+	if secret["kind"] != "Secret" || nested(secret, "metadata", "name") != "rhiza-object-store" {
+		t.Fatalf("local overlay Secret identity=%v/%v", secret["kind"], nested(secret, "metadata", "name"))
+	}
+	credentials := secret["stringData"].(obj)
+	if len(credentials) != 2 || credentials["RHIZA_OBJSTORE_ACCESS_KEY"] != "fencing-local" || credentials["RHIZA_OBJSTORE_SECRET_KEY"] != "fencing-local-secret" {
+		t.Fatalf("local overlay must contain only fake writer keys: %#v", credentials)
+	}
+
+	patchBytes, err := os.ReadFile("../../deploy/operator/fencing/supervised-statefulset.patch.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(patchBytes), "rhiza-object-store") || strings.Contains(string(patchBytes), "RHIZA_OBJSTORE_ACCESS_KEY") || strings.Contains(string(patchBytes), "RHIZA_OBJSTORE_SECRET_KEY") {
+		t.Fatal("shipped supervised patch references or exposes the local writer Secret")
+	}
+	runScript, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := string(runScript)
+	productionPatch := strings.Index(run, `k patch statefulset rhiza --type=strategic --patch-file "$fencing_tmp/supervised.patch.yaml"`)
+	localSecret := strings.Index(run, `"$FENCING_E2E_BIN" local-cooperative-store-secret`)
+	statefulOverlay := strings.Index(run, `k patch statefulset rhiza --type=json -p "$local_store_ref"`)
+	operatorOverlay := strings.Index(run, `k patch deployment rhiza-operator --type=json -p "$local_store_ref"`)
+	if productionPatch < 0 || localSecret <= productionPatch || statefulOverlay <= localSecret || operatorOverlay <= statefulOverlay {
+		t.Fatal("local fake writer credential overlay must be applied after the shipped production patch")
+	}
+}
+
+func referencesStoreWriterSecret(container obj) bool {
+	for _, source := range container["envFrom"].([]obj) {
+		if nested(source, "secretRef", "name") == "rhiza-object-store" {
+			return true
+		}
+	}
+	return false
+}
+
 func TestFixtureRestoreHasWritableTmpWithReadOnlyRoot(t *testing.T) {
 	data, err := os.ReadFile("../../deploy/operator/fencing/supervised-statefulset.patch.yaml")
 	if err != nil {
