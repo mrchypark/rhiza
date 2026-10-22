@@ -1,6 +1,9 @@
 package fencing
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path"
 	"strings"
@@ -115,7 +118,12 @@ func (s ArchiveScope) Hash() (string, error) {
 	if err := s.Validate(); err != nil {
 		return "", err
 	}
-	return hashJSON([]string{"rhiza-archive-scope-v1", s.Provider, s.Bucket, s.Prefix, s.ClusterID}), nil
+	encoded, err := json.Marshal([]string{"rhiza-archive-scope-v1", s.Provider, s.Bucket, s.Prefix, s.ClusterID})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // ArchiveScopeClaim is create-only canonical authority state. ConfigID is the
