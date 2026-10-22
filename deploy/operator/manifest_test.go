@@ -26,10 +26,39 @@ func TestSupervisedSourcePodReplacesObjectStoreSecretInjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	patch := string(data)
-	if !strings.Contains(patch, "- $patch: replace") || !strings.Contains(patch, "name: rhiza-peer-credentials") || strings.Contains(patch, "name: rhiza-object-store") {
-		t.Fatal("supervised source Pod must replace base envFrom and omit the object-store writer Secret")
+	var patch map[string]any
+	if err := yaml.Unmarshal(data, &patch); err != nil {
+		t.Fatal(err)
 	}
+	spec, _ := patch["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	podSpec, _ := nestedManifestMap(template, "spec")
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) != 1 {
+		t.Fatalf("supervised StatefulSet has %d containers, want exactly one", len(containers))
+	}
+	container, _ := containers[0].(map[string]any)
+	envFrom, _ := container["envFrom"].([]any)
+	if len(envFrom) != 2 {
+		t.Fatalf("supervised envFrom has %d entries, want only ConfigMap and peer Secret", len(envFrom))
+	}
+	if !isEnvFromRef(envFrom[0], "configMapRef", "rhiza-config") || !isEnvFromRef(envFrom[1], "secretRef", "rhiza-peer-credentials") {
+		t.Fatalf("supervised envFrom is not the exact public-config plus peer-credentials allowlist: %#v", envFrom)
+	}
+}
+
+func nestedManifestMap(value map[string]any, key string) (map[string]any, bool) {
+	nested, ok := value[key].(map[string]any)
+	return nested, ok
+}
+
+func isEnvFromRef(value any, kind, name string) bool {
+	ref, ok := value.(map[string]any)
+	if !ok || len(ref) != 1 {
+		return false
+	}
+	entry, ok := ref[kind].(map[string]any)
+	return ok && len(entry) == 1 && entry["name"] == name
 }
 
 func TestOperatorDeploymentProjectsFencerAudienceTokenReadOnly(t *testing.T) {

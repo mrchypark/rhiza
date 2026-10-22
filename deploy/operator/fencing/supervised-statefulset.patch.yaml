@@ -21,10 +21,9 @@ spec:
         - name: rhiza
           command: [/usr/local/bin/rhiza-fencer]
           args: [supervise, --, /usr/local/bin/rhiza]
-          # Replace the base object's envFrom list: the node receives public
-          # store coordinates and peer identity, never the writer Secret.
+          # Keep only public store coordinates and peer identity; never inject
+          # the object-store writer Secret into the voter.
           envFrom:
-            - $patch: replace
             - configMapRef:
                 name: rhiza-config
             - secretRef:
