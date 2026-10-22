@@ -60,7 +60,7 @@ jobs:
   fixture-only:
     if: github.event_name == 'workflow_dispatch' && inputs.fixture_only
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v6
@@ -71,9 +71,9 @@ jobs:
         run: |
           embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'
           go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
-          go test ./pkg/fencing ./pkg/operator ./e2e/fencing -count=1 -timeout=5m
+          go test ./pkg/fencing ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
           go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
-          go test -race ./pkg/fencing ./pkg/operator ./e2e/fencing -count=1 -timeout=5m
+          go test -race ./pkg/fencing ./pkg/operator ./pkg/recovery ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
 
   cooperative-fencing:
     if: github.event_name != 'workflow_dispatch' || !inputs.fixture_only

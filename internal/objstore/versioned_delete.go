@@ -5,13 +5,28 @@ import (
 	"errors"
 	"fmt"
 
+	"cloud.google.com/go/storage"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
 
 var (
 	ErrVersionedDeleteUnsupported = errors.New("object store does not support versioned deletes")
 	ErrDeleteVersionRequired      = errors.New("object version is required for versioned delete")
+	ErrBucketAttrsUnsupported     = errors.New("bucket does not expose provider bucket attributes")
 )
+
+// BucketAttrsReader is an optional capability for reading provider-level
+// bucket metadata without creating a second client or changing credentials.
+type BucketAttrsReader interface {
+	BucketAttrs(context.Context) (*storage.BucketAttrs, error)
+}
+
+func (b *gcsVersionedDeleteBucket) BucketAttrs(ctx context.Context) (*storage.BucketAttrs, error) {
+	if b == nil || b.handle == nil {
+		return nil, ErrBucketAttrsUnsupported
+	}
+	return b.handle.Attrs(ctx)
+}
 
 // VersionedDeleteBucket is an optional capability for deleting only the
 // selected object version. Implementations must not fall back to Delete.

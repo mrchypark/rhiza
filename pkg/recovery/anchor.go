@@ -37,6 +37,7 @@ type GenerationAnchor struct {
 	SourceBootstrap  string               `json:"source_bootstrap_hash"`
 	TargetMembership MembershipRecord     `json:"target_membership"`
 	Checkpoint       GenerationCheckpoint `json:"checkpoint"`
+	FrozenSource     *FrozenSourceBinding `json:"frozen_source,omitempty"`
 }
 
 func GenerationAnchorKey(prefix string) string { return forkKey(prefix, "recovery/anchor.json") }
@@ -75,6 +76,11 @@ func ReadGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix st
 func ValidateGenerationAnchor(anchor GenerationAnchor) error {
 	if anchor.Version != 1 || anchor.OperationID == "" || anchor.SourcePrefix == "" || anchor.TargetPrefix == "" || anchor.SourceTip == 0 || !validForkHash(anchor.SourceManifest) || !validForkHash(anchor.SourcePrefixHash) || !validForkHash(anchor.SourceBootstrap) || anchor.TargetMembership.Version != MembershipRecordVersion || anchor.Checkpoint.Index != anchor.SourceTip || !validForkHash(anchor.Checkpoint.RootHash) || !validForkHash(anchor.Checkpoint.StateHash) {
 		return fmt.Errorf("invalid generation anchor")
+	}
+	if anchor.FrozenSource != nil {
+		if validateFrozenAnchorSource(anchor) != nil || !frozenTargetPrefixMatches(anchor.SourcePrefix, anchor.TargetPrefix, anchor.FrozenSource.Identity) {
+			return fmt.Errorf("invalid generation anchor")
+		}
 	}
 	return nil
 }
@@ -160,15 +166,18 @@ func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix 
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match target registration")
 	}
 	intent, ok, err := readForkIntent(ctx, bucket, prefix)
-	if err != nil || !ok || intent.Version != 2 || intent.OperationID != anchor.OperationID || intent.SourcePrefix != anchor.SourcePrefix || intent.TargetPrefix != anchor.TargetPrefix || intent.ManifestHash != anchor.SourceManifest || intent.SourceBootstrapHash != anchor.SourceBootstrap {
+	if err != nil || !ok || (intent.Version != 2 && intent.Version != 3) || intent.OperationID != anchor.OperationID || intent.SourcePrefix != anchor.SourcePrefix || intent.TargetPrefix != anchor.TargetPrefix || intent.ManifestHash != anchor.SourceManifest || intent.SourceBootstrapHash != anchor.SourceBootstrap {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match fork intent")
+	}
+	if (intent.Version == 3) != (anchor.FrozenSource != nil) || intent.Version == 3 && (intent.FrozenSource == nil || !sameFrozenSourceBinding(*intent.FrozenSource, *anchor.FrozenSource)) {
+		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match frozen source intent")
 	}
 	membershipHash, err := membershipHash(expectedMembership)
 	if err != nil || intent.TargetMembershipHash != membershipHash {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match target membership intent")
 	}
 	result, ok, err := readForkResult(ctx, bucket, prefix)
-	if err != nil || !ok || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash {
+	if err != nil || !ok || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash || (result.FrozenSource != nil) != (anchor.FrozenSource != nil) || result.FrozenSource != nil && !sameFrozenSourceBinding(*result.FrozenSource, *anchor.FrozenSource) {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match fork result")
 	}
 	archive := NewManager(bucket, prefix, ArchiveConfigID)
@@ -224,19 +233,35 @@ func mustGenerationHash(value string) [32]byte {
 // suffix into a temporary materializer, and publishes a target-only root and
 // empty anchored archive. The caller must have fenced every source writer.
 func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result ForkResult, sourcePrefix, targetPrefix, operationID string, sourceBootstrap quepaxa.Cluster, targetMembership MembershipRecord) (GenerationAnchor, error) {
+	return materializeGeneration(ctx, bucket, result, sourcePrefix, targetPrefix, operationID, sourceBootstrap, targetMembership, nil, nil, nil)
+}
+
+// materializeGeneration shares the existing target materialization pipeline.
+// frozenSnapshot is supplied only by ForkFrozenSource and was loaded without
+// source-side pins; frozenHeadBytes binds its exact original object contents.
+func materializeGeneration(ctx context.Context, bucket objstore.Bucket, result ForkResult, sourcePrefix, targetPrefix, operationID string, sourceBootstrap quepaxa.Cluster, targetMembership MembershipRecord, frozenSnapshot *RecoverySnapshot, frozenHeadBytes []byte, verifyFrozenEnvironment func(context.Context) error) (GenerationAnchor, error) {
 	if bucket == nil || operationID == "" || len(sourceBootstrap.Members) == 0 || targetMembership.Version != MembershipRecordVersion || result.Tip == 0 || !validForkHash(result.ManifestHash) || result.PrefixHash != "" && !validForkHash(result.PrefixHash) {
 		return GenerationAnchor{}, fmt.Errorf("invalid generation materialization")
 	}
 	source := NewManager(bucket, sourcePrefix, ArchiveConfigID)
 	defer source.Close()
-	if err := source.Load(ctx); err != nil {
-		return GenerationAnchor{}, err
+	var snapshot *RecoverySnapshot
+	if frozenSnapshot == nil {
+		if err := source.Load(ctx); err != nil {
+			return GenerationAnchor{}, err
+		}
+		var err error
+		snapshot, err = source.BeginRecoverySnapshot(ctx, "materialize-"+shortHash(operationID), forkLease)
+		if err != nil {
+			return GenerationAnchor{}, err
+		}
+		defer closeSnapshot(snapshot)
+	} else {
+		if frozenSnapshot.manager == nil || frozenSnapshot.manager.bucket != bucket || frozenSnapshot.manager.prefix != sourcePrefix || len(frozenHeadBytes) == 0 || result.FrozenSource == nil || validateFrozenBinding(*result.FrozenSource) != nil || verifyFrozenEnvironment == nil {
+			return GenerationAnchor{}, fmt.Errorf("invalid frozen source snapshot")
+		}
+		snapshot = frozenSnapshot
 	}
-	snapshot, err := source.BeginRecoverySnapshot(ctx, "materialize-"+shortHash(operationID), forkLease)
-	if err != nil {
-		return GenerationAnchor{}, err
-	}
-	defer closeSnapshot(snapshot)
 	if snapshot.Tip() != quepaxa.Slot(result.Tip) {
 		return GenerationAnchor{}, fmt.Errorf("materialization source tip does not match result")
 	}
@@ -295,15 +320,20 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 		if err := sourceCP.Verify(ctx, root.Index, root.RootHash, root.Hash); err != nil {
 			return GenerationAnchor{}, err
 		}
-		rootPin, err = sourceCP.PinRecoveryRoot(ctx, root, "materialize-"+shortHash(operationID), forkLease)
-		if err != nil {
-			return GenerationAnchor{}, err
+		if frozenSnapshot == nil {
+			rootPin, err = sourceCP.PinRecoveryRoot(ctx, root, "materialize-"+shortHash(operationID), forkLease)
+			if err != nil {
+				return GenerationAnchor{}, err
+			}
+			defer closeRootPin(rootPin)
 		}
-		defer closeRootPin(rootPin)
 	}
-	guard := newForkEvidenceGuard(ctx, snapshot, rootPin)
-	defer guard.Close()
-	ctx = guard.Context()
+	var guard *forkEvidenceGuard
+	if frozenSnapshot == nil {
+		guard = newForkEvidenceGuard(ctx, snapshot, rootPin)
+		defer guard.Close()
+		ctx = guard.Context()
+	}
 	dir, err := os.MkdirTemp("", "rhiza-generation-materialize-*")
 	if err != nil {
 		return GenerationAnchor{}, err
@@ -425,19 +455,28 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 	if err != nil {
 		return GenerationAnchor{}, err
 	}
-	if err := guard.Check(); err != nil {
-		return GenerationAnchor{}, err
+	if guard != nil {
+		if err := guard.Check(); err != nil {
+			return GenerationAnchor{}, err
+		}
+		if err := source.Load(ctx); err != nil || !archiveHeadsEqual(source.head, snapshot.head) {
+			return GenerationAnchor{}, fmt.Errorf("source archive changed during materialization")
+		}
+	} else if err := verifyFrozenFrontier(ctx, bucket, sourcePrefix, result.FrozenSource.Frontier, frozenHeadBytes); err != nil {
+		return GenerationAnchor{}, fmt.Errorf("source archive changed during frozen materialization: %w", err)
+	} else if err := verifyFrozenEnvironment(ctx); err != nil {
+		return GenerationAnchor{}, fmt.Errorf("source bucket environment changed during frozen materialization: %w", err)
 	}
-	if err := source.Load(ctx); err != nil || !archiveHeadsEqual(source.head, snapshot.head) {
-		return GenerationAnchor{}, fmt.Errorf("source archive changed during materialization")
+	anchor := GenerationAnchor{Version: 1, OperationID: operationID, SourcePrefix: sourcePrefix, TargetPrefix: targetPrefix, SourceManifest: result.ManifestHash, SourceTip: result.Tip, SourcePrefixHash: hex.EncodeToString(prefix[:]), SourceBootstrap: bootstrap, TargetMembership: targetMembership, Checkpoint: GenerationCheckpoint{Index: targetRoot.Index, RootHash: hex.EncodeToString(targetRoot.RootHash[:]), StateHash: hex.EncodeToString(targetRoot.Hash[:])}, FrozenSource: result.FrozenSource}
+	data, err := json.Marshal(anchor)
+	if err != nil || len(data) > maxHeadSize {
+		return GenerationAnchor{}, fmt.Errorf("generation anchor exceeds the bounded record size")
 	}
-	anchor := GenerationAnchor{Version: 1, OperationID: operationID, SourcePrefix: sourcePrefix, TargetPrefix: targetPrefix, SourceManifest: result.ManifestHash, SourceTip: result.Tip, SourcePrefixHash: hex.EncodeToString(prefix[:]), SourceBootstrap: bootstrap, TargetMembership: targetMembership, Checkpoint: GenerationCheckpoint{Index: targetRoot.Index, RootHash: hex.EncodeToString(targetRoot.RootHash[:]), StateHash: hex.EncodeToString(targetRoot.Hash[:])}}
-	data, _ := json.Marshal(anchor)
 	if err := bucket.Upload(ctx, GenerationAnchorKey(targetPrefix), bytes.NewReader(data), objstore.WithIfNotExists()); err != nil && !bucket.IsConditionNotMetErr(err) {
 		return GenerationAnchor{}, err
 	}
 	stored, anchorHash, err := ReadGenerationAnchor(ctx, bucket, targetPrefix)
-	if err != nil || stored != anchor {
+	if err != nil || !sameGenerationAnchor(stored, anchor) {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor conflict")
 	}
 	target := NewManager(bucket, targetPrefix, ArchiveConfigID)
@@ -515,12 +554,12 @@ func resumeMaterializedGeneration(ctx context.Context, bucket objstore.Bucket, r
 		return GenerationAnchor{}, false, err
 	}
 	bootstrap, err := bootstrapHash(sourceBootstrap)
-	if err != nil || anchor.OperationID != operationID || anchor.SourcePrefix != sourcePrefix || anchor.TargetPrefix != targetPrefix || anchor.SourceManifest != result.ManifestHash || anchor.SourceTip != result.Tip || anchor.SourceBootstrap != bootstrap || anchor.TargetMembership != targetMembership || result.PrefixHash != "" && anchor.SourcePrefixHash != result.PrefixHash {
+	if err != nil || anchor.OperationID != operationID || anchor.SourcePrefix != sourcePrefix || anchor.TargetPrefix != targetPrefix || anchor.SourceManifest != result.ManifestHash || anchor.SourceTip != result.Tip || anchor.SourceBootstrap != bootstrap || anchor.TargetMembership != targetMembership || result.PrefixHash != "" && anchor.SourcePrefixHash != result.PrefixHash || (anchor.FrozenSource != nil) != (result.FrozenSource != nil) || anchor.FrozenSource != nil && !sameFrozenSourceBinding(*anchor.FrozenSource, *result.FrozenSource) {
 		return GenerationAnchor{}, false, fmt.Errorf("published generation anchor does not match fork request")
 	}
 	intent, present, err := readForkIntent(ctx, bucket, targetPrefix)
 	targetHash, hashErr := membershipHash(targetMembership)
-	if err != nil || !present || intent.Version != 2 || intent.OperationID != operationID || intent.SourcePrefix != sourcePrefix || intent.TargetPrefix != targetPrefix || intent.ManifestHash != result.ManifestHash || intent.SourceBootstrapHash != bootstrap || hashErr != nil || intent.TargetMembershipHash != targetHash {
+	if err != nil || !present || (intent.Version != 2 && intent.Version != 3) || intent.OperationID != operationID || intent.SourcePrefix != sourcePrefix || intent.TargetPrefix != targetPrefix || intent.ManifestHash != result.ManifestHash || intent.SourceBootstrapHash != bootstrap || hashErr != nil || intent.TargetMembershipHash != targetHash || (intent.FrozenSource != nil) != (result.FrozenSource != nil) || intent.FrozenSource != nil && !sameFrozenSourceBinding(*intent.FrozenSource, *result.FrozenSource) {
 		return GenerationAnchor{}, false, fmt.Errorf("published generation anchor does not match fork intent")
 	}
 	// MaterializeGeneration publishes the anchor and archive head before its
