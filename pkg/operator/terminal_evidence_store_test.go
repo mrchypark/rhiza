@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -45,6 +46,61 @@ func retainTerminalTestRun(t *testing.T, e *FencingExecutor, runtime fencing.Run
 	return ref
 }
 
+func terminalObjectKeyForTest(t *testing.T, e *FencingExecutor, runtime fencing.RuntimeBinding, name string) string {
+	t.Helper()
+	key, err := terminalArtifactKey(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectKey, err := store.objectKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return objectKey
+}
+
+func terminalArtifactBytes(t *testing.T, e *FencingExecutor, runtime fencing.RuntimeBinding, ref fencing.TerminalReference) []byte {
+	t.Helper()
+	store, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := terminalArtifactKey(ref.ProofName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _, err := store.Read(t.Context(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(r)
+	closeErr := r.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func terminalArtifactCount(t *testing.T, e *FencingExecutor, runtime fencing.RuntimeBinding) int {
+	t.Helper()
+	store, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	if err := e.AuthorityState.bucket.Iter(t.Context(), store.prefix+"/terminal/", func(string) error {
+		count++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
 func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 	e, _, runtime := terminalStoreFixture(t)
 	closeTerminalTestRun(t, e, runtime)
@@ -60,7 +116,13 @@ func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 	if _, err := e.commitMutationArchive(t.Context(), runtime, storeCompactionPlan(t, e, runtime, 1)); err != nil {
 		t.Fatal(err)
 	}
-	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
+	// Terminal proof recovery must not need a Kubernetes evidence index or the
+	// previous authority process's local state.
+	reopenedStore, err := NewAuthorityStateStore(e.AuthorityState.bucket, e.AuthorityState.prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &FencingExecutor{AuthorityState: reopenedStore, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
 	evidence, got, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, hashJSON(state))
 	if err != nil || got != ref || !bytes.Equal(evidence.RuntimeReceipt, []byte("test-provider-terminal")) {
 		t.Fatalf("retained original evidence not reusable: %+v %v", got, err)
@@ -75,39 +137,48 @@ func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 }
 
 func TestTerminalStoreLostCreateAndRootCASResponsesAreIdempotent(t *testing.T) {
-	e, f, runtime := terminalStoreFixture(t)
+	e, _, runtime := terminalStoreFixture(t)
 	closeTerminalTestRun(t, e, runtime)
-	f.mu.Lock()
-	f.lostTerminalResponse = true
-	f.mu.Unlock()
+	producer, err := e.reserveMutationProducer(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := e.enrolledMutationRun(t.Context(), runtime)
+	if err != nil || run.Stop == nil {
+		t.Fatalf("closed test run unavailable: %+v %v", run, err)
+	}
+	evidence := terminalEvidence{Version: 2, Request: *run.Stop, Runtime: runtime, ProducerUID: run.MutationProducerUID, Storage: terminalTestStorage,
+		RuntimeReceipt: []byte("test-provider-terminal"), Producer: terminalProducer(producer)}
+	artifactKey := terminalObjectKeyForTest(t, e, runtime, evidence.reference("pending").ProofName)
 	rootKey, _, err := e.AuthorityState.rootKey(runtime.StatefulSetUID, runtime.SourceClusterID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrapped := &archiveTestBucket{Bucket: e.AuthorityState.bucket, loseCASResponse: rootKey}
+	wrapped := &archiveTestBucket{Bucket: e.AuthorityState.bucket, loseCreate: artifactKey, loseCASResponse: rootKey}
 	e.AuthorityState.bucket = wrapped
-	first := retainTerminalTestRun(t, e, runtime)
+	var first fencing.TerminalReference
+	for attempt := 0; attempt < 3; attempt++ {
+		first, err = e.retainIndependentTerminal(t.Context(), runtime, terminalTestStorage, []byte("test-provider-terminal"))
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		t.Fatalf("same terminal operation did not recover from lost responses: %v", err)
+	}
 	second := retainTerminalTestRun(t, e, runtime)
 	if first != second {
 		t.Fatal("uncertain commit generated another terminal proof")
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	count := 0
-	for path := range f.objects {
-		if strings.Contains(path, "/rhiza-terminal-") {
-			count++
-		}
-	}
-	if count != 1 || f.lostTerminalResponse || wrapped.loseCASResponse != "" || wrapped.failReadOnce != "" {
-		t.Fatalf("expected terminal and root lost-response injections to resolve with one proof, got count=%d terminal-pending=%t cas-pending=%q readback-pending=%q", count, f.lostTerminalResponse, wrapped.loseCASResponse, wrapped.failReadOnce)
+	if count := terminalArtifactCount(t, e, runtime); count != 1 || wrapped.loseCreate != "" || wrapped.loseCASResponse != "" || wrapped.failReadOnce != "" {
+		t.Fatalf("expected terminal and root lost-response injections to resolve with one proof, got count=%d create-pending=%q cas-pending=%q readback-pending=%q", count, wrapped.loseCreate, wrapped.loseCASResponse, wrapped.failReadOnce)
 	}
 }
 
 func TestTerminalStoreRejectsIncompleteOrUntrustedTermination(t *testing.T) {
 	for _, kind := range []string{"open", "no runtime verifier", "bad runtime receipt", "unresolved mutation"} {
 		t.Run(kind, func(t *testing.T) {
-			e, f, runtime := terminalStoreFixture(t)
+			e, _, runtime := terminalStoreFixture(t)
 			if kind == "unresolved mutation" {
 				_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
 					return p.Admit(2, completeStoreIntent(fencing.MutationIntent{OperationID: "unresolved", Kind: "delete", Key: "key"}))
@@ -129,43 +200,56 @@ func TestTerminalStoreRejectsIncompleteOrUntrustedTermination(t *testing.T) {
 			if _, err := e.retainIndependentTerminal(t.Context(), runtime, terminalTestStorage, receipt); err == nil {
 				t.Fatal("unproven termination retained")
 			}
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			for path := range f.objects {
-				if strings.Contains(path, "/rhiza-terminal-") {
-					t.Fatal("unverified evidence created an artifact")
-				}
+			if count := terminalArtifactCount(t, e, runtime); count != 0 {
+				t.Fatal("unverified evidence created an artifact")
 			}
 		})
 	}
 }
 
 func TestTerminalStoreRevalidatesRetainedArtifactAndTrust(t *testing.T) {
-	for _, kind := range []string{"missing", "UID replaced", "mutable", "deleting", "corrupt", "trailing JSON", "unknown field", "storage", "verifier removed", "verifier rejects"} {
+	for _, kind := range []string{"missing", "version replaced", "corrupt", "trailing JSON", "unknown field", "storage", "verifier removed", "verifier rejects"} {
 		t.Run(kind, func(t *testing.T) {
-			e, f, runtime := terminalStoreFixture(t)
+			e, _, runtime := terminalStoreFixture(t)
 			closeTerminalTestRun(t, e, runtime)
 			ref := retainTerminalTestRun(t, e, runtime)
-			f.mu.Lock()
-			resource := f.objects[e.terminalEvidencePath(ref.ProofName)]
+			store, err := e.authorityEvidenceFor(runtime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, err := terminalArtifactKey(ref.ProofName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			objectKey, err := store.objectKey(key)
+			if err != nil {
+				t.Fatal(err)
+			}
 			switch kind {
 			case "missing":
-				delete(f.objects, e.terminalEvidencePath(ref.ProofName))
-			case "UID replaced":
-				asObject(resource["metadata"])["uid"] = "replacement"
-			case "mutable":
-				resource["immutable"] = false
-			case "deleting":
-				asObject(resource["metadata"])["deletionTimestamp"] = "now"
+				if err := e.AuthorityState.bucket.Delete(t.Context(), objectKey); err != nil {
+					t.Fatal(err)
+				}
+			case "version replaced":
+				data := terminalArtifactBytes(t, e, runtime, ref)
+				if err := e.AuthorityState.bucket.Upload(t.Context(), objectKey, bytes.NewReader(data)); err != nil {
+					t.Fatal(err)
+				}
 			case "corrupt":
-				asObject(resource["data"])["terminal.json"] = "invalid"
+				if err := e.AuthorityState.bucket.Upload(t.Context(), objectKey, strings.NewReader("invalid")); err != nil {
+					t.Fatal(err)
+				}
 			case "trailing JSON":
-				asObject(resource["data"])["terminal.json"] = str(nested(resource, "data", "terminal.json")) + " {}"
+				data := append(terminalArtifactBytes(t, e, runtime, ref), []byte(" {}")...)
+				if err := e.AuthorityState.bucket.Upload(t.Context(), objectKey, bytes.NewReader(data)); err != nil {
+					t.Fatal(err)
+				}
 			case "unknown field":
-				raw := str(nested(resource, "data", "terminal.json"))
-				asObject(resource["data"])["terminal.json"] = strings.TrimSuffix(raw, "}") + `,"untrusted":true}`
+				data := []byte(strings.TrimSuffix(string(terminalArtifactBytes(t, e, runtime, ref)), "}") + `,"untrusted":true}`)
+				if err := e.AuthorityState.bucket.Upload(t.Context(), objectKey, bytes.NewReader(data)); err != nil {
+					t.Fatal(err)
+				}
 			}
-			f.mu.Unlock()
 			storage := terminalTestStorage
 			if kind == "storage" {
 				storage.Prefix = "other"
@@ -186,7 +270,7 @@ func TestTerminalStoreRevalidatesRetainedArtifactAndTrust(t *testing.T) {
 }
 
 func TestTerminalStoreBoundedArchiveVerificationSurvivesRestart(t *testing.T) {
-	e, f, runtime := terminalStoreFixture(t)
+	e, _, runtime := terminalStoreFixture(t)
 	for sequence := uint64(1); sequence <= 70; sequence++ {
 		if sequence > 1 {
 			appendSettledStoreMutation(t, e, runtime, sequence)
@@ -213,13 +297,11 @@ func TestTerminalStoreBoundedArchiveVerificationSurvivesRestart(t *testing.T) {
 	}
 	// A new generation must scan again; completed old-operation cursors cannot
 	// hide subsequently observed missing ancestor evidence.
+	data := terminalArtifactBytes(t, e, runtime, *ref)
 	var artifact terminalEvidence
-	f.mu.Lock()
-	if err := json.Unmarshal([]byte(str(nested(f.objects[e.terminalEvidencePath(ref.ProofName)], "data", "terminal.json"))), &artifact); err != nil {
-		f.mu.Unlock()
+	if err := json.Unmarshal(data, &artifact); err != nil {
 		t.Fatal(err)
 	}
-	f.mu.Unlock()
 	headPlan, err := e.readMutationArchive(t.Context(), *artifact.Producer.ArchiveHead, runtime, artifact.ProducerUID, "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -338,7 +420,7 @@ func TestTerminalStoreRejectsOtherStorePreparedLiveOrArchived(t *testing.T) {
 }
 
 func TestTerminalStoreRejectsOversizedRuntimeReceiptBeforeArtifactCreation(t *testing.T) {
-	e, f, runtime := terminalStoreFixture(t)
+	e, _, runtime := terminalStoreFixture(t)
 	closeTerminalTestRun(t, e, runtime)
 	e.VerifyRuntimeEvidence = func(context.Context, fencing.RuntimeBinding, fencing.StopRequest, []byte) error {
 		t.Fatal("unbounded receipt reached provider verifier")
@@ -347,11 +429,7 @@ func TestTerminalStoreRejectsOversizedRuntimeReceiptBeforeArtifactCreation(t *te
 	if _, err := e.retainIndependentTerminal(t.Context(), runtime, terminalTestStorage, bytes.Repeat([]byte("x"), 65537)); err == nil {
 		t.Fatal("oversized receipt accepted")
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for path := range f.objects {
-		if strings.Contains(path, "/rhiza-terminal-") {
-			t.Fatal("oversized receipt was persisted")
-		}
+	if count := terminalArtifactCount(t, e, runtime); count != 0 {
+		t.Fatal("oversized receipt was persisted")
 	}
 }

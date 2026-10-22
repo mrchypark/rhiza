@@ -20,6 +20,8 @@ import (
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
 )
 
 type unavailableTransport struct{}
@@ -317,6 +319,41 @@ func TestCachedReceiptsWaitForDurabilityBeforeAcknowledging(t *testing.T) {
 				t.Fatalf("recovered retry advanced consensus tip to %d", tip)
 			}
 		})
+	}
+}
+
+func TestCachedWriteReceiptCannotBeAcknowledgedAfterArchiveSeal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	core := mustCore(t, "n1", []quepaxa.Member{{ID: "n1"}}, nil, nil)
+	material, err := materializer.Open(t.TempDir()+"/db.sqlite", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer material.Close()
+	bucket := objstore.NewInMemBucket()
+	defer bucket.Close()
+	archive := recovery.NewManager(bucket, "cluster", 1)
+	defer archive.Close()
+	server := NewServer(core, material, "cluster", true, nil)
+	defer server.Close()
+	server.SetDurabilityBarrier(func(barrierCtx context.Context, slot quepaxa.Slot) error {
+		if err := core.EnsureDurable(slot); err != nil {
+			return err
+		}
+		return archive.SyncThrough(barrierCtx, core, slot)
+	})
+
+	req := KVMutationRequest{RequestID: "receipt-before-seal", Key: "key", Value: []byte("value")}
+	first, err := server.KVPut(ctx, req)
+	if err != nil || !first.Applied || archive.Tip() < quepaxa.Slot(first.Slot) {
+		t.Fatalf("initial write receipt=%+v archive_tip=%d err=%v", first, archive.Tip(), err)
+	}
+	if err := recovery.Seal(ctx, bucket, "cluster", "recovery-after-ack"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.KVPut(ctx, req); !errors.Is(err, ErrCommitUnknown) || !errors.Is(err, recovery.ErrArchiveSealed) {
+		t.Fatalf("cached write receipt after seal error=%v, want commit-unknown with archive-sealed cause", err)
 	}
 }
 

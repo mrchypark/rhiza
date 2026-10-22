@@ -183,7 +183,7 @@ func newMutationStoreFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixt
 	if err := e.initializeRoot(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID); err != nil {
 		t.Fatal(err)
 	}
-	_, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
+	_, err = e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
 		l.RequireRuntimeBinding = true
 		l.RequireMutationJournal = true
 		return l.RegisterEnrolled(id, runtime)
