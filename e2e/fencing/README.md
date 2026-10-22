@@ -92,3 +92,61 @@ injection of an ambiguous storage mutation. Unknown mutation,
 stale receipt and crash history rejection are covered by focused Go regressions.
 The added online stage is not qualified until this exact candidate passes runtime
 CI; an earlier generation-only success does not qualify the extended scenario.
+
+## Direct GCS HA qualification driver
+
+The `cooperative-fencing` Actions job builds two standalone binaries from the
+same commit: Linux/amd64 and macOS/arm64, both with `CGO_ENABLED=0`. It uploads
+them, `source-sha.txt`, and `SHA256SUMS` as
+`gcs-ha-qualification-driver-<sha>-<run>-<attempt>` only after its cooperative
+tests and disposable-Kubernetes qualification pass. Building this artifact is
+not a GCS or Chaos run.
+
+Use the driver artifact and immutable application/operator image digests from
+the same successful workflow run. The image digests are in that run's
+`qualification-publication-<sha>-<run>-<attempt>` artifact when the existing
+`workflow_dispatch` input `publish_chaos_image` is enabled. Read the
+`RepoDigests` in its published-image records; do not use local tags or images
+from another source SHA. The qualification host image is not needed: this
+native command runs on a host with the approved `kubectl` context and `kubectl`
+installed. The driver is not added to the app or operator
+image.
+
+After extracting the artifact, verify its checksums and compare its source SHA
+with the commit SHA of that exact Actions run. On Linux:
+
+```sh
+sha256sum -c SHA256SUMS
+test "$(cat source-sha.txt)" = "$EXPECTED_SOURCE_SHA"
+chmod 700 ./fencing-e2e-linux-amd64 ./fencing-e2e-darwin-arm64
+```
+
+On macOS use `shasum -a 256 -c SHA256SUMS` for the first command. Set
+`FENCING_E2E_OUT` to a new private local directory (mode 0700), then invoke
+the existing command directly with the binary for your host:
+
+```sh
+./fencing-e2e-darwin-arm64 run-gcs-ha-ack-loss
+# or on Linux/amd64:
+./fencing-e2e-linux-amd64 run-gcs-ha-ack-loss
+```
+
+This requires the GCS run inputs in [`../chaos/README.md`](../chaos/README.md),
+including `RHIZA_KUBE_CONTEXT`, `RHIZA_NAMESPACE`, `RHIZA_RUN_ID`,
+`RHIZA_APP_IMAGE`, `RHIZA_OPERATOR_IMAGE`, `RHIZA_GCP_PROJECT_ID`, and
+`RHIZA_DATA_GSA_ID`. It also requires a distinct read-only observer identity
+provided through `RHIZA_GCS_AUTHORITY_READONLY_CREDENTIALS_FILE` and
+`RHIZA_GCS_AUTHORITY_READER_EMAIL`; the driver rejects writer-credential
+fallback. Before fault injection, separately verify that this identity has
+read access to the selected authority and source-object scopes and no
+write/delete grants. The driver does not verify least-privilege IAM. Keep all
+credential values out of shell history, logs, source control, and artifacts.
+
+Keep the raw `FENCING_E2E_OUT` tree private. For a public packet, record the
+actual exit code in `actual-exit.txt`, the verified source SHA in
+`source-head.txt`, and the two digest-pinned image refs in `image-ids.txt`,
+then run `safe-artifacts` and upload only `public/`. Never upload raw private
+events, authority receipts, object names, bucket/prefix values, Pod identities,
+or credential files. Follow the fresh namespace/prefix, cost-cap, and cleanup
+requirements in the GCS runbook. This is a launch path, not a claim that a real
+GCS/Chaos qualification has run.
