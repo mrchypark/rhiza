@@ -25,9 +25,14 @@ type fencedBucket struct {
 	*objectstore.MeteredBucket
 	source sourceBucketMutator
 	prefix string
+	// Set only after a successful authenticated bind with no producer capability.
+	cooperativeDirect bool
 }
 
 func (b *fencedBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...thanosobjstore.ObjectUploadOption) error {
+	if b.cooperativeDirect {
+		return b.MeteredBucket.Upload(ctx, name, reader, options...)
+	}
 	if b.source == nil {
 		return fmt.Errorf("fencing: protected object writes are unavailable")
 	}
@@ -67,11 +72,17 @@ func (b *fencedBucket) Upload(ctx context.Context, name string, reader io.Reader
 	return b.source.Upload(ctx, key, condition, payload)
 }
 
-func (b *fencedBucket) Delete(context.Context, string) error {
+func (b *fencedBucket) Delete(ctx context.Context, name string) error {
+	if b.cooperativeDirect {
+		return b.MeteredBucket.Delete(ctx, name)
+	}
 	return fmt.Errorf("fencing: protected deletion requires an exact selected object generation")
 }
 
 func (b *fencedBucket) DeleteVersion(ctx context.Context, name string, version thanosobjstore.ObjectVersion) error {
+	if b.cooperativeDirect {
+		return b.MeteredBucket.DeleteVersion(ctx, name, version)
+	}
 	if b.source == nil {
 		return fmt.Errorf("fencing: protected object deletion is unavailable")
 	}
@@ -89,14 +100,30 @@ func (b *fencedBucket) DeleteVersion(ctx context.Context, name string, version t
 	return b.source.Delete(ctx, key, generation)
 }
 
-func (b *fencedBucket) SupportsVersionedDelete() bool { return b.source != nil }
+func (b *fencedBucket) SupportsVersionedDelete() bool {
+	if b.cooperativeDirect {
+		return objectstore.SupportsVersionedDelete(b.MeteredBucket)
+	}
+	return b.source != nil
+}
 
 func (b *fencedBucket) IsConditionNotMetErr(err error) bool {
 	return errors.Is(err, fencing.ErrMutationConditionFailed) || b.MeteredBucket.IsConditionNotMetErr(err)
 }
 
 func (b *fencedBucket) SupportedObjectUploadOptions() []thanosobjstore.ObjectUploadOptionType {
+	if b.cooperativeDirect {
+		return b.MeteredBucket.SupportedObjectUploadOptions()
+	}
 	return []thanosobjstore.ObjectUploadOptionType{thanosobjstore.IfNotExists, thanosobjstore.IfMatch}
+}
+
+func (b *fencedBucket) activateCooperativeDirect() error {
+	if b == nil || b.MeteredBucket == nil || b.source != nil {
+		return fmt.Errorf("fencing: cooperative object-store path is unavailable")
+	}
+	b.cooperativeDirect = true
+	return nil
 }
 
 func (b *fencedBucket) Close() error {

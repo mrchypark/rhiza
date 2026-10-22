@@ -424,10 +424,7 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
-		if n.fenceSession != nil {
-			if provider != objectstore.ProviderGCS {
-				return fmt.Errorf("supervised source mutations currently require GCS")
-			}
+		if n.fenceSession != nil && provider == objectstore.ProviderGCS {
 			if err := rejectSupervisedWriterCredentials(n.config); err != nil {
 				return err
 			}
