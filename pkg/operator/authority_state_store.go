@@ -78,6 +78,93 @@ func (s *AuthorityStateStore) genesisKey(identity string) string {
 	return s.key("root-genesis", identity)
 }
 
+func (s *AuthorityStateStore) archiveScopeClaimKey(scope fencing.ArchiveScope) (string, string, error) {
+	hash, err := scope.Hash()
+	if err != nil {
+		return "", "", err
+	}
+	identity := hashJSON([]string{"rhiza-archive-scope-claim-v1", hash})
+	return s.key("archive-scope-claims", identity), identity, nil
+}
+
+// ReadArchiveScopeClaim reads the create-only stable-scope authorization
+// record. Missing state is not evidence that an archive namespace is new.
+func (s *AuthorityStateStore) ReadArchiveScopeClaim(ctx context.Context, scope fencing.ArchiveScope) (fencing.ArchiveScopeClaim, *objstore.ObjectVersion, error) {
+	key, identity, err := s.archiveScopeClaimKey(scope)
+	if err != nil {
+		return fencing.ArchiveScopeClaim{}, nil, err
+	}
+	data, version, err := s.read(ctx, key, identity)
+	if err != nil {
+		return fencing.ArchiveScopeClaim{}, nil, err
+	}
+	var claim fencing.ArchiveScopeClaim
+	if err := decodeAuthorityValue(data, &claim); err != nil || claim.Scope != scope || claim.Validate() != nil {
+		return fencing.ArchiveScopeClaim{}, nil, errors.Join(err, fmt.Errorf("fencing: archive scope claim differs"))
+	}
+	return claim, version, nil
+}
+
+// ClaimArchiveScope authorizes a stable archive scope exactly once. A retry is
+// idempotent only for the byte-identical first owner and registration.
+func (s *AuthorityStateStore) ClaimArchiveScope(ctx context.Context, scope fencing.ArchiveScope, configID uint, ownerUID, ownerSource, registrationIdentity string) (fencing.ArchiveScopeClaim, error) {
+	_, identity, err := s.archiveScopeClaimKey(scope)
+	if err != nil {
+		return fencing.ArchiveScopeClaim{}, err
+	}
+	hash, _ := scope.Hash()
+	want := fencing.ArchiveScopeClaim{Version: fencing.ArchiveGenesisVersion, Scope: scope, ScopeHash: hash, ConfigID: configID, OwnerStatefulSetUID: ownerUID, OwnerSourceClusterID: ownerSource, RegistrationIdentity: registrationIdentity}
+	if err := want.Validate(); err != nil {
+		return fencing.ArchiveScopeClaim{}, err
+	}
+	key, _, _ := s.archiveScopeClaimKey(scope)
+	writeErr := s.write(ctx, key, identity, want, nil)
+	if writeErr == nil {
+		return want, nil
+	}
+	got, _, readErr := s.ReadArchiveScopeClaim(ctx, scope)
+	if readErr == nil && got.Scope == want.Scope && got.ScopeHash == want.ScopeHash && got.ConfigID == want.ConfigID &&
+		got.OwnerStatefulSetUID == want.OwnerStatefulSetUID && got.OwnerSourceClusterID == want.OwnerSourceClusterID {
+		return got, nil
+	}
+	return fencing.ArchiveScopeClaim{}, errors.Join(writeErr, readErr, errAuthorityStateConflict)
+}
+
+// SetArchiveScopeGenesisRef commits the first full genesis reference in the
+// stable claim. The exact existing reference is the only successful retry.
+func (s *AuthorityStateStore) SetArchiveScopeGenesisRef(ctx context.Context, scope fencing.ArchiveScope, ref fencing.ArchiveGenesisRef) error {
+	if err := ref.ValidateForScope(scope); err != nil {
+		return fmt.Errorf("fencing: archive genesis reference scope differs")
+	}
+	for range 8 {
+		claim, version, err := s.ReadArchiveScopeClaim(ctx, scope)
+		if err != nil {
+			return err
+		}
+		if claim.GenesisRef != nil {
+			if hashJSON(claim.GenesisRef) == hashJSON(&ref) {
+				return nil
+			}
+			return fmt.Errorf("fencing: archive genesis reference already committed")
+		}
+		if claim.ConfigID != ref.ConfigID {
+			return fmt.Errorf("fencing: archive genesis config differs from registered scope claim")
+		}
+		claim.GenesisRef = &ref
+		_, identity, _ := s.archiveScopeClaimKey(scope)
+		if err := s.write(ctx, s.key("archive-scope-claims", identity), identity, claim, version); err == nil {
+			return nil
+		} else if !errors.Is(err, errAuthorityStateConflict) {
+			got, _, readErr := s.ReadArchiveScopeClaim(ctx, scope)
+			if readErr == nil && got.GenesisRef != nil && hashJSON(got.GenesisRef) == hashJSON(&ref) {
+				return nil
+			}
+			return errors.Join(err, readErr)
+		}
+	}
+	return fmt.Errorf("fencing: archive genesis claim changed too often")
+}
+
 func (s *AuthorityStateStore) ensureRootGenesis(ctx context.Context, identity string) error {
 	key := s.genesisKey(identity)
 	value := struct {

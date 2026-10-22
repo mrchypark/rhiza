@@ -578,7 +578,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	}
 	if mode == "single target failure" || twoFailures || partialInventory {
 		r.Spec.Automatic = true
-		r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+		r.Spec.Policy = &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 		loaded.BindingHash = autoBinding(r)
 		loaded.SuspectedSince = time.Now().Add(-3 * time.Second)
 		loaded.Completions = []time.Time{loaded.SuspectedSince}

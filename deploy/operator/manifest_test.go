@@ -69,6 +69,45 @@ func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {
 	}
 }
 
+func TestClusterCRDAutomaticRecoveryRequiresExplicitPolicy(t *testing.T) {
+	data, err := os.ReadFile("cluster-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions, _ := crd["spec"].(map[string]any)["versions"].([]any)
+	spec, _ := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)["properties"].(map[string]any)["spec"].(map[string]any)
+	properties, _ := spec["properties"].(map[string]any)
+	requiredSpec, _ := spec["required"].([]any)
+	for _, field := range requiredSpec {
+		if field == "automatic" || field == "policy" {
+			t.Fatalf("spec.%s must be optional for manual recovery", field)
+		}
+	}
+	if automatic, _ := properties["automatic"].(map[string]any); automatic["default"] != false {
+		t.Fatalf("automatic default=%v, want false", automatic["default"])
+	}
+	policy, ok := properties["policy"].(map[string]any)
+	if !ok {
+		t.Fatal("optional policy schema is missing")
+	}
+	wantRequired := map[string]bool{"failureGraceSeconds": true, "cooldownSeconds": true, "maxRecoveriesPerDay": true, "allowDataLoss": true}
+	required, _ := policy["required"].([]any)
+	for _, field := range required {
+		delete(wantRequired, field.(string))
+	}
+	if len(wantRequired) != 0 {
+		t.Fatalf("policy omits required explicit fields: %v", wantRequired)
+	}
+	validations, _ := spec["x-kubernetes-validations"].([]any)
+	if len(validations) != 1 || !strings.Contains(validations[0].(map[string]any)["rule"].(string), "has(self.policy)") {
+		t.Fatalf("automatic policy opt-in validation missing: %v", validations)
+	}
+}
+
 // The PDB must leave quorum intact for every supported voter count.
 func TestNoPVCPDBToleratesOneVoterAtATTime(t *testing.T) {
 	data, err := os.ReadFile("no-pvc/statefulset-base.yaml")

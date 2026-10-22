@@ -13,6 +13,9 @@ type Ledger struct {
 	Runs                   map[string]Run         `json:"runs"`
 	RequireRuntimeBinding  bool                   `json:"requireRuntimeBinding,omitempty"`
 	RequireMutationJournal bool                   `json:"requireMutationJournal,omitempty"`
+	ArchiveGenesisState    string                 `json:"archiveGenesisState,omitempty"`
+	ArchiveScopeHash       string                 `json:"archiveScopeHash,omitempty"`
+	ArchiveGenesisRef      *ArchiveGenesisRef     `json:"archiveGenesisRef,omitempty"`
 }
 
 type Run struct {

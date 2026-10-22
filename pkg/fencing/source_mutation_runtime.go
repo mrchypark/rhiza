@@ -88,6 +88,20 @@ func (c *SourceMutationClient) Delete(ctx context.Context, key string, generatio
 	return c.client.settle(ctx, step)
 }
 
+// ArchiveGenesisStatus is an authenticated idempotent POST through the existing
+// authority path. It does not allocate a mutation tuple or bypass Upload.
+func (c *SourceMutationClient) ArchiveGenesisStatus(ctx context.Context, archiveKey string, configID uint) (ArchiveGenesisStatus, error) {
+	if ctx == nil {
+		return ArchiveGenesisStatus{}, fmt.Errorf("fencing: archive genesis status context is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.usable(); err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	return c.client.archiveGenesisStatus(ctx, archiveKey, configID)
+}
+
 func (c *SourceMutationClient) nextIntent(kind, key string, condition MutationCondition) (MutationIntent, error) {
 	if key == "" {
 		return MutationIntent{}, fmt.Errorf("fencing: source mutation key is empty")

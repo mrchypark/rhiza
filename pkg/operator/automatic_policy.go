@@ -24,6 +24,29 @@ type AutoPolicy struct {
 	AllowDataLoss       bool  `json:"allowDataLoss"`
 }
 
+func (p AutoPolicy) validate() error {
+	if p.FailureGraceSeconds < 1 || p.FailureGraceSeconds > 86400 {
+		return fmt.Errorf("policy failureGraceSeconds must be between 1 and 86400")
+	}
+	if p.CooldownSeconds < 1 || p.CooldownSeconds > 604800 {
+		return fmt.Errorf("policy cooldownSeconds must be between 1 and 604800")
+	}
+	if p.MaxRecoveriesPerDay < 1 || p.MaxRecoveriesPerDay > 100 {
+		return fmt.Errorf("policy maxRecoveriesPerDay must be between 1 and 100")
+	}
+	return nil
+}
+
+func validateAutomaticPolicyForNewIncident(state *autoControl, automatic bool, policy *AutoPolicy) error {
+	if !automatic || state != nil && state.Intent != nil {
+		return nil
+	}
+	if policy == nil {
+		return fmt.Errorf("automatic recovery requires an explicit policy")
+	}
+	return policy.validate()
+}
+
 // AutoObservation describes the current observable cluster state.
 type AutoObservation struct {
 	Known          bool
@@ -46,9 +69,8 @@ func DecideAutoRecovery(
 	suspectedSince time.Time,
 	completed []time.Time,
 ) (AutoDecision, string) {
-	// Validate policy fields.
-	if policy.FailureGraceSeconds <= 0 || policy.CooldownSeconds <= 0 || policy.MaxRecoveriesPerDay <= 0 {
-		return AutoBlocked, "policy fields FailureGraceSeconds, CooldownSeconds, MaxRecoveriesPerDay must be positive"
+	if err := policy.validate(); err != nil {
+		return AutoBlocked, err.Error()
 	}
 
 	// Unknown observation — cannot decide.

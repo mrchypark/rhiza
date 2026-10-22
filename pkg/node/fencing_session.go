@@ -12,6 +12,7 @@ import (
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 func (n *Node) connectFenceSession(ctx context.Context) error {
@@ -68,6 +69,18 @@ func (n *Node) bindFenceWAL(ctx context.Context, walIdentity string) error {
 		return fmt.Errorf("open source mutation client: %w", err)
 	}
 	n.protectedBucket.source = client
+	binding, ok := n.fenceSession.MutationBinding()
+	if !ok || binding.StoreScopeHash == "" {
+		return fmt.Errorf("fencing: validated mutation binding disappeared")
+	}
+	scope := fencing.ArchiveScope{
+		Provider: string(provider), Bucket: n.config.ObjStoreBucket,
+		Prefix: n.protectedBucket.prefix, ClusterID: string(n.config.ClusterID),
+	}
+	membership := recovery.NewMembershipRecord(string(n.config.ClusterID), n.config.Members, string(n.config.ObjStoreDurability))
+	if err := ensureArchiveGenesis(ctx, client, n.protectedBucket, scope, binding.StoreScopeHash, membership); err != nil {
+		return err
+	}
 	return nil
 }
 

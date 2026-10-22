@@ -44,8 +44,8 @@ type ClusterSpec struct {
 	Bootstrap      bool   `json:"bootstrap,omitempty"`
 	AnchorID       string `json:"anchorID,omitempty"`
 
-	Automatic bool       `json:"automatic"`
-	Policy    AutoPolicy `json:"policy"`
+	Automatic bool        `json:"automatic,omitempty"`
+	Policy    *AutoPolicy `json:"policy,omitempty"`
 }
 type ClusterStatus struct {
 	Phase              string `json:"phase"`
@@ -793,6 +793,9 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if err != nil && !c.Bucket.IsObjNotFoundErr(err) {
 		return block(nil, "durable automatic control record is unavailable")
 	}
+	if err := validateAutomaticPolicyForNewIncident(state, r.Spec.Automatic, r.Spec.Policy); err != nil {
+		return block(state, err.Error())
+	}
 	members, adopted, err := clusterMembers(env["RHIZA_CLUSTER_MEMBERS"])
 	if err != nil {
 		return block(nil, err.Error())
@@ -916,6 +919,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if !r.Spec.Automatic || r.Metadata["deletionTimestamp"] != nil {
 		return c.autoStatus(ctx, r, state, "Manual", "new automatic recovery is suspended")
 	}
+	policy := *r.Spec.Policy
 	// The declared count, the workload environment, and the replica count are one
 	// contract; reconciling a mismatch as an outage would fence a live majority.
 	obs, statuses, err := c.observeAutomatic(ctx, r, state, sts)
@@ -923,7 +927,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		return block(state, err.Error())
 	}
 	now := time.Now().UTC()
-	decision, message := DecideAutoRecovery(r.Spec.Policy, obs, now, state.SuspectedSince, state.Completions)
+	decision, message := DecideAutoRecovery(policy, obs, now, state.SuspectedSince, state.Completions)
 	if decision == AutoHealthy {
 		state.SuspectedSince = time.Time{}
 	} else if (decision == AutoSuspect || decision == AutoDegraded) && state.SuspectedSince.IsZero() {
@@ -941,14 +945,14 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		single := obs
 		single.QuorumVerified = false
 		single.Durability = "before-ack"
-		decision, message = DecideAutoRecovery(r.Spec.Policy, single, now, state.SuspectedSince, state.Completions)
+		decision, message = DecideAutoRecovery(policy, single, now, state.SuspectedSince, state.Completions)
 	}
 	if decision == AutoRecover && failed != "" && (state.Identities[failed].WALIdentity == "" || state.Identities[failed].PodUID == "") {
 		// An unknown incarnation cannot authorize online removal. The existing
 		// generation fence covers all authority, including unobserved processes.
 		whole := obs
 		whole.QuorumVerified = false
-		decision, message = DecideAutoRecovery(r.Spec.Policy, whole, now, state.SuspectedSince, state.Completions)
+		decision, message = DecideAutoRecovery(policy, whole, now, state.SuspectedSince, state.Completions)
 		failed = ""
 	}
 	if decision == AutoRecover {
@@ -990,7 +994,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		if err := fenceCapacityError(len(request.Targets)); err != nil {
 			return block(state, err.Error())
 		}
-		state.Intent = &autoIntent{Request: request, Policy: r.Spec.Policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), Failed: failed, RecoveryName: name, LearnerName: name + "-learner"}
+		state.Intent = &autoIntent{Request: request, Policy: policy, Durability: obs.Durability, Voters: append([]VoterPod(nil), state.Voters...), Failed: failed, RecoveryName: name, LearnerName: name + "-learner"}
 	}
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
 		return err
