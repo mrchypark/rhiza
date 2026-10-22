@@ -96,11 +96,18 @@ jobs:
           go list -tags rhiza_local_testhooks ./... > "$package_list"
           test -s "$package_list"
           index=0
+          compile_failed=0
           while IFS= read -r package; do
             index=$((index + 1))
             binary_name=$(printf '%04d.test' "$index")
-            go test -c -tags rhiza_local_testhooks -o "$output_dir/$binary_name" "$package"
+            printf 'Compiling test package %s\n' "$package"
+            if ! go test -c -tags rhiza_local_testhooks -o "$output_dir/$binary_name" "$package"; then
+              compile_failed=1
+            fi
           done < "$package_list"
+          if [ "$compile_failed" -ne 0 ]; then
+            exit 1
+          fi
       - name: Check fencing runtime profile validator
         run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
       - name: Check cooperative protocol and engine regression tests
