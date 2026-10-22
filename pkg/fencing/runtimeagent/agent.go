@@ -18,6 +18,7 @@ import (
 	"sync"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 )
 
 const maxMessage = 1 << 20
@@ -51,6 +52,7 @@ type Config struct {
 	Directory               string
 	Auth                    Authenticator
 	Backend                 Backend
+	Diagnostic              func(stage, code string)
 }
 
 type Service struct {
@@ -160,6 +162,7 @@ func (s *Service) authorize(r *http.Request) error {
 
 func (s *Service) enroll(ctx context.Context, base fencing.RuntimeBinding) (fencing.RuntimeBinding, error) {
 	if base.AuthorityID != s.cfg.AuthorityID {
+		s.enrollmentDiagnostic("request_validation", "authority_mismatch")
 		return fencing.RuntimeBinding{}, errors.New("runtime enrollment authority differs")
 	}
 	s.mu.Lock()
@@ -167,24 +170,103 @@ func (s *Service) enroll(ctx context.Context, base fencing.RuntimeBinding) (fenc
 	key := enrollmentKey(base)
 	if old, err := s.read(key); err == nil {
 		if !sameEnrollmentBase(old.Binding, base) {
+			s.enrollmentDiagnostic("state_read", "binding_conflict")
 			return fencing.RuntimeBinding{}, errors.New("runtime enrollment conflict")
 		}
 		return old.Binding, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
+		s.enrollmentDiagnostic("state_read", "state_unavailable")
 		return fencing.RuntimeBinding{}, err
 	}
 	binding, scope, err := s.cfg.Backend.Enroll(ctx, base)
 	if err != nil {
+		s.enrollmentDiagnostic("cri_enroll", enrollmentBackendErrorCode(err))
 		return fencing.RuntimeBinding{}, err
 	}
 	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
-	if err := binding.Validate(identity); err != nil || !sameEnrollmentBase(binding, base) || len(scope) == 0 || !json.Valid(scope) {
+	if err := binding.Validate(identity); err != nil {
+		s.enrollmentDiagnostic("backend_result_validation", "binding_invalid")
+		return fencing.RuntimeBinding{}, errors.New("runtime backend returned incomplete enrollment")
+	}
+	if !sameEnrollmentBase(binding, base) {
+		s.enrollmentDiagnostic("backend_result_validation", "binding_mismatch")
+		return fencing.RuntimeBinding{}, errors.New("runtime backend returned incomplete enrollment")
+	}
+	if len(scope) == 0 || !json.Valid(scope) {
+		s.enrollmentDiagnostic("backend_result_validation", "scope_invalid")
 		return fencing.RuntimeBinding{}, errors.New("runtime backend returned incomplete enrollment")
 	}
 	if err := s.write(key, record{Binding: binding, Scope: scope}); err != nil {
+		s.enrollmentDiagnostic("state_persist", "state_write_failed")
 		return fencing.RuntimeBinding{}, err
 	}
 	return binding, nil
+}
+
+func (s *Service) enrollmentDiagnostic(stage, code string) {
+	if s.cfg.Diagnostic != nil {
+		s.cfg.Diagnostic(stage, code)
+	}
+}
+
+func enrollmentBackendErrorCode(err error) string {
+	if !errors.Is(err, cri.ErrUnverified) {
+		return "backend_error"
+	}
+	for _, check := range []struct{ marker, code string }{
+		{"incomplete qualified runtime enrollment", "binding_incomplete"},
+		{"unsupported runtime enrollment profile", "profile_unsupported"},
+		{"read host identity", "host_identity_unavailable"},
+		{"local node or boot identity differs", "host_identity_mismatch"},
+		{"enrolled node, machine, boot or kernel differs", "host_identity_mismatch"},
+		{"runtime version is not the qualified profile", "runtime_profile_mismatch"},
+		{"runtime version:", "runtime_api_unavailable"},
+		{"enrolled runtime/API version differs", "runtime_profile_mismatch"},
+		{"container ID is not containerd-qualified", "container_id_unqualified"},
+		{"pre-child container metadata differs", "container_metadata_mismatch"},
+		{"containerd verbose info is missing or ambiguous", "containerd_verbose_info_missing"},
+		{"containerd verbose info is not an object", "containerd_verbose_info_invalid"},
+		{"invalid containerd verbose info", "containerd_verbose_info_invalid"},
+		{"invalid containerd verbose info key", "containerd_verbose_info_invalid"},
+		{"invalid containerd verbose info value", "containerd_verbose_info_invalid"},
+		{"incomplete containerd verbose info", "containerd_verbose_info_invalid"},
+		{"trailing containerd verbose info", "containerd_verbose_info_invalid"},
+		{"duplicate containerd verbose info field", "containerd_verbose_field_duplicate"},
+		{"containerd verbose info field", "containerd_verbose_field_missing"},
+		{"containerd verbose info schema differs", "containerd_verbose_schema_mismatch"},
+		{"containerd verbose identity differs", "containerd_verbose_identity_mismatch"},
+		{"containerd PID changed during cgroup capture", "containerd_pid_changed_during_capture"},
+		{"containerd PID changed during pre-child capture", "containerd_pid_changed_during_capture"},
+		{"sandbox status:", "sandbox_status_unavailable"},
+		{"sandbox enrollment or namespace metadata differs", "sandbox_metadata_mismatch"},
+		{"private execution namespaces are required", "execution_namespace_mismatch"},
+		{"container status:", "container_status_unavailable"},
+		{"container enrollment differs", "container_metadata_mismatch"},
+		{"sandbox container inventory:", "sandbox_inventory_unavailable"},
+		{"sandbox inventory is missing", "sandbox_inventory_missing"},
+		{"sandbox has unknown or duplicate container scope", "sandbox_inventory_ambiguous"},
+		{"target container inventory differs", "target_container_metadata_mismatch"},
+		{"target container is outside the captured sandbox", "target_container_outside_sandbox"},
+		{"invalid cgroup capture configuration", "cgroup_capture_configuration_invalid"},
+		{"read enrolled process identity", "process_identity_unavailable"},
+		{"read process cgroup", "process_cgroup_unavailable"},
+		{"unified cgroup path is unsafe", "process_cgroup_path_invalid"},
+		{"unified cgroup path missing", "process_cgroup_path_missing"},
+		{"resolve cgroup root", "cgroup_root_unavailable"},
+		{"resolve cgroup scope", "cgroup_scope_unavailable"},
+		{"cgroup directory unavailable", "cgroup_scope_unavailable"},
+		{"cgroup filesystem identity unavailable", "cgroup_identity_unavailable"},
+		{"cgroup is not populated", "cgroup_not_populated"},
+		{"process changed during pre-child capture", "process_changed_during_capture"},
+		{"process changed during cgroup capture", "process_changed_during_capture"},
+		{"runtime enrollment identity differs", "runtime_binding_invalid"},
+		{"runtime enrollment is incomplete", "runtime_binding_invalid"},
+	} {
+		if strings.Contains(err.Error(), check.marker) {
+			return check.code
+		}
+	}
+	return "cri_scope_unverified"
 }
 
 func (s *Service) stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest) (json.RawMessage, error) {

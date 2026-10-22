@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +127,72 @@ type fencerDiagnosticsView struct {
 		Bytes    int64  `json:"bytes"`
 		Lines    int64  `json:"lines"`
 	} `json:"logs"`
+	RuntimeAgent struct {
+		PodName string `json:"podName"`
+		PodUID  string `json:"podUID"`
+		Logs    struct {
+			Captured bool   `json:"captured"`
+			SHA256   string `json:"sha256"`
+			Bytes    int64  `json:"bytes"`
+			Lines    int64  `json:"lines"`
+		} `json:"logs"`
+		Diagnostics          []runtimeAgentEnrollmentDiagnostic `json:"diagnostics"`
+		DiagnosticsTruncated bool                               `json:"diagnosticsTruncated,omitempty"`
+	} `json:"runtimeAgent"`
+}
+
+type runtimeAgentEnrollmentDiagnostic struct {
+	Stage string `json:"stage"`
+	Code  string `json:"code"`
+}
+
+const maxRuntimeAgentDiagnostics = 20
+
+var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
+	"request_validation/authority_mismatch":            {},
+	"state_read/binding_conflict":                      {},
+	"state_read/state_unavailable":                     {},
+	"cri_enroll/binding_incomplete":                    {},
+	"cri_enroll/profile_unsupported":                   {},
+	"cri_enroll/host_identity_unavailable":             {},
+	"cri_enroll/host_identity_mismatch":                {},
+	"cri_enroll/runtime_api_unavailable":               {},
+	"cri_enroll/runtime_profile_mismatch":              {},
+	"cri_enroll/runtime_binding_invalid":               {},
+	"cri_enroll/container_id_unqualified":              {},
+	"cri_enroll/container_metadata_mismatch":           {},
+	"cri_enroll/containerd_verbose_info_missing":       {},
+	"cri_enroll/containerd_verbose_info_invalid":       {},
+	"cri_enroll/containerd_verbose_field_duplicate":    {},
+	"cri_enroll/containerd_verbose_field_missing":      {},
+	"cri_enroll/containerd_verbose_schema_mismatch":    {},
+	"cri_enroll/containerd_verbose_identity_mismatch":  {},
+	"cri_enroll/containerd_pid_changed_during_capture": {},
+	"cri_enroll/sandbox_status_unavailable":            {},
+	"cri_enroll/sandbox_metadata_mismatch":             {},
+	"cri_enroll/execution_namespace_mismatch":          {},
+	"cri_enroll/container_status_unavailable":          {},
+	"cri_enroll/sandbox_inventory_unavailable":         {},
+	"cri_enroll/sandbox_inventory_missing":             {},
+	"cri_enroll/sandbox_inventory_ambiguous":           {},
+	"cri_enroll/target_container_metadata_mismatch":    {},
+	"cri_enroll/target_container_outside_sandbox":      {},
+	"cri_enroll/cgroup_capture_configuration_invalid":  {},
+	"cri_enroll/process_identity_unavailable":          {},
+	"cri_enroll/process_cgroup_unavailable":            {},
+	"cri_enroll/process_cgroup_path_invalid":           {},
+	"cri_enroll/process_cgroup_path_missing":           {},
+	"cri_enroll/cgroup_root_unavailable":               {},
+	"cri_enroll/cgroup_scope_unavailable":              {},
+	"cri_enroll/cgroup_identity_unavailable":           {},
+	"cri_enroll/cgroup_not_populated":                  {},
+	"cri_enroll/process_changed_during_capture":        {},
+	"cri_enroll/cri_scope_unverified":                  {},
+	"cri_enroll/backend_error":                         {},
+	"backend_result_validation/binding_invalid":        {},
+	"backend_result_validation/binding_mismatch":       {},
+	"backend_result_validation/scope_invalid":          {},
+	"state_persist/state_write_failed":                 {},
 }
 
 type fencerPodsView struct {
@@ -249,7 +317,14 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 	case name == "runtime-component-probe.json":
 		value = &runtimeComponentEvidence{}
 	case name == "fencer-diagnostics.json":
-		value = &fencerDiagnosticsView{}
+		var view fencerDiagnosticsView
+		if err := json.Unmarshal(data, &view); err != nil {
+			return nil, err
+		}
+		if err := validateRuntimeAgentDiagnostics(view); err != nil {
+			return nil, err
+		}
+		return json.Marshal(view)
 	case name == "fencer-pods.json":
 		value = &fencerPodsView{}
 	case name == "fencer-events.json":
@@ -263,6 +338,85 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(value)
+}
+
+func validateRuntimeAgentDiagnostics(view fencerDiagnosticsView) error {
+	agent := view.RuntimeAgent
+	if len(agent.Diagnostics) > maxRuntimeAgentDiagnostics || agent.Logs.Bytes < 0 || agent.Logs.Bytes > 65536 || agent.Logs.Lines < 0 || agent.Logs.Lines > 200 {
+		return fmt.Errorf("runtime-agent diagnostic receipt exceeds bounds")
+	}
+	if agent.Logs.Captured {
+		if agent.PodName == "" || agent.PodUID == "" || len(agent.Logs.SHA256) != 64 {
+			return fmt.Errorf("runtime-agent diagnostic identity is incomplete")
+		}
+		if _, err := hex.DecodeString(agent.Logs.SHA256); err != nil || strings.ToLower(agent.Logs.SHA256) != agent.Logs.SHA256 {
+			return fmt.Errorf("runtime-agent diagnostic log digest is invalid")
+		}
+	} else if len(agent.Diagnostics) != 0 || agent.DiagnosticsTruncated {
+		return fmt.Errorf("runtime-agent diagnostics lack a captured log")
+	}
+	if agent.DiagnosticsTruncated && len(agent.Diagnostics) != maxRuntimeAgentDiagnostics {
+		return fmt.Errorf("runtime-agent diagnostic truncation marker is inconsistent")
+	}
+	for _, diagnostic := range agent.Diagnostics {
+		if _, ok := allowedRuntimeAgentDiagnosticPairs[diagnostic.Stage+"/"+diagnostic.Code]; !ok {
+			return fmt.Errorf("runtime-agent diagnostic code is not allowlisted")
+		}
+	}
+	return nil
+}
+
+func projectRuntimeAgentDiagnostics(raw string, data []byte) ([]byte, error) {
+	var view fencerDiagnosticsView
+	if err := json.Unmarshal(data, &view); err != nil {
+		return nil, err
+	}
+	view.RuntimeAgent.Diagnostics = []runtimeAgentEnrollmentDiagnostic{}
+	if !view.RuntimeAgent.Logs.Captured {
+		return json.Marshal(view)
+	}
+	path := filepath.Join(raw, "private-fencer-diagnostics", "runtime-agent-current.log")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 65536 {
+		return nil, fmt.Errorf("runtime-agent private log is unsafe or oversized")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	logData, err := io.ReadAll(io.LimitReader(file, 65537))
+	if err != nil || len(logData) > 65536 || bytes.Count(logData, []byte("\n")) > 200 {
+		return nil, fmt.Errorf("runtime-agent private log exceeds bounds")
+	}
+	digest := sha256.Sum256(logData)
+	if int64(len(logData)) != view.RuntimeAgent.Logs.Bytes || int64(bytes.Count(logData, []byte("\n"))) != view.RuntimeAgent.Logs.Lines || hex.EncodeToString(digest[:]) != view.RuntimeAgent.Logs.SHA256 {
+		return nil, fmt.Errorf("runtime-agent private log does not match its public receipt")
+	}
+	const marker = "runtime-agent enrollment rejected "
+	for _, line := range strings.Split(string(logData), "\n") {
+		at := strings.Index(line, marker)
+		if at < 0 {
+			continue
+		}
+		fields := strings.Fields(line[at+len(marker):])
+		if len(fields) != 2 || !strings.HasPrefix(fields[0], "stage=") || !strings.HasPrefix(fields[1], "code=") {
+			continue
+		}
+		diagnostic := runtimeAgentEnrollmentDiagnostic{Stage: strings.TrimPrefix(fields[0], "stage="), Code: strings.TrimPrefix(fields[1], "code=")}
+		if _, ok := allowedRuntimeAgentDiagnosticPairs[diagnostic.Stage+"/"+diagnostic.Code]; !ok {
+			continue
+		}
+		if len(view.RuntimeAgent.Diagnostics) == maxRuntimeAgentDiagnostics {
+			view.RuntimeAgent.DiagnosticsTruncated = true
+			continue
+		}
+		view.RuntimeAgent.Diagnostics = append(view.RuntimeAgent.Diagnostics, diagnostic)
+	}
+	return json.Marshal(view)
 }
 
 // Only explicit evidence types enter the public packet; raw diagnostics stay on the disposable runner.
@@ -314,6 +468,12 @@ func safeArtifacts(raw string) error {
 		case approved:
 			if name == "terminal.json" {
 				name = "resources-summary.json"
+			}
+			if name == "fencer-diagnostics.json" {
+				data, err = projectRuntimeAgentDiagnostics(raw, data)
+				if err != nil {
+					return err
+				}
 			}
 			data, err = safeJSON(name, data)
 		case name == "events.jsonl":

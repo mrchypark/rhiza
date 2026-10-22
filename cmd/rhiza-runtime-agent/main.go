@@ -104,7 +104,10 @@ func run(ctx context.Context, args []string) error {
 	}
 	defer provider.Close()
 	service, err := runtimeagent.New(runtimeagent.Config{AuthorityID: "rhiza-fencer/" + *namespace, AuthorityNamespace: *namespace, AuthorityServiceAccount: "rhiza-fencer", AuthorityWorkloadUID: *authorityUID, Audience: runtimeAgentAudience,
-		Directory: *stateDir, Auth: tokenReviewer{Kube: kube, Namespace: *namespace, ServiceAccount: "rhiza-fencer", DeploymentUID: *authorityUID}, Backend: &runtimeagent.CRIBackend{Provider: provider, ProcRoot: "/host/proc", CgroupRoot: "/host/sys/fs/cgroup"}})
+		Directory: *stateDir, Auth: tokenReviewer{Kube: kube, Namespace: *namespace, ServiceAccount: "rhiza-fencer", DeploymentUID: *authorityUID}, Backend: &runtimeagent.CRIBackend{Provider: provider, ProcRoot: "/host/proc", CgroupRoot: "/host/sys/fs/cgroup"},
+		Diagnostic: func(stage, code string) {
+			log.Printf("runtime-agent enrollment rejected stage=%s code=%s", stage, code)
+		}})
 	if err != nil {
 		return err
 	}

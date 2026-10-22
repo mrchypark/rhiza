@@ -1,9 +1,11 @@
 package runtimeagent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 )
 
 type testAuth struct {
@@ -24,6 +27,7 @@ func (a testAuth) Authenticate(context.Context, string) (Principal, error) { ret
 
 type testBackend struct {
 	enrolls, stops, resumes int
+	enrollErr               error
 	stopErr                 error
 	resumeErr               error
 	crashAfterEffect        bool
@@ -34,9 +38,53 @@ type testBackend struct {
 
 func (b *testBackend) Enroll(_ context.Context, base fencing.RuntimeBinding) (fencing.RuntimeBinding, json.RawMessage, error) {
 	b.enrolls++
+	if b.enrollErr != nil {
+		return fencing.RuntimeBinding{}, nil, b.enrollErr
+	}
 	base.NodeUID, base.MachineID, base.BootID = "node-uid", "machine", "boot"
 	base.RuntimeID, base.SandboxID = "cri-profile", "sandbox"
 	return base, json.RawMessage(`{"path":"pod-a","dev":1,"ino":2}`), nil
+}
+
+func TestEnrollmentFailureReturnsGenericConflictAndOnlyAllowlistedDiagnostic(t *testing.T) {
+	const canary = "backend-error-secret-canary"
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &testBackend{enrollErr: fmt.Errorf("%w: containerd verbose info schema differs (%s)", cri.ErrUnverified, canary)}
+	var gotStage, gotCode string
+	cfg := Config{AuthorityID: "authority", AuthorityNamespace: "rhiza", AuthorityServiceAccount: "rhiza-fencer", AuthorityWorkloadUID: "authority-deployment-uid",
+		Audience: "rhiza-runtime-agent", Directory: dir,
+		Auth:    testAuth{principal: Principal{Username: "system:serviceaccount:rhiza:rhiza-fencer", PodUID: "authority-pod", WorkloadUID: "authority-deployment-uid", Audiences: []string{"rhiza-runtime-agent"}}},
+		Backend: backend, Diagnostic: func(stage, code string) { gotStage, gotCode = stage, code }}
+	service, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody, err := json.Marshal(enrollRequest{Binding: testBaseBinding()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/enroll", bytes.NewReader(requestBody))
+	request.Header.Set("Authorization", "Bearer trusted-test-token")
+	response := httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || strings.Contains(response.Body.String(), canary) || response.Body.String() != "runtime enrollment unavailable\n" {
+		t.Fatalf("enrollment response leaked backend detail or changed status: %d %q", response.Code, response.Body.String())
+	}
+	if gotStage != "cri_enroll" || gotCode != "containerd_verbose_schema_mismatch" {
+		t.Fatalf("unexpected private enrollment diagnostic stage=%q code=%q", gotStage, gotCode)
+	}
+}
+
+func TestEnrollmentBackendDiagnosticUsesGenericClassForUnclassifiedErrors(t *testing.T) {
+	if got := enrollmentBackendErrorCode(errors.New("untrusted diagnostic text")); got != "backend_error" {
+		t.Fatalf("unclassified backend error code=%q", got)
+	}
+	if got := enrollmentBackendErrorCode(fmt.Errorf("%w: untrusted details", cri.ErrUnverified)); got != "cri_scope_unverified" {
+		t.Fatalf("unmatched CRI error code=%q", got)
+	}
 }
 func (b *testBackend) Stop(_ context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, _ json.RawMessage) (json.RawMessage, error) {
 	b.stops++

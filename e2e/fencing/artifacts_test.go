@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -31,6 +33,9 @@ func TestPublicImageEvidenceOmitsCredentialCanaries(t *testing.T) {
 
 func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	const canary = "fixture-secret-canary-never-publish"
+	privateAgentLog := "2026/10/22 00:00:00 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch\n" +
+		"2026/10/22 00:00:01 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch private=" + canary + "\n"
+	agentLogDigest := sha256.Sum256([]byte(privateAgentLog))
 	raw := t.TempDir()
 	write := func(name string, data []byte) {
 		t.Helper()
@@ -52,7 +57,9 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 		"sandboxNotReady": true, "cgroupEmpty": true, "receiptVerified": true,
 		"agentRestarted": true, "receiptRecovered": true, "receiptSHA256": strings.Repeat("d", 64), "token": canary,
 	}))
-	write("fencer-diagnostics.json", encoded(obj{"context": "kind-rhiza-generic-fencing", "namespace": "rhiza-fencing-e2e", "podsCaptured": true, "eventsCaptured": true, "logs": obj{"captured": true, "sha256": strings.Repeat("e", 64), "bytes": 123, "lines": 4}, "token": canary}))
+	write("fencer-diagnostics.json", encoded(obj{"context": "kind-rhiza-generic-fencing", "namespace": "rhiza-fencing-e2e", "podsCaptured": true, "eventsCaptured": true,
+		"logs":         obj{"captured": true, "sha256": strings.Repeat("e", 64), "bytes": 123, "lines": 4},
+		"runtimeAgent": obj{"podName": "rhiza-runtime-agent-abc", "podUID": "runtime-agent-pod-uid", "logs": obj{"captured": true, "sha256": hex.EncodeToString(agentLogDigest[:]), "bytes": len([]byte(privateAgentLog)), "lines": 2}, "rawLog": canary}, "token": canary}))
 	write("fencer-pods.json", encoded(obj{"pods": []obj{{"name": "rhiza-fencer-abc", "uid": "pod-uid", "phase": "Pending", "conditions": []obj{{"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": canary}}, "containers": []obj{{"name": "fencer", "ready": false, "restartCount": 0, "state": obj{"waiting": obj{"reason": "CrashLoopBackOff", "message": canary}}, "private": canary}}}}, "spec": obj{"env": canary}}))
 	write("fencer-events.json", encoded(obj{"warnings": []obj{{"type": "Warning", "reason": "FailedMount", "count": 2, "lastTimestamp": "2026-10-22T00:00:00Z", "involvedObject": obj{"kind": "Pod", "name": "rhiza-fencer-abc", "uid": canary}, "source": obj{"component": "kubelet"}, "message": canary}}}))
 	write("fencer-deployment.json", encoded(obj{"name": "rhiza-fencer", "uid": "deployment-uid", "generation": 2, "observedGeneration": 1, "replicas": 1, "updatedReplicas": 0, "readyReplicas": 0, "availableReplicas": 0, "conditions": []obj{{"type": "Available", "status": "False", "reason": "MinimumReplicasUnavailable", "message": canary}}}))
@@ -71,6 +78,9 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(raw, "private-fencer-diagnostics", "authority-current.log"), []byte(canary), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(raw, "private-fencer-diagnostics", "runtime-agent-current.log"), []byte(privateAgentLog), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := safeArtifacts(raw); err != nil {
@@ -95,10 +105,48 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 			t.Fatalf("runtime evidence projection failed or leaked: %s: %v", name, err)
 		}
 	}
+	var diagnostics fencerDiagnosticsView
+	diagnosticsData, err := os.ReadFile(filepath.Join(raw, "public", "fencer-diagnostics.json"))
+	if err != nil || json.Unmarshal(diagnosticsData, &diagnostics) != nil || !diagnostics.RuntimeAgent.Logs.Captured || diagnostics.RuntimeAgent.Logs.SHA256 != hex.EncodeToString(agentLogDigest[:]) ||
+		len(diagnostics.RuntimeAgent.Diagnostics) != 1 || diagnostics.RuntimeAgent.Diagnostics[0] != (runtimeAgentEnrollmentDiagnostic{Stage: "cri_enroll", Code: "containerd_verbose_schema_mismatch"}) {
+		t.Fatalf("runtime-agent log hash projection failed: %v", err)
+	}
 	var resources []obj
 	data, err := os.ReadFile(filepath.Join(raw, "public", "resources-summary.json"))
 	if err != nil || json.Unmarshal(data, &resources) != nil || len(resources) != 2 || resources[0]["uid"] != "uid" {
 		t.Fatal("resource summary lost audit identity")
+	}
+}
+
+func TestRuntimeAgentDiagnosticsRejectUnallowlistedOrExcessivePairs(t *testing.T) {
+	base := fencerDiagnosticsView{}
+	base.RuntimeAgent.PodName = "rhiza-runtime-agent-abc"
+	base.RuntimeAgent.PodUID = "runtime-agent-pod-uid"
+	base.RuntimeAgent.Logs.Captured = true
+	base.RuntimeAgent.Logs.SHA256 = strings.Repeat("a", 64)
+	for _, diagnostics := range [][]runtimeAgentEnrollmentDiagnostic{
+		{{Stage: "state_read", Code: "authority_mismatch"}},
+		make([]runtimeAgentEnrollmentDiagnostic, maxRuntimeAgentDiagnostics+1),
+	} {
+		view := base
+		view.RuntimeAgent.Diagnostics = diagnostics
+		if _, err := safeJSON("fencer-diagnostics.json", encoded(view)); err == nil {
+			t.Fatal("unallowlisted or excessive runtime-agent diagnostics were accepted")
+		}
+	}
+}
+
+func TestRuntimeAgentDiagnosticsAllowRuntimeProfileAndBindingFailures(t *testing.T) {
+	view := fencerDiagnosticsView{}
+	view.RuntimeAgent.PodName = "rhiza-runtime-agent-abc"
+	view.RuntimeAgent.PodUID = "runtime-agent-pod-uid"
+	view.RuntimeAgent.Logs.Captured = true
+	view.RuntimeAgent.Logs.SHA256 = strings.Repeat("a", 64)
+	for _, code := range []string{"runtime_api_unavailable", "runtime_binding_invalid"} {
+		view.RuntimeAgent.Diagnostics = []runtimeAgentEnrollmentDiagnostic{{Stage: "cri_enroll", Code: code}}
+		if _, err := safeJSON("fencer-diagnostics.json", encoded(view)); err != nil {
+			t.Errorf("allowlisted CRI enrollment code %q was rejected: %v", code, err)
+		}
 	}
 }
 
@@ -171,6 +219,14 @@ func TestRunScriptCapturesBoundedOwnedDiagnosticsBeforeDeletingKind(t *testing.T
 		"--tail=200 --limit-bytes=65536 --max-log-requests=5",
 		"diagnostics_dir/authority-current.log",
 		"get deployment rhiza-fencer",
+		"runtime-agent-current.log",
+		"owner == \"DaemonSet\" and .name == \"rhiza-runtime-agent\" and .uid == $owner",
+		"logs \"$runtime_agent_pod_name\" -c runtime-agent --prefix --tail=200 --limit-bytes=65536",
+		"get pod \"$runtime_agent_pod_name\" -o json",
+		"runtime_agent_after_ds_uid=$(k --request-timeout=10s get daemonset rhiza-runtime-agent -o jsonpath='{.metadata.uid}'",
+		"[ \"$runtime_agent_after_ds_uid\" = \"$runtime_agent_ds_uid\" ]",
+		".metadata.uid == $pod and .spec.nodeName == $node",
+		"runtimeAgentLogsSHA256",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("bounded owned diagnostic capture missing %q", required)

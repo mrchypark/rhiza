@@ -10,6 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -388,7 +391,7 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 	if oldAgentUID == "" {
 		return fmt.Errorf("runtime-agent Pod UID unavailable")
 	}
-	if _, err := kubectl(ctx, "delete", "pod", text(nested(oldAgent, "metadata", "name")), "--wait=false", "--preconditions=uid="+oldAgentUID); err != nil {
+	if err := deleteObjectWithUID(ctx, "pods", text(nested(oldAgent, "metadata", "name")), oldAgentUID); err != nil {
 		return fmt.Errorf("delete owned runtime-agent Pod for restart: %w", err)
 	}
 	if err := wait(ctx, "runtime-agent Pod replacement", func() (bool, error) {
@@ -462,18 +465,133 @@ func deleteProbeObject(ctx context.Context, kind, name, uid string) error {
 	if uid == "" {
 		return fmt.Errorf("refusing name-only cleanup for %s/%s", kind, name)
 	}
-	_, deleteErr := kubectl(ctx, "delete", kind, name, "--wait=true", "--timeout=20s", "--preconditions=uid="+uid)
-	current, err := get(ctx, kind, name)
-	if err != nil {
-		if strings.Contains(err.Error(), "(NotFound)") {
-			return nil
+	resource := map[string]string{"pod": "pods", "statefulset": "statefulsets"}[kind]
+	if resource == "" {
+		return fmt.Errorf("unsupported probe cleanup kind %q", kind)
+	}
+	deleteErr := deleteObjectWithUID(ctx, resource, name, uid)
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if err := wait(waitCtx, "probe "+kind+" UID cleanup", func() (bool, error) {
+		current, err := get(waitCtx, kind, name)
+		if err != nil {
+			if strings.Contains(err.Error(), "(NotFound)") {
+				return true, nil
+			}
+			return false, err
 		}
+		return probeUIDGone(uid, current), nil
+	}); err != nil {
 		return errors.Join(deleteErr, fmt.Errorf("confirm probe %s UID cleanup: %w", kind, err))
 	}
-	if !probeUIDGone(uid, current) {
-		return errors.Join(deleteErr, fmt.Errorf("probe %s UID remains after cleanup", kind))
+	return nil
+}
+
+// deleteObjectWithUID uses Kubernetes DeleteOptions rather than a kubectl
+// delete flag: kubectl does not support --preconditions on all pinned versions.
+func deleteObjectWithUID(ctx context.Context, resource, name, uid string) error {
+	if name == "" || uid == "" {
+		return fmt.Errorf("refusing UID-preconditioned delete without name and UID")
+	}
+	path, err := probeDeletePath(namespace, resource, name)
+	if err != nil {
+		return err
+	}
+
+	proxyDir, err := os.MkdirTemp("/tmp", "rhiza-kube-proxy-")
+	if err != nil {
+		return fmt.Errorf("create private Kubernetes proxy directory: %w", err)
+	}
+	defer os.RemoveAll(proxyDir)
+	socketPath := filepath.Join(proxyDir, "proxy.sock")
+	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "proxy", "--unix-socket", socketPath, "--api-prefix=/")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start Kubernetes API proxy: %w", err)
+	}
+	proxyDone := make(chan struct{})
+	var proxyErr error
+	go func() {
+		proxyErr = cmd.Wait()
+		close(proxyDone)
+	}()
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-proxyDone
+	}()
+
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	baseURL := "http://localhost"
+	readyDeadline := time.NewTimer(10 * time.Second)
+	defer readyDeadline.Stop()
+	for {
+		select {
+		case <-proxyDone:
+			return fmt.Errorf("Kubernetes API proxy exited before readiness: %v", proxyErr)
+		default:
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/version", nil)
+		if err != nil {
+			return err
+		}
+		response, requestErr := client.Do(request)
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Kubernetes API proxy: %w", ctx.Err())
+		case <-readyDeadline.C:
+			return fmt.Errorf("Kubernetes API proxy did not become ready")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	deleteOptions := struct {
+		APIVersion    string `json:"apiVersion"`
+		Kind          string `json:"kind"`
+		Preconditions struct {
+			UID string `json:"uid"`
+		} `json:"preconditions"`
+	}{APIVersion: "v1", Kind: "DeleteOptions"}
+	deleteOptions.Preconditions.UID = uid
+	body, err := json.Marshal(deleteOptions)
+	if err != nil {
+		return fmt.Errorf("encode Kubernetes UID delete options: %w", err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("construct Kubernetes UID delete request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", baseURL)
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("send Kubernetes UID-preconditioned delete: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("Kubernetes UID-preconditioned delete returned HTTP %d", response.StatusCode)
 	}
 	return nil
+}
+
+func probeDeletePath(namespace, resource, name string) (string, error) {
+	apiPrefix := map[string]string{"pods": "/api/v1", "statefulsets": "/apis/apps/v1"}[resource]
+	if apiPrefix == "" {
+		return "", fmt.Errorf("unsupported UID-preconditioned delete resource %q", resource)
+	}
+	return apiPrefix + "/namespaces/" + url.PathEscape(namespace) + "/" + resource + "/" + url.PathEscape(name), nil
 }
 
 func probeUIDGone(uid string, current obj) bool {
