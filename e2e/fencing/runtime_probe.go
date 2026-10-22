@@ -321,7 +321,7 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	if first.Binding.RuntimeID != fencing.RuntimeIdentity(profile.RuntimeName, profile.RuntimeVersion, profile.RuntimeAPIVersion) {
+	if first.Binding.RuntimeID != cri.RuntimeIdentity(profile.RuntimeName, profile.RuntimeVersion, profile.RuntimeAPIVersion) {
 		return fmt.Errorf("runtime enrollment differs from captured CRI profile")
 	}
 	if first.Binding.Validate(identity) != nil || first.Binding.NodeName != nodeName || first.Binding.ContainerID != containerID || first.Binding.ImageID != imageID ||
