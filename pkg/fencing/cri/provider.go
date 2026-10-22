@@ -419,7 +419,7 @@ func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, req
 // and persisted by the authenticated agent under the immutable binding.
 func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, procRoot, cgroupRoot string, scope CgroupScope) (StopObservation, error) {
 	observation := StopObservation{Runtime: binding, Request: request}
-	if p == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
+	if p == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
 		return observation, fmt.Errorf("%w: enrolled cgroup belongs to another runtime binding", ErrUnverified)
 	}
 	if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
@@ -446,7 +446,7 @@ func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.Runti
 	observation := StopObservation{Runtime: binding, Request: request, CgroupScope: scope}
 	digest, digestErr := hex.DecodeString(request.RequestHash)
 	if p == nil || p.client == nil || p.host == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || request.OperationID == "" || digestErr != nil || len(digest) != sha256.Size ||
-		scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
+		scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
 		return observation, fmt.Errorf("%w: resumed stop intent differs from captured scope", ErrUnverified)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)

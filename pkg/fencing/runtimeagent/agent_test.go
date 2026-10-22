@@ -33,6 +33,8 @@ type testBackend struct {
 	crashAfterEffect        bool
 	terminal                bool
 	receipt                 json.RawMessage
+	scope                   json.RawMessage
+	changeBinding           func(*fencing.RuntimeBinding)
 	onStop                  func()
 }
 
@@ -43,7 +45,15 @@ func (b *testBackend) Enroll(_ context.Context, base fencing.RuntimeBinding) (fe
 	}
 	base.NodeUID, base.MachineID, base.BootID = "node-uid", "machine", "boot"
 	base.RuntimeID, base.SandboxID = "cri-profile", "sandbox"
-	return base, json.RawMessage(`{"path":"pod-a","dev":1,"ino":2}`), nil
+	if b.changeBinding != nil {
+		b.changeBinding(&base)
+	}
+	if len(b.scope) != 0 {
+		return base, append(json.RawMessage(nil), b.scope...), nil
+	}
+	scope, err := json.Marshal(cri.CgroupScope{Path: "kubepods/pod-a", Dev: 1, Ino: 2, PID: 123, StartTime: 789,
+		RuntimeHash: fencing.RuntimeScopeBindingDigest(base), ProfileID: "qualified-test-profile"})
+	return base, scope, err
 }
 
 func TestEnrollmentFailureReturnsGenericConflictAndOnlyAllowlistedDiagnostic(t *testing.T) {
@@ -116,6 +126,135 @@ func (b *testBackend) ResumeStop(context.Context, fencing.RuntimeBinding, fencin
 func testBaseBinding() fencing.RuntimeBinding {
 	return fencing.RuntimeBinding{AuthorityID: "authority", NamespaceUID: "namespace-uid", BindingUID: "binding-uid", StatefulSetUID: "statefulset-uid", SourceClusterID: "source",
 		NodeID: "rhiza-0", PodUID: "pod-uid", RunID: strings.Repeat("a", 32), NodeName: "node-a", ContainerID: "containerd://container", ImageID: "image-digest"}
+}
+
+func testServiceConfig(dir string, backend Backend) Config {
+	return Config{AuthorityID: "authority", AuthorityNamespace: "rhiza", AuthorityServiceAccount: "rhiza-fencer", AuthorityWorkloadUID: "authority-deployment-uid",
+		Audience: "rhiza-runtime-agent", Directory: dir,
+		Auth:    testAuth{principal: Principal{Username: "system:serviceaccount:rhiza:rhiza-fencer", PodUID: "authority-pod", WorkloadUID: "authority-deployment-uid", Audiences: []string{"rhiza-runtime-agent"}}},
+		Backend: backend}
+}
+
+func TestStopRecapturesMissingDirectoryOnlyForExactLiveScope(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &testBackend{}
+	cfg := testServiceConfig(dir, backend)
+	service, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := service.enroll(t.Context(), testBaseBinding())
+	if err != nil || !validDigest(binding.CapturedScopeDigest) {
+		t.Fatalf("initial enrollment lacks captured-scope digest: binding=%+v err=%v", binding, err)
+	}
+	request := fencing.StopRequest{OperationID: "closed-op", RequestHash: strings.Repeat("b", 64), Identity: fencing.Identity{
+		SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, WALIdentity: "wal"}}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.onStop = func() {
+		stored, readErr := restarted.read(enrollmentKey(binding))
+		if readErr != nil || stored.Binding != binding || stored.Stop == nil || *stored.Stop != request || rawDigest(stored.Scope) != binding.CapturedScopeDigest {
+			t.Errorf("stop effect began before exact binding, scope, and intent were durable: %+v %v", stored, readErr)
+		}
+	}
+	receipt, err := restarted.stop(t.Context(), binding, request)
+	if err != nil || len(receipt) == 0 || backend.enrolls != 2 || backend.stops != 1 {
+		t.Fatalf("missing live enrollment was not recaptured exactly once: receipt=%s err=%v enrolls=%d stops=%d", receipt, err, backend.enrolls, backend.stops)
+	}
+	if err := restarted.verify(binding, request, receipt); err != nil {
+		t.Fatalf("recaptured exact stop receipt did not verify: %v", err)
+	}
+	if _, err := restarted.stop(t.Context(), binding, request); err != nil || backend.enrolls != 2 || backend.stops != 1 {
+		t.Fatalf("saved receipt was not reused: err=%v enrolls=%d stops=%d", err, backend.enrolls, backend.stops)
+	}
+}
+
+func TestStopDoesNotRecaptureCorruptOrMismatchedEnrollment(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		corrupt   bool
+		legacy    bool
+		enrollErr error
+		change    func(*testBackend)
+	}{
+		{name: "corrupt state", corrupt: true},
+		{name: "legacy binding lacks scope digest", legacy: true},
+		{name: "CRI not found", enrollErr: errors.New("container not found")},
+		{name: "measured binding changed", change: func(backend *testBackend) {
+			backend.changeBinding = func(binding *fencing.RuntimeBinding) { binding.SandboxID = "replacement-sandbox" }
+		}},
+		{name: "measured scope changed", change: func(backend *testBackend) {
+			backend.scope, _ = json.Marshal(cri.CgroupScope{Path: "kubepods/other", Dev: 1, Ino: 3, PID: 123, StartTime: 789,
+				RuntimeHash: fencing.RuntimeScopeBindingDigest(testMeasuredBinding(testBaseBinding())), ProfileID: "qualified-test-profile"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			backend := &testBackend{}
+			cfg := testServiceConfig(dir, backend)
+			service, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding, err := service.enroll(t.Context(), testBaseBinding())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := fencing.StopRequest{OperationID: "closed-op", RequestHash: strings.Repeat("c", 64), Identity: fencing.Identity{
+				SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}}
+			if test.corrupt {
+				if err := os.WriteFile(filepath.Join(dir, enrollmentKey(binding)+".json"), []byte("{"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Remove(filepath.Join(dir, enrollmentKey(binding)+".json")); err != nil {
+				t.Fatal(err)
+			}
+			if test.legacy {
+				binding.CapturedScopeDigest = ""
+			}
+			backend.enrollErr = test.enrollErr
+			if test.change != nil {
+				test.change(backend)
+			}
+			if _, err := service.stop(t.Context(), binding, request); err == nil {
+				t.Fatal("unsafe recapture returned terminal evidence")
+			}
+			wantEnrolls := 2
+			if test.corrupt || test.legacy {
+				wantEnrolls = 1
+			}
+			if backend.enrolls != wantEnrolls || backend.stops != 0 {
+				t.Fatalf("unsafe recapture reached stop: enrolls=%d want=%d stops=%d", backend.enrolls, wantEnrolls, backend.stops)
+			}
+			stored, readErr := service.read(enrollmentKey(binding))
+			if test.corrupt {
+				if readErr == nil {
+					t.Fatal("corrupt local state was overwritten")
+				}
+			} else if errors.Is(readErr, os.ErrNotExist) {
+				return
+			} else if readErr != nil || stored.Stop != nil || len(stored.Receipt) != 0 {
+				t.Fatalf("failed recapture persisted stop/receipt: %+v err=%v", stored, readErr)
+			}
+		})
+	}
+}
+
+func testMeasuredBinding(base fencing.RuntimeBinding) fencing.RuntimeBinding {
+	base.NodeUID, base.MachineID, base.BootID = "node-uid", "machine", "boot"
+	base.RuntimeID, base.SandboxID = "cri-profile", "sandbox"
+	return base
 }
 
 func TestDurableExactReceiptIsRecoveredBeforeBackendAfterRestart(t *testing.T) {

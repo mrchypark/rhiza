@@ -25,6 +25,14 @@ register returns and before the supervised child is launched. For stop, the
 agent keys a durable fsync'd receipt by the exact binding and complete
 StopRequest. It checks this receipt before querying CRI, allowing a lost HTTP
 response or later CRI metadata collection to recover the original receipt.
+The returned binding also contains a root-pinned SHA-256 digest of the exact
+captured cgroup-scope JSON bytes. If the agent's enrollment directory is lost,
+it may reconstruct that record only by remeasuring the same live runtime and
+matching both the entire immutable binding and the captured-scope digest. It
+persists the reconstructed record and exact stop intent before issuing the CRI
+stop. A legacy binding without the digest, corrupt local state, a changed
+runtime/scope, or CRI NotFound cannot use this recovery path and remains
+pending; none of these conditions is evidence that the runtime stopped.
 Without a matching saved receipt, unavailable/missing CRI metadata and any
 unverified or live cgroup descendant remain pending; Pod deletion or an empty
 sample is not terminal proof. This retained receipt alone does not establish

@@ -6,22 +6,23 @@ import "fmt"
 // It belongs to one run, even when several runs share a Pod UID. The eventual
 // WAL binding stays in Run.Identity and cannot change this runtime incarnation.
 type RuntimeBinding struct {
-	AuthorityID     string `json:"authorityID"`
-	NamespaceUID    string `json:"namespaceUID"`
-	BindingUID      string `json:"bindingUID"`
-	StatefulSetUID  string `json:"statefulSetUID"`
-	SourceClusterID string `json:"sourceClusterID"`
-	NodeID          string `json:"nodeID"`
-	PodUID          string `json:"podUID"`
-	RunID           string `json:"runID"`
-	NodeName        string `json:"nodeName"`
-	NodeUID         string `json:"nodeUID"`
-	MachineID       string `json:"machineID"`
-	BootID          string `json:"bootID"`
-	RuntimeID       string `json:"runtimeID"`
-	SandboxID       string `json:"sandboxID"`
-	ContainerID     string `json:"containerID"`
-	ImageID         string `json:"imageID"`
+	AuthorityID         string `json:"authorityID"`
+	NamespaceUID        string `json:"namespaceUID"`
+	BindingUID          string `json:"bindingUID"`
+	StatefulSetUID      string `json:"statefulSetUID"`
+	SourceClusterID     string `json:"sourceClusterID"`
+	NodeID              string `json:"nodeID"`
+	PodUID              string `json:"podUID"`
+	RunID               string `json:"runID"`
+	NodeName            string `json:"nodeName"`
+	NodeUID             string `json:"nodeUID"`
+	MachineID           string `json:"machineID"`
+	BootID              string `json:"bootID"`
+	RuntimeID           string `json:"runtimeID"`
+	SandboxID           string `json:"sandboxID"`
+	ContainerID         string `json:"containerID"`
+	ImageID             string `json:"imageID"`
+	CapturedScopeDigest string `json:"capturedScopeDigest,omitempty"`
 }
 
 func (b RuntimeBinding) Validate(id Identity) error {
@@ -36,6 +37,9 @@ func (b RuntimeBinding) Validate(id Identity) error {
 		if value == "" {
 			return fmt.Errorf("fencing: runtime enrollment is incomplete")
 		}
+	}
+	if b.CapturedScopeDigest != "" && !mutationDigestValid(b.CapturedScopeDigest) {
+		return fmt.Errorf("fencing: runtime cgroup scope digest is invalid")
 	}
 	return nil
 }

@@ -150,6 +150,18 @@ func TestRuntimeAgentDiagnosticsAllowRuntimeProfileAndBindingFailures(t *testing
 	}
 }
 
+func TestRuntimeAgentDiagnosticsAllowCapturedScopeDigestMismatch(t *testing.T) {
+	view := fencerDiagnosticsView{}
+	view.RuntimeAgent.PodName = "rhiza-runtime-agent-abc"
+	view.RuntimeAgent.PodUID = "runtime-agent-pod-uid"
+	view.RuntimeAgent.Logs.Captured = true
+	view.RuntimeAgent.Logs.SHA256 = strings.Repeat("a", 64)
+	view.RuntimeAgent.Diagnostics = []runtimeAgentEnrollmentDiagnostic{{Stage: "backend_result_validation", Code: "scope_digest_mismatch"}}
+	if _, err := safeJSON("fencer-diagnostics.json", encoded(view)); err != nil {
+		t.Fatalf("allowlisted captured-scope digest mismatch was rejected: %v", err)
+	}
+}
+
 func TestFailedEarlyRunKeepsExitReceiptWithoutRuntimeProfile(t *testing.T) {
 	raw := t.TempDir()
 	for name, data := range map[string][]byte{
@@ -220,7 +232,7 @@ func TestRunScriptCapturesBoundedOwnedDiagnosticsBeforeDeletingKind(t *testing.T
 		"diagnostics_dir/authority-current.log",
 		"get deployment rhiza-fencer",
 		"runtime-agent-current.log",
-		"owner == \"DaemonSet\" and .name == \"rhiza-runtime-agent\" and .uid == $owner",
+		".kind == \"DaemonSet\" and .name == \"rhiza-runtime-agent\" and .uid == $owner",
 		"logs \"$runtime_agent_pod_name\" -c runtime-agent --prefix --tail=200 --limit-bytes=65536",
 		"get pod \"$runtime_agent_pod_name\" -o json",
 		"runtime_agent_after_ds_uid=$(k --request-timeout=10s get daemonset rhiza-runtime-agent -o jsonpath='{.metadata.uid}'",

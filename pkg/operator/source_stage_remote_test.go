@@ -159,7 +159,7 @@ func TestAuthorityEvidenceStoreStableRootAndGenerationCAS(t *testing.T) {
 	data, err := io.ReadAll(r)
 	_ = r.Close()
 	if err != nil || gotGeneration == nil || generation == nil || *gotGeneration != *generation || string(data) != `{"v":1}` {
-		t.Fatalf("read=%q generation=%d err=%v", data, gotGeneration, err)
+		t.Fatalf("read=%q generation=%v err=%v", data, gotGeneration, err)
 	}
 	if _, err := a.CompareAndSwap(ctx, "producer/root.json", generation, []byte(`{"v":2}`)); err != nil {
 		t.Fatal(err)
