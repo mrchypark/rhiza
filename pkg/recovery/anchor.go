@@ -171,7 +171,7 @@ func VerifyGenerationAnchor(ctx context.Context, bucket objstore.Bucket, prefix 
 	if err != nil || !ok || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor does not match fork result")
 	}
-	archive := NewManager(bucket, prefix, 1)
+	archive := NewManager(bucket, prefix, ArchiveConfigID)
 	defer archive.Close()
 	if err := archive.Load(ctx); err != nil {
 		return GenerationAnchor{}, err
@@ -227,7 +227,7 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 	if bucket == nil || operationID == "" || len(sourceBootstrap.Members) == 0 || targetMembership.Version != MembershipRecordVersion || result.Tip == 0 || !validForkHash(result.ManifestHash) || result.PrefixHash != "" && !validForkHash(result.PrefixHash) {
 		return GenerationAnchor{}, fmt.Errorf("invalid generation materialization")
 	}
-	source := NewManager(bucket, sourcePrefix, 1)
+	source := NewManager(bucket, sourcePrefix, ArchiveConfigID)
 	defer source.Close()
 	if err := source.Load(ctx); err != nil {
 		return GenerationAnchor{}, err
@@ -440,7 +440,7 @@ func MaterializeGeneration(ctx context.Context, bucket objstore.Bucket, result F
 	if err != nil || stored != anchor {
 		return GenerationAnchor{}, fmt.Errorf("generation anchor conflict")
 	}
-	target := NewManager(bucket, targetPrefix, 1)
+	target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 	defer target.Close()
 	if err := target.InitializeFencedGeneration(ctx, quepaxa.Slot(result.Tip), prefix, anchorHash); err != nil {
 		return GenerationAnchor{}, err
@@ -534,7 +534,7 @@ func resumeMaterializedGeneration(ctx context.Context, bucket objstore.Bucket, r
 		if err != nil {
 			return GenerationAnchor{}, false, err
 		}
-		target := NewManager(bucket, targetPrefix, 1)
+		target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 		defer target.Close()
 		if err := target.Load(ctx); err != nil {
 			return GenerationAnchor{}, false, fmt.Errorf("load interrupted target archive: %w", err)
@@ -560,7 +560,7 @@ func resumeMaterializedGeneration(ctx context.Context, bucket objstore.Bucket, r
 	if err != nil {
 		return GenerationAnchor{}, false, err
 	}
-	target := NewManager(bucket, targetPrefix, 1)
+	target := NewManager(bucket, targetPrefix, ArchiveConfigID)
 	defer target.Close()
 	if err := target.Load(ctx); err != nil {
 		return GenerationAnchor{}, false, err

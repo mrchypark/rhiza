@@ -27,6 +27,10 @@ import (
 )
 
 const (
+	// ArchiveConfigID is the immutable shared-archive lineage identity. It is
+	// distinct from QuePaxa's ConfigID, which changes with membership.
+	ArchiveConfigID uint = 1
+
 	maxExtentSize      = 8 << 20
 	maxExtentItems     = 1024
 	maxExtentPayload   = maxExtentSize - extentHeaderSize - archiveCRCSize - 8

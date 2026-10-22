@@ -1349,6 +1349,38 @@ func TestArchiveHeadV2StrictnessAndProofIdentity(t *testing.T) {
 	}
 }
 
+func TestValidateEmptyArchiveHead(t *testing.T) {
+	empty, err := EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateEmptyArchiveHead(empty, ArchiveConfigID); err != nil {
+		t.Fatalf("valid empty archive head: %v", err)
+	}
+	if err := ValidateEmptyArchiveHead(empty, ArchiveConfigID+1); err == nil {
+		t.Fatal("accepted a different archive config ID")
+	}
+	if err := ValidateEmptyArchiveHead(empty, 0); err == nil {
+		t.Fatal("accepted an unspecified expected config ID")
+	}
+
+	for name, head := range map[string]archiveHead{
+		"generation": {ConfigID: ArchiveConfigID, Generation: 2},
+		"tip":        {ConfigID: ArchiveConfigID, Generation: 1, Tip: 1, TailHash: [32]byte{1}, TailObject: 1},
+		"sealed":     {ConfigID: ArchiveConfigID, Sealed: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, err := encodeHead(head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateEmptyArchiveHead(data, ArchiveConfigID); err == nil {
+				t.Fatal("accepted non-empty archive head")
+			}
+		})
+	}
+}
+
 func TestArchiveTrimRejectsOversizePayloadWithoutAdvancing(t *testing.T) {
 	manager := NewManager(objstore.NewInMemBucket(), "cluster", 1)
 	defer manager.Close()
@@ -1545,6 +1577,13 @@ func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := objstore.NewInMemBucket()
+	emptyHead, err := EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Upload(ctx, "cluster/archive/head.bin", bytes.NewReader(emptyHead), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
 	builder := NewManager(base, "cluster", 1)
 	extent, data, _, err := builder.buildExtent(core, 1, 1, [32]byte{}, 0)
 	if err != nil {
@@ -1561,7 +1600,16 @@ func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
 	}
 	gcDone := make(chan error, 1)
 	go func() { gcDone <- gc.Cleanup(ctx, 0) }()
-	<-bucket.started
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(bucket.release) }) }
+	defer release()
+	select {
+	case <-bucket.started:
+	case err := <-gcDone:
+		t.Fatalf("cleanup finished before reaching stale candidate delete: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cleanup to reach stale candidate delete")
+	}
 	stale, err := gc.readGCLock(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1584,7 +1632,7 @@ func TestStaleArchiveCleanupCannotDeleteRepublishedExtent(t *testing.T) {
 	if err := publisher.releaseGCLock(ctx, successor); err != nil {
 		t.Fatal(err)
 	}
-	close(bucket.release)
+	release()
 	if err := <-gcDone; err != nil {
 		t.Fatal(err)
 	}

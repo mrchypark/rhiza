@@ -133,7 +133,7 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	if intent.Durability == "async" && !intent.Policy.AllowDataLoss {
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "async generation escalation requires allowDataLoss")
 	}
-	archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), 1)
+	archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), recovery.ArchiveConfigID)
 	err = archive.Load(ctx)
 	tip := archive.Tip()
 	archive.Close()

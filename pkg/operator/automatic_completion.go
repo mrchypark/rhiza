@@ -83,7 +83,7 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 	if decodeErr != nil || trailingErr != io.EOF || closeErr != nil || lineage.Version != 1 || lineage.OperationID != c.operationID(child) || lineage.Source != child.Spec.SourceClusterID || lineage.SourceDurability != child.Status.SourceDurability || lineage.SourceMembership != child.Status.SourceMembership || lineage.TargetMembership != registered || lineage.Fork.Tip != child.Status.RecoveredTip || lineage.Fork.ManifestHash != child.Status.ManifestHash || lineage.Fork.PrefixHash == "" {
 		return fmt.Errorf("immutable generation lineage differs from completed fork")
 	}
-	source := recovery.NewManager(c.Bucket, path.Join(c.Prefix, child.Spec.SourceClusterID), 1)
+	source := recovery.NewManager(c.Bucket, path.Join(c.Prefix, child.Spec.SourceClusterID), recovery.ArchiveConfigID)
 	defer source.Close()
 	if err := source.Load(ctx); err != nil || !source.Sealed() || uint64(source.Tip()) != child.Status.RecoveredTip {
 		return fmt.Errorf("source is not sealed at the completed fork tip")

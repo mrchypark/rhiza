@@ -959,7 +959,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 			return block(state, "failed voter identity has not been authenticated")
 		}
 		if failed == "" {
-			archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), 1)
+			archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), recovery.ArchiveConfigID)
 			err := archive.Load(ctx)
 			tip := archive.Tip()
 			archive.Close()
