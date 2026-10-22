@@ -35,13 +35,17 @@ type HostIdentity struct {
 // Profile pins a runtime/kernel combination for subsequent qualification. Merely
 // setting these strings does not qualify the combination or its process isolation.
 type Profile struct {
-	Namespace         string
-	ContainerName     string
-	RuntimeName       string
-	RuntimeVersion    string
-	RuntimeAPIVersion string
-	KernelRelease     string
-	GraceSeconds      int64
+	Namespace             string
+	ContainerName         string
+	RuntimeName           string
+	RuntimeVersion        string
+	RuntimeAPIVersion     string
+	ContainerdRuntimeType string
+	// CgroupProfileID names an administrator-qualified private cgroup-v2
+	// profile; a non-empty value is an assertion, not proof of no-escape.
+	CgroupProfileID string
+	KernelRelease   string
+	GraceSeconds    int64
 }
 
 // False flags mean not verified, not proof that a scope is alive. This is a
@@ -120,6 +124,66 @@ func (p *Provider) verifyVersion(ctx context.Context, binding fencing.RuntimeBin
 		return fmt.Errorf("%w: enrolled runtime/API version differs", ErrUnverified)
 	}
 	return nil
+}
+
+// CaptureCgroupScope maps a containerd verbose-status PID to its live host
+// cgroup. The exact containerd runtime/API version and runtime type must be
+// pinned in Profile; CRI's generic Info map is not accepted for other runtimes.
+func (p *Provider) CaptureCgroupScope(ctx context.Context, binding fencing.RuntimeBinding, procRoot, cgroupRoot string) (CgroupScope, error) {
+	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
+	if p == nil || p.client == nil || p.host == nil || p.profile.RuntimeName != "containerd" || p.profile.ContainerdRuntimeType == "" || p.profile.CgroupProfileID == "" || binding.Validate(identity) != nil {
+		return CgroupScope{}, fmt.Errorf("%w: qualified containerd cgroup capture is not configured", ErrUnverified)
+	}
+	containerID := strings.TrimPrefix(binding.ContainerID, p.profile.RuntimeName+"://")
+	if containerID == "" || strings.Contains(containerID, "://") {
+		return CgroupScope{}, fmt.Errorf("%w: runtime container ID differs", ErrUnverified)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := p.verifyHost(ctx, binding); err != nil {
+		return CgroupScope{}, err
+	}
+	if err := p.verifyVersion(ctx, binding); err != nil {
+		return CgroupScope{}, err
+	}
+	if err := p.inspect(ctx, binding, containerID, false); err != nil {
+		return CgroupScope{}, err
+	}
+	pid, err := p.containerdPID(ctx, binding, containerID)
+	if err != nil {
+		return CgroupScope{}, err
+	}
+	scope, err := captureCgroupScope(procRoot, cgroupRoot, pid, binding, p.profile.CgroupProfileID)
+	if err != nil {
+		return CgroupScope{}, err
+	}
+	secondPID, err := p.containerdPID(ctx, binding, containerID)
+	if err != nil || secondPID != pid || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
+		return CgroupScope{}, fmt.Errorf("%w: containerd PID changed during cgroup capture", ErrUnverified)
+	}
+	if err := p.inspect(ctx, binding, containerID, false); err != nil {
+		return CgroupScope{}, err
+	}
+	if err := p.verifyHost(ctx, binding); err != nil {
+		return CgroupScope{}, err
+	}
+	if err := p.verifyVersion(ctx, binding); err != nil {
+		return CgroupScope{}, err
+	}
+	return scope, nil
+}
+
+func (p *Provider) containerdPID(ctx context.Context, binding fencing.RuntimeBinding, containerID string) (uint32, error) {
+	response, err := p.client.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: containerID, Verbose: true})
+	if err != nil || response == nil || response.Status == nil || response.Status.Id != containerID || response.Status.Metadata == nil ||
+		response.Status.Metadata.Name != p.profile.ContainerName || response.Status.ImageRef != binding.ImageID || response.Status.State != runtimeapi.ContainerState_CONTAINER_RUNNING {
+		return 0, fmt.Errorf("%w: verbose container status identity differs", ErrUnverified)
+	}
+	pid, err := containerdPIDFromBinding(binding, response.Info, p.profile.ContainerdRuntimeType)
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
 }
 
 func (p *Provider) inspect(ctx context.Context, binding fencing.RuntimeBinding, containerID string, stopped bool) error {
@@ -242,6 +306,29 @@ func (p *Provider) Stop(ctx context.Context, binding fencing.RuntimeBinding, req
 		return observation, err
 	}
 	observation.ContainerExited, observation.SandboxNotReady = true, true
+	observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	return observation, nil
+}
+
+// StopInCgroup is the qualified Linux path: it requires the exact enrolled
+// cgroup inode to be populated before stopping and empty afterward. CgroupScope
+// must have been captured from this container's host PID before child startup
+// and persisted by the authenticated agent under the immutable binding.
+func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, procRoot, cgroupRoot string, scope CgroupScope) (StopObservation, error) {
+	observation := StopObservation{Runtime: binding, Request: request}
+	if p == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
+		return observation, fmt.Errorf("%w: enrolled cgroup belongs to another runtime binding", ErrUnverified)
+	}
+	if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
+		return observation, err
+	}
+	observation, err := p.Stop(ctx, binding, request)
+	if err != nil {
+		return observation, err
+	}
+	if err := scope.VerifyEmpty(cgroupRoot); err != nil {
+		return observation, err
+	}
 	observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return observation, nil
 }

@@ -84,6 +84,8 @@ func serve(ctx context.Context, args []string) error {
 	attestorURL := f.String("attestor-url", os.Getenv("RHIZA_FENCE_ATTESTOR_URL"), "unsupported legacy v1 attestor endpoint")
 	attestorToken := f.String("attestor-token-file", os.Getenv("RHIZA_FENCE_ATTESTOR_TOKEN_FILE"), "unsupported legacy v1 attestor token")
 	attestorCA := f.String("attestor-ca-file", os.Getenv("RHIZA_FENCE_ATTESTOR_CA_FILE"), "unsupported legacy v1 attestor CA")
+	stageDir := f.String("source-stage-dir", os.Getenv("FENCER_SOURCE_STAGE_DIR"), "pre-provisioned local POSIX source staging directory")
+	stageIncarnation := f.String("source-stage-incarnation", os.Getenv("FENCER_SOURCE_STAGE_INCARNATION"), "pinned source staging incarnation digest")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -98,6 +100,17 @@ func serve(ctx context.Context, args []string) error {
 		return err
 	}
 	executor := &operator.FencingExecutor{Kube: kube}
+	if (*stageDir == "") != (*stageIncarnation == "") {
+		return fmt.Errorf("source staging requires both directory and pinned incarnation")
+	}
+	if *stageDir != "" {
+		store, err := operator.OpenSourceStageStore(*stageDir, *stageIncarnation)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		executor.SourceStages = store
+	}
 	server := &http.Server{Addr: *listen, Handler: executor.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 35 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	defer server.Close()
 	serving := make(chan error, 1)
