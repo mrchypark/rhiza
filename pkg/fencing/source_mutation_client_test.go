@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -25,11 +27,18 @@ type sourceMutationFake struct {
 	pendingDispatch bool
 	lookupErr       error
 	beforeAdmit     func() error
+	beforeReserve   func(string) error
+	beforeSeal      func(string, []byte) error
 }
 
-func (f *sourceMutationFake) ReserveUpload(ctx context.Context, _ string, _ MutationIntent) error {
+func (f *sourceMutationFake) ReserveUpload(ctx context.Context, ticket string, _ MutationIntent) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if f.beforeReserve != nil {
+		if err := f.beforeReserve(ticket); err != nil {
+			return err
+		}
 	}
 	f.reserves++
 	return f.reserveErr
@@ -38,6 +47,11 @@ func (f *sourceMutationFake) ReserveUpload(ctx context.Context, _ string, _ Muta
 func (f *sourceMutationFake) SealUpload(ctx context.Context, ticket string, payload []byte) (sourceSealedPayload, error) {
 	if err := ctx.Err(); err != nil {
 		return sourceSealedPayload{}, err
+	}
+	if f.beforeSeal != nil {
+		if err := f.beforeSeal(ticket, payload); err != nil {
+			return sourceSealedPayload{}, err
+		}
 	}
 	f.seals++
 	digest := sha256.Sum256(payload)
@@ -69,31 +83,31 @@ func (f *sourceMutationFake) Admit(ctx context.Context, sequence uint64, intent 
 	return nil
 }
 
-func (f *sourceMutationFake) Lookup(ctx context.Context, sequence uint64, intent MutationIntent) (MutationEntry, bool, bool, error) {
+func (f *sourceMutationFake) Lookup(ctx context.Context, sequence uint64, intent MutationIntent) (MutationLookupResult, error) {
 	if err := ctx.Err(); err != nil {
-		return MutationEntry{}, false, false, err
+		return MutationLookupResult{}, err
 	}
 	if f.lookupErr != nil && f.producer.LastAdmitted > 0 {
-		return MutationEntry{}, false, false, f.lookupErr
+		return MutationLookupResult{}, f.lookupErr
 	}
 	if entry, ok := f.archivedEntries[sequence]; ok {
 		if entry.Intent != intent {
-			return MutationEntry{}, false, true, errors.New("archived tuple mismatch")
+			return MutationLookupResult{}, errors.New("archived tuple mismatch")
 		}
-		return entry, true, true, nil
+		return MutationLookupResult{Found: true, Archived: true, CompactedThrough: f.producer.CompactedThrough, ArchiveHead: f.producer.ArchiveHead, Entry: &entry}, nil
 	}
 	entry, ok := f.producer.Entries[sequence]
 	if !ok {
-		return MutationEntry{}, false, false, nil
+		return MutationLookupResult{CompactedThrough: f.producer.CompactedThrough, ArchiveHead: f.producer.ArchiveHead}, nil
 	}
 	if entry.Intent != intent {
-		return MutationEntry{}, false, false, errors.New("tuple mismatch")
+		return MutationLookupResult{}, errors.New("tuple mismatch")
 	}
 	entry, err := f.resolve(sequence)
 	if err != nil {
-		return MutationEntry{}, false, false, err
+		return MutationLookupResult{}, err
 	}
-	return entry, true, false, nil
+	return MutationLookupResult{Found: true, CompactedThrough: f.producer.CompactedThrough, ArchiveHead: f.producer.ArchiveHead, Entry: &entry}, nil
 }
 
 func (f *sourceMutationFake) resolve(sequence uint64) (MutationEntry, error) {
@@ -205,6 +219,23 @@ func TestSourceMutationClientLostAdmissionResponseReopensSameTuple(t *testing.T)
 
 func TestSourceMutationClientFsyncsTupleBeforeFirstAdmission(t *testing.T) {
 	client, fake, _, _ := newSourceMutationClientTest(t)
+	fake.beforeReserve = func(ticket string) error {
+		for _, stage := range client.state.data.Stages {
+			if stage.Ticket != ticket || stage.LocalPayload == nil {
+				continue
+			}
+			data, err := os.ReadFile(client.state.dir + "/" + stage.LocalPayload.Ref)
+			if err != nil {
+				return err
+			}
+			digest := sha256.Sum256(data)
+			if int64(len(data)) != stage.LocalPayload.Size || hex.EncodeToString(digest[:]) != stage.LocalPayload.Digest {
+				return fmt.Errorf("local payload was not durably retained before reservation")
+			}
+			return nil
+		}
+		return fmt.Errorf("reservation preceded local payload persistence")
+	}
 	fake.beforeAdmit = func() error {
 		data, err := os.ReadFile(client.state.dir + "/retry.json")
 		if err != nil {
@@ -222,6 +253,87 @@ func TestSourceMutationClientFsyncsTupleBeforeFirstAdmission(t *testing.T) {
 	fake.result = &MutationResolution{Outcome: MutationCommitted, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true}
 	if err := client.Upload(context.Background(), bootstrapDraft("run", "registration"), []byte("{}")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSourceMutationClientRecoversLostSealResponseFromDurableBytes(t *testing.T) {
+	client, fake, binding, dir := newSourceMutationClientTest(t)
+	draft, payload := bootstrapDraft("run-1", "registration-a"), []byte(`{"node":"a"}`)
+	fileSyncs := 0
+	client.state.syncFile = func(file *os.File) error {
+		fileSyncs++
+		if fileSyncs == 3 { // ticket, local payload, then post-seal descriptor
+			return errors.New("simulated descriptor fsync failure")
+		}
+		return file.Sync()
+	}
+	if err := client.Upload(context.Background(), draft, payload); err == nil || fake.admits != 0 || fake.seals != 1 {
+		t.Fatalf("lost local descriptor was treated as admitted: seals=%d admits=%d err=%v", fake.seals, fake.admits, err)
+	}
+	client.state = reopenSourceRetryTest(t, client.state, binding, dir)
+	fake.result = &MutationResolution{Outcome: MutationCommitted, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true}
+	if err := client.Upload(context.Background(), draft, payload); err != nil {
+		t.Fatalf("replay from durable original bytes: %v", err)
+	}
+	if fake.seals != 2 || fake.admits != 1 || len(client.state.data.Steps) != 1 || client.state.data.Steps[0].Sequence != 1 {
+		t.Fatalf("seal recovery changed owner sequence or admission: seals=%d admits=%d steps=%+v", fake.seals, fake.admits, client.state.data.Steps)
+	}
+}
+
+func TestSourceRetryReopenRejectsMissingOrCorruptOriginalPayload(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing", true: "corrupt"}[corrupt], func(t *testing.T) {
+			state, binding, dir := newSourceRetryTest(t)
+			draft, payload := bootstrapDraft("run-1", "registration-a"), []byte(`{"node":"a"}`)
+			stage, err := state.reserveUploadWithPayload(uploadStageDraft(draft), payload)
+			mustJournal(t, err)
+			if stage.LocalPayload == nil {
+				t.Fatal("local source payload descriptor missing")
+			}
+			mustJournal(t, state.Close())
+			path := filepath.Join(dir, stage.LocalPayload.Ref)
+			if corrupt {
+				mustJournal(t, os.WriteFile(path, []byte("altered"), 0600))
+			} else {
+				mustJournal(t, os.Remove(path))
+			}
+			if unexpected, err := openSourceRetryState(dir, binding); err == nil {
+				_ = unexpected.Close()
+				t.Fatal("missing or corrupt original source bytes were accepted")
+			}
+		})
+	}
+}
+
+func TestSourceRetryRestoresPayloadOnlyBeforeAnyRemoteStageCall(t *testing.T) {
+	state, binding, dir := newSourceRetryTest(t)
+	draft, payload := bootstrapDraft("run-1", "registration-a"), []byte(`{"node":"a"}`)
+	stage, err := state.reserveUploadWithPayload(uploadStageDraft(draft), payload)
+	mustJournal(t, err)
+	mustJournal(t, state.Close())
+	mustJournal(t, os.Remove(filepath.Join(dir, stage.LocalPayload.Ref)))
+	state, err = openSourceRetryState(dir, binding)
+	mustJournal(t, err)
+	t.Cleanup(func() { mustJournal(t, state.Close()) })
+	if _, err := state.reserveUploadWithPayload(uploadStageDraft(draft), []byte(`{"node":"changed"}`)); err == nil {
+		t.Fatal("different bytes repaired the original pre-transport slot")
+	}
+	recovered, err := state.reserveUploadWithPayload(uploadStageDraft(draft), payload)
+	mustJournal(t, err)
+	if recovered.Ticket != stage.Ticket || recovered.LocalPayload == nil {
+		t.Fatal("matching retry did not restore the original stage descriptor")
+	}
+	got, err := state.readLocalPayload(*recovered.LocalPayload)
+	mustJournal(t, err)
+	if string(got) != string(payload) {
+		t.Fatal("restored original payload differs")
+	}
+	mustJournal(t, state.markStageRemoteStarted(stage.Ticket))
+	mustJournal(t, state.Close())
+	mustJournal(t, os.Remove(filepath.Join(dir, stage.LocalPayload.Ref)))
+	if unexpected, err := openSourceRetryState(dir, binding); err == nil {
+		_ = unexpected.Close()
+		t.Fatal("missing bytes after remote staging may have begun were accepted")
 	}
 }
 
@@ -316,6 +428,32 @@ func TestSourceMutationClientArchivedResultIsLookupOnly(t *testing.T) {
 	}
 	if fake.admits != 1 || len(fake.producer.Entries) != 0 || fake.producer.CompactedThrough != 1 || fake.archivedEntries[1].Resolution == nil {
 		t.Fatal("compacted archived result was not lookup-only")
+	}
+}
+
+func TestSourceMutationClientBootstrapOwnerRetiresAtFullArchiveCapacity(t *testing.T) {
+	client, fake, _, _ := newSourceMutationClientTest(t)
+	fake.result = &MutationResolution{Outcome: MutationCommitted, ReceiptDigest: journalTestDigest, AllCopiesTerminal: true}
+	for i := 0; i < MaxMutationJournalEntries; i++ {
+		owner := fmt.Sprintf("registration-%02d", i)
+		if err := client.Upload(context.Background(), bootstrapDraft("run", owner), []byte(owner)); err != nil {
+			t.Fatalf("bootstrap owner %s: %v", owner, err)
+		}
+	}
+	for sequence := uint64(1); sequence <= MaxMutationJournalEntries; sequence++ {
+		if err := fake.saveArchived(sequence); err != nil {
+			t.Fatalf("archive sequence %d: %v", sequence, err)
+		}
+	}
+	newDraft := bootstrapDraft("run", "registration-after-archive")
+	if err := client.Upload(context.Background(), newDraft, []byte("after")); err != nil {
+		t.Fatalf("archive watermark did not free bounded live capacity: %v", err)
+	}
+	if client.state.data.NextSequence != MaxMutationJournalEntries+2 || client.state.data.RetiredThrough != MaxMutationJournalEntries || len(client.state.data.Steps) != 1 {
+		t.Fatalf("capacity reuse reset or reconstructed the sequence: next=%d retired=%d steps=%d", client.state.data.NextSequence, client.state.data.RetiredThrough, len(client.state.data.Steps))
+	}
+	if err := client.Upload(context.Background(), bootstrapDraft("run", "registration-00"), []byte("registration-00")); err == nil {
+		t.Fatal("retired bootstrap owner was reused under a new sequence")
 	}
 }
 

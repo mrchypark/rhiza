@@ -155,7 +155,7 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 		host:        HostIdentity{NodeName: "node-0", NodeUID: "node-uid", MachineID: "machine", BootID: "boot", KernelRelease: "test-kernel"},
 		sandbox: &runtimeapi.PodSandboxStatus{Id: "sandbox-0", CreatedAt: 1, State: runtimeapi.PodSandboxState_SANDBOX_READY,
 			Metadata: &runtimeapi.PodSandboxMetadata{Name: "database", Namespace: "test", Uid: "pod-uid"},
-			Linux:    &runtimeapi.LinuxPodSandboxStatus{Namespaces: &runtimeapi.Namespace{Options: &runtimeapi.NamespaceOption{Pid: runtimeapi.NamespaceMode_CONTAINER}}}},
+			Linux:    &runtimeapi.LinuxPodSandboxStatus{Namespaces: &runtimeapi.Namespace{Options: &runtimeapi.NamespaceOption{Pid: runtimeapi.NamespaceMode_CONTAINER, Network: runtimeapi.NamespaceMode_POD, Ipc: runtimeapi.NamespaceMode_POD}}}},
 		container:  &runtimeapi.ContainerStatus{Id: "container-0", CreatedAt: 2, State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: "image-digest", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}},
 		containers: []*runtimeapi.Container{{Id: "container-0", PodSandboxId: "sandbox-0", State: runtimeapi.ContainerState_CONTAINER_RUNNING, ImageRef: "image-digest", Metadata: &runtimeapi.ContainerMetadata{Name: "database"}}},
 	}
@@ -354,6 +354,31 @@ func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 	if err != nil || !observation.ContainerExited || observation.ObservedAt == "" {
 		t.Fatalf("qualified execution scope was not verified: %+v %v", observation, err)
 	}
+	f.mu.Lock()
+	stopContainers, stopSandboxes := f.stopContainers, f.stopSandboxes
+	f.mu.Unlock()
+	recovered, err := p.ResumeStopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope)
+	if err != nil || !recovered.RecoveredTerminalState || !recovered.CgroupEmpty || recovered.CgroupScope != scope ||
+		recovered.ContainerStopAcknowledged || recovered.SandboxStopAcknowledged || !recovered.ContainerExited || !recovered.SandboxNotReady {
+		t.Fatalf("complete exact terminal state was not recoverable without repeating CRI stop: %+v %v", recovered, err)
+	}
+	f.mu.Lock()
+	if f.stopContainers != stopContainers || f.stopSandboxes != stopSandboxes {
+		f.mu.Unlock()
+		t.Fatal("terminal receipt recovery repeated a CRI side effect")
+	}
+	f.metadataGone = true
+	f.mu.Unlock()
+	if _, err := p.ResumeStopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("missing CRI terminal metadata was treated as proof: %v", err)
+	}
+	f.mu.Lock()
+	if f.stopContainers != stopContainers || f.stopSandboxes != stopSandboxes {
+		f.mu.Unlock()
+		t.Fatal("metadata loss triggered a new stop call")
+	}
+	f.metadataGone = false
+	f.mu.Unlock()
 	otherBinding := binding
 	otherBinding.RunID = "other-run"
 	otherRequest := request
@@ -412,6 +437,42 @@ func TestCRIContainerdEnrollmentCapturesPIDOnlyForExactBinding(t *testing.T) {
 	f.mu.Unlock()
 	if _, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("cross-sandbox containerd PID was accepted: %v", err)
+	}
+}
+
+func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
+	p, f, base, _ := newRuntimeFixture(t)
+	f.mu.Lock()
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
+	f.mu.Unlock()
+	base.NodeUID, base.MachineID, base.BootID, base.RuntimeID, base.SandboxID = "", "", "", "", ""
+	root := t.TempDir()
+	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
+	if err := os.MkdirAll(filepath.Join(cgroupRoot, "kubepods", "pod-0"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0")
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "kubepods", "pod-0", "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	binding, scope, err := p.EnrollBinding(t.Context(), base, proc, cgroupRoot)
+	if err != nil {
+		t.Fatalf("pre-child runtime enrollment failed: %v", err)
+	}
+	if binding.NodeUID != f.host.NodeUID || binding.MachineID != f.host.MachineID || binding.BootID != f.host.BootID || binding.RuntimeID != RuntimeIdentity("containerd", "test-version", "v1") || binding.SandboxID != "sandbox-0" || binding.ContainerID != base.ContainerID || binding.ImageID != base.ImageID {
+		t.Fatalf("runtime facts were not bound from the host and CRI: %+v", binding)
+	}
+	if scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) || scope.ProfileID != "qualified-test-profile" {
+		t.Fatalf("captured scope does not bind full runtime enrollment: %+v", scope)
+	}
+	base.ImageID = "other-image@sha256:" + strings.Repeat("0", 64)
+	if _, _, err := p.EnrollBinding(t.Context(), base, proc, cgroupRoot); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("mismatched Kubernetes image accepted: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 0 || f.stopSandboxes != 0 {
+		t.Fatal("enrollment unexpectedly stopped CRI processes")
 	}
 }
 

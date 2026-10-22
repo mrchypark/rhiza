@@ -57,6 +57,9 @@ type StopObservation struct {
 	SandboxStopAcknowledged   bool                   `json:"sandboxStopAcknowledged"`
 	ContainerExited           bool                   `json:"containerExited"`
 	SandboxNotReady           bool                   `json:"sandboxNotReady"`
+	CgroupScope               CgroupScope            `json:"cgroupScope,omitempty"`
+	CgroupEmpty               bool                   `json:"cgroupEmpty,omitempty"`
+	RecoveredTerminalState    bool                   `json:"recoveredTerminalState,omitempty"`
 	ObservedAt                string                 `json:"observedAt,omitempty"`
 }
 
@@ -124,6 +127,79 @@ func (p *Provider) verifyVersion(ctx context.Context, binding fencing.RuntimeBin
 		return fmt.Errorf("%w: enrolled runtime/API version differs", ErrUnverified)
 	}
 	return nil
+}
+
+// EnrollBinding fills node/runtime/sandbox identity from this node and its
+// pinned CRI, then captures the populated private cgroup before the supervisor
+// starts its application child. Kubernetes-supplied container/image IDs are
+// treated as expected identities and must match CRI exactly.
+func (p *Provider) EnrollBinding(ctx context.Context, base fencing.RuntimeBinding, procRoot, cgroupRoot string) (fencing.RuntimeBinding, CgroupScope, error) {
+	binding := base
+	identity := fencing.Identity{SourceClusterID: base.SourceClusterID, NodeID: base.NodeID, PodUID: base.PodUID, RunID: base.RunID}
+	if p == nil || p.client == nil || p.host == nil || p.profile.RuntimeName != "containerd" || p.profile.ContainerdRuntimeType == "" || p.profile.CgroupProfileID == "" ||
+		base.AuthorityID == "" || base.NamespaceUID == "" || base.BindingUID == "" || base.StatefulSetUID == "" || base.NodeName == "" || base.ContainerID == "" || base.ImageID == "" ||
+		identity.SourceClusterID == "" || identity.NodeID == "" || identity.PodUID == "" || identity.RunID == "" {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: incomplete qualified runtime enrollment", ErrUnverified)
+	}
+	if p.profile.RuntimeAPIVersion != "v1" || !filepath.IsAbs(procRoot) || !filepath.IsAbs(cgroupRoot) {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: unsupported runtime enrollment profile", ErrUnverified)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	host, err := p.host(ctx)
+	if err != nil || host.NodeName != base.NodeName || host.NodeUID == "" || host.MachineID == "" || host.BootID == "" || host.KernelRelease != p.profile.KernelRelease {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: local node or boot identity differs", ErrUnverified)
+	}
+	binding.NodeUID, binding.MachineID, binding.BootID = host.NodeUID, host.MachineID, host.BootID
+	version, err := p.client.Version(ctx, &runtimeapi.VersionRequest{Version: "0.1.0"})
+	if err != nil || version == nil || version.RuntimeName != p.profile.RuntimeName || version.RuntimeVersion != p.profile.RuntimeVersion || version.RuntimeApiVersion != p.profile.RuntimeAPIVersion {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: runtime version is not the qualified profile", ErrUnverified)
+	}
+	binding.RuntimeID = RuntimeIdentity(version.RuntimeName, version.RuntimeVersion, version.RuntimeApiVersion)
+	containerID, ok := strings.CutPrefix(base.ContainerID, "containerd://")
+	if !ok || containerID == "" || strings.Contains(containerID, "://") {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: container ID is not containerd-qualified", ErrUnverified)
+	}
+	status, err := p.client.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: containerID, Verbose: true})
+	if err != nil || status == nil || status.Status == nil || status.Status.Id != containerID || status.Status.Metadata == nil || status.Status.Metadata.Name != p.profile.ContainerName ||
+		status.Status.ImageRef != base.ImageID || status.Status.State != runtimeapi.ContainerState_CONTAINER_RUNNING {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: pre-child container metadata differs", ErrUnverified)
+	}
+	sandboxID, pid, err := containerdVerboseIdentity(status.Info, "", p.profile.ContainerdRuntimeType)
+	if err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	binding.SandboxID = sandboxID
+	if err := p.verifyHost(ctx, binding); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	if err := p.verifyVersion(ctx, binding); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	if err := p.inspect(ctx, binding, containerID, false); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	scope, err := captureCgroupScope(procRoot, cgroupRoot, pid, binding, p.profile.CgroupProfileID)
+	if err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	secondPID, err := p.containerdPID(ctx, binding, containerID)
+	if err != nil || secondPID != pid || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: process changed during pre-child capture", ErrUnverified)
+	}
+	if err := p.inspect(ctx, binding, containerID, false); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	if err := p.verifyHost(ctx, binding); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	if err := p.verifyVersion(ctx, binding); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	if err := binding.Validate(identity); err != nil {
+		return fencing.RuntimeBinding{}, CgroupScope{}, err
+	}
+	return binding, scope, nil
 }
 
 // CaptureCgroupScope maps a containerd verbose-status PID to its live host
@@ -329,6 +405,51 @@ func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBind
 	if err := scope.VerifyEmpty(cgroupRoot); err != nil {
 		return observation, err
 	}
+	observation.CgroupScope, observation.CgroupEmpty = scope, true
 	observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	return observation, nil
+}
+
+// ResumeStopInCgroup resumes only a previously durable exact stop intent. It
+// either reissues Stop for the same PID/starttime and cgroup, or reconstructs
+// a receipt from complete exact CRI terminal metadata plus the same empty
+// cgroup inode. Missing CRI metadata, a changed process, or partial terminal
+// observations remain unverified.
+func (p *Provider) ResumeStopInCgroup(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, procRoot, cgroupRoot string, scope CgroupScope) (StopObservation, error) {
+	observation := StopObservation{Runtime: binding, Request: request, CgroupScope: scope}
+	digest, digestErr := hex.DecodeString(request.RequestHash)
+	if p == nil || p.client == nil || p.host == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || request.OperationID == "" || digestErr != nil || len(digest) != sha256.Size ||
+		scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
+		return observation, fmt.Errorf("%w: resumed stop intent differs from captured scope", ErrUnverified)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := p.verifyHost(ctx, binding); err != nil {
+		return observation, err
+	}
+	if err := p.verifyVersion(ctx, binding); err != nil {
+		return observation, err
+	}
+	containerID := strings.TrimPrefix(binding.ContainerID, p.profile.RuntimeName+"://")
+	if containerID == "" || strings.Contains(containerID, "://") {
+		return observation, fmt.Errorf("%w: runtime container ID differs", ErrUnverified)
+	}
+	if p.inspect(ctx, binding, containerID, true) == nil && scope.VerifyEmpty(cgroupRoot) == nil {
+		if err := p.verifyHost(ctx, binding); err != nil {
+			return observation, err
+		}
+		if err := p.verifyVersion(ctx, binding); err != nil {
+			return observation, err
+		}
+		observation.ContainerExited, observation.SandboxNotReady = true, true
+		observation.CgroupEmpty, observation.RecoveredTerminalState = true, true
+		observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return observation, nil
+	}
+	// A nonterminal retry may reissue the exact CRI operation only while the
+	// originally captured process incarnation still occupies the pinned scope.
+	if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
+		return observation, err
+	}
+	return p.StopInCgroup(ctx, binding, request, procRoot, cgroupRoot, scope)
 }

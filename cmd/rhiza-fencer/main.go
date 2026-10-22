@@ -86,6 +86,10 @@ func serve(ctx context.Context, args []string) error {
 	attestorCA := f.String("attestor-ca-file", os.Getenv("RHIZA_FENCE_ATTESTOR_CA_FILE"), "unsupported legacy v1 attestor CA")
 	stageDir := f.String("source-stage-dir", os.Getenv("FENCER_SOURCE_STAGE_DIR"), "pre-provisioned local POSIX source staging directory")
 	stageIncarnation := f.String("source-stage-incarnation", os.Getenv("FENCER_SOURCE_STAGE_INCARNATION"), "pinned source staging incarnation digest")
+	runtimeAgentCA := f.String("runtime-agent-ca-file", os.Getenv("FENCER_RUNTIME_AGENT_CA_FILE"), "dedicated node runtime-agent TLS CA; enables runtime enrollment and terminal evidence")
+	runtimeAgentToken := f.String("runtime-agent-token-file", "/var/run/secrets/rhiza-fencer/runtime-agent-token", "TokenReview-audience-bound runtime-agent credential")
+	runtimeAgentServer := f.String("runtime-agent-server-name", "runtime-agent", "TLS DNS identity on node runtime-agent certificates")
+	runtimeAgentPort := f.String("runtime-agent-port", "9445", "node runtime-agent HTTPS host port")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -100,6 +104,18 @@ func serve(ctx context.Context, args []string) error {
 		return err
 	}
 	executor := &operator.FencingExecutor{Kube: kube}
+	if *runtimeAgentCA != "" {
+		ca, err := os.ReadFile(*runtimeAgentCA)
+		if err != nil {
+			return fmt.Errorf("read runtime-agent CA: %w", err)
+		}
+		client := &operator.RuntimeAgentClient{Kube: kube, AuthorityID: "rhiza-fencer/" + *namespace, TokenFile: *runtimeAgentToken, CA: ca, ServerName: *runtimeAgentServer, Port: *runtimeAgentPort}
+		executor.RuntimeAgent = client
+		executor.CollectRuntimeEvidence = client.Stop
+		executor.VerifyRuntimeEvidence = client.Verify
+	} else if *runtimeAgentToken != "/var/run/secrets/rhiza-fencer/runtime-agent-token" || *runtimeAgentServer != "runtime-agent" || *runtimeAgentPort != "9445" {
+		return fmt.Errorf("runtime-agent token, server name, and port require --runtime-agent-ca-file")
+	}
 	if (*stageDir == "") != (*stageIncarnation == "") {
 		return fmt.Errorf("source staging requires both directory and pinned incarnation")
 	}

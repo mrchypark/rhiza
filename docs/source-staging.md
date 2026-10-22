@@ -47,8 +47,11 @@ are the JSON forms of `sourceStageRecord` and `fencing.MutationIntent` in the
 implementation. Provision this initial empty manifest with a trusted local
 provisioning procedure; no manifest-generation or repair command is provided.
 The configured incarnation must exactly equal the manifest's value on every
-start. This pins local spool identity only; it is not a root-ledger binding or
-a cross-host identity guarantee.
+start. When the source-stage store is configured during producer binding, the
+authority also pins this exact digest in the root ledger before WAL activation
+and returns it in the producer binding. This detects replacement by another
+configured incarnation; it is not a cross-host identity guarantee or a
+distributed lock.
 
 For example, after provisioning a real manifest and directory (the values
 below are placeholders), configure the fencer process with:
@@ -102,6 +105,6 @@ profile are independently implemented, reviewed, and qualified.
 
 The original Pro contract remains the source of mutation identity, retry,
 unknown-outcome, and result-retention requirements. The later user waiver
-allowed implementation to continue without another Pro consultation; it did
-not approve a new provider, shared-volume, root-ledger pinning, or deployment
-design. This document records only the bounded local spool behavior above.
+allowed implementation to continue without another Pro consultation; it does
+not approve provider activation, shared-volume use, or deployment. This
+document records the bounded local spool and immutable root-ledger pin above.

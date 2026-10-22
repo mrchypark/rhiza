@@ -18,6 +18,15 @@ func newSourceRetryTest(t *testing.T) (*sourceRetryState, BindReceipt, string) {
 	return s, r, dir
 }
 
+func TestSourceRetryRequiresRootPinnedStageIncarnation(t *testing.T) {
+	binding := testProducerReceipt()
+	binding.Producer.StageIncarnation = ""
+	if state, err := createSourceRetryState(filepath.Join(t.TempDir(), "retry"), binding); err == nil {
+		_ = state.Close()
+		t.Fatal("source retry initialized without a root-pinned spool incarnation")
+	}
+}
+
 func sourceRetryIntent(step string) MutationIntent {
 	intent := journalUpload(step)
 	intent.OperationID = ""
