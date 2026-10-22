@@ -270,6 +270,11 @@ func safeArtifacts(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("FENCING_E2E_OUT is required")
 	}
+	exitData, err := os.ReadFile(filepath.Join(raw, "actual-exit.txt"))
+	if err != nil {
+		return err
+	}
+	failedRun := strings.TrimSpace(string(exitData)) != "0"
 	public := filepath.Join(raw, "public")
 	if err := os.Mkdir(public, 0700); err != nil {
 		return err
@@ -298,6 +303,12 @@ func safeArtifacts(raw string) error {
 		data, err := os.ReadFile(filepath.Join(raw, name))
 		if err != nil {
 			return err
+		}
+		// A failed run may stop before a redirected diagnostic JSON file gets
+		// any bytes. Preserve the actual exit receipt and the usable diagnostics;
+		// do not turn an early qualification failure into an artifact parse error.
+		if failedRun && approved && len(data) == 0 {
+			continue
 		}
 		switch {
 		case approved:
@@ -363,13 +374,9 @@ func safeArtifacts(raw string) error {
 			return err
 		}
 	}
-	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt", "runtime-profile.json"}
-	exitData, err := os.ReadFile(filepath.Join(public, "actual-exit.txt"))
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(string(exitData)) == "0" {
-		required = append(required, "runtime-component-probe.json")
+	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
+	if !failedRun {
+		required = append(required, "runtime-profile.json", "runtime-component-probe.json")
 	} else {
 		for _, name := range []string{"fencer-diagnostics.json", "fencer-pods.json", "fencer-events.json", "fencer-deployment.json"} {
 			if _, statErr := os.Stat(filepath.Join(public, name)); statErr == nil {

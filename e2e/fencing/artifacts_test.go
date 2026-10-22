@@ -102,6 +102,31 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	}
 }
 
+func TestFailedEarlyRunKeepsExitReceiptWithoutRuntimeProfile(t *testing.T) {
+	raw := t.TempDir()
+	for name, data := range map[string][]byte{
+		"actual-exit.txt":      []byte("1\n"),
+		"source-head.txt":      []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":        []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		"runtime-profile.json": nil,
+		"terminal.json":        nil,
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("early failed run did not produce a usable public receipt: %v", err)
+	}
+	public := filepath.Join(raw, "public")
+	if data, err := os.ReadFile(filepath.Join(public, "actual-exit.txt")); err != nil || string(data) != "1\n" {
+		t.Fatalf("actual exit receipt was not preserved: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(public, "runtime-profile.json")); !os.IsNotExist(err) {
+		t.Fatalf("empty runtime profile should be omitted after early failure, got %v", err)
+	}
+}
+
 func TestFailurePacketDoesNotRequireUnreachedRuntimeProbe(t *testing.T) {
 	raw := t.TempDir()
 	for name, data := range map[string][]byte{
