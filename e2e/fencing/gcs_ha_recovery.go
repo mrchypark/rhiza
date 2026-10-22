@@ -20,6 +20,7 @@ import (
 
 type gcsRecoverySource struct {
 	Namespace        string
+	NamespaceUID     string
 	BindingName      string
 	LogicalID        string
 	StatefulSet      string
@@ -968,6 +969,14 @@ func sameFenceRequestSpec(spec any, expected operator.FenceRequest) bool {
 
 func captureGCSRecoverySource(ctx context.Context, out string) (gcsRecoverySource, error) {
 	var source gcsRecoverySource
+	ns, err := get(ctx, "namespace", namespace)
+	if err != nil {
+		return source, fmt.Errorf("read exact run namespace identity: %w", err)
+	}
+	source.NamespaceUID = text(nested(ns, "metadata", "uid"))
+	if source.NamespaceUID == "" || text(nested(ns, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID {
+		return source, fmt.Errorf("run namespace UID or owner label is unavailable")
+	}
 	bindings, err := get(ctx, "rhizaclusters", "")
 	if err != nil {
 		return source, err

@@ -41,7 +41,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-ack-loss|runtime-probe|runtime-agent-request"))
 	}
 	if os.Args[1] == "runtime-agent-request" {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -95,6 +95,13 @@ func main() {
 		defer cancel()
 		fatal(configureGCSHA(ctx))
 		fatal(qualifyGCSAsyncEmptyExplicit(ctx))
+		return
+	}
+	if os.Args[1] == "run-gcs-ha-ack-loss" {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSHAAckLoss(ctx))
 		return
 	}
 	if os.Args[1] == "safe-artifacts" {

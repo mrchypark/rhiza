@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/thanos-io/objstore"
 )
@@ -381,6 +383,154 @@ func TestFailedAsyncEmptyRunPublishesOnlyHashOfPartialPrivateEvents(t *testing.T
 	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "failed" || summary.PrivateEventsSHA256 == "" || summary.PrivateEvidenceSHA256 != "" {
 		t.Fatalf("failed-run summary incorrectly claims complete private evidence: %+v, %v", summary, err)
 	}
+}
+
+func TestFailedAckLossProjectionPublishesNoPrivateScopeOrIdentity(t *testing.T) {
+	const privateCanary = "private-bucket-prefix-poduid-credential-canary"
+	raw := t.TempDir()
+	public := filepath.Join(raw, "public")
+	if err := os.Mkdir(public, 0700); err != nil {
+		t.Fatal(err)
+	}
+	events := []byte(`{"event":"ack_loss_fault_armed","time":"2026-10-23T00:00:00Z","data":{"bucket":"` + privateCanary + `","prefix":"` + privateCanary + `","podUID":"` + privateCanary + `"}}` + "\n")
+	if err := os.WriteFile(filepath.Join(raw, gcsAckLossEventsName), events, 0600); err != nil {
+		t.Fatal(err)
+	}
+	seen, err := projectGCSAckLossEvidence(raw, public, true)
+	if err != nil || !seen {
+		t.Fatalf("failed ACK-loss run did not produce a safe partial summary: seen=%t err=%v", seen, err)
+	}
+	data, err := os.ReadFile(filepath.Join(public, gcsAckLossSummaryName))
+	if err != nil || bytes.Contains(data, []byte(privateCanary)) {
+		t.Fatalf("ACK-loss public summary leaked private scope or identity: %v", err)
+	}
+	var summary gcsAckLossPublicSummary
+	if err := json.Unmarshal(data, &summary); err != nil || summary.Outcome != "failed" || summary.PrivateEventsSHA256 == "" || !summary.FaultArmed || summary.FaultInjected {
+		t.Fatalf("ACK-loss failure summary is incomplete or overstates outcome: %+v, %v", summary, err)
+	}
+}
+
+func TestAckLossProjectorRejectsReceiptSourceAndGuardMismatch(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mutate  func(*gcsAckLossPrivateEvidence)
+		wantErr bool
+	}{
+		{name: "consistent canonical packet", mutate: func(*gcsAckLossPrivateEvidence) {}},
+		{name: "receipt source mismatch", mutate: func(private *gcsAckLossPrivateEvidence) {
+			var first struct {
+				Source gcsRecoverySource `json:"source"`
+			}
+			if err := decodeAckLossRecovery(private.FirstRecovery, &first); err != nil {
+				t.Fatalf("decode first recovery: %v", err)
+			}
+			first.Source.ClusterID = "different-source"
+			private.FirstRecovery["source"] = first.Source
+		}, wantErr: true},
+		{name: "guard tuple mismatch", mutate: func(private *gcsAckLossPrivateEvidence) {
+			private.CanonicalObservation.Guarded.DispatchID = "different-dispatch"
+		}, wantErr: true},
+		{name: "guard digest mismatch", mutate: func(private *gcsAckLossPrivateEvidence) {
+			private.CanonicalObservation.Guarded.GuardDigest = strings.Repeat("b", 64)
+		}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, public := t.TempDir(), filepath.Join(t.TempDir(), "public")
+			if err := os.Mkdir(public, 0700); err != nil {
+				t.Fatal(err)
+			}
+			private := validGCSAckLossEvidenceFixture(t)
+			test.mutate(&private)
+			data, err := json.Marshal(private)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(raw, gcsAckLossEvidenceName), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			var events strings.Builder
+			for _, name := range []string{"ack_loss_fault_armed", "ack_loss_canonical_and_object_verified", "ack_loss_two_recoveries_complete"} {
+				fmt.Fprintf(&events, `{"event":%q,"time":"2026-10-23T00:00:00Z","data":{}}`+"\n", name)
+			}
+			if err := os.WriteFile(filepath.Join(raw, gcsAckLossEventsName), []byte(events.String()), 0600); err != nil {
+				t.Fatal(err)
+			}
+			seen, err := projectGCSAckLossEvidence(raw, public, false)
+			if err != nil && !test.wantErr {
+				t.Fatalf("consistent private ACK-loss evidence was rejected: %v", err)
+			}
+			if err == nil && test.wantErr {
+				t.Fatal("inconsistent private ACK-loss evidence was projected as a successful qualification")
+			}
+			if !test.wantErr {
+				data, readErr := os.ReadFile(filepath.Join(public, gcsAckLossSummaryName))
+				var summary gcsAckLossPublicSummary
+				if !seen || readErr != nil || json.Unmarshal(data, &summary) != nil || summary.Outcome != "passed" {
+					t.Fatalf("consistent private packet did not produce a passed summary: seen=%t summary=%+v readErr=%v", seen, summary, readErr)
+				}
+			}
+		})
+	}
+}
+
+func validGCSAckLossEvidenceFixture(t *testing.T) gcsAckLossPrivateEvidence {
+	t.Helper()
+	identity := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run", WALIdentity: "wal"}
+	runtime := fencing.RuntimeBinding{AuthorityID: "authority", NamespaceUID: "namespace-uid", BindingUID: "binding-uid", StatefulSetUID: "sts-uid",
+		SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run", NodeName: "node-name", NodeUID: "node-uid", MachineID: "machine",
+		BootID: "boot", RuntimeID: "runtime", SandboxID: "sandbox", ContainerID: "container", ImageID: "image"}
+	source := gcsRecoverySource{Namespace: "run-ns", NamespaceUID: runtime.NamespaceUID, BindingUID: runtime.BindingUID, StatefulSetUID: runtime.StatefulSetUID,
+		ClusterID: runtime.SourceClusterID, Bucket: "bucket", Prefix: "data/source"}
+	scope := gcsHAAckSourceScope(source)
+	scopeHash, err := gcsHAAckScopeHash(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadDigest := strings.Repeat("a", 64)
+	intent := fencing.MutationIntent{ContractVersion: 1, StoreScopeHash: scopeHash,
+		OwnerStep: fencing.MutationOwnerStep{Owner: "rhiza", Workflow: "archive", Step: "extent", Attempt: 1},
+		Condition: fencing.MutationCondition{Mode: fencing.MutationCreateOnly}, OperationID: "mutation-op", Kind: "upload",
+		Key: "archive/blocks/" + strings.Repeat("c", 64) + "_00000000000000000001.bin", PayloadDigest: payloadDigest, PayloadSize: 16}
+	preparation := fencing.MutationPreparation{Profile: fencing.MutationHeldExecutionProfile, StoreScopeHash: scopeHash, GenerationSet: true, Generation: 0}
+	receipt := operator.GCSMutationAckLossReceipt{Version: 1, Injected: true, WireRequests: 1, SourceIdentity: identity, Runtime: runtime,
+		ProducerUID: "producer", Sequence: 4, DispatchID: "dispatch", OperationID: intent.OperationID, Intent: intent, Preparation: preparation,
+		Scope: scope, Bucket: source.Bucket, Prefix: source.Prefix, ObjectKey: intent.Key, PayloadDigest: payloadDigest, PayloadSize: intent.PayloadSize}
+	receipt.TupleDigest = gcsHAAckTupleDigest(receipt)
+	guarded := fencing.MutationGuardedLogicalResolution{Version: fencing.MutationGuardedLogicalResolutionVersion, Runtime: runtime, WALIdentity: identity.WALIdentity,
+		ProducerUID: receipt.ProducerUID, Sequence: receipt.Sequence, Intent: intent, Preparation: preparation, PreparationHash: strings.Repeat("d", 64),
+		DispatchID: receipt.DispatchID, Profile: fencing.MutationHeldExecutionProfile, GuardRootIdentity: gcsHAAuthorityRootIdentity(runtime.StatefulSetUID, runtime.SourceClusterID),
+		GuardVersion: fencing.MutationGuardedLogicalResolutionVersion, GuardRef: "guard/record", GuardDigest: strings.Repeat("e", 64),
+		ObjectGeneration: 101, ObjectMetageneration: 2, ObjectSize: intent.PayloadSize, PayloadDigest: payloadDigest}
+	observation := gcsHAAckObservation{Runtime: runtime, ProducerUID: receipt.ProducerUID, Sequence: receipt.Sequence, DispatchID: receipt.DispatchID,
+		Guarded: guarded, GuardSHA256: guarded.GuardDigest}
+	object := gcsAckLossObjectEvidence{Generation: guarded.ObjectGeneration, Metageneration: guarded.ObjectMetageneration, Size: guarded.ObjectSize,
+		PayloadSHA256: payloadDigest, TemporaryHold: true}
+	firstFence := operator.FenceRequest{OperationID: "fence-1", SourceClusterID: "source", StatefulSetUID: source.StatefulSetUID, BindingUID: source.BindingUID}
+	firstProof := operator.FenceProof{OperationID: firstFence.OperationID, SourceClusterID: firstFence.SourceClusterID, BindingUID: firstFence.BindingUID, ProofID: "proof-1"}
+	firstRecovery := operator.Resource{Spec: operator.Spec{SourceClusterID: "source", RecoveryID: firstFence.OperationID,
+		Fence: operator.Fence{RecoveryID: firstFence.OperationID, ClusterID: "source", StatefulSetUID: source.StatefulSetUID, Confirmed: true, Evidence: firstProof.ProofID}},
+		Status: operator.Status{Phase: "Complete", Stage: "Complete", StatefulSetUID: source.StatefulSetUID, Source: "source", Target: "target-1",
+			TargetIdentities: []operator.FenceTarget{{PodUID: "target-pod-1", WALIdentity: "target-wal-1"}}}}
+	secondFence := operator.FenceRequest{OperationID: "fence-2", SourceClusterID: "target-1", StatefulSetUID: source.StatefulSetUID, BindingUID: source.BindingUID,
+		Targets: []operator.FenceTarget{{PodUID: "new-source-pod", WALIdentity: "new-source-wal"}}}
+	secondProof := operator.FenceProof{OperationID: secondFence.OperationID, SourceClusterID: secondFence.SourceClusterID, BindingUID: secondFence.BindingUID, ProofID: "proof-2"}
+	secondRecovery := operator.Resource{Spec: operator.Spec{SourceClusterID: "target-1", RecoveryID: secondFence.OperationID,
+		Fence: operator.Fence{RecoveryID: secondFence.OperationID, ClusterID: "target-1", StatefulSetUID: source.StatefulSetUID, Confirmed: true, Evidence: secondProof.ProofID}},
+		Status: operator.Status{Phase: "Complete", Stage: "Complete", StatefulSetUID: source.StatefulSetUID, Source: "target-1", Target: "target-2",
+			TargetIdentities: []operator.FenceTarget{{PodUID: "target-pod-2", WALIdentity: "target-wal-2"}}}}
+	return gcsAckLossPrivateEvidence{Version: 1, BaselineAck: gcsAcknowledgement{RequestID: "baseline", Slot: 1, Rows: `[[1,"gcs-ack-loss-baseline"]]`},
+		FaultReceipt: receipt, CanonicalObservation: observation, Object: object,
+		FirstRecovery:  gcsRecoveryEvidence(&gcsRecoveryOutcome{Source: source, Fence: firstFence, Proof: firstProof, Recovery: firstRecovery}),
+		SecondRecovery: gcsRecoveryEvidence(&gcsRecoveryOutcome{Source: source, Fence: secondFence, Proof: secondProof, Recovery: secondRecovery}),
+		SecondAck:      gcsAcknowledgement{RequestID: "successor", Slot: 2, Rows: `[[2,"gcs-ack-loss-successor"]]`}}
+}
+
+func decodeAckLossRecovery(data obj, target any) error {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(encoded, target)
 }
 
 func asyncEmptyPrivateEvidenceFixture(privateValue string) []byte {
