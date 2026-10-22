@@ -86,6 +86,7 @@ type Server struct {
 	mutationMu           sync.Mutex
 	mutationAdmission    mutationAdmission
 	durability           func(context.Context, quepaxa.Slot) error
+	readDurability       func(context.Context, quepaxa.Slot) error
 	proposeMu            sync.Mutex
 	admissionChanged     chan struct{}
 	admissionEpoch       uint64
@@ -452,6 +453,23 @@ func (s *Server) Close() {
 // SetDurabilityBarrier installs the mutation ACK barrier before the server is exposed.
 func (s *Server) SetDurabilityBarrier(barrier func(context.Context, quepaxa.Slot) error) {
 	s.durability = barrier
+}
+
+// SetReadDurabilityBarrier installs a post-read barrier. A successful read is
+// not returned until the exact materializer snapshot it observed is durable.
+// Standalone callers leave this unset.
+func (s *Server) SetReadDurabilityBarrier(barrier func(context.Context, quepaxa.Slot) error) {
+	s.readDurability = barrier
+}
+
+func (s *Server) waitReadDurable(ctx context.Context, slot uint64) error {
+	if s.readDurability == nil {
+		return nil
+	}
+	if err := s.readDurability(ctx, quepaxa.Slot(slot)); err != nil {
+		return fmt.Errorf("%w: %w", ErrDurabilityUnavailable, err)
+	}
+	return nil
 }
 
 func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
@@ -1580,6 +1598,9 @@ func (s *Server) query(ctx context.Context, req QueryRequest) (QueryResponse, er
 	if err != nil {
 		return QueryResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	if err := s.waitReadDurable(ctx, appliedSlot); err != nil {
+		return QueryResponse{}, err
+	}
 	return QueryResponse{Columns: result.Columns, Rows: result.Rows, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
@@ -1795,6 +1816,9 @@ func (s *Server) kvGet(ctx context.Context, req KVGetRequest) (KVGetResponse, er
 		return KVGetResponse{}, err
 	}
 	value, found, appliedSlot, err := s.material.KVGetAt(ctx, req.Key, time.Now())
+	if err == nil {
+		err = s.waitReadDurable(ctx, appliedSlot)
+	}
 	return KVGetResponse{Found: found, Value: value, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, err
 }
 
@@ -2039,13 +2063,63 @@ func (s *Server) NotifyPublish(ctx context.Context, req types.NotifyCommand) (ty
 }
 
 func (s *Server) NotifySubscribe(topic string) (<-chan []byte, func(), error) {
+	events, cancelEvents, err := s.notifySubscribeEvents(topic)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.handlerMu.Lock()
+	if s.handlerClosing {
+		s.handlerMu.Unlock()
+		cancelEvents()
+		return nil, nil, ErrNotReady
+	}
+	s.handlerWG.Add(1)
+	s.handlerMu.Unlock()
+	parent := s.proposalCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancelContext := context.WithCancel(parent)
+	out := make(chan []byte)
+	go func() {
+		defer s.handlerWG.Done()
+		defer cancelContext()
+		defer cancelEvents()
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-events:
+				if !ok || ctx.Err() != nil || s.waitReadDurable(ctx, event.AppliedSlot) != nil {
+					return
+				}
+				payload := append([]byte(nil), event.Payload...)
+				select {
+				case out <- payload:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	var cancelOnce sync.Once
+	return out, func() {
+		cancelOnce.Do(func() {
+			cancelContext()
+			cancelEvents()
+		})
+	}, nil
+}
+
+func (s *Server) notifySubscribeEvents(topic string) (<-chan materializer.NotificationEvent, func(), error) {
 	if s.localFailure() != nil {
 		return nil, nil, ErrNotReady
 	}
 	if topic == "" || len(topic) > 256 {
 		return nil, nil, ErrInvalidRequest
 	}
-	ch, cancel, err := s.material.Subscribe(topic)
+	ch, cancel, err := s.material.SubscribeEvents(topic)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrOverloaded, err)
 	}
@@ -2075,7 +2149,7 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
-	ch, cancel, err := s.NotifySubscribe(topic)
+	ch, cancel, err := s.notifySubscribeEvents(topic)
 	if err != nil {
 		writeAPIError(w, err)
 		return
@@ -2089,11 +2163,14 @@ func (s *Server) handleNotifySubscribe(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-r.Context().Done():
 			return
-		case payload, ok := <-ch:
+		case event, ok := <-ch:
 			if !ok {
 				return
 			}
-			data, _ := json.Marshal(payload)
+			if err := s.waitReadDurable(r.Context(), event.AppliedSlot); err != nil {
+				return
+			}
+			data, _ := json.Marshal(event.Payload)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-keepalive.C:

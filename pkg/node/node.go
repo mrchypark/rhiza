@@ -744,7 +744,16 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		})
 	}
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
-		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+		barrier := func(ctx context.Context, slot quepaxa.Slot) error {
+			if slot == 0 {
+				if err := n.archive.Load(ctx); err != nil {
+					return err
+				}
+				if n.archive.Sealed() {
+					return recovery.ErrArchiveSealed
+				}
+				return nil
+			}
 			if err := core.EnsureDurable(slot); err != nil {
 				return err
 			}
@@ -755,7 +764,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 				return err
 			}
 			return nil
-		})
+		}
+		server.SetDurabilityBarrier(barrier)
+		if n.config.EnableReconfiguration {
+			server.SetReadDurabilityBarrier(voterReadDurabilityBarrier(core.IsVoter, barrier))
+		}
 	}
 	n.server = server
 	server.SetCompactedHandler(n.wakeCatchUp)
@@ -1083,6 +1096,15 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	}
 	n.startFenceWatcher(ctx)
 	return nil
+}
+
+func voterReadDurabilityBarrier(isVoter func() bool, barrier func(context.Context, quepaxa.Slot) error) func(context.Context, quepaxa.Slot) error {
+	return func(ctx context.Context, slot quepaxa.Slot) error {
+		if !isVoter() {
+			return nil
+		}
+		return barrier(ctx, slot)
+	}
 }
 
 func rejectSupervisedWriterCredentials(config *types.ExecutionConfig) error {

@@ -182,6 +182,9 @@ func (s *Server) graphQuery(ctx context.Context, request GraphQueryRequest) (typ
 	if err != nil {
 		return types.GraphCommandResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	if err := s.waitReadDurable(ctx, result.AppliedSlot); err != nil {
+		return types.GraphCommandResult{}, err
+	}
 	result.ConsensusTip = uint64(s.core.Tip())
 	return result, nil
 }
@@ -216,6 +219,9 @@ func (s *Server) graphReachable(ctx context.Context, request GraphReachableReque
 		default:
 			return GraphReachableResult{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 		}
+	}
+	if err := s.waitReadDurable(ctx, result.AppliedSlot); err != nil {
+		return GraphReachableResult{}, err
 	}
 	return result, nil
 }
@@ -255,6 +261,9 @@ func (s *Server) graphStreamRead(ctx context.Context, request GraphStreamReadReq
 		}
 		return GraphStreamReadResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
 	}
+	if err := s.waitReadDurable(ctx, appliedSlot); err != nil {
+		return GraphStreamReadResponse{}, err
+	}
 	return GraphStreamReadResponse{Records: records, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }
 
@@ -277,6 +286,9 @@ func (s *Server) graphStreamOffset(ctx context.Context, request GraphStreamOffse
 			return GraphStreamOffsetResponse{}, ctx.Err()
 		}
 		return GraphStreamOffsetResponse{}, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if err := s.waitReadDurable(ctx, appliedSlot); err != nil {
+		return GraphStreamOffsetResponse{}, err
 	}
 	return GraphStreamOffsetResponse{Sequence: sequence, Found: found, AppliedSlot: appliedSlot, ConsensusTip: uint64(s.core.Tip())}, nil
 }

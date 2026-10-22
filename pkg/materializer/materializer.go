@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 	"io"
 	"math"
 	"net/url"
@@ -24,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mrchypark/rhiza/internal/sqlpolicy"
 
 	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -103,8 +104,16 @@ type Materializer struct {
 }
 
 type notificationSubscription struct {
-	topic string
-	ch    chan []byte
+	topic   string
+	ch      chan []byte
+	eventCh chan NotificationEvent
+}
+
+// NotificationEvent carries the private applied-slot watermark needed by
+// managed response paths. Subscribe continues to expose payloads only.
+type NotificationEvent struct {
+	Payload     []byte
+	AppliedSlot uint64
 }
 
 type snapshotParts struct {
@@ -1069,8 +1078,9 @@ func (m *Materializer) pruneReceipts(ctx context.Context, tx *sql.Tx, tip uint64
 }
 
 type pendingNotification struct {
-	topic   string
-	payload []byte
+	topic       string
+	payload     []byte
+	appliedSlot uint64
 }
 
 type pendingSQLReceipt struct {
@@ -1218,7 +1228,7 @@ func (m *Materializer) runNotifications() {
 		case <-m.notifyStop:
 			return
 		case notification := <-m.notifyQueue:
-			m.publishNotification(notification.topic, notification.payload)
+			m.publishNotificationAt(notification.topic, notification.payload, notification.appliedSlot)
 		}
 	}
 }
@@ -1466,17 +1476,27 @@ func (m *Materializer) applyValueLocked(ctx context.Context, conn *sql.Conn, tx 
 		return fmt.Errorf("persist applied position: %w", err)
 	}
 	if publish {
-		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: notifyCommand.Payload})
+		*pending = append(*pending, pendingNotification{topic: notifyCommand.Topic, payload: notifyCommand.Payload, appliedSlot: slot})
 	}
 	return nil
 }
 
 func (m *Materializer) publishNotification(topic string, payload []byte) {
+	m.publishNotificationAt(topic, payload, 0)
+}
+
+func (m *Materializer) publishNotificationAt(topic string, payload []byte, appliedSlot uint64) {
 	m.notifyMu.Lock()
 	channels := make([]chan []byte, 0, len(m.subs))
+	eventChannels := make([]chan NotificationEvent, 0, len(m.subs))
 	for _, sub := range m.subs {
 		if sub.topic == topic {
-			channels = append(channels, sub.ch)
+			if sub.ch != nil {
+				channels = append(channels, sub.ch)
+			}
+			if sub.eventCh != nil {
+				eventChannels = append(eventChannels, sub.eventCh)
+			}
 		}
 	}
 	m.notifyMu.Unlock()
@@ -1488,6 +1508,18 @@ func (m *Materializer) publishNotification(topic string, payload []byte) {
 		select {
 		case ch <- append([]byte(nil), payload...):
 		default: // A receiver raced another delivery; slow subscribers observe a gap.
+			m.notifyDrops.Add(1)
+		}
+	}
+	for _, ch := range eventChannels {
+		if len(ch) == cap(ch) {
+			m.notifyDrops.Add(1)
+			continue
+		}
+		event := NotificationEvent{Payload: append([]byte(nil), payload...), AppliedSlot: appliedSlot}
+		select {
+		case ch <- event:
+		default:
 			m.notifyDrops.Add(1)
 		}
 	}
@@ -1510,6 +1542,32 @@ func (m *Materializer) Subscribe(topic string) (<-chan []byte, func(), error) {
 	m.nextSub++
 	ch := make(chan []byte, notificationQueueDepth)
 	m.subs[id] = notificationSubscription{topic: topic, ch: ch}
+	m.notifyMu.Unlock()
+	return ch, func() {
+		m.notifyMu.Lock()
+		delete(m.subs, id)
+		m.notifyMu.Unlock()
+	}, nil
+}
+
+// SubscribeEvents returns live notifications with their internally assigned
+// applied-slot watermark. It does not change the payload-only Subscribe API.
+func (m *Materializer) SubscribeEvents(topic string) (<-chan NotificationEvent, func(), error) {
+	m.notifyMu.Lock()
+	select {
+	case <-m.notifyStop:
+		m.notifyMu.Unlock()
+		return nil, nil, fmt.Errorf("materializer is closed")
+	default:
+	}
+	if len(m.subs) >= notificationSubscriberLimit {
+		m.notifyMu.Unlock()
+		return nil, nil, fmt.Errorf("notification subscriber limit reached")
+	}
+	id := m.nextSub
+	m.nextSub++
+	ch := make(chan NotificationEvent, notificationQueueDepth)
+	m.subs[id] = notificationSubscription{topic: topic, eventCh: ch}
 	m.notifyMu.Unlock()
 	return ch, func() {
 		m.notifyMu.Lock()
@@ -2958,7 +3016,12 @@ func (m *Materializer) Close() error {
 	m.notifyWG.Wait()
 	m.notifyMu.Lock()
 	for id, sub := range m.subs {
-		close(sub.ch)
+		if sub.ch != nil {
+			close(sub.ch)
+		}
+		if sub.eventCh != nil {
+			close(sub.eventCh)
+		}
 		delete(m.subs, id)
 	}
 	m.notifyMu.Unlock()
