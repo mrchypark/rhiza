@@ -18,6 +18,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/thanos-io/objstore"
 )
 
 const fencingProtocolAnnotation = "rhiza.mrchypark.dev/cooperative-fencing"
@@ -36,6 +37,12 @@ type FencingExecutor struct {
 	// AuthorityState is canonical ObjectStorage state; Kubernetes resources are
 	// only optional indexes and are never consulted to reconstruct authority.
 	AuthorityState *AuthorityStateStore
+	// ArchiveBucket is the configured shared object store used to independently
+	// verify fork evidence before target-root registration.
+	ArchiveBucket objstore.Bucket
+	// ControllerServiceAccount is the only TokenReview identity allowed to
+	// register a nonzero archive fork. Source Pod credentials are never accepted.
+	ControllerServiceAccount string
 	// LegacyCooperativeControlState explicitly opts into the Kubernetes CAS
 	// ledger for cooperative-only operation. It is never a fallback from a
 	// configured canonical store and source-mutation APIs still require
@@ -299,6 +306,10 @@ func (e *FencingExecutor) readLegacyCooperative(ctx context.Context, uid, source
 func (e *FencingExecutor) Handler() http.Handler { return http.HandlerFunc(e.handle) }
 
 func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/archive-genesis/") {
+		e.handleArchiveForkGenesis(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v1/source-mutations/") {
 		e.handleSourceMutation(w, r)
 		return

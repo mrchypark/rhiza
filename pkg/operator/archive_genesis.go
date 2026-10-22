@@ -178,7 +178,7 @@ func (e *FencingExecutor) validateArchiveGenesisMutationPayload(ctx context.Cont
 		return errors.Join(err, storeErr, fmt.Errorf("fencing: archive genesis mutation scope differs"))
 	}
 	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
-	if err != nil || claim.OwnerStatefulSetUID != runtime.StatefulSetUID || claim.OwnerSourceClusterID != runtime.SourceClusterID || claim.ConfigID != recovery.ArchiveConfigID {
+	if err != nil || claim.ScopeHash != scopeHash || claim.OwnerStatefulSetUID != runtime.StatefulSetUID || claim.OwnerSourceClusterID != runtime.SourceClusterID || claim.ConfigID != recovery.ArchiveConfigID {
 		return errors.Join(err, fmt.Errorf("fencing: archive scope claim does not bind the required root and config"))
 	}
 	state, err := e.read(ctx, runtime.StatefulSetUID, runtime.SourceClusterID)
@@ -221,6 +221,9 @@ func (e *FencingExecutor) validateArchiveGenesisMutationPayload(ctx context.Cont
 	}
 	if err := recovery.ValidateEmptyArchiveHead(data, recovery.ArchiveConfigID); err != nil {
 		return fmt.Errorf("fencing: staged archive head is not the registered empty genesis: %w", err)
+	}
+	if err := e.ensureArchiveScopeHasNoGenesisEvidence(ctx, scope); err != nil {
+		return err
 	}
 	provider, err := newGCSMutationProvider(e.SourceMutationStorage, AttestationStoreScope{Provider: scope.Provider, Bucket: scope.Bucket, Prefix: scope.Prefix})
 	if err != nil {
@@ -537,18 +540,17 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 // or a headless checkpoint from being misclassified as a fresh empty archive.
 // These keys are written by the existing recovery protocol before activation.
 func (e *FencingExecutor) ensureArchiveScopeHasNoGenesisEvidence(ctx context.Context, scope fencing.ArchiveScope) error {
+	if e == nil || e.ArchiveBucket == nil {
+		return fmt.Errorf("fencing: canonical archive reader is unavailable for genesis check")
+	}
+	if err := recovery.RequireEmptyArchiveScope(ctx, e.ArchiveBucket, scope.Prefix); err != nil {
+		return err
+	}
 	provider, err := newGCSMutationProvider(e.SourceMutationStorage, AttestationStoreScope{Provider: scope.Provider, Bucket: scope.Bucket, Prefix: scope.Prefix})
 	if err != nil {
 		return err
 	}
-	for _, key := range []string{
-		"archive/head.bin",
-		"fork/intent.json",
-		"fork/result.json",
-		"recovery/anchor.json",
-		"recovery/generation.json",
-		"voters/membership.json",
-	} {
+	for _, key := range []string{"archive/head.bin", "voters/membership.json"} {
 		if _, exists, err := provider.observe(ctx, key); err != nil {
 			return err
 		} else if exists {

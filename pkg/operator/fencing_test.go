@@ -224,6 +224,80 @@ func TestFenceTLSRealHTTP(t *testing.T) {
 	}
 }
 
+func TestArchiveForkGenesisRegistrationUsesAuthenticatedCanonicalEndpoint(t *testing.T) {
+	request := ArchiveForkGenesisRequest{
+		StatefulSetUID: "sts-uid", TargetClusterID: "target-cluster",
+		OperationID: "resource-uid:recovery-7", SourceFenceOperationID: "recovery-7",
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/archive-genesis/fork/register" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-bearer-token" || r.Header.Get("Idempotency-Key") != request.OperationID {
+			t.Errorf("registration authentication or idempotency key differs")
+		}
+		var got ArchiveForkGenesisRequest
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil || got != request {
+			t.Errorf("registration request=%+v err=%v want=%+v", got, err, request)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"profile":"independent","genesisRegistered":true}`))
+	})
+	srv, caCert := newTLSHandler(t, handler)
+	fc := &FencingClient{URL: srv.URL + "/fence", TokenFile: writeToken(t), Client: tlsClient(t, caCert)}
+	if err := fc.RegisterArchiveForkGenesis(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestArchiveForkGenesisRegistrationPendingDoesNotConfirm(t *testing.T) {
+	srv, caCert := newTLSHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	fc := &FencingClient{URL: srv.URL + "/fence", TokenFile: writeToken(t), Client: tlsClient(t, caCert)}
+	err := fc.RegisterArchiveForkGenesis(t.Context(), ArchiveForkGenesisRequest{
+		StatefulSetUID: "sts-uid", TargetClusterID: "target-cluster",
+		OperationID: "resource-uid:recovery-7", SourceFenceOperationID: "recovery-7",
+	})
+	if !errors.Is(err, ErrFencePending) {
+		t.Fatalf("202 registration response = %v, want pending", err)
+	}
+}
+
+func TestArchiveForkGenesisRegistrationRequiresExplicitConsistentProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		body       string
+		wantErr    bool
+	}{
+		{name: "registered independent", statusCode: http.StatusOK, body: `{"profile":"independent","genesisRegistered":true}`},
+		{name: "verified cooperative", statusCode: http.StatusOK, body: `{"profile":"cooperative","genesisRegistered":false}`},
+		{name: "empty response", statusCode: http.StatusOK, wantErr: true},
+		{name: "unknown profile", statusCode: http.StatusOK, body: `{"profile":"other","genesisRegistered":false}`, wantErr: true},
+		{name: "independent without registration", statusCode: http.StatusOK, body: `{"profile":"independent","genesisRegistered":false}`, wantErr: true},
+		{name: "cooperative claims registration", statusCode: http.StatusOK, body: `{"profile":"cooperative","genesisRegistered":true}`, wantErr: true},
+		{name: "unknown field", statusCode: http.StatusOK, body: `{"profile":"cooperative","genesisRegistered":false,"extra":true}`, wantErr: true},
+		{name: "trailing payload", statusCode: http.StatusOK, body: `{"profile":"cooperative","genesisRegistered":false}{}`, wantErr: true},
+		{name: "success without profile", statusCode: http.StatusNoContent, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, caCert := newTLSHandler(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.statusCode)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			fc := &FencingClient{URL: srv.URL + "/fence", TokenFile: writeToken(t), Client: tlsClient(t, caCert)}
+			err := fc.RegisterArchiveForkGenesis(t.Context(), ArchiveForkGenesisRequest{
+				StatefulSetUID: "sts-uid", TargetClusterID: "target-cluster",
+				OperationID: "resource-uid:recovery-7", SourceFenceOperationID: "recovery-7",
+			})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("registration err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestFencePending202(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)

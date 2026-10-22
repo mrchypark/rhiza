@@ -116,6 +116,111 @@ func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t
 	}
 }
 
+type archiveForkRegistrarFixture struct {
+	request ArchiveForkGenesisRequest
+	calls   int
+	err     error
+}
+
+type archiveForkRegistrarHidingFencer struct{ Fencer }
+
+func (*archiveForkRegistrarFixture) Fence(context.Context, FenceRequest) (*FenceProof, error) {
+	return nil, fmt.Errorf("unexpected fencing request")
+}
+
+func (f *archiveForkRegistrarFixture) RegisterArchiveForkGenesis(_ context.Context, request ArchiveForkGenesisRequest) error {
+	f.calls++
+	f.request = request
+	return f.err
+}
+
+func TestControllerRegistersCanonicalForkBeforeAdvancing(t *testing.T) {
+	for _, failRegistration := range []bool{false, true} {
+		name := "success"
+		if failRegistration {
+			name = "registration error"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+			r.Spec.RecoveryID = "source-fence-op"
+			r.Spec.Fence = fence(r)
+			ctr, err := container(api.sts, "rhiza")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+			registrar := &archiveForkRegistrarFixture{}
+			if failRegistration {
+				registrar.err = fmt.Errorf("canonical registration unavailable")
+			}
+			c.Fencer = registrar
+			for range 3 {
+				if err := c.reconcileAll(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if r.Status.Stage == "Stopping" || r.Status.Phase == "Blocked" {
+					break
+				}
+			}
+			if registrar.calls != 1 {
+				t.Fatalf("registration calls=%d, want 1", registrar.calls)
+			}
+			want := ArchiveForkGenesisRequest{
+				StatefulSetUID: "sts-uid", TargetClusterID: r.Status.Target,
+				OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID,
+			}
+			if registrar.request != want {
+				t.Fatalf("registered request=%+v want=%+v", registrar.request, want)
+			}
+			if failRegistration {
+				if r.Status.Phase != "Blocked" || r.Status.Stage != "Sealed" || api.zeroPuts != 0 {
+					t.Fatalf("failed registration advanced recovery: status=%+v zeroPuts=%d", r.Status, api.zeroPuts)
+				}
+			} else if r.Status.Stage != "Stopping" {
+				t.Fatalf("successful registration did not advance verified fork: %+v", r.Status)
+			}
+		})
+	}
+}
+
+func TestControllerDoesNotTreatMissingRegistrarAsCooperativeProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fencer    Fencer
+		wantStage string
+		wantPhase string
+	}{
+		{name: "wrapped independent backend without registrar", fencer: archiveForkRegistrarHidingFencer{&FencingClient{}}, wantStage: "Sealed", wantPhase: "Blocked"},
+		{name: "explicit Kubernetes cooperative backend", fencer: &KubernetesFencer{}, wantStage: "Stopping", wantPhase: "Recovering"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
+			r.Spec.RecoveryID = "source-fence-op"
+			r.Spec.Fence = fence(r)
+			ctr, err := container(api.sts, "rhiza")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+			c.Fencer = tc.fencer
+			for range 3 {
+				if err := c.reconcileAll(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if r.Status.Stage == "Stopping" || r.Status.Phase == "Blocked" {
+					break
+				}
+			}
+			if r.Status.Stage != tc.wantStage || r.Status.Phase != tc.wantPhase {
+				t.Fatalf("unexpected recovery progress: got stage=%q phase=%q, want stage=%q phase=%q", r.Status.Stage, r.Status.Phase, tc.wantStage, tc.wantPhase)
+			}
+			if tc.wantPhase == "Blocked" && api.zeroPuts != 0 {
+				t.Fatalf("missing canonical registrar advanced activation: zero replica writes=%d", api.zeroPuts)
+			}
+		})
+	}
+}
+
 func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
 	ctx, _, r, api, c := controllerFixture(t, "before-ack", "before-ack")
 	ctr, err := container(api.sts, "rhiza")

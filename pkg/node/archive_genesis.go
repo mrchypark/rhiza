@@ -40,7 +40,7 @@ func ensureArchiveGenesis(ctx context.Context, client archiveGenesisClient, buck
 		if !status.CanInitializeEmpty {
 			return fmt.Errorf("fencing: canonical archive genesis is not initialized")
 		}
-		if err := requireAbsentArchiveHead(ctx, bucket, scope.Prefix); err != nil {
+		if err := recovery.RequireEmptyArchiveScope(ctx, bucket, scope.Prefix); err != nil {
 			return err
 		}
 		emptyHead, err := recovery.EmptyArchiveHeadBytes()
@@ -107,43 +107,6 @@ func validateMutationArchiveGenesis(status fencing.ArchiveGenesisStatus, emptyHe
 		resolution.ConditionFailed || resolution.PayloadDigest != digestHex || !validArchiveGenesisDigest(resolution.PreparationHash) ||
 		!validArchiveGenesisDigest(resolution.ReceiptDigest) {
 		return fmt.Errorf("fencing: archive genesis mutation lacks terminal commit evidence")
-	}
-	return nil
-}
-
-func requireAbsentArchiveHead(ctx context.Context, bucket objstore.Bucket, prefix string) error {
-	archive := recovery.NewManager(bucket, prefix, recovery.ArchiveConfigID)
-	defer archive.Close()
-	if err := archive.Load(ctx); err != nil {
-		return fmt.Errorf("verify empty archive before genesis: %w", err)
-	}
-	if _, exists := archive.HeadVersion(); exists || archive.Tip() != 0 {
-		return fmt.Errorf("fencing: archive already has a HEAD; genesis cannot adopt it")
-	}
-	for _, key := range []string{
-		path.Join(prefix, "fork/intent.json"),
-		path.Join(prefix, "fork/result.json"),
-		path.Join(prefix, "checkpoint/CURRENT"),
-		path.Join(prefix, "recovery/anchor.json"),
-		path.Join(prefix, "recovery/generation.json"),
-	} {
-		if _, err := bucket.Attributes(ctx, key); err == nil {
-			return fmt.Errorf("fencing: archive recovery evidence %q exists without a HEAD", key)
-		} else if !bucket.IsObjNotFoundErr(err) {
-			return fmt.Errorf("check archive recovery evidence %q: %w", key, err)
-		}
-	}
-	for _, namespace := range []string{"checkpoint/roots", "checkpoint/blocks", "checkpoint/recovery-pins"} {
-		found := false
-		if err := bucket.Iter(ctx, path.Join(prefix, namespace), func(string) error {
-			found = true
-			return nil
-		}); err != nil {
-			return fmt.Errorf("check archive recovery evidence %q: %w", namespace, err)
-		}
-		if found {
-			return fmt.Errorf("fencing: archive recovery evidence %q exists without a HEAD", namespace)
-		}
 	}
 	return nil
 }

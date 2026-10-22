@@ -32,6 +32,79 @@ func TestSupervisedSourcePodReplacesObjectStoreSecretInjection(t *testing.T) {
 	}
 }
 
+func TestOperatorDeploymentProjectsFencerAudienceTokenReadOnly(t *testing.T) {
+	data, err := os.ReadFile("deployment.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deployment map[string]any
+	if err := yaml.Unmarshal(data, &deployment); err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := deployment["spec"].(map[string]any)
+	template, _ := spec["template"].(map[string]any)
+	podSpec, _ := template["spec"].(map[string]any)
+	if podSpec["serviceAccountName"] != "rhiza-operator" {
+		t.Fatalf("operator service account=%v, want rhiza-operator", podSpec["serviceAccountName"])
+	}
+	containers, _ := podSpec["containers"].([]any)
+	if len(containers) != 1 {
+		t.Fatalf("operator deployment containers=%d, want 1", len(containers))
+	}
+	container, _ := containers[0].(map[string]any)
+	env, _ := container["env"].([]any)
+	if !containsManifestNameValue(env, "RHIZA_FENCER_TOKEN_FILE", "/var/run/secrets/rhiza-fencer/token") {
+		t.Fatal("operator must read the projected rhiza-fencer audience token from its configured path")
+	}
+	mounts, _ := container["volumeMounts"].([]any)
+	if !containsReadonlyManifestMount(mounts, "fencer-token", "/var/run/secrets/rhiza-fencer") {
+		t.Fatal("operator fencer token mount must be read-only at /var/run/secrets/rhiza-fencer")
+	}
+	volumes, _ := podSpec["volumes"].([]any)
+	if !containsProjectedServiceAccountToken(volumes, "fencer-token", "rhiza-fencer", "token") {
+		t.Fatal("operator must project a service-account token with audience rhiza-fencer and path token")
+	}
+}
+
+func containsManifestNameValue(items []any, name, value string) bool {
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["name"] == name && entry["value"] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsReadonlyManifestMount(items []any, name, mountPath string) bool {
+	for _, item := range items {
+		entry, _ := item.(map[string]any)
+		if entry["name"] == name && entry["mountPath"] == mountPath && entry["readOnly"] == true {
+			return true
+		}
+	}
+	return false
+}
+
+func containsProjectedServiceAccountToken(items []any, name, audience, tokenPath string) bool {
+	for _, item := range items {
+		volume, _ := item.(map[string]any)
+		if volume["name"] != name {
+			continue
+		}
+		projected, _ := volume["projected"].(map[string]any)
+		sources, _ := projected["sources"].([]any)
+		for _, source := range sources {
+			tokenSource, _ := source.(map[string]any)
+			token, _ := tokenSource["serviceAccountToken"].(map[string]any)
+			if token["audience"] == audience && token["path"] == tokenPath {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // The CRD schema accepts the supported voterCount range and no longer exposes
 // the removed authoritative voter list.
 func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {

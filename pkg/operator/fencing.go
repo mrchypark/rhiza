@@ -250,6 +250,13 @@ type Fencer interface {
 	Fence(context.Context, FenceRequest) (*FenceProof, error)
 }
 
+// ArchiveForkGenesisRegistrar binds a verified successor fork to the
+// canonical archive authority. Cooperative backends may omit this capability;
+// configured HTTPS authorities implement it and fail closed if unsupported.
+type ArchiveForkGenesisRegistrar interface {
+	RegisterArchiveForkGenesis(context.Context, ArchiveForkGenesisRequest) error
+}
+
 // FencingClient is the HTTPS backend; it does not own recovery decisions.
 type FencingClient struct {
 	URL       string
@@ -402,6 +409,74 @@ func (fc *FencingClient) Fence(ctx context.Context, req FenceRequest) (*FencePro
 		return nil, err
 	}
 	return &proof, nil
+}
+
+// RegisterArchiveForkGenesis submits only the canonical identifiers. The
+// authority independently reads and verifies the fork evidence before binding
+// it; the controller never supplies a caller-asserted proof.
+func (fc *FencingClient) RegisterArchiveForkGenesis(ctx context.Context, request ArchiveForkGenesisRequest) error {
+	if err := validateURL(fc.URL); err != nil {
+		return err
+	}
+	if request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" || request.SourceFenceOperationID == "" {
+		return fmt.Errorf("fencing: archive fork genesis identifiers are required")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("fencing: marshal archive fork genesis request: %w", err)
+	}
+	endpoint, err := url.Parse(fc.URL)
+	if err != nil {
+		return fmt.Errorf("fencing: invalid endpoint")
+	}
+	endpoint.Path = "/v1/archive-genesis/fork/register"
+	endpoint.RawPath = ""
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("fencing: build archive fork genesis request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Idempotency-Key", request.OperationID)
+	token, err := readToken(fc.TokenFile)
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	resp, err := cloneClient(fc.Client).Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("fencing: archive fork genesis request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		return ErrFencePending
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("fencing: archive fork genesis HTTP %d", resp.StatusCode)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("fencing: read archive fork genesis response: %w", err)
+	}
+	if int64(len(responseBody)) > maxResponseBytes {
+		return fmt.Errorf("fencing: archive fork genesis response exceeds %d bytes", maxResponseBytes)
+	}
+	var result struct {
+		Profile           string `json:"profile"`
+		GenesisRegistered bool   `json:"genesisRegistered"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return fmt.Errorf("fencing: invalid archive fork genesis profile response")
+	}
+	switch {
+	case result.Profile == "independent" && result.GenesisRegistered:
+		return nil
+	case result.Profile == "cooperative" && !result.GenesisRegistered:
+		return nil
+	default:
+		return fmt.Errorf("fencing: archive fork genesis profile response is inconsistent")
+	}
 }
 
 // Validate independently of the backend before authorizing recovery effects.

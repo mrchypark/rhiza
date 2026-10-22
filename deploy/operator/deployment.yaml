@@ -31,6 +31,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: RHIZA_FENCER_TOKEN_FILE
+              value: /var/run/secrets/rhiza-fencer/token
           envFrom:
             - configMapRef:
                 name: rhiza-config
@@ -46,6 +48,9 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: fencer-token
+              mountPath: /var/run/secrets/rhiza-fencer
+              readOnly: true
           resources:
             requests:
               cpu: 100m
@@ -55,3 +60,10 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: fencer-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: rhiza-fencer
+                  expirationSeconds: 3600
+                  path: token

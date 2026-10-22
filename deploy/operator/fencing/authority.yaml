@@ -21,7 +21,7 @@ rules:
     verbs: [get, create, update]
   - apiGroups: [apps]
     resources: [statefulsets]
-    verbs: [get]
+    verbs: [get, list]
   - apiGroups: [rhiza.mrchypark.dev]
     resources: [rhizafences, rhizaclusters]
     verbs: [get, list]
