@@ -11,6 +11,11 @@ on:
         type: boolean
         required: false
         default: false
+      fixture_only:
+        description: Run only focused rollback, IAM, manifest, empty-recovery, and terminal-evidence Go regressions
+        type: boolean
+        required: false
+        default: false
       publish_chaos_image:
         description: Publish the tested qualification host image for a local run
         type: boolean
@@ -22,7 +27,7 @@ permissions:
 
 jobs:
   embedded-object-storage-providers:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -48,7 +53,7 @@ jobs:
             /tmp/rhiza-embedded-providers.*/selected-tests.txt
 
   fencing-only:
-    if: github.event_name == 'workflow_dispatch' && inputs.fencing_only
+    if: github.event_name == 'workflow_dispatch' && inputs.fencing_only && !inputs.fixture_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -78,7 +83,27 @@ jobs:
           go test -tags rhiza_local_testhooks ./pkg/recovery -run "$tests" -count=1 -timeout=2m
           go test -race -tags rhiza_local_testhooks ./pkg/recovery -run "$tests" -count=1 -timeout=2m
 
+  fixture-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.fixture_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check focused rollback, IAM, manifest, and recovery fixtures
+        run: |
+          embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'
+          operator_tests='^(TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot|TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead|TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound|TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault|TestTerminalStoreRejectsIncompleteOrUntrustedTermination)$'
+          go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
+          go test ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m
+          go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
+          go test -race ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m
+
   cooperative-fencing:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fixture_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -183,7 +208,7 @@ jobs:
           fi
 
   operator-chaos:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -221,7 +246,7 @@ jobs:
         run: kind delete cluster --name rhiza-operator-chaos
 
   automatic-operator-chaos:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -277,7 +302,7 @@ jobs:
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
   membership-e2e:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -367,7 +392,7 @@ jobs:
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
   rust-sdk:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -403,7 +428,7 @@ jobs:
           cargo test --manifest-path "sdk/rust/target/package/rhizadb-$crate_version/Cargo.toml" --locked --all-targets
 
   go:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
@@ -527,7 +552,7 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   containers:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -556,7 +581,7 @@ jobs:
           tags: rhiza-operator:ci
 
   anchor-operator-chaos:
-    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
+    if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -643,7 +668,7 @@ jobs:
           retention-days: 7
 
   publish-chaos-image:
-    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only
+    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only
     needs: [anchor-operator-chaos, go, containers]
     runs-on: ubuntu-latest
     timeout-minutes: 10
