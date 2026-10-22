@@ -1102,6 +1102,21 @@ func loadNodeArchive(ctx context.Context, archive *recovery.Manager, durability 
 }
 
 func installArchiveDurabilityBarriers(server *network.Server, core *quepaxa.Core, archive *recovery.Manager, durability types.ObjectStoreDurability, reconfiguration, supervised, local bool, syncLocalBackup func(context.Context) error) error {
+	if local && !supervised {
+		if durability != types.ObjectStoreDurabilityBeforeAck {
+			return nil
+		}
+		if syncLocalBackup == nil {
+			return fmt.Errorf("Local backup sync is required for before-ack durability")
+		}
+		server.SetDurabilityBarrier(func(ctx context.Context, slot quepaxa.Slot) error {
+			if err := core.EnsureDurable(slot); err != nil {
+				return err
+			}
+			return syncLocalBackup(ctx)
+		})
+		return nil
+	}
 	if archive == nil {
 		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
 			return fmt.Errorf("shared decision archive is required")

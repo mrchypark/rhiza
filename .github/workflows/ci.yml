@@ -247,6 +247,7 @@ jobs:
 
   automatic-operator-chaos:
     if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
+    needs: [containers]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -263,6 +264,28 @@ jobs:
         if: matrix.host == 'rust'
       - name: Fencing executor regression checks
         run: python3 e2e/chaos/kind_fencer_test.py
+      - uses: actions/download-artifact@v4
+        if: matrix.host == 'go'
+        with:
+          name: runtime-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-candidate
+      - name: Load exact Go runtime candidate images
+        if: matrix.host == 'go'
+        working-directory: runtime-candidate
+        run: |
+          set -eu
+          sha256sum -c SHA256SUMS
+          docker load -i runtime-images.tar
+          test "$(docker image inspect rhiza:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' application-image.json)"
+          test "$(docker image inspect rhiza-operator:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' operator-image.json)"
+          docker tag rhiza:ci rhiza-chaos:local
+          docker tag rhiza-operator:ci rhiza-operator-chaos:local
+          app_container=$(docker create rhiza-chaos:local)
+          trap 'docker rm "$app_container" >/dev/null' EXIT
+          docker cp "$app_container:/usr/local/bin/rhiza" rhiza
+          docker cp "$app_container:/usr/local/bin/rhiza-entrypoint" rhiza-entrypoint
+          cmp rhiza rhiza-entrypoint
+          cmp bin/rhiza rhiza
       - name: Build test images and Kubernetes cluster
         env:
           CGO_ENABLED: 0
@@ -271,19 +294,21 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaos-images"
           case "${{ matrix.host }}" in
             server) go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./cmd/rhiza ;;
-            go) go build -o "$RUNNER_TEMP/chaos-images/rhiza" ./e2e/chaos/embedded-go ;;
+            go) : ;; # The exact embedded Go candidate image was loaded above.
             rust)
               cargo build --manifest-path sdk/rust/Cargo.toml --locked --example operator_chaos
               cp sdk/rust/target/debug/examples/operator_chaos "$RUNNER_TEMP/chaos-images/rhiza"
               ;;
           esac
-          go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
-          if [[ "${{ matrix.host }}" == rust ]]; then
-            docker build -f e2e/chaos/Dockerfile.rust -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
-          else
-            docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+          if [[ "${{ matrix.host }}" != go ]]; then
+            go build -o "$RUNNER_TEMP/chaos-images/operator" ./cmd/rhiza-operator
+            if [[ "${{ matrix.host }}" == rust ]]; then
+              docker build -f e2e/chaos/Dockerfile.rust -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+            else
+              docker build -f e2e/chaos/Dockerfile --build-arg BINARY=rhiza -t rhiza-chaos:local "$RUNNER_TEMP/chaos-images"
+            fi
+            docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           fi
-          docker build -f e2e/chaos/Dockerfile --build-arg BINARY=operator -t rhiza-operator-chaos:local "$RUNNER_TEMP/chaos-images"
           kind create cluster --name rhiza-operator-chaos --wait 120s
           kind load docker-image rhiza-chaos:local rhiza-operator-chaos:local --name rhiza-operator-chaos
       - name: Inject faults and verify unattended Operator recovery
@@ -556,29 +581,66 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare container test tools
-        run: |
-          awk '
-            { print }
-            $0 == "FROM mirror.gcr.io/library/golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder" {
-              print "RUN apk --no-cache add jq coreutils"
-              matched++
-            }
-            END { if (matched != 1) exit 1 }
-          ' Dockerfile > "$RUNNER_TEMP/Dockerfile.ci"
       - uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ runner.temp }}/Dockerfile.ci
+          file: Dockerfile
+          build-args: |
+            RHIZA_APPLICATION_PACKAGE=./e2e/chaos/embedded-go
           push: false
+          load: true
           tags: rhiza:ci
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.rhiza.candidate.source-sha=${{ github.sha }}
+            io.rhiza.candidate.application-package=./e2e/chaos/embedded-go
 
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.operator
           push: false
+          load: true
           tags: rhiza-operator:ci
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.rhiza.candidate.source-sha=${{ github.sha }}
+
+      - name: Export voter and operator images for exact recovery testing
+        run: |
+          set -eu
+          export_dir="$RUNNER_TEMP/runtime-candidate"
+          mkdir -p "$export_dir/bin"
+          docker image inspect rhiza:ci > "$export_dir/application-image.json"
+          docker image inspect rhiza-operator:ci > "$export_dir/operator-image.json"
+          for image_file in "$export_dir/application-image.json" "$export_dir/operator-image.json"; do
+            jq -e --arg revision "$GITHUB_SHA" --arg source "https://github.com/$GITHUB_REPOSITORY" '
+              .[0] | .Os == "linux" and .Architecture == "amd64" and
+              .Config.Labels["org.opencontainers.image.source"] == $source and
+              .Config.Labels["org.opencontainers.image.revision"] == $revision and
+              .Config.Labels["io.rhiza.candidate.source-sha"] == $revision
+            ' "$image_file" >/dev/null
+          done
+          app_container=$(docker create rhiza:ci)
+          operator_container=$(docker create rhiza-operator:ci)
+          trap 'docker rm "$app_container" "$operator_container" >/dev/null' EXIT
+          docker cp "$app_container:/usr/local/bin/rhiza" "$export_dir/bin/rhiza"
+          docker cp "$app_container:/usr/local/bin/rhiza-entrypoint" "$export_dir/bin/rhiza-entrypoint"
+          docker cp "$app_container:/usr/local/bin/rhiza-fencer" "$export_dir/bin/application-rhiza-fencer"
+          docker cp "$operator_container:/usr/local/bin/rhiza-operator" "$export_dir/bin/rhiza-operator"
+          docker cp "$operator_container:/usr/local/bin/rhiza-fencer" "$export_dir/bin/operator-rhiza-fencer"
+          docker cp "$operator_container:/usr/local/bin/rhiza-runtime-agent" "$export_dir/bin/rhiza-runtime-agent"
+          (cd "$export_dir" && sha256sum bin/* > binaries.sha256)
+          docker save rhiza:ci rhiza-operator:ci -o "$export_dir/runtime-images.tar"
+          (cd "$export_dir" && sha256sum application-image.json operator-image.json binaries.sha256 runtime-images.tar > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runtime-candidate
+          if-no-files-found: error
+          retention-days: 7
 
   anchor-operator-chaos:
     if: github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)
@@ -669,7 +731,7 @@ jobs:
 
   publish-chaos-image:
     if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only
-    needs: [anchor-operator-chaos, go, containers]
+    needs: [anchor-operator-chaos, go, containers, automatic-operator-chaos, cooperative-fencing]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -680,6 +742,38 @@ jobs:
         with:
           name: qualification-host-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: qualification-host
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-candidate
+      - name: Verify and load tested voter and operator images
+        working-directory: runtime-candidate
+        run: |
+          set -eu
+          sha256sum -c SHA256SUMS
+          for image_file in application-image.json operator-image.json; do
+            jq -e --arg revision "$GITHUB_SHA" '
+              .[0].Config.Labels["io.rhiza.candidate.source-sha"] == $revision and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $revision
+            ' "$image_file" >/dev/null
+          done
+          jq -e '.[0].Config.Labels["io.rhiza.candidate.application-package"] == "./e2e/chaos/embedded-go"' application-image.json >/dev/null
+          docker load -i runtime-images.tar
+          test "$(docker image inspect rhiza:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' application-image.json)"
+          test "$(docker image inspect rhiza-operator:ci --format '{{.Id}}')" = "$(jq -r '.[0].Id' operator-image.json)"
+          app_container=$(docker create rhiza:ci)
+          operator_container=$(docker create rhiza-operator:ci)
+          trap 'docker rm "$app_container" "$operator_container" >/dev/null' EXIT
+          mkdir -p verify-bin
+          docker cp "$app_container:/usr/local/bin/rhiza" verify-bin/rhiza
+          docker cp "$app_container:/usr/local/bin/rhiza-entrypoint" verify-bin/rhiza-entrypoint
+          docker cp "$app_container:/usr/local/bin/rhiza-fencer" verify-bin/application-rhiza-fencer
+          docker cp "$operator_container:/usr/local/bin/rhiza-operator" verify-bin/rhiza-operator
+          docker cp "$operator_container:/usr/local/bin/rhiza-fencer" verify-bin/operator-rhiza-fencer
+          docker cp "$operator_container:/usr/local/bin/rhiza-runtime-agent" verify-bin/rhiza-runtime-agent
+          for binary in rhiza rhiza-entrypoint application-rhiza-fencer rhiza-operator operator-rhiza-fencer rhiza-runtime-agent; do
+            cmp "bin/$binary" "verify-bin/$binary"
+          done
       - name: Verify and load the tested host image
         working-directory: qualification-host
         run: |
@@ -698,13 +792,43 @@ jobs:
       - name: Publish only the immutable run tag
         shell: bash
         run: |
+          set -euo pipefail
           target="ghcr.io/mrchypark/rhiza-sql:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          app_target="ghcr.io/mrchypark/rhiza-application:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          operator_target="ghcr.io/mrchypark/rhiza-operator:ci-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          for candidate in "$target" "$app_target" "$operator_target"; do
+            if docker manifest inspect "$candidate" >/dev/null 2>&1; then
+              echo "::error::refusing to retarget immutable image $candidate" >&2
+              exit 1
+            fi
+          done
           docker tag rhiza-chaos:local "$target"
+          docker tag rhiza:ci "$app_target"
+          docker tag rhiza-operator:ci "$operator_target"
           docker push "$target" | tee qualification-host/push.log
           docker image inspect "$target" > qualification-host/published-image.json
-          # shellcheck disable=SC2016 # Markdown backticks are literal output.
-          printf 'Qualification host: `%s`\n\n' "$target" >> "$GITHUB_STEP_SUMMARY"
-          jq -r '.[0].RepoDigests[]' qualification-host/published-image.json >> "$GITHUB_STEP_SUMMARY"
+          docker push "$app_target" | tee runtime-candidate/application-push.log
+          docker image inspect "$app_target" > runtime-candidate/application-published-image.json
+          docker push "$operator_target" | tee runtime-candidate/operator-push.log
+          docker image inspect "$operator_target" > runtime-candidate/operator-published-image.json
+          for published in runtime-candidate/application-published-image.json runtime-candidate/operator-published-image.json; do
+            jq -e --arg revision "$GITHUB_SHA" '
+              .[0].Config.Labels["io.rhiza.candidate.source-sha"] == $revision and
+              .[0].Config.Labels["org.opencontainers.image.revision"] == $revision and
+              ([.[0].RepoDigests[]? | select(test("@sha256:[a-f0-9]{64}$"))] | length) > 0
+            ' "$published" >/dev/null
+          done
+          {
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf 'Qualification host: `%s`\n\n' "$target"
+            jq -r '.[0].RepoDigests[]' qualification-host/published-image.json
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf '\nVoter application image: `%s`\n\n' "$app_target"
+            jq -r '.[0].RepoDigests[]' runtime-candidate/application-published-image.json
+            # shellcheck disable=SC2016 # Markdown backticks are literal output.
+            printf '\nOperator/fencer/runtime-agent image: `%s`\n\n' "$operator_target"
+            jq -r '.[0].RepoDigests[]' runtime-candidate/operator-published-image.json
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -715,5 +839,13 @@ jobs:
             qualification-host/SHA256SUMS
             qualification-host/push.log
             qualification-host/published-image.json
+            runtime-candidate/application-image.json
+            runtime-candidate/operator-image.json
+            runtime-candidate/binaries.sha256
+            runtime-candidate/SHA256SUMS
+            runtime-candidate/application-push.log
+            runtime-candidate/operator-push.log
+            runtime-candidate/application-published-image.json
+            runtime-candidate/operator-published-image.json
           if-no-files-found: error
           retention-days: 7
