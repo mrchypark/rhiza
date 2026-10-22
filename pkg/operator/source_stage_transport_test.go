@@ -10,17 +10,41 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 )
 
-func sourceStageHTTPFixture(t *testing.T) (*FencingExecutor, fencing.Identity, fencing.MutationIntent) {
+func sourceStageHTTPFixture(t *testing.T) (*FencingExecutor, fencing.Identity, fencing.RuntimeBinding, string, *SourceStageStore, fencing.MutationIntent) {
 	t.Helper()
-	e, f, id, _, _ := mutationLookupFixture(t)
+	e, f, id, runtime := newMutationStoreFixture(t)
+	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
+		t.Fatal(err)
+	}
+	stages, err := e.sourceStagesFor(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id.WALIdentity = "wal"
+	if _, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
+		if err := l.BindMutationScope(id, strings.Repeat("a", 64), fencing.MutationExecutionProfile); err != nil {
+			return err
+		}
+		return l.BindMutationStage(id, stages.incarnation)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { return l.Bind(id) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.Activate(id) }); err != nil {
+		t.Fatal(err)
+	}
+	run, err := e.enrolledMutationRun(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pod := supervisedTestPod()
 	asObject(pod["metadata"])["name"] = id.NodeID
 	asObject(pod["metadata"])["uid"] = id.PodUID
@@ -30,15 +54,7 @@ func sourceStageHTTPFixture(t *testing.T) (*FencingExecutor, fencing.Identity, f
 	f.mu.Lock()
 	f.authPod, f.authStatefulSet = pod, sts
 	f.mu.Unlock()
-	dir := filepath.Join(t.TempDir(), "spool")
-	provisionStageStoreFixture(t, dir, strings.Repeat("4", 64))
-	store, err := OpenSourceStageStore(dir, strings.Repeat("4", 64))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	e.SourceStages = store
-	return e, id, stageStoreIntent()
+	return e, id, runtime, run.MutationProducerUID, stages, stageStoreIntent()
 }
 
 func sourceStageRequest(t *testing.T, method, url string, id fencing.Identity, body io.Reader, token string) *http.Request {
@@ -68,7 +84,7 @@ func mustJSON(t *testing.T, value any) []byte {
 }
 
 func TestSourceStageAuthenticatedHTTPReservesAndStreamsSealedBytes(t *testing.T) {
-	e, id, draft := sourceStageHTTPFixture(t)
+	e, id, runtime, producerUID, selectedStage, draft := sourceStageHTTPFixture(t)
 	server := httptest.NewTLSServer(e.Handler())
 	t.Cleanup(server.Close)
 	ticket := strings.Repeat("d", 64)
@@ -109,14 +125,21 @@ func TestSourceStageAuthenticatedHTTPReservesAndStreamsSealedBytes(t *testing.T)
 	if descriptor.Ref != "payload-"+ticket || descriptor.Digest != digest || descriptor.Size != int64(len(payload)) {
 		t.Fatalf("sealed descriptor differs: %+v", descriptor)
 	}
-	got, err := os.ReadFile(filepath.Join(e.SourceStages.dir, descriptor.Ref))
+	sealed := draft
+	sealed.PayloadRef, sealed.PayloadDigest, sealed.PayloadSize = descriptor.Ref, descriptor.Digest, descriptor.Size
+	reader, err := selectedStage.openMutationPayloadContext(t.Context(), producerUID, sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	got, err := io.ReadAll(reader)
 	if err != nil || !bytes.Equal(got, payload) {
-		t.Fatalf("sealed bytes differ: %q %v", got, err)
+		t.Fatalf("sealed bytes differ from selected canonical stage for %s/%s: %q %v", runtime.StatefulSetUID, runtime.SourceClusterID, got, err)
 	}
 }
 
 func TestSourceStageHTTPRejectsForeignAndChangedScope(t *testing.T) {
-	e, id, draft := sourceStageHTTPFixture(t)
+	e, id, _, _, _, draft := sourceStageHTTPFixture(t)
 	server := httptest.NewTLSServer(e.Handler())
 	t.Cleanup(server.Close)
 	foreign := id
