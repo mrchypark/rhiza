@@ -66,7 +66,7 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"chaos.rhiza.io/owner: gcs-iam-preflight",
-		"name: __PROBE_KSA__",
+		"serviceAccountName: __PROBE_KSA__",
 		"qualification-gcs-iam-probe, __PROBE_MODE__",
 		"automountServiceAccountToken: false",
 		"readOnlyRootFilesystem: true",

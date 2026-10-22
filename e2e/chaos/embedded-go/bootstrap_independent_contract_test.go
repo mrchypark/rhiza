@@ -385,11 +385,11 @@ verify_rollback_side_effect_markers
 
 func bootstrapOwnershipHelpers(source string) (string, error) {
 	defs := []struct{ name, endToken string }{
-		{"mark", "owned() {"},
-		{"owned", "check_folder_identity() {"},
 		{"check_folder_identity", "check_folder_create_readback() {"},
 		{"check_folder_create_readback", "folder_iam_data() ("},
 		{"record", "if [ \"$mode\" = apply ]; then"},
+		{"mark", "owned() {"},
+		{"owned", "if [ \"$mode\" = gsa-delete-wait-worker ]; then"},
 		{"check_sa", "receipt_succeeded() {"},
 		{"receipt_succeeded", "marker_writable() {"},
 		{"marker_writable", "recover_created_gsa_marker() {"},

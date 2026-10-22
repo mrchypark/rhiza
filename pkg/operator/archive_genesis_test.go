@@ -597,7 +597,7 @@ func commitArchiveGenesisMutation(t *testing.T, e *FencingExecutor, id fencing.I
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 			return
 		}
-		body, err := io.ReadAll(r.Body)
+		body, err := readGCSMultipartMedia(r)
 		if err != nil || !bytes.Equal(body, payload) {
 			t.Errorf("genesis upload bytes differ from staged payload: %v", err)
 			http.Error(w, "payload differs", http.StatusBadRequest)
