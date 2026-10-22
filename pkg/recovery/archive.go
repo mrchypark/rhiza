@@ -1430,18 +1430,27 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 		return err
 	}
 	_ = archiveGCTrace(ctx, "readers", func() error { m.waitReaders(); return nil })
-	markers := make(map[string]time.Time)
+	type gcMarker struct {
+		modified time.Time
+		version  *objstore.ObjectVersion
+	}
+	versionedDelete := objmetrics.SupportsVersionedDelete(m.bucket)
+	markers := make(map[string]gcMarker)
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:candidate-scan:begin")
 	err = m.bucket.IterWithAttributes(ctx, m.key("archive/gc-candidates"), func(attributes objstore.IterObjectAttributes) error {
 		modified, ok := attributes.LastModified()
-		if !ok {
+		var version *objstore.ObjectVersion
+		if !ok || versionedDelete {
 			objectAttributes, err := m.bucket.Attributes(ctx, attributes.Name)
 			if err != nil {
 				return err
 			}
-			modified = objectAttributes.LastModified
+			if !ok {
+				modified = objectAttributes.LastModified
+			}
+			version = objectAttributes.Version
 		}
-		markers[attributes.Name] = modified
+		markers[attributes.Name] = gcMarker{modified: modified, version: version}
 		return nil
 	}, objstore.WithUpdatedAt(), objstore.WithRecursiveIter())
 	if err != nil {
@@ -1460,7 +1469,7 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				return err
 			}
 			marker := m.gcMarkerKey(name)
-			markedAt, marked := markers[marker]
+			markerState, marked := markers[marker]
 			delete(markers, marker)
 			if dir == "archive/blocks" {
 				generation, ok := extentObjectGeneration(name)
@@ -1469,20 +1478,20 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				}
 				if generation > gcGeneration {
 					if marked {
-						return m.bucket.Delete(ctx, marker)
+						return objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, markerState.version)
 					}
 					return nil
 				}
 				if pinnedGeneration != 0 && generation <= pinnedGeneration {
 					if marked {
-						return m.bucket.Delete(ctx, marker)
+						return objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, markerState.version)
 					}
 					return nil
 				}
 			}
 			if _, ok := keep[name]; ok {
 				if marked {
-					if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+					if err := objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, markerState.version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 						return err
 					}
 				}
@@ -1495,17 +1504,28 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 				}
 				return nil
 			}
-			if markedAt.After(cutoff) {
+			if markerState.modified.After(cutoff) {
 				return nil
+			}
+			var objectVersion *objstore.ObjectVersion
+			if versionedDelete {
+				objectAttributes, err := m.bucket.Attributes(deleteCtx, name)
+				if err != nil {
+					if m.bucket.IsObjNotFoundErr(err) {
+						return objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, marker, markerState.version)
+					}
+					return err
+				}
+				objectVersion = objectAttributes.Version
 			}
 			deletes.Go(func() error {
 				if err := deleteCtx.Err(); err != nil {
 					return err
 				}
-				if err := m.bucket.Delete(deleteCtx, name); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+				if err := objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, name, objectVersion); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 					return err
 				}
-				if err := m.bucket.Delete(deleteCtx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+				if err := objmetrics.DeleteSelectedVersion(deleteCtx, m.bucket, marker, markerState.version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 					return err
 				}
 				return nil
@@ -1523,8 +1543,8 @@ func (m *Manager) cleanupDeletes(ctx context.Context, grace time.Duration, keep 
 		return err
 	}
 	localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:begin")
-	for marker := range markers {
-		if err := m.bucket.Delete(ctx, marker); err != nil && !m.bucket.IsObjNotFoundErr(err) {
+	for marker, state := range markers {
+		if err := objmetrics.DeleteSelectedVersion(ctx, m.bucket, marker, state.version); err != nil && !m.bucket.IsObjNotFoundErr(err) {
 			localtesthooks.HitArchiveGCPhase(ctx, "archive-gc:marker-cleanup:error")
 			return err
 		}

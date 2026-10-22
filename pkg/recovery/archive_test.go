@@ -10,6 +10,7 @@ import (
 	"hash/crc32"
 	"io"
 	"math/rand"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,89 @@ type countingBucket struct {
 	blockPuts           atomic.Uint64
 	archiveHeadPuts     atomic.Uint64
 	publicationLockPuts atomic.Uint64
+}
+
+var errArchiveGenerationChanged = errors.New("archive object generation changed")
+
+type versionedArchiveDeleteBucket struct {
+	objstore.Bucket
+	mu                 sync.Mutex
+	generations        map[string]int64
+	beforeDelete       func(context.Context, string) error
+	afterCandidateScan func(context.Context) error
+}
+
+func newVersionedArchiveDeleteBucket() *versionedArchiveDeleteBucket {
+	return &versionedArchiveDeleteBucket{Bucket: objstore.NewInMemBucket(), generations: make(map[string]int64)}
+}
+
+func (*versionedArchiveDeleteBucket) SupportsVersionedDelete() bool { return true }
+
+func (b *versionedArchiveDeleteBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.Bucket.Upload(ctx, name, reader, options...); err != nil {
+		return err
+	}
+	b.generations[name]++
+	return nil
+}
+
+func (b *versionedArchiveDeleteBucket) Delete(ctx context.Context, name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.Bucket.Delete(ctx, name); err != nil {
+		return err
+	}
+	delete(b.generations, name)
+	return nil
+}
+
+func (b *versionedArchiveDeleteBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	attributes, err := b.Bucket.Attributes(ctx, name)
+	if err != nil {
+		return attributes, err
+	}
+	generation := b.generations[name]
+	attributes.Version = &objstore.ObjectVersion{Type: objstore.Generation, Value: strconv.FormatInt(generation, 10)}
+	return attributes, nil
+}
+
+func (b *versionedArchiveDeleteBucket) DeleteVersion(ctx context.Context, name string, version objstore.ObjectVersion) error {
+	if b.beforeDelete != nil {
+		if err := b.beforeDelete(ctx, name); err != nil {
+			return err
+		}
+	}
+	if version.Type != objstore.Generation {
+		return ErrArchiveBusy
+	}
+	selected, err := strconv.ParseInt(version.Value, 10, 64)
+	if err != nil {
+		return ErrArchiveBusy
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	current := b.generations[name]
+	if selected == 0 || selected != current {
+		return errArchiveGenerationChanged
+	}
+	if err := b.Bucket.Delete(ctx, name); err != nil {
+		return err
+	}
+	delete(b.generations, name)
+	return nil
+}
+
+func (b *versionedArchiveDeleteBucket) IterWithAttributes(ctx context.Context, dir string, f func(objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	err := b.Bucket.IterWithAttributes(ctx, dir, f, options...)
+	if err == nil && dir == "cluster/archive/gc-candidates" && b.afterCandidateScan != nil {
+		err = b.afterCandidateScan(ctx)
+		b.afterCandidateScan = nil
+	}
+	return err
 }
 
 type blockingUploadBucket struct {
@@ -1298,6 +1382,73 @@ func TestArchiveCleanupRemovesOrphanMarker(t *testing.T) {
 	}
 	if exists, err := bucket.Exists(ctx, orphan); err != nil || exists {
 		t.Fatalf("orphan marker exists=%t err=%v", exists, err)
+	}
+}
+
+func TestArchiveGCVersionDeleteCannotRemoveReplacement(t *testing.T) {
+	ctx := context.Background()
+	bucket := newVersionedArchiveDeleteBucket()
+	manager := NewManager(bucket, "cluster", 1)
+	name := manager.key("archive/manifests/old.json")
+	marker := manager.gcMarkerKey(name)
+	if err := bucket.Upload(ctx, name, strings.NewReader("old version")); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, marker, strings.NewReader(name)); err != nil {
+		t.Fatal(err)
+	}
+	var replaced atomic.Bool
+	bucket.beforeDelete = func(ctx context.Context, key string) error {
+		if key == name && replaced.CompareAndSwap(false, true) {
+			return bucket.Upload(ctx, key, strings.NewReader("replacement generation"))
+		}
+		return nil
+	}
+	err := manager.cleanupDeletes(ctx, 0, map[string]struct{}{}, 0)
+	if !errors.Is(err, errArchiveGenerationChanged) {
+		t.Fatalf("archive cleanup error=%v, want exact-generation conflict", err)
+	}
+	if !replaced.Load() {
+		t.Fatal("cleanup did not reach selected manifest")
+	}
+	reader, err := bucket.Get(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(data) != "replacement generation" {
+		t.Fatalf("replacement bytes=%q read=%v close=%v", data, readErr, closeErr)
+	}
+}
+
+func TestArchiveGCMarkerDeleteUsesSelectedGeneration(t *testing.T) {
+	ctx := context.Background()
+	bucket := newVersionedArchiveDeleteBucket()
+	manager := NewManager(bucket, "cluster", 1)
+	name := manager.key("archive/manifests/kept.json")
+	marker := manager.gcMarkerKey(name)
+	if err := bucket.Upload(ctx, name, strings.NewReader("kept")); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(ctx, marker, strings.NewReader(name)); err != nil {
+		t.Fatal(err)
+	}
+	bucket.afterCandidateScan = func(ctx context.Context) error {
+		return bucket.Upload(ctx, marker, strings.NewReader("replacement marker"))
+	}
+	err := manager.cleanupDeletes(ctx, 0, map[string]struct{}{name: {}}, 0)
+	if !errors.Is(err, errArchiveGenerationChanged) {
+		t.Fatalf("archive marker cleanup error=%v, want exact-generation conflict", err)
+	}
+	reader, err := bucket.Get(ctx, marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(data) != "replacement marker" {
+		t.Fatalf("replacement marker bytes=%q read=%v close=%v", data, readErr, closeErr)
 	}
 }
 

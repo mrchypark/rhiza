@@ -10,7 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -128,6 +130,79 @@ type streamingIterBucket struct {
 type oldAttributesBucket struct {
 	objstore.Bucket
 	modified time.Time
+}
+
+var errCheckpointGenerationChanged = errors.New("checkpoint object generation changed")
+
+type generationDeleteBucket struct {
+	objstore.Bucket
+	mu           sync.Mutex
+	generations  map[string]int64
+	beforeDelete func(context.Context, string) error
+}
+
+func newGenerationDeleteBucket() *generationDeleteBucket {
+	return &generationDeleteBucket{Bucket: objstore.NewInMemBucket(), generations: make(map[string]int64)}
+}
+
+func (*generationDeleteBucket) SupportsVersionedDelete() bool { return true }
+
+func (b *generationDeleteBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.Bucket.Upload(ctx, name, reader, options...); err != nil {
+		return err
+	}
+	b.generations[name]++
+	return nil
+}
+
+func (b *generationDeleteBucket) Delete(ctx context.Context, name string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.Bucket.Delete(ctx, name); err != nil {
+		return err
+	}
+	delete(b.generations, name)
+	return nil
+}
+
+func (b *generationDeleteBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	attributes, err := b.Bucket.Attributes(ctx, name)
+	if err != nil {
+		return attributes, err
+	}
+	generation := b.generations[name]
+	attributes.Version = &objstore.ObjectVersion{Type: objstore.Generation, Value: strconv.FormatInt(generation, 10)}
+	return attributes, nil
+}
+
+func (b *generationDeleteBucket) DeleteVersion(ctx context.Context, name string, version objstore.ObjectVersion) error {
+	if b.beforeDelete != nil {
+		if err := b.beforeDelete(ctx, name); err != nil {
+			return err
+		}
+	}
+	if version.Type != objstore.Generation {
+		return ErrPublisherFenced
+	}
+	selected, err := strconv.ParseInt(version.Value, 10, 64)
+	if err != nil {
+		return ErrPublisherFenced
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	current := b.generations[name]
+	if selected == 0 || selected != current {
+		return errCheckpointGenerationChanged
+	}
+	if err := b.Bucket.Delete(ctx, name); err != nil {
+		return err
+	}
+	delete(b.generations, name)
+	return nil
 }
 
 func (b *oldAttributesBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
@@ -721,6 +796,48 @@ func TestGarbageCollectRetiresRootBeforeBlocks(t *testing.T) {
 	}
 	if exists, _ := bucket.Exists(ctx, key); exists {
 		t.Fatal("orphaned block survived following GC pass")
+	}
+}
+
+func TestCheckpointGCVersionDeleteCannotRemoveReplacement(t *testing.T) {
+	ctx := context.Background()
+	bucket := newGenerationDeleteBucket()
+	manager := NewManager(bucket, "cluster", t.TempDir(), 9)
+	old := createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "old version")}, 10)
+	if err := manager.PromoteCertifiedCurrent(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	current := createFiles(t, manager, ctx, []Source{source(t, RoleSQLite, "current version")}, 11)
+	if err := manager.PromoteCertifiedCurrent(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.GarbageCollectFrom(ctx, nil, 1, current.Index, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	blockKeyValue := manager.key(blockObjectKey(old.Files[0].Blocks[0]))
+	var replaced atomic.Bool
+	bucket.beforeDelete = func(ctx context.Context, name string) error {
+		if name == blockKeyValue && replaced.CompareAndSwap(false, true) {
+			return bucket.Upload(ctx, name, strings.NewReader("replacement generation"))
+		}
+		return nil
+	}
+	err := manager.GarbageCollectFrom(ctx, nil, 1, current.Index, 0)
+	if !errors.Is(err, errCheckpointGenerationChanged) {
+		t.Fatalf("GC error=%v, want exact-generation conflict", err)
+	}
+	if !replaced.Load() {
+		t.Fatal("GC did not reach the selected stale block")
+	}
+	reader, err := bucket.Get(ctx, blockKeyValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(data) != "replacement generation" {
+		t.Fatalf("replacement bytes=%q read=%v close=%v", data, readErr, closeErr)
 	}
 }
 
