@@ -523,6 +523,34 @@ func resumeMaterializedGeneration(ctx context.Context, bucket objstore.Bucket, r
 	if err != nil || !present || intent.Version != 2 || intent.OperationID != operationID || intent.SourcePrefix != sourcePrefix || intent.TargetPrefix != targetPrefix || intent.ManifestHash != result.ManifestHash || intent.SourceBootstrapHash != bootstrap || hashErr != nil || intent.TargetMembershipHash != targetHash {
 		return GenerationAnchor{}, false, fmt.Errorf("published generation anchor does not match fork intent")
 	}
+	// MaterializeGeneration publishes the anchor and archive head before its
+	// caller commits ForkResult. If that response is lost, replay the verified
+	// materialization below and let the caller commit the same result. The
+	// existing anchor and head are checked against the rebuilt source evidence.
+	if _, present, err := readForkResult(ctx, bucket, targetPrefix); err != nil {
+		return GenerationAnchor{}, false, err
+	} else if !present {
+		prefix, err := parseGenerationHash(anchor.SourcePrefixHash)
+		if err != nil {
+			return GenerationAnchor{}, false, err
+		}
+		target := NewManager(bucket, targetPrefix, 1)
+		defer target.Close()
+		if err := target.Load(ctx); err != nil {
+			return GenerationAnchor{}, false, fmt.Errorf("load interrupted target archive: %w", err)
+		}
+		if _, ok := target.HeadVersion(); !ok {
+			return GenerationAnchor{}, false, fmt.Errorf("interrupted generation anchor has no committed archive head")
+		}
+		want := archiveHead{ConfigID: target.configID, Generation: 1, Base: quepaxa.Slot(anchor.SourceTip), BasePrefix: prefix, Tip: quepaxa.Slot(anchor.SourceTip), BaseAnchor: &archiveAnchorRef{Hash: anchorHash}, LineageAnchor: &archiveAnchorRef{Hash: anchorHash}}
+		target.mu.Lock()
+		head, tip := target.head, target.tip
+		target.mu.Unlock()
+		if tip != quepaxa.Slot(anchor.SourceTip) || !archiveHeadsEqual(head, want) {
+			return GenerationAnchor{}, false, fmt.Errorf("interrupted target archive head does not match generation anchor")
+		}
+		return GenerationAnchor{}, false, nil
+	}
 	pin, err := PinGenerationAnchor(ctx, bucket, targetPrefix, "resume-"+shortHash(operationID), forkLease)
 	if err != nil {
 		return GenerationAnchor{}, false, fmt.Errorf("verify published generation root: %w", err)
