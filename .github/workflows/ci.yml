@@ -6,6 +6,11 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      fencing_only:
+        description: Run only the fencing harness and checkpoint/archive regression tests
+        type: boolean
+        required: false
+        default: false
       publish_chaos_image:
         description: Publish the tested qualification host image for a local run
         type: boolean
@@ -16,6 +21,37 @@ permissions:
   contents: read
 
 jobs:
+  fencing-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.fencing_only
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check fencing harness fixtures
+        run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
+      - name: Check public fencing artifact fixtures
+        env:
+          CGO_ENABLED: 1
+        run: go test -race ./e2e/fencing -count=1 -timeout=5m
+      - name: Check checkpoint adoption and archive regressions
+        env:
+          CGO_ENABLED: 1
+        run: |
+          tests='^(TestLearnerHardKillAtAdoptionWALBoundaries|TestLearnerExpiredPinDuringBuildAllowsSuccessorGCAndRestart|TestLearnerExpiredPinAtManifestAllowsSuccessorGCAndRestart|TestCertifiedCheckpointDefersOnlyLivePinCompaction|TestCertifiedCheckpointDefersOnlyHeldGCLockCompaction|TestCheckpointClaimLifecycle.*|TestNodeForegroundCheckpointClaimRetry.*|TestNodeForegroundArchiveBusy.*|TestNodeArchiveGCPhaseTraceFiniteTerminals|TestNodeArchiveExtentAttributionRowGate)$'
+          go test -tags rhiza_local_testhooks . ./pkg/node ./pkg/checkpoint -run "$tests" -count=1 -timeout=8m
+          go test -race -tags rhiza_local_testhooks . ./pkg/node ./pkg/checkpoint -run "$tests" -count=1 -timeout=8m
+      - name: Check archive version-GC races
+        env:
+          CGO_ENABLED: 1
+        run: |
+          tests='^(TestArchiveGCVersionDeleteCannotRemoveReplacement|TestRecoveryPinGCDoesNotDeleteConcurrentRenewal|TestRecoveryPinGCKeepsGenerationWithoutReadingExtentChain)$'
+          go test -tags rhiza_local_testhooks ./pkg/recovery -run "$tests" -count=1 -timeout=2m
+          go test -race -tags rhiza_local_testhooks ./pkg/recovery -run "$tests" -count=1 -timeout=2m
+
   cooperative-fencing:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -79,6 +115,7 @@ jobs:
           fi
 
   operator-chaos:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -116,6 +153,7 @@ jobs:
         run: kind delete cluster --name rhiza-operator-chaos
 
   automatic-operator-chaos:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -171,6 +209,7 @@ jobs:
         if: always()
         run: kind delete cluster --name rhiza-operator-chaos
   membership-e2e:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -260,6 +299,7 @@ jobs:
           go test -race . -run '^TestS3(Membership|VoterIdentity)' -count=1 -timeout=8m
 
   rust-sdk:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -295,6 +335,7 @@ jobs:
           cargo test --manifest-path "sdk/rust/target/package/rhizadb-$crate_version/Cargo.toml" --locked --all-targets
 
   go:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -402,6 +443,7 @@ jobs:
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   containers:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -430,6 +472,7 @@ jobs:
           tags: rhiza-operator:ci
 
   anchor-operator-chaos:
+    if: github.event_name != 'workflow_dispatch' || !inputs.fencing_only
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -516,7 +559,7 @@ jobs:
           retention-days: 7
 
   publish-chaos-image:
-    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image
+    if: github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only
     needs: [anchor-operator-chaos, go, containers]
     runs-on: ubuntu-latest
     timeout-minutes: 10

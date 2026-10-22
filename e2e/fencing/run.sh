@@ -9,6 +9,21 @@ profile_field_valid() {
   esac
 }
 
+crictl_version_field() {
+  printf '%s\n' "$2" | awk -F: -v field="$1" '
+    $1 == field {
+      value = substr($0, index($0, ":") + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      count++
+      result = value
+    }
+    END {
+      if (count != 1 || result == "") exit 1
+      print result
+    }'
+}
+
 if [ "${FENCING_PROFILE_SELFTEST:-}" = 1 ]; then
   profile_field_valid containerd
   profile_field_valid 1.7.27
@@ -16,6 +31,18 @@ if [ "${FENCING_PROFILE_SELFTEST:-}" = 1 ]; then
   profile_field_valid 6.12.0
   if profile_field_valid '' || profile_field_valid 'runtime:type'; then
     echo 'runtime profile validator accepted an invalid field' >&2
+    exit 1
+  fi
+  fencing_crictl_fixture='Version:  0.1.0
+RuntimeName:  containerd
+RuntimeVersion:  1.7.27
+RuntimeApiVersion:  v1'
+  [ "$(crictl_version_field RuntimeName "$fencing_crictl_fixture")" = containerd ]
+  [ "$(crictl_version_field RuntimeVersion "$fencing_crictl_fixture")" = 1.7.27 ]
+  [ "$(crictl_version_field RuntimeApiVersion "$fencing_crictl_fixture")" = v1 ]
+  if crictl_version_field RuntimeName 'RuntimeName: containerd
+RuntimeName: containerd' >/dev/null; then
+    echo 'runtime profile parser accepted duplicate fields' >&2
     exit 1
   fi
   exit 0
@@ -125,7 +152,7 @@ cleanup() {
       fencing_exit=1
     fi
   fi
-  rm -f "$fencing_tmp/tls.key" "$fencing_tmp/tls.crt" "$fencing_tmp/openssl.cnf" "$fencing_tmp/authority.yaml" "$fencing_tmp/supervised.patch.yaml" "$fencing_tmp/sa.yaml" "$fencing_tmp/rbac.yaml" "$fencing_tmp/manifests.json" "$fencing_tmp/crictl-version.json" "$fencing_tmp/crictl-info.json"
+  rm -f "$fencing_tmp/tls.key" "$fencing_tmp/tls.crt" "$fencing_tmp/openssl.cnf" "$fencing_tmp/authority.yaml" "$fencing_tmp/supervised.patch.yaml" "$fencing_tmp/sa.yaml" "$fencing_tmp/rbac.yaml" "$fencing_tmp/manifests.json" "$fencing_tmp/crictl-version.txt" "$fencing_tmp/crictl-info.json"
   rmdir "$fencing_tmp" || fencing_exit=1
   printf '%s\n' "$fencing_exit" >"$FENCING_E2E_OUT/actual-exit.txt"
   exit "$fencing_exit"
@@ -137,11 +164,11 @@ kind create cluster --name "$fencing_cluster" --image "$fencing_node_image" --wa
 fencing_owned=true
 printf '%s\n' "$fencing_cluster" >"$FENCING_E2E_OUT/owned-cluster.txt"
 fencing_node=$fencing_cluster-control-plane
-docker exec "$fencing_node" crictl version -o json >"$fencing_tmp/crictl-version.json"
+docker exec "$fencing_node" crictl version >"$fencing_tmp/crictl-version.txt"
 docker exec "$fencing_node" crictl info -o json >"$fencing_tmp/crictl-info.json"
-fencing_runtime_name=$(jq -er '.runtimeName' "$fencing_tmp/crictl-version.json")
-fencing_runtime_version=$(jq -er '.runtimeVersion' "$fencing_tmp/crictl-version.json")
-fencing_runtime_api=$(jq -er '.runtimeApiVersion' "$fencing_tmp/crictl-version.json")
+fencing_runtime_name=$(crictl_version_field RuntimeName "$(cat "$fencing_tmp/crictl-version.txt")")
+fencing_runtime_version=$(crictl_version_field RuntimeVersion "$(cat "$fencing_tmp/crictl-version.txt")")
+fencing_runtime_api=$(crictl_version_field RuntimeApiVersion "$(cat "$fencing_tmp/crictl-version.txt")")
 fencing_runtime_type=$(jq -er '.config.containerd as $c | $c.runtimes[$c.defaultRuntimeName].runtimeType' "$fencing_tmp/crictl-info.json")
 fencing_kernel=$(docker exec "$fencing_node" uname -r)
 fencing_cgroup_fs=$(docker exec "$fencing_node" stat -fc %T /sys/fs/cgroup)
