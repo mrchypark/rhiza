@@ -97,7 +97,7 @@ func TestGCSNetworkChaosAdmissionRemainsNarrowAndAddsOnlyBoundedShapes(t *testin
 		"object.spec.mode == 'all' && variables.selectorRuntimeAgent",
 		"object.spec.mode == 'one' && variables.selectorOperatorPod",
 		"variables.selector.pods['@NAMESPACE@'].all(p, p.matches('^rhiza-voter-[0-9]+$'))",
-		"!has(object.spec.selector.nodes)",
+		"!has(variables.selector.nodes) && !has(variables.selector.nodeSelectors)",
 		"!has(object.spec.target.selector.nodes)",
 		"resources: [pods]\n    verbs: [create, get, list, watch, delete, patch]",
 		"resources: [configmaps, services]\n    verbs: [create, get, list, watch, delete]",
