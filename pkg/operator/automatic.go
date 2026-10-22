@@ -963,11 +963,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 			return block(state, "failed voter identity has not been authenticated")
 		}
 		if failed == "" {
-			archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), recovery.ArchiveConfigID)
-			err := archive.Load(ctx)
-			tip := archive.Tip()
-			archive.Close()
-			if err != nil || tip == 0 {
+			if !automaticArchiveAllowsGenerationRecovery(ctx, c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), obs.Durability, policy.AllowDataLoss) {
 				return block(state, "certified archive is unavailable; no destructive recovery will start")
 			}
 		}
@@ -1000,6 +996,21 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		return err
 	}
 	return c.autoStatus(ctx, r, state, string(decision), message)
+}
+
+// An empty async archive can authorize generation recovery only when its
+// initialized HEAD is present and the policy explicitly accepts ACK loss.
+func automaticArchiveAllowsGenerationRecovery(ctx context.Context, bucket objstore.Bucket, prefix, durability string, allowDataLoss bool) bool {
+	archive := recovery.NewManager(bucket, prefix, recovery.ArchiveConfigID)
+	defer archive.Close()
+	if err := archive.Load(ctx); err != nil {
+		return false
+	}
+	if archive.Tip() != 0 {
+		return true
+	}
+	_, hasHead := archive.HeadVersion()
+	return durability == "async" && allowDataLoss && hasHead
 }
 
 func (c *Controller) observeAutomatic(ctx context.Context, r *ClusterResource, state *autoControl, sts object) (AutoObservation, map[quepaxa.NodeID]network.MembershipStatus, error) {

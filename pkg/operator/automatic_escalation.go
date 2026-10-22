@@ -9,7 +9,6 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
-	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -133,11 +132,7 @@ func (c *Controller) assessAutomaticEscalation(ctx context.Context, r *ClusterRe
 	if intent.Durability == "async" && !intent.Policy.AllowDataLoss {
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "async generation escalation requires allowDataLoss")
 	}
-	archive := recovery.NewManager(c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), recovery.ArchiveConfigID)
-	err = archive.Load(ctx)
-	tip := archive.Tip()
-	archive.Close()
-	if err != nil || tip == 0 {
+	if !automaticArchiveAllowsGenerationRecovery(ctx, c.Bucket, path.Join(c.Prefix, state.ActiveClusterID), intent.Durability, intent.Policy.AllowDataLoss) {
 		return automaticEscalationStop, c.autoStatus(ctx, r, state, "Blocked", "certified archive unavailable for escalation")
 	}
 	state.Sequence++
