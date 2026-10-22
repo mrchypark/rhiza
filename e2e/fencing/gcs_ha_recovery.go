@@ -338,7 +338,7 @@ func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, toke
 	if err := operatorFault.Restore(chaosCtx); err != nil {
 		return nil, fmt.Errorf("restore operator control after return observation: %w", err)
 	}
-	outcome, err := waitForGCSRecovery(ctx, source, "fork", expectedRows, out)
+	outcome, err := waitForGCSRecovery(ctx, source, pending, "fork", expectedRows, out)
 	if err != nil {
 		return nil, err
 	}
@@ -348,6 +348,7 @@ func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, toke
 
 type pendingGCSFence struct {
 	Name    string                `json:"name"`
+	UID     string                `json:"uid"`
 	Request operator.FenceRequest `json:"request"`
 }
 
@@ -379,7 +380,12 @@ func waitForPendingGCSFence(ctx context.Context, source gcsRecoverySource) (pend
 			if nested(item, "status", "proof") != nil {
 				return false, fmt.Errorf("matching generation fence proof arrived before operator isolation")
 			}
-			matches = append(matches, pendingGCSFence{Name: text(nested(item, "metadata", "name")), Request: request})
+			name := text(nested(item, "metadata", "name"))
+			uid := text(nested(item, "metadata", "uid"))
+			if name == "" || uid == "" {
+				return false, fmt.Errorf("pending generation fence lacks a stable resource identity")
+			}
+			matches = append(matches, pendingGCSFence{Name: name, UID: uid, Request: request})
 		}
 		if len(matches) > 1 {
 			return false, fmt.Errorf("multiple exact generation fence requests exist")
@@ -401,11 +407,11 @@ func confirmPendingGCSFence(ctx context.Context, source gcsRecoverySource, pendi
 	if err != nil {
 		return err
 	}
-	var request operator.FenceRequest
-	if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
+	request, err := exactPendingGCSFenceRequest(item, pending)
+	if err != nil {
 		return err
 	}
-	if !sameFenceRequest(request, pending.Request) || request.SourceClusterID != source.ClusterID || !sameTargets(request.Targets, source.Targets) || nested(item, "status", "proof") != nil {
+	if request.SourceClusterID != source.ClusterID || !sameTargets(request.Targets, source.Targets) || nested(item, "status", "proof") != nil {
 		return fmt.Errorf("exact fence request is no longer pending without proof")
 	}
 	return nil
@@ -417,7 +423,7 @@ func waitForGCSFenceProof(ctx context.Context, source gcsRecoverySource, pending
 		if err != nil {
 			return false, err
 		}
-		if !sameFenceRequestSpec(nested(item, "spec"), pending.Request) {
+		if _, err := exactPendingGCSFenceRequest(item, pending); err != nil {
 			return false, fmt.Errorf("generation fence request mutated after creation")
 		}
 		if nested(item, "status", "proof") == nil {
@@ -1333,9 +1339,30 @@ func gcsWorkloadHasNoPVC(sts any) bool {
 	return true
 }
 
-func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, expectedBase, expectedRows, out string) (*gcsRecoveryOutcome, error) {
+func pendingFenceIdentityMatches(item any, pending pendingGCSFence) bool {
+	return pending.Name != "" && pending.UID != "" && text(nested(item, "metadata", "name")) == pending.Name && text(nested(item, "metadata", "uid")) == pending.UID
+}
+
+func exactPendingGCSFenceRequest(item any, pending pendingGCSFence) (operator.FenceRequest, error) {
+	var request operator.FenceRequest
+	if !pendingFenceIdentityMatches(item, pending) {
+		return request, fmt.Errorf("pending generation fence resource identity changed")
+	}
+	if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
+		return request, err
+	}
+	if !sameFenceRequest(request, pending.Request) {
+		return request, fmt.Errorf("pending generation fence request changed")
+	}
+	return request, nil
+}
+
+func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence, expectedBase, expectedRows, out string) (*gcsRecoveryOutcome, error) {
 	if source.ClusterID == "" || source.StatefulSetUID == "" || source.BindingUID == "" || source.Bucket == "" || source.Prefix == "" || len(source.Targets) == 0 || expectedBase != "fork" && expectedBase != "empty" || expectedRows == "" {
 		return nil, fmt.Errorf("GCS recovery observation contract is incomplete")
+	}
+	if pending.Name == "" || pending.UID == "" || pending.Request.OperationID == "" || pending.Request.SourceClusterID != source.ClusterID || !sameTargets(pending.Request.Targets, source.Targets) {
+		return nil, fmt.Errorf("GCS recovery is not bound to the exact pending fence")
 	}
 	outcome := &gcsRecoveryOutcome{Source: source}
 	if err := wait(ctx, "IndependentV2 generation fence", func() (bool, error) {
@@ -1345,14 +1372,17 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, expectedB
 		}
 		items, _ := list["items"].([]any)
 		for _, item := range items {
-			if nested(item, "spec", "scope") != string(operator.ScopeGeneration) || nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "statefulSetUID") != source.StatefulSetUID || nested(item, "spec", "bindingUID") != source.BindingUID || nested(item, "status", "proof") == nil {
+			if text(nested(item, "metadata", "name")) != pending.Name {
 				continue
 			}
-			var candidate operator.FenceRequest
-			if err := json.Unmarshal(encoded(nested(item, "spec")), &candidate); err != nil {
+			candidate, err := exactPendingGCSFenceRequest(item, pending)
+			if err != nil {
 				return false, err
 			}
-			if !sameTargets(candidate.Targets, source.Targets) {
+			if candidate.Scope != operator.ScopeGeneration || candidate.SourceClusterID != source.ClusterID || !sameTargets(candidate.Targets, source.Targets) {
+				return false, fmt.Errorf("pending generation fence no longer matches the captured source cohort")
+			}
+			if nested(item, "status", "proof") == nil {
 				continue
 			}
 			request, proof, err := verifyIndependentGenerationProof(item, source.ClusterID, source.StatefulSetUID, source.BindingUID, source.Targets, source.Bucket, source.Prefix, source.Namespace, source.StatefulSet, source.LogicalID)
@@ -1373,7 +1403,7 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, expectedB
 		}
 		items, _ := list["items"].([]any)
 		for _, item := range items {
-			if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != outcome.Fence.OperationID {
+			if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != pending.Request.OperationID {
 				continue
 			}
 			if err := json.Unmarshal(encoded(item), &outcome.Recovery); err != nil {
@@ -1382,8 +1412,13 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, expectedB
 			if outcome.Recovery.Status.Phase != "Complete" || outcome.Recovery.Status.Stage != "Complete" {
 				return false, nil
 			}
-			if outcome.Recovery.Status.Source != source.ClusterID || outcome.Recovery.Status.StatefulSetUID != source.StatefulSetUID || outcome.Recovery.Status.TargetBaseKind != expectedBase || (expectedBase == "empty" && (outcome.Recovery.Status.RecoveredTip != 0 || outcome.Recovery.Status.ManifestHash != "")) {
+			if outcome.Recovery.Spec.SourceClusterID != source.ClusterID || outcome.Recovery.Spec.RecoveryID != pending.Request.OperationID ||
+				outcome.Recovery.Status.Source != source.ClusterID || outcome.Recovery.Status.StatefulSetUID != source.StatefulSetUID ||
+				outcome.Recovery.Status.TargetBaseKind != expectedBase || (expectedBase == "empty" && (outcome.Recovery.Status.RecoveredTip != 0 || outcome.Recovery.Status.ManifestHash != "")) {
 				return false, fmt.Errorf("completed recovery differs from the captured source or expected archive base")
+			}
+			if err := recoveryFenceMatchesProof(outcome.Recovery, outcome.Fence, outcome.Proof); err != nil {
+				return false, err
 			}
 			return true, nil
 		}
@@ -1431,6 +1466,21 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, expectedB
 	return outcome, nil
 }
 
+// recoveryFenceMatchesProof ties the persisted recovery fence to the exact
+// captured generation-fence request and validated proof, not merely to the
+// source cluster and workload UID.
+func recoveryFenceMatchesProof(recovery operator.Resource, request operator.FenceRequest, proof operator.FenceProof) error {
+	fence := recovery.Spec.Fence
+	if request.OperationID == "" || request.SourceClusterID == "" || request.StatefulSetUID == "" || proof.ProofID == "" ||
+		proof.OperationID != request.OperationID || proof.SourceClusterID != request.SourceClusterID || proof.BindingUID != request.BindingUID ||
+		recovery.Spec.RecoveryID != request.OperationID || recovery.Spec.SourceClusterID != request.SourceClusterID ||
+		!fence.Confirmed || fence.RecoveryID != request.OperationID || fence.ClusterID != request.SourceClusterID ||
+		fence.StatefulSetUID != request.StatefulSetUID || fence.Evidence != proof.ProofID {
+		return fmt.Errorf("recovery fence does not bind the exact captured generation proof")
+	}
+	return nil
+}
+
 func readMembershipWithToken(ctx context.Context, f *forward, token string) (network.MembershipStatus, error) {
 	data, err := call(ctx, f, "/membership/status", nil, token)
 	var status network.MembershipStatus
@@ -1466,13 +1516,13 @@ func verifyRecoveryLineage(previous, next operator.Resource, previousFence, next
 	return nil
 }
 
-func verifyAsyncEmptyRecovery(resource operator.Resource, proof operator.FenceProof) error {
+func verifyAsyncEmptyRecovery(resource operator.Resource, request operator.FenceRequest, proof operator.FenceProof) error {
 	if resource.Status.Phase != "Complete" || resource.Status.Stage != "Complete" || resource.Status.TargetBaseKind != "empty" ||
 		resource.Status.SourceDurability != "async" || resource.Spec.Durability != "async" || !resource.Spec.AllowDataLoss ||
 		resource.Status.RecoveredTip != 0 || resource.Status.ManifestHash != "" || proof.IndependentV2 == nil || proof.IndependentV2.StorageScope.Provider != "gcs" {
 		return fmt.Errorf("async zero-tip recovery lacks explicit loss authorization or committed empty GCS lineage")
 	}
-	return nil
+	return recoveryFenceMatchesProof(resource, request, proof)
 }
 
 // verifyIndependentGenerationProof validates the issuer-published V2 metadata
