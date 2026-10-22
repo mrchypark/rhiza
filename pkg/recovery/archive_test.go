@@ -178,20 +178,22 @@ type blockingHeadUploadBucket struct {
 
 type archiveSyncAdmissionBucket struct {
 	objstore.Bucket
-	headReads        atomic.Uint64
-	lockReads        atomic.Uint64
-	failHeadReads    atomic.Int64
-	invalidHeadGets  atomic.Int64
-	firstHead        chan struct{}
-	releaseFirstHead chan struct{}
-	recheckAt        uint64
-	recheckObserved  chan struct{}
-	failuresObserved chan struct{}
-	busyObserved     chan struct{}
-	firstHeadOnce    sync.Once
-	recheckOnce      sync.Once
-	failuresOnce     sync.Once
-	busyOnce         sync.Once
+	headReads                atomic.Uint64
+	lockReads                atomic.Uint64
+	failHeadReads            atomic.Int64
+	invalidHeadGets          atomic.Int64
+	firstHead                chan struct{}
+	releaseFirstHead         chan struct{}
+	recheckAt                atomic.Uint64
+	recheckObserved          chan struct{}
+	failuresObserved         chan struct{}
+	busyObserved             chan struct{}
+	armHeadFailureOnLockRead bool
+	headFailureArmed         atomic.Bool
+	firstHeadOnce            sync.Once
+	recheckOnce              sync.Once
+	failuresOnce             sync.Once
+	busyOnce                 sync.Once
 }
 
 func (b *archiveSyncAdmissionBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
@@ -205,15 +207,17 @@ func (b *archiveSyncAdmissionBucket) Attributes(ctx context.Context, name string
 			case <-b.releaseFirstHead:
 			}
 		}
-		if read == b.recheckAt && b.recheckObserved != nil {
+		if recheckAt := b.recheckAt.Load(); recheckAt != 0 && read == recheckAt && b.recheckObserved != nil {
 			b.recheckOnce.Do(func() { close(b.recheckObserved) })
 		}
-		for failures := b.failHeadReads.Load(); failures > 0; failures = b.failHeadReads.Load() {
-			if b.failHeadReads.CompareAndSwap(failures, failures-1) {
-				if failures == 1 && b.failuresObserved != nil {
-					b.failuresOnce.Do(func() { close(b.failuresObserved) })
+		if !b.armHeadFailureOnLockRead || b.headFailureArmed.Load() {
+			for failures := b.failHeadReads.Load(); failures > 0; failures = b.failHeadReads.Load() {
+				if b.failHeadReads.CompareAndSwap(failures, failures-1) {
+					if failures == 1 && b.failuresObserved != nil {
+						b.failuresOnce.Do(func() { close(b.failuresObserved) })
+					}
+					return objstore.ObjectAttributes{}, errors.New("injected archive head read failure")
 				}
-				return objstore.ObjectAttributes{}, errors.New("injected archive head read failure")
 			}
 		}
 	}
@@ -233,6 +237,12 @@ func (b *archiveSyncAdmissionBucket) Get(ctx context.Context, name string) (io.R
 	}
 	if strings.HasSuffix(name, "/archive/PUBLISH_LOCK") {
 		b.lockReads.Add(1)
+		if b.armHeadFailureOnLockRead {
+			b.headFailureArmed.Store(true)
+		}
+		// The next HEAD Attributes call is the admission recheck after this
+		// lock read reports the holder's active lease.
+		b.recheckAt.Store(b.headReads.Load() + 1)
 		if b.busyObserved != nil {
 			b.busyOnce.Do(func() { close(b.busyObserved) })
 		}
@@ -719,8 +729,8 @@ func TestArchiveSyncThroughBusyRecheckDoesNotFalseSucceed(t *testing.T) {
 		invalidHeadGets int64
 	}{
 		{name: "head below target", seedLower: true},
-		{name: "head read failure", failHeadReads: 2},
-		{name: "head validation failure", seedLower: true, invalidHeadGets: 2},
+		{name: "head read failure", failHeadReads: 1},
+		{name: "head validation failure", seedLower: true, invalidHeadGets: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx, base, core, waiter, writer := newArchiveSyncAdmissionManagers(t)
@@ -736,6 +746,29 @@ func TestArchiveSyncThroughBusyRecheckDoesNotFalseSucceed(t *testing.T) {
 				t.Fatal(err)
 			}
 			target := core.Tip()
+			if test.invalidHeadGets > 0 {
+				// SyncThrough now refreshes HEAD before joining or creating a
+				// publication batch. These failures therefore belong to that
+				// entry read, not the later busy-lock recheck. A failed initial
+				// read must be returned, never interpreted as covered work.
+				observed := &archiveSyncAdmissionBucket{
+					Bucket:           base,
+					failuresObserved: make(chan struct{}),
+				}
+				observed.failHeadReads.Store(test.failHeadReads)
+				observed.invalidHeadGets.Store(test.invalidHeadGets)
+				waiter.bucket = observed
+				err := waiter.SyncThrough(ctx, core, target)
+				select {
+				case <-observed.failuresObserved:
+				default:
+					t.Fatal("injected HEAD failure was not consumed by the entry read")
+				}
+				if err == nil {
+					t.Fatal("SyncThrough succeeded after an unvalidated HEAD read")
+				}
+				return
+			}
 			holder := NewManager(base, "cluster", 1)
 			defer holder.Close()
 			held, release := make(chan struct{}), make(chan struct{})
@@ -765,12 +798,12 @@ func TestArchiveSyncThroughBusyRecheckDoesNotFalseSucceed(t *testing.T) {
 				t.Fatal(ctx.Err())
 			}
 			observed := &archiveSyncAdmissionBucket{
-				Bucket:           base,
-				failHeadReads:    atomic.Int64{},
-				invalidHeadGets:  atomic.Int64{},
-				recheckAt:        2,
-				recheckObserved:  make(chan struct{}),
-				failuresObserved: make(chan struct{}),
+				Bucket:                   base,
+				failHeadReads:            atomic.Int64{},
+				invalidHeadGets:          atomic.Int64{},
+				recheckObserved:          make(chan struct{}),
+				failuresObserved:         make(chan struct{}),
+				armHeadFailureOnLockRead: test.failHeadReads > 0,
 			}
 			observed.failHeadReads.Store(test.failHeadReads)
 			observed.invalidHeadGets.Store(test.invalidHeadGets)
@@ -2341,8 +2374,10 @@ func TestArchivePublishRevalidatesItsTail(t *testing.T) {
 	if err := manager.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
 	}
-	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 14 || gets != 6 {
-		t.Fatalf("publish physical attributes=%d gets=%d, want 14/6 (archive head attributes=%d gets=%d, block gets=%d)", heads, gets, bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load())
+	if heads, gets := bucket.heads.Load(), bucket.gets.Load(); heads != 15 || gets != 6 {
+		// The entry-point freshness check adds one physical HEAD
+		// Attributes call; it is metadata-only, so payload GETs stay 6.
+		t.Fatalf("publish physical attributes=%d gets=%d, want 15/6 including entry HEAD refresh (archive head attributes=%d gets=%d, block gets=%d)", heads, gets, bucket.archiveHeads.Load(), bucket.archiveHeadGets.Load(), bucket.blockGets.Load())
 	}
 }
 

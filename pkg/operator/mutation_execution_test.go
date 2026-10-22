@@ -7,8 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,8 +69,12 @@ func mutationExecutionFixture(t *testing.T, conditions ...fencing.MutationCondit
 	}
 	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
 	scopeHash := hashJSON(scope)
+	stages, err := e.sourceStagesFor(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
 	id := fencing.Identity{SourceClusterID: "source", NodeID: "n0", PodUID: "pod-0", RunID: "run-0", WALIdentity: "wal"}
-	incarnation := strings.Repeat("4", 64)
+	incarnation := stages.incarnation
 	if _, err := e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
 		if err := l.BindMutationScope(id, scopeHash, fencing.MutationExecutionProfile); err != nil {
 			return err
@@ -91,13 +93,6 @@ func mutationExecutionFixture(t *testing.T, conditions ...fencing.MutationCondit
 	if err != nil {
 		t.Fatal(err)
 	}
-	stageDir := filepath.Join(t.TempDir(), "stage")
-	provisionStageStoreFixture(t, stageDir, incarnation)
-	stages, err := OpenSourceStageStore(stageDir, incarnation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = stages.Close() })
 	e.SourceStages = stages
 
 	draft := stageStoreIntent()
@@ -120,15 +115,10 @@ func mutationExecutionFixture(t *testing.T, conditions ...fencing.MutationCondit
 	if _, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.Admit(1, intent) }); err != nil {
 		t.Fatal(err)
 	}
-	receiptsDir := filepath.Join(t.TempDir(), "receipts")
-	if err := os.Mkdir(receiptsDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	receipts, err := OpenMutationExecutionReceiptStore(receiptsDir)
+	receipts, err := e.receiptsForRuntime(runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = receipts.Close() })
 	return e, runtime, intent, payload, scope, receipts
 }
 

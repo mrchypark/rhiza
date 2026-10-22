@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -240,15 +238,6 @@ func TestSourceMutationHTTPAdmitExecutesGCSAndReturnsOriginalDurableTuple(t *tes
 	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
 		t.Fatal(err)
 	}
-	incarnation := strings.Repeat("4", 64)
-	stageDir := filepath.Join(t.TempDir(), "stage")
-	provisionStageStoreFixture(t, stageDir, incarnation)
-	stages, err := OpenSourceStageStore(stageDir, incarnation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = stages.Close() })
-	e.SourceStages = stages
 
 	env := []any{
 		object{"name": "RHIZA_CLUSTER_ID", "value": id.SourceClusterID},
@@ -293,16 +282,13 @@ func TestSourceMutationHTTPAdmitExecutesGCSAndReturnsOriginalDurableTuple(t *tes
 	}
 	defer writer.Close()
 	e.SourceMutationStorage = writer
-	receiptsDir := filepath.Join(t.TempDir(), "receipts")
-	if err := os.Mkdir(receiptsDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	receipts, err := OpenMutationExecutionReceiptStore(receiptsDir)
+	receipts, err := e.receiptsForRuntime(runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = receipts.Close() })
-	e.SourceMutationReceipts = receipts
+	if receipts.evidence == nil {
+		t.Fatal("canonical authority runtime selected local mutation receipts")
+	}
 
 	authority := httptest.NewTLSServer(e.Handler())
 	defer authority.Close()
@@ -336,5 +322,10 @@ func TestSourceMutationHTTPAdmitExecutesGCSAndReturnsOriginalDurableTuple(t *tes
 	}
 	if gcsRequests.Load() != 1 {
 		t.Fatalf("admission executed %d GCS requests, want one", gcsRequests.Load())
+	}
+	owner := hashJSON([]any{runtime, id.WALIdentity, binding.Producer.ProducerUID, uint64(1), intent.OperationID})
+	receipt, err := receipts.get("receipt-" + owner)
+	if err != nil || receipt.Intent != intent || receipt.WALIdentity != id.WALIdentity || receipt.Generation != 21 {
+		t.Fatalf("provider receipt was not preserved in root-bound object storage: %+v %v", receipt, err)
 	}
 }

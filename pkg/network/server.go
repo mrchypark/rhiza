@@ -481,7 +481,7 @@ func (s *Server) waitDurable(ctx context.Context, slot quepaxa.Slot) error {
 		if s.localMode {
 			return fmt.Errorf("local durability wait: %w", err)
 		}
-		return fmt.Errorf("%w: %v", ErrDurabilityUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrDurabilityUnavailable, err)
 	}
 	return nil
 }
