@@ -127,13 +127,52 @@ capture_fencer_diagnostics() {
   logs_lines=$(wc -l <"$logs_file" | tr -d ' ')
   logs_sha256=$(sha256sum "$logs_file" | awk '{print $1}')
   chmod 400 "$logs_file"
+  chmod 600 "$FENCING_E2E_OUT/fencer-pods.json" "$FENCING_E2E_OUT/fencer-events.json" "$FENCING_E2E_OUT/fencer-deployment.json"
+
+  runtime_agent_logs="$diagnostics_dir/runtime-agent-current.log"
+  runtime_agent_ds_uid=$(k --request-timeout=10s get daemonset rhiza-runtime-agent -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  runtime_agent_pod_json=''
+  runtime_agent_pod_name=''
+  runtime_agent_pod_uid=''
+  if [ -n "$runtime_agent_ds_uid" ] && runtime_agent_pod_json=$(k --request-timeout=10s get pods -l app.kubernetes.io/name=rhiza-runtime-agent -o json 2>/dev/null); then
+    runtime_agent_pod_identity=$(printf '%s\n' "$runtime_agent_pod_json" | jq -cer --arg node "$fencing_node" --arg owner "$runtime_agent_ds_uid" \
+      '[.items[] | select(.spec.nodeName == $node) | select(any(.metadata.ownerReferences[]?; .kind == "DaemonSet" and .name == "rhiza-runtime-agent" and .uid == $owner)) | {name:.metadata.name,uid:.metadata.uid}] | if length == 1 then .[0] else error("runtime-agent Pod identity is ambiguous") end' 2>/dev/null || true)
+    runtime_agent_pod_name=$(printf '%s\n' "$runtime_agent_pod_identity" | jq -r '.name // empty' 2>/dev/null || true)
+    runtime_agent_pod_uid=$(printf '%s\n' "$runtime_agent_pod_identity" | jq -r '.uid // empty' 2>/dev/null || true)
+  fi
+  unset runtime_agent_pod_json runtime_agent_pod_identity
+  runtime_agent_logs_captured=false
+  if [ -n "$runtime_agent_pod_name" ] && [ -n "$runtime_agent_pod_uid" ] &&
+    k --request-timeout=10s logs "$runtime_agent_pod_name" -c runtime-agent --prefix --tail=200 --limit-bytes=65536 >"$runtime_agent_logs" 2>"$diagnostics_dir/runtime-agent-logs.stderr"; then
+    runtime_agent_after_ds_uid=$(k --request-timeout=10s get daemonset rhiza-runtime-agent -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+    runtime_agent_after_json=$(k --request-timeout=10s get pod "$runtime_agent_pod_name" -o json 2>/dev/null || true)
+    if [ "$runtime_agent_after_ds_uid" = "$runtime_agent_ds_uid" ] && printf '%s\n' "$runtime_agent_after_json" | jq -e --arg pod "$runtime_agent_pod_uid" --arg node "$fencing_node" --arg owner "$runtime_agent_ds_uid" \
+      '.metadata.uid == $pod and .spec.nodeName == $node and any(.metadata.ownerReferences[]?; .kind == "DaemonSet" and .name == "rhiza-runtime-agent" and .uid == $owner)' >/dev/null 2>&1; then
+      runtime_agent_logs_captured=true
+    else
+      : >"$runtime_agent_logs"
+      runtime_agent_pod_name=''
+      runtime_agent_pod_uid=''
+    fi
+    unset runtime_agent_after_ds_uid runtime_agent_after_json
+  else
+    : >"$runtime_agent_logs"
+  fi
+  chmod 600 "$runtime_agent_logs"
+  runtime_agent_logs_bytes=$(wc -c <"$runtime_agent_logs" | tr -d ' ')
+  runtime_agent_logs_lines=$(wc -l <"$runtime_agent_logs" | tr -d ' ')
+  runtime_agent_logs_sha256=$(sha256sum "$runtime_agent_logs" | awk '{print $1}')
+  chmod 400 "$runtime_agent_logs"
   jq -cn --arg context "$fencing_context" --arg namespace "$fencing_namespace" \
     --arg logsSHA256 "$logs_sha256" --argjson logsBytes "$logs_bytes" --argjson logsLines "$logs_lines" \
     --argjson podsCaptured "$pods_captured" --argjson eventsCaptured "$events_captured" --argjson deploymentCaptured "$deployment_captured" --argjson logsCaptured "$logs_captured" \
+    --arg runtimeAgentPodName "$runtime_agent_pod_name" --arg runtimeAgentPodUID "$runtime_agent_pod_uid" \
+    --arg runtimeAgentLogsSHA256 "$runtime_agent_logs_sha256" --argjson runtimeAgentLogsBytes "$runtime_agent_logs_bytes" --argjson runtimeAgentLogsLines "$runtime_agent_logs_lines" --argjson runtimeAgentLogsCaptured "$runtime_agent_logs_captured" \
     '{context:$context,namespace:$namespace,podsCaptured:$podsCaptured,eventsCaptured:$eventsCaptured,deploymentCaptured:$deploymentCaptured,
-      logs:{captured:$logsCaptured,sha256:$logsSHA256,bytes:$logsBytes,lines:$logsLines}}' \
+      logs:{captured:$logsCaptured,sha256:$logsSHA256,bytes:$logsBytes,lines:$logsLines},
+      runtimeAgent:{podName:$runtimeAgentPodName,podUID:$runtimeAgentPodUID,logs:{captured:$runtimeAgentLogsCaptured,sha256:$runtimeAgentLogsSHA256,bytes:$runtimeAgentLogsBytes,lines:$runtimeAgentLogsLines}}}' \
     >"$FENCING_E2E_OUT/fencer-diagnostics.json"
-  chmod 600 "$FENCING_E2E_OUT/fencer-pods.json" "$FENCING_E2E_OUT/fencer-events.json" "$FENCING_E2E_OUT/fencer-deployment.json" "$FENCING_E2E_OUT/fencer-diagnostics.json"
+  chmod 600 "$FENCING_E2E_OUT/fencer-diagnostics.json"
 }
 cleanup() {
   fencing_exit=$?

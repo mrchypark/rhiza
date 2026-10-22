@@ -52,6 +52,24 @@ func TestProbeUIDCleanupDoesNotAcceptSameNameReplacement(t *testing.T) {
 	}
 }
 
+func TestProbeDeletePathUsesResourceAPIGroup(t *testing.T) {
+	for _, test := range []struct {
+		resource string
+		want     string
+	}{
+		{"pods", "/api/v1/namespaces/rhiza-fencing-e2e/pods/probe"},
+		{"statefulsets", "/apis/apps/v1/namespaces/rhiza-fencing-e2e/statefulsets/probe"},
+	} {
+		got, err := probeDeletePath("rhiza-fencing-e2e", test.resource, "probe")
+		if err != nil || got != test.want {
+			t.Errorf("probeDeletePath(%q) = %q, %v; want %q", test.resource, got, err, test.want)
+		}
+	}
+	if _, err := probeDeletePath("rhiza-fencing-e2e", "deployments", "probe"); err == nil {
+		t.Fatal("unsupported resource accepted for UID-preconditioned deletion")
+	}
+}
+
 func TestChangedRequestHashDiffers(t *testing.T) {
 	for _, hash := range []string{"0", "abcdef"} {
 		if changed := changedRequestHash(hash); changed == hash || len(changed) != len(hash) {
