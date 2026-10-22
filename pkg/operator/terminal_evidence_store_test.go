@@ -153,7 +153,10 @@ func TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault(t *testing.T) 
 	if err != nil || receipts == nil || receipts.evidence == nil {
 		t.Fatalf("fixture did not select root-bound remote mutation receipts: store=%+v err=%v", receipts, err)
 	}
-	if _, err := f.e.retainIndependentTerminal(t.Context(), f.runtime, terminalTestStorage, []byte("verified-terminal")); err != nil {
+	if _, err := f.e.retainIndependentTerminal(t.Context(), f.runtime, terminalTestStorage, []byte("verified-terminal")); err == nil {
+		t.Fatal("terminal proof accepted a scope different from the committed remote mutation")
+	}
+	if _, err := f.e.retainIndependentTerminal(t.Context(), f.runtime, f.storeScope, []byte("verified-terminal")); err != nil {
 		t.Fatalf("terminal proof rejected exact remote mutation receipt by default: %v", err)
 	}
 	producer, err := f.e.reserveMutationProducer(t.Context(), f.runtime)

@@ -62,6 +62,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Compile all Go tests with local hooks (do not execute)
+        id: compile_go_tests
         run: |
           set -eu
           output_dir="$RUNNER_TEMP/rhiza-compiled-tests"
@@ -83,11 +84,14 @@ jobs:
             exit 1
           fi
       - name: Check fencing runtime profile validator
+        id: profile_selftest
         run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
       - name: Check cooperative protocol and engine regression tests
+        id: cooperative_tests
         run: |
           go test -race ./cmd/rhiza-fencer ./cmd/rhiza-runtime-agent ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/node ./pkg/network ./pkg/recovery ./pkg/materializer ./internal/objstore ./e2e/fencing ./deploy/operator ./e2e/chaos/embedded-go -count=1 -timeout=5m
       - name: Qualify shipped runtime agent and cooperative executor in disposable Kubernetes
+        id: qualify
         env:
           CGO_ENABLED: 0
           FENCING_E2E_OUT: cooperative-fencing-results
@@ -117,8 +121,25 @@ jobs:
         id: fencing_public
         if: always()
         run: |
-          test -x "$RUNNER_TEMP/fencing-e2e"
-          FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
+          if [ '${{ steps.qualify.outcome }}' = 'skipped' ]; then
+            mkdir -p cooperative-fencing-results/public
+            prior_step=unknown
+            prior_outcome=cancelled
+            if [ '${{ steps.compile_go_tests.outcome }}' = 'failure' ]; then
+              prior_step=compile-go-tests
+              prior_outcome=failure
+            elif [ '${{ steps.profile_selftest.outcome }}' = 'failure' ]; then
+              prior_step=profile-selftest
+              prior_outcome=failure
+            elif [ '${{ steps.cooperative_tests.outcome }}' = 'failure' ]; then
+              prior_step=cooperative-tests
+              prior_outcome=failure
+            fi
+            printf '{"kind":"qualification-not-started","stage":"pre-kind","priorStep":"%s","priorStepOutcome":"%s"}\n' "$prior_step" "$prior_outcome" > cooperative-fencing-results/public/qualification-not-started.json
+          else
+            test -x "$RUNNER_TEMP/fencing-e2e"
+            FENCING_E2E_OUT=cooperative-fencing-results "$RUNNER_TEMP/fencing-e2e" safe-artifacts
+          fi
           find cooperative-fencing-results/public -type f ! -name SHA256SUMS -exec sha256sum {} + > cooperative-fencing-results/public/SHA256SUMS
       - uses: actions/upload-artifact@v4
         if: always() && steps.fencing_public.outcome == 'success'

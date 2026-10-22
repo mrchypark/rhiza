@@ -158,7 +158,8 @@ func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 	fenceRequest := FenceRequest{LogicalID: "empty-recovery-test", BindingUID: f.runtime.BindingUID, Namespace: "test", StatefulSet: "rhiza",
 		StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: "source", OperationID: "source-fence", Scope: ScopeGeneration}
 	fence := &fenceResource{Metadata: object{"name": "source-fence", "namespace": "test"}, Spec: fenceRequest}
-	if err := e.reconcileFence(ctx, e.controller().corePath("rhizafences", ""), fence); err != nil {
+	fenceCollection := "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizafences"
+	if err := e.reconcileFence(ctx, fenceCollection, fence); err != nil {
 		t.Fatalf("produce source generation proof: %v", err)
 	}
 	fenceName := "fence-" + hashJSON([]string{f.runtime.BindingUID, fenceRequest.OperationID})[:40]
@@ -176,7 +177,7 @@ func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.f.mu.Lock()
-	f.f.objects[e.controller().corePath("rhizafences", fenceName)] = fenceObject
+	f.f.objects[fenceCollection+"/"+fenceName] = fenceObject
 	f.f.mu.Unlock()
 	state, err := e.read(ctx, f.runtime.StatefulSetUID, "source")
 	if err != nil {
@@ -246,7 +247,7 @@ func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.f.mu.Lock()
-	f.f.objects[e.controller().corePath("rhizafences", fenceName)] = fenceObject
+	f.f.objects[fenceCollection+"/"+fenceName] = fenceObject
 	f.f.mu.Unlock()
 	retry, err := e.RegisterArchiveEmptyRecovery(ctx, request)
 	if err != nil || retry.State != fencing.EmptyRecoveryAuthorized || retry.Authorization != registered.Authorization {

@@ -47,6 +47,62 @@ func TestWorkflowExcludesRawKindArtifacts(t *testing.T) {
 	}
 }
 
+func TestWorkflowPublishesOnlyPreKindFailureReceiptWhenQualificationIsSkipped(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type step struct {
+		ID   string `yaml:"id"`
+		Name string `yaml:"name"`
+		If   string `yaml:"if"`
+		Run  string `yaml:"run"`
+		Uses string `yaml:"uses"`
+		With struct {
+			Path string `yaml:"path"`
+		} `yaml:"with"`
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []step `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	steps := workflow.Jobs["cooperative-fencing"].Steps
+	var qualify, prepare, upload *step
+	for i := range steps {
+		switch steps[i].ID {
+		case "qualify":
+			qualify = &steps[i]
+		case "fencing_public":
+			prepare = &steps[i]
+		}
+		if strings.HasPrefix(steps[i].Uses, "actions/upload-artifact@") {
+			upload = &steps[i]
+		}
+	}
+	if qualify == nil || qualify.Name != "Qualify shipped runtime agent and cooperative executor in disposable Kubernetes" {
+		t.Fatal("qualification step must have a stable id for skip handling")
+	}
+	if prepare == nil || prepare.If != "always()" {
+		t.Fatal("public evidence preparation must still run after a pre-kind failure")
+	}
+	branch, attempted, ok := strings.Cut(prepare.Run, "else\n")
+	if !ok || !strings.Contains(branch, "steps.qualify.outcome") || !strings.Contains(branch, "qualification-not-started.json") ||
+		!strings.Contains(branch, `"stage":"pre-kind"`) || !strings.Contains(branch, "priorStepOutcome") ||
+		strings.Contains(branch, "actual-exit.txt") || strings.Contains(branch, "safe-artifacts") {
+		t.Fatal("skipped qualification must emit only a fixed pre-kind receipt, never a fabricated driver exit or raw fallback")
+	}
+	if !strings.Contains(attempted, `"$RUNNER_TEMP/fencing-e2e" safe-artifacts`) || strings.Contains(attempted, "qualification-not-started.json") {
+		t.Fatal("attempted qualification must continue through the strict allowlist projection")
+	}
+	if upload == nil || strings.TrimSpace(upload.With.Path) != "cooperative-fencing-results/public" {
+		t.Fatal("workflow may upload only the sanitized public evidence directory")
+	}
+}
+
 func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	config := "sha256:" + strings.Repeat("a", 64)
 	for _, reference := range []string{config, "containerd://" + config, "docker.io/library/import-date@" + config} {
