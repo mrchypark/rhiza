@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -39,7 +41,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-async-empty|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|runtime-probe|runtime-agent-request"))
 	}
 	if os.Args[1] == "runtime-agent-request" {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -74,11 +76,25 @@ func main() {
 		fatal(qualifyGCSHA(ctx))
 		return
 	}
+	if os.Args[1] == "run-gcs-ha-explicit" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSHAExplicit(ctx))
+		return
+	}
 	if os.Args[1] == "run-gcs-ha-async-empty" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 		fatal(configureGCSHA(ctx))
 		fatal(qualifyGCSAsyncEmpty(ctx))
+		return
+	}
+	if os.Args[1] == "run-gcs-ha-async-empty-explicit" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSAsyncEmptyExplicit(ctx))
 		return
 	}
 	if os.Args[1] == "safe-artifacts" {
@@ -279,6 +295,109 @@ func command(ctx context.Context, name string, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("%s command failed: %w: %s", name, err, data)
 	}
 	return data, nil
+}
+
+// startFencerForward opens only the run-owned fencer Service and keeps the
+// kubectl subprocess log separate from the short-lived controller token.
+func startFencerForward(ctx context.Context, out string) (*forward, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	log, err := os.CreateTemp(out, "rhiza-fencer-portforward-*.log")
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "port-forward", "service/rhiza-fencer", fmt.Sprintf("%d:9444", port), "--address=127.0.0.1")
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		_ = log.Close()
+		return nil, err
+	}
+	f := &forward{cmd: cmd, port: port, done: make(chan error, 1), log: log}
+	go func() { f.done <- cmd.Wait() }()
+	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := wait(ready, "port-forward rhiza-fencer", func() (bool, error) {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 100*time.Millisecond)
+		if err != nil {
+			return false, nil
+		}
+		_ = conn.Close()
+		return true, nil
+	}); err != nil {
+		f.close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// requestGenerationFence uses a TokenRequest token only in memory. It never
+// places credentials in argv, files, events, or subprocess logs.
+func requestGenerationFence(ctx context.Context, source gcsRecoverySource, request operator.FenceRequest, out string) error {
+	if err := validateExplicitGenerationFenceRequest(request, source, request.OperationID); err != nil {
+		return err
+	}
+	allowed, err := kubectl(ctx, "auth", "can-i", "create", "serviceaccounts/token")
+	if err != nil || strings.TrimSpace(string(allowed)) != "yes" {
+		return fmt.Errorf("run identity cannot mint the required short-lived controller token")
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "create", "token", "rhiza-operator", "--audience=rhiza-fencer", "--duration=10m")
+	tokenBytes, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("mint short-lived rhiza-fencer audience token: %w", err)
+	}
+	defer func() {
+		for i := range tokenBytes {
+			tokenBytes[i] = 0
+		}
+	}()
+	token := strings.TrimSpace(string(tokenBytes))
+	if token == "" || strings.ContainsAny(token, "\r\n \t") {
+		return fmt.Errorf("TokenRequest returned an invalid controller token")
+	}
+	caConfig, err := get(ctx, "configmap", "rhiza-fencer-ca")
+	if err != nil {
+		return fmt.Errorf("read fencer CA bundle: %w", err)
+	}
+	caPEM := text(nested(caConfig, "data", "ca.crt"))
+	roots := x509.NewCertPool()
+	if caPEM == "" || !roots.AppendCertsFromPEM([]byte(caPEM)) {
+		return fmt.Errorf("deployed fencer CA bundle is invalid")
+	}
+	f, err := startFencerForward(ctx, out)
+	if err != nil {
+		return err
+	}
+	defer f.close()
+	body, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://127.0.0.1:%d/v1/fences", f.port), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Idempotency-Key", request.OperationID)
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "rhiza-fencer"}}}
+	defer client.CloseIdleConnections()
+	response, err := client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("submit exact explicit generation fence request")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("explicit generation fence did not remain pending during runtime-agent isolation (HTTP %d)", response.StatusCode)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if err != nil || len(responseBody) >= 64<<10 {
+		return fmt.Errorf("read bounded pending generation fence response")
+	}
+	return nil
 }
 func kubectl(ctx context.Context, args ...string) ([]byte, error) {
 	return command(ctx, "kubectl", append([]string{"--context", kubeContext, "-n", namespace}, args...)...)

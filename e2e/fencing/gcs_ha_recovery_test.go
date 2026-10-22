@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/thanos-io/objstore"
 )
 
 func TestGCSRecoveryMatchesApprovedWorkloadSelector(t *testing.T) {
@@ -35,6 +38,213 @@ func TestGCSRecoveryRequiresNoPVCWorkload(t *testing.T) {
 			t.Fatalf("accepted PVC-backed workload: %v", workload)
 		}
 	}
+}
+
+func TestExplicitRecoveryProfileRequiresAutomaticModeOffAndNoAutomaticLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		spec      obj
+		automatic string
+		want      bool
+	}{
+		{name: "explicit no policy", spec: obj{"automatic": false}, automatic: "false", want: true},
+		{name: "explicit safe legacy policy", spec: obj{"automatic": false, "policy": obj{"allowDataLoss": false}}, automatic: "false", want: true},
+		{name: "cluster automatic", spec: obj{"automatic": true}, automatic: "false"},
+		{name: "operator automatic", spec: obj{"automatic": false}, automatic: "true"},
+		{name: "automatic loss policy", spec: obj{"automatic": false, "policy": obj{"allowDataLoss": true}}, automatic: "false"},
+		{name: "missing cluster mode", spec: obj{}, automatic: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := explicitGCSRecoveryProfileSafe(tc.spec, tc.automatic); got != tc.want {
+				t.Fatalf("explicit profile validity = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExplicitRecoveryMutationsRequireFreshRunOwnedResources(t *testing.T) {
+	previousRunID := qualificationRunID
+	t.Cleanup(func() { qualificationRunID = previousRunID })
+	created, err := time.Parse(time.RFC3339Nano, "2026-10-23T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qualificationRunID = "deadbeef"
+	valid := obj{"metadata": obj{
+		"namespace": "run-deadbeef", "uid": "resource-uid", "creationTimestamp": "2026-10-23T00:00:01Z",
+		"labels": obj{"chaos.rhiza.io/run": "deadbeef"},
+	}}
+	if err := requireRunOwnedResource(valid, "fixture", "run-deadbeef", created); err != nil {
+		t.Fatalf("rejected fresh run-owned resource: %v", err)
+	}
+	for name, mutate := range map[string]func(obj){
+		"wrong namespace": func(resource obj) { resource["metadata"].(obj)["namespace"] = "other" },
+		"missing UID":     func(resource obj) { resource["metadata"].(obj)["uid"] = "" },
+		"preexisting": func(resource obj) {
+			resource["metadata"].(obj)["creationTimestamp"] = "2026-10-22T23:59:59Z"
+		},
+		"foreign run label": func(resource obj) {
+			resource["metadata"].(obj)["labels"].(obj)["chaos.rhiza.io/run"] = "feedface"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resource := obj{"metadata": obj{
+				"namespace": "run-deadbeef", "uid": "resource-uid", "creationTimestamp": "2026-10-23T00:00:01Z",
+				"labels": obj{"chaos.rhiza.io/run": "deadbeef"},
+			}}
+			mutate(resource)
+			if err := requireRunOwnedResource(resource, "fixture", "run-deadbeef", created); err == nil {
+				t.Fatal("accepted a resource not proven to belong to this fresh run")
+			}
+		})
+	}
+}
+
+func TestExplicitRecoveryIdentityRejectsUntrustedRunIDs(t *testing.T) {
+	for _, runID := range []string{"", "deadbeef-extra", "DEADBEEF", "deadbeeg", "deadbee"} {
+		if _, _, err := explicitRecoveryIdentity(runID, "first"); err == nil {
+			t.Fatalf("accepted malformed run ID %q", runID)
+		}
+	}
+	if _, _, err := explicitRecoveryIdentity("deadbeef", "unexpected"); err == nil {
+		t.Fatal("accepted an unknown explicit recovery phase")
+	}
+}
+
+func TestExplicitRecoveryHasNoSuccessorReservationUntilFenceProof(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	if err := verifyNoGCSReservationAt(ctx, bucket, "rhiza/run-prefix"); err != nil {
+		t.Fatalf("accepted fresh source with no successor reservation: %v", err)
+	}
+	if err := bucket.Upload(ctx, "rhiza/run-prefix/recovery/successor.json", strings.NewReader(`{"target":"successor"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyNoGCSReservationAt(ctx, bucket, "rhiza/run-prefix"); err == nil {
+		t.Fatal("accepted a successor reservation before the external fence proof")
+	}
+}
+
+func TestExplicitRecoveryManifestStartsUnconfirmedAndBindsCapturedFence(t *testing.T) {
+	source := gcsRecoverySource{
+		Namespace: "run-deadbeef", LogicalID: "logical", StatefulSet: "rhiza-voter", Container: "rhiza",
+		ClusterID: "source-cluster", StatefulSetUID: "sts-uid", BindingUID: "binding-uid",
+		Targets: []operator.FenceTarget{{NodeID: "rhiza-voter-0", Pod: "rhiza-voter-0", PodUID: "pod-0", WALIdentity: "wal-0"}},
+	}
+	manifest, name, recoveryID, err := explicitRecoveryManifest(source, "deadbeef", "first", "before-ack", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "rhiza-manual-deadbeef-first" || recoveryID != "manual-deadbeef-first" ||
+		text(nested(manifest, "metadata", "labels", "chaos.rhiza.io/run")) != "deadbeef" ||
+		nested(manifest, "spec", "allowDataLoss") != false || nested(manifest, "spec", "fence", "confirmed") != false ||
+		nested(manifest, "spec", "fence", "recoveryID") != recoveryID || nested(manifest, "spec", "fence", "clusterID") != source.ClusterID ||
+		nested(manifest, "spec", "fence", "statefulSetUID") != source.StatefulSetUID {
+		t.Fatalf("explicit resource is not an unconfirmed, run-owned request: %v", manifest)
+	}
+	request := explicitGenerationFenceRequest(source, recoveryID)
+	if err := validateExplicitGenerationFenceRequest(request, source, recoveryID); err != nil {
+		t.Fatalf("fencer request is not bound to the captured source incarnation: %v", err)
+	}
+	for name, mutate := range map[string]func(*operator.FenceRequest){
+		"different operation": func(request *operator.FenceRequest) { request.OperationID = "other-operation" },
+		"different binding":   func(request *operator.FenceRequest) { request.BindingUID = "other-binding" },
+		"different generation": func(request *operator.FenceRequest) {
+			request.SourceClusterID = "other-generation"
+		},
+		"different StatefulSet UID": func(request *operator.FenceRequest) { request.StatefulSetUID = "other-sts" },
+		"different cohort": func(request *operator.FenceRequest) {
+			request.Targets = []operator.FenceTarget{{NodeID: "other", Pod: "other", PodUID: "other-pod", WALIdentity: "other-wal"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wrong := request
+			wrong.Targets = append([]operator.FenceTarget(nil), request.Targets...)
+			mutate(&wrong)
+			if err := validateExplicitGenerationFenceRequest(wrong, source, recoveryID); err == nil {
+				t.Fatal("accepted a fence not bound to the captured source request")
+			}
+		})
+	}
+	asyncManifest, _, _, err := explicitRecoveryManifest(source, "deadbeef", "async-empty", "async", true)
+	if err != nil || nested(asyncManifest, "spec", "allowDataLoss") != true {
+		t.Fatalf("explicit async loss must be declared on the recovery resource: %v", err)
+	}
+	if _, _, _, err := explicitRecoveryManifest(source, "deadbeef", "async-empty", "async", false); err == nil {
+		t.Fatal("accepted explicit async recovery without resource-scoped allowDataLoss")
+	}
+}
+
+func TestExplicitRecoveryConfirmationBindsUIDSourcePolicyAndResourceVersion(t *testing.T) {
+	source := gcsRecoverySource{Namespace: "run-deadbeef", StatefulSet: "rhiza-voter", Container: "rhiza",
+		ClusterID: "source-cluster", StatefulSetUID: "sts-uid"}
+	manifest, name, recoveryID, err := explicitRecoveryManifest(source, "deadbeef", "async-empty", "async", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery := explicitGCSRecoveryRef{Name: name, UID: "recovery-uid", Namespace: source.Namespace, RunLabel: "deadbeef",
+		OperationID: recoveryID, SourceClusterID: source.ClusterID, StatefulSet: source.StatefulSet, Container: source.Container,
+		Durability: "async", AllowDataLoss: true}
+	base := obj{
+		"metadata": obj{"name": name, "namespace": source.Namespace, "uid": recovery.UID, "resourceVersion": "17", "labels": obj{"chaos.rhiza.io/run": "deadbeef"}},
+		"spec":     nested(manifest, "spec"), "status": obj{"phase": "AwaitingFence"},
+	}
+	if err := validateExplicitRecoveryResource(base, source, recovery); err != nil {
+		t.Fatalf("rejected captured explicit recovery: %v", err)
+	}
+	if err := validateExplicitRecoveryResource([]any{"malformed response"}, source, recovery); err == nil {
+		t.Fatal("accepted a non-object recovery API response")
+	}
+	for name, mutate := range map[string]func(obj){
+		"replacement UID": func(item obj) { nested(item, "metadata").(obj)["uid"] = "replacement-uid" },
+		"changed source":  func(item obj) { nested(item, "spec").(obj)["sourceClusterID"] = "other-source" },
+		"changed policy":  func(item obj) { nested(item, "spec").(obj)["allowDataLoss"] = false },
+		"changed target durability": func(item obj) {
+			nested(item, "spec").(obj)["durability"] = "before-ack"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := cloneExplicitRecoveryResource(t, base)
+			mutate(item)
+			if err := validateExplicitRecoveryResource(item, source, recovery); err == nil {
+				t.Fatal("accepted a changed explicit-recovery identity or policy")
+			}
+		})
+	}
+	patch, err := explicitRecoveryConfirmationPatch(base, recovery, "proof-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionTestFound := false
+	for _, operation := range patch {
+		if operation["op"] == "test" && operation["path"] == "/metadata/resourceVersion" && operation["value"] == "17" {
+			versionTestFound = true
+		}
+	}
+	if !versionTestFound {
+		t.Fatal("confirmation patch did not atomically test the exact resourceVersion read with the recovery")
+	}
+	base["metadata"].(obj)["resourceVersion"] = "18"
+	newPatch, err := explicitRecoveryConfirmationPatch(base, recovery, "proof-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newPatch[1]["value"] != "18" {
+		t.Fatalf("fresh confirmation patch did not bind its current resourceVersion: %v", newPatch[1])
+	}
+	delete(base["metadata"].(obj), "resourceVersion")
+	if _, err := explicitRecoveryConfirmationPatch(base, recovery, "proof-id"); err == nil {
+		t.Fatal("built a confirmation patch without a resourceVersion precondition")
+	}
+}
+
+func cloneExplicitRecoveryResource(t *testing.T, resource obj) obj {
+	t.Helper()
+	var copy obj
+	if err := json.Unmarshal(encoded(resource), &copy); err != nil {
+		t.Fatal(err)
+	}
+	return copy
 }
 
 func TestGCSFenceSpecComparisonDecodesKubernetesMap(t *testing.T) {

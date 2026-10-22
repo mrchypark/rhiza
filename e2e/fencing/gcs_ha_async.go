@@ -54,6 +54,14 @@ type gcsArchiveHeadEvidence struct {
 }
 
 func qualifyGCSAsyncEmpty(ctx context.Context) (resultErr error) {
+	return qualifyGCSAsyncEmptyWithMode(ctx, false)
+}
+
+func qualifyGCSAsyncEmptyExplicit(ctx context.Context) error {
+	return qualifyGCSAsyncEmptyWithMode(ctx, true)
+}
+
+func qualifyGCSAsyncEmptyWithMode(ctx context.Context, explicit bool) (resultErr error) {
 	out := os.Getenv("FENCING_E2E_OUT")
 	if out == "" {
 		out = "gcs-async-empty-results"
@@ -86,8 +94,18 @@ func qualifyGCSAsyncEmpty(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	if err := requireGCSAsyncEmptyProfile(ctx, source); err != nil {
-		return err
+	if explicit {
+		source, err = prepareExplicitGCSRecoverySource(ctx, source, out, true)
+		if err != nil {
+			return err
+		}
+		if err := requireGCSAsyncEmptyExplicitProfile(ctx, source); err != nil {
+			return err
+		}
+	} else {
+		if err := requireGCSAsyncEmptyProfile(ctx, source); err != nil {
+			return err
+		}
 	}
 	adminToken, err := sourceAdminToken(ctx, source.StatefulSet, source.Container)
 	if err != nil {
@@ -119,7 +137,7 @@ func qualifyGCSAsyncEmpty(ctx context.Context) (resultErr error) {
 	}
 	event("source_head_before_fence", beforeFence)
 
-	outcome, err := gcsLoseQuorumAndRecoverAsyncEmpty(ctx, source, adminToken, archive, beforeFence, ackStarted, out, event, &faults)
+	outcome, err := gcsLoseQuorumAndRecoverAsyncEmpty(ctx, source, adminToken, archive, beforeFence, ackStarted, explicit, out, event, &faults)
 	if err != nil {
 		return err
 	}
@@ -183,6 +201,39 @@ func qualifyGCSAsyncEmpty(ctx context.Context) (resultErr error) {
 }
 
 func requireGCSAsyncEmptyProfile(ctx context.Context, source gcsRecoverySource) error {
+	if err := requireGCSAsyncEmptySourceProfile(ctx, source); err != nil {
+		return err
+	}
+	binding, err := get(ctx, "rhizacluster", source.BindingName)
+	if err != nil {
+		return err
+	}
+	if !gcsAsyncEmptyPolicyEnabled(nested(binding, "spec")) {
+		return fmt.Errorf("async-empty automatic recovery requires predeclared allowDataLoss policy")
+	}
+	operatorDeployment, err := get(ctx, "deployment", "rhiza-operator")
+	if err != nil {
+		return err
+	}
+	opContainer, err := boundContainer(operatorDeployment, "operator")
+	if err != nil {
+		return err
+	}
+	automatic, err := effectiveGCSSetting(ctx, opContainer, "RHIZA_AUTOMATIC_RECOVERY")
+	if err != nil || automatic != "true" {
+		return fmt.Errorf("async-empty qualification requires the automatic recovery controller to be enabled")
+	}
+	return nil
+}
+
+func requireGCSAsyncEmptyExplicitProfile(ctx context.Context, source gcsRecoverySource) error {
+	if err := requireGCSAsyncEmptySourceProfile(ctx, source); err != nil {
+		return err
+	}
+	return requireExplicitGCSRecoveryProfile(ctx, source, true)
+}
+
+func requireGCSAsyncEmptySourceProfile(ctx context.Context, source gcsRecoverySource) error {
 	sts, err := get(ctx, "statefulset", source.StatefulSet)
 	if err != nil {
 		return err
@@ -213,25 +264,6 @@ func requireGCSAsyncEmptyProfile(ctx context.Context, source gcsRecoverySource) 
 	}
 	if err := validateGCSAsyncEmptyCadence(syncText, checkpointText, tailText); err != nil {
 		return err
-	}
-	binding, err := get(ctx, "rhizacluster", source.BindingName)
-	if err != nil {
-		return err
-	}
-	if !gcsAsyncEmptyPolicyEnabled(nested(binding, "spec")) {
-		return fmt.Errorf("async-empty automatic recovery requires predeclared allowDataLoss policy")
-	}
-	operatorDeployment, err := get(ctx, "deployment", "rhiza-operator")
-	if err != nil {
-		return err
-	}
-	opContainer, err := boundContainer(operatorDeployment, "operator")
-	if err != nil {
-		return err
-	}
-	automatic, err := effectiveGCSSetting(ctx, opContainer, "RHIZA_AUTOMATIC_RECOVERY")
-	if err != nil || automatic != "true" {
-		return fmt.Errorf("async-empty qualification requires the automatic recovery controller to be enabled")
 	}
 	return nil
 }
@@ -402,8 +434,8 @@ func readGCSArchiveHead(ctx context.Context, bucket objstore.Bucket, prefix stri
 }
 
 func validateSealedZeroHead(before, after gcsArchiveHeadEvidence) error {
-	if before.Version == "" || before.VersionType == 0 || before.Tip != 0 || before.Sealed || before.HeadSHA256 == "" ||
-		after.Version == "" || after.VersionType != before.VersionType || after.Version == before.Version || after.Tip != 0 || !after.Sealed || after.HeadSHA256 == "" || after.HeadSHA256 == before.HeadSHA256 {
+	if before.Version == "" || before.VersionType != int(objstore.Generation) || before.Tip != 0 || before.Sealed || before.HeadSHA256 == "" ||
+		after.Version == "" || after.VersionType != int(objstore.Generation) || after.Version == before.Version || after.Tip != 0 || !after.Sealed || after.HeadSHA256 == "" || after.HeadSHA256 == before.HeadSHA256 {
 		return fmt.Errorf("source generation was not sealed at a new persisted zero-tip GCS HEAD version")
 	}
 	return nil
@@ -429,7 +461,7 @@ func validateInitialZeroHead(head gcsArchiveHeadEvidence) error {
 	return nil
 }
 
-func gcsLoseQuorumAndRecoverAsyncEmpty(ctx context.Context, source gcsRecoverySource, token string, archive objstore.Bucket, initialHead gcsArchiveHeadEvidence, ackStarted time.Time, out string, event func(string, any), faults *[]*gcsChaosFault) (*gcsAsyncEmptyOutcome, error) {
+func gcsLoseQuorumAndRecoverAsyncEmpty(ctx context.Context, source gcsRecoverySource, token string, archive objstore.Bucket, initialHead gcsArchiveHeadEvidence, ackStarted time.Time, explicit bool, out string, event func(string, any), faults *[]*gcsChaosFault) (*gcsAsyncEmptyOutcome, error) {
 	chaosCtx, cancel := context.WithTimeout(ctx, 165*time.Second)
 	defer cancel()
 	if len(source.Targets) < 3 || len(source.Targets) > 64 || len(source.AgentPods) == 0 || source.OperatorPod == "" {
@@ -483,9 +515,33 @@ func gcsLoseQuorumAndRecoverAsyncEmpty(ctx context.Context, source gcsRecoverySo
 	if err != nil {
 		return nil, err
 	}
-	pending, err := waitForPendingGCSFence(chaosCtx, source)
+	var pending pendingGCSFence
+	var explicitRecovery explicitGCSRecoveryRef
+	if explicit {
+		explicitRecovery, err = createExplicitGCSRecovery(chaosCtx, source, "async-empty", "async", true)
+		if err != nil {
+			return nil, err
+		}
+		if err := verifyNoGCSReservation(chaosCtx, source); err != nil {
+			return nil, err
+		}
+		if err := requestGenerationFence(chaosCtx, source, explicitGenerationFenceRequest(source, explicitRecovery.OperationID), out); err != nil {
+			return nil, err
+		}
+		pending, err = waitForPendingGCSFenceOperation(chaosCtx, source, explicitRecovery.OperationID)
+	} else {
+		pending, err = waitForPendingGCSFence(chaosCtx, source)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if explicit {
+		if _, err := waitForExplicitGCSRecoveryAwaitingFence(chaosCtx, source, explicitRecovery.Name, pending.Request.OperationID, explicitRecovery.UID, explicitRecovery.AllowDataLoss); err != nil {
+			return nil, err
+		}
+		if err := verifyNoGCSReservation(chaosCtx, source); err != nil {
+			return nil, err
+		}
 	}
 	preProofHead, err := readGCSArchiveHead(chaosCtx, archive, source.Prefix, true)
 	if err != nil {
@@ -530,6 +586,11 @@ func gcsLoseQuorumAndRecoverAsyncEmpty(ctx context.Context, source gcsRecoverySo
 	if err := waitForGCSFenceProof(chaosCtx, source, pending); err != nil {
 		return nil, err
 	}
+	if explicit {
+		if err := confirmExplicitGCSRecoveryFence(chaosCtx, source, pending, explicitRecovery); err != nil {
+			return nil, err
+		}
+	}
 	sealedHead, err := readGCSArchiveHead(chaosCtx, archive, source.Prefix, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify sealed source HEAD after generation fence: %w", err)
@@ -551,14 +612,18 @@ func gcsLoseQuorumAndRecoverAsyncEmpty(ctx context.Context, source gcsRecoverySo
 		return nil, err
 	}
 	event("async_empty_generation_fence_proven", obj{"fenceName": pending.Name, "operationID": pending.Request.OperationID})
-	recoveryOutcome, err := waitForAsyncEmptyGCSRecovery(ctx, source, pending, out)
+	var expectedRecovery *explicitGCSRecoveryRef
+	if explicit {
+		expectedRecovery = &explicitRecovery
+	}
+	recoveryOutcome, err := waitForAsyncEmptyGCSRecovery(ctx, source, pending, out, expectedRecovery)
 	if err != nil {
 		return nil, err
 	}
 	return &gcsAsyncEmptyOutcome{Source: source, Fence: pending.Request, Proof: recoveryOutcome.Proof, Recovery: recoveryOutcome.Recovery, PreProofHead: preProofHead, SealedSourceHead: sealedHead, AckToSeal: ackToSeal, Admin: recoveryOutcome.Admin}, nil
 }
 
-func waitForAsyncEmptyGCSRecovery(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence, out string) (*gcsRecoveryOutcome, error) {
+func waitForAsyncEmptyGCSRecovery(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence, out string, explicitRecovery *explicitGCSRecoveryRef) (*gcsRecoveryOutcome, error) {
 	if pending.Name == "" || pending.UID == "" || pending.Request.OperationID == "" || pending.Request.SourceClusterID != source.ClusterID || !sameTargets(pending.Request.Targets, source.Targets) {
 		return nil, fmt.Errorf("async-empty recovery is not bound to the exact pending fence")
 	}
@@ -602,7 +667,14 @@ func waitForAsyncEmptyGCSRecovery(ctx context.Context, source gcsRecoverySource,
 		items, _ := list["items"].([]any)
 		matches := 0
 		for _, item := range items {
-			if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != pending.Request.OperationID {
+			if explicitRecovery != nil {
+				if nested(item, "metadata", "name") != explicitRecovery.Name && nested(item, "spec", "recoveryID") != explicitRecovery.OperationID {
+					continue
+				}
+				if err := validateExplicitRecoveryResource(item, source, *explicitRecovery); err != nil {
+					return false, err
+				}
+			} else if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != pending.Request.OperationID {
 				continue
 			}
 			matches++
@@ -615,6 +687,10 @@ func waitForAsyncEmptyGCSRecovery(ctx context.Context, source gcsRecoverySource,
 		}
 		if matches == 0 || outcome.Recovery.Status.Phase != "Complete" || outcome.Recovery.Status.Stage != "Complete" {
 			return false, nil
+		}
+		if explicitRecovery != nil && (outcome.Recovery.Metadata["uid"] != explicitRecovery.UID || outcome.Recovery.Metadata["name"] != explicitRecovery.Name ||
+			outcome.Recovery.Metadata["namespace"] != explicitRecovery.Namespace) {
+			return false, fmt.Errorf("completed async recovery does not match the captured resource identity")
 		}
 		if outcome.Recovery.Spec.SourceClusterID != source.ClusterID || outcome.Recovery.Spec.RecoveryID != pending.Request.OperationID ||
 			outcome.Recovery.Status.Source != source.ClusterID || outcome.Recovery.Status.StatefulSetUID != source.StatefulSetUID ||
