@@ -114,6 +114,21 @@ jobs:
         id: cooperative_tests
         run: |
           go test -race ./cmd/rhiza-fencer ./cmd/rhiza-runtime-agent ./pkg/fencing ./pkg/fencing/cri ./pkg/fencing/runtimeagent ./pkg/operator ./pkg/node ./pkg/network ./pkg/recovery ./pkg/materializer ./internal/objstore ./e2e/fencing ./deploy/operator ./e2e/chaos/embedded-go -count=1 -timeout=5m
+      - name: Build native GCS HA qualification drivers
+        id: gcs_qualification_driver
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -eu
+          artifact_dir="$RUNNER_TEMP/gcs-ha-qualification-driver"
+          mkdir -p "$artifact_dir"
+          printf '%s\n' "$GITHUB_SHA" >"$artifact_dir/source-sha.txt"
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$artifact_dir/fencing-e2e-linux-amd64" ./e2e/fencing
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$artifact_dir/fencing-e2e-darwin-arm64" ./e2e/fencing
+          (
+            cd "$artifact_dir"
+            sha256sum fencing-e2e-linux-amd64 fencing-e2e-darwin-arm64 source-sha.txt >SHA256SUMS
+          )
       - name: Qualify shipped runtime agent and cooperative executor in disposable Kubernetes
         id: qualify
         env:
@@ -131,6 +146,13 @@ jobs:
           docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
           if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
           FENCING_E2E_BIN="$RUNNER_TEMP/fencing-e2e" sh e2e/fencing/run.sh
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.gcs_qualification_driver.outcome == 'success' && steps.cooperative_tests.outcome == 'success' && steps.qualify.outcome == 'success'
+        with:
+          name: gcs-ha-qualification-driver-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/gcs-ha-qualification-driver
+          if-no-files-found: error
+          retention-days: 7
       - name: Verify pre-cleanup runtime diagnostics on failure
         if: always()
         run: |

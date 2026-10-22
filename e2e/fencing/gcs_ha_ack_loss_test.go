@@ -101,13 +101,23 @@ func TestVerifyGCSAckLossHeldObjectRequiresExactHeldGenerationAndBytes(t *testin
 			}
 			objectName := path.Join("cluster/source", objectKey)
 			metadataReads := 0
+			mediaReads := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || r.URL.Query().Get("generation") != "41" || !strings.Contains(r.URL.Path, "/b/ack-bucket/o/") || !strings.HasSuffix(r.URL.Path, objectName) {
+				if r.Method != http.MethodGet || r.URL.Query().Get("generation") != "41" {
 					http.Error(w, "wrong exact-object request", http.StatusBadRequest)
 					return
 				}
 				if r.URL.Query().Get("alt") == "media" {
+					if r.URL.Path != "/ack-bucket/"+objectName {
+						http.Error(w, "wrong exact-generation media route", http.StatusBadRequest)
+						return
+					}
+					mediaReads++
 					_, _ = w.Write(test.bytes)
+					return
+				}
+				if !strings.Contains(r.URL.Path, "/b/ack-bucket/o/") || !strings.HasSuffix(r.URL.Path, objectName) {
+					http.Error(w, "wrong exact-object request", http.StatusBadRequest)
 					return
 				}
 				metadataReads++
@@ -143,6 +153,9 @@ func TestVerifyGCSAckLossHeldObjectRequiresExactHeldGenerationAndBytes(t *testin
 			}
 			if err != nil || got.Generation != 41 || got.Metageneration != 3 || got.Size != int64(len(payload)) || got.PayloadSHA256 != payloadDigest || !got.TemporaryHold {
 				t.Fatalf("exact held object was not verified: evidence=%+v err=%v", got, err)
+			}
+			if mediaReads != 1 {
+				t.Fatalf("expected exactly one pinned-SDK XML media read for the selected generation, got %d", mediaReads)
 			}
 		})
 	}
