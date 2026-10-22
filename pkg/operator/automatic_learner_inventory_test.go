@@ -595,6 +595,25 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 	if r.Status.Phase != "Blocked" || !strings.Contains(r.Status.Message, "cannot reserve its fallback generation fence") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory {
 		t.Fatalf("full journal mutated Kubernetes: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
 	}
+	originalLearners := append([]learnerIncarnation(nil), loaded.Learners...)
+
+	// Reuse the real learner provisioning API fixture for the next reconcile;
+	// only the CR status endpoint is added so we can observe actual Pod creation.
+	api := &learnerAPI{}
+	api.server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		if q.Method == http.MethodPut && q.URL.Path == "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizaclusters/root/status" {
+			var status ClusterResource
+			if err := json.NewDecoder(q.Body).Decode(&status); err != nil {
+				http.Error(w, "invalid status", http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(status)
+			return
+		}
+		api.serve(w, q)
+	}))
+	t.Cleanup(api.Close)
+	f.c.Kube = api.kube(t)
 
 	f.ledger = terminatedLedger(t, append([]learnerIncarnation(nil), loaded.Learners[:4]...))
 	f.fenceReady = true
@@ -627,21 +646,27 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 		}
 		return &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "test-canonical-status-" + hash, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}, nil
 	})
-	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
+	sts := learnerSTS(t)
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, sts, &Resource{}); err != nil || !handled {
 		t.Fatalf("compaction recovery handled=%t err=%v", handled, err)
 	}
-	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory-4 {
-		t.Fatalf("compaction did not free capacity before mutation: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
+	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || api.createCount != 0 || len(loaded.Learners) != maxLearnerHistory-4 {
+		t.Fatalf("compaction did not free capacity before mutation: status=%+v creates=%d learners=%d", r.Status, api.createCount, len(loaded.Learners))
 	}
 	loaded, version, err = f.c.loadAuto(ctx, f.c.autoKey(r))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
-		t.Fatalf("next reconcile after compaction handled=%t err=%v", handled, err)
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, sts, &Resource{}); err != nil || !handled {
+		t.Fatalf("next reconcile did not provision after compaction: handled=%t err=%v status=%+v", handled, err, r.Status)
 	}
-	if f.mutations == 0 {
-		t.Fatal("capacity freed by verified compaction was not usable on the next reconcile")
+	if api.createCount != 3 || !api.podExists || len(loaded.Learners) != maxLearnerHistory-4+1 || len(loaded.Learners) > maxLearnerHistory {
+		t.Fatalf("freed capacity did not permit replacement provisioning: creates=%d pod=%t learners=%d", api.createCount, api.podExists, len(loaded.Learners))
+	}
+	for i, old := range originalLearners[4:] {
+		if loaded.Learners[i] != old {
+			t.Fatalf("unproven learner history at index %d was not retained: got=%+v want=%+v", i, loaded.Learners[i], old)
+		}
 	}
 }
 
