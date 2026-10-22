@@ -15,23 +15,47 @@ cleanup() { rm -rf "$temporary_dir"; }
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$temporary_dir"
-cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$repo_dir/rhiza.go" "$repo_dir/replica.go" "$repo_dir/config_env.go" "$repo_dir/operator_handler.go" "$repo_dir/membership.go" "$temporary_dir/"
+cp "$repo_dir/go.mod" "$repo_dir/go.sum" "$temporary_dir/"
 
-(
-    cd "$repo_dir"
-    export NATIVE_OUTPUT="$temporary_dir"
-    find cmd/rhiza-ffi internal pkg -type f ! -name '*_test.go' -exec sh -c '
-        for source do
-            target="$NATIVE_OUTPUT/$source"
-            mkdir -p "$(dirname "$target")"
-            cp "$source" "$target"
-        done
-    ' sh {} +
-)
-
-rm -rf "$native_dir"
-mv "$temporary_dir" "$native_dir"
-trap - EXIT HUP INT TERM
+# Ship only production packages in cmd/rhiza-ffi's actual local import graph
+# across every OS/architecture supported by build.rs.
+# Copying every package under pkg/ bloats the published crate with unrelated
+# production code even though Go never compiles it for the FFI. Copy each
+# package's direct non-test files (not only .go files) so direct cgo inputs
+# remain available. The current FFI import graph has no nested or go:embed
+# assets; extend this copy step if that changes. go list is metadata discovery;
+# it does not build or run tests.
+package_list="$temporary_dir/.package-dirs"
+for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+    target_os=${target%/*}
+    target_arch=${target#*/}
+    if ! (cd "$repo_dir" && GOOS="$target_os" GOARCH="$target_arch" CGO_ENABLED=1 GOWORK=off go list -deps -f '{{if and .Module (eq .Module.Path "github.com/mrchypark/rhiza")}}{{.Dir}}{{end}}' ./cmd/rhiza-ffi) >> "$package_list"; then
+        echo "FAIL unable to resolve the FFI package graph for $target" >&2
+        exit 1
+    fi
+done
+sort -u "$package_list" > "$package_list.sorted"
+mv "$package_list.sorted" "$package_list"
+if ! grep -F -x "$repo_dir/cmd/rhiza-ffi" "$package_list" >/dev/null; then
+    echo "FAIL resolved package graph omits cmd/rhiza-ffi" >&2
+    exit 1
+fi
+while IFS= read -r package_dir; do
+    [ -n "$package_dir" ] || continue
+    case "$package_dir" in
+        "$repo_dir") relative=.;;
+        "$repo_dir"/*) relative=${package_dir#"$repo_dir"/};;
+        *) echo "FAIL local FFI dependency is outside the repository: $package_dir" >&2; exit 1;;
+    esac
+    for source in "$package_dir"/*; do
+        [ -f "$source" ] || continue
+        case "$source" in *_test.go) continue;; esac
+        target="$temporary_dir/$relative/${source##*/}"
+        mkdir -p "$(dirname "$target")"
+        cp "$source" "$target"
+    done
+done < "$package_list"
+rm -f "$package_list"
 
 hash_files() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -41,15 +65,15 @@ hash_files() {
     fi
 }
 
-before=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
-(cd "$native_dir" && GOWORK=off go mod vendor)
+before=$(hash_files "$temporary_dir/go.mod" "$temporary_dir/go.sum")
+(cd "$temporary_dir" && GOWORK=off go mod vendor)
 # Markdown is compiler-unread here: this generated native tree has no
 # go:embed directive targeting Markdown. Preserve legal/notice Markdown names;
 # keep any Markdown in a package containing go:embed conservatively rather than
 # attempting to parse embed patterns.
-NATIVE_VENDOR=$native_dir/vendor
+NATIVE_VENDOR=$temporary_dir/vendor
 export NATIVE_VENDOR
-find "$native_dir/vendor" -type f -exec sh -eu -c '
+find "$temporary_dir/vendor" -type f -exec sh -eu -c '
     for source do
         base=${source##*/}
         case "$base" in
@@ -94,8 +118,14 @@ find "$native_dir/vendor" -type f -exec sh -eu -c '
         fi
     done
 ' sh {} +
-after=$(hash_files "$native_dir/go.mod" "$native_dir/go.sum")
+after=$(hash_files "$temporary_dir/go.mod" "$temporary_dir/go.sum")
 if [ "$before" != "$after" ]; then
     echo "FAIL go.mod or go.sum changed while vendoring; run go mod tidy on the module and retry" >&2
     exit 1
 fi
+
+# Replace the previous generated snapshot only after source selection,
+# vendoring, pruning, and module-integrity checks all succeed.
+rm -rf "$native_dir"
+mv "$temporary_dir" "$native_dir"
+trap - EXIT HUP INT TERM
