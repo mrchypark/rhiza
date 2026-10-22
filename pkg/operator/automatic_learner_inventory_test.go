@@ -241,17 +241,21 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			state.Intent.Proof = &FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: state.BindingUID, RequestHash: hash, ProofID: recovery.Spec.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
 			if neverBound {
 				// Never-bound cleanup re-reads the canonical fence status; keep the
-				// fixture bound to the exact retirement request, not a fake CM ledger.
-				retiredRequest := f.fences[len(f.fences)-1]
+				// fixture bound to the exact generation request and its persisted proof.
+				retiredRequest := request
+				retiredProof := *state.Intent.Proof
 				retiredHash, err := requestHash(&retiredRequest)
 				if err != nil {
 					t.Fatal(err)
 				}
 				c.Fencer = retirementFencer(func(_ context.Context, got FenceRequest) (*FenceProof, error) {
 					if hashJSON(got) != hashJSON(retiredRequest) {
-						return nil, fencing.ErrPending
+						return nil, ErrFencePending
 					}
-					return &FenceProof{OperationID: retiredRequest.OperationID, SourceClusterID: retiredRequest.SourceClusterID, BindingUID: retiredRequest.BindingUID, RequestHash: retiredHash, ProofID: "external-retirement-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}, nil
+					if retiredProof.RequestHash != retiredHash {
+						return nil, fmt.Errorf("persisted generation proof does not match its immutable request")
+					}
+					return &retiredProof, nil
 				})
 			}
 			_, version = f.load(t)
@@ -594,6 +598,35 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 
 	f.ledger = terminatedLedger(t, append([]learnerIncarnation(nil), loaded.Learners[:4]...))
 	f.fenceReady = true
+	f.c.Fencer = learnerCompactionFencer(func(_ context.Context, request FenceRequest) (*FenceProof, error) {
+		if !f.fenceReady || f.ledger == nil {
+			return nil, ErrFencePending
+		}
+		for _, target := range request.Targets {
+			covered := false
+			for _, run := range f.ledger.Ledger.Runs {
+				if run.Identity.NodeID != target.NodeID || run.Identity.PodUID != target.PodUID || run.Identity.WALIdentity != target.WALIdentity || run.Stop == nil || !run.Exited {
+					continue
+				}
+				if run.Identity.WALIdentity == "" {
+					covered = run.NeverBoundExit != nil && *run.NeverBoundExit == *run.Stop
+				} else {
+					covered = run.Drain != nil && run.Drain.Request == *run.Stop && run.Drain.Clean()
+				}
+				if covered {
+					break
+				}
+			}
+			if !covered {
+				return nil, ErrFencePending
+			}
+		}
+		hash, err := requestHash(&request)
+		if err != nil {
+			return nil, err
+		}
+		return &FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, RequestHash: hash, ProofID: "test-canonical-status-" + hash, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}, nil
+	})
 	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
 		t.Fatalf("compaction recovery handled=%t err=%v", handled, err)
 	}
