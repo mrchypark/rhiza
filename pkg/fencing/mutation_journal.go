@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"path"
+	"strings"
 )
 
 const (
@@ -85,6 +87,7 @@ type MutationResolution struct {
 	PreparationHash string          `json:"preparationHash"`
 	ReceiptDigest   string          `json:"receiptDigest"`
 	PayloadDigest   string          `json:"payloadDigest,omitempty"`
+	ConditionFailed bool            `json:"conditionFailed,omitempty"`
 	// AllCopiesTerminal is a trusted provider-worker assertion backed by the
 	// receipt. In particular a successful create-if-absent response alone does
 	// not establish this: a delayed copy can succeed after a later deletion.
@@ -121,18 +124,23 @@ type MutationCopyCompletion struct {
 // each transition before dispatch or ACK; this type does not provide persistence.
 // Missing state is Reserved/unknown, never an implicitly open producer.
 type MutationProducer struct {
-	Runtime          RuntimeBinding            `json:"runtime"`
-	WALIdentity      string                    `json:"walIdentity,omitempty"`
-	Phase            MutationPhase             `json:"phase"`
-	LastAdmitted     uint64                    `json:"lastAdmitted"`
-	ClosedThrough    uint64                    `json:"closedThrough,omitempty"`
-	CloseOperationID string                    `json:"closeOperationID,omitempty"`
-	CloseRequestHash string                    `json:"closeRequestHash,omitempty"`
-	CompactedThrough uint64                    `json:"compactedThrough,omitempty"`
-	ArchiveHead      *MutationArchiveReference `json:"archiveHead,omitempty"`
-	ArchiveScan      *MutationArchiveScan      `json:"archiveScan,omitempty"`
-	EvidenceFault    string                    `json:"evidenceFault,omitempty"`
-	Entries          map[uint64]MutationEntry  `json:"entries"`
+	Runtime          RuntimeBinding `json:"runtime"`
+	WALIdentity      string         `json:"walIdentity,omitempty"`
+	Phase            MutationPhase  `json:"phase"`
+	LastAdmitted     uint64         `json:"lastAdmitted"`
+	ClosedThrough    uint64         `json:"closedThrough,omitempty"`
+	CloseOperationID string         `json:"closeOperationID,omitempty"`
+	CloseRequestHash string         `json:"closeRequestHash,omitempty"`
+	CompactedThrough uint64         `json:"compactedThrough,omitempty"`
+	// RetiredStageThrough is the contiguous archive prefix whose remote stage
+	// payloads have been retired (or whose entries had no staged payload).
+	// It is persisted separately from CompactedThrough so retirement can resume
+	// after an archive commit and process restart.
+	RetiredStageThrough uint64                    `json:"retiredStageThrough,omitempty"`
+	ArchiveHead         *MutationArchiveReference `json:"archiveHead,omitempty"`
+	ArchiveScan         *MutationArchiveScan      `json:"archiveScan,omitempty"`
+	EvidenceFault       string                    `json:"evidenceFault,omitempty"`
+	Entries             map[uint64]MutationEntry  `json:"entries"`
 }
 
 // Validate rejects incomplete or damaged state after loading it. This is not
@@ -147,7 +155,7 @@ func (p *MutationProducer) Validate() error {
 	if err := p.Runtime.Validate(id); err != nil {
 		return err
 	}
-	if p.CompactedThrough > p.LastAdmitted || p.Entries == nil || p.LastAdmitted-p.CompactedThrough > MaxMutationJournalEntries || uint64(len(p.Entries)) != p.LastAdmitted-p.CompactedThrough {
+	if p.CompactedThrough > p.LastAdmitted || p.RetiredStageThrough > p.CompactedThrough || p.Entries == nil || p.LastAdmitted-p.CompactedThrough > MaxMutationJournalEntries || uint64(len(p.Entries)) != p.LastAdmitted-p.CompactedThrough {
 		return fmt.Errorf("fencing: mutation journal is incomplete or exceeds capacity")
 	}
 	if (p.CompactedThrough == 0) != (p.ArchiveHead == nil) || (p.ArchiveHead != nil && !p.ArchiveHead.Valid()) {
@@ -199,6 +207,26 @@ func (p *MutationProducer) Validate() error {
 			return err
 		}
 	}
+	return nil
+}
+
+// AdvanceArchivedStageRetirement advances exactly one archived sequence after
+// its external stage retirement has completed. Persist this transition only
+// after retirement; callers can safely retry a failed retirement unchanged.
+func (p *MutationProducer) AdvanceArchivedStageRetirement(sequence uint64) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if sequence == 0 || sequence > p.CompactedThrough {
+		return fmt.Errorf("fencing: archived stage retirement cursor is not contiguous")
+	}
+	if sequence <= p.RetiredStageThrough {
+		return nil
+	}
+	if sequence != p.RetiredStageThrough+1 {
+		return fmt.Errorf("fencing: archived stage retirement cursor is not contiguous")
+	}
+	p.RetiredStageThrough = sequence
 	return nil
 }
 
@@ -300,7 +328,7 @@ func (p *MutationProducer) Admit(sequence uint64, intent MutationIntent) error {
 }
 
 func validateMutationIntent(intent MutationIntent) error {
-	if intent.ContractVersion != MutationIntentVersion || !mutationDigestValid(intent.StoreScopeHash) || intent.OperationID == "" || len(intent.OperationID) > 256 || intent.Key == "" || len(intent.Key) > 1024 || (intent.Kind != "upload" && intent.Kind != "delete") {
+	if intent.ContractVersion != MutationIntentVersion || !mutationDigestValid(intent.StoreScopeHash) || intent.OperationID == "" || len(intent.OperationID) > 256 || intent.Key == "" || len(intent.Key) > 1024 || intent.Key == "." || strings.HasPrefix(intent.Key, "/") || intent.Key == ".." || strings.HasPrefix(intent.Key, "../") || path.Clean(intent.Key) != intent.Key || (intent.Kind != "upload" && intent.Kind != "delete") {
 		return fmt.Errorf("fencing: mutation intent is incomplete")
 	}
 	owner := intent.OwnerStep
@@ -441,11 +469,14 @@ func (p *MutationProducer) validateResolution(sequence uint64, entry MutationEnt
 	if !mutationDigestValid(resolution.ReceiptDigest) {
 		return fmt.Errorf("fencing: resolution requires durable evidence")
 	}
+	if resolution.ConditionFailed && (resolution.Outcome != MutationRejected || entry.Intent.Condition.Mode == MutationUnconditional) {
+		return fmt.Errorf("fencing: condition failure must be a conditional terminal rejection")
+	}
 	if resolution.AllCopiesTerminal && !allDispatchesTerminal(entry) {
 		return fmt.Errorf("fencing: executable dispatch permissions remain unsealed or unresolved")
 	}
 	if entry.Preparation == nil {
-		if resolution.Outcome != MutationRejected || resolution.PreparationHash != "" || resolution.PayloadDigest != "" || !resolution.AllCopiesTerminal {
+		if resolution.Outcome != MutationRejected || resolution.PreparationHash != "" || resolution.PayloadDigest != "" || resolution.ConditionFailed || !resolution.AllCopiesTerminal {
 			return fmt.Errorf("fencing: unprepared work can only be terminally cancelled")
 		}
 		return nil

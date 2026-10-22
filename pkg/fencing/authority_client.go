@@ -3,6 +3,9 @@ package fencing
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -45,6 +48,10 @@ type AuthorityClient struct {
 	URL       string
 	TokenFile string
 	Client    *http.Client
+	// Bound identity and producer are populated only by a validated Bind.
+	// Source mutation endpoints are unavailable before that receipt.
+	boundIdentity Identity
+	producer      *ProducerBinding
 }
 
 func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, result any) error {
@@ -89,6 +96,9 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 	if resp.StatusCode == http.StatusGone {
 		return ErrClosed
 	}
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return ErrMutationConditionFailed
+	}
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
 			return ErrUnavailable
@@ -120,11 +130,22 @@ func (a *AuthorityClient) Register(ctx context.Context, id Identity) error {
 	return a.call(ctx, AuthorityMessage{Action: "register", Identity: id}, nil)
 }
 func (a *AuthorityClient) Bind(ctx context.Context, id Identity) (BindReceipt, error) {
+	a.boundIdentity = Identity{}
+	a.producer = nil
 	var receipt BindReceipt
 	if err := a.call(ctx, AuthorityMessage{Action: "bind", Identity: id}, &receipt); err != nil {
 		return BindReceipt{}, err
 	}
-	return receipt, receipt.Validate(id)
+	if err := receipt.Validate(id); err != nil {
+		return BindReceipt{}, err
+	}
+	a.boundIdentity = id
+	a.producer = nil
+	if receipt.Producer != nil {
+		producer := *receipt.Producer
+		a.producer = &producer
+	}
+	return receipt, nil
 }
 func (a *AuthorityClient) Stop(ctx context.Context, id Identity) (StopRequest, error) {
 	var request StopRequest
@@ -171,6 +192,186 @@ func (a *AuthorityClient) LookupMutation(ctx context.Context, id Identity, produ
 	return result, nil
 }
 
+func (a *AuthorityClient) sourceMutationBinding() (Identity, ProducerBinding, error) {
+	if a == nil || a.producer == nil || a.producer.StageIncarnation == "" || a.producer.ProducerUID == "" || a.producer.Runtime.StatefulSetUID == "" || a.boundIdentity.WALIdentity == "" {
+		return Identity{}, ProducerBinding{}, fmt.Errorf("fencing: source mutation producer is not bound")
+	}
+	return a.boundIdentity, *a.producer, nil
+}
+
+func (a *AuthorityClient) sourceEndpoint(suffix string) (string, error) {
+	u, err := url.Parse(a.URL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasSuffix(strings.TrimSuffix(u.Path, "/"), "/v1/supervisor") {
+		return "", fmt.Errorf("fencing: HTTPS authority required")
+	}
+	pathSuffix, query, _ := strings.Cut(suffix, "?")
+	u.Path = strings.TrimSuffix(strings.TrimSuffix(u.Path, "/"), "/v1/supervisor") + pathSuffix
+	u.RawPath = ""
+	u.RawQuery = query
+	return u.String(), nil
+}
+
+func (a *AuthorityClient) sourcePost(ctx context.Context, endpoint string, body []byte, contentType string, headers http.Header, result any) error {
+	token, err := os.ReadFile(a.TokenFile)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(token)) == 0 || a.Client == nil {
+		return fmt.Errorf("fencing: authenticated bounded authority client required")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	req.Header.Set("Content-Type", contentType)
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	client := *a.Client
+	if client.Timeout <= 0 || client.Timeout > 30*time.Second {
+		client.Timeout = 30 * time.Second
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		return ErrPending
+	}
+	if resp.StatusCode == http.StatusGone {
+		return ErrClosed
+	}
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		return ErrMutationConditionFailed
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+			return ErrUnavailable
+		}
+		return fmt.Errorf("fencing: source authority HTTP %d", resp.StatusCode)
+	}
+	if result == nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
+	if err != nil || len(data) > 65536 {
+		return fmt.Errorf("%w: source authority response unreadable", ErrUnavailable)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(result); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("fencing: trailing source authority response")
+	}
+	return nil
+}
+
+func (a *AuthorityClient) ReserveUpload(ctx context.Context, ticket string, draft MutationIntent) error {
+	id, producer, err := a.sourceMutationBinding()
+	if err != nil {
+		return err
+	}
+	if !mutationDigestValid(ticket) || draft != uploadStageDraft(draft) || draft.StoreScopeHash != producer.StoreScopeHash {
+		return fmt.Errorf("fencing: invalid source upload reservation")
+	}
+	endpoint, err := a.sourceEndpoint("/v1/source-stages/reserve")
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(struct {
+		Identity Identity       `json:"identity"`
+		Ticket   string         `json:"ticket"`
+		Draft    MutationIntent `json:"draft"`
+	}{id, ticket, draft})
+	if err != nil {
+		return err
+	}
+	return a.sourcePost(ctx, endpoint, body, "application/json", nil, nil)
+}
+
+func (a *AuthorityClient) SealUpload(ctx context.Context, ticket string, payload []byte) (sourceSealedPayload, error) {
+	id, _, err := a.sourceMutationBinding()
+	if err != nil {
+		return sourceSealedPayload{}, err
+	}
+	if !mutationDigestValid(ticket) || int64(len(payload)) > maxStagePayloadBytes {
+		return sourceSealedPayload{}, fmt.Errorf("fencing: invalid source upload payload")
+	}
+	digest := sha256.Sum256(payload)
+	endpoint, err := a.sourceEndpoint("/v1/source-stages/" + ticket + "?digest=" + hex.EncodeToString(digest[:]) + "&size=" + fmt.Sprint(len(payload)))
+	if err != nil {
+		return sourceSealedPayload{}, err
+	}
+	identity, err := json.Marshal(id)
+	if err != nil {
+		return sourceSealedPayload{}, err
+	}
+	headers := make(http.Header)
+	headers.Set(sourceStageIdentityHeader, base64.RawURLEncoding.EncodeToString(identity))
+	var sealed sourceSealedPayload
+	if err := a.sourcePost(ctx, endpoint, payload, "application/octet-stream", headers, &sealed); err != nil {
+		return sourceSealedPayload{}, err
+	}
+	if sealed.Ref != "payload-"+ticket || sealed.Size != int64(len(payload)) || sealed.Digest != hex.EncodeToString(digest[:]) {
+		return sourceSealedPayload{}, fmt.Errorf("fencing: source authority sealed different bytes")
+	}
+	return sealed, nil
+}
+
+func (a *AuthorityClient) Admit(ctx context.Context, sequence uint64, intent MutationIntent) error {
+	id, producer, err := a.sourceMutationBinding()
+	if err != nil {
+		return err
+	}
+	if sequence == 0 || intent.OperationID != MutationRequestID(producer.ProducerUID, sequence) || intent.StoreScopeHash != producer.StoreScopeHash {
+		return fmt.Errorf("fencing: source mutation admission tuple differs")
+	}
+	return a.postMutation(ctx, "/v1/source-mutations/admit", id, producer.ProducerUID, sequence, intent)
+}
+
+func (a *AuthorityClient) Lookup(ctx context.Context, sequence uint64, intent MutationIntent) (MutationLookupResult, error) {
+	id, producer, err := a.sourceMutationBinding()
+	if err != nil {
+		return MutationLookupResult{}, err
+	}
+	return a.LookupMutation(ctx, id, producer.ProducerUID, sequence, intent)
+}
+
+func (a *AuthorityClient) Execute(ctx context.Context, sequence uint64, intent MutationIntent) error {
+	id, producer, err := a.sourceMutationBinding()
+	if err != nil {
+		return err
+	}
+	if sequence == 0 || intent.OperationID != MutationRequestID(producer.ProducerUID, sequence) || intent.StoreScopeHash != producer.StoreScopeHash {
+		return fmt.Errorf("fencing: source mutation execution tuple differs")
+	}
+	return a.postMutation(ctx, "/v1/source-mutations/execute", id, producer.ProducerUID, sequence, intent)
+}
+
+func (a *AuthorityClient) postMutation(ctx context.Context, path string, id Identity, producerUID string, sequence uint64, intent MutationIntent) error {
+	endpoint, err := a.sourceEndpoint(path)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(struct {
+		Identity    Identity       `json:"identity"`
+		ProducerUID string         `json:"producerUID"`
+		Sequence    uint64         `json:"sequence"`
+		Intent      MutationIntent `json:"intent"`
+	}{id, producerUID, sequence, intent})
+	if err != nil {
+		return err
+	}
+	return a.sourcePost(ctx, endpoint, body, "application/json", nil, nil)
+}
+
 func validateMutationLookupEntry(entry MutationEntry) error {
 	if err := validateMutationIntent(entry.Intent); err != nil {
 		return err
@@ -193,8 +394,11 @@ func validateMutationLookupEntry(entry MutationEntry) error {
 		if !mutationDigestValid(r.ReceiptDigest) || (r.AllCopiesTerminal && !allDispatchesTerminal(entry)) {
 			return fmt.Errorf("fencing: malformed mutation lookup resolution")
 		}
+		if r.ConditionFailed && (r.Outcome != MutationRejected || entry.Intent.Condition.Mode == MutationUnconditional) {
+			return fmt.Errorf("fencing: malformed conditional mutation rejection")
+		}
 		if entry.Preparation == nil {
-			if r.Outcome != MutationRejected || r.PreparationHash != "" || r.PayloadDigest != "" || !r.AllCopiesTerminal {
+			if r.Outcome != MutationRejected || r.PreparationHash != "" || r.PayloadDigest != "" || r.ConditionFailed || !r.AllCopiesTerminal {
 				return fmt.Errorf("fencing: malformed cancelled mutation lookup resolution")
 			}
 		} else {

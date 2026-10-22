@@ -2,13 +2,9 @@ package operator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"slices"
-	"strings"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 )
@@ -43,6 +39,9 @@ func (e *FencingExecutor) enrolledMutationRun(ctx context.Context, runtime fenci
 // lookupMutation returns only the original entry for a root-enrolled producer
 // tuple. This path never admits or executes work; live reads use GET only.
 func (e *FencingExecutor) lookupMutation(ctx context.Context, statefulSetUID string, id fencing.Identity, request fencing.MutationLookupRequest) (fencing.MutationLookupResult, error) {
+	if e.AuthorityState == nil {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
+	}
 	state, err := e.read(ctx, statefulSetUID, id.SourceClusterID)
 	if err != nil {
 		return fencing.MutationLookupResult{}, err
@@ -57,21 +56,12 @@ func (e *FencingExecutor) lookupMutation(ctx context.Context, statefulSetUID str
 	if err := run.Runtime.Validate(id); err != nil {
 		return fencing.MutationLookupResult{}, err
 	}
-	var resource object
-	if err := e.Kube.Get(ctx, e.mutationProducerPath(*run.Runtime), &resource); err != nil {
+	producer, producerUID, _, err := e.AuthorityState.ReadProducer(ctx, *run.Runtime)
+	if err != nil {
 		return fencing.MutationLookupResult{}, err
 	}
-	if nested(resource, "metadata", "deletionTimestamp") != nil || str(nested(resource, "metadata", "uid")) != run.MutationProducerUID || str(nested(resource, "metadata", "resourceVersion")) == "" {
-		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: bound mutation producer storage identity differs")
-	}
-	var producer fencing.MutationProducer
-	decoder := json.NewDecoder(strings.NewReader(str(nested(resource, "data", "producer.json"))))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&producer); err != nil {
-		return fencing.MutationLookupResult{}, err
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: trailing producer state")
+	if producerUID != run.MutationProducerUID {
+		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: bound mutation producer identity differs from canonical ObjectStorage")
 	}
 	if producer.Runtime != *run.Runtime || producer.WALIdentity != id.WALIdentity || producer.EvidenceFault != "" || producer.Validate() != nil {
 		return fencing.MutationLookupResult{}, fmt.Errorf("fencing: stored mutation producer identity or state differs")
@@ -108,21 +98,21 @@ func (e *FencingExecutor) changeMutationProducer(ctx context.Context, runtime fe
 }
 
 func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.RuntimeBinding, allowCreate, latchingEvidenceFault bool, transition func(*fencing.MutationProducer) error) (fencing.MutationProducer, error) {
-	endpoint := e.mutationProducerPath(runtime)
+	if e.AuthorityState == nil {
+		return fencing.MutationProducer{}, fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
+	}
 	for range 8 {
 		run, err := e.enrolledMutationRun(ctx, runtime)
 		if err != nil {
 			return fencing.MutationProducer{}, err
 		}
-		var resource object
-		err = e.Kube.Get(ctx, endpoint, &resource)
-		creating := apiNotFound(err)
-		if err != nil && (!creating || !allowCreate) {
+		producer, producerUID, version, err := e.AuthorityState.ReadProducer(ctx, runtime)
+		creating := errors.Is(err, errAuthorityStateNotFound)
+		if err != nil && !creating {
 			return fencing.MutationProducer{}, err
 		}
-		var producer fencing.MutationProducer
 		if creating {
-			if run.Identity.WALIdentity != "" || run.MutationProducerUID != "" {
+			if !allowCreate || run.Identity.WALIdentity != "" || run.MutationProducerUID != "" {
 				return producer, fmt.Errorf("fencing: missing bound producer cannot be recreated")
 			}
 			initial, err := fencing.NewMutationProducer(run.Identity, runtime)
@@ -130,36 +120,34 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 				return producer, err
 			}
 			producer = *initial
-		} else {
-			if nested(resource, "metadata", "deletionTimestamp") != nil || str(nested(resource, "metadata", "uid")) == "" || str(nested(resource, "metadata", "resourceVersion")) == "" {
-				return producer, fmt.Errorf("fencing: mutation producer deleting or lacks storage identity")
+			producerUID = stableMutationProducerUID(runtime)
+			if err := e.AuthorityState.WriteProducer(ctx, runtime, producer, nil); err != nil {
+				if errors.Is(err, errAuthorityStateConflict) {
+					continue
+				}
+				stored, storedUID, _, readErr := e.AuthorityState.ReadProducer(ctx, runtime)
+				if readErr == nil && storedUID == producerUID && hashJSON(stored) == hashJSON(producer) {
+					continue
+				}
+				return producer, errors.Join(err, readErr)
 			}
-			decoder := json.NewDecoder(strings.NewReader(str(nested(resource, "data", "producer.json"))))
-			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&producer); err != nil {
+			continue
+		}
+		if producerUID != stableMutationProducerUID(runtime) || (run.MutationProducerUID != "" && run.MutationProducerUID != producerUID) {
+			return producer, fmt.Errorf("fencing: canonical mutation producer identity differs from root")
+		}
+		if run.MutationProducerUID == "" {
+			if !allowCreate || run.Identity.WALIdentity != "" || producer.LastAdmitted != 0 || (producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
+				return producer, fmt.Errorf("fencing: producer identity must be pinned before activation")
+			}
+			_, err := e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
+				return l.BindMutationProducer(run.Identity, runtime, producerUID)
+			})
+			if err != nil {
 				return producer, err
 			}
-			if err := decoder.Decode(new(any)); err != io.EOF {
-				return producer, fmt.Errorf("fencing: trailing producer state")
-			}
-			if producer.Runtime != runtime || producer.Validate() != nil {
-				return producer, fmt.Errorf("fencing: stored mutation producer identity/state differs")
-			}
-			uid := str(nested(resource, "metadata", "uid"))
-			if run.MutationProducerUID == "" {
-				if !allowCreate || run.Identity.WALIdentity != "" || producer.LastAdmitted != 0 || (producer.Phase != fencing.MutationReserved && producer.Phase != fencing.MutationClosed) {
-					return producer, fmt.Errorf("fencing: producer UID must be pinned before activation")
-				}
-				_, err := e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error { return l.BindMutationProducer(run.Identity, runtime, uid) })
-				if err != nil {
-					return producer, err
-				}
-				// Reload both objects: closure may have raced this initialization.
-				continue
-			}
-			if run.MutationProducerUID != uid {
-				return producer, fmt.Errorf("fencing: producer object was replaced")
-			}
+			// Reload root and producer together; closure may have raced this bind.
+			continue
 		}
 		// Every bound WAL is immutable in the root; producer transitions cannot
 		// silently point at a different incarnation's admission authority.
@@ -194,32 +182,19 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 				return producer, err
 			}
 		}
-		data, err := json.Marshal(producer)
-		if err != nil {
-			return producer, err
-		}
-		if len(data) > 700000 {
-			return producer, fmt.Errorf("fencing: mutation journal capacity exhausted")
-		}
-		if creating {
-			name := strings.TrimPrefix(endpoint, e.controller().corePath("configmaps", "")+"/")
-			resource = object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": name, "namespace": e.Kube.Namespace}, "data": object{"producer.json": string(data)}}
-			err = e.Kube.Post(ctx, e.controller().corePath("configmaps", ""), resource, nil)
-		} else {
-			resource["data"] = object{"producer.json": string(data)}
-			err = e.Kube.Put(ctx, endpoint, resource, nil)
-		}
-		if err == nil {
-			if creating {
-				// Creation is not enrollment. Bind the server-assigned UID in
-				// the root before returning any authorization.
-				continue
-			}
+		writeErr := e.AuthorityState.WriteProducer(ctx, runtime, producer, version)
+		if writeErr == nil {
 			return producer, nil
 		}
-		var api *APIError
-		if !errors.As(err, &api) || api.StatusCode != http.StatusConflict {
-			return producer, err
+		if errors.Is(writeErr, errAuthorityStateConflict) {
+			continue
+		}
+		stored, storedUID, _, readErr := e.AuthorityState.ReadProducer(ctx, runtime)
+		if readErr == nil && storedUID == producerUID && hashJSON(stored) == hashJSON(producer) {
+			return stored, nil
+		}
+		if readErr != nil && !errors.Is(readErr, errAuthorityStateNotFound) {
+			return producer, errors.Join(writeErr, readErr)
 		}
 	}
 	return fencing.MutationProducer{}, fencing.ErrUnavailable

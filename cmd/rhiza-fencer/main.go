@@ -16,8 +16,11 @@ import (
 	"syscall"
 	"time"
 
+	"cloud.google.com/go/storage"
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"google.golang.org/api/option"
 )
 
 func main() {
@@ -86,10 +89,14 @@ func serve(ctx context.Context, args []string) error {
 	attestorCA := f.String("attestor-ca-file", os.Getenv("RHIZA_FENCE_ATTESTOR_CA_FILE"), "unsupported legacy v1 attestor CA")
 	stageDir := f.String("source-stage-dir", os.Getenv("FENCER_SOURCE_STAGE_DIR"), "pre-provisioned local POSIX source staging directory")
 	stageIncarnation := f.String("source-stage-incarnation", os.Getenv("FENCER_SOURCE_STAGE_INCARNATION"), "pinned source staging incarnation digest")
+	sourceReceiptDir := f.String("source-mutation-receipt-dir", os.Getenv("FENCER_SOURCE_MUTATION_RECEIPT_DIR"), "pre-provisioned durable source mutation receipt directory")
+	sourceWriterCredentials := f.String("source-writer-credentials-file", os.Getenv("FENCER_SOURCE_WRITER_CREDENTIALS_FILE"), "separate GCS source-writer credentials file")
 	runtimeAgentCA := f.String("runtime-agent-ca-file", os.Getenv("FENCER_RUNTIME_AGENT_CA_FILE"), "dedicated node runtime-agent TLS CA; enables runtime enrollment and terminal evidence")
 	runtimeAgentToken := f.String("runtime-agent-token-file", "/var/run/secrets/rhiza-fencer/runtime-agent-token", "TokenReview-audience-bound runtime-agent credential")
 	runtimeAgentServer := f.String("runtime-agent-server-name", "runtime-agent", "TLS DNS identity on node runtime-agent certificates")
 	runtimeAgentPort := f.String("runtime-agent-port", "9445", "node runtime-agent HTTPS host port")
+	authorityStatePrefix := f.String("authority-state-prefix", os.Getenv("FENCER_AUTHORITY_STATE_PREFIX"), "canonical authority state prefix in the configured GCS bucket")
+	independentMutation := f.Bool("independent-mutation-profile", os.Getenv("FENCER_INDEPENDENT_MUTATION_PROFILE") == "true", "require canonical remote state and source-mutation providers for the independent NoPVC mutation profile")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -103,7 +110,34 @@ func serve(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	executor := &operator.FencingExecutor{Kube: kube}
+	stateConfig := objectstore.LoadConfig()
+	var authorityState *operator.AuthorityStateStore
+	if stateConfig.Provider == objectstore.ProviderGCS && stateConfig.Bucket != "" {
+		stateBucket, err := objectstore.NewBucket(stateConfig)
+		if err != nil {
+			return fmt.Errorf("configure canonical authority ObjectStorage: %w", err)
+		}
+		defer stateBucket.Close()
+		statePrefix := *authorityStatePrefix
+		if statePrefix == "" {
+			statePrefix = "rhiza-authority-state"
+		}
+		authorityState, err = operator.NewAuthorityStateStore(stateBucket, statePrefix)
+		if err != nil {
+			return err
+		}
+	}
+	if *independentMutation {
+		if authorityState == nil {
+			return fmt.Errorf("independent mutation profile requires RHIZA_OBJSTORE_PROVIDER=gcs and a bucket; cooperative-only mode may use legacy control state but is not NoPVC-qualified")
+		}
+		if *runtimeAgentCA == "" || *sourceWriterCredentials == "" || *stageDir != "" || *stageIncarnation != "" || *sourceReceiptDir != "" {
+			return fmt.Errorf("independent mutation profile requires runtime-agent CA, separate source writer credentials, and remote source staging and receipts (no local stage or receipt directory)")
+		}
+	} else if (*sourceReceiptDir != "" || *sourceWriterCredentials != "") && authorityState == nil {
+		return fmt.Errorf("source mutation execution requires canonical GCS authority state; configure the independent mutation profile or disable source-mutation providers")
+	}
+	executor := &operator.FencingExecutor{Kube: kube, AuthorityState: authorityState}
 	if *runtimeAgentCA != "" {
 		ca, err := os.ReadFile(*runtimeAgentCA)
 		if err != nil {
@@ -126,6 +160,29 @@ func serve(ctx context.Context, args []string) error {
 		}
 		defer store.Close()
 		executor.SourceStages = store
+	}
+	if !*independentMutation && (*sourceReceiptDir == "") != (*sourceWriterCredentials == "") {
+		return fmt.Errorf("source mutation execution requires both a receipt directory and separate writer credentials")
+	}
+	if *sourceWriterCredentials != "" {
+		credentialInfo, err := os.Lstat(*sourceWriterCredentials)
+		if err != nil || !credentialInfo.Mode().IsRegular() || credentialInfo.Mode()&os.ModeSymlink != 0 || credentialInfo.Mode().Perm()&0077 != 0 {
+			return fmt.Errorf("source writer credentials file is missing or unsafe")
+		}
+		if *sourceReceiptDir != "" {
+			receipts, err := operator.OpenMutationExecutionReceiptStore(*sourceReceiptDir)
+			if err != nil {
+				return err
+			}
+			defer receipts.Close()
+			executor.SourceMutationReceipts = receipts
+		}
+		writer, err := storage.NewClient(ctx, option.WithCredentialsFile(*sourceWriterCredentials))
+		if err != nil {
+			return fmt.Errorf("configure source writer: %w", err)
+		}
+		defer writer.Close()
+		executor.SourceMutationStorage = writer
 	}
 	server := &http.Server{Addr: *listen, Handler: executor.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 35 * time.Second, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	defer server.Close()

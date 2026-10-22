@@ -36,11 +36,18 @@ func (n *Node) bindFenceWAL(ctx context.Context, walIdentity string) error {
 	if err := n.fenceSession.BindWAL(ctx, walIdentity); err != nil {
 		return err
 	}
-	// A validated binding alone must not enable the legacy direct-write bucket.
-	// Replace this refusal only with the durable, authority-only mutation client.
-	if _, enabled := n.fenceSession.MutationBinding(); enabled {
-		return fmt.Errorf("independent fencing requires the durable authority-only mutation client; direct provider writes are disabled")
+	if n.protectedBucket == nil {
+		return fmt.Errorf("supervised source mutation bucket is unavailable")
 	}
+	dir, err := fencing.SourceRetryDirectory(n.config.DataDir, n.fenceSession.Identity())
+	if err != nil {
+		return fmt.Errorf("prepare source retry directory: %w", err)
+	}
+	client, err := fencing.OpenSourceMutationClient(dir, n.fenceSession)
+	if err != nil {
+		return fmt.Errorf("open source mutation client: %w", err)
+	}
+	n.protectedBucket.source = client
 	return nil
 }
 

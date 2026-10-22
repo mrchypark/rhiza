@@ -2,6 +2,7 @@ package operator
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -51,11 +52,22 @@ type SourceStageStore struct {
 	mu          sync.Mutex
 	dir         string
 	incarnation string
+	evidence    *AuthorityEvidenceStore
 	lock        *os.File
 	fatal       error
 	manifest    sourceStageManifest
 	syncFile    func(*os.File) error
 	syncDir     func(string) error
+}
+
+// NewRemoteSourceStageStore selects ObjectStorage as the source-stage authority.
+// Unlike OpenSourceStageStore it has no local root, manifest, or disk takeover
+// dependency; local bytes are not a production fallback.
+func NewRemoteSourceStageStore(evidence *AuthorityEvidenceStore) (*SourceStageStore, error) {
+	if evidence == nil || evidence.Identity() == "" {
+		return nil, fmt.Errorf("fencing: remote source stages require root-bound authority evidence")
+	}
+	return &SourceStageStore{evidence: evidence, incarnation: evidence.Identity()}, nil
 }
 
 func OpenSourceStageStore(dir, incarnation string) (*SourceStageStore, error) {
@@ -254,6 +266,9 @@ func validStageTempSuffix(suffix string) bool {
 }
 
 func (s *SourceStageStore) Reserve(producerUID, ticket string, draft fencing.MutationIntent) error {
+	if s != nil && s.evidence != nil {
+		return s.ReserveContext(context.Background(), producerUID, ticket, draft)
+	}
 	if producerUID == "" || !validStageTicket(ticket) || !validStageDraft(draft) {
 		return fmt.Errorf("fencing: invalid source staging reservation")
 	}
@@ -282,6 +297,9 @@ func (s *SourceStageStore) Reserve(producerUID, ticket string, draft fencing.Mut
 }
 
 func (s *SourceStageStore) Seal(producerUID, ticket, digest string, size int64, input io.Reader) (sourceStageDescriptor, error) {
+	if s != nil && s.evidence != nil {
+		return s.SealContext(context.Background(), producerUID, ticket, digest, size, input)
+	}
 	if producerUID == "" || !validStageTicket(ticket) || !validStageDigest(digest) || size < 0 || size > maxSourceStageBytes || input == nil {
 		return sourceStageDescriptor{}, fmt.Errorf("fencing: invalid or oversized source stage")
 	}
@@ -361,6 +379,9 @@ func (s *SourceStageStore) Seal(producerUID, ticket, digest string, size int64, 
 }
 
 func (s *SourceStageStore) Cancel(producerUID, ticket string) error {
+	if s != nil && s.evidence != nil {
+		return s.CancelContext(context.Background(), producerUID, ticket)
+	}
 	if producerUID == "" || !validStageTicket(ticket) {
 		return fmt.Errorf("fencing: invalid source stage cancellation")
 	}
@@ -526,6 +547,9 @@ func (s *SourceStageStore) fail(err error) error {
 }
 
 func (s *SourceStageStore) Close() error {
+	if s != nil && s.evidence != nil {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lock == nil {

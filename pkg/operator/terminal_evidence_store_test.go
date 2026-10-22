@@ -15,7 +15,7 @@ var terminalTestStorage = AttestationStoreScope{Provider: "gcs", Bucket: "test-o
 
 func terminalStoreFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixture, fencing.RuntimeBinding) {
 	t.Helper()
-	e, f, id, runtime := newMutationStoreFixture(t)
+	e, f, id, runtime := newMutationArchiveFixture(t)
 	activateStoredProducer(t, e, id, runtime)
 	appendSettledStoreMutation(t, e, runtime, 1)
 	e.VerifyRuntimeEvidence = func(_ context.Context, got fencing.RuntimeBinding, request fencing.StopRequest, receipt []byte) error {
@@ -60,7 +60,7 @@ func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 	if _, err := e.commitMutationArchive(t.Context(), runtime, storeCompactionPlan(t, e, runtime, 1)); err != nil {
 		t.Fatal(err)
 	}
-	restarted := &FencingExecutor{Kube: e.Kube, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
+	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
 	evidence, got, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, hashJSON(state))
 	if err != nil || got != ref || !bytes.Equal(evidence.RuntimeReceipt, []byte("test-provider-terminal")) {
 		t.Fatalf("retained original evidence not reusable: %+v %v", got, err)
@@ -191,7 +191,7 @@ func TestTerminalStoreBoundedArchiveVerificationSurvivesRestart(t *testing.T) {
 	}
 	closeTerminalTestRun(t, e, runtime)
 	for attempt := 0; attempt < 3; attempt++ {
-		e = &FencingExecutor{Kube: e.Kube, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
+		e = &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
 		_, err := e.retainIndependentTerminal(t.Context(), runtime, terminalTestStorage, []byte("test-provider-terminal"))
 		if attempt < 2 && !errors.Is(err, ErrFencePending) || attempt == 2 && err != nil {
 			t.Fatalf("bounded verification attempt %d: %v", attempt, err)
@@ -207,26 +207,35 @@ func TestTerminalStoreBoundedArchiveVerificationSurvivesRestart(t *testing.T) {
 	}
 	// A new generation must scan again; completed old-operation cursors cannot
 	// hide subsequently observed missing ancestor evidence.
-	f.mu.Lock()
 	var artifact terminalEvidence
+	f.mu.Lock()
 	if err := json.Unmarshal([]byte(str(nested(f.objects[e.terminalEvidencePath(ref.ProofName)], "data", "terminal.json"))), &artifact); err != nil {
 		f.mu.Unlock()
 		t.Fatal(err)
 	}
-	headPlan, err := e.decodeMutationArchive(f.objects[e.mutationArchivePath(artifact.Producer.ArchiveHead.Name)], *artifact.Producer.ArchiveHead, runtime, artifact.ProducerUID, "wal")
+	f.mu.Unlock()
+	headPlan, err := e.readMutationArchive(t.Context(), *artifact.Producer.ArchiveHead, runtime, artifact.ProducerUID, "wal")
 	if err != nil {
-		f.mu.Unlock()
 		t.Fatal(err)
 	}
-	delete(f.objects, e.mutationArchivePath(headPlan.Previous.Name))
-	f.mu.Unlock()
+	evidence, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := evidence.objectKey(headPlan.Previous.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.AuthorityState.bucket.Delete(t.Context(), path); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := e.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("f", 64)); !errors.Is(err, errMutationArchiveEvidence) {
 		t.Fatalf("new generation reused unverified history: %v", err)
 	}
 }
 
 func TestTerminalStoreNeverBoundRunPinsProducerBeforeRetention(t *testing.T) {
-	e, _, _, runtime := newMutationStoreFixture(t)
+	e, _, _, runtime := newMutationArchiveFixture(t)
 	closeTerminalTestRun(t, e, runtime)
 	e.VerifyRuntimeEvidence = func(context.Context, fencing.RuntimeBinding, fencing.StopRequest, []byte) error { return nil }
 	ref := retainTerminalTestRun(t, e, runtime)
@@ -236,7 +245,7 @@ func TestTerminalStoreNeverBoundRunPinsProducerBeforeRetention(t *testing.T) {
 }
 
 func TestTerminalStoreRequiresPreparedMutationReceiptVerification(t *testing.T) {
-	e, _, id, runtime := newMutationStoreFixture(t)
+	e, _, id, runtime := newMutationArchiveFixture(t)
 	activateStoredProducer(t, e, id, runtime)
 	_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
 		if err := p.Admit(1, completeStoreIntent(fencing.MutationIntent{StoreScopeHash: hashJSON(terminalTestStorage), OperationID: "prepared-delete", Kind: "delete", Key: "key"})); err != nil {
@@ -276,7 +285,7 @@ func TestTerminalStoreRequiresPreparedMutationReceiptVerification(t *testing.T) 
 		t.Fatal("reference did not bind the retained mutation outcomes")
 	}
 	// The current executor must still have the verifier after restart.
-	restarted := &FencingExecutor{Kube: e.Kube, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
+	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, VerifyRuntimeEvidence: e.VerifyRuntimeEvidence}
 	if _, _, err := restarted.readIndependentTerminal(t.Context(), runtime, terminalTestStorage, strings.Repeat("d", 64)); err == nil {
 		t.Fatal("restart accepted prepared work without its receipt verifier")
 	}
@@ -285,7 +294,7 @@ func TestTerminalStoreRequiresPreparedMutationReceiptVerification(t *testing.T) 
 func TestTerminalStoreRejectsOtherStorePreparedLiveOrArchived(t *testing.T) {
 	for _, archived := range []bool{false, true} {
 		t.Run(map[bool]string{false: "live", true: "archived"}[archived], func(t *testing.T) {
-			e, _, id, runtime := newMutationStoreFixture(t)
+			e, _, id, runtime := newMutationArchiveFixture(t)
 			activateStoredProducer(t, e, id, runtime)
 			run, err := e.enrolledMutationRun(t.Context(), runtime)
 			if err != nil {

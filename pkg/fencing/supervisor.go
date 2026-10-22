@@ -262,6 +262,10 @@ func (s *Supervisor) handler() http.Handler {
 			http.Error(w, "unauthorized", http.StatusForbidden)
 			return
 		}
+		if sourceRelayPath(r.URL.Path) {
+			s.sourceRelay(w, r)
+			return
+		}
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536))
 		decoder.DisallowUnknownFields()
 		var err error
