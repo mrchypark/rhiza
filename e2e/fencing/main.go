@@ -37,7 +37,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|wait-source|run|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|runtime-probe|runtime-agent-request"))
 	}
 	if os.Args[1] == "runtime-agent-request" {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -53,6 +53,10 @@ func main() {
 	}
 	if os.Args[1] == "manifests" {
 		fatal(json.NewEncoder(os.Stdout).Encode(manifests()))
+		return
+	}
+	if os.Args[1] == "local-cooperative-store-secret" {
+		fatal(json.NewEncoder(os.Stdout).Encode(localCooperativeStoreSecret()))
 		return
 	}
 	if os.Args[1] == "wait-source" {
@@ -180,25 +184,28 @@ func manifests() obj {
 		tokens[id] = token
 		members = append(members, obj{"node_id": id, "url": "http://" + id + ".rhiza-headless:8080", "peer_url": "quic://" + id + ".rhiza-headless:9090", "public_key": rhiza.PeerPublicKey("chaos-source", id, token)})
 	}
-	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_PREFIX": "rhiza", "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": string(encoded(members))}
+	config := obj{"RHIZA_CLUSTER_ID": "chaos-source", "RHIZA_BIND_ADDR": "0.0.0.0:8080", "RHIZA_PEER_ADDR": "0.0.0.0:9090", "RHIZA_DATA_DIR": "/data", "RHIZA_ENABLE_RECONFIGURATION": "true", "RHIZA_CHECKPOINT_INTERVAL": "0", "RHIZA_OBJSTORE_SYNC_INTERVAL": "1s", "RHIZA_OBJSTORE_GC_INTERVAL": "0", "RHIZA_OBJSTORE_PROVIDER": "s3", "RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_REGION": "us-east-1", "RHIZA_OBJSTORE_PREFIX": "rhiza", "RHIZA_OBJSTORE_DURABILITY": "before-ack", "RHIZA_CLUSTER_MEMBERS": string(encoded(members))}
 	configMap := obj{"apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata("rhiza-config"), "data": config}
 	credentials := obj{"apiVersion": "v1", "kind": "Secret", "metadata": metadata("rhiza-peer-credentials"), "stringData": obj{"RHIZA_ADMIN_TOKEN": admin, "RHIZA_PEER_TOKENS": string(encoded(tokens))}}
-	storeCredentials := obj{"apiVersion": "v1", "kind": "Secret", "metadata": metadata("rhiza-object-store"), "stringData": obj{"RHIZA_OBJSTORE_ENDPOINT": "rhiza-minio:9000", "RHIZA_OBJSTORE_BUCKET": "rhiza", "RHIZA_OBJSTORE_INSECURE": "true", "RHIZA_OBJSTORE_ACCESS_KEY": "fencing-local", "RHIZA_OBJSTORE_SECRET_KEY": "fencing-local-secret", "RHIZA_OBJSTORE_REGION": "us-east-1"}}
 	store := resource("apps/v1", "Deployment", "rhiza-minio", obj{"replicas": 1, "selector": obj{"matchLabels": selector("rhiza-minio")}, "template": obj{"metadata": obj{"labels": selector("rhiza-minio")}, "spec": obj{"containers": []obj{{"name": "minio", "image": "ghcr.io/versity/versitygw@sha256:30292fc2eeacc67a36993b01f7a7a5e3361a19cced0e80c1d71cfa2a4b0a2499", "args": []string{"--port", ":9000", "--health", "/_/health", "posix", "/data"}, "env": []obj{value("ROOT_ACCESS_KEY", "fencing-local"), value("ROOT_SECRET_KEY", "fencing-local-secret")}, "ports": []obj{{"name": "s3", "containerPort": 9000}}, "readinessProbe": obj{"httpGet": obj{"path": "/_/health", "port": "s3"}}, "volumeMounts": []obj{{"name": "data", "mountPath": "/data"}}}}, "volumes": []obj{{"name": "data", "emptyDir": obj{}}}}}})
 	storeService := resource("v1", "Service", "rhiza-minio", obj{"selector": selector("rhiza-minio"), "ports": []obj{{"port": 9000, "targetPort": "s3"}}})
 	bucketJob := resource("batch/v1", "Job", "rhiza-create-bucket", obj{"backoffLimit": 0, "activeDeadlineSeconds": 120, "template": obj{"spec": obj{"restartPolicy": "Never", "containers": []obj{{"name": "create", "image": "amazon/aws-cli@sha256:83f8ffe939569070c5b66d22231862ab78718766d9d8e4c44ca84dd0be5569a5", "args": []string{"--endpoint-url=http://rhiza-minio:9000", "s3api", "create-bucket", "--bucket", "rhiza"}, "env": []obj{value("AWS_ACCESS_KEY_ID", "fencing-local"), value("AWS_SECRET_ACCESS_KEY", "fencing-local-secret"), value("AWS_DEFAULT_REGION", "us-east-1"), value("AWS_EC2_METADATA_DISABLED", "true")}}}}}})
 	headless := resource("v1", "Service", "rhiza-headless", obj{"clusterIP": "None", "publishNotReadyAddresses": true, "selector": selector("rhiza"), "ports": []obj{{"name": "http", "port": 8080, "targetPort": "http"}, {"name": "peer-quic", "port": 9090, "targetPort": "peer-quic", "protocol": "UDP"}}})
-	envFrom := []obj{{"configMapRef": obj{"name": "rhiza-config"}}, {"secretRef": obj{"name": "rhiza-peer-credentials"}}, {"secretRef": obj{"name": "rhiza-object-store"}}}
+	envFrom := []obj{{"configMapRef": obj{"name": "rhiza-config"}}, {"secretRef": obj{"name": "rhiza-peer-credentials"}}}
 	sts := resource("apps/v1", "StatefulSet", "rhiza", obj{"replicas": 0, "serviceName": "rhiza-headless", "podManagementPolicy": "Parallel", "updateStrategy": obj{"type": "OnDelete"}, "selector": obj{"matchLabels": selector("rhiza")}, "template": obj{"metadata": obj{"labels": selector("rhiza")}, "spec": obj{"securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "rhiza", "image": "rhiza-fencing-host:local", "envFrom": envFrom, "env": []obj{field("RHIZA_NODE_ID", "metadata.name")}, "ports": []obj{{"name": "http", "containerPort": 8080}, {"name": "peer-quic", "containerPort": 9090, "protocol": "UDP"}}, "volumeMounts": []obj{{"name": "data", "mountPath": "/data"}}, "readinessProbe": obj{"httpGet": obj{"path": "/ready", "port": "http"}, "periodSeconds": 2}, "resources": obj{"requests": obj{"cpu": "250m", "memory": "256Mi"}, "limits": obj{"memory": "2Gi"}}}}, "volumes": []obj{{"name": "data", "emptyDir": obj{}}}}}})
 	workload := nested(sts, "spec", "template", "spec").(obj)
 	workload["hostPID"], workload["shareProcessNamespace"] = false, false
 	application := workload["containers"].([]obj)[0]
 	application["securityContext"] = obj{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": obj{"drop": []string{"ALL"}}}
 	opEnv := []obj{field("POD_NAMESPACE", "metadata.namespace"), value("RHIZA_AUTOMATIC_RECOVERY", "true"), value("RHIZA_FENCER_BACKEND", "kubernetes")}
-	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0], envFrom[2]}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}}}}})
+	op := resource("apps/v1", "Deployment", "rhiza-operator", obj{"replicas": 0, "selector": obj{"matchLabels": selector("rhiza-operator")}, "template": obj{"metadata": obj{"labels": selector("rhiza-operator")}, "spec": obj{"serviceAccountName": "rhiza-operator", "securityContext": obj{"runAsNonRoot": true, "fsGroup": 65532}, "containers": []obj{{"name": "operator", "image": "rhiza-fencing-operator:local", "args": []string{"--namespace=$(POD_NAMESPACE)", "--poll-interval=1s"}, "env": opEnv, "envFrom": []obj{envFrom[0]}, "volumeMounts": []obj{{"name": "tmp", "mountPath": "/tmp"}}}}, "volumes": []obj{{"name": "tmp", "emptyDir": obj{}}}}}})
 	binding := resource("rhiza.mrchypark.dev/v1alpha1", "RhizaCluster", "rhiza", obj{"logicalID": "fencing-e2e", "statefulSet": "rhiza", "container": "rhiza", "adoptClusterID": "chaos-source", "automatic": true, "voterCount": len(members), "policy": obj{"failureGraceSeconds": 15, "cooldownSeconds": 3, "maxRecoveriesPerDay": 3, "allowDataLoss": false}})
 	bucketJob["spec"].(obj)["suspend"] = true
-	return obj{"apiVersion": "v1", "kind": "List", "items": []obj{configMap, credentials, storeCredentials, store, storeService, bucketJob, headless, sts, op, binding}}
+	return obj{"apiVersion": "v1", "kind": "List", "items": []obj{configMap, credentials, store, storeService, bucketJob, headless, sts, op, binding}}
+}
+
+func localCooperativeStoreSecret() obj {
+	return obj{"apiVersion": "v1", "kind": "Secret", "metadata": metadata("rhiza-object-store"), "stringData": obj{"RHIZA_OBJSTORE_ACCESS_KEY": "fencing-local", "RHIZA_OBJSTORE_SECRET_KEY": "fencing-local-secret"}}
 }
 
 func command(ctx context.Context, name string, args ...string) ([]byte, error) {

@@ -191,7 +191,7 @@ cleanup() {
       fencing_exit=1
     fi
   fi
-  rm -f "$fencing_tmp/tls.key" "$fencing_tmp/tls.crt" "$fencing_tmp/openssl.cnf" "$fencing_tmp/authority.yaml" "$fencing_tmp/supervised.patch.yaml" "$fencing_tmp/sa.yaml" "$fencing_tmp/rbac.yaml" "$fencing_tmp/manifests.json" "$fencing_tmp/crictl-version.txt" "$fencing_tmp/crictl-info.json"
+  rm -f "$fencing_tmp/tls.key" "$fencing_tmp/tls.crt" "$fencing_tmp/openssl.cnf" "$fencing_tmp/authority.yaml" "$fencing_tmp/supervised.patch.yaml" "$fencing_tmp/sa.yaml" "$fencing_tmp/rbac.yaml" "$fencing_tmp/manifests.json" "$fencing_tmp/local-cooperative-store-secret.json" "$fencing_tmp/crictl-version.txt" "$fencing_tmp/crictl-info.json"
   rmdir "$fencing_tmp" || fencing_exit=1
   printf '%s\n' "$fencing_exit" >"$FENCING_E2E_OUT/actual-exit.txt"
   exit "$fencing_exit"
@@ -244,6 +244,13 @@ sed '/^---$/,$d' deploy/operator/fencing/supervised-statefulset.patch.yaml | sed
 "$FENCING_E2E_BIN" manifests >"$fencing_tmp/manifests.json"
 k apply -f "$fencing_tmp/manifests.json"
 k patch statefulset rhiza --type=strategic --patch-file "$fencing_tmp/supervised.patch.yaml"
+# Local cooperative fixture overlay only: credentials are never part of the
+# shipped supervised patch or the base fixture manifests.
+"$FENCING_E2E_BIN" local-cooperative-store-secret >"$fencing_tmp/local-cooperative-store-secret.json"
+k apply -f "$fencing_tmp/local-cooperative-store-secret.json"
+local_store_ref='[{"op":"add","path":"/spec/template/spec/containers/0/envFrom/-","value":{"secretRef":{"name":"rhiza-object-store"}}}]'
+k patch statefulset rhiza --type=json -p "$local_store_ref"
+k patch deployment rhiza-operator --type=json -p "$local_store_ref"
 k rollout status deployment/rhiza-minio --timeout=180s
 k patch job rhiza-create-bucket --type=merge -p '{"spec":{"suspend":false}}'
 k wait --for=condition=Complete job/rhiza-create-bucket --timeout=180s
