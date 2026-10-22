@@ -33,7 +33,7 @@ func TestArchiveForkRegistrationRequiresConfiguredControllerToken(t *testing.T) 
 		{name: "other controller", username: "system:serviceaccount:test:other", want: http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/apis/authentication.k8s.io/v1/tokenreviews" || r.Method != http.MethodPost {
 					http.NotFound(w, r)
 					return

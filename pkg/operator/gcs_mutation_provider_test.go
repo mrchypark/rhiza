@@ -234,27 +234,10 @@ func TestGCSMutationProviderUnknownExactDeleteBecomesNoncommitExclusion(t *testi
 }
 
 func TestSourceMutationHTTPAdmitExecutesGCSAndReturnsOriginalDurableTuple(t *testing.T) {
-	e, fixture, id, runtime := newMutationStoreFixture(t)
-	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
-		t.Fatal(err)
-	}
-
-	env := []any{
-		object{"name": "RHIZA_CLUSTER_ID", "value": id.SourceClusterID},
-		object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
-		object{"name": "RHIZA_OBJSTORE_BUCKET", "value": "archive"},
-		object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"},
-	}
-	pod := supervisedTestPod()
-	asObject(pod["metadata"])["name"] = id.NodeID
-	asObject(pod["metadata"])["uid"] = id.PodUID
-	asObject(pod["metadata"])["ownerReferences"] = []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": runtime.StatefulSetUID, "controller": true}}
-	asObject(list(nested(pod, "spec", "containers"))[0])["env"] = env
-	sts := object{"metadata": object{"uid": runtime.StatefulSetUID}, "spec": object{"template": object{"spec": object{"containers": []any{object{"name": "rhiza", "env": env}}}}}}
-	fixture.mu.Lock()
-	fixture.authPod, fixture.authStatefulSet = pod, sts
-	fixture.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
-	fixture.mu.Unlock()
+	bootstrap := newArchiveGenesisFixture(t)
+	commitArchiveGenesisFixture(t, bootstrap)
+	e, runtime := bootstrap.e, bootstrap.runtime
+	id := bootstrap.id
 
 	payload := []byte(`{"membership":"source bytes"}`)
 	var gcsRequests atomic.Int32
@@ -293,13 +276,13 @@ func TestSourceMutationHTTPAdmitExecutesGCSAndReturnsOriginalDurableTuple(t *tes
 	authority := httptest.NewTLSServer(e.Handler())
 	defer authority.Close()
 	client := &fencing.AuthorityClient{URL: authority.URL + "/v1/supervisor", TokenFile: e.Kube.TokenFile, Client: authority.Client()}
-	id.WALIdentity = "wal-source-http"
 	binding, err := client.Bind(t.Context(), id)
 	if err != nil || binding.Producer == nil {
 		t.Fatalf("source producer binding unavailable: %+v %v", binding, err)
 	}
 	draft := stageStoreIntent()
 	draft.StoreScopeHash = binding.Producer.StoreScopeHash
+	draft.OwnerStep.Step = "membership-registration"
 	ticket := strings.Repeat("d", 64)
 	if err := client.ReserveUpload(t.Context(), ticket, draft); err != nil {
 		t.Fatal(err)
@@ -309,21 +292,21 @@ func TestSourceMutationHTTPAdmitExecutesGCSAndReturnsOriginalDurableTuple(t *tes
 		t.Fatal(err)
 	}
 	intent := draft
-	intent.OperationID = fencing.MutationRequestID(binding.Producer.ProducerUID, 1)
+	intent.OperationID = fencing.MutationRequestID(binding.Producer.ProducerUID, 2)
 	intent.PayloadRef, intent.PayloadDigest, intent.PayloadSize = sealed.Ref, sealed.Digest, sealed.Size
 	expectedOperation.Store(intent.OperationID)
 	expectedDigest.Store(intent.PayloadDigest)
-	if err := client.Admit(t.Context(), 1, intent); err != nil {
+	if err := client.Admit(t.Context(), 2, intent); err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.LookupMutation(t.Context(), id, binding.Producer.ProducerUID, 1, intent)
+	result, err := client.LookupMutation(t.Context(), id, binding.Producer.ProducerUID, 2, intent)
 	if err != nil || !result.Found || result.Entry == nil || result.Entry.Intent != intent || result.Entry.Resolution == nil || result.Entry.Resolution.Outcome != fencing.MutationCommitted || result.Entry.Resolution.PayloadDigest != intent.PayloadDigest {
 		t.Fatalf("source ACK lacks its original durable commit tuple: %+v %v", result, err)
 	}
 	if gcsRequests.Load() != 1 {
 		t.Fatalf("admission executed %d GCS requests, want one", gcsRequests.Load())
 	}
-	owner := hashJSON([]any{runtime, id.WALIdentity, binding.Producer.ProducerUID, uint64(1), intent.OperationID})
+	owner := hashJSON([]any{runtime, id.WALIdentity, binding.Producer.ProducerUID, uint64(2), intent.OperationID})
 	receipt, err := receipts.get("receipt-" + owner)
 	if err != nil || receipt.Intent != intent || receipt.WALIdentity != id.WALIdentity || receipt.Generation != 21 {
 		t.Fatalf("provider receipt was not preserved in root-bound object storage: %+v %v", receipt, err)

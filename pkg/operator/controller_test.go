@@ -68,7 +68,7 @@ func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
 
 	restart := func() {
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Fencer: c.Fencer}
 	}
 	advance := func(stage string) {
 		t.Helper()
@@ -114,6 +114,14 @@ func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t
 	if r.Status.Phase != "Complete" {
 		t.Fatalf("completion=%+v", r.Status)
 	}
+	registrar := c.Fencer.(*archiveForkRegistrarFixture)
+	wantRegistration := ArchiveForkGenesisRequest{
+		StatefulSetUID: "sts-uid", TargetClusterID: r.Status.Target,
+		OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID,
+	}
+	if registrar.calls != 1 || registrar.request != wantRegistration {
+		t.Fatalf("canonical fork registration calls=%d request=%+v want=%+v", registrar.calls, registrar.request, wantRegistration)
+	}
 }
 
 type archiveForkRegistrarFixture struct {
@@ -131,6 +139,9 @@ func (*archiveForkRegistrarFixture) Fence(context.Context, FenceRequest) (*Fence
 func (f *archiveForkRegistrarFixture) RegisterArchiveForkGenesis(_ context.Context, request ArchiveForkGenesisRequest) error {
 	f.calls++
 	f.request = request
+	if request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" || request.SourceFenceOperationID == "" {
+		return fmt.Errorf("incomplete archive fork registration request: %+v", request)
+	}
 	return f.err
 }
 
@@ -641,7 +652,7 @@ func TestControllerVoterCountContract(t *testing.T) {
 				api.unready[string(voters[i].ID)] = true
 			}
 			for range 8 {
-				c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity}
+				c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Fencer: c.Fencer}
 				if err := c.reconcileAll(ctx); err != nil {
 					t.Fatal(err)
 				}
@@ -830,7 +841,7 @@ func controllerFixtureVoters(t *testing.T, sourceMode, targetMode string, voters
 	r := &Resource{Metadata: map[string]any{"name": "recover", "uid": "resource-uid", "generation": float64(1), "resourceVersion": "1"}, Spec: Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: targetMode}}
 	api := newOperatorAPIVoters(t, r, sourceMode, voters)
 	t.Cleanup(api.Close)
-	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity()}
+	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity(), Fencer: &archiveForkRegistrarFixture{}}
 }
 
 type operatorAPI struct {

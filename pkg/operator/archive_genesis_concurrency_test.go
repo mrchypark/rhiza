@@ -109,8 +109,9 @@ func TestConcurrentArchiveGenesisCandidatesHaveOneCASWinnerAndTerminalLoser(t *t
 	first := f.intent
 	second := first
 	second.OperationID = fencing.MutationRequestID(f.producer, 2)
+	second.OwnerStep.Step = "genesis-candidate-two"
 	second.PayloadRef, second.PayloadDigest, second.PayloadSize = "", "", 0
-	secondTicket := strings.Repeat("h", 64)
+	secondTicket := strings.Repeat("8", 64)
 	if err := f.stages.Reserve(f.producer, secondTicket, second); err != nil {
 		t.Fatal(err)
 	}
@@ -279,8 +280,9 @@ func TestArchiveGenesisStatusCancelsLostLoserAfterClaimRootCASGapAndClosure(t *t
 	first := f.intent
 	second := first
 	second.OperationID = fencing.MutationRequestID(f.producer, 2)
+	second.OwnerStep.Step = "genesis-candidate-two"
 	second.PayloadRef, second.PayloadDigest, second.PayloadSize = "", "", 0
-	secondTicket := strings.Repeat("i", 64)
+	secondTicket := strings.Repeat("9", 64)
 	if err := f.stages.Reserve(f.producer, secondTicket, second); err != nil {
 		t.Fatal(err)
 	}
