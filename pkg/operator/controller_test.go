@@ -132,6 +132,9 @@ func TestControllerEmptySourceRequiresCanonicalCommitAndTargetReadBarrier(t *tes
 
 func TestTargetReadBarrierRejectsReplacementAfterFinalProbe(t *testing.T) {
 	ctx, _, r, api, c := controllerEmptyFixture(t, "before-ack", "before-ack")
+	r.Spec.RecoveryID = "read-barrier-replacement"
+	r.Status.Target = "rhiza-r-" + shortID(c.operationID(r))
+	r.Status.StatefulSetUID = "sts-uid"
 	api.replacePodAfterProbe = true
 	ready := map[string]bool{}
 	for _, member := range api.voters {
@@ -338,8 +341,9 @@ func (f *archiveForkRegistrarFixture) RegisterArchiveEmptyRecovery(_ context.Con
 		SourceFenceOperationID: request.SourceFenceOperationID, ConfigID: recovery.ArchiveConfigID,
 		SourceScopeHash: digest, TargetScopeHash: hashJSON("target-scope"),
 		SourceGenesisRefDigest: digest, SourceHeadDigest: digest,
-		SourceHeadVersion: objstore.ObjectVersion{Type: objstore.ETag, Value: "source-head"},
-		SourceRootDigest:  digest, SourceFenceDigest: digest, SourceMembershipHash: digest,
+		SourceHeadVersion:     objstore.ObjectVersion{Type: objstore.ETag, Value: "source-head"},
+		TargetEmptyHeadDigest: authorityStateDigest(emptyArchiveHeadFixture()),
+		SourceRootDigest:      digest, SourceFenceDigest: digest, SourceMembershipHash: digest,
 		SourceDurability: "before-ack", TargetMembershipHash: request.TargetMembershipHash,
 		TargetDurability: request.TargetDurability, AllowDataLoss: request.AllowDataLoss,
 		PolicyDigest: emptyRecoveryPolicyDigest(request.PolicyDigest, "before-ack", request.TargetDurability, request.AllowDataLoss),

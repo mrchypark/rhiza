@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -514,9 +517,16 @@ func commitArchiveGenesisFixture(t *testing.T, f archiveGenesisFixture) {
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 			return
 		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil || !bytes.Equal(body, f.payload) {
-			t.Errorf("bootstrap did not upload the staged empty HEAD bytes: %v", err)
+		body, err := readGCSMultipartMedia(r)
+		if err != nil {
+			t.Errorf("read bootstrap GCS media: %v", err)
+			http.Error(w, "invalid GCS multipart upload", http.StatusBadRequest)
+			return
+		}
+		if !bytes.Equal(body, f.payload) {
+			t.Errorf("bootstrap GCS media differs from the staged empty HEAD bytes")
+			http.Error(w, "unexpected GCS media", http.StatusBadRequest)
+			return
 		}
 		if err := f.e.ArchiveBucket.Upload(r.Context(), path.Join(f.storeScope.Prefix, "archive/head.bin"), bytes.NewReader(body), objstore.WithIfNotExists()); err != nil {
 			t.Errorf("mirror target HEAD into archive verification bucket: %v", err)
@@ -541,6 +551,37 @@ func commitArchiveGenesisFixture(t *testing.T, f archiveGenesisFixture) {
 	if err != nil || root.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted || root.Ledger.ArchiveGenesisRef == nil {
 		t.Fatalf("fixture archive genesis did not become committed: %+v err=%v", root.Ledger, err)
 	}
+}
+
+func readGCSMultipartMedia(r *http.Request) ([]byte, error) {
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, err
+	}
+	if mediaType != "multipart/related" || params["boundary"] == "" {
+		return nil, fmt.Errorf("unexpected GCS upload content type %q", mediaType)
+	}
+	reader := multipart.NewReader(r.Body, params["boundary"])
+	var parts [][]byte
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		body, err := io.ReadAll(part)
+		closeErr := part.Close()
+		if err := errors.Join(err, closeErr); err != nil {
+			return nil, err
+		}
+		parts = append(parts, body)
+	}
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("GCS multipart upload has %d parts, want metadata and media", len(parts))
+	}
+	return parts[1], nil
 }
 
 func commitArchiveGenesisMutation(t *testing.T, e *FencingExecutor, id fencing.Identity, runtime fencing.RuntimeBinding, producer string, intent fencing.MutationIntent, payload []byte, scope AttestationStoreScope) {
