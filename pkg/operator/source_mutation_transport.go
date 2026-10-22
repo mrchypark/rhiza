@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +18,7 @@ type sourceMutationRequest struct {
 }
 
 func (e *FencingExecutor) handleSourceMutation(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost || (r.URL.Path != "/v1/source-mutations/admit" && r.URL.Path != "/v1/source-mutations/execute") || r.URL.RawQuery != "" {
+	if r.Method != http.MethodPost || (r.URL.Path != "/v1/source-mutations/admit" && r.URL.Path != "/v1/source-mutations/execute" && r.URL.Path != "/v1/source-mutations/genesis-status") || r.URL.RawQuery != "" {
 		w.Header().Set("Allow", "POST")
 		http.NotFound(w, r)
 		return
@@ -27,15 +28,34 @@ func (e *FencingExecutor) handleSourceMutation(w http.ResponseWriter, r *http.Re
 		return
 	}
 	var request struct {
-		Identity    fencing.Identity       `json:"identity"`
-		ProducerUID string                 `json:"producerUID"`
-		Sequence    uint64                 `json:"sequence"`
-		Intent      fencing.MutationIntent `json:"intent"`
+		Identity       fencing.Identity                    `json:"identity"`
+		ProducerUID    string                              `json:"producerUID"`
+		Sequence       uint64                              `json:"sequence"`
+		Intent         fencing.MutationIntent              `json:"intent"`
+		ArchiveGenesis fencing.ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
 		http.Error(w, "invalid source mutation request", http.StatusBadRequest)
+		return
+	}
+	if r.URL.Path == "/v1/source-mutations/genesis-status" {
+		if request.ArchiveGenesis.ArchiveKey != "archive/head.bin" || request.ArchiveGenesis.ConfigID == 0 || request.ProducerUID != "" || request.Sequence != 0 || request.Intent != (fencing.MutationIntent{}) {
+			http.Error(w, "invalid archive genesis status request", http.StatusBadRequest)
+			return
+		}
+		status, err := e.archiveGenesisStatus(r.Context(), r.Header.Get("Authorization"), request.Identity, request.ArchiveGenesis.ArchiveKey, request.ArchiveGenesis.ConfigID)
+		if err != nil {
+			e.writeSourceStageError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+		return
+	}
+	if request.ArchiveGenesis.ArchiveKey != "" {
+		http.Error(w, "unexpected archive genesis request", http.StatusBadRequest)
 		return
 	}
 	if err := e.executeSourceMutationRequest(r.Context(), r.Header.Get("Authorization"), request.Identity, sourceMutationRequest{ProducerUID: request.ProducerUID, Sequence: request.Sequence, Intent: request.Intent}, r.URL.Path == "/v1/source-mutations/admit"); err != nil {
@@ -76,6 +96,11 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 				return err
 			}
 		}
+		if !isArchiveGenesisMutation(request.Intent) {
+			if err := e.validateArchiveGenesisMutationPayload(ctx, runtime, request.ProducerUID, request.Sequence, request.Intent); err != nil {
+				return err
+			}
+		}
 		if err := e.compactSourceMutationJournal(ctx, runtime, request.Sequence); err != nil {
 			return err
 		}
@@ -87,6 +112,20 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 		}); err != nil {
 			return err
 		}
+		if isArchiveGenesisMutation(request.Intent) {
+			if err := e.validateArchiveGenesisMutationPayload(ctx, runtime, request.ProducerUID, request.Sequence, request.Intent); err != nil {
+				if errors.Is(err, errArchiveGenesisClaimed) {
+					return errors.Join(errArchiveGenesisClaimed, e.cancelArchiveGenesisLoser(ctx, runtime, request.ProducerUID, request.Sequence, request.Intent))
+				}
+				return err
+			}
+			if err := e.prepareArchiveGenesisMutation(ctx, uid, runtime, request.ProducerUID, request.Sequence, request.Intent); err != nil {
+				if errors.Is(err, errArchiveGenesisClaimed) {
+					return errors.Join(errArchiveGenesisClaimed, e.cancelArchiveGenesisLoser(ctx, runtime, request.ProducerUID, request.Sequence, request.Intent))
+				}
+				return err
+			}
+		}
 	}
 	provider, err := newGCSMutationProvider(e.SourceMutationStorage, scope)
 	if err != nil {
@@ -94,6 +133,9 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 	}
 	receipts, err := e.receiptsForRuntime(runtime)
 	if err != nil {
+		return err
+	}
+	if err := e.requireArchiveGenesisForExecution(ctx, runtime, request.ProducerUID, request.Sequence, request.Intent); err != nil {
 		return err
 	}
 	err = e.ExecuteSourceMutation(ctx, runtime, request.ProducerUID, request.Sequence, request.Intent, scope, provider, receipts)

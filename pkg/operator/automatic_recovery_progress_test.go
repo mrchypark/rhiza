@@ -204,7 +204,7 @@ func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	}
 	r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
 	r.Spec.Automatic = true
-	r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+	r.Spec.Policy = &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 	state := validAutoControl()
 	state.StatefulSetUID = "sts-uid"
 	state.Voters = []VoterPod{{NodeID: "n1", Pod: "n1"}, {NodeID: "n2", Pod: "n2"}, {NodeID: "n3", Pod: "n3"}}
@@ -400,7 +400,7 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"})
 			r := autoClusterResource("cluster-1", "binding-uid-1", "logical-1")
 			r.Spec.Container, r.Spec.Automatic = "rhiza", true
-			r.Spec.Policy = AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
+			r.Spec.Policy = &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 10}
 			voterPods := make([]VoterPod, 0, tc.voters)
 			for _, member := range voters {
 				voterPods = append(voterPods, VoterPod{NodeID: member.ID, Pod: string(member.ID)})

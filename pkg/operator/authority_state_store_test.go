@@ -143,6 +143,61 @@ func TestAuthorityStateReopensFromObjectStorageWithoutLocalOrKubeIndex(t *testin
 	}
 }
 
+func TestArchiveGenesisRefCASRetryUsesDecodedStructuralEquality(t *testing.T) {
+	store, _ := newAuthorityStateStoreForTest(t)
+	ctx := context.Background()
+	scope := fencing.ArchiveScope{Provider: "s3", Bucket: "archive", Prefix: "base/source", ClusterID: "source"}
+	scopeHash, err := scope.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimArchiveScope(ctx, scope, 1, "sts-uid", "source", hashJSON([]string{"registration"})); err != nil {
+		t.Fatal(err)
+	}
+	ref := fencing.ArchiveGenesisRef{
+		Version: fencing.ArchiveGenesisVersion, ConfigID: 1, ScopeHash: scopeHash,
+		Mutation: &fencing.ArchiveGenesisMutation{ProducerUID: "producer", Sequence: 1, Intent: fencing.MutationIntent{
+			ContractVersion: fencing.MutationIntentVersion,
+			StoreScopeHash:  hashJSON([]string{"mutation-scope"}),
+			Condition:       fencing.MutationCondition{Mode: fencing.MutationCreateOnly},
+			OperationID:     fencing.MutationRequestID("producer", 1), Kind: "upload", Key: "archive/head.bin",
+			PayloadRef: "payload-ref", PayloadDigest: hashJSON([]string{"head"}), PayloadSize: 4,
+		}},
+	}
+	wrongConfig := ref
+	wrongConfig.ConfigID++
+	if err := store.SetArchiveScopeGenesisRef(ctx, scope, wrongConfig); err == nil {
+		t.Fatal("genesis reference changed the config ID fixed at claim creation")
+	}
+	if err := store.SetArchiveScopeGenesisRef(ctx, scope, ref); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := store.ReadArchiveScopeClaim(ctx, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ConfigID != ref.ConfigID || got.GenesisRef == nil {
+		t.Fatalf("committed config/reference missing: %+v", got)
+	}
+	// A JSON round-trip ensures nested pointers are distinct as they are after
+	// reading canonical storage, while the committed reference remains exact.
+	encoded, err := json.Marshal(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded fencing.ArchiveGenesisRef
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetArchiveScopeGenesisRef(ctx, scope, decoded); err != nil {
+		t.Fatalf("decoded exact reference was not an idempotent retry: %v", err)
+	}
+	decoded.ConfigID++
+	if err := store.SetArchiveScopeGenesisRef(ctx, scope, decoded); err == nil {
+		t.Fatal("different config ID replaced the immutable genesis reference")
+	}
+}
+
 func TestAuthorityStateRejectsStaleRootCASAndPreservesClosure(t *testing.T) {
 	store, _ := newAuthorityStateStoreForTest(t)
 	ctx := context.Background()

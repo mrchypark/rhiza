@@ -26,6 +26,32 @@ when their required evidence is unavailable. This contract does not promise
 that arbitrary crashes are immediately recoverable or that control-plane
 actions physically fence a process.
 
+## Required recovery and durability policy scope
+
+The product target includes disaster recovery after total QuePaxa quorum loss,
+when the configured trusted recovery/control path can establish a safe
+successor and exclude prior writers. A predeclared CRD policy may authorize
+automatic recovery under that policy; without such a policy, an explicit
+recovery request must authorize the action. Per-incident manual approval is not
+required when an applicable policy was declared in advance. This target is not
+limited to single-Pod failure or cooperative shutdown. If the required
+authority, canonical storage, or trusted fencing path is unavailable, the
+implementation must fail closed; that safety boundary does not narrow the
+required supported recovery scenarios.
+
+Asynchronous durability remains a supported target policy. Its recovery
+behavior must follow the predeclared policy, or require an explicit recovery
+request when no policy exists, and clearly disclose the acknowledged-write loss
+exposure/RPO inherent in asynchronous archiving. This is distinct from
+before-ack durability; it is not a reason to drop async support or require
+case-by-case approval when an applicable policy was declared in advance. These
+are product requirements, not statements that runtime/Chaos qualification
+already satisfies them. Unknown loss must be reported as unknown; without a
+bounded archive lag, no maximum loss interval is guaranteed. The existing
+RhizaCluster `automatic` and `policy` fields authorize new automatic incidents;
+omitting the policy leaves the explicit RhizaRecovery path available. An
+already reserved recovery continues with its durable policy snapshot.
+
 ## Required ObjectStorage capabilities
 
 A provider is suitable for canonical HA state only when its documented and

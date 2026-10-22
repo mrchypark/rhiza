@@ -31,12 +31,27 @@ type sourceMutationExecutor interface {
 	Execute(context.Context, uint64, MutationIntent) error
 }
 
+type sourceArchiveGenesisAuthority interface {
+	ArchiveGenesisStatus(context.Context, string, uint) (ArchiveGenesisStatus, error)
+}
+
 // sourceMutationClient owns only the source-side orchestration. Its retry state
 // must already be opened from the original durable producer directory; this
 // client never creates recovery state or infers sequence numbers from authority.
 type sourceMutationClient struct {
 	state     *sourceRetryState
 	authority sourceMutationAuthority
+}
+
+func (c *sourceMutationClient) archiveGenesisStatus(ctx context.Context, key string, configID uint) (ArchiveGenesisStatus, error) {
+	if c == nil || ctx == nil || c.authority == nil || key != "archive/head.bin" || configID == 0 {
+		return ArchiveGenesisStatus{}, fmt.Errorf("fencing: archive genesis status is not configured")
+	}
+	authority, ok := c.authority.(sourceArchiveGenesisAuthority)
+	if !ok {
+		return ArchiveGenesisStatus{}, fmt.Errorf("fencing: archive genesis status is unavailable")
+	}
+	return authority.ArchiveGenesisStatus(ctx, key, configID)
 }
 
 // Upload implements the first source vertical path for bounded bootstrap JSON

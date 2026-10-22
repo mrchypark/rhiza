@@ -74,6 +74,53 @@ func TestBlockedNegativePolicyFields(t *testing.T) {
 	}
 }
 
+func TestAutomaticPolicyIsRequiredOnlyForNewAutomaticIncidents(t *testing.T) {
+	invalid := &AutoPolicy{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 101}
+	for _, tt := range []struct {
+		name      string
+		state     *autoControl
+		automatic bool
+		policy    *AutoPolicy
+		wantErr   bool
+	}{
+		{name: "manual without policy"},
+		{name: "manual ignores dormant invalid policy", policy: invalid},
+		{name: "automatic missing policy", automatic: true, wantErr: true},
+		{name: "automatic invalid policy", automatic: true, policy: invalid, wantErr: true},
+		{name: "automatic valid policy", automatic: true, policy: &goodPolicy},
+		{name: "reserved intent continues after policy removal", state: &autoControl{Intent: &autoIntent{Policy: goodPolicy}}, automatic: false},
+		{name: "reserved intent keeps policy snapshot after edit", state: &autoControl{Intent: &autoIntent{Policy: goodPolicy}}, automatic: true, policy: invalid},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAutomaticPolicyForNewIncident(tt.state, tt.automatic, tt.policy)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validation error=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if tt.state != nil && tt.state.Intent != nil && tt.state.Intent.Policy != goodPolicy {
+				t.Fatalf("reserved intent policy changed: %+v", tt.state.Intent.Policy)
+			}
+		})
+	}
+}
+
+func TestAutomaticPolicyBoundsMatchCRD(t *testing.T) {
+	for _, policy := range []AutoPolicy{
+		{FailureGraceSeconds: 0, CooldownSeconds: 1, MaxRecoveriesPerDay: 1},
+		{FailureGraceSeconds: 86401, CooldownSeconds: 1, MaxRecoveriesPerDay: 1},
+		{FailureGraceSeconds: 1, CooldownSeconds: 0, MaxRecoveriesPerDay: 1},
+		{FailureGraceSeconds: 1, CooldownSeconds: 604801, MaxRecoveriesPerDay: 1},
+		{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 0},
+		{FailureGraceSeconds: 1, CooldownSeconds: 1, MaxRecoveriesPerDay: 101},
+	} {
+		if err := policy.validate(); err == nil {
+			t.Fatalf("accepted out-of-range policy: %+v", policy)
+		}
+	}
+	if err := goodPolicy.validate(); err != nil {
+		t.Fatalf("rejected in-range policy: %v", err)
+	}
+}
+
 func TestBlockedUnknownObservation(t *testing.T) {
 	obs := AutoObservation{Known: false}
 	d, _ := DecideAutoRecovery(goodPolicy, obs, tBase, tBase, nil)

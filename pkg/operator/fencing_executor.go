@@ -143,6 +143,12 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 	initial := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{
 		SourceClusterID: source, RequireRuntimeBinding: e != nil && e.RequireMutationJournal,
 		RequireMutationJournal: e != nil && e.RequireMutationJournal,
+		ArchiveGenesisState: func() string {
+			if e != nil && e.RequireMutationJournal {
+				return fencing.ArchiveGenesisRegistrationPending
+			}
+			return ""
+		}(),
 	}}
 	err := e.AuthorityState.WriteRoot(ctx, uid, source, initial, nil)
 	if err != nil && !errors.Is(err, errAuthorityStateConflict) {
@@ -173,6 +179,26 @@ func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) erro
 	}
 	if state.Ledger.RequireMutationJournal && !state.Ledger.RequireRuntimeBinding {
 		return fmt.Errorf("fencing: authority root requires mutation journal without runtime binding")
+	}
+	if state.Ledger.RequireMutationJournal {
+		if state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisRegistrationPending {
+			if state.Ledger.ArchiveScopeHash != "" || state.Ledger.ArchiveGenesisRef != nil {
+				return fmt.Errorf("fencing: pending archive genesis root has unexpected scope state")
+			}
+		} else if state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisAwaitingRef {
+			if !validEvidenceDigest(state.Ledger.ArchiveScopeHash) || state.Ledger.ArchiveGenesisRef != nil {
+				return fmt.Errorf("fencing: archive genesis scope claim differs")
+			}
+		} else if state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisCommitted {
+			if !validEvidenceDigest(state.Ledger.ArchiveScopeHash) || state.Ledger.ArchiveGenesisRef == nil ||
+				state.Ledger.ArchiveGenesisRef.ScopeHash != state.Ledger.ArchiveScopeHash || state.Ledger.ArchiveGenesisRef.Validate() != nil {
+				return fmt.Errorf("fencing: committed archive genesis reference differs")
+			}
+		} else {
+			return fmt.Errorf("fencing: required archive genesis state is missing")
+		}
+	} else if state.Ledger.ArchiveGenesisState != "" || state.Ledger.ArchiveScopeHash != "" || state.Ledger.ArchiveGenesisRef != nil {
+		return fmt.Errorf("fencing: cooperative root carries independent archive genesis state")
 	}
 	return nil
 }
@@ -359,7 +385,8 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if err == nil {
-			_, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
+			var changed fenceLedger
+			changed, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
 				switch message.Action {
 				case "register":
 					if e.RequireMutationJournal && !l.RequireMutationJournal {
@@ -400,6 +427,13 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 					return fmt.Errorf("fencing: unknown action")
 				}
 			})
+			if err == nil && message.Action == "register" && changed.Ledger.RequireMutationJournal {
+				if enrolled == nil {
+					err = fmt.Errorf("fencing: required archive genesis registration lacks runtime binding")
+				} else {
+					err = e.claimArchiveScopeForRegistration(r.Context(), uid, message.Identity, *enrolled)
+				}
+			}
 		}
 	}
 	if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {

@@ -23,14 +23,16 @@ type sourceRelayAuthority interface {
 	Admit(context.Context, uint64, MutationIntent) error
 	LookupMutation(context.Context, Identity, string, uint64, MutationIntent) (MutationLookupResult, error)
 	Execute(context.Context, uint64, MutationIntent) error
+	ArchiveGenesisStatus(context.Context, string, uint) (ArchiveGenesisStatus, error)
 }
 
 type sourceRelayRequest struct {
-	Identity    Identity       `json:"identity"`
-	Ticket      string         `json:"ticket,omitempty"`
-	ProducerUID string         `json:"producerUID,omitempty"`
-	Sequence    uint64         `json:"sequence,omitempty"`
-	Intent      MutationIntent `json:"intent,omitempty"`
+	Identity       Identity                    `json:"identity"`
+	Ticket         string                      `json:"ticket,omitempty"`
+	ProducerUID    string                      `json:"producerUID,omitempty"`
+	Sequence       uint64                      `json:"sequence,omitempty"`
+	Intent         MutationIntent              `json:"intent,omitempty"`
+	ArchiveGenesis ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
 }
 
 const sourceStageIdentityHeader = "X-Rhiza-Fencing-Identity"
@@ -115,6 +117,14 @@ func (s *Supervisor) sourceRelay(w http.ResponseWriter, r *http.Request) {
 			var lookup MutationLookupResult
 			lookup, err = authority.LookupMutation(r.Context(), identity, request.ProducerUID, request.Sequence, request.Intent)
 			result = lookup
+		case "/v1/source-mutations/genesis-status":
+			if request.ArchiveGenesis.ArchiveKey != "archive/head.bin" || request.ArchiveGenesis.ConfigID == 0 || request.ProducerUID != "" || request.Sequence != 0 {
+				err = fmt.Errorf("fencing: invalid archive genesis status request")
+				break
+			}
+			var status ArchiveGenesisStatus
+			status, err = authority.ArchiveGenesisStatus(r.Context(), request.ArchiveGenesis.ArchiveKey, request.ArchiveGenesis.ConfigID)
+			result = status
 		default:
 			http.NotFound(w, r)
 			return
@@ -219,6 +229,34 @@ func (s *Session) Execute(ctx context.Context, sequence uint64, intent MutationI
 		return err
 	}
 	return s.sourceJSON(ctx, "/v1/source-mutations/execute", sourceRelayRequest{Identity: id, ProducerUID: producer, Sequence: sequence, Intent: intent}, nil)
+}
+
+// ArchiveGenesisStatus uses the same authenticated local source relay and
+// protected authority-client route as Upload/Execute; it is not a separate
+// supervisor-management channel.
+func (s *Session) ArchiveGenesisStatus(ctx context.Context, archiveKey string, configID uint) (ArchiveGenesisStatus, error) {
+	id, _, err := s.sourceBinding()
+	if err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	if archiveKey != "archive/head.bin" || configID == 0 {
+		return ArchiveGenesisStatus{}, fmt.Errorf("fencing: invalid archive genesis key")
+	}
+	var result ArchiveGenesisStatus
+	err = s.sourceJSON(ctx, "/v1/source-mutations/genesis-status", sourceRelayRequest{Identity: id, ArchiveGenesis: ArchiveGenesisStatusRequest{ArchiveKey: archiveKey, ConfigID: configID}}, &result)
+	if err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	s.mu.Lock()
+	var scopeHash string
+	if s.binding != nil && s.binding.Producer != nil {
+		scopeHash = s.binding.Producer.StoreScopeHash
+	}
+	s.mu.Unlock()
+	if err := result.Validate(scopeHash, configID); err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	return result, nil
 }
 
 func (s *Session) sourceBinding() (Identity, string, error) {

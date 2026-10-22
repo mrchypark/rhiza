@@ -19,11 +19,12 @@ import (
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
-	Action         string                 `json:"action"`
-	Identity       Identity               `json:"identity"`
-	Drain          *DrainReceipt          `json:"drain,omitempty"`
-	Request        *StopRequest           `json:"request,omitempty"`
-	MutationLookup *MutationLookupRequest `json:"mutationLookup,omitempty"`
+	Action         string                       `json:"action"`
+	Identity       Identity                     `json:"identity"`
+	Drain          *DrainReceipt                `json:"drain,omitempty"`
+	Request        *StopRequest                 `json:"request,omitempty"`
+	MutationLookup *MutationLookupRequest       `json:"mutationLookup,omitempty"`
+	ArchiveGenesis *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
 }
 
 // MutationLookupRequest asks the authority for one original producer tuple.
@@ -353,6 +354,38 @@ func (a *AuthorityClient) Execute(ctx context.Context, sequence uint64, intent M
 		return fmt.Errorf("fencing: source mutation execution tuple differs")
 	}
 	return a.postMutation(ctx, "/v1/source-mutations/execute", id, producer.ProducerUID, sequence, intent)
+}
+
+// ArchiveGenesisStatus asks the canonical authority to reconcile the retained
+// genesis tuple and report the current stable-scope reference. This is a POST
+// because reconciliation may complete durable CAS/dispatch work.
+func (a *AuthorityClient) ArchiveGenesisStatus(ctx context.Context, archiveKey string, configID uint) (ArchiveGenesisStatus, error) {
+	id, producer, err := a.sourceMutationBinding()
+	if err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	if archiveKey != "archive/head.bin" || configID == 0 {
+		return ArchiveGenesisStatus{}, fmt.Errorf("fencing: invalid archive genesis key")
+	}
+	endpoint, err := a.sourceEndpoint("/v1/source-mutations/genesis-status")
+	if err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	body, err := json.Marshal(struct {
+		Identity       Identity                    `json:"identity"`
+		ArchiveGenesis ArchiveGenesisStatusRequest `json:"archiveGenesis"`
+	}{id, ArchiveGenesisStatusRequest{ArchiveKey: archiveKey, ConfigID: configID}})
+	if err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	var result ArchiveGenesisStatus
+	if err := a.sourcePost(ctx, endpoint, body, "application/json", nil, &result); err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	if err := result.Validate(producer.StoreScopeHash, configID); err != nil {
+		return ArchiveGenesisStatus{}, err
+	}
+	return result, nil
 }
 
 func (a *AuthorityClient) postMutation(ctx context.Context, path string, id Identity, producerUID string, sequence uint64, intent MutationIntent) error {

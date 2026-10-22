@@ -92,6 +92,12 @@ func (a *relayConditionAuthority) Execute(_ context.Context, sequence uint64, _ 
 	return nil
 }
 
+func (*relayConditionAuthority) ArchiveGenesisStatus(context.Context, string, uint) (ArchiveGenesisStatus, error) {
+	return ArchiveGenesisStatus{}, fmt.Errorf("fencing: archive genesis status is not configured in this fixture")
+}
+
+var _ sourceRelayAuthority = (*relayConditionAuthority)(nil)
+
 func TestSourceMutationRuntimeReplansAcrossSupervisorRelayAfterConditionalRejection(t *testing.T) {
 	authority := &relayConditionAuthority{}
 	id := testIdentity()
