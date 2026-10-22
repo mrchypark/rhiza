@@ -17,6 +17,7 @@ import (
 type sourceBucketMutator interface {
 	Upload(context.Context, string, fencing.MutationCondition, []byte) error
 	Delete(context.Context, string, int64) error
+	DrainMutations(context.Context) error
 	Close() error
 }
 
@@ -109,6 +110,17 @@ func (b *fencedBucket) Close() error {
 	return err
 }
 
+func (b *fencedBucket) DrainMutations(ctx context.Context) error {
+	var err error
+	if b.source != nil {
+		err = errors.Join(err, b.source.DrainMutations(ctx))
+	}
+	if b.MeteredBucket != nil {
+		err = errors.Join(err, b.MeteredBucket.DrainMutations(ctx))
+	}
+	return err
+}
+
 func (b *fencedBucket) mutationKey(name string) (string, error) {
 	if name == "" || path.Clean(name) != name || strings.HasPrefix(name, "/") {
 		return "", fmt.Errorf("fencing: invalid object key")
@@ -125,3 +137,5 @@ func (b *fencedBucket) mutationKey(name string) (string, error) {
 
 var _ thanosobjstore.Bucket = (*fencedBucket)(nil)
 var _ objectstore.VersionedDeleteBucket = (*fencedBucket)(nil)
+var _ nodeObjectBucket = (*fencedBucket)(nil)
+var _ nodeObjectBucket = (*objectstore.MeteredBucket)(nil)

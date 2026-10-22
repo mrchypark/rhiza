@@ -150,7 +150,12 @@ func TestExecuteSourceMutationConsumesSealedBytesAndCommitsReceiptBeforeResolve(
 	if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Resolution == nil || lookup.Entry.Resolution.Outcome != fencing.MutationCommitted || !lookup.Entry.Resolution.AllCopiesTerminal {
 		t.Fatalf("committed tuple lacks terminal durable resolution: %+v %v", lookup, err)
 	}
-	if len(lookup.Entry.Dispatches) != 1 || !allDispatchesTerminal(*lookup.Entry) {
+	dispatchesTerminal := len(lookup.Entry.Dispatches) == 1 && lookup.Entry.DispatchClosed
+	for _, dispatch := range lookup.Entry.Dispatches {
+		_, digestErr := hex.DecodeString(dispatch.ReceiptDigest)
+		dispatchesTerminal = dispatchesTerminal && len(dispatch.ReceiptDigest) == sha256.Size*2 && digestErr == nil
+	}
+	if !dispatchesTerminal {
 		t.Fatalf("provider receipt did not terminalize the one dispatch: %+v", lookup.Entry.Dispatches)
 	}
 	owner := hashJSON([]any{runtime, "wal", producerUID, uint64(1), intent.OperationID})
@@ -223,7 +228,13 @@ func TestExecuteSourceMutationUnknownDispatchIsNeverCopiedOrAcknowledged(t *test
 		t.Fatalf("object-store lock did not exclude another owner without Kubernetes: %v", err)
 	}
 	lookup, err := e.lookupMutation(t.Context(), runtime.StatefulSetUID, fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: runtime.PodUID, RunID: runtime.RunID, WALIdentity: "wal"}, fencing.MutationLookupRequest{ProducerUID: producerUID, Sequence: 1, Intent: intent})
-	if err != nil || lookup.Entry == nil || lookup.Entry.Resolution != nil || len(lookup.Entry.Dispatches) != 1 || allDispatchesTerminal(*lookup.Entry) {
+	dispatchesUnresolved := lookup.Entry != nil && len(lookup.Entry.Dispatches) == 1
+	if lookup.Entry != nil {
+		for _, dispatch := range lookup.Entry.Dispatches {
+			dispatchesUnresolved = dispatchesUnresolved && dispatch.ReceiptDigest == ""
+		}
+	}
+	if err != nil || lookup.Entry == nil || lookup.Entry.Resolution != nil || !dispatchesUnresolved {
 		t.Fatalf("unknown dispatch was incorrectly resolved: %+v %v", lookup, err)
 	}
 }

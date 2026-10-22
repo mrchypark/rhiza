@@ -14,10 +14,11 @@ import (
 // before accepting a new invocation; it does not identify calls by key or
 // content.
 type SourceMutationClient struct {
-	mu     sync.Mutex
-	state  *sourceRetryState
-	client *sourceMutationClient
-	closed bool
+	mu       sync.Mutex
+	state    *sourceRetryState
+	client   *sourceMutationClient
+	closed   bool
+	closeErr error
 }
 
 // OpenSourceMutationClient creates the retry journal for this exact bound run.
@@ -174,14 +175,43 @@ func (c *SourceMutationClient) usable() error {
 	return nil
 }
 
-func (c *SourceMutationClient) Close() error {
+func (c *SourceMutationClient) DrainMutations(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	if ctx == nil {
+		return fmt.Errorf("fencing: source mutation drain context is required")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return nil
+		return c.closeErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.state == nil {
+		return fmt.Errorf("fencing: source mutation retry state is unavailable")
 	}
 	c.closed = true
-	return c.state.Close()
+	c.state.mu.Lock()
+	pending := false
+	for _, step := range c.state.data.Steps {
+		if !step.Advanced || step.Entry.Resolution == nil {
+			pending = true
+			break
+		}
+	}
+	c.state.mu.Unlock()
+	c.closeErr = c.state.Close()
+	if pending {
+		c.closeErr = errors.Join(c.closeErr, ErrPending)
+	}
+	return c.closeErr
+}
+
+func (c *SourceMutationClient) Close() error {
+	return c.DrainMutations(context.Background())
 }
 
 // SourceRetryDirectory returns a run-scoped location beneath the node's data
