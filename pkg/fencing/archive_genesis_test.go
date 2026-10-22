@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"testing"
+
+	"github.com/thanos-io/objstore"
 )
 
 func hashJSON(value any) string {
@@ -55,6 +57,77 @@ func TestArchiveGenesisRefSeparatesStableAndMutationScopes(t *testing.T) {
 	status.MutationScopeHash = hashJSON([]string{"different-mutation-scope"})
 	if err := status.Validate(ref.Mutation.Intent.StoreScopeHash, ref.ConfigID); err == nil {
 		t.Fatal("status accepted a mutation scope different from the bound producer")
+	}
+}
+
+func TestArchiveEmptyRecoveryAuthorizationIsSeparateAndBoundToEmptySource(t *testing.T) {
+	digest := hashJSON([]string{"evidence"})
+	auth := ArchiveEmptyRecoveryAuthorization{
+		Version: ArchiveGenesisVersion, StatefulSetUID: "sts-uid", TargetClusterID: "target",
+		OperationID: "resource-uid:recovery-1", SourceFenceOperationID: "recovery-1", ConfigID: 1,
+		SourceTip: 0, SourceScopeHash: hashJSON([]string{"source-scope"}), TargetScopeHash: hashJSON([]string{"target-scope"}),
+		SourceGenesisRefDigest: digest, SourceHeadDigest: digest, TargetEmptyHeadDigest: digest, SourceHeadVersion: objstore.ObjectVersion{Type: objstore.ETag, Value: "opaque-etag"},
+		SourceRootDigest: digest, SourceFenceDigest: digest, SourceMembershipHash: digest, SourceDurability: "async",
+		TargetMembershipHash: digest, TargetDurability: "before-ack", AllowDataLoss: true, PolicyDigest: digest,
+	}
+	if err := auth.Validate(); err != nil {
+		t.Fatalf("valid empty recovery authorization rejected: %v", err)
+	}
+	bad := auth
+	bad.SourceTip = 1
+	if err := bad.Validate(); err == nil {
+		t.Fatal("nonzero source tip accepted for empty recovery")
+	}
+	bad = auth
+	bad.SourceScopeHash = bad.TargetScopeHash
+	if err := bad.Validate(); err == nil {
+		t.Fatal("same source and target scope accepted")
+	}
+	bad = auth
+	bad.SourceHeadVersion = objstore.ObjectVersion{Type: objstore.ETag}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("empty object version accepted")
+	}
+	bad = auth
+	bad.AllowDataLoss = false
+	if err := bad.Validate(); err == nil {
+		t.Fatal("async source authorization accepted without explicit data-loss policy")
+	}
+
+	auth.SourceHeadDigest = hashJSON([]string{"sealed-source-head"})
+	auth.TargetEmptyHeadDigest = hashJSON([]string{"unsealed-target-empty-head"})
+	status := ArchiveGenesisStatus{ScopeHash: auth.TargetScopeHash, MutationScopeHash: digest, ConfigID: 1,
+		EmptyRecoveryAuthorization: &auth, EmptyRecoveryState: EmptyRecoveryAuthorized}
+	if err := status.Validate(digest, 1); err != nil {
+		t.Fatalf("authorization status without mutation ref rejected: %v", err)
+	}
+	status.EmptyRecoveryState = EmptyRecoveryCommitted
+	if err := status.Validate(digest, 1); err == nil {
+		t.Fatal("committed empty recovery status without target receipt accepted")
+	}
+	status.EmptyRecoveryAuthorization = nil
+	status.EmptyRecoveryState = EmptyRecoveryAuthorized
+	if err := status.Validate(digest, 1); err == nil {
+		t.Fatal("empty recovery state detached from authorization accepted")
+	}
+
+	ref := ArchiveGenesisRef{Version: ArchiveGenesisVersion, ConfigID: 1, ScopeHash: auth.TargetScopeHash,
+		Mutation: &ArchiveGenesisMutation{ProducerUID: "target-producer", Sequence: 1, Intent: MutationIntent{
+			ContractVersion: MutationIntentVersion, StoreScopeHash: digest, OperationID: MutationRequestID("target-producer", 1),
+			Kind: "upload", Key: "archive/head.bin", PayloadRef: "target-empty", PayloadDigest: auth.TargetEmptyHeadDigest, PayloadSize: 10,
+			Condition: MutationCondition{Mode: MutationCreateOnly},
+		}}}
+	status = ArchiveGenesisStatus{ScopeHash: auth.TargetScopeHash, MutationScopeHash: digest, ConfigID: 1, Ref: &ref,
+		Mutation:                   &MutationLookupResult{Found: true, Entry: &MutationEntry{Intent: ref.Mutation.Intent}},
+		EmptyRecoveryAuthorization: &auth, EmptyRecoveryState: EmptyRecoveryAuthorized}
+	if err := status.Validate(digest, 1); err != nil {
+		t.Fatalf("separate sealed source and unsealed target HEAD digests rejected: %v", err)
+	}
+	ref.Mutation.Intent.PayloadDigest = auth.SourceHeadDigest
+	status.Ref = &ref
+	status.Mutation = &MutationLookupResult{Found: true, Entry: &MutationEntry{Intent: ref.Mutation.Intent}}
+	if err := status.Validate(digest, 1); err == nil {
+		t.Fatal("target genesis ref accepted the sealed source HEAD digest instead of target empty HEAD")
 	}
 }
 

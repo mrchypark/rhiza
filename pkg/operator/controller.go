@@ -222,8 +222,16 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if r.Status.Stage == "" {
 		archive := recovery.NewManager(c.Bucket, prefix, recovery.ArchiveConfigID)
 		defer archive.Close()
-		if err := archive.Load(ctx); err != nil || archive.Tip() == 0 {
-			return reject("source archive has no available certified history")
+		if err := archive.Load(ctx); err != nil {
+			return reject("source archive is unavailable")
+		}
+		if archive.Tip() == 0 {
+			if _, exists := archive.HeadVersion(); !exists {
+				return reject("source archive has no initialized empty HEAD")
+			}
+			r.Status.TargetBaseKind = "empty"
+		} else {
+			r.Status.TargetBaseKind = "fork"
 		}
 		if r.Spec.MaxArchiveAgeSeconds > 0 {
 			attrs, err := c.Bucket.Attributes(ctx, path.Join(prefix, "archive/head.bin"))
@@ -291,6 +299,17 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if err != nil {
 				return c.record(ctx, r, "Blocked", err.Error())
 			}
+		}
+		targetBaseKind := r.Status.TargetBaseKind
+		if targetBaseKind == "" {
+			// Pre-field reservations were only created for nonzero forks.
+			targetBaseKind = "fork"
+		}
+		if targetBaseKind == "empty" {
+			return c.prepareEmptyRecovery(ctx, r, s, secret, targetMembers)
+		}
+		if targetBaseKind != "fork" {
+			return c.record(ctx, r, "Blocked", "recovery target base kind is missing or invalid")
 		}
 		result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, s.prefix, s.members, s.reconfiguration, targetMembers))
 		if err != nil {
@@ -373,6 +392,76 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 	}
 }
 
+func (c *Controller) prepareEmptyRecovery(ctx context.Context, r *Resource, s sourceState, secret string, targetMembers []quepaxa.Member) error {
+	if r.Spec.AnchorID != "" {
+		return c.record(ctx, r, "Blocked", "empty archive recovery cannot claim fork-anchor evidence")
+	}
+	if targetMembers == nil {
+		var err error
+		targetMembers, err = c.targetCredentials(ctx, r, secret, s.members)
+		if err != nil {
+			return c.record(ctx, r, "Blocked", err.Error())
+		}
+	}
+	record := recovery.NewMembershipRecord(r.Status.Target, targetMembers, r.Spec.Durability)
+	if err := c.immutable(ctx, path.Join(c.Prefix, r.Status.Target, "voters/membership.json"), jsonBytes(record)); err != nil {
+		return c.record(ctx, r, "Blocked", "target membership is unavailable or inconsistent")
+	}
+	if err := recovery.RequireEmptyArchiveScope(ctx, c.Bucket, path.Join(c.Prefix, r.Status.Target)); err != nil {
+		return c.record(ctx, r, "Blocked", "target archive is not a pristine empty scope")
+	}
+	response, err := c.registerEmptyRecovery(ctx, r, record)
+	if err != nil {
+		if errors.Is(err, ErrFencePending) {
+			return c.record(ctx, r, "Recovering", "canonical empty recovery authorization is pending")
+		}
+		return c.record(ctx, r, "Blocked", "canonical empty recovery authorization failed")
+	}
+	if response.State != "authorized" && response.State != "committed" {
+		return c.record(ctx, r, "Blocked", "canonical empty recovery returned an invalid state")
+	}
+	r.Status.SecretName = secret
+	r.Status.ManifestHash = ""
+	r.Status.RecoveredTip = 0
+	r.Status.Stage = "Stopping"
+	return c.record(ctx, r, "Recovering", "authorized empty target and credentials preserved before source shutdown")
+}
+
+func (c *Controller) registerEmptyRecovery(ctx context.Context, r *Resource, membership recovery.MembershipRecord) (ArchiveEmptyRecoveryResponse, error) {
+	registrar, ok := c.Fencer.(ArchiveEmptyRecoveryRegistrar)
+	if !ok || registrar == nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("canonical empty recovery registrar is required")
+	}
+	request := ArchiveEmptyRecoveryRequest{
+		RecoveryName: resourceName(r), StatefulSetUID: r.Status.StatefulSetUID,
+		TargetClusterID: r.Status.Target, OperationID: c.operationID(r),
+		SourceFenceOperationID: r.Spec.RecoveryID,
+		TargetMembershipHash:   authorityStateDigest(jsonBytes(membership)),
+		TargetDurability:       r.Spec.Durability, AllowDataLoss: r.Spec.AllowDataLoss,
+		PolicyDigest: hashJSON(r.Spec),
+	}
+	if request.RecoveryName == "" || request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" ||
+		request.SourceFenceOperationID == "" || request.TargetMembershipHash == "" || request.PolicyDigest == "" {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("incomplete canonical empty recovery request")
+	}
+	response, err := registrar.RegisterArchiveEmptyRecovery(ctx, request)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
+	}
+	if response.State != "authorized" && response.State != "committed" {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("invalid canonical empty recovery state")
+	}
+	authorization := response.Authorization
+	if err := authorization.Validate(); err != nil || authorization.StatefulSetUID != request.StatefulSetUID ||
+		authorization.TargetClusterID != request.TargetClusterID || authorization.OperationID != request.OperationID ||
+		authorization.SourceFenceOperationID != request.SourceFenceOperationID || authorization.SourceTip != 0 ||
+		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
+		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("canonical empty recovery authorization differs from the requested operation")
+	}
+	return response, nil
+}
+
 func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts object) error {
 	if err := c.verifyReservation(ctx, r); err != nil {
 		return c.record(ctx, r, "Blocked", "reserved source successor changed or disappeared")
@@ -383,7 +472,15 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if r.Status.SourceDurability == "async" && !r.Spec.AllowDataLoss {
 		return c.record(ctx, r, "Blocked", "async recovery still requires allowDataLoss")
 	}
-	if r.Status.Target != "rhiza-r-"+shortID(c.operationID(r)) || r.Status.SecretName != "rhiza-recovery-"+shortID(c.operationID(r)) || r.Status.RecoveredTip == 0 {
+	targetBaseKind := r.Status.TargetBaseKind
+	if targetBaseKind == "" && r.Status.Stage != "" {
+		// Prior journal entries were only created for nonzero certified forks.
+		targetBaseKind = "fork"
+	}
+	if r.Status.Target != "rhiza-r-"+shortID(c.operationID(r)) || r.Status.SecretName != "rhiza-recovery-"+shortID(c.operationID(r)) ||
+		(targetBaseKind == "fork" && r.Status.RecoveredTip == 0) ||
+		(targetBaseKind == "empty" && (r.Status.RecoveredTip != 0 || r.Status.ManifestHash != "")) ||
+		(targetBaseKind != "fork" && targetBaseKind != "empty") {
 		return c.record(ctx, r, "Blocked", "invalid target recovery journal")
 	}
 	if str(nested(sts, "metadata", "annotations", ownerAnnotation)) != c.operationID(r) {
@@ -418,6 +515,14 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	record, err := c.sourceMembership(ctx, path.Join(c.Prefix, r.Status.Target))
 	if err != nil || record != recovery.NewMembershipRecord(r.Status.Target, members, r.Spec.Durability) {
 		return c.record(ctx, r, "Blocked", "target membership changed")
+	}
+	if targetBaseKind == "empty" {
+		if _, err := c.registerEmptyRecovery(ctx, r, record); err != nil {
+			if errors.Is(err, ErrFencePending) {
+				return c.record(ctx, r, "Recovering", "canonical empty recovery authorization is pending")
+			}
+			return c.record(ctx, r, "Blocked", "canonical empty recovery authorization is unavailable")
+		}
 	}
 	// Common anchor verification: covers Starting (both branches) and Restarted.
 	sourcePrefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
@@ -463,9 +568,18 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 			if err != nil {
 				return c.record(ctx, r, "Blocked", err.Error())
 			}
-			result, err := recovery.Fork(ctx, c.Bucket, c.forkOptions(r, sourcePrefix, sourceMembers, reconfiguration, members))
-			if err != nil || result.Tip != r.Status.RecoveredTip || result.ManifestHash != r.Status.ManifestHash {
-				return c.record(ctx, r, "Blocked", "prepared target evidence changed before activation")
+			var result recovery.ForkResult
+			if targetBaseKind == "fork" {
+				result, err = recovery.Fork(ctx, c.Bucket, c.forkOptions(r, sourcePrefix, sourceMembers, reconfiguration, members))
+				if err != nil || result.Tip != r.Status.RecoveredTip || result.ManifestHash != r.Status.ManifestHash {
+					return c.record(ctx, r, "Blocked", "prepared target evidence changed before activation")
+				}
+			} else if targetBaseKind == "empty" {
+				if err := recovery.RequireEmptyArchiveScope(ctx, c.Bucket, path.Join(c.Prefix, r.Status.Target)); err != nil {
+					return c.record(ctx, r, "Blocked", "empty target archive is not pristine before activation")
+				}
+			} else {
+				return c.record(ctx, r, "Blocked", "invalid target recovery base kind")
 			}
 			if number(nested(sts, "spec", "replicas")) != 0 {
 				return c.record(ctx, r, "Blocked", "source replicas reappeared before activation")
@@ -478,7 +592,7 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 				return c.record(ctx, r, "Blocked", "source pods reappeared before activation")
 			}
 			// Live re-verify anchor receipt just before StatefulSet PUT.
-			if r.Spec.AnchorID != "" {
+			if r.Spec.AnchorID != "" && targetBaseKind == "fork" {
 				targetPrefix := path.Join(c.Prefix, r.Status.Target)
 				gaRecord, gaRecErr := c.sourceMembership(ctx, targetPrefix)
 				if gaRecErr != nil {
@@ -538,6 +652,31 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	if len(ready) < len(members)/2+1 {
 		return c.record(ctx, r, "WaitingReady", "waiting for a matching recovered quorum")
 	}
+	if targetBaseKind == "empty" {
+		response, err := c.registerEmptyRecovery(ctx, r, record)
+		if err != nil {
+			if errors.Is(err, ErrFencePending) {
+				return c.record(ctx, r, "WaitingReady", "canonical empty archive genesis commit is pending")
+			}
+			return c.record(ctx, r, "Blocked", "canonical empty archive genesis commit is unavailable")
+		}
+		if response.State != "committed" {
+			return c.record(ctx, r, "WaitingReady", "target quorum is ready; canonical empty archive genesis is not committed")
+		}
+		if err := c.targetApplicationReadBarrier(ctx, r, sts, ready, env["RHIZA_ADMIN_TOKEN"]); err != nil {
+			return c.record(ctx, r, "WaitingReady", "target application read-durability barrier is unavailable")
+		}
+		response, err = c.registerEmptyRecovery(ctx, r, record)
+		if err != nil {
+			if errors.Is(err, ErrFencePending) {
+				return c.record(ctx, r, "WaitingReady", "canonical empty archive genesis commit is pending")
+			}
+			return c.record(ctx, r, "Blocked", "canonical empty archive genesis commit is unavailable")
+		}
+		if response.State != "committed" {
+			return c.record(ctx, r, "WaitingReady", "target application barrier passed; canonical empty archive genesis is not committed")
+		}
+	}
 	if str(nested(r.Metadata, "annotations", automaticOwner)) != "" {
 		identities, err := c.captureAutomaticTargetIdentities(ctx, r, sts, members, env["RHIZA_ADMIN_TOKEN"])
 		if err != nil {
@@ -551,8 +690,96 @@ func (c *Controller) startAndObserve(ctx context.Context, r *Resource, sts objec
 	return c.record(ctx, r, "Complete", "new generation has a verified recovered quorum")
 }
 
+// targetApplicationReadBarrier requires a live target voter to pass the
+// authenticated ReadIndex probe and the application route's linearizable,
+// read-durable query before an empty recovery can complete.
+func (c *Controller) targetApplicationReadBarrier(ctx context.Context, r *Resource, sts object, ready map[string]bool, token string) error {
+	if token == "" {
+		return fmt.Errorf("target admin token is unavailable")
+	}
+	pods, err := c.ownedPods(ctx, str(nested(sts, "metadata", "uid")))
+	if err != nil {
+		return err
+	}
+	for _, pod := range pods {
+		name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
+		if !ready[name] || uid == "" || nested(pod, "metadata", "deletionTimestamp") != nil || !ownedBy(pod, r.Status.StatefulSetUID) {
+			continue
+		}
+		probeEndpoint, err := podEndpoint(pod, r.Spec.Container, "/recovery/probe")
+		if err != nil || !c.automaticQuorumProbe(ctx, probeEndpoint, token, r.Status.Target, name) {
+			continue
+		}
+		queryEndpoint, err := podEndpoint(pod, r.Spec.Container, "/sql/query")
+		if err != nil {
+			continue
+		}
+		body, err := json.Marshal(network.QueryRequest{SQL: "SELECT 1", Consistency: "linearizable"})
+		if err != nil {
+			return err
+		}
+		call, cancel := context.WithTimeout(ctx, 5*time.Second)
+		request, err := http.NewRequestWithContext(call, http.MethodPost, queryEndpoint, bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := c.client().Do(request)
+		if err != nil {
+			cancel()
+			continue
+		}
+		var result network.QueryResponse
+		decodeErr := error(nil)
+		if response.StatusCode != http.StatusOK {
+			decodeErr = fmt.Errorf("linearizable application query returned HTTP %d", response.StatusCode)
+		} else {
+			decodeErr = json.NewDecoder(io.LimitReader(response.Body, 16<<10)).Decode(&result)
+		}
+		response.Body.Close()
+		cancel()
+		var value float64
+		valueOK := false
+		if len(result.Rows) == 1 && len(result.Rows[0]) == 1 {
+			value, valueOK = result.Rows[0][0].(float64)
+		}
+		if decodeErr != nil || len(result.Columns) != 1 || result.Columns[0] != "1" || !valueOK || value != 1 || result.ConsensusTip < result.AppliedSlot {
+			continue
+		}
+		// Bind both service calls to the same still-owned Pod incarnation.
+		var current object
+		if err := c.Kube.Get(ctx, c.corePath("pods", name), &current); err != nil ||
+			str(nested(current, "metadata", "uid")) != uid ||
+			nested(current, "status", "podIP") != nested(pod, "status", "podIP") ||
+			nested(current, "metadata", "deletionTimestamp") != nil || !ownedBy(current, r.Status.StatefulSetUID) {
+			continue
+		}
+		if !c.automaticQuorumProbe(ctx, probeEndpoint, token, r.Status.Target, name) {
+			continue
+		}
+		// The final authenticated probe is the last service interaction. Re-read
+		// the Pod afterward so a same-name replacement between the earlier
+		// identity check and this probe cannot satisfy the barrier as the old
+		// incarnation.
+		var final object
+		if err := c.Kube.Get(ctx, c.corePath("pods", name), &final); err != nil ||
+			str(nested(final, "metadata", "uid")) != uid ||
+			nested(final, "status", "podIP") != nested(pod, "status", "podIP") ||
+			nested(final, "metadata", "deletionTimestamp") != nil || !ownedBy(final, r.Status.StatefulSetUID) {
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("no ready target voter completed an authenticated ReadIndex and linearizable application read-durability barrier")
+}
+
 func (c *Controller) reservation(r *Resource) object {
-	return object{"version": 1, "operation_id": c.operationID(r), "target": r.Status.Target, "source": r.Spec.SourceClusterID, "source_membership": r.Status.SourceMembership, "statefulset_uid": r.Status.StatefulSetUID, "spec_hash": r.Status.SpecHash}
+	reservation := object{"version": 1, "operation_id": c.operationID(r), "target": r.Status.Target, "source": r.Spec.SourceClusterID, "source_membership": r.Status.SourceMembership, "statefulset_uid": r.Status.StatefulSetUID, "spec_hash": r.Status.SpecHash}
+	if r.Status.TargetBaseKind != "" {
+		reservation["target_base_kind"] = r.Status.TargetBaseKind
+	}
+	return reservation
 }
 func reconfigurationEnabled(env map[string]string) (bool, error) {
 	raw := env["RHIZA_ENABLE_RECONFIGURATION"]

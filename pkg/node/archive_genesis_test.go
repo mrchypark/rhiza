@@ -20,11 +20,12 @@ import (
 )
 
 type archiveGenesisFixtureClient struct {
-	bucket  objstore.Bucket
-	prefix  string
-	status  fencing.ArchiveGenesisStatus
-	calls   int
-	uploads int
+	bucket      objstore.Bucket
+	prefix      string
+	status      fencing.ArchiveGenesisStatus
+	calls       int
+	uploads     int
+	afterUpload func(*archiveGenesisFixtureClient)
 }
 
 func (c *archiveGenesisFixtureClient) ArchiveGenesisStatus(_ context.Context, _ string, _ uint) (fencing.ArchiveGenesisStatus, error) {
@@ -58,6 +59,9 @@ func (c *archiveGenesisFixtureClient) Upload(ctx context.Context, key string, co
 		Outcome: fencing.MutationCommitted, PreparationHash: strings.Repeat("a", 64), ReceiptDigest: strings.Repeat("b", 64),
 		PayloadDigest: digestHex, AllCopiesTerminal: true,
 	}}}
+	if c.afterUpload != nil {
+		c.afterUpload(c)
+	}
 	return nil
 }
 
@@ -89,6 +93,57 @@ func TestEnsureArchiveGenesisCreatesOnlyClaimAuthorizedEmptyHead(t *testing.T) {
 	if _, ok := archive.HeadVersion(); !ok || archive.Tip() != 0 || archive.Sealed() {
 		t.Fatal("genesis HEAD was not a persisted empty unsealed archive")
 	}
+}
+
+func TestEmptyRecoveryAuthorizationMustRemainIdenticalAcrossGenesisUpload(t *testing.T) {
+	ctx := context.Background()
+	bucket := objstore.NewInMemBucket()
+	scope := fencing.ArchiveScope{Provider: "gcs", Bucket: "bucket", Prefix: "target", ClusterID: "target"}
+	scopeHash, err := scope.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	membership := recovery.MembershipRecord{Cluster: "target", Durability: "async"}
+	membershipBytes, err := json.Marshal(membership)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := func(value string) string { return archiveGenesisBytesDigest([]byte(value)) }
+	authorization := fencing.ArchiveEmptyRecoveryAuthorization{
+		Version: fencing.ArchiveGenesisVersion, StatefulSetUID: "sts", TargetClusterID: "target",
+		OperationID: "recovery-op", SourceFenceOperationID: "fence-op", ConfigID: recovery.ArchiveConfigID,
+		SourceTip: 0, SourceScopeHash: digest("source-scope"), TargetScopeHash: scopeHash,
+		SourceGenesisRefDigest: digest("source-genesis"), SourceHeadDigest: digest("sealed-source-head"),
+		SourceHeadVersion:     objstore.ObjectVersion{Type: objstore.ETag, Value: "sealed-source-etag"},
+		TargetEmptyHeadDigest: archiveGenesisBytesDigest(mustEmptyArchiveHead(t)), SourceRootDigest: digest("source-root"),
+		SourceFenceDigest: digest("source-fence"), SourceMembershipHash: digest("source-membership"),
+		SourceDurability: "async", TargetMembershipHash: digest(string(membershipBytes)), TargetDurability: "async",
+		AllowDataLoss: true, PolicyDigest: digest("persisted-policy"),
+	}
+	client := &archiveGenesisFixtureClient{bucket: bucket, prefix: scope.Prefix, status: fencing.ArchiveGenesisStatus{
+		ScopeHash: scopeHash, MutationScopeHash: digest("mutation-scope"), ConfigID: recovery.ArchiveConfigID,
+		EmptyRecoveryAuthorization: &authorization, EmptyRecoveryState: fencing.EmptyRecoveryAuthorized,
+	}}
+	client.afterUpload = func(client *archiveGenesisFixtureClient) {
+		client.status.EmptyRecoveryAuthorization = nil
+		client.status.EmptyRecoveryState = ""
+	}
+	if err := ensureArchiveGenesis(ctx, client, bucket, scope, client.status.MutationScopeHash, membership); err != nil {
+		if !strings.Contains(err.Error(), "authorization changed") {
+			t.Fatalf("missing original authorization was not rejected explicitly: %v", err)
+		}
+	} else {
+		t.Fatal("accepted a changed or missing authorization after publishing target genesis")
+	}
+}
+
+func mustEmptyArchiveHead(t *testing.T) []byte {
+	t.Helper()
+	data, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestEnsureArchiveGenesisDoesNotAdoptAnExistingHead(t *testing.T) {

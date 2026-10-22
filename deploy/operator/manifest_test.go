@@ -331,4 +331,12 @@ func TestFencerRoleCreatesFenceRequestsWithoutClusterWrites(t *testing.T) {
 			t.Errorf("fencer Role must not grant %q on rhizaclusters", verb)
 		}
 	}
+	if !grants["rhizarecoveries"]["get"] {
+		t.Error("fencer Role must grant get on rhizarecoveries for canonical recovery registration")
+	}
+	for _, verb := range []string{"list", "create", "update", "patch", "delete", "deletecollection"} {
+		if grants["rhizarecoveries"][verb] {
+			t.Errorf("fencer Role must not grant %q on rhizarecoveries", verb)
+		}
+	}
 }

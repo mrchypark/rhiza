@@ -257,6 +257,13 @@ type ArchiveForkGenesisRegistrar interface {
 	RegisterArchiveForkGenesis(context.Context, ArchiveForkGenesisRequest) error
 }
 
+// ArchiveEmptyRecoveryRegistrar authorizes or confirms a fresh empty target.
+// It reports committed only after the target's real archive genesis receipt is
+// canonical; authorized alone permits activation but never completion.
+type ArchiveEmptyRecoveryRegistrar interface {
+	RegisterArchiveEmptyRecovery(context.Context, ArchiveEmptyRecoveryRequest) (ArchiveEmptyRecoveryResponse, error)
+}
+
 // FencingClient is the HTTPS backend; it does not own recovery decisions.
 type FencingClient struct {
 	URL       string
@@ -477,6 +484,81 @@ func (fc *FencingClient) RegisterArchiveForkGenesis(ctx context.Context, request
 	default:
 		return fmt.Errorf("fencing: archive fork genesis profile response is inconsistent")
 	}
+}
+
+// RegisterArchiveEmptyRecovery submits identifiers and the exact policy
+// snapshot. The authority reads the stored fence, source archive, and target
+// membership itself; the controller does not provide a caller-asserted proof.
+func (fc *FencingClient) RegisterArchiveEmptyRecovery(ctx context.Context, request ArchiveEmptyRecoveryRequest) (ArchiveEmptyRecoveryResponse, error) {
+	if err := validateURL(fc.URL); err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
+	}
+	if request.RecoveryName == "" || request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" ||
+		request.SourceFenceOperationID == "" || !validEvidenceDigest(request.TargetMembershipHash) ||
+		(request.TargetDurability != "async" && request.TargetDurability != "before-ack") ||
+		!validEvidenceDigest(request.PolicyDigest) || request.SourceFenceOperationID == request.OperationID {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery request identity or policy is invalid")
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: marshal empty recovery request: %w", err)
+	}
+	endpoint, err := url.Parse(fc.URL)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: invalid endpoint")
+	}
+	endpoint.Path = "/v1/archive-genesis/empty-recovery/register"
+	endpoint.RawPath = ""
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: build empty recovery request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Idempotency-Key", request.OperationID)
+	token, err := readToken(fc.TokenFile)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	resp, err := cloneClient(fc.Client).Do(httpReq)
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery request failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusAccepted {
+		return ArchiveEmptyRecoveryResponse{}, ErrFencePending
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery HTTP %d", resp.StatusCode)
+	}
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: read empty recovery response: %w", err)
+	}
+	if int64(len(responseBody)) > maxResponseBytes {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery response exceeds %d bytes", maxResponseBytes)
+	}
+	var result ArchiveEmptyRecoveryResponse
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: invalid empty recovery response")
+	}
+	if (result.State != fencing.EmptyRecoveryAuthorized && result.State != fencing.EmptyRecoveryCommitted) || result.Authorization.Validate() != nil {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery response is not a valid authorization")
+	}
+	authorization := result.Authorization
+	if authorization.StatefulSetUID != request.StatefulSetUID || authorization.TargetClusterID != request.TargetClusterID ||
+		authorization.OperationID != request.OperationID || authorization.SourceFenceOperationID != request.SourceFenceOperationID ||
+		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
+		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery authorization differs from request")
+	}
+	return result, nil
+}
+
+func emptyRecoveryPolicyDigest(specDigest, sourceDurability, targetDurability string, allowDataLoss bool) string {
+	return hashJSON([]any{"rhiza-empty-recovery-policy-v1", specDigest, sourceDurability, targetDurability, allowDataLoss})
 }
 
 // Validate independently of the backend before authorizing recovery effects.

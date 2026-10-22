@@ -74,7 +74,7 @@ func TestReadDurabilityFailureLogsReadDurabilityPhase(t *testing.T) {
 		t.Fatal("Query succeeded despite controlled durability failure")
 	}
 	message := output.String()
-	for _, want := range []string{"phase=read-durability", "node=n1", "read_index=0", "core_tip=0", "applied_tip=0", "elapsed=", "error_class=backend"} {
+	for _, want := range []string{"phase=read-durability", "node=n1", "read_index=0", "core_tip=0", "applied_tip=0", "elapsed=", "error_class=durability-unavailable"} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("failure log %q does not contain %q", message, want)
 		}

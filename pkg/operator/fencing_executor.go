@@ -189,8 +189,12 @@ func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) erro
 	}
 	if state.Ledger.RequireMutationJournal {
 		if state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisRegistrationPending {
-			if state.Ledger.ArchiveScopeHash != "" || state.Ledger.ArchiveGenesisRef != nil {
+			if state.Ledger.ArchiveScopeHash != "" || state.Ledger.ArchiveGenesisRef != nil || state.Ledger.EmptyRecoveryAuthorization != nil {
 				return fmt.Errorf("fencing: pending archive genesis root has unexpected scope state")
+			}
+		} else if state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisEmptyRecoveryPending {
+			if !validEvidenceDigest(state.Ledger.ArchiveScopeHash) || state.Ledger.ArchiveGenesisRef != nil || state.Ledger.EmptyRecoveryAuthorization != nil {
+				return fmt.Errorf("fencing: pending empty recovery root has unexpected scope state")
 			}
 		} else if state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisAwaitingRef {
 			if !validEvidenceDigest(state.Ledger.ArchiveScopeHash) || state.Ledger.ArchiveGenesisRef != nil {
@@ -204,8 +208,19 @@ func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) erro
 		} else {
 			return fmt.Errorf("fencing: required archive genesis state is missing")
 		}
-	} else if state.Ledger.ArchiveGenesisState != "" || state.Ledger.ArchiveScopeHash != "" || state.Ledger.ArchiveGenesisRef != nil {
+	} else if state.Ledger.ArchiveGenesisState != "" || state.Ledger.ArchiveScopeHash != "" || state.Ledger.ArchiveGenesisRef != nil || state.Ledger.EmptyRecoveryAuthorization != nil {
 		return fmt.Errorf("fencing: cooperative root carries independent archive genesis state")
+	}
+	if state.Ledger.EmptyRecoveryAuthorization != nil {
+		a := state.Ledger.EmptyRecoveryAuthorization
+		if err := a.Validate(); err != nil || a.StatefulSetUID != state.StatefulSetUID || a.TargetClusterID != state.Ledger.SourceClusterID ||
+			a.TargetScopeHash != state.Ledger.ArchiveScopeHash || !state.Ledger.RequireMutationJournal ||
+			(state.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisAwaitingRef && state.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted) {
+			return fmt.Errorf("fencing: root empty recovery authorization differs")
+		}
+		if state.Ledger.ArchiveGenesisRef != nil && (state.Ledger.ArchiveGenesisRef.Mutation == nil || state.Ledger.ArchiveGenesisRef.Mutation.Intent.PayloadDigest != a.TargetEmptyHeadDigest) {
+			return fmt.Errorf("fencing: root empty recovery authorization differs from target genesis mutation")
+		}
 	}
 	return nil
 }
@@ -308,6 +323,10 @@ func (e *FencingExecutor) Handler() http.Handler { return http.HandlerFunc(e.han
 func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == httpFenceRequestPath {
 		e.handleHTTPFenceRequest(w, r)
+		return
+	}
+	if r.URL.Path == "/v1/archive-genesis/empty-recovery/register" {
+		e.handleArchiveEmptyRecovery(w, r)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/archive-genesis/") {

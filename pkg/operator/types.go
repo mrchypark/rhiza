@@ -74,6 +74,9 @@ type Status struct {
 	ObservedGeneration int64                         `json:"observedGeneration"`
 	Source             string                        `json:"source"`
 	Target             string                        `json:"target,omitempty"`
+	// TargetBaseKind distinguishes an authorized empty recovery from a fork.
+	// Empty means tip zero was explicitly observed and authorized, not absent.
+	TargetBaseKind     string                        `json:"targetBaseKind,omitempty"`
 	RecoveryID         string                        `json:"recoveryID,omitempty"`
 	SpecHash           string                        `json:"specHash,omitempty"`
 	StatefulSetUID     string                        `json:"statefulSetUID,omitempty"`

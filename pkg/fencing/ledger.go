@@ -6,16 +6,17 @@ import "fmt"
 // persisted with the resourceVersion read alongside this value. Never replace a
 // ledger after a conflict or discard an older incarnation when a Pod disappears.
 type Ledger struct {
-	SourceClusterID        string                 `json:"sourceClusterID"`
-	ClosedBy               string                 `json:"closedBy,omitempty"`
-	ClosedHash             string                 `json:"closedHash,omitempty"`
-	ClosedNodes            map[string]StopRequest `json:"closedNodes,omitempty"`
-	Runs                   map[string]Run         `json:"runs"`
-	RequireRuntimeBinding  bool                   `json:"requireRuntimeBinding,omitempty"`
-	RequireMutationJournal bool                   `json:"requireMutationJournal,omitempty"`
-	ArchiveGenesisState    string                 `json:"archiveGenesisState,omitempty"`
-	ArchiveScopeHash       string                 `json:"archiveScopeHash,omitempty"`
-	ArchiveGenesisRef      *ArchiveGenesisRef     `json:"archiveGenesisRef,omitempty"`
+	SourceClusterID            string                             `json:"sourceClusterID"`
+	ClosedBy                   string                             `json:"closedBy,omitempty"`
+	ClosedHash                 string                             `json:"closedHash,omitempty"`
+	ClosedNodes                map[string]StopRequest             `json:"closedNodes,omitempty"`
+	Runs                       map[string]Run                     `json:"runs"`
+	RequireRuntimeBinding      bool                               `json:"requireRuntimeBinding,omitempty"`
+	RequireMutationJournal     bool                               `json:"requireMutationJournal,omitempty"`
+	ArchiveGenesisState        string                             `json:"archiveGenesisState,omitempty"`
+	ArchiveScopeHash           string                             `json:"archiveScopeHash,omitempty"`
+	ArchiveGenesisRef          *ArchiveGenesisRef                 `json:"archiveGenesisRef,omitempty"`
+	EmptyRecoveryAuthorization *ArchiveEmptyRecoveryAuthorization `json:"emptyRecoveryAuthorization,omitempty"`
 }
 
 type Run struct {

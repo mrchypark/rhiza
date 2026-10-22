@@ -36,8 +36,14 @@ func ensureArchiveGenesis(ctx context.Context, client archiveGenesisClient, buck
 	if err := validateArchiveGenesisStatus(status, scopeHash, mutationScopeHash); err != nil {
 		return err
 	}
+	if status.EmptyRecoveryAuthorization != nil {
+		if err := validateEmptyRecoveryArchiveGenesis(status, scopeHash, membership); err != nil {
+			return err
+		}
+	}
+	initialEmptyRecoveryAuthorization := status.EmptyRecoveryAuthorization
 	if status.Ref == nil {
-		if !status.CanInitializeEmpty {
+		if status.EmptyRecoveryAuthorization == nil && !status.CanInitializeEmpty {
 			return fmt.Errorf("fencing: canonical archive genesis is not initialized")
 		}
 		if err := recovery.RequireEmptyArchiveScope(ctx, bucket, scope.Prefix); err != nil {
@@ -55,6 +61,15 @@ func ensureArchiveGenesis(ctx context.Context, client archiveGenesisClient, buck
 		if err := validateArchiveGenesisStatus(status, scopeHash, mutationScopeHash); err != nil {
 			return err
 		}
+		if (initialEmptyRecoveryAuthorization == nil) != (status.EmptyRecoveryAuthorization == nil) ||
+			(initialEmptyRecoveryAuthorization != nil && !sameEmptyRecoveryAuthorization(*initialEmptyRecoveryAuthorization, *status.EmptyRecoveryAuthorization)) {
+			return fmt.Errorf("fencing: canonical empty recovery authorization changed during genesis registration")
+		}
+		if status.EmptyRecoveryAuthorization != nil {
+			if err := validateEmptyRecoveryArchiveGenesis(status, scopeHash, membership); err != nil {
+				return err
+			}
+		}
 		if status.Ref == nil {
 			if uploadErr != nil {
 				return fmt.Errorf("create canonical archive genesis: %w", uploadErr)
@@ -70,6 +85,11 @@ func ensureArchiveGenesis(ctx context.Context, client archiveGenesisClient, buck
 		if err := validateMutationArchiveGenesis(status, emptyHead); err != nil {
 			return err
 		}
+		if status.EmptyRecoveryAuthorization != nil {
+			if err := validateEmptyRecoveryArchiveGenesis(status, scopeHash, membership); err != nil {
+				return err
+			}
+		}
 	} else if status.Ref.Fork != nil {
 		if err := verifyForkArchiveGenesis(ctx, bucket, scope.Prefix, membership, *status.Ref.Fork); err != nil {
 			return err
@@ -78,6 +98,30 @@ func ensureArchiveGenesis(ctx context.Context, client archiveGenesisClient, buck
 		return fmt.Errorf("fencing: archive genesis reference has no supported proof")
 	}
 	return requireCurrentUnsealedArchive(ctx, bucket, scope.Prefix)
+}
+
+func sameEmptyRecoveryAuthorization(a, b fencing.ArchiveEmptyRecoveryAuthorization) bool {
+	left, errLeft := json.Marshal(a)
+	right, errRight := json.Marshal(b)
+	return errLeft == nil && errRight == nil && bytes.Equal(left, right)
+}
+
+func validateEmptyRecoveryArchiveGenesis(status fencing.ArchiveGenesisStatus, scopeHash string, membership recovery.MembershipRecord) error {
+	authorization := status.EmptyRecoveryAuthorization
+	if authorization == nil || authorization.Validate() != nil || authorization.TargetScopeHash != scopeHash ||
+		authorization.TargetClusterID != membership.Cluster || authorization.TargetDurability != membership.Durability ||
+		authorization.SourceTip != 0 || (status.EmptyRecoveryState != fencing.EmptyRecoveryAuthorized && status.EmptyRecoveryState != fencing.EmptyRecoveryCommitted) {
+		return fmt.Errorf("fencing: canonical empty recovery authorization differs from target scope")
+	}
+	encoded, err := json.Marshal(membership)
+	if err != nil || archiveGenesisBytesDigest(encoded) != authorization.TargetMembershipHash {
+		return fmt.Errorf("fencing: canonical empty recovery membership differs")
+	}
+	emptyHead, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil || archiveGenesisBytesDigest(emptyHead) != authorization.TargetEmptyHeadDigest {
+		return fmt.Errorf("fencing: canonical empty recovery does not authorize the empty archive HEAD")
+	}
+	return nil
 }
 
 func validateArchiveGenesisStatus(status fencing.ArchiveGenesisStatus, scopeHash, mutationScopeHash string) error {

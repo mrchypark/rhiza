@@ -150,6 +150,9 @@ func (s *AuthorityStateStore) SetArchiveScopeGenesisRef(ctx context.Context, sco
 		if claim.ConfigID != ref.ConfigID {
 			return fmt.Errorf("fencing: archive genesis config differs from registered scope claim")
 		}
+		if claim.EmptyRecoveryAuthorization != nil && (ref.Mutation == nil || ref.Mutation.Intent.PayloadDigest != claim.EmptyRecoveryAuthorization.TargetEmptyHeadDigest) {
+			return fmt.Errorf("fencing: target genesis mutation differs from empty recovery authorization")
+		}
 		claim.GenesisRef = &ref
 		_, identity, _ := s.archiveScopeClaimKey(scope)
 		if err := s.write(ctx, s.key("archive-scope-claims", identity), identity, claim, version); err == nil {
@@ -163,6 +166,79 @@ func (s *AuthorityStateStore) SetArchiveScopeGenesisRef(ctx context.Context, sco
 		}
 	}
 	return fmt.Errorf("fencing: archive genesis claim changed too often")
+}
+
+// SetArchiveScopeEmptyRecoveryAuthorization stores the immutable proof that
+// this target scope may be initialized from a sealed empty recovery source.
+// It is separate from GenesisRef, which records the target's actual mutation.
+func (s *AuthorityStateStore) SetArchiveScopeEmptyRecoveryAuthorization(ctx context.Context, scope fencing.ArchiveScope, authorization fencing.ArchiveEmptyRecoveryAuthorization) error {
+	hash, err := scope.Hash()
+	if err != nil || authorization.Validate() != nil || authorization.TargetScopeHash != hash || authorization.ConfigID == 0 {
+		return fmt.Errorf("fencing: empty recovery authorization does not match archive scope")
+	}
+	for range 8 {
+		claim, version, err := s.ReadArchiveScopeClaim(ctx, scope)
+		if err != nil {
+			return err
+		}
+		if claim.ConfigID != authorization.ConfigID || claim.OwnerStatefulSetUID != authorization.StatefulSetUID || claim.OwnerSourceClusterID != scope.ClusterID {
+			return fmt.Errorf("fencing: empty recovery claim belongs to a different root")
+		}
+		if claim.EmptyRecoveryAuthorization != nil {
+			if hashJSON(claim.EmptyRecoveryAuthorization) == hashJSON(&authorization) {
+				return nil
+			}
+			return fmt.Errorf("fencing: empty recovery authorization is immutable")
+		}
+		claim.EmptyRecoveryAuthorization = &authorization
+		_, identity, _ := s.archiveScopeClaimKey(scope)
+		if err := s.write(ctx, s.key("archive-scope-claims", identity), identity, claim, version); err == nil {
+			return nil
+		} else if !errors.Is(err, errAuthorityStateConflict) {
+			got, _, readErr := s.ReadArchiveScopeClaim(ctx, scope)
+			if readErr == nil && got.EmptyRecoveryAuthorization != nil && hashJSON(got.EmptyRecoveryAuthorization) == hashJSON(&authorization) {
+				return nil
+			}
+			return errors.Join(err, readErr)
+		}
+	}
+	return fmt.Errorf("fencing: empty recovery claim changed too often")
+}
+
+// SetRootEmptyRecoveryAuthorization binds the same immutable authorization to
+// the canonical root. It never changes ArchiveGenesisRef, the commit receipt.
+func (s *AuthorityStateStore) SetRootEmptyRecoveryAuthorization(ctx context.Context, uid, source string, authorization fencing.ArchiveEmptyRecoveryAuthorization) error {
+	for range 8 {
+		state, version, err := s.ReadRoot(ctx, uid, source)
+		if err != nil {
+			return err
+		}
+		if state.StatefulSetUID != authorization.StatefulSetUID || source != authorization.TargetClusterID ||
+			state.Ledger.ArchiveScopeHash != authorization.TargetScopeHash || authorization.Validate() != nil {
+			return fmt.Errorf("fencing: empty recovery root binding differs")
+		}
+		if state.Ledger.EmptyRecoveryAuthorization != nil {
+			if hashJSON(state.Ledger.EmptyRecoveryAuthorization) == hashJSON(&authorization) {
+				return nil
+			}
+			return fmt.Errorf("fencing: empty recovery root authorization is immutable")
+		}
+		if state.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisEmptyRecoveryPending || state.Ledger.ArchiveGenesisRef != nil {
+			return fmt.Errorf("fencing: target root is not reserved for empty recovery")
+		}
+		state.Ledger.EmptyRecoveryAuthorization = &authorization
+		state.Ledger.ArchiveGenesisState = fencing.ArchiveGenesisAwaitingRef
+		if err := s.WriteRoot(ctx, uid, source, state, version); err == nil {
+			return nil
+		} else if !errors.Is(err, errAuthorityStateConflict) {
+			confirmed, _, readErr := s.ReadRoot(ctx, uid, source)
+			if readErr == nil && confirmed.Ledger.EmptyRecoveryAuthorization != nil && hashJSON(confirmed.Ledger.EmptyRecoveryAuthorization) == hashJSON(&authorization) {
+				return nil
+			}
+			return errors.Join(err, readErr)
+		}
+	}
+	return fmt.Errorf("fencing: empty recovery root changed too often")
 }
 
 func (s *AuthorityStateStore) ensureRootGenesis(ctx context.Context, identity string) error {
