@@ -960,8 +960,11 @@ mod tests {
                 .unwrap()
                 .require_committed()
                 .unwrap();
+            // Confirm each hint reached the node-local dispatcher before
+            // publishing the next one. The unread subscriber queue has depth
+            // one, so the second delivery must be counted as a drop.
+            wait_for_dispatch(&format!("after-hint-{version}"));
         }
-        wait_for_dispatch("after-live-hints");
         // The live queue retains one hint; the other is deliberately lost.
         assert!(db.notification_drops().unwrap() > drops);
         assert_eq!(subscription.recv_timeout(1_000).unwrap(), b"changed");
