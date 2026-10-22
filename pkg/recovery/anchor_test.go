@@ -157,7 +157,7 @@ func TestForkMaterializesAnchoredTargetWithoutSourceExtents(t *testing.T) {
 	}
 	anchor, hash, err := ReadGenerationAnchor(ctx, bucket, "anchor-source")
 	storedResult, resultPresent, resultErr := readForkResult(ctx, bucket, "anchor-source")
-	if err != nil || resultErr != nil || !resultPresent || storedResult != result || anchor.SourceTip != result.Tip || anchor.SourcePrefixHash != result.PrefixHash || partialTip != quepaxa.Slot(result.Tip) {
+	if err != nil || resultErr != nil || !resultPresent || !sameForkResult(storedResult, result) || anchor.SourceTip != result.Tip || anchor.SourcePrefixHash != result.PrefixHash || partialTip != quepaxa.Slot(result.Tip) {
 		t.Fatalf("anchor=%+v err=%v", anchor, err)
 	}
 	target := NewManager(bucket, "anchor-source", 1)

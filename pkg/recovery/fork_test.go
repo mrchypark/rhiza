@@ -93,7 +93,7 @@ func TestForkCopiesVerifiedGenerationAndIsIdempotent(t *testing.T) {
 		t.Fatal(err)
 	}
 	again, err := Fork(ctx, bucket, options)
-	if err != nil || again != result {
+	if err != nil || !sameForkResult(again, result) {
 		t.Fatalf("retry result=%+v err=%v", again, err)
 	}
 	target := NewManager(bucket, "target", 1)

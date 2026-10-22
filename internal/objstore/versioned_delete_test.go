@@ -76,6 +76,40 @@ func TestGCSDeleteVersionPinsGenerationAndPrecondition(t *testing.T) {
 	}
 }
 
+func TestMeteredBucketForwardsGCSBucketAttrsFromExistingHandle(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/storage/v1/b/bucket" {
+			t.Fatalf("unexpected bucket attrs request: %s %s", r.Method, r.URL)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"name":"bucket","metageneration":"7","lifecycle":{"rule":[{"action":{"type":"Delete"},"condition":{"matchesPrefix":["other/"]}}]}}`))
+	}))
+	defer server.Close()
+	client, err := storage.NewClient(context.Background(), option.WithEndpoint(server.URL+"/storage/v1/"), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	base := &gcsVersionedDeleteBucket{Bucket: thanosobjstore.NewInMemBucket(), handle: client.Bucket("bucket")}
+	bucket := newMeteredBucket(base, &bucketMetrics{})
+	attrs, err := bucket.BucketAttrs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attrs.Name != "bucket" || attrs.MetaGeneration != 7 || len(attrs.Lifecycle.Rules) != 1 || attrs.Lifecycle.Rules[0].Condition.MatchesPrefix[0] != "other/" || requests != 1 {
+		t.Fatalf("unexpected forwarded bucket attrs: attrs=%+v requests=%d", attrs, requests)
+	}
+}
+
+func TestMeteredBucketBucketAttrsFailsClosedWithoutProviderCapability(t *testing.T) {
+	bucket := newMeteredBucket(thanosobjstore.NewInMemBucket(), &bucketMetrics{})
+	if attrs, err := bucket.BucketAttrs(context.Background()); attrs != nil || !errors.Is(err, ErrBucketAttrsUnsupported) {
+		t.Fatalf("unsupported metadata capability returned attrs=%v err=%v", attrs, err)
+	}
+}
+
 func TestGCSDeleteVersionRejectsMissingOrNonGenerationVersionBeforeRequest(t *testing.T) {
 	var requests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

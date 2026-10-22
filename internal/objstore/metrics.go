@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"cloud.google.com/go/storage"
 	minio "github.com/minio/minio-go/v7"
 	thanosobjstore "github.com/thanos-io/objstore"
 )
@@ -301,6 +302,19 @@ func (b *MeteredBucket) Stats() Stats {
 		ReplayTrackedOperationsActive: b.metrics.replayTrackedOperationsActive.Load(),
 		ReplayOpenReaders:             b.metrics.replayOpenReaders.Load(),
 	}
+}
+
+// BucketAttrs forwards the optional provider metadata capability. Providers
+// without bucket-level metadata fail closed rather than fabricating attributes.
+func (b *MeteredBucket) BucketAttrs(ctx context.Context) (*storage.BucketAttrs, error) {
+	if b == nil || b.Bucket == nil {
+		return nil, ErrBucketAttrsUnsupported
+	}
+	reader, ok := b.Bucket.(BucketAttrsReader)
+	if !ok {
+		return nil, ErrBucketAttrsUnsupported
+	}
+	return reader.BucketAttrs(ctx)
 }
 
 func (b *MeteredBucket) Upload(ctx context.Context, name string, reader io.Reader, opts ...thanosobjstore.ObjectUploadOption) error {
