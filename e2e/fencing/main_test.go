@@ -103,6 +103,94 @@ func TestWorkflowPublishesOnlyPreKindFailureReceiptWhenQualificationIsSkipped(t 
 	}
 }
 
+func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
+	data, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type input struct {
+		Type    string `yaml:"type"`
+		Default bool   `yaml:"default"`
+	}
+	type step struct {
+		Run string `yaml:"run"`
+	}
+	var workflow struct {
+		On struct {
+			WorkflowDispatch struct {
+				Inputs map[string]input `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+		Jobs map[string]struct {
+			If    string `yaml:"if"`
+			Steps []step `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	fixtureInput, ok := workflow.On.WorkflowDispatch.Inputs["fixture_only"]
+	if !ok || fixtureInput.Type != "boolean" || fixtureInput.Default {
+		t.Fatal("fixture_only must be an opt-in boolean that defaults to the normal full workflow")
+	}
+	wantConditions := map[string]string{
+		"fencing-only":             "github.event_name == 'workflow_dispatch' && inputs.fencing_only && !inputs.fixture_only",
+		"fixture-only":             "github.event_name == 'workflow_dispatch' && inputs.fixture_only",
+		"cooperative-fencing":      "github.event_name != 'workflow_dispatch' || !inputs.fixture_only",
+		"operator-chaos":           "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"automatic-operator-chaos": "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"membership-e2e":           "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"rust-sdk":                 "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"go":                       "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"containers":               "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"anchor-operator-chaos":    "github.event_name != 'workflow_dispatch' || (!inputs.fencing_only && !inputs.fixture_only)",
+		"publish-chaos-image":      "github.repository == 'mrchypark/rhiza' && github.event_name == 'workflow_dispatch' && inputs.publish_chaos_image && !inputs.fencing_only && !inputs.fixture_only",
+	}
+	if len(workflow.Jobs) != len(wantConditions) {
+		t.Fatalf("workflow job set changed: got %d jobs, contract covers %d", len(workflow.Jobs), len(wantConditions))
+	}
+	for name, want := range wantConditions {
+		job, ok := workflow.Jobs[name]
+		if !ok || job.If != want {
+			t.Errorf("job %s condition=%q, want %q", name, job.If, want)
+		}
+	}
+	var run string
+	for _, step := range workflow.Jobs["fixture-only"].Steps {
+		run += step.Run
+	}
+	hasLine := func(want string) bool {
+		for _, line := range strings.Split(run, "\n") {
+			if line == want {
+				return true
+			}
+		}
+		return false
+	}
+	wantEmbeddedSelector := "embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'"
+	wantOperatorSelector := "operator_tests='^(TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot|TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead|TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound|TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault|TestTerminalStoreRejectsIncompleteOrUntrustedTermination)$'"
+	if !hasLine(wantEmbeddedSelector) || !hasLine(wantOperatorSelector) {
+		t.Fatal("fixture-only job must assign the fixed rollback/IAM/manifest and recovery/terminal selector literals")
+	}
+	wantCommands := []string{
+		`go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
+		`go test ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m`,
+		`go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
+		`go test -race ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m`,
+	}
+	for _, command := range wantCommands {
+		if !hasLine(command) {
+			t.Errorf("fixture-only job omits exact package/selector command %q", command)
+		}
+	}
+	if strings.Count(run, "go test ") != len(wantCommands) {
+		t.Fatal("fixture-only job must contain only the four asserted focused test commands")
+	}
+	if strings.Contains(run, "go test ./...") || strings.Contains(run, "kind ") || strings.Contains(run, "docker ") {
+		t.Fatal("fixture-only job must remain a focused Go feedback path without cluster/image work")
+	}
+}
+
 func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	config := "sha256:" + strings.Repeat("a", 64)
 	for _, reference := range []string{config, "containerd://" + config, "docker.io/library/import-date@" + config} {
