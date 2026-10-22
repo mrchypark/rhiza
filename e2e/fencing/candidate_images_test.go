@@ -154,13 +154,13 @@ func TestOptInCandidatePublicationMatchesRemoteGCSRuntimeImages(t *testing.T) {
 	if err != nil || !strings.Contains(string(embedded), "qualification-gcs-iam-probe") {
 		t.Fatal("embedded Go application source must include the qualification command required by the GCS workload")
 	}
-	driver, err := os.ReadFile("../../e2e/chaos/votercount_gcs_chaos.py")
+	driver, err := os.ReadFile("gcs_ha_recovery.go")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, fragment := range []string{`"runtime-agent": self.args.operator_image`, `"runtime-agent": self.pods_with("app.kubernetes.io/name=rhiza-runtime-agent")`} {
+	for _, fragment := range []string{`verifyGCSPodImage(pod, "runtime-agent", operatorImage)`, `source.AgentDaemonUID`, `evidence["runtimeAgent"]`} {
 		if !strings.Contains(string(driver), fragment) {
-			t.Fatalf("remote GCS runtime image inventory must verify the runtime-agent digest: missing %q", fragment)
+			t.Fatalf("remote GCS runtime image inventory must verify and record the owned DaemonSet image: missing %q", fragment)
 		}
 	}
 }
