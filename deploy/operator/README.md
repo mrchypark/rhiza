@@ -51,12 +51,28 @@ not configure canonical GCS state; those deployments are not the independent
 NoPVC mutation profile. Opt into that profile with
 `FENCER_INDEPENDENT_MUTATION_PROFILE=true` (or
 `--independent-mutation-profile`) only after configuring generation-CAS GCS
-authority state, the runtime-agent CA, and a separate source-writer
-credential. Source staging and execution receipts then use root-bound remote
-ObjectStorage; local stage and receipt directories are rejected rather than
-used as fallbacks. The remote stage quota is 64 tickets and 4 GiB per producer.
-Tickets remain reserved until their exact mutation is found in verified
-compacted archive history; cancellation or age alone never frees capacity.
+authority state, the runtime-agent CA, and exactly one source-writer
+credential mode: the existing `--source-writer-credentials-file` (or
+`FENCER_SOURCE_WRITER_CREDENTIALS_FILE`), or explicit
+`--source-writer-use-adc` (or `FENCER_SOURCE_WRITER_USE_ADC=true`). These
+options are mutually exclusive; ADC mode is accepted only with the independent
+profile and has no fallback to the credential file. It uses the fencing
+authority Pod's Application Default Credentials (on GKE, configure that Pod's
+Workload Identity principal deliberately). The canonical authority state uses
+that principal when its GCS client also uses default credentials; explicit
+`RHIZA_OBJSTORE_SERVICE_ACCOUNT` credentials can select a different state
+principal. ADC mode does not itself prove separation between authority-state
+and source-object permissions. Keep the source
+application's KSA distinct and read/list-only, do not mount or inject writer
+credentials into the application Pod, and verify IAM bindings and denied
+operations with the qualification harness before making an isolation claim.
+Source staging and execution receipts then use root-bound remote ObjectStorage;
+local stage and receipt directories are rejected rather than used as
+fallbacks. The remote stage quota is 64 tickets and 4 GiB per producer.
+Cancellation before a ticket enters receiving may durably retire it and release
+quota. Once receiving/admission has begun, tickets remain reserved until their
+exact mutation is found in verified compacted archive history; age alone never
+frees capacity.
 
 ## Operator image
 
