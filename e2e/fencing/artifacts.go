@@ -192,6 +192,7 @@ var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
 	"backend_result_validation/binding_invalid":        {},
 	"backend_result_validation/binding_mismatch":       {},
 	"backend_result_validation/scope_invalid":          {},
+	"backend_result_validation/scope_digest_mismatch":   {},
 	"state_persist/state_write_failed":                 {},
 }
 

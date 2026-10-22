@@ -169,7 +169,7 @@ func (s *Service) enroll(ctx context.Context, base fencing.RuntimeBinding) (fenc
 	defer s.mu.Unlock()
 	key := enrollmentKey(base)
 	if old, err := s.read(key); err == nil {
-		if !sameEnrollmentBase(old.Binding, base) {
+		if !sameEnrollmentBase(old.Binding, base) || (base.CapturedScopeDigest != "" && old.Binding != base) {
 			s.enrollmentDiagnostic("state_read", "binding_conflict")
 			return fencing.RuntimeBinding{}, errors.New("runtime enrollment conflict")
 		}
@@ -178,29 +178,68 @@ func (s *Service) enroll(ctx context.Context, base fencing.RuntimeBinding) (fenc
 		s.enrollmentDiagnostic("state_read", "state_unavailable")
 		return fencing.RuntimeBinding{}, err
 	}
-	binding, scope, err := s.cfg.Backend.Enroll(ctx, base)
+	recovered, err := s.captureEnrollment(ctx, base)
 	if err != nil {
-		s.enrollmentDiagnostic("cri_enroll", enrollmentBackendErrorCode(err))
 		return fencing.RuntimeBinding{}, err
 	}
-	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
-	if err := binding.Validate(identity); err != nil {
-		s.enrollmentDiagnostic("backend_result_validation", "binding_invalid")
-		return fencing.RuntimeBinding{}, errors.New("runtime backend returned incomplete enrollment")
-	}
-	if !sameEnrollmentBase(binding, base) {
-		s.enrollmentDiagnostic("backend_result_validation", "binding_mismatch")
-		return fencing.RuntimeBinding{}, errors.New("runtime backend returned incomplete enrollment")
-	}
-	if len(scope) == 0 || !json.Valid(scope) {
-		s.enrollmentDiagnostic("backend_result_validation", "scope_invalid")
-		return fencing.RuntimeBinding{}, errors.New("runtime backend returned incomplete enrollment")
-	}
-	if err := s.write(key, record{Binding: binding, Scope: scope}); err != nil {
+	if err := s.write(key, recovered); err != nil {
 		s.enrollmentDiagnostic("state_persist", "state_write_failed")
 		return fencing.RuntimeBinding{}, err
 	}
-	return binding, nil
+	return recovered.Binding, nil
+}
+
+func (s *Service) captureEnrollment(ctx context.Context, expected fencing.RuntimeBinding) (record, error) {
+	binding, scope, err := s.cfg.Backend.Enroll(ctx, expected)
+	if err != nil {
+		s.enrollmentDiagnostic("cri_enroll", enrollmentBackendErrorCode(err))
+		return record{}, err
+	}
+	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
+	binding.CapturedScopeDigest = ""
+	if err := binding.Validate(identity); err != nil {
+		s.enrollmentDiagnostic("backend_result_validation", "binding_invalid")
+		return record{}, errors.New("runtime backend returned incomplete enrollment")
+	}
+	if !sameEnrollmentBase(binding, expected) {
+		s.enrollmentDiagnostic("backend_result_validation", "binding_mismatch")
+		return record{}, errors.New("runtime backend returned incomplete enrollment")
+	}
+	if err := validateCapturedScope(scope, binding); err != nil {
+		s.enrollmentDiagnostic("backend_result_validation", "scope_invalid")
+		return record{}, err
+	}
+	digest := rawDigest(scope)
+	if expected.CapturedScopeDigest != "" && expected.CapturedScopeDigest != digest {
+		s.enrollmentDiagnostic("backend_result_validation", "scope_digest_mismatch")
+		return record{}, errors.New("runtime backend captured scope differs from the enrolled scope")
+	}
+	binding.CapturedScopeDigest = digest
+	if expected.CapturedScopeDigest != "" && binding != expected {
+		s.enrollmentDiagnostic("backend_result_validation", "binding_mismatch")
+		return record{}, errors.New("runtime backend re-enrollment differs from the immutable runtime binding")
+	}
+	return record{Binding: binding, Scope: append(json.RawMessage(nil), scope...)}, nil
+}
+
+func validateCapturedScope(data json.RawMessage, binding fencing.RuntimeBinding) error {
+	if len(data) == 0 || !json.Valid(data) {
+		return errors.New("runtime backend returned incomplete enrollment scope")
+	}
+	var scope cri.CgroupScope
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&scope); err != nil || decoder.Decode(new(any)) != io.EOF ||
+		scope.Path == "" || scope.Dev == 0 || scope.Ino == 0 || scope.PID == 0 || scope.StartTime == 0 ||
+		scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID == "" {
+		return errors.New("runtime backend returned invalid captured cgroup scope")
+	}
+	return nil
+}
+
+func rawDigest(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
 }
 
 func (s *Service) enrollmentDiagnostic(stage, code string) {
@@ -277,7 +316,21 @@ func (s *Service) stop(ctx context.Context, binding fencing.RuntimeBinding, requ
 	}
 	key := enrollmentKey(binding)
 	state, err := s.read(key)
-	if err != nil || state.Binding != binding {
+	if errors.Is(err, os.ErrNotExist) {
+		if !validDigest(binding.CapturedScopeDigest) {
+			return nil, errors.New("runtime enrollment lacks a root-pinned captured scope digest")
+		}
+		state, err = s.captureEnrollment(ctx, binding)
+		if err != nil {
+			return nil, err
+		}
+		if state.Binding != binding {
+			return nil, errors.New("runtime enrollment differs from the immutable stop binding")
+		}
+		if err := s.write(key, state); err != nil {
+			return nil, err
+		}
+	} else if err != nil || state.Binding != binding {
 		return nil, errors.New("runtime enrollment missing")
 	}
 	// A retry reads the durable receipt before any CRI call or metadata lookup.
@@ -334,6 +387,7 @@ func (s *Service) verify(binding fencing.RuntimeBinding, request fencing.StopReq
 func sameEnrollmentBase(a, b fencing.RuntimeBinding) bool {
 	a.NodeUID, a.MachineID, a.BootID, a.RuntimeID, a.SandboxID = "", "", "", "", ""
 	b.NodeUID, b.MachineID, b.BootID, b.RuntimeID, b.SandboxID = "", "", "", "", ""
+	a.CapturedScopeDigest, b.CapturedScopeDigest = "", ""
 	return a == b
 }
 

@@ -45,10 +45,10 @@ func TestCgroupScopeDigestBindsFullRuntimeRun(t *testing.T) {
 	if err := binding.Validate(identity); err != nil {
 		t.Fatal(err)
 	}
-	scope := CgroupScope{Path: "kubepods/pod-a", Dev: 1, Ino: 2, PID: 123, StartTime: 789, RuntimeHash: fencing.RuntimeBindingDigest(binding), ProfileID: "qualified-test-profile"}
+	scope := CgroupScope{Path: "kubepods/pod-a", Dev: 1, Ino: 2, PID: 123, StartTime: 789, RuntimeHash: fencing.RuntimeScopeBindingDigest(binding), ProfileID: "qualified-test-profile"}
 	other := binding
 	other.RunID = "another-run"
-	if scope.RuntimeHash == fencing.RuntimeBindingDigest(other) {
+	if scope.RuntimeHash == fencing.RuntimeScopeBindingDigest(other) {
 		t.Fatal("run-specific runtime bindings unexpectedly share a cgroup key")
 	}
 }

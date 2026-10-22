@@ -627,7 +627,7 @@ func TestCRIContainerdEnrollmentCapturesPIDOnlyForExactBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	scope, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot)
-	if err != nil || scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) {
+	if err != nil || scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) {
 		t.Fatalf("containerd enrollment scope=%+v, %v", scope, err)
 	}
 	f.mu.Lock()
@@ -660,7 +660,7 @@ func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
 	if binding.NodeUID != f.host.NodeUID || binding.MachineID != f.host.MachineID || binding.BootID != f.host.BootID || binding.RuntimeID != RuntimeIdentity("containerd", "test-version", "v1") || binding.SandboxID != "sandbox-0" || binding.ContainerID != base.ContainerID || binding.ImageID != base.ImageID {
 		t.Fatalf("runtime facts were not bound from the host and CRI: %+v", binding)
 	}
-	if scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) || scope.ProfileID != "qualified-test-profile" {
+	if scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != "qualified-test-profile" {
 		t.Fatalf("captured scope does not bind full runtime enrollment: %+v", scope)
 	}
 	base.ImageID = "other-image@sha256:" + strings.Repeat("0", 64)

@@ -64,7 +64,7 @@ func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, binding fencing
 		return CgroupScope{}, fmt.Errorf("%w: process changed during cgroup capture", ErrUnverified)
 	}
 	return CgroupScope{Path: relative, Dev: dev, Ino: ino, PID: pid, StartTime: startTime,
-		RuntimeHash: fencing.RuntimeBindingDigest(binding), ProfileID: profileID}, nil
+		RuntimeHash: fencing.RuntimeScopeBindingDigest(binding), ProfileID: profileID}, nil
 }
 
 // VerifyEmpty confirms the same cgroup inode still exists and cgroup.events

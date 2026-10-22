@@ -34,6 +34,15 @@ func RuntimeBindingDigest(runtime RuntimeBinding) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// RuntimeScopeBindingDigest binds a captured CRI scope to the enrolled runtime
+// while excluding only the digest of that scope, which would be self-referential.
+func RuntimeScopeBindingDigest(runtime RuntimeBinding) string {
+	runtime.CapturedScopeDigest = ""
+	data, _ := json.Marshal(runtime)
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
 func validateTerminalReference(run Run, reference TerminalReference) error {
 	if run.Stop == nil || *run.Stop != reference.Request || reference.Request.Identity != run.Identity {
 		return fmt.Errorf("fencing: independent terminal reference has another closed run")

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,7 @@ func enrolledRuntime(id Identity, container string) RuntimeBinding {
 		NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID,
 		NodeName: "node", NodeUID: "node-uid", MachineID: "machine", BootID: "boot",
 		RuntimeID: "containerd", SandboxID: "sandbox", ContainerID: container, ImageID: "image",
+		CapturedScopeDigest: strings.Repeat("a", 64),
 	}
 }
 
@@ -53,10 +55,38 @@ func TestRuntimeEnrollmentRequiresEveryIdentityFieldBeforeMutation(t *testing.T)
 			missing := complete
 			reflect.ValueOf(&missing).Elem().Field(field).SetString("")
 			l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true}
+			if reflect.TypeOf(complete).Field(field).Name == "CapturedScopeDigest" {
+				if err := l.RegisterEnrolled(id, missing); err != nil || len(l.Runs) != 1 {
+					t.Fatalf("legacy binding without optional captured scope digest was rejected: error=%v runs=%d", err, len(l.Runs))
+				}
+				return
+			}
 			if err := l.RegisterEnrolled(id, missing); err == nil || len(l.Runs) != 0 {
 				t.Fatalf("incomplete runtime was registered: error=%v runs=%d", err, len(l.Runs))
 			}
 		})
+	}
+}
+
+func TestCapturedScopeDigestIsValidatedAndExcludedOnlyFromScopeBindingDigest(t *testing.T) {
+	id := testIdentity()
+	runtime := enrolledRuntime(id, "container")
+	changed := runtime
+	changed.CapturedScopeDigest = strings.Repeat("b", 64)
+	if RuntimeScopeBindingDigest(runtime) != RuntimeScopeBindingDigest(changed) {
+		t.Fatal("scope-binding digest depends on the self-referential captured scope digest")
+	}
+	if RuntimeBindingDigest(runtime) == RuntimeBindingDigest(changed) {
+		t.Fatal("full runtime binding digest omitted the captured scope digest")
+	}
+	changed.CapturedScopeDigest = "not-a-digest"
+	if err := changed.Validate(id); err == nil {
+		t.Fatal("malformed captured scope digest was accepted")
+	}
+	legacy := runtime
+	legacy.CapturedScopeDigest = ""
+	if err := legacy.Validate(id); err != nil {
+		t.Fatalf("legacy runtime binding without a digest was rejected: %v", err)
 	}
 }
 
