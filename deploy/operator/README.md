@@ -237,6 +237,15 @@ controller service account and creates or joins the same `RhizaFence` CRD record
 HTTP 202 means the executor has not yet stored a validated proof. The CRD remains
 the only request journal.
 
+For a certified zero-tip source, recovery uses the same explicit `RhizaRecovery`
+operation and additionally requires the fencer to register a canonical empty
+target authorization. This path is distinct from a fork: it records tip zero
+and an immutable empty-HEAD receipt, then waits for a target quorum plus an
+authenticated ReadIndex and linearizable application read before completion.
+An async source requires `allowDataLoss: true`; without it, the operation stays
+blocked. The fencer Role needs only `get` on `rhizarecoveries` to verify the
+persisted operation and policy; it does not gain recovery-resource write access.
+
 After proof, the Operator provisions and promotes a learner, fences and aborts a
 lost learner before retrying a fresh identity, or restores a new generation when
 quorum is lost. The StatefulSet remains the deployment basis. The kind executor

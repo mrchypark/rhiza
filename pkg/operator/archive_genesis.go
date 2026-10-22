@@ -49,6 +49,8 @@ func (e *FencingExecutor) claimArchiveScopeForRegistration(ctx context.Context, 
 		case fencing.ArchiveGenesisRegistrationPending:
 			state.Ledger.ArchiveGenesisState = fencing.ArchiveGenesisAwaitingRef
 			state.Ledger.ArchiveScopeHash = claim.ScopeHash
+		case fencing.ArchiveGenesisEmptyRecoveryPending:
+			return fencing.ErrPending
 		case fencing.ArchiveGenesisAwaitingRef:
 			if state.Ledger.ArchiveScopeHash != claim.ScopeHash || state.Ledger.ArchiveGenesisRef != nil {
 				return fmt.Errorf("fencing: archive genesis scope claim changed")
@@ -106,6 +108,9 @@ func (e *FencingExecutor) setRootArchiveGenesisRef(ctx context.Context, uid, sou
 		}
 		if state.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisAwaitingRef {
 			return fmt.Errorf("fencing: root is not awaiting an archive genesis reference")
+		}
+		if state.Ledger.EmptyRecoveryAuthorization != nil && (ref.Mutation == nil || ref.Mutation.Intent.PayloadDigest != state.Ledger.EmptyRecoveryAuthorization.TargetEmptyHeadDigest) {
+			return fmt.Errorf("fencing: target genesis mutation differs from empty recovery authorization")
 		}
 		state.Ledger.ArchiveGenesisRef = &ref
 		state.Ledger.ArchiveGenesisState = fencing.ArchiveGenesisCommitted
@@ -185,8 +190,18 @@ func (e *FencingExecutor) validateArchiveGenesisMutationPayload(ctx context.Cont
 	if err != nil || !state.Ledger.RequireMutationJournal || state.Ledger.ArchiveScopeHash != claim.ScopeHash {
 		return errors.Join(err, fmt.Errorf("fencing: required archive genesis root binding differs"))
 	}
+	if (claim.EmptyRecoveryAuthorization == nil) != (state.Ledger.EmptyRecoveryAuthorization == nil) ||
+		(claim.EmptyRecoveryAuthorization != nil && hashJSON(claim.EmptyRecoveryAuthorization) != hashJSON(state.Ledger.EmptyRecoveryAuthorization)) {
+		return fmt.Errorf("fencing: empty recovery authorization differs between root and scope claim")
+	}
 	if claim.GenesisRef != nil || state.Ledger.ArchiveGenesisRef != nil {
 		if claim.GenesisRef == nil || state.Ledger.ArchiveGenesisRef == nil || !sameArchiveGenesisRef(claim.GenesisRef, state.Ledger.ArchiveGenesisRef) {
+			if claim.GenesisRef != nil && state.Ledger.ArchiveGenesisRef == nil && state.Ledger.ArchiveGenesisState == fencing.ArchiveGenesisAwaitingRef {
+				// The stable-scope CAS may have succeeded while its matching root
+				// CAS is still pending. Do not let another tuple proceed, but keep
+				// the exact admitted winner retryable after that partial write.
+				return errors.Join(fencing.ErrPending, errArchiveGenesisClaimed)
+			}
 			return fmt.Errorf("fencing: archive genesis claim and root reference differ")
 		}
 		if err := validateArchiveGenesisAdmission(claim.GenesisRef, producerUID, sequence, intent); err != nil {
@@ -221,6 +236,9 @@ func (e *FencingExecutor) validateArchiveGenesisMutationPayload(ctx context.Cont
 	}
 	if err := recovery.ValidateEmptyArchiveHead(data, recovery.ArchiveConfigID); err != nil {
 		return fmt.Errorf("fencing: staged archive head is not the registered empty genesis: %w", err)
+	}
+	if claim.EmptyRecoveryAuthorization != nil && authorityStateDigest(data) != claim.EmptyRecoveryAuthorization.TargetEmptyHeadDigest {
+		return fmt.Errorf("fencing: staged target genesis differs from its authorized target payload")
 	}
 	if err := e.ensureArchiveScopeHasNoGenesisEvidence(ctx, scope); err != nil {
 		return err
@@ -460,6 +478,10 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 	if !state.Ledger.RequireMutationJournal || state.Ledger.ArchiveScopeHash != scopeHash {
 		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: required archive genesis root binding differs")
 	}
+	if (claim.EmptyRecoveryAuthorization == nil) != (state.Ledger.EmptyRecoveryAuthorization == nil) ||
+		(claim.EmptyRecoveryAuthorization != nil && hashJSON(claim.EmptyRecoveryAuthorization) != hashJSON(state.Ledger.EmptyRecoveryAuthorization)) {
+		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: empty recovery authorization differs between root and scope claim")
+	}
 	if claim.GenesisRef == nil {
 		if state.Ledger.ArchiveGenesisRef != nil || state.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisAwaitingRef {
 			return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: archive genesis claim and root reference differ")
@@ -469,6 +491,13 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 			return fencing.ArchiveGenesisStatus{}, err
 		}
 		if !found {
+			if claim.EmptyRecoveryAuthorization != nil {
+				return fencing.ArchiveGenesisStatus{
+					ScopeHash: scopeHash, MutationScopeHash: mutationScopeHash, ConfigID: claim.ConfigID,
+					EmptyRecoveryAuthorization: claim.EmptyRecoveryAuthorization,
+					EmptyRecoveryState:         fencing.EmptyRecoveryAuthorized,
+				}, nil
+			}
 			if err := e.ensureArchiveScopeHasNoGenesisEvidence(ctx, scope); err != nil {
 				return fencing.ArchiveGenesisStatus{}, err
 			}
@@ -498,7 +527,11 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 	} else if !sameArchiveGenesisRef(state.Ledger.ArchiveGenesisRef, claim.GenesisRef) {
 		return fencing.ArchiveGenesisStatus{}, fmt.Errorf("fencing: root and scope genesis references differ")
 	}
-	status := fencing.ArchiveGenesisStatus{ScopeHash: scopeHash, MutationScopeHash: mutationScopeHash, ConfigID: claim.ConfigID, Ref: claim.GenesisRef}
+	status := fencing.ArchiveGenesisStatus{ScopeHash: scopeHash, MutationScopeHash: mutationScopeHash, ConfigID: claim.ConfigID, Ref: claim.GenesisRef,
+		EmptyRecoveryAuthorization: claim.EmptyRecoveryAuthorization}
+	if claim.EmptyRecoveryAuthorization != nil {
+		status.EmptyRecoveryState = fencing.EmptyRecoveryAuthorized
+	}
 	if claim.GenesisRef.Mutation != nil {
 		m := claim.GenesisRef.Mutation
 		runtime, run, err := e.archiveGenesisProducerRun(ctx, state, m.ProducerUID)
@@ -532,6 +565,9 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 			return fencing.ArchiveGenesisStatus{}, errors.Join(err, fencing.ErrPending)
 		}
 		status.Mutation = &lookup
+		if claim.EmptyRecoveryAuthorization != nil && lookup.Entry.Resolution != nil && lookup.Entry.Resolution.Outcome == fencing.MutationCommitted && lookup.Entry.Resolution.AllCopiesTerminal {
+			status.EmptyRecoveryState = fencing.EmptyRecoveryCommitted
+		}
 	}
 	return status, nil
 }

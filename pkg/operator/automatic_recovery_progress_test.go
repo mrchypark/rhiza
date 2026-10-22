@@ -169,6 +169,11 @@ func TestAutomaticRecoveryProgressEscalatesWithFullFencingInventory(t *testing.T
 func TestAutomaticRecoveryProgressReplacesCommittedFailedLearner(t *testing.T) {
 	ctx, child, api, c := membershipFixture(t)
 	child.Spec.Container = "rhiza"
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ADMIN_TOKEN", object{"value": "admin"})
 	child.Spec.Membership.OperationID = "recover"
 	child.Spec.Membership.RemovedPod = "n3"
 	api.learnerID = "learner"

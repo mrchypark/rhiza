@@ -213,6 +213,20 @@ func TestGCSMutationTerminalUploadsCompactNormalAndRecoveredCommits(t *testing.T
 		t.Fatal(err)
 	}
 	e, runtime, firstIntent, firstPayload, scope, receipts := mutationExecutionFixture(t)
+	// The local in-memory bucket does not model exact-version deletion. Keep the
+	// production capability check intact while giving this compaction test the
+	// same generation-aware deletion seam used by archive-retirement tests.
+	versioned := &archiveTestBucket{Bucket: e.AuthorityState.bucket}
+	e.AuthorityState.bucket = versioned
+	e.SourceStages, err = e.sourceStagesFor(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptEvidence, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipts.evidence = receiptEvidence
 	state, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
 	if err != nil {
 		t.Fatal(err)

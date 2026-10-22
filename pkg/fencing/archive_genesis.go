@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/thanos-io/objstore"
 )
 
 const ArchiveGenesisVersion = 1
 
 const (
-	ArchiveGenesisRegistrationPending = "registration-pending"
-	ArchiveGenesisAwaitingRef         = "awaiting-ref"
-	ArchiveGenesisCommitted           = "committed"
+	ArchiveGenesisRegistrationPending  = "registration-pending"
+	ArchiveGenesisEmptyRecoveryPending = "empty-recovery-pending"
+	ArchiveGenesisAwaitingRef          = "awaiting-ref"
+	ArchiveGenesisCommitted            = "committed"
 )
 
 type ArchiveGenesisMutation struct {
@@ -50,6 +53,55 @@ type ArchiveGenesisRef struct {
 	ScopeHash string                  `json:"scopeHash"`
 	Mutation  *ArchiveGenesisMutation `json:"mutation,omitempty"`
 	Fork      *ArchiveGenesisFork     `json:"fork,omitempty"`
+}
+
+const (
+	EmptyRecoveryAuthorized = "authorized"
+	EmptyRecoveryCommitted  = "committed"
+)
+
+// ArchiveEmptyRecoveryAuthorization is immutable evidence that a trusted
+// recovery controller authorized a fresh empty target from a terminal,
+// sealed empty source. It is deliberately separate from ArchiveGenesisRef:
+// the latter records the target's actual committed mutation receipt.
+type ArchiveEmptyRecoveryAuthorization struct {
+	Version                int                    `json:"version"`
+	StatefulSetUID         string                 `json:"statefulSetUID"`
+	TargetClusterID        string                 `json:"targetClusterID"`
+	OperationID            string                 `json:"operationID"`
+	SourceFenceOperationID string                 `json:"sourceFenceOperationID"`
+	ConfigID               uint                   `json:"configID"`
+	SourceTip              uint64                 `json:"sourceTip"`
+	SourceScopeHash        string                 `json:"sourceScopeHash"`
+	TargetScopeHash        string                 `json:"targetScopeHash"`
+	SourceGenesisRefDigest string                 `json:"sourceGenesisRefDigest"`
+	SourceHeadDigest       string                 `json:"sourceHeadDigest"`
+	SourceHeadVersion      objstore.ObjectVersion `json:"sourceHeadVersion"`
+	TargetEmptyHeadDigest  string                 `json:"targetEmptyHeadDigest"`
+	SourceRootDigest       string                 `json:"sourceRootDigest"`
+	SourceFenceDigest      string                 `json:"sourceFenceDigest"`
+	SourceMembershipHash   string                 `json:"sourceMembershipHash"`
+	SourceDurability       string                 `json:"sourceDurability"`
+	TargetMembershipHash   string                 `json:"targetMembershipHash"`
+	TargetDurability       string                 `json:"targetDurability"`
+	AllowDataLoss          bool                   `json:"allowDataLoss"`
+	PolicyDigest           string                 `json:"policyDigest"`
+}
+
+func (a ArchiveEmptyRecoveryAuthorization) Validate() error {
+	if a.Version != ArchiveGenesisVersion || a.StatefulSetUID == "" || a.TargetClusterID == "" ||
+		a.OperationID == "" || a.SourceFenceOperationID == "" || a.ConfigID == 0 || a.SourceTip != 0 ||
+		!mutationDigestValid(a.SourceScopeHash) || !mutationDigestValid(a.TargetScopeHash) || a.SourceScopeHash == a.TargetScopeHash ||
+		!mutationDigestValid(a.SourceGenesisRefDigest) || !mutationDigestValid(a.SourceHeadDigest) || !mutationDigestValid(a.TargetEmptyHeadDigest) ||
+		!mutationDigestValid(a.SourceRootDigest) || !mutationDigestValid(a.SourceFenceDigest) ||
+		!mutationDigestValid(a.SourceMembershipHash) || !mutationDigestValid(a.TargetMembershipHash) || !mutationDigestValid(a.PolicyDigest) ||
+		(a.SourceHeadVersion.Type != objstore.Generation && a.SourceHeadVersion.Type != objstore.ETag) || a.SourceHeadVersion.Value == "" ||
+		(a.SourceDurability != "async" && a.SourceDurability != "before-ack") ||
+		(a.TargetDurability != "async" && a.TargetDurability != "before-ack") ||
+		(a.SourceDurability == "async" && !a.AllowDataLoss) {
+		return fmt.Errorf("fencing: invalid empty recovery authorization")
+	}
+	return nil
 }
 
 func (r ArchiveGenesisRef) Validate() error {
@@ -130,14 +182,15 @@ func (s ArchiveScope) Hash() (string, error) {
 // immutable archive protocol identity selected by the protected profile (not
 // QuePaxa's evolving membership ConfigID). GenesisRef is written once by CAS.
 type ArchiveScopeClaim struct {
-	Version              int                `json:"version"`
-	Scope                ArchiveScope       `json:"scope"`
-	ScopeHash            string             `json:"scopeHash"`
-	ConfigID             uint               `json:"configID,omitempty"`
-	OwnerStatefulSetUID  string             `json:"ownerStatefulSetUID"`
-	OwnerSourceClusterID string             `json:"ownerSourceClusterID"`
-	RegistrationIdentity string             `json:"registrationIdentity"`
-	GenesisRef           *ArchiveGenesisRef `json:"genesisRef,omitempty"`
+	Version                    int                                `json:"version"`
+	Scope                      ArchiveScope                       `json:"scope"`
+	ScopeHash                  string                             `json:"scopeHash"`
+	ConfigID                   uint                               `json:"configID,omitempty"`
+	OwnerStatefulSetUID        string                             `json:"ownerStatefulSetUID"`
+	OwnerSourceClusterID       string                             `json:"ownerSourceClusterID"`
+	RegistrationIdentity       string                             `json:"registrationIdentity"`
+	GenesisRef                 *ArchiveGenesisRef                 `json:"genesisRef,omitempty"`
+	EmptyRecoveryAuthorization *ArchiveEmptyRecoveryAuthorization `json:"emptyRecoveryAuthorization,omitempty"`
 }
 
 type ArchiveGenesisStatusRequest struct {
@@ -151,12 +204,14 @@ type ArchiveGenesisStatusRequest struct {
 // claim is owned by this root and has no genesis reference; the caller must
 // still validate that its local archive has no current head before writing.
 type ArchiveGenesisStatus struct {
-	ScopeHash          string                `json:"scopeHash"`
-	MutationScopeHash  string                `json:"mutationScopeHash"`
-	ConfigID           uint                  `json:"configID,omitempty"`
-	CanInitializeEmpty bool                  `json:"canInitializeEmpty,omitempty"`
-	Ref                *ArchiveGenesisRef    `json:"ref,omitempty"`
-	Mutation           *MutationLookupResult `json:"mutation,omitempty"`
+	ScopeHash                  string                             `json:"scopeHash"`
+	MutationScopeHash          string                             `json:"mutationScopeHash"`
+	ConfigID                   uint                               `json:"configID,omitempty"`
+	CanInitializeEmpty         bool                               `json:"canInitializeEmpty,omitempty"`
+	Ref                        *ArchiveGenesisRef                 `json:"ref,omitempty"`
+	Mutation                   *MutationLookupResult              `json:"mutation,omitempty"`
+	EmptyRecoveryAuthorization *ArchiveEmptyRecoveryAuthorization `json:"emptyRecoveryAuthorization,omitempty"`
+	EmptyRecoveryState         string                             `json:"emptyRecoveryState,omitempty"`
 }
 
 func (s ArchiveGenesisStatus) Validate(mutationScopeHash string, expectedConfigID uint) error {
@@ -164,13 +219,42 @@ func (s ArchiveGenesisStatus) Validate(mutationScopeHash string, expectedConfigI
 		return fmt.Errorf("fencing: invalid archive genesis status")
 	}
 	if s.Ref == nil {
-		if !s.CanInitializeEmpty {
+		if s.EmptyRecoveryAuthorization != nil {
+			if err := s.EmptyRecoveryAuthorization.Validate(); err != nil || s.EmptyRecoveryAuthorization.ConfigID != s.ConfigID || s.EmptyRecoveryAuthorization.TargetScopeHash != s.ScopeHash ||
+				(s.EmptyRecoveryState != EmptyRecoveryAuthorized && s.EmptyRecoveryState != EmptyRecoveryCommitted) || s.CanInitializeEmpty {
+				return fmt.Errorf("fencing: invalid empty recovery status")
+			}
+			if s.EmptyRecoveryState == EmptyRecoveryCommitted {
+				return fmt.Errorf("fencing: empty recovery committed status has no mutation reference")
+			}
+			return nil
+		}
+		if s.EmptyRecoveryState != "" || !s.CanInitializeEmpty {
 			return fmt.Errorf("fencing: archive genesis is not authorized")
 		}
 		return nil
 	}
 	if s.Ref.ScopeHash != s.ScopeHash || s.Ref.ConfigID != s.ConfigID || s.ConfigID != expectedConfigID || s.Ref.Validate() != nil || s.CanInitializeEmpty {
 		return fmt.Errorf("fencing: archive genesis status reference differs")
+	}
+	if s.EmptyRecoveryAuthorization != nil {
+		if err := s.EmptyRecoveryAuthorization.Validate(); err != nil || s.EmptyRecoveryAuthorization.ConfigID != s.ConfigID || s.EmptyRecoveryAuthorization.TargetScopeHash != s.ScopeHash ||
+			(s.EmptyRecoveryState != EmptyRecoveryAuthorized && s.EmptyRecoveryState != EmptyRecoveryCommitted) {
+			return fmt.Errorf("fencing: invalid empty recovery status")
+		}
+		if s.Ref.Mutation == nil {
+			return fmt.Errorf("fencing: empty recovery receipt is not an empty-head mutation")
+		}
+		if s.Ref.Mutation.Intent.PayloadDigest != s.EmptyRecoveryAuthorization.TargetEmptyHeadDigest {
+			return fmt.Errorf("fencing: empty recovery target genesis differs from its authorized target payload")
+		}
+		if s.EmptyRecoveryState == EmptyRecoveryCommitted && (s.Mutation == nil || !s.Mutation.Found || s.Mutation.Entry == nil ||
+			s.Mutation.Entry.Intent != s.Ref.Mutation.Intent || s.Mutation.Entry.Resolution == nil ||
+			s.Mutation.Entry.Resolution.Outcome != MutationCommitted || !s.Mutation.Entry.Resolution.AllCopiesTerminal) {
+			return fmt.Errorf("fencing: empty recovery commit lacks exact mutation receipt")
+		}
+	} else if s.EmptyRecoveryState != "" {
+		return fmt.Errorf("fencing: empty recovery state has no authorization")
 	}
 	if s.Ref.Mutation != nil {
 		if s.Ref.Mutation.Intent.StoreScopeHash != s.MutationScopeHash || s.Mutation == nil || !s.Mutation.Found || s.Mutation.Entry == nil || s.Mutation.Entry.Intent != s.Ref.Mutation.Intent {
@@ -190,6 +274,14 @@ func (c ArchiveScopeClaim) Validate() error {
 	}
 	if c.GenesisRef != nil && (c.GenesisRef.ConfigID == 0 || c.GenesisRef.ConfigID != c.ConfigID || c.GenesisRef.ValidateForScope(c.Scope) != nil) {
 		return fmt.Errorf("fencing: archive scope claim genesis reference differs")
+	}
+	if c.EmptyRecoveryAuthorization != nil {
+		if err := c.EmptyRecoveryAuthorization.Validate(); err != nil || c.EmptyRecoveryAuthorization.ConfigID != c.ConfigID || c.EmptyRecoveryAuthorization.TargetScopeHash != c.ScopeHash {
+			return fmt.Errorf("fencing: archive scope claim empty recovery authorization differs")
+		}
+		if c.GenesisRef != nil && (c.GenesisRef.Mutation == nil || c.GenesisRef.Mutation.Intent.PayloadDigest != c.EmptyRecoveryAuthorization.TargetEmptyHeadDigest) {
+			return fmt.Errorf("fencing: empty recovery authorization differs from target genesis mutation")
+		}
 	}
 	return nil
 }

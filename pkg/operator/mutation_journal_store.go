@@ -214,7 +214,7 @@ func (e *FencingExecutor) closeMutationProducers(ctx context.Context, state fenc
 			continue
 		}
 		if run.Runtime == nil || run.Stop == nil {
-			return false, fmt.Errorf("fencing: producer cohort lacks runtime enrollment or closure")
+			return false, ErrFencePending
 		}
 		producer, err := e.reserveMutationProducer(ctx, *run.Runtime)
 		if err != nil {

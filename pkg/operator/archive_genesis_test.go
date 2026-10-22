@@ -2,11 +2,14 @@ package operator
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -14,10 +17,339 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 	"google.golang.org/api/option"
 )
+
+func TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead(t *testing.T) {
+	f := newArchiveGenesisFixture(t)
+	ctx := t.Context()
+	scope, targetScopeHash, err := f.e.archiveGenesisScope(ctx, f.runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceScopeHash, err := (fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: "root/retired-source", ClusterID: "retired-source"}).Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceScopeHash == targetScopeHash {
+		t.Fatal("test source and target scopes unexpectedly match")
+	}
+	authorization := fencing.ArchiveEmptyRecoveryAuthorization{
+		Version: fencing.ArchiveGenesisVersion, StatefulSetUID: f.runtime.StatefulSetUID,
+		TargetClusterID: f.runtime.SourceClusterID, OperationID: "recovery-op", SourceFenceOperationID: "fence-op",
+		ConfigID: recovery.ArchiveConfigID, SourceTip: 0, SourceScopeHash: sourceScopeHash, TargetScopeHash: targetScopeHash,
+		SourceGenesisRefDigest: strings.Repeat("1", 64), SourceHeadDigest: strings.Repeat("2", 64),
+		SourceHeadVersion:     objstore.ObjectVersion{Type: objstore.ETag, Value: "sealed-source-head-etag"},
+		TargetEmptyHeadDigest: f.intent.PayloadDigest, SourceRootDigest: strings.Repeat("3", 64),
+		SourceFenceDigest: strings.Repeat("4", 64), SourceMembershipHash: strings.Repeat("5", 64),
+		SourceDurability: "async", TargetMembershipHash: strings.Repeat("6", 64), TargetDurability: "async",
+		AllowDataLoss: true, PolicyDigest: strings.Repeat("7", 64),
+	}
+	if err := authorization.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.e.change(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+		ledger.ArchiveGenesisState = fencing.ArchiveGenesisEmptyRecoveryPending
+		ledger.ArchiveScopeHash = targetScopeHash
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.AuthorityState.SetArchiveScopeEmptyRecoveryAuthorization(ctx, scope, authorization); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.e.AuthorityState.SetRootEmptyRecoveryAuthorization(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID, authorization); err != nil {
+		t.Fatal(err)
+	}
+	commitArchiveGenesisFixture(t, f)
+
+	// This advances the target's valid HEAD without changing the immutable
+	// empty-genesis mutation receipt or its separate source authorization.
+	manager := recovery.NewManager(f.e.ArchiveBucket, scope.Prefix, recovery.ArchiveConfigID)
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prefixHash := sha256.Sum256([]byte("target-base-prefix"))
+	anchorHash := sha256.Sum256([]byte("target-lineage-anchor"))
+	if err := manager.InitializeFencedGeneration(ctx, 1, prefixHash, anchorHash); err != nil {
+		manager.Close()
+		t.Fatalf("advance target archive HEAD: %v", err)
+	}
+	manager.Close()
+	response, found, err := f.e.readCommittedEmptyRecovery(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID, scope, authorization)
+	if err != nil || !found || response.State != fencing.EmptyRecoveryCommitted {
+		t.Fatalf("committed retry did not recognize the evolved target HEAD: found=%v response=%+v err=%v", found, response, err)
+	}
+}
+
+func TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound(t *testing.T) {
+	e := &FencingExecutor{Kube: &Kubernetes{Namespace: "ns"}}
+	state := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{
+		SourceClusterID: "source", ClosedBy: "fence-op", ClosedHash: strings.Repeat("a", 64),
+		RequireMutationJournal: true, ArchiveGenesisState: fencing.ArchiveGenesisCommitted,
+		ArchiveScopeHash: strings.Repeat("b", 64),
+		ArchiveGenesisRef: &fencing.ArchiveGenesisRef{Version: fencing.ArchiveGenesisVersion, ConfigID: recovery.ArchiveConfigID,
+			ScopeHash: strings.Repeat("c", 64), Mutation: &fencing.ArchiveGenesisMutation{ProducerUID: "producer", Sequence: 1}},
+	}}
+	proofHash := e.ledgerHash(state)
+	if err := verifyEmptyRecoveryClosedRootBinding(e, state, proofHash); err != nil {
+		t.Fatalf("exact closed root proof was rejected: %v", err)
+	}
+	if err := verifyEmptyRecoveryClosedRootBinding(e, state, strings.Repeat("d", 64)); err == nil {
+		t.Fatal("accepted proof hash from another canonical root")
+	}
+	wrongRoot := state
+	wrongRoot.Ledger.SourceClusterID = "replacement-source"
+	if err := verifyEmptyRecoveryClosedRootBinding(e, wrongRoot, proofHash); err == nil {
+		t.Fatal("accepted old proof after source root identity changed")
+	}
+	stable := emptyRecoveryClosedRootDigest(e.Kube.Namespace, state)
+	if stable == emptyRecoveryClosedRootDigest(e.Kube.Namespace, wrongRoot) {
+		t.Fatal("stable closed-root identity omitted the source cluster")
+	}
+	// Kubernetes metadata is not part of the canonical authority root; changing
+	// unrelated object metadata cannot change the digest inputs above.
+	e.Kube.Namespace = "other-ns"
+	if stable == emptyRecoveryClosedRootDigest(e.Kube.Namespace, state) {
+		t.Fatal("closed-root identity omitted its authority namespace")
+	}
+}
+
+func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
+	f := newArchiveGenesisFixture(t)
+	e, ctx := f.e, t.Context()
+	sourceMembers := []quepaxa.Member{forkTestMember(t, "empty-source")}
+	container := list(nested(f.f.authStatefulSet, "spec", "template", "spec", "containers"))[0]
+	env := list(asObject(container)["env"])
+	env = append(env,
+		object{"name": "RHIZA_OBJSTORE_DURABILITY", "value": "async"},
+		object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(jsonBytes(sourceMembers))},
+	)
+	asObject(container)["env"] = env
+	f.f.mu.Lock()
+	f.f.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{f.f.authStatefulSet}}
+	pod := independentPod(f.id.NodeID, f.id.PodUID)
+	asObject(pod["metadata"])["ownerReferences"] = []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": f.runtime.StatefulSetUID, "controller": true}}
+	asObject(pod["status"])["containerStatuses"] = []any{object{"containerID": "containerd://container", "imageID": "sha256:image"}}
+	f.f.objects["/api/v1/namespaces/test/pods"] = object{"items": []any{pod}}
+	f.f.mu.Unlock()
+	if err := f.e.ArchiveBucket.Upload(ctx, "root/source/voters/membership.json", bytes.NewReader(jsonBytes(recovery.NewMembershipRecord("source", sourceMembers, "async"))), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	commitArchiveGenesisFixture(t, f)
+	if err := recovery.Seal(ctx, f.e.ArchiveBucket, "root/source", "source-fence"); err != nil {
+		t.Fatal(err)
+	}
+	e.CollectRuntimeEvidence = func(context.Context, fencing.RuntimeBinding, fencing.StopRequest) ([]byte, error) {
+		return []byte("verified-runtime-terminal"), nil
+	}
+	e.VerifyRuntimeEvidence = func(_ context.Context, _ fencing.RuntimeBinding, _ fencing.StopRequest, receipt []byte) error {
+		if string(receipt) != "verified-runtime-terminal" {
+			return errors.New("unexpected runtime terminal")
+		}
+		return nil
+	}
+	fenceRequest := FenceRequest{LogicalID: "empty-recovery-test", BindingUID: f.runtime.BindingUID, Namespace: "test", StatefulSet: "rhiza",
+		StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: "source", OperationID: "source-fence", Scope: ScopeGeneration}
+	fence := &fenceResource{Metadata: object{"name": "source-fence", "namespace": "test"}, Spec: fenceRequest}
+	if err := e.reconcileFence(ctx, e.controller().corePath("rhizafences", ""), fence); err != nil {
+		t.Fatalf("produce source generation proof: %v", err)
+	}
+	fenceName := "fence-" + hashJSON([]string{f.runtime.BindingUID, fenceRequest.OperationID})[:40]
+	fence.Metadata["name"] = fenceName
+	fence.Metadata["namespace"] = "test"
+	fence.Metadata["uid"] = "source-fence-uid"
+	fence.Metadata["resourceVersion"] = "1"
+	fence.Metadata["annotations"] = object{"benign": "post-close metadata"}
+	fenceData, err := json.Marshal(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fenceObject object
+	if err := json.Unmarshal(fenceData, &fenceObject); err != nil {
+		t.Fatal(err)
+	}
+	f.f.mu.Lock()
+	f.f.objects[e.controller().corePath("rhizafences", fenceName)] = fenceObject
+	f.f.mu.Unlock()
+	state, err := e.read(ctx, f.runtime.StatefulSetUID, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := ArchiveEmptyRecoveryRequest{RecoveryName: "rhiza-recovery", StatefulSetUID: f.runtime.StatefulSetUID,
+		TargetClusterID: "", OperationID: "", SourceFenceOperationID: "source-fence",
+		TargetDurability: "async", AllowDataLoss: true}
+	recoveryResource := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
+		Metadata: object{"name": request.RecoveryName, "uid": "recovery-uid", "namespace": "test"},
+		Spec:     Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: "async", RecoveryID: "source-fence", AllowDataLoss: true},
+		Status:   Status{StatefulSetUID: f.runtime.StatefulSetUID, TargetBaseKind: "empty"}}
+	request.OperationID = "recovery-uid:source-fence"
+	request.TargetClusterID = "rhiza-r-" + shortID(request.OperationID)
+	request.PolicyDigest = hashJSON(recoveryResource.Spec)
+	targetMembers := []quepaxa.Member{forkTestMember(t, "empty-target")}
+	targetMembership := recovery.NewMembershipRecord(request.TargetClusterID, targetMembers, "async")
+	targetMembershipBytes := jsonBytes(targetMembership)
+	request.TargetMembershipHash = authorityStateDigest(targetMembershipBytes)
+	targetPrefix := path.Join("root", request.TargetClusterID)
+	if err := e.ArchiveBucket.Upload(ctx, path.Join(targetPrefix, "voters/membership.json"), bytes.NewReader(targetMembershipBytes), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
+	resourceBytes, err := json.Marshal(recoveryResource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resourceObject object
+	if err := json.Unmarshal(resourceBytes, &resourceObject); err != nil {
+		t.Fatal(err)
+	}
+	f.f.mu.Lock()
+	f.f.objects[e.controller().resourcePath(request.RecoveryName)] = resourceObject
+	f.f.mu.Unlock()
+	sts, err := e.archiveForkStatefulSet(ctx, f.runtime.StatefulSetUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifiedFence, sourceVersion, sealedHead, err := e.verifyEmptyRecoverySource(ctx, request, sts, "source", "root/source", state, StoreIdentity(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": "archive", "RHIZA_OBJSTORE_PREFIX": "root",
+	}))
+	if err != nil || verifiedFence.Status.Proof == nil || sourceVersion.Value == "" || len(sealedHead) == 0 {
+		t.Fatalf("sealed source verification failed: version=%v err=%v", sourceVersion, err)
+	}
+	if err := verifyEmptyRecoveryClosedRootBinding(e, state, verifiedFence.Status.Proof.IndependentV2.LedgerHash); err != nil {
+		t.Fatalf("closed source root did not bind to proof: %v", err)
+	}
+	wrongRoot := state
+	wrongRoot.Ledger.SourceClusterID = "wrong-source"
+	if err := verifyEmptyRecoveryClosedRootBinding(e, wrongRoot, verifiedFence.Status.Proof.IndependentV2.LedgerHash); err == nil {
+		t.Fatal("accepted a source proof against another canonical root")
+	}
+	registered, err := e.RegisterArchiveEmptyRecovery(ctx, request)
+	if err != nil || registered.State != fencing.EmptyRecoveryAuthorized {
+		t.Fatalf("register verified empty source recovery: response=%+v err=%v", registered, err)
+	}
+	// ResourceVersion and annotations may change after source closure. The
+	// committed controller retry must join the immutable auth/root/claim rather
+	// than hashing mutable Kubernetes metadata into the proof identity.
+	fence.Metadata["resourceVersion"] = "2"
+	fence.Metadata["annotations"] = object{"benign": "updated after close"}
+	fenceData, err = json.Marshal(fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(fenceData, &fenceObject); err != nil {
+		t.Fatal(err)
+	}
+	f.f.mu.Lock()
+	f.f.objects[e.controller().corePath("rhizafences", fenceName)] = fenceObject
+	f.f.mu.Unlock()
+	retry, err := e.RegisterArchiveEmptyRecovery(ctx, request)
+	if err != nil || retry.State != fencing.EmptyRecoveryAuthorized || retry.Authorization != registered.Authorization {
+		t.Fatalf("metadata-only source fence update changed authorization: response=%+v err=%v", retry, err)
+	}
+
+	// Simulate the externally managed StatefulSet moving to the target profile
+	// before its first protected mutation. The registrar retry below must use
+	// the persisted source authorization, not mistake this live target for the
+	// retired source.
+	currentSTSEnv := list(nested(f.f.authStatefulSet, "spec", "template", "spec", "containers"))[0]
+	currentEnv := replaceEnv(list(asObject(currentSTSEnv)["env"]), "RHIZA_CLUSTER_ID", object{"value": request.TargetClusterID})
+	currentEnv = replaceEnv(currentEnv, "RHIZA_CLUSTER_MEMBERS", object{"value": string(jsonBytes(targetMembers))})
+	asObject(currentSTSEnv)["env"] = currentEnv
+	authPodContainer := list(nested(f.f.authPod, "spec", "containers"))[0]
+	asObject(authPodContainer)["env"] = currentEnv
+	f.f.mu.Lock()
+	f.f.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{f.f.authStatefulSet}}
+	f.f.mu.Unlock()
+
+	// Join the target root with a distinct producer, stage the same canonical
+	// empty HEAD, and drive the ordinary mutation path to a terminal receipt.
+	targetRuntime := f.runtime
+	targetRuntime.SourceClusterID = request.TargetClusterID
+	targetID := f.id
+	targetID.SourceClusterID = request.TargetClusterID
+	targetID.WALIdentity = ""
+	if _, err := e.change(ctx, targetRuntime.StatefulSetUID, targetRuntime.SourceClusterID, func(ledger *fencing.Ledger) error {
+		return ledger.RegisterEnrolled(targetID, targetRuntime)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.reserveMutationProducer(ctx, targetRuntime); err != nil {
+		t.Fatal(err)
+	}
+	targetStages, err := e.sourceStagesFor(ctx, targetRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetStoreScope, err := e.sourceMutationStorageScope(ctx, targetRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetStoreScopeHash := hashJSON(targetStoreScope)
+	targetID.WALIdentity = "wal-empty-target"
+	if _, err := e.change(ctx, targetRuntime.StatefulSetUID, targetRuntime.SourceClusterID, func(ledger *fencing.Ledger) error {
+		if err := ledger.BindMutationScope(targetID, targetStoreScopeHash, fencing.MutationExecutionProfile); err != nil {
+			return err
+		}
+		if err := ledger.BindMutationStage(targetID, targetStages.incarnation); err != nil {
+			return err
+		}
+		return ledger.Bind(targetID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	targetRun, err := e.enrolledMutationRun(ctx, targetRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.changeMutationProducer(ctx, targetRuntime, func(producer *fencing.MutationProducer) error { return producer.Activate(targetID) }); err != nil {
+		t.Fatal(err)
+	}
+	targetPayload, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetDraft := stageStoreIntent()
+	targetDraft.StoreScopeHash = targetStoreScopeHash
+	targetDraft.Key = "archive/head.bin"
+	ticket := strings.Repeat("8", 64)
+	if err := targetStages.Reserve(targetRun.MutationProducerUID, ticket, targetDraft); err != nil {
+		t.Fatal(err)
+	}
+	targetSealed, err := targetStages.Seal(targetRun.MutationProducerUID, ticket, hashBytes(targetPayload), int64(len(targetPayload)), bytes.NewReader(targetPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetIntent := targetDraft
+	targetIntent.OperationID = fencing.MutationRequestID(targetRun.MutationProducerUID, 1)
+	targetIntent.PayloadRef, targetIntent.PayloadDigest, targetIntent.PayloadSize = targetSealed.Ref, targetSealed.Digest, targetSealed.Size
+	commitArchiveGenesisMutation(t, e, targetID, targetRuntime, targetRun.MutationProducerUID, targetIntent, targetPayload, targetStoreScope)
+
+	// Registration now resolves the persisted authorization and committed
+	// receipt without treating the successor as the retired source or requiring
+	// its former target HEAD bytes after the current HEAD has evolved.
+	committed, err := e.RegisterArchiveEmptyRecovery(ctx, request)
+	if err != nil || committed.State != fencing.EmptyRecoveryCommitted {
+		t.Fatalf("requery committed empty genesis after target activation: response=%+v err=%v", committed, err)
+	}
+	manager := recovery.NewManager(e.ArchiveBucket, targetStoreScope.Prefix, recovery.ArchiveConfigID)
+	if err := manager.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prefixHash := sha256.Sum256([]byte("successor-prefix"))
+	anchorHash := sha256.Sum256([]byte("successor-anchor"))
+	if err := manager.InitializeFencedGeneration(ctx, 1, prefixHash, anchorHash); err != nil {
+		manager.Close()
+		t.Fatal(err)
+	}
+	manager.Close()
+	committed, err = e.RegisterArchiveEmptyRecovery(ctx, request)
+	if err != nil || committed.State != fencing.EmptyRecoveryCommitted {
+		t.Fatalf("requery committed authorization after evolved target HEAD: response=%+v err=%v", committed, err)
+	}
+}
 
 func TestArchiveGenesisAdmissionOnlyAllowsExactCommittedTuple(t *testing.T) {
 	intent := fencing.MutationIntent{
@@ -183,8 +515,13 @@ func commitArchiveGenesisFixture(t *testing.T, f archiveGenesisFixture) {
 			return
 		}
 		body, err := io.ReadAll(r.Body)
-		if err != nil || !bytes.Contains(body, f.payload) {
+		if err != nil || !bytes.Equal(body, f.payload) {
 			t.Errorf("bootstrap did not upload the staged empty HEAD bytes: %v", err)
+		}
+		if err := f.e.ArchiveBucket.Upload(r.Context(), path.Join(f.storeScope.Prefix, "archive/head.bin"), bytes.NewReader(body), objstore.WithIfNotExists()); err != nil {
+			t.Errorf("mirror target HEAD into archive verification bucket: %v", err)
+			http.Error(w, "archive mirror failed", http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -203,6 +540,54 @@ func commitArchiveGenesisFixture(t *testing.T, f archiveGenesisFixture) {
 	root, err := f.e.read(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
 	if err != nil || root.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted || root.Ledger.ArchiveGenesisRef == nil {
 		t.Fatalf("fixture archive genesis did not become committed: %+v err=%v", root.Ledger, err)
+	}
+}
+
+func commitArchiveGenesisMutation(t *testing.T, e *FencingExecutor, id fencing.Identity, runtime fencing.RuntimeBinding, producer string, intent fencing.MutationIntent, payload []byte, scope AttestationStoreScope) {
+	t.Helper()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Query().Get("ifGenerationMatch") != "0" || r.URL.Query().Get("name") != path.Join(scope.Prefix, intent.Key) {
+			t.Errorf("unexpected staged genesis request: %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Equal(body, payload) {
+			t.Errorf("genesis upload bytes differ from staged payload: %v", err)
+			http.Error(w, "payload differs", http.StatusBadRequest)
+			return
+		}
+		if err := e.ArchiveBucket.Upload(r.Context(), path.Join(scope.Prefix, intent.Key), bytes.NewReader(body), objstore.WithIfNotExists()); err != nil {
+			t.Errorf("mirror target HEAD into archive verification bucket: %v", err)
+			http.Error(w, "archive mirror failed", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kind": "storage#object", "bucket": scope.Bucket, "name": path.Join(scope.Prefix, intent.Key),
+			"generation": "22", "metageneration": "1", "size": strconv.Itoa(len(payload)),
+			"metadata": map[string]string{"rhiza-operation-id": intent.OperationID, "rhiza-payload-sha256": intent.PayloadDigest},
+		})
+	}))
+	t.Cleanup(server.Close)
+	storageClient, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL+"/storage/v1/"), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storageClient.Close() })
+	e.SourceMutationStorage = storageClient
+	if err := e.executeSourceMutationRequest(t.Context(), "Bearer test", id, sourceMutationRequest{
+		ProducerUID: producer, Sequence: 1, Intent: intent,
+	}, true); err != nil {
+		t.Fatalf("commit staged empty archive genesis: %v", err)
+	}
+	root, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil || root.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted || root.Ledger.ArchiveGenesisRef == nil {
+		t.Fatalf("target archive genesis did not become committed: %+v err=%v", root.Ledger, err)
 	}
 }
 
