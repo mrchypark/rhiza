@@ -401,7 +401,7 @@ func testArchivedStageRetirementRecovery(t *testing.T, failure string) {
 	}
 	e.AuthorityState.bucket = wrapped
 	if err := e.ReconcileArchivedStages(t.Context(), runtime); err == nil {
-		t.Fatal("transient payload deletion failure was hidden")
+		t.Fatalf("transient %s failure was retried or hidden", failure)
 	}
 	producer = readFixtureProducer(t, e, nil, runtime)
 	if producer.RetiredStageThrough != 0 || producer.CompactedThrough != 1 {

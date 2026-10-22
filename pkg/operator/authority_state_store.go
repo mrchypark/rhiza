@@ -35,13 +35,17 @@ type AuthorityStateStore struct {
 type authorityStateEnvelope struct {
 	Version  int             `json:"version"`
 	Identity string          `json:"identity"`
+	Revision string          `json:"revision,omitempty"`
 	Digest   string          `json:"digest"`
 	Value    json.RawMessage `json:"value"`
 }
 
 func NewAuthorityStateStore(bucket objstore.Bucket, prefix string) (*AuthorityStateStore, error) {
-	if bucket == nil || prefix == "." || strings.HasPrefix(prefix, "/") || (prefix != "" && path.Clean(prefix) != prefix) {
+	if prefix == "." || strings.HasPrefix(prefix, "/") || (prefix != "" && path.Clean(prefix) != prefix) {
 		return nil, fmt.Errorf("fencing: canonical authority object store and clean prefix are required")
+	}
+	if err := validateAuthorityCASBucket(bucket); err != nil {
+		return nil, err
 	}
 	return &AuthorityStateStore{bucket: bucket, prefix: prefix}, nil
 }
@@ -116,38 +120,43 @@ func (s *AuthorityStateStore) ensureRootGenesis(ctx context.Context, identity st
 }
 
 func (s *AuthorityStateStore) read(ctx context.Context, key, identity string) (json.RawMessage, *objstore.ObjectVersion, error) {
+	value, version, _, err := s.readVersioned(ctx, key, identity)
+	return value, version, err
+}
+
+func (s *AuthorityStateStore) readVersioned(ctx context.Context, key, identity string) (json.RawMessage, *objstore.ObjectVersion, string, error) {
 	for attempt := 0; attempt < 4; attempt++ {
 		before, err := s.bucket.Attributes(ctx, key)
 		if err != nil {
 			if s.bucket.IsObjNotFoundErr(err) {
-				return nil, nil, errAuthorityStateNotFound
+				return nil, nil, "", errAuthorityStateNotFound
 			}
-			return nil, nil, err
+			return nil, nil, "", err
 		}
-		if before.Version == nil || before.Version.Type != objstore.Generation || before.Version.Value == "" {
-			return nil, nil, fmt.Errorf("fencing: authority state requires a generation-versioned object store")
+		if !validAuthorityObjectVersion(before.Version) {
+			return nil, nil, "", fmt.Errorf("fencing: authority state requires an exact generation or ETag version")
 		}
 		reader, err := s.bucket.Get(ctx, key)
 		if err != nil {
 			if s.bucket.IsObjNotFoundErr(err) {
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		data, readErr := io.ReadAll(io.LimitReader(reader, maxAuthorityStateBytes+1))
 		closeErr := reader.Close()
 		if err := errors.Join(readErr, closeErr); err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		if len(data) > maxAuthorityStateBytes {
-			return nil, nil, fmt.Errorf("fencing: canonical authority state exceeds capacity")
+			return nil, nil, "", fmt.Errorf("fencing: canonical authority state exceeds capacity")
 		}
 		after, err := s.bucket.Attributes(ctx, key)
 		if err != nil {
 			if s.bucket.IsObjNotFoundErr(err) {
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		if after.Version == nil || *after.Version != *before.Version {
 			continue
@@ -156,17 +165,21 @@ func (s *AuthorityStateStore) read(ctx context.Context, key, identity string) (j
 		decoder := json.NewDecoder(bytes.NewReader(data))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&envelope); err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		if err := decoder.Decode(new(any)); err != io.EOF {
-			return nil, nil, fmt.Errorf("fencing: trailing canonical authority state")
+			return nil, nil, "", fmt.Errorf("fencing: trailing canonical authority state")
 		}
-		if envelope.Version != 1 || envelope.Identity != identity || envelope.Digest != authorityStateDigest(envelope.Value) || len(envelope.Value) == 0 {
-			return nil, nil, fmt.Errorf("fencing: canonical authority state identity or digest differs")
+		digestValid := envelope.Digest == authorityStateDigest(envelope.Value)
+		if envelope.Revision != "" {
+			digestValid = validAuthorityRevision(envelope.Revision) && envelope.Digest == authorityStateEnvelopeDigest(envelope.Value, envelope.Revision)
 		}
-		return envelope.Value, before.Version, nil
+		if envelope.Version != 1 || envelope.Identity != identity || !digestValid || len(envelope.Value) == 0 || (before.Version.Type == objstore.ETag && envelope.Revision == "") {
+			return nil, nil, "", fmt.Errorf("fencing: canonical authority state identity or digest differs")
+		}
+		return envelope.Value, before.Version, envelope.Revision, nil
 	}
-	return nil, nil, fmt.Errorf("fencing: canonical authority state changed during read")
+	return nil, nil, "", fmt.Errorf("fencing: canonical authority state changed during read")
 }
 
 func (s *AuthorityStateStore) write(ctx context.Context, key, identity string, value any, expected *objstore.ObjectVersion) error {
@@ -177,8 +190,12 @@ func (s *AuthorityStateStore) write(ctx context.Context, key, identity string, v
 	if len(encoded) > maxAuthorityStateBytes-1024 {
 		return fmt.Errorf("fencing: canonical authority state exceeds capacity")
 	}
-	digest := authorityStateDigest(encoded)
-	body, err := json.Marshal(authorityStateEnvelope{Version: 1, Identity: identity, Digest: digest, Value: encoded})
+	revision, err := newAuthorityRevision()
+	if err != nil {
+		return err
+	}
+	digest := authorityStateEnvelopeDigest(encoded, revision)
+	body, err := json.Marshal(authorityStateEnvelope{Version: 1, Identity: identity, Revision: revision, Digest: digest, Value: encoded})
 	if err != nil {
 		return err
 	}
@@ -188,8 +205,15 @@ func (s *AuthorityStateStore) write(ctx context.Context, key, identity string, v
 	if expected == nil {
 		err = s.bucket.Upload(ctx, key, bytes.NewReader(body), objstore.WithIfNotExists())
 	} else {
-		if expected.Type != objstore.Generation || expected.Value == "" {
-			return fmt.Errorf("fencing: authority state CAS requires an exact generation")
+		if !validAuthorityObjectVersion(expected) {
+			return fmt.Errorf("fencing: authority state CAS requires an exact generation or ETag version")
+		}
+		_, currentVersion, readErr := s.read(ctx, key, identity)
+		if readErr != nil {
+			return readErr
+		}
+		if currentVersion.Type != expected.Type {
+			return fmt.Errorf("fencing: authority state CAS version type differs from current object")
 		}
 		version := *expected
 		err = s.bucket.Upload(ctx, key, bytes.NewReader(body), objstore.WithIfMatch(&version))
@@ -197,12 +221,23 @@ func (s *AuthorityStateStore) write(ctx context.Context, key, identity string, v
 	if err != nil && s.bucket.IsConditionNotMetErr(err) {
 		return errAuthorityStateConflict
 	}
+	if err != nil && expected != nil {
+		stored, readVersion, storedRevision, readErr := s.readVersioned(ctx, key, identity)
+		if readErr == nil && validAuthorityObjectVersion(readVersion) && readVersion.Type == expected.Type && storedRevision == revision && bytes.Equal(stored, encoded) {
+			return nil
+		}
+		return errors.Join(err, readErr)
+	}
 	return err
 }
 
 func authorityStateDigest(value []byte) string {
 	digest := sha256.Sum256(value)
 	return hex.EncodeToString(digest[:])
+}
+
+func authorityStateEnvelopeDigest(value []byte, revision string) string {
+	return hashJSON([]string{"rhiza-authority-state-envelope-v1", revision, authorityStateDigest(value)})
 }
 
 func (s *AuthorityStateStore) ReadRoot(ctx context.Context, uid, source string) (fenceLedger, *objstore.ObjectVersion, error) {

@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/thanos-io/objstore"
@@ -91,10 +92,10 @@ func learnerTargetCovered(target FenceTarget, targets []FenceTarget) bool {
 	return false
 }
 
-// compactLearnerHistory retries every retained incarnation on each reconcile.
+// compactLearnerHistory re-queries trusted fencing status for every eligible incarnation.
 // An in-flight intent only protects its own targets, active voters, and current
 // learner; unrelated entries remain eligible for ledger-backed compaction.
-func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoControl) (bool, error) {
+func (c *Controller) compactLearnerHistory(ctx context.Context, r *ClusterResource, state *autoControl) (bool, error) {
 	if err := validateLearnerHistory(state.Learners); err != nil {
 		return false, err
 	}
@@ -124,13 +125,17 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 			retained = append(retained, entry)
 			continue
 		}
-		proven := false
-		if entry.Retirement != nil && learnerTargetCovered(entry.Target, entry.Retirement.Request.Targets) && validateFenceProof(entry.Retirement.Request, &entry.Retirement.Proof) == nil {
-			proven = true
-		}
-		if !proven && c.verifyTerminatedCleanup(ctx, state.StatefulSetUID, entry) != nil {
+		request := learnerRetirementRequest(c, r, state, entry)
+		proof, err := c.fence(ctx, request)
+		if errors.Is(err, ErrFencePending) {
 			retained = append(retained, entry)
 			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("query canonical learner retirement for %q: %w", entry.Target.PodUID, err)
+		}
+		if err := proofCoversLearner(request, proof, entry.Target); err != nil {
+			return false, err
 		}
 		if !c.retireLearnerCredential(ctx, entry) {
 			retained = append(retained, entry)
@@ -140,7 +145,7 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, state *autoContr
 	changed := len(retained) != len(state.Learners)
 	state.Learners = retained
 	if len(state.Learners) > maxLearnerHistory {
-		return changed, fmt.Errorf("learner history has %d entries and cannot be compacted; restore the fencing ledger for the affected generations or remove verified completed generation learners", len(state.Learners))
+		return changed, fmt.Errorf("learner history has %d entries and cannot be compacted; restore canonical fencing evidence for the affected generations or remove verified completed generation learners", len(state.Learners))
 	}
 	return changed, nil
 }
@@ -178,36 +183,44 @@ func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerI
 	return true
 }
 
-func (c *Controller) verifyTerminatedCleanup(ctx context.Context, stsUID string, entry learnerIncarnation) error {
-	ledger, err := (&FencingExecutor{Kube: c.Kube}).read(ctx, stsUID, entry.SourceClusterID)
-	if err != nil {
-		return err
+func learnerRetirementRequest(c *Controller, r *ClusterResource, state *autoControl, entry learnerIncarnation) FenceRequest {
+	if entry.Retirement != nil {
+		return entry.Retirement.Request
 	}
-	found := false
-	for _, run := range ledger.Ledger.Runs {
-		if run.Identity.PodUID != entry.Target.PodUID {
-			continue
-		}
-		found = true
-		if run.Identity.NodeID != entry.Target.NodeID || run.Identity.SourceClusterID != entry.SourceClusterID || run.Stop == nil {
-			return fmt.Errorf("learner run identity differs")
-		}
-		if entry.Target.WALIdentity == "" {
-			if run.Identity.WALIdentity != "" || run.NeverBoundExit == nil || *run.NeverBoundExit != *run.Stop {
-				return fmt.Errorf("learner never-bound exit is not proven")
-			}
-		} else if run.Identity.WALIdentity != entry.Target.WALIdentity || !run.Exited || run.Drain == nil || run.Drain.Request != *run.Stop || !run.Drain.Clean() {
-			return fmt.Errorf("learner termination proof is incomplete")
+	request := FenceRequest{
+		LogicalID:       str(r.Spec.LogicalID),
+		BindingUID:      state.BindingUID,
+		Namespace:       c.Kube.Namespace,
+		StatefulSet:     r.Spec.StatefulSet,
+		StatefulSetUID:  state.StatefulSetUID,
+		SourceClusterID: entry.SourceClusterID,
+		Scope:           ScopeVoter,
+		Targets:         []FenceTarget{entry.Target},
+	}
+	request.OperationID = "learner-retire-" + hashJSON([]any{state.BindingUID, state.StatefulSetUID, entry.SourceClusterID, entry.OperationID, entry.Target})[:32]
+	return request
+}
+
+func proofCoversLearner(request FenceRequest, proof *FenceProof, target FenceTarget) error {
+	if proof == nil || !learnerTargetCovered(target, request.Targets) {
+		return fmt.Errorf("learner retirement proof omits the captured target")
+	}
+	if proof.IndependentV2 == nil {
+		// The configured Fencer is the trusted status API for the cooperative
+		// backend; its validated proof represents its complete ledger check.
+		return nil
+	}
+	for _, ref := range proof.IndependentV2.Terminals {
+		id := ref.Request.Identity
+		if id.SourceClusterID == request.SourceClusterID && id.NodeID == target.NodeID && id.PodUID == target.PodUID && id.WALIdentity == target.WALIdentity {
+			return nil
 		}
 	}
-	if !found {
-		return fmt.Errorf("learner run is absent from the fencing ledger")
-	}
-	return nil
+	return fmt.Errorf("canonical learner retirement proof omits the exact captured run")
 }
 
 func (c *Controller) prepareLearnerProvisioning(ctx context.Context, r *ClusterResource, state *autoControl, version *objstore.ObjectVersion) (bool, error) {
-	changed, err := c.compactLearnerHistory(ctx, state)
+	changed, err := c.compactLearnerHistory(ctx, r, state)
 	if err != nil {
 		return true, c.autoStatus(ctx, r, state, "Blocked", err.Error())
 	}
@@ -227,7 +240,7 @@ func (c *Controller) prepareLearnerProvisioning(ctx context.Context, r *ClusterR
 		return true, c.autoStatus(ctx, r, state, "Blocked", "online learner replacement cannot reserve its fallback generation fence: "+err.Error()+"; use whole-generation recovery instead")
 	}
 	if len(state.Learners) >= maxLearnerHistory {
-		return true, c.autoStatus(ctx, r, state, "Blocked", fmt.Sprintf("learner history is full (%d) and no ledger proof can compact it; restore the fencing ledger or remove verified completed-generation learners", maxLearnerHistory))
+		return true, c.autoStatus(ctx, r, state, "Blocked", fmt.Sprintf("learner history is full (%d) and canonical fencing status cannot compact it; restore canonical fencing evidence or remove verified completed-generation learners", maxLearnerHistory))
 	}
 	return false, nil
 }
@@ -268,7 +281,7 @@ func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoContr
 		if err := validateSupervisedPod(pod); err != nil {
 			return entry, err
 		}
-		if err := (&FencingExecutor{Kube: c.Kube}).validateLearnerBinding(ctx, pod, str(nested(sts, "metadata", "name"))); err != nil {
+		if err := (&FencingExecutor{Kube: c.Kube, LegacyCooperativeControlState: true}).validateLearnerBinding(ctx, pod, str(nested(sts, "metadata", "name"))); err != nil {
 			return entry, err
 		}
 	}
@@ -325,29 +338,24 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 }
 
 func (c *Controller) verifyNeverBoundCleanup(ctx context.Context, request FenceRequest, proof *FenceProof, target FenceTarget) error {
-	state, err := (&FencingExecutor{Kube: c.Kube}).read(ctx, request.StatefulSetUID, request.SourceClusterID)
+	verified, err := c.fence(ctx, request)
 	if err != nil {
 		return err
 	}
-	hash, err := requestHash(&request)
-	if err != nil {
-		return err
+	if proof == nil || verified.ProofID != proof.ProofID {
+		return fmt.Errorf("never-bound cleanup proof differs from canonical fencing status")
 	}
-	if proof.ProofID != "cooperative-"+hashJSON(state) || !state.Ledger.CompleteNodes(request.OperationID, hash, nil, []string{target.PodUID}) {
-		return fmt.Errorf("never-bound cleanup lacks exact complete ledger proof")
-	}
-	found := false
-	for _, run := range state.Ledger.Runs {
-		if run.Identity.PodUID != target.PodUID {
-			continue
+	if verified.IndependentV2 != nil {
+		for _, ref := range verified.IndependentV2.Terminals {
+			id := ref.Request.Identity
+			if id.SourceClusterID == request.SourceClusterID && id.NodeID == target.NodeID && id.PodUID == target.PodUID && id.WALIdentity == "" {
+				return nil
+			}
 		}
-		if run.Identity.NodeID != target.NodeID || run.Identity.SourceClusterID != request.SourceClusterID || run.Identity.WALIdentity != "" || run.NeverBoundExit == nil {
-			return fmt.Errorf("learner was bound or has unknown startup history")
-		}
-		found = true
+		return fmt.Errorf("never-bound cleanup lacks an exact canonical never-bound terminal")
 	}
-	if !found {
-		return fmt.Errorf("never-bound learner is absent from ledger")
+	if !learnerTargetCovered(target, request.Targets) {
+		return fmt.Errorf("never-bound cleanup target is outside the canonical request")
 	}
 	return nil
 }

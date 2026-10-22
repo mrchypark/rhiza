@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 )
 
 func TestServeRejectsLegacyAttestorBeforeOpeningCredentialsOrListener(t *testing.T) {
@@ -27,12 +29,12 @@ func TestSourceWriterConfigValidationIsPureAndFailClosed(t *testing.T) {
 	}{
 		{
 			name: "independent profile accepts explicit ADC with remote stores",
-			config: sourceWriterConfig{Independent: true, HasCanonicalGCSState: true,
+			config: sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS,
 				RuntimeAgentCA: "/runtime-agent-ca", UseADC: true},
 		},
 		{
 			name: "independent profile preserves credential file mode",
-			config: sourceWriterConfig{Independent: true, HasCanonicalGCSState: true,
+			config: sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS,
 				RuntimeAgentCA: "/runtime-agent-ca", CredentialsFile: "/writer/credentials.json"},
 		},
 		{
@@ -41,39 +43,39 @@ func TestSourceWriterConfigValidationIsPureAndFailClosed(t *testing.T) {
 		},
 		{
 			name:    "ADC is not an implicit cooperative mode",
-			config:  sourceWriterConfig{HasCanonicalGCSState: true, UseADC: true},
+			config:  sourceWriterConfig{HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS, UseADC: true},
 			wantErr: "require the independent mutation profile",
 		},
 		{
 			name: "ADC and credentials file conflict",
-			config: sourceWriterConfig{Independent: true, HasCanonicalGCSState: true,
+			config: sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS,
 				RuntimeAgentCA: "/runtime-agent-ca", CredentialsFile: "/writer/credentials.json", UseADC: true},
 			wantErr: "mutually exclusive",
 		},
 		{
 			name:    "independent profile requires remote canonical state",
-			config:  sourceWriterConfig{Independent: true, RuntimeAgentCA: "/runtime-agent-ca", UseADC: true},
-			wantErr: "requires RHIZA_OBJSTORE_PROVIDER=gcs and a bucket",
+			config:  sourceWriterConfig{Independent: true, SourceProvider: objectstore.ProviderGCS, RuntimeAgentCA: "/runtime-agent-ca", UseADC: true},
+			wantErr: "requires a configured remote canonical authority store",
 		},
 		{
 			name:    "independent profile requires runtime CA",
-			config:  sourceWriterConfig{Independent: true, HasCanonicalGCSState: true, UseADC: true},
+			config:  sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS, UseADC: true},
 			wantErr: "requires runtime-agent CA",
 		},
 		{
 			name:    "independent profile requires one writer credential mode",
-			config:  sourceWriterConfig{Independent: true, HasCanonicalGCSState: true, RuntimeAgentCA: "/runtime-agent-ca"},
+			config:  sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS, RuntimeAgentCA: "/runtime-agent-ca"},
 			wantErr: "exactly one separate source writer credential mode",
 		},
 		{
 			name: "independent profile rejects local stage state",
-			config: sourceWriterConfig{Independent: true, HasCanonicalGCSState: true,
+			config: sourceWriterConfig{Independent: true, HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS,
 				RuntimeAgentCA: "/runtime-agent-ca", UseADC: true, StageDir: "/stage"},
 			wantErr: "remote source staging and receipts",
 		},
 		{
 			name:    "legacy file mode still requires paired local receipts",
-			config:  sourceWriterConfig{HasCanonicalGCSState: true, CredentialsFile: "/writer/credentials.json"},
+			config:  sourceWriterConfig{HasCanonicalState: true, SourceProvider: objectstore.ProviderGCS, CredentialsFile: "/writer/credentials.json"},
 			wantErr: "both a receipt directory and separate writer credentials",
 		},
 	}
@@ -88,6 +90,55 @@ func TestSourceWriterConfigValidationIsPureAndFailClosed(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCanonicalStateSelectionIsProviderNeutralButMutationProfileIsNot(t *testing.T) {
+	for _, test := range []struct {
+		provider objectstore.Provider
+		bucket   string
+		want     bool
+	}{
+		{provider: objectstore.ProviderFilesystem, bucket: "/tmp/rhiza", want: false},
+		{provider: objectstore.ProviderS3, bucket: "rhiza", want: true},
+		{provider: objectstore.ProviderGCS, bucket: "rhiza", want: true},
+		{provider: objectstore.ProviderAzure, bucket: "rhiza", want: true},
+	} {
+		if got := hasRemoteCanonicalState(objectstore.Config{Provider: test.provider, Bucket: test.bucket}); got != test.want {
+			t.Errorf("provider %q canonical state=%t, want %t", test.provider, got, test.want)
+		}
+	}
+	for _, provider := range []objectstore.Provider{objectstore.ProviderS3, objectstore.ProviderAzure} {
+		err := validateSourceWriterConfig(sourceWriterConfig{
+			Independent: true, HasCanonicalState: true, SourceProvider: provider,
+			RuntimeAgentCA: "/runtime-agent-ca", UseADC: true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "source mutation proof profile for provider") || !strings.Contains(err.Error(), string(provider)) {
+			t.Errorf("provider %q source profile error = %v", provider, err)
+		}
+	}
+}
+
+func TestLegacyCooperativeControlStateIsExplicitlyLimitedToCooperativeOnly(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		independent bool
+		receipts    string
+		credentials string
+		useADC      bool
+		want        bool
+	}{
+		{name: "cooperative default", want: true},
+		{name: "independent profile", independent: true},
+		{name: "receipt provider configured", receipts: "/receipts"},
+		{name: "writer credential configured", credentials: "/writer.json"},
+		{name: "ADC configured", useADC: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := legacyCooperativeControlState(test.independent, test.receipts, test.credentials, test.useADC); got != test.want {
+				t.Fatalf("legacy cooperative mode=%t, want %t", got, test.want)
 			}
 		})
 	}

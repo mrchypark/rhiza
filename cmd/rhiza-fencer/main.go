@@ -96,7 +96,7 @@ func serve(ctx context.Context, args []string) error {
 	runtimeAgentToken := f.String("runtime-agent-token-file", "/var/run/secrets/rhiza-fencer/runtime-agent-token", "TokenReview-audience-bound runtime-agent credential")
 	runtimeAgentServer := f.String("runtime-agent-server-name", "runtime-agent", "TLS DNS identity on node runtime-agent certificates")
 	runtimeAgentPort := f.String("runtime-agent-port", "9445", "node runtime-agent HTTPS host port")
-	authorityStatePrefix := f.String("authority-state-prefix", os.Getenv("FENCER_AUTHORITY_STATE_PREFIX"), "canonical authority state prefix in the configured GCS bucket")
+	authorityStatePrefix := f.String("authority-state-prefix", os.Getenv("FENCER_AUTHORITY_STATE_PREFIX"), "canonical authority state prefix in the configured remote ObjectStorage bucket")
 	independentMutation := f.Bool("independent-mutation-profile", os.Getenv("FENCER_INDEPENDENT_MUTATION_PROFILE") == "true", "require canonical remote state and source-mutation providers for the independent NoPVC mutation profile")
 	if err := f.Parse(args); err != nil {
 		return err
@@ -109,7 +109,7 @@ func serve(ctx context.Context, args []string) error {
 	}
 	stateConfig := objectstore.LoadConfig()
 	if err := validateSourceWriterConfig(sourceWriterConfig{
-		Independent: *independentMutation, HasCanonicalGCSState: stateConfig.Provider == objectstore.ProviderGCS && stateConfig.Bucket != "",
+		Independent: *independentMutation, HasCanonicalState: hasRemoteCanonicalState(stateConfig), SourceProvider: stateConfig.Provider,
 		RuntimeAgentCA: *runtimeAgentCA, StageDir: *stageDir, StageIncarnation: *stageIncarnation,
 		ReceiptDir: *sourceReceiptDir, CredentialsFile: *sourceWriterCredentials, UseADC: *sourceWriterUseADC,
 	}); err != nil {
@@ -120,7 +120,7 @@ func serve(ctx context.Context, args []string) error {
 		return err
 	}
 	var authorityState *operator.AuthorityStateStore
-	if stateConfig.Provider == objectstore.ProviderGCS && stateConfig.Bucket != "" {
+	if hasRemoteCanonicalState(stateConfig) {
 		stateBucket, err := objectstore.NewBucket(stateConfig)
 		if err != nil {
 			return fmt.Errorf("configure canonical authority ObjectStorage: %w", err)
@@ -139,10 +139,13 @@ func serve(ctx context.Context, args []string) error {
 		// Static profile validation above runs before Kubernetes access. This
 		// check confirms the configured remote authority store opened correctly.
 		if authorityState == nil {
-			return fmt.Errorf("independent mutation profile requires canonical GCS authority state")
+			return fmt.Errorf("independent mutation profile requires canonical remote authority state")
 		}
 	}
-	executor := &operator.FencingExecutor{Kube: kube, AuthorityState: authorityState}
+	executor := &operator.FencingExecutor{
+		Kube: kube, AuthorityState: authorityState,
+		LegacyCooperativeControlState: legacyCooperativeControlState(*independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC),
+	}
 	if *runtimeAgentCA != "" {
 		ca, err := os.ReadFile(*runtimeAgentCA)
 		if err != nil {
@@ -214,14 +217,23 @@ func serve(ctx context.Context, args []string) error {
 }
 
 type sourceWriterConfig struct {
-	Independent          bool
-	HasCanonicalGCSState bool
-	RuntimeAgentCA       string
-	StageDir             string
-	StageIncarnation     string
-	ReceiptDir           string
-	CredentialsFile      string
-	UseADC               bool
+	Independent       bool
+	HasCanonicalState bool
+	SourceProvider    objectstore.Provider
+	RuntimeAgentCA    string
+	StageDir          string
+	StageIncarnation  string
+	ReceiptDir        string
+	CredentialsFile   string
+	UseADC            bool
+}
+
+func hasRemoteCanonicalState(config objectstore.Config) bool {
+	return config.Provider != objectstore.ProviderFilesystem && config.Bucket != ""
+}
+
+func legacyCooperativeControlState(independent bool, receiptDir, credentialsFile string, useADC bool) bool {
+	return !independent && receiptDir == "" && credentialsFile == "" && !useADC
 }
 
 // validateSourceWriterConfig checks the selected credential/profile mode
@@ -230,12 +242,17 @@ func validateSourceWriterConfig(c sourceWriterConfig) error {
 	if c.CredentialsFile != "" && c.UseADC {
 		return fmt.Errorf("source writer credentials file and Application Default Credentials are mutually exclusive")
 	}
+	if c.Independent || c.ReceiptDir != "" || c.CredentialsFile != "" || c.UseADC {
+		if c.SourceProvider != objectstore.ProviderGCS {
+			return fmt.Errorf("source mutation proof profile for provider %q not implemented", c.SourceProvider)
+		}
+	}
 	if c.UseADC && !c.Independent {
 		return fmt.Errorf("source writer Application Default Credentials require the independent mutation profile")
 	}
 	if c.Independent {
-		if !c.HasCanonicalGCSState {
-			return fmt.Errorf("independent mutation profile requires RHIZA_OBJSTORE_PROVIDER=gcs and a bucket; cooperative-only mode may use legacy control state but is not NoPVC-qualified")
+		if !c.HasCanonicalState {
+			return fmt.Errorf("independent mutation profile requires a configured remote canonical authority store; cooperative-only mode may use legacy control state but is not NoPVC-qualified")
 		}
 		if c.RuntimeAgentCA == "" || (c.CredentialsFile == "" && !c.UseADC) || c.StageDir != "" || c.StageIncarnation != "" || c.ReceiptDir != "" {
 			return fmt.Errorf("independent mutation profile requires runtime-agent CA, exactly one separate source writer credential mode, and remote source staging and receipts (no local stage or receipt directory)")
@@ -245,8 +262,8 @@ func validateSourceWriterConfig(c sourceWriterConfig) error {
 	if (c.ReceiptDir == "") != (c.CredentialsFile == "") {
 		return fmt.Errorf("source mutation execution requires both a receipt directory and separate writer credentials")
 	}
-	if (c.ReceiptDir != "" || c.CredentialsFile != "") && !c.HasCanonicalGCSState {
-		return fmt.Errorf("source mutation execution requires canonical GCS authority state; configure the independent mutation profile or disable source-mutation providers")
+	if (c.ReceiptDir != "" || c.CredentialsFile != "") && !c.HasCanonicalState {
+		return fmt.Errorf("source mutation execution requires canonical remote authority state; configure the independent mutation profile or disable source-mutation providers")
 	}
 	return nil
 }

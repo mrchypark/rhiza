@@ -14,7 +14,7 @@ import (
 )
 
 // evidenceObjects is the small consistent-object-store surface used by
-// authority evidence. Mutable values require generation CAS; attachments are
+// authority evidence. Mutable values require exact-version CAS; attachments are
 // immutable create-only objects.
 type evidenceObjects interface {
 	create(context.Context, string, io.Reader, int64) (*objstore.ObjectVersion, error)
@@ -24,7 +24,7 @@ type evidenceObjects interface {
 }
 
 // AuthorityEvidenceStore provides immutable attachments and mutable
-// generation-CAS records under the same configured object-store prefix/root
+// version-CAS records under the same configured object-store prefix/root
 // identity used by AuthorityStateStore.
 type AuthorityEvidenceStore struct {
 	objects  evidenceObjects
@@ -33,8 +33,11 @@ type AuthorityEvidenceStore struct {
 }
 
 func NewAuthorityEvidenceStore(bucket objstore.Bucket, prefix, rootUID, sourceID string) (*AuthorityEvidenceStore, error) {
-	if bucket == nil || rootUID == "" || sourceID == "" || prefix == "." || strings.HasPrefix(prefix, "/") || (prefix != "" && path.Clean(prefix) != prefix) {
+	if rootUID == "" || sourceID == "" || prefix == "." || strings.HasPrefix(prefix, "/") || (prefix != "" && path.Clean(prefix) != prefix) {
 		return nil, fmt.Errorf("fencing: authority evidence requires object store and canonical root identity")
+	}
+	if err := validateAuthorityCASBucket(bucket); err != nil {
+		return nil, err
 	}
 	identity := hashJSON([]string{"rhiza-authority-root-v1", rootUID, sourceID})
 	return newAuthorityEvidenceStore(objstoreEvidenceObjects{bucket: bucket}, prefix, identity)
@@ -112,8 +115,8 @@ func (s *AuthorityEvidenceStore) CreateImmutable(ctx context.Context, key string
 	return nil, errors.Join(err, readErr, fmt.Errorf("fencing: immutable evidence key contains different bytes"))
 }
 
-// Read returns an object reader and exact generation. The reader is owned by
-// the caller; payload consumers must verify its digest before using its bytes.
+// Read returns the exact stored object bytes and version. It never interprets
+// record framing, so immutable payloads remain byte-for-byte transparent.
 func (s *AuthorityEvidenceStore) Read(ctx context.Context, key string) (io.ReadCloser, *objstore.ObjectVersion, error) {
 	if ctx == nil {
 		return nil, nil, fmt.Errorf("fencing: evidence context is required")
@@ -125,18 +128,43 @@ func (s *AuthorityEvidenceStore) Read(ctx context.Context, key string) (io.ReadC
 	return s.objects.read(ctx, name)
 }
 
+// ReadMutable returns the logical bytes of a mutable CAS record. Unlike Read,
+// it recognizes the fixed-size CAS revision header written by CompareAndSwap.
+func (s *AuthorityEvidenceStore) ReadMutable(ctx context.Context, key string) (io.ReadCloser, *objstore.ObjectVersion, error) {
+	if ctx == nil {
+		return nil, nil, fmt.Errorf("fencing: evidence context is required")
+	}
+	name, err := s.objectKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	r, version, err := s.objects.read(ctx, name)
+	if err != nil {
+		return nil, nil, err
+	}
+	return unwrapAuthorityCASBody(r), version, nil
+}
+
 // CompareAndSwap updates one canonical record only at its exact prior version.
-// If the response is lost, the same desired bytes/generation are read back.
+// If the response is lost, the same desired bytes/version are read back.
 func (s *AuthorityEvidenceStore) CompareAndSwap(ctx context.Context, key string, expected *objstore.ObjectVersion, body []byte) (*objstore.ObjectVersion, error) {
-	if ctx == nil || expected == nil || expected.Type != objstore.Generation || expected.Value == "" || body == nil {
-		return nil, fmt.Errorf("fencing: evidence CAS requires exact generation and body")
+	if ctx == nil || !validAuthorityObjectVersion(expected) || body == nil {
+		return nil, fmt.Errorf("fencing: evidence CAS requires exact generation or ETag and body")
 	}
 	name, err := s.objectKey(key)
 	if err != nil {
 		return nil, err
 	}
-	version, err := s.objects.compareAndSwap(ctx, name, expected, body)
+	revision, err := newAuthorityRevision()
+	if err != nil {
+		return nil, err
+	}
+	casBody := wrapAuthorityCASBody(revision, body)
+	version, err := s.objects.compareAndSwap(ctx, name, expected, casBody)
 	if err == nil {
+		if !validAuthorityObjectVersion(version) || version.Type != expected.Type {
+			return nil, fmt.Errorf("fencing: authority evidence CAS returned an inconsistent object version")
+		}
 		return version, nil
 	}
 	current, gotVersion, readErr := s.objects.read(ctx, name)
@@ -144,18 +172,19 @@ func (s *AuthorityEvidenceStore) CompareAndSwap(ctx context.Context, key string,
 		return nil, errors.Join(err, readErr)
 	}
 	defer current.Close()
-	got, readErr := io.ReadAll(io.LimitReader(current, int64(len(body))+1))
-	if readErr == nil && gotVersion != nil && gotVersion.Type == objstore.Generation && gotVersion.Value != expected.Value && bytes.Equal(got, body) {
+	got, readErr := io.ReadAll(io.LimitReader(current, int64(len(casBody))+1))
+	if readErr == nil && validAuthorityObjectVersion(gotVersion) && gotVersion.Type == expected.Type && bytes.Equal(got, casBody) {
 		return gotVersion, nil
 	}
 	return nil, errors.Join(err, readErr)
 }
 
-// DeleteVersion removes only the exact generation previously observed by the
-// caller. Providers without exact-version deletion fail closed.
+// DeleteVersion removes only the exact version previously observed by the
+// caller. Providers without exact-version deletion fail closed; ETag CAS
+// support alone does not imply exact-version deletion.
 func (s *AuthorityEvidenceStore) DeleteVersion(ctx context.Context, key string, version objstore.ObjectVersion) error {
 	if ctx == nil || version.Type != objstore.Generation || version.Value == "" {
-		return fmt.Errorf("fencing: evidence deletion requires an exact generation")
+		return fmt.Errorf("fencing: evidence deletion requires an exact generation; ETag deletion is unsupported")
 	}
 	name, err := s.objectKey(key)
 	if err != nil {
@@ -195,6 +224,16 @@ func (o objstoreEvidenceObjects) read(ctx context.Context, key string) (io.ReadC
 }
 
 func (o objstoreEvidenceObjects) compareAndSwap(ctx context.Context, key string, expected *objstore.ObjectVersion, body []byte) (*objstore.ObjectVersion, error) {
+	if !validAuthorityObjectVersion(expected) {
+		return nil, fmt.Errorf("fencing: authority evidence CAS requires an exact generation or ETag version")
+	}
+	current, err := o.version(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if current.Type != expected.Type {
+		return nil, fmt.Errorf("fencing: authority evidence CAS version type differs from current object")
+	}
 	version := *expected
 	if err := o.bucket.Upload(ctx, key, bytes.NewReader(body), objstore.WithIfMatch(&version)); err != nil {
 		return nil, err
@@ -211,11 +250,51 @@ func (o objstoreEvidenceObjects) version(ctx context.Context, key string) (*objs
 	if err != nil {
 		return nil, err
 	}
-	if attrs.Version == nil || attrs.Version.Type != objstore.Generation || attrs.Version.Value == "" {
-		return nil, fmt.Errorf("fencing: authority evidence requires generation-versioned object store")
+	if !validAuthorityObjectVersion(attrs.Version) {
+		return nil, fmt.Errorf("fencing: authority evidence requires an exact generation or ETag version")
 	}
 	version := *attrs.Version
 	return &version, nil
+}
+
+const authorityCASBodyPrefix = "\x00rhiza-cas-v1 "
+const authorityCASHeaderSize = len(authorityCASBodyPrefix) + 64 + 1
+
+func wrapAuthorityCASBody(revision string, body []byte) []byte {
+	wrapped := make([]byte, 0, len(authorityCASBodyPrefix)+len(revision)+1+len(body))
+	wrapped = append(wrapped, authorityCASBodyPrefix...)
+	wrapped = append(wrapped, revision...)
+	wrapped = append(wrapped, '\n')
+	wrapped = append(wrapped, body...)
+	return wrapped
+}
+
+type authorityCASBodyReader struct {
+	reader io.Reader
+	closer io.Closer
+}
+
+func (r authorityCASBodyReader) Read(p []byte) (int, error) { return r.reader.Read(p) }
+func (r authorityCASBodyReader) Close() error               { return r.closer.Close() }
+
+// unwrapAuthorityCASBody hides the fresh revision marker from store callers.
+// It keeps the body streaming so large immutable payload reads stay bounded.
+func unwrapAuthorityCASBody(input io.ReadCloser) io.ReadCloser {
+	header := make([]byte, authorityCASHeaderSize)
+	prefixSize := len(authorityCASBodyPrefix)
+	n, err := io.ReadFull(input, header[:prefixSize])
+	if err != nil || string(header[:n]) != authorityCASBodyPrefix {
+		return authorityCASBodyReader{reader: io.MultiReader(bytes.NewReader(header[:n]), input), closer: input}
+	}
+	n, err = io.ReadFull(input, header[prefixSize:])
+	if err != nil {
+		return authorityCASBodyReader{reader: io.MultiReader(bytes.NewReader(header[:prefixSize+n]), input), closer: input}
+	}
+	revision := string(header[prefixSize : authorityCASHeaderSize-1])
+	if header[authorityCASHeaderSize-1] != '\n' || !validAuthorityRevision(revision) {
+		return authorityCASBodyReader{reader: io.MultiReader(bytes.NewReader(header), input), closer: input}
+	}
+	return authorityCASBodyReader{reader: input, closer: input}
 }
 
 func (o objstoreEvidenceObjects) isNotFound(err error) bool { return o.bucket.IsObjNotFoundErr(err) }

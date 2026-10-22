@@ -61,6 +61,20 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Compile all Go tests with local hooks (do not execute)
+        run: |
+          set -eu
+          output_dir="$RUNNER_TEMP/rhiza-compiled-tests"
+          package_list="$RUNNER_TEMP/rhiza-test-packages.txt"
+          mkdir -p "$output_dir"
+          go list -tags rhiza_local_testhooks ./... > "$package_list"
+          test -s "$package_list"
+          index=0
+          while IFS= read -r package; do
+            index=$((index + 1))
+            binary_name=$(printf '%04d.test' "$index")
+            go test -c -tags rhiza_local_testhooks -o "$output_dir/$binary_name" "$package"
+          done < "$package_list"
       - name: Check fencing runtime profile validator
         run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
       - name: Check cooperative protocol and engine regression tests

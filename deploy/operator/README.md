@@ -46,23 +46,27 @@ the bucket endpoint and credentials appropriate for the selected provider.
 Generation-specific peer credentials are distinct secrets created by the
 controller; they must not reuse the source voters' credentials.
 
-The authority remains compatible with cooperative-only deployments that do
-not configure canonical GCS state; those deployments are not the independent
-NoPVC mutation profile. Opt into that profile with
-`FENCER_INDEPENDENT_MUTATION_PROFILE=true` (or
-`--independent-mutation-profile`) only after configuring generation-CAS GCS
-authority state, the runtime-agent CA, and exactly one source-writer
-credential mode: the existing `--source-writer-credentials-file` (or
+The independent NoPVC mutation profile requires a configured remote canonical
+authority store whose constructor accepts the selected ObjectStorage
+provider's conditional create and compare-and-swap capabilities; operations
+that retire exact objects also require that provider's versioned-delete
+semantics. It also requires the runtime-agent CA and exactly one source-writer
+credential mode: the existing
+`--source-writer-credentials-file` (or
 `FENCER_SOURCE_WRITER_CREDENTIALS_FILE`), or explicit
 `--source-writer-use-adc` (or `FENCER_SOURCE_WRITER_USE_ADC=true`). These
 options are mutually exclusive; ADC mode is accepted only with the independent
-profile and has no fallback to the credential file. It uses the fencing
-authority Pod's Application Default Credentials (on GKE, configure that Pod's
-Workload Identity principal deliberately). The canonical authority state uses
-that principal when its GCS client also uses default credentials; explicit
-`RHIZA_OBJSTORE_SERVICE_ACCOUNT` credentials can select a different state
-principal. ADC mode does not itself prove separation between authority-state
-and source-object permissions. Keep the source
+profile and has no fallback to the credential file. The current source-mutation
+proof adapter is GCS-specific; selecting another provider for source mutations
+fails startup with an explicit unsupported-profile error before Google client
+setup. This does not make GCS a requirement of the general ObjectStorage
+architecture or establish support for another mutation provider. ADC mode uses
+the fencing authority Pod's Application Default Credentials for the GCS source
+writer (on GKE, configure that Pod's Workload Identity principal deliberately).
+When the authority-state provider is GCS and also uses default credentials, it
+uses that principal too; explicit `RHIZA_OBJSTORE_SERVICE_ACCOUNT` credentials
+can select a different GCS state principal. ADC mode does not itself prove
+separation between authority-state and source-object permissions. Keep the source
 application's KSA distinct and read/list-only, do not mount or inject writer
 credentials into the application Pod, and verify IAM bindings and denied
 operations with the qualification harness before making an isolation claim.

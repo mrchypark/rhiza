@@ -189,13 +189,9 @@ func (e *FencingExecutor) mutateProducer(ctx context.Context, runtime fencing.Ru
 		if errors.Is(writeErr, errAuthorityStateConflict) {
 			continue
 		}
-		stored, storedUID, _, readErr := e.AuthorityState.ReadProducer(ctx, runtime)
-		if readErr == nil && storedUID == producerUID && hashJSON(stored) == hashJSON(producer) {
-			return stored, nil
-		}
-		if readErr != nil && !errors.Is(readErr, errAuthorityStateNotFound) {
-			return producer, errors.Join(writeErr, readErr)
-		}
+		// WriteProducer confirms uncertain updates by this attempt's exact fresh
+		// revision. Do not turn matching logical producer bytes into a new grant.
+		return producer, writeErr
 	}
 	return fencing.MutationProducer{}, fencing.ErrUnavailable
 }

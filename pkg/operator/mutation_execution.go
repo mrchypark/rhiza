@@ -264,6 +264,9 @@ func (e *FencingExecutor) releaseMutationKey(ctx context.Context, scopeHash, key
 // one provider request under a durable cross-producer key lock. Only a fsynced
 // provider receipt followed by a committed journal CAS can return success.
 func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fencing.RuntimeBinding, producerUID string, sequence uint64, intent fencing.MutationIntent, scope AttestationStoreScope, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) error {
+	if e == nil || e.AuthorityState == nil {
+		return fmt.Errorf("fencing: canonical authority state is required for source mutation execution")
+	}
 	if ctx == nil || e == nil || provider == nil || receipts == nil || sequence == 0 || producerUID == "" || scope.Provider != "gcs" || hashJSON(scope) != intent.StoreScopeHash {
 		return fmt.Errorf("fencing: source mutation execution is not configured for this scope")
 	}
