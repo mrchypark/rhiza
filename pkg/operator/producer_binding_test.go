@@ -37,7 +37,7 @@ func TestProducerBindingRecoversLostRootOrActivationResponse(t *testing.T) {
 				t.Fatalf("exact canonical readback did not resolve the lost response: %+v %v", receipt, firstErr)
 			}
 			restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState}
-			receipt, err := restarted.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64))
+			receipt, err = restarted.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64))
 			if err != nil || receipt.Validate(id) != nil || receipt.Producer == nil || receipt.Producer.ProducerUID != run.MutationProducerUID {
 				t.Fatalf("lost bind did not recover same producer: %+v %v", receipt, err)
 			}

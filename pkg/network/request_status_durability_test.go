@@ -130,7 +130,7 @@ func TestRequestStatusSamplesTipAfterReceiptLookup(t *testing.T) {
 }
 
 func TestHTTPRequestStatusDoesNotReturnBeforeDurability(t *testing.T) {
-	server, write, req := committedStatusFixture(t)
+	server, write, _ := committedStatusFixture(t)
 	entered := make(chan quepaxa.Slot, 1)
 	release := make(chan struct{})
 	server.SetDurabilityBarrier(func(_ context.Context, slot quepaxa.Slot) error {
