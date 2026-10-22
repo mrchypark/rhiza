@@ -50,10 +50,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Check fencing runtime profile validator
+        run: FENCING_PROFILE_SELFTEST=1 sh e2e/fencing/run.sh
       - name: Check cooperative protocol and engine regression tests
         run: |
           go test -race ./pkg/fencing ./pkg/fencing/cri ./pkg/operator ./pkg/node ./pkg/network ./internal/objstore ./e2e/fencing -count=1 -timeout=5m
-      - name: Qualify actual cooperative executor in disposable Kubernetes
+      - name: Qualify shipped runtime agent and cooperative executor in disposable Kubernetes
         env:
           CGO_ENABLED: 0
           FENCING_E2E_OUT: cooperative-fencing-results
@@ -63,18 +65,22 @@ jobs:
           go build -o "$RUNNER_TEMP/fencing-images/rhiza" ./cmd/rhiza
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-operator" ./cmd/rhiza-operator
           go build -o "$RUNNER_TEMP/fencing-images/rhiza-fencer" ./cmd/rhiza-fencer
+          go build -o "$RUNNER_TEMP/fencing-images/rhiza-runtime-agent" ./cmd/rhiza-runtime-agent
           go build -o "$RUNNER_TEMP/fencing-e2e" ./e2e/fencing
+          cp "$RUNNER_TEMP/fencing-e2e" "$RUNNER_TEMP/fencing-images/fencing-e2e"
           docker build -f Dockerfile.fencing-test -t rhiza-fencing-host:local -t rhiza-fencing-operator:local "$RUNNER_TEMP/fencing-images"
           if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
-          printf '%s\n' rhiza-generic-fencing > cooperative-fencing-results/owned-cluster.txt
           FENCING_E2E_BIN="$RUNNER_TEMP/fencing-e2e" sh e2e/fencing/run.sh
-      - name: Collect owned runtime diagnostics
+      - name: Verify pre-cleanup runtime diagnostics on failure
         if: always()
         run: |
-          mkdir -p cooperative-fencing-results
-          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e get pods,events,configmaps,rhizafences -o yaml > cooperative-fencing-results/resources.yaml 2>&1 || true
-          kubectl --context kind-rhiza-generic-fencing -n rhiza-fencing-e2e logs -l app.kubernetes.io/name=rhiza-fencer --all-containers --prefix > cooperative-fencing-results/post-cleanup-authority.log 2>&1 || true
-          kind export logs cooperative-fencing-results/post-step-kind --name rhiza-generic-fencing || true
+          if test -f cooperative-fencing-results/actual-exit.txt && test "$(cat cooperative-fencing-results/actual-exit.txt)" != 0; then
+            test -s cooperative-fencing-results/fencer-diagnostics.json
+            test -s cooperative-fencing-results/fencer-pods.json
+            test -s cooperative-fencing-results/fencer-events.json
+            test -s cooperative-fencing-results/fencer-deployment.json
+            test -f cooperative-fencing-results/private-fencer-diagnostics/authority-current.log
+          fi
       - name: Prepare allowlisted public fencing evidence
         id: fencing_public
         if: always()
@@ -91,7 +97,9 @@ jobs:
         if: always()
         run: |
           if test -f cooperative-fencing-results/owned-cluster.txt && command -v kind >/dev/null 2>&1; then
-            kind delete cluster --name rhiza-generic-fencing
+            if kind get clusters | grep -Fx rhiza-generic-fencing; then
+              kind delete cluster --name rhiza-generic-fencing
+            fi
             if kind get clusters | grep -Fx rhiza-generic-fencing; then exit 1; fi
           fi
 

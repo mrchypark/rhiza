@@ -113,6 +113,90 @@ type eventView struct {
 	} `json:"fault,omitempty"`
 }
 
+type fencerDiagnosticsView struct {
+	Context            string `json:"context"`
+	Namespace          string `json:"namespace"`
+	PodsCaptured       bool   `json:"podsCaptured"`
+	EventsCaptured     bool   `json:"eventsCaptured"`
+	DeploymentCaptured bool   `json:"deploymentCaptured"`
+	Logs               struct {
+		Captured bool   `json:"captured"`
+		SHA256   string `json:"sha256"`
+		Bytes    int64  `json:"bytes"`
+		Lines    int64  `json:"lines"`
+	} `json:"logs"`
+}
+
+type fencerPodsView struct {
+	Pods []struct {
+		Name       string `json:"name"`
+		UID        string `json:"uid"`
+		Phase      string `json:"phase"`
+		Conditions []struct {
+			Type   string `json:"type"`
+			Status string `json:"status"`
+			Reason string `json:"reason,omitempty"`
+		} `json:"conditions"`
+		Containers []struct {
+			Name         string `json:"name"`
+			Ready        bool   `json:"ready"`
+			RestartCount int32  `json:"restartCount"`
+			State        struct {
+				Waiting struct {
+					Reason string `json:"reason,omitempty"`
+				} `json:"waiting"`
+				Terminated struct {
+					Reason     string `json:"reason,omitempty"`
+					ExitCode   *int32 `json:"exitCode,omitempty"`
+					FinishedAt string `json:"finishedAt,omitempty"`
+				} `json:"terminated"`
+			} `json:"state"`
+			LastState struct {
+				Terminated struct {
+					Reason     string `json:"reason,omitempty"`
+					ExitCode   *int32 `json:"exitCode,omitempty"`
+					FinishedAt string `json:"finishedAt,omitempty"`
+				} `json:"terminated"`
+			} `json:"lastState"`
+		} `json:"containers"`
+	} `json:"pods"`
+}
+
+type fencerEventsView struct {
+	Warnings []struct {
+		Type           string `json:"type"`
+		Reason         string `json:"reason"`
+		Count          int32  `json:"count"`
+		LastTimestamp  string `json:"lastTimestamp"`
+		InvolvedObject struct {
+			Kind string `json:"kind"`
+			Name string `json:"name"`
+		} `json:"involvedObject"`
+		Source struct {
+			Component string `json:"component"`
+		} `json:"source"`
+	} `json:"warnings"`
+}
+
+type fencerDeploymentView struct {
+	Name                string `json:"name"`
+	UID                 string `json:"uid"`
+	Generation          int64  `json:"generation"`
+	ObservedGeneration  int64  `json:"observedGeneration"`
+	Replicas            int32  `json:"replicas"`
+	UpdatedReplicas     int32  `json:"updatedReplicas"`
+	ReadyReplicas       int32  `json:"readyReplicas"`
+	AvailableReplicas   int32  `json:"availableReplicas"`
+	UnavailableReplicas int32  `json:"unavailableReplicas"`
+	Conditions          []struct {
+		Type               string `json:"type"`
+		Status             string `json:"status"`
+		Reason             string `json:"reason,omitempty"`
+		LastUpdateTime     string `json:"lastUpdateTime,omitempty"`
+		LastTransitionTime string `json:"lastTransitionTime,omitempty"`
+	} `json:"conditions"`
+}
+
 func safeJSON(name string, data []byte) ([]byte, error) {
 	var value any
 	switch {
@@ -160,6 +244,18 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 		}
 		source.Recovery.Metadata = obj{"name": source.Recovery.Metadata["name"], "uid": source.Recovery.Metadata["uid"], "namespace": source.Recovery.Metadata["namespace"]}
 		return encoded(source), nil
+	case name == "runtime-profile.json":
+		value = &runtimeProfileEvidence{}
+	case name == "runtime-component-probe.json":
+		value = &runtimeComponentEvidence{}
+	case name == "fencer-diagnostics.json":
+		value = &fencerDiagnosticsView{}
+	case name == "fencer-pods.json":
+		value = &fencerPodsView{}
+	case name == "fencer-events.json":
+		value = &fencerEventsView{}
+	case name == "fencer-deployment.json":
+		value = &fencerDeploymentView{}
 	default:
 		return nil, fmt.Errorf("artifact type is not approved")
 	}
@@ -190,7 +286,7 @@ func safeArtifacts(raw string) error {
 		if entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("artifact symlinks are unsupported")
 		}
-		approved := strings.HasSuffix(name, "-image-evidence.json") || name == "validated-voter-proof.json" || name == "validated-generation-proof.json" || name == "online-active-ledger.json" || name == "learner-authenticated-binding.json" || name == "online-completed-membership.json" || name == "terminal.json"
+		approved := strings.HasSuffix(name, "-image-evidence.json") || name == "validated-voter-proof.json" || name == "validated-generation-proof.json" || name == "online-active-ledger.json" || name == "learner-authenticated-binding.json" || name == "online-completed-membership.json" || name == "runtime-profile.json" || name == "runtime-component-probe.json" || name == "fencer-diagnostics.json" || name == "fencer-pods.json" || name == "fencer-events.json" || name == "fencer-deployment.json" || name == "terminal.json"
 		textFile := name == "source-head.txt" || name == "image-ids.txt" || name == "actual-exit.txt"
 		if !approved && !textFile && name != "events.jsonl" && name != "cleanup.log" {
 			continue
@@ -267,7 +363,21 @@ func safeArtifacts(raw string) error {
 			return err
 		}
 	}
-	for _, name := range []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"} {
+	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt", "runtime-profile.json"}
+	exitData, err := os.ReadFile(filepath.Join(public, "actual-exit.txt"))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(exitData)) == "0" {
+		required = append(required, "runtime-component-probe.json")
+	} else {
+		for _, name := range []string{"fencer-diagnostics.json", "fencer-pods.json", "fencer-events.json", "fencer-deployment.json"} {
+			if _, statErr := os.Stat(filepath.Join(public, name)); statErr == nil {
+				required = append(required, name)
+			}
+		}
+	}
+	for _, name := range required {
 		if _, err := os.Stat(filepath.Join(public, name)); err != nil {
 			return fmt.Errorf("required public receipt missing: %s", name)
 		}

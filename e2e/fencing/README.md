@@ -21,6 +21,21 @@ CGO_ENABLED=0 go build -o "$RUNNER_TEMP/rhiza-fencing-e2e" ./e2e/fencing
 FENCING_E2E_BIN="$RUNNER_TEMP/rhiza-fencing-e2e" sh e2e/fencing/run.sh
 ```
 
+Before starting the source workload, the script records the pinned Kind node
+image, actual CRI/containerd version and runtime type, kernel release, and cgroup
+filesystem. It then drives the shipped `rhiza-runtime-agent` binary through the
+authority's projected audience-bound token against a disposable one-shot Pod.
+The Pod has `restartPolicy: Never` and a non-controller owner reference to a
+non-matching zero-replica StatefulSet; the driver verifies those identities before
+requesting the exact stop. It requires the agent's captured cgroup inode and
+terminal receipt, deletes only the agent Pod on the target node, and asks the
+replacement agent to recover and verify the same durable receipt. If containerd
+removes the captured cgroup before it can be verified, the component result is
+recorded as a failure; missing cgroup metadata is not treated as proof. This is
+runtime-agent component evidence only, not full fencing or D1-D4 qualification.
+The public packet contains the allowlisted profile and outcome fields plus a
+receipt hash, never the raw receipt, token, Pod dump, or runtime logs.
+
 This creates only the disposable `rhiza-generic-fencing` Kind cluster and
 `rhiza-fencing-e2e` namespace. A pre-existing cluster with that name is rejected.
 The script uses the canonical authority manifest and supervised StatefulSet
