@@ -422,7 +422,7 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 			// keep their cleanup unresolved so this test measures reserved scope
 			// capacity rather than accidentally compacting it first.
 			c.Fencer = retirementFencer(func(context.Context, FenceRequest) (*FenceProof, error) {
-				return nil, fencing.ErrPending
+				return nil, ErrFencePending
 			})
 			api.membership = nil
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
