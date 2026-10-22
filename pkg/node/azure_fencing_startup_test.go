@@ -18,7 +18,7 @@ import (
 	"github.com/thanos-io/objstore/providers/azure"
 )
 
-func TestOpenSupervisedAzureFailsBeforeAnyStorageOrBindSideEffect(t *testing.T) {
+func TestOpenSupervisedAzureRejectsBindWithoutProvisioningStorage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var reads, creates, binds atomic.Int32
@@ -73,13 +73,13 @@ func TestOpenSupervisedAzureFailsBeforeAnyStorageOrBindSideEffect(t *testing.T) 
 	config.ObjStoreAzureConnectionString = fmt.Sprintf("DefaultEndpointsProtocol=https;AccountName=account;AccountKey=dGVzdA==;BlobEndpoint=%s", store.URL)
 	n := New(config)
 	err = n.Open(objmetrics.WithReplayObservation(ctx))
-	if err == nil || !strings.Contains(err.Error(), "currently require GCS") || binds.Load() != 0 {
-		t.Fatalf("unsupported supervised Azure profile was not rejected before bind: error=%v binds=%d reads=%d creates=%d", err, binds.Load(), reads.Load(), creates.Load())
+	if err == nil || !strings.Contains(err.Error(), "supervisor returned HTTP 403") || binds.Load() != 1 {
+		t.Fatalf("supervised Azure startup did not fail on rejected WAL bind: error=%v binds=%d reads=%d creates=%d", err, binds.Load(), reads.Load(), creates.Load())
 	}
 	if n.fenceSession == nil || n.fenceSession.Identity().WALIdentity != "" {
-		t.Fatal("unsupported storage profile unexpectedly admitted a WAL")
+		t.Fatal("rejected bind unexpectedly admitted a WAL")
 	}
-	if reads.Load() != 0 || creates.Load() != 0 {
-		t.Fatalf("unsupported supervised profile contacted Azure before rejection: reads=%d mutations=%d", reads.Load(), creates.Load())
+	if creates.Load() != 0 {
+		t.Fatalf("rejected bind attempted Azure storage mutation before admission: reads=%d mutations=%d", reads.Load(), creates.Load())
 	}
 }
