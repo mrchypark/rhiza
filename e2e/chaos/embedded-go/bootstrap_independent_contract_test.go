@@ -279,6 +279,7 @@ data=rhiza-v0191-data-a1b2c3d4@example-project.iam.gserviceaccount.com
 readonly_email=rhiza-v0191-readonly-a1b2c3d4@example-project.iam.gserviceaccount.com
 owner='` + owner + `'
 RHIZA_AUTH_STATE='` + stateDir + `'
+local_fixture=$RHIZA_AUTH_STATE
 RHIZA_TEST_FIXTURE_DIR='` + fixtureDir + `'
 gcloud() { case "$*" in
   *'iam service-accounts describe '*data*) cat "$RHIZA_TEST_FIXTURE_DIR/data-live.json" ;;
@@ -370,6 +371,7 @@ die() { printf '%s\\n' "$*" >&2; exit 1; }
 auth_mode=ci
 RHIZA_GCS_INDEPENDENT_LAYOUT=yes
 RHIZA_AUTH_STATE='` + stateDir + `'
+local_fixture=$RHIZA_AUTH_STATE
 owner='fixture-owner'
 ` + functions + `
 verify_rollback_side_effect_markers
