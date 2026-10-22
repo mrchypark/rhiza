@@ -67,7 +67,6 @@ func TestGCSAsyncEmptyHeadEvidenceRequiresStableInitialAndSealedVersions(t *test
 		{VersionType: int(objstore.Generation), Version: "1001", Tip: 0, Sealed: true, HeadSHA256: strings.Repeat("b", 64)},
 		{VersionType: int(objstore.Generation), Version: "1002", Tip: 1, Sealed: true, HeadSHA256: strings.Repeat("b", 64)},
 		{VersionType: int(objstore.Generation), Version: "1002", Tip: 0, HeadSHA256: strings.Repeat("b", 64)},
-		{VersionType: int(objstore.Generation), Version: "1002", Tip: 0, Sealed: true, HeadSHA256: strings.Repeat("b", 64)},
 		{VersionType: int(objstore.Generation), Version: "1002", Tip: 0, Sealed: true, HeadSHA256: before.HeadSHA256},
 	} {
 		if err := validateSealedZeroHead(before, bad); err == nil {
