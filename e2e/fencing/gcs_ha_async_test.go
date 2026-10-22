@@ -56,10 +56,10 @@ func TestGCSAsyncEmptyHeadEvidenceRequiresStableInitialAndSealedVersions(t *test
 	for _, bad := range []gcsArchiveHeadEvidence{
 		{Version: "1001", VersionType: int(objstore.Generation), Tip: 1, HeadSHA256: strings.Repeat("a", 64)},
 		{Version: "1001", VersionType: int(objstore.Generation), Tip: 0, Sealed: true, HeadSHA256: strings.Repeat("a", 64)},
-		{Version: "1001", VersionType: int(objstore.Generation), Tip: 0, HeadSHA256: strings.Repeat("a", 64)},
+		{Version: "1001", VersionType: int(objstore.ETag), Tip: 0, HeadSHA256: strings.Repeat("a", 64)},
 	} {
 		if err := validateInitialZeroHead(bad); err == nil {
-			t.Fatalf("accepted non-genesis or versionless initial HEAD: %+v", bad)
+			t.Fatalf("accepted non-genesis or wrong-version-type initial HEAD: %+v", bad)
 		}
 	}
 	for _, bad := range []gcsArchiveHeadEvidence{
