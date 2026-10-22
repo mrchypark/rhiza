@@ -279,11 +279,10 @@ data=rhiza-v0191-data-a1b2c3d4@example-project.iam.gserviceaccount.com
 readonly_email=rhiza-v0191-readonly-a1b2c3d4@example-project.iam.gserviceaccount.com
 owner='` + owner + `'
 RHIZA_AUTH_STATE='` + stateDir + `'
-local_fixture=$RHIZA_AUTH_STATE
 RHIZA_TEST_FIXTURE_DIR='` + fixtureDir + `'
 gcloud() { case "$*" in
   *'iam service-accounts describe '*data*) cat "$RHIZA_TEST_FIXTURE_DIR/data-live.json" ;;
-  *'iam service-accounts describe '*readonly_email*) cat "$RHIZA_TEST_FIXTURE_DIR/readonly-live.json" ;;
+  *'iam service-accounts describe '*"$readonly_email"*) cat "$RHIZA_TEST_FIXTURE_DIR/readonly-live.json" ;;
   *'managed-folders describe '*'/data/'*) cat "$RHIZA_TEST_FIXTURE_DIR/data-folder-live.json" ;;
   *'managed-folders describe '*'/control/'*) cat "$RHIZA_TEST_FIXTURE_DIR/control-folder-live.json" ;;
 	  *'managed-folders describe '*'/qualification/a1b2c3d4/'*) cat "$RHIZA_TEST_FIXTURE_DIR/folder-live.json" ;;
@@ -371,7 +370,6 @@ die() { printf '%s\\n' "$*" >&2; exit 1; }
 auth_mode=ci
 RHIZA_GCS_INDEPENDENT_LAYOUT=yes
 RHIZA_AUTH_STATE='` + stateDir + `'
-local_fixture=$RHIZA_AUTH_STATE
 owner='fixture-owner'
 ` + functions + `
 verify_rollback_side_effect_markers
@@ -401,7 +399,7 @@ func bootstrapOwnershipHelpers(source string) (string, error) {
 	}
 	var out strings.Builder
 	for _, def := range defs {
-		start := strings.Index(source, def.name+"() {")
+		start := topLevelShellFunctionStart(source, def.name)
 		if start < 0 {
 			return "", fmt.Errorf("bootstrap helper %s missing", def.name)
 		}
@@ -412,7 +410,39 @@ func bootstrapOwnershipHelpers(source string) (string, error) {
 		out.WriteString(source[start : start+len(def.name)+len("() {")+end])
 		out.WriteByte('\n')
 	}
+	if strings.Contains(out.String(), "fixture_case=positive") || strings.Contains(out.String(), "mint_local >") {
+		return "", fmt.Errorf("bootstrap helper extraction included the local self-test body")
+	}
 	return out.String(), nil
+}
+
+func TestTopLevelShellFunctionStart(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		source string
+		want   int
+	}{
+		{name: "byte zero", source: "record() {\nbody\n}", want: 0},
+		{name: "top level after newline", source: "#!/bin/sh\nrecord() {\nbody\n}", want: len("#!/bin/sh\n")},
+		{name: "skip indented decoy", source: "#!/bin/sh\n    record() {\ndecoy\n}\nrecord() {\nbody\n}", want: len("#!/bin/sh\n    record() {\ndecoy\n}\n")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := topLevelShellFunctionStart(tt.source, "record"); got != tt.want {
+				t.Fatalf("topLevelShellFunctionStart() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func topLevelShellFunctionStart(source, name string) int {
+	definition := name + "() {"
+	if strings.HasPrefix(source, definition) {
+		return 0
+	}
+	if start := strings.Index(source, "\n"+definition); start >= 0 {
+		return start + 1
+	}
+	return -1
 }
 
 func folderIdentityJSON(bucket, name string) string {
