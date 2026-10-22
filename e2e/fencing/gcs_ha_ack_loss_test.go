@@ -107,9 +107,12 @@ func TestVerifyGCSAckLossHeldObjectRequiresExactHeldGenerationAndBytes(t *testin
 					http.Error(w, "wrong exact-object request", http.StatusBadRequest)
 					return
 				}
-				if r.URL.Query().Get("alt") == "media" {
-					if r.URL.Path != "/ack-bucket/"+objectName {
-						http.Error(w, "wrong exact-generation media route", http.StatusBadRequest)
+				// storage v1.56.0 uses the XML API by default for NewReader. Its
+				// exact-generation media request is GET /<bucket>/<object>?generation=N;
+				// it does not send the JSON API's alt=media query parameter.
+				if r.URL.Path == "/ack-bucket/"+objectName {
+					if len(r.URL.Query()) != 1 || r.URL.Query().Get("generation") != "41" {
+						http.Error(w, fmt.Sprintf("unexpected query on exact-generation XML media route: %q", r.URL.RawQuery), http.StatusBadRequest)
 						return
 					}
 					mediaReads++
@@ -117,7 +120,7 @@ func TestVerifyGCSAckLossHeldObjectRequiresExactHeldGenerationAndBytes(t *testin
 					return
 				}
 				if !strings.Contains(r.URL.Path, "/b/ack-bucket/o/") || !strings.HasSuffix(r.URL.Path, objectName) {
-					http.Error(w, "wrong exact-object request", http.StatusBadRequest)
+					http.Error(w, fmt.Sprintf("unmatched pinned-SDK request: method=%s path=%q query=%q", r.Method, r.URL.Path, r.URL.RawQuery), http.StatusBadRequest)
 					return
 				}
 				metadataReads++
