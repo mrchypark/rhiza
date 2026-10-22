@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -669,6 +671,224 @@ func writeGCSAsyncEmptySummary(public string, summary gcsAsyncEmptyPublicSummary
 	return nil
 }
 
+type gcsAckLossPublicSummary struct {
+	Qualification         string `json:"qualification"`
+	Outcome               string `json:"outcome"`
+	Provider              string `json:"provider"`
+	NoPVC                 bool   `json:"noPVC"`
+	FaultArmed            bool   `json:"faultArmed"`
+	FaultInjected         bool   `json:"faultInjected"`
+	CanonicalReceipt      bool   `json:"canonicalReceiptVerified"`
+	HeldBytes             bool   `json:"heldBytesVerified"`
+	FirstRecovery         bool   `json:"firstRecoveryVerified"`
+	SecondRecovery        bool   `json:"secondRecoveryVerified"`
+	PrivateEvidenceSHA256 string `json:"privateEvidenceSHA256,omitempty"`
+	PrivateEventsSHA256   string `json:"privateEventsSHA256,omitempty"`
+	PrivateReceiptSHA256  string `json:"privateReceiptSHA256,omitempty"`
+}
+
+const (
+	gcsAckLossEvidenceName = "gcs-ack-loss-evidence.json"
+	gcsAckLossEventsName   = "gcs-ack-loss-events.jsonl"
+	gcsAckLossReceiptName  = "gcs-ack-loss-receipt.json"
+	gcsAckLossSummaryName  = "gcs-ack-loss-summary.json"
+)
+
+// projectGCSAckLossEvidence publishes only a typed summary and hashes. The
+// receipt, runtime identity, object key, bucket and prefix remain private.
+func projectGCSAckLossEvidence(raw, public string, failedRun bool) (bool, error) {
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	known := map[string]bool{gcsAckLossEvidenceName: false, gcsAckLossEventsName: false, gcsAckLossReceiptName: false}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "gcs-ack-loss-") {
+			if _, ok := known[name]; !ok {
+				return false, fmt.Errorf("ACK-loss private artifact name is not allowlisted")
+			}
+			known[name] = true
+		}
+	}
+	if !known[gcsAckLossEvidenceName] && !known[gcsAckLossEventsName] {
+		return false, nil
+	}
+	if !known[gcsAckLossEventsName] {
+		return false, fmt.Errorf("ACK-loss private evidence exists without its event record")
+	}
+	events, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAckLossEventsName), true)
+	if err != nil {
+		return false, err
+	}
+	counts, err := validateAckLossPrivateEvents(events)
+	if err != nil {
+		return false, err
+	}
+	eventsHash := sha256.Sum256(events)
+	summary := gcsAckLossPublicSummary{
+		Qualification:       "gcs-held-create-ack-loss-recovery",
+		Outcome:             "failed",
+		Provider:            "gcs",
+		NoPVC:               true,
+		FaultArmed:          counts["ack_loss_fault_armed"] == 1,
+		PrivateEventsSHA256: hex.EncodeToString(eventsHash[:]),
+	}
+	if known[gcsAckLossReceiptName] {
+		receipt, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAckLossReceiptName), false)
+		if err != nil {
+			return false, err
+		}
+		receiptHash := sha256.Sum256(receipt)
+		summary.PrivateReceiptSHA256 = hex.EncodeToString(receiptHash[:])
+	}
+	if !known[gcsAckLossEvidenceName] {
+		if !failedRun {
+			return false, fmt.Errorf("successful ACK-loss qualification is missing private evidence")
+		}
+		return true, writeGCSAckLossSummary(public, summary)
+	}
+	evidence, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAckLossEvidenceName), false)
+	if err != nil {
+		return false, err
+	}
+	var private gcsAckLossPrivateEvidence
+	decoder := json.NewDecoder(bytes.NewReader(evidence))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&private); err != nil {
+		return false, fmt.Errorf("decode private ACK-loss evidence")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("private ACK-loss evidence has trailing data")
+	}
+	if err := validateGCSAckLossPrivateEvidence(private, counts); err != nil {
+		return false, err
+	}
+	summary.FaultInjected = private.FaultReceipt.Injected
+	summary.CanonicalReceipt = true
+	summary.HeldBytes = true
+	summary.FirstRecovery = true
+	summary.SecondRecovery = true
+	evidenceHash := sha256.Sum256(evidence)
+	summary.PrivateEvidenceSHA256 = hex.EncodeToString(evidenceHash[:])
+	if !failedRun {
+		if !summary.FaultInjected || !summary.CanonicalReceipt || !summary.HeldBytes || !summary.FirstRecovery || !summary.SecondRecovery {
+			return false, fmt.Errorf("successful ACK-loss run lacks a complete private evidence sequence")
+		}
+		summary.Outcome = "passed"
+	}
+	return true, writeGCSAckLossSummary(public, summary)
+}
+
+func validateAckLossPrivateEvents(data []byte) (map[string]int, error) {
+	counts := make(map[string]int)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		var event struct {
+			Event string          `json:"event"`
+			Time  string          `json:"time"`
+			Data  json.RawMessage `json:"data"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(scanner.Bytes()))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&event); err != nil || event.Event == "" || event.Time == "" || len(event.Data) == 0 {
+			return nil, fmt.Errorf("private ACK-loss event record is invalid")
+		}
+		if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("private ACK-loss event has trailing data")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, event.Time); err != nil {
+			return nil, fmt.Errorf("private ACK-loss event timestamp is invalid")
+		}
+		counts[event.Event]++
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read private ACK-loss events: %w", err)
+	}
+	for _, name := range []string{"ack_loss_fault_armed", "ack_loss_canonical_and_object_verified", "ack_loss_two_recoveries_complete"} {
+		if counts[name] > 1 {
+			return nil, fmt.Errorf("private ACK-loss event sequence is ambiguous")
+		}
+	}
+	return counts, nil
+}
+
+func validateGCSAckLossPrivateEvidence(private gcsAckLossPrivateEvidence, events map[string]int) error {
+	receipt, observation := private.FaultReceipt, private.CanonicalObservation
+	if private.Version != 1 || !receipt.Injected || receipt.WireRequests != 1 || receipt.OperationID == "" ||
+		receipt.Runtime != observation.Runtime || receipt.DispatchID != observation.DispatchID || receipt.Sequence != observation.Sequence ||
+		receipt.Intent.OperationID != receipt.OperationID || receipt.Intent.PayloadDigest != receipt.PayloadDigest || receipt.Intent.PayloadSize != receipt.PayloadSize ||
+		observation.Guarded.DispatchID != receipt.DispatchID || observation.Guarded.ObjectGeneration != private.Object.Generation ||
+		observation.Guarded.ObjectMetageneration != private.Object.Metageneration || observation.Guarded.PayloadDigest != private.Object.PayloadSHA256 ||
+		observation.Guarded.ObjectSize != private.Object.Size || !private.Object.TemporaryHold ||
+		private.BaselineAck.RequestID == "" || private.BaselineAck.Slot == 0 || private.BaselineAck.Rows != `[[1,"gcs-ack-loss-baseline"]]` ||
+		private.SecondAck.RequestID == "" || private.SecondAck.Slot == 0 || private.SecondAck.Rows != `[[2,"gcs-ack-loss-successor"]]` {
+		return fmt.Errorf("private ACK-loss evidence does not bind the exact fault, object, and acknowledged rows")
+	}
+	if events["ack_loss_fault_armed"] != 1 || events["ack_loss_canonical_and_object_verified"] != 1 || events["ack_loss_two_recoveries_complete"] != 1 {
+		return fmt.Errorf("private ACK-loss event sequence is incomplete")
+	}
+	var first, second struct {
+		Source   gcsRecoverySource     `json:"source"`
+		Fence    operator.FenceRequest `json:"fence"`
+		Proof    operator.FenceProof   `json:"proof"`
+		Recovery operator.Resource     `json:"recovery"`
+	}
+	decodeRecovery := func(data obj, target any) error {
+		encoded, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+		decoder := json.NewDecoder(bytes.NewReader(encoded))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(target); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := decodeRecovery(private.FirstRecovery, &first); err != nil {
+		return fmt.Errorf("decode private first recovery evidence")
+	}
+	if err := decodeRecovery(private.SecondRecovery, &second); err != nil {
+		return fmt.Errorf("decode private second recovery evidence")
+	}
+	if err := validateGCSHAAckReceipt(first.Source, receipt); err != nil {
+		return fmt.Errorf("private ACK-loss receipt does not match the first captured source: %w", err)
+	}
+	guarded := observation.Guarded
+	guardDigest, digestErr := hex.DecodeString(guarded.GuardDigest)
+	if guarded.Version != fencing.MutationGuardedLogicalResolutionVersion || guarded.Runtime != receipt.Runtime ||
+		guarded.WALIdentity != receipt.SourceIdentity.WALIdentity || guarded.ProducerUID != receipt.ProducerUID || guarded.Sequence != receipt.Sequence ||
+		guarded.Intent != receipt.Intent || guarded.Preparation != receipt.Preparation || guarded.DispatchID != receipt.DispatchID ||
+		guarded.Profile != fencing.MutationHeldExecutionProfile || guarded.GuardRootIdentity != gcsHAAuthorityRootIdentity(receipt.Runtime.StatefulSetUID, receipt.Runtime.SourceClusterID) ||
+		guarded.GuardVersion != fencing.MutationGuardedLogicalResolutionVersion || guarded.GuardRef == "" || guarded.PreparationHash == "" ||
+		digestErr != nil || len(guardDigest) != sha256.Size || observation.GuardSHA256 != guarded.GuardDigest ||
+		guarded.ObjectGeneration != private.Object.Generation || guarded.ObjectMetageneration != private.Object.Metageneration ||
+		guarded.ObjectSize != receipt.PayloadSize || guarded.ObjectSize != private.Object.Size || guarded.PayloadDigest != receipt.PayloadDigest ||
+		guarded.PayloadDigest != private.Object.PayloadSHA256 || !private.Object.TemporaryHold {
+		return fmt.Errorf("private ACK-loss guard does not match the exact receipt, source root, and held object tuple")
+	}
+	for _, item := range []struct {
+		source   gcsRecoverySource
+		fence    operator.FenceRequest
+		proof    operator.FenceProof
+		recovery operator.Resource
+	}{{first.Source, first.Fence, first.Proof, first.Recovery}, {second.Source, second.Fence, second.Proof, second.Recovery}} {
+		if item.source.ClusterID == "" || item.fence.OperationID == "" || item.proof.OperationID != item.fence.OperationID ||
+			item.proof.SourceClusterID != item.fence.SourceClusterID || item.recovery.Status.Phase != "Complete" ||
+			item.recovery.Status.Stage != "Complete" || item.recovery.Spec.RecoveryID != item.fence.OperationID ||
+			item.recovery.Spec.SourceClusterID != item.fence.SourceClusterID || recoveryFenceMatchesProof(item.recovery, item.fence, item.proof) != nil {
+			return fmt.Errorf("private ACK-loss recovery evidence is not a complete fence-linked recovery")
+		}
+	}
+	return verifyRecoveryLineage(first.Recovery, second.Recovery, first.Fence, second.Fence)
+}
+
+func writeGCSAckLossSummary(public string, summary gcsAckLossPublicSummary) error {
+	return os.WriteFile(filepath.Join(public, gcsAckLossSummaryName), encoded(summary), 0600)
+}
+
 // Only explicit evidence types enter the public packet; raw diagnostics stay on the disposable runner.
 func safeArtifacts(raw string) error {
 	if raw == "" {
@@ -788,11 +1008,18 @@ func safeArtifacts(raw string) error {
 	if err != nil {
 		return err
 	}
+	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
+	if err != nil {
+		return err
+	}
 	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
 	if !failedRun {
 		required = append(required, "runtime-profile.json", "runtime-component-probe.json")
 		if asyncEmptySeen {
 			required = append(required, gcsAsyncEmptySummaryName)
+		}
+		if ackLossSeen {
+			required = append(required, gcsAckLossSummaryName)
 		}
 	} else {
 		for _, name := range []string{"fencer-diagnostics.json", "fencer-pods.json", "fencer-events.json", "fencer-deployment.json"} {
