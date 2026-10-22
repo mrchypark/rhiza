@@ -157,7 +157,13 @@ func newHeldGCSServer(t *testing.T, fixture heldProfileFixture) (*heldGCSServer,
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
 		if name == "" {
-			name, _ = url.PathUnescape(strings.TrimPrefix(r.URL.EscapedPath(), "/storage/v1/b/archive/o/"))
+			escapedPath := r.URL.EscapedPath()
+			if strings.HasPrefix(escapedPath, "/storage/v1/b/archive/o/") {
+				name, _ = url.PathUnescape(strings.TrimPrefix(escapedPath, "/storage/v1/b/archive/o/"))
+			} else if strings.HasPrefix(escapedPath, "/archive/") {
+				// The pinned SDK defaults NewReader to the XML API path.
+				name, _ = url.PathUnescape(strings.TrimPrefix(escapedPath, "/archive/"))
+			}
 		}
 		state.mu.Lock()
 		defer state.mu.Unlock()
@@ -205,7 +211,10 @@ func newHeldGCSServer(t *testing.T, fixture heldProfileFixture) (*heldGCSServer,
 				http.NotFound(w, r)
 				return
 			}
-			if r.URL.Query().Get("alt") == "media" {
+			if r.URL.Query().Get("alt") == "media" || strings.HasPrefix(r.URL.EscapedPath(), "/archive/") {
+				w.Header().Set("X-Goog-Generation", strconv.FormatInt(obj.generation, 10))
+				w.Header().Set("X-Goog-Metageneration", strconv.FormatInt(obj.metageneration, 10))
+				w.Header().Set("Content-Length", strconv.Itoa(len(obj.payload)))
 				_, _ = w.Write(obj.payload)
 				return
 			}

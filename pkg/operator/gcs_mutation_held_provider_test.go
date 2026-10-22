@@ -44,6 +44,11 @@ func TestGCSHeldCreateWritesHoldAndFinalizesOnlyExactReceipt(t *testing.T) {
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(attrs)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/archive/"):
+			if r.URL.Query().Get("generation") != "51" {
+				t.Errorf("byte verification did not read the exact selected generation: %s", r.URL.String())
+			}
+			_, _ = w.Write(payload)
 		case r.Method == http.MethodGet && r.URL.Query().Get("alt") == "media":
 			if r.URL.Query().Get("generation") != "51" {
 				t.Errorf("byte verification did not read the exact selected generation: %s", r.URL.String())
@@ -138,6 +143,11 @@ func TestGCSHeldUnconditionalZeroGenerationCreatesOnlyWhenPreparedAbsent(t *test
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(attrs)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/archive/"):
+			if r.URL.Query().Get("generation") != "52" {
+				t.Errorf("unconditional write verification did not read its exact generation: %s", r.URL.String())
+			}
+			_, _ = w.Write(payload)
 		case r.Method == http.MethodGet && r.URL.Query().Get("alt") == "media":
 			if r.URL.Query().Get("generation") != "52" {
 				t.Errorf("unconditional write verification did not read its exact generation: %s", r.URL.String())
@@ -300,6 +310,11 @@ func TestGCSGuardedReplayRequiresRootGuardAndActualHeldGenerationBytes(t *testin
 						t.Errorf("guarded replay changed the original create-only request: %s", r.URL.String())
 					}
 					http.Error(w, "already exists", http.StatusPreconditionFailed)
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/archive/"):
+					if r.URL.Query().Get("generation") != "61" {
+						t.Errorf("guarded replay did not read exact generation bytes: %s", r.URL.String())
+					}
+					_, _ = w.Write(tc.stored)
 				case r.Method == http.MethodGet && r.URL.Query().Get("alt") == "media":
 					if r.URL.Query().Get("generation") != "61" {
 						t.Errorf("guarded replay did not read exact generation bytes: %s", r.URL.String())
@@ -369,6 +384,11 @@ func TestGCSGuardedReplayCreateStoresHeldGenerationAfterRootGuard(t *testing.T) 
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(attrs)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/archive/"):
+			if r.URL.Query().Get("generation") != "71" {
+				t.Errorf("guarded replay did not read its exact created generation: %s", r.URL.String())
+			}
+			_, _ = w.Write(payload)
 		case r.Method == http.MethodGet && r.URL.Query().Get("alt") == "media":
 			if r.URL.Query().Get("generation") != "71" {
 				t.Errorf("guarded replay did not read the exact created generation: %s", r.URL.String())
