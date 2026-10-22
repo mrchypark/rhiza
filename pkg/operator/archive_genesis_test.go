@@ -15,6 +15,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	"github.com/thanos-io/objstore"
 	"google.golang.org/api/option"
 )
 
@@ -72,6 +73,16 @@ type archiveGenesisFixture struct {
 func newArchiveGenesisFixture(t *testing.T) archiveGenesisFixture {
 	t.Helper()
 	e, f, id, runtime := newMutationStoreFixture(t)
+	e.RequireMutationJournal = true
+	if _, err := e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(l *fencing.Ledger) error {
+		l.ArchiveGenesisState = fencing.ArchiveGenesisRegistrationPending
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.ArchiveBucket = objstore.NewInMemBucket()
+	archiveBucket := e.ArchiveBucket
+	t.Cleanup(func() { _ = archiveBucket.Close() })
 	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +104,7 @@ func newArchiveGenesisFixture(t *testing.T) archiveGenesisFixture {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	p, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.Activate(id) })
+	_, err = e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.Activate(id) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,9 +147,9 @@ func newArchiveGenesisFixture(t *testing.T) archiveGenesisFixture {
 		t.Fatal(err)
 	}
 	intent := draft
-	intent.OperationID = fencing.MutationRequestID(p.ProducerUID, 1)
+	intent.OperationID = fencing.MutationRequestID(run.MutationProducerUID, 1)
 	intent.PayloadRef, intent.PayloadDigest, intent.PayloadSize = sealed.Ref, sealed.Digest, sealed.Size
-	return archiveGenesisFixture{e: e, f: f, id: id, runtime: runtime, producer: p.ProducerUID, stages: stages, intent: intent, payload: payload, storeScope: storeScope}
+	return archiveGenesisFixture{e: e, f: f, id: id, runtime: runtime, producer: run.MutationProducerUID, stages: stages, intent: intent, payload: payload, storeScope: storeScope}
 }
 
 func (f archiveGenesisFixture) admit(t *testing.T, sequence uint64, intent fencing.MutationIntent) {
@@ -406,9 +417,12 @@ func TestArchiveGenesisStatusDoesNotCallHeadlessForkFreshEmpty(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	f := newArchiveGenesisFixture(t)
+	if err := f.e.ArchiveBucket.Upload(t.Context(), "root/source/fork/intent.json", strings.NewReader("{}")); err != nil {
+		t.Fatal(err)
+	}
 	f.setStorage(t, server.URL, server.Client())
 	_, code := postArchiveGenesisStatus(t, f.e, f.id)
-	if code != http.StatusAccepted {
+	if code != http.StatusConflict {
 		t.Fatalf("headless fork was advertised as a fresh empty archive: status=%d", code)
 	}
 }

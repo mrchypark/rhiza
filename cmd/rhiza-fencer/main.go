@@ -20,6 +20,7 @@ import (
 	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	thanosobjstore "github.com/thanos-io/objstore"
 	"google.golang.org/api/option"
 )
 
@@ -98,6 +99,11 @@ func serve(ctx context.Context, args []string) error {
 	runtimeAgentPort := f.String("runtime-agent-port", "9445", "node runtime-agent HTTPS host port")
 	authorityStatePrefix := f.String("authority-state-prefix", os.Getenv("FENCER_AUTHORITY_STATE_PREFIX"), "canonical authority state prefix in the configured remote ObjectStorage bucket")
 	independentMutation := f.Bool("independent-mutation-profile", os.Getenv("FENCER_INDEPENDENT_MUTATION_PROFILE") == "true", "require canonical remote state and source-mutation providers for the independent NoPVC mutation profile")
+	controllerSA := os.Getenv("FENCER_CONTROLLER_SERVICE_ACCOUNT")
+	if controllerSA == "" {
+		controllerSA = "rhiza-operator"
+	}
+	controllerServiceAccount := f.String("controller-service-account", controllerSA, "service account allowed to register verified archive forks")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
@@ -120,12 +126,14 @@ func serve(ctx context.Context, args []string) error {
 		return err
 	}
 	var authorityState *operator.AuthorityStateStore
+	var archiveBucket thanosobjstore.Bucket
 	if hasRemoteCanonicalState(stateConfig) {
 		stateBucket, err := objectstore.NewBucket(stateConfig)
 		if err != nil {
 			return fmt.Errorf("configure canonical authority ObjectStorage: %w", err)
 		}
 		defer stateBucket.Close()
+		archiveBucket = stateBucket
 		statePrefix := *authorityStatePrefix
 		if statePrefix == "" {
 			statePrefix = "rhiza-authority-state"
@@ -143,6 +151,8 @@ func serve(ctx context.Context, args []string) error {
 		}
 	}
 	executor := newFencingExecutor(kube, authorityState, *independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC)
+	executor.ArchiveBucket = archiveBucket
+	executor.ControllerServiceAccount = *controllerServiceAccount
 	if *runtimeAgentCA != "" {
 		ca, err := os.ReadFile(*runtimeAgentCA)
 		if err != nil {

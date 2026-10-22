@@ -312,11 +312,22 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			return c.record(ctx, r, "Blocked", "target lineage is unavailable or inconsistent")
 		}
 
-		// External anchor activation: delegate to trusted Coordinator/Client.
-		if r.Spec.AnchorID != "" {
-			if c.Anchor == nil {
-				return c.record(ctx, r, "Blocked", "anchor backend is not configured for anchorID "+r.Spec.AnchorID)
-			}
+		// Only the explicitly configured Kubernetes fencer is the legacy
+		// cooperative backend. Unknown or wrapped backends must prove the
+		// canonical genesis capability; absence of that capability is not
+		// evidence that the source uses cooperative storage.
+		requiresArchiveGenesis := true
+		if _, cooperative := c.Fencer.(*KubernetesFencer); cooperative {
+			requiresArchiveGenesis = false
+		}
+		registrar, canRegisterArchiveGenesis := c.Fencer.(ArchiveForkGenesisRegistrar)
+		if requiresArchiveGenesis && !canRegisterArchiveGenesis {
+			return c.record(ctx, r, "Blocked", "configured fencing backend cannot register canonical archive fork genesis")
+		}
+		if requiresArchiveGenesis && !s.reconfiguration {
+			return c.record(ctx, r, "Blocked", "canonical archive fork genesis requires verified reconfiguration lineage")
+		}
+		if requiresArchiveGenesis || r.Spec.AnchorID != "" {
 			targetPrefix := path.Join(c.Prefix, r.Status.Target)
 			anchor, anchorH, anchorErr := recovery.ReadGenerationAnchor(ctx, c.Bucket, targetPrefix)
 			if anchorErr != nil {
@@ -332,13 +343,27 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 			if anchor.OperationID != c.operationID(r) || anchor.SourcePrefix != s.prefix || anchor.SourcePrefixHash != result.PrefixHash || anchor.SourceTip != result.Tip || anchor.SourceManifest != result.ManifestHash {
 				return c.record(ctx, r, "Blocked", "target generation anchor does not match fork result")
 			}
-			req := c.buildAnchorRequest(r, s, record, result, hex.EncodeToString(anchorH[:]))
-			receipt, actErr := c.Anchor.Activate(ctx, req)
-			if actErr != nil {
-				return c.record(ctx, r, "Blocked", "anchor activation failed: "+actErr.Error())
+			if requiresArchiveGenesis {
+				request := ArchiveForkGenesisRequest{
+					StatefulSetUID: r.Status.StatefulSetUID, TargetClusterID: r.Status.Target,
+					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID,
+				}
+				if err := registrar.RegisterArchiveForkGenesis(ctx, request); err != nil {
+					return c.record(ctx, r, "Blocked", "canonical archive fork genesis registration failed: "+err.Error())
+				}
 			}
-			r.Status.AnchorRequest = &req
-			r.Status.AnchorReceipt = &receipt
+			if r.Spec.AnchorID != "" {
+				if c.Anchor == nil {
+					return c.record(ctx, r, "Blocked", "anchor backend is not configured for anchorID "+r.Spec.AnchorID)
+				}
+				req := c.buildAnchorRequest(r, s, record, result, hex.EncodeToString(anchorH[:]))
+				receipt, actErr := c.Anchor.Activate(ctx, req)
+				if actErr != nil {
+					return c.record(ctx, r, "Blocked", "anchor activation failed: "+actErr.Error())
+				}
+				r.Status.AnchorRequest = &req
+				r.Status.AnchorReceipt = &receipt
+			}
 		}
 		r.Status.SecretName, r.Status.ManifestHash, r.Status.RecoveredTip = secret, result.ManifestHash, result.Tip
 		r.Status.Stage = "Stopping"
