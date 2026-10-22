@@ -226,7 +226,7 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 		} `json:"metadata"`
 	}
 	anchorCreateAttempted = true
-	if data, err := commandWithInput(ctx, encoded(runtimeProbeAnchor()), "kubectl", "--context", kubeContext, "-n", namespace, "apply", "-f", "-"); err != nil {
+	if data, err := commandWithInput(ctx, encoded(runtimeProbeAnchor()), "kubectl", "--context", kubeContext, "-n", namespace, "apply", "-f", "-", "-o", "json"); err != nil {
 		return fmt.Errorf("create non-controller probe anchor: %w", err)
 	} else if err := json.Unmarshal(data, &anchor); err != nil || anchor.Metadata.UID == "" {
 		return fmt.Errorf("probe anchor UID unavailable")
