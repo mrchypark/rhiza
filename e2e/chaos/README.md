@@ -120,14 +120,56 @@ directory, adopt colliding resources, or rerun after an unknown outcome.
 path. It is a second, run-owned path that shares the bootstrap above: run
 `bootstrap-gcs-postrelease.sh apply-local` first so the namespace, the `rhiza-gcs`
 and `rhiza-operator` workload-identity bindings, the quota and the admission
-policies exist. Then use the launcher's two phases with one fresh `RHIZA_OUT`
-directory:
+policies exist. The control-plane writer identity is `RHIZA_DATA_GSA_ID`; the
+operator and fencer use it because they manage recovery and authority objects.
+Configure its Workload Identity binding for both KSAs `rhiza-operator` and
+`rhiza-fencer` in the run namespace, with the control-plane bucket permissions
+needed by those components. Set `RHIZA_READONLY_WORKLOAD_GSA_ID` to a different,
+fresh GSA and bind it to KSA `rhiza-workload` with object viewer access only on
+`${RHIZA_GCS_PREFIX}data/`. Do not grant it access to the parent prefix or the
+private `${RHIZA_GCS_PREFIX}control` authority prefix. The launcher rejects
+using the same GSA for both identities. No service-account keys are generated
+or mounted.
+
+The launcher keeps the supplied `RHIZA_GCS_PREFIX` as the run-owned parent,
+places application data under its `data/` child, and puts canonical authority
+state under its `control` child. Keep control-prefix objects out of public
+evidence artifacts. The runtime-agent DaemonSet reserves host port 9445 on each
+eligible node, so qualification runs sharing a node set must be serialized.
+
+Before `install`, provide the existing runtime-agent CA and TLS Secrets through
+`RHIZA_RUNTIME_AGENT_CA_SECRET` and `RHIZA_RUNTIME_AGENT_TLS_SECRET`. The CA
+Secret must contain `ca.crt`; the TLS Secret must contain `tls.crt` and `tls.key`.
+Also supply the exact qualified node values through `RHIZA_CONTAINERD_VERSION`,
+`RHIZA_CONTAINERD_RUNTIME_TYPE`, `RHIZA_CGROUP_PROFILE_ID`, and
+`RHIZA_KERNEL_RELEASE`. These are required inputs, not proof of qualification:
+the launcher renders the shipped runtime-agent DaemonSet with those declarations
+and pins its authority to the installed fencer Deployment UID; runtime
+enrollment must still measure and verify the actual nodes. Missing or placeholder
+inputs fail closed.
+
+Before applying the `RhizaCluster`, `install` runs a create-only GCS identity
+preflight with the control-plane KSA and the actual workload KSA. It confirms the
+workload's metadata-server GSA, a successful read of a writer-created data
+canary, and HTTP 403 for control-object read, create, update, and delete. The
+preflight rejects emulator, metadata-endpoint, proxy, and credential-file
+overrides; its result is a wiring check, not a recovery qualification. Failed
+exact-version cleanup is recorded privately in `RHIZA_OUT` as
+`gcs-iam-cleanup-pending-<nonce>.*`; do not treat that run as clean or reuse it.
+If a create response or UID-scoped Pod cleanup is uncertain, a private
+`gcs-iam-pod-cleanup-pending-<nonce>.*` artifact records only the verified
+namespace, Pod name, UID, and reason. Review that UID before any manual cleanup;
+the launcher never falls back to name-only deletion.
+
+Then use the launcher's two phases with one fresh `RHIZA_OUT` directory:
 
 - `install` with the administrator kubeconfig. It applies the repository CRDs,
   generates a one-day self-signed `rhiza-fencer-tls` Secret and matching
-  `rhiza-fencer-ca` ConfigMap, applies `votercount_gcs_chaos.yaml.in`, and
-  captures the operator-generated bootstrap admin credential as a mode-0600
-  `admin-token` file for the runtime phase.
+  `rhiza-fencer-ca` ConfigMap, applies `votercount_gcs_chaos.yaml.in`, waits for
+  the fencer, renders and applies the node-qualified runtime-agent profile
+  using that fencer Deployment UID, and captures the operator-generated
+  bootstrap admin credential as a mode-0600 `admin-token` file for the runtime
+  phase.
 - `run` with the scoped runtime kubeconfig. It runs
   `votercount_gcs_chaos.py`, which proves the admission shapes by server-side
   dry-run and runs the positive scenarios (intact-WAL restart, online
@@ -151,6 +193,11 @@ inspector's Kubernetes API egress was denied while the derived control stayed
 reachable before and after. The namespace quota therefore has to admit seven
 Pods (three voters, operator, authority, and the two probe Pods) while the probe
 runs.
+
+This wiring does not by itself qualify independent GCS mutation, canonical
+ObjectStorage recovery, NoPVC recovery, or dead-Pod return. Those claims still
+require a run with the real identities, measured runtime enrollment, and
+preserved recovery/read-barrier evidence.
 
 What that does not claim: the deny-all is not asserted to be the exclusive
 possible cause of the denial, since a node-local, label-specific or

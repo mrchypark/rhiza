@@ -2,7 +2,7 @@
 # namespace, rhiza-gcs KSA, operator GSA binding, quota and the four admission
 # policies. This set adds the voterCount operator path: one HTTP bind (RHIZA_BIND_ADDR port must equal
 # spec.httpPort), a supervised bootstrap StatefulSet that exports no
-# RHIZA_CLUSTER_MEMBERS, the operator, and the real cooperative fencing authority.
+# RHIZA_CLUSTER_MEMBERS, the operator, and the independent object-backed authority.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,7 +16,7 @@ data:
   RHIZA_DATA_DIR: /data
   RHIZA_OBJSTORE_PROVIDER: gcs
   RHIZA_OBJSTORE_BUCKET: __GCS_BUCKET__
-  RHIZA_OBJSTORE_PREFIX: __GCS_PREFIX__
+  RHIZA_OBJSTORE_PREFIX: __WORKLOAD_PREFIX__
   RHIZA_OBJSTORE_DURABILITY: before-ack
   RHIZA_OBJSTORE_MAX_RETRIES: "1"
   RHIZA_CHECKPOINT_INTERVAL: 10s
@@ -44,7 +44,7 @@ spec:
 # Bootstrap opt-in: replicas start at 0, ordinals.start is explicit 0, and no
 # RHIZA_CLUSTER_MEMBERS is exported. The operator writes the reservation object,
 # installs the immutable bootstrap Secret, patches env and scales to voterCount.
-# Container runs the supervised writer so the cooperative authority owns the fence.
+# Source mutations use the fencer's separate ADC identity, not the workload identity.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -65,10 +65,8 @@ spec:
         app: 'rhiza-voter'
         app.kubernetes.io/part-of: 'rhiza-chaos'
         chaos.rhiza.io/run: '__RUN_ID__'
-      annotations:
-        rhiza.mrchypark.dev/cooperative-fencing: "1"
     spec:
-      serviceAccountName: rhiza-gcs
+      serviceAccountName: rhiza-workload
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 90
       securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
@@ -122,6 +120,7 @@ spec:
 ---
 # The controller derives voterCount identities; automatic recovery dispatches no
 # recovery child before the authority publishes a matching proof.
+# BEGIN RHIZA CLUSTER
 apiVersion: rhiza.mrchypark.dev/v1alpha1
 kind: RhizaCluster
 metadata:
@@ -140,10 +139,13 @@ spec:
   bootstrap: true
   automatic: true
   policy: {failureGraceSeconds: 30, cooldownSeconds: 60, maxRecoveriesPerDay: 10, allowDataLoss: false}
+# END RHIZA CLUSTER
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
-metadata: {name: rhiza-operator, namespace: __NAMESPACE__}
+metadata:
+  name: rhiza-operator
+  namespace: __NAMESPACE__
 rules:
   - {apiGroups: [''], resources: [pods], verbs: [get, list, create, delete]}
   - {apiGroups: [''], resources: [secrets], verbs: [get, create, delete]}
@@ -162,7 +164,7 @@ metadata:
   name: rhiza-operator
   namespace: __NAMESPACE__
   annotations:
-    iam.gke.io/gcp-service-account: __POD_GSA__
+    iam.gke.io/gcp-service-account: __CONTROLPLANE_GSA__
     iam.gke.io/return-principal-id-as-email: "true"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -190,17 +192,45 @@ spec:
           env:
             - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
             - {name: RHIZA_AUTOMATIC_RECOVERY, value: "true"}
-            - {name: RHIZA_FENCER_BACKEND, value: kubernetes}
+            - {name: RHIZA_FENCER_BACKEND, value: http}
+            - {name: RHIZA_FENCER_URL, value: https://rhiza-fencer:9444}
+            - {name: RHIZA_FENCER_TOKEN_FILE, value: /var/run/secrets/rhiza-fencer/token}
+            - {name: RHIZA_FENCER_CA_FILE, value: /fencer-ca/ca.crt}
           envFrom:
             - {configMapRef: {name: rhiza-config}}
           securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}, readOnlyRootFilesystem: true}
-          volumeMounts: [{name: tmp, mountPath: /tmp}]
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: fencer-token, mountPath: /var/run/secrets/rhiza-fencer, readOnly: true}
+            - {name: fencer-ca, mountPath: /fencer-ca, readOnly: true}
           resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {memory: 256Mi}}
-      volumes: [{name: tmp, emptyDir: {}}]
+      volumes:
+        - {name: tmp, emptyDir: {}}
+        - name: fencer-token
+          projected:
+            sources:
+              - serviceAccountToken: {path: token, audience: rhiza-fencer, expirationSeconds: 3600}
+        - name: fencer-ca
+          configMap: {name: rhiza-fencer-ca}
 ---
 apiVersion: v1
 kind: ServiceAccount
-metadata: {name: rhiza-fencer, namespace: __NAMESPACE__}
+metadata:
+  name: rhiza-workload
+  namespace: __NAMESPACE__
+  annotations:
+    iam.gke.io/gcp-service-account: __READONLY_WORKLOAD_GSA__
+    iam.gke.io/return-principal-id-as-email: "true"
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-fencer
+  namespace: __NAMESPACE__
+  annotations:
+    iam.gke.io/gcp-service-account: __CONTROLPLANE_GSA__
+    iam.gke.io/return-principal-id-as-email: "true"
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -211,11 +241,14 @@ rules:
   - {apiGroups: [''], resources: [configmaps], verbs: [get, create, update]}
   - {apiGroups: [apps], resources: [statefulsets], verbs: [get]}
   - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizafences, rhizaclusters], verbs: [get, list]}
+  - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizarecoveries], verbs: [get]}
   - {apiGroups: [rhiza.mrchypark.dev], resources: [rhizafences/status], verbs: [get, update]}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
-metadata: {name: rhiza-fencer, namespace: __NAMESPACE__}
+metadata:
+  name: rhiza-fencer
+  namespace: __NAMESPACE__
 subjects: [{kind: ServiceAccount, name: rhiza-fencer, namespace: __NAMESPACE__}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: rhiza-fencer}
 ---
@@ -254,13 +287,25 @@ spec:
         - name: authority
           image: __OPERATOR_IMAGE__
           command: [/usr/local/bin/rhiza-fencer]
-          args: [serve, --tls-cert=/tls/tls.crt, --tls-key=/tls/tls.key]
-          env: [{name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}]
+          args: [serve, --tls-cert=/tls/tls.crt, --tls-key=/tls/tls.key, --runtime-agent-ca-file=/runtime-agent-ca/ca.crt]
+          envFrom:
+            - configMapRef: {name: rhiza-config}
+          env:
+            - {name: POD_NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: FENCER_INDEPENDENT_MUTATION_PROFILE, value: "true"}
+            - {name: FENCER_SOURCE_WRITER_USE_ADC, value: "true"}
+            - {name: FENCER_RUNTIME_AGENT_CA_FILE, value: /runtime-agent-ca/ca.crt}
+            - {name: FENCER_AUTHORITY_STATE_PREFIX, value: __AUTHORITY_PREFIX__}
           ports: [{name: https, containerPort: 9444}]
           securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
-          volumeMounts: [{name: tls, mountPath: /tls, readOnly: true}]
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+            - {name: runtime-agent-ca, mountPath: /runtime-agent-ca, readOnly: true}
           resources: {requests: {cpu: 100m, memory: 64Mi}, limits: {memory: 256Mi}}
-      volumes: [{name: tls, secret: {secretName: rhiza-fencer-tls}}]
+      volumes:
+        - {name: tls, secret: {secretName: rhiza-fencer-tls}}
+        - name: runtime-agent-ca
+          secret: {secretName: __RUNTIME_AGENT_CA_SECRET__, items: [{key: ca.crt, path: ca.crt}]}
 ---
 # BEGIN INSPECTOR PROBE
 # Paired NetworkPolicy isolation probe for the positive claim. The bootstrap owns
