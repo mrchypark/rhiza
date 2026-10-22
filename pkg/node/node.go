@@ -194,9 +194,8 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if n.opened.Load() {
 		return fmt.Errorf("node is already open")
 	}
-	if err := n.connectFenceSession(ctx); err != nil {
-		return err
-	}
+	socket, ticket := os.Getenv("RHIZA_FENCE_SOCKET"), os.Getenv("RHIZA_FENCE_TICKET")
+	supervised := socket != "" || ticket != ""
 	if n.config.Local && (enroll || len(n.config.Members) != 0 || n.config.Learner != nil || n.config.EnableReconfiguration ||
 		n.config.BindAddr != "" || n.config.PeerAddr != "" || n.config.PeerToken != "" || n.config.AdminToken != "" ||
 		n.config.ObjStoreProvider != "" || n.config.ObjStoreEndpoint != "" || n.config.ObjStoreBucket != "" || n.config.ObjStoreDir != "") {
@@ -242,6 +241,9 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 	if configErr != nil {
 		return configErr
 	}
+	if supervised && !objectStoreConfigured {
+		return fmt.Errorf("supervised fencing requires a shared decision archive")
+	}
 	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck && !objectStoreConfigured {
 		return fmt.Errorf("before-ack durability requires object storage")
 	}
@@ -268,6 +270,12 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			_ = n.Shutdown()
 		}
 	}()
+	// Do not durably enroll a process until all pure configuration and
+	// admission checks have passed and failure cleanup is installed.
+	if err := n.connectFenceSession(ctx); err != nil {
+		return err
+	}
+	supervised = n.fenceSession != nil
 	ctx, n.cancel = context.WithCancel(ctx)
 
 	// 1. Acquire lock file
@@ -444,14 +452,8 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
 		}
-		if loadErr := n.archive.Load(ctx); loadErr != nil {
-			if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
-				return fmt.Errorf("load shared decision archive: %w", loadErr)
-			}
-			log.Printf("shared archive unavailable during async startup: %v", loadErr)
-		}
-		if n.archive.Sealed() {
-			return recovery.ErrArchiveSealed
+		if err := loadNodeArchive(ctx, n.archive, n.config.ObjStoreDurability, supervised); err != nil {
+			return err
 		}
 	}
 	if !objectStoreConfigured {
@@ -711,29 +713,8 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return archive.SyncThrough(ctx, core, core.Tip())
 		})
 	}
-	if n.config.ObjStoreDurability == types.ObjectStoreDurabilityBeforeAck {
-		barrier := func(ctx context.Context, slot quepaxa.Slot) error {
-			if slot == 0 {
-				if err := n.archive.Load(ctx); err != nil {
-					return err
-				}
-				if n.archive.Sealed() {
-					return recovery.ErrArchiveSealed
-				}
-				return nil
-			}
-			if err := core.EnsureDurable(slot); err != nil {
-				return err
-			}
-			if err := n.archive.SyncThrough(ctx, core, slot); err != nil {
-				return err
-			}
-			return nil
-		}
-		server.SetDurabilityBarrier(barrier)
-		if n.config.EnableReconfiguration {
-			server.SetReadDurabilityBarrier(voterReadDurabilityBarrier(core.IsVoter, barrier))
-		}
+	if err := installArchiveDurabilityBarriers(server, core, n.archive, n.config.ObjStoreDurability, n.config.EnableReconfiguration, supervised); err != nil {
+		return err
 	}
 	n.server = server
 	server.SetCompactedHandler(n.wakeCatchUp)
@@ -1053,6 +1034,68 @@ func voterReadDurabilityBarrier(isVoter func() bool, barrier func(context.Contex
 		}
 		return barrier(ctx, slot)
 	}
+}
+
+func loadNodeArchive(ctx context.Context, archive *recovery.Manager, durability types.ObjectStoreDurability, supervised bool) error {
+	if archive == nil {
+		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
+			return fmt.Errorf("shared decision archive is required")
+		}
+		return nil
+	}
+	if err := archive.Load(ctx); err != nil {
+		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
+			return fmt.Errorf("load shared decision archive: %w", err)
+		}
+		log.Printf("shared archive unavailable during async startup: %v", err)
+	}
+	if archive.Sealed() {
+		return recovery.ErrArchiveSealed
+	}
+	return nil
+}
+
+func installArchiveDurabilityBarriers(server *network.Server, core *quepaxa.Core, archive *recovery.Manager, durability types.ObjectStoreDurability, reconfiguration, supervised bool) error {
+	if archive == nil {
+		if supervised || durability == types.ObjectStoreDurabilityBeforeAck {
+			return fmt.Errorf("shared decision archive is required")
+		}
+		return nil
+	}
+	if !supervised && durability != types.ObjectStoreDurabilityBeforeAck {
+		return nil
+	}
+	barrier := func(ctx context.Context, slot quepaxa.Slot) error {
+		if supervised && durability == types.ObjectStoreDurabilityAsync {
+			if err := archive.Load(ctx); err != nil {
+				return err
+			}
+			if archive.Sealed() {
+				return recovery.ErrArchiveSealed
+			}
+			return nil
+		}
+		if slot == 0 {
+			if err := archive.Load(ctx); err != nil {
+				return err
+			}
+			if archive.Sealed() {
+				return recovery.ErrArchiveSealed
+			}
+			return nil
+		}
+		if err := core.EnsureDurable(slot); err != nil {
+			return err
+		}
+		return archive.SyncThrough(ctx, core, slot)
+	}
+	server.SetDurabilityBarrier(barrier)
+	if supervised {
+		server.SetReadDurabilityBarrier(barrier)
+	} else if durability == types.ObjectStoreDurabilityBeforeAck && reconfiguration {
+		server.SetReadDurabilityBarrier(voterReadDurabilityBarrier(core.IsVoter, barrier))
+	}
+	return nil
 }
 
 func rejectSupervisedWriterCredentials(config *types.ExecutionConfig) error {
