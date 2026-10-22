@@ -2114,8 +2114,16 @@ func TestArchiveCleanupIgnoresFutureGenerationBeforeHeadPublish(t *testing.T) {
 	if _, _, err := core.Propose(ctx, []byte("value")); err != nil {
 		t.Fatal(err)
 	}
+	base := objstore.NewInMemBucket()
+	emptyHead, err := EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Upload(ctx, "cluster/archive/head.bin", bytes.NewReader(emptyHead), objstore.WithIfNotExists()); err != nil {
+		t.Fatal(err)
+	}
 	extentBucket := &archiveExtentOutcomeBucket{
-		Bucket:           objstore.NewInMemBucket(),
+		Bucket:           base,
 		uploadErr:        fmt.Errorf("injected lost upload response: %w", syscall.EPIPE),
 		persistBeforeErr: true,
 	}
@@ -2123,9 +2131,21 @@ func TestArchiveCleanupIgnoresFutureGenerationBeforeHeadPublish(t *testing.T) {
 	bucket := &blockingHeadUploadBucket{Bucket: extentBucket, started: make(chan struct{}), release: make(chan struct{})}
 	bucket.armed.Store(true)
 	publisher := NewManager(bucket, "cluster", 1)
+	defer publisher.Close()
+	publishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var releaseOnce sync.Once
+	releasePublisher := func() { releaseOnce.Do(func() { close(bucket.release) }) }
+	defer releasePublisher()
 	publishDone := make(chan error, 1)
-	go func() { publishDone <- publisher.SyncThrough(ctx, core, 1) }()
-	<-bucket.started
+	go func() { publishDone <- publisher.SyncThrough(publishCtx, core, 1) }()
+	select {
+	case <-bucket.started:
+	case err := <-publishDone:
+		t.Fatalf("publisher did not pause before HEAD publish: %v", err)
+	case <-publishCtx.Done():
+		t.Fatalf("publisher HEAD pause: %v", publishCtx.Err())
+	}
 	var object string
 	if err := bucket.Iter(ctx, "cluster/archive/blocks", func(name string) error { object = name; return nil }); err != nil {
 		t.Fatal(err)
@@ -2143,7 +2163,7 @@ func TestArchiveCleanupIgnoresFutureGenerationBeforeHeadPublish(t *testing.T) {
 	if exists, _ := bucket.Exists(ctx, object); !exists {
 		t.Fatal("GC deleted an in-flight future-generation extent")
 	}
-	close(bucket.release)
+	releasePublisher()
 	if err := <-publishDone; err != nil {
 		t.Fatal(err)
 	}
