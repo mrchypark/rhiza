@@ -430,6 +430,11 @@ def resources(namespace: str, db_image: str, operator_image: str) -> list[dict]:
                                         }
                                     },
                                 },
+                                # This MinIO/S3 Kind fixture intentionally
+                                # exercises the cooperative Kubernetes fencer;
+                                # it is not the independent NoPVC profile.
+                                {"name": "RHIZA_AUTOMATIC_RECOVERY", "value": "true"},
+                                {"name": "RHIZA_FENCER_BACKEND", "value": "kubernetes"},
                             ],
                             "envFrom": [
                                 {"configMapRef": {"name": "rhiza-config"}},

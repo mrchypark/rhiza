@@ -115,7 +115,7 @@ func TestAnchorActivateFailsClosed(t *testing.T) {
 	}
 
 	// Reserved → Sealed
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestAnchorActivateFailsClosed(t *testing.T) {
 	failAnchor := &fakeAnchorClient{activate: func(_ context.Context, _ recoveryanchor.Request) (recoveryanchor.Receipt, error) {
 		return recoveryanchor.Receipt{}, fmt.Errorf("anchor service unavailable")
 	}}
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestAnchorSuccessFullFlow(t *testing.T) {
 
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -228,7 +228,7 @@ func TestAnchorTamperedRequestBlocks(t *testing.T) {
 
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -246,7 +246,7 @@ func TestAnchorTamperedRequestBlocks(t *testing.T) {
 	// Tamper with the persisted anchor request.
 	r.Status.AnchorRequest.Fork.Tip = 999
 
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestAnchorLostStatusWriteRetryIdempotent(t *testing.T) {
 	}
 
 	// Reserved → Sealed
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestAnchorLostStatusWriteRetryIdempotent(t *testing.T) {
 
 	// Simulate lost status write.
 	api.failStatus = 1
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 	err := c.reconcileAll(ctx)
 	if err == nil {
 		t.Fatal("expected status write failure")
@@ -294,7 +294,7 @@ func TestAnchorLostStatusWriteRetryIdempotent(t *testing.T) {
 	}
 
 	// Retry: idempotent.
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestAnchorStartingAlreadyTargetStaleVerify(t *testing.T) {
 	c.Anchor = anchor
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -338,7 +338,7 @@ func TestAnchorStartingAlreadyTargetStaleVerify(t *testing.T) {
 	// Simulate lost status: sts already has target env, reset only Stage.
 	r.Status.Stage = "Starting"
 	nBefore := atomic.LoadInt32(&anchor.verifyN)
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: failAnchor, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +377,7 @@ func TestAnchorStartingVerifyFailsWhenBackendUnavailable(t *testing.T) {
 	c.Anchor = anchor
 	advance := func(stage string) {
 		t.Helper()
-		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor}
+		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Anchor: anchor, Fencer: c.Fencer}
 		if err := c.reconcileAll(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -392,7 +392,7 @@ func TestAnchorStartingVerifyFailsWhenBackendUnavailable(t *testing.T) {
 	advance("Starting")
 	// Nil the anchor backend. anchorEnvGate fires before receipt check.
 	c.Anchor = nil
-	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity}
+	c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Fencer: c.Fencer}
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}

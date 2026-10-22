@@ -138,7 +138,7 @@ func newArchiveGenesisFixture(t *testing.T) archiveGenesisFixture {
 	draft := stageStoreIntent()
 	draft.StoreScopeHash = storeScopeHash
 	draft.Key = "archive/head.bin"
-	ticket := strings.Repeat("g", 64)
+	ticket := strings.Repeat("7", 64)
 	if err := stages.Reserve(run.MutationProducerUID, ticket, draft); err != nil {
 		t.Fatal(err)
 	}
@@ -168,6 +168,42 @@ func (f archiveGenesisFixture) setStorage(t *testing.T, endpoint string, client 
 	}
 	t.Cleanup(func() { _ = storageClient.Close() })
 	f.e.SourceMutationStorage = storageClient
+}
+
+func commitArchiveGenesisFixture(t *testing.T, f archiveGenesisFixture) {
+	t.Helper()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Query().Get("ifGenerationMatch") != "0" || r.URL.Query().Get("name") != "root/source/archive/head.bin" {
+			t.Errorf("unexpected bootstrap GCS request: %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Contains(body, f.payload) {
+			t.Errorf("bootstrap did not upload the staged empty HEAD bytes: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kind": "storage#object", "bucket": "archive", "name": "root/source/archive/head.bin",
+			"generation": "21", "metageneration": "1", "size": strconv.Itoa(len(f.payload)),
+			"metadata": map[string]string{"rhiza-operation-id": f.intent.OperationID, "rhiza-payload-sha256": f.intent.PayloadDigest},
+		})
+	}))
+	t.Cleanup(server.Close)
+	f.setStorage(t, server.URL, server.Client())
+	if err := f.e.executeSourceMutationRequest(t.Context(), "Bearer test", f.id, sourceMutationRequest{
+		ProducerUID: f.producer, Sequence: 1, Intent: f.intent,
+	}, true); err != nil {
+		t.Fatalf("fixture failed to commit its real archive genesis mutation: %v", err)
+	}
+	root, err := f.e.read(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil || root.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted || root.Ledger.ArchiveGenesisRef == nil {
+		t.Fatalf("fixture archive genesis did not become committed: %+v err=%v", root.Ledger, err)
+	}
 }
 
 func postArchiveGenesisStatus(t *testing.T, e *FencingExecutor, id fencing.Identity) (fencing.ArchiveGenesisStatus, int) {
@@ -314,7 +350,8 @@ func TestArchiveGenesisLosingAdmittedTupleIsDurablyCancelledBeforeDispatch(t *te
 	}
 	second := f.intent
 	second.OperationID = fencing.MutationRequestID(f.producer, 2)
-	ticket := strings.Repeat("h", 64)
+	second.OwnerStep.Step = "genesis-candidate-two"
+	ticket := strings.Repeat("8", 64)
 	draft := second
 	draft.OperationID, draft.PayloadRef, draft.PayloadDigest, draft.PayloadSize = "", "", "", 0
 	if err := f.stages.Reserve(f.producer, ticket, draft); err != nil {

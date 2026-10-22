@@ -85,7 +85,7 @@ func TestAutomaticMembershipCompletionInstallsFailedLearner(t *testing.T) {
 	t.Cleanup(server.Close)
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
 	fenced := 0
-	c.Fencer = &countingFencer{count: &fenced}
+	c.Fencer = &completionOutcomeFencer{countingFencer: &countingFencer{count: &fenced}, archiveForkRegistrarFixture: &archiveForkRegistrarFixture{}}
 	if err := c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func completedAutomaticTarget(t *testing.T, voters []quepaxa.Member) *automaticC
 	if err := bucket.Upload(ctx, "root/source/recovery/successor.json", bytes.NewReader(jsonBytes(c.reservation(child)))); err != nil {
 		t.Fatal(err)
 	}
-	c.Fencer = &countingFencer{count: new(int)}
+	c.Fencer = &completionOutcomeFencer{countingFencer: &countingFencer{count: new(int)}, archiveForkRegistrarFixture: &archiveForkRegistrarFixture{}}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 		if q.Method == http.MethodGet && q.URL.Path == c.resourcePath("recovery-1") {
 			json.NewEncoder(w).Encode(child)
@@ -498,7 +498,7 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 	t.Cleanup(server.Close)
 	c.Kube.BaseURL, c.Kube.Client = server.URL, server.Client()
 	fenced := 0
-	c.Fencer = &countingFencer{count: &fenced}
+	c.Fencer = &completionOutcomeFencer{countingFencer: &countingFencer{count: &fenced}, archiveForkRegistrarFixture: &archiveForkRegistrarFixture{}}
 	if err := c.saveAuto(ctx, r, state, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -667,5 +667,14 @@ func testAutomaticCompletionOutcome(t *testing.T, mode string) {
 }
 
 type completionOutcomeTransport func(*http.Request) (*http.Response, error)
+
+type completionOutcomeFencer struct {
+	*countingFencer
+	*archiveForkRegistrarFixture
+}
+
+func (f *completionOutcomeFencer) Fence(ctx context.Context, request FenceRequest) (*FenceProof, error) {
+	return f.countingFencer.Fence(ctx, request)
+}
 
 func (f completionOutcomeTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
