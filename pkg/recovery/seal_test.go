@@ -135,7 +135,7 @@ func TestSealStopsPublicationAndKeepsSnapshotReadable(t *testing.T) {
 func TestSealRejectsSyncThroughFromWarmCachedTip(t *testing.T) {
 	ctx, bucket, core, cached := newSealableArchive(t)
 	t.Cleanup(func() {
-		_ = cached.Close()
+		cached.Close()
 		_ = bucket.Close()
 	})
 	covered := cached.Tip()
