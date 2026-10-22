@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -192,7 +193,7 @@ var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
 	"backend_result_validation/binding_invalid":        {},
 	"backend_result_validation/binding_mismatch":       {},
 	"backend_result_validation/scope_invalid":          {},
-	"backend_result_validation/scope_digest_mismatch":   {},
+	"backend_result_validation/scope_digest_mismatch":  {},
 	"state_persist/state_write_failed":                 {},
 }
 
@@ -420,6 +421,254 @@ func projectRuntimeAgentDiagnostics(raw string, data []byte) ([]byte, error) {
 	return json.Marshal(view)
 }
 
+type gcsAsyncEmptyPublicSummary struct {
+	Qualification               string `json:"qualification"`
+	Outcome                     string `json:"outcome"`
+	Provider                    string `json:"provider"`
+	NoPVC                       bool   `json:"noPVC"`
+	SourceDurability            string `json:"sourceDurability"`
+	AllowDataLoss               bool   `json:"allowDataLoss"`
+	SourceAcknowledged          bool   `json:"sourceAcknowledged"`
+	SourceAckLostAtEmptyBase    bool   `json:"sourceAckLostAtEmptyBase"`
+	PersistedZeroTipBeforeFence bool   `json:"persistedZeroTipBeforeFence"`
+	SameHeadBeforeProof         bool   `json:"sameHeadBeforeProof"`
+	SealedZeroTipAfterFence     bool   `json:"sealedZeroTipAfterFence"`
+	EmptyBaseRecoveryCommitted  bool   `json:"emptyBaseRecoveryCommitted"`
+	TargetQuorumVerified        bool   `json:"targetQuorumVerified"`
+	EmptyReadbackVerified       bool   `json:"emptyReadbackVerified"`
+	TargetAckReadbackVerified   bool   `json:"targetAckReadbackVerified"`
+	AckToSeal                   string `json:"ackToSeal,omitempty"`
+	PrivateEvidenceSHA256       string `json:"privateEvidenceSHA256,omitempty"`
+	PrivateEventsSHA256         string `json:"privateEventsSHA256,omitempty"`
+}
+
+const (
+	gcsAsyncEmptyEvidenceName   = "gcs-async-empty-evidence.json"
+	gcsAsyncEmptyEventsName     = "gcs-async-empty-events.jsonl"
+	gcsAsyncEmptySummaryName    = "gcs-async-empty-summary.json"
+	maxPrivateQualificationFile = 16 << 20
+)
+
+func projectGCSAsyncEmptyEvidence(raw, public string, failedRun bool) (bool, error) {
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	known := map[string]bool{gcsAsyncEmptyEvidenceName: false, gcsAsyncEmptyEventsName: false}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "gcs-async-empty-") {
+			if _, ok := known[name]; !ok {
+				return false, fmt.Errorf("async-empty private artifact name is not allowlisted")
+			}
+			known[name] = true
+		}
+	}
+	if !known[gcsAsyncEmptyEvidenceName] && !known[gcsAsyncEmptyEventsName] {
+		return false, nil
+	}
+	if !known[gcsAsyncEmptyEventsName] {
+		return false, fmt.Errorf("async-empty evidence exists without its private event record")
+	}
+
+	events, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAsyncEmptyEventsName), true)
+	if err != nil {
+		return false, err
+	}
+	eventsHash := sha256.Sum256(events)
+	summary := gcsAsyncEmptyPublicSummary{
+		Qualification:       "gcs-async-empty-tip-recovery",
+		Outcome:             "failed",
+		PrivateEventsSHA256: hex.EncodeToString(eventsHash[:]),
+	}
+	if !known[gcsAsyncEmptyEvidenceName] {
+		if !failedRun {
+			return false, fmt.Errorf("successful async-empty run is missing its private evidence record")
+		}
+		return true, writeGCSAsyncEmptySummary(public, summary)
+	}
+	evidence, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsAsyncEmptyEvidenceName), false)
+	if err != nil {
+		return false, err
+	}
+	if err := validateGCSAsyncEmptyPrivateEvidence(evidence, &summary); err != nil {
+		return false, err
+	}
+	evidenceHash := sha256.Sum256(evidence)
+	summary.PrivateEvidenceSHA256 = hex.EncodeToString(evidenceHash[:])
+	if !failedRun {
+		summary.Outcome = "passed"
+	}
+	return true, writeGCSAsyncEmptySummary(public, summary)
+}
+
+func readBoundedPrivateArtifact(name string, allowEmpty bool) ([]byte, error) {
+	info, err := os.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || (!allowEmpty && info.Size() <= 0) || info.Size() > maxPrivateQualificationFile {
+		return nil, fmt.Errorf("private async-empty artifact is unsafe or oversized")
+	}
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxPrivateQualificationFile+1))
+	if err != nil || (!allowEmpty && len(data) == 0) || len(data) > maxPrivateQualificationFile {
+		return nil, fmt.Errorf("private async-empty artifact could not be read within bounds")
+	}
+	return data, nil
+}
+
+func validateGCSAsyncEmptyPrivateEvidence(data []byte, summary *gcsAsyncEmptyPublicSummary) error {
+	fields, err := exactJSONFields(data,
+		"qualification", "profile", "sourceAck", "sourceHeadBeforeFence", "sourceHeadBeforeProof", "sealedSourceHead",
+		"fence", "proof", "recovery", "sourceAckLost", "targetQuorumVerified", "emptyReadbackVerified",
+		"targetAckReadbackVerified", "targetEmptyRows", "targetAck", "ackToSeal", "proofSource")
+	if err != nil {
+		return err
+	}
+	var qualification string
+	var profile struct {
+		Provider         string `json:"provider"`
+		Bucket           string `json:"bucket"`
+		NoPVC            bool   `json:"noPVC"`
+		SourceDurability string `json:"sourceDurability"`
+		AllowDataLoss    bool   `json:"allowDataLoss"`
+	}
+	if err := json.Unmarshal(fields["qualification"], &qualification); err != nil || qualification != "gcs-async-empty-tip-recovery" {
+		return fmt.Errorf("private async-empty evidence has an unknown qualification")
+	}
+	if _, err := exactJSONFields(fields["profile"], "provider", "bucket", "noPVC", "sourceDurability", "allowDataLoss"); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["profile"], &profile); err != nil || profile.Provider != "gcs" || profile.Bucket == "" || !profile.NoPVC || profile.SourceDurability != "async" || !profile.AllowDataLoss {
+		return fmt.Errorf("private async-empty evidence profile is incomplete")
+	}
+	var sourceAck, targetAck gcsAcknowledgement
+	if _, err := exactJSONFields(fields["sourceAck"], "requestID", "slot", "rows"); err != nil {
+		return err
+	}
+	if _, err := exactJSONFields(fields["targetAck"], "requestID", "slot", "rows"); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["sourceAck"], &sourceAck); err != nil || sourceAck.RequestID == "" || sourceAck.Slot == 0 || sourceAck.Rows != `[[1,"gcs-async-ack-lost"]]` {
+		return fmt.Errorf("private async-empty source ACK receipt is incomplete")
+	}
+	if err := json.Unmarshal(fields["targetAck"], &targetAck); err != nil || targetAck.RequestID == "" || targetAck.Slot == 0 || targetAck.Rows != `[[2,"gcs-async-target-ack"]]` {
+		return fmt.Errorf("private async-empty target ACK readback is incomplete")
+	}
+	var before, beforeProof, sealed gcsArchiveHeadEvidence
+	for name, head := range map[string]*gcsArchiveHeadEvidence{"sourceHeadBeforeFence": &before, "sourceHeadBeforeProof": &beforeProof, "sealedSourceHead": &sealed} {
+		if _, err := exactJSONFields(fields[name], "versionType", "version", "tip", "sealed", "headSHA256"); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(fields[name], head); err != nil {
+			return fmt.Errorf("private async-empty source HEAD evidence is invalid")
+		}
+	}
+	if err := validateInitialZeroHead(before); err != nil {
+		return err
+	}
+	if err := validateUnchangedZeroHead(before, beforeProof); err != nil {
+		return err
+	}
+	if err := validateSealedZeroHead(before, sealed); err != nil {
+		return err
+	}
+	var fence operator.FenceRequest
+	var proof operator.FenceProof
+	var recovery operator.Resource
+	if err := json.Unmarshal(fields["fence"], &fence); err != nil || fence.OperationID == "" || fence.SourceClusterID == "" {
+		return fmt.Errorf("private async-empty generation fence identity is incomplete")
+	}
+	if err := json.Unmarshal(fields["proof"], &proof); err != nil || proof.OperationID != fence.OperationID || proof.SourceClusterID != fence.SourceClusterID || proof.BindingUID != fence.BindingUID {
+		return fmt.Errorf("private async-empty generation proof differs from its request")
+	}
+	if err := json.Unmarshal(fields["recovery"], &recovery); err != nil || recovery.Spec.RecoveryID != fence.OperationID || recovery.Spec.SourceClusterID != fence.SourceClusterID {
+		return fmt.Errorf("private async-empty recovery differs from its source fence")
+	}
+	if err := recoveryFenceMatchesProof(recovery, fence, proof); err != nil {
+		return err
+	}
+	if err := verifyAsyncEmptyRecovery(recovery, fence, proof); err != nil {
+		return err
+	}
+	var sourceAckLost, targetQuorum, emptyReadback, targetReadback bool
+	if err := json.Unmarshal(fields["sourceAckLost"], &sourceAckLost); err != nil || !sourceAckLost {
+		return fmt.Errorf("private async-empty evidence does not prove the source ACK was lost")
+	}
+	if err := json.Unmarshal(fields["targetQuorumVerified"], &targetQuorum); err != nil || !targetQuorum {
+		return fmt.Errorf("private async-empty evidence does not prove target quorum")
+	}
+	if err := json.Unmarshal(fields["emptyReadbackVerified"], &emptyReadback); err != nil || !emptyReadback {
+		return fmt.Errorf("private async-empty evidence does not prove the empty-base readback")
+	}
+	if err := json.Unmarshal(fields["targetAckReadbackVerified"], &targetReadback); err != nil || !targetReadback {
+		return fmt.Errorf("private async-empty evidence does not prove the target ACK readback")
+	}
+	var targetEmptyRows, proofSource, ackToSeal string
+	if err := json.Unmarshal(fields["targetEmptyRows"], &targetEmptyRows); err != nil || targetEmptyRows != "[]" {
+		return fmt.Errorf("private async-empty target readback is not empty")
+	}
+	if err := json.Unmarshal(fields["proofSource"], &proofSource); err != nil || proofSource != "RhizaFence status plus direct read-only GCS HEAD read; the generation fence proof is validated against captured workload identities" {
+		return fmt.Errorf("private async-empty proof source is not recognized")
+	}
+	if err := json.Unmarshal(fields["ackToSeal"], &ackToSeal); err != nil {
+		return fmt.Errorf("private async-empty ACK-to-seal duration is invalid")
+	}
+	duration, err := time.ParseDuration(ackToSeal)
+	if err != nil || duration < 0 || duration > gcsAsyncEmptyMaxAckToSeal {
+		return fmt.Errorf("private async-empty ACK-to-seal duration is outside its bound")
+	}
+
+	summary.Qualification = qualification
+	summary.Provider = profile.Provider
+	summary.NoPVC = profile.NoPVC
+	summary.SourceDurability = profile.SourceDurability
+	summary.AllowDataLoss = profile.AllowDataLoss
+	summary.SourceAcknowledged = true
+	summary.SourceAckLostAtEmptyBase = sourceAckLost
+	summary.PersistedZeroTipBeforeFence = true
+	summary.SameHeadBeforeProof = true
+	summary.SealedZeroTipAfterFence = true
+	summary.EmptyBaseRecoveryCommitted = true
+	summary.TargetQuorumVerified = targetQuorum
+	summary.EmptyReadbackVerified = emptyReadback
+	summary.TargetAckReadbackVerified = targetReadback
+	summary.AckToSeal = ackToSeal
+	return nil
+}
+
+func exactJSONFields(data []byte, expected ...string) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil || fields == nil {
+		return nil, fmt.Errorf("private async-empty evidence object is invalid")
+	}
+	wanted := make(map[string]bool, len(expected))
+	for _, name := range expected {
+		wanted[name] = true
+	}
+	if len(fields) != len(wanted) {
+		return nil, fmt.Errorf("private async-empty evidence has an unexpected field set")
+	}
+	for name := range fields {
+		if !wanted[name] {
+			return nil, fmt.Errorf("private async-empty evidence contains an unknown field")
+		}
+	}
+	return fields, nil
+}
+
+func writeGCSAsyncEmptySummary(public string, summary gcsAsyncEmptyPublicSummary) error {
+	if err := os.WriteFile(filepath.Join(public, gcsAsyncEmptySummaryName), encoded(summary), 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Only explicit evidence types enter the public packet; raw diagnostics stay on the disposable runner.
 func safeArtifacts(raw string) error {
 	if raw == "" {
@@ -535,9 +784,16 @@ func safeArtifacts(raw string) error {
 			return err
 		}
 	}
+	asyncEmptySeen, err := projectGCSAsyncEmptyEvidence(raw, public, failedRun)
+	if err != nil {
+		return err
+	}
 	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
 	if !failedRun {
 		required = append(required, "runtime-profile.json", "runtime-component-probe.json")
+		if asyncEmptySeen {
+			required = append(required, gcsAsyncEmptySummaryName)
+		}
 	} else {
 		for _, name := range []string{"fencer-diagnostics.json", "fencer-pods.json", "fencer-events.json", "fencer-deployment.json"} {
 			if _, statErr := os.Stat(filepath.Join(public, name)); statErr == nil {

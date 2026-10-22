@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/thanos-io/objstore"
 )
 
 func TestPublicImageEvidenceOmitsCredentialCanaries(t *testing.T) {
@@ -255,4 +258,149 @@ func TestPublicPacketFailsClosedOnUnexpectedReadback(t *testing.T) {
 	if err := safeArtifacts(raw); err == nil {
 		t.Fatal("unexpected readback admitted for publication")
 	}
+}
+
+func TestAsyncEmptyPublicProjectionHashesPrivateEvidenceWithoutScopeIdentifiers(t *testing.T) {
+	const privateCanary = "private-bucket-project-prefix-endpoint-poduid-token-canary"
+	raw := t.TempDir()
+	for name, data := range map[string][]byte{
+		"actual-exit.txt":              []byte("0\n"),
+		"source-head.txt":              []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":                []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		"runtime-profile.json":         encoded(runtimeProfileEvidence{}),
+		"runtime-component-probe.json": encoded(runtimeComponentEvidence{}),
+		gcsAsyncEmptyEventsName:        []byte(`{"event":"private","value":"` + privateCanary + `"}` + "\n"),
+		gcsAsyncEmptyEvidenceName:      asyncEmptyPrivateEvidenceFixture(privateCanary),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("strict async-empty public projection failed: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsAsyncEmptySummaryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(public, []byte(privateCanary)) || bytes.Contains(public, []byte("bucket")) || bytes.Contains(public, []byte("prefix")) || bytes.Contains(public, []byte("endpoint")) {
+		t.Fatalf("public async-empty summary leaked a private identifier: %s", public)
+	}
+	var summary gcsAsyncEmptyPublicSummary
+	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "passed" || !summary.SourceAckLostAtEmptyBase || !summary.EmptyBaseRecoveryCommitted || !summary.TargetAckReadbackVerified || len(summary.PrivateEvidenceSHA256) != 64 || len(summary.PrivateEventsSHA256) != 64 {
+		t.Fatalf("public async-empty summary is incomplete: %+v, %v", summary, err)
+	}
+	for _, name := range []string{gcsAsyncEmptyEvidenceName, gcsAsyncEmptyEventsName} {
+		if _, err := os.Stat(filepath.Join(raw, "public", name)); !os.IsNotExist(err) {
+			t.Fatalf("private async-empty artifact %s was copied publicly", name)
+		}
+	}
+}
+
+func TestAsyncEmptyArtifactProjectionRejectsUnknownFieldsAndFiles(t *testing.T) {
+	privateCanary := "private-scope-value"
+	for _, tc := range []struct {
+		name   string
+		mutate func(obj) obj
+		file   string
+	}{
+		{name: "unknown evidence key", mutate: func(value obj) obj { value["unreviewed"] = "private"; return value }},
+		{name: "recovery references another proof", mutate: func(value obj) obj {
+			recovery := value["recovery"].(map[string]any)
+			spec := recovery["spec"].(map[string]any)
+			fence := spec["fence"].(map[string]any)
+			fence["evidence"] = "different-proof"
+			return value
+		}},
+		{name: "recovery fence names another operation", mutate: func(value obj) obj {
+			recovery := value["recovery"].(map[string]any)
+			spec := recovery["spec"].(map[string]any)
+			fence := spec["fence"].(map[string]any)
+			fence["recoveryID"] = "different-operation"
+			return value
+		}},
+		{name: "recovery fence is unconfirmed", mutate: func(value obj) obj {
+			recovery := value["recovery"].(map[string]any)
+			spec := recovery["spec"].(map[string]any)
+			fence := spec["fence"].(map[string]any)
+			fence["confirmed"] = false
+			return value
+		}},
+		{name: "unknown async artifact file", file: "gcs-async-empty-extra.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := t.TempDir()
+			if err := os.Mkdir(filepath.Join(raw, "public"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if tc.file != "" {
+				if err := os.WriteFile(filepath.Join(raw, tc.file), []byte("private"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				value := asyncEmptyPrivateEvidenceFixture(privateCanary)
+				var evidence obj
+				if err := json.Unmarshal(value, &evidence); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(raw, gcsAsyncEmptyEvidenceName), encoded(tc.mutate(evidence)), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(raw, gcsAsyncEmptyEventsName), []byte("{}\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := projectGCSAsyncEmptyEvidence(raw, filepath.Join(raw, "public"), false); err == nil {
+				t.Fatal("accepted unreviewed async-empty artifact content")
+			}
+		})
+	}
+}
+
+func TestFailedAsyncEmptyRunPublishesOnlyHashOfPartialPrivateEvents(t *testing.T) {
+	const privateCanary = "private-partial-async-empty-scope"
+	raw := t.TempDir()
+	for name, data := range map[string][]byte{
+		"actual-exit.txt":       []byte("1\n"),
+		"source-head.txt":       []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":         []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
+		gcsAsyncEmptyEventsName: []byte(`{"event":"partial","private":"` + privateCanary + `"}` + "\n"),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("failed async-empty run did not preserve safe failure artifacts: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsAsyncEmptySummaryName))
+	if err != nil || bytes.Contains(public, []byte(privateCanary)) {
+		t.Fatalf("failed-run projection leaked partial private event data: %v", err)
+	}
+	var summary gcsAsyncEmptyPublicSummary
+	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "failed" || summary.PrivateEventsSHA256 == "" || summary.PrivateEvidenceSHA256 != "" {
+		t.Fatalf("failed-run summary incorrectly claims complete private evidence: %+v, %v", summary, err)
+	}
+}
+
+func asyncEmptyPrivateEvidenceFixture(privateValue string) []byte {
+	before := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1001", Tip: 0, Sealed: false, HeadSHA256: strings.Repeat("a", 64)}
+	sealed := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1002", Tip: 0, Sealed: true, HeadSHA256: strings.Repeat("b", 64)}
+	fence := operator.FenceRequest{OperationID: "source-fence-op", SourceClusterID: privateValue, StatefulSetUID: "source-sts", BindingUID: "binding", Namespace: privateValue, Targets: []operator.FenceTarget{{Pod: privateValue, PodUID: privateValue}}}
+	proof := operator.FenceProof{OperationID: fence.OperationID, SourceClusterID: fence.SourceClusterID, BindingUID: fence.BindingUID, ProofID: "exact-proof", IndependentV2: &operator.IndependentEvidenceV2{StorageScope: operator.AttestationStoreScope{Provider: "gcs", Bucket: privateValue, Prefix: privateValue, Endpoint: privateValue}}}
+	recovery := operator.Resource{
+		Metadata: map[string]any{"bucket": privateValue, "podUID": privateValue},
+		Spec:     operator.Spec{SourceClusterID: fence.SourceClusterID, RecoveryID: fence.OperationID, Durability: "async", AllowDataLoss: true, Fence: operator.Fence{RecoveryID: fence.OperationID, ClusterID: fence.SourceClusterID, StatefulSetUID: fence.StatefulSetUID, Confirmed: true, Evidence: proof.ProofID}},
+		Status:   operator.Status{Phase: "Complete", Stage: "Complete", Source: fence.SourceClusterID, TargetBaseKind: "empty", SourceDurability: "async"},
+	}
+	return encoded(obj{
+		"qualification":         "gcs-async-empty-tip-recovery",
+		"profile":               obj{"provider": "gcs", "bucket": privateValue, "noPVC": true, "sourceDurability": "async", "allowDataLoss": true},
+		"sourceAck":             gcsAcknowledgement{RequestID: "source-write", Slot: 1, Rows: `[[1,"gcs-async-ack-lost"]]`},
+		"sourceHeadBeforeFence": before, "sourceHeadBeforeProof": before, "sealedSourceHead": sealed,
+		"fence": fence, "proof": proof, "recovery": recovery,
+		"sourceAckLost": true, "targetQuorumVerified": true, "emptyReadbackVerified": true, "targetAckReadbackVerified": true,
+		"targetEmptyRows": "[]", "targetAck": gcsAcknowledgement{RequestID: "target-write", Slot: 1, Rows: `[[2,"gcs-async-target-ack"]]`},
+		"ackToSeal": "5s", "proofSource": "RhizaFence status plus direct read-only GCS HEAD read; the generation fence proof is validated against captured workload identities",
+	})
 }

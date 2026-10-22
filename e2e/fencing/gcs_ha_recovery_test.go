@@ -52,6 +52,31 @@ func TestGCSFenceSpecComparisonDecodesKubernetesMap(t *testing.T) {
 	}
 }
 
+func TestGCSProofWaitIsBoundToTheExactPendingFenceResourceAndOperation(t *testing.T) {
+	request := operator.FenceRequest{
+		LogicalID: "logical", BindingUID: "binding", Namespace: "run-ns", StatefulSet: "rhiza-voter", StatefulSetUID: "sts-uid",
+		SourceClusterID: "generation-1", OperationID: "fence-exact", Scope: operator.ScopeGeneration,
+		Targets: []operator.FenceTarget{{NodeID: "voter-0", Pod: "voter-0", PodUID: "pod-uid", WALIdentity: "wal"}},
+	}
+	pending := pendingGCSFence{Name: "fence-resource", UID: "fence-uid", Request: request}
+	item := obj{"metadata": obj{"name": pending.Name, "uid": pending.UID}, "spec": request}
+	if got, err := exactPendingGCSFenceRequest(item, pending); err != nil || !sameFenceRequest(got, request) {
+		t.Fatalf("rejected the exact pending fence resource: %v", err)
+	}
+
+	otherOperation := request
+	otherOperation.OperationID = "another-operation-same-cohort"
+	item["spec"] = otherOperation
+	if _, err := exactPendingGCSFenceRequest(item, pending); err == nil {
+		t.Fatal("accepted another operation for the same source cohort")
+	}
+	item["spec"] = request
+	item["metadata"] = obj{"name": pending.Name, "uid": "replacement-resource-uid"}
+	if _, err := exactPendingGCSFenceRequest(item, pending); err == nil {
+		t.Fatal("accepted a same-name replacement RhizaFence resource")
+	}
+}
+
 func TestScopedProofUsesCapturedSourceGeneration(t *testing.T) {
 	request := operator.FenceRequest{LogicalID: "fencing-e2e", BindingUID: "binding", Namespace: namespace, StatefulSet: "rhiza", StatefulSetUID: "sts", SourceClusterID: "gcs-source", OperationID: "fence", Scope: operator.ScopeGeneration}
 	proof := operator.FenceProof{OperationID: "fence", SourceClusterID: "gcs-source", BindingUID: "binding"}
@@ -117,15 +142,30 @@ func TestRecoveryLineageRequiresSameStatefulSetAndFreshIncarnations(t *testing.T
 	}
 }
 
-func TestAsyncZeroRecoveryRequiresExplicitLossPolicyAndEmptyBase(t *testing.T) {
-	resource := operator.Resource{Spec: operator.Spec{Durability: "async", AllowDataLoss: true}, Status: operator.Status{Phase: "Complete", Stage: "Complete", TargetBaseKind: "empty", SourceDurability: "async"}}
-	proof := operator.FenceProof{IndependentV2: &operator.IndependentEvidenceV2{StorageScope: operator.AttestationStoreScope{Provider: "gcs"}}}
-	if err := verifyAsyncEmptyRecovery(resource, proof); err != nil {
+func TestAsyncZeroRecoveryRequiresExplicitLossPolicyAndExactFenceProof(t *testing.T) {
+	request := operator.FenceRequest{OperationID: "fence-op", SourceClusterID: "source", StatefulSetUID: "source-sts", BindingUID: "binding"}
+	proof := operator.FenceProof{OperationID: request.OperationID, SourceClusterID: request.SourceClusterID, BindingUID: request.BindingUID, ProofID: "exact-proof", IndependentV2: &operator.IndependentEvidenceV2{StorageScope: operator.AttestationStoreScope{Provider: "gcs"}}}
+	resource := operator.Resource{Spec: operator.Spec{SourceClusterID: request.SourceClusterID, RecoveryID: request.OperationID, Durability: "async", AllowDataLoss: true, Fence: operator.Fence{RecoveryID: request.OperationID, ClusterID: request.SourceClusterID, StatefulSetUID: request.StatefulSetUID, Confirmed: true, Evidence: proof.ProofID}}, Status: operator.Status{Phase: "Complete", Stage: "Complete", TargetBaseKind: "empty", SourceDurability: "async"}}
+	if err := verifyAsyncEmptyRecovery(resource, request, proof); err != nil {
 		t.Fatalf("valid explicit async zero recovery rejected: %v", err)
 	}
 	resource.Spec.AllowDataLoss = false
-	if err := verifyAsyncEmptyRecovery(resource, proof); err == nil {
+	if err := verifyAsyncEmptyRecovery(resource, request, proof); err == nil {
 		t.Fatal("accepted async zero recovery without explicit allowDataLoss")
+	}
+	resource.Spec.AllowDataLoss = true
+	for name, mutate := range map[string]func(*operator.Resource, *operator.FenceProof){
+		"wrong proof ID":          func(_ *operator.Resource, p *operator.FenceProof) { p.ProofID = "other-proof" },
+		"wrong recovery fence ID": func(r *operator.Resource, _ *operator.FenceProof) { r.Spec.Fence.RecoveryID = "other-operation" },
+		"unconfirmed fence":       func(r *operator.Resource, _ *operator.FenceProof) { r.Spec.Fence.Confirmed = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			badResource, badProof := resource, proof
+			mutate(&badResource, &badProof)
+			if err := verifyAsyncEmptyRecovery(badResource, request, badProof); err == nil {
+				t.Fatal("accepted recovery not linked to the exact captured proof")
+			}
+		})
 	}
 }
 
