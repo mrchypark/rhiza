@@ -204,7 +204,7 @@ func TestNodeForegroundAPICostS3(t *testing.T) {
 		transportObserver.SetPhase("cleanup_preparation")
 		cleanupStart, cleanupStartErr := nodeVersityRequestCount(gateway)
 		storeBeforeCleanup := snapshotNodeStoreStats(nodes)
-		storeBuckets := make([]*objmetrics.MeteredBucket, len(nodes))
+		storeBuckets := make([]nodeObjectBucket, len(nodes))
 		for i, node := range nodes {
 			storeBuckets[i] = node.bucket
 		}
@@ -3225,7 +3225,7 @@ func snapshotNodeStoreStats(nodes []*Node) []nodeStoreSnapshot {
 	return snapshots
 }
 
-func snapshotNodeStoreBuckets(buckets []*objmetrics.MeteredBucket) []nodeStoreSnapshot {
+func snapshotNodeStoreBuckets(buckets []nodeObjectBucket) []nodeStoreSnapshot {
 	snapshots := make([]nodeStoreSnapshot, len(buckets))
 	for i, bucket := range buckets {
 		if bucket != nil {

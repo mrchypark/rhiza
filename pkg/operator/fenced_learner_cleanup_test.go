@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -41,6 +42,12 @@ func TestStoppingDeletesOnlyFencedStandaloneLearner(t *testing.T) {
 			state := validAutoControl()
 			state.BindingUID, state.StatefulSetUID = "root-uid", "sts-uid"
 			state.Intent = &autoIntent{Request: request, RecoveryName: resourceName(r), RecoveryUID: str(r.Metadata["uid"]), SpecHash: hashJSON(r.Spec), Proof: &FenceProof{OperationID: request.OperationID, BindingUID: request.BindingUID, SourceClusterID: request.SourceClusterID, RequestHash: hash, ProofID: r.Spec.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}}
+			c.Fencer = retirementFencer(func(_ context.Context, got FenceRequest) (*FenceProof, error) {
+				if scenario != "never-bound" || hashJSON(got) != hashJSON(request) {
+					return nil, ErrFencePending
+				}
+				return state.Intent.Proof, nil
+			})
 			state.Learners = []learnerIncarnation{{SourceClusterID: "source", OperationID: "original-online-op", CredentialUID: "credential-uid", Target: request.Targets[0]}}
 			ledger := fenceLedger{StatefulSetUID: "sts-uid", Ledger: fencing.Ledger{SourceClusterID: "source"}}
 			if neverBound {

@@ -36,7 +36,12 @@ type FencingExecutor struct {
 	// AuthorityState is canonical ObjectStorage state; Kubernetes resources are
 	// only optional indexes and are never consulted to reconstruct authority.
 	AuthorityState *AuthorityStateStore
-	Attestor       FenceAttestor
+	// LegacyCooperativeControlState explicitly opts into the Kubernetes CAS
+	// ledger for cooperative-only operation. It is never a fallback from a
+	// configured canonical store and source-mutation APIs still require
+	// AuthorityState.
+	LegacyCooperativeControlState bool
+	Attestor                      FenceAttestor
 	// SourceStages is an optional local fallback for isolated tests or development.
 	// Production selects root-bound ObjectStorage staging through sourceStagesFor.
 	SourceStages *SourceStageStore
@@ -73,6 +78,9 @@ func (e *FencingExecutor) ledgerPath(uid, source string) string {
 // pure and must tolerate a response lost after the conditional write commits.
 func (e *FencingExecutor) change(ctx context.Context, uid, source string, transition func(*fencing.Ledger) error) (fenceLedger, error) {
 	if e.AuthorityState == nil {
+		if e != nil && e.LegacyCooperativeControlState {
+			return e.changeLegacyCooperative(ctx, uid, source, transition)
+		}
 		return fenceLedger{}, fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
 	}
 	for attempt := 0; attempt < 8; attempt++ {
@@ -93,14 +101,9 @@ func (e *FencingExecutor) change(ctx context.Context, uid, source string, transi
 		if errors.Is(writeErr, errAuthorityStateConflict) {
 			continue
 		}
-		// A lost response is confirmed only by reading the exact canonical root.
-		committed, _, readErr := e.AuthorityState.ReadRoot(ctx, uid, source)
-		if readErr == nil && hashJSON(committed) == hashJSON(state) {
-			return committed, nil
-		}
-		if readErr != nil && !errors.Is(readErr, errAuthorityStateNotFound) {
-			return state, errors.Join(writeErr, readErr)
-		}
+		// WriteRoot confirms uncertain responses only when this attempt's fresh
+		// revision is present. Logical equality alone can describe an older value.
+		return state, writeErr
 	}
 	return fenceLedger{}, fencing.ErrUnavailable
 }
@@ -109,6 +112,13 @@ func (e *FencingExecutor) change(ctx context.Context, uid, source string, transi
 // transitions never interpret a missing canonical root as permission to open it.
 func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string) error {
 	if e.AuthorityState == nil {
+		if e != nil && e.LegacyCooperativeControlState {
+			_, err := e.readLegacyCooperative(ctx, uid, source)
+			if apiNotFound(err) {
+				return nil
+			}
+			return err
+		}
 		return fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
 	}
 	if _, _, err := e.AuthorityState.ReadRoot(ctx, uid, source); err == nil {
@@ -137,11 +147,88 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 
 func (e *FencingExecutor) read(ctx context.Context, uid, source string) (fenceLedger, error) {
 	if e.AuthorityState == nil {
+		if e != nil && e.LegacyCooperativeControlState {
+			return e.readLegacyCooperative(ctx, uid, source)
+		}
 		return fenceLedger{}, fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
 	}
 	state, _, err := e.AuthorityState.ReadRoot(ctx, uid, source)
 	if err != nil {
 		return fenceLedger{}, err
+	}
+	return state, nil
+}
+
+func (e *FencingExecutor) changeLegacyCooperative(ctx context.Context, uid, source string, transition func(*fencing.Ledger) error) (fenceLedger, error) {
+	if e == nil || e.Kube == nil || transition == nil {
+		return fenceLedger{}, fmt.Errorf("fencing: legacy cooperative Kubernetes control state is unavailable")
+	}
+	endpoint := e.ledgerPath(uid, source)
+	for attempt := 0; attempt < 8; attempt++ {
+		var resource object
+		err := e.Kube.Get(ctx, endpoint, &resource)
+		creating := apiNotFound(err)
+		if err != nil && !creating {
+			return fenceLedger{}, err
+		}
+		state := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{SourceClusterID: source}}
+		if !creating {
+			if nested(resource, "metadata", "deletionTimestamp") != nil {
+				return state, fmt.Errorf("fencing: ledger deleting")
+			}
+			if err := json.Unmarshal([]byte(str(nested(resource, "data", "ledger.json"))), &state); err != nil {
+				return state, err
+			}
+			if state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
+				return state, fmt.Errorf("fencing: ledger identity differs")
+			}
+		}
+		if err := transition(&state.Ledger); err != nil {
+			return state, err
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return state, err
+		}
+		if len(data) > 700000 {
+			return state, fmt.Errorf("fencing: ledger capacity exhausted; old evidence cannot be discarded")
+		}
+		if creating {
+			_, name, _ := strings.Cut(endpoint, e.controller().corePath("configmaps", "")+"/")
+			resource = object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": name, "namespace": e.Kube.Namespace}, "data": object{"ledger.json": string(data)}}
+			err = e.Kube.Post(ctx, e.controller().corePath("configmaps", ""), resource, nil)
+		} else {
+			resource["data"] = object{"ledger.json": string(data)}
+			err = e.Kube.Put(ctx, endpoint, resource, nil)
+		}
+		if err == nil {
+			return state, nil
+		}
+		var api *APIError
+		if !errors.As(err, &api) || api.StatusCode != http.StatusConflict {
+			return state, err
+		}
+	}
+	return fenceLedger{}, fencing.ErrUnavailable
+}
+
+func (e *FencingExecutor) readLegacyCooperative(ctx context.Context, uid, source string) (fenceLedger, error) {
+	if e == nil || e.Kube == nil {
+		return fenceLedger{}, fmt.Errorf("fencing: legacy cooperative Kubernetes control state is unavailable")
+	}
+	var resource object
+	if err := e.Kube.Get(ctx, e.ledgerPath(uid, source), &resource); err != nil {
+		return fenceLedger{}, err
+	}
+	var state fenceLedger
+	if nested(resource, "metadata", "deletionTimestamp") != nil {
+		return state, fmt.Errorf("fencing: ledger deleting")
+	}
+	if err := json.Unmarshal([]byte(str(nested(resource, "data", "ledger.json"))), &state); err != nil {
+		return state, err
+	}
+	if state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
+		return state, fmt.Errorf("fencing: ledger identity differs")
 	}
 	return state, nil
 }

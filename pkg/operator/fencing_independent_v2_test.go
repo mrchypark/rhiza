@@ -118,7 +118,7 @@ func exerciseIndependentVoterThenGeneration(t *testing.T) {
 		}
 		return nil
 	}
-	restarted := &FencingExecutor{Kube: e.Kube, CollectRuntimeEvidence: collector, VerifyRuntimeEvidence: verifier}
+	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState, CollectRuntimeEvidence: collector, VerifyRuntimeEvidence: verifier}
 	next := record.Spec
 	next.Scope, next.OperationID = ScopeGeneration, "next-generation"
 	next.Targets = []FenceTarget{{NodeID: other.NodeID, Pod: other.NodeID, PodUID: other.PodUID, WALIdentity: "wal", NodeName: other.NodeName, NodeUID: other.NodeUID, ContainerID: other.ContainerID, ImageID: other.ImageID}}

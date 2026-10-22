@@ -48,7 +48,7 @@ func (s *SourceStageStore) reserveRemoteStageQuota(ctx context.Context, producer
 	key := sourceStageQuotaKey(producerUID)
 	for range 32 {
 		var quota remoteSourceStageQuota
-		r, generation, err := s.evidence.Read(ctx, key)
+		r, generation, err := s.evidence.ReadMutable(ctx, key)
 		if err != nil {
 			if !s.evidence.IsNotFound(err) {
 				return err
@@ -155,7 +155,7 @@ func (s *SourceStageStore) retireRemoteStageQuota(ctx context.Context, producerU
 	key := sourceStageQuotaKey(producerUID)
 	for range 32 {
 		var quota remoteSourceStageQuota
-		r, generation, err := s.evidence.Read(ctx, key)
+		r, generation, err := s.evidence.ReadMutable(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -185,11 +185,23 @@ func (s *SourceStageStore) retireRemoteStageQuota(ctx context.Context, producerU
 		if err != nil {
 			return err
 		}
-		if _, err := s.evidence.CompareAndSwap(ctx, key, generation, body); err == nil {
+		if _, err := s.evidence.CompareAndSwap(ctx, key, generation, body); err != nil {
+			if !stageEvidenceCASConflict(s.evidence, err) {
+				return fmt.Errorf("fencing: remote source stage quota retirement CAS: %w", err)
+			}
+		} else {
 			return nil
 		}
 	}
 	return fmt.Errorf("fencing: remote source staging retirement CAS remained uncertain")
+}
+
+func stageEvidenceCASConflict(evidence *AuthorityEvidenceStore, err error) bool {
+	if evidence == nil || err == nil {
+		return false
+	}
+	checker, ok := evidence.objects.(interface{ isConflict(error) bool })
+	return ok && checker.isConflict(err)
 }
 
 // releaseCancelledRemoteStageQuota frees capacity only after the stage record
@@ -199,7 +211,7 @@ func (s *SourceStageStore) releaseCancelledRemoteStageQuota(ctx context.Context,
 	key := sourceStageQuotaKey(producerUID)
 	for range 32 {
 		var quota remoteSourceStageQuota
-		r, generation, err := s.evidence.Read(ctx, key)
+		r, generation, err := s.evidence.ReadMutable(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -464,7 +476,7 @@ func (s *SourceStageStore) CancelContext(ctx context.Context, producerUID, ticke
 
 func (s *SourceStageStore) readRemoteStage(ctx context.Context, producerUID, ticket string) (remoteSourceStageRecord, *objstore.ObjectVersion, error) {
 	var record remoteSourceStageRecord
-	r, generation, err := s.evidence.Read(ctx, sourceStageRecordKey(producerUID, ticket))
+	r, generation, err := s.evidence.ReadMutable(ctx, sourceStageRecordKey(producerUID, ticket))
 	if err != nil {
 		return record, nil, err
 	}
@@ -505,15 +517,7 @@ func (s *SourceStageStore) writeRemoteStage(ctx context.Context, producerUID, ti
 	if err != nil {
 		return nil, err
 	}
-	newGeneration, err := s.evidence.CompareAndSwap(ctx, sourceStageRecordKey(producerUID, ticket), generation, data)
-	if err == nil {
-		return newGeneration, nil
-	}
-	current, gotGeneration, readErr := s.readRemoteStage(ctx, producerUID, ticket)
-	if readErr == nil && current.Digest == record.Digest && current.digest() == record.Digest {
-		return gotGeneration, nil
-	}
-	return nil, errors.Join(err, readErr)
+	return s.evidence.CompareAndSwap(ctx, sourceStageRecordKey(producerUID, ticket), generation, data)
 }
 
 func (s *SourceStageStore) openRemoteMutationPayload(ctx context.Context, producerUID string, intent fencing.MutationIntent) (io.ReadCloser, error) {

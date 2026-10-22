@@ -158,7 +158,7 @@ func newAttestedExecutor(t *testing.T, attestor FenceAttestor) (*FencingExecutor
 	request := independentRequest()
 	record := &fenceResource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaFence", Metadata: object{"name": "fence-x", "namespace": "default"}, Spec: request}
 	kube := &Kubernetes{BaseURL: api.server.URL, Namespace: "default", TokenFile: token, Client: api.server.Client()}
-	return &FencingExecutor{Kube: kube, Attestor: attestor}, api, record
+	return &FencingExecutor{Kube: kube, Attestor: attestor, LegacyCooperativeControlState: true}, api, record
 }
 
 func TestAttestedFenceNeverReplacesTheCooperativeLedger(t *testing.T) {

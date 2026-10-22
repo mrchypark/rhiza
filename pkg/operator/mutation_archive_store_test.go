@@ -19,12 +19,13 @@ import (
 
 type archiveTestBucket struct {
 	objstore.Bucket
-	failReadKey   string
-	failReadOnce  string
-	failDeleteKey string
-	failUploadKey string
-	loseCreate    string
-	reads         int
+	failReadKey     string
+	failReadOnce    string
+	failDeleteKey   string
+	failUploadKey   string
+	loseCreate      string
+	loseCASResponse string
+	reads           int
 }
 
 func (b *archiveTestBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -50,6 +51,11 @@ func (b *archiveTestBucket) Upload(ctx context.Context, name string, r io.Reader
 	if err == nil && name == b.loseCreate {
 		b.loseCreate = ""
 		return errors.New("lost immutable create response")
+	}
+	if err == nil && name == b.loseCASResponse {
+		b.loseCASResponse = ""
+		b.failReadOnce = name
+		return errors.New("lost authority CAS response")
 	}
 	return err
 }
@@ -405,7 +411,7 @@ func TestMutationArchiveStoreLostCASAndOrphanRequireExactCommittedChain(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrapped := &archiveTestBucket{Bucket: e.AuthorityState.bucket, loseCreate: producerKey, failReadOnce: producerKey}
+	wrapped := &archiveTestBucket{Bucket: e.AuthorityState.bucket, loseCASResponse: producerKey}
 	e.AuthorityState.bucket = wrapped
 	_, err = e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.CommitMutationCompaction(a.ProducerUID, a, ref) })
 	if err == nil {

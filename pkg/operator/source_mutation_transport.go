@@ -22,7 +22,7 @@ func (e *FencingExecutor) handleSourceMutation(w http.ResponseWriter, r *http.Re
 		http.NotFound(w, r)
 		return
 	}
-	if e.SourceMutationStorage == nil {
+	if e.SourceMutationStorage == nil || e.AuthorityState == nil {
 		http.Error(w, "source mutation execution is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -106,6 +106,9 @@ func (e *FencingExecutor) executeSourceMutationRequest(ctx context.Context, auth
 // sourceMutationProducer permits replay of an exact admitted tuple after root
 // closure, but new admission still requires an open producer and run.
 func (e *FencingExecutor) sourceMutationProducer(ctx context.Context, uid string, id fencing.Identity, requireOpen bool) (fencing.RuntimeBinding, string, error) {
+	if e == nil || e.AuthorityState == nil {
+		return fencing.RuntimeBinding{}, "", fmt.Errorf("fencing: canonical mutation producer state is not configured")
+	}
 	state, err := e.read(ctx, uid, id.SourceClusterID)
 	if err != nil {
 		return fencing.RuntimeBinding{}, "", err
@@ -124,9 +127,6 @@ func (e *FencingExecutor) sourceMutationProducer(ctx context.Context, uid string
 	}
 	if run.MutationStageIncarnation != stages.incarnation {
 		return fencing.RuntimeBinding{}, "", fmt.Errorf("fencing: source mutation stage identity differs")
-	}
-	if e.AuthorityState == nil {
-		return fencing.RuntimeBinding{}, "", fmt.Errorf("fencing: canonical mutation producer state is not configured")
 	}
 	producer, producerUID, _, err := e.AuthorityState.ReadProducer(ctx, *run.Runtime)
 	if err != nil {

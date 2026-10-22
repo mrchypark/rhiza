@@ -22,7 +22,7 @@ func TestStoredAllocatedCancellationLostResponseRetainsOriginalResult(t *testing
 	}
 	// A new authority process retries the identical pure transition. There is no
 	// intermediate persisted entry that a worker could prepare or dispatch.
-	restarted := &FencingExecutor{Kube: e.Kube}
+	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState}
 	p, err := restarted.changeMutationProducer(t.Context(), runtime, transition)
 	if err != nil {
 		t.Fatal(err)

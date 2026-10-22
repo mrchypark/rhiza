@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/thanos-io/objstore"
 )
 
 func completeStoreIntent(intent fencing.MutationIntent) fencing.MutationIntent {
@@ -43,6 +44,7 @@ type mutationStoreFixture struct {
 	archivePosts         int
 	archiveReadError     string
 	statusWrites         int
+	authorityBucket      objstore.Bucket
 	// Optional Kubernetes auth fixtures for testing the bound-token HTTP route.
 	authPod         object
 	authStatefulSet object
@@ -164,12 +166,22 @@ func newMutationStoreFixture(t *testing.T) (*FencingExecutor, *mutationStoreFixt
 	if err := os.WriteFile(token, []byte("test"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}}
+	stateBucket := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = stateBucket.Close() })
+	state, err := NewAuthorityStateStore(stateBucket, "test-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.authorityBucket = stateBucket
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}, AuthorityState: state}
 	id := fencing.Identity{SourceClusterID: "source", NodeID: "n0", PodUID: "pod-0", RunID: "run-0"}
 	runtime := fencing.RuntimeBinding{
 		AuthorityID: "authority", NamespaceUID: "namespace", BindingUID: "binding", StatefulSetUID: "sts",
 		SourceClusterID: id.SourceClusterID, NodeID: id.NodeID, PodUID: id.PodUID, RunID: id.RunID,
 		NodeName: "node", NodeUID: "node-uid", MachineID: "machine", BootID: "boot", RuntimeID: "containerd", SandboxID: "sandbox", ContainerID: "container", ImageID: "image",
+	}
+	if err := e.initializeRoot(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID); err != nil {
+		t.Fatal(err)
 	}
 	_, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error {
 		l.RequireRuntimeBinding = true
@@ -209,7 +221,7 @@ func TestMutationJournalStoreClosureIncludesMissingReservedProducer(t *testing.T
 	}
 	// A fresh executor simulates authority restart; it reads the same closed
 	// object and cannot initialize a new open value from absent process memory.
-	restarted := &FencingExecutor{Kube: e.Kube}
+	restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState}
 	p, err := restarted.reserveMutationProducer(t.Context(), runtime)
 	if err != nil || p.Phase != fencing.MutationClosed || !p.BarrierComplete() {
 		t.Fatalf("closure not durable: %+v %v", p, err)

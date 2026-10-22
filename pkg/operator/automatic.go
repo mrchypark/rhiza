@@ -902,7 +902,7 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if version == nil {
 		return c.autoStatus(ctx, r, state, "Observing", "durable cluster binding created")
 	}
-	if compacted, err := c.compactLearnerHistory(ctx, state); err != nil {
+	if compacted, err := c.compactLearnerHistory(ctx, r, state); err != nil {
 		return block(state, err.Error())
 	} else if compacted {
 		if err := c.saveAuto(ctx, r, state, version); err != nil {

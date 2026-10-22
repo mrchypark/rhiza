@@ -52,7 +52,7 @@ func TestCooperativeLedgerCASRegistrationRacesClosure(t *testing.T) {
 	if err := os.WriteFile(token, []byte("test"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}}
+	e := &FencingExecutor{Kube: &Kubernetes{BaseURL: api.URL, Namespace: "test", TokenFile: token, Client: api.Client()}, LegacyCooperativeControlState: true}
 	id := fencing.Identity{SourceClusterID: "source", NodeID: "n1", PodUID: "pod", RunID: "run"}
 	start := make(chan struct{})
 	results := make(chan error, 2)

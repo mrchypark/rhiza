@@ -78,6 +78,15 @@ evidence from enrolled runtime/mutation providers described below or a carefully
 verified manual recovery; never delete the ledger or restart the object store to
 manufacture a pass.
 
+The fencer's cooperative-only default may use the explicitly selected legacy
+Kubernetes control ledger when canonical GCS authority state is not configured.
+That mode is for cooperative fencing only and is **not NoPVC-qualified**. The
+independent mutation profile requires remote canonical authority state and its
+separate runtime, staging, receipt, and source-writer providers. If a remote
+authority store is configured but unavailable, the fencer fails closed; it does
+not fall back to the Kubernetes ledger. Source-mutation endpoints always require
+canonical remote authority state, even when the cooperative-only option is set.
+
 Voter fencing permanently closes that stable slot in the source generation but
 does not stop surviving voters. A later generation fence preserves immutable
 prior stop receipts and may reuse completed proof. A prior pending stop still

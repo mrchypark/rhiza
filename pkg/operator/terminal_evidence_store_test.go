@@ -78,8 +78,14 @@ func TestTerminalStoreLostCreateAndRootCASResponsesAreIdempotent(t *testing.T) {
 	e, f, runtime := terminalStoreFixture(t)
 	closeTerminalTestRun(t, e, runtime)
 	f.mu.Lock()
-	f.lostTerminalResponse, f.lostLedgerResponse = true, true
+	f.lostTerminalResponse = true
 	f.mu.Unlock()
+	rootKey, _, err := e.AuthorityState.rootKey(runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &archiveTestBucket{Bucket: e.AuthorityState.bucket, loseCASResponse: rootKey}
+	e.AuthorityState.bucket = wrapped
 	first := retainTerminalTestRun(t, e, runtime)
 	second := retainTerminalTestRun(t, e, runtime)
 	if first != second {
@@ -93,8 +99,8 @@ func TestTerminalStoreLostCreateAndRootCASResponsesAreIdempotent(t *testing.T) {
 			count++
 		}
 	}
-	if count != 1 || f.lostTerminalResponse || f.lostLedgerResponse {
-		t.Fatalf("expected both lost responses and exactly one proof, got %d", count)
+	if count != 1 || f.lostTerminalResponse || wrapped.loseCASResponse != "" || wrapped.failReadOnce != "" {
+		t.Fatalf("expected terminal and root lost-response injections to resolve with one proof, got count=%d terminal-pending=%t cas-pending=%q readback-pending=%q", count, f.lostTerminalResponse, wrapped.loseCASResponse, wrapped.failReadOnce)
 	}
 }
 
