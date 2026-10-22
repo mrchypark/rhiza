@@ -28,8 +28,10 @@ import (
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
 
-const namespace = "rhiza-fencing-e2e"
-const kubeContext = "kind-rhiza-generic-fencing"
+var namespace = "rhiza-fencing-e2e"
+var kubeContext = "kind-rhiza-generic-fencing"
+var qualificationRunID string
+
 const kindNode = "rhiza-generic-fencing-control-plane"
 const admin = "fencing-test-admin"
 
@@ -37,7 +39,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|runtime-probe|runtime-agent-request"))
 	}
 	if os.Args[1] == "runtime-agent-request" {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -65,6 +67,13 @@ func main() {
 		fatal(waitSource(ctx))
 		return
 	}
+	if os.Args[1] == "run-gcs-ha" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSHA(ctx))
+		return
+	}
 	if os.Args[1] == "safe-artifacts" {
 		fatal(safeArtifacts(os.Getenv("FENCING_E2E_OUT")))
 		return
@@ -75,6 +84,54 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 	fatal(qualify(ctx))
+}
+
+func configureGCSHA(ctx context.Context) error {
+	contextName := os.Getenv("RHIZA_KUBE_CONTEXT")
+	ns := os.Getenv("RHIZA_NAMESPACE")
+	runID := os.Getenv("RHIZA_RUN_ID")
+	if contextName == "" || ns == "" || len(runID) != 8 {
+		return fmt.Errorf("run-gcs-ha requires RHIZA_KUBE_CONTEXT, RHIZA_NAMESPACE, and an eight-character RHIZA_RUN_ID")
+	}
+	for _, r := range runID {
+		if !(r >= 'a' && r <= 'f' || r >= '0' && r <= '9') {
+			return fmt.Errorf("RHIZA_RUN_ID must be eight lowercase hexadecimal characters")
+		}
+	}
+	for _, r := range ns {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return fmt.Errorf("RHIZA_NAMESPACE is not a Kubernetes DNS label")
+		}
+	}
+	namespace, kubeContext, qualificationRunID = ns, contextName, runID
+	data, err := command(ctx, "kubectl", "--context", kubeContext, "get", "namespace", namespace, "-o", "json")
+	if err != nil {
+		return fmt.Errorf("read run namespace identity: %w", err)
+	}
+	var nsObject obj
+	if err := json.Unmarshal(data, &nsObject); err != nil {
+		return err
+	}
+	if nested(nsObject, "metadata", "labels", "chaos.rhiza.io/run") != runID || nested(nsObject, "metadata", "annotations", "chaos-mesh.org/inject") != "enabled" {
+		return fmt.Errorf("namespace is not the fresh run-owned Chaos Mesh injection scope")
+	}
+	canPatch, err := command(ctx, "kubectl", "--context", kubeContext, "auth", "can-i", "patch", "pods", "--namespace", namespace)
+	if err != nil || strings.TrimSpace(string(canPatch)) != "yes" {
+		return fmt.Errorf("run identity lacks Pod patch permission required to UID-pin control-plane chaos: %v (%s)", err, strings.TrimSpace(string(canPatch)))
+	}
+	for _, kind := range []string{"networkchaos", "podchaos"} {
+		items, err := get(ctx, kind, "")
+		if err != nil {
+			return err
+		}
+		resources, _ := items["items"].([]any)
+		for _, item := range resources {
+			if nested(item, "metadata", "labels", "chaos.rhiza.io/run") == runID {
+				return fmt.Errorf("fresh GCS recovery scope already contains run-owned %s %s", kind, nested(item, "metadata", "name"))
+			}
+		}
+	}
+	return nil
 }
 
 func waitSource(ctx context.Context) error {
@@ -1258,7 +1315,7 @@ func verifyGenerationProof(ctx context.Context, item any, stsUID, bindingUID str
 	return verifyScopedProof(ctx, item, stsUID, bindingUID, oldUIDs, operator.ScopeGeneration, targets, out)
 }
 
-func verifyScopedProof(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, scope operator.Scope, targets []operator.FenceTarget, out string) error {
+func verifyScopedProof(ctx context.Context, item any, stsUID, bindingUID string, oldUIDs []string, scope operator.Scope, targets []operator.FenceTarget, out string, expectedSource ...string) error {
 	var request operator.FenceRequest
 	var proof operator.FenceProof
 	if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
@@ -1267,7 +1324,11 @@ func verifyScopedProof(ctx context.Context, item any, stsUID, bindingUID string,
 	if err := json.Unmarshal(encoded(nested(item, "status", "proof")), &proof); err != nil {
 		return err
 	}
-	if request.SourceClusterID != "chaos-source" || request.StatefulSet != "rhiza" || request.StatefulSetUID != stsUID || request.BindingUID != bindingUID || request.Namespace != namespace || request.LogicalID != "fencing-e2e" || request.OperationID == "" || request.Scope != scope {
+	sourceID := "chaos-source"
+	if len(expectedSource) > 0 {
+		sourceID = expectedSource[0]
+	}
+	if sourceID == "" || request.SourceClusterID != sourceID || request.StatefulSet != "rhiza" || request.StatefulSetUID != stsUID || request.BindingUID != bindingUID || request.Namespace != namespace || request.LogicalID != "fencing-e2e" || request.OperationID == "" || request.Scope != scope {
 		return fmt.Errorf("generation fence request identity differs")
 	}
 	var nodes []string
