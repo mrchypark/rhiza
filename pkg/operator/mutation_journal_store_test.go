@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -208,6 +209,27 @@ func activateStoredProducer(t *testing.T, e *FencingExecutor, id fencing.Identit
 	}
 }
 
+var errInjectedMutationProducerCASConflict = errors.New("injected producer conditional-write conflict")
+
+type forcedProducerCASConflictBucket struct {
+	objstore.Bucket
+	key       string
+	remaining int
+}
+
+func (b *forcedProducerCASConflictBucket) Upload(ctx context.Context, name string, reader io.Reader, options ...objstore.ObjectUploadOption) error {
+	params := objstore.ApplyObjectUploadOptions(options...)
+	if name == b.key && params.Condition != nil && b.remaining > 0 {
+		b.remaining--
+		return errInjectedMutationProducerCASConflict
+	}
+	return b.Bucket.Upload(ctx, name, reader, options...)
+}
+
+func (b *forcedProducerCASConflictBucket) IsConditionNotMetErr(err error) bool {
+	return errors.Is(err, errInjectedMutationProducerCASConflict) || b.Bucket.IsConditionNotMetErr(err)
+}
+
 func TestMutationJournalStoreClosureIncludesMissingReservedProducer(t *testing.T) {
 	e, _, _, runtime := newMutationStoreFixture(t)
 	digest := strings.Repeat("a", 64)
@@ -237,9 +259,13 @@ func TestMutationJournalStoreClosureIncludesMissingReservedProducer(t *testing.T
 func TestMutationJournalStoreMissingBoundStateCannotBeRecreated(t *testing.T) {
 	e, f, id, runtime := newMutationStoreFixture(t)
 	activateStoredProducer(t, e, id, runtime)
-	f.mu.Lock()
-	delete(f.objects, e.mutationProducerPath(runtime))
-	f.mu.Unlock()
+	key, _, err := e.AuthorityState.producerKey(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.authorityBucket.Delete(t.Context(), key); err != nil {
+		t.Fatal(err)
+	}
 	state, err := e.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { return l.Close("fence", strings.Repeat("a", 64)) })
 	if err != nil {
 		t.Fatal(err)
@@ -247,10 +273,7 @@ func TestMutationJournalStoreMissingBoundStateCannotBeRecreated(t *testing.T) {
 	if complete, err := e.closeMutationProducers(t.Context(), state, nil); err == nil || complete {
 		t.Fatal("deleted bound journal was fabricated as empty and complete")
 	}
-	f.mu.Lock()
-	replacement := f.objects[e.mutationProducerPath(runtime)]
-	f.mu.Unlock()
-	if replacement != nil {
+	if exists, err := f.authorityBucket.Exists(t.Context(), key); err != nil || exists {
 		t.Fatal("missing bound producer recreated")
 	}
 }
@@ -293,13 +316,11 @@ func TestMutationJournalStoreCASRejectsDelayedAdmission(t *testing.T) {
 func TestMutationJournalStoreLostResponseRetainsSameOperation(t *testing.T) {
 	e, f, id, runtime := newMutationStoreFixture(t)
 	activateStoredProducer(t, e, id, runtime)
+	e.AuthorityState.bucket = &mutationCASReplyFaultBucket{Bucket: f.authorityBucket, loseCASReply: true}
 	intent := completeStoreIntent(fencing.MutationIntent{OperationID: "same-op", Kind: "delete", Key: "key"})
-	f.mu.Lock()
-	f.lostResponse = true
-	f.mu.Unlock()
 	transition := func(p *fencing.MutationProducer) error { return p.Admit(1, intent) }
-	if _, err := e.changeMutationProducer(t.Context(), runtime, transition); err == nil {
-		t.Fatal("lost response reported as success")
+	if _, err := e.changeMutationProducer(t.Context(), runtime, transition); err != nil {
+		t.Fatal(err)
 	}
 	p, err := e.changeMutationProducer(t.Context(), runtime, transition)
 	if err != nil || p.LastAdmitted != 1 || len(p.Entries) != 1 {
@@ -322,49 +343,98 @@ func TestMutationJournalStoreLostResponseRetainsSameOperation(t *testing.T) {
 }
 
 func TestMutationJournalStoreRejectsCorruptionAndBoundsConflicts(t *testing.T) {
-	for _, scenario := range []string{"runtime", "deleting", "unknown-field", "missing-uid", "replaced-uid", "conflicts", "unenrolled", "closed-without-stop"} {
+	for _, scenario := range []string{"runtime", "corrupt-envelope", "unknown-field", "conflicts", "unenrolled", "closed-without-stop"} {
 		t.Run(scenario, func(t *testing.T) {
 			e, f, id, runtime := newMutationStoreFixture(t)
 			activateStoredProducer(t, e, id, runtime)
-			f.mu.Lock()
-			resource := f.objects[e.mutationProducerPath(runtime)]
 			switch scenario {
 			case "runtime":
-				var p fencing.MutationProducer
-				_ = json.Unmarshal([]byte(str(nested(resource, "data", "producer.json"))), &p)
+				p, _, version, err := e.AuthorityState.ReadProducer(t.Context(), runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
 				p.Runtime.BootID = "other-boot"
-				data, _ := json.Marshal(p)
-				asObject(resource["data"])["producer.json"] = string(data)
-			case "deleting":
-				asObject(resource["metadata"])["deletionTimestamp"] = "now"
+				key, identity, err := e.AuthorityState.producerKey(runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				value := struct {
+					ProducerUID string                   `json:"producerUID"`
+					Producer    fencing.MutationProducer `json:"producer"`
+				}{stableMutationProducerUID(runtime), p}
+				if err := e.AuthorityState.write(t.Context(), key, identity, value, version); err != nil {
+					t.Fatal(err)
+				}
+			case "corrupt-envelope":
+				key, _, err := e.AuthorityState.producerKey(runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.authorityBucket.Upload(t.Context(), key, strings.NewReader("not an authority envelope")); err != nil {
+					t.Fatal(err)
+				}
 			case "unknown-field":
-				data := str(nested(resource, "data", "producer.json"))
-				asObject(resource["data"])["producer.json"] = strings.TrimSuffix(data, "}") + `,"compactedThrough":100}`
-			case "missing-uid":
-				delete(asObject(resource["metadata"]), "uid")
-			case "replaced-uid":
-				asObject(resource["metadata"])["uid"] = "replacement-object-uid"
-			case "conflicts":
-				f.conflicts = 8
+				key, identity, err := e.AuthorityState.producerKey(runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				p, _, _, err := e.AuthorityState.ReadProducer(t.Context(), runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				value := struct {
+					ProducerUID string                   `json:"producerUID"`
+					Producer    fencing.MutationProducer `json:"producer"`
+				}{stableMutationProducerUID(runtime), p}
+				data, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = append(data[:len(data)-1], []byte(`,"unknown":true}`)...)
+				revision, err := newAuthorityRevision()
+				if err != nil {
+					t.Fatal(err)
+				}
+				env := authorityStateEnvelope{Version: 1, Identity: identity, Revision: revision, Digest: authorityStateEnvelopeDigest(data, revision), Value: data}
+				body, err := json.Marshal(env)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.authorityBucket.Upload(t.Context(), key, bytes.NewReader(body)); err != nil {
+					t.Fatal(err)
+				}
 			case "unenrolled":
 				runtime.RunID = "unregistered"
+			case "conflicts":
+				key, _, err := e.AuthorityState.producerKey(runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.AuthorityState.bucket = &forcedProducerCASConflictBucket{Bucket: f.authorityBucket, key: key, remaining: 8}
 			case "closed-without-stop":
-				root := f.objects[e.ledgerPath(runtime.StatefulSetUID, runtime.SourceClusterID)]
-				var state fenceLedger
-				_ = json.Unmarshal([]byte(str(nested(root, "data", "ledger.json"))), &state)
+				state, version, err := e.AuthorityState.ReadRoot(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+				if err != nil {
+					t.Fatal(err)
+				}
 				state.Ledger.ClosedBy, state.Ledger.ClosedHash = "fence", strings.Repeat("a", 64)
-				data, _ := json.Marshal(state)
-				asObject(root["data"])["ledger.json"] = string(data)
+				if err := e.AuthorityState.WriteRoot(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, state, version); err != nil {
+					t.Fatal(err)
+				}
 			}
-			f.mu.Unlock()
 			_, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error {
 				return p.Admit(1, completeStoreIntent(fencing.MutationIntent{OperationID: "op", Kind: "delete", Key: "key"}))
 			})
 			if err == nil {
 				t.Fatal("unsafe producer accepted")
 			}
-			if scenario == "conflicts" && !errors.Is(err, fencing.ErrUnavailable) {
-				t.Fatalf("conflict retry not bounded: %v", err)
+			if scenario == "conflicts" {
+				if !errors.Is(err, fencing.ErrUnavailable) {
+					t.Fatalf("canonical producer CAS conflicts were not bounded: %v", err)
+				}
+				p, _, _, readErr := e.AuthorityState.ReadProducer(t.Context(), runtime)
+				if readErr != nil || p.LastAdmitted != 0 || len(p.Entries) != 0 {
+					t.Fatalf("conflicted admission changed canonical producer: %+v err=%v", p, readErr)
+				}
 			}
 		})
 	}

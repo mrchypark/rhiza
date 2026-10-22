@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -417,7 +418,12 @@ func TestAutomaticReservationRejectsUnfenceableScope(t *testing.T) {
 				pod := "learner-" + strconv.Itoa(i)
 				state.Learners = append(state.Learners, learnerIncarnation{SourceClusterID: "source", OperationID: "retire-1", CredentialUID: "cred-1", Target: FenceTarget{NodeID: pod, Pod: pod, PodUID: "pod-" + pod, WALIdentity: "wal-" + pod}})
 			}
-			c.Fencer = &countingFencer{count: new(int)}
+			// These target identities are intentionally absent from the fake API;
+			// keep their cleanup unresolved so this test measures reserved scope
+			// capacity rather than accidentally compacting it first.
+			c.Fencer = retirementFencer(func(context.Context, FenceRequest) (*FenceProof, error) {
+				return nil, fencing.ErrPending
+			})
 			api.membership = nil
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 				if q.Method == http.MethodPut && q.URL.Path == c.clusterPath("cluster-1")+"/status" {

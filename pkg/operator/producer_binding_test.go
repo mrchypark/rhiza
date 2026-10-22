@@ -8,7 +8,7 @@ import (
 )
 
 func TestProducerBindingRecoversLostRootOrActivationResponse(t *testing.T) {
-	for _, lost := range []string{"root", "producer"} {
+	for _, lost := range []string{"root", "producer", "root-unknown"} {
 		t.Run(lost, func(t *testing.T) {
 			e, f, id, runtime := newMutationStoreFixture(t)
 			if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
@@ -18,12 +18,23 @@ func TestProducerBindingRecoversLostRootOrActivationResponse(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			f.mu.Lock()
-			f.lostLedgerResponse, f.lostResponse = lost == "root", lost == "producer"
-			f.mu.Unlock()
+			faultBucket := &mutationCASReplyFaultBucket{
+				Bucket:             f.authorityBucket,
+				loseCASAfter:       1,
+				failReadAfterReply: lost == "root-unknown",
+			}
+			if lost == "producer" {
+				faultBucket.loseCASAfter = 2 // root bind, then producer activation
+			}
+			e.AuthorityState.bucket = faultBucket
 			id.WALIdentity = "wal"
-			if receipt, err := e.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64)); err == nil || receipt.Producer != nil {
-				t.Fatal("lost response became a usable binding")
+			receipt, firstErr := e.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64))
+			if lost == "root-unknown" {
+				if firstErr == nil || receipt.Producer != nil {
+					t.Fatal("CAS response plus failed readback was not kept uncertain")
+				}
+			} else if firstErr != nil || receipt.Validate(id) != nil || receipt.Producer == nil {
+				t.Fatalf("exact canonical readback did not resolve the lost response: %+v %v", receipt, firstErr)
 			}
 			restarted := &FencingExecutor{Kube: e.Kube, AuthorityState: e.AuthorityState}
 			receipt, err := restarted.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64))
@@ -85,13 +96,29 @@ func TestProducerBindingRejectsClosureScopeAndReplacedStorage(t *testing.T) {
 			case "scope":
 				scope = strings.Repeat("b", 64)
 			case "missing":
-				f.mu.Lock()
-				delete(f.objects, e.mutationProducerPath(runtime))
-				f.mu.Unlock()
+				key, _, err := e.AuthorityState.producerKey(runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := f.authorityBucket.Delete(t.Context(), key); err != nil {
+					t.Fatal(err)
+				}
 			case "replaced":
-				f.mu.Lock()
-				asObject(f.objects[e.mutationProducerPath(runtime)]["metadata"])["uid"] = "replacement"
-				f.mu.Unlock()
+				p, _, version, err := e.AuthorityState.ReadProducer(t.Context(), runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				key, identity, err := e.AuthorityState.producerKey(runtime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				value := struct {
+					ProducerUID string                   `json:"producerUID"`
+					Producer    fencing.MutationProducer `json:"producer"`
+				}{"replacement-uid", p}
+				if err := e.AuthorityState.write(t.Context(), key, identity, value, version); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if receipt, err := e.bindWALAtScope(t.Context(), "sts", id, scope); err == nil || receipt.Producer != nil {
 				t.Fatal("unverifiable producer returned a binding")

@@ -239,6 +239,21 @@ func TestRetiredLearnerSurvivesRotationAndGenerationRequest(t *testing.T) {
 			state.Intent.RecoveryName, state.Intent.RecoveryUID = request.OperationID, str(recovery.Metadata["uid"])
 			state.Intent.SpecHash = hashJSON(recovery.Spec)
 			state.Intent.Proof = &FenceProof{OperationID: request.OperationID, SourceClusterID: "source", BindingUID: state.BindingUID, RequestHash: hash, ProofID: recovery.Spec.Fence.Evidence, ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}
+			if neverBound {
+				// Never-bound cleanup re-reads the canonical fence status; keep the
+				// fixture bound to the exact retirement request, not a fake CM ledger.
+				retiredRequest := f.fences[len(f.fences)-1]
+				retiredHash, err := requestHash(&retiredRequest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.Fencer = retirementFencer(func(_ context.Context, got FenceRequest) (*FenceProof, error) {
+					if hashJSON(got) != hashJSON(retiredRequest) {
+						return nil, fencing.ErrPending
+					}
+					return &FenceProof{OperationID: retiredRequest.OperationID, SourceClusterID: retiredRequest.SourceClusterID, BindingUID: retiredRequest.BindingUID, RequestHash: retiredHash, ProofID: "external-retirement-proof", ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true}, nil
+				})
+			}
 			_, version = f.load(t)
 			var pods []object
 			secrets := map[string]object{}
@@ -585,6 +600,16 @@ func TestLearnerProvisioningChecksJournalCapacityBeforeMutation(t *testing.T) {
 	if r.Status.Phase != "Recovering" || !strings.Contains(r.Status.Message, "compacted before replacement provisioning") || f.mutations != 0 || len(loaded.Learners) != maxLearnerHistory-4 {
 		t.Fatalf("compaction did not free capacity before mutation: status=%+v mutations=%d learners=%d", r.Status, f.mutations, len(loaded.Learners))
 	}
+	loaded, version, err = f.c.loadAuto(ctx, f.c.autoKey(r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := f.c.handleAutomaticLearner(ctx, r, loaded, version, object{}, &Resource{}); err != nil || !handled {
+		t.Fatalf("next reconcile after compaction handled=%t err=%v", handled, err)
+	}
+	if f.mutations == 0 {
+		t.Fatal("capacity freed by verified compaction was not usable on the next reconcile")
+	}
 }
 
 func TestLearnerProvisioningReservesWorstCaseGenerationScope(t *testing.T) {
@@ -653,6 +678,7 @@ func TestLearnerRetirementReceiptCompactsWithoutCooperativeLedger(t *testing.T) 
 		t.Fatal(err)
 	}
 	loaded.Learners = append(loaded.Learners, unresolved)
+	f.fenceReady = false
 	changed, err := f.c.compactLearnerHistory(ctx, f.resource, loaded)
 	if err != nil || changed || len(loaded.Learners) != 1 {
 		t.Fatalf("unresolved learner was removed: changed=%t err=%v learners=%d", changed, err, len(loaded.Learners))
