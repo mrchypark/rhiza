@@ -23,7 +23,12 @@ import (
 
 func TestGCSMutationProviderUsesOneConditionalWireRequestAndExactMetadata(t *testing.T) {
 	payload := []byte(`{"membership":"exact staged bytes"}`)
-	intent := fencing.MutationIntent{Kind: "upload", OperationID: "producer-sequence", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	intent := fencing.MutationIntent{ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: hashJSON(scope),
+		OwnerStep: fencing.MutationOwnerStep{Owner: "source", Workflow: "test", Step: "membership", Attempt: 1},
+		Condition: fencing.MutationCondition{Mode: fencing.MutationMatchGeneration, Generation: 14},
+		Kind:      "upload", Key: "membership.json", OperationID: "producer-sequence", PayloadRef: "staging/payload",
+		PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
 	var requests atomic.Int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -58,7 +63,7 @@ func TestGCSMutationProviderUsesOneConditionalWireRequestAndExactMetadata(t *tes
 		t.Fatal(err)
 	}
 	defer client.Close()
-	provider, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"})
+	provider, err := newGCSMutationProvider(client, scope)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +90,11 @@ func TestGCSMutationProviderRejectsEmulatorEndpoint(t *testing.T) {
 
 func TestGCSMutationProviderRecoveryRequiresExactCommittedMetadata(t *testing.T) {
 	payload := []byte("sealed recovery payload")
-	intent := fencing.MutationIntent{Kind: "upload", OperationID: "producer-sequence", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	intent := fencing.MutationIntent{ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: hashJSON(scope),
+		OwnerStep: fencing.MutationOwnerStep{Owner: "source", Workflow: "test", Step: "recovery", Attempt: 1},
+		Condition: fencing.MutationCondition{Mode: fencing.MutationUnconditional}, Kind: "upload", Key: "key", PayloadRef: "staging/payload",
+		OperationID: "producer-sequence", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
 	for _, tc := range []struct {
 		name    string
 		attrs   map[string]any
@@ -120,11 +129,11 @@ func TestGCSMutationProviderRecoveryRequiresExactCommittedMetadata(t *testing.T)
 				t.Fatal(err)
 			}
 			defer client.Close()
-			provider, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"})
+			provider, err := newGCSMutationProvider(client, scope)
 			if err != nil {
 				t.Fatal(err)
 			}
-			preparation := fencing.MutationPreparation{Generation: 20}
+			preparation := fencing.MutationPreparation{Profile: fencing.MutationExecutionProfile, StoreScopeHash: intent.StoreScopeHash, GenerationSet: true, Generation: 20}
 			if tc.name == "not newer than preparation" {
 				preparation.Generation = 21
 			}
@@ -439,12 +448,16 @@ func TestGCSMutationProviderNeverRetriesAnUncertainSingleRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	provider, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"})
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	provider, err := newGCSMutationProvider(client, scope)
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload := []byte("payload")
-	intent := fencing.MutationIntent{Kind: "upload", OperationID: "producer-sequence", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
+	intent := fencing.MutationIntent{ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: hashJSON(scope),
+		OwnerStep: fencing.MutationOwnerStep{Owner: "source", Workflow: "test", Step: "uncertain", Attempt: 1},
+		Condition: fencing.MutationCondition{Mode: fencing.MutationCreateOnly}, Kind: "upload", Key: "key", PayloadRef: "staging/payload",
+		OperationID: "producer-sequence", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
 	if _, err := provider.upload(context.Background(), "key", 0, intent, bytes.NewReader(payload)); err == nil {
 		t.Fatal("provider failure was accepted as committed")
 	}
@@ -557,7 +570,8 @@ func TestGCSMutationProviderUnknownExactDeleteBecomesNoncommitExclusion(t *testi
 		t.Fatal(err)
 	}
 	defer client.Close()
-	provider, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"})
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	provider, err := newGCSMutationProvider(client, scope)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,8 +579,11 @@ func TestGCSMutationProviderUnknownExactDeleteBecomesNoncommitExclusion(t *testi
 	if err != nil || result.Outcome != fencing.MutationExcluded || result.Generation != 42 || result.AllCopiesTerminal {
 		t.Fatalf("unknown exact-generation delete was mislabeled committed or left unbounded: result=%+v err=%v", result, err)
 	}
-	intent := fencing.MutationIntent{Kind: "delete", OperationID: "producer-sequence", Key: "object"}
-	recovered, found, err := provider.committed(context.Background(), "object", intent, fencing.MutationPreparation{Generation: 42})
+	intent := fencing.MutationIntent{ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: hashJSON(scope),
+		OwnerStep: fencing.MutationOwnerStep{Owner: "source", Workflow: "test", Step: "delete", Attempt: 1},
+		Condition: fencing.MutationCondition{Mode: fencing.MutationMatchGeneration, Generation: 42},
+		Kind:      "delete", OperationID: "producer-sequence", Key: "object"}
+	recovered, found, err := provider.committed(context.Background(), "object", intent, fencing.MutationPreparation{Profile: fencing.MutationExecutionProfile, StoreScopeHash: intent.StoreScopeHash, GenerationSet: true, Generation: 42})
 	if err != nil || !found || recovered.Outcome != fencing.MutationExcluded || recovered.Generation != 42 || recovered.AllCopiesTerminal {
 		t.Fatalf("missing selected generation did not prove only noncommit exclusion: result=%+v found=%t err=%v", recovered, found, err)
 	}
