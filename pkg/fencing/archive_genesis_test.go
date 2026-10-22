@@ -1,8 +1,17 @@
 package fencing
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"testing"
 )
+
+func hashJSON(value any) string {
+	encoded, _ := json.Marshal(value)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
 
 func archiveGenesisMutationRefForTest(t *testing.T, scope ArchiveScope) ArchiveGenesisRef {
 	t.Helper()
