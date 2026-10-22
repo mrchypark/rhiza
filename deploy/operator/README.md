@@ -46,6 +46,18 @@ the bucket endpoint and credentials appropriate for the selected provider.
 Generation-specific peer credentials are distinct secrets created by the
 controller; they must not reuse the source voters' credentials.
 
+The authority remains compatible with cooperative-only deployments that do
+not configure canonical GCS state; those deployments are not the independent
+NoPVC mutation profile. Opt into that profile with
+`FENCER_INDEPENDENT_MUTATION_PROFILE=true` (or
+`--independent-mutation-profile`) only after configuring generation-CAS GCS
+authority state, the runtime-agent CA, and a separate source-writer
+credential. Source staging and execution receipts then use root-bound remote
+ObjectStorage; local stage and receipt directories are rejected rather than
+used as fallbacks. The remote stage quota is 64 tickets and 4 GiB per producer.
+Tickets remain reserved until their exact mutation is found in verified
+compacted archive history; cancellation or age alone never frees capacity.
+
 ## Operator image
 
 Published GitHub releases build and push `ghcr.io/mrchypark/rhiza-operator`
@@ -120,6 +132,9 @@ membership and do not reuse old PVCs.
 
 The operator container has a read-only root filesystem and mounts an
 `emptyDir` at `/tmp` for the recovery worker's temporary WAL files.
+
+The supervised StatefulSet patch deliberately omits the `rhiza-object-store`
+Secret from the source Pod. Put only non-secret GCS coordinates (`RHIZA_OBJSTORE_PROVIDER=gcs`, bucket, and prefix) in `rhiza-config`; bind the `rhiza-supervised` workload identity to read/list-only access. The mutation writer credential file belongs only to the fencing authority deployment. Do not mount or inject that credential into the source Pod.
 
 ## Voter count
 

@@ -21,6 +21,17 @@ func TestNoPVCBootstrapRetainsPeerCredentials(t *testing.T) {
 	}
 }
 
+func TestSupervisedSourcePodReplacesObjectStoreSecretInjection(t *testing.T) {
+	data, err := os.ReadFile("fencing/supervised-statefulset.patch.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := string(data)
+	if !strings.Contains(patch, "- $patch: replace") || !strings.Contains(patch, "name: rhiza-peer-credentials") || strings.Contains(patch, "name: rhiza-object-store") {
+		t.Fatal("supervised source Pod must replace base envFrom and omit the object-store writer Secret")
+	}
+}
+
 // The CRD schema accepts the supported voterCount range and no longer exposes
 // the removed authoritative voter list.
 func TestClusterCRDAcceptsVoterCountRange(t *testing.T) {

@@ -52,8 +52,16 @@ func (e *FencingExecutor) bindSupervisorWAL(ctx context.Context, uid string, id 
 		scopeHash = hashJSON(scope)
 	}
 	stageIncarnation := ""
-	if e.SourceStages != nil {
-		stageIncarnation = e.SourceStages.incarnation
+	if state.Ledger.RequireMutationJournal {
+		run := state.Ledger.Runs[id.RunID]
+		if run.Runtime == nil {
+			return fencing.BindReceipt{}, fmt.Errorf("fencing: enrolled runtime is missing")
+		}
+		stages, err := e.sourceStagesFor(ctx, *run.Runtime)
+		if err != nil {
+			return fencing.BindReceipt{}, err
+		}
+		stageIncarnation = stages.incarnation
 	}
 	return e.bindWALAtScopeWithStage(ctx, uid, id, scopeHash, stageIncarnation)
 }

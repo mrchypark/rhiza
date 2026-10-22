@@ -31,7 +31,7 @@ type sourceStageReserveRequest struct {
 // and producer scope are checked before either ticket metadata or payload bytes
 // can be changed.
 func (e *FencingExecutor) handleSourceStage(w http.ResponseWriter, r *http.Request) {
-	if e.SourceStages == nil {
+	if e == nil || e.AuthorityState == nil && e.SourceStages == nil {
 		http.Error(w, "source staging is not configured", http.StatusServiceUnavailable)
 		return
 	}
@@ -75,12 +75,12 @@ func (e *FencingExecutor) handleSourceStageReserve(w http.ResponseWriter, r *htt
 		http.Error(w, "invalid source stage reservation", http.StatusBadRequest)
 		return
 	}
-	producerUID, scope, err := e.sourceStageProducer(r, request.Identity)
+	producerUID, scope, stages, runtime, err := e.sourceStageProducer(r, request.Identity)
 	if err == nil && request.Draft.StoreScopeHash != scope {
 		err = fmt.Errorf("fencing: source stage scope differs from enrolled workload")
 	}
 	if err == nil {
-		err = e.SourceStages.Reserve(producerUID, request.Ticket, request.Draft)
+		err = e.reserveSourceStage(r.Context(), runtime, stages, producerUID, request.Ticket, request.Draft)
 	}
 	if err != nil {
 		e.writeSourceStageError(w, err)
@@ -100,7 +100,7 @@ func (e *FencingExecutor) handleSourceStageSeal(w http.ResponseWriter, r *http.R
 		http.Error(w, "invalid source stage identity", http.StatusBadRequest)
 		return
 	}
-	producerUID, _, err := e.sourceStageProducer(r, id)
+	producerUID, _, stages, _, err := e.sourceStageProducer(r, id)
 	if err != nil {
 		e.writeSourceStageError(w, err)
 		return
@@ -116,7 +116,7 @@ func (e *FencingExecutor) handleSourceStageSeal(w http.ResponseWriter, r *http.R
 		return
 	}
 	input := http.MaxBytesReader(w, r.Body, size+1)
-	descriptor, err := e.SourceStages.Seal(producerUID, ticket, query.Get("digest"), size, input)
+	descriptor, err := stages.SealContext(r.Context(), producerUID, ticket, query.Get("digest"), size, input)
 	if err != nil {
 		e.writeSourceStageError(w, err)
 		return
@@ -133,9 +133,9 @@ func (e *FencingExecutor) handleSourceStageCancel(w http.ResponseWriter, r *http
 		http.Error(w, "invalid source stage identity", http.StatusBadRequest)
 		return
 	}
-	producerUID, _, err := e.sourceStageProducer(r, id)
+	producerUID, _, stages, _, err := e.sourceStageProducer(r, id)
 	if err == nil {
-		err = e.SourceStages.Cancel(producerUID, ticket)
+		err = stages.CancelContext(r.Context(), producerUID, ticket)
 	}
 	if err != nil {
 		e.writeSourceStageError(w, err)
@@ -159,41 +159,78 @@ func sourceStageIdentity(r *http.Request) (fencing.Identity, error) {
 	return id, nil
 }
 
-func (e *FencingExecutor) sourceStageProducer(r *http.Request, id fencing.Identity) (string, string, error) {
+func (e *FencingExecutor) sourceStageProducer(r *http.Request, id fencing.Identity) (string, string, *SourceStageStore, fencing.RuntimeBinding, error) {
 	uid, err := e.authenticate(r.Context(), r.Header.Get("Authorization"), id)
 	if err != nil {
-		return "", "", sourceStageAuthenticationError{err: err}
+		return "", "", nil, fencing.RuntimeBinding{}, sourceStageAuthenticationError{err: err}
 	}
 	state, err := e.read(r.Context(), uid, id.SourceClusterID)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, fencing.RuntimeBinding{}, err
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
 	_, closed := state.Ledger.ClosedNodes[id.NodeID]
-	if !ok || run.Identity != id || run.Stop != nil || closed || state.Ledger.ClosedBy != "" || !state.Ledger.RequireMutationJournal || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" || run.MutationScopeHash == "" || run.MutationProfile != fencing.MutationExecutionProfile || run.MutationStageIncarnation == "" || run.MutationStageIncarnation != e.SourceStages.incarnation {
-		return "", "", fmt.Errorf("fencing: source stage is outside the active enrolled producer")
+	if !ok || run.Identity != id || run.Stop != nil || closed || state.Ledger.ClosedBy != "" || !state.Ledger.RequireMutationJournal || run.Runtime == nil || run.Runtime.StatefulSetUID != uid || run.MutationProducerUID == "" || run.MutationScopeHash == "" || run.MutationProfile != fencing.MutationExecutionProfile {
+		return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage is outside the active enrolled producer")
 	}
 	if err := run.Runtime.Validate(id); err != nil {
-		return "", "", err
+		return "", "", nil, fencing.RuntimeBinding{}, err
 	}
-	var resource object
-	if err := e.Kube.Get(r.Context(), e.mutationProducerPath(*run.Runtime), &resource); err != nil {
-		return "", "", err
-	}
-	if nested(resource, "metadata", "deletionTimestamp") != nil || str(nested(resource, "metadata", "uid")) != run.MutationProducerUID || str(nested(resource, "metadata", "resourceVersion")) == "" {
-		return "", "", fmt.Errorf("fencing: source stage producer storage identity differs")
+	stages, err := e.sourceStagesFor(r.Context(), *run.Runtime)
+	if err != nil || run.MutationStageIncarnation == "" || run.MutationStageIncarnation != stages.incarnation {
+		return "", "", nil, fencing.RuntimeBinding{}, errors.Join(err, fmt.Errorf("fencing: bound source stage store is unavailable or differs"))
 	}
 	var producer fencing.MutationProducer
-	d := json.NewDecoder(strings.NewReader(str(nested(resource, "data", "producer.json"))))
-	d.DisallowUnknownFields()
-	if err := d.Decode(&producer); err != nil || d.Decode(new(any)) != io.EOF || producer.Runtime != *run.Runtime || producer.WALIdentity != id.WALIdentity || producer.Phase != fencing.MutationOpen || producer.Validate() != nil {
-		return "", "", fmt.Errorf("fencing: source stage producer is not open and bound")
+	var producerUID string
+	if e.AuthorityState != nil {
+		producer, producerUID, _, err = e.AuthorityState.ReadProducer(r.Context(), *run.Runtime)
+		if err != nil {
+			return "", "", nil, fencing.RuntimeBinding{}, err
+		}
+	} else {
+		var resource object
+		if err := e.Kube.Get(r.Context(), e.mutationProducerPath(*run.Runtime), &resource); err != nil {
+			return "", "", nil, fencing.RuntimeBinding{}, err
+		}
+		if nested(resource, "metadata", "deletionTimestamp") != nil || str(nested(resource, "metadata", "resourceVersion")) == "" {
+			return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage producer storage identity differs")
+		}
+		producerUID = str(nested(resource, "metadata", "uid"))
+		d := json.NewDecoder(strings.NewReader(str(nested(resource, "data", "producer.json"))))
+		d.DisallowUnknownFields()
+		if err := d.Decode(&producer); err != nil || d.Decode(new(any)) != io.EOF {
+			return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage producer record is invalid")
+		}
 	}
-	return run.MutationProducerUID, run.MutationScopeHash, nil
+	if producerUID != run.MutationProducerUID || producer.Runtime != *run.Runtime || producer.WALIdentity != id.WALIdentity || producer.Phase != fencing.MutationOpen || producer.Validate() != nil {
+		return "", "", nil, fencing.RuntimeBinding{}, fmt.Errorf("fencing: source stage producer is not open and bound")
+	}
+	return run.MutationProducerUID, run.MutationScopeHash, stages, *run.Runtime, nil
+}
+
+func (e *FencingExecutor) reserveSourceStage(ctx context.Context, runtime fencing.RuntimeBinding, stages *SourceStageStore, producerUID, ticket string, draft fencing.MutationIntent) error {
+	if e != nil && e.AuthorityState != nil {
+		if err := e.ReconcileArchivedStages(ctx, runtime); err != nil {
+			return err
+		}
+	}
+	return stages.ReserveContext(ctx, producerUID, ticket, draft)
 }
 
 func (e *FencingExecutor) writeSourceStageError(w http.ResponseWriter, err error) {
 	if err == nil {
+		return
+	}
+	if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	if errors.Is(err, fencing.ErrClosed) {
+		w.WriteHeader(http.StatusGone)
+		return
+	}
+	if errors.Is(err, fencing.ErrMutationConditionFailed) {
+		w.WriteHeader(http.StatusPreconditionFailed)
 		return
 	}
 	if transientFenceAuthority(err) {

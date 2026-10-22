@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/qlog"
-	"github.com/thanos-io/objstore"
 )
 
 func TestIndependentBindingCannotFallThroughToDirectBootstrapWrites(t *testing.T) {
@@ -60,7 +60,7 @@ func TestIndependentBindingCannotFallThroughToDirectBootstrapWrites(t *testing.T
 				SandboxID: "sandbox", ContainerID: "container", ImageID: "image"}
 			_ = json.NewEncoder(w).Encode(fencing.BindReceipt{Identity: bound, Producer: &fencing.ProducerBinding{
 				ContractVersion: fencing.MutationIntentVersion, Runtime: runtime, ProducerUID: "producer",
-				StoreScopeHash: strings.Repeat("a", 64), ExecutionProfile: fencing.MutationExecutionProfile}})
+				StoreScopeHash: strings.Repeat("a", 64), ExecutionProfile: fencing.MutationExecutionProfile, StageIncarnation: strings.Repeat("b", 64)}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -88,9 +88,14 @@ func TestIndependentBindingCannotFallThroughToDirectBootstrapWrites(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	bucket := objstore.NewInMemBucket()
-	err = ensureVoterIdentity(ctx, config, bucket, wal, local, false, n.bindFenceWAL)
-	if err == nil || !strings.Contains(err.Error(), "durable authority-only mutation client") || binds.Load() != 1 {
+	bucket, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.protectedBucket = &fencedBucket{MeteredBucket: bucket, prefix: "cluster"}
+	defer n.protectedBucket.Close()
+	err = ensureVoterIdentity(ctx, config, n.protectedBucket, wal, local, false, n.bindFenceWAL)
+	if err == nil || !strings.Contains(err.Error(), "supervisor source HTTP") || binds.Load() != 1 {
 		t.Fatalf("independent binding bypassed client gate: %v binds=%d", err, binds.Load())
 	}
 	if n.fenceSession == nil {
@@ -99,7 +104,7 @@ func TestIndependentBindingCannotFallThroughToDirectBootstrapWrites(t *testing.T
 	if _, valid := n.fenceSession.MutationBinding(); !valid {
 		t.Fatal("test refused an invalid receipt instead of direct-write fallthrough")
 	}
-	if err := bucket.Iter(ctx, "", func(key string) error {
+	if err := n.protectedBucket.Iter(ctx, "", func(key string) error {
 		t.Errorf("bootstrap wrote provider object before durable client: %s", key)
 		return nil
 	}); err != nil {

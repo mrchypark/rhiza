@@ -109,6 +109,27 @@ func TestMutationCompactionNeverRecreatesArchivedDispatchRights(t *testing.T) {
 	settledMutation(t, p, 2)
 }
 
+func TestArchivedStageRetirementCursorIsContiguousAndBoundedByWatermark(t *testing.T) {
+	p := newJournalProducer(t, "stage-retirement-cursor")
+	settledMutation(t, p, 1)
+	plan, err := p.PlanMutationCompaction(compactionProducerUID, 1)
+	mustJournal(t, err)
+	mustJournal(t, p.CommitMutationCompaction(compactionProducerUID, plan, archiveReference(plan)))
+	if err := p.AdvanceArchivedStageRetirement(2); err == nil {
+		t.Fatal("retirement cursor skipped an archived sequence")
+	}
+	mustJournal(t, p.AdvanceArchivedStageRetirement(1))
+	mustJournal(t, p.AdvanceArchivedStageRetirement(1))
+	if err := p.AdvanceArchivedStageRetirement(2); err == nil {
+		t.Fatal("retirement cursor advanced beyond archive coverage")
+	}
+	copy := *p
+	copy.RetiredStageThrough = 2
+	if err := copy.Validate(); err == nil {
+		t.Fatal("producer accepted retirement cursor beyond compaction watermark")
+	}
+}
+
 func TestMutationCompactionChecksExactSnapshotAndPersistedReference(t *testing.T) {
 	p := newJournalProducer(t, "snapshot")
 	settledMutation(t, p, 1)

@@ -29,7 +29,14 @@ import (
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/mrchypark/rhiza/pkg/recovery"
+	thanosobjstore "github.com/thanos-io/objstore"
 )
+
+type nodeObjectBucket interface {
+	thanosobjstore.Bucket
+	Stats() objectstore.Stats
+	Close() error
+}
 
 // Node is the main runtime container.
 type Node struct {
@@ -42,7 +49,8 @@ type Node struct {
 	catchUp                   *network.Transport
 	wal                       *qlog.WAL
 	lock                      *qlog.LockFile
-	bucket                    *objectstore.MeteredBucket
+	bucket                    nodeObjectBucket
+	protectedBucket           *fencedBucket
 	checkpoints               *checkpoint.Manager
 	archive                   *recovery.Manager
 	checkpointer              *checkpoint.AutoCheckpointer
@@ -407,6 +415,14 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if provider == "" {
 			provider = objectstore.ProviderS3
 		}
+		if n.fenceSession != nil {
+			if provider != objectstore.ProviderGCS {
+				return fmt.Errorf("supervised source mutations currently require GCS")
+			}
+			if err := rejectSupervisedWriterCredentials(n.config); err != nil {
+				return err
+			}
+		}
 		newBucket := objectstore.NewBucketWithContext
 		if n.fenceSession != nil {
 			newBucket = objectstore.NewBucketForSupervisedStartup
@@ -424,12 +440,18 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		if bucketErr != nil {
 			return fmt.Errorf("open object store: %w", bucketErr)
 		}
-		n.bucket = bucket
+		var runtimeBucket nodeObjectBucket = bucket
+		if n.fenceSession != nil {
+			protected := &fencedBucket{MeteredBucket: bucket, prefix: path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))}
+			n.protectedBucket = protected
+			runtimeBucket = protected
+		}
+		n.bucket = runtimeBucket
 		var beforeWrite []func(context.Context, string) error
 		if n.fenceSession != nil {
 			beforeWrite = append(beforeWrite, n.bindFenceWAL)
 		}
-		if err := ensureVoterIdentity(ctx, n.config, bucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
+		if err := ensureVoterIdentity(ctx, n.config, runtimeBucket, n.wal, localVoter, enroll, beforeWrite...); err != nil {
 			return err
 		}
 		if n.fenceSession != nil && n.fenceSession.Identity().WALIdentity == "" {
@@ -439,11 +461,11 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 			return n.Shutdown()
 		}
 		clusterPrefix := path.Join(n.config.ObjStorePrefix, string(n.config.ClusterID))
-		n.checkpoints = checkpoint.NewManager(bucket, clusterPrefix, n.config.DataDir, 1)
+		n.checkpoints = checkpoint.NewManager(runtimeBucket, clusterPrefix, n.config.DataDir, 1)
 		if loadErr := n.checkpoints.Load(ctx); loadErr != nil {
 			return fmt.Errorf("load checkpoint manifest: %w", loadErr)
 		}
-		n.archive = recovery.NewManager(bucket, clusterPrefix, 1)
+		n.archive = recovery.NewManager(runtimeBucket, clusterPrefix, 1)
 		n.archive.SetGroupDelay(n.config.ObjStoreBatchDelay)
 		if len(n.config.Members) > 1 && !n.archive.CASSupported() {
 			return fmt.Errorf("multi-node shared archive requires conditional object writes")
@@ -1059,6 +1081,13 @@ func (n *Node) open(ctx context.Context, enroll bool) (err error) {
 		}()
 	}
 	n.startFenceWatcher(ctx)
+	return nil
+}
+
+func rejectSupervisedWriterCredentials(config *types.ExecutionConfig) error {
+	if config.ObjStoreServiceAccount != "" || os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
+		return fmt.Errorf("supervised node must use its read-only workload identity; key-file credentials belong only to the fencer")
+	}
 	return nil
 }
 

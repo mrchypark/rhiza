@@ -37,18 +37,22 @@ func TestMutationIntentRetryPreservesCompleteCallerDescriptor(t *testing.T) {
 
 func TestMutationIntentRejectsIncompleteCallerSelection(t *testing.T) {
 	invalid := map[string]func(*MutationIntent){
-		"legacy version":           func(i *MutationIntent) { i.ContractVersion = 0 },
-		"scope":                    func(i *MutationIntent) { i.StoreScopeHash = "" },
-		"owner":                    func(i *MutationIntent) { i.OwnerStep.Owner = "" },
-		"oversize owner":           func(i *MutationIntent) { i.OwnerStep.Owner = strings.Repeat("a", 129) },
-		"workflow":                 func(i *MutationIntent) { i.OwnerStep.Workflow = "" },
-		"step":                     func(i *MutationIntent) { i.OwnerStep.Step = "" },
-		"attempt":                  func(i *MutationIntent) { i.OwnerStep.Attempt = 0 },
-		"condition":                func(i *MutationIntent) { i.Condition.Mode = "" },
-		"create with generation":   func(i *MutationIntent) { i.Condition = MutationCondition{Mode: MutationCreateOnly, Generation: 1} },
-		"missing exact generation": func(i *MutationIntent) { i.Condition.Mode = MutationMatchGeneration },
-		"negative length":          func(i *MutationIntent) { i.PayloadSize = -1 },
-		"unversioned delete":       func(i *MutationIntent) { i.Kind, i.PayloadRef, i.PayloadDigest, i.PayloadSize = "delete", "", "", 0 },
+		"legacy version":            func(i *MutationIntent) { i.ContractVersion = 0 },
+		"scope":                     func(i *MutationIntent) { i.StoreScopeHash = "" },
+		"owner":                     func(i *MutationIntent) { i.OwnerStep.Owner = "" },
+		"oversize owner":            func(i *MutationIntent) { i.OwnerStep.Owner = strings.Repeat("a", 129) },
+		"workflow":                  func(i *MutationIntent) { i.OwnerStep.Workflow = "" },
+		"step":                      func(i *MutationIntent) { i.OwnerStep.Step = "" },
+		"attempt":                   func(i *MutationIntent) { i.OwnerStep.Attempt = 0 },
+		"condition":                 func(i *MutationIntent) { i.Condition.Mode = "" },
+		"create with generation":    func(i *MutationIntent) { i.Condition = MutationCondition{Mode: MutationCreateOnly, Generation: 1} },
+		"missing exact generation":  func(i *MutationIntent) { i.Condition.Mode = MutationMatchGeneration },
+		"negative length":           func(i *MutationIntent) { i.PayloadSize = -1 },
+		"unversioned delete":        func(i *MutationIntent) { i.Kind, i.PayloadRef, i.PayloadDigest, i.PayloadSize = "delete", "", "", 0 },
+		"dot segment key alias":     func(i *MutationIntent) { i.Key = "nested/../target" },
+		"prefix escape key alias":   func(i *MutationIntent) { i.Key = "../source/target" },
+		"duplicate separator alias": func(i *MutationIntent) { i.Key = "nested//target" },
+		"absolute object key":       func(i *MutationIntent) { i.Key = "/target" },
 	}
 	for name, change := range invalid {
 		t.Run(name, func(t *testing.T) {

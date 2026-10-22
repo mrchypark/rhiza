@@ -1,34 +1,32 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"os"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/thanos-io/objstore"
 )
 
 var errMutationArchiveEvidence = errors.New("fencing: retained mutation archive is missing or differs")
 
-func (e *FencingExecutor) mutationArchivePath(name string) string {
-	return e.controller().corePath("configmaps", name)
-}
-
-func (e *FencingExecutor) decodeMutationArchive(resource object, reference fencing.MutationArchiveReference, runtime fencing.RuntimeBinding, producerUID, wal string) (fencing.MutationCompactionPlan, error) {
+func (e *FencingExecutor) decodeMutationArchive(data []byte, version *objstore.ObjectVersion, reference fencing.MutationArchiveReference, runtime fencing.RuntimeBinding, producerUID, wal string) (fencing.MutationCompactionPlan, error) {
 	var plan fencing.MutationCompactionPlan
-	if !reference.Valid() || str(nested(resource, "metadata", "name")) != reference.Name || str(nested(resource, "metadata", "namespace")) != e.Kube.Namespace || str(nested(resource, "metadata", "uid")) != reference.UID || nested(resource, "metadata", "deletionTimestamp") != nil || resource["immutable"] != true {
+	if !reference.Valid() || version == nil || version.Type != objstore.Generation || version.Value != reference.UID || len(data) > 700000 {
 		return plan, errMutationArchiveEvidence
 	}
-	raw := str(nested(resource, "data", "archive.json"))
-	if len(raw) > 700000 {
-		return plan, errMutationArchiveEvidence
-	}
-	d := json.NewDecoder(strings.NewReader(raw))
+	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
 	if d.Decode(&plan) != nil || d.Decode(new(any)) != io.EOF || plan.Validate() != nil || plan.Digest() != reference.Digest || plan.ProducerUID != producerUID || plan.Runtime != runtime || plan.WALIdentity != wal {
+		return fencing.MutationCompactionPlan{}, errMutationArchiveEvidence
+	}
+	canonical, err := json.Marshal(plan)
+	if err != nil || !bytes.Equal(canonical, data) {
 		return fencing.MutationCompactionPlan{}, errMutationArchiveEvidence
 	}
 	return plan, nil
@@ -38,14 +36,22 @@ func (e *FencingExecutor) readMutationArchive(ctx context.Context, reference fen
 	if !reference.Valid() {
 		return fencing.MutationCompactionPlan{}, errMutationArchiveEvidence
 	}
-	var resource object
-	if err := e.Kube.Get(ctx, e.mutationArchivePath(reference.Name), &resource); err != nil {
-		if apiNotFound(err) {
+	evidence, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		return fencing.MutationCompactionPlan{}, err
+	}
+	r, version, err := evidence.Read(ctx, reference.Name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || evidence.IsNotFound(err) {
 			return fencing.MutationCompactionPlan{}, errMutationArchiveEvidence
 		}
 		return fencing.MutationCompactionPlan{}, err
 	}
-	return e.decodeMutationArchive(resource, reference, runtime, producerUID, wal)
+	data, readErr := io.ReadAll(io.LimitReader(r, 700001))
+	if err := errors.Join(readErr, r.Close()); err != nil {
+		return fencing.MutationCompactionPlan{}, err
+	}
+	return e.decodeMutationArchive(data, version, reference, runtime, producerUID, wal)
 }
 
 // Creation alone never advances coverage. Readback resolves an uncertain create
@@ -66,30 +72,36 @@ func (e *FencingExecutor) persistMutationArchive(ctx context.Context, plan fenci
 	}
 	ref := fencing.MutationArchiveReference{Digest: plan.Digest()}
 	ref.Name = fencing.MutationArchiveName(ref.Digest)
-	resource := object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": ref.Name, "namespace": e.Kube.Namespace}, "immutable": true, "data": object{"archive.json": string(data)}}
-	postErr := e.Kube.Post(ctx, e.controller().corePath("configmaps", ""), resource, nil)
-	var stored object
-	if err := e.Kube.Get(ctx, e.mutationArchivePath(ref.Name), &stored); err != nil {
-		return ref, errors.Join(postErr, err)
+	evidence, err := e.authorityEvidenceFor(plan.Runtime)
+	if err != nil {
+		return fencing.MutationArchiveReference{}, err
 	}
-	ref.UID = str(nested(stored, "metadata", "uid"))
-	if _, err := e.decodeMutationArchive(stored, ref, plan.Runtime, plan.ProducerUID, plan.WALIdentity); err != nil {
+	version, err := evidence.CreateImmutable(ctx, ref.Name, data)
+	if err != nil {
+		return ref, err
+	}
+	if version == nil || version.Type != objstore.Generation || version.Value == "" {
+		return ref, fmt.Errorf("fencing: mutation archive requires an immutable object generation")
+	}
+	ref.UID = version.Value
+	if _, err := e.readMutationArchive(ctx, ref, plan.Runtime, plan.ProducerUID, plan.WALIdentity); err != nil {
 		return ref, err
 	}
 	return ref, nil
 }
 
 func (e *FencingExecutor) verifyMutationArchiveReceipts(ctx context.Context, plan fencing.MutationCompactionPlan) error {
+	verify := e.VerifyMutationEvidence
+	if verify == nil {
+		verify = e.VerifySourceMutationEvidence
+	}
 	for sequence, entry := range plan.Entries {
 		// The archive's cancelled-unprepared CAS record itself proves no
 		// executable descriptor existed. Prepared work needs external evidence.
 		if entry.Preparation == nil {
 			continue
 		}
-		if e.VerifyMutationEvidence == nil {
-			return fmt.Errorf("fencing: prepared mutation evidence verifier is not configured")
-		}
-		if err := e.VerifyMutationEvidence(ctx, plan.Runtime, sequence, entry); err != nil {
+		if err := verify(ctx, plan.Runtime, sequence, entry); err != nil {
 			return err
 		}
 	}

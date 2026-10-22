@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	errMutationExcluded = errors.New("fencing: original mutation was excluded")
-	errMutationRejected = errors.New("fencing: original mutation was rejected")
+	errMutationExcluded        = errors.New("fencing: original mutation was excluded")
+	errMutationRejected        = errors.New("fencing: original mutation was rejected")
+	ErrMutationConditionFailed = errors.New("fencing: original storage condition failed")
 )
 
 // sourceMutationAuthority is deliberately narrow and internal. Implementations
@@ -21,6 +22,13 @@ type sourceMutationAuthority interface {
 	SealUpload(context.Context, string, []byte) (sourceSealedPayload, error)
 	Admit(context.Context, uint64, MutationIntent) error
 	Lookup(context.Context, uint64, MutationIntent) (MutationLookupResult, error)
+}
+
+// sourceMutationExecutor is optional so journal-only authorities remain useful
+// for diagnostics and tests. A production provider must implement it before an
+// unresolved admitted tuple can receive a committed ACK.
+type sourceMutationExecutor interface {
+	Execute(context.Context, uint64, MutationIntent) error
 }
 
 // sourceMutationClient owns only the source-side orchestration. Its retry state
@@ -112,7 +120,7 @@ func (c *sourceMutationClient) refreshArchivedOwners(ctx context.Context) error 
 		}
 		before := c.state.retiredThrough()
 		err := c.settle(ctx, step)
-		if err != nil && !errors.Is(err, errMutationExcluded) && !errors.Is(err, errMutationRejected) {
+		if err != nil && !errors.Is(err, errMutationExcluded) && !errors.Is(err, errMutationRejected) && !errors.Is(err, ErrMutationConditionFailed) {
 			return err
 		}
 		if c.state.retiredThrough() == before {
@@ -170,7 +178,23 @@ func (c *sourceMutationClient) settle(ctx context.Context, step sourceRetryStep)
 		return fmt.Errorf("fencing: authority result changed original intent")
 	}
 	if entry.Resolution == nil {
-		return ErrPending
+		executor, ok := c.authority.(sourceMutationExecutor)
+		if !ok {
+			return ErrPending
+		}
+		if err := executor.Execute(ctx, sequence, intent); err != nil {
+			if !errors.Is(err, ErrMutationConditionFailed) {
+				return err
+			}
+		}
+		result, err = c.authority.Lookup(ctx, sequence, intent)
+		if err != nil {
+			return err
+		}
+		if !result.Found || result.Entry == nil || result.Entry.Intent != intent || result.Entry.Resolution == nil {
+			return ErrPending
+		}
+		entry = *result.Entry
 	}
 	if err := c.state.resolved(sequence, entry); err != nil {
 		return err
@@ -196,6 +220,9 @@ func (c *sourceMutationClient) finish(step sourceRetryStep) error {
 	case MutationExcluded:
 		return errMutationExcluded
 	case MutationRejected:
+		if step.Entry.Resolution.ConditionFailed {
+			return ErrMutationConditionFailed
+		}
 		return errMutationRejected
 	default:
 		return fmt.Errorf("fencing: authority returned unknown mutation outcome")

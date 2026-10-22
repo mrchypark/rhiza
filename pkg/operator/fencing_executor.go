@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"cloud.google.com/go/storage"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
@@ -31,11 +32,18 @@ const fencingCredentialAnnotation = "rhiza.mrchypark.dev/fencing-credential-uid"
 // cooperative ledger is durably closed. The legacy Attestor transport is retained
 // for diagnostics, never as an alternative recovery authorization.
 type FencingExecutor struct {
-	Kube     *Kubernetes
-	Attestor FenceAttestor
-	// SourceStages is nil unless an operator explicitly opens a provisioned,
-	// incarnation-pinned local POSIX spool. Node mutation remains disabled.
+	Kube *Kubernetes
+	// AuthorityState is canonical ObjectStorage state; Kubernetes resources are
+	// only optional indexes and are never consulted to reconstruct authority.
+	AuthorityState *AuthorityStateStore
+	Attestor       FenceAttestor
+	// SourceStages is an optional local fallback for isolated tests or development.
+	// Production selects root-bound ObjectStorage staging through sourceStagesFor.
 	SourceStages *SourceStageStore
+	// Source mutations stay unavailable unless the authority receives separate
+	// writer credentials and a durable receipt directory.
+	SourceMutationStorage  *storage.Client
+	SourceMutationReceipts *MutationExecutionReceiptStore
 	// Prepared work needs trusted receipt/session verification, not just valid
 	// digest strings. A missing provider verifier cannot qualify archived work.
 	VerifyMutationEvidence func(context.Context, fencing.RuntimeBinding, uint64, fencing.MutationEntry) error
@@ -61,72 +69,79 @@ func (e *FencingExecutor) ledgerPath(uid, source string) string {
 	return e.controller().corePath("configmaps", "rhiza-fence-ledger-"+hashJSON([]string{uid, source})[:40])
 }
 
-// change retries only a Kubernetes CAS conflict, not failed executions. The
-// transition is pure and must tolerate a previously committed response loss.
+// change retries only an ObjectStorage generation conflict. The transition is
+// pure and must tolerate a response lost after the conditional write commits.
 func (e *FencingExecutor) change(ctx context.Context, uid, source string, transition func(*fencing.Ledger) error) (fenceLedger, error) {
-	endpoint := e.ledgerPath(uid, source)
+	if e.AuthorityState == nil {
+		return fenceLedger{}, fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
+	}
 	for attempt := 0; attempt < 8; attempt++ {
-		var resource object
-		err := e.Kube.Get(ctx, endpoint, &resource)
-		creating := apiNotFound(err)
-		if err != nil && !creating {
+		state, version, err := e.AuthorityState.ReadRoot(ctx, uid, source)
+		if err != nil {
+			if errors.Is(err, errAuthorityStateNotFound) {
+				return fenceLedger{}, fmt.Errorf("fencing: canonical authority root is missing; refusing to bootstrap")
+			}
 			return fenceLedger{}, err
-		}
-		state := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{SourceClusterID: source}}
-		if !creating {
-			if nested(resource, "metadata", "deletionTimestamp") != nil {
-				return state, fmt.Errorf("fencing: ledger deleting")
-			}
-			if err := json.Unmarshal([]byte(str(nested(resource, "data", "ledger.json"))), &state); err != nil {
-				return state, err
-			}
-			if state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
-				return state, fmt.Errorf("fencing: ledger identity differs")
-			}
 		}
 		if err := transition(&state.Ledger); err != nil {
 			return state, err
 		}
-		data, err := json.Marshal(state)
-		if err != nil {
-			return state, err
-		}
-		if len(data) > 700000 {
-			return state, fmt.Errorf("fencing: ledger capacity exhausted; old evidence cannot be discarded")
-		}
-		if creating {
-			_, name, _ := strings.Cut(endpoint, e.controller().corePath("configmaps", "")+"/")
-			resource = object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": object{"name": name, "namespace": e.Kube.Namespace}, "data": object{"ledger.json": string(data)}}
-			err = e.Kube.Post(ctx, e.controller().corePath("configmaps", ""), resource, nil)
-		} else {
-			resource["data"] = object{"ledger.json": string(data)}
-			err = e.Kube.Put(ctx, endpoint, resource, nil)
-		}
-		if err == nil {
+		writeErr := e.AuthorityState.WriteRoot(ctx, uid, source, state, version)
+		if writeErr == nil {
 			return state, nil
 		}
-		var api *APIError
-		if !errors.As(err, &api) || api.StatusCode != http.StatusConflict {
-			return state, err
+		if errors.Is(writeErr, errAuthorityStateConflict) {
+			continue
+		}
+		// A lost response is confirmed only by reading the exact canonical root.
+		committed, _, readErr := e.AuthorityState.ReadRoot(ctx, uid, source)
+		if readErr == nil && hashJSON(committed) == hashJSON(state) {
+			return committed, nil
+		}
+		if readErr != nil && !errors.Is(readErr, errAuthorityStateNotFound) {
+			return state, errors.Join(writeErr, readErr)
 		}
 	}
 	return fenceLedger{}, fencing.ErrUnavailable
 }
 
+// initializeRoot is called only for authenticated source registration. Other
+// transitions never interpret a missing canonical root as permission to open it.
+func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string) error {
+	if e.AuthorityState == nil {
+		return fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
+	}
+	if _, _, err := e.AuthorityState.ReadRoot(ctx, uid, source); err == nil {
+		_, identity, _ := e.AuthorityState.rootKey(uid, source)
+		return e.AuthorityState.ensureRootGenesis(ctx, identity)
+	} else if !errors.Is(err, errAuthorityStateNotFound) {
+		return err
+	}
+	initial := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{SourceClusterID: source}}
+	err := e.AuthorityState.WriteRoot(ctx, uid, source, initial, nil)
+	if err != nil && !errors.Is(err, errAuthorityStateConflict) {
+		_, _, readErr := e.AuthorityState.ReadRoot(ctx, uid, source)
+		if readErr == nil {
+			_, identity, _ := e.AuthorityState.rootKey(uid, source)
+			return e.AuthorityState.ensureRootGenesis(ctx, identity)
+		}
+		return errors.Join(err, readErr)
+	}
+	_, _, err = e.AuthorityState.ReadRoot(ctx, uid, source)
+	if err != nil {
+		return err
+	}
+	_, identity, _ := e.AuthorityState.rootKey(uid, source)
+	return e.AuthorityState.ensureRootGenesis(ctx, identity)
+}
+
 func (e *FencingExecutor) read(ctx context.Context, uid, source string) (fenceLedger, error) {
-	var resource object
-	if err := e.Kube.Get(ctx, e.ledgerPath(uid, source), &resource); err != nil {
+	if e.AuthorityState == nil {
+		return fenceLedger{}, fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
+	}
+	state, _, err := e.AuthorityState.ReadRoot(ctx, uid, source)
+	if err != nil {
 		return fenceLedger{}, err
-	}
-	var state fenceLedger
-	if nested(resource, "metadata", "deletionTimestamp") != nil {
-		return state, fmt.Errorf("fencing: ledger deleting")
-	}
-	if err := json.Unmarshal([]byte(str(nested(resource, "data", "ledger.json"))), &state); err != nil {
-		return state, err
-	}
-	if state.StatefulSetUID != uid || state.Ledger.SourceClusterID != source {
-		return state, fmt.Errorf("fencing: ledger differs")
 	}
 	return state, nil
 }
@@ -136,6 +151,10 @@ func (e *FencingExecutor) read(ctx context.Context, uid, source string) (fenceLe
 func (e *FencingExecutor) Handler() http.Handler { return http.HandlerFunc(e.handle) }
 
 func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/source-mutations/") {
+		e.handleSourceMutation(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v1/source-stages/") {
 		e.handleSourceStage(w, r)
 		return
@@ -212,36 +231,41 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		_, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
-			switch message.Action {
-			case "register":
-				if enrolled != nil {
-					l.RequireRuntimeBinding = true
-					return l.RegisterEnrolled(message.Identity, *enrolled)
+		if message.Action == "register" {
+			err = e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID)
+		}
+		if err == nil {
+			_, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
+				switch message.Action {
+				case "register":
+					if enrolled != nil {
+						l.RequireRuntimeBinding = true
+						return l.RegisterEnrolled(message.Identity, *enrolled)
+					}
+					if l.RequireRuntimeBinding {
+						return fmt.Errorf("fencing: runtime agent is required")
+					}
+					return l.Register(message.Identity)
+				case "drain":
+					if message.Drain == nil || message.Drain.Request.Identity != message.Identity {
+						return fmt.Errorf("fencing: drain binding differs")
+					}
+					return l.RecordDrain(*message.Drain)
+				case "exit":
+					if message.Request == nil || message.Request.Identity != message.Identity {
+						return fmt.Errorf("fencing: exit binding differs")
+					}
+					return l.RecordExit(*message.Request)
+				case "never-bound-exit":
+					if message.Request == nil || message.Request.Identity != message.Identity {
+						return fmt.Errorf("fencing: never-bound exit binding differs")
+					}
+					return l.RecordNeverBoundExit(*message.Request)
+				default:
+					return fmt.Errorf("fencing: unknown action")
 				}
-				if l.RequireRuntimeBinding {
-					return fmt.Errorf("fencing: runtime agent is required")
-				}
-				return l.Register(message.Identity)
-			case "drain":
-				if message.Drain == nil || message.Drain.Request.Identity != message.Identity {
-					return fmt.Errorf("fencing: drain binding differs")
-				}
-				return l.RecordDrain(*message.Drain)
-			case "exit":
-				if message.Request == nil || message.Request.Identity != message.Identity {
-					return fmt.Errorf("fencing: exit binding differs")
-				}
-				return l.RecordExit(*message.Request)
-			case "never-bound-exit":
-				if message.Request == nil || message.Request.Identity != message.Identity {
-					return fmt.Errorf("fencing: never-bound exit binding differs")
-				}
-				return l.RecordNeverBoundExit(*message.Request)
-			default:
-				return fmt.Errorf("fencing: unknown action")
-			}
-		})
+			})
+		}
 	}
 	if errors.Is(err, fencing.ErrPending) || errors.Is(err, ErrFencePending) {
 		w.WriteHeader(http.StatusAccepted)
