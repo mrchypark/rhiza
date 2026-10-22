@@ -313,7 +313,7 @@ func (e *FencingExecutor) cancelArchiveGenesisLoser(ctx context.Context, runtime
 	if err != nil {
 		return err
 	}
-	receiptDigest := hashBytes(body)
+	receiptDigest := authorityStateDigest(body)
 	evidence, err := e.authorityEvidenceFor(runtime)
 	if err != nil {
 		return err
