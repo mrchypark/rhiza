@@ -15,6 +15,7 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/thanos-io/objstore"
 )
 
 type gcsRecoverySource struct {
@@ -36,6 +37,7 @@ type gcsRecoverySource struct {
 	Bucket           string
 	Endpoint         string
 	Prefix           string
+	Durability       string
 	Targets          []operator.FenceTarget
 }
 
@@ -57,6 +59,14 @@ type gcsRecoveryOutcome struct {
 }
 
 func qualifyGCSHA(ctx context.Context) (resultErr error) {
+	return qualifyGCSHAWithMode(ctx, false)
+}
+
+func qualifyGCSHAExplicit(ctx context.Context) error {
+	return qualifyGCSHAWithMode(ctx, true)
+}
+
+func qualifyGCSHAWithMode(ctx context.Context, explicit bool) (resultErr error) {
 	out := os.Getenv("FENCING_E2E_OUT")
 	if out == "" {
 		out = "gcs-ha-recovery-results"
@@ -88,6 +98,12 @@ func qualifyGCSHA(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
+	if explicit {
+		firstSource, err = prepareExplicitGCSRecoverySource(ctx, firstSource, out, false)
+		if err != nil {
+			return err
+		}
+	}
 	adminToken, err := sourceAdminToken(ctx, firstSource.StatefulSet, firstSource.Container)
 	if err != nil {
 		return err
@@ -107,7 +123,7 @@ func qualifyGCSHA(ctx context.Context) (resultErr error) {
 	}
 	rows1 := `[[1,"gcs-ack-1"]]`
 	event("source_ack", obj{"source": firstSource.ClusterID, "ack": ack1})
-	firstOutcome, err := gcsLoseQuorumAndRecover(ctx, firstSource, adminToken, rows1, "first", out, event, &faults)
+	firstOutcome, err := gcsLoseQuorumAndRecover(ctx, firstSource, adminToken, rows1, "first", explicit, out, event, &faults)
 	if err != nil {
 		return fmt.Errorf("first GCS recovery: %w", err)
 	}
@@ -121,13 +137,18 @@ func qualifyGCSHA(ctx context.Context) (resultErr error) {
 	if secondSource.ClusterID != firstOutcome.Recovery.Status.Target || secondSource.ClusterID == firstSource.ClusterID {
 		return fmt.Errorf("second source is not the distinct first recovery target")
 	}
+	if explicit {
+		if err := requireExplicitGCSRecoveryProfile(ctx, secondSource, false); err != nil {
+			return err
+		}
+	}
 	ack2, err := writeGCSAcknowledgedRow(ctx, firstOutcome.Forward, firstOutcome.Admin, 2, "gcs-ack-2")
 	if err != nil {
 		return fmt.Errorf("second-generation acknowledged row: %w", err)
 	}
 	rows2 := `[[1,"gcs-ack-1"],[2,"gcs-ack-2"]]`
 	event("second_source_ack", obj{"source": secondSource.ClusterID, "ack": ack2})
-	secondOutcome, err := gcsLoseQuorumAndRecover(ctx, secondSource, firstOutcome.Admin, rows2, "second", out, event, &faults)
+	secondOutcome, err := gcsLoseQuorumAndRecover(ctx, secondSource, firstOutcome.Admin, rows2, "second", explicit, out, event, &faults)
 	if err != nil {
 		return fmt.Errorf("second GCS recovery: %w", err)
 	}
@@ -155,6 +176,180 @@ func qualifyGCSHA(ctx context.Context) (resultErr error) {
 		return err
 	}
 	event("old_pod_return_qualified", oldReturn)
+	return nil
+}
+
+func prepareExplicitGCSRecoverySource(ctx context.Context, source gcsRecoverySource, out string, async bool) (gcsRecoverySource, error) {
+	if source.Namespace != namespace || source.BindingName == "" || source.StatefulSet == "" {
+		return source, fmt.Errorf("explicit recovery source is outside the configured run namespace")
+	}
+	if err := ensureNoGCSRecoveryInProgress(ctx, source); err != nil {
+		return source, err
+	}
+	wantDurability := "before-ack"
+	if async {
+		wantDurability = "async"
+	}
+	if source.Durability != wantDurability {
+		return source, fmt.Errorf("explicit recovery mode does not match the captured source durability")
+	}
+	// Prove every object that would be changed was created inside this fresh,
+	// run-labeled namespace before touching either control plane.
+	ns, err := get(ctx, "namespace", namespace)
+	if err != nil {
+		return source, err
+	}
+	if nested(ns, "metadata", "labels", "chaos.rhiza.io/run") != qualificationRunID {
+		return source, fmt.Errorf("explicit recovery requires the current run-owned namespace")
+	}
+	namespaceCreated, err := time.Parse(time.RFC3339Nano, text(nested(ns, "metadata", "creationTimestamp")))
+	if err != nil {
+		return source, fmt.Errorf("read run namespace creation identity: %w", err)
+	}
+	binding, err := get(ctx, "rhizacluster", source.BindingName)
+	if err != nil {
+		return source, err
+	}
+	if err := requireRunOwnedResource(binding, "RhizaCluster", namespace, namespaceCreated); err != nil {
+		return source, err
+	}
+	sts, err := get(ctx, "statefulset", source.StatefulSet)
+	if err != nil {
+		return source, err
+	}
+	if err := requireRunOwnedResource(sts, "StatefulSet", namespace, namespaceCreated); err != nil {
+		return source, err
+	}
+	operatorDeployment, err := get(ctx, "deployment", "rhiza-operator")
+	if err != nil {
+		return source, err
+	}
+	if err := requireRunOwnedResource(operatorDeployment, "operator Deployment", namespace, namespaceCreated); err != nil {
+		return source, err
+	}
+	if nested(operatorDeployment, "spec", "selector", "matchLabels", "app.kubernetes.io/name") != "rhiza-operator" ||
+		nested(operatorDeployment, "spec", "template", "metadata", "labels", "app.kubernetes.io/name") != "rhiza-operator" {
+		return source, fmt.Errorf("operator Deployment does not match the run fixture identity")
+	}
+	container, err := boundContainer(operatorDeployment, "operator")
+	if err != nil {
+		return source, err
+	}
+	automatic, err := effectiveGCSOptionalSetting(ctx, container, "RHIZA_AUTOMATIC_RECOVERY")
+	if err != nil {
+		return source, err
+	}
+	if automatic != "false" {
+		if _, err := kubectl(ctx, "set", "env", "deployment/rhiza-operator", "RHIZA_AUTOMATIC_RECOVERY=false"); err != nil {
+			return source, fmt.Errorf("disable automatic recovery for explicit qualification: %w", err)
+		}
+		if _, err := kubectl(ctx, "rollout", "status", "deployment/rhiza-operator", "--timeout=120s"); err != nil {
+			return source, fmt.Errorf("wait for explicit-mode operator rollout: %w", err)
+		}
+	}
+	if !explicitGCSRecoveryProfileSafe(nested(binding, "spec"), "false") {
+		patch := `{"spec":{"automatic":false,"policy":null}}`
+		if _, err := kubectl(ctx, "patch", "rhizacluster", source.BindingName, "--type=merge", "-p", patch); err != nil {
+			return source, fmt.Errorf("disable automatic incident policy for explicit qualification: %w", err)
+		}
+	}
+	if err := wait(ctx, "persisted explicit-only recovery profile", func() (bool, error) {
+		binding, err := get(ctx, "rhizacluster", source.BindingName)
+		if err != nil {
+			return false, err
+		}
+		deployment, err := get(ctx, "deployment", "rhiza-operator")
+		if err != nil {
+			return false, err
+		}
+		container, err := boundContainer(deployment, "operator")
+		if err != nil {
+			return false, err
+		}
+		setting, err := effectiveGCSSetting(ctx, container, "RHIZA_AUTOMATIC_RECOVERY")
+		if err != nil {
+			return false, err
+		}
+		return explicitGCSRecoveryProfileSafe(nested(binding, "spec"), setting), nil
+	}); err != nil {
+		return source, err
+	}
+	refreshed, err := captureGCSRecoverySource(ctx, out)
+	if err != nil {
+		return source, err
+	}
+	if err := requireExplicitGCSRecoveryProfile(ctx, refreshed, async); err != nil {
+		return source, err
+	}
+	return refreshed, nil
+}
+
+func requireRunOwnedResource(resource any, description, expectedNamespace string, namespaceCreated time.Time) error {
+	resourceNamespace := text(nested(resource, "metadata", "namespace"))
+	uid := text(nested(resource, "metadata", "uid"))
+	createdAt, err := time.Parse(time.RFC3339Nano, text(nested(resource, "metadata", "creationTimestamp")))
+	if err != nil || resourceNamespace != expectedNamespace || uid == "" || createdAt.Before(namespaceCreated) {
+		return fmt.Errorf("%s is not proven to belong to the fresh run namespace", description)
+	}
+	if runLabel := text(nested(resource, "metadata", "labels", "chaos.rhiza.io/run")); runLabel != "" && runLabel != qualificationRunID {
+		return fmt.Errorf("%s carries a different run identity", description)
+	}
+	return nil
+}
+
+func explicitGCSRecoveryProfileSafe(spec any, operatorAutomatic string) bool {
+	return nested(spec, "automatic") == false && nested(spec, "policy", "allowDataLoss") != true && operatorAutomatic == "false"
+}
+
+func requireExplicitGCSRecoveryProfile(ctx context.Context, source gcsRecoverySource, async bool) error {
+	binding, err := get(ctx, "rhizacluster", source.BindingName)
+	if err != nil {
+		return err
+	}
+	deployment, err := get(ctx, "deployment", "rhiza-operator")
+	if err != nil {
+		return err
+	}
+	container, err := boundContainer(deployment, "operator")
+	if err != nil {
+		return err
+	}
+	automatic, err := effectiveGCSSetting(ctx, container, "RHIZA_AUTOMATIC_RECOVERY")
+	if err != nil || !explicitGCSRecoveryProfileSafe(nested(binding, "spec"), automatic) {
+		return fmt.Errorf("explicit recovery requires automatic recovery disabled and no automatic loss policy")
+	}
+	want := "before-ack"
+	if async {
+		want = "async"
+	}
+	if source.Durability != want {
+		return fmt.Errorf("explicit recovery source durability is %q, want %q", source.Durability, want)
+	}
+	return nil
+}
+
+func ensureNoGCSRecoveryInProgress(ctx context.Context, source gcsRecoverySource) error {
+	recoveries, err := get(ctx, "rhizarecoveries", "")
+	if err != nil {
+		return err
+	}
+	if items, _ := recoveries["items"].([]any); len(items) != 0 {
+		return fmt.Errorf("explicit recovery qualification requires a fresh namespace with no prior recovery resources")
+	}
+	fences, err := get(ctx, "rhizafences", "")
+	if err != nil {
+		return err
+	}
+	items, _ := nested(fences, "items").([]any)
+	for _, item := range items {
+		var request operator.FenceRequest
+		if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
+			return err
+		}
+		if request.Scope == operator.ScopeGeneration && request.SourceClusterID == source.ClusterID {
+			return fmt.Errorf("explicit recovery qualification found a prior generation fence for the source")
+		}
+	}
 	return nil
 }
 
@@ -213,7 +408,173 @@ func sourceAdminToken(ctx context.Context, statefulSet, container string) (strin
 	return "", fmt.Errorf("source workload has no readable admin Secret")
 }
 
-func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, token, expectedRows, phase, out string, event func(string, any), faults *[]*gcsChaosFault) (*gcsRecoveryOutcome, error) {
+func explicitGenerationFenceRequest(source gcsRecoverySource, recoveryID string) operator.FenceRequest {
+	return operator.FenceRequest{
+		LogicalID: source.LogicalID, BindingUID: source.BindingUID, Namespace: source.Namespace,
+		StatefulSet: source.StatefulSet, StatefulSetUID: source.StatefulSetUID,
+		SourceClusterID: source.ClusterID, OperationID: recoveryID,
+		Scope: operator.ScopeGeneration, Targets: append([]operator.FenceTarget(nil), source.Targets...),
+	}
+}
+
+func validateExplicitGenerationFenceRequest(request operator.FenceRequest, source gcsRecoverySource, recoveryID string) error {
+	if recoveryID == "" || request.Scope != operator.ScopeGeneration || request.OperationID != recoveryID ||
+		!sameFenceRequest(request, explicitGenerationFenceRequest(source, recoveryID)) {
+		return fmt.Errorf("explicit fence request differs from the captured source workload")
+	}
+	return nil
+}
+
+func explicitRecoveryIdentity(runID, phase string) (string, string, error) {
+	if len(runID) != 8 || (phase != "first" && phase != "second" && phase != "async-empty") {
+		return "", "", fmt.Errorf("explicit recovery requires a run-owned ID and known phase")
+	}
+	for _, r := range runID {
+		if !(r >= 'a' && r <= 'f' || r >= '0' && r <= '9') {
+			return "", "", fmt.Errorf("explicit recovery requires a lowercase hexadecimal run ID")
+		}
+	}
+	name := "rhiza-manual-" + runID + "-" + phase
+	recoveryID := "manual-" + runID + "-" + phase
+	return name, recoveryID, nil
+}
+
+func explicitRecoveryManifest(source gcsRecoverySource, runID, phase, targetDurability string, allowDataLoss bool) (obj, string, string, error) {
+	name, recoveryID, err := explicitRecoveryIdentity(runID, phase)
+	if err != nil {
+		return nil, "", "", err
+	}
+	async := targetDurability == "async"
+	if (targetDurability != "async" && targetDurability != "before-ack") || allowDataLoss != async {
+		return nil, "", "", fmt.Errorf("explicit recovery durability and loss policy are inconsistent")
+	}
+	request := obj{
+		"apiVersion": "rhiza.mrchypark.dev/v1alpha1", "kind": "RhizaRecovery",
+		"metadata": obj{"name": name, "namespace": source.Namespace, "labels": obj{"chaos.rhiza.io/run": runID}},
+		"spec": obj{
+			"statefulSet": source.StatefulSet, "container": source.Container,
+			"sourceClusterID": source.ClusterID, "durability": targetDurability,
+			"recoveryID": recoveryID, "allowDataLoss": allowDataLoss,
+			"fence": obj{"recoveryID": recoveryID, "clusterID": source.ClusterID, "statefulSetUID": source.StatefulSetUID, "confirmed": false},
+		},
+	}
+	return request, name, recoveryID, nil
+}
+
+func createExplicitGCSRecovery(ctx context.Context, source gcsRecoverySource, phase, targetDurability string, allowDataLoss bool) (explicitGCSRecoveryRef, error) {
+	async := targetDurability == "async"
+	if err := requireExplicitGCSRecoveryProfile(ctx, source, async); err != nil {
+		return explicitGCSRecoveryRef{}, err
+	}
+	request, name, recoveryID, err := explicitRecoveryManifest(source, qualificationRunID, phase, targetDurability, allowDataLoss)
+	if err != nil {
+		return explicitGCSRecoveryRef{}, err
+	}
+	if _, err := commandWithInput(ctx, encoded(request), "kubectl", "--context", kubeContext, "-n", source.Namespace, "create", "-f", "-"); err != nil {
+		return explicitGCSRecoveryRef{}, fmt.Errorf("create unconfirmed explicit recovery resource: %w", err)
+	}
+	uid, err := waitForExplicitGCSRecoveryAwaitingFence(ctx, source, name, recoveryID, "", allowDataLoss)
+	if err != nil {
+		return explicitGCSRecoveryRef{}, err
+	}
+	if err := verifyNoGCSReservation(ctx, source); err != nil {
+		return explicitGCSRecoveryRef{}, err
+	}
+	return explicitGCSRecoveryRef{Name: name, UID: uid, Namespace: source.Namespace, RunLabel: qualificationRunID,
+		OperationID: recoveryID, SourceClusterID: source.ClusterID, StatefulSet: source.StatefulSet,
+		Container: source.Container, Durability: targetDurability, AllowDataLoss: allowDataLoss}, nil
+}
+
+func waitForExplicitGCSRecoveryAwaitingFence(ctx context.Context, source gcsRecoverySource, name, recoveryID, expectedUID string, allowDataLoss bool) (string, error) {
+	var recoveryUID string
+	err := wait(ctx, "explicit recovery awaits its exact external fence", func() (bool, error) {
+		resource, err := get(ctx, "rhizarecovery", name)
+		if err != nil {
+			return false, err
+		}
+		uid := text(nested(resource, "metadata", "uid"))
+		wantDurability := "before-ack"
+		if allowDataLoss {
+			wantDurability = "async"
+		}
+		if uid == "" || expectedUID != "" && uid != expectedUID || text(nested(resource, "metadata", "namespace")) != source.Namespace ||
+			text(nested(resource, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID ||
+			nested(resource, "spec", "sourceClusterID") != source.ClusterID || nested(resource, "spec", "statefulSet") != source.StatefulSet || nested(resource, "spec", "container") != source.Container ||
+			nested(resource, "spec", "durability") != wantDurability || nested(resource, "spec", "recoveryID") != recoveryID || nested(resource, "spec", "allowDataLoss") != allowDataLoss ||
+			nested(resource, "spec", "fence", "recoveryID") != recoveryID || nested(resource, "spec", "fence", "confirmed") != false ||
+			nested(resource, "spec", "fence", "statefulSetUID") != source.StatefulSetUID || nested(resource, "spec", "fence", "clusterID") != source.ClusterID ||
+			nested(resource, "status", "target") != nil || nested(resource, "status", "stage") != nil {
+			return false, fmt.Errorf("explicit recovery identity changed or reserved a successor before proof")
+		}
+		phase := text(nested(resource, "status", "phase"))
+		if phase != "" && phase != "AwaitingFence" {
+			return false, fmt.Errorf("explicit recovery entered unexpected phase %q before its fence", phase)
+		}
+		if phase == "AwaitingFence" {
+			recoveryUID = uid
+			return true, nil
+		}
+		return false, nil
+	})
+	return recoveryUID, err
+}
+
+func verifyNoGCSReservation(ctx context.Context, source gcsRecoverySource) error {
+	bucket, err := newGCSArchiveReader(source)
+	if err != nil {
+		return err
+	}
+	defer bucket.Close()
+	return verifyNoGCSReservationAt(ctx, bucket, source.Prefix)
+}
+
+func verifyNoGCSReservationAt(ctx context.Context, bucket objstore.Bucket, prefix string) error {
+	key := path.Join(prefix, "recovery/successor.json")
+	reader, err := bucket.Get(ctx, key)
+	if err != nil {
+		if bucket.IsObjNotFoundErr(err) {
+			return nil
+		}
+		return fmt.Errorf("verify no pre-fence GCS successor reservation: %w", err)
+	}
+	_ = reader.Close()
+	return fmt.Errorf("explicit recovery reserved a successor before its exact fence proof")
+}
+
+func confirmExplicitGCSRecoveryFence(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence, recovery explicitGCSRecoveryRef) error {
+	item, err := get(ctx, "rhizafence", pending.Name)
+	if err != nil {
+		return err
+	}
+	request, err := exactPendingGCSFenceRequest(item, pending)
+	if err != nil {
+		return err
+	}
+	request, proof, err := verifyIndependentGenerationProof(item, source.ClusterID, source.StatefulSetUID, source.BindingUID, source.Targets, source.Bucket, source.Prefix, source.Namespace, source.StatefulSet, source.LogicalID)
+	if err != nil || !sameFenceRequest(request, pending.Request) || proof.OperationID != pending.Request.OperationID {
+		return fmt.Errorf("explicit recovery proof is not the exact captured generation fence")
+	}
+	recoveryResource, err := get(ctx, "rhizarecovery", recovery.Name)
+	if err != nil {
+		return err
+	}
+	if err := validateExplicitRecoveryResource(recoveryResource, source, recovery); err != nil ||
+		nested(recoveryResource, "status", "phase") != "AwaitingFence" || nested(recoveryResource, "spec", "fence", "confirmed") != false ||
+		recovery.OperationID != pending.Request.OperationID {
+		return fmt.Errorf("explicit recovery changed before the exact fence proof was confirmed")
+	}
+	patchOps, err := explicitRecoveryConfirmationPatch(recoveryResource, recovery, proof.ProofID)
+	if err != nil {
+		return err
+	}
+	_, err = kubectl(ctx, "patch", "rhizarecovery", recovery.Name, "--type=json", "-p", string(encoded(patchOps)))
+	if err != nil {
+		return fmt.Errorf("confirm explicit recovery with the exact persisted proof: %w", err)
+	}
+	return nil
+}
+
+func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, token, expectedRows, phase string, explicit bool, out string, event func(string, any), faults *[]*gcsChaosFault) (*gcsRecoveryOutcome, error) {
 	chaosCtx, cancelChaos := context.WithTimeout(ctx, 165*time.Second)
 	defer cancelChaos()
 	if len(source.Targets) < 3 || len(source.Targets) > 64 || len(source.AgentPods) == 0 || source.OperatorPod == "" {
@@ -270,9 +631,30 @@ func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, toke
 		return nil, err
 	}
 	event("source_quorum_lost", obj{"source": source.ClusterID, "isolatedPodUIDs": podUIDs(source.Targets)})
-	pending, err := waitForPendingGCSFence(chaosCtx, source)
+	var pending pendingGCSFence
+	var explicitRecovery explicitGCSRecoveryRef
+	if explicit {
+		explicitRecovery, err = createExplicitGCSRecovery(chaosCtx, source, phase, "before-ack", false)
+		if err != nil {
+			return nil, err
+		}
+		if err := requestGenerationFence(chaosCtx, source, explicitGenerationFenceRequest(source, explicitRecovery.OperationID), out); err != nil {
+			return nil, err
+		}
+		pending, err = waitForPendingGCSFenceOperation(chaosCtx, source, explicitRecovery.OperationID)
+	} else {
+		pending, err = waitForPendingGCSFence(chaosCtx, source)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if explicit {
+		if _, err := waitForExplicitGCSRecoveryAwaitingFence(chaosCtx, source, explicitRecovery.Name, pending.Request.OperationID, explicitRecovery.UID, explicitRecovery.AllowDataLoss); err != nil {
+			return nil, err
+		}
+		if err := verifyNoGCSReservation(chaosCtx, source); err != nil {
+			return nil, err
+		}
 	}
 	if err := agentFault.RecheckInjected(chaosCtx); err != nil {
 		return nil, fmt.Errorf("runtime-agent partition expired before pending fence observation: %w", err)
@@ -314,6 +696,11 @@ func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, toke
 	if err := waitForGCSFenceProof(chaosCtx, source, pending); err != nil {
 		return nil, err
 	}
+	if explicit {
+		if err := confirmExplicitGCSRecoveryFence(chaosCtx, source, pending, explicitRecovery); err != nil {
+			return nil, err
+		}
+	}
 	if err := operatorFault.RecheckInjected(chaosCtx); err != nil {
 		return nil, fmt.Errorf("operator partition expired before closed-generation return observation: %w", err)
 	}
@@ -338,7 +725,11 @@ func gcsLoseQuorumAndRecover(ctx context.Context, source gcsRecoverySource, toke
 	if err := operatorFault.Restore(chaosCtx); err != nil {
 		return nil, fmt.Errorf("restore operator control after return observation: %w", err)
 	}
-	outcome, err := waitForGCSRecovery(ctx, source, pending, "fork", expectedRows, out)
+	var expectedRecovery *explicitGCSRecoveryRef
+	if explicit {
+		expectedRecovery = &explicitRecovery
+	}
+	outcome, err := waitForGCSRecovery(ctx, source, pending, "fork", expectedRows, out, expectedRecovery)
 	if err != nil {
 		return nil, err
 	}
@@ -352,6 +743,61 @@ type pendingGCSFence struct {
 	Request operator.FenceRequest `json:"request"`
 }
 
+type explicitGCSRecoveryRef struct {
+	Name            string
+	UID             string
+	Namespace       string
+	RunLabel        string
+	OperationID     string
+	SourceClusterID string
+	StatefulSet     string
+	Container       string
+	Durability      string
+	AllowDataLoss   bool
+}
+
+func validateExplicitRecoveryResource(resource any, source gcsRecoverySource, recovery explicitGCSRecoveryRef) error {
+	resourceObject, ok := resource.(map[string]any)
+	if !ok {
+		return fmt.Errorf("explicit recovery response is not a Kubernetes object")
+	}
+	resource = obj(resourceObject)
+	if text(nested(resource, "metadata", "name")) != recovery.Name ||
+		text(nested(resource, "metadata", "uid")) != recovery.UID ||
+		text(nested(resource, "metadata", "namespace")) != recovery.Namespace ||
+		text(nested(resource, "metadata", "labels", "chaos.rhiza.io/run")) != recovery.RunLabel ||
+		recovery.Namespace != source.Namespace || recovery.SourceClusterID != source.ClusterID || recovery.StatefulSet != source.StatefulSet ||
+		recovery.Container != source.Container ||
+		nested(resource, "spec", "recoveryID") != recovery.OperationID ||
+		nested(resource, "spec", "sourceClusterID") != recovery.SourceClusterID ||
+		nested(resource, "spec", "statefulSet") != recovery.StatefulSet || nested(resource, "spec", "container") != recovery.Container ||
+		nested(resource, "spec", "durability") != recovery.Durability || nested(resource, "spec", "allowDataLoss") != recovery.AllowDataLoss ||
+		nested(resource, "spec", "fence", "recoveryID") != recovery.OperationID ||
+		nested(resource, "spec", "fence", "clusterID") != recovery.SourceClusterID ||
+		nested(resource, "spec", "fence", "statefulSetUID") != source.StatefulSetUID {
+		return fmt.Errorf("explicit recovery resource identity or policy changed")
+	}
+	return nil
+}
+
+func explicitRecoveryConfirmationPatch(resource obj, recovery explicitGCSRecoveryRef, proofID string) ([]obj, error) {
+	resourceVersion := text(nested(resource, "metadata", "resourceVersion"))
+	if resourceVersion == "" || proofID == "" || recovery.UID == "" || recovery.OperationID == "" {
+		return nil, fmt.Errorf("explicit recovery confirmation lacks versioned identity or proof")
+	}
+	return []obj{
+		{"op": "test", "path": "/metadata/uid", "value": recovery.UID},
+		{"op": "test", "path": "/metadata/resourceVersion", "value": resourceVersion},
+		{"op": "test", "path": "/spec/recoveryID", "value": recovery.OperationID},
+		{"op": "test", "path": "/spec/sourceClusterID", "value": recovery.SourceClusterID},
+		{"op": "test", "path": "/spec/durability", "value": recovery.Durability},
+		{"op": "test", "path": "/spec/allowDataLoss", "value": recovery.AllowDataLoss},
+		{"op": "test", "path": "/spec/fence/confirmed", "value": false},
+		{"op": "add", "path": "/spec/fence/evidence", "value": proofID},
+		{"op": "replace", "path": "/spec/fence/confirmed", "value": true},
+	}, nil
+}
+
 func podUIDs(targets []operator.FenceTarget) []string {
 	uids := make([]string, 0, len(targets))
 	for _, target := range targets {
@@ -361,6 +807,10 @@ func podUIDs(targets []operator.FenceTarget) []string {
 }
 
 func waitForPendingGCSFence(ctx context.Context, source gcsRecoverySource) (pendingGCSFence, error) {
+	return waitForPendingGCSFenceOperation(ctx, source, "")
+}
+
+func waitForPendingGCSFenceOperation(ctx context.Context, source gcsRecoverySource, operationID string) (pendingGCSFence, error) {
 	var pending pendingGCSFence
 	err := wait(ctx, "exact source generation fence request without proof", func() (bool, error) {
 		list, err := get(ctx, "rhizafences", "")
@@ -374,7 +824,7 @@ func waitForPendingGCSFence(ctx context.Context, source gcsRecoverySource) (pend
 			if err := json.Unmarshal(encoded(nested(item, "spec")), &request); err != nil {
 				return false, err
 			}
-			if request.Scope != operator.ScopeGeneration || request.SourceClusterID != source.ClusterID || request.StatefulSet != source.StatefulSet || request.StatefulSetUID != source.StatefulSetUID || request.BindingUID != source.BindingUID || request.Namespace != source.Namespace || request.LogicalID != source.LogicalID || request.OperationID == "" || !sameTargets(request.Targets, source.Targets) {
+			if request.Scope != operator.ScopeGeneration || request.SourceClusterID != source.ClusterID || request.StatefulSet != source.StatefulSet || request.StatefulSetUID != source.StatefulSetUID || request.BindingUID != source.BindingUID || request.Namespace != source.Namespace || request.LogicalID != source.LogicalID || request.OperationID == "" || operationID != "" && request.OperationID != operationID || !sameTargets(request.Targets, source.Targets) {
 				continue
 			}
 			if nested(item, "status", "proof") != nil {
@@ -538,8 +988,8 @@ func captureGCSRecoverySource(ctx context.Context, out string) (gcsRecoverySourc
 		return source, fmt.Errorf("no healthy active RhizaCluster exists in the run namespace")
 	}
 	source.Namespace = text(nested(binding, "metadata", "namespace"))
-	if source.Namespace == "" {
-		source.Namespace = namespace
+	if source.Namespace == "" || source.Namespace != namespace {
+		return source, fmt.Errorf("active RhizaCluster is not in the configured run namespace")
 	}
 	source.BindingName = text(nested(binding, "metadata", "name"))
 	source.LogicalID = text(nested(binding, "spec", "logicalID"))
@@ -562,6 +1012,10 @@ func captureGCSRecoverySource(ctx context.Context, out string) (gcsRecoverySourc
 	}
 	source.ConfigMap = configMapName
 	configuredClusterID := config["RHIZA_CLUSTER_ID"]
+	source.Durability, err = effectiveGCSSetting(ctx, appContainer, "RHIZA_OBJSTORE_DURABILITY")
+	if err != nil {
+		return source, err
+	}
 	source.Bucket = config["RHIZA_OBJSTORE_BUCKET"]
 	source.Endpoint = config["RHIZA_OBJSTORE_ENDPOINT"]
 	basePrefix := strings.Trim(path.Clean(config["RHIZA_OBJSTORE_PREFIX"]), "/")
@@ -1357,7 +1811,7 @@ func exactPendingGCSFenceRequest(item any, pending pendingGCSFence) (operator.Fe
 	return request, nil
 }
 
-func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence, expectedBase, expectedRows, out string) (*gcsRecoveryOutcome, error) {
+func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending pendingGCSFence, expectedBase, expectedRows, out string, explicitRecovery *explicitGCSRecoveryRef) (*gcsRecoveryOutcome, error) {
 	if source.ClusterID == "" || source.StatefulSetUID == "" || source.BindingUID == "" || source.Bucket == "" || source.Prefix == "" || len(source.Targets) == 0 || expectedBase != "fork" && expectedBase != "empty" || expectedRows == "" {
 		return nil, fmt.Errorf("GCS recovery observation contract is incomplete")
 	}
@@ -1402,27 +1856,42 @@ func waitForGCSRecovery(ctx context.Context, source gcsRecoverySource, pending p
 			return false, err
 		}
 		items, _ := list["items"].([]any)
+		matches := 0
 		for _, item := range items {
-			if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != pending.Request.OperationID {
+			if explicitRecovery != nil {
+				if nested(item, "metadata", "name") != explicitRecovery.Name && nested(item, "spec", "recoveryID") != explicitRecovery.OperationID {
+					continue
+				}
+				if err := validateExplicitRecoveryResource(item, source, *explicitRecovery); err != nil {
+					return false, err
+				}
+			} else if nested(item, "spec", "sourceClusterID") != source.ClusterID || nested(item, "spec", "recoveryID") != pending.Request.OperationID {
 				continue
 			}
+			matches++
 			if err := json.Unmarshal(encoded(item), &outcome.Recovery); err != nil {
 				return false, err
 			}
-			if outcome.Recovery.Status.Phase != "Complete" || outcome.Recovery.Status.Stage != "Complete" {
-				return false, nil
-			}
-			if outcome.Recovery.Spec.SourceClusterID != source.ClusterID || outcome.Recovery.Spec.RecoveryID != pending.Request.OperationID ||
-				outcome.Recovery.Status.Source != source.ClusterID || outcome.Recovery.Status.StatefulSetUID != source.StatefulSetUID ||
-				outcome.Recovery.Status.TargetBaseKind != expectedBase || (expectedBase == "empty" && (outcome.Recovery.Status.RecoveredTip != 0 || outcome.Recovery.Status.ManifestHash != "")) {
-				return false, fmt.Errorf("completed recovery differs from the captured source or expected archive base")
-			}
-			if err := recoveryFenceMatchesProof(outcome.Recovery, outcome.Fence, outcome.Proof); err != nil {
-				return false, err
-			}
-			return true, nil
 		}
-		return false, nil
+		if matches > 1 {
+			return false, fmt.Errorf("multiple recoveries match the captured fence operation")
+		}
+		if matches == 0 || outcome.Recovery.Status.Phase != "Complete" || outcome.Recovery.Status.Stage != "Complete" {
+			return false, nil
+		}
+		if explicitRecovery != nil && (outcome.Recovery.Metadata["uid"] != explicitRecovery.UID || outcome.Recovery.Metadata["name"] != explicitRecovery.Name ||
+			outcome.Recovery.Metadata["namespace"] != explicitRecovery.Namespace) {
+			return false, fmt.Errorf("completed recovery does not match the captured resource identity")
+		}
+		if outcome.Recovery.Spec.SourceClusterID != source.ClusterID || outcome.Recovery.Spec.RecoveryID != pending.Request.OperationID ||
+			outcome.Recovery.Status.Source != source.ClusterID || outcome.Recovery.Status.StatefulSetUID != source.StatefulSetUID ||
+			outcome.Recovery.Status.TargetBaseKind != expectedBase || (expectedBase == "empty" && (outcome.Recovery.Status.RecoveredTip != 0 || outcome.Recovery.Status.ManifestHash != "")) {
+			return false, fmt.Errorf("completed recovery differs from the captured source or expected archive base")
+		}
+		if err := recoveryFenceMatchesProof(outcome.Recovery, outcome.Fence, outcome.Proof); err != nil {
+			return false, err
+		}
+		return true, nil
 	}); err != nil {
 		return nil, err
 	}
