@@ -179,6 +179,8 @@ func gcsIAMProbeTestConfig() gcsIAMProbeConfig {
 
 func prepareFakeGCSIAMProbe(t *testing.T) (*fakeGCSIAMProbeStore, gcsIAMProbeConfig) {
 	t.Helper()
+	t.Setenv("RHIZA_GCS_IAM_PROBE_CREATE_GENERATION", "0")
+	t.Setenv("RHIZA_GCS_IAM_PROBE_UPDATE_GENERATION", "0")
 	store := newFakeGCSIAMProbeStore()
 	store.allowCreate = true
 	cfg := gcsIAMProbeTestConfig()
@@ -193,6 +195,7 @@ func prepareFakeGCSIAMProbe(t *testing.T) (*fakeGCSIAMProbeStore, gcsIAMProbeCon
 
 func TestGCSIAMProbeRequiresPositiveReadAndExact403Denials(t *testing.T) {
 	store, cfg := prepareFakeGCSIAMProbe(t)
+	store.calls = nil
 	if err := verifyGCSIAMProbe(context.Background(), cfg, store); err != nil {
 		t.Fatalf("valid read-only identity rejected: %v", err)
 	}
@@ -213,6 +216,8 @@ func TestGCSIAMProbeRequiresPositiveReadAndExact403Denials(t *testing.T) {
 func TestGCSIAMProbeDoesNotTreat404AsDeniedPermission(t *testing.T) {
 	store, cfg := prepareFakeGCSIAMProbe(t)
 	keys := gcsIAMProbeKeys(cfg)
+	store.calls = nil
+	store.deniedReads[keys.control] = false
 	delete(store.objects, keys.control)
 	if err := verifyGCSIAMProbe(context.Background(), cfg, store); err == nil || !strings.Contains(err.Error(), "control read was not denied") {
 		t.Fatalf("missing control object was accepted as an IAM denial: %v", err)
@@ -227,6 +232,7 @@ func TestGCSIAMProbeDoesNotTreat404AsDeniedPermission(t *testing.T) {
 func TestGCSIAMProbeStopsBeforeDenialChecksWithoutPositiveDataRead(t *testing.T) {
 	store, cfg := prepareFakeGCSIAMProbe(t)
 	keys := gcsIAMProbeKeys(cfg)
+	store.calls = nil
 	store.deniedReads[keys.read] = true
 	if err := verifyGCSIAMProbe(context.Background(), cfg, store); err == nil || !strings.Contains(err.Error(), "positive data read failed") {
 		t.Fatalf("unreadable data canary was accepted: %v", err)
@@ -255,9 +261,15 @@ func TestGCSIAMProbeUnexpectedWritesFailAndCleanupIsExact(t *testing.T) {
 				t.Fatalf("unexpected write access passed: %v", err)
 			}
 			keys := gcsIAMProbeKeys(cfg)
+			// Cleanup runs as the trusted writer, not the read-only identity
+			// whose expected 403 was exercised above.
+			store.deniedReads[keys.control] = false
 			store.unknownVersions[keys.read] = map[int64]bool{999: true}
 			outside := cfg.Prefix + "unowned/object"
 			store.objects[outside] = fakeGCSIAMProbeObject{body: []byte("untouched"), generation: 99}
+			if test.name == "update" {
+				t.Setenv("RHIZA_GCS_IAM_PROBE_UPDATE_GENERATION", "4")
+			}
 			if err := cleanupGCSIAMProbe(context.Background(), cfg, store); err != nil {
 				t.Fatalf("exact cleanup failed: %v", err)
 			}
@@ -267,7 +279,6 @@ func TestGCSIAMProbeUnexpectedWritesFailAndCleanupIsExact(t *testing.T) {
 				{key: keys.manifest, generation: cfg.ManifestGeneration},
 			}
 			if test.name == "update" {
-				t.Setenv("RHIZA_GCS_IAM_PROBE_UPDATE_GENERATION", "4")
 				wantKeys = append(wantKeys, gcsIAMProbeOwnedGeneration{key: keys.update, generation: 4, expected: gcsIAMProbePayload(cfg, "update")})
 			}
 			if !reflect.DeepEqual(cleanupPairsByKey(store.cleanupKeys), cleanupPairsByKey(wantKeys)) {
@@ -305,6 +316,7 @@ func TestGCSIAMProbeSameGenerationMetadataUpdateDeduplicatesCleanup(t *testing.T
 
 func TestGCSIAMCleanupFailurePreservesExactRemainingGeneration(t *testing.T) {
 	store, cfg := prepareFakeGCSIAMProbe(t)
+	store.deniedReads[gcsIAMProbeKeys(cfg).control] = false
 	store.cleanupErr = &gcsIAMProbeCleanupPending{items: []gcsIAMProbeCleanupItem{{label: "read", generation: 2}}}
 	err := cleanupGCSIAMProbe(context.Background(), cfg, store)
 	var pending *gcsIAMProbeCleanupPending
@@ -428,6 +440,8 @@ func TestGCSIAMProbeRejectsEmulatorAndCredentialOverrides(t *testing.T) {
 func TestGCSIAMProbeCleanupAttemptsAndReportsAllExactGenerations(t *testing.T) {
 	store, cfg := prepareFakeGCSIAMProbe(t)
 	keys := gcsIAMProbeKeys(cfg)
+	store.deniedReads[keys.control] = false
+	t.Setenv("RHIZA_GCS_IAM_PROBE_UPDATE_GENERATION", "4")
 	store.cleanupErr = &gcsIAMProbeCleanupPending{items: []gcsIAMProbeCleanupItem{
 		{label: "update", generation: 3}, {label: "update", generation: 4},
 	}}
@@ -437,13 +451,14 @@ func TestGCSIAMProbeCleanupAttemptsAndReportsAllExactGenerations(t *testing.T) {
 		pending.items[0].label != "update" || pending.items[1].label != "update" {
 		t.Fatalf("multiple exact generations were hidden: %v", err)
 	}
-	if len(store.cleanupKeys) != 5 || store.cleanupKeys[1].key != keys.update || store.cleanupKeys[1].generation != 3 {
+	if len(store.cleanupKeys) != 6 || store.cleanupKeys[2].key != keys.update || store.cleanupKeys[2].generation != 3 {
 		t.Fatalf("cleanup scope lost baseline version: %+v", store.cleanupKeys)
 	}
 }
 
 func TestGCSIAMCleanupRetainsExactVersionWhenPayloadDoesNotMatch(t *testing.T) {
 	store, cfg := prepareFakeGCSIAMProbe(t)
+	store.deniedReads[gcsIAMProbeKeys(cfg).control] = false
 	key := gcsIAMProbeKeys(cfg).read
 	version := store.versions[key][2]
 	store.versions[key][2] = []byte("different payload")
