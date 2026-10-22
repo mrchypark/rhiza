@@ -283,3 +283,52 @@ func TestOperatorRoleCoversControllerWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestFencerRoleCreatesFenceRequestsWithoutClusterWrites(t *testing.T) {
+	data, err := os.ReadFile("fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants := map[string]map[string]bool{}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "Role" {
+			continue
+		}
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta["name"] != "rhiza-fencer" {
+			continue
+		}
+		for _, raw := range doc["rules"].([]any) {
+			rule, _ := raw.(map[string]any)
+			for _, resource := range rule["resources"].([]any) {
+				name, _ := resource.(string)
+				if grants[name] == nil {
+					grants[name] = map[string]bool{}
+				}
+				for _, verb := range rule["verbs"].([]any) {
+					grants[name][verb.(string)] = true
+				}
+			}
+		}
+	}
+	for _, verb := range []string{"get", "list", "create"} {
+		if !grants["rhizafences"][verb] {
+			t.Errorf("fencer Role must grant %q on rhizafences", verb)
+		}
+	}
+	for _, verb := range []string{"get", "list"} {
+		if !grants["rhizaclusters"][verb] {
+			t.Errorf("fencer Role must grant %q on rhizaclusters", verb)
+		}
+	}
+	for _, verb := range []string{"create", "update", "patch", "delete", "deletecollection"} {
+		if grants["rhizaclusters"][verb] {
+			t.Errorf("fencer Role must not grant %q on rhizaclusters", verb)
+		}
+	}
+}

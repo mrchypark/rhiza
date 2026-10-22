@@ -231,6 +231,12 @@ prevent recreation and quiesce storage before updating the fence status. The
 Operator service account cannot write that status. Missing executor or incomplete
 proof leaves recovery pending; a Pod DELETE response is insufficient.
 
+When the Operator uses the HTTPS fencer client, it posts the immutable request
+to `/v1/fences` on `rhiza-fencer`. The adapter authenticates the configured
+controller service account and creates or joins the same `RhizaFence` CRD record;
+HTTP 202 means the executor has not yet stored a validated proof. The CRD remains
+the only request journal.
+
 After proof, the Operator provisions and promotes a learner, fences and aborts a
 lost learner before retrying a fresh identity, or restores a new generation when
 quorum is lost. The StatefulSet remains the deployment basis. The kind executor
