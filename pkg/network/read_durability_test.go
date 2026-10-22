@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -149,6 +150,9 @@ func TestManagedReadBarrierCoversSQLKVAndGraphReadAPIs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := server.KVGet(context.Background(), KVGetRequest{Key: "missing", Consistency: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.material.ConfigureLocalGraphNodePropertyIndexes([]types.GraphNodePropertyIndex{{Label: "N", Property: "id"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := server.GraphQuery(context.Background(), GraphQueryRequest{Cypher: "MATCH (n) RETURN n", Consistency: "local"}); err != nil {

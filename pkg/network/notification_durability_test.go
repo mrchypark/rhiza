@@ -3,6 +3,8 @@ package network
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -253,7 +255,16 @@ func TestNotifySSEWaitsForAppliedSlotDurabilityAndPreservesPayload(t *testing.T)
 		t.Fatal("SSE event was not flushed after durability")
 	}
 	body := w.bodyString()
-	if !strings.Contains(body, `data: "trusted-payload"`) || strings.Contains(body, "applied_slot") {
+	var encodedPayload string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "data: ") {
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &encodedPayload); err != nil {
+				t.Fatalf("decode SSE JSON payload: %v", err)
+			}
+		}
+	}
+	decodedPayload, err := base64.StdEncoding.DecodeString(encodedPayload)
+	if err != nil || !bytes.Equal(decodedPayload, []byte("trusted-payload")) || strings.Contains(body, "applied_slot") {
 		t.Fatalf("SSE body=%q; want unchanged JSON payload without internal slot metadata", body)
 	}
 
