@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -24,6 +25,10 @@ func TestHTTPEmptyRecoveryRegistrationRequiresExactCanonicalResponse(t *testing.
 		PolicyDigest: hashJSON("persisted-spec"),
 	}
 	digest := hashJSON("source-proof")
+	emptyHead, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/archive-genesis/empty-recovery/register" || r.Method != http.MethodPost || r.Header.Get("Idempotency-Key") != request.OperationID || r.Header.Get("Authorization") != "Bearer controller-token" {
 			http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -40,8 +45,9 @@ func TestHTTPEmptyRecoveryRegistrationRequiresExactCanonicalResponse(t *testing.
 			SourceFenceOperationID: request.SourceFenceOperationID, ConfigID: 1,
 			SourceScopeHash: digest, TargetScopeHash: hashJSON("target-scope"),
 			SourceGenesisRefDigest: digest, SourceHeadDigest: digest,
-			SourceHeadVersion: objstore.ObjectVersion{Type: objstore.ETag, Value: "source-head"},
-			SourceRootDigest:  digest, SourceFenceDigest: digest, SourceMembershipHash: digest,
+			SourceHeadVersion:     objstore.ObjectVersion{Type: objstore.ETag, Value: "source-head"},
+			TargetEmptyHeadDigest: authorityStateDigest(emptyHead),
+			SourceRootDigest:      digest, SourceFenceDigest: digest, SourceMembershipHash: digest,
 			SourceDurability: "before-ack", TargetMembershipHash: request.TargetMembershipHash,
 			TargetDurability: request.TargetDurability,
 			PolicyDigest:     emptyRecoveryPolicyDigest(request.PolicyDigest, "before-ack", request.TargetDurability, request.AllowDataLoss),
