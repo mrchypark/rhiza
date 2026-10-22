@@ -12,6 +12,9 @@ func (e *FencingExecutor) bindSupervisorWAL(ctx context.Context, uid string, id 
 	if err != nil {
 		return fencing.BindReceipt{}, err
 	}
+	if err := e.validateMutationJournalProfile(state); err != nil {
+		return fencing.BindReceipt{}, err
+	}
 	scopeHash := ""
 	if state.Ledger.RequireMutationJournal {
 		var pod object
@@ -73,7 +76,17 @@ func (e *FencingExecutor) bindWALAtScope(ctx context.Context, uid string, id fen
 }
 
 func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid string, id fencing.Identity, scopeHash, stageIncarnation string) (fencing.BindReceipt, error) {
+	currentRoot, err := e.read(ctx, uid, id.SourceClusterID)
+	if err != nil {
+		return fencing.BindReceipt{}, err
+	}
+	if err := e.validateMutationJournalProfile(currentRoot); err != nil {
+		return fencing.BindReceipt{}, err
+	}
 	state, err := e.change(ctx, uid, id.SourceClusterID, func(l *fencing.Ledger) error {
+		if e.RequireMutationJournal && !l.RequireMutationJournal {
+			return fmt.Errorf("fencing: authority root does not require mutation journal")
+		}
 		if l.RequireMutationJournal {
 			if err := l.BindMutationScope(id, scopeHash, fencing.MutationExecutionProfile); err != nil {
 				return err
@@ -127,6 +140,9 @@ func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid strin
 			Runtime: *current.Runtime, ProducerUID: current.MutationProducerUID,
 			StoreScopeHash: current.MutationScopeHash, ExecutionProfile: current.MutationProfile,
 			StageIncarnation: current.MutationStageIncarnation}
+	}
+	if (e.RequireMutationJournal || confirmed.Ledger.RequireMutationJournal) && receipt.Producer == nil {
+		return fencing.BindReceipt{}, fmt.Errorf("fencing: required mutation-journal binding has no validated producer")
 	}
 	return receipt, receipt.Validate(id)
 }

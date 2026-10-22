@@ -142,10 +142,7 @@ func serve(ctx context.Context, args []string) error {
 			return fmt.Errorf("independent mutation profile requires canonical remote authority state")
 		}
 	}
-	executor := &operator.FencingExecutor{
-		Kube: kube, AuthorityState: authorityState,
-		LegacyCooperativeControlState: legacyCooperativeControlState(*independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC),
-	}
+	executor := newFencingExecutor(kube, authorityState, *independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC)
 	if *runtimeAgentCA != "" {
 		ca, err := os.ReadFile(*runtimeAgentCA)
 		if err != nil {
@@ -234,6 +231,14 @@ func hasRemoteCanonicalState(config objectstore.Config) bool {
 
 func legacyCooperativeControlState(independent bool, receiptDir, credentialsFile string, useADC bool) bool {
 	return !independent && receiptDir == "" && credentialsFile == "" && !useADC
+}
+
+func newFencingExecutor(kube *operator.Kubernetes, authorityState *operator.AuthorityStateStore, independent bool, receiptDir, credentialsFile string, useADC bool) *operator.FencingExecutor {
+	return &operator.FencingExecutor{
+		Kube: kube, AuthorityState: authorityState,
+		RequireMutationJournal:        independent,
+		LegacyCooperativeControlState: legacyCooperativeControlState(independent, receiptDir, credentialsFile, useADC),
+	}
 }
 
 // validateSourceWriterConfig checks the selected credential/profile mode

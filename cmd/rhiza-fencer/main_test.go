@@ -143,3 +143,14 @@ func TestLegacyCooperativeControlStateIsExplicitlyLimitedToCooperativeOnly(t *te
 		})
 	}
 }
+
+func TestExecutorMutationJournalRequirementFollowsExistingIndependentFlag(t *testing.T) {
+	independent := newFencingExecutor(nil, nil, true, "", "", false)
+	if !independent.RequireMutationJournal || independent.LegacyCooperativeControlState {
+		t.Fatalf("independent CLI profile not pinned into executor: %+v", independent)
+	}
+	cooperative := newFencingExecutor(nil, nil, false, "", "", false)
+	if cooperative.RequireMutationJournal || !cooperative.LegacyCooperativeControlState {
+		t.Fatalf("cooperative CLI profile unexpectedly requires mutation journal: %+v", cooperative)
+	}
+}

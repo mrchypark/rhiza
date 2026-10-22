@@ -49,6 +49,48 @@ func TestProducerBindingRecoversLostRootOrActivationResponse(t *testing.T) {
 	}
 }
 
+func TestMutationJournalBindingRejectsCooperativeRootAndPreservesCooperativeBinding(t *testing.T) {
+	t.Run("required executor rejects stale cooperative root without mutation", func(t *testing.T) {
+		store, _ := newAuthorityStateStoreForTest(t)
+		cooperative := &FencingExecutor{AuthorityState: store}
+		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run", WALIdentity: "wal"}
+		if err := cooperative.initializeRoot(t.Context(), "sts", "source"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cooperative.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { return l.Register(id) }); err != nil {
+			t.Fatal(err)
+		}
+		_, beforeVersion, err := store.ReadRoot(t.Context(), "sts", "source")
+		if err != nil {
+			t.Fatal(err)
+		}
+		required := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true}
+		if receipt, err := required.bindWALAtScope(t.Context(), "sts", id, strings.Repeat("a", 64)); err == nil || receipt.Producer != nil {
+			t.Fatalf("stale cooperative root returned required binding: %+v %v", receipt, err)
+		}
+		_, afterVersion, err := store.ReadRoot(t.Context(), "sts", "source")
+		if err != nil || beforeVersion != afterVersion {
+			t.Fatalf("profile mismatch mutated root version: %v", err)
+		}
+	})
+
+	t.Run("explicit cooperative root may bind without producer", func(t *testing.T) {
+		store, _ := newAuthorityStateStoreForTest(t)
+		executor := &FencingExecutor{AuthorityState: store}
+		id := fencing.Identity{SourceClusterID: "source", NodeID: "node", PodUID: "pod", RunID: "run", WALIdentity: "wal"}
+		if err := executor.initializeRoot(t.Context(), "sts", "source"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := executor.change(t.Context(), "sts", "source", func(l *fencing.Ledger) error { return l.Register(id) }); err != nil {
+			t.Fatal(err)
+		}
+		receipt, err := executor.bindWALAtScope(t.Context(), "sts", id, "")
+		if err != nil || receipt.Producer != nil || receipt.Validate(id) != nil {
+			t.Fatalf("cooperative bind did not retain nil-producer contract: %+v %v", receipt, err)
+		}
+	})
+}
+
 func TestProducerBindingPinsImmutableSourceStageIncarnation(t *testing.T) {
 	e, _, id, runtime := newMutationStoreFixture(t)
 	if _, err := e.reserveMutationProducer(t.Context(), runtime); err != nil {
