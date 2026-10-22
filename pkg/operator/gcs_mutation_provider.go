@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 
@@ -21,6 +22,9 @@ type gcsMutationProvider struct {
 }
 
 func newGCSMutationProvider(client *storage.Client, scope AttestationStoreScope) (*gcsMutationProvider, error) {
+	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+		return nil, fmt.Errorf("fencing: independent GCS mutation profile rejects STORAGE_EMULATOR_HOST")
+	}
 	if client == nil || scope.Provider != "gcs" || scope.Bucket == "" || scope.Prefix == "" || path.Clean(scope.Prefix) != scope.Prefix || scope.Prefix == "." || strings.HasPrefix(scope.Prefix, "/") || scope.Endpoint != "" || scope.Account != "" || scope.ConnectionStringDigest != "" {
 		return nil, fmt.Errorf("fencing: GCS mutation provider requires an exact bucket scope")
 	}
@@ -89,7 +93,11 @@ func (p *gcsMutationProvider) upload(ctx context.Context, key string, generation
 	if attrs == nil || attrs.Generation <= 0 || attrs.Size != intent.PayloadSize || attrs.Metadata["rhiza-operation-id"] != intent.OperationID || attrs.Metadata["rhiza-payload-sha256"] != intent.PayloadDigest {
 		return mutationProviderResult{}, fmt.Errorf("fencing: GCS committed object metadata differs from original mutation")
 	}
-	return mutationProviderResult{Outcome: fencing.MutationCommitted, Generation: attrs.Generation, Metageneration: attrs.Metageneration, PayloadDigest: intent.PayloadDigest}, nil
+	// This profile uses one non-resumable JSON API request with RetryNever. The
+	// successful response and exact returned generation/metadata therefore close
+	// its only physical permission; a stale replay is also blocked by the same
+	// generation precondition.
+	return mutationProviderResult{Outcome: fencing.MutationCommitted, Generation: attrs.Generation, Metageneration: attrs.Metageneration, PayloadDigest: intent.PayloadDigest, AllCopiesTerminal: true}, nil
 }
 
 func gcsConditionFailed(err error) bool {

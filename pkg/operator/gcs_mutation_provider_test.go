@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -63,8 +66,333 @@ func TestGCSMutationProviderUsesOneConditionalWireRequestAndExactMetadata(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests.Load() != 1 || result.Outcome != fencing.MutationCommitted || result.Generation != 21 || result.Metageneration != 3 || result.PayloadDigest != intent.PayloadDigest {
+	if requests.Load() != 1 || result.Outcome != fencing.MutationCommitted || result.Generation != 21 || result.Metageneration != 3 || result.PayloadDigest != intent.PayloadDigest || !result.AllCopiesTerminal {
 		t.Fatalf("GCS result did not bind the one wire commit: requests=%d result=%+v", requests.Load(), result)
+	}
+}
+
+func TestGCSMutationProviderRejectsEmulatorEndpoint(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "http://127.0.0.1:9999")
+	client, err := storage.NewClient(context.Background(), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}); err == nil || !strings.Contains(err.Error(), "rejects STORAGE_EMULATOR_HOST") {
+		t.Fatalf("emulator endpoint accepted for independent mutations: %v", err)
+	}
+}
+
+func TestGCSMutationProviderRecoveryRequiresExactCommittedMetadata(t *testing.T) {
+	payload := []byte("sealed recovery payload")
+	intent := fencing.MutationIntent{Kind: "upload", OperationID: "producer-sequence", PayloadDigest: hashBytes(payload), PayloadSize: int64(len(payload))}
+	for _, tc := range []struct {
+		name    string
+		attrs   map[string]any
+		missing bool
+	}{
+		{name: "wrong operation", attrs: map[string]any{"generation": "21", "size": strconv.Itoa(len(payload)), "metadata": map[string]string{"rhiza-operation-id": "other", "rhiza-payload-sha256": intent.PayloadDigest}}},
+		{name: "wrong digest", attrs: map[string]any{"generation": "21", "size": strconv.Itoa(len(payload)), "metadata": map[string]string{"rhiza-operation-id": intent.OperationID, "rhiza-payload-sha256": "different"}}},
+		{name: "not newer than preparation", attrs: map[string]any{"generation": "21", "size": strconv.Itoa(len(payload)), "metadata": map[string]string{"rhiza-operation-id": intent.OperationID, "rhiza-payload-sha256": intent.PayloadDigest}}},
+		{name: "absent object", missing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("unexpected request %s", r.Method)
+					http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+					return
+				}
+				if tc.missing {
+					http.Error(w, "missing", http.StatusNotFound)
+					return
+				}
+				attrs := map[string]any{"kind": "storage#object", "bucket": "archive", "name": "root/source/key"}
+				for key, value := range tc.attrs {
+					attrs[key] = value
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(attrs)
+			}))
+			defer server.Close()
+			client, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL+"/storage/v1/"), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			provider, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			preparation := fencing.MutationPreparation{Generation: 20}
+			if tc.name == "not newer than preparation" {
+				preparation.Generation = 21
+			}
+			result, found, err := provider.committed(t.Context(), "key", intent, preparation)
+			if err != nil || found || result.AllCopiesTerminal {
+				t.Fatalf("nonmatching object was treated as a terminal commit: result=%+v found=%t err=%v", result, found, err)
+			}
+		})
+	}
+}
+
+func TestGCSMutationTerminalUploadsCompactNormalAndRecoveredCommits(t *testing.T) {
+	const recoveredSequence = uint64(70)
+	objects := make(map[string]map[string]any)
+	intents := make(map[string]fencing.MutationIntent)
+	payloads := make(map[string][]byte)
+	var mu sync.Mutex
+	var uploads atomic.Int32
+	var lostReply atomic.Bool
+	var recoveredOperation string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const getPrefix = "/storage/v1/b/archive/o/"
+		if r.Method == http.MethodGet {
+			name := strings.TrimPrefix(r.URL.Path, getPrefix)
+			if name == r.URL.Path {
+				name = strings.TrimPrefix(r.URL.EscapedPath(), getPrefix)
+			}
+			mu.Lock()
+			attrs, ok := objects[name]
+			mu.Unlock()
+			if !ok {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(attrs)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected GCS method %s", r.Method)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		name := r.URL.Query().Get("name")
+		mu.Lock()
+		intent, ok := intents[name]
+		payload, payloadOK := payloads[name]
+		recoverOperation := recoveredOperation
+		mu.Unlock()
+		if !ok || !payloadOK || r.URL.Query().Get("ifGenerationMatch") != "0" {
+			t.Errorf("GCS upload did not match staged create-only object %q", name)
+			http.Error(w, "unexpected object", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Contains(body, payload) || !bytes.Contains(body, []byte(intent.OperationID)) || !bytes.Contains(body, []byte(intent.PayloadDigest)) {
+			t.Errorf("GCS upload differs from exact staged tuple for %q: %v", name, err)
+			http.Error(w, "tuple mismatch", http.StatusBadRequest)
+			return
+		}
+		generation := strconv.FormatInt(1000+int64(uploads.Load()+1), 10)
+		attrs := map[string]any{
+			"kind": "storage#object", "bucket": "archive", "name": name,
+			"generation": generation, "metageneration": "1", "size": strconv.Itoa(len(payload)),
+			"metadata": map[string]string{"rhiza-operation-id": intent.OperationID, "rhiza-payload-sha256": intent.PayloadDigest},
+		}
+		mu.Lock()
+		objects[name] = attrs
+		mu.Unlock()
+		uploads.Add(1)
+		if intent.OperationID == recoverOperation && lostReply.CompareAndSwap(false, true) {
+			http.Error(w, "committed response lost", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(attrs)
+	}))
+	defer server.Close()
+	client, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL+"/storage/v1/"), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	provider, err := newGCSMutationProvider(client, AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, runtime, firstIntent, firstPayload, scope, receipts := mutationExecutionFixture(t)
+	state, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producerUID := state.Ledger.Runs[runtime.RunID].MutationProducerUID
+	mu.Lock()
+	recoveredOperation = fencing.MutationRequestID(producerUID, recoveredSequence)
+	mu.Unlock()
+
+	for sequence := uint64(1); sequence <= 130; sequence++ {
+		if sequence > 1 {
+			if err := e.compactSourceMutationJournal(t.Context(), runtime, sequence); err != nil {
+				t.Fatalf("pre-admission compaction at %d: %v", sequence, err)
+			}
+			draft := firstIntent
+			draft.OperationID = ""
+			draft.Key = fmt.Sprintf("bulk/%03d.json", sequence)
+			draft.OwnerStep.Step = fmt.Sprintf("bulk-%03d", sequence)
+			draft.PayloadRef, draft.PayloadDigest, draft.PayloadSize = "", "", 0
+			payload := []byte(fmt.Sprintf("payload-%03d", sequence))
+			ticket := fmt.Sprintf("%064x", sequence)
+			if err := e.SourceStages.Reserve(producerUID, ticket, draft); err != nil {
+				t.Fatalf("reserve sequence %d: %v", sequence, err)
+			}
+			sealed, err := e.SourceStages.Seal(producerUID, ticket, hashBytes(payload), int64(len(payload)), bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("seal sequence %d: %v", sequence, err)
+			}
+			intent := draft
+			intent.OperationID = fencing.MutationRequestID(producerUID, sequence)
+			intent.PayloadRef, intent.PayloadDigest, intent.PayloadSize = sealed.Ref, sealed.Digest, sealed.Size
+			if _, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.Admit(sequence, intent) }); err != nil {
+				t.Fatalf("admit sequence %d: %v", sequence, err)
+			}
+			name := "root/source/" + intent.Key
+			mu.Lock()
+			intents[name], payloads[name] = intent, payload
+			mu.Unlock()
+		} else {
+			name := "root/source/" + firstIntent.Key
+			mu.Lock()
+			intents[name], payloads[name] = firstIntent, firstPayload
+			mu.Unlock()
+		}
+
+		intent := firstIntent
+		if sequence > 1 {
+			mu.Lock()
+			intent = intents["root/source/"+fmt.Sprintf("bulk/%03d.json", sequence)]
+			mu.Unlock()
+		}
+		err := e.ExecuteSourceMutation(t.Context(), runtime, producerUID, sequence, intent, scope, provider, receipts)
+		if sequence == recoveredSequence {
+			if !errors.Is(err, ErrFencePending) {
+				t.Fatalf("lost response at sequence %d was not kept pending: %v", sequence, err)
+			}
+			err = e.ExecuteSourceMutation(t.Context(), runtime, producerUID, sequence, intent, scope, provider, receipts)
+		}
+		if err != nil {
+			t.Fatalf("execute sequence %d: %v", sequence, err)
+		}
+	}
+	if uploads.Load() != 130 {
+		t.Fatalf("recovered request was physically redispatched: uploads=%d", uploads.Load())
+	}
+	producer, _, _, err := e.AuthorityState.ReadProducer(t.Context(), runtime)
+	if err != nil || producer.LastAdmitted != 130 || producer.CompactedThrough < 64 || len(producer.Entries) > fencing.MaxMutationJournalEntries || producer.ArchiveHead == nil {
+		t.Fatalf("terminal GCS receipts did not compact the over-bound journal: admitted=%d compacted=%d entries=%d archive=%v err=%v", producer.LastAdmitted, producer.CompactedThrough, len(producer.Entries), producer.ArchiveHead, err)
+	}
+	terminalArchived := map[uint64]bool{1: false, recoveredSequence: false}
+	run, err := e.enrolledMutationRun(t.Context(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for reference := producer.ArchiveHead; reference != nil; {
+		plan, err := e.readMutationArchive(t.Context(), *reference, runtime, producerUID, run.Identity.WALIdentity)
+		if err != nil {
+			t.Fatalf("read compacted GCS mutation archive: %v", err)
+		}
+		for sequence := range terminalArchived {
+			if entry, ok := plan.Entries[sequence]; ok {
+				if entry.Resolution == nil || !entry.Resolution.AllCopiesTerminal {
+					t.Fatalf("archived sequence %d lacks terminal-copy proof: %+v", sequence, entry)
+				}
+				terminalArchived[sequence] = true
+			}
+		}
+		reference = plan.Previous
+	}
+	for sequence, found := range terminalArchived {
+		if !found {
+			t.Fatalf("sequence %d was not retained in verified compacted history", sequence)
+		}
+	}
+	entry := producer.Entries[130]
+	if entry.Resolution == nil || !entry.Resolution.AllCopiesTerminal {
+		t.Fatalf("sequence 130 lacks durable terminal-copy evidence: %+v", entry)
+	}
+}
+
+func TestGCSUnknownUploadReadbackCannotAcknowledgeOrReleaseGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		missing bool
+	}{
+		{name: "object missing", missing: true},
+		{name: "object metadata differs"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, runtime, intent, _, scope, receipts := mutationExecutionFixture(t)
+			state, err := e.read(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			producerUID := state.Ledger.Runs[runtime.RunID].MutationProducerUID
+			var uploads, readbacks atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					uploads.Add(1)
+					http.Error(w, "response lost after uncertain dispatch", http.StatusServiceUnavailable)
+				case http.MethodGet:
+					readbacks.Add(1)
+					if tc.missing {
+						http.Error(w, "object not found", http.StatusNotFound)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"kind": "storage#object", "bucket": "archive", "name": "root/source/" + intent.Key,
+						"generation": "2000", "metageneration": "1", "size": strconv.FormatInt(intent.PayloadSize, 10),
+						"metadata": map[string]string{"rhiza-operation-id": "different-operation", "rhiza-payload-sha256": intent.PayloadDigest},
+					})
+				default:
+					t.Errorf("unexpected GCS method %s", r.Method)
+					http.Error(w, "unexpected request", http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+			client, err := storage.NewClient(t.Context(), option.WithEndpoint(server.URL+"/storage/v1/"), option.WithHTTPClient(server.Client()), option.WithoutAuthentication())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			provider, err := newGCSMutationProvider(client, scope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := e.ExecuteSourceMutation(t.Context(), runtime, producerUID, 1, intent, scope, provider, receipts); !errors.Is(err, ErrFencePending) {
+				t.Fatalf("uncertain upload was not kept pending: %v", err)
+			}
+			if err := e.ExecuteSourceMutation(t.Context(), runtime, producerUID, 1, intent, scope, provider, receipts); !errors.Is(err, ErrFencePending) {
+				t.Fatalf("nonmatching readback was acknowledged: %v", err)
+			}
+			if uploads.Load() != 1 || readbacks.Load() != 1 {
+				t.Fatalf("unknown dispatch was resent or readback skipped: uploads=%d readbacks=%d", uploads.Load(), readbacks.Load())
+			}
+			lookup, err := e.lookupMutation(t.Context(), runtime.StatefulSetUID, fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: runtime.PodUID, RunID: runtime.RunID, WALIdentity: "wal"}, fencing.MutationLookupRequest{ProducerUID: producerUID, Sequence: 1, Intent: intent})
+			dispatchesUnresolved := lookup.Entry != nil && len(lookup.Entry.Dispatches) == 1
+			if lookup.Entry != nil {
+				for _, dispatch := range lookup.Entry.Dispatches {
+					dispatchesUnresolved = dispatchesUnresolved && dispatch.ReceiptDigest == ""
+				}
+			}
+			if err != nil || lookup.Entry == nil || lookup.Entry.Resolution != nil || !dispatchesUnresolved {
+				t.Fatalf("unknown dispatch gained a resolution/receipt: %+v err=%v", lookup, err)
+			}
+			owner := hashJSON([]any{runtime, "wal", producerUID, uint64(1), intent.OperationID})
+			lock, err := readMutationKeyForTest(t.Context(), e, intent.StoreScopeHash, intent.Key)
+			if err != nil || lock.Owner != owner {
+				t.Fatalf("unknown outcome released its canonical key guard: %+v err=%v", lock, err)
+			}
+			if _, err := receipts.get("receipt-" + owner); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("unknown outcome unexpectedly persisted an execution receipt: err=%v", err)
+			}
+			closed, err := e.changeMutationProducer(t.Context(), runtime, func(p *fencing.MutationProducer) error { return p.Close("close", hashBytes([]byte("close"))) })
+			if err != nil || closed.BarrierComplete() {
+				t.Fatalf("unresolved dispatch passed the close barrier: complete=%t err=%v", closed.BarrierComplete(), err)
+			}
+		})
 	}
 }
 

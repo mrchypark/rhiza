@@ -44,7 +44,7 @@ func (f *fakeAnchorClient) Verify(ctx context.Context, req recoveryanchor.Reques
 func setAnchorEnv(r *Resource, api *operatorAPI) {
 	ctr, _ := container(api.sts, "rhiza")
 	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_RECOVERY_ANCHOR_ID", "value": r.Spec.AnchorID})
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 }
 
 func TestAnchorBlockedWhenBackendNil(t *testing.T) {

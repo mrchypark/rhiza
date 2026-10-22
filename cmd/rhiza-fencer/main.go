@@ -118,6 +118,7 @@ func serve(ctx context.Context, args []string) error {
 		Independent: *independentMutation, HasCanonicalState: hasRemoteCanonicalState(stateConfig), SourceProvider: stateConfig.Provider,
 		RuntimeAgentCA: *runtimeAgentCA, StageDir: *stageDir, StageIncarnation: *stageIncarnation,
 		ReceiptDir: *sourceReceiptDir, CredentialsFile: *sourceWriterCredentials, UseADC: *sourceWriterUseADC,
+		StorageEmulatorHost: os.Getenv("STORAGE_EMULATOR_HOST"),
 	}); err != nil {
 		return err
 	}
@@ -224,15 +225,16 @@ func serve(ctx context.Context, args []string) error {
 }
 
 type sourceWriterConfig struct {
-	Independent       bool
-	HasCanonicalState bool
-	SourceProvider    objectstore.Provider
-	RuntimeAgentCA    string
-	StageDir          string
-	StageIncarnation  string
-	ReceiptDir        string
-	CredentialsFile   string
-	UseADC            bool
+	Independent         bool
+	HasCanonicalState   bool
+	SourceProvider      objectstore.Provider
+	RuntimeAgentCA      string
+	StageDir            string
+	StageIncarnation    string
+	ReceiptDir          string
+	CredentialsFile     string
+	UseADC              bool
+	StorageEmulatorHost string
 }
 
 func hasRemoteCanonicalState(config objectstore.Config) bool {
@@ -266,6 +268,9 @@ func validateSourceWriterConfig(c sourceWriterConfig) error {
 		return fmt.Errorf("source writer Application Default Credentials require the independent mutation profile")
 	}
 	if c.Independent {
+		if c.StorageEmulatorHost != "" {
+			return fmt.Errorf("independent mutation profile rejects STORAGE_EMULATOR_HOST")
+		}
 		if !c.HasCanonicalState {
 			return fmt.Errorf("independent mutation profile requires a configured remote canonical authority store; cooperative-only mode may use legacy control state but is not NoPVC-qualified")
 		}

@@ -25,6 +25,8 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
+const controllerFixtureAdminToken = "controller-fixture-admin"
+
 func TestControllerObservationAndFenceDoNotMutateStatefulSet(t *testing.T) {
 	ctx, bucket, r, api, c := controllerFixture(t, "before-ack", "before-ack")
 	if err := c.reconcileAll(ctx); err != nil {
@@ -65,7 +67,7 @@ func TestControllerReconfigurationForkPersistsAnchoredGenerationAcrossRestarts(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 
 	restart := func() {
 		c = &Controller{Kube: c.Kube, Bucket: bucket, Prefix: c.Prefix, StoreIdentity: c.StoreIdentity, Fencer: c.Fencer}
@@ -159,7 +161,7 @@ func TestControllerRegistersCanonicalForkBeforeAdvancing(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 			registrar := &archiveForkRegistrarFixture{}
 			if failRegistration {
 				registrar.err = fmt.Errorf("canonical registration unavailable")
@@ -212,7 +214,7 @@ func TestControllerDoesNotTreatMissingRegistrarAsCooperativeProfile(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+			ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 			c.Fencer = tc.fencer
 			for range 3 {
 				if err := c.reconcileAll(ctx); err != nil {
@@ -238,7 +240,7 @@ func TestControllerRejectsInvalidReconfigurationFlag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "sometimes"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "sometimes"})
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +509,7 @@ func membershipFixture(t *testing.T) (context.Context, *Resource, *operatorAPI, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ADMIN_TOKEN", "value": "admin"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ADMIN_TOKEN", object{"value": controllerFixtureAdminToken})
 	_, port, err := net.SplitHostPort(api.learner.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -783,7 +785,7 @@ func TestControllerRejectsSubsetTargetCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctr["env"] = append(list(ctr["env"]), object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"})
+	ctr["env"] = replaceEnv(list(ctr["env"]), "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
 	subset := []quepaxa.Member{voterMember("source", "n1", "new1"), voterMember("source", "n2", "new2"), voterMember("source", "n3", "new3")}
 	tokens := map[string]string{}
 	for _, member := range subset {
@@ -840,6 +842,14 @@ func controllerFixtureVoters(t *testing.T, sourceMode, targetMode string, voters
 	seedArchive(t, ctx, bucket, "root/source", voters, sourceMode)
 	r := &Resource{Metadata: map[string]any{"name": "recover", "uid": "resource-uid", "generation": float64(1), "resourceVersion": "1"}, Spec: Spec{StatefulSet: "rhiza", SourceClusterID: "source", Durability: targetMode}}
 	api := newOperatorAPIVoters(t, r, sourceMode, voters)
+	ctr, err := container(api.sts, "rhiza")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := list(ctr["env"])
+	env = replaceEnv(env, "RHIZA_ENABLE_RECONFIGURATION", object{"value": "true"})
+	env = replaceEnv(env, "RHIZA_ADMIN_TOKEN", object{"value": controllerFixtureAdminToken})
+	ctr["env"] = env
 	t.Cleanup(api.Close)
 	return ctx, bucket, r, api, &Controller{Kube: api.kube(t), Bucket: bucket, Prefix: "root", StoreIdentity: storeIdentity(), Fencer: &archiveForkRegistrarFixture{}}
 }
@@ -873,6 +883,16 @@ func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepa
 		a.peers = append(a.peers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
 			a.mu.Lock()
 			defer a.mu.Unlock()
+			if q.URL.Path == "/recovery/archive" && q.Method == http.MethodPost {
+				if q.Header.Get("Authorization") != "Bearer "+controllerFixtureAdminToken {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				// seedArchive already materializes the current-policy certified
+				// source history; this endpoint models its authenticated capture ack.
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			if q.URL.Path == "/membership/status" {
 				status, ok := a.membership[string(member.ID)]
 				if !ok {
@@ -1122,7 +1142,7 @@ func seedArchive(t *testing.T, ctx context.Context, bucket objstore.Bucket, pref
 		t.Fatal(err)
 	}
 	defer wal.Close()
-	core, err := quepaxa.New(quepaxa.Config{NodeID: ms[0].ID, Cluster: quepaxa.Cluster{ConfigID: 1, Members: ms}, WAL: wal, Transport: testTransport{}})
+	core, err := quepaxa.New(quepaxa.Config{NodeID: ms[0].ID, Cluster: quepaxa.Cluster{ConfigID: recovery.ArchiveConfigID, Members: ms}, WAL: wal, Transport: testTransport{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1130,10 +1150,13 @@ func seedArchive(t *testing.T, ctx context.Context, bucket objstore.Bucket, pref
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := types.ValidateExecutionPolicy(value); err != nil {
+		t.Fatalf("seed archive must use the current SQL execution policy: %v", err)
+	}
 	if _, _, err = core.Propose(ctx, value); err != nil {
 		t.Fatal(err)
 	}
-	archive := recovery.NewManager(bucket, prefix, 1)
+	archive := recovery.NewManager(bucket, prefix, recovery.ArchiveConfigID)
 	defer archive.Close()
 	if err = archive.SyncThrough(ctx, core, core.Tip()); err != nil {
 		t.Fatal(err)
