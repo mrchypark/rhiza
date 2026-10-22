@@ -72,7 +72,7 @@ func terminalObjectVersionID(version *objstore.ObjectVersion) (string, error) {
 	if !validAuthorityObjectVersion(version) {
 		return "", fmt.Errorf("fencing: terminal evidence object version is unavailable")
 	}
-	return hashJSON([]string{"rhiza-terminal-object-version-v1", string(version.Type), version.Value}), nil
+	return hashJSON([]any{"rhiza-terminal-object-version-v1", version.Type, version.Value}), nil
 }
 
 func decodeTerminalEvidence(data []byte, ref fencing.TerminalReference, version *objstore.ObjectVersion) (terminalEvidence, error) {

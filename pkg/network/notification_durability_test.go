@@ -55,7 +55,7 @@ func notificationTestServer(t *testing.T) *Server {
 	}
 	t.Cleanup(func() { _ = material.Close() })
 	server := NewServer(core, material, "cluster", true, nil)
-	t.Cleanup(func() { _ = server.Close() })
+	t.Cleanup(func() { server.Close() })
 	return server
 }
 
