@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -191,6 +192,65 @@ func TestAuthorityRootCannotReinitializeAfterRegisteredRootLoss(t *testing.T) {
 	if err := executor.initializeRoot(ctx, uid, source); !errors.Is(err, errAuthorityRootLost) {
 		t.Fatalf("missing registered root was treated as a new authority: %v", err)
 	}
+}
+
+func TestMutationJournalProfileIsPinnedBeforeRootRegistration(t *testing.T) {
+	ctx := context.Background()
+	const uid, source = "statefulset-uid", "source-id"
+
+	t.Run("new required root persists both requirements", func(t *testing.T) {
+		store, _ := newAuthorityStateStoreForTest(t)
+		executor := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true}
+		if err := executor.initializeRoot(ctx, uid, source); err != nil {
+			t.Fatal(err)
+		}
+		state, _, err := store.ReadRoot(ctx, uid, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.Ledger.RequireMutationJournal || !state.Ledger.RequireRuntimeBinding {
+			t.Fatalf("required profile was not persisted before registration: %+v", state.Ledger)
+		}
+	})
+
+	t.Run("cooperative root cannot be upgraded in place", func(t *testing.T) {
+		store, _ := newAuthorityStateStoreForTest(t)
+		cooperative := &FencingExecutor{AuthorityState: store}
+		if err := cooperative.initializeRoot(ctx, uid, source); err != nil {
+			t.Fatal(err)
+		}
+		before, version, err := store.ReadRoot(ctx, uid, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		required := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true}
+		if err := required.initializeRoot(ctx, uid, source); err == nil {
+			t.Fatal("required profile upgraded an existing cooperative root")
+		}
+		after, afterVersion, err := store.ReadRoot(ctx, uid, source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(version, afterVersion) || hashJSON(before) != hashJSON(after) || after.Ledger.RequireMutationJournal {
+			t.Fatalf("profile mismatch mutated the canonical root: before=%+v after=%+v", before.Ledger, after.Ledger)
+		}
+	})
+
+	t.Run("nonrequired executor cannot downgrade required root", func(t *testing.T) {
+		store, _ := newAuthorityStateStoreForTest(t)
+		required := &FencingExecutor{AuthorityState: store, RequireMutationJournal: true}
+		if err := required.initializeRoot(ctx, uid, source); err != nil {
+			t.Fatal(err)
+		}
+		cooperative := &FencingExecutor{AuthorityState: store}
+		if err := cooperative.initializeRoot(ctx, uid, source); err != nil {
+			t.Fatal(err)
+		}
+		state, _, err := store.ReadRoot(ctx, uid, source)
+		if err != nil || !state.Ledger.RequireMutationJournal || !state.Ledger.RequireRuntimeBinding {
+			t.Fatalf("required root was downgraded: %+v %v", state.Ledger, err)
+		}
+	})
 }
 
 func TestAuthorityProducerIdentityIsStableAcrossStoreReopenAndNotServerUID(t *testing.T) {

@@ -41,7 +41,11 @@ type FencingExecutor struct {
 	// configured canonical store and source-mutation APIs still require
 	// AuthorityState.
 	LegacyCooperativeControlState bool
-	Attestor                      FenceAttestor
+	// RequireMutationJournal pins this executor to the independently configured
+	// source-mutation profile. The persisted root claim is immutable: this option
+	// may create a required root, but never upgrades an existing cooperative root.
+	RequireMutationJournal bool
+	Attestor               FenceAttestor
 	// SourceStages is an optional local fallback for isolated tests or development.
 	// Production selects root-bound ObjectStorage staging through sourceStagesFor.
 	SourceStages *SourceStageStore
@@ -78,6 +82,9 @@ func (e *FencingExecutor) ledgerPath(uid, source string) string {
 // pure and must tolerate a response lost after the conditional write commits.
 func (e *FencingExecutor) change(ctx context.Context, uid, source string, transition func(*fencing.Ledger) error) (fenceLedger, error) {
 	if e.AuthorityState == nil {
+		if e != nil && e.RequireMutationJournal {
+			return fenceLedger{}, fmt.Errorf("fencing: required mutation journal needs canonical ObjectStorage authority state")
+		}
 		if e != nil && e.LegacyCooperativeControlState {
 			return e.changeLegacyCooperative(ctx, uid, source, transition)
 		}
@@ -111,6 +118,9 @@ func (e *FencingExecutor) change(ctx context.Context, uid, source string, transi
 // initializeRoot is called only for authenticated source registration. Other
 // transitions never interpret a missing canonical root as permission to open it.
 func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string) error {
+	if e != nil && e.RequireMutationJournal && e.AuthorityState == nil {
+		return fmt.Errorf("fencing: required mutation journal needs canonical ObjectStorage authority state")
+	}
 	if e.AuthorityState == nil {
 		if e != nil && e.LegacyCooperativeControlState {
 			_, err := e.readLegacyCooperative(ctx, uid, source)
@@ -121,32 +131,57 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 		}
 		return fmt.Errorf("fencing: canonical ObjectStorage authority state is not configured")
 	}
-	if _, _, err := e.AuthorityState.ReadRoot(ctx, uid, source); err == nil {
+	if existing, _, err := e.AuthorityState.ReadRoot(ctx, uid, source); err == nil {
+		if err := e.validateMutationJournalProfile(existing); err != nil {
+			return err
+		}
 		_, identity, _ := e.AuthorityState.rootKey(uid, source)
 		return e.AuthorityState.ensureRootGenesis(ctx, identity)
 	} else if !errors.Is(err, errAuthorityStateNotFound) {
 		return err
 	}
-	initial := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{SourceClusterID: source}}
+	initial := fenceLedger{StatefulSetUID: uid, Ledger: fencing.Ledger{
+		SourceClusterID: source, RequireRuntimeBinding: e != nil && e.RequireMutationJournal,
+		RequireMutationJournal: e != nil && e.RequireMutationJournal,
+	}}
 	err := e.AuthorityState.WriteRoot(ctx, uid, source, initial, nil)
 	if err != nil && !errors.Is(err, errAuthorityStateConflict) {
-		_, _, readErr := e.AuthorityState.ReadRoot(ctx, uid, source)
+		created, _, readErr := e.AuthorityState.ReadRoot(ctx, uid, source)
 		if readErr == nil {
+			if profileErr := e.validateMutationJournalProfile(created); profileErr != nil {
+				return profileErr
+			}
 			_, identity, _ := e.AuthorityState.rootKey(uid, source)
 			return e.AuthorityState.ensureRootGenesis(ctx, identity)
 		}
 		return errors.Join(err, readErr)
 	}
-	_, _, err = e.AuthorityState.ReadRoot(ctx, uid, source)
+	created, _, err := e.AuthorityState.ReadRoot(ctx, uid, source)
 	if err != nil {
+		return err
+	}
+	if err := e.validateMutationJournalProfile(created); err != nil {
 		return err
 	}
 	_, identity, _ := e.AuthorityState.rootKey(uid, source)
 	return e.AuthorityState.ensureRootGenesis(ctx, identity)
 }
 
+func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) error {
+	if e != nil && e.RequireMutationJournal && !state.Ledger.RequireMutationJournal {
+		return fmt.Errorf("fencing: existing authority root is cooperative-only; refusing mutation-journal profile upgrade")
+	}
+	if state.Ledger.RequireMutationJournal && !state.Ledger.RequireRuntimeBinding {
+		return fmt.Errorf("fencing: authority root requires mutation journal without runtime binding")
+	}
+	return nil
+}
+
 func (e *FencingExecutor) read(ctx context.Context, uid, source string) (fenceLedger, error) {
 	if e.AuthorityState == nil {
+		if e != nil && e.RequireMutationJournal {
+			return fenceLedger{}, fmt.Errorf("fencing: required mutation journal needs canonical ObjectStorage authority state")
+		}
 		if e != nil && e.LegacyCooperativeControlState {
 			return e.readLegacyCooperative(ctx, uid, source)
 		}
@@ -271,8 +306,13 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "supervisor identity rejected", http.StatusForbidden)
 		return
 	}
+	if message.Action == "register" {
+		// Persist the immutable profile claim before enrollment or any admission
+		// side effect. A failed enrollment leaves a required, retryable root.
+		err = e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID)
+	}
 	var enrolled *fencing.RuntimeBinding
-	if message.Action == "register" && e.RuntimeAgent != nil {
+	if err == nil && message.Action == "register" && e.RuntimeAgent != nil {
 		if message.Drain != nil || message.Request != nil || message.MutationLookup != nil {
 			http.Error(w, "malformed runtime registration", http.StatusBadRequest)
 			return
@@ -318,13 +358,21 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if message.Action == "register" {
-			err = e.initializeRoot(r.Context(), uid, message.Identity.SourceClusterID)
-		}
 		if err == nil {
 			_, err = e.change(r.Context(), uid, message.Identity.SourceClusterID, func(l *fencing.Ledger) error {
 				switch message.Action {
 				case "register":
+					if e.RequireMutationJournal && !l.RequireMutationJournal {
+						return fmt.Errorf("fencing: authority root does not require mutation journal")
+					}
+					if l.RequireMutationJournal {
+						if !l.RequireRuntimeBinding {
+							return fmt.Errorf("fencing: authority root requires mutation journal without runtime binding")
+						}
+						if enrolled == nil {
+							return fmt.Errorf("fencing: runtime agent is required for mutation-journal registration")
+						}
+					}
 					if enrolled != nil {
 						l.RequireRuntimeBinding = true
 						return l.RegisterEnrolled(message.Identity, *enrolled)
