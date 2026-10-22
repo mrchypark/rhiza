@@ -126,6 +126,7 @@ type Server struct {
 	compactedHandler     func()
 	readAdmissionMu      sync.RWMutex
 	readAdmission        *readAdmission
+	statusLookupHook     func()
 }
 
 // ReadAdmissionLimits bounds concurrent read work in one Server. Long-poll
@@ -1701,7 +1702,6 @@ func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (R
 	if !ok {
 		return RequestStatusResponse{}, ErrInvalidRequest
 	}
-	tip := s.material.Tip()
 	var receipt types.MutationReceipt
 	var found bool
 	var err error
@@ -1713,8 +1713,28 @@ func (s *Server) RequestStatus(ctx context.Context, req RequestStatusRequest) (R
 	if err != nil {
 		return RequestStatusResponse{}, err
 	}
+	if s.statusLookupHook != nil {
+		s.statusLookupHook()
+	}
+	tip := s.material.Tip()
 	if !found {
+		if s.readDurability != nil {
+			err = s.waitReadDurable(ctx, tip)
+		} else {
+			err = s.waitDurable(ctx, quepaxa.Slot(tip))
+		}
+		if err != nil {
+			return RequestStatusResponse{}, err
+		}
 		return RequestStatusResponse{State: "unknown_or_expired", Tip: tip}, nil
+	}
+	if err := s.waitReceiptDurable(ctx, receipt, req.RequestID); err != nil {
+		return RequestStatusResponse{}, err
+	}
+	if s.readDurability != nil {
+		if err := s.waitReadDurable(ctx, receipt.Slot); err != nil {
+			return RequestStatusResponse{}, err
+		}
 	}
 	return RequestStatusResponse{State: string(receipt.Status), Tip: tip, Receipt: &receipt}, nil
 }
