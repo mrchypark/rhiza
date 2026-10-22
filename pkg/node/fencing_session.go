@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	objectstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 )
@@ -33,11 +34,30 @@ func (n *Node) connectFenceSession(ctx context.Context) error {
 }
 
 func (n *Node) bindFenceWAL(ctx context.Context, walIdentity string) error {
+	if n.fenceSession == nil {
+		return fmt.Errorf("supervised WAL binding requires an authenticated fencing session")
+	}
 	if err := n.fenceSession.BindWAL(ctx, walIdentity); err != nil {
 		return err
 	}
+	if n.fenceSession.Identity().WALIdentity != walIdentity {
+		return fmt.Errorf("fencing: authenticated WAL binding differs")
+	}
 	if n.protectedBucket == nil {
 		return fmt.Errorf("supervised source mutation bucket is unavailable")
+	}
+	if _, independent := n.fenceSession.MutationBinding(); !independent {
+		return n.protectedBucket.activateCooperativeDirect()
+	}
+	provider := objectstore.Provider(n.config.ObjStoreProvider)
+	if provider == "" {
+		provider = objectstore.ProviderS3
+	}
+	if provider != objectstore.ProviderGCS {
+		return fmt.Errorf("supervised source mutations currently require GCS")
+	}
+	if err := rejectSupervisedWriterCredentials(n.config); err != nil {
+		return err
 	}
 	dir, err := fencing.SourceRetryDirectory(n.config.DataDir, n.fenceSession.Identity())
 	if err != nil {

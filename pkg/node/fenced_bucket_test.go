@@ -40,6 +40,36 @@ func TestFencedBucketClassifiesRelayedMutationConditionFailure(t *testing.T) {
 		t.Fatalf("relayed 412 was not visible to the archive caller: err=%v classified=%t", err, bucket.IsConditionNotMetErr(err))
 	}
 }
+
+func TestFencedBucketCooperativeDirectModeIsExplicitAndDelegates(t *testing.T) {
+	base, err := objectstore.NewBucket(objectstore.Config{Provider: objectstore.ProviderFilesystem, FilesystemDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	bucket := &fencedBucket{MeteredBucket: base}
+	if err := bucket.Upload(context.Background(), "object", strings.NewReader("before-bind")); err == nil {
+		t.Fatal("default-deny bucket accepted a write before authenticated binding")
+	}
+	if err := bucket.activateCooperativeDirect(); err != nil {
+		t.Fatal(err)
+	}
+	if err := bucket.Upload(context.Background(), "object", strings.NewReader("cooperative")); err != nil {
+		t.Fatal(err)
+	}
+	exists, err := bucket.Exists(context.Background(), "object")
+	if err != nil || !exists {
+		t.Fatalf("cooperative write did not reach the wrapped bucket: exists=%t err=%v", exists, err)
+	}
+	if err := bucket.Delete(context.Background(), "object"); err != nil {
+		t.Fatal(err)
+	}
+	exists, err = bucket.Exists(context.Background(), "object")
+	if err != nil || exists {
+		t.Fatalf("cooperative delete did not reach the wrapped bucket: exists=%t err=%v", exists, err)
+	}
+}
+
 func (m *recordingSourceMutator) Delete(_ context.Context, key string, generation int64) error {
 	m.key, m.deleted = key, generation
 	return nil
