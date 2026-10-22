@@ -441,6 +441,36 @@ func (b *MeteredBucket) Delete(ctx context.Context, name string) error {
 	return err
 }
 
+// SupportsVersionedDelete reports whether the underlying provider can delete
+// an exact object version. The MeteredBucket method keeps the optional
+// capability visible through this wrapper without claiming support otherwise.
+func (b *MeteredBucket) SupportsVersionedDelete() bool {
+	return SupportsVersionedDelete(b.Bucket)
+}
+
+// DeleteVersion deletes only the selected object version. It deliberately
+// returns an unsupported-capability error instead of falling back to Delete.
+func (b *MeteredBucket) DeleteVersion(ctx context.Context, name string, version thanosobjstore.ObjectVersion) error {
+	if err := b.metrics.mutations.begin(); err != nil {
+		return err
+	}
+	known := false
+	defer func() { b.metrics.mutations.end(known) }()
+	b.metrics.deletes.Add(1)
+	ctx, operation := b.metrics.beginReplayOperation(ctx)
+	defer finishReplayOperation(operation)
+	deleter, ok := b.Bucket.(VersionedDeleteBucket)
+	if !ok || !SupportsVersionedDelete(b.Bucket) {
+		err := ErrVersionedDeleteUnsupported
+		b.record(err)
+		return err
+	}
+	err := deleter.DeleteVersion(ctx, name, version)
+	known = err == nil || b.Bucket.IsObjNotFoundErr(err) || b.Bucket.IsConditionNotMetErr(err)
+	b.record(err)
+	return err
+}
+
 func (b *MeteredBucket) record(err error) {
 	if err != nil {
 		b.metrics.failures.Add(1)
