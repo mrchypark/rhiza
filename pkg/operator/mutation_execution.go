@@ -474,7 +474,11 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 			return err
 		}
 		defer payload.Close()
-		result, err = provider.upload(ctx, intent.Key, entry.Preparation.Generation, intent, payload)
+		dispatchContext := ctx
+		if e.GCSMutationAckLoss != nil && fencing.IsHeldCreateEligible(intent, *entry.Preparation) {
+			dispatchContext = e.GCSMutationAckLoss.arm(ctx, runtime, run, producerUID, sequence, dispatchID, intent, *entry.Preparation, scope)
+		}
+		result, err = provider.upload(dispatchContext, intent.Key, entry.Preparation.Generation, intent, payload)
 		if err != nil {
 			return ErrFencePending
 		}

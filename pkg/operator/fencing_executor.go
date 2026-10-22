@@ -63,6 +63,9 @@ type FencingExecutor struct {
 	// writer credentials and a durable receipt directory.
 	SourceMutationStorage  *storage.Client
 	SourceMutationReceipts *MutationExecutionReceiptStore
+	// GCSMutationAckLoss is an optional, exact-dispatch qualification fault.
+	// It is nil in production unless an explicit run-scoped config is supplied.
+	GCSMutationAckLoss *GCSMutationAckLossFault
 	// Prepared work needs trusted receipt/session verification, not just valid
 	// digest strings. A missing provider verifier cannot qualify archived work.
 	VerifyMutationEvidence func(context.Context, fencing.RuntimeBinding, uint64, fencing.MutationEntry) error

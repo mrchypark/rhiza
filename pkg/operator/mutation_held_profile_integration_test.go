@@ -326,6 +326,9 @@ func heldProfileProvider(t *testing.T, fixture heldProfileFixture) *gcsMutationP
 
 func TestHeldProfileUnknownCreateClosesThroughGuardAndPinsKeyAcrossCompaction(t *testing.T) {
 	f := newHeldProfileFixture(t)
+	// Compaction retires exact source-stage generations, so this test bucket
+	// must expose the same versioned-delete contract as the production store.
+	f.e.AuthorityState.bucket = &archiveTestBucket{Bucket: f.e.AuthorityState.bucket}
 	gcs, _ := newHeldGCSServer(t, f)
 	provider := heldProfileProvider(t, f)
 	ctx := t.Context()
