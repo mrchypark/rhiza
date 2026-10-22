@@ -143,14 +143,19 @@ func (e *FencingExecutor) verifyTerminalEvidence(ctx context.Context, evidence t
 	// Bind every prepared descriptor, including archived work, to this exact
 	// workload store. A valid receipt for another bucket/prefix cannot compose.
 	verifier := *e
+	verifyMutationEvidence := e.VerifyMutationEvidence
+	if verifyMutationEvidence == nil {
+		// Keep terminal verification consistent with mutation-archive compaction:
+		// the built-in verifier reopens the exact root-bound journal and remote
+		// execution receipt. A missing custom verifier is not a reason to skip
+		// proof, and must not turn into a digest-only success.
+		verifyMutationEvidence = e.VerifySourceMutationEvidence
+	}
 	verifier.VerifyMutationEvidence = func(ctx context.Context, runtime fencing.RuntimeBinding, sequence uint64, entry fencing.MutationEntry) error {
 		if entry.Preparation == nil || entry.Preparation.StoreScopeHash != hashJSON(evidence.Storage) {
 			return fmt.Errorf("fencing: terminal mutation names another storage scope")
 		}
-		if e.VerifyMutationEvidence == nil {
-			return fmt.Errorf("fencing: mutation evidence verifier is unavailable")
-		}
-		return e.VerifyMutationEvidence(ctx, runtime, sequence, entry)
+		return verifyMutationEvidence(ctx, runtime, sequence, entry)
 	}
 	if err := verifier.verifyMutationArchiveReceipts(ctx, fencing.MutationCompactionPlan{Runtime: evidence.Runtime, Entries: evidence.Producer.Entries}); err != nil {
 		return err
