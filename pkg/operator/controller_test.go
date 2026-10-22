@@ -1111,7 +1111,16 @@ func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepa
 				return
 			}
 			if q.URL.Path == "/recovery/probe" && q.Method == http.MethodGet {
-				if q.Header.Get("Authorization") != "Bearer "+controllerFixtureAdminToken {
+				// Activation replaces the source admin token with the freshly
+				// generated target credential. Validate the installed target
+				// token so the fixture reaches the SQL read-barrier path.
+				token := controllerFixtureAdminToken
+				if a.secret != nil {
+					if decoded, err := base64.StdEncoding.DecodeString(str(nested(a.secret, "data", "admin"))); err == nil {
+						token = string(decoded)
+					}
+				}
+				if q.Header.Get("Authorization") != "Bearer "+token {
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
@@ -1124,7 +1133,7 @@ func newOperatorAPIVoters(t *testing.T, r *Resource, mode string, voters []quepa
 					NodeID: string(member.ID), ClusterID: "rhiza-r-" + shortID(str(a.r.Metadata["uid"])+":"+a.r.Spec.RecoveryID), Durability: a.r.Spec.Durability,
 					Ready: !a.unready[string(member.ID)], Quorum: !a.noQuorum, CertifiedTip: tip, AppliedTip: tip,
 				}}
-				probe.MAC = controllerFixtureRecoveryProbeMAC(probe, controllerFixtureAdminToken)
+				probe.MAC = controllerFixtureRecoveryProbeMAC(probe, token)
 				_ = json.NewEncoder(w).Encode(probe)
 				if a.replacePodAfterProbe && a.finalProbeCalls >= 2 {
 					a.podUIDOverride = "replacement-after-probe"

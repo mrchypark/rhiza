@@ -136,6 +136,37 @@ func TestTerminalStoreRetainsEvidenceAcrossGenerationAndRestart(t *testing.T) {
 	}
 }
 
+func TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault(t *testing.T) {
+	f := newArchiveGenesisFixture(t)
+	commitArchiveGenesisFixture(t, f)
+	closeTerminalTestRun(t, f.e, f.runtime)
+	f.e.VerifyRuntimeEvidence = func(_ context.Context, got fencing.RuntimeBinding, request fencing.StopRequest, receipt []byte) error {
+		if got != f.runtime || request.Identity.RunID != f.runtime.RunID || !bytes.Equal(receipt, []byte("verified-terminal")) {
+			return errors.New("test runtime verifier rejected evidence")
+		}
+		return nil
+	}
+	if f.e.VerifyMutationEvidence != nil {
+		t.Fatal("fixture unexpectedly installs a custom mutation verifier")
+	}
+	receipts, err := f.e.receiptsForRuntime(f.runtime)
+	if err != nil || receipts == nil || receipts.evidence == nil {
+		t.Fatalf("fixture did not select root-bound remote mutation receipts: store=%+v err=%v", receipts, err)
+	}
+	if _, err := f.e.retainIndependentTerminal(t.Context(), f.runtime, terminalTestStorage, []byte("verified-terminal")); err != nil {
+		t.Fatalf("terminal proof rejected exact remote mutation receipt by default: %v", err)
+	}
+	producer, err := f.e.reserveMutationProducer(t.Context(), f.runtime)
+	if err != nil || producer.Entries[1].Preparation == nil {
+		t.Fatalf("committed mutation entry unavailable for negative root check: producer=%+v err=%v", producer, err)
+	}
+	wrongRuntime := f.runtime
+	wrongRuntime.SourceClusterID = "different-source-root"
+	if err := f.e.VerifySourceMutationEvidence(t.Context(), wrongRuntime, 1, producer.Entries[1]); err == nil {
+		t.Fatal("built-in remote mutation verifier accepted a receipt through another canonical root")
+	}
+}
+
 func TestTerminalStoreLostCreateAndRootCASResponsesAreIdempotent(t *testing.T) {
 	e, _, runtime := terminalStoreFixture(t)
 	closeTerminalTestRun(t, e, runtime)
