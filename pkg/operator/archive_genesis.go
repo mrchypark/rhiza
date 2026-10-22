@@ -428,7 +428,7 @@ func (e *FencingExecutor) reconcileArchiveGenesisCandidates(ctx context.Context,
 	}
 	var losers []candidate
 	for _, run := range state.Ledger.Runs {
-		if run.Runtime == nil || run.MutationProducerUID == "" || run.MutationProfile != fencing.MutationExecutionProfile {
+		if run.Runtime == nil || run.MutationProducerUID == "" || !fencing.MutationProfileSupported(run.MutationProfile) {
 			continue
 		}
 		producer, producerUID, _, err := e.AuthorityState.ReadProducer(ctx, *run.Runtime)
@@ -546,7 +546,7 @@ func (e *FencingExecutor) archiveGenesisStatus(ctx context.Context, authorizatio
 		if err != nil {
 			return fencing.ArchiveGenesisStatus{}, err
 		}
-		provider, err := newGCSMutationProvider(e.SourceMutationStorage, storeScope)
+		provider, err := newGCSMutationProviderForProfile(e.SourceMutationStorage, storeScope, run.MutationProfile)
 		if err != nil {
 			return fencing.ArchiveGenesisStatus{}, err
 		}
@@ -607,7 +607,7 @@ type archiveGenesisCandidate struct {
 func (e *FencingExecutor) findArchiveGenesisCandidate(ctx context.Context, state fenceLedger) (archiveGenesisCandidate, bool, error) {
 	var candidate archiveGenesisCandidate
 	for _, run := range state.Ledger.Runs {
-		if run.Runtime == nil || run.MutationProducerUID == "" || run.MutationProfile != fencing.MutationExecutionProfile {
+		if run.Runtime == nil || run.MutationProducerUID == "" || !fencing.MutationProfileSupported(run.MutationProfile) {
 			continue
 		}
 		producer, producerUID, _, err := e.AuthorityState.ReadProducer(ctx, *run.Runtime)

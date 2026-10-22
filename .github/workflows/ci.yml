@@ -12,7 +12,7 @@ on:
         required: false
         default: false
       fixture_only:
-        description: Run only focused rollback, IAM, manifest, empty-recovery, and terminal-evidence Go regressions
+        description: Run only focused rollback, IAM, manifest, operator, and fencing Go regressions
         type: boolean
         required: false
         default: false
@@ -96,11 +96,10 @@ jobs:
       - name: Check focused rollback, IAM, manifest, and recovery fixtures
         run: |
           embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'
-          operator_tests='^(TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot|TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead|TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound|TestAutomaticArchiveAllowsEmptyAsyncOnlyWithExplicitLossAndHEAD|TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault|TestTerminalStoreRejectsIncompleteOrUntrustedTermination)$'
           go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
-          go test ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m
+          go test ./pkg/fencing ./pkg/operator ./e2e/fencing -count=1 -timeout=5m
           go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m
-          go test -race ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m
+          go test -race ./pkg/fencing ./pkg/operator ./e2e/fencing -count=1 -timeout=5m
 
   cooperative-fencing:
     if: github.event_name != 'workflow_dispatch' || !inputs.fixture_only

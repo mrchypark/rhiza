@@ -169,15 +169,14 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 		return false
 	}
 	wantEmbeddedSelector := "embedded_tests='^(TestIndependentRollbackReconcilesInterruptedCreateMarkers|TestRollbackMarkerGateCoversEveryIndependentAndCIWrite|TestIndependentGCSChaosManifestContract|TestGCSIAM.*)$'"
-	wantOperatorSelector := "operator_tests='^(TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot|TestEmptyRecoveryCommittedRetryAcceptsEvolvedTargetHead|TestEmptyRecoveryClosedRootBindingIsExactAndScopeBound|TestAutomaticArchiveAllowsEmptyAsyncOnlyWithExplicitLossAndHEAD|TestTerminalStoreUsesRootBoundRemoteMutationReceiptByDefault|TestTerminalStoreRejectsIncompleteOrUntrustedTermination)$'"
-	if !hasLine(wantEmbeddedSelector) || !hasLine(wantOperatorSelector) {
-		t.Fatal("fixture-only job must assign the fixed rollback/IAM/manifest and recovery/terminal selector literals")
+	if !hasLine(wantEmbeddedSelector) || strings.Contains(run, "operator_tests=") {
+		t.Fatal("fixture-only job must retain only the fixed embedded rollback/IAM/manifest selector")
 	}
 	wantCommands := []string{
 		`go test ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
-		`go test ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m`,
+		`go test ./pkg/fencing ./pkg/operator ./e2e/fencing -count=1 -timeout=5m`,
 		`go test -race ./e2e/chaos/embedded-go -run "$embedded_tests" -count=1 -timeout=5m`,
-		`go test -race ./pkg/operator -run "$operator_tests" -count=1 -timeout=5m`,
+		`go test -race ./pkg/fencing ./pkg/operator ./e2e/fencing -count=1 -timeout=5m`,
 	}
 	for _, command := range wantCommands {
 		if !hasLine(command) {

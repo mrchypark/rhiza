@@ -80,6 +80,15 @@ type MutationPreparation struct {
 	SessionRef     string `json:"sessionRef,omitempty"`
 }
 
+// IsHeldCreateEligible identifies zero-generation uploads protected by the
+// held profile. The original condition remains in the intent and is never
+// rewritten; unconditional writes are eligible only when preparation pinned
+// the observed absence as generation zero.
+func IsHeldCreateEligible(intent MutationIntent, preparation MutationPreparation) bool {
+	return intent.Kind == "upload" && preparation.Profile == MutationHeldExecutionProfile && preparation.GenerationSet && preparation.Generation == 0 &&
+		(intent.Condition.Mode == MutationCreateOnly || intent.Condition.Mode == MutationUnconditional)
+}
+
 // MutationResolution must be supplied only by the trusted provider worker after
 // recording its immutable provider evidence. Exclusion is never a client ACK.
 type MutationResolution struct {
@@ -97,13 +106,40 @@ type MutationResolution struct {
 }
 
 type MutationEntry struct {
-	Intent         MutationIntent              `json:"intent"`
-	Preparation    *MutationPreparation        `json:"preparation,omitempty"`
-	Resolution     *MutationResolution         `json:"resolution,omitempty"`
-	CopyCompletion *MutationCopyCompletion     `json:"copyCompletion,omitempty"`
-	DispatchClosed bool                        `json:"dispatchClosed,omitempty"`
-	Dispatches     map[string]MutationDispatch `json:"dispatches,omitempty"`
+	Intent                   MutationIntent                    `json:"intent"`
+	Preparation              *MutationPreparation              `json:"preparation,omitempty"`
+	Resolution               *MutationResolution               `json:"resolution,omitempty"`
+	CopyCompletion           *MutationCopyCompletion           `json:"copyCompletion,omitempty"`
+	GuardedLogicalResolution *MutationGuardedLogicalResolution `json:"guardedLogicalResolution,omitempty"`
+	DispatchClosed           bool                              `json:"dispatchClosed,omitempty"`
+	Dispatches               map[string]MutationDispatch       `json:"dispatches,omitempty"`
 }
+
+// MutationGuardedLogicalResolution resolves only the logical value of an
+// uncertain held generation-zero create. It deliberately does not terminalize
+// the original provider permission; the live held object fences later effects.
+type MutationGuardedLogicalResolution struct {
+	Version              int                 `json:"version"`
+	Runtime              RuntimeBinding      `json:"runtime"`
+	WALIdentity          string              `json:"walIdentity"`
+	ProducerUID          string              `json:"producerUID"`
+	Sequence             uint64              `json:"sequence"`
+	Intent               MutationIntent      `json:"intent"`
+	Preparation          MutationPreparation `json:"preparation"`
+	PreparationHash      string              `json:"preparationHash"`
+	DispatchID           string              `json:"dispatchID"`
+	Profile              string              `json:"profile"`
+	GuardRootIdentity    string              `json:"guardRootIdentity"`
+	GuardVersion         int                 `json:"guardVersion"`
+	GuardRef             string              `json:"guardRef"`
+	GuardDigest          string              `json:"guardDigest"`
+	ObjectGeneration     int64               `json:"objectGeneration"`
+	ObjectMetageneration int64               `json:"objectMetageneration"`
+	ObjectSize           int64               `json:"objectSize"`
+	PayloadDigest        string              `json:"payloadDigest"`
+}
+
+const MutationGuardedLogicalResolutionVersion = 1
 
 // MutationDispatch is a durable executable permission, including a worker that
 // paused before sending any bytes. Empty ReceiptDigest means unresolved. The
@@ -257,6 +293,14 @@ func (p *MutationProducer) validateEntry(sequence uint64, entry MutationEntry) e
 			return fmt.Errorf("fencing: copy completion lacks matching prepared terminal work")
 		}
 	}
+	if entry.GuardedLogicalResolution != nil {
+		if entry.Resolution == nil {
+			return fmt.Errorf("fencing: guarded logical evidence lacks a logical resolution")
+		}
+		if err := p.validateGuardedLogicalResolution(sequence, entry, *entry.GuardedLogicalResolution); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -406,8 +450,11 @@ func validateMutationPreparation(intent MutationIntent, prepared MutationPrepara
 	if intent.Condition.Mode == MutationCreateOnly && prepared.Generation != 0 || intent.Condition.Mode == MutationMatchGeneration && prepared.Generation != intent.Condition.Generation {
 		return fmt.Errorf("fencing: preparation changed the original mutation condition")
 	}
-	if prepared.Profile != "gcs-json-v1" && prepared.Profile != "gcs-resumable-v1" {
+	if prepared.Profile != MutationExecutionProfile && prepared.Profile != MutationHeldExecutionProfile && prepared.Profile != "gcs-resumable-v1" {
 		return fmt.Errorf("fencing: unsupported mutation profile")
+	}
+	if prepared.Profile == MutationHeldExecutionProfile && prepared.Generation == 0 && intent.Kind == "upload" && !IsHeldCreateEligible(intent, prepared) {
+		return fmt.Errorf("fencing: zero-generation held upload is not eligible")
 	}
 	if prepared.Profile == "gcs-resumable-v1" && intent.Kind != "upload" {
 		return fmt.Errorf("fencing: resumable profile only supports uploads")
@@ -432,6 +479,74 @@ func (p *MutationProducer) PreparationHash(sequence uint64) (string, error) {
 		return "", fmt.Errorf("fencing: mutation has no preparation")
 	}
 	return p.preparationHash(sequence, entry), nil
+}
+
+// ResolveGuardedLogical records a root-authenticated logical resolution without
+// changing the original receipt or marking its physical dispatch terminal.
+func (p *MutationProducer) ResolveGuardedLogical(producerUID string, sequence uint64, evidence MutationGuardedLogicalResolution) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	entry, exists := p.Entries[sequence]
+	if !exists {
+		return fmt.Errorf("fencing: guarded logical resolution lacks an admitted mutation")
+	}
+	if producerUID == "" || evidence.ProducerUID != producerUID {
+		return fmt.Errorf("fencing: guarded logical resolution producer identity differs")
+	}
+	if err := p.validateGuardedLogicalResolution(sequence, entry, evidence); err != nil {
+		return err
+	}
+	if entry.GuardedLogicalResolution != nil && *entry.GuardedLogicalResolution != evidence {
+		return fmt.Errorf("fencing: guarded logical resolution is immutable")
+	}
+	if entry.Resolution == nil {
+		entry.Resolution = &MutationResolution{Outcome: MutationCommitted, PreparationHash: evidence.PreparationHash,
+			ReceiptDigest: evidence.GuardDigest, PayloadDigest: evidence.PayloadDigest}
+	}
+	entry.GuardedLogicalResolution = &evidence
+	p.Entries[sequence] = entry
+	return nil
+}
+
+// ValidateGuardedLogicalResolution checks archived or separately persisted
+// evidence against an exact closed producer entry without changing that entry.
+func (p *MutationProducer) ValidateGuardedLogicalResolution(producerUID string, sequence uint64, entry MutationEntry) error {
+	if p == nil || p.Phase != MutationClosed || p.WALIdentity == "" || producerUID == "" || entry.GuardedLogicalResolution == nil || entry.GuardedLogicalResolution.ProducerUID != producerUID {
+		return fmt.Errorf("fencing: guarded logical resolution producer identity differs")
+	}
+	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, WALIdentity: p.WALIdentity}
+	if err := p.Runtime.Validate(id); err != nil {
+		return err
+	}
+	return p.validateGuardedLogicalResolution(sequence, entry, *entry.GuardedLogicalResolution)
+}
+
+func (p *MutationProducer) validateGuardedLogicalResolution(sequence uint64, entry MutationEntry, evidence MutationGuardedLogicalResolution) error {
+	if p == nil || p.Phase != MutationClosed || sequence > p.ClosedThrough || entry.Preparation == nil || evidence.Version != MutationGuardedLogicalResolutionVersion ||
+		evidence.Runtime != p.Runtime || evidence.WALIdentity != p.WALIdentity || evidence.ProducerUID == "" || evidence.Sequence != sequence ||
+		evidence.Intent != entry.Intent || evidence.Preparation != *entry.Preparation || evidence.Profile != MutationHeldExecutionProfile ||
+		evidence.Preparation.Profile != MutationHeldExecutionProfile || evidence.PreparationHash != p.preparationHash(sequence, entry) ||
+		evidence.GuardRootIdentity == "" || !mutationDigestValid(evidence.GuardRootIdentity) || evidence.GuardVersion != MutationGuardedLogicalResolutionVersion || evidence.GuardRef == "" || len(evidence.GuardRef) > 512 ||
+		!strings.HasPrefix(evidence.GuardRef, "mutation-guards/") || strings.HasPrefix(evidence.GuardRef, "/") || path.Clean(evidence.GuardRef) != evidence.GuardRef || strings.HasPrefix(evidence.GuardRef, "../") ||
+		!mutationDigestValid(evidence.GuardDigest) || evidence.ObjectGeneration <= 0 || evidence.ObjectMetageneration <= 0 ||
+		evidence.ObjectSize != entry.Intent.PayloadSize || evidence.PayloadDigest != entry.Intent.PayloadDigest || !mutationDigestValid(evidence.PayloadDigest) {
+		return fmt.Errorf("fencing: guarded logical resolution is not bound to the exact prepared producer tuple")
+	}
+	if !IsHeldCreateEligible(entry.Intent, *entry.Preparation) ||
+		(entry.Resolution != nil && (entry.Resolution.Outcome != MutationCommitted || entry.Resolution.AllCopiesTerminal || entry.Resolution.PayloadDigest != entry.Intent.PayloadDigest)) ||
+		entry.DispatchClosed == false || len(entry.Dispatches) != 1 {
+		return fmt.Errorf("fencing: guarded logical resolution is not eligible for an unresolved held create")
+	}
+	if _, ok := entry.Dispatches[evidence.DispatchID]; !ok || evidence.DispatchID == "" {
+		return fmt.Errorf("fencing: guarded logical resolution does not bind the original dispatch grant")
+	}
+	for _, dispatch := range entry.Dispatches {
+		if dispatch.ReceiptDigest != "" {
+			return fmt.Errorf("fencing: guarded logical resolution cannot rewrite a terminal dispatch receipt")
+		}
+	}
+	return nil
 }
 
 func (p *MutationProducer) preparationHash(sequence uint64, entry MutationEntry) string {
@@ -662,7 +777,7 @@ func mutationEntryTerminal(entry MutationEntry) bool {
 	if entry.Resolution == nil {
 		return false
 	}
-	return entry.Preparation == nil || entry.Preparation.Generation != 0 || entry.Resolution.AllCopiesTerminal || entry.CopyCompletion != nil
+	return entry.Preparation == nil || entry.Preparation.Generation != 0 || entry.Resolution.AllCopiesTerminal || entry.CopyCompletion != nil || entry.GuardedLogicalResolution != nil
 }
 
 func mutationDigestValid(value string) bool {

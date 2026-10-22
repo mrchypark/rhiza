@@ -29,6 +29,34 @@ type mutationExecutionProvider interface {
 	committed(context.Context, string, fencing.MutationIntent, fencing.MutationPreparation) (mutationProviderResult, bool, error)
 }
 
+// mutationGuardedReplayRequest carries the complete canonical mutation tuple
+// plus the exact root identity that must own the immutable guard record.
+type mutationGuardedReplayRequest struct {
+	Runtime           fencing.RuntimeBinding
+	WALIdentity       string
+	ProducerUID       string
+	Sequence          uint64
+	Intent            fencing.MutationIntent
+	Preparation       fencing.MutationPreparation
+	PreparationHash   string
+	DispatchID        string
+	GuardRootIdentity string
+}
+
+// mutationGuardedReplayProvider is implemented only by the held GCS profile.
+// replay creates/read-backs the immutable guard before replaying exact staged
+// bytes; verify rereads that guard and the exact held object generation.
+type mutationGuardedReplayProvider interface {
+	replayGuardedCreate(context.Context, *AuthorityEvidenceStore, mutationGuardedReplayRequest, io.Reader) (fencing.MutationGuardedLogicalResolution, error)
+	verifyGuardedCreate(context.Context, *AuthorityEvidenceStore, mutationGuardedReplayRequest, fencing.MutationGuardedLogicalResolution) error
+}
+
+// mutationHeldCreateFinalizer releases a successful original create's hold
+// only after its exact receipt has been committed to the canonical producer.
+type mutationHeldCreateFinalizer interface {
+	finalizeHeldCreate(context.Context, string, fencing.MutationIntent, mutationExecutionReceipt) error
+}
+
 type mutationKeyState struct {
 	ScopeHash string `json:"scopeHash"`
 	Key       string `json:"key"`
@@ -53,7 +81,7 @@ func (e *FencingExecutor) compactSourceMutationJournal(ctx context.Context, runt
 	for sequence := producer.CompactedThrough; sequence < producer.LastAdmitted; {
 		sequence++
 		entry := producer.Entries[sequence]
-		if entry.Resolution == nil || (entry.Preparation != nil && entry.Preparation.Generation == 0 && !entry.Resolution.AllCopiesTerminal && entry.CopyCompletion == nil) {
+		if entry.Resolution == nil || (entry.Preparation != nil && entry.Preparation.Generation == 0 && !entry.Resolution.AllCopiesTerminal && entry.CopyCompletion == nil && entry.GuardedLogicalResolution == nil) {
 			break
 		}
 		through = sequence
@@ -282,7 +310,7 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		return err
 	}
 	run, ok := state.Ledger.Runs[runtime.RunID]
-	if !ok || run.Runtime == nil || *run.Runtime != runtime || run.MutationProducerUID != producerUID || run.MutationScopeHash != intent.StoreScopeHash || run.MutationProfile != fencing.MutationExecutionProfile || run.Identity.WALIdentity == "" {
+	if !ok || run.Runtime == nil || *run.Runtime != runtime || run.MutationProducerUID != producerUID || run.MutationScopeHash != intent.StoreScopeHash || !fencing.MutationProfileSupported(run.MutationProfile) || run.Identity.WALIdentity == "" {
 		return fmt.Errorf("fencing: source mutation is outside enrolled producer scope")
 	}
 	lookup, err := e.lookupMutation(ctx, runtime.StatefulSetUID, run.Identity, fencing.MutationLookupRequest{ProducerUID: producerUID, Sequence: sequence, Intent: intent})
@@ -323,9 +351,14 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		}); err != nil {
 			return err
 		}
-		// A create-only write with unresolved copies retains the cross-producer
-		// key guard after its caller-visible commit. A later zero-generation
-		// delete must not race a delayed copy that could recreate the name.
+		if fencing.IsHeldCreateEligible(receipt.Intent, receipt.Preparation) &&
+			receipt.Outcome == fencing.MutationCommitted && receipt.AllCopiesTerminal {
+			if err := e.finalizeHeldMutationReceipt(ctx, runtime, sequence, producerUID, receipt, provider, receipts); err != nil {
+				return errors.Join(ErrFencePending, err)
+			}
+		}
+		// A zero-generation held upload with unresolved copies retains the
+		// cross-producer key guard after its caller-visible commit.
 		if receipt.Preparation.Generation != 0 || receipt.AllCopiesTerminal {
 			if err := e.releaseMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner); err != nil {
 				return err
@@ -340,9 +373,27 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		return nil
 	}
 	if entry.Resolution != nil {
+		if entry.GuardedLogicalResolution != nil {
+			return e.verifyGuardedLogicalResolution(ctx, runtime, run, producerUID, sequence, entry, provider)
+		}
 		if entry.Resolution.Outcome == fencing.MutationCommitted {
+			if fencing.IsHeldCreateEligible(intent, *entry.Preparation) && entry.Resolution.AllCopiesTerminal {
+				if err := e.finalizeHeldMutationEntry(ctx, runtime, sequence, producerUID, entry, provider, receipts); err != nil {
+					return errors.Join(ErrFencePending, err)
+				}
+			}
 			if entry.Preparation.Generation != 0 || entry.Resolution.AllCopiesTerminal || entry.CopyCompletion != nil {
 				return e.releaseMutationKey(ctx, intent.StoreScopeHash, intent.Key, owner)
+			}
+			if run.MutationProfile == fencing.MutationHeldExecutionProfile {
+				current, actualUID, _, readErr := e.AuthorityState.ReadProducer(ctx, runtime)
+				if readErr != nil || actualUID != producerUID {
+					return errors.Join(ErrFencePending, readErr)
+				}
+				if current.Phase != fencing.MutationClosed {
+					return nil // the caller-visible logical commit remains valid while the producer is open
+				}
+				return e.replayGuardedLogicalResolution(ctx, runtime, run, producerUID, sequence, entry, stages, provider)
 			}
 			return nil
 		}
@@ -376,7 +427,7 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 				generation = observed
 			}
 		}
-		prepared := fencing.MutationPreparation{Profile: fencing.MutationExecutionProfile, StoreScopeHash: intent.StoreScopeHash, GenerationSet: true, Generation: generation}
+		prepared := fencing.MutationPreparation{Profile: run.MutationProfile, StoreScopeHash: intent.StoreScopeHash, GenerationSet: true, Generation: generation}
 		if _, err := e.changeMutationProducer(ctx, runtime, func(p *fencing.MutationProducer) error { return p.Prepare(sequence, prepared) }); err != nil {
 			return err
 		}
@@ -390,7 +441,11 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		for id := range entry.Dispatches {
 			dispatchID = id
 		}
-		// A granted but unresolved right is never reused for another physical call.
+		// A granted but unresolved legacy right is never reused for another
+		// physical call. The held profile has a separate root-guarded replay below.
+		if fencing.IsHeldCreateEligible(intent, *entry.Preparation) {
+			return e.replayGuardedLogicalResolution(ctx, runtime, run, producerUID, sequence, entry, stages, provider)
+		}
 		result, found, err := provider.committed(ctx, intent.Key, intent, *entry.Preparation)
 		if err != nil || !found {
 			return ErrFencePending
@@ -445,6 +500,140 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		Metageneration: result.Metageneration, PayloadDigest: result.PayloadDigest, AllCopiesTerminal: result.AllCopiesTerminal}
 	receipt.ReceiptDigest = receipt.digest()
 	return finish(receipt)
+}
+
+func (e *FencingExecutor) replayGuardedLogicalResolution(ctx context.Context, runtime fencing.RuntimeBinding, run fencing.Run, producerUID string, sequence uint64, entry fencing.MutationEntry, stages *SourceStageStore, provider mutationExecutionProvider) error {
+	guardProvider, ok := provider.(mutationGuardedReplayProvider)
+	if !ok || e == nil || e.AuthorityState == nil || run.MutationProfile != fencing.MutationHeldExecutionProfile ||
+		entry.Preparation == nil || !fencing.IsHeldCreateEligible(entry.Intent, *entry.Preparation) || !entry.DispatchClosed || len(entry.Dispatches) != 1 {
+		return ErrFencePending
+	}
+	producer, actualUID, _, err := e.AuthorityState.ReadProducer(ctx, runtime)
+	if err != nil || actualUID != producerUID || producer.Runtime != runtime || producer.WALIdentity != run.Identity.WALIdentity || producer.Phase != fencing.MutationClosed || producer.Validate() != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	current, exists := producer.Entries[sequence]
+	if !exists || hashJSON(current) != hashJSON(entry) {
+		return ErrFencePending
+	}
+	preparationHash, err := producer.PreparationHash(sequence)
+	if err != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	dispatchID := ""
+	for id, dispatch := range entry.Dispatches {
+		if dispatch.ReceiptDigest != "" {
+			return ErrFencePending
+		}
+		dispatchID = id
+	}
+	evidenceStore, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		return err
+	}
+	request := mutationGuardedReplayRequest{Runtime: runtime, WALIdentity: run.Identity.WALIdentity, ProducerUID: producerUID,
+		Sequence: sequence, Intent: entry.Intent, Preparation: *entry.Preparation, PreparationHash: preparationHash,
+		DispatchID: dispatchID, GuardRootIdentity: evidenceStore.Identity()}
+	if entry.GuardedLogicalResolution != nil {
+		if err := guardProvider.verifyGuardedCreate(ctx, evidenceStore, request, *entry.GuardedLogicalResolution); err != nil {
+			return errors.Join(ErrFencePending, err)
+		}
+		return nil
+	}
+	payload, err := stages.openMutationPayloadContext(ctx, producerUID, entry.Intent)
+	if err != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	evidence, replayErr := guardProvider.replayGuardedCreate(ctx, evidenceStore, request, payload)
+	closeErr := payload.Close()
+	if err := errors.Join(replayErr, closeErr); err != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	if err := guardProvider.verifyGuardedCreate(ctx, evidenceStore, request, evidence); err != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	if evidence.GuardRootIdentity != evidenceStore.Identity() {
+		return ErrFencePending
+	}
+	_, err = e.changeMutationProducer(ctx, runtime, func(p *fencing.MutationProducer) error {
+		if p.WALIdentity != run.Identity.WALIdentity {
+			return fmt.Errorf("fencing: guarded mutation producer WAL differs")
+		}
+		return p.ResolveGuardedLogical(producerUID, sequence, evidence)
+	})
+	return err
+}
+
+func (e *FencingExecutor) verifyGuardedLogicalResolution(ctx context.Context, runtime fencing.RuntimeBinding, run fencing.Run, producerUID string, sequence uint64, entry fencing.MutationEntry, provider mutationExecutionProvider) error {
+	guardProvider, ok := provider.(mutationGuardedReplayProvider)
+	if !ok || entry.GuardedLogicalResolution == nil || entry.Preparation == nil {
+		return ErrFencePending
+	}
+	producer := fencing.MutationProducer{Runtime: runtime, WALIdentity: run.Identity.WALIdentity, Phase: fencing.MutationClosed, ClosedThrough: sequence}
+	if err := producer.ValidateGuardedLogicalResolution(producerUID, sequence, entry); err != nil {
+		return err
+	}
+	evidenceStore, err := e.authorityEvidenceFor(runtime)
+	if err != nil {
+		return err
+	}
+	preparationHash := entry.GuardedLogicalResolution.PreparationHash
+	request := mutationGuardedReplayRequest{Runtime: runtime, WALIdentity: run.Identity.WALIdentity, ProducerUID: producerUID,
+		Sequence: sequence, Intent: entry.Intent, Preparation: *entry.Preparation, PreparationHash: preparationHash,
+		DispatchID: entry.GuardedLogicalResolution.DispatchID, GuardRootIdentity: evidenceStore.Identity()}
+	if entry.GuardedLogicalResolution.GuardRootIdentity != evidenceStore.Identity() {
+		return ErrFencePending
+	}
+	if err := guardProvider.verifyGuardedCreate(ctx, evidenceStore, request, *entry.GuardedLogicalResolution); err != nil {
+		return errors.Join(ErrFencePending, err)
+	}
+	return nil
+}
+
+func (e *FencingExecutor) finalizeHeldMutationEntry(ctx context.Context, runtime fencing.RuntimeBinding, sequence uint64, producerUID string, entry fencing.MutationEntry, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) error {
+	if entry.Preparation == nil || entry.Resolution == nil || receipts == nil {
+		return ErrFencePending
+	}
+	run, err := e.enrolledMutationRun(ctx, runtime)
+	if err != nil || run.MutationProducerUID != producerUID {
+		return errors.Join(ErrFencePending, err)
+	}
+	owner := hashJSON([]any{runtime, run.Identity.WALIdentity, producerUID, sequence, entry.Intent.OperationID})
+	receipt, err := receipts.get("receipt-" + owner)
+	if err != nil {
+		return err
+	}
+	return e.finalizeHeldMutationReceipt(ctx, runtime, sequence, producerUID, receipt, provider, receipts)
+}
+
+func (e *FencingExecutor) finalizeHeldMutationReceipt(ctx context.Context, runtime fencing.RuntimeBinding, sequence uint64, producerUID string, receipt mutationExecutionReceipt, provider mutationExecutionProvider, receipts *MutationExecutionReceiptStore) error {
+	finalizer, ok := provider.(mutationHeldCreateFinalizer)
+	if !ok || receipts == nil || !fencing.IsHeldCreateEligible(receipt.Intent, receipt.Preparation) ||
+		receipt.Outcome != fencing.MutationCommitted || !receipt.AllCopiesTerminal || receipt.Runtime != runtime || receipt.ProducerUID != producerUID || receipt.Sequence != sequence {
+		return ErrFencePending
+	}
+	run, err := e.enrolledMutationRun(ctx, runtime)
+	if err != nil || run.MutationProducerUID != producerUID || run.Identity.WALIdentity != receipt.WALIdentity {
+		return errors.Join(ErrFencePending, err)
+	}
+	owner := hashJSON([]any{runtime, run.Identity.WALIdentity, producerUID, sequence, receipt.Intent.OperationID})
+	saved, err := receipts.get("receipt-" + owner)
+	if err != nil || saved != receipt {
+		return errors.Join(ErrFencePending, err)
+	}
+	producer, actualUID, _, err := e.AuthorityState.ReadProducer(ctx, runtime)
+	if err != nil || actualUID != producerUID || producer.Runtime != runtime || producer.WALIdentity != run.Identity.WALIdentity {
+		return errors.Join(ErrFencePending, err)
+	}
+	entry, exists := producer.Entries[sequence]
+	if !exists || entry.Intent != receipt.Intent || entry.Preparation == nil || *entry.Preparation != receipt.Preparation || entry.Resolution == nil ||
+		entry.Resolution.ReceiptDigest != receipt.ReceiptDigest || entry.Resolution.AllCopiesTerminal != receipt.AllCopiesTerminal {
+		return ErrFencePending
+	}
+	if err := e.VerifySourceMutationEvidence(ctx, runtime, sequence, entry); err != nil {
+		return err
+	}
+	return finalizer.finalizeHeldCreate(ctx, receipt.Intent.Key, receipt.Intent, receipt)
 }
 
 func grantMutationDispatch(producer *fencing.MutationProducer, sequence uint64, dispatchID string) error {

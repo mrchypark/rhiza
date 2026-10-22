@@ -52,7 +52,10 @@ type FencingExecutor struct {
 	// source-mutation profile. The persisted root claim is immutable: this option
 	// may create a required root, but never upgrades an existing cooperative root.
 	RequireMutationJournal bool
-	Attestor               FenceAttestor
+	// MutationProfile selects the profile for newly enrolled source producers.
+	// Existing root-bound profiles are always preserved on rebind.
+	MutationProfile string
+	Attestor        FenceAttestor
 	// SourceStages is an optional local fallback for isolated tests or development.
 	// Production selects root-bound ObjectStorage staging through sourceStagesFor.
 	SourceStages *SourceStageStore
@@ -181,6 +184,9 @@ func (e *FencingExecutor) initializeRoot(ctx context.Context, uid, source string
 }
 
 func (e *FencingExecutor) validateMutationJournalProfile(state fenceLedger) error {
+	if e != nil && e.RequireMutationJournal && !fencing.MutationProfileSupported(e.sourceMutationProfile()) {
+		return fmt.Errorf("fencing: configured source mutation profile is unsupported")
+	}
 	if e != nil && e.RequireMutationJournal && !state.Ledger.RequireMutationJournal {
 		return fmt.Errorf("fencing: existing authority root is cooperative-only; refusing mutation-journal profile upgrade")
 	}

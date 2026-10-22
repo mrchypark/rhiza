@@ -2,7 +2,16 @@ package fencing
 
 import "fmt"
 
-const MutationExecutionProfile = "gcs-json-v1"
+const (
+	MutationExecutionProfile     = "gcs-json-v1"
+	MutationHeldExecutionProfile = "gcs-json-held-v2"
+)
+
+// MutationProfileSupported is used by readers that must preserve old bindings
+// while admitting the explicitly versioned held-create protocol.
+func MutationProfileSupported(profile string) bool {
+	return profile == MutationExecutionProfile || profile == MutationHeldExecutionProfile
+}
 
 // ProducerBinding names the durable journal authority, not a mutation ACK or
 // proof that staging, provider execution or runtime termination has completed.
@@ -27,7 +36,7 @@ func (r BindReceipt) Validate(expected Identity) error {
 		return fmt.Errorf("fencing: bind receipt identity differs")
 	}
 	if p := r.Producer; p != nil {
-		if p.ContractVersion != MutationIntentVersion || p.ProducerUID == "" || len(p.ProducerUID) > 128 || !mutationDigestValid(p.StoreScopeHash) || p.ExecutionProfile != MutationExecutionProfile || (p.StageIncarnation != "" && !mutationDigestValid(p.StageIncarnation)) {
+		if p.ContractVersion != MutationIntentVersion || p.ProducerUID == "" || len(p.ProducerUID) > 128 || !mutationDigestValid(p.StoreScopeHash) || !MutationProfileSupported(p.ExecutionProfile) || (p.StageIncarnation != "" && !mutationDigestValid(p.StageIncarnation)) {
 			return fmt.Errorf("fencing: incomplete mutation producer binding")
 		}
 		if err := p.Runtime.Validate(expected); err != nil {
@@ -46,7 +55,7 @@ func (l *Ledger) BindMutationStage(id Identity, incarnation string) error {
 	if ok {
 		before.WALIdentity = run.Identity.WALIdentity
 	}
-	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || !mutationDigestValid(incarnation) || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || run.MutationScopeHash == "" || run.MutationProfile != MutationExecutionProfile {
+	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || !mutationDigestValid(incarnation) || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || run.MutationScopeHash == "" || !MutationProfileSupported(run.MutationProfile) {
 		return fmt.Errorf("fencing: invalid mutation stage enrollment")
 	}
 	if l.ClosedBy != "" || run.Stop != nil {
@@ -91,7 +100,7 @@ func (l *Ledger) BindMutationScope(id Identity, scope, profile string) error {
 	run, ok := l.Runs[id.RunID]
 	before := id
 	before.WALIdentity = run.Identity.WALIdentity
-	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || !mutationDigestValid(scope) || profile != MutationExecutionProfile {
+	if !ok || !l.RequireMutationJournal || run.Runtime == nil || run.MutationProducerUID == "" || before != run.Identity || id.WALIdentity == "" || (run.Identity.WALIdentity != "" && run.Identity.WALIdentity != id.WALIdentity) || !mutationDigestValid(scope) || !MutationProfileSupported(profile) {
 		return fmt.Errorf("fencing: invalid mutation scope enrollment")
 	}
 	if l.ClosedBy != "" || run.Stop != nil {

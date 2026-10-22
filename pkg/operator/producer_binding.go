@@ -83,12 +83,22 @@ func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid strin
 	if err := e.validateMutationJournalProfile(currentRoot); err != nil {
 		return fencing.BindReceipt{}, err
 	}
+	profile := e.sourceMutationProfile()
+	if existing, ok := currentRoot.Ledger.Runs[id.RunID]; ok && existing.MutationProfile != "" {
+		if !fencing.MutationProfileSupported(existing.MutationProfile) {
+			return fencing.BindReceipt{}, fmt.Errorf("fencing: existing source mutation profile is unsupported")
+		}
+		if profile == fencing.MutationHeldExecutionProfile && existing.MutationProfile != profile {
+			return fencing.BindReceipt{}, fmt.Errorf("fencing: configured held-create profile cannot attach to an existing source mutation profile")
+		}
+		profile = existing.MutationProfile
+	}
 	state, err := e.change(ctx, uid, id.SourceClusterID, func(l *fencing.Ledger) error {
 		if e.RequireMutationJournal && !l.RequireMutationJournal {
 			return fmt.Errorf("fencing: authority root does not require mutation journal")
 		}
 		if l.RequireMutationJournal {
-			if err := l.BindMutationScope(id, scopeHash, fencing.MutationExecutionProfile); err != nil {
+			if err := l.BindMutationScope(id, scopeHash, profile); err != nil {
 				return err
 			}
 			if stageIncarnation != "" {
@@ -133,7 +143,7 @@ func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid strin
 	}
 	receipt := fencing.BindReceipt{Identity: id}
 	if confirmed.Ledger.RequireMutationJournal {
-		if current.Runtime == nil || run.Runtime == nil || *current.Runtime != *run.Runtime || current.MutationProducerUID != run.MutationProducerUID || current.MutationScopeHash != scopeHash || current.MutationProfile != fencing.MutationExecutionProfile || current.MutationStageIncarnation != stageIncarnation {
+		if current.Runtime == nil || run.Runtime == nil || *current.Runtime != *run.Runtime || current.MutationProducerUID != run.MutationProducerUID || current.MutationScopeHash != scopeHash || current.MutationProfile != profile || current.MutationStageIncarnation != stageIncarnation {
 			return fencing.BindReceipt{}, fmt.Errorf("fencing: producer binding changed during activation")
 		}
 		receipt.Producer = &fencing.ProducerBinding{ContractVersion: fencing.MutationIntentVersion,
@@ -145,4 +155,11 @@ func (e *FencingExecutor) bindWALAtScopeWithStage(ctx context.Context, uid strin
 		return fencing.BindReceipt{}, fmt.Errorf("fencing: required mutation-journal binding has no validated producer")
 	}
 	return receipt, receipt.Validate(id)
+}
+
+func (e *FencingExecutor) sourceMutationProfile() string {
+	if e != nil && e.MutationProfile != "" {
+		return e.MutationProfile
+	}
+	return fencing.MutationExecutionProfile
 }
