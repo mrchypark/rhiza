@@ -26,6 +26,7 @@ type fakeRuntime struct {
 	version             *runtimeapi.VersionResponse
 	sandbox             *runtimeapi.PodSandboxStatus
 	container           *runtimeapi.ContainerStatus
+	verboseInfo         map[string]string
 	containers          []*runtimeapi.Container
 	host                HostIdentity
 	stopContainers      int
@@ -40,6 +41,7 @@ type fakeRuntime struct {
 	blockStop           bool
 	changeHostAfterStop bool
 	directory           string
+	scopeEventsFile     string
 	stopEntered         chan struct{}
 	stopEnteredOnce     sync.Once
 }
@@ -72,7 +74,14 @@ func (f *fakeRuntime) ContainerStatus(_ context.Context, request *runtimeapi.Con
 	if request.ContainerId != "container-0" {
 		return nil, status.Error(codes.NotFound, "wrong container ID")
 	}
-	return &runtimeapi.ContainerStatusResponse{Status: proto.Clone(f.container).(*runtimeapi.ContainerStatus)}, nil
+	response := &runtimeapi.ContainerStatusResponse{Status: proto.Clone(f.container).(*runtimeapi.ContainerStatus)}
+	if request.Verbose {
+		response.Info = make(map[string]string, len(f.verboseInfo))
+		for key, value := range f.verboseInfo {
+			response.Info[key] = value
+		}
+	}
+	return response, nil
 }
 
 func (f *fakeRuntime) ListContainers(_ context.Context, request *runtimeapi.ListContainersRequest) (*runtimeapi.ListContainersResponse, error) {
@@ -122,6 +131,11 @@ func (f *fakeRuntime) StopPodSandbox(_ context.Context, request *runtimeapi.Stop
 		return nil, status.Error(f.sandboxError, "test sandbox result unknown")
 	}
 	f.sandbox.State = runtimeapi.PodSandboxState_SANDBOX_NOTREADY
+	if f.scopeEventsFile != "" && !f.stillRunning && !f.descendantRunning {
+		if err := os.WriteFile(f.scopeEventsFile, []byte("populated 0\nfrozen 0\n"), 0600); err != nil {
+			return nil, status.Error(codes.Internal, "test cgroup update failed")
+		}
+	}
 	for i, entry := range f.containers {
 		if !f.stillRunning && !(f.descendantRunning && i != 0) {
 			entry.State = runtimeapi.ContainerState_CONTAINER_EXITED
@@ -166,7 +180,7 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 	done := make(chan struct{})
 	go func() { defer close(done); _ = server.Serve(listener) }()
 	t.Cleanup(func() { server.Stop(); _ = listener.Close(); <-done })
-	profile := Profile{Namespace: "test", ContainerName: "database", RuntimeName: "containerd", RuntimeVersion: "test-version", RuntimeAPIVersion: "v1", KernelRelease: "test-kernel", GraceSeconds: 3}
+	profile := Profile{Namespace: "test", ContainerName: "database", RuntimeName: "containerd", RuntimeVersion: "test-version", RuntimeAPIVersion: "v1", ContainerdRuntimeType: "io.containerd.runc.v2", CgroupProfileID: "qualified-test-profile", KernelRelease: "test-kernel", GraceSeconds: 3}
 	p, err := Open(socket, profile, func(context.Context) (HostIdentity, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -290,6 +304,114 @@ func TestCRIAcknowledgementAloneIsNotTerminalEvidence(t *testing.T) {
 				t.Fatal("partial container stop acknowledgement was discarded")
 			}
 		})
+	}
+}
+
+func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
+	p, f, binding, request := newRuntimeFixture(t)
+	root := t.TempDir()
+	proc := filepath.Join(root, "proc")
+	cgroupRoot := filepath.Join(root, "cgroup")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0")
+	if err := os.MkdirAll(cgroup, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0")
+	events := filepath.Join(cgroup, "cgroup.events")
+	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, binding, p.profile.CgroupProfileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(cgroupRoot, "kubepods", "other-pod")
+	if err := os.MkdirAll(moved, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moved, "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proc, "123", "cgroup"), []byte("0::/kubepods/other-pod\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.StopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("process moved to another cgroup was accepted: %v", err)
+	}
+	f.mu.Lock()
+	if f.stopContainers != 0 || f.stopSandboxes != 0 {
+		f.mu.Unlock()
+		t.Fatal("moved process received a CRI stop command")
+	}
+	f.mu.Unlock()
+	if err := os.WriteFile(filepath.Join(proc, "123", "cgroup"), []byte("0::/kubepods/pod-0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.scopeEventsFile = events
+	f.mu.Unlock()
+	observation, err := p.StopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope)
+	if err != nil || !observation.ContainerExited || observation.ObservedAt == "" {
+		t.Fatalf("qualified execution scope was not verified: %+v %v", observation, err)
+	}
+	otherBinding := binding
+	otherBinding.RunID = "other-run"
+	otherRequest := request
+	otherRequest.Identity.RunID = otherBinding.RunID
+	if _, err := p.StopInCgroup(t.Context(), otherBinding, otherRequest, proc, cgroupRoot, scope); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("cgroup scope from another run was accepted: %v", err)
+	}
+	f.mu.Lock()
+	f.stillRunning = true
+	f.scopeEventsFile = ""
+	f.mu.Unlock()
+	// A new cgroup identity is rejected before any second CRI stop attempt.
+	if err := os.MkdirAll(filepath.Join(cgroupRoot, "replacement"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "replacement", "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(cgroup, filepath.Join(cgroupRoot, "old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(cgroupRoot, "replacement"), cgroup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.StopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("changed cgroup identity was accepted: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 1 || f.stopSandboxes != 1 {
+		t.Fatalf("changed cgroup identity reached CRI: containers=%d sandboxes=%d", f.stopContainers, f.stopSandboxes)
+	}
+}
+
+func TestCRIContainerdEnrollmentCapturesPIDOnlyForExactBinding(t *testing.T) {
+	p, f, binding, _ := newRuntimeFixture(t)
+	f.mu.Lock()
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
+	f.mu.Unlock()
+	root := t.TempDir()
+	proc := filepath.Join(root, "proc")
+	cgroupRoot := filepath.Join(root, "cgroup")
+	if err := os.MkdirAll(filepath.Join(cgroupRoot, "kubepods", "pod-0"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0")
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "kubepods", "pod-0", "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot)
+	if err != nil || scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeBindingDigest(binding) {
+		t.Fatalf("containerd enrollment scope=%+v, %v", scope, err)
+	}
+	f.mu.Lock()
+	f.verboseInfo = map[string]string{"info": `{"sandboxID":"another-sandbox","pid":123,"removing":false,"snapshotKey":"snapshot","snapshotter":"overlayfs","runtimeType":"io.containerd.runc.v2","runtimeOptions":null,"config":{},"runtimeSpec":{}}`}
+	f.mu.Unlock()
+	if _, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("cross-sandbox containerd PID was accepted: %v", err)
 	}
 }
 

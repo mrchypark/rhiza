@@ -33,6 +33,9 @@ const fencingCredentialAnnotation = "rhiza.mrchypark.dev/fencing-credential-uid"
 type FencingExecutor struct {
 	Kube     *Kubernetes
 	Attestor FenceAttestor
+	// SourceStages is nil unless an operator explicitly opens a provisioned,
+	// incarnation-pinned local POSIX spool. Node mutation remains disabled.
+	SourceStages *SourceStageStore
 	// Prepared work needs trusted receipt/session verification, not just valid
 	// digest strings. A missing provider verifier cannot qualify archived work.
 	VerifyMutationEvidence func(context.Context, fencing.RuntimeBinding, uint64, fencing.MutationEntry) error
@@ -130,6 +133,10 @@ func (e *FencingExecutor) read(ctx context.Context, uid, source string) (fenceLe
 func (e *FencingExecutor) Handler() http.Handler { return http.HandlerFunc(e.handle) }
 
 func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/source-stages/") {
+		e.handleSourceStage(w, r)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.Path != "/v1/supervisor" {
 		http.NotFound(w, r)
 		return
