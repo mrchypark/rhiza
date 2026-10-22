@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 )
