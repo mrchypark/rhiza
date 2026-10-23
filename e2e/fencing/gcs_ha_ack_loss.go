@@ -14,14 +14,16 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
-	internalobjstore "github.com/mrchypark/rhiza/internal/objstore"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/thanos-io/objstore"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -44,8 +46,11 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 	if err := config.Validate(); err != nil {
 		return "", nil, err
 	}
-	if source.Namespace != namespace || source.StatefulSetUID == "" || source.ClusterID == "" || source.Bucket != config.Bucket || source.Prefix != config.Prefix {
+	if source.Namespace != namespace || (source.StatefulSetUID == "" && config.Bootstrap == nil) || source.ClusterID == "" || source.Bucket != config.Bucket || source.Prefix != config.Prefix {
 		return "", nil, fmt.Errorf("acknowledgement-loss config is outside the captured GCS source scope")
+	}
+	if config.Bootstrap != nil && (source.StatefulSetUID != "" || source.NamespaceUID != config.Bootstrap.NamespaceUID || source.ClusterID != config.Bootstrap.SourceClusterID) {
+		return "", nil, fmt.Errorf("bootstrap acknowledgement-loss config differs from the pre-apply namespace/source binding")
 	}
 	if source.FencerPod == "" || out == "" {
 		return "", nil, fmt.Errorf("acknowledgement-loss rollout identity is incomplete")
@@ -139,13 +144,13 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 					_, cleanupErr = kubectl(cleanupCtx, "rollout", "status", "deployment/rhiza-fencer", "--timeout=120s")
 				}
 				if cleanupErr == nil {
-					cleanupErr = deleteAckLossConfigMap(cleanupCtx, configUID)
+					cleanupErr = deleteAckLossConfigMapExact(cleanupCtx, configUID, gcsInitialHeadDigest(configBytes))
 				}
 				cancel()
 				return "", nil, errors.Join(fmt.Errorf("fencer patch response was lost after applying the exact template: %w", err), cleanupErr)
 			}
 			if templateErr == nil && currentIndex == containerIndex && sameJSON(currentArgs, args) && sameJSON(currentMounts, mounts) && sameJSON(currentVolumes, volumes) {
-				cleanupErr := deleteAckLossConfigMap(ctx, configUID)
+				cleanupErr := deleteAckLossConfigMapExact(ctx, configUID, gcsInitialHeadDigest(configBytes))
 				return "", nil, errors.Join(fmt.Errorf("patch run-owned fencer Deployment for acknowledgement-loss qualification: %w", err), cleanupErr)
 			}
 		}
@@ -170,7 +175,7 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 		if _, err := kubectl(cleanupCtx, "rollout", "status", "deployment/rhiza-fencer", "--timeout=120s"); err != nil {
 			return fmt.Errorf("wait for original fencer Deployment after restore: %w", err)
 		}
-		return deleteAckLossConfigMap(cleanupCtx, configUID)
+		return deleteAckLossConfigMapExact(cleanupCtx, configUID, gcsInitialHeadDigest(configBytes))
 	}
 	if _, err := kubectl(ctx, "rollout", "status", "deployment/rhiza-fencer", "--timeout=120s"); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
@@ -204,21 +209,145 @@ func reconcileAndDeleteAckLossConfigMap(ctx context.Context, expected []byte) er
 		text(nested(current, "data", "config.json")) != string(expected) || nested(current, "immutable") != true {
 		return fmt.Errorf("acknowledgement-loss ConfigMap ownership is not exact; possible residue remains")
 	}
-	if err := deleteAckLossConfigMap(ctx, uid); err != nil {
+	if err := deleteAckLossConfigMapExact(ctx, uid, gcsInitialHeadDigest(expected)); err != nil {
 		return fmt.Errorf("delete exact reconciled acknowledgement-loss ConfigMap UID %s; possible residue remains: %w", uid, err)
 	}
 	return nil
 }
 
-type readOnlyAuthorityBucket struct{ objstore.Bucket }
+type readOnlyAuthorityBucket struct {
+	client *storage.Client
+	name   string
+}
+
+var errGCSAuthorityObserverReadOnly = errors.New("GCS authority observer is read-only")
+
+func isAckLossNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "notfound") || strings.Contains(lower, "not found")
+}
 
 func (readOnlyAuthorityBucket) Upload(context.Context, string, io.Reader, ...objstore.ObjectUploadOption) error {
-	return fmt.Errorf("GCS authority observer is read-only")
+	return errGCSAuthorityObserverReadOnly
 }
 
 func (readOnlyAuthorityBucket) Delete(context.Context, string) error {
-	return fmt.Errorf("GCS authority observer is read-only")
+	return errGCSAuthorityObserverReadOnly
 }
+
+// The CAS options are advertised only so the authority-store codec can validate
+// its envelope contract. This bucket is backed by a read-only OAuth scope and
+// every mutation method is rejected locally.
+func (b readOnlyAuthorityBucket) SupportedObjectUploadOptions() []objstore.ObjectUploadOptionType {
+	return []objstore.ObjectUploadOptionType{objstore.IfNotExists, objstore.IfMatch}
+}
+
+func (readOnlyAuthorityBucket) Provider() objstore.ObjProvider { return objstore.GCS }
+func (b readOnlyAuthorityBucket) Name() string                 { return b.name }
+func (readOnlyAuthorityBucket) Close() error                   { return nil }
+
+func (readOnlyAuthorityBucket) SupportedIterOptions() []objstore.IterOptionType {
+	return []objstore.IterOptionType{objstore.Recursive, objstore.UpdatedAt}
+}
+
+func (b readOnlyAuthorityBucket) Iter(ctx context.Context, dir string, fn func(string) error, options ...objstore.IterOption) error {
+	var recursive []objstore.IterOption
+	for _, option := range options {
+		if option.Type == objstore.Recursive {
+			recursive = append(recursive, option)
+			break
+		}
+	}
+	return b.IterWithAttributes(ctx, dir, func(attrs objstore.IterObjectAttributes) error { return fn(attrs.Name) }, recursive...)
+}
+
+func (b readOnlyAuthorityBucket) IterWithAttributes(ctx context.Context, dir string, fn func(objstore.IterObjectAttributes) error, options ...objstore.IterOption) error {
+	if err := objstore.ValidateIterOptions(b.SupportedIterOptions(), options...); err != nil {
+		return err
+	}
+	if dir != "" {
+		dir = strings.TrimSuffix(dir, objstore.DirDelim) + objstore.DirDelim
+	}
+	applied := objstore.ApplyIterOptions(options...)
+	delimiter := objstore.DirDelim
+	if applied.Recursive {
+		delimiter = ""
+	}
+	query := &storage.Query{Prefix: dir, Delimiter: delimiter}
+	attrsToSelect := []string{"Name"}
+	if applied.LastModified {
+		attrsToSelect = append(attrsToSelect, "Updated")
+	}
+	if err := query.SetAttrSelection(attrsToSelect); err != nil {
+		return err
+	}
+	it := b.client.Bucket(b.name).Objects(ctx, query)
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		entry := objstore.IterObjectAttributes{Name: attrs.Prefix + attrs.Name}
+		if applied.LastModified {
+			entry.SetLastModified(attrs.Updated)
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+	}
+}
+
+func (b readOnlyAuthorityBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	reader, err := b.client.Bucket(b.name).Object(name).NewReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return objstore.ObjectSizerReadCloser{ReadCloser: reader, Size: func() (int64, error) { return reader.Attrs.Size, nil }}, nil
+}
+
+func (b readOnlyAuthorityBucket) GetRange(ctx context.Context, name string, offset, length int64) (io.ReadCloser, error) {
+	reader, err := b.client.Bucket(b.name).Object(name).NewRangeReader(ctx, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	size := reader.Remain()
+	return objstore.ObjectSizerReadCloser{ReadCloser: reader, Size: func() (int64, error) { return size, nil }}, nil
+}
+
+func (b readOnlyAuthorityBucket) Attributes(ctx context.Context, name string) (objstore.ObjectAttributes, error) {
+	attrs, err := b.client.Bucket(b.name).Object(name).Attrs(ctx)
+	if err != nil {
+		return objstore.ObjectAttributes{}, err
+	}
+	return objstore.ObjectAttributes{Size: attrs.Size, LastModified: attrs.Updated,
+		Version: &objstore.ObjectVersion{Type: objstore.Generation, Value: strconv.FormatInt(attrs.Generation, 10)}}, nil
+}
+
+func (b readOnlyAuthorityBucket) Exists(ctx context.Context, name string) (bool, error) {
+	_, err := b.client.Bucket(b.name).Object(name).Attrs(ctx)
+	if err == nil {
+		return true, nil
+	}
+	if b.IsObjNotFoundErr(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (readOnlyAuthorityBucket) IsObjNotFoundErr(err error) bool {
+	return errors.Is(err, storage.ErrObjectNotExist)
+}
+func (readOnlyAuthorityBucket) IsAccessDeniedErr(err error) bool {
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == 403
+}
+func (readOnlyAuthorityBucket) IsConditionNotMetErr(error) bool { return false }
 
 type gcsAckLossReadScope struct {
 	Bucket          string
@@ -314,31 +443,25 @@ func newGCSAckLossReadScope(ctx context.Context, source gcsRecoverySource, deplo
 }
 
 func openGCSAckLossAuthorityStores(ctx context.Context, source gcsRecoverySource, scope gcsAckLossReadScope) (*operator.AuthorityStateStore, *operator.AuthorityEvidenceStore, *storage.Client, objstore.Bucket, func() error, error) {
-	var storageClient *storage.Client
 	if scope.Bucket != source.Bucket || scope.Prefix == "" || scope.CredentialsPath == "" || len(scope.CredentialsJSON) == 0 {
 		return nil, nil, nil, nil, nil, fmt.Errorf("read-only GCS authority scope is incomplete")
 	}
-	bucket, err := internalobjstore.NewBucket(internalobjstore.Config{Provider: internalobjstore.ProviderGCS, Bucket: scope.Bucket, ServiceAccount: string(scope.CredentialsJSON)})
+	storageClient, err := storage.NewClient(ctx, option.WithCredentialsJSON(scope.CredentialsJSON), option.WithScopes(storage.ScopeReadOnly))
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("open read-only canonical GCS state client")
+		return nil, nil, nil, nil, nil, fmt.Errorf("open read-only GCS authority observer")
 	}
-	reader := readOnlyAuthorityBucket{Bucket: bucket}
+	reader := readOnlyAuthorityBucket{client: storageClient, name: scope.Bucket}
 	state, err := operator.NewAuthorityStateStore(reader, scope.Prefix)
 	if err != nil {
-		_ = bucket.Close()
+		_ = storageClient.Close()
 		return nil, nil, nil, nil, nil, fmt.Errorf("configure read-only canonical authority store: %w", err)
 	}
 	evidence, err := operator.NewAuthorityEvidenceStore(reader, scope.Prefix, source.StatefulSetUID, source.ClusterID)
 	if err != nil {
-		_ = bucket.Close()
+		_ = storageClient.Close()
 		return nil, nil, nil, nil, nil, fmt.Errorf("configure read-only canonical authority evidence: %w", err)
 	}
-	storageClient, err = storage.NewClient(ctx, option.WithCredentialsFile(scope.CredentialsPath), option.WithScopes(storage.ScopeReadOnly))
-	if err != nil {
-		_ = bucket.Close()
-		return nil, nil, nil, nil, nil, fmt.Errorf("open read-only GCS object observer")
-	}
-	return state, evidence, storageClient, reader, bucket.Close, nil
+	return state, evidence, storageClient, reader, nil, nil
 }
 
 // qualifyGCSHAAckLoss reuses the normal SQL/archive writer path, then proves
@@ -791,14 +914,21 @@ func ackLossPodOwnedBy(ctx context.Context, pod any, deploymentUID string) bool 
 }
 
 func deleteAckLossConfigMap(ctx context.Context, uid string) error {
+	return deleteAckLossConfigMapExact(ctx, uid, "")
+}
+
+func deleteAckLossConfigMapExact(ctx context.Context, uid, expectedDigest string) error {
 	current, err := get(ctx, "configmap", gcsAckLossConfigMapName)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "notfound") || strings.Contains(strings.ToLower(err.Error()), "not found") {
+		if isAckLossNotFound(err) {
 			return nil
 		}
 		return err
 	}
-	if text(nested(current, "metadata", "uid")) != uid || text(nested(current, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID {
+	configBytes := []byte(text(nested(current, "data", "config.json")))
+	if uid == "" || text(nested(current, "metadata", "uid")) != uid || text(nested(current, "metadata", "namespace")) != namespace ||
+		text(nested(current, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID || nested(current, "immutable") != true ||
+		(expectedDigest != "" && gcsInitialHeadDigest(configBytes) != expectedDigest) {
 		return fmt.Errorf("acknowledgement-loss ConfigMap identity changed; refusing deletion")
 	}
 	_, err = kubectl(ctx, "delete", "configmap", gcsAckLossConfigMapName, "--wait=true", "--preconditions=uid="+uid)
