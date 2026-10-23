@@ -169,8 +169,7 @@ func runtimeAgentRequest(ctx context.Context) error {
 	var observation cri.StopObservation
 	if err := json.Unmarshal(receipt, &observation); err != nil || observation.Runtime != request.Binding || observation.Request != request.Request ||
 		!observation.ContainerExited || !observation.SandboxNotReady || !observation.CgroupEmpty || observation.ObservedAt == "" ||
-		observation.CgroupScope.Path == "" || observation.CgroupScope.Ino == 0 || observation.CgroupScope.PID == 0 || observation.CgroupScope.StartTime == 0 ||
-		observation.CgroupScope.RuntimeHash != fencing.RuntimeBindingDigest(request.Binding) || observation.CgroupScope.ProfileID == "" {
+		!runtimeProbeCgroupScopeMatches(request.Binding, observation.CgroupScope, "") {
 		return fmt.Errorf("runtime-agent receipt lacks exact terminal container, sandbox and cgroup evidence")
 	}
 	if request.Action == "stop" && (!observation.ContainerStopAcknowledged || !observation.SandboxStopAcknowledged) {
@@ -183,6 +182,11 @@ func runtimeAgentRequest(ctx context.Context) error {
 		reply.Receipt = base64.StdEncoding.EncodeToString(receipt)
 	}
 	return json.NewEncoder(os.Stdout).Encode(reply)
+}
+
+func runtimeProbeCgroupScopeMatches(binding fencing.RuntimeBinding, scope cri.CgroupScope, profileID string) bool {
+	return scope.Path != "" && scope.Ino != 0 && scope.PID != 0 && scope.StartTime != 0 && scope.ProfileID != "" &&
+		scope.RuntimeHash == fencing.RuntimeScopeBindingDigest(binding) && (profileID == "" || scope.ProfileID == profileID)
 }
 
 func runtimeProbeWorkload(statefulSetUID string) obj {
@@ -371,8 +375,7 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 	}
 	if first.Observation.Runtime != first.Binding || first.Observation.Request != stopRequest || !first.Observation.ContainerStopAcknowledged || !first.Observation.SandboxStopAcknowledged ||
 		!first.Observation.ContainerExited || !first.Observation.SandboxNotReady || !first.Observation.CgroupEmpty ||
-		first.Observation.CgroupScope.ProfileID != profile.CgroupProfileID || first.Observation.CgroupScope.RuntimeHash != fencing.RuntimeBindingDigest(first.Binding) ||
-		first.Observation.CgroupScope.Path == "" || first.Observation.CgroupScope.Ino == 0 || first.Observation.CgroupScope.PID == 0 || first.Observation.CgroupScope.StartTime == 0 {
+		!runtimeProbeCgroupScopeMatches(first.Binding, first.Observation.CgroupScope, profile.CgroupProfileID) {
 		return fmt.Errorf("runtime agent did not return actual exact terminal scope evidence")
 	}
 	evidence.EnrollmentCaptured, evidence.ContainerStopAck, evidence.SandboxStopAck = true, true, true
