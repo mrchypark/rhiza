@@ -26,10 +26,11 @@ func TestMissingMembershipLauncherUsesDistinctDefaultOffCases(t *testing.T) {
 		}
 	}
 	start := strings.Index(source, "if [ \"$missing_membership\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?missing-membership qualification requires the fencing-e2e driver}\"")
+	dispatch := strings.Index(source, "step 30-missing-membership-collector env")
 	call := strings.Index(source, `"$FENCING_E2E_BIN" run-gcs-ha-missing-membership`)
+	branchExit := strings.Index(source, "echo \"GCS missing-membership $missing_membership_case qualification collector completed\"\n  exit 0\nfi")
 	legacy := strings.Index(source, "step 30-driver python3 -u")
-	branchExit := strings.Index(source, "GCS missing-membership $missing_membership_case qualification collector completed\n  exit 0\nfi\nstep 30-driver python3 -u")
-	if start < 0 || call < start || branchExit < call || legacy < branchExit {
+	if start < 0 || dispatch < start || call < dispatch || branchExit < call || legacy < branchExit {
 		t.Fatal("missing-membership scenario must use the native driver and exit before legacy Python")
 	}
 }
