@@ -67,6 +67,9 @@ func TestPendingLearnerCanBindWALButCannotAcquireMutationAuthority(t *testing.T)
 	if err := l.BindMutationScope(bound, strings.Repeat("a", 64), MutationExecutionProfile); err == nil {
 		t.Fatal("pending learner acquired mutation scope")
 	}
+	if err := l.BindMutationStage(bound, strings.Repeat("c", 64)); err == nil {
+		t.Fatal("pending learner acquired mutation stage")
+	}
 	run := l.Runs[id.RunID]
 	if run.MutationProducerUID != "" || run.MutationScopeHash != "" || run.Identity.WALIdentity != "wal" || runRole(run) != StartupRoleLearnerPendingRemove {
 		t.Fatalf("learner binding changed unexpected ledger state: %+v", run)
@@ -106,8 +109,16 @@ func TestLearnerPromotionRequiresCanonicalEvidenceAndBoundIdentity(t *testing.T)
 	if err := l.BindMutationScope(bound, strings.Repeat("a", 64), MutationExecutionProfile); err != nil {
 		t.Fatalf("promoted learner could not bind exact source scope: %v", err)
 	}
+	if err := l.BindMutationStage(bound, strings.Repeat("c", 64)); err != nil {
+		t.Fatalf("promoted learner could not bind exact source stage: %v", err)
+	}
+	wrong := bound
+	wrong.WALIdentity = "other-wal"
+	if err := l.BindMutationScope(wrong, strings.Repeat("a", 64), MutationExecutionProfile); err == nil {
+		t.Fatal("promoted scope accepted a different WAL identity")
+	}
 	run := l.Runs[id.RunID]
-	if runRole(run) != StartupRoleVoterActive || run.Promotion == nil || run.Promotion.EvidenceHash != evidence || run.MutationProducerUID != "producer" {
+	if runRole(run) != StartupRoleVoterActive || run.Promotion == nil || run.Promotion.EvidenceHash != evidence || run.MutationProducerUID != "producer" || run.MutationScopeHash != strings.Repeat("a", 64) || run.MutationStageIncarnation != strings.Repeat("c", 64) {
 		t.Fatalf("promotion did not persist the exact authority transition: %+v", run)
 	}
 }
@@ -248,6 +259,12 @@ func TestRuntimeEnrollmentPinsProducerUIDBeforeWALAdmission(t *testing.T) {
 	}
 	if err := l.Bind(bound); err != nil {
 		t.Fatal(err)
+	}
+	if err := l.BindMutationScope(bound, strings.Repeat("a", 64), MutationExecutionProfile); err == nil {
+		t.Fatal("ordinary active voter retrofitted mutation scope after WAL activation")
+	}
+	if l.Runs[id.RunID].MutationScopeHash != "" {
+		t.Fatal("rejected late scope changed durable voter state")
 	}
 	if err := l.BindMutationProducer(id, runtime, "producer-uid"); err != nil {
 		t.Fatal("lost enrollment response not resolvable:", err)

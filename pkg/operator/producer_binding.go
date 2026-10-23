@@ -20,7 +20,12 @@ func (e *FencingExecutor) promoteSupervisorLearner(ctx context.Context, uid stri
 		return fencing.BindReceipt{}, err
 	}
 	run, ok := state.Ledger.Runs[id.RunID]
-	if !ok || run.Identity != id || fencing.RunRole(run) != fencing.StartupRoleLearnerPendingRemove || run.Identity.WALIdentity == "" || run.Stop != nil || run.Runtime == nil || !state.Ledger.RequireMutationJournal {
+	if !ok || run.Identity != id || run.Identity.WALIdentity == "" || run.Stop != nil || run.Runtime == nil || !state.Ledger.RequireMutationJournal {
+		return fencing.BindReceipt{}, fencing.ErrClosed
+	}
+	roleBeforeRetry := fencing.RunRole(run)
+	resumingPromotion := roleBeforeRetry == fencing.StartupRoleVoterActive && run.Promotion != nil
+	if roleBeforeRetry != fencing.StartupRoleLearnerPendingRemove && !resumingPromotion {
 		return fencing.BindReceipt{}, fencing.ErrClosed
 	}
 	role, err := e.resolveStartupRole(ctx, uid, id)
@@ -31,17 +36,31 @@ func (e *FencingExecutor) promoteSupervisorLearner(ctx context.Context, uid stri
 	if err != nil {
 		return fencing.BindReceipt{}, errors.Join(fencing.ErrPending, err)
 	}
+	if resumingPromotion && (run.Promotion.OperationID != proofHash.operationID || run.Promotion.EvidenceHash != proofHash.digest) {
+		return fencing.BindReceipt{}, fencing.ErrClosed
+	}
 	if _, err := e.change(ctx, uid, id.SourceClusterID, func(l *fencing.Ledger) error {
 		return l.PromoteLearner(id, proofHash.operationID, proofHash.digest)
 	}); err != nil {
 		return fencing.BindReceipt{}, err
 	}
+	return e.finishPromotedSupervisorLearner(ctx, uid, id, proofHash)
+}
+
+// finishPromotedSupervisorLearner resumes only the exact durable promotion
+// after canonical role/proof validation by promoteSupervisorLearner. It is
+// deliberately safe to retry across producer reservation, archive-scope, or
+// WAL-binding failures; none of those failures rolls back the canonical role.
+func (e *FencingExecutor) finishPromotedSupervisorLearner(ctx context.Context, uid string, id fencing.Identity, proofHash learnerPromotionHash) (fencing.BindReceipt, error) {
 	current, err := e.read(ctx, uid, id.SourceClusterID)
 	if err != nil {
 		return fencing.BindReceipt{}, err
 	}
 	currentRun, ok := current.Ledger.Runs[id.RunID]
-	if !ok || currentRun.Identity != id || fencing.RunRole(currentRun) != fencing.StartupRoleVoterActive || currentRun.Promotion == nil || currentRun.Promotion.EvidenceHash != proofHash.digest {
+	_, voterClosed := current.Ledger.ClosedNodes[id.NodeID]
+	if !ok || currentRun.Identity != id || id.WALIdentity == "" || currentRun.Stop != nil || current.Ledger.ClosedBy != "" || voterClosed ||
+		!current.Ledger.RequireMutationJournal || fencing.RunRole(currentRun) != fencing.StartupRoleVoterActive || currentRun.Runtime == nil || currentRun.Promotion == nil ||
+		currentRun.Promotion.OperationID != proofHash.operationID || currentRun.Promotion.EvidenceHash != proofHash.digest {
 		return fencing.BindReceipt{}, fencing.ErrClosed
 	}
 	if _, err := e.reserveMutationProducer(ctx, *currentRun.Runtime); err != nil {
