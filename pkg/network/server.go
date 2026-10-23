@@ -2031,8 +2031,47 @@ func (s *Server) logReadFailure(phase string, started time.Time, index quepaxa.S
 	case errors.Is(err, ErrDurabilityUnavailable):
 		errorClass = "durability-unavailable"
 	}
-	log.Printf("read failed: phase=%s node=%s read_index=%d source=%s core_tip=%d applied_tip=%d elapsed=%s error_class=%s",
-		phase, s.core.NodeID(), index, source, s.core.Tip(), s.material.Tip(), time.Since(started), errorClass)
+	indexLabel := "read_index"
+	if phase == "read-durability" {
+		// This phase receives the materializer slot, not the earlier consensus
+		// ReadIndex value. Do not report it under a misleading field name.
+		indexLabel = "applied_slot"
+	}
+	var archiveDiagnostic interface {
+		ReadDurabilityDiagnostic() (required, archiveTip uint64, stage, lockState string)
+	}
+	if phase == "read-durability" && errors.As(err, &archiveDiagnostic) {
+		required, archiveTip, stage, lockState := archiveDiagnostic.ReadDurabilityDiagnostic()
+		stage = boundedArchiveWaitStage(stage)
+		lockState = boundedArchiveLockState(lockState)
+		log.Printf("read failed: phase=%s node=%s %s=%d source=%s core_tip=%d applied_tip=%d elapsed=%s error_class=%s archive_required_slot=%d archive_tip=%d archive_wait_stage=%s archive_lock_state=%s",
+			phase, s.core.NodeID(), indexLabel, index, source, s.core.Tip(), s.material.Tip(), time.Since(started), errorClass,
+			required, archiveTip, stage, lockState)
+		return
+	}
+	log.Printf("read failed: phase=%s node=%s %s=%d source=%s core_tip=%d applied_tip=%d elapsed=%s error_class=%s",
+		phase, s.core.NodeID(), indexLabel, index, source, s.core.Tip(), s.material.Tip(), time.Since(started), errorClass)
+}
+
+func boundedArchiveWaitStage(stage string) string {
+	switch stage {
+	case "entry-head-refresh", "batch-coalesce", "archive-sync", "archive-head-refresh",
+		"publication-lock", "lock-recheck-head-refresh", "head-refresh-under-lock",
+		"extent-build-upload", "head-publish", "head-readback", "publish-conflict-refresh",
+		"publication-lock-release":
+		return stage
+	default:
+		return "unknown"
+	}
+}
+
+func boundedArchiveLockState(state string) string {
+	switch state {
+	case "not-observed", "not-held", "busy", "held", "released", "unknown":
+		return state
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Server) handleNotifyPublish(w http.ResponseWriter, r *http.Request) {
