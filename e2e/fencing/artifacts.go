@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/runtimeagent"
 	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -155,6 +156,31 @@ type runtimeAgentEnrollmentDiagnostic struct {
 const maxRuntimeAgentDiagnostics = 20
 
 var allowedRuntimeAgentDiagnosticPairs = map[string]struct{}{
+	"authorization/token_missing":                              {},
+	"authorization/token_review_failed":                        {},
+	"authorization/principal_mismatch":                         {},
+	"authorization/audience_mismatch":                          {},
+	"client/config_invalid":                                    {},
+	"client/node_lookup_failed":                                {},
+	"client/node_address_unavailable":                          {},
+	"client/trust_invalid":                                     {},
+	"client/token_unavailable":                                 {},
+	"client/token_empty":                                       {},
+	"client/request_invalid":                                   {},
+	"transport/unavailable":                                    {},
+	"transport/context_canceled":                               {},
+	"transport/deadline_exceeded":                              {},
+	"client/context_canceled":                                  {},
+	"client/deadline_exceeded":                                 {},
+	"response/http_rejected":                                   {},
+	"response/body_unavailable":                                {},
+	"response/body_oversized":                                  {},
+	"response/context_canceled":                                {},
+	"response/deadline_exceeded":                               {},
+	"response/decode_invalid":                                  {},
+	"response/trailing_data":                                   {},
+	"binding/invalid":                                          {},
+	"binding/mismatch":                                         {},
 	"request_validation/authority_mismatch":                    {},
 	"state_read/binding_conflict":                              {},
 	"state_read/state_unavailable":                             {},
@@ -336,7 +362,15 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 	case name == "runtime-profile.json":
 		value = &runtimeProfileEvidence{}
 	case name == "runtime-component-probe.json":
-		value = &runtimeComponentEvidence{}
+		var evidence runtimeComponentEvidence
+		if err := json.Unmarshal(data, &evidence); err != nil {
+			return nil, err
+		}
+		if (evidence.EnrollmentDiagnosticStage != "" || evidence.EnrollmentDiagnosticCode != "") &&
+			(!runtimeagent.ValidEnrollmentDiagnostic(evidence.EnrollmentDiagnosticStage, evidence.EnrollmentDiagnosticCode) || evidence.EnrollmentCaptured) {
+			return nil, fmt.Errorf("runtime-agent enrollment diagnostic is invalid")
+		}
+		return json.Marshal(evidence)
 	case name == "fencer-diagnostics.json":
 		var view fencerDiagnosticsView
 		if err := json.Unmarshal(data, &view); err != nil {

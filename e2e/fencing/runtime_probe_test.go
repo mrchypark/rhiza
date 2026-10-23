@@ -51,6 +51,29 @@ func TestRuntimeProbeRecordsEnrollmentAndSafeStopStageBeforePending(t *testing.T
 	}
 }
 
+func TestRuntimeProbePreservesRejectedEnrollmentAsFailureProgress(t *testing.T) {
+	for _, tc := range []struct{ stage, code string }{
+		{"authorization", "token_review_failed"},
+		{"transport", "unavailable"},
+		{"response", "http_rejected"},
+		{"response", "decode_invalid"},
+		{"binding", "mismatch"},
+	} {
+		evidence := &runtimeComponentEvidence{}
+		err := applyRuntimeProbeProgress(evidence, &runtimeProbeProgress{EnrollmentStage: tc.stage, EnrollmentCode: tc.code})
+		if err == nil || err.Error() != "runtime-agent enrollment rejected at "+tc.stage+"/"+tc.code {
+			t.Fatalf("enrollment failure progress error=%v for %s/%s", err, tc.stage, tc.code)
+		}
+		if evidence.EnrollmentCaptured || evidence.EnrollmentDiagnosticStage != tc.stage || evidence.EnrollmentDiagnosticCode != tc.code {
+			t.Fatalf("rejected enrollment was lost or treated as captured: %+v", evidence)
+		}
+	}
+	bad := &runtimeComponentEvidence{}
+	if err := applyRuntimeProbeProgress(bad, &runtimeProbeProgress{EnrollmentCaptured: true, EnrollmentStage: "authorization", EnrollmentCode: "token_review_failed"}); err == nil || bad.EnrollmentCaptured || bad.EnrollmentDiagnosticCode != "" {
+		t.Fatalf("invalid progress claimed both enrollment and rejection: evidence=%+v err=%v", bad, err)
+	}
+}
+
 func TestRuntimeProbeRejectsUnallowlistedStopDiagnostic(t *testing.T) {
 	evidence := &runtimeComponentEvidence{}
 	err := applyRuntimeProbeProgress(evidence, &runtimeProbeProgress{EnrollmentCaptured: true, StopStage: "internal", StopCode: "secret/path", Pending: true})
@@ -67,8 +90,8 @@ func TestRuntimeProbeStopDiagnosticSurvivesPublicArtifactProjection(t *testing.T
 		"source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
 		"image-ids.txt":   []byte("sha256:" + strings.Repeat("b", 64) + "\n"),
 		"runtime-component-probe.json": encoded(obj{
-			"qualification": "runtime-agent-component-only", "outcome": "failed", "failureStage": "authenticated-stop",
-			"enrollmentCaptured": true, "stopDiagnosticStage": "pre_container_scope", "stopDiagnosticCode": "process_scope_unverified",
+			"qualification": "runtime-agent-component-only", "outcome": "failed", "failureStage": "enrollment",
+			"enrollmentCaptured": false, "enrollmentDiagnosticStage": "authorization", "enrollmentDiagnosticCode": "token_review_failed",
 			"backendError": private, "procPath": private,
 		}),
 	} {
@@ -90,8 +113,8 @@ func TestRuntimeProbeStopDiagnosticSurvivesPublicArtifactProjection(t *testing.T
 	if err := json.Unmarshal(projected, &evidence); err != nil {
 		t.Fatal(err)
 	}
-	if !evidence.EnrollmentCaptured || evidence.StopDiagnosticStage != "pre_container_scope" || evidence.StopDiagnosticCode != "process_scope_unverified" {
-		t.Fatalf("public projection lost stop progress: %+v", evidence)
+	if evidence.EnrollmentCaptured || evidence.EnrollmentDiagnosticStage != "authorization" || evidence.EnrollmentDiagnosticCode != "token_review_failed" {
+		t.Fatalf("public projection lost enrollment failure progress: %+v", evidence)
 	}
 }
 

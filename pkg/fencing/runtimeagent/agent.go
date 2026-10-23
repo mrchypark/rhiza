@@ -131,7 +131,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if err := s.authorize(r); err != nil {
+	stage, code, err := s.authorize(r)
+	if err != nil {
+		if r.URL.Path == "/v1/enroll" {
+			s.enrollmentDiagnostic(stage, code)
+			w.Header().Set("X-Rhiza-Enrollment-Stage", stage)
+			w.Header().Set("X-Rhiza-Enrollment-Code", code)
+		}
 		http.Error(w, "runtime authority rejected", http.StatusForbidden)
 		return
 	}
@@ -181,19 +187,22 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Service) authorize(r *http.Request) error {
+func (s *Service) authorize(r *http.Request) (string, string, error) {
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || token == "" {
-		return errors.New("missing bearer token")
+		return "authorization", "token_missing", errors.New("missing bearer token")
 	}
 	p, err := s.cfg.Auth.Authenticate(r.Context(), token)
-	if err != nil || p.PodUID == "" || p.WorkloadUID != s.cfg.AuthorityWorkloadUID || p.Username != "system:serviceaccount:"+s.cfg.AuthorityNamespace+":"+s.cfg.AuthorityServiceAccount {
-		return errors.New("not the dedicated fencing authority")
+	if err != nil {
+		return "authorization", "token_review_failed", errors.New("token review failed")
+	}
+	if p.PodUID == "" || p.WorkloadUID != s.cfg.AuthorityWorkloadUID || p.Username != "system:serviceaccount:"+s.cfg.AuthorityNamespace+":"+s.cfg.AuthorityServiceAccount {
+		return "authorization", "principal_mismatch", errors.New("not the dedicated fencing authority")
 	}
 	if len(p.Audiences) == 1 && p.Audiences[0] == s.cfg.Audience {
-		return nil
+		return "", "", nil
 	}
-	return errors.New("authority token must have exactly the dedicated audience")
+	return "authorization", "audience_mismatch", errors.New("authority token must have exactly the dedicated audience")
 }
 
 func (s *Service) enroll(ctx context.Context, base fencing.RuntimeBinding) (fencing.RuntimeBinding, error) {

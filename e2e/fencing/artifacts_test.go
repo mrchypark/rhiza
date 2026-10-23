@@ -43,7 +43,8 @@ func TestPublicImageEvidenceOmitsCredentialCanaries(t *testing.T) {
 func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	const canary = "fixture-secret-canary-never-publish"
 	privateAgentLog := "2026/10/22 00:00:00 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch\n" +
-		"2026/10/22 00:00:01 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch private=" + canary + "\n"
+		"2026/10/22 00:00:01 runtime-agent enrollment rejected stage=authorization code=token_review_failed\n" +
+		"2026/10/22 00:00:02 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch private=" + canary + "\n"
 	agentLogDigest := sha256.Sum256([]byte(privateAgentLog))
 	raw := t.TempDir()
 	write := func(name string, data []byte) {
@@ -68,7 +69,7 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	}))
 	write("fencer-diagnostics.json", encoded(obj{"context": "kind-rhiza-generic-fencing", "namespace": "rhiza-fencing-e2e", "podsCaptured": true, "eventsCaptured": true,
 		"logs":         obj{"captured": true, "sha256": strings.Repeat("e", 64), "bytes": 123, "lines": 4},
-		"runtimeAgent": obj{"podName": "rhiza-runtime-agent-abc", "podUID": "runtime-agent-pod-uid", "logs": obj{"captured": true, "sha256": hex.EncodeToString(agentLogDigest[:]), "bytes": len([]byte(privateAgentLog)), "lines": 2}, "rawLog": canary}, "token": canary}))
+		"runtimeAgent": obj{"podName": "rhiza-runtime-agent-abc", "podUID": "runtime-agent-pod-uid", "logs": obj{"captured": true, "sha256": hex.EncodeToString(agentLogDigest[:]), "bytes": len([]byte(privateAgentLog)), "lines": 3}, "rawLog": canary}, "token": canary}))
 	write("fencer-pods.json", encoded(obj{"pods": []obj{{"name": "rhiza-fencer-abc", "uid": "pod-uid", "phase": "Pending", "conditions": []obj{{"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": canary}}, "containers": []obj{{"name": "fencer", "ready": false, "restartCount": 0, "state": obj{"waiting": obj{"reason": "CrashLoopBackOff", "message": canary}}, "private": canary}}}}, "spec": obj{"env": canary}}))
 	write("fencer-events.json", encoded(obj{"warnings": []obj{{"type": "Warning", "reason": "FailedMount", "count": 2, "lastTimestamp": "2026-10-22T00:00:00Z", "involvedObject": obj{"kind": "Pod", "name": "rhiza-fencer-abc", "uid": canary}, "source": obj{"component": "kubelet"}, "message": canary}}}))
 	write("fencer-deployment.json", encoded(obj{"name": "rhiza-fencer", "uid": "deployment-uid", "generation": 2, "observedGeneration": 1, "replicas": 1, "updatedReplicas": 0, "readyReplicas": 0, "availableReplicas": 0, "conditions": []obj{{"type": "Available", "status": "False", "reason": "MinimumReplicasUnavailable", "message": canary}}}))
@@ -117,7 +118,8 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	var diagnostics fencerDiagnosticsView
 	diagnosticsData, err := os.ReadFile(filepath.Join(raw, "public", "fencer-diagnostics.json"))
 	if err != nil || json.Unmarshal(diagnosticsData, &diagnostics) != nil || !diagnostics.RuntimeAgent.Logs.Captured || diagnostics.RuntimeAgent.Logs.SHA256 != hex.EncodeToString(agentLogDigest[:]) ||
-		len(diagnostics.RuntimeAgent.Diagnostics) != 1 || diagnostics.RuntimeAgent.Diagnostics[0] != (runtimeAgentEnrollmentDiagnostic{Stage: "cri_enroll", Code: "containerd_verbose_schema_mismatch"}) {
+		len(diagnostics.RuntimeAgent.Diagnostics) != 2 || diagnostics.RuntimeAgent.Diagnostics[0] != (runtimeAgentEnrollmentDiagnostic{Stage: "cri_enroll", Code: "containerd_verbose_schema_mismatch"}) ||
+		diagnostics.RuntimeAgent.Diagnostics[1] != (runtimeAgentEnrollmentDiagnostic{Stage: "authorization", Code: "token_review_failed"}) {
 		t.Fatalf("runtime-agent log hash projection failed: %v", err)
 	}
 	var resources []obj

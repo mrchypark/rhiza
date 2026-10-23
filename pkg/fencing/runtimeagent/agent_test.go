@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,15 @@ type testAuth struct {
 	principal Principal
 	err       error
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+type errorReadCloser struct{ err error }
+
+func (r errorReadCloser) Read([]byte) (int, error) { return 0, r.err }
+func (errorReadCloser) Close() error               { return nil }
 
 func (a testAuth) Authenticate(context.Context, string) (Principal, error) { return a.principal, a.err }
 
@@ -64,6 +74,178 @@ func (b *testBackend) Enroll(_ context.Context, base fencing.RuntimeBinding) (fe
 	scope, err := json.Marshal(cri.CgroupScope{Path: "kubepods/pod-a", Dev: 1, Ino: 2, PID: 123, StartTime: 789,
 		RuntimeHash: fencing.RuntimeScopeBindingDigest(base), ProfileID: "qualified-test-profile"})
 	return base, scope, err
+}
+
+func TestEnrollmentAuthorizationFailureKeepsGeneric403AndEmitsBoundedDiagnostic(t *testing.T) {
+	tests := []struct {
+		name string
+		auth testAuth
+		code string
+	}{
+		{name: "token review unavailable", auth: testAuth{err: errors.New("private token review detail")}, code: "token_review_failed"},
+		{name: "wrong principal", auth: testAuth{principal: Principal{Username: "system:serviceaccount:rhiza:other", PodUID: "pod", WorkloadUID: "authority-deployment-uid", Audiences: []string{"rhiza-runtime-agent"}}}, code: "principal_mismatch"},
+		{name: "wrong audience", auth: testAuth{principal: Principal{Username: "system:serviceaccount:rhiza:rhiza-fencer", PodUID: "pod", WorkloadUID: "authority-deployment-uid", Audiences: []string{"other"}}}, code: "audience_mismatch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			var gotStage, gotCode string
+			service, err := New(Config{AuthorityID: "authority", AuthorityNamespace: "rhiza", AuthorityServiceAccount: "rhiza-fencer",
+				AuthorityWorkloadUID: "authority-deployment-uid", Audience: "rhiza-runtime-agent", Directory: dir, Auth: tt.auth,
+				Backend: &testBackend{}, Diagnostic: func(stage, code string) { gotStage, gotCode = stage, code }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/enroll", strings.NewReader(`{}`))
+			request.Header.Set("Authorization", "Bearer private-token-canary")
+			response := httptest.NewRecorder()
+			service.Handler().ServeHTTP(response, request)
+			headers := response.Result().Header
+			if response.Code != http.StatusForbidden || response.Body.String() != "runtime authority rejected\n" ||
+				headers.Get("X-Rhiza-Enrollment-Stage") != "authorization" || headers.Get("X-Rhiza-Enrollment-Code") != tt.code ||
+				strings.Contains(response.Body.String(), "private") {
+				t.Fatalf("authorization rejection changed or leaked response: status=%d body=%q headers=%v", response.Code, response.Body.String(), response.Header())
+			}
+			if gotStage != "authorization" || gotCode != tt.code {
+				t.Fatalf("bounded authorization diagnostic=%q/%q, want authorization/%q", gotStage, gotCode, tt.code)
+			}
+			if !ValidEnrollmentDiagnostic(gotStage, gotCode) {
+				t.Fatalf("server emitted unallowlisted diagnostic %q/%q", gotStage, gotCode)
+			}
+			tokenFile := filepath.Join(dir, "token")
+			if err := os.WriteFile(tokenFile, []byte("private-token-canary\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewTLSServer(service.Handler())
+			defer server.Close()
+			client := Client{BaseURL: server.URL, TokenFile: tokenFile, HTTP: server.Client()}
+			_, err = client.Enroll(context.Background(), testBaseBinding())
+			var enrollmentDiagnostic *EnrollmentDiagnosticError
+			if !errors.As(err, &enrollmentDiagnostic) || enrollmentDiagnostic.Stage != "authorization" || enrollmentDiagnostic.Code != tt.code || strings.Contains(err.Error(), "private") {
+				t.Fatalf("client did not preserve only the bounded enrollment category: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnrollClientClassifiesEveryFailureWithoutRawDetails(t *testing.T) {
+	tests := []struct {
+		name       string
+		client     func(*testing.T, string) *Client
+		stage      string
+		code       string
+		wantCanary string
+		wantIs     error
+	}{
+		{name: "invalid client", client: func(*testing.T, string) *Client { return &Client{} }, stage: "client", code: "config_invalid"},
+		{name: "missing token file", client: func(t *testing.T, serverURL string) *Client {
+			return &Client{BaseURL: serverURL, TokenFile: filepath.Join(t.TempDir(), "missing"), HTTP: &http.Client{}}
+		}, stage: "client", code: "token_unavailable"},
+		{name: "transport", client: func(t *testing.T, serverURL string) *Client {
+			return testEnrollClient(t, serverURL, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("private transport canary") }))
+		}, stage: "transport", code: "unavailable", wantCanary: "private transport canary"},
+		{name: "transport canceled", client: func(t *testing.T, serverURL string) *Client {
+			return testEnrollClient(t, serverURL, roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, fmt.Errorf("private: %w", context.Canceled) }))
+		}, stage: "transport", code: "context_canceled", wantIs: context.Canceled},
+		{name: "transport deadline", client: func(t *testing.T, serverURL string) *Client {
+			return testEnrollClient(t, serverURL, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, fmt.Errorf("private: %w", context.DeadlineExceeded)
+			}))
+		}, stage: "transport", code: "deadline_exceeded", wantIs: context.DeadlineExceeded},
+		{name: "http conflict", client: func(t *testing.T, serverURL string) *Client {
+			return testEnrollClient(t, serverURL, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				headers := http.Header{"X-Rhiza-Enrollment-Stage": []string{"internal"}, "X-Rhiza-Enrollment-Code": []string{"private response canary"}}
+				return enrollResponse(http.StatusConflict, "private response canary", headers), nil
+			}))
+		}, stage: "response", code: "http_rejected", wantCanary: "private response canary"},
+		{name: "malformed response", client: func(t *testing.T, serverURL string) *Client {
+			return testEnrollClient(t, serverURL, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return enrollResponse(http.StatusOK, "{private response canary", nil), nil
+			}))
+		}, stage: "response", code: "decode_invalid", wantCanary: "private response canary"},
+		{name: "invalid binding", client: func(t *testing.T, serverURL string) *Client {
+			return testEnrollClient(t, serverURL, roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return enrollResponse(http.StatusOK, `{}`, nil), nil
+			}))
+		}, stage: "binding", code: "invalid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := tt.client(t, "https://runtime-agent.test")
+			_, err := client.Enroll(context.Background(), testBaseBinding())
+			var diagnostic *EnrollmentDiagnosticError
+			if !errors.As(err, &diagnostic) || diagnostic.Stage != tt.stage || diagnostic.Code != tt.code || !ValidEnrollmentDiagnostic(diagnostic.Stage, diagnostic.Code) {
+				t.Fatalf("Enroll error=%v; want bounded %s/%s", err, tt.stage, tt.code)
+			}
+			if tt.wantCanary != "" && strings.Contains(err.Error(), tt.wantCanary) {
+				t.Fatalf("Enroll error exposed response detail: %v", err)
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Fatalf("Enroll error %v does not preserve %v", err, tt.wantIs)
+			}
+		})
+	}
+}
+
+func TestEnrollClientClassifiesValidatedButDifferentBinding(t *testing.T) {
+	base := testBaseBinding()
+	result := base
+	result.BindingUID = "different-binding"
+	result.NodeUID, result.MachineID, result.BootID = "node-uid", "machine", "boot"
+	result.RuntimeID, result.SandboxID = "cri-profile", "sandbox"
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := testEnrollClient(t, "https://runtime-agent.test", roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return enrollResponse(http.StatusOK, string(data), nil), nil
+	}))
+	_, err = client.Enroll(context.Background(), base)
+	var diagnostic *EnrollmentDiagnosticError
+	if !errors.As(err, &diagnostic) || diagnostic.Stage != "binding" || diagnostic.Code != "mismatch" || strings.Contains(err.Error(), "different-binding") {
+		t.Fatalf("binding mismatch was not safely classified: %v", err)
+	}
+}
+
+func TestEnrollClientPreservesResponseReadCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		code string
+		err  error
+	}{
+		{code: "context_canceled", err: context.Canceled},
+		{code: "deadline_exceeded", err: context.DeadlineExceeded},
+	} {
+		client := testEnrollClient(t, "https://runtime-agent.test", roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: errorReadCloser{err: fmt.Errorf("private: %w", tc.err)}, Request: &http.Request{}}, nil
+		}))
+		_, err := client.Enroll(context.Background(), testBaseBinding())
+		var diagnostic *EnrollmentDiagnosticError
+		if !errors.As(err, &diagnostic) || diagnostic.Stage != "response" || diagnostic.Code != tc.code || !errors.Is(err, tc.err) {
+			t.Fatalf("response-read error=%v; want response/%s preserving sentinel", err, tc.code)
+		}
+		if strings.Contains(err.Error(), "private") {
+			t.Fatalf("response-read diagnostic leaked its cause: %v", err)
+		}
+	}
+}
+
+func testEnrollClient(t *testing.T, serverURL string, transport http.RoundTripper) *Client {
+	t.Helper()
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("fixture-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return &Client{BaseURL: serverURL, TokenFile: tokenFile, HTTP: &http.Client{Transport: transport}}
+}
+
+func enrollResponse(status int, body string, headers http.Header) *http.Response {
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	return &http.Response{StatusCode: status, Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: &http.Request{}}
 }
 
 func TestEnrollmentFailureReturnsGenericConflictAndOnlyAllowlistedDiagnostic(t *testing.T) {
