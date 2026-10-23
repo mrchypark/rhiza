@@ -52,7 +52,8 @@ def make_anchor_record(src_cluster):
         "binding": {"cluster_id": src_cluster,
                     "storage_id": storage_id(src_cluster)},
         "evidence": canonical_evidence(),
-        "pending_write": False, "generation": 0}
+        "pending_write": False, "generation": 0,
+        "transition": None, "last_transition": None}
 
 
 class AnchorChaos(AutomaticChaos):
