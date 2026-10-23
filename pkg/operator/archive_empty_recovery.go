@@ -421,6 +421,9 @@ func (e *FencingExecutor) handleArchiveEmptyRecovery(w http.ResponseWriter, r *h
 	}
 	response, err := e.registerArchiveEmptyRecovery(r.Context(), request)
 	if err != nil {
+		if e.observeEmptyRecoveryError != nil {
+			e.observeEmptyRecoveryError(err)
+		}
 		if errors.Is(err, fencing.ErrPending) || transientFenceAuthority(err) {
 			w.WriteHeader(http.StatusAccepted)
 			return

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,10 +29,28 @@ import (
 // that no write was attempted.
 type automaticBootstrapGenesisFixture struct {
 	heldProfileFixture
-	archive  *objstore.InMemBucket
-	provider *heldGCSServer
-	intent   fencing.MutationIntent
-	cohort   []fencing.RuntimeBinding
+	archive            *objstore.InMemBucket
+	provider           *heldGCSServer
+	intent             fencing.MutationIntent
+	cohort             []fencing.RuntimeBinding
+	emptyRecoveryError *emptyRecoveryErrorCapture
+}
+
+type emptyRecoveryErrorCapture struct {
+	mu  sync.Mutex
+	err string
+}
+
+func (c *emptyRecoveryErrorCapture) record(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = err.Error()
+}
+
+func (c *emptyRecoveryErrorCapture) value() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
 }
 
 const (
@@ -554,6 +573,9 @@ func storeAutomaticBootstrapCluster(t *testing.T, f automaticBootstrapGenesisFix
 func automaticBootstrapController(t *testing.T, f automaticBootstrapGenesisFixture) (*Controller, *httptest.Server, ClusterResource) {
 	t.Helper()
 	f.e.ControllerServiceAccount = "default"
+	if f.emptyRecoveryError != nil {
+		f.e.observeEmptyRecoveryError = f.emptyRecoveryError.record
+	}
 	f.e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
 		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": f.scope.Bucket, "RHIZA_OBJSTORE_PREFIX": "root",
 	})
@@ -741,6 +763,8 @@ func TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap
 
 func TestManualMissingSourceMembershipReconcilesCanonicalEmptyRecovery(t *testing.T) {
 	f := newAutomaticBootstrapGenesisFixture(t)
+	registrarError := &emptyRecoveryErrorCapture{}
+	f.emptyRecoveryError = registrarError
 	controller, _, child, request, _ := closeAutomaticBootstrapForChild(t, f)
 	ctx := t.Context()
 	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
@@ -790,7 +814,8 @@ func TestManualMissingSourceMembershipReconcilesCanonicalEmptyRecovery(t *testin
 	}
 	if child.Status.Stage != "Stopping" || child.Status.RecoveryMode != RecoveryModeFrozenSource ||
 		child.Status.ManualMembershipBindingDigest == "" || child.Status.TargetBaseKind != "empty" || child.Status.Target == "" {
-		t.Fatalf("manual path did not persist its canonical binding and reach empty-target authorization: %+v", child.Status)
+		t.Fatalf("manual path did not persist its canonical binding and reach empty-target authorization: status=%+v registrarError=%q diagnostics={%s}",
+			child.Status, registrarError.value(), automaticBootstrapEmptyRecoveryDiagnostic(t, f, request, child.Status.Target))
 	}
 	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
 		t.Fatalf("manual recovery fabricated source membership: exists=%t err=%v", exists, err)

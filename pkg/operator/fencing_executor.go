@@ -78,6 +78,10 @@ type FencingExecutor struct {
 	// Only a trusted runtime/power provider can collect a terminal receipt. A
 	// missing or unreachable provider leaves the operation pending.
 	CollectRuntimeEvidence func(context.Context, fencing.RuntimeBinding, fencing.StopRequest) ([]byte, error)
+	// observeEmptyRecoveryError is an in-process diagnostic hook for controlled
+	// tests. It never changes the HTTP response or authorization decision and is
+	// nil in production.
+	observeEmptyRecoveryError func(error)
 	// RuntimeAgent captures the exact containerd/cgroup incarnation before
 	// RegisterEnrolled is durably persisted and before supervisor child startup.
 	RuntimeAgent *RuntimeAgentClient
