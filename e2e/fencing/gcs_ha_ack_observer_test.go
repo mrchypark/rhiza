@@ -57,6 +57,45 @@ func TestValidateGCSHAAckReceiptBindsFullTupleAndLiveScope(t *testing.T) {
 	})
 }
 
+func TestGCSAckLossWriterObserverOptInIsExplicitAndIdentityBound(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{name: "default off"},
+		{name: "explicit no", value: "no"},
+		{name: "explicit yes", value: "yes", want: true},
+		{name: "reject malformed opt-in", value: "true", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseGCSAckLossWriterObserverOptIn(test.value)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("opt-in %q = %t, %v; want %t, error=%t", test.value, got, err, test.want, test.wantErr)
+			}
+		})
+	}
+
+	const writerEmail = "rhiza-data@example.iam.gserviceaccount.com"
+	writerIdentity := gcsAckLossCredentialIdentity{Type: "service_account", ClientEmail: writerEmail}
+	if shared, err := validateGCSAckLossObserverIdentity(writerIdentity, writerEmail, writerEmail, false); err == nil || shared {
+		t.Fatalf("same writer identity passed with opt-in off: shared=%t err=%v", shared, err)
+	}
+	if shared, err := validateGCSAckLossObserverIdentity(writerIdentity, writerEmail, writerEmail, true); err != nil || !shared {
+		t.Fatalf("explicit opt-in rejected the exact writer credential: shared=%t err=%v", shared, err)
+	}
+	wrongIdentity := writerIdentity
+	wrongIdentity.ClientEmail = "other@example.iam.gserviceaccount.com"
+	if shared, err := validateGCSAckLossObserverIdentity(wrongIdentity, writerEmail, writerEmail, true); err == nil || shared {
+		t.Fatalf("opt-in accepted a credential for a different identity: shared=%t err=%v", shared, err)
+	}
+	readerIdentity := gcsAckLossCredentialIdentity{Type: "service_account", ClientEmail: "reader@example.iam.gserviceaccount.com"}
+	if shared, err := validateGCSAckLossObserverIdentity(readerIdentity, readerIdentity.ClientEmail, writerEmail, false); err != nil || shared {
+		t.Fatalf("distinct reader identity behavior changed: shared=%t err=%v", shared, err)
+	}
+}
+
 func TestObserveGCSHAAckReceiptRejectsCanonicalBindingNamespaceAndGuardDigestDrift(t *testing.T) {
 	for _, test := range []struct {
 		name           string

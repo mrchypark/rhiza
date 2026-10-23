@@ -28,12 +28,13 @@ import (
 )
 
 const (
-	gcsAckLossConfigMapName = "rhiza-fencer-ack-loss"
-	gcsAckLossConfigPath    = "/var/run/rhiza/gcs-ack-loss/config.json"
-	gcsAckLossVolumeName    = "gcs-ack-loss-config"
-	gcsAckLossEventPrefix   = "GCS_ACK_LOSS_QUALIFICATION "
-	maxAckLossReceiptBytes  = 1 << 20
-	maxAckLossPayloadBytes  = int64(4 << 30)
+	gcsAckLossConfigMapName          = "rhiza-fencer-ack-loss"
+	gcsAckLossConfigPath             = "/var/run/rhiza/gcs-ack-loss/config.json"
+	gcsAckLossVolumeName             = "gcs-ack-loss-config"
+	gcsAckLossEventPrefix            = "GCS_ACK_LOSS_QUALIFICATION "
+	maxAckLossReceiptBytes           = 1 << 20
+	maxAckLossPayloadBytes           = int64(4 << 30)
+	gcsAckLossAllowWriterObserverEnv = "RHIZA_GCS_ALLOW_WRITER_OBSERVER"
 )
 
 var gcsAckLossCredentialEmail = regexp.MustCompile(`^[^@\s]+@[^@\s]+$`)
@@ -365,10 +366,11 @@ func (readOnlyAuthorityBucket) IsAccessDeniedErr(err error) bool {
 func (readOnlyAuthorityBucket) IsConditionNotMetErr(error) bool { return false }
 
 type gcsAckLossReadScope struct {
-	Bucket          string
-	Prefix          string
-	CredentialsJSON []byte
-	CredentialsPath string
+	Bucket               string
+	Prefix               string
+	CredentialsJSON      []byte
+	CredentialsPath      string
+	SharedWriterIdentity bool
 }
 
 type gcsAckLossObjectEvidence struct {
@@ -380,20 +382,62 @@ type gcsAckLossObjectEvidence struct {
 }
 
 type gcsAckLossPrivateEvidence struct {
-	Version              int                                `json:"version"`
-	BaselineAck          gcsAcknowledgement                 `json:"baselineAck"`
-	FaultReceipt         operator.GCSMutationAckLossReceipt `json:"faultReceipt"`
-	CanonicalObservation gcsHAAckObservation                `json:"canonicalObservation"`
-	Object               gcsAckLossObjectEvidence           `json:"object"`
-	FirstRecovery        obj                                `json:"firstRecovery"`
-	SecondRecovery       obj                                `json:"secondRecovery"`
-	SecondAck            gcsAcknowledgement                 `json:"secondAck"`
+	Version                      int                                `json:"version"`
+	BaselineAck                  gcsAcknowledgement                 `json:"baselineAck"`
+	FaultReceipt                 operator.GCSMutationAckLossReceipt `json:"faultReceipt"`
+	CanonicalObservation         gcsHAAckObservation                `json:"canonicalObservation"`
+	Object                       gcsAckLossObjectEvidence           `json:"object"`
+	FirstRecovery                obj                                `json:"firstRecovery"`
+	SecondRecovery               obj                                `json:"secondRecovery"`
+	SecondAck                    gcsAcknowledgement                 `json:"secondAck"`
+	ObserverSharedWriterIdentity bool                               `json:"observerSharedWriterIdentity"`
+}
+
+type gcsAckLossCredentialIdentity struct {
+	Type             string `json:"type"`
+	ClientEmail      string `json:"client_email"`
+	Audience         string `json:"audience"`
+	ImpersonationURL string `json:"service_account_impersonation_url"`
+}
+
+func parseGCSAckLossWriterObserverOptIn(value string) (bool, error) {
+	switch strings.TrimSpace(value) {
+	case "", "no":
+		return false, nil
+	case "yes":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be yes or no when set", gcsAckLossAllowWriterObserverEnv)
+	}
+}
+
+func validateGCSAckLossObserverIdentity(identity gcsAckLossCredentialIdentity, readerEmail, writerEmail string, allowWriterObserver bool) (bool, error) {
+	readerEmail = strings.TrimSpace(readerEmail)
+	if !gcsAckLossCredentialEmail.MatchString(readerEmail) {
+		return false, fmt.Errorf("read-only authority reader identity is invalid")
+	}
+	sharedWriterIdentity := readerEmail == writerEmail
+	if sharedWriterIdentity && !allowWriterObserver {
+		return false, fmt.Errorf("authority observer must use a distinct explicitly configured reader identity")
+	}
+	if identity.Type == "service_account" {
+		if !gcsAckLossCredentialEmail.MatchString(identity.ClientEmail) || identity.ClientEmail != readerEmail {
+			return false, fmt.Errorf("read-only observer service account identity differs from the configured authority reader")
+		}
+	} else if identity.Type != "external_account" || identity.Audience == "" || !strings.Contains(identity.ImpersonationURL, readerEmail) {
+		return false, fmt.Errorf("read-only observer requires explicit service-account or workload-identity credentials")
+	}
+	return sharedWriterIdentity, nil
 }
 
 func newGCSAckLossReadScope(ctx context.Context, source gcsRecoverySource, deployment obj) (gcsAckLossReadScope, error) {
 	var result gcsAckLossReadScope
 	if source.Bucket == "" || source.ConfigMap == "" || source.ClusterID == "" || source.NamespaceUID == "" {
 		return result, fmt.Errorf("GCS ACK observer source identity is incomplete")
+	}
+	allowWriterObserver, err := parseGCSAckLossWriterObserverOptIn(os.Getenv(gcsAckLossAllowWriterObserverEnv))
+	if err != nil {
+		return result, err
 	}
 	credentialsPath := strings.TrimSpace(os.Getenv("RHIZA_GCS_AUTHORITY_READONLY_CREDENTIALS_FILE"))
 	if credentialsPath == "" {
@@ -407,12 +451,7 @@ func newGCSAckLossReadScope(ctx context.Context, source gcsRecoverySource, deplo
 	if err != nil || len(credentials) == 0 || len(credentials) > 1<<20 {
 		return result, fmt.Errorf("read-only GCS observer credentials are unavailable or oversized")
 	}
-	var credentialIdentity struct {
-		Type             string `json:"type"`
-		ClientEmail      string `json:"client_email"`
-		Audience         string `json:"audience"`
-		ImpersonationURL string `json:"service_account_impersonation_url"`
-	}
+	var credentialIdentity gcsAckLossCredentialIdentity
 	if err := json.Unmarshal(credentials, &credentialIdentity); err != nil {
 		return result, fmt.Errorf("decode read-only observer credential identity: %w", err)
 	}
@@ -422,15 +461,9 @@ func newGCSAckLossReadScope(ctx context.Context, source gcsRecoverySource, deplo
 		return result, fmt.Errorf("read-only authority reader identity is required")
 	}
 	writerEmail := writerID + "@" + project + ".iam.gserviceaccount.com"
-	if !gcsAckLossCredentialEmail.MatchString(readerEmail) || readerEmail == writerEmail {
-		return result, fmt.Errorf("authority observer must use a distinct explicitly configured reader identity")
-	}
-	if credentialIdentity.Type == "service_account" {
-		if !gcsAckLossCredentialEmail.MatchString(credentialIdentity.ClientEmail) || credentialIdentity.ClientEmail != readerEmail {
-			return result, fmt.Errorf("read-only observer service account identity differs from the configured authority reader")
-		}
-	} else if credentialIdentity.Type != "external_account" || credentialIdentity.Audience == "" || !strings.Contains(credentialIdentity.ImpersonationURL, readerEmail) {
-		return result, fmt.Errorf("read-only observer requires explicit service-account or workload-identity credentials")
+	sharedWriterIdentity, err := validateGCSAckLossObserverIdentity(credentialIdentity, readerEmail, writerEmail, allowWriterObserver)
+	if err != nil {
+		return result, err
 	}
 	for _, override := range []string{"STORAGE_EMULATOR_HOST", "GCE_METADATA_HOST", "GCE_METADATA_IP", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"} {
 		if strings.TrimSpace(os.Getenv(override)) != "" {
@@ -453,7 +486,7 @@ func newGCSAckLossReadScope(ctx context.Context, source gcsRecoverySource, deplo
 	if err != nil || strings.Trim(basePrefix, "/") != basePrefix || path.Clean(basePrefix) != basePrefix || path.Join(basePrefix, source.ClusterID) != source.Prefix {
 		return result, fmt.Errorf("captured GCS data prefix is not canonical")
 	}
-	result = gcsAckLossReadScope{Bucket: bucket, Prefix: authorityPrefix, CredentialsJSON: credentials, CredentialsPath: credentialsPath}
+	result = gcsAckLossReadScope{Bucket: bucket, Prefix: authorityPrefix, CredentialsJSON: credentials, CredentialsPath: credentialsPath, SharedWriterIdentity: sharedWriterIdentity}
 	return result, nil
 }
 
@@ -651,7 +684,8 @@ func qualifyGCSHAAckLoss(ctx context.Context) (resultErr error) {
 		return err
 	}
 	private := gcsAckLossPrivateEvidence{Version: 1, BaselineAck: baselineAck, FaultReceipt: receipt, CanonicalObservation: observation, Object: objectEvidence,
-		FirstRecovery: gcsRecoveryEvidence(first), SecondRecovery: gcsRecoveryEvidence(second), SecondAck: secondAck}
+		FirstRecovery: gcsRecoveryEvidence(first), SecondRecovery: gcsRecoveryEvidence(second), SecondAck: secondAck,
+		ObserverSharedWriterIdentity: readScope.SharedWriterIdentity}
 	if err := writePrivateAckLossEvidence(out, private); err != nil {
 		return err
 	}

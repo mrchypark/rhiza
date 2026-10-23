@@ -134,13 +134,19 @@ the existing command directly with the binary for your host:
 This requires the GCS run inputs in [`../chaos/README.md`](../chaos/README.md),
 including `RHIZA_KUBE_CONTEXT`, `RHIZA_NAMESPACE`, `RHIZA_RUN_ID`,
 `RHIZA_APP_IMAGE`, `RHIZA_OPERATOR_IMAGE`, `RHIZA_GCP_PROJECT_ID`, and
-`RHIZA_DATA_GSA_ID`. It also requires a distinct read-only observer identity
+`RHIZA_DATA_GSA_ID`. By default, it requires a distinct observer identity
 provided through `RHIZA_GCS_AUTHORITY_READONLY_CREDENTIALS_FILE` and
-`RHIZA_GCS_AUTHORITY_READER_EMAIL`; the driver rejects writer-credential
-fallback. Before fault injection, separately verify that this identity has
-read access to the selected authority and source-object scopes and no
-write/delete grants. The driver does not verify least-privilege IAM. Keep all
-credential values out of shell history, logs, source control, and artifacts.
+`RHIZA_GCS_AUTHORITY_READER_EMAIL`; writer-credential reuse is rejected. For an
+explicitly approved observer run using the existing data-writer credential,
+set `RHIZA_GCS_ALLOW_WRITER_OBSERVER=yes` and point those two observer settings
+at the writer credential file and its exact service-account email. This opt-in
+defaults off and does not change IAM. The observer client still requests the
+GCS read-only OAuth scope, and its bucket wrapper rejects uploads/deletes; this
+does not prove that the identity lacks write permissions in IAM or establish
+an independent observer principal. Before fault injection, ensure the
+credential can read the selected canonical authority and source-object scopes.
+Keep all credential values out of shell history, logs, source control, and
+artifacts.
 
 Keep the raw `FENCING_E2E_OUT` tree private. For a public packet, record the
 actual exit code in `actual-exit.txt`, the verified source SHA in
