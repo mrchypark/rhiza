@@ -58,8 +58,31 @@ func (b *frozenSourceWriteTrackingBucket) DeleteVersion(ctx context.Context, nam
 	return deleter.DeleteVersion(ctx, name, version)
 }
 
+func newFrozenSealableArchive(t *testing.T) (context.Context, objstore.Bucket, *quepaxa.Core, *Manager) {
+	t.Helper()
+	ctx := context.Background()
+	wal, err := qlog.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = wal.Close() })
+	core, err := quepaxa.New(quepaxa.Config{NodeID: "n1", Cluster: quepaxa.Cluster{ConfigID: ArchiveConfigID, Members: []quepaxa.Member{{ID: "n1"}}}, WAL: wal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := core.Propose(ctx, policySQL(t, "CREATE TABLE frozen_source (value TEXT)")); err != nil {
+		t.Fatal(err)
+	}
+	bucket := objstore.NewInMemBucket()
+	archive := NewManager(bucket, "cluster", ArchiveConfigID)
+	if err := archive.SyncThrough(ctx, core, core.Tip()); err != nil {
+		t.Fatal(err)
+	}
+	return ctx, bucket, core, archive
+}
+
 func TestForkFrozenSourceCopiesWithoutSourceWritesAndBindsEnvironment(t *testing.T) {
-	ctx, bucket, _, archive := newSealableArchive(t)
+	ctx, bucket, _, archive := newFrozenSealableArchive(t)
 	defer archive.Close()
 
 	tracked := &frozenSourceWriteTrackingBucket{Bucket: bucket, prefix: "cluster"}
@@ -119,7 +142,7 @@ func TestForkFrozenSourceCopiesWithoutSourceWritesAndBindsEnvironment(t *testing
 func TestForkFrozenSourceRejectsCachedResultDetachedFromFrontier(t *testing.T) {
 	for _, field := range []string{"tip", "manifest"} {
 		t.Run(field, func(t *testing.T) {
-			ctx, bucket, _, archive := newSealableArchive(t)
+			ctx, bucket, _, archive := newFrozenSealableArchive(t)
 			defer archive.Close()
 			options := frozenForkTestOptions(t)
 			if _, err := ForkFrozenSource(ctx, bucket, options); err != nil {
@@ -152,7 +175,7 @@ func TestForkFrozenSourceRejectsCachedResultDetachedFromFrontier(t *testing.T) {
 func TestFrozenGenerationAnchorBindsSourceTipAndManifestToFrontier(t *testing.T) {
 	for _, field := range []string{"tip", "manifest"} {
 		t.Run(field, func(t *testing.T) {
-			ctx, bucket, _, archive := newSealableArchive(t)
+			ctx, bucket, _, archive := newFrozenSealableArchive(t)
 			defer archive.Close()
 			options := frozenForkTestOptions(t)
 			if _, err := ForkFrozenSource(ctx, bucket, options); err != nil {
@@ -186,7 +209,7 @@ func TestFrozenGenerationAnchorBindsSourceTipAndManifestToFrontier(t *testing.T)
 func TestForkFrozenSourceFailsWhenCapturedExtentIsMissingOrChanged(t *testing.T) {
 	for _, mutation := range []string{"missing", "changed"} {
 		t.Run(mutation, func(t *testing.T) {
-			ctx, bucket, _, archive := newSealableArchive(t)
+			ctx, bucket, _, archive := newFrozenSealableArchive(t)
 			defer archive.Close()
 			options := frozenForkTestOptions(t)
 			result, err := ForkFrozenSource(ctx, bucket, options)
@@ -383,7 +406,7 @@ func extentObjectKeyFromFrozen(extent FrozenExtent) string {
 }
 
 func TestForkFrozenSourceArbitratesConcurrentOperationsForOneStableTarget(t *testing.T) {
-	ctx, bucket, _, archive := newSealableArchive(t)
+	ctx, bucket, _, archive := newFrozenSealableArchive(t)
 	defer archive.Close()
 	base := frozenForkTestOptions(t)
 	options := []FrozenForkOptions{base, base}
@@ -416,7 +439,7 @@ func TestForkFrozenSourceArbitratesConcurrentOperationsForOneStableTarget(t *tes
 }
 
 func TestForkFrozenSourceStopsWhenBucketEnvironmentChangesDuringCopy(t *testing.T) {
-	ctx, bucket, _, archive := newSealableArchive(t)
+	ctx, bucket, _, archive := newFrozenSealableArchive(t)
 	defer archive.Close()
 
 	options := frozenForkTestOptions(t)
@@ -461,7 +484,7 @@ func TestFrozenTargetIDUsesOnlyStableSourceIdentity(t *testing.T) {
 }
 
 func TestFrozenFrontierRejectsSameBytesAtNewObjectVersion(t *testing.T) {
-	ctx, bucket, _, archive := newSealableArchive(t)
+	ctx, bucket, _, archive := newFrozenSealableArchive(t)
 	defer archive.Close()
 
 	manager := NewManager(bucket, "cluster", ArchiveConfigID)
@@ -513,6 +536,7 @@ func frozenForkTestOptions(t *testing.T) FrozenForkOptions {
 		t.Fatal(err)
 	}
 	targetMembers := []quepaxa.Member{{ID: "n2", PublicKey: testPublicKey("n2")}}
+	environment := FrozenBucketEnvironment{Metageneration: "7", LifecycleDigest: strings.Repeat("d", 64)}
 	return FrozenForkOptions{
 		ForkOptions: ForkOptions{
 			SourcePrefix: "cluster", TargetPrefix: path.Join(path.Dir("cluster"), targetID),
@@ -522,6 +546,12 @@ func frozenForkTestOptions(t *testing.T) FrozenForkOptions {
 			OperationID:      "recovery-op-1",
 		},
 		SourceIdentity: identity, FenceProofDigest: strings.Repeat("b", 64), ClosedRootDigest: strings.Repeat("c", 64),
-		BucketEnvironment: FrozenBucketEnvironment{Metageneration: "7", LifecycleDigest: strings.Repeat("d", 64)},
+		BucketEnvironment: environment,
+		VerifyEnvironment: func(_ context.Context, want FrozenBucketEnvironment) error {
+			if want != environment {
+				return fmt.Errorf("unexpected bucket environment binding")
+			}
+			return nil
+		},
 	}
 }
