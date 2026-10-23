@@ -49,7 +49,7 @@ func TestPrepareInitialHeadFaultBindsFreshNamespaceAndDataScopeBeforeSourceExist
 		t.Fatal(err)
 	}
 	configMapResponse := map[string]any{
-		"metadata": map[string]any{"name": gcsAckLossConfigMapName, "namespace": namespace, "uid": "configmap-uid-fresh",
+		"metadata": map[string]any{"name": gcsAckLossConfigMapName, "namespace": namespace, "uid": "configmap-uid-fresh", "resourceVersion": "17",
 			"labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID}},
 		"immutable": true, "data": map[string]any{"config.json": string(configBytes)},
 	}
@@ -83,12 +83,39 @@ func TestPrepareInitialHeadFaultBindsFreshNamespaceAndDataScopeBeforeSourceExist
 				}},
 			}, "volumes": []any{}}}},
 	}
+	originalDeploymentJSON := writeJSON("deployment-original.json", deployment)
 	deploymentJSON := writeJSON("deployment.json", deployment)
+	containerIndex, args, mounts, volumes, err := ackLossDeploymentTemplate(obj(deployment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalTemplate, err := ackLossPodTemplate(obj(deployment))
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchedArgs := append(append([]any(nil), args...), "--gcs-ack-loss-config-file="+gcsAckLossConfigPath)
+	patchedMounts := append(append([]any(nil), mounts...), obj{"name": gcsAckLossVolumeName, "mountPath": filepath.Dir(gcsAckLossConfigPath), "readOnly": true})
+	patchedVolumes := append(append([]any(nil), volumes...), obj{"name": gcsAckLossVolumeName, "configMap": obj{"name": gcsAckLossConfigMapName, "items": []any{obj{"key": "config.json", "path": "config.json"}}}})
+	patchedTemplate, err := patchAckLossPodTemplate(originalTemplate, containerIndex, patchedArgs, patchedMounts, patchedVolumes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchedDeploymentBytes, err := json.Marshal(deployment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var patchedDeployment map[string]any
+	if err := json.Unmarshal(patchedDeploymentBytes, &patchedDeployment); err != nil {
+		t.Fatal(err)
+	}
+	patchedDeployment["spec"].(map[string]any)["template"] = patchedTemplate
+	patchedDeploymentJSON := writeJSON("deployment-patched.json", patchedDeployment)
 	oldPod := initialHeadTestPod("rhiza-fencer-old", "fencer-pod-old", qualificationRunID)
 	newPod := initialHeadTestPod("rhiza-fencer-new", "fencer-pod-new", qualificationRunID)
 	oldPodsJSON := writeJSON("pods-old.json", map[string]any{"items": []any{oldPod}})
 	newPodsJSON := writeJSON("pods-new.json", map[string]any{"items": []any{newPod}})
 	oldPodJSON := writeJSON("pod-old.json", oldPod)
+	newPodJSON := writeJSON("pod-new.json", newPod)
 	replicaSetJSON := writeJSON("replicaset.json", map[string]any{
 		"metadata": map[string]any{"name": "rhiza-fencer-rs", "uid": "fencer-replicaset-uid", "ownerReferences": []any{
 			map[string]any{"kind": "Deployment", "name": "rhiza-fencer", "uid": "fencer-deployment-uid", "controller": true},
@@ -106,7 +133,15 @@ if [ "$5" = "create" ] && [ "$6" = "-f" ]; then
   : > %q
   exit 0
 fi
-if [ "$5" = "patch" ] || [ "$5" = "rollout" ]; then exit 0; fi
+if [ "$5" = "patch" ]; then
+  case "$*" in
+    *gcs-ack-loss-config-file*) cp %q %q ;;
+    *) cp %q %q ;;
+  esac
+  : > %q
+  exit 0
+fi
+if [ "$5" = "rollout" ]; then exit 0; fi
 if [ "$5" != "get" ]; then echo "unexpected kubectl operation" >&2; exit 90; fi
 kind=$6
 name=${7:-}
@@ -114,7 +149,7 @@ case "$kind:$name" in
   namespace:rhiza-ha-run-a1b2c3d4) cat %q ;;
   deployment:rhiza-fencer) cat %q ;;
   pods:-o)
-    if [ -f %q ]; then cat %q; else : > %q; cat %q; fi
+    if [ -f %q ]; then cat %q; else cat %q; fi
     ;;
   pod:rhiza-fencer-old) cat %q ;;
   pod:rhiza-fencer-new) cat %q ;;
@@ -126,8 +161,9 @@ case "$kind:$name" in
   statefulset:*|rhizacluster:*) echo "source workload queried before bootstrap" >&2; exit 91 ;;
   *) echo "unexpected kubectl get: $kind $name" >&2; exit 92 ;;
 esac
-`, logPath, manifestCopy, filepath.Join(tmp, "config-created"), namespaceJSON, deploymentJSON,
-		seenPods, newPodsJSON, seenPods, oldPodsJSON, oldPodJSON, newPodsJSON, replicaSetJSON, rhizaConfigJSON,
+`, logPath, manifestCopy, filepath.Join(tmp, "config-created"), patchedDeploymentJSON, deploymentJSON,
+		originalDeploymentJSON, deploymentJSON, seenPods, namespaceJSON, deploymentJSON,
+		seenPods, newPodsJSON, oldPodsJSON, oldPodJSON, newPodJSON, replicaSetJSON, rhizaConfigJSON,
 		gcsAckLossConfigMapName, filepath.Join(tmp, "config-created"), configMapJSON)
 	kubectlPath := filepath.Join(tmp, "kubectl")
 	if err := os.WriteFile(kubectlPath, []byte(script), 0700); err != nil {
@@ -480,13 +516,36 @@ func TestInitialHeadCleanupRestoresOnlyCapturedTemplateAndUIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := string(logBytes)
-	if !strings.Contains(log, `"op":"test","path":"/metadata/uid","value":"original-deployment-uid"`) ||
-		!strings.Contains(log, `"op":"test","path":"/metadata/labels/chaos.rhiza.io~1run","value":"a1b2c3d4"`) ||
-		!strings.Contains(log, `"op":"test","path":"/spec/template","value":`) ||
-		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/containers/0/args","value":["serve"]`) ||
-		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/containers/0/volumeMounts","value":[]`) ||
-		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/volumes","value":[]`) {
+	if !strings.Contains(log, " patch deployment rhiza-fencer --type=json -p ") {
 		t.Fatalf("cleanup did not restore the exact saved template under UID preconditions: %s", log)
+	}
+	patchLine := ""
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, " patch deployment rhiza-fencer --type=json -p ") {
+			patchLine = line
+			break
+		}
+	}
+	patchOffset := strings.Index(patchLine, " -p ")
+	var patch []map[string]any
+	if patchOffset < 0 || json.Unmarshal([]byte(patchLine[patchOffset+4:]), &patch) != nil {
+		t.Fatalf("cleanup patch was not valid JSON Patch: %s", patchLine)
+	}
+	patchHas := func(operation, path string, want any) bool {
+		for _, entry := range patch {
+			if entry["op"] == operation && entry["path"] == path && sameJSON(entry["value"], want) {
+				return true
+			}
+		}
+		return false
+	}
+	if !patchHas("test", "/metadata/uid", "original-deployment-uid") ||
+		!patchHas("test", "/metadata/labels/chaos.rhiza.io~1run", qualificationRunID) ||
+		!patchHas("test", "/spec/template", state.PatchedTemplate) ||
+		!patchHas("replace", "/spec/template/spec/containers/0/args", []any{"serve"}) ||
+		!patchHas("replace", "/spec/template/spec/containers/0/volumeMounts", nil) ||
+		!patchHas("replace", "/spec/template/spec/volumes", nil) {
+		t.Fatalf("cleanup patch did not test the exact saved template and restore captured fields: %s", patchLine)
 	}
 	deleteBody, err := os.ReadFile(deleteBodyPath)
 	if err != nil {

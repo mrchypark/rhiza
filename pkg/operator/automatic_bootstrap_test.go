@@ -164,8 +164,8 @@ func configureAutomaticBootstrapCohort(t *testing.T, f *heldProfileFixture, base
 		runtime.BootID = fmt.Sprintf("boot-%d", i)
 		runtime.RuntimeID = fmt.Sprintf("runtime-%d", i)
 		runtime.SandboxID = fmt.Sprintf("sandbox-%d", i)
-		runtime.ContainerID = fmt.Sprintf("container-%d", i)
-		runtime.ImageID = fmt.Sprintf("image-%d", i)
+		runtime.ContainerID = fmt.Sprintf("containerd://%032x", i+1)
+		runtime.ImageID = fmt.Sprintf("registry.example/rhiza@sha256:%064x", i+1)
 		runtime.BindingUID = automaticBootstrapClusterUID
 		runtime.NamespaceUID = automaticBootstrapNamespaceUID
 		cohort = append(cohort, runtime)
@@ -258,7 +258,7 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 		}
 		asObject(list(podSpec["containers"])[0])["env"] = podEnv
 		status := asObject(list(nested(pod, "status", "containerStatuses"))[0])
-		status["containerID"], status["imageID"] = "containerd://"+runtime.ContainerID, "sha256:"+runtime.ImageID
+		status["containerID"], status["imageID"] = runtime.ContainerID, runtime.ImageID
 		podList = append(podList, pod)
 	}
 	f.api.mu.Lock()
@@ -366,7 +366,7 @@ func TestBootstrapGenesisPreflightRequiresExplicitEligiblePolicyAndExactInventor
 					asObject(f.api.objects[f.e.controller().corePath("pods", "")])["items"] = pods[:len(pods)-1]
 				} else if name == "ready-pod" {
 					conditions := []any{object{"type": "Ready", "status": "True"}}
-					asObject(pods[0])["status"] = object{"containerStatuses": []any{object{"containerID": "containerd://container-0", "imageID": "sha256:image-0"}}, "conditions": conditions}
+					asObject(pods[0])["status"] = object{"containerStatuses": []any{object{"containerID": f.cohort[0].ContainerID, "imageID": f.cohort[0].ImageID}}, "conditions": conditions}
 				} else {
 					pod := asObject(pods[0])
 					switch name {
