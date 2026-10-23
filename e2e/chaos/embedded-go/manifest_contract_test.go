@@ -177,6 +177,9 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"^# This profile is deliberately opt-in:",
+		"hostPID: true",
+		"capabilities:",
+		"drop: [ALL]",
 		"PINNED_RHIZA_FENCER_DEPLOYMENT_UID",
 		"--runtime-agent-ca-file=/runtime-agent-ca/ca.crt",
 		"path: /sys/fs/cgroup",
