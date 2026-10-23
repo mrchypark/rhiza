@@ -490,6 +490,17 @@ func deleteProbeObject(ctx context.Context, kind, name, uid string) error {
 // deleteObjectWithUID uses Kubernetes DeleteOptions rather than a kubectl
 // delete flag: kubectl does not support --preconditions on all pinned versions.
 func deleteObjectWithUID(ctx context.Context, resource, name, uid string) error {
+	return deleteObjectWithPreconditions(ctx, resource, name, uid, "")
+}
+
+func deleteObjectWithUIDAndResourceVersion(ctx context.Context, resource, name, uid, resourceVersion string) error {
+	if resourceVersion == "" {
+		return fmt.Errorf("refusing resourceVersion-preconditioned delete without resourceVersion")
+	}
+	return deleteObjectWithPreconditions(ctx, resource, name, uid, resourceVersion)
+}
+
+func deleteObjectWithPreconditions(ctx context.Context, resource, name, uid, resourceVersion string) error {
 	if name == "" || uid == "" {
 		return fmt.Errorf("refusing UID-preconditioned delete without name and UID")
 	}
@@ -561,10 +572,14 @@ func deleteObjectWithUID(ctx context.Context, resource, name, uid string) error 
 		APIVersion    string `json:"apiVersion"`
 		Kind          string `json:"kind"`
 		Preconditions struct {
-			UID string `json:"uid"`
+			UID             string  `json:"uid"`
+			ResourceVersion *string `json:"resourceVersion,omitempty"`
 		} `json:"preconditions"`
 	}{APIVersion: "v1", Kind: "DeleteOptions"}
 	deleteOptions.Preconditions.UID = uid
+	if resourceVersion != "" {
+		deleteOptions.Preconditions.ResourceVersion = &resourceVersion
+	}
 	body, err := json.Marshal(deleteOptions)
 	if err != nil {
 		return fmt.Errorf("encode Kubernetes UID delete options: %w", err)
@@ -587,7 +602,7 @@ func deleteObjectWithUID(ctx context.Context, resource, name, uid string) error 
 }
 
 func probeDeletePath(namespace, resource, name string) (string, error) {
-	apiPrefix := map[string]string{"pods": "/api/v1", "statefulsets": "/apis/apps/v1"}[resource]
+	apiPrefix := map[string]string{"pods": "/api/v1", "configmaps": "/api/v1", "statefulsets": "/apis/apps/v1"}[resource]
 	if apiPrefix == "" {
 		return "", fmt.Errorf("unsupported UID-preconditioned delete resource %q", resource)
 	}

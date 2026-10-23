@@ -42,7 +42,7 @@ var gcsAckLossExtentKey = regexp.MustCompile(`^archive/blocks/[a-f0-9]{64}_[0-9]
 // installGCSAckLossConfig opts only the run-owned fencer Deployment into the
 // one-shot exact-dispatch fault. The ConfigMap has no credentials and is
 // removed only after the original Deployment template has been restored.
-func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, config operator.GCSMutationAckLossConfig, out string) (string, func(context.Context) error, error) {
+func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, config operator.GCSMutationAckLossConfig, out string, expectedTemplates ...obj) (string, func(context.Context) error, error) {
 	if err := config.Validate(); err != nil {
 		return "", nil, err
 	}
@@ -64,6 +64,9 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 		text(nested(deployment, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID || nested(deployment, "spec", "replicas") != float64(1) {
 		return "", nil, fmt.Errorf("refusing to alter a fencer Deployment outside this run")
 	}
+	if len(expectedTemplates) > 1 || len(expectedTemplates) == 1 && !sameJSON(nested(deployment, "spec", "template"), expectedTemplates[0]) {
+		return "", nil, fmt.Errorf("fencer Pod template changed after initial-HEAD restore state was captured")
+	}
 	oldFencerPod, err := get(ctx, "pod", source.FencerPod)
 	if err != nil || text(nested(oldFencerPod, "metadata", "namespace")) != namespace ||
 		text(nested(oldFencerPod, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID ||
@@ -78,6 +81,17 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 		return "", nil, err
 	}
 	containerIndex, args, mounts, volumes, err := ackLossDeploymentTemplate(deployment)
+	if err != nil {
+		return "", nil, err
+	}
+	patchedArgs := append(append([]any(nil), args...), "--gcs-ack-loss-config-file="+gcsAckLossConfigPath)
+	patchedMounts := append(append([]any(nil), mounts...), obj{"name": gcsAckLossVolumeName, "mountPath": filepath.Dir(gcsAckLossConfigPath), "readOnly": true})
+	patchedVolumes := append(append([]any(nil), volumes...), obj{"name": gcsAckLossVolumeName, "configMap": obj{"name": gcsAckLossConfigMapName, "items": []any{obj{"key": "config.json", "path": "config.json"}}}})
+	originalTemplate, err := ackLossPodTemplate(deployment)
+	if err != nil {
+		return "", nil, err
+	}
+	patchedTemplate, err := patchAckLossPodTemplate(originalTemplate, containerIndex, patchedArgs, patchedMounts, patchedVolumes)
 	if err != nil {
 		return "", nil, err
 	}
@@ -129,17 +143,15 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 		return "", nil, fmt.Errorf("created acknowledgement-loss ConfigMap has no UID")
 	}
 
-	patchedArgs := append(append([]any(nil), args...), "--gcs-ack-loss-config-file="+gcsAckLossConfigPath)
-	patchedMounts := append(append([]any(nil), mounts...), obj{"name": gcsAckLossVolumeName, "mountPath": filepath.Dir(gcsAckLossConfigPath), "readOnly": true})
-	patchedVolumes := append(append([]any(nil), volumes...), obj{"name": gcsAckLossVolumeName, "configMap": obj{"name": gcsAckLossConfigMapName, "items": []any{obj{"key": "config.json", "path": "config.json"}}}})
-	patch := ackLossDeploymentPatch(deploymentUID, containerIndex, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes)
+	patch := ackLossDeploymentPatchWithTemplate(deploymentUID, qualificationRunID, containerIndex, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes, originalTemplate)
 	if _, err := kubectl(ctx, "patch", "deployment", "rhiza-fencer", "--type=json", "-p", string(encoded(patch))); err != nil {
 		current, readErr := get(ctx, "deployment", "rhiza-fencer")
-		if readErr == nil && text(nested(current, "metadata", "uid")) == deploymentUID {
-			currentIndex, currentArgs, currentMounts, currentVolumes, templateErr := ackLossDeploymentTemplate(current)
-			if templateErr == nil && currentIndex == containerIndex && sameJSON(currentArgs, patchedArgs) && sameJSON(currentMounts, patchedMounts) && sameJSON(currentVolumes, patchedVolumes) {
+		if readErr == nil && text(nested(current, "metadata", "uid")) == deploymentUID &&
+			text(nested(current, "metadata", "labels", "chaos.rhiza.io/run")) == qualificationRunID {
+			currentIndex, currentArgs, currentMounts, currentVolumes, templateErr := readAckLossDeploymentTemplate(current)
+			if templateErr == nil && currentIndex == containerIndex && sameJSON(nested(current, "spec", "template"), patchedTemplate) && sameJSON(currentArgs, patchedArgs) && sameJSON(currentMounts, patchedMounts) && sameJSON(currentVolumes, patchedVolumes) {
 				cleanupCtx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-				cleanupErr := restoreAckLossDeployment(cleanupCtx, deploymentUID, containerIndex, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes)
+				cleanupErr := restoreAckLossDeployment(cleanupCtx, deploymentUID, containerIndex, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes, originalTemplate, patchedTemplate)
 				if cleanupErr == nil {
 					_, cleanupErr = kubectl(cleanupCtx, "rollout", "status", "deployment/rhiza-fencer", "--timeout=120s")
 				}
@@ -149,7 +161,7 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 				cancel()
 				return "", nil, errors.Join(fmt.Errorf("fencer patch response was lost after applying the exact template: %w", err), cleanupErr)
 			}
-			if templateErr == nil && currentIndex == containerIndex && sameJSON(currentArgs, args) && sameJSON(currentMounts, mounts) && sameJSON(currentVolumes, volumes) {
+			if templateErr == nil && currentIndex == containerIndex && sameJSON(nested(current, "spec", "template"), originalTemplate) && sameJSON(currentArgs, args) && sameJSON(currentMounts, mounts) && sameJSON(currentVolumes, volumes) {
 				cleanupErr := deleteAckLossConfigMapExact(ctx, configUID, gcsInitialHeadDigest(configBytes))
 				return "", nil, errors.Join(fmt.Errorf("patch run-owned fencer Deployment for acknowledgement-loss qualification: %w", err), cleanupErr)
 			}
@@ -164,11 +176,14 @@ func installGCSAckLossConfig(ctx context.Context, source gcsRecoverySource, conf
 		if text(nested(current, "metadata", "uid")) != deploymentUID || text(nested(current, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID {
 			return fmt.Errorf("fencer Deployment UID changed; leaving qualification config for operator cleanup")
 		}
-		currentIndex, currentArgs, currentMounts, currentVolumes, err := ackLossDeploymentTemplate(current)
-		if err != nil || currentIndex != containerIndex || !sameJSON(currentArgs, patchedArgs) || !sameJSON(currentMounts, patchedMounts) || !sameJSON(currentVolumes, patchedVolumes) {
-			return fmt.Errorf("fencer Deployment template changed during qualification; refusing to overwrite it: %w", err)
+		currentIndex, currentArgs, currentMounts, currentVolumes, err := readAckLossDeploymentTemplate(current)
+		if err != nil {
+			return fmt.Errorf("read fencer Deployment template before restore: %w", err)
 		}
-		restorePatch := ackLossDeploymentPatch(deploymentUID, containerIndex, patchedArgs, patchedMounts, patchedVolumes, args, mounts, volumes)
+		if currentIndex != containerIndex || !sameJSON(nested(current, "spec", "template"), patchedTemplate) || !sameJSON(currentArgs, patchedArgs) || !sameJSON(currentMounts, patchedMounts) || !sameJSON(currentVolumes, patchedVolumes) {
+			return fmt.Errorf("fencer Deployment template changed during qualification; refusing to overwrite it")
+		}
+		restorePatch := ackLossDeploymentPatchWithTemplate(deploymentUID, qualificationRunID, containerIndex, patchedArgs, patchedMounts, patchedVolumes, args, mounts, volumes, patchedTemplate)
 		if _, err := kubectl(cleanupCtx, "patch", "deployment", "rhiza-fencer", "--type=json", "-p", string(encoded(restorePatch))); err != nil {
 			return fmt.Errorf("restore fencer Deployment template: %w", err)
 		}
@@ -780,6 +795,35 @@ func validateAckLossFencerStorageConfig(ctx context.Context, deployment obj, sou
 }
 
 func ackLossDeploymentTemplate(deployment obj) (int, []any, []any, []any, error) {
+	index, args, mounts, volumes, err := readAckLossDeploymentTemplate(deployment)
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+	for _, arg := range args {
+		if strings.HasPrefix(text(arg), "--gcs-ack-loss-config-file=") {
+			return 0, nil, nil, nil, fmt.Errorf("fencer already has an acknowledgement-loss config")
+		}
+	}
+	for _, mount := range mounts {
+		m, ok := ackLossObject(mount)
+		if !ok {
+			return 0, nil, nil, nil, fmt.Errorf("fencer Deployment contains a malformed volume mount")
+		}
+		if text(m["name"]) == gcsAckLossVolumeName || text(m["mountPath"]) == filepath.Dir(gcsAckLossConfigPath) {
+			return 0, nil, nil, nil, fmt.Errorf("fencer already uses acknowledgement-loss config mount")
+		}
+	}
+	for _, volume := range volumes {
+		if text(nested(volume, "name")) == gcsAckLossVolumeName {
+			return 0, nil, nil, nil, fmt.Errorf("fencer already uses acknowledgement-loss config volume")
+		}
+	}
+	return index, args, mounts, volumes, nil
+}
+
+// readAckLossDeploymentTemplate extracts a structurally valid template. Callers
+// that inspect an armed template must compare all fields with their saved patch.
+func readAckLossDeploymentTemplate(deployment obj) (int, []any, []any, []any, error) {
 	containers, ok := ackLossArray(nested(deployment, "spec", "template", "spec", "containers"))
 	if !ok {
 		return 0, nil, nil, nil, fmt.Errorf("fencer Deployment has no container list")
@@ -802,11 +846,6 @@ func ackLossDeploymentTemplate(deployment obj) (int, []any, []any, []any, error)
 		if !ok || len(args) == 0 || text(args[0]) != "serve" {
 			return 0, nil, nil, nil, fmt.Errorf("fencer authority container is not running the expected serve command")
 		}
-		for _, arg := range args {
-			if strings.HasPrefix(text(arg), "--gcs-ack-loss-config-file=") {
-				return 0, nil, nil, nil, fmt.Errorf("fencer already has an acknowledgement-loss config")
-			}
-		}
 		mounts, ok = ackLossArray(container["volumeMounts"])
 		if !ok {
 			return 0, nil, nil, nil, fmt.Errorf("fencer authority volume mounts are unavailable")
@@ -818,20 +857,6 @@ func ackLossDeploymentTemplate(deployment obj) (int, []any, []any, []any, error)
 	volumes, ok := ackLossArray(nested(deployment, "spec", "template", "spec", "volumes"))
 	if !ok {
 		return 0, nil, nil, nil, fmt.Errorf("fencer Deployment volume list is unavailable")
-	}
-	for _, mount := range mounts {
-		m, ok := ackLossObject(mount)
-		if !ok {
-			return 0, nil, nil, nil, fmt.Errorf("fencer Deployment contains a malformed volume mount")
-		}
-		if text(m["name"]) == gcsAckLossVolumeName || text(m["mountPath"]) == filepath.Dir(gcsAckLossConfigPath) {
-			return 0, nil, nil, nil, fmt.Errorf("fencer already uses acknowledgement-loss config mount")
-		}
-	}
-	for _, volume := range volumes {
-		if text(nested(volume, "name")) == gcsAckLossVolumeName {
-			return 0, nil, nil, nil, fmt.Errorf("fencer already uses acknowledgement-loss config volume")
-		}
 	}
 	return index, append([]any(nil), args...), append([]any(nil), mounts...), append([]any(nil), volumes...), nil
 }
@@ -848,6 +873,63 @@ func ackLossDeploymentPatch(uid string, index int, oldArgs, oldMounts, oldVolume
 		obj{"op": "replace", "path": container + "/volumeMounts", "value": newMounts},
 		obj{"op": "replace", "path": base + "/volumes", "value": newVolumes},
 	}
+}
+
+func ackLossDeploymentPatchWithTemplate(uid, runID string, index int, oldArgs, oldMounts, oldVolumes, newArgs, newMounts, newVolumes []any, expectedTemplate obj) []any {
+	patch := ackLossDeploymentPatch(uid, index, oldArgs, oldMounts, oldVolumes, newArgs, newMounts, newVolumes)
+	result := make([]any, 0, len(patch)+2)
+	result = append(result, patch[0], obj{"op": "test", "path": "/metadata/labels/chaos.rhiza.io~1run", "value": runID},
+		obj{"op": "test", "path": "/spec/template", "value": expectedTemplate})
+	return append(result, patch[1:]...)
+}
+
+func ackLossPodTemplate(deployment obj) (obj, error) {
+	template, ok := ackLossObject(nested(deployment, "spec", "template"))
+	if !ok {
+		return nil, fmt.Errorf("fencer Deployment Pod template is malformed")
+	}
+	data, err := json.Marshal(template)
+	if err != nil {
+		return nil, err
+	}
+	var snapshot obj
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil, fmt.Errorf("copy fencer Deployment Pod template: %w", err)
+	}
+	if snapshot == nil {
+		return nil, fmt.Errorf("copy fencer Deployment Pod template: snapshot is not an object")
+	}
+	return snapshot, nil
+}
+
+func patchAckLossPodTemplate(template obj, index int, args, mounts, volumes []any) (obj, error) {
+	data, err := json.Marshal(template)
+	if err != nil {
+		return nil, err
+	}
+	var patched obj
+	if err := json.Unmarshal(data, &patched); err != nil {
+		return nil, fmt.Errorf("copy fencer Pod template for qualification: %w", err)
+	}
+	if patched == nil {
+		return nil, fmt.Errorf("copy fencer Pod template for qualification: snapshot is not an object")
+	}
+	spec, ok := ackLossObject(patched["spec"])
+	if !ok {
+		return nil, fmt.Errorf("fencer Pod template spec is malformed")
+	}
+	containers, ok := ackLossArray(spec["containers"])
+	if !ok || index < 0 || index >= len(containers) {
+		return nil, fmt.Errorf("fencer Pod template container index is invalid")
+	}
+	container, ok := ackLossObject(containers[index])
+	if !ok || text(container["name"]) != "authority" {
+		return nil, fmt.Errorf("fencer Pod template authority container changed")
+	}
+	container["args"] = args
+	container["volumeMounts"] = mounts
+	spec["volumes"] = volumes
+	return patched, nil
 }
 
 func waitAckLossFencerRestart(ctx context.Context, oldPodName, oldPodUID, deploymentUID string) (string, error) {
@@ -926,13 +1008,13 @@ func deleteAckLossConfigMapExact(ctx context.Context, uid, expectedDigest string
 		return err
 	}
 	configBytes := []byte(text(nested(current, "data", "config.json")))
+	resourceVersion := text(nested(current, "metadata", "resourceVersion"))
 	if uid == "" || text(nested(current, "metadata", "uid")) != uid || text(nested(current, "metadata", "namespace")) != namespace ||
 		text(nested(current, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID || nested(current, "immutable") != true ||
-		(expectedDigest != "" && gcsInitialHeadDigest(configBytes) != expectedDigest) {
+		resourceVersion == "" || (expectedDigest != "" && gcsInitialHeadDigest(configBytes) != expectedDigest) {
 		return fmt.Errorf("acknowledgement-loss ConfigMap identity changed; refusing deletion")
 	}
-	_, err = kubectl(ctx, "delete", "configmap", gcsAckLossConfigMapName, "--wait=true", "--preconditions=uid="+uid)
-	return err
+	return deleteObjectWithUIDAndResourceVersion(ctx, "configmaps", gcsAckLossConfigMapName, uid, resourceVersion)
 }
 
 func writePrivateAckLossConfig(dir string, data []byte) (string, error) {
@@ -986,7 +1068,7 @@ func sameJSON(left, right any) bool {
 	return errA == nil && errB == nil && string(a) == string(b)
 }
 
-func restoreAckLossDeployment(ctx context.Context, uid string, index int, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes []any) error {
+func restoreAckLossDeployment(ctx context.Context, uid string, index int, args, mounts, volumes, patchedArgs, patchedMounts, patchedVolumes []any, templates ...obj) error {
 	current, err := get(ctx, "deployment", "rhiza-fencer")
 	if err != nil {
 		return err
@@ -994,11 +1076,31 @@ func restoreAckLossDeployment(ctx context.Context, uid string, index int, args, 
 	if text(nested(current, "metadata", "uid")) != uid || text(nested(current, "metadata", "labels", "chaos.rhiza.io/run")) != qualificationRunID {
 		return fmt.Errorf("fencer Deployment identity changed before restore")
 	}
-	currentIndex, currentArgs, currentMounts, currentVolumes, err := ackLossDeploymentTemplate(current)
-	if err != nil || currentIndex != index || !sameJSON(currentArgs, patchedArgs) || !sameJSON(currentMounts, patchedMounts) || !sameJSON(currentVolumes, patchedVolumes) {
-		return fmt.Errorf("fencer template differs from the exact applied qualification template: %w", err)
+	if len(templates) != 2 || templates[0] == nil || templates[1] == nil {
+		return fmt.Errorf("fencer restore requires saved full Pod template snapshots")
 	}
-	patch := ackLossDeploymentPatch(uid, index, patchedArgs, patchedMounts, patchedVolumes, args, mounts, volumes)
+	originalIndex, originalArgs, originalMounts, originalVolumes, err := ackLossDeploymentTemplate(obj{"spec": obj{"template": templates[0]}})
+	if err != nil {
+		return fmt.Errorf("validate saved original fencer Pod template: %w", err)
+	}
+	if originalIndex != index || !sameJSON(originalArgs, args) || !sameJSON(originalMounts, mounts) || !sameJSON(originalVolumes, volumes) {
+		return fmt.Errorf("saved original fencer Pod template does not match its captured container fields")
+	}
+	expectedPatched, err := patchAckLossPodTemplate(templates[0], index, patchedArgs, patchedMounts, patchedVolumes)
+	if err != nil {
+		return fmt.Errorf("reconstruct saved fencer qualification template: %w", err)
+	}
+	if !sameJSON(expectedPatched, templates[1]) {
+		return fmt.Errorf("saved fencer Pod template snapshots do not describe the exact qualification patch")
+	}
+	currentIndex, currentArgs, currentMounts, currentVolumes, err := readAckLossDeploymentTemplate(current)
+	if err != nil {
+		return fmt.Errorf("read current fencer Pod template before restore: %w", err)
+	}
+	if currentIndex != index || !sameJSON(nested(current, "spec", "template"), templates[1]) || !sameJSON(currentArgs, patchedArgs) || !sameJSON(currentMounts, patchedMounts) || !sameJSON(currentVolumes, patchedVolumes) {
+		return fmt.Errorf("fencer template differs from the exact applied qualification template")
+	}
+	patch := ackLossDeploymentPatchWithTemplate(uid, qualificationRunID, index, patchedArgs, patchedMounts, patchedVolumes, args, mounts, volumes, templates[1])
 	if _, err := kubectl(ctx, "patch", "deployment", "rhiza-fencer", "--type=json", "-p", string(encoded(patch))); err != nil {
 		return err
 	}
