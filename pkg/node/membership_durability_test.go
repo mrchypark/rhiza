@@ -13,11 +13,31 @@ func TestMembershipRetryDurablyPublishesCommittedConfiguration(t *testing.T) {
 	ctx := context.Background()
 	n, identities, bucket, transport := newMembershipOperationNode(t)
 	transport.disable("c")
+	if _, _, err := n.core.Propose(ctx, []byte("membership durability baseline")); err != nil {
+		t.Fatalf("commit preexisting archive baseline: %v", err)
+	}
+	baselineTip := n.core.Tip()
+	if _, ok := n.core.CertifiedValue(baselineTip); !ok {
+		t.Fatalf("baseline slot %d is not certified", baselineTip)
+	}
+	if err := n.core.EnsureDurableThrough(ctx, baselineTip); err != nil {
+		t.Fatalf("make preexisting archive baseline locally durable: %v", err)
+	}
+	if err := n.archive.SyncThrough(ctx, n.core, baselineTip); err != nil {
+		t.Fatalf("publish preexisting archive baseline: %v", err)
+	}
+	if got := n.archive.Tip(); got != baselineTip {
+		t.Fatalf("preexisting archive tip=%d, want certified baseline %d", got, baselineTip)
+	}
+
 	faults := &failFirstArchiveHeadUploadBucket{Bucket: bucket}
 	n.archive.Close()
 	n.archive = recovery.NewManager(faults, "cluster", 1)
 	if err := n.archive.Load(ctx); err != nil {
 		t.Fatalf("load archive before mutation: %v", err)
+	}
+	if got := n.archive.Tip(); got != baselineTip {
+		t.Fatalf("fault-wrapped archive tip=%d, want existing baseline %d", got, baselineTip)
 	}
 	t.Cleanup(n.archive.Close)
 
