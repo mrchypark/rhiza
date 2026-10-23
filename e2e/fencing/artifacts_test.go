@@ -141,13 +141,17 @@ func TestRuntimeAgentDiagnosticsRejectUnallowlistedOrExcessivePairs(t *testing.T
 	}
 }
 
-func TestRuntimeAgentDiagnosticsAllowRuntimeProfileAndBindingFailures(t *testing.T) {
+func TestRuntimeAgentDiagnosticsAllowRuntimeProfileBindingAndCgroupPathFailures(t *testing.T) {
 	view := fencerDiagnosticsView{}
 	view.RuntimeAgent.PodName = "rhiza-runtime-agent-abc"
 	view.RuntimeAgent.PodUID = "runtime-agent-pod-uid"
 	view.RuntimeAgent.Logs.Captured = true
 	view.RuntimeAgent.Logs.SHA256 = strings.Repeat("a", 64)
-	for _, code := range []string{"runtime_api_unavailable", "runtime_binding_invalid"} {
+	for _, code := range []string{
+		"runtime_api_unavailable", "runtime_binding_invalid",
+		"process_cgroup_path_root", "process_cgroup_path_absolute", "process_cgroup_path_dot",
+		"process_cgroup_path_noncanonical", "process_cgroup_path_traversal",
+	} {
 		view.RuntimeAgent.Diagnostics = []runtimeAgentEnrollmentDiagnostic{{Stage: "cri_enroll", Code: code}}
 		if _, err := safeJSON("fencer-diagnostics.json", encoded(view)); err != nil {
 			t.Errorf("allowlisted CRI enrollment code %q was rejected: %v", code, err)

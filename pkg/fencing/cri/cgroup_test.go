@@ -102,16 +102,32 @@ func TestCaptureCgroupScopeRejectsMissingOrEscapingIdentity(t *testing.T) {
 	root := t.TempDir()
 	proc := filepath.Join(root, "proc")
 	cgroups := filepath.Join(root, "cgroup")
-	binding := testRuntimeBinding()
-	for _, value := range []string{"2:cpu:/kubepods/pod-a\n", "0::/../outside\n", "0::/missing\n"} {
-		writeProcIdentity(t, proc, 123, 789, strings.TrimPrefix(value, "0::/"))
-		if strings.HasPrefix(value, "2:") {
-			if err := os.WriteFile(filepath.Join(proc, "123", "cgroup"), []byte(value), 0600); err != nil {
+	for _, tc := range []struct {
+		name, contents, want string
+	}{
+		{name: "root", contents: "0::/\n", want: "(root)"},
+		{name: "absolute", contents: "0:://outside\n", want: "(absolute)"},
+		{name: "dot", contents: "0::/kubepods/./pod-a\n", want: "(dot)"},
+		{name: "noncanonical", contents: "0::/kubepods//pod-a\n", want: "(noncanonical)"},
+		{name: "traversal", contents: "0::/kubepods/../outside\n", want: "(traversal)"},
+		{name: "missing unified entry", contents: "2:cpu:/kubepods/pod-a\n", want: "unified cgroup path missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeProcIdentity(t, proc, 123, 789, "kubepods/pod-a")
+			if err := os.WriteFile(filepath.Join(proc, "123", "cgroup"), []byte(tc.contents), 0600); err != nil {
 				t.Fatal(err)
 			}
-		}
-		if _, err := captureCgroupScope(proc, cgroups, 123, binding, "qualified-test-profile"); err == nil {
-			t.Fatalf("unsafe or missing cgroup identity accepted: %q", value)
-		}
+			_, err := processCgroupPath(proc, 123)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("processCgroupPath() error = %v, want category %q", err, tc.want)
+			}
+		})
+	}
+
+	// Rejected paths must remain un-enrollable, even though the diagnostic now
+	// carries a stable category.
+	writeProcIdentity(t, proc, 123, 789, "kubepods/../outside")
+	if _, err := captureCgroupScope(proc, cgroups, 123, testRuntimeBinding(), "qualified-test-profile"); err == nil {
+		t.Fatal("escaping cgroup identity was accepted")
 	}
 }

@@ -494,7 +494,8 @@ seal_independent_workload_identity() {
       "$RHIZA_AUTH_STATE/workload-ksa-identity.json" "$RHIZA_AUTH_STATE/operator-ksa-identity.json" \
       "$RHIZA_AUTH_STATE/fencer-ksa-identity.json" "$RHIZA_AUTH_STATE/data-folder-before.json" \
       "$RHIZA_AUTH_STATE/data-folder-after.json" "$RHIZA_AUTH_STATE/control-folder-before.json" \
-      "$RHIZA_AUTH_STATE/control-folder-after.json"; do
+      "$RHIZA_AUTH_STATE/control-folder-after.json" "$RHIZA_AUTH_STATE/folder-before.json" \
+      "$RHIZA_AUTH_STATE/folder-after.json"; do
         [ -f "$live_receipt" ] && [ ! -L "$live_receipt" ] || die 'Independent workload identity receipts missing'
     done
     [ ! -e "$RHIZA_AUTH_STATE/workload-identity.json" ] && [ ! -e "$RHIZA_AUTH_STATE/workload-identity.sha256" ] || die 'Workload identity receipt collision'
@@ -536,16 +537,27 @@ seal_independent_workload_identity() {
       (.bindings[0].members|sort)==([$operator,$fencer]|sort) and
       .bindings[0].condition=={title:$title,expression:$expression}
     ' "$RHIZA_AUTH_STATE/data-wi-after.json" >/dev/null || die 'Writer GSA binding does not exactly match operator and fencer KSAs'
-    jq -e --arg readonly "$readonly_email" --arg prefix "$data_prefix" '
+    jq -e --arg readonly "$readonly_email" --arg writer "$data" \
+      --arg role "projects/$project/roles/$folder_role" --arg prefix "$data_prefix" \
+      --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
+      (.bindings|type)=="array" and (.bindings|length)==2 and
+      (.resourceId|endswith("/managedFolders/"+$prefix)) and
+      any(.bindings[]; .role=="roles/storage.objectViewer" and .members==[$readonly] and .condition==null) and
+      any(.bindings[]; .role==$role and .members==[$writer] and
+        .condition=={title:$title,expression:$expression})
+    ' "$RHIZA_AUTH_STATE/data-folder-after.json" >/dev/null || die 'Writer/reader IAM grants are not exact on the data child folder'
+    jq -e --arg writer "$data" --arg role "projects/$project/roles/$folder_role" \
+      --arg prefix "$control_prefix" --arg title "rhiza-$RHIZA_RUN_ID-expiry" \
+      --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '
       (.bindings|type)=="array" and (.bindings|length)==1 and
-      .bindings[0].role=="roles/storage.objectViewer" and (.bindings[0].members|sort)==([$readonly]|sort) and
-      (.bindings[0].condition==null) and (.resourceId|endswith("/managedFolders/"+$prefix))
-    ' "$RHIZA_AUTH_STATE/data-folder-after.json" >/dev/null || die 'Read-only IAM grant is not limited to the data child folder'
-    jq -e --arg readonly "$readonly_email" '
-      all((.bindings // [])[]; ((.members // [])|index($readonly))==null)
-    ' "$RHIZA_AUTH_STATE/control-folder-after.json" >/dev/null || die 'Read-only GSA gained a control-folder binding'
-    jq -e --slurpfile before "$RHIZA_AUTH_STATE/control-folder-before.json" '.bindings==$before[0].bindings' \
-      "$RHIZA_AUTH_STATE/control-folder-after.json" >/dev/null || die 'Control-folder IAM policy changed during bootstrap'
+      (.resourceId|endswith("/managedFolders/"+$prefix)) and
+      .bindings[0].role==$role and .bindings[0].members==[$writer] and
+      .bindings[0].condition=={title:$title,expression:$expression}
+    ' "$RHIZA_AUTH_STATE/control-folder-after.json" >/dev/null || die 'Writer IAM grant is not exact on the control child folder'
+    jq -e --slurpfile before "$RHIZA_AUTH_STATE/folder-before.json" \
+      '.bindings==$before[0].bindings' "$RHIZA_AUTH_STATE/folder-after.json" >/dev/null ||
+      die 'Writer IAM grant escaped the DATA/CONTROL child folders'
     workload_uid=$(jq -r '.metadata.uid' "$RHIZA_AUTH_STATE/workload-ksa-identity.json")
     operator_uid=$(jq -r '.metadata.uid' "$RHIZA_AUTH_STATE/operator-ksa-identity.json")
     fencer_uid=$(jq -r '.metadata.uid' "$RHIZA_AUTH_STATE/fencer-ksa-identity.json")
@@ -555,6 +567,7 @@ seal_independent_workload_identity() {
       --arg data_prefix "$data_prefix" --arg control_prefix "$control_prefix" \
       --arg workload_uid "$workload_uid" --arg operator_uid "$operator_uid" --arg fencer_uid "$fencer_uid" \
       --arg readonly "$readonly_email" --arg writer "$data" --arg readonly_uid "$readonly_uid" --arg writer_uid "$data_uid" \
+      --arg writer_role "projects/$project/roles/$folder_role" \
       --arg workload_member "$workload_member" --arg operator_member "$operator_member" --arg fencer_member "$fencer_member" \
       --arg title "rhiza-$RHIZA_RUN_ID-expiry" --arg expression "request.time < timestamp('$RHIZA_AUTH_EXPIRES')" '{
         run:$run,namespace:$ns,parentPrefix:$prefix,
@@ -562,7 +575,7 @@ seal_independent_workload_identity() {
           gsa:{email:$readonly,unique_id:$readonly_uid,role:"roles/storage.objectViewer",managedFolder:$data_prefix},
           workloadIdentityBinding:{role:"roles/iam.workloadIdentityUser",members:[$workload_member],condition:{title:$title,expression:$expression}}},
         writer:{ksas:[{name:"rhiza-operator",uid:$operator_uid,member:$operator_member},{name:"rhiza-fencer",uid:$fencer_uid,member:$fencer_member}],
-          gsa:{email:$writer,unique_id:$writer_uid,managedFolder:$prefix},
+          gsa:{email:$writer,unique_id:$writer_uid,managedFolders:[$data_prefix,$control_prefix],role:$writer_role},
           workloadIdentityBinding:{role:"roles/iam.workloadIdentityUser",members:[$operator_member,$fencer_member],condition:{title:$title,expression:$expression}}},
         controlPrefix:$control_prefix
       }' > "$RHIZA_AUTH_STATE/workload-identity.json"
@@ -661,6 +674,22 @@ folder_iam_data() (
     folder_role_resource=roles/storage.objectViewer
     data=$readonly_email
     folder_identity_receipt=$RHIZA_AUTH_STATE/data-folder-identity.json
+    folder_iam "$action"
+)
+folder_iam_writer_data() (
+    action=$1
+    folder=$data_folder
+    prefix=$data_prefix
+    folder_role_resource=projects/$project/roles/$folder_role
+    folder_identity_receipt=$RHIZA_AUTH_STATE/data-folder-identity.json
+    folder_iam "$action"
+)
+folder_iam_writer_control() (
+    action=$1
+    folder=$control_folder
+    prefix=$control_prefix
+    folder_role_resource=projects/$project/roles/$folder_role
+    folder_identity_receipt=$RHIZA_AUTH_STATE/control-folder-identity.json
     folder_iam "$action"
 )
 folder_iam_control() (
@@ -1485,9 +1514,16 @@ check_readonly_inherited_access() {
 }
 if [ "$mode" = mint-local ]; then
     [ "$auth_mode" = local ] || die 'Local mode required'
-    for required in local-prepared kubernetes data-wi-grant operator-wi-grant folder-grant fixture-secret; do
+    for required in local-prepared kubernetes data-wi-grant operator-wi-grant fixture-secret; do
         owned "$required" || die 'Local bootstrap did not complete; no mint from partial/failed apply'
     done
+    if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
+        for required in data-writer-folder-grant control-writer-folder-grant data-folder-grant; do
+            owned "$required" || die 'Local bootstrap lacks exact DATA/CONTROL writer grants; no token mint'
+        done
+    else
+        owned folder-grant || die 'Local bootstrap lacks its run-prefix writer grant; no token mint'
+    fi
     if [ -f "$RHIZA_AUTH_STATE/inflight" ]; then
         last=$(cat "$RHIZA_AUTH_STATE/inflight")
         [ -f "$RHIZA_AUTH_STATE/$last.exit" ] && [ "$(cat "$RHIZA_AUTH_STATE/$last.exit")" = 0 ] || die 'Unresolved operation outcome; no token mint'
@@ -1587,6 +1623,8 @@ if [ "$mode" = apply ]; then
         check_folder_identity "$RHIZA_AUTH_STATE/control-folder-identity.json" "$control_prefix" "$RHIZA_AUTH_STATE/control-folder-identity.json"
         record data-folder-before folder_iam_data get
         record control-folder-before folder_iam_control get
+        jq -e '((.bindings // [])|length)==0' "$RHIZA_AUTH_STATE/data-folder-before.json" >/dev/null || die 'New data folder has preexisting IAM bindings'
+        jq -e '((.bindings // [])|length)==0' "$RHIZA_AUTH_STATE/control-folder-before.json" >/dev/null || die 'New control folder has preexisting IAM bindings'
     fi
     if [ "$auth_mode" = ci ]; then record ci-wi-before g iam service-accounts get-iam-policy "$ci" --format=json; fi
     record data-wi-before g iam service-accounts get-iam-policy "$data" --format=json
@@ -1690,12 +1728,17 @@ if [ "$mode" = apply ]; then
         mark fencer-wi-grant
         record data-post-grant-identity g iam service-accounts describe "$data" --format=json
         record readonly-post-grant-identity g iam service-accounts describe "$readonly_email" --format=json
+        record data-writer-folder-grant folder_iam_writer_data add
+        mark data-writer-folder-grant
+        record control-writer-folder-grant folder_iam_writer_control add
+        mark control-writer-folder-grant
         record data-folder-grant folder_iam_data add
         mark data-folder-grant
         record data-wi-after g iam service-accounts get-iam-policy "$data" --format=json
         record readonly-wi-after g iam service-accounts get-iam-policy "$readonly_email" --format=json
         record data-folder-after folder_iam_data get
         record control-folder-after folder_iam_control get
+        record folder-after folder_iam get
         seal_independent_workload_identity
     else
         record data-wi-grant g iam service-accounts add-iam-policy-binding "$data" --member="$data_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json
@@ -1704,13 +1747,13 @@ if [ "$mode" = apply ]; then
         mark operator-wi-grant
         record data-post-grant-identity g iam service-accounts describe "$data" --format=json
         seal_workload_identity
+        record folder-grant folder_iam add
+        mark folder-grant
+        record folder-after folder_iam get
     fi
-    record folder-grant folder_iam add
-    mark folder-grant
     record project-after g projects get-iam-policy "$project" --format=json
     record bucket-after g storage buckets get-iam-policy "gs://$bucket" --format=json
     check_readonly_inherited_access
-    record folder-after folder_iam get
     check_readonly_inherited_access
     if [ "$auth_mode" = local ]; then mark local-prepared; fi
     printf '%s\n' "Prepared $ns ($auth_mode); scoped actor/GCS/admission checks still required before faults."
@@ -1795,12 +1838,14 @@ verify_rollback_side_effect_markers() {
     # interrupted rollback prerequisite, not evidence that the resource was
     # never created. Reconstruct only the narrowly verified GSA/folder cases
     # above; every other category must stop short of a false terminal receipt.
-    side_effects='data-create:data folder-role-create:folder-role folder-create:folder kubernetes-create:kubernetes fixture-secret-create:fixture-secret data-wi-grant:data-wi-grant operator-wi-grant:operator-wi-grant folder-grant:folder-grant'
+    side_effects='data-create:data folder-role-create:folder-role folder-create:folder kubernetes-create:kubernetes fixture-secret-create:fixture-secret data-wi-grant:data-wi-grant operator-wi-grant:operator-wi-grant'
     if [ "$auth_mode" = ci ]; then
         side_effects="$side_effects ci-create:ci cluster-role-create:cluster-role pool-create:pool provider-create:provider ci-project-grant:ci-project-grant ci-wi-grant:ci-wi-grant"
     fi
     if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ]; then
-        side_effects="$side_effects readonly-create:readonly data-folder-create:data-folder control-folder-create:control-folder fencer-wi-grant:fencer-wi-grant data-folder-grant:data-folder-grant"
+        side_effects="$side_effects readonly-create:readonly data-folder-create:data-folder control-folder-create:control-folder fencer-wi-grant:fencer-wi-grant data-folder-grant:data-folder-grant data-writer-folder-grant:data-writer-folder-grant control-writer-folder-grant:control-writer-folder-grant"
+    else
+        side_effects="$side_effects folder-grant:folder-grant"
     fi
     for pair in $side_effects; do
         effect=${pair%%:*}
@@ -1866,7 +1911,8 @@ if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] && owned data-folder; then
     check_folder_identity "$RHIZA_AUTH_STATE/data-folder-current.json" "$data_prefix" "$RHIZA_AUTH_STATE/data-folder-identity.json"
     record data-folder-policy-current folder_iam_data get
     expected_data_folder_policy=$RHIZA_AUTH_STATE/data-folder-before.json
-    if owned data-folder-grant; then expected_data_folder_policy=$RHIZA_AUTH_STATE/data-folder-after.json; fi
+    if owned data-writer-folder-grant; then expected_data_folder_policy=$RHIZA_AUTH_STATE/data-writer-folder-grant.json; fi
+    if owned data-folder-grant; then expected_data_folder_policy=$RHIZA_AUTH_STATE/data-folder-grant.json; fi
     jq -e --slurpfile expected "$expected_data_folder_policy" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
       "$RHIZA_AUTH_STATE/data-folder-policy-current.json" >/dev/null || die 'Data-folder policy changed; preserve concurrent bindings for review'
 fi
@@ -1874,11 +1920,15 @@ if [ "$RHIZA_GCS_INDEPENDENT_LAYOUT" = yes ] && owned control-folder; then
     record control-folder-current g storage managed-folders describe "$control_folder" --raw --format=json
     check_folder_identity "$RHIZA_AUTH_STATE/control-folder-current.json" "$control_prefix" "$RHIZA_AUTH_STATE/control-folder-identity.json"
     record control-folder-policy-current folder_iam_control get
-    jq -e --slurpfile expected "$RHIZA_AUTH_STATE/control-folder-before.json" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
+    expected_control_folder_policy=$RHIZA_AUTH_STATE/control-folder-before.json
+    if owned control-writer-folder-grant; then expected_control_folder_policy=$RHIZA_AUTH_STATE/control-writer-folder-grant.json; fi
+    jq -e --slurpfile expected "$expected_control_folder_policy" '(.bindings // [] | sort_by(.role,.condition.title)) == ($expected[0].bindings // [] | sort_by(.role,.condition.title))' \
       "$RHIZA_AUTH_STATE/control-folder-policy-current.json" >/dev/null || die 'Control-folder policy changed; preserve concurrent bindings for review'
 fi
 # Only the exact live folder binding is changed with its current etag. No retries.
 if owned folder-grant; then record revoke-folder folder_iam remove; fi
+if owned data-writer-folder-grant; then record revoke-data-writer-folder folder_iam_writer_data remove; fi
+if owned control-writer-folder-grant; then record revoke-control-writer-folder folder_iam_writer_control remove; fi
 if owned data-folder-grant; then record revoke-data-folder folder_iam_data remove; fi
 if owned ci-wi-grant; then record revoke-ci-wi g iam service-accounts remove-iam-policy-binding "$ci" --member="$ci_member" --role=roles/iam.workloadIdentityUser --condition="$expiry" --format=json; fi
 if owned data-wi-grant; then
