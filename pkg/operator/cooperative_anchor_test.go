@@ -80,6 +80,6 @@ func archiveObjectVersions(ctx context.Context, bucket objstore.Bucket) (map[str
 		}
 		objects[name] = fmt.Sprintf("%d:%s", attrs.Size, version)
 		return nil
-	})
+	}, objstore.WithRecursiveIter())
 	return objects, err
 }

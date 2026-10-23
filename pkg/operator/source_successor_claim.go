@@ -1,10 +1,12 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"path"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
@@ -232,7 +234,7 @@ func (c *Controller) verifyOrFindSuccessorReservation(ctx context.Context, sourc
 		return true, "", err
 	}
 	var got archiveForkReservation
-	if err := decodeCanonicalArchiveJSON(data, &got); err != nil {
+	if err := decodeLegacySuccessorReservation(data, &got); err != nil {
 		return true, "", err
 	}
 	wantBytes, err := json.Marshal(want)
@@ -261,7 +263,7 @@ func readLegacySuccessorReservation(ctx context.Context, bucket objstore.Bucket,
 		return "", err
 	}
 	var got archiveForkReservation
-	if err := decodeCanonicalArchiveJSON(data, &got); err != nil {
+	if err := decodeLegacySuccessorReservation(data, &got); err != nil {
 		return "", err
 	}
 	if got.Version != want.Version || got.OperationID != want.OperationID || got.Target != want.Target || got.Source != want.Source ||
@@ -270,4 +272,33 @@ func readLegacySuccessorReservation(ctx context.Context, bucket objstore.Bucket,
 		return "", fmt.Errorf("fencing: legacy successor reservation differs from the source generation claim")
 	}
 	return authorityStateDigest(data), nil
+}
+
+// decodeLegacySuccessorReservation preserves the map-key ordering emitted by
+// Controller.reservation while still requiring an exact canonical payload.
+func decodeLegacySuccessorReservation(data []byte, target *archiveForkReservation) error {
+	if target == nil {
+		return fmt.Errorf("fencing: legacy successor reservation target is unavailable")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return fmt.Errorf("fencing: trailing legacy successor reservation JSON")
+	}
+	canonical := object{
+		"version": target.Version, "operation_id": target.OperationID, "target": target.Target,
+		"source": target.Source, "source_membership": target.SourceMembership,
+		"statefulset_uid": target.StatefulSetUID, "spec_hash": target.SpecHash,
+	}
+	if target.TargetBaseKind != "" {
+		canonical["target_base_kind"] = target.TargetBaseKind
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil || !bytes.Equal(encoded, data) {
+		return errors.Join(err, fmt.Errorf("fencing: noncanonical legacy successor reservation JSON"))
+	}
+	return nil
 }

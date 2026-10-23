@@ -229,7 +229,7 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 			return ArchiveForkGenesisResponse{}, err
 		}
 		var reservation archiveForkReservation
-		if err := decodeCanonicalArchiveJSON(reservationData, &reservation); err != nil || reservation.Version != 1 || reservation.OperationID != request.OperationID || reservation.Target != request.TargetClusterID || reservation.Source != sourceID || reservation.StatefulSetUID != request.StatefulSetUID || reservation.SourceMembership != sourceFingerprint(sourceID, sourceDurability, sourceMembers, sourcePrefix) || !validEvidenceDigest(reservation.SpecHash) || (reservation.TargetBaseKind != "" && reservation.TargetBaseKind != "fork") {
+		if err := decodeLegacySuccessorReservation(reservationData, &reservation); err != nil || reservation.Version != 1 || reservation.OperationID != request.OperationID || reservation.Target != request.TargetClusterID || reservation.Source != sourceID || reservation.StatefulSetUID != request.StatefulSetUID || reservation.SourceMembership != sourceFingerprint(sourceID, sourceDurability, sourceMembers, sourcePrefix) || !validEvidenceDigest(reservation.SpecHash) || (reservation.TargetBaseKind != "" && reservation.TargetBaseKind != "fork") {
 			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: archive fork request differs from the immutable successor reservation"))
 		}
 		reservationDigest = authorityStateDigest(reservationData)
