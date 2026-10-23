@@ -81,8 +81,17 @@ case "$async_nonempty" in
   no|yes) ;;
   *) echo 'RHIZA_GCS_ASYNC_NONEMPTY must be yes or no' >&2; exit 2 ;;
 esac
-[ "$initial_head_ack_loss" != yes ] || [ "$async_nonempty" != yes ] || {
-  echo 'initial-HEAD ACK-loss and async-nonempty qualifications require separate run scopes' >&2
+manual_terminal=${RHIZA_GCS_MANUAL_TERMINAL:-no}
+case "$manual_terminal" in
+  no|yes) ;;
+  *) echo 'RHIZA_GCS_MANUAL_TERMINAL must be yes or no' >&2; exit 2 ;;
+esac
+scenario_count=0
+for selected in "$initial_head_ack_loss" "$async_nonempty" "$manual_terminal"; do
+  [ "$selected" != yes ] || scenario_count=$((scenario_count + 1))
+done
+[ "$scenario_count" -le 1 ] || {
+  echo 'initial-HEAD ACK-loss, async-nonempty, and manual-terminal qualifications require separate run scopes' >&2
   exit 2
 }
 
@@ -378,6 +387,26 @@ cleanup() {
     fi
     if [ -n "$artifact_error" ]; then
       echo "async-nonempty artifact finalization failed: $artifact_error" >&2
+      [ "$exit_status" -ne 0 ] || exit_status=1
+    fi
+  fi
+  if [ "$mode" = run ] && [ "$manual_terminal" = yes ]; then
+    artifact_error=
+    if [ -z "${FENCING_E2E_BIN:-}" ] || [ ! -x "$FENCING_E2E_BIN" ]; then
+      artifact_error='fencing-e2e driver is unavailable'
+    elif [ -z "$source_head" ]; then
+      artifact_error='source revision was not captured'
+    else
+      printf '%s\n' "$exit_status" >"$out/actual-exit.txt" || artifact_error='actual exit receipt could not be written'
+      printf '%s\n' "$source_head" >"$out/source-head.txt" || artifact_error='source revision receipt could not be written'
+      printf '%s\n%s\n' "$RHIZA_APP_IMAGE" "$RHIZA_OPERATOR_IMAGE" >"$out/image-ids.txt" || artifact_error='immutable image receipt could not be written'
+      if [ -z "$artifact_error" ] && ! FENCING_E2E_OUT="$out" FENCING_E2E_QUALIFICATION=gcs-manual-terminal \
+        "$FENCING_E2E_BIN" safe-artifacts; then
+        artifact_error='strict manual-terminal artifact projection failed'
+      fi
+    fi
+    if [ -n "$artifact_error" ]; then
+      echo "manual-terminal artifact finalization failed: $artifact_error" >&2
       [ "$exit_status" -ne 0 ] || exit_status=1
     fi
   fi
@@ -1075,6 +1104,16 @@ if [ "$async_nonempty" = yes ]; then
     RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" \
     "$FENCING_E2E_BIN" run-gcs-ha-async-nonempty
   echo 'nonempty async GCS quorum-loss and exact archived-tip recovery collector completed'
+  exit 0
+fi
+if [ "$manual_terminal" = yes ]; then
+  : "${FENCING_E2E_BIN:?manual-terminal qualification requires the fencing-e2e driver}"
+  [ -x "$FENCING_E2E_BIN" ] || { echo 'FENCING_E2E_BIN is not executable' >&2; exit 2; }
+  step 30-manual-terminal-collector env FENCING_E2E_OUT="$out" RHIZA_KUBE_CONTEXT="$RHIZA_KUBE_CONTEXT" \
+    RHIZA_NAMESPACE="$RHIZA_NAMESPACE" RHIZA_RUN_ID="$RHIZA_RUN_ID" RHIZA_GCS_BUCKET="$RHIZA_GCS_BUCKET" \
+    RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" RHIZA_GCS_MANUAL_TERMINAL=yes \
+    "$FENCING_E2E_BIN" run-gcs-ha-manual-terminal
+  echo 'manual-terminal GCS challenge, independent approval, recovery, and readback collector completed'
   exit 0
 fi
 step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \

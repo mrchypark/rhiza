@@ -427,7 +427,7 @@ func validateExplicitGenerationFenceRequest(request operator.FenceRequest, sourc
 }
 
 func explicitRecoveryIdentity(runID, phase string) (string, string, error) {
-	if len(runID) != 8 || (phase != "first" && phase != "second" && phase != "async-empty") {
+	if len(runID) != 8 || (phase != "first" && phase != "second" && phase != "async-empty" && phase != "manual-terminal") {
 		return "", "", fmt.Errorf("explicit recovery requires a run-owned ID and known phase")
 	}
 	for _, r := range runID {
