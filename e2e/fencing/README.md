@@ -150,3 +150,25 @@ events, authority receipts, object names, bucket/prefix values, Pod identities,
 or credential files. Follow the fresh namespace/prefix, cost-cap, and cleanup
 requirements in the GCS runbook. This is a launch path, not a claim that a real
 GCS/Chaos qualification has run.
+
+### Initial canonical HEAD fault pre-arm
+
+The voter-count GCS launcher has a separate, default-off pre-arm option for
+the first canonical `archive/head.bin` held-v2 create. It must use the
+source-matched fencing driver and a fresh namespace/prefix. Set
+`RHIZA_GCS_INITIAL_HEAD_ACK_LOSS=yes` and `FENCING_E2E_BIN` only for the
+explicit bootstrap qualification run. The launcher installs the immutable,
+credential-free fencer config after IAM preflight and before applying the
+RhizaCluster. At dispatch, the fencer still requires the exact committed
+CONTROL genesis reference, source runtime, held-v2 tuple, and canonical empty
+HEAD digest. The injected event means only that a successful GCS response was
+discarded; it does not establish a no-effect request or terminal provider
+outcome.
+
+The pre-arm command by itself is not qualification evidence. Keep the private
+restore state and ACK-loss receipt local until the full bootstrap recovery
+collector verifies the canonical guard, exact held GCS generation/bytes,
+protected closure proof, target genesis, and target read barrier. Restore the
+fencer only after those checks with
+`fencing-e2e cleanup-gcs-ha-initial-head-ack-loss`; if verification does not
+complete, preserve the private state for diagnosis and do not report success.

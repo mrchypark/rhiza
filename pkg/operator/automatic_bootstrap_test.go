@@ -58,23 +58,24 @@ func newAutomaticBootstrapGenesisFixture(t *testing.T) automaticBootstrapGenesis
 	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
 	f := heldProfileFixture{e: e, api: api, scope: scope}
 	if err := e.initializeRoot(t.Context(), baseRuntime.StatefulSetUID, baseRuntime.SourceClusterID); err != nil {
-		t.Fatal(err)
+		t.Fatalf("initialize required canonical bootstrap CONTROL root: %v", err)
 	}
 	cohort := configureAutomaticBootstrapCohort(t, &f, baseRuntime, 3)
-	f.id, f.runtime = fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "bootstrap-pod-0", RunID: "bootstrap-run-0", WALIdentity: "bootstrap-wal-0"}, cohort[0]
+	f.id, f.runtime = fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "bootstrap-pod-0", RunID: "bootstrap-run-0"}, cohort[0]
 	if _, err := e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 		ledger.RequireRuntimeBinding = true
 		ledger.RequireMutationJournal = true
 		return ledger.RegisterEnrolled(f.id, f.runtime)
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("enroll bootstrap runtime before WAL binding: %v", err)
 	}
 	if _, err := e.reserveMutationProducer(t.Context(), f.runtime); err != nil {
-		t.Fatal(err)
+		t.Fatalf("reserve bootstrap producer after enrollment: %v", err)
 	}
-	f.stages, _ = e.sourceStagesFor(t.Context(), f.runtime)
-	if f.stages == nil {
-		t.Fatal("bootstrap source stage store was not configured")
+	f.id.WALIdentity = "bootstrap-wal-0"
+	f.stages, err = e.sourceStagesFor(t.Context(), f.runtime)
+	if err != nil || f.stages == nil {
+		t.Fatalf("configure root-bound bootstrap source stage store: %v", err)
 	}
 	if _, err := e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 		if err := ledger.BindMutationScope(f.id, hashJSON(scope), fencing.MutationHeldExecutionProfile); err != nil {
@@ -85,37 +86,37 @@ func newAutomaticBootstrapGenesisFixture(t *testing.T) automaticBootstrapGenesis
 		}
 		return ledger.Bind(f.id)
 	}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("bind bootstrap runtime WAL and held mutation scope: %v", err)
 	}
 	producer, err := e.enrolledMutationRun(t.Context(), f.runtime)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read enrolled bootstrap mutation producer: %v", err)
 	}
 	f.producer = producer.MutationProducerUID
 	if _, err := e.changeMutationProducer(t.Context(), f.runtime, func(p *fencing.MutationProducer) error { return p.Activate(f.id) }); err != nil {
-		t.Fatal(err)
+		t.Fatalf("activate bootstrap mutation producer: %v", err)
 	}
 	f.receipts, err = e.receiptsForRuntime(f.runtime)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("configure bootstrap mutation receipts: %v", err)
 	}
 	configureAutomaticBootstrapKubernetes(t, &f, cohort)
 	archive := objstore.NewInMemBucket()
 	t.Cleanup(func() { _ = archive.Close() })
 	e.ArchiveBucket = frozenSourceEmptyTestBucket{Bucket: archive}
 	if err := f.e.claimArchiveScopeForRegistration(t.Context(), f.runtime.StatefulSetUID, f.id, f.runtime); err != nil {
-		t.Fatal(err)
+		t.Fatalf("claim canonical bootstrap archive scope after enrollment: %v", err)
 	}
 	provider := newFrozenEmptyNoEffectServer(t, f)
 	payload, err := recovery.EmptyArchiveHeadBytes()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("encode canonical empty bootstrap HEAD: %v", err)
 	}
 	intent := f.admitUpload(t, 1, "archive/head.bin", fencing.MutationCondition{Mode: fencing.MutationCreateOnly}, payload)
 	if err := f.e.executeSourceMutationRequest(t.Context(), "Bearer test", f.id, sourceMutationRequest{
 		ProducerUID: f.producer, Sequence: 1, Intent: intent,
 	}, true); !errors.Is(err, ErrFencePending) {
-		t.Fatalf("initial held genesis did not remain pending after the provider no-effect fault: %v", err)
+		t.Fatalf("dispatch canonical held bootstrap HEAD and preserve provider no-effect as pending: %v", err)
 	}
 	root, err := f.e.read(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
 	if err != nil {
@@ -207,7 +208,7 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 	podList := make([]any, 0, len(cohort))
 	for i, runtime := range cohort {
 		identity := fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: runtime.PodUID,
-			RunID: runtime.RunID, WALIdentity: fmt.Sprintf("bootstrap-wal-%d", i)}
+			RunID: runtime.RunID}
 		if i > 0 {
 			if _, err := f.e.change(t.Context(), runtime.StatefulSetUID, runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 				return ledger.RegisterEnrolled(identity, runtime)
@@ -217,6 +218,7 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 			if _, err := f.e.reserveMutationProducer(t.Context(), runtime); err != nil {
 				t.Fatalf("reserve bootstrap mutation producer %d: %v", i, err)
 			}
+			identity.WALIdentity = fmt.Sprintf("bootstrap-wal-%d", i)
 			stages, err := f.e.sourceStagesFor(t.Context(), runtime)
 			if err != nil {
 				t.Fatalf("create bootstrap stage store %d: %v", i, err)

@@ -45,6 +45,11 @@ case "$mode" in install|run) ;; *) echo "usage: $0 install|run" >&2; exit 2 ;; e
 : "${RHIZA_KERNEL_RELEASE:?qualified kernel release for every eligible node}"
 : "${RHIZA_APP_IMAGE:?digest-pinned application image}"
 : "${RHIZA_OPERATOR_IMAGE:?digest-pinned operator image}"
+initial_head_ack_loss=${RHIZA_GCS_INITIAL_HEAD_ACK_LOSS:-no}
+case "$initial_head_ack_loss" in
+  no|yes) ;;
+  *) echo 'RHIZA_GCS_INITIAL_HEAD_ACK_LOSS must be yes or no' >&2; exit 2 ;;
+esac
 
 require_digest() {
   value=$2
@@ -158,14 +163,46 @@ admin_token_file=$out/admin-token
 tls_tmp=
 remove_admin_token=false
 cleanup() {
+  exit_status=$?
+  initial_state=$out/gcs-initial-head-install-state.json
+  if [ "$initial_head_ack_loss" = yes ] && { [ -e "$initial_state" ] || [ -L "$initial_state" ]; } &&
+    { [ "$mode" = run ] || [ "$exit_status" -ne 0 ]; }; then
+    cleanup_log=$out/initial-head-cleanup.log
+    cleanup_error=
+    if [ -L "$initial_state" ] || [ ! -f "$initial_state" ]; then
+      cleanup_error='private restore state is not a regular file'
+    elif [ -z "${FENCING_E2E_BIN:-}" ] || [ ! -x "$FENCING_E2E_BIN" ]; then
+      cleanup_error='source-matched fencing-e2e cleanup binary is unavailable'
+    elif { [ -e "$cleanup_log" ] || [ -L "$cleanup_log" ]; } && { [ -L "$cleanup_log" ] || [ ! -f "$cleanup_log" ]; }; then
+      cleanup_error='private cleanup log path is unsafe'
+    elif [ -e "$cleanup_log" ] && ! chmod 600 "$cleanup_log" 2>/dev/null; then
+      cleanup_error='private cleanup log permissions could not be secured'
+    else
+      if [ ! -e "$cleanup_log" ]; then (umask 077; : > "$cleanup_log") || cleanup_error='private cleanup log could not be created'; fi
+      if [ -z "$cleanup_error" ]; then
+        if FENCING_E2E_OUT="$out" RHIZA_KUBE_CONTEXT="$RHIZA_KUBE_CONTEXT" RHIZA_NAMESPACE="$RHIZA_NAMESPACE" \
+          RHIZA_RUN_ID="$RHIZA_RUN_ID" "$FENCING_E2E_BIN" cleanup-gcs-ha-initial-head-ack-loss >>"$cleanup_log" 2>&1; then
+          :
+        else
+          cleanup_error='fencer restore was not verified; private restore state was preserved'
+        fi
+      fi
+    fi
+    if [ -n "$cleanup_error" ]; then
+      echo "initial-HEAD cleanup failed: $cleanup_error" >&2
+      [ "$exit_status" -ne 0 ] || exit_status=1
+    fi
+  fi
   rm -f "$out/.admin-token.tmp"
   if [ "$remove_admin_token" = true ]; then rm -f "$admin_token_file"; fi
   if [ -n "$tls_tmp" ]; then
     rm -f "$tls_tmp/tls.key" "$tls_tmp/tls.crt" "$tls_tmp/openssl.cnf"
     rmdir "$tls_tmp" 2>/dev/null || :
   fi
+  return "$exit_status"
 }
 trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
 
 render() {
   sed -e "s|__NAMESPACE__|$RHIZA_NAMESPACE|g" \
@@ -181,6 +218,18 @@ render() {
       -e "s|__HOST_IMAGE__|$RHIZA_APP_IMAGE|g" \
       -e "s|__OPERATOR_IMAGE__|$RHIZA_OPERATOR_IMAGE|g" \
       "$here/votercount_gcs_chaos.yaml.in" > "$out/rendered.yaml"
+  if [ "$initial_head_ack_loss" = yes ]; then
+    initial_render="$out/rendered.initial-head.tmp"
+    sed -e 's/RHIZA_OBJSTORE_DURABILITY: before-ack/RHIZA_OBJSTORE_DURABILITY: async/' \
+      -e 's/allowDataLoss: false/allowDataLoss: true/' \
+      "$out/rendered.yaml" > "$initial_render"
+    [ "$(grep -c 'RHIZA_OBJSTORE_DURABILITY: async' "$initial_render")" -eq 1 ] &&
+      [ "$(grep -c 'allowDataLoss: true' "$initial_render")" -eq 1 ] || {
+        echo 'initial-HEAD mode did not render explicit async data-loss policy' >&2
+        exit 2
+      }
+    mv "$initial_render" "$out/rendered.yaml"
+  fi
   ! grep -Eq '__[A-Z0-9_]+__' "$out/rendered.yaml"
   # The paired isolation probe Pods are created just-in-time by the driver: they
   # must not hold namespace quota while the scenarios run. Marker drift fails here.
@@ -594,6 +643,14 @@ if [ "$mode" = install ]; then
     echo 'independent GCS IAM preflight failed; RhizaCluster was not installed' >&2
     exit 1
   fi
+  if [ "$initial_head_ack_loss" = yes ]; then
+    : "${FENCING_E2E_BIN:?initial HEAD fault requires the source-matched fencing-e2e driver}"
+    [ -x "$FENCING_E2E_BIN" ] || { echo 'FENCING_E2E_BIN is not executable' >&2; exit 2; }
+    FENCING_E2E_OUT=$out RHIZA_KUBE_CONTEXT=$RHIZA_KUBE_CONTEXT RHIZA_NAMESPACE=$RHIZA_NAMESPACE \
+      RHIZA_RUN_ID=$RHIZA_RUN_ID RHIZA_GCS_BUCKET=$RHIZA_GCS_BUCKET RHIZA_GCS_PREFIX=$RHIZA_GCS_PREFIX \
+      RHIZA_CLUSTER_ID=$RHIZA_CLUSTER_ID RHIZA_GCS_INITIAL_HEAD_ACK_LOSS=yes \
+      "$FENCING_E2E_BIN" prepare-gcs-ha-initial-head-ack-loss
+  fi
   step 25-apply-rhiza-cluster kubectl --context "$RHIZA_KUBE_CONTEXT" apply -f "$out/rhiza-cluster.yaml"
   printf '%s %s\n' "$RHIZA_RUN_ID" "$receipt_sha" > "$out/gcs-iam-preflight.ok"
   chmod 600 "$out/gcs-iam-preflight.ok"
@@ -629,6 +686,16 @@ verify_bootstrap_receipt || exit 2
     exit 2
   }
 remove_admin_token=true
+if [ "$initial_head_ack_loss" = yes ]; then
+  : "${FENCING_E2E_BIN:?initial HEAD qualification requires the source-matched fencing-e2e driver}"
+  [ -x "$FENCING_E2E_BIN" ] || { echo 'FENCING_E2E_BIN is not executable' >&2; exit 2; }
+  step 30-initial-head-collector env FENCING_E2E_OUT="$out" RHIZA_KUBE_CONTEXT="$RHIZA_KUBE_CONTEXT" \
+    RHIZA_NAMESPACE="$RHIZA_NAMESPACE" RHIZA_RUN_ID="$RHIZA_RUN_ID" RHIZA_GCS_BUCKET="$RHIZA_GCS_BUCKET" \
+    RHIZA_GCS_PREFIX="$RHIZA_GCS_PREFIX" RHIZA_CLUSTER_ID="$RHIZA_CLUSTER_ID" \
+    RHIZA_GCS_INITIAL_HEAD_ACK_LOSS=yes "$FENCING_E2E_BIN" run-gcs-ha-initial-head-ack-loss
+  echo 'initial canonical HEAD GCS/Chaos qualification collector completed'
+  exit 0
+fi
 step 30-driver python3 -u "$here/votercount_gcs_chaos.py" \
   --context "$RHIZA_KUBE_CONTEXT" \
   --namespace "$RHIZA_NAMESPACE" \

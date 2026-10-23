@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -440,6 +443,83 @@ func TestFixtureRestoreHasWritableTmpWithReadOnlyRoot(t *testing.T) {
 	nested(patch, "spec", "template", "spec").(obj)["volumes"] = []any{}
 	if verifyScratch(patch) == nil {
 		t.Fatal("accepted read-only root without writable scratch storage")
+	}
+}
+
+func TestInitialHeadLauncherExitCleanupPrecedesTokenRemovalAndPreservesStatus(t *testing.T) {
+	launcher, err := os.ReadFile("../chaos/run-votercount-gcs-chaos.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const startMarker = "cleanup() {"
+	const endMarker = "\n}\ntrap cleanup EXIT"
+	start := strings.Index(string(launcher), startMarker)
+	if start < 0 {
+		t.Fatal("launcher has no cleanup function")
+	}
+	endOffset := strings.Index(string(launcher[start:]), endMarker)
+	if endOffset < 0 {
+		t.Fatal("launcher cleanup function is not installed as the EXIT trap")
+	}
+	cleanupFunction := string(launcher[start : start+endOffset+2])
+
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "private")
+	if err := os.Mkdir(out, 0700); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(out, "admin-token")
+	if err := os.WriteFile(tokenPath, []byte("test-only-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// A restore record marks that the fencer fault was armed. The fake driver
+	// fails deliberately after recording whether the token still exists.
+	if err := os.WriteFile(filepath.Join(out, gcsInitialHeadInstallStateName), []byte("test-only-state"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(tmp, "events")
+	driverPath := filepath.Join(tmp, "fencing-e2e")
+	driver := "#!/bin/sh\n" +
+		"printf '%s token=%s\\n' \"$1\" \"$(test -f \"$TEST_TOKEN\" && echo present || echo absent)\" >> \"$TEST_EVENTS\"\n" +
+		"exit 29\n"
+	if err := os.WriteFile(driverPath, []byte(driver), 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := cleanupFunction + `
+set -eu
+out=$TEST_OUT
+admin_token_file=$TEST_TOKEN
+tls_tmp=
+remove_admin_token=true
+mode=install
+initial_head_ack_loss=yes
+FENCING_E2E_BIN=$TEST_DRIVER
+export FENCING_E2E_OUT=$out
+export RHIZA_KUBE_CONTEXT=test-context RHIZA_NAMESPACE=test-namespace RHIZA_RUN_ID=a1b2c3d4
+trap cleanup EXIT
+exit 23
+`
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"TEST_OUT="+out,
+		"TEST_TOKEN="+tokenPath,
+		"TEST_DRIVER="+driverPath,
+		"TEST_EVENTS="+eventsPath,
+	)
+	err = cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+		t.Fatalf("cleanup changed the original launcher exit status: err=%v", err)
+	}
+	events, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("armed fencer cleanup was not attempted: %v", err)
+	}
+	if got := string(events); got != "cleanup-gcs-ha-initial-head-ack-loss token=present\n" {
+		t.Fatalf("fencer cleanup did not precede local token removal: %q", got)
+	}
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		t.Fatalf("launcher did not remove its local token after fencer cleanup: %v", err)
 	}
 }
 

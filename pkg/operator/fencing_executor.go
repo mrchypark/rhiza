@@ -489,7 +489,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 				if enrolled == nil {
 					err = fmt.Errorf("fencing: required archive genesis registration lacks runtime binding")
 				} else {
-					err = e.claimArchiveScopeForRegistration(r.Context(), uid, message.Identity, *enrolled)
+					_, err = e.reserveMutationProducer(r.Context(), *enrolled)
+					if err == nil {
+						err = e.claimArchiveScopeForRegistration(r.Context(), uid, message.Identity, *enrolled)
+					}
 				}
 			}
 		}

@@ -2,6 +2,7 @@ package operator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 type qualificationRoundTripper func(*http.Request) (*http.Response, error)
@@ -51,6 +53,187 @@ func newQualificationFixture() qualificationFixture {
 	run := fencing.Run{Identity: id, Runtime: &runtime, MutationProducerUID: "producer-uid", MutationScopeHash: intent.StoreScopeHash,
 		MutationProfile: fencing.MutationHeldExecutionProfile, MutationStageIncarnation: intent.OwnerStep.Workflow}
 	return qualificationFixture{id: id, runtime: runtime, scope: scope, config: config, intent: intent, preparation: preparation, run: run}
+}
+
+func newInitialHeadQualificationFixture(t *testing.T) qualificationFixture {
+	t.Helper()
+	f := newQualificationFixture()
+	payload, err := recovery.EmptyArchiveHeadBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.config.Selector = GCSMutationAckLossSelectorInitialArchiveHead
+	f.config.Runtime = fencing.RuntimeBinding{}
+	f.config.Identity = fencing.Identity{}
+	f.config.Bootstrap = &GCSMutationAckLossBootstrapBinding{NamespaceUID: f.runtime.NamespaceUID, SourceClusterID: f.runtime.SourceClusterID}
+	f.intent = fencing.MutationIntent{
+		ContractVersion: fencing.MutationIntentVersion, StoreScopeHash: hashJSON(f.scope),
+		OwnerStep: fencing.MutationOwnerStep{Owner: f.run.MutationProducerUID, Workflow: f.run.MutationStageIncarnation, Step: "genesis-head", Attempt: 1},
+		Condition: fencing.MutationCondition{Mode: fencing.MutationCreateOnly}, OperationID: "genesis-operation",
+		Kind: "upload", Key: "archive/head.bin", PayloadDigest: authorityStateDigest(payload), PayloadSize: int64(len(payload)),
+	}
+	f.preparation = fencing.MutationPreparation{Profile: fencing.MutationHeldExecutionProfile, StoreScopeHash: f.intent.StoreScopeHash, GenerationSet: true}
+	return f
+}
+
+func TestGCSMutationAckLossInitialHeadConfigAndCanonicalDispatch(t *testing.T) {
+	f := newInitialHeadQualificationFixture(t)
+	configBytes, err := json.Marshal(f.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseGCSMutationAckLossConfig(configBytes)
+	if err != nil || parsed.Selector != GCSMutationAckLossSelectorInitialArchiveHead || parsed.Bootstrap == nil {
+		t.Fatalf("parse initial HEAD selector: config=%+v err=%v", parsed, err)
+	}
+	var receipts []GCSMutationAckLossReceipt
+	fault, err := NewGCSMutationAckLossFault(parsed, func(receipt GCSMutationAckLossReceipt) { receipts = append(receipts, receipt) })
+	if err != nil || !fault.RequiresBootstrapGenesisAuthorization() {
+		t.Fatalf("initial HEAD selector did not require CONTROL authorization: fault=%v err=%v", fault, err)
+	}
+	ctx := fault.arm(context.Background(), f.runtime, f.run, f.run.MutationProducerUID, 1, "dispatch-genesis", f.intent, f.preparation, f.scope, true)
+	armed, ok := ctx.Value(gcsMutationAckLossContextKey{}).(*gcsMutationAckLossRequest)
+	if !ok || armed.intent != f.intent || armed.runtime != f.runtime || armed.identity != f.id || armed.sequence != 1 || armed.dispatchID != "dispatch-genesis" {
+		t.Fatal("canonical initial HEAD dispatch was not pinned to its exact CONTROL-derived tuple")
+	}
+	query := url.Values{"uploadType": {"multipart"}, "ifGenerationMatch": {"0"}, "name": {f.scope.Prefix + "/archive/head.bin"}}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://storage.googleapis.com/upload/storage/v1/b/"+f.scope.Bucket+"/o?"+query.Encode(), strings.NewReader("multipart payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "multipart/related; boundary=bootstrap")
+	body := &countingReadCloser{Reader: strings.NewReader("provider success response")}
+	transport := fault.WrapTransport(qualificationRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body}, nil
+	}))
+	response, err := transport.RoundTrip(request)
+	if response != nil || !errors.Is(err, errGCSMutationAckLost) || !body.closed {
+		t.Fatalf("initial HEAD response loss = (%v, %v), bodyClosed=%t", response, err, body.closed)
+	}
+	if len(receipts) != 1 || !receipts[0].Injected || receipts[0].WireRequests != 1 || receipts[0].Intent != f.intent ||
+		receipts[0].Preparation != f.preparation || receipts[0].Runtime != f.runtime || receipts[0].SourceIdentity != f.id ||
+		receipts[0].ObjectKey != "archive/head.bin" || receipts[0].PayloadDigest != f.intent.PayloadDigest || receipts[0].PayloadSize != f.intent.PayloadSize {
+		t.Fatalf("initial HEAD response-loss receipt differs from the exact selected dispatch: %#v", receipts)
+	}
+}
+
+func TestGCSMutationAckLossInitialHeadRejectsIneligibleDispatches(t *testing.T) {
+	tests := []struct {
+		name        string
+		mutate      func(*qualificationFixture)
+		withControl bool
+	}{
+		{name: "no canonical CONTROL authorization"},
+		{name: "wrong namespace UID", mutate: func(f *qualificationFixture) { f.runtime.NamespaceUID = "other-namespace" }, withControl: true},
+		{name: "wrong source cluster", mutate: func(f *qualificationFixture) { f.runtime.SourceClusterID = "other-source" }, withControl: true},
+		{name: "source run mismatch", mutate: func(f *qualificationFixture) { f.run.Identity.SourceClusterID = "other-source" }, withControl: true},
+		{name: "wrong object key", mutate: func(f *qualificationFixture) { f.intent.Key = "archive/blocks/fake" }, withControl: true},
+		{name: "wrong mutation kind", mutate: func(f *qualificationFixture) { f.intent.Kind = "delete" }, withControl: true},
+		{name: "unconditional intent", mutate: func(f *qualificationFixture) { f.intent.Condition.Mode = fencing.MutationUnconditional }, withControl: true},
+		{name: "noncanonical HEAD bytes", mutate: func(f *qualificationFixture) { f.intent.PayloadDigest = strings.Repeat("c", 64) }, withControl: true},
+		{name: "wrong payload size", mutate: func(f *qualificationFixture) { f.intent.PayloadSize++ }, withControl: true},
+		{name: "nonzero generation", mutate: func(f *qualificationFixture) { f.preparation.Generation = 1 }, withControl: true},
+		{name: "legacy profile", mutate: func(f *qualificationFixture) { f.run.MutationProfile = fencing.MutationExecutionProfile }, withControl: true},
+		{name: "wrong scope", mutate: func(f *qualificationFixture) { f.scope.Prefix = "other/source" }, withControl: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newInitialHeadQualificationFixture(t)
+			if test.mutate != nil {
+				test.mutate(&f)
+			}
+			fault, err := NewGCSMutationAckLossFault(f.config, func(GCSMutationAckLossReceipt) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ctx context.Context
+			if test.withControl {
+				ctx = fault.arm(context.Background(), f.runtime, f.run, f.run.MutationProducerUID, 1, "dispatch", f.intent, f.preparation, f.scope, true)
+			} else {
+				ctx = fault.arm(context.Background(), f.runtime, f.run, f.run.MutationProducerUID, 1, "dispatch", f.intent, f.preparation, f.scope)
+			}
+			if _, ok := ctx.Value(gcsMutationAckLossContextKey{}).(*gcsMutationAckLossRequest); ok {
+				t.Fatal("ineligible initial HEAD dispatch was armed")
+			}
+		})
+	}
+}
+
+func TestGCSMutationAckLossInitialHeadSelectorIsOptInAndConfigIsStrict(t *testing.T) {
+	extent := newQualificationFixture()
+	extentFault, err := NewGCSMutationAckLossFault(extent.config, func(GCSMutationAckLossReceipt) {})
+	if err != nil || extentFault.RequiresBootstrapGenesisAuthorization() {
+		t.Fatalf("ordinary extent selector changed its default authorization contract: fault=%v err=%v", extentFault, err)
+	}
+	initial := newInitialHeadQualificationFixture(t)
+	for _, tc := range []struct {
+		name   string
+		change func(*GCSMutationAckLossConfig)
+	}{
+		{name: "missing bootstrap", change: func(c *GCSMutationAckLossConfig) { c.Bootstrap = nil }},
+		{name: "missing namespace UID", change: func(c *GCSMutationAckLossConfig) { c.Bootstrap.NamespaceUID = "" }},
+		{name: "missing source cluster", change: func(c *GCSMutationAckLossConfig) { c.Bootstrap.SourceClusterID = "" }},
+		{name: "identity must be resolved from CONTROL", change: func(c *GCSMutationAckLossConfig) { c.Identity = initial.id }},
+		{name: "runtime must be resolved from CONTROL", change: func(c *GCSMutationAckLossConfig) { c.Runtime = initial.runtime }},
+		{name: "bootstrap is not valid for extent selector", change: func(c *GCSMutationAckLossConfig) { c.Selector = GCSMutationAckLossSelectorFirstArchiveExtent }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := initial.config
+			tc.change(&config)
+			if err := config.Validate(); err == nil {
+				t.Fatal("accepted malformed or mismatched bootstrap selector config")
+			}
+		})
+	}
+}
+
+func TestGCSMutationAckLossInitialHeadRequiresExactCanonicalControlGenesis(t *testing.T) {
+	f := newAutomaticBootstrapGenesisFixture(t)
+	ctx := t.Context()
+	state, err := f.e.read(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.e.canonicalBootstrapGenesisDispatch(ctx, f.runtime, state, f.producer, 1, f.intent, f.scope) {
+		t.Fatal("exact root- and claim-referenced initial HEAD dispatch was not authorized")
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*fenceLedger, *string, *uint64, *fencing.MutationIntent, *AttestationStoreScope)
+	}{
+		{name: "missing committed root reference", change: func(state *fenceLedger, _ *string, _ *uint64, _ *fencing.MutationIntent, _ *AttestationStoreScope) {
+			state.Ledger.ArchiveGenesisRef = nil
+		}},
+		{name: "wrong root cluster", change: func(state *fenceLedger, _ *string, _ *uint64, _ *fencing.MutationIntent, _ *AttestationStoreScope) {
+			state.Ledger.SourceClusterID = "other-source"
+		}},
+		{name: "wrong producer", change: func(_ *fenceLedger, producer *string, _ *uint64, _ *fencing.MutationIntent, _ *AttestationStoreScope) {
+			*producer = "other-producer"
+		}},
+		{name: "wrong sequence", change: func(_ *fenceLedger, _ *string, sequence *uint64, _ *fencing.MutationIntent, _ *AttestationStoreScope) {
+			*sequence = 2
+		}},
+		{name: "different intent", change: func(_ *fenceLedger, _ *string, _ *uint64, intent *fencing.MutationIntent, _ *AttestationStoreScope) {
+			intent.Key = "archive/blocks/unrelated"
+		}},
+		{name: "different object-store scope", change: func(_ *fenceLedger, _ *string, _ *uint64, _ *fencing.MutationIntent, scope *AttestationStoreScope) {
+			scope.Prefix = "root/other"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := state
+			candidate.Ledger = state.Ledger
+			if state.Ledger.ArchiveGenesisRef != nil {
+				ref := *state.Ledger.ArchiveGenesisRef
+				candidate.Ledger.ArchiveGenesisRef = &ref
+			}
+			producer, sequence, intent, scope := f.producer, uint64(1), f.intent, f.scope
+			tc.change(&candidate, &producer, &sequence, &intent, &scope)
+			if f.e.canonicalBootstrapGenesisDispatch(ctx, f.runtime, candidate, producer, sequence, intent, scope) {
+				t.Fatal("fault selector accepted a tuple not referenced by canonical CONTROL root and scope claim")
+			}
+		})
+	}
 }
 
 func TestGCSMutationAckLossSelectsFirstCanonicalOrdinaryExtent(t *testing.T) {

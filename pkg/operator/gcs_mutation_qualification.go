@@ -16,20 +16,32 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 const GCSMutationAckLossSelectorFirstArchiveExtent = "first-ordinary-archive-extent-v1"
+const GCSMutationAckLossSelectorInitialArchiveHead = "initial-canonical-archive-head-v1"
 
-// GCSMutationAckLossConfig opts one exact source runtime and GCS scope into a
-// one-shot fault for its first eligible ordinary archive extent. An empty
-// config-file path leaves this qualification seam disabled.
+// GCSMutationAckLossBootstrapBinding pins a pre-apply bootstrap run to its
+// namespace and declared source. Runtime and producer identities are resolved
+// only from canonical CONTROL state when the genesis dispatch is admitted.
+type GCSMutationAckLossBootstrapBinding struct {
+	NamespaceUID    string `json:"namespaceUID"`
+	SourceClusterID string `json:"sourceClusterID"`
+}
+
+// GCSMutationAckLossConfig opts one exact source GCS scope into a one-shot
+// dispatch fault. The ordinary-extent selector binds a complete runtime in
+// advance; the initial-HEAD selector binds namespace/source and resolves the
+// admitted runtime from canonical CONTROL state at dispatch.
 type GCSMutationAckLossConfig struct {
-	Version  int                    `json:"version"`
-	Selector string                 `json:"selector"`
-	Runtime  fencing.RuntimeBinding `json:"runtime"`
-	Identity fencing.Identity       `json:"identity"`
-	Bucket   string                 `json:"bucket"`
-	Prefix   string                 `json:"prefix"`
+	Version   int                                 `json:"version"`
+	Selector  string                              `json:"selector"`
+	Runtime   fencing.RuntimeBinding              `json:"runtime"`
+	Identity  fencing.Identity                    `json:"identity"`
+	Bucket    string                              `json:"bucket"`
+	Prefix    string                              `json:"prefix"`
+	Bootstrap *GCSMutationAckLossBootstrapBinding `json:"bootstrap,omitempty"`
 }
 
 // GCSMutationAckLossReceipt is a private log event correlating an injected
@@ -37,6 +49,7 @@ type GCSMutationAckLossConfig struct {
 // and deliberately excludes the successful GCS response as recovery evidence.
 type GCSMutationAckLossReceipt struct {
 	Version        int                         `json:"version"`
+	Selector       string                      `json:"selector"`
 	Injected       bool                        `json:"injected"`
 	Reason         string                      `json:"reason,omitempty"`
 	WireRequests   uint64                      `json:"wireRequests"`
@@ -100,7 +113,20 @@ func ParseGCSMutationAckLossConfig(data []byte) (GCSMutationAckLossConfig, error
 }
 
 func (c GCSMutationAckLossConfig) Validate() error {
-	if c.Version != 1 || c.Selector != GCSMutationAckLossSelectorFirstArchiveExtent || c.Identity.WALIdentity == "" || c.Runtime.Validate(c.Identity) != nil {
+	if c.Version != 1 {
+		return fmt.Errorf("GCS acknowledgement-loss config requires version 1")
+	}
+	switch c.Selector {
+	case GCSMutationAckLossSelectorFirstArchiveExtent:
+		if c.Bootstrap != nil || c.Identity.WALIdentity == "" || c.Runtime.Validate(c.Identity) != nil {
+			return fmt.Errorf("ordinary-extent ACK-loss config requires an exact enrolled runtime and WAL identity")
+		}
+	case GCSMutationAckLossSelectorInitialArchiveHead:
+		if c.Bootstrap == nil || c.Bootstrap.NamespaceUID == "" || c.Bootstrap.SourceClusterID == "" ||
+			c.Identity != (fencing.Identity{}) || c.Runtime != (fencing.RuntimeBinding{}) {
+			return fmt.Errorf("initial HEAD ACK-loss config requires only an exact bootstrap namespace and source binding")
+		}
+	default:
 		return fmt.Errorf("GCS acknowledgement-loss config requires an exact enrolled runtime and WAL identity")
 	}
 	if len(c.Bucket) < 3 || len(c.Bucket) > 63 || !isBucketName(c.Bucket) || c.Prefix == "" || path.Clean(c.Prefix) != c.Prefix || c.Prefix == "." || strings.HasPrefix(c.Prefix, "/") {
@@ -161,14 +187,33 @@ func NewGCSMutationAckLossFault(config GCSMutationAckLossConfig, report func(GCS
 	return &GCSMutationAckLossFault{config: config, log: report}, nil
 }
 
+func (f *GCSMutationAckLossFault) RequiresBootstrapGenesisAuthorization() bool {
+	return f != nil && f.config.Selector == GCSMutationAckLossSelectorInitialArchiveHead
+}
+
 func (f *GCSMutationAckLossFault) arm(ctx context.Context, runtime fencing.RuntimeBinding, run fencing.Run, producerUID string, sequence uint64, dispatchID string,
-	intent fencing.MutationIntent, preparation fencing.MutationPreparation, scope AttestationStoreScope) context.Context {
+	intent fencing.MutationIntent, preparation fencing.MutationPreparation, scope AttestationStoreScope, canonicalBootstrapGenesis ...bool) context.Context {
 	if f == nil || ctx == nil || dispatchID == "" || producerUID == "" || sequence == 0 || run.MutationProfile != fencing.MutationHeldExecutionProfile ||
-		run.Identity != f.config.Identity || run.Runtime == nil || *run.Runtime != f.config.Runtime || runtime != f.config.Runtime ||
 		run.MutationProducerUID != producerUID || run.MutationStageIncarnation == "" ||
-		intent.OwnerStep.Owner != producerUID || intent.OwnerStep.Workflow != run.MutationStageIncarnation || intent.OwnerStep.Step != fmt.Sprintf("bucket-%d", sequence) || intent.OwnerStep.Attempt != 1 ||
-		intent.Condition.Mode != fencing.MutationCreateOnly || isGCSMutationControlKey(intent.Key) || !isGCSOrdinaryArchiveExtentKey(intent.Key, intent.PayloadDigest) || intent.PayloadSize <= 0 || !fencing.IsHeldCreateEligible(intent, preparation) ||
+		intent.OwnerStep.Owner != producerUID || intent.OwnerStep.Workflow != run.MutationStageIncarnation || intent.OwnerStep.Attempt != 1 ||
+		intent.Condition.Mode != fencing.MutationCreateOnly || intent.PayloadSize <= 0 || !fencing.IsHeldCreateEligible(intent, preparation) ||
 		scope.Provider != "gcs" || scope.Bucket != f.config.Bucket || scope.Prefix != f.config.Prefix || scope.Endpoint != "" || scope.Account != "" || scope.ConnectionStringDigest != "" {
+		return ctx
+	}
+	switch f.config.Selector {
+	case GCSMutationAckLossSelectorFirstArchiveExtent:
+		if f.config.Bootstrap != nil || run.Identity != f.config.Identity || run.Runtime == nil || *run.Runtime != f.config.Runtime || runtime != f.config.Runtime ||
+			intent.OwnerStep.Step != fmt.Sprintf("bucket-%d", sequence) || !isGCSOrdinaryArchiveExtentKey(intent.Key, intent.PayloadDigest) {
+			return ctx
+		}
+	case GCSMutationAckLossSelectorInitialArchiveHead:
+		if f.config.Bootstrap == nil || runtime.NamespaceUID != f.config.Bootstrap.NamespaceUID || runtime.SourceClusterID != f.config.Bootstrap.SourceClusterID ||
+			run.Identity.SourceClusterID != f.config.Bootstrap.SourceClusterID || run.Identity.WALIdentity == "" || run.Runtime == nil || *run.Runtime != runtime || runtime.Validate(run.Identity) != nil ||
+			run.MutationScopeHash != intent.StoreScopeHash || !isCanonicalEmptyArchiveHeadIntent(intent) ||
+			len(canonicalBootstrapGenesis) != 1 || !canonicalBootstrapGenesis[0] {
+			return ctx
+		}
+	default:
 		return ctx
 	}
 	request := &gcsMutationAckLossRequest{
@@ -182,6 +227,14 @@ func (f *GCSMutationAckLossFault) arm(ctx context.Context, runtime fencing.Runti
 	}
 	f.selected = request // The canonical grant above is durable before any wire call.
 	return context.WithValue(ctx, gcsMutationAckLossContextKey{}, request)
+}
+
+func isCanonicalEmptyArchiveHeadIntent(intent fencing.MutationIntent) bool {
+	if intent.Key != "archive/head.bin" || intent.Kind != "upload" || intent.Condition.Mode != fencing.MutationCreateOnly {
+		return false
+	}
+	head, err := recovery.EmptyArchiveHeadBytes()
+	return err == nil && int64(len(head)) == intent.PayloadSize && authorityStateDigest(head) == intent.PayloadDigest
 }
 
 // WrapTransport wraps the authenticated HTTP transport used by the Storage
@@ -257,7 +310,7 @@ func oneQueryValue(values map[string][]string, key, want string) bool {
 
 func (f *GCSMutationAckLossFault) report(request *gcsMutationAckLossRequest, injected bool, reason string) {
 	f.log(GCSMutationAckLossReceipt{
-		Version: 1, Injected: injected, Reason: reason, WireRequests: request.wireCount,
+		Version: 1, Selector: f.config.Selector, Injected: injected, Reason: reason, WireRequests: request.wireCount,
 		SourceIdentity: request.identity, Runtime: request.runtime, ProducerUID: request.producerUID,
 		Sequence: request.sequence, DispatchID: request.dispatchID, OperationID: request.intent.OperationID,
 		Intent: request.intent, Preparation: request.preparation, Scope: request.scope,

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 )
 
 type mutationProviderResult struct {
@@ -476,7 +477,11 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		defer payload.Close()
 		dispatchContext := ctx
 		if e.GCSMutationAckLoss != nil && fencing.IsHeldCreateEligible(intent, *entry.Preparation) {
-			dispatchContext = e.GCSMutationAckLoss.arm(ctx, runtime, run, producerUID, sequence, dispatchID, intent, *entry.Preparation, scope)
+			bootstrapGenesisAuthorized := false
+			if e.GCSMutationAckLoss.RequiresBootstrapGenesisAuthorization() {
+				bootstrapGenesisAuthorized = e.canonicalBootstrapGenesisDispatch(ctx, runtime, state, producerUID, sequence, intent, scope)
+			}
+			dispatchContext = e.GCSMutationAckLoss.arm(ctx, runtime, run, producerUID, sequence, dispatchID, intent, *entry.Preparation, scope, bootstrapGenesisAuthorized)
 		}
 		result, err = provider.upload(dispatchContext, intent.Key, entry.Preparation.Generation, intent, payload)
 		if err != nil {
@@ -504,6 +509,27 @@ func (e *FencingExecutor) ExecuteSourceMutation(ctx context.Context, runtime fen
 		Metageneration: result.Metageneration, PayloadDigest: result.PayloadDigest, AllCopiesTerminal: result.AllCopiesTerminal}
 	receipt.ReceiptDigest = receipt.digest()
 	return finish(receipt)
+}
+
+// canonicalBootstrapGenesisDispatch authorizes the initial-HEAD fault selector
+// only for the exact tuple linked by both immutable CONTROL references. The
+// transport receipt is not used to infer whether storage committed the upload.
+func (e *FencingExecutor) canonicalBootstrapGenesisDispatch(ctx context.Context, runtime fencing.RuntimeBinding, state fenceLedger, producerUID string, sequence uint64, intent fencing.MutationIntent, scope AttestationStoreScope) bool {
+	if e == nil || e.AuthorityState == nil || state.StatefulSetUID != runtime.StatefulSetUID || state.Ledger.SourceClusterID != runtime.SourceClusterID ||
+		state.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisCommitted || state.Ledger.ArchiveScopeHash == "" || state.Ledger.ArchiveGenesisRef == nil {
+		return false
+	}
+	ref := state.Ledger.ArchiveGenesisRef
+	if ref.ConfigID != recovery.ArchiveConfigID || ref.ScopeHash != state.Ledger.ArchiveScopeHash || ref.Mutation == nil ||
+		ref.Mutation.ProducerUID != producerUID || ref.Mutation.Sequence != sequence || ref.Mutation.Intent != intent || !isCanonicalEmptyArchiveHeadIntent(intent) ||
+		intent.StoreScopeHash != hashJSON(scope) {
+		return false
+	}
+	archiveScope := fencing.ArchiveScope{Provider: scope.Provider, Bucket: scope.Bucket, Prefix: scope.Prefix, ClusterID: runtime.SourceClusterID}
+	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, archiveScope)
+	return err == nil && claim.ScopeHash == ref.ScopeHash && claim.ConfigID == recovery.ArchiveConfigID &&
+		claim.OwnerStatefulSetUID == runtime.StatefulSetUID && claim.OwnerSourceClusterID == runtime.SourceClusterID &&
+		claim.GenesisRef != nil && sameArchiveGenesisRef(claim.GenesisRef, ref)
 }
 
 func (e *FencingExecutor) replayGuardedLogicalResolution(ctx context.Context, runtime fencing.RuntimeBinding, run fencing.Run, producerUID string, sequence uint64, entry fencing.MutationEntry, stages *SourceStageStore, provider mutationExecutionProvider) error {

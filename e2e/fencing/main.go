@@ -41,7 +41,32 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-ack-loss|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-ack-loss|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+	}
+	if os.Args[1] == "prepare-gcs-ha-initial-head-ack-loss" {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		if err := configureGCSHA(ctx); err != nil {
+			fatal(err)
+		}
+		fatal(prepareGCSInitialHeadAckLoss(ctx))
+		return
+	}
+	if os.Args[1] == "cleanup-gcs-ha-initial-head-ack-loss" {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		if err := configureGCSHACleanup(ctx); err != nil {
+			fatal(err)
+		}
+		fatal(restoreGCSInitialHeadAckLoss(ctx))
+		return
+	}
+	if os.Args[1] == "run-gcs-ha-initial-head-ack-loss" {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSInitialHeadAckLoss(ctx))
+		return
 	}
 	if os.Args[1] == "runtime-agent-request" {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -117,6 +142,14 @@ func main() {
 }
 
 func configureGCSHA(ctx context.Context) error {
+	return configureGCSHAContext(ctx, true)
+}
+
+func configureGCSHACleanup(ctx context.Context) error {
+	return configureGCSHAContext(ctx, false)
+}
+
+func configureGCSHAContext(ctx context.Context, requireNoOwnedChaos bool) error {
 	contextName := os.Getenv("RHIZA_KUBE_CONTEXT")
 	ns := os.Getenv("RHIZA_NAMESPACE")
 	runID := os.Getenv("RHIZA_RUN_ID")
@@ -149,15 +182,24 @@ func configureGCSHA(ctx context.Context) error {
 	if err != nil || strings.TrimSpace(string(canPatch)) != "yes" {
 		return fmt.Errorf("run identity lacks Pod patch permission required to UID-pin control-plane chaos: %v (%s)", err, strings.TrimSpace(string(canPatch)))
 	}
-	for _, kind := range []string{"networkchaos", "podchaos"} {
-		items, err := get(ctx, kind, "")
-		if err != nil {
-			return err
+	if requireNoOwnedChaos {
+		for _, kind := range []string{"networkchaos", "podchaos"} {
+			items, err := get(ctx, kind, "")
+			if err != nil {
+				return err
+			}
+			resources, _ := items["items"].([]any)
+			for _, item := range resources {
+				if nested(item, "metadata", "labels", "chaos.rhiza.io/run") == runID {
+					return fmt.Errorf("fresh GCS recovery scope already contains run-owned %s %s", kind, nested(item, "metadata", "name"))
+				}
+			}
 		}
-		resources, _ := items["items"].([]any)
-		for _, item := range resources {
-			if nested(item, "metadata", "labels", "chaos.rhiza.io/run") == runID {
-				return fmt.Errorf("fresh GCS recovery scope already contains run-owned %s %s", kind, nested(item, "metadata", "name"))
+	} else {
+		for _, check := range [][2]string{{"patch", "deployment/rhiza-fencer"}, {"delete", "configmap/rhiza-fencer-ack-loss"}} {
+			answer, err := command(ctx, "kubectl", "--context", kubeContext, "auth", "can-i", check[0], check[1], "--namespace", namespace)
+			if err != nil || strings.TrimSpace(string(answer)) != "yes" {
+				return fmt.Errorf("cleanup identity lacks %s permission required to restore the run-owned fencer configuration", check[0])
 			}
 		}
 	}
