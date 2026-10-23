@@ -47,7 +47,7 @@ func TestResolveStartupRoleRequiresCanonicalPendingLearnerAssignment(t *testing.
 		"annotations":     object{fencingRootAnnotation: "root-uid", fencingCredentialAnnotation: "credential-uid", ownerAnnotation: operation},
 		"ownerReferences": []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": "sts-uid", "controller": false}}}}
 	var child *Resource
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	api := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/namespaces/default/pods/" + learnerName:
