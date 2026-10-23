@@ -193,6 +193,10 @@ func (s *Service) captureEnrollment(ctx context.Context, expected fencing.Runtim
 	binding, scope, err := s.cfg.Backend.Enroll(ctx, expected)
 	if err != nil {
 		s.enrollmentDiagnostic("cri_enroll", enrollmentBackendErrorCode(err))
+		var namespaceDiagnostic interface{ CgroupNamespaceDiagnosticCode() string }
+		if errors.As(err, &namespaceDiagnostic) {
+			s.enrollmentDiagnostic("cri_enroll", namespaceDiagnostic.CgroupNamespaceDiagnosticCode())
+		}
 		return record{}, err
 	}
 	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}

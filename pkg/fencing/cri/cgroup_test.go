@@ -131,3 +131,44 @@ func TestCaptureCgroupScopeRejectsMissingOrEscapingIdentity(t *testing.T) {
 		t.Fatal("escaping cgroup identity was accepted")
 	}
 }
+
+func TestClassifyCgroupNamespaceRelation(t *testing.T) {
+	root := t.TempDir()
+	paths := map[string]string{}
+	for _, name := range []string{"agent", "host", "target", "other"} {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+		paths[name] = path
+	}
+	info := func(name string) os.FileInfo {
+		t.Helper()
+		value, err := os.Stat(paths[name])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	for _, tc := range []struct {
+		name, agent, host, target, want string
+	}{
+		{"all same", "agent", "agent", "agent", "cgroup_namespace_all_same"},
+		{"agent and host same", "agent", "agent", "target", "cgroup_namespace_agent_host_same_target_other"},
+		{"agent and target same", "agent", "host", "agent", "cgroup_namespace_agent_target_same_host_other"},
+		{"host and target same", "agent", "host", "host", "cgroup_namespace_host_target_same_agent_other"},
+		{"all different", "agent", "host", "target", "cgroup_namespace_all_different"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyCgroupNamespaceRelation(info(tc.agent), info(tc.host), info(tc.target)); got != tc.want {
+				t.Fatalf("namespace relation = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := classifyCgroupNamespaceRelation(nil, info("host"), info("target")); got != "cgroup_namespace_agent_unavailable" {
+		t.Fatalf("missing agent namespace relation = %q", got)
+	}
+	if got := classifyCgroupNamespaceRelation(nil, nil, info("target")); got != "cgroup_namespace_multiple_unavailable" {
+		t.Fatalf("multiple missing namespace relation = %q", got)
+	}
+}

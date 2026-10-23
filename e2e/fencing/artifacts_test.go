@@ -151,6 +151,11 @@ func TestRuntimeAgentDiagnosticsAllowRuntimeProfileBindingAndCgroupPathFailures(
 		"runtime_api_unavailable", "runtime_binding_invalid",
 		"process_cgroup_path_root", "process_cgroup_path_absolute", "process_cgroup_path_dot",
 		"process_cgroup_path_noncanonical", "process_cgroup_path_traversal",
+		"cgroup_namespace_all_same", "cgroup_namespace_agent_host_same_target_other",
+		"cgroup_namespace_agent_target_same_host_other", "cgroup_namespace_host_target_same_agent_other",
+		"cgroup_namespace_all_different", "cgroup_namespace_agent_unavailable",
+		"cgroup_namespace_host_unavailable", "cgroup_namespace_target_unavailable",
+		"cgroup_namespace_multiple_unavailable",
 	} {
 		view.RuntimeAgent.Diagnostics = []runtimeAgentEnrollmentDiagnostic{{Stage: "cri_enroll", Code: code}}
 		if _, err := safeJSON("fencer-diagnostics.json", encoded(view)); err != nil {
