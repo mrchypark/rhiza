@@ -156,7 +156,6 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 		f.f.mu.Unlock()
 	}
 	persistRecovery()
-	assertManualTerminalSourceWorkload(t, ctx, f.e, resource)
 
 	server := httptest.NewServer(f.e.Handler())
 	t.Cleanup(server.Close)
@@ -178,11 +177,17 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 		if err := controller.reconcile(ctx, &resource); err != nil {
 			t.Fatalf("controller manual preflight step %d: %v", step, err)
 		}
+		var persisted Resource
+		if err := f.e.Kube.Get(ctx, f.e.controller().resourcePath(resourceName(&resource)), &persisted); err != nil {
+			t.Fatalf("read persisted manual preflight state after step %d: %v", step, err)
+		}
+		resource = persisted
 	}
 	if resource.Status.ManualRecoveryChallenge == nil || resource.Status.ManualRecoveryChallengeDigest == "" ||
 		resource.Status.Target != "" || resource.Status.Stage != "" || resource.Status.FrozenBucketEnvironment == nil {
 		t.Fatalf("controller must persist a challenge and lifecycle snapshot without claiming/creating the target: status=%+v", resource.Status)
 	}
+	assertManualTerminalSourceWorkload(t, ctx, f.e, resource)
 	challenge := *resource.Status.ManualRecoveryChallenge
 	if challenge.TargetClusterID != targetID || challenge.TargetBaseKind != "fork" {
 		t.Fatalf("challenge did not bind the deterministic proposed target: challenge=%+v expected=%q", challenge, targetID)
@@ -215,6 +220,11 @@ func runManualTerminalFrozenForkRegistration(t *testing.T, durability string, al
 		if err := controller.reconcile(ctx, &resource); err != nil {
 			t.Fatalf("controller approved manual preflight step %d: %v", step, err)
 		}
+		var persisted Resource
+		if err := f.e.Kube.Get(ctx, f.e.controller().resourcePath(resourceName(&resource)), &persisted); err != nil {
+			t.Fatalf("read persisted approved manual preflight state after step %d: %v", step, err)
+		}
+		resource = persisted
 	}
 	if resource.Status.Target != targetID || resource.Status.ManualRecoveryChallengeDigest == "" || resource.Status.ManualAttestationDigest == "" || resource.Status.Stage != "FrozenForked" {
 		t.Fatalf("controller did not claim exactly the approved canonical proposal: status=%+v", resource.Status)
