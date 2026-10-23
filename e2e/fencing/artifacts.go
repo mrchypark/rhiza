@@ -544,6 +544,14 @@ const (
 	gcsAsyncNonemptySummaryName  = "gcs-async-nonempty-summary.json"
 )
 
+const (
+	gcsManualTerminalQualification = "gcs-manual-terminal"
+	gcsManualTerminalEvidenceName  = "gcs-manual-terminal-evidence.json"
+	gcsManualTerminalChallengeName = "gcs-manual-terminal-challenge.json"
+	gcsManualTerminalEventsName    = "gcs-manual-terminal-events.jsonl"
+	gcsManualTerminalSummaryName   = "gcs-manual-terminal-summary.json"
+)
+
 func projectGCSAsyncNonemptyEvidence(raw, public string, failedRun bool) (bool, error) {
 	entries, err := os.ReadDir(raw)
 	if err != nil {
@@ -594,6 +602,233 @@ func projectGCSAsyncNonemptyEvidence(raw, public string, failedRun bool) (bool, 
 		summary.Outcome = "passed"
 	}
 	return true, writeGCSAsyncNonemptySummary(public, summary)
+}
+
+type gcsManualTerminalPublicSummary struct {
+	Qualification          string `json:"qualification"`
+	Outcome                string `json:"outcome"`
+	Provider               string `json:"provider"`
+	NoPVC                  bool   `json:"noPVC"`
+	SourceDurability       string `json:"sourceDurability"`
+	AllowDataLoss          bool   `json:"allowDataLoss"`
+	SourceAcknowledged     bool   `json:"sourceAcknowledged"`
+	NonemptySourceSealed   bool   `json:"nonemptySourceSealed"`
+	IndependentV2Absent    bool   `json:"independentV2Absent"`
+	ChallengeObserved      bool   `json:"challengeObserved"`
+	IndependentApproval    bool   `json:"independentApprovalObserved"`
+	NoPreapprovalTarget    bool   `json:"noPreapprovalTargetClaim"`
+	RecoveryCommitted      bool   `json:"recoveryCommitted"`
+	TargetReadbackVerified bool   `json:"targetReadbackVerified"`
+	PrivateEvidenceSHA256  string `json:"privateEvidenceSHA256,omitempty"`
+	PrivateEventsSHA256    string `json:"privateEventsSHA256,omitempty"`
+}
+
+func projectGCSManualTerminalEvidence(raw, public string, failedRun bool) (bool, error) {
+	entries, err := os.ReadDir(raw)
+	if err != nil {
+		return false, err
+	}
+	known := map[string]bool{gcsManualTerminalEvidenceName: false, gcsManualTerminalChallengeName: false, gcsManualTerminalEventsName: false}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "gcs-manual-terminal-") {
+			if _, ok := known[name]; !ok {
+				return false, fmt.Errorf("manual-terminal private artifact name is not allowlisted")
+			}
+			known[name] = true
+		}
+	}
+	seen := known[gcsManualTerminalEvidenceName] || known[gcsManualTerminalChallengeName] || known[gcsManualTerminalEventsName]
+	if !seen {
+		return false, nil
+	}
+	if !known[gcsManualTerminalEventsName] {
+		return false, fmt.Errorf("manual-terminal evidence exists without its private event record")
+	}
+	events, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsManualTerminalEventsName), true)
+	if err != nil {
+		return false, err
+	}
+	eventsHash := sha256.Sum256(events)
+	summary := gcsManualTerminalPublicSummary{Qualification: gcsManualTerminalQualification, Outcome: "failed", PrivateEventsSHA256: hex.EncodeToString(eventsHash[:])}
+	challengeDigest := ""
+	if known[gcsManualTerminalChallengeName] {
+		challenge, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsManualTerminalChallengeName), false)
+		if err != nil {
+			return false, err
+		}
+		var challengeRecord struct {
+			Challenge       operator.ManualRecoveryChallenge `json:"challenge"`
+			ChallengeDigest string                           `json:"challengeDigest"`
+			AttestationName string                           `json:"attestationName"`
+		}
+		if err := json.Unmarshal(challenge, &challengeRecord); err != nil {
+			return false, fmt.Errorf("private manual-terminal challenge is invalid")
+		}
+		digest, err := operator.ManualRecoveryChallengeDigest(challengeRecord.Challenge)
+		attestationName, nameErr := operator.ManualRecoveryAttestationName(challengeRecord.Challenge.RecoveryUID)
+		if err != nil || nameErr != nil || digest != challengeRecord.ChallengeDigest || attestationName != challengeRecord.AttestationName ||
+			challengeRecord.Challenge.TargetBaseKind != "fork" || challengeRecord.Challenge.TargetClusterID == "" {
+			return false, fmt.Errorf("private manual-terminal challenge binding is invalid")
+		}
+		challengeDigest = challengeRecord.ChallengeDigest
+		summary.ChallengeObserved = true
+	}
+	if !known[gcsManualTerminalEvidenceName] {
+		if !failedRun {
+			return false, fmt.Errorf("successful manual-terminal run is missing private evidence")
+		}
+		return true, writeGCSManualTerminalSummary(public, summary)
+	}
+	evidence, err := readBoundedPrivateArtifact(filepath.Join(raw, gcsManualTerminalEvidenceName), false)
+	if err != nil {
+		return false, err
+	}
+	if !summary.ChallengeObserved {
+		return false, fmt.Errorf("manual-terminal evidence is missing its separately captured challenge")
+	}
+	if err := validateGCSManualTerminalPrivateEvidence(evidence, challengeDigest, &summary); err != nil {
+		return false, err
+	}
+	evidenceHash := sha256.Sum256(evidence)
+	summary.PrivateEvidenceSHA256 = hex.EncodeToString(evidenceHash[:])
+	if !failedRun {
+		summary.Outcome = "passed"
+	}
+	return true, writeGCSManualTerminalSummary(public, summary)
+}
+
+func validateGCSManualTerminalPrivateEvidence(data []byte, expectedChallengeDigest string, summary *gcsManualTerminalPublicSummary) error {
+	fields, err := exactJSONFields(data, "qualification", "profile", "sourceAck", "sourceHeadBeforeFence", "sealedSourceHead", "fence", "fenceProof", "challenge", "challengeDigest", "independentApproval", "approvalDigest", "preApprovalTargetUnclaimed", "recovery", "targetQuorumVerified", "recoveredRows", "targetAck", "independentV2Absent")
+	if err != nil {
+		return err
+	}
+	var qualification string
+	if err := json.Unmarshal(fields["qualification"], &qualification); err != nil || qualification != gcsManualTerminalQualification {
+		return fmt.Errorf("private manual-terminal qualification is unknown")
+	}
+	var profile struct {
+		Provider         string `json:"provider"`
+		NoPVC            bool   `json:"noPVC"`
+		SourceDurability string `json:"sourceDurability"`
+		AllowDataLoss    bool   `json:"allowDataLoss"`
+	}
+	if _, err := exactJSONFields(fields["profile"], "provider", "noPVC", "sourceDurability", "allowDataLoss"); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["profile"], &profile); err != nil || profile.Provider != "gcs" || !profile.NoPVC ||
+		(profile.SourceDurability != "async" && profile.SourceDurability != "before-ack") || profile.AllowDataLoss != (profile.SourceDurability == "async") {
+		return fmt.Errorf("private manual-terminal GCS profile is invalid")
+	}
+	var sourceAck, targetAck gcsAcknowledgement
+	if _, err := exactJSONFields(fields["sourceAck"], "requestID", "slot", "rows"); err != nil {
+		return err
+	}
+	if _, err := exactJSONFields(fields["targetAck"], "requestID", "slot", "rows"); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["sourceAck"], &sourceAck); err != nil || sourceAck.RequestID != "gcs-ha-ack-1" || sourceAck.Slot == 0 || sourceAck.Rows != `[[1,"gcs-manual-terminal-source"]]` {
+		return fmt.Errorf("private manual-terminal source ACK is invalid")
+	}
+	var before, sealed gcsArchiveHeadEvidence
+	for name, head := range map[string]*gcsArchiveHeadEvidence{"sourceHeadBeforeFence": &before, "sealedSourceHead": &sealed} {
+		if _, err := exactJSONFields(fields[name], "versionType", "version", "tip", "sealed", "headSHA256"); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(fields[name], head); err != nil {
+			return err
+		}
+	}
+	if before.Tip < sourceAck.Slot {
+		return fmt.Errorf("private manual-terminal source HEAD omits the acknowledged row")
+	}
+	if err := validateSealedNonemptyHead(before, sealed); err != nil {
+		return err
+	}
+	var fence operator.FenceRequest
+	if err := json.Unmarshal(fields["fence"], &fence); err != nil || fence.Scope != operator.ScopeGeneration || fence.OperationID == "" || fence.SourceClusterID == "" {
+		return fmt.Errorf("private manual-terminal generation fence is invalid")
+	}
+	var proof operator.FenceProof
+	if string(fields["fenceProof"]) == "null" || json.Unmarshal(fields["fenceProof"], &proof) != nil {
+		return fmt.Errorf("private manual-terminal generation fence proof is missing")
+	}
+	fenceHash := sha256.Sum256(encoded(fence))
+	if proof.OperationID != fence.OperationID || proof.SourceClusterID != fence.SourceClusterID || proof.BindingUID != fence.BindingUID ||
+		proof.RequestHash != hex.EncodeToString(fenceHash[:]) || proof.Independent != nil || proof.IndependentV2 != nil {
+		return fmt.Errorf("private manual-terminal fence proof is invalid or contains independent evidence")
+	}
+	var challenge operator.ManualRecoveryChallenge
+	if err := json.Unmarshal(fields["challenge"], &challenge); err != nil {
+		return err
+	}
+	var challengeDigest, approvalDigest string
+	if err := json.Unmarshal(fields["challengeDigest"], &challengeDigest); err != nil {
+		return err
+	}
+	calculatedChallenge, err := operator.ManualRecoveryChallengeDigest(challenge)
+	if err != nil || calculatedChallenge != challengeDigest || challengeDigest != expectedChallengeDigest || challenge.TargetBaseKind != "fork" ||
+		challenge.TargetClusterID == fence.SourceClusterID || challenge.RecoveryID != fence.OperationID || challenge.OperationID != fence.OperationID ||
+		challenge.SourceClusterID != fence.SourceClusterID || challenge.StatefulSetUID != fence.StatefulSetUID ||
+		challenge.FenceRequestHash != hex.EncodeToString(fenceHash[:]) {
+		return fmt.Errorf("private manual-terminal challenge is invalid")
+	}
+	var approval operator.ManualRecoveryAttestationObject
+	if err := json.Unmarshal(fields["independentApproval"], &approval); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(fields["approvalDigest"], &approvalDigest); err != nil {
+		return err
+	}
+	approvalBytes, err := json.Marshal(approval)
+	if err != nil {
+		return err
+	}
+	approvalHash := sha256.Sum256(approvalBytes)
+	if hex.EncodeToString(approvalHash[:]) != approvalDigest || operator.ValidateManualRecoveryAttestation(challenge, approval, challenge.ManualRecoveryBinding, approval.UID, time.Now().UTC()) != nil {
+		return fmt.Errorf("private manual-terminal independent approval is invalid")
+	}
+	var unclaimed, quorum, noIndependentV2 bool
+	if err := json.Unmarshal(fields["preApprovalTargetUnclaimed"], &unclaimed); err != nil || !unclaimed {
+		return fmt.Errorf("private manual-terminal evidence does not prove target was unclaimed before approval")
+	}
+	if err := json.Unmarshal(fields["targetQuorumVerified"], &quorum); err != nil || !quorum {
+		return fmt.Errorf("private manual-terminal recovery lacks target quorum readback")
+	}
+	if err := json.Unmarshal(fields["independentV2Absent"], &noIndependentV2); err != nil || !noIndependentV2 {
+		return fmt.Errorf("private manual-terminal evidence is not an unproven-generation path")
+	}
+	var recovery operator.Resource
+	if err := json.Unmarshal(fields["recovery"], &recovery); err != nil || recovery.Status.Phase != "Complete" || recovery.Status.Stage != "Complete" ||
+		recovery.Status.Target != challenge.TargetClusterID || recovery.Status.TargetBaseKind != "fork" || recovery.Status.ManualRecoveryChallengeDigest != challengeDigest ||
+		recovery.Status.ManualAttestationDigest != approvalDigest || recovery.Spec.RecoveryID != fence.OperationID ||
+		recovery.Spec.SourceClusterID != fence.SourceClusterID || recovery.Spec.StatefulSet != fence.StatefulSet ||
+		recovery.Spec.Durability != profile.SourceDurability || recovery.Spec.AllowDataLoss != profile.AllowDataLoss ||
+		recovery.Spec.Fence.RecoveryID != fence.OperationID || recovery.Spec.Fence.ClusterID != fence.SourceClusterID ||
+		recovery.Spec.Fence.StatefulSetUID != fence.StatefulSetUID || !recovery.Spec.Fence.Confirmed ||
+		text(recovery.Metadata["name"]) != challenge.RecoveryName || text(recovery.Metadata["namespace"]) != challenge.RecoveryNamespace ||
+		text(recovery.Metadata["uid"]) != challenge.RecoveryUID ||
+		recovery.Status.Source != fence.SourceClusterID || recovery.Status.StatefulSetUID != fence.StatefulSetUID {
+		return fmt.Errorf("private manual-terminal recovery differs from the exact approval")
+	}
+	var recoveredRows string
+	if err := json.Unmarshal(fields["recoveredRows"], &recoveredRows); err != nil || recoveredRows != sourceAck.Rows {
+		return fmt.Errorf("private manual-terminal readback differs from the acknowledged source row")
+	}
+	if err := json.Unmarshal(fields["targetAck"], &targetAck); err != nil || targetAck.RequestID != "gcs-ha-ack-2" || targetAck.Slot <= before.Tip || targetAck.Rows != `[[2,"gcs-manual-terminal-target"]]` {
+		return fmt.Errorf("private manual-terminal target ACK/readback is invalid")
+	}
+	summary.Provider, summary.NoPVC = profile.Provider, profile.NoPVC
+	summary.SourceDurability, summary.AllowDataLoss = profile.SourceDurability, profile.AllowDataLoss
+	summary.SourceAcknowledged, summary.NonemptySourceSealed = true, true
+	summary.IndependentV2Absent, summary.ChallengeObserved = true, true
+	summary.IndependentApproval, summary.NoPreapprovalTarget = true, true
+	summary.RecoveryCommitted, summary.TargetReadbackVerified = true, true
+	return nil
+}
+
+func writeGCSManualTerminalSummary(public string, summary gcsManualTerminalPublicSummary) error {
+	return os.WriteFile(filepath.Join(public, gcsManualTerminalSummaryName), encoded(summary), 0600)
 }
 
 func validateGCSAsyncNonemptyPrivateEvidence(data []byte, summary *gcsAsyncNonemptyPublicSummary) error {
@@ -1130,7 +1365,7 @@ func safeArtifacts(raw string) error {
 		return fmt.Errorf("FENCING_E2E_OUT is required")
 	}
 	qualification := os.Getenv("FENCING_E2E_QUALIFICATION")
-	if qualification != "" && qualification != "gcs-async-nonempty" {
+	if qualification != "" && qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification {
 		return fmt.Errorf("artifact qualification selector is unsupported")
 	}
 	exitData, err := os.ReadFile(filepath.Join(raw, "actual-exit.txt"))
@@ -1156,7 +1391,7 @@ func safeArtifacts(raw string) error {
 		if entry.IsDir() {
 			continue
 		}
-		if qualification == "gcs-async-nonempty" && (name == "runtime-profile.json" || name == "runtime-component-probe.json") {
+		if (qualification == "gcs-async-nonempty" || qualification == gcsManualTerminalQualification) && (name == "runtime-profile.json" || name == "runtime-component-probe.json") {
 			// These receipts describe the disposable Kind component probe, not
 			// the independently qualified GCS scenario.
 			continue
@@ -1267,13 +1502,23 @@ func safeArtifacts(raw string) error {
 	if qualification == "gcs-async-nonempty" && !failedRun && !asyncNonemptySeen {
 		return fmt.Errorf("successful async-nonempty artifact set is missing its required scenario evidence")
 	}
+	manualTerminalSeen, err := projectGCSManualTerminalEvidence(raw, public, failedRun)
+	if err != nil {
+		return err
+	}
+	if manualTerminalSeen && qualification != gcsManualTerminalQualification {
+		return fmt.Errorf("manual-terminal evidence requires its explicit artifact qualification selector")
+	}
+	if qualification == gcsManualTerminalQualification && !failedRun && !manualTerminalSeen {
+		return fmt.Errorf("successful manual-terminal artifact set is missing its required scenario evidence")
+	}
 	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
 	if err != nil {
 		return err
 	}
 	required := []string{"actual-exit.txt", "source-head.txt", "image-ids.txt"}
 	if !failedRun {
-		if qualification != "gcs-async-nonempty" {
+		if qualification != "gcs-async-nonempty" && qualification != gcsManualTerminalQualification {
 			required = append(required, "runtime-profile.json", "runtime-component-probe.json")
 		}
 		if asyncEmptySeen {
@@ -1281,6 +1526,9 @@ func safeArtifacts(raw string) error {
 		}
 		if asyncNonemptySeen {
 			required = append(required, gcsAsyncNonemptySummaryName)
+		}
+		if manualTerminalSeen {
+			required = append(required, gcsManualTerminalSummaryName)
 		}
 		if ackLossSeen {
 			required = append(required, gcsAckLossSummaryName)

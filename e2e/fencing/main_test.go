@@ -598,6 +598,42 @@ func TestAsyncNonemptyLauncherRequiresDedicatedNativeScenarioAndProjection(t *te
 	}
 }
 
+func TestManualTerminalLauncherIsExplicitAndUsesNativeApprovalCollector(t *testing.T) {
+	launcher, err := os.ReadFile("../chaos/run-votercount-gcs-chaos.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(launcher)
+	for _, required := range []string{
+		"manual_terminal=${RHIZA_GCS_MANUAL_TERMINAL:-no}",
+		"[ \"$scenario_count\" -le 1 ]",
+		"run-gcs-ha-manual-terminal",
+		"RHIZA_GCS_MANUAL_TERMINAL=yes",
+		"FENCING_E2E_QUALIFICATION=gcs-manual-terminal",
+		"strict manual-terminal artifact projection failed",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("manual-terminal launcher contract is missing %q", required)
+		}
+	}
+	manualStart := strings.Index(source, "if [ \"$manual_terminal\" = yes ]; then\n  : \"${FENCING_E2E_BIN:?manual-terminal qualification requires the fencing-e2e driver}\"")
+	nativeDispatch := strings.Index(source, "step 30-manual-terminal-collector env")
+	nativeInvocation := strings.Index(source, `"$FENCING_E2E_BIN" run-gcs-ha-manual-terminal`)
+	legacyPython := strings.Index(source, "step 30-driver python3 -u")
+	branchExit := strings.Index(source, "echo 'manual-terminal GCS challenge, independent approval, recovery, and readback collector completed'\n  exit 0\nfi\nstep 30-driver python3 -u")
+	if manualStart < 0 || nativeDispatch < manualStart || nativeInvocation < nativeDispatch ||
+		branchExit < nativeInvocation || legacyPython < branchExit {
+		t.Fatal("manual-terminal qualification must use the dedicated native collector and return before the legacy Python path")
+	}
+}
+
+func TestManualTerminalDriverIsDefaultOff(t *testing.T) {
+	t.Setenv("RHIZA_GCS_MANUAL_TERMINAL", "no")
+	if err := qualifyGCSManualTerminal(context.Background()); err == nil || !strings.Contains(err.Error(), "default-off") {
+		t.Fatalf("manual-terminal driver did not fail closed before external access: %v", err)
+	}
+}
+
 func TestScratchAcceptsAPIOmittedFalsePIDOptionsOnly(t *testing.T) {
 	// Matches API serialization: default-false hostPID is omitted, not emitted
 	// as false; all nondefault security and scratch-volume fields are retained.

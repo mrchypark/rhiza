@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
@@ -736,6 +737,233 @@ func TestAsyncNonemptySafeArtifactsRequiresExplicitSelectorAndEvidence(t *testin
 			}
 		})
 	}
+}
+
+func TestManualTerminalPublicProjectionRequiresExactApprovalAndRedactsPrivateEvidence(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsManualTerminalQualification)
+	const privateCanary = "manual-terminal-private-scope-canary"
+	raw := t.TempDir()
+	evidence := manualTerminalPrivateEvidenceFixture(privateCanary)
+	files := map[string][]byte{
+		"actual-exit.txt": []byte("0\n"),
+		"source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt": []byte("registry.example/app@sha256:" + strings.Repeat("b", 64) + "\n" +
+			"registry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+		gcsManualTerminalEventsName:    []byte(`{"event":"private","scope":"` + privateCanary + `"}` + "\n"),
+		gcsManualTerminalChallengeName: manualTerminalChallengeRecord(evidence),
+		gcsManualTerminalEvidenceName:  evidence,
+	}
+	for name, data := range files {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("strict manual-terminal public projection failed: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsManualTerminalSummaryName))
+	if err != nil || bytes.Contains(public, []byte(privateCanary)) || bytes.Contains(public, []byte("sourceClusterID")) {
+		t.Fatalf("public manual-terminal summary leaked private evidence: %s (%v)", public, err)
+	}
+	var summary gcsManualTerminalPublicSummary
+	if err := json.Unmarshal(public, &summary); err != nil || summary.Outcome != "passed" || !summary.SourceAcknowledged ||
+		!summary.NonemptySourceSealed || !summary.IndependentV2Absent || !summary.ChallengeObserved ||
+		!summary.IndependentApproval || !summary.NoPreapprovalTarget || !summary.RecoveryCommitted ||
+		!summary.TargetReadbackVerified || len(summary.PrivateEvidenceSHA256) != 64 || len(summary.PrivateEventsSHA256) != 64 {
+		t.Fatalf("manual-terminal public summary is incomplete: %+v, %v", summary, err)
+	}
+	for _, name := range []string{gcsManualTerminalEvidenceName, gcsManualTerminalChallengeName, gcsManualTerminalEventsName} {
+		if _, err := os.Stat(filepath.Join(raw, "public", name)); !os.IsNotExist(err) {
+			t.Fatalf("private manual-terminal artifact %s was copied publicly", name)
+		}
+	}
+}
+
+func TestManualTerminalProjectionRejectsChallengeFileForDifferentEvidence(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsManualTerminalQualification)
+	raw := t.TempDir()
+	if err := os.Mkdir(filepath.Join(raw, "public"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	evidenceData := manualTerminalPrivateEvidenceFixture("private-scope")
+	var evidence obj
+	if err := json.Unmarshal(evidenceData, &evidence); err != nil {
+		t.Fatal(err)
+	}
+	var challenge operator.ManualRecoveryChallenge
+	if err := json.Unmarshal(encoded(evidence["challenge"]), &challenge); err != nil {
+		t.Fatal(err)
+	}
+	challenge.TargetClusterID = "different-target"
+	digest, err := operator.ManualRecoveryChallengeDigest(challenge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := operator.ManualRecoveryAttestationName(challenge.RecoveryUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for file, data := range map[string][]byte{
+		gcsManualTerminalEvidenceName: evidenceData,
+		gcsManualTerminalChallengeName: encoded(obj{"challenge": challenge, "challengeDigest": digest,
+			"attestationName": name}),
+		gcsManualTerminalEventsName: []byte("{}\n"),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, file), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := projectGCSManualTerminalEvidence(raw, filepath.Join(raw, "public"), false); err == nil {
+		t.Fatal("accepted a valid but unrelated challenge file beside the evidence")
+	}
+}
+
+func TestManualTerminalProjectionRejectsChangedApprovalAndProofMixing(t *testing.T) {
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsManualTerminalQualification)
+	for _, tc := range []struct {
+		name   string
+		mutate func(obj)
+	}{
+		{name: "preapproval target already claimed", mutate: func(e obj) { e["preApprovalTargetUnclaimed"] = false }},
+		{name: "independent proof mixed into manual path", mutate: func(e obj) {
+			e["fenceProof"].(map[string]any)["independentV2"] = obj{"version": 2}
+		}},
+		{name: "legacy independent proof mixed into manual path", mutate: func(e obj) {
+			e["fenceProof"].(map[string]any)["independent"] = obj{"proofID": "legacy-independent"}
+		}},
+		{name: "approval binding changed", mutate: func(e obj) {
+			e["independentApproval"].(map[string]any)["Spec"].(map[string]any)["sourceClusterID"] = "other-source"
+		}},
+		{name: "target recovery changed", mutate: func(e obj) {
+			e["recovery"].(map[string]any)["status"].(map[string]any)["target"] = "other-target"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := t.TempDir()
+			if err := os.Mkdir(filepath.Join(raw, "public"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			var evidence obj
+			if err := json.Unmarshal(manualTerminalPrivateEvidenceFixture("private-scope"), &evidence); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(evidence)
+			for name, data := range map[string][]byte{
+				gcsManualTerminalEvidenceName: encoded(evidence),
+				gcsManualTerminalEventsName:   []byte("{}\n"),
+			} {
+				if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := projectGCSManualTerminalEvidence(raw, filepath.Join(raw, "public"), false); err == nil {
+				t.Fatal("accepted changed or mixed manual-terminal evidence")
+			}
+		})
+	}
+}
+
+func TestManualTerminalSafeArtifactsRequiresExplicitSelectorAndEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selector string
+		evidence bool
+	}{
+		{name: "evidence without selector", evidence: true},
+		{name: "selected successful run without evidence", selector: gcsManualTerminalQualification},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FENCING_E2E_QUALIFICATION", tc.selector)
+			raw := t.TempDir()
+			files := map[string][]byte{"actual-exit.txt": []byte("0\n"), "source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+				"image-ids.txt": []byte("registry.example/app@sha256:" + strings.Repeat("b", 64) + "\n" +
+					"registry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n")}
+			if tc.evidence {
+				files[gcsManualTerminalEventsName] = []byte("{}\n")
+				files[gcsManualTerminalEvidenceName] = manualTerminalPrivateEvidenceFixture("private-scope")
+			}
+			for name, data := range files {
+				if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := safeArtifacts(raw); err == nil {
+				t.Fatal("accepted unselected or evidence-free manual-terminal success")
+			}
+		})
+	}
+}
+
+func manualTerminalChallengeRecord(evidenceData []byte) []byte {
+	var evidence obj
+	if err := json.Unmarshal(evidenceData, &evidence); err != nil {
+		panic("invalid manual terminal evidence fixture: " + err.Error())
+	}
+	var challenge operator.ManualRecoveryChallenge
+	if err := json.Unmarshal(encoded(evidence["challenge"]), &challenge); err != nil {
+		panic("invalid manual terminal challenge fixture: " + err.Error())
+	}
+	digest, _ := operator.ManualRecoveryChallengeDigest(challenge)
+	name, _ := operator.ManualRecoveryAttestationName(challenge.RecoveryUID)
+	return encoded(obj{"challenge": challenge, "challengeDigest": digest, "attestationName": name})
+}
+
+func manualTerminalPrivateEvidenceFixture(privateValue string) []byte {
+	now := time.Now().UTC().Truncate(time.Second)
+	challenge := manualTerminalChallengeFixture(privateValue)
+	challenge.IssuedAt, challenge.ExpiresAt = now.Add(-time.Minute), now.Add(30*time.Minute)
+	challengeDigest, _ := operator.ManualRecoveryChallengeDigest(challenge)
+	attestationName, _ := operator.ManualRecoveryAttestationName(challenge.RecoveryUID)
+	approval := operator.ManualRecoveryAttestationObject{Namespace: challenge.RecoveryNamespace, Name: attestationName, UID: "approval-api-uid", CreatedAt: now,
+		Spec: operator.ManualRecoveryAttestationSpec{Version: 1, ChallengeDigest: challengeDigest, ManualRecoveryBinding: challenge.ManualRecoveryBinding,
+			Assertions: operator.ManualRecoveryAssertions{AllHistoricalRunsTerminated: true, RecreationBlocked: true,
+				OldPeerAndClientWriteAccessBlocked: true, OldArchiveWriterAccessRevoked: true, StorageQuiesced: true},
+			Attester: "incident-review", EvidenceRefs: []string{"runbook://manual-terminal"}}}
+	approvalData, _ := json.Marshal(approval)
+	approvalHash := sha256.Sum256(approvalData)
+	before := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1001", Tip: 1, HeadSHA256: strings.Repeat("1", 64)}
+	sealed := gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "1002", Tip: 1, Sealed: true, HeadSHA256: strings.Repeat("2", 64)}
+	fence := manualTerminalFenceFixture(privateValue)
+	fenceHash := sha256.Sum256(encoded(fence))
+	proof := operator.FenceProof{OperationID: fence.OperationID, SourceClusterID: fence.SourceClusterID, BindingUID: fence.BindingUID,
+		RequestHash: hex.EncodeToString(fenceHash[:]), ProofID: "non-independent-proof"}
+	recovery := operator.Resource{Metadata: map[string]any{"name": challenge.RecoveryName, "namespace": challenge.RecoveryNamespace, "uid": challenge.RecoveryUID},
+		Spec: operator.Spec{StatefulSet: fence.StatefulSet, SourceClusterID: privateValue, RecoveryID: fence.OperationID,
+			Durability: "async", AllowDataLoss: true,
+			Fence: operator.Fence{RecoveryID: fence.OperationID, ClusterID: privateValue, StatefulSetUID: fence.StatefulSetUID, Confirmed: true}},
+		Status: operator.Status{Phase: "Complete", Stage: "Complete", Source: privateValue, StatefulSetUID: fence.StatefulSetUID,
+			Target: challenge.TargetClusterID, TargetBaseKind: "fork", ManualRecoveryChallengeDigest: challengeDigest,
+			ManualAttestationDigest: hex.EncodeToString(approvalHash[:])}}
+	return encoded(obj{"qualification": gcsManualTerminalQualification,
+		"profile":               obj{"provider": "gcs", "noPVC": true, "sourceDurability": "async", "allowDataLoss": true},
+		"sourceAck":             gcsAcknowledgement{RequestID: "gcs-ha-ack-1", Slot: 1, Rows: `[[1,"gcs-manual-terminal-source"]]`},
+		"sourceHeadBeforeFence": before, "sealedSourceHead": sealed, "fence": fence, "fenceProof": proof,
+		"challenge": challenge, "challengeDigest": challengeDigest, "independentApproval": approval,
+		"approvalDigest": hex.EncodeToString(approvalHash[:]), "preApprovalTargetUnclaimed": true, "recovery": recovery,
+		"targetQuorumVerified": true, "recoveredRows": `[[1,"gcs-manual-terminal-source"]]`,
+		"targetAck":           gcsAcknowledgement{RequestID: "gcs-ha-ack-2", Slot: 2, Rows: `[[2,"gcs-manual-terminal-target"]]`},
+		"independentV2Absent": true})
+}
+
+func manualTerminalChallengeFixture(privateValue string) operator.ManualRecoveryChallenge {
+	stamp := strings.Repeat("a", 64)
+	fence := manualTerminalFenceFixture(privateValue)
+	fenceHash := sha256.Sum256(encoded(fence))
+	return operator.ManualRecoveryChallenge{Version: 1,
+		ManualRecoveryBinding: operator.ManualRecoveryBinding{EvidenceKind: operator.ManualTerminalEvidenceKind,
+			RecoveryNamespace: "qualification", RecoveryName: "manual-terminal-recovery", RecoveryUID: "manual-recovery-uid",
+			RecoveryID: fence.OperationID, OperationID: fence.OperationID, SourceClusterID: privateValue,
+			StatefulSetName: fence.StatefulSet, StatefulSetUID: fence.StatefulSetUID, FenceRequestHash: hex.EncodeToString(fenceHash[:]), PolicyDigest: stamp, RootDigest: stamp,
+			LedgerDigest: stamp, CohortDigest: stamp, StorageScopeDigest: stamp, SourceArchiveDigest: stamp,
+			TargetClusterID: "manual-target", TargetBaseKind: "fork", CurrentPodUIDs: []string{"pod-1", "pod-2", "pod-3"}},
+		IssuedAt: time.Now().UTC().Truncate(time.Second), ExpiresAt: time.Now().UTC().Truncate(time.Second).Add(30 * time.Minute)}
+}
+
+func manualTerminalFenceFixture(source string) operator.FenceRequest {
+	return operator.FenceRequest{LogicalID: "manual-terminal", BindingUID: "binding-uid", Namespace: "qualification",
+		StatefulSet: "rhiza", StatefulSetUID: "statefulset-uid", SourceClusterID: source,
+		OperationID: "manual-terminal-operation", Scope: operator.ScopeGeneration,
+		Targets: []operator.FenceTarget{{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0", WALIdentity: "wal-0"}}}
 }
 
 func asyncNonemptyPrivateEvidenceFixture(privateValue string) []byte {
