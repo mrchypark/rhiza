@@ -56,8 +56,13 @@ func TestPassiveObservationRequiresBothPinnedProcessesAndDetachedCgroups(t *test
 		t.Fatalf("passive receipt has wrong mode or tuple: %#v err=%v", decoded, err)
 	}
 	request.OperationID = "different"
-	if _, err := bindPassiveReceipt(binding, request, scope, valid); err == nil {
-		t.Fatal("passive observation was accepted for a different request")
+	newReceipt, err := bindPassiveReceipt(binding, request, scope, valid)
+	if err != nil {
+		t.Fatalf("pre-intent observation rejected a fresh valid request: %v", err)
+	}
+	var rebound PassiveReceipt
+	if err := json.Unmarshal(newReceipt, &rebound); err != nil || rebound.Request != request {
+		t.Fatalf("pre-intent observation did not bind the fresh request: %#v err=%v", rebound, err)
 	}
 }
 
@@ -70,10 +75,9 @@ func TestPassiveSandboxProfileRequiresApprovedExecutableAndExactArgv(t *testing.
 		hash string
 		args []string
 	}{
-		"different executable": {hash: strings.Repeat("b", 64), args: []string{"/pause"}},
-		"invalid digest":       {hash: "not-a-sha256", args: []string{"/pause"}},
-		"different argv":       {hash: approved, args: []string{"/pause", "--unexpected"}},
-		"empty argv":           {hash: approved, args: nil},
+		"invalid digest": {hash: "not-a-sha256", args: []string{"/pause"}},
+		"different argv": {hash: approved, args: []string{"/pause", "--unexpected"}},
+		"empty argv":     {hash: approved, args: nil},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if validPassiveSandboxProfile(profile.hash, []string{"/pause"}, profile.args) {

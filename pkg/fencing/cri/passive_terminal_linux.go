@@ -133,7 +133,7 @@ func (p *Provider) capturePassiveScope(ctx context.Context, binding fencing.Runt
 		return err
 	}
 	sandboxExecutableSHA256, err := sandboxExecutableDigest(procRoot, sandbox.PID, sandboxStart)
-	if err != nil || sandboxExecutableSHA256 != p.profile.SandboxExecutableSHA256 {
+	if err != nil || !sandboxExecutableApproved(p.profile.SandboxExecutableSHA256, sandboxExecutableSHA256) {
 		closePassiveFDs(targetFD, sandboxFD, targetPIDFD, sandboxPIDFD)
 		return fmt.Errorf("%w: sandbox executable is not administrator-qualified", ErrUnverified)
 	}
@@ -156,7 +156,7 @@ func (p *Provider) capturePassiveScope(ctx context.Context, binding fencing.Runt
 		return fmt.Errorf("%w: sandbox identity changed during kernel pin", ErrUnverified)
 	}
 	secondExecutableSHA256, err := sandboxExecutableDigest(procRoot, sandbox.PID, sandboxStart)
-	if err != nil || secondExecutableSHA256 != p.profile.SandboxExecutableSHA256 || secondExecutableSHA256 != sandboxExecutableSHA256 {
+	if err != nil || !sandboxExecutableApproved(p.profile.SandboxExecutableSHA256, secondExecutableSHA256) || secondExecutableSHA256 != sandboxExecutableSHA256 {
 		closePassiveFDs(targetFD, sandboxFD, targetPIDFD, sandboxPIDFD)
 		return fmt.Errorf("%w: sandbox executable changed during kernel pin", ErrUnverified)
 	}
@@ -266,6 +266,10 @@ func processArguments(procRoot string, pid uint32) ([]string, error) {
 		result[i] = string(part)
 	}
 	return result, nil
+}
+
+func sandboxExecutableApproved(approvedSHA256, observedSHA256 string) bool {
+	return validOCIDigest("sha256:"+approvedSHA256) && observedSHA256 == approvedSHA256
 }
 
 func sandboxExecutableDigest(procRoot string, pid uint32, expectedStart uint64) (string, error) {

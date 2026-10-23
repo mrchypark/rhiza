@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -79,6 +80,25 @@ func TestSandboxExecutableDigestMatchesLiveProcExecutable(t *testing.T) {
 	}
 	if _, err := sandboxExecutableDigest("/proc", pid, start+1); err == nil {
 		t.Fatal("changed PID start time was accepted")
+	}
+}
+
+func TestPassiveCaptureRejectsDifferentMeasuredSandboxExecutable(t *testing.T) {
+	procRoot := t.TempDir()
+	writeProcIdentity(t, procRoot, 123, 789, "kubepods/pause")
+	image := sandboxELF32(elf.ET_EXEC, nil)
+	if err := os.WriteFile(filepath.Join(procRoot, "123", "exe"), image, 0600); err != nil {
+		t.Fatal(err)
+	}
+	measured, err := sandboxExecutableDigest(procRoot, 123, 789)
+	if err != nil {
+		t.Fatalf("measure pinned sandbox executable: %v", err)
+	}
+	if !sandboxExecutableApproved(measured, measured) {
+		t.Fatal("capture trust check rejected the exact measured administrator-approved executable")
+	}
+	if sandboxExecutableApproved(strings.Repeat("b", 64), measured) {
+		t.Fatal("capture trust check accepted the measured executable under a different approved digest")
 	}
 }
 

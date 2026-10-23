@@ -760,6 +760,20 @@ func TestManualMissingSourceMembershipReconcilesCanonicalEmptyRecovery(t *testin
 	if err != nil || manualPreflight.ManualMembershipBindingDigest == "" {
 		t.Fatalf("direct manual canonical preflight rejected the controlled fixture: response=%+v err=%v", manualPreflight, err)
 	}
+	configuredArchiveIdentity := f.e.ArchiveStoreIdentity
+	mismatchedArchiveIdentity := make(map[string]string, len(configuredArchiveIdentity))
+	for key, value := range configuredArchiveIdentity {
+		mismatchedArchiveIdentity[key] = value
+	}
+	mismatchedArchiveIdentity["RHIZA_OBJSTORE_PREFIX"] = "different-root"
+	f.e.ArchiveStoreIdentity = mismatchedArchiveIdentity
+	_, mismatchErr := f.e.frozenSourcePreflight(ctx, FrozenSourcePreflightRequest{
+		RecoveryName: resourceName(&child), RecoveryUID: str(child.Metadata["uid"]),
+	})
+	f.e.ArchiveStoreIdentity = configuredArchiveIdentity
+	if mismatchErr == nil {
+		t.Fatal("manual preflight accepted a source workload outside the configured archive identity")
+	}
 	manualController := *controller
 	manualController.Automatic = false
 	for step := 0; step < 5; step++ {
