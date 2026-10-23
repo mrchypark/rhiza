@@ -426,30 +426,49 @@ func verifyPassiveProcessProfile(procRoot string, pid uint32, target bool) error
 }
 
 func openPinnedCgroup(root, relative string, wantDev, wantIno uint64) (int, uint64, uint64, error) {
+	rootFD, fd, dev, ino, err := openPinnedCgroupWithRoot(root, relative, wantDev, wantIno)
+	if err != nil {
+		return -1, 0, 0, err
+	}
+	_ = unix.Close(rootFD)
+	return fd, dev, ino, nil
+}
+
+// openPinnedCgroupWithRoot retains the exact configured cgroup root used for
+// the target lookup. Stop verification uses that same directory handle to
+// distinguish removal from a replacement at the original path.
+func openPinnedCgroupWithRoot(root, relative string, wantDev, wantIno uint64) (rootFD, fd int, dev, ino uint64, err error) {
 	if !filepath.IsAbs(root) || relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, "../") || relative == ".." {
-		return -1, 0, 0, fmt.Errorf("%w: invalid cgroup pin path", ErrUnverified)
+		return -1, -1, 0, 0, fmt.Errorf("%w: invalid cgroup pin path", ErrUnverified)
 	}
-	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	rootFD, err = unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, 0, 0, fmt.Errorf("%w: cgroup root unavailable", ErrUnverified)
+		return -1, -1, 0, 0, fmt.Errorf("%w: cgroup root unavailable", ErrUnverified)
 	}
-	defer unix.Close(rootFD)
-	fd, err := unix.Openat2(rootFD, relative, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS})
+	keepRoot := false
+	defer func() {
+		if !keepRoot {
+			_ = unix.Close(rootFD)
+		}
+	}()
+	fd, err = unix.Openat2(rootFD, relative, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV})
 	if err != nil {
-		return -1, 0, 0, fmt.Errorf("%w: cgroup handle unavailable", ErrUnverified)
+		return -1, -1, 0, 0, fmt.Errorf("%w: cgroup handle unavailable", ErrUnverified)
 	}
 	var stat unix.Stat_t
-	var fs unix.Statfs_t
-	if unix.Fstat(fd, &stat) != nil || unix.Fstatfs(fd, &fs) != nil || uint64(fs.Type) != uint64(unix.CGROUP2_SUPER_MAGIC) {
-		unix.Close(fd)
-		return -1, 0, 0, fmt.Errorf("%w: cgroup handle is not cgroup v2", ErrUnverified)
+	var fs, rootFS unix.Statfs_t
+	if unix.Fstat(fd, &stat) != nil || unix.Fstatfs(fd, &fs) != nil || unix.Fstatfs(rootFD, &rootFS) != nil ||
+		uint64(fs.Type) != uint64(unix.CGROUP2_SUPER_MAGIC) || uint64(rootFS.Type) != uint64(unix.CGROUP2_SUPER_MAGIC) {
+		_ = unix.Close(fd)
+		return -1, -1, 0, 0, fmt.Errorf("%w: cgroup handle is not cgroup v2", ErrUnverified)
 	}
-	dev, ino := pinnedCgroupIdentity(&stat)
+	dev, ino = pinnedCgroupIdentity(&stat)
 	if wantDev != 0 && (dev != wantDev || ino != wantIno) {
-		unix.Close(fd)
-		return -1, 0, 0, fmt.Errorf("%w: cgroup handle identity differs", ErrUnverified)
+		_ = unix.Close(fd)
+		return -1, -1, 0, 0, fmt.Errorf("%w: cgroup handle identity differs", ErrUnverified)
 	}
-	return fd, dev, ino, nil
+	keepRoot = true
+	return rootFD, fd, dev, ino, nil
 }
 
 func pinnedCgroupIdentity(stat *unix.Stat_t) (dev, ino uint64) {

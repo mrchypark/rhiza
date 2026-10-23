@@ -5,7 +5,9 @@ package cri
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -14,10 +16,13 @@ import (
 // addressable across CRI StopContainer. containerd may unlink the cgroup as
 // part of that RPC, before the caller can inspect its former pathname.
 type pinnedStopCgroup struct {
+	mu       sync.Mutex
+	rootFD   int
 	cgroupFD int
 	pidFD    int
 	dev      uint64
 	ino      uint64
+	path     string
 	kernel   stopCgroupKernel
 }
 
@@ -25,15 +30,17 @@ type pinnedStopCgroup struct {
 // used by verifyEmpty, plus FD close. Tests can exercise the production
 // decision logic without mounting or modifying a real cgroup hierarchy.
 type stopCgroupKernel interface {
-	identity(int) (dev, ino, fsType, links uint64, err error)
+	identity(int) (dev, ino, fsType uint64, err error)
 	pidExited(int) error
 	populated(int) (bool, error)
+	scopeAbsent(rootFD int, relative string) (bool, error)
 	close(int) error
 }
 
 type linuxStopCgroupKernel struct {
 	fstat   func(int, *unix.Stat_t) error
 	fstatfs func(int, *unix.Statfs_t) error
+	openat2 func(int, string, *unix.OpenHow) (int, error)
 }
 
 // cgroupObservationError records only a fixed operation and errno class. Its
@@ -72,7 +79,12 @@ func cgroupObservationCode(err error) (string, bool) {
 	return "cgroup_" + observation.operation + "_" + observation.class, true
 }
 
-func (k linuxStopCgroupKernel) identity(fd int) (uint64, uint64, uint64, uint64, error) {
+func missingCgroupEvents(err error) bool {
+	var observation *cgroupObservationError
+	return errors.As(err, &observation) && observation != nil && observation.operation == "events" && errors.Is(observation.cause, unix.ENOENT)
+}
+
+func (k linuxStopCgroupKernel) identity(fd int) (uint64, uint64, uint64, error) {
 	fstat, fstatfs := k.fstat, k.fstatfs
 	if fstat == nil {
 		fstat = unix.Fstat
@@ -83,12 +95,14 @@ func (k linuxStopCgroupKernel) identity(fd int) (uint64, uint64, uint64, uint64,
 	var stat unix.Stat_t
 	var fs unix.Statfs_t
 	if err := fstat(fd, &stat); err != nil {
-		return 0, 0, 0, 0, cgroupObservationFailure("fstat", err)
+		return 0, 0, 0, cgroupObservationFailure("fstat", err)
 	}
 	if err := fstatfs(fd, &fs); err != nil {
-		return 0, 0, 0, 0, cgroupObservationFailure("fstatfs", err)
+		return 0, 0, 0, cgroupObservationFailure("fstatfs", err)
 	}
-	return uint64(stat.Dev), stat.Ino, uint64(fs.Type), uint64(stat.Nlink), nil
+	// kernfs synthesizes directory nlink as subdirs+2; it is not a reliable
+	// cgroup-removal signal and must not authorize a terminal observation.
+	return uint64(stat.Dev), stat.Ino, uint64(fs.Type), nil
 }
 
 func (linuxStopCgroupKernel) pidExited(fd int) error { return verifyPIDFDExited(fd) }
@@ -101,30 +115,75 @@ func (linuxStopCgroupKernel) populated(fd int) (bool, error) {
 	return populated, nil
 }
 
+// scopeAbsent checks the captured relative path beneath the exact root FD
+// retained when the target cgroup was pinned. cgroup v2 rejects rename (its
+// kernfs syscall table has no rename callback), so a missing entry here cannot
+// be a moved scope. A new entry, symlink, mount crossing, or lookup error is
+// not treated as removal.
+func (k linuxStopCgroupKernel) scopeAbsent(rootFD int, relative string) (bool, error) {
+	var rootFS unix.Statfs_t
+	fstatfs := k.fstatfs
+	if fstatfs == nil {
+		fstatfs = unix.Fstatfs
+	}
+	if err := fstatfs(rootFD, &rootFS); err != nil {
+		return false, cgroupObservationFailure("scope_path", err)
+	}
+	if uint64(rootFS.Type) != uint64(unix.CGROUP2_SUPER_MAGIC) {
+		return false, cgroupObservationFailure("scope_path", unix.ENODEV)
+	}
+	openat2 := k.openat2
+	if openat2 == nil {
+		openat2 = unix.Openat2
+	}
+	fd, err := openat2(rootFD, relative, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_XDEV,
+	})
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return true, nil
+		}
+		return false, cgroupObservationFailure("scope_path", err)
+	}
+	_ = unix.Close(fd)
+	return false, nil
+}
+
 func (linuxStopCgroupKernel) close(fd int) error { return unix.Close(fd) }
 
 func pinStopCgroup(procRoot, cgroupRoot string, scope CgroupScope) (stopCgroupPin, error) {
-	fd, dev, ino, err := openPinnedCgroup(cgroupRoot, scope.Path, scope.Dev, scope.Ino)
+	root, err := filepath.EvalSymlinks(cgroupRoot)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve cgroup root", ErrUnverified)
+	}
+	rootFD, fd, dev, ino, err := openPinnedCgroupWithRoot(root, scope.Path, scope.Dev, scope.Ino)
 	if err != nil {
 		return nil, err
 	}
 	pidFD, err := pinPID(procRoot, scope.PID, scope.StartTime)
 	if err != nil {
 		_ = unix.Close(fd)
+		_ = unix.Close(rootFD)
 		return nil, err
 	}
-	return &pinnedStopCgroup{cgroupFD: fd, pidFD: pidFD, dev: dev, ino: ino, kernel: linuxStopCgroupKernel{}}, nil
+	return &pinnedStopCgroup{rootFD: rootFD, cgroupFD: fd, pidFD: pidFD, dev: dev, ino: ino, path: scope.Path, kernel: linuxStopCgroupKernel{}}, nil
 }
 
 func (p *pinnedStopCgroup) verifyEmpty() error {
-	if p == nil || p.cgroupFD < 0 || p.pidFD < 0 {
+	if p == nil {
+		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: enrolled cgroup pin is unavailable", ErrUnverified))
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rootFD < 0 || p.cgroupFD < 0 || p.pidFD < 0 || p.path == "" {
 		return stopCgroupFailure("cgroup_observation_unavailable", fmt.Errorf("%w: enrolled cgroup pin is unavailable", ErrUnverified))
 	}
 	kernel := p.kernel
 	if kernel == nil {
 		kernel = linuxStopCgroupKernel{}
 	}
-	dev, ino, fsType, links, err := kernel.identity(p.cgroupFD)
+	dev, ino, fsType, err := kernel.identity(p.cgroupFD)
 	if err != nil {
 		code, ok := cgroupObservationCode(err)
 		if !ok {
@@ -141,14 +200,25 @@ func (p *pinnedStopCgroup) verifyEmpty() error {
 		}
 		return err
 	}
-	if links == 0 {
-		// cgroup v2 permits removing a cgroup directory only after it and all
-		// descendants are empty. The pinned inode proves this is the enrolled
-		// scope, even though its former name no longer resolves.
-		return nil
-	}
 	populated, err := kernel.populated(p.cgroupFD)
 	if err != nil {
+		if missingCgroupEvents(err) {
+			absent, absentErr := kernel.scopeAbsent(p.rootFD, p.path)
+			if absentErr != nil {
+				code, ok := cgroupObservationCode(absentErr)
+				if !ok {
+					code = "cgroup_observation_unavailable"
+				}
+				return stopCgroupFailure(code, fmt.Errorf("%w: pinned cgroup path cannot be checked", ErrUnverified))
+			}
+			if absent {
+				// cgroup_destroy_locked removes cgroup.events only after checking
+				// populated==0 and no online children, then marks the cgroup dying
+				// so it cannot accept another task or child.
+				return nil
+			}
+			return stopCgroupFailure("cgroup_scope_not_removed", fmt.Errorf("%w: cgroup.events is missing while the captured path remains", ErrUnverified))
+		}
 		code, ok := cgroupObservationCode(err)
 		if !ok {
 			code = "cgroup_observation_unavailable"
@@ -180,6 +250,8 @@ func (p *pinnedStopCgroup) close() {
 	if p == nil {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.cgroupFD >= 0 {
 		kernel := p.kernel
 		if kernel == nil {
@@ -195,5 +267,13 @@ func (p *pinnedStopCgroup) close() {
 		}
 		_ = kernel.close(p.pidFD)
 		p.pidFD = -1
+	}
+	if p.rootFD >= 0 {
+		kernel := p.kernel
+		if kernel == nil {
+			kernel = linuxStopCgroupKernel{}
+		}
+		_ = kernel.close(p.rootFD)
+		p.rootFD = -1
 	}
 }
