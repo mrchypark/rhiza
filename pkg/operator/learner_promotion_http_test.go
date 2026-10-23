@@ -54,6 +54,11 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	f.api.mu.Unlock()
 	controller, _, cluster := automaticBootstrapController(t, f)
 	clusterPath := controller.clusterPath(automaticBootstrapClusterName)
+	// Establish the protected pre-fence automatic-control record before this
+	// test mutates it into a canonical same-ordinal promotion intent.
+	if err := controller.reconcileCluster(ctx, &cluster); err != nil {
+		t.Fatalf("initialize canonical automatic control: %v", err)
+	}
 
 	// The source voter is closed through the real CONTROL fencer. The callbacks
 	// stand in for the already-verified runtime evidence boundary used by the
