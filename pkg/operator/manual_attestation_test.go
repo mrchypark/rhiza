@@ -191,6 +191,7 @@ func validManualAttestationFixture(t *testing.T) (ManualRecoveryChallenge, Manua
 	t.Helper()
 	now := time.Date(2026, time.October, 23, 12, 0, 0, 0, time.UTC)
 	binding := ManualRecoveryBinding{
+		EvidenceKind:         ManualTerminalEvidenceKind,
 		RecoveryNamespace:    "rhiza-test",
 		RecoveryName:         "recovery-1",
 		RecoveryUID:          "recovery-object-uid",
