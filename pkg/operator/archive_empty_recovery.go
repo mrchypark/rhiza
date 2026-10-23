@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,15 +21,17 @@ import (
 // the exact policy snapshot. All source evidence and archive scopes are read
 // and validated by the authority, never supplied as caller assertions.
 type ArchiveEmptyRecoveryRequest struct {
-	RecoveryName           string `json:"recoveryName"`
-	StatefulSetUID         string `json:"statefulSetUID"`
-	TargetClusterID        string `json:"targetClusterID"`
-	OperationID            string `json:"operationID"`
-	SourceFenceOperationID string `json:"sourceFenceOperationID"`
-	TargetMembershipHash   string `json:"targetMembershipHash"`
-	TargetDurability       string `json:"targetDurability"`
-	AllowDataLoss          bool   `json:"allowDataLoss"`
-	PolicyDigest           string `json:"policyDigest"`
+	RecoveryName           string                            `json:"recoveryName"`
+	StatefulSetUID         string                            `json:"statefulSetUID"`
+	TargetClusterID        string                            `json:"targetClusterID"`
+	OperationID            string                            `json:"operationID"`
+	SourceFenceOperationID string                            `json:"sourceFenceOperationID"`
+	TargetMembershipHash   string                            `json:"targetMembershipHash"`
+	TargetDurability       string                            `json:"targetDurability"`
+	AllowDataLoss          bool                              `json:"allowDataLoss"`
+	PolicyDigest           string                            `json:"policyDigest"`
+	RecoveryMode           string                            `json:"recoveryMode,omitempty"`
+	BucketEnvironment      *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
 }
 
 type ArchiveEmptyRecoveryResponse struct {
@@ -42,6 +45,9 @@ func (r ArchiveEmptyRecoveryRequest) validate() error {
 		(r.TargetDurability != "async" && r.TargetDurability != "before-ack") || r.OperationID == r.SourceFenceOperationID ||
 		len(r.RecoveryName) > 253 || len(r.StatefulSetUID) > 128 || len(r.TargetClusterID) > 128 || len(r.OperationID) > 256 || len(r.SourceFenceOperationID) > 256 {
 		return fmt.Errorf("fencing: empty recovery request identity or policy is invalid")
+	}
+	if (r.RecoveryMode == RecoveryModeFrozenSource) != (r.BucketEnvironment != nil) || (r.RecoveryMode != "" && r.RecoveryMode != RecoveryModeFrozenSource) {
+		return fmt.Errorf("fencing: empty recovery mode and bucket environment differ")
 	}
 	return nil
 }
@@ -66,9 +72,9 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	}
 	uid := str(stored.Metadata["uid"])
 	if uid == "" || uid+":"+stored.Spec.RecoveryID != request.OperationID || stored.Spec.RecoveryID != request.SourceFenceOperationID ||
-		request.StatefulSetUID != str(stored.Status.StatefulSetUID) || request.TargetClusterID != "rhiza-r-"+shortID(request.OperationID) ||
+		request.StatefulSetUID != str(stored.Status.StatefulSetUID) ||
 		request.TargetDurability != stored.Spec.Durability || request.AllowDataLoss != stored.Spec.AllowDataLoss || request.PolicyDigest != hashJSON(stored.Spec) ||
-		stored.Status.TargetBaseKind != "empty" || stored.Status.RecoveredTip != 0 || stored.Status.ManifestHash != "" {
+		stored.Status.TargetBaseKind != "empty" || stored.Status.RecoveredTip != 0 || stored.Status.ManifestHash != "" || stored.Status.RecoveryMode != request.RecoveryMode {
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery request differs from persisted recovery resource")
 	}
 
@@ -85,6 +91,9 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
 	sourceID := strings.TrimSpace(env["RHIZA_CLUSTER_ID"])
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		sourceID = strings.TrimSpace(stored.Spec.SourceClusterID)
+	}
 	identity := StoreIdentity(env)
 	basePrefix := strings.Trim(identity["RHIZA_OBJSTORE_PREFIX"], "/")
 	provider := strings.ToLower(strings.TrimSpace(identity["RHIZA_OBJSTORE_PROVIDER"]))
@@ -97,6 +106,19 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	if err := targetScope.Validate(); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
+	claimScope := fencing.ArchiveScope{Provider: provider, Bucket: bucket,
+		Prefix: path.Join(basePrefix, stored.Spec.SourceClusterID), ClusterID: stored.Spec.SourceClusterID}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		frozenIdentity, identityErr := e.controller().frozenSourceIdentity(&stored, sourceState{prefix: sourcePrefix, env: env})
+		expectedTarget, targetErr := recovery.FrozenTargetID(frozenIdentity)
+		if identityErr != nil || targetErr != nil || request.TargetClusterID != expectedTarget || stored.Status.Target != expectedTarget ||
+			stored.Status.FrozenBucketEnvironment == nil || hashJSON(stored.Status.FrozenBucketEnvironment) != hashJSON(request.BucketEnvironment) {
+			return ArchiveEmptyRecoveryResponse{}, errors.Join(identityErr, targetErr, fmt.Errorf("fencing: frozen empty identity or bucket environment differs from persisted mode"))
+		}
+		if err := e.verifyFrozenBucketEnvironment(ctx, bucket, sourcePrefix, *request.BucketEnvironment); err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
+	}
 	// Once the target has committed its immutable genesis, the workload may
 	// already advertise the successor cluster ID and membership. Rejoin through
 	// the persisted authorization/ref/receipt, not by reinterpreting the live
@@ -104,10 +126,43 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	if response, handled, err := e.readExistingEmptyRecovery(ctx, request, stored, basePrefix, targetScope); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	} else if handled {
+		mode := request.RecoveryMode
+		reservationDigest := ""
+		if mode == RecoveryModeFrozenSource {
+			reserved, err := e.ArchiveBucket.Exists(ctx, path.Join(sourcePrefix, "recovery/successor.json"))
+			if err != nil || reserved {
+				return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: frozen-source retry cannot join a legacy successor reservation"))
+			}
+		} else {
+			mode = sourceSuccessorModeLegacy
+			reservationDigest, err = readLegacySuccessorReservation(ctx, e.ArchiveBucket, sourcePrefix, archiveForkReservation{
+				Version: 1, OperationID: request.OperationID, Target: request.TargetClusterID, Source: sourceID,
+				SourceMembership: stored.Status.SourceMembership, StatefulSetUID: request.StatefulSetUID,
+				SpecHash: stored.Status.SpecHash, TargetBaseKind: "empty",
+			})
+			if err != nil {
+				return ArchiveEmptyRecoveryResponse{}, err
+			}
+		}
+		if err := e.verifySourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID,
+			request.SourceFenceOperationID, request.TargetClusterID, "empty", mode, reservationDigest); err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
 		return response, nil
 	}
 	if sourceID == "" || sourceID != stored.Spec.SourceClusterID || sourceID == request.TargetClusterID || sourcePrefix == targetPrefix {
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery source and target identities differ")
+	}
+	sourceDurability := env["RHIZA_OBJSTORE_DURABILITY"]
+	if sourceDurability == "" {
+		sourceDurability = "async"
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if sourceDurability != "async" || !request.AllowDataLoss {
+			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: guarded empty-source recovery requires explicit async allowDataLoss")
+		}
+	} else if request.RecoveryMode != "" || request.TargetClusterID != "rhiza-r-"+shortID(request.OperationID) {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: unsupported empty recovery mode or target")
 	}
 
 	sourceState, _, err := e.AuthorityState.ReadRoot(ctx, request.StatefulSetUID, sourceID)
@@ -129,10 +184,6 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	if err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
-	sourceDurability := env["RHIZA_OBJSTORE_DURABILITY"]
-	if sourceDurability == "" {
-		sourceDurability = "async"
-	}
 	if sourceDurability != "async" && sourceDurability != "before-ack" || (sourceDurability == "async" && !request.AllowDataLoss) {
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: source durability policy does not authorize empty recovery")
 	}
@@ -143,6 +194,46 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	var sourceRecord recovery.MembershipRecord
 	if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceVoters, sourceDurability) {
 		return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: canonical source membership differs from enrolled workload"))
+	}
+	claimMode := request.RecoveryMode
+	if claimMode == "" {
+		claimMode = sourceSuccessorModeLegacy
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource && strings.TrimSpace(env["RHIZA_CLUSTER_ID"]) != stored.Spec.SourceClusterID {
+		// A target-side retry is safe only if the original source-generation
+		// winner already exists and is byte-for-byte the same immutable claim.
+		if strings.TrimSpace(env["RHIZA_CLUSTER_ID"]) != request.TargetClusterID {
+			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: frozen empty recovery runtime is neither its source nor target identity")
+		}
+		expected, err := e.sourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID,
+			request.SourceFenceOperationID, request.TargetClusterID, "empty", RecoveryModeFrozenSource, "")
+		if err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
+		winner, err := e.AuthorityState.readSourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID)
+		if err != nil || winner != expected {
+			return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: target-side retry lacks the original frozen source successor claim"))
+		}
+	}
+	reservationDigest := ""
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		reserved, err := e.ArchiveBucket.Exists(ctx, path.Join(sourcePrefix, "recovery/successor.json"))
+		if err != nil || reserved {
+			return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: frozen-source registration cannot join a legacy successor reservation"))
+		}
+	} else {
+		reservationDigest, err = readLegacySuccessorReservation(ctx, e.ArchiveBucket, sourcePrefix, archiveForkReservation{
+			Version: 1, OperationID: request.OperationID, Target: request.TargetClusterID, Source: sourceID,
+			SourceMembership: sourceFingerprint(sourceID, sourceDurability, sourceVoters, sourcePrefix),
+			StatefulSetUID:   request.StatefulSetUID, SpecHash: immutableSpecHash(stored.Spec), TargetBaseKind: "empty",
+		})
+		if err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
+	}
+	if err := e.claimSourceSuccessor(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID, request.SourceFenceOperationID,
+		request.TargetClusterID, "empty", claimMode, reservationDigest); err != nil {
+		return ArchiveEmptyRecoveryResponse{}, err
 	}
 	targetMembership, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(targetPrefix, "voters/membership.json"), 64<<10)
 	if err != nil || authorityStateDigest(targetMembership) != request.TargetMembershipHash {
@@ -159,6 +250,11 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	if response, found, err := e.readCommittedEmptyRecovery(ctx, request.StatefulSetUID, request.TargetClusterID, targetScope, authorization); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	} else if found {
+		if request.RecoveryMode == RecoveryModeFrozenSource {
+			if err := e.verifyFrozenBucketEnvironment(ctx, bucket, sourcePrefix, *request.BucketEnvironment); err != nil {
+				return ArchiveEmptyRecoveryResponse{}, err
+			}
+		}
 		return response, nil
 	}
 	if err := recovery.RequireEmptyArchiveScope(ctx, e.ArchiveBucket, targetPrefix); err != nil {
@@ -204,8 +300,17 @@ func (e *FencingExecutor) readExistingEmptyRecovery(ctx context.Context, request
 		authorization.SourceScopeHash != sourceScopeHash || authorization.TargetScopeHash != targetScopeHash ||
 		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
 		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != hashJSON(stored.Spec) ||
+		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != sourceScope.Prefix || authorization.BucketMetageneration != frozenBucketMetageneration(request.BucketEnvironment) || authorization.LifecyclePolicyDigest != frozenBucketLifecycleDigest(request.BucketEnvironment) ||
 		stored.Spec.RecoveryID != request.SourceFenceOperationID || stored.Status.StatefulSetUID != request.StatefulSetUID {
 		return ArchiveEmptyRecoveryResponse{}, true, errors.Join(err, sourceErr, targetErr, fmt.Errorf("fencing: persisted empty recovery authorization differs from request"))
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if stored.Status.FrozenBucketEnvironment == nil || hashJSON(stored.Status.FrozenBucketEnvironment) != hashJSON(request.BucketEnvironment) {
+			return ArchiveEmptyRecoveryResponse{}, true, fmt.Errorf("fencing: persisted frozen environment differs from the recovery request")
+		}
+		if err := e.verifyFrozenBucketEnvironment(ctx, targetScope.Bucket, sourceScope.Prefix, *request.BucketEnvironment); err != nil {
+			return ArchiveEmptyRecoveryResponse{}, true, err
+		}
 	}
 	if response, found, err := e.readCommittedEmptyRecovery(ctx, request.StatefulSetUID, request.TargetClusterID, targetScope, authorization); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, true, err
@@ -331,13 +436,12 @@ func (e *FencingExecutor) verifyEmptyRecoverySource(ctx context.Context, request
 		return fenceResource{}, objstore.ObjectVersion{}, nil, errors.Join(err, fencing.ErrPending)
 	}
 	lookup, err := e.lookupMutation(ctx, request.StatefulSetUID, run.Identity, fencing.MutationLookupRequest{ProducerUID: m.ProducerUID, Sequence: m.Sequence, Intent: m.Intent})
-	if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Intent != m.Intent || lookup.Entry.Resolution == nil ||
-		lookup.Entry.Resolution.Outcome != fencing.MutationCommitted || !lookup.Entry.Resolution.AllCopiesTerminal {
+	if err != nil || !lookup.Found || lookup.Entry == nil || lookup.Entry.Intent != m.Intent || lookup.Entry.Resolution == nil || lookup.Entry.Resolution.Outcome != fencing.MutationCommitted {
 		return fenceResource{}, objstore.ObjectVersion{}, nil, errors.Join(err, fencing.ErrPending)
 	}
 	manager := recovery.NewManager(e.ArchiveBucket, sourcePrefix, recovery.ArchiveConfigID)
 	defer manager.Close()
-	if err := manager.Load(ctx); err != nil || manager.Tip() != 0 || !manager.Sealed() {
+	if err := manager.Load(ctx); err != nil || manager.Tip() != 0 {
 		return fenceResource{}, objstore.ObjectVersion{}, nil, errors.Join(err, fencing.ErrPending)
 	}
 	version, ok := manager.HeadVersion()
@@ -353,10 +457,47 @@ func (e *FencingExecutor) verifyEmptyRecoverySource(ctx context.Context, request
 	if err != nil || attrs.Version == nil || *attrs.Version != version {
 		return fenceResource{}, objstore.ObjectVersion{}, nil, errors.Join(err, fencing.ErrPending)
 	}
-	if err := e.verifyEmptyRecoverySeal(ctx, sourcePrefix, request.SourceFenceOperationID); err != nil {
-		return fenceResource{}, objstore.ObjectVersion{}, nil, err
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if lookup.Entry.GuardedLogicalResolution == nil || lookup.Entry.Resolution.AllCopiesTerminal || lookup.Entry.Preparation == nil ||
+			!fencing.IsHeldCreateEligible(m.Intent, *lookup.Entry.Preparation) || m.Intent.Key != "archive/head.bin" ||
+			m.Intent.Condition != (fencing.MutationCondition{Mode: fencing.MutationCreateOnly}) ||
+			m.Intent.PayloadDigest != authorityStateDigest(emptyHead) {
+			return fenceResource{}, objstore.ObjectVersion{}, nil, fmt.Errorf("fencing: source empty HEAD lacks the exact guarded held-create resolution")
+		}
+		if manager.Sealed() || !bytes.Equal(data, emptyHead) {
+			return fenceResource{}, objstore.ObjectVersion{}, nil, fmt.Errorf("fencing: guarded empty source HEAD is not canonical and unsealed")
+		}
+		if err := e.verifyGuardedLogicalResolution(ctx, runtime, run, m.ProducerUID, m.Sequence, *lookup.Entry, provider); err != nil {
+			return fenceResource{}, objstore.ObjectVersion{}, nil, err
+		}
+		if err := verifyFrozenEmptyArchiveNamespace(ctx, e.ArchiveBucket, sourcePrefix); err != nil {
+			return fenceResource{}, objstore.ObjectVersion{}, nil, err
+		}
+	} else {
+		if !lookup.Entry.Resolution.AllCopiesTerminal || !manager.Sealed() {
+			return fenceResource{}, objstore.ObjectVersion{}, nil, fencing.ErrPending
+		}
+		if err := e.verifyEmptyRecoverySeal(ctx, sourcePrefix, request.SourceFenceOperationID); err != nil {
+			return fenceResource{}, objstore.ObjectVersion{}, nil, err
+		}
 	}
 	return fence, version, data, nil
+}
+
+func verifyFrozenEmptyArchiveNamespace(ctx context.Context, bucket objstore.Bucket, prefix string) error {
+	headKey := path.Join(prefix, "archive/head.bin")
+	if err := bucket.Iter(ctx, prefix, func(key string) error {
+		if strings.HasPrefix(key, path.Join(prefix, "archive")+"/") && key != headKey {
+			return fmt.Errorf("fencing: guarded empty source contains additional archive history")
+		}
+		if strings.HasPrefix(key, path.Join(prefix, "checkpoint")+"/") {
+			return fmt.Errorf("fencing: guarded empty source contains checkpoint history")
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("fencing: cannot enumerate guarded empty source history: %w", err)
+	}
+	return nil
 }
 
 // verifyEmptyRecoveryClosedRootBinding keeps two checks distinct: the V2
@@ -412,6 +553,11 @@ func (e *FencingExecutor) makeEmptyRecoveryAuthorization(request ArchiveEmptyRec
 		SourceMembershipHash: authorityStateDigest(jsonBytes(sourceMembership)), SourceDurability: sourceDurability,
 		TargetMembershipHash: request.TargetMembershipHash, TargetDurability: request.TargetDurability,
 		AllowDataLoss: request.AllowDataLoss, PolicyDigest: request.PolicyDigest,
+		RecoveryMode:          request.RecoveryMode,
+		SourcePrefix:          sourcePrefix,
+		BucketName:            targetScope.Bucket,
+		BucketMetageneration:  frozenBucketMetageneration(request.BucketEnvironment),
+		LifecyclePolicyDigest: frozenBucketLifecycleDigest(request.BucketEnvironment),
 	}
 	if err := auth.Validate(); err != nil {
 		return fencing.ArchiveEmptyRecoveryAuthorization{}, err
@@ -495,6 +641,11 @@ func (e *FencingExecutor) prepareEmptyRecoveryRoot(ctx context.Context, uid, tar
 }
 
 func (e *FencingExecutor) emptyRecoveryResponse(ctx context.Context, uid, targetID string, scope fencing.ArchiveScope, authorization fencing.ArchiveEmptyRecoveryAuthorization) (ArchiveEmptyRecoveryResponse, error) {
+	if authorization.RecoveryMode == RecoveryModeFrozenSource {
+		if err := e.verifyFrozenBucketEnvironment(ctx, authorization.BucketName, authorization.SourcePrefix, recovery.FrozenBucketEnvironment{Metageneration: authorization.BucketMetageneration, LifecycleDigest: authorization.LifecyclePolicyDigest}); err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
+	}
 	claim, _, err := e.AuthorityState.ReadArchiveScopeClaim(ctx, scope)
 	if err != nil || claim.EmptyRecoveryAuthorization == nil || hashJSON(claim.EmptyRecoveryAuthorization) != hashJSON(&authorization) {
 		return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fencing.ErrPending)
@@ -536,6 +687,11 @@ func (e *FencingExecutor) emptyRecoveryResponse(ctx context.Context, uid, target
 	}
 	if err := verifyCommittedEmptyRecoveryTargetHead(ctx, e.ArchiveBucket, scope.Prefix); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fencing.ErrPending)
+	}
+	if authorization.RecoveryMode == RecoveryModeFrozenSource {
+		if err := e.verifyFrozenBucketEnvironment(ctx, authorization.BucketName, authorization.SourcePrefix, recovery.FrozenBucketEnvironment{Metageneration: authorization.BucketMetageneration, LifecycleDigest: authorization.LifecyclePolicyDigest}); err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
 	}
 	response.State = fencing.EmptyRecoveryCommitted
 	return response, nil

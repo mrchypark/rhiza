@@ -23,10 +23,13 @@ import (
 // service account. OperationID is the recovery/anchor operation; the source
 // fence operation is a distinct immutable RhizaFence identity.
 type ArchiveForkGenesisRequest struct {
-	StatefulSetUID         string `json:"statefulSetUID"`
-	TargetClusterID        string `json:"targetClusterID"`
-	OperationID            string `json:"operationID"`
-	SourceFenceOperationID string `json:"sourceFenceOperationID"`
+	RecoveryName           string                            `json:"recoveryName,omitempty"`
+	StatefulSetUID         string                            `json:"statefulSetUID"`
+	TargetClusterID        string                            `json:"targetClusterID"`
+	OperationID            string                            `json:"operationID"`
+	SourceFenceOperationID string                            `json:"sourceFenceOperationID"`
+	RecoveryMode           string                            `json:"recoveryMode,omitempty"`
+	BucketEnvironment      *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
 }
 
 // ArchiveForkGenesisResponse makes the persisted source profile explicit to
@@ -48,8 +51,27 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: archive fork registration is unavailable")
 	}
 	if request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" || request.SourceFenceOperationID == "" ||
-		len(request.StatefulSetUID) > 128 || len(request.TargetClusterID) > 128 || len(request.OperationID) > 256 || len(request.SourceFenceOperationID) > 256 {
+		len(request.StatefulSetUID) > 128 || len(request.TargetClusterID) > 128 || len(request.OperationID) > 256 || len(request.SourceFenceOperationID) > 256 ||
+		(request.RecoveryMode != "" && request.RecoveryMode != RecoveryModeFrozenSource) {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: archive fork registration identity is incomplete")
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if request.RecoveryName == "" || request.BucketEnvironment == nil {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: frozen-source registration lacks persisted recovery identity")
+		}
+		var stored Resource
+		if err := e.Kube.Get(ctx, e.controller().resourcePath(request.RecoveryName), &stored); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		uid := str(stored.Metadata["uid"])
+		if uid == "" || uid+":"+stored.Spec.RecoveryID != request.OperationID || stored.Spec.RecoveryID != request.SourceFenceOperationID ||
+			stored.Status.StatefulSetUID != request.StatefulSetUID || stored.Status.RecoveryMode != RecoveryModeFrozenSource ||
+			stored.Status.TargetBaseKind != "fork" || stored.Status.Stage != "FrozenForked" || stored.Status.Target != request.TargetClusterID || stored.Status.FrozenBucketEnvironment == nil ||
+			hashJSON(stored.Status.FrozenBucketEnvironment) != hashJSON(request.BucketEnvironment) {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: frozen-source registration differs from its persisted recovery mode")
+		}
+	} else if request.RecoveryName != "" || request.BucketEnvironment != nil {
+		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: legacy fork cannot carry frozen-source recovery bindings")
 	}
 	sts, err := e.archiveForkStatefulSet(ctx, request.StatefulSetUID)
 	if err != nil {
@@ -77,6 +99,9 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 		return ArchiveForkGenesisResponse{}, err
 	}
 	if !state.Ledger.RequireMutationJournal {
+		if request.RecoveryMode != "" {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: frozen-source recovery requires the independently journaled profile")
+		}
 		if err := e.verifyCooperativeArchiveForkSource(ctx, request, sourceID, state); err != nil {
 			return ArchiveForkGenesisResponse{}, err
 		}
@@ -97,6 +122,7 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 	if basePrefix == "." || sourcePrefix == targetPrefix || sourcePrefix == "" || targetPrefix == "" {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: archive fork prefixes are invalid")
 	}
+	var frozenBinding *recovery.FrozenSourceBinding
 	if state.Ledger.ClosedBy != request.SourceFenceOperationID {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source root is not closed by the requested fence")
 	}
@@ -147,6 +173,37 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 	if scopeProvider != "gcs" || scopeBucket == "" {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: archive fork registration requires the configured GCS source provider")
 	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if request.BucketEnvironment == nil {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: frozen-source bucket environment is missing")
+		}
+		if err := e.verifyFrozenBucketEnvironment(ctx, scopeBucket, sourcePrefix, *request.BucketEnvironment); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		sourceScope := fencing.ArchiveScope{Provider: scopeProvider, Bucket: scopeBucket, Prefix: sourcePrefix, ClusterID: sourceID}
+		scopeHash, err := sourceScope.Hash()
+		if err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		sourceIdentity := recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: sourceID, StatefulSetUID: request.StatefulSetUID}
+		expected, err := recovery.FrozenTargetID(sourceIdentity)
+		if err != nil || request.TargetClusterID != expected {
+			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: frozen-source target differs from stable source identity"))
+		}
+		frozenBinding = &recovery.FrozenSourceBinding{Identity: sourceIdentity, FenceProofDigest: hashJSON(fence.Status.Proof), ClosedRootDigest: e.ledgerHash(state)}
+	} else if request.BucketEnvironment != nil {
+		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: legacy fork cannot carry a frozen-source bucket environment")
+	}
+	recoveryUID, _, ok := strings.Cut(request.OperationID, ":")
+	if !ok || recoveryUID == "" {
+		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: archive fork operation has no recovery resource identity")
+	}
+	claimMode := request.RecoveryMode
+	if claimMode == "" {
+		claimMode = sourceSuccessorModeLegacy
+	}
+	sourceScope := fencing.ArchiveScope{Provider: scopeProvider, Bucket: scopeBucket, Prefix: sourcePrefix, ClusterID: sourceID}
+	reservationDigest := ""
 	sourceMembers, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
 	if err != nil {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: source membership is unavailable: %w", err)
@@ -166,21 +223,38 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 	if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceMembers, sourceDurability) {
 		return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source membership differs from enrolled workload"))
 	}
-	reservationData, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "recovery/successor.json"), 64<<10)
-	if err != nil {
-		return ArchiveForkGenesisResponse{}, err
+	if request.RecoveryMode == "" {
+		reservationData, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "recovery/successor.json"), 64<<10)
+		if err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		var reservation archiveForkReservation
+		if err := decodeCanonicalArchiveJSON(reservationData, &reservation); err != nil || reservation.Version != 1 || reservation.OperationID != request.OperationID || reservation.Target != request.TargetClusterID || reservation.Source != sourceID || reservation.StatefulSetUID != request.StatefulSetUID || reservation.SourceMembership != sourceFingerprint(sourceID, sourceDurability, sourceMembers, sourcePrefix) || !validEvidenceDigest(reservation.SpecHash) || (reservation.TargetBaseKind != "" && reservation.TargetBaseKind != "fork") {
+			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: archive fork request differs from the immutable successor reservation"))
+		}
+		reservationDigest = authorityStateDigest(reservationData)
+	} else {
+		reserved, err := e.ArchiveBucket.Exists(ctx, path.Join(sourcePrefix, "recovery/successor.json"))
+		if err != nil || reserved {
+			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: frozen-source registration cannot join a legacy successor reservation"))
+		}
 	}
-	var reservation archiveForkReservation
-	if err := decodeCanonicalArchiveJSON(reservationData, &reservation); err != nil || reservation.Version != 1 || reservation.OperationID != request.OperationID || reservation.Target != request.TargetClusterID || reservation.Source != sourceID || reservation.StatefulSetUID != request.StatefulSetUID || reservation.SourceMembership != sourceFingerprint(sourceID, sourceDurability, sourceMembers, sourcePrefix) || !validEvidenceDigest(reservation.SpecHash) {
-		return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: archive fork request differs from the immutable successor reservation"))
+	if err := e.claimSourceSuccessor(ctx, sourceScope, request.StatefulSetUID, recoveryUID, request.OperationID, request.SourceFenceOperationID,
+		request.TargetClusterID, "fork", claimMode, reservationDigest); err != nil {
+		return ArchiveForkGenesisResponse{}, err
 	}
 	scope := fencing.ArchiveScope{Provider: scopeProvider, Bucket: scopeBucket, Prefix: targetPrefix, ClusterID: request.TargetClusterID}
 	if err := scope.Validate(); err != nil {
 		return ArchiveForkGenesisResponse{}, err
 	}
-	ref, err := e.verifyArchiveForkArtifacts(ctx, request, sourceID, sourcePrefix, targetPrefix, scope, sourceMembers, sourceDurability)
+	ref, err := e.verifyArchiveForkArtifacts(ctx, request, sourceID, sourcePrefix, targetPrefix, scope, sourceMembers, sourceDurability, frozenBinding)
 	if err != nil {
 		return ArchiveForkGenesisResponse{}, err
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if err := e.verifyFrozenBucketEnvironment(ctx, scopeBucket, sourcePrefix, *request.BucketEnvironment); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
 	}
 	if err := e.initializeRoot(ctx, request.StatefulSetUID, request.TargetClusterID); err != nil {
 		return ArchiveForkGenesisResponse{}, err
@@ -191,6 +265,11 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 	}
 	if err := e.commitArchiveGenesisRef(ctx, request.StatefulSetUID, request.TargetClusterID, scope, ref); err != nil {
 		return ArchiveForkGenesisResponse{}, err
+	}
+	if request.RecoveryMode == RecoveryModeFrozenSource {
+		if err := e.verifyFrozenBucketEnvironment(ctx, scopeBucket, sourcePrefix, *request.BucketEnvironment); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
 	}
 	return ArchiveForkGenesisResponse{Profile: "independent", GenesisRegistered: true}, nil
 }
@@ -307,14 +386,15 @@ func (e *FencingExecutor) readCanonicalSourceFence(ctx context.Context, registra
 }
 
 type archiveForkIntentRecord struct {
-	Version              int      `json:"version"`
-	OperationID          string   `json:"operation_id"`
-	SourcePrefix         string   `json:"source_prefix"`
-	TargetPrefix         string   `json:"target_prefix"`
-	MemberIDs            []string `json:"member_ids"`
-	ManifestHash         string   `json:"manifest_hash"`
-	SourceBootstrapHash  string   `json:"source_bootstrap_hash,omitempty"`
-	TargetMembershipHash string   `json:"target_membership_hash,omitempty"`
+	Version              int                           `json:"version"`
+	OperationID          string                        `json:"operation_id"`
+	SourcePrefix         string                        `json:"source_prefix"`
+	TargetPrefix         string                        `json:"target_prefix"`
+	MemberIDs            []string                      `json:"member_ids"`
+	ManifestHash         string                        `json:"manifest_hash"`
+	SourceBootstrapHash  string                        `json:"source_bootstrap_hash,omitempty"`
+	TargetMembershipHash string                        `json:"target_membership_hash,omitempty"`
+	FrozenSource         *recovery.FrozenSourceBinding `json:"frozen_source,omitempty"`
 }
 type archiveForkReservation struct {
 	Version          int    `json:"version"`
@@ -324,6 +404,7 @@ type archiveForkReservation struct {
 	SourceMembership string `json:"source_membership"`
 	StatefulSetUID   string `json:"statefulset_uid"`
 	SpecHash         string `json:"spec_hash"`
+	TargetBaseKind   string `json:"target_base_kind,omitempty"`
 }
 type archiveForkLineageRecord struct {
 	Version          int                       `json:"version"`
@@ -335,12 +416,13 @@ type archiveForkLineageRecord struct {
 	Fork             recovery.ForkResult       `json:"fork"`
 }
 
-func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, request ArchiveForkGenesisRequest, sourceID, sourcePrefix, targetPrefix string, scope fencing.ArchiveScope, sourceMembers []quepaxa.Member, sourceDurability string) (fencing.ArchiveGenesisRef, error) {
+func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, request ArchiveForkGenesisRequest, sourceID, sourcePrefix, targetPrefix string, scope fencing.ArchiveScope, sourceMembers []quepaxa.Member, sourceDurability string, frozen *recovery.FrozenSourceBinding) (fencing.ArchiveGenesisRef, error) {
 	anchor, anchorHash, err := recovery.ReadGenerationAnchor(ctx, e.ArchiveBucket, targetPrefix)
 	if err != nil {
 		return fencing.ArchiveGenesisRef{}, err
 	}
-	if anchor.OperationID != request.OperationID || anchor.SourcePrefix != sourcePrefix || anchor.TargetPrefix != targetPrefix || anchor.SourceTip == 0 {
+	if anchor.OperationID != request.OperationID || anchor.SourcePrefix != sourcePrefix || anchor.TargetPrefix != targetPrefix || anchor.SourceTip == 0 ||
+		(frozen == nil) != (anchor.FrozenSource == nil) || frozen != nil && (anchor.FrozenSource.Identity != frozen.Identity || anchor.FrozenSource.FenceProofDigest != frozen.FenceProofDigest || anchor.FrozenSource.ClosedRootDigest != frozen.ClosedRootDigest) {
 		return fencing.ArchiveGenesisRef{}, fmt.Errorf("fencing: verified anchor does not match source, target, or recovery operation")
 	}
 	membershipData, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(targetPrefix, "voters/membership.json"), 64<<10)
@@ -359,10 +441,17 @@ func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, reques
 		return fencing.ArchiveGenesisRef{}, err
 	}
 	var intent archiveForkIntentRecord
-	if err := decodeCanonicalArchiveJSON(intentData, &intent); err != nil || (intent.Version != 1 && intent.Version != 2) || intent.OperationID != request.OperationID || intent.SourcePrefix != sourcePrefix || intent.TargetPrefix != targetPrefix || intent.ManifestHash != anchor.SourceManifest {
+	validIntentVersion := func(version int) bool {
+		if frozen != nil {
+			return version == 3
+		}
+		return version == 1 || version == 2
+	}
+	if err := decodeCanonicalArchiveJSON(intentData, &intent); err != nil || !validIntentVersion(intent.Version) || intent.OperationID != request.OperationID || intent.SourcePrefix != sourcePrefix || intent.TargetPrefix != targetPrefix || intent.ManifestHash != anchor.SourceManifest ||
+		(frozen == nil) != (intent.FrozenSource == nil) || frozen != nil && hashJSON(intent.FrozenSource) != hashJSON(anchor.FrozenSource) {
 		return fencing.ArchiveGenesisRef{}, errors.Join(err, fmt.Errorf("fencing: fork intent differs from verified anchor"))
 	}
-	if intent.Version != 2 || len(intent.MemberIDs) != len(sourceMembers) || intent.SourceBootstrapHash == "" || intent.TargetMembershipHash == "" {
+	if (intent.Version != 2 && intent.Version != 3) || len(intent.MemberIDs) != len(sourceMembers) || intent.SourceBootstrapHash == "" || intent.TargetMembershipHash == "" {
 		return fencing.ArchiveGenesisRef{}, fmt.Errorf("fencing: fork intent lacks anchored source and target membership bindings")
 	}
 	wantMembers := make([]string, 0, len(sourceMembers))
@@ -389,7 +478,8 @@ func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, reques
 		return fencing.ArchiveGenesisRef{}, err
 	}
 	var result recovery.ForkResult
-	if err := decodeCanonicalArchiveJSON(resultData, &result); err != nil || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash {
+	if err := decodeCanonicalArchiveJSON(resultData, &result); err != nil || result.Tip != anchor.SourceTip || result.ManifestHash != anchor.SourceManifest || result.PrefixHash != anchor.SourcePrefixHash ||
+		(frozen == nil) != (result.FrozenSource == nil) || frozen != nil && hashJSON(result.FrozenSource) != hashJSON(anchor.FrozenSource) {
 		return fencing.ArchiveGenesisRef{}, errors.Join(err, fmt.Errorf("fencing: fork result differs from verified anchor"))
 	}
 	lineageData, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(targetPrefix, "recovery/generation.json"), 64<<10)
@@ -413,8 +503,22 @@ func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, reques
 	}
 	sourceArchive := recovery.NewManager(e.ArchiveBucket, sourcePrefix, recovery.ArchiveConfigID)
 	defer sourceArchive.Close()
-	if err := sourceArchive.Load(ctx); err != nil || !sourceArchive.Sealed() || uint64(sourceArchive.Tip()) != result.Tip {
-		return fencing.ArchiveGenesisRef{}, errors.Join(err, fmt.Errorf("fencing: fork source archive is not the exact sealed generation"))
+	if err := sourceArchive.Load(ctx); err != nil || uint64(sourceArchive.Tip()) != result.Tip {
+		return fencing.ArchiveGenesisRef{}, errors.Join(err, fmt.Errorf("fencing: fork source archive is not the exact generation"))
+	}
+	if frozen == nil && !sourceArchive.Sealed() {
+		return fencing.ArchiveGenesisRef{}, fmt.Errorf("fencing: legacy fork source archive is not sealed")
+	}
+	if frozen != nil {
+		frontier := anchor.FrozenSource.Frontier
+		if request.BucketEnvironment == nil || frontier.BucketMetageneration != request.BucketEnvironment.Metageneration || frontier.LifecyclePolicyDigest != request.BucketEnvironment.LifecycleDigest {
+			return fencing.ArchiveGenesisRef{}, fmt.Errorf("fencing: frozen source bucket environment differs from the materialized anchor")
+		}
+		attrs, attrErr := e.ArchiveBucket.Attributes(ctx, path.Join(sourcePrefix, "archive/head.bin"))
+		data, readErr := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "archive/head.bin"), 64<<10)
+		if attrErr != nil || readErr != nil || attrs.Version == nil || *attrs.Version != frontier.HeadVersion || authorityStateDigest(data) != frontier.HeadDigest || frontier.Tip != uint64(sourceArchive.Tip()) || sourceArchive.Sealed() {
+			return fencing.ArchiveGenesisRef{}, errors.Join(attrErr, readErr, fmt.Errorf("fencing: frozen source frontier differs from the current unsealed archive"))
+		}
 	}
 	anchorDigest := anchorHash
 	intentDigest, resultDigest, lineageDigest := authorityStateDigest(intentData), authorityStateDigest(resultData), authorityStateDigest(lineageData)

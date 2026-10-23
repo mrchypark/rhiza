@@ -338,6 +338,10 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 		e.handleArchiveEmptyRecovery(w, r)
 		return
 	}
+	if r.URL.Path == frozenSourcePreflightPath {
+		e.handleFrozenSourcePreflight(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/v1/archive-genesis/") {
 		e.handleArchiveForkGenesis(w, r)
 		return
