@@ -441,8 +441,9 @@ func TestFrozenEmptyRecoverySettlesUnknownHeldGenesisAfterClosure(t *testing.T) 
 		t.Fatalf("authorization was not separately persisted before target genesis: claim=%+v err=%v", targetClaim, err)
 	}
 	targetRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, targetID)
-	if err != nil || targetRoot.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisEmptyRecoveryPending || targetRoot.Ledger.ArchiveGenesisRef != nil {
-		t.Fatalf("target root advanced without a real committed genesis receipt: root=%+v err=%v", targetRoot.Ledger, err)
+	if err != nil || targetRoot.Ledger.ArchiveGenesisState != fencing.ArchiveGenesisAwaitingRef || targetRoot.Ledger.ArchiveGenesisRef != nil ||
+		targetRoot.Ledger.EmptyRecoveryAuthorization == nil {
+		t.Fatalf("target root did not remain authorized but uncommitted pending a real genesis receipt: root=%+v err=%v", targetRoot.Ledger, err)
 	}
 	gcs.mu.Lock()
 	postsAfterAuthorization := gcs.posts

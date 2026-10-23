@@ -262,8 +262,12 @@ func TestEmptyRecoveryVerifiesRealSealedSourceAndClosedRoot(t *testing.T) {
 	if err != nil || registered.State != fencing.EmptyRecoveryAuthorized {
 		t.Fatalf("register verified empty source recovery: response=%+v err=%v", registered, err)
 	}
+	if registered.Authorization.RecoveryMode != "" || registered.Authorization.SourcePrefix != "" || registered.Authorization.BucketName != "" ||
+		registered.Authorization.BucketMetageneration != "" || registered.Authorization.LifecyclePolicyDigest != "" {
+		t.Fatalf("legacy empty authorization unexpectedly contains frozen-source environment: %+v", registered.Authorization)
+	}
 	// ResourceVersion and annotations may change after source closure. The
-	// committed controller retry must join the immutable auth/root/claim rather
+	// legacy exact retry must join the immutable auth/root/claim rather
 	// than hashing mutable Kubernetes metadata into the proof identity.
 	fence.Metadata["resourceVersion"] = "2"
 	fence.Metadata["annotations"] = object{"benign": "updated after close"}

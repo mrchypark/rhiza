@@ -19,6 +19,9 @@ import (
 func TestFrozenSourcePreflightUsesReadOnlyControlAuthority(t *testing.T) {
 	f := newHeldProfileFixture(t)
 	ctx := t.Context()
+	dataBucket := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = dataBucket.Close() })
+	f.e.ArchiveBucket = dataBucket
 	if _, err := f.e.change(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 		ledger.RequireRuntimeBinding = true
 		ledger.RequireMutationJournal = true
@@ -52,9 +55,6 @@ func TestFrozenSourcePreflightUsesReadOnlyControlAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dataBucket := objstore.NewInMemBucket()
-	t.Cleanup(func() { _ = dataBucket.Close() })
-	f.e.ArchiveBucket = dataBucket
 	dataPrefix := f.scope.Prefix
 	dataAuthority, err := NewAuthorityStateStore(dataBucket, dataPrefix)
 	if err != nil {
