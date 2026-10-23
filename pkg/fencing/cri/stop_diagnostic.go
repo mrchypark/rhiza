@@ -53,7 +53,12 @@ func ValidStopDiagnostic(stage, code string) bool {
 	case "post_container_state":
 		return code == "container_state_unverified"
 	case "pre_sandbox_scope":
-		return code == "cgroup_scope_unverified"
+		switch code {
+		case "cgroup_scope_unverified", "cgroup_identity_changed", "cgroup_observation_unavailable", "target_process_live", "target_process_state_unavailable", "cgroup_populated":
+			return true
+		default:
+			return false
+		}
 	case "pre_sandbox_identity":
 		return code == "runtime_identity_unverified"
 	case "cri_stop_sandbox":
