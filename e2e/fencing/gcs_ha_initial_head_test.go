@@ -67,7 +67,7 @@ func TestPrepareInitialHeadFaultBindsFreshNamespaceAndDataScopeBeforeSourceExist
 	}
 	namespaceJSON := writeJSON("namespace.json", map[string]any{"metadata": map[string]any{"name": namespace, "uid": "namespace-uid-fresh"}})
 	rhizaConfigJSON := writeJSON("rhiza-config.json", map[string]any{"data": map[string]any{
-		"RHIZA_OBJSTORE_BUCKET": "qualification-bucket", "RHIZA_OBJSTORE_PREFIX": "runs/a1b2c3d4",
+		"RHIZA_OBJSTORE_BUCKET": "qualification-bucket", "RHIZA_OBJSTORE_PREFIX": "runs/a1b2c3d4/data",
 		"RHIZA_CLUSTER_ID": "source-cluster", "FENCER_AUTHORITY_STATE_PREFIX": "runs/a1b2c3d4/control",
 	}})
 	deployment := map[string]any{
@@ -328,7 +328,7 @@ func TestInitialHeadFencerRequiresRunDerivedControlPrefix(t *testing.T) {
 		map[string]any{"kind": "Deployment", "name": "rhiza-fencer", "uid": "fencer-deployment-uid", "controller": true},
 	}}})
 	configMapJSON := writeJSON("rhiza-config.json", map[string]any{"data": map[string]any{
-		"RHIZA_OBJSTORE_BUCKET": "qualification-bucket", "RHIZA_OBJSTORE_PREFIX": "runs/a1b2c3d4", "RHIZA_CLUSTER_ID": "source-cluster",
+		"RHIZA_OBJSTORE_BUCKET": "qualification-bucket", "RHIZA_OBJSTORE_PREFIX": "runs/a1b2c3d4/data", "RHIZA_CLUSTER_ID": "source-cluster",
 	}})
 	logPath := filepath.Join(tmp, "kubectl.log")
 	kubectlPath := filepath.Join(tmp, "kubectl")
@@ -485,9 +485,24 @@ func TestInitialHeadCleanupRestoresOnlyCapturedTemplateAndUIDs(t *testing.T) {
 		!strings.Contains(log, `"op":"test","path":"/spec/template","value":`) ||
 		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/containers/0/args","value":["serve"]`) ||
 		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/containers/0/volumeMounts","value":[]`) ||
-		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/volumes","value":[]`) ||
-		!strings.Contains(log, `--preconditions=uid=original-configmap-uid`) {
+		!strings.Contains(log, `"op":"replace","path":"/spec/template/spec/volumes","value":[]`) {
 		t.Fatalf("cleanup did not restore the exact saved template under UID preconditions: %s", log)
+	}
+	deleteBody, err := os.ReadFile(deleteBodyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deleteOptions struct {
+		APIVersion    string `json:"apiVersion"`
+		Kind          string `json:"kind"`
+		Preconditions struct {
+			UID             string `json:"uid"`
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"preconditions"`
+	}
+	if err := json.Unmarshal(deleteBody, &deleteOptions); err != nil || deleteOptions.APIVersion != "v1" || deleteOptions.Kind != "DeleteOptions" ||
+		deleteOptions.Preconditions.UID != "original-configmap-uid" || deleteOptions.Preconditions.ResourceVersion != "17" {
+		t.Fatalf("cleanup did not send exact ConfigMap UID/resourceVersion delete preconditions: %s", deleteBody)
 	}
 }
 
@@ -757,6 +772,7 @@ if [ "$5" = "get" ] && [ "$6" = "configmap" ]; then
   echo 'Error from server (NotFound)' >&2
   exit 1
 fi
+if [ "$5" = "patch" ] && [ "$6" = "deployment" ] && [ "$7" = "rhiza-fencer" ] && [ "$8" = "--type=json" ]; then exit 0; fi
 if [ "$5" = "rollout" ] && [ "$6" = "status" ]; then exit 0; fi
 if [ "$3" = "proxy" ]; then
   export RHIZA_TEST_KUBE_PROXY_HELPER=1

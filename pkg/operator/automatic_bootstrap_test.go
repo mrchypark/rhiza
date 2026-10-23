@@ -55,12 +55,16 @@ func newAutomaticBootstrapGenesisFixture(t *testing.T) automaticBootstrapGenesis
 	api.authorityBucket = controlBucket
 	e.MutationProfile = fencing.MutationHeldExecutionProfile
 	e.RequireMutationJournal = true
+	e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": "archive", "RHIZA_OBJSTORE_PREFIX": "root",
+	})
 	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
 	f := heldProfileFixture{e: e, api: api, scope: scope}
 	if err := e.initializeRoot(t.Context(), baseRuntime.StatefulSetUID, baseRuntime.SourceClusterID); err != nil {
 		t.Fatalf("initialize required canonical bootstrap CONTROL root: %v", err)
 	}
 	cohort := configureAutomaticBootstrapCohort(t, &f, baseRuntime, 3)
+	e.RuntimeAgent = &RuntimeAgentClient{AuthorityID: cohort[0].AuthorityID}
 	f.id, f.runtime = fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "bootstrap-pod-0", RunID: "bootstrap-run-0"}, cohort[0]
 	if _, err := e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 		ledger.RequireRuntimeBinding = true
@@ -246,7 +250,13 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 		metadata := asObject(pod["metadata"])
 		metadata["namespace"] = "test"
 		metadata["ownerReferences"] = []any{object{"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "rhiza", "uid": runtime.StatefulSetUID, "controller": true}}
-		asObject(pod["spec"])["nodeName"] = runtime.NodeName
+		podSpec := asObject(pod["spec"])
+		podSpec["nodeName"] = runtime.NodeName
+		podEnv := make([]any, 0, len(list(container["env"])))
+		for _, env := range list(container["env"]) {
+			podEnv = append(podEnv, jsonObjectForPreflight(t, env))
+		}
+		asObject(list(podSpec["containers"])[0])["env"] = podEnv
 		status := asObject(list(nested(pod, "status", "containerStatuses"))[0])
 		status["containerID"], status["imageID"] = "containerd://"+runtime.ContainerID, "sha256:"+runtime.ImageID
 		podList = append(podList, pod)
@@ -260,6 +270,9 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 	f.api.objects[clusterPath] = jsonObjectForPreflight(t, cluster)
 	f.api.objects["/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizaclusters"] = object{"items": []any{jsonObjectForPreflight(t, cluster)}}
 	f.api.objects["/api/v1/namespaces/test"] = object{"metadata": object{"name": "test", "uid": automaticBootstrapNamespaceUID}}
+	for _, runtime := range cohort {
+		f.api.objects["/api/v1/nodes/"+runtime.NodeName] = object{"metadata": object{"name": runtime.NodeName, "uid": runtime.NodeUID}}
+	}
 	f.api.objects[f.e.controller().corePath("services", "rhiza-headless")] = object{"metadata": object{"name": "rhiza-headless", "namespace": "test"}, "spec": object{
 		"clusterIP": "None", "publishNotReadyAddresses": true, "selector": object{"app": "rhiza"},
 	}}
