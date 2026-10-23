@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -185,12 +186,6 @@ func qualifyGCSManualTerminal(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	challengePath := filepath.Join(out, gcsManualTerminalChallengeName)
-	if err := writeNewPrivateAckLossFile(challengePath, encoded(obj{"challenge": challenge, "challengeDigest": challengeDigest, "attestationName": challengeName})); err != nil {
-		return err
-	}
-	event("independent_manual_approval_required", obj{"challengeDigest": challengeDigest, "attestationName": challengeName, "expiresAt": challenge.ExpiresAt})
-
 	observerDeployment, err := get(ctx, "deployment", "rhiza-fencer")
 	if err != nil {
 		return err
@@ -233,6 +228,43 @@ func qualifyGCSManualTerminal(ctx context.Context) (resultErr error) {
 	if err := verifyManualTerminalUnclaimed(ctx, archive, controlBucket, source, challenge, successorClaimKey, targetPrefix, controlPrefix); err != nil {
 		return err
 	}
+	sourceDataScope := fencing.ArchiveScope{Provider: "gcs", Bucket: source.Bucket, Prefix: source.Prefix, ClusterID: source.ClusterID}
+	targetDataScope := fencing.ArchiveScope{Provider: "gcs", Bucket: source.Bucket, Prefix: targetPrefix, ClusterID: challenge.TargetClusterID}
+	targetControlKeys, err := manualTerminalTargetControlKeys(source, controlPrefix, targetPrefix, challenge.TargetClusterID)
+	if err != nil {
+		return err
+	}
+	historicalRuns := make([]gcsManualTerminalHistoricalRun, 0, len(sourceRoot.Ledger.Runs))
+	for runID, run := range sourceRoot.Ledger.Runs {
+		if run.Identity.RunID != runID || run.Identity.SourceClusterID != source.ClusterID {
+			return fmt.Errorf("manual-terminal closed CONTROL root has an invalid historical run identity")
+		}
+		historicalRuns = append(historicalRuns, gcsManualTerminalHistoricalRun{Identity: run.Identity, Runtime: run.Runtime})
+	}
+	if len(historicalRuns) == 0 {
+		return fmt.Errorf("manual-terminal closed CONTROL root has no historical run inventory")
+	}
+	sort.Slice(historicalRuns, func(i, j int) bool { return historicalRuns[i].Identity.RunID < historicalRuns[j].Identity.RunID })
+	verifiedContext := gcsManualTerminalVerifiedContext{
+		RootDigest: hex.EncodeToString(rootDigest[:]), FenceRequest: pending.Request,
+		FenceRequestHash: hex.EncodeToString(fenceDigest[:]), SourceDataScope: sourceDataScope,
+		SourceControlPrefix: controlPrefix, SuccessorClaimKey: successorClaimKey,
+		TargetDataScope: targetDataScope, TargetControlKeys: targetControlKeys,
+		UnclaimedObservedAt: time.Now().UTC(), HistoricalRunInventory: historicalRuns,
+		HistoricalRunCount: len(sourceRoot.Ledger.Runs),
+	}
+	challengeRecord := gcsManualTerminalChallengeRecord{
+		Challenge: challenge, ChallengeDigest: challengeDigest, AttestationName: challengeName, VerifiedContext: verifiedContext,
+	}
+	challengeBytes := encoded(challengeRecord)
+	if len(challengeBytes) > maxPrivateQualificationFile {
+		return fmt.Errorf("manual-terminal approver context exceeds the private artifact limit")
+	}
+	challengePath := filepath.Join(out, gcsManualTerminalChallengeName)
+	if err := writeNewPrivateAckLossFile(challengePath, challengeBytes); err != nil {
+		return err
+	}
+	event("independent_manual_approval_required", obj{"challengeDigest": challengeDigest, "attestationName": challengeName, "expiresAt": challenge.ExpiresAt})
 	if err := waitForManualTerminalApproval(ctx, challenge, challengeDigest, challengeName, archive, controlBucket, source,
 		successorClaimKey, targetPrefix, controlPrefix); err != nil {
 		return err

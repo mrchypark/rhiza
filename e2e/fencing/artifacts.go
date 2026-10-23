@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -920,6 +921,55 @@ type gcsManualTerminalPublicSummary struct {
 	PrivateEventsSHA256    string `json:"privateEventsSHA256,omitempty"`
 }
 
+type gcsManualTerminalHistoricalRun struct {
+	Identity       fencing.Identity        `json:"identity"`
+	Runtime        *fencing.RuntimeBinding `json:"runtime"`
+	runtimePresent bool
+}
+
+func (run *gcsManualTerminalHistoricalRun) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if _, ok := fields["runtime"]; !ok {
+		return fmt.Errorf("manual-terminal historical run omits runtime status")
+	}
+	type historicalRunAlias gcsManualTerminalHistoricalRun
+	var decoded historicalRunAlias
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	run.Identity = decoded.Identity
+	run.Runtime = decoded.Runtime
+	run.runtimePresent = true
+	return nil
+}
+
+// This packet is bounded private review context, not independent termination proof.
+type gcsManualTerminalVerifiedContext struct {
+	RootDigest             string                           `json:"rootDigest"`
+	FenceRequest           operator.FenceRequest            `json:"fenceRequest"`
+	FenceRequestHash       string                           `json:"fenceRequestHash"`
+	SourceDataScope        fencing.ArchiveScope             `json:"sourceDataScope"`
+	SourceControlPrefix    string                           `json:"sourceControlPrefix"`
+	SuccessorClaimKey      string                           `json:"successorClaimKey"`
+	TargetDataScope        fencing.ArchiveScope             `json:"targetDataScope"`
+	TargetControlKeys      []string                         `json:"targetControlKeys"`
+	UnclaimedObservedAt    time.Time                        `json:"unclaimedObservedAt"`
+	HistoricalRunInventory []gcsManualTerminalHistoricalRun `json:"historicalRunInventory"`
+	HistoricalRunCount     int                              `json:"historicalRunCount"`
+}
+
+type gcsManualTerminalChallengeRecord struct {
+	Challenge       operator.ManualRecoveryChallenge `json:"challenge"`
+	ChallengeDigest string                           `json:"challengeDigest"`
+	AttestationName string                           `json:"attestationName"`
+	VerifiedContext gcsManualTerminalVerifiedContext `json:"verifiedContext"`
+}
+
 func projectGCSManualTerminalEvidence(raw, public string, failedRun bool) (bool, error) {
 	entries, err := os.ReadDir(raw)
 	if err != nil {
@@ -954,18 +1004,17 @@ func projectGCSManualTerminalEvidence(raw, public string, failedRun bool) (bool,
 		if err != nil {
 			return false, err
 		}
-		var challengeRecord struct {
-			Challenge       operator.ManualRecoveryChallenge `json:"challenge"`
-			ChallengeDigest string                           `json:"challengeDigest"`
-			AttestationName string                           `json:"attestationName"`
-		}
-		if err := json.Unmarshal(challenge, &challengeRecord); err != nil {
+		var challengeRecord gcsManualTerminalChallengeRecord
+		decoder := json.NewDecoder(bytes.NewReader(challenge))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&challengeRecord); err != nil || decoder.Decode(new(any)) != io.EOF {
 			return false, fmt.Errorf("private manual-terminal challenge is invalid")
 		}
 		digest, err := operator.ManualRecoveryChallengeDigest(challengeRecord.Challenge)
 		attestationName, nameErr := operator.ManualRecoveryAttestationName(challengeRecord.Challenge.RecoveryUID)
 		if err != nil || nameErr != nil || digest != challengeRecord.ChallengeDigest || attestationName != challengeRecord.AttestationName ||
-			challengeRecord.Challenge.TargetBaseKind != "fork" || challengeRecord.Challenge.TargetClusterID == "" {
+			challengeRecord.Challenge.TargetBaseKind != "fork" || challengeRecord.Challenge.TargetClusterID == "" ||
+			validateGCSManualTerminalVerifiedContext(challengeRecord) != nil {
 			return false, fmt.Errorf("private manual-terminal challenge binding is invalid")
 		}
 		challengeDigest = challengeRecord.ChallengeDigest
@@ -993,6 +1042,71 @@ func projectGCSManualTerminalEvidence(raw, public string, failedRun bool) (bool,
 		summary.Outcome = "passed"
 	}
 	return true, writeGCSManualTerminalSummary(public, summary)
+}
+
+func validateGCSManualTerminalVerifiedContext(record gcsManualTerminalChallengeRecord) error {
+	context := record.VerifiedContext
+	challenge := record.Challenge
+	if context.RootDigest == "" || context.RootDigest != challenge.RootDigest || context.FenceRequestHash == "" ||
+		context.FenceRequestHash != challenge.FenceRequestHash || context.HistoricalRunCount <= 0 ||
+		context.HistoricalRunCount != len(context.HistoricalRunInventory) || context.UnclaimedObservedAt.IsZero() ||
+		context.UnclaimedObservedAt.Before(challenge.IssuedAt) || context.UnclaimedObservedAt.After(challenge.ExpiresAt) {
+		return fmt.Errorf("manual-terminal verified review context is incomplete")
+	}
+	requestDigest := sha256.Sum256(encoded(context.FenceRequest))
+	if hex.EncodeToString(requestDigest[:]) != context.FenceRequestHash ||
+		context.FenceRequest.Scope != operator.ScopeGeneration || context.FenceRequest.OperationID != challenge.OperationID ||
+		context.FenceRequest.SourceClusterID != challenge.SourceClusterID || context.FenceRequest.StatefulSetUID != challenge.StatefulSetUID ||
+		context.FenceRequest.StatefulSet != challenge.StatefulSetName || context.FenceRequest.Namespace != challenge.RecoveryNamespace ||
+		context.FenceRequest.BootstrapGenesis != nil {
+		return fmt.Errorf("manual-terminal request context differs from its challenge")
+	}
+	sourceScope := context.SourceDataScope
+	sourceScopeHash, err := sourceScope.Hash()
+	if err != nil || sourceScope.Provider != "gcs" || sourceScope.ClusterID != challenge.SourceClusterID ||
+		sourceScopeHash != challenge.StorageScopeDigest {
+		return fmt.Errorf("manual-terminal source scope context differs from its challenge")
+	}
+	targetPrefix := path.Join(path.Dir(sourceScope.Prefix), challenge.TargetClusterID)
+	if context.TargetDataScope.Provider != "gcs" || context.TargetDataScope.Bucket != sourceScope.Bucket ||
+		context.TargetDataScope.Prefix != targetPrefix || context.TargetDataScope.ClusterID != challenge.TargetClusterID ||
+		context.SourceControlPrefix != path.Join(path.Dir(sourceScope.Prefix), "control") || context.SuccessorClaimKey == "" {
+		return fmt.Errorf("manual-terminal target scope context is invalid")
+	}
+	claimKey, err := manualTerminalSuccessorClaimKey(gcsRecoverySource{
+		Bucket: sourceScope.Bucket, Prefix: sourceScope.Prefix, ClusterID: sourceScope.ClusterID,
+		StatefulSetUID: challenge.StatefulSetUID,
+	}, context.SourceControlPrefix)
+	if err != nil || claimKey != context.SuccessorClaimKey {
+		return fmt.Errorf("manual-terminal successor claim context is invalid")
+	}
+	targetKeys, err := manualTerminalTargetControlKeys(gcsRecoverySource{Bucket: sourceScope.Bucket, StatefulSetUID: challenge.StatefulSetUID},
+		context.SourceControlPrefix, targetPrefix, challenge.TargetClusterID)
+	if err != nil || len(targetKeys) != len(context.TargetControlKeys) {
+		return fmt.Errorf("manual-terminal target CONTROL scope context is invalid")
+	}
+	for i := range targetKeys {
+		if targetKeys[i] != context.TargetControlKeys[i] {
+			return fmt.Errorf("manual-terminal target CONTROL scope context is invalid")
+		}
+	}
+	previousRunID := ""
+	for _, run := range context.HistoricalRunInventory {
+		if !run.runtimePresent || run.Identity.SourceClusterID == "" || run.Identity.SourceClusterID != challenge.SourceClusterID ||
+			run.Identity.NodeID == "" || run.Identity.PodUID == "" || run.Identity.RunID == "" ||
+			(run.Identity.PodName != "" && run.Identity.PodName != run.Identity.NodeID && run.Identity.AssignmentID == "") ||
+			(run.Identity.AssignmentID != "" && (run.Identity.PodName == "" || run.Identity.PodName == run.Identity.NodeID)) ||
+			(previousRunID != "" && run.Identity.RunID <= previousRunID) {
+			return fmt.Errorf("manual-terminal historical run inventory is incomplete or unordered")
+		}
+		if run.Runtime != nil {
+			if err := run.Runtime.Validate(run.Identity); err != nil {
+				return fmt.Errorf("manual-terminal historical run runtime differs from identity: %w", err)
+			}
+		}
+		previousRunID = run.Identity.RunID
+	}
+	return nil
 }
 
 func validateGCSManualTerminalPrivateEvidence(data []byte, expectedChallengeDigest string, summary *gcsManualTerminalPublicSummary) error {
