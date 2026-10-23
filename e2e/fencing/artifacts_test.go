@@ -42,6 +42,8 @@ func TestPublicImageEvidenceOmitsCredentialCanaries(t *testing.T) {
 
 func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	const canary = "fixture-secret-canary-never-publish"
+	privateAuthorityLog := "fencer startup detail " + canary + "\n"
+	authorityLogDigest := sha256.Sum256([]byte(privateAuthorityLog))
 	privateAgentLog := "2026/10/22 00:00:00 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch\n" +
 		"2026/10/22 00:00:01 runtime-agent enrollment rejected stage=authorization code=token_review_failed\n" +
 		"2026/10/22 00:00:02 runtime-agent enrollment rejected stage=cri_enroll code=containerd_verbose_schema_mismatch private=" + canary + "\n"
@@ -68,7 +70,7 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 		"agentRestarted": true, "receiptRecovered": true, "receiptSHA256": strings.Repeat("d", 64), "token": canary,
 	}))
 	write("fencer-diagnostics.json", encoded(obj{"context": "kind-rhiza-generic-fencing", "namespace": "rhiza-fencing-e2e", "podsCaptured": true, "eventsCaptured": true,
-		"logs":         obj{"captured": true, "sha256": strings.Repeat("e", 64), "bytes": 123, "lines": 4},
+		"logs":         obj{"captured": true, "sha256": hex.EncodeToString(authorityLogDigest[:]), "bytes": len([]byte(privateAuthorityLog)), "lines": 1},
 		"runtimeAgent": obj{"podName": "rhiza-runtime-agent-abc", "podUID": "runtime-agent-pod-uid", "logs": obj{"captured": true, "sha256": hex.EncodeToString(agentLogDigest[:]), "bytes": len([]byte(privateAgentLog)), "lines": 3}, "rawLog": canary}, "token": canary}))
 	write("fencer-pods.json", encoded(obj{"pods": []obj{{"name": "rhiza-fencer-abc", "uid": "pod-uid", "phase": "Pending", "conditions": []obj{{"type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": canary}}, "containers": []obj{{"name": "fencer", "ready": false, "restartCount": 0, "state": obj{"waiting": obj{"reason": "CrashLoopBackOff", "message": canary}}, "private": canary}}}}, "spec": obj{"env": canary}}))
 	write("fencer-events.json", encoded(obj{"warnings": []obj{{"type": "Warning", "reason": "FailedMount", "count": 2, "lastTimestamp": "2026-10-22T00:00:00Z", "involvedObject": obj{"kind": "Pod", "name": "rhiza-fencer-abc", "uid": canary}, "source": obj{"component": "kubelet"}, "message": canary}}}))
@@ -87,7 +89,7 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(raw, "private-fencer-diagnostics"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(raw, "private-fencer-diagnostics", "authority-current.log"), []byte(canary), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(raw, "private-fencer-diagnostics", "authority-current.log"), []byte(privateAuthorityLog), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(raw, "private-fencer-diagnostics", "runtime-agent-current.log"), []byte(privateAgentLog), 0600); err != nil {
@@ -126,6 +128,98 @@ func TestPublicPacketExcludesRawDiagnosticsAndSecretFields(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(raw, "public", "resources-summary.json"))
 	if err != nil || json.Unmarshal(data, &resources) != nil || len(resources) != 2 || resources[0]["uid"] != "uid" {
 		t.Fatal("resource summary lost audit identity")
+	}
+}
+
+func TestFencerRejectionProjectionUsesFixedCodesOnly(t *testing.T) {
+	const canary = "private-error-token-canary"
+	privateLog := strings.Join([]string{
+		"2026/10/24 09:59:59 fencing supervisor authentication rejected: action=register podUID=private-pod-uid error=fencing: Pod source differs",
+		"2026/10/24 10:00:00 runtime enrollment pending: podUID=private-pod-uid runID=private-run-id error=fencing: runtime enrollment rejected at client/node_lookup_failed",
+		"2026/10/24 10:00:00 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: startup recovery child differs from assignment",
+		"2026/10/24 10:00:01 fencing supervisor transition rejected: action=register podUID=private-pod-uid error=unrecognized private failure " + canary,
+		"2026/10/24 10:00:02 fencing supervisor transition rejected: action=bind podUID=private-pod-uid error=fencing: startup recovery child differs from assignment",
+		"2026/10/24 10:00:02 fencing supervisor authentication rejected: action=bind podUID=private-pod-uid error=fencing: Pod source differs",
+		"2026/10/24 10:00:03 unrelated log fencing supervisor transition rejected: action=register podUID=private-pod-uid error=fencing: startup root binding is unavailable",
+	}, "\n") + "\n"
+	digest := sha256.Sum256([]byte(privateLog))
+	raw := t.TempDir()
+	diagnosticsDir := filepath.Join(raw, "private-fencer-diagnostics")
+	if err := os.Mkdir(diagnosticsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diagnosticsDir, "authority-current.log"), []byte(privateLog), 0600); err != nil {
+		t.Fatal(err)
+	}
+	input := encoded(fencerDiagnosticsView{})
+	var view fencerDiagnosticsView
+	if err := json.Unmarshal(input, &view); err != nil {
+		t.Fatal(err)
+	}
+	view.Logs.Captured = true
+	view.Logs.SHA256 = hex.EncodeToString(digest[:])
+	view.Logs.Bytes = int64(len([]byte(privateLog)))
+	view.Logs.Lines = int64(strings.Count(privateLog, "\n"))
+	projected, err := projectRuntimeAgentDiagnostics(raw, encoded(view))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(projected, []byte(canary)) || bytes.Contains(projected, []byte("private-pod-uid")) || bytes.Contains(projected, []byte("startup recovery child differs")) {
+		t.Fatal("public supervisor diagnostics leaked private log contents")
+	}
+	var got fencerDiagnosticsView
+	if err := json.Unmarshal(projected, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []supervisorRejectionDiagnostic{
+		{Stage: "authentication", Action: "register", Code: "authentication_source_mismatch"},
+		{Stage: "runtime_enrollment", Action: "register", Code: "runtimeagent_client_node_lookup_failed"},
+		{Stage: "transition", Action: "register", Code: "replacement_recovery_child_mismatch"},
+		{Stage: "transition", Action: "register", Code: "register_guard_unknown"},
+	}
+	if len(got.Logs.Rejections) != len(want) {
+		t.Fatalf("unexpected projected supervisor rejections: %+v", got.Logs.Rejections)
+	}
+	for i := range want {
+		if got.Logs.Rejections[i] != want[i] {
+			t.Fatalf("rejection %d = %+v, want %+v", i, got.Logs.Rejections[i], want[i])
+		}
+	}
+	if _, err := safeJSON("fencer-diagnostics.json", projected); err != nil {
+		t.Fatalf("projected rejection codes failed allowlist validation: %v", err)
+	}
+}
+
+func TestFencerRejectionProjectionIsBounded(t *testing.T) {
+	var lines []string
+	for i := 0; i < maxSupervisorRejectionDiagnostics+2; i++ {
+		lines = append(lines, fmt.Sprintf("2026/10/24 10:00:00 fencing supervisor transition rejected: action=register podUID=private-%d error=unknown", i))
+	}
+	privateLog := strings.Join(lines, "\n") + "\n"
+	digest := sha256.Sum256([]byte(privateLog))
+	raw := t.TempDir()
+	diagnosticsDir := filepath.Join(raw, "private-fencer-diagnostics")
+	if err := os.Mkdir(diagnosticsDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(diagnosticsDir, "authority-current.log"), []byte(privateLog), 0600); err != nil {
+		t.Fatal(err)
+	}
+	view := fencerDiagnosticsView{}
+	view.Logs.Captured = true
+	view.Logs.SHA256 = hex.EncodeToString(digest[:])
+	view.Logs.Bytes = int64(len([]byte(privateLog)))
+	view.Logs.Lines = int64(strings.Count(privateLog, "\n"))
+	projected, err := projectRuntimeAgentDiagnostics(raw, encoded(view))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got fencerDiagnosticsView
+	if err := json.Unmarshal(projected, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Logs.Rejections) != maxSupervisorRejectionDiagnostics || !got.Logs.RejectionsTruncated {
+		t.Fatalf("rejection limit was not reported: count=%d truncated=%t", len(got.Logs.Rejections), got.Logs.RejectionsTruncated)
 	}
 }
 
