@@ -61,6 +61,15 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	f.api.mu.Unlock()
 	f.e.ControllerServiceAccount = "default"
 	controller, _, cluster := automaticBootstrapController(t, f)
+	controlPrefix := f.e.ArchiveStoreIdentity["RHIZA_OBJSTORE_PREFIX"]
+	if controlPrefix == "" || controlPrefix != controller.Prefix {
+		t.Fatalf("fencer/control prefix mismatch: fencer=%q controller=%q", controlPrefix, controller.Prefix)
+	}
+	f.e.AutomaticControlPrefix = controlPrefix
+	fencerControl := &Controller{Kube: f.e.Kube, Prefix: f.e.AutomaticControlPrefix}
+	if got, want := fencerControl.autoKey(&cluster), controller.autoKey(&cluster); got != want {
+		t.Fatalf("fencer/control automatic key mismatch: fencer=%q controller=%q", got, want)
+	}
 	clusterPath := controller.clusterPath(automaticBootstrapClusterName)
 	// Establish the protected pre-fence automatic-control record before this
 	// test mutates it into a canonical same-ordinal promotion intent.
