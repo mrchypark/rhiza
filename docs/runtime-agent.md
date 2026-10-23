@@ -19,6 +19,15 @@ rejects any token not originating from that workload. Restrict node TCP port
 9445 to the authority network path. The runtime-agent CA secret must contain
 `ca.crt`, and its TLS certificate must identify `runtime-agent`.
 
+The opt-in runtime-agent DaemonSet uses `hostPID: true` so host CRI PIDs can be
+matched against the selected cgroup's `cgroup.procs`; it does not use
+`hostNetwork` or `hostIPC`. This expands the agent's visibility into the host
+process namespace and is part of the runtime-agent trust boundary. The agent
+still drops all Linux capabilities, including `CAP_SYS_ADMIN`, and disallows
+privilege escalation. This setting applies only to the explicitly installed
+runtime-agent, not to supervised database Pods or the default cooperative
+fencing deployment.
+
 Authority registration synchronously enrolls the exact Kubernetes container
 with the node agent and persists the returned full runtime binding before
 register returns and before the supervised child is launched. For stop, the

@@ -258,6 +258,10 @@ spec:
         app.kubernetes.io/name: rhiza-runtime-agent
     spec:
       serviceAccountName: rhiza-runtime-agent
+      # The runtime agent compares host CRI PIDs with cgroup.procs. Sharing
+      # the host PID namespace makes those PID values comparable without
+      # granting CAP_SYS_ADMIN or any other Linux capability.
+      hostPID: true
       terminationGracePeriodSeconds: 10
       containers:
         - name: runtime-agent

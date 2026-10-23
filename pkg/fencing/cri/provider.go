@@ -204,11 +204,11 @@ func (p *Provider) EnrollBinding(ctx context.Context, base fencing.RuntimeBindin
 		status.Status.ImageRef != base.ImageID || status.Status.State != runtimeapi.ContainerState_CONTAINER_RUNNING {
 		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: pre-child container metadata differs", ErrUnverified)
 	}
-	sandboxID, pid, err := containerdVerboseIdentity(status.Info, "", p.profile.ContainerdRuntimeType)
+	criIdentity, err := containerdVerboseRuntimeIdentity(status.Info, "", p.profile.ContainerdRuntimeType)
 	if err != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, err
 	}
-	binding.SandboxID = sandboxID
+	binding.SandboxID = criIdentity.SandboxID
 	if err := p.verifyHost(ctx, binding); err != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, err
 	}
@@ -218,12 +218,12 @@ func (p *Provider) EnrollBinding(ctx context.Context, base fencing.RuntimeBindin
 	if err := p.inspect(ctx, binding, containerID, false); err != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, err
 	}
-	scope, err := captureCgroupScope(procRoot, cgroupRoot, pid, binding, p.profile.CgroupProfileID)
+	scope, err := captureCgroupScope(procRoot, cgroupRoot, criIdentity.PID, criIdentity.CgroupsPath, binding, p.profile.CgroupProfileID)
 	if err != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, err
 	}
-	secondPID, err := p.containerdPID(ctx, binding, containerID)
-	if err != nil || secondPID != pid || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
+	secondPID, secondPath, err := p.containerdPID(ctx, binding, containerID)
+	if err != nil || secondPID != criIdentity.PID || secondPath != criIdentity.CgroupsPath || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: process changed during pre-child capture", ErrUnverified)
 	}
 	if err := p.inspect(ctx, binding, containerID, false); err != nil {
@@ -264,16 +264,16 @@ func (p *Provider) CaptureCgroupScope(ctx context.Context, binding fencing.Runti
 	if err := p.inspect(ctx, binding, containerID, false); err != nil {
 		return CgroupScope{}, err
 	}
-	pid, err := p.containerdPID(ctx, binding, containerID)
+	pid, cgroupsPath, err := p.containerdPID(ctx, binding, containerID)
 	if err != nil {
 		return CgroupScope{}, err
 	}
-	scope, err := captureCgroupScope(procRoot, cgroupRoot, pid, binding, p.profile.CgroupProfileID)
+	scope, err := captureCgroupScope(procRoot, cgroupRoot, pid, cgroupsPath, binding, p.profile.CgroupProfileID)
 	if err != nil {
 		return CgroupScope{}, err
 	}
-	secondPID, err := p.containerdPID(ctx, binding, containerID)
-	if err != nil || secondPID != pid || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
+	secondPID, secondPath, err := p.containerdPID(ctx, binding, containerID)
+	if err != nil || secondPID != pid || secondPath != cgroupsPath || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
 		return CgroupScope{}, fmt.Errorf("%w: containerd PID changed during cgroup capture", ErrUnverified)
 	}
 	if err := p.inspect(ctx, binding, containerID, false); err != nil {
@@ -288,17 +288,17 @@ func (p *Provider) CaptureCgroupScope(ctx context.Context, binding fencing.Runti
 	return scope, nil
 }
 
-func (p *Provider) containerdPID(ctx context.Context, binding fencing.RuntimeBinding, containerID string) (uint32, error) {
+func (p *Provider) containerdPID(ctx context.Context, binding fencing.RuntimeBinding, containerID string) (uint32, string, error) {
 	response, err := p.client.ContainerStatus(ctx, &runtimeapi.ContainerStatusRequest{ContainerId: containerID, Verbose: true})
 	if err != nil || response == nil || response.Status == nil || response.Status.Id != containerID || response.Status.Metadata == nil ||
 		response.Status.Metadata.Name != p.profile.ContainerName || response.Status.ImageRef != binding.ImageID || response.Status.State != runtimeapi.ContainerState_CONTAINER_RUNNING {
-		return 0, fmt.Errorf("%w: verbose container status identity differs", ErrUnverified)
+		return 0, "", fmt.Errorf("%w: verbose container status identity differs", ErrUnverified)
 	}
-	pid, err := containerdPIDFromBinding(binding, response.Info, p.profile.ContainerdRuntimeType)
+	identity, err := containerdVerboseRuntimeIdentity(response.Info, binding.SandboxID, p.profile.ContainerdRuntimeType)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return pid, nil
+	return identity.PID, identity.CgroupsPath, nil
 }
 
 func (p *Provider) inspect(ctx context.Context, binding fencing.RuntimeBinding, containerID string, stopped bool) error {
@@ -401,12 +401,12 @@ func knownContainerState(state runtimeapi.ContainerState) bool {
 // descendant containment and return prevention before it can authorize fencing.
 // A partial observation on error preserves acknowledged boundaries, not success.
 func (p *Provider) Stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest) (StopObservation, error) {
-	return p.stop(ctx, binding, request, nil)
+	return p.stop(ctx, binding, request, nil, nil)
 }
 
 // stop leaves a container-stopped/sandbox-ready scope pending unless its exact
 // CRI inventory is terminal before the sandbox stop is attempted.
-func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, beforeSandboxStop func() error) (StopObservation, error) {
+func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, beforeContainerStop, beforeSandboxStop func(context.Context) error) (StopObservation, error) {
 	observation := StopObservation{Runtime: binding, Request: request}
 	if p == nil || p.client == nil || p.host == nil {
 		return observation, fmt.Errorf("%w: local runtime provider is not configured", ErrUnverified)
@@ -433,6 +433,11 @@ func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, req
 	if err := p.verifyHost(ctx, binding); err != nil {
 		return observation, err
 	}
+	if beforeContainerStop != nil {
+		if err := beforeContainerStop(ctx); err != nil {
+			return observation, err
+		}
+	}
 	ack, err := p.client.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: containerID, Timeout: p.profile.GraceSeconds})
 	if err != nil {
 		return observation, fmt.Errorf("%w: container stop acknowledgement is uncertain: %w", ErrUnverified, err)
@@ -445,7 +450,7 @@ func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, req
 		return observation, err
 	}
 	if beforeSandboxStop != nil {
-		if err := beforeSandboxStop(); err != nil {
+		if err := beforeSandboxStop(ctx); err != nil {
 			return observation, err
 		}
 	}
@@ -486,10 +491,19 @@ func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBind
 	if p == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
 		return observation, fmt.Errorf("%w: enrolled cgroup belongs to another runtime binding", ErrUnverified)
 	}
-	if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
-		return observation, err
+	beforeContainerStop := func(ctx context.Context) error {
+		containerID := strings.TrimPrefix(binding.ContainerID, p.profile.RuntimeName+"://")
+		pid, cgroupsPath, err := p.containerdPID(ctx, binding, containerID)
+		if err != nil || pid != scope.PID {
+			return fmt.Errorf("%w: CRI process identity differs from captured scope", ErrUnverified)
+		}
+		mappedPath, err := containerdCgroupsPath(cgroupsPath, containerID)
+		if err != nil || mappedPath != scope.Path {
+			return fmt.Errorf("%w: CRI cgroups path differs from captured scope", ErrUnverified)
+		}
+		return scope.VerifyProcess(procRoot, cgroupRoot)
 	}
-	observation, err := p.stop(ctx, binding, request, func() error { return scope.VerifyEmpty(cgroupRoot) })
+	observation, err := p.stop(ctx, binding, request, beforeContainerStop, func(context.Context) error { return scope.VerifyEmpty(cgroupRoot) })
 	if err != nil {
 		return observation, err
 	}

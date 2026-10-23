@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -254,6 +255,18 @@ func newRuntimeFixture(t *testing.T) (*Provider, *fakeRuntime, fencing.RuntimeBi
 	return p, f, binding, request
 }
 
+func writeCgroupProcs(t *testing.T, dir string, pids ...uint32) {
+	t.Helper()
+	var contents strings.Builder
+	for _, pid := range pids {
+		contents.WriteString(strconv.FormatUint(uint64(pid), 10))
+		contents.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(contents.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCRIExactStopUsesRealUnixGRPCAndVerifiesScope(t *testing.T) {
 	p, f, binding, request := newRuntimeFixture(t)
 	observation, err := p.Stop(t.Context(), binding, request)
@@ -493,7 +506,7 @@ func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 	root := t.TempDir()
 	proc := filepath.Join(root, "proc")
 	cgroupRoot := filepath.Join(root, "cgroup")
-	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
 	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +515,8 @@ func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	scope, err := captureCgroupScope(proc, cgroupRoot, 123, binding, p.profile.CgroupProfileID)
+	writeCgroupProcs(t, cgroup, 123)
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, "/kubepods/pod-0/container-0", binding, p.profile.CgroupProfileID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,6 +527,8 @@ func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(moved, "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	writeCgroupProcs(t, cgroup)
+	writeCgroupProcs(t, moved, 123)
 	if err := os.WriteFile(filepath.Join(proc, "123", "cgroup"), []byte("0::/kubepods/other-pod\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -525,9 +541,7 @@ func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 		t.Fatal("moved process received a CRI stop command")
 	}
 	f.mu.Unlock()
-	if err := os.WriteFile(filepath.Join(proc, "123", "cgroup"), []byte("0::/kubepods/pod-0\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeCgroupProcs(t, cgroup, 123)
 	f.mu.Lock()
 	f.scopeEventsFile = events
 	f.mu.Unlock()
@@ -594,11 +608,44 @@ func TestCRIQualifiedStopRequiresSameCgroupToBecomeEmpty(t *testing.T) {
 	}
 }
 
+func TestCRIQualifiedStopRejectsVerboseCgroupPathChangeBeforeStop(t *testing.T) {
+	p, f, binding, request := newRuntimeFixture(t)
+	root := t.TempDir()
+	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
+	if err := os.MkdirAll(cgroup, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcIdentity(t, proc, 123, 789, "../peer")
+	writeCgroupProcs(t, cgroup, 123)
+	if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
+	f.mu.Unlock()
+	scope, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot)
+	if err != nil {
+		t.Fatalf("capture trusted runtime cgroup scope: %v", err)
+	}
+	f.mu.Lock()
+	f.verboseInfo = map[string]string{"info": strings.Replace(containerdInfoFixture, "/kubepods/pod-0/container-0", "/kubepods/pod-other/container-0", 1)}
+	f.mu.Unlock()
+	if _, err := p.StopInCgroup(t.Context(), binding, request, proc, cgroupRoot, scope); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("changed runtime cgroups path was accepted: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.stopContainers != 0 || f.stopSandboxes != 0 {
+		t.Fatalf("changed runtime cgroups path reached CRI stop: containers=%d sandboxes=%d", f.stopContainers, f.stopSandboxes)
+	}
+}
+
 func TestCRIResumeCompletesExactContainerStoppedSandboxReadyCrashWindow(t *testing.T) {
 	p, f, binding, request := newRuntimeFixture(t)
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
-	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
 	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -607,7 +654,8 @@ func TestCRIResumeCompletesExactContainerStoppedSandboxReadyCrashWindow(t *testi
 	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	scope, err := captureCgroupScope(proc, cgroupRoot, 123, binding, p.profile.CgroupProfileID)
+	writeCgroupProcs(t, cgroup, 123)
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, "/kubepods/pod-0/container-0", binding, p.profile.CgroupProfileID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -636,7 +684,7 @@ func TestCRIResumeRejectsRuntimeVersionChangeBeforeSandboxStop(t *testing.T) {
 	p, f, binding, request := newRuntimeFixture(t)
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
-	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
 	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +693,8 @@ func TestCRIResumeRejectsRuntimeVersionChangeBeforeSandboxStop(t *testing.T) {
 	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	scope, err := captureCgroupScope(proc, cgroupRoot, 123, binding, p.profile.CgroupProfileID)
+	writeCgroupProcs(t, cgroup, 123)
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, "/kubepods/pod-0/container-0", binding, p.profile.CgroupProfileID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +725,7 @@ func TestCRIResumeRejectsWrongSandboxIdentityInContainerStoppedWindow(t *testing
 	p, f, binding, request := newRuntimeFixture(t)
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
-	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
 	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -685,7 +734,8 @@ func TestCRIResumeRejectsWrongSandboxIdentityInContainerStoppedWindow(t *testing
 	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	scope, err := captureCgroupScope(proc, cgroupRoot, 123, binding, p.profile.CgroupProfileID)
+	writeCgroupProcs(t, cgroup, 123)
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, "/kubepods/pod-0/container-0", binding, p.profile.CgroupProfileID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +766,7 @@ func TestCRIResumeRejectsNewLiveContainerInContainerStoppedWindow(t *testing.T) 
 	p, f, binding, request := newRuntimeFixture(t)
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
-	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
 	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +775,8 @@ func TestCRIResumeRejectsNewLiveContainerInContainerStoppedWindow(t *testing.T) 
 	if err := os.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	scope, err := captureCgroupScope(proc, cgroupRoot, 123, binding, p.profile.CgroupProfileID)
+	writeCgroupProcs(t, cgroup, 123)
+	scope, err := captureCgroupScope(proc, cgroupRoot, 123, "/kubepods/pod-0/container-0", binding, p.profile.CgroupProfileID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -761,11 +812,13 @@ func TestCRIContainerdEnrollmentCapturesPIDOnlyForExactBinding(t *testing.T) {
 	root := t.TempDir()
 	proc := filepath.Join(root, "proc")
 	cgroupRoot := filepath.Join(root, "cgroup")
-	if err := os.MkdirAll(filepath.Join(cgroupRoot, "kubepods", "pod-0"), 0700); err != nil {
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
+	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
 	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0")
-	if err := os.WriteFile(filepath.Join(cgroupRoot, "kubepods", "pod-0", "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
+	writeCgroupProcs(t, cgroup, 123)
+	if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	scope, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot)
@@ -788,11 +841,13 @@ func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
 	base.NodeUID, base.MachineID, base.BootID, base.RuntimeID, base.SandboxID = "", "", "", "", ""
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
-	if err := os.MkdirAll(filepath.Join(cgroupRoot, "kubepods", "pod-0"), 0700); err != nil {
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
+	if err := os.MkdirAll(cgroup, 0700); err != nil {
 		t.Fatal(err)
 	}
 	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0")
-	if err := os.WriteFile(filepath.Join(cgroupRoot, "kubepods", "pod-0", "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
+	writeCgroupProcs(t, cgroup, 123)
+	if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	binding, scope, err := p.EnrollBinding(t.Context(), base, proc, cgroupRoot)

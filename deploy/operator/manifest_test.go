@@ -370,6 +370,63 @@ func TestFencerRoleCreatesFenceRequestsWithoutClusterWrites(t *testing.T) {
 	}
 }
 
+func TestRuntimeAgentSharesHostPIDNamespaceWithoutCapabilities(t *testing.T) {
+	data, err := os.ReadFile("fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "DaemonSet" {
+			continue
+		}
+		metadata, _ := doc["metadata"].(map[string]any)
+		if metadata["name"] != "rhiza-runtime-agent" {
+			continue
+		}
+		spec, ok := nestedManifestMap(doc, "spec")
+		if !ok {
+			t.Fatal("runtime-agent DaemonSet spec is missing")
+		}
+		template, ok := nestedManifestMap(spec, "template")
+		if !ok {
+			t.Fatal("runtime-agent DaemonSet template is missing")
+		}
+		podSpec, ok := nestedManifestMap(template, "spec")
+		if !ok || podSpec["hostPID"] != true {
+			t.Fatalf("runtime-agent must share the host PID namespace, got %#v", podSpec["hostPID"])
+		}
+		for _, field := range []string{"hostNetwork", "hostIPC"} {
+			if podSpec[field] == true {
+				t.Errorf("runtime-agent must not share host %s", field)
+			}
+		}
+		containers, _ := podSpec["containers"].([]any)
+		if len(containers) != 1 {
+			t.Fatalf("runtime-agent containers=%d, want exactly one", len(containers))
+		}
+		container, _ := containers[0].(map[string]any)
+		security, _ := container["securityContext"].(map[string]any)
+		if security["allowPrivilegeEscalation"] != false || security["privileged"] == true {
+			t.Fatal("runtime-agent must not allow privilege escalation or privileged mode")
+		}
+		capabilities, _ := security["capabilities"].(map[string]any)
+		if capabilities["add"] != nil {
+			t.Fatalf("runtime-agent must not add Linux capabilities: %#v", capabilities["add"])
+		}
+		dropped, _ := capabilities["drop"].([]any)
+		if len(dropped) != 1 || dropped[0] != "ALL" {
+			t.Fatalf("runtime-agent must drop all Linux capabilities, got %#v", dropped)
+		}
+		return
+	}
+	t.Fatal("runtime-agent DaemonSet not found")
+}
+
 func TestFencerNamespaceLookupIsPinnedToOnlyTheRhizaNamespace(t *testing.T) {
 	data, err := os.ReadFile("fencing/authority.yaml")
 	if err != nil {

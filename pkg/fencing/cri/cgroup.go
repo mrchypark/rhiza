@@ -24,9 +24,10 @@ type CgroupScope struct {
 	ProfileID   string `json:"profileID"`
 }
 
-// captureCgroupScope resolves a CRI-selected process's unified cgroup and
-// requires it to be populated. procRoot/cgroupRoot come from fixed agent config.
-func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, binding fencing.RuntimeBinding, profileID string) (CgroupScope, error) {
+// captureCgroupScope resolves the pinned containerd runtimeSpec path beneath
+// the fixed cgroup root and requires the CRI PID to be a direct member of that
+// populated cgroup. procRoot/cgroupRoot come from fixed agent config.
+func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, cgroupsPath string, binding fencing.RuntimeBinding, profileID string) (CgroupScope, error) {
 	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
 	if pid == 0 || profileID == "" || !filepath.IsAbs(procRoot) || !filepath.IsAbs(cgroupRoot) || binding.Validate(identity) != nil {
 		return CgroupScope{}, fmt.Errorf("%w: invalid cgroup capture configuration", ErrUnverified)
@@ -35,7 +36,7 @@ func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, binding fencing
 	if err != nil {
 		return CgroupScope{}, fmt.Errorf("%w: read enrolled process identity: %w", ErrUnverified, err)
 	}
-	relative, err := processCgroupPath(procRoot, pid)
+	relative, err := containerdCgroupsPath(cgroupsPath, strings.TrimPrefix(binding.ContainerID, "containerd://"))
 	if err != nil {
 		return CgroupScope{}, err
 	}
@@ -47,6 +48,9 @@ func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, binding fencing
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil || !under(root, resolved) {
 		return CgroupScope{}, fmt.Errorf("%w: resolve cgroup scope", ErrUnverified)
+	}
+	if err := cgroupContainsPID(resolved, pid); err != nil {
+		return CgroupScope{}, fmt.Errorf("%w: CRI process is not a direct cgroup member", ErrUnverified)
 	}
 	info, err := os.Stat(resolved)
 	if err != nil || !info.IsDir() {
@@ -63,8 +67,12 @@ func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, binding fencing
 	if current, err := processStartTime(procRoot, pid); err != nil || current != startTime {
 		return CgroupScope{}, fmt.Errorf("%w: process changed during cgroup capture", ErrUnverified)
 	}
-	return CgroupScope{Path: relative, Dev: dev, Ino: ino, PID: pid, StartTime: startTime,
-		RuntimeHash: fencing.RuntimeScopeBindingDigest(binding), ProfileID: profileID}, nil
+	scope := CgroupScope{Path: relative, Dev: dev, Ino: ino, PID: pid, StartTime: startTime,
+		RuntimeHash: fencing.RuntimeScopeBindingDigest(binding), ProfileID: profileID}
+	if err := scope.VerifyProcess(procRoot, cgroupRoot); err != nil {
+		return CgroupScope{}, err
+	}
+	return scope, nil
 }
 
 // VerifyEmpty confirms the same cgroup inode still exists and cgroup.events
@@ -89,14 +97,13 @@ func (s CgroupScope) VerifyProcess(procRoot, cgroupRoot string) error {
 	if err != nil || startTime != s.StartTime {
 		return fmt.Errorf("%w: enrolled process identity changed", ErrUnverified)
 	}
-	relative, err := processCgroupPath(procRoot, s.PID)
-	if err != nil || relative != s.Path {
-		return fmt.Errorf("%w: enrolled process moved to another cgroup", ErrUnverified)
+	if err := s.VerifyPopulated(cgroupRoot); err != nil {
+		return err
 	}
 	if current, err := processStartTime(procRoot, s.PID); err != nil || current != s.StartTime {
 		return fmt.Errorf("%w: enrolled process identity changed during cgroup verification", ErrUnverified)
 	}
-	return s.VerifyPopulated(cgroupRoot)
+	return nil
 }
 
 func (s CgroupScope) verify(cgroupRoot string, wantPopulated bool) error {
@@ -125,6 +132,38 @@ func (s CgroupScope) verify(cgroupRoot string, wantPopulated bool) error {
 			return fmt.Errorf("%w: enrolled cgroup is not populated", ErrUnverified)
 		}
 		return fmt.Errorf("%w: cgroup or descendant remains populated", ErrUnverified)
+	}
+	if wantPopulated {
+		if s.PID == 0 {
+			return fmt.Errorf("%w: enrolled cgroup process identity is missing", ErrUnverified)
+		}
+		if err := cgroupContainsPID(path, s.PID); err != nil {
+			return fmt.Errorf("%w: enrolled process is not a direct cgroup member", ErrUnverified)
+		}
+	}
+	return nil
+}
+
+func cgroupContainsPID(path string, pid uint32) error {
+	if pid == 0 {
+		return fmt.Errorf("zero PID")
+	}
+	data, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, field := range strings.Fields(string(data)) {
+		listed, err := strconv.ParseUint(field, 10, 32)
+		if err != nil || listed == 0 {
+			return fmt.Errorf("invalid cgroup process list")
+		}
+		if uint32(listed) == pid {
+			count++
+		}
+	}
+	if count != 1 {
+		return fmt.Errorf("direct cgroup membership is not unique")
 	}
 	return nil
 }
