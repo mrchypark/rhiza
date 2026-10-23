@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,11 +44,25 @@ func run(ctx context.Context, args []string) error {
 	runtimeVersion := f.String("containerd-version", "", "exact qualified containerd version")
 	runtimeType := f.String("containerd-runtime-type", "io.containerd.runc.v2", "qualified containerd runtime type")
 	profileID := f.String("cgroup-profile-id", "", "administrator-qualified private cgroup-v2 profile ID")
+	sandboxExecutableSHA256 := f.String("sandbox-executable-sha256", os.Getenv("SANDBOX_EXECUTABLE_SHA256"), "administrator-approved SHA-256 of the live pause executable")
+	sandboxArgsJSON := f.String("sandbox-args-json", os.Getenv("SANDBOX_ARGS_JSON"), "JSON array of the exact administrator-approved pause argv")
 	kernelRelease := f.String("kernel-release", "", "exact qualified Linux kernel release")
 	authorityUID := f.String("authority-deployment-uid", os.Getenv("AUTHORITY_DEPLOYMENT_UID"), "pinned immutable rhiza-fencer Deployment UID")
 	grace := f.Int64("stop-grace-seconds", 3, "bounded CRI stop grace period")
 	if err := f.Parse(args); err != nil {
 		return err
+	}
+	if *sandboxArgsJSON == "" {
+		*sandboxArgsJSON = `["/pause"]`
+	}
+	var sandboxArgs []string
+	if err := json.Unmarshal([]byte(*sandboxArgsJSON), &sandboxArgs); err != nil || sandboxArgs == nil {
+		return fmt.Errorf("runtime agent sandbox-args-json must be a JSON string array")
+	}
+	for _, arg := range sandboxArgs {
+		if arg == "" || strings.ContainsRune(arg, 0) {
+			return fmt.Errorf("runtime agent sandbox-args-json contains an invalid argument")
+		}
 	}
 	if f.NArg() != 0 || *namespace == "" || *runtimeVersion == "" || *runtimeType == "" || *profileID == "" || *kernelRelease == "" || *authorityUID == "" || *grace < 0 || *grace > 10 {
 		return fmt.Errorf("runtime agent requires namespace, pinned authority Deployment UID, exact containerd/kernel versions, qualified cgroup profile, and valid grace period")
@@ -98,7 +113,8 @@ func run(ctx context.Context, args []string) error {
 		return cri.HostIdentity{NodeName: nodeName, NodeUID: node.Metadata.UID, MachineID: machineID, BootID: bootID, KernelRelease: release}, nil
 	}
 	provider, err := cri.Open(*socket, cri.Profile{Namespace: *namespace, ContainerName: *containerName, RuntimeName: "containerd", RuntimeVersion: *runtimeVersion,
-		RuntimeAPIVersion: "v1", ContainerdRuntimeType: *runtimeType, CgroupProfileID: *profileID, KernelRelease: *kernelRelease, GraceSeconds: *grace}, host)
+		RuntimeAPIVersion: "v1", ContainerdRuntimeType: *runtimeType, CgroupProfileID: *profileID, KernelRelease: *kernelRelease,
+		SandboxExecutableSHA256: *sandboxExecutableSHA256, SandboxArgs: sandboxArgs, GraceSeconds: *grace}, host)
 	if err != nil {
 		return err
 	}
@@ -111,6 +127,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer service.Close()
 	server := &http.Server{Addr: *listen, Handler: service.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 35 * time.Second, WriteTimeout: 35 * time.Second,
 		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
 	defer server.Close()

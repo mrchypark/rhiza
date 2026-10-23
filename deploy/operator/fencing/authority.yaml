@@ -183,6 +183,8 @@ data:
   containerd-runtime-type: QUALIFIED_CONTAINERD_RUNTIME_TYPE
   cgroup-profile-id: QUALIFIED_PRIVATE_CGROUP_V2_PROFILE_ID
   kernel-release: QUALIFIED_LINUX_KERNEL_RELEASE
+  sandbox-executable-sha256: "QUALIFIED_SANDBOX_EXECUTABLE_SHA256"
+  sandbox-args-json: '["/pause"]'
   authority-deployment-uid: PINNED_RHIZA_FENCER_DEPLOYMENT_UID
 ---
 apiVersion: v1
@@ -256,6 +258,8 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: rhiza-runtime-agent
+      annotations:
+        rhiza.dev/sandbox-executable-sha256: "QUALIFIED_SANDBOX_EXECUTABLE_SHA256"
     spec:
       serviceAccountName: rhiza-runtime-agent
       # The runtime agent compares host CRI PIDs with cgroup.procs. Sharing
@@ -275,6 +279,8 @@ spec:
             - --containerd-version=$(CONTAINERD_VERSION)
             - --containerd-runtime-type=$(CONTAINERD_RUNTIME_TYPE)
             - --cgroup-profile-id=$(CGROUP_PROFILE_ID)
+            - --sandbox-executable-sha256=$(SANDBOX_EXECUTABLE_SHA256)
+            - --sandbox-args-json=$(SANDBOX_ARGS_JSON)
             - --kernel-release=$(KERNEL_RELEASE)
             - --authority-deployment-uid=$(AUTHORITY_DEPLOYMENT_UID)
           env:
@@ -306,6 +312,16 @@ spec:
                 configMapKeyRef:
                   name: rhiza-runtime-agent-profile
                   key: kernel-release
+            - name: SANDBOX_EXECUTABLE_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: rhiza-runtime-agent-profile
+                  key: sandbox-executable-sha256
+            - name: SANDBOX_ARGS_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: rhiza-runtime-agent-profile
+                  key: sandbox-args-json
             - name: AUTHORITY_DEPLOYMENT_UID
               valueFrom:
                 configMapKeyRef:

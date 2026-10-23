@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/fencing/cri"
@@ -56,16 +57,21 @@ type Config struct {
 }
 
 type Service struct {
-	mu   sync.Mutex
-	cfg  Config
-	base string
+	mu          sync.Mutex
+	cfg         Config
+	base        string
+	ctx         context.Context
+	cancel      context.CancelFunc
+	watching    map[string]bool
+	writeRecord func(string, record) error
 }
 
 type record struct {
-	Binding fencing.RuntimeBinding `json:"binding"`
-	Scope   json.RawMessage        `json:"scope"`
-	Stop    *fencing.StopRequest   `json:"stop,omitempty"`
-	Receipt json.RawMessage        `json:"receipt,omitempty"`
+	Binding            fencing.RuntimeBinding  `json:"binding"`
+	Scope              json.RawMessage         `json:"scope"`
+	PassiveObservation *cri.PassiveObservation `json:"passiveObservation,omitempty"`
+	Stop               *fencing.StopRequest    `json:"stop,omitempty"`
+	Receipt            json.RawMessage         `json:"receipt,omitempty"`
 }
 
 type enrollRequest struct {
@@ -92,7 +98,30 @@ func New(cfg Config) (*Service, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
 		return nil, fmt.Errorf("fencing: unsafe runtime-agent state directory")
 	}
-	return &Service{cfg: cfg, base: cfg.Directory}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	service := &Service{cfg: cfg, base: cfg.Directory, ctx: ctx, cancel: cancel, watching: make(map[string]bool)}
+	service.writeRecord = service.write
+	return service, nil
+}
+
+// Close stops bounded passive observers. Process exit also closes all kernel
+// descriptors, but callers should close the service during orderly shutdown.
+func (s *Service) Close() {
+	if s == nil {
+		return
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if backend, ok := s.cfg.Backend.(cri.PassiveTerminalBackend); ok {
+		for key := range s.watching {
+			if state, err := s.read(key); err == nil {
+				backend.CompletePassiveTerminal(state.Binding, state.Scope)
+			}
+		}
+	}
 }
 
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.handle) }
@@ -125,6 +154,13 @@ func (s *Service) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		receipt, err := s.stop(r.Context(), req.Binding, req.Request)
 		if err != nil {
+			if diagnostic, ok := cri.StopDiagnosticFrom(err); ok {
+				w.Header().Set("X-Rhiza-Stop-Stage", diagnostic.Stage)
+				w.Header().Set("X-Rhiza-Stop-Code", diagnostic.Code)
+			} else {
+				w.Header().Set("X-Rhiza-Stop-Stage", "backend_stop")
+				w.Header().Set("X-Rhiza-Stop-Code", "backend_unclassified")
+			}
 			http.Error(w, "runtime stop pending", http.StatusAccepted)
 			return
 		}
@@ -186,7 +222,109 @@ func (s *Service) enroll(ctx context.Context, base fencing.RuntimeBinding) (fenc
 		s.enrollmentDiagnostic("state_persist", "state_write_failed")
 		return fencing.RuntimeBinding{}, err
 	}
+	s.startPassiveWatcher(key, recovered)
 	return recovered.Binding, nil
+}
+
+func (s *Service) startPassiveWatcher(key string, state record) {
+	if _, ok := s.cfg.Backend.(cri.PassiveTerminalBackend); !ok || state.Scope == nil || len(state.Scope) == 0 {
+		return
+	}
+	var scope cri.CgroupScope
+	d := json.NewDecoder(bytes.NewReader(state.Scope))
+	d.DisallowUnknownFields()
+	if d.Decode(&scope) != nil || scope.Passive == nil {
+		return
+	}
+	if s.watching[key] {
+		return
+	}
+	s.watching[key] = true
+	go s.watchPassive(key, state.Binding, append(json.RawMessage(nil), state.Scope...))
+}
+
+func (s *Service) watchPassive(key string, binding fencing.RuntimeBinding, scope json.RawMessage) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.watching, key)
+		s.mu.Unlock()
+	}()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	backend := s.cfg.Backend.(cri.PassiveTerminalBackend)
+	var pending *cri.PassiveObservation
+	writeFailures := 0
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		s.mu.Lock()
+		state, err := s.read(key)
+		if err != nil || state.Binding != binding {
+			s.mu.Unlock()
+			return
+		}
+		if state.Stop != nil && state.PassiveObservation == nil {
+			if pending != nil {
+				s.mu.Unlock()
+				return
+			}
+			backend.CompletePassiveTerminal(binding, scope)
+			s.mu.Unlock()
+			return
+		}
+		var observation cri.PassiveObservation
+		if state.PassiveObservation != nil {
+			observation = *state.PassiveObservation
+			if pending != nil && *pending != observation {
+				s.enrollmentDiagnostic("passive_observation_persist", "state_conflict")
+				s.mu.Unlock()
+				return
+			}
+			pending = &observation
+		} else if pending != nil {
+			observation = *pending
+			state.PassiveObservation = &observation
+		} else {
+			var complete bool
+			observation, complete, err = backend.ObservePassiveTerminal(s.ctx, binding, scope)
+			if err != nil {
+				backend.CompletePassiveTerminal(binding, scope)
+				s.mu.Unlock()
+				return
+			}
+			if !complete {
+				s.mu.Unlock()
+				continue
+			}
+			if err := validatePassiveRecord(scope, binding, observation); err != nil {
+				backend.CompletePassiveTerminal(binding, scope)
+				s.mu.Unlock()
+				return
+			}
+			pending = &observation
+			state.PassiveObservation = &observation
+		}
+		if err := validatePassiveRecord(scope, binding, observation); err != nil {
+			s.enrollmentDiagnostic("passive_observation_persist", "observation_invalid")
+			s.mu.Unlock()
+			return
+		}
+		if err := s.writeRecord(key, state); err != nil {
+			writeFailures++
+			s.enrollmentDiagnostic("passive_observation_persist", "state_write_failed")
+			s.mu.Unlock()
+			if writeFailures >= 5 {
+				return
+			}
+			continue
+		}
+		backend.CompletePassiveTerminal(binding, scope)
+		s.mu.Unlock()
+		return
+	}
 }
 
 func (s *Service) captureEnrollment(ctx context.Context, expected fencing.RuntimeBinding) (record, error) {
@@ -238,7 +376,22 @@ func validateCapturedScope(data json.RawMessage, binding fencing.RuntimeBinding)
 		scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID == "" {
 		return errors.New("runtime backend returned invalid captured cgroup scope")
 	}
+	if scope.Passive != nil {
+		if scope.Passive.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || cri.ValidatePassiveScope(scope) != nil {
+			return errors.New("runtime backend returned invalid passive terminal scope")
+		}
+	}
 	return nil
+}
+
+func validatePassiveRecord(scopeData json.RawMessage, binding fencing.RuntimeBinding, observation cri.PassiveObservation) error {
+	var scope cri.CgroupScope
+	decoder := json.NewDecoder(bytes.NewReader(scopeData))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&scope); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return errors.New("runtime passive scope is invalid")
+	}
+	return cri.ValidatePassiveObservation(binding, scope, observation)
 }
 
 func rawDigest(data []byte) string {
@@ -320,61 +473,103 @@ func (s *Service) stop(ctx context.Context, binding fencing.RuntimeBinding, requ
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if binding.AuthorityID != s.cfg.AuthorityID || binding.Validate(request.Identity) != nil || request.OperationID == "" || !validDigest(request.RequestHash) {
-		return nil, errors.New("invalid exact stop request")
+		return nil, cri.NewStopDiagnosticError("stop_request", "invalid_request", errors.New("invalid exact stop request"))
 	}
 	key := enrollmentKey(binding)
 	state, err := s.read(key)
 	if errors.Is(err, os.ErrNotExist) {
 		if !validDigest(binding.CapturedScopeDigest) {
-			return nil, errors.New("runtime enrollment lacks a root-pinned captured scope digest")
+			return nil, cri.NewStopDiagnosticError("enrollment_state", "missing_or_unreadable", errors.New("runtime enrollment lacks a root-pinned captured scope digest"))
 		}
 		state, err = s.captureEnrollment(ctx, binding)
 		if err != nil {
-			return nil, err
+			return nil, cri.NewStopDiagnosticError("enrollment_capture", "capture_unverified", err)
 		}
 		if state.Binding != binding {
-			return nil, errors.New("runtime enrollment differs from the immutable stop binding")
+			return nil, cri.NewStopDiagnosticError("enrollment_state", "binding_mismatch", errors.New("runtime enrollment differs from the immutable stop binding"))
 		}
 		if err := s.write(key, state); err != nil {
-			return nil, err
+			return nil, cri.NewStopDiagnosticError("enrollment_state", "missing_or_unreadable", err)
 		}
 	} else if err != nil || state.Binding != binding {
-		return nil, errors.New("runtime enrollment missing")
+		return nil, cri.NewStopDiagnosticError("enrollment_state", "missing_or_unreadable", errors.New("runtime enrollment missing"))
 	}
 	// A retry reads the durable receipt before any CRI call or metadata lookup.
 	if state.Stop != nil {
 		if *state.Stop != request {
-			return nil, errors.New("different stop request for enrolled run")
+			return nil, cri.NewStopDiagnosticError("stop_request", "invalid_request", errors.New("different stop request for enrolled run"))
 		}
 		if len(state.Receipt) != 0 {
 			return append(json.RawMessage(nil), state.Receipt...), nil
 		}
+		if state.PassiveObservation != nil {
+			if backend, ok := s.cfg.Backend.(cri.PassiveTerminalBackend); ok {
+				receipt, err := backend.BindPassiveTerminal(binding, request, state.Scope, *state.PassiveObservation)
+				if err != nil {
+					return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", err)
+				}
+				return s.persistReceipt(key, state, request, receipt)
+			}
+			return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", errors.New("passive terminal observation backend unavailable"))
+		}
 		receipt, err := s.cfg.Backend.ResumeStop(ctx, binding, request, state.Scope)
 		if err != nil {
-			return nil, err
+			return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", err)
 		}
 		return s.persistReceipt(key, state, request, receipt)
+	}
+	// Observe a previously enrolled process incarnation before writing fresh
+	// stop intent. A complete passive observation is fsynced independently; only
+	// after the exact request is durable may it be converted into a receipt.
+	if state.PassiveObservation == nil {
+		if backend, ok := s.cfg.Backend.(cri.PassiveTerminalBackend); ok {
+			observation, complete, observeErr := backend.ObservePassiveTerminal(ctx, binding, state.Scope)
+			if observeErr == nil && complete {
+				if err := validatePassiveRecord(state.Scope, binding, observation); err != nil {
+					return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", err)
+				}
+				state.PassiveObservation = &observation
+				if err := s.write(key, state); err != nil {
+					return nil, cri.NewStopDiagnosticError("passive_observation_persist", "observation_write_failed", err)
+				}
+				backend.CompletePassiveTerminal(binding, state.Scope)
+			}
+		}
 	}
 	// Persist exact intent before any potentially effective CRI request. After a
 	// crash, only this exact tuple may be resumed from captured scope evidence.
 	state.Stop = &request
 	if err := s.write(key, state); err != nil {
-		return nil, err
+		return nil, cri.NewStopDiagnosticError("stop_intent_persist", "intent_write_failed", err)
+	}
+	if state.PassiveObservation != nil {
+		backend, ok := s.cfg.Backend.(cri.PassiveTerminalBackend)
+		if !ok {
+			return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", errors.New("passive terminal observation backend unavailable"))
+		}
+		receipt, err := backend.BindPassiveTerminal(binding, request, state.Scope, *state.PassiveObservation)
+		if err != nil {
+			return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", err)
+		}
+		return s.persistReceipt(key, state, request, receipt)
 	}
 	receipt, err := s.cfg.Backend.Stop(ctx, binding, request, state.Scope)
 	if err != nil {
-		return nil, err
+		return nil, cri.NewStopDiagnosticError("backend_stop", "backend_unclassified", err)
 	}
 	return s.persistReceipt(key, state, request, receipt)
 }
 
 func (s *Service) persistReceipt(key string, state record, request fencing.StopRequest, receipt json.RawMessage) (json.RawMessage, error) {
 	if len(receipt) == 0 || len(receipt) > maxMessage || !json.Valid(receipt) {
-		return nil, errors.New("runtime backend returned invalid receipt")
+		return nil, cri.NewStopDiagnosticError("receipt_validation", "receipt_invalid", errors.New("runtime backend returned invalid receipt"))
 	}
 	state.Stop, state.Receipt = &request, append(json.RawMessage(nil), receipt...)
 	if err := s.write(key, state); err != nil {
-		return nil, err
+		return nil, cri.NewStopDiagnosticError("receipt_persist", "receipt_write_failed", err)
+	}
+	if backend, ok := s.cfg.Backend.(cri.PassiveTerminalBackend); ok {
+		backend.CompletePassiveTerminal(state.Binding, state.Scope)
 	}
 	return append(json.RawMessage(nil), receipt...), nil
 }

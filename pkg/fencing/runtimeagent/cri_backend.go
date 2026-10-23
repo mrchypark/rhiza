@@ -59,6 +59,35 @@ func (b *CRIBackend) ResumeStop(ctx context.Context, binding fencing.RuntimeBind
 	return encodeObservation(observation, binding, request, scope)
 }
 
+func (b *CRIBackend) ObservePassiveTerminal(ctx context.Context, binding fencing.RuntimeBinding, scopeData json.RawMessage) (cri.PassiveObservation, bool, error) {
+	scope, err := decodeScope(scopeData)
+	if err != nil {
+		return cri.PassiveObservation{}, false, err
+	}
+	if b == nil || b.Provider == nil {
+		return cri.PassiveObservation{}, false, fmt.Errorf("fencing: CRI provider missing")
+	}
+	return b.Provider.ObservePassiveTerminal(ctx, binding, scope)
+}
+
+func (b *CRIBackend) BindPassiveTerminal(binding fencing.RuntimeBinding, request fencing.StopRequest, scopeData json.RawMessage, observation cri.PassiveObservation) (json.RawMessage, error) {
+	scope, err := decodeScope(scopeData)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil || b.Provider == nil {
+		return nil, fmt.Errorf("fencing: CRI provider missing")
+	}
+	return b.Provider.BindPassiveTerminal(binding, request, scope, observation)
+}
+
+func (b *CRIBackend) CompletePassiveTerminal(binding fencing.RuntimeBinding, scopeData json.RawMessage) {
+	scope, err := decodeScope(scopeData)
+	if err == nil && b != nil && b.Provider != nil {
+		b.Provider.CompletePassiveTerminal(binding, scope)
+	}
+}
+
 func decodeScope(scopeData json.RawMessage) (cri.CgroupScope, error) {
 	var scope cri.CgroupScope
 	d := json.NewDecoder(bytes.NewReader(scopeData))

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,7 +15,9 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/thanos-io/objstore"
 )
 
 // qualifyGCSDeadPod exercises automatic single-voter replacement on an
@@ -66,6 +69,9 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	if source.Durability != "before-ack" || len(source.Targets) != 3 {
 		return fmt.Errorf("GCS dead-Pod qualification requires three voters and before-ACK durability")
 	}
+	if err := verifyGCSDeadPodPassiveAgentProfile(ctx, source); err != nil {
+		return fmt.Errorf("passive dead-Pod profile preflight (before fault injection): %w", err)
+	}
 	binding, err := get(ctx, "rhizacluster", source.BindingName)
 	if err != nil {
 		return err
@@ -109,7 +115,7 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	stateStore, _, gcsClient, readBucket, closeStores, err := openGCSAckLossAuthorityStores(ctx, source, readScope)
+	stateStore, evidenceStore, gcsClient, readBucket, closeStores, err := openGCSAckLossAuthorityStores(ctx, source, readScope)
 	if err != nil {
 		return err
 	}
@@ -162,6 +168,15 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
+	terminalRef, err := findGCSDeadPodTerminalRef(proof, source, target, runtime, producerUID)
+	if err != nil {
+		return err
+	}
+	passiveReceipt, err := verifyGCSDeadPodPassiveTerminal(ctx, stateStore, evidenceStore, source, target, runtime, producerUID, terminalRef)
+	if err != nil {
+		return fmt.Errorf("exact passive dead-Pod terminal receipt: %w", err)
+	}
+	event("passive_terminal_receipt_verified", passiveReceipt)
 	event("voter_fence_proven", obj{"fence": fenceObject, "request": request, "proof": proof})
 
 	recovery, err := waitForGCSVoterRecovery(ctx, source, target, request, proof)
@@ -201,6 +216,346 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 		"recovery": recovery, "postRecoveryAck": postAck, "postRecoveryRows": rows["rows"], "oldOrdinalReturn": oldReturn}
 	if err := os.WriteFile(filepath.Join(out, "gcs-dead-pod-evidence.json"), encoded(evidence), 0600); err != nil {
 		return err
+	}
+	return nil
+}
+
+func verifyGCSDeadPodPassiveAgentProfile(ctx context.Context, source gcsRecoverySource) error {
+	profile, err := get(ctx, "configmap", "rhiza-runtime-agent-profile")
+	if err != nil {
+		return fmt.Errorf("read installed runtime-agent profile: %w", err)
+	}
+	daemonSet, err := get(ctx, "daemonset", runtimeAgentDSName)
+	if err != nil {
+		return fmt.Errorf("read installed runtime-agent DaemonSet: %w", err)
+	}
+	pods, err := get(ctx, "pods", "")
+	if err != nil {
+		return fmt.Errorf("read runtime-agent Pods: %w", err)
+	}
+	return validateGCSDeadPodPassiveAgentProfile(profile, daemonSet, pods, source)
+}
+
+func validateGCSDeadPodPassiveAgentProfile(profile, daemonSet, pods obj, source gcsRecoverySource) error {
+	const profileName = "rhiza-runtime-agent-profile"
+	if text(nested(profile, "metadata", "name")) != profileName || text(nested(profile, "metadata", "namespace")) != source.Namespace ||
+		text(nested(profile, "metadata", "uid")) == "" || text(nested(profile, "metadata", "resourceVersion")) == "" {
+		return fmt.Errorf("installed runtime-agent profile identity is incomplete")
+	}
+	sandboxDigest := text(nested(profile, "data", "sandbox-executable-sha256"))
+	if len(sandboxDigest) != 64 || strings.ToLower(sandboxDigest) != sandboxDigest {
+		return fmt.Errorf("installed runtime-agent profile lacks an approved lowercase SHA-256 pause executable digest")
+	}
+	if _, err := immutableDigest("sha256:" + sandboxDigest); err != nil {
+		return fmt.Errorf("installed runtime-agent pause executable digest is invalid")
+	}
+	if text(nested(profile, "data", "sandbox-args-json")) != `["/pause"]` {
+		return fmt.Errorf("installed runtime-agent profile does not pin the exact passive pause argv")
+	}
+
+	daemonSetUID := text(nested(daemonSet, "metadata", "uid"))
+	generation := numberOrZero(nested(daemonSet, "metadata", "generation"))
+	if text(nested(daemonSet, "metadata", "name")) != runtimeAgentDSName || text(nested(daemonSet, "metadata", "namespace")) != source.Namespace ||
+		daemonSetUID == "" || source.AgentDaemonUID == "" || daemonSetUID != source.AgentDaemonUID || generation <= 0 ||
+		numberOrZero(nested(daemonSet, "status", "observedGeneration")) != generation {
+		return fmt.Errorf("runtime-agent DaemonSet identity or observed generation is stale")
+	}
+	desired := int(numberOrZero(nested(daemonSet, "status", "desiredNumberScheduled")))
+	if desired <= 0 || int(numberOrZero(nested(daemonSet, "status", "currentNumberScheduled"))) != desired ||
+		int(numberOrZero(nested(daemonSet, "status", "updatedNumberScheduled"))) != desired ||
+		int(numberOrZero(nested(daemonSet, "status", "numberReady"))) != desired ||
+		int(numberOrZero(nested(daemonSet, "status", "numberAvailable"))) != desired {
+		return fmt.Errorf("runtime-agent DaemonSet rollout is incomplete")
+	}
+	if text(nested(daemonSet, "spec", "template", "metadata", "annotations", "rhiza.dev/sandbox-executable-sha256")) != sandboxDigest {
+		return fmt.Errorf("runtime-agent DaemonSet template is not bound to the installed pause executable profile")
+	}
+	if text(nested(daemonSet, "spec", "template", "metadata", "annotations", "rhiza.mrchypark.dev/runtime-proof-profile")) != "passive-kernel-v1" ||
+		!runtimeAgentPassivePodSpecOK(nested(daemonSet, "spec", "template", "spec")) {
+		return fmt.Errorf("runtime-agent DaemonSet is not using the exact opt-in passive-kernel privilege profile")
+	}
+	selector, _ := nested(daemonSet, "spec", "selector", "matchLabels").(map[string]any)
+	if len(selector) == 0 {
+		return fmt.Errorf("runtime-agent DaemonSet selector is missing")
+	}
+
+	containers := runtimeProbeList(nested(daemonSet, "spec", "template", "spec", "containers"))
+	var agent obj
+	for _, candidate := range containers {
+		if nested(candidate, "name") == "runtime-agent" {
+			if agent != nil {
+				return fmt.Errorf("runtime-agent DaemonSet container is ambiguous")
+			}
+			agent = runtimeProbeObject(candidate)
+		}
+	}
+	if agent == nil || !runtimeAgentProfileConfigMapBinding(agent, profileName) ||
+		!runtimeAgentProfileArgBinding(agent, "--sandbox-executable-sha256=$(SANDBOX_EXECUTABLE_SHA256)") ||
+		!runtimeAgentProfileArgBinding(agent, "--sandbox-args-json=$(SANDBOX_ARGS_JSON)") {
+		return fmt.Errorf("runtime-agent DaemonSet does not bind the exact installed passive profile")
+	}
+
+	wantNodes := make(map[string]bool)
+	expectedAgents := make(map[string]gcsControlPodIdentity)
+	agentIndex := 0
+	for _, target := range source.Targets {
+		if target.NodeName == "" {
+			return fmt.Errorf("captured voter has no source node identity")
+		}
+		if wantNodes[target.NodeName] {
+			continue
+		}
+		wantNodes[target.NodeName] = true
+		if agentIndex >= len(source.AgentPods) {
+			return fmt.Errorf("captured runtime-agent identities do not cover every source node")
+		}
+		identity := source.AgentPods[agentIndex]
+		if identity.Name == "" || identity.UID == "" || identity.OwnerUID != daemonSetUID {
+			return fmt.Errorf("captured runtime-agent identity is incomplete")
+		}
+		expectedAgents[target.NodeName] = identity
+		agentIndex++
+	}
+	if len(wantNodes) == 0 {
+		return fmt.Errorf("captured voter cohort has no source nodes")
+	}
+	if len(expectedAgents) != len(wantNodes) || len(source.AgentPods) != agentIndex {
+		return fmt.Errorf("captured runtime-agent identities do not cover every source node")
+	}
+	readyByNode := make(map[string]int, len(wantNodes))
+	owned := 0
+	for _, pod := range runtimeProbeList(nested(pods, "items")) {
+		isOwned := false
+		owners := ownerRefs(pod)
+		for _, owner := range owners {
+			isOwned = isOwned || nested(owner, "apiVersion") == "apps/v1" && nested(owner, "kind") == "DaemonSet" &&
+				nested(owner, "name") == runtimeAgentDSName && nested(owner, "uid") == daemonSetUID && nested(owner, "controller") == true
+		}
+		if !isOwned {
+			continue
+		}
+		if len(owners) != 1 {
+			return fmt.Errorf("runtime-agent Pod ownership is ambiguous")
+		}
+		owned++
+		if !labelsMatch(nested(pod, "metadata", "labels"), selector) || text(nested(pod, "metadata", "deletionTimestamp")) != "" ||
+			text(nested(pod, "metadata", "annotations", "rhiza.dev/sandbox-executable-sha256")) != sandboxDigest || !podReady(pod) ||
+			text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/runtime-proof-profile")) != "passive-kernel-v1" ||
+			!runtimeAgentPassivePodSpecOK(nested(pod, "spec")) ||
+			nested(namedContainerStatus(pod, "runtime-agent"), "ready") != true {
+			return fmt.Errorf("runtime-agent DaemonSet has an unready or profile-mismatched Pod")
+		}
+		node := text(nested(pod, "spec", "nodeName"))
+		if wantNodes[node] {
+			expected := expectedAgents[node]
+			if text(nested(pod, "metadata", "name")) != expected.Name || text(nested(pod, "metadata", "uid")) != expected.UID {
+				return fmt.Errorf("source-node runtime-agent Pod identity changed after capture")
+			}
+			readyByNode[node]++
+		}
+	}
+	if owned != desired {
+		return fmt.Errorf("runtime-agent DaemonSet Pod inventory differs from its desired rollout")
+	}
+	for node := range wantNodes {
+		if readyByNode[node] != 1 {
+			return fmt.Errorf("source node does not have exactly one Ready runtime-agent Pod")
+		}
+	}
+	return nil
+}
+
+func runtimeAgentPassivePodSpecOK(raw any) bool {
+	spec := runtimeProbeObject(raw)
+	return nested(spec, "hostPID") == true && len(runtimeProbeList(nested(spec, "initContainers"))) == 0 &&
+		len(runtimeProbeList(nested(spec, "ephemeralContainers"))) == 0 &&
+		runtimeAgentPassiveSecurityContextOK(nested(spec, "containers"))
+}
+
+func runtimeAgentPassiveSecurityContextOK(raw any) bool {
+	containers := runtimeProbeList(raw)
+	if len(containers) != 1 {
+		return false
+	}
+	var agent obj
+	for _, candidate := range containers {
+		container := runtimeProbeObject(candidate)
+		if text(nested(container, "name")) != "runtime-agent" {
+			continue
+		}
+		if agent != nil {
+			return false
+		}
+		agent = container
+	}
+	if agent == nil {
+		return false
+	}
+	security := runtimeProbeObject(nested(agent, "securityContext"))
+	capabilities := runtimeProbeObject(nested(security, "capabilities"))
+	added := runtimeProbeList(capabilities["add"])
+	dropped := runtimeProbeList(capabilities["drop"])
+	return nested(security, "privileged") == false && nested(security, "allowPrivilegeEscalation") == false &&
+		len(added) == 1 && added[0] == "SYS_PTRACE" && len(dropped) == 1 && dropped[0] == "ALL"
+}
+
+func runtimeAgentProfileConfigMapBinding(container obj, profileName string) bool {
+	foundSHA, foundArgs := false, false
+	for _, entry := range runtimeProbeList(nested(container, "env")) {
+		name := text(nested(entry, "name"))
+		key := ""
+		switch name {
+		case "SANDBOX_EXECUTABLE_SHA256":
+			key = "sandbox-executable-sha256"
+		case "SANDBOX_ARGS_JSON":
+			key = "sandbox-args-json"
+		default:
+			continue
+		}
+		if text(nested(entry, "valueFrom", "configMapKeyRef", "name")) != profileName ||
+			text(nested(entry, "valueFrom", "configMapKeyRef", "key")) != key || nested(entry, "valueFrom", "configMapKeyRef", "optional") == true {
+			return false
+		}
+		if name == "SANDBOX_EXECUTABLE_SHA256" {
+			if foundSHA {
+				return false
+			}
+			foundSHA = true
+		} else {
+			if foundArgs {
+				return false
+			}
+			foundArgs = true
+		}
+	}
+	return foundSHA && foundArgs
+}
+
+func runtimeAgentProfileArgBinding(container obj, expected string) bool {
+	count := 0
+	for _, argument := range runtimeProbeList(nested(container, "args")) {
+		if argument == expected {
+			count++
+		}
+	}
+	return count == 1
+}
+
+type gcsDeadPodTerminalEvidence struct {
+	Version        int                            `json:"version"`
+	Request        fencing.StopRequest            `json:"request"`
+	Runtime        fencing.RuntimeBinding         `json:"runtime"`
+	ProducerUID    string                         `json:"producerUID"`
+	Storage        operator.AttestationStoreScope `json:"storage"`
+	RuntimeReceipt []byte                         `json:"runtimeReceipt"`
+	Producer       fencing.MutationProducer       `json:"producer"`
+}
+
+func findGCSDeadPodTerminalRef(proof operator.FenceProof, source gcsRecoverySource, target operator.FenceTarget, runtime fencing.RuntimeBinding, producerUID string) (fencing.TerminalReference, error) {
+	if proof.IndependentV2 == nil {
+		return fencing.TerminalReference{}, fmt.Errorf("voter fence has no IndependentV2 terminal references")
+	}
+	var found *fencing.TerminalReference
+	for i := range proof.IndependentV2.Terminals {
+		ref := &proof.IndependentV2.Terminals[i]
+		id := ref.Request.Identity
+		if id.SourceClusterID != source.ClusterID || id.NodeID != target.NodeID || id.PodUID != target.PodUID ||
+			id.RunID != runtime.RunID || id.WALIdentity != target.WALIdentity || ref.RuntimeHash != fencing.RuntimeBindingDigest(runtime) || ref.ProducerUID != producerUID {
+			continue
+		}
+		if found != nil {
+			return fencing.TerminalReference{}, fmt.Errorf("multiple canonical terminal references match the captured voter")
+		}
+		found = ref
+	}
+	if found == nil {
+		return fencing.TerminalReference{}, fmt.Errorf("IndependentV2 proof omits the exact captured terminal reference")
+	}
+	return *found, nil
+}
+
+func verifyGCSDeadPodPassiveTerminal(ctx context.Context, stateStore *operator.AuthorityStateStore, evidenceStore *operator.AuthorityEvidenceStore,
+	source gcsRecoverySource, target operator.FenceTarget, runtime fencing.RuntimeBinding, producerUID string, ref fencing.TerminalReference) (obj, error) {
+	if ctx == nil || stateStore == nil || evidenceStore == nil || producerUID == "" || ref.Request.OperationID == "" {
+		return nil, fmt.Errorf("canonical terminal stores and exact stop request are required")
+	}
+	root, _, err := stateStore.ReadRoot(ctx, runtime.StatefulSetUID, runtime.SourceClusterID)
+	if err != nil {
+		return nil, fmt.Errorf("read canonical root for dead-Pod terminal: %w", err)
+	}
+	run, ok := root.Ledger.Runs[runtime.RunID]
+	if !ok || root.StatefulSetUID != source.StatefulSetUID || root.Ledger.SourceClusterID != source.ClusterID ||
+		run.Identity != ref.Request.Identity || run.Runtime == nil || *run.Runtime != runtime || run.Stop == nil || *run.Stop != ref.Request ||
+		run.IndependentTerminal == nil || *run.IndependentTerminal != ref || run.MutationProducerUID != producerUID {
+		return nil, fmt.Errorf("canonical root does not bind the exact closed runtime, request, producer, and terminal reference")
+	}
+	wantRoot := gcsHAAuthorityRootIdentity(runtime.StatefulSetUID, runtime.SourceClusterID)
+	if evidenceStore.Identity() != wantRoot {
+		return nil, fmt.Errorf("terminal evidence store is not scoped to the canonical source root")
+	}
+	producer, gotProducerUID, _, err := stateStore.ReadProducer(ctx, runtime)
+	if err != nil || gotProducerUID != producerUID || producer.Runtime != runtime || producer.WALIdentity != target.WALIdentity ||
+		producer.CloseOperationID != ref.Request.OperationID || producer.CloseRequestHash != ref.Request.RequestHash || !producer.BarrierComplete() {
+		return nil, fmt.Errorf("canonical mutation producer is not durably closed for the exact terminal request: %v", err)
+	}
+	if len(ref.ProofName) != len("rhiza-terminal-")+40 || !strings.HasPrefix(ref.ProofName, "rhiza-terminal-") {
+		return nil, fmt.Errorf("canonical terminal evidence object name is invalid")
+	}
+	object, version, err := evidenceStore.Read(ctx, path.Join("terminal", ref.ProofName))
+	if err != nil {
+		return nil, fmt.Errorf("read canonical terminal evidence object: %w", err)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(object, 700001))
+	closeErr := object.Close()
+	if err := errors.Join(readErr, closeErr); err != nil || len(data) > 700000 || version == nil || version.Value == "" ||
+		(version.Type != objstore.Generation && version.Type != objstore.ETag) {
+		return nil, fmt.Errorf("canonical terminal evidence object is incomplete: %v", err)
+	}
+	versionID := fmt.Sprintf("%x", sha256.Sum256(encoded([]any{"rhiza-terminal-object-version-v1", version.Type, version.Value})))
+	if versionID != ref.ProofUID {
+		return nil, fmt.Errorf("canonical terminal evidence object version differs from its reference")
+	}
+	var evidence gcsDeadPodTerminalEvidence
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&evidence) != nil || decoder.Decode(new(any)) != io.EOF || !bytes.Equal(encoded(evidence), data) ||
+		evidence.Version != 2 || evidence.Request != ref.Request || evidence.Runtime != runtime || evidence.ProducerUID != producerUID ||
+		evidence.Storage != gcsHAAckSourceScope(source) || !bytes.Equal(encoded(evidence.Producer), encoded(producer)) || evidence.Producer.Validate() != nil || !evidence.Producer.BarrierComplete() {
+		return nil, fmt.Errorf("canonical terminal evidence contents differ from the exact closed source run")
+	}
+	proofDigest := fmt.Sprintf("%x", sha256.Sum256(encoded(evidence)))
+	mutationDigest := fmt.Sprintf("%x", sha256.Sum256(encoded(evidence.Producer)))
+	storageDigest := fmt.Sprintf("%x", sha256.Sum256(encoded(evidence.Storage)))
+	receiptDigest := fmt.Sprintf("%x", sha256.Sum256(evidence.RuntimeReceipt))
+	if proofDigest != ref.ProofDigest || mutationDigest != ref.MutationReceiptDigest || storageDigest != ref.StorageScopeDigest || receiptDigest != ref.RuntimeReceiptDigest {
+		return nil, fmt.Errorf("canonical terminal evidence digest differs from its IndependentV2 reference")
+	}
+	if err := validateGCSDeadPodPassiveReceipt(evidence.RuntimeReceipt, ref, target, runtime, producerUID); err != nil {
+		return nil, err
+	}
+	return obj{"mode": "passive-kernel-v1", "receiptSHA256": receiptDigest, "scopeDigest": runtime.CapturedScopeDigest}, nil
+}
+
+func validateGCSDeadPodPassiveReceipt(data []byte, ref fencing.TerminalReference, target operator.FenceTarget, runtime fencing.RuntimeBinding, producerUID string) error {
+	identity := fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: target.NodeID, PodUID: target.PodUID, RunID: runtime.RunID, WALIdentity: target.WALIdentity}
+	_, requestHashErr := immutableDigest("sha256:" + ref.Request.RequestHash)
+	if len(data) == 0 || len(data) > 65536 || producerUID == "" || ref.EvidenceVersion != 2 || ref.Request.Identity != identity ||
+		runtime.Validate(identity) != nil || ref.RuntimeHash != fencing.RuntimeBindingDigest(runtime) || ref.ProducerUID != producerUID ||
+		ref.Request.OperationID == "" || requestHashErr != nil {
+		return fmt.Errorf("terminal receipt reference is not bound to the exact captured run")
+	}
+	var receipt cri.PassiveReceipt
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&receipt) != nil || decoder.Decode(new(any)) != io.EOF || !bytes.Equal(encoded(receipt), data) ||
+		receipt.Mode != "passive-kernel-v1" || receipt.Runtime != runtime || receipt.Request != ref.Request ||
+		receipt.Observation.Version != 1 || receipt.Observation.RuntimeHash != fencing.RuntimeScopeBindingDigest(runtime) ||
+		receipt.Observation.ScopeDigest != runtime.CapturedScopeDigest || !receipt.Observation.TargetPIDExited ||
+		!receipt.Observation.TargetCgroupGone || !receipt.Observation.SandboxPIDExited || !receipt.Observation.SandboxCgroupGone {
+		return fmt.Errorf("terminal receipt is not an exact passive-kernel observation")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, receipt.Observation.ObservedAt); err != nil {
+		return fmt.Errorf("passive terminal receipt observation time is invalid")
 	}
 	return nil
 }

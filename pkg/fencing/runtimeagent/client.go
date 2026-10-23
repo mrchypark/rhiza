@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 )
 
 type Client struct {
@@ -88,7 +89,11 @@ func (c *Client) post(ctx context.Context, route string, value any, result any) 
 		return nil
 	}
 	if route == "/v1/stop" && response.StatusCode == http.StatusAccepted {
-		return fencing.ErrPending
+		stage, code := response.Header.Get("X-Rhiza-Stop-Stage"), response.Header.Get("X-Rhiza-Stop-Code")
+		if !cri.ValidStopDiagnostic(stage, code) {
+			stage, code = "backend_stop", "backend_unclassified"
+		}
+		return cri.NewStopDiagnosticError(stage, code, fencing.ErrPending)
 	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("fencing: runtime agent HTTP %d", response.StatusCode)

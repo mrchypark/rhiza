@@ -15,13 +15,14 @@ import (
 // container's init process. Path is only meaningful beneath the configured
 // host cgroup root; callers must persist this value with the enrolled binding.
 type CgroupScope struct {
-	Path        string `json:"path"`
-	Dev         uint64 `json:"dev"`
-	Ino         uint64 `json:"ino"`
-	PID         uint32 `json:"pid"`
-	StartTime   uint64 `json:"startTime"`
-	RuntimeHash string `json:"runtimeHash"`
-	ProfileID   string `json:"profileID"`
+	Path        string        `json:"path"`
+	Dev         uint64        `json:"dev"`
+	Ino         uint64        `json:"ino"`
+	PID         uint32        `json:"pid"`
+	StartTime   uint64        `json:"startTime"`
+	RuntimeHash string        `json:"runtimeHash"`
+	ProfileID   string        `json:"profileID"`
+	Passive     *PassiveScope `json:"passive,omitempty"`
 }
 
 // captureCgroupScope resolves the pinned containerd runtimeSpec path beneath
