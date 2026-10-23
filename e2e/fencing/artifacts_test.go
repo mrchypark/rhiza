@@ -14,6 +14,8 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
+	"github.com/mrchypark/rhiza/pkg/recovery"
 	"github.com/thanos-io/objstore"
 )
 
@@ -1027,4 +1029,196 @@ func asyncEmptyPrivateEvidenceFixture(privateValue string) []byte {
 		"targetEmptyRows": "[]", "targetAck": gcsAcknowledgement{RequestID: "target-write", Slot: 1, Rows: `[[2,"gcs-async-target-ack"]]`},
 		"ackToSeal": "5s", "proofSource": "RhizaFence status plus direct read-only GCS HEAD read; the generation fence proof is validated against captured workload identities",
 	})
+}
+
+func TestMissingMembershipArtifactProjectionIsCaseBoundAndRedacted(t *testing.T) {
+	raw := t.TempDir()
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsMissingMembershipNegativeQualification)
+	for name, data := range map[string][]byte{
+		"actual-exit.txt": []byte("0\n"), "source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":                []byte("registry.invalid/app@sha256:" + strings.Repeat("b", 64) + "\nregistry.invalid/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+		gcsMissingMembershipEventsName: []byte("{}\n"),
+		gcsMissingMembershipNegativeEvidenceName: encoded(obj{
+			"qualification": "gcs-missing-membership-no-opt-in-rejection", "case": "negative", "sourceClusterID": "private-source",
+			"statefulSetUID": "private-sts", "recoveryUID": "private-recovery", "phase": "Blocked",
+			"sourceMembershipAbsent": true, "sourceSuccessorAbsent": true, "targetScopeUnclaimed": true, "missingMembershipOptInAbsent": true,
+		}),
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("strict negative projection failed: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsMissingMembershipSummaryName))
+	if err != nil || bytes.Contains(public, []byte("private-source")) || bytes.Contains(public, []byte("private-recovery")) {
+		t.Fatalf("public summary leaked private identities or is missing: %s (%v)", public, err)
+	}
+	wrongCase := t.TempDir()
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsMissingMembershipPositiveQualification)
+	for name, data := range map[string][]byte{
+		"actual-exit.txt": []byte("0\n"), "source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":                []byte("registry.invalid/app@sha256:" + strings.Repeat("b", 64) + "\nregistry.invalid/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+		gcsMissingMembershipEventsName: []byte("{}\n"),
+		gcsMissingMembershipNegativeEvidenceName: encoded(obj{
+			"qualification": "gcs-missing-membership-no-opt-in-rejection", "case": "negative", "sourceClusterID": "private-source",
+			"statefulSetUID": "private-sts", "recoveryUID": "private-recovery", "phase": "Blocked",
+			"sourceMembershipAbsent": true, "sourceSuccessorAbsent": true, "targetScopeUnclaimed": true, "missingMembershipOptInAbsent": true,
+		}),
+	} {
+		if err := os.WriteFile(filepath.Join(wrongCase, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(wrongCase); err == nil {
+		t.Fatal("accepted negative evidence under the positive selector")
+	}
+}
+
+func TestMissingMembershipPositiveProjectorBindsFreshTargetSecretAndProof(t *testing.T) {
+	data := missingMembershipPositiveEvidenceFixture()
+	if err := validateGCSMissingMembershipPositiveEvidence(data); err != nil {
+		t.Fatalf("rejected canonical positive evidence: %v", err)
+	}
+	raw := t.TempDir()
+	t.Setenv("FENCING_E2E_QUALIFICATION", gcsMissingMembershipPositiveQualification)
+	for name, content := range map[string][]byte{
+		"actual-exit.txt": []byte("0\n"), "source-head.txt": []byte(strings.Repeat("a", 40) + "\n"),
+		"image-ids.txt":                []byte("registry.example/db@sha256:" + strings.Repeat("b", 64) + "\nregistry.example/operator@sha256:" + strings.Repeat("c", 64) + "\n"),
+		gcsMissingMembershipEventsName: []byte("{}\n"), gcsMissingMembershipPositiveEvidenceName: data,
+	} {
+		if err := os.WriteFile(filepath.Join(raw, name), content, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := safeArtifacts(raw); err != nil {
+		t.Fatalf("valid positive missing-membership evidence did not project: %v", err)
+	}
+	public, err := os.ReadFile(filepath.Join(raw, "public", gcsMissingMembershipSummaryName))
+	if err != nil || bytes.Contains(public, []byte("fixture-ns")) || bytes.Contains(public, []byte("fixture-secret-uid")) || bytes.Contains(public, []byte("rhiza-0")) {
+		t.Fatalf("public missing-membership summary leaks private identity or is absent: %s (%v)", public, err)
+	}
+	for _, mutate := range []struct {
+		name string
+		fn   func(obj)
+	}{
+		{name: "target membership uses source keys", fn: func(evidence obj) {
+			target := evidence["targetMembership"].(map[string]any)
+			members := evidence["sourceMembers"]
+			target["membership"] = recovery.NewMembershipRecord("target-id", mustFixtureMembers(t, members), "async").Membership
+		}},
+		{name: "target secret belongs to another recovery", fn: func(evidence obj) {
+			evidence["targetCredentials"].(map[string]any)["ownerOperationID"] = "other-recovery"
+		}},
+		{name: "target secret keys are not fresh", fn: func(evidence obj) {
+			credentials := evidence["targetCredentials"].(map[string]any)
+			targetMembers := credentials["members"].([]any)
+			sourceMembers := evidence["sourceMembers"].([]any)
+			targetMembers[0].(map[string]any)["public_key"] = sourceMembers[0].(map[string]any)["public_key"]
+			credentials["membersSHA256"] = fmt.Sprintf("%x", sha256.Sum256(encoded(targetMembers)))
+		}},
+		{name: "proof names another operation", fn: func(evidence obj) {
+			evidence["fence"].(map[string]any)["operationID"] = "other-operation"
+		}},
+		{name: "proof terminal misses captured WAL", fn: func(evidence obj) {
+			proof := evidence["proof"].(map[string]any)
+			independent := proof["independentV2"].(map[string]any)
+			terminals := independent["terminals"].([]any)
+			request := terminals[0].(map[string]any)["request"].(map[string]any)
+			request["identity"].(map[string]any)["walIdentity"] = "different-wal"
+		}},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			var evidence obj
+			if err := json.Unmarshal(data, &evidence); err != nil {
+				t.Fatal(err)
+			}
+			mutate.fn(evidence)
+			if err := validateGCSMissingMembershipPositiveEvidence(encoded(evidence)); err == nil {
+				t.Fatal("accepted inconsistent target authorization or proof")
+			}
+		})
+	}
+}
+
+func missingMembershipPositiveEvidenceFixture() []byte {
+	const (
+		sourceID  = "fixture-source"
+		stsUID    = "fixture-sts-uid"
+		binding   = "fixture-binding-uid"
+		requestID = "fixture-missing-membership"
+	)
+	var sourceMembers, targetMembers []quepaxa.Member
+	var targets []operator.FenceTarget
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("rhiza-%d", i)
+		var oldKey, newKey quepaxa.PublicKey
+		oldKey[0], newKey[0] = byte(i+1), byte(i+11)
+		sourceMembers = append(sourceMembers, quepaxa.Member{ID: quepaxa.NodeID(id), URL: "http://" + id + ":7000", PeerURL: "http://" + id + ":7001", LogURL: "http://" + id + ":7002", PublicKey: oldKey, WALIdentity: "wal-" + id})
+		targetMembers = append(targetMembers, quepaxa.Member{ID: quepaxa.NodeID(id), URL: "http://" + id + ":7000", PeerURL: "http://" + id + ":7001", LogURL: "http://" + id + ":7002", PublicKey: newKey, WALIdentity: "wal-" + id})
+		targets = append(targets, operator.FenceTarget{NodeID: id, Pod: id, PodUID: "pod-" + id, WALIdentity: "wal-" + id})
+	}
+	source := obj{"namespace": "fixture-ns", "statefulSet": "rhiza", "statefulSetUID": stsUID, "container": "database", "bindingUID": binding,
+		"logicalID": "fixture-logical", "clusterID": sourceID, "bucket": "fixture-bucket", "prefix": "runs/fixture", "targets": targets}
+	scope := fencing.ArchiveScope{Provider: "gcs", Bucket: "fixture-bucket", Prefix: "runs/fixture", ClusterID: sourceID}
+	scopeHash, _ := scope.Hash()
+	targetID, _ := recovery.FrozenTargetID(recovery.FrozenSourceIdentity{ScopeHash: scopeHash, ClusterID: sourceID, StatefulSetUID: stsUID})
+	fence := operator.FenceRequest{LogicalID: "fixture-logical", BindingUID: binding, Namespace: "fixture-ns", StatefulSet: "rhiza", StatefulSetUID: stsUID,
+		SourceClusterID: sourceID, OperationID: requestID, Scope: operator.ScopeGeneration, Targets: targets}
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(encoded(fence)))
+	storageScope := operator.AttestationStoreScope{Provider: "gcs", Bucket: "fixture-bucket", Prefix: "runs/fixture"}
+	scopeDigest := fmt.Sprintf("%x", sha256.Sum256(encoded(storageScope)))
+	terminals := make([]fencing.TerminalReference, 0, len(targets))
+	for _, target := range targets {
+		terminals = append(terminals, fencing.TerminalReference{EvidenceVersion: 2,
+			Request: fencing.StopRequest{OperationID: "stop-" + target.NodeID, RequestHash: strings.Repeat("a", 64), Identity: fencing.Identity{
+				SourceClusterID: sourceID, NodeID: target.NodeID, PodUID: target.PodUID, RunID: "run-" + target.NodeID, WALIdentity: target.WALIdentity}},
+			RuntimeHash: strings.Repeat("b", 64), ProducerUID: "producer-" + target.NodeID, ProofName: "proof-" + target.NodeID,
+			ProofUID: "proof-uid-" + target.NodeID, ProofDigest: strings.Repeat("c", 64), RuntimeReceiptDigest: strings.Repeat("d", 64),
+			MutationReceiptDigest: strings.Repeat("e", 64), StorageScopeDigest: scopeDigest})
+	}
+	independent := &operator.IndependentEvidenceV2{Version: 2, RequestHash: requestHash, LedgerHash: strings.Repeat("f", 64), StorageScope: storageScope, Terminals: terminals}
+	proof := operator.FenceProof{OperationID: requestID, SourceClusterID: sourceID, BindingUID: binding, RequestHash: requestHash,
+		ProofID: "independent-v2-" + fmt.Sprintf("%x", sha256.Sum256(encoded(independent))), ProcessesTerminated: true, RecreationBlocked: true, StorageQuiesced: true, IndependentV2: independent}
+	recoveryUID := "fixture-recovery-uid"
+	ownerOperationID := recoveryUID + ":" + requestID
+	credentialBytes := encoded(targetMembers)
+	credentialHash := sha256.Sum256(credentialBytes)
+	secretName := "rhiza-recovery-" + gcsShortID(targetID)
+	bindingDigest := strings.Repeat("1", 64)
+	resource := operator.Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
+		Metadata: map[string]any{"uid": recoveryUID, "namespace": "fixture-ns", "labels": map[string]any{"chaos.rhiza.io/run": qualificationRunID}},
+		Spec: operator.Spec{StatefulSet: "rhiza", Container: "database", SourceClusterID: sourceID, RecoveryID: requestID, Durability: "async", AllowDataLoss: true,
+			AllowMissingSourceMembership: true, Fence: operator.Fence{RecoveryID: requestID, ClusterID: sourceID, StatefulSetUID: stsUID, Confirmed: true, Evidence: proof.ProofID}},
+		Status: operator.Status{Phase: "Complete", Stage: "Complete", Source: sourceID, Target: targetID, TargetBaseKind: "fork", SourceDurability: "async", StatefulSetUID: stsUID,
+			RecoveredTip: 5, ManifestHash: strings.Repeat("2", 64), ManualMembershipBindingDigest: bindingDigest, SecretName: secretName}}
+	return encoded(obj{
+		"qualification": "gcs-manual-missing-membership-nonempty-fork", "case": "positive",
+		"profile": obj{"provider": "gcs", "noPVC": true, "sourceDurability": "async", "allowDataLoss": true, "allowMissingSourceMembership": true},
+		"sourceAcknowledgements": []gcsAcknowledgement{{RequestID: "gcs-ha-ack-1", Slot: 1, Rows: `[[1,"gcs-missing-membership-source-1"]]`},
+			{RequestID: "gcs-ha-ack-2", Slot: 2, Rows: `[[2,"gcs-missing-membership-source-2"]]`}, {RequestID: "gcs-ha-ack-3", Slot: 3, Rows: `[[3,"gcs-missing-membership-source-3"]]`}},
+		"sourceRows":            `[[1,"gcs-missing-membership-source-1"],[2,"gcs-missing-membership-source-2"],[3,"gcs-missing-membership-source-3"]]`,
+		"sourceHeadBeforeFence": gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "generation-before", Tip: 5, HeadSHA256: strings.Repeat("3", 64)},
+		"sealedSourceHead":      gcsArchiveHeadEvidence{VersionType: int(objstore.Generation), Version: "generation-sealed", Tip: 5, Sealed: true, HeadSHA256: strings.Repeat("4", 64)},
+		"fence":                 fence, "proof": proof, "sourceIdentity": source, "recovery": resource, "sourceMembershipAbsent": true,
+		"sourceMembers": sourceMembers, "targetCredentials": obj{"secretName": secretName, "secretUID": "fixture-secret-uid", "resourceVersion": "17",
+			"ownerOperationID": ownerOperationID, "immutable": true, "membersSHA256": fmt.Sprintf("%x", credentialHash), "members": targetMembers},
+		"targetMembership": recovery.NewMembershipRecord(targetID, targetMembers, "async"), "manualMembershipBindingDigest": bindingDigest,
+		"targetMembershipVerified": true, "recoveredRows": `[[1,"a"],[2,"b"],[3,"c"]]`, "targetQuorumVerified": true,
+		"targetAck": gcsAcknowledgement{RequestID: "gcs-ha-ack-4", Slot: 6, Rows: `[[4,"gcs-missing-membership-target"]]`},
+	})
+}
+
+func mustFixtureMembers(t *testing.T, raw any) []quepaxa.Member {
+	t.Helper()
+	data, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var members []quepaxa.Member
+	if err := json.Unmarshal(data, &members); err != nil {
+		t.Fatal(err)
+	}
+	return members
 }
