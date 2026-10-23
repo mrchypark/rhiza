@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,9 +15,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mrchypark/rhiza/internal/types"
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/fencing/cri"
+	"github.com/mrchypark/rhiza/pkg/network"
 	"github.com/mrchypark/rhiza/pkg/operator"
+	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
 
@@ -96,7 +100,11 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	defer forward.close()
+	defer func() {
+		if forward != nil {
+			forward.close()
+		}
+	}()
 	if _, err := call(ctx, forward, "/sql/execute", obj{"request_id": "gcs-dead-pod-create-table", "sql": "CREATE TABLE fencing_items (id INTEGER PRIMARY KEY, value TEXT)"}, adminToken); err != nil {
 		return fmt.Errorf("create dead-Pod baseline table: %w", err)
 	}
@@ -134,6 +142,14 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 		return fmt.Errorf("authenticated read-only source authority cannot read canonical archive HEAD")
 	}
 	target := source.Targets[0]
+	oldPod, err := get(ctx, "pod", target.Pod)
+	if err != nil || text(nested(oldPod, "metadata", "uid")) != target.PodUID {
+		return fmt.Errorf("captured voter Pod changed before same-ordinal recovery: %v", err)
+	}
+	oldCredentialUID := text(nested(oldPod, "metadata", "annotations", "rhiza.mrchypark.dev/fencing-credential-uid"))
+	if oldCredentialUID == "" {
+		return fmt.Errorf("captured voter has no immutable peer-credential UID")
+	}
 	if err := requireNoPriorGCSVoterFence(ctx, source, target); err != nil {
 		return err
 	}
@@ -189,11 +205,15 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	}
 	fault = nil
 
-	// Confirm the survivor-authenticated membership is a three-voter cluster,
-	// with the old two voter incarnations and one distinct automatic learner.
-	if err := verifyGCSVoterMembership(ctx, source, target, recovery, forward, adminToken, out); err != nil {
+	// Confirm the source-authorized replacement uses this exact ordinal with a
+	// fresh Pod UID, logical NodeID, WAL, and immutable credential.
+	replacement, err := verifyGCSVoterMembership(ctx, source, target, oldCredentialUID, recovery, forward, adminToken, out)
+	if err != nil {
 		return err
 	}
+	event("old_logical_identity_closed", obj{"oldNodeID": target.NodeID, "oldWALIdentity": target.WALIdentity,
+		"oldCredentialUID": oldCredentialUID, "replacementNodeID": replacement.NodeID, "replacementWALIdentity": replacement.WALIdentity,
+		"replacementCredentialUID": recovery.Status.Membership.Add.SecretUID, "oldNodeAbsent": true})
 	postAck, err := writeGCSAcknowledgedRow(ctx, forward, adminToken, 2, "gcs-dead-pod-post-recovery")
 	if err != nil {
 		return fmt.Errorf("post-recovery ACK and linearizable readback: %w", err)
@@ -204,16 +224,51 @@ func qualifyGCSDeadPod(ctx context.Context) (resultErr error) {
 	}
 	event("post_recovery_ack_durable", obj{"ack": postAck, "rows": rows["rows"]})
 
-	oldReturn, err := waitForGCSDeadPodReturnRefusal(ctx, source, target, runtime.CapturedScopeDigest, out)
+	// Restart only the supervised application child inside the same admitted
+	// Pod. The exact Pod UID and WAL must survive; the container/runtime run must
+	// be new and the replacement must reauthenticate as its assigned voter.
+	beforeRestartPod, err := get(ctx, "pod", replacement.Pod)
+	if err != nil || text(nested(beforeRestartPod, "metadata", "uid")) != replacement.PodUID {
+		return fmt.Errorf("same-ordinal voter changed before active restart: %v", err)
+	}
+	beforeRestartStatus := namedContainerStatus(beforeRestartPod, source.Container)
+	if beforeRestartStatus == nil {
+		return fmt.Errorf("same-ordinal active container status is unavailable before restart")
+	}
+	beforeContainerID := text(nested(beforeRestartStatus, "containerID"))
+	beforeRestartCount := numberOrZero(nested(beforeRestartStatus, "restartCount"))
+	beforeRunID, err := currentGCSRuntimeRunID(ctx, stateStore, source, replacement, beforeContainerID)
+	if err != nil {
+		return fmt.Errorf("capture active same-ordinal runtime run before restart: %w", err)
+	}
+	if err := restartGCSDeadPodChild(ctx, source, replacement, beforeRestartCount, beforeContainerID); err != nil {
+		return fmt.Errorf("restart same-ordinal active voter child: %w", err)
+	}
+	forward.close()
+	forward, err = startForward(ctx, replacement.Pod, out)
 	if err != nil {
 		return err
 	}
-	event("old_ordinal_new_incarnation_refused", oldReturn)
+	postRestart, err := waitForGCSActiveSameOrdinalRestart(ctx, stateStore, source, replacement, recovery.Status.TargetIdentities, target.NodeID,
+		forward, adminToken, beforeRestartCount, beforeContainerID, beforeRunID)
+	if err != nil {
+		return err
+	}
+	ackAfterRestart, err := writeGCSAcknowledgedRow(ctx, forward, adminToken, 3, "gcs-dead-pod-post-restart")
+	if err != nil {
+		return fmt.Errorf("post-restart ACK and linearizable readback: %w", err)
+	}
+	rows, err = call(ctx, forward, "/sql/query", obj{"sql": "SELECT id,value FROM fencing_items ORDER BY id", "consistency": "linearizable"}, adminToken)
+	if err != nil || string(encoded(rows["rows"])) != `[[1,"gcs-dead-pod-baseline"],[2,"gcs-dead-pod-post-recovery"],[3,"gcs-dead-pod-post-restart"]]` {
+		return fmt.Errorf("post-restart linearizable readback differs: %v", err)
+	}
+	event("same_ordinal_active_restart_verified", obj{"identity": replacement, "restart": postRestart, "ack": ackAfterRestart, "rows": rows["rows"]})
 	evidence := obj{"qualification": "gcs-noPVC-single-voter-dead-pod", "status": "qualified",
-		"scope":  "one exact captured voter; replacement may be a separately named automatic learner; no same-ordinal promotion claim",
+		"scope":  "one exact captured voter; same StatefulSet ordinal promoted under a fresh logical identity and verified across an active child restart",
 		"source": source, "oldIncarnation": target, "runtimeScopeDigest": runtime.CapturedScopeDigest,
 		"baselineAck": baseline, "fenceRequest": request, "independentV2Proof": proof,
-		"recovery": recovery, "postRecoveryAck": postAck, "postRecoveryRows": rows["rows"], "oldOrdinalReturn": oldReturn}
+		"recovery": recovery, "replacement": replacement, "postRecoveryAck": postAck, "activeRestart": postRestart,
+		"postRestartAck": ackAfterRestart, "postRestartRows": rows["rows"]}
 	if err := os.WriteFile(filepath.Join(out, "gcs-dead-pod-evidence.json"), encoded(evidence), 0600); err != nil {
 		return err
 	}
@@ -885,8 +940,8 @@ func waitForGCSVoterRecovery(ctx context.Context, source gcsRecoverySource, targ
 			return false, fmt.Errorf("completed voter recovery does not bind exact source proof")
 		}
 		if recovery.Spec.Membership == nil || string(recovery.Spec.Membership.Remove) != target.NodeID || recovery.Spec.Membership.RemovedPod != target.Pod ||
-			recovery.Spec.Membership.OperationID != request.OperationID || recovery.Spec.Membership.ReplacementPod == "" ||
-			recovery.Status.Membership == nil || recovery.Status.Membership.Phase != "Complete" || recovery.Status.Membership.RemoveRequest == nil {
+			recovery.Spec.Membership.OperationID != request.OperationID || recovery.Spec.Membership.ReplacementPod != target.Pod || recovery.Spec.Membership.ReplacementSecret == "" ||
+			recovery.Status.Membership == nil || recovery.Status.Membership.Phase != "Complete" || recovery.Status.Membership.RemoveRequest == nil || recovery.Status.Membership.Add == nil {
 			return false, fmt.Errorf("recovery child does not remove the captured voter")
 		}
 		remove := recovery.Status.Membership.RemoveRequest
@@ -897,6 +952,11 @@ func waitForGCSVoterRecovery(ctx context.Context, source gcsRecoverySource, targ
 		}
 		if len(recovery.Spec.Membership.VoterPods) != 2 {
 			return false, fmt.Errorf("automatic replacement did not bind exactly the two surviving voters")
+		}
+		add := recovery.Status.Membership.Add
+		if add.OperationID == "" || add.MemberID == "" || add.MemberID == quepaxa.NodeID(target.NodeID) || add.WALIdentity == "" ||
+			add.RequestHash == "" || add.SecretUID == "" || add.SecretResourceVer == "" {
+			return false, fmt.Errorf("same-ordinal voter addition lacks a fresh logical identity, WAL, request, or credential binding")
 		}
 		remaining := map[string]string{}
 		for _, voter := range recovery.Spec.Membership.VoterPods {
@@ -919,28 +979,28 @@ func waitForGCSVoterRecovery(ctx context.Context, source gcsRecoverySource, targ
 	return recovery, err
 }
 
-func verifyGCSVoterMembership(ctx context.Context, source gcsRecoverySource, old operator.FenceTarget, recovery operator.Resource, forward *forward, token, out string) error {
+func verifyGCSVoterMembership(ctx context.Context, source gcsRecoverySource, old operator.FenceTarget, oldCredentialUID string, recovery operator.Resource, forward *forward, token, out string) (operator.FenceTarget, error) {
 	status, err := readMembershipWithToken(ctx, forward, token)
 	if err != nil || status.ClusterID != source.ClusterID || string(status.NodeID) != source.Targets[1].NodeID || status.WALIdentity != source.Targets[1].WALIdentity ||
 		status.Pending || !status.Voting || len(status.Voters) != 3 {
-		return fmt.Errorf("authenticated source membership did not converge to three voters: %v", err)
+		return operator.FenceTarget{}, fmt.Errorf("authenticated source membership did not converge to three voters: %v", err)
 	}
 	identities := recovery.Status.TargetIdentities
 	if len(identities) != 3 {
-		return fmt.Errorf("completed voter recovery lacks exactly three target identities")
+		return operator.FenceTarget{}, fmt.Errorf("completed voter recovery lacks exactly three target identities")
 	}
 	byUID := map[string]operator.FenceTarget{}
 	byNodeID := map[string]bool{}
 	var learner operator.FenceTarget
 	for _, identity := range identities {
 		if identity.NodeID == "" || identity.Pod == "" || identity.PodUID == "" || identity.WALIdentity == "" || byUID[identity.PodUID].PodUID != "" || byNodeID[identity.NodeID] {
-			return fmt.Errorf("recovered membership identity set is incomplete or duplicated")
+			return operator.FenceTarget{}, fmt.Errorf("recovered membership identity set is incomplete or duplicated")
 		}
 		byUID[identity.PodUID] = identity
 		byNodeID[identity.NodeID] = true
-		if identity.PodUID != old.PodUID && identity.Pod != old.Pod {
-			if learner.PodUID != "" || identity.NodeID == old.NodeID {
-				return fmt.Errorf("recovered membership reused the old voter identity or has multiple replacements")
+		if identity.PodUID != old.PodUID && identity.NodeID != old.NodeID {
+			if learner.PodUID != "" {
+				return operator.FenceTarget{}, fmt.Errorf("recovered membership has multiple replacement identities")
 			}
 			learner = identity
 		}
@@ -950,22 +1010,34 @@ func verifyGCSVoterMembership(ctx context.Context, source gcsRecoverySource, old
 			continue
 		}
 		if _, ok := byUID[target.PodUID]; !ok {
-			return fmt.Errorf("surviving voter incarnation is absent from completed membership")
+			return operator.FenceTarget{}, fmt.Errorf("surviving voter incarnation is absent from completed membership")
 		}
 	}
 	if learner.PodUID == "" {
-		return fmt.Errorf("recovery did not identify exactly one distinct replacement learner")
+		return operator.FenceTarget{}, fmt.Errorf("recovery did not identify exactly one fresh logical replacement")
+	}
+	if learner.Pod != old.Pod || learner.PodUID == old.PodUID || learner.NodeID == old.NodeID || learner.WALIdentity == old.WALIdentity {
+		return operator.FenceTarget{}, fmt.Errorf("replacement did not preserve the exact ordinal with fresh Pod, logical, and WAL identities")
+	}
+	if recovery.Spec.Membership == nil || recovery.Spec.Membership.ReplacementPod != old.Pod || recovery.Spec.Membership.ReplacementSecret == "" || recovery.Status.Membership == nil || recovery.Status.Membership.Add == nil ||
+		recovery.Status.Membership.Add.MemberID != quepaxa.NodeID(learner.NodeID) || recovery.Status.Membership.Add.WALIdentity != learner.WALIdentity {
+		return operator.FenceTarget{}, fmt.Errorf("durable ADD journal does not bind the same-ordinal replacement")
+	}
+	for _, voter := range status.Voters {
+		if string(voter) == old.NodeID {
+			return operator.FenceTarget{}, fmt.Errorf("closed old logical identity remains in authenticated membership")
+		}
 	}
 	seenVoters := map[string]bool{}
 	for _, voter := range status.Voters {
 		id := string(voter)
 		if !byNodeID[id] || seenVoters[id] {
-			return fmt.Errorf("authenticated current membership differs from completed recovery identities")
+			return operator.FenceTarget{}, fmt.Errorf("authenticated current membership differs from completed recovery identities")
 		}
 		seenVoters[id] = true
 	}
 	if len(seenVoters) != len(byNodeID) {
-		return fmt.Errorf("authenticated current membership omits a completed voter identity")
+		return operator.FenceTarget{}, fmt.Errorf("authenticated current membership omits a completed voter identity")
 	}
 	for _, original := range source.Targets {
 		if original.PodUID == old.PodUID {
@@ -973,74 +1045,174 @@ func verifyGCSVoterMembership(ctx context.Context, source gcsRecoverySource, old
 		}
 		pod, err := get(ctx, "pod", original.Pod)
 		if err != nil || text(nested(pod, "metadata", "uid")) != original.PodUID || !podReady(pod) {
-			return fmt.Errorf("surviving captured voter Pod identity changed: %v", err)
+			return operator.FenceTarget{}, fmt.Errorf("surviving captured voter Pod identity changed: %v", err)
 		}
 		identity, ok := byUID[original.PodUID]
 		if !ok || identity.NodeID != original.NodeID || identity.Pod != original.Pod || identity.WALIdentity != original.WALIdentity {
-			return fmt.Errorf("surviving voter changed its captured Node, Pod, or WAL identity")
+			return operator.FenceTarget{}, fmt.Errorf("surviving voter changed its captured Node, Pod, or WAL identity")
 		}
 	}
 	pod, err := get(ctx, "pod", learner.Pod)
 	if err != nil || text(nested(pod, "metadata", "uid")) != learner.PodUID || !podReady(pod) {
-		return fmt.Errorf("replacement learner Pod identity or readiness is not confirmed: %v", err)
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal replacement Pod identity or readiness is not confirmed: %v", err)
 	}
 	learnerForward, err := startForward(ctx, learner.Pod, out)
 	if err != nil {
-		return err
+		return operator.FenceTarget{}, err
 	}
 	learnerStatus, err := readMembershipWithToken(ctx, learnerForward, token)
 	learnerForward.close()
-	if err != nil || learnerStatus.ClusterID != source.ClusterID || string(learnerStatus.NodeID) != learner.NodeID || learnerStatus.Pending || !learnerStatus.Voting {
-		return fmt.Errorf("replacement learner did not authenticate as an active voter: %v", err)
+	if err != nil || learnerStatus.ClusterID != source.ClusterID || string(learnerStatus.NodeID) != learner.NodeID || learnerStatus.WALIdentity != learner.WALIdentity || learnerStatus.Pending || !learnerStatus.Voting || len(learnerStatus.Voters) != 3 {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal replacement did not authenticate as the committed active voter: %v", err)
 	}
-	if err := verifyLearnerBinding(ctx, pod, recovery, learnerStatus, source.StatefulSetUID, source.BindingUID, recovery.Spec.RecoveryID, out); err != nil {
-		return fmt.Errorf("replacement learner immutable credential/root binding: %w", err)
+	add := recovery.Status.Membership.Add
+	secret, err := get(ctx, "secret", recovery.Spec.Membership.ReplacementSecret)
+	if err != nil || secret["type"] != "Opaque" || secret["immutable"] != true || text(nested(secret, "metadata", "name")) != recovery.Spec.Membership.ReplacementSecret ||
+		text(nested(secret, "metadata", "namespace")) != source.Namespace || text(nested(secret, "metadata", "uid")) != add.SecretUID || text(nested(secret, "metadata", "resourceVersion")) != add.SecretResourceVer ||
+		text(nested(secret, "metadata", "annotations", "rhiza.mrchypark.dev/automatic-owner")) != recovery.Spec.RecoveryID || add.SecretUID == oldCredentialUID {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal replacement credential is not fresh, immutable, and bound to the committed ADD: %v", err)
+	}
+	if text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/fencing-root-uid")) != source.BindingUID ||
+		text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/cooperative-fencing")) != "1" ||
+		text(nested(pod, "metadata", "annotations", "rhiza.mrchypark.dev/fencing-credential-uid")) != add.SecretUID {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal replacement Pod is not bound to the captured root and committed credential")
+	}
+	memberBytes, err := base64.StdEncoding.DecodeString(text(nested(secret, "data", "member")))
+	if err != nil {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal member credential is invalid")
+	}
+	var member quepaxa.Member
+	if err := json.Unmarshal(memberBytes, &member); err != nil || string(member.ID) != learner.NodeID {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal immutable member credential differs from committed logical identity")
+	}
+	member.WALIdentity = learner.WALIdentity
+	request := network.MembershipChange{OperationID: add.OperationID, ClusterID: source.ClusterID, ExpectedConfigID: add.ExpectedConfigID, ExpectedAbortSlot: add.ExpectedAbortSlot, Add: &member}
+	if fmt.Sprintf("%x", sha256.Sum256(encoded(request))) != add.RequestHash {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal credential does not reproduce the committed ADD request hash")
+	}
+	peerToken, err := base64.StdEncoding.DecodeString(text(nested(secret, "data", "RHIZA_PEER_TOKEN")))
+	if err != nil || len(peerToken) == 0 || !bytes.Equal(network.PeerPublicKey(types.ClusterID(source.ClusterID), member.ID, string(peerToken)), member.PublicKey[:]) {
+		return operator.FenceTarget{}, fmt.Errorf("same-ordinal peer token does not match the committed public identity")
+	}
+	if err := os.WriteFile(filepath.Join(out, "same-ordinal-authenticated-binding.json"), encoded(obj{
+		"pod": learner.Pod, "podUID": learner.PodUID, "oldPodUID": old.PodUID, "nodeID": learner.NodeID, "oldNodeID": old.NodeID,
+		"walIdentity": learner.WALIdentity, "oldWALIdentity": old.WALIdentity, "credentialUID": add.SecretUID,
+		"oldCredentialUID": oldCredentialUID, "addition": add, "membership": learnerStatus,
+	}), 0600); err != nil {
+		return operator.FenceTarget{}, err
+	}
+	return learner, nil
+}
+
+func restartGCSDeadPodChild(ctx context.Context, source gcsRecoverySource, target operator.FenceTarget, restartCount float64, containerID string) error {
+	if target.Pod == "" || target.PodUID == "" || target.NodeID == "" || target.WALIdentity == "" || restartCount < 0 || containerID == "" {
+		return fmt.Errorf("same-ordinal restart binding is incomplete")
+	}
+	pod, err := get(ctx, "pod", target.Pod)
+	if err != nil || text(nested(pod, "metadata", "uid")) != target.PodUID || !gcsPodOwnedBy(pod, source.StatefulSetUID) {
+		return fmt.Errorf("same-ordinal Pod identity changed before restart: %v", err)
+	}
+	status := namedContainerStatus(pod, source.Container)
+	if status == nil || text(nested(status, "containerID")) != containerID || numberOrZero(nested(status, "restartCount")) != restartCount || nested(status, "ready") != true {
+		return fmt.Errorf("same-ordinal active container changed before restart")
+	}
+	// The supervised workload has the fencer as PID 1 and the Rhiza child as
+	// PID 2. Check the process identity before signaling; never kill PID 1 or
+	// select a process by an untrusted name substring.
+	_, err = command(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "exec", target.Pod, "-c", source.Container,
+		"--", "/bin/sh", "-ec", `test "$(cat /proc/2/comm)" = rhiza; kill -TERM 2`)
+	if err != nil {
+		// A successful restart below is the authoritative result: kubectl exec
+		// may lose its stream while the container is restarting.
+		return nil
 	}
 	return nil
 }
 
-func waitForGCSDeadPodReturnRefusal(ctx context.Context, source gcsRecoverySource, target operator.FenceTarget, scopeDigest, out string) (obj, error) {
+func currentGCSRuntimeRunID(ctx context.Context, store *operator.AuthorityStateStore, source gcsRecoverySource, target operator.FenceTarget, containerID string) (string, error) {
+	if store == nil || containerID == "" {
+		return "", fmt.Errorf("runtime authority or container identity is unavailable")
+	}
+	state, _, err := store.ReadRoot(ctx, source.StatefulSetUID, source.ClusterID)
+	if err != nil {
+		return "", err
+	}
+	var runID string
+	for id, run := range state.Ledger.Runs {
+		if run.Identity.PodUID != target.PodUID || run.Identity.NodeID != target.NodeID || run.Identity.WALIdentity != target.WALIdentity ||
+			run.Runtime == nil || run.Runtime.ContainerID != containerID || run.Stop != nil || run.Exited {
+			continue
+		}
+		if runID != "" {
+			return "", fmt.Errorf("multiple active canonical runs match the exact replacement container")
+		}
+		runID = id
+	}
+	if runID == "" {
+		return "", fmt.Errorf("no active canonical run matches the exact replacement container")
+	}
+	return runID, nil
+}
+
+func waitForGCSActiveSameOrdinalRestart(ctx context.Context, store *operator.AuthorityStateStore, source gcsRecoverySource, target operator.FenceTarget,
+	committedIdentities []operator.FenceTarget, closedNodeID string, forward *forward, token string, previousRestarts float64, previousContainerID, previousRunID string) (obj, error) {
 	var evidence obj
-	err := wait(ctx, "natural StatefulSet ordinal recreation refuses old voter incarnation", func() (bool, error) {
+	err := wait(ctx, "same-ordinal active child restart with retained Pod and WAL identity", func() (bool, error) {
 		pod, err := get(ctx, "pod", target.Pod)
 		if err != nil {
-			return false, err
-		}
-		uid := text(nested(pod, "metadata", "uid"))
-		if uid == target.PodUID {
 			return false, nil
 		}
-		if uid == "" || !gcsPodOwnedBy(pod, source.StatefulSetUID) || !podUsesConfigMap(pod, source.ConfigMap) {
-			return false, fmt.Errorf("natural ordinal return does not belong to the captured StatefulSet")
+		if text(nested(pod, "metadata", "uid")) != target.PodUID || !gcsPodOwnedBy(pod, source.StatefulSetUID) {
+			return false, fmt.Errorf("same-ordinal active restart changed physical Pod identity")
 		}
-		ready := podReady(pod)
-		if ready {
-			return false, fmt.Errorf("natural return of the old StatefulSet ordinal became Ready")
-		}
-		logs, logErr := command(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "logs", target.Pod, "-c", source.Container)
-		var previous []byte
-		previous, _ = command(ctx, "kubectl", "--context", kubeContext, "-n", namespace, "logs", target.Pod, "-c", source.Container, "--previous")
-		if logErr != nil && len(previous) == 0 {
+		status := namedContainerStatus(pod, source.Container)
+		if status == nil || numberOrZero(nested(status, "restartCount")) <= previousRestarts || text(nested(status, "containerID")) == "" || text(nested(status, "containerID")) == previousContainerID || nested(status, "ready") != true || !podReady(pod) {
 			return false, nil
 		}
-		closed := strings.Contains(string(logs), "fencing: incarnation terminally fenced") || strings.Contains(string(previous), "fencing: incarnation terminally fenced")
-		if !closed {
+		membership, err := readMembershipWithToken(ctx, forward, token)
+		if err != nil {
 			return false, nil
 		}
-		containerStatus := namedContainerStatus(pod, source.Container)
-		if containerStatus == nil || nested(containerStatus, "ready") == true || numberOrZero(nested(containerStatus, "restartCount")) < 1 {
+		if membership.ClusterID != source.ClusterID || string(membership.NodeID) != target.NodeID || membership.WALIdentity != target.WALIdentity ||
+			membership.Pending || !membership.Voting || !gcsMembershipMatchesCommittedIdentities(membership, committedIdentities, closedNodeID) {
+			return false, fmt.Errorf("restarted child did not resume the exact committed voter set without the closed logical identity")
+		}
+		runID, err := currentGCSRuntimeRunID(ctx, store, source, target, text(nested(status, "containerID")))
+		if err != nil {
 			return false, nil
 		}
-		evidence = obj{"pod": target.Pod, "oldUID": target.PodUID, "newUID": uid, "ready": ready,
-			"containerRestartCount": numberOrZero(nested(containerStatus, "restartCount")),
-			"runtimeScopeDigest":    scopeDigest, "startupRefusal": "fencing: incarnation terminally fenced"}
+		if runID == previousRunID {
+			return false, fmt.Errorf("active container restart reused the prior supervisor run ID")
+		}
+		evidence = obj{"pod": target.Pod, "podUID": target.PodUID, "nodeID": target.NodeID, "walIdentity": target.WALIdentity,
+			"previousContainerID": previousContainerID, "currentContainerID": nested(status, "containerID"),
+			"previousRestartCount": previousRestarts, "currentRestartCount": numberOrZero(nested(status, "restartCount")), "previousRunID": previousRunID, "currentRunID": runID,
+			"membership": membership}
 		return true, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyGCSPinnedImages(ctx, source, "dead-pod-return-"+source.ClusterID, out); err != nil {
-		return nil, err
-	}
 	return evidence, nil
+}
+
+func gcsMembershipMatchesCommittedIdentities(status network.MembershipStatus, identities []operator.FenceTarget, closedNodeID string) bool {
+	if closedNodeID == "" || len(identities) == 0 || len(status.Voters) != len(identities) {
+		return false
+	}
+	want := make(map[string]bool, len(identities))
+	for _, identity := range identities {
+		if identity.NodeID == "" || identity.NodeID == closedNodeID || want[identity.NodeID] {
+			return false
+		}
+		want[identity.NodeID] = true
+	}
+	for _, voter := range status.Voters {
+		id := string(voter)
+		if id == closedNodeID || !want[id] {
+			return false
+		}
+		delete(want, id)
+	}
+	return len(want) == 0
 }
