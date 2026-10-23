@@ -101,6 +101,9 @@ type Materializer struct {
 	walCheckpointStop        chan struct{}
 	walCheckpointOnce        sync.Once
 	walCheckpointWG          sync.WaitGroup
+	// checkpointAfterSnapshot is an unexported synchronization seam for tests
+	// that need to observe writes while both checkpoint snapshots are held.
+	checkpointAfterSnapshot func()
 }
 
 type notificationSubscription struct {
@@ -2600,6 +2603,9 @@ func (m *Materializer) CheckpointFilesAt(ctx context.Context) ([]CheckpointFile,
 		}
 		cleanup()
 		return nil, 0, nil, err
+	}
+	if m.checkpointAfterSnapshot != nil {
+		m.checkpointAfterSnapshot()
 	}
 	if err = sqliteSnapshot.Backup(sqlitePath); err == nil {
 		err = ctx.Err()
