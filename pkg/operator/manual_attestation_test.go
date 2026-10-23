@@ -208,6 +208,7 @@ func validManualAttestationFixture(t *testing.T) (ManualRecoveryChallenge, Manua
 		StorageScopeDigest:   strings.Repeat("5", 64),
 		SourceArchiveDigest:  strings.Repeat("6", 64),
 		TargetClusterID:      "target-cluster",
+		TargetBaseKind:       "fork",
 		TargetMembershipHash: strings.Repeat("7", 64),
 		CurrentPodUIDs:       []string{"pod-a", "pod-b", "pod-c"},
 	}

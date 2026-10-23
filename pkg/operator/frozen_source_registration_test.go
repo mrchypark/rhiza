@@ -285,6 +285,9 @@ func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, memb
 	}
 	ctx := t.Context()
 	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	f.e.ArchiveStoreIdentity = StoreIdentity(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER": "gcs", "RHIZA_OBJSTORE_BUCKET": "archive", "RHIZA_OBJSTORE_PREFIX": "root",
+	})
 	env := []any{
 		object{"name": "RHIZA_CLUSTER_ID", "value": f.id.SourceClusterID},
 		object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
