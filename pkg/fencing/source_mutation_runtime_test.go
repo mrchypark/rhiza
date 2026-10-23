@@ -21,6 +21,8 @@ type relayConditionAuthority struct {
 func (a *relayConditionAuthority) Register(context.Context, Identity) error { return nil }
 func (a *relayConditionAuthority) Bind(_ context.Context, id Identity) (BindReceipt, error) {
 	runtime := enrolledRuntime(id, "container")
+	runtime.PodName = id.PodName
+	runtime.AssignmentID = id.AssignmentID
 	producer, err := NewMutationProducer(id, runtime)
 	if err != nil {
 		return BindReceipt{}, err
