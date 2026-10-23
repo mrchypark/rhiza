@@ -1239,6 +1239,11 @@ func (a *operatorAPI) serve(w http.ResponseWriter, q *http.Request) {
 			json.NewEncoder(w).Encode(recoveryList{Items: []Resource{*a.r}})
 			return
 		}
+	case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries/recover":
+		if q.Method == "GET" {
+			json.NewEncoder(w).Encode(a.r)
+			return
+		}
 	case "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/default/rhizarecoveries/recover/status":
 		if q.Method == "PUT" {
 			if a.failStatus > 0 {

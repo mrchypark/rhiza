@@ -200,6 +200,12 @@ func TestMembershipRetirementRejectsDelayedJournalAfterAcknowledgment(t *testing
 	var mu sync.Mutex
 	current := "2" // The automatic parent has submitted its retirement revision.
 	casAPI := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == c.resourcePath(resourceName(r)) && req.Method == http.MethodGet {
+			mu.Lock()
+			defer mu.Unlock()
+			_ = json.NewEncoder(w).Encode(r)
+			return
+		}
 		if strings.HasSuffix(req.URL.Path, "/recover/status") && req.Method == http.MethodPut {
 			mu.Lock()
 			defer mu.Unlock()
@@ -264,7 +270,7 @@ func TestMembershipRetirementReplaysJournalBeforeFirstDispatch(t *testing.T) {
 	if err := c.reconcileAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if r.Status.Phase != "Aborting" || len(api.changes) != 1 || hashJSON(api.changes[0]) != requestHash {
+	if r.Status.Phase != "Aborting" || len(api.changes) != 2 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil || api.changes[0].ExpectedConfigID != 1 || api.changes[1].ExpectedConfigID != 2 || hashJSON(api.changes[1]) != requestHash {
 		t.Fatalf("journaled request was not replayed verbatim: %+v changes=%+v", r.Status, api.changes)
 	}
 	c.HTTP = nil
@@ -377,6 +383,10 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
+			if len(api.changes) != 1 || api.changes[0].Remove != "n3" || api.changes[0].Add != nil {
+				t.Fatalf("valid replacement setup did not acknowledge only the removal: %+v", api.changes)
+			}
+			acknowledgedChanges := len(api.changes)
 			if scenario != "missing-operation" {
 				if err := writeRetirementOperation(ctx, c, r); err != nil {
 					t.Fatal(err)
@@ -432,7 +442,7 @@ func TestMembershipRetirementCommittedEvidenceFailsClosed(t *testing.T) {
 			if err := c.reconcileAll(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if r.Status.Phase != "Blocked" || r.Status.Membership.Add == nil || len(api.changes) != 0 || len(api.aborts) != 0 {
+			if r.Status.Phase != "Blocked" || r.Status.Membership.Add == nil || len(api.changes) != acknowledgedChanges || len(api.aborts) != 0 {
 				t.Fatalf("unproven commit accepted: %+v", r.Status)
 			}
 		})

@@ -191,6 +191,9 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 		if journal.RemoveRequest == nil {
 			return c.recordMembership(ctx, r, "Blocked", "journaled remove request is unavailable before replacement dispatch")
 		}
+		if err := c.ensureMembershipAddDispatchCurrent(ctx, r); err != nil {
+			return err
+		}
 		if err := c.changeMembership(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, *journal.RemoveRequest); err != nil {
 			return c.recordMembership(ctx, r, "Removing", "committed removal durability confirmation remains pending: "+err.Error())
 		}
@@ -208,6 +211,23 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 		return c.recordMembership(ctx, r, "Adding", "add request remains pending: "+err.Error())
 	}
 	return c.recordMembership(ctx, r, "Adding", "add request accepted; waiting for configuration confirmation")
+}
+
+// ensureMembershipAddDispatchCurrent prevents a delayed reconciliation from
+// acknowledging the removal after another reconciliation has retired the add.
+func (c *Controller) ensureMembershipAddDispatchCurrent(ctx context.Context, r *Resource) error {
+	var current Resource
+	if err := c.Kube.Get(ctx, c.resourcePath(resourceName(r)), &current); err != nil {
+		return err
+	}
+	if str(current.Metadata["uid"]) != str(r.Metadata["uid"]) ||
+		str(current.Metadata["resourceVersion"]) != str(r.Metadata["resourceVersion"]) ||
+		current.Spec.Membership == nil || current.Spec.Membership.AbortAddition ||
+		hashJSON(current.Spec.Membership) != hashJSON(r.Spec.Membership) ||
+		hashJSON(current.Status.Membership) != hashJSON(r.Status.Membership) {
+		return &APIError{StatusCode: http.StatusConflict}
+	}
+	return nil
 }
 
 func (c *Controller) abortMembership(ctx context.Context, r *Resource, pods map[quepaxa.NodeID]object, statuses map[quepaxa.NodeID]network.MembershipStatus, admin string, current network.MembershipStatus) error {
