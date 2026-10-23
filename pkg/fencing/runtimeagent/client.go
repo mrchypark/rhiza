@@ -26,7 +26,7 @@ func (c *Client) Enroll(ctx context.Context, binding fencing.RuntimeBinding) (fe
 	var result fencing.RuntimeBinding
 	err := c.post(ctx, "/v1/enroll", enrollRequest{Binding: binding}, &result)
 	if err == nil {
-		id := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
+		id := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, AssignmentID: binding.AssignmentID}
 		if err = result.Validate(id); err == nil && !sameEnrollmentBase(result, binding) {
 			err = fmt.Errorf("fencing: runtime agent enrollment binding differs")
 		}

@@ -996,6 +996,7 @@ func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
 	f.verboseInfo = map[string]string{"info": containerdInfoFixture}
 	f.mu.Unlock()
 	base.NodeUID, base.MachineID, base.BootID, base.RuntimeID, base.SandboxID = "", "", "", "", ""
+	base.AssignmentID = "learner-assignment"
 	root := t.TempDir()
 	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
 	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
@@ -1011,7 +1012,7 @@ func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pre-child runtime enrollment failed: %v", err)
 	}
-	if binding.NodeUID != f.host.NodeUID || binding.MachineID != f.host.MachineID || binding.BootID != f.host.BootID || binding.RuntimeID != RuntimeIdentity("containerd", "test-version", "v1") || binding.SandboxID != "sandbox-0" || binding.ContainerID != base.ContainerID || binding.ImageID != base.ImageID {
+	if binding.NodeUID != f.host.NodeUID || binding.MachineID != f.host.MachineID || binding.BootID != f.host.BootID || binding.RuntimeID != RuntimeIdentity("containerd", "test-version", "v1") || binding.SandboxID != "sandbox-0" || binding.ContainerID != base.ContainerID || binding.ImageID != base.ImageID || binding.AssignmentID != base.AssignmentID {
 		t.Fatalf("runtime facts were not bound from the host and CRI: %+v", binding)
 	}
 	if scope.PID != 123 || scope.StartTime != 789 || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != "qualified-test-profile" {
@@ -1025,6 +1026,25 @@ func TestCRIEnrollmentBuildsFullBindingAndCapturesBeforeReturn(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.stopContainers != 0 || f.stopSandboxes != 0 {
 		t.Fatal("enrollment unexpectedly stopped CRI processes")
+	}
+}
+
+func TestCRICaptureCgroupScopeAcceptsExactLearnerAssignment(t *testing.T) {
+	p, _, binding, _ := newRuntimeFixture(t)
+	binding.AssignmentID = "learner-assignment"
+	root := t.TempDir()
+	proc, cgroupRoot := filepath.Join(root, "proc"), filepath.Join(root, "cgroup")
+	cgroup := filepath.Join(cgroupRoot, "kubepods", "pod-0", "container-0")
+	if err := os.MkdirAll(cgroup, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeProcIdentity(t, proc, 123, 789, "kubepods/pod-0/container-0")
+	writeCgroupProcs(t, cgroup, 123)
+	if err := os.WriteFile(filepath.Join(cgroup, "cgroup.events"), []byte("populated 1\nfrozen 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.CaptureCgroupScope(t.Context(), binding, proc, cgroupRoot); err != nil {
+		t.Fatalf("exact assigned learner cgroup capture failed: %v", err)
 	}
 }
 

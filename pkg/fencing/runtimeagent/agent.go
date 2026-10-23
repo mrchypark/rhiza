@@ -337,7 +337,7 @@ func (s *Service) captureEnrollment(ctx context.Context, expected fencing.Runtim
 		}
 		return record{}, err
 	}
-	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
+	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, AssignmentID: binding.AssignmentID}
 	binding.CapturedScopeDigest = ""
 	if err := binding.Validate(identity); err != nil {
 		s.enrollmentDiagnostic("backend_result_validation", "binding_invalid")

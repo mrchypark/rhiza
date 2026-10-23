@@ -259,7 +259,7 @@ func (p *Provider) verifyVersion(ctx context.Context, binding fencing.RuntimeBin
 // treated as expected identities and must match CRI exactly.
 func (p *Provider) EnrollBinding(ctx context.Context, base fencing.RuntimeBinding, procRoot, cgroupRoot string) (fencing.RuntimeBinding, CgroupScope, error) {
 	binding := base
-	identity := fencing.Identity{SourceClusterID: base.SourceClusterID, NodeID: base.NodeID, PodUID: base.PodUID, RunID: base.RunID}
+	identity := fencing.Identity{SourceClusterID: base.SourceClusterID, NodeID: base.NodeID, PodUID: base.PodUID, RunID: base.RunID, AssignmentID: base.AssignmentID}
 	if p == nil || p.client == nil || p.host == nil || p.profile.RuntimeName != "containerd" || p.profile.ContainerdRuntimeType == "" || p.profile.CgroupProfileID == "" ||
 		base.AuthorityID == "" || base.NamespaceUID == "" || base.BindingUID == "" || base.StatefulSetUID == "" || base.NodeName == "" || base.ContainerID == "" || base.ImageID == "" ||
 		identity.SourceClusterID == "" || identity.NodeID == "" || identity.PodUID == "" || identity.RunID == "" {
@@ -387,7 +387,7 @@ func (p *Provider) CompletePassiveTerminal(_ fencing.RuntimeBinding, scope Cgrou
 // cgroup. The exact containerd runtime/API version and runtime type must be
 // pinned in Profile; CRI's generic Info map is not accepted for other runtimes.
 func (p *Provider) CaptureCgroupScope(ctx context.Context, binding fencing.RuntimeBinding, procRoot, cgroupRoot string) (CgroupScope, error) {
-	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
+	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, AssignmentID: binding.AssignmentID}
 	if p == nil || p.client == nil || p.host == nil || p.profile.RuntimeName != "containerd" || p.profile.ContainerdRuntimeType == "" || p.profile.CgroupProfileID == "" || binding.Validate(identity) != nil {
 		return CgroupScope{}, fmt.Errorf("%w: qualified containerd cgroup capture is not configured", ErrUnverified)
 	}
