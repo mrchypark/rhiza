@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -26,9 +27,9 @@ type RuntimeAgentClient struct {
 	Port        string
 }
 
-func (a *RuntimeAgentClient) agent(ctx context.Context, nodeName string) (*runtimeagent.Client, error) {
+func (a *RuntimeAgentClient) agent(ctx context.Context, nodeName string) (*runtimeagent.Client, string, string, error) {
 	if a == nil || a.Kube == nil || a.AuthorityID == "" || a.TokenFile == "" || len(a.CA) == 0 || a.ServerName == "" || a.Port == "" || nodeName == "" {
-		return nil, fmt.Errorf("fencing: complete node runtime-agent configuration required")
+		return nil, "client", "config_invalid", fmt.Errorf("fencing: complete node runtime-agent configuration required")
 	}
 	var node struct {
 		Status struct {
@@ -39,7 +40,13 @@ func (a *RuntimeAgentClient) agent(ctx context.Context, nodeName string) (*runti
 		} `json:"status"`
 	}
 	if err := a.Kube.Get(ctx, "/api/v1/nodes/"+url.PathEscape(nodeName), &node); err != nil {
-		return nil, err
+		code := "node_lookup_failed"
+		if errors.Is(err, context.Canceled) {
+			code = "context_canceled"
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			code = "deadline_exceeded"
+		}
+		return nil, "client", code, err
 	}
 	var address string
 	for _, candidate := range node.Status.Addresses {
@@ -49,26 +56,30 @@ func (a *RuntimeAgentClient) agent(ctx context.Context, nodeName string) (*runti
 		}
 	}
 	if address == "" {
-		return nil, fmt.Errorf("fencing: node has no valid internal IP")
+		return nil, "client", "node_address_unavailable", fmt.Errorf("fencing: node has no valid internal IP")
 	}
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(a.CA) {
-		return nil, fmt.Errorf("fencing: runtime-agent CA has no certificate")
+		return nil, "client", "trust_invalid", fmt.Errorf("fencing: runtime-agent CA has no certificate")
 	}
 	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: a.ServerName}}
-	return &runtimeagent.Client{BaseURL: "https://" + net.JoinHostPort(address, a.Port), TokenFile: a.TokenFile, HTTP: &http.Client{Transport: transport, Timeout: 30 * time.Second}}, nil
+	return &runtimeagent.Client{BaseURL: "https://" + net.JoinHostPort(address, a.Port), TokenFile: a.TokenFile, HTTP: &http.Client{Transport: transport, Timeout: 30 * time.Second}}, "", "", nil
 }
 
 func (a *RuntimeAgentClient) Enroll(ctx context.Context, binding fencing.RuntimeBinding) (fencing.RuntimeBinding, error) {
-	client, err := a.agent(ctx, binding.NodeName)
+	client, stage, code, err := a.agent(ctx, binding.NodeName)
 	if err != nil {
-		return fencing.RuntimeBinding{}, err
+		diagnostic := runtimeagent.NewEnrollmentDiagnosticError(stage, code, err)
+		if diagnostic == nil {
+			return fencing.RuntimeBinding{}, fmt.Errorf("fencing: runtime enrollment setup unavailable")
+		}
+		return fencing.RuntimeBinding{}, diagnostic
 	}
 	return client.Enroll(ctx, binding)
 }
 
 func (a *RuntimeAgentClient) Stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest) ([]byte, error) {
-	client, err := a.agent(ctx, binding.NodeName)
+	client, _, _, err := a.agent(ctx, binding.NodeName)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +87,7 @@ func (a *RuntimeAgentClient) Stop(ctx context.Context, binding fencing.RuntimeBi
 }
 
 func (a *RuntimeAgentClient) Verify(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, receipt []byte) error {
-	client, err := a.agent(ctx, binding.NodeName)
+	client, _, _, err := a.agent(ctx, binding.NodeName)
 	if err != nil {
 		return err
 	}

@@ -21,6 +21,7 @@ import (
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
 	"github.com/mrchypark/rhiza/pkg/fencing/cri"
+	"github.com/mrchypark/rhiza/pkg/fencing/runtimeagent"
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
 
@@ -44,35 +45,37 @@ type runtimeProfileEvidence struct {
 }
 
 type runtimeComponentEvidence struct {
-	Qualification         string `json:"qualification"`
-	Outcome               string `json:"outcome"`
-	FailureStage          string `json:"failureStage,omitempty"`
-	KindNodeImage         string `json:"kindNodeImage,omitempty"`
-	NodeName              string `json:"nodeName,omitempty"`
-	RuntimeVersion        string `json:"runtimeVersion,omitempty"`
-	RuntimeType           string `json:"runtimeType,omitempty"`
-	KernelRelease         string `json:"kernelRelease,omitempty"`
-	CgroupFilesystem      string `json:"cgroupFilesystem,omitempty"`
-	CgroupProfileID       string `json:"cgroupProfileID,omitempty"`
-	PodUIDSHA256          string `json:"podUIDSHA256,omitempty"`
-	ContainerIDSHA256     string `json:"containerIDSHA256,omitempty"`
-	RuntimeBindingID      string `json:"runtimeBindingID,omitempty"`
-	EnrollmentCaptured    bool   `json:"enrollmentCaptured"`
-	StopDiagnosticStage   string `json:"stopDiagnosticStage,omitempty"`
-	StopDiagnosticCode    string `json:"stopDiagnosticCode,omitempty"`
-	ContainerStopAck      bool   `json:"containerStopAcknowledged"`
-	SandboxStopAck        bool   `json:"sandboxStopAcknowledged"`
-	ContainerExited       bool   `json:"containerExited"`
-	SandboxNotReady       bool   `json:"sandboxNotReady"`
-	CgroupEmpty           bool   `json:"cgroupEmpty"`
-	ReceiptVerified       bool   `json:"receiptVerified"`
-	AgentRestarted        bool   `json:"agentRestarted"`
-	ReceiptRecovered      bool   `json:"receiptRecovered"`
-	ReceiptSHA256         string `json:"receiptSHA256,omitempty"`
-	NoReplacementObserved bool   `json:"noReplacementObserved"`
-	CleanupConfirmed      bool   `json:"cleanupConfirmed"`
-	StartedAt             string `json:"startedAt"`
-	CompletedAt           string `json:"completedAt,omitempty"`
+	Qualification             string `json:"qualification"`
+	Outcome                   string `json:"outcome"`
+	FailureStage              string `json:"failureStage,omitempty"`
+	KindNodeImage             string `json:"kindNodeImage,omitempty"`
+	NodeName                  string `json:"nodeName,omitempty"`
+	RuntimeVersion            string `json:"runtimeVersion,omitempty"`
+	RuntimeType               string `json:"runtimeType,omitempty"`
+	KernelRelease             string `json:"kernelRelease,omitempty"`
+	CgroupFilesystem          string `json:"cgroupFilesystem,omitempty"`
+	CgroupProfileID           string `json:"cgroupProfileID,omitempty"`
+	PodUIDSHA256              string `json:"podUIDSHA256,omitempty"`
+	ContainerIDSHA256         string `json:"containerIDSHA256,omitempty"`
+	RuntimeBindingID          string `json:"runtimeBindingID,omitempty"`
+	EnrollmentCaptured        bool   `json:"enrollmentCaptured"`
+	EnrollmentDiagnosticStage string `json:"enrollmentDiagnosticStage,omitempty"`
+	EnrollmentDiagnosticCode  string `json:"enrollmentDiagnosticCode,omitempty"`
+	StopDiagnosticStage       string `json:"stopDiagnosticStage,omitempty"`
+	StopDiagnosticCode        string `json:"stopDiagnosticCode,omitempty"`
+	ContainerStopAck          bool   `json:"containerStopAcknowledged"`
+	SandboxStopAck            bool   `json:"sandboxStopAcknowledged"`
+	ContainerExited           bool   `json:"containerExited"`
+	SandboxNotReady           bool   `json:"sandboxNotReady"`
+	CgroupEmpty               bool   `json:"cgroupEmpty"`
+	ReceiptVerified           bool   `json:"receiptVerified"`
+	AgentRestarted            bool   `json:"agentRestarted"`
+	ReceiptRecovered          bool   `json:"receiptRecovered"`
+	ReceiptSHA256             string `json:"receiptSHA256,omitempty"`
+	NoReplacementObserved     bool   `json:"noReplacementObserved"`
+	CleanupConfirmed          bool   `json:"cleanupConfirmed"`
+	StartedAt                 string `json:"startedAt"`
+	CompletedAt               string `json:"completedAt,omitempty"`
 }
 
 type runtimeProbeInvocation struct {
@@ -94,6 +97,8 @@ type runtimeProbeReply struct {
 
 type runtimeProbeProgress struct {
 	EnrollmentCaptured bool   `json:"enrollmentCaptured"`
+	EnrollmentStage    string `json:"enrollmentStage,omitempty"`
+	EnrollmentCode     string `json:"enrollmentCode,omitempty"`
 	StopStage          string `json:"stopStage,omitempty"`
 	StopCode           string `json:"stopCode,omitempty"`
 	Pending            bool   `json:"pending,omitempty"`
@@ -129,6 +134,10 @@ func runtimeAgentRequest(ctx context.Context) error {
 	if request.Action == "stop" {
 		request.Binding, err = client.Enroll(ctx, request.Binding)
 		if err != nil {
+			var diagnostic *runtimeagent.EnrollmentDiagnosticError
+			if errors.As(err, &diagnostic) && runtimeagent.ValidEnrollmentDiagnostic(diagnostic.Stage, diagnostic.Code) {
+				return json.NewEncoder(os.Stdout).Encode(runtimeProbeReply{Progress: &runtimeProbeProgress{EnrollmentStage: diagnostic.Stage, EnrollmentCode: diagnostic.Code}})
+			}
 			return fmt.Errorf("runtime-agent enrollment failed: %w", err)
 		}
 		enrollmentCaptured = true
@@ -343,6 +352,9 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
+	if first.Progress != nil && (first.Progress.EnrollmentStage != "" || first.Progress.EnrollmentCode != "") {
+		stage = "enrollment"
+	}
 	if err := applyRuntimeProbeProgress(&evidence, first.Progress); err != nil {
 		return err
 	}
@@ -462,6 +474,13 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 func applyRuntimeProbeProgress(evidence *runtimeComponentEvidence, progress *runtimeProbeProgress) error {
 	if evidence == nil || progress == nil {
 		return fmt.Errorf("runtime-agent stop progress is unavailable")
+	}
+	if progress.EnrollmentStage != "" || progress.EnrollmentCode != "" {
+		if !runtimeagent.ValidEnrollmentDiagnostic(progress.EnrollmentStage, progress.EnrollmentCode) || progress.EnrollmentCaptured {
+			return fmt.Errorf("runtime-agent enrollment diagnostic category is invalid")
+		}
+		evidence.EnrollmentDiagnosticStage, evidence.EnrollmentDiagnosticCode = progress.EnrollmentStage, progress.EnrollmentCode
+		return fmt.Errorf("runtime-agent enrollment rejected at %s/%s", progress.EnrollmentStage, progress.EnrollmentCode)
 	}
 	evidence.EnrollmentCaptured = progress.EnrollmentCaptured
 	if progress.StopStage != "" || progress.StopCode != "" {
