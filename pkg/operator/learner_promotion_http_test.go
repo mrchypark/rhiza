@@ -2,7 +2,6 @@ package operator
 
 import (
 	"context"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -24,34 +23,6 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	ctx := t.Context()
 	f := newAutomaticBootstrapGenesisFixture(t)
 	f.e.ControllerServiceAccount = "default"
-	// A membership replacement requires a real source voter set in the
-	// supervised template, rather than the bootstrap fixture's otherwise-empty
-	// membership variable.
-	members := make([]quepaxa.Member, 0, len(f.cohort))
-	for _, runtime := range f.cohort {
-		member := voterMember(f.runtime.SourceClusterID, runtime.NodeID, "bootstrap-token-"+runtime.NodeID)
-		member.URL = fmt.Sprintf("http://%s.rhiza-headless.test.svc.cluster.local:8080", runtime.NodeID)
-		member.PeerURL = fmt.Sprintf("quic://%s.rhiza-headless.test.svc.cluster.local:9090", runtime.NodeID)
-		members = append(members, member)
-	}
-	f.api.mu.Lock()
-	stsFixture := f.api.authStatefulSet
-	containerFixture := asObject(list(nested(stsFixture, "spec", "template", "spec", "containers"))[0])
-	memberJSON, err := json.Marshal(members)
-	if err != nil {
-		f.api.mu.Unlock()
-		t.Fatal(err)
-	}
-	containerFixture["env"] = replaceEnv(list(containerFixture["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(memberJSON)})
-	f.api.objects[f.e.controller().stsPath("rhiza")] = stsFixture
-	f.api.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{stsFixture}}
-	podList := list(asObject(f.api.objects[f.e.controller().corePath("pods", "")])["items"])
-	for _, raw := range podList {
-		pod := asObject(raw)
-		podCtr := asObject(list(nested(pod, "spec", "containers"))[0])
-		podCtr["env"] = replaceEnv(list(podCtr["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(memberJSON)})
-	}
-	f.api.mu.Unlock()
 	controller, _, cluster := automaticBootstrapController(t, f)
 	clusterPath := controller.clusterPath(automaticBootstrapClusterName)
 	// Establish the protected pre-fence automatic-control record before this
