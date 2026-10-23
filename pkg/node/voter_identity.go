@@ -90,7 +90,22 @@ func voterIdentityFor(config *types.ExecutionConfig) voterIdentity {
 // ensureVoterIdentity runs before any archive replay or peer listener. An
 // archive contains decided values, not the lost voter's outstanding promises.
 func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite ...func(context.Context, string) error) error {
+	return ensureVoterIdentityWithHooks(ctx, config, bucket, wal, local, enroll, beforeWrite, nil)
+}
+
+func ensureVoterIdentityWithHooks(ctx context.Context, config *types.ExecutionConfig, bucket objstore.Bucket, wal *qlog.WAL, local localVoterState, enroll bool, beforeWrite []func(context.Context, string) error, pendingIdentityWrite []func(context.Context, string, []byte) error, authorityAssignedRestart ...bool) error {
 	want := voterIdentityFor(config)
+	assignedRestart := len(authorityAssignedRestart) != 0 && authorityAssignedRestart[0]
+	if assignedRestart {
+		if local.identity == nil || !local.identity.Registered || config.Learner != nil || local.identity.Node != string(config.NodeID) || local.identity.Cluster != string(config.ClusterID) {
+			return fmt.Errorf("%w: authority-assigned restart lacks its registered logical identity", ErrVoterStateLost)
+		}
+		// Only the fencer can set this branch after verifying the completed
+		// same-ordinal assignment. The immutable voter record intentionally
+		// retains the cohort under which its learner identity was first bound.
+		want.Membership = local.identity.Membership
+		want.LearnerPublicKey = local.identity.LearnerPublicKey
+	}
 	bound, hasBinding := wal.Identity()
 	if local.identity != nil {
 		nonce, _ := hex.DecodeString(local.identity.Nonce)
@@ -162,6 +177,20 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 		}
 	}
 	clusterWant, _ := json.Marshal(recovery.NewMembershipRecord(want.Cluster, config.Members, string(config.ObjStoreDurability)))
+	if assignedRestart && clusterData != nil {
+		var genesis recovery.MembershipRecord
+		decoder := json.NewDecoder(bytes.NewReader(clusterData))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&genesis) != nil || decoder.Decode(new(any)) != io.EOF || genesis.Version != recovery.MembershipRecordVersion ||
+			genesis.Cluster != want.Cluster || genesis.Membership != want.Membership || genesis.Durability != string(config.ObjStoreDurability) {
+			return fmt.Errorf("%w: assigned restart does not match the immutable voter genesis", ErrVoterStateLost)
+		}
+		canonical, _ := json.Marshal(genesis)
+		if !bytes.Equal(canonical, clusterData) {
+			return fmt.Errorf("%w: assigned restart voter genesis is not canonical", ErrVoterStateLost)
+		}
+		clusterWant = append([]byte(nil), clusterData...)
+	}
 	if local.identity == nil {
 		var nonce [32]byte
 		if _, err := rand.Read(nonce[:]); err != nil {
@@ -196,7 +225,18 @@ func ensureVoterIdentity(ctx context.Context, config *types.ExecutionConfig, buc
 	remote := *local.identity
 	remote.Registered = true
 	data, _ := json.Marshal(remote)
-	if err := matchVoterRegistration(ctx, bucket, identityKey, data, registered); err != nil {
+	if registered == nil && len(pendingIdentityWrite) != 0 {
+		if err := pendingIdentityWrite[0](ctx, identityKey, data); err != nil {
+			return err
+		}
+		registered, err = readVoterRegistration(ctx, bucket, identityKey)
+		if err != nil {
+			return err
+		}
+		if registered == nil || !bytes.Equal(data, registered) {
+			return fmt.Errorf("%w: authority learner identity readback differs", ErrVoterStateLost)
+		}
+	} else if err := matchVoterRegistration(ctx, bucket, identityKey, data, registered); err != nil {
 		return err
 	}
 	if !local.identity.Registered {

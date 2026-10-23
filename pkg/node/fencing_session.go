@@ -47,8 +47,19 @@ func (n *Node) bindFenceWAL(ctx context.Context, walIdentity string) error {
 	if n.protectedBucket == nil {
 		return fmt.Errorf("supervised source mutation bucket is unavailable")
 	}
+	if n.fenceSession.StartupRole() == fencing.StartupRoleLearnerPendingRemove {
+		// Pending learners may bind their WAL and read canonical archive state,
+		// but receive no producer and no source write path. Their sole remote
+		// registration write is separately authorized by RegisterLearnerIdentity.
+		n.fenceWriterActive.Store(false)
+		return nil
+	}
 	if _, independent := n.fenceSession.MutationBinding(); !independent {
-		return n.protectedBucket.activateCooperativeDirect()
+		if err := n.protectedBucket.activateCooperativeDirect(); err != nil {
+			return err
+		}
+		n.fenceWriterActive.Store(true)
+		return nil
 	}
 	provider := objectstore.Provider(n.config.ObjStoreProvider)
 	if provider == "" {
@@ -81,6 +92,7 @@ func (n *Node) bindFenceWAL(ctx context.Context, walIdentity string) error {
 	if err := ensureArchiveGenesis(ctx, client, n.protectedBucket, scope, binding.StoreScopeHash, membership); err != nil {
 		return err
 	}
+	n.fenceWriterActive.Store(true)
 	return nil
 }
 
@@ -88,6 +100,45 @@ func (n *Node) startFenceWatcher(ctx context.Context) {
 	session := n.fenceSession
 	if session == nil {
 		return
+	}
+	if session.StartupRole() == fencing.StartupRoleLearnerPendingRemove {
+		n.wg.Add(1)
+		go func() {
+			defer n.wg.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				if n.core == nil || !n.core.IsVoter() {
+					continue
+				}
+				// Once the locally applied configuration includes this identity,
+				// keep client mutations gated until the authority confirms the
+				// canonical REMOVE/ADD journal and post-commit durability ACK.
+				n.ready.Store(false)
+				promoteCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				err := error(nil)
+				if session.StartupRole() == fencing.StartupRoleLearnerPendingRemove {
+					err = session.PromoteLearner(promoteCtx)
+				}
+				if err == nil && !n.fenceWriterActive.Load() {
+					err = n.bindFenceWAL(promoteCtx, n.core.WALIdentity())
+				}
+				cancel()
+				if err != nil {
+					if !errors.Is(err, fencing.ErrPending) && !errors.Is(err, fencing.ErrUnavailable) && ctx.Err() == nil {
+						log.Printf("fencing learner promotion remains unavailable")
+					}
+					continue
+				}
+				n.ready.Store(true)
+				return
+			}
+		}()
 	}
 	// This watcher must not join n.wg: it initiates the shutdown that joins it.
 	go func() {

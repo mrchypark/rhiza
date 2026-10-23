@@ -78,7 +78,11 @@ func supervise(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(filepath.Dir(*socket), 0700); err != nil {
 		return err
 	}
-	s := &fencing.Supervisor{Authority: &fencing.AuthorityClient{URL: *endpoint, TokenFile: *token, Client: client}, SocketPath: *socket, Command: f.Args(), Identity: fencing.Identity{SourceClusterID: os.Getenv("RHIZA_CLUSTER_ID"), NodeID: os.Getenv("RHIZA_NODE_ID"), PodUID: os.Getenv("POD_UID")}}
+	podName := os.Getenv("RHIZA_POD_NAME")
+	if podName == "" {
+		podName = os.Getenv("RHIZA_NODE_ID")
+	}
+	s := &fencing.Supervisor{Authority: &fencing.AuthorityClient{URL: *endpoint, TokenFile: *token, Client: client}, SocketPath: *socket, Command: f.Args(), Identity: fencing.Identity{SourceClusterID: os.Getenv("RHIZA_CLUSTER_ID"), NodeID: os.Getenv("RHIZA_NODE_ID"), PodName: podName, PodUID: os.Getenv("POD_UID")}}
 	return s.Run(ctx)
 }
 
@@ -158,6 +162,7 @@ func serve(ctx context.Context, args []string) error {
 	}
 	executor := newFencingExecutor(kube, authorityState, *independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC)
 	executor.ArchiveBucket = archiveBucket
+	executor.AutomaticControlPrefix = stateConfig.Prefix
 	executor.ArchiveStoreIdentity = operator.StoreIdentity(map[string]string{
 		"RHIZA_OBJSTORE_PROVIDER":                string(stateConfig.Provider),
 		"RHIZA_OBJSTORE_ENDPOINT":                stateConfig.Endpoint,

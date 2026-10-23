@@ -87,8 +87,12 @@ func (a *RuntimeAgentClient) enrollmentBase(ctx context.Context, namespace strin
 	if a == nil || a.Kube == nil || a.AuthorityID == "" || namespace != a.Kube.Namespace {
 		return fencing.RuntimeBinding{}, fmt.Errorf("fencing: runtime enrollment authority unavailable")
 	}
+	podName := identity.PodName
+	if podName == "" {
+		podName = identity.NodeID
+	}
 	var pod object
-	if err := a.Kube.Get(ctx, (&Controller{Kube: a.Kube}).corePath("pods", identity.NodeID), &pod); err != nil {
+	if err := a.Kube.Get(ctx, (&Controller{Kube: a.Kube}).corePath("pods", podName), &pod); err != nil {
 		return fencing.RuntimeBinding{}, err
 	}
 	if str(nested(pod, "metadata", "uid")) != identity.PodUID || nested(pod, "metadata", "deletionTimestamp") != nil || str(nested(pod, "spec", "nodeName")) == "" || str(nested(pod, "metadata", "annotations", fencingRootAnnotation)) == "" {
@@ -115,6 +119,6 @@ func (a *RuntimeAgentClient) enrollmentBase(ctx context.Context, namespace strin
 		return fencing.RuntimeBinding{}, fmt.Errorf("fencing: namespace UID is unavailable")
 	}
 	return fencing.RuntimeBinding{AuthorityID: a.AuthorityID, NamespaceUID: namespaceUID, BindingUID: str(nested(pod, "metadata", "annotations", fencingRootAnnotation)),
-		StatefulSetUID: statefulSetUID, SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, PodUID: identity.PodUID, RunID: identity.RunID,
+		StatefulSetUID: statefulSetUID, SourceClusterID: identity.SourceClusterID, NodeID: identity.NodeID, PodName: podName, PodUID: identity.PodUID, RunID: identity.RunID, AssignmentID: identity.AssignmentID,
 		NodeName: str(nested(pod, "spec", "nodeName")), ContainerID: containerID, ImageID: imageID}, nil
 }

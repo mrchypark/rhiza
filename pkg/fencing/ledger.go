@@ -21,6 +21,7 @@ type Ledger struct {
 
 type Run struct {
 	Identity                 Identity           `json:"identity"`
+	Role                     StartupRole        `json:"role,omitempty"`
 	Stop                     *StopRequest       `json:"stop,omitempty"`
 	Drain                    *DrainReceipt      `json:"drain,omitempty"`
 	Exited                   bool               `json:"exited,omitempty"`
@@ -31,11 +32,31 @@ type Run struct {
 	MutationProfile          string             `json:"mutationProfile,omitempty"`
 	MutationStageIncarnation string             `json:"mutationStageIncarnation,omitempty"`
 	IndependentTerminal      *TerminalReference `json:"independentTerminal,omitempty"`
+	Promotion                *LearnerPromotion  `json:"promotion,omitempty"`
+}
+
+// LearnerPromotion binds the role transition to the exact canonical membership
+// completion that the authority independently verified. It is not a caller
+// supplied capability; only the authenticated fencer writes it.
+type LearnerPromotion struct {
+	OperationID  string `json:"operationID"`
+	EvidenceHash string `json:"evidenceHash"`
 }
 
 func (l *Ledger) Register(identity Identity) error {
+	return l.RegisterWithRole(identity, StartupRoleVoterActive)
+}
+
+// RegisterWithRole is called only by the authenticated authority after it has
+// independently resolved a role. Empty roles in historical ledger records are
+// interpreted as voter-active for wire/storage compatibility.
+func (l *Ledger) RegisterWithRole(identity Identity, role StartupRole) error {
 	if identity.SourceClusterID != l.SourceClusterID || identity.NodeID == "" || identity.PodUID == "" || identity.RunID == "" || identity.WALIdentity != "" {
 		return fmt.Errorf("fencing: invalid registration")
+	}
+	assigned := identity.AssignmentID != "" && mutationDigestValid(identity.AssignmentID) && identity.PodName != "" && identity.PodName != identity.NodeID
+	if !role.Valid() || (identity.PodName != "" && identity.PodName != identity.NodeID && !assigned) || (identity.AssignmentID != "" && !assigned) {
+		return fmt.Errorf("fencing: invalid registration role or physical Pod mapping")
 	}
 	if l.ClosedBy != "" {
 		return ErrClosed
@@ -49,7 +70,7 @@ func (l *Ledger) Register(identity Identity) error {
 	if old, exists := l.Runs[identity.RunID]; exists {
 		// A caller may resolve an uncertain registration response, but cannot
 		// reuse a bound run as authorization for another child spawn.
-		if old.Identity == identity && old.Stop == nil {
+		if old.Identity == identity && runRole(old) == role && old.Stop == nil {
 			return nil
 		}
 		return fmt.Errorf("fencing: run ID already registered")
@@ -60,7 +81,46 @@ func (l *Ledger) Register(identity Identity) error {
 			return fmt.Errorf("fencing: earlier incarnation has no clean termination proof")
 		}
 	}
-	l.Runs[identity.RunID] = Run{Identity: identity}
+	l.Runs[identity.RunID] = Run{Identity: identity, Role: role}
+	return nil
+}
+
+func runRole(run Run) StartupRole {
+	if run.Role == "" {
+		return StartupRoleVoterActive
+	}
+	return run.Role
+}
+
+// StartupRole returns the persisted role, treating pre-role ledger records as
+// the historical static-voter profile.
+func RunRole(run Run) StartupRole { return runRole(run) }
+
+// PromoteLearner is an idempotent pending-to-active transition. The operator
+// authority calls it only after validating the exact persisted REMOVE/ADD
+// requests, immutable credentials, committed configuration, and durability
+// confirmation. A bound WAL and immutable evidence digest are mandatory.
+func (l *Ledger) PromoteLearner(identity Identity, operationID, evidenceHash string) error {
+	run, ok := l.Runs[identity.RunID]
+	if !ok || identity.WALIdentity == "" || run.Identity != identity || run.Runtime == nil || run.Stop != nil || l.ClosedBy != "" {
+		return ErrClosed
+	}
+	if _, closed := l.ClosedNodes[identity.NodeID]; closed {
+		return ErrClosed
+	}
+	if operationID == "" || !mutationDigestValid(evidenceHash) || runRole(run) != StartupRoleLearnerPendingRemove {
+		if runRole(run) == StartupRoleVoterActive && run.Promotion != nil &&
+			run.Promotion.OperationID == operationID && run.Promotion.EvidenceHash == evidenceHash {
+			return nil
+		}
+		return fmt.Errorf("fencing: learner promotion evidence is invalid")
+	}
+	if run.MutationProducerUID != "" || run.MutationScopeHash != "" || run.MutationProfile != "" || run.MutationStageIncarnation != "" {
+		return fmt.Errorf("fencing: pending learner already has source mutation authority")
+	}
+	run.Role = StartupRoleVoterActive
+	run.Promotion = &LearnerPromotion{OperationID: operationID, EvidenceHash: evidenceHash}
+	l.Runs[identity.RunID] = run
 	return nil
 }
 
@@ -85,8 +145,11 @@ func (l *Ledger) Bind(identity Identity) error {
 			return err
 		}
 	}
-	if l.RequireMutationJournal && run.MutationProducerUID == "" {
+	if l.RequireMutationJournal && runRole(run) == StartupRoleVoterActive && run.MutationProducerUID == "" {
 		return fmt.Errorf("fencing: immutable mutation producer enrollment required before WAL binding")
+	}
+	if runRole(run) == StartupRoleLearnerPendingRemove && run.MutationProducerUID != "" {
+		return fmt.Errorf("fencing: pending learner cannot bind a mutation producer")
 	}
 	for _, old := range l.Runs {
 		if old.Identity.RunID != identity.RunID && old.Identity.NodeID == identity.NodeID && old.Identity.WALIdentity != "" && old.Identity.WALIdentity != identity.WALIdentity {

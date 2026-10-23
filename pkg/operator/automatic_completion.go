@@ -36,9 +36,27 @@ func (c *Controller) verifyAutomaticCompletion(ctx context.Context, r *ClusterRe
 		if remove.OperationID != membershipOperationID(child, "remove") || remove.ClusterID != state.ActiveClusterID || remove.Remove != i.Failed || !sameFence(remove.Fence, m.Fence) {
 			return fmt.Errorf("committed removal differs from fenced intent")
 		}
+		if m.ReplacementPod != learnerPhysicalPod(i) || m.ReplacementSecret != learnerCredentialName(i) {
+			return fmt.Errorf("replacement physical Pod or credential name differs from the frozen assignment")
+		}
+		if i.LearnerPodName != "" {
+			assignment, err := sameOrdinalAssignmentDigest(state, i)
+			if err != nil || assignment != i.LearnerAssignmentID || i.LearnerAssignmentID == "" {
+				return fmt.Errorf("same-ordinal learner assignment digest differs from the completed child")
+			}
+		}
 		member, uid, rv, err := c.replacementMember(ctx, m.ReplacementSecret)
 		if err != nil {
 			return err
+		}
+		if i.LearnerSecretName != "" {
+			var secret object
+			if err := c.Kube.Get(ctx, c.corePath("secrets", i.LearnerSecretName), &secret); err != nil {
+				return err
+			}
+			if secret["immutable"] != true || uid != i.LearnerSecretUID || rv != i.LearnerSecretRV || hashJSON(secret["data"]) != i.LearnerSecretHash {
+				return fmt.Errorf("committed learner credential differs from the frozen Pod assignment")
+			}
 		}
 		member.WALIdentity = i.LearnerWAL
 		add := journal.Add

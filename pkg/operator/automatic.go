@@ -86,6 +86,7 @@ var clusterDomainRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0
 type learnerIncarnation struct {
 	SourceClusterID string             `json:"sourceClusterID"`
 	OperationID     string             `json:"operationID"`
+	CredentialName  string             `json:"credentialName,omitempty"`
 	CredentialUID   string             `json:"credentialUID"`
 	Target          FenceTarget        `json:"target"`
 	Retirement      *learnerRetirement `json:"retirement,omitempty"`
@@ -105,14 +106,15 @@ type bootstrapCandidate struct {
 
 // autoCompletion records an installed outcome, independently of later health.
 type autoCompletion struct {
-	RecoveryName     string     `json:"recoveryName"`
-	RecoveryUID      string     `json:"recoveryUID"`
-	SpecHash         string     `json:"specHash"`
-	FenceProofID     string     `json:"fenceProofID"`
-	FenceRequestHash string     `json:"fenceRequestHash"`
-	ClusterID        string     `json:"clusterID"`
-	Voters           []VoterPod `json:"voters"`
-	At               time.Time  `json:"at"`
+	RecoveryName     string      `json:"recoveryName"`
+	RecoveryUID      string      `json:"recoveryUID"`
+	SpecHash         string      `json:"specHash"`
+	FenceProofID     string      `json:"fenceProofID"`
+	FenceRequestHash string      `json:"fenceRequestHash"`
+	ClusterID        string      `json:"clusterID"`
+	Voters           []VoterPod  `json:"voters"`
+	LearnerIntent    *autoIntent `json:"learnerIntent,omitempty"`
+	At               time.Time   `json:"at"`
 }
 type autoIntent struct {
 	Supersedes          string    `json:"supersedes,omitempty"`
@@ -135,6 +137,14 @@ type autoIntent struct {
 	RecoveryUID      string         `json:"recoveryUID,omitempty"`
 	SpecHash         string         `json:"specHash,omitempty"`
 	LearnerName      string         `json:"learnerName,omitempty"`
+	// LearnerPodName may differ from LearnerName only for a supervisor-assigned
+	// fresh logical identity on a recreated StatefulSet ordinal.
+	LearnerPodName      string `json:"learnerPodName,omitempty"`
+	LearnerSecretName   string `json:"learnerSecretName,omitempty"`
+	LearnerSecretUID    string `json:"learnerSecretUID,omitempty"`
+	LearnerSecretRV     string `json:"learnerSecretResourceVersion,omitempty"`
+	LearnerSecretHash   string `json:"learnerSecretHash,omitempty"`
+	LearnerAssignmentID string `json:"learnerAssignmentID,omitempty"`
 }
 
 func (c *Controller) clusterPath(name string) string {

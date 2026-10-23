@@ -34,7 +34,7 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		return false, nil
 	}
 	if intent.Aborting {
-		if child.Spec.Membership == nil || !child.Spec.Membership.AbortAddition || child.Spec.Membership.ReplacementPod != intent.LearnerName || hashJSON(child.Spec) != intent.SpecHash || child.Status.Membership == nil || child.Status.Membership.Phase != "Aborted" {
+		if child.Spec.Membership == nil || !child.Spec.Membership.AbortAddition || child.Spec.Membership.ReplacementPod != learnerPhysicalPod(intent) || hashJSON(child.Spec) != intent.SpecHash || child.Status.Membership == nil || child.Status.Membership.Phase != "Aborted" {
 			return false, nil
 		}
 		request := intent.Request
@@ -62,6 +62,11 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		intent.LearnerAttempt++
 		intent.LearnerUID = ""
 		intent.LearnerWAL = ""
+		intent.LearnerPodName = ""
+		intent.LearnerSecretName = ""
+		intent.LearnerSecretUID = ""
+		intent.LearnerSecretRV = ""
+		intent.LearnerSecretHash = ""
 		intent.LearnerMissingSince = time.Time{}
 		intent.LearnerName = fmt.Sprintf("%s-learner-%d", intent.RecoveryName, intent.LearnerAttempt)
 		return save("aborted learner replaced with a fresh incarnation")
@@ -70,6 +75,24 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		return block("automatic learner retry limit reached; existing journal retained")
 	}
 	if intent.LearnerUID == "" {
+		assigned, err := c.prepareSameOrdinalLearner(ctx, state, sts, r.Spec.Container)
+		if err != nil {
+			return block("same-ordinal replacement identity conflicts with the fenced incarnation")
+		}
+		if assigned {
+			var pod object
+			if err := c.Kube.Get(ctx, c.corePath("pods", learnerPhysicalPod(intent)), &pod); err != nil {
+				return true, err
+			}
+			entry, err := c.learnerInventoryEntry(ctx, state, sts, pod)
+			if err != nil {
+				return block(err.Error())
+			}
+			if err := rememberLearner(state, entry); err != nil {
+				return block(err.Error())
+			}
+			return save("same-ordinal learner identity reserved before startup authorization")
+		}
 		if handled, err := c.prepareLearnerProvisioning(ctx, r, state, version); handled || err != nil {
 			return handled, err
 		}
@@ -77,7 +100,7 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 			return block("replacement provisioning is unavailable or conflicts with ownership")
 		}
 		var pod object
-		if err := c.Kube.Get(ctx, c.corePath("pods", intent.LearnerName), &pod); err != nil {
+		if err := c.Kube.Get(ctx, c.corePath("pods", learnerPhysicalPod(intent)), &pod); err != nil {
 			return true, err
 		}
 		intent.LearnerUID = str(nested(pod, "metadata", "uid"))
@@ -94,7 +117,7 @@ func (c *Controller) handleAutomaticLearner(ctx context.Context, r *ClusterResou
 		return save("replacement Pod identity persisted before membership dispatch")
 	}
 	var pod object
-	err := c.Kube.Get(ctx, c.corePath("pods", intent.LearnerName), &pod)
+	err := c.Kube.Get(ctx, c.corePath("pods", learnerPhysicalPod(intent)), &pod)
 	if err != nil && !apiNotFound(err) {
 		return true, err
 	}

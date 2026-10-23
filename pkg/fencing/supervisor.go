@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +31,21 @@ type Authority interface {
 	NeverBoundExit(context.Context, StopRequest) error
 }
 
+// StartupGrantAuthority is an optional role-aware extension. Keeping it
+// separate preserves existing static-authority implementations while making
+// any learner role an authenticated response rather than a child assertion.
+type StartupGrantAuthority interface {
+	RegisterStartup(context.Context, Identity) (StartupGrant, error)
+}
+
+type LearnerIdentityAuthority interface {
+	RegisterLearnerIdentity(context.Context, Identity, LearnerIdentityRegistration) error
+}
+
+type LearnerPromotionAuthority interface {
+	PromoteLearner(context.Context, Identity) (BindReceipt, error)
+}
+
 // Supervisor supports only a dedicated, private Linux process namespace in
 // which it is PID 1. A crash never produces a receipt; restart must reserve a
 // fresh run and therefore cannot erase the unresolved prior run.
@@ -39,7 +55,9 @@ type Supervisor struct {
 	SocketPath string
 	Command    []string
 	mu         sync.Mutex
+	requested  Identity
 	bound      Identity
+	grant      StartupGrant
 	binding    *BindReceipt
 	drain      *DrainReceipt
 	ticket     string
@@ -58,12 +76,23 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	s.Identity.RunID = hex.EncodeToString(nonce[:16])
 	s.Identity.WALIdentity = ""
+	s.requested = s.Identity
 	s.bound = s.Identity
+	s.grant = StartupGrant{Identity: s.Identity, Role: StartupRoleVoterActive}
 	s.binding = nil
 	s.ticket = hex.EncodeToString(nonce[16:])
 	// Must precede listener readiness and exec. The authority can close this
 	// reservation concurrently; the child must also pass Connect and BindWAL.
-	if err := s.Authority.Register(ctx, s.Identity); err != nil {
+	if authority, ok := s.Authority.(StartupGrantAuthority); ok {
+		grant, err := authority.RegisterStartup(ctx, s.Identity)
+		if err != nil {
+			return err
+		}
+		if err := grant.Validate(s.Identity); err != nil {
+			return err
+		}
+		s.grant, s.bound = grant, grant.Identity
+	} else if err := s.Authority.Register(ctx, s.Identity); err != nil {
 		return err
 	}
 	listener, err := listenSupervisor(s.SocketPath)
@@ -80,9 +109,15 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	go func() { _ = server.Serve(listener) }()
 	child := exec.Command(s.Command[0], s.Command[1:]...)
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "RHIZA_FENCE_SOCKET=") && !strings.HasPrefix(entry, "RHIZA_FENCE_TICKET=") {
+		if !strings.HasPrefix(entry, "RHIZA_FENCE_SOCKET=") && !strings.HasPrefix(entry, "RHIZA_FENCE_TICKET=") &&
+			!strings.HasPrefix(entry, "RHIZA_CLUSTER_ID=") && !strings.HasPrefix(entry, "RHIZA_NODE_ID=") && !strings.HasPrefix(entry, "RHIZA_POD_NAME=") && !strings.HasPrefix(entry, "RHIZA_STARTUP_ROLE=") &&
+			!strings.HasPrefix(entry, "RHIZA_LEARNER=") && !strings.HasPrefix(entry, "RHIZA_PEER_TOKEN=") && !strings.HasPrefix(entry, "RHIZA_PEER_TOKENS=") && !strings.HasPrefix(entry, "RHIZA_CLUSTER_MEMBERS=") {
 			child.Env = append(child.Env, entry)
 		}
+	}
+	child.Env = append(child.Env, "RHIZA_CLUSTER_ID="+s.grant.Identity.SourceClusterID, "RHIZA_NODE_ID="+s.grant.Identity.NodeID, "RHIZA_POD_NAME="+s.grant.Identity.PodName, "RHIZA_STARTUP_ROLE="+string(s.grant.Role))
+	for key, value := range s.grant.Environment {
+		child.Env = append(child.Env, key+"="+value)
 	}
 	child.Env = append(child.Env, "RHIZA_FENCE_SOCKET="+s.SocketPath, "RHIZA_FENCE_TICKET="+s.ticket)
 	child.Stdout, child.Stderr, child.Stdin = os.Stdout, os.Stderr, os.Stdin
@@ -292,6 +327,20 @@ func (s *Supervisor) handler() http.Handler {
 					s.mu.Unlock()
 				}
 			}
+		} else if r.URL.Path == "/v1/learner-identity" {
+			var request struct {
+				Identity Identity                    `json:"identity"`
+				Object   LearnerIdentityRegistration `json:"object"`
+			}
+			err = decoder.Decode(&request)
+			if err == nil {
+				err = decoder.Decode(new(any))
+				if err == io.EOF {
+					err = s.registerLearnerIdentity(r.Context(), request.Identity, request.Object)
+				} else if err == nil {
+					err = fmt.Errorf("fencing: trailing learner identity request")
+				}
+			}
 		} else {
 			var identity Identity
 			err = decoder.Decode(&identity)
@@ -323,12 +372,49 @@ func (s *Supervisor) handler() http.Handler {
 	})
 }
 
+func (s *Supervisor) registerLearnerIdentity(ctx context.Context, identity Identity, request LearnerIdentityRegistration) error {
+	s.mu.Lock()
+	bound, role := s.bound, s.grant.Role
+	s.mu.Unlock()
+	if role != StartupRoleLearnerPendingRemove || identity != bound || len(request.Data) == 0 || len(request.Data) > 64<<10 {
+		return fmt.Errorf("fencing: learner identity registration is unavailable")
+	}
+	authority, ok := s.Authority.(LearnerIdentityAuthority)
+	if !ok {
+		return fmt.Errorf("fencing: learner identity authority is unavailable")
+	}
+	return authority.RegisterLearnerIdentity(ctx, identity, request)
+}
+
 func (s *Supervisor) identityRequest(ctx context.Context, path string, identity Identity) (any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch path {
+	case "/v1/promote-learner":
+		if identity != s.bound || s.grant.Role != StartupRoleLearnerPendingRemove || identity.WALIdentity == "" {
+			return nil, fmt.Errorf("fencing: learner promotion identity differs")
+		}
+		authority, ok := s.Authority.(LearnerPromotionAuthority)
+		if !ok {
+			return nil, ErrUnavailable
+		}
+		receipt, err := authority.PromoteLearner(ctx, identity)
+		if err != nil {
+			return nil, err
+		}
+		if err := receipt.Validate(identity); err != nil || receipt.Role != StartupRoleVoterActive {
+			return nil, fmt.Errorf("fencing: invalid learner promotion receipt")
+		}
+		copy := receipt.clone()
+		s.binding = &copy
+		s.grant.Role = StartupRoleVoterActive
+		return receipt, nil
 	case "/v1/startup":
-		if identity.SourceClusterID != s.bound.SourceClusterID || identity.NodeID != s.bound.NodeID {
+		requested := s.requested
+		if requested.NodeID == "" {
+			requested = s.Identity
+		}
+		if identity.SourceClusterID != requested.SourceClusterID || identity.NodeID != requested.NodeID || identity.PodName != requested.PodName || identity.PodUID != "" || identity.RunID != "" || identity.WALIdentity != "" {
 			return nil, fmt.Errorf("fencing: startup identity mismatch")
 		}
 		if _, err := s.Authority.Stop(ctx, s.bound); err != ErrPending {
@@ -337,7 +423,7 @@ func (s *Supervisor) identityRequest(ctx context.Context, path string, identity 
 			}
 			return nil, err
 		}
-		return s.bound, nil
+		return s.grant, nil
 	case "/v1/bind":
 		if identity.WALIdentity == "" {
 			return nil, fmt.Errorf("fencing: empty WAL")

@@ -117,7 +117,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		target := intent.Request.Targets[0]
 		desired.RecoveryID = ""
 		desired.Fence = Fence{}
-		desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: intent.LearnerName, ReplacementSecret: intent.LearnerName + "-credentials", Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
+		desired.Membership = &MembershipSpec{AbortAddition: intent.Aborting, OperationID: intent.RecoveryName, Remove: intent.Failed, RemovedPod: target.Pod, VoterPods: voters, ReplacementPod: learnerPhysicalPod(intent), ReplacementSecret: learnerCredentialName(intent), Fence: MembershipFence{NodeID: intent.Failed, WALIdentity: target.WALIdentity, WorkloadUID: target.PodUID, Confirmed: true, Evidence: intent.Proof.ProofID}}
 	}
 	var child Resource
 	err := c.Kube.Get(ctx, c.resourcePath(intent.RecoveryName), &child)
@@ -145,6 +145,13 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		if intent.RecoveryUID == "" {
 			return block("recovery resource UID is unavailable")
 		}
+		if intent.LearnerPodName != "" {
+			assignment, err := sameOrdinalAssignmentDigest(state, intent)
+			if err != nil {
+				return block("same-ordinal assignment binding is incomplete")
+			}
+			intent.LearnerAssignmentID = assignment
+		}
 		if err := c.saveAuto(ctx, r, state, version); err != nil {
 			return err
 		}
@@ -156,6 +163,13 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 		intent.PreviousSpecHash = intent.SpecHash
 		intent.SpecHash = hashJSON(desired)
+		if intent.LearnerPodName != "" {
+			assignment, err := sameOrdinalAssignmentDigest(state, intent)
+			if err != nil {
+				return block("same-ordinal assignment binding is incomplete")
+			}
+			intent.LearnerAssignmentID = assignment
+		}
 		if err := c.saveAuto(ctx, r, state, version); err != nil {
 			return err
 		}
@@ -188,9 +202,9 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 				state.Voters = append(state.Voters, ref)
 			}
 		}
-		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: intent.LearnerName})
+		state.Voters = append(state.Voters, VoterPod{NodeID: quepaxa.NodeID(intent.LearnerName), Pod: learnerPhysicalPod(intent)})
 		delete(state.Identities, intent.Failed)
-		state.Identities[quepaxa.NodeID(intent.LearnerName)] = FenceTarget{NodeID: intent.LearnerName, Pod: intent.LearnerName, PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
+		state.Identities[quepaxa.NodeID(intent.LearnerName)] = FenceTarget{NodeID: intent.LearnerName, Pod: learnerPhysicalPod(intent), PodUID: intent.LearnerUID, WALIdentity: intent.LearnerWAL}
 	} else {
 		if child.Status.Target == "" || child.Status.Stage != "Complete" {
 			return block("target generation is not confirmed complete")
@@ -218,7 +232,12 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 		}
 	}
 	state.Completions = recent
-	state.Completed = &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
+	completion := &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
+	if intent.LearnerPodName != "" {
+		copy := *intent
+		completion.LearnerIntent = &copy
+	}
+	state.Completed = completion
 	state.BootstrapGenesis = nil
 	state.SuspectedSince = time.Time{}
 	state.Intent = nil

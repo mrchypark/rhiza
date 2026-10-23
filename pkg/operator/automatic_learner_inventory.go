@@ -17,7 +17,8 @@ const maxLearnerHistory = 64
 func learnerFenceTarget(state *autoControl, name, uid, wal string) FenceTarget {
 	target := FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: wal}
 	for _, entry := range state.Learners {
-		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.Pod == name && entry.Target.PodUID == uid {
+		if entry.SourceClusterID == state.ActiveClusterID && entry.Target.NodeID == name && entry.Target.PodUID == uid {
+			target.Pod = entry.Target.Pod
 			target.NodeName, target.NodeUID, target.ContainerID, target.ImageID = entry.Target.NodeName, entry.Target.NodeUID, entry.Target.ContainerID, entry.Target.ImageID
 		}
 	}
@@ -29,10 +30,14 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 		return err
 	}
 	for i, old := range state.Learners {
-		if old.SourceClusterID != entry.SourceClusterID || old.Target.Pod != entry.Target.Pod {
+		if old.SourceClusterID != entry.SourceClusterID || old.Target.NodeID != entry.Target.NodeID || old.Target.PodUID != entry.Target.PodUID {
 			continue
 		}
-		if old.Target.PodUID != entry.Target.PodUID || old.OperationID != entry.OperationID || old.CredentialUID != entry.CredentialUID || old.Target.NodeID != entry.Target.NodeID || (old.Target.WALIdentity != "" && old.Target.WALIdentity != entry.Target.WALIdentity) {
+		oldCredentialName := old.CredentialName
+		if oldCredentialName == "" {
+			oldCredentialName = old.Target.Pod + "-credentials"
+		}
+		if old.Target.Pod != entry.Target.Pod || old.OperationID != entry.OperationID || oldCredentialName != entry.CredentialName || old.CredentialUID != entry.CredentialUID || (old.Target.WALIdentity != "" && old.Target.WALIdentity != entry.Target.WALIdentity) {
 			return fmt.Errorf("learner incarnation history conflicts")
 		}
 		state.Learners[i] = entry
@@ -47,11 +52,11 @@ func rememberLearner(state *autoControl, entry learnerIncarnation) error {
 
 func validateLearnerHistory(entries []learnerIncarnation) error {
 	for i, entry := range entries {
-		if entry.SourceClusterID == "" || entry.OperationID == "" || entry.Target.PodUID == "" || entry.Target.NodeID != entry.Target.Pod || !identifier.MatchString(entry.Target.Pod) {
+		if entry.SourceClusterID == "" || entry.OperationID == "" || entry.Target.PodUID == "" || !identifier.MatchString(entry.Target.NodeID) || !identifier.MatchString(entry.Target.Pod) {
 			return fmt.Errorf("invalid learner history")
 		}
 		for _, old := range entries[:i] {
-			if old.SourceClusterID == entry.SourceClusterID && (old.Target.Pod == entry.Target.Pod || old.Target.PodUID == entry.Target.PodUID) {
+			if old.SourceClusterID == entry.SourceClusterID && (old.Target.NodeID == entry.Target.NodeID || old.Target.PodUID == entry.Target.PodUID) {
 				return fmt.Errorf("duplicate learner history")
 			}
 		}
@@ -69,7 +74,7 @@ func includeLearnerHistory(state *autoControl, request *FenceRequest) error {
 		}
 		found := false
 		for _, target := range request.Targets {
-			if target.Pod == entry.Target.Pod {
+			if target.NodeID == entry.Target.NodeID || target.PodUID == entry.Target.PodUID {
 				if target != entry.Target {
 					return fmt.Errorf("learner generation inventory conflicts")
 				}
@@ -114,6 +119,7 @@ func (c *Controller) compactLearnerHistory(ctx context.Context, r *ClusterResour
 			protected[target.Pod] = true
 		}
 		protected[intent.LearnerName] = true
+		protected[learnerPhysicalPod(intent)] = true
 	}
 	retained := make([]learnerIncarnation, 0, len(state.Learners))
 	for _, entry := range state.Learners {
@@ -166,8 +172,12 @@ func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerI
 	if entry.CredentialUID == "" {
 		return false
 	}
+	name := entry.CredentialName
+	if name == "" {
+		name = entry.Target.Pod + "-credentials"
+	}
 	var secret object
-	err := c.Kube.Get(ctx, c.corePath("secrets", entry.Target.Pod+"-credentials"), &secret)
+	err := c.Kube.Get(ctx, c.corePath("secrets", name), &secret)
 	if apiNotFound(err) {
 		return true
 	}
@@ -177,7 +187,7 @@ func (c *Controller) retireLearnerCredential(ctx context.Context, entry learnerI
 	if str(nested(secret, "metadata", "uid")) != entry.CredentialUID {
 		return true
 	}
-	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, entry.Target.Pod+"-credentials", entry.CredentialUID); err != nil {
+	if err := c.Kube.DeleteSecret(ctx, c.Kube.Namespace, name, entry.CredentialUID); err != nil {
 		return apiNotFound(err)
 	}
 	return true
@@ -264,12 +274,14 @@ func worstCaseGenerationTargets(state *autoControl) int {
 func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoControl, sts object, pod object) (learnerIncarnation, error) {
 	i := state.Intent
 	name, uid := str(nested(pod, "metadata", "name")), str(nested(pod, "metadata", "uid"))
-	entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID, Target: capturedFenceIdentity(FenceTarget{NodeID: name, Pod: name, PodUID: uid, WALIdentity: i.LearnerWAL}, pod)}
-	if uid == "" || name != i.LearnerName || (i.LearnerUID != "" && uid != i.LearnerUID) {
+	physical := learnerPhysicalPod(i)
+	entry := learnerIncarnation{SourceClusterID: state.ActiveClusterID, OperationID: i.Request.OperationID, CredentialName: learnerCredentialName(i), CredentialUID: i.LearnerSecretUID,
+		Target: capturedFenceIdentity(FenceTarget{NodeID: i.LearnerName, Pod: physical, PodUID: uid, WALIdentity: i.LearnerWAL}, pod)}
+	if uid == "" || name != physical || i.LearnerName == "" || (i.LearnerUID != "" && uid != i.LearnerUID) {
 		return entry, fmt.Errorf("learner Pod identity differs")
 	}
 	supervised := str(nested(sts, "spec", "template", "metadata", "annotations", fencingProtocolAnnotation)) == "1"
-	if supervised {
+	if supervised && i.LearnerPodName == "" {
 		refs := list(nested(pod, "metadata", "ownerReferences"))
 		if len(refs) != 1 {
 			return entry, fmt.Errorf("learner owner differs")
@@ -286,11 +298,16 @@ func (c *Controller) learnerInventoryEntry(ctx context.Context, state *autoContr
 		}
 	}
 	var credential object
-	if err := c.Kube.Get(ctx, c.corePath("secrets", name+"-credentials"), &credential); err != nil {
+	secretName := learnerCredentialName(i)
+	if err := c.Kube.Get(ctx, c.corePath("secrets", secretName), &credential); err != nil {
 		return entry, err
 	}
-	entry.CredentialUID = str(nested(credential, "metadata", "uid"))
-	if supervised && entry.CredentialUID != str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) {
+	credentialUID := str(nested(credential, "metadata", "uid"))
+	if entry.CredentialUID != "" && credentialUID != entry.CredentialUID {
+		return entry, fmt.Errorf("learner credential UID differs from its canonical assignment")
+	}
+	entry.CredentialUID = credentialUID
+	if supervised && i.LearnerPodName == "" && entry.CredentialUID != str(nested(pod, "metadata", "annotations", fencingCredentialAnnotation)) {
 		return entry, fmt.Errorf("learner credential UID differs")
 	}
 	if entry.CredentialUID == "" {
@@ -308,7 +325,7 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 	}
 	seen := false
 	for _, old := range state.Learners {
-		if old.SourceClusterID != state.ActiveClusterID || old.Target.Pod != i.LearnerName {
+		if old.SourceClusterID != state.ActiveClusterID || old.Target.NodeID != i.LearnerName || old.Target.Pod != learnerPhysicalPod(i) {
 			continue
 		}
 		if seen || old.Target.PodUID != i.LearnerUID || old.Target.WALIdentity != i.LearnerWAL || old.OperationID != i.Request.OperationID {
@@ -320,7 +337,7 @@ func (c *Controller) recoverLearnerInventory(ctx context.Context, r *ClusterReso
 		return false, nil
 	}
 	var pod object
-	if err := c.Kube.Get(ctx, c.corePath("pods", i.LearnerName), &pod); err != nil {
+	if err := c.Kube.Get(ctx, c.corePath("pods", learnerPhysicalPod(i)), &pod); err != nil {
 		if apiNotFound(err) {
 			return false, nil
 		}

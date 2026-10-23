@@ -19,12 +19,21 @@ import (
 // AuthorityMessage is sent only over authenticated TLS. The server authenticates
 // the bound service account token independently of the claimed identity.
 type AuthorityMessage struct {
-	Action         string                       `json:"action"`
-	Identity       Identity                     `json:"identity"`
-	Drain          *DrainReceipt                `json:"drain,omitempty"`
-	Request        *StopRequest                 `json:"request,omitempty"`
-	MutationLookup *MutationLookupRequest       `json:"mutationLookup,omitempty"`
-	ArchiveGenesis *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
+	Action          string                       `json:"action"`
+	Identity        Identity                     `json:"identity"`
+	Drain           *DrainReceipt                `json:"drain,omitempty"`
+	Request         *StopRequest                 `json:"request,omitempty"`
+	MutationLookup  *MutationLookupRequest       `json:"mutationLookup,omitempty"`
+	ArchiveGenesis  *ArchiveGenesisStatusRequest `json:"archiveGenesis,omitempty"`
+	LearnerIdentity *LearnerIdentityRegistration `json:"learnerIdentity,omitempty"`
+}
+
+// LearnerIdentityRegistration is the one create-only voter identity object a
+// pending learner may register. The authority checks the exact key and bytes
+// against its authenticated pending run before performing the conditional write.
+type LearnerIdentityRegistration struct {
+	Key  string `json:"key"`
+	Data []byte `json:"data"`
 }
 
 // MutationLookupRequest asks the authority for one original producer tuple.
@@ -53,6 +62,7 @@ type AuthorityClient struct {
 	// Source mutation endpoints are unavailable before that receipt.
 	boundIdentity Identity
 	producer      *ProducerBinding
+	role          StartupRole
 }
 
 func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, result any) error {
@@ -130,15 +140,50 @@ func (a *AuthorityClient) call(ctx context.Context, message AuthorityMessage, re
 func (a *AuthorityClient) Register(ctx context.Context, id Identity) error {
 	return a.call(ctx, AuthorityMessage{Action: "register", Identity: id}, nil)
 }
+
+func (a *AuthorityClient) RegisterStartup(ctx context.Context, id Identity) (StartupGrant, error) {
+	var grant StartupGrant
+	err := a.call(ctx, AuthorityMessage{Action: "register", Identity: id}, &grant)
+	if err != nil {
+		return StartupGrant{}, err
+	}
+	if err := grant.Validate(id); err != nil {
+		return StartupGrant{}, err
+	}
+	a.role = grant.Role
+	return grant, nil
+}
+
+func (a *AuthorityClient) RegisterLearnerIdentity(ctx context.Context, id Identity, registration LearnerIdentityRegistration) error {
+	return a.call(ctx, AuthorityMessage{Action: "learner-identity", Identity: id, LearnerIdentity: &registration}, nil)
+}
+
+// PromoteLearner asks the authority to activate this already-bound WAL only
+// after it has independently verified the committed membership journal.
+func (a *AuthorityClient) PromoteLearner(ctx context.Context, id Identity) (BindReceipt, error) {
+	var receipt BindReceipt
+	err := a.call(ctx, AuthorityMessage{Action: "promote-learner", Identity: id}, &receipt)
+	return receipt, err
+}
 func (a *AuthorityClient) Bind(ctx context.Context, id Identity) (BindReceipt, error) {
 	a.boundIdentity = Identity{}
 	a.producer = nil
+	if a.role == "" {
+		a.role = StartupRoleVoterActive
+	}
 	var receipt BindReceipt
 	if err := a.call(ctx, AuthorityMessage{Action: "bind", Identity: id}, &receipt); err != nil {
 		return BindReceipt{}, err
 	}
 	if err := receipt.Validate(id); err != nil {
 		return BindReceipt{}, err
+	}
+	receiptRole := receipt.Role
+	if receiptRole == "" {
+		receiptRole = StartupRoleVoterActive
+	}
+	if receiptRole != a.role {
+		return BindReceipt{}, fmt.Errorf("fencing: bind role differs from startup grant")
 	}
 	a.boundIdentity = id
 	a.producer = nil
@@ -194,7 +239,7 @@ func (a *AuthorityClient) LookupMutation(ctx context.Context, id Identity, produ
 }
 
 func (a *AuthorityClient) sourceMutationBinding() (Identity, ProducerBinding, error) {
-	if a == nil || a.producer == nil || a.producer.StageIncarnation == "" || a.producer.ProducerUID == "" || a.producer.Runtime.StatefulSetUID == "" || a.boundIdentity.WALIdentity == "" {
+	if a == nil || (a.role != "" && a.role != StartupRoleVoterActive) || a.producer == nil || a.producer.StageIncarnation == "" || a.producer.ProducerUID == "" || a.producer.Runtime.StatefulSetUID == "" || a.boundIdentity.WALIdentity == "" {
 		return Identity{}, ProducerBinding{}, fmt.Errorf("fencing: source mutation producer is not bound")
 	}
 	return a.boundIdentity, *a.producer, nil

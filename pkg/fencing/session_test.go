@@ -20,6 +20,36 @@ type sessionAuthority struct {
 	stop *StopRequest
 }
 
+type learnerIdentityTestAuthority struct {
+	sessionAuthority
+	registered *LearnerIdentityRegistration
+}
+
+func (a *learnerIdentityTestAuthority) RegisterLearnerIdentity(_ context.Context, _ Identity, registration LearnerIdentityRegistration) error {
+	copy := registration
+	copy.Data = append([]byte(nil), registration.Data...)
+	a.registered = &copy
+	return nil
+}
+
+func TestPendingLearnerIdentityRegistrationIsSingleScopedAuthorityCall(t *testing.T) {
+	id := testIdentity()
+	id.WALIdentity = "wal"
+	authority := &learnerIdentityTestAuthority{}
+	s := &Supervisor{Authority: authority, bound: id, grant: StartupGrant{Identity: id, Role: StartupRoleLearnerPendingRemove}}
+	request := LearnerIdentityRegistration{Key: "source/voters/identity.json", Data: []byte(`{"registered":true}`)}
+	if err := s.registerLearnerIdentity(t.Context(), id, request); err != nil {
+		t.Fatal(err)
+	}
+	if authority.registered == nil || authority.registered.Key != request.Key || string(authority.registered.Data) != string(request.Data) {
+		t.Fatal("identity request did not reach the authority unchanged")
+	}
+	active := &Supervisor{Authority: authority, bound: id, grant: StartupGrant{Identity: id, Role: StartupRoleVoterActive}}
+	if err := active.registerLearnerIdentity(t.Context(), id, request); err == nil {
+		t.Fatal("active voter used pending-learner identity path")
+	}
+}
+
 func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *testing.T) {
 	var unavailable atomic.Bool
 	id := testIdentity()
@@ -31,6 +61,10 @@ func TestSessionTransient503AndConnectionFailureRemainDistinctFromIdentity(t *te
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if unavailable.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if r.URL.Path == "/v1/startup" {
+			_ = json.NewEncoder(w).Encode(StartupGrant{Identity: id, Role: StartupRoleVoterActive})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(id)
@@ -123,7 +157,7 @@ func (a *sessionAuthority) NeverBoundExit(context.Context, StopRequest) error { 
 func TestSupervisorSessionBindsExactRunAndStop(t *testing.T) {
 	id := testIdentity()
 	authority := &sessionAuthority{id: id}
-	s := &Supervisor{Authority: authority, Identity: id, bound: id, ticket: "private-ticket"}
+	s := &Supervisor{Authority: authority, Identity: id, bound: id, grant: StartupGrant{Identity: id, Role: StartupRoleVoterActive}, ticket: "private-ticket"}
 	socket := filepath.Join(t.TempDir(), "control.sock")
 	listener, err := net.Listen("unix", socket)
 	if err != nil {

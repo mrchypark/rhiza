@@ -46,6 +46,69 @@ func TestRuntimeEnrollmentPrecedesRequiredWALBinding(t *testing.T) {
 	}
 }
 
+func TestPendingLearnerCanBindWALButCannotAcquireMutationAuthority(t *testing.T) {
+	id := testIdentity()
+	id.PodName = id.NodeID
+	id.WALIdentity = ""
+	runtime := enrolledRuntime(id, "container")
+	runtime.PodName = id.PodName
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true, RequireMutationJournal: true}
+	if err := l.RegisterEnrolledWithRole(id, runtime, StartupRoleLearnerPendingRemove); err != nil {
+		t.Fatal(err)
+	}
+	bound := id
+	bound.WALIdentity = "wal"
+	if err := l.Bind(bound); err != nil {
+		t.Fatalf("pending learner WAL bind: %v", err)
+	}
+	if err := l.BindMutationProducer(bound, runtime, "producer"); err == nil {
+		t.Fatal("pending learner acquired producer")
+	}
+	if err := l.BindMutationScope(bound, strings.Repeat("a", 64), MutationExecutionProfile); err == nil {
+		t.Fatal("pending learner acquired mutation scope")
+	}
+	run := l.Runs[id.RunID]
+	if run.MutationProducerUID != "" || run.MutationScopeHash != "" || run.Identity.WALIdentity != "wal" || runRole(run) != StartupRoleLearnerPendingRemove {
+		t.Fatalf("learner binding changed unexpected ledger state: %+v", run)
+	}
+}
+
+func TestLearnerPromotionRequiresCanonicalEvidenceAndBoundIdentity(t *testing.T) {
+	id := testIdentity()
+	id.PodName = "physical-ordinal-2"
+	runtime := enrolledRuntime(id, "container")
+	runtime.PodName = id.PodName
+	l := Ledger{SourceClusterID: id.SourceClusterID, RequireRuntimeBinding: true, RequireMutationJournal: true}
+	if err := l.RegisterEnrolledWithRole(id, runtime, StartupRoleLearnerPendingRemove); err != nil {
+		t.Fatal(err)
+	}
+	bound := id
+	bound.WALIdentity = "wal"
+	if err := l.Bind(bound); err != nil {
+		t.Fatal(err)
+	}
+	evidence := strings.Repeat("b", 64)
+	if err := l.PromoteLearner(bound, "remove-add-op", "not-a-digest"); err == nil {
+		t.Fatal("malformed promotion evidence accepted")
+	}
+	if err := l.PromoteLearner(bound, "remove-add-op", evidence); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.PromoteLearner(bound, "remove-add-op", evidence); err != nil {
+		t.Fatalf("exact promotion retry was not idempotent: %v", err)
+	}
+	if err := l.BindMutationProducer(bound, runtime, "producer"); err != nil {
+		t.Fatalf("verified promotion could not bind its reserved producer: %v", err)
+	}
+	if err := l.BindMutationScope(bound, strings.Repeat("a", 64), MutationExecutionProfile); err != nil {
+		t.Fatalf("promoted learner could not bind exact source scope: %v", err)
+	}
+	run := l.Runs[id.RunID]
+	if runRole(run) != StartupRoleVoterActive || run.Promotion == nil || run.Promotion.EvidenceHash != evidence || run.MutationProducerUID != "producer" {
+		t.Fatalf("promotion did not persist the exact authority transition: %+v", run)
+	}
+}
+
 func TestRuntimeEnrollmentRequiresEveryIdentityFieldBeforeMutation(t *testing.T) {
 	id := testIdentity()
 	id.WALIdentity = ""
