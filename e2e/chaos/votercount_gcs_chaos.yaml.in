@@ -71,6 +71,13 @@ spec:
       terminationGracePeriodSeconds: 90
       securityContext: {runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - labelSelector:
@@ -183,6 +190,14 @@ spec:
     metadata: {labels: {app: 'rhiza-operator', chaos.rhiza.io/run: '__RUN_ID__'}}
     spec:
       serviceAccountName: rhiza-operator
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
       securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: operator
@@ -255,14 +270,22 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: rhiza-fencer}
 # Cluster-scoped, name made run-unique so parallel runs never collide.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
-metadata: {name: '__NAMESPACE__-fencer-tokenreview', labels: {chaos.rhiza.io/run: '__RUN_ID__'}}
+metadata:
+  name: '__NAMESPACE__-fencer-tokenreview'
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+  ownerReferences:
+    - {apiVersion: v1, kind: Namespace, name: __NAMESPACE__, uid: __NAMESPACE_UID__, blockOwnerDeletion: false}
 rules:
   - {apiGroups: [authentication.k8s.io], resources: [tokenreviews], verbs: [create]}
   - {apiGroups: [''], resources: [namespaces], resourceNames: [__NAMESPACE__], verbs: [get]}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
-metadata: {name: '__NAMESPACE__-fencer-tokenreview', labels: {chaos.rhiza.io/run: '__RUN_ID__'}}
+metadata:
+  name: '__NAMESPACE__-fencer-tokenreview'
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+  ownerReferences:
+    - {apiVersion: v1, kind: Namespace, name: __NAMESPACE__, uid: __NAMESPACE_UID__, blockOwnerDeletion: false}
 subjects: [{kind: ServiceAccount, name: rhiza-fencer, namespace: __NAMESPACE__}]
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: '__NAMESPACE__-fencer-tokenreview'}
 ---
@@ -283,6 +306,14 @@ spec:
     metadata: {labels: {app: 'rhiza-fencer', chaos.rhiza.io/run: '__RUN_ID__'}}
     spec:
       serviceAccountName: rhiza-fencer
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
       securityContext: {runAsNonRoot: true, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
       containers:
         - name: authority
@@ -318,7 +349,7 @@ spec:
 # which removes node placement as a difference; it does not rule out a
 # node-local, label-specific or Pod-IP-specific rule as another cause of the
 # denial. Both are created just-in-time by the driver and released again: the
-# namespace quota must stay free for the scenarios, and the driver validates the
+      # namespace quota must stay free for the scenarios, and the driver validates the
 # live pair against its own receipts.
 apiVersion: v1
 kind: Pod
@@ -333,6 +364,14 @@ spec:
   hostPID: false
   hostIPC: false
   restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_A__, __NODE_B__, __NODE_C__]
   securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
   containers:
     - name: inspector
@@ -356,6 +395,13 @@ spec:
   hostPID: false
   hostIPC: false
   affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_A__, __NODE_B__, __NODE_C__]
     podAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
         - labelSelector: {matchLabels: {chaos.rhiza.io/run: '__RUN_ID__', app: 'rhiza-inspector'}}

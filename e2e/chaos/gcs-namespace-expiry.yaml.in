@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhiza-namespace-expiry
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: '__NAMESPACE__-namespace-expiry'
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+  ownerReferences:
+    - {apiVersion: v1, kind: Namespace, name: __NAMESPACE__, uid: __NAMESPACE_UID__, blockOwnerDeletion: false}
+rules:
+  - apiGroups: ['']
+    resources: [namespaces]
+    resourceNames: [__NAMESPACE__]
+    verbs: [get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: '__NAMESPACE__-namespace-expiry'
+  labels: {chaos.rhiza.io/run: '__RUN_ID__'}
+  ownerReferences:
+    - {apiVersion: v1, kind: Namespace, name: __NAMESPACE__, uid: __NAMESPACE_UID__, blockOwnerDeletion: false}
+subjects:
+  - kind: ServiceAccount
+    name: rhiza-namespace-expiry
+    namespace: __NAMESPACE__
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: '__NAMESPACE__-namespace-expiry'
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rhiza-namespace-expiry
+  namespace: __NAMESPACE__
+  labels: {chaos.rhiza.io/run: '__RUN_ID__', chaos.rhiza.io/owner: namespace-expiry}
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 10800
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels: {chaos.rhiza.io/run: '__RUN_ID__', chaos.rhiza.io/owner: namespace-expiry}
+    spec:
+      serviceAccountName: rhiza-namespace-expiry
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 5
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchFields:
+                  - key: metadata.name
+                    operator: In
+                    values: [__NODE_A__, __NODE_B__, __NODE_C__]
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: expiry
+          image: __KUBECTL_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - >-
+              set -eu;
+              deadline=__EXPIRY_DEADLINE__;
+              case "$deadline" in ''|*[!0-9]*) exit 1 ;; esac;
+              while :; do
+                now=$(date +%s);
+                [ "$now" -lt "$deadline" ] || break;
+                remaining=$((deadline - now));
+                [ "$remaining" -le 60 ] || remaining=60;
+                sleep "$remaining";
+              done;
+              while :; do
+                uid=$(kubectl get namespace __NAMESPACE__ --ignore-not-found -o jsonpath='{.metadata.uid}') || { sleep 30; continue; };
+                if [ -z "$uid" ]; then exit 0; fi;
+                rv=$(kubectl get namespace __NAMESPACE__ -o jsonpath='{.metadata.resourceVersion}') || { sleep 30; continue; };
+                run=$(kubectl get namespace __NAMESPACE__ -o jsonpath='{.metadata.labels.chaos\.rhiza\.io/run}') || { sleep 30; continue; };
+                test "$uid" = '__NAMESPACE_UID__' && test -n "$rv" && test "$run" = '__RUN_ID__' || exit 1;
+                body=$(printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}' "$uid" "$rv");
+                if printf '%s' "$body" | kubectl delete --raw /api/v1/namespaces/__NAMESPACE__ -f - >/dev/null; then exit 0; fi;
+                sleep 30;
+              done
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi, ephemeral-storage: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi, ephemeral-storage: 64Mi}

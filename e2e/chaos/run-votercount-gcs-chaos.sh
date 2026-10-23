@@ -57,6 +57,20 @@ esac
 : "${RHIZA_KERNEL_RELEASE:?qualified kernel release for every eligible node}"
 : "${RHIZA_APP_IMAGE:?digest-pinned application image}"
 : "${RHIZA_OPERATOR_IMAGE:?digest-pinned operator image}"
+: "${RHIZA_KUBECTL_IMAGE:?digest-pinned kubectl image with /bin/sh and kubectl}"
+: "${RHIZA_NODE_A:?first captured existing node}"
+: "${RHIZA_NODE_B:?second captured existing node}"
+: "${RHIZA_NODE_C:?third captured existing node}"
+for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
+  printf '%s\n' "$node" | LC_ALL=C grep -Eq '^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$' || {
+    echo 'existing node name rejected' >&2
+    exit 2
+  }
+done
+[ "$RHIZA_NODE_A" != "$RHIZA_NODE_B" ] && [ "$RHIZA_NODE_A" != "$RHIZA_NODE_C" ] && [ "$RHIZA_NODE_B" != "$RHIZA_NODE_C" ] || {
+  echo 'three distinct existing nodes are required' >&2
+  exit 2
+}
 initial_head_ack_loss=${RHIZA_GCS_INITIAL_HEAD_ACK_LOSS:-no}
 case "$initial_head_ack_loss" in
   no|yes) ;;
@@ -76,6 +90,7 @@ require_digest() {
 }
 require_digest RHIZA_APP_IMAGE "$RHIZA_APP_IMAGE"
 require_digest RHIZA_OPERATOR_IMAGE "$RHIZA_OPERATOR_IMAGE"
+require_digest RHIZA_KUBECTL_IMAGE "$RHIZA_KUBECTL_IMAGE"
 if [ -n "$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256" ]; then
   case "$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256" in
     *[!0-9a-f]*) echo 'qualified sandbox executable approval must be lowercase SHA-256 hex' >&2; exit 2 ;;
@@ -187,6 +202,105 @@ mkdir -p "$out"
 admin_token_file=$out/admin-token
 tls_tmp=
 remove_admin_token=false
+scope_uid_file=$out/gcs-namespace-uid
+scope_nodes_file=$out/gcs-existing-nodes
+cleanup_namespace=false
+
+capture_run_scope() {
+  namespace_json=$out/gcs-namespace-current.json
+  kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" -o json > "$namespace_json" || {
+    echo 'run namespace identity could not be read' >&2
+    return 1
+  }
+  namespace_uid=$(jq -er --arg ns "$RHIZA_NAMESPACE" --arg run "$RHIZA_RUN_ID" '
+    select(.metadata.name==$ns and .metadata.labels["chaos.rhiza.io/run"]==$run) |
+    .metadata.uid | select(type=="string" and length>0)
+  ' "$namespace_json") || {
+    echo 'namespace is not labeled as this run or has no UID' >&2
+    return 1
+  }
+  printf '%s\n' "$namespace_uid" | LC_ALL=C grep -Eq '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$' || {
+    echo 'namespace UID format rejected' >&2
+    return 1
+  }
+  if [ "$mode" = install ]; then
+    [ ! -e "$scope_uid_file" ] && [ ! -L "$scope_uid_file" ] &&
+      [ ! -e "$scope_nodes_file" ] && [ ! -L "$scope_nodes_file" ] || {
+        echo 'captured run-scope receipt already exists; refusing reuse' >&2
+        return 1
+      }
+    for node in "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C"; do
+      node_json=$out/node-$node.json
+      kubectl --context "$RHIZA_KUBE_CONTEXT" get node "$node" -o json > "$node_json" || {
+        echo 'a captured existing node could not be read' >&2
+        return 1
+      }
+      jq -e --arg node "$node" '
+        .metadata.name==$node and any(.status.conditions[]?; .type=="Ready" and .status=="True")
+      ' "$node_json" >/dev/null || {
+        echo 'a captured existing node is not Ready' >&2
+        return 1
+      }
+    done
+    printf '%s\n' "$namespace_uid" > "$scope_uid_file"
+    printf '%s\n%s\n%s\n' "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C" > "$scope_nodes_file"
+    chmod 600 "$scope_uid_file" "$scope_nodes_file"
+  else
+    [ -f "$scope_uid_file" ] && [ ! -L "$scope_uid_file" ] &&
+      [ "$(cat "$scope_uid_file")" = "$namespace_uid" ] &&
+      [ -f "$scope_nodes_file" ] && [ ! -L "$scope_nodes_file" ] || {
+        echo 'run namespace or captured node identity changed since install' >&2
+        return 1
+      }
+    expected_nodes=$(printf '%s\n%s\n%s' "$RHIZA_NODE_A" "$RHIZA_NODE_B" "$RHIZA_NODE_C")
+    [ "$(cat "$scope_nodes_file")" = "$expected_nodes" ] || {
+      echo 'run node selection differs from the installed namespace profile' >&2
+      return 1
+    }
+  fi
+}
+
+cleanup_owned_namespace() {
+  [ -f "$scope_uid_file" ] && [ ! -L "$scope_uid_file" ] || return 1
+  expected_uid=$(cat "$scope_uid_file") || return 1
+  current=$out/namespace-cleanup-current.json
+  kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" --ignore-not-found -o json > "$current" 2>/dev/null || return 1
+  if [ ! -s "$current" ]; then
+    printf '%s\n' 'namespace-absence-observed; cluster-rbac-owner-gc-not-verified' > "$out/namespace-cleanup.status"
+    return 0
+  fi
+  jq -e --arg ns "$RHIZA_NAMESPACE" --arg run "$RHIZA_RUN_ID" --arg uid "$expected_uid" '
+    .metadata.name==$ns and .metadata.uid==$uid and .metadata.labels["chaos.rhiza.io/run"]==$run
+  ' "$current" >/dev/null || return 1
+  options=$out/namespace-delete-options.json
+  current_uid=$(jq -er '.metadata.uid' "$current") || return 1
+  current_rv=$(jq -er '.metadata.resourceVersion' "$current") || return 1
+  [ "$current_uid" = "$expected_uid" ] || return 1
+  printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}\n' \
+    "$expected_uid" "$current_rv" > "$options" || return 1
+  kubectl --context "$RHIZA_KUBE_CONTEXT" delete --raw "/api/v1/namespaces/$RHIZA_NAMESPACE" \
+    -f "$options" >/dev/null 2>&1 || {
+      jq -e '(.metadata.deletionTimestamp|type)=="string"' "$current" >/dev/null 2>&1 || return 1
+    }
+  attempts=0
+  while [ "$attempts" -lt 120 ]; do
+    observed=$out/namespace-cleanup-observed.txt
+    if kubectl --context "$RHIZA_KUBE_CONTEXT" get namespace "$RHIZA_NAMESPACE" \
+      --ignore-not-found -o name > "$observed" 2>/dev/null; then
+      if [ ! -s "$observed" ]; then
+        printf '%s\n' 'namespace-absence-observed; cluster-rbac-owner-gc-not-verified' > "$out/namespace-cleanup.status"
+        return 0
+      fi
+    else
+      return 1
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  printf '%s\n' 'delete-requested-absence-not-yet-observed' > "$out/namespace-cleanup.status"
+  return 1
+}
+
 cleanup() {
   exit_status=$?
   initial_state=$out/gcs-initial-head-install-state.json
@@ -218,6 +332,15 @@ cleanup() {
       [ "$exit_status" -ne 0 ] || exit_status=1
     fi
   fi
+  if [ "$cleanup_namespace" = true ] && { [ "$mode" = run ] || [ "$exit_status" -ne 0 ]; }; then
+    if cleanup_owned_namespace; then
+      :
+    else
+      printf '%s\n' 'local-delete-unavailable-or-not-observed; run-owned expiry Job remains pending until its 7200s deadline' > "$out/namespace-cleanup.status"
+      echo 'namespace cleanup was not verified locally; the in-cluster expiry Job remains pending until its deadline' >&2
+      [ "$exit_status" -ne 0 ] || exit_status=1
+    fi
+  fi
   rm -f "$out/.admin-token.tmp"
   if [ "$remove_admin_token" = true ]; then rm -f "$admin_token_file"; fi
   if [ -n "$tls_tmp" ]; then
@@ -229,9 +352,22 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
+# GNU timeout is also used by the repository's GCS post-release launcher. The
+# trap is best-effort: SIGKILL, host loss, or an unavailable API can skip cleanup.
+if [ "${RHIZA_GCS_DEADLINE_WRAPPED:-no}" != yes ]; then
+  command -v timeout >/dev/null 2>&1 || { echo 'GNU timeout is required for bounded host execution' >&2; exit 2; }
+  case "$mode" in install) host_limit=2100 ;; run) host_limit=3600 ;; esac
+  export RHIZA_GCS_DEADLINE_WRAPPED=yes
+  exec timeout --signal=TERM --kill-after=10m "${host_limit}s" /bin/sh "$0" "$mode"
+fi
+
 render() {
   sed -e "s|__NAMESPACE__|$RHIZA_NAMESPACE|g" \
+      -e "s|__NAMESPACE_UID__|$namespace_uid|g" \
       -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
+      -e "s|__NODE_A__|$RHIZA_NODE_A|g" \
+      -e "s|__NODE_B__|$RHIZA_NODE_B|g" \
+      -e "s|__NODE_C__|$RHIZA_NODE_C|g" \
       -e "s|__CLUSTER_ID__|$RHIZA_CLUSTER_ID|g" \
       -e "s|__GCS_BUCKET__|$RHIZA_GCS_BUCKET|g" \
       -e "s|__WORKLOAD_PREFIX__|$workload_prefix|g" \
@@ -280,6 +416,9 @@ render_iam_probe() {
       -e "s|__PROBE_MODE__|$probe_mode|g" \
       -e "s|__NAMESPACE__|$RHIZA_NAMESPACE|g" \
       -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
+      -e "s|__NODE_A__|$RHIZA_NODE_A|g" \
+      -e "s|__NODE_B__|$RHIZA_NODE_B|g" \
+      -e "s|__NODE_C__|$RHIZA_NODE_C|g" \
       -e "s|__APP_IMAGE__|$RHIZA_APP_IMAGE|g" \
       -e "s|__GCS_BUCKET__|$RHIZA_GCS_BUCKET|g" \
       -e "s|__GCS_PREFIX__|$RHIZA_GCS_PREFIX|g" \
@@ -291,9 +430,53 @@ render_iam_probe() {
   ! grep -Eq '__[A-Z0-9_]+__' "$out/$pod.yaml"
 }
 
+render_expiry_job() {
+  expiry_now=$(date +%s) || return 1
+  printf '%s\n' "$expiry_now" | LC_ALL=C grep -Eq '^[0-9]+$' || {
+    echo 'expiry epoch could not be validated' >&2
+    return 1
+  }
+  expiry_deadline=$((expiry_now + 7200))
+  sed -e "s|__NAMESPACE__|$RHIZA_NAMESPACE|g" \
+      -e "s|__NAMESPACE_UID__|$namespace_uid|g" \
+      -e "s|__RUN_ID__|$RHIZA_RUN_ID|g" \
+      -e "s|__EXPIRY_DEADLINE__|$expiry_deadline|g" \
+      -e "s|__NODE_A__|$RHIZA_NODE_A|g" \
+      -e "s|__NODE_B__|$RHIZA_NODE_B|g" \
+      -e "s|__NODE_C__|$RHIZA_NODE_C|g" \
+      -e "s|__KUBECTL_IMAGE__|$RHIZA_KUBECTL_IMAGE|g" \
+      "$here/gcs-namespace-expiry.yaml.in" > "$out/namespace-expiry.yaml"
+  ! grep -Eq '__[A-Z0-9_]+__' "$out/namespace-expiry.yaml"
+}
+
+require_fresh_expiry_resources() {
+  for object in "clusterrole/$RHIZA_NAMESPACE-namespace-expiry" \
+    "clusterrolebinding/$RHIZA_NAMESPACE-namespace-expiry" \
+    "serviceaccount/rhiza-namespace-expiry" "job/rhiza-namespace-expiry"; do
+    resource=${object%%/*}
+    name=${object#*/}
+    if [ "$resource" = clusterrole ] || [ "$resource" = clusterrolebinding ]; then
+      existing=$(kubectl --context "$RHIZA_KUBE_CONTEXT" get "$resource" "$name" --ignore-not-found -o name) || {
+        echo 'could not verify expiry resource absence' >&2
+        return 1
+      }
+    else
+      existing=$(kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" get "$resource" "$name" --ignore-not-found -o name) || {
+        echo 'could not verify expiry resource absence' >&2
+        return 1
+      }
+    fi
+    [ -z "$existing" ] || {
+      echo 'expiry resource already exists; refusing adoption' >&2
+      return 1
+    }
+  done
+}
+
 verified_probe_pod_uid() {
   object=$1; pod=$2
   jq -er --arg pod "$pod" --arg ns "$RHIZA_NAMESPACE" --arg run "$RHIZA_RUN_ID" \
+    --arg node_a "$RHIZA_NODE_A" --arg node_b "$RHIZA_NODE_B" --arg node_c "$RHIZA_NODE_C" \
     --arg ksa "$probe_ksa" --arg image "$RHIZA_APP_IMAGE" --arg mode "$probe_mode" \
     --arg bucket "$RHIZA_GCS_BUCKET" --arg prefix "$RHIZA_GCS_PREFIX" \
     --arg nonce "$probe_nonce" --arg manifest "$probe_manifest_generation" \
@@ -307,6 +490,8 @@ verified_probe_pod_uid() {
       .spec.restartPolicy=="Never" and
       ((.spec.hostNetwork // false)==false) and ((.spec.hostPID // false)==false) and
       ((.spec.hostIPC // false)==false) and ((.spec.shareProcessNamespace // false)==false) and
+      .spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms==[
+        {matchFields:[{key:"metadata.name",operator:"In",values:[$node_a,$node_b,$node_c]}]}] and
       ((.spec.ephemeralContainers // [])|length)==0 and
       .spec.securityContext.runAsNonRoot==true and .spec.securityContext.runAsUser==65532 and
       .spec.securityContext.seccompProfile.type=="RuntimeDefault" and
@@ -558,12 +743,57 @@ render_runtime_agent() {
       -e "s|rhiza-runtime-agent-ca|$RHIZA_RUNTIME_AGENT_CA_SECRET|g" \
       -e "s|rhiza-runtime-agent-tls|$RHIZA_RUNTIME_AGENT_TLS_SECRET|g" \
       > "$out/runtime-agent.yaml"
+  runtime_agent_pinned=$out/runtime-agent-pinned.yaml
+  awk -v a="$RHIZA_NODE_A" -v b="$RHIZA_NODE_B" -v c="$RHIZA_NODE_C" '
+    $0 == "      serviceAccountName: rhiza-runtime-agent" {
+      print
+      print "      affinity:"
+      print "        nodeAffinity:"
+      print "          requiredDuringSchedulingIgnoredDuringExecution:"
+      print "            nodeSelectorTerms:"
+      print "              - matchFields:"
+      print "                  - key: metadata.name"
+      print "                    operator: In"
+      print "                    values: [" a ", " b ", " c "]"
+      inserted++
+      next
+    }
+    { print }
+    END { if (inserted != 1) exit 1 }
+  ' "$out/runtime-agent.yaml" > "$runtime_agent_pinned" || {
+    echo 'runtime-agent node-affinity insertion was not unique' >&2
+    return 1
+  }
+  runtime_agent_owned=$out/runtime-agent-owned.yaml
+  awk -v ns="$RHIZA_NAMESPACE" -v uid="$namespace_uid" '
+    /^kind:/ { cluster=($0=="kind: ClusterRole" || $0=="kind: ClusterRoleBinding"); print; next }
+    cluster && $0=="metadata:" {
+      print
+      print "  ownerReferences:"
+      print "    - apiVersion: v1"
+      print "      kind: Namespace"
+      print "      name: " ns
+      print "      uid: " uid
+      print "      blockOwnerDeletion: false"
+      owners++
+      cluster=0
+      next
+    }
+    { print }
+    END { if (owners != 2) exit 1 }
+  ' "$runtime_agent_pinned" > "$runtime_agent_owned" || {
+    echo 'runtime-agent cluster-object ownership binding was not exact' >&2
+    return 1
+  }
+  mv "$runtime_agent_owned" "$out/runtime-agent.yaml"
   grep -q '^kind: DaemonSet$' "$out/runtime-agent.yaml" &&
     grep -q "^  authority-deployment-uid: $deployment_uid$" "$out/runtime-agent.yaml" &&
     grep -Fqx "  sandbox-executable-sha256: \"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"" "$out/runtime-agent.yaml" &&
     grep -Fqx "        rhiza.dev/sandbox-executable-sha256: \"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"" "$out/runtime-agent.yaml" &&
     grep -Fqx "  sandbox-args-json: '[\"/pause\"]'" "$out/runtime-agent.yaml" &&
-    ! grep -Eq 'QUALIFIED_|PINNED_|PLACEHOLDER' "$out/runtime-agent.yaml"
+    ! grep -Eq 'QUALIFIED_|PINNED_|PLACEHOLDER' "$out/runtime-agent.yaml" &&
+    grep -Fq "values: [$RHIZA_NODE_A, $RHIZA_NODE_B, $RHIZA_NODE_C]" "$out/runtime-agent.yaml" &&
+    grep -Fq "uid: $namespace_uid" "$out/runtime-agent.yaml"
 }
 
 render_passive_kernel_patch() {
@@ -622,6 +852,8 @@ step() {
 
 if [ "$mode" = install ]; then
   verify_bootstrap_receipt || exit 2
+  capture_run_scope || exit 2
+  cleanup_namespace=true
   probe_nonce=$(openssl rand -hex 16 2>/dev/null) || {
     echo 'cryptographic preflight nonce generation failed' >&2
     exit 2
@@ -654,6 +886,8 @@ if [ "$mode" = install ]; then
     exit 2
   }
   render
+  render_expiry_job
+  require_fresh_expiry_resources || exit 2
   root=$(CDPATH='' cd -- "$here/../.." && pwd)
   step 00-crds kubectl --context "$RHIZA_KUBE_CONTEXT" apply \
     -f "$root/deploy/operator/crd.yaml" \
@@ -664,6 +898,43 @@ if [ "$mode" = install ]; then
     crd/rhizaclusters.rhiza.mrchypark.dev \
     crd/rhizafences.rhiza.mrchypark.dev --timeout=120s
   provision_tls
+  step 10-expiry kubectl --context "$RHIZA_KUBE_CONTEXT" apply -f "$out/namespace-expiry.yaml"
+  step 10-expiry-ready kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" wait \
+    --for=condition=Ready pod -l chaos.rhiza.io/owner=namespace-expiry --timeout=180s
+  expiry_pods=$out/namespace-expiry-pods.json
+  kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" get pods \
+    -l chaos.rhiza.io/owner=namespace-expiry -o json > "$expiry_pods"
+  jq -e --arg ns "$RHIZA_NAMESPACE" --arg run "$RHIZA_RUN_ID" \
+    --arg a "$RHIZA_NODE_A" --arg b "$RHIZA_NODE_B" --arg c "$RHIZA_NODE_C" \
+    --arg image "$RHIZA_KUBECTL_IMAGE" '
+      (.items|length)==1 and .items[0].metadata.namespace==$ns and
+      .items[0].metadata.labels["chaos.rhiza.io/run"]==$run and
+      (.items[0].spec.nodeName as $node | ([$a,$b,$c]|index($node))!=null) and
+      .items[0].spec.containers[0].image==$image and
+      .items[0].status.phase=="Running"
+    ' "$expiry_pods" >/dev/null || {
+    echo 'namespace expiry Pod did not start on a captured node with the pinned kubectl image' >&2
+    exit 1
+  }
+  expiry_pod_name=$(jq -er '.items[0].metadata.name' "$expiry_pods") || exit 1
+  kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" exec "$expiry_pod_name" -- \
+    /bin/sh -c 'command -v kubectl >/dev/null && command -v date >/dev/null && command -v sleep >/dev/null' || {
+      echo 'namespace expiry image must provide kubectl, date, sleep, and /bin/sh' >&2
+      exit 1
+    }
+  expiry_job_json=$out/namespace-expiry-live.json
+  kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" get job rhiza-namespace-expiry -o json > "$expiry_job_json"
+  jq -e --arg ns "$RHIZA_NAMESPACE" --arg run "$RHIZA_RUN_ID" '
+    .metadata.name=="rhiza-namespace-expiry" and .metadata.namespace==$ns and
+    .metadata.labels["chaos.rhiza.io/run"]==$run and
+    .spec.activeDeadlineSeconds==10800 and .spec.template.spec.restartPolicy=="Never" and
+    .spec.template.spec.serviceAccountName=="rhiza-namespace-expiry"
+  ' "$expiry_job_json" >/dev/null || {
+    echo 'run-owned namespace expiry Job identity or bounded deadline rejected' >&2
+    exit 1
+  }
+  printf '%s\n' 'created; namespace UID and run label checked before delete; deadline 7200s' > "$out/namespace-cleanup.status"
+  chmod 600 "$out/namespace-cleanup.status"
   step 10-apply kubectl --context "$RHIZA_KUBE_CONTEXT" apply -f "$out/manifests.yaml"
   step 20-fencer kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" rollout status \
     deployment/rhiza-fencer --timeout=180s
@@ -738,12 +1009,14 @@ fi
   exit 2
 }
 verify_bootstrap_receipt || exit 2
+capture_run_scope || exit 2
 [ -f "$out/gcs-iam-preflight.ok" ] && [ ! -L "$out/gcs-iam-preflight.ok" ] &&
   [ "$(cat "$out/gcs-iam-preflight.ok")" = "$RHIZA_RUN_ID $receipt_sha" ] || {
     echo 'matching successful independent GCS IAM preflight receipt is required' >&2
     exit 2
   }
 remove_admin_token=true
+cleanup_namespace=true
 if [ "$initial_head_ack_loss" = yes ]; then
   : "${FENCING_E2E_BIN:?initial HEAD qualification requires the source-matched fencing-e2e driver}"
   [ -x "$FENCING_E2E_BIN" ] || { echo 'FENCING_E2E_BIN is not executable' >&2; exit 2; }
