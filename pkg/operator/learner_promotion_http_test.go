@@ -50,6 +50,7 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 		object{"name": "http", "containerPort": float64(8080)},
 		object{"name": "peer-quic", "containerPort": float64(9090), "protocol": "UDP"},
 	}
+	asObject(containers[0])["image"] = "registry.example/rhiza:fixture"
 	if f.api.authStatefulSet != nil {
 		f.api.authStatefulSet = supervisedSTS
 	}
@@ -130,8 +131,14 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 		t.Fatal("same-ordinal source Pod fixture is missing")
 	}
 	asObject(replacement["metadata"])["uid"] = replacementUID
+	replacementContainer := asObject(list(nested(replacement, "spec", "containers"))[0])
+	replacementContainer["image"] = "registry.example/rhiza:fixture"
 	status := asObject(list(nested(replacement, "status", "containerStatuses"))[0])
-	status["containerID"], status["imageID"] = "containerd://0123456789abcdef0123456789abcdef", "registry.example/rhiza@sha256:"+strings.Repeat("b", 64)
+	containerID := "containerd://0123456789abcdef0123456789abcdef"
+	imageID := "registry.example/rhiza@sha256:" + strings.Repeat("b", 64)
+	status["name"], status["containerID"], status["image"], status["imageID"] = "rhiza", containerID, replacementContainer["image"], imageID
+	status["ready"], status["restartCount"] = true, float64(0)
+	status["state"] = object{"running": object{"startedAt": "2026-10-23T17:00:00Z"}}
 	f.api.objects[f.e.controller().corePath("pods", physicalPod)] = replacement
 	f.api.authPod, f.api.authPodName, f.api.authPodUID = replacement, physicalPod, replacementUID
 	f.api.mu.Unlock()
@@ -234,6 +241,11 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	client := fencing.AuthorityClient{URL: authorityServer.URL + "/v1/supervisor", TokenFile: tokenFile, Client: authorityServer.Client()}
 	physicalID := fencing.Identity{SourceClusterID: f.runtime.SourceClusterID, NodeID: intent.LearnerName, PodName: physicalPod,
 		PodUID: replacementUID, RunID: "promotion-run", AssignmentID: intent.LearnerAssignmentID}
+	replacementNodeName := str(nested(replacement, "spec", "nodeName"))
+	enrollment, err := f.e.RuntimeAgent.enrollmentBase(ctx, "test", f.runtime.StatefulSetUID, physicalID)
+	if err != nil || replacementNodeName == "" || enrollment.PodName != physicalPod || enrollment.PodUID != replacementUID || enrollment.NodeName != replacementNodeName || enrollment.ContainerID != containerID || enrollment.ImageID != imageID {
+		t.Fatalf("replacement Pod does not expose the complete live enrollment identity: binding=%+v err=%v", enrollment, err)
+	}
 	canonicalChildSpec, canonicalSpecHash, canonicalAssignment := child.Spec, intent.SpecHash, intent.LearnerAssignmentID
 	canonicalMembershipFenceEvidence := child.Spec.Membership.Fence.Evidence
 	child.Spec.Membership.Fence.Evidence = strings.Repeat("e", 64)
