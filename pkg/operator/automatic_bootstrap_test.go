@@ -41,15 +41,27 @@ const (
 func newAutomaticBootstrapGenesisFixture(t *testing.T) automaticBootstrapGenesisFixture {
 	t.Helper()
 	e, api, _, baseRuntime := newMutationStoreFixture(t)
+	// newMutationStoreFixture initializes a cooperative-only root. The
+	// bootstrap fixture must instead start with an independently configured
+	// CONTROL store, because production deliberately refuses to upgrade an
+	// existing cooperative root in place.
+	controlBucket := objstore.NewInMemBucket()
+	t.Cleanup(func() { _ = controlBucket.Close() })
+	controlState, err := NewAuthorityStateStore(controlBucket, "test-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.AuthorityState = controlState
+	api.authorityBucket = controlBucket
 	e.MutationProfile = fencing.MutationHeldExecutionProfile
 	e.RequireMutationJournal = true
 	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
 	f := heldProfileFixture{e: e, api: api, scope: scope}
-	cohort := configureAutomaticBootstrapCohort(t, &f, baseRuntime, 3)
-	f.id, f.runtime = fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "bootstrap-pod-0", RunID: "bootstrap-run-0", WALIdentity: "bootstrap-wal-0"}, cohort[0]
-	if err := e.initializeRoot(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID); err != nil {
+	if err := e.initializeRoot(t.Context(), baseRuntime.StatefulSetUID, baseRuntime.SourceClusterID); err != nil {
 		t.Fatal(err)
 	}
+	cohort := configureAutomaticBootstrapCohort(t, &f, baseRuntime, 3)
+	f.id, f.runtime = fencing.Identity{SourceClusterID: "source", NodeID: "rhiza-0", PodUID: "bootstrap-pod-0", RunID: "bootstrap-run-0", WALIdentity: "bootstrap-wal-0"}, cohort[0]
 	if _, err := e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
 		ledger.RequireRuntimeBinding = true
 		ledger.RequireMutationJournal = true
@@ -91,12 +103,6 @@ func newAutomaticBootstrapGenesisFixture(t *testing.T) automaticBootstrapGenesis
 	archive := objstore.NewInMemBucket()
 	t.Cleanup(func() { _ = archive.Close() })
 	e.ArchiveBucket = frozenSourceEmptyTestBucket{Bucket: archive}
-	if _, err := f.e.change(t.Context(), f.runtime.StatefulSetUID, f.runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
-		ledger.ArchiveGenesisState = fencing.ArchiveGenesisRegistrationPending
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
 	if err := f.e.claimArchiveScopeForRegistration(t.Context(), f.runtime.StatefulSetUID, f.id, f.runtime); err != nil {
 		t.Fatal(err)
 	}
