@@ -163,6 +163,25 @@ and pins its authority to the installed fencer Deployment UID; runtime
 enrollment must still measure and verify the actual nodes. Missing or placeholder
 inputs fail closed.
 
+For the native `run-gcs-ha-dead-pod` passive terminal-proof scenario, set
+`RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL=yes` and
+`RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256` during `install`. The digest must be
+independently approved; the launcher rejects the privilege opt-in without it.
+The base DaemonSet always drops all capabilities. The explicit test-namespace
+overlay adds only `SYS_PTRACE`, keeps privilege escalation and privileged mode
+disabled, and pins `passive-kernel-v1` in the Pod template. The installed profile
+binds the digest and exact fixed argv `["/pause"]`; the dead-Pod collector checks
+those values, the opt-in annotation, exact capabilities, host-PID mode, observed
+rollout, and Ready source-node agents before creating PodChaos. A digest alone
+does not grant the capability. Leaving the flag unset preserves the ordinary
+capless profile and fails the passive dead-Pod preflight before fault injection.
+
+The GCS installer is fresh-namespace-only for this profile: immediately before
+applying the runtime-agent DaemonSet, it requires the named DaemonSet to be
+absent. If lookup fails or any DaemonSet already exists, installation stops;
+it never adopts or reapplies an existing object whose capability fields may
+include an unmanaged `SYS_PTRACE` entry.
+
 Before applying the `RhizaCluster`, `install` runs a create-only GCS identity
 preflight with the control-plane KSA and the actual workload KSA. It confirms the
 workload's metadata-server GSA, a successful read of a writer-created data

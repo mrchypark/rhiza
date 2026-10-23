@@ -50,6 +50,22 @@ fi
 
 test -n "${FENCING_E2E_BIN:-}" || { echo 'FENCING_E2E_BIN is required' >&2; exit 2; }
 test -x "$FENCING_E2E_BIN"
+fencing_passive_kernel=${RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL:-no}
+fencing_sandbox_executable_sha256=${RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256:-}
+case "$fencing_passive_kernel" in
+  no) ;;
+  yes)
+    [ -n "$fencing_sandbox_executable_sha256" ] || {
+      echo 'passive kernel proof requires an independently approved sandbox executable digest' >&2
+      exit 2
+    }
+    ;;
+  *) echo 'RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL must be yes or no' >&2; exit 2 ;;
+esac
+if [ -n "$fencing_sandbox_executable_sha256" ]; then
+  case "$fencing_sandbox_executable_sha256" in *[!0-9a-f]*) echo 'sandbox executable approval must be lowercase SHA-256 hex' >&2; exit 2 ;; esac
+  [ "${#fencing_sandbox_executable_sha256}" -eq 64 ] || { echo 'sandbox executable approval must be 64 lowercase hex characters' >&2; exit 2; }
+fi
 fencing_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$fencing_root"
 fencing_cluster=rhiza-generic-fencing
@@ -214,7 +230,12 @@ fencing_cgroup_fs=$(docker exec "$fencing_node" stat -fc %T /sys/fs/cgroup)
 case "$fencing_runtime_name:$fencing_runtime_api:$fencing_cgroup_fs" in containerd:v1:cgroup2fs) ;; *) echo 'runtime probe requires containerd CRI v1 on cgroup v2' >&2; exit 1 ;; esac
 profile_field_valid "$fencing_runtime_version" && profile_field_valid "$fencing_runtime_type" && profile_field_valid "$fencing_kernel" || { echo 'unsafe or missing runtime profile value' >&2; exit 1; }
 fencing_profile_id=kind-ci-cgroup-v2-component-v1
-jq -cn --arg kindNodeImage "$fencing_node_image" --arg runtimeName "$fencing_runtime_name" --arg runtimeVersion "$fencing_runtime_version" --arg runtimeAPIVersion "$fencing_runtime_api" --arg runtimeType "$fencing_runtime_type" --arg kernelRelease "$fencing_kernel" --arg cgroupFilesystem "$fencing_cgroup_fs" --arg cgroupProfileID "$fencing_profile_id" '{qualification:"runtime-agent-component-only",kindNodeImage:$kindNodeImage,runtimeName:$runtimeName,runtimeVersion:$runtimeVersion,runtimeAPIVersion:$runtimeAPIVersion,runtimeType:$runtimeType,kernelRelease:$kernelRelease,cgroupFilesystem:$cgroupFilesystem,cgroupProfileID:$cgroupProfileID}' >"$FENCING_E2E_OUT/runtime-profile.json"
+fencing_sandbox_args_json='["/pause"]'
+printf '%s' "$fencing_sandbox_args_json" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0 and (contains("\u0000") | not))' >/dev/null || {
+  echo 'sandbox argv must be a non-empty JSON string array without NUL arguments' >&2
+  exit 1
+}
+jq -cn --arg kindNodeImage "$fencing_node_image" --arg runtimeName "$fencing_runtime_name" --arg runtimeVersion "$fencing_runtime_version" --arg runtimeAPIVersion "$fencing_runtime_api" --arg runtimeType "$fencing_runtime_type" --arg kernelRelease "$fencing_kernel" --arg cgroupFilesystem "$fencing_cgroup_fs" --arg cgroupProfileID "$fencing_profile_id" --argjson passiveSandboxProfileConfigured "$([ -n "$fencing_sandbox_executable_sha256" ] && printf true || printf false)" '{qualification:"runtime-agent-component-only",kindNodeImage:$kindNodeImage,runtimeName:$runtimeName,runtimeVersion:$runtimeVersion,runtimeAPIVersion:$runtimeAPIVersion,runtimeType:$runtimeType,kernelRelease:$kernelRelease,cgroupFilesystem:$cgroupFilesystem,cgroupProfileID:$cgroupProfileID,passiveSandboxProfileConfigured:$passiveSandboxProfileConfigured}' >"$FENCING_E2E_OUT/runtime-profile.json"
 kind load docker-image rhiza-fencing-host:local rhiza-fencing-operator:local --name "$fencing_cluster"
 kubectl --context "$fencing_context" create namespace "$fencing_namespace"
 for fencing_crd in crd cluster-crd fence-crd; do k apply -f "deploy/operator/$fencing_crd.yaml"; done
@@ -232,11 +253,17 @@ sed -e "s/namespace: rhiza$/namespace: $fencing_namespace/" \
   -e 's/image: rhiza-operator:latest$/image: rhiza-fencing-operator:local/' \
   -e "s/QUALIFIED_CONTAINERD_VERSION/$fencing_runtime_version/" -e "s/QUALIFIED_CONTAINERD_RUNTIME_TYPE/$fencing_runtime_type/" -e "s/QUALIFIED_PRIVATE_CGROUP_V2_PROFILE_ID/$fencing_profile_id/" \
   -e "s/QUALIFIED_LINUX_KERNEL_RELEASE/$fencing_kernel/" -e 's/PINNED_RHIZA_FENCER_DEPLOYMENT_UID/pending-authority-uid/' \
+  -e "s/QUALIFIED_SANDBOX_EXECUTABLE_SHA256/$fencing_sandbox_executable_sha256/g" \
   deploy/operator/fencing/authority.yaml >"$fencing_tmp/authority.yaml"
 k apply -f "$fencing_tmp/authority.yaml"
 fencing_authority_uid=$(k get deployment rhiza-fencer -o jsonpath='{.metadata.uid}')
 test -n "$fencing_authority_uid"
-k patch configmap rhiza-runtime-agent-profile --type=merge -p "$(jq -cn --arg uid "$fencing_authority_uid" '{data:{"authority-deployment-uid":$uid}}')"
+k patch configmap rhiza-runtime-agent-profile --type=merge -p "$(jq -cn --arg uid "$fencing_authority_uid" --arg sandboxExecutableSHA256 "$fencing_sandbox_executable_sha256" --arg sandboxArgsJSON "$fencing_sandbox_args_json" '{data:{"authority-deployment-uid":$uid,"sandbox-executable-sha256":$sandboxExecutableSHA256,"sandbox-args-json":$sandboxArgsJSON}}')"
+if [ "$fencing_passive_kernel" = yes ]; then
+  sed "s/namespace: rhiza$/namespace: $fencing_namespace/" \
+    deploy/operator/fencing/runtime-agent-passive-kernel-patch.yaml >"$fencing_tmp/runtime-agent-passive-kernel-patch.yaml"
+  k patch daemonset rhiza-runtime-agent --type=strategic --patch-file "$fencing_tmp/runtime-agent-passive-kernel-patch.yaml"
+fi
 k rollout restart daemonset rhiza-runtime-agent
 k rollout status daemonset/rhiza-runtime-agent --timeout=180s
 # The second YAML document is the application's unprivileged ServiceAccount.

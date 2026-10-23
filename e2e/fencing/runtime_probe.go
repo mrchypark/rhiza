@@ -58,6 +58,8 @@ type runtimeComponentEvidence struct {
 	ContainerIDSHA256     string `json:"containerIDSHA256,omitempty"`
 	RuntimeBindingID      string `json:"runtimeBindingID,omitempty"`
 	EnrollmentCaptured    bool   `json:"enrollmentCaptured"`
+	StopDiagnosticStage   string `json:"stopDiagnosticStage,omitempty"`
+	StopDiagnosticCode    string `json:"stopDiagnosticCode,omitempty"`
 	ContainerStopAck      bool   `json:"containerStopAcknowledged"`
 	SandboxStopAck        bool   `json:"sandboxStopAcknowledged"`
 	ContainerExited       bool   `json:"containerExited"`
@@ -87,6 +89,14 @@ type runtimeProbeReply struct {
 	ReceiptSHA256 string                 `json:"receiptSHA256"`
 	Observation   cri.StopObservation    `json:"observation"`
 	Verified      bool                   `json:"verified"`
+	Progress      *runtimeProbeProgress  `json:"progress,omitempty"`
+}
+
+type runtimeProbeProgress struct {
+	EnrollmentCaptured bool   `json:"enrollmentCaptured"`
+	StopStage          string `json:"stopStage,omitempty"`
+	StopCode           string `json:"stopCode,omitempty"`
+	Pending            bool   `json:"pending,omitempty"`
 }
 
 // runtimeAgentRequest runs inside the real authority Pod so TokenReview sees
@@ -115,11 +125,13 @@ func runtimeAgentRequest(ctx context.Context) error {
 	}
 	client := &operator.RuntimeAgentClient{Kube: kube, AuthorityID: "rhiza-fencer/" + namespace,
 		TokenFile: "/var/run/secrets/rhiza-fencer/runtime-agent-token", CA: ca, ServerName: "runtime-agent", Port: "9445"}
+	enrollmentCaptured := false
 	if request.Action == "stop" {
 		request.Binding, err = client.Enroll(ctx, request.Binding)
 		if err != nil {
 			return fmt.Errorf("runtime-agent enrollment failed: %w", err)
 		}
+		enrollmentCaptured = true
 	} else if request.Action == "resume" {
 		decoded, decodeErr := base64.StdEncoding.DecodeString(request.Receipt)
 		if decodeErr != nil || len(decoded) == 0 || !json.Valid(decoded) {
@@ -128,6 +140,12 @@ func runtimeAgentRequest(ctx context.Context) error {
 	}
 	receipt, err := client.Stop(ctx, request.Binding, request.Request)
 	if err != nil {
+		var stopFailure *cri.StopDiagnosticError
+		if request.Action == "stop" && errors.Is(err, fencing.ErrPending) && errors.As(err, &stopFailure) &&
+			cri.ValidStopDiagnostic(stopFailure.Stage, stopFailure.Code) {
+			return json.NewEncoder(os.Stdout).Encode(runtimeProbeReply{Progress: &runtimeProbeProgress{EnrollmentCaptured: enrollmentCaptured,
+				StopStage: stopFailure.Stage, StopCode: stopFailure.Code, Pending: true}})
+		}
 		return fmt.Errorf("runtime-agent exact stop remains unverified: %w", err)
 	}
 	if request.Action == "resume" {
@@ -150,7 +168,8 @@ func runtimeAgentRequest(ctx context.Context) error {
 		return fmt.Errorf("runtime-agent initial receipt is not a completed stop")
 	}
 	digest := sha256.Sum256(receipt)
-	reply := runtimeProbeReply{Binding: request.Binding, Request: request.Request, ReceiptSHA256: hex.EncodeToString(digest[:]), Observation: observation, Verified: true}
+	reply := runtimeProbeReply{Binding: request.Binding, Request: request.Request, ReceiptSHA256: hex.EncodeToString(digest[:]), Observation: observation, Verified: true,
+		Progress: &runtimeProbeProgress{EnrollmentCaptured: enrollmentCaptured}}
 	if request.Action == "stop" {
 		reply.Receipt = base64.StdEncoding.EncodeToString(receipt)
 	}
@@ -324,6 +343,9 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 	if err != nil {
 		return err
 	}
+	if err := applyRuntimeProbeProgress(&evidence, first.Progress); err != nil {
+		return err
+	}
 	if first.Binding.RuntimeID != cri.RuntimeIdentity(profile.RuntimeName, profile.RuntimeVersion, profile.RuntimeAPIVersion) {
 		return fmt.Errorf("runtime enrollment differs from captured CRI profile")
 	}
@@ -434,6 +456,26 @@ func runtimeComponentProbe(parent context.Context) (resultErr error) {
 	}
 	evidence.ReceiptRecovered = true
 	stage = "cleanup"
+	return nil
+}
+
+func applyRuntimeProbeProgress(evidence *runtimeComponentEvidence, progress *runtimeProbeProgress) error {
+	if evidence == nil || progress == nil {
+		return fmt.Errorf("runtime-agent stop progress is unavailable")
+	}
+	evidence.EnrollmentCaptured = progress.EnrollmentCaptured
+	if progress.StopStage != "" || progress.StopCode != "" {
+		if !cri.ValidStopDiagnostic(progress.StopStage, progress.StopCode) {
+			return fmt.Errorf("runtime-agent stop diagnostic category is invalid")
+		}
+		evidence.StopDiagnosticStage, evidence.StopDiagnosticCode = progress.StopStage, progress.StopCode
+	}
+	if progress.Pending {
+		if progress.StopStage == "" || progress.StopCode == "" {
+			return fmt.Errorf("runtime-agent pending response lacks a stop category")
+		}
+		return fmt.Errorf("runtime-agent stop pending at %s/%s", progress.StopStage, progress.StopCode)
+	}
 	return nil
 }
 

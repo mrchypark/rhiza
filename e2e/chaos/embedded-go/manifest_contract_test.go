@@ -33,7 +33,19 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	launcher := readContractFile(t, "../run-votercount-gcs-chaos.sh")
 	preflight := readContractFile(t, "../gcs-iam-preflight.yaml.in")
 	authority := readContractFile(t, "../../../deploy/operator/fencing/authority.yaml")
+	passivePatch := readContractFile(t, "../../../deploy/operator/fencing/runtime-agent-passive-kernel-patch.yaml")
+	fencingLauncher := readContractFile(t, "../../../e2e/fencing/run.sh")
 	probe := readContractFile(t, "gcs_reader_probe.go")
+	guardDefinition := strings.Index(launcher, "require_fresh_runtime_agent_daemonset() {")
+	guardCall := strings.Index(launcher, "  require_fresh_runtime_agent_daemonset\n")
+	runtimeAgentApply := strings.Index(launcher, "  step 20-runtime-agent-apply kubectl --context \"$RHIZA_KUBE_CONTEXT\" apply -f \"$out/runtime-agent.yaml\"")
+	if guardDefinition < 0 || guardCall < 0 || runtimeAgentApply < 0 || guardDefinition > guardCall || guardCall > runtimeAgentApply ||
+		!strings.Contains(launcher, "get daemonset rhiza-runtime-agent --ignore-not-found -o name") ||
+		!strings.Contains(launcher, "[ -z \"$existing_runtime_agent\" ]") ||
+		!strings.Contains(launcher, "could not verify runtime-agent DaemonSet absence; refusing to reuse or overwrite it") ||
+		!strings.Contains(launcher, "runtime-agent DaemonSet already exists; refusing to reuse or overwrite it") {
+		t.Fatal("GCS installer must fail closed on existing or uncheckable runtime-agent DaemonSets before applying the profile")
+	}
 
 	for _, want := range []string{
 		"FENCER_INDEPENDENT_MUTATION_PROFILE, value: \"true\"",
@@ -182,12 +194,43 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 		"drop: [ALL]",
 		"PINNED_RHIZA_FENCER_DEPLOYMENT_UID",
 		"--runtime-agent-ca-file=/runtime-agent-ca/ca.crt",
+		"RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256",
+		"QUALIFIED_SANDBOX_EXECUTABLE_SHA256",
+		"sandbox-executable-sha256: \"QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"",
+		"rhiza.dev/sandbox-executable-sha256: \"QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"",
+		"rhiza.dev/sandbox-executable-sha256: \"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"",
+		"sandbox-args-json: '[\\\"/pause\\\"]'",
+		"qualified sandbox executable approval must be 64 lowercase hex characters",
+		"${RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL:=no}",
+		"RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL must be yes or no",
+		"if [ \"$RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL\" = yes ]; then",
+		"runtime-agent-passive-kernel-patch.yaml",
 		"path: /sys/fs/cgroup",
 		"path: /proc",
 	} {
 		if !strings.Contains(launcher+authority, want) {
 			t.Errorf("runtime-agent rendering contract missing %q", want)
 		}
+	}
+	for _, want := range []string{
+		"namespace: rhiza",
+		"rhiza.mrchypark.dev/runtime-proof-profile: passive-kernel-v1",
+		"privileged: false",
+		"allowPrivilegeEscalation: false",
+		"drop: [ALL]",
+		"add: [SYS_PTRACE]",
+	} {
+		if !strings.Contains(passivePatch, want) {
+			t.Errorf("passive-kernel opt-in patch missing %q", want)
+		}
+	}
+	if strings.Contains(passivePatch, "SYS_ADMIN") || strings.Contains(passivePatch, "privileged: true") || strings.Contains(authority, "add: [SYS_PTRACE]") {
+		t.Fatal("passive privilege must be explicit, narrow, and absent from the base profile")
+	}
+	if !strings.Contains(fencingLauncher, "${RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL:-no}") ||
+		!strings.Contains(fencingLauncher, "if [ \"$fencing_passive_kernel\" = yes ]; then") ||
+		!strings.Contains(fencingLauncher, "runtime-agent-passive-kernel-patch.yaml") {
+		t.Fatal("native fencing installer must keep passive-kernel capability default-off and explicit")
 	}
 }
 

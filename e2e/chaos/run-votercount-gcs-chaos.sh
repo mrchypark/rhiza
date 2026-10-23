@@ -39,6 +39,18 @@ case "$mode" in install|run) ;; *) echo "usage: $0 install|run" >&2; exit 2 ;; e
 : "${RHIZA_READONLY_WORKLOAD_GSA_ID:?separate read-only workload GSA account id}"
 : "${RHIZA_RUNTIME_AGENT_CA_SECRET:?pre-provisioned runtime-agent CA Secret name}"
 : "${RHIZA_RUNTIME_AGENT_TLS_SECRET:?pre-provisioned runtime-agent TLS Secret name}"
+: "${RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256:=}"
+: "${RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL:=no}"
+case "$RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL" in
+  no) ;;
+  yes)
+    [ -n "$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256" ] || {
+      echo 'passive kernel proof requires an independently approved sandbox executable digest' >&2
+      exit 2
+    }
+    ;;
+  *) echo 'RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL must be yes or no' >&2; exit 2 ;;
+esac
 : "${RHIZA_CONTAINERD_VERSION:?qualified containerd version for every eligible node}"
 : "${RHIZA_CONTAINERD_RUNTIME_TYPE:?qualified containerd runtime type}"
 : "${RHIZA_CGROUP_PROFILE_ID:?qualified cgroup profile identifier}"
@@ -64,6 +76,15 @@ require_digest() {
 }
 require_digest RHIZA_APP_IMAGE "$RHIZA_APP_IMAGE"
 require_digest RHIZA_OPERATOR_IMAGE "$RHIZA_OPERATOR_IMAGE"
+if [ -n "$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256" ]; then
+  case "$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256" in
+    *[!0-9a-f]*) echo 'qualified sandbox executable approval must be lowercase SHA-256 hex' >&2; exit 2 ;;
+  esac
+  [ "${#RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256}" -eq 64 ] || {
+    echo 'qualified sandbox executable approval must be 64 lowercase hex characters' >&2
+    exit 2
+  }
+fi
 
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 out=${RHIZA_OUT:-$PWD/votercount-gcs-chaos-results}
@@ -533,12 +554,39 @@ render_runtime_agent() {
       -e "s|QUALIFIED_PRIVATE_CGROUP_V2_PROFILE_ID|$RHIZA_CGROUP_PROFILE_ID|g" \
       -e "s|QUALIFIED_LINUX_KERNEL_RELEASE|$RHIZA_KERNEL_RELEASE|g" \
       -e "s|PINNED_RHIZA_FENCER_DEPLOYMENT_UID|$deployment_uid|g" \
+      -e "s|QUALIFIED_SANDBOX_EXECUTABLE_SHA256|$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256|g" \
       -e "s|rhiza-runtime-agent-ca|$RHIZA_RUNTIME_AGENT_CA_SECRET|g" \
       -e "s|rhiza-runtime-agent-tls|$RHIZA_RUNTIME_AGENT_TLS_SECRET|g" \
       > "$out/runtime-agent.yaml"
   grep -q '^kind: DaemonSet$' "$out/runtime-agent.yaml" &&
     grep -q "^  authority-deployment-uid: $deployment_uid$" "$out/runtime-agent.yaml" &&
+    grep -Fqx "  sandbox-executable-sha256: \"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"" "$out/runtime-agent.yaml" &&
+    grep -Fqx "        rhiza.dev/sandbox-executable-sha256: \"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"" "$out/runtime-agent.yaml" &&
+    grep -Fqx "  sandbox-args-json: '[\"/pause\"]'" "$out/runtime-agent.yaml" &&
     ! grep -Eq 'QUALIFIED_|PINNED_|PLACEHOLDER' "$out/runtime-agent.yaml"
+}
+
+render_passive_kernel_patch() {
+  root=$(CDPATH='' cd -- "$here/../.." && pwd)
+  sed "s/namespace: rhiza$/namespace: $RHIZA_NAMESPACE/" \
+    "$root/deploy/operator/fencing/runtime-agent-passive-kernel-patch.yaml" \
+    > "$out/runtime-agent-passive-kernel-patch.yaml"
+  grep -Fqx '              add: [SYS_PTRACE]' "$out/runtime-agent-passive-kernel-patch.yaml" &&
+    grep -Fqx '              drop: [ALL]' "$out/runtime-agent-passive-kernel-patch.yaml" &&
+    grep -Fqx '        rhiza.mrchypark.dev/runtime-proof-profile: passive-kernel-v1' "$out/runtime-agent-passive-kernel-patch.yaml" &&
+    ! grep -Eq 'SYS_ADMIN|privileged: true|CAP_SYS_ADMIN' "$out/runtime-agent-passive-kernel-patch.yaml"
+}
+
+require_fresh_runtime_agent_daemonset() {
+  existing_runtime_agent=$(kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+    get daemonset rhiza-runtime-agent --ignore-not-found -o name) || {
+      echo 'could not verify runtime-agent DaemonSet absence; refusing to reuse or overwrite it' >&2
+      return 1
+    }
+  [ -z "$existing_runtime_agent" ] || {
+    echo 'runtime-agent DaemonSet already exists; refusing to reuse or overwrite it in this qualification namespace' >&2
+    return 1
+  }
 }
 
 provision_tls() {
@@ -629,7 +677,13 @@ if [ "$mode" = install ]; then
     exit 1
   }
   render_runtime_agent "$fencer_deployment_uid"
+  require_fresh_runtime_agent_daemonset
   step 20-runtime-agent-apply kubectl --context "$RHIZA_KUBE_CONTEXT" apply -f "$out/runtime-agent.yaml"
+  if [ "$RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL" = yes ]; then
+    render_passive_kernel_patch
+    step 20-runtime-agent-passive-kernel kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" \
+      patch daemonset rhiza-runtime-agent --type=strategic --patch-file "$out/runtime-agent-passive-kernel-patch.yaml"
+  fi
   step 20-runtime-agent kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" rollout status \
     daemonset/rhiza-runtime-agent --timeout=180s
   step 20-operator kubectl --context "$RHIZA_KUBE_CONTEXT" -n "$RHIZA_NAMESPACE" rollout status \

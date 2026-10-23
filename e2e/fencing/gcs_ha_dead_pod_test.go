@@ -4,12 +4,171 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
+	"github.com/mrchypark/rhiza/pkg/fencing/cri"
 	"github.com/mrchypark/rhiza/pkg/operator"
 )
+
+func TestGCSDeadPodQualificationRequiresExactPassiveTerminalReceipt(t *testing.T) {
+	runtime := fencing.RuntimeBinding{AuthorityID: "authority", NamespaceUID: "namespace-uid", BindingUID: "binding-uid",
+		StatefulSetUID: "sts-uid", SourceClusterID: "cluster", NodeID: "node-0", PodUID: "pod-old", RunID: "run-old",
+		NodeName: "node", NodeUID: "node-uid", MachineID: "machine", BootID: "boot", RuntimeID: "runtime", SandboxID: "sandbox",
+		ContainerID: "containerd://container", ImageID: "image@sha256:abc", CapturedScopeDigest: strings.Repeat("9", 64)}
+	target := operator.FenceTarget{NodeID: runtime.NodeID, Pod: "rhiza-voter-0", PodUID: runtime.PodUID, WALIdentity: "wal"}
+	request := fencing.StopRequest{OperationID: "exact-stop", RequestHash: strings.Repeat("b", 64), Identity: fencing.Identity{
+		SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: runtime.PodUID, RunID: runtime.RunID, WALIdentity: target.WALIdentity}}
+	ref := fencing.TerminalReference{EvidenceVersion: 2, Request: request, RuntimeHash: fencing.RuntimeBindingDigest(runtime), ProducerUID: "producer"}
+	receipt := cri.PassiveReceipt{Mode: "passive-kernel-v1", Runtime: runtime, Request: request, Observation: cri.PassiveObservation{
+		Version: 1, RuntimeHash: fencing.RuntimeScopeBindingDigest(runtime), ScopeDigest: runtime.CapturedScopeDigest,
+		TargetPIDExited: true, TargetCgroupGone: true, SandboxPIDExited: true, SandboxCgroupGone: true, ObservedAt: "2026-10-23T00:00:00Z"}}
+	if err := validateGCSDeadPodPassiveReceipt(encoded(receipt), ref, target, runtime, "producer"); err != nil {
+		t.Fatalf("rejected exact passive terminal receipt: %v", err)
+	}
+
+	t.Run("normal CRI receipt is not passive qualification", func(t *testing.T) {
+		fallback := cri.StopObservation{Runtime: runtime, Request: request, ContainerExited: true, SandboxNotReady: true, CgroupEmpty: true, ObservedAt: receipt.Observation.ObservedAt}
+		if err := validateGCSDeadPodPassiveReceipt(encoded(fallback), ref, target, runtime, "producer"); err == nil {
+			t.Fatal("accepted the normal CRI fallback receipt as passive dead-Pod proof")
+		}
+	})
+	t.Run("wrong request", func(t *testing.T) {
+		wrong := receipt
+		wrong.Request.OperationID = "other-stop"
+		if err := validateGCSDeadPodPassiveReceipt(encoded(wrong), ref, target, runtime, "producer"); err == nil {
+			t.Fatal("accepted a passive receipt for another stop request")
+		}
+	})
+	t.Run("wrong incarnation", func(t *testing.T) {
+		wrong := receipt
+		wrong.Runtime.PodUID = "pod-new"
+		if err := validateGCSDeadPodPassiveReceipt(encoded(wrong), ref, target, runtime, "producer"); err == nil {
+			t.Fatal("accepted a passive receipt for another Pod incarnation")
+		}
+	})
+}
+
+func TestGCSDeadPodPassiveProfilePreflightRequiresInstalledQualifiedRollout(t *testing.T) {
+	profile, daemonSet, pods, source := gcsDeadPodPassiveProfileFixture()
+	if err := validateGCSDeadPodPassiveAgentProfile(profile, daemonSet, pods, source); err != nil {
+		t.Fatalf("rejected installed qualified runtime-agent rollout: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(obj, obj, obj)
+	}{
+		{"unset executable approval", func(profile, _, _ obj) { profile["data"].(obj)["sandbox-executable-sha256"] = "" }},
+		{"invalid executable approval", func(profile, _, _ obj) { profile["data"].(obj)["sandbox-executable-sha256"] = strings.Repeat("A", 64) }},
+		{"wrong approved argv", func(profile, _, _ obj) { profile["data"].(obj)["sandbox-args-json"] = `["/other"]` }},
+		{"digest does not opt in to passive capability", func(_, ds, _ obj) {
+			ds["spec"].(obj)["template"].(obj)["metadata"].(obj)["annotations"].(obj)["rhiza.mrchypark.dev/runtime-proof-profile"] = nil
+		}},
+		{"ConfigMap changed without rollout", func(profile, _, _ obj) { profile["data"].(obj)["sandbox-executable-sha256"] = strings.Repeat("b", 64) }},
+		{"wrong ConfigMap identity", func(profile, _, _ obj) { profile["metadata"].(obj)["uid"] = "" }},
+		{"wrong ConfigMap key reference", func(_, ds, _ obj) {
+			ds["spec"].(obj)["template"].(obj)["spec"].(obj)["containers"].([]any)[0].(obj)["env"].([]any)[0].(obj)["valueFrom"].(obj)["configMapKeyRef"].(obj)["key"] = "other"
+		}},
+		{"missing command binding", func(_, ds, _ obj) {
+			args := ds["spec"].(obj)["template"].(obj)["spec"].(obj)["containers"].([]any)[0].(obj)["args"].([]any)
+			ds["spec"].(obj)["template"].(obj)["spec"].(obj)["containers"].([]any)[0].(obj)["args"] = args[1:]
+		}},
+		{"stale observed generation", func(_, ds, _ obj) { ds["status"].(obj)["observedGeneration"] = float64(1) }},
+		{"incomplete rollout", func(_, ds, _ obj) { ds["status"].(obj)["updatedNumberScheduled"] = float64(1) }},
+		{"wrong template profile annotation", func(_, ds, _ obj) {
+			ds["spec"].(obj)["template"].(obj)["metadata"].(obj)["annotations"].(obj)["rhiza.dev/sandbox-executable-sha256"] = strings.Repeat("b", 64)
+		}},
+		{"wrong Pod profile annotation", func(_, _, pods obj) {
+			pods["items"].([]any)[0].(obj)["metadata"].(obj)["annotations"].(obj)["rhiza.dev/sandbox-executable-sha256"] = strings.Repeat("b", 64)
+		}},
+		{"Pod missing passive profile annotation", func(_, _, pods obj) {
+			delete(pods["items"].([]any)[0].(obj)["metadata"].(obj)["annotations"].(obj), "rhiza.mrchypark.dev/runtime-proof-profile")
+		}},
+		{"host PID namespace disabled", func(_, ds, _ obj) { ds["spec"].(obj)["template"].(obj)["spec"].(obj)["hostPID"] = false }},
+		{"default capless profile", func(_, ds, _ obj) {
+			delete(ds["spec"].(obj)["template"].(obj)["spec"].(obj)["containers"].([]any)[0].(obj), "securityContext")
+		}},
+		{"extra acquired capability", func(_, ds, _ obj) {
+			ds["spec"].(obj)["template"].(obj)["spec"].(obj)["containers"].([]any)[0].(obj)["securityContext"].(obj)["capabilities"].(obj)["add"] = []any{"SYS_PTRACE", "SYS_ADMIN"}
+		}},
+		{"extra sidecar", func(_, ds, _ obj) {
+			spec := ds["spec"].(obj)["template"].(obj)["spec"].(obj)
+			spec["containers"] = append(spec["containers"].([]any), obj{"name": "unverified-sidecar"})
+		}},
+		{"ephemeral container", func(_, _, pods obj) {
+			pods["items"].([]any)[0].(obj)["spec"].(obj)["ephemeralContainers"] = []any{obj{"name": "debug"}}
+		}},
+		{"privileged agent", func(_, ds, _ obj) {
+			ds["spec"].(obj)["template"].(obj)["spec"].(obj)["containers"].([]any)[0].(obj)["securityContext"].(obj)["privileged"] = true
+		}},
+		{"changed captured source agent UID", func(_, _, pods obj) { pods["items"].([]any)[0].(obj)["metadata"].(obj)["uid"] = "replacement-agent" }},
+		{"source-node agent not ready", func(_, _, pods obj) { pods["items"].([]any)[0].(obj)["status"].(obj)["conditions"] = []any{} }},
+		{"agent container not ready", func(_, _, pods obj) {
+			pods["items"].([]any)[0].(obj)["status"].(obj)["containerStatuses"].([]any)[0].(obj)["ready"] = false
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profileCopy := encodedClone(profile)
+			daemonSetCopy := encodedClone(daemonSet)
+			podsCopy := encodedClone(pods)
+			test.mutate(profileCopy, daemonSetCopy, podsCopy)
+			if err := validateGCSDeadPodPassiveAgentProfile(profileCopy, daemonSetCopy, podsCopy, source); err == nil {
+				t.Fatal("accepted an unqualified or incomplete installed runtime-agent profile")
+			}
+		})
+	}
+}
+
+func TestGCSDeadPodProfilePreflightRunsBeforePodChaos(t *testing.T) {
+	source, err := os.ReadFile("gcs_ha_dead_pod.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	preflight := strings.Index(text, "verifyGCSDeadPodPassiveAgentProfile(ctx, source)")
+	fault := strings.Index(text, "createGCSDeadPodFault(ctx, source, target)")
+	if preflight < 0 || fault < 0 || preflight >= fault {
+		t.Fatal("passive profile preflight must precede dead-Pod Chaos creation")
+	}
+}
+
+func gcsDeadPodPassiveProfileFixture() (obj, obj, obj, gcsRecoverySource) {
+	const profileName, daemonSetUID = "rhiza-runtime-agent-profile", "agent-ds-uid"
+	profile := obj{"metadata": obj{"name": profileName, "namespace": "run-ns", "uid": "profile-uid", "resourceVersion": "profile-rv"},
+		"data": obj{"sandbox-executable-sha256": strings.Repeat("a", 64), "sandbox-args-json": `["/pause"]`}}
+	container := obj{"name": "runtime-agent", "args": []any{"--sandbox-executable-sha256=$(SANDBOX_EXECUTABLE_SHA256)", "--sandbox-args-json=$(SANDBOX_ARGS_JSON)"},
+		"securityContext": obj{"privileged": false, "allowPrivilegeEscalation": false,
+			"capabilities": obj{"drop": []any{"ALL"}, "add": []any{"SYS_PTRACE"}}},
+		"env": []any{
+			obj{"name": "SANDBOX_EXECUTABLE_SHA256", "valueFrom": obj{"configMapKeyRef": obj{"name": profileName, "key": "sandbox-executable-sha256"}}},
+			obj{"name": "SANDBOX_ARGS_JSON", "valueFrom": obj{"configMapKeyRef": obj{"name": profileName, "key": "sandbox-args-json"}}},
+		}}
+	selector := obj{"app.kubernetes.io/name": runtimeAgentDSName}
+	daemonSet := obj{"metadata": obj{"name": runtimeAgentDSName, "namespace": "run-ns", "uid": daemonSetUID, "generation": float64(7)},
+		"spec": obj{"selector": obj{"matchLabels": selector}, "template": obj{"metadata": obj{"annotations": obj{
+			"rhiza.dev/sandbox-executable-sha256": strings.Repeat("a", 64), "rhiza.mrchypark.dev/runtime-proof-profile": "passive-kernel-v1"}},
+			"spec": obj{"hostPID": true, "containers": []any{container}}}},
+		"status": obj{"observedGeneration": float64(7), "desiredNumberScheduled": float64(2), "currentNumberScheduled": float64(2),
+			"updatedNumberScheduled": float64(2), "numberReady": float64(2), "numberAvailable": float64(2)}}
+	makePod := func(name, uid, node string) obj {
+		return obj{"metadata": obj{"name": name, "uid": uid, "labels": obj{"app.kubernetes.io/name": runtimeAgentDSName},
+			"annotations": obj{"rhiza.dev/sandbox-executable-sha256": strings.Repeat("a", 64),
+				"rhiza.mrchypark.dev/runtime-proof-profile": "passive-kernel-v1"},
+			"ownerReferences": []any{obj{"apiVersion": "apps/v1", "kind": "DaemonSet", "name": runtimeAgentDSName, "uid": daemonSetUID, "controller": true}}},
+			"spec": obj{"nodeName": node, "hostPID": true, "containers": []any{encodedClone(container)}},
+			"status": obj{"conditions": []any{obj{"type": "Ready", "status": "True"}},
+				"containerStatuses": []any{obj{"name": "runtime-agent", "ready": true}}}}
+	}
+	pods := obj{"items": []any{makePod("agent-a", "agent-a-uid", "node-a"), makePod("agent-b", "agent-b-uid", "node-b")}}
+	source := gcsRecoverySource{Namespace: "run-ns", AgentDaemonUID: daemonSetUID,
+		AgentPods: []gcsControlPodIdentity{{Name: "agent-a", UID: "agent-a-uid", OwnerUID: daemonSetUID}, {Name: "agent-b", UID: "agent-b-uid", OwnerUID: daemonSetUID}},
+		Targets:   []operator.FenceTarget{{NodeName: "node-a"}, {NodeName: "node-b"}}}
+	return profile, daemonSet, pods, source
+}
 
 func TestGCSDeadPodChaosObjectUsesExactAdmittedSelector(t *testing.T) {
 	body, err := gcsDeadPodChaosObject("run-deadbeef", "deadbeef", "rhiza-voter-0")

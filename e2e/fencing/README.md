@@ -131,7 +131,7 @@ the existing command directly with the binary for your host:
 ./fencing-e2e-linux-amd64 run-gcs-ha-ack-loss
 ```
 
-The separate, still-unqualified single-voter dead-Pod scenario uses the same
+The separate single-voter dead-Pod scenario uses the same
 configured GCS and read-only authority observer inputs:
 
 ```sh
@@ -145,11 +145,32 @@ safe automatic recovery. It kills only one captured voter with the admitted
 10-second PodChaos profile; then it requires an exact single-target
 IndependentV2 `Voter` proof, completed same-cluster membership replacement,
 authenticated three-voter status, committed/read-back ACKs, and a new-UID
-natural ordinal return refused before readiness. The replacement may be a
+natural ordinal return refused before readiness. It also rereads the exact
+canonical terminal evidence object and requires its receipt to carry
+`mode: passive-kernel-v1`, the exact closed stop request/runtime/producer, and
+both target and sandbox terminal observations. A normal CRI fallback receipt
+does not qualify this scenario. The replacement may be a
 separately named learner; this does not claim the original ordinal was promoted.
 The event/evidence files are private driver output. The code path is not
 qualification evidence until it completes in an actual GCS and Chaos Mesh run,
 and it does not claim the broader D1-D4 matrix.
+
+The passive receipt path is enabled only when the runtime-agent profile has an
+independently approved `sandbox-executable-sha256` and exact
+`sandbox-args-json` (default argv is `["/pause"]`). The SHA-256 must come from
+the approved pause image artifact, not from observing the running node during
+the qualification. The pinned executable must also be a static ELF executable
+(ET_EXEC or static PIE), with no interpreter or external dynamic dependency;
+the runtime agent checks the live executable through the same pinned file used
+for the digest. The Kind setup script accepts the digest as
+`RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256`. The separate
+`RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL=yes` flag is default-off and applies only the
+SYS_PTRACE overlay in the disposable test namespace; without it, the base agent
+drops all capabilities. A digest alone never changes privileges. The passive
+dead-Pod collector verifies the installed template, Pod annotations, exact
+capability set, host-PID setting, and rollout before creating a fault. The
+ordinary CRI path remains unchanged when the flag is unset, and that fallback
+cannot satisfy this scenario.
 
 This requires the GCS run inputs in [`../chaos/README.md`](../chaos/README.md),
 including `RHIZA_KUBE_CONTEXT`, `RHIZA_NAMESPACE`, `RHIZA_RUN_ID`,

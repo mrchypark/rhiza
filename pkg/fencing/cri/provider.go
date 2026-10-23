@@ -13,6 +13,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/fencing"
@@ -42,6 +43,11 @@ type Profile struct {
 	RuntimeVersion        string
 	RuntimeAPIVersion     string
 	ContainerdRuntimeType string
+	// SandboxExecutableSHA256 and SandboxArgs are the administrator-approved
+	// pause executable identity and exact runtime argv. An empty hash disables
+	// optional passive terminal proof without affecting ordinary CRI stopping.
+	SandboxExecutableSHA256 string
+	SandboxArgs             []string
 	// CgroupProfileID names an administrator-qualified private cgroup-v2
 	// profile; a non-empty value is an assertion, not proof of no-escape.
 	CgroupProfileID string
@@ -70,6 +76,8 @@ type Provider struct {
 	conn        *grpc.ClientConn
 	profile     Profile
 	host        func(context.Context) (HostIdentity, error)
+	passiveMu   sync.Mutex
+	passive     map[string]*passiveSession
 }
 
 // RuntimeIdentity binds enrollment to the exact CRI runtime/API versions, not
@@ -139,7 +147,16 @@ func validOCIRepoDigest(value string) bool {
 }
 
 func (p *Provider) Close() error {
-	if p == nil || p.conn == nil {
+	if p == nil {
+		return nil
+	}
+	p.passiveMu.Lock()
+	for key, session := range p.passive {
+		session.close()
+		delete(p.passive, key)
+	}
+	p.passiveMu.Unlock()
+	if p.conn == nil {
 		return nil
 	}
 	return p.conn.Close()
@@ -222,6 +239,19 @@ func (p *Provider) EnrollBinding(ctx context.Context, base fencing.RuntimeBindin
 	if err != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, err
 	}
+	if err := p.capturePassiveScope(ctx, binding, procRoot, cgroupRoot, criIdentity.PID, criIdentity.CgroupsPath, &scope); err != nil {
+		// Passive proof is an additional qualification path. If its kernel
+		// handles cannot be pinned, preserve the existing CRI stop enrollment;
+		// this scope can never emit a passive receipt.
+		scope.Passive = nil
+	}
+	passiveCaptured := scope.Passive != nil
+	keepPassiveSession := false
+	defer func() {
+		if passiveCaptured && !keepPassiveSession {
+			p.CompletePassiveTerminal(binding, scope)
+		}
+	}()
 	secondPID, secondPath, err := p.containerdPID(ctx, binding, containerID)
 	if err != nil || secondPID != criIdentity.PID || secondPath != criIdentity.CgroupsPath || scope.VerifyProcess(procRoot, cgroupRoot) != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, fmt.Errorf("%w: process changed during pre-child capture", ErrUnverified)
@@ -238,7 +268,51 @@ func (p *Provider) EnrollBinding(ctx context.Context, base fencing.RuntimeBindin
 	if err := binding.Validate(identity); err != nil {
 		return fencing.RuntimeBinding{}, CgroupScope{}, err
 	}
+	keepPassiveSession = passiveCaptured
 	return binding, scope, nil
+}
+
+// ObservePassiveTerminal inspects only kernel handles retained during enrollment.
+// It never queries CRI or issues a stop. A provider restart loses these handles,
+// so an unrecorded observation then remains pending.
+func (p *Provider) ObservePassiveTerminal(_ context.Context, binding fencing.RuntimeBinding, scope CgroupScope) (PassiveObservation, bool, error) {
+	if p == nil || scope.Passive == nil || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) {
+		return PassiveObservation{}, false, fmt.Errorf("%w: passive scope is unavailable", ErrUnverified)
+	}
+	digest, err := passiveScopeDigest(scope)
+	if err != nil {
+		return PassiveObservation{}, false, err
+	}
+	key := digest
+	p.passiveMu.Lock()
+	session := p.passive[key]
+	p.passiveMu.Unlock()
+	if session == nil {
+		// A provider restart loses unpersisted pidfds. This is not terminal
+		// evidence; runtimeagent may still use the unchanged exact CRI stop path.
+		return PassiveObservation{}, false, nil
+	}
+	observation, complete, err := session.observe(binding, scope)
+	return observation, complete, err
+}
+
+func (p *Provider) BindPassiveTerminal(binding fencing.RuntimeBinding, request fencing.StopRequest, scope CgroupScope, observation PassiveObservation) (json.RawMessage, error) {
+	return bindPassiveReceipt(binding, request, scope, observation)
+}
+
+func (p *Provider) CompletePassiveTerminal(_ fencing.RuntimeBinding, scope CgroupScope) {
+	if p == nil {
+		return
+	}
+	digest, err := passiveScopeDigest(scope)
+	if err != nil {
+		return
+	}
+	p.passiveMu.Lock()
+	session := p.passive[digest]
+	delete(p.passive, digest)
+	p.passiveMu.Unlock()
+	session.close()
 }
 
 // CaptureCgroupScope maps a containerd verbose-status PID to its live host
@@ -409,73 +483,73 @@ func (p *Provider) Stop(ctx context.Context, binding fencing.RuntimeBinding, req
 func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, beforeContainerStop, beforeSandboxStop func(context.Context) error) (StopObservation, error) {
 	observation := StopObservation{Runtime: binding, Request: request}
 	if p == nil || p.client == nil || p.host == nil {
-		return observation, fmt.Errorf("%w: local runtime provider is not configured", ErrUnverified)
+		return observation, stopDiagnostic("pre_container_identity", "runtime_identity_unverified", fmt.Errorf("%w: local runtime provider is not configured", ErrUnverified))
 	}
 	decoded, err := hex.DecodeString(request.RequestHash)
 	if binding.Validate(request.Identity) != nil || request.OperationID == "" || err != nil || len(decoded) != sha256.Size {
-		return observation, fmt.Errorf("%w: invalid enrolled stop request", ErrUnverified)
+		return observation, stopDiagnostic("stop_request", "invalid_request", fmt.Errorf("%w: invalid enrolled stop request", ErrUnverified))
 	}
 	containerID := strings.TrimPrefix(binding.ContainerID, p.profile.RuntimeName+"://")
 	if containerID == "" || strings.Contains(containerID, "://") {
-		return observation, fmt.Errorf("%w: runtime container ID differs", ErrUnverified)
+		return observation, stopDiagnostic("stop_request", "invalid_request", fmt.Errorf("%w: runtime container ID differs", ErrUnverified))
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := p.verifyHost(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("pre_container_identity", "runtime_identity_unverified", err)
 	}
 	if err := p.verifyVersion(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("pre_container_identity", "runtime_identity_unverified", err)
 	}
 	if err := p.inspect(ctx, binding, containerID, false); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("pre_container_state", "container_state_unverified", err)
 	}
 	if err := p.verifyHost(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("pre_container_identity", "runtime_identity_unverified", err)
 	}
 	if beforeContainerStop != nil {
 		if err := beforeContainerStop(ctx); err != nil {
-			return observation, err
+			return observation, stopDiagnostic("pre_container_scope", "process_scope_unverified", err)
 		}
 	}
 	ack, err := p.client.StopContainer(ctx, &runtimeapi.StopContainerRequest{ContainerId: containerID, Timeout: p.profile.GraceSeconds})
 	if err != nil {
-		return observation, fmt.Errorf("%w: container stop acknowledgement is uncertain: %w", ErrUnverified, err)
+		return observation, stopDiagnostic("cri_stop_container", "container_stop_unconfirmed", fmt.Errorf("%w: container stop acknowledgement is uncertain: %w", ErrUnverified, err))
 	}
 	if ack == nil {
-		return observation, fmt.Errorf("%w: container stop acknowledgement is missing", ErrUnverified)
+		return observation, stopDiagnostic("cri_stop_container", "container_stop_unconfirmed", fmt.Errorf("%w: container stop acknowledgement is missing", ErrUnverified))
 	}
 	observation.ContainerStopAcknowledged = true
 	if err := p.inspectState(ctx, binding, containerID, true, runtimeapi.PodSandboxState_SANDBOX_READY, true); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("post_container_state", "container_state_unverified", err)
 	}
 	if beforeSandboxStop != nil {
 		if err := beforeSandboxStop(ctx); err != nil {
-			return observation, err
+			return observation, stopDiagnostic("pre_sandbox_scope", "cgroup_scope_unverified", err)
 		}
 	}
 	if err := p.verifyVersion(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("pre_sandbox_identity", "runtime_identity_unverified", err)
 	}
 	if err := p.verifyHost(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("pre_sandbox_identity", "runtime_identity_unverified", err)
 	}
 	sandboxAck, err := p.client.StopPodSandbox(ctx, &runtimeapi.StopPodSandboxRequest{PodSandboxId: binding.SandboxID})
 	if err != nil {
-		return observation, fmt.Errorf("%w: sandbox stop acknowledgement is uncertain: %w", ErrUnverified, err)
+		return observation, stopDiagnostic("cri_stop_sandbox", "sandbox_stop_unconfirmed", fmt.Errorf("%w: sandbox stop acknowledgement is uncertain: %w", ErrUnverified, err))
 	}
 	if sandboxAck == nil {
-		return observation, fmt.Errorf("%w: sandbox stop acknowledgement is missing", ErrUnverified)
+		return observation, stopDiagnostic("cri_stop_sandbox", "sandbox_stop_unconfirmed", fmt.Errorf("%w: sandbox stop acknowledgement is missing", ErrUnverified))
 	}
 	observation.SandboxStopAcknowledged = true
 	if err := p.inspect(ctx, binding, containerID, true); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("post_sandbox_state", "sandbox_state_unverified", err)
 	}
 	if err := p.verifyVersion(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("post_stop_identity", "runtime_identity_unverified", err)
 	}
 	if err := p.verifyHost(ctx, binding); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("post_stop_identity", "runtime_identity_unverified", err)
 	}
 	observation.ContainerExited, observation.SandboxNotReady = true, true
 	observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
@@ -489,7 +563,7 @@ func (p *Provider) stop(ctx context.Context, binding fencing.RuntimeBinding, req
 func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, procRoot, cgroupRoot string, scope CgroupScope) (StopObservation, error) {
 	observation := StopObservation{Runtime: binding, Request: request}
 	if p == nil || p.profile.CgroupProfileID == "" || binding.Validate(request.Identity) != nil || scope.RuntimeHash != fencing.RuntimeScopeBindingDigest(binding) || scope.ProfileID != p.profile.CgroupProfileID {
-		return observation, fmt.Errorf("%w: enrolled cgroup belongs to another runtime binding", ErrUnverified)
+		return observation, stopDiagnostic("stop_request", "invalid_request", fmt.Errorf("%w: enrolled cgroup belongs to another runtime binding", ErrUnverified))
 	}
 	beforeContainerStop := func(ctx context.Context) error {
 		containerID := strings.TrimPrefix(binding.ContainerID, p.profile.RuntimeName+"://")
@@ -508,7 +582,7 @@ func (p *Provider) StopInCgroup(ctx context.Context, binding fencing.RuntimeBind
 		return observation, err
 	}
 	if err := scope.VerifyEmpty(cgroupRoot); err != nil {
-		return observation, err
+		return observation, stopDiagnostic("post_stop_cgroup", "cgroup_empty_unverified", err)
 	}
 	observation.CgroupScope, observation.CgroupEmpty = scope, true
 	observation.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)

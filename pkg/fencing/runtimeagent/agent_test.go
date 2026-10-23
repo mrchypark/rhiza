@@ -143,6 +143,41 @@ func TestEnrollmentBackendDiagnosticUsesGenericClassForUnclassifiedErrors(t *tes
 		t.Fatalf("unmatched CRI error code=%q", got)
 	}
 }
+
+func TestPendingStopReturnsBoundedStageAndPreservesPendingSemantics(t *testing.T) {
+	const canary = "private-backend-detail-canary"
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	backend := &testBackend{stopErr: cri.NewStopDiagnosticError("cri_stop_container", "container_stop_unconfirmed", errors.New(canary))}
+	service, err := New(testServiceConfig(dir, backend))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(service.Handler())
+	t.Cleanup(server.Close)
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("trusted-test-token"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	client := Client{BaseURL: server.URL, TokenFile: tokenFile, HTTP: server.Client()}
+	binding, err := client.Enroll(t.Context(), testBaseBinding())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fencing.StopRequest{OperationID: "stop-probe", RequestHash: strings.Repeat("c", 64), Identity: fencing.Identity{
+		SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, WALIdentity: "wal"}}
+	_, err = client.Stop(t.Context(), binding, request)
+	var diagnostic *cri.StopDiagnosticError
+	if !errors.Is(err, fencing.ErrPending) || !errors.As(err, &diagnostic) || diagnostic.Stage != "cri_stop_container" || diagnostic.Code != "container_stop_unconfirmed" {
+		t.Fatalf("pending stop diagnostic=%#v err=%v", diagnostic, err)
+	}
+	if strings.Contains(err.Error(), canary) {
+		t.Fatalf("pending diagnostic leaked backend detail: %v", err)
+	}
+}
+
 func (b *testBackend) Stop(_ context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, _ json.RawMessage) (json.RawMessage, error) {
 	b.stops++
 	if b.onStop != nil {
