@@ -369,3 +369,54 @@ func TestFencerRoleCreatesFenceRequestsWithoutClusterWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestFencerNamespaceLookupIsPinnedToOnlyTheRhizaNamespace(t *testing.T) {
+	data, err := os.ReadFile("fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	found := false
+	for {
+		var doc map[string]any
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "ClusterRole" {
+			continue
+		}
+		meta, _ := doc["metadata"].(map[string]any)
+		if meta["name"] != "rhiza-fencer-tokenreview" {
+			continue
+		}
+		for _, raw := range doc["rules"].([]any) {
+			rule, _ := raw.(map[string]any)
+			groups, _ := rule["apiGroups"].([]any)
+			resources, _ := rule["resources"].([]any)
+			coversNamespace := false
+			for _, resource := range resources {
+				if resource == "namespaces" || resource == "*" {
+					coversNamespace = true
+				}
+			}
+			if !coversNamespace {
+				continue
+			}
+			found = true
+			if len(groups) != 1 || groups[0] != "" || len(resources) != 1 || resources[0] != "namespaces" {
+				t.Errorf("namespace lookup rule has broad apiGroups/resources: apiGroups=%v resources=%v", groups, resources)
+			}
+			verbs, _ := rule["verbs"].([]any)
+			if len(verbs) != 1 || verbs[0] != "get" {
+				t.Errorf("namespace lookup verbs=%v, want only get", verbs)
+			}
+			names, _ := rule["resourceNames"].([]any)
+			if len(names) != 1 || names[0] != "rhiza" {
+				t.Errorf("namespace lookup resourceNames=%v, want only rhiza", names)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fencer ClusterRole must contain a namespace get rule scoped to rhiza")
+	}
+}

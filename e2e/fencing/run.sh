@@ -227,7 +227,9 @@ k create secret tls rhiza-fencer-tls --cert="$fencing_tmp/tls.crt" --key="$fenci
 k create configmap rhiza-fencer-ca --from-file="ca.crt=$fencing_tmp/tls.crt"
 k create secret tls rhiza-runtime-agent-tls --cert="$fencing_tmp/tls.crt" --key="$fencing_tmp/tls.key"
 k create secret generic rhiza-runtime-agent-ca --from-file="ca.crt=$fencing_tmp/tls.crt"
-sed -e "s/namespace: rhiza$/namespace: $fencing_namespace/" -e 's/image: rhiza-operator:latest$/image: rhiza-fencing-operator:local/' \
+sed -e "s/namespace: rhiza$/namespace: $fencing_namespace/" \
+  -e "s/resourceNames: \[rhiza\]$/resourceNames: [$fencing_namespace]/" \
+  -e 's/image: rhiza-operator:latest$/image: rhiza-fencing-operator:local/' \
   -e "s/QUALIFIED_CONTAINERD_VERSION/$fencing_runtime_version/" -e "s/QUALIFIED_CONTAINERD_RUNTIME_TYPE/$fencing_runtime_type/" -e "s/QUALIFIED_PRIVATE_CGROUP_V2_PROFILE_ID/$fencing_profile_id/" \
   -e "s/QUALIFIED_LINUX_KERNEL_RELEASE/$fencing_kernel/" -e 's/PINNED_RHIZA_FENCER_DEPLOYMENT_UID/pending-authority-uid/' \
   deploy/operator/fencing/authority.yaml >"$fencing_tmp/authority.yaml"

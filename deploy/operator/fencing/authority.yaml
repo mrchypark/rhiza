@@ -51,8 +51,8 @@ roleRef:
   kind: Role
   name: rhiza-fencer
 ---
-# TokenReview is cluster-scoped, but grants no Pod/Node mutation permission.
-# Install only after explicitly reviewing this permission.
+# TokenReview and namespace UID lookup are cluster-scoped; neither grants
+# Pod/Node mutation permission. Install only after reviewing these permissions.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -64,6 +64,13 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get]
+  # The preflight binds a bootstrap candidate to this namespace's live UID.
+  # Keep this cluster-scoped lookup pinned to the shipped namespace; renderers
+  # for isolated qualification namespaces must rewrite this resourceName.
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get]
+    resourceNames: [rhiza]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

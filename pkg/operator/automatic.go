@@ -68,9 +68,14 @@ type autoControl struct {
 	Completions       []time.Time                    `json:"completions,omitempty"`
 	Sequence          uint64                         `json:"sequence"`
 
-	Intent    *autoIntent          `json:"intent,omitempty"`
-	Completed *autoCompletion      `json:"completed,omitempty"`
-	Learners  []learnerIncarnation `json:"learners,omitempty"`
+	Intent *autoIntent `json:"intent,omitempty"`
+	// BootstrapGenesis is set only when the protected fencer preflight
+	// authenticated the exact initial held HEAD mutation and runtime cohort.
+	// It is controller-side durable intent, not authority; the fencer remains
+	// authoritative for the binding and closed proof.
+	BootstrapGenesis *BootstrapGenesisBinding `json:"bootstrapGenesis,omitempty"`
+	Completed        *autoCompletion          `json:"completed,omitempty"`
+	Learners         []learnerIncarnation     `json:"learners,omitempty"`
 }
 
 const autoBindingVersion = 1
@@ -595,6 +600,75 @@ func expectedBootstrapCandidate(r *ClusterResource, sts object) bootstrapCandida
 	return bootstrapCandidate{Version: 1, VoterCount: r.Spec.VoterCount, HTTPPort: r.Spec.HTTPPort, PeerPort: r.Spec.PeerPort, LogicalID: r.Spec.LogicalID, StatefulSet: r.Spec.StatefulSet, StatefulSetUID: str(nested(sts, "metadata", "uid")), AdoptClusterID: r.Spec.AdoptClusterID, Container: r.Spec.Container, ClusterDomain: r.Spec.ClusterDomain, ServiceName: str(nested(sts, "spec", "serviceName"))}
 }
 
+func (c *Controller) readBootstrapCandidate(ctx context.Context, r *ClusterResource, sts object) (bool, error) {
+	var stored bootstrapCandidate
+	reader, err := c.Bucket.Get(ctx, c.bootstrapCandidateKey(r))
+	if c.Bucket.IsObjNotFoundErr(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("fresh bootstrap reservation is unavailable")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(reader, 64<<10))
+	closeErr := reader.Close()
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if readErr != nil || closeErr != nil || len(data) >= 64<<10 || decoder.Decode(&stored) != nil || decoder.Decode(new(any)) != io.EOF {
+		return false, fmt.Errorf("fresh bootstrap reservation is invalid")
+	}
+	if stored != expectedBootstrapCandidate(r, sts) {
+		return false, fmt.Errorf("fresh bootstrap reservation differs from the current workload contract")
+	}
+	return true, nil
+}
+
+// archiveMembershipMissing distinguishes the only recoverable bootstrap
+// signal (definitive object-not-found) from unreadable or malformed history.
+// A present object is left to the ordinary membership validation path.
+func (c *Controller) archiveMembershipMissing(ctx context.Context, sourceID string) (bool, error) {
+	reader, err := c.Bucket.Get(ctx, path.Join(c.Prefix, sourceID, "voters/membership.json"))
+	if c.Bucket.IsObjNotFoundErr(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("source membership history is unavailable")
+	}
+	if err := reader.Close(); err != nil {
+		return false, fmt.Errorf("source membership history is unavailable")
+	}
+	return false, nil
+}
+
+func sameBootstrapTargets(targets []FenceTarget, voters []VoterPod, captured map[quepaxa.NodeID]FenceTarget) bool {
+	if len(targets) == 0 || len(targets) != len(voters) {
+		return false
+	}
+	byID := make(map[string]FenceTarget, len(targets))
+	for _, target := range targets {
+		if target.NodeID == "" || target.Pod == "" || target.PodUID == "" || target.WALIdentity == "" || target.NodeName == "" || target.NodeUID == "" || target.ContainerID == "" || target.ImageID == "" {
+			return false
+		}
+		if _, exists := byID[target.NodeID]; exists {
+			return false
+		}
+		byID[target.NodeID] = target
+	}
+	seenPods := make(map[string]bool, len(voters))
+	for _, voter := range voters {
+		target, ok := byID[string(voter.NodeID)]
+		if !ok || target.Pod != voter.Pod || seenPods[target.Pod] {
+			return false
+		}
+		if captured != nil {
+			if previous, exists := captured[voter.NodeID]; !exists || previous != target {
+				return false
+			}
+		}
+		seenPods[target.Pod] = true
+	}
+	return true
+}
+
 func bootstrapTemplateInstalled(ctr object, r *ClusterResource) bool {
 	secretName := bootstrapSecretName(r)
 	found := false
@@ -800,6 +874,15 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if err != nil {
 		return block(nil, err.Error())
 	}
+	if state == nil || state.BootstrapGenesis != nil {
+		handled, message, err := c.reconcileAutomaticBootstrapGenesis(ctx, r, sts, ctr, env, state, version, members, adopted)
+		if err != nil {
+			return block(state, err.Error())
+		}
+		if handled {
+			return c.autoStatus(ctx, r, state, "Observing", message)
+		}
+	}
 	if state == nil {
 		candidateExists, err := c.Bucket.Exists(ctx, c.bootstrapCandidateKey(r))
 		if err != nil {
@@ -916,6 +999,15 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 	if state.Intent != nil {
 		return c.advanceAutomatic(ctx, r, state, version, sts)
 	}
+	if state.BootstrapGenesis != nil {
+		handled, message, err := c.reconcileAutomaticBootstrapGenesis(ctx, r, sts, ctr, env, state, version, members, adopted)
+		if err != nil {
+			return block(state, err.Error())
+		}
+		if handled {
+			return c.autoStatus(ctx, r, state, "Observing", message)
+		}
+	}
 	if !r.Spec.Automatic || r.Metadata["deletionTimestamp"] != nil {
 		return c.autoStatus(ctx, r, state, "Manual", "new automatic recovery is suspended")
 	}
@@ -996,6 +1088,161 @@ func (c *Controller) reconcileCluster(ctx context.Context, r *ClusterResource) e
 		return err
 	}
 	return c.autoStatus(ctx, r, state, string(decision), message)
+}
+
+// reconcileAutomaticBootstrapGenesis is the only automatic path that may
+// bypass archive membership discovery. It requires an immutable bootstrap
+// reservation, a definitive missing membership object, and the authenticated
+// CONTROL preflight for the exact held initial HEAD/cohort. Any later fence is
+// still submitted through the normal durable automatic intent and Fence proof.
+func (c *Controller) reconcileAutomaticBootstrapGenesis(ctx context.Context, r *ClusterResource, sts, ctr object, env map[string]string, state *autoControl, version *objstore.ObjectVersion, members []quepaxa.Member, adopted bool) (bool, string, error) {
+	if state != nil && state.BootstrapGenesis == nil {
+		return false, "", nil
+	}
+	if state != nil && (state.Intent != nil || state.BootstrapGenesis == nil) {
+		return false, "", nil
+	}
+	if !r.Spec.Automatic || !r.Spec.Bootstrap || r.Metadata["deletionTimestamp"] != nil || r.Spec.Policy == nil || !r.Spec.Policy.AllowDataLoss {
+		if state != nil {
+			return true, "bootstrap recovery policy changed; no further fencing will start", nil
+		}
+		return false, "", nil
+	}
+	if err := validateClusterRuntime(r, ctr, env); err != nil {
+		return false, "", err
+	}
+	if err := noPVC(sts, ctr, env); err != nil {
+		return false, "", err
+	}
+	if env["RHIZA_CLUSTER_ID"] != r.Spec.AdoptClusterID || env["RHIZA_OBJSTORE_DURABILITY"] != "async" || env["RHIZA_ENABLE_RECONFIGURATION"] != "true" {
+		return false, "", nil
+	}
+	exists, err := c.readBootstrapCandidate(ctx, r, sts)
+	if err != nil || !exists {
+		if state != nil {
+			return true, "bootstrap candidate is unavailable or changed", err
+		}
+		return false, "", err
+	}
+	missing, err := c.archiveMembershipMissing(ctx, r.Spec.AdoptClusterID)
+	if err != nil {
+		return false, "", err
+	}
+	if !missing {
+		if state == nil {
+			return false, "", nil
+		}
+		registered, err := c.sourceMembership(ctx, path.Join(c.Prefix, r.Spec.AdoptClusterID))
+		if err != nil || !adopted || registered != recovery.NewMembershipRecord(r.Spec.AdoptClusterID, members, env["RHIZA_OBJSTORE_DURABILITY"]) {
+			return true, "bootstrap membership appeared but does not match the source contract", err
+		}
+		state.BootstrapGenesis = nil
+		state.SuspectedSince = time.Time{}
+		if err := c.saveAuto(ctx, r, state, version); err != nil {
+			return true, "", err
+		}
+		return true, "initial archive membership is now registered; resuming ordinary observation", nil
+	}
+	if !adopted || len(members) != r.Spec.VoterCount {
+		return false, "", nil
+	}
+	allowed, err := allowedGenerationVoterIDs(r, sts, state)
+	if err != nil {
+		return false, "", err
+	}
+	if err := voterCountContract(r, sts, members, adopted, true, allowed); err != nil {
+		return false, "", err
+	}
+	if err := c.validateBootstrappedMembers(ctx, r, sts, adopted, members, allowed); err != nil {
+		return false, "", err
+	}
+	preflight, ok := c.Fencer.(BootstrapGenesisPreflighter)
+	if !ok || preflight == nil {
+		if state != nil {
+			return true, "authenticated bootstrap preflight is unavailable", nil
+		}
+		return false, "", nil
+	}
+	response, err := preflight.BootstrapGenesisPreflight(ctx, BootstrapGenesisPreflightRequest{
+		ClusterName: str(r.Metadata["name"]), ClusterUID: str(r.Metadata["uid"]), StatefulSetUID: str(nested(sts, "metadata", "uid")),
+	})
+	if err != nil {
+		if state != nil {
+			if errors.Is(err, ErrFencePending) {
+				return true, "bootstrap runtime cohort or canonical genesis evidence is pending", nil
+			}
+			return true, "authenticated bootstrap preflight failed", err
+		}
+		// A fresh zero-Pod bootstrap remains on the existing path. Once Pods
+		// exist, the old path refuses to reinitialize them and this branch stays
+		// fail-closed rather than inventing runtime identity.
+		pods, podErr := c.ownedPods(ctx, str(nested(sts, "metadata", "uid")))
+		if podErr == nil && len(pods) == 0 && int(number(nested(sts, "spec", "replicas"))) == 0 {
+			return false, "", nil
+		}
+		return true, "bootstrap genesis preflight is pending or unavailable", nil
+	}
+	if response.Binding.Version != 1 || response.Binding.ClusterName != str(r.Metadata["name"]) || response.Binding.ClusterUID != str(r.Metadata["uid"]) || !validEvidenceDigest(response.Binding.CandidateDigest) {
+		return true, "authenticated bootstrap preflight returned an invalid binding", nil
+	}
+	voters, err := derivedVoters(r, sts)
+	if err != nil || !sameBootstrapTargets(response.Targets, voters, nil) {
+		return true, "authenticated bootstrap preflight differs from the declared voter inventory", err
+	}
+	if state == nil {
+		bindingKey := path.Join(c.Prefix, "automatic-workloads", c.Kube.Namespace, str(nested(sts, "metadata", "uid")), "binding.json")
+		bound, err := c.Bucket.Exists(ctx, bindingKey)
+		if err != nil || bound {
+			return true, "automatic bootstrap workload binding is unavailable or already claimed", err
+		}
+		identities := make(map[quepaxa.NodeID]FenceTarget, len(response.Targets))
+		for _, target := range response.Targets {
+			identities[quepaxa.NodeID(target.NodeID)] = target
+		}
+		state = &autoControl{Version: 1, BindingUID: str(r.Metadata["uid"]), BindingHash: autoBinding(r), BindingVersion: autoBindingVersion,
+			StatefulSetUID: str(nested(sts, "metadata", "uid")), ActiveClusterID: r.Spec.AdoptClusterID,
+			Voters: voters, Identities: identities, BootstrapGenesis: &response.Binding, SuspectedSince: time.Now().UTC()}
+		if err := c.saveAuto(ctx, r, state, nil); err != nil {
+			return true, "", err
+		}
+		return true, "protected bootstrap genesis is identified; starting the configured failure grace period", nil
+	}
+	if state.BootstrapGenesis == nil || *state.BootstrapGenesis != response.Binding || state.BindingUID != str(r.Metadata["uid"]) || state.StatefulSetUID != str(nested(sts, "metadata", "uid")) || state.ActiveClusterID != r.Spec.AdoptClusterID || !sameBootstrapTargets(response.Targets, state.Voters, state.Identities) {
+		return true, "bootstrap genesis binding or captured runtime cohort changed", nil
+	}
+	if state.SuspectedSince.IsZero() {
+		state.SuspectedSince = time.Now().UTC()
+		if err := c.saveAuto(ctx, r, state, version); err != nil {
+			return true, "", err
+		}
+		return true, "bootstrap failure grace period started", nil
+	}
+	// The protected preflight is the source of truth for this special
+	// observation; no API membership/read failure is translated to quorum loss.
+	observation := AutoObservation{Known: true, Voters: len(state.Voters), StoreAvailable: true, Durability: "async"}
+	decision, message := DecideAutoRecovery(*r.Spec.Policy, observation, time.Now().UTC(), state.SuspectedSince, state.Completions)
+	if decision != AutoRecover {
+		if err := c.saveAuto(ctx, r, state, version); err != nil {
+			return true, "", err
+		}
+		return true, message, nil
+	}
+	if c.Fencer == nil {
+		return true, "fencing backend is unavailable", nil
+	}
+	state.Sequence++
+	name := "auto-" + shortID(state.BindingUID+":"+fmt.Sprint(state.Sequence))
+	request := FenceRequest{LogicalID: r.Spec.LogicalID, BindingUID: state.BindingUID, Namespace: c.Kube.Namespace,
+		StatefulSet: r.Spec.StatefulSet, StatefulSetUID: state.StatefulSetUID, SourceClusterID: state.ActiveClusterID,
+		OperationID: name, Scope: ScopeGeneration, Targets: append([]FenceTarget(nil), response.Targets...), BootstrapGenesis: state.BootstrapGenesis}
+	if err := validateRequest(&request); err != nil {
+		return true, "bootstrap generation fence request is invalid", err
+	}
+	state.Intent = &autoIntent{Request: request, Policy: *r.Spec.Policy, Durability: "async", Voters: append([]VoterPod(nil), state.Voters...), RecoveryName: name, LearnerName: name + "-learner"}
+	if err := c.saveAuto(ctx, r, state, version); err != nil {
+		return true, "", err
+	}
+	return true, "bootstrap generation fence is durably reserved", nil
 }
 
 // An empty async archive can authorize generation recovery only when its

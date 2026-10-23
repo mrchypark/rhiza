@@ -6,11 +6,28 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
 	"github.com/thanos-io/objstore"
 )
+
+// BootstrapGenesisFenceConfirmation is returned only by the protected
+// read-only fencer confirmation route. It carries the persisted fence request
+// alongside its canonical proof so the DATA-side authorization cannot treat a
+// locally stored proof-shaped object as authority.
+type BootstrapGenesisFenceConfirmation struct {
+	Request FenceRequest `json:"request"`
+	Proof   FenceProof   `json:"proof"`
+}
+
+// BootstrapGenesisFenceConfirmer confirms an already-persisted bootstrap
+// fence. Implementations must not reconcile, dispatch, settle, or otherwise
+// mutate source state while answering this query.
+type BootstrapGenesisFenceConfirmer interface {
+	ConfirmBootstrapGenesisFence(context.Context, FenceRequest) (BootstrapGenesisFenceConfirmation, error)
+}
 
 const automaticOwner = "rhiza.mrchypark.dev/automatic-owner"
 const automaticLogical = "rhiza.mrchypark.dev/automatic-logical"
@@ -23,6 +40,14 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	}
 	if intent.Request.BindingUID != state.BindingUID || intent.Request.SourceClusterID != state.ActiveClusterID || intent.Request.StatefulSetUID != state.StatefulSetUID {
 		return block("recovery intent differs from durable binding")
+	}
+	if state.BootstrapGenesis != nil {
+		if intent.Request.BootstrapGenesis == nil || *intent.Request.BootstrapGenesis != *state.BootstrapGenesis ||
+			intent.Request.Scope != ScopeGeneration || intent.Durability != "async" || !intent.Policy.AllowDataLoss {
+			return block("bootstrap genesis intent differs from its protected binding")
+		}
+	} else if intent.Request.BootstrapGenesis != nil {
+		return block("bootstrap genesis request has no durable automatic binding")
 	}
 	if intent.Proof == nil {
 		// This intent is already durably reserved. An ambiguous provider result is
@@ -194,6 +219,7 @@ func (c *Controller) advanceAutomatic(ctx context.Context, r *ClusterResource, s
 	}
 	state.Completions = recent
 	state.Completed = &autoCompletion{RecoveryName: intent.RecoveryName, RecoveryUID: intent.RecoveryUID, SpecHash: intent.SpecHash, FenceProofID: intent.Proof.ProofID, FenceRequestHash: intent.Proof.RequestHash, ClusterID: state.ActiveClusterID, Voters: append([]VoterPod(nil), state.Voters...), At: now}
+	state.BootstrapGenesis = nil
 	state.SuspectedSince = time.Time{}
 	state.Intent = nil
 	if err := c.saveAuto(ctx, r, state, version); err != nil {
@@ -238,8 +264,71 @@ func (c *Controller) authorizeAutomaticChild(ctx context.Context, r *Resource) (
 	if state.BindingUID != owner || intent == nil || intent.Proof == nil || intent.RecoveryUID != str(r.Metadata["uid"]) || intent.RecoveryName != resourceName(r) || intent.SpecHash != hashJSON(r.Spec) {
 		return false, nil
 	}
+	if state.BootstrapGenesis != nil {
+		if intent.Request.BootstrapGenesis == nil || *intent.Request.BootstrapGenesis != *state.BootstrapGenesis ||
+			r.Spec.SourceClusterID != state.ActiveClusterID || r.Spec.Durability != "async" || !r.Spec.AllowDataLoss {
+			return false, nil
+		}
+		if _, err := c.confirmBootstrapFence(ctx, intent.Request, *intent.Proof); err != nil {
+			if errors.Is(err, errBootstrapFenceConfirmationUnavailable) {
+				return false, nil
+			}
+			return false, err
+		}
+	} else if intent.Request.BootstrapGenesis != nil {
+		return false, nil
+	}
 	if err := validateFenceProof(intent.Request, intent.Proof); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+var errBootstrapFenceConfirmationUnavailable = errors.New("canonical bootstrap fence confirmation is unavailable")
+
+func (c *Controller) confirmBootstrapFence(ctx context.Context, request FenceRequest, dataProof FenceProof) (BootstrapGenesisFenceConfirmation, error) {
+	confirmer, ok := c.Fencer.(BootstrapGenesisFenceConfirmer)
+	if !ok || confirmer == nil {
+		return BootstrapGenesisFenceConfirmation{}, errBootstrapFenceConfirmationUnavailable
+	}
+	confirmation, err := confirmer.ConfirmBootstrapGenesisFence(ctx, request)
+	if err != nil {
+		return BootstrapGenesisFenceConfirmation{}, err
+	}
+	if hashJSON(confirmation.Request) != hashJSON(request) || hashJSON(confirmation.Proof) != hashJSON(dataProof) ||
+		confirmation.Proof.IndependentV2 == nil || !strings.HasPrefix(confirmation.Proof.ProofID, "independent-v2-") {
+		return BootstrapGenesisFenceConfirmation{}, fmt.Errorf("bootstrap recovery child has no matching canonical CONTROL fence proof")
+	}
+	if err := validateFenceProof(request, &confirmation.Proof); err != nil {
+		return BootstrapGenesisFenceConfirmation{}, err
+	}
+	return confirmation, nil
+}
+
+// confirmedBootstrapFenceForChild recovers the protected source cohort used
+// for the one initial-genesis case where the archive membership object itself
+// was never written. The DATA control record only supplies a lookup request;
+// confirmBootstrapFence verifies that request and proof with canonical CONTROL.
+func (c *Controller) confirmedBootstrapFenceForChild(ctx context.Context, r *Resource) (*BootstrapGenesisFenceConfirmation, error) {
+	owner := str(nested(r.Metadata, "annotations", automaticOwner))
+	logical := str(nested(r.Metadata, "annotations", automaticLogical))
+	if owner == "" || !identifier.MatchString(logical) {
+		return nil, nil
+	}
+	state, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+	if err != nil {
+		return nil, err
+	}
+	intent := state.Intent
+	if state.BootstrapGenesis == nil || intent == nil || intent.Proof == nil || state.BindingUID != owner ||
+		intent.RecoveryUID != str(r.Metadata["uid"]) || intent.RecoveryName != resourceName(r) || intent.SpecHash != hashJSON(r.Spec) ||
+		intent.Request.BootstrapGenesis == nil || *intent.Request.BootstrapGenesis != *state.BootstrapGenesis ||
+		r.Spec.SourceClusterID != state.ActiveClusterID || r.Spec.Durability != "async" || !r.Spec.AllowDataLoss {
+		return nil, nil
+	}
+	confirmation, err := c.confirmBootstrapFence(ctx, intent.Request, *intent.Proof)
+	if err != nil {
+		return nil, err
+	}
+	return &confirmation, nil
 }

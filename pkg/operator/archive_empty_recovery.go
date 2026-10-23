@@ -189,12 +189,18 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: source durability policy does not authorize empty recovery")
 	}
 	sourceMembership, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "voters/membership.json"), 64<<10)
-	if err != nil {
-		return ArchiveEmptyRecoveryResponse{}, err
-	}
 	var sourceRecord recovery.MembershipRecord
-	if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceVoters, sourceDurability) {
-		return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: canonical source membership differs from enrolled workload"))
+	if err == nil {
+		if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceVoters, sourceDurability) {
+			return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: canonical source membership differs from enrolled workload"))
+		}
+	} else if e.ArchiveBucket.IsObjNotFoundErr(err) {
+		sourceRecord, err = e.bootstrapGenesisMembership(ctx, request, stored, env, sourceID, sourceDurability, sourceState, fence)
+		if err != nil {
+			return ArchiveEmptyRecoveryResponse{}, err
+		}
+	} else {
+		return ArchiveEmptyRecoveryResponse{}, err
 	}
 	claimMode := request.RecoveryMode
 	if claimMode == "" {
@@ -269,6 +275,45 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
 	return response, nil
+}
+
+func (e *FencingExecutor) bootstrapGenesisMembership(ctx context.Context, request ArchiveEmptyRecoveryRequest, stored Resource, env map[string]string, sourceID, sourceDurability string, state fenceLedger, fence fenceResource) (recovery.MembershipRecord, error) {
+	if sourceDurability != "async" || !request.AllowDataLoss || !stored.Spec.AllowDataLoss ||
+		fence.Spec.BootstrapGenesis == nil || fence.Spec.Scope != ScopeGeneration || fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil ||
+		fence.Spec.OperationID != request.SourceFenceOperationID || fence.Spec.SourceClusterID != sourceID || fence.Spec.StatefulSetUID != request.StatefulSetUID {
+		return recovery.MembershipRecord{}, fmt.Errorf("fencing: missing source membership is not covered by a canonical async bootstrap fence")
+	}
+	if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
+		return recovery.MembershipRecord{}, err
+	}
+	if err := validateIndependentV2(fence.Spec, fence.Status.Proof.IndependentV2); err != nil || fence.Status.Proof.IndependentV2.LedgerHash != e.ledgerHash(state) {
+		return recovery.MembershipRecord{}, errors.Join(err, fmt.Errorf("fencing: bootstrap fence proof differs from the closed CONTROL root"))
+	}
+	candidate, targets, err := e.bootstrapGenesisFenceCandidate(ctx, fence.Spec, state, true)
+	if err != nil || fence.Spec.BootstrapGenesis.CandidateDigest != hashJSON(candidate) || fence.Spec.BootstrapGenesis.ClusterUID != candidate.ClusterUID {
+		return recovery.MembershipRecord{}, errors.Join(err, fmt.Errorf("fencing: bootstrap membership candidate differs from the closed CONTROL cohort"))
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil || len(members) != len(targets) {
+		return recovery.MembershipRecord{}, errors.Join(err, fmt.Errorf("fencing: declared bootstrap voters do not match the closed CONTROL cohort"))
+	}
+	targetIDs := make(map[string]bool, len(targets))
+	for _, target := range targets {
+		if target.NodeID == "" || targetIDs[target.NodeID] {
+			return recovery.MembershipRecord{}, fmt.Errorf("fencing: closed bootstrap voter identities are ambiguous")
+		}
+		targetIDs[target.NodeID] = true
+	}
+	for _, member := range members {
+		if !targetIDs[string(member.ID)] {
+			return recovery.MembershipRecord{}, fmt.Errorf("fencing: declared bootstrap voter is not in the closed CONTROL cohort")
+		}
+		delete(targetIDs, string(member.ID))
+	}
+	if len(targetIDs) != 0 {
+		return recovery.MembershipRecord{}, fmt.Errorf("fencing: closed CONTROL cohort is missing a declared bootstrap voter")
+	}
+	return recovery.NewMembershipRecord(sourceID, members, sourceDurability), nil
 }
 
 func (e *FencingExecutor) readExistingEmptyRecovery(ctx context.Context, request ArchiveEmptyRecoveryRequest, stored Resource, basePrefix string, targetScope fencing.ArchiveScope) (ArchiveEmptyRecoveryResponse, bool, error) {
