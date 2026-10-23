@@ -278,6 +278,26 @@ func TestMutationJournalGuardedLogicalResolutionRejectsMismatchedEvidence(t *tes
 	})
 }
 
+func TestMutationJournalAssignedLearnerRuntimeAndGuardedResolution(t *testing.T) {
+	p, evidence := guardedCreateProducer(t, MutationHeldExecutionProfile)
+	p.Runtime.AssignmentID = "learner-assignment"
+	evidence.Runtime = p.Runtime
+	if err := p.Validate(); err != nil {
+		t.Fatalf("assigned learner producer did not validate: %v", err)
+	}
+	mustJournal(t, p.ResolveGuardedLogical(evidence.ProducerUID, 1, evidence))
+	entry := p.Entries[1]
+	if err := p.ValidateGuardedLogicalResolution(evidence.ProducerUID, 1, entry); err != nil {
+		t.Fatalf("assigned learner guarded resolution did not validate: %v", err)
+	}
+	wrong := *entry.GuardedLogicalResolution
+	wrong.Runtime.AssignmentID = "different-assignment"
+	entry.GuardedLogicalResolution = &wrong
+	if err := p.ValidateGuardedLogicalResolution(evidence.ProducerUID, 1, entry); err == nil {
+		t.Fatal("guarded resolution with a mismatched assignment was accepted")
+	}
+}
+
 func TestHeldProfileRetainsOrdinaryGenerationCASAndDeleteOperations(t *testing.T) {
 	for _, test := range []struct {
 		name   string

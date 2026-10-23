@@ -187,7 +187,7 @@ func (p *MutationProducer) Validate() error {
 	if p == nil {
 		return fmt.Errorf("fencing: missing mutation producer")
 	}
-	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID}
+	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID}
 	if err := p.Runtime.Validate(id); err != nil {
 		return err
 	}
@@ -515,7 +515,7 @@ func (p *MutationProducer) ValidateGuardedLogicalResolution(producerUID string, 
 	if p == nil || p.Phase != MutationClosed || p.WALIdentity == "" || producerUID == "" || entry.GuardedLogicalResolution == nil || entry.GuardedLogicalResolution.ProducerUID != producerUID {
 		return fmt.Errorf("fencing: guarded logical resolution producer identity differs")
 	}
-	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, WALIdentity: p.WALIdentity}
+	id := Identity{SourceClusterID: p.Runtime.SourceClusterID, NodeID: p.Runtime.NodeID, PodUID: p.Runtime.PodUID, RunID: p.Runtime.RunID, AssignmentID: p.Runtime.AssignmentID, WALIdentity: p.WALIdentity}
 	if err := p.Runtime.Validate(id); err != nil {
 		return err
 	}

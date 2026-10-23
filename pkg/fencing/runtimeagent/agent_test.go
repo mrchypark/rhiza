@@ -178,6 +178,51 @@ func TestPendingStopReturnsBoundedStageAndPreservesPendingSemantics(t *testing.T
 	}
 }
 
+func TestAssignedLearnerEnrollmentPreservesAssignmentIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		changeBinding func(*fencing.RuntimeBinding)
+		wantErr       bool
+	}{
+		{name: "exact assignment accepted"},
+		{name: "mismatched assignment rejected", changeBinding: func(binding *fencing.RuntimeBinding) { binding.AssignmentID = "different-assignment" }, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			backend := &testBackend{changeBinding: test.changeBinding}
+			service, err := New(testServiceConfig(dir, backend))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewTLSServer(service.Handler())
+			t.Cleanup(server.Close)
+			tokenFile := filepath.Join(dir, "token")
+			if err := os.WriteFile(tokenFile, []byte("trusted-test-token"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			client := Client{BaseURL: server.URL, TokenFile: tokenFile, HTTP: server.Client()}
+			binding := testBaseBinding()
+			binding.AssignmentID = "learner-assignment"
+			got, err := client.Enroll(t.Context(), binding)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("mismatched assignment was accepted: %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("assigned learner enrollment failed: %v", err)
+			}
+			if got.AssignmentID != binding.AssignmentID {
+				t.Fatalf("enrollment assignment=%q, want %q", got.AssignmentID, binding.AssignmentID)
+			}
+		})
+	}
+}
+
 func (b *testBackend) Stop(_ context.Context, binding fencing.RuntimeBinding, request fencing.StopRequest, _ json.RawMessage) (json.RawMessage, error) {
 	b.stops++
 	if b.onStop != nil {

@@ -29,7 +29,7 @@ type CgroupScope struct {
 // the fixed cgroup root and requires the CRI PID to be a direct member of that
 // populated cgroup. procRoot/cgroupRoot come from fixed agent config.
 func captureCgroupScope(procRoot, cgroupRoot string, pid uint32, cgroupsPath string, binding fencing.RuntimeBinding, profileID string) (CgroupScope, error) {
-	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID}
+	identity := fencing.Identity{SourceClusterID: binding.SourceClusterID, NodeID: binding.NodeID, PodUID: binding.PodUID, RunID: binding.RunID, AssignmentID: binding.AssignmentID}
 	if pid == 0 || profileID == "" || !filepath.IsAbs(procRoot) || !filepath.IsAbs(cgroupRoot) || binding.Validate(identity) != nil {
 		return CgroupScope{}, fmt.Errorf("%w: invalid cgroup capture configuration", ErrUnverified)
 	}
