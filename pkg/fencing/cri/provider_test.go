@@ -181,7 +181,7 @@ func (f *fakeRuntime) StopPodSandbox(_ context.Context, request *runtimeapi.Stop
 	}
 	f.sandbox.State = runtimeapi.PodSandboxState_SANDBOX_NOTREADY
 	if f.scopeEventsFile != "" && !f.stillRunning && !f.descendantRunning {
-		if err := os.WriteFile(f.scopeEventsFile, []byte("populated 0\nfrozen 0\n"), 0600); err != nil {
+		if err := os.WriteFile(f.scopeEventsFile, []byte("populated 0\nfrozen 0\n"), 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, status.Error(codes.Internal, "test cgroup update failed")
 		}
 	}
