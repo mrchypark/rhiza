@@ -287,6 +287,7 @@ func configureAutomaticBootstrapKubernetes(t *testing.T, f *heldProfileFixture, 
 	f.api.mu.Lock()
 	sts["spec"].(object)["template"].(object)["metadata"] = object{"labels": object{"app": "rhiza"}}
 	f.api.authStatefulSet = sts
+	f.api.objects["/apis/apps/v1/namespaces/test/statefulsets/rhiza"] = sts
 	// Registration derives the archive scope from the live StatefulSet
 	// collection, not only from the named object used by pod authentication.
 	f.api.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
