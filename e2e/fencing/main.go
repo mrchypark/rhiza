@@ -41,7 +41,7 @@ type obj = map[string]any
 
 func main() {
 	if len(os.Args) != 2 {
-		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
+		fatal(fmt.Errorf("usage: fencing-e2e manifests|local-cooperative-store-secret|wait-source|run|run-gcs-ha|run-gcs-ha-explicit|run-gcs-ha-async-empty|run-gcs-ha-async-empty-explicit|run-gcs-ha-async-nonempty|run-gcs-ha-ack-loss|run-gcs-ha-dead-pod|prepare-gcs-ha-initial-head-ack-loss|cleanup-gcs-ha-initial-head-ack-loss|run-gcs-ha-initial-head-ack-loss|runtime-probe|runtime-agent-request"))
 	}
 	if os.Args[1] == "prepare-gcs-ha-initial-head-ack-loss" {
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
@@ -120,6 +120,13 @@ func main() {
 		defer cancel()
 		fatal(configureGCSHA(ctx))
 		fatal(qualifyGCSAsyncEmptyExplicit(ctx))
+		return
+	}
+	if os.Args[1] == "run-gcs-ha-async-nonempty" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		fatal(configureGCSHA(ctx))
+		fatal(qualifyGCSAsyncNonempty(ctx))
 		return
 	}
 	if os.Args[1] == "run-gcs-ha-ack-loss" {
