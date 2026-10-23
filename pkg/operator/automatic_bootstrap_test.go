@@ -736,6 +736,89 @@ func TestAutomaticRecoveryChildReconcilesMissingMembershipFromCanonicalBootstrap
 	}
 }
 
+func TestManualMissingSourceMembershipReconcilesCanonicalEmptyRecovery(t *testing.T) {
+	f := newAutomaticBootstrapGenesisFixture(t)
+	controller, _, child, request, _ := closeAutomaticBootstrapForChild(t, f)
+	ctx := t.Context()
+	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
+		t.Fatalf("manual source must start without a membership record: exists=%t err=%v", exists, err)
+	}
+	child.Metadata["annotations"] = object{}
+	child.Spec.AllowMissingSourceMembership = true
+	child.Status.SpecHash = immutableSpecHash(child.Spec)
+	child.Status.ManualMembershipBindingDigest = ""
+	if !manualMissingSourceMembershipAllowed(&child) || child.Spec.Membership != nil {
+		t.Fatal("empty authorization fixture is not a default-off manual-only recovery child")
+	}
+	persistTestRecovery(t, f, child)
+	manualController := *controller
+	manualController.Automatic = false
+	for step := 0; step < 5; step++ {
+		if err := manualController.reconcile(ctx, &child); err != nil {
+			t.Fatalf("manual recovery reconcile step %d: %v", step, err)
+		}
+		persistTestRecovery(t, f, child)
+		if child.Status.Stage == "Stopping" {
+			break
+		}
+	}
+	if child.Status.Stage != "Stopping" || child.Status.RecoveryMode != RecoveryModeFrozenSource ||
+		child.Status.ManualMembershipBindingDigest == "" || child.Status.TargetBaseKind != "empty" || child.Status.Target == "" {
+		t.Fatalf("manual path did not persist its canonical binding and reach empty-target authorization: %+v", child.Status)
+	}
+	if exists, err := f.archive.Exists(ctx, "root/source/voters/membership.json"); err != nil || exists {
+		t.Fatalf("manual recovery fabricated source membership: exists=%t err=%v", exists, err)
+	}
+	targetMembershipKey := path.Join("root", child.Status.Target, "voters/membership.json")
+	if exists, err := f.archive.Exists(ctx, targetMembershipKey); err != nil || !exists {
+		t.Fatalf("manual recovery did not create the independently provisioned target membership: exists=%t err=%v", exists, err)
+	}
+	targetRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, child.Status.StatefulSetUID, child.Status.Target)
+	if err != nil || targetRoot.Ledger.EmptyRecoveryAuthorization == nil || targetRoot.Ledger.ArchiveGenesisRef != nil {
+		t.Fatalf("manual source binding did not authorize only the canonical empty target: root=%+v err=%v", targetRoot.Ledger, err)
+	}
+	sourceRoot, _, err := f.e.AuthorityState.ReadRoot(ctx, child.Status.StatefulSetUID, request.SourceClusterID)
+	if err != nil || sourceRoot.Ledger.ClosedBy != request.OperationID {
+		t.Fatalf("manual empty authorization lost its exact closed source CONTROL root: root=%+v err=%v", sourceRoot.Ledger, err)
+	}
+}
+
+func TestManualMissingSourceMembershipRejectsMalformedOrUnavailableRecord(t *testing.T) {
+	for _, name := range []string{"malformed-record", "membership-read-error"} {
+		t.Run(name, func(t *testing.T) {
+			f := newAutomaticBootstrapGenesisFixture(t)
+			controller, _, child, _, _ := closeAutomaticBootstrapForChild(t, f)
+			child.Metadata["annotations"] = object{}
+			child.Spec.AllowMissingSourceMembership = true
+			child.Status.SpecHash = immutableSpecHash(child.Spec)
+			persistTestRecovery(t, f, child)
+			if name == "malformed-record" {
+				if err := f.archive.Upload(t.Context(), "root/source/voters/membership.json", strings.NewReader("{")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				f.e.ArchiveBucket = membershipReadErrorBucket{Bucket: f.archive, key: "root/source/voters/membership.json"}
+			}
+			manualController := *controller
+			manualController.Automatic = false
+			err := manualController.reconcile(t.Context(), &child)
+			if err == nil && child.Status.Phase != "Blocked" {
+				t.Fatalf("manual recovery accepted %s as definitive membership absence: status=%+v", name, child.Status)
+			}
+			if child.Status.ManualMembershipBindingDigest != "" || child.Status.Target != "" || child.Status.Stage != "" {
+				t.Fatalf("invalid membership evidence advanced or bound manual recovery: %+v", child.Status)
+			}
+			if child.Status.Target != "" {
+				if exists, err := f.archive.Exists(t.Context(), path.Join("root", child.Status.Target, "voters/membership.json")); err != nil {
+					t.Fatal(err)
+				} else if exists {
+					t.Fatal("invalid membership evidence created a target membership")
+				}
+			}
+		})
+	}
+}
+
 func automaticBootstrapEmptyRecoveryDiagnostic(t *testing.T, f automaticBootstrapGenesisFixture, request FenceRequest, targetID string) string {
 	t.Helper()
 	f.api.mu.Lock()

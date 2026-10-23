@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 
@@ -619,11 +620,12 @@ type FrozenSourcePreflightRequest struct {
 }
 
 type FrozenSourcePreflightResponse struct {
-	Identity             recovery.FrozenSourceIdentity `json:"identity"`
-	ClosureReady         bool                          `json:"closureReady"`
-	ProofDigest          string                        `json:"proofDigest,omitempty"`
-	ClosedRootDigest     string                        `json:"closedRootDigest,omitempty"`
-	EmptyGenesisEligible bool                          `json:"emptyGenesisEligible,omitempty"`
+	Identity                      recovery.FrozenSourceIdentity `json:"identity"`
+	ClosureReady                  bool                          `json:"closureReady"`
+	ProofDigest                   string                        `json:"proofDigest,omitempty"`
+	ClosedRootDigest              string                        `json:"closedRootDigest,omitempty"`
+	EmptyGenesisEligible          bool                          `json:"emptyGenesisEligible,omitempty"`
+	ManualMembershipBindingDigest string                        `json:"manualMembershipBindingDigest,omitempty"`
 }
 
 type FrozenSourcePreflighter interface {
@@ -818,6 +820,23 @@ func (e *FencingExecutor) frozenSourcePreflight(ctx context.Context, request Fro
 	if !sameStrings(currentUIDs, proofUIDs) {
 		return FrozenSourcePreflightResponse{}, fmt.Errorf("fencing: source Pod inventory changed since independent proof")
 	}
+	if persisted.Spec.AllowMissingSourceMembership {
+		ctr, err := container(sts, persisted.Spec.Container)
+		if err != nil {
+			return FrozenSourcePreflightResponse{}, err
+		}
+		env, err := e.controller().environment(ctx, ctr)
+		if err != nil || noPVC(sts, ctr, env) != nil || e.controller().storeConfigMatches(env) != nil {
+			return FrozenSourcePreflightResponse{}, errors.Join(err, fmt.Errorf("fencing: manual source workload configuration is unavailable or unsafe"))
+		}
+		manualDigest, missing, err := e.manualMissingSourceMembershipBinding(ctx, persisted, env, archiveScope, state, fence)
+		if err != nil {
+			return FrozenSourcePreflightResponse{}, err
+		}
+		if missing {
+			result.ManualMembershipBindingDigest = manualDigest
+		}
+	}
 	result.ClosureReady = true
 	result.ProofDigest = hashJSON(fence.Status.Proof)
 	result.ClosedRootDigest = e.ledgerHash(state)
@@ -827,6 +846,84 @@ func (e *FencingExecutor) frozenSourcePreflight(ctx context.Context, request Fro
 		}
 	}
 	return result, nil
+}
+
+// manualMissingSourceMembershipBinding derives the opt-in binding only from a
+// definite DATA NotFound and the complete independently verified closed fence.
+// The resulting digest is not a source membership receipt; it only authorizes
+// the controller/fencer to use the declared cohort as target input.
+func (e *FencingExecutor) manualMissingSourceMembershipBinding(ctx context.Context, stored Resource, env map[string]string, scope fencing.ArchiveScope, state fenceLedger, fence fenceResource) (string, bool, error) {
+	reconfiguration, reconfigErr := reconfigurationEnabled(env)
+	if !stored.Spec.AllowMissingSourceMembership || stored.Spec.RecoveryID == "" ||
+		!stored.Spec.AllowDataLoss || stored.Status.SourceDurability != "async" || env["RHIZA_OBJSTORE_DURABILITY"] != "async" || reconfigErr != nil || !reconfiguration ||
+		str(nested(stored.Metadata, "annotations", automaticOwner)) != "" || str(nested(stored.Metadata, "annotations", automaticLogical)) != "" ||
+		stored.Spec.Membership != nil {
+		return "", false, errors.Join(reconfigErr, fmt.Errorf("fencing: manual missing-membership opt-in is not eligible"))
+	}
+	if e.ArchiveBucket == nil {
+		return "", false, fmt.Errorf("fencing: source membership store is unavailable")
+	}
+	key := path.Join(scope.Prefix, "voters/membership.json")
+	reader, err := e.ArchiveBucket.Get(ctx, key)
+	if err == nil {
+		if closeErr := reader.Close(); closeErr != nil {
+			return "", false, closeErr
+		}
+		return "", false, nil
+	}
+	if !e.ArchiveBucket.IsObjNotFoundErr(err) {
+		return "", false, fmt.Errorf("fencing: source membership cannot be verified")
+	}
+	if state.Ledger.ClosedBy != stored.Spec.RecoveryID || state.Ledger.ClosedHash == "" ||
+		fence.Spec.OperationID != stored.Spec.RecoveryID || fence.Spec.SourceClusterID != stored.Spec.SourceClusterID ||
+		fence.Spec.StatefulSetUID != stored.Status.StatefulSetUID || fence.Spec.Scope != ScopeGeneration ||
+		fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil {
+		return "", false, fmt.Errorf("fencing: manual missing-membership cohort is not bound to its closed CONTROL fence")
+	}
+	if err := validateFenceProof(fence.Spec, fence.Status.Proof); err != nil {
+		return "", false, err
+	}
+	if err := verifyIndependentProofCoverage(state, fence.Spec, fence.Status.Proof.IndependentV2); err != nil {
+		return "", false, err
+	}
+	members, err := recoveryMembers(env["RHIZA_CLUSTER_MEMBERS"])
+	if err != nil || len(members) < 3 || env["RHIZA_CLUSTER_ID"] != stored.Spec.SourceClusterID {
+		return "", false, errors.Join(err, fmt.Errorf("fencing: manual source cohort is incomplete"))
+	}
+	if len(fence.Spec.Targets) != len(members) {
+		return "", false, fmt.Errorf("fencing: manual source cohort differs from the closed CONTROL fence")
+	}
+	targets := make(map[string]FenceTarget, len(fence.Spec.Targets))
+	for _, target := range fence.Spec.Targets {
+		if target.NodeID == "" || target.Pod == "" || target.NodeID != target.Pod || target.PodUID == "" || target.WALIdentity == "" || targets[target.NodeID].NodeID != "" {
+			return "", false, fmt.Errorf("fencing: manual closed source cohort is incomplete or ambiguous")
+		}
+		targets[target.NodeID] = target
+	}
+	for _, member := range members {
+		if _, ok := targets[string(member.ID)]; !ok {
+			return "", false, fmt.Errorf("fencing: manual declared voter is absent from the closed CONTROL cohort")
+		}
+		delete(targets, string(member.ID))
+	}
+	if len(targets) != 0 {
+		return "", false, fmt.Errorf("fencing: closed CONTROL cohort contains an undeclared voter")
+	}
+	if stored.Status.SpecHash != immutableSpecHash(stored.Spec) || str(stored.Metadata["uid"]) == "" ||
+		stored.Status.RecoveryID != stored.Spec.RecoveryID || stored.Status.StatefulSetUID == "" {
+		return "", false, fmt.Errorf("fencing: manual recovery identity or immutable spec binding differs")
+	}
+	scopeHash, err := scope.Hash()
+	if err != nil {
+		return "", false, err
+	}
+	record := recovery.NewMembershipRecord(stored.Spec.SourceClusterID, members, "async")
+	digest := hashJSON([]any{"rhiza-manual-missing-source-membership-v1", str(stored.Metadata["uid"]), hashJSON(stored.Spec),
+		stored.Status.StatefulSetUID, scopeHash, e.ledgerHash(state), stableSourceFenceEvidenceDigest(fence), hashJSON(record)})
+	if stored.Status.ManualMembershipBindingDigest != "" && stored.Status.ManualMembershipBindingDigest != digest {
+		return "", false, fmt.Errorf("fencing: persisted manual source-cohort binding changed")
+	}
+	return digest, true, nil
 }
 
 func (e *FencingExecutor) validatePendingFrozenEmptyGenesis(ctx context.Context, state fenceLedger, scope fencing.ArchiveScope, uid, sourceID, recoveryID, closedRootDigest string) error {

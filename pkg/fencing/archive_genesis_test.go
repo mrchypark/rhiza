@@ -60,6 +60,27 @@ func TestArchiveGenesisRefSeparatesStableAndMutationScopes(t *testing.T) {
 	}
 }
 
+func TestArchiveGenesisForkAcceptsOnlyCanonicalManualMembershipBinding(t *testing.T) {
+	scope := ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: "root/target", ClusterID: "target"}
+	scopeHash, err := scope.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := hashJSON([]string{"manual-source-cohort"})
+	ref := ArchiveGenesisRef{Version: ArchiveGenesisVersion, ConfigID: 1, ScopeHash: scopeHash, Fork: &ArchiveGenesisFork{
+		AnchorKey: "recovery/generation-anchor.json", AnchorDigest: digest, IntentDigest: digest, ResultDigest: digest,
+		LineageDigest: digest, TargetPrefix: scope.Prefix, MembershipHash: digest,
+		ManualMembershipBindingDigest: digest, ConfigID: 1, BaseTip: 1, BasePrefixHash: digest, AnchorHash: digest,
+	}}
+	if err := ref.ValidateForScope(scope); err != nil {
+		t.Fatalf("valid fork with a manual source-cohort binding rejected: %v", err)
+	}
+	ref.Fork.ManualMembershipBindingDigest = "not-a-digest"
+	if err := ref.ValidateForScope(scope); err == nil {
+		t.Fatal("fork accepted a malformed manual source-cohort binding")
+	}
+}
+
 func TestArchiveEmptyRecoveryAuthorizationIsSeparateAndBoundToEmptySource(t *testing.T) {
 	digest := hashJSON([]string{"evidence"})
 	auth := ArchiveEmptyRecoveryAuthorization{
@@ -92,6 +113,24 @@ func TestArchiveEmptyRecoveryAuthorizationIsSeparateAndBoundToEmptySource(t *tes
 	bad.AllowDataLoss = false
 	if err := bad.Validate(); err == nil {
 		t.Fatal("async source authorization accepted without explicit data-loss policy")
+	}
+	manual := auth
+	manual.RecoveryMode = "frozen-source-v1"
+	manual.SourcePrefix, manual.BucketName, manual.BucketMetageneration = "root/source", "archive", "1"
+	manual.LifecyclePolicyDigest = digest
+	manual.ManualMembershipBindingDigest = digest
+	if err := manual.Validate(); err != nil {
+		t.Fatalf("valid frozen-source manual cohort binding rejected: %v", err)
+	}
+	badManual := manual
+	badManual.ManualMembershipBindingDigest = "not-a-digest"
+	if err := badManual.Validate(); err == nil {
+		t.Fatal("frozen authorization accepted a malformed manual cohort binding")
+	}
+	legacyManual := auth
+	legacyManual.ManualMembershipBindingDigest = digest
+	if err := legacyManual.Validate(); err == nil {
+		t.Fatal("legacy authorization accepted a frozen-source manual cohort binding")
 	}
 
 	auth.SourceHeadDigest = hashJSON([]string{"sealed-source-head"})

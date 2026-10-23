@@ -116,6 +116,19 @@ func TestFrozenSourcePreflightUsesReadOnlyControlAuthority(t *testing.T) {
 	if err != nil || response.Identity.StatefulSetUID != f.runtime.StatefulSetUID || !response.EmptyGenesisEligible || response.ClosureReady {
 		t.Fatalf("authenticated read-only preflight did not use canonical CONTROL state: response=%+v err=%v", response, err)
 	}
+	manualResource := resource
+	manualResource.Spec.AllowMissingSourceMembership = true
+	manualResource.Status.SpecHash = immutableSpecHash(manualResource.Spec)
+	f.api.mu.Lock()
+	f.api.objects[f.e.controller().resourcePath(resourceName(&manualResource))] = jsonObjectForPreflight(t, manualResource)
+	f.api.mu.Unlock()
+	manualPending, err := client.FrozenSourcePreflight(ctx, FrozenSourcePreflightRequest{RecoveryName: resourceName(&manualResource), RecoveryUID: "recovery-uid"})
+	if err != nil || manualPending.ClosureReady || manualPending.ManualMembershipBindingDigest != "" {
+		t.Fatalf("manual cohort binding escaped before a closed CONTROL fence: response=%+v err=%v", manualPending, err)
+	}
+	f.api.mu.Lock()
+	f.api.objects[f.e.controller().resourcePath(resourceName(&resource))] = jsonObjectForPreflight(t, resource)
+	f.api.mu.Unlock()
 	controlAfter, controlVersionAfter, err := f.e.AuthorityState.ReadRoot(ctx, f.runtime.StatefulSetUID, f.runtime.SourceClusterID)
 	if err != nil || hashJSON(controlBefore) != hashJSON(controlAfter) || controlVersion.Value != controlVersionAfter.Value {
 		t.Fatalf("preflight mutated canonical CONTROL state: before=%+v after=%+v err=%v", controlBefore, controlAfter, err)

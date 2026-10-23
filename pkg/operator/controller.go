@@ -198,16 +198,22 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 		return reject(err.Error())
 	}
 	if membershipMissing {
-		if bootstrapConfirmation == nil || !c.useFrozenSourceFork(source) || mode != "async" || !r.Spec.AllowDataLoss {
+		if bootstrapConfirmation == nil && manualMissingSourceMembershipAllowed(r) && c.useFrozenSourceFork(source) && mode == "async" && r.Spec.AllowDataLoss {
+			// This is only a provisional target input. The canonical fencer must
+			// independently bind the complete declared cohort to the closed root
+			// before any source-stop or target authorization side effect.
+			registered = recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode)
+		} else if bootstrapConfirmation == nil || !c.useFrozenSourceFork(source) || mode != "async" || !r.Spec.AllowDataLoss {
 			return reject("immutable source membership is missing outside the confirmed frozen bootstrap-genesis path")
+		} else {
+			members, err = c.confirmedBootstrapSourceMembers(ctx, r, sts, ctr, env, members, *bootstrapConfirmation)
+			if err != nil {
+				return reject("confirmed bootstrap source cohort differs from canonical fence evidence: " + err.Error())
+			}
+			// This value is a derived input for the target only. It is never written
+			// back to the source archive or treated as an existing source receipt.
+			registered = recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode)
 		}
-		members, err = c.confirmedBootstrapSourceMembers(ctx, r, sts, ctr, env, members, *bootstrapConfirmation)
-		if err != nil {
-			return reject("confirmed bootstrap source cohort differs from canonical fence evidence: " + err.Error())
-		}
-		// This value is a derived input for the target only. It is never written
-		// back to the source archive or treated as an existing source receipt.
-		registered = recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode)
 	} else if registered != recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode) {
 		return reject("immutable source membership or durability differs from StatefulSet")
 	}
@@ -312,6 +318,20 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 			}
 			if !preflight.ClosureReady {
 				return c.record(ctx, r, "Recovering", "frozen-source closure proof is pending")
+			}
+			if membershipMissing {
+				if !manualMissingSourceMembershipAllowed(r) || mode != "async" || !r.Spec.AllowDataLoss || preflight.ManualMembershipBindingDigest == "" {
+					return reject("manual missing-membership authorization is not bound to a closed canonical source cohort")
+				}
+				if r.Status.ManualMembershipBindingDigest == "" {
+					r.Status.ManualMembershipBindingDigest = preflight.ManualMembershipBindingDigest
+					return c.record(ctx, r, "Recovering", "manual source-cohort binding persisted before target authorization")
+				}
+				if r.Status.ManualMembershipBindingDigest != preflight.ManualMembershipBindingDigest {
+					return reject("manual source-cohort binding changed during recovery")
+				}
+			} else if r.Status.ManualMembershipBindingDigest != "" {
+				return reject("manual source-cohort binding exists without a missing source membership")
 			}
 			configuredIdentity, err := c.frozenSourceIdentity(r, source)
 			if err != nil || configuredIdentity != preflight.Identity {
@@ -521,7 +541,7 @@ func (c *Controller) advance(ctx context.Context, r *Resource, s sourceState) er
 				request := ArchiveForkGenesisRequest{
 					StatefulSetUID: r.Status.StatefulSetUID, TargetClusterID: r.Status.Target,
 					OperationID: c.operationID(r), SourceFenceOperationID: r.Spec.RecoveryID, RecoveryMode: r.Status.RecoveryMode,
-					BucketEnvironment: r.Status.FrozenBucketEnvironment,
+					BucketEnvironment: r.Status.FrozenBucketEnvironment, ManualMembershipBindingDigest: r.Status.ManualMembershipBindingDigest,
 				}
 				if r.Status.RecoveryMode == RecoveryModeFrozenSource {
 					request.RecoveryName = resourceName(r)
@@ -598,6 +618,7 @@ func (c *Controller) registerEmptyRecovery(ctx context.Context, r *Resource, mem
 		TargetMembershipHash:   authorityStateDigest(jsonBytes(membership)),
 		TargetDurability:       r.Spec.Durability, AllowDataLoss: r.Spec.AllowDataLoss,
 		PolicyDigest: hashJSON(r.Spec), RecoveryMode: r.Status.RecoveryMode, BucketEnvironment: r.Status.FrozenBucketEnvironment,
+		ManualMembershipBindingDigest: r.Status.ManualMembershipBindingDigest,
 	}
 	if request.RecoveryName == "" || request.StatefulSetUID == "" || request.TargetClusterID == "" || request.OperationID == "" ||
 		request.SourceFenceOperationID == "" || request.TargetMembershipHash == "" || request.PolicyDigest == "" {
@@ -1360,6 +1381,17 @@ func (c *Controller) sourceMembershipOrMissing(ctx context.Context, prefix strin
 		return record, false, fmt.Errorf("source membership or durability history is invalid")
 	}
 	return record, false, nil
+}
+
+func manualMissingSourceMembershipAllowed(r *Resource) bool {
+	if r == nil || !r.Spec.AllowMissingSourceMembership || r.Spec.RecoveryID == "" ||
+		str(r.Metadata["uid"]) == "" || r.Spec.Membership != nil {
+		return false
+	}
+	// Automatic recovery owns a different policy and binding. This opt-in is
+	// deliberately unavailable to annotated automatic children.
+	return str(nested(r.Metadata, "annotations", automaticOwner)) == "" &&
+		str(nested(r.Metadata, "annotations", automaticLogical)) == ""
 }
 
 func (c *Controller) confirmedBootstrapSourceMembers(ctx context.Context, r *Resource, sts, ctr object, env map[string]string, members []quepaxa.Member, confirmation BootstrapGenesisFenceConfirmation) ([]quepaxa.Member, error) {
