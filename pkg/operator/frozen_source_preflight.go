@@ -322,6 +322,28 @@ func (e *FencingExecutor) deriveBootstrapGenesisCandidate(ctx context.Context, c
 	if err != nil {
 		return zero, nil, err
 	}
+	if !bootstrapTemplateInstalled(ctr, &cluster) {
+		return zero, nil, fmt.Errorf("fencing: bootstrap credential template is not installed")
+	}
+	secretName := bootstrapSecretName(&cluster)
+	for _, raw := range list(ctr["env"]) {
+		entry := asObject(raw)
+		if str(entry["name"]) != "RHIZA_CLUSTER_MEMBERS" {
+			continue
+		}
+		if str(nested(entry, "valueFrom", "secretKeyRef", "name")) != secretName || str(nested(entry, "valueFrom", "secretKeyRef", "key")) != "members" {
+			return zero, nil, fmt.Errorf("fencing: bootstrap membership must reference the immutable members key")
+		}
+	}
+	var credentials object
+	if err := e.Kube.Get(ctx, e.controller().corePath("secrets", secretName), &credentials); err != nil {
+		return zero, nil, fmt.Errorf("fencing: bootstrap credential Secret is unavailable: %w", err)
+	}
+	if credentials["immutable"] != true || str(nested(credentials, "metadata", "name")) != secretName ||
+		str(nested(credentials, "metadata", "namespace")) != e.Kube.Namespace ||
+		str(nested(credentials, "metadata", "annotations", ownerAnnotation)) != uid+":"+cluster.Spec.LogicalID {
+		return zero, nil, fmt.Errorf("fencing: bootstrap credential Secret identity or immutability differs")
+	}
 	env, err := e.controller().environment(ctx, ctr)
 	if err != nil {
 		return zero, nil, err
