@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mrchypark/rhiza/internal/types"
+	"github.com/mrchypark/rhiza/pkg/materializer"
 	"github.com/mrchypark/rhiza/pkg/network/peerfb"
 	"github.com/mrchypark/rhiza/pkg/qlog"
 	"github.com/mrchypark/rhiza/pkg/quepaxa"
@@ -65,7 +67,12 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 		}
 		transport.BindCore(core)
 		cores[member.ID] = core
-		servers[member.ID] = NewServer(core, nil, clusterID, true, transport)
+		material, err := materializer.Open(filepath.Join(t.TempDir(), string(member.ID)+".sqlite"), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = material.Close() })
+		servers[member.ID] = NewServer(core, material, clusterID, true, transport)
 		t.Cleanup(servers[member.ID].Close)
 	}
 	for i, member := range config.Members {
@@ -156,7 +163,12 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	}
 	learnerTransport.BindCore(dCore)
 	dMember.WALIdentity = dCore.WALIdentity()
-	dServer := NewServer(dCore, nil, clusterID, true, learnerTransport)
+	dMaterial, err := materializer.Open(filepath.Join(t.TempDir(), "d.sqlite"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dMaterial.Close() })
+	dServer := NewServer(dCore, dMaterial, clusterID, true, learnerTransport)
 	t.Cleanup(dServer.Close)
 	dPeer, err := StartPeerServerOnTransport(ctx, dListener, dServer, append(append([]quepaxa.Member(nil), config.Members...), dMember), dToken, "admin-token")
 	if err != nil {
