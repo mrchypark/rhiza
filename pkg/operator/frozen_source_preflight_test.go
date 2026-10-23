@@ -82,7 +82,7 @@ func TestFrozenSourcePreflightUsesReadOnlyControlAuthority(t *testing.T) {
 		}
 		copiedAuthorityObjects++
 		return nil
-	}); err != nil {
+	}, objstore.WithRecursiveIter()); err != nil {
 		t.Fatal(err)
 	}
 	if copiedAuthorityObjects == 0 {
