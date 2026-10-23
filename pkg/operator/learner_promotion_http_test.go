@@ -108,6 +108,12 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 		f.api.mu.Unlock()
 		t.Fatal("supervised StatefulSet fixture is missing")
 	}
+	// Real Kubernetes objects always carry resourceVersion. Root-pin
+	// revalidation requires it even when this fixture's root is already pinned.
+	stsMetadata := asObject(supervisedSTS["metadata"])
+	stsMetadata["resourceVersion"] = "1"
+	stsSpec := asObject(supervisedSTS["spec"])
+	stsSpec["selector"] = object{"matchLabels": object{"app": "rhiza"}}
 	annotations := object{fencingProtocolAnnotation: "1", fencingRootAnnotation: automaticBootstrapClusterUID}
 	template := asObject(nested(supervisedSTS, "spec", "template"))
 	metadata := asObject(template["metadata"])
@@ -115,12 +121,14 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 		metadata = object{}
 		template["metadata"] = metadata
 	}
+	metadata["labels"] = object{"app": "rhiza"}
 	metadata["annotations"] = annotations
 	containers := list(nested(supervisedSTS, "spec", "template", "spec", "containers"))
 	if len(containers) != 1 || asObject(containers[0]) == nil {
 		f.api.mu.Unlock()
 		t.Fatal("supervised StatefulSet fixture container is missing or ambiguous")
 	}
+	asObject(containers[0])["securityContext"] = object{"allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": object{"drop": []any{"ALL"}}}
 	asObject(containers[0])["ports"] = []any{
 		object{"name": "http", "containerPort": float64(8080)},
 		object{"name": "peer-quic", "containerPort": float64(9090), "protocol": "UDP"},
@@ -132,6 +140,7 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 	podsPath := f.e.controller().corePath("pods", "")
 	for _, raw := range list(asObject(f.api.objects[podsPath])["items"]) {
 		podMetadata := asObject(asObject(raw)["metadata"])
+		podMetadata["labels"] = object{"app": "rhiza"}
 		podMetadata["annotations"] = object{fencingProtocolAnnotation: "1", fencingRootAnnotation: automaticBootstrapClusterUID}
 	}
 	f.api.mu.Unlock()
@@ -227,7 +236,12 @@ func TestAuthenticatedLearnerPromotionRetriesExactCanonicalCompletion(t *testing
 
 	state, version, err := controller.loadAuto(ctx, controller.autoKey(&cluster))
 	if err != nil || state == nil || version == nil {
-		t.Fatalf("load canonical automatic control: state=%+v err=%v", state, err)
+		f.api.mu.Lock()
+		storedCluster := asObject(f.api.objects[clusterPath])
+		phase := str(nested(storedCluster, "status", "phase"))
+		message := str(nested(storedCluster, "status", "message"))
+		f.api.mu.Unlock()
+		t.Fatalf("load canonical automatic control: state=%+v err=%v Cluster status=%s %q", state, err, phase, message)
 	}
 	state.Intent = &autoIntent{Request: request, Failed: quepaxa.NodeID(oldTarget.NodeID), Proof: fence.Status.Proof,
 		RecoveryName: "promotion-recovery", LearnerWAL: strings.Repeat("c", 64)}
