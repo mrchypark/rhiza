@@ -211,6 +211,48 @@ func TestFixtureOnlyWorkflowIsExclusiveAndRunsFixedGoSelectors(t *testing.T) {
 	}
 }
 
+func TestFreshNamespaceRendererRewritesPinnedNamespaceLookup(t *testing.T) {
+	const namespace = "rhiza-fencing-isolated"
+	runBytes, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const renderExpression = `-e "s/resourceNames: \[rhiza\]$/resourceNames: [$fencing_namespace]/"`
+	if !strings.Contains(string(runBytes), renderExpression) {
+		t.Fatalf("run.sh must rewrite the pinned namespace resourceNames when rendering the fresh qualification namespace")
+	}
+	manifest, err := os.ReadFile("../../deploy/operator/fencing/authority.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := strings.ReplaceAll(string(manifest), "namespace: rhiza\n", "namespace: "+namespace+"\n")
+	rendered = strings.ReplaceAll(rendered, "resourceNames: [rhiza]\n", "resourceNames: ["+namespace+"]\n")
+	decoder := yaml.NewDecoder(strings.NewReader(rendered))
+	found := false
+	for {
+		var doc obj
+		if err := decoder.Decode(&doc); err != nil {
+			break
+		}
+		if doc["kind"] != "ClusterRole" || nested(doc, "metadata", "name") != "rhiza-fencer-tokenreview" {
+			continue
+		}
+		for _, raw := range doc["rules"].([]any) {
+			rule := raw.(map[string]any)
+			if len(rule["resources"].([]any)) != 1 || rule["resources"].([]any)[0] != "namespaces" {
+				continue
+			}
+			found = true
+			if len(rule["resourceNames"].([]any)) != 1 || rule["resourceNames"].([]any)[0] != namespace {
+				t.Fatalf("rendered namespace resourceNames=%v, want only %s", rule["resourceNames"], namespace)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("rendered authority manifest omitted the namespace lookup rule")
+	}
+}
+
 func TestImmutableImageResolutionDescriptors(t *testing.T) {
 	config := "sha256:" + strings.Repeat("a", 64)
 	for _, reference := range []string{config, "containerd://" + config, "docker.io/library/import-date@" + config} {

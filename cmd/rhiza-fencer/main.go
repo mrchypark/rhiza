@@ -158,6 +158,14 @@ func serve(ctx context.Context, args []string) error {
 	}
 	executor := newFencingExecutor(kube, authorityState, *independentMutation, *sourceReceiptDir, *sourceWriterCredentials, *sourceWriterUseADC)
 	executor.ArchiveBucket = archiveBucket
+	executor.ArchiveStoreIdentity = operator.StoreIdentity(map[string]string{
+		"RHIZA_OBJSTORE_PROVIDER":                string(stateConfig.Provider),
+		"RHIZA_OBJSTORE_ENDPOINT":                stateConfig.Endpoint,
+		"RHIZA_OBJSTORE_BUCKET":                  stateConfig.Bucket,
+		"RHIZA_OBJSTORE_PREFIX":                  stateConfig.Prefix,
+		"RHIZA_OBJSTORE_AZURE_STORAGE_ACCOUNT":   stateConfig.AzureStorageAccount,
+		"RHIZA_OBJSTORE_AZURE_CONNECTION_STRING": stateConfig.AzureConnectionString,
+	})
 	executor.ControllerServiceAccount = *controllerServiceAccount
 	var ackLossFault *operator.GCSMutationAckLossFault
 	if *ackLossConfigFile != "" {

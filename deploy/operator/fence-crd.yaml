@@ -25,6 +25,8 @@ spec:
               x-kubernetes-validations:
                 - rule: self == oldSelf
                   message: fencing requests are immutable
+                - rule: '!has(self.bootstrapGenesis) || (self.scope == "Generation" && size(self.targets) > 0)'
+                  message: bootstrap genesis fencing requires a captured generation cohort
               required: [logicalID, bindingUID, namespace, statefulSet, statefulSetUID, sourceClusterID, operationID, scope, targets]
               properties:
                 logicalID: {type: string, maxLength: 256, minLength: 1}
@@ -35,6 +37,14 @@ spec:
                 sourceClusterID: {type: string, maxLength: 256, minLength: 1}
                 operationID: {type: string, maxLength: 256, minLength: 1}
                 scope: {type: string, enum: [Voter, Generation]}
+                bootstrapGenesis:
+                  type: object
+                  required: [version, candidateDigest, clusterName, clusterUID]
+                  properties:
+                    version: {type: integer, enum: [1]}
+                    candidateDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+                    clusterName: {type: string, maxLength: 253, minLength: 1}
+                    clusterUID: {type: string, maxLength: 256, minLength: 1}
                 targets:
                   description: >-
                     Every voter of the fenced generation plus retained learner

@@ -40,6 +40,9 @@ type FencingExecutor struct {
 	// ArchiveBucket is the configured shared object store used to independently
 	// verify fork evidence before target-root registration.
 	ArchiveBucket objstore.Bucket
+	// ArchiveStoreIdentity is the non-secret identity derived from the
+	// fencer's configured archive bucket, not from workload environment.
+	ArchiveStoreIdentity map[string]string
 	// ControllerServiceAccount is the only TokenReview identity allowed to
 	// register a nonzero archive fork. Source Pod credentials are never accepted.
 	ControllerServiceAccount string
@@ -340,6 +343,14 @@ func (e *FencingExecutor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == frozenSourcePreflightPath {
 		e.handleFrozenSourcePreflight(w, r)
+		return
+	}
+	if r.URL.Path == bootstrapGenesisPreflightPath {
+		e.handleBootstrapGenesisPreflight(w, r)
+		return
+	}
+	if r.URL.Path == bootstrapGenesisFenceConfirmPath {
+		e.handleBootstrapGenesisFenceConfirmation(w, r)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/v1/archive-genesis/") {
@@ -750,7 +761,25 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 			nodes = append(nodes, target.NodeID)
 		}
 	}
-	state, err := e.change(ctx, r.StatefulSetUID, r.SourceClusterID, func(l *fencing.Ledger) error { return l.CloseNodes(r.OperationID, hash, nodes) })
+	state, err := e.change(ctx, r.StatefulSetUID, r.SourceClusterID, func(l *fencing.Ledger) error {
+		if binding := r.BootstrapGenesis; binding != nil {
+			if l.ClosedBy != "" {
+				if l.ClosedBy != r.OperationID || l.ClosedHash != hash {
+					return fencing.ErrClosed
+				}
+			} else {
+				current := fenceLedger{StatefulSetUID: r.StatefulSetUID, Ledger: *l}
+				candidate, targets, err := e.bootstrapGenesisFenceCandidate(ctx, r, current, false)
+				if err != nil {
+					return err
+				}
+				if binding.ClusterUID != candidate.ClusterUID || binding.CandidateDigest != hashJSON(candidate) || hashJSON(targets) != hashJSON(r.Targets) {
+					return fmt.Errorf("fencing: automatic bootstrap candidate or target inventory changed")
+				}
+			}
+		}
+		return l.CloseNodes(r.OperationID, hash, nodes)
+	})
 	if err != nil {
 		return err
 	}
@@ -779,6 +808,19 @@ func (e *FencingExecutor) reconcileFence(ctx context.Context, endpoint string, r
 		}
 		if !settled {
 			return ErrFencePending
+		}
+		if r.BootstrapGenesis != nil {
+			closed, err := e.read(ctx, r.StatefulSetUID, r.SourceClusterID)
+			if err != nil {
+				return err
+			}
+			if closed.Ledger.ClosedBy != r.OperationID || closed.Ledger.ClosedHash != hash {
+				return fencing.ErrPending
+			}
+			candidate, targets, err := e.bootstrapGenesisFenceCandidate(ctx, r, closed, true)
+			if err != nil || r.BootstrapGenesis.CandidateDigest != hashJSON(candidate) || r.BootstrapGenesis.ClusterUID != candidate.ClusterUID || hashJSON(targets) != hashJSON(r.Targets) {
+				return errors.Join(err, fencing.ErrPending)
+			}
 		}
 		return e.independentFence(ctx, endpoint, record, r, sts, state, hash, nodes, current)
 	}

@@ -544,6 +544,25 @@ func TestRequestHashDeterministic(t *testing.T) {
 	}
 }
 
+func TestFenceRequestLegacyJSONAndHashOmitBootstrapBinding(t *testing.T) {
+	req := FenceRequest{LogicalID: "l", BindingUID: "b", Namespace: "ns", OperationID: "op", Scope: ScopeGeneration}
+	encoded, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON := `{"logicalID":"l","bindingUID":"b","namespace":"ns","statefulSet":"","statefulSetUID":"","sourceClusterID":"","operationID":"op","scope":"Generation","targets":null}`
+	if string(encoded) != wantJSON {
+		t.Fatalf("ordinary fence request wire format changed: got %s want %s", encoded, wantJSON)
+	}
+	hash, err := requestHash(&req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != "a0861d2532f7f69df602a027a2fc85aa701af9b8e539d75fcd409f38be12b2a5" {
+		t.Fatalf("ordinary fence request hash changed: %s", hash)
+	}
+}
+
 func TestFenceRequestValidation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -554,6 +573,20 @@ func TestFenceRequestValidation(t *testing.T) {
 		{"missing sourceClusterID", FenceRequest{OperationID: "o", BindingUID: "b", Scope: ScopeGeneration}, "sourceClusterID"},
 		{"missing bindingUID", FenceRequest{OperationID: "o", SourceClusterID: "s", Scope: ScopeGeneration}, "bindingUID"},
 		{"invalid scope", FenceRequest{OperationID: "o", SourceClusterID: "s", BindingUID: "b", Scope: "Bad"}, "scope"},
+		{"unknown bootstrap version", bootstrapValidationRequest(BootstrapGenesisBinding{Version: 2, CandidateDigest: strings.Repeat("a", 64), ClusterName: "cluster", ClusterUID: "cluster-uid"}), "binding is invalid"},
+		{"malformed bootstrap digest", bootstrapValidationRequest(BootstrapGenesisBinding{Version: 1, CandidateDigest: "not-a-digest", ClusterName: "cluster", ClusterUID: "cluster-uid"}), "binding is invalid"},
+		{"missing bootstrap cluster name", bootstrapValidationRequest(BootstrapGenesisBinding{Version: 1, CandidateDigest: strings.Repeat("a", 64), ClusterUID: "cluster-uid"}), "binding is invalid"},
+		{"missing bootstrap cluster UID", bootstrapValidationRequest(BootstrapGenesisBinding{Version: 1, CandidateDigest: strings.Repeat("a", 64), ClusterName: "cluster"}), "binding is invalid"},
+		{"bootstrap voter scope", func() FenceRequest {
+			req := bootstrapValidationRequest(BootstrapGenesisBinding{Version: 1, CandidateDigest: strings.Repeat("a", 64), ClusterName: "cluster", ClusterUID: "cluster-uid"})
+			req.Scope = ScopeVoter
+			return req
+		}(), "generation-wide"},
+		{"bootstrap empty target list", func() FenceRequest {
+			req := bootstrapValidationRequest(BootstrapGenesisBinding{Version: 1, CandidateDigest: strings.Repeat("a", 64), ClusterName: "cluster", ClusterUID: "cluster-uid"})
+			req.Targets = nil
+			return req
+		}(), "generation-wide"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -563,6 +596,11 @@ func TestFenceRequestValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func bootstrapValidationRequest(binding BootstrapGenesisBinding) FenceRequest {
+	return FenceRequest{OperationID: "op", SourceClusterID: "source", BindingUID: "binding", Scope: ScopeGeneration,
+		Targets: []FenceTarget{{NodeID: "rhiza-0", Pod: "rhiza-0", PodUID: "pod-0"}}, BootstrapGenesis: &binding}
 }
 
 func TestCloneClientTimeout(t *testing.T) {

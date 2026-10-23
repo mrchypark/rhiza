@@ -111,6 +111,10 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if err != nil || !authorized {
 		return err
 	}
+	bootstrapConfirmation, err := c.confirmedBootstrapFenceForChild(ctx, r)
+	if err != nil {
+		return err
+	}
 	if r.Spec.Membership != nil {
 		return c.reconcileMembership(ctx, r)
 	}
@@ -187,21 +191,33 @@ func (c *Controller) reconcile(ctx context.Context, r *Resource) error {
 	if err := anchorEnvGate(r.Spec.AnchorID, env, reconfiguration, c.Anchor); err != nil {
 		return reject(err.Error())
 	}
-	prefix := path.Join(c.Prefix, r.Spec.SourceClusterID)
-	registered, err := c.sourceMembership(ctx, prefix)
+	source := sourceState{prefix: path.Join(c.Prefix, r.Spec.SourceClusterID), members: members, durability: mode, reconfiguration: reconfiguration, env: env, stateful: sts}
+	prefix := source.prefix
+	registered, membershipMissing, err := c.sourceMembershipOrMissing(ctx, prefix)
 	if err != nil {
 		return reject(err.Error())
 	}
-	if registered != recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode) {
+	if membershipMissing {
+		if bootstrapConfirmation == nil || !c.useFrozenSourceFork(source) || mode != "async" || !r.Spec.AllowDataLoss {
+			return reject("immutable source membership is missing outside the confirmed frozen bootstrap-genesis path")
+		}
+		members, err = c.confirmedBootstrapSourceMembers(ctx, r, sts, ctr, env, members, *bootstrapConfirmation)
+		if err != nil {
+			return reject("confirmed bootstrap source cohort differs from canonical fence evidence: " + err.Error())
+		}
+		// This value is a derived input for the target only. It is never written
+		// back to the source archive or treated as an existing source receipt.
+		registered = recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode)
+	} else if registered != recovery.NewMembershipRecord(r.Spec.SourceClusterID, members, mode) {
 		return reject("immutable source membership or durability differs from StatefulSet")
 	}
+	source.members = members
 	fingerprint := sourceFingerprint(r.Spec.SourceClusterID, mode, members, prefix)
 	if r.Status.RecoveryID != "" && fingerprint != r.Status.SourceMembership {
 		return reject("source configuration changed during recovery")
 	}
 	r.Status.Source, r.Status.SourceDurability, r.Status.SourceMembership = r.Spec.SourceClusterID, registered.Durability, fingerprint
 	r.Status.StatefulSetUID = uid
-	source := sourceState{prefix, members, mode, reconfiguration, env, sts}
 	if r.Spec.RecoveryID == "" {
 		peers, err := c.probe(ctx, r, sts)
 		if err != nil {
@@ -1316,17 +1332,132 @@ func (c *Controller) immutable(ctx context.Context, key string, data []byte) err
 	return nil
 }
 func (c *Controller) sourceMembership(ctx context.Context, prefix string) (recovery.MembershipRecord, error) {
+	record, missing, err := c.sourceMembershipOrMissing(ctx, prefix)
+	if err != nil {
+		return recovery.MembershipRecord{}, err
+	}
+	if missing {
+		return recovery.MembershipRecord{}, fmt.Errorf("source membership history unavailable")
+	}
+	return record, nil
+}
+
+// sourceMembershipOrMissing preserves the distinction between definitive
+// absence and an unreadable or malformed source object. Only the former may be
+// considered by the authenticated bootstrap-genesis exception.
+func (c *Controller) sourceMembershipOrMissing(ctx context.Context, prefix string) (recovery.MembershipRecord, bool, error) {
 	var record recovery.MembershipRecord
 	reader, err := c.Bucket.Get(ctx, path.Join(prefix, "voters/membership.json"))
+	if c.Bucket.IsObjNotFoundErr(err) {
+		return record, true, nil
+	}
 	if err != nil {
-		return record, fmt.Errorf("source membership history unavailable")
+		return record, false, fmt.Errorf("source membership history unavailable")
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, 64<<10))
 	closeErr := reader.Close()
 	if err != nil || closeErr != nil || len(data) == 64<<10 || json.Unmarshal(data, &record) != nil || record.Version != 2 || (record.Durability != "async" && record.Durability != "before-ack") || !bytes.Equal(data, jsonBytes(record)) {
-		return record, fmt.Errorf("source membership or durability history is invalid")
+		return record, false, fmt.Errorf("source membership or durability history is invalid")
 	}
-	return record, nil
+	return record, false, nil
+}
+
+func (c *Controller) confirmedBootstrapSourceMembers(ctx context.Context, r *Resource, sts, ctr object, env map[string]string, members []quepaxa.Member, confirmation BootstrapGenesisFenceConfirmation) ([]quepaxa.Member, error) {
+	request := confirmation.Request
+	binding := request.BootstrapGenesis
+	if binding == nil || request.Scope != ScopeGeneration || request.OperationID != r.Spec.RecoveryID || request.SourceClusterID != r.Spec.SourceClusterID ||
+		request.StatefulSet != r.Spec.StatefulSet || request.StatefulSetUID != str(nested(sts, "metadata", "uid")) ||
+		request.LogicalID == "" || request.LogicalID != str(nested(r.Metadata, "annotations", automaticLogical)) ||
+		request.BindingUID != str(nested(r.Metadata, "annotations", automaticOwner)) || request.Namespace != c.Kube.Namespace || binding.ClusterName == "" || binding.ClusterUID == "" {
+		return nil, fmt.Errorf("confirmed fence request does not identify this source generation")
+	}
+	var cluster ClusterResource
+	if err := c.Kube.Get(ctx, c.clusterPath(binding.ClusterName), &cluster); err != nil {
+		return nil, fmt.Errorf("bootstrap cluster configuration is unavailable")
+	}
+	normalizeClusterSpec(&cluster)
+	logical := str(nested(r.Metadata, "annotations", automaticLogical))
+	auto, _, err := c.loadAuto(ctx, path.Join(c.Prefix, "automatic", c.Kube.Namespace, logical, "control.json"))
+	if err != nil {
+		return nil, fmt.Errorf("protected automatic bootstrap intent is unavailable")
+	}
+	if str(cluster.Metadata["name"]) != binding.ClusterName || str(cluster.Metadata["namespace"]) != c.Kube.Namespace ||
+		str(cluster.Metadata["uid"]) != binding.ClusterUID || cluster.Spec.StatefulSet != r.Spec.StatefulSet ||
+		cluster.Spec.AdoptClusterID != r.Spec.SourceClusterID || cluster.Spec.LogicalID != request.LogicalID || !cluster.Spec.Automatic || !cluster.Spec.Bootstrap ||
+		cluster.Spec.Policy == nil || !cluster.Spec.Policy.AllowDataLoss || cluster.Spec.VoterCount != len(members) ||
+		logical != request.LogicalID || auto.BindingUID != str(cluster.Metadata["uid"]) || auto.BindingVersion != autoBindingVersion ||
+		auto.BindingHash != autoBinding(&cluster) || auto.StatefulSetUID != request.StatefulSetUID || auto.ActiveClusterID != request.SourceClusterID ||
+		auto.BootstrapGenesis == nil || *auto.BootstrapGenesis != *binding || auto.Intent == nil || auto.Intent.Proof == nil ||
+		hashJSON(auto.Intent.Request) != hashJSON(request) || hashJSON(*auto.Intent.Proof) != hashJSON(confirmation.Proof) ||
+		env["RHIZA_CLUSTER_ID"] != r.Spec.SourceClusterID || env["RHIZA_OBJSTORE_DURABILITY"] != "async" || env["RHIZA_ENABLE_RECONFIGURATION"] != "true" {
+		return nil, fmt.Errorf("bootstrap source configuration no longer matches the confirmed policy")
+	}
+	if err := validateClusterRuntime(&cluster, ctr, env); err != nil {
+		return nil, err
+	}
+	if err := noPVC(sts, ctr, env); err != nil {
+		return nil, err
+	}
+	if err := c.storeConfigMatches(env); err != nil {
+		return nil, err
+	}
+	if !bootstrapTemplateInstalled(ctr, &cluster) {
+		return nil, fmt.Errorf("source membership is not from the immutable bootstrap configuration")
+	}
+	allowed, err := allowedGenerationVoterIDs(&cluster, sts, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := voterCountContract(&cluster, sts, members, true, true, allowed); err != nil {
+		return nil, err
+	}
+	if err := c.validateBootstrappedMembers(ctx, &cluster, sts, true, members, allowed); err != nil {
+		return nil, err
+	}
+	if len(request.Targets) != len(members) {
+		return nil, fmt.Errorf("confirmed fence target count differs from bootstrap membership")
+	}
+	targets := make(map[string]FenceTarget, len(request.Targets))
+	for _, target := range request.Targets {
+		if target.NodeID == "" || target.Pod == "" || target.NodeID != target.Pod || targets[target.NodeID].NodeID != "" {
+			return nil, fmt.Errorf("confirmed fence target inventory is incomplete or ambiguous")
+		}
+		targets[target.NodeID] = target
+	}
+	for _, member := range members {
+		if _, ok := targets[string(member.ID)]; !ok {
+			return nil, fmt.Errorf("bootstrap membership differs from the confirmed fence cohort")
+		}
+	}
+	// Cross-check the bootstrap Secret-backed source endpoints against the
+	// configured endpoints and CONTROL-confirmed voter IDs before using them for
+	// the target-only source fingerprint.
+	derived, err := clusterMemberSources(&cluster, sts, c.Kube.Namespace)
+	if err != nil || len(derived) != len(request.Targets) {
+		return nil, errors.Join(err, fmt.Errorf("bootstrap source cohort could not be derived"))
+	}
+	for _, member := range derived {
+		if _, ok := targets[string(member.ID)]; !ok {
+			return nil, fmt.Errorf("derived bootstrap membership differs from the confirmed fence cohort")
+		}
+	}
+	if len(members) != len(derived) {
+		return nil, fmt.Errorf("bootstrap membership differs from the configured source cohort")
+	}
+	configured := make(map[quepaxa.NodeID]quepaxa.Member, len(members))
+	for _, member := range members {
+		configured[member.ID] = member
+	}
+	for _, member := range derived {
+		observed, ok := configured[member.ID]
+		if !ok || observed.URL != member.URL || observed.PeerURL != member.PeerURL {
+			return nil, fmt.Errorf("bootstrap source endpoints differ from the configured cohort")
+		}
+	}
+	// Preserve the source public keys so the target-only fingerprint matches the
+	// fencer's independently checked cohort; targetCredentials replaces them
+	// with fresh target keys before any target membership is written.
+	return members, nil
 }
 func (c *Controller) record(ctx context.Context, r *Resource, phase, message string) error {
 	r.Status.Phase, r.Status.Message = phase, message

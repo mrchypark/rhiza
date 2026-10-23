@@ -459,3 +459,45 @@ func TestFenceCRDCarriesVerifiedIndependentV2References(t *testing.T) {
 		}
 	}
 }
+
+func TestFenceCRDBootstrapGenesisBindingIsOptionalAndComplete(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/operator/fence-crd.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var crd map[string]any
+	if err := yaml.Unmarshal(data, &crd); err != nil {
+		t.Fatal(err)
+	}
+	versions := crd["spec"].(map[string]any)["versions"].([]any)
+	root := versions[0].(map[string]any)["schema"].(map[string]any)["openAPIV3Schema"].(map[string]any)
+	spec := root["properties"].(map[string]any)["spec"].(map[string]any)
+	properties := spec["properties"].(map[string]any)
+	bootstrap, ok := properties["bootstrapGenesis"].(map[string]any)
+	if !ok || bootstrap["type"] != "object" {
+		t.Fatalf("optional bootstrapGenesis request schema is missing: %#v", properties["bootstrapGenesis"])
+	}
+	for _, required := range spec["required"].([]any) {
+		if required == "bootstrapGenesis" {
+			t.Fatal("ordinary RhizaFence requests must not require bootstrapGenesis")
+		}
+	}
+	fields, ok := bootstrap["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("bootstrapGenesis has no typed properties: %#v", bootstrap)
+	}
+	for _, field := range []string{"version", "candidateDigest", "clusterName", "clusterUID"} {
+		if fields[field] == nil {
+			t.Fatalf("bootstrapGenesis schema is missing %q", field)
+		}
+	}
+	for _, requiredField := range []string{"version", "candidateDigest", "clusterName", "clusterUID"} {
+		found := false
+		for _, required := range bootstrap["required"].([]any) {
+			found = found || required == requiredField
+		}
+		if !found {
+			t.Fatalf("bootstrapGenesis must require %q when present", requiredField)
+		}
+	}
+}

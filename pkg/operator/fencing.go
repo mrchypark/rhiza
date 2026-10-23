@@ -66,15 +66,25 @@ const (
 const fenceTargetCapacity = 64
 
 type FenceRequest struct {
-	LogicalID       string        `json:"logicalID"`
-	BindingUID      string        `json:"bindingUID"`
-	Namespace       string        `json:"namespace"`
-	StatefulSet     string        `json:"statefulSet"`
-	StatefulSetUID  string        `json:"statefulSetUID"`
-	SourceClusterID string        `json:"sourceClusterID"`
-	OperationID     string        `json:"operationID"`
-	Scope           Scope         `json:"scope"`
-	Targets         []FenceTarget `json:"targets"`
+	LogicalID        string                   `json:"logicalID"`
+	BindingUID       string                   `json:"bindingUID"`
+	Namespace        string                   `json:"namespace"`
+	StatefulSet      string                   `json:"statefulSet"`
+	StatefulSetUID   string                   `json:"statefulSetUID"`
+	SourceClusterID  string                   `json:"sourceClusterID"`
+	OperationID      string                   `json:"operationID"`
+	Scope            Scope                    `json:"scope"`
+	Targets          []FenceTarget            `json:"targets"`
+	BootstrapGenesis *BootstrapGenesisBinding `json:"bootstrapGenesis,omitempty"`
+}
+
+// BootstrapGenesisBinding is present only for a fencer-authorized recovery of
+// an automatic bootstrap blocked on its first canonical HEAD mutation.
+type BootstrapGenesisBinding struct {
+	Version         int    `json:"version"`
+	CandidateDigest string `json:"candidateDigest"`
+	ClusterName     string `json:"clusterName"`
+	ClusterUID      string `json:"clusterUID"`
 }
 
 type FenceProof struct {
@@ -337,6 +347,15 @@ func validateRequest(req *FenceRequest) error {
 	}
 	if req.Scope != ScopeGeneration && req.Scope != ScopeVoter {
 		return fmt.Errorf("fencing: invalid scope %q", req.Scope)
+	}
+	if req.BootstrapGenesis != nil {
+		binding := req.BootstrapGenesis
+		if binding.Version != 1 || !validEvidenceDigest(binding.CandidateDigest) || binding.ClusterName == "" || len(binding.ClusterName) > 253 || binding.ClusterUID == "" || len(binding.ClusterUID) > 256 {
+			return fmt.Errorf("fencing: bootstrap genesis binding is invalid")
+		}
+		if req.Scope != ScopeGeneration || len(req.Targets) == 0 {
+			return fmt.Errorf("fencing: bootstrap genesis requires a generation-wide captured cohort")
+		}
 	}
 	return fenceCapacityError(len(req.Targets))
 }
