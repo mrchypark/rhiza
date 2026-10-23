@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -25,6 +26,104 @@ type frozenRegistrarTrackingBucket struct {
 	objstore.Bucket
 	sourcePrefix string
 	writes       []string
+}
+
+func configureManualFrozenForkCohort(t *testing.T, f archiveGenesisFixture, members []quepaxa.Member) []FenceTarget {
+	t.Helper()
+	if len(members) < 3 || string(members[0].ID) != f.id.NodeID {
+		t.Fatal("manual fork fixture must include the enrolled source runtime and at least two additional voters")
+	}
+	ctx := t.Context()
+	scope := AttestationStoreScope{Provider: "gcs", Bucket: "archive", Prefix: "root/source"}
+	env := []any{
+		object{"name": "RHIZA_CLUSTER_ID", "value": f.id.SourceClusterID},
+		object{"name": "RHIZA_OBJSTORE_PROVIDER", "value": "gcs"},
+		object{"name": "RHIZA_OBJSTORE_BUCKET", "value": "archive"},
+		object{"name": "RHIZA_OBJSTORE_PREFIX", "value": "root"},
+		object{"name": "RHIZA_OBJSTORE_DURABILITY", "value": "async"},
+		object{"name": "RHIZA_ENABLE_RECONFIGURATION", "value": "true"},
+		object{"name": "RHIZA_CLUSTER_MEMBERS", "value": string(jsonBytes(members))},
+	}
+	sts := f.f.authStatefulSet
+	if sts == nil {
+		sts = object{"metadata": object{"name": "rhiza", "namespace": "test", "uid": f.runtime.StatefulSetUID},
+			"spec": object{"template": object{"spec": object{"containers": []any{object{"name": "rhiza"}}}}}}
+	}
+	container := asObject(list(nested(sts, "spec", "template", "spec", "containers"))[0])
+	container["env"] = env
+	var targets []FenceTarget
+	pods := make([]any, 0, len(members))
+	for i, member := range members {
+		runtime := f.runtime
+		identity := f.id
+		if i > 0 {
+			nodeID := string(member.ID)
+			runtime.NodeID, runtime.PodUID, runtime.RunID = nodeID, "manual-fork-pod-"+strconv.Itoa(i), "manual-fork-run-"+strconv.Itoa(i)
+			runtime.NodeName, runtime.NodeUID = "manual-fork-node-"+strconv.Itoa(i), "manual-fork-node-uid-"+strconv.Itoa(i)
+			runtime.MachineID, runtime.BootID = "manual-fork-machine-"+strconv.Itoa(i), "manual-fork-boot-"+strconv.Itoa(i)
+			runtime.RuntimeID, runtime.SandboxID = "manual-fork-runtime-"+strconv.Itoa(i), "manual-fork-sandbox-"+strconv.Itoa(i)
+			runtime.ContainerID, runtime.ImageID = "containerd://manual-fork-"+strconv.Itoa(i), "sha256:manual-fork-"+strconv.Itoa(i)
+			identity = fencing.Identity{SourceClusterID: runtime.SourceClusterID, NodeID: runtime.NodeID, PodUID: runtime.PodUID, RunID: runtime.RunID}
+			if _, err := f.e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+				return ledger.RegisterEnrolled(identity, runtime)
+			}); err != nil {
+				t.Fatalf("register manual fork source runtime %d: %v", i, err)
+			}
+			if _, err := f.e.reserveMutationProducer(ctx, runtime); err != nil {
+				t.Fatalf("reserve manual fork producer %d: %v", i, err)
+			}
+			stages, err := f.e.sourceStagesFor(ctx, runtime)
+			if err != nil {
+				t.Fatalf("create manual fork stage store %d: %v", i, err)
+			}
+			identity.WALIdentity = "manual-fork-wal-" + strconv.Itoa(i)
+			if _, err := f.e.change(ctx, runtime.StatefulSetUID, runtime.SourceClusterID, func(ledger *fencing.Ledger) error {
+				if err := ledger.BindMutationScope(identity, hashJSON(scope), fencing.MutationHeldExecutionProfile); err != nil {
+					return err
+				}
+				if err := ledger.BindMutationStage(identity, stages.incarnation); err != nil {
+					return err
+				}
+				return ledger.Bind(identity)
+			}); err != nil {
+				t.Fatalf("bind manual fork WAL %d: %v", i, err)
+			}
+			if _, err := f.e.changeMutationProducer(ctx, runtime, func(producer *fencing.MutationProducer) error {
+				return producer.Activate(identity)
+			}); err != nil {
+				t.Fatalf("activate manual fork producer %d: %v", i, err)
+			}
+		}
+		targets = append(targets, FenceTarget{NodeID: runtime.NodeID, Pod: runtime.NodeID, PodUID: runtime.PodUID,
+			WALIdentity: identity.WALIdentity, NodeName: runtime.NodeName, NodeUID: runtime.NodeUID,
+			ContainerID: runtime.ContainerID, ImageID: runtime.ImageID})
+		pod := independentPod(runtime.NodeID, runtime.PodUID)
+		asObject(pod["metadata"])["namespace"] = "test"
+		asObject(pod["metadata"])["ownerReferences"] = []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": runtime.StatefulSetUID, "controller": true}}
+		asObject(pod["spec"])["nodeName"] = runtime.NodeName
+		asObject(list(nested(pod, "spec", "containers"))[0])["env"] = env
+		asObject(list(nested(pod, "status", "containerStatuses"))[0])["containerID"] = runtime.ContainerID
+		asObject(list(nested(pod, "status", "containerStatuses"))[0])["imageID"] = runtime.ImageID
+		pods = append(pods, pod)
+	}
+	asObject(nested(sts, "spec"))["replicas"] = float64(len(members))
+	asObject(nested(sts, "spec"))["volumeClaimTemplates"] = []any{}
+	f.f.authStatefulSet = sts
+	f.f.mu.Lock()
+	f.f.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
+	f.f.objects["/apis/apps/v1/namespaces/test/statefulsets/rhiza"] = sts
+	f.f.objects["/api/v1/namespaces/test/pods"] = object{"items": pods}
+	for i := range members {
+		runtime := f.runtime
+		if i > 0 {
+			runtime.NodeName = "manual-fork-node-" + strconv.Itoa(i)
+			runtime.NodeUID = "manual-fork-node-uid-" + strconv.Itoa(i)
+		}
+		f.f.objects["/api/v1/nodes/"+runtime.NodeName] = object{"metadata": object{"name": runtime.NodeName, "uid": runtime.NodeUID}}
+	}
+	f.f.authPod, f.f.authPodName, f.f.authPodUID = asObject(pods[0]), f.runtime.NodeID, f.runtime.PodUID
+	f.f.mu.Unlock()
+	return targets
 }
 
 func (b *frozenRegistrarTrackingBucket) BucketAttrs(context.Context) (*storage.BucketAttrs, error) {
@@ -68,30 +167,9 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 	if f.e.AuthorityState.bucket == f.e.ArchiveBucket {
 		t.Fatal("test fixture must keep canonical CONTROL state separate from DATA archive objects")
 	}
-	sourceMembers := []quepaxa.Member{forkTestMember(t, "frozen-source-voter")}
+	sourceMembers := []quepaxa.Member{forkTestMember(t, f.id.NodeID), forkTestMember(t, "frozen-source-voter-1"), forkTestMember(t, "frozen-source-voter-2")}
 	targetMembers := []quepaxa.Member{forkTestMember(t, "frozen-target-voter")}
-
-	container := list(nested(f.f.authStatefulSet, "spec", "template", "spec", "containers"))[0]
-	env := list(asObject(container)["env"])
-	env = replaceEnv(env, "RHIZA_OBJSTORE_DURABILITY", object{"value": "async"})
-	env = replaceEnv(env, "RHIZA_CLUSTER_MEMBERS", object{"value": string(jsonBytes(sourceMembers))})
-	asObject(container)["env"] = env
-	sts := f.f.authStatefulSet
-	stsContainer := list(nested(sts, "spec", "template", "spec", "containers"))[0]
-	asObject(stsContainer)["env"] = env
-	f.f.authStatefulSet = sts
-	f.f.mu.Lock()
-	f.f.objects["/apis/apps/v1/namespaces/test/statefulsets"] = object{"items": []any{sts}}
-	pod := independentPod(f.id.NodeID, f.id.PodUID)
-	asObject(pod["metadata"])["ownerReferences"] = []any{object{"kind": "StatefulSet", "name": "rhiza", "uid": f.runtime.StatefulSetUID, "controller": true}}
-	asObject(list(nested(pod, "spec", "containers"))[0])["env"] = env
-	asObject(pod["status"])["containerStatuses"] = []any{object{"containerID": "containerd://source", "imageID": "sha256:source"}}
-	f.f.objects["/api/v1/namespaces/test/pods"] = object{"items": []any{pod}}
-	f.f.mu.Unlock()
-
-	if err := f.e.ArchiveBucket.Upload(ctx, path.Join(sourcePrefix, "voters/membership.json"), bytes.NewReader(jsonBytes(recovery.NewMembershipRecord(sourceID, sourceMembers, "async"))), objstore.WithIfNotExists()); err != nil {
-		t.Fatal(err)
-	}
+	targets := configureManualFrozenForkCohort(t, f, sourceMembers)
 	commitArchiveGenesisFixture(t, f)
 	wal, err := qlog.Open(t.TempDir())
 	if err != nil {
@@ -126,11 +204,15 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 		return nil
 	}
 	fenceRequest := FenceRequest{LogicalID: "frozen-registration", BindingUID: f.runtime.BindingUID, Namespace: "test", StatefulSet: "rhiza",
-		StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: sourceID, OperationID: fenceOperation, Scope: ScopeGeneration}
+		StatefulSetUID: f.runtime.StatefulSetUID, SourceClusterID: sourceID, OperationID: fenceOperation, Scope: ScopeGeneration, Targets: targets}
 	fence := &fenceResource{Metadata: object{"name": "source-fence", "namespace": "test"}, Spec: fenceRequest}
 	fenceCollection := "/apis/rhiza.mrchypark.dev/v1alpha1/namespaces/test/rhizafences"
 	if err := f.e.reconcileFence(ctx, fenceCollection, fence); err != nil {
 		t.Fatalf("close frozen source generation: %v", err)
+	}
+	if fence.Status.Proof == nil || fence.Status.Proof.IndependentV2 == nil ||
+		len(fence.Status.Proof.IndependentV2.Terminals) != len(sourceMembers) {
+		t.Fatalf("manual fork fixture did not close the complete CONTROL cohort: proof=%+v", fence.Status.Proof)
 	}
 	fenceName := "fence-" + hashJSON([]string{f.runtime.BindingUID, fenceOperation})[:40]
 	fence.Metadata["name"], fence.Metadata["namespace"], fence.Metadata["uid"], fence.Metadata["resourceVersion"] = fenceName, "test", "source-fence-uid", "1"
@@ -159,10 +241,12 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 		t.Fatal(err)
 	}
 	targetPrefix := path.Join("root", targetID)
-	resourceSpec := Spec{StatefulSet: "rhiza", SourceClusterID: sourceID, RecoveryID: fenceOperation, Durability: "async", AllowDataLoss: true}
+	resourceSpec := Spec{StatefulSet: "rhiza", SourceClusterID: sourceID, RecoveryID: fenceOperation, Durability: "async", AllowDataLoss: true,
+		AllowMissingSourceMembership: true}
 	resource := Resource{APIVersion: "rhiza.mrchypark.dev/v1alpha1", Kind: "RhizaRecovery",
 		Metadata: object{"name": "rhiza-recovery", "uid": recoveryUID, "namespace": "test"}, Spec: resourceSpec,
-		Status: Status{StatefulSetUID: f.runtime.StatefulSetUID, Target: targetID, TargetBaseKind: "fork", RecoveryMode: RecoveryModeFrozenSource, Stage: "FrozenForked"}}
+		Status: Status{RecoveryID: fenceOperation, SpecHash: immutableSpecHash(resourceSpec), Source: sourceID, SourceDurability: "async",
+			StatefulSetUID: f.runtime.StatefulSetUID, Target: targetID, TargetBaseKind: "fork", RecoveryMode: RecoveryModeFrozenSource, Stage: "FrozenForked"}}
 	// The DATA archive and fencer CONTROL state use separate buckets in this
 	// fixture. Obtain proof material from the fencer side; never infer authority
 	// state from the DATA archive.
@@ -189,6 +273,34 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 		t.Fatal(err)
 	}
 	resource.Status.FrozenBucketEnvironment = &environment
+	var sourceContainer object
+	for _, candidate := range list(nested(f.f.authStatefulSet, "spec", "template", "spec", "containers")) {
+		if str(asObject(candidate)["name"]) == "rhiza" {
+			sourceContainer = asObject(candidate)
+			break
+		}
+	}
+	if sourceContainer == nil {
+		t.Fatal("manual fork source container is unavailable")
+	}
+	env, err := f.e.controller().environment(ctx, sourceContainer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedRoot, err := f.e.read(ctx, f.runtime.StatefulSetUID, sourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manualDigest, missing, err := f.e.manualMissingSourceMembershipBinding(ctx, resource, env,
+		fencing.ArchiveScope{Provider: "gcs", Bucket: "archive", Prefix: sourcePrefix, ClusterID: sourceID}, closedRoot, *fence)
+	if err != nil || !missing || !validEvidenceDigest(manualDigest) {
+		t.Fatalf("manual cohort binding was not derived from the absent record and canonical closed CONTROL cohort: missing=%t digest=%q err=%v", missing, manualDigest, err)
+	}
+	resource.Status.ManualMembershipBindingDigest = manualDigest
+	if !manualMissingSourceMembershipAllowed(&resource) || str(nested(resource.Metadata, "annotations", automaticOwner)) != "" ||
+		str(nested(resource.Metadata, "annotations", automaticLogical)) != "" {
+		t.Fatal("fork authorization fixture is not an explicitly opted-in manual recovery child")
+	}
 	resourceData, err := json.Marshal(resource)
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +348,64 @@ func TestFrozenArchiveForkRegistrationCommitsAndRetriesWithoutSourceWrites(t *te
 
 	request := ArchiveForkGenesisRequest{RecoveryName: "rhiza-recovery", StatefulSetUID: f.runtime.StatefulSetUID,
 		TargetClusterID: targetID, OperationID: operationID, SourceFenceOperationID: fenceOperation,
-		RecoveryMode: RecoveryModeFrozenSource, BucketEnvironment: &environment}
+		RecoveryMode: RecoveryModeFrozenSource, BucketEnvironment: &environment, ManualMembershipBindingDigest: manualDigest}
+	persistRecovery := func(value Resource) {
+		data, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var encoded object
+		if err := json.Unmarshal(data, &encoded); err != nil {
+			t.Fatal(err)
+		}
+		f.f.mu.Lock()
+		f.f.objects[f.e.controller().resourcePath(resourceName(&value))] = encoded
+		f.f.mu.Unlock()
+	}
+	for _, name := range []string{"wrong-recovery-uid", "changed-spec", "wrong-manual-digest", "changed-cohort", "malformed-present-membership"} {
+		t.Run(name, func(t *testing.T) {
+			candidate := resource
+			candidate.Spec = resource.Spec
+			candidate.Metadata = make(object, len(resource.Metadata))
+			for key, value := range resource.Metadata {
+				candidate.Metadata[key] = value
+			}
+			candidate.Status = resource.Status
+			candidateRequest := request
+			cleanup := func() {}
+			switch name {
+			case "wrong-recovery-uid":
+				candidate.Metadata["uid"] = "different-recovery-uid"
+				persistRecovery(candidate)
+				cleanup = func() { persistRecovery(resource) }
+			case "changed-spec":
+				candidate.Spec.AllowDataLoss = false
+				persistRecovery(candidate)
+				cleanup = func() { persistRecovery(resource) }
+			case "wrong-manual-digest":
+				candidateRequest.ManualMembershipBindingDigest = strings.Repeat("a", 64)
+			case "changed-cohort":
+				original := env["RHIZA_CLUSTER_MEMBERS"]
+				sourceContainer["env"] = replaceEnv(list(sourceContainer["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": string(jsonBytes(sourceMembers[:2]))})
+				cleanup = func() {
+					sourceContainer["env"] = replaceEnv(list(sourceContainer["env"]), "RHIZA_CLUSTER_MEMBERS", object{"value": original})
+				}
+			case "malformed-present-membership":
+				if err := tracked.Bucket.Upload(ctx, path.Join(sourcePrefix, "voters/membership.json"), strings.NewReader("{")); err != nil {
+					t.Fatal(err)
+				}
+				cleanup = func() {
+					if err := tracked.Bucket.Delete(ctx, path.Join(sourcePrefix, "voters/membership.json")); err != nil {
+						t.Errorf("restore absent membership fixture: %v", err)
+					}
+				}
+			}
+			defer cleanup()
+			if err := f.e.RegisterArchiveForkGenesis(ctx, candidateRequest); err == nil {
+				t.Fatalf("fork registrar accepted invalid manual source evidence: %s", name)
+			}
+		})
+	}
 	if err := tracked.Delete(ctx, lineageKey); err != nil {
 		t.Fatalf("remove lineage to simulate interrupted registration prerequisites: %v", err)
 	}

@@ -30,17 +30,18 @@ type ArchiveGenesisMutation struct {
 // nonzero target base. The recovery package remains responsible for verifying
 // the referenced anchor and fork records before this descriptor is admitted.
 type ArchiveGenesisFork struct {
-	AnchorKey      string `json:"anchorKey"`
-	AnchorDigest   string `json:"anchorDigest"`
-	IntentDigest   string `json:"intentDigest"`
-	ResultDigest   string `json:"resultDigest"`
-	LineageDigest  string `json:"lineageDigest"`
-	TargetPrefix   string `json:"targetPrefix"`
-	MembershipHash string `json:"membershipHash"`
-	ConfigID       uint   `json:"configID"`
-	BaseTip        uint64 `json:"baseTip"`
-	BasePrefixHash string `json:"basePrefixHash"`
-	AnchorHash     string `json:"anchorHash"`
+	AnchorKey                     string `json:"anchorKey"`
+	AnchorDigest                  string `json:"anchorDigest"`
+	IntentDigest                  string `json:"intentDigest"`
+	ResultDigest                  string `json:"resultDigest"`
+	LineageDigest                 string `json:"lineageDigest"`
+	TargetPrefix                  string `json:"targetPrefix"`
+	MembershipHash                string `json:"membershipHash"`
+	ManualMembershipBindingDigest string `json:"manualMembershipBindingDigest,omitempty"`
+	ConfigID                      uint   `json:"configID"`
+	BaseTip                       uint64 `json:"baseTip"`
+	BasePrefixHash                string `json:"basePrefixHash"`
+	AnchorHash                    string `json:"anchorHash"`
 }
 
 // ArchiveGenesisRef is the single immutable authority pointer to the initial
@@ -65,32 +66,33 @@ const (
 // sealed empty source. It is deliberately separate from ArchiveGenesisRef:
 // the latter records the target's actual committed mutation receipt.
 type ArchiveEmptyRecoveryAuthorization struct {
-	Version                int                    `json:"version"`
-	StatefulSetUID         string                 `json:"statefulSetUID"`
-	TargetClusterID        string                 `json:"targetClusterID"`
-	OperationID            string                 `json:"operationID"`
-	SourceFenceOperationID string                 `json:"sourceFenceOperationID"`
-	ConfigID               uint                   `json:"configID"`
-	SourceTip              uint64                 `json:"sourceTip"`
-	SourceScopeHash        string                 `json:"sourceScopeHash"`
-	TargetScopeHash        string                 `json:"targetScopeHash"`
-	SourceGenesisRefDigest string                 `json:"sourceGenesisRefDigest"`
-	SourceHeadDigest       string                 `json:"sourceHeadDigest"`
-	SourceHeadVersion      objstore.ObjectVersion `json:"sourceHeadVersion"`
-	TargetEmptyHeadDigest  string                 `json:"targetEmptyHeadDigest"`
-	SourceRootDigest       string                 `json:"sourceRootDigest"`
-	SourceFenceDigest      string                 `json:"sourceFenceDigest"`
-	SourceMembershipHash   string                 `json:"sourceMembershipHash"`
-	SourceDurability       string                 `json:"sourceDurability"`
-	TargetMembershipHash   string                 `json:"targetMembershipHash"`
-	TargetDurability       string                 `json:"targetDurability"`
-	AllowDataLoss          bool                   `json:"allowDataLoss"`
-	PolicyDigest           string                 `json:"policyDigest"`
-	RecoveryMode           string                 `json:"recoveryMode,omitempty"`
-	SourcePrefix           string                 `json:"sourcePrefix,omitempty"`
-	BucketName             string                 `json:"bucketName,omitempty"`
-	BucketMetageneration   string                 `json:"bucketMetageneration,omitempty"`
-	LifecyclePolicyDigest  string                 `json:"lifecyclePolicyDigest,omitempty"`
+	Version                       int                    `json:"version"`
+	StatefulSetUID                string                 `json:"statefulSetUID"`
+	TargetClusterID               string                 `json:"targetClusterID"`
+	OperationID                   string                 `json:"operationID"`
+	SourceFenceOperationID        string                 `json:"sourceFenceOperationID"`
+	ConfigID                      uint                   `json:"configID"`
+	SourceTip                     uint64                 `json:"sourceTip"`
+	SourceScopeHash               string                 `json:"sourceScopeHash"`
+	TargetScopeHash               string                 `json:"targetScopeHash"`
+	SourceGenesisRefDigest        string                 `json:"sourceGenesisRefDigest"`
+	SourceHeadDigest              string                 `json:"sourceHeadDigest"`
+	SourceHeadVersion             objstore.ObjectVersion `json:"sourceHeadVersion"`
+	TargetEmptyHeadDigest         string                 `json:"targetEmptyHeadDigest"`
+	SourceRootDigest              string                 `json:"sourceRootDigest"`
+	SourceFenceDigest             string                 `json:"sourceFenceDigest"`
+	SourceMembershipHash          string                 `json:"sourceMembershipHash"`
+	ManualMembershipBindingDigest string                 `json:"manualMembershipBindingDigest,omitempty"`
+	SourceDurability              string                 `json:"sourceDurability"`
+	TargetMembershipHash          string                 `json:"targetMembershipHash"`
+	TargetDurability              string                 `json:"targetDurability"`
+	AllowDataLoss                 bool                   `json:"allowDataLoss"`
+	PolicyDigest                  string                 `json:"policyDigest"`
+	RecoveryMode                  string                 `json:"recoveryMode,omitempty"`
+	SourcePrefix                  string                 `json:"sourcePrefix,omitempty"`
+	BucketName                    string                 `json:"bucketName,omitempty"`
+	BucketMetageneration          string                 `json:"bucketMetageneration,omitempty"`
+	LifecyclePolicyDigest         string                 `json:"lifecyclePolicyDigest,omitempty"`
 }
 
 func (a ArchiveEmptyRecoveryAuthorization) Validate() error {
@@ -100,6 +102,7 @@ func (a ArchiveEmptyRecoveryAuthorization) Validate() error {
 		!mutationDigestValid(a.SourceGenesisRefDigest) || !mutationDigestValid(a.SourceHeadDigest) || !mutationDigestValid(a.TargetEmptyHeadDigest) ||
 		!mutationDigestValid(a.SourceRootDigest) || !mutationDigestValid(a.SourceFenceDigest) ||
 		!mutationDigestValid(a.SourceMembershipHash) || !mutationDigestValid(a.TargetMembershipHash) || !mutationDigestValid(a.PolicyDigest) ||
+		(a.ManualMembershipBindingDigest != "" && !mutationDigestValid(a.ManualMembershipBindingDigest)) ||
 		(a.SourceHeadVersion.Type != objstore.Generation && a.SourceHeadVersion.Type != objstore.ETag) || a.SourceHeadVersion.Value == "" ||
 		(a.SourceDurability != "async" && a.SourceDurability != "before-ack") ||
 		(a.TargetDurability != "async" && a.TargetDurability != "before-ack") ||
@@ -107,7 +110,7 @@ func (a ArchiveEmptyRecoveryAuthorization) Validate() error {
 		return fmt.Errorf("fencing: invalid empty recovery authorization")
 	}
 	if a.RecoveryMode == "" {
-		if a.SourcePrefix != "" || a.BucketName != "" || a.BucketMetageneration != "" || a.LifecyclePolicyDigest != "" {
+		if a.SourcePrefix != "" || a.BucketName != "" || a.BucketMetageneration != "" || a.LifecyclePolicyDigest != "" || a.ManualMembershipBindingDigest != "" {
 			return fmt.Errorf("fencing: legacy empty authorization carries frozen-source environment")
 		}
 	} else if a.RecoveryMode != "frozen-source-v1" || a.SourceDurability != "async" || !a.AllowDataLoss ||
@@ -136,7 +139,8 @@ func (r ArchiveGenesisRef) Validate() error {
 	if f.AnchorKey == "" || !mutationDigestValid(f.AnchorDigest) || !mutationDigestValid(f.IntentDigest) ||
 		!mutationDigestValid(f.ResultDigest) || !mutationDigestValid(f.LineageDigest) || f.TargetPrefix == "" ||
 		!mutationDigestValid(f.MembershipHash) || f.ConfigID == 0 || f.ConfigID != r.ConfigID || f.BaseTip == 0 ||
-		!mutationDigestValid(f.BasePrefixHash) || !mutationDigestValid(f.AnchorHash) {
+		!mutationDigestValid(f.BasePrefixHash) || !mutationDigestValid(f.AnchorHash) ||
+		(f.ManualMembershipBindingDigest != "" && !mutationDigestValid(f.ManualMembershipBindingDigest)) {
 		return fmt.Errorf("fencing: invalid anchored fork genesis descriptor")
 	}
 	return nil

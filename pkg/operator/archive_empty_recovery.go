@@ -21,17 +21,18 @@ import (
 // the exact policy snapshot. All source evidence and archive scopes are read
 // and validated by the authority, never supplied as caller assertions.
 type ArchiveEmptyRecoveryRequest struct {
-	RecoveryName           string                            `json:"recoveryName"`
-	StatefulSetUID         string                            `json:"statefulSetUID"`
-	TargetClusterID        string                            `json:"targetClusterID"`
-	OperationID            string                            `json:"operationID"`
-	SourceFenceOperationID string                            `json:"sourceFenceOperationID"`
-	TargetMembershipHash   string                            `json:"targetMembershipHash"`
-	TargetDurability       string                            `json:"targetDurability"`
-	AllowDataLoss          bool                              `json:"allowDataLoss"`
-	PolicyDigest           string                            `json:"policyDigest"`
-	RecoveryMode           string                            `json:"recoveryMode,omitempty"`
-	BucketEnvironment      *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
+	RecoveryName                  string                            `json:"recoveryName"`
+	StatefulSetUID                string                            `json:"statefulSetUID"`
+	TargetClusterID               string                            `json:"targetClusterID"`
+	OperationID                   string                            `json:"operationID"`
+	SourceFenceOperationID        string                            `json:"sourceFenceOperationID"`
+	TargetMembershipHash          string                            `json:"targetMembershipHash"`
+	TargetDurability              string                            `json:"targetDurability"`
+	AllowDataLoss                 bool                              `json:"allowDataLoss"`
+	PolicyDigest                  string                            `json:"policyDigest"`
+	RecoveryMode                  string                            `json:"recoveryMode,omitempty"`
+	BucketEnvironment             *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
+	ManualMembershipBindingDigest string                            `json:"manualMembershipBindingDigest,omitempty"`
 }
 
 type ArchiveEmptyRecoveryResponse struct {
@@ -46,7 +47,8 @@ func (r ArchiveEmptyRecoveryRequest) validate() error {
 		len(r.RecoveryName) > 253 || len(r.StatefulSetUID) > 128 || len(r.TargetClusterID) > 128 || len(r.OperationID) > 256 || len(r.SourceFenceOperationID) > 256 {
 		return fmt.Errorf("fencing: empty recovery request identity or policy is invalid")
 	}
-	if (r.RecoveryMode == RecoveryModeFrozenSource) != (r.BucketEnvironment != nil) || (r.RecoveryMode != "" && r.RecoveryMode != RecoveryModeFrozenSource) {
+	if (r.RecoveryMode == RecoveryModeFrozenSource) != (r.BucketEnvironment != nil) || (r.RecoveryMode != "" && r.RecoveryMode != RecoveryModeFrozenSource) ||
+		(r.ManualMembershipBindingDigest != "" && !validEvidenceDigest(r.ManualMembershipBindingDigest)) {
 		return fmt.Errorf("fencing: empty recovery mode and bucket environment differ")
 	}
 	return nil
@@ -76,6 +78,10 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 		request.TargetDurability != stored.Spec.Durability || request.AllowDataLoss != stored.Spec.AllowDataLoss || request.PolicyDigest != hashJSON(stored.Spec) ||
 		stored.Status.TargetBaseKind != "empty" || stored.Status.RecoveredTip != 0 || stored.Status.ManifestHash != "" || stored.Status.RecoveryMode != request.RecoveryMode {
 		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: empty recovery request differs from persisted recovery resource")
+	}
+	if stored.Status.RecoveryMode == RecoveryModeFrozenSource && (stored.Status.SpecHash != immutableSpecHash(stored.Spec) ||
+		request.ManualMembershipBindingDigest != stored.Status.ManualMembershipBindingDigest) {
+		return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: frozen recovery spec or manual cohort binding differs")
 	}
 
 	sts, err := e.archiveForkStatefulSet(ctx, request.StatefulSetUID)
@@ -146,7 +152,7 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 			}
 		}
 		if err := e.verifySourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID,
-			request.SourceFenceOperationID, request.TargetClusterID, "empty", mode, reservationDigest); err != nil {
+			request.SourceFenceOperationID, request.TargetClusterID, "empty", mode, reservationDigest, request.ManualMembershipBindingDigest); err != nil {
 			return ArchiveEmptyRecoveryResponse{}, err
 		}
 		return response, nil
@@ -191,11 +197,28 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 	sourceMembership, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "voters/membership.json"), 64<<10)
 	var sourceRecord recovery.MembershipRecord
 	if err == nil {
+		if request.ManualMembershipBindingDigest != "" {
+			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: manual missing-membership binding supplied for a present source record")
+		}
 		if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceVoters, sourceDurability) {
 			return ArchiveEmptyRecoveryResponse{}, errors.Join(err, fmt.Errorf("fencing: canonical source membership differs from enrolled workload"))
 		}
 	} else if e.ArchiveBucket.IsObjNotFoundErr(err) {
-		sourceRecord, err = e.bootstrapGenesisMembership(ctx, request, stored, env, sourceID, sourceDurability, sourceState, fence)
+		if stored.Spec.AllowMissingSourceMembership {
+			if request.ManualMembershipBindingDigest == "" {
+				return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: explicit manual missing-membership opt-in lacks its canonical binding")
+			}
+			manualDigest, missing, bindErr := e.manualMissingSourceMembershipBinding(ctx, stored, env,
+				fencing.ArchiveScope{Provider: provider, Bucket: bucket, Prefix: sourcePrefix, ClusterID: sourceID}, sourceState, fence)
+			if bindErr != nil || !missing || manualDigest != request.ManualMembershipBindingDigest || stored.Status.ManualMembershipBindingDigest != manualDigest {
+				return ArchiveEmptyRecoveryResponse{}, errors.Join(bindErr, fmt.Errorf("fencing: absent source membership lacks its exact manual CONTROL binding"))
+			}
+			sourceRecord = recovery.NewMembershipRecord(sourceID, sourceVoters, sourceDurability)
+		} else if request.ManualMembershipBindingDigest != "" {
+			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: manual binding supplied without persisted opt-in")
+		} else {
+			sourceRecord, err = e.bootstrapGenesisMembership(ctx, request, stored, env, sourceID, sourceDurability, sourceState, fence)
+		}
 		if err != nil {
 			return ArchiveEmptyRecoveryResponse{}, err
 		}
@@ -213,7 +236,7 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 			return ArchiveEmptyRecoveryResponse{}, fmt.Errorf("fencing: frozen empty recovery runtime is neither its source nor target identity")
 		}
 		expected, err := e.sourceSuccessorClaim(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID,
-			request.SourceFenceOperationID, request.TargetClusterID, "empty", RecoveryModeFrozenSource, "")
+			request.SourceFenceOperationID, request.TargetClusterID, "empty", RecoveryModeFrozenSource, "", request.ManualMembershipBindingDigest)
 		if err != nil {
 			return ArchiveEmptyRecoveryResponse{}, err
 		}
@@ -239,7 +262,7 @@ func (e *FencingExecutor) registerArchiveEmptyRecovery(ctx context.Context, requ
 		}
 	}
 	if err := e.claimSourceSuccessor(ctx, claimScope, request.StatefulSetUID, uid, request.OperationID, request.SourceFenceOperationID,
-		request.TargetClusterID, "empty", claimMode, reservationDigest); err != nil {
+		request.TargetClusterID, "empty", claimMode, reservationDigest, request.ManualMembershipBindingDigest); err != nil {
 		return ArchiveEmptyRecoveryResponse{}, err
 	}
 	targetMembership, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(targetPrefix, "voters/membership.json"), 64<<10)
@@ -353,6 +376,7 @@ func (e *FencingExecutor) readExistingEmptyRecovery(ctx context.Context, request
 		authorization.SourceScopeHash != sourceScopeHash || authorization.TargetScopeHash != targetScopeHash ||
 		authorization.TargetMembershipHash != request.TargetMembershipHash || authorization.TargetDurability != request.TargetDurability ||
 		authorization.AllowDataLoss != request.AllowDataLoss || authorization.PolicyDigest != emptyRecoveryPolicyDigest(request.PolicyDigest, authorization.SourceDurability, request.TargetDurability, request.AllowDataLoss) ||
+		authorization.ManualMembershipBindingDigest != request.ManualMembershipBindingDigest ||
 		authorization.RecoveryMode != request.RecoveryMode || authorization.SourcePrefix != expectedSourcePrefix || authorization.BucketName != expectedBucketName ||
 		authorization.BucketMetageneration != expectedMetageneration || authorization.LifecyclePolicyDigest != expectedLifecycleDigest ||
 		stored.Spec.RecoveryID != request.SourceFenceOperationID || stored.Status.StatefulSetUID != request.StatefulSetUID {
@@ -604,7 +628,7 @@ func (e *FencingExecutor) makeEmptyRecoveryAuthorization(request ArchiveEmptyRec
 		SourceGenesisRefDigest: authorityStateDigest(jsonBytes(sourceState.Ledger.ArchiveGenesisRef)), SourceHeadDigest: authorityStateDigest(sealedHead),
 		SourceHeadVersion: version, TargetEmptyHeadDigest: authorityStateDigest(targetHead),
 		SourceRootDigest: emptyRecoveryClosedRootDigest(e.Kube.Namespace, sourceState), SourceFenceDigest: stableSourceFenceEvidenceDigest(fence),
-		SourceMembershipHash: authorityStateDigest(jsonBytes(sourceMembership)), SourceDurability: sourceDurability,
+		SourceMembershipHash: authorityStateDigest(jsonBytes(sourceMembership)), ManualMembershipBindingDigest: request.ManualMembershipBindingDigest, SourceDurability: sourceDurability,
 		TargetMembershipHash: request.TargetMembershipHash, TargetDurability: request.TargetDurability,
 		AllowDataLoss: request.AllowDataLoss,
 		PolicyDigest:  emptyRecoveryPolicyDigest(request.PolicyDigest, sourceDurability, request.TargetDurability, request.AllowDataLoss),

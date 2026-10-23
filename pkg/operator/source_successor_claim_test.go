@@ -56,20 +56,32 @@ func TestSourceSuccessorClaimArbitratesRecoveryModesAndJoinsExactRetry(t *testin
 		StatefulSetUID: ownerUID, RecoveryResourceUID: recoveryUID, RecoveryMode: RecoveryModeFrozenSource,
 		TargetBaseKind: "fork", TargetClusterID: frozenTarget, OperationID: operationID,
 		FenceOperationID: fenceID, ClosedRootDigest: digest, FenceDigest: digest,
+		ManualMembershipBindingDigest: digest,
 	}
 	legacy := frozen
 	legacy.RecoveryMode = sourceSuccessorModeLegacy
 	legacy.TargetClusterID = "rhiza-r-" + shortID(operationID)
 	legacy.ReservationDigest = digest
+	legacy.ManualMembershipBindingDigest = ""
 	badOperation := frozen
 	badOperation.OperationID += "-other"
 	if err := badOperation.validate(scope); err == nil {
 		t.Fatal("claim validation accepted an operation unrelated to its recovery and closed fence")
 	}
+	badManualBinding := frozen
+	badManualBinding.ManualMembershipBindingDigest = "not-a-digest"
+	if err := badManualBinding.validate(scope); err == nil {
+		t.Fatal("claim validation accepted a malformed manual source-cohort binding")
+	}
 	badLegacyTarget := legacy
 	badLegacyTarget.TargetClusterID += "-other"
 	if err := badLegacyTarget.validate(scope); err == nil {
 		t.Fatal("claim validation accepted a legacy target unrelated to its operation")
+	}
+	badLegacyBinding := legacy
+	badLegacyBinding.ManualMembershipBindingDigest = digest
+	if err := badLegacyBinding.validate(scope); err == nil {
+		t.Fatal("legacy claim accepted a frozen-source manual cohort binding")
 	}
 
 	start := make(chan struct{})
@@ -123,6 +135,18 @@ func TestSourceSuccessorClaimArbitratesRecoveryModesAndJoinsExactRetry(t *testin
 	}
 	if err := reopened.claimSourceSuccessor(ctx, scope, winner); err != nil {
 		t.Fatalf("exact post-CAS retry did not resume: %v", err)
+	}
+	manualStore, err := NewAuthorityStateStore(bucket, "manual-successor-claims")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manualStore.claimSourceSuccessor(ctx, scope, frozen); err != nil {
+		t.Fatalf("manual frozen-source claim rejected: %v", err)
+	}
+	changedManualBinding := frozen
+	changedManualBinding.ManualMembershipBindingDigest = strings.Repeat("b", 64)
+	if err := manualStore.claimSourceSuccessor(ctx, scope, changedManualBinding); err == nil {
+		t.Fatal("different manual source-cohort binding joined the frozen successor claim")
 	}
 }
 

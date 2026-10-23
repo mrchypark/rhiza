@@ -1447,6 +1447,34 @@ func seedArchive(t *testing.T, ctx context.Context, bucket objstore.Bucket, pref
 
 type testTransport struct{}
 
+func TestManualMissingSourceMembershipOptInIsManualOnly(t *testing.T) {
+	base := Resource{Metadata: object{"uid": "recovery-uid"}, Spec: Spec{RecoveryID: "recovery-id"}}
+	if manualMissingSourceMembershipAllowed(&base) {
+		t.Fatal("missing-membership recovery was enabled by default")
+	}
+	base.Spec.AllowMissingSourceMembership = true
+	if !manualMissingSourceMembershipAllowed(&base) {
+		t.Fatal("explicit manual recovery opt-in was rejected")
+	}
+	for name, mutate := range map[string]func(*Resource){
+		"missing recovery uid": func(r *Resource) { r.Metadata["uid"] = "" },
+		"missing operation":    func(r *Resource) { r.Spec.RecoveryID = "" },
+		"membership operation": func(r *Resource) { r.Spec.Membership = &MembershipSpec{} },
+		"automatic owner":      func(r *Resource) { r.Metadata["annotations"] = object{automaticOwner: "cluster-uid"} },
+		"automatic logical":    func(r *Resource) { r.Metadata["annotations"] = object{automaticLogical: "logical"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			candidate.Metadata = object{"uid": "recovery-uid"}
+			candidate.Spec.Membership = nil
+			mutate(&candidate)
+			if manualMissingSourceMembershipAllowed(&candidate) {
+				t.Fatal("invalid or automatic recovery satisfied the manual opt-in gate")
+			}
+		})
+	}
+}
+
 func (testTransport) SendRecord(_ context.Context, to quepaxa.NodeID, r quepaxa.RecordRequest) (quepaxa.Summary, error) {
 	p := r.Proposal
 	return quepaxa.Summary{RecorderID: to, Step: r.Step, FirstCurrent: &p}, nil

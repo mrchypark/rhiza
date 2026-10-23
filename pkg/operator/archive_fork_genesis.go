@@ -23,13 +23,14 @@ import (
 // service account. OperationID is the recovery/anchor operation; the source
 // fence operation is a distinct immutable RhizaFence identity.
 type ArchiveForkGenesisRequest struct {
-	RecoveryName           string                            `json:"recoveryName,omitempty"`
-	StatefulSetUID         string                            `json:"statefulSetUID"`
-	TargetClusterID        string                            `json:"targetClusterID"`
-	OperationID            string                            `json:"operationID"`
-	SourceFenceOperationID string                            `json:"sourceFenceOperationID"`
-	RecoveryMode           string                            `json:"recoveryMode,omitempty"`
-	BucketEnvironment      *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
+	RecoveryName                  string                            `json:"recoveryName,omitempty"`
+	StatefulSetUID                string                            `json:"statefulSetUID"`
+	TargetClusterID               string                            `json:"targetClusterID"`
+	OperationID                   string                            `json:"operationID"`
+	SourceFenceOperationID        string                            `json:"sourceFenceOperationID"`
+	RecoveryMode                  string                            `json:"recoveryMode,omitempty"`
+	BucketEnvironment             *recovery.FrozenBucketEnvironment `json:"bucketEnvironment,omitempty"`
+	ManualMembershipBindingDigest string                            `json:"manualMembershipBindingDigest,omitempty"`
 }
 
 // ArchiveForkGenesisResponse makes the persisted source profile explicit to
@@ -67,10 +68,11 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 		if uid == "" || uid+":"+stored.Spec.RecoveryID != request.OperationID || stored.Spec.RecoveryID != request.SourceFenceOperationID ||
 			stored.Status.StatefulSetUID != request.StatefulSetUID || stored.Status.RecoveryMode != RecoveryModeFrozenSource ||
 			stored.Status.TargetBaseKind != "fork" || stored.Status.Stage != "FrozenForked" || stored.Status.Target != request.TargetClusterID || stored.Status.FrozenBucketEnvironment == nil ||
-			hashJSON(stored.Status.FrozenBucketEnvironment) != hashJSON(request.BucketEnvironment) {
+			hashJSON(stored.Status.FrozenBucketEnvironment) != hashJSON(request.BucketEnvironment) ||
+			stored.Status.SpecHash != immutableSpecHash(stored.Spec) || request.ManualMembershipBindingDigest != stored.Status.ManualMembershipBindingDigest {
 			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: frozen-source registration differs from its persisted recovery mode")
 		}
-	} else if request.RecoveryName != "" || request.BucketEnvironment != nil {
+	} else if request.RecoveryName != "" || request.BucketEnvironment != nil || request.ManualMembershipBindingDigest != "" {
 		return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: legacy fork cannot carry frozen-source recovery bindings")
 	}
 	sts, err := e.archiveForkStatefulSet(ctx, request.StatefulSetUID)
@@ -217,11 +219,25 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 	}
 	sourceMembership, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "voters/membership.json"), 64<<10)
 	if err != nil {
-		return ArchiveForkGenesisResponse{}, err
-	}
-	var sourceRecord recovery.MembershipRecord
-	if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceMembers, sourceDurability) {
-		return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source membership differs from enrolled workload"))
+		if !e.ArchiveBucket.IsObjNotFoundErr(err) || request.RecoveryMode != RecoveryModeFrozenSource {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		var stored Resource
+		if err := e.Kube.Get(ctx, e.controller().resourcePath(request.RecoveryName), &stored); err != nil {
+			return ArchiveForkGenesisResponse{}, err
+		}
+		manualDigest, missing, bindErr := e.manualMissingSourceMembershipBinding(ctx, stored, env, sourceScope, state, fence)
+		if bindErr != nil || !missing || request.ManualMembershipBindingDigest == "" || request.ManualMembershipBindingDigest != manualDigest || stored.Status.ManualMembershipBindingDigest != manualDigest {
+			return ArchiveForkGenesisResponse{}, errors.Join(bindErr, fmt.Errorf("fencing: absent source membership lacks its exact manual CONTROL binding"))
+		}
+	} else {
+		if request.ManualMembershipBindingDigest != "" {
+			return ArchiveForkGenesisResponse{}, fmt.Errorf("fencing: manual missing-membership binding supplied for a present source record")
+		}
+		var sourceRecord recovery.MembershipRecord
+		if err := decodeCanonicalArchiveJSON(sourceMembership, &sourceRecord); err != nil || sourceRecord != recovery.NewMembershipRecord(sourceID, sourceMembers, sourceDurability) {
+			return ArchiveForkGenesisResponse{}, errors.Join(err, fmt.Errorf("fencing: source membership differs from enrolled workload"))
+		}
 	}
 	if request.RecoveryMode == "" {
 		reservationData, err := readBoundedArchiveObject(ctx, e.ArchiveBucket, path.Join(sourcePrefix, "recovery/successor.json"), 64<<10)
@@ -240,7 +256,7 @@ func (e *FencingExecutor) registerArchiveForkGenesis(ctx context.Context, reques
 		}
 	}
 	if err := e.claimSourceSuccessor(ctx, sourceScope, request.StatefulSetUID, recoveryUID, request.OperationID, request.SourceFenceOperationID,
-		request.TargetClusterID, "fork", claimMode, reservationDigest); err != nil {
+		request.TargetClusterID, "fork", claimMode, reservationDigest, request.ManualMembershipBindingDigest); err != nil {
 		return ArchiveForkGenesisResponse{}, err
 	}
 	scope := fencing.ArchiveScope{Provider: scopeProvider, Bucket: scopeBucket, Prefix: targetPrefix, ClusterID: request.TargetClusterID}
@@ -525,7 +541,7 @@ func (e *FencingExecutor) verifyArchiveForkArtifacts(ctx context.Context, reques
 	fork := &fencing.ArchiveGenesisFork{
 		AnchorKey: recovery.GenerationAnchorKey(targetPrefix), AnchorDigest: hex.EncodeToString(anchorDigest[:]),
 		IntentDigest: intentDigest, ResultDigest: resultDigest, LineageDigest: lineageDigest,
-		TargetPrefix: targetPrefix, MembershipHash: authorityStateDigest(membershipData), ConfigID: recovery.ArchiveConfigID,
+		TargetPrefix: targetPrefix, MembershipHash: authorityStateDigest(membershipData), ManualMembershipBindingDigest: request.ManualMembershipBindingDigest, ConfigID: recovery.ArchiveConfigID,
 		BaseTip: result.Tip, BasePrefixHash: result.PrefixHash, AnchorHash: hex.EncodeToString(anchorHash[:]),
 	}
 	ref := fencing.ArchiveGenesisRef{Version: fencing.ArchiveGenesisVersion, ConfigID: recovery.ArchiveConfigID, Fork: fork}

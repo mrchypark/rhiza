@@ -23,11 +23,15 @@ type Spec struct {
 	SourceClusterID string `json:"sourceClusterID"`
 	// Durability is the NEW generation's mode. The immutable source record,
 	// not this desired setting, determines whether recovery can lose ACKs.
-	Durability           string `json:"durability"`
-	RecoveryID           string `json:"recoveryID,omitempty"`
-	AllowDataLoss        bool   `json:"allowDataLoss,omitempty"`
-	MaxArchiveAgeSeconds int64  `json:"maxArchiveAgeSeconds,omitempty"`
-	Fence                Fence  `json:"fence,omitempty"`
+	Durability    string `json:"durability"`
+	RecoveryID    string `json:"recoveryID,omitempty"`
+	AllowDataLoss bool   `json:"allowDataLoss,omitempty"`
+	// AllowMissingSourceMembership is a default-off manual recovery opt-in. It
+	// is accepted only when the canonical frozen-source fencer independently
+	// binds the complete live cohort to a closed CONTROL fence.
+	AllowMissingSourceMembership bool  `json:"allowMissingSourceMembership,omitempty"`
+	MaxArchiveAgeSeconds         int64 `json:"maxArchiveAgeSeconds,omitempty"`
+	Fence                        Fence `json:"fence,omitempty"`
 	// AnchorID opts this recovery into external anchor verification. When set,
 	// the workload must export RHIZA_RECOVERY_ANCHOR_ID matching this value.
 	AnchorID   string          `json:"anchorID,omitempty"`
@@ -85,19 +89,20 @@ type Status struct {
 	FrozenEmptyGenesisPending bool `json:"frozenEmptyGenesisPending,omitempty"`
 	// RecoveryMode is selected before recovery side effects and is immutable for
 	// the operation. Empty preserves the legacy path for already-running entries.
-	RecoveryMode            string                            `json:"recoveryMode,omitempty"`
-	FrozenBucketEnvironment *recovery.FrozenBucketEnvironment `json:"frozenBucketEnvironment,omitempty"`
-	RecoveryID              string                            `json:"recoveryID,omitempty"`
-	SpecHash                string                            `json:"specHash,omitempty"`
-	StatefulSetUID          string                            `json:"statefulSetUID,omitempty"`
-	SourceDurability        string                            `json:"sourceDurability,omitempty"`
-	SourceMembership        string                            `json:"sourceMembership,omitempty"`
-	ManifestHash            string                            `json:"manifestHash,omitempty"`
-	RecoveredTip            uint64                            `json:"recoveredTip,omitempty"`
-	SecretName              string                            `json:"secretName,omitempty"`
-	Stage                   string                            `json:"stage,omitempty"`
-	ArchiveCapture          string                            `json:"archiveCapture,omitempty"`
-	Peers                   []network.VoterRecoveryStatus     `json:"peers,omitempty"`
+	RecoveryMode                  string                            `json:"recoveryMode,omitempty"`
+	FrozenBucketEnvironment       *recovery.FrozenBucketEnvironment `json:"frozenBucketEnvironment,omitempty"`
+	RecoveryID                    string                            `json:"recoveryID,omitempty"`
+	SpecHash                      string                            `json:"specHash,omitempty"`
+	ManualMembershipBindingDigest string                            `json:"manualMembershipBindingDigest,omitempty"`
+	StatefulSetUID                string                            `json:"statefulSetUID,omitempty"`
+	SourceDurability              string                            `json:"sourceDurability,omitempty"`
+	SourceMembership              string                            `json:"sourceMembership,omitempty"`
+	ManifestHash                  string                            `json:"manifestHash,omitempty"`
+	RecoveredTip                  uint64                            `json:"recoveredTip,omitempty"`
+	SecretName                    string                            `json:"secretName,omitempty"`
+	Stage                         string                            `json:"stage,omitempty"`
+	ArchiveCapture                string                            `json:"archiveCapture,omitempty"`
+	Peers                         []network.VoterRecoveryStatus     `json:"peers,omitempty"`
 	// Automatic installation retains authenticated identities for a new incident
 	// even when a target voter fails before the parent adopts this generation.
 	// Missing observations never authorize single-voter fencing or invented WALs.
