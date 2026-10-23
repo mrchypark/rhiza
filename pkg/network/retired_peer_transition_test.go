@@ -180,6 +180,16 @@ func TestRetiredPeerTransitionRejectsCachedIdentityAndAdmitsNewIdentity(t *testi
 	if _, err := dBeforeAdd.ReadTip(ctx, "a"); err == nil || !errors.Is(err, errPeerRejected) {
 		t.Fatalf("new identity before committed ADD error=%v, want rejection", err)
 	}
+	// The replacement must first learn the committed REMOVE through the
+	// authenticated, read-only sync path. Otherwise its history resolves the
+	// later ADD terminal under config 1 and correctly rejects the config-2
+	// envelope before it can apply that terminal.
+	if err := dServer.catchUpFrom(ctx, "a", cores["a"].Tip(), true); err != nil {
+		t.Fatalf("replacement learner catch-up through committed REMOVE: %v", err)
+	}
+	if got := dCore.CurrentCluster(); got.ConfigID != withoutC.ConfigID || !sameNetworkMembers(got, withoutC) || dCore.IsVoter() {
+		t.Fatalf("replacement learner did not remain non-voting at post-REMOVE config: voter=%t cluster=%+v", dCore.IsVoter(), got)
+	}
 
 	withD := quepaxa.Cluster{ConfigID: 3, Members: append([]quepaxa.Member(nil), withoutC.Members...)}
 	withD.Members = append(withD.Members, dMember)
