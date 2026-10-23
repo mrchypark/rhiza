@@ -312,6 +312,127 @@ type fencerDeploymentView struct {
 	} `json:"conditions"`
 }
 
+type voterStartupPrivateView struct {
+	StatefulSetIdentity string `json:"statefulSetIdentity"`
+	StatefulSetUID      string `json:"statefulSetUID"`
+	Voters              []struct {
+		Ordinal      string `json:"ordinal"`
+		PodUID       string `json:"podUID"`
+		Identity     string `json:"identity"`
+		LogsCaptured bool   `json:"logsCaptured"`
+		Status       struct {
+			Phase      string `json:"phase"`
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+				Reason string `json:"reason"`
+			} `json:"conditions"`
+			Containers []struct {
+				Ready        bool  `json:"ready"`
+				RestartCount int32 `json:"restartCount"`
+				State        struct {
+					Waiting struct {
+						Reason string `json:"reason"`
+					} `json:"waiting"`
+					Terminated struct {
+						Reason   string `json:"reason"`
+						ExitCode *int32 `json:"exitCode"`
+						Signal   *int32 `json:"signal"`
+					} `json:"terminated"`
+				} `json:"state"`
+				LastState struct {
+					Terminated struct {
+						Reason   string `json:"reason"`
+						ExitCode *int32 `json:"exitCode"`
+						Signal   *int32 `json:"signal"`
+					} `json:"terminated"`
+				} `json:"lastState"`
+			} `json:"containers"`
+		} `json:"status"`
+	} `json:"voters"`
+}
+
+type voterStartupPublicView struct {
+	StatefulSetPinned bool                      `json:"statefulSetPinned"`
+	Voters            []voterStartupPublicEntry `json:"voters"`
+}
+
+type voterStartupPublicEntry struct {
+	Ordinal     string               `json:"ordinal"`
+	Identity    string               `json:"identity"`
+	Phase       string               `json:"phase"`
+	Conditions  []voterConditionView `json:"conditions"`
+	Containers  []voterContainerView `json:"containers"`
+	CurrentLog  voterLogView         `json:"currentLog"`
+	PreviousLog voterLogView         `json:"previousLog"`
+}
+
+type voterConditionView struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type voterContainerView struct {
+	Ready        bool   `json:"ready"`
+	RestartCount int32  `json:"restartCount"`
+	Waiting      string `json:"waiting,omitempty"`
+	Terminated   string `json:"terminated,omitempty"`
+	ExitCode     *int32 `json:"exitCode,omitempty"`
+	Signal       *int32 `json:"signal,omitempty"`
+	LastReason   string `json:"lastReason,omitempty"`
+	LastExitCode *int32 `json:"lastExitCode,omitempty"`
+	LastSignal   *int32 `json:"lastSignal,omitempty"`
+}
+
+type voterLogView struct {
+	Captured bool     `json:"captured"`
+	Bytes    int      `json:"bytes"`
+	SHA256   string   `json:"sha256,omitempty"`
+	Startup  []string `json:"startupCategories,omitempty"`
+}
+
+var allowedVoterPhases = map[string]struct{}{"Pending": {}, "Running": {}, "Succeeded": {}, "Failed": {}, "Unknown": {}}
+var allowedVoterConditionTypes = map[string]struct{}{"Ready": {}, "PodScheduled": {}, "Initialized": {}, "ContainersReady": {}}
+var allowedVoterStatuses = map[string]struct{}{"True": {}, "False": {}, "Unknown": {}}
+var allowedVoterReasons = map[string]struct{}{
+	"CrashLoopBackOff": {}, "ImagePullBackOff": {}, "ErrImagePull": {}, "CreateContainerConfigError": {},
+	"CreateContainerError": {}, "RunContainerError": {}, "ContainerCannotRun": {}, "OOMKilled": {},
+	"Error": {}, "Completed": {}, "ContainerCreating": {}, "PodInitializing": {}, "PodFailed": {},
+	"ContainersNotReady": {}, "Unschedulable": {}, "FailedScheduling": {}, "FailedMount": {},
+	"FailedAttachVolume": {}, "FailedCreatePodSandBox": {}, "MinimumReplicasUnavailable": {},
+}
+
+var voterStartupPrefixes = []struct{ prefix, category string }{
+	{"invalid RHIZA_", "config_invalid"},
+	{"conflicting RHIZA_", "config_conflict"},
+	{"fencing:", "supervisor_admission_failed"},
+	{"acquire lock:", "wal_lock_failed"},
+	{"open WAL:", "wal_open_failed"},
+	{"open object store:", "object_store_open_failed"},
+	{"load checkpoint manifest:", "checkpoint_load_failed"},
+	{"pin startup recovery evidence:", "recovery_evidence_pin_failed"},
+	{"recover shared archive:", "archive_recovery_failed"},
+	{"load shared decision archive:", "archive_recovery_failed"},
+	{"open materializer:", "materializer_open_failed"},
+	{"rebuild materializer:", "materializer_rebuild_failed"},
+	{"configure local graph indexes:", "materializer_config_failed"},
+	{"create QuePaxa core:", "consensus_core_create_failed"},
+	{"learner WAL identity differs", "wal_identity_mismatch"},
+	{"restore generation anchor:", "recovery_restore_failed"},
+	{"restore checkpoint recovery base:", "recovery_restore_failed"},
+	{"recover certified log through ", "recovery_replay_failed"},
+	{"replay local decisions:", "recovery_replay_failed"},
+	{"renew startup recovery evidence:", "recovery_evidence_renew_failed"},
+	{"listen peer QUIC:", "peer_listener_failed"},
+	{"open rhiza:", "node_open_failed"},
+	{"open learner:", "replica_open_failed"},
+	{"open object-store:", "replica_open_failed"},
+	{"configure learner:", "role_config_failed"},
+	{"configure object-store:", "role_config_failed"},
+	{"listen on ", "http_listener_failed"},
+}
+
 func safeJSON(name string, data []byte) ([]byte, error) {
 	var value any
 	switch {
@@ -386,6 +507,8 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 		value = &fencerEventsView{}
 	case name == "fencer-deployment.json":
 		value = &fencerDeploymentView{}
+	case name == "voter-startup-private.json":
+		return nil, fmt.Errorf("private voter diagnostics require identity-bound projection")
 	default:
 		return nil, fmt.Errorf("artifact type is not approved")
 	}
@@ -393,6 +516,148 @@ func safeJSON(name string, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(value)
+}
+
+func projectVoterStartupDiagnostics(raw string, data []byte) ([]byte, error) {
+	var source voterStartupPrivateView
+	if err := json.Unmarshal(data, &source); err != nil {
+		return nil, err
+	}
+	if source.StatefulSetIdentity != "pinned" && source.StatefulSetIdentity != "unavailable" {
+		return nil, fmt.Errorf("voter diagnostic identity status is invalid")
+	}
+	if source.StatefulSetIdentity == "pinned" && (source.StatefulSetUID == "" || len(source.Voters) != 3) {
+		return nil, fmt.Errorf("pinned voter diagnostic identity is incomplete")
+	}
+	if source.StatefulSetIdentity == "unavailable" && (source.StatefulSetUID != "" || len(source.Voters) != 0) {
+		return nil, fmt.Errorf("unavailable voter diagnostic identity is inconsistent")
+	}
+	public := voterStartupPublicView{StatefulSetPinned: source.StatefulSetIdentity == "pinned", Voters: make([]voterStartupPublicEntry, 0, len(source.Voters))}
+	seen := map[string]bool{}
+	for _, voter := range source.Voters {
+		if voter.Ordinal != "0" && voter.Ordinal != "1" && voter.Ordinal != "2" || seen[voter.Ordinal] {
+			return nil, fmt.Errorf("voter diagnostic ordinal is invalid")
+		}
+		seen[voter.Ordinal] = true
+		if voter.Identity != "verified" && voter.Identity != "identity_drift" && voter.Identity != "unavailable" {
+			return nil, fmt.Errorf("voter diagnostic identity status is invalid")
+		}
+		entry := voterStartupPublicEntry{Ordinal: voter.Ordinal, Identity: voter.Identity, Phase: "Unknown"}
+		if _, ok := allowedVoterPhases[voter.Status.Phase]; ok {
+			entry.Phase = voter.Status.Phase
+		}
+		for _, condition := range voter.Status.Conditions {
+			if _, ok := allowedVoterConditionTypes[condition.Type]; !ok {
+				continue
+			}
+			if _, ok := allowedVoterStatuses[condition.Status]; !ok {
+				continue
+			}
+			reason := ""
+			if _, ok := allowedVoterReasons[condition.Reason]; ok {
+				reason = condition.Reason
+			}
+			entry.Conditions = append(entry.Conditions, voterConditionView{Type: condition.Type, Status: condition.Status, Reason: reason})
+		}
+		for _, container := range voter.Status.Containers {
+			view := voterContainerView{Ready: container.Ready, RestartCount: container.RestartCount,
+				Waiting: allowedVoterReason(container.State.Waiting.Reason), Terminated: allowedVoterReason(container.State.Terminated.Reason),
+				ExitCode: container.State.Terminated.ExitCode, Signal: container.State.Terminated.Signal,
+				LastReason: allowedVoterReason(container.LastState.Terminated.Reason), LastExitCode: container.LastState.Terminated.ExitCode,
+				LastSignal: container.LastState.Terminated.Signal}
+			entry.Containers = append(entry.Containers, view)
+		}
+		if voter.Identity == "verified" && voter.LogsCaptured {
+			privateDir := filepath.Join(raw, "private-voter-diagnostics", "rhiza-"+voter.Ordinal)
+			entry.CurrentLog = readVoterLog(privateDir, "current", entry.Phase != "Running" || !allVoterContainersReady(voter.Status.Containers))
+			entry.PreviousLog = readVoterLog(privateDir, "previous", entry.Phase != "Running" || !allVoterContainersReady(voter.Status.Containers))
+		}
+		public.Voters = append(public.Voters, entry)
+	}
+	return json.Marshal(public)
+}
+
+func allowedVoterReason(reason string) string {
+	if _, ok := allowedVoterReasons[reason]; ok {
+		return reason
+	}
+	return ""
+}
+
+func allVoterContainersReady(containers []struct {
+	Ready        bool  `json:"ready"`
+	RestartCount int32 `json:"restartCount"`
+	State        struct {
+		Waiting struct {
+			Reason string `json:"reason"`
+		} `json:"waiting"`
+		Terminated struct {
+			Reason   string `json:"reason"`
+			ExitCode *int32 `json:"exitCode"`
+			Signal   *int32 `json:"signal"`
+		} `json:"terminated"`
+	} `json:"state"`
+	LastState struct {
+		Terminated struct {
+			Reason   string `json:"reason"`
+			ExitCode *int32 `json:"exitCode"`
+			Signal   *int32 `json:"signal"`
+		} `json:"terminated"`
+	} `json:"lastState"`
+}) bool {
+	if len(containers) != 1 {
+		return false
+	}
+	return containers[0].Ready
+}
+
+func readVoterLog(dir, name string, startupFailure bool) voterLogView {
+	var view voterLogView
+	captured, err := os.ReadFile(filepath.Join(dir, name+".captured"))
+	if err != nil || strings.TrimSpace(string(captured)) != "true" {
+		return view
+	}
+	logPath := filepath.Join(dir, name+".log")
+	info, err := os.Lstat(logPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 16384 {
+		return view
+	}
+	file, err := os.Open(logPath)
+	if err != nil {
+		return view
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 16385))
+	if err != nil || len(data) > 16384 || bytes.Count(data, []byte("\n")) > 80 {
+		return view
+	}
+	digest := sha256.Sum256(data)
+	view.Captured = true
+	view.Bytes = len(data)
+	view.SHA256 = hex.EncodeToString(digest[:])
+	view.Startup = classifyVoterStartupLog(data)
+	if startupFailure && len(view.Startup) == 0 && len(bytes.TrimSpace(data)) != 0 {
+		view.Startup = []string{"unknown_startup_error"}
+	}
+	return view
+}
+
+func classifyVoterStartupLog(data []byte) []string {
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		for _, item := range voterStartupPrefixes {
+			if strings.HasPrefix(line, item.prefix) || strings.Contains(line, item.prefix) {
+				seen[item.category] = true
+			}
+		}
+	}
+	var categories []string
+	for _, item := range voterStartupPrefixes {
+		if seen[item.category] {
+			categories = append(categories, item.category)
+		}
+	}
+	return categories
 }
 
 func validateRuntimeAgentDiagnostics(view fencerDiagnosticsView) error {
@@ -1970,6 +2235,17 @@ func safeArtifacts(raw string) error {
 	if (qualification == gcsMissingMembershipNegativeQualification || qualification == gcsMissingMembershipPositiveQualification) && !failedRun && !missingMembershipSeen {
 		return fmt.Errorf("successful missing-membership artifact set is missing its required case evidence")
 	}
+	if privateData, readErr := os.ReadFile(filepath.Join(raw, "voter-startup-private.json")); readErr == nil {
+		projected, projectErr := projectVoterStartupDiagnostics(raw, privateData)
+		if projectErr != nil {
+			return projectErr
+		}
+		if err := os.WriteFile(filepath.Join(public, "voter-startup-diagnostics.json"), projected, 0600); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(readErr) {
+		return fmt.Errorf("private voter diagnostics are unavailable")
+	}
 	ackLossSeen, err := projectGCSAckLossEvidence(raw, public, failedRun)
 	if err != nil {
 		return err
@@ -2000,6 +2276,9 @@ func safeArtifacts(raw string) error {
 			if _, statErr := os.Stat(filepath.Join(public, name)); statErr == nil {
 				required = append(required, name)
 			}
+		}
+		if _, statErr := os.Stat(filepath.Join(public, "voter-startup-diagnostics.json")); statErr == nil {
+			required = append(required, "voter-startup-diagnostics.json")
 		}
 	}
 	for _, name := range required {
