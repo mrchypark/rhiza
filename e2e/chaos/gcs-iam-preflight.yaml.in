@@ -9,6 +9,14 @@ spec:
   serviceAccountName: __PROBE_KSA__
   automountServiceAccountToken: false
   restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values: [__NODE_A__, __NODE_B__, __NODE_C__]
   securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
   containers:
     - name: probe

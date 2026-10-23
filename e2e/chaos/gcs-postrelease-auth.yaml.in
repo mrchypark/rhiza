@@ -52,9 +52,9 @@ spec:
     limits.memory: 8Gi
     requests.ephemeral-storage: 8Gi
     limits.ephemeral-storage: 8Gi
-    # Three voters, operator and authority are resident, plus the two transient
-    # isolation probe Pods: the positive run needs 7, leaving one Pod of headroom.
-    pods: '8'
+    # Three runtime agents, operator, authority, three voters, expiry Job Pod,
+    # one concurrent IAM probe, paired inspectors, and one temporary learner.
+    pods: '12'
     services: '2'
     services.loadbalancers: '0'
     services.nodeports: '0'

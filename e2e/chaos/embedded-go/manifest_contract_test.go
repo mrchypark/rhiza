@@ -32,9 +32,11 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	manifest := readContractFile(t, "../votercount_gcs_chaos.yaml.in")
 	launcher := readContractFile(t, "../run-votercount-gcs-chaos.sh")
 	preflight := readContractFile(t, "../gcs-iam-preflight.yaml.in")
+	expiry := readContractFile(t, "../gcs-namespace-expiry.yaml.in")
 	authority := readContractFile(t, "../../../deploy/operator/fencing/authority.yaml")
 	passivePatch := readContractFile(t, "../../../deploy/operator/fencing/runtime-agent-passive-kernel-patch.yaml")
 	fencingLauncher := readContractFile(t, "../../../e2e/fencing/run.sh")
+	bootstrapNamespace := readContractFile(t, "../gcs-postrelease-auth.yaml.in")
 	probe := readContractFile(t, "gcs_reader_probe.go")
 	guardDefinition := strings.Index(launcher, "require_fresh_runtime_agent_daemonset() {")
 	guardCall := strings.Index(launcher, "  require_fresh_runtime_agent_daemonset\n")
@@ -69,6 +71,7 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	for _, want := range []string{
 		"name: '__NAMESPACE__-fencer-tokenreview'",
 		"chaos.rhiza.io/run: '__RUN_ID__'",
+		"kind: Namespace, name: __NAMESPACE__, uid: __NAMESPACE_UID__",
 		"resources: [namespaces]",
 		"resourceNames: [__NAMESPACE__]",
 		"verbs: [get]",
@@ -92,6 +95,34 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 		if !strings.Contains(fencerBinding, want) {
 			t.Errorf("run-scoped fencer ClusterRoleBinding missing %q", want)
 		}
+	}
+	for _, want := range []string{
+		"resourceNames: [__NAMESPACE__]", "verbs: [get, delete]",
+		"kind: Namespace, name: __NAMESPACE__, uid: __NAMESPACE_UID__",
+		"metadata.resourceVersion", "deadline=__EXPIRY_DEADLINE__", "activeDeadlineSeconds: 10800",
+		"kubectl delete --raw /api/v1/namespaces/__NAMESPACE__ -f -", "sleep 30",
+		"DeleteOptions", "resourceVersion",
+	} {
+		if !strings.Contains(expiry, want) {
+			t.Errorf("namespace expiry ownership/expiry contract missing %q", want)
+		}
+	}
+	if strings.Contains(expiry, "--preconditions=") {
+		t.Fatal("namespace expiry must send a raw DeleteOptions body; kubectl has no resourceVersion precondition flag")
+	}
+	if !strings.Contains(launcher, "namespace cleanup was not verified locally; the in-cluster expiry Job remains pending") ||
+		!strings.Contains(launcher, "exit_status=1") {
+		t.Fatal("unverified local namespace cleanup must make the launcher fail")
+	}
+	if !strings.Contains(launcher, "command -v kubectl >/dev/null && command -v date >/dev/null && command -v sleep >/dev/null") {
+		t.Fatal("expiry image must be checked for every command used by its cleanup loop")
+	}
+	if !strings.Contains(launcher, "expiry_deadline=$((expiry_now + 7200))") ||
+		!strings.Contains(launcher, "s|__EXPIRY_DEADLINE__|$expiry_deadline|g") {
+		t.Fatal("expiry deadline must be computed once at render time and fixed into the Job")
+	}
+	if !strings.Contains(bootstrapNamespace, "pods: '12'") {
+		t.Fatal("namespace Pod quota does not account for pinned agent, workload, probe, and expiry Pods")
 	}
 	if strings.Contains(fencerRole, "name: rhiza-fencer-tokenreview") || strings.Contains(fencerBinding, "name: rhiza-fencer-tokenreview") {
 		t.Fatal("fencer RBAC must not bind a shared, non-run-unique ClusterRole")
@@ -164,6 +195,7 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	}
 
 	for _, input := range []string{
+		"RHIZA_NODE_A", "RHIZA_NODE_B", "RHIZA_NODE_C", "RHIZA_KUBECTL_IMAGE",
 		"RHIZA_READONLY_WORKLOAD_GSA_ID",
 		"RHIZA_RUNTIME_AGENT_CA_SECRET",
 		"RHIZA_RUNTIME_AGENT_TLS_SECRET",
@@ -175,6 +207,27 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	} {
 		if !strings.Contains(launcher, input) {
 			t.Errorf("launcher does not validate/render %q", input)
+		}
+	}
+	for _, want := range []string{
+		"requiredDuringSchedulingIgnoredDuringExecution", "matchFields", "key: metadata.name",
+		"__NODE_A__", "__NODE_B__", "__NODE_C__", "capture_run_scope",
+		"get node \"$node\" -o json", "a captured existing node is not Ready",
+		"timeout --signal=TERM --kill-after=10m", "RHIZA_GCS_DEADLINE_WRAPPED",
+		"cleanup_owned_namespace", "resourceVersion",
+	} {
+		if !strings.Contains(launcher+manifest+preflight, want) {
+			t.Errorf("bounded placement/cleanup contract missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"kind: ClusterRole", "resources: [namespaces]", "resourceNames: [__NAMESPACE__]",
+		"verbs: [get, delete]", "kind: ClusterRoleBinding", "kind: Job",
+		"activeDeadlineSeconds: 10800", "sleep 7200", "__NAMESPACE_UID__",
+		"resourceVersion=", "__NODE_A__", "__NODE_B__", "__NODE_C__", "__KUBECTL_IMAGE__",
+	} {
+		if !strings.Contains(expiry, want) {
+			t.Errorf("run-owned namespace expiry contract missing %q", want)
 		}
 	}
 	for _, want := range []string{
@@ -234,6 +287,96 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 	}
 }
 
+func TestRuntimeAgentRenderPinsNodesAndNamespaceOwnerReferences(t *testing.T) {
+	launcher := readContractFile(t, "../run-votercount-gcs-chaos.sh")
+	input := filepath.Join(t.TempDir(), "runtime-agent.yaml")
+	if err := os.WriteFile(input, []byte("kind: DaemonSet\nmetadata:\n  name: rhiza-runtime-agent\nspec:\n  template:\n    spec:\n      serviceAccountName: rhiza-runtime-agent\n---\nkind: ClusterRole\nmetadata:\n  name: run-runtime-agent\n---\nkind: ClusterRoleBinding\nmetadata:\n  name: run-runtime-agent\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	programs := []struct {
+		start, end string
+		args       []string
+	}{
+		{
+			start: "  awk -v a=",
+			end:   "\n  ' \"$out/runtime-agent.yaml\" > \"$runtime_agent_pinned\"",
+			args:  []string{"-v", "a=node-a", "-v", "b=node-b", "-v", "c=node-c"},
+		},
+		{
+			start: "  awk -v ns=",
+			end:   "\n  ' \"$runtime_agent_pinned\" > \"$runtime_agent_owned\"",
+			args:  []string{"-v", "ns=run-ns", "-v", "uid=namespace-uid"},
+		},
+	}
+	for i, program := range programs {
+		start := strings.Index(launcher, program.start)
+		if start < 0 {
+			t.Fatalf("runtime-agent renderer block %d missing", i)
+		}
+		quote := strings.Index(launcher[start:], "'\n")
+		if quote < 0 {
+			t.Fatalf("runtime-agent renderer block %d has no awk program", i)
+		}
+		bodyStart := start + quote + 2
+		end := strings.Index(launcher[bodyStart:], program.end)
+		if end < 0 {
+			t.Fatalf("runtime-agent renderer block %d terminator missing", i)
+		}
+		awkProgram := launcher[bodyStart : bodyStart+end]
+		args := append([]string{}, program.args...)
+		args = append(args, awkProgram, input)
+		output, err := exec.Command("awk", args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("runtime-agent renderer block %d failed: %v: %s", i, err, output)
+		}
+		if err := os.WriteFile(input, output, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rendered, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"values: [node-a, node-b, node-c]",
+		"kind: ClusterRole\nmetadata:\n  ownerReferences:\n    - apiVersion: v1\n      kind: Namespace\n      name: run-ns\n      uid: namespace-uid\n      blockOwnerDeletion: false\n  name: run-runtime-agent",
+		"kind: ClusterRoleBinding\nmetadata:\n  ownerReferences:\n    - apiVersion: v1\n      kind: Namespace\n      name: run-ns\n      uid: namespace-uid\n      blockOwnerDeletion: false\n  name: run-runtime-agent",
+	} {
+		if !strings.Contains(string(rendered), want) {
+			t.Errorf("runtime-agent render missing %q", want)
+		}
+	}
+}
+
+func TestNamespaceExpiryRendersUIDResourceVersionDelete(t *testing.T) {
+	manifest := readContractFile(t, "../gcs-namespace-expiry.yaml.in")
+	for _, replacement := range [][2]string{
+		{"__NAMESPACE__", "rhiza-chaos-abc12345"},
+		{"__NAMESPACE_UID__", "namespace-uid-123"},
+		{"__RUN_ID__", "abc12345"},
+		{"__EXPIRY_DEADLINE__", "1792761600"},
+		{"__NODE_A__", "node-a"}, {"__NODE_B__", "node-b"}, {"__NODE_C__", "node-c"},
+		{"__KUBECTL_IMAGE__", "registry.example/kubectl@sha256:" + strings.Repeat("c", 64)},
+	} {
+		manifest = strings.ReplaceAll(manifest, replacement[0], replacement[1])
+	}
+	for _, want := range []string{
+		"kubectl delete --raw /api/v1/namespaces/rhiza-chaos-abc12345 -f -",
+		"deadline=1792761600",
+		`body=$(printf '{"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":"%s","resourceVersion":"%s"}}' "$uid" "$rv");`,
+		"test \"$uid\" = 'namespace-uid-123'",
+		"test \"$run\" = 'abc12345'",
+	} {
+		if !strings.Contains(manifest, want) {
+			t.Errorf("rendered namespace expiry is missing %q", want)
+		}
+	}
+	if strings.Contains(manifest, "--preconditions=") {
+		t.Fatal("rendered expiry must not use kubectl's unsupported preconditions flag")
+	}
+}
+
 func TestVoterCountLauncherRunRequiresPrivilegedInstallCredential(t *testing.T) {
 	out := t.TempDir()
 	authState := filepath.Join(t.TempDir(), "bootstrap-state")
@@ -260,6 +403,10 @@ func TestVoterCountLauncherRunRequiresPrivilegedInstallCredential(t *testing.T) 
 		"RHIZA_KERNEL_RELEASE=6.1.0",
 		"RHIZA_APP_IMAGE=repo/app@sha256:" + strings.Repeat("a", 64),
 		"RHIZA_OPERATOR_IMAGE=repo/operator@sha256:" + strings.Repeat("b", 64),
+		"RHIZA_KUBECTL_IMAGE=repo/kubectl@sha256:" + strings.Repeat("c", 64),
+		"RHIZA_NODE_A=node-a",
+		"RHIZA_NODE_B=node-b",
+		"RHIZA_NODE_C=node-c",
 		"RHIZA_OUT=" + out,
 	}
 	output, err := command.CombinedOutput()
@@ -299,6 +446,13 @@ func TestIAMProbePodIdentityRejectsPrivilegeMutation(t *testing.T) {
 		"spec": map[string]any{
 			"serviceAccountName": "rhiza-workload", "automountServiceAccountToken": false,
 			"restartPolicy": "Never",
+			"affinity": map[string]any{"nodeAffinity": map[string]any{
+				"requiredDuringSchedulingIgnoredDuringExecution": map[string]any{
+					"nodeSelectorTerms": []any{map[string]any{"matchFields": []any{map[string]any{
+						"key": "metadata.name", "operator": "In", "values": []any{"node-a", "node-b", "node-c"},
+					}}}},
+				},
+			}},
 			"securityContext": map[string]any{
 				"runAsNonRoot": true, "runAsUser": 65532,
 				"seccompProfile": map[string]any{"type": "RuntimeDefault"},
@@ -326,6 +480,7 @@ func TestIAMProbePodIdentityRejectsPrivilegeMutation(t *testing.T) {
 		},
 	}
 	args := []string{"-er", "--arg", "pod", "probe", "--arg", "ns", "run-ns", "--arg", "run", "1234abcd",
+		"--arg", "node_a", "node-a", "--arg", "node_b", "node-b", "--arg", "node_c", "node-c",
 		"--arg", "ksa", "rhiza-workload", "--arg", "image", "example.invalid/rhiza@sha256:abc",
 		"--arg", "mode", "reader", "--arg", "bucket", "bucket", "--arg", "prefix", "qual/1234abcd/data/",
 		"--arg", "nonce", strings.Repeat("b", 32), "--arg", "manifest", "6", "--arg", "create", "0",
