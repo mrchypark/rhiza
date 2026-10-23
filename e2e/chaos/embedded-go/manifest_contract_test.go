@@ -198,7 +198,7 @@ func TestIndependentGCSChaosManifestContract(t *testing.T) {
 		"QUALIFIED_SANDBOX_EXECUTABLE_SHA256",
 		"sandbox-executable-sha256: \"QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"",
 		"rhiza.dev/sandbox-executable-sha256: \"QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"",
-		"rhiza.dev/sandbox-executable-sha256: \"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\"",
+		"rhiza.dev/sandbox-executable-sha256: \\\"$RHIZA_QUALIFIED_SANDBOX_EXECUTABLE_SHA256\\\"",
 		"sandbox-args-json: '[\\\"/pause\\\"]'",
 		"qualified sandbox executable approval must be 64 lowercase hex characters",
 		"${RHIZA_RUNTIME_AGENT_PASSIVE_KERNEL:=no}",
