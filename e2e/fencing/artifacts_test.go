@@ -314,6 +314,9 @@ func TestVoterStartupStageProjectionUsesExactWrappersAndFixedCodes(t *testing.T)
 	if err := os.WriteFile(logPath, []byte(logs), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(filepath.Dir(logPath), "current.captured"), []byte("true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	view := readVoterLog(filepath.Dir(logPath), "current", true)
 	if !view.Captured || len(view.StartupStages) != 6 || view.StartupStagesTruncated {
 		t.Fatalf("startup stage projection is incomplete: %+v", view)
