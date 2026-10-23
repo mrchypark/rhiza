@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -31,9 +32,12 @@ func TestGCSDeadPodChaosObjectUsesExactAdmittedSelector(t *testing.T) {
 	if _, ok := spec["containerNames"]; ok {
 		t.Fatal("PodChaos must kill the whole Pod, not only a container")
 	}
-	created := obj{"apiVersion": nested(body, "apiVersion"), "kind": nested(body, "kind"),
+	created := obj{}
+	if err := json.Unmarshal(encoded(obj{"apiVersion": nested(body, "apiVersion"), "kind": nested(body, "kind"),
 		"metadata": obj{"name": nested(body, "metadata", "name"), "namespace": nested(body, "metadata", "namespace"),
-			"uid": "chaos-uid", "labels": obj{gcsChaosRunLabel: "deadbeef"}}, "spec": nested(body, "spec")}
+			"uid": "chaos-uid", "labels": obj{gcsChaosRunLabel: "deadbeef"}}, "spec": nested(body, "spec")}), &created); err != nil {
+		t.Fatal(err)
+	}
 	if !gcsDeadPodObjectMatches(created, body) {
 		t.Fatal("rejected exact created PodChaos object")
 	}

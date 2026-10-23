@@ -117,6 +117,13 @@ func (c *Controller) reconcileMembership(ctx context.Context, r *Resource) error
 		return blocked("persisted remove request differs from immutable membership specification")
 	}
 	if !containsID(expected.Voters, m.Remove) {
+		// The removed voter disappearing from the observed configuration only
+		// proves that the membership change committed. Replay the exact journaled
+		// request so the surviving node can finish persistMembership before the
+		// replacement add is journaled or dispatched.
+		if err := c.changeMembership(ctx, survivorPod(pods, statuses, "", expected), r.Spec.Container, admin, *journal.RemoveRequest); err != nil {
+			return c.recordMembership(ctx, r, "Removing", "committed removal durability confirmation remains pending: "+err.Error())
+		}
 		return c.reconcileMembershipAdd(ctx, r, sts, pods, statuses, admin, expected)
 	}
 	if journal.RemoveRequest.ExpectedConfigID != expected.ConfigID || journal.RemoveRequest.ExpectedAbortSlot != expected.AbortSlot {
@@ -161,6 +168,13 @@ func (c *Controller) reconcileMembershipAdd(ctx context.Context, r *Resource, st
 	// journal's abort slot identifies the add round to dispatch, but cannot be
 	// required on the resulting configuration.
 	if journal.Add != nil && journal.Add.OperationID == request.OperationID && journal.Add.MemberID == member.ID && journal.Add.WALIdentity == member.WALIdentity && journal.Add.RequestHash == hashJSON(request) && journal.Add.SecretUID == secretUID && journal.Add.SecretResourceVer == secretResourceVer && current.AbortSlot == 0 && current.ConfigID == journal.Add.ExpectedConfigID+1 && containsID(current.Voters, journal.Add.MemberID) && learner.Voting && !learner.Pending && learner.WALIdentity == journal.Add.WALIdentity {
+		// Membership status proves that the configuration committed, but not
+		// that the node's post-commit archive SyncThrough completed. Replaying
+		// the exact journaled request is idempotent on the committed node and
+		// repeats persistMembership before we publish completion.
+		if err := c.changeMembership(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, request); err != nil {
+			return c.recordMembership(ctx, r, "Adding", "committed add durability confirmation remains pending: "+err.Error())
+		}
 		journal.Phase = "Complete"
 		return c.recordMembership(ctx, r, "Complete", "replacement learner promoted under surviving quorum")
 	}
@@ -189,6 +203,13 @@ func (c *Controller) abortMembership(ctx context.Context, r *Resource, pods map[
 	if current.ConfigID == add.ExpectedConfigID+1 {
 		if err := c.confirmRetiredMembershipCommit(ctx, r, statuses, current); err != nil {
 			return c.recordMembership(ctx, r, "Blocked", err.Error())
+		}
+		request, err := c.retiringMembershipRequest(ctx, r)
+		if err != nil {
+			return c.recordMembership(ctx, r, "Blocked", err.Error())
+		}
+		if err := c.changeMembership(ctx, survivorPod(pods, statuses, "", current), r.Spec.Container, admin, request); err != nil {
+			return c.recordMembership(ctx, r, "Aborting", "committed addition durability confirmation remains pending: "+err.Error())
 		}
 		return c.recordMembership(ctx, r, "Complete", "journaled addition already committed; failed voter identity retained for the next recovery")
 	}
